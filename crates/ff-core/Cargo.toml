@@ -1,0 +1,35 @@
+[package]
+name = "ff-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+metal = ["candle-core/metal"]
+
+[dependencies]
+anyhow.workspace = true
+candle-core.workspace = true
+clap.workspace = true
+half.workspace = true
+memmap2.workspace = true
+png.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

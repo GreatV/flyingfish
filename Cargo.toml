@@ -1,0 +1,119 @@
+[package]
+name = "flyingfish"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+resolver = "3"
+members = ["crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music"]
+default-members = [".", "crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+# candle-kernels 0.11.0 cannot compile for a pre-Ampere target against any
+# CUDA from 12.6 onward: its `compatibility.cuh` supplies `__hmax_nan` and
+# `__hmin_nan` below sm_80, and those toolkits already declare both for every
+# architecture. The vendored copy adds a `CUDA_VERSION` term to that one guard
+# and changes nothing else. Compiled from one path so nvcc's file-derived
+# symbol prefixes and embedded `__FILE__` strings match, all twelve kernels
+# emit byte-identical PTX at `compute_89` before and after the change; at
+# `compute_75` upstream compiles two of twelve and the patched copy compiles
+# all twelve. See `third_party/candle-kernels/src/compatibility.cuh`.
+[patch.crates-io]
+candle-kernels = { path = "third_party/candle-kernels" }
+
+[workspace.dependencies]
+anyhow = "1.0"
+candle-core = "=0.11.0"
+candle-kernels = "=0.11.0"
+candle-flash-attn = { version = "=0.11.0", default-features = false }
+candle-nn = "=0.11.0"
+# Names the E4M3 element type candle already stores FP8 checkpoints in.
+float8 = "=0.7.0"
+clap = { version = "4.5", features = ["derive", "string"] }
+cudarc = { version = "=0.19.9", default-features = false, features = ["std", "driver", "nvrtc", "cublaslt", "cudnn", "f16", "cuda-version-from-build-system"] }
+hound = "3.5"
+half = "=2.7.1"
+memmap2 = "0.9"
+libc = "0.2"
+png = "0.18"
+rand = "0.9"
+rand_distr = "0.5"
+safetensors = "=0.8.0"
+serde = { version = "1.0", features = ["derive"] }
+# Replay reports validate derived f64 metrics exactly after serialization.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+tokenizers = "=0.22.2"
+tempfile = "3.20"
+# Already present on Windows through clap, so these bindings cost no extra
+# build. Using them keeps hand-written `extern "system"` blocks out of the
+# codebase.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[[bin]]
+name = "ff"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = [
+    "ff-core/cuda",
+    "ff-h3/cuda",
+    "ff-glm/cuda",
+    "ff-trellis/cuda",
+    "ff-minicpm/cuda",
+    "ff-music/cuda",
+    "candle-core/cuda",
+    "dep:cudarc",
+]
+flash-attn = ["cuda", "ff-h3/flash-attn"]
+metal = ["ff-music/metal", "ff-minicpm/metal", "ff-core/metal", "ff-h3/metal", "candle-core/metal"]
+
+[dependencies]
+ff-core = { path = "crates/ff-core" }
+ff-h3 = { path = "crates/ff-h3" }
+ff-glm = { path = "crates/ff-glm" }
+ff-trellis = { path = "crates/ff-trellis" }
+ff-minicpm = { path = "crates/ff-minicpm" }
+ff-music = { path = "crates/ff-music" }
+anyhow = "1.0"
+candle-core = "=0.11.0"
+clap = { version = "4.5", features = ["derive", "string"] }
+cudarc = { version = "=0.19.9", optional = true, default-features = false, features = ["std", "driver", "cublaslt", "cudnn", "f16", "cuda-version-from-build-system"] }
+half.workspace = true
+hound = "3.5"
+memmap2 = "0.9"
+png = "0.18"
+rand = "0.9"
+rand_distr = "0.5"
+safetensors = "=0.8.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json.workspace = true
+tokenizers = "=0.22.2"
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[lints.rust]
+warnings = "deny"

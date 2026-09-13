@@ -1,0 +1,1018 @@
+//! Metadata-derived phase peaks. No device allocation or live capacity probe.
+use crate::{
+    config::{GlmTextConfig, MlpKind},
+    execution_policy::GLM_ADMISSION_SAFETY_BYTES,
+    model::{
+        LM_HEAD_WEIGHT, prefill::prefill_workspace_bytes, static_weight_specs,
+        streamed_static_weight_groups,
+    },
+};
+use anyhow::{Context, Result, bail, ensure};
+use candle_core::DType;
+use ff_core::{
+    probe::ResourceSnapshot,
+    resource_selection::ResourcePhaseEstimate,
+    weights::{
+        CachePolicy, ModelWeights, TensorMetadata, WeightSource,
+        accounting::{CacheInventory, CacheLoadLifetimes, estimate_cache_residency},
+    },
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlmLayerScope {
+    pub start: usize,
+    pub end: usize,
+    pub total_layers: usize,
+}
+
+impl GlmLayerScope {
+    pub fn for_rank(total_layers: usize, rank: usize, ranks: usize) -> Result<Self> {
+        ensure!(
+            ranks > 0 && ranks <= total_layers && rank < ranks,
+            "invalid GLM layer partition"
+        );
+        Ok(Self {
+            start: rank
+                .checked_mul(total_layers)
+                .context("GLM partition overflow")?
+                .div_ceil(ranks),
+            end: (rank + 1)
+                .checked_mul(total_layers)
+                .context("GLM partition overflow")?
+                .div_ceil(ranks),
+            total_layers,
+        })
+    }
+    pub fn contains_layer(self, layer: usize) -> bool {
+        (self.start..self.end).contains(&layer)
+    }
+    pub fn owns_head(self) -> bool {
+        self.end == self.total_layers
+    }
+    pub fn owns_embedding(self) -> bool {
+        self.start == 0
+    }
+    pub fn contains_static(self, name: &str) -> bool {
+        if let Some(rest) = name.strip_prefix("model.language_model.layers.") {
+            return rest
+                .split('.')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .is_some_and(|n| self.contains_layer(n));
+        }
+        self.owns_head() && matches!(name, "lm_head.weight" | "model.language_model.norm.weight")
+    }
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            self.start < self.end && self.end <= self.total_layers,
+            "invalid GLM layer range"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlmAdmissionBreakdown {
+    pub scope: GlmLayerScope,
+    pub compute_on_host: bool,
+    pub cpu_fp8_dequantization: bool,
+    #[serde(default)]
+    pub pinned_transfer_bytes: u64,
+    pub prompt_tokens: usize,
+    pub num_hidden_layers: u32,
+    pub num_experts: u32,
+    pub experts_per_token: u32,
+    pub sparse_layers: Vec<u32>,
+    pub static_bytes: usize,
+    pub lm_head_bytes: usize,
+    pub largest_streamed_group_bytes: usize,
+    pub kda_state_bytes: usize,
+    pub dsa_cache_bytes_per_token: usize,
+    pub maximum_dsa_cache_bytes: usize,
+    pub maximum_dsa_layer_cache_bytes: usize,
+    pub live_expert_bytes: usize,
+    pub prefill_workspace_bytes: usize,
+    pub decode_workspace_bytes: usize,
+    pub host_route_workspace_bytes: u64,
+    pub host_sampling_workspace_bytes: u64,
+    pub prefill_host_mask_bytes: u64,
+    pub static_load_host_bytes: u64,
+    pub streamed_load_host_bytes: u64,
+    pub expert_load_host_bytes: u64,
+    pub static_load_device_bytes: u64,
+    pub expert_load_device_bytes: u64,
+    pub raw_inventory: CacheInventory,
+}
+
+impl GlmAdmissionBreakdown {
+    /// `weights` must have no materialized payloads at the caller's capture
+    /// boundary. Includes static/initialization/scale names, not vision or MTP.
+    pub fn from_metadata(
+        weights: &ModelWeights,
+        text: &GlmTextConfig,
+        cpu: bool,
+        prompt_tokens: usize,
+    ) -> Result<Self> {
+        Self::from_metadata_with_fp8(weights, text, cpu, prompt_tokens, cpu)
+    }
+
+    pub fn from_metadata_with_fp8(
+        weights: &ModelWeights,
+        text: &GlmTextConfig,
+        cpu: bool,
+        prompt_tokens: usize,
+        cpu_fp8_dequantization: bool,
+    ) -> Result<Self> {
+        Self::from_metadata_for_scope(
+            weights,
+            text,
+            cpu,
+            prompt_tokens,
+            cpu_fp8_dequantization,
+            GlmLayerScope {
+                start: 0,
+                end: text.num_hidden_layers,
+                total_layers: text.num_hidden_layers,
+            },
+        )
+    }
+
+    pub fn from_metadata_for_scope(
+        weights: &ModelWeights,
+        text: &GlmTextConfig,
+        cpu: bool,
+        prompt_tokens: usize,
+        cpu_fp8_dequantization: bool,
+        scope: GlmLayerScope,
+    ) -> Result<Self> {
+        scope.validate()?;
+        ensure!(
+            scope.total_layers == text.num_hidden_layers,
+            "GLM scope disagrees with model layers"
+        );
+        let cpu_fp8_dequantization = cpu || cpu_fp8_dequantization;
+        text.validate()?;
+        let compute_dtype = if cpu { DType::F32 } else { DType::BF16 };
+        let mut static_bytes = 0usize;
+        let mut lm_head_bytes = 0usize;
+        let mut static_tensor_bytes = BTreeMap::new();
+        let specs: Vec<_> = static_weight_specs(text)
+            .into_iter()
+            .filter(|(name, _)| scope.contains_static(name))
+            .collect();
+        for (name, linear_weight) in &specs {
+            let metadata = weights.metadata(name)?;
+            let elements = metadata
+                .shape
+                .iter()
+                .try_fold(1usize, |count, &dimension| {
+                    count
+                        .checked_mul(dimension)
+                        .context("GLM tensor element count overflow")
+                })?;
+            let bytes_per_element = if cpu {
+                DType::F32.size_in_bytes()
+            } else if *linear_weight && metadata.dtype == "F8_E4M3" {
+                compute_dtype.size_in_bytes()
+            } else {
+                match metadata.dtype.as_str() {
+                    "BF16" => DType::BF16.size_in_bytes(),
+                    "F32" => DType::F32.size_in_bytes(),
+                    other => bail!("unsupported resident GLM tensor dtype {other}"),
+                }
+            };
+            let bytes = elements
+                .checked_mul(bytes_per_element)
+                .context("GLM resident tensor byte count overflow")?;
+            static_bytes = static_bytes
+                .checked_add(bytes)
+                .context("GLM static residency byte count overflow")?;
+            if name == LM_HEAD_WEIGHT {
+                lm_head_bytes = bytes;
+            }
+            ensure!(
+                static_tensor_bytes.insert(name.clone(), bytes).is_none(),
+                "duplicate GLM static admission tensor"
+            );
+        }
+
+        let streamed_groups = streamed_static_weight_groups(text);
+        let covered = streamed_groups
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        for name in static_tensor_bytes.keys() {
+            if name != LM_HEAD_WEIGHT {
+                ensure!(
+                    covered.contains(name.as_str()),
+                    "GLM streamed-static admission has no live group for {name}"
+                );
+            }
+        }
+        let largest_streamed_group_bytes =
+            streamed_groups
+                .iter()
+                .map(|group| {
+                    group
+                        .iter()
+                        .filter(|name| scope.contains_static(name))
+                        .try_fold(0usize, |total, name| {
+                            total
+                                .checked_add(*static_tensor_bytes.get(name).with_context(|| {
+                                    format!("unknown GLM live-group tensor {name}")
+                                })?)
+                                .context("GLM streamed live-group byte count overflow")
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .context("GLM streamed-static live groups are empty")?;
+
+        let qkv_dim = text.linear_qkv_dim()?;
+        let recurrent_per_layer = text
+            .linear_num_heads
+            .checked_mul(text.linear_head_dim)
+            .and_then(|value| value.checked_mul(text.linear_head_dim))
+            .and_then(|value| value.checked_mul(DType::F32.size_in_bytes()))
+            .context("GLM recurrent-state byte count overflow")?;
+        let conv_per_layer = 3usize
+            .checked_mul(qkv_dim)
+            .and_then(|value| value.checked_mul(text.linear_conv_kernel_dim))
+            .and_then(|value| value.checked_mul(compute_dtype.size_in_bytes()))
+            .context("GLM convolution-state byte count overflow")?;
+        let kda_state_bytes = recurrent_per_layer
+            .checked_add(conv_per_layer)
+            .and_then(|value| {
+                value.checked_mul(
+                    text.linear_attention_layers()
+                        .filter(|&n| scope.contains_layer(n))
+                        .count(),
+                )
+            })
+            .context("GLM KDA state byte count overflow")?;
+        let dsa_cache_bytes_per_token = text
+            .sparse_attention_layers()
+            .filter(|&n| scope.contains_layer(n))
+            .count()
+            .checked_mul(text.num_attention_heads)
+            .and_then(|value| {
+                value.checked_mul(text.qk_nope_head_dim.checked_add(text.v_head_dim)?)
+            })
+            .and_then(|value| value.checked_mul(compute_dtype.size_in_bytes()))
+            .context("GLM per-token DSA cache byte count overflow")?;
+        let dsa_cache_bytes = dsa_cache_bytes_per_token
+            .checked_mul(text.index_topk)
+            .context("GLM maximum DSA cache byte count overflow")?;
+        let sparse_count = text
+            .mlp_layer_types
+            .iter()
+            .enumerate()
+            .filter(|(layer, kind)| scope.contains_layer(*layer) && **kind == MlpKind::Sparse)
+            .count();
+        let live_expert_bytes = if sparse_count == 0 {
+            0
+        } else {
+            text.hidden_size
+                .checked_mul(text.moe_intermediate_size)
+                .and_then(|value| value.checked_mul(5))
+                .and_then(|value| value.checked_mul(compute_dtype.size_in_bytes()))
+                .context("GLM live expert byte count overflow")?
+        };
+
+        let mut names = BTreeSet::new();
+        let mut static_load_host_bytes = 0;
+        let mut expert_load_host_bytes = 0;
+        for (name, linear) in specs {
+            let metadata = weights.metadata(&name)?;
+            let scale_name = format!("{name}_scale_inv");
+            let scale = if linear && metadata.dtype == "F8_E4M3" {
+                names.insert(scale_name.clone());
+                Some(weights.metadata(&scale_name)?)
+            } else {
+                None
+            };
+            static_load_host_bytes = static_load_host_bytes.max(load_host_transient_bytes(
+                &metadata,
+                scale.as_ref(),
+                cpu,
+                cpu_fp8_dequantization,
+            )?);
+            names.insert(name);
+        }
+        if scope.owns_embedding() {
+            names.insert("model.language_model.embed_tokens.weight".into());
+        }
+        for (layer, kind) in text.mlp_layer_types.iter().enumerate() {
+            if *kind != MlpKind::Sparse || !scope.contains_layer(layer) {
+                continue;
+            }
+            for expert in 0..text.n_routed_experts {
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    let name = format!(
+                        "model.language_model.layers.{layer}.mlp.experts.{expert}.{projection}.weight"
+                    );
+                    let metadata = weights.metadata(&name)?;
+                    let scale_name = format!("{name}_scale_inv");
+                    let scale = if metadata.dtype == "F8_E4M3" {
+                        names.insert(scale_name.clone());
+                        Some(weights.metadata(&scale_name)?)
+                    } else {
+                        None
+                    };
+                    expert_load_host_bytes = expert_load_host_bytes.max(load_host_transient_bytes(
+                        &metadata,
+                        scale.as_ref(),
+                        cpu,
+                        cpu_fp8_dequantization,
+                    )?);
+                    names.insert(name);
+                }
+            }
+        }
+        let mut static_load_device_bytes = 0;
+        let mut expert_load_device_bytes = 0;
+        if !cpu_fp8_dequantization {
+            for name in &names {
+                let metadata = weights.metadata(name)?;
+                if metadata.dtype == "F8_E4M3" {
+                    let scale = weights.metadata(&format!("{name}_scale_inv"))?;
+                    let bytes = u64::try_from(metadata.bytes)?
+                        .checked_add(u64::try_from(scale.bytes)?)
+                        .context("GLM raw GPU dequant staging overflow")?;
+                    if name.contains(".experts.") {
+                        expert_load_device_bytes = expert_load_device_bytes.max(bytes);
+                    } else {
+                        static_load_device_bytes = static_load_device_bytes.max(bytes);
+                    }
+                }
+            }
+        }
+        let raw_inventory = weights.cache_inventory_for(names.iter().map(String::as_str))?;
+        Ok(Self {
+            scope,
+            compute_on_host: cpu,
+            cpu_fp8_dequantization,
+            pinned_transfer_bytes: 0,
+            prompt_tokens,
+            num_hidden_layers: u32::try_from(text.num_hidden_layers)?,
+            num_experts: u32::try_from(text.n_routed_experts)?,
+            experts_per_token: u32::try_from(text.num_experts_per_tok)?,
+            sparse_layers: text
+                .mlp_layer_types
+                .iter()
+                .enumerate()
+                .filter_map(|(i, k)| {
+                    (*k == MlpKind::Sparse && scope.contains_layer(i)).then_some(i)
+                })
+                .map(u32::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            static_bytes,
+            lm_head_bytes,
+            largest_streamed_group_bytes,
+            kda_state_bytes,
+            dsa_cache_bytes_per_token,
+            maximum_dsa_cache_bytes: dsa_cache_bytes,
+            maximum_dsa_layer_cache_bytes: dsa_cache_bytes
+                .checked_div(
+                    text.sparse_attention_layers()
+                        .filter(|&n| scope.contains_layer(n))
+                        .count(),
+                )
+                .unwrap_or(0),
+            live_expert_bytes,
+            static_load_device_bytes,
+            expert_load_device_bytes,
+            prefill_workspace_bytes: prefill_workspace_bytes(text, prompt_tokens)?,
+            decode_workspace_bytes: prefill_workspace_bytes(text, 1)?,
+            host_route_workspace_bytes: u64::try_from(text.index_topk)?
+                .checked_mul(sparse_count as u64)
+                .and_then(|n| {
+                    n.checked_mul(
+                        128_u64
+                            .checked_add(32_u64.checked_mul(text.num_experts_per_tok as u64)?)?,
+                    )
+                })
+                .context("GLM host routing workspace overflow")?,
+            prefill_host_mask_bytes: host_mask_bytes(prompt_tokens, cpu)?,
+            host_sampling_workspace_bytes: if scope.owns_head() {
+                u64::try_from(text.vocab_size)?
+                    .checked_mul(24)
+                    .context("GLM sampling workspace overflow")?
+            } else {
+                0
+            },
+            static_load_host_bytes,
+            streamed_load_host_bytes: static_load_host_bytes.max(expert_load_host_bytes),
+            expert_load_host_bytes,
+            raw_inventory,
+        })
+    }
+
+    /// Two persistent slots, each holding the largest raw FP8/scale pair.
+    /// The same logical ceiling is charged independently to host and device.
+    pub fn enable_pinned_transfer(&mut self) -> Result<()> {
+        ensure!(
+            !self.compute_on_host && !self.cpu_fp8_dequantization,
+            "pinned FP8 staging requires CUDA conversion"
+        );
+        self.pinned_transfer_bytes = self
+            .static_load_device_bytes
+            .max(self.expert_load_device_bytes)
+            .checked_mul(2)
+            .context("FP8 staging capacity overflow")?;
+        Ok(())
+    }
+
+    pub fn phases(
+        &self,
+        resident_static: bool,
+        expert_cache_bytes: usize,
+        cache_policy: CachePolicy,
+    ) -> Result<Vec<ResourcePhaseEstimate>> {
+        let raw = estimate_cache_residency(
+            &self.raw_inventory,
+            WeightSource::Mmap,
+            cache_policy,
+            CacheLoadLifetimes {
+                additional_storage_bytes: if cache_policy.granularity
+                    == ff_core::weights::CacheGranularity::Tensor
+                {
+                    self.raw_inventory
+                        .shards
+                        .iter()
+                        .map(|s| s.header_bytes)
+                        .max()
+                        .unwrap_or(0)
+                } else {
+                    0
+                },
+                ..CacheLoadLifetimes::SERIAL
+            },
+        )?
+        .peak_storage_bytes;
+        let weights = if resident_static {
+            self.static_bytes
+        } else {
+            self.lm_head_bytes
+                .checked_add(self.largest_streamed_group_bytes)
+                .context("GLM streamed weight residency overflow")?
+        };
+        let state = self
+            .kda_state_bytes
+            .checked_add(self.maximum_dsa_cache_bytes)
+            .context("GLM state bytes overflow")?;
+        let decode_state = state
+            .checked_add(self.maximum_dsa_layer_cache_bytes)
+            .context("GLM KV growth bytes overflow")?;
+        let load_host = if resident_static {
+            self.expert_load_host_bytes
+        } else {
+            self.streamed_load_host_bytes
+        };
+        let load_device = if resident_static {
+            self.expert_load_device_bytes
+        } else {
+            self.static_load_device_bytes
+                .max(self.expert_load_device_bytes)
+        };
+        let runtime = |phase: &str, state, workspace| -> Result<ResourcePhaseEstimate> {
+            let host_workspace = self
+                .host_route_workspace_bytes
+                .checked_add(self.host_sampling_workspace_bytes)
+                .and_then(|n| {
+                    n.checked_add(if phase == "prefill" {
+                        self.prefill_host_mask_bytes
+                    } else {
+                        0
+                    })
+                })
+                .and_then(|n| n.checked_add(load_host))
+                .context("GLM host workspace overflow")?;
+            let compute = [weights, state, self.live_expert_bytes, workspace]
+                .into_iter()
+                .try_fold(0_u64, |sum, v| {
+                    sum.checked_add(u64::try_from(v)?)
+                        .context("GLM phase compute bytes overflow")
+                })?;
+            if self.compute_on_host {
+                Ok(ResourcePhaseEstimate {
+                    phase: phase.into(),
+                    required_host_bytes: compute
+                        .checked_add(host_workspace)
+                        .and_then(|v| v.checked_add(GLM_ADMISSION_SAFETY_BYTES))
+                        .context("GLM CPU phase bytes overflow")?,
+                    optional_host_bytes: raw
+                        .checked_add(u64::try_from(expert_cache_bytes)?)
+                        .context("GLM CPU retention bytes overflow")?,
+                    host_promotion_reserve_bytes: 0,
+                    required_device_bytes: None,
+                    optional_device_bytes: None,
+                    device_reserve_bytes: 0,
+                })
+            } else {
+                Ok(ResourcePhaseEstimate {
+                    phase: phase.into(),
+                    required_host_bytes: host_workspace,
+                    optional_host_bytes: raw,
+                    host_promotion_reserve_bytes: 0,
+                    required_device_bytes: Some(
+                        compute
+                            .checked_add(load_device)
+                            .context("GLM device staging peak overflow")?,
+                    ),
+                    optional_device_bytes: Some(u64::try_from(expert_cache_bytes)?),
+                    device_reserve_bytes: GLM_ADMISSION_SAFETY_BYTES,
+                })
+            }
+        };
+        let mut phases = vec![
+            runtime("prefill", state, self.prefill_workspace_bytes)?,
+            runtime("decode", decode_state, self.decode_workspace_bytes)?,
+        ];
+        if resident_static {
+            phases.insert(
+                0,
+                if self.compute_on_host {
+                    ResourcePhaseEstimate {
+                        phase: "static_initialization".into(),
+                        required_host_bytes: u64::try_from(self.static_bytes)?
+                            .checked_add(self.static_load_host_bytes)
+                            .and_then(|v| v.checked_add(GLM_ADMISSION_SAFETY_BYTES))
+                            .context("GLM CPU initialization overflow")?,
+                        optional_host_bytes: raw,
+                        host_promotion_reserve_bytes: 0,
+                        required_device_bytes: None,
+                        optional_device_bytes: None,
+                        device_reserve_bytes: 0,
+                    }
+                } else {
+                    ResourcePhaseEstimate {
+                        phase: "static_initialization".into(),
+                        required_host_bytes: self.static_load_host_bytes,
+                        optional_host_bytes: raw,
+                        host_promotion_reserve_bytes: 0,
+                        required_device_bytes: Some(
+                            u64::try_from(self.static_bytes)?
+                                .checked_add(self.static_load_device_bytes)
+                                .context("GLM static GPU staging peak overflow")?,
+                        ),
+                        optional_device_bytes: Some(0),
+                        device_reserve_bytes: GLM_ADMISSION_SAFETY_BYTES,
+                    }
+                },
+            );
+        }
+        for phase in &mut phases {
+            phase.required_host_bytes = phase
+                .required_host_bytes
+                .checked_add(self.pinned_transfer_bytes)
+                .context("pinned host staging peak overflow")?;
+            if let Some(bytes) = &mut phase.required_device_bytes {
+                *bytes = bytes
+                    .checked_add(self.pinned_transfer_bytes)
+                    .context("pinned device staging peak overflow")?;
+            }
+        }
+        Ok(phases)
+    }
+
+    /// Remaining CUDA capacity after the caller's complete phase peaks. Rank
+    /// callers include their transfer buffers in these phases before sizing.
+    pub fn automatic_expert_cache_bytes(
+        &self,
+        phases: &[ResourcePhaseEstimate],
+        snapshot: &ResourceSnapshot,
+    ) -> Result<usize> {
+        if self.compute_on_host || self.sparse_layers.is_empty() {
+            return Ok(0);
+        }
+        let Some(free) = snapshot.device_free_memory_bytes else {
+            return Ok(0);
+        };
+        let required = phases.iter().try_fold(0u64, |peak, phase| {
+            Ok::<_, anyhow::Error>(
+                peak.max(
+                    phase
+                        .required_device_bytes
+                        .unwrap_or(0)
+                        .checked_add(phase.device_reserve_bytes)
+                        .context("GLM automatic cache reserve overflow")?,
+                ),
+            )
+        })?;
+        let available = free.saturating_sub(required).saturating_sub(1 << 30);
+        let available = available / (1 << 20) * (1 << 20);
+        let all_experts = (self.live_expert_bytes as u64 / 5)
+            .checked_mul(3)
+            .and_then(|n| n.checked_mul(self.num_experts as u64))
+            .and_then(|n| n.checked_mul(self.sparse_layers.len() as u64))
+            .context("GLM expert working set overflow")?;
+        usize::try_from(available.min(all_experts)).context("GLM cache bound exceeds usize")
+    }
+
+    pub fn validate_capacity(
+        &self,
+        resident_static: bool,
+        expert_cache_bytes: usize,
+        cache_policy: CachePolicy,
+        snapshot: &ResourceSnapshot,
+    ) -> Result<()> {
+        let host = host_available(snapshot)
+            .context("cannot measure free host memory for GLM admission")?;
+        for phase in self.phases(resident_static, expert_cache_bytes, cache_policy)? {
+            let required = phase.host_peak_bytes()?;
+            ensure!(
+                required <= host,
+                "GLM {} needs {required} free host bytes, but only {host} are available",
+                phase.phase
+            );
+            if let Some(required) = phase.device_peak_bytes()? {
+                let free = snapshot
+                    .device_free_memory_bytes
+                    .context("cannot measure free CUDA memory for GLM admission")?;
+                ensure!(
+                    required <= free,
+                    "GLM {} needs {required} free CUDA bytes, but only {free} are available",
+                    phase.phase
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn host_mask_bytes(tokens: usize, cpu: bool) -> Result<u64> {
+    if cpu {
+        return Ok(0);
+    }
+    u64::try_from(tokens)?
+        .checked_mul(u64::try_from(tokens)?)
+        .context("GLM host mask size overflow")
+}
+
+pub fn host_available(snapshot: &ResourceSnapshot) -> Option<u64> {
+    [
+        snapshot.host_memory_available_bytes,
+        snapshot.cgroup_v2_memory_available_bytes,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+/// CPU: extra bytes beyond the final F32 compute tensor already charged in
+/// its live group. CUDA: compact raw upload staging, with no CPU dequantization.
+fn load_host_transient_bytes(
+    metadata: &TensorMetadata,
+    scale: Option<&TensorMetadata>,
+    cpu: bool,
+    cpu_fp8_dequantization: bool,
+) -> Result<u64> {
+    let elements = metadata.shape.iter().try_fold(1_u64, |n, &d| {
+        n.checked_mul(u64::try_from(d)?)
+            .context("GLM tensor element overflow")
+    })?;
+    match metadata.dtype.as_str() {
+        "F8_E4M3" => {
+            let scale = scale.context("GLM FP8 admission requires inverse scale metadata")?;
+            ensure!(
+                metadata.shape.len() == 2
+                    && scale.dtype == "F32"
+                    && scale.shape
+                        == [
+                            metadata.shape[0].div_ceil(128),
+                            metadata.shape[1].div_ceil(128)
+                        ],
+                "GLM admission FP8 scale shape/dtype mismatch"
+            );
+            if !cpu_fp8_dequantization {
+                return elements
+                    .checked_add(u64::try_from(scale.bytes)?)
+                    .context("GLM compact upload staging overflow");
+            }
+            let aligned = metadata.shape.iter().all(|d| d.is_multiple_of(128));
+            let per_element = (if cpu { 5 } else { 11 }) + if aligned { 0 } else { 8 };
+            let index_bytes = if aligned {
+                0
+            } else {
+                u64::try_from(metadata.shape[0])?
+                    .checked_add(u64::try_from(metadata.shape[1])?)
+                    .and_then(|n| n.checked_mul(4))
+                    .context("GLM scale indices overflow")?
+            };
+            elements
+                .checked_mul(per_element)
+                .and_then(|n| n.checked_add(scale.bytes as u64))
+                .and_then(|n| n.checked_add(index_bytes))
+                .context("GLM dequant staging overflow")
+        }
+        "BF16" => {
+            if cpu {
+                elements
+                    .checked_mul(2)
+                    .context("GLM BF16 source copy overflow")
+            } else {
+                Ok(0)
+            }
+        }
+        "F32" => Ok(0),
+        other => bail!("unsupported GLM admission tensor dtype {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::GlmConfig, test_support::tiny_checkpoint};
+    use ff_core::probe::{CgroupMemoryLimit, ResourceMeasurementScopes};
+
+    #[test]
+    fn layer_scopes_partition_static_weights_state_and_global_endpoints() {
+        for layers in 1usize..=65 {
+            for ranks in 1..=layers {
+                let scopes = (0..ranks)
+                    .map(|rank| GlmLayerScope::for_rank(layers, rank, ranks).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(scopes[0].start, 0);
+                assert_eq!(scopes.last().unwrap().end, layers);
+                assert!(scopes.windows(2).all(|p| p[0].end == p[1].start));
+                assert!(scopes.iter().all(|s| s.start < s.end));
+            }
+        }
+        assert!(GlmLayerScope::for_rank(2, 0, 3).is_err());
+        let root = tiny_checkpoint();
+        crate::test_support::quantize_tiny_linears(root.path());
+        let w = ModelWeights::open(root.path(), WeightSource::Mmap, CachePolicy::new(1)).unwrap();
+        let c = GlmConfig::from_model_dir(root.path()).unwrap();
+        let whole = GlmAdmissionBreakdown::from_metadata(&w, &c.text_config, false, 3).unwrap();
+        let parts = (0..2)
+            .map(|rank| {
+                GlmAdmissionBreakdown::from_metadata_for_scope(
+                    &w,
+                    &c.text_config,
+                    false,
+                    3,
+                    false,
+                    GlmLayerScope::for_rank(2, rank, 2).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parts.iter().map(|p| p.static_bytes).sum::<usize>(),
+            whole.static_bytes
+        );
+        assert_eq!(
+            parts.iter().map(|p| p.kda_state_bytes).sum::<usize>(),
+            whole.kda_state_bytes
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .map(|p| p.maximum_dsa_cache_bytes)
+                .sum::<usize>(),
+            whole.maximum_dsa_cache_bytes
+        );
+        assert_eq!(parts[0].lm_head_bytes, 0);
+        assert_eq!(parts[1].lm_head_bytes, whole.lm_head_bytes);
+        assert_eq!(parts[0].host_sampling_workspace_bytes, 0);
+        assert_eq!(
+            parts[1].host_sampling_workspace_bytes,
+            whole.host_sampling_workspace_bytes
+        );
+        assert!(parts[0].sparse_layers.is_empty());
+        assert_eq!(parts[0].live_expert_bytes, 0);
+        assert_eq!(parts[1].sparse_layers, whole.sparse_layers);
+        let selected = |p: &GlmAdmissionBreakdown| {
+            p.raw_inventory
+                .shards
+                .iter()
+                .map(|s| s.selected_tensor_bytes)
+                .sum::<u64>()
+        };
+        assert_eq!(parts.iter().map(selected).sum::<u64>(), selected(&whole));
+        assert_eq!(w.access_stats().device_tensor_materializations, 0);
+    }
+
+    fn snapshot(host: u64, cgroup: u64, device: Option<u64>) -> ResourceSnapshot {
+        ResourceSnapshot {
+            schema_version: 1,
+            measured_at_unix_ms: 1,
+            host_memory_available_bytes: Some(host),
+            cgroup_v2_memory_limit: Some(CgroupMemoryLimit::Bytes(cgroup)),
+            cgroup_v2_memory_current_bytes: Some(0),
+            cgroup_v2_memory_available_bytes: Some(cgroup),
+            device_free_memory_bytes: device,
+            measurement_scope: ResourceMeasurementScopes {
+                host_memory: None,
+                cgroup_memory: None,
+                device_memory: None,
+            },
+        }
+    }
+
+    #[test]
+    fn metadata_phase_model_includes_static_ranges_and_preserves_empty_payload_cache() {
+        let root = tiny_checkpoint();
+        crate::test_support::quantize_tiny_linears(root.path());
+        let weights =
+            ModelWeights::open(root.path(), WeightSource::Mmap, CachePolicy::new(1)).unwrap();
+        let config = GlmConfig::from_model_dir(root.path()).unwrap();
+        let cpu =
+            GlmAdmissionBreakdown::from_metadata(&weights, &config.text_config, true, 2).unwrap();
+        let gpu =
+            GlmAdmissionBreakdown::from_metadata(&weights, &config.text_config, false, 2).unwrap();
+        let cpu_conversion = GlmAdmissionBreakdown::from_metadata_with_fp8(
+            &weights,
+            &config.text_config,
+            false,
+            2,
+            true,
+        )
+        .unwrap();
+        assert_eq!(gpu.static_bytes, cpu_conversion.static_bytes);
+        assert_eq!(gpu.live_expert_bytes, cpu_conversion.live_expert_bytes);
+        assert!(gpu.expert_load_device_bytes > 0);
+        assert_eq!(cpu_conversion.expert_load_device_bytes, 0);
+        assert_eq!(cpu_conversion.static_load_device_bytes, 0);
+        assert!(cpu_conversion.expert_load_host_bytes > gpu.expert_load_host_bytes);
+        assert!(cpu.static_bytes > gpu.static_bytes);
+        let head = weights.metadata("lm_head.weight").unwrap();
+        assert!(
+            gpu.raw_inventory
+                .largest_unit_bytes(ff_core::weights::CacheGranularity::Tensor)
+                >= head.bytes as u64
+        );
+        let stats = weights.cache_stats();
+        assert_eq!((stats.hits, stats.misses, stats.resident_bytes), (0, 0, 0));
+        let phases = gpu.phases(true, 10, CachePolicy::new(1)).unwrap();
+        assert_eq!(
+            phases[0].required_device_bytes,
+            Some(gpu.static_bytes as u64 + gpu.static_load_device_bytes)
+        );
+        let fallback_phases = cpu_conversion
+            .phases(true, 10, CachePolicy::new(1))
+            .unwrap();
+        assert_eq!(
+            phases[1].required_device_bytes.unwrap(),
+            fallback_phases[1].required_device_bytes.unwrap() + gpu.expert_load_device_bytes
+        );
+        assert_eq!(
+            phases.iter().map(|p| p.phase.as_str()).collect::<Vec<_>>(),
+            ["static_initialization", "prefill", "decode"]
+        );
+        for phase in &phases {
+            assert_eq!(phase.device_reserve_bytes, GLM_ADMISSION_SAFETY_BYTES);
+            assert!(phase.device_peak_bytes().unwrap().unwrap() >= GLM_ADMISSION_SAFETY_BYTES);
+        }
+        for phase in cpu.phases(true, 10, CachePolicy::new(1)).unwrap() {
+            assert_eq!(phase.device_peak_bytes().unwrap(), None);
+            assert!(phase.required_host_bytes >= GLM_ADMISSION_SAFETY_BYTES);
+        }
+        assert!(
+            cpu.validate_capacity(true, 0, CachePolicy::new(1), &snapshot(u64::MAX, 1, None))
+                .is_err()
+        );
+        cpu.validate_capacity(
+            true,
+            0,
+            CachePolicy::new(1),
+            &snapshot(u64::MAX, u64::MAX, None),
+        )
+        .unwrap();
+        assert!(
+            gpu.validate_capacity(
+                true,
+                0,
+                CachePolicy::new(1),
+                &snapshot(u64::MAX, u64::MAX, Some(1))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn large_static_fp8_staging_uses_actual_shape_and_cpu_output_is_not_charged_twice() {
+        let metadata = |shape: Vec<usize>, dtype: &str, bytes| TensorMetadata {
+            name: "static.weight".into(),
+            shard: "s.safetensors".into(),
+            dtype: dtype.into(),
+            shape,
+            bytes,
+        };
+        let static_weight = metadata(vec![4096, 16384], "F8_E4M3", 64 << 20);
+        let scale = metadata(vec![32, 128], "F32", 16 << 10);
+        assert_eq!(
+            load_host_transient_bytes(&static_weight, Some(&scale), false, false).unwrap(),
+            (64 << 20) + (16 << 10)
+        );
+        assert_eq!(
+            load_host_transient_bytes(&static_weight, Some(&scale), true, true).unwrap(),
+            (320 << 20) + (16 << 10)
+        );
+        let expert = metadata(vec![2048, 4096], "F8_E4M3", 8 << 20);
+        let expert_scale = metadata(vec![16, 32], "F32", 2048);
+        assert_eq!(
+            load_host_transient_bytes(&expert, Some(&expert_scale), false, false).unwrap(),
+            (8 << 20) + 2048
+        );
+        assert!(
+            load_host_transient_bytes(&static_weight, Some(&expert_scale), false, false).is_err()
+        );
+        assert!(load_host_transient_bytes(&static_weight, None, false, false).is_err());
+    }
+
+    #[test]
+    fn pinned_buffers_are_charged_to_both_tiers_in_every_phase() {
+        let root = crate::test_support::tiny_checkpoint();
+        crate::test_support::quantize_tiny_linears(root.path());
+        let weights =
+            ModelWeights::open(root.path(), WeightSource::Mmap, CachePolicy::new(1)).unwrap();
+        let config = GlmConfig::from_model_dir(root.path()).unwrap();
+        let mut breakdown = GlmAdmissionBreakdown::from_metadata_with_fp8(
+            &weights,
+            &config.text_config,
+            false,
+            3,
+            false,
+        )
+        .unwrap();
+        let before = breakdown.phases(true, 4096, CachePolicy::new(1)).unwrap();
+        breakdown.enable_pinned_transfer().unwrap();
+        let bytes = breakdown.pinned_transfer_bytes;
+        assert!(bytes > 0);
+        for (before, after) in before
+            .iter()
+            .zip(breakdown.phases(true, 4096, CachePolicy::new(1)).unwrap())
+        {
+            assert_eq!(
+                after.host_peak_bytes().unwrap(),
+                before.host_peak_bytes().unwrap() + bytes
+            );
+            assert_eq!(
+                after.device_peak_bytes().unwrap().unwrap(),
+                before.device_peak_bytes().unwrap().unwrap() + bytes
+            );
+        }
+        assert_eq!(weights.access_stats().device_tensor_materializations, 0);
+        breakdown.compute_on_host = true;
+        assert!(breakdown.enable_pinned_transfer().is_err());
+    }
+
+    #[test]
+    fn selected_residency_and_tensor_cache_execute_the_same_tokens() {
+        let root = tiny_checkpoint();
+        let baseline =
+            crate::StreamedGlm::open(root.path(), crate::test_support::tiny_options()).unwrap();
+        let mut prepared =
+            crate::StreamedGlm::prepare(root.path(), crate::test_support::tiny_options()).unwrap();
+        let mut policy = prepared.execution_policy().clone();
+        policy.resident_static = true;
+        policy.weights.granularity = ff_core::weights::CacheGranularity::Tensor;
+        policy.weights.cache_bytes = Some(4096);
+        policy.weights.cache_shards = usize::MAX as u64;
+        prepared.select_execution_policy(&policy).unwrap();
+        assert_eq!(prepared.cache_stats().misses, 0);
+        let observed = ResourceSnapshot::capture(Some(prepared.device()));
+        let selected = prepared.open(1, &observed).unwrap();
+        assert_eq!(*selected.execution_policy(), policy);
+        let options = crate::GlmGenerationOptions {
+            max_new_tokens: 2,
+            max_context_tokens: 8,
+            reasoning_effort: "low".into(),
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: 0,
+            progress: false,
+        };
+        let a = baseline.generate("hello", &options).unwrap();
+        let b = selected.generate("hello", &options).unwrap();
+        assert_eq!(a.generated_token_ids, b.generated_token_ids);
+        assert_eq!(a.text, b.text);
+        assert!(selected.resident_static_bytes() > 0);
+    }
+
+    #[test]
+    fn prepared_open_obeys_supplied_capacity_before_static_preload() {
+        let root = tiny_checkpoint();
+        let options = crate::test_support::tiny_options().with_resident_static(true);
+        let prepared = crate::StreamedGlm::prepare(root.path(), options).unwrap();
+        assert_eq!(prepared.cache_stats().resident_bytes, 0);
+        assert_eq!(prepared.access_stats().device_tensor_materializations, 0);
+        let small = prepared.estimate(1).unwrap();
+        let large = prepared.estimate(2).unwrap();
+        assert!(large.prefill_workspace_bytes >= small.prefill_workspace_bytes);
+        assert!(prepared.estimate(0).is_err());
+        let error = prepared
+            .open(2, &snapshot(u64::MAX, 0, None))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("free host bytes"));
+    }
+}

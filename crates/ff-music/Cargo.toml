@@ -1,0 +1,30 @@
+[package]
+name = "ff-music"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+cuda = ["ff-core/cuda", "candle-core/cuda", "candle-nn/cuda"]
+metal = ["ff-core/metal", "candle-core/metal", "candle-nn/metal"]
+
+[dependencies]
+ff-core = { path = "../ff-core" }
+anyhow.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokenizers.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+regex = "1.12"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

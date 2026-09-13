@@ -1,0 +1,6 @@
+/target
+/output/
+
+# Model checkpoints are hundreds of gigabytes. Keeping them outside this
+# working tree is safer still; these anchored rules are the backstop.
+/models/
