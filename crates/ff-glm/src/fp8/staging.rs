@@ -550,13 +550,18 @@ fn fill_pinned_from_checkpoint(
     }
     // Limit readers to roughly one per 2 MiB.
     let readers = pinned_fill_threads().min((count / (2 << 20)).max(1));
-    ff_core::storage::read_parallel_into(
+    // A shard that moved or failed to reopen leaves the retained mapping usable,
+    // so report it as unavailable rather than aborting the load.
+    if ff_core::storage::read_parallel_into(
         ff_core::storage::ParallelReadSource::Reopen(&path),
         base,
         &mut host.as_mut_slice()?[..count],
         readers,
     )
-    .with_context(|| format!("failed to fill FP8 weight {name} from {}", path.display()))?;
+    .is_err()
+    {
+        return Ok(None);
+    }
     Ok(Some(0))
 }
 

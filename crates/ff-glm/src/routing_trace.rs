@@ -111,6 +111,15 @@ impl RoutingTrace {
             self.schema_version,
             ROUTING_TRACE_SCHEMA_VERSION
         );
+        // Schema 3 promises gate weights aligned with `experts`; only the
+        // schema-2 compatibility path may omit them and the router parameters.
+        let requires_gate_weights = self.schema_version >= 3;
+        ensure!(
+            !requires_gate_weights
+                || (self.routed_scaling_factor.is_some() && self.norm_topk_prob.is_some()),
+            "routing-trace schema {} requires routed_scaling_factor and norm_topk_prob",
+            self.schema_version
+        );
         validate_routing_trace_domain(&self.domain)?;
         let hidden_layers = usize::try_from(self.num_hidden_layers)
             .context("routing-trace hidden-layer count exceeds usize")?;
@@ -242,6 +251,11 @@ impl RoutingTrace {
                 decision.experts.len() == top_k,
                 "routing decision {sequence} has {} experts; expected {top_k}",
                 decision.experts.len()
+            );
+            ensure!(
+                !requires_gate_weights || !decision.gate_weights.is_empty(),
+                "routing decision {sequence} has no gate weights; schema {} requires one per expert",
+                self.schema_version
             );
             if !decision.gate_weights.is_empty() {
                 ensure!(
@@ -2268,11 +2282,55 @@ mod tests {
                 .contains("0..=1e3")
         );
 
-        // Without router parameters, the sum cannot be validated.
+        // Schema 3 promises the router parameters that make the sum checkable.
         let mut trace = hand_trace(&[0, 0, 1, 0]);
+        trace.norm_topk_prob = None;
+        assert!(
+            trace
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("norm_topk_prob")
+        );
+
+        // A schema-2 trace may carry weights without them; the sum goes unchecked.
+        let mut trace = hand_trace(&[0, 0, 1, 0]);
+        trace.schema_version = 2;
         trace.norm_topk_prob = None;
         trace.decisions[0].gate_weights = vec![0.4];
         trace.validate().unwrap();
+    }
+
+    #[test]
+    fn schema_three_traces_require_gate_weights() {
+        let trace = hand_trace(&[0, 0, 1, 0]);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&trace.canonical_json().unwrap()).unwrap();
+        for decision in value["decisions"].as_array_mut().unwrap() {
+            decision.as_object_mut().unwrap().remove("gate_weights");
+        }
+        let error = RoutingTrace::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("no gate weights"));
+
+        let mut truncated = hand_trace(&[0, 0, 1, 0]);
+        truncated.decisions[2].gate_weights.clear();
+        assert!(
+            truncated
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("no gate weights")
+        );
+
+        let mut without_scaling = hand_trace(&[0, 0, 1, 0]);
+        without_scaling.routed_scaling_factor = None;
+        assert!(
+            without_scaling
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("routed_scaling_factor")
+        );
     }
 
     #[test]

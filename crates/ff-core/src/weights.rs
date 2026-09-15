@@ -1335,11 +1335,18 @@ impl ModelWeights {
             let metadata = self.raw_tensor_metadata(name)?;
             let dtype = produced_dtype(metadata.dtype, device)?;
             if metadata.bytes > 0 && cuda_allocation::supports(dtype) {
+                // Ordinary materialization keeps stream-pool allocations; only a
+                // `Direct` cache opts out, through `materialize_for_cache`.
                 return self.with_source(name, |view, source| {
-                    cuda_allocation::upload(view.data(), source, view.shape(), dtype, cuda)
-                        .with_context(|| {
-                            format!("failed to materialize tensor {name} on {device:?}")
-                        })
+                    cuda_allocation::upload(
+                        view.data(),
+                        source,
+                        view.shape(),
+                        dtype,
+                        cuda,
+                        CudaWeightAllocator::StreamPool,
+                    )
+                    .with_context(|| format!("failed to materialize tensor {name} on {device:?}"))
                 });
             }
         }
@@ -1379,7 +1386,14 @@ impl ModelWeights {
                     .can_retain(attached.store, name, device, metadata.bytes as u64)
             {
                 return self.with_source(name, |view, source| {
-                    cuda_allocation::upload(view.data(), source, view.shape(), dtype, cuda)
+                    cuda_allocation::upload(
+                        view.data(),
+                        source,
+                        view.shape(),
+                        dtype,
+                        cuda,
+                        CudaWeightAllocator::Direct,
+                    )
                 });
             }
         }

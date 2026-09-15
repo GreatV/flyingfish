@@ -80,8 +80,12 @@ pub struct GlmAdmissionBreakdown {
     pub scope: GlmLayerScope,
     pub compute_on_host: bool,
     pub cpu_fp8_dequantization: bool,
+    /// Device (and host) bytes held by every configured upload lane's slots.
     #[serde(default)]
     pub pinned_transfer_bytes: u64,
+    /// Host-only pinned bytes held by the fill-ahead ring.
+    #[serde(default)]
+    pub pinned_fill_ahead_bytes: u64,
     pub prompt_tokens: usize,
     pub num_hidden_layers: u32,
     pub num_experts: u32,
@@ -363,6 +367,7 @@ impl GlmAdmissionBreakdown {
             compute_on_host: cpu,
             cpu_fp8_dequantization,
             pinned_transfer_bytes: 0,
+            pinned_fill_ahead_bytes: 0,
             prompt_tokens,
             num_hidden_layers: u32::try_from(text.num_hidden_layers)?,
             num_experts: u32::try_from(text.n_routed_experts)?,
@@ -418,18 +423,30 @@ impl GlmAdmissionBreakdown {
         })
     }
 
-    /// Reserve two persistent slots using the largest device staging requirement.
-    /// The same logical ceiling is charged independently to host and device.
-    pub fn enable_pinned_transfer(&mut self) -> Result<()> {
+    /// Reserve two persistent slots per upload lane using the largest device
+    /// staging requirement, and `fill_ring_depth` host-only fill-ahead buffers
+    /// of the same ceiling. The lane reservation is charged independently to
+    /// host and device; the fill-ahead ring is pinned host memory only.
+    ///
+    /// Both counts come from the runtime configuration (`FF_GLM_LOAD_LANES`,
+    /// `FF_GLM_FILL_AHEAD`), so admission bounds what inference will allocate.
+    pub fn enable_pinned_transfer(&mut self, lanes: usize, fill_ring_depth: usize) -> Result<()> {
         ensure!(
             !self.compute_on_host && !self.cpu_fp8_dequantization,
             "pinned FP8 staging requires CUDA conversion"
         );
-        self.pinned_transfer_bytes = self
+        let slot_bytes = self
             .static_load_device_bytes
-            .max(self.expert_load_device_bytes)
-            .checked_mul(2)
+            .max(self.expert_load_device_bytes);
+        self.pinned_transfer_bytes = u64::try_from(lanes.max(1))
+            .ok()
+            .and_then(|lanes| lanes.checked_mul(2))
+            .and_then(|slots| slot_bytes.checked_mul(slots))
             .context("FP8 staging capacity overflow")?;
+        self.pinned_fill_ahead_bytes = u64::try_from(fill_ring_depth)
+            .ok()
+            .and_then(|depth| slot_bytes.checked_mul(depth))
+            .context("FP8 fill-ahead capacity overflow")?;
         Ok(())
     }
 
@@ -576,6 +593,7 @@ impl GlmAdmissionBreakdown {
             phase.required_host_bytes = phase
                 .required_host_bytes
                 .checked_add(self.pinned_transfer_bytes)
+                .and_then(|bytes| bytes.checked_add(self.pinned_fill_ahead_bytes))
                 .context("pinned host staging peak overflow")?;
             if let Some(bytes) = &mut phase.required_device_bytes {
                 *bytes = bytes
@@ -998,9 +1016,10 @@ mod tests {
         )
         .unwrap();
         let before = breakdown.phases(true, 4096, CachePolicy::new(1)).unwrap();
-        breakdown.enable_pinned_transfer().unwrap();
+        breakdown.enable_pinned_transfer(1, 0).unwrap();
         let bytes = breakdown.pinned_transfer_bytes;
         assert!(bytes > 0);
+        assert_eq!(breakdown.pinned_fill_ahead_bytes, 0);
         for (before, after) in before
             .iter()
             .zip(breakdown.phases(true, 4096, CachePolicy::new(1)).unwrap())
@@ -1014,9 +1033,28 @@ mod tests {
                 before.device_peak_bytes().unwrap().unwrap() + bytes
             );
         }
+        // Every configured lane holds its own slot pair; the fill-ahead ring is
+        // pinned host memory alone.
+        breakdown.enable_pinned_transfer(3, 4).unwrap();
+        let ring = bytes / 2 * 4;
+        assert_eq!(breakdown.pinned_transfer_bytes, bytes * 3);
+        assert_eq!(breakdown.pinned_fill_ahead_bytes, ring);
+        for (before, after) in before
+            .iter()
+            .zip(breakdown.phases(true, 4096, CachePolicy::new(1)).unwrap())
+        {
+            assert_eq!(
+                after.host_peak_bytes().unwrap(),
+                before.host_peak_bytes().unwrap() + bytes * 3 + ring
+            );
+            assert_eq!(
+                after.device_peak_bytes().unwrap().unwrap(),
+                before.device_peak_bytes().unwrap().unwrap() + bytes * 3
+            );
+        }
         assert_eq!(weights.access_stats().device_tensor_materializations, 0);
         breakdown.compute_on_host = true;
-        assert!(breakdown.enable_pinned_transfer().is_err());
+        assert!(breakdown.enable_pinned_transfer(1, 0).is_err());
     }
 
     #[test]

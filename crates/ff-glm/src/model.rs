@@ -225,6 +225,25 @@ fn warm_checkpoint_pages(ranges: &[(std::path::PathBuf, u64, u64)], next: &Atomi
 #[cfg(not(unix))]
 fn warm_checkpoint_pages(_ranges: &[(std::path::PathBuf, u64, u64)], _next: &AtomicUsize) {}
 
+/// Pinned staging the runtime may allocate: upload lanes, each holding two
+/// slots, and the fill-ahead ring depth chosen in `expert_contributions`.
+/// Admission reserves both, so the configured knobs cannot outgrow it.
+#[cfg(feature = "cuda")]
+pub(crate) fn pinned_staging_shape() -> (usize, usize) {
+    let workers = fill_ahead_count();
+    let depth = if workers > 0 {
+        workers.saturating_mul(2).max(4)
+    } else {
+        0
+    };
+    (fp8::cuda::configured_lanes(), depth)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn pinned_staging_shape() -> (usize, usize) {
+    (1, 0)
+}
+
 /// Fill-ahead worker count (`FF_GLM_FILL_AHEAD`, default 0/off, maximum 8).
 #[cfg(feature = "cuda")]
 fn fill_ahead_count() -> usize {
@@ -645,7 +664,8 @@ impl StreamedGlm {
             model.execution_policy.cpu_fp8_dequantization,
         )?;
         if options.pinned_fp8_transfer {
-            breakdown.enable_pinned_transfer()?;
+            let (lanes, fill_ring_depth) = pinned_staging_shape();
+            breakdown.enable_pinned_transfer(lanes, fill_ring_depth)?;
         }
         Ok(PreparedGlm {
             model,
