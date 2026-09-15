@@ -133,7 +133,7 @@ fn windows_last_error() -> u32 {
 /// is the same call the standard library makes; the difference is that it must
 /// come from a handle rather than from an already-taken `Metadata`.
 #[cfg(windows)]
-pub(crate) fn windows_file_identity(file: &std::fs::File) -> Result<(u32, u64)> {
+pub(crate) fn windows_file_identity(file: &std::fs::File) -> anyhow::Result<(u32, u64)> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,

@@ -188,17 +188,13 @@ from the Candle project, redirected into this workspace through
 Copyright (c) 2023 Hugging Face. Licensed under MIT OR Apache-2.0; this
 workspace uses it under Apache-2.0, the same licence it carries here.
 
-The copy is unmodified except for one guard in `src/compatibility.cuh`. That
-file supplies `__hmax_nan` and `__hmin_nan` for targets below sm_80, which the
-toolkit used to declare only for sm_80 and later. CUDA 12.6 changed that:
-`cuda_fp16.hpp` now declares both for every architecture and selects the
-implementation internally, so the upstream block is a redefinition and any
-pre-Ampere build fails. The vendored copy adds `&& CUDA_VERSION < 12060` to
-that one `#if`, and includes `<cuda.h>` because the fp16/bf16/fp8 headers do
-not define `CUDA_VERSION` in a device-only compilation.
+Local changes:
+
+- `src/compatibility.cuh` guards the pre-Ampere `__hmax_nan` and `__hmin_nan` definitions with `CUDA_VERSION < 12060` and includes `<cuda.h>`. CUDA 12.6 and later already supply these intrinsics.
+- `build.rs` enables MSVC's conforming preprocessor for PTX and static CUDA kernel builds, as required by CUDA 13.3's CCCL headers.
 
 Compiled from a single path, so that nvcc's file-derived symbol prefixes and
-embedded `__FILE__` strings are held constant, all twelve kernels emit
+embedded `__FILE__` strings are held constant, the compatibility-header change made all twelve kernels emit
 byte-identical PTX at `compute_89` before and after the change. At
 `compute_75` the upstream copy compiles two of twelve and the vendored copy
 compiles twelve.
