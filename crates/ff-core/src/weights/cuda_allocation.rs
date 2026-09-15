@@ -52,39 +52,16 @@ fn fill_pinned_from_checkpoint(
     len: usize,
     stream: &Arc<CudaStream>,
 ) -> Option<candle_core::cuda_backend::cudarc::driver::PinnedHostSlice<u8>> {
-    use std::os::unix::fs::FileExt;
     let mut host = unsafe { stream.context().alloc_pinned::<u8>(len) }.ok()?;
-    let pointer = host.as_mut_ptr().ok()? as usize;
-    let file = file.try_clone().ok()?;
-    let file = &file;
     let readers = warm_threads().min(len.div_ceil(2 << 20).max(1));
-    let chunk = len.div_ceil(readers);
-    let ok = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for reader in 0..readers {
-            let start = reader * chunk;
-            if start >= len {
-                break;
-            }
-            let end = (start + chunk).min(len);
-            handles.push(scope.spawn(move || {
-                let mut cursor = start;
-                while cursor < end {
-                    let wanted = (end - cursor).min(4 << 20);
-                    let slice = unsafe {
-                        std::slice::from_raw_parts_mut((pointer + cursor) as *mut u8, wanted)
-                    };
-                    match file.read_at(slice, (offset + cursor) as u64) {
-                        Ok(0) | Err(_) => return false,
-                        Ok(read) => cursor += read,
-                    }
-                }
-                true
-            }));
-        }
-        handles.into_iter().all(|h| h.join().unwrap_or(false))
-    });
-    ok.then_some(host)
+    crate::storage::read_parallel_into(
+        crate::storage::ParallelReadSource::Shared(file),
+        offset as u64,
+        host.as_mut_slice().ok()?,
+        readers,
+    )
+    .ok()?;
+    Some(host)
 }
 
 #[cfg(unix)]

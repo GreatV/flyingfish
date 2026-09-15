@@ -94,7 +94,7 @@ pub(super) fn insert_hyper_map(tensors: &mut HashMap<String, Tensor>, prefix: &s
     let mix = (2 + 2) * 2;
     tensors.insert(
         format!("{prefix}.hc_{site}_fn"),
-        f32_zeros((mix, 2 * HIDDEN)),
+        f32_zeros((mix, 2 * HIDDEN)).to_dtype(DType::BF16).unwrap(),
     );
     tensors.insert(format!("{prefix}.hc_{site}_base"), f32_zeros(mix));
     tensors.insert(format!("{prefix}.hc_{site}_scale"), f32_ones(3));

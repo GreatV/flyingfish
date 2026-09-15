@@ -577,7 +577,6 @@ struct ShardCache {
 /// FF_WEIGHT_LOAD_THREADS sets the reader count (default 8).
 #[cfg(unix)]
 fn read_shard_parallel(path: &Path) -> Result<Box<[u8]>> {
-    use std::os::unix::fs::FileExt;
     let file = File::open(path)
         .with_context(|| format!("failed to open weight shard {}", path.display()))?;
     let len = usize::try_from(file.metadata()?.len()).context("weight shard size exceeds usize")?;
@@ -588,40 +587,13 @@ fn read_shard_parallel(path: &Path) -> Result<Box<[u8]>> {
         .unwrap_or(8usize)
         .max(1)
         .min(len.div_ceil(4 << 20).max(1));
-    let chunk = len.div_ceil(threads);
-    let base = bytes.as_mut_ptr() as usize;
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for reader in 0..threads {
-            let start = reader * chunk;
-            if start >= len {
-                break;
-            }
-            let end = (start + chunk).min(len);
-            let file = &file;
-            handles.push(scope.spawn(move || -> Result<()> {
-                let mut cursor = start;
-                while cursor < end {
-                    let wanted = (end - cursor).min(4 << 20);
-                    let slice = unsafe {
-                        std::slice::from_raw_parts_mut((base + cursor) as *mut u8, wanted)
-                    };
-                    let read = file.read_at(slice, cursor as u64).with_context(|| {
-                        format!("failed to read weight shard {}", path.display())
-                    })?;
-                    anyhow::ensure!(read > 0, "weight shard {} is truncated", path.display());
-                    cursor += read;
-                }
-                Ok(())
-            }));
-        }
-        for handle in handles {
-            handle
-                .join()
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("weight shard reader panicked")))?;
-        }
-        Ok::<_, anyhow::Error>(())
-    })?;
+    crate::storage::read_parallel_into(
+        crate::storage::ParallelReadSource::Shared(&file),
+        0,
+        &mut bytes,
+        threads,
+    )
+    .with_context(|| format!("failed to read weight shard {}", path.display()))?;
     Ok(bytes.into_boxed_slice())
 }
 

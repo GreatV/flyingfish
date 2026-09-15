@@ -533,7 +533,6 @@ fn fill_pinned_from_checkpoint(
     count: usize,
     host: &mut PinnedHostSlice<u8>,
 ) -> Result<Option<u32>> {
-    use std::os::unix::fs::FileExt;
     let metadata = match weights.raw_tensor_metadata(name) {
         Ok(metadata) => metadata,
         Err(_) => return Ok(None),
@@ -551,43 +550,13 @@ fn fill_pinned_from_checkpoint(
     }
     // Limit readers to roughly one per 2 MiB.
     let readers = pinned_fill_threads().min((count / (2 << 20)).max(1));
-    let pointer = host.as_mut_ptr()? as usize;
-    let chunk = count.div_ceil(readers);
-    let path = &path;
-    std::thread::scope(|scope| -> Result<()> {
-        let mut handles = Vec::new();
-        for reader in 0..readers {
-            let start = reader * chunk;
-            if start >= count {
-                break;
-            }
-            let end = (start + chunk).min(count);
-            handles.push(scope.spawn(move || -> Result<()> {
-                // Open a separate file per reader to keep kernel readahead windows independent.
-                let file = std::fs::File::open(path).with_context(|| {
-                    format!("failed to open FP8 checkpoint shard {}", path.display())
-                })?;
-                let mut offset = start;
-                while offset < end {
-                    let destination = (pointer + offset) as *mut u8;
-                    let wanted = (end - offset).min(4 << 20);
-                    let slice = unsafe { std::slice::from_raw_parts_mut(destination, wanted) };
-                    let read = file
-                        .read_at(slice, base + offset as u64)
-                        .context("positional read into pinned FP8 buffer failed")?;
-                    ensure!(read > 0, "checkpoint shard ended mid-tensor");
-                    offset += read;
-                }
-                Ok(())
-            }));
-        }
-        for handle in handles {
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("pinned FP8 fill reader panicked"))??;
-        }
-        Ok(())
-    })?;
+    ff_core::storage::read_parallel_into(
+        ff_core::storage::ParallelReadSource::Reopen(&path),
+        base,
+        &mut host.as_mut_slice()?[..count],
+        readers,
+    )
+    .with_context(|| format!("failed to fill FP8 weight {name} from {}", path.display()))?;
     Ok(Some(0))
 }
 

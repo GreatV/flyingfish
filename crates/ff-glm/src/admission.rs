@@ -3,7 +3,7 @@ use crate::{
     config::{GlmTextConfig, MlpKind},
     execution_policy::GLM_ADMISSION_SAFETY_BYTES,
     model::{
-        LM_HEAD_WEIGHT, prefill::prefill_workspace_bytes, static_weight_specs,
+        LM_HEAD_WEIGHT, is_mhc_constant, prefill::prefill_workspace_bytes, static_weight_specs,
         streamed_static_weight_groups,
     },
 };
@@ -174,7 +174,7 @@ impl GlmAdmissionBreakdown {
                         .checked_mul(dimension)
                         .context("GLM tensor element count overflow")
                 })?;
-            let bytes_per_element = if cpu {
+            let bytes_per_element = if cpu || is_mhc_constant(name) {
                 DType::F32.size_in_bytes()
             } else if *linear_weight && metadata.dtype == "F8_E4M3" {
                 compute_dtype.size_in_bytes()
@@ -337,10 +337,10 @@ impl GlmAdmissionBreakdown {
         }
         let mut static_load_device_bytes = 0;
         let mut expert_load_device_bytes = 0;
-        if !cpu_fp8_dequantization {
+        if !cpu {
             for name in &names {
                 let metadata = weights.metadata(name)?;
-                if metadata.dtype == "F8_E4M3" {
+                if !cpu_fp8_dequantization && metadata.dtype == "F8_E4M3" {
                     let scale = weights.metadata(&format!("{name}_scale_inv"))?;
                     let bytes = u64::try_from(metadata.bytes)?
                         .checked_add(u64::try_from(scale.bytes)?)
@@ -350,6 +350,10 @@ impl GlmAdmissionBreakdown {
                     } else {
                         static_load_device_bytes = static_load_device_bytes.max(bytes);
                     }
+                } else if is_mhc_constant(name) && metadata.dtype == "BF16" {
+                    // The raw tensor remains live while its F32 replacement is allocated.
+                    static_load_device_bytes =
+                        static_load_device_bytes.max(u64::try_from(metadata.bytes)?);
                 }
             }
         }
@@ -414,7 +418,7 @@ impl GlmAdmissionBreakdown {
         })
     }
 
-    /// Two persistent slots, each holding the largest raw FP8/scale pair.
+    /// Reserve two persistent slots using the largest device staging requirement.
     /// The same logical ceiling is charged independently to host and device.
     pub fn enable_pinned_transfer(&mut self) -> Result<()> {
         ensure!(
@@ -733,6 +737,52 @@ mod tests {
     use ff_core::probe::{CgroupMemoryLimit, ResourceMeasurementScopes};
 
     #[test]
+    fn mhc_promotion_counts_residency_and_conversion_peaks() -> Result<()> {
+        let root = tiny_checkpoint();
+        let config = GlmConfig::from_model_dir(root.path())?;
+        let estimate = || -> Result<GlmAdmissionBreakdown> {
+            let weights = ModelWeights::open(root.path(), WeightSource::Mmap, CachePolicy::new(1))?;
+            GlmAdmissionBreakdown::from_metadata(&weights, &config.text_config, false, 2)
+        };
+        let bf16 = estimate()?;
+        let path = root.path().join("model.safetensors");
+        let mut tensors = candle_core::safetensors::load(&path, &candle_core::Device::Cpu)?;
+        let mut raw_peak = 0;
+        for (name, tensor) in &mut tensors {
+            if is_mhc_constant(name) && tensor.dtype() == DType::BF16 {
+                raw_peak = raw_peak.max((tensor.elem_count() * 2) as u64);
+                *tensor = tensor.to_dtype(DType::F32)?;
+            }
+        }
+        candle_core::safetensors::save(&tensors, path)?;
+        let f32 = estimate()?;
+        assert!(raw_peak > 0);
+        assert_eq!(bf16.static_bytes, f32.static_bytes);
+        assert_eq!(
+            bf16.largest_streamed_group_bytes,
+            f32.largest_streamed_group_bytes
+        );
+        assert_eq!(bf16.static_load_device_bytes, raw_peak);
+        assert_eq!(f32.static_load_device_bytes, 0);
+        for resident in [false, true] {
+            let before = bf16.phases(resident, 0, CachePolicy::new(1))?;
+            let after = f32.phases(resident, 0, CachePolicy::new(1))?;
+            for (before, after) in before.iter().zip(&after) {
+                let transient = if !resident || before.phase == "static_initialization" {
+                    raw_peak
+                } else {
+                    0
+                };
+                assert_eq!(
+                    before.required_device_bytes.unwrap(),
+                    after.required_device_bytes.unwrap() + transient
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn layer_scopes_partition_static_weights_state_and_global_endpoints() {
         for layers in 1usize..=65 {
             for ranks in 1..=layers {
@@ -840,7 +890,11 @@ mod tests {
         assert_eq!(gpu.live_expert_bytes, cpu_conversion.live_expert_bytes);
         assert!(gpu.expert_load_device_bytes > 0);
         assert_eq!(cpu_conversion.expert_load_device_bytes, 0);
-        assert_eq!(cpu_conversion.static_load_device_bytes, 0);
+        let raw_mhc_bytes = weights
+            .metadata("model.language_model.layers.0.hc_attn_fn")
+            .unwrap()
+            .bytes as u64;
+        assert_eq!(cpu_conversion.static_load_device_bytes, raw_mhc_bytes);
         assert!(cpu_conversion.expert_load_host_bytes > gpu.expert_load_host_bytes);
         assert!(cpu.static_bytes > gpu.static_bytes);
         let head = weights.metadata("lm_head.weight").unwrap();

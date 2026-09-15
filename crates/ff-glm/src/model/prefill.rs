@@ -522,6 +522,84 @@ pub(crate) fn prefill_workspace_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        HIDDEN, patterned_bf16, tiny_checkpoint, tiny_checkpoint_with_kda_width,
+    };
+    use candle_core::safetensors;
+
+    fn check_mhc_residency(device: Device) -> Result<()> {
+        let checkpoint = if device.is_cuda() {
+            tiny_checkpoint_with_kda_width(128)
+        } else {
+            tiny_checkpoint()
+        };
+        let path = checkpoint.path().join("model.safetensors");
+        let mut tensors = safetensors::load(&path, &Device::Cpu)?;
+        for (name, tensor) in &mut tensors {
+            if is_mhc_constant(name) && name.ends_with("_fn") {
+                *tensor = patterned_bf16(tensor.shape().clone(), 7);
+            }
+        }
+        safetensors::save(&tensors, path)?;
+        let open = |resident| {
+            StreamedGlm::open(
+                checkpoint.path(),
+                StreamedGlmOptions::new(WeightSource::Mmap, CachePolicy::new(1), device.clone())
+                    .with_resident_static(resident),
+            )
+        };
+        let resident = open(true)?;
+        let streamed = open(false)?;
+        let admitted = resident.admission_breakdown.as_ref().unwrap().static_bytes;
+        assert_eq!(resident.resident_static_bytes(), admitted);
+        for (name, tensor) in &resident.static_weights {
+            if is_mhc_constant(name) {
+                assert_eq!(tensor.dtype(), DType::F32, "{name}");
+            }
+        }
+        let streams = patterned_bf16((2, HIDDEN), 3)
+            .to_device(&device)?
+            .to_dtype(resident.compute_dtype)?;
+        let batch = Tensor::stack(&[&streams, &streams], 0)?;
+        let values = |(a, b, c): (Tensor, Tensor, Tensor)| -> Result<Vec<Vec<f32>>> {
+            [a, b, c]
+                .into_iter()
+                .map(|t| Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?))
+                .collect()
+        };
+        for layer in 0..resident.config.text_config.num_hidden_layers {
+            let prefix = format!("model.language_model.layers.{layer}");
+            for site in ["attn", "ffn"] {
+                for _ in 0..2 {
+                    assert_eq!(
+                        values(resident.hyper_map(&prefix, site, &streams)?)?,
+                        values(streamed.hyper_map(&prefix, site, &streams)?)?,
+                    );
+                    assert_eq!(
+                        values(resident.hyper_map_prefill(&prefix, site, &batch)?)?,
+                        values(streamed.hyper_map_prefill(&prefix, site, &batch)?)?,
+                    );
+                }
+            }
+        }
+        assert_eq!(resident.resident_static_bytes(), admitted);
+        assert_eq!(streamed.resident_static_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn mhc_residency_matches_admission_and_streamed_output() -> Result<()> {
+        check_mhc_residency(Device::Cpu)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn mhc_residency_matches_admission_and_streamed_output_cuda() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        check_mhc_residency(device)
+    }
 
     fn close(actual: &Tensor, expected: &Tensor) {
         assert_eq!(actual.dims(), expected.dims());

@@ -1,5 +1,10 @@
 //! The storage properties that bound weight streaming.
 
+#[cfg(unix)]
+mod parallel_read;
+#[cfg(unix)]
+pub use parallel_read::{ParallelReadSource, read_parallel_into};
+
 use std::{
     fs::File,
     path::{Path, PathBuf},

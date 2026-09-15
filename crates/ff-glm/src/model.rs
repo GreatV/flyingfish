@@ -41,6 +41,8 @@ const EMBEDDING_WEIGHT: &str = "model.language_model.embed_tokens.weight";
 const FINAL_NORM_WEIGHT: &str = "model.language_model.norm.weight";
 pub(crate) const LM_HEAD_WEIGHT: &str = "lm_head.weight";
 
+#[cfg(any(feature = "cuda", test))]
+mod fill_ahead;
 pub(crate) mod prefill;
 
 #[derive(Clone, Copy, Debug)]
@@ -334,8 +336,6 @@ pub struct StreamedGlm {
     host_expert_share: f64,
     static_weights: BTreeMap<String, Tensor>,
     expert_cache: ExpertCacheManager,
-    /// F32 mapping constants (weight, base, scale), cached by `hc_{site}` prefix.
-    mhc_consts: std::sync::Mutex<std::collections::HashMap<String, (Tensor, Tensor, Tensor)>>,
     execution_policy: GlmExecutionPolicy,
     admission: Option<GlmAdmissionModel>,
     admission_breakdown: Option<crate::admission::GlmAdmissionBreakdown>,
@@ -497,27 +497,6 @@ struct FillPipeline<'a> {
     workers: usize,
 }
 
-/// Abort and wake both condvars on drop so scoped threads can join after failure.
-/// The uploader stays armed; workers disarm on success to let pending fills finish.
-#[cfg(feature = "cuda")]
-struct FillAbortOnDrop<'a> {
-    abort: &'a std::sync::atomic::AtomicBool,
-    free_cv: &'a std::sync::Condvar,
-    ready_cv: &'a std::sync::Condvar,
-    armed: bool,
-}
-
-#[cfg(feature = "cuda")]
-impl Drop for FillAbortOnDrop<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
-            self.free_cv.notify_all();
-            self.ready_cv.notify_all();
-        }
-    }
-}
-
 impl StreamedGlm {
     pub fn open(model_dir: impl AsRef<Path>, options: StreamedGlmOptions) -> Result<Self> {
         let prepared = Self::prepare(model_dir, options)?;
@@ -651,7 +630,6 @@ impl StreamedGlm {
             tokenizer,
             static_weights: BTreeMap::new(),
             expert_cache,
-            mhc_consts: std::sync::Mutex::new(std::collections::HashMap::new()),
             execution_policy,
             admission: None,
             admission_breakdown: None,
@@ -1179,27 +1157,9 @@ impl StreamedGlm {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let text = &self.config.text_config;
         let key = format!("{prefix}.hc_{site}");
-        let (weight, base, scale) = {
-            let mut cache = self
-                .mhc_consts
-                .lock()
-                .expect("GLM mHC constants mutex poisoned");
-            match cache.get(&key) {
-                Some(consts) => consts.clone(),
-                None => {
-                    let consts = (
-                        self.load_tensor(&format!("{key}_fn"))?
-                            .to_dtype(DType::F32)?,
-                        self.load_tensor(&format!("{key}_base"))?
-                            .to_dtype(DType::F32)?,
-                        self.load_tensor(&format!("{key}_scale"))?
-                            .to_dtype(DType::F32)?,
-                    );
-                    cache.insert(key, consts.clone());
-                    consts
-                }
-            }
-        };
+        let weight = self.load_tensor(&format!("{key}_fn"))?;
+        let base = self.load_tensor(&format!("{key}_base"))?;
+        let scale = self.load_tensor(&format!("{key}_scale"))?;
         math::mhc_map(
             streams,
             &weight,
@@ -1571,19 +1531,9 @@ impl StreamedGlm {
             }
         }
         #[cfg(feature = "cuda")]
-        let next_fill = AtomicUsize::new(0);
-        #[cfg(feature = "cuda")]
-        let free_buffers = std::sync::Mutex::new(Vec::<usize>::new());
-        #[cfg(feature = "cuda")]
-        let free_cv = std::sync::Condvar::new();
-        #[cfg(feature = "cuda")]
-        let ready_fills: std::sync::Mutex<
-            std::collections::HashMap<usize, Result<(usize, fp8::staging::FillMeta)>>,
-        > = std::sync::Mutex::new(std::collections::HashMap::new());
-        #[cfg(feature = "cuda")]
-        let ready_cv = std::sync::Condvar::new();
-        #[cfg(feature = "cuda")]
-        let abort = std::sync::atomic::AtomicBool::new(false);
+        let fill_queue = fill_pipeline
+            .as_ref()
+            .map(|pipeline| fill_ahead::FillQueue::new(pipeline.ring.len(), pipeline.names.len()));
         std::thread::scope(|scope| -> Result<()> {
             let warmers = expert_prefetch_threads().min(prefetch_ranges.len());
             for _ in 0..warmers {
@@ -1643,98 +1593,39 @@ impl StreamedGlm {
                     workers,
                 }) = &fill_pipeline
                 {
-                    *free_buffers
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("GLM fill-ahead free lock poisoned"))? =
-                        (0..ring.len()).collect();
-                    // Wake waiting workers on every uploader exit so the scope can join.
-                    let _uploader_guard = FillAbortOnDrop {
-                        abort: &abort,
-                        free_cv: &free_cv,
-                        ready_cv: &ready_cv,
-                        armed: true,
-                    };
+                    let queue = fill_queue.as_ref().expect("fill pipeline queue");
+                    let _uploader_guard = queue.guard();
+                    let mut fill_workers = Vec::with_capacity(*workers);
                     for _ in 0..*workers {
-                        let next_fill = &next_fill;
-                        let free_buffers = &free_buffers;
-                        let free_cv = &free_cv;
-                        let ready_fills = &ready_fills;
-                        let ready_cv = &ready_cv;
-                        let abort = &abort;
-                        scope.spawn(move || -> Result<()> {
-                            let mut worker_guard = FillAbortOnDrop {
-                                abort,
-                                free_cv,
-                                ready_cv,
-                                armed: true,
-                            };
-                            let result = (|| -> Result<()> {
-                                loop {
-                                    if abort.load(std::sync::atomic::Ordering::Relaxed) {
-                                        return Ok(());
-                                    }
-                                    // Claim a buffer before an ordinal: otherwise later fills can occupy all
-                                    // buffers while the ordered consumer waits for a worker without one.
-                                    // Extra ring capacity keeps workers busy during out-of-order completion.
-                                    let buffer_index = {
-                                        let mut free = free_buffers.lock().map_err(|_| {
-                                            anyhow::anyhow!("GLM fill-ahead free lock poisoned")
-                                        })?;
-                                        loop {
-                                            if abort.load(std::sync::atomic::Ordering::Relaxed) {
-                                                return Ok(());
-                                            }
-                                            if let Some(index) = free.pop() {
-                                                break index;
-                                            }
-                                            free = free_cv.wait(free).map_err(|_| {
-                                                anyhow::anyhow!("GLM fill-ahead free lock poisoned")
-                                            })?;
-                                        }
-                                    };
-                                    let ordinal = next_fill
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if ordinal >= fill_names.len() {
-                                        free_buffers
-                                            .lock()
-                                            .map_err(|_| {
-                                                anyhow::anyhow!("GLM fill-ahead free lock poisoned")
-                                            })?
-                                            .push(buffer_index);
-                                        free_cv.notify_one();
-                                        return Ok(());
-                                    }
+                        fill_workers.push(scope.spawn(move || {
+                            queue.run_worker(|| {
+                                while let Some((ordinal, buffer_index)) = queue.claim()? {
+                                    let name = fill_names[ordinal];
                                     let mut buffer =
                                         ring.buffer(buffer_index).lock().map_err(|_| {
                                             anyhow::anyhow!("GLM fill-ahead buffer lock poisoned")
                                         })?;
                                     if let Some(event) = buffer.event.take() {
-                                        // Wait for H2D completion before refill; enqueue no GPU work.
-                                        event.synchronize()?;
+                                        // Wait for H2D completion before reusing the host buffer.
+                                        event.synchronize().with_context(|| {
+                                            format!("failed to reuse FP8 buffer for {name}")
+                                        })?;
                                     }
-                                    let scale_name = format!("{}_scale_inv", fill_names[ordinal]);
-                                    let filled = fp8::staging::fill_prepared(
+                                    let scale_name = format!("{name}_scale_inv");
+                                    let meta = fp8::staging::fill_prepared(
                                         weights,
-                                        fill_names[ordinal],
+                                        name,
                                         &scale_name,
                                         self.compute_dtype,
                                         &mut buffer,
                                     )
-                                    .map(|meta| (buffer_index, meta));
+                                    .with_context(|| format!("failed to fill FP8 weight {name}"))?;
                                     drop(buffer);
-                                    ready_fills
-                                        .lock()
-                                        .map_err(|_| {
-                                            anyhow::anyhow!("GLM fill-ahead ready lock poisoned")
-                                        })?
-                                        .insert(ordinal, filled);
-                                    ready_cv.notify_all();
+                                    queue.publish(ordinal, (buffer_index, meta))?;
                                 }
-                            })();
-                            // Keep the guard armed on failure; normal exits must not abort pending fills.
-                            worker_guard.armed = result.is_err();
-                            result
-                        });
+                                Ok(())
+                            })
+                        }));
                     }
                     let mut ordinal = 0usize;
                     let mut take = |cached: &Option<Tensor>, name: &str| -> Result<Tensor> {
@@ -1743,29 +1634,7 @@ impl StreamedGlm {
                         }
                         let mine = ordinal;
                         ordinal += 1;
-                        let (buffer_index, meta) = {
-                            let mut ready = ready_fills.lock().map_err(|_| {
-                                anyhow::anyhow!("GLM fill-ahead ready lock poisoned")
-                            })?;
-                            loop {
-                                if let Some(filled) = ready.remove(&mine) {
-                                    break filled;
-                                }
-                                if abort.load(std::sync::atomic::Ordering::Relaxed) {
-                                    bail!("GLM fill-ahead aborted before miss {mine}");
-                                }
-                                // Fail on a missing fill so the scope can join.
-                                let (guard, timeout) = ready_cv
-                                    .wait_timeout(ready, std::time::Duration::from_secs(60))
-                                    .map_err(|_| {
-                                        anyhow::anyhow!("GLM fill-ahead ready lock poisoned")
-                                    })?;
-                                ready = guard;
-                                if timeout.timed_out() {
-                                    bail!("GLM fill-ahead timed out 60s waiting for miss {mine}");
-                                }
-                            }
-                        }?;
+                        let (buffer_index, meta) = queue.take(mine)?;
                         let tensor = {
                             let mut buffer = ring.buffer(buffer_index).lock().map_err(|_| {
                                 anyhow::anyhow!("GLM fill-ahead buffer lock poisoned")
@@ -1780,11 +1649,7 @@ impl StreamedGlm {
                             buffer.event = Some(drained);
                             tensor
                         };
-                        free_buffers
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("GLM fill-ahead free lock poisoned"))?
-                            .push(buffer_index);
-                        free_cv.notify_one();
+                        queue.release(buffer_index)?;
                         cache.insert(name.to_owned(), tensor.clone());
                         Ok(tensor)
                     };
@@ -1805,7 +1670,7 @@ impl StreamedGlm {
                         }
                         Ok(())
                     })();
-                    walk?;
+                    queue.finish(walk, fill_workers)?;
                     true
                 } else {
                     false
@@ -2153,9 +2018,15 @@ impl StreamedGlm {
         if let Some(tensor) = self.static_weights.get(name) {
             return Ok(tensor.clone());
         }
-        self.weights
+        let tensor = self
+            .weights
             .load(name, &self.device)
-            .with_context(|| format!("failed to load GLM tensor {name}"))
+            .with_context(|| format!("failed to load GLM tensor {name}"))?;
+        if is_mhc_constant(name) {
+            Ok(tensor.to_dtype(DType::F32)?)
+        } else {
+            Ok(tensor)
+        }
     }
 
     fn load_linear_weight(&self, name: &str) -> Result<Tensor> {
@@ -2483,6 +2354,20 @@ fn plan_cache_readmission(
         realized_before_bytes,
         decision,
     })
+}
+
+pub(crate) fn is_mhc_constant(name: &str) -> bool {
+    matches!(
+        name.rsplit('.').next(),
+        Some(
+            "hc_attn_fn"
+                | "hc_attn_base"
+                | "hc_attn_scale"
+                | "hc_ffn_fn"
+                | "hc_ffn_base"
+                | "hc_ffn_scale"
+        )
+    )
 }
 
 pub(crate) fn static_weight_specs(text: &super::config::GlmTextConfig) -> Vec<(String, bool)> {
@@ -3118,6 +3003,61 @@ mod tests {
     use candle_core::Device;
     use candle_core::Tensor;
     use candle_core::safetensors;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pinned_fp8_generation_matches_cuda_reference() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let checkpoint = tiny_checkpoint_with_kda_width(128);
+        quantize_tiny_linears(checkpoint.path());
+        let open = |pinned| {
+            StreamedGlm::open(
+                checkpoint.path(),
+                StreamedGlmOptions::new(WeightSource::Mmap, CachePolicy::new(1), device.clone())
+                    .with_resident_static(true)
+                    .with_pinned_fp8_transfer(pinned),
+            )
+        };
+        let baseline = open(false)?;
+        let pinned = open(true)?;
+        let mut reference_state =
+            DecoderState::new(&baseline.config, baseline.compute_dtype, &device)?;
+        let mut pinned_state = DecoderState::new(&pinned.config, pinned.compute_dtype, &device)?;
+        for token in [4, 5, 6] {
+            let reference = baseline.forward_token(
+                token,
+                &mut reference_state,
+                RoutingTracePhase::Decode,
+                &mut None,
+            )?;
+            let actual = pinned.forward_token(
+                token,
+                &mut pinned_state,
+                RoutingTracePhase::Decode,
+                &mut None,
+            )?;
+            assert_eq!(
+                actual.to_dtype(DType::F32)?.to_vec1::<f32>()?,
+                reference.to_dtype(DType::F32)?.to_vec1::<f32>()?
+            );
+        }
+        let options = GlmGenerationOptions {
+            max_new_tokens: 3,
+            max_context_tokens: 8,
+            reasoning_effort: "low".into(),
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: 7,
+            progress: false,
+        };
+        let expected = baseline.generate("hello", &options)?;
+        for _ in 0..2 {
+            let actual = pinned.generate("hello", &options)?;
+            assert_eq!(actual.generated_token_ids, expected.generated_token_ids);
+            assert_eq!(actual.text, expected.text);
+        }
+        Ok(())
+    }
 
     #[test]
     fn generates_tokens_through_tiny_cpu_kda_mla_dense_moe_checkpoint() {
