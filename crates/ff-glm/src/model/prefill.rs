@@ -4,9 +4,11 @@
 use super::*;
 use candle_core::IndexOp;
 
+type TokenRoutes = Vec<(Vec<u32>, Vec<f32>)>;
+
 pub(super) struct PrefillLayerOutput {
     pub(super) streams: Tensor,
-    routes: Option<Vec<Vec<u32>>>,
+    routes: Option<TokenRoutes>,
 }
 
 impl StreamedGlm {
@@ -113,7 +115,14 @@ impl StreamedGlm {
         if let Some(trace) = routing_trace.as_mut() {
             for token in 0..tokens.len() {
                 for (layer, selected) in &routes {
-                    trace.record(token, RoutingTracePhase::Prefill, *layer, &selected[token])?;
+                    let (experts, gate_weights) = &selected[token];
+                    trace.record(
+                        token,
+                        RoutingTracePhase::Prefill,
+                        *layer,
+                        experts,
+                        gate_weights,
+                    )?;
                 }
             }
         }
@@ -371,7 +380,7 @@ impl StreamedGlm {
         layer: usize,
         prefix: &str,
         input: &Tensor,
-    ) -> Result<(Tensor, Vec<Vec<u32>>)> {
+    ) -> Result<(Tensor, TokenRoutes)> {
         let text = &self.config.text_config;
         let routed = math::topk_router(
             input,
@@ -430,7 +439,7 @@ impl StreamedGlm {
         }
         Ok((
             output.add(&self.mlp_prefill(&format!("{prefix}.shared_experts"), input)?)?,
-            selected,
+            selected.into_iter().zip(mixtures).collect(),
         ))
     }
 }

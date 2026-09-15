@@ -1386,7 +1386,7 @@ impl StreamedGlm {
             .next()
             .context("GLM router returned no mixture-weight row")?;
         if let Some(trace) = routing_trace.as_mut() {
-            trace.record(token_index, trace_phase, layer, &indices)?;
+            trace.record(token_index, trace_phase, layer, &indices, &weights)?;
         }
         let mut selected = indices.into_iter().zip(weights).collect::<Vec<_>>();
         selected.sort_unstable_by_key(|(expert, _)| *expert);
@@ -2138,6 +2138,8 @@ impl StreamedGlm {
         RoutingTraceBuilder::new(
             domain,
             cache_entry_dtype,
+            text.routed_scaling_factor,
+            text.norm_topk_prob,
             text.num_hidden_layers,
             text.n_routed_experts,
             text.num_experts_per_tok,
