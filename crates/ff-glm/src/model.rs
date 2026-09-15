@@ -24,6 +24,7 @@ use std::{
     cmp::Ordering,
     collections::BTreeMap,
     path::Path,
+    sync::atomic::AtomicUsize,
     time::{Duration, Instant},
 };
 use tokenizers::Tokenizer;
@@ -106,13 +107,8 @@ pub struct StreamedGlmOptions {
     pub expert_cache_min_bytes: usize,
     pub adaptive_expert_cache: bool,
     pub cpu_fp8_dequantization: bool,
-    /// Fraction of each routed miss set to evaluate on the host instead of
-    /// moving it to the device. Only a measurement of this machine justifies a
-    /// value here; see `flyingfish::host_profile`.
-    ///
-    /// Private because `with_host_expert_share` is what makes it a share: it
-    /// quantises to the per-mille the execution policy records. Reached
-    /// directly, the field could hold a value no run could describe.
+    /// Host share, measured by `flyingfish::host_profile`.
+    /// Set through `with_host_expert_share` to match the policy's per-mille precision.
     host_expert_share: f64,
     pub pinned_fp8_transfer: bool,
     /// Emit static-residency preload progress on stderr. Off by default so the
@@ -120,18 +116,8 @@ pub struct StreamedGlmOptions {
     pub progress: bool,
 }
 
-/// Evaluate one expert on the host from the checkpoint's quantized bytes.
-///
-/// The ordinary path dequantizes each projection into a tensor and multiplies
-/// by it, which is right when the tensor will be reused -- the expert cache
-/// exists for exactly that. It is wrong for an expert that will be read once:
-/// a 25 MiB expert becomes about 175 MiB of traffic to be used and dropped.
-/// This never builds the matrix, so it moves the quantized bytes and no more.
-///
-/// A free function rather than a method because it runs on a worker thread
-/// beside the device path, and so may borrow only what is shared safely: the
-/// weights and the input. Everything it returns is on the CPU; the transfer
-/// back to the device belongs to the thread that owns the device.
+/// Evaluate an expert from quantized weights without materializing its matrices.
+/// Worker threads return CPU tensors; the caller transfers them to the device.
 fn host_expert_contribution(
     weights: &ModelWeights,
     swiglu_limit: f64,
@@ -176,18 +162,78 @@ fn host_projection(
     )
 }
 
-/// The share as the execution policy is able to write it down: whole per-mille.
-///
-/// The policy records per-mille, so a share between two of them cannot be
-/// recorded. Every path quantises through here before executing on a share, so
-/// the recorded number determines the split: otherwise 0.2499 and 0.2501 both
-/// record 250 and still place a different number of experts on the host, and
-/// the record stops describing the run it came from.
+/// Quantize the host share to the policy's per-mille precision so replay uses
+/// the same split as execution.
 fn host_expert_share_per_mille(share: f64) -> u32 {
     if !share.is_finite() || share <= 0.0 {
         return 0;
     }
     (share.min(1.0) * 1000.0).round() as u32
+}
+
+/// Page-warming readers (`FF_GLM_PREFETCH_THREADS`, default 4).
+fn expert_prefetch_threads() -> usize {
+    std::env::var("FF_GLM_PREFETCH_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4)
+}
+
+/// Host expert workers (`FF_GLM_HOST_THREADS`, default 4).
+fn host_evaluation_threads() -> usize {
+    std::env::var("FF_GLM_HOST_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4)
+}
+
+/// Read checkpoint ranges into the page cache. Failures leave demand reads unchanged.
+#[cfg(unix)]
+fn warm_checkpoint_pages(ranges: &[(std::path::PathBuf, u64, u64)], next: &AtomicUsize) {
+    use std::os::unix::fs::FileExt;
+    let mut files: std::collections::HashMap<&Path, std::fs::File> =
+        std::collections::HashMap::new();
+    let mut buffer = vec![0u8; 2 << 20];
+    loop {
+        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some((path, offset, len)) = ranges.get(index) else {
+            return;
+        };
+        let file = match files.entry(path.as_path()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let Ok(opened) = std::fs::File::open(path) else {
+                    continue;
+                };
+                entry.insert(opened)
+            }
+        };
+        let mut position = *offset;
+        let end = offset.saturating_add(*len);
+        while position < end {
+            let count = buffer.len().min((end - position) as usize);
+            match file.read_at(&mut buffer[..count], position) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => position += read as u64,
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warm_checkpoint_pages(_ranges: &[(std::path::PathBuf, u64, u64)], _next: &AtomicUsize) {}
+
+/// Fill-ahead worker count (`FF_GLM_FILL_AHEAD`, default 0/off, maximum 8).
+#[cfg(feature = "cuda")]
+fn fill_ahead_count() -> usize {
+    static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        std::env::var("FF_GLM_FILL_AHEAD")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+            .clamp(0, 8)
+    })
 }
 
 /// Shared by the model and by `StreamedGlmOptions`, so the rule can be checked
@@ -440,6 +486,36 @@ impl PreparedGlm {
     }
 }
 
+#[cfg(feature = "cuda")]
+struct FillPipeline<'a> {
+    pool: &'a fp8::cuda::WeightPool,
+    device: &'a candle_core::CudaDevice,
+    ring: std::sync::Arc<fp8::staging::FillRing>,
+    names: Vec<&'a str>,
+    workers: usize,
+}
+
+/// Abort and wake both condvars on drop so scoped threads can join after failure.
+/// The uploader stays armed; workers disarm on success to let pending fills finish.
+#[cfg(feature = "cuda")]
+struct FillAbortOnDrop<'a> {
+    abort: &'a std::sync::atomic::AtomicBool,
+    free_cv: &'a std::sync::Condvar,
+    ready_cv: &'a std::sync::Condvar,
+    armed: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for FillAbortOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.free_cv.notify_all();
+            self.ready_cv.notify_all();
+        }
+    }
+}
+
 impl StreamedGlm {
     pub fn open(model_dir: impl AsRef<Path>, options: StreamedGlmOptions) -> Result<Self> {
         let prepared = Self::prepare(model_dir, options)?;
@@ -551,8 +627,13 @@ impl StreamedGlm {
             execution_policy.cpu_fp8_dequantization = true;
         }
         execution_policy.pinned_fp8_transfer = options.pinned_fp8_transfer;
+        // Resolve FF_GLM_HOST_SHARE (per-mille) here so the policy records the actual split.
+        let host_share_override = std::env::var("FF_GLM_HOST_SHARE")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|per_mille| f64::from(per_mille.min(1000)) / 1000.0);
         execution_policy.host_expert_share_per_mille =
-            host_expert_share_per_mille(options.host_expert_share);
+            host_expert_share_per_mille(host_share_override.unwrap_or(options.host_expert_share));
         execution_policy.validate()?;
         let model = Self {
             weights,
@@ -563,7 +644,7 @@ impl StreamedGlm {
             } else {
                 DType::BF16
             },
-            host_expert_share: options.host_expert_share,
+            host_expert_share: host_share_override.unwrap_or(options.host_expert_share),
             device: options.device,
             tokenizer,
             static_weights: BTreeMap::new(),
@@ -1038,7 +1119,8 @@ impl StreamedGlm {
             .mean(0)?
             .to_dtype(self.compute_dtype)?;
         let norm_weight = self.load_tensor(FINAL_NORM_WEIGHT)?;
-        math::rms_norm(&collapsed, Some(&norm_weight), text.rms_norm_eps)
+        let normed = math::rms_norm(&collapsed, Some(&norm_weight), text.rms_norm_eps)?;
+        Ok(normed)
     }
 
     fn forward_layer(
@@ -1331,6 +1413,61 @@ impl StreamedGlm {
             }
         }
 
+        // Warm pages for host experts and buffered device loads. O_DIRECT bypasses
+        // the page cache, so warming direct device loads would duplicate disk reads.
+        #[cfg(feature = "cuda")]
+        let skip_device_warm = fp8::staging::direct_fill_active();
+        #[cfg(not(feature = "cuda"))]
+        let skip_device_warm = false;
+        let mut prefetch_names: Vec<&str> = Vec::new();
+        let mut device_iter = device_work.iter().filter(|expert| !expert.is_complete());
+        let mut host_iter = host_work.iter();
+        loop {
+            let mut pushed = false;
+            if !skip_device_warm && let Some(expert) = device_iter.next() {
+                if expert.gate.is_none() {
+                    prefetch_names.push(&expert.gate_name);
+                }
+                if expert.up.is_none() {
+                    prefetch_names.push(&expert.up_name);
+                }
+                if expert.down.is_none() {
+                    prefetch_names.push(&expert.down_name);
+                }
+                pushed = true;
+            }
+            if let Some((_, expert_prefix, _)) = host_iter.next() {
+                prefetch_names.push(expert_prefix);
+                pushed = true;
+            }
+            if !pushed {
+                break;
+            }
+        }
+        let mut prefetch_ranges: Vec<(std::path::PathBuf, u64, u64)> = Vec::new();
+        for name in prefetch_names {
+            // Host prefixes expand to three projections; include scales for every projection.
+            let projections = if name.ends_with(".weight") {
+                vec![name.to_owned()]
+            } else {
+                ["gate_proj", "up_proj", "down_proj"]
+                    .iter()
+                    .map(|projection| format!("{name}.{projection}.weight"))
+                    .collect()
+            };
+            for projection in projections {
+                for key in [projection.clone(), format!("{projection}_scale_inv")] {
+                    if let Ok(metadata) = self.weights.raw_tensor_metadata(&key) {
+                        prefetch_ranges.push((
+                            self.weights.root().join(&metadata.shard),
+                            metadata.file_offset as u64,
+                            metadata.bytes as u64,
+                        ));
+                    }
+                }
+            }
+        }
+
         // The host input is captured once, on this thread, because reading it
         // off the device is a device operation like any other.
         let host_input = host_work
@@ -1347,42 +1484,401 @@ impl StreamedGlm {
         let mut contributions = Vec::with_capacity(device_work.len() + host_work.len());
         let weights = &self.weights;
         let swiglu_limit = self.config.text_config.swiglu_limit;
+        let next_range = AtomicUsize::new(0);
+        let next_host = AtomicUsize::new(0);
+        let next_device = AtomicUsize::new(0);
+        // Serialize matvecs because cuBLAS handles are not thread-safe; loads stay parallel.
+        let matvec_lock = std::sync::Mutex::new(());
+        // Fill workers write pinned buffers; the main thread uploads and evaluates in
+        // routing order. Shared state lives outside the scope closure to outlive worker joins.
+        let device_lanes = self.device_lanes().min(device_work.len().max(1));
+        #[cfg(feature = "cuda")]
+        let mut fill_pipeline: Option<FillPipeline<'_>> = None;
+        #[cfg(feature = "cuda")]
+        if device_lanes <= 1 && self.fill_ahead_workers() > 0 {
+            let mut fill_names: Vec<&str> = Vec::new();
+            for expert in &device_work {
+                if expert.gate.is_none() {
+                    fill_names.push(expert.gate_name.as_str());
+                }
+                if expert.up.is_none() {
+                    fill_names.push(expert.up_name.as_str());
+                }
+                if expert.down.is_none() {
+                    fill_names.push(expert.down_name.as_str());
+                }
+            }
+            let mut block_fp8_only = !fill_names.is_empty();
+            let mut max_bytes = 0usize;
+            let mut max_scales = 0usize;
+            for name in &fill_names {
+                match self.weights.metadata(name) {
+                    Ok(metadata) if metadata.dtype == "F8_E4M3" => {}
+                    _ => {
+                        block_fp8_only = false;
+                        break;
+                    }
+                }
+                if let Ok(raw) = self.weights.raw_tensor_metadata(name) {
+                    max_bytes = max_bytes.max(raw.bytes);
+                }
+                if let Ok(raw) = self
+                    .weights
+                    .raw_tensor_metadata(&format!("{name}_scale_inv"))
+                {
+                    max_scales = max_scales.max(raw.bytes / 4);
+                }
+            }
+            let workers = self.fill_ahead_workers().min(fill_names.len());
+            if workers > 0 && block_fp8_only && max_bytes > 0 {
+                self.ensure_weight_pool()?;
+                if let (Some(pool), Device::Cuda(device)) = (
+                    self.weight_pool.get().and_then(Option::as_ref),
+                    &self.device,
+                ) {
+                    let ring =
+                        pool.fill_ring(workers.saturating_mul(2).max(4), max_bytes, max_scales)?;
+                    fill_pipeline = Some(FillPipeline {
+                        pool,
+                        device,
+                        ring,
+                        names: fill_names,
+                        workers,
+                    });
+                }
+            }
+        }
+        #[cfg(feature = "cuda")]
+        let next_fill = AtomicUsize::new(0);
+        #[cfg(feature = "cuda")]
+        let free_buffers = std::sync::Mutex::new(Vec::<usize>::new());
+        #[cfg(feature = "cuda")]
+        let free_cv = std::sync::Condvar::new();
+        #[cfg(feature = "cuda")]
+        let ready_fills: std::sync::Mutex<
+            std::collections::HashMap<usize, Result<(usize, fp8::staging::FillMeta)>>,
+        > = std::sync::Mutex::new(std::collections::HashMap::new());
+        #[cfg(feature = "cuda")]
+        let ready_cv = std::sync::Condvar::new();
+        #[cfg(feature = "cuda")]
+        let abort = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| -> Result<()> {
+            let warmers = expert_prefetch_threads().min(prefetch_ranges.len());
+            for _ in 0..warmers {
+                let ranges = &prefetch_ranges;
+                let next = &next_range;
+                scope.spawn(move || warm_checkpoint_pages(ranges, next));
+            }
             // The whole point of the split: the host evaluates its share while
             // this thread is inside the device path, not before or after it.
             // Serially the host branch can only ever add its own time, which is
             // what the first version of this measured.
-            let worker = host_input.as_ref().map(|input| {
-                scope.spawn(move || {
-                    host_work
-                        .iter()
-                        .map(|(expert, expert_prefix, mixture)| {
-                            Ok((
-                                *expert,
-                                host_expert_contribution(
-                                    weights,
-                                    swiglu_limit,
-                                    expert_prefix,
-                                    input,
-                                    *mixture,
-                                )?,
-                            ))
+            let host_queue = &host_work;
+            let host_next = &next_host;
+            let workers: Vec<_> = match host_input.as_ref() {
+                Some(input) => {
+                    let threads = host_evaluation_threads().max(1).min(host_queue.len());
+                    (0..threads)
+                        .map(|_| {
+                            scope.spawn(move || {
+                                let mut evaluated = Vec::new();
+                                loop {
+                                    let index = host_next
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let Some((expert, expert_prefix, mixture)) =
+                                        host_queue.get(index)
+                                    else {
+                                        break;
+                                    };
+                                    evaluated.push((
+                                        *expert,
+                                        host_expert_contribution(
+                                            weights,
+                                            swiglu_limit,
+                                            expert_prefix,
+                                            input,
+                                            *mixture,
+                                        )?,
+                                    ));
+                                }
+                                Ok::<_, anyhow::Error>(evaluated)
+                            })
                         })
-                        .collect::<Result<Vec<_>>>()
-                })
-            });
+                        .collect()
+                }
+                None => Vec::new(),
+            };
 
-            for expert in device_work {
-                let gate = self.complete_cached_weight(cache, expert.gate_name, expert.gate)?;
-                let up = self.complete_cached_weight(cache, expert.up_name, expert.up)?;
-                let down = self.complete_cached_weight(cache, expert.down_name, expert.down)?;
-                contributions.push((
-                    expert.expert,
-                    self.mlp_with_weights(hidden, &gate, &up, &down, Some(expert.mixture as f64))?,
-                ));
+            // Each upload lane consumes a shared queue; a single lane runs inline.
+            // Consumers wait for lane dequantization before matvecs on the compute stream.
+            if device_lanes <= 1 {
+                #[cfg(feature = "cuda")]
+                let ran_pipeline = if let Some(FillPipeline {
+                    pool,
+                    device,
+                    ring,
+                    names: fill_names,
+                    workers,
+                }) = &fill_pipeline
+                {
+                    *free_buffers
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("GLM fill-ahead free lock poisoned"))? =
+                        (0..ring.len()).collect();
+                    // Wake waiting workers on every uploader exit so the scope can join.
+                    let _uploader_guard = FillAbortOnDrop {
+                        abort: &abort,
+                        free_cv: &free_cv,
+                        ready_cv: &ready_cv,
+                        armed: true,
+                    };
+                    for _ in 0..*workers {
+                        let next_fill = &next_fill;
+                        let free_buffers = &free_buffers;
+                        let free_cv = &free_cv;
+                        let ready_fills = &ready_fills;
+                        let ready_cv = &ready_cv;
+                        let abort = &abort;
+                        scope.spawn(move || -> Result<()> {
+                            let mut worker_guard = FillAbortOnDrop {
+                                abort,
+                                free_cv,
+                                ready_cv,
+                                armed: true,
+                            };
+                            let result = (|| -> Result<()> {
+                                loop {
+                                    if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                                        return Ok(());
+                                    }
+                                    // Claim a buffer before an ordinal: otherwise later fills can occupy all
+                                    // buffers while the ordered consumer waits for a worker without one.
+                                    // Extra ring capacity keeps workers busy during out-of-order completion.
+                                    let buffer_index = {
+                                        let mut free = free_buffers.lock().map_err(|_| {
+                                            anyhow::anyhow!("GLM fill-ahead free lock poisoned")
+                                        })?;
+                                        loop {
+                                            if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                                                return Ok(());
+                                            }
+                                            if let Some(index) = free.pop() {
+                                                break index;
+                                            }
+                                            free = free_cv.wait(free).map_err(|_| {
+                                                anyhow::anyhow!("GLM fill-ahead free lock poisoned")
+                                            })?;
+                                        }
+                                    };
+                                    let ordinal = next_fill
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if ordinal >= fill_names.len() {
+                                        free_buffers
+                                            .lock()
+                                            .map_err(|_| {
+                                                anyhow::anyhow!("GLM fill-ahead free lock poisoned")
+                                            })?
+                                            .push(buffer_index);
+                                        free_cv.notify_one();
+                                        return Ok(());
+                                    }
+                                    let mut buffer =
+                                        ring.buffer(buffer_index).lock().map_err(|_| {
+                                            anyhow::anyhow!("GLM fill-ahead buffer lock poisoned")
+                                        })?;
+                                    if let Some(event) = buffer.event.take() {
+                                        // Wait for H2D completion before refill; enqueue no GPU work.
+                                        event.synchronize()?;
+                                    }
+                                    let scale_name = format!("{}_scale_inv", fill_names[ordinal]);
+                                    let filled = fp8::staging::fill_prepared(
+                                        weights,
+                                        fill_names[ordinal],
+                                        &scale_name,
+                                        self.compute_dtype,
+                                        &mut buffer,
+                                    )
+                                    .map(|meta| (buffer_index, meta));
+                                    drop(buffer);
+                                    ready_fills
+                                        .lock()
+                                        .map_err(|_| {
+                                            anyhow::anyhow!("GLM fill-ahead ready lock poisoned")
+                                        })?
+                                        .insert(ordinal, filled);
+                                    ready_cv.notify_all();
+                                }
+                            })();
+                            // Keep the guard armed on failure; normal exits must not abort pending fills.
+                            worker_guard.armed = result.is_err();
+                            result
+                        });
+                    }
+                    let mut ordinal = 0usize;
+                    let mut take = |cached: &Option<Tensor>, name: &str| -> Result<Tensor> {
+                        if let Some(tensor) = cached {
+                            return Ok(tensor.clone());
+                        }
+                        let mine = ordinal;
+                        ordinal += 1;
+                        let (buffer_index, meta) = {
+                            let mut ready = ready_fills.lock().map_err(|_| {
+                                anyhow::anyhow!("GLM fill-ahead ready lock poisoned")
+                            })?;
+                            loop {
+                                if let Some(filled) = ready.remove(&mine) {
+                                    break filled;
+                                }
+                                if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                                    bail!("GLM fill-ahead aborted before miss {mine}");
+                                }
+                                // Fail on a missing fill so the scope can join.
+                                let (guard, timeout) = ready_cv
+                                    .wait_timeout(ready, std::time::Duration::from_secs(60))
+                                    .map_err(|_| {
+                                        anyhow::anyhow!("GLM fill-ahead ready lock poisoned")
+                                    })?;
+                                ready = guard;
+                                if timeout.timed_out() {
+                                    bail!("GLM fill-ahead timed out 60s waiting for miss {mine}");
+                                }
+                            }
+                        }?;
+                        let tensor = {
+                            let mut buffer = ring.buffer(buffer_index).lock().map_err(|_| {
+                                anyhow::anyhow!("GLM fill-ahead buffer lock poisoned")
+                            })?;
+                            let (tensor, drained) = pool.upload_prepared_on(
+                                0,
+                                device,
+                                self.compute_dtype,
+                                &mut buffer,
+                                &meta,
+                            )?;
+                            buffer.event = Some(drained);
+                            tensor
+                        };
+                        free_buffers
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("GLM fill-ahead free lock poisoned"))?
+                            .push(buffer_index);
+                        free_cv.notify_one();
+                        cache.insert(name.to_owned(), tensor.clone());
+                        Ok(tensor)
+                    };
+                    let walk = (|| -> Result<()> {
+                        for expert in &device_work {
+                            let gate = take(&expert.gate, &expert.gate_name)?;
+                            let up = take(&expert.up, &expert.up_name)?;
+                            let down = take(&expert.down, &expert.down_name)?;
+                            self.wait_lane_ready(0)?;
+                            let contribution = self.mlp_with_weights(
+                                hidden,
+                                &gate,
+                                &up,
+                                &down,
+                                Some(expert.mixture as f64),
+                            )?;
+                            contributions.push((expert.expert, contribution));
+                        }
+                        Ok(())
+                    })();
+                    walk?;
+                    true
+                } else {
+                    false
+                };
+                #[cfg(not(feature = "cuda"))]
+                let ran_pipeline = false;
+                if !ran_pipeline {
+                    for expert in &device_work {
+                        let gate = self.complete_cached_weight_on_lane(
+                            cache,
+                            &expert.gate_name,
+                            expert.gate.clone(),
+                            0,
+                        )?;
+                        let up = self.complete_cached_weight_on_lane(
+                            cache,
+                            &expert.up_name,
+                            expert.up.clone(),
+                            0,
+                        )?;
+                        let down = self.complete_cached_weight_on_lane(
+                            cache,
+                            &expert.down_name,
+                            expert.down.clone(),
+                            0,
+                        )?;
+                        self.wait_lane_ready(0)?;
+                        let contribution = self.mlp_with_weights(
+                            hidden,
+                            &gate,
+                            &up,
+                            &down,
+                            Some(expert.mixture as f64),
+                        )?;
+                        contributions.push((expert.expert, contribution));
+                    }
+                }
+            } else {
+                let device_queue = &device_work;
+                let next = &next_device;
+                let matvec = &matvec_lock;
+                let mut consumers = Vec::with_capacity(device_lanes);
+                for lane in 0..device_lanes {
+                    consumers.push(scope.spawn(move || -> Result<Vec<(u32, Tensor)>> {
+                        let mut evaluated = Vec::new();
+                        loop {
+                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(expert) = device_queue.get(index) else {
+                                break;
+                            };
+                            let gate = self.complete_cached_weight_on_lane(
+                                cache,
+                                &expert.gate_name,
+                                expert.gate.clone(),
+                                lane,
+                            )?;
+                            let up = self.complete_cached_weight_on_lane(
+                                cache,
+                                &expert.up_name,
+                                expert.up.clone(),
+                                lane,
+                            )?;
+                            let down = self.complete_cached_weight_on_lane(
+                                cache,
+                                &expert.down_name,
+                                expert.down.clone(),
+                                lane,
+                            )?;
+                            self.wait_lane_ready(lane)?;
+                            let contribution = {
+                                let _serial = matvec
+                                    .lock()
+                                    .map_err(|_| anyhow::anyhow!("GLM matvec lock poisoned"))?;
+                                self.mlp_with_weights(
+                                    hidden,
+                                    &gate,
+                                    &up,
+                                    &down,
+                                    Some(expert.mixture as f64),
+                                )?
+                            };
+                            evaluated.push((expert.expert, contribution));
+                        }
+                        Ok(evaluated)
+                    }));
+                }
+                for consumer in consumers {
+                    let evaluated = consumer
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("GLM device expert worker panicked"))??;
+                    contributions.extend(evaluated);
+                }
             }
 
-            if let Some(worker) = worker {
+            for worker in workers {
                 let evaluated = worker
                     .join()
                     .map_err(|_| anyhow::anyhow!("GLM host expert worker panicked"))??;
@@ -1477,17 +1973,8 @@ impl StreamedGlm {
         }
     }
 
-    /// How many of this routing decision's misses to evaluate on the host.
-    ///
-    /// The share comes from two rates measured on this machine: moving an
-    /// expert across the link against evaluating one here. Balancing the two
-    /// branches gives a host share of `1 - B_P/B_H`, which the caller resolves
-    /// and passes in; this only turns it into a count.
-    ///
-    /// One miss is always left to the device path. A routing decision that sent
-    /// every miss to the host would admit nothing to the expert cache, so the
-    /// next decision would face the same misses and the cache would never warm
-    /// -- which on this model is worth more than the split is.
+    /// Convert the configured host share to a miss count.
+    /// Leave at least one miss on the device so its expert cache can warm.
     fn host_expert_budget(&self, misses: usize) -> usize {
         host_expert_budget(self.host_expert_share, misses)
     }
@@ -1498,12 +1985,77 @@ impl StreamedGlm {
         name: String,
         cached: Option<Tensor>,
     ) -> Result<Tensor> {
+        self.complete_cached_weight_on_lane(cache, &name, cached, 0)
+    }
+
+    /// Use one consumer per upload lane, or a serial loop without a pinned pool.
+    fn device_lanes(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if self.execution_policy.pinned_fp8_transfer
+            && let Some(pool) = self.weight_pool.get().and_then(Option::as_ref)
+        {
+            return pool.lanes();
+        }
+        1
+    }
+
+    /// Fill-ahead worker count when pinned transfers and CUDA async allocation are enabled.
+    #[cfg(feature = "cuda")]
+    fn fill_ahead_workers(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if self.execution_policy.pinned_fp8_transfer
+            && let Device::Cuda(device) = &self.device
+            && device.cuda_stream().context().has_async_alloc()
+        {
+            return fill_ahead_count();
+        }
+        0
+    }
+
+    #[cfg(feature = "cuda")]
+    fn ensure_weight_pool(&self) -> Result<()> {
+        if self.weight_pool.get().is_none()
+            && let Device::Cuda(device) = &self.device
+        {
+            let pool = if device.cuda_stream().context().has_async_alloc() {
+                Some(fp8::cuda::WeightPool::new(device)?)
+            } else {
+                None
+            };
+            let _ = self.weight_pool.set(pool);
+        }
+        Ok(())
+    }
+
+    fn complete_cached_weight_on_lane(
+        &self,
+        cache: &ExpertCache,
+        name: &str,
+        cached: Option<Tensor>,
+        lane: usize,
+    ) -> Result<Tensor> {
         if let Some(tensor) = cached {
             return Ok(tensor);
         }
-        let tensor = self.load_linear_weight(&name)?;
-        cache.insert(name, tensor.clone());
+        let tensor = self.load_linear_weight_on_lane(name, lane)?;
+        cache.insert(name.to_owned(), tensor.clone());
         Ok(tensor)
+    }
+
+    /// Order lane dequantization before compute-stream reads; non-pinned loads
+    /// are already ordered.
+    fn wait_lane_ready(&self, _lane: usize) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if self.execution_policy.pinned_fp8_transfer
+            && let (Device::Cuda(device), Some(pool)) = (
+                &self.device,
+                self.weight_pool.get().and_then(Option::as_ref),
+            )
+            && let Some(event) = pool.lane_ready(_lane)?
+        {
+            device.cuda_stream().wait(&event)?;
+        }
+        Ok(())
     }
 
     fn new_routing_trace_builder(
@@ -1583,6 +2135,15 @@ impl StreamedGlm {
     }
 
     fn load_linear_weight(&self, name: &str) -> Result<Tensor> {
+        self.load_linear_weight_on_lane(name, 0)
+    }
+
+    /// Load through the selected lane's pinned staging area.
+    fn load_linear_weight_on_lane(
+        &self,
+        name: &str,
+        #[allow(unused)] lane: usize,
+    ) -> Result<Tensor> {
         if let Some(tensor) = self.static_weights.get(name) {
             return Ok(tensor.clone());
         }
@@ -1606,22 +2167,16 @@ impl StreamedGlm {
         }
         #[cfg(feature = "cuda")]
         if let (Some(scale), Device::Cuda(device)) = (scale, &self.device) {
-            if self.weight_pool.get().is_none() {
-                let pool = if device.cuda_stream().context().has_async_alloc() {
-                    Some(fp8::cuda::WeightPool::new(device)?)
-                } else {
-                    None
-                };
-                let _ = self.weight_pool.set(pool);
-            }
+            self.ensure_weight_pool()?;
             if let Some(pool) = self.weight_pool.get().and_then(Option::as_ref) {
                 if self.execution_policy.pinned_fp8_transfer {
-                    return pool.load_pinned(
+                    return pool.load_pinned_on(
                         &self.weights,
                         name,
                         scale,
                         device,
                         self.compute_dtype,
+                        lane,
                     );
                 }
                 return fp8::cuda::load_weight(

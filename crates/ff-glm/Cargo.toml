@@ -23,6 +23,9 @@ tokenizers.workspace = true
 half.workspace = true
 float8.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

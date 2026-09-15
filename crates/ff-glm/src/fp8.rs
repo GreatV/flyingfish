@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda;
 #[cfg(feature = "cuda")]
-mod staging;
+pub(crate) mod staging;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Fp8TransferStats {
@@ -142,23 +142,8 @@ pub fn dequantize_block_fp8(
     }
 }
 
-/// Fused, threaded CPU dequantization.
-///
-/// The generic path costs four passes over the matrix: an E4M3-to-F32 widen,
-/// a scale broadcast, and an optional BF16 narrow, each materializing a full
-/// intermediate. At GLM's expert geometry that is 100 MiB of F32 traffic to
-/// produce 50 MiB of BF16, single-threaded, and it measured 79.8 ms per expert
-/// against 4.3 ms of actual arithmetic.
-///
-/// E4M3 has 256 distinct values and one inverse scale covers a 128-by-128
-/// block, so every product in a block comes from a 256-entry table. Building
-/// one table per block costs 256 operations and serves 16,384 elements. The
-/// inner loop is then a byte load, a table index and a store — no arithmetic,
-/// no intermediate — and the whole matrix is read and written exactly once.
-///
-/// The table holds `convert(f32(value) * scale)`, which is the same F32
-/// multiply and the same single rounding the generic path performs, so the
-/// output is bit-for-bit what it produced.
+/// Threaded CPU dequantization using one 256-entry lookup table per 128x128 block.
+/// Entries use the generic path's F32 product and output cast for bitwise parity.
 struct FusedCpuDequantize {
     output_dtype: DType,
 }
@@ -305,26 +290,30 @@ impl CustomOp2 for FusedCpuDequantize {
     }
 }
 
-/// Multiply a block-FP8 matrix by a vector without ever building the matrix.
-///
-/// `weight` is `[rows, cols]` E4M3 with one inverse scale per 128-by-128
-/// block, `input` is `[cols]`, and the result is `[rows]`, computing
-/// `output[r] = sum_c weight[r, c] * scale_inv[r / 128, c / 128] * input[c]`.
-///
-/// Materializing the dequantized matrix first is what this avoids, and at
-/// GLM's expert geometry that is the whole cost. Dequantizing writes 50 MiB of
-/// BF16 (or 100 MiB of F32) and the matmul reads it back, so a 25 MiB expert
-/// moves about 175 MiB through memory to be used once. Fused, the 25 MiB is
-/// read and nothing is written, and the dequantized value never leaves a
-/// register. Measured on the pinned host, one routed expert's three
-/// projections: 9.93 ms materialized against 1.66 ms fused, which is a host
-/// evaluation bandwidth of 4.72 GiB/s against 28.27 GiB/s.
-///
-/// The products are the same products: a table entry is `f32(value) * scale`
-/// in F32, exactly the dequantized weight. The sums are not the same sums --
-/// this accumulates a row in column order where a blocked GEMM does not -- so
-/// results agree to rounding rather than bit for bit, in the direction the
-/// tests pin down.
+/// Divide CPU capacity across host experts to avoid nested thread oversubscription.
+/// FF_GLM_HOST_MATVEC_THREADS overrides the per-matvec worker count.
+fn host_matvec_workers() -> usize {
+    static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(NonZeroUsize::get)
+            .unwrap_or(1);
+        let host_workers = std::env::var("FF_GLM_HOST_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1);
+        std::env::var("FF_GLM_HOST_MATVEC_THREADS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or((cores / host_workers).max(1))
+            .max(1)
+    })
+}
+
+/// CPU matvec on `[rows, cols]` E4M3 weights and `[cols]` input, without a decoded matrix.
+/// Uses one inverse scale per 128x128 block and returns `[rows]` in F32.
+/// Products match dequantization; reduction order may differ from GEMM.
 pub fn fused_block_fp8_matvec(
     weight: &Tensor,
     scale_inv: &Tensor,
@@ -380,17 +369,7 @@ impl FusedCpuMatvec {
         input: &[f32],
         output: &mut [f32],
     ) {
-        // Every table for one row block at once, so a row streams past them
-        // without rebuilding: 32 tables of 256 F32 entries is 32 KiB at GLM's
-        // width, which stays in L1 alongside the input vector.
-        //
-        // The table looks like the thing to remove -- a load whose address
-        // depends on the datum, which does not vectorize -- and it is not.
-        // Decoding E4M3 arithmetically instead (re-bias the exponent into F32,
-        // handle subnormals as `m * 2^-9`, select NaN) was measured at 3.17 ms
-        // per expert against this version's 1.28 ms. At 32 KiB the tables never
-        // leave L1, so each lookup is a cheap hit rather than a gather, and
-        // replacing it costs about ten operations to save one load.
+        // Build one lookup table per column block and reuse it across the row block.
         let mut tables = vec![[0f32; 256]; column_blocks];
         for (index, row) in output.iter_mut().enumerate() {
             if index % FP8_BLOCK_SIZE == 0 {
@@ -469,9 +448,7 @@ impl CustomOp3 for FusedCpuMatvec {
         let input = &input[input_layout.start_offset()..][..cols];
 
         let mut output = vec![0f32; rows];
-        let workers = std::thread::available_parallelism()
-            .map(NonZeroUsize::get)
-            .unwrap_or(1)
+        let workers = host_matvec_workers()
             .min(rows.div_ceil(FP8_BLOCK_SIZE))
             .max(1);
         // Split on row-block boundaries so a worker owns whole blocks and never
