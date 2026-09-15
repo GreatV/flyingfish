@@ -334,6 +334,8 @@ pub struct StreamedGlm {
     host_expert_share: f64,
     static_weights: BTreeMap<String, Tensor>,
     expert_cache: ExpertCacheManager,
+    /// F32 mapping constants (weight, base, scale), cached by `hc_{site}` prefix.
+    mhc_consts: std::sync::Mutex<std::collections::HashMap<String, (Tensor, Tensor, Tensor)>>,
     execution_policy: GlmExecutionPolicy,
     admission: Option<GlmAdmissionModel>,
     admission_breakdown: Option<crate::admission::GlmAdmissionBreakdown>,
@@ -649,6 +651,7 @@ impl StreamedGlm {
             tokenizer,
             static_weights: BTreeMap::new(),
             expert_cache,
+            mhc_consts: std::sync::Mutex::new(std::collections::HashMap::new()),
             execution_policy,
             admission: None,
             admission_breakdown: None,
@@ -1175,9 +1178,28 @@ impl StreamedGlm {
         streams: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let text = &self.config.text_config;
-        let weight = self.load_tensor(&format!("{prefix}.hc_{site}_fn"))?;
-        let base = self.load_tensor(&format!("{prefix}.hc_{site}_base"))?;
-        let scale = self.load_tensor(&format!("{prefix}.hc_{site}_scale"))?;
+        let key = format!("{prefix}.hc_{site}");
+        let (weight, base, scale) = {
+            let mut cache = self
+                .mhc_consts
+                .lock()
+                .expect("GLM mHC constants mutex poisoned");
+            match cache.get(&key) {
+                Some(consts) => consts.clone(),
+                None => {
+                    let consts = (
+                        self.load_tensor(&format!("{key}_fn"))?
+                            .to_dtype(DType::F32)?,
+                        self.load_tensor(&format!("{key}_base"))?
+                            .to_dtype(DType::F32)?,
+                        self.load_tensor(&format!("{key}_scale"))?
+                            .to_dtype(DType::F32)?,
+                    );
+                    cache.insert(key, consts.clone());
+                    consts
+                }
+            }
+        };
         math::mhc_map(
             streams,
             &weight,
