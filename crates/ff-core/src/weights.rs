@@ -339,12 +339,16 @@ enum ShardBytes {
 /// pages would never be hit again -- see `storage::advise_dropped`.
 struct MappedShard {
     mapping: Mmap,
-    droppable: Option<File>,
+    /// Backing file for positional reads and page eviction.
+    file: Option<File>,
+    droppable: bool,
 }
 
 impl Drop for MappedShard {
     fn drop(&mut self) {
-        if let Some(file) = &self.droppable {
+        if self.droppable
+            && let Some(file) = &self.file
+        {
             let _ = crate::storage::advise_dropped(file);
         }
     }
@@ -527,6 +531,18 @@ impl ShardData {
         TensorView::new(info.dtype, info.shape.clone(), data).map_err(Into::into)
     }
 
+    /// Returns an mmap tensor's backing file, byte offset and length.
+    #[cfg(feature = "cuda")]
+    fn tensor_file_range(&self, name: &str) -> Option<(&File, usize, usize)> {
+        let info = self.tensor_info(name).ok()?;
+        if let ShardBytes::Mmap(mapped) = &self.storage {
+            let file = mapped.file.as_ref()?;
+            Some((file, info.offset, info.len))
+        } else {
+            None
+        }
+    }
+
     fn len(&self) -> usize {
         self.bytes().len()
     }
@@ -555,6 +571,65 @@ struct ShardCache {
     /// the checkpoint's own size against the host's own free memory.
     drop_evicted_pages: bool,
     state: Mutex<CacheState>,
+}
+
+/// Read a shard with parallel positional reads.
+/// FF_WEIGHT_LOAD_THREADS sets the reader count (default 8).
+#[cfg(unix)]
+fn read_shard_parallel(path: &Path) -> Result<Box<[u8]>> {
+    use std::os::unix::fs::FileExt;
+    let file = File::open(path)
+        .with_context(|| format!("failed to open weight shard {}", path.display()))?;
+    let len = usize::try_from(file.metadata()?.len()).context("weight shard size exceeds usize")?;
+    let mut bytes = vec![0u8; len];
+    let threads = std::env::var("FF_WEIGHT_LOAD_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8usize)
+        .max(1)
+        .min(len.div_ceil(4 << 20).max(1));
+    let chunk = len.div_ceil(threads);
+    let base = bytes.as_mut_ptr() as usize;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for reader in 0..threads {
+            let start = reader * chunk;
+            if start >= len {
+                break;
+            }
+            let end = (start + chunk).min(len);
+            let file = &file;
+            handles.push(scope.spawn(move || -> Result<()> {
+                let mut cursor = start;
+                while cursor < end {
+                    let wanted = (end - cursor).min(4 << 20);
+                    let slice = unsafe {
+                        std::slice::from_raw_parts_mut((base + cursor) as *mut u8, wanted)
+                    };
+                    let read = file.read_at(slice, cursor as u64).with_context(|| {
+                        format!("failed to read weight shard {}", path.display())
+                    })?;
+                    anyhow::ensure!(read > 0, "weight shard {} is truncated", path.display());
+                    cursor += read;
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("weight shard reader panicked")))?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(bytes.into_boxed_slice())
+}
+
+#[cfg(not(unix))]
+fn read_shard_parallel(path: &Path) -> Result<Box<[u8]>> {
+    Ok(fs::read(path)
+        .with_context(|| format!("failed to read weight shard {}", path.display()))?
+        .into_boxed_slice())
 }
 
 impl ShardCache {
@@ -605,14 +680,11 @@ impl ShardCache {
                     .with_context(|| format!("failed to mmap weight shard {}", path.display()))?;
                 ShardBytes::Mmap(MappedShard {
                     mapping: mmap,
-                    droppable: self.drop_evicted_pages.then_some(file),
+                    file: Some(file),
+                    droppable: self.drop_evicted_pages,
                 })
             }
-            WeightSource::Memory => ShardBytes::Memory(
-                fs::read(path)
-                    .with_context(|| format!("failed to read weight shard {}", path.display()))?
-                    .into_boxed_slice(),
-            ),
+            WeightSource::Memory => ShardBytes::Memory(read_shard_parallel(path)?),
         };
         let loaded = Arc::new(
             ShardData::new(storage, header)
@@ -1286,6 +1358,19 @@ impl ModelWeights {
     }
 
     fn materialize(&self, name: &str, device: &Device) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(cuda) = device {
+            let metadata = self.raw_tensor_metadata(name)?;
+            let dtype = produced_dtype(metadata.dtype, device)?;
+            if metadata.bytes > 0 && cuda_allocation::supports(dtype) {
+                return self.with_source(name, |view, source| {
+                    cuda_allocation::upload(view.data(), source, view.shape(), dtype, cuda)
+                        .with_context(|| {
+                            format!("failed to materialize tensor {name} on {device:?}")
+                        })
+                });
+            }
+        }
         self.with_view(name, |view, _| {
             let tensor = view
                 .load(device)
@@ -1321,8 +1406,8 @@ impl ModelWeights {
                     .cache
                     .can_retain(attached.store, name, device, metadata.bytes as u64)
             {
-                return self.with_view(name, |view, _| {
-                    cuda_allocation::upload(view.data(), view.shape(), dtype, cuda)
+                return self.with_source(name, |view, source| {
+                    cuda_allocation::upload(view.data(), source, view.shape(), dtype, cuda)
                 });
             }
         }
@@ -1557,6 +1642,30 @@ impl ModelWeights {
             )
         })?;
         f(&view, &shard_path)
+    }
+
+    /// Like `with_view`, with an optional backing file, offset and length for uploads.
+    #[cfg(feature = "cuda")]
+    fn with_source<T>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&safetensors::tensor::TensorView<'_>, Option<(&File, usize, usize)>) -> Result<T>,
+    ) -> Result<T> {
+        let shard_name = self.index.weight_map.get(name).with_context(|| {
+            format!(
+                "tensor is not present in {}: {name}",
+                self.index_path.display()
+            )
+        })?;
+        let shard_path = self.root.join(shard_name);
+        let shard = self.cache.get(&shard_path)?;
+        let view = shard.tensor_view(name).with_context(|| {
+            format!(
+                "index maps {name} to {}, but it is absent",
+                shard_path.display()
+            )
+        })?;
+        f(&view, shard.tensor_file_range(name))
     }
 }
 
