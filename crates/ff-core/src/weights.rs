@@ -1651,6 +1651,9 @@ impl ModelWeights {
         name: &str,
         f: impl FnOnce(&safetensors::tensor::TensorView<'_>, Option<(&File, usize, usize)>) -> Result<T>,
     ) -> Result<T> {
+        if self.tensor_cache.is_some() {
+            return self.with_view(name, |view, _| f(view, None));
+        }
         let shard_name = self.index.weight_map.get(name).with_context(|| {
             format!(
                 "tensor is not present in {}: {name}",
@@ -1920,6 +1923,53 @@ mod tests {
             stats.memory_source_read_bytes,
             file_bytes(dir.path(), "one.safetensors")
         );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_uploads_preserve_tensor_cache_granularity() {
+        let Ok(device) = Device::new_cuda(0) else {
+            return;
+        };
+        let root = fixture();
+        for source in [WeightSource::Mmap, WeightSource::Memory] {
+            for direct_cache in [false, true] {
+                let mut weights = ModelWeights::open(
+                    root.path(),
+                    source,
+                    CachePolicy::new(1).with_granularity(CacheGranularity::Tensor),
+                )
+                .unwrap();
+                if direct_cache {
+                    weights
+                        .configure_device_cache(DeviceCache::new(
+                            DeviceCachePolicy::with_max_bytes(12)
+                                .with_cuda_allocator(CudaWeightAllocator::Direct),
+                        ))
+                        .unwrap();
+                }
+                for _ in 0..2 {
+                    assert_eq!(
+                        weights
+                            .load("a", &device)
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap(),
+                        [1., 2., 3.]
+                    );
+                    assert_eq!(
+                        weights
+                            .load("b", &device)
+                            .unwrap()
+                            .to_vec2::<f32>()
+                            .unwrap(),
+                        [[4., 5.], [6., 7.]]
+                    );
+                }
+                device.synchronize().unwrap();
+                assert!(weights.cache_stats().misses > 0);
+            }
+        }
     }
 
     #[test]
