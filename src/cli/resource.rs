@@ -190,7 +190,13 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
             }
         }
         for phase in &mut selection.provenance.phases {
-            phase.device_reserve_bytes = super::DEVICE_RESIDENCY_RESERVE_BYTES;
+            // Host-only phases (CPU, or the unified-memory fold that charges
+            // device bytes into the host axis) must keep a zero device
+            // reserve: the phase type invariant rejects the combination, and
+            // the sizing already accounted the headroom against the pool.
+            if phase.required_device_bytes.is_some() {
+                phase.device_reserve_bytes = super::DEVICE_RESIDENCY_RESERVE_BYTES;
+            }
         }
     }
     selection.provenance.workload.insert(
