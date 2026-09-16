@@ -192,7 +192,8 @@ impl TensorCache {
                     // the shard cache's decision, not this one's.
                     ShardBytes::Mmap(super::MappedShard {
                         mapping,
-                        droppable: None,
+                        file: None,
+                        droppable: false,
                     })
                 }
                 WeightSource::Memory => {

@@ -10,12 +10,28 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct WeightPool {
     pool: sys::CUmemoryPool,
     context: Arc<CudaContext>,
-    staging: Mutex<Option<super::staging::Staging>>,
+    /// Independent staging areas; FF_GLM_LOAD_LANES=1 uses a single lane.
+    stagings: Vec<Mutex<Option<super::staging::Staging>>>,
+    /// Pinned fill-ahead buffers, allocated lazily and grown as needed.
+    fill_ring: Mutex<Option<Arc<super::staging::FillRing>>>,
     trace: bool,
 }
 
 unsafe impl Send for WeightPool {}
 unsafe impl Sync for WeightPool {}
+
+/// Upload lanes, each with its own buffers and stream
+/// (`FF_GLM_LOAD_LANES`, default 1, clamped to 1..=8).
+pub(crate) fn configured_lanes() -> usize {
+    static LANES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LANES.get_or_init(|| {
+        std::env::var("FF_GLM_LOAD_LANES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1)
+            .clamp(1, 8)
+    })
+}
 
 impl WeightPool {
     pub(crate) fn new(device: &candle_core::CudaDevice) -> anyhow::Result<Self> {
@@ -34,7 +50,8 @@ impl WeightPool {
         Ok(Self {
             pool,
             context,
-            staging: Mutex::new(None),
+            stagings: (0..configured_lanes()).map(|_| Mutex::new(None)).collect(),
+            fill_ring: Mutex::new(None),
             trace: std::env::var_os("FF_GLM_TRACE_TRANSFERS").is_some_and(|v| v == "1"),
         })
     }
@@ -69,16 +86,17 @@ impl WeightPool {
         }
     }
 
-    pub(crate) fn load_pinned(
+    pub(crate) fn load_pinned_on(
         &self,
         weights: &ff_core::weights::ModelWeights,
         name: &str,
         scale: &str,
         device: &candle_core::CudaDevice,
         dtype: DType,
+        lane: usize,
     ) -> anyhow::Result<Tensor> {
-        let mut staging = self
-            .staging
+        let lane = lane % self.stagings.len();
+        let mut staging = self.stagings[lane]
             .lock()
             .map_err(|_| anyhow::anyhow!("FP8 staging lock poisoned"))?;
         if staging.is_none() {
@@ -89,23 +107,104 @@ impl WeightPool {
             .unwrap()
             .load(weights, name, scale, device, dtype, self)
     }
-    pub(crate) fn staging_bytes(&self) -> anyhow::Result<u64> {
-        Ok(self
-            .staging
+
+    pub(crate) fn lanes(&self) -> usize {
+        self.stagings.len()
+    }
+
+    /// Allocate or grow the fill ring on the calling thread; workers only fill it.
+    pub(crate) fn fill_ring(
+        &self,
+        depth: usize,
+        weight_bytes: usize,
+        scale_count: usize,
+    ) -> anyhow::Result<Arc<super::staging::FillRing>> {
+        let mut ring = self
+            .fill_ring
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FP8 fill ring lock poisoned"))?;
+        if ring
+            .as_ref()
+            .is_none_or(|ring| !ring.fits(depth, weight_bytes, scale_count))
+        {
+            *ring = Some(Arc::new(super::staging::FillRing::new(
+                &self.context,
+                depth,
+                weight_bytes,
+                scale_count,
+            )?));
+        }
+        Ok(ring.as_ref().unwrap().clone())
+    }
+
+    /// Upload and dequantize a staged projection on `lane`.
+    /// The returned H2D event must complete before the buffer is refilled.
+    pub(crate) fn upload_prepared_on(
+        &self,
+        lane: usize,
+        device: &candle_core::CudaDevice,
+        dtype: DType,
+        buffer: &mut super::staging::FillBuffer,
+        meta: &super::staging::FillMeta,
+    ) -> anyhow::Result<(Tensor, candle_core::cuda_backend::cudarc::driver::CudaEvent)> {
+        let lane = lane % self.stagings.len();
+        let mut staging = self.stagings[lane]
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FP8 staging lock poisoned"))?;
+        if staging.is_none() {
+            *staging = Some(super::staging::Staging::new(device, self.trace)?);
+        }
+        staging
+            .as_mut()
+            .unwrap()
+            .upload_prepared(device, dtype, self, buffer, meta)
+    }
+
+    /// Record completion of the lane's queued work for compute-stream consumers.
+    /// May include later loads when callers share a lane.
+    pub(crate) fn lane_ready(
+        &self,
+        lane: usize,
+    ) -> anyhow::Result<Option<candle_core::cuda_backend::cudarc::driver::CudaEvent>> {
+        let lane = lane % self.stagings.len();
+        self.stagings[lane]
             .lock()
             .map_err(|_| anyhow::anyhow!("FP8 staging lock poisoned"))?
             .as_ref()
-            .map(super::staging::Staging::bytes)
-            .unwrap_or(0))
+            .map(super::staging::Staging::ready_event)
+            .transpose()
+    }
+
+    pub(crate) fn staging_bytes(&self) -> anyhow::Result<u64> {
+        let mut total = 0;
+        for staging in &self.stagings {
+            total += staging
+                .lock()
+                .map_err(|_| anyhow::anyhow!("FP8 staging lock poisoned"))?
+                .as_ref()
+                .map(super::staging::Staging::bytes)
+                .unwrap_or(0);
+        }
+        Ok(total)
     }
     pub(crate) fn transfer_stats(&self) -> anyhow::Result<super::Fp8TransferStats> {
-        self.staging
-            .lock()
-            .map_err(|_| anyhow::anyhow!("FP8 staging lock poisoned"))?
-            .as_ref()
-            .map(super::staging::Staging::stats)
-            .transpose()
-            .map(|s| s.unwrap_or_default())
+        let mut result = super::Fp8TransferStats::default();
+        for staging in &self.stagings {
+            let stats = staging
+                .lock()
+                .map_err(|_| anyhow::anyhow!("FP8 staging lock poisoned"))?
+                .as_ref()
+                .map(super::staging::Staging::stats)
+                .transpose()?;
+            if let Some(stats) = stats {
+                result.uploads += stats.uploads;
+                result.uploaded_bytes += stats.uploaded_bytes;
+                result.slot_allocations += stats.slot_allocations;
+                result.staging_bytes_per_tier += stats.staging_bytes_per_tier;
+                result.trace.extend(stats.trace);
+            }
+        }
+        Ok(result)
     }
     pub(crate) fn tracing_enabled(&self) -> bool {
         self.trace
@@ -118,7 +217,18 @@ impl WeightPool {
         if !self.trace {
             return Ok(None);
         }
-        self.staging
+        if self.stagings.len() > 1 {
+            // Matvec tracing covers only lane 0; warn once when other lanes are active.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "GLM FP8 compute trace brackets lane 0 only; {} lanes are active",
+                    self.stagings.len()
+                );
+            }
+        }
+        self.stagings[0]
             .lock()
             .map_err(|_| anyhow::anyhow!("FP8 staging lock poisoned"))?
             .as_ref()
@@ -132,8 +242,7 @@ impl WeightPool {
         start: Option<candle_core::cuda_backend::cudarc::driver::CudaEvent>,
     ) -> anyhow::Result<()> {
         if let Some(start) = start
-            && let Some(staging) = self
-                .staging
+            && let Some(staging) = self.stagings[0]
                 .lock()
                 .map_err(|_| anyhow::anyhow!("FP8 staging lock poisoned"))?
                 .as_mut()

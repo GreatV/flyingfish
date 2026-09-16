@@ -408,6 +408,7 @@ mod tests {
             },
             cpu_fp8_dequantization: false,
             pinned_transfer_bytes: 0,
+            pinned_fill_ahead_bytes: 0,
             static_load_device_bytes: 0,
             expert_load_device_bytes: 0,
             compute_on_host: true,

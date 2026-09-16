@@ -11,6 +11,8 @@ const REFERENCE_NVCC_VERSION: &str = "13.2.86";
 fn main() {
     println!("cargo:rerun-if-changed=cuda/rsqrt_f32.cu");
     println!("cargo:rerun-if-changed=cuda/fp8_dequant.cu");
+    println!("cargo:rerun-if-changed=cuda/mhc_sinkhorn_loop_f32.cu");
+    println!("cargo:rerun-if-changed=cuda/normalized_f32.cu");
     println!("cargo:rerun-if-env-changed=NVCC");
     if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -83,6 +85,53 @@ fn main() {
     assert!(
         compiled.status.success(),
         "GLM FP8 compilation failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    // compute_80 PTX requires an Ampere or newer GPU.
+    let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"))
+        .join("glm_mhc_sinkhorn_loop_f32.ptx");
+    let compiled = Command::new(&nvcc)
+        .args([
+            "--ptx",
+            "--std=c++17",
+            "-O2",
+            "--gpu-architecture=compute_80",
+            "--prec-div=true",
+            "--prec-sqrt=true",
+            "--ftz=false",
+            "-o",
+        ])
+        .arg(&output)
+        .arg("cuda/mhc_sinkhorn_loop_f32.cu")
+        .output()
+        .expect("failed to invoke GLM mHC Sinkhorn nvcc");
+    assert!(
+        compiled.status.success(),
+        "GLM mHC Sinkhorn compilation failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"))
+        .join("glm_normalized_f32.ptx");
+    let compiled = Command::new(&nvcc)
+        .args([
+            "--ptx",
+            "--std=c++17",
+            "-O2",
+            "--gpu-architecture=compute_80",
+            "--prec-div=true",
+            "--prec-sqrt=true",
+            "--ftz=false",
+            // Preserve the F32 rounding of the square before accumulation.
+            "--fmad=false",
+            "-o",
+        ])
+        .arg(&output)
+        .arg("cuda/normalized_f32.cu")
+        .output()
+        .expect("failed to invoke GLM normalization nvcc");
+    assert!(
+        compiled.status.success(),
+        "GLM normalization compilation failed: {}",
         String::from_utf8_lossy(&compiled.stderr)
     );
 }
