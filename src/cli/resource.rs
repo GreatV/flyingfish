@@ -173,9 +173,17 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
             })
             .context("H3 host allowance overflow")?,
     };
+    // Under the unified fold the reserve already sits in the host peak via
+    // additional_host_allowance_bytes; passing it again as sizing headroom
+    // would charge it twice. Discrete keeps the headroom-sized path.
+    let headroom_bytes = if unified {
+        0
+    } else {
+        super::DEVICE_RESIDENCY_RESERVE_BYTES
+    };
     let automatic_cache = flyingfish::resource_policy::h3::automatic_device_cache(
         &selection_request,
-        super::DEVICE_RESIDENCY_RESERVE_BYTES,
+        headroom_bytes,
     )?;
     let mut baseline = request.baseline.clone();
     if let Some(cache) = automatic_cache {
@@ -184,7 +192,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         eprintln!(
             "H3 device residency: auto retains up to {} MiB after compute/workspace estimates and {} MiB additional headroom",
             cache.max_bytes / (1 << 20),
-            super::DEVICE_RESIDENCY_RESERVE_BYTES / (1 << 20),
+            headroom_bytes / (1 << 20),
         );
     }
     let mut selection = flyingfish::resource_policy::h3::select(selection_request)?;
