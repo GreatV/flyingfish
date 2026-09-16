@@ -97,6 +97,13 @@ pub struct ResourcePhaseEstimate {
     pub required_host_bytes: u64,
     pub optional_host_bytes: u64,
     pub host_promotion_reserve_bytes: u64,
+    /// Page-cache-resident bytes the kernel can reclaim under pressure (e.g.
+    /// mmap'd weight shards). They are memory *performance*, not memory
+    /// *usage*: `MemAvailable` already counts them as available, so admission
+    /// never charges them against capacity. Reported for telemetry and for
+    /// diagnosing cache-eviction slowdowns, not for fit decisions.
+    #[serde(default)]
+    pub reclaimable_host_bytes: u64,
     #[serde(deserialize_with = "crate::required_option")]
     pub required_device_bytes: Option<u64>,
     #[serde(deserialize_with = "crate::required_option")]
@@ -384,6 +391,7 @@ mod tests {
                 phase: "decode".into(),
                 required_host_bytes: 1,
                 optional_host_bytes: 0,
+                reclaimable_host_bytes: 0,
                 host_promotion_reserve_bytes: 100,
                 required_device_bytes: None,
                 optional_device_bytes: None,

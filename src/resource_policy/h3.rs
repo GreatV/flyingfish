@@ -473,6 +473,7 @@ fn build_provenance(
             .checked_sub(retained)
             .context("H3 retained bytes exceed host peak")?,
         optional_host_bytes: retained,
+        reclaimable_host_bytes: 0,
         host_promotion_reserve_bytes: if promoted {
             (1 << 30).max(request.budget.max_host_bytes.unwrap_or(0) / 20)
         } else {

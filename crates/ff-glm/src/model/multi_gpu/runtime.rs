@@ -647,6 +647,7 @@ mod tests {
                     phase: "prefill".into(),
                     required_host_bytes: 60,
                     optional_host_bytes: 0,
+                    reclaimable_host_bytes: 0,
                     host_promotion_reserve_bytes: 0,
                     required_device_bytes: Some(10),
                     optional_device_bytes: Some(0),

@@ -456,6 +456,10 @@ impl GlmAdmissionBreakdown {
         expert_cache_bytes: usize,
         cache_policy: CachePolicy,
     ) -> Result<Vec<ResourcePhaseEstimate>> {
+        // The mmap'd shard residency is page cache: file-backed and
+        // kernel-reclaimable, already counted as available in MemAvailable.
+        // It is reported as `reclaimable_host_bytes` (telemetry) and never
+        // charged in fit decisions; only exclusive allocations are.
         let raw = estimate_cache_residency(
             &self.raw_inventory,
             WeightSource::Mmap,
@@ -528,9 +532,9 @@ impl GlmAdmissionBreakdown {
                         .checked_add(host_workspace)
                         .and_then(|v| v.checked_add(GLM_ADMISSION_SAFETY_BYTES))
                         .context("GLM CPU phase bytes overflow")?,
-                    optional_host_bytes: raw
-                        .checked_add(u64::try_from(expert_cache_bytes)?)
+                    optional_host_bytes: u64::try_from(expert_cache_bytes)
                         .context("GLM CPU retention bytes overflow")?,
+                    reclaimable_host_bytes: raw,
                     host_promotion_reserve_bytes: 0,
                     required_device_bytes: None,
                     optional_device_bytes: None,
@@ -540,7 +544,8 @@ impl GlmAdmissionBreakdown {
                 Ok(ResourcePhaseEstimate {
                     phase: phase.into(),
                     required_host_bytes: host_workspace,
-                    optional_host_bytes: raw,
+                    optional_host_bytes: 0,
+                    reclaimable_host_bytes: raw,
                     host_promotion_reserve_bytes: 0,
                     required_device_bytes: Some(
                         compute
@@ -566,7 +571,8 @@ impl GlmAdmissionBreakdown {
                             .checked_add(self.static_load_host_bytes)
                             .and_then(|v| v.checked_add(GLM_ADMISSION_SAFETY_BYTES))
                             .context("GLM CPU initialization overflow")?,
-                        optional_host_bytes: raw,
+                        optional_host_bytes: 0,
+                        reclaimable_host_bytes: raw,
                         host_promotion_reserve_bytes: 0,
                         required_device_bytes: None,
                         optional_device_bytes: None,
@@ -576,7 +582,8 @@ impl GlmAdmissionBreakdown {
                     ResourcePhaseEstimate {
                         phase: "static_initialization".into(),
                         required_host_bytes: self.static_load_host_bytes,
-                        optional_host_bytes: raw,
+                        optional_host_bytes: 0,
+                        reclaimable_host_bytes: raw,
                         host_promotion_reserve_bytes: 0,
                         required_device_bytes: Some(
                             u64::try_from(self.static_bytes)?
