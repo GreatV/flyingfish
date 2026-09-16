@@ -257,9 +257,13 @@ impl ResourceSelectionProvenance {
                 );
             }
         }
+        // A recorded refusal (workload["refused"] == 1) selects nothing; every
+        // other record must select exactly one candidate. Old records carry no
+        // `refused` key and keep the strict rule.
+        let refused = self.workload.get("refused").copied().unwrap_or(0) == 1;
         ensure!(
-            selected == 1,
-            "resource selection must select exactly one candidate"
+            selected == 1 || (refused && selected == 0),
+            "resource selection must select exactly one candidate (or none on a recorded refusal)"
         );
         Ok(())
     }
