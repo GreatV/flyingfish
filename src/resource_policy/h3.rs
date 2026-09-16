@@ -422,19 +422,51 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
         }
         observations.push(observation);
     }
-    let (policy, estimate, _, _) = selected.with_context(|| {
-        format!(
-            "H3 resource admission refused: {}",
-            observations
-                .iter()
-                .map(|r| r.reason.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        )
-    })?;
-    let (host, device) = future_peaks(&request, &estimate)?;
-    let retained = host_weight_residency_charges(&policy, request.inventory)?.peak_storage_bytes;
-    let promoted = policy != *request.baseline;
+    let Some((policy, estimate, _, _)) = selected else {
+        // A refusal must still ship its numbers. The record names the
+        // baseline (that is what was evaluated) and marks refused=1.
+        let baseline_estimate = estimate(&request, request.baseline)?;
+        let provenance = build_provenance(
+            &request,
+            request.baseline,
+            &baseline_estimate,
+            observations,
+            true,
+        )?;
+        let summary = provenance
+            .candidates
+            .iter()
+            .map(|r| r.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(super::AdmissionRefused {
+            provenance,
+            summary: format!("H3 resource admission refused: {summary}"),
+        }
+        .into());
+    };
+    let provenance = build_provenance(&request, &policy, &estimate, observations, false)?;
+    Ok(H3Selection {
+        policy,
+        estimate,
+        provenance,
+    })
+}
+
+/// Assemble the selection record for a policy: its denoise phase, axis
+/// origins, the budget ledger, and every candidate observation. `refused`
+/// marks a record whose baseline was evaluated but admitted nothing.
+fn build_provenance(
+    request: &H3SelectionRequest<'_>,
+    policy: &ExecutionPolicy,
+    estimate: &crate::h3::resources::ResourceEstimate,
+    observations: Vec<ResourceCandidateObservation>,
+    refused: bool,
+) -> Result<ResourceSelectionProvenance> {
+    let base_axes = axes(request.baseline)?;
+    let (host, device) = future_peaks(request, estimate)?;
+    let retained = host_weight_residency_charges(policy, request.inventory)?.peak_storage_bytes;
+    let promoted = !refused && policy != request.baseline;
     let phase = ResourcePhaseEstimate {
         phase: "denoise".into(),
         required_host_bytes: host
@@ -452,7 +484,7 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
             .then_some(policy.weights.device_cache.max_bytes),
         device_reserve_bytes: 0,
     };
-    let selected_axes = axes(&policy)?
+    let selected_axes = axes(policy)?
         .into_iter()
         .map(|(axis, value)| {
             let origin = request.locked_origin.unwrap_or_else(|| {
@@ -473,7 +505,7 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
         .collect();
     let mut provenance = ResourceSelectionProvenance {
         schema_version: 1,
-        policy: serde_json::to_value(&policy)?,
+        policy: serde_json::to_value(policy)?,
         selector_revision: "h3-resource-measured-v1".into(),
         request: request.context.request.clone(),
         input: None,
@@ -521,17 +553,14 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
                 "additional_host_allowance_bytes".into(),
                 request.additional_host_allowance_bytes,
             ),
+            ("refused".into(), u64::from(refused)),
         ]),
         axes: selected_axes,
         candidates: observations,
     };
     record_budget(&mut provenance, "selection", request.budget, host, device)?;
     provenance.validate()?;
-    Ok(H3Selection {
-        policy,
-        estimate,
-        provenance,
-    })
+    Ok(provenance)
 }
 
 #[cfg(test)]

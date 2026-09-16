@@ -317,7 +317,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
             ]);
         }
     }
-    let mut selection = flyingfish::resource_policy::glm::select(
+    let mut selection = match flyingfish::resource_policy::glm::select(
         &baseline,
         &breakdown,
         &selection_snapshot,
@@ -325,7 +325,16 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         resource_policy,
         &explicit_axes,
         evidence.as_ref().map(|(record, _)| record),
-    )?;
+    ) {
+        Ok(selection) => selection,
+        Err(error) => {
+            // A refusal still publishes its per-candidate record when a
+            // sidecar path was given, so the rejection can be calibrated
+            // against instead of guessed about.
+            flyingfish::resource_policy::report_refusal(&error, resource_selection.as_deref());
+            return Err(error);
+        }
+    };
     if !automatic_axes.is_empty() {
         selection.provenance.selector_revision = "glm-resource-capacity-v2".into();
         for axis in &mut selection.provenance.axes {

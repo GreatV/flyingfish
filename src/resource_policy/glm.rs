@@ -4,8 +4,8 @@ use crate::{
     runtime::{
         probe::ResourceSnapshot,
         resource_selection::{
-            CandidateDisposition, ResourceCandidateObservation, ResourcePolicyMode,
-            ResourceSelectionProvenance, SelectedResourceAxis, SelectionOrigin,
+            CandidateDisposition, ResourceCandidateObservation, ResourcePhaseEstimate,
+            ResourcePolicyMode, ResourceSelectionProvenance, SelectedResourceAxis, SelectionOrigin,
         },
         weights::CachePolicy,
     },
@@ -304,9 +304,69 @@ pub fn select(
         }
         observations.push(observation);
     }
-    let (policy, _, measured) = selected.context(
-        "no admissible GLM resource policy; the baseline and qualified candidates were refused",
-    )?;
+    let build_provenance = |policy: &GlmExecutionPolicy,
+                            axes: Vec<SelectedResourceAxis>,
+                            phases: Vec<ResourcePhaseEstimate>,
+                            observations: Vec<ResourceCandidateObservation>,
+                            refused: bool|
+     -> Result<ResourceSelectionProvenance> {
+        Ok(ResourceSelectionProvenance {
+            schema_version: 1,
+            policy: serde_json::to_value(policy)?,
+            selector_revision: "resource-policy-measured-v1".into(),
+            request: context.request.clone(),
+            input: None,
+            model: serde_json::to_value(&context.model)?,
+            hardware: Some(serde_json::to_value(&context.hardware)?),
+            executable: context
+                .executable_metadata
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
+            environment: Some(serde_json::to_value(&context.environment)?),
+            mode,
+            selection_snapshot: snapshot.clone(),
+            final_admission_snapshot: None,
+            already_present_at_capture: vec!["device context, tokenizer and header catalog".into()],
+            inventory: breakdown.raw_inventory.clone(),
+            phases,
+            workload: BTreeMap::from([
+                ("prompt_tokens".into(), breakdown.prompt_tokens as u64),
+                (
+                    "context_bound_tokens".into(),
+                    policy.dsa_context_bound_tokens as u64,
+                ),
+                ("refused".into(), u64::from(refused)),
+            ]),
+            axes,
+            candidates: observations,
+        })
+    };
+    let Some((policy, _, measured)) = selected else {
+        // A refusal must still ship its numbers: per-candidate dispositions
+        // and the phase estimates they were judged against. The record names
+        // the baseline (that is what was evaluated) and marks refused=1.
+        let refusal_axes = baseline_axes
+            .iter()
+            .map(|(axis, value)| SelectedResourceAxis {
+                axis: axis.clone(),
+                value: value.clone(),
+                origin: SelectionOrigin::Baseline,
+            })
+            .collect();
+        let refusal_phases = breakdown.phases(
+            baseline.resident_static,
+            usize::try_from(baseline.expert_cache.maximum_bound_bytes)?,
+            cache_policy(baseline)?,
+        )?;
+        let provenance =
+            build_provenance(baseline, refusal_axes, refusal_phases, observations, true)?;
+        return Err(super::AdmissionRefused {
+            provenance,
+            summary: "no admissible GLM resource policy; the baseline and qualified candidates were refused".into(),
+        }
+        .into());
+    };
     let selected_axes = axes(&policy)?
         .into_iter()
         .map(|(axis, value)| {
@@ -341,36 +401,7 @@ pub fn select(
             phase.host_promotion_reserve_bytes = (1_u64 << 30).max(host / 20);
         }
     }
-    let provenance = ResourceSelectionProvenance {
-        schema_version: 1,
-        policy: serde_json::to_value(&policy)?,
-        selector_revision: "resource-policy-measured-v1".into(),
-        request: context.request.clone(),
-        input: None,
-        model: serde_json::to_value(&context.model)?,
-        hardware: Some(serde_json::to_value(&context.hardware)?),
-        executable: context
-            .executable_metadata
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()?,
-        environment: Some(serde_json::to_value(&context.environment)?),
-        mode,
-        selection_snapshot: snapshot.clone(),
-        final_admission_snapshot: None,
-        already_present_at_capture: vec!["device context, tokenizer and header catalog".into()],
-        inventory: breakdown.raw_inventory.clone(),
-        phases,
-        workload: BTreeMap::from([
-            ("prompt_tokens".into(), breakdown.prompt_tokens as u64),
-            (
-                "context_bound_tokens".into(),
-                policy.dsa_context_bound_tokens as u64,
-            ),
-        ]),
-        axes: selected_axes,
-        candidates: observations,
-    };
+    let provenance = build_provenance(&policy, selected_axes, phases, observations, false)?;
     provenance.validate()?;
     provenance.validate_policy_binding(&serde_json::to_value(&policy)?)?;
     Ok(GlmSelection { policy, provenance })
@@ -655,6 +686,47 @@ mod tests {
         assert_eq!(
             selected.policy, base,
             "unified pool must charge device bytes to the promotion reserve"
+        );
+    }
+
+    #[test]
+    fn refusal_carries_the_full_candidate_record() {
+        let base = baseline();
+        let mut tight = snapshot();
+        // Nothing fits: 1 byte of host capacity.
+        tight.host_memory_available_bytes = Some(1);
+        tight.cgroup_v2_memory_available_bytes = Some(1);
+        tight.cgroup_v2_memory_limit = Some(CgroupMemoryLimit::Bytes(1));
+        let error = match select(
+            &base,
+            &breakdown(),
+            &tight,
+            &context(),
+            ResourcePolicyMode::Performance,
+            &BTreeSet::new(),
+            None,
+        ) {
+            Ok(_) => panic!("a 1-byte capacity must refuse"),
+            Err(error) => error,
+        };
+        let refusal = error
+            .downcast_ref::<crate::resource_policy::AdmissionRefused>()
+            .expect("refusals must carry the candidate record");
+        assert_eq!(refusal.provenance.workload.get("refused"), Some(&1));
+        assert!(!refusal.provenance.candidates.is_empty());
+        assert!(
+            refusal
+                .provenance
+                .candidates
+                .iter()
+                .all(|c| c.disposition != CandidateDisposition::Selected)
+        );
+        assert!(
+            refusal
+                .provenance
+                .candidates
+                .iter()
+                .any(|c| !c.reason.is_empty())
         );
     }
 

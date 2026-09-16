@@ -477,7 +477,7 @@ pub(super) fn run_denoise_conditioned(command: H3Command) -> Result<()> {
         "file": inputs.display().to_string(),
         "bytes": input_stat.len(),
     });
-    let mut selected = super::resource::select_h3(super::resource::H3ResourceRequest {
+    let mut selected = match super::resource::select_h3(super::resource::H3ResourceRequest {
         additional_host_allowance_bytes: 0,
         component: &transformer_dir,
         device: &device,
@@ -500,7 +500,13 @@ pub(super) fn run_denoise_conditioned(command: H3Command) -> Result<()> {
             "command":"h3.denoise-conditioned","inputs":input_evidence.clone(),
             "geometry":geometry,"packed_rows":rows,"evaluations":evaluations,
         }),
-    })?;
+    }) {
+        Ok(selected) => selected,
+        Err(error) => {
+            flyingfish::resource_policy::report_refusal(&error, Some(&selection_path));
+            return Err(error);
+        }
+    };
     selected.provenance.input = Some(input_evidence);
     execution_policy = selected.policy;
     flyingfish::resource_policy::publish_selection(&selection_path, &selected.provenance)?;

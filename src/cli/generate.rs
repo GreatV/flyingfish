@@ -866,7 +866,7 @@ fn select_generation_resources(
     } else {
         None
     };
-    let selected = super::resource::select_h3(super::resource::H3ResourceRequest {
+    let selected = match super::resource::select_h3(super::resource::H3ResourceRequest {
         additional_host_allowance_bytes: 0,
         component: &transformer_dir,
         device,
@@ -887,7 +887,15 @@ fn select_generation_resources(
         request: serde_json::json!({"command":"h3.generate", "model_root":model_root_record, "prompt":prompt,
                     "token_ids":token_ids, "geometry":geometry, "sigma_points":sigma_points, "seed":seed, "target_hidden_state":target_hidden_state,
                     "video_shift":video_shift, "audio_shift":audio_shift, "wav_format":format!("{wav_format:?}")}),
-    })?;
+    }) {
+        Ok(selected) => selected,
+        Err(error) => {
+            // No sidecar path is in scope here; the refusal record still goes
+            // to stderr with per-candidate reasons.
+            flyingfish::resource_policy::report_refusal(&error, None);
+            return Err(error);
+        }
+    };
     if selected.policy != *execution_policy {
         *policy_origin = PolicyOrigin::Promoted;
     }

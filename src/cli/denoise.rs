@@ -637,7 +637,7 @@ pub(super) fn run_denoise_t2va(command: H3Command) -> Result<()> {
         &output,
         &[telemetry_json.as_deref(), checkpoint_dir.as_deref()],
     )?;
-    let mut selected = super::resource::select_h3(super::resource::H3ResourceRequest {
+    let mut selected = match super::resource::select_h3(super::resource::H3ResourceRequest {
         additional_host_allowance_bytes: 0,
         component: &component_dir,
         device: &device,
@@ -658,7 +658,13 @@ pub(super) fn run_denoise_t2va(command: H3Command) -> Result<()> {
         )?,
         request: serde_json::json!({"command":"h3.transformer", "geometry":geometry,
             "sigma_points":sigma_points, "start_step":start_step, "evaluations":evaluations, "video_shift":video_shift,"audio_shift":audio_shift}),
-    })?;
+    }) {
+        Ok(selected) => selected,
+        Err(error) => {
+            flyingfish::resource_policy::report_refusal(&error, Some(&selection_path));
+            return Err(error);
+        }
+    };
     selected.provenance.input = Some(serde_json::json!({
         "file": inputs.display().to_string(),
         "bytes": flyingfish::runtime::artifact::FileStat::of_target(&inputs)?.len(),

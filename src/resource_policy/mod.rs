@@ -15,6 +15,46 @@ pub fn publish_selection(path: &Path, record: &ResourceSelectionProvenance) -> R
     Ok(())
 }
 
+/// A resource-selection refusal carrying the complete record: every
+/// candidate's disposition and reason plus the phase estimates it was judged
+/// against. Callers publish this as the resource-selection sidecar even when
+/// no run happens — a refusal without its numbers cannot be calibrated.
+///
+/// The provenance records the baseline policy (that is what was evaluated)
+/// and marks `workload["refused"] = 1`; a refusal is distinguished by that
+/// marker and by no candidate carrying a `Selected` disposition.
+#[derive(Debug)]
+pub struct AdmissionRefused {
+    pub provenance: ResourceSelectionProvenance,
+    pub summary: String,
+}
+
+impl std::fmt::Display for AdmissionRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.summary)
+    }
+}
+
+impl std::error::Error for AdmissionRefused {}
+
+/// Publish the refusal record and print per-candidate reasons, if the error
+/// carries one. Returns the summary for the outward error message.
+pub fn report_refusal(error: &anyhow::Error, sidecar: Option<&Path>) -> Option<String> {
+    let refusal = error.downcast_ref::<AdmissionRefused>()?;
+    for candidate in &refusal.provenance.candidates {
+        eprintln!(
+            "resource refusal {}: {:?} ({})",
+            candidate.candidate_id, candidate.disposition, candidate.reason
+        );
+    }
+    if let Some(path) = sidecar
+        && let Err(error) = publish_selection(path, &refusal.provenance)
+    {
+        eprintln!("warning: failed to publish refusal resource selection: {error}");
+    }
+    Some(refusal.summary.clone())
+}
+
 #[derive(Clone, Copy)]
 struct MeasuredScore {
     median_us: u64,
