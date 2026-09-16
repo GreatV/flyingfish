@@ -728,6 +728,18 @@ mod tests {
                 .iter()
                 .any(|c| !c.reason.is_empty())
         );
+        // The record must carry calibratable numbers, not just the refusal
+        // marker: at least one phase with a non-zero host peak. (This fixture
+        // is host-only, so no device peaks exist here; CUDA phases are covered
+        // by the unified-pool tests above.)
+        assert!(
+            refusal
+                .provenance
+                .phases
+                .iter()
+                .any(|p| p.host_peak_bytes().is_ok_and(|peak| peak > 0)),
+            "refusal record must carry non-zero phase estimates"
+        );
     }
 
     #[test]
