@@ -17,15 +17,8 @@ edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
 
-# candle-kernels 0.11.0 cannot compile for a pre-Ampere target against any
-# CUDA from 12.6 onward: its `compatibility.cuh` supplies `__hmax_nan` and
-# `__hmin_nan` below sm_80, and those toolkits already declare both for every
-# architecture. The vendored copy adds a `CUDA_VERSION` term to that one guard
-# and changes nothing else. Compiled from one path so nvcc's file-derived
-# symbol prefixes and embedded `__FILE__` strings match, all twelve kernels
-# emit byte-identical PTX at `compute_89` before and after the change; at
-# `compute_75` upstream compiles two of twelve and the patched copy compiles
-# all twelve. See `third_party/candle-kernels/src/compatibility.cuh`.
+# Vendored CUDA fixes: pre-Ampere intrinsics on CUDA 12.6+ and MSVC preprocessing.
+# See third_party/candle-kernels/.
 [patch.crates-io]
 candle-kernels = { path = "third_party/candle-kernels" }
 

@@ -10,6 +10,7 @@ use candle_core::{D, DType, Tensor};
 
 pub(crate) mod normalization;
 mod prefill;
+pub(crate) mod sinkhorn;
 pub use prefill::kda_prefill;
 
 /// Output of GLM's sigmoid/noaux top-k router.
@@ -216,29 +217,42 @@ pub fn mhc_map_batched(
     let flat = rms_norm(&flat, None, rms_eps)?;
     let mixed = linear_f32(&flat, mapping_weight)?;
 
-    let pre_logits = mixed.narrow(1, 0, streams)?;
-    let post_logits = mixed.narrow(1, streams, streams)?;
+    // Reuse cached F32 constants without redundant conversion copies.
+    let scale_owned;
+    let scale: &Tensor = if mapping_scale.dtype() == DType::F32 {
+        mapping_scale
+    } else {
+        scale_owned = mapping_scale.to_dtype(DType::F32)?;
+        &scale_owned
+    };
+    let base_owned;
+    let base: &Tensor = if mapping_base.dtype() == DType::F32 {
+        mapping_base
+    } else {
+        base_owned = mapping_base.to_dtype(DType::F32)?;
+        &base_owned
+    };
     let comb_logits = mixed.narrow(1, 2 * streams, streams * streams)?;
-    let pre_scale = mapping_scale.narrow(0, 0, 1)?.to_dtype(DType::F32)?;
-    let post_scale = mapping_scale.narrow(0, 1, 1)?.to_dtype(DType::F32)?;
-    let comb_scale = mapping_scale.narrow(0, 2, 1)?.to_dtype(DType::F32)?;
-
-    let base = mapping_base.to_dtype(DType::F32)?;
-    let pre_base = base.narrow(0, 0, streams)?;
-    let post_base = base.narrow(0, streams, streams)?;
+    let comb_scale = scale.narrow(0, 2, 1)?;
     let comb_base = base.narrow(0, 2 * streams, streams * streams)?;
 
-    let pre = (&candle_nn::ops::sigmoid(
-        &pre_logits
-            .broadcast_mul(&pre_scale)?
-            .broadcast_add(&pre_base)?,
-    )? + hc_eps)?;
-    let post = candle_nn::ops::sigmoid(
-        &post_logits
-            .broadcast_mul(&post_scale)?
-            .broadcast_add(&post_base)?,
-    )?
-    .affine(2.0, 0.0)?;
+    // Batch adjacent pre/post gates without changing per-element arithmetic.
+    // Apply each half's final constant separately (+eps for pre, *2 for post).
+    let pp_scale = Tensor::cat(
+        &[
+            &scale.narrow(0, 0, 1)?.broadcast_as((streams,))?,
+            &scale.narrow(0, 1, 1)?.broadcast_as((streams,))?,
+        ],
+        0,
+    )?;
+    let pp = candle_nn::ops::sigmoid(
+        &mixed
+            .narrow(1, 0, 2 * streams)?
+            .broadcast_mul(&pp_scale)?
+            .broadcast_add(&base.narrow(0, 0, 2 * streams)?)?,
+    )?;
+    let pre = (&pp.narrow(1, 0, streams)? + hc_eps)?;
+    let post = pp.narrow(1, streams, streams)?.affine(2.0, 0.0)?;
 
     let comb_logits = comb_logits
         .broadcast_mul(&comb_scale)?
@@ -246,10 +260,7 @@ pub fn mhc_map_batched(
         .reshape((tokens, streams, streams))?;
     let mut comb = (&candle_nn::ops::softmax(&comb_logits, D::Minus1)? + hc_eps)?;
     comb = comb.broadcast_div(&(&comb.sum_keepdim(1)? + hc_eps)?)?;
-    for _ in 0..sinkhorn_iters - 1 {
-        comb = comb.broadcast_div(&(&comb.sum_keepdim(2)? + hc_eps)?)?;
-        comb = comb.broadcast_div(&(&comb.sum_keepdim(1)? + hc_eps)?)?;
-    }
+    let comb = sinkhorn::fused_loop(&comb, sinkhorn_iters - 1, hc_eps)?;
 
     let weighted_streams = pre
         .unsqueeze(2)?
@@ -772,6 +783,104 @@ mod tests {
             &[13.0, 13.0],
             1e-6,
         );
+    }
+
+    /// Batching the pre/post gates must preserve bitwise equality.
+    #[test]
+    fn mhc_batched_gate_chain_matches_split_chain_bitwise() {
+        let device = Device::Cpu;
+        let (tokens, streams) = (3usize, 4usize);
+        let hc_eps = 1e-6f64;
+        let mixed = Tensor::from_vec(
+            (0..tokens * 4 * streams)
+                .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.37)
+                .collect::<Vec<_>>(),
+            (tokens, 4 * streams),
+            &device,
+        )
+        .unwrap();
+        let scale = Tensor::from_vec(vec![0.5f32, 1.5, 2.5], 3, &device).unwrap();
+        let base = Tensor::from_vec(
+            (0..4 * streams)
+                .map(|i| (i as f32 - 8.0) * 0.11)
+                .collect::<Vec<_>>(),
+            4 * streams,
+            &device,
+        )
+        .unwrap();
+
+        // Split chain (the original two-pass form).
+        let pre_old = (&candle_nn::ops::sigmoid(
+            &mixed
+                .narrow(1, 0, streams)
+                .unwrap()
+                .broadcast_mul(&scale.narrow(0, 0, 1).unwrap())
+                .unwrap()
+                .broadcast_add(&base.narrow(0, 0, streams).unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+            + hc_eps)
+            .unwrap();
+        let post_old = candle_nn::ops::sigmoid(
+            &mixed
+                .narrow(1, streams, streams)
+                .unwrap()
+                .broadcast_mul(&scale.narrow(0, 1, 1).unwrap())
+                .unwrap()
+                .broadcast_add(&base.narrow(0, streams, streams).unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+        .affine(2.0, 0.0)
+        .unwrap();
+
+        // Batched chain (the fused form under test).
+        let pp_scale = Tensor::cat(
+            &[
+                &scale
+                    .narrow(0, 0, 1)
+                    .unwrap()
+                    .broadcast_as((streams,))
+                    .unwrap(),
+                &scale
+                    .narrow(0, 1, 1)
+                    .unwrap()
+                    .broadcast_as((streams,))
+                    .unwrap(),
+            ],
+            0,
+        )
+        .unwrap();
+        let pp = candle_nn::ops::sigmoid(
+            &mixed
+                .narrow(1, 0, 2 * streams)
+                .unwrap()
+                .broadcast_mul(&pp_scale)
+                .unwrap()
+                .broadcast_add(&base.narrow(0, 0, 2 * streams).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let pre_new = (&pp.narrow(1, 0, streams).unwrap() + hc_eps).unwrap();
+        let post_new = pp
+            .narrow(1, streams, streams)
+            .unwrap()
+            .affine(2.0, 0.0)
+            .unwrap();
+
+        for (batched, split) in [(&pre_new, &pre_old), (&post_new, &post_old)] {
+            let batched = batched.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let split = split.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(batched.len(), split.len());
+            for (index, (batched, split)) in batched.iter().zip(&split).enumerate() {
+                assert_eq!(
+                    batched.to_bits(),
+                    split.to_bits(),
+                    "element {index}: batched {batched:e} != split {split:e}"
+                );
+            }
+        }
     }
 
     #[test]

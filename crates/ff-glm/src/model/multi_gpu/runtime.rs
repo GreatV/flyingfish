@@ -194,7 +194,8 @@ impl LayerPartitionedGlm {
                 scope,
             )?;
             if options.pinned_fp8_transfer {
-                breakdown.enable_pinned_transfer()?;
+                let (lanes, fill_ring_depth) = crate::model::pinned_staging_shape();
+                breakdown.enable_pinned_transfer(lanes, fill_ring_depth)?;
             }
             breakdown.maximum_dsa_cache_bytes = breakdown
                 .dsa_cache_bytes_per_token

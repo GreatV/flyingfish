@@ -6,6 +6,25 @@ use candle_core::cuda_backend::cudarc::driver::{
 use candle_core::{CudaDevice, DType, Storage, Tensor, op::BackpropOp};
 use std::sync::Arc;
 
+use super::device_cache::CudaWeightAllocator;
+
+/// Allocate `count` uninitialized elements under the cache's allocator policy.
+/// `Direct` allocations sit outside the stream pool that ordinary candle
+/// tensors draw from, so only a `Direct` cache may ask for them.
+unsafe fn allocate<T: DeviceRepr>(
+    allocator: CudaWeightAllocator,
+    count: usize,
+    bytes: usize,
+    stream: &Arc<CudaStream>,
+) -> Result<CudaSlice<T>> {
+    match allocator {
+        CudaWeightAllocator::Direct => {
+            Ok(unsafe { stream.upgrade_device_ptr::<T>(result::malloc_sync(bytes)?, count) })
+        }
+        CudaWeightAllocator::StreamPool => Ok(unsafe { stream.alloc::<T>(count) }?),
+    }
+}
+
 pub(super) fn supports(dtype: DType) -> bool {
     matches!(
         dtype,
@@ -24,6 +43,7 @@ fn upload_slice<T: DeviceRepr>(
     data: &[u8],
     count: usize,
     stream: &Arc<CudaStream>,
+    allocator: CudaWeightAllocator,
 ) -> Result<CudaSlice<T>> {
     ensure!(
         count.checked_mul(std::mem::size_of::<T>()) == Some(data.len()),
@@ -31,8 +51,7 @@ fn upload_slice<T: DeviceRepr>(
     );
     stream.synchronize()?;
     stream.context().bind_to_thread()?;
-    let mut output =
-        unsafe { stream.upgrade_device_ptr::<T>(result::malloc_sync(data.len())?, count) };
+    let mut output = unsafe { allocate::<T>(allocator, count, data.len(), stream) }?;
     let copied = {
         let (pointer, _written) = output.device_ptr_mut(stream);
         unsafe { result::memcpy_htod_async(pointer, data, stream.cu_stream()) }
@@ -43,11 +62,79 @@ fn upload_slice<T: DeviceRepr>(
     Ok(output)
 }
 
+/// Fill pinned memory with parallel positional reads.
+/// Returns `None` on allocation or read failure so the caller can use the mmap.
+#[cfg(unix)]
+fn fill_pinned_from_checkpoint(
+    file: &std::fs::File,
+    offset: usize,
+    len: usize,
+    stream: &Arc<CudaStream>,
+) -> Option<candle_core::cuda_backend::cudarc::driver::PinnedHostSlice<u8>> {
+    let mut host = unsafe { stream.context().alloc_pinned::<u8>(len) }.ok()?;
+    let readers = warm_threads().min(len.div_ceil(2 << 20).max(1));
+    crate::storage::read_parallel_into(
+        crate::storage::ParallelReadSource::Shared(file),
+        offset as u64,
+        host.as_mut_slice().ok()?,
+        readers,
+    )
+    .ok()?;
+    Some(host)
+}
+
+#[cfg(unix)]
+fn warm_threads() -> usize {
+    std::env::var("FF_WEIGHT_WARM_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8)
+        .max(1)
+}
+
+/// Upload file-backed bytes through a pinned buffer filled by parallel readers.
+#[cfg(unix)]
+fn upload_slice_from_source<T: DeviceRepr>(
+    file: &std::fs::File,
+    offset: usize,
+    len: usize,
+    count: usize,
+    stream: &Arc<CudaStream>,
+    allocator: CudaWeightAllocator,
+) -> Result<Option<CudaSlice<T>>> {
+    ensure!(
+        count.checked_mul(std::mem::size_of::<T>()) == Some(len),
+        "weight upload byte count mismatch"
+    );
+    let Some(host) = fill_pinned_from_checkpoint(file, offset, len, stream) else {
+        return Ok(None);
+    };
+    let host_slice = match host.as_slice() {
+        Ok(slice) => slice,
+        Err(_) => return Ok(None),
+    };
+    stream.synchronize()?;
+    stream.context().bind_to_thread()?;
+    let mut output = unsafe { allocate::<T>(allocator, count, len, stream) }?;
+    let copied = {
+        let (pointer, _written) = output.device_ptr_mut(stream);
+        unsafe { result::memcpy_htod_async(pointer, host_slice, stream.cu_stream()) }
+    };
+    let completed = stream.synchronize();
+    copied.context("direct weight upload failed")?;
+    completed.context("direct weight upload completion failed")?;
+    Ok(Some(output))
+}
+
+// `source` feeds only the #[cfg(unix)] upload_slice_from_source path.
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub(super) fn upload(
     data: &[u8],
+    source: Option<(&std::fs::File, usize, usize)>,
     shape: &[usize],
     dtype: DType,
     device: &CudaDevice,
+    allocator: CudaWeightAllocator,
 ) -> Result<Tensor> {
     let count = shape
         .iter()
@@ -56,12 +143,27 @@ pub(super) fn upload(
     ensure!(count > 0, "empty direct weight");
     let stream = device.cuda_stream();
     macro_rules! upload {
-        ($ty:ty) => {
+        ($ty:ty) => {{
+            #[cfg(unix)]
+            if let Some((file, offset, len)) = source
+                && let Some(slice) =
+                    upload_slice_from_source::<$ty>(file, offset, len, count, &stream, allocator)?
+            {
+                return Ok(Tensor::from_storage(
+                    Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+                        slice,
+                        device.clone(),
+                    )),
+                    shape.to_vec(),
+                    BackpropOp::none(),
+                    false,
+                ));
+            }
             candle_core::CudaStorage::wrap_cuda_slice(
-                upload_slice::<$ty>(data, count, &stream)?,
+                upload_slice::<$ty>(data, count, &stream, allocator)?,
                 device.clone(),
             )
-        };
+        }};
     }
     let storage = match dtype {
         DType::BF16 => upload!(half::bf16),

@@ -301,12 +301,7 @@ impl StreamedTransformer {
         options: StreamedTransformerOptions,
     ) -> Result<Self> {
         let plan = H3ExecutionPlan::from_config(&weights, &config)?;
-        // Every stage is read once per evaluation and none is reused inside
-        // one, so a request whose stages outweigh host memory never hits a page
-        // it cached: the next evaluation has already evicted it. Retention only
-        // costs there, so the shards are dropped behind the scan instead. Both
-        // terms are measured -- the plan's own bytes and the host's own free
-        // memory -- so a machine that can hold the model keeps caching it.
+        // Drop evicted pages when evaluation weights exceed available host memory.
         weights.drop_evicted_pages(!host_can_retain(plan.evaluation_weight_bytes()));
         let phases = if options.device_cache_policy.is_enabled() || options.host_phase_priority {
             plan.stages()

@@ -1,15 +1,13 @@
-//! Bounded GLM routed-expert traces and deterministic offline cache replay.
-//!
-//! A trace records only the already-computed top-k expert identities. It does
-//! not participate in routing, reorder experts, or retain model activations.
-//! SRP and SCH follow the ICLR 2026 paper and the authors' implementation at
-//! `ljcleo/moe-lrc` commit `30425e6418a9ff5f6afcb2d14b72975888060d28`.
+//! Bounded top-k expert/mixture-weight traces and deterministic cache replay.
+//! Tracing preserves routing order and retains no activations.
+//! SRP/SCH follow the ICLR 2026 paper and `ljcleo/moe-lrc`
+//! commit `30425e6418a9ff5f6afcb2d14b72975888060d28`.
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const ROUTING_TRACE_SCHEMA_VERSION: u32 = 2;
+pub const ROUTING_TRACE_SCHEMA_VERSION: u32 = 3;
 pub const ROUTING_REPLAY_SCHEMA_VERSION: u32 = 2;
 pub const MAX_ROUTING_TRACE_JSON_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_ROUTING_REPLAY_JSON_BYTES: usize = 64 * 1024 * 1024;
@@ -67,21 +65,27 @@ pub struct RoutingTraceLayer {
     pub expert_bytes: Vec<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingDecision {
     pub token_index: u32,
     pub phase: RoutingTracePhase,
     pub layer_index: u32,
     /// Expert identities in router-returned order (CUDA is not score-sorted).
-    /// Mixture weights are deliberately not traced.
     pub experts: Vec<u32>,
+    /// Final mixture weights aligned with `experts`, after normalization and scaling.
+    /// Empty for schema-2 traces, which skip weight validation.
+    #[serde(default)]
+    pub gate_weights: Vec<f32>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingTrace {
     pub schema_version: u32,
+    /// Router scaling used to validate gate weights; absent before schema 3.
+    pub routed_scaling_factor: Option<f64>,
+    pub norm_topk_prob: Option<bool>,
     pub prefill_schedule: RoutingPrefillSchedule,
     pub model_family: RoutingModelFamily,
     pub domain: String,
@@ -102,10 +106,19 @@ pub struct RoutingTrace {
 impl RoutingTrace {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.schema_version == ROUTING_TRACE_SCHEMA_VERSION,
-            "unsupported GLM routing-trace schema {}; this build supports schema {}",
+            (2..=ROUTING_TRACE_SCHEMA_VERSION).contains(&self.schema_version),
+            "unsupported GLM routing-trace schema {}; this build supports schemas 2..={}",
             self.schema_version,
             ROUTING_TRACE_SCHEMA_VERSION
+        );
+        // Schema 3 promises gate weights aligned with `experts`; only the
+        // schema-2 compatibility path may omit them and the router parameters.
+        let requires_gate_weights = self.schema_version >= 3;
+        ensure!(
+            !requires_gate_weights
+                || (self.routed_scaling_factor.is_some() && self.norm_topk_prob.is_some()),
+            "routing-trace schema {} requires routed_scaling_factor and norm_topk_prob",
+            self.schema_version
         );
         validate_routing_trace_domain(&self.domain)?;
         let hidden_layers = usize::try_from(self.num_hidden_layers)
@@ -239,6 +252,42 @@ impl RoutingTrace {
                 "routing decision {sequence} has {} experts; expected {top_k}",
                 decision.experts.len()
             );
+            ensure!(
+                !requires_gate_weights || !decision.gate_weights.is_empty(),
+                "routing decision {sequence} has no gate weights; schema {} requires one per expert",
+                self.schema_version
+            );
+            if !decision.gate_weights.is_empty() {
+                ensure!(
+                    decision.gate_weights.len() == decision.experts.len(),
+                    "routing decision {sequence} has {} gate weights for {} experts",
+                    decision.gate_weights.len(),
+                    decision.experts.len()
+                );
+                // Sanity ceiling for malformed weights, independent of model scaling.
+                ensure!(
+                    decision
+                        .gate_weights
+                        .iter()
+                        .all(|weight| weight.is_finite() && *weight >= 0.0 && *weight <= 1e3),
+                    "routing decision {sequence} gate weights must be finite and in 0..=1e3"
+                );
+                // Normalized weights must sum to the routed scaling factor.
+                if self.norm_topk_prob == Some(true)
+                    && let Some(routed_scaling) = self.routed_scaling_factor
+                {
+                    let sum: f64 = decision
+                        .gate_weights
+                        .iter()
+                        .map(|weight| f64::from(*weight))
+                        .sum();
+                    let tolerance = 1e-4 * routed_scaling.abs().max(1.0);
+                    ensure!(
+                        (sum - routed_scaling).abs() <= tolerance,
+                        "routing decision {sequence} gate weights sum to {sum}; expected the routed scaling factor {routed_scaling}"
+                    );
+                }
+            }
             for &expert in &decision.experts {
                 ensure!(
                     usize::try_from(expert)
@@ -364,6 +413,8 @@ impl RoutingTraceBuilder {
     pub(crate) fn new(
         domain: &str,
         cache_entry_dtype: ExpertCacheEntryDtype,
+        routed_scaling_factor: f64,
+        norm_topk_prob: bool,
         num_hidden_layers: usize,
         num_experts: usize,
         experts_per_token: usize,
@@ -399,7 +450,8 @@ impl RoutingTraceBuilder {
             .and_then(|bytes| bytes.checked_add(layers.len().checked_mul(256)?))
             .and_then(|bytes| bytes.checked_add(declared_expert_sizes.checked_mul(32)?))
             .and_then(|bytes| bytes.checked_add(capacity.checked_mul(256)?))
-            .and_then(|bytes| bytes.checked_add(maximum_accesses.checked_mul(32)?))
+            // Each access prints an expert id line and an f32 weight line.
+            .and_then(|bytes| bytes.checked_add(maximum_accesses.checked_mul(64)?))
             .context("routing-trace JSON bound estimate overflow")?;
         ensure!(
             conservative_json_bytes <= MAX_ROUTING_TRACE_JSON_BYTES,
@@ -407,6 +459,8 @@ impl RoutingTraceBuilder {
         );
         let trace = RoutingTrace {
             schema_version: ROUTING_TRACE_SCHEMA_VERSION,
+            routed_scaling_factor: Some(routed_scaling_factor),
+            norm_topk_prob: Some(norm_topk_prob),
             prefill_schedule: RoutingPrefillSchedule::LayerBatchedExpertGrouped,
             model_family: RoutingModelFamily::Glm5Next,
             domain: domain.to_owned(),
@@ -483,6 +537,7 @@ impl RoutingTraceBuilder {
         phase: RoutingTracePhase,
         layer_index: usize,
         experts: &[u32],
+        gate_weights: &[f32],
     ) -> Result<()> {
         ensure!(
             token_index < self.max_routed_tokens,
@@ -527,12 +582,23 @@ impl RoutingTraceBuilder {
             experts.iter().collect::<BTreeSet<_>>().len() == experts.len(),
             "routing trace requires unique expert identities"
         );
+        ensure!(
+            gate_weights.len() == experts.len(),
+            "routing trace requires one gate weight per expert"
+        );
+        ensure!(
+            gate_weights
+                .iter()
+                .all(|weight| weight.is_finite() && *weight >= 0.0),
+            "routing trace gate weights must be finite and non-negative"
+        );
         self.trace.decisions.push(RoutingDecision {
             token_index: u32::try_from(token_index)
                 .context("routing-trace token index exceeds u32")?,
             phase,
             layer_index: expected_layer,
             experts: experts.to_vec(),
+            gate_weights: gate_weights.to_vec(),
         });
         Ok(())
     }
@@ -2119,10 +2185,13 @@ mod tests {
                 },
                 layer_index: 1,
                 experts: vec![expert],
+                gate_weights: vec![0.5],
             })
             .collect();
         RoutingTrace {
             schema_version: ROUTING_TRACE_SCHEMA_VERSION,
+            routed_scaling_factor: Some(0.5),
+            norm_topk_prob: Some(true),
             prefill_schedule: RoutingPrefillSchedule::TokenSerial,
             model_family: RoutingModelFamily::Glm5Next,
             domain: "hand-calculated".to_owned(),
@@ -2159,6 +2228,112 @@ mod tests {
     }
 
     #[test]
+    fn schema_two_traces_validate_without_gate_weights() {
+        let trace = hand_trace(&[0, 0, 1, 0]);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&trace.canonical_json().unwrap()).unwrap();
+        value["schema_version"] = serde_json::json!(2);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("routed_scaling_factor");
+        value.as_object_mut().unwrap().remove("norm_topk_prob");
+        for decision in value["decisions"].as_array_mut().unwrap() {
+            decision.as_object_mut().unwrap().remove("gate_weights");
+        }
+        let v2 = RoutingTrace::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(v2.decisions.iter().all(|d| d.gate_weights.is_empty()));
+        assert_eq!(v2.routed_scaling_factor, None);
+        v2.validate().unwrap();
+
+        value["schema_version"] = serde_json::json!(ROUTING_TRACE_SCHEMA_VERSION + 1);
+        let error = RoutingTrace::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported GLM routing-trace schema")
+        );
+    }
+
+    #[test]
+    fn gate_weight_contract_is_enforced_when_present() {
+        let mut trace = hand_trace(&[0, 0, 1, 0]);
+        trace.decisions[0].gate_weights = vec![0.4];
+        let error = trace.validate().unwrap_err();
+        assert!(error.to_string().contains("routed scaling factor"));
+
+        let mut trace = hand_trace(&[0, 0, 1, 0]);
+        trace.decisions[0].gate_weights = vec![f32::NAN];
+        assert!(
+            trace
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("0..=1e3")
+        );
+
+        let mut trace = hand_trace(&[0, 0, 1, 0]);
+        trace.decisions[0].gate_weights = vec![1e3 + 1.0];
+        assert!(
+            trace
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("0..=1e3")
+        );
+
+        // Schema 3 promises the router parameters that make the sum checkable.
+        let mut trace = hand_trace(&[0, 0, 1, 0]);
+        trace.norm_topk_prob = None;
+        assert!(
+            trace
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("norm_topk_prob")
+        );
+
+        // A schema-2 trace may carry weights without them; the sum goes unchecked.
+        let mut trace = hand_trace(&[0, 0, 1, 0]);
+        trace.schema_version = 2;
+        trace.norm_topk_prob = None;
+        trace.decisions[0].gate_weights = vec![0.4];
+        trace.validate().unwrap();
+    }
+
+    #[test]
+    fn schema_three_traces_require_gate_weights() {
+        let trace = hand_trace(&[0, 0, 1, 0]);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&trace.canonical_json().unwrap()).unwrap();
+        for decision in value["decisions"].as_array_mut().unwrap() {
+            decision.as_object_mut().unwrap().remove("gate_weights");
+        }
+        let error = RoutingTrace::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("no gate weights"));
+
+        let mut truncated = hand_trace(&[0, 0, 1, 0]);
+        truncated.decisions[2].gate_weights.clear();
+        assert!(
+            truncated
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("no gate weights")
+        );
+
+        let mut without_scaling = hand_trace(&[0, 0, 1, 0]);
+        without_scaling.routed_scaling_factor = None;
+        assert!(
+            without_scaling
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("routed_scaling_factor")
+        );
+    }
+
+    #[test]
     fn trace_validation_rejects_incomplete_or_ambiguous_routes() {
         let mut trace = hand_trace(&[0, 0, 1, 0]);
         trace.decisions.pop();
@@ -2173,12 +2348,14 @@ mod tests {
         let mut trace = hand_trace(&[0, 0, 1, 0]);
         trace.experts_per_token = 2;
         trace.decisions[0].experts = vec![0, 0];
+        trace.decisions[0].gate_weights = vec![0.25, 0.25];
         assert!(trace.validate().unwrap_err().to_string().contains("unique"));
 
         let mut trace = hand_trace(&[0, 0, 1, 0]);
         trace.experts_per_token = 2;
         for decision in &mut trace.decisions {
             decision.experts = vec![1, 0];
+            decision.gate_weights = vec![0.25, 0.25];
         }
         trace.validate().unwrap();
 
@@ -2265,16 +2442,20 @@ mod tests {
                 phase,
                 layer_index: 0,
                 experts: vec![layer_zero],
+                gate_weights: vec![0.5],
             });
             decisions.push(RoutingDecision {
                 token_index: token_index as u32,
                 phase,
                 layer_index: 1,
                 experts: vec![layer_one],
+                gate_weights: vec![0.5],
             });
         }
         let trace = RoutingTrace {
             schema_version: ROUTING_TRACE_SCHEMA_VERSION,
+            routed_scaling_factor: Some(0.5),
+            norm_topk_prob: Some(true),
             prefill_schedule: RoutingPrefillSchedule::TokenSerial,
             model_family: RoutingModelFamily::Glm5Next,
             domain: "pool-ablation".to_owned(),
@@ -2605,11 +2786,14 @@ mod tests {
                     },
                     layer_index: layer,
                     experts: (0..8).map(|offset| (start + offset * 13) % 288).collect(),
+                    gate_weights: vec![0.125; 8],
                 });
             }
         }
         let trace = RoutingTrace {
             schema_version: ROUTING_TRACE_SCHEMA_VERSION,
+            routed_scaling_factor: Some(1.0),
+            norm_topk_prob: Some(true),
             prefill_schedule: RoutingPrefillSchedule::TokenSerial,
             model_family: RoutingModelFamily::Glm5Next,
             domain: "a4-shape-synthetic-routes".to_owned(),
@@ -2698,6 +2882,12 @@ mod tests {
         assert_eq!(trace.decisions[1].phase, RoutingTracePhase::Decode);
         assert_eq!(trace.decisions[0].experts, [0, 1]);
         assert_eq!(trace.decisions[1].experts, [0, 1]);
+        // The fixture normalizes top-k weights and scales their sum to 2.5.
+        for decision in &trace.decisions {
+            assert_eq!(decision.gate_weights.len(), 2);
+            let sum: f32 = decision.gate_weights.iter().sum();
+            assert!((sum - 2.5).abs() < 1e-5, "gate weights sum to {sum}");
+        }
         assert_eq!(
             RoutingTrace::from_json(&trace.canonical_json().unwrap()).unwrap(),
             trace

@@ -775,6 +775,8 @@ mod tests {
         let sequence = [0, 0, 1, 0];
         let trace = RoutingTrace {
             schema_version: ROUTING_TRACE_SCHEMA_VERSION,
+            routed_scaling_factor: Some(1.0),
+            norm_topk_prob: Some(false),
             prefill_schedule: flyingfish::glm::routing_trace::RoutingPrefillSchedule::TokenSerial,
             model_family: RoutingModelFamily::Glm5Next,
             domain: "cli-test".to_owned(),
@@ -802,6 +804,7 @@ mod tests {
                     },
                     layer_index: 1,
                     experts: vec![expert],
+                    gate_weights: vec![0.5],
                 })
                 .collect(),
         };

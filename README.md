@@ -62,59 +62,11 @@ ff text generate \
     --max-new-tokens 32
 ```
 
-Use `--device cuda:0` or `--device metal:0` with the corresponding build. Add `--draft-model "<dspark-checkpoint>"` to enable speculative decoding.
+Use `--device cuda:0` or `--device metal:0` with the corresponding build.
 
-### GLM with explicit cache budgets
+## Model guide
 
-Generate with explicit cache budgets; parameter and memory admission checks run before inference:
-
-```bash
-ff text generate \
-    --model "<glm-checkpoint>" \
-    --prompt 'Explain paging to a systems programmer.' \
-    --device cuda:0 \
-    --max-new-tokens 32 \
-    --weight-source mmap \
-    --host-cache-mib 4096 --host-cache-granularity tensor \
-    --expert-cache-mib 2048 --expert-cache-replacement lru \
-    --json
-```
-
-Adjust the cache budgets for the machine. The current GLM text profile handles one request at a time with at most 2,048 prompt-plus-generated tokens, and requires `--weight-source mmap`. Use `ff text generate-multi --help` for CUDA layer partitioning across devices.
-
-### Resumable H3 generation
-
-```bash
-mkdir -p output
-ff video generate \
-    --model "<h3-checkpoint>" \
-    --prompt 'A fishing boat crossing a calm lake at sunrise.' \
-    --device cuda:0 \
-    --short-edge 768 --aspect-ratio 16:9 --duration-seconds 4 \
-    --output-dir output/boat
-```
-
-A successful run writes PNGs under `frames/`, `generated.wav` and recovery checkpoints in the run directory. Repeating the same command with the same output directory resumes an interrupted run.
-
-Use `ff video --help` for first/last-frame and reference-conditioning workflows, and `ff music generate --help`, `ff 3d generate --help` or `ff similarity score --help` for the other adapters.
-
-### 3D generation
-
-Generate a colored mesh with TRELLIS.2 and its DINOv3 conditioner. The input is a prepared 512×512 PNG:
-
-```bash
-ff 3d generate \
-    --model "<trellis2-checkpoint>" \
-    --conditioner "<dinov3-checkpoint>" \
-    --models-root "<models-root>" \
-    --image "<prepared-image.png>" \
-    --resolution 512 \
-    --output "<mesh.ply>"
-```
-
-TRELLIS-1 uses the same task entry point with a compatible text or image conditioner. Its text path accepts `--prompt`; its image path accepts a prepared 518×518 PNG. Use `ff 3d --help` for generation and decoding operations.
-
-See [Adding model adapters](docs/adding-models.md) for the CLI extension interface.
+See [Model guide](docs/models.md) for per-model commands, measured performance and adapter development.
 
 ## License
 
