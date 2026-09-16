@@ -582,6 +582,83 @@ mod tests {
         );
     }
     #[test]
+    fn unified_pool_blocks_weight_promotion_that_split_axes_admit() {
+        let base = baseline();
+        // Candidate differs only in the weights axis, so it reaches the
+        // host-promotion reserve check.
+        let mut promoted = base.clone();
+        promoted.weights.cache_bytes = Some(64 << 30);
+        let evidence = ResourceEvidence {
+            candidates: vec![MeasuredCandidate {
+                baseline_policy: EvidencePolicy::Glm(base.clone()),
+                candidate: EvidencePolicy::Glm(promoted.clone()),
+                minimum_improvement_basis_points: 200,
+                routing_trace: None,
+                routing_replay: None,
+                observed_peak_deltas: Some((1, None)),
+                routing_verified: false,
+                routing_profile: None,
+                pairs: (0..3)
+                    .map(|n| PairedObservation {
+                        baseline_wall_us: 1000,
+                        candidate_wall_us: 500,
+                        baseline_record: EvidenceArtifact {
+                            file: format!("wbase{n}.json"),
+                            bytes: 20 + n,
+                        },
+                        candidate_record: EvidenceArtifact {
+                            file: format!("wcandidate{n}.json"),
+                            bytes: 30 + n,
+                        },
+                        outputs_match: true,
+                    })
+                    .collect(),
+            }],
+            ..evidence()
+        };
+        // Pool (the device view is smallest) passes plain capacity but not the
+        // promotion reserve; the discrete host view admits both. Fixture peaks
+        // sit at ~1 GiB, so a 1.8 GiB pool is above capacity but below
+        // capacity plus the 1 GiB promotion reserve.
+        let mut unified_snapshot = snapshot();
+        unified_snapshot.device_free_memory_bytes = Some(1_932_735_283);
+        unified_snapshot.host_device_memory_is_unified = Some(true);
+        let mut discrete_snapshot = unified_snapshot.clone();
+        discrete_snapshot.host_device_memory_is_unified = None;
+
+        let selected = select(
+            &base,
+            &breakdown(),
+            &discrete_snapshot,
+            &context(),
+            ResourcePolicyMode::Performance,
+            &BTreeSet::new(),
+            Some(&evidence),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.policy.weights.cache_bytes,
+            Some(64 << 30),
+            "discrete axes admit the promotion reserve"
+        );
+
+        let selected = select(
+            &base,
+            &breakdown(),
+            &unified_snapshot,
+            &context(),
+            ResourcePolicyMode::Performance,
+            &BTreeSet::new(),
+            Some(&evidence),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.policy, base,
+            "unified pool must charge device bytes to the promotion reserve"
+        );
+    }
+
+    #[test]
     fn explicit_false_and_conservative_mode_own_the_choice() {
         for (mode, explicit) in [
             (ResourcePolicyMode::Conservative, BTreeSet::new()),

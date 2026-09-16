@@ -1056,6 +1056,94 @@ mod tests {
     }
 
     #[test]
+    fn unified_pool_shrinks_automatic_expert_cache_by_host_peaks() {
+        // Hand-rolled CUDA breakdown: the all-experts clamp must not bind, so
+        // expert geometry is sized large enough to leave the pool arithmetic
+        // observable.
+        let inventory = ff_core::weights::accounting::CacheInventory {
+            shards: vec![ff_core::weights::accounting::CacheShardInventory {
+                name: "a.safetensors".into(),
+                file_bytes: 108,
+                header_bytes: 8,
+                selected_tensor_bytes: 100,
+                selected_tensor_count: 1,
+                largest_tensor_bytes: 100,
+            }],
+        };
+        let breakdown = GlmAdmissionBreakdown {
+            scope: GlmLayerScope {
+                start: 0,
+                end: 2,
+                total_layers: 2,
+            },
+            cpu_fp8_dequantization: false,
+            pinned_transfer_bytes: 0,
+            pinned_fill_ahead_bytes: 0,
+            static_load_device_bytes: 256 << 20,
+            expert_load_device_bytes: 8 << 20,
+            compute_on_host: false,
+            prompt_tokens: 2,
+            num_hidden_layers: 2,
+            num_experts: 288,
+            experts_per_token: 8,
+            sparse_layers: vec![1],
+            static_bytes: 1 << 30,
+            lm_head_bytes: 64 << 20,
+            largest_streamed_group_bytes: 32 << 20,
+            kda_state_bytes: 4,
+            dsa_cache_bytes_per_token: 4,
+            maximum_dsa_cache_bytes: 128,
+            maximum_dsa_layer_cache_bytes: 64,
+            live_expert_bytes: 80 << 20,
+            prefill_workspace_bytes: 128,
+            decode_workspace_bytes: 64,
+            host_route_workspace_bytes: 32,
+            host_sampling_workspace_bytes: 0,
+            prefill_host_mask_bytes: 0,
+            static_load_host_bytes: 16 << 20,
+            streamed_load_host_bytes: 16 << 20,
+            expert_load_host_bytes: 4 << 20,
+            raw_inventory: inventory,
+        };
+        let phases = breakdown.phases(false, 0, CachePolicy::new(1)).unwrap();
+        let device_required = phases
+            .iter()
+            .map(|p| p.required_device_bytes.unwrap_or(0) + p.device_reserve_bytes)
+            .max()
+            .unwrap();
+        let host_required = phases
+            .iter()
+            .map(|p| p.host_peak_bytes().unwrap())
+            .max()
+            .unwrap();
+        assert!(host_required > 0);
+        let all_experts = (80u64 << 20) / 5 * 3 * 288;
+        // Discrete: sized from the device view alone. The 8 GiB device view
+        // keeps the all-experts clamp (13.8 GiB) from binding.
+        let discrete = breakdown
+            .automatic_expert_cache_bytes(&phases, &snapshot(8 << 30, u64::MAX, Some(8 << 30)))
+            .unwrap();
+        let expected_discrete =
+            ((8u64 << 30) - device_required - (1 << 30)) / (1 << 20) * (1 << 20);
+        assert!(expected_discrete < all_experts, "clamp must not bind");
+        assert_eq!(discrete as u64, expected_discrete);
+        // Unified: same numbers, but the host phase peaks are subtracted from
+        // the shared pool too, so the result is strictly smaller.
+        let unified_snapshot = ResourceSnapshot {
+            host_device_memory_is_unified: Some(true),
+            ..snapshot(8 << 30, u64::MAX, Some(8 << 30))
+        };
+        let unified = breakdown
+            .automatic_expert_cache_bytes(&phases, &unified_snapshot)
+            .unwrap();
+        let pool = 8u64 << 30; // min(host, cgroup, device) views
+        let expected_unified =
+            (pool - device_required - host_required - (1 << 30)) / (1 << 20) * (1 << 20);
+        assert_eq!(unified as u64, expected_unified);
+        assert!(unified < discrete);
+    }
+
+    #[test]
     fn large_static_fp8_staging_uses_actual_shape_and_cpu_output_is_not_charged_twice() {
         let metadata = |shape: Vec<usize>, dtype: &str, bytes| TensorMetadata {
             name: "static.weight".into(),
