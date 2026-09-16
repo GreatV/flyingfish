@@ -73,6 +73,10 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         assumptions.activation_element_bytes = 4;
         assumptions.device_memory_is_host = true;
     }
+    // Unified-memory devices (e.g. Jetson) share one pool across both axes.
+    if snapshot.host_device_memory_is_unified == Some(true) {
+        assumptions.device_memory_is_host = true;
+    }
     assumptions.evaluation_count = u64::try_from(request.evaluations)?;
     assumptions.precompute_adaln_steps = if request.baseline.precompute_adaln {
         assumptions.evaluation_count

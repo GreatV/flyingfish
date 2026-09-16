@@ -451,12 +451,15 @@ pub fn decide_device_residency(
     reserve_bytes: u64,
     authorization: ResidencyAuthorization,
 ) -> Result<DeviceResidencyDecision> {
-    decide_residency_within(
-        snapshot.device_free_memory_bytes.unwrap_or(0),
-        demands,
-        reserve_bytes,
-        authorization,
-    )
+    // On a probed unified-memory device, host allocations draw from the same
+    // pool, so the binding capacity is the smaller pool view rather than the
+    // device view alone. Discrete and unprobed captures use the device view
+    // exactly as before.
+    let capacity = snapshot
+        .unified_pool_available_bytes()
+        .or(snapshot.device_free_memory_bytes)
+        .unwrap_or(0);
+    decide_residency_within(capacity, demands, reserve_bytes, authorization)
 }
 
 /// One device's capacity, as probed for that device. `ResourceSnapshot` reports
@@ -887,6 +890,7 @@ mod tests {
             cgroup_v2_memory_current_bytes: None,
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: device_free,
+            host_device_memory_is_unified: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -1127,6 +1131,7 @@ mod tests {
         let demands = [sharded, demand("norms", 8, 8, 8)];
         let snapshot = ResourceSnapshot {
             device_free_memory_bytes: Some(96),
+            host_device_memory_is_unified: None,
             ..ResourceSnapshot::capture(None)
         };
         let authorization = ResidencyAuthorization::OperatorExplicit {

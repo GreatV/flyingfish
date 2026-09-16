@@ -392,12 +392,41 @@ pub struct ResourceSnapshot {
     pub cgroup_v2_memory_available_bytes: Option<u64>,
     #[serde(deserialize_with = "crate::required_option")]
     pub device_free_memory_bytes: Option<u64>,
+    /// Whether host and device memory are one shared physical pool (the CUDA
+    /// `integrated` device attribute, e.g. Jetson unified memory). `Some(true)`
+    /// switches admission to combined-pool accounting. `None` — legacy records,
+    /// non-CUDA backends, and (warned-once) failed probes — keeps the split
+    /// per-axis checks every consumer used before this field existed, as does
+    /// a confirmed-discrete `Some(false)`. The distinction that matters for
+    /// correctness is `Some(true)` versus everything else; the distinction
+    /// between `None` and `Some(false)` is provenance for diagnostics.
+    #[serde(default)]
+    pub host_device_memory_is_unified: Option<bool>,
     pub measurement_scope: ResourceMeasurementScopes,
 }
 
 impl ResourceSnapshot {
     pub fn capture(device: Option<&Device>) -> Self {
         resource_snapshot_with_source(device, &SystemProbeSource, unix_time_ms())
+    }
+
+    /// Available bytes of the single memory pool when the probe confirmed a
+    /// unified host/device topology. Both axes' charges draw from it, so the
+    /// binding budget is the smaller of the two views. Returns `None` when
+    /// the topology is discrete or was not probed, and when either view of
+    /// the pool could not be measured.
+    pub fn unified_pool_available_bytes(&self) -> Option<u64> {
+        if self.host_device_memory_is_unified != Some(true) {
+            return None;
+        }
+        [
+            self.host_memory_available_bytes,
+            self.cgroup_v2_memory_available_bytes,
+            self.device_free_memory_bytes,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 }
 
@@ -535,6 +564,7 @@ fn resource_snapshot_with_source(
     let (cgroup_v2_memory_limit, cgroup_v2_memory_current_bytes, cgroup_v2_memory_available_bytes) =
         read_cgroup_v2_memory(source).unwrap_or((None, None, None));
     let device_free_memory_bytes = device.and_then(device_free_memory);
+    let host_device_memory_is_unified = device.and_then(device_memory_is_unified);
 
     ResourceSnapshot {
         schema_version: RESOURCE_SNAPSHOT_SCHEMA_VERSION,
@@ -544,6 +574,7 @@ fn resource_snapshot_with_source(
         cgroup_v2_memory_current_bytes,
         cgroup_v2_memory_available_bytes,
         device_free_memory_bytes,
+        host_device_memory_is_unified,
         measurement_scope: ResourceMeasurementScopes {
             host_memory: host_memory_available_bytes.map(|_| MemoryMeasurementScope::HostWide),
             cgroup_memory: (cgroup_v2_memory_limit.is_some()
@@ -986,6 +1017,43 @@ fn device_free_memory(_device: &Device) -> Option<u64> {
     None
 }
 
+/// Probe the CUDA `integrated` device attribute once at snapshot capture.
+/// `Some(false)` is a confirmed discrete topology; `None` means unprobed
+/// (non-CUDA device or build). A query failure on a CUDA device is not
+/// silent: it warns once per process before falling back to `None`, so a real
+/// integrated device cannot regress to split-axis accounting unnoticed.
+#[cfg(feature = "cuda")]
+fn device_memory_is_unified(device: &Device) -> Option<bool> {
+    use candle_core::cuda_backend::cudarc::driver::sys;
+
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let cuda = device.as_cuda_device().ok()?;
+    let stream = cuda.cuda_stream();
+    let mut value = 0_i32;
+    let result = unsafe {
+        sys::cuDeviceGetAttribute(
+            &raw mut value,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED,
+            stream.context().cu_device(),
+        )
+    };
+    if result == sys::CUresult::CUDA_SUCCESS {
+        return Some(value != 0);
+    }
+    WARNED.call_once(|| {
+        eprintln!(
+            "warning: CUDA integrated-topology attribute query failed ({result:?}); \
+             this capture records host_device_memory_is_unified as unprobed"
+        );
+    });
+    None
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_memory_is_unified(_device: &Device) -> Option<bool> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1284,6 +1352,7 @@ mod tests {
                 cgroup_v2_memory_current_bytes: None,
                 cgroup_v2_memory_available_bytes: None,
                 device_free_memory_bytes: None,
+                host_device_memory_is_unified: None,
                 measurement_scope: ResourceMeasurementScopes {
                     host_memory: None,
                     cgroup_memory: None,
@@ -1291,6 +1360,30 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn unified_pool_available_bytes_requires_a_probed_unified_topology() {
+        let snapshot = |unified: Option<bool>| ResourceSnapshot {
+            schema_version: RESOURCE_SNAPSHOT_SCHEMA_VERSION,
+            measured_at_unix_ms: 1,
+            host_memory_available_bytes: Some(10),
+            cgroup_v2_memory_limit: None,
+            cgroup_v2_memory_current_bytes: None,
+            cgroup_v2_memory_available_bytes: Some(8),
+            device_free_memory_bytes: Some(6),
+            host_device_memory_is_unified: unified,
+            measurement_scope: ResourceMeasurementScopes {
+                host_memory: None,
+                cgroup_memory: None,
+                device_memory: None,
+            },
+        };
+        // Unprobed (legacy) and confirmed-discrete records expose no pool.
+        assert_eq!(snapshot(None).unified_pool_available_bytes(), None);
+        assert_eq!(snapshot(Some(false)).unified_pool_available_bytes(), None);
+        // A probed unified topology binds on the smallest view of the pool.
+        assert_eq!(snapshot(Some(true)).unified_pool_available_bytes(), Some(6));
     }
 
     #[test]

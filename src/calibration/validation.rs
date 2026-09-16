@@ -226,6 +226,12 @@ pub(super) fn validate_snapshot_backend(
                 let total_bytes = fingerprint.device_total_memory_bytes.context(
                     "CUDA calibration snapshot reports free memory without fingerprint total memory",
                 )?;
+                // On integrated (unified-memory) devices the fingerprint total
+                // is the whole system memory, not dedicated VRAM; the bound
+                // still holds, but neither value may be read as exclusive
+                // device capacity. `host_device_memory_is_unified == None`
+                // (legacy record) is not assumed discrete here — this
+                // assertion does not depend on the topology.
                 anyhow::ensure!(
                     free_bytes <= total_bytes,
                     "calibration {label} snapshot device-free memory exceeds fingerprint total memory"

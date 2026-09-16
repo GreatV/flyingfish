@@ -130,17 +130,39 @@ pub fn select(
             continue;
         }
         if candidate.weights != baseline.weights {
-            let host = crate::glm::admission::host_available(snapshot)
-                .context("host capacity unavailable")?;
+            // Unified-memory topologies charge the device peak to the same
+            // pool; reserving against the host view alone would overspend it.
+            let unified_pool = snapshot.unified_pool_available_bytes();
+            let host = match unified_pool {
+                Some(pool) => pool,
+                None => crate::glm::admission::host_available(snapshot)
+                    .context("host capacity unavailable")?,
+            };
             let reserve = (1_u64 << 30).max(host / 20);
             if breakdown
                 .phases(candidate.resident_static, expert_bytes, cache)?
                 .iter()
                 .any(|p| {
-                    p.host_peak_bytes()
-                        .ok()
-                        .and_then(|n| n.checked_add(reserve))
-                        .is_none_or(|n| n > host)
+                    let peak = match p.host_peak_bytes() {
+                        Ok(peak) => peak,
+                        Err(_) => return true,
+                    };
+                    let peak = if unified_pool.is_some() {
+                        match p
+                            .device_peak_bytes()
+                            .and_then(|d| {
+                                peak.checked_add(d.unwrap_or(0))
+                                    .context("unified promotion peak overflow")
+                            })
+                            .ok()
+                        {
+                            Some(peak) => peak,
+                            None => return true,
+                        }
+                    } else {
+                        peak
+                    };
+                    peak.checked_add(reserve).is_none_or(|n| n > host)
                 })
             {
                 observation.disposition = CandidateDisposition::CapacityRejected;
@@ -308,8 +330,13 @@ pub fn select(
         cache_policy(&policy)?,
     )?;
     if policy.weights != baseline.weights {
-        let host =
-            crate::glm::admission::host_available(snapshot).context("host capacity unavailable")?;
+        // The reserve is sized from the same pool view the admission check
+        // used: the unified pool when probed, else the host view.
+        let host = match snapshot.unified_pool_available_bytes() {
+            Some(pool) => pool,
+            None => crate::glm::admission::host_available(snapshot)
+                .context("host capacity unavailable")?,
+        };
         for phase in &mut phases {
             phase.host_promotion_reserve_bytes = (1_u64 << 30).max(host / 20);
         }
@@ -392,6 +419,7 @@ mod tests {
             cgroup_v2_memory_limit: Some(CgroupMemoryLimit::Bytes(8 << 30)),
             cgroup_v2_memory_current_bytes: Some(0),
             device_free_memory_bytes: None,
+            host_device_memory_is_unified: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,

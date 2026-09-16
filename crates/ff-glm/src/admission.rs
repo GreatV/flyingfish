@@ -614,7 +614,12 @@ impl GlmAdmissionBreakdown {
         if self.compute_on_host || self.sparse_layers.is_empty() {
             return Ok(0);
         }
-        let Some(free) = snapshot.device_free_memory_bytes else {
+        // On a probed unified-memory topology the cache draws from the same
+        // pool as every host charge, so size it from the combined peak instead
+        // of the device view alone. Discrete and unprobed captures take the
+        // device view exactly as before.
+        let unified_pool = snapshot.unified_pool_available_bytes();
+        let Some(free) = unified_pool.or(snapshot.device_free_memory_bytes) else {
             return Ok(0);
         };
         let required = phases.iter().try_fold(0u64, |peak, phase| {
@@ -628,7 +633,20 @@ impl GlmAdmissionBreakdown {
                 ),
             )
         })?;
-        let available = free.saturating_sub(required).saturating_sub(1 << 30);
+        // Host charges share the unified pool; the largest phase host peak
+        // (required plus optional retention, same ledger validate_capacity
+        // charges) is not available for device retention either.
+        let host_required = if unified_pool.is_some() {
+            phases.iter().try_fold(0u64, |peak, phase| {
+                Ok::<_, anyhow::Error>(peak.max(phase.host_peak_bytes()?))
+            })?
+        } else {
+            0
+        };
+        let available = free
+            .saturating_sub(required)
+            .saturating_sub(host_required)
+            .saturating_sub(1 << 30);
         let available = available / (1 << 20) * (1 << 20);
         let all_experts = (self.live_expert_bytes as u64 / 5)
             .checked_mul(3)
@@ -645,16 +663,35 @@ impl GlmAdmissionBreakdown {
         cache_policy: CachePolicy,
         snapshot: &ResourceSnapshot,
     ) -> Result<()> {
-        let host = host_available(snapshot)
-            .context("cannot measure free host memory for GLM admission")?;
+        // A probed unified-memory topology (e.g. Jetson) charges host and
+        // device peaks against one pool; independent per-axis checks would
+        // admit a combined footprint the machine cannot hold. `None` (unprobed
+        // or legacy record) keeps the split-axis behavior: degrading to
+        // discrete checks is unsafe only when the pool is known shared, and
+        // legacy records predate unified support entirely.
+        let unified_pool = snapshot.unified_pool_available_bytes();
         for phase in self.phases(resident_static, expert_cache_bytes, cache_policy)? {
-            let required = phase.host_peak_bytes()?;
+            let host_peak = phase.host_peak_bytes()?;
+            let device_peak = phase.device_peak_bytes()?;
+            if let Some(pool) = unified_pool {
+                let combined = host_peak
+                    .checked_add(device_peak.unwrap_or(0))
+                    .context("GLM unified-pool peak overflow")?;
+                ensure!(
+                    combined <= pool,
+                    "GLM {} needs {combined} bytes from the unified host/device pool, but only {pool} are available",
+                    phase.phase
+                );
+                continue;
+            }
+            let host = host_available(snapshot)
+                .context("cannot measure free host memory for GLM admission")?;
             ensure!(
-                required <= host,
-                "GLM {} needs {required} free host bytes, but only {host} are available",
+                host_peak <= host,
+                "GLM {} needs {host_peak} free host bytes, but only {host} are available",
                 phase.phase
             );
-            if let Some(required) = phase.device_peak_bytes()? {
+            if let Some(required) = device_peak {
                 let free = snapshot
                     .device_free_memory_bytes
                     .context("cannot measure free CUDA memory for GLM admission")?;
@@ -877,6 +914,7 @@ mod tests {
             cgroup_v2_memory_current_bytes: Some(0),
             cgroup_v2_memory_available_bytes: Some(cgroup),
             device_free_memory_bytes: device,
+            host_device_memory_is_unified: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -967,6 +1005,54 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn unified_pool_charges_host_and_device_peaks_together() {
+        let root = tiny_checkpoint();
+        crate::test_support::quantize_tiny_linears(root.path());
+        let weights =
+            ModelWeights::open(root.path(), WeightSource::Mmap, CachePolicy::new(1)).unwrap();
+        let config = GlmConfig::from_model_dir(root.path()).unwrap();
+        let gpu =
+            GlmAdmissionBreakdown::from_metadata(&weights, &config.text_config, false, 2).unwrap();
+        let phases = gpu.phases(false, 0, CachePolicy::new(1)).unwrap();
+        let host_peak = phases
+            .iter()
+            .map(|p| p.host_peak_bytes().unwrap())
+            .max()
+            .unwrap();
+        let device_peak = phases
+            .iter()
+            .map(|p| p.device_peak_bytes().unwrap().unwrap())
+            .max()
+            .unwrap();
+        assert!(host_peak > 0 && device_peak > 0);
+        // Each axis fits its own view, but the sum exceeds the shared pool.
+        let pool = host_peak.max(device_peak);
+        assert!(pool < host_peak + device_peak);
+        let unified = |unified: Option<bool>, pool: u64| ResourceSnapshot {
+            host_device_memory_is_unified: unified,
+            ..snapshot(pool, u64::MAX, Some(pool))
+        };
+        assert!(
+            gpu.validate_capacity(false, 0, CachePolicy::new(1), &unified(Some(true), pool))
+                .is_err()
+        );
+        // Unprobed (None) and confirmed-discrete (Some(false)) records keep the
+        // split-axis behavior: the same numbers are admitted.
+        for legacy in [None, Some(false)] {
+            gpu.validate_capacity(false, 0, CachePolicy::new(1), &unified(legacy, pool))
+                .unwrap();
+        }
+        // A pool that holds the combined peak is admitted.
+        gpu.validate_capacity(
+            false,
+            0,
+            CachePolicy::new(1),
+            &unified(Some(true), host_peak + device_peak),
+        )
+        .unwrap();
     }
 
     #[test]

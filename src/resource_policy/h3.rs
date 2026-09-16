@@ -602,6 +602,7 @@ mod tests {
             cgroup_v2_memory_current_bytes: None,
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: None,
+            host_device_memory_is_unified: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,

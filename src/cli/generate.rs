@@ -2044,6 +2044,12 @@ fn preflight_generation(
         assumptions.activation_element_bytes = 4;
         assumptions.device_memory_is_host = true;
     }
+    // A probed unified-memory device (e.g. Jetson) draws device allocations
+    // from the host pool; fold the device axis into host accounting instead of
+    // checking the two axes against the same bytes independently.
+    if snapshot.host_device_memory_is_unified == Some(true) {
+        assumptions.device_memory_is_host = true;
+    }
     assumptions.use_flash_attention = policy.flash_attention();
     assumptions.evaluation_count =
         u64::try_from(evaluation_count).context("evaluation count exceeds u64")?;
@@ -3614,6 +3620,7 @@ mod tests {
             cgroup_v2_memory_current_bytes: None,
             cgroup_v2_memory_available_bytes: Some(8 * 1024 * 1024),
             device_free_memory_bytes: Some(6 * 1024 * 1024),
+            host_device_memory_is_unified: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -3649,6 +3656,7 @@ mod tests {
             cgroup_v2_memory_current_bytes: None,
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: None,
+            host_device_memory_is_unified: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
