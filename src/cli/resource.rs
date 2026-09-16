@@ -74,7 +74,8 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         assumptions.device_memory_is_host = true;
     }
     // Unified-memory devices (e.g. Jetson) share one pool across both axes.
-    if snapshot.host_device_memory_is_unified == Some(true) {
+    let unified = snapshot.host_device_memory_is_unified == Some(true);
+    if unified {
         assumptions.device_memory_is_host = true;
     }
     assumptions.evaluation_count = u64::try_from(request.evaluations)?;
@@ -158,7 +159,19 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         evidence: evidence.as_ref().map(|(record, _)| record),
         locked_origin: request.locked_origin,
         resident_input_bytes: request.resident_input_bytes,
-        additional_host_allowance_bytes: request.additional_host_allowance_bytes,
+        // Under the unified fold the once-only device reserve is charged to
+        // the host axis instead of stamped on phases (host-only phases carry
+        // no device reserve). This holds the "modelled peaks plus at least
+        // DEVICE_RESIDENCY_RESERVE_BYTES of slack" invariant unconditionally,
+        // including the paths where automatic_device_cache early-returns.
+        additional_host_allowance_bytes: request
+            .additional_host_allowance_bytes
+            .checked_add(if unified {
+                super::DEVICE_RESIDENCY_RESERVE_BYTES
+            } else {
+                0
+            })
+            .context("H3 host allowance overflow")?,
     };
     let automatic_cache = flyingfish::resource_policy::h3::automatic_device_cache(
         &selection_request,
