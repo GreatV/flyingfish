@@ -463,6 +463,14 @@ trait ProbeSource {
     fn host_available_memory_bytes(&self) -> Option<u64> {
         None
     }
+
+    /// Host-wide total physical memory, for platforms that report it outside
+    /// the filesystem. Reserves scale with totals rather than the momentary
+    /// available view, so a platform that cannot answer this falls back to an
+    /// available figure and loses that stability.
+    fn host_total_memory_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 struct SystemProbeSource;
@@ -474,24 +482,32 @@ impl ProbeSource for SystemProbeSource {
 
     #[cfg(windows)]
     fn host_available_memory_bytes(&self) -> Option<u64> {
-        windows_available_physical_bytes()
+        windows_physical_memory_bytes().map(|(available, _)| available)
+    }
+
+    #[cfg(windows)]
+    fn host_total_memory_bytes(&self) -> Option<u64> {
+        windows_physical_memory_bytes().map(|(_, total)| total)
     }
 }
 
-/// Windows' host-wide available physical memory.
+/// Windows' host-wide available and total physical memory, in that order.
 ///
 /// `ullAvailPhys` is the closest counterpart to Linux's `MemAvailable`: both
 /// answer "how much can a new allocation expect without paging". They are not
 /// computed the same way — `MemAvailable` includes reclaimable page cache,
 /// `ullAvailPhys` reports free physical pages — so a snapshot is comparable
-/// across runs on one host, not across platforms.
+/// across runs on one host, not across platforms. `ullTotalPhys` is the
+/// counterpart to `MemTotal` and needs no such caveat: it is a hardware
+/// property, which is why reserves are scaled from it.
 #[cfg(windows)]
-fn windows_available_physical_bytes() -> Option<u64> {
+fn windows_physical_memory_bytes() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
     let mut status = unsafe { std::mem::zeroed::<MEMORYSTATUSEX>() };
     status.dwLength = u32::try_from(size_of::<MEMORYSTATUSEX>()).ok()?;
-    (unsafe { GlobalMemoryStatusEx(&raw mut status) } != 0).then_some(status.ullAvailPhys)
+    (unsafe { GlobalMemoryStatusEx(&raw mut status) } != 0)
+        .then_some((status.ullAvailPhys, status.ullTotalPhys))
 }
 
 fn hardware_fingerprint_with_source(
@@ -590,7 +606,8 @@ fn resource_snapshot_with_source(
         .read_to_string(Path::new("/proc/meminfo"))
         .ok()
         .as_deref()
-        .and_then(|contents| parse_meminfo_bytes(contents, "MemTotal"));
+        .and_then(|contents| parse_meminfo_bytes(contents, "MemTotal"))
+        .or_else(|| source.host_total_memory_bytes());
     let device_total_memory_bytes = device.and_then(device_total_memory);
 
     ResourceSnapshot {
@@ -1121,6 +1138,53 @@ mod tests {
                 )
             })
         }
+    }
+
+    /// A platform with no `/proc/meminfo`, answering both host figures through
+    /// system calls the way the Windows source does.
+    struct SyscallOnlyProbeSource {
+        available: Option<u64>,
+        total: Option<u64>,
+    }
+
+    impl ProbeSource for SyscallOnlyProbeSource {
+        fn read_to_string(&self, _: &Path) -> io::Result<String> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "no procfs"))
+        }
+        fn host_available_memory_bytes(&self) -> Option<u64> {
+            self.available
+        }
+        fn host_total_memory_bytes(&self) -> Option<u64> {
+            self.total
+        }
+    }
+
+    #[test]
+    fn snapshot_takes_both_host_figures_from_the_source_without_procfs() {
+        // Reserves scale with the total, so a platform that reports only the
+        // available figure silently loses the stable margin; both hooks must
+        // be consulted, not just the one procfs happens to cover.
+        let snapshot = resource_snapshot_with_source(
+            None,
+            &SyscallOnlyProbeSource {
+                available: Some(4 << 30),
+                total: Some(16 << 30),
+            },
+            1,
+        );
+        assert_eq!(snapshot.host_memory_available_bytes, Some(4 << 30));
+        assert_eq!(snapshot.host_memory_total_bytes, Some(16 << 30));
+        // A source that answers neither reports neither, rather than passing
+        // one figure off as the other.
+        let blind = resource_snapshot_with_source(
+            None,
+            &SyscallOnlyProbeSource {
+                available: Some(4 << 30),
+                total: None,
+            },
+            1,
+        );
+        assert_eq!(blind.host_memory_total_bytes, None);
     }
 
     fn valid_current_cuda_fingerprint() -> HardwareFingerprint {
