@@ -381,6 +381,7 @@ mod tests {
                 cgroup_v2_memory_available_bytes: None,
                 device_free_memory_bytes: None,
                 host_device_memory_is_unified: None,
+                device_topology_probe_failed: false,
                 host_memory_total_bytes: None,
                 device_total_memory_bytes: None,
                 measurement_scope: ResourceMeasurementScopes {

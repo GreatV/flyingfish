@@ -478,27 +478,33 @@ impl GlmAdmissionBreakdown {
         // kernel-reclaimable, already counted as available in MemAvailable.
         // It is reported as `reclaimable_host_bytes` (telemetry) and never
         // charged in fit decisions; only exclusive allocations are.
+        // Tensor granularity materializes the largest shard header as an owned
+        // `encoded_header` Vec while validating each load. That copy is an
+        // exclusive allocation, not page cache, so it is charged as required
+        // host bytes; only the mapped payload residency below is reclaimable.
+        let header_copies =
+            if cache_policy.granularity == ff_core::weights::CacheGranularity::Tensor {
+                self.raw_inventory
+                    .shards
+                    .iter()
+                    .map(|s| s.header_bytes)
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
         let raw = estimate_cache_residency(
             &self.raw_inventory,
             WeightSource::Mmap,
             cache_policy,
             CacheLoadLifetimes {
-                additional_storage_bytes: if cache_policy.granularity
-                    == ff_core::weights::CacheGranularity::Tensor
-                {
-                    self.raw_inventory
-                        .shards
-                        .iter()
-                        .map(|s| s.header_bytes)
-                        .max()
-                        .unwrap_or(0)
-                } else {
-                    0
-                },
+                additional_storage_bytes: header_copies,
                 ..CacheLoadLifetimes::SERIAL
             },
         )?
-        .peak_storage_bytes;
+        .peak_storage_bytes
+        .checked_sub(header_copies)
+        .context("GLM cache residency is smaller than its header copies")?;
         let weights = if resident_static {
             self.static_bytes
         } else {
@@ -536,6 +542,7 @@ impl GlmAdmissionBreakdown {
                     })
                 })
                 .and_then(|n| n.checked_add(load_host))
+                .and_then(|n| n.checked_add(header_copies))
                 .context("GLM host workspace overflow")?;
             let compute = [weights, state, self.live_expert_bytes, workspace]
                 .into_iter()
@@ -662,7 +669,7 @@ impl GlmAdmissionBreakdown {
         // A confirmed shared pool whose size is unknown retains nothing: the
         // device view is not a substitute for it (see `residency.rs`, which
         // takes the same position for the same reason).
-        if snapshot.unified_pool_is_unmeasurable() {
+        if snapshot.unified_accounting_is_undecidable() {
             return Ok(0);
         }
         let unified_pool = snapshot.unified_pool_available_bytes();
@@ -789,7 +796,7 @@ impl GlmAdmissionBreakdown {
         // legacy records predate unified support entirely.
         let unified_pool = snapshot.unified_pool_available_bytes();
         ensure!(
-            !snapshot.unified_pool_is_unmeasurable(),
+            !snapshot.unified_accounting_is_undecidable(),
             "GLM admission needs the shared host/device pool size on a unified-memory device, \
              but one of the host and CUDA views could not be measured"
         );
@@ -1049,6 +1056,7 @@ mod tests {
             cgroup_v2_memory_available_bytes: (cgroup != u64::MAX).then_some(cgroup),
             device_free_memory_bytes: device,
             host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
@@ -1190,6 +1198,7 @@ mod tests {
         // what matters is the split/merged outcome pair below.)
         let unified = |unified: Option<bool>, pool: u64| ResourceSnapshot {
             host_device_memory_is_unified: unified,
+            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             ..snapshot(pool, u64::MAX, Some(pool))
@@ -1241,6 +1250,7 @@ mod tests {
         // instantaneous available view).
         let small = ResourceSnapshot {
             host_device_memory_is_unified: Some(true),
+            device_topology_probe_failed: false,
             host_memory_total_bytes: Some(7_849_050_112),
             device_total_memory_bytes: Some(7_849_050_112),
             ..snapshot(6272 << 20, u64::MAX, Some(6272 << 20))
@@ -1327,6 +1337,7 @@ mod tests {
         // the shared pool too, so the result is strictly smaller.
         let unified_snapshot = ResourceSnapshot {
             host_device_memory_is_unified: Some(true),
+            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             ..snapshot(8 << 30, u64::MAX, Some(8 << 30))

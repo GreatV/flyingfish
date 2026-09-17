@@ -458,7 +458,7 @@ pub fn decide_device_residency(
     // capacity: falling back to the device view there would authorize residency
     // past a host or cgroup constraint that was simply not measured, which is
     // the substitution `unified_pool_available_bytes` exists to prevent.
-    let capacity = if snapshot.unified_pool_is_unmeasurable() {
+    let capacity = if snapshot.unified_accounting_is_undecidable() {
         0
     } else {
         snapshot
@@ -899,6 +899,7 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: device_free,
             host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
@@ -1121,6 +1122,7 @@ mod tests {
         assert!(discrete > 0, "the discrete path must still place weights");
         let unmeasurable = ResourceSnapshot {
             host_device_memory_is_unified: Some(true),
+            device_topology_probe_failed: false,
             ..snapshot(Some(8 << 30))
         };
         assert!(unmeasurable.unified_pool_is_unmeasurable());
@@ -1133,6 +1135,7 @@ mod tests {
         // A measured shared pool places as usual.
         let measured = ResourceSnapshot {
             host_device_memory_is_unified: Some(true),
+            device_topology_probe_failed: false,
             host_memory_available_bytes: Some(8 << 30),
             ..snapshot(Some(8 << 30))
         };
@@ -1181,6 +1184,7 @@ mod tests {
         let snapshot = ResourceSnapshot {
             device_free_memory_bytes: Some(96),
             host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             ..ResourceSnapshot::capture(None)

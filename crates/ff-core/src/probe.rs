@@ -402,6 +402,14 @@ pub struct ResourceSnapshot {
     /// between `None` and `Some(false)` is provenance for diagnostics.
     #[serde(default)]
     pub host_device_memory_is_unified: Option<bool>,
+    /// A live CUDA topology query that failed, as opposed to a record that
+    /// predates the field or a non-CUDA capture. All three read as `None`
+    /// above, but only this one describes a present CUDA device whose topology
+    /// is unknown — and on an integrated device the split per-axis checks that
+    /// `None` falls back to are the unsound accounting this field exists to
+    /// prevent. Defaults to false, so legacy records keep the old behaviour.
+    #[serde(default)]
+    pub device_topology_probe_failed: bool,
     /// Hardware-level totals (MemTotal / device total memory), unlike the
     /// instantaneous `*_available`/`device_free` views. Reserve sizes scale
     /// with totals so that a run's margin does not shrink when the machine is
@@ -456,6 +464,16 @@ impl ResourceSnapshot {
             (Some(host), Some(limit)) => Some(host.min(limit)),
             (host, limit) => host.or(limit),
         }
+    }
+
+    /// Whether admission must refuse rather than fall back to independent
+    /// per-axis checks: either a confirmed shared pool whose size is unknown,
+    /// or a live CUDA device whose topology query failed, which leaves the
+    /// question of whether to fold unanswered. Assuming discrete in either case
+    /// is the specific unsoundness this work exists to remove — a warning does
+    /// not prevent the OOM that follows.
+    pub fn unified_accounting_is_undecidable(&self) -> bool {
+        self.device_topology_probe_failed || self.unified_pool_is_unmeasurable()
     }
 
     /// Whether the probe confirmed a shared host/device pool whose size it
@@ -619,7 +637,9 @@ fn resource_snapshot_with_source(
     let (cgroup_v2_memory_limit, cgroup_v2_memory_current_bytes, cgroup_v2_memory_available_bytes) =
         read_cgroup_v2_memory(source).unwrap_or((None, None, None));
     let device_free_memory_bytes = device.and_then(device_free_memory);
-    let host_device_memory_is_unified = device.and_then(device_memory_is_unified);
+    let (host_device_memory_is_unified, device_topology_probe_failed) = device
+        .map(device_memory_is_unified)
+        .unwrap_or((None, false));
     let host_memory_total_bytes = source
         .read_to_string(Path::new("/proc/meminfo"))
         .ok()
@@ -637,6 +657,7 @@ fn resource_snapshot_with_source(
         cgroup_v2_memory_available_bytes,
         device_free_memory_bytes,
         host_device_memory_is_unified,
+        device_topology_probe_failed,
         host_memory_total_bytes,
         device_total_memory_bytes,
         measurement_scope: ResourceMeasurementScopes {
@@ -1099,11 +1120,13 @@ fn device_total_memory(_device: &Device) -> Option<u64> {
 /// silent: it warns once per process before falling back to `None`, so a real
 /// integrated device cannot regress to split-axis accounting unnoticed.
 #[cfg(feature = "cuda")]
-fn device_memory_is_unified(device: &Device) -> Option<bool> {
+fn device_memory_is_unified(device: &Device) -> (Option<bool>, bool) {
     use candle_core::cuda_backend::cudarc::driver::sys;
 
     static WARNED: std::sync::Once = std::sync::Once::new();
-    let cuda = device.as_cuda_device().ok()?;
+    let Ok(cuda) = device.as_cuda_device() else {
+        return (None, false);
+    };
     let stream = cuda.cuda_stream();
     let mut value = 0_i32;
     let result = unsafe {
@@ -1114,7 +1137,7 @@ fn device_memory_is_unified(device: &Device) -> Option<bool> {
         )
     };
     if result == sys::CUresult::CUDA_SUCCESS {
-        return Some(value != 0);
+        return (Some(value != 0), false);
     }
     WARNED.call_once(|| {
         eprintln!(
@@ -1122,12 +1145,12 @@ fn device_memory_is_unified(device: &Device) -> Option<bool> {
              this capture records host_device_memory_is_unified as unprobed"
         );
     });
-    None
+    (None, true)
 }
 
 #[cfg(not(feature = "cuda"))]
-fn device_memory_is_unified(_device: &Device) -> Option<bool> {
-    None
+fn device_memory_is_unified(_device: &Device) -> (Option<bool>, bool) {
+    (None, false)
 }
 
 #[cfg(test)]
@@ -1188,6 +1211,7 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: None,
             host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
             host_memory_total_bytes: host,
             device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
@@ -1523,6 +1547,7 @@ mod tests {
                 cgroup_v2_memory_available_bytes: None,
                 device_free_memory_bytes: None,
                 host_device_memory_is_unified: None,
+                device_topology_probe_failed: false,
                 host_memory_total_bytes: None,
                 device_total_memory_bytes: None,
                 measurement_scope: ResourceMeasurementScopes {
@@ -1545,6 +1570,7 @@ mod tests {
             cgroup_v2_memory_available_bytes: Some(8),
             device_free_memory_bytes: Some(6),
             host_device_memory_is_unified: unified,
+            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {

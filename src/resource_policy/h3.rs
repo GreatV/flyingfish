@@ -70,7 +70,7 @@ pub fn automatic_device_cache(
     // above excludes it.)
     // A confirmed shared pool whose size is unknown retains nothing: the device
     // view would authorize retention past an unmeasured host constraint.
-    if request.snapshot.unified_pool_is_unmeasurable() {
+    if request.snapshot.unified_accounting_is_undecidable() {
         return Ok(None);
     }
     let unified_pool = request.snapshot.unified_pool_available_bytes();
@@ -699,6 +699,7 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: None,
             host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {

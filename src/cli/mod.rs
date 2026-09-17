@@ -529,7 +529,7 @@ fn decide_auto_residency_with_required_memory(
     // requests got the correction. A confirmed pool of unknown size retains
     // nothing rather than falling back to the device view.
     let snapshot = ResourceSnapshot::capture(Some(device));
-    let capacity = if snapshot.unified_pool_is_unmeasurable() {
+    let capacity = if snapshot.unified_accounting_is_undecidable() {
         0
     } else {
         snapshot
