@@ -37,6 +37,13 @@ impl std::fmt::Display for AdmissionRefused {
 
 impl std::error::Error for AdmissionRefused {}
 
+/// A refusal's own destination beside a selection sidecar. Sharing the path
+/// would make the diagnostic block the retry it exists to inform: the caller's
+/// `ensure_new_output` rejects the existing file before admission can rerun.
+pub fn refusal_path_for(selection: &Path) -> std::path::PathBuf {
+    selection.with_extension("refusal.json")
+}
+
 /// Publish the refusal record and print per-candidate reasons, if the error
 /// carries one. Returns the summary for the outward error message.
 pub fn report_refusal(error: &anyhow::Error, sidecar: Option<&Path>) -> Option<String> {
@@ -49,7 +56,10 @@ pub fn report_refusal(error: &anyhow::Error, sidecar: Option<&Path>) -> Option<S
     }
     if let Some(path) = sidecar {
         // Created here, not at each call site: `ArtifactStaging` canonicalizes
-        // the parent, and five of six callers did not do this.
+        // the parent, and five of six callers did not do this. A previous
+        // attempt's record is removed first: this path is retryable by design,
+        // and `ArtifactStaging` will not replace a destination, so keeping the
+        // stale ledger would describe a snapshot that no longer applies.
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
             && let Err(error) = std::fs::create_dir_all(parent)
@@ -58,6 +68,11 @@ pub fn report_refusal(error: &anyhow::Error, sidecar: Option<&Path>) -> Option<S
                 "warning: cannot create {} for the refusal record: {error}",
                 parent.display()
             );
+        }
+        if path.exists()
+            && let Err(error) = std::fs::remove_file(path)
+        {
+            eprintln!("warning: cannot replace {}: {error}", path.display());
         }
         if let Err(error) = publish_selection(path, &refusal.provenance) {
             eprintln!("warning: failed to publish refusal resource selection: {error}");

@@ -503,7 +503,12 @@ pub(super) fn run_denoise_conditioned(command: H3Command) -> Result<()> {
     }) {
         Ok(selected) => selected,
         Err(error) => {
-            flyingfish::resource_policy::report_refusal(&error, Some(&selection_path));
+            flyingfish::resource_policy::report_refusal(
+                &error,
+                Some(&flyingfish::resource_policy::refusal_path_for(
+                    &selection_path,
+                )),
+            );
             return Err(error);
         }
     };

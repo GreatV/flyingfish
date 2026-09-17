@@ -336,7 +336,13 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
             // A refusal still publishes its per-candidate record when a
             // sidecar path was given, so the rejection can be calibrated
             // against instead of guessed about.
-            flyingfish::resource_policy::report_refusal(&error, resource_selection.as_deref());
+            flyingfish::resource_policy::report_refusal(
+                &error,
+                resource_selection
+                    .as_deref()
+                    .map(flyingfish::resource_policy::refusal_path_for)
+                    .as_deref(),
+            );
             return Err(error);
         }
     };
@@ -383,7 +389,13 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
             provenance,
             summary: format!("GLM final admission refused: {error}"),
         });
-        flyingfish::resource_policy::report_refusal(&refusal, resource_selection.as_deref());
+        flyingfish::resource_policy::report_refusal(
+            &refusal,
+            resource_selection
+                .as_deref()
+                .map(flyingfish::resource_policy::refusal_path_for)
+                .as_deref(),
+        );
         return Err(refusal);
     }
     selection.provenance.final_admission_snapshot = Some(admission_snapshot.clone());
