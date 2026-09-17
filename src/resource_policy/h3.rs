@@ -77,7 +77,17 @@ pub fn automatic_device_cache(
     let Some(free) = unified_pool.or(request.snapshot.device_free_memory_bytes) else {
         return Ok(None);
     };
-    let capacity = request.budget.max_device_bytes.unwrap_or(free).min(free);
+    // Under the unified fold every charge — including this retention — lands on
+    // the host axis, so an explicit `--max-host-mib` bounds it as well. Sizing
+    // from the device bound alone would fill the measured pool past that limit,
+    // and because the retained policy replaces the baseline before selection,
+    // the run is then refused outright instead of choosing a smaller cache.
+    let mut capacity = request.budget.max_device_bytes.unwrap_or(free).min(free);
+    if unified_pool.is_some()
+        && let Some(host_bound) = request.budget.max_host_bytes
+    {
+        capacity = capacity.min(host_bound);
+    }
     let modeled = estimate(request, request.baseline)?;
     let (host, required) = future_peaks(request, &modeled)?;
     // The retention draws from the same pool as every other charge. Under the
