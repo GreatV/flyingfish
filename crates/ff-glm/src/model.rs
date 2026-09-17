@@ -249,6 +249,17 @@ pub(crate) fn pinned_staging_shape() -> (usize, usize) {
     (fp8::cuda::configured_lanes(), depth)
 }
 
+/// Loads in flight: the foreground one plus any fill-ahead workers.
+#[cfg(feature = "cuda")]
+pub(crate) fn concurrent_load_count() -> usize {
+    fill_ahead_count().saturating_add(1)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn concurrent_load_count() -> usize {
+    1
+}
+
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn pinned_staging_shape() -> (usize, usize) {
     (1, 0)
@@ -697,6 +708,9 @@ impl StreamedGlm {
             1,
             model.execution_policy.cpu_fp8_dequantization,
         )?;
+        // Fill-ahead workers run independently of pinned staging, and each
+        // holds its own decoded header while loading.
+        breakdown.concurrent_loads = u64::try_from(concurrent_load_count())?;
         if options.pinned_fp8_transfer {
             let (lanes, fill_ring_depth) = pinned_staging_shape();
             breakdown.enable_pinned_transfer(lanes, fill_ring_depth)?;

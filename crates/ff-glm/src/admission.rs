@@ -86,6 +86,10 @@ pub struct GlmAdmissionBreakdown {
     /// Host-only pinned bytes held by the fill-ahead ring.
     #[serde(default)]
     pub pinned_fill_ahead_bytes: u64,
+    /// Loads that can be in flight at once, including the foreground one. Each
+    /// owns its own decoded header, so this scales that exclusive charge.
+    #[serde(default)]
+    pub concurrent_loads: u64,
     pub prompt_tokens: usize,
     pub num_hidden_layers: u32,
     pub num_experts: u32,
@@ -368,6 +372,7 @@ impl GlmAdmissionBreakdown {
             cpu_fp8_dequantization,
             pinned_transfer_bytes: 0,
             pinned_fill_ahead_bytes: 0,
+            concurrent_loads: 0,
             prompt_tokens,
             num_hidden_layers: u32::try_from(text.num_hidden_layers)?,
             num_experts: u32::try_from(text.n_routed_experts)?,
@@ -486,6 +491,7 @@ impl GlmAdmissionBreakdown {
             cache_policy,
             CacheLoadLifetimes {
                 additional_storage_bytes: header_copies,
+                maximum_concurrent_loads: self.concurrent_loads(),
                 ..CacheLoadLifetimes::SERIAL
             },
         )?
@@ -625,18 +631,24 @@ impl GlmAdmissionBreakdown {
 
     /// Remaining CUDA capacity after the caller's complete phase peaks. Rank
     /// callers include their transfer buffers in these phases before sizing.
-    /// The owned `encoded_header` a tensor-granularity miss allocates.
+    /// Loads in flight at once; zero in a legacy record means serial.
+    pub fn concurrent_loads(&self) -> u64 {
+        self.concurrent_loads.max(1)
+    }
+
+    /// The owned `encoded_header` buffers a tensor-granularity miss allocates,
+    /// one per loader in flight.
     pub fn largest_header_bytes(&self, cache_policy: CachePolicy) -> u64 {
-        if cache_policy.granularity == ff_core::weights::CacheGranularity::Tensor {
-            self.raw_inventory
-                .shards
-                .iter()
-                .map(|s| s.header_bytes)
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
+        if cache_policy.granularity != ff_core::weights::CacheGranularity::Tensor {
+            return 0;
         }
+        self.raw_inventory
+            .shards
+            .iter()
+            .map(|s| s.header_bytes)
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(self.concurrent_loads())
     }
 
     pub fn automatic_expert_cache_bytes(
@@ -1263,6 +1275,7 @@ mod tests {
             cpu_fp8_dequantization: false,
             pinned_transfer_bytes: 0,
             pinned_fill_ahead_bytes: 0,
+            concurrent_loads: 0,
             static_load_device_bytes: 256 << 20,
             expert_load_device_bytes: 8 << 20,
             compute_on_host: false,
