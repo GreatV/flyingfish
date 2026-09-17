@@ -334,15 +334,37 @@ impl LayerPartitionedGlm {
         }
         if experts {
             let admission = self.admission(prompt_tokens)?;
-            // Integrated ranks draw their caches from one pool, and the
-            // validator sums them, so each gets a share of the remainder rather
-            // than all of it. Discrete ranks own their device outright.
-            let unified_ranks = admission
-                .snapshots
-                .iter()
-                .filter(|s| s.unified_pool_available_bytes().is_some())
-                .count()
-                .max(1) as u64;
+            // Integrated ranks draw their caches from one pool and the validator
+            // sums them, so the remainder is computed once — after every such
+            // rank's device peak is subtracted — and then divided. Subtracting
+            // only each rank's own peak before dividing still oversubscribes the
+            // pool by (1 - 1/N) of the summed peaks. Discrete ranks are unchanged.
+            let unified: Vec<usize> = (0..self.workers.len())
+                .filter(|&r| {
+                    admission.snapshots[r]
+                        .unified_pool_available_bytes()
+                        .is_some()
+                })
+                .collect();
+            let joint_share = if unified.is_empty() {
+                None
+            } else {
+                let mut remainder = admission.snapshots[unified[0]]
+                    .unified_pool_available_bytes()
+                    .unwrap_or(0)
+                    .saturating_sub(admission.required_host_bytes);
+                for &r in &unified {
+                    let peak = admission.ranks[r]
+                        .phases
+                        .iter()
+                        .map(|p| p.device_peak_bytes().unwrap_or(None).unwrap_or(0))
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_sub(admission.ranks[r].already_resident_device_bytes);
+                    remainder = remainder.saturating_sub(peak);
+                }
+                Some(remainder / unified.len() as u64 / (1 << 20) * (1 << 20))
+            };
             for rank in 0..self.workers.len() {
                 let estimate = &admission.ranks[rank];
                 let shared = admission.snapshots[rank]
@@ -356,10 +378,9 @@ impl LayerPartitionedGlm {
                         &admission.snapshots[rank],
                         Some(admission.required_host_bytes),
                     )?;
-                let bytes = if shared {
-                    bytes / unified_ranks as usize
-                } else {
-                    bytes
+                let bytes = match (shared, joint_share) {
+                    (true, Some(share)) => bytes.min(usize::try_from(share)?),
+                    _ => bytes,
                 };
                 self.workers[rank].expert_cache.resize(bytes)?;
                 let policy = &mut self.workers[rank].execution_policy.expert_cache;
