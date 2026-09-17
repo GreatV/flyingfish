@@ -1059,7 +1059,13 @@ mod tests {
         let config = GlmConfig::from_model_dir(root.path()).unwrap();
         let gpu =
             GlmAdmissionBreakdown::from_metadata(&weights, &config.text_config, false, 2).unwrap();
-        let phases = gpu.phases(false, 0, CachePolicy::new(1)).unwrap();
+        // Peaks must be computed with the same pool-scaled reserve that
+        // validate_capacity applies, or the test measures the wrong ledger.
+        // Use the zero-reserve floor: the refusal margin then holds at any
+        // pool-scaled reserve validate_capacity might apply.
+        let phases = gpu
+            .phases_with_safety(false, 0, CachePolicy::new(1), 0)
+            .unwrap();
         let host_peak = phases
             .iter()
             .map(|p| p.host_peak_bytes().unwrap())
@@ -1071,9 +1077,24 @@ mod tests {
             .max()
             .unwrap();
         assert!(host_peak > 0 && device_peak > 0);
-        // Each axis fits its own view, but the sum exceeds the shared pool.
-        let pool = host_peak.max(device_peak);
-        assert!(pool < host_peak + device_peak);
+        // validate_capacity applies a pool-scaled reserve (pool/20), so the
+        // pool must cover each axis *plus* that reserve in split mode while
+        // staying below the merged sum. Iterate to the fixed point: pool =
+        // device_peak + pool/20 converges in a few steps at these sizes.
+        let mut pool = host_peak.max(device_peak);
+        for _ in 0..16 {
+            let reserve = pool / 20;
+            let split_need = (device_peak + reserve).max(host_peak);
+            let merged_need = host_peak + device_peak + reserve;
+            if split_need <= pool && merged_need > pool {
+                break;
+            }
+            assert!(split_need > pool, "fixed point not converging");
+            pool = split_need;
+        }
+        // (The reserve alone can exceed the tiny host peak at these fixture
+        // sizes, so pool may legitimately exceed host_peak + device_peak;
+        // what matters is the split/merged outcome pair below.)
         let unified = |unified: Option<bool>, pool: u64| ResourceSnapshot {
             host_device_memory_is_unified: unified,
             ..snapshot(pool, u64::MAX, Some(pool))
@@ -1088,12 +1109,16 @@ mod tests {
             gpu.validate_capacity(false, 0, CachePolicy::new(1), &unified(legacy, pool))
                 .unwrap();
         }
-        // A pool that holds the combined peak is admitted.
+        // A pool that holds the combined peak plus the pool-scaled reserve is
+        // admitted. (H + D)·21/19 + 2 covers the reserve = pool/20 fixed point.
         gpu.validate_capacity(
             false,
             0,
             CachePolicy::new(1),
-            &unified(Some(true), host_peak + device_peak),
+            &unified(
+                Some(true),
+                (host_peak + device_peak) / 19 * 21 + (host_peak + device_peak) % 19 + 2,
+            ),
         )
         .unwrap();
     }
