@@ -327,9 +327,16 @@ impl LayerPartitionedGlm {
             let admission = self.admission(prompt_tokens)?;
             for rank in 0..self.workers.len() {
                 let estimate = &admission.ranks[rank];
+                // Sized against the ledger the validator uses: on an
+                // integrated rank that is this rank's device requirement plus
+                // every rank's host requirement, not this rank's host peak.
                 let bytes = estimate
                     .breakdown
-                    .automatic_expert_cache_bytes(&estimate.phases, &admission.snapshots[rank])?;
+                    .automatic_expert_cache_bytes_against_host(
+                        &estimate.phases,
+                        &admission.snapshots[rank],
+                        Some(admission.required_host_bytes),
+                    )?;
                 self.workers[rank].expert_cache.resize(bytes)?;
                 let policy = &mut self.workers[rank].execution_policy.expert_cache;
                 policy.maximum_bound_bytes = bytes as u64;

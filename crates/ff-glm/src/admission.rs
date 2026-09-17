@@ -636,6 +636,22 @@ impl GlmAdmissionBreakdown {
         phases: &[ResourcePhaseEstimate],
         snapshot: &ResourceSnapshot,
     ) -> Result<usize> {
+        self.automatic_expert_cache_bytes_against_host(phases, snapshot, None)
+    }
+
+    /// `aggregate_host_bytes` replaces the phase's own host peak under the
+    /// unified fold, for callers whose validator charges a wider host ledger
+    /// than these phases describe. The partition path is one: it folds a rank's
+    /// device requirement against *every* rank's host requirement, so sizing a
+    /// rank's cache against its own host peak alone would consume capacity the
+    /// validator has already promised to the other ranks — and the whole
+    /// automatic configuration is then rejected instead of shrinking.
+    pub fn automatic_expert_cache_bytes_against_host(
+        &self,
+        phases: &[ResourcePhaseEstimate],
+        snapshot: &ResourceSnapshot,
+        aggregate_host_bytes: Option<u64>,
+    ) -> Result<usize> {
         if self.compute_on_host || self.sparse_layers.is_empty() {
             return Ok(0);
         }
@@ -667,8 +683,12 @@ impl GlmAdmissionBreakdown {
                 .checked_add(phase.device_reserve_bytes)
                 .context("GLM automatic cache reserve overflow")?;
             let charge = if unified_pool.is_some() {
+                let host = match aggregate_host_bytes {
+                    Some(aggregate) => aggregate,
+                    None => phase.host_peak_bytes()?,
+                };
                 device
-                    .checked_add(phase.host_peak_bytes()?)
+                    .checked_add(host)
                     .context("GLM automatic cache unified charge overflow")?
             } else {
                 device
