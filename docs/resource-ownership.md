@@ -25,6 +25,38 @@ align).
 | mmap'd shard residency (page cache) | yes (kernel drops under pressure) | **no** — telemetry only (A7-2) | `reclaimable_host_bytes` |
 | H3 mapped weight residency | yes | same rule (pending) | `mapped_weight_residency_bytes` (assumption axis) |
 
+## Follow-ups with triggers (no dates)
+
+- **FA backend workspace geometry scaling** — trigger: a machine where
+  flash-attention actually runs on a small pool (it never ran on the Orin, so
+  no ground truth exists to calibrate a scaled constant).
+- **Generic adapters' flat 1 GiB device residency reserve** (H3 included) —
+  trigger: any sub-20 GiB pool running minicpm/music/trellis, where the flat
+  GiB decides admission. On such pools GLM now reserves 5% while they reserve
+  1 GiB of the same physical pool.
+- **Discrete-path axis selection for reserve scaling is code- and unit-test
+  covered only, not live-measured** — trigger: a machine whose host and device
+  totals straddle the 20 GiB crossover (e.g. a 16 GiB card with a 62 GiB
+  host), where the two axes would give different reserves. On the 4090 both
+  axes clamp to 1 GiB, so the local baseline cannot tell them apart.
+- **The unified-fold retention guard fix (`b3d3647`) has no observable effect
+  on our only unified machine** — its justification is correctness (the flag
+  conflated "no device" with "device shares host memory"), not performance:
+  zero retention was actually faster in one measurement (1393 s vs 1555 s,
+  budgets moved between runs so wall clocks are not directly comparable). Do
+  not cite it as a performance fix.
+
+## Worked claim, with its arithmetic
+
+"Under the final accounting this pool cannot afford device weight retention."
+Numbers from the Orin tip run (h3-smoke, `20260917-orin-final-h3`): measured
+device free at selection 5.53 GiB; folded host requirement 4.70 GiB plus the
+1 GiB residency reserve = 5.70 GiB; 5.70 > 5.53, so the automatic device
+cache sized to zero. This conclusion previously appeared as an artifact of a
+double-charged reserve (fixed in `821f51b`); it now stands with single
+charging, but any future reader should re-check the arithmetic rather than
+trust the sentence.
+
 ## Rule
 
 Admission answers "will it OOM", not "will it thrash". Reclaimable residency
