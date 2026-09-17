@@ -58,6 +58,8 @@ impl GlmPartitionAdmission {
             "partition admission rank count mismatch"
         );
         let mut host_sum = 0u64;
+        let mut unified_device_sum = 0u64;
+        let mut unified_pool: Option<u64> = None;
         for (rank, (record, snapshot)) in self.ranks.iter().zip(&self.snapshots).enumerate() {
             ensure!(
                 record.rank == rank && !record.phases.is_empty(),
@@ -80,12 +82,28 @@ impl GlmPartitionAdmission {
                 "rank retained credit exceeds its declared storage"
             );
             let mut host_peak = 0;
+            // Phases are mutually exclusive, so a rank contributes its peak; the
+            // ranks run together, so those peaks are what get summed.
+            let mut rank_unified_peak = 0u64;
             for phase in &record.phases {
                 host_peak = host_peak.max(phase.host_peak_bytes()?);
                 let total = phase
                     .device_peak_bytes()?
                     .context("missing rank device bound")?;
                 let required = total.saturating_sub(record.already_resident_device_bytes);
+                // Integrated ranks are checked together after the loop: their
+                // device allocations and every rank's host allocations draw from
+                // one pool, so per-rank checks admit a combination it cannot hold.
+                if let Some(pool) = snapshot.unified_pool_available_bytes() {
+                    rank_unified_peak = rank_unified_peak.max(required);
+                    unified_pool =
+                        Some(unified_pool.map_or(pool, |current: u64| current.min(pool)));
+                    continue;
+                }
+                ensure!(
+                    !snapshot.unified_accounting_is_undecidable(),
+                    "GLM rank {rank} is an integrated device whose shared pool could not be measured"
+                );
                 let available = snapshot
                     .device_free_memory_bytes
                     .context("rank device memory unavailable")?;
@@ -98,11 +116,23 @@ impl GlmPartitionAdmission {
             host_sum = host_sum
                 .checked_add(host_peak)
                 .context("partition host peak overflow")?;
+            unified_device_sum = unified_device_sum
+                .checked_add(rank_unified_peak)
+                .context("partition unified device sum overflow")?;
         }
         ensure!(
             host_sum == self.required_host_bytes,
             "partition aggregate host bound is inconsistent"
         );
+        if let Some(pool) = unified_pool {
+            let combined = unified_device_sum
+                .checked_add(self.required_host_bytes)
+                .context("partition unified peak overflow")?;
+            ensure!(
+                combined <= pool,
+                "GLM integrated ranks jointly need {combined} bytes from the unified host/device pool, but only {pool} are available"
+            );
+        }
         let available = self
             .snapshots
             .iter()
@@ -193,6 +223,9 @@ impl LayerPartitionedGlm {
                 options.cpu_fp8_dequantization,
                 scope,
             )?;
+            breakdown.concurrent_loads = u64::try_from(crate::model::concurrent_load_count(
+                options.pinned_fp8_transfer,
+            ))?;
             if options.pinned_fp8_transfer {
                 let (lanes, fill_ring_depth) = crate::model::pinned_staging_shape();
                 breakdown.enable_pinned_transfer(lanes, fill_ring_depth)?;
@@ -304,11 +337,58 @@ impl LayerPartitionedGlm {
         }
         if experts {
             let admission = self.admission(prompt_tokens)?;
+            // Integrated ranks draw their caches from one pool and the validator
+            // sums them, so the remainder is computed once — after every such
+            // rank's device peak is subtracted — and then divided. Subtracting
+            // only each rank's own peak before dividing still oversubscribes the
+            // pool by (1 - 1/N) of the summed peaks. Discrete ranks are unchanged.
+            let unified: Vec<usize> = (0..self.workers.len())
+                .filter(|&r| {
+                    admission.snapshots[r]
+                        .unified_pool_available_bytes()
+                        .is_some()
+                })
+                .collect();
+            let joint_share = if unified.is_empty() {
+                None
+            } else {
+                // The validator binds on the smallest pool view across these
+                // ranks, so the remainder starts there rather than at rank 0's.
+                let mut remainder = unified
+                    .iter()
+                    .filter_map(|&r| admission.snapshots[r].unified_pool_available_bytes())
+                    .min()
+                    .unwrap_or(0)
+                    .saturating_sub(admission.required_host_bytes);
+                for &r in &unified {
+                    let peak = admission.ranks[r]
+                        .phases
+                        .iter()
+                        .map(|p| p.device_peak_bytes().unwrap_or(None).unwrap_or(0))
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_sub(admission.ranks[r].already_resident_device_bytes);
+                    remainder = remainder.saturating_sub(peak);
+                }
+                Some(remainder / unified.len() as u64 / (1 << 20) * (1 << 20))
+            };
             for rank in 0..self.workers.len() {
                 let estimate = &admission.ranks[rank];
+                let shared = admission.snapshots[rank]
+                    .unified_pool_available_bytes()
+                    .is_some();
+                // Sized against the ledger the validator uses.
                 let bytes = estimate
                     .breakdown
-                    .automatic_expert_cache_bytes(&estimate.phases, &admission.snapshots[rank])?;
+                    .automatic_expert_cache_bytes_against_host(
+                        &estimate.phases,
+                        &admission.snapshots[rank],
+                        Some(admission.required_host_bytes),
+                    )?;
+                let bytes = match (shared, joint_share) {
+                    (true, Some(share)) => bytes.min(usize::try_from(share)?),
+                    _ => bytes,
+                };
                 self.workers[rank].expert_cache.resize(bytes)?;
                 let policy = &mut self.workers[rank].execution_policy.expert_cache;
                 policy.maximum_bound_bytes = bytes as u64;
@@ -388,10 +468,13 @@ impl LayerPartitionedGlm {
             b.prefill_workspace_bytes = prefill::prefill_workspace_bytes(text, prompt_tokens)?;
             b.prefill_host_mask_bytes = crate::admission::host_mask_bytes(prompt_tokens, false)?;
             let rp = &self.policy.ranks[rank];
-            let mut phases = b.phases(
+            // Each rank is judged against its own device, so it gets its own
+            // pool-scaled reserve; `phases` would apply the flat constant.
+            let mut phases = b.phases_with_safety(
                 rp.execution.resident_static,
                 worker.expert_cache_stats().max_bytes,
                 worker.weights.cache_policy(),
+                b.scaled_admission_safety_bytes(&snapshots[rank]),
             )?;
             let mut host_peak = 0;
             let mut retained = tensor_bytes(worker.static_weights.values())
@@ -647,6 +730,7 @@ mod tests {
                     phase: "prefill".into(),
                     required_host_bytes: 60,
                     optional_host_bytes: 0,
+                    reclaimable_host_bytes: 0,
                     host_promotion_reserve_bytes: 0,
                     required_device_bytes: Some(10),
                     optional_device_bytes: Some(0),
@@ -661,6 +745,10 @@ mod tests {
                 cgroup_v2_memory_current_bytes: Some(0),
                 cgroup_v2_memory_available_bytes: Some(100),
                 device_free_memory_bytes: Some(10),
+                host_device_memory_is_unified: None,
+                device_topology_probe_failed: false,
+                host_memory_total_bytes: None,
+                device_total_memory_bytes: None,
                 measurement_scope: ResourceMeasurementScopes {
                     host_memory: None,
                     cgroup_memory: None,

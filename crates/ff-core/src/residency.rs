@@ -451,12 +451,17 @@ pub fn decide_device_residency(
     reserve_bytes: u64,
     authorization: ResidencyAuthorization,
 ) -> Result<DeviceResidencyDecision> {
-    decide_residency_within(
-        snapshot.device_free_memory_bytes.unwrap_or(0),
-        demands,
-        reserve_bytes,
-        authorization,
-    )
+    // On a shared pool the binding capacity is the smaller view, and a pool of
+    // unknown size gets none rather than the device view as a stand-in.
+    let capacity = if snapshot.unified_accounting_is_undecidable() {
+        0
+    } else {
+        snapshot
+            .unified_pool_available_bytes()
+            .or(snapshot.device_free_memory_bytes)
+            .unwrap_or(0)
+    };
+    decide_residency_within(capacity, demands, reserve_bytes, authorization)
 }
 
 /// One device's capacity, as probed for that device. `ResourceSnapshot` reports
@@ -560,6 +565,7 @@ fn decide_residency_within(
             phase: demand.name.clone(),
             required_host_bytes: 0,
             optional_host_bytes: 0,
+            reclaimable_host_bytes: 0,
             host_promotion_reserve_bytes: 0,
             required_device_bytes: Some(0),
             optional_device_bytes: Some(if active && placed.contains(demand.name.as_str()) {
@@ -887,6 +893,10 @@ mod tests {
             cgroup_v2_memory_current_bytes: None,
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: device_free,
+            host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -1092,6 +1102,43 @@ mod tests {
     }
 
     #[test]
+    fn a_confirmed_shared_pool_of_unknown_size_authorizes_no_residency() {
+        let demands = vec![demand("decode", 1 << 20, 1 << 20, 10)];
+        let authorization = ResidencyAuthorization::MeasuredEvidence {
+            ceiling_bytes: u64::MAX,
+        };
+        let discrete =
+            decide_device_residency(&snapshot(Some(8 << 30)), &demands, 0, authorization)
+                .unwrap()
+                .authorized_budget_bytes;
+        assert!(discrete > 0, "the discrete path must still place weights");
+        let unmeasurable = ResourceSnapshot {
+            host_device_memory_is_unified: Some(true),
+            device_topology_probe_failed: false,
+            ..snapshot(Some(8 << 30))
+        };
+        assert!(unmeasurable.unified_pool_is_unmeasurable());
+        assert_eq!(
+            decide_device_residency(&unmeasurable, &demands, 0, authorization)
+                .unwrap()
+                .authorized_budget_bytes,
+            0
+        );
+        let measured = ResourceSnapshot {
+            host_device_memory_is_unified: Some(true),
+            device_topology_probe_failed: false,
+            host_memory_available_bytes: Some(8 << 30),
+            ..snapshot(Some(8 << 30))
+        };
+        assert!(
+            decide_device_residency(&measured, &demands, 0, authorization)
+                .unwrap()
+                .authorized_budget_bytes
+                > 0
+        );
+    }
+
+    #[test]
     fn authorized_decision_without_headroom_is_capacity_rejected() {
         let demands = vec![demand("decode", 1 << 30, 1 << 30, 10)];
         let decision = decide_device_residency(
@@ -1127,6 +1174,10 @@ mod tests {
         let demands = [sharded, demand("norms", 8, 8, 8)];
         let snapshot = ResourceSnapshot {
             device_free_memory_bytes: Some(96),
+            host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             ..ResourceSnapshot::capture(None)
         };
         let authorization = ResidencyAuthorization::OperatorExplicit {

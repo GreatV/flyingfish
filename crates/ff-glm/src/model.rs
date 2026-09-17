@@ -54,6 +54,19 @@ struct GlmAdmissionModel {
     live_expert_bytes: usize,
     weight_load_staging_bytes: usize,
     safety_bytes: usize,
+    /// Whether admission folded both axes into one pool.
+    unified_pool: bool,
+    /// Host workspaces and load staging, charged only under the fold.
+    host_charge_bytes: usize,
+    /// The prefill routing mask: a temporary already dropped by decode.
+    prefill_host_charge_bytes: usize,
+    /// One pinned upload slot set, plus the fill-ahead ring. The phase model
+    /// charges a slot set to each axis, so a folded guard needs two. Required
+    /// only before the pool exists: afterwards both are resident and already
+    /// counted by the snapshot each later guard measures.
+    pinned_slot_bytes: usize,
+    /// The fill-ahead ring: host-only, and like the slots resident afterwards.
+    pinned_ring_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,6 +250,22 @@ pub(crate) fn pinned_staging_shape() -> (usize, usize) {
         0
     };
     (fp8::cuda::configured_lanes(), depth)
+}
+
+/// Loads in flight for a configured transfer path: the foreground one plus any
+/// fill-ahead workers, and never fewer than the upload lanes. Fill-ahead only
+/// runs on the pinned path, so a non-pinned configuration has one loader.
+pub(crate) fn concurrent_load_count(pinned: bool) -> usize {
+    if !pinned {
+        return 1;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let (lanes, _) = pinned_staging_shape();
+        fill_ahead_count().saturating_add(1).max(lanes)
+    }
+    #[cfg(not(feature = "cuda"))]
+    1
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -494,10 +523,44 @@ impl PreparedGlm {
                 breakdown
                     .static_load_device_bytes
                     .max(breakdown.expert_load_device_bytes)
-            })?
-            .checked_add(usize::try_from(breakdown.pinned_transfer_bytes)?)
-            .context("FP8 staging admission overflow")?,
-            safety_bytes: usize::try_from(crate::execution_policy::GLM_ADMISSION_SAFETY_BYTES)?,
+            })?,
+            // The runtime guards must require the reserve admission granted.
+            safety_bytes: usize::try_from(breakdown.scaled_admission_safety_bytes(snapshot))?,
+            unified_pool: snapshot.unified_pool_available_bytes().is_some(),
+            prefill_host_charge_bytes: usize::try_from(breakdown.prefill_host_mask_bytes)?,
+            // Resident-static preloads the FP8 weights below, which creates the
+            // pool and its slots before any guard runs; the snapshot those
+            // guards capture already contains them.
+            pinned_slot_bytes: if self.resident_static {
+                0
+            } else {
+                usize::try_from(breakdown.pinned_transfer_bytes)?
+            },
+            pinned_ring_bytes: if self.resident_static {
+                0
+            } else {
+                usize::try_from(breakdown.pinned_fill_ahead_bytes)?
+            },
+            host_charge_bytes: usize::try_from(
+                breakdown
+                    .host_route_workspace_bytes
+                    .checked_add(breakdown.host_sampling_workspace_bytes)
+                    // The same `resident_static` split `phases_with_safety` uses.
+                    .and_then(|n| {
+                        n.checked_add(if self.resident_static {
+                            breakdown.expert_load_host_bytes
+                        } else {
+                            breakdown.streamed_load_host_bytes
+                        })
+                    })
+                    // A tensor-granularity miss owns a header copy per loader.
+                    .and_then(|n| {
+                        n.checked_add(
+                            breakdown.largest_header_bytes(self.model.weights.cache_policy()),
+                        )
+                    })
+                    .context("GLM unified host charge overflow")?,
+            )?,
         });
         self.model.admission_breakdown = Some(breakdown);
         if self.resident_static {
@@ -663,6 +726,10 @@ impl StreamedGlm {
             1,
             model.execution_policy.cpu_fp8_dequantization,
         )?;
+        // Fill-ahead workers only run on the pinned path, so header copies are
+        // charged for loaders that can actually exist.
+        breakdown.concurrent_loads =
+            u64::try_from(concurrent_load_count(options.pinned_fp8_transfer))?;
         if options.pinned_fp8_transfer {
             let (lanes, fill_ring_depth) = pinned_staging_shape();
             breakdown.enable_pinned_transfer(lanes, fill_ring_depth)?;
@@ -775,8 +842,14 @@ impl StreamedGlm {
             .context("GLM runtime admission model is unavailable")?;
         let before = self.expert_cache.stats()?;
         let snapshot = ResourceSnapshot::capture(Some(&self.device));
+        // Fold exactly as admission did.
         let (available, memory_kind) = if self.device.is_cpu() {
             (crate::admission::host_available(&snapshot), "host")
+        } else if admission.unified_pool {
+            (
+                snapshot.unified_pool_available_bytes(),
+                "unified host/device pool",
+            )
         } else {
             (snapshot.device_free_memory_bytes, "CUDA")
         };
@@ -2317,10 +2390,14 @@ fn plan_cache_readmission(
         expected_maximum_dsa == admission.maximum_dsa_cache_bytes,
         "GLM DSA admission model disagrees with the execution policy context bound"
     );
+    // The applied reserve is snapshot-derived and at most the declared
+    // allowance, so this is a bound rather than an equality.
+    let applied_safety =
+        u64::try_from(admission.safety_bytes).context("GLM admission safety exceeds u64")?;
     ensure!(
-        u64::try_from(admission.safety_bytes).context("GLM admission safety exceeds u64")?
-            == policy.admission_safety_bytes,
-        "GLM runtime admission safety disagrees with the execution policy"
+        applied_safety > 0 && applied_safety <= policy.admission_safety_bytes,
+        "GLM runtime admission safety {applied_safety} is not within the execution policy allowance {}",
+        policy.admission_safety_bytes
     );
     let current_dsa = admission
         .dsa_cache_bytes_per_token
@@ -2341,6 +2418,22 @@ fn plan_cache_readmission(
         .and_then(|bytes| bytes.checked_add(admission.live_expert_bytes))
         .and_then(|bytes| bytes.checked_add(admission.weight_load_staging_bytes))
         .and_then(|bytes| bytes.checked_add(admission.safety_bytes))
+        .and_then(|bytes| {
+            bytes.checked_add(if admission.unified_pool {
+                admission.host_charge_bytes
+            } else {
+                0
+            })
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(
+                if admission.unified_pool && phase == RoutingTracePhase::Prefill {
+                    admission.prefill_host_charge_bytes
+                } else {
+                    0
+                },
+            )
+        })
         .context("GLM cache re-admission headroom overflow")?;
     let required_future_headroom_bytes = u64::try_from(required_future_headroom_bytes)
         .context("GLM cache re-admission headroom exceeds u64")?;
@@ -2893,6 +2986,11 @@ mod tests {
             pending_lm_head_bytes: 7,
             live_expert_bytes: 11,
             safety_bytes: safety,
+            unified_pool: false,
+            host_charge_bytes: 0,
+            prefill_host_charge_bytes: 0,
+            pinned_slot_bytes: 0,
+            pinned_ring_bytes: 0,
         };
         let cache = ExpertCacheStats {
             bytes: 60,
@@ -2962,6 +3060,56 @@ mod tests {
             plan_cache_readmission(&policy, admission, 2, RoutingTracePhase::Prefill, 0, cache)
                 .unwrap_err();
         assert!(error.to_string().contains("no cache bound was changed"));
+
+        let scaled = GlmAdmissionModel {
+            safety_bytes: safety / 8,
+            ..admission
+        };
+        assert!(
+            plan_cache_readmission(
+                &policy,
+                scaled,
+                2,
+                RoutingTracePhase::Prefill,
+                GLM_ADMISSION_SAFETY_BYTES + 73,
+                cache,
+            )
+            .is_ok()
+        );
+        for invalid in [safety * 2, 0] {
+            let error = plan_cache_readmission(
+                &policy,
+                GlmAdmissionModel {
+                    safety_bytes: invalid,
+                    ..admission
+                },
+                2,
+                RoutingTracePhase::Prefill,
+                GLM_ADMISSION_SAFETY_BYTES + 73,
+                cache,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("execution policy allowance"));
+        }
+
+        let folded = GlmAdmissionModel {
+            unified_pool: true,
+            host_charge_bytes: 29,
+            ..admission
+        };
+        let unified = plan_cache_readmission(
+            &policy,
+            folded,
+            2,
+            RoutingTracePhase::Prefill,
+            GLM_ADMISSION_SAFETY_BYTES + 73,
+            cache,
+        )
+        .unwrap();
+        assert_eq!(
+            unified.required_future_headroom_bytes,
+            shrink.required_future_headroom_bytes + 29
+        );
     }
 
     #[test]

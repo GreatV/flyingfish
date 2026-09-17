@@ -260,9 +260,17 @@ pub(crate) fn prepare(
         return Ok(());
     }
     device.synchronize()?;
-    let free = ff_core::probe::ResourceSnapshot::capture(Some(device))
-        .device_free_memory_bytes
-        .unwrap_or(0);
+    // The same fold the other adapters apply: on a shared pool the device view
+    // alone is not this cache's capacity.
+    let snapshot = ff_core::probe::ResourceSnapshot::capture(Some(device));
+    let free = if snapshot.unified_accounting_is_undecidable() {
+        0
+    } else {
+        snapshot
+            .unified_pool_available_bytes()
+            .or(snapshot.device_free_memory_bytes)
+            .unwrap_or(0)
+    };
     let reserve = sum(&[tensor_bytes, 1 << 30])?;
     let capacity = cache
         .stats()

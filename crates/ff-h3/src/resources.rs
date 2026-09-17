@@ -255,6 +255,11 @@ pub struct ResourceAssumptions {
         skip_serializing_if = "is_default_timestep_rows"
     )]
     pub timestep_rows: u64,
+    /// Host weight-cache bytes charged to the host peak. Under the
+    /// unified-memory fold (`device_memory_is_host` on a CUDA device) this
+    /// also carries the once-only device residency reserve, routed here via
+    /// `additional_host_allowance_bytes` — do not read the field as a cache
+    /// sizing recommendation without checking that allowance first.
     pub host_weight_cache_bytes: u64,
     pub mapped_weight_residency_bytes: u64,
     #[serde(deserialize_with = "crate::required_option")]
