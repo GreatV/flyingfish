@@ -478,10 +478,8 @@ impl GlmAdmissionBreakdown {
         // kernel-reclaimable, already counted as available in MemAvailable.
         // It is reported as `reclaimable_host_bytes` (telemetry) and never
         // charged in fit decisions; only exclusive allocations are.
-        // Tensor granularity materializes the largest shard header as an owned
-        // `encoded_header` Vec while validating each load. That copy is an
-        // exclusive allocation, not page cache, so it is charged as required
-        // host bytes; only the mapped payload residency below is reclaimable.
+        // The largest shard header is realized as an owned Vec — an exclusive
+        // allocation, so it is charged as required, not reclaimable, bytes.
         let header_copies =
             if cache_policy.granularity == ff_core::weights::CacheGranularity::Tensor {
                 self.raw_inventory
@@ -647,12 +645,8 @@ impl GlmAdmissionBreakdown {
     }
 
     /// `aggregate_host_bytes` replaces the phase's own host peak under the
-    /// unified fold, for callers whose validator charges a wider host ledger
-    /// than these phases describe. The partition path is one: it folds a rank's
-    /// device requirement against *every* rank's host requirement, so sizing a
-    /// rank's cache against its own host peak alone would consume capacity the
-    /// validator has already promised to the other ranks — and the whole
-    /// automatic configuration is then rejected instead of shrinking.
+    /// fold, for callers whose validator charges a wider host ledger — the
+    /// partition path folds each rank's device peak against every rank's host.
     pub fn automatic_expert_cache_bytes_against_host(
         &self,
         phases: &[ResourcePhaseEstimate],
@@ -666,9 +660,7 @@ impl GlmAdmissionBreakdown {
         // pool as every host charge, so size it from the combined peak instead
         // of the device view alone. Discrete and unprobed captures take the
         // device view exactly as before.
-        // A confirmed shared pool whose size is unknown retains nothing: the
-        // device view is not a substitute for it (see `residency.rs`, which
-        // takes the same position for the same reason).
+        // A confirmed pool of unknown size retains nothing.
         if snapshot.unified_accounting_is_undecidable() {
             return Ok(0);
         }
@@ -676,13 +668,9 @@ impl GlmAdmissionBreakdown {
         let Some(free) = unified_pool.or(snapshot.device_free_memory_bytes) else {
             return Ok(0);
         };
-        // Under the unified fold both axes of one phase draw from the pool at
-        // the same time, so the binding charge is the largest per-phase *sum*.
-        // Maximising each axis independently and adding the two results charges
-        // a combination no phase ever reaches — a host-heavy runtime phase plus
-        // a device-heavy initialization phase — which needlessly shrinks or
-        // disables the cache. This mirrors `validate_capacity`, which checks the
-        // same per-phase sum.
+        // The binding charge is the largest per-phase sum: maximising each axis
+        // independently charges a combination no phase reaches. Mirrors
+        // `validate_capacity`.
         let required = phases.iter().try_fold(0u64, |peak, phase| {
             let device = phase
                 .required_device_bytes
@@ -702,13 +690,9 @@ impl GlmAdmissionBreakdown {
             };
             Ok::<_, anyhow::Error>(peak.max(charge))
         })?;
-        // Only the reserve the phases already carry is charged. `required`
-        // includes each phase's `device_reserve_bytes`, which is the admission
-        // safety reserve — allocator slack against modelled-peak error — so a
-        // second fixed gigabyte for the same purpose double-charged it, and did
-        // so unscaled: on a 6 GiB pool it withheld a sixth of the pool from a
-        // cache the scaled admission model says fits. Pools at or above the
-        // 20 GiB crossover therefore gain up to 1 GiB of cache capacity.
+        // Only the reserve the phases carry: `required` already includes each
+        // phase's `device_reserve_bytes`, so a second fixed gigabyte for the
+        // same purpose double-charged it, unscaled.
         let available = free.saturating_sub(required);
         let available = available / (1 << 20) * (1 << 20);
         let all_experts = (self.live_expert_bytes as u64 / 5)

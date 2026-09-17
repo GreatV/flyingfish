@@ -68,8 +68,7 @@ pub fn automatic_device_cache(
     // avoids re-fetching them from storage, which is the binding term on such
     // machines. (The host-less CPU path never reaches here — the backend check
     // above excludes it.)
-    // A confirmed shared pool whose size is unknown retains nothing: the device
-    // view would authorize retention past an unmeasured host constraint.
+    // A confirmed pool of unknown size retains nothing.
     if request.snapshot.unified_accounting_is_undecidable() {
         return Ok(None);
     }
@@ -77,11 +76,9 @@ pub fn automatic_device_cache(
     let Some(free) = unified_pool.or(request.snapshot.device_free_memory_bytes) else {
         return Ok(None);
     };
-    // Under the unified fold every charge — including this retention — lands on
-    // the host axis, so an explicit `--max-host-mib` bounds it as well. Sizing
-    // from the device bound alone would fill the measured pool past that limit,
-    // and because the retained policy replaces the baseline before selection,
-    // the run is then refused outright instead of choosing a smaller cache.
+    // Under the fold every charge lands on the host axis, so `--max-host-mib`
+    // bounds this too; the retained policy replaces the baseline before
+    // selection, so over-sizing refuses the run rather than shrinking.
     let mut capacity = request.budget.max_device_bytes.unwrap_or(free).min(free);
     if unified_pool.is_some()
         && let Some(host_bound) = request.budget.max_host_bytes
@@ -110,11 +107,8 @@ pub fn automatic_device_cache(
 }
 
 /// Record the budget a boundary was judged against. `refused` selects the
-/// refusal ledger: the peaks are known to exceed the budget — that is why the
-/// refusal happened — so the admitted-peak invariant must not be applied, and
-/// the overshoot is recorded as a shortfall instead of a remainder. Applying
-/// the invariant here would replace `AdmissionRefused` with a generic error and
-/// lose the candidate ledger the refusal exists to publish.
+/// refusal ledger: the peaks are known to exceed it, so the admitted-peak
+/// invariant is skipped and the overshoot recorded as a shortfall.
 fn record_budget(
     record: &mut ResourceSelectionProvenance,
     boundary: &str,
@@ -414,12 +408,9 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
             }));
             if !row.qualifies()
                 || row.observed_peak_deltas.is_none_or(|(h, d)| {
-                    // `device_memory_is_host` now marks two different things:
-                    // the host-only CPU path, where a device observation cannot
-                    // belong to the trial at all, and the unified fold, where a
-                    // real CUDA device records one and both axes draw from the
-                    // same pool. Rejecting the fold for merely having a device
-                    // delta marks every qualified CUDA candidate a regression.
+                    // `device_memory_is_host` marks two things: the CPU path,
+                    // where a device observation cannot belong to the trial, and
+                    // the fold, where a real device records one.
                     let unified = request.snapshot.host_device_memory_is_unified == Some(true);
                     h > host
                         || if unified {

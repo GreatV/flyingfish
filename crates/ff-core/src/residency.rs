@@ -451,13 +451,9 @@ pub fn decide_device_residency(
     reserve_bytes: u64,
     authorization: ResidencyAuthorization,
 ) -> Result<DeviceResidencyDecision> {
-    // On a probed unified-memory device, host allocations draw from the same
-    // pool, so the binding capacity is the smaller pool view rather than the
-    // device view alone. Discrete and unprobed captures use the device view
-    // exactly as before. A confirmed shared pool whose size is unknown gets no
-    // capacity: falling back to the device view there would authorize residency
-    // past a host or cgroup constraint that was simply not measured, which is
-    // the substitution `unified_pool_available_bytes` exists to prevent.
+    // On a shared pool the binding capacity is the smaller view, not the device
+    // one; a confirmed pool of unknown size gets none rather than the device
+    // view as a stand-in. Discrete and unprobed captures are unchanged.
     let capacity = if snapshot.unified_accounting_is_undecidable() {
         0
     } else {

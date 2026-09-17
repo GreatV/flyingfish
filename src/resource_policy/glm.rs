@@ -245,12 +245,9 @@ pub fn select(
                 cache,
                 breakdown.scaled_admission_safety_bytes(snapshot),
             )?;
-            // Admission charges only exclusive bytes, but the evidence this is
-            // compared against is a process-RSS delta, and `VmRSS` counts
-            // faulted mmap-backed weight pages too. Comparing an RSS delta with
-            // an exclusive-only bound marks valid trials as regressions, so the
-            // bound used *for evidence* adds the reclaimable residency back.
-            // Nothing here changes what admission charges.
+            // The evidence is a process-RSS delta, which counts faulted
+            // mmap-backed pages, so the bound used for it adds reclaimable
+            // residency back. What admission charges is unchanged.
             let host_peak = phases
                 .iter()
                 .map(|p| {
@@ -269,12 +266,8 @@ pub fn select(
                 .into_iter()
                 .flatten()
                 .max();
-            // Under the fold both observed deltas draw from one pool, so the
-            // ceiling is the largest per-phase combined charge and the trial is
-            // judged on host + device together. Maximising the two axes
-            // independently admits a trial whose shared-pool usage exceeds
-            // anything `validate_capacity` modelled. This mirrors the unified
-            // H3 evidence path.
+            // Under the fold both deltas draw from one pool, so the ceiling is
+            // the largest per-phase combined charge. Mirrors the H3 path.
             let combined_peak = if snapshot.unified_pool_available_bytes().is_some() {
                 Some(
                     phases
@@ -406,11 +399,8 @@ pub fn select(
         // A refusal must still ship its numbers: per-candidate dispositions
         // and the phase estimates they were judged against. The record names
         // the baseline (that is what was evaluated) and marks refused=1.
-        // Origins follow the same rule as the admitted path. Recording every
-        // axis as `Baseline` would describe operator-selected settings as
-        // defaults, so a reader calibrating against the refusal would blame the
-        // wrong configuration for it. Measured evidence cannot appear here:
-        // nothing was selected.
+        // Same rule as the admitted path; measured evidence cannot appear here
+        // because nothing was selected.
         let refusal_axes = baseline_axes
             .iter()
             .map(|(axis, value)| SelectedResourceAxis {

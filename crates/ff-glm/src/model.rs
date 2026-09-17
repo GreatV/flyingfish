@@ -54,23 +54,17 @@ struct GlmAdmissionModel {
     live_expert_bytes: usize,
     weight_load_staging_bytes: usize,
     safety_bytes: usize,
-    /// Whether admission folded both axes into one pool. The runtime guards
-    /// must fold the same way: checking device headroom alone on a shared pool
-    /// lets the host charges below pass unaccounted.
+    /// Whether admission folded both axes into one pool; the runtime guards
+    /// must fold the same way.
     unified_pool: bool,
-    /// Host bytes the runtime allocates alongside the device charges — route
-    /// and sampling workspaces and host-side load staging. Charged only under
-    /// the fold, where they draw from the same pool.
+    /// Host route/sampling workspaces and load staging, charged only under the
+    /// fold.
     host_charge_bytes: usize,
-    /// The prefill routing mask, split out because it is a temporary that
-    /// `forward_layer_prefill` has already dropped by the time decode
-    /// readmission runs — the phase model charges it to prefill alone, and
-    /// reserving it during decode shrinks the cache for bytes nobody holds.
+    /// The prefill routing mask: a temporary already dropped by decode.
     prefill_host_charge_bytes: usize,
-    /// Host-side pinned upload slots. Required by the batched-prefill guard,
-    /// which runs before the pool is created, and omitted afterwards because
-    /// the persistent pool is already in the snapshot the guard measures.
-    pinned_host_slot_bytes: usize,
+    /// Pinned upload slots: required only before the pool exists, since the
+    /// persistent pool is already in the snapshot each later guard measures.
+    pinned_slot_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -511,27 +505,17 @@ impl PreparedGlm {
                 breakdown
                     .static_load_device_bytes
                     .max(breakdown.expert_load_device_bytes)
-            })?
-            .checked_add(usize::try_from(breakdown.pinned_transfer_bytes)?)
-            .context("FP8 staging admission overflow")?,
-            // The runtime checks (batched prefill, cache re-admission) must
-            // require the same reserve admission was granted against. Storing
-            // the declared constant here would refuse, after the run started, a
-            // margin that selection and final admission both accepted — on a
-            // sub-20 GiB pool the scaled value is a fraction of the constant.
+            })?,
+            // The runtime guards must require the reserve admission granted.
             safety_bytes: usize::try_from(breakdown.scaled_admission_safety_bytes(snapshot))?,
             unified_pool: snapshot.unified_pool_available_bytes().is_some(),
             prefill_host_charge_bytes: usize::try_from(breakdown.prefill_host_mask_bytes)?,
-            pinned_host_slot_bytes: usize::try_from(breakdown.pinned_transfer_bytes)?,
+            pinned_slot_bytes: usize::try_from(breakdown.pinned_transfer_bytes)?,
             host_charge_bytes: usize::try_from(
                 breakdown
                     .host_route_workspace_bytes
                     .checked_add(breakdown.host_sampling_workspace_bytes)
-                    // The same `resident_static` split `phases_with_safety`
-                    // uses. Charging the maximum instead would require more at
-                    // runtime than admission granted whenever the streamed
-                    // static buffer is the larger one and is never allocated,
-                    // rejecting after the model already passed both admissions.
+                    // The same `resident_static` split `phases_with_safety` uses.
                     .and_then(|n| {
                         n.checked_add(if self.resident_static {
                             breakdown.expert_load_host_bytes
@@ -539,12 +523,7 @@ impl PreparedGlm {
                             breakdown.streamed_load_host_bytes
                         })
                     })
-                    // The fill-ahead ring is allocated per transfer, so it is
-                    // future headroom at every boundary. The upload slots are
-                    // not: the first expert forward stores the `WeightPool` in
-                    // a `OnceLock`, after which they are already resident and
-                    // counted by the snapshot — charging them again at each
-                    // readmission reserves the same bytes twice.
+                    // The ring is per transfer, so it is headroom everywhere.
                     .and_then(|n| n.checked_add(breakdown.pinned_fill_ahead_bytes))
                     .context("GLM unified host charge overflow")?,
             )?,
@@ -825,8 +804,7 @@ impl StreamedGlm {
             .context("GLM runtime admission model is unavailable")?;
         let before = self.expert_cache.stats()?;
         let snapshot = ResourceSnapshot::capture(Some(&self.device));
-        // Fold exactly as admission did: on a shared pool the device view is
-        // not the bound, and the host charges are drawn from the same bytes.
+        // Fold exactly as admission did.
         let (available, memory_kind) = if self.device.is_cpu() {
             (crate::admission::host_available(&snapshot), "host")
         } else if admission.unified_pool {
@@ -2374,11 +2352,8 @@ fn plan_cache_readmission(
         expected_maximum_dsa == admission.maximum_dsa_cache_bytes,
         "GLM DSA admission model disagrees with the execution policy context bound"
     );
-    // The policy's allowance is the declared ceiling and stays identical across
-    // machines so a recorded policy replays; the reserve actually applied is
-    // snapshot-derived and is at most that ceiling (`min(declared, total/20)`).
-    // Requiring equality here would abort the first readmission on every pool
-    // below the 20 GiB crossover, where the two legitimately differ.
+    // The policy allowance is the declared ceiling; the applied reserve is
+    // snapshot-derived and at most that, so this is a bound, not an equality.
     let applied_safety =
         u64::try_from(admission.safety_bytes).context("GLM admission safety exceeds u64")?;
     ensure!(
@@ -2976,7 +2951,7 @@ mod tests {
             unified_pool: false,
             host_charge_bytes: 0,
             prefill_host_charge_bytes: 0,
-            pinned_host_slot_bytes: 0,
+            pinned_slot_bytes: 0,
         };
         let cache = ExpertCacheStats {
             bytes: 60,

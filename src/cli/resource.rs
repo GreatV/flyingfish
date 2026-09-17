@@ -246,11 +246,9 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         request.limits.max_device_mib,
     )?;
     let phase = &selection.provenance.phases[0];
-    // The fold makes `build_provenance` emit a host-only phase, so reading the
-    // device peak from it records zero compute and the whole device budget as
-    // remaining — contradicting the selection ledger, which kept the real CUDA
-    // component. Physical fit is still enforced through the combined host peak;
-    // this only decides what the record says was used.
+    // The fold emits a host-only phase, so reading the device peak from it
+    // records zero and contradicts the selection ledger. Fit is still enforced
+    // through the combined host peak; this only affects the record.
     let device_peak = if selection.policy.execution_backend == ExecutionBackendPolicy::Cpu
         || final_observation.host_device_memory_is_unified == Some(true)
     {
@@ -267,10 +265,8 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         .check_peaks(host_peak, device_peak)
         .within_budget
     {
-        // The capacity race this second snapshot exists to detect publishes its
-        // ledger like any other refusal — a bare error leaves the caller's
-        // `report_refusal` with nothing to downcast, so the sidecar it promised
-        // is silently absent in exactly the case the snapshot was taken for.
+        // The capacity race this snapshot detects publishes its ledger like any
+        // other refusal; a bare error leaves nothing to downcast.
         let mut provenance = selection.provenance.clone();
         provenance.final_admission_snapshot = Some(final_observation);
         provenance.workload.insert("refused".into(), 1);
@@ -396,10 +392,8 @@ pub(super) fn validate_recorded_selection(path: &Path, policy: &ExecutionPolicy)
     let record = flyingfish::runtime::resource_selection::ResourceSelectionProvenance::from_json(
         &bytes.bytes,
     )?;
-    // A refusal record parses and can bind to the same baseline policy, but it
-    // says that policy was never admitted. Accepting it here would let a resume
-    // continue from a checkpoint whose configuration has no evidence of ever
-    // having passed admission.
+    // A refusal parses and binds to the same baseline, but says that policy was
+    // never admitted, so it cannot stand as a run's provenance.
     anyhow::ensure!(
         !record.is_refusal(),
         "recorded resource selection at {} is a refusal record, not an admitted selection",

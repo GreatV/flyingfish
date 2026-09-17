@@ -48,12 +48,8 @@ pub fn report_refusal(error: &anyhow::Error, sidecar: Option<&Path>) -> Option<S
         );
     }
     if let Some(path) = sidecar {
-        // The destination's parent is created here rather than at each call
-        // site. `ArtifactStaging` canonicalizes it, so a run that is refused
-        // before it creates its own directory would otherwise lose the ledger
-        // to a warning — and every caller would have to remember the same
-        // step. Six call sites, one of which had it: that is a rule belonging
-        // in the operation, not in its callers.
+        // Created here, not at each call site: `ArtifactStaging` canonicalizes
+        // the parent, and five of six callers did not do this.
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
             && let Err(error) = std::fs::create_dir_all(parent)

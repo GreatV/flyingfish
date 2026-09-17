@@ -52,28 +52,20 @@ impl StreamedGlm {
             admission.weight_load_staging_bytes,
             additional_cache,
             admission.safety_bytes,
-            // Under the unified fold the host route/mask/staging allocations
-            // draw from the same pool as the device charges above, so they are
-            // required here too; on discrete topology they are a separate axis.
+            // Under the fold these draw from the same pool as the charges above.
             if admission.unified_pool {
                 admission.host_charge_bytes
             } else {
                 0
             },
-            // This guard is the prefill boundary, so the routing mask and the
-            // pinned upload slots it is about to allocate are charged here.
-            // Cache readmission omits both: by then the mask is dropped and the
-            // slots are resident in the pool the snapshot already measures.
+            // The mask is charged at its own boundary; readmission omits it.
             if admission.unified_pool {
                 admission.prefill_host_charge_bytes
             } else {
                 0
             },
-            if admission.unified_pool {
-                admission.pinned_host_slot_bytes
-            } else {
-                0
-            },
+            // Charged before the pool exists, and nowhere after.
+            admission.pinned_slot_bytes,
         ]
         .into_iter()
         .try_fold(0usize, |sum, bytes| {

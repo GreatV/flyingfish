@@ -402,12 +402,9 @@ pub struct ResourceSnapshot {
     /// between `None` and `Some(false)` is provenance for diagnostics.
     #[serde(default)]
     pub host_device_memory_is_unified: Option<bool>,
-    /// A live CUDA topology query that failed, as opposed to a record that
-    /// predates the field or a non-CUDA capture. All three read as `None`
-    /// above, but only this one describes a present CUDA device whose topology
-    /// is unknown — and on an integrated device the split per-axis checks that
-    /// `None` falls back to are the unsound accounting this field exists to
-    /// prevent. Defaults to false, so legacy records keep the old behaviour.
+    /// A live CUDA topology query that failed, as distinct from a legacy or
+    /// non-CUDA record: both read as `None` above, but only this one leaves a
+    /// present device unaccounted. Defaults to false for old records.
     #[serde(default)]
     pub device_topology_probe_failed: bool,
     /// Hardware-level totals (MemTotal / device total memory), unlike the
@@ -435,10 +432,9 @@ impl ResourceSnapshot {
         if self.host_device_memory_is_unified != Some(true) {
             return None;
         }
-        // Both binding views are required. A minimum over whichever views
-        // happened to be measured would pass one axis's availability off as
-        // the shared pool's, which is the error this method exists to prevent.
-        // A cgroup limit is genuinely optional: its absence is no constraint.
+        // Both binding views are required; a minimum over whichever happened to
+        // be measured would pass one axis off as the pool. A cgroup limit is
+        // optional: its absence is no constraint.
         let pool = self
             .host_memory_available_bytes?
             .min(self.device_free_memory_bytes?);
@@ -448,13 +444,9 @@ impl ResourceSnapshot {
         })
     }
 
-    /// The host pool a run is actually confined to: physical host memory, or a
-    /// finite cgroup limit when that is smaller. A container's pool is its
-    /// limit, not the machine's RAM — an 8 GiB container on a 64 GiB host would
-    /// otherwise scale reserves from 64 GiB and keep a margin worth 12.5% of
-    /// what the run can use instead of 5%. Both inputs are configured or
-    /// hardware totals rather than instantaneous views, so the result stays
-    /// stable across runs the way reserve scaling requires.
+    /// The host pool a run is confined to: physical memory, or a finite cgroup
+    /// limit when smaller. Both are totals, so reserves scaled from this stay
+    /// stable across runs.
     pub fn host_pool_total_bytes(&self) -> Option<u64> {
         let limit = match self.cgroup_v2_memory_limit {
             Some(CgroupMemoryLimit::Bytes(bytes)) => Some(bytes),
@@ -466,12 +458,9 @@ impl ResourceSnapshot {
         }
     }
 
-    /// Whether admission must refuse rather than fall back to independent
-    /// per-axis checks: either a confirmed shared pool whose size is unknown,
-    /// or a live CUDA device whose topology query failed, which leaves the
-    /// question of whether to fold unanswered. Assuming discrete in either case
-    /// is the specific unsoundness this work exists to remove — a warning does
-    /// not prevent the OOM that follows.
+    /// Whether admission must refuse rather than fall back to per-axis checks:
+    /// a shared pool of unknown size, or a failed live topology query. Assuming
+    /// discrete in either case is the unsoundness this work removes.
     pub fn unified_accounting_is_undecidable(&self) -> bool {
         self.device_topology_probe_failed || self.unified_pool_is_unmeasurable()
     }
@@ -501,9 +490,8 @@ trait ProbeSource {
     }
 
     /// Host-wide total physical memory, for platforms that report it outside
-    /// the filesystem. Reserves scale with totals rather than the momentary
-    /// available view, so a platform that cannot answer this falls back to an
-    /// available figure and loses that stability.
+    /// the filesystem. A platform that cannot answer falls back to the
+    /// available view and loses the stability reserves scale on.
     fn host_total_memory_bytes(&self) -> Option<u64> {
         None
     }

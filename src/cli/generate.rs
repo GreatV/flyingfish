@@ -27,11 +27,8 @@ const GENERATION_READY_FILE: &str = "generation-ready";
 const EXECUTION_POLICY_FILE: &str = "execution-policy.json";
 const RESOURCE_SELECTION_FILE: &str = "resource-selection.json";
 
-/// A generation preflight rejected for capacity, as distinct from the parse,
-/// metadata and numerical-backend failures the same function can return. Only
-/// this one becomes a resource refusal: publishing a filesystem error as a
-/// `CapacityRejected` candidate would put a false cause in the very ledger the
-/// refusal exists to make trustworthy.
+/// A preflight rejected for capacity, as distinct from the parse, metadata and
+/// backend failures the same function returns. Only this one becomes a refusal.
 #[derive(Debug)]
 struct PreflightCapacityRefusal(String);
 
@@ -923,10 +920,8 @@ fn select_generation_resources(
     }) {
         Ok(selected) => selected,
         Err(error) => {
-            // Only a refusal that carries a ledger names a destination: an
-            // early bail — a zero budget, say — has nothing to publish, and a
-            // run that never started must leave no directory behind.
-            // `report_refusal` creates the parent when it does publish.
+            // Only a refusal carrying a ledger names a destination; an early
+            // bail has nothing to publish and leaves no directory behind.
             let destination = error
                 .downcast_ref::<flyingfish::resource_policy::AdmissionRefused>()
                 .map(|_| refusal_sidecar);
@@ -1830,10 +1825,8 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         let preflight = match preflight {
             Ok(preflight) => preflight,
             Err(error) => {
-                // The second preflight is a final admission like the GLM and H3
-                // ones: when a selection exists it carries a complete candidate
-                // ledger, so a capacity change between selection and here is
-                // published rather than reduced to a message.
+                // A final admission like the GLM and H3 ones: a capacity change
+                // since selection is published, not reduced to a message.
                 if error.downcast_ref::<PreflightCapacityRefusal>().is_none() {
                     return Err(error);
                 }
@@ -2117,14 +2110,10 @@ fn preflight_generation(
         max_host_mib,
         max_device_mib,
     )?;
-    // Selection promised the same reserve on the folded host axis (see
-    // `cli/resource.rs`, which charges it as `additional_host_allowance_bytes`).
-    // This preflight captures a fresh snapshot and becomes the final admission
-    // record, so without the reserve a pool that fell between the modelled peak
-    // and peak-plus-reserve would pass here after selection had refused it.
-    // Charged on the budget side rather than the peak so it is applied exactly
-    // once on this path; unifying the two homes is the A7 follow-up recorded in
-    // `docs/resource-ownership.md`.
+    // Selection promised the same reserve on the folded host axis; this
+    // preflight captures a fresh snapshot and becomes the final record. Charged
+    // on the budget side so it applies once here; unifying the two homes is the
+    // A7 follow-up in `docs/resource-ownership.md`.
     if snapshot.host_device_memory_is_unified == Some(true) {
         budget.max_host_bytes = Some(
             budget
@@ -2256,13 +2245,10 @@ pub(super) fn probed_budget(
     let max_host_bytes = requested_host.or(probed_host).context(
         "generation preflight cannot measure available host memory; provide --max-host-mib explicitly",
     )?;
-    // On a probed unified-memory device the device axis is folded into host
-    // accounting, so the combined peak is charged against this one bound. The
-    // host view alone can exceed the shared pool — CUDA free memory tracks
-    // MemFree while MemAvailable also counts reclaimable page cache — so an
-    // unclamped host bound admits a footprint the pool cannot hold. Explicit
-    // `--max-host-mib` is clamped too, matching how the device axis already
-    // takes the minimum of the request and the probe.
+    // Under the fold the combined peak is charged against this one bound, and
+    // the host view alone can exceed the pool: CUDA free memory tracks MemFree
+    // while MemAvailable also counts reclaimable cache. Explicit
+    // `--max-host-mib` is clamped too, as the device axis already is.
     anyhow::ensure!(
         !snapshot.unified_accounting_is_undecidable(),
         "generation preflight needs the shared host/device pool size on a unified-memory device, \
@@ -2609,11 +2595,8 @@ fn validate_staging_directory(staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A directory holding nothing but refusal diagnostics is a retryable state,
-/// not partial run state: admission rejected the request before anything was
-/// initialized, and the record was published precisely so the operator could
-/// read it, free memory and run the same command again. Requiring them to
-/// delete it first would make publishing the ledger a penalty.
+/// A directory holding only refusal diagnostics is retryable state, not partial
+/// run state: nothing was initialized, and the record exists to be read.
 fn validate_empty_uninitialized_directory(output_dir: &Path) -> Result<()> {
     for entry in fs::read_dir(output_dir)
         .with_context(|| format!("failed to read {}", output_dir.display()))?
