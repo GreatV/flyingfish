@@ -123,11 +123,24 @@ pub(super) fn run(args: Args) -> Result<()> {
     let cancelled = AtomicBool::new(false);
     let completions = Mutex::new(Vec::<Completion>::new());
     let started = Instant::now();
-    // Every worker holds a frame stack at once, and on a shared pool they all
-    // come from the same memory, so each reserves the concurrent sum rather
-    // than its own. Discrete workers are unaffected: the reserve only applies
-    // under the fold.
+    // Workers run at once, so on a shared pool their frame stacks and device
+    // charges are all live together. Each integrated worker therefore reserves
+    // the concurrent sum of both, and takes a share of what is left rather than
+    // all of it. Discrete workers are unaffected: the fold does not apply.
     let concurrent_workers = args.devices.len().min(requests.len()).max(1) as u64;
+    let unified_workers = args
+        .devices
+        .iter()
+        .take(requests.len())
+        .filter(|name| {
+            parse_device(name).is_ok_and(|device| {
+                flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device))
+                    .unified_pool_available_bytes()
+                    .is_some()
+            })
+        })
+        .count()
+        .max(1) as u64;
     let worker_errors = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for name in args.devices.iter().take(requests.len()) {
@@ -167,7 +180,7 @@ pub(super) fn run(args: Args) -> Result<()> {
                         &demands,
                         &device,
                         args.device_cache,
-                        reserve,
+                        reserve.saturating_mul(unified_workers),
                         host_reserve.saturating_mul(concurrent_workers),
                     )?)?;
                     while !cancelled.load(Ordering::Acquire) {
