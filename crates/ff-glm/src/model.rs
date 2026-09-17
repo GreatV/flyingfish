@@ -60,10 +60,13 @@ struct GlmAdmissionModel {
     host_charge_bytes: usize,
     /// The prefill routing mask: a temporary already dropped by decode.
     prefill_host_charge_bytes: usize,
-    /// One pinned upload slot set. The phase model charges one to each axis,
-    /// so a folded guard needs two and a device-only guard one. Required only
-    /// before the pool exists.
+    /// One pinned upload slot set, plus the fill-ahead ring. The phase model
+    /// charges a slot set to each axis, so a folded guard needs two. Required
+    /// only before the pool exists: afterwards both are resident and already
+    /// counted by the snapshot each later guard measures.
     pinned_slot_bytes: usize,
+    /// The fill-ahead ring: host-only, and like the slots resident afterwards.
+    pinned_ring_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -521,6 +524,7 @@ impl PreparedGlm {
             unified_pool: snapshot.unified_pool_available_bytes().is_some(),
             prefill_host_charge_bytes: usize::try_from(breakdown.prefill_host_mask_bytes)?,
             pinned_slot_bytes: usize::try_from(breakdown.pinned_transfer_bytes)?,
+            pinned_ring_bytes: usize::try_from(breakdown.pinned_fill_ahead_bytes)?,
             host_charge_bytes: usize::try_from(
                 breakdown
                     .host_route_workspace_bytes
@@ -533,9 +537,7 @@ impl PreparedGlm {
                             breakdown.streamed_load_host_bytes
                         })
                     })
-                    // The ring is per transfer, so it is headroom everywhere;
-                    // a tensor-granularity miss also owns a header copy.
-                    .and_then(|n| n.checked_add(breakdown.pinned_fill_ahead_bytes))
+                    // A tensor-granularity miss owns a header copy per loader.
                     .and_then(|n| {
                         n.checked_add(
                             breakdown.largest_header_bytes(self.model.weights.cache_policy()),
@@ -708,13 +710,15 @@ impl StreamedGlm {
             1,
             model.execution_policy.cpu_fp8_dequantization,
         )?;
-        // Fill-ahead workers run independently of pinned staging, and each
-        // holds its own decoded header while loading.
-        breakdown.concurrent_loads = u64::try_from(concurrent_load_count())?;
-        if options.pinned_fp8_transfer {
+        // Fill-ahead workers only run on the pinned path, so header copies are
+        // charged for loaders that can actually exist.
+        breakdown.concurrent_loads = if options.pinned_fp8_transfer {
             let (lanes, fill_ring_depth) = pinned_staging_shape();
             breakdown.enable_pinned_transfer(lanes, fill_ring_depth)?;
-        }
+            u64::try_from(concurrent_load_count().max(lanes))?
+        } else {
+            1
+        };
         Ok(PreparedGlm {
             model,
             breakdown,
@@ -2971,6 +2975,7 @@ mod tests {
             host_charge_bytes: 0,
             prefill_host_charge_bytes: 0,
             pinned_slot_bytes: 0,
+            pinned_ring_bytes: 0,
         };
         let cache = ExpertCacheStats {
             bytes: 60,

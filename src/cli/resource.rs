@@ -276,7 +276,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
             &mut provenance,
             final_observation,
             final_budget,
-            host_peak,
+            checked_host,
             device_peak,
         )?;
         provenance.workload.insert("refused".into(), 1);

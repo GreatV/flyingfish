@@ -69,6 +69,7 @@ impl StreamedGlm {
             admission
                 .pinned_slot_bytes
                 .checked_mul(if admission.unified_pool { 2 } else { 1 })
+                .and_then(|n| n.checked_add(admission.pinned_ring_bytes))
                 .context("GLM pinned slot charge overflow")?,
         ]
         .into_iter()

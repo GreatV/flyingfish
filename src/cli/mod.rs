@@ -532,13 +532,14 @@ fn decide_auto_residency_with_required_memory(
             unified_share,
         );
     }
-    // Each concurrent caller needs its own fixed margin, not one for the batch.
-    let reserve = required_device_bytes
-        .checked_add(DEVICE_RESIDENCY_RESERVE_BYTES.saturating_mul(unified_share.max(1)))
-        .context("device residency reserve overflow")?;
-    // The same fold `decide_device_residency` applies; this automatic path is
-    // the default for the generic adapters and had been left on the device view.
     let snapshot = ResourceSnapshot::capture(Some(device));
+    // Each concurrent caller needs its own fixed margin, but only where the
+    // pool is actually shared; a discrete device owes nothing to the others.
+    let shared = snapshot.unified_pool_available_bytes().is_some();
+    let share = if shared { unified_share.max(1) } else { 1 };
+    let reserve = required_device_bytes
+        .checked_add(DEVICE_RESIDENCY_RESERVE_BYTES.saturating_mul(share))
+        .context("device residency reserve overflow")?;
     let capacity = if snapshot.unified_accounting_is_undecidable() {
         0
     } else {
@@ -547,7 +548,7 @@ fn decide_auto_residency_with_required_memory(
             .or(snapshot.device_free_memory_bytes)
             .unwrap_or(0)
     };
-    let reserve = if snapshot.unified_pool_available_bytes().is_some() {
+    let reserve = if shared {
         reserve
             .checked_add(unified_host_bytes)
             .context("unified host reserve overflow")?
@@ -556,12 +557,7 @@ fn decide_auto_residency_with_required_memory(
     };
     // Reserving each concurrent caller's charges is not enough: the remainder
     // is also shared, so one caller may retain only its portion of it.
-    let available = capacity.saturating_sub(reserve)
-        / if snapshot.unified_pool_available_bytes().is_some() {
-            unified_share.max(1)
-        } else {
-            1
-        };
+    let available = capacity.saturating_sub(reserve) / share;
     let plan = plan_device_residency(demands, available, 0)?;
     eprintln!(
         "device residency: auto retains {} MiB in {}/{} weight groups after reserving {} MiB for request tensors and workspace",
@@ -586,14 +582,16 @@ fn decide_residency_with_required_memory(
     unified_share: u64,
 ) -> Result<DeviceCache> {
     use flyingfish::runtime::{probe::ResourceSnapshot, residency::decide_device_residency};
+    let snapshot = ResourceSnapshot::capture(Some(device));
+    let shared = snapshot.unified_pool_available_bytes().is_some();
+    let share = if shared { unified_share.max(1) } else { 1 };
     let reserve = DEVICE_RESIDENCY_RESERVE_BYTES
-        .saturating_mul(unified_share.max(1))
+        .saturating_mul(share)
         .checked_add(required_device_bytes)
         .context("device residency reserve overflow")?;
-    let snapshot = ResourceSnapshot::capture(Some(device));
     // An explicit ceiling is still clamped against the shared pool, so the
     // caller's separately modelled host allocation is reserved here too.
-    let reserve = if snapshot.unified_pool_available_bytes().is_some() {
+    let reserve = if shared {
         reserve
             .checked_add(unified_host_bytes)
             .context("unified host reserve overflow")?
@@ -606,9 +604,7 @@ fn decide_residency_with_required_memory(
     // retained. The operator's own ceiling still clamps on top, so a ceiling
     // that already fits the share is not reduced.
     let reserve = match snapshot.unified_pool_available_bytes() {
-        Some(pool) if unified_share > 1 => {
-            pool.saturating_sub(pool.saturating_sub(reserve) / unified_share)
-        }
+        Some(pool) if share > 1 => pool.saturating_sub(pool.saturating_sub(reserve) / share),
         _ => reserve,
     };
     let decision = decide_device_residency(&snapshot, demands, reserve, args.authorization()?)?;

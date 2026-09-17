@@ -219,12 +219,17 @@ pub(super) fn run_solve_t2va(command: H3Command) -> Result<()> {
         // checks each axis against its own bound, which on a shared pool can
         // call a candidate feasible whose two axes together exceed it. Refused
         // rather than reported wrongly until the solver models a combined bound.
-        // Only when a device is actually present: a non-CUDA binary still
-        // solves symbolically, and nothing is folded there.
+        // Only an omitted device skips probing: a named one that cannot be
+        // opened is an error, not the symbolic mode, and silently treating it
+        // as such would emit a split-axis solution for an unknown topology.
         let probe = device
             .as_deref()
-            .and_then(|name| parse_device(name).ok())
-            .map(|device| flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device)));
+            .map(|name| -> Result<_> {
+                Ok(flyingfish::runtime::probe::ResourceSnapshot::capture(Some(
+                    &parse_device(name)?,
+                )))
+            })
+            .transpose()?;
         anyhow::ensure!(
             probe.is_none_or(|snapshot| {
                 snapshot.host_device_memory_is_unified != Some(true)
