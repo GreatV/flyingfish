@@ -479,17 +479,7 @@ impl GlmAdmissionBreakdown {
         // It is reported as `reclaimable_host_bytes` (telemetry) and never
         // charged in fit decisions; only exclusive allocations are.
         // The largest shard header is an owned Vec: required, not reclaimable.
-        let header_copies =
-            if cache_policy.granularity == ff_core::weights::CacheGranularity::Tensor {
-                self.raw_inventory
-                    .shards
-                    .iter()
-                    .map(|s| s.header_bytes)
-                    .max()
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+        let header_copies = self.largest_header_bytes(cache_policy);
         let raw = estimate_cache_residency(
             &self.raw_inventory,
             WeightSource::Mmap,
@@ -635,6 +625,20 @@ impl GlmAdmissionBreakdown {
 
     /// Remaining CUDA capacity after the caller's complete phase peaks. Rank
     /// callers include their transfer buffers in these phases before sizing.
+    /// The owned `encoded_header` a tensor-granularity miss allocates.
+    pub fn largest_header_bytes(&self, cache_policy: CachePolicy) -> u64 {
+        if cache_policy.granularity == ff_core::weights::CacheGranularity::Tensor {
+            self.raw_inventory
+                .shards
+                .iter()
+                .map(|s| s.header_bytes)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
     pub fn automatic_expert_cache_bytes(
         &self,
         phases: &[ResourcePhaseEstimate],

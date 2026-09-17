@@ -60,7 +60,8 @@ struct GlmAdmissionModel {
     host_charge_bytes: usize,
     /// The prefill routing mask: a temporary already dropped by decode.
     prefill_host_charge_bytes: usize,
-    /// Pinned upload slots: required only before the pool exists.
+    /// Pinned upload slots, both copies: the phase model charges them to each
+    /// axis, so the fold requires two. Only before the pool exists.
     pinned_slot_bytes: usize,
 }
 
@@ -507,7 +508,12 @@ impl PreparedGlm {
             safety_bytes: usize::try_from(breakdown.scaled_admission_safety_bytes(snapshot))?,
             unified_pool: snapshot.unified_pool_available_bytes().is_some(),
             prefill_host_charge_bytes: usize::try_from(breakdown.prefill_host_mask_bytes)?,
-            pinned_slot_bytes: usize::try_from(breakdown.pinned_transfer_bytes)?,
+            pinned_slot_bytes: usize::try_from(
+                breakdown
+                    .pinned_transfer_bytes
+                    .checked_mul(2)
+                    .context("pinned slot charge overflow")?,
+            )?,
             host_charge_bytes: usize::try_from(
                 breakdown
                     .host_route_workspace_bytes
@@ -520,8 +526,14 @@ impl PreparedGlm {
                             breakdown.streamed_load_host_bytes
                         })
                     })
-                    // The ring is per transfer, so it is headroom everywhere.
+                    // The ring is per transfer, so it is headroom everywhere;
+                    // a tensor-granularity miss also owns a header copy.
                     .and_then(|n| n.checked_add(breakdown.pinned_fill_ahead_bytes))
+                    .and_then(|n| {
+                        n.checked_add(
+                            breakdown.largest_header_bytes(self.model.weights.cache_policy()),
+                        )
+                    })
                     .context("GLM unified host charge overflow")?,
             )?,
         });
