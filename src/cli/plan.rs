@@ -226,7 +226,10 @@ pub(super) fn run_solve_t2va(command: H3Command) -> Result<()> {
             .and_then(|name| parse_device(name).ok())
             .map(|device| flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device)));
         anyhow::ensure!(
-            probe.is_none_or(|snapshot| snapshot.host_device_memory_is_unified != Some(true)),
+            probe.is_none_or(|snapshot| {
+                snapshot.host_device_memory_is_unified != Some(true)
+                    && !snapshot.unified_accounting_is_undecidable()
+            }),
             "solve-t2va cannot model a unified-memory device: its candidate search checks the host \
              and device axes independently, which overstates feasibility on one shared pool"
         );
