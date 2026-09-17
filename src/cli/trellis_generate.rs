@@ -158,6 +158,8 @@ pub(super) fn generate(args: GenerateArgs) -> Result<()> {
         args.device_cache,
         0,
         0,
+        // discrete-only adapters share nothing.
+        1,
     )?;
     let progress = |stage: &str, done: usize, total: usize| {
         eprintln!(
@@ -322,6 +324,8 @@ pub(super) fn decode(args: DecodeArgs) -> Result<()> {
             args.device_cache,
             0,
             0,
+            // discrete-only adapters share nothing.
+            1,
         )?,
     )?;
     publish_cloud(&cloud, staging)?;

@@ -92,6 +92,7 @@ impl Worker {
                 memory.tensor_peak_bytes
             },
             0,
+            1,
         )?;
         let priority = phases
             .iter()

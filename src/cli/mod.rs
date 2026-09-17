@@ -509,15 +509,17 @@ const DEVICE_RESIDENCY_RESERVE_BYTES: u64 = 1 << 30;
 
 /// Default CUDA placement for adapters with request tensor estimates. Explicit
 /// ceilings (including zero) and non-CUDA devices keep their existing behavior.
-/// `unified_host_bytes` is a host allocation the caller models separately. It
-/// is reserved only under the fold, where it draws from the same pool as this
-/// cache; on discrete topology the two axes are independent.
+/// `unified_host_bytes` is a host allocation the caller models separately, and
+/// `unified_share` is how many callers draw from the same pool at once. Both
+/// apply only under the fold; on discrete topology the axes are independent and
+/// each caller owns its device.
 fn decide_auto_residency_with_required_memory(
     demands: &[flyingfish::runtime::residency::PhaseResidencyDemand],
     device: &candle_core::Device,
     args: DeviceCacheArgs,
     required_device_bytes: u64,
     unified_host_bytes: u64,
+    unified_share: u64,
 ) -> Result<DeviceCache> {
     use flyingfish::runtime::{probe::ResourceSnapshot, residency::plan_device_residency};
     if !device.is_cuda() || args.device_cache_mib.is_some() {
@@ -550,7 +552,14 @@ fn decide_auto_residency_with_required_memory(
     } else {
         reserve
     };
-    let available = capacity.saturating_sub(reserve);
+    // Reserving each concurrent caller's charges is not enough: the remainder
+    // is also shared, so one caller may retain only its portion of it.
+    let available = capacity.saturating_sub(reserve)
+        / if snapshot.unified_pool_available_bytes().is_some() {
+            unified_share.max(1)
+        } else {
+            1
+        };
     let plan = plan_device_residency(demands, available, 0)?;
     eprintln!(
         "device residency: auto retains {} MiB in {}/{} weight groups after reserving {} MiB for request tensors and workspace",

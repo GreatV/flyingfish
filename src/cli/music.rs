@@ -119,6 +119,7 @@ pub(super) fn run(command: MusicCommand) -> Result<()> {
         // Modelled separately and allocated on the host; under the fold it
         // competes with this cache for the same pool.
         memory.frame_stack_host_peak_bytes,
+        1,
     )?)?;
     let mut previous = String::new();
     let started = Instant::now();

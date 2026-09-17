@@ -182,6 +182,7 @@ pub(super) fn run(args: Args) -> Result<()> {
                         args.device_cache,
                         reserve.saturating_mul(unified_workers),
                         host_reserve.saturating_mul(concurrent_workers),
+                        unified_workers,
                     )?)?;
                     while !cancelled.load(Ordering::Acquire) {
                         let index = next.fetch_add(1, Ordering::Relaxed);
