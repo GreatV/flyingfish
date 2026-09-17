@@ -349,8 +349,12 @@ impl LayerPartitionedGlm {
             let joint_share = if unified.is_empty() {
                 None
             } else {
-                let mut remainder = admission.snapshots[unified[0]]
-                    .unified_pool_available_bytes()
+                // The validator binds on the smallest pool view across these
+                // ranks, so the remainder starts there rather than at rank 0's.
+                let mut remainder = unified
+                    .iter()
+                    .filter_map(|&r| admission.snapshots[r].unified_pool_available_bytes())
+                    .min()
                     .unwrap_or(0)
                     .saturating_sub(admission.required_host_bytes);
                 for &r in &unified {
