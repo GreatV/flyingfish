@@ -11,10 +11,10 @@ align).
 
 | reserve | protects | owning ledger (target) | current homes (legacy) |
 |---|---|---|---|
-| GLM admission safety | allocator slack against modelled-peak error | pool-proportional, charged once in the phase model | `GLM_ADMISSION_SAFETY_BYTES` baked into every phase's device reserve / CPU safety term |
+| GLM admission safety | allocator slack against modelled-peak error | **scaled: min(1 GiB, pool/20)**, applied at admission and recorded in the sidecar | `GLM_ADMISSION_SAFETY_BYTES` (declared contract constant, identity) |
 | GLM host promotion reserve | headroom for weight-source promotion | (dead — recorded, never charged; A3) | `host_promotion_reserve_bytes`, set in `resource_policy/glm.rs`, read nowhere |
-| H3 device residency reserve | activation/workspace slack around retained weights | the request's `additional_host_allowance_bytes` under the unified fold; the phase `device_reserve_bytes` stamp on discrete | cli/resource.rs allowance + phase stamp + `automatic_device_cache` headroom |
-| FA backend workspace floor | cuDNN/FlashAttention workspace | should scale with sequence geometry, not a flat 3584 MiB | `DEFAULT_FLASH_BACKEND_WORKSPACE_MIB` |
+| H3/generic device residency reserve | activation/workspace slack around retained weights | **still fixed 1 GiB** — intentionally NOT scaled yet: the generic adapters (minicpm/music/trellis) and H3 keep `DEVICE_RESIDENCY_RESERVE_BYTES` flat. This is a *known two-family inconsistency* introduced by scaling GLM only; scaling these is A7 follow-up, not an oversight | cli/resource.rs allowance + phase stamp + `automatic_device_cache` headroom |
+| FA backend workspace floor | cuDNN/FlashAttention workspace | **deferred**: scale with sequence geometry, but no ground truth exists (FA never ran on the Orin pool) — deferred deliberately rather than guessed | `DEFAULT_FLASH_BACKEND_WORKSPACE_MIB` |
 | non-FA backend workspace | attention score workspaces | geometry-scaled | `DEFAULT_NON_FLASH_BACKEND_WORKSPACE_MIB` (1536 MiB) |
 
 ## Residency (bytes held, by reclaimability)
