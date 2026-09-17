@@ -69,21 +69,25 @@ pub fn report_refusal(error: &anyhow::Error, sidecar: Option<&Path>) -> Option<S
                 parent.display()
             );
         }
-        // Replaced only if it is this command's own refusal record. The path is
-        // derived from a caller-supplied one, so an unrelated file can sit
-        // there; deleting it to publish a diagnostic would be a poor trade.
+        // Replaced only if it is this same request's refusal record: format
+        // alone is not ownership, and the path is derived from a caller-supplied
+        // one, so another command's artifact can sit there.
         if path.exists() {
             match std::fs::read(path)
                 .ok()
                 .and_then(|bytes| ResourceSelectionProvenance::from_json(&bytes).ok())
             {
-                Some(existing) if existing.is_refusal() => {
+                Some(existing)
+                    if existing.is_refusal()
+                        && existing.request == refusal.provenance.request
+                        && existing.model == refusal.provenance.model =>
+                {
                     if let Err(error) = std::fs::remove_file(path) {
                         eprintln!("warning: cannot replace {}: {error}", path.display());
                     }
                 }
                 _ => eprintln!(
-                    "warning: {} is not a refusal record; leaving it and not publishing",
+                    "warning: {} is not this request's refusal record; leaving it and not publishing",
                     path.display()
                 ),
             }
