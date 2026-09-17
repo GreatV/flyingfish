@@ -760,6 +760,10 @@ fn report_weight_streaming_window(model_root: &Path) {
 /// These are the generation request's own terms, carried as one value so the
 /// planner's signature stays a signature rather than a list.
 struct GenerationResourceRequest<'a> {
+    /// Where a refusal publishes its candidate ledger. The run writes its
+    /// selection to this same path on success, so a rejected request is
+    /// diagnosable from the same artifact rather than from stderr alone.
+    refusal_sidecar: &'a Path,
     model: &'a Path,
     model_root_record: &'a str,
     device: &'a Device,
@@ -802,6 +806,7 @@ fn select_generation_resources(
         return Ok(None);
     }
     let GenerationResourceRequest {
+        refusal_sidecar,
         model,
         model_root_record,
         device,
@@ -890,9 +895,7 @@ fn select_generation_resources(
     }) {
         Ok(selected) => selected,
         Err(error) => {
-            // No sidecar path is in scope here; the refusal record still goes
-            // to stderr with per-candidate reasons.
-            flyingfish::resource_policy::report_refusal(&error, None);
+            flyingfish::resource_policy::report_refusal(&error, Some(refusal_sidecar));
             return Err(error);
         }
     };
@@ -1655,6 +1658,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         &mut execution_policy,
         &mut policy_origin,
         GenerationResourceRequest {
+            refusal_sidecar: &output_dir.join(RESOURCE_SELECTION_FILE),
             model: &model,
             model_root_record: &model_root_record,
             device: &device,
