@@ -223,7 +223,9 @@ impl LayerPartitionedGlm {
                 options.cpu_fp8_dequantization,
                 scope,
             )?;
-            breakdown.concurrent_loads = u64::try_from(crate::model::concurrent_load_count())?;
+            breakdown.concurrent_loads = u64::try_from(crate::model::concurrent_load_count(
+                options.pinned_fp8_transfer,
+            ))?;
             if options.pinned_fp8_transfer {
                 let (lanes, fill_ring_depth) = crate::model::pinned_staging_shape();
                 breakdown.enable_pinned_transfer(lanes, fill_ring_depth)?;

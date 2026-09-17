@@ -252,14 +252,19 @@ pub(crate) fn pinned_staging_shape() -> (usize, usize) {
     (fp8::cuda::configured_lanes(), depth)
 }
 
-/// Loads in flight: the foreground one plus any fill-ahead workers.
-#[cfg(feature = "cuda")]
-pub(crate) fn concurrent_load_count() -> usize {
-    fill_ahead_count().saturating_add(1)
-}
-
-#[cfg(not(feature = "cuda"))]
-pub(crate) fn concurrent_load_count() -> usize {
+/// Loads in flight for a configured transfer path: the foreground one plus any
+/// fill-ahead workers, and never fewer than the upload lanes. Fill-ahead only
+/// runs on the pinned path, so a non-pinned configuration has one loader.
+pub(crate) fn concurrent_load_count(pinned: bool) -> usize {
+    if !pinned {
+        return 1;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let (lanes, _) = pinned_staging_shape();
+        fill_ahead_count().saturating_add(1).max(lanes)
+    }
+    #[cfg(not(feature = "cuda"))]
     1
 }
 
@@ -523,8 +528,19 @@ impl PreparedGlm {
             safety_bytes: usize::try_from(breakdown.scaled_admission_safety_bytes(snapshot))?,
             unified_pool: snapshot.unified_pool_available_bytes().is_some(),
             prefill_host_charge_bytes: usize::try_from(breakdown.prefill_host_mask_bytes)?,
-            pinned_slot_bytes: usize::try_from(breakdown.pinned_transfer_bytes)?,
-            pinned_ring_bytes: usize::try_from(breakdown.pinned_fill_ahead_bytes)?,
+            // Resident-static preloads the FP8 weights below, which creates the
+            // pool and its slots before any guard runs; the snapshot those
+            // guards capture already contains them.
+            pinned_slot_bytes: if self.resident_static {
+                0
+            } else {
+                usize::try_from(breakdown.pinned_transfer_bytes)?
+            },
+            pinned_ring_bytes: if self.resident_static {
+                0
+            } else {
+                usize::try_from(breakdown.pinned_fill_ahead_bytes)?
+            },
             host_charge_bytes: usize::try_from(
                 breakdown
                     .host_route_workspace_bytes
@@ -712,13 +728,12 @@ impl StreamedGlm {
         )?;
         // Fill-ahead workers only run on the pinned path, so header copies are
         // charged for loaders that can actually exist.
-        breakdown.concurrent_loads = if options.pinned_fp8_transfer {
+        breakdown.concurrent_loads =
+            u64::try_from(concurrent_load_count(options.pinned_fp8_transfer))?;
+        if options.pinned_fp8_transfer {
             let (lanes, fill_ring_depth) = pinned_staging_shape();
             breakdown.enable_pinned_transfer(lanes, fill_ring_depth)?;
-            u64::try_from(concurrent_load_count().max(lanes))?
-        } else {
-            1
-        };
+        }
         Ok(PreparedGlm {
             model,
             breakdown,
