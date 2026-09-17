@@ -334,8 +334,20 @@ impl LayerPartitionedGlm {
         }
         if experts {
             let admission = self.admission(prompt_tokens)?;
+            // Integrated ranks draw their caches from one pool, and the
+            // validator sums them, so each gets a share of the remainder rather
+            // than all of it. Discrete ranks own their device outright.
+            let unified_ranks = admission
+                .snapshots
+                .iter()
+                .filter(|s| s.unified_pool_available_bytes().is_some())
+                .count()
+                .max(1) as u64;
             for rank in 0..self.workers.len() {
                 let estimate = &admission.ranks[rank];
+                let shared = admission.snapshots[rank]
+                    .unified_pool_available_bytes()
+                    .is_some();
                 // Sized against the ledger the validator uses.
                 let bytes = estimate
                     .breakdown
@@ -344,6 +356,11 @@ impl LayerPartitionedGlm {
                         &admission.snapshots[rank],
                         Some(admission.required_host_bytes),
                     )?;
+                let bytes = if shared {
+                    bytes / unified_ranks as usize
+                } else {
+                    bytes
+                };
                 self.workers[rank].expert_cache.resize(bytes)?;
                 let policy = &mut self.workers[rank].execution_policy.expert_cache;
                 policy.maximum_bound_bytes = bytes as u64;
