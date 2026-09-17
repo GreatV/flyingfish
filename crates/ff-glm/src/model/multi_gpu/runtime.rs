@@ -58,6 +58,8 @@ impl GlmPartitionAdmission {
             "partition admission rank count mismatch"
         );
         let mut host_sum = 0u64;
+        let mut unified_device_sum = 0u64;
+        let mut unified_pool: Option<u64> = None;
         for (rank, (record, snapshot)) in self.ranks.iter().zip(&self.snapshots).enumerate() {
             ensure!(
                 record.rank == rank && !record.phases.is_empty(),
@@ -86,18 +88,16 @@ impl GlmPartitionAdmission {
                     .device_peak_bytes()?
                     .context("missing rank device bound")?;
                 let required = total.saturating_sub(record.already_resident_device_bytes);
-                // An integrated rank shares one pool with every rank's host
-                // allocations, so the aggregate host requirement is charged
-                // alongside this rank's device requirement.
+                // Integrated ranks are accumulated and checked together after
+                // the loop: each one's device allocations and every rank's host
+                // allocations draw from the same pool, so per-rank checks admit
+                // a combination the pool cannot hold.
                 if let Some(pool) = snapshot.unified_pool_available_bytes() {
-                    let combined = required
-                        .checked_add(self.required_host_bytes)
-                        .context("partition unified peak overflow")?;
-                    ensure!(
-                        combined <= pool,
-                        "GLM rank {rank} {} needs {combined} bytes from the unified host/device pool, but only {pool} are available",
-                        phase.phase
-                    );
+                    unified_device_sum = unified_device_sum
+                        .checked_add(required)
+                        .context("partition unified device sum overflow")?;
+                    unified_pool =
+                        Some(unified_pool.map_or(pool, |current: u64| current.min(pool)));
                     continue;
                 }
                 ensure!(
@@ -121,6 +121,15 @@ impl GlmPartitionAdmission {
             host_sum == self.required_host_bytes,
             "partition aggregate host bound is inconsistent"
         );
+        if let Some(pool) = unified_pool {
+            let combined = unified_device_sum
+                .checked_add(self.required_host_bytes)
+                .context("partition unified peak overflow")?;
+            ensure!(
+                combined <= pool,
+                "GLM integrated ranks jointly need {combined} bytes from the unified host/device pool, but only {pool} are available"
+            );
+        }
         let available = self
             .snapshots
             .iter()
