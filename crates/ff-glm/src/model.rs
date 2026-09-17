@@ -54,6 +54,14 @@ struct GlmAdmissionModel {
     live_expert_bytes: usize,
     weight_load_staging_bytes: usize,
     safety_bytes: usize,
+    /// Whether admission folded both axes into one pool. The runtime guards
+    /// must fold the same way: checking device headroom alone on a shared pool
+    /// lets the host charges below pass unaccounted.
+    unified_pool: bool,
+    /// Host bytes the runtime allocates alongside the device charges — route
+    /// and sampling workspaces, the prefill mask, and host-side load staging.
+    /// Charged only under the fold, where they draw from the same pool.
+    host_charge_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,6 +511,21 @@ impl PreparedGlm {
             // margin that selection and final admission both accepted — on a
             // sub-20 GiB pool the scaled value is a fraction of the constant.
             safety_bytes: usize::try_from(breakdown.scaled_admission_safety_bytes(snapshot))?,
+            unified_pool: snapshot.unified_pool_available_bytes().is_some(),
+            host_charge_bytes: usize::try_from(
+                breakdown
+                    .host_route_workspace_bytes
+                    .checked_add(breakdown.host_sampling_workspace_bytes)
+                    .and_then(|n| n.checked_add(breakdown.prefill_host_mask_bytes))
+                    .and_then(|n| {
+                        n.checked_add(
+                            breakdown
+                                .streamed_load_host_bytes
+                                .max(breakdown.expert_load_host_bytes),
+                        )
+                    })
+                    .context("GLM unified host charge overflow")?,
+            )?,
         });
         self.model.admission_breakdown = Some(breakdown);
         if self.resident_static {
@@ -780,8 +803,15 @@ impl StreamedGlm {
             .context("GLM runtime admission model is unavailable")?;
         let before = self.expert_cache.stats()?;
         let snapshot = ResourceSnapshot::capture(Some(&self.device));
+        // Fold exactly as admission did: on a shared pool the device view is
+        // not the bound, and the host charges are drawn from the same bytes.
         let (available, memory_kind) = if self.device.is_cpu() {
             (crate::admission::host_available(&snapshot), "host")
+        } else if admission.unified_pool {
+            (
+                snapshot.unified_pool_available_bytes(),
+                "unified host/device pool",
+            )
         } else {
             (snapshot.device_free_memory_bytes, "CUDA")
         };
@@ -2322,10 +2352,17 @@ fn plan_cache_readmission(
         expected_maximum_dsa == admission.maximum_dsa_cache_bytes,
         "GLM DSA admission model disagrees with the execution policy context bound"
     );
+    // The policy's allowance is the declared ceiling and stays identical across
+    // machines so a recorded policy replays; the reserve actually applied is
+    // snapshot-derived and is at most that ceiling (`min(declared, total/20)`).
+    // Requiring equality here would abort the first readmission on every pool
+    // below the 20 GiB crossover, where the two legitimately differ.
+    let applied_safety =
+        u64::try_from(admission.safety_bytes).context("GLM admission safety exceeds u64")?;
     ensure!(
-        u64::try_from(admission.safety_bytes).context("GLM admission safety exceeds u64")?
-            == policy.admission_safety_bytes,
-        "GLM runtime admission safety disagrees with the execution policy"
+        applied_safety > 0 && applied_safety <= policy.admission_safety_bytes,
+        "GLM runtime admission safety {applied_safety} is not within the execution policy allowance {}",
+        policy.admission_safety_bytes
     );
     let current_dsa = admission
         .dsa_cache_bytes_per_token
@@ -2346,6 +2383,13 @@ fn plan_cache_readmission(
         .and_then(|bytes| bytes.checked_add(admission.live_expert_bytes))
         .and_then(|bytes| bytes.checked_add(admission.weight_load_staging_bytes))
         .and_then(|bytes| bytes.checked_add(admission.safety_bytes))
+        .and_then(|bytes| {
+            bytes.checked_add(if admission.unified_pool {
+                admission.host_charge_bytes
+            } else {
+                0
+            })
+        })
         .context("GLM cache re-admission headroom overflow")?;
     let required_future_headroom_bytes = u64::try_from(required_future_headroom_bytes)
         .context("GLM cache re-admission headroom exceeds u64")?;
@@ -2898,6 +2942,8 @@ mod tests {
             pending_lm_head_bytes: 7,
             live_expert_bytes: 11,
             safety_bytes: safety,
+            unified_pool: false,
+            host_charge_bytes: 0,
         };
         let cache = ExpertCacheStats {
             bytes: 60,
@@ -2967,6 +3013,63 @@ mod tests {
             plan_cache_readmission(&policy, admission, 2, RoutingTracePhase::Prefill, 0, cache)
                 .unwrap_err();
         assert!(error.to_string().contains("no cache bound was changed"));
+
+        // A pool-scaled reserve is below the policy's declared allowance, which
+        // is the identity constant every recorded policy carries. Readmission
+        // must accept it — requiring equality aborted the first readmission on
+        // every pool under the 20 GiB crossover — while still rejecting a
+        // reserve above the allowance or none at all.
+        let scaled = GlmAdmissionModel {
+            safety_bytes: safety / 8,
+            ..admission
+        };
+        assert!(
+            plan_cache_readmission(
+                &policy,
+                scaled,
+                2,
+                RoutingTracePhase::Prefill,
+                GLM_ADMISSION_SAFETY_BYTES + 73,
+                cache,
+            )
+            .is_ok()
+        );
+        for invalid in [safety * 2, 0] {
+            let error = plan_cache_readmission(
+                &policy,
+                GlmAdmissionModel {
+                    safety_bytes: invalid,
+                    ..admission
+                },
+                2,
+                RoutingTracePhase::Prefill,
+                GLM_ADMISSION_SAFETY_BYTES + 73,
+                cache,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("execution policy allowance"));
+        }
+
+        // Under the unified fold the host charges draw from the same pool, so
+        // readmission requires them on top of the device ledger.
+        let folded = GlmAdmissionModel {
+            unified_pool: true,
+            host_charge_bytes: 29,
+            ..admission
+        };
+        let unified = plan_cache_readmission(
+            &policy,
+            folded,
+            2,
+            RoutingTracePhase::Prefill,
+            GLM_ADMISSION_SAFETY_BYTES + 73,
+            cache,
+        )
+        .unwrap();
+        assert_eq!(
+            unified.required_future_headroom_bytes,
+            shrink.required_future_headroom_bytes + 29
+        );
     }
 
     #[test]
