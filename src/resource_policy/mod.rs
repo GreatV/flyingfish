@@ -12,7 +12,123 @@ pub fn publish_selection(path: &Path, record: &ResourceSelectionProvenance) -> R
     let staging = ArtifactStaging::new(path)?;
     staging.write_bytes(&bytes)?;
     staging.publish()?;
+    remove_superseded_refusal(&refusal_path_for(path), record);
     Ok(())
+}
+
+/// Remove an earlier attempt's refusal once this record is admitted: keeping
+/// both would describe one run as refused and admitted at once. Only this
+/// request's own refusal is removed — the reserved name can hold someone
+/// else's file, and a name is not ownership.
+pub fn remove_superseded_refusal(refusal: &Path, admitted: &ResourceSelectionProvenance) {
+    if !refusal.exists() {
+        return;
+    }
+    let owned = std::fs::read(refusal)
+        .ok()
+        .and_then(|bytes| ResourceSelectionProvenance::from_json(&bytes).ok())
+        .is_some_and(|existing| {
+            existing.is_refusal()
+                && existing.request == admitted.request
+                && existing.model == admitted.model
+        });
+    if !owned {
+        eprintln!(
+            "warning: {} is not this request's refusal record; leaving it in place",
+            refusal.display()
+        );
+        return;
+    }
+    if let Err(error) = std::fs::remove_file(refusal) {
+        eprintln!(
+            "warning: cannot remove the superseded refusal {}: {error}",
+            refusal.display()
+        );
+    }
+}
+
+/// A resource-selection refusal carrying the complete record: every
+/// candidate's disposition and reason plus the phase estimates it was judged
+/// against. Callers publish this as the resource-selection sidecar even when
+/// no run happens — a refusal without its numbers cannot be calibrated.
+///
+/// The provenance records the baseline policy (that is what was evaluated)
+/// and marks `workload["refused"] = 1`; a refusal is distinguished by that
+/// marker and by no candidate carrying a `Selected` disposition.
+#[derive(Debug)]
+pub struct AdmissionRefused {
+    pub provenance: ResourceSelectionProvenance,
+    pub summary: String,
+}
+
+impl std::fmt::Display for AdmissionRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.summary)
+    }
+}
+
+impl std::error::Error for AdmissionRefused {}
+
+/// A refusal's own destination beside a selection sidecar. Sharing the path
+/// would make the diagnostic block the retry it exists to inform: the caller's
+/// `ensure_new_output` rejects the existing file before admission can rerun.
+pub fn refusal_path_for(selection: &Path) -> std::path::PathBuf {
+    selection.with_extension("refusal.json")
+}
+
+/// Publish the refusal record and print per-candidate reasons, if the error
+/// carries one. Returns the summary for the outward error message.
+pub fn report_refusal(error: &anyhow::Error, sidecar: Option<&Path>) -> Option<String> {
+    let refusal = error.downcast_ref::<AdmissionRefused>()?;
+    for candidate in &refusal.provenance.candidates {
+        eprintln!(
+            "resource refusal {}: {:?} ({})",
+            candidate.candidate_id, candidate.disposition, candidate.reason
+        );
+    }
+    if let Some(path) = sidecar {
+        // Created here, not at each call site: `ArtifactStaging` canonicalizes
+        // the parent, and five of six callers did not do this. A previous
+        // attempt's record is removed first: this path is retryable by design,
+        // and `ArtifactStaging` will not replace a destination, so keeping the
+        // stale ledger would describe a snapshot that no longer applies.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "warning: cannot create {} for the refusal record: {error}",
+                parent.display()
+            );
+        }
+        // Replaced only if it is this same request's refusal record: format
+        // alone is not ownership, and the path is derived from a caller-supplied
+        // one, so another command's artifact can sit there.
+        if path.exists() {
+            match std::fs::read(path)
+                .ok()
+                .and_then(|bytes| ResourceSelectionProvenance::from_json(&bytes).ok())
+            {
+                Some(existing)
+                    if existing.is_refusal()
+                        && existing.request == refusal.provenance.request
+                        && existing.model == refusal.provenance.model =>
+                {
+                    if let Err(error) = std::fs::remove_file(path) {
+                        eprintln!("warning: cannot replace {}: {error}", path.display());
+                    }
+                }
+                _ => eprintln!(
+                    "warning: {} is not this request's refusal record; leaving it and not publishing",
+                    path.display()
+                ),
+            }
+        }
+        if let Err(error) = publish_selection(path, &refusal.provenance) {
+            eprintln!("warning: failed to publish refusal resource selection: {error}");
+        }
+    }
+    Some(refusal.summary.clone())
 }
 
 #[derive(Clone, Copy)]

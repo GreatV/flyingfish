@@ -152,8 +152,15 @@ pub(super) fn generate(args: GenerateArgs) -> Result<()> {
     };
     let demands =
         generation::residency_demands(&args.model, args.models_root.as_deref(), &device, &options)?;
-    options.device_cache =
-        super::decide_auto_residency_with_required_memory(&demands, &device, args.device_cache, 0)?;
+    options.device_cache = super::decide_auto_residency_with_required_memory(
+        &demands,
+        &device,
+        args.device_cache,
+        0,
+        0,
+        // discrete-only adapters share nothing.
+        1,
+    )?;
     let progress = |stage: &str, done: usize, total: usize| {
         eprintln!(
             "{stage}: {done}/{total} ({:.1}s)",
@@ -311,7 +318,15 @@ pub(super) fn decode(args: DecodeArgs) -> Result<()> {
         &grid,
         &latents,
         args.attention_query_chunk_size,
-        super::decide_auto_residency_with_required_memory(&demands, &device, args.device_cache, 0)?,
+        super::decide_auto_residency_with_required_memory(
+            &demands,
+            &device,
+            args.device_cache,
+            0,
+            0,
+            // discrete-only adapters share nothing.
+            1,
+        )?,
     )?;
     publish_cloud(&cloud, staging)?;
     println!(

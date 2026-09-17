@@ -215,17 +215,82 @@ pub(super) fn validate_snapshot_backend(
     snapshot: &ResourceSnapshot,
     fingerprint: &HardwareFingerprint,
 ) -> Result<()> {
+    // The host total scales reserves as the device total does, so it needs the
+    // same guards. A CPU fingerprint's `device_total_memory_bytes` is MemTotal.
+    if let Some(total) = snapshot.host_memory_total_bytes {
+        if let Some(available) = snapshot.host_memory_available_bytes {
+            anyhow::ensure!(
+                available <= total,
+                "calibration {label} snapshot host-available memory exceeds its own total"
+            );
+        }
+        if fingerprint.backend == DeviceBackend::Cpu
+            && let Some(fingerprint_total) = fingerprint.device_total_memory_bytes
+        {
+            anyhow::ensure!(
+                total == fingerprint_total,
+                "calibration {label} snapshot host total memory disagrees with the CPU fingerprint"
+            );
+        }
+    }
     match fingerprint.backend {
-        DeviceBackend::Cpu | DeviceBackend::Metal => anyhow::ensure!(
-            snapshot.device_free_memory_bytes.is_none(),
-            "calibration {label} snapshot cannot report device-free memory for the {:?} backend",
-            fingerprint.backend
-        ),
+        DeviceBackend::Cpu | DeviceBackend::Metal => {
+            anyhow::ensure!(
+                !snapshot.device_topology_probe_failed,
+                "calibration {label} snapshot cannot report a failed CUDA topology probe for the {:?} backend",
+                fingerprint.backend
+            );
+            anyhow::ensure!(
+                snapshot.device_free_memory_bytes.is_none(),
+                "calibration {label} snapshot cannot report device-free memory for the {:?} backend",
+                fingerprint.backend
+            );
+            // Both come from the CUDA driver, so a non-CUDA trial claiming
+            // either describes a machine that cannot exist.
+            anyhow::ensure!(
+                snapshot.host_device_memory_is_unified.is_none(),
+                "calibration {label} snapshot cannot report a host/device topology for the {:?} backend",
+                fingerprint.backend
+            );
+            anyhow::ensure!(
+                snapshot.device_total_memory_bytes.is_none(),
+                "calibration {label} snapshot cannot report device total memory for the {:?} backend",
+                fingerprint.backend
+            );
+        }
         DeviceBackend::Cuda => {
+            // The live probe produces the failure flag only with no topology.
+            anyhow::ensure!(
+                !snapshot.device_topology_probe_failed
+                    || snapshot.host_device_memory_is_unified.is_none(),
+                "calibration {label} snapshot reports both a failed topology probe and a topology"
+            );
+            if let Some(total) = snapshot.device_total_memory_bytes {
+                // The fingerprint total is the stable hardware figure.
+                let fingerprint_total = fingerprint.device_total_memory_bytes.context(
+                    "CUDA calibration snapshot reports device total memory without a fingerprint total",
+                )?;
+                anyhow::ensure!(
+                    total == fingerprint_total,
+                    "calibration {label} snapshot device total memory disagrees with the fingerprint"
+                );
+                if let Some(free_bytes) = snapshot.device_free_memory_bytes {
+                    anyhow::ensure!(
+                        free_bytes <= total,
+                        "calibration {label} snapshot device-free memory exceeds its own total"
+                    );
+                }
+            }
             if let Some(free_bytes) = snapshot.device_free_memory_bytes {
                 let total_bytes = fingerprint.device_total_memory_bytes.context(
                     "CUDA calibration snapshot reports free memory without fingerprint total memory",
                 )?;
+                // On integrated (unified-memory) devices the fingerprint total
+                // is the whole system memory, not dedicated VRAM; the bound
+                // still holds, but neither value may be read as exclusive
+                // device capacity. `host_device_memory_is_unified == None`
+                // (legacy record) is not assumed discrete here — this
+                // assertion does not depend on the topology.
                 anyhow::ensure!(
                     free_bytes <= total_bytes,
                     "calibration {label} snapshot device-free memory exceeds fingerprint total memory"

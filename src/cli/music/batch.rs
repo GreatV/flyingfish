@@ -123,6 +123,24 @@ pub(super) fn run(args: Args) -> Result<()> {
     let cancelled = AtomicBool::new(false);
     let completions = Mutex::new(Vec::<Completion>::new());
     let started = Instant::now();
+    // Workers run at once, so on a shared pool their frame stacks and device
+    // charges are all live together. Each integrated worker therefore reserves
+    // the concurrent sum of both, and takes a share of what is left rather than
+    // all of it. Discrete workers are unaffected: the fold does not apply.
+    let concurrent_workers = args.devices.len().min(requests.len()).max(1) as u64;
+    let unified_workers = args
+        .devices
+        .iter()
+        .take(requests.len())
+        .filter(|name| {
+            parse_device(name).is_ok_and(|device| {
+                flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device))
+                    .unified_pool_available_bytes()
+                    .is_some()
+            })
+        })
+        .count()
+        .max(1) as u64;
     let worker_errors = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for name in args.devices.iter().take(requests.len()) {
@@ -143,26 +161,29 @@ pub(super) fn run(args: Args) -> Result<()> {
                         DeviceCache::disabled(),
                     )?;
                     let demands = model.residency_demands(max_frames, max_steps, &device)?;
-                    let reserve =
-                        requests
-                            .iter()
-                            .try_fold(0u64, |largest, request| -> Result<_> {
-                                Ok(largest.max(
-                                    model
-                                        .request_memory(
-                                            &request.prompt,
-                                            &request.lyrics,
-                                            &request.options,
-                                        )?
-                                        .known_device_reserve_bytes,
-                                ))
-                            })?;
+                    let (reserve, host_reserve) = requests.iter().try_fold(
+                        (0u64, 0u64),
+                        |(device, host), request| -> Result<_> {
+                            let memory = model.request_memory(
+                                &request.prompt,
+                                &request.lyrics,
+                                &request.options,
+                            )?;
+                            Ok((
+                                device.max(memory.known_device_reserve_bytes),
+                                host.max(memory.frame_stack_host_peak_bytes),
+                            ))
+                        },
+                    )?;
                     eprintln!("{name}: maximum queued Music3 known tensor reserve {reserve} bytes");
                     model.configure_device_cache(decide_auto_residency_with_required_memory(
                         &demands,
                         &device,
                         args.device_cache,
                         reserve,
+                        // Every worker holds a frame stack, discrete ones too.
+                        host_reserve.saturating_mul(concurrent_workers),
+                        unified_workers,
                     )?)?;
                     while !cancelled.load(Ordering::Acquire) {
                         let index = next.fetch_add(1, Ordering::Relaxed);

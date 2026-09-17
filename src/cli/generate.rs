@@ -26,6 +26,38 @@ const GENERATION_INITIALIZATION_FILE: &str = "generation-initialization.json";
 const GENERATION_READY_FILE: &str = "generation-ready";
 const EXECUTION_POLICY_FILE: &str = "execution-policy.json";
 const RESOURCE_SELECTION_FILE: &str = "resource-selection.json";
+
+/// A preflight rejected for capacity; only this becomes a refusal. It carries
+/// the observation that rejected the run, not just its text: a record naming
+/// the selection's older snapshot cannot reproduce the budget that refused.
+#[derive(Debug)]
+struct PreflightCapacityRefusal {
+    message: String,
+    snapshot: ResourceSnapshot,
+    budget: ResourceBudget,
+    host_peak: u64,
+    device_peak: u64,
+}
+
+impl std::fmt::Display for PreflightCapacityRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PreflightCapacityRefusal {}
+const RESOURCE_REFUSAL_FILE: &str = "resource-refusal.json";
+
+/// Where a refusal ledger is published: always its own file, never the
+/// selection artifact. `ArtifactStaging` refuses to replace an existing
+/// destination, so sharing the path would lose a resumed run's refusal behind
+/// the admitted record of the original attempt — and, in the other direction,
+/// would leave a fresh run'"'"'s refusal occupying the path a successful retry then
+/// needs. A separate name removes both collisions and lets a refusal-only
+/// directory be recognised as retryable state.
+fn refusal_artifact_path(output_dir: &Path) -> PathBuf {
+    output_dir.join(RESOURCE_REFUSAL_FILE)
+}
 const CHECKPOINT_DIRECTORY: &str = "checkpoints";
 const STAGING_DIRECTORY: &str = "staging";
 const FINAL_LATENTS_FILE: &str = "denoised-latents.safetensors";
@@ -760,6 +792,8 @@ fn report_weight_streaming_window(model_root: &Path) {
 /// These are the generation request's own terms, carried as one value so the
 /// planner's signature stays a signature rather than a list.
 struct GenerationResourceRequest<'a> {
+    /// Where a refusal publishes its candidate ledger.
+    refusal_sidecar: &'a Path,
     model: &'a Path,
     model_root_record: &'a str,
     device: &'a Device,
@@ -802,6 +836,7 @@ fn select_generation_resources(
         return Ok(None);
     }
     let GenerationResourceRequest {
+        refusal_sidecar,
         model,
         model_root_record,
         device,
@@ -866,7 +901,7 @@ fn select_generation_resources(
     } else {
         None
     };
-    let selected = super::resource::select_h3(super::resource::H3ResourceRequest {
+    let selected = match super::resource::select_h3(super::resource::H3ResourceRequest {
         additional_host_allowance_bytes: 0,
         component: &transformer_dir,
         device,
@@ -887,7 +922,17 @@ fn select_generation_resources(
         request: serde_json::json!({"command":"h3.generate", "model_root":model_root_record, "prompt":prompt,
                     "token_ids":token_ids, "geometry":geometry, "sigma_points":sigma_points, "seed":seed, "target_hidden_state":target_hidden_state,
                     "video_shift":video_shift, "audio_shift":audio_shift, "wav_format":format!("{wav_format:?}")}),
-    })?;
+    }) {
+        Ok(selected) => selected,
+        Err(error) => {
+            // An early bail has no ledger, and leaves no directory behind.
+            let destination = error
+                .downcast_ref::<flyingfish::resource_policy::AdmissionRefused>()
+                .map(|_| refusal_sidecar);
+            flyingfish::resource_policy::report_refusal(&error, destination);
+            return Err(error);
+        }
+    };
     if selected.policy != *execution_policy {
         *policy_origin = PolicyOrigin::Promoted;
     }
@@ -1647,6 +1692,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         &mut execution_policy,
         &mut policy_origin,
         GenerationResourceRequest {
+            refusal_sidecar: &refusal_artifact_path(&output_dir),
             model: &model,
             model_root_record: &model_root_record,
             device: &device,
@@ -1779,7 +1825,46 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
             max_device_mib,
             backend_workspace_mib,
             &device,
-        )?;
+        );
+        let preflight = match preflight {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                let Some(refusal) = error.downcast_ref::<PreflightCapacityRefusal>() else {
+                    return Err(error);
+                };
+                if let Some(selected) = resource_selection.as_ref() {
+                    let mut provenance = selected.provenance.clone();
+                    flyingfish::resource_policy::h3::record_refused_final_admission(
+                        &mut provenance,
+                        refusal.snapshot.clone(),
+                        refusal.budget,
+                        refusal.host_peak,
+                        refusal.device_peak,
+                    )?;
+                    provenance.workload.insert("refused".into(), 1);
+                    for candidate in &mut provenance.candidates {
+                        if candidate.disposition
+                            == flyingfish::runtime::resource_selection::CandidateDisposition::Selected
+                        {
+                            candidate.disposition =
+                                flyingfish::runtime::resource_selection::CandidateDisposition::CapacityRejected;
+                            candidate.reason = format!("refused by generation preflight: {error}");
+                        }
+                    }
+                    let refusal =
+                        anyhow::Error::from(flyingfish::resource_policy::AdmissionRefused {
+                            provenance,
+                            summary: format!("generation preflight refused: {error}"),
+                        });
+                    flyingfish::resource_policy::report_refusal(
+                        &refusal,
+                        Some(&refusal_artifact_path(&output_dir)),
+                    );
+                    return Err(refusal);
+                }
+                return Err(error);
+            }
+        };
         if let Some(selected) = resource_selection.as_mut() {
             flyingfish::resource_policy::h3::record_final_admission(
                 &mut selected.provenance,
@@ -1825,13 +1910,19 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         )?;
     }
 
-    if recorded_initialization.is_none()
-        && let Some(selected) = &resource_selection
-    {
-        flyingfish::resource_policy::publish_selection(
-            &output_dir.join(RESOURCE_SELECTION_FILE),
+    if let Some(selected) = &resource_selection {
+        if recorded_initialization.is_none() {
+            flyingfish::resource_policy::publish_selection(
+                &output_dir.join(RESOURCE_SELECTION_FILE),
+                &selected.provenance,
+            )?;
+        }
+        // Outside the fresh-run branch: a resume that first refused and then
+        // succeeded leaves the same stale record beside its original selection.
+        flyingfish::resource_policy::remove_superseded_refusal(
+            &refusal_artifact_path(&output_dir),
             &selected.provenance,
-        )?;
+        );
     }
 
     let weight_source = execution_policy.weight_source();
@@ -2028,12 +2119,22 @@ fn preflight_generation(
     )
     .context("generation numerical-backend preflight refused before model payload access")?;
     let snapshot = ResourceSnapshot::capture(Some(device));
-    let budget = probed_budget(
+    let mut budget = probed_budget(
         &snapshot,
         policy.execution_backend,
         max_host_mib,
         max_device_mib,
     )?;
+    // Selection promised this reserve on the folded host axis. Charged on the
+    // budget side so it applies once; unifying the two homes is an A7 follow-up.
+    if snapshot.host_device_memory_is_unified == Some(true) {
+        budget.max_host_bytes = Some(
+            budget
+                .max_host_bytes
+                .context("unified generation preflight needs a host bound")?
+                .saturating_sub(super::DEVICE_RESIDENCY_RESERVE_BYTES),
+        );
+    }
 
     require_indexed_transformer(transformer_dir)?;
     let weights = ModelWeights::open(transformer_dir, WeightSource::Mmap, CachePolicy::new(1))?;
@@ -2042,6 +2143,12 @@ fn preflight_generation(
     if policy.execution_backend == ExecutionBackendPolicy::Cpu {
         assumptions.weight_element_bytes = 4;
         assumptions.activation_element_bytes = 4;
+        assumptions.device_memory_is_host = true;
+    }
+    // A probed unified-memory device (e.g. Jetson) draws device allocations
+    // from the host pool; fold the device axis into host accounting instead of
+    // checking the two axes against the same bytes independently.
+    if snapshot.host_device_memory_is_unified == Some(true) {
         assumptions.device_memory_is_host = true;
     }
     assumptions.use_flash_attention = policy.flash_attention();
@@ -2090,9 +2197,16 @@ fn preflight_generation(
             })
             .collect::<Vec<_>>()
             .join("+");
-        bail!(
-            "generation preflight admission refused before any model tensor was materialized (binding budget: {binding}): {error}"
-        );
+        return Err(PreflightCapacityRefusal {
+            message: format!(
+                "generation preflight admission refused before any model tensor was materialized (binding budget: {binding}): {error}"
+            ),
+            snapshot,
+            budget,
+            host_peak: estimate.peak_host_bytes,
+            device_peak: estimate.peak_device_bytes,
+        }
+        .into());
     }
     Ok(GenerationPreflight {
         estimate,
@@ -2150,6 +2264,18 @@ pub(super) fn probed_budget(
     let max_host_bytes = requested_host.or(probed_host).context(
         "generation preflight cannot measure available host memory; provide --max-host-mib explicitly",
     )?;
+    // Under the fold the combined peak is charged against this one bound, and
+    // the host view alone can exceed the pool: CUDA free tracks MemFree while
+    // MemAvailable counts reclaimable cache.
+    anyhow::ensure!(
+        !snapshot.unified_accounting_is_undecidable(),
+        "generation preflight needs the shared host/device pool size on a unified-memory device, \
+         but one of the host and CUDA views could not be measured"
+    );
+    let max_host_bytes = match snapshot.unified_pool_available_bytes() {
+        Some(pool) => max_host_bytes.min(pool),
+        None => max_host_bytes,
+    };
     let requested_device = max_device_mib.map(mib_to_bytes).transpose()?;
     let max_device_bytes = match backend {
         ExecutionBackendPolicy::Cpu => requested_device,
@@ -2373,6 +2499,7 @@ fn validate_generation_directory_entries(directory: &Path) -> Result<()> {
         GENERATION_REQUEST_FILE,
         EXECUTION_POLICY_FILE,
         RESOURCE_SELECTION_FILE,
+        RESOURCE_REFUSAL_FILE,
         CHECKPOINT_DIRECTORY,
         STAGING_DIRECTORY,
         FINAL_LATENTS_FILE,
@@ -2486,14 +2613,19 @@ fn validate_staging_directory(staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A directory holding only refusal diagnostics is retryable, not partial.
 fn validate_empty_uninitialized_directory(output_dir: &Path) -> Result<()> {
-    anyhow::ensure!(
-        fs::read_dir(output_dir)
-            .with_context(|| format!("failed to read {}", output_dir.display()))?
-            .next()
-            .is_none(),
-        "generation directory has partial state without an initialization record"
-    );
+    for entry in fs::read_dir(output_dir)
+        .with_context(|| format!("failed to read {}", output_dir.display()))?
+    {
+        let name = entry
+            .with_context(|| format!("failed to read an entry of {}", output_dir.display()))?
+            .file_name();
+        anyhow::ensure!(
+            name == RESOURCE_REFUSAL_FILE,
+            "generation directory has partial state without an initialization record"
+        );
+    }
     Ok(())
 }
 
@@ -3614,6 +3746,10 @@ mod tests {
             cgroup_v2_memory_current_bytes: None,
             cgroup_v2_memory_available_bytes: Some(8 * 1024 * 1024),
             device_free_memory_bytes: Some(6 * 1024 * 1024),
+            host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -3649,6 +3785,10 @@ mod tests {
             cgroup_v2_memory_current_bytes: None,
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: None,
+            host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -3666,6 +3806,64 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("cannot measure free device memory")
+        );
+    }
+
+    #[test]
+    fn probed_budget_clamps_the_host_bound_to_a_probed_unified_pool() {
+        let snapshot = |unified: Option<bool>| ResourceSnapshot {
+            schema_version: flyingfish::runtime::probe::RESOURCE_SNAPSHOT_SCHEMA_VERSION,
+            measured_at_unix_ms: 1,
+            host_memory_available_bytes: Some(10 * 1024 * 1024),
+            cgroup_v2_memory_limit: None,
+            cgroup_v2_memory_current_bytes: None,
+            cgroup_v2_memory_available_bytes: None,
+            device_free_memory_bytes: Some(6 * 1024 * 1024),
+            host_device_memory_is_unified: unified,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
+            measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
+                host_memory: None,
+                cgroup_memory: None,
+                device_memory: None,
+            },
+        };
+        for legacy in [None, Some(false)] {
+            let budget =
+                probed_budget(&snapshot(legacy), ExecutionBackendPolicy::Cuda, None, None).unwrap();
+            assert_eq!(budget.max_host_bytes, Some(10 * 1024 * 1024));
+        }
+        let folded = probed_budget(
+            &snapshot(Some(true)),
+            ExecutionBackendPolicy::Cuda,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(folded.max_host_bytes, Some(6 * 1024 * 1024));
+        let requested = probed_budget(
+            &snapshot(Some(true)),
+            ExecutionBackendPolicy::Cuda,
+            Some(9),
+            None,
+        )
+        .unwrap();
+        assert_eq!(requested.max_host_bytes, Some(6 * 1024 * 1024));
+        let unmeasurable = ResourceSnapshot {
+            device_free_memory_bytes: None,
+            ..snapshot(Some(true))
+        };
+        assert!(
+            probed_budget(
+                &unmeasurable,
+                ExecutionBackendPolicy::Cuda,
+                Some(9),
+                Some(9)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("shared host/device pool size")
         );
     }
 

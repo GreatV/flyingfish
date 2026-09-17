@@ -73,6 +73,11 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         assumptions.activation_element_bytes = 4;
         assumptions.device_memory_is_host = true;
     }
+    // Unified-memory devices (e.g. Jetson) share one pool across both axes.
+    let unified = snapshot.host_device_memory_is_unified == Some(true);
+    if unified {
+        assumptions.device_memory_is_host = true;
+    }
     assumptions.evaluation_count = u64::try_from(request.evaluations)?;
     assumptions.precompute_adaln_steps = if request.baseline.precompute_adaln {
         assumptions.evaluation_count
@@ -154,11 +159,31 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         evidence: evidence.as_ref().map(|(record, _)| record),
         locked_origin: request.locked_origin,
         resident_input_bytes: request.resident_input_bytes,
-        additional_host_allowance_bytes: request.additional_host_allowance_bytes,
+        // Under the unified fold the once-only device reserve is charged to
+        // the host axis instead of stamped on phases (host-only phases carry
+        // no device reserve). This holds the "modelled peaks plus at least
+        // DEVICE_RESIDENCY_RESERVE_BYTES of slack" invariant unconditionally,
+        // including the paths where automatic_device_cache early-returns.
+        additional_host_allowance_bytes: request
+            .additional_host_allowance_bytes
+            .checked_add(if unified {
+                super::DEVICE_RESIDENCY_RESERVE_BYTES
+            } else {
+                0
+            })
+            .context("H3 host allowance overflow")?,
+    };
+    // Under the unified fold the reserve already sits in the host peak via
+    // additional_host_allowance_bytes; passing it again as sizing headroom
+    // would charge it twice. Discrete keeps the headroom-sized path.
+    let headroom_bytes = if unified {
+        0
+    } else {
+        super::DEVICE_RESIDENCY_RESERVE_BYTES
     };
     let automatic_cache = flyingfish::resource_policy::h3::automatic_device_cache(
         &selection_request,
-        super::DEVICE_RESIDENCY_RESERVE_BYTES,
+        headroom_bytes,
     )?;
     let mut baseline = request.baseline.clone();
     if let Some(cache) = automatic_cache {
@@ -167,7 +192,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         eprintln!(
             "H3 device residency: auto retains up to {} MiB after compute/workspace estimates and {} MiB additional headroom",
             cache.max_bytes / (1 << 20),
-            super::DEVICE_RESIDENCY_RESERVE_BYTES / (1 << 20),
+            headroom_bytes / (1 << 20),
         );
     }
     let mut selection = flyingfish::resource_policy::h3::select(selection_request)?;
@@ -186,7 +211,13 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
             }
         }
         for phase in &mut selection.provenance.phases {
-            phase.device_reserve_bytes = super::DEVICE_RESIDENCY_RESERVE_BYTES;
+            // Host-only phases (CPU, or the unified-memory fold that charges
+            // device bytes into the host axis) must keep a zero device
+            // reserve: the phase type invariant rejects the combination, and
+            // the sizing already accounted the headroom against the pool.
+            if phase.required_device_bytes.is_some() {
+                phase.device_reserve_bytes = super::DEVICE_RESIDENCY_RESERVE_BYTES;
+            }
         }
     }
     selection.provenance.workload.insert(
@@ -215,7 +246,11 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         request.limits.max_device_mib,
     )?;
     let phase = &selection.provenance.phases[0];
-    let device_peak = if selection.policy.execution_backend == ExecutionBackendPolicy::Cpu {
+    // The fold emits a host-only phase, so reading the device peak from it
+    // records zero and contradicts the selection ledger. Fit is unaffected.
+    let device_peak = if selection.policy.execution_backend == ExecutionBackendPolicy::Cpu
+        || final_observation.host_device_memory_is_unified == Some(true)
+    {
         selection
             .estimate
             .peak_device_bytes
@@ -224,13 +259,42 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
     } else {
         phase.device_peak_bytes()?.unwrap_or(0)
     };
-    anyhow::ensure!(
-        final_budget
-            .check_peaks(phase.host_peak_bytes()?, device_peak)
-            .within_budget,
-        "live H3 admission refused the unchanged selected policy"
-    );
+    // A promotion was selected only if its peak plus this reserve fitted, so
+    // the same requirement is carried into the final check. Under the fold the
+    // device peak is already inside the host ledger the reserve sits beside.
     let host_peak = phase.host_peak_bytes()?;
+    let checked_host = host_peak
+        .checked_add(phase.host_promotion_reserve_bytes)
+        .context("H3 final promotion headroom overflow")?;
+    if !final_budget
+        .check_peaks(checked_host, device_peak)
+        .within_budget
+    {
+        // A bare error would leave the caller nothing to downcast.
+        let mut provenance = selection.provenance.clone();
+        flyingfish::resource_policy::h3::record_refused_final_admission(
+            &mut provenance,
+            final_observation,
+            final_budget,
+            checked_host,
+            device_peak,
+        )?;
+        provenance.workload.insert("refused".into(), 1);
+        for candidate in &mut provenance.candidates {
+            if candidate.disposition
+                == flyingfish::runtime::resource_selection::CandidateDisposition::Selected
+            {
+                candidate.disposition =
+                    flyingfish::runtime::resource_selection::CandidateDisposition::CapacityRejected;
+                candidate.reason = "refused by final H3 admission".into();
+            }
+        }
+        return Err(flyingfish::resource_policy::AdmissionRefused {
+            provenance,
+            summary: "live H3 admission refused the unchanged selected policy".into(),
+        }
+        .into());
+    }
     flyingfish::resource_policy::h3::record_final_admission(
         &mut selection.provenance,
         final_observation,
@@ -338,6 +402,11 @@ pub(super) fn validate_recorded_selection(path: &Path, policy: &ExecutionPolicy)
     let record = flyingfish::runtime::resource_selection::ResourceSelectionProvenance::from_json(
         &bytes.bytes,
     )?;
+    anyhow::ensure!(
+        !record.is_refusal(),
+        "recorded resource selection at {} is a refusal record, not an admitted selection",
+        path.display()
+    );
     record.validate_policy_binding(&serde_json::to_value(policy)?)
 }
 

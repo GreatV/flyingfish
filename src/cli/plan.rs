@@ -214,6 +214,30 @@ pub(super) fn run_solve_t2va(command: H3Command) -> Result<()> {
         assumptions.weight_element_bytes = 4;
         assumptions.activation_element_bytes = 4;
         assumptions.device_memory_is_host = true;
+    } else {
+        // The solver requires `device_memory_is_host = false` for CUDA and
+        // checks each axis against its own bound, which on a shared pool can
+        // call a candidate feasible whose two axes together exceed it. Refused
+        // rather than reported wrongly until the solver models a combined bound.
+        // Only an omitted device skips probing: a named one that cannot be
+        // opened is an error, not the symbolic mode, and silently treating it
+        // as such would emit a split-axis solution for an unknown topology.
+        let probe = device
+            .as_deref()
+            .map(|name| -> Result<_> {
+                Ok(flyingfish::runtime::probe::ResourceSnapshot::capture(Some(
+                    &parse_device(name)?,
+                )))
+            })
+            .transpose()?;
+        anyhow::ensure!(
+            probe.is_none_or(|snapshot| {
+                snapshot.host_device_memory_is_unified != Some(true)
+                    && !snapshot.unified_accounting_is_undecidable()
+            }),
+            "solve-t2va cannot model a unified-memory device: its candidate search checks the host \
+             and device axes independently, which overstates feasibility on one shared pool"
+        );
     }
     assumptions.evaluation_count = evaluation_count;
     assumptions.precompute_adaln_steps = assumptions.evaluation_count;

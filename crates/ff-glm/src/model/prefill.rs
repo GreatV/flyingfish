@@ -52,6 +52,25 @@ impl StreamedGlm {
             admission.weight_load_staging_bytes,
             additional_cache,
             admission.safety_bytes,
+            // Under the fold these draw from the same pool as the charges above.
+            if admission.unified_pool {
+                admission.host_charge_bytes
+            } else {
+                0
+            },
+            // The mask is charged at its own boundary; readmission omits it.
+            if admission.unified_pool {
+                admission.prefill_host_charge_bytes
+            } else {
+                0
+            },
+            // Charged before the pool exists, and nowhere after. The phase
+            // model charges one set per axis, so a folded check needs both.
+            admission
+                .pinned_slot_bytes
+                .checked_mul(if admission.unified_pool { 2 } else { 1 })
+                .and_then(|n| n.checked_add(admission.pinned_ring_bytes))
+                .context("GLM pinned slot charge overflow")?,
         ]
         .into_iter()
         .try_fold(0usize, |sum, bytes| {
@@ -61,6 +80,8 @@ impl StreamedGlm {
         let snapshot = ResourceSnapshot::capture(Some(&self.device));
         let available = if self.device.is_cpu() {
             crate::admission::host_available(&snapshot)
+        } else if admission.unified_pool {
+            snapshot.unified_pool_available_bytes()
         } else {
             snapshot.device_free_memory_bytes
         }

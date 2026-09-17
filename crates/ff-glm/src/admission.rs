@@ -86,6 +86,10 @@ pub struct GlmAdmissionBreakdown {
     /// Host-only pinned bytes held by the fill-ahead ring.
     #[serde(default)]
     pub pinned_fill_ahead_bytes: u64,
+    /// Loads that can be in flight at once, including the foreground one. Each
+    /// owns its own decoded header, so this scales that exclusive charge.
+    #[serde(default)]
+    pub concurrent_loads: u64,
     pub prompt_tokens: usize,
     pub num_hidden_layers: u32,
     pub num_experts: u32,
@@ -368,6 +372,7 @@ impl GlmAdmissionBreakdown {
             cpu_fp8_dequantization,
             pinned_transfer_bytes: 0,
             pinned_fill_ahead_bytes: 0,
+            concurrent_loads: 0,
             prompt_tokens,
             num_hidden_layers: u32::try_from(text.num_hidden_layers)?,
             num_experts: u32::try_from(text.n_routed_experts)?,
@@ -456,27 +461,43 @@ impl GlmAdmissionBreakdown {
         expert_cache_bytes: usize,
         cache_policy: CachePolicy,
     ) -> Result<Vec<ResourcePhaseEstimate>> {
+        self.phases_with_safety(
+            resident_static,
+            expert_cache_bytes,
+            cache_policy,
+            GLM_ADMISSION_SAFETY_BYTES,
+        )
+    }
+
+    /// `safety_bytes` is the reserve applied per phase; admission-time callers
+    /// pass the pool-scaled value from `scaled_admission_safety_bytes`, tests
+    /// and the policy contract keep the declared constant via `phases()`.
+    pub fn phases_with_safety(
+        &self,
+        resident_static: bool,
+        expert_cache_bytes: usize,
+        cache_policy: CachePolicy,
+        safety_bytes: u64,
+    ) -> Result<Vec<ResourcePhaseEstimate>> {
+        // The mmap'd shard residency is page cache: file-backed and
+        // kernel-reclaimable, already counted as available in MemAvailable.
+        // It is reported as `reclaimable_host_bytes` (telemetry) and never
+        // charged in fit decisions; only exclusive allocations are.
+        // The largest shard header is an owned Vec: required, not reclaimable.
+        let header_copies = self.largest_header_bytes(cache_policy);
         let raw = estimate_cache_residency(
             &self.raw_inventory,
             WeightSource::Mmap,
             cache_policy,
             CacheLoadLifetimes {
-                additional_storage_bytes: if cache_policy.granularity
-                    == ff_core::weights::CacheGranularity::Tensor
-                {
-                    self.raw_inventory
-                        .shards
-                        .iter()
-                        .map(|s| s.header_bytes)
-                        .max()
-                        .unwrap_or(0)
-                } else {
-                    0
-                },
+                additional_storage_bytes: header_copies,
+                maximum_concurrent_loads: self.concurrent_loads(),
                 ..CacheLoadLifetimes::SERIAL
             },
         )?
-        .peak_storage_bytes;
+        .peak_storage_bytes
+        .checked_sub(header_copies)
+        .context("GLM cache residency is smaller than its header copies")?;
         let weights = if resident_static {
             self.static_bytes
         } else {
@@ -514,6 +535,7 @@ impl GlmAdmissionBreakdown {
                     })
                 })
                 .and_then(|n| n.checked_add(load_host))
+                .and_then(|n| n.checked_add(header_copies))
                 .context("GLM host workspace overflow")?;
             let compute = [weights, state, self.live_expert_bytes, workspace]
                 .into_iter()
@@ -526,11 +548,11 @@ impl GlmAdmissionBreakdown {
                     phase: phase.into(),
                     required_host_bytes: compute
                         .checked_add(host_workspace)
-                        .and_then(|v| v.checked_add(GLM_ADMISSION_SAFETY_BYTES))
+                        .and_then(|v| v.checked_add(safety_bytes))
                         .context("GLM CPU phase bytes overflow")?,
-                    optional_host_bytes: raw
-                        .checked_add(u64::try_from(expert_cache_bytes)?)
+                    optional_host_bytes: u64::try_from(expert_cache_bytes)
                         .context("GLM CPU retention bytes overflow")?,
+                    reclaimable_host_bytes: raw,
                     host_promotion_reserve_bytes: 0,
                     required_device_bytes: None,
                     optional_device_bytes: None,
@@ -540,7 +562,8 @@ impl GlmAdmissionBreakdown {
                 Ok(ResourcePhaseEstimate {
                     phase: phase.into(),
                     required_host_bytes: host_workspace,
-                    optional_host_bytes: raw,
+                    optional_host_bytes: 0,
+                    reclaimable_host_bytes: raw,
                     host_promotion_reserve_bytes: 0,
                     required_device_bytes: Some(
                         compute
@@ -548,7 +571,7 @@ impl GlmAdmissionBreakdown {
                             .context("GLM device staging peak overflow")?,
                     ),
                     optional_device_bytes: Some(u64::try_from(expert_cache_bytes)?),
-                    device_reserve_bytes: GLM_ADMISSION_SAFETY_BYTES,
+                    device_reserve_bytes: safety_bytes,
                 })
             }
         };
@@ -564,9 +587,10 @@ impl GlmAdmissionBreakdown {
                         phase: "static_initialization".into(),
                         required_host_bytes: u64::try_from(self.static_bytes)?
                             .checked_add(self.static_load_host_bytes)
-                            .and_then(|v| v.checked_add(GLM_ADMISSION_SAFETY_BYTES))
+                            .and_then(|v| v.checked_add(safety_bytes))
                             .context("GLM CPU initialization overflow")?,
-                        optional_host_bytes: raw,
+                        optional_host_bytes: 0,
+                        reclaimable_host_bytes: raw,
                         host_promotion_reserve_bytes: 0,
                         required_device_bytes: None,
                         optional_device_bytes: None,
@@ -576,7 +600,8 @@ impl GlmAdmissionBreakdown {
                     ResourcePhaseEstimate {
                         phase: "static_initialization".into(),
                         required_host_bytes: self.static_load_host_bytes,
-                        optional_host_bytes: raw,
+                        optional_host_bytes: 0,
+                        reclaimable_host_bytes: raw,
                         host_promotion_reserve_bytes: 0,
                         required_device_bytes: Some(
                             u64::try_from(self.static_bytes)?
@@ -584,7 +609,7 @@ impl GlmAdmissionBreakdown {
                                 .context("GLM static GPU staging peak overflow")?,
                         ),
                         optional_device_bytes: Some(0),
-                        device_reserve_bytes: GLM_ADMISSION_SAFETY_BYTES,
+                        device_reserve_bytes: safety_bytes,
                     }
                 },
             );
@@ -606,29 +631,80 @@ impl GlmAdmissionBreakdown {
 
     /// Remaining CUDA capacity after the caller's complete phase peaks. Rank
     /// callers include their transfer buffers in these phases before sizing.
+    /// Loads in flight at once; zero in a legacy record means serial.
+    pub fn concurrent_loads(&self) -> u64 {
+        self.concurrent_loads.max(1)
+    }
+
+    /// The owned `encoded_header` buffers a tensor-granularity miss allocates,
+    /// one per loader in flight.
+    pub fn largest_header_bytes(&self, cache_policy: CachePolicy) -> u64 {
+        if cache_policy.granularity != ff_core::weights::CacheGranularity::Tensor {
+            return 0;
+        }
+        self.raw_inventory
+            .shards
+            .iter()
+            .map(|s| s.header_bytes)
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(self.concurrent_loads())
+    }
+
     pub fn automatic_expert_cache_bytes(
         &self,
         phases: &[ResourcePhaseEstimate],
         snapshot: &ResourceSnapshot,
     ) -> Result<usize> {
+        self.automatic_expert_cache_bytes_against_host(phases, snapshot, None)
+    }
+
+    /// `aggregate_host_bytes` replaces the phase's own host peak under the
+    /// fold, for callers whose validator charges a wider host ledger.
+    pub fn automatic_expert_cache_bytes_against_host(
+        &self,
+        phases: &[ResourcePhaseEstimate],
+        snapshot: &ResourceSnapshot,
+        aggregate_host_bytes: Option<u64>,
+    ) -> Result<usize> {
         if self.compute_on_host || self.sparse_layers.is_empty() {
             return Ok(0);
         }
-        let Some(free) = snapshot.device_free_memory_bytes else {
+        // On a probed unified-memory topology the cache draws from the same
+        // pool as every host charge, so size it from the combined peak instead
+        // of the device view alone. Discrete and unprobed captures take the
+        // device view exactly as before.
+        // A confirmed pool of unknown size retains nothing.
+        if snapshot.unified_accounting_is_undecidable() {
+            return Ok(0);
+        }
+        let unified_pool = snapshot.unified_pool_available_bytes();
+        let Some(free) = unified_pool.or(snapshot.device_free_memory_bytes) else {
             return Ok(0);
         };
+        // The binding charge is the largest per-phase sum, as in
+        // `validate_capacity`: maximising each axis charges a phantom phase.
         let required = phases.iter().try_fold(0u64, |peak, phase| {
-            Ok::<_, anyhow::Error>(
-                peak.max(
-                    phase
-                        .required_device_bytes
-                        .unwrap_or(0)
-                        .checked_add(phase.device_reserve_bytes)
-                        .context("GLM automatic cache reserve overflow")?,
-                ),
-            )
+            let device = phase
+                .required_device_bytes
+                .unwrap_or(0)
+                .checked_add(phase.device_reserve_bytes)
+                .context("GLM automatic cache reserve overflow")?;
+            let charge = if unified_pool.is_some() {
+                let host = match aggregate_host_bytes {
+                    Some(aggregate) => aggregate,
+                    None => phase.host_peak_bytes()?,
+                };
+                device
+                    .checked_add(host)
+                    .context("GLM automatic cache unified charge overflow")?
+            } else {
+                device
+            };
+            Ok::<_, anyhow::Error>(peak.max(charge))
         })?;
-        let available = free.saturating_sub(required).saturating_sub(1 << 30);
+        // Only the reserve the phases already carry in `device_reserve_bytes`.
+        let available = free.saturating_sub(required);
         let available = available / (1 << 20) * (1 << 20);
         let all_experts = (self.live_expert_bytes as u64 / 5)
             .checked_mul(3)
@@ -638,6 +714,105 @@ impl GlmAdmissionBreakdown {
         usize::try_from(available.min(all_experts)).context("GLM cache bound exceeds usize")
     }
 
+    /// The admission-time safety reserve: 5% of the pool's TOTAL bytes, capped
+    /// at the declared 1 GiB. The denominator is the hardware total, not the
+    /// instantaneous available view — a busier machine does not get a smaller
+    /// safety margin, and sidecar-recorded reserves stay comparable across
+    /// runs. The crossover is a 20 GiB pool: below it (including small
+    /// discrete cards) the reserve relaxes below 1 GiB. Axis: device total for
+    /// CUDA, host total for CPU, the smaller of both totals when unified.
+    /// Legacy records without totals fall back to the available views.
+    pub fn scaled_admission_safety_bytes(&self, snapshot: &ResourceSnapshot) -> u64 {
+        let unified = snapshot.host_device_memory_is_unified == Some(true);
+        let total = if self.compute_on_host {
+            snapshot
+                .host_pool_total_bytes()
+                .or(snapshot.host_memory_available_bytes)
+        } else if unified {
+            [
+                snapshot.host_pool_total_bytes(),
+                snapshot.device_total_memory_bytes,
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .or_else(|| snapshot.unified_pool_available_bytes())
+        } else {
+            snapshot
+                .device_total_memory_bytes
+                .or(snapshot.device_free_memory_bytes)
+                .or_else(|| snapshot.host_pool_total_bytes())
+                .or(snapshot.host_memory_available_bytes)
+        };
+        match total {
+            Some(total) => GLM_ADMISSION_SAFETY_BYTES.min(total / 20),
+            None => GLM_ADMISSION_SAFETY_BYTES,
+        }
+    }
+
+    /// The host-promotion reserve, on the same footing as the safety reserve:
+    /// 5% of the host (or unified pool) total, capped at 1 GiB. This reserve
+    /// gates weight-source promotions; the reverse-scaled `max(1 GiB, pool/20)`
+    /// it replaces never shrank and grew with the pool.
+    pub fn scaled_promotion_reserve_bytes(snapshot: &ResourceSnapshot) -> u64 {
+        let unified = snapshot.host_device_memory_is_unified == Some(true);
+        let total = if unified {
+            [
+                snapshot.host_pool_total_bytes(),
+                snapshot.device_total_memory_bytes,
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .or_else(|| snapshot.unified_pool_available_bytes())
+        } else {
+            snapshot
+                .host_pool_total_bytes()
+                .or(snapshot.host_memory_available_bytes)
+        };
+        match total {
+            Some(total) => (1_u64 << 30).min(total / 20),
+            None => 1_u64 << 30,
+        }
+    }
+
+    /// Whether a weight promotion still has its reserve of headroom. The
+    /// selector admits a promotion only when every phase plus this reserve
+    /// fits, so a later snapshot must be judged by the same rule.
+    pub fn promotion_headroom_error(
+        &self,
+        resident_static: bool,
+        expert_cache_bytes: usize,
+        cache_policy: CachePolicy,
+        snapshot: &ResourceSnapshot,
+    ) -> Option<String> {
+        let unified = snapshot.unified_pool_available_bytes();
+        let host = unified.or_else(|| host_available(snapshot))?;
+        let reserve = Self::scaled_promotion_reserve_bytes(snapshot);
+        let phases = self
+            .phases_with_safety(
+                resident_static,
+                expert_cache_bytes,
+                cache_policy,
+                self.scaled_admission_safety_bytes(snapshot),
+            )
+            .ok()?;
+        for phase in phases {
+            let mut peak = phase.host_peak_bytes().ok()?;
+            if unified.is_some() {
+                peak = peak.checked_add(phase.device_peak_bytes().ok()?.unwrap_or(0))?;
+            }
+            let needed = peak.checked_add(reserve)?;
+            if needed > host {
+                return Some(format!(
+                    "GLM {} promotion needs {needed} bytes including its {reserve} byte reserve, but only {host} are available",
+                    phase.phase
+                ));
+            }
+        }
+        None
+    }
+
     pub fn validate_capacity(
         &self,
         resident_static: bool,
@@ -645,16 +820,43 @@ impl GlmAdmissionBreakdown {
         cache_policy: CachePolicy,
         snapshot: &ResourceSnapshot,
     ) -> Result<()> {
-        let host = host_available(snapshot)
-            .context("cannot measure free host memory for GLM admission")?;
-        for phase in self.phases(resident_static, expert_cache_bytes, cache_policy)? {
-            let required = phase.host_peak_bytes()?;
+        // A probed unified-memory topology (e.g. Jetson) charges host and
+        // device peaks against one pool; independent per-axis checks would
+        // admit a combined footprint the machine cannot hold. `None` (unprobed
+        // or legacy record) keeps the split-axis behavior: degrading to
+        // discrete checks is unsafe only when the pool is known shared, and
+        // legacy records predate unified support entirely.
+        let unified_pool = snapshot.unified_pool_available_bytes();
+        ensure!(
+            !snapshot.unified_accounting_is_undecidable(),
+            "GLM admission needs the shared host/device pool size on a unified-memory device, \
+             but one of the host and CUDA views could not be measured"
+        );
+        let safety = self.scaled_admission_safety_bytes(snapshot);
+        for phase in
+            self.phases_with_safety(resident_static, expert_cache_bytes, cache_policy, safety)?
+        {
+            let host_peak = phase.host_peak_bytes()?;
+            let device_peak = phase.device_peak_bytes()?;
+            if let Some(pool) = unified_pool {
+                let combined = host_peak
+                    .checked_add(device_peak.unwrap_or(0))
+                    .context("GLM unified-pool peak overflow")?;
+                ensure!(
+                    combined <= pool,
+                    "GLM {} needs {combined} bytes from the unified host/device pool, but only {pool} are available",
+                    phase.phase
+                );
+                continue;
+            }
+            let host = host_available(snapshot)
+                .context("cannot measure free host memory for GLM admission")?;
             ensure!(
-                required <= host,
-                "GLM {} needs {required} free host bytes, but only {host} are available",
+                host_peak <= host,
+                "GLM {} needs {host_peak} free host bytes, but only {host} are available",
                 phase.phase
             );
-            if let Some(required) = phase.device_peak_bytes()? {
+            if let Some(required) = device_peak {
                 let free = snapshot
                     .device_free_memory_bytes
                     .context("cannot measure free CUDA memory for GLM admission")?;
@@ -873,10 +1075,22 @@ mod tests {
             schema_version: 1,
             measured_at_unix_ms: 1,
             host_memory_available_bytes: Some(host),
-            cgroup_v2_memory_limit: Some(CgroupMemoryLimit::Bytes(cgroup)),
+            // `u64::MAX` means "no cgroup constraint" at these call sites. A
+            // real probe reports that as `Unlimited` — `memory.max` reading
+            // `max` never parses to a finite byte count — so expressing it as
+            // `Bytes(u64::MAX)` would hand reserve scaling an 18-exabyte pool.
+            cgroup_v2_memory_limit: Some(if cgroup == u64::MAX {
+                CgroupMemoryLimit::Unlimited
+            } else {
+                CgroupMemoryLimit::Bytes(cgroup)
+            }),
             cgroup_v2_memory_current_bytes: Some(0),
-            cgroup_v2_memory_available_bytes: Some(cgroup),
+            cgroup_v2_memory_available_bytes: (cgroup != u64::MAX).then_some(cgroup),
             device_free_memory_bytes: device,
+            host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -967,6 +1181,233 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn unified_pool_charges_host_and_device_peaks_together() {
+        let root = tiny_checkpoint();
+        crate::test_support::quantize_tiny_linears(root.path());
+        let weights =
+            ModelWeights::open(root.path(), WeightSource::Mmap, CachePolicy::new(1)).unwrap();
+        let config = GlmConfig::from_model_dir(root.path()).unwrap();
+        let gpu =
+            GlmAdmissionBreakdown::from_metadata(&weights, &config.text_config, false, 2).unwrap();
+        let phases = gpu
+            .phases_with_safety(false, 0, CachePolicy::new(1), 0)
+            .unwrap();
+        let host_peak = phases
+            .iter()
+            .map(|p| p.host_peak_bytes().unwrap())
+            .max()
+            .unwrap();
+        let device_peak = phases
+            .iter()
+            .map(|p| p.device_peak_bytes().unwrap().unwrap())
+            .max()
+            .unwrap();
+        assert!(host_peak > 0 && device_peak > 0);
+        // validate_capacity applies a pool-scaled reserve (pool/20), so the
+        // pool must cover each axis *plus* that reserve in split mode while
+        // staying below the merged sum. Iterate to the fixed point: pool =
+        // device_peak + pool/20 converges in a few steps at these sizes.
+        let mut pool = host_peak.max(device_peak);
+        for _ in 0..16 {
+            let reserve = pool / 20;
+            let split_need = (device_peak + reserve).max(host_peak);
+            let merged_need = host_peak + device_peak + reserve;
+            if split_need <= pool && merged_need > pool {
+                break;
+            }
+            assert!(split_need > pool, "fixed point not converging");
+            pool = split_need;
+        }
+        // (The reserve alone can exceed the tiny host peak at these fixture
+        // sizes, so pool may legitimately exceed host_peak + device_peak;
+        // what matters is the split/merged outcome pair below.)
+        let unified = |unified: Option<bool>, pool: u64| ResourceSnapshot {
+            host_device_memory_is_unified: unified,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
+            ..snapshot(pool, u64::MAX, Some(pool))
+        };
+        assert!(
+            gpu.validate_capacity(false, 0, CachePolicy::new(1), &unified(Some(true), pool))
+                .is_err()
+        );
+        // Unprobed (None) and confirmed-discrete (Some(false)) records keep the
+        // split-axis behavior: the same numbers are admitted.
+        for legacy in [None, Some(false)] {
+            gpu.validate_capacity(false, 0, CachePolicy::new(1), &unified(legacy, pool))
+                .unwrap();
+        }
+        // A pool that holds the combined peak plus the pool-scaled reserve is
+        // admitted. (H + D)·21/19 + 2 covers the reserve = pool/20 fixed point.
+        gpu.validate_capacity(
+            false,
+            0,
+            CachePolicy::new(1),
+            &unified(
+                Some(true),
+                (host_peak + device_peak) / 19 * 21 + (host_peak + device_peak) % 19 + 2,
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn safety_reserve_scales_down_on_small_pools_and_never_up() {
+        let root = tiny_checkpoint();
+        crate::test_support::quantize_tiny_linears(root.path());
+        let weights =
+            ModelWeights::open(root.path(), WeightSource::Mmap, CachePolicy::new(1)).unwrap();
+        let config = GlmConfig::from_model_dir(root.path()).unwrap();
+        let gpu =
+            GlmAdmissionBreakdown::from_metadata(&weights, &config.text_config, false, 2).unwrap();
+        // Discrete workstation (24 GiB card): the declared 1 GiB is under
+        // device_total/20 there.
+        let desktop = ResourceSnapshot {
+            device_total_memory_bytes: Some(24 << 30),
+            ..snapshot(62 << 30, u64::MAX, Some(24 << 30))
+        };
+        assert_eq!(
+            gpu.scaled_admission_safety_bytes(&desktop),
+            GLM_ADMISSION_SAFETY_BYTES
+        );
+        // Small unified pool: 5% of its total, fixed across runs (not the
+        // instantaneous available view).
+        let small = ResourceSnapshot {
+            host_device_memory_is_unified: Some(true),
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: Some(7_849_050_112),
+            device_total_memory_bytes: Some(7_849_050_112),
+            ..snapshot(6272 << 20, u64::MAX, Some(6272 << 20))
+        };
+        let scaled = gpu.scaled_admission_safety_bytes(&small);
+        assert_eq!(scaled, 7_849_050_112 / 20);
+        assert!(scaled < GLM_ADMISSION_SAFETY_BYTES);
+    }
+
+    #[test]
+    fn unified_pool_shrinks_automatic_expert_cache_by_host_peaks() {
+        // Hand-rolled CUDA breakdown: the all-experts clamp must not bind, so
+        // expert geometry is sized large enough to leave the pool arithmetic
+        // observable.
+        let inventory = ff_core::weights::accounting::CacheInventory {
+            shards: vec![ff_core::weights::accounting::CacheShardInventory {
+                name: "a.safetensors".into(),
+                file_bytes: 108,
+                header_bytes: 8,
+                selected_tensor_bytes: 100,
+                selected_tensor_count: 1,
+                largest_tensor_bytes: 100,
+            }],
+        };
+        let breakdown = GlmAdmissionBreakdown {
+            scope: GlmLayerScope {
+                start: 0,
+                end: 2,
+                total_layers: 2,
+            },
+            cpu_fp8_dequantization: false,
+            pinned_transfer_bytes: 0,
+            pinned_fill_ahead_bytes: 0,
+            concurrent_loads: 0,
+            static_load_device_bytes: 256 << 20,
+            expert_load_device_bytes: 8 << 20,
+            compute_on_host: false,
+            prompt_tokens: 2,
+            num_hidden_layers: 2,
+            num_experts: 288,
+            experts_per_token: 8,
+            sparse_layers: vec![1],
+            static_bytes: 1 << 30,
+            lm_head_bytes: 64 << 20,
+            largest_streamed_group_bytes: 32 << 20,
+            kda_state_bytes: 4,
+            dsa_cache_bytes_per_token: 4,
+            maximum_dsa_cache_bytes: 128,
+            maximum_dsa_layer_cache_bytes: 64,
+            live_expert_bytes: 80 << 20,
+            prefill_workspace_bytes: 128,
+            decode_workspace_bytes: 64,
+            host_route_workspace_bytes: 32,
+            host_sampling_workspace_bytes: 0,
+            prefill_host_mask_bytes: 0,
+            static_load_host_bytes: 16 << 20,
+            streamed_load_host_bytes: 16 << 20,
+            expert_load_host_bytes: 4 << 20,
+            raw_inventory: inventory,
+        };
+        let phases = breakdown.phases(false, 0, CachePolicy::new(1)).unwrap();
+        let device_required = phases
+            .iter()
+            .map(|p| p.required_device_bytes.unwrap_or(0) + p.device_reserve_bytes)
+            .max()
+            .unwrap();
+        let host_required = phases
+            .iter()
+            .map(|p| p.host_peak_bytes().unwrap())
+            .max()
+            .unwrap();
+        assert!(host_required > 0);
+        let all_experts = (80u64 << 20) / 5 * 3 * 288;
+        // Discrete: sized from the device view alone. The 8 GiB device view
+        // keeps the all-experts clamp (13.8 GiB) from binding.
+        let discrete = breakdown
+            .automatic_expert_cache_bytes(&phases, &snapshot(8 << 30, u64::MAX, Some(8 << 30)))
+            .unwrap();
+        let expected_discrete = ((8u64 << 30) - device_required) / (1 << 20) * (1 << 20);
+        assert!(expected_discrete < all_experts, "clamp must not bind");
+        assert_eq!(discrete as u64, expected_discrete);
+        // Unified: same numbers, but the host phase peaks are subtracted from
+        // the shared pool too, so the result is strictly smaller.
+        let unified_snapshot = ResourceSnapshot {
+            host_device_memory_is_unified: Some(true),
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
+            ..snapshot(8 << 30, u64::MAX, Some(8 << 30))
+        };
+        let unified = breakdown
+            .automatic_expert_cache_bytes(&phases, &unified_snapshot)
+            .unwrap();
+        let pool = 8u64 << 30; // min(host, cgroup, device) views
+        // Both maxima fall in one phase here, so this fixture alone cannot tell
+        // the two formulas apart; the split phases below can.
+        let combined = phases
+            .iter()
+            .map(|p| {
+                p.host_peak_bytes().unwrap()
+                    + p.required_device_bytes.unwrap_or(0)
+                    + p.device_reserve_bytes
+            })
+            .max()
+            .unwrap();
+        assert_eq!(combined, device_required + host_required);
+        let expected_unified = (pool - combined) / (1 << 20) * (1 << 20);
+        assert_eq!(unified as u64, expected_unified);
+        assert!(unified < discrete);
+
+        let split = |phase: &str, host: u64, device: u64| ResourcePhaseEstimate {
+            phase: phase.into(),
+            required_host_bytes: host,
+            optional_host_bytes: 0,
+            reclaimable_host_bytes: 0,
+            host_promotion_reserve_bytes: 0,
+            required_device_bytes: Some(device),
+            optional_device_bytes: Some(0),
+            device_reserve_bytes: 0,
+        };
+        let skewed = vec![
+            split("prefill", 3 << 30, 1 << 30),
+            split("decode", 1 << 30, 3 << 30),
+        ];
+        let sized = breakdown
+            .automatic_expert_cache_bytes(&skewed, &unified_snapshot)
+            .unwrap() as u64;
+        assert_eq!(sized, pool - (4 << 30));
+        assert!(sized > pool - (6 << 30));
     }
 
     #[test]
