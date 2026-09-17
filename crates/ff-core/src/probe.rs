@@ -440,6 +440,24 @@ impl ResourceSnapshot {
         })
     }
 
+    /// The host pool a run is actually confined to: physical host memory, or a
+    /// finite cgroup limit when that is smaller. A container's pool is its
+    /// limit, not the machine's RAM — an 8 GiB container on a 64 GiB host would
+    /// otherwise scale reserves from 64 GiB and keep a margin worth 12.5% of
+    /// what the run can use instead of 5%. Both inputs are configured or
+    /// hardware totals rather than instantaneous views, so the result stays
+    /// stable across runs the way reserve scaling requires.
+    pub fn host_pool_total_bytes(&self) -> Option<u64> {
+        let limit = match self.cgroup_v2_memory_limit {
+            Some(CgroupMemoryLimit::Bytes(bytes)) => Some(bytes),
+            Some(CgroupMemoryLimit::Unlimited) | None => None,
+        };
+        match (self.host_memory_total_bytes, limit) {
+            (Some(host), Some(limit)) => Some(host.min(limit)),
+            (host, limit) => host.or(limit),
+        }
+    }
+
     /// Whether the probe confirmed a shared host/device pool whose size it
     /// could not measure. Callers that fold both axes must not silently fall
     /// back to independent per-axis checks here: the fold is known to be
@@ -1157,6 +1175,53 @@ mod tests {
         fn host_total_memory_bytes(&self) -> Option<u64> {
             self.total
         }
+    }
+
+    #[test]
+    fn host_pool_total_binds_on_a_finite_cgroup_limit() {
+        let snapshot = |host: Option<u64>, limit: Option<CgroupMemoryLimit>| ResourceSnapshot {
+            schema_version: RESOURCE_SNAPSHOT_SCHEMA_VERSION,
+            measured_at_unix_ms: 1,
+            host_memory_available_bytes: Some(1 << 30),
+            cgroup_v2_memory_limit: limit,
+            cgroup_v2_memory_current_bytes: None,
+            cgroup_v2_memory_available_bytes: None,
+            device_free_memory_bytes: None,
+            host_device_memory_is_unified: None,
+            host_memory_total_bytes: host,
+            device_total_memory_bytes: None,
+            measurement_scope: ResourceMeasurementScopes {
+                host_memory: None,
+                cgroup_memory: None,
+                device_memory: None,
+            },
+        };
+        let host = 64u64 << 30;
+        let container = 8u64 << 30;
+        // A container's pool is its limit: scaling a reserve from the machine's
+        // 64 GiB would keep 1 GiB, which is 12.5% of what the run can use.
+        assert_eq!(
+            snapshot(Some(host), Some(CgroupMemoryLimit::Bytes(container))).host_pool_total_bytes(),
+            Some(container)
+        );
+        // An unlimited or absent limit leaves the host total alone, and a limit
+        // above physical memory is not a pool the run can reach.
+        for limit in [Some(CgroupMemoryLimit::Unlimited), None] {
+            assert_eq!(
+                snapshot(Some(host), limit).host_pool_total_bytes(),
+                Some(host)
+            );
+        }
+        assert_eq!(
+            snapshot(Some(host), Some(CgroupMemoryLimit::Bytes(host * 2))).host_pool_total_bytes(),
+            Some(host)
+        );
+        // Either figure alone still answers; neither means no pool.
+        assert_eq!(
+            snapshot(None, Some(CgroupMemoryLimit::Bytes(container))).host_pool_total_bytes(),
+            Some(container)
+        );
+        assert_eq!(snapshot(None, None).host_pool_total_bytes(), None);
     }
 
     #[test]

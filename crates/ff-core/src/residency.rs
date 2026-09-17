@@ -454,11 +454,18 @@ pub fn decide_device_residency(
     // On a probed unified-memory device, host allocations draw from the same
     // pool, so the binding capacity is the smaller pool view rather than the
     // device view alone. Discrete and unprobed captures use the device view
-    // exactly as before.
-    let capacity = snapshot
-        .unified_pool_available_bytes()
-        .or(snapshot.device_free_memory_bytes)
-        .unwrap_or(0);
+    // exactly as before. A confirmed shared pool whose size is unknown gets no
+    // capacity: falling back to the device view there would authorize residency
+    // past a host or cgroup constraint that was simply not measured, which is
+    // the substitution `unified_pool_available_bytes` exists to prevent.
+    let capacity = if snapshot.unified_pool_is_unmeasurable() {
+        0
+    } else {
+        snapshot
+            .unified_pool_available_bytes()
+            .or(snapshot.device_free_memory_bytes)
+            .unwrap_or(0)
+    };
     decide_residency_within(capacity, demands, reserve_bytes, authorization)
 }
 
@@ -1096,6 +1103,45 @@ mod tests {
         assert_eq!(residency.disposition, CandidateDisposition::Selected);
         assert_eq!(baseline.disposition, CandidateDisposition::OperatorExcluded);
         provenance(&decision).validate().unwrap();
+    }
+
+    #[test]
+    fn a_confirmed_shared_pool_of_unknown_size_authorizes_no_residency() {
+        // The device view is not a stand-in for a shared pool: on a confirmed
+        // unified device with the host view unmeasured, using it would place
+        // weights past a host or cgroup constraint nobody looked at.
+        let demands = vec![demand("decode", 1 << 20, 1 << 20, 10)];
+        let authorization = ResidencyAuthorization::MeasuredEvidence {
+            ceiling_bytes: u64::MAX,
+        };
+        let discrete =
+            decide_device_residency(&snapshot(Some(8 << 30)), &demands, 0, authorization)
+                .unwrap()
+                .authorized_budget_bytes;
+        assert!(discrete > 0, "the discrete path must still place weights");
+        let unmeasurable = ResourceSnapshot {
+            host_device_memory_is_unified: Some(true),
+            ..snapshot(Some(8 << 30))
+        };
+        assert!(unmeasurable.unified_pool_is_unmeasurable());
+        assert_eq!(
+            decide_device_residency(&unmeasurable, &demands, 0, authorization)
+                .unwrap()
+                .authorized_budget_bytes,
+            0
+        );
+        // A measured shared pool places as usual.
+        let measured = ResourceSnapshot {
+            host_device_memory_is_unified: Some(true),
+            host_memory_available_bytes: Some(8 << 30),
+            ..snapshot(Some(8 << 30))
+        };
+        assert!(
+            decide_device_residency(&measured, &demands, 0, authorization)
+                .unwrap()
+                .authorized_budget_bytes
+                > 0
+        );
     }
 
     #[test]

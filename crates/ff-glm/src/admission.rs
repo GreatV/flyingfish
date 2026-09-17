@@ -643,6 +643,12 @@ impl GlmAdmissionBreakdown {
         // pool as every host charge, so size it from the combined peak instead
         // of the device view alone. Discrete and unprobed captures take the
         // device view exactly as before.
+        // A confirmed shared pool whose size is unknown retains nothing: the
+        // device view is not a substitute for it (see `residency.rs`, which
+        // takes the same position for the same reason).
+        if snapshot.unified_pool_is_unmeasurable() {
+            return Ok(0);
+        }
         let unified_pool = snapshot.unified_pool_available_bytes();
         let Some(free) = unified_pool.or(snapshot.device_free_memory_bytes) else {
             return Ok(0);
@@ -691,11 +697,11 @@ impl GlmAdmissionBreakdown {
         let unified = snapshot.host_device_memory_is_unified == Some(true);
         let total = if self.compute_on_host {
             snapshot
-                .host_memory_total_bytes
+                .host_pool_total_bytes()
                 .or(snapshot.host_memory_available_bytes)
         } else if unified {
             [
-                snapshot.host_memory_total_bytes,
+                snapshot.host_pool_total_bytes(),
                 snapshot.device_total_memory_bytes,
             ]
             .into_iter()
@@ -706,7 +712,7 @@ impl GlmAdmissionBreakdown {
             snapshot
                 .device_total_memory_bytes
                 .or(snapshot.device_free_memory_bytes)
-                .or(snapshot.host_memory_total_bytes)
+                .or_else(|| snapshot.host_pool_total_bytes())
                 .or(snapshot.host_memory_available_bytes)
         };
         match total {
@@ -723,7 +729,7 @@ impl GlmAdmissionBreakdown {
         let unified = snapshot.host_device_memory_is_unified == Some(true);
         let total = if unified {
             [
-                snapshot.host_memory_total_bytes,
+                snapshot.host_pool_total_bytes(),
                 snapshot.device_total_memory_bytes,
             ]
             .into_iter()
@@ -732,7 +738,7 @@ impl GlmAdmissionBreakdown {
             .or_else(|| snapshot.unified_pool_available_bytes())
         } else {
             snapshot
-                .host_memory_total_bytes
+                .host_pool_total_bytes()
                 .or(snapshot.host_memory_available_bytes)
         };
         match total {
@@ -1003,9 +1009,17 @@ mod tests {
             schema_version: 1,
             measured_at_unix_ms: 1,
             host_memory_available_bytes: Some(host),
-            cgroup_v2_memory_limit: Some(CgroupMemoryLimit::Bytes(cgroup)),
+            // `u64::MAX` means "no cgroup constraint" at these call sites. A
+            // real probe reports that as `Unlimited` — `memory.max` reading
+            // `max` never parses to a finite byte count — so expressing it as
+            // `Bytes(u64::MAX)` would hand reserve scaling an 18-exabyte pool.
+            cgroup_v2_memory_limit: Some(if cgroup == u64::MAX {
+                CgroupMemoryLimit::Unlimited
+            } else {
+                CgroupMemoryLimit::Bytes(cgroup)
+            }),
             cgroup_v2_memory_current_bytes: Some(0),
-            cgroup_v2_memory_available_bytes: Some(cgroup),
+            cgroup_v2_memory_available_bytes: (cgroup != u64::MAX).then_some(cgroup),
             device_free_memory_bytes: device,
             host_device_memory_is_unified: None,
             host_memory_total_bytes: None,
