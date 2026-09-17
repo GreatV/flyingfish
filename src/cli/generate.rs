@@ -1834,14 +1834,13 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
                 };
                 if let Some(selected) = resource_selection.as_ref() {
                     let mut provenance = selected.provenance.clone();
-                    flyingfish::resource_policy::h3::record_final_admission(
+                    flyingfish::resource_policy::h3::record_refused_final_admission(
                         &mut provenance,
                         refusal.snapshot.clone(),
                         refusal.budget,
                         refusal.host_peak,
                         refusal.device_peak,
-                    )
-                    .ok();
+                    )?;
                     provenance.workload.insert("refused".into(), 1);
                     for candidate in &mut provenance.candidates {
                         if candidate.disposition

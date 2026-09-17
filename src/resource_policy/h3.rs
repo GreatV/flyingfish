@@ -157,6 +157,28 @@ fn record_budget(
 
 /// Keep the effective limits and checked peaks with the observation that used
 /// them. Compute limits also apply to the compute portion of a CPU host ledger.
+/// The refusal counterpart: the peaks are known to exceed the budget, so the
+/// admitted-peak invariant is skipped and the overshoot recorded as a
+/// shortfall. Without this the record carries neither snapshot nor budget.
+pub fn record_refused_final_admission(
+    record: &mut ResourceSelectionProvenance,
+    snapshot: ResourceSnapshot,
+    budget: ResourceBudget,
+    host_peak: u64,
+    compute_peak: u64,
+) -> Result<()> {
+    record_budget(
+        record,
+        "final_admission",
+        budget,
+        host_peak,
+        compute_peak,
+        true,
+    )?;
+    record.final_admission_snapshot = Some(snapshot);
+    Ok(())
+}
+
 pub fn record_final_admission(
     record: &mut ResourceSelectionProvenance,
     snapshot: ResourceSnapshot,
@@ -758,6 +780,25 @@ mod tests {
             additional_host_allowance_bytes: 0,
         })
     }
+    #[test]
+    fn a_refused_final_admission_records_its_snapshot_and_shortfall() {
+        let mut record = run(&baseline(), None, None, 0).unwrap().provenance;
+        let budget = ResourceBudget {
+            max_host_bytes: Some(1),
+            max_device_bytes: Some(1),
+        };
+        assert!(
+            record_final_admission(&mut record, snapshot(), budget, 100, 0).is_err(),
+            "the admitted path must still reject an over-budget peak"
+        );
+        record_refused_final_admission(&mut record, snapshot(), budget, 100, 0).unwrap();
+        assert!(record.final_admission_snapshot.is_some());
+        assert_eq!(
+            record.workload.get("final_admission_host_shortfall_bytes"),
+            Some(&99)
+        );
+    }
+
     #[test]
     fn refusal_publishes_its_ledger_instead_of_a_budget_recording_error() {
         let error = run_with_budget(
