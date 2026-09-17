@@ -524,6 +524,14 @@ impl PreparedGlm {
                                 .max(breakdown.expert_load_host_bytes),
                         )
                     })
+                    // Pinned upload slots are charged to both axes and the
+                    // fill-ahead ring to the host; both are allocated lazily,
+                    // after the first batched-prefill guard runs, and only the
+                    // device side of the slots reaches
+                    // `weight_load_staging_bytes`. Under the fold the host side
+                    // draws from the same pool and must be required here.
+                    .and_then(|n| n.checked_add(breakdown.pinned_transfer_bytes))
+                    .and_then(|n| n.checked_add(breakdown.pinned_fill_ahead_bytes))
                     .context("GLM unified host charge overflow")?,
             )?,
         });
