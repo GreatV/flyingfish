@@ -69,10 +69,24 @@ pub fn report_refusal(error: &anyhow::Error, sidecar: Option<&Path>) -> Option<S
                 parent.display()
             );
         }
-        if path.exists()
-            && let Err(error) = std::fs::remove_file(path)
-        {
-            eprintln!("warning: cannot replace {}: {error}", path.display());
+        // Replaced only if it is this command's own refusal record. The path is
+        // derived from a caller-supplied one, so an unrelated file can sit
+        // there; deleting it to publish a diagnostic would be a poor trade.
+        if path.exists() {
+            match std::fs::read(path)
+                .ok()
+                .and_then(|bytes| ResourceSelectionProvenance::from_json(&bytes).ok())
+            {
+                Some(existing) if existing.is_refusal() => {
+                    if let Err(error) = std::fs::remove_file(path) {
+                        eprintln!("warning: cannot replace {}: {error}", path.display());
+                    }
+                }
+                _ => eprintln!(
+                    "warning: {} is not a refusal record; leaving it and not publishing",
+                    path.display()
+                ),
+            }
         }
         if let Err(error) = publish_selection(path, &refusal.provenance) {
             eprintln!("warning: failed to publish refusal resource selection: {error}");
