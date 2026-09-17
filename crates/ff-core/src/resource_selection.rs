@@ -269,8 +269,12 @@ impl ResourceSelectionProvenance {
         // `refused` key and keep the strict rule.
         let refused = self.workload.get("refused").copied().unwrap_or(0) == 1;
         ensure!(
-            selected == 1 || (refused && selected == 0),
-            "resource selection must select exactly one candidate (or none on a recorded refusal)"
+            if refused {
+                selected == 0
+            } else {
+                selected == 1
+            },
+            "resource selection must select exactly one candidate (and a recorded refusal none)"
         );
         Ok(())
     }
@@ -369,6 +373,8 @@ mod tests {
                 cgroup_v2_memory_available_bytes: None,
                 device_free_memory_bytes: None,
                 host_device_memory_is_unified: None,
+                host_memory_total_bytes: None,
+                device_total_memory_bytes: None,
                 measurement_scope: ResourceMeasurementScopes {
                     host_memory: None,
                     cgroup_memory: None,

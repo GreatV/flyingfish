@@ -402,6 +402,14 @@ pub struct ResourceSnapshot {
     /// between `None` and `Some(false)` is provenance for diagnostics.
     #[serde(default)]
     pub host_device_memory_is_unified: Option<bool>,
+    /// Hardware-level totals (MemTotal / device total memory), unlike the
+    /// instantaneous `*_available`/`device_free` views. Reserve sizes scale
+    /// with totals so that a run's margin does not shrink when the machine is
+    /// busy and sidecar-recorded reserves stay comparable across runs.
+    #[serde(default)]
+    pub host_memory_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub device_total_memory_bytes: Option<u64>,
     pub measurement_scope: ResourceMeasurementScopes,
 }
 
@@ -565,6 +573,12 @@ fn resource_snapshot_with_source(
         read_cgroup_v2_memory(source).unwrap_or((None, None, None));
     let device_free_memory_bytes = device.and_then(device_free_memory);
     let host_device_memory_is_unified = device.and_then(device_memory_is_unified);
+    let host_memory_total_bytes = source
+        .read_to_string(Path::new("/proc/meminfo"))
+        .ok()
+        .as_deref()
+        .and_then(|contents| parse_meminfo_bytes(contents, "MemTotal"));
+    let device_total_memory_bytes = device.and_then(device_total_memory);
 
     ResourceSnapshot {
         schema_version: RESOURCE_SNAPSHOT_SCHEMA_VERSION,
@@ -575,6 +589,8 @@ fn resource_snapshot_with_source(
         cgroup_v2_memory_available_bytes,
         device_free_memory_bytes,
         host_device_memory_is_unified,
+        host_memory_total_bytes,
+        device_total_memory_bytes,
         measurement_scope: ResourceMeasurementScopes {
             host_memory: host_memory_available_bytes.map(|_| MemoryMeasurementScope::HostWide),
             cgroup_memory: (cgroup_v2_memory_limit.is_some()
@@ -1017,6 +1033,18 @@ fn device_free_memory(_device: &Device) -> Option<u64> {
     None
 }
 
+#[cfg(feature = "cuda")]
+fn device_total_memory(device: &Device) -> Option<u64> {
+    let cuda = device.as_cuda_device().ok()?;
+    let stream = cuda.cuda_stream();
+    u64::try_from(stream.context().total_mem().ok()?).ok()
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_total_memory(_device: &Device) -> Option<u64> {
+    None
+}
+
 /// Probe the CUDA `integrated` device attribute once at snapshot capture.
 /// `Some(false)` is a confirmed discrete topology; `None` means unprobed
 /// (non-CUDA device or build). A query failure on a CUDA device is not
@@ -1353,6 +1381,8 @@ mod tests {
                 cgroup_v2_memory_available_bytes: None,
                 device_free_memory_bytes: None,
                 host_device_memory_is_unified: None,
+                host_memory_total_bytes: None,
+                device_total_memory_bytes: None,
                 measurement_scope: ResourceMeasurementScopes {
                     host_memory: None,
                     cgroup_memory: None,
@@ -1373,6 +1403,8 @@ mod tests {
             cgroup_v2_memory_available_bytes: Some(8),
             device_free_memory_bytes: Some(6),
             host_device_memory_is_unified: unified,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,

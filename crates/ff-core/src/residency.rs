@@ -892,6 +892,8 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: device_free,
             host_device_memory_is_unified: None,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -1133,6 +1135,8 @@ mod tests {
         let snapshot = ResourceSnapshot {
             device_free_memory_bytes: Some(96),
             host_device_memory_is_unified: None,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             ..ResourceSnapshot::capture(None)
         };
         let authorization = ResidencyAuthorization::OperatorExplicit {

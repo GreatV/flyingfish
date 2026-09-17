@@ -3629,6 +3629,8 @@ mod tests {
             cgroup_v2_memory_available_bytes: Some(8 * 1024 * 1024),
             device_free_memory_bytes: Some(6 * 1024 * 1024),
             host_device_memory_is_unified: None,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -3665,6 +3667,8 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: None,
             host_device_memory_is_unified: None,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,

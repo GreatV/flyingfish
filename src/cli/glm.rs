@@ -305,9 +305,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
                 baseline.resident_static,
                 0,
                 baseline.cache_policy()?,
-                flyingfish::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(
-                    &selection_snapshot,
-                ),
+                breakdown.scaled_admission_safety_bytes(&selection_snapshot),
             )?;
             let bytes =
                 breakdown.automatic_expert_cache_bytes(&phases, &selection_snapshot)? as u64;

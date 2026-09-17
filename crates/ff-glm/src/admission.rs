@@ -681,18 +681,65 @@ impl GlmAdmissionBreakdown {
         usize::try_from(available.min(all_experts)).context("GLM cache bound exceeds usize")
     }
 
-    /// The admission-time safety reserve: the declared 1 GiB on machines with
-    /// room, scaled down to 5% of the pool on small unified-memory machines so
-    /// the margin stays proportional instead of becoming the dominant term.
-    /// Discrete desktops are unchanged: min(1 GiB, pool/20) = 1 GiB there.
-    pub fn scaled_admission_safety_bytes(snapshot: &ResourceSnapshot) -> u64 {
-        let pool = snapshot
-            .unified_pool_available_bytes()
-            .or_else(|| host_available(snapshot))
-            .or(snapshot.device_free_memory_bytes);
-        match pool {
-            Some(pool) => GLM_ADMISSION_SAFETY_BYTES.min(pool / 20),
+    /// The admission-time safety reserve: 5% of the pool's TOTAL bytes, capped
+    /// at the declared 1 GiB. The denominator is the hardware total, not the
+    /// instantaneous available view — a busier machine does not get a smaller
+    /// safety margin, and sidecar-recorded reserves stay comparable across
+    /// runs. The crossover is a 20 GiB pool: below it (including small
+    /// discrete cards) the reserve relaxes below 1 GiB. Axis: device total for
+    /// CUDA, host total for CPU, the smaller of both totals when unified.
+    /// Legacy records without totals fall back to the available views.
+    pub fn scaled_admission_safety_bytes(&self, snapshot: &ResourceSnapshot) -> u64 {
+        let unified = snapshot.host_device_memory_is_unified == Some(true);
+        let total = if self.compute_on_host {
+            snapshot
+                .host_memory_total_bytes
+                .or(snapshot.host_memory_available_bytes)
+        } else if unified {
+            [
+                snapshot.host_memory_total_bytes,
+                snapshot.device_total_memory_bytes,
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .or_else(|| snapshot.unified_pool_available_bytes())
+        } else {
+            snapshot
+                .device_total_memory_bytes
+                .or(snapshot.device_free_memory_bytes)
+                .or(snapshot.host_memory_total_bytes)
+                .or(snapshot.host_memory_available_bytes)
+        };
+        match total {
+            Some(total) => GLM_ADMISSION_SAFETY_BYTES.min(total / 20),
             None => GLM_ADMISSION_SAFETY_BYTES,
+        }
+    }
+
+    /// The host-promotion reserve, on the same footing as the safety reserve:
+    /// 5% of the host (or unified pool) total, capped at 1 GiB. This reserve
+    /// gates weight-source promotions; the reverse-scaled `max(1 GiB, pool/20)`
+    /// it replaces never shrank and grew with the pool.
+    pub fn scaled_promotion_reserve_bytes(snapshot: &ResourceSnapshot) -> u64 {
+        let unified = snapshot.host_device_memory_is_unified == Some(true);
+        let total = if unified {
+            [
+                snapshot.host_memory_total_bytes,
+                snapshot.device_total_memory_bytes,
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .or_else(|| snapshot.unified_pool_available_bytes())
+        } else {
+            snapshot
+                .host_memory_total_bytes
+                .or(snapshot.host_memory_available_bytes)
+        };
+        match total {
+            Some(total) => (1_u64 << 30).min(total / 20),
+            None => 1_u64 << 30,
         }
     }
 
@@ -710,7 +757,7 @@ impl GlmAdmissionBreakdown {
         // discrete checks is unsafe only when the pool is known shared, and
         // legacy records predate unified support entirely.
         let unified_pool = snapshot.unified_pool_available_bytes();
-        let safety = Self::scaled_admission_safety_bytes(snapshot);
+        let safety = self.scaled_admission_safety_bytes(snapshot);
         for phase in
             self.phases_with_safety(resident_static, expert_cache_bytes, cache_policy, safety)?
         {
@@ -958,6 +1005,8 @@ mod tests {
             cgroup_v2_memory_available_bytes: Some(cgroup),
             device_free_memory_bytes: device,
             host_device_memory_is_unified: None,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -1097,6 +1146,8 @@ mod tests {
         // what matters is the split/merged outcome pair below.)
         let unified = |unified: Option<bool>, pool: u64| ResourceSnapshot {
             host_device_memory_is_unified: unified,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             ..snapshot(pool, u64::MAX, Some(pool))
         };
         assert!(
@@ -1125,22 +1176,33 @@ mod tests {
 
     #[test]
     fn safety_reserve_scales_down_on_small_pools_and_never_up() {
-        // Discrete workstation: the declared 1 GiB is under pool/20 there.
+        let root = tiny_checkpoint();
+        crate::test_support::quantize_tiny_linears(root.path());
+        let weights =
+            ModelWeights::open(root.path(), WeightSource::Mmap, CachePolicy::new(1)).unwrap();
+        let config = GlmConfig::from_model_dir(root.path()).unwrap();
+        let gpu =
+            GlmAdmissionBreakdown::from_metadata(&weights, &config.text_config, false, 2).unwrap();
+        // Discrete workstation (24 GiB card): the declared 1 GiB is under
+        // device_total/20 there.
+        let desktop = ResourceSnapshot {
+            device_total_memory_bytes: Some(24 << 30),
+            ..snapshot(62 << 30, u64::MAX, Some(24 << 30))
+        };
         assert_eq!(
-            GlmAdmissionBreakdown::scaled_admission_safety_bytes(&snapshot(
-                62 << 30,
-                u64::MAX,
-                Some(24 << 30)
-            )),
+            gpu.scaled_admission_safety_bytes(&desktop),
             GLM_ADMISSION_SAFETY_BYTES
         );
-        // Small unified pool: 5% of it, and never above the constant.
+        // Small unified pool: 5% of its total, fixed across runs (not the
+        // instantaneous available view).
         let small = ResourceSnapshot {
             host_device_memory_is_unified: Some(true),
+            host_memory_total_bytes: Some(7_849_050_112),
+            device_total_memory_bytes: Some(7_849_050_112),
             ..snapshot(6272 << 20, u64::MAX, Some(6272 << 20))
         };
-        let scaled = GlmAdmissionBreakdown::scaled_admission_safety_bytes(&small);
-        assert_eq!(scaled, (6272u64 << 20) / 20);
+        let scaled = gpu.scaled_admission_safety_bytes(&small);
+        assert_eq!(scaled, 7_849_050_112 / 20);
         assert!(scaled < GLM_ADMISSION_SAFETY_BYTES);
     }
 
@@ -1220,6 +1282,8 @@ mod tests {
         // the shared pool too, so the result is strictly smaller.
         let unified_snapshot = ResourceSnapshot {
             host_device_memory_is_unified: Some(true),
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             ..snapshot(8 << 30, u64::MAX, Some(8 << 30))
         };
         let unified = breakdown

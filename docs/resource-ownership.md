@@ -11,9 +11,9 @@ align).
 
 | reserve | protects | owning ledger (target) | current homes (legacy) |
 |---|---|---|---|
-| GLM admission safety | allocator slack against modelled-peak error | **scaled: min(1 GiB, pool/20)**, applied at admission and recorded in the sidecar | `GLM_ADMISSION_SAFETY_BYTES` (declared contract constant, identity) |
-| GLM host promotion reserve | headroom for weight-source promotion | (dead — recorded, never charged; A3) | `host_promotion_reserve_bytes`, set in `resource_policy/glm.rs`, read nowhere |
-| H3/generic device residency reserve | activation/workspace slack around retained weights | **still fixed 1 GiB** — intentionally NOT scaled yet: the generic adapters (minicpm/music/trellis) and H3 keep `DEVICE_RESIDENCY_RESERVE_BYTES` flat. This is a *known two-family inconsistency* introduced by scaling GLM only; scaling these is A7 follow-up, not an oversight | cli/resource.rs allowance + phase stamp + `automatic_device_cache` headroom |
+| GLM admission safety | allocator slack against modelled-peak error | **scaled: min(1 GiB, axis_total/20)** — device total on CUDA, host total on CPU, min of both totals when unified; recorded in the sidecar. Crossover: 20 GiB pools, below which the reserve relaxes (deliberate, pinned) | `GLM_ADMISSION_SAFETY_BYTES` (declared contract constant, identity) |
+| GLM host promotion reserve | headroom for weight-source promotion | **alive and gating** promotions (`resource_policy/glm.rs` capacity check); **scaled the same way** (min(1 GiB, pool_total/20)) — the pre-A7 `max(1 GiB, pool/20)` never shrank and grew with the pool | the *field* `host_promotion_reserve_bytes` is still write-only (A3) |
+| H3/generic device residency reserve | activation/workspace slack around retained weights | **still fixed 1 GiB** — intentionally NOT scaled yet: the generic adapters (minicpm/music/trellis) and H3 keep `DEVICE_RESIDENCY_RESERVE_BYTES` flat. This is a *known two-family inconsistency* introduced by scaling GLM only; **trigger to fix: any sub-20 GiB pool running those adapters**, where the flat GiB decides admission | cli/resource.rs allowance + phase stamp + `automatic_device_cache` headroom |
 | FA backend workspace floor | cuDNN/FlashAttention workspace | **deferred**: scale with sequence geometry, but no ground truth exists (FA never ran on the Orin pool) — deferred deliberately rather than guessed | `DEFAULT_FLASH_BACKEND_WORKSPACE_MIB` |
 | non-FA backend workspace | attention score workspaces | geometry-scaled | `DEFAULT_NON_FLASH_BACKEND_WORKSPACE_MIB` (1536 MiB) |
 
@@ -31,4 +31,6 @@ Admission answers "will it OOM", not "will it thrash". Reclaimable residency
 is reported (it dominates delivered supply when evicted), never charged. A
 fixed-byte reserve must declare what it protects and scale with the relevant
 quantity (pool size or request working set), and the scaled value is recorded
-in the selection sidecar.
+in the selection sidecar. Reserves scale with the pool's TOTAL bytes, never
+the instantaneous available view — a busier machine does not get a smaller
+margin, and recorded reserves stay comparable across runs.

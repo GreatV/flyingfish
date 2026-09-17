@@ -138,15 +138,16 @@ pub fn select(
                 None => crate::glm::admission::host_available(snapshot)
                     .context("host capacity unavailable")?,
             };
-            let reserve = (1_u64 << 30).max(host / 20);
+            let reserve =
+                crate::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
+                    snapshot,
+                );
             if breakdown
                 .phases_with_safety(
                     candidate.resident_static,
                     expert_bytes,
                     cache,
-                    crate::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(
-                        snapshot,
-                    ),
+                    breakdown.scaled_admission_safety_bytes(snapshot),
                 )?
                 .iter()
                 .any(|p| {
@@ -242,9 +243,7 @@ pub fn select(
                 candidate.resident_static,
                 expert_bytes,
                 cache,
-                crate::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(
-                    snapshot,
-                ),
+                breakdown.scaled_admission_safety_bytes(snapshot),
             )?;
             let host_peak = phases
                 .iter()
@@ -355,9 +354,7 @@ pub fn select(
                 // calibration reader needs the number, not the rule.
                 (
                     "admission_safety_bytes_applied".into(),
-                    crate::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(
-                        snapshot,
-                    ),
+                    breakdown.scaled_admission_safety_bytes(snapshot),
                 ),
             ]),
             axes,
@@ -380,7 +377,7 @@ pub fn select(
             baseline.resident_static,
             usize::try_from(baseline.expert_cache.maximum_bound_bytes)?,
             cache_policy(baseline)?,
-            crate::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(snapshot),
+            breakdown.scaled_admission_safety_bytes(snapshot),
         )?;
         let provenance =
             build_provenance(baseline, refusal_axes, refusal_phases, observations, true)?;
@@ -411,18 +408,14 @@ pub fn select(
         policy.resident_static,
         usize::try_from(policy.expert_cache.maximum_bound_bytes)?,
         cache_policy(&policy)?,
-        crate::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(snapshot),
+        breakdown.scaled_admission_safety_bytes(snapshot),
     )?;
     if policy.weights != baseline.weights {
-        // The reserve is sized from the same pool view the admission check
-        // used: the unified pool when probed, else the host view.
-        let host = match snapshot.unified_pool_available_bytes() {
-            Some(pool) => pool,
-            None => crate::glm::admission::host_available(snapshot)
-                .context("host capacity unavailable")?,
-        };
         for phase in &mut phases {
-            phase.host_promotion_reserve_bytes = (1_u64 << 30).max(host / 20);
+            phase.host_promotion_reserve_bytes =
+                crate::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
+                    snapshot,
+                );
         }
     }
     let provenance = build_provenance(&policy, selected_axes, phases, observations, false)?;
@@ -475,6 +468,8 @@ mod tests {
             cgroup_v2_memory_current_bytes: Some(0),
             device_free_memory_bytes: None,
             host_device_memory_is_unified: None,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -672,11 +667,12 @@ mod tests {
             ..evidence()
         };
         // Pool (the device view is smallest) passes plain capacity but not the
-        // promotion reserve; the discrete host view admits both. With the
-        // pool-scaled safety term the fixture's host peak is small, so the
-        // discriminating margin is the 1 GiB promotion reserve floor: pool
-        // must sit below peak + 1 GiB while staying above the peak itself.
+        // promotion reserve; the discrete host view admits both. Totals are
+        // set explicitly so the total-scaled reserves are fixed (host_total
+        // 8 GiB → promotion reserve 0.4 GiB) and the discriminating margin is
+        // not pool-dependent: peak 0.404 GiB + 0.4 GiB > 0.5 GiB pool.
         let mut unified_snapshot = snapshot();
+        unified_snapshot.host_memory_total_bytes = Some(8 << 30);
         unified_snapshot.device_free_memory_bytes = Some(536_870_912);
         unified_snapshot.host_device_memory_is_unified = Some(true);
         let mut discrete_snapshot = unified_snapshot.clone();

@@ -663,6 +663,8 @@ mod tests {
                 cgroup_v2_memory_available_bytes: Some(100),
                 device_free_memory_bytes: Some(10),
                 host_device_memory_is_unified: None,
+                host_memory_total_bytes: None,
+                device_total_memory_bytes: None,
                 measurement_scope: ResourceMeasurementScopes {
                     host_memory: None,
                     cgroup_memory: None,
