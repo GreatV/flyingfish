@@ -26,6 +26,22 @@ const GENERATION_INITIALIZATION_FILE: &str = "generation-initialization.json";
 const GENERATION_READY_FILE: &str = "generation-ready";
 const EXECUTION_POLICY_FILE: &str = "execution-policy.json";
 const RESOURCE_SELECTION_FILE: &str = "resource-selection.json";
+
+/// A generation preflight rejected for capacity, as distinct from the parse,
+/// metadata and numerical-backend failures the same function can return. Only
+/// this one becomes a resource refusal: publishing a filesystem error as a
+/// `CapacityRejected` candidate would put a false cause in the very ledger the
+/// refusal exists to make trustworthy.
+#[derive(Debug)]
+struct PreflightCapacityRefusal(String);
+
+impl std::fmt::Display for PreflightCapacityRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PreflightCapacityRefusal {}
 const RESOURCE_REFUSAL_FILE: &str = "resource-refusal.json";
 
 /// Where a refusal ledger is published. A fresh run has no selection artifact
@@ -1829,6 +1845,9 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
                 // ones: when a selection exists it carries a complete candidate
                 // ledger, so a capacity change between selection and here is
                 // published rather than reduced to a message.
+                if error.downcast_ref::<PreflightCapacityRefusal>().is_none() {
+                    return Err(error);
+                }
                 if let Some(selected) = resource_selection.as_ref() {
                     let mut provenance = selected.provenance.clone();
                     provenance.workload.insert("refused".into(), 1);
@@ -2187,9 +2206,10 @@ fn preflight_generation(
             })
             .collect::<Vec<_>>()
             .join("+");
-        bail!(
+        return Err(PreflightCapacityRefusal(format!(
             "generation preflight admission refused before any model tensor was materialized (binding budget: {binding}): {error}"
-        );
+        ))
+        .into());
     }
     Ok(GenerationPreflight {
         estimate,
@@ -2255,7 +2275,7 @@ pub(super) fn probed_budget(
     // `--max-host-mib` is clamped too, matching how the device axis already
     // takes the minimum of the request and the probe.
     anyhow::ensure!(
-        !snapshot.unified_pool_is_unmeasurable(),
+        !snapshot.unified_accounting_is_undecidable(),
         "generation preflight needs the shared host/device pool size on a unified-memory device, \
          but one of the host and CUDA views could not be measured"
     );
@@ -3728,6 +3748,7 @@ mod tests {
             cgroup_v2_memory_available_bytes: Some(8 * 1024 * 1024),
             device_free_memory_bytes: Some(6 * 1024 * 1024),
             host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
@@ -3766,6 +3787,7 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: None,
             host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
@@ -3801,6 +3823,7 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: Some(6 * 1024 * 1024),
             host_device_memory_is_unified: unified,
+            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
