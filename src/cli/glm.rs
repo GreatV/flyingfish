@@ -301,7 +301,14 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
             automatic_axes.push("resident_static");
         }
         if !explicit_axes.contains("expert_cache.maximum_bound_bytes") {
-            let phases = breakdown.phases(baseline.resident_static, 0, baseline.cache_policy()?)?;
+            let phases = breakdown.phases_with_safety(
+                baseline.resident_static,
+                0,
+                baseline.cache_policy()?,
+                flyingfish::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(
+                    &selection_snapshot,
+                ),
+            )?;
             let bytes =
                 breakdown.automatic_expert_cache_bytes(&phases, &selection_snapshot)? as u64;
             baseline.expert_cache.maximum_bound_bytes = bytes;

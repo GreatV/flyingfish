@@ -456,6 +456,24 @@ impl GlmAdmissionBreakdown {
         expert_cache_bytes: usize,
         cache_policy: CachePolicy,
     ) -> Result<Vec<ResourcePhaseEstimate>> {
+        self.phases_with_safety(
+            resident_static,
+            expert_cache_bytes,
+            cache_policy,
+            GLM_ADMISSION_SAFETY_BYTES,
+        )
+    }
+
+    /// `safety_bytes` is the reserve applied per phase; admission-time callers
+    /// pass the pool-scaled value from `scaled_admission_safety_bytes`, tests
+    /// and the policy contract keep the declared constant via `phases()`.
+    pub fn phases_with_safety(
+        &self,
+        resident_static: bool,
+        expert_cache_bytes: usize,
+        cache_policy: CachePolicy,
+        safety_bytes: u64,
+    ) -> Result<Vec<ResourcePhaseEstimate>> {
         // The mmap'd shard residency is page cache: file-backed and
         // kernel-reclaimable, already counted as available in MemAvailable.
         // It is reported as `reclaimable_host_bytes` (telemetry) and never
@@ -530,7 +548,7 @@ impl GlmAdmissionBreakdown {
                     phase: phase.into(),
                     required_host_bytes: compute
                         .checked_add(host_workspace)
-                        .and_then(|v| v.checked_add(GLM_ADMISSION_SAFETY_BYTES))
+                        .and_then(|v| v.checked_add(safety_bytes))
                         .context("GLM CPU phase bytes overflow")?,
                     optional_host_bytes: u64::try_from(expert_cache_bytes)
                         .context("GLM CPU retention bytes overflow")?,
@@ -553,7 +571,7 @@ impl GlmAdmissionBreakdown {
                             .context("GLM device staging peak overflow")?,
                     ),
                     optional_device_bytes: Some(u64::try_from(expert_cache_bytes)?),
-                    device_reserve_bytes: GLM_ADMISSION_SAFETY_BYTES,
+                    device_reserve_bytes: safety_bytes,
                 })
             }
         };
@@ -569,7 +587,7 @@ impl GlmAdmissionBreakdown {
                         phase: "static_initialization".into(),
                         required_host_bytes: u64::try_from(self.static_bytes)?
                             .checked_add(self.static_load_host_bytes)
-                            .and_then(|v| v.checked_add(GLM_ADMISSION_SAFETY_BYTES))
+                            .and_then(|v| v.checked_add(safety_bytes))
                             .context("GLM CPU initialization overflow")?,
                         optional_host_bytes: 0,
                         reclaimable_host_bytes: raw,
@@ -591,7 +609,7 @@ impl GlmAdmissionBreakdown {
                                 .context("GLM static GPU staging peak overflow")?,
                         ),
                         optional_device_bytes: Some(0),
-                        device_reserve_bytes: GLM_ADMISSION_SAFETY_BYTES,
+                        device_reserve_bytes: safety_bytes,
                     }
                 },
             );
@@ -663,6 +681,21 @@ impl GlmAdmissionBreakdown {
         usize::try_from(available.min(all_experts)).context("GLM cache bound exceeds usize")
     }
 
+    /// The admission-time safety reserve: the declared 1 GiB on machines with
+    /// room, scaled down to 5% of the pool on small unified-memory machines so
+    /// the margin stays proportional instead of becoming the dominant term.
+    /// Discrete desktops are unchanged: min(1 GiB, pool/20) = 1 GiB there.
+    pub fn scaled_admission_safety_bytes(snapshot: &ResourceSnapshot) -> u64 {
+        let pool = snapshot
+            .unified_pool_available_bytes()
+            .or_else(|| host_available(snapshot))
+            .or(snapshot.device_free_memory_bytes);
+        match pool {
+            Some(pool) => GLM_ADMISSION_SAFETY_BYTES.min(pool / 20),
+            None => GLM_ADMISSION_SAFETY_BYTES,
+        }
+    }
+
     pub fn validate_capacity(
         &self,
         resident_static: bool,
@@ -677,7 +710,10 @@ impl GlmAdmissionBreakdown {
         // discrete checks is unsafe only when the pool is known shared, and
         // legacy records predate unified support entirely.
         let unified_pool = snapshot.unified_pool_available_bytes();
-        for phase in self.phases(resident_static, expert_cache_bytes, cache_policy)? {
+        let safety = Self::scaled_admission_safety_bytes(snapshot);
+        for phase in
+            self.phases_with_safety(resident_static, expert_cache_bytes, cache_policy, safety)?
+        {
             let host_peak = phase.host_peak_bytes()?;
             let device_peak = phase.device_peak_bytes()?;
             if let Some(pool) = unified_pool {
@@ -1060,6 +1096,27 @@ mod tests {
             &unified(Some(true), host_peak + device_peak),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn safety_reserve_scales_down_on_small_pools_and_never_up() {
+        // Discrete workstation: the declared 1 GiB is under pool/20 there.
+        assert_eq!(
+            GlmAdmissionBreakdown::scaled_admission_safety_bytes(&snapshot(
+                62 << 30,
+                u64::MAX,
+                Some(24 << 30)
+            )),
+            GLM_ADMISSION_SAFETY_BYTES
+        );
+        // Small unified pool: 5% of it, and never above the constant.
+        let small = ResourceSnapshot {
+            host_device_memory_is_unified: Some(true),
+            ..snapshot(6272 << 20, u64::MAX, Some(6272 << 20))
+        };
+        let scaled = GlmAdmissionBreakdown::scaled_admission_safety_bytes(&small);
+        assert_eq!(scaled, (6272u64 << 20) / 20);
+        assert!(scaled < GLM_ADMISSION_SAFETY_BYTES);
     }
 
     #[test]

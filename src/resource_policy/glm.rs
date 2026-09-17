@@ -140,7 +140,14 @@ pub fn select(
             };
             let reserve = (1_u64 << 30).max(host / 20);
             if breakdown
-                .phases(candidate.resident_static, expert_bytes, cache)?
+                .phases_with_safety(
+                    candidate.resident_static,
+                    expert_bytes,
+                    cache,
+                    crate::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(
+                        snapshot,
+                    ),
+                )?
                 .iter()
                 .any(|p| {
                     let peak = match p.host_peak_bytes() {
@@ -231,7 +238,14 @@ pub fn select(
                     continue;
                 }
             }
-            let phases = breakdown.phases(candidate.resident_static, expert_bytes, cache)?;
+            let phases = breakdown.phases_with_safety(
+                candidate.resident_static,
+                expert_bytes,
+                cache,
+                crate::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(
+                    snapshot,
+                ),
+            )?;
             let host_peak = phases
                 .iter()
                 .map(|p| p.host_peak_bytes())
@@ -337,6 +351,14 @@ pub fn select(
                     policy.dsa_context_bound_tokens as u64,
                 ),
                 ("refused".into(), u64::from(refused)),
+                // The reserve actually applied, after pool scaling — the
+                // calibration reader needs the number, not the rule.
+                (
+                    "admission_safety_bytes_applied".into(),
+                    crate::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(
+                        snapshot,
+                    ),
+                ),
             ]),
             axes,
             candidates: observations,
@@ -354,10 +376,11 @@ pub fn select(
                 origin: SelectionOrigin::Baseline,
             })
             .collect();
-        let refusal_phases = breakdown.phases(
+        let refusal_phases = breakdown.phases_with_safety(
             baseline.resident_static,
             usize::try_from(baseline.expert_cache.maximum_bound_bytes)?,
             cache_policy(baseline)?,
+            crate::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(snapshot),
         )?;
         let provenance =
             build_provenance(baseline, refusal_axes, refusal_phases, observations, true)?;
@@ -384,10 +407,11 @@ pub fn select(
             }
         })
         .collect();
-    let mut phases = breakdown.phases(
+    let mut phases = breakdown.phases_with_safety(
         policy.resident_static,
         usize::try_from(policy.expert_cache.maximum_bound_bytes)?,
         cache_policy(&policy)?,
+        crate::glm::admission::GlmAdmissionBreakdown::scaled_admission_safety_bytes(snapshot),
     )?;
     if policy.weights != baseline.weights {
         // The reserve is sized from the same pool view the admission check
