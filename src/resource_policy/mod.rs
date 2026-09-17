@@ -47,10 +47,25 @@ pub fn report_refusal(error: &anyhow::Error, sidecar: Option<&Path>) -> Option<S
             candidate.candidate_id, candidate.disposition, candidate.reason
         );
     }
-    if let Some(path) = sidecar
-        && let Err(error) = publish_selection(path, &refusal.provenance)
-    {
-        eprintln!("warning: failed to publish refusal resource selection: {error}");
+    if let Some(path) = sidecar {
+        // The destination's parent is created here rather than at each call
+        // site. `ArtifactStaging` canonicalizes it, so a run that is refused
+        // before it creates its own directory would otherwise lose the ledger
+        // to a warning — and every caller would have to remember the same
+        // step. Six call sites, one of which had it: that is a rule belonging
+        // in the operation, not in its callers.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "warning: cannot create {} for the refusal record: {error}",
+                parent.display()
+            );
+        }
+        if let Err(error) = publish_selection(path, &refusal.provenance) {
+            eprintln!("warning: failed to publish refusal resource selection: {error}");
+        }
     }
     Some(refusal.summary.clone())
 }

@@ -44,18 +44,15 @@ impl std::fmt::Display for PreflightCapacityRefusal {
 impl std::error::Error for PreflightCapacityRefusal {}
 const RESOURCE_REFUSAL_FILE: &str = "resource-refusal.json";
 
-/// Where a refusal ledger is published. A fresh run has no selection artifact
-/// yet, so the refusal takes the run's own path; a resumed run already holds
-/// the admitted provenance of the original attempt, and `ArtifactStaging`
-/// refuses to replace an existing destination — so the refusal goes beside it
-/// instead of being dropped, which is exactly the capacity-change case a resume
-/// is most likely to hit.
-fn refusal_artifact_path(output_dir: &Path, existing_run: bool) -> PathBuf {
-    output_dir.join(if existing_run {
-        RESOURCE_REFUSAL_FILE
-    } else {
-        RESOURCE_SELECTION_FILE
-    })
+/// Where a refusal ledger is published: always its own file, never the
+/// selection artifact. `ArtifactStaging` refuses to replace an existing
+/// destination, so sharing the path would lose a resumed run's refusal behind
+/// the admitted record of the original attempt — and, in the other direction,
+/// would leave a fresh run'"'"'s refusal occupying the path a successful retry then
+/// needs. A separate name removes both collisions and lets a refusal-only
+/// directory be recognised as retryable state.
+fn refusal_artifact_path(output_dir: &Path) -> PathBuf {
+    output_dir.join(RESOURCE_REFUSAL_FILE)
 }
 const CHECKPOINT_DIRECTORY: &str = "checkpoints";
 const STAGING_DIRECTORY: &str = "staging";
@@ -926,21 +923,13 @@ fn select_generation_resources(
     }) {
         Ok(selected) => selected,
         Err(error) => {
-            // Only a refusal that carries a ledger needs a home for it. An
+            // Only a refusal that carries a ledger names a destination: an
             // early bail — a zero budget, say — has nothing to publish, and a
-            // run that never started must leave no directory behind, which is
-            // what `ArtifactStaging` would otherwise require us to create.
+            // run that never started must leave no directory behind.
+            // `report_refusal` creates the parent when it does publish.
             let destination = error
                 .downcast_ref::<flyingfish::resource_policy::AdmissionRefused>()
-                .and_then(|_| {
-                    let parent = refusal_sidecar.parent()?;
-                    std::fs::create_dir_all(parent)
-                        .inspect_err(|error| {
-                            eprintln!("warning: cannot create {}: {error}", parent.display())
-                        })
-                        .ok()?;
-                    Some(refusal_sidecar)
-                });
+                .map(|_| refusal_sidecar);
             flyingfish::resource_policy::report_refusal(&error, destination);
             return Err(error);
         }
@@ -1704,7 +1693,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         &mut execution_policy,
         &mut policy_origin,
         GenerationResourceRequest {
-            refusal_sidecar: &refusal_artifact_path(&output_dir, existing_run),
+            refusal_sidecar: &refusal_artifact_path(&output_dir),
             model: &model,
             model_root_record: &model_root_record,
             device: &device,
@@ -1867,7 +1856,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
                         });
                     flyingfish::resource_policy::report_refusal(
                         &refusal,
-                        Some(&refusal_artifact_path(&output_dir, existing_run)),
+                        Some(&refusal_artifact_path(&output_dir)),
                     );
                     return Err(refusal);
                 }
@@ -2506,6 +2495,7 @@ fn validate_generation_directory_entries(directory: &Path) -> Result<()> {
         GENERATION_REQUEST_FILE,
         EXECUTION_POLICY_FILE,
         RESOURCE_SELECTION_FILE,
+        RESOURCE_REFUSAL_FILE,
         CHECKPOINT_DIRECTORY,
         STAGING_DIRECTORY,
         FINAL_LATENTS_FILE,
@@ -2619,14 +2609,23 @@ fn validate_staging_directory(staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A directory holding nothing but refusal diagnostics is a retryable state,
+/// not partial run state: admission rejected the request before anything was
+/// initialized, and the record was published precisely so the operator could
+/// read it, free memory and run the same command again. Requiring them to
+/// delete it first would make publishing the ledger a penalty.
 fn validate_empty_uninitialized_directory(output_dir: &Path) -> Result<()> {
-    anyhow::ensure!(
-        fs::read_dir(output_dir)
-            .with_context(|| format!("failed to read {}", output_dir.display()))?
-            .next()
-            .is_none(),
-        "generation directory has partial state without an initialization record"
-    );
+    for entry in fs::read_dir(output_dir)
+        .with_context(|| format!("failed to read {}", output_dir.display()))?
+    {
+        let name = entry
+            .with_context(|| format!("failed to read an entry of {}", output_dir.display()))?
+            .file_name();
+        anyhow::ensure!(
+            name == RESOURCE_REFUSAL_FILE,
+            "generation directory has partial state without an initialization record"
+        );
+    }
     Ok(())
 }
 
