@@ -359,12 +359,36 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
     resident_static = selection.policy.resident_static;
     let admission_snapshot =
         flyingfish::runtime::probe::ResourceSnapshot::capture(Some(prepared.device()));
-    breakdown.validate_capacity(
+    if let Err(error) = breakdown.validate_capacity(
         resident_static,
         usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
         selection.policy.cache_policy()?,
         &admission_snapshot,
-    )?;
+    ) {
+        // The capacity race this second snapshot exists to detect publishes its
+        // numbers like any other refusal. The selection record is already in
+        // hand, so it is marked refused and reported rather than returned bare:
+        // a refusal without its ledger cannot be calibrated against, and this is
+        // the one refusal that carries both snapshots.
+        let mut provenance = selection.provenance.clone();
+        provenance.final_admission_snapshot = Some(admission_snapshot);
+        provenance.workload.insert("refused".into(), 1);
+        for candidate in &mut provenance.candidates {
+            if candidate.disposition
+                == flyingfish::runtime::resource_selection::CandidateDisposition::Selected
+            {
+                candidate.disposition =
+                    flyingfish::runtime::resource_selection::CandidateDisposition::CapacityRejected;
+                candidate.reason = format!("refused by final admission: {error}");
+            }
+        }
+        let refusal = anyhow::Error::from(flyingfish::resource_policy::AdmissionRefused {
+            provenance,
+            summary: format!("GLM final admission refused: {error}"),
+        });
+        flyingfish::resource_policy::report_refusal(&refusal, resource_selection.as_deref());
+        return Err(refusal);
+    }
     selection.provenance.final_admission_snapshot = Some(admission_snapshot.clone());
     eprintln!(
         "GLM resource policy {:?}: {} candidates, static={}, expert cache={} bytes",
