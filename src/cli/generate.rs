@@ -1917,6 +1917,17 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
             &output_dir.join(RESOURCE_SELECTION_FILE),
             &selected.provenance,
         )?;
+        // An earlier attempt's refusal is superseded by this admission; leaving
+        // both would describe one run as refused and admitted at once.
+        let refusal = refusal_artifact_path(&output_dir);
+        if refusal.exists()
+            && let Err(error) = fs::remove_file(&refusal)
+        {
+            eprintln!(
+                "warning: cannot remove the superseded refusal {}: {error}",
+                refusal.display()
+            );
+        }
     }
 
     let weight_source = execution_policy.weight_source();
