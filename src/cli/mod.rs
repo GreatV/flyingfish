@@ -529,6 +529,7 @@ fn decide_auto_residency_with_required_memory(
             args,
             required_device_bytes,
             unified_host_bytes,
+            unified_share,
         );
     }
     let reserve = required_device_bytes
@@ -581,6 +582,7 @@ fn decide_residency_with_required_memory(
     args: DeviceCacheArgs,
     required_device_bytes: u64,
     unified_host_bytes: u64,
+    unified_share: u64,
 ) -> Result<DeviceCache> {
     use flyingfish::runtime::{probe::ResourceSnapshot, residency::decide_device_residency};
     let reserve = DEVICE_RESIDENCY_RESERVE_BYTES
@@ -596,7 +598,12 @@ fn decide_residency_with_required_memory(
     } else {
         reserve
     };
-    let decision = decide_device_residency(&snapshot, demands, reserve, args.authorization()?)?;
+    // The explicit ceiling is still clamped against the shared pool, so it is
+    // divided among concurrent callers exactly as the automatic path is.
+    let mut decision = decide_device_residency(&snapshot, demands, reserve, args.authorization()?)?;
+    if snapshot.unified_pool_available_bytes().is_some() {
+        decision.authorized_budget_bytes /= unified_share.max(1);
+    }
     if decision.authorized_budget_bytes > 0 {
         eprintln!(
             "device residency: {} MiB authorized, {}/{} phase working sets fit, {} MiB planned weight peak",
