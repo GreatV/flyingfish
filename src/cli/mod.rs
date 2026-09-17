@@ -532,8 +532,9 @@ fn decide_auto_residency_with_required_memory(
             unified_share,
         );
     }
+    // Each concurrent caller needs its own fixed margin, not one for the batch.
     let reserve = required_device_bytes
-        .checked_add(DEVICE_RESIDENCY_RESERVE_BYTES)
+        .checked_add(DEVICE_RESIDENCY_RESERVE_BYTES.saturating_mul(unified_share.max(1)))
         .context("device residency reserve overflow")?;
     // The same fold `decide_device_residency` applies; this automatic path is
     // the default for the generic adapters and had been left on the device view.
@@ -586,6 +587,7 @@ fn decide_residency_with_required_memory(
 ) -> Result<DeviceCache> {
     use flyingfish::runtime::{probe::ResourceSnapshot, residency::decide_device_residency};
     let reserve = DEVICE_RESIDENCY_RESERVE_BYTES
+        .saturating_mul(unified_share.max(1))
         .checked_add(required_device_bytes)
         .context("device residency reserve overflow")?;
     let snapshot = ResourceSnapshot::capture(Some(device));
@@ -598,12 +600,18 @@ fn decide_residency_with_required_memory(
     } else {
         reserve
     };
-    // The explicit ceiling is still clamped against the shared pool, so it is
-    // divided among concurrent callers exactly as the automatic path is.
-    let mut decision = decide_device_residency(&snapshot, demands, reserve, args.authorization()?)?;
-    if snapshot.unified_pool_available_bytes().is_some() {
-        decision.authorized_budget_bytes /= unified_share.max(1);
-    }
+    // The share is taken before planning, by withholding the other callers'
+    // portions as reserve: dividing the decision afterwards would leave a plan
+    // built against the whole remainder, selecting phases that can never be
+    // retained. The operator's own ceiling still clamps on top, so a ceiling
+    // that already fits the share is not reduced.
+    let reserve = match snapshot.unified_pool_available_bytes() {
+        Some(pool) if unified_share > 1 => {
+            pool.saturating_sub(pool.saturating_sub(reserve) / unified_share)
+        }
+        _ => reserve,
+    };
+    let decision = decide_device_residency(&snapshot, demands, reserve, args.authorization()?)?;
     if decision.authorized_budget_bytes > 0 {
         eprintln!(
             "device residency: {} MiB authorized, {}/{} phase working sets fit, {} MiB planned weight peak",
