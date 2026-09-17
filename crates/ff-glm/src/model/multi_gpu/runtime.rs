@@ -388,10 +388,15 @@ impl LayerPartitionedGlm {
             b.prefill_workspace_bytes = prefill::prefill_workspace_bytes(text, prompt_tokens)?;
             b.prefill_host_mask_bytes = crate::admission::host_mask_bytes(prompt_tokens, false)?;
             let rp = &self.policy.ranks[rank];
-            let mut phases = b.phases(
+            // Each rank is judged against its own device, so it also gets its
+            // own pool-scaled reserve. `phases` applies the flat declared
+            // constant, which on a sub-20 GiB device is a far larger share of
+            // the pool than the 5% single-GPU admission now keeps.
+            let mut phases = b.phases_with_safety(
                 rp.execution.resident_static,
                 worker.expert_cache_stats().max_bytes,
                 worker.weights.cache_policy(),
+                b.scaled_admission_safety_bytes(&snapshots[rank]),
             )?;
             let mut host_peak = 0;
             let mut retained = tensor_bytes(worker.static_weights.values())
