@@ -67,6 +67,10 @@ struct GlmAdmissionModel {
     /// readmission runs — the phase model charges it to prefill alone, and
     /// reserving it during decode shrinks the cache for bytes nobody holds.
     prefill_host_charge_bytes: usize,
+    /// Host-side pinned upload slots. Required by the batched-prefill guard,
+    /// which runs before the pool is created, and omitted afterwards because
+    /// the persistent pool is already in the snapshot the guard measures.
+    pinned_host_slot_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -518,6 +522,7 @@ impl PreparedGlm {
             safety_bytes: usize::try_from(breakdown.scaled_admission_safety_bytes(snapshot))?,
             unified_pool: snapshot.unified_pool_available_bytes().is_some(),
             prefill_host_charge_bytes: usize::try_from(breakdown.prefill_host_mask_bytes)?,
+            pinned_host_slot_bytes: usize::try_from(breakdown.pinned_transfer_bytes)?,
             host_charge_bytes: usize::try_from(
                 breakdown
                     .host_route_workspace_bytes
@@ -534,13 +539,12 @@ impl PreparedGlm {
                             breakdown.streamed_load_host_bytes
                         })
                     })
-                    // Pinned upload slots are charged to both axes and the
-                    // fill-ahead ring to the host; both are allocated lazily,
-                    // after the first batched-prefill guard runs, and only the
-                    // device side of the slots reaches
-                    // `weight_load_staging_bytes`. Under the fold the host side
-                    // draws from the same pool and must be required here.
-                    .and_then(|n| n.checked_add(breakdown.pinned_transfer_bytes))
+                    // The fill-ahead ring is allocated per transfer, so it is
+                    // future headroom at every boundary. The upload slots are
+                    // not: the first expert forward stores the `WeightPool` in
+                    // a `OnceLock`, after which they are already resident and
+                    // counted by the snapshot — charging them again at each
+                    // readmission reserves the same bytes twice.
                     .and_then(|n| n.checked_add(breakdown.pinned_fill_ahead_bytes))
                     .context("GLM unified host charge overflow")?,
             )?,
@@ -2972,6 +2976,7 @@ mod tests {
             unified_pool: false,
             host_charge_bytes: 0,
             prefill_host_charge_bytes: 0,
+            pinned_host_slot_bytes: 0,
         };
         let cache = ExpertCacheStats {
             bytes: 60,

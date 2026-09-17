@@ -60,10 +60,17 @@ impl StreamedGlm {
             } else {
                 0
             },
-            // This guard is the prefill boundary, so the routing mask it is
-            // about to allocate is charged here even though decode is not.
+            // This guard is the prefill boundary, so the routing mask and the
+            // pinned upload slots it is about to allocate are charged here.
+            // Cache readmission omits both: by then the mask is dropped and the
+            // slots are resident in the pool the snapshot already measures.
             if admission.unified_pool {
                 admission.prefill_host_charge_bytes
+            } else {
+                0
+            },
+            if admission.unified_pool {
+                admission.pinned_host_slot_bytes
             } else {
                 0
             },
