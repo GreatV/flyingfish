@@ -216,12 +216,46 @@ pub(super) fn validate_snapshot_backend(
     fingerprint: &HardwareFingerprint,
 ) -> Result<()> {
     match fingerprint.backend {
-        DeviceBackend::Cpu | DeviceBackend::Metal => anyhow::ensure!(
-            snapshot.device_free_memory_bytes.is_none(),
-            "calibration {label} snapshot cannot report device-free memory for the {:?} backend",
-            fingerprint.backend
-        ),
+        DeviceBackend::Cpu | DeviceBackend::Metal => {
+            anyhow::ensure!(
+                snapshot.device_free_memory_bytes.is_none(),
+                "calibration {label} snapshot cannot report device-free memory for the {:?} backend",
+                fingerprint.backend
+            );
+            // The topology probe and the device total come from the CUDA
+            // driver, so a non-CUDA trial claiming either describes a machine
+            // that cannot exist. These fields now decide reserve scaling, so an
+            // impossible snapshot would corrupt the calibration they feed.
+            anyhow::ensure!(
+                snapshot.host_device_memory_is_unified.is_none(),
+                "calibration {label} snapshot cannot report a host/device topology for the {:?} backend",
+                fingerprint.backend
+            );
+            anyhow::ensure!(
+                snapshot.device_total_memory_bytes.is_none(),
+                "calibration {label} snapshot cannot report device total memory for the {:?} backend",
+                fingerprint.backend
+            );
+        }
         DeviceBackend::Cuda => {
+            if let Some(total) = snapshot.device_total_memory_bytes {
+                // The fingerprint total is the stable hardware figure; a
+                // snapshot total that disagrees with it, or that its own free
+                // measurement exceeds, is not a reading of this machine.
+                let fingerprint_total = fingerprint.device_total_memory_bytes.context(
+                    "CUDA calibration snapshot reports device total memory without a fingerprint total",
+                )?;
+                anyhow::ensure!(
+                    total == fingerprint_total,
+                    "calibration {label} snapshot device total memory disagrees with the fingerprint"
+                );
+                if let Some(free_bytes) = snapshot.device_free_memory_bytes {
+                    anyhow::ensure!(
+                        free_bytes <= total,
+                        "calibration {label} snapshot device-free memory exceeds its own total"
+                    );
+                }
+            }
             if let Some(free_bytes) = snapshot.device_free_memory_bytes {
                 let total_bytes = fingerprint.device_total_memory_bytes.context(
                     "CUDA calibration snapshot reports free memory without fingerprint total memory",
