@@ -414,8 +414,17 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
             }));
             if !row.qualifies()
                 || row.observed_peak_deltas.is_none_or(|(h, d)| {
+                    // `device_memory_is_host` now marks two different things:
+                    // the host-only CPU path, where a device observation cannot
+                    // belong to the trial at all, and the unified fold, where a
+                    // real CUDA device records one and both axes draw from the
+                    // same pool. Rejecting the fold for merely having a device
+                    // delta marks every qualified CUDA candidate a regression.
+                    let unified = request.snapshot.host_device_memory_is_unified == Some(true);
                     h > host
-                        || if request.assumptions.device_memory_is_host {
+                        || if unified {
+                            d.is_none_or(|d| h.saturating_add(d) > host)
+                        } else if request.assumptions.device_memory_is_host {
                             d.is_some()
                         } else {
                             d.is_none_or(|d| d > device)
