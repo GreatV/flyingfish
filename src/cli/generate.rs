@@ -1917,8 +1917,9 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
             &output_dir.join(RESOURCE_SELECTION_FILE),
             &selected.provenance,
         )?;
-        // An earlier attempt's refusal is superseded by this admission; leaving
-        // both would describe one run as refused and admitted at once.
+        // This run's refusal lives at a fixed name in the directory rather than
+        // beside the selection file, so it is cleared here; the shared rule in
+        // `publish_selection` covers the sibling-path callers.
         let refusal = refusal_artifact_path(&output_dir);
         if refusal.exists()
             && let Err(error) = fs::remove_file(&refusal)

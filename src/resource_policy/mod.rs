@@ -12,6 +12,25 @@ pub fn publish_selection(path: &Path, record: &ResourceSelectionProvenance) -> R
     let staging = ArtifactStaging::new(path)?;
     staging.write_bytes(&bytes)?;
     staging.publish()?;
+    // An admitted selection supersedes an earlier attempt's refusal beside it;
+    // keeping both would describe one run as refused and admitted at once.
+    let refusal = refusal_path_for(path);
+    if refusal.exists()
+        && std::fs::read(&refusal)
+            .ok()
+            .and_then(|bytes| ResourceSelectionProvenance::from_json(&bytes).ok())
+            .is_some_and(|existing| {
+                existing.is_refusal()
+                    && existing.request == record.request
+                    && existing.model == record.model
+            })
+        && let Err(error) = std::fs::remove_file(&refusal)
+    {
+        eprintln!(
+            "warning: cannot remove the superseded refusal {}: {error}",
+            refusal.display()
+        );
+    }
     Ok(())
 }
 
