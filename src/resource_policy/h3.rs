@@ -94,15 +94,22 @@ pub fn automatic_device_cache(
     }))
 }
 
+/// Record the budget a boundary was judged against. `refused` selects the
+/// refusal ledger: the peaks are known to exceed the budget — that is why the
+/// refusal happened — so the admitted-peak invariant must not be applied, and
+/// the overshoot is recorded as a shortfall instead of a remainder. Applying
+/// the invariant here would replace `AdmissionRefused` with a generic error and
+/// lose the candidate ledger the refusal exists to publish.
 fn record_budget(
     record: &mut ResourceSelectionProvenance,
     boundary: &str,
     budget: ResourceBudget,
     host_peak: u64,
     compute_peak: u64,
+    refused: bool,
 ) -> Result<()> {
     ensure!(
-        budget.check_peaks(host_peak, compute_peak).within_budget,
+        refused || budget.check_peaks(host_peak, compute_peak).within_budget,
         "recorded H3 admission budget is below its peak"
     );
     record.workload.insert("budget_record_version".into(), 1);
@@ -118,16 +125,24 @@ fn record_budget(
         );
         record.workload.remove(&format!("{prefix}_budget_bytes"));
         record.workload.remove(&format!("{prefix}_remaining_bytes"));
+        record.workload.remove(&format!("{prefix}_shortfall_bytes"));
         if let Some(limit) = limit {
-            let remaining = limit
-                .checked_sub(peak)
-                .context("recorded H3 admission budget is below its peak")?;
             record
                 .workload
                 .insert(format!("{prefix}_budget_bytes"), limit);
-            record
-                .workload
-                .insert(format!("{prefix}_remaining_bytes"), remaining);
+            match limit.checked_sub(peak) {
+                Some(remaining) => {
+                    record
+                        .workload
+                        .insert(format!("{prefix}_remaining_bytes"), remaining);
+                }
+                None => {
+                    ensure!(refused, "recorded H3 admission budget is below its peak");
+                    record
+                        .workload
+                        .insert(format!("{prefix}_shortfall_bytes"), peak - limit);
+                }
+            }
         }
     }
     Ok(())
@@ -142,7 +157,14 @@ pub fn record_final_admission(
     host_peak: u64,
     compute_peak: u64,
 ) -> Result<()> {
-    record_budget(record, "final_admission", budget, host_peak, compute_peak)?;
+    record_budget(
+        record,
+        "final_admission",
+        budget,
+        host_peak,
+        compute_peak,
+        false,
+    )?;
     record.final_admission_snapshot = Some(snapshot);
     Ok(())
 }
@@ -559,7 +581,14 @@ fn build_provenance(
         axes: selected_axes,
         candidates: observations,
     };
-    record_budget(&mut provenance, "selection", request.budget, host, device)?;
+    record_budget(
+        &mut provenance,
+        "selection",
+        request.budget,
+        host,
+        device,
+        refused,
+    )?;
     provenance.validate()?;
     Ok(provenance)
 }
@@ -716,6 +745,53 @@ mod tests {
             additional_host_allowance_bytes: 0,
         })
     }
+    #[test]
+    fn refusal_publishes_its_ledger_instead_of_a_budget_recording_error() {
+        // A budget below the baseline peak is the ordinary reason selection
+        // refuses. The refusal must still reach `AdmissionRefused` carrying the
+        // candidate ledger: recording the budget must not apply the invariant
+        // that peaks fit, since the whole point is that they do not.
+        let error = run_with_budget(
+            &baseline(),
+            None,
+            None,
+            0,
+            ResourceBudget {
+                max_host_bytes: Some(1),
+                max_device_bytes: Some(1),
+            },
+        )
+        .err()
+        .expect("a budget below the baseline peak must refuse");
+        let refusal = error
+            .downcast_ref::<super::super::AdmissionRefused>()
+            .expect("refusal must carry its record, not a budget-recording error");
+        assert_eq!(refusal.provenance.workload.get("refused"), Some(&1));
+        assert!(!refusal.provenance.candidates.is_empty());
+        assert!(
+            refusal
+                .provenance
+                .candidates
+                .iter()
+                .all(|c| c.disposition != CandidateDisposition::Selected)
+        );
+        // The overshoot is recorded as a shortfall, where an admitted record
+        // would carry a remainder.
+        assert!(
+            refusal
+                .provenance
+                .workload
+                .contains_key("selection_host_shortfall_bytes")
+        );
+        assert!(
+            !refusal
+                .provenance
+                .workload
+                .contains_key("selection_host_remaining_bytes")
+        );
+        refusal.provenance.validate().unwrap();
+    }
+
     #[test]
     fn explicit_device_retention_is_charged_before_admission_and_not_auto_enabled() {
         let base = baseline();
