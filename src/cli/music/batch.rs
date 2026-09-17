@@ -123,6 +123,11 @@ pub(super) fn run(args: Args) -> Result<()> {
     let cancelled = AtomicBool::new(false);
     let completions = Mutex::new(Vec::<Completion>::new());
     let started = Instant::now();
+    // Every worker holds a frame stack at once, and on a shared pool they all
+    // come from the same memory, so each reserves the concurrent sum rather
+    // than its own. Discrete workers are unaffected: the reserve only applies
+    // under the fold.
+    let concurrent_workers = args.devices.len().min(requests.len()).max(1) as u64;
     let worker_errors = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for name in args.devices.iter().take(requests.len()) {
@@ -163,7 +168,7 @@ pub(super) fn run(args: Args) -> Result<()> {
                         &device,
                         args.device_cache,
                         reserve,
-                        host_reserve,
+                        host_reserve.saturating_mul(concurrent_workers),
                     )?)?;
                     while !cancelled.load(Ordering::Acquire) {
                         let index = next.fetch_add(1, Ordering::Relaxed);
