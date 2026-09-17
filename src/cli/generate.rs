@@ -1910,16 +1910,15 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         )?;
     }
 
-    if recorded_initialization.is_none()
-        && let Some(selected) = &resource_selection
-    {
-        flyingfish::resource_policy::publish_selection(
-            &output_dir.join(RESOURCE_SELECTION_FILE),
-            &selected.provenance,
-        )?;
-        // This run's refusal lives at a fixed name in the directory rather than
-        // beside the selection file, so it is cleared here, under the same
-        // ownership rule `publish_selection` applies to sibling paths.
+    if let Some(selected) = &resource_selection {
+        if recorded_initialization.is_none() {
+            flyingfish::resource_policy::publish_selection(
+                &output_dir.join(RESOURCE_SELECTION_FILE),
+                &selected.provenance,
+            )?;
+        }
+        // Outside the fresh-run branch: a resume that first refused and then
+        // succeeded leaves the same stale record beside its original selection.
         flyingfish::resource_policy::remove_superseded_refusal(
             &refusal_artifact_path(&output_dir),
             &selected.provenance,
