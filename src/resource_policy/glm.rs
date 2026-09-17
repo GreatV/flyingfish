@@ -288,8 +288,13 @@ pub fn select(
             };
             if row.observed_peak_deltas.is_none_or(|(host, device)| {
                 if let Some(bound) = combined_peak {
+                    // A missing device observation is not a zero one; the H3
+                    // fold rejects it and so does this.
+                    let Some(device) = device else {
+                        return true;
+                    };
                     return host
-                        .checked_add(device.unwrap_or(0))
+                        .checked_add(device)
                         .is_none_or(|combined| combined > bound);
                 }
                 host > host_peak
@@ -525,6 +530,7 @@ mod tests {
             cpu_fp8_dequantization: false,
             pinned_transfer_bytes: 0,
             pinned_fill_ahead_bytes: 0,
+            concurrent_loads: 0,
             static_load_device_bytes: 0,
             expert_load_device_bytes: 0,
             compute_on_host: true,
