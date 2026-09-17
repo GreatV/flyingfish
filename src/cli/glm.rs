@@ -373,7 +373,20 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
     ) {
         // The capacity race this second snapshot detects publishes its ledger
         // like any other refusal; it is the one that carries both snapshots.
+        // Rebuilt from the final snapshot: `validate_capacity` scales its
+        // reserve from that snapshot's pool, so selection-time phases and
+        // applied reserve cannot reproduce the check that rejected the run.
         let mut provenance = selection.provenance.clone();
+        let final_safety = breakdown.scaled_admission_safety_bytes(&admission_snapshot);
+        provenance.phases = breakdown.phases_with_safety(
+            resident_static,
+            usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
+            selection.policy.cache_policy()?,
+            final_safety,
+        )?;
+        provenance
+            .workload
+            .insert("admission_safety_bytes_applied".into(), final_safety);
         provenance.final_admission_snapshot = Some(admission_snapshot);
         provenance.workload.insert("refused".into(), 1);
         for candidate in &mut provenance.candidates {
@@ -398,6 +411,19 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         );
         return Err(refusal);
     }
+    // The admitted record is rebuilt from the same snapshot for the same
+    // reason: what it reports must be what the final check actually applied.
+    let final_safety = breakdown.scaled_admission_safety_bytes(&admission_snapshot);
+    selection.provenance.phases = breakdown.phases_with_safety(
+        resident_static,
+        usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
+        selection.policy.cache_policy()?,
+        final_safety,
+    )?;
+    selection
+        .provenance
+        .workload
+        .insert("admission_safety_bytes_applied".into(), final_safety);
     selection.provenance.final_admission_snapshot = Some(admission_snapshot.clone());
     eprintln!(
         "GLM resource policy {:?}: {} candidates, static={}, expert cache={} bytes",
