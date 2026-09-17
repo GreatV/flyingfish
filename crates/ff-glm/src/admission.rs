@@ -647,31 +647,29 @@ impl GlmAdmissionBreakdown {
         let Some(free) = unified_pool.or(snapshot.device_free_memory_bytes) else {
             return Ok(0);
         };
+        // Under the unified fold both axes of one phase draw from the pool at
+        // the same time, so the binding charge is the largest per-phase *sum*.
+        // Maximising each axis independently and adding the two results charges
+        // a combination no phase ever reaches — a host-heavy runtime phase plus
+        // a device-heavy initialization phase — which needlessly shrinks or
+        // disables the cache. This mirrors `validate_capacity`, which checks the
+        // same per-phase sum.
         let required = phases.iter().try_fold(0u64, |peak, phase| {
-            Ok::<_, anyhow::Error>(
-                peak.max(
-                    phase
-                        .required_device_bytes
-                        .unwrap_or(0)
-                        .checked_add(phase.device_reserve_bytes)
-                        .context("GLM automatic cache reserve overflow")?,
-                ),
-            )
+            let device = phase
+                .required_device_bytes
+                .unwrap_or(0)
+                .checked_add(phase.device_reserve_bytes)
+                .context("GLM automatic cache reserve overflow")?;
+            let charge = if unified_pool.is_some() {
+                device
+                    .checked_add(phase.host_peak_bytes()?)
+                    .context("GLM automatic cache unified charge overflow")?
+            } else {
+                device
+            };
+            Ok::<_, anyhow::Error>(peak.max(charge))
         })?;
-        // Host charges share the unified pool; the largest phase host peak
-        // (required plus optional retention, same ledger validate_capacity
-        // charges) is not available for device retention either.
-        let host_required = if unified_pool.is_some() {
-            phases.iter().try_fold(0u64, |peak, phase| {
-                Ok::<_, anyhow::Error>(peak.max(phase.host_peak_bytes()?))
-            })?
-        } else {
-            0
-        };
-        let available = free
-            .saturating_sub(required)
-            .saturating_sub(host_required)
-            .saturating_sub(1 << 30);
+        let available = free.saturating_sub(required).saturating_sub(1 << 30);
         let available = available / (1 << 20) * (1 << 20);
         let all_experts = (self.live_expert_bytes as u64 / 5)
             .checked_mul(3)
@@ -1295,10 +1293,46 @@ mod tests {
             .automatic_expert_cache_bytes(&phases, &unified_snapshot)
             .unwrap();
         let pool = 8u64 << 30; // min(host, cgroup, device) views
-        let expected_unified =
-            (pool - device_required - host_required - (1 << 30)) / (1 << 20) * (1 << 20);
+        // The binding charge is the largest per-phase sum. In this fixture both
+        // maxima fall in the same phase, so it coincides with the sum of the two
+        // independent maxima — which is why this fixture alone cannot tell the
+        // two formulas apart, and why the phases below are hand-built.
+        let combined = phases
+            .iter()
+            .map(|p| {
+                p.host_peak_bytes().unwrap()
+                    + p.required_device_bytes.unwrap_or(0)
+                    + p.device_reserve_bytes
+            })
+            .max()
+            .unwrap();
+        assert_eq!(combined, device_required + host_required);
+        let expected_unified = (pool - combined - (1 << 30)) / (1 << 20) * (1 << 20);
         assert_eq!(unified as u64, expected_unified);
         assert!(unified < discrete);
+
+        // Maxima in *different* phases: charging max(host) + max(device) would
+        // reserve 6 GiB, a combination neither phase reaches, where the largest
+        // per-phase sum is 4 GiB.
+        let split = |phase: &str, host: u64, device: u64| ResourcePhaseEstimate {
+            phase: phase.into(),
+            required_host_bytes: host,
+            optional_host_bytes: 0,
+            reclaimable_host_bytes: 0,
+            host_promotion_reserve_bytes: 0,
+            required_device_bytes: Some(device),
+            optional_device_bytes: Some(0),
+            device_reserve_bytes: 0,
+        };
+        let skewed = vec![
+            split("prefill", 3 << 30, 1 << 30),
+            split("decode", 1 << 30, 3 << 30),
+        ];
+        let sized = breakdown
+            .automatic_expert_cache_bytes(&skewed, &unified_snapshot)
+            .unwrap() as u64;
+        assert_eq!(sized, pool - (4 << 30) - (1 << 30));
+        assert!(sized > pool - (6 << 30) - (1 << 30));
     }
 
     #[test]
