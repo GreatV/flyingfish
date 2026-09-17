@@ -269,7 +269,38 @@ pub fn select(
                 .into_iter()
                 .flatten()
                 .max();
+            // Under the fold both observed deltas draw from one pool, so the
+            // ceiling is the largest per-phase combined charge and the trial is
+            // judged on host + device together. Maximising the two axes
+            // independently admits a trial whose shared-pool usage exceeds
+            // anything `validate_capacity` modelled. This mirrors the unified
+            // H3 evidence path.
+            let combined_peak = if snapshot.unified_pool_available_bytes().is_some() {
+                Some(
+                    phases
+                        .iter()
+                        .map(|p| {
+                            p.host_peak_bytes()?
+                                .checked_add(p.reclaimable_host_bytes)
+                                .and_then(|n| {
+                                    n.checked_add(p.device_peak_bytes().ok()?.unwrap_or(0))
+                                })
+                                .context("GLM unified evidence bound overflow")
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .max()
+                        .unwrap_or(0),
+                )
+            } else {
+                None
+            };
             if row.observed_peak_deltas.is_none_or(|(host, device)| {
+                if let Some(bound) = combined_peak {
+                    return host
+                        .checked_add(device.unwrap_or(0))
+                        .is_none_or(|combined| combined > bound);
+                }
                 host > host_peak
                     || match (device, device_peak) {
                         (Some(d), Some(bound)) => d > bound,
