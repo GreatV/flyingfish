@@ -82,20 +82,20 @@ impl GlmPartitionAdmission {
                 "rank retained credit exceeds its declared storage"
             );
             let mut host_peak = 0;
+            // Phases are mutually exclusive, so a rank contributes its peak; the
+            // ranks run together, so those peaks are what get summed.
+            let mut rank_unified_peak = 0u64;
             for phase in &record.phases {
                 host_peak = host_peak.max(phase.host_peak_bytes()?);
                 let total = phase
                     .device_peak_bytes()?
                     .context("missing rank device bound")?;
                 let required = total.saturating_sub(record.already_resident_device_bytes);
-                // Integrated ranks are accumulated and checked together after
-                // the loop: each one's device allocations and every rank's host
-                // allocations draw from the same pool, so per-rank checks admit
-                // a combination the pool cannot hold.
+                // Integrated ranks are checked together after the loop: their
+                // device allocations and every rank's host allocations draw from
+                // one pool, so per-rank checks admit a combination it cannot hold.
                 if let Some(pool) = snapshot.unified_pool_available_bytes() {
-                    unified_device_sum = unified_device_sum
-                        .checked_add(required)
-                        .context("partition unified device sum overflow")?;
+                    rank_unified_peak = rank_unified_peak.max(required);
                     unified_pool =
                         Some(unified_pool.map_or(pool, |current: u64| current.min(pool)));
                     continue;
@@ -116,6 +116,9 @@ impl GlmPartitionAdmission {
             host_sum = host_sum
                 .checked_add(host_peak)
                 .context("partition host peak overflow")?;
+            unified_device_sum = unified_device_sum
+                .checked_add(rank_unified_peak)
+                .context("partition unified device sum overflow")?;
         }
         ensure!(
             host_sum == self.required_host_bytes,
