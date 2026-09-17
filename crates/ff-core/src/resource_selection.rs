@@ -279,6 +279,14 @@ impl ResourceSelectionProvenance {
         Ok(())
     }
 
+    /// Whether this record is a refusal rather than an admitted selection. A
+    /// refusal is still a well-formed, parseable artifact — that is the point
+    /// of publishing it — but it states that no policy passed admission, so it
+    /// must never stand in as the provenance of a run that produced output.
+    pub fn is_refusal(&self) -> bool {
+        self.workload.get("refused").copied().unwrap_or(0) == 1
+    }
+
     pub fn canonical_json(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)?;

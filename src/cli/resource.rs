@@ -255,13 +255,33 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
     } else {
         phase.device_peak_bytes()?.unwrap_or(0)
     };
-    anyhow::ensure!(
-        final_budget
-            .check_peaks(phase.host_peak_bytes()?, device_peak)
-            .within_budget,
-        "live H3 admission refused the unchanged selected policy"
-    );
     let host_peak = phase.host_peak_bytes()?;
+    if !final_budget
+        .check_peaks(host_peak, device_peak)
+        .within_budget
+    {
+        // The capacity race this second snapshot exists to detect publishes its
+        // ledger like any other refusal — a bare error leaves the caller's
+        // `report_refusal` with nothing to downcast, so the sidecar it promised
+        // is silently absent in exactly the case the snapshot was taken for.
+        let mut provenance = selection.provenance.clone();
+        provenance.final_admission_snapshot = Some(final_observation);
+        provenance.workload.insert("refused".into(), 1);
+        for candidate in &mut provenance.candidates {
+            if candidate.disposition
+                == flyingfish::runtime::resource_selection::CandidateDisposition::Selected
+            {
+                candidate.disposition =
+                    flyingfish::runtime::resource_selection::CandidateDisposition::CapacityRejected;
+                candidate.reason = "refused by final H3 admission".into();
+            }
+        }
+        return Err(flyingfish::resource_policy::AdmissionRefused {
+            provenance,
+            summary: "live H3 admission refused the unchanged selected policy".into(),
+        }
+        .into());
+    }
     flyingfish::resource_policy::h3::record_final_admission(
         &mut selection.provenance,
         final_observation,
@@ -369,6 +389,15 @@ pub(super) fn validate_recorded_selection(path: &Path, policy: &ExecutionPolicy)
     let record = flyingfish::runtime::resource_selection::ResourceSelectionProvenance::from_json(
         &bytes.bytes,
     )?;
+    // A refusal record parses and can bind to the same baseline policy, but it
+    // says that policy was never admitted. Accepting it here would let a resume
+    // continue from a checkpoint whose configuration has no evidence of ever
+    // having passed admission.
+    anyhow::ensure!(
+        !record.is_refusal(),
+        "recorded resource selection at {} is a refusal record, not an admitted selection",
+        path.display()
+    );
     record.validate_policy_binding(&serde_json::to_value(policy)?)
 }
 
