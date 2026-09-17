@@ -26,6 +26,21 @@ const GENERATION_INITIALIZATION_FILE: &str = "generation-initialization.json";
 const GENERATION_READY_FILE: &str = "generation-ready";
 const EXECUTION_POLICY_FILE: &str = "execution-policy.json";
 const RESOURCE_SELECTION_FILE: &str = "resource-selection.json";
+const RESOURCE_REFUSAL_FILE: &str = "resource-refusal.json";
+
+/// Where a refusal ledger is published. A fresh run has no selection artifact
+/// yet, so the refusal takes the run's own path; a resumed run already holds
+/// the admitted provenance of the original attempt, and `ArtifactStaging`
+/// refuses to replace an existing destination — so the refusal goes beside it
+/// instead of being dropped, which is exactly the capacity-change case a resume
+/// is most likely to hit.
+fn refusal_artifact_path(output_dir: &Path, existing_run: bool) -> PathBuf {
+    output_dir.join(if existing_run {
+        RESOURCE_REFUSAL_FILE
+    } else {
+        RESOURCE_SELECTION_FILE
+    })
+}
 const CHECKPOINT_DIRECTORY: &str = "checkpoints";
 const STAGING_DIRECTORY: &str = "staging";
 const FINAL_LATENTS_FILE: &str = "denoised-latents.safetensors";
@@ -1673,7 +1688,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         &mut execution_policy,
         &mut policy_origin,
         GenerationResourceRequest {
-            refusal_sidecar: &output_dir.join(RESOURCE_SELECTION_FILE),
+            refusal_sidecar: &refusal_artifact_path(&output_dir, existing_run),
             model: &model,
             model_root_record: &model_root_record,
             device: &device,
@@ -1806,7 +1821,40 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
             max_device_mib,
             backend_workspace_mib,
             &device,
-        )?;
+        );
+        let preflight = match preflight {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                // The second preflight is a final admission like the GLM and H3
+                // ones: when a selection exists it carries a complete candidate
+                // ledger, so a capacity change between selection and here is
+                // published rather than reduced to a message.
+                if let Some(selected) = resource_selection.as_ref() {
+                    let mut provenance = selected.provenance.clone();
+                    provenance.workload.insert("refused".into(), 1);
+                    for candidate in &mut provenance.candidates {
+                        if candidate.disposition
+                            == flyingfish::runtime::resource_selection::CandidateDisposition::Selected
+                        {
+                            candidate.disposition =
+                                flyingfish::runtime::resource_selection::CandidateDisposition::CapacityRejected;
+                            candidate.reason = format!("refused by generation preflight: {error}");
+                        }
+                    }
+                    let refusal =
+                        anyhow::Error::from(flyingfish::resource_policy::AdmissionRefused {
+                            provenance,
+                            summary: format!("generation preflight refused: {error}"),
+                        });
+                    flyingfish::resource_policy::report_refusal(
+                        &refusal,
+                        Some(&refusal_artifact_path(&output_dir, existing_run)),
+                    );
+                    return Err(refusal);
+                }
+                return Err(error);
+            }
+        };
         if let Some(selected) = resource_selection.as_mut() {
             flyingfish::resource_policy::h3::record_final_admission(
                 &mut selected.provenance,
