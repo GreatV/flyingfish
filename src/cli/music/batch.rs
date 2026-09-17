@@ -161,10 +161,6 @@ pub(super) fn run(args: Args) -> Result<()> {
                         DeviceCache::disabled(),
                     )?;
                     let demands = model.residency_demands(max_frames, max_steps, &device)?;
-                    let shared =
-                        flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device))
-                            .unified_pool_available_bytes()
-                            .is_some();
                     let (reserve, host_reserve) = requests.iter().try_fold(
                         (0u64, 0u64),
                         |(device, host), request| -> Result<_> {
@@ -184,13 +180,8 @@ pub(super) fn run(args: Args) -> Result<()> {
                         &demands,
                         &device,
                         args.device_cache,
-                        // Aggregates apply only to a worker that actually
-                        // shares the pool; a discrete one reserves its own.
-                        if shared {
-                            reserve.saturating_mul(unified_workers)
-                        } else {
-                            reserve
-                        },
+                        reserve,
+                        // Every worker holds a frame stack, discrete ones too.
                         host_reserve.saturating_mul(concurrent_workers),
                         unified_workers,
                     )?)?;

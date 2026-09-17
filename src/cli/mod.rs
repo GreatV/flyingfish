@@ -509,10 +509,12 @@ const DEVICE_RESIDENCY_RESERVE_BYTES: u64 = 1 << 30;
 
 /// Default CUDA placement for adapters with request tensor estimates. Explicit
 /// ceilings (including zero) and non-CUDA devices keep their existing behavior.
-/// `unified_host_bytes` is a host allocation the caller models separately, and
-/// `unified_share` is how many callers draw from the same pool at once. Both
-/// apply only under the fold; on discrete topology the axes are independent and
-/// each caller owns its device.
+/// `required_device_bytes` is one caller's device charge and is multiplied by
+/// `unified_share`, the number of callers drawing from this pool.
+/// `unified_host_bytes` is already the total across every concurrent host
+/// allocation, because those exist per caller whether or not the caller shares
+/// this pool — the two counts differ and only the caller knows the second. All
+/// of it applies under the fold alone.
 fn decide_auto_residency_with_required_memory(
     demands: &[flyingfish::runtime::residency::PhaseResidencyDemand],
     device: &candle_core::Device,
@@ -538,6 +540,7 @@ fn decide_auto_residency_with_required_memory(
     let shared = snapshot.unified_pool_available_bytes().is_some();
     let share = if shared { unified_share.max(1) } else { 1 };
     let reserve = required_device_bytes
+        .saturating_mul(share)
         .checked_add(DEVICE_RESIDENCY_RESERVE_BYTES.saturating_mul(share))
         .context("device residency reserve overflow")?;
     let capacity = if snapshot.unified_accounting_is_undecidable() {
@@ -587,7 +590,7 @@ fn decide_residency_with_required_memory(
     let share = if shared { unified_share.max(1) } else { 1 };
     let reserve = DEVICE_RESIDENCY_RESERVE_BYTES
         .saturating_mul(share)
-        .checked_add(required_device_bytes)
+        .checked_add(required_device_bytes.saturating_mul(share))
         .context("device residency reserve overflow")?;
     // An explicit ceiling is still clamped against the shared pool, so the
     // caller's separately modelled host allocation is reserved here too.
