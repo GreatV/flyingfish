@@ -509,11 +509,15 @@ const DEVICE_RESIDENCY_RESERVE_BYTES: u64 = 1 << 30;
 
 /// Default CUDA placement for adapters with request tensor estimates. Explicit
 /// ceilings (including zero) and non-CUDA devices keep their existing behavior.
+/// `unified_host_bytes` is a host allocation the caller models separately. It
+/// is reserved only under the fold, where it draws from the same pool as this
+/// cache; on discrete topology the two axes are independent.
 fn decide_auto_residency_with_required_memory(
     demands: &[flyingfish::runtime::residency::PhaseResidencyDemand],
     device: &candle_core::Device,
     args: DeviceCacheArgs,
     required_device_bytes: u64,
+    unified_host_bytes: u64,
 ) -> Result<DeviceCache> {
     use flyingfish::runtime::{probe::ResourceSnapshot, residency::plan_device_residency};
     if !device.is_cuda() || args.device_cache_mib.is_some() {
@@ -532,6 +536,13 @@ fn decide_auto_residency_with_required_memory(
             .unified_pool_available_bytes()
             .or(snapshot.device_free_memory_bytes)
             .unwrap_or(0)
+    };
+    let reserve = if snapshot.unified_pool_available_bytes().is_some() {
+        reserve
+            .checked_add(unified_host_bytes)
+            .context("unified host reserve overflow")?
+    } else {
+        reserve
     };
     let available = capacity.saturating_sub(reserve);
     let plan = plan_device_residency(demands, available, 0)?;
