@@ -12,26 +12,39 @@ pub fn publish_selection(path: &Path, record: &ResourceSelectionProvenance) -> R
     let staging = ArtifactStaging::new(path)?;
     staging.write_bytes(&bytes)?;
     staging.publish()?;
-    // An admitted selection supersedes an earlier attempt's refusal beside it;
-    // keeping both would describe one run as refused and admitted at once.
-    let refusal = refusal_path_for(path);
-    if refusal.exists()
-        && std::fs::read(&refusal)
-            .ok()
-            .and_then(|bytes| ResourceSelectionProvenance::from_json(&bytes).ok())
-            .is_some_and(|existing| {
-                existing.is_refusal()
-                    && existing.request == record.request
-                    && existing.model == record.model
-            })
-        && let Err(error) = std::fs::remove_file(&refusal)
-    {
+    remove_superseded_refusal(&refusal_path_for(path), record);
+    Ok(())
+}
+
+/// Remove an earlier attempt's refusal once this record is admitted: keeping
+/// both would describe one run as refused and admitted at once. Only this
+/// request's own refusal is removed — the reserved name can hold someone
+/// else's file, and a name is not ownership.
+pub fn remove_superseded_refusal(refusal: &Path, admitted: &ResourceSelectionProvenance) {
+    if !refusal.exists() {
+        return;
+    }
+    let owned = std::fs::read(refusal)
+        .ok()
+        .and_then(|bytes| ResourceSelectionProvenance::from_json(&bytes).ok())
+        .is_some_and(|existing| {
+            existing.is_refusal()
+                && existing.request == admitted.request
+                && existing.model == admitted.model
+        });
+    if !owned {
+        eprintln!(
+            "warning: {} is not this request's refusal record; leaving it in place",
+            refusal.display()
+        );
+        return;
+    }
+    if let Err(error) = std::fs::remove_file(refusal) {
         eprintln!(
             "warning: cannot remove the superseded refusal {}: {error}",
             refusal.display()
         );
     }
-    Ok(())
 }
 
 /// A resource-selection refusal carrying the complete record: every

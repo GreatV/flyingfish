@@ -1918,17 +1918,12 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
             &selected.provenance,
         )?;
         // This run's refusal lives at a fixed name in the directory rather than
-        // beside the selection file, so it is cleared here; the shared rule in
-        // `publish_selection` covers the sibling-path callers.
-        let refusal = refusal_artifact_path(&output_dir);
-        if refusal.exists()
-            && let Err(error) = fs::remove_file(&refusal)
-        {
-            eprintln!(
-                "warning: cannot remove the superseded refusal {}: {error}",
-                refusal.display()
-            );
-        }
+        // beside the selection file, so it is cleared here, under the same
+        // ownership rule `publish_selection` applies to sibling paths.
+        flyingfish::resource_policy::remove_superseded_refusal(
+            &refusal_artifact_path(&output_dir),
+            &selected.provenance,
+        );
     }
 
     let weight_source = execution_policy.weight_source();
