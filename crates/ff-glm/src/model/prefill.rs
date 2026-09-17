@@ -52,6 +52,14 @@ impl StreamedGlm {
             admission.weight_load_staging_bytes,
             additional_cache,
             admission.safety_bytes,
+            // Under the unified fold the host route/mask/staging allocations
+            // draw from the same pool as the device charges above, so they are
+            // required here too; on discrete topology they are a separate axis.
+            if admission.unified_pool {
+                admission.host_charge_bytes
+            } else {
+                0
+            },
         ]
         .into_iter()
         .try_fold(0usize, |sum, bytes| {
@@ -61,6 +69,8 @@ impl StreamedGlm {
         let snapshot = ResourceSnapshot::capture(Some(&self.device));
         let available = if self.device.is_cpu() {
             crate::admission::host_available(&snapshot)
+        } else if admission.unified_pool {
+            snapshot.unified_pool_available_bytes()
         } else {
             snapshot.device_free_memory_bytes
         }
