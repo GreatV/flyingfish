@@ -27,13 +27,21 @@ const GENERATION_READY_FILE: &str = "generation-ready";
 const EXECUTION_POLICY_FILE: &str = "execution-policy.json";
 const RESOURCE_SELECTION_FILE: &str = "resource-selection.json";
 
-/// A preflight rejected for capacity; only this becomes a refusal.
+/// A preflight rejected for capacity; only this becomes a refusal. It carries
+/// the observation that rejected the run, not just its text: a record naming
+/// the selection's older snapshot cannot reproduce the budget that refused.
 #[derive(Debug)]
-struct PreflightCapacityRefusal(String);
+struct PreflightCapacityRefusal {
+    message: String,
+    snapshot: ResourceSnapshot,
+    budget: ResourceBudget,
+    host_peak: u64,
+    device_peak: u64,
+}
 
 impl std::fmt::Display for PreflightCapacityRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -1821,11 +1829,19 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         let preflight = match preflight {
             Ok(preflight) => preflight,
             Err(error) => {
-                if error.downcast_ref::<PreflightCapacityRefusal>().is_none() {
+                let Some(refusal) = error.downcast_ref::<PreflightCapacityRefusal>() else {
                     return Err(error);
-                }
+                };
                 if let Some(selected) = resource_selection.as_ref() {
                     let mut provenance = selected.provenance.clone();
+                    flyingfish::resource_policy::h3::record_final_admission(
+                        &mut provenance,
+                        refusal.snapshot.clone(),
+                        refusal.budget,
+                        refusal.host_peak,
+                        refusal.device_peak,
+                    )
+                    .ok();
                     provenance.workload.insert("refused".into(), 1);
                     for candidate in &mut provenance.candidates {
                         if candidate.disposition
@@ -2176,9 +2192,15 @@ fn preflight_generation(
             })
             .collect::<Vec<_>>()
             .join("+");
-        return Err(PreflightCapacityRefusal(format!(
-            "generation preflight admission refused before any model tensor was materialized (binding budget: {binding}): {error}"
-        ))
+        return Err(PreflightCapacityRefusal {
+            message: format!(
+                "generation preflight admission refused before any model tensor was materialized (binding budget: {binding}): {error}"
+            ),
+            snapshot,
+            budget,
+            host_peak: estimate.peak_host_bytes,
+            device_peak: estimate.peak_device_bytes,
+        }
         .into());
     }
     Ok(GenerationPreflight {
