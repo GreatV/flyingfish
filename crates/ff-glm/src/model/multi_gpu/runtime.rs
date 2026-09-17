@@ -86,6 +86,27 @@ impl GlmPartitionAdmission {
                     .device_peak_bytes()?
                     .context("missing rank device bound")?;
                 let required = total.saturating_sub(record.already_resident_device_bytes);
+                // An integrated rank draws its device allocations from the same
+                // pool as every rank's host allocations, so the two axes cannot
+                // be checked against separate bounds there: 4 GiB on each would
+                // pass two 6 GiB checks while needing 8 GiB of one pool. The
+                // aggregate host requirement is charged alongside this rank's
+                // device requirement against the shared pool.
+                if let Some(pool) = snapshot.unified_pool_available_bytes() {
+                    let combined = required
+                        .checked_add(self.required_host_bytes)
+                        .context("partition unified peak overflow")?;
+                    ensure!(
+                        combined <= pool,
+                        "GLM rank {rank} {} needs {combined} bytes from the unified host/device pool, but only {pool} are available",
+                        phase.phase
+                    );
+                    continue;
+                }
+                ensure!(
+                    !snapshot.unified_pool_is_unmeasurable(),
+                    "GLM rank {rank} is an integrated device whose shared pool could not be measured"
+                );
                 let available = snapshot
                     .device_free_memory_bytes
                     .context("rank device memory unavailable")?;
