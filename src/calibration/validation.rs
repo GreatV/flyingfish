@@ -215,6 +215,26 @@ pub(super) fn validate_snapshot_backend(
     snapshot: &ResourceSnapshot,
     fingerprint: &HardwareFingerprint,
 ) -> Result<()> {
+    // The host total scales admission reserves exactly as the device total
+    // does, so it needs the same guards: availability cannot exceed it, and on
+    // a CPU fingerprint — whose `device_total_memory_bytes` is `MemTotal` —
+    // the two readings of the same physical memory must agree.
+    if let Some(total) = snapshot.host_memory_total_bytes {
+        if let Some(available) = snapshot.host_memory_available_bytes {
+            anyhow::ensure!(
+                available <= total,
+                "calibration {label} snapshot host-available memory exceeds its own total"
+            );
+        }
+        if fingerprint.backend == DeviceBackend::Cpu
+            && let Some(fingerprint_total) = fingerprint.device_total_memory_bytes
+        {
+            anyhow::ensure!(
+                total == fingerprint_total,
+                "calibration {label} snapshot host total memory disagrees with the CPU fingerprint"
+            );
+        }
+    }
     match fingerprint.backend {
         DeviceBackend::Cpu | DeviceBackend::Metal => {
             anyhow::ensure!(
