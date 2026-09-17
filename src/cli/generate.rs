@@ -3750,8 +3750,13 @@ mod tests {
         }
         // A probed unified pool binds the folded host bound, and an explicit
         // request is clamped the same way the device axis already is.
-        let folded =
-            probed_budget(&snapshot(Some(true)), ExecutionBackendPolicy::Cuda, None, None).unwrap();
+        let folded = probed_budget(
+            &snapshot(Some(true)),
+            ExecutionBackendPolicy::Cuda,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(folded.max_host_bytes, Some(6 * 1024 * 1024));
         let requested = probed_budget(
             &snapshot(Some(true)),
