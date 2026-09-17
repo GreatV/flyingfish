@@ -246,8 +246,7 @@ pub fn select(
                 breakdown.scaled_admission_safety_bytes(snapshot),
             )?;
             // The evidence is a process-RSS delta, which counts faulted
-            // mmap-backed pages, so the bound used for it adds reclaimable
-            // residency back. What admission charges is unchanged.
+            // mmap-backed pages, so this bound adds reclaimable residency back.
             let host_peak = phases
                 .iter()
                 .map(|p| {
@@ -266,8 +265,7 @@ pub fn select(
                 .into_iter()
                 .flatten()
                 .max();
-            // Under the fold both deltas draw from one pool, so the ceiling is
-            // the largest per-phase combined charge. Mirrors the H3 path.
+            // Under the fold both deltas draw from one pool.
             let combined_peak = if snapshot.unified_pool_available_bytes().is_some() {
                 Some(
                     phases
@@ -399,8 +397,7 @@ pub fn select(
         // A refusal must still ship its numbers: per-candidate dispositions
         // and the phase estimates they were judged against. The record names
         // the baseline (that is what was evaluated) and marks refused=1.
-        // Same rule as the admitted path; measured evidence cannot appear here
-        // because nothing was selected.
+        // Same rule as the admitted path; nothing was selected, so no evidence.
         let refusal_axes = baseline_axes
             .iter()
             .map(|(axis, value)| SelectedResourceAxis {

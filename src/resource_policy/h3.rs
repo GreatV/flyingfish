@@ -77,8 +77,7 @@ pub fn automatic_device_cache(
         return Ok(None);
     };
     // Under the fold every charge lands on the host axis, so `--max-host-mib`
-    // bounds this too; the retained policy replaces the baseline before
-    // selection, so over-sizing refuses the run rather than shrinking.
+    // bounds this too.
     let mut capacity = request.budget.max_device_bytes.unwrap_or(free).min(free);
     if unified_pool.is_some()
         && let Some(host_bound) = request.budget.max_host_bytes
@@ -106,9 +105,8 @@ pub fn automatic_device_cache(
     }))
 }
 
-/// Record the budget a boundary was judged against. `refused` selects the
-/// refusal ledger: the peaks are known to exceed it, so the admitted-peak
-/// invariant is skipped and the overshoot recorded as a shortfall.
+/// Record the budget a boundary was judged against. `refused` skips the
+/// admitted-peak invariant and records the overshoot as a shortfall.
 fn record_budget(
     record: &mut ResourceSelectionProvenance,
     boundary: &str,
@@ -408,9 +406,8 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
             }));
             if !row.qualifies()
                 || row.observed_peak_deltas.is_none_or(|(h, d)| {
-                    // `device_memory_is_host` marks two things: the CPU path,
-                    // where a device observation cannot belong to the trial, and
-                    // the fold, where a real device records one.
+                    // The flag marks two things: the CPU path, where a device
+                    // observation cannot belong to the trial, and the fold.
                     let unified = request.snapshot.host_device_memory_is_unified == Some(true);
                     h > host
                         || if unified {
@@ -763,10 +760,6 @@ mod tests {
     }
     #[test]
     fn refusal_publishes_its_ledger_instead_of_a_budget_recording_error() {
-        // A budget below the baseline peak is the ordinary reason selection
-        // refuses. The refusal must still reach `AdmissionRefused` carrying the
-        // candidate ledger: recording the budget must not apply the invariant
-        // that peaks fit, since the whole point is that they do not.
         let error = run_with_budget(
             &baseline(),
             None,
@@ -791,8 +784,6 @@ mod tests {
                 .iter()
                 .all(|c| c.disposition != CandidateDisposition::Selected)
         );
-        // The overshoot is recorded as a shortfall, where an admitted record
-        // would carry a remainder.
         assert!(
             refusal
                 .provenance

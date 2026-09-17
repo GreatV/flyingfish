@@ -27,8 +27,7 @@ const GENERATION_READY_FILE: &str = "generation-ready";
 const EXECUTION_POLICY_FILE: &str = "execution-policy.json";
 const RESOURCE_SELECTION_FILE: &str = "resource-selection.json";
 
-/// A preflight rejected for capacity, as distinct from the parse, metadata and
-/// backend failures the same function returns. Only this one becomes a refusal.
+/// A preflight rejected for capacity; only this becomes a refusal.
 #[derive(Debug)]
 struct PreflightCapacityRefusal(String);
 
@@ -785,9 +784,7 @@ fn report_weight_streaming_window(model_root: &Path) {
 /// These are the generation request's own terms, carried as one value so the
 /// planner's signature stays a signature rather than a list.
 struct GenerationResourceRequest<'a> {
-    /// Where a refusal publishes its candidate ledger. The run writes its
-    /// selection to this same path on success, so a rejected request is
-    /// diagnosable from the same artifact rather than from stderr alone.
+    /// Where a refusal publishes its candidate ledger.
     refusal_sidecar: &'a Path,
     model: &'a Path,
     model_root_record: &'a str,
@@ -920,8 +917,7 @@ fn select_generation_resources(
     }) {
         Ok(selected) => selected,
         Err(error) => {
-            // Only a refusal carrying a ledger names a destination; an early
-            // bail has nothing to publish and leaves no directory behind.
+            // An early bail has no ledger, and leaves no directory behind.
             let destination = error
                 .downcast_ref::<flyingfish::resource_policy::AdmissionRefused>()
                 .map(|_| refusal_sidecar);
@@ -1825,8 +1821,6 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         let preflight = match preflight {
             Ok(preflight) => preflight,
             Err(error) => {
-                // A final admission like the GLM and H3 ones: a capacity change
-                // since selection is published, not reduced to a message.
                 if error.downcast_ref::<PreflightCapacityRefusal>().is_none() {
                     return Err(error);
                 }
@@ -2110,10 +2104,8 @@ fn preflight_generation(
         max_host_mib,
         max_device_mib,
     )?;
-    // Selection promised the same reserve on the folded host axis; this
-    // preflight captures a fresh snapshot and becomes the final record. Charged
-    // on the budget side so it applies once here; unifying the two homes is the
-    // A7 follow-up in `docs/resource-ownership.md`.
+    // Selection promised this reserve on the folded host axis. Charged on the
+    // budget side so it applies once; unifying the two homes is an A7 follow-up.
     if snapshot.host_device_memory_is_unified == Some(true) {
         budget.max_host_bytes = Some(
             budget
@@ -2246,9 +2238,8 @@ pub(super) fn probed_budget(
         "generation preflight cannot measure available host memory; provide --max-host-mib explicitly",
     )?;
     // Under the fold the combined peak is charged against this one bound, and
-    // the host view alone can exceed the pool: CUDA free memory tracks MemFree
-    // while MemAvailable also counts reclaimable cache. Explicit
-    // `--max-host-mib` is clamped too, as the device axis already is.
+    // the host view alone can exceed the pool: CUDA free tracks MemFree while
+    // MemAvailable counts reclaimable cache.
     anyhow::ensure!(
         !snapshot.unified_accounting_is_undecidable(),
         "generation preflight needs the shared host/device pool size on a unified-memory device, \
@@ -2595,8 +2586,7 @@ fn validate_staging_directory(staging_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A directory holding only refusal diagnostics is retryable state, not partial
-/// run state: nothing was initialized, and the record exists to be read.
+/// A directory holding only refusal diagnostics is retryable, not partial.
 fn validate_empty_uninitialized_directory(output_dir: &Path) -> Result<()> {
     for entry in fs::read_dir(output_dir)
         .with_context(|| format!("failed to read {}", output_dir.display()))?
@@ -3797,8 +3787,6 @@ mod tests {
         let snapshot = |unified: Option<bool>| ResourceSnapshot {
             schema_version: flyingfish::runtime::probe::RESOURCE_SNAPSHOT_SCHEMA_VERSION,
             measured_at_unix_ms: 1,
-            // MemAvailable counts reclaimable page cache; CUDA free memory
-            // tracks MemFree. On a shared pool the larger view is not a bound.
             host_memory_available_bytes: Some(10 * 1024 * 1024),
             cgroup_v2_memory_limit: None,
             cgroup_v2_memory_current_bytes: None,
@@ -3814,14 +3802,11 @@ mod tests {
                 device_memory: None,
             },
         };
-        // Discrete and unprobed records keep the host view untouched.
         for legacy in [None, Some(false)] {
             let budget =
                 probed_budget(&snapshot(legacy), ExecutionBackendPolicy::Cuda, None, None).unwrap();
             assert_eq!(budget.max_host_bytes, Some(10 * 1024 * 1024));
         }
-        // A probed unified pool binds the folded host bound, and an explicit
-        // request is clamped the same way the device axis already is.
         let folded = probed_budget(
             &snapshot(Some(true)),
             ExecutionBackendPolicy::Cuda,
@@ -3838,8 +3823,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(requested.max_host_bytes, Some(6 * 1024 * 1024));
-        // A unified topology whose pool cannot be measured is refused, not
-        // quietly treated as a discrete device.
         let unmeasurable = ResourceSnapshot {
             device_free_memory_bytes: None,
             ..snapshot(Some(true))

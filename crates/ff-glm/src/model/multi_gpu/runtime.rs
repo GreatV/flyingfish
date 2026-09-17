@@ -86,12 +86,9 @@ impl GlmPartitionAdmission {
                     .device_peak_bytes()?
                     .context("missing rank device bound")?;
                 let required = total.saturating_sub(record.already_resident_device_bytes);
-                // An integrated rank draws its device allocations from the same
-                // pool as every rank's host allocations, so the two axes cannot
-                // be checked against separate bounds there: 4 GiB on each would
-                // pass two 6 GiB checks while needing 8 GiB of one pool. The
-                // aggregate host requirement is charged alongside this rank's
-                // device requirement against the shared pool.
+                // An integrated rank shares one pool with every rank's host
+                // allocations, so the aggregate host requirement is charged
+                // alongside this rank's device requirement.
                 if let Some(pool) = snapshot.unified_pool_available_bytes() {
                     let combined = required
                         .checked_add(self.required_host_bytes)
@@ -327,9 +324,7 @@ impl LayerPartitionedGlm {
             let admission = self.admission(prompt_tokens)?;
             for rank in 0..self.workers.len() {
                 let estimate = &admission.ranks[rank];
-                // Sized against the ledger the validator uses: on an
-                // integrated rank that is this rank's device requirement plus
-                // every rank's host requirement, not this rank's host peak.
+                // Sized against the ledger the validator uses.
                 let bytes = estimate
                     .breakdown
                     .automatic_expert_cache_bytes_against_host(
@@ -416,10 +411,8 @@ impl LayerPartitionedGlm {
             b.prefill_workspace_bytes = prefill::prefill_workspace_bytes(text, prompt_tokens)?;
             b.prefill_host_mask_bytes = crate::admission::host_mask_bytes(prompt_tokens, false)?;
             let rp = &self.policy.ranks[rank];
-            // Each rank is judged against its own device, so it also gets its
-            // own pool-scaled reserve. `phases` applies the flat declared
-            // constant, which on a sub-20 GiB device is a far larger share of
-            // the pool than the 5% single-GPU admission now keeps.
+            // Each rank is judged against its own device, so it gets its own
+            // pool-scaled reserve; `phases` would apply the flat constant.
             let mut phases = b.phases_with_safety(
                 rp.execution.resident_static,
                 worker.expert_cache_stats().max_bytes,

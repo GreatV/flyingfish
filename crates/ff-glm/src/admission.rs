@@ -478,8 +478,7 @@ impl GlmAdmissionBreakdown {
         // kernel-reclaimable, already counted as available in MemAvailable.
         // It is reported as `reclaimable_host_bytes` (telemetry) and never
         // charged in fit decisions; only exclusive allocations are.
-        // The largest shard header is realized as an owned Vec — an exclusive
-        // allocation, so it is charged as required, not reclaimable, bytes.
+        // The largest shard header is an owned Vec: required, not reclaimable.
         let header_copies =
             if cache_policy.granularity == ff_core::weights::CacheGranularity::Tensor {
                 self.raw_inventory
@@ -645,8 +644,7 @@ impl GlmAdmissionBreakdown {
     }
 
     /// `aggregate_host_bytes` replaces the phase's own host peak under the
-    /// fold, for callers whose validator charges a wider host ledger — the
-    /// partition path folds each rank's device peak against every rank's host.
+    /// fold, for callers whose validator charges a wider host ledger.
     pub fn automatic_expert_cache_bytes_against_host(
         &self,
         phases: &[ResourcePhaseEstimate],
@@ -668,9 +666,8 @@ impl GlmAdmissionBreakdown {
         let Some(free) = unified_pool.or(snapshot.device_free_memory_bytes) else {
             return Ok(0);
         };
-        // The binding charge is the largest per-phase sum: maximising each axis
-        // independently charges a combination no phase reaches. Mirrors
-        // `validate_capacity`.
+        // The binding charge is the largest per-phase sum, as in
+        // `validate_capacity`: maximising each axis charges a phantom phase.
         let required = phases.iter().try_fold(0u64, |peak, phase| {
             let device = phase
                 .required_device_bytes
@@ -690,9 +687,7 @@ impl GlmAdmissionBreakdown {
             };
             Ok::<_, anyhow::Error>(peak.max(charge))
         })?;
-        // Only the reserve the phases carry: `required` already includes each
-        // phase's `device_reserve_bytes`, so a second fixed gigabyte for the
-        // same purpose double-charged it, unscaled.
+        // Only the reserve the phases already carry in `device_reserve_bytes`.
         let available = free.saturating_sub(required);
         let available = available / (1 << 20) * (1 << 20);
         let all_experts = (self.live_expert_bytes as u64 / 5)
@@ -1144,10 +1139,6 @@ mod tests {
         let config = GlmConfig::from_model_dir(root.path()).unwrap();
         let gpu =
             GlmAdmissionBreakdown::from_metadata(&weights, &config.text_config, false, 2).unwrap();
-        // Peaks must be computed with the same pool-scaled reserve that
-        // validate_capacity applies, or the test measures the wrong ledger.
-        // Use the zero-reserve floor: the refusal margin then holds at any
-        // pool-scaled reserve validate_capacity might apply.
         let phases = gpu
             .phases_with_safety(false, 0, CachePolicy::new(1), 0)
             .unwrap();
@@ -1312,8 +1303,6 @@ mod tests {
         let discrete = breakdown
             .automatic_expert_cache_bytes(&phases, &snapshot(8 << 30, u64::MAX, Some(8 << 30)))
             .unwrap();
-        // Only the reserve the phases carry is charged; there is no second
-        // fixed gigabyte on top of `device_reserve_bytes`.
         let expected_discrete = ((8u64 << 30) - device_required) / (1 << 20) * (1 << 20);
         assert!(expected_discrete < all_experts, "clamp must not bind");
         assert_eq!(discrete as u64, expected_discrete);
@@ -1330,10 +1319,8 @@ mod tests {
             .automatic_expert_cache_bytes(&phases, &unified_snapshot)
             .unwrap();
         let pool = 8u64 << 30; // min(host, cgroup, device) views
-        // The binding charge is the largest per-phase sum. In this fixture both
-        // maxima fall in the same phase, so it coincides with the sum of the two
-        // independent maxima — which is why this fixture alone cannot tell the
-        // two formulas apart, and why the phases below are hand-built.
+        // Both maxima fall in one phase here, so this fixture alone cannot tell
+        // the two formulas apart; the split phases below can.
         let combined = phases
             .iter()
             .map(|p| {
@@ -1348,9 +1335,6 @@ mod tests {
         assert_eq!(unified as u64, expected_unified);
         assert!(unified < discrete);
 
-        // Maxima in *different* phases: charging max(host) + max(device) would
-        // reserve 6 GiB, a combination neither phase reaches, where the largest
-        // per-phase sum is 4 GiB.
         let split = |phase: &str, host: u64, device: u64| ResourcePhaseEstimate {
             phase: phase.into(),
             required_host_bytes: host,

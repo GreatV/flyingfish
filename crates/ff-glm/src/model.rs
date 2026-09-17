@@ -54,16 +54,13 @@ struct GlmAdmissionModel {
     live_expert_bytes: usize,
     weight_load_staging_bytes: usize,
     safety_bytes: usize,
-    /// Whether admission folded both axes into one pool; the runtime guards
-    /// must fold the same way.
+    /// Whether admission folded both axes into one pool.
     unified_pool: bool,
-    /// Host route/sampling workspaces and load staging, charged only under the
-    /// fold.
+    /// Host workspaces and load staging, charged only under the fold.
     host_charge_bytes: usize,
     /// The prefill routing mask: a temporary already dropped by decode.
     prefill_host_charge_bytes: usize,
-    /// Pinned upload slots: required only before the pool exists, since the
-    /// persistent pool is already in the snapshot each later guard measures.
+    /// Pinned upload slots: required only before the pool exists.
     pinned_slot_bytes: usize,
 }
 
@@ -2352,8 +2349,8 @@ fn plan_cache_readmission(
         expected_maximum_dsa == admission.maximum_dsa_cache_bytes,
         "GLM DSA admission model disagrees with the execution policy context bound"
     );
-    // The policy allowance is the declared ceiling; the applied reserve is
-    // snapshot-derived and at most that, so this is a bound, not an equality.
+    // The applied reserve is snapshot-derived and at most the declared
+    // allowance, so this is a bound rather than an equality.
     let applied_safety =
         u64::try_from(admission.safety_bytes).context("GLM admission safety exceeds u64")?;
     ensure!(
@@ -3022,11 +3019,6 @@ mod tests {
                 .unwrap_err();
         assert!(error.to_string().contains("no cache bound was changed"));
 
-        // A pool-scaled reserve is below the policy's declared allowance, which
-        // is the identity constant every recorded policy carries. Readmission
-        // must accept it — requiring equality aborted the first readmission on
-        // every pool under the 20 GiB crossover — while still rejecting a
-        // reserve above the allowance or none at all.
         let scaled = GlmAdmissionModel {
             safety_bytes: safety / 8,
             ..admission
@@ -3058,8 +3050,6 @@ mod tests {
             assert!(error.to_string().contains("execution policy allowance"));
         }
 
-        // Under the unified fold the host charges draw from the same pool, so
-        // readmission requires them on top of the device ledger.
         let folded = GlmAdmissionModel {
             unified_pool: true,
             host_charge_bytes: 29,

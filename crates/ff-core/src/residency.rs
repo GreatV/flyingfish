@@ -451,9 +451,8 @@ pub fn decide_device_residency(
     reserve_bytes: u64,
     authorization: ResidencyAuthorization,
 ) -> Result<DeviceResidencyDecision> {
-    // On a shared pool the binding capacity is the smaller view, not the device
-    // one; a confirmed pool of unknown size gets none rather than the device
-    // view as a stand-in. Discrete and unprobed captures are unchanged.
+    // On a shared pool the binding capacity is the smaller view, and a pool of
+    // unknown size gets none rather than the device view as a stand-in.
     let capacity = if snapshot.unified_accounting_is_undecidable() {
         0
     } else {
@@ -1104,9 +1103,6 @@ mod tests {
 
     #[test]
     fn a_confirmed_shared_pool_of_unknown_size_authorizes_no_residency() {
-        // The device view is not a stand-in for a shared pool: on a confirmed
-        // unified device with the host view unmeasured, using it would place
-        // weights past a host or cgroup constraint nobody looked at.
         let demands = vec![demand("decode", 1 << 20, 1 << 20, 10)];
         let authorization = ResidencyAuthorization::MeasuredEvidence {
             ceiling_bytes: u64::MAX,
@@ -1128,7 +1124,6 @@ mod tests {
                 .authorized_budget_bytes,
             0
         );
-        // A measured shared pool places as usual.
         let measured = ResourceSnapshot {
             host_device_memory_is_unified: Some(true),
             device_topology_probe_failed: false,

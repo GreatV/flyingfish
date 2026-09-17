@@ -402,9 +402,7 @@ pub struct ResourceSnapshot {
     /// between `None` and `Some(false)` is provenance for diagnostics.
     #[serde(default)]
     pub host_device_memory_is_unified: Option<bool>,
-    /// A live CUDA topology query that failed, as distinct from a legacy or
-    /// non-CUDA record: both read as `None` above, but only this one leaves a
-    /// present device unaccounted. Defaults to false for old records.
+    /// A failed live CUDA topology query, as distinct from a legacy record.
     #[serde(default)]
     pub device_topology_probe_failed: bool,
     /// Hardware-level totals (MemTotal / device total memory), unlike the
@@ -432,9 +430,7 @@ impl ResourceSnapshot {
         if self.host_device_memory_is_unified != Some(true) {
             return None;
         }
-        // Both binding views are required; a minimum over whichever happened to
-        // be measured would pass one axis off as the pool. A cgroup limit is
-        // optional: its absence is no constraint.
+        // Both binding views are required; an absent cgroup limit is not one.
         let pool = self
             .host_memory_available_bytes?
             .min(self.device_free_memory_bytes?);
@@ -444,9 +440,8 @@ impl ResourceSnapshot {
         })
     }
 
-    /// The host pool a run is confined to: physical memory, or a finite cgroup
-    /// limit when smaller. Both are totals, so reserves scaled from this stay
-    /// stable across runs.
+    /// The host pool a run is confined to: physical memory, or a smaller
+    /// finite cgroup limit. Both are totals, so scaled reserves stay stable.
     pub fn host_pool_total_bytes(&self) -> Option<u64> {
         let limit = match self.cgroup_v2_memory_limit {
             Some(CgroupMemoryLimit::Bytes(bytes)) => Some(bytes),
@@ -459,17 +454,12 @@ impl ResourceSnapshot {
     }
 
     /// Whether admission must refuse rather than fall back to per-axis checks:
-    /// a shared pool of unknown size, or a failed live topology query. Assuming
-    /// discrete in either case is the unsoundness this work removes.
+    /// a shared pool of unknown size, or a failed live topology query.
     pub fn unified_accounting_is_undecidable(&self) -> bool {
         self.device_topology_probe_failed || self.unified_pool_is_unmeasurable()
     }
 
-    /// Whether the probe confirmed a shared host/device pool whose size it
-    /// could not measure. Callers that fold both axes must not silently fall
-    /// back to independent per-axis checks here: the fold is known to be
-    /// required and the bound is unknown, which is not the same situation as
-    /// an unprobed or discrete device.
+    /// Whether a confirmed shared pool's size could not be measured.
     pub fn unified_pool_is_unmeasurable(&self) -> bool {
         self.host_device_memory_is_unified == Some(true)
             && self.unified_pool_available_bytes().is_none()
@@ -489,9 +479,7 @@ trait ProbeSource {
         None
     }
 
-    /// Host-wide total physical memory, for platforms that report it outside
-    /// the filesystem. A platform that cannot answer falls back to the
-    /// available view and loses the stability reserves scale on.
+    /// Host-wide total physical memory, for platforms outside the filesystem.
     fn host_total_memory_bytes(&self) -> Option<u64> {
         None
     }
@@ -522,8 +510,7 @@ impl ProbeSource for SystemProbeSource {
 /// computed the same way — `MemAvailable` includes reclaimable page cache,
 /// `ullAvailPhys` reports free physical pages — so a snapshot is comparable
 /// across runs on one host, not across platforms. `ullTotalPhys` is the
-/// counterpart to `MemTotal` and needs no such caveat: it is a hardware
-/// property, which is why reserves are scaled from it.
+/// hardware counterpart to `MemTotal`, which is why reserves scale from it.
 #[cfg(windows)]
 fn windows_physical_memory_bytes() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -1169,8 +1156,7 @@ mod tests {
         }
     }
 
-    /// A platform with no `/proc/meminfo`, answering both host figures through
-    /// system calls the way the Windows source does.
+    /// A platform with no `/proc/meminfo`, as Windows answers both figures.
     struct SyscallOnlyProbeSource {
         available: Option<u64>,
         total: Option<u64>,
@@ -1210,14 +1196,10 @@ mod tests {
         };
         let host = 64u64 << 30;
         let container = 8u64 << 30;
-        // A container's pool is its limit: scaling a reserve from the machine's
-        // 64 GiB would keep 1 GiB, which is 12.5% of what the run can use.
         assert_eq!(
             snapshot(Some(host), Some(CgroupMemoryLimit::Bytes(container))).host_pool_total_bytes(),
             Some(container)
         );
-        // An unlimited or absent limit leaves the host total alone, and a limit
-        // above physical memory is not a pool the run can reach.
         for limit in [Some(CgroupMemoryLimit::Unlimited), None] {
             assert_eq!(
                 snapshot(Some(host), limit).host_pool_total_bytes(),
@@ -1228,7 +1210,6 @@ mod tests {
             snapshot(Some(host), Some(CgroupMemoryLimit::Bytes(host * 2))).host_pool_total_bytes(),
             Some(host)
         );
-        // Either figure alone still answers; neither means no pool.
         assert_eq!(
             snapshot(None, Some(CgroupMemoryLimit::Bytes(container))).host_pool_total_bytes(),
             Some(container)
@@ -1238,9 +1219,6 @@ mod tests {
 
     #[test]
     fn snapshot_takes_both_host_figures_from_the_source_without_procfs() {
-        // Reserves scale with the total, so a platform that reports only the
-        // available figure silently loses the stable margin; both hooks must
-        // be consulted, not just the one procfs happens to cover.
         let snapshot = resource_snapshot_with_source(
             None,
             &SyscallOnlyProbeSource {
@@ -1251,8 +1229,6 @@ mod tests {
         );
         assert_eq!(snapshot.host_memory_available_bytes, Some(4 << 30));
         assert_eq!(snapshot.host_memory_total_bytes, Some(16 << 30));
-        // A source that answers neither reports neither, rather than passing
-        // one figure off as the other.
         let blind = resource_snapshot_with_source(
             None,
             &SyscallOnlyProbeSource {
@@ -1573,9 +1549,6 @@ mod tests {
         // A probed unified topology binds on the smallest view of the pool.
         assert_eq!(snapshot(Some(true)).unified_pool_available_bytes(), Some(6));
         assert!(!snapshot(Some(true)).unified_pool_is_unmeasurable());
-        // A missing binding view yields no pool rather than the other view's
-        // availability, and is reported as unmeasurable so that callers do not
-        // mistake it for a discrete device.
         for missing in [
             ResourceSnapshot {
                 device_free_memory_bytes: None,
@@ -1589,14 +1562,12 @@ mod tests {
             assert_eq!(missing.unified_pool_available_bytes(), None);
             assert!(missing.unified_pool_is_unmeasurable());
         }
-        // An absent cgroup limit is no constraint, not a missing measurement.
         let no_cgroup = ResourceSnapshot {
             cgroup_v2_memory_available_bytes: None,
             ..snapshot(Some(true))
         };
         assert_eq!(no_cgroup.unified_pool_available_bytes(), Some(6));
         assert!(!no_cgroup.unified_pool_is_unmeasurable());
-        // Discrete records are never "unmeasurable": the fold does not apply.
         assert!(!snapshot(Some(false)).unified_pool_is_unmeasurable());
         assert!(!snapshot(None).unified_pool_is_unmeasurable());
     }

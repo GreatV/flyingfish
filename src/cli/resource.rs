@@ -247,8 +247,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
     )?;
     let phase = &selection.provenance.phases[0];
     // The fold emits a host-only phase, so reading the device peak from it
-    // records zero and contradicts the selection ledger. Fit is still enforced
-    // through the combined host peak; this only affects the record.
+    // records zero and contradicts the selection ledger. Fit is unaffected.
     let device_peak = if selection.policy.execution_backend == ExecutionBackendPolicy::Cpu
         || final_observation.host_device_memory_is_unified == Some(true)
     {
@@ -265,8 +264,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         .check_peaks(host_peak, device_peak)
         .within_budget
     {
-        // The capacity race this snapshot detects publishes its ledger like any
-        // other refusal; a bare error leaves nothing to downcast.
+        // A bare error would leave the caller nothing to downcast.
         let mut provenance = selection.provenance.clone();
         provenance.final_admission_snapshot = Some(final_observation);
         provenance.workload.insert("refused".into(), 1);
@@ -392,8 +390,6 @@ pub(super) fn validate_recorded_selection(path: &Path, policy: &ExecutionPolicy)
     let record = flyingfish::runtime::resource_selection::ResourceSelectionProvenance::from_json(
         &bytes.bytes,
     )?;
-    // A refusal parses and binds to the same baseline, but says that policy was
-    // never admitted, so it cannot stand as a run's provenance.
     anyhow::ensure!(
         !record.is_refusal(),
         "recorded resource selection at {} is a refusal record, not an admitted selection",

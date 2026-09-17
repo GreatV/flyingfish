@@ -365,11 +365,8 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         selection.policy.cache_policy()?,
         &admission_snapshot,
     ) {
-        // The capacity race this second snapshot exists to detect publishes its
-        // numbers like any other refusal. The selection record is already in
-        // hand, so it is marked refused and reported rather than returned bare:
-        // a refusal without its ledger cannot be calibrated against, and this is
-        // the one refusal that carries both snapshots.
+        // The capacity race this second snapshot detects publishes its ledger
+        // like any other refusal; it is the one that carries both snapshots.
         let mut provenance = selection.provenance.clone();
         provenance.final_admission_snapshot = Some(admission_snapshot);
         provenance.workload.insert("refused".into(), 1);

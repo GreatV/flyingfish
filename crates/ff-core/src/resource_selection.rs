@@ -279,10 +279,8 @@ impl ResourceSelectionProvenance {
         Ok(())
     }
 
-    /// Whether this record is a refusal rather than an admitted selection. A
-    /// refusal is still a well-formed, parseable artifact — that is the point
-    /// of publishing it — but it states that no policy passed admission, so it
-    /// must never stand in as the provenance of a run that produced output.
+    /// Whether this record is a refusal. It parses like any other, but says no
+    /// policy was admitted, so it cannot be a run's provenance.
     pub fn is_refusal(&self) -> bool {
         self.workload.get("refused").copied().unwrap_or(0) == 1
     }

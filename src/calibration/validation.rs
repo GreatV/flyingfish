@@ -215,10 +215,8 @@ pub(super) fn validate_snapshot_backend(
     snapshot: &ResourceSnapshot,
     fingerprint: &HardwareFingerprint,
 ) -> Result<()> {
-    // The host total scales admission reserves exactly as the device total
-    // does, so it needs the same guards: availability cannot exceed it, and on
-    // a CPU fingerprint — whose `device_total_memory_bytes` is `MemTotal` —
-    // the two readings of the same physical memory must agree.
+    // The host total scales reserves as the device total does, so it needs the
+    // same guards. A CPU fingerprint's `device_total_memory_bytes` is MemTotal.
     if let Some(total) = snapshot.host_memory_total_bytes {
         if let Some(available) = snapshot.host_memory_available_bytes {
             anyhow::ensure!(
@@ -242,10 +240,8 @@ pub(super) fn validate_snapshot_backend(
                 "calibration {label} snapshot cannot report device-free memory for the {:?} backend",
                 fingerprint.backend
             );
-            // The topology probe and the device total come from the CUDA
-            // driver, so a non-CUDA trial claiming either describes a machine
-            // that cannot exist. These fields now decide reserve scaling, so an
-            // impossible snapshot would corrupt the calibration they feed.
+            // Both come from the CUDA driver, so a non-CUDA trial claiming
+            // either describes a machine that cannot exist.
             anyhow::ensure!(
                 snapshot.host_device_memory_is_unified.is_none(),
                 "calibration {label} snapshot cannot report a host/device topology for the {:?} backend",
@@ -259,9 +255,7 @@ pub(super) fn validate_snapshot_backend(
         }
         DeviceBackend::Cuda => {
             if let Some(total) = snapshot.device_total_memory_bytes {
-                // The fingerprint total is the stable hardware figure; a
-                // snapshot total that disagrees with it, or that its own free
-                // measurement exceeds, is not a reading of this machine.
+                // The fingerprint total is the stable hardware figure.
                 let fingerprint_total = fingerprint.device_total_memory_bytes.context(
                     "CUDA calibration snapshot reports device total memory without a fingerprint total",
                 )?;
