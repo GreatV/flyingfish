@@ -64,8 +64,12 @@ impl StreamedGlm {
             } else {
                 0
             },
-            // Charged before the pool exists, and nowhere after.
-            admission.pinned_slot_bytes,
+            // Charged before the pool exists, and nowhere after. The phase
+            // model charges one set per axis, so a folded check needs both.
+            admission
+                .pinned_slot_bytes
+                .checked_mul(if admission.unified_pool { 2 } else { 1 })
+                .context("GLM pinned slot charge overflow")?,
         ]
         .into_iter()
         .try_fold(0usize, |sum, bytes| {
