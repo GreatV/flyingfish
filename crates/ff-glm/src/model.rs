@@ -59,9 +59,14 @@ struct GlmAdmissionModel {
     /// lets the host charges below pass unaccounted.
     unified_pool: bool,
     /// Host bytes the runtime allocates alongside the device charges — route
-    /// and sampling workspaces, the prefill mask, and host-side load staging.
-    /// Charged only under the fold, where they draw from the same pool.
+    /// and sampling workspaces and host-side load staging. Charged only under
+    /// the fold, where they draw from the same pool.
     host_charge_bytes: usize,
+    /// The prefill routing mask, split out because it is a temporary that
+    /// `forward_layer_prefill` has already dropped by the time decode
+    /// readmission runs — the phase model charges it to prefill alone, and
+    /// reserving it during decode shrinks the cache for bytes nobody holds.
+    prefill_host_charge_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -512,11 +517,11 @@ impl PreparedGlm {
             // sub-20 GiB pool the scaled value is a fraction of the constant.
             safety_bytes: usize::try_from(breakdown.scaled_admission_safety_bytes(snapshot))?,
             unified_pool: snapshot.unified_pool_available_bytes().is_some(),
+            prefill_host_charge_bytes: usize::try_from(breakdown.prefill_host_mask_bytes)?,
             host_charge_bytes: usize::try_from(
                 breakdown
                     .host_route_workspace_bytes
                     .checked_add(breakdown.host_sampling_workspace_bytes)
-                    .and_then(|n| n.checked_add(breakdown.prefill_host_mask_bytes))
                     // The same `resident_static` split `phases_with_safety`
                     // uses. Charging the maximum instead would require more at
                     // runtime than admission granted whenever the streamed
@@ -2403,6 +2408,15 @@ fn plan_cache_readmission(
                 0
             })
         })
+        .and_then(|bytes| {
+            bytes.checked_add(
+                if admission.unified_pool && phase == RoutingTracePhase::Prefill {
+                    admission.prefill_host_charge_bytes
+                } else {
+                    0
+                },
+            )
+        })
         .context("GLM cache re-admission headroom overflow")?;
     let required_future_headroom_bytes = u64::try_from(required_future_headroom_bytes)
         .context("GLM cache re-admission headroom exceeds u64")?;
@@ -2957,6 +2971,7 @@ mod tests {
             safety_bytes: safety,
             unified_pool: false,
             host_charge_bytes: 0,
+            prefill_host_charge_bytes: 0,
         };
         let cache = ExpertCacheStats {
             bytes: 60,

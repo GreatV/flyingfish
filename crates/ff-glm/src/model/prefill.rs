@@ -60,6 +60,13 @@ impl StreamedGlm {
             } else {
                 0
             },
+            // This guard is the prefill boundary, so the routing mask it is
+            // about to allocate is charged here even though decode is not.
+            if admission.unified_pool {
+                admission.prefill_host_charge_bytes
+            } else {
+                0
+            },
         ]
         .into_iter()
         .try_fold(0usize, |sum, bytes| {
