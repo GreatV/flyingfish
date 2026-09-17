@@ -675,7 +675,14 @@ impl GlmAdmissionBreakdown {
             };
             Ok::<_, anyhow::Error>(peak.max(charge))
         })?;
-        let available = free.saturating_sub(required).saturating_sub(1 << 30);
+        // Only the reserve the phases already carry is charged. `required`
+        // includes each phase's `device_reserve_bytes`, which is the admission
+        // safety reserve — allocator slack against modelled-peak error — so a
+        // second fixed gigabyte for the same purpose double-charged it, and did
+        // so unscaled: on a 6 GiB pool it withheld a sixth of the pool from a
+        // cache the scaled admission model says fits. Pools at or above the
+        // 20 GiB crossover therefore gain up to 1 GiB of cache capacity.
+        let available = free.saturating_sub(required);
         let available = available / (1 << 20) * (1 << 20);
         let all_experts = (self.live_expert_bytes as u64 / 5)
             .checked_mul(3)
@@ -1291,8 +1298,9 @@ mod tests {
         let discrete = breakdown
             .automatic_expert_cache_bytes(&phases, &snapshot(8 << 30, u64::MAX, Some(8 << 30)))
             .unwrap();
-        let expected_discrete =
-            ((8u64 << 30) - device_required - (1 << 30)) / (1 << 20) * (1 << 20);
+        // Only the reserve the phases carry is charged; there is no second
+        // fixed gigabyte on top of `device_reserve_bytes`.
+        let expected_discrete = ((8u64 << 30) - device_required) / (1 << 20) * (1 << 20);
         assert!(expected_discrete < all_experts, "clamp must not bind");
         assert_eq!(discrete as u64, expected_discrete);
         // Unified: same numbers, but the host phase peaks are subtracted from
@@ -1321,7 +1329,7 @@ mod tests {
             .max()
             .unwrap();
         assert_eq!(combined, device_required + host_required);
-        let expected_unified = (pool - combined - (1 << 30)) / (1 << 20) * (1 << 20);
+        let expected_unified = (pool - combined) / (1 << 20) * (1 << 20);
         assert_eq!(unified as u64, expected_unified);
         assert!(unified < discrete);
 
@@ -1345,8 +1353,8 @@ mod tests {
         let sized = breakdown
             .automatic_expert_cache_bytes(&skewed, &unified_snapshot)
             .unwrap() as u64;
-        assert_eq!(sized, pool - (4 << 30) - (1 << 30));
-        assert!(sized > pool - (6 << 30) - (1 << 30));
+        assert_eq!(sized, pool - (4 << 30));
+        assert!(sized > pool - (6 << 30));
     }
 
     #[test]
