@@ -521,7 +521,13 @@ fn decide_auto_residency_with_required_memory(
 ) -> Result<DeviceCache> {
     use flyingfish::runtime::{probe::ResourceSnapshot, residency::plan_device_residency};
     if !device.is_cuda() || args.device_cache_mib.is_some() {
-        return decide_residency_with_required_memory(demands, device, args, required_device_bytes);
+        return decide_residency_with_required_memory(
+            demands,
+            device,
+            args,
+            required_device_bytes,
+            unified_host_bytes,
+        );
     }
     let reserve = required_device_bytes
         .checked_add(DEVICE_RESIDENCY_RESERVE_BYTES)
@@ -565,12 +571,22 @@ fn decide_residency_with_required_memory(
     device: &candle_core::Device,
     args: DeviceCacheArgs,
     required_device_bytes: u64,
+    unified_host_bytes: u64,
 ) -> Result<DeviceCache> {
     use flyingfish::runtime::{probe::ResourceSnapshot, residency::decide_device_residency};
     let reserve = DEVICE_RESIDENCY_RESERVE_BYTES
         .checked_add(required_device_bytes)
         .context("device residency reserve overflow")?;
     let snapshot = ResourceSnapshot::capture(Some(device));
+    // An explicit ceiling is still clamped against the shared pool, so the
+    // caller's separately modelled host allocation is reserved here too.
+    let reserve = if snapshot.unified_pool_available_bytes().is_some() {
+        reserve
+            .checked_add(unified_host_bytes)
+            .context("unified host reserve overflow")?
+    } else {
+        reserve
+    };
     let decision = decide_device_residency(&snapshot, demands, reserve, args.authorization()?)?;
     if decision.authorized_budget_bytes > 0 {
         eprintln!(
