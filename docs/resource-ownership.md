@@ -33,4 +33,7 @@ fixed-byte reserve must declare what it protects and scale with the relevant
 quantity (pool size or request working set), and the scaled value is recorded
 in the selection sidecar. Reserves scale with the pool's TOTAL bytes, never
 the instantaneous available view — a busier machine does not get a smaller
-margin, and recorded reserves stay comparable across runs.
+margin, and recorded reserves stay comparable across runs. Exception: legacy
+records and unprobed captures lack totals, so the fallbacks reach the
+available views there; reserves recorded against those fallbacks are NOT
+comparable across runs, which is exactly the data needing calibration.
