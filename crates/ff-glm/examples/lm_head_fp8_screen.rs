@@ -72,11 +72,17 @@ fn main() -> Result<()> {
     let dir = args
         .get(1)
         .context("usage: lm_head_fp8_screen <checkpoint-dir>")?;
-    let shard = format!("{dir}/model-00001-of-00062.safetensors");
-    let tensors = candle_core::safetensors::load(&shard, &Device::Cpu)?;
+    // Resolved through the index: no checkpoint layout is assumed.
+    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(format!(
+        "{dir}/model.safetensors.index.json"
+    ))?)?;
+    let shard = index["weight_map"]["lm_head.weight"]
+        .as_str()
+        .context("lm_head.weight is absent from the checkpoint index")?;
+    let tensors = candle_core::safetensors::load(format!("{dir}/{shard}"), &Device::Cpu)?;
     let lm_head = tensors
         .get("lm_head.weight")
-        .context("lm_head.weight not in shard 1")?
+        .context("lm_head.weight is absent from its indexed shard")?
         .to_dtype(DType::F32)?;
     let (rows, cols) = lm_head.dims2()?;
     println!("lm_head [{}x{}] BF16 loaded", rows, cols);
