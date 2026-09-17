@@ -497,7 +497,12 @@ impl PreparedGlm {
             })?
             .checked_add(usize::try_from(breakdown.pinned_transfer_bytes)?)
             .context("FP8 staging admission overflow")?,
-            safety_bytes: usize::try_from(crate::execution_policy::GLM_ADMISSION_SAFETY_BYTES)?,
+            // The runtime checks (batched prefill, cache re-admission) must
+            // require the same reserve admission was granted against. Storing
+            // the declared constant here would refuse, after the run started, a
+            // margin that selection and final admission both accepted — on a
+            // sub-20 GiB pool the scaled value is a fraction of the constant.
+            safety_bytes: usize::try_from(breakdown.scaled_admission_safety_bytes(snapshot))?,
         });
         self.model.admission_breakdown = Some(breakdown);
         if self.resident_static {
