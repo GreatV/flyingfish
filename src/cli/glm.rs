@@ -387,6 +387,15 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         provenance
             .workload
             .insert("admission_safety_bytes_applied".into(), final_safety);
+        if selection.policy.weights != baseline.weights {
+            let promotion =
+                flyingfish::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
+                    &admission_snapshot,
+                );
+            for phase in &mut provenance.phases {
+                phase.host_promotion_reserve_bytes = promotion;
+            }
+        }
         provenance.final_admission_snapshot = Some(admission_snapshot);
         provenance.workload.insert("refused".into(), 1);
         for candidate in &mut provenance.candidates {
@@ -424,6 +433,15 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         .provenance
         .workload
         .insert("admission_safety_bytes_applied".into(), final_safety);
+    if selection.policy.weights != baseline.weights {
+        let promotion =
+            flyingfish::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
+                &admission_snapshot,
+            );
+        for phase in &mut selection.provenance.phases {
+            phase.host_promotion_reserve_bytes = promotion;
+        }
+    }
     selection.provenance.final_admission_snapshot = Some(admission_snapshot.clone());
     eprintln!(
         "GLM resource policy {:?}: {} candidates, static={}, expert cache={} bytes",
