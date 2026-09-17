@@ -631,13 +631,17 @@ pub(super) fn run_denoise_t2va(command: H3Command) -> Result<()> {
     } else {
         None
     };
+    let input_identity = serde_json::json!({
+        "file": inputs.display().to_string(),
+        "bytes": flyingfish::runtime::artifact::FileStat::of_target(&inputs)?.len(),
+    });
     let selection_path = output.with_extension("resource-selection.json");
     super::resource::validate_sidecar_output(
         &selection_path,
         &output,
         &[telemetry_json.as_deref(), checkpoint_dir.as_deref()],
     )?;
-    let mut selected = super::resource::select_h3(super::resource::H3ResourceRequest {
+    let mut selected = match super::resource::select_h3(super::resource::H3ResourceRequest {
         additional_host_allowance_bytes: 0,
         component: &component_dir,
         device: &device,
@@ -656,13 +660,25 @@ pub(super) fn run_denoise_t2va(command: H3Command) -> Result<()> {
             &video_latents,
             &audio_latents,
         )?,
+        // The input belongs to the request identity: without it two refusals
+        // for different inputs with the same geometry are indistinguishable,
+        // and the ownership check that replaces a refusal compares exactly this.
         request: serde_json::json!({"command":"h3.transformer", "geometry":geometry,
-            "sigma_points":sigma_points, "start_step":start_step, "evaluations":evaluations, "video_shift":video_shift,"audio_shift":audio_shift}),
-    })?;
-    selected.provenance.input = Some(serde_json::json!({
-        "file": inputs.display().to_string(),
-        "bytes": flyingfish::runtime::artifact::FileStat::of_target(&inputs)?.len(),
-    }));
+            "sigma_points":sigma_points, "start_step":start_step, "evaluations":evaluations,
+            "video_shift":video_shift, "audio_shift":audio_shift, "input":input_identity}),
+    }) {
+        Ok(selected) => selected,
+        Err(error) => {
+            flyingfish::resource_policy::report_refusal(
+                &error,
+                Some(&flyingfish::resource_policy::refusal_path_for(
+                    &selection_path,
+                )),
+            );
+            return Err(error);
+        }
+    };
+    selected.provenance.input = Some(input_identity.clone());
     execution_policy = selected.policy;
     flyingfish::resource_policy::publish_selection(&selection_path, &selected.provenance)?;
     if let Some(path) = checkpoint_dir.as_ref() {

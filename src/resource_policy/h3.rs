@@ -59,20 +59,44 @@ pub fn automatic_device_cache(
         || request.locked_origin.is_some()
         || request.evidence.is_some()
         || request.baseline.execution_backend != ExecutionBackendPolicy::Cuda
-        || request.assumptions.device_memory_is_host
         || request.baseline.weights.device_cache.is_enabled()
         || request.explicit_axes.contains("weights.device_cache")
     {
         return Ok(None);
     }
-    let Some(free) = request.snapshot.device_free_memory_bytes else {
+    // A unified-memory CUDA device still has a device: retaining weights there
+    // avoids re-fetching them from storage, which is the binding term on such
+    // machines. (The host-less CPU path never reaches here — the backend check
+    // above excludes it.)
+    // A confirmed pool of unknown size retains nothing.
+    if request.snapshot.unified_accounting_is_undecidable() {
+        return Ok(None);
+    }
+    let unified_pool = request.snapshot.unified_pool_available_bytes();
+    let Some(free) = unified_pool.or(request.snapshot.device_free_memory_bytes) else {
         return Ok(None);
     };
-    let capacity = request.budget.max_device_bytes.unwrap_or(free).min(free);
+    // Under the fold every charge lands on the host axis, so `--max-host-mib`
+    // bounds this too.
+    let mut capacity = request.budget.max_device_bytes.unwrap_or(free).min(free);
+    if unified_pool.is_some()
+        && let Some(host_bound) = request.budget.max_host_bytes
+    {
+        capacity = capacity.min(host_bound);
+    }
     let modeled = estimate(request, request.baseline)?;
-    let (_, required) = future_peaks(request, &modeled)?;
+    let (host, required) = future_peaks(request, &modeled)?;
+    // The retention draws from the same pool as every other charge. Under the
+    // unified fold the host figure already includes the device peak, so it is
+    // the binding subtrahend; on discrete topology the device axis is used as
+    // before.
+    let subtrahend = if unified_pool.is_some() {
+        host
+    } else {
+        required
+    };
     let ceiling = capacity
-        .saturating_sub(required)
+        .saturating_sub(subtrahend)
         .saturating_sub(headroom_bytes)
         .min(request.inventory.total_bytes(CacheGranularity::Tensor)?);
     let ceiling = ceiling / (1 << 20) * (1 << 20);
@@ -81,15 +105,18 @@ pub fn automatic_device_cache(
     }))
 }
 
+/// Record the budget a boundary was judged against. `refused` skips the
+/// admitted-peak invariant and records the overshoot as a shortfall.
 fn record_budget(
     record: &mut ResourceSelectionProvenance,
     boundary: &str,
     budget: ResourceBudget,
     host_peak: u64,
     compute_peak: u64,
+    refused: bool,
 ) -> Result<()> {
     ensure!(
-        budget.check_peaks(host_peak, compute_peak).within_budget,
+        refused || budget.check_peaks(host_peak, compute_peak).within_budget,
         "recorded H3 admission budget is below its peak"
     );
     record.workload.insert("budget_record_version".into(), 1);
@@ -105,16 +132,24 @@ fn record_budget(
         );
         record.workload.remove(&format!("{prefix}_budget_bytes"));
         record.workload.remove(&format!("{prefix}_remaining_bytes"));
+        record.workload.remove(&format!("{prefix}_shortfall_bytes"));
         if let Some(limit) = limit {
-            let remaining = limit
-                .checked_sub(peak)
-                .context("recorded H3 admission budget is below its peak")?;
             record
                 .workload
                 .insert(format!("{prefix}_budget_bytes"), limit);
-            record
-                .workload
-                .insert(format!("{prefix}_remaining_bytes"), remaining);
+            match limit.checked_sub(peak) {
+                Some(remaining) => {
+                    record
+                        .workload
+                        .insert(format!("{prefix}_remaining_bytes"), remaining);
+                }
+                None => {
+                    ensure!(refused, "recorded H3 admission budget is below its peak");
+                    record
+                        .workload
+                        .insert(format!("{prefix}_shortfall_bytes"), peak - limit);
+                }
+            }
         }
     }
     Ok(())
@@ -122,6 +157,28 @@ fn record_budget(
 
 /// Keep the effective limits and checked peaks with the observation that used
 /// them. Compute limits also apply to the compute portion of a CPU host ledger.
+/// The refusal counterpart: the peaks are known to exceed the budget, so the
+/// admitted-peak invariant is skipped and the overshoot recorded as a
+/// shortfall. Without this the record carries neither snapshot nor budget.
+pub fn record_refused_final_admission(
+    record: &mut ResourceSelectionProvenance,
+    snapshot: ResourceSnapshot,
+    budget: ResourceBudget,
+    host_peak: u64,
+    compute_peak: u64,
+) -> Result<()> {
+    record_budget(
+        record,
+        "final_admission",
+        budget,
+        host_peak,
+        compute_peak,
+        true,
+    )?;
+    record.final_admission_snapshot = Some(snapshot);
+    Ok(())
+}
+
 pub fn record_final_admission(
     record: &mut ResourceSelectionProvenance,
     snapshot: ResourceSnapshot,
@@ -129,7 +186,14 @@ pub fn record_final_admission(
     host_peak: u64,
     compute_peak: u64,
 ) -> Result<()> {
-    record_budget(record, "final_admission", budget, host_peak, compute_peak)?;
+    record_budget(
+        record,
+        "final_admission",
+        budget,
+        host_peak,
+        compute_peak,
+        false,
+    )?;
     record.final_admission_snapshot = Some(snapshot);
     Ok(())
 }
@@ -364,8 +428,13 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
             }));
             if !row.qualifies()
                 || row.observed_peak_deltas.is_none_or(|(h, d)| {
+                    // The flag marks two things: the CPU path, where a device
+                    // observation cannot belong to the trial, and the fold.
+                    let unified = request.snapshot.host_device_memory_is_unified == Some(true);
                     h > host
-                        || if request.assumptions.device_memory_is_host {
+                        || if unified {
+                            d.is_none_or(|d| h.saturating_add(d) > host)
+                        } else if request.assumptions.device_memory_is_host {
                             d.is_some()
                         } else {
                             d.is_none_or(|d| d > device)
@@ -409,25 +478,58 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
         }
         observations.push(observation);
     }
-    let (policy, estimate, _, _) = selected.with_context(|| {
-        format!(
-            "H3 resource admission refused: {}",
-            observations
-                .iter()
-                .map(|r| r.reason.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        )
-    })?;
-    let (host, device) = future_peaks(&request, &estimate)?;
-    let retained = host_weight_residency_charges(&policy, request.inventory)?.peak_storage_bytes;
-    let promoted = policy != *request.baseline;
+    let Some((policy, estimate, _, _)) = selected else {
+        // A refusal must still ship its numbers. The record names the
+        // baseline (that is what was evaluated) and marks refused=1.
+        let baseline_estimate = estimate(&request, request.baseline)?;
+        let provenance = build_provenance(
+            &request,
+            request.baseline,
+            &baseline_estimate,
+            observations,
+            true,
+        )?;
+        let summary = provenance
+            .candidates
+            .iter()
+            .map(|r| r.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(super::AdmissionRefused {
+            provenance,
+            summary: format!("H3 resource admission refused: {summary}"),
+        }
+        .into());
+    };
+    let provenance = build_provenance(&request, &policy, &estimate, observations, false)?;
+    Ok(H3Selection {
+        policy,
+        estimate,
+        provenance,
+    })
+}
+
+/// Assemble the selection record for a policy: its denoise phase, axis
+/// origins, the budget ledger, and every candidate observation. `refused`
+/// marks a record whose baseline was evaluated but admitted nothing.
+fn build_provenance(
+    request: &H3SelectionRequest<'_>,
+    policy: &ExecutionPolicy,
+    estimate: &crate::h3::resources::ResourceEstimate,
+    observations: Vec<ResourceCandidateObservation>,
+    refused: bool,
+) -> Result<ResourceSelectionProvenance> {
+    let base_axes = axes(request.baseline)?;
+    let (host, device) = future_peaks(request, estimate)?;
+    let retained = host_weight_residency_charges(policy, request.inventory)?.peak_storage_bytes;
+    let promoted = !refused && policy != request.baseline;
     let phase = ResourcePhaseEstimate {
         phase: "denoise".into(),
         required_host_bytes: host
             .checked_sub(retained)
             .context("H3 retained bytes exceed host peak")?,
         optional_host_bytes: retained,
+        reclaimable_host_bytes: 0,
         host_promotion_reserve_bytes: if promoted {
             (1 << 30).max(request.budget.max_host_bytes.unwrap_or(0) / 20)
         } else {
@@ -439,7 +541,7 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
             .then_some(policy.weights.device_cache.max_bytes),
         device_reserve_bytes: 0,
     };
-    let selected_axes = axes(&policy)?
+    let selected_axes = axes(policy)?
         .into_iter()
         .map(|(axis, value)| {
             let origin = request.locked_origin.unwrap_or_else(|| {
@@ -460,7 +562,7 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
         .collect();
     let mut provenance = ResourceSelectionProvenance {
         schema_version: 1,
-        policy: serde_json::to_value(&policy)?,
+        policy: serde_json::to_value(policy)?,
         selector_revision: "h3-resource-measured-v1".into(),
         request: request.context.request.clone(),
         input: None,
@@ -508,17 +610,21 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
                 "additional_host_allowance_bytes".into(),
                 request.additional_host_allowance_bytes,
             ),
+            ("refused".into(), u64::from(refused)),
         ]),
         axes: selected_axes,
         candidates: observations,
     };
-    record_budget(&mut provenance, "selection", request.budget, host, device)?;
+    record_budget(
+        &mut provenance,
+        "selection",
+        request.budget,
+        host,
+        device,
+        refused,
+    )?;
     provenance.validate()?;
-    Ok(H3Selection {
-        policy,
-        estimate,
-        provenance,
-    })
+    Ok(provenance)
 }
 
 #[cfg(test)]
@@ -602,6 +708,10 @@ mod tests {
             cgroup_v2_memory_current_bytes: None,
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: None,
+            host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -671,6 +781,66 @@ mod tests {
         })
     }
     #[test]
+    fn a_refused_final_admission_records_its_snapshot_and_shortfall() {
+        let mut record = run(&baseline(), None, None, 0).unwrap().provenance;
+        let budget = ResourceBudget {
+            max_host_bytes: Some(1),
+            max_device_bytes: Some(1),
+        };
+        assert!(
+            record_final_admission(&mut record, snapshot(), budget, 100, 0).is_err(),
+            "the admitted path must still reject an over-budget peak"
+        );
+        record_refused_final_admission(&mut record, snapshot(), budget, 100, 0).unwrap();
+        assert!(record.final_admission_snapshot.is_some());
+        assert_eq!(
+            record.workload.get("final_admission_host_shortfall_bytes"),
+            Some(&99)
+        );
+    }
+
+    #[test]
+    fn refusal_publishes_its_ledger_instead_of_a_budget_recording_error() {
+        let error = run_with_budget(
+            &baseline(),
+            None,
+            None,
+            0,
+            ResourceBudget {
+                max_host_bytes: Some(1),
+                max_device_bytes: Some(1),
+            },
+        )
+        .err()
+        .expect("a budget below the baseline peak must refuse");
+        let refusal = error
+            .downcast_ref::<super::super::AdmissionRefused>()
+            .expect("refusal must carry its record, not a budget-recording error");
+        assert_eq!(refusal.provenance.workload.get("refused"), Some(&1));
+        assert!(!refusal.provenance.candidates.is_empty());
+        assert!(
+            refusal
+                .provenance
+                .candidates
+                .iter()
+                .all(|c| c.disposition != CandidateDisposition::Selected)
+        );
+        assert!(
+            refusal
+                .provenance
+                .workload
+                .contains_key("selection_host_shortfall_bytes")
+        );
+        assert!(
+            !refusal
+                .provenance
+                .workload
+                .contains_key("selection_host_remaining_bytes")
+        );
+        refusal.provenance.validate().unwrap();
+    }
+
+    #[test]
     fn explicit_device_retention_is_charged_before_admission_and_not_auto_enabled() {
         let base = baseline();
         let old = run(&base, None, None, 0).unwrap();
@@ -711,6 +881,63 @@ mod tests {
                 .candidates
                 .iter()
                 .any(|c| c.disposition == CandidateDisposition::OperatorExcluded)
+        );
+    }
+
+    #[test]
+    fn unified_cuda_keeps_automatic_device_cache_sized_from_folded_host_peak() {
+        // A unified-memory CUDA device still has a device; the CPU-shaped
+        // device_memory_is_host flag must not disable retention that avoids
+        // re-fetching weights from storage (the binding term there).
+        let mut base = baseline();
+        base.execution_backend = crate::h3::policy::ExecutionBackendPolicy::Cuda;
+        *base.numerics = crate::h3::policy::H3NumericalContract::for_target(
+            crate::h3::policy::ExecutionBackendPolicy::Cuda,
+            Some(crate::h3::policy::CudaCapabilities::NONE),
+            crate::h3::policy::AttentionBackendPolicy::FullSoftmax,
+        )
+        .unwrap();
+        let mut unified = snapshot();
+        unified.device_free_memory_bytes = Some(8 << 30);
+        unified.host_device_memory_is_unified = Some(true);
+        let inventory = CacheInventory {
+            shards: vec![CacheShardInventory {
+                name: "w.safetensors".into(),
+                file_bytes: 80 << 20,
+                header_bytes: 8,
+                selected_tensor_bytes: 64 << 20,
+                selected_tensor_count: 1,
+                largest_tensor_bytes: 64 << 20,
+            }],
+        };
+        let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
+        assumptions.device_memory_is_host = true;
+        let geometry = geometry();
+        let request = H3SelectionRequest {
+            baseline: &base,
+            config: &config(),
+            rows: geometry.sequence_rows([1, 1, 1]).unwrap(),
+            geometry,
+            assumptions,
+            inventory: &inventory,
+            budget: ResourceBudget {
+                max_host_bytes: Some(8 << 30),
+                max_device_bytes: Some(8 << 30),
+            },
+            snapshot: &unified,
+            context: &context(),
+            mode: ResourcePolicyMode::Performance,
+            explicit_axes: &BTreeSet::new(),
+            evidence: None,
+            locked_origin: None,
+            resident_input_bytes: 0,
+            additional_host_allowance_bytes: 0,
+        };
+        let cache = automatic_device_cache(&request, 0).unwrap();
+        assert_eq!(
+            cache.map(|c| c.max_bytes),
+            Some(64 << 20),
+            "inventory clamp bounds the folded-pool ceiling"
         );
     }
 

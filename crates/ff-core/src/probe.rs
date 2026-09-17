@@ -392,12 +392,77 @@ pub struct ResourceSnapshot {
     pub cgroup_v2_memory_available_bytes: Option<u64>,
     #[serde(deserialize_with = "crate::required_option")]
     pub device_free_memory_bytes: Option<u64>,
+    /// Whether host and device memory are one shared physical pool (the CUDA
+    /// `integrated` device attribute, e.g. Jetson unified memory). `Some(true)`
+    /// switches admission to combined-pool accounting. `None` — legacy records,
+    /// non-CUDA backends, and (warned-once) failed probes — keeps the split
+    /// per-axis checks every consumer used before this field existed, as does
+    /// a confirmed-discrete `Some(false)`. The distinction that matters for
+    /// correctness is `Some(true)` versus everything else; the distinction
+    /// between `None` and `Some(false)` is provenance for diagnostics.
+    #[serde(default)]
+    pub host_device_memory_is_unified: Option<bool>,
+    /// A failed live CUDA topology query, as distinct from a legacy record.
+    #[serde(default)]
+    pub device_topology_probe_failed: bool,
+    /// Hardware-level totals (MemTotal / device total memory), unlike the
+    /// instantaneous `*_available`/`device_free` views. Reserve sizes scale
+    /// with totals so that a run's margin does not shrink when the machine is
+    /// busy and sidecar-recorded reserves stay comparable across runs.
+    #[serde(default)]
+    pub host_memory_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub device_total_memory_bytes: Option<u64>,
     pub measurement_scope: ResourceMeasurementScopes,
 }
 
 impl ResourceSnapshot {
     pub fn capture(device: Option<&Device>) -> Self {
         resource_snapshot_with_source(device, &SystemProbeSource, unix_time_ms())
+    }
+
+    /// Available bytes of the single memory pool when the probe confirmed a
+    /// unified host/device topology. Both axes' charges draw from it, so the
+    /// binding budget is the smaller of the two views. Returns `None` when
+    /// the topology is discrete or was not probed, and when either view of
+    /// the pool could not be measured.
+    pub fn unified_pool_available_bytes(&self) -> Option<u64> {
+        if self.host_device_memory_is_unified != Some(true) {
+            return None;
+        }
+        // Both binding views are required; an absent cgroup limit is not one.
+        let pool = self
+            .host_memory_available_bytes?
+            .min(self.device_free_memory_bytes?);
+        Some(match self.cgroup_v2_memory_available_bytes {
+            Some(limit) => pool.min(limit),
+            None => pool,
+        })
+    }
+
+    /// The host pool a run is confined to: physical memory, or a smaller
+    /// finite cgroup limit. Both are totals, so scaled reserves stay stable.
+    pub fn host_pool_total_bytes(&self) -> Option<u64> {
+        let limit = match self.cgroup_v2_memory_limit {
+            Some(CgroupMemoryLimit::Bytes(bytes)) => Some(bytes),
+            Some(CgroupMemoryLimit::Unlimited) | None => None,
+        };
+        match (self.host_memory_total_bytes, limit) {
+            (Some(host), Some(limit)) => Some(host.min(limit)),
+            (host, limit) => host.or(limit),
+        }
+    }
+
+    /// Whether admission must refuse rather than fall back to per-axis checks:
+    /// a shared pool of unknown size, or a failed live topology query.
+    pub fn unified_accounting_is_undecidable(&self) -> bool {
+        self.device_topology_probe_failed || self.unified_pool_is_unmeasurable()
+    }
+
+    /// Whether a confirmed shared pool's size could not be measured.
+    pub fn unified_pool_is_unmeasurable(&self) -> bool {
+        self.host_device_memory_is_unified == Some(true)
+            && self.unified_pool_available_bytes().is_none()
     }
 }
 
@@ -413,6 +478,11 @@ trait ProbeSource {
     fn host_available_memory_bytes(&self) -> Option<u64> {
         None
     }
+
+    /// Host-wide total physical memory, for platforms outside the filesystem.
+    fn host_total_memory_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 struct SystemProbeSource;
@@ -424,24 +494,31 @@ impl ProbeSource for SystemProbeSource {
 
     #[cfg(windows)]
     fn host_available_memory_bytes(&self) -> Option<u64> {
-        windows_available_physical_bytes()
+        windows_physical_memory_bytes().map(|(available, _)| available)
+    }
+
+    #[cfg(windows)]
+    fn host_total_memory_bytes(&self) -> Option<u64> {
+        windows_physical_memory_bytes().map(|(_, total)| total)
     }
 }
 
-/// Windows' host-wide available physical memory.
+/// Windows' host-wide available and total physical memory, in that order.
 ///
 /// `ullAvailPhys` is the closest counterpart to Linux's `MemAvailable`: both
 /// answer "how much can a new allocation expect without paging". They are not
 /// computed the same way — `MemAvailable` includes reclaimable page cache,
 /// `ullAvailPhys` reports free physical pages — so a snapshot is comparable
-/// across runs on one host, not across platforms.
+/// across runs on one host, not across platforms. `ullTotalPhys` is the
+/// hardware counterpart to `MemTotal`, which is why reserves scale from it.
 #[cfg(windows)]
-fn windows_available_physical_bytes() -> Option<u64> {
+fn windows_physical_memory_bytes() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
     let mut status = unsafe { std::mem::zeroed::<MEMORYSTATUSEX>() };
     status.dwLength = u32::try_from(size_of::<MEMORYSTATUSEX>()).ok()?;
-    (unsafe { GlobalMemoryStatusEx(&raw mut status) } != 0).then_some(status.ullAvailPhys)
+    (unsafe { GlobalMemoryStatusEx(&raw mut status) } != 0)
+        .then_some((status.ullAvailPhys, status.ullTotalPhys))
 }
 
 fn hardware_fingerprint_with_source(
@@ -535,6 +612,16 @@ fn resource_snapshot_with_source(
     let (cgroup_v2_memory_limit, cgroup_v2_memory_current_bytes, cgroup_v2_memory_available_bytes) =
         read_cgroup_v2_memory(source).unwrap_or((None, None, None));
     let device_free_memory_bytes = device.and_then(device_free_memory);
+    let (host_device_memory_is_unified, device_topology_probe_failed) = device
+        .map(device_memory_is_unified)
+        .unwrap_or((None, false));
+    let host_memory_total_bytes = source
+        .read_to_string(Path::new("/proc/meminfo"))
+        .ok()
+        .as_deref()
+        .and_then(|contents| parse_meminfo_bytes(contents, "MemTotal"))
+        .or_else(|| source.host_total_memory_bytes());
+    let device_total_memory_bytes = device.and_then(device_total_memory);
 
     ResourceSnapshot {
         schema_version: RESOURCE_SNAPSHOT_SCHEMA_VERSION,
@@ -544,6 +631,10 @@ fn resource_snapshot_with_source(
         cgroup_v2_memory_current_bytes,
         cgroup_v2_memory_available_bytes,
         device_free_memory_bytes,
+        host_device_memory_is_unified,
+        device_topology_probe_failed,
+        host_memory_total_bytes,
+        device_total_memory_bytes,
         measurement_scope: ResourceMeasurementScopes {
             host_memory: host_memory_available_bytes.map(|_| MemoryMeasurementScope::HostWide),
             cgroup_memory: (cgroup_v2_memory_limit.is_some()
@@ -986,6 +1077,57 @@ fn device_free_memory(_device: &Device) -> Option<u64> {
     None
 }
 
+#[cfg(feature = "cuda")]
+fn device_total_memory(device: &Device) -> Option<u64> {
+    let cuda = device.as_cuda_device().ok()?;
+    let stream = cuda.cuda_stream();
+    u64::try_from(stream.context().total_mem().ok()?).ok()
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_total_memory(_device: &Device) -> Option<u64> {
+    None
+}
+
+/// Probe the CUDA `integrated` device attribute once at snapshot capture.
+/// `Some(false)` is a confirmed discrete topology; `None` means unprobed
+/// (non-CUDA device or build). A query failure on a CUDA device is not
+/// silent: it warns once per process before falling back to `None`, so a real
+/// integrated device cannot regress to split-axis accounting unnoticed.
+#[cfg(feature = "cuda")]
+fn device_memory_is_unified(device: &Device) -> (Option<bool>, bool) {
+    use candle_core::cuda_backend::cudarc::driver::sys;
+
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let Ok(cuda) = device.as_cuda_device() else {
+        return (None, false);
+    };
+    let stream = cuda.cuda_stream();
+    let mut value = 0_i32;
+    let result = unsafe {
+        sys::cuDeviceGetAttribute(
+            &raw mut value,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED,
+            stream.context().cu_device(),
+        )
+    };
+    if result == sys::CUresult::CUDA_SUCCESS {
+        return (Some(value != 0), false);
+    }
+    WARNED.call_once(|| {
+        eprintln!(
+            "warning: CUDA integrated-topology attribute query failed ({result:?}); \
+             this capture records host_device_memory_is_unified as unprobed"
+        );
+    });
+    (None, true)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_memory_is_unified(_device: &Device) -> (Option<bool>, bool) {
+    (None, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1154,90 @@ mod tests {
                 )
             })
         }
+    }
+
+    /// A platform with no `/proc/meminfo`, as Windows answers both figures.
+    struct SyscallOnlyProbeSource {
+        available: Option<u64>,
+        total: Option<u64>,
+    }
+
+    impl ProbeSource for SyscallOnlyProbeSource {
+        fn read_to_string(&self, _: &Path) -> io::Result<String> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "no procfs"))
+        }
+        fn host_available_memory_bytes(&self) -> Option<u64> {
+            self.available
+        }
+        fn host_total_memory_bytes(&self) -> Option<u64> {
+            self.total
+        }
+    }
+
+    #[test]
+    fn host_pool_total_binds_on_a_finite_cgroup_limit() {
+        let snapshot = |host: Option<u64>, limit: Option<CgroupMemoryLimit>| ResourceSnapshot {
+            schema_version: RESOURCE_SNAPSHOT_SCHEMA_VERSION,
+            measured_at_unix_ms: 1,
+            host_memory_available_bytes: Some(1 << 30),
+            cgroup_v2_memory_limit: limit,
+            cgroup_v2_memory_current_bytes: None,
+            cgroup_v2_memory_available_bytes: None,
+            device_free_memory_bytes: None,
+            host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: host,
+            device_total_memory_bytes: None,
+            measurement_scope: ResourceMeasurementScopes {
+                host_memory: None,
+                cgroup_memory: None,
+                device_memory: None,
+            },
+        };
+        let host = 64u64 << 30;
+        let container = 8u64 << 30;
+        assert_eq!(
+            snapshot(Some(host), Some(CgroupMemoryLimit::Bytes(container))).host_pool_total_bytes(),
+            Some(container)
+        );
+        for limit in [Some(CgroupMemoryLimit::Unlimited), None] {
+            assert_eq!(
+                snapshot(Some(host), limit).host_pool_total_bytes(),
+                Some(host)
+            );
+        }
+        assert_eq!(
+            snapshot(Some(host), Some(CgroupMemoryLimit::Bytes(host * 2))).host_pool_total_bytes(),
+            Some(host)
+        );
+        assert_eq!(
+            snapshot(None, Some(CgroupMemoryLimit::Bytes(container))).host_pool_total_bytes(),
+            Some(container)
+        );
+        assert_eq!(snapshot(None, None).host_pool_total_bytes(), None);
+    }
+
+    #[test]
+    fn snapshot_takes_both_host_figures_from_the_source_without_procfs() {
+        let snapshot = resource_snapshot_with_source(
+            None,
+            &SyscallOnlyProbeSource {
+                available: Some(4 << 30),
+                total: Some(16 << 30),
+            },
+            1,
+        );
+        assert_eq!(snapshot.host_memory_available_bytes, Some(4 << 30));
+        assert_eq!(snapshot.host_memory_total_bytes, Some(16 << 30));
+        let blind = resource_snapshot_with_source(
+            None,
+            &SyscallOnlyProbeSource {
+                available: Some(4 << 30),
+                total: None,
+            },
+            1,
+        );
+        assert_eq!(blind.host_memory_total_bytes, None);
     }
 
     fn valid_current_cuda_fingerprint() -> HardwareFingerprint {
@@ -1284,6 +1510,10 @@ mod tests {
                 cgroup_v2_memory_current_bytes: None,
                 cgroup_v2_memory_available_bytes: None,
                 device_free_memory_bytes: None,
+                host_device_memory_is_unified: None,
+                device_topology_probe_failed: false,
+                host_memory_total_bytes: None,
+                device_total_memory_bytes: None,
                 measurement_scope: ResourceMeasurementScopes {
                     host_memory: None,
                     cgroup_memory: None,
@@ -1291,6 +1521,55 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn unified_pool_available_bytes_requires_a_probed_unified_topology() {
+        let snapshot = |unified: Option<bool>| ResourceSnapshot {
+            schema_version: RESOURCE_SNAPSHOT_SCHEMA_VERSION,
+            measured_at_unix_ms: 1,
+            host_memory_available_bytes: Some(10),
+            cgroup_v2_memory_limit: None,
+            cgroup_v2_memory_current_bytes: None,
+            cgroup_v2_memory_available_bytes: Some(8),
+            device_free_memory_bytes: Some(6),
+            host_device_memory_is_unified: unified,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
+            measurement_scope: ResourceMeasurementScopes {
+                host_memory: None,
+                cgroup_memory: None,
+                device_memory: None,
+            },
+        };
+        // Unprobed (legacy) and confirmed-discrete records expose no pool.
+        assert_eq!(snapshot(None).unified_pool_available_bytes(), None);
+        assert_eq!(snapshot(Some(false)).unified_pool_available_bytes(), None);
+        // A probed unified topology binds on the smallest view of the pool.
+        assert_eq!(snapshot(Some(true)).unified_pool_available_bytes(), Some(6));
+        assert!(!snapshot(Some(true)).unified_pool_is_unmeasurable());
+        for missing in [
+            ResourceSnapshot {
+                device_free_memory_bytes: None,
+                ..snapshot(Some(true))
+            },
+            ResourceSnapshot {
+                host_memory_available_bytes: None,
+                ..snapshot(Some(true))
+            },
+        ] {
+            assert_eq!(missing.unified_pool_available_bytes(), None);
+            assert!(missing.unified_pool_is_unmeasurable());
+        }
+        let no_cgroup = ResourceSnapshot {
+            cgroup_v2_memory_available_bytes: None,
+            ..snapshot(Some(true))
+        };
+        assert_eq!(no_cgroup.unified_pool_available_bytes(), Some(6));
+        assert!(!no_cgroup.unified_pool_is_unmeasurable());
+        assert!(!snapshot(Some(false)).unified_pool_is_unmeasurable());
+        assert!(!snapshot(None).unified_pool_is_unmeasurable());
     }
 
     #[test]

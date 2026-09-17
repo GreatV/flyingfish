@@ -97,6 +97,13 @@ pub struct ResourcePhaseEstimate {
     pub required_host_bytes: u64,
     pub optional_host_bytes: u64,
     pub host_promotion_reserve_bytes: u64,
+    /// Page-cache-resident bytes the kernel can reclaim under pressure (e.g.
+    /// mmap'd weight shards). They are memory *performance*, not memory
+    /// *usage*: `MemAvailable` already counts them as available, so admission
+    /// never charges them against capacity. Reported for telemetry and for
+    /// diagnosing cache-eviction slowdowns, not for fit decisions.
+    #[serde(default)]
+    pub reclaimable_host_bytes: u64,
     #[serde(deserialize_with = "crate::required_option")]
     pub required_device_bytes: Option<u64>,
     #[serde(deserialize_with = "crate::required_option")]
@@ -257,11 +264,25 @@ impl ResourceSelectionProvenance {
                 );
             }
         }
+        // A recorded refusal (workload["refused"] == 1) selects nothing; every
+        // other record must select exactly one candidate. Old records carry no
+        // `refused` key and keep the strict rule.
+        let refused = self.workload.get("refused").copied().unwrap_or(0) == 1;
         ensure!(
-            selected == 1,
-            "resource selection must select exactly one candidate"
+            if refused {
+                selected == 0
+            } else {
+                selected == 1
+            },
+            "resource selection must select exactly one candidate (and a recorded refusal none)"
         );
         Ok(())
+    }
+
+    /// Whether this record is a refusal. It parses like any other, but says no
+    /// policy was admitted, so it cannot be a run's provenance.
+    pub fn is_refusal(&self) -> bool {
+        self.workload.get("refused").copied().unwrap_or(0) == 1
     }
 
     pub fn canonical_json(&self) -> Result<Vec<u8>> {
@@ -357,6 +378,10 @@ mod tests {
                 cgroup_v2_memory_current_bytes: None,
                 cgroup_v2_memory_available_bytes: None,
                 device_free_memory_bytes: None,
+                host_device_memory_is_unified: None,
+                device_topology_probe_failed: false,
+                host_memory_total_bytes: None,
+                device_total_memory_bytes: None,
                 measurement_scope: ResourceMeasurementScopes {
                     host_memory: None,
                     cgroup_memory: None,
@@ -379,6 +404,7 @@ mod tests {
                 phase: "decode".into(),
                 required_host_bytes: 1,
                 optional_host_bytes: 0,
+                reclaimable_host_bytes: 0,
                 host_promotion_reserve_bytes: 100,
                 required_device_bytes: None,
                 optional_device_bytes: None,

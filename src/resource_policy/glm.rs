@@ -4,8 +4,8 @@ use crate::{
     runtime::{
         probe::ResourceSnapshot,
         resource_selection::{
-            CandidateDisposition, ResourceCandidateObservation, ResourcePolicyMode,
-            ResourceSelectionProvenance, SelectedResourceAxis, SelectionOrigin,
+            CandidateDisposition, ResourceCandidateObservation, ResourcePhaseEstimate,
+            ResourcePolicyMode, ResourceSelectionProvenance, SelectedResourceAxis, SelectionOrigin,
         },
         weights::CachePolicy,
     },
@@ -130,17 +130,47 @@ pub fn select(
             continue;
         }
         if candidate.weights != baseline.weights {
-            let host = crate::glm::admission::host_available(snapshot)
-                .context("host capacity unavailable")?;
-            let reserve = (1_u64 << 30).max(host / 20);
+            // Unified-memory topologies charge the device peak to the same
+            // pool; reserving against the host view alone would overspend it.
+            let unified_pool = snapshot.unified_pool_available_bytes();
+            let host = match unified_pool {
+                Some(pool) => pool,
+                None => crate::glm::admission::host_available(snapshot)
+                    .context("host capacity unavailable")?,
+            };
+            let reserve =
+                crate::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
+                    snapshot,
+                );
             if breakdown
-                .phases(candidate.resident_static, expert_bytes, cache)?
+                .phases_with_safety(
+                    candidate.resident_static,
+                    expert_bytes,
+                    cache,
+                    breakdown.scaled_admission_safety_bytes(snapshot),
+                )?
                 .iter()
                 .any(|p| {
-                    p.host_peak_bytes()
-                        .ok()
-                        .and_then(|n| n.checked_add(reserve))
-                        .is_none_or(|n| n > host)
+                    let peak = match p.host_peak_bytes() {
+                        Ok(peak) => peak,
+                        Err(_) => return true,
+                    };
+                    let peak = if unified_pool.is_some() {
+                        match p
+                            .device_peak_bytes()
+                            .and_then(|d| {
+                                peak.checked_add(d.unwrap_or(0))
+                                    .context("unified promotion peak overflow")
+                            })
+                            .ok()
+                        {
+                            Some(peak) => peak,
+                            None => return true,
+                        }
+                    } else {
+                        peak
+                    };
+                    peak.checked_add(reserve).is_none_or(|n| n > host)
                 })
             {
                 observation.disposition = CandidateDisposition::CapacityRejected;
@@ -209,10 +239,21 @@ pub fn select(
                     continue;
                 }
             }
-            let phases = breakdown.phases(candidate.resident_static, expert_bytes, cache)?;
+            let phases = breakdown.phases_with_safety(
+                candidate.resident_static,
+                expert_bytes,
+                cache,
+                breakdown.scaled_admission_safety_bytes(snapshot),
+            )?;
+            // The evidence is a process-RSS delta, which counts faulted
+            // mmap-backed pages, so this bound adds reclaimable residency back.
             let host_peak = phases
                 .iter()
-                .map(|p| p.host_peak_bytes())
+                .map(|p| {
+                    p.host_peak_bytes()?
+                        .checked_add(p.reclaimable_host_bytes)
+                        .context("GLM evidence host bound overflow")
+                })
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .max()
@@ -224,7 +265,38 @@ pub fn select(
                 .into_iter()
                 .flatten()
                 .max();
+            // Under the fold both deltas draw from one pool.
+            let combined_peak = if snapshot.unified_pool_available_bytes().is_some() {
+                Some(
+                    phases
+                        .iter()
+                        .map(|p| {
+                            p.host_peak_bytes()?
+                                .checked_add(p.reclaimable_host_bytes)
+                                .and_then(|n| {
+                                    n.checked_add(p.device_peak_bytes().ok()?.unwrap_or(0))
+                                })
+                                .context("GLM unified evidence bound overflow")
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .max()
+                        .unwrap_or(0),
+                )
+            } else {
+                None
+            };
             if row.observed_peak_deltas.is_none_or(|(host, device)| {
+                if let Some(bound) = combined_peak {
+                    // A missing device observation is not a zero one; the H3
+                    // fold rejects it and so does this.
+                    let Some(device) = device else {
+                        return true;
+                    };
+                    return host
+                        .checked_add(device)
+                        .is_none_or(|combined| combined > bound);
+                }
                 host > host_peak
                     || match (device, device_peak) {
                         (Some(d), Some(bound)) => d > bound,
@@ -282,9 +354,81 @@ pub fn select(
         }
         observations.push(observation);
     }
-    let (policy, _, measured) = selected.context(
-        "no admissible GLM resource policy; the baseline and qualified candidates were refused",
-    )?;
+    let build_provenance = |policy: &GlmExecutionPolicy,
+                            axes: Vec<SelectedResourceAxis>,
+                            phases: Vec<ResourcePhaseEstimate>,
+                            observations: Vec<ResourceCandidateObservation>,
+                            refused: bool|
+     -> Result<ResourceSelectionProvenance> {
+        Ok(ResourceSelectionProvenance {
+            schema_version: 1,
+            policy: serde_json::to_value(policy)?,
+            selector_revision: "resource-policy-measured-v1".into(),
+            request: context.request.clone(),
+            input: None,
+            model: serde_json::to_value(&context.model)?,
+            hardware: Some(serde_json::to_value(&context.hardware)?),
+            executable: context
+                .executable_metadata
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
+            environment: Some(serde_json::to_value(&context.environment)?),
+            mode,
+            selection_snapshot: snapshot.clone(),
+            final_admission_snapshot: None,
+            already_present_at_capture: vec!["device context, tokenizer and header catalog".into()],
+            inventory: breakdown.raw_inventory.clone(),
+            phases,
+            workload: BTreeMap::from([
+                ("prompt_tokens".into(), breakdown.prompt_tokens as u64),
+                (
+                    "context_bound_tokens".into(),
+                    policy.dsa_context_bound_tokens as u64,
+                ),
+                ("refused".into(), u64::from(refused)),
+                // The reserve actually applied, after pool scaling — the
+                // calibration reader needs the number, not the rule.
+                (
+                    "admission_safety_bytes_applied".into(),
+                    breakdown.scaled_admission_safety_bytes(snapshot),
+                ),
+            ]),
+            axes,
+            candidates: observations,
+        })
+    };
+    let Some((policy, _, measured)) = selected else {
+        // A refusal must still ship its numbers: per-candidate dispositions
+        // and the phase estimates they were judged against. The record names
+        // the baseline (that is what was evaluated) and marks refused=1.
+        // Same rule as the admitted path; nothing was selected, so no evidence.
+        let refusal_axes = baseline_axes
+            .iter()
+            .map(|(axis, value)| SelectedResourceAxis {
+                axis: axis.clone(),
+                value: value.clone(),
+                origin: if explicit_axes.contains(axis) {
+                    SelectionOrigin::OperatorExplicit
+                } else {
+                    SelectionOrigin::Baseline
+                },
+            })
+            .collect();
+        let refusal_phases = breakdown.phases_with_safety(
+            baseline.resident_static,
+            usize::try_from(baseline.expert_cache.maximum_bound_bytes)?,
+            cache_policy(baseline)?,
+            breakdown.scaled_admission_safety_bytes(snapshot),
+        )?;
+        let provenance =
+            build_provenance(baseline, refusal_axes, refusal_phases, observations, true)?;
+        return Err(super::AdmissionRefused {
+            provenance,
+            summary: "no admissible GLM resource policy; the baseline and qualified candidates were refused".into(),
+        }
+        .into());
+    };
     let selected_axes = axes(&policy)?
         .into_iter()
         .map(|(axis, value)| {
@@ -302,48 +446,21 @@ pub fn select(
             }
         })
         .collect();
-    let mut phases = breakdown.phases(
+    let mut phases = breakdown.phases_with_safety(
         policy.resident_static,
         usize::try_from(policy.expert_cache.maximum_bound_bytes)?,
         cache_policy(&policy)?,
+        breakdown.scaled_admission_safety_bytes(snapshot),
     )?;
     if policy.weights != baseline.weights {
-        let host =
-            crate::glm::admission::host_available(snapshot).context("host capacity unavailable")?;
         for phase in &mut phases {
-            phase.host_promotion_reserve_bytes = (1_u64 << 30).max(host / 20);
+            phase.host_promotion_reserve_bytes =
+                crate::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
+                    snapshot,
+                );
         }
     }
-    let provenance = ResourceSelectionProvenance {
-        schema_version: 1,
-        policy: serde_json::to_value(&policy)?,
-        selector_revision: "resource-policy-measured-v1".into(),
-        request: context.request.clone(),
-        input: None,
-        model: serde_json::to_value(&context.model)?,
-        hardware: Some(serde_json::to_value(&context.hardware)?),
-        executable: context
-            .executable_metadata
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()?,
-        environment: Some(serde_json::to_value(&context.environment)?),
-        mode,
-        selection_snapshot: snapshot.clone(),
-        final_admission_snapshot: None,
-        already_present_at_capture: vec!["device context, tokenizer and header catalog".into()],
-        inventory: breakdown.raw_inventory.clone(),
-        phases,
-        workload: BTreeMap::from([
-            ("prompt_tokens".into(), breakdown.prompt_tokens as u64),
-            (
-                "context_bound_tokens".into(),
-                policy.dsa_context_bound_tokens as u64,
-            ),
-        ]),
-        axes: selected_axes,
-        candidates: observations,
-    };
+    let provenance = build_provenance(&policy, selected_axes, phases, observations, false)?;
     provenance.validate()?;
     provenance.validate_policy_binding(&serde_json::to_value(&policy)?)?;
     Ok(GlmSelection { policy, provenance })
@@ -392,6 +509,10 @@ mod tests {
             cgroup_v2_memory_limit: Some(CgroupMemoryLimit::Bytes(8 << 30)),
             cgroup_v2_memory_current_bytes: Some(0),
             device_free_memory_bytes: None,
+            host_device_memory_is_unified: None,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -409,6 +530,7 @@ mod tests {
             cpu_fp8_dequantization: false,
             pinned_transfer_bytes: 0,
             pinned_fill_ahead_bytes: 0,
+            concurrent_loads: 0,
             static_load_device_bytes: 0,
             expert_load_device_bytes: 0,
             compute_on_host: true,
@@ -553,6 +675,138 @@ mod tests {
                     && a.origin == SelectionOrigin::MeasuredEvidence)
         );
     }
+    #[test]
+    fn unified_pool_blocks_weight_promotion_that_split_axes_admit() {
+        let base = baseline();
+        // Candidate differs only in the weights axis, so it reaches the
+        // host-promotion reserve check.
+        let mut promoted = base.clone();
+        promoted.weights.cache_bytes = Some(64 << 30);
+        let evidence = ResourceEvidence {
+            candidates: vec![MeasuredCandidate {
+                baseline_policy: EvidencePolicy::Glm(base.clone()),
+                candidate: EvidencePolicy::Glm(promoted.clone()),
+                minimum_improvement_basis_points: 200,
+                routing_trace: None,
+                routing_replay: None,
+                observed_peak_deltas: Some((1, None)),
+                routing_verified: false,
+                routing_profile: None,
+                pairs: (0..3)
+                    .map(|n| PairedObservation {
+                        baseline_wall_us: 1000,
+                        candidate_wall_us: 500,
+                        baseline_record: EvidenceArtifact {
+                            file: format!("wbase{n}.json"),
+                            bytes: 20 + n,
+                        },
+                        candidate_record: EvidenceArtifact {
+                            file: format!("wcandidate{n}.json"),
+                            bytes: 30 + n,
+                        },
+                        outputs_match: true,
+                    })
+                    .collect(),
+            }],
+            ..evidence()
+        };
+        // Pool (the device view is smallest) passes plain capacity but not the
+        // promotion reserve; the discrete host view admits both. Totals are
+        // set explicitly so the total-scaled reserves are fixed (host_total
+        // 8 GiB → promotion reserve 0.4 GiB) and the discriminating margin is
+        // not pool-dependent: peak 0.404 GiB + 0.4 GiB > 0.5 GiB pool.
+        let mut unified_snapshot = snapshot();
+        unified_snapshot.host_memory_total_bytes = Some(8 << 30);
+        unified_snapshot.device_free_memory_bytes = Some(536_870_912);
+        unified_snapshot.host_device_memory_is_unified = Some(true);
+        let mut discrete_snapshot = unified_snapshot.clone();
+        discrete_snapshot.host_device_memory_is_unified = None;
+
+        let selected = select(
+            &base,
+            &breakdown(),
+            &discrete_snapshot,
+            &context(),
+            ResourcePolicyMode::Performance,
+            &BTreeSet::new(),
+            Some(&evidence),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.policy.weights.cache_bytes,
+            Some(64 << 30),
+            "discrete axes admit the promotion reserve"
+        );
+
+        let selected = select(
+            &base,
+            &breakdown(),
+            &unified_snapshot,
+            &context(),
+            ResourcePolicyMode::Performance,
+            &BTreeSet::new(),
+            Some(&evidence),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.policy, base,
+            "unified pool must charge device bytes to the promotion reserve"
+        );
+    }
+
+    #[test]
+    fn refusal_carries_the_full_candidate_record() {
+        let base = baseline();
+        let mut tight = snapshot();
+        // Nothing fits: 1 byte of host capacity.
+        tight.host_memory_available_bytes = Some(1);
+        tight.cgroup_v2_memory_available_bytes = Some(1);
+        tight.cgroup_v2_memory_limit = Some(CgroupMemoryLimit::Bytes(1));
+        let error = match select(
+            &base,
+            &breakdown(),
+            &tight,
+            &context(),
+            ResourcePolicyMode::Performance,
+            &BTreeSet::new(),
+            None,
+        ) {
+            Ok(_) => panic!("a 1-byte capacity must refuse"),
+            Err(error) => error,
+        };
+        let refusal = error
+            .downcast_ref::<crate::resource_policy::AdmissionRefused>()
+            .expect("refusals must carry the candidate record");
+        assert_eq!(refusal.provenance.workload.get("refused"), Some(&1));
+        assert!(!refusal.provenance.candidates.is_empty());
+        assert!(
+            refusal
+                .provenance
+                .candidates
+                .iter()
+                .all(|c| c.disposition != CandidateDisposition::Selected)
+        );
+        assert!(
+            refusal
+                .provenance
+                .candidates
+                .iter()
+                .any(|c| !c.reason.is_empty())
+        );
+        // The record must carry calibratable numbers, not just the refusal
+        // marker: at least one phase with a non-zero host peak. (This fixture
+        // is host-only, so no device peaks exist here; CUDA phases are covered
+        // by the unified-pool tests above.)
+        assert!(
+            refusal
+                .provenance
+                .phases
+                .iter()
+                .any(|p| p.host_peak_bytes().is_ok_and(|peak| peak > 0)),
+            "refusal record must carry non-zero phase estimates"
+        );
+    }
+
     #[test]
     fn explicit_false_and_conservative_mode_own_the_choice() {
         for (mode, explicit) in [

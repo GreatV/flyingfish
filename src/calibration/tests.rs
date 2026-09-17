@@ -157,6 +157,10 @@ fn resource_snapshot(measured_at_unix_ms: u64) -> ResourceSnapshot {
         cgroup_v2_memory_current_bytes: None,
         cgroup_v2_memory_available_bytes: None,
         device_free_memory_bytes: None,
+        host_device_memory_is_unified: None,
+        device_topology_probe_failed: false,
+        host_memory_total_bytes: None,
+        device_total_memory_bytes: None,
         measurement_scope: ResourceMeasurementScopes {
             host_memory: None,
             cgroup_memory: None,

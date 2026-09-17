@@ -301,7 +301,12 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
             automatic_axes.push("resident_static");
         }
         if !explicit_axes.contains("expert_cache.maximum_bound_bytes") {
-            let phases = breakdown.phases(baseline.resident_static, 0, baseline.cache_policy()?)?;
+            let phases = breakdown.phases_with_safety(
+                baseline.resident_static,
+                0,
+                baseline.cache_policy()?,
+                breakdown.scaled_admission_safety_bytes(&selection_snapshot),
+            )?;
             let bytes =
                 breakdown.automatic_expert_cache_bytes(&phases, &selection_snapshot)? as u64;
             baseline.expert_cache.maximum_bound_bytes = bytes;
@@ -317,7 +322,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
             ]);
         }
     }
-    let mut selection = flyingfish::resource_policy::glm::select(
+    let mut selection = match flyingfish::resource_policy::glm::select(
         &baseline,
         &breakdown,
         &selection_snapshot,
@@ -325,7 +330,22 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         resource_policy,
         &explicit_axes,
         evidence.as_ref().map(|(record, _)| record),
-    )?;
+    ) {
+        Ok(selection) => selection,
+        Err(error) => {
+            // A refusal still publishes its per-candidate record when a
+            // sidecar path was given, so the rejection can be calibrated
+            // against instead of guessed about.
+            flyingfish::resource_policy::report_refusal(
+                &error,
+                resource_selection
+                    .as_deref()
+                    .map(flyingfish::resource_policy::refusal_path_for)
+                    .as_deref(),
+            );
+            return Err(error);
+        }
+    };
     if !automatic_axes.is_empty() {
         selection.provenance.selector_revision = "glm-resource-capacity-v2".into();
         for axis in &mut selection.provenance.axes {
@@ -345,12 +365,102 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
     resident_static = selection.policy.resident_static;
     let admission_snapshot =
         flyingfish::runtime::probe::ResourceSnapshot::capture(Some(prepared.device()));
-    breakdown.validate_capacity(
+    // A promotion was admitted only because its peaks plus the promotion
+    // reserve fitted; that gate is re-run here, not just the ordinary peaks.
+    let promotion_refusal = if selection.policy.weights != baseline.weights {
+        flyingfish::glm::admission::GlmAdmissionBreakdown::promotion_headroom_error(
+            &breakdown,
+            resident_static,
+            usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
+            selection.policy.cache_policy()?,
+            &admission_snapshot,
+        )
+    } else {
+        None
+    };
+    if let Err(error) = breakdown
+        .validate_capacity(
+            resident_static,
+            usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
+            selection.policy.cache_policy()?,
+            &admission_snapshot,
+        )
+        .and_then(|()| match promotion_refusal {
+            Some(message) => anyhow::bail!("{message}"),
+            None => Ok(()),
+        })
+    {
+        // The capacity race this second snapshot detects publishes its ledger
+        // like any other refusal; it is the one that carries both snapshots.
+        // Rebuilt from the final snapshot: `validate_capacity` scales its
+        // reserve from that snapshot's pool, so selection-time phases and
+        // applied reserve cannot reproduce the check that rejected the run.
+        let mut provenance = selection.provenance.clone();
+        let final_safety = breakdown.scaled_admission_safety_bytes(&admission_snapshot);
+        provenance.phases = breakdown.phases_with_safety(
+            resident_static,
+            usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
+            selection.policy.cache_policy()?,
+            final_safety,
+        )?;
+        provenance
+            .workload
+            .insert("admission_safety_bytes_applied".into(), final_safety);
+        if selection.policy.weights != baseline.weights {
+            let promotion =
+                flyingfish::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
+                    &admission_snapshot,
+                );
+            for phase in &mut provenance.phases {
+                phase.host_promotion_reserve_bytes = promotion;
+            }
+        }
+        provenance.final_admission_snapshot = Some(admission_snapshot);
+        provenance.workload.insert("refused".into(), 1);
+        for candidate in &mut provenance.candidates {
+            if candidate.disposition
+                == flyingfish::runtime::resource_selection::CandidateDisposition::Selected
+            {
+                candidate.disposition =
+                    flyingfish::runtime::resource_selection::CandidateDisposition::CapacityRejected;
+                candidate.reason = format!("refused by final admission: {error}");
+            }
+        }
+        let refusal = anyhow::Error::from(flyingfish::resource_policy::AdmissionRefused {
+            provenance,
+            summary: format!("GLM final admission refused: {error}"),
+        });
+        flyingfish::resource_policy::report_refusal(
+            &refusal,
+            resource_selection
+                .as_deref()
+                .map(flyingfish::resource_policy::refusal_path_for)
+                .as_deref(),
+        );
+        return Err(refusal);
+    }
+    // The admitted record is rebuilt from the same snapshot for the same
+    // reason: what it reports must be what the final check actually applied.
+    let final_safety = breakdown.scaled_admission_safety_bytes(&admission_snapshot);
+    selection.provenance.phases = breakdown.phases_with_safety(
         resident_static,
         usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
         selection.policy.cache_policy()?,
-        &admission_snapshot,
+        final_safety,
     )?;
+    selection
+        .provenance
+        .workload
+        .insert("admission_safety_bytes_applied".into(), final_safety);
+    if selection.policy.weights != baseline.weights {
+        let promotion =
+            flyingfish::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
+                &admission_snapshot,
+            );
+        for phase in &mut selection.provenance.phases {
+            phase.host_promotion_reserve_bytes = promotion;
+        }
+    }
     selection.provenance.final_admission_snapshot = Some(admission_snapshot.clone());
     eprintln!(
         "GLM resource policy {:?}: {} candidates, static={}, expert cache={} bytes",
