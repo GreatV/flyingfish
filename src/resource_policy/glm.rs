@@ -245,9 +245,19 @@ pub fn select(
                 cache,
                 breakdown.scaled_admission_safety_bytes(snapshot),
             )?;
+            // Admission charges only exclusive bytes, but the evidence this is
+            // compared against is a process-RSS delta, and `VmRSS` counts
+            // faulted mmap-backed weight pages too. Comparing an RSS delta with
+            // an exclusive-only bound marks valid trials as regressions, so the
+            // bound used *for evidence* adds the reclaimable residency back.
+            // Nothing here changes what admission charges.
             let host_peak = phases
                 .iter()
-                .map(|p| p.host_peak_bytes())
+                .map(|p| {
+                    p.host_peak_bytes()?
+                        .checked_add(p.reclaimable_host_bytes)
+                        .context("GLM evidence host bound overflow")
+                })
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .max()
