@@ -365,12 +365,21 @@ pub fn select(
         // A refusal must still ship its numbers: per-candidate dispositions
         // and the phase estimates they were judged against. The record names
         // the baseline (that is what was evaluated) and marks refused=1.
+        // Origins follow the same rule as the admitted path. Recording every
+        // axis as `Baseline` would describe operator-selected settings as
+        // defaults, so a reader calibrating against the refusal would blame the
+        // wrong configuration for it. Measured evidence cannot appear here:
+        // nothing was selected.
         let refusal_axes = baseline_axes
             .iter()
             .map(|(axis, value)| SelectedResourceAxis {
                 axis: axis.clone(),
                 value: value.clone(),
-                origin: SelectionOrigin::Baseline,
+                origin: if explicit_axes.contains(axis) {
+                    SelectionOrigin::OperatorExplicit
+                } else {
+                    SelectionOrigin::Baseline
+                },
             })
             .collect();
         let refusal_phases = breakdown.phases_with_safety(
