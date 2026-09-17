@@ -517,12 +517,17 @@ impl PreparedGlm {
                     .host_route_workspace_bytes
                     .checked_add(breakdown.host_sampling_workspace_bytes)
                     .and_then(|n| n.checked_add(breakdown.prefill_host_mask_bytes))
+                    // The same `resident_static` split `phases_with_safety`
+                    // uses. Charging the maximum instead would require more at
+                    // runtime than admission granted whenever the streamed
+                    // static buffer is the larger one and is never allocated,
+                    // rejecting after the model already passed both admissions.
                     .and_then(|n| {
-                        n.checked_add(
-                            breakdown
-                                .streamed_load_host_bytes
-                                .max(breakdown.expert_load_host_bytes),
-                        )
+                        n.checked_add(if self.resident_static {
+                            breakdown.expert_load_host_bytes
+                        } else {
+                            breakdown.streamed_load_host_bytes
+                        })
                     })
                     // Pinned upload slots are charged to both axes and the
                     // fill-ahead ring to the host; both are allocated lazily,
