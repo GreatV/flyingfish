@@ -895,7 +895,22 @@ fn select_generation_resources(
     }) {
         Ok(selected) => selected,
         Err(error) => {
-            flyingfish::resource_policy::report_refusal(&error, Some(refusal_sidecar));
+            // Only a refusal that carries a ledger needs a home for it. An
+            // early bail — a zero budget, say — has nothing to publish, and a
+            // run that never started must leave no directory behind, which is
+            // what `ArtifactStaging` would otherwise require us to create.
+            let destination = error
+                .downcast_ref::<flyingfish::resource_policy::AdmissionRefused>()
+                .and_then(|_| {
+                    let parent = refusal_sidecar.parent()?;
+                    std::fs::create_dir_all(parent)
+                        .inspect_err(|error| {
+                            eprintln!("warning: cannot create {}: {error}", parent.display())
+                        })
+                        .ok()?;
+                    Some(refusal_sidecar)
+                });
+            flyingfish::resource_policy::report_refusal(&error, destination);
             return Err(error);
         }
     };
