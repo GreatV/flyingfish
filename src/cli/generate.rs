@@ -2164,6 +2164,22 @@ pub(super) fn probed_budget(
     let max_host_bytes = requested_host.or(probed_host).context(
         "generation preflight cannot measure available host memory; provide --max-host-mib explicitly",
     )?;
+    // On a probed unified-memory device the device axis is folded into host
+    // accounting, so the combined peak is charged against this one bound. The
+    // host view alone can exceed the shared pool — CUDA free memory tracks
+    // MemFree while MemAvailable also counts reclaimable page cache — so an
+    // unclamped host bound admits a footprint the pool cannot hold. Explicit
+    // `--max-host-mib` is clamped too, matching how the device axis already
+    // takes the minimum of the request and the probe.
+    anyhow::ensure!(
+        !snapshot.unified_pool_is_unmeasurable(),
+        "generation preflight needs the shared host/device pool size on a unified-memory device, \
+         but one of the host and CUDA views could not be measured"
+    );
+    let max_host_bytes = match snapshot.unified_pool_available_bytes() {
+        Some(pool) => max_host_bytes.min(pool),
+        None => max_host_bytes,
+    };
     let requested_device = max_device_mib.map(mib_to_bytes).transpose()?;
     let max_device_bytes = match backend {
         ExecutionBackendPolicy::Cpu => requested_device,
@@ -3686,6 +3702,65 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("cannot measure free device memory")
+        );
+    }
+
+    #[test]
+    fn probed_budget_clamps_the_host_bound_to_a_probed_unified_pool() {
+        let snapshot = |unified: Option<bool>| ResourceSnapshot {
+            schema_version: flyingfish::runtime::probe::RESOURCE_SNAPSHOT_SCHEMA_VERSION,
+            measured_at_unix_ms: 1,
+            // MemAvailable counts reclaimable page cache; CUDA free memory
+            // tracks MemFree. On a shared pool the larger view is not a bound.
+            host_memory_available_bytes: Some(10 * 1024 * 1024),
+            cgroup_v2_memory_limit: None,
+            cgroup_v2_memory_current_bytes: None,
+            cgroup_v2_memory_available_bytes: None,
+            device_free_memory_bytes: Some(6 * 1024 * 1024),
+            host_device_memory_is_unified: unified,
+            host_memory_total_bytes: None,
+            device_total_memory_bytes: None,
+            measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
+                host_memory: None,
+                cgroup_memory: None,
+                device_memory: None,
+            },
+        };
+        // Discrete and unprobed records keep the host view untouched.
+        for legacy in [None, Some(false)] {
+            let budget =
+                probed_budget(&snapshot(legacy), ExecutionBackendPolicy::Cuda, None, None).unwrap();
+            assert_eq!(budget.max_host_bytes, Some(10 * 1024 * 1024));
+        }
+        // A probed unified pool binds the folded host bound, and an explicit
+        // request is clamped the same way the device axis already is.
+        let folded =
+            probed_budget(&snapshot(Some(true)), ExecutionBackendPolicy::Cuda, None, None).unwrap();
+        assert_eq!(folded.max_host_bytes, Some(6 * 1024 * 1024));
+        let requested = probed_budget(
+            &snapshot(Some(true)),
+            ExecutionBackendPolicy::Cuda,
+            Some(9),
+            None,
+        )
+        .unwrap();
+        assert_eq!(requested.max_host_bytes, Some(6 * 1024 * 1024));
+        // A unified topology whose pool cannot be measured is refused, not
+        // quietly treated as a discrete device.
+        let unmeasurable = ResourceSnapshot {
+            device_free_memory_bytes: None,
+            ..snapshot(Some(true))
+        };
+        assert!(
+            probed_budget(
+                &unmeasurable,
+                ExecutionBackendPolicy::Cuda,
+                Some(9),
+                Some(9)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("shared host/device pool size")
         );
     }
 
