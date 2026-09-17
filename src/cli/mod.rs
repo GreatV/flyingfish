@@ -522,10 +522,22 @@ fn decide_auto_residency_with_required_memory(
     let reserve = required_device_bytes
         .checked_add(DEVICE_RESIDENCY_RESERVE_BYTES)
         .context("device residency reserve overflow")?;
-    let available = ResourceSnapshot::capture(Some(device))
-        .device_free_memory_bytes
-        .unwrap_or(0)
-        .saturating_sub(reserve);
+    // The same fold `decide_device_residency` applies. On an integrated device
+    // the host and cgroup views can be tighter than CUDA free memory, and this
+    // automatic path — the default for the generic adapters — would otherwise
+    // fill past the shared pool while only explicit `--device-cache-mib`
+    // requests got the correction. A confirmed pool of unknown size retains
+    // nothing rather than falling back to the device view.
+    let snapshot = ResourceSnapshot::capture(Some(device));
+    let capacity = if snapshot.unified_pool_is_unmeasurable() {
+        0
+    } else {
+        snapshot
+            .unified_pool_available_bytes()
+            .or(snapshot.device_free_memory_bytes)
+            .unwrap_or(0)
+    };
+    let available = capacity.saturating_sub(reserve);
     let plan = plan_device_residency(demands, available, 0)?;
     eprintln!(
         "device residency: auto retains {} MiB in {}/{} weight groups after reserving {} MiB for request tensors and workspace",
