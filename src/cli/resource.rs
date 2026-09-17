@@ -246,7 +246,14 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         request.limits.max_device_mib,
     )?;
     let phase = &selection.provenance.phases[0];
-    let device_peak = if selection.policy.execution_backend == ExecutionBackendPolicy::Cpu {
+    // The fold makes `build_provenance` emit a host-only phase, so reading the
+    // device peak from it records zero compute and the whole device budget as
+    // remaining — contradicting the selection ledger, which kept the real CUDA
+    // component. Physical fit is still enforced through the combined host peak;
+    // this only decides what the record says was used.
+    let device_peak = if selection.policy.execution_backend == ExecutionBackendPolicy::Cpu
+        || final_observation.host_device_memory_is_unified == Some(true)
+    {
         selection
             .estimate
             .peak_device_bytes
