@@ -259,9 +259,15 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
     } else {
         phase.device_peak_bytes()?.unwrap_or(0)
     };
+    // A promotion was selected only if its peak plus this reserve fitted, so
+    // the same requirement is carried into the final check. Under the fold the
+    // device peak is already inside the host ledger the reserve sits beside.
     let host_peak = phase.host_peak_bytes()?;
+    let checked_host = host_peak
+        .checked_add(phase.host_promotion_reserve_bytes)
+        .context("H3 final promotion headroom overflow")?;
     if !final_budget
-        .check_peaks(host_peak, device_peak)
+        .check_peaks(checked_host, device_peak)
         .within_budget
     {
         // A bare error would leave the caller nothing to downcast.
