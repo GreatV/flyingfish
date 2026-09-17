@@ -266,7 +266,13 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
     {
         // A bare error would leave the caller nothing to downcast.
         let mut provenance = selection.provenance.clone();
-        provenance.final_admission_snapshot = Some(final_observation);
+        flyingfish::resource_policy::h3::record_refused_final_admission(
+            &mut provenance,
+            final_observation,
+            final_budget,
+            host_peak,
+            device_peak,
+        )?;
         provenance.workload.insert("refused".into(), 1);
         for candidate in &mut provenance.candidates {
             if candidate.disposition
