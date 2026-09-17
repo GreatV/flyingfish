@@ -2036,12 +2036,28 @@ fn preflight_generation(
     )
     .context("generation numerical-backend preflight refused before model payload access")?;
     let snapshot = ResourceSnapshot::capture(Some(device));
-    let budget = probed_budget(
+    let mut budget = probed_budget(
         &snapshot,
         policy.execution_backend,
         max_host_mib,
         max_device_mib,
     )?;
+    // Selection promised the same reserve on the folded host axis (see
+    // `cli/resource.rs`, which charges it as `additional_host_allowance_bytes`).
+    // This preflight captures a fresh snapshot and becomes the final admission
+    // record, so without the reserve a pool that fell between the modelled peak
+    // and peak-plus-reserve would pass here after selection had refused it.
+    // Charged on the budget side rather than the peak so it is applied exactly
+    // once on this path; unifying the two homes is the A7 follow-up recorded in
+    // `docs/resource-ownership.md`.
+    if snapshot.host_device_memory_is_unified == Some(true) {
+        budget.max_host_bytes = Some(
+            budget
+                .max_host_bytes
+                .context("unified generation preflight needs a host bound")?
+                .saturating_sub(super::DEVICE_RESIDENCY_RESERVE_BYTES),
+        );
+    }
 
     require_indexed_transformer(transformer_dir)?;
     let weights = ModelWeights::open(transformer_dir, WeightSource::Mmap, CachePolicy::new(1))?;
