@@ -365,12 +365,31 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
     resident_static = selection.policy.resident_static;
     let admission_snapshot =
         flyingfish::runtime::probe::ResourceSnapshot::capture(Some(prepared.device()));
-    if let Err(error) = breakdown.validate_capacity(
-        resident_static,
-        usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
-        selection.policy.cache_policy()?,
-        &admission_snapshot,
-    ) {
+    // A promotion was admitted only because its peaks plus the promotion
+    // reserve fitted; that gate is re-run here, not just the ordinary peaks.
+    let promotion_refusal = if selection.policy.weights != baseline.weights {
+        flyingfish::glm::admission::GlmAdmissionBreakdown::promotion_headroom_error(
+            &breakdown,
+            resident_static,
+            usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
+            selection.policy.cache_policy()?,
+            &admission_snapshot,
+        )
+    } else {
+        None
+    };
+    if let Err(error) = breakdown
+        .validate_capacity(
+            resident_static,
+            usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
+            selection.policy.cache_policy()?,
+            &admission_snapshot,
+        )
+        .and_then(|()| match promotion_refusal {
+            Some(message) => anyhow::bail!("{message}"),
+            None => Ok(()),
+        })
+    {
         // The capacity race this second snapshot detects publishes its ledger
         // like any other refusal; it is the one that carries both snapshots.
         // Rebuilt from the final snapshot: `validate_capacity` scales its

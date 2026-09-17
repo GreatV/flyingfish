@@ -776,6 +776,43 @@ impl GlmAdmissionBreakdown {
         }
     }
 
+    /// Whether a weight promotion still has its reserve of headroom. The
+    /// selector admits a promotion only when every phase plus this reserve
+    /// fits, so a later snapshot must be judged by the same rule.
+    pub fn promotion_headroom_error(
+        &self,
+        resident_static: bool,
+        expert_cache_bytes: usize,
+        cache_policy: CachePolicy,
+        snapshot: &ResourceSnapshot,
+    ) -> Option<String> {
+        let unified = snapshot.unified_pool_available_bytes();
+        let host = unified.or_else(|| host_available(snapshot))?;
+        let reserve = Self::scaled_promotion_reserve_bytes(snapshot);
+        let phases = self
+            .phases_with_safety(
+                resident_static,
+                expert_cache_bytes,
+                cache_policy,
+                self.scaled_admission_safety_bytes(snapshot),
+            )
+            .ok()?;
+        for phase in phases {
+            let mut peak = phase.host_peak_bytes().ok()?;
+            if unified.is_some() {
+                peak = peak.checked_add(phase.device_peak_bytes().ok()?.unwrap_or(0))?;
+            }
+            let needed = peak.checked_add(reserve)?;
+            if needed > host {
+                return Some(format!(
+                    "GLM {} promotion needs {needed} bytes including its {reserve} byte reserve, but only {host} are available",
+                    phase.phase
+                ));
+            }
+        }
+        None
+    }
+
     pub fn validate_capacity(
         &self,
         resident_static: bool,
