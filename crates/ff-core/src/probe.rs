@@ -427,14 +427,27 @@ impl ResourceSnapshot {
         if self.host_device_memory_is_unified != Some(true) {
             return None;
         }
-        [
-            self.host_memory_available_bytes,
-            self.cgroup_v2_memory_available_bytes,
-            self.device_free_memory_bytes,
-        ]
-        .into_iter()
-        .flatten()
-        .min()
+        // Both binding views are required. A minimum over whichever views
+        // happened to be measured would pass one axis's availability off as
+        // the shared pool's, which is the error this method exists to prevent.
+        // A cgroup limit is genuinely optional: its absence is no constraint.
+        let pool = self
+            .host_memory_available_bytes?
+            .min(self.device_free_memory_bytes?);
+        Some(match self.cgroup_v2_memory_available_bytes {
+            Some(limit) => pool.min(limit),
+            None => pool,
+        })
+    }
+
+    /// Whether the probe confirmed a shared host/device pool whose size it
+    /// could not measure. Callers that fold both axes must not silently fall
+    /// back to independent per-axis checks here: the fold is known to be
+    /// required and the bound is unknown, which is not the same situation as
+    /// an unprobed or discrete device.
+    pub fn unified_pool_is_unmeasurable(&self) -> bool {
+        self.host_device_memory_is_unified == Some(true)
+            && self.unified_pool_available_bytes().is_none()
     }
 }
 
@@ -1416,6 +1429,33 @@ mod tests {
         assert_eq!(snapshot(Some(false)).unified_pool_available_bytes(), None);
         // A probed unified topology binds on the smallest view of the pool.
         assert_eq!(snapshot(Some(true)).unified_pool_available_bytes(), Some(6));
+        assert!(!snapshot(Some(true)).unified_pool_is_unmeasurable());
+        // A missing binding view yields no pool rather than the other view's
+        // availability, and is reported as unmeasurable so that callers do not
+        // mistake it for a discrete device.
+        for missing in [
+            ResourceSnapshot {
+                device_free_memory_bytes: None,
+                ..snapshot(Some(true))
+            },
+            ResourceSnapshot {
+                host_memory_available_bytes: None,
+                ..snapshot(Some(true))
+            },
+        ] {
+            assert_eq!(missing.unified_pool_available_bytes(), None);
+            assert!(missing.unified_pool_is_unmeasurable());
+        }
+        // An absent cgroup limit is no constraint, not a missing measurement.
+        let no_cgroup = ResourceSnapshot {
+            cgroup_v2_memory_available_bytes: None,
+            ..snapshot(Some(true))
+        };
+        assert_eq!(no_cgroup.unified_pool_available_bytes(), Some(6));
+        assert!(!no_cgroup.unified_pool_is_unmeasurable());
+        // Discrete records are never "unmeasurable": the fold does not apply.
+        assert!(!snapshot(Some(false)).unified_pool_is_unmeasurable());
+        assert!(!snapshot(None).unified_pool_is_unmeasurable());
     }
 
     #[test]

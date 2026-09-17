@@ -757,6 +757,11 @@ impl GlmAdmissionBreakdown {
         // discrete checks is unsafe only when the pool is known shared, and
         // legacy records predate unified support entirely.
         let unified_pool = snapshot.unified_pool_available_bytes();
+        ensure!(
+            !snapshot.unified_pool_is_unmeasurable(),
+            "GLM admission needs the shared host/device pool size on a unified-memory device, \
+             but one of the host and CUDA views could not be measured"
+        );
         let safety = self.scaled_admission_safety_bytes(snapshot);
         for phase in
             self.phases_with_safety(resident_static, expert_cache_bytes, cache_policy, safety)?
