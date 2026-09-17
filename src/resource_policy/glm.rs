@@ -672,11 +672,12 @@ mod tests {
             ..evidence()
         };
         // Pool (the device view is smallest) passes plain capacity but not the
-        // promotion reserve; the discrete host view admits both. Fixture peaks
-        // sit at ~1 GiB, so a 1.8 GiB pool is above capacity but below
-        // capacity plus the 1 GiB promotion reserve.
+        // promotion reserve; the discrete host view admits both. With the
+        // pool-scaled safety term the fixture's host peak is small, so the
+        // discriminating margin is the 1 GiB promotion reserve floor: pool
+        // must sit below peak + 1 GiB while staying above the peak itself.
         let mut unified_snapshot = snapshot();
-        unified_snapshot.device_free_memory_bytes = Some(1_932_735_283);
+        unified_snapshot.device_free_memory_bytes = Some(536_870_912);
         unified_snapshot.host_device_memory_is_unified = Some(true);
         let mut discrete_snapshot = unified_snapshot.clone();
         discrete_snapshot.host_device_memory_is_unified = None;
