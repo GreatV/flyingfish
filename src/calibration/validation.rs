@@ -236,6 +236,11 @@ pub(super) fn validate_snapshot_backend(
     match fingerprint.backend {
         DeviceBackend::Cpu | DeviceBackend::Metal => {
             anyhow::ensure!(
+                !snapshot.device_topology_probe_failed,
+                "calibration {label} snapshot cannot report a failed CUDA topology probe for the {:?} backend",
+                fingerprint.backend
+            );
+            anyhow::ensure!(
                 snapshot.device_free_memory_bytes.is_none(),
                 "calibration {label} snapshot cannot report device-free memory for the {:?} backend",
                 fingerprint.backend
@@ -254,6 +259,12 @@ pub(super) fn validate_snapshot_backend(
             );
         }
         DeviceBackend::Cuda => {
+            // The live probe produces the failure flag only with no topology.
+            anyhow::ensure!(
+                !snapshot.device_topology_probe_failed
+                    || snapshot.host_device_memory_is_unified.is_none(),
+                "calibration {label} snapshot reports both a failed topology probe and a topology"
+            );
             if let Some(total) = snapshot.device_total_memory_bytes {
                 // The fingerprint total is the stable hardware figure.
                 let fingerprint_total = fingerprint.device_total_memory_bytes.context(
