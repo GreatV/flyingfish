@@ -23,8 +23,13 @@ fn fp8_roundtrip(weights: &Tensor, scales: &Tensor, rb: usize, cb: usize) -> Res
         .reshape((nrow, ncol, 1))?
         .broadcast_as((nrow, ncol, rb * cb))?
         .contiguous()?;
-    let q = (blocked.clone() * &scales_bc)?.to_dtype(DType::F8E4M3)?;
-    let back = (q.to_dtype(DType::F32)? * &scales_bc.recip()?)?;
+    // `scales` is absmax/448, so quantization divides by it — that maps each
+    // block's largest magnitude onto e4m3's 448 and uses the format's range.
+    // Multiplying instead drives every weight below e4m3's smallest subnormal
+    // (2^-9): a block with absmax 0.5 becomes 5.6e-4, flushes to zero, and the
+    // screen reports ~100% relative error whether or not FP8 is usable here.
+    let q = (blocked.clone() * &scales_bc.recip()?)?.to_dtype(DType::F8E4M3)?;
+    let back = (q.to_dtype(DType::F32)? * &scales_bc)?;
     Ok(back
         .reshape((nrow, ncol, rb, cb))?
         .transpose(1, 2)?
