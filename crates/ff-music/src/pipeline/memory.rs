@@ -47,6 +47,13 @@ fn sum(values: &[u64]) -> Result<u64> {
 #[cfg(feature = "cuda")]
 use ff_core::weights::is_cuda_allocation_error as is_cuda_oom;
 
+/// Flat free-memory headroom required at an allocation instant (tensor bytes
+/// plus this must fit free memory). Distinct from the pool-scaled admission
+/// reserves on purpose: those size a planning budget, this guards one
+/// allocation, and the two must not move together.
+#[cfg(feature = "cuda")]
+const STAGE_GUARD_HEADROOM_BYTES: u64 = 1 << 30;
+
 fn language_state(component: &Component, prompt: usize, frames: usize) -> Result<(u64, u64, u64)> {
     let tokens = prompt
         .checked_add(frames)
@@ -224,7 +231,13 @@ impl Music3 {
                 let after = context.mem_get_info()?.0 as u64;
                 self.memory_releases.push(PhaseMemoryRelease {
                     stage: "vocoder-oom-retry".to_owned(),
-                    required_free_bytes: sum(&[tensor_bytes, 1 << 30])?,
+                    required_free_bytes: sum(&[
+                        tensor_bytes,
+                        // An instantaneous pre-allocation guard, not an
+                        // admission reserve: a flat local headroom, so tuning
+                        // the shared reserve never moves this gate.
+                        STAGE_GUARD_HEADROOM_BYTES,
+                    ])?,
                     free_bytes_before: before,
                     free_bytes_after: after,
                     released_tensors,
@@ -255,7 +268,7 @@ impl Music3 {
                 if !self.residency.policy().is_enabled() {
                     return Ok(());
                 }
-                let required = sum(&[tensor_bytes, 1 << 30])?;
+                let required = sum(&[tensor_bytes, STAGE_GUARD_HEADROOM_BYTES])?;
                 let context = cuda.cuda_stream().context().clone();
                 device.synchronize()?;
                 let before = context.mem_get_info()?.0 as u64;

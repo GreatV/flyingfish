@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 pub const GLM_EXECUTION_POLICY_SCHEMA_VERSION: u32 = 8;
 pub const MAX_GLM_EXECUTION_POLICY_JSON_BYTES: usize = 1024 * 1024;
-pub const GLM_ADMISSION_SAFETY_BYTES: u64 = 1024 * 1024 * 1024;
+pub const GLM_ADMISSION_SAFETY_BYTES: u64 = ff_core::probe::ADMISSION_RESERVE_CAP_BYTES;
 pub const MAX_GLM_EXPERT_CACHE_BOUND_BYTES: u64 = 1 << 50;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -3,7 +3,7 @@
 //! layout, pinned in docs/qwen35-design.md). Per-group scale/bias by
 //! iterated least squares on the bf16 values (2 rounds), deterministic.
 //!
-//! Usage: requant <src_dir> <dst_dir> [threads]
+//! Usage: requant `<src_dir> <dst_dir> [threads]`
 
 use anyhow::{Context, Result, ensure};
 use half::bf16;
