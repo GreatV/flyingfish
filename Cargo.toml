@@ -8,8 +8,8 @@ publish = false
 
 [workspace]
 resolver = "3"
-members = ["crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music"]
-default-members = [".", "crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music"]
+members = ["crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35"]
+default-members = [".", "crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35"]
 
 [workspace.package]
 version = "0.1.0"

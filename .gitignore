@@ -4,3 +4,7 @@
 # Model checkpoints are hundreds of gigabytes. Keeping them outside this
 # working tree is safer still; these anchored rules are the backstop.
 /models/
+
+/edge0-src
+/edge0-ref
+/models
