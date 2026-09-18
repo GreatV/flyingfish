@@ -1200,13 +1200,13 @@ mod tests {
             .max()
             .unwrap();
         assert!(host_peak > 0 && device_peak > 0);
-        // validate_capacity applies a pool-scaled reserve (pool/20), so the
+        // validate_capacity applies the shared pool-scaled reserve, so the
         // pool must cover each axis *plus* that reserve in split mode while
         // staying below the merged sum. Iterate to the fixed point: pool =
-        // device_peak + pool/20 converges in a few steps at these sizes.
+        // device_peak + reserve(pool) converges in a few steps at these sizes.
         let mut pool = host_peak.max(device_peak);
         for _ in 0..16 {
-            let reserve = pool / 20;
+            let reserve = ff_core::probe::admission_reserve_bytes(Some(pool));
             let split_need = (device_peak + reserve).max(host_peak);
             let merged_need = host_peak + device_peak + reserve;
             if split_need <= pool && merged_need > pool {
@@ -1236,15 +1236,22 @@ mod tests {
                 .unwrap();
         }
         // A pool that holds the combined peak plus the pool-scaled reserve is
-        // admitted. (H + D)·21/19 + 2 covers the reserve = pool/20 fixed point.
+        // admitted — iterate to the merged fixed point, same reserve fn.
+        let mut merged_pool = host_peak + device_peak;
+        for _ in 0..16 {
+            let need = host_peak
+                + device_peak
+                + ff_core::probe::admission_reserve_bytes(Some(merged_pool));
+            if need <= merged_pool {
+                break;
+            }
+            merged_pool = need;
+        }
         gpu.validate_capacity(
             false,
             0,
             CachePolicy::new(1),
-            &unified(
-                Some(true),
-                (host_peak + device_peak) / 19 * 21 + (host_peak + device_peak) % 19 + 2,
-            ),
+            &unified(Some(true), merged_pool),
         )
         .unwrap();
     }
@@ -1268,18 +1275,25 @@ mod tests {
             gpu.scaled_admission_safety_bytes(&desktop),
             GLM_ADMISSION_SAFETY_BYTES
         );
-        // Small unified pool: 5% of its total, fixed across runs (not the
-        // instantaneous available view).
-        let small = ResourceSnapshot {
+        // A mid-size unified pool: 5% of its total (above the floor, below
+        // the cap), fixed across runs (not the instantaneous available view).
+        let mid = ResourceSnapshot {
             host_device_memory_is_unified: Some(true),
             device_topology_probe_failed: false,
-            host_memory_total_bytes: Some(7_849_050_112),
-            device_total_memory_bytes: Some(7_849_050_112),
-            ..snapshot(6272 << 20, u64::MAX, Some(6272 << 20))
+            host_memory_total_bytes: Some(12 << 30),
+            device_total_memory_bytes: Some(12 << 30),
+            ..snapshot(11 << 30, u64::MAX, Some(11 << 30))
         };
-        let scaled = gpu.scaled_admission_safety_bytes(&small);
-        assert_eq!(scaled, 7_849_050_112 / 20);
+        let scaled = gpu.scaled_admission_safety_bytes(&mid);
+        assert_eq!(scaled, (12 << 30) / 20);
         assert!(scaled < GLM_ADMISSION_SAFETY_BYTES);
+        // A small pool keeps the floor instead of shrinking past the fixed
+        // CUDA-context component the reserve also covers.
+        let small = ResourceSnapshot {
+            host_memory_total_bytes: Some(7_849_050_112),
+            ..mid
+        };
+        assert_eq!(gpu.scaled_admission_safety_bytes(&small), 512 << 20);
     }
 
     #[test]

@@ -469,13 +469,20 @@ impl ResourceSnapshot {
 /// Cap every pool-scaled admission reserve converges to: 1 GiB.
 pub const ADMISSION_RESERVE_CAP_BYTES: u64 = 1 << 30;
 
-/// The one admission-reserve shape: 5% of the pool total, capped at 1 GiB.
-/// Pools under 20 GiB scale below the cap so small and unified-memory
-/// machines are not over-reserved; an unknown pool keeps the full cap,
-/// matching the flat reserves this consolidates.
+/// Floor under every pool-scaled admission reserve: part of what a reserve
+/// covers is a fixed cost (a CUDA context is hundreds of MiB) that does not
+/// shrink with the pool, so the percentage alone would under-protect small
+/// machines — the inverse of the over-reservation this consolidates away.
+pub const ADMISSION_RESERVE_FLOOR_BYTES: u64 = 512 << 20;
+
+/// The one admission-reserve shape: 5% of the pool total, floored at
+/// 512 MiB and capped at 1 GiB. Pools under 20 GiB scale below the cap so
+/// small and unified-memory machines are not over-reserved; pools under
+/// ~10 GiB keep the floor so the fixed component stays covered; an unknown
+/// pool keeps the full cap, matching the flat reserves this consolidates.
 pub fn admission_reserve_bytes(pool_total: Option<u64>) -> u64 {
     pool_total.map_or(ADMISSION_RESERVE_CAP_BYTES, |total| {
-        ADMISSION_RESERVE_CAP_BYTES.min(total / 20)
+        ADMISSION_RESERVE_FLOOR_BYTES.max(ADMISSION_RESERVE_CAP_BYTES.min(total / 20))
     })
 }
 
@@ -1853,8 +1860,15 @@ mod tests {
     #[test]
     fn admission_reserve_scales_below_the_crossover_and_caps_above_it() {
         const GIB: u64 = 1 << 30;
+        const FLOOR: u64 = 512 << 20;
         assert_eq!(admission_reserve_bytes(None), GIB);
-        assert_eq!(admission_reserve_bytes(Some(6 * GIB)), 6 * GIB / 20);
+        // Small pools scale down to the floor, never past it: the reserve
+        // still has to cover the fixed CUDA-context component.
+        assert_eq!(admission_reserve_bytes(Some(6 * GIB)), FLOOR);
+        assert_eq!(admission_reserve_bytes(Some(8 * GIB)), FLOOR);
+        assert_eq!(admission_reserve_bytes(Some(0)), FLOOR);
+        // Above ~10 GiB the percentage clears the floor and dominates.
+        assert_eq!(admission_reserve_bytes(Some(16 * GIB)), 16 * GIB / 20);
         assert_eq!(
             admission_reserve_bytes(Some(20 * GIB)),
             GIB,
@@ -1866,6 +1880,5 @@ mod tests {
             "the 24 GiB baseline keeps the flat 1 GiB margin"
         );
         assert_eq!(admission_reserve_bytes(Some(u64::MAX)), GIB);
-        assert_eq!(admission_reserve_bytes(Some(0)), 0);
     }
 }

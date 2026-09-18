@@ -519,6 +519,9 @@ fn device_residency_reserve_bytes(snapshot: &flyingfish::runtime::probe::Resourc
     } else {
         snapshot.device_total_memory_bytes
     };
+    // The free-view fallback below is for legacy recorded snapshots only: a
+    // live capture produces the device total and free together (both come
+    // from the same CUDA device handle).
     flyingfish::runtime::probe::admission_reserve_bytes(total.or(snapshot.device_free_memory_bytes))
 }
 
@@ -1428,7 +1431,7 @@ mod tests {
     #[test]
     fn device_residency_reserve_scales_down_on_small_unified_pools() {
         let snapshot = snap(Some(true), Some(6 << 30), Some(6 << 30), Some(4 << 30));
-        assert_eq!(device_residency_reserve_bytes(&snapshot), (6 << 30) / 20);
+        assert_eq!(device_residency_reserve_bytes(&snapshot), 512 << 20);
     }
 
     #[test]
@@ -1436,10 +1439,11 @@ mod tests {
         // No totals at all: the historical flat cap, not a free-view guess.
         let snapshot = snap(None, None, None, None);
         assert_eq!(device_residency_reserve_bytes(&snapshot), 1 << 30);
-        // A free view without totals mirrors the GLM axis fallback (free/20),
-        // matching what that family already did before consolidation.
+        // A free view without a total is a LEGACY-RECORD shape only (a live
+        // capture produces the total and free together); it mirrors the GLM
+        // axis fallback so replayed selections reproduce their era's reserve.
         let snapshot = snap(None, None, None, Some(4 << 30));
-        assert_eq!(device_residency_reserve_bytes(&snapshot), (4 << 30) / 20);
+        assert_eq!(device_residency_reserve_bytes(&snapshot), 512 << 20);
     }
 
     #[test]

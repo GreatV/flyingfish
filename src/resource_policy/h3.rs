@@ -386,8 +386,11 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
                 .context("automatic host retention requires measured or explicit capacity")?;
             // Same shape as every other admission reserve (see the GLM
             // docstring): the reverse-scaled max() never shrank and grew with
-            // the pool, over-reserving small hosts.
-            let reserve = admission_reserve_bytes(Some(available));
+            // the pool, over-reserving small hosts. The denominator is the
+            // host POOL TOTAL, never an availability view — a reserve that
+            // shrank because the machine is busy would protect least exactly
+            // when protection matters.
+            let reserve = admission_reserve_bytes(request.snapshot.host_pool_total_bytes());
             if host.checked_add(reserve).is_none_or(|n| n > available) {
                 observation.disposition = CandidateDisposition::CapacityRejected;
                 observation.reason = "host retention would consume the promotion reserve".into();
@@ -534,7 +537,9 @@ fn build_provenance(
         optional_host_bytes: retained,
         reclaimable_host_bytes: 0,
         host_promotion_reserve_bytes: if promoted {
-            admission_reserve_bytes(request.budget.max_host_bytes)
+            // Totals, not availability, so the stamped reserve stays
+            // comparable across runs (the reason the totals fields exist).
+            admission_reserve_bytes(request.snapshot.host_pool_total_bytes())
         } else {
             0
         },
@@ -752,6 +757,7 @@ mod tests {
                 max_host_bytes: Some(8 << 30),
                 max_device_bytes: None,
             },
+            &snapshot(),
         )
     }
     fn run_with_budget(
@@ -760,6 +766,7 @@ mod tests {
         evidence: Option<&ResourceEvidence>,
         credit: u64,
         budget: ResourceBudget,
+        snapshot: &ResourceSnapshot,
     ) -> Result<H3Selection> {
         let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
         assumptions.device_memory_is_host = true;
@@ -773,7 +780,7 @@ mod tests {
             assumptions,
             inventory: &inventory(),
             budget,
-            snapshot: &snapshot(),
+            snapshot,
             context: &context(),
             mode: ResourcePolicyMode::Performance,
             explicit_axes: &BTreeSet::new(),
@@ -813,6 +820,7 @@ mod tests {
                 max_host_bytes: Some(1),
                 max_device_bytes: Some(1),
             },
+            &snapshot(),
         )
         .err()
         .expect("a budget below the baseline peak must refuse");
@@ -868,7 +876,8 @@ mod tests {
                 ResourceBudget {
                     max_host_bytes: Some(old.estimate.peak_host_bytes),
                     max_device_bytes: None,
-                }
+                },
+                &snapshot(),
             )
             .is_err()
         );
@@ -980,6 +989,7 @@ mod tests {
                     max_host_bytes: Some(host_limit),
                     max_device_bytes: Some(1 << 30),
                 },
+                &snapshot(),
             )
             .unwrap();
             let record = selected.provenance;
@@ -1115,18 +1125,34 @@ mod tests {
     #[test]
     fn small_host_budgets_scale_the_promotion_reserve_down() {
         // The retired reverse-scaled max() stamped a flat 1 GiB and rejected
-        // any host peak within 1 GiB of the bound; the shared formula keeps
-        // 5% of it, so the same selection admits on smaller hosts.
+        // any host peak within 1 GiB of the bound; the shared formula scales
+        // with the host POOL TOTAL (never an availability view, which would
+        // shrink the reserve exactly when the machine is busiest).
         let budget = ResourceBudget {
             max_host_bytes: Some(8 << 30),
             max_device_bytes: None,
         };
-        let selected = run_with_budget(&baseline(), None, Some(&evidence()), 0, budget).unwrap();
+        // A snapshot without a host total keeps the full cap.
+        let selected =
+            run_with_budget(&baseline(), None, Some(&evidence()), 0, budget, &snapshot()).unwrap();
         assert_ne!(selected.policy, baseline());
         assert_eq!(
             selected.provenance.phases[0].host_promotion_reserve_bytes,
-            (8 << 30) / 20
+            1 << 30
         );
+        // A 64 GiB host total caps at 1 GiB (the old reverse-scaled formula
+        // reserved 3.2 GiB there); a 6 GiB one keeps the 512 MiB floor.
+        for (host_total, expected) in [(64 << 30, 1 << 30), (6 << 30, 512 << 20)] {
+            let mut hw = snapshot();
+            hw.host_memory_total_bytes = Some(host_total);
+            let selected =
+                run_with_budget(&baseline(), None, Some(&evidence()), 0, budget, &hw).unwrap();
+            assert_ne!(selected.policy, baseline());
+            assert_eq!(
+                selected.provenance.phases[0].host_promotion_reserve_bytes, expected,
+                "host total {host_total}"
+            );
+        }
     }
     #[test]
     fn measured_complete_memory_can_promote_but_pinned_and_recorded_policies_replay() {

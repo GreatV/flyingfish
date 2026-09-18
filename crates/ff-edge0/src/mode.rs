@@ -252,7 +252,7 @@ mod tests {
             host_memory_available_bytes: Some(16 << 30),
         };
         let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
-        assert_eq!(plan.budget_bytes, (8 << 30) - (8 << 30) / 20);
+        assert_eq!(plan.budget_bytes, (8 << 30) - (512 << 20));
         assert_eq!(plan.mode, PerformanceMode::StreamingExperts);
     }
 

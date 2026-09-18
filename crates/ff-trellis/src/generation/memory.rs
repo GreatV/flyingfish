@@ -3,6 +3,11 @@ use super::*;
 use crate::config::{AttentionMode, SLatCoderArgs, SLatFlowArgs};
 use ff_core::weights::ModelWeights;
 
+/// Flat free-memory headroom required at an allocation instant. Distinct from
+/// the pool-scaled admission reserves on purpose: those size a planning
+/// budget, this guards one allocation, and the two must not move together.
+const STAGE_GUARD_HEADROOM_BYTES: u64 = 1 << 30;
+
 fn product(values: &[u64]) -> Result<u64> {
     values.iter().try_fold(1u64, |n, &v| {
         n.checked_mul(v).context("TRELLIS workspace size overflow")
@@ -271,9 +276,9 @@ pub(crate) fn prepare(
             .or(snapshot.device_free_memory_bytes)
             .unwrap_or(0)
     };
-    // An instantaneous pre-allocation guard, not an admission reserve: the
-    // full cap, never pool-scaled.
-    let reserve = sum(&[tensor_bytes, ff_core::probe::ADMISSION_RESERVE_CAP_BYTES])?;
+    // An instantaneous pre-allocation guard, not an admission reserve: a
+    // flat local headroom, so tuning the shared reserve never moves this.
+    let reserve = sum(&[tensor_bytes, STAGE_GUARD_HEADROOM_BYTES])?;
     let capacity = cache
         .stats()
         .resident_bytes
