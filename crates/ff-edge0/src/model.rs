@@ -773,32 +773,43 @@ impl Edge0Text {
             // before ~17 GiB of expert uploads OOM mid-way.
             let sizes = crate::mode::WeightSizes::from_weights(&self.weights)?;
             let (free, total) = ctx.context.mem_get_info().context("mem_get_info")?;
-            // Same probe contract the ff-core snapshot uses: a failed query
-            // warns once and degrades to unprobed (planned as discrete)
-            // rather than guessing a topology.
+            // Same probe contract the ff-core snapshot uses, including the
+            // fail-closed half: a failed query warns once and refuses
+            // planning (a shared pool cannot be ruled out) rather than
+            // guessing a topology.
             static UNIFIED_WARNED: std::sync::Once = std::sync::Once::new();
-            let unified = match ctx
+            let (unified, probe_failed) = match ctx
                 .context
                 .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED)
             {
-                Ok(value) => Some(value != 0),
+                Ok(value) => (Some(value != 0), false),
                 Err(error) => {
                     UNIFIED_WARNED.call_once(|| {
                         eprintln!(
                             "warning: CUDA integrated-topology query failed ({error}); \
-                             planning assumes a discrete topology"
+                             refusing to plan residency without a topology"
                         );
                     });
-                    None
+                    (None, true)
                 }
             };
-            // Host-only capture: /proc/meminfo and cgroup views, no CUDA probe.
+            // Host-only capture: /proc/meminfo and cgroup views, no CUDA
+            // probe. MemAvailable ignores a container's memory ceiling, so
+            // the host view is clamped to the cgroup available where one
+            // applies (the clamp ff-core's unified-pool helper performs).
             let snapshot = ff_core::probe::ResourceSnapshot::capture(None);
+            let host_available = snapshot.host_memory_available_bytes.map(|host| {
+                match snapshot.cgroup_v2_memory_available_bytes {
+                    Some(cgroup) => host.min(cgroup),
+                    None => host,
+                }
+            });
             let hardware = crate::mode::Hardware {
                 total_vram_bytes: Some(total as u64),
                 free_vram_bytes: Some(free as u64),
                 unified_host_device: unified,
-                host_memory_available_bytes: snapshot.host_memory_available_bytes,
+                host_memory_available_bytes: host_available,
+                unified_probe_failed: probe_failed,
             };
             let plan =
                 crate::mode::plan_mode(&hardware, &crate::mode::ModeOverrides::default(), &sizes)?;
@@ -807,8 +818,9 @@ impl Edge0Text {
             }
             anyhow::ensure!(
                 plan.mode == crate::mode::PerformanceMode::FullResident,
-                "EDGE0_GPU=full requested but the planner selected {:?} — \
-                 rerun with plain EDGE0_GPU=1 (static weights only)",
+                "EDGE0_GPU=full requested but the planner selected {:?} — rerun with \
+                 plain EDGE0_GPU=1 (static weights only) only if this device is \
+                 discrete; on a unified pool fix the availability probe first",
                 plan.mode
             );
         }
