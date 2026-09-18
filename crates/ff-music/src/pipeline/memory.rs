@@ -260,8 +260,7 @@ impl Music3 {
                 if !self.residency.policy().is_enabled() {
                     return Ok(());
                 }
-                let required =
-                    sum(&[tensor_bytes, ff_core::probe::ADMISSION_RESERVE_CAP_BYTES])?;
+                let required = sum(&[tensor_bytes, ff_core::probe::ADMISSION_RESERVE_CAP_BYTES])?;
                 let context = cuda.cuda_stream().context().clone();
                 device.synchronize()?;
                 let before = context.mem_get_info()?.0 as u64;

@@ -13,11 +13,6 @@ use ff_core::probe::admission_reserve_bytes;
 /// every traffic and residency budget in this crate.
 pub const SCALE_BIAS_OVERHEAD: f64 = 0.125;
 
-/// VRAM held back for CUDA context, activations, KV/GDN state and allocator
-/// slack — the shared admission-reserve shape (5% of the pool total, capped
-/// at 1 GiB), so small and unified pools are not over-reserved while a
-/// 24 GiB card keeps a flat 1 GiB.
-
 /// Host-side floor subtracted from unified pools so a mode plan cannot
 /// budget away the memory the host run itself needs.
 const UNIFIED_HOST_FLOOR_BYTES: u64 = 2_u64 << 30;

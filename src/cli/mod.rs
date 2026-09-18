@@ -507,9 +507,7 @@ impl DeviceCacheArgs {
 /// allocations separately. Runtime cache demotion can recover weight-load
 /// allocation failures; this margin does not guarantee that every activation
 /// allocation will fit.
-fn device_residency_reserve_bytes(
-    snapshot: &flyingfish::runtime::probe::ResourceSnapshot,
-) -> u64 {
+fn device_residency_reserve_bytes(snapshot: &flyingfish::runtime::probe::ResourceSnapshot) -> u64 {
     let total = if snapshot.host_device_memory_is_unified == Some(true) {
         [
             snapshot.host_pool_total_bytes(),
