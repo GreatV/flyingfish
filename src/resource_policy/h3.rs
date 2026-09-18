@@ -10,7 +10,7 @@ use crate::{
         },
     },
     runtime::{
-        probe::ResourceSnapshot,
+        probe::{ResourceSnapshot, admission_reserve_bytes},
         resource_selection::{
             CandidateDisposition, ResourceCandidateObservation, ResourcePhaseEstimate,
             ResourcePolicyMode, ResourceSelectionProvenance, SelectedResourceAxis, SelectionOrigin,
@@ -384,7 +384,10 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
                 .budget
                 .max_host_bytes
                 .context("automatic host retention requires measured or explicit capacity")?;
-            let reserve = (1_u64 << 30).max(available / 20);
+            // Same shape as every other admission reserve (see the GLM
+            // docstring): the reverse-scaled max() never shrank and grew with
+            // the pool, over-reserving small hosts.
+            let reserve = admission_reserve_bytes(Some(available));
             if host.checked_add(reserve).is_none_or(|n| n > available) {
                 observation.disposition = CandidateDisposition::CapacityRejected;
                 observation.reason = "host retention would consume the promotion reserve".into();
@@ -531,7 +534,7 @@ fn build_provenance(
         optional_host_bytes: retained,
         reclaimable_host_bytes: 0,
         host_promotion_reserve_bytes: if promoted {
-            (1 << 30).max(request.budget.max_host_bytes.unwrap_or(0) / 20)
+            admission_reserve_bytes(request.budget.max_host_bytes)
         } else {
             0
         },
@@ -1108,6 +1111,22 @@ mod tests {
                 routing_profile: None,
             }],
         }
+    }
+    #[test]
+    fn small_host_budgets_scale_the_promotion_reserve_down() {
+        // The retired reverse-scaled max() stamped a flat 1 GiB and rejected
+        // any host peak within 1 GiB of the bound; the shared formula keeps
+        // 5% of it, so the same selection admits on smaller hosts.
+        let budget = ResourceBudget {
+            max_host_bytes: Some(8 << 30),
+            max_device_bytes: None,
+        };
+        let selected = run_with_budget(&baseline(), None, Some(&evidence()), 0, budget).unwrap();
+        assert_ne!(selected.policy, baseline());
+        assert_eq!(
+            selected.provenance.phases[0].host_promotion_reserve_bytes,
+            (8 << 30) / 20
+        );
     }
     #[test]
     fn measured_complete_memory_can_promote_but_pinned_and_recorded_policies_replay() {
