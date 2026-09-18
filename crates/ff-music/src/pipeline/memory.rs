@@ -224,7 +224,12 @@ impl Music3 {
                 let after = context.mem_get_info()?.0 as u64;
                 self.memory_releases.push(PhaseMemoryRelease {
                     stage: "vocoder-oom-retry".to_owned(),
-                    required_free_bytes: sum(&[tensor_bytes, 1 << 30])?,
+                    required_free_bytes: sum(&[
+                        tensor_bytes,
+                        // An instantaneous pre-allocation guard, not an
+                        // admission reserve: the full cap, never pool-scaled.
+                        ff_core::probe::ADMISSION_RESERVE_CAP_BYTES,
+                    ])?,
                     free_bytes_before: before,
                     free_bytes_after: after,
                     released_tensors,
@@ -255,7 +260,8 @@ impl Music3 {
                 if !self.residency.policy().is_enabled() {
                     return Ok(());
                 }
-                let required = sum(&[tensor_bytes, 1 << 30])?;
+                let required =
+                    sum(&[tensor_bytes, ff_core::probe::ADMISSION_RESERVE_CAP_BYTES])?;
                 let context = cuda.cuda_stream().context().clone();
                 device.synchronize()?;
                 let before = context.mem_get_info()?.0 as u64;

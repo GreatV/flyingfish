@@ -271,7 +271,9 @@ pub(crate) fn prepare(
             .or(snapshot.device_free_memory_bytes)
             .unwrap_or(0)
     };
-    let reserve = sum(&[tensor_bytes, 1 << 30])?;
+    // An instantaneous pre-allocation guard, not an admission reserve: the
+    // full cap, never pool-scaled.
+    let reserve = sum(&[tensor_bytes, ff_core::probe::ADMISSION_RESERVE_CAP_BYTES])?;
     let capacity = cache
         .stats()
         .resident_bytes
