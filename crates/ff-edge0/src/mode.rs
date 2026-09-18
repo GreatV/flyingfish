@@ -124,8 +124,7 @@ pub fn plan_mode(
         None | Some(false) => None,
         Some(true) => match hardware.host_memory_available_bytes {
             Some(host_available) => {
-                let pool =
-                    host_available.min(hardware.free_vram_bytes.unwrap_or(host_available));
+                let pool = host_available.min(hardware.free_vram_bytes.unwrap_or(host_available));
                 let device_view = hardware
                     .free_vram_bytes
                     .map(|free| format!("{free} B"))
@@ -308,8 +307,16 @@ mod tests {
         let reserve = (6 << 30) / 20;
         assert_eq!(plan.budget_bytes, pool - reserve);
         assert_eq!(plan.mode, PerformanceMode::StreamingExperts);
-        assert!(plan.provenance.iter().any(|l| l.contains("unified pool: host view")));
-        assert!(plan.provenance.iter().any(|l| l.contains("device free view")));
+        assert!(
+            plan.provenance
+                .iter()
+                .any(|l| l.contains("unified pool: host view"))
+        );
+        assert!(
+            plan.provenance
+                .iter()
+                .any(|l| l.contains("device free view"))
+        );
     }
 
     #[test]

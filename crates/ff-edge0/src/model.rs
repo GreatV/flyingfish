@@ -777,9 +777,10 @@ impl Edge0Text {
             // warns once and degrades to unprobed (planned as discrete)
             // rather than guessing a topology.
             static UNIFIED_WARNED: std::sync::Once = std::sync::Once::new();
-            let unified = match ctx.context.attribute(
-                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED,
-            ) {
+            let unified = match ctx
+                .context
+                .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED)
+            {
                 Ok(value) => Some(value != 0),
                 Err(error) => {
                     UNIFIED_WARNED.call_once(|| {
