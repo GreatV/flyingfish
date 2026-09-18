@@ -33,9 +33,8 @@ fn l2norm(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| v / norm).collect()
 }
 
-/// Interleaved mrope over the partial rotary dims: freq index i picks axis
-/// h when i%3==1 && i<3*sec[1], w when i%3==2 && i<3*sec[2], else t.
-/// With pos3=[p,p,p] this is bit-identical to the scalar form.
+/// Interleaved mrope: freq i picks axis h (i%3==1 && i<3*sec[1]), w
+/// (i%3==2 && i<3*sec[2]), else t. Bit-identical to scalar at [p,p,p].
 fn rope_mrope(
     x: &mut [f32],
     pos3: [usize; 3],
@@ -61,10 +60,8 @@ fn rope_mrope(
     }
 }
 
-/// Decode rope position = KV index + mrope delta (delta < 0 for image
-/// prompts — mrope compresses the image region). Free function so the
-/// arithmetic is unit-testable without the model (the usize-clamp incident:
-/// review HIGH on the vision PR).
+/// Decode rope position = KV index + mrope delta (negative for image
+/// prompts). Free function so CI can pin the arithmetic without the model.
 pub fn decode_rope_pos(position: usize, mrope_delta: i64) -> usize {
     (position as i64 + mrope_delta) as usize
 }
@@ -95,12 +92,11 @@ pub struct Qwen35Text {
     /// The MTP layer's own KV cache (one full-attention layer).
     mtp_kv: KvCache,
     position: usize,
-    /// Rope position (t,h,w) for the token currently in flight; text decode
-    /// keeps it [position + mrope_delta; 3]. `position` stays the KV index.
+    /// Rope position (t,h,w) of the in-flight token; `position` stays the
+    /// KV index.
     pos3: [usize; 3],
-    /// mrope decode offset: max(prefill positions)+1 - prompt_len. NEGATIVE
-    /// for image prompts (mrope compresses the image region) — i64 by
-    /// necessity (usize silently clamped it once: review HIGH).
+    /// Decode offset max(prefill)+1 - prompt_len; negative for image
+    /// prompts (i64 by necessity).
     mrope_delta: i64,
     /// Per-layer post-residual hidden states, populated when QWEN35_DUMP=1.
     pub dump: Vec<Vec<f32>>,
@@ -189,14 +185,13 @@ impl Qwen35Text {
         self.forward_hidden(self.embed_row(token)?, pos3)
     }
 
-    /// Text token at an explicit mrope position (image-prompt prefill).
+    /// Text token at an explicit mrope position.
     pub fn forward_at(&mut self, token: u32, pos3: [usize; 3]) -> Result<(Vec<f32>, Vec<f32>)> {
         let h = self.embed_row(token)?;
         self.forward_hidden(h, pos3)
     }
 
-    /// Vision-row splice entry: the hidden comes from the vision tower, not
-    /// the embedding table. `pos3` is this token's mrope position.
+    /// Vision-row splice: hidden from the tower, not the embedding table.
     pub fn forward_vision_row(
         &mut self,
         row: Vec<f32>,
@@ -209,8 +204,7 @@ impl Qwen35Text {
         self.mrope_delta = delta;
     }
 
-    /// The rope position the NEXT forward_raw will use — the decode
-    /// continuation check for the e2e gate (must equal max(prefill)+1).
+    /// Rope position the next forward_raw will use (e2e gate hook).
     pub fn next_rope_pos(&self) -> usize {
         decode_rope_pos(self.position, self.mrope_delta)
     }

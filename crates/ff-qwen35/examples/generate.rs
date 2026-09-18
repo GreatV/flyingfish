@@ -29,8 +29,8 @@ fn main() -> anyhow::Result<()> {
     // The checkpoint's chat_template.jinja prepends this system block
     // (verified against apply_chat_template 2026-09-17). Divergent prompts
     // were the whole "first token mismatch" bug class — keep byte-exact.
-    // Vision: preprocess + tower forward (CPU f32), then the single
-    // <|image_pad|> placeholder expands to the merged-token count.
+    // Vision: preprocess + tower forward (CPU f32); the <|image_pad|>
+    // placeholder expands to the merged-token count.
     let vision = match &image_path {
         Some(path) => {
             anyhow::ensure!(
@@ -84,7 +84,7 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("encode: {e}"))?
         .get_ids()
         .to_vec();
-    // Expand the placeholder and build per-token mrope positions.
+    // Expand the placeholder; build per-token mrope positions.
     let (pos3, mrope_delta) = if let Some((_, grid)) = &vision {
         let image_token = config.image_token_id.context("no image_token_id")?;
         let merge = config
@@ -115,8 +115,8 @@ fn main() -> anyhow::Result<()> {
     {
         ids.truncate(n);
     }
-    // Sized after QWEN35_PREFIX truncation; the cap is the attn_scores
-    // kernel's shared-memory bound (8192).
+    // After QWEN35_PREFIX truncation; the cap is the attn_scores kernel's
+    // shared-memory bound.
     let total_ctx = ids.len() + n + 4;
     anyhow::ensure!(
         total_ctx <= 8192,
@@ -142,7 +142,7 @@ fn main() -> anyhow::Result<()> {
                 if id == image_token {
                     let row = &rows[pad_row * n_hidden..(pad_row + 1) * n_hidden];
                     pad_row += 1;
-                    gpu.push_vision_row(row, p)?;
+                    gpu.push_vision_row(row, p)?; // splice the tower row
                 } else {
                     gpu.push_token_at(id, p)?;
                 }

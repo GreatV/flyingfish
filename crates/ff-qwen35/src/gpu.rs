@@ -33,9 +33,8 @@ pub struct QwenGpu {
     pub(crate) x1: CudaSliceF,
     /// Spec-mode access (the verify driver pokes these directly).
     pub pos: CudaSliceI,
-    /// mrope rope position [t,h,w], device-side. Prefill writes it per token;
-    /// decode advances it via inc3 (captured in the graph). Text-only runs
-    /// hold [pos,pos,pos] — the mrope kernel is bit-identical then.
+    /// mrope position [t,h,w], device-side; prefill writes per token,
+    /// decode advances via inc3 (graph-captured). Bit-identical at [p,p,p].
     pub rope_pos: CudaSliceI,
     /// Spec-mode access (the verify driver pokes these directly).
     pub next_token: CudaSliceI,
@@ -272,8 +271,8 @@ impl QwenGpu {
         )
     }
 
-    /// The layer stack + lm_head + argmax + counter bumps. Reads `hidden`
-    /// (embed output or a spliced vision row) and `rope_pos`.
+    /// Layer stack + lm_head + argmax + counter bumps; reads `hidden`
+    /// (embed output or spliced vision row) and `rope_pos`.
     fn step_layers(&mut self) -> Result<()> {
         let text = self.config.text_config.clone();
         let eps = text.rms_norm_eps as f32;
@@ -509,15 +508,13 @@ impl QwenGpu {
         Ok(())
     }
 
-    /// Feed a prompt token (host id) into the pipeline. Text-only fast path:
-    /// rope position = KV index.
+    /// Feed a prompt token (text-only: rope position = KV index).
     pub fn push_token(&mut self, token: u32) -> Result<()> {
         let p = self.position as i32;
         self.push_token_at(token, [p, p, p])
     }
 
-    /// Prefill one text token at an explicit mrope position (image prompts:
-    /// text after an image continues from the image's max extent).
+    /// Prefill one text token at an explicit mrope position.
     pub fn push_token_at(&mut self, token: u32, pos3: [i32; 3]) -> Result<()> {
         self.ctx
             .stream
@@ -526,9 +523,8 @@ impl QwenGpu {
         self.step()
     }
 
-    /// Prefill one merged vision row: the hidden comes from the vision
-    /// tower, not the embedding table. Eager (never graph-captured — the
-    /// decode graph is splice-free).
+    /// Prefill one merged vision row into `hidden`. Eager — never
+    /// graph-captured (the decode graph is splice-free).
     pub fn push_vision_row(&mut self, row: &[f32], pos3: [i32; 3]) -> Result<()> {
         anyhow::ensure!(
             row.len() == self.hidden.len(),

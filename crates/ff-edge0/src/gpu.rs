@@ -2218,9 +2218,8 @@ impl GpuContext {
         Ok(())
     }
 
-    /// glue_attn_qk_raw with 3-axis mrope: rope positions from the device
-    /// rope_pos[3] (t,h,w); KV slot/length still from `position`.
-    /// Bit-identical to the scalar path when rope_pos == [pos, pos, pos].
+    /// glue_attn_qk_raw with 3-axis mrope (rope from rope_pos[3]; KV length
+    /// from `position`). Bit-identical at rope_pos == [pos, pos, pos].
     #[allow(clippy::too_many_arguments)]
     pub fn glue_attn_qk_zc_mrope(
         &self,

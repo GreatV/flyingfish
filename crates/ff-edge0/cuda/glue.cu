@@ -270,10 +270,9 @@ extern "C" __global__ void edge0_attn_qk_zc(
 
 
 
-// mrope variant: rope positions come from a 3-int device buffer (t,h,w)
-// with the interleaved section axis map (i%3, section caps). KV slot and
-// length still ride `position`. Bit-identical to attn_qk_impl when
-// rope_pos == [pos, pos, pos] (same f64 math order).
+// mrope variant: rope from a device [t,h,w] buffer (interleaved section
+// axis map); KV slot/length still ride `position`. Bit-identical at
+// rope_pos == [pos,pos,pos].
 __device__ __forceinline__ void rope_mrope_head(
     float* __restrict__ x, const int* __restrict__ rope_pos, int half,
     int rotary_dim, double theta, int tid, int sec_h, int sec_w)
@@ -352,8 +351,7 @@ extern "C" __global__ void edge0_attn_qk_zc_mrope(
                        theta, sec_h, sec_w);
 }
 
-// Increment a 3-int rope position counter (decode continuation after an
-// mrope prefill — text positions advance all three axes together).
+// Increment a 3-int rope position counter.
 extern "C" __global__ void edge0_inc3(int* __restrict__ c)
 {
     if (threadIdx.x == 0) { c[0]++; c[1]++; c[2]++; }

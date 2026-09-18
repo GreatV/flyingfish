@@ -1,16 +1,7 @@
-//! Vision tower for Qwen3.5-27B: image preprocessing + ViT + merger,
-//! CPU f32 via candle. Ported from ff-h3's multimodal_text_encoder
-//! (Qwen3-VL family), minus video/deepstack and the CUDA paths.
-//! Weight names: `model.visual.*` (BF16 in the checkpoint, widened to f32).
-//!
-//! Gate semantics (the two fixtures prove different things): the tower
-//! gate compares against HF's vision module in **f32** and proves the
-//! ALGORITHM — bf16 is measurably chaotic in this tower (bf16-vs-f32 HF
-//! diverges by hundreds of units pre-merger; the merger LN re-normalizes),
-//! so a bf16 reference could not separate algorithm errors from dtype
-//! noise. The e2e gate (tests/vision_e2e.rs) covers the DEPLOYMENT path
-//! (mrope positions + int4 ids). By construction the f32 tower gate cannot
-//! see bf16/int4-specific defects; that is what e2e is for.
+//! Vision tower for Qwen3.5-27B: preprocessing + ViT + merger, CPU f32
+//! (candle), ported from ff-h3 (Qwen3-VL family), minus video/deepstack.
+//! Tower gate references HF in f32 (bf16 is chaotic pre-merger); e2e gate
+//! (tests/vision_e2e.rs) covers the deployment path.
 
 use crate::config::{VISION_ROPE_THETA, VisionConfig};
 use crate::weights::Qwen35Weights;
@@ -154,8 +145,7 @@ impl ProcessorConfig {
     }
 }
 
-/// Qwen smart_resize: snap to `factor` (patch*merge), round-ties-even,
-/// clamped to the pixel budget. Ported from ff-h3.
+/// Qwen smart_resize: snap to factor, round-ties-even, pixel-budget clamped.
 pub fn smart_resize_image(
     height: usize,
     width: usize,
@@ -201,13 +191,9 @@ struct AxisSample {
     taps: Vec<(usize, f32)>,
 }
 
-/// Separable bicubic resize matching torchvision's uint8 antialias path
-/// (the HF fast processor's resize): cubic a=-0.5, tap window CLIPPED at the
-/// borders (not index-clamped), intermediate rounded to u8 between axes.
-/// Verified against the HF fixture: identical except a single rounding tie.
-/// DO NOT "unify" this with ff-h3's resize (a=-0.75, index-clamped taps):
-/// the two target DIFFERENT references and each is fixture-pinned on its
-/// side.
+/// Bicubic resize matching torchvision's uint8 antialias path (cubic a=-0.5,
+/// border-clipped taps, u8-rounded intermediate). Fixture-pinned; do NOT
+/// unify with ff-h3's resize (a=-0.75, different reference).
 fn resize_bicubic_antialias(image: &RgbImage, width: usize, height: usize) -> Result<RgbImage> {
     ensure!(width > 0 && height > 0, "resize target must be non-zero");
     if image.width == width && image.height == height {
@@ -297,8 +283,8 @@ fn cubic_kernel(distance: f64) -> f64 {
     }
 }
 
-/// Merge-major flattened patches, normalized (x/255 - mean)/std; the image
-/// frame is duplicated to fill temporal_patch_size. Ported from ff-h3.
+/// Merge-major flattened patches, (x/255 - mean)/std; frame duplicated to
+/// fill temporal_patch_size.
 fn patchify_image(
     frame: &RgbImage,
     grid: VisionGrid,
@@ -428,9 +414,8 @@ fn learned_position_interpolation(
     Ok((indices, weights))
 }
 
-/// 2D axial rope tables, one row per patch in merge-block order.
-/// head_dim 72 -> 18 frequencies per axis; rows are [freq_h, freq_w] x2.
-/// Ported from ff-h3 (theta = VISION_ROPE_THETA, the HF default).
+/// 2D axial rope tables, one row per patch in merge-block order,
+/// [freq_h, freq_w] x2 layout (theta = VISION_ROPE_THETA, the HF default).
 fn vision_rotary_tables(
     grid: VisionGrid,
     merge: usize,
@@ -510,8 +495,7 @@ fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
         .map_err(Into::into)
 }
 
-/// The Qwen3.5 vision tower (CPU f32): patch embed -> learned pos embed ->
-/// 27 pre-LN blocks with 2D rope -> pre-shuffle-norm merger.
+/// The Qwen3.5 vision tower (CPU f32).
 pub struct VisionTower {
     config: VisionConfig,
     device: Device,
@@ -709,10 +693,8 @@ fn rotate_half_tensor(x: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[&second.neg()?, &first], candle_core::D::Minus1).map_err(Into::into)
 }
 
-/// Per-token mrope positions [t,h,w] and the decode delta.
+/// Per-token mrope positions [t,h,w] + decode delta (max(pos)+1 - seq_len).
 /// `types`: 0 = text, 1 = image pad run (one per grid, in order).
-/// Ported from ff-h3 (video arm dropped). delta = max(pos)+1 - seq_len:
-/// decode token at KV index i gets position [i+delta; 3].
 pub fn multimodal_positions(
     types: &[u8],
     grids: &[VisionGrid],
@@ -785,9 +767,8 @@ pub fn multimodal_positions(
 mod tests {
     use super::*;
 
-    /// Gate 1: preprocessing must match the HF processor fixture
-    /// (scripts/qwen35_vision_reference.py processor) bit-for-bit on the
-    /// grid and to 1e-6 on pixel values (both sides normalize u8s).
+    /// Gate 1: preprocessing vs the HF processor fixture (grid exact,
+    /// pixels to 1e-6).
     #[test]
     fn preprocess_matches_hf_processor_fixture() {
         let dir = Path::new("src/testdata");

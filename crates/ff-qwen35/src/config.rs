@@ -208,8 +208,8 @@ mod tests {
         assert_eq!(cfg.image_token_id, Some(248056));
         assert_eq!(cfg.vision_start_token_id, Some(248053));
         assert_eq!(cfg.vision_end_token_id, Some(248054));
-        // The tower hardcodes tanh-gelu in blocks / erf-gelu in the merger
-        // (vision.rs); fail loudly if the checkpoint ever changes that.
+        // Tower act split (tanh blocks / erf merger) is hardcoded in
+        // vision.rs; fail loudly if the checkpoint changes it.
         let raw = fs::read_to_string(dir.join("config.json")).unwrap();
         assert!(raw.contains("\"gelu_pytorch_tanh\""));
     }

@@ -1,7 +1,4 @@
 //! E2E vision acceptance vs the HF fixtures (skips without the model dir).
-//! Catches the decode-position class of bug: prefill positions are
-//! fixture-verified (vision.rs gates), so this pins the decode continuation
-//! AND the produced ids.
 
 use ff_qwen35::config::Qwen35Config;
 use ff_qwen35::model::Qwen35Text;
@@ -18,9 +15,9 @@ struct E2eFixture {
     margins: Vec<f32>,
 }
 
-/// CI-unconditional half of the gate: the decode-position arithmetic from
-/// the committed rope fixture (130 ids, delta -63 -> first decode at 67).
-/// The id-level e2e below still skips without the model dir.
+/// CI-unconditional: decode-position arithmetic from the committed rope
+/// fixture (130 ids, delta -63 -> 67). The id-level e2e below skips without
+/// the model dir.
 #[test]
 fn decode_rope_pos_matches_fixture_arithmetic() {
     let f: serde_json::Value = serde_json::from_str(
@@ -107,10 +104,8 @@ fn image_prompt_decode_matches_hf_fixture() {
             });
         }
         model.set_mrope_delta(delta);
-        // The decode continuation: first generated token's rope position
-        // must be max(prefill positions)+1, NOT the KV index. (The i64
-        // delta is negative for image prompts; a usize clamp once zeroed it
-        // and ids happened not to flip — position-level gate catches it.)
+        // First decode token's rope position must be max(prefill)+1, not
+        // the KV index (delta is negative for image prompts).
         let max_prefill = pos3.iter().flatten().max().copied().unwrap() as usize;
         assert_eq!(
             model.next_rope_pos(),
@@ -146,9 +141,8 @@ fn image_prompt_decode_matches_hf_fixture() {
             fixture.gen_ids.len(),
             fixture.margins.get(prefix).copied().unwrap_or(f32::NAN)
         );
-        // int4-vs-bf16 class, per-prompt measured baselines (both flips sit
-        // at HF margins <= 0.50 — the known int4 quality class, not wiring).
-        // GPU (position-correct by construction) produced the same prefixes.
+        // Per-prompt measured baselines (flips sit at HF margins <= 0.50,
+        // the int4 quality class); GPU produced the same prefixes.
         let baseline = ["Describe this image.", "What colors dominate?"]
             .iter()
             .position(|p| *p == fixture.prompt)
