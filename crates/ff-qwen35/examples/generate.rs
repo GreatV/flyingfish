@@ -1,7 +1,7 @@
 //! Greedy decode on the int4 CPU path; prints prompt/gen token ids as JSON
 //! for comparison against scripts/qwen35_reference.py (HF bf16).
 //!
-//! Usage: generate <model_dir> [n_tokens] [prompt]
+//! Usage: generate <model_dir> [n_tokens] [prompt] [image.png]
 
 use anyhow::Context as _;
 use ff_qwen35::config::Qwen35Config;
@@ -11,9 +11,7 @@ use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let dir = args
-        .next()
-        .unwrap_or_else(|| "models/Qwen/Qwen3.8-27B-int4".to_string());
+    let dir = args.next().context("usage: generate <model_dir> ...")?;
     let n: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(8);
     let prompt = args
         .next()
