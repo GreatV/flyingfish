@@ -33,11 +33,27 @@ fn l2norm(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| v / norm).collect()
 }
 
-fn rope_partial(x: &mut [f32], position: usize, rotary_dim: usize, theta: f64) {
+/// Interleaved mrope over the partial rotary dims: freq index i picks axis
+/// h when i%3==1 && i<3*sec[1], w when i%3==2 && i<3*sec[2], else t.
+/// With pos3=[p,p,p] this is bit-identical to the scalar form.
+fn rope_mrope(
+    x: &mut [f32],
+    pos3: [usize; 3],
+    rotary_dim: usize,
+    theta: f64,
+    sections: [usize; 3],
+) {
     let half = rotary_dim / 2;
     for i in 0..half {
+        let axis = if i % 3 == 1 && i < 3 * sections[1] {
+            1
+        } else if i % 3 == 2 && i < 3 * sections[2] {
+            2
+        } else {
+            0
+        };
         let freq = theta.powf(-(2.0 * i as f64) / rotary_dim as f64);
-        let angle = position as f64 * freq;
+        let angle = pos3[axis] as f64 * freq;
         let (sin, cos) = (angle.sin() as f32, angle.cos() as f32);
         let (x1, x2) = (x[i], x[i + half]);
         x[i] = x1 * cos - x2 * sin;
@@ -71,6 +87,12 @@ pub struct Qwen35Text {
     /// The MTP layer's own KV cache (one full-attention layer).
     mtp_kv: KvCache,
     position: usize,
+    /// Rope position (t,h,w) for the token currently in flight; text decode
+    /// keeps it [position + mrope_delta; 3]. `position` stays the KV index.
+    pos3: [usize; 3],
+    /// mrope decode offset: max(prefill positions)+1 - prompt_len (0 for
+    /// text-only prompts).
+    mrope_delta: usize,
     /// Per-layer post-residual hidden states, populated when QWEN35_DUMP=1.
     pub dump: Vec<Vec<f32>>,
     dump_mixer: bool,
@@ -117,6 +139,8 @@ impl Qwen35Text {
                 len: 0,
             },
             position: 0,
+            pos3: [0; 3],
+            mrope_delta: 0,
             dump: Vec::new(),
             mixer_dump: Vec::new(),
         })
@@ -152,7 +176,27 @@ impl Qwen35Text {
 
     /// forward + the pre-final-norm hidden (the MTP layer's input).
     pub fn forward_raw(&mut self, token: u32) -> Result<(Vec<f32>, Vec<f32>)> {
-        let mut hidden = self.embed_row(token)?;
+        let pos3 = [self.position + self.mrope_delta; 3];
+        self.forward_hidden(self.embed_row(token)?, pos3)
+    }
+
+    /// Vision-row splice entry: the hidden comes from the vision tower, not
+    /// the embedding table. `pos3` is this token's mrope position.
+    pub fn forward_vision_row(
+        &mut self,
+        row: Vec<f32>,
+        pos3: [usize; 3],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.forward_hidden(row, pos3)
+    }
+
+    pub fn set_mrope_delta(&mut self, delta: usize) {
+        self.mrope_delta = delta;
+    }
+
+    fn forward_hidden(&mut self, hidden: Vec<f32>, pos3: [usize; 3]) -> Result<(Vec<f32>, Vec<f32>)> {
+        let mut hidden = hidden;
+        self.pos3 = pos3;
         // QWEN35_BF16ROUND=1: round the residual stream to bf16 after each
         // op, emulating HF's per-op casts — isolates dtype chaos from bugs.
         let round_bf16 = std::env::var_os("QWEN35_BF16ROUND").is_some();
@@ -313,13 +357,13 @@ impl Qwen35Text {
             gate[h * head_dim..(h + 1) * head_dim]
                 .copy_from_slice(&q_raw[base + head_dim..base + 2 * head_dim]);
         }
-        let position = pos;
+        let pos3 = [pos; 3]; // MTP's own timeline is text-only (scalar)
         let kv_stride = kv_heads * head_dim;
         let cache = &mut self.mtp_kv;
         for kh in 0..kv_heads {
             let mut kvec = k_raw[kh * head_dim..(kh + 1) * head_dim].to_vec();
             kvec = rmsnorm_zc(&kvec, &k_norm_w, eps);
-            rope_partial(&mut kvec, position, rotary_dim, text.rope.rope_theta);
+            rope_mrope(&mut kvec, pos3, rotary_dim, text.rope.rope_theta, text.rope.mrope_section);
             cache.keys.extend_from_slice(&kvec);
         }
         cache.values.extend_from_slice(&v_raw);
@@ -330,7 +374,7 @@ impl Qwen35Text {
             let kv_head = h / (heads / kv_heads);
             let mut q = query[h * head_dim..(h + 1) * head_dim].to_vec();
             q = rmsnorm_zc(&q, &q_norm_w, eps);
-            rope_partial(&mut q, position, rotary_dim, text.rope.rope_theta);
+            rope_mrope(&mut q, pos3, rotary_dim, text.rope.rope_theta, text.rope.mrope_section);
             let mut scores = Vec::with_capacity(cache.len);
             #[allow(clippy::needless_range_loop)] // step couples scores + kv stride
             for step in 0..cache.len {
@@ -479,13 +523,15 @@ impl Qwen35Text {
                 .copy_from_slice(&q_raw[base + head_dim..base + 2 * head_dim]);
         }
 
-        let position = self.position;
+        let pos3 = self.pos3;
+        let sections = text.rope.mrope_section;
+        let theta = text.rope.rope_theta;
         let kv_stride = kv_heads * head_dim;
         let cache = &mut self.kv[kv_index];
         for kh in 0..kv_heads {
             let mut kvec = k_raw[kh * head_dim..(kh + 1) * head_dim].to_vec();
             kvec = rmsnorm_zc(&kvec, &k_norm_w, eps);
-            rope_partial(&mut kvec, position, rotary_dim, text.rope.rope_theta);
+            rope_mrope(&mut kvec, pos3, rotary_dim, theta, sections);
             cache.keys.extend_from_slice(&kvec);
         }
         cache.values.extend_from_slice(&v_raw);
@@ -497,7 +543,7 @@ impl Qwen35Text {
             let kv_head = h / (heads / kv_heads);
             let mut q = query[h * head_dim..(h + 1) * head_dim].to_vec();
             q = rmsnorm_zc(&q, &q_norm_w, eps);
-            rope_partial(&mut q, position, rotary_dim, text.rope.rope_theta);
+            rope_mrope(&mut q, pos3, rotary_dim, theta, sections);
             let mut scores = Vec::with_capacity(cache.len);
             #[allow(clippy::needless_range_loop)] // step couples scores + kv stride
             for step in 0..cache.len {
