@@ -773,11 +773,31 @@ impl Edge0Text {
             // before ~17 GiB of expert uploads OOM mid-way.
             let sizes = crate::mode::WeightSizes::from_weights(&self.weights)?;
             let (free, total) = ctx.context.mem_get_info().context("mem_get_info")?;
+            // Same probe contract the ff-core snapshot uses: a failed query
+            // warns once and degrades to unprobed (planned as discrete)
+            // rather than guessing a topology.
+            static UNIFIED_WARNED: std::sync::Once = std::sync::Once::new();
+            let unified = match ctx.context.attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED,
+            ) {
+                Ok(value) => Some(value != 0),
+                Err(error) => {
+                    UNIFIED_WARNED.call_once(|| {
+                        eprintln!(
+                            "warning: CUDA integrated-topology query failed ({error}); \
+                             planning assumes a discrete topology"
+                        );
+                    });
+                    None
+                }
+            };
+            // Host-only capture: /proc/meminfo and cgroup views, no CUDA probe.
+            let snapshot = ff_core::probe::ResourceSnapshot::capture(None);
             let hardware = crate::mode::Hardware {
                 total_vram_bytes: Some(total as u64),
                 free_vram_bytes: Some(free as u64),
-                unified_host_device: None,
-                host_memory_available_bytes: None,
+                unified_host_device: unified,
+                host_memory_available_bytes: snapshot.host_memory_available_bytes,
             };
             let plan =
                 crate::mode::plan_mode(&hardware, &crate::mode::ModeOverrides::default(), &sizes)?;
