@@ -693,6 +693,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff-edge0"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "candle-core",
+ "candle-nn",
+ "cudarc 0.19.9",
+ "ff-core",
+ "half",
+ "memmap2",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
 name = "ff-glm"
 version = "0.1.0"
 dependencies = [
@@ -764,6 +782,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokenizers",
+]
+
+[[package]]
+name = "ff-qwen35"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc 0.19.9",
+ "ff-edge0",
+ "half",
+ "memmap2",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
  "tokenizers",
 ]
 

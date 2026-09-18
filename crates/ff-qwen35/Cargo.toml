@@ -1,0 +1,30 @@
+[package]
+name = "ff-qwen35"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+memmap2.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ff-edge0 = { path = "../ff-edge0" }
+cudarc = { workspace = true, optional = true }
+
+[features]
+cuda = ["ff-edge0/cuda", "dep:cudarc"]
+
+[lints]
+workspace = true
+
+[[example]]
+name = "wide_bw"
+required-features = ["cuda"]
+
+[dev-dependencies]
+tokenizers.workspace = true

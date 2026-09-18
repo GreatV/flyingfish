@@ -1,0 +1,39 @@
+[package]
+name = "ff-edge0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ff-core = { path = "../ff-core" }
+anyhow.workspace = true
+bytemuck = "1"
+candle-core.workspace = true
+candle-nn.workspace = true
+half.workspace = true
+memmap2.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokenizers.workspace = true
+cudarc = { workspace = true, optional = true }
+
+[features]
+cuda = ["ff-core/cuda", "candle-core/cuda", "dep:cudarc"]
+
+[[example]]
+name = "acceptance_gate"
+required-features = ["cuda"]
+
+[[example]]
+name = "generate"
+required-features = ["cuda"]
+
+[[example]]
+name = "logit_sensitivity"
+required-features = ["cuda"]
+
+[lints.rust]
+warnings = "deny"
