@@ -5,6 +5,7 @@
 //! so a run's mode is attributable after the fact.
 
 use anyhow::Result;
+use ff_core::probe::admission_reserve_bytes;
 
 /// Scale/bias bytes as a fraction of packed bytes — geometry-fixed by
 /// group_size 64 and the BF16 scales+biases pair, and WEIGHED exactly
@@ -12,11 +13,11 @@ use anyhow::Result;
 /// every traffic and residency budget in this crate.
 pub const SCALE_BIAS_OVERHEAD: f64 = 0.125;
 
-/// Minimum VRAM held back for CUDA context, activations, KV/GDN state and
-/// allocator slack; the actual reserve scales with the pool (total/12) —
-/// a fixed 2 GiB would be 8% of a workstation card but a third of an
-/// 8 GiB unified pool.
-const MIN_RESERVE_BYTES: u64 = 1_u64 << 30;
+/// VRAM held back for CUDA context, activations, KV/GDN state and allocator
+/// slack — the shared admission-reserve shape (5% of the pool total, capped
+/// at 1 GiB), so small and unified pools are not over-reserved while a
+/// 24 GiB card keeps a flat 1 GiB.
+
 /// Host-side floor subtracted from unified pools so a mode plan cannot
 /// budget away the memory the host run itself needs.
 const UNIFIED_HOST_FLOOR_BYTES: u64 = 2_u64 << 30;
@@ -120,7 +121,7 @@ pub fn plan_mode(
         });
     };
 
-    let reserve = (total / 12).max(MIN_RESERVE_BYTES);
+    let reserve = admission_reserve_bytes(Some(total));
 
     // Unified pools share one physical memory with the host: the device
     // side may not budget away what the host run itself needs.
@@ -245,6 +246,19 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("ASSUMED to already include"))
         );
+    }
+
+    #[test]
+    fn reserve_scales_below_the_crossover_on_small_pools() {
+        let hw = Hardware {
+            total_vram_bytes: Some(8 << 30),
+            free_vram_bytes: Some(7 << 30),
+            unified_host_device: Some(false),
+            host_memory_available_bytes: Some(16 << 30),
+        };
+        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
+        assert_eq!(plan.budget_bytes, (8 << 30) - (8 << 30) / 20);
+        assert_eq!(plan.mode, PerformanceMode::StreamingExperts);
     }
 
     #[test]
