@@ -51,6 +51,13 @@ fn main() -> anyhow::Result<()> {
                 config.vision_config.as_ref().context("no vision_config")?,
             )?;
             let started = Instant::now();
+            anyhow::ensure!(
+                config.vision_config.as_ref().unwrap().out_hidden_size
+                    == config.text_config.hidden_size,
+                "tower out_hidden {} != text hidden {}",
+                config.vision_config.as_ref().unwrap().out_hidden_size,
+                config.text_config.hidden_size
+            );
             let rows = tower.forward(&patches, grid)?;
             println!(
                 "vision: grid [{}, {}, {}] -> {n_merged} tokens in {:.1}s",
@@ -101,22 +108,25 @@ fn main() -> anyhow::Result<()> {
     } else {
         (Vec::new(), 0)
     };
-    let total_ctx = ids.len() + n + 4;
-    anyhow::ensure!(
-        total_ctx <= 8192,
-        "prompt + generation {total_ctx} exceeds the 8192 kernel cap"
-    );
+
     if let Some(n) = std::env::var("QWEN35_PREFIX")
         .ok()
         .and_then(|v| v.parse().ok())
     {
         ids.truncate(n);
     }
+    // Sized after QWEN35_PREFIX truncation; the cap is the attn_scores
+    // kernel's shared-memory bound (8192).
+    let total_ctx = ids.len() + n + 4;
+    anyhow::ensure!(
+        total_ctx <= 8192,
+        "prompt + generation {total_ctx} exceeds the 8192 kernel cap"
+    );
     println!("prompt ids: {} {:?}", ids.len(), ids);
     #[cfg(feature = "cuda")]
     if std::env::var_os("QWEN35_GPU").is_some() {
         let weights = ff_qwen35::weights::Qwen35Weights::open(dir)?;
-        let mut gpu = if vision.is_some() {
+        let mut gpu = if total_ctx > 4096 {
             ff_qwen35::gpu::QwenGpu::with_max_ctx(&weights, &config, total_ctx.next_power_of_two())?
         } else {
             ff_qwen35::gpu::QwenGpu::new(&weights, &config)?
@@ -166,6 +176,8 @@ fn main() -> anyhow::Result<()> {
                     generated.push(spec.draft_id);
                     gpu.ctx.glue_inc(&mut gpu.pos)?;
                     gpu.ctx.glue_inc(&mut gpu.pos)?;
+                    gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
+                    gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
                     gpu.position += 2;
                     pending = b;
                     let td = Instant::now();
@@ -176,6 +188,7 @@ fn main() -> anyhow::Result<()> {
                     generated.push(pending);
                     spec.reject_restore(&mut gpu)?;
                     gpu.ctx.glue_inc(&mut gpu.pos)?;
+                    gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
                     gpu.position += 1;
                     pending = a;
                     let td = Instant::now();
@@ -235,7 +248,7 @@ fn main() -> anyhow::Result<()> {
                 model.forward_at(id, p)?.1
             });
         }
-        model.set_mrope_delta(mrope_delta.max(0) as usize);
+        model.set_mrope_delta(mrope_delta);
     } else {
         for &id in &ids {
             hidden = Some(model.forward(id)?);

@@ -103,6 +103,10 @@ pub struct VisionConfig {
     pub temporal_patch_size: usize,
     pub num_position_embeddings: usize,
     pub out_hidden_size: usize,
+    /// DeepStack is unimplemented (vision.rs); fail loud rather than
+    /// silently dropping injections on a checkpoint variant that has them.
+    #[serde(default)]
+    pub deepstack_visual_indexes: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -138,6 +142,13 @@ impl Qwen35Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(v) = &self.vision_config {
+            ensure!(
+                v.deepstack_visual_indexes.is_empty(),
+                "deepstack_visual_indexes {:?} unsupported (no injection path)",
+                v.deepstack_visual_indexes
+            );
+        }
         ensure!(
             self.architectures.iter().any(|a| a == QWEN35_ARCHITECTURE),
             "unsupported architectures {:?}; expected {QWEN35_ARCHITECTURE}",

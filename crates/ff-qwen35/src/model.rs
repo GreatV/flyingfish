@@ -90,9 +90,10 @@ pub struct Qwen35Text {
     /// Rope position (t,h,w) for the token currently in flight; text decode
     /// keeps it [position + mrope_delta; 3]. `position` stays the KV index.
     pos3: [usize; 3],
-    /// mrope decode offset: max(prefill positions)+1 - prompt_len (0 for
-    /// text-only prompts).
-    mrope_delta: usize,
+    /// mrope decode offset: max(prefill positions)+1 - prompt_len. NEGATIVE
+    /// for image prompts (mrope compresses the image region) — i64 by
+    /// necessity (usize silently clamped it once: review HIGH).
+    mrope_delta: i64,
     /// Per-layer post-residual hidden states, populated when QWEN35_DUMP=1.
     pub dump: Vec<Vec<f32>>,
     dump_mixer: bool,
@@ -176,7 +177,8 @@ impl Qwen35Text {
 
     /// forward + the pre-final-norm hidden (the MTP layer's input).
     pub fn forward_raw(&mut self, token: u32) -> Result<(Vec<f32>, Vec<f32>)> {
-        let pos3 = [self.position + self.mrope_delta; 3];
+        let rope_pos = (self.position as i64 + self.mrope_delta) as usize;
+        let pos3 = [rope_pos; 3];
         self.forward_hidden(self.embed_row(token)?, pos3)
     }
 
@@ -196,8 +198,14 @@ impl Qwen35Text {
         self.forward_hidden(row, pos3)
     }
 
-    pub fn set_mrope_delta(&mut self, delta: usize) {
+    pub fn set_mrope_delta(&mut self, delta: i64) {
         self.mrope_delta = delta;
+    }
+
+    /// The rope position the NEXT forward_raw will use — the decode
+    /// continuation check for the e2e gate (must equal max(prefill)+1).
+    pub fn next_rope_pos(&self) -> usize {
+        (self.position as i64 + self.mrope_delta) as usize
     }
 
     fn forward_hidden(

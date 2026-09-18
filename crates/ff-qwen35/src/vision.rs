@@ -155,15 +155,15 @@ pub fn smart_resize_image(
     maximum_pixels: usize,
 ) -> Result<(usize, usize)> {
     ensure!(
-        height >= factor && width >= factor,
-        "image dimensions must each be at least the resize factor {factor}"
-    );
-    ensure!(
         height.max(width) as f64 / height.min(width) as f64 <= 200.,
         "image aspect ratio must not exceed 200:1"
     );
+    // HF clamps small edges UP to the factor (max(factor, round_by_factor)),
+    // it does not reject them.
     let mut resized_height = round_ties_even(height as f64 / factor as f64) as usize * factor;
     let mut resized_width = round_ties_even(width as f64 / factor as f64) as usize * factor;
+    resized_height = resized_height.max(factor);
+    resized_width = resized_width.max(factor);
     let rounded_area = resized_height
         .checked_mul(resized_width)
         .context("image resize area overflow")?;
@@ -196,6 +196,9 @@ struct AxisSample {
 /// (the HF fast processor's resize): cubic a=-0.5, tap window CLIPPED at the
 /// borders (not index-clamped), intermediate rounded to u8 between axes.
 /// Verified against the HF fixture: identical except a single rounding tie.
+/// DO NOT "unify" this with ff-h3's resize (a=-0.75, index-clamped taps):
+/// the two target DIFFERENT references and each is fixture-pinned on its
+/// side.
 fn resize_bicubic_antialias(image: &RgbImage, width: usize, height: usize) -> Result<RgbImage> {
     ensure!(width > 0 && height > 0, "resize target must be non-zero");
     if image.width == width && image.height == height {
