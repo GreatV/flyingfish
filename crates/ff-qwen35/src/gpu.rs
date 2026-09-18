@@ -33,6 +33,9 @@ pub struct QwenGpu {
     pub(crate) x1: CudaSliceF,
     /// Spec-mode access (the verify driver pokes these directly).
     pub pos: CudaSliceI,
+    /// mrope position [t,h,w], device-side; prefill writes per token,
+    /// decode advances via inc3 (graph-captured). Bit-identical at [p,p,p].
+    pub rope_pos: CudaSliceI,
     /// Spec-mode access (the verify driver pokes these directly).
     pub next_token: CudaSliceI,
     /// Captured decode-step graph (QWEN35_GRAPH=1; pos/next_token are
@@ -172,6 +175,7 @@ impl QwenGpu {
             hidden: ctx.stream.alloc_zeros::<f32>(hidden_size)?,
             x1: ctx.stream.alloc_zeros::<f32>(hidden_size)?,
             pos: ctx.upload_i32(&[0])?,
+            rope_pos: ctx.upload_i32(&[0, 0, 0])?,
             next_token: ctx.upload_i32(&[0])?,
             nt_spare: ctx.upload_i32(&[0])?,
             decode_graph: None,
@@ -255,14 +259,24 @@ impl QwenGpu {
     }
 
     fn step_inner(&mut self) -> Result<()> {
-        let text = self.config.text_config.clone();
-        let eps = text.rms_norm_eps as f32;
-        let n = text.hidden_size;
+        self.embed_from_next_token()?;
+        self.step_layers()
+    }
+
+    fn embed_from_next_token(&mut self) -> Result<()> {
         self.ctx.glue_embed_row(
             self.get(&format!("{TEXT_PREFIX}.embed_tokens"))?,
             &self.next_token,
             &self.hidden,
-        )?;
+        )
+    }
+
+    /// Layer stack + lm_head + argmax + counter bumps; reads `hidden`
+    /// (embed output or spliced vision row) and `rope_pos`.
+    fn step_layers(&mut self) -> Result<()> {
+        let text = self.config.text_config.clone();
+        let eps = text.rms_norm_eps as f32;
+        let n = text.hidden_size;
         self.ctx
             .glue_rmsnorm_zc(&self.hidden, &self.ln[0][0], &self.x1, n, eps)?;
         let mut gdn_index = 0usize;
@@ -336,7 +350,7 @@ impl QwenGpu {
                 )?;
                 let [qn, kn] = &self.attn_norms[kv_index];
                 let rotary_dim = (text.head_dim as f64 * text.rope.partial_rotary_factor) as usize;
-                self.ctx.glue_attn_qk_raw(
+                self.ctx.glue_attn_qk_zc_mrope(
                     q.y_ref(),
                     qn,
                     k.y_ref(),
@@ -347,13 +361,15 @@ impl QwenGpu {
                     &self.kv_keys[kv_index],
                     &self.kv_values[kv_index],
                     &self.pos,
+                    &self.rope_pos,
                     text.num_key_value_heads * text.head_dim,
                     text.num_attention_heads,
                     text.num_key_value_heads,
                     text.head_dim,
                     rotary_dim,
                     text.rope.rope_theta,
-                    true,
+                    text.rope.mrope_section[1],
+                    text.rope.mrope_section[2],
                 )?;
                 let scale = 1.0 / (text.head_dim as f32).sqrt();
                 self.ctx.glue_attn_scores_raw(
@@ -487,16 +503,44 @@ impl QwenGpu {
             .glue_argmax(lm.y_ref(), &mut self.nt_spare, lm_out)?;
         std::mem::swap(&mut self.next_token, &mut self.nt_spare);
         self.ctx.glue_inc(&mut self.pos)?;
+        self.ctx.glue_inc3(&mut self.rope_pos)?;
         self.position += 1;
         Ok(())
     }
 
-    /// Feed a prompt token (host id) into the pipeline.
+    /// Feed a prompt token (text-only: rope position = KV index).
     pub fn push_token(&mut self, token: u32) -> Result<()> {
+        let p = self.position as i32;
+        self.push_token_at(token, [p, p, p])
+    }
+
+    /// Prefill one text token at an explicit mrope position.
+    pub fn push_token_at(&mut self, token: u32, pos3: [i32; 3]) -> Result<()> {
         self.ctx
             .stream
             .memcpy_htod(&[token as i32], &mut self.next_token)?;
+        self.ctx.stream.memcpy_htod(&pos3, &mut self.rope_pos)?;
         self.step()
+    }
+
+    /// Prefill one merged vision row into `hidden`. Eager — never
+    /// graph-captured (the decode graph is splice-free).
+    pub fn push_vision_row(&mut self, row: &[f32], pos3: [i32; 3]) -> Result<()> {
+        anyhow::ensure!(
+            row.len() == self.hidden.len(),
+            "vision row {} != hidden {}",
+            row.len(),
+            self.hidden.len()
+        );
+        anyhow::ensure!(
+            self.position < self.max_ctx,
+            "position {} reached max_ctx {} (KV cache capacity)",
+            self.position,
+            self.max_ctx
+        );
+        self.ctx.stream.memcpy_htod(row, &mut self.hidden)?;
+        self.ctx.stream.memcpy_htod(&pos3, &mut self.rope_pos)?;
+        self.step_layers()
     }
 
     /// The generated token id (the one sync per token).

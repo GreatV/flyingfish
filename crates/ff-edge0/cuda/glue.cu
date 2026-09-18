@@ -270,6 +270,93 @@ extern "C" __global__ void edge0_attn_qk_zc(
 
 
 
+// mrope variant: rope from a device [t,h,w] buffer (interleaved section
+// axis map); KV slot/length still ride `position`. Bit-identical at
+// rope_pos == [pos,pos,pos].
+__device__ __forceinline__ void rope_mrope_head(
+    float* __restrict__ x, const int* __restrict__ rope_pos, int half,
+    int rotary_dim, double theta, int tid, int sec_h, int sec_w)
+{
+    if (tid >= half) return;
+    const int axis = (tid % 3 == 1 && tid < 3 * sec_h) ? 1
+                   : (tid % 3 == 2 && tid < 3 * sec_w) ? 2 : 0;
+    const double freq = pow(theta, -(2.0 * tid) / rotary_dim);
+    const double angle = rope_pos[axis] * freq;
+    const float sin_f = (float)sin(angle);
+    const float cos_f = (float)cos(angle);
+    const float x1 = x[tid];
+    const float x2 = x[tid + half];
+    x[tid] = x1 * cos_f - x2 * sin_f;
+    x[tid + half] = x2 * cos_f + x1 * sin_f;
+}
+
+__device__ void attn_qk_mrope_impl(
+    const float* __restrict__ q_raw, const float* __restrict__ q_norm_w,
+    const float* __restrict__ k_raw, const float* __restrict__ k_norm_w,
+    const float* __restrict__ v_raw, float* __restrict__ q_out,
+    float* __restrict__ gate_out, float* __restrict__ kv_keys,
+    float* __restrict__ kv_values, const int* __restrict__ position,
+    const int* __restrict__ rope_pos, int kv_stride, int heads, int kv_heads,
+    int head_dim, int rotary_dim, double theta, int sec_h, int sec_w)
+{
+    const int pos = *position;
+    const int hd = head_dim;
+    const int half = rotary_dim / 2;
+    const int tid = threadIdx.x;
+
+    if (blockIdx.x < heads) {
+        const int h = blockIdx.x;
+        const float* src = q_raw + (long long)h * 2 * hd;
+        const float* gate_src = src + hd;
+        float* dst = q_out + (long long)h * hd;
+        float* gdst = gate_out + (long long)h * hd;
+        for (int i = tid; i < hd; i += blockDim.x) {
+            dst[i] = src[i];
+            gdst[i] = gate_src[i];
+        }
+        __syncthreads();
+        rmsnorm_head(dst, q_norm_w, tid, hd, 1);
+        __syncthreads();
+        rope_mrope_head(dst, rope_pos, half, rotary_dim, theta, tid, sec_h, sec_w);
+    } else if (blockIdx.x < heads + kv_heads) {
+        const int kh = blockIdx.x - heads;
+        float* dst = kv_keys + (long long)pos * kv_stride + (long long)kh * hd;
+        const float* src = k_raw + (long long)kh * hd;
+        for (int i = tid; i < hd; i += blockDim.x) dst[i] = src[i];
+        __syncthreads();
+        rmsnorm_head(dst, k_norm_w, tid, hd, 1);
+        __syncthreads();
+        rope_mrope_head(dst, rope_pos, half, rotary_dim, theta, tid, sec_h, sec_w);
+    } else {
+        const int kh = blockIdx.x - heads - kv_heads;
+        float* dst = kv_values + (long long)pos * kv_stride + (long long)kh * hd;
+        const float* src = v_raw + (long long)kh * hd;
+        for (int i = tid; i < hd; i += blockDim.x) dst[i] = src[i];
+    }
+}
+
+// qwen3_5 dense multimodal: zero-centered q/k norms + 3-axis mrope.
+extern "C" __global__ void edge0_attn_qk_zc_mrope(
+    const float* __restrict__ q_raw, const float* __restrict__ q_norm_w,
+    const float* __restrict__ k_raw, const float* __restrict__ k_norm_w,
+    const float* __restrict__ v_raw, float* __restrict__ q_out,
+    float* __restrict__ gate_out, float* __restrict__ kv_keys,
+    float* __restrict__ kv_values, const int* __restrict__ position,
+    const int* __restrict__ rope_pos, int kv_stride, int heads, int kv_heads,
+    int head_dim, int rotary_dim, double theta, int sec_h, int sec_w)
+{
+    attn_qk_mrope_impl(q_raw, q_norm_w, k_raw, k_norm_w, v_raw, q_out,
+                       gate_out, kv_keys, kv_values, position, rope_pos,
+                       kv_stride, heads, kv_heads, head_dim, rotary_dim,
+                       theta, sec_h, sec_w);
+}
+
+// Increment a 3-int rope position counter.
+extern "C" __global__ void edge0_inc3(int* __restrict__ c)
+{
+    if (threadIdx.x == 0) { c[0]++; c[1]++; c[2]++; }
+}
+
 // One block per q head; thread d owns output dimension d. len <= 8192
 // (the shared scores cap; the host asserts max_ctx).
 extern "C" __global__ void edge0_attn_scores(

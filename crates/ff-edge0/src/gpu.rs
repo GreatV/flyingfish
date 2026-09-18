@@ -42,7 +42,9 @@ pub struct GpuContext {
     k_rmsnorm_zc: cudarc::driver::safe::CudaFunction,
     k_add_rmsnorm_zc: cudarc::driver::safe::CudaFunction,
     k_attn_qk_zc: cudarc::driver::safe::CudaFunction,
+    k_attn_qk_zc_mrope: cudarc::driver::safe::CudaFunction,
     k_inc: cudarc::driver::safe::CudaFunction,
+    k_inc3: cudarc::driver::safe::CudaFunction,
     /// Counted per kernel launch — read BEFORE reading time (today's four
     /// bogus per-sync constants all came from reading time first).
     pub launch_count: std::sync::atomic::AtomicU64,
@@ -212,6 +214,12 @@ impl GpuContext {
         let k_attn_qk_zc = glue_module
             .load_function("edge0_attn_qk_zc")
             .context("edge0_attn_qk_zc missing")?;
+        let k_attn_qk_zc_mrope = glue_module
+            .load_function("edge0_attn_qk_zc_mrope")
+            .context("edge0_attn_qk_zc_mrope missing")?;
+        let k_inc3 = glue_module
+            .load_function("edge0_inc3")
+            .context("edge0_inc3 missing")?;
         let k_inc = glue_module
             .load_function("edge0_inc")
             .context("edge0_inc missing")?;
@@ -256,7 +264,9 @@ impl GpuContext {
             k_rmsnorm_zc,
             k_add_rmsnorm_zc,
             k_attn_qk_zc,
+            k_attn_qk_zc_mrope,
             k_inc,
+            k_inc3,
             sync_count: std::sync::atomic::AtomicU64::new(0),
             launch_count: std::sync::atomic::AtomicU64::new(0),
             argmax_scratch,
@@ -2189,6 +2199,87 @@ impl GpuContext {
                 })
         }
         .map_err(|e| anyhow::anyhow!("inc launch failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Increment a 3-int mrope position counter (t,h,w together).
+    pub fn glue_inc3(&self, counter: &mut CudaSlice<i32>) -> Result<()> {
+        unsafe {
+            self.stream
+                .launch_builder(&self.k_inc3)
+                .arg(counter)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .map_err(|e| anyhow::anyhow!("inc3 launch failed: {e}"))?;
+        Ok(())
+    }
+
+    /// glue_attn_qk_raw with 3-axis mrope (rope from rope_pos[3]; KV length
+    /// from `position`). Bit-identical at rope_pos == [pos, pos, pos].
+    #[allow(clippy::too_many_arguments)]
+    pub fn glue_attn_qk_zc_mrope(
+        &self,
+        q_raw: &CudaSlice<f32>,
+        q_norm_w: &CudaSlice<f32>,
+        k_raw: &CudaSlice<f32>,
+        k_norm_w: &CudaSlice<f32>,
+        v_raw: &CudaSlice<f32>,
+        q_out: &CudaSlice<f32>,
+        gate_out: &CudaSlice<f32>,
+        kv_keys: &CudaSlice<f32>,
+        kv_values: &CudaSlice<f32>,
+        position: &CudaSlice<i32>,
+        rope_pos: &CudaSlice<i32>,
+        kv_stride: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        theta: f64,
+        sec_h: usize,
+        sec_w: usize,
+    ) -> Result<()> {
+        let kv_stride_i = kv_stride as i32;
+        let heads_i = heads as i32;
+        let kv_heads_i = kv_heads as i32;
+        let hd_i = head_dim as i32;
+        let rot_i = rotary_dim as i32;
+        let sec_h_i = sec_h as i32;
+        let sec_w_i = sec_w as i32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.k_attn_qk_zc_mrope)
+                .arg(q_raw)
+                .arg(q_norm_w)
+                .arg(k_raw)
+                .arg(k_norm_w)
+                .arg(v_raw)
+                .arg(q_out)
+                .arg(gate_out)
+                .arg(kv_keys)
+                .arg(kv_values)
+                .arg(position)
+                .arg(rope_pos)
+                .arg(&kv_stride_i)
+                .arg(&heads_i)
+                .arg(&kv_heads_i)
+                .arg(&hd_i)
+                .arg(&rot_i)
+                .arg(&theta)
+                .arg(&sec_h_i)
+                .arg(&sec_w_i)
+                .launch(LaunchConfig {
+                    grid_dim: ((heads + 2 * kv_heads) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map(|_| ())
+        }
+        .map_err(|e| anyhow::anyhow!("attn_qk_zc_mrope launch failed: {e}"))?;
         Ok(())
     }
 }

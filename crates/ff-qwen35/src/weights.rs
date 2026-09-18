@@ -138,6 +138,13 @@ impl Qwen35Weights {
         Ok(bf16_to_f32(&data))
     }
 
+    /// bf16 tensor of any rank (the vision tower's conv/2-D weights),
+    /// widened to f32. Shape preserved.
+    pub fn bf16_tensor(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>)> {
+        let (shape, data) = self.view(name)?;
+        Ok((shape, bf16_to_f32(&data)))
+    }
+
     /// `{name}.weight` (U32 packed) + `.scales`/`.biases` (bf16) -> GroupQuant.
     pub fn quant_projection(&self, name: &str) -> Result<GroupQuant> {
         let (shape, packed) = self.view(&format!("{name}.weight"))?;
