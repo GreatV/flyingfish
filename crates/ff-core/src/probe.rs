@@ -466,6 +466,19 @@ impl ResourceSnapshot {
     }
 }
 
+/// Cap every pool-scaled admission reserve converges to: 1 GiB.
+pub const ADMISSION_RESERVE_CAP_BYTES: u64 = 1 << 30;
+
+/// The one admission-reserve shape: 5% of the pool total, capped at 1 GiB.
+/// Pools under 20 GiB scale below the cap so small and unified-memory
+/// machines are not over-reserved; an unknown pool keeps the full cap,
+/// matching the flat reserves this consolidates.
+pub fn admission_reserve_bytes(pool_total: Option<u64>) -> u64 {
+    pool_total.map_or(ADMISSION_RESERVE_CAP_BYTES, |total| {
+        ADMISSION_RESERVE_CAP_BYTES.min(total / 20)
+    })
+}
+
 trait ProbeSource {
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
 
@@ -1835,5 +1848,24 @@ mod tests {
         let encoded = serde_json::to_vec(&snapshot).unwrap();
         let decoded: ResourceSnapshot = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn admission_reserve_scales_below_the_crossover_and_caps_above_it() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(admission_reserve_bytes(None), GIB);
+        assert_eq!(admission_reserve_bytes(Some(6 * GIB)), 6 * GIB / 20);
+        assert_eq!(
+            admission_reserve_bytes(Some(20 * GIB)),
+            GIB,
+            "exactly at the crossover the cap binds"
+        );
+        assert_eq!(
+            admission_reserve_bytes(Some(24 * GIB)),
+            GIB,
+            "the 24 GiB baseline keeps the flat 1 GiB margin"
+        );
+        assert_eq!(admission_reserve_bytes(Some(u64::MAX)), GIB);
+        assert_eq!(admission_reserve_bytes(Some(0)), 0);
     }
 }
