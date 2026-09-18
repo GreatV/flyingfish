@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use candle_core::DType;
 use ff_core::{
-    probe::ResourceSnapshot,
+    probe::{ResourceSnapshot, admission_reserve_bytes},
     resource_selection::ResourcePhaseEstimate,
     weights::{
         CachePolicy, ModelWeights, TensorMetadata, WeightSource,
@@ -744,10 +744,7 @@ impl GlmAdmissionBreakdown {
                 .or_else(|| snapshot.host_pool_total_bytes())
                 .or(snapshot.host_memory_available_bytes)
         };
-        match total {
-            Some(total) => GLM_ADMISSION_SAFETY_BYTES.min(total / 20),
-            None => GLM_ADMISSION_SAFETY_BYTES,
-        }
+        admission_reserve_bytes(total)
     }
 
     /// The host-promotion reserve, on the same footing as the safety reserve:
@@ -770,10 +767,7 @@ impl GlmAdmissionBreakdown {
                 .host_pool_total_bytes()
                 .or(snapshot.host_memory_available_bytes)
         };
-        match total {
-            Some(total) => (1_u64 << 30).min(total / 20),
-            None => 1_u64 << 30,
-        }
+        admission_reserve_bytes(total)
     }
 
     /// Whether a weight promotion still has its reserve of headroom. The
