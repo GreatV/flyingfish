@@ -18,6 +18,35 @@ struct E2eFixture {
     margins: Vec<f32>,
 }
 
+/// CI-unconditional half of the gate: the decode-position arithmetic from
+/// the committed rope fixture (130 ids, delta -63 -> first decode at 67).
+/// The id-level e2e below still skips without the model dir.
+#[test]
+fn decode_rope_pos_matches_fixture_arithmetic() {
+    let f: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string("src/testdata/vision_rope_fixture.json").unwrap(),
+    )
+    .unwrap();
+    let seq_len = f["input_ids"].as_array().unwrap().len();
+    let delta = f["rope_delta"].as_f64().unwrap() as i64;
+    let max_pos = f["position_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|axis| axis.as_array().unwrap().iter())
+        .filter_map(|v| v.as_i64())
+        .max()
+        .unwrap();
+    // First decode token sits at KV index seq_len; its rope position must be
+    // max(prefill)+1 — negative delta included (the usize-clamp regression).
+    assert_eq!(
+        ff_qwen35::model::decode_rope_pos(seq_len, delta),
+        (max_pos + 1) as usize,
+        "decode continuation position mismatch"
+    );
+    assert!(delta < 0, "fixture should exercise the negative-delta path");
+}
+
 #[test]
 fn image_prompt_decode_matches_hf_fixture() {
     let dir = Path::new("../../models/Qwen/Qwen3.8-27B-int4");

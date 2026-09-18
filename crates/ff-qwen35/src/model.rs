@@ -61,6 +61,14 @@ fn rope_mrope(
     }
 }
 
+/// Decode rope position = KV index + mrope delta (delta < 0 for image
+/// prompts — mrope compresses the image region). Free function so the
+/// arithmetic is unit-testable without the model (the usize-clamp incident:
+/// review HIGH on the vision PR).
+pub fn decode_rope_pos(position: usize, mrope_delta: i64) -> usize {
+    (position as i64 + mrope_delta) as usize
+}
+
 struct GdnState {
     /// [k-1][conv_dim] ring (oldest first), as in the edge0 layout.
     conv: Vec<f32>,
@@ -177,8 +185,7 @@ impl Qwen35Text {
 
     /// forward + the pre-final-norm hidden (the MTP layer's input).
     pub fn forward_raw(&mut self, token: u32) -> Result<(Vec<f32>, Vec<f32>)> {
-        let rope_pos = (self.position as i64 + self.mrope_delta) as usize;
-        let pos3 = [rope_pos; 3];
+        let pos3 = [decode_rope_pos(self.position, self.mrope_delta); 3];
         self.forward_hidden(self.embed_row(token)?, pos3)
     }
 
@@ -205,7 +212,7 @@ impl Qwen35Text {
     /// The rope position the NEXT forward_raw will use — the decode
     /// continuation check for the e2e gate (must equal max(prefill)+1).
     pub fn next_rope_pos(&self) -> usize {
-        (self.position as i64 + self.mrope_delta) as usize
+        decode_rope_pos(self.position, self.mrope_delta)
     }
 
     fn forward_hidden(
