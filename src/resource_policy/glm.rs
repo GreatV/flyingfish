@@ -713,14 +713,18 @@ mod tests {
         // Pool (the device view is smallest) passes plain capacity but not the
         // promotion reserve; the discrete host view admits both. Totals are
         // set explicitly so the total-scaled reserves are fixed (host_total
-        // 8 GiB → promotion reserve 0.4 GiB) and the discriminating margin is
-        // not pool-dependent: peak 0.404 GiB + 0.4 GiB > 0.5 GiB pool.
+        // 8 GiB → both reserves at the 512 MiB floor) and the discriminating
+        // margin is not pool-dependent: promoted peak 0.404 GiB + 0.512 GiB
+        // > 0.9 GiB pool, while the baseline peak + the same reserve fits.
+        // The discrete device view is widened further so its own safety
+        // reserve fits with room to spare.
         let mut unified_snapshot = snapshot();
         unified_snapshot.host_memory_total_bytes = Some(8 << 30);
-        unified_snapshot.device_free_memory_bytes = Some(536_870_912);
+        unified_snapshot.device_free_memory_bytes = Some(966_367_640); // 0.9 GiB
         unified_snapshot.host_device_memory_is_unified = Some(true);
         let mut discrete_snapshot = unified_snapshot.clone();
         discrete_snapshot.host_device_memory_is_unified = None;
+        discrete_snapshot.device_free_memory_bytes = Some(2 << 30);
 
         let selected = select(
             &base,

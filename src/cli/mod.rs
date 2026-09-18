@@ -498,14 +498,32 @@ impl DeviceCacheArgs {
 }
 
 /// Headroom the residency ladder leaves free on the device for activations,
-/// workspaces and allocator slack.
+/// workspaces and allocator slack: the shared admission-reserve shape (5% of
+/// the pool total, capped at 1 GiB), so small and unified pools are not
+/// over-reserved — a 24 GiB discrete card keeps the historical flat 1 GiB
+/// exactly.
 ///
-/// This is the same conservative one-gibibyte margin the GLM admission policy
-/// already states as `admission_safety_bytes`. It is a declared margin, not a
-/// measured requirement. Adapters add known request allocations separately.
-/// Runtime cache demotion can recover weight-load allocation failures; this
-/// margin does not guarantee that every activation allocation will fit.
-const DEVICE_RESIDENCY_RESERVE_BYTES: u64 = 1 << 30;
+/// A declared margin, not a measured requirement. Adapters add known request
+/// allocations separately. Runtime cache demotion can recover weight-load
+/// allocation failures; this margin does not guarantee that every activation
+/// allocation will fit.
+fn device_residency_reserve_bytes(snapshot: &flyingfish::runtime::probe::ResourceSnapshot) -> u64 {
+    let total = if snapshot.host_device_memory_is_unified == Some(true) {
+        [
+            snapshot.host_pool_total_bytes(),
+            snapshot.device_total_memory_bytes,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    } else {
+        snapshot.device_total_memory_bytes
+    };
+    // The free-view fallback below is for legacy recorded snapshots only: a
+    // live capture produces the device total and free together (both come
+    // from the same CUDA device handle).
+    flyingfish::runtime::probe::admission_reserve_bytes(total.or(snapshot.device_free_memory_bytes))
+}
 
 /// Default CUDA placement for adapters with request tensor estimates. Explicit
 /// ceilings (including zero) and non-CUDA devices keep their existing behavior.
@@ -541,7 +559,7 @@ fn decide_auto_residency_with_required_memory(
     let share = if shared { unified_share.max(1) } else { 1 };
     let reserve = required_device_bytes
         .saturating_mul(share)
-        .checked_add(DEVICE_RESIDENCY_RESERVE_BYTES.saturating_mul(share))
+        .checked_add(device_residency_reserve_bytes(&snapshot).saturating_mul(share))
         .context("device residency reserve overflow")?;
     let capacity = if snapshot.unified_accounting_is_undecidable() {
         0
@@ -588,7 +606,7 @@ fn decide_residency_with_required_memory(
     let snapshot = ResourceSnapshot::capture(Some(device));
     let shared = snapshot.unified_pool_available_bytes().is_some();
     let share = if shared { unified_share.max(1) } else { 1 };
-    let reserve = DEVICE_RESIDENCY_RESERVE_BYTES
+    let reserve = device_residency_reserve_bytes(&snapshot)
         .saturating_mul(share)
         .checked_add(required_device_bytes.saturating_mul(share))
         .context("device residency reserve overflow")?;
@@ -1375,6 +1393,58 @@ fn parse_device(value: &str) -> Result<Device> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    fn snap(
+        unified: Option<bool>,
+        host_total: Option<u64>,
+        device_total: Option<u64>,
+        device_free: Option<u64>,
+    ) -> flyingfish::runtime::probe::ResourceSnapshot {
+        flyingfish::runtime::probe::ResourceSnapshot {
+            schema_version: flyingfish::runtime::probe::RESOURCE_SNAPSHOT_SCHEMA_VERSION,
+            measured_at_unix_ms: 1,
+            host_memory_available_bytes: Some(host_total.unwrap_or(0)),
+            cgroup_v2_memory_limit: None,
+            cgroup_v2_memory_current_bytes: None,
+            cgroup_v2_memory_available_bytes: None,
+            device_free_memory_bytes: device_free,
+            host_device_memory_is_unified: unified,
+            device_topology_probe_failed: false,
+            host_memory_total_bytes: host_total,
+            device_total_memory_bytes: device_total,
+            measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
+                host_memory: None,
+                cgroup_memory: None,
+                device_memory: None,
+            },
+        }
+    }
+
+    #[test]
+    fn device_residency_reserve_matches_the_flat_margin_on_a_24gib_card() {
+        let snapshot = snap(Some(false), Some(64 << 30), Some(24 << 30), Some(20 << 30));
+        // 24 GiB / 20 = 1.2 GiB > the 1 GiB cap: the historical flat margin,
+        // pinned so the baseline cannot drift.
+        assert_eq!(device_residency_reserve_bytes(&snapshot), 1 << 30);
+    }
+
+    #[test]
+    fn device_residency_reserve_scales_down_on_small_unified_pools() {
+        let snapshot = snap(Some(true), Some(6 << 30), Some(6 << 30), Some(4 << 30));
+        assert_eq!(device_residency_reserve_bytes(&snapshot), 512 << 20);
+    }
+
+    #[test]
+    fn device_residency_reserve_keeps_the_cap_without_totals() {
+        // No totals at all: the historical flat cap, not a free-view guess.
+        let snapshot = snap(None, None, None, None);
+        assert_eq!(device_residency_reserve_bytes(&snapshot), 1 << 30);
+        // A free view without a total is a LEGACY-RECORD shape only (a live
+        // capture produces the total and free together); it mirrors the GLM
+        // axis fallback so replayed selections reproduce their era's reserve.
+        let snapshot = snap(None, None, None, Some(4 << 30));
+        assert_eq!(device_residency_reserve_bytes(&snapshot), 512 << 20);
+    }
 
     #[test]
     fn parses_calibrate_io_command() {

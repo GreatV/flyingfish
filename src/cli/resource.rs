@@ -161,13 +161,13 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         resident_input_bytes: request.resident_input_bytes,
         // Under the unified fold the once-only device reserve is charged to
         // the host axis instead of stamped on phases (host-only phases carry
-        // no device reserve). This holds the "modelled peaks plus at least
-        // DEVICE_RESIDENCY_RESERVE_BYTES of slack" invariant unconditionally,
-        // including the paths where automatic_device_cache early-returns.
+        // no device reserve). This keeps "modelled peaks plus the shared
+        // pool-scaled reserve of slack" charged exactly once, including the
+        // paths where automatic_device_cache early-returns.
         additional_host_allowance_bytes: request
             .additional_host_allowance_bytes
             .checked_add(if unified {
-                super::DEVICE_RESIDENCY_RESERVE_BYTES
+                super::device_residency_reserve_bytes(&snapshot)
             } else {
                 0
             })
@@ -179,7 +179,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
     let headroom_bytes = if unified {
         0
     } else {
-        super::DEVICE_RESIDENCY_RESERVE_BYTES
+        super::device_residency_reserve_bytes(&snapshot)
     };
     let automatic_cache = flyingfish::resource_policy::h3::automatic_device_cache(
         &selection_request,
@@ -216,7 +216,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
             // reserve: the phase type invariant rejects the combination, and
             // the sizing already accounted the headroom against the pool.
             if phase.required_device_bytes.is_some() {
-                phase.device_reserve_bytes = super::DEVICE_RESIDENCY_RESERVE_BYTES;
+                phase.device_reserve_bytes = super::device_residency_reserve_bytes(&snapshot);
             }
         }
     }
