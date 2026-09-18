@@ -8,3 +8,5 @@
 /edge0-src
 /edge0-ref
 /models
+__pycache__/
+*.pyc
