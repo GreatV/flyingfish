@@ -98,7 +98,7 @@ pub struct Qwen35Text {
     /// Decode offset max(prefill)+1 - prompt_len; negative for image
     /// prompts (i64 by necessity).
     mrope_delta: i64,
-    /// Per-layer post-residual hidden states, populated when QWEN35_DUMP=1.
+    /// Per-layer post-residual hidden states, populated when QWEN35_DUMP=<path>.
     pub dump: Vec<Vec<f32>>,
     dump_mixer: bool,
     /// (gdn_in, gdn_out, mlp_in, mlp_out) for layer 0 when DUMP_MIXER.

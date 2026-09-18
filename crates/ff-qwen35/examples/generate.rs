@@ -264,7 +264,11 @@ fn main() -> anyhow::Result<()> {
             }
         }
         std::fs::write(&path, &bytes)?;
-        println!("mixer dumped {} vecs", model.mixer_dump.len());
+        println!(
+            "mixer dumped {} vecs -> {}",
+            model.mixer_dump.len(),
+            path.to_string_lossy()
+        );
     }
     if let Some(path) = std::env::var_os("QWEN35_DUMP") {
         let mut bytes = Vec::new();
@@ -275,9 +279,10 @@ fn main() -> anyhow::Result<()> {
         }
         std::fs::write(&path, &bytes)?;
         println!(
-            "dumped {} layers x {} floats",
+            "dumped {} layers x {} floats -> {}",
             model.dump.len(),
-            model.dump[0].len()
+            model.dump[0].len(),
+            path.to_string_lossy()
         );
     }
 
