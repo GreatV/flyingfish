@@ -2,6 +2,15 @@
 //! CPU f32 via candle. Ported from ff-h3's multimodal_text_encoder
 //! (Qwen3-VL family), minus video/deepstack and the CUDA paths.
 //! Weight names: `model.visual.*` (BF16 in the checkpoint, widened to f32).
+//!
+//! Gate semantics (the two fixtures prove different things): the tower
+//! gate compares against HF's vision module in **f32** and proves the
+//! ALGORITHM — bf16 is measurably chaotic in this tower (bf16-vs-f32 HF
+//! diverges by hundreds of units pre-merger; the merger LN re-normalizes),
+//! so a bf16 reference could not separate algorithm errors from dtype
+//! noise. The e2e gate (tests/vision_e2e.rs) covers the DEPLOYMENT path
+//! (mrope positions + int4 ids). By construction the f32 tower gate cannot
+//! see bf16/int4-specific defects; that is what e2e is for.
 
 use crate::config::{VISION_ROPE_THETA, VisionConfig};
 use crate::weights::Qwen35Weights;
