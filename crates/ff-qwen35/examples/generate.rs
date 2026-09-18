@@ -3,6 +3,7 @@
 //!
 //! Usage: generate <model_dir> [n_tokens] [prompt]
 
+use anyhow::Context as _;
 use ff_qwen35::config::Qwen35Config;
 use ff_qwen35::model::Qwen35Text;
 use std::path::Path;
@@ -17,6 +18,7 @@ fn main() -> anyhow::Result<()> {
     let prompt = args
         .next()
         .unwrap_or_else(|| "Explain paging to a systems programmer.".to_string());
+    let image_path = args.next();
 
     let dir = Path::new(&dir);
     let config = Qwen35Config::from_model_dir(dir)?;
@@ -27,14 +29,83 @@ fn main() -> anyhow::Result<()> {
     // The checkpoint's chat_template.jinja prepends this system block
     // (verified against apply_chat_template 2026-09-17). Divergent prompts
     // were the whole "first token mismatch" bug class — keep byte-exact.
-    let templated = format!(
-        "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"
-    );
+    // Vision: preprocess + tower forward (CPU f32), then the single
+    // <|image_pad|> placeholder expands to the merged-token count.
+    let vision = match &image_path {
+        Some(path) => {
+            anyhow::ensure!(
+                std::env::var("QWEN35_MTP").unwrap_or_default().is_empty(),
+                "image prompts do not support QWEN35_MTP (spec is text-only)"
+            );
+            anyhow::ensure!(
+                std::env::var_os("QWEN35_PREFIX").is_none(),
+                "QWEN35_PREFIX with an image is unsupported"
+            );
+            let proc = ff_qwen35::vision::ProcessorConfig::from_model_dir(dir)?;
+            let img = ff_qwen35::vision::RgbImage::from_png(path)?;
+            let (patches, grid) = ff_qwen35::vision::preprocess_image(&img, &proc)?;
+            let n_merged = grid.merged_count(proc.merge_size())?;
+            let weights = ff_qwen35::weights::Qwen35Weights::open(dir)?;
+            let tower = ff_qwen35::vision::VisionTower::load(
+                &weights,
+                config.vision_config.as_ref().context("no vision_config")?,
+            )?;
+            let started = Instant::now();
+            let rows = tower.forward(&patches, grid)?;
+            println!(
+                "vision: grid [{}, {}, {}] -> {n_merged} tokens in {:.1}s",
+                grid.temporal,
+                grid.height,
+                grid.width,
+                started.elapsed().as_secs_f32()
+            );
+            Some((rows, grid))
+        }
+        None => None,
+    };
+    let templated = if vision.is_some() {
+        format!(
+            "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        )
+    } else {
+        format!(
+            "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        )
+    };
     let mut ids = tokenizer
         .encode(templated.as_str(), false)
         .map_err(|e| anyhow::anyhow!("encode: {e}"))?
         .get_ids()
         .to_vec();
+    // Expand the placeholder and build per-token mrope positions.
+    let (pos3, mrope_delta) = if let Some((_, grid)) = &vision {
+        let image_token = config.image_token_id.context("no image_token_id")?;
+        let merge = config
+            .vision_config
+            .as_ref()
+            .map(|v| v.spatial_merge_size)
+            .unwrap_or(2);
+        let n_merged = grid.merged_count(merge)?;
+        let at = ids
+            .iter()
+            .position(|&t| t == image_token)
+            .context("no <|image_pad|> in the tokenized prompt")?;
+        let mut expanded = Vec::with_capacity(ids.len() + n_merged - 1);
+        expanded.extend_from_slice(&ids[..at]);
+        expanded.extend(std::iter::repeat_n(image_token, n_merged));
+        expanded.extend_from_slice(&ids[at + 1..]);
+        ids = expanded;
+        let types: Vec<u8> = ids.iter().map(|&t| (t == image_token) as u8).collect();
+        let (p, d) = ff_qwen35::vision::multimodal_positions(&types, &[*grid], merge)?;
+        (p, d)
+    } else {
+        (Vec::new(), 0)
+    };
+    let total_ctx = ids.len() + n + 4;
+    anyhow::ensure!(
+        total_ctx <= 8192,
+        "prompt + generation {total_ctx} exceeds the 8192 kernel cap"
+    );
     if let Some(n) = std::env::var("QWEN35_PREFIX")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -45,11 +116,31 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "cuda")]
     if std::env::var_os("QWEN35_GPU").is_some() {
         let weights = ff_qwen35::weights::Qwen35Weights::open(dir)?;
-        let mut gpu = ff_qwen35::gpu::QwenGpu::new(&weights, &config)?;
+        let mut gpu = if vision.is_some() {
+            ff_qwen35::gpu::QwenGpu::with_max_ctx(&weights, &config, total_ctx.next_power_of_two())?
+        } else {
+            ff_qwen35::gpu::QwenGpu::new(&weights, &config)?
+        };
         let spec_mode = std::env::var("QWEN35_MTP").unwrap_or_default() == "spec";
         let started = Instant::now();
-        for &id in &ids {
-            gpu.push_token(id)?;
+        if let Some((rows, _)) = &vision {
+            let n_hidden = config.text_config.hidden_size;
+            let image_token = config.image_token_id.unwrap();
+            let mut pad_row = 0usize;
+            for (i, &id) in ids.iter().enumerate() {
+                let p = pos3[i];
+                if id == image_token {
+                    let row = &rows[pad_row * n_hidden..(pad_row + 1) * n_hidden];
+                    pad_row += 1;
+                    gpu.push_vision_row(row, p)?;
+                } else {
+                    gpu.push_token_at(id, p)?;
+                }
+            }
+        } else {
+            for &id in &ids {
+                gpu.push_token(id)?;
+            }
         }
         println!("prefill: {:.2}s (gpu)", started.elapsed().as_secs_f32());
         if spec_mode {
@@ -126,8 +217,29 @@ fn main() -> anyhow::Result<()> {
 
     let started = Instant::now();
     let mut hidden = None;
-    for &id in &ids {
-        hidden = Some(model.forward(id)?);
+    if let Some((rows, _)) = &vision {
+        let n_hidden = config.text_config.hidden_size;
+        let image_token = config.image_token_id.unwrap();
+        let mut pad_row = 0usize;
+        for (i, &id) in ids.iter().enumerate() {
+            let p = [
+                pos3[i][0] as usize,
+                pos3[i][1] as usize,
+                pos3[i][2] as usize,
+            ];
+            hidden = Some(if id == image_token {
+                let row = rows[pad_row * n_hidden..(pad_row + 1) * n_hidden].to_vec();
+                pad_row += 1;
+                model.forward_vision_row(row, p)?.1
+            } else {
+                model.forward_at(id, p)?.1
+            });
+        }
+        model.set_mrope_delta(mrope_delta.max(0) as usize);
+    } else {
+        for &id in &ids {
+            hidden = Some(model.forward(id)?);
+        }
     }
     println!("prefill: {:.1}s", started.elapsed().as_secs_f32());
     if std::env::var_os("QWEN35_DUMP_MIXER").is_some() {

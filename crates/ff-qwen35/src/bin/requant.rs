@@ -388,6 +388,8 @@ fn main() -> Result<()> {
         "tokenizer_config.json",
         "chat_template.jinja",
         "generation_config.json",
+        "preprocessor_config.json",
+        "processor_config.json",
         "merges.txt",
         "vocab.json",
     ] {

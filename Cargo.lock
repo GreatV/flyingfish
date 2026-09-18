@@ -790,10 +790,13 @@ name = "ff-qwen35"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "candle-core",
+ "candle-nn",
  "cudarc 0.19.9",
  "ff-edge0",
  "half",
  "memmap2",
+ "png",
  "safetensors 0.8.0",
  "serde",
  "serde_json",

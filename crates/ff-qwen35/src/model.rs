@@ -180,6 +180,12 @@ impl Qwen35Text {
         self.forward_hidden(self.embed_row(token)?, pos3)
     }
 
+    /// Text token at an explicit mrope position (image-prompt prefill).
+    pub fn forward_at(&mut self, token: u32, pos3: [usize; 3]) -> Result<(Vec<f32>, Vec<f32>)> {
+        let h = self.embed_row(token)?;
+        self.forward_hidden(h, pos3)
+    }
+
     /// Vision-row splice entry: the hidden comes from the vision tower, not
     /// the embedding table. `pos3` is this token's mrope position.
     pub fn forward_vision_row(
@@ -194,7 +200,11 @@ impl Qwen35Text {
         self.mrope_delta = delta;
     }
 
-    fn forward_hidden(&mut self, hidden: Vec<f32>, pos3: [usize; 3]) -> Result<(Vec<f32>, Vec<f32>)> {
+    fn forward_hidden(
+        &mut self,
+        hidden: Vec<f32>,
+        pos3: [usize; 3],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
         let mut hidden = hidden;
         self.pos3 = pos3;
         // QWEN35_BF16ROUND=1: round the residual stream to bf16 after each
@@ -363,7 +373,13 @@ impl Qwen35Text {
         for kh in 0..kv_heads {
             let mut kvec = k_raw[kh * head_dim..(kh + 1) * head_dim].to_vec();
             kvec = rmsnorm_zc(&kvec, &k_norm_w, eps);
-            rope_mrope(&mut kvec, pos3, rotary_dim, text.rope.rope_theta, text.rope.mrope_section);
+            rope_mrope(
+                &mut kvec,
+                pos3,
+                rotary_dim,
+                text.rope.rope_theta,
+                text.rope.mrope_section,
+            );
             cache.keys.extend_from_slice(&kvec);
         }
         cache.values.extend_from_slice(&v_raw);
@@ -374,7 +390,13 @@ impl Qwen35Text {
             let kv_head = h / (heads / kv_heads);
             let mut q = query[h * head_dim..(h + 1) * head_dim].to_vec();
             q = rmsnorm_zc(&q, &q_norm_w, eps);
-            rope_mrope(&mut q, pos3, rotary_dim, text.rope.rope_theta, text.rope.mrope_section);
+            rope_mrope(
+                &mut q,
+                pos3,
+                rotary_dim,
+                text.rope.rope_theta,
+                text.rope.mrope_section,
+            );
             let mut scores = Vec::with_capacity(cache.len);
             #[allow(clippy::needless_range_loop)] // step couples scores + kv stride
             for step in 0..cache.len {

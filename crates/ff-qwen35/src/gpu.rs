@@ -522,9 +522,7 @@ impl QwenGpu {
         self.ctx
             .stream
             .memcpy_htod(&[token as i32], &mut self.next_token)?;
-        self.ctx
-            .stream
-            .memcpy_htod(&pos3, &mut self.rope_pos)?;
+        self.ctx.stream.memcpy_htod(&pos3, &mut self.rope_pos)?;
         self.step()
     }
 
@@ -545,9 +543,7 @@ impl QwenGpu {
             self.max_ctx
         );
         self.ctx.stream.memcpy_htod(row, &mut self.hidden)?;
-        self.ctx
-            .stream
-            .memcpy_htod(&pos3, &mut self.rope_pos)?;
+        self.ctx.stream.memcpy_htod(&pos3, &mut self.rope_pos)?;
         self.step_layers()
     }
 

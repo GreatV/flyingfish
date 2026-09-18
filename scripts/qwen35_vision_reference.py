@@ -101,7 +101,9 @@ def load_rgb(image_path):
         filt = raw[y * stride]
         assert filt == 0, f"filter {filt} unsupported (our encoder writes none)"
         out[y] = np.frombuffer(bytes(line), dtype=np.uint8).reshape(width, 3)
-    return out
+    from PIL import Image
+
+    return Image.fromarray(out, "RGB")
 
 
 def rope_dump(image_path, out_path):
@@ -121,6 +123,7 @@ def rope_dump(image_path, out_path):
     model = load_model()
     position_ids, rope_delta = model.model.get_rope_index(
         inputs["input_ids"],
+        inputs["mm_token_type_ids"],
         inputs.get("image_grid_thw"),
         None,
     )
@@ -152,17 +155,31 @@ def load_model():
 
 
 def tower_dump(image_path, out_path):
+    """Vision-module-only fixture, in f32: the bf16 tower is measurably
+    ill-conditioned in late blocks (bf16-vs-f32 HF diverges by hundreds of
+    units before the merger), so the gate references the f32 run — the
+    merger's LN makes the f32 output well-conditioned."""
+    import glob
+
     import torch
+    from transformers import AutoConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+    import safetensors.torch as st
 
     proc = load_processor()
     image = load_rgb(image_path)
     result = proc.image_processor(images=[image], return_tensors="pt")
-    model = load_model()
+    cfg = AutoConfig.from_pretrained(MODEL)
+    visual = Qwen3_5VisionModel(cfg.vision_config)
+    sd = {}
+    for shard in sorted(glob.glob(f"{MODEL}/model-*.safetensors")):
+        for k, v in st.load_file(shard).items():
+            if k.startswith("model.visual."):
+                sd[k[len("model.visual."):]] = v
+    visual.load_state_dict(sd, strict=True)
+    visual = visual.to(torch.float32).eval()
     with torch.no_grad():
-        out = model.model.visual(
-            result["pixel_values"].to(torch.bfloat16),
-            result["image_grid_thw"],
-        )
+        out = visual(result["pixel_values"].float(), result["image_grid_thw"])
     pooler = out.pooler_output if hasattr(out, "pooler_output") else out
     with open(out_path, "w") as f:
         json.dump(
