@@ -255,24 +255,25 @@ fn main() -> anyhow::Result<()> {
         }
     }
     println!("prefill: {:.1}s", started.elapsed().as_secs_f32());
-    if std::env::var_os("QWEN35_DUMP_MIXER").is_some() {
+    // Dump path comes from the env var's VALUE (unset = no dump).
+    if let Some(path) = std::env::var_os("QWEN35_DUMP_MIXER") {
         let mut bytes = Vec::new();
         for h in &model.mixer_dump {
             for v in h {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
         }
-        std::fs::write("/tmp/qwen_rust_mixer.bin", &bytes)?;
+        std::fs::write(&path, &bytes)?;
         println!("mixer dumped {} vecs", model.mixer_dump.len());
     }
-    if std::env::var_os("QWEN35_DUMP").is_some() {
+    if let Some(path) = std::env::var_os("QWEN35_DUMP") {
         let mut bytes = Vec::new();
         for h in &model.dump {
             for v in h {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
         }
-        std::fs::write("/tmp/qwen_rust_dump.bin", &bytes)?;
+        std::fs::write(&path, &bytes)?;
         println!(
             "dumped {} layers x {} floats",
             model.dump.len(),

@@ -186,7 +186,9 @@ mod tests {
 
     #[test]
     fn parses_the_real_checkpoint_config() {
-        let dir = Path::new("../../models/Qwen/Qwen3.8-27B");
+        let dir = std::env::var("QWEN35_MODEL_DIR")
+            .unwrap_or_else(|_| "../../models/Qwen/Qwen3.8-27B".into());
+        let dir = Path::new(&dir);
         if !dir.exists() {
             return;
         }
