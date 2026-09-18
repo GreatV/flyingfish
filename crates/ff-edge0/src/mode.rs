@@ -13,17 +13,21 @@ use ff_core::probe::admission_reserve_bytes;
 /// every traffic and residency budget in this crate.
 pub const SCALE_BIAS_OVERHEAD: f64 = 0.125;
 
-/// Host-side floor subtracted from unified pools so a mode plan cannot
-/// budget away the memory the host run itself needs.
-const UNIFIED_HOST_FLOOR_BYTES: u64 = 2_u64 << 30;
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hardware {
     pub total_vram_bytes: Option<u64>,
     pub free_vram_bytes: Option<u64>,
     /// From the unified-memory three-tier probe; None = unprobed.
     pub unified_host_device: Option<bool>,
+    /// Host availability already clamped to the cgroup limit where one
+    /// applies (MemAvailable alone ignores a container's memory ceiling).
     pub host_memory_available_bytes: Option<u64>,
+    /// The topology query itself failed on a CUDA device. Distinct from
+    /// `unified_host_device: None` (never probed): a failed probe cannot
+    /// rule out a shared pool, so planning must refuse rather than assume
+    /// discrete — the same contract as ff-core's
+    /// `device_topology_probe_failed`.
+    pub unified_probe_failed: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -118,32 +122,72 @@ pub fn plan_mode(
 
     let reserve = admission_reserve_bytes(Some(total));
 
-    // Unified pools share one physical memory with the host: the device
-    // side may not budget away what the host run itself needs.
-    let host_floor = if hardware.unified_host_device == Some(true) {
-        provenance.push(format!(
-            "unified pool: reserving an additional host floor of {UNIFIED_HOST_FLOOR_BYTES} B on the shared pool"
+    // Unified pools share one physical memory with the host, so the budget
+    // comes from the measured pool — the smaller of the two availability
+    // views — not from the device total alone (which on such devices IS the
+    // host's memory too). Any view the contract needs but cannot measure
+    // (host availability, the device free view, or the topology query
+    // itself) fails closed to host-only rather than planning a pool that may
+    // already be spent; `None` alone still means discrete, as in ff-core.
+    let fail_closed = |provenance_line: &str, provenance: &mut Vec<String>| {
+        provenance.push(provenance_line.to_owned());
+        ModePlan {
+            mode: PerformanceMode::HostOnly,
+            budget_bytes: 0,
+            expert_bytes_resident: 0,
+            provenance: std::mem::take(provenance),
+        }
+    };
+    let unified_pool: Option<u64> = if hardware.unified_probe_failed {
+        return Ok(fail_closed(
+            "mode: HOST-ONLY — topology probe failed; a shared pool cannot be ruled out",
+            &mut provenance,
         ));
-        UNIFIED_HOST_FLOOR_BYTES
     } else {
-        0
+        match hardware.unified_host_device {
+            None | Some(false) => None,
+            Some(true) => match (
+                hardware.host_memory_available_bytes,
+                hardware.free_vram_bytes,
+            ) {
+                (Some(host_available), Some(free)) => {
+                    let pool = host_available.min(free);
+                    provenance.push(format!(
+                        "unified pool: host view {host_available} B, device free view {free} B → pool {pool} B"
+                    ));
+                    Some(pool)
+                }
+                _ => {
+                    return Ok(fail_closed(
+                        "mode: HOST-ONLY — unified pool of unknown size (a required availability view is unmeasured)",
+                        &mut provenance,
+                    ));
+                }
+            },
+        }
     };
 
     let budget = match overrides.vram_budget_bytes {
         Some(user) => {
-            let b = user.min(total.saturating_sub(host_floor));
+            // User budgets are ASSUMED to already include runtime overhead;
+            // a unified pool still caps what the shared memory can supply.
+            let cap = unified_pool.map_or(total, |pool| total.min(pool));
+            let b = user.min(cap);
             provenance.push(format!(
                 "budget: user {user} B capped to {b} B — user budget is ASSUMED to already include runtime overhead (context, activations, KV/GDN state)"
             ));
             b
         }
         None => {
-            let b = total.saturating_sub(reserve).saturating_sub(host_floor);
-            if let Some(free) = hardware.free_vram_bytes {
+            let source = unified_pool.unwrap_or(total);
+            let b = source.saturating_sub(reserve);
+            if unified_pool.is_none()
+                && let Some(free) = hardware.free_vram_bytes
+            {
                 provenance.push(format!("free VRAM at probe: {free} B"));
             }
             provenance.push(format!(
-                "budget: unset → total {total} B − scaled reserve {reserve} B − host floor {host_floor} B = {b} B"
+                "budget: unset → pool {source} B − scaled reserve {reserve} B = {b} B"
             ));
             b
         }
@@ -204,6 +248,7 @@ mod tests {
             free_vram_bytes: Some(23 << 30),
             unified_host_device: Some(false),
             host_memory_available_bytes: Some(60 << 30),
+            unified_probe_failed: false,
         }
     }
 
@@ -250,6 +295,7 @@ mod tests {
             free_vram_bytes: Some(7 << 30),
             unified_host_device: Some(false),
             host_memory_available_bytes: Some(16 << 30),
+            unified_probe_failed: false,
         };
         let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
         assert_eq!(plan.budget_bytes, (8 << 30) - (512 << 20));
@@ -271,16 +317,129 @@ mod tests {
     }
 
     #[test]
-    fn unified_pool_reserves_host_floor() {
+    fn unified_pool_budgets_against_measured_availability() {
         let hw = Hardware {
-            total_vram_bytes: Some(32 << 30),
-            free_vram_bytes: Some(30 << 30),
+            total_vram_bytes: Some(6 << 30),
+            free_vram_bytes: Some(7 << 29), // 3.5 GiB
             unified_host_device: Some(true),
-            host_memory_available_bytes: Some(30 << 30),
+            host_memory_available_bytes: Some(4 << 30),
+            unified_probe_failed: false,
         };
         let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
-        assert!(plan.provenance.iter().any(|l| l.contains("host floor")));
+        let pool = 7 << 29; // min(4 GiB host view, 3.5 GiB device free view)
+        let reserve = 512 << 20; // the shared formula's floor at a 6 GiB total
+        assert_eq!(plan.budget_bytes, pool - reserve);
+        assert_eq!(plan.mode, PerformanceMode::StreamingExperts);
+        assert!(
+            plan.provenance
+                .iter()
+                .any(|l| l.contains("unified pool: host view"))
+        );
+        assert!(
+            plan.provenance
+                .iter()
+                .any(|l| l.contains("device free view"))
+        );
+    }
+
+    #[test]
+    fn unmeasurable_unified_pool_fails_closed_to_host_only() {
+        let hw = Hardware {
+            total_vram_bytes: Some(16 << 30),
+            free_vram_bytes: Some(15 << 30),
+            unified_host_device: Some(true),
+            host_memory_available_bytes: None,
+            unified_probe_failed: false,
+        };
+        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
+        assert_eq!(plan.mode, PerformanceMode::HostOnly);
+        assert_eq!(plan.budget_bytes, 0);
+        assert!(
+            plan.provenance
+                .iter()
+                .any(|l| l.contains("unified pool of unknown size"))
+        );
+    }
+
+    #[test]
+    fn failed_topology_probe_fails_closed_to_host_only() {
+        // A failed probe cannot rule out a shared pool: planning as discrete
+        // would reintroduce the very blind spot this closed (review finding,
+        // mirroring ff-core's device_topology_probe_failed consumers).
+        let hw = Hardware {
+            total_vram_bytes: Some(24 << 30),
+            free_vram_bytes: Some(23 << 30),
+            unified_host_device: None,
+            host_memory_available_bytes: None,
+            unified_probe_failed: true,
+        };
+        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
+        assert_eq!(plan.mode, PerformanceMode::HostOnly);
+        assert!(
+            plan.provenance
+                .iter()
+                .any(|l| l.contains("topology probe failed"))
+        );
+    }
+
+    #[test]
+    fn unified_pool_without_a_device_free_view_fails_closed() {
+        // Symmetric with the missing-host-view case: both availability views
+        // are binding for a shared pool (the ff-core contract).
+        let hw = Hardware {
+            total_vram_bytes: Some(16 << 30),
+            free_vram_bytes: None,
+            unified_host_device: Some(true),
+            host_memory_available_bytes: Some(8 << 30),
+            unified_probe_failed: false,
+        };
+        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
+        assert_eq!(plan.mode, PerformanceMode::HostOnly);
+        assert!(
+            plan.provenance
+                .iter()
+                .any(|l| l.contains("availability view is unmeasured"))
+        );
+    }
+
+    #[test]
+    fn unprobed_unified_topology_keeps_the_discrete_plan() {
+        // Today's production values on a discrete card: the integrated probe
+        // failed or was skipped, so legacy split-axis planning must hold.
+        let hw = Hardware {
+            total_vram_bytes: Some(24 << 30),
+            free_vram_bytes: Some(23 << 30),
+            unified_host_device: None,
+            host_memory_available_bytes: None,
+            unified_probe_failed: false,
+        };
+        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
         assert_eq!(plan.mode, PerformanceMode::FullResident);
+        assert_eq!(plan.budget_bytes, (24 << 30) - (1 << 30));
+        assert!(!plan.provenance.iter().any(|l| l.contains("unified pool")));
+    }
+
+    #[test]
+    fn unified_pool_with_a_user_budget_caps_to_the_measured_pool() {
+        let hw = Hardware {
+            total_vram_bytes: Some(6 << 30),
+            free_vram_bytes: Some(4 << 30),
+            unified_host_device: Some(true),
+            host_memory_available_bytes: Some(4 << 30),
+            unified_probe_failed: false,
+        };
+        let plan = plan_mode(
+            &hw,
+            &ModeOverrides {
+                vram_budget_bytes: Some(6 << 30),
+                force_host_only: false,
+            },
+            &sizes(),
+        )
+        .unwrap();
+        // The user asked for the whole 6 GiB total; the shared pool only
+        // measures 4 GiB free, and no reserve is charged (operator contract).
+        assert_eq!(plan.budget_bytes, 4 << 30);
     }
 
     #[test]
@@ -291,6 +450,7 @@ mod tests {
                 free_vram_bytes: None,
                 unified_host_device: None,
                 host_memory_available_bytes: None,
+                unified_probe_failed: false,
             },
             &ModeOverrides::default(),
             &sizes(),
