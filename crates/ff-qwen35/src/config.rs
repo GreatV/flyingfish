@@ -92,6 +92,8 @@ impl TextConfig {
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct VisionConfig {
+    #[serde(default = "three")]
+    pub in_channels: usize,
     pub depth: usize,
     pub hidden_size: usize,
     pub num_heads: usize,
@@ -110,7 +112,21 @@ pub struct Qwen35Config {
     pub text_config: TextConfig,
     #[serde(default)]
     pub vision_config: Option<VisionConfig>,
+    #[serde(default)]
+    pub image_token_id: Option<u32>,
+    #[serde(default)]
+    pub vision_start_token_id: Option<u32>,
+    #[serde(default)]
+    pub vision_end_token_id: Option<u32>,
 }
+
+fn three() -> usize {
+    3
+}
+
+/// The vision tower's rope theta: vision_config carries no rope_parameters,
+/// HF resolves the hardcoded default 10000.0 (Qwen3_5VisionRotaryEmbedding).
+pub const VISION_ROPE_THETA: f64 = 10_000.0;
 
 impl Qwen35Config {
     pub fn from_model_dir(dir: &Path) -> Result<Self> {
@@ -175,5 +191,15 @@ mod tests {
         assert_eq!(t.mtp_num_hidden_layers, 1);
         assert!(!t.mtp_use_dedicated_embeddings);
         assert!(cfg.vision_config.is_some());
+        let v = cfg.vision_config.as_ref().unwrap();
+        assert_eq!(v.in_channels, 3);
+        assert_eq!(v.out_hidden_size, 5120);
+        assert_eq!(cfg.image_token_id, Some(248056));
+        assert_eq!(cfg.vision_start_token_id, Some(248053));
+        assert_eq!(cfg.vision_end_token_id, Some(248054));
+        // The tower hardcodes tanh-gelu in blocks / erf-gelu in the merger
+        // (vision.rs); fail loudly if the checkpoint ever changes that.
+        let raw = fs::read_to_string(dir.join("config.json")).unwrap();
+        assert!(raw.contains("\"gelu_pytorch_tanh\""));
     }
 }
