@@ -228,6 +228,19 @@ fn main() -> Result<()> {
             .context("usage: requant <src> <dst> [threads]")?,
     );
     let threads: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(8);
+    // Checkpoints are read-only inputs: never write into src, never
+    // overwrite a non-empty dst.
+    ensure!(
+        src.canonicalize()? != dst.canonicalize().unwrap_or(dst.clone()),
+        "dst must differ from src (checkpoints are read-only)"
+    );
+    if dst.exists() {
+        ensure!(
+            dst.read_dir()?.next().is_none(),
+            "dst {} exists and is not empty",
+            dst.display()
+        );
+    }
     std::fs::create_dir_all(&dst)?;
 
     // Collect jobs from every shard's header.
