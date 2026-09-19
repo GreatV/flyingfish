@@ -291,7 +291,10 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
             && breakdown
                 .validate_capacity(
                     true,
-                    expert_cache_bytes,
+                    flyingfish::glm::admission::ExpertCacheBound::new(
+                        expert_cache_bytes,
+                        baseline.expert_cache.layout,
+                    ),
                     baseline.cache_policy()?,
                     &selection_snapshot,
                 )
@@ -303,12 +306,15 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         if !explicit_axes.contains("expert_cache.maximum_bound_bytes") {
             let phases = breakdown.phases_with_safety(
                 baseline.resident_static,
-                0,
+                flyingfish::glm::admission::ExpertCacheBound::new(0, baseline.expert_cache.layout),
                 baseline.cache_policy()?,
                 breakdown.scaled_admission_safety_bytes(&selection_snapshot),
             )?;
-            let bytes =
-                breakdown.automatic_expert_cache_bytes(&phases, &selection_snapshot)? as u64;
+            let bytes = breakdown.automatic_expert_cache_bytes(
+                &phases,
+                &selection_snapshot,
+                baseline.expert_cache.layout,
+            )? as u64;
             baseline.expert_cache.maximum_bound_bytes = bytes;
             baseline.expert_cache.minimum_bound_bytes = bytes;
             if bytes > 0 && !explicit_axes.contains("expert_cache.replacement") {
@@ -367,11 +373,13 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         flyingfish::runtime::probe::ResourceSnapshot::capture(Some(prepared.device()));
     // A promotion was admitted only because its peaks plus the promotion
     // reserve fitted; that gate is re-run here, not just the ordinary peaks.
+    let selection_cache =
+        flyingfish::glm::admission::ExpertCacheBound::from_policy(&selection.policy.expert_cache)?;
     let promotion_refusal = if selection.policy.weights != baseline.weights {
         flyingfish::glm::admission::GlmAdmissionBreakdown::promotion_headroom_error(
             &breakdown,
             resident_static,
-            usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
+            selection_cache,
             selection.policy.cache_policy()?,
             &admission_snapshot,
         )
@@ -381,7 +389,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
     if let Err(error) = breakdown
         .validate_capacity(
             resident_static,
-            usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
+            selection_cache,
             selection.policy.cache_policy()?,
             &admission_snapshot,
         )
@@ -400,7 +408,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         let final_safety = breakdown.scaled_admission_safety_bytes(&admission_snapshot);
         provenance.phases = breakdown.phases_with_safety(
             resident_static,
-            usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
+            selection_cache,
             selection.policy.cache_policy()?,
             final_safety,
         )?;
@@ -448,7 +456,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
     let final_safety = breakdown.scaled_admission_safety_bytes(&admission_snapshot);
     selection.provenance.phases = breakdown.phases_with_safety(
         resident_static,
-        usize::try_from(selection.policy.expert_cache.maximum_bound_bytes)?,
+        selection_cache,
         selection.policy.cache_policy()?,
         final_safety,
     )?;

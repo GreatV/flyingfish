@@ -2,6 +2,7 @@
 use crate::{
     config::{GlmTextConfig, MlpKind},
     execution_policy::GLM_ADMISSION_SAFETY_BYTES,
+    expert_cache_manager::{ExpertCacheLayout, split_total_budget},
     model::{
         LM_HEAD_WEIGHT, is_mhc_constant, prefill::prefill_workspace_bytes, static_weight_specs,
         streamed_static_weight_groups,
@@ -19,6 +20,28 @@ use ff_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// An expert-cache byte bound together with the layout that interprets it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpertCacheBound {
+    pub bytes: usize,
+    pub layout: ExpertCacheLayout,
+}
+
+impl ExpertCacheBound {
+    pub fn new(bytes: usize, layout: ExpertCacheLayout) -> Self {
+        Self { bytes, layout }
+    }
+
+    pub fn from_policy(
+        policy: &crate::execution_policy::GlmExpertCacheExecutionPolicy,
+    ) -> Result<Self> {
+        Ok(Self::new(
+            usize::try_from(policy.maximum_bound_bytes)?,
+            policy.layout,
+        ))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -458,12 +481,12 @@ impl GlmAdmissionBreakdown {
     pub fn phases(
         &self,
         resident_static: bool,
-        expert_cache_bytes: usize,
+        expert_cache: ExpertCacheBound,
         cache_policy: CachePolicy,
     ) -> Result<Vec<ResourcePhaseEstimate>> {
         self.phases_with_safety(
             resident_static,
-            expert_cache_bytes,
+            expert_cache,
             cache_policy,
             GLM_ADMISSION_SAFETY_BYTES,
         )
@@ -475,10 +498,11 @@ impl GlmAdmissionBreakdown {
     pub fn phases_with_safety(
         &self,
         resident_static: bool,
-        expert_cache_bytes: usize,
+        expert_cache: ExpertCacheBound,
         cache_policy: CachePolicy,
         safety_bytes: u64,
     ) -> Result<Vec<ResourcePhaseEstimate>> {
+        let expert_cache_bytes = self.retained_expert_cache_bytes(expert_cache)?;
         // The mmap'd shard residency is page cache: file-backed and
         // kernel-reclaimable, already counted as available in MemAvailable.
         // It is reported as `reclaimable_host_bytes` (telemetry) and never
@@ -651,12 +675,52 @@ impl GlmAdmissionBreakdown {
             .saturating_mul(self.concurrent_loads())
     }
 
+    /// One expert-cache entry is one dequantized projection tensor;
+    /// live_expert_bytes is five of them.
+    pub fn expert_cache_entry_bytes(&self) -> u64 {
+        (self.live_expert_bytes / 5) as u64
+    }
+
+    /// Bytes the layout can actually retain, from the same quota arithmetic
+    /// the cache manager applies at runtime.
+    pub fn retained_expert_cache_bytes(&self, cache: ExpertCacheBound) -> Result<usize> {
+        if self.sparse_layers.is_empty() || cache.bytes == 0 {
+            return Ok(0);
+        }
+        let entry_bytes = self.expert_cache_entry_bytes();
+        ensure!(
+            entry_bytes > 0,
+            "GLM sparse layers carry no sized expert-cache entry"
+        );
+        let retained = match cache.layout {
+            ExpertCacheLayout::PerLayerSplit => {
+                let quotas = split_total_budget(cache.bytes, self.sparse_layers.len())?;
+                quotas.iter().try_fold(0u64, |sum, &quota| {
+                    let quota = u64::try_from(quota)?;
+                    let retained = quota / entry_bytes * entry_bytes;
+                    sum.checked_add(retained)
+                        .context("GLM retained cache bytes overflow")
+                })?
+            }
+            ExpertCacheLayout::SharedPool => {
+                u64::try_from(cache.bytes)? / entry_bytes * entry_bytes
+            }
+        };
+        let all_entries = entry_bytes
+            .checked_mul(3)
+            .and_then(|n| n.checked_mul(self.num_experts as u64))
+            .and_then(|n| n.checked_mul(self.sparse_layers.len() as u64))
+            .context("GLM expert working set overflow")?;
+        usize::try_from(retained.min(all_entries)).context("GLM retained cache bound exceeds usize")
+    }
+
     pub fn automatic_expert_cache_bytes(
         &self,
         phases: &[ResourcePhaseEstimate],
         snapshot: &ResourceSnapshot,
+        layout: ExpertCacheLayout,
     ) -> Result<usize> {
-        self.automatic_expert_cache_bytes_against_host(phases, snapshot, None)
+        self.automatic_expert_cache_bytes_against_host(phases, snapshot, None, layout)
     }
 
     /// `aggregate_host_bytes` replaces the phase's own host peak under the
@@ -666,6 +730,7 @@ impl GlmAdmissionBreakdown {
         phases: &[ResourcePhaseEstimate],
         snapshot: &ResourceSnapshot,
         aggregate_host_bytes: Option<u64>,
+        layout: ExpertCacheLayout,
     ) -> Result<usize> {
         if self.compute_on_host || self.sparse_layers.is_empty() {
             return Ok(0);
@@ -706,12 +771,15 @@ impl GlmAdmissionBreakdown {
         // Only the reserve the phases already carry in `device_reserve_bytes`.
         let available = free.saturating_sub(required);
         let available = available / (1 << 20) * (1 << 20);
-        let all_experts = (self.live_expert_bytes as u64 / 5)
+        let all_experts = self
+            .expert_cache_entry_bytes()
             .checked_mul(3)
             .and_then(|n| n.checked_mul(self.num_experts as u64))
             .and_then(|n| n.checked_mul(self.sparse_layers.len() as u64))
             .context("GLM expert working set overflow")?;
-        usize::try_from(available.min(all_experts)).context("GLM cache bound exceeds usize")
+        let bound =
+            usize::try_from(available.min(all_experts)).context("GLM cache bound exceeds usize")?;
+        self.retained_expert_cache_bytes(ExpertCacheBound::new(bound, layout))
     }
 
     /// The admission-time safety reserve: 5% of the pool's TOTAL bytes, capped
@@ -776,7 +844,7 @@ impl GlmAdmissionBreakdown {
     pub fn promotion_headroom_error(
         &self,
         resident_static: bool,
-        expert_cache_bytes: usize,
+        expert_cache: ExpertCacheBound,
         cache_policy: CachePolicy,
         snapshot: &ResourceSnapshot,
     ) -> Option<String> {
@@ -786,7 +854,7 @@ impl GlmAdmissionBreakdown {
         let phases = self
             .phases_with_safety(
                 resident_static,
-                expert_cache_bytes,
+                expert_cache,
                 cache_policy,
                 self.scaled_admission_safety_bytes(snapshot),
             )
@@ -810,7 +878,7 @@ impl GlmAdmissionBreakdown {
     pub fn validate_capacity(
         &self,
         resident_static: bool,
-        expert_cache_bytes: usize,
+        expert_cache: ExpertCacheBound,
         cache_policy: CachePolicy,
         snapshot: &ResourceSnapshot,
     ) -> Result<(), CapacityRejection> {
@@ -828,7 +896,7 @@ impl GlmAdmissionBreakdown {
         }
         let safety = self.scaled_admission_safety_bytes(snapshot);
         let phases = self
-            .phases_with_safety(resident_static, expert_cache_bytes, cache_policy, safety)
+            .phases_with_safety(resident_static, expert_cache, cache_policy, safety)
             .map_err(|error| CapacityRejection::Malformed(error.to_string()))?;
         for phase in phases {
             let host_peak = phase
@@ -1097,8 +1165,16 @@ mod tests {
         assert_eq!(bf16.static_load_device_bytes, raw_peak);
         assert_eq!(f32.static_load_device_bytes, 0);
         for resident in [false, true] {
-            let before = bf16.phases(resident, 0, CachePolicy::new(1))?;
-            let after = f32.phases(resident, 0, CachePolicy::new(1))?;
+            let before = bf16.phases(
+                resident,
+                ExpertCacheBound::new(0, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+            )?;
+            let after = f32.phases(
+                resident,
+                ExpertCacheBound::new(0, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+            )?;
             for (before, after) in before.iter().zip(&after) {
                 let transient = if !resident || before.phase == "static_initialization" {
                     raw_peak
@@ -1249,13 +1325,23 @@ mod tests {
         );
         let stats = weights.cache_stats();
         assert_eq!((stats.hits, stats.misses, stats.resident_bytes), (0, 0, 0));
-        let phases = gpu.phases(true, 10, CachePolicy::new(1)).unwrap();
+        let phases = gpu
+            .phases(
+                true,
+                ExpertCacheBound::new(10, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+            )
+            .unwrap();
         assert_eq!(
             phases[0].required_device_bytes,
             Some(gpu.static_bytes as u64 + gpu.static_load_device_bytes)
         );
         let fallback_phases = cpu_conversion
-            .phases(true, 10, CachePolicy::new(1))
+            .phases(
+                true,
+                ExpertCacheBound::new(10, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+            )
             .unwrap();
         assert_eq!(
             phases[1].required_device_bytes.unwrap(),
@@ -1269,12 +1355,24 @@ mod tests {
             assert_eq!(phase.device_reserve_bytes, GLM_ADMISSION_SAFETY_BYTES);
             assert!(phase.device_peak_bytes().unwrap().unwrap() >= GLM_ADMISSION_SAFETY_BYTES);
         }
-        for phase in cpu.phases(true, 10, CachePolicy::new(1)).unwrap() {
+        for phase in cpu
+            .phases(
+                true,
+                ExpertCacheBound::new(10, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+            )
+            .unwrap()
+        {
             assert_eq!(phase.device_peak_bytes().unwrap(), None);
             assert!(phase.required_host_bytes >= GLM_ADMISSION_SAFETY_BYTES);
         }
         let rejection = cpu
-            .validate_capacity(true, 0, CachePolicy::new(1), &snapshot(u64::MAX, 1, None))
+            .validate_capacity(
+                true,
+                ExpertCacheBound::new(0, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+                &snapshot(u64::MAX, 1, None),
+            )
             .expect_err("host bytes below the peak are rejected");
         let shortfall = rejection.shortfall().expect("the rejection binds by bytes");
         assert_eq!(shortfall.predicate, "host_available");
@@ -1282,7 +1380,7 @@ mod tests {
         assert!(shortfall.needed_bytes > 1);
         cpu.validate_capacity(
             true,
-            0,
+            ExpertCacheBound::new(0, ExpertCacheLayout::PerLayerSplit),
             CachePolicy::new(1),
             &snapshot(u64::MAX, u64::MAX, None),
         )
@@ -1290,7 +1388,7 @@ mod tests {
         assert!(
             gpu.validate_capacity(
                 true,
-                0,
+                ExpertCacheBound::new(0, ExpertCacheLayout::PerLayerSplit),
                 CachePolicy::new(1),
                 &snapshot(u64::MAX, u64::MAX, Some(1))
             )
@@ -1308,7 +1406,12 @@ mod tests {
         let gpu =
             GlmAdmissionBreakdown::from_metadata(&weights, &config.text_config, false, 2).unwrap();
         let phases = gpu
-            .phases_with_safety(false, 0, CachePolicy::new(1), 0)
+            .phases_with_safety(
+                false,
+                ExpertCacheBound::new(0, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+                0,
+            )
             .unwrap();
         let host_peak = phases
             .iter()
@@ -1347,14 +1450,24 @@ mod tests {
             ..snapshot(pool, u64::MAX, Some(pool))
         };
         assert!(
-            gpu.validate_capacity(false, 0, CachePolicy::new(1), &unified(Some(true), pool))
-                .is_err()
+            gpu.validate_capacity(
+                false,
+                ExpertCacheBound::new(0, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+                &unified(Some(true), pool)
+            )
+            .is_err()
         );
         // Unprobed (None) and confirmed-discrete (Some(false)) records keep the
         // split-axis behavior: the same numbers are admitted.
         for legacy in [None, Some(false)] {
-            gpu.validate_capacity(false, 0, CachePolicy::new(1), &unified(legacy, pool))
-                .unwrap();
+            gpu.validate_capacity(
+                false,
+                ExpertCacheBound::new(0, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+                &unified(legacy, pool),
+            )
+            .unwrap();
         }
         // A pool that holds the combined peak plus the pool-scaled reserve is
         // admitted — iterate to the merged fixed point, same reserve fn.
@@ -1370,7 +1483,7 @@ mod tests {
         }
         gpu.validate_capacity(
             false,
-            0,
+            ExpertCacheBound::new(0, ExpertCacheLayout::PerLayerSplit),
             CachePolicy::new(1),
             &unified(Some(true), merged_pool),
         )
@@ -1468,7 +1581,13 @@ mod tests {
             expert_load_host_bytes: 4 << 20,
             raw_inventory: inventory,
         };
-        let phases = breakdown.phases(false, 0, CachePolicy::new(1)).unwrap();
+        let phases = breakdown
+            .phases(
+                false,
+                ExpertCacheBound::new(0, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+            )
+            .unwrap();
         let device_required = phases
             .iter()
             .map(|p| p.required_device_bytes.unwrap_or(0) + p.device_reserve_bytes)
@@ -1480,14 +1599,20 @@ mod tests {
             .max()
             .unwrap();
         assert!(host_required > 0);
-        let all_experts = (80u64 << 20) / 5 * 3 * 288;
+        let all_experts = breakdown.expert_cache_entry_bytes() * 3 * 288;
         // Discrete: sized from the device view alone. The 8 GiB device view
         // keeps the all-experts clamp (13.8 GiB) from binding.
         let discrete = breakdown
-            .automatic_expert_cache_bytes(&phases, &snapshot(8 << 30, u64::MAX, Some(8 << 30)))
+            .automatic_expert_cache_bytes(
+                &phases,
+                &snapshot(8 << 30, u64::MAX, Some(8 << 30)),
+                ExpertCacheLayout::SharedPool,
+            )
             .unwrap();
         let expected_discrete = ((8u64 << 30) - device_required) / (1 << 20) * (1 << 20);
         assert!(expected_discrete < all_experts, "clamp must not bind");
+        let entry = breakdown.expert_cache_entry_bytes();
+        let expected_discrete = expected_discrete - expected_discrete % entry;
         assert_eq!(discrete as u64, expected_discrete);
         // Unified: same numbers, but the host phase peaks are subtracted from
         // the shared pool too, so the result is strictly smaller.
@@ -1499,7 +1624,7 @@ mod tests {
             ..snapshot(8 << 30, u64::MAX, Some(8 << 30))
         };
         let unified = breakdown
-            .automatic_expert_cache_bytes(&phases, &unified_snapshot)
+            .automatic_expert_cache_bytes(&phases, &unified_snapshot, ExpertCacheLayout::SharedPool)
             .unwrap();
         let pool = 8u64 << 30; // min(host, cgroup, device) views
         // Both maxima fall in one phase here, so this fixture alone cannot tell
@@ -1515,6 +1640,7 @@ mod tests {
             .unwrap();
         assert_eq!(combined, device_required + host_required);
         let expected_unified = (pool - combined) / (1 << 20) * (1 << 20);
+        let expected_unified = expected_unified - expected_unified % entry;
         assert_eq!(unified as u64, expected_unified);
         assert!(unified < discrete);
 
@@ -1533,10 +1659,227 @@ mod tests {
             split("decode", 1 << 30, 3 << 30),
         ];
         let sized = breakdown
-            .automatic_expert_cache_bytes(&skewed, &unified_snapshot)
+            .automatic_expert_cache_bytes(&skewed, &unified_snapshot, ExpertCacheLayout::SharedPool)
             .unwrap() as u64;
         assert_eq!(sized, pool - (4 << 30));
         assert!(sized > pool - (6 << 30));
+    }
+
+    fn flash_cache_geometry() -> GlmAdmissionBreakdown {
+        let inventory = ff_core::weights::accounting::CacheInventory {
+            shards: vec![ff_core::weights::accounting::CacheShardInventory {
+                name: "a.safetensors".into(),
+                file_bytes: 108,
+                header_bytes: 8,
+                selected_tensor_bytes: 100,
+                selected_tensor_count: 1,
+                largest_tensor_bytes: 100,
+            }],
+        };
+        GlmAdmissionBreakdown {
+            scope: GlmLayerScope {
+                start: 0,
+                end: 42,
+                total_layers: 42,
+            },
+            cpu_fp8_dequantization: false,
+            pinned_transfer_bytes: 0,
+            pinned_fill_ahead_bytes: 0,
+            concurrent_loads: 0,
+            static_load_device_bytes: 0,
+            expert_load_device_bytes: 0,
+            compute_on_host: false,
+            prompt_tokens: 2,
+            num_hidden_layers: 42,
+            num_experts: 288,
+            experts_per_token: 8,
+            sparse_layers: (0..42).collect(),
+            static_bytes: 1 << 30,
+            lm_head_bytes: 64 << 20,
+            largest_streamed_group_bytes: 32 << 20,
+            kda_state_bytes: 4,
+            dsa_cache_bytes_per_token: 4,
+            maximum_dsa_cache_bytes: 128,
+            maximum_dsa_layer_cache_bytes: 64,
+            live_expert_bytes: 80 << 20,
+            prefill_workspace_bytes: 128,
+            decode_workspace_bytes: 64,
+            host_route_workspace_bytes: 32,
+            host_sampling_workspace_bytes: 0,
+            prefill_host_mask_bytes: 0,
+            static_load_host_bytes: 16 << 20,
+            streamed_load_host_bytes: 16 << 20,
+            expert_load_host_bytes: 4 << 20,
+            raw_inventory: inventory,
+        }
+    }
+
+    #[test]
+    fn expert_cache_charge_matches_layout_retention() {
+        let breakdown = flash_cache_geometry();
+        assert_eq!(breakdown.expert_cache_entry_bytes(), 16 << 20);
+        assert_eq!(
+            breakdown
+                .retained_expert_cache_bytes(ExpertCacheBound::new(
+                    512 << 20,
+                    ExpertCacheLayout::PerLayerSplit
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            breakdown
+                .retained_expert_cache_bytes(ExpertCacheBound::new(
+                    1024 << 20,
+                    ExpertCacheLayout::PerLayerSplit
+                ))
+                .unwrap(),
+            (42 * 16) << 20
+        );
+        assert_eq!(
+            breakdown
+                .retained_expert_cache_bytes(ExpertCacheBound::new(
+                    2048 << 20,
+                    ExpertCacheLayout::PerLayerSplit
+                ))
+                .unwrap(),
+            (42 * 48) << 20
+        );
+        assert_eq!(
+            breakdown
+                .retained_expert_cache_bytes(ExpertCacheBound::new(
+                    4096 << 20,
+                    ExpertCacheLayout::PerLayerSplit
+                ))
+                .unwrap(),
+            (42 * 96) << 20
+        );
+        assert_eq!(
+            breakdown
+                .retained_expert_cache_bytes(ExpertCacheBound::new(
+                    512 << 20,
+                    ExpertCacheLayout::SharedPool
+                ))
+                .unwrap(),
+            512 << 20
+        );
+        assert_eq!(
+            breakdown
+                .retained_expert_cache_bytes(ExpertCacheBound::new(
+                    100 << 20,
+                    ExpertCacheLayout::SharedPool
+                ))
+                .unwrap(),
+            96 << 20
+        );
+        let phases = breakdown
+            .phases_with_safety(
+                false,
+                ExpertCacheBound::new(4096 << 20, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+                0,
+            )
+            .unwrap();
+        assert!(
+            phases
+                .iter()
+                .all(|p| p.optional_device_bytes == Some(((42 * 96) as u64) << 20))
+        );
+    }
+
+    #[test]
+    fn inert_layout_charges_nothing_and_admits() {
+        let breakdown = flash_cache_geometry();
+        let bound = ExpertCacheBound::new(512 << 20, ExpertCacheLayout::PerLayerSplit);
+        let phases = breakdown
+            .phases_with_safety(false, bound, CachePolicy::new(1), 0)
+            .unwrap();
+        assert!(phases.iter().all(|p| p.optional_device_bytes == Some(0)));
+        let peak = phases
+            .iter()
+            .map(|p| p.device_peak_bytes().unwrap().unwrap())
+            .max()
+            .unwrap();
+        breakdown
+            .validate_capacity(
+                false,
+                bound,
+                CachePolicy::new(1),
+                &snapshot(62 << 30, peak, Some(24 << 30)),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_breakdown_without_a_sized_entry_errors_instead_of_dividing() {
+        let mut breakdown = flash_cache_geometry();
+        breakdown.live_expert_bytes = 0;
+        assert!(
+            breakdown
+                .retained_expert_cache_bytes(ExpertCacheBound::new(
+                    512 << 20,
+                    ExpertCacheLayout::PerLayerSplit
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn per_rank_scope_and_layout_change_retention() {
+        let mut rank_a = flash_cache_geometry();
+        rank_a.sparse_layers = (0..20).collect();
+        rank_a.scope = GlmLayerScope {
+            start: 0,
+            end: 21,
+            total_layers: 42,
+        };
+        let mut rank_b = flash_cache_geometry();
+        rank_b.sparse_layers = (21..43).collect();
+        rank_b.scope = GlmLayerScope {
+            start: 21,
+            end: 42,
+            total_layers: 42,
+        };
+        let budget = 600 << 20;
+        assert_eq!(
+            rank_a
+                .retained_expert_cache_bytes(ExpertCacheBound::new(
+                    budget,
+                    ExpertCacheLayout::PerLayerSplit
+                ))
+                .unwrap(),
+            (20 * 16) << 20
+        );
+        assert_eq!(
+            rank_b
+                .retained_expert_cache_bytes(ExpertCacheBound::new(
+                    budget,
+                    ExpertCacheLayout::PerLayerSplit
+                ))
+                .unwrap(),
+            (22 * 16) << 20
+        );
+        let mut small = flash_cache_geometry();
+        small.sparse_layers = vec![0, 1, 2, 3];
+        small.live_expert_bytes = 250 << 20;
+        assert_eq!(
+            small
+                .retained_expert_cache_bytes(ExpertCacheBound::new(
+                    130 << 20,
+                    ExpertCacheLayout::PerLayerSplit
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            small
+                .retained_expert_cache_bytes(ExpertCacheBound::new(
+                    130 << 20,
+                    ExpertCacheLayout::SharedPool
+                ))
+                .unwrap(),
+            100 << 20
+        );
     }
 
     #[test]
@@ -1585,15 +1928,26 @@ mod tests {
             false,
         )
         .unwrap();
-        let before = breakdown.phases(true, 4096, CachePolicy::new(1)).unwrap();
+        let before = breakdown
+            .phases(
+                true,
+                ExpertCacheBound::new(4096, ExpertCacheLayout::PerLayerSplit),
+                CachePolicy::new(1),
+            )
+            .unwrap();
         breakdown.enable_pinned_transfer(1, 0).unwrap();
         let bytes = breakdown.pinned_transfer_bytes;
         assert!(bytes > 0);
         assert_eq!(breakdown.pinned_fill_ahead_bytes, 0);
-        for (before, after) in before
-            .iter()
-            .zip(breakdown.phases(true, 4096, CachePolicy::new(1)).unwrap())
-        {
+        for (before, after) in before.iter().zip(
+            breakdown
+                .phases(
+                    true,
+                    ExpertCacheBound::new(4096, ExpertCacheLayout::PerLayerSplit),
+                    CachePolicy::new(1),
+                )
+                .unwrap(),
+        ) {
             assert_eq!(
                 after.host_peak_bytes().unwrap(),
                 before.host_peak_bytes().unwrap() + bytes
@@ -1609,10 +1963,15 @@ mod tests {
         let ring = bytes / 2 * 4;
         assert_eq!(breakdown.pinned_transfer_bytes, bytes * 3);
         assert_eq!(breakdown.pinned_fill_ahead_bytes, ring);
-        for (before, after) in before
-            .iter()
-            .zip(breakdown.phases(true, 4096, CachePolicy::new(1)).unwrap())
-        {
+        for (before, after) in before.iter().zip(
+            breakdown
+                .phases(
+                    true,
+                    ExpertCacheBound::new(4096, ExpertCacheLayout::PerLayerSplit),
+                    CachePolicy::new(1),
+                )
+                .unwrap(),
+        ) {
             assert_eq!(
                 after.host_peak_bytes().unwrap(),
                 before.host_peak_bytes().unwrap() + bytes * 3 + ring

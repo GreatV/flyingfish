@@ -249,7 +249,7 @@ fn validate_resize_sums(
     Ok(())
 }
 
-fn split_total_budget(total: usize, parts: usize) -> Result<Vec<usize>> {
+pub(crate) fn split_total_budget(total: usize, parts: usize) -> Result<Vec<usize>> {
     ensure!(parts > 0, "cannot split expert cache across zero layers");
     let base = total / parts;
     let remainder = total % parts;

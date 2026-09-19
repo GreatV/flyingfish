@@ -398,6 +398,7 @@ pub struct PreparedGlm {
     breakdown: crate::admission::GlmAdmissionBreakdown,
     resident_static: bool,
     expert_cache_bytes: usize,
+    expert_cache_layout: ExpertCacheLayout,
     progress: bool,
 }
 
@@ -493,7 +494,10 @@ impl PreparedGlm {
         let breakdown = self.estimate(prompt_tokens)?;
         breakdown.validate_capacity(
             self.resident_static,
-            self.expert_cache_bytes,
+            crate::admission::ExpertCacheBound::new(
+                self.expert_cache_bytes,
+                self.expert_cache_layout,
+            ),
             self.model.weights.cache_policy(),
             snapshot,
         )?;
@@ -739,6 +743,7 @@ impl StreamedGlm {
             breakdown,
             resident_static: options.resident_static,
             expert_cache_bytes: options.expert_cache_bytes,
+            expert_cache_layout: options.expert_cache_layout,
             progress: options.progress,
         })
     }
