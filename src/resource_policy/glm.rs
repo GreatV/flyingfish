@@ -1,6 +1,9 @@
 use super::evidence::{EvidenceContext, EvidencePolicy, ResourceEvidence};
 use crate::{
-    glm::{GlmExecutionPolicy, admission::GlmAdmissionBreakdown},
+    glm::{
+        GlmExecutionPolicy,
+        admission::{ExpertCacheBound, GlmAdmissionBreakdown},
+    },
     runtime::{
         probe::ResourceSnapshot,
         resource_selection::{
@@ -141,8 +144,8 @@ pub fn select(
                 continue;
             }
         };
-        let expert_bytes = match usize::try_from(candidate.expert_cache.maximum_bound_bytes) {
-            Ok(bytes) => bytes,
+        let expert_cache = match ExpertCacheBound::from_policy(&candidate.expert_cache) {
+            Ok(bound) => bound,
             Err(error) => {
                 observation.disposition = CandidateDisposition::CapacityRejected;
                 observation.reason = format!("expert-cache bound is not a byte count: {error}");
@@ -151,7 +154,7 @@ pub fn select(
             }
         };
         if let Err(rejection) =
-            breakdown.validate_capacity(candidate.resident_static, expert_bytes, cache, snapshot)
+            breakdown.validate_capacity(candidate.resident_static, expert_cache, cache, snapshot)
         {
             observation.disposition = CandidateDisposition::CapacityRejected;
             observation.reason = rejection.to_string();
@@ -182,7 +185,7 @@ pub fn select(
                 );
             let promotion_phases = match breakdown.phases_with_safety(
                 candidate.resident_static,
-                expert_bytes,
+                expert_cache,
                 cache,
                 breakdown.scaled_admission_safety_bytes(snapshot),
             ) {
@@ -246,7 +249,7 @@ pub fn select(
                 "minimum_improvement_basis_points": row.minimum_improvement_basis_points,
             }));
             if candidate.expert_cache != baseline.expert_cache
-                && expert_bytes > 0
+                && expert_cache.bytes > 0
                 && !row.routing_verified
             {
                 observation.reason =
@@ -254,7 +257,7 @@ pub fn select(
                 observations.push(observation);
                 continue;
             }
-            if candidate.expert_cache != baseline.expert_cache && expert_bytes > 0 {
+            if candidate.expert_cache != baseline.expert_cache && expert_cache.bytes > 0 {
                 let expected_expert_bytes = u64::try_from(breakdown.live_expert_bytes)? / 5 * 3;
                 if row.routing_profile.as_ref().is_none_or(|profile| {
                     profile.prompt_tokens as usize != breakdown.prompt_tokens
@@ -277,7 +280,7 @@ pub fn select(
             }
             let phases = match breakdown.phases_with_safety(
                 candidate.resident_static,
-                expert_bytes,
+                expert_cache,
                 cache,
                 breakdown.scaled_admission_safety_bytes(snapshot),
             ) {
@@ -437,6 +440,16 @@ pub fn select(
                     "admission_safety_bytes_applied".into(),
                     breakdown.scaled_admission_safety_bytes(snapshot),
                 ),
+                (
+                    "expert_cache_requested_bytes".into(),
+                    policy.expert_cache.maximum_bound_bytes,
+                ),
+                (
+                    "expert_cache_retained_bytes".into(),
+                    u64::try_from(breakdown.retained_expert_cache_bytes(
+                        ExpertCacheBound::from_policy(&policy.expert_cache)?,
+                    )?)?,
+                ),
             ]),
             axes,
             candidates: observations,
@@ -461,7 +474,7 @@ pub fn select(
             .collect();
         let refusal_phases = breakdown.phases_with_safety(
             baseline.resident_static,
-            usize::try_from(baseline.expert_cache.maximum_bound_bytes)?,
+            ExpertCacheBound::from_policy(&baseline.expert_cache)?,
             cache_policy(baseline)?,
             breakdown.scaled_admission_safety_bytes(snapshot),
         )?;
@@ -492,7 +505,7 @@ pub fn select(
         .collect();
     let mut phases = breakdown.phases_with_safety(
         policy.resident_static,
-        usize::try_from(policy.expert_cache.maximum_bound_bytes)?,
+        ExpertCacheBound::from_policy(&policy.expert_cache)?,
         cache_policy(&policy)?,
         breakdown.scaled_admission_safety_bytes(snapshot),
     )?;
@@ -961,7 +974,7 @@ mod tests {
             breakdown()
                 .validate_capacity(
                     selected.policy.resident_static,
-                    0,
+                    ExpertCacheBound::new(0, ExpertCacheLayout::PerLayerSplit),
                     selected.policy.cache_policy().unwrap(),
                     &current
                 )
@@ -971,6 +984,39 @@ mod tests {
             .provenance
             .validate_policy_binding(&serde_json::to_value(&selected.policy).unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn selection_records_requested_and_retained_expert_cache_bytes() {
+        let mut policy = baseline();
+        policy.expert_cache.maximum_bound_bytes = 512 << 20;
+        policy.expert_cache.minimum_bound_bytes = 512 << 20;
+        let selected = select(
+            &policy,
+            &breakdown(),
+            &snapshot(),
+            &context(),
+            ResourcePolicyMode::Conservative,
+            &BTreeSet::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            selected
+                .provenance
+                .workload
+                .get("expert_cache_requested_bytes"),
+            Some(&(512 << 20))
+        );
+        // The fixture holds one sparse layer with four experts of five
+        // projection bytes: the distinct-entry cap binds below the request.
+        assert_eq!(
+            selected
+                .provenance
+                .workload
+                .get("expert_cache_retained_bytes"),
+            Some(&48)
+        );
     }
 
     #[test]

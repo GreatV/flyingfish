@@ -384,6 +384,7 @@ impl LayerPartitionedGlm {
                         &estimate.phases,
                         &admission.snapshots[rank],
                         Some(admission.required_host_bytes),
+                        self.workers[rank].expert_cache.layout(),
                     )?;
                 let bytes = match (shared, joint_share) {
                     (true, Some(share)) => bytes.min(usize::try_from(share)?),
@@ -472,7 +473,10 @@ impl LayerPartitionedGlm {
             // pool-scaled reserve; `phases` would apply the flat constant.
             let mut phases = b.phases_with_safety(
                 rp.execution.resident_static,
-                worker.expert_cache_stats().max_bytes,
+                crate::admission::ExpertCacheBound::new(
+                    worker.expert_cache_stats().max_bytes,
+                    worker.expert_cache.layout(),
+                ),
                 worker.weights.cache_policy(),
                 b.scaled_admission_safety_bytes(&snapshots[rank]),
             )?;
