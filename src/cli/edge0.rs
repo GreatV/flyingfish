@@ -115,11 +115,18 @@ fn generate_cuda(
     eos_token_ids: &[u32],
 ) -> Result<Vec<u32>> {
     model.enable_gpu(resident_experts)?;
+    let needed = ids.len() + max_new_tokens;
+    let max_ctx = model.gpu_max_ctx().context("resident runtime")?;
+    anyhow::ensure!(
+        needed <= max_ctx,
+        "prompt + generation {needed} exceeds the {max_ctx} KV-cache capacity; \
+         raise EDGE0_MAX_CTX (kernel cap 8192)"
+    );
     let mut hidden = None;
     for &id in ids {
         hidden = Some(model.forward(id)?);
     }
-    if model.is_resident() {
+    if model.has_resident_experts() {
         let mut generated = vec![model.first_token()?];
         while generated.len() < max_new_tokens && !eos_token_ids.contains(generated.last().unwrap())
         {

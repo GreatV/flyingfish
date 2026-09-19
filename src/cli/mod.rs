@@ -1230,7 +1230,9 @@ fn resolve_text_device(value: &str) -> Result<TextDevice> {
     let selected = match value {
         "cpu" => TextDevice::Cpu,
         "auto" => {
-            if Device::cuda_if_available(0).is_ok_and(|device| device.is_cuda()) {
+            if Device::cuda_if_available(0)
+                .is_ok_and(|device| device.is_cuda() && ptx_floor_supported(&device))
+            {
                 TextDevice::Cuda
             } else {
                 TextDevice::Cpu
@@ -1247,6 +1249,22 @@ fn resolve_text_device(value: &str) -> Result<TextDevice> {
         bail!("CUDA decoding requires a binary built with --features cuda");
     }
     Ok(selected)
+}
+
+/// The int4 text adapters' kernels ship as compute_80 PTX; older GPUs cannot
+/// JIT it, so `auto` must not select them.
+#[cfg(feature = "cuda")]
+fn ptx_floor_supported(device: &Device) -> bool {
+    device
+        .as_cuda_device()
+        .ok()
+        .and_then(|cuda| cuda.cuda_stream().context().compute_capability().ok())
+        .is_some_and(|(major, _)| major >= 8)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn ptx_floor_supported(_: &Device) -> bool {
+    false
 }
 
 fn greedy_token(logits: &[f32]) -> Result<u32> {

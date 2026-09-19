@@ -181,6 +181,22 @@ impl Edge0Text {
         self.gpu.as_ref().is_some_and(|rt| rt.res.is_some())
     }
 
+    /// The closed decode loop requires the resident expert set, not just the
+    /// static projections.
+    #[cfg(feature = "cuda")]
+    pub fn has_resident_experts(&self) -> bool {
+        self.gpu_experts.is_some()
+    }
+
+    /// The resident KV-cache capacity (EDGE0_MAX_CTX, default 4096).
+    #[cfg(feature = "cuda")]
+    pub fn gpu_max_ctx(&self) -> Option<usize> {
+        self.gpu
+            .as_ref()
+            .and_then(|rt| rt.res.as_ref())
+            .map(|res| res.max_ctx)
+    }
+
     /// Device-resident decode step: hidden never leaves the GPU except as
     /// the returned final-norm output. Syncs per token: router top-k and
     /// MoE combine per layer (host, until device top-k lands) + this read.
