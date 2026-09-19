@@ -73,7 +73,7 @@ impl WideKernels {
         // The splitk row loop is #pragma-unrolled with no tail guard
         // (guarded variants miscompiled) — rows must be a full RPB multiple.
         anyhow::ensure!(
-            rows % WIDE_RPB == 0,
+            rows.is_multiple_of(WIDE_RPB),
             "wide splitk: rows {rows} not a multiple of {WIDE_RPB} — the \
              unrolled row loop would read out of bounds"
         );
@@ -84,7 +84,8 @@ impl WideKernels {
         let stream = ctx.stream.clone();
         // uint4 variant when slices are 4-word aligned (all qwen shapes).
         let words = in_dim / 8;
-        if words % 4 == 0 && (words / split) % 4 == 0 && words / split / 4 <= 256 {
+        if words.is_multiple_of(4) && (words / split).is_multiple_of(4) && words / split / 4 <= 256
+        {
             unsafe {
                 stream
                     .launch_builder(&self.splitk_v4)
@@ -198,7 +199,7 @@ impl WideKernels {
             .map(|n| n.div_ceil(WIDE_RPB) as u32)
             .sum();
         let words_g = in_dim / 8;
-        if words_g % 4 == 0 && words_g / 4 <= 256 {
+        if words_g.is_multiple_of(4) && words_g / 4 <= 256 {
             unsafe {
                 ctx.stream
                     .launch_builder(&self.group_v4)
@@ -303,12 +304,12 @@ impl WideKernels {
         let words = in_dim / 8;
         let slice_words = words / split;
         anyhow::ensure!(
-            slice_words % 4 == 0 && words % 4 == 0,
+            slice_words.is_multiple_of(4) && words.is_multiple_of(4),
             "uint4 splitk needs 4-word-aligned slices (in {in_dim}, split {split})"
         );
         // Same unguarded row loop as down(): full RPB multiples only.
         anyhow::ensure!(
-            rows % WIDE_RPB == 0,
+            rows.is_multiple_of(WIDE_RPB),
             "wide splitk: rows {rows} not a multiple of {WIDE_RPB}"
         );
         let rows_i = rows as i32;
