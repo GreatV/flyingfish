@@ -4,7 +4,7 @@
 
 Measurements used Linux, Intel i9-13900KF, 62 GiB RAM with 8 GiB swap, local NVMe storage, and one RTX 4090 with 24 GiB VRAM. The binary was built with Rust 1.95.0, CUDA 13.2 and `cargo build --locked --release --features flash-attn`.
 
-Each row is one run; cases ran sequentially with OS caches retained, except the GLM-5.3-Flash row, which was re-measured on 2026-09-19 as the middle of three back-to-back runs of its documented command. Wall time includes loading, initialization, inference and output writing. Peak RSS measures resident process memory and excludes the OS page cache. GPU usage is sampled across the device once per second, so brief peaks may be missed. Timings depend on inputs, cache state and hardware.
+Each row is one run; cases ran sequentially with OS caches retained, except the GLM-5.3-Flash row, which was re-measured as the middle of three back-to-back runs of its documented command; the Edge0-35B-A3B and Qwen3.8-27B rows were measured as the middle of three back-to-back runs of their documented commands, with `--features cuda` (which differs from `flash-attn` only in ff-h3 code paths these two adapters do not exercise). Wall time includes loading, initialization, inference and output writing. Peak RSS measures resident process memory and excludes the OS page cache. GPU usage is sampled across the device once per second, so brief peaks may be missed. Timings depend on inputs, cache state and hardware.
 
 | Model | Workload and output | Wall time | Peak RSS | Sampled GPU peak |
 |---|---|---:|---:|---:|
@@ -12,8 +12,8 @@ Each row is one run; cases ran sequentially with OS caches retained, except the 
 | [MiniMax-H3](#minimax-h3) | Generated 107 frames in 49 evaluations for a 768p, 16:9, 4-second request | 1,853.57 s | 58.82 GiB | 20.92 GiB |
 | [MiniCPM5-2B](#minicpm5-2b-and-dspark) | Generated 31 tokens with a 32-token limit | 5.34 s | 1.10 GiB | 4.62 GiB |
 | [MiniCPM5-2B + DSpark](#minicpm5-2b-and-dspark) | Generated 31 tokens with a 32-token limit | 2.24 s | 1.10 GiB | 5.17 GiB |
-| [Edge0-35B-A3B](#edge0-35b-a3b) | Greedy text generation | — | — | — |
-| [Qwen3.8-27B](#qwen38-27b) | Greedy text generation, optional image input | — | — | — |
+| [Edge0-35B-A3B](#edge0-35b-a3b) | Generated 128 tokens with a 128-token limit (streamed experts) | 17.50 s | 9.27 GiB | 2.14 GiB |
+| [Qwen3.8-27B](#qwen38-27b) | Generated 128 tokens with a 128-token limit (text-only) | 13.93 s | 16.63 GiB | 17.17 GiB |
 | [CLIP ViT-L/14](#clip) | Scored two candidate texts against a 224×224 image | 2.44 s | 0.44 GiB | 0.99 GiB |
 | [TRELLIS-text-base](#trellis-1) | Generated 180,288 Gaussian splats from a text prompt | 8.96 s | 0.70 GiB | 3.98 GiB |
 | [TRELLIS-text-large](#trellis-1) | Generated 231,744 Gaussian splats from a text prompt | 21.95 s | 0.69 GiB | 5.41 GiB |
@@ -23,8 +23,6 @@ Each row is one run; cases ran sequentially with OS caches retained, except the 
 | [MiniMax-Music3](#minimax-music3) | Generated 8 s of audio in 30 denoise steps | 130.63 s | 2.11 GiB | 19.22 GiB |
 
 Image tests used a fixed procedural chair pattern at each required resolution. DINOv2/v3 are included in the corresponding TRELLIS pipeline timings. RMBG-2.0/BiRefNet currently has no inference adapter.
-
-The Edge0-35B-A3B and Qwen3.8-27B cells are blank: both models are pending a measured run under this setup.
 
 ## Usage
 
@@ -38,7 +36,7 @@ mkdir -p output
 
 ### GLM-5.3-Flash
 
-The recorded run achieved **0.87 tokens/s** of decode: 32 tokens in 36.663 s of decode, with 29.607 s of prefill and 74.80 s of wall time, measured 2026-09-19 on current main. It is the middle of three back-to-back runs of the command below (walls 73.07–75.49 s, decode 35.48–36.66 s, prefill 29.04–30.49 s), recorded as one run per the table's convention. This uses pinned FP8 transfers, a 4 GiB shared LFU expert cache and a host/device split from a local hardware profile.
+The recorded run achieved **0.87 tokens/s** of decode: 32 tokens in 36.663 s of decode, with 29.607 s of prefill and 74.80 s of wall time. It is the middle of three back-to-back runs of the command below (walls 73.07–75.49 s, decode 35.48–36.66 s, prefill 29.04–30.49 s), recorded as one run per the table's convention. This uses pinned FP8 transfers, a 4 GiB shared LFU expert cache and a host/device split from a local hardware profile.
 
 The host/device split is calibrated per machine and per run by `ff bench io`, and the generation command takes it from `--host-profile`; it is not a property of the binary. The calibration behind the recorded figures reported B_P 18.798 GiB/s and B_H 31.248 GiB/s evaluating (8.095 GiB/s end to end), B_P/B_H 0.60 — a 40% host share of a miss set, recorded by the run as `host_expert_share_per_mille: 398`. A prefill/decode split is a function of this calibration as much as of the code, and no recorded split is reproducible without it.
 
