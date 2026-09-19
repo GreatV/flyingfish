@@ -32,7 +32,7 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
         device,
         resident_experts,
     } = command;
-    let device = resolve_text_device(&device)?;
+    let (device, _) = resolve_text_device(&device)?;
     let config = Edge0Config::from_model_dir(&model_dir)?;
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|error| anyhow::anyhow!("load tokenizer: {error}"))?;

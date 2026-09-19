@@ -12,6 +12,10 @@ use std::{fs, path::Path};
 pub const QWEN35_ARCHITECTURE: &str = "Qwen3_5ForConditionalGeneration";
 pub const QWEN35_TEXT_MODEL_TYPE: &str = "qwen3_5_text";
 
+/// `quantization.format` value the requantizer stamps into config.json; the
+/// upstream BF16 checkpoint shares the architecture but lacks this marker.
+pub const QUANTIZATION_FORMAT: &str = "groupwise-int4-u32";
+
 /// Tensor prefix differs from Edge0: `model.language_model.layers.N.*`.
 pub const TEXT_PREFIX: &str = "model.language_model";
 

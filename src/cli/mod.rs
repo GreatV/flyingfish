@@ -1226,7 +1226,7 @@ enum TextDevice {
     Cuda,
 }
 
-fn resolve_text_device(value: &str) -> Result<TextDevice> {
+fn resolve_text_device(value: &str) -> Result<(TextDevice, bool)> {
     let selected = match value {
         "cpu" => TextDevice::Cpu,
         "auto" => {
@@ -1248,7 +1248,7 @@ fn resolve_text_device(value: &str) -> Result<TextDevice> {
     if matches!(selected, TextDevice::Cuda) {
         bail!("CUDA decoding requires a binary built with --features cuda");
     }
-    Ok(selected)
+    Ok((selected, value == "auto"))
 }
 
 /// The int4 text adapters' kernels ship as compute_80 PTX; older GPUs cannot

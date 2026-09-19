@@ -92,6 +92,10 @@ impl Metadata {
     pub(super) fn model_type(&self, name: &str) -> bool {
         self.0["model_type"] == name
     }
+
+    pub(super) fn quantization_format(&self, name: &str) -> bool {
+        self.0["quantization"]["format"] == name
+    }
 }
 
 /// Registering another model supplies its recognition, CLI and execution in

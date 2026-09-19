@@ -7,7 +7,6 @@ use flyingfish::qwen35::{
 };
 
 /// The attn_scores CUDA kernel's shared-memory bound.
-#[cfg(feature = "cuda")]
 const GPU_CONTEXT_CAP: usize = 8192;
 
 #[derive(Debug, Subcommand)]
@@ -38,15 +37,15 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
         max_new_tokens,
         device,
     } = command;
-    let device = resolve_text_device(&device)?;
+    let (device, auto) = resolve_text_device(&device)?;
     let config = Qwen35Config::from_model_dir(&model_dir)?;
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|error| anyhow::anyhow!("load tokenizer: {error}"))?;
-    let vision = match &image {
-        Some(path) => Some(prepare_vision(&model_dir, &config, path)?),
+    let vision_input = match &image {
+        Some(path) => Some(preprocess(&model_dir, path)?),
         None => None,
     };
-    let templated = if vision.is_some() {
+    let templated = if vision_input.is_some() {
         chat_prompt_with_image(&prompt)
     } else {
         chat_prompt(&prompt)
@@ -57,7 +56,7 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
         .get_ids()
         .to_vec();
     anyhow::ensure!(!ids.is_empty(), "prompt tokenized to an empty sequence");
-    let (pos3, mrope_delta) = match &vision {
+    let (pos3, mrope_delta) = match &vision_input {
         Some((_, grid)) => expand_image_tokens(&config, &mut ids, *grid)?,
         None => (Vec::new(), 0),
     };
@@ -70,6 +69,27 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
         total <= config.text_config.max_position_embeddings,
         "prompt and requested output exceed model context"
     );
+    let device = match device {
+        TextDevice::Cuda => {
+            anyhow::ensure!(
+                total <= GPU_CONTEXT_CAP,
+                "prompt + generation {total} exceeds the {GPU_CONTEXT_CAP} kernel cap"
+            );
+            if auto && !checkpoint_fits_free_vram(&model_dir)? {
+                eprintln!("auto: checkpoint exceeds free VRAM; falling back to CPU");
+                TextDevice::Cpu
+            } else {
+                TextDevice::Cuda
+            }
+        }
+        TextDevice::Cpu => TextDevice::Cpu,
+    };
+    let vision = match vision_input {
+        Some((patches, grid)) => {
+            Some((run_vision_tower(&model_dir, &config, patches, grid)?, grid))
+        }
+        None => None,
+    };
     let generated = match device {
         TextDevice::Cpu => {
             let mut model = Qwen35Text::load(&model_dir, config.clone())?;
@@ -106,14 +126,18 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
     Ok(())
 }
 
-fn prepare_vision(
-    model_dir: &Path,
-    config: &Qwen35Config,
-    image: &Path,
-) -> Result<(Vec<f32>, VisionGrid)> {
+fn preprocess(model_dir: &Path, image: &Path) -> Result<(Vec<f32>, VisionGrid)> {
     let processor = vision::ProcessorConfig::from_model_dir(model_dir)?;
     let image = vision::RgbImage::from_png(image)?;
-    let (patches, grid) = vision::preprocess_image(&image, &processor)?;
+    vision::preprocess_image(&image, &processor)
+}
+
+fn run_vision_tower(
+    model_dir: &Path,
+    config: &Qwen35Config,
+    patches: Vec<f32>,
+    grid: VisionGrid,
+) -> Result<Vec<f32>> {
     let weights = Qwen35Weights::open(model_dir)?;
     let vision_config = config
         .vision_config
@@ -126,8 +150,37 @@ fn prepare_vision(
         config.text_config.hidden_size
     );
     let tower = vision::VisionTower::load(&weights, vision_config)?;
-    let rows = tower.forward(&patches, grid)?;
-    Ok((rows, grid))
+    tower.forward(&patches, grid)
+}
+
+/// The CUDA path uploads every projection; the weights dominate device
+/// memory, so the safetensors bytes are the fit estimate.
+#[cfg(feature = "cuda")]
+fn checkpoint_fits_free_vram(model_dir: &Path) -> Result<bool> {
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(model_dir)? {
+        let entry = entry?;
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "safetensors")
+        {
+            bytes += entry.metadata()?.len();
+        }
+    }
+    anyhow::ensure!(
+        bytes > 0,
+        "no safetensors shards in {}",
+        model_dir.display()
+    );
+    let context = cudarc::driver::CudaContext::new(0).context("open CUDA device 0")?;
+    let (free, _) = context.mem_get_info().context("mem_get_info")?;
+    Ok(bytes <= free as u64)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn checkpoint_fits_free_vram(_: &Path) -> Result<bool> {
+    Ok(true)
 }
 
 /// Replace the <|image_pad|> placeholder with one token per merged row and
