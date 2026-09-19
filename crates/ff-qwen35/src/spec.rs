@@ -1,13 +1,9 @@
 //! MTP speculative decode: batch-2 verify rounds over the batch2.cu
-//! kernels (weights read once per token pair). Reject restores GDN state
-//! from the post-A scratch via dtod — no recompute; KV needs nothing
-//! (write slots derive from the position counters).
+//! kernels. Reject restores GDN state from the post-A scratch via dtod;
+//! KV needs nothing (write slots derive from the position counters).
 //!
-//! Timelines: the main model uses `gpu.pos`; the draft position rides
-//! `pos_b` (= pos + 1, uploaded per round). The MTP layer keeps its OWN
-//! 0-based KV timeline (`mtp_pos`): rope angles shift by a constant
-//! against the main timeline, which preserves relative angles — the
-//! acceptance measurement arbitrates draft quality anyway.
+//! Timelines: main model on `gpu.pos`; draft on `pos_b` (= pos + 1). The
+//! MTP layer keeps its own 0-based KV timeline (`mtp_pos`).
 
 use crate::config::{LayerKind, TEXT_PREFIX};
 use crate::gpu::QwenGpu;

@@ -1,7 +1,6 @@
 //! Vision tower for Qwen3.5-27B: preprocessing + ViT + merger, CPU f32
-//! (candle), ported from ff-h3 (Qwen3-VL family), minus video/deepstack.
-//! Tower gate references HF in f32 (bf16 is chaotic pre-merger); e2e gate
-//! (tests/vision_e2e.rs) covers the deployment path.
+//! (candle), ported from ff-h3. Fixtures: tower vs HF f32; preprocess and
+//! positions vs HF processor; e2e ids in tests/vision_e2e.rs.
 
 use crate::config::{VISION_ROPE_THETA, VisionConfig};
 use crate::weights::Qwen35Weights;
@@ -157,8 +156,7 @@ pub fn smart_resize_image(
         height.max(width) as f64 / height.min(width) as f64 <= 200.,
         "image aspect ratio must not exceed 200:1"
     );
-    // HF clamps small edges UP to the factor (max(factor, round_by_factor)),
-    // it does not reject them.
+    // HF clamps small edges UP to the factor.
     let mut resized_height = round_ties_even(height as f64 / factor as f64) as usize * factor;
     let mut resized_width = round_ties_even(width as f64 / factor as f64) as usize * factor;
     resized_height = resized_height.max(factor);
@@ -191,9 +189,8 @@ struct AxisSample {
     taps: Vec<(usize, f32)>,
 }
 
-/// Bicubic resize matching torchvision's uint8 antialias path (cubic a=-0.5,
-/// border-clipped taps, u8-rounded intermediate). Fixture-pinned; do NOT
-/// unify with ff-h3's resize (a=-0.75, different reference).
+/// Bicubic resize, torchvision uint8 antialias form: a=-0.5, border-clipped
+/// taps, u8-rounded intermediate. ff-h3's resize differs (a=-0.75).
 fn resize_bicubic_antialias(image: &RgbImage, width: usize, height: usize) -> Result<RgbImage> {
     ensure!(width > 0 && height > 0, "resize target must be non-zero");
     if image.width == width && image.height == height {
@@ -315,9 +312,8 @@ fn patchify_image(
                                     let source_column = patch_w * patch + column;
                                     let byte = frame.pixels
                                         [(source_row * width + source_column) * 3 + channel];
-                                    // Match the HF fast processor's op order:
-                                    // rescale is a MULTIPLY by 1/255, then
-                                    // normalize (x - mean) / std.
+                                    // HF op order: multiply by 1/255, then
+                                    // (x - mean) / std.
                                     output.push(
                                         (byte as f32 * (1.0 / 255.)
                                             - processor.image_mean[channel])
@@ -574,7 +570,7 @@ impl VisionTower {
         );
         let x = Tensor::from_vec(patches.to_vec(), (rows, patch_dim), &self.device)?;
 
-        // Patch projection: Conv3d with stride=kernel == Linear over the
+        // Patch projection: Conv3d stride=kernel == Linear over the
         // flattened patch.
         let weight = self.tensor("model.visual.patch_embed.proj.weight")?;
         let bias = self.tensor("model.visual.patch_embed.proj.bias")?;
@@ -604,7 +600,7 @@ impl VisionTower {
 
         for block in 0..v.depth {
             let prefix = format!("model.visual.blocks.{block}");
-            // Attention sub-block.
+            // Attention sub-block (norm1 -> qkv -> 2D rope -> softmax -> proj).
             let normalized = layer_norm(
                 &x,
                 self.tensor(&format!("{prefix}.norm1.weight"))?,
@@ -616,7 +612,6 @@ impl VisionTower {
             let key = qkv.narrow(1, 1, 1)?.squeeze(1)?;
             let value = qkv.narrow(1, 2, 1)?.squeeze(1)?;
             // 2D rope: x*cos + rotate_half(x)*sin, f32.
-            // 2D rope per patch row: x*cos + rotate_half(x)*sin.
             let rope = |t: &Tensor| -> Result<Tensor> {
                 let c = cos.unsqueeze(1)?;
                 let s = sin.unsqueeze(1)?;
@@ -785,8 +780,7 @@ mod tests {
         }
         let fixture: Fixture = serde_json::from_str(&fs::read_to_string(fixture).unwrap()).unwrap();
         let image = RgbImage::from_png(&png).unwrap();
-        // The fixture was dumped from the raw checkpoint dir; both share the
-        // preprocessor_config.json contents.
+        // Fixture and this run share preprocessor_config.json contents.
         let proc = ProcessorConfig {
             size: ProcessorSize {
                 longest_edge: 16777216,
@@ -814,10 +808,8 @@ mod tests {
             vec![grid.temporal * grid.height * grid.width, 3 * 2 * 16 * 16],
             "fixture shape"
         );
-        // f32 op-order ulps differ everywhere; the gate is on REAL
-        // deviations: torchvision's uint8 rounding ties give an isolated
-        // 1-level (2/255) diff; algorithmic mismatches measured 21+ levels
-        // on 9% of pixels (wrong kernel/clipping variants).
+        // Gate on real deviations: uint8 rounding ties give an isolated
+        // 1-level (2/255) diff; wrong variants measured 21+ levels.
         let mut max_abs = 0.0f32;
         let mut n_big = 0usize;
         for (a, b) in patches.iter().zip(&fixture.pixel_values) {
@@ -912,10 +904,8 @@ mod tests {
             max_rel = max_rel.max(d / b.abs().max(1.0));
         }
         eprintln!("tower vs HF f32: max_abs {max_abs:.4} max_rel {max_rel:.4}");
-        // The fixture is HF's tower in f32 (bf16 is measurably chaotic here:
-        // bf16-vs-f32 HF diverges by hundreds of units pre-merger; the
-        // merger LN re-normalizes, so the f32 reference is well-conditioned).
-        // Measured: max_rel 0.0011, max_abs 0.023 — gate at 4x margin.
+        // Fixture: HF tower in f32 (bf16-vs-f32 HF diverges by hundreds of
+        // units pre-merger). Measured here: max_rel 0.0011; gate 0.005.
         assert!(
             max_rel <= 0.005,
             "tower max_rel {max_rel} exceeds the f32-reference class"

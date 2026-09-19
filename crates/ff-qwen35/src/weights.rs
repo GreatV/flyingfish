@@ -78,8 +78,7 @@ impl Qwen35Weights {
     }
 
     /// Zero-copy tensor view straight off the mmap (file-backed pages are
-    /// reclaimable; a materialized f32 copy is not — the f32-caching
-    /// version of this path OOM-killed a session).
+    /// reclaimable; a materialized f32 copy is not).
     fn view_ref(&self, name: &str) -> Result<(Vec<usize>, &'static [u8])> {
         let &shard = self
             .index

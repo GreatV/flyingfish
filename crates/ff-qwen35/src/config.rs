@@ -1,9 +1,8 @@
 //! Qwen3.8-27B (dense `qwen3_5`) checkpoint configuration.
 //!
-//! Verified against `models/Qwen/Qwen3.8-27B/config.json` and the shard
-//! index on 2026-09-17; see docs/qwen35-design.md. The checkpoint is all
-//! BF16 — quantization is OURS (offline requant, groupwise affine int4,
-//! group 64, the edge0 byte layout).
+//! Verified against the checkpoint's config.json and shard index
+//! (2026-09-17). The checkpoint is all BF16; quantization is ours
+//! (offline requant, groupwise affine int4, group 64, the edge0 layout).
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -103,8 +102,7 @@ pub struct VisionConfig {
     pub temporal_patch_size: usize,
     pub num_position_embeddings: usize,
     pub out_hidden_size: usize,
-    /// DeepStack is unimplemented (vision.rs); fail loud rather than
-    /// silently dropping injections on a checkpoint variant that has them.
+    /// DeepStack is unimplemented; a non-empty list fails validation.
     #[serde(default)]
     pub deepstack_visual_indexes: Vec<usize>,
 }
@@ -212,7 +210,7 @@ mod tests {
         assert_eq!(cfg.vision_start_token_id, Some(248053));
         assert_eq!(cfg.vision_end_token_id, Some(248054));
         // Tower act split (tanh blocks / erf merger) is hardcoded in
-        // vision.rs; fail loudly if the checkpoint changes it.
+        // vision.rs; asserted here against the checkpoint.
         let raw = fs::read_to_string(dir.join("config.json")).unwrap();
         assert!(raw.contains("\"gelu_pytorch_tanh\""));
     }
