@@ -62,7 +62,9 @@ pub struct TextConfig {
     /// Dense MLP width (no MoE in this family).
     pub intermediate_size: usize,
     pub vocab_size: usize,
-    pub eos_token_id: u32,
+    /// HF writes eos_token_id as one id or a list.
+    #[serde(deserialize_with = "token_id_list")]
+    pub eos_token_id: Vec<u32>,
     pub rms_norm_eps: f64,
     pub max_position_embeddings: usize,
     #[serde(default)]
@@ -125,6 +127,21 @@ pub struct Qwen35Config {
     pub vision_end_token_id: Option<u32>,
 }
 
+fn token_id_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<u32>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        One(u32),
+        Many(Vec<u32>),
+    }
+    Ok(match Repr::deserialize(deserializer)? {
+        Repr::One(id) => vec![id],
+        Repr::Many(ids) => ids,
+    })
+}
+
 /// The system block the checkpoint's chat_template.jinja prepends (verified
 /// byte-exact against apply_chat_template in the crate fixtures).
 pub const SYSTEM_BLOCK: &str = "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n";
@@ -173,10 +190,10 @@ impl Qwen35Config {
         );
         let t = &self.text_config;
         ensure!(
-            (t.eos_token_id as usize) < t.vocab_size,
-            "EOS token id {} outside vocab {}",
-            t.eos_token_id,
-            t.vocab_size
+            !t.eos_token_id.is_empty()
+                && t.eos_token_id.iter().all(|&id| (id as usize) < t.vocab_size),
+            "invalid EOS token ids {:?}",
+            t.eos_token_id
         );
         ensure!(
             t.linear_conv_kernel_dim == 4,

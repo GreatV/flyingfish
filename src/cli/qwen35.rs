@@ -82,7 +82,7 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
                 let logits = model.logits(&hidden)?;
                 let best = greedy_token(&logits)?;
                 generated.push(best);
-                if best == config.text_config.eos_token_id {
+                if config.text_config.eos_token_id.contains(&best) {
                     break;
                 }
                 hidden = model.forward(best)?;
@@ -248,7 +248,10 @@ fn generate_cuda(
     }
     let mut generated = vec![gpu.read_token()?];
     while generated.len() < max_new_tokens
-        && generated.last().copied() != Some(config.text_config.eos_token_id)
+        && !config
+            .text_config
+            .eos_token_id
+            .contains(generated.last().unwrap())
     {
         gpu.step()?;
         generated.push(gpu.read_token()?);
