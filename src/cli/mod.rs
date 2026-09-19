@@ -1220,7 +1220,7 @@ fn mib_to_bytes(value: u64) -> Result<u64> {
 }
 
 /// The int4 text adapters drive CUDA through cudarc contexts bound to
-/// device 0; other ordinals and Metal have no path to offer.
+/// device 0.
 enum TextDevice {
     Cpu,
     Cuda,

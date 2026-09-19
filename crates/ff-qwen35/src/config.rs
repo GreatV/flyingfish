@@ -142,8 +142,7 @@ fn token_id_list<'de, D: serde::Deserializer<'de>>(
     })
 }
 
-/// The system block the checkpoint's chat_template.jinja prepends (verified
-/// byte-exact against apply_chat_template in the crate fixtures).
+/// The system block the checkpoint's chat_template.jinja prepends.
 pub const SYSTEM_BLOCK: &str = "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n";
 
 /// The checkpoint's chat template for a text-only turn.
