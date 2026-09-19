@@ -26,9 +26,6 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     let mut model = Qwen35Text::load(dir, config.clone())?;
 
-    // The checkpoint's chat_template.jinja prepends this system block
-    // (verified against apply_chat_template 2026-09-17). Divergent prompts
-    // were the whole "first token mismatch" bug class — keep byte-exact.
     // Vision: preprocess + tower forward (CPU f32); the <|image_pad|>
     // placeholder expands to the merged-token count.
     let vision = match &image_path {
@@ -71,13 +68,9 @@ fn main() -> anyhow::Result<()> {
         None => None,
     };
     let templated = if vision.is_some() {
-        format!(
-            "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"
-        )
+        ff_qwen35::config::chat_prompt_with_image(&prompt)
     } else {
-        format!(
-            "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"
-        )
+        ff_qwen35::config::chat_prompt(&prompt)
     };
     let mut ids = tokenizer
         .encode(templated.as_str(), false)

@@ -1,5 +1,8 @@
 use super::*;
-use flyingfish::edge0::{config::Edge0Config, model::Edge0Text};
+use flyingfish::edge0::{
+    config::{Edge0Config, chat_prompt},
+    model::Edge0Text,
+};
 
 #[derive(Debug, Subcommand)]
 pub(super) enum Edge0Command {
@@ -33,10 +36,8 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
     let config = Edge0Config::from_model_dir(&model_dir)?;
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|error| anyhow::anyhow!("load tokenizer: {error}"))?;
-    let templated =
-        format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n");
     let ids = tokenizer
-        .encode(templated.as_str(), false)
+        .encode(chat_prompt(&prompt).as_str(), false)
         .map_err(|error| anyhow::anyhow!("tokenize prompt: {error}"))?
         .get_ids()
         .to_vec();
@@ -47,6 +48,7 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
             .is_some_and(|total| total <= config.text_config.max_position_embeddings),
         "prompt and requested output exceed model context"
     );
+    let eos_token_ids = config.eos_token_id.clone();
     let mut model = Edge0Text::load(&model_dir, config)?;
     let generated = match device {
         TextDevice::Cpu => {
@@ -54,11 +56,15 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
                 !resident_experts,
                 "--resident-experts requires a CUDA device"
             );
-            generate_greedy(&mut model, &ids, max_new_tokens.get())?
+            generate_greedy(&mut model, &ids, max_new_tokens.get(), &eos_token_ids)?
         }
-        TextDevice::Cuda => {
-            generate_cuda(&mut model, &ids, max_new_tokens.get(), resident_experts)?
-        }
+        TextDevice::Cuda => generate_cuda(
+            &mut model,
+            &ids,
+            max_new_tokens.get(),
+            resident_experts,
+            &eos_token_ids,
+        )?,
     };
     let text = tokenizer
         .decode(&generated, true)
@@ -68,24 +74,33 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
     Ok(())
 }
 
-fn generate_greedy(model: &mut Edge0Text, ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
+fn generate_greedy(
+    model: &mut Edge0Text,
+    ids: &[u32],
+    max_new_tokens: usize,
+    eos_token_ids: &[u32],
+) -> Result<Vec<u32>> {
     let mut hidden = None;
     for &id in ids {
         hidden = Some(model.forward(id)?);
     }
-    decode_from_hidden(model, hidden, max_new_tokens)
+    decode_from_hidden(model, hidden, max_new_tokens, eos_token_ids)
 }
 
 fn decode_from_hidden(
     model: &mut Edge0Text,
     mut hidden: Option<Vec<f32>>,
     max_new_tokens: usize,
+    eos_token_ids: &[u32],
 ) -> Result<Vec<u32>> {
     let mut generated = Vec::with_capacity(max_new_tokens);
     while generated.len() < max_new_tokens {
         let logits = model.logits(hidden.as_ref().context("missing prefill state")?)?;
         let best = greedy_token(&logits)?;
         generated.push(best);
+        if eos_token_ids.contains(&best) {
+            break;
+        }
         hidden = Some(model.forward(best)?);
     }
     Ok(generated)
@@ -97,6 +112,7 @@ fn generate_cuda(
     ids: &[u32],
     max_new_tokens: usize,
     resident_experts: bool,
+    eos_token_ids: &[u32],
 ) -> Result<Vec<u32>> {
     model.enable_gpu(resident_experts)?;
     let mut hidden = None;
@@ -105,16 +121,17 @@ fn generate_cuda(
     }
     if model.is_resident() {
         let mut generated = vec![model.first_token()?];
-        while generated.len() < max_new_tokens {
+        while generated.len() < max_new_tokens && !eos_token_ids.contains(generated.last().unwrap())
+        {
             let prev = *generated.last().expect("first token");
             generated.push(model.forward_token(prev)?);
         }
         return Ok(generated);
     }
-    decode_from_hidden(model, hidden, max_new_tokens)
+    decode_from_hidden(model, hidden, max_new_tokens, eos_token_ids)
 }
 
 #[cfg(not(feature = "cuda"))]
-fn generate_cuda(_: &mut Edge0Text, _: &[u32], _: usize, _: bool) -> Result<Vec<u32>> {
+fn generate_cuda(_: &mut Edge0Text, _: &[u32], _: usize, _: bool, _: &[u32]) -> Result<Vec<u32>> {
     bail!("CUDA decoding requires a binary built with --features cuda")
 }

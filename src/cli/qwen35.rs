@@ -1,6 +1,6 @@
 use super::*;
 use flyingfish::qwen35::{
-    config::Qwen35Config,
+    config::{Qwen35Config, chat_prompt, chat_prompt_with_image},
     model::Qwen35Text,
     vision::{self, VisionGrid},
     weights::Qwen35Weights,
@@ -30,10 +30,6 @@ pub(super) enum Qwen35Command {
     },
 }
 
-/// The system block the checkpoint's chat_template.jinja prepends (verified
-/// byte-exact against apply_chat_template in ff-qwen35's fixtures).
-const SYSTEM_BLOCK: &str = "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n";
-
 pub(super) fn run(command: Qwen35Command) -> Result<()> {
     let Qwen35Command::Generate {
         model: model_dir,
@@ -51,13 +47,9 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
         None => None,
     };
     let templated = if vision.is_some() {
-        format!(
-            "{SYSTEM_BLOCK}<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"
-        )
+        chat_prompt_with_image(&prompt)
     } else {
-        format!(
-            "{SYSTEM_BLOCK}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"
-        )
+        chat_prompt(&prompt)
     };
     let mut ids = tokenizer
         .encode(templated.as_str(), false)
@@ -90,6 +82,9 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
                 let logits = model.logits(&hidden)?;
                 let best = greedy_token(&logits)?;
                 generated.push(best);
+                if best == config.text_config.eos_token_id {
+                    break;
+                }
                 hidden = model.forward(best)?;
             }
             generated
@@ -252,7 +247,9 @@ fn generate_cuda(
         }
     }
     let mut generated = vec![gpu.read_token()?];
-    while generated.len() < max_new_tokens {
+    while generated.len() < max_new_tokens
+        && generated.last().copied() != Some(config.text_config.eos_token_id)
+    {
         gpu.step()?;
         generated.push(gpu.read_token()?);
     }
