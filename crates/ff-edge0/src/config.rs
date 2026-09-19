@@ -12,6 +12,10 @@ pub const EDGE0_ARCHITECTURE: &str = "Qwen3_5MoeForConditionalGeneration";
 pub const EDGE0_MODEL_TYPE: &str = "qwen3_5_moe";
 pub const EDGE0_TEXT_MODEL_TYPE: &str = "qwen3_5_moe_text";
 
+/// `quantization.mode` value in the checkpoint's config.json; an upstream
+/// BF16 Qwen3.5-MoE shares the architecture but carries no such object.
+pub const EDGE0_QUANTIZATION_MODE: &str = "affine";
+
 /// Groupwise affine quantization, verified from the checkpoint: body
 /// tensors carry 8x unsigned int4 per U32 word (low nibble first), the
 /// router and shared-expert gates carry 4x unsigned int8.
@@ -130,8 +134,8 @@ impl QuantizationConfig {
             self.bits
         );
         ensure!(
-            self.mode == "affine",
-            "unsupported Edge0 quantization mode {:?}; expected affine",
+            self.mode == EDGE0_QUANTIZATION_MODE,
+            "unsupported Edge0 quantization mode {:?}; expected {EDGE0_QUANTIZATION_MODE}",
             self.mode
         );
         Ok(())

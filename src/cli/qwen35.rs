@@ -70,12 +70,17 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
     );
     let device = match device {
         TextDevice::Cuda => {
-            anyhow::ensure!(
-                total <= GPU_CONTEXT_CAP,
-                "prompt + generation {total} exceeds the {GPU_CONTEXT_CAP} kernel cap"
-            );
-            if auto && !checkpoint_fits_free_vram(&model_dir)? {
-                eprintln!("auto: checkpoint exceeds free VRAM; falling back to CPU");
+            if total > GPU_CONTEXT_CAP {
+                if auto {
+                    eprintln!(
+                        "auto: prompt + generation {total} exceeds the {GPU_CONTEXT_CAP} kernel cap; falling back to CPU"
+                    );
+                    TextDevice::Cpu
+                } else {
+                    bail!("prompt + generation {total} exceeds the {GPU_CONTEXT_CAP} kernel cap");
+                }
+            } else if auto && !checkpoint_fits_free_vram(&model_dir, &config, total)? {
+                eprintln!("auto: checkpoint and KV cache exceed free VRAM; falling back to CPU");
                 TextDevice::Cpu
             } else {
                 TextDevice::Cuda
@@ -155,9 +160,15 @@ fn run_vision_tower(
 }
 
 /// The CUDA path uploads every projection; the weights dominate device
-/// memory, so the safetensors bytes are the fit estimate.
+/// memory, so the safetensors bytes are the fit estimate. Scale/bias rows
+/// upload as f32 (double their bf16 share on disk), and each full-attention
+/// layer holds two f32 KV planes sized by the context the run will use.
 #[cfg(feature = "cuda")]
-fn checkpoint_fits_free_vram(model_dir: &Path) -> Result<bool> {
+fn checkpoint_fits_free_vram(
+    model_dir: &Path,
+    config: &Qwen35Config,
+    total_tokens: usize,
+) -> Result<bool> {
     let mut bytes = 0u64;
     for entry in std::fs::read_dir(model_dir)? {
         let entry = entry?;
@@ -174,13 +185,27 @@ fn checkpoint_fits_free_vram(model_dir: &Path) -> Result<bool> {
         "no safetensors shards in {}",
         model_dir.display()
     );
+    let text = &config.text_config;
+    let max_ctx = if total_tokens > 4096 {
+        total_tokens.next_power_of_two()
+    } else {
+        4096
+    };
+    let full_attention = (0..text.num_hidden_layers)
+        .filter(|&layer| {
+            text.layer_kind(layer) == flyingfish::qwen35::config::LayerKind::FullAttention
+        })
+        .count() as u64;
+    let kv =
+        full_attention * 2 * max_ctx as u64 * (text.num_key_value_heads * text.head_dim) as u64 * 4;
+    let required = bytes + bytes / 8 + kv;
     let context = cudarc::driver::CudaContext::new(0).context("open CUDA device 0")?;
     let (free, _) = context.mem_get_info().context("mem_get_info")?;
-    Ok(bytes <= free as u64)
+    Ok(required <= free as u64)
 }
 
 #[cfg(not(feature = "cuda"))]
-fn checkpoint_fits_free_vram(_: &Path) -> Result<bool> {
+fn checkpoint_fits_free_vram(_: &Path, _: &Qwen35Config, _: usize) -> Result<bool> {
     Ok(true)
 }
 

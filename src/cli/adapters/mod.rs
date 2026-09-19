@@ -96,6 +96,10 @@ impl Metadata {
     pub(super) fn quantization_format(&self, name: &str) -> bool {
         self.0["quantization"]["format"] == name
     }
+
+    pub(super) fn quantization_mode(&self, name: &str) -> bool {
+        self.0["quantization"]["mode"] == name
+    }
 }
 
 /// Registering another model supplies its recognition, CLI and execution in
