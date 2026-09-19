@@ -226,7 +226,12 @@ fn absolutize(p: &Path) -> Result<PathBuf> {
         match ancestor.file_name() {
             Some(name) => {
                 missing.push(name);
-                ancestor = ancestor.parent().context("no ancestor")?;
+                // A bare relative name ("out") has parent "" — treat as ".".
+                ancestor = match ancestor.parent() {
+                    Some(p) if p.as_os_str().is_empty() => Path::new("."),
+                    Some(p) => p,
+                    None => break,
+                };
             }
             None => break,
         }
@@ -461,6 +466,19 @@ mod tests {
                 .starts_with(&src_abs)
         );
         assert!(!absolutize(&tmp.join("out")).unwrap().starts_with(&src_abs));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn bare_relative_dst_works() {
+        // `requant <src> out` — the usage-line form: parent is "", not ".".
+        let tmp = std::env::temp_dir().join(format!("requant-rel-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+        let abs = absolutize(Path::new("out")).unwrap();
+        std::env::set_current_dir(cwd).unwrap();
+        assert_eq!(abs, tmp.canonicalize().unwrap().join("out"));
         std::fs::remove_dir_all(&tmp).ok();
     }
 
