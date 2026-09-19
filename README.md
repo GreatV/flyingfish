@@ -17,6 +17,8 @@ Each adapter supplies its supported operations and options. Use `ff text generat
 | `ff video` | [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) | Text, first/last-frame and reference conditioning for video and audio, checkpointed and resumable |
 | `ff text` | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | Disk-streamed MoE text generation, single or multi-GPU |
 | `ff text` | [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B), [DSpark](https://huggingface.co/openbmb/MiniCPM5-2B-DSpark) | Greedy text generation with an optional speculative draft |
+| `ff text` | Edge0-35B-A3B | Groupwise-int4 hybrid GDN/MoE text generation with optional CUDA expert residency |
+| `ff text` | Qwen3.8-27B | Groupwise-int4 dense text generation with an optional PNG image input |
 | `ff music` | [MiniMax Music3](https://huggingface.co/MiniMaxAI/MiniMax-Music3) | Lyrics and a caption to a stereo WAV |
 | `ff 3d` | [TRELLIS-1](https://huggingface.co/microsoft/TRELLIS-text-large), [TRELLIS.2](https://huggingface.co/microsoft/TRELLIS.2-4B) | TRELLIS-1 text/image to Gaussian splats; TRELLIS.2 image to a colored mesh |
 | `ff similarity` | [CLIP](https://huggingface.co/openai/clip-vit-large-patch14) | Image/text similarity scoring |

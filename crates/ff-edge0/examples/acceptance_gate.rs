@@ -113,8 +113,7 @@ fn main() -> anyhow::Result<()> {
         }
         let mut model = Edge0Text::load(model_dir, config.clone())?;
         model.enable_gpu(true)?;
-        let templated =
-            format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n");
+        let templated = ff_edge0::config::chat_prompt(prompt);
         let enc = tokenizer
             .encode(templated.as_str(), false)
             .map_err(|e| anyhow::anyhow!("encode: {e}"))?;

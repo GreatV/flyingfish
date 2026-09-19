@@ -9,8 +9,7 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     let mut model = Edge0Text::load(model_dir, config)?;
     let prompt = "Explain paging to a systems programmer.";
-    let templated =
-        format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n");
+    let templated = ff_edge0::config::chat_prompt(prompt);
     let ids = tokenizer
         .encode(templated.as_str(), false)
         .map_err(|e| anyhow::anyhow!("encode: {e}"))?

@@ -1,10 +1,12 @@
 //! Model-specific command schemas and execution behind task-based routing.
 
 mod clip;
+mod edge0;
 mod glm;
 mod h3;
 mod minicpm;
 mod music;
+mod qwen35;
 mod trellis;
 
 pub(super) use glm::GlmCommand;
@@ -106,6 +108,8 @@ pub(super) struct Adapter {
 pub(super) const BUILTINS: &[Adapter] = &[
     glm::ADAPTER,
     minicpm::ADAPTER,
+    edge0::ADAPTER,
+    qwen35::ADAPTER,
     h3::ADAPTER,
     music::ADAPTER,
     trellis::ADAPTER,

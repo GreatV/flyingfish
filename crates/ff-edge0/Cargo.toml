@@ -28,10 +28,6 @@ name = "acceptance_gate"
 required-features = ["cuda"]
 
 [[example]]
-name = "generate"
-required-features = ["cuda"]
-
-[[example]]
 name = "logit_sensitivity"
 required-features = ["cuda"]
 

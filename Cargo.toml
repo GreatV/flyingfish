@@ -73,6 +73,8 @@ cuda = [
     "ff-trellis/cuda",
     "ff-minicpm/cuda",
     "ff-music/cuda",
+    "ff-edge0/cuda",
+    "ff-qwen35/cuda",
     "candle-core/cuda",
     "dep:cudarc",
 ]
@@ -86,6 +88,8 @@ ff-glm = { path = "crates/ff-glm" }
 ff-trellis = { path = "crates/ff-trellis" }
 ff-minicpm = { path = "crates/ff-minicpm" }
 ff-music = { path = "crates/ff-music" }
+ff-edge0 = { path = "crates/ff-edge0" }
+ff-qwen35 = { path = "crates/ff-qwen35" }
 anyhow = "1.0"
 candle-core = "=0.11.0"
 clap = { version = "4.5", features = ["derive", "string"] }

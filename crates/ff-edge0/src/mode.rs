@@ -233,13 +233,29 @@ mod tests {
     use crate::weights::Edge0Weights;
     use std::path::Path;
 
-    fn sizes() -> WeightSizes {
-        let weights = Edge0Weights::open(Path::new(concat!(
+    /// The real checkpoint's weighed sizes as five constants; the audit test
+    /// holds this fixture to the checkpoint where one is present.
+    fn synthetic_sizes() -> WeightSizes {
+        WeightSizes {
+            expert_packed: 15 << 30,
+            expert_scale_bias: 15 << 27,
+            static_packed: 684 << 20,
+            static_scale_bias: 684 << 17,
+            embed_lm_head: 545 << 20,
+        }
+    }
+
+    /// Weighed against the real checkpoint; the audit test skips without it.
+    fn sizes() -> Option<WeightSizes> {
+        let dir = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../models/Edge0/Edge0-35B-A3B-preview"
-        )))
-        .unwrap();
-        WeightSizes::from_weights(&weights).unwrap()
+        ));
+        if !dir.is_dir() {
+            return None;
+        }
+        let weights = Edge0Weights::open(dir).unwrap();
+        Some(WeightSizes::from_weights(&weights).unwrap())
     }
 
     fn hw24g() -> Hardware {
@@ -254,30 +270,53 @@ mod tests {
 
     #[test]
     fn weighed_sizes_match_the_index_audit() {
-        let s = sizes();
+        let Some(s) = sizes() else { return };
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         assert!((gib(s.expert_packed + s.expert_scale_bias) - 16.88).abs() < 0.05);
         assert!((s.expert_scale_bias as f64 / s.expert_packed as f64 - 0.125).abs() < 0.001);
         assert!((gib(s.static_packed + s.static_scale_bias) - 0.76).abs() < 0.05);
         assert!((gib(s.embed_lm_head) - 0.53).abs() < 0.05);
+        let synth = synthetic_sizes();
+        for (field, synthetic, real) in [
+            ("expert_packed", synth.expert_packed, s.expert_packed),
+            (
+                "expert_scale_bias",
+                synth.expert_scale_bias,
+                s.expert_scale_bias,
+            ),
+            ("static_packed", synth.static_packed, s.static_packed),
+            (
+                "static_scale_bias",
+                synth.static_scale_bias,
+                s.static_scale_bias,
+            ),
+            ("embed_lm_head", synth.embed_lm_head, s.embed_lm_head),
+        ] {
+            assert!(
+                (gib(synthetic) - gib(real)).abs() < 0.05,
+                "synthetic_sizes {field} drifts from the checkpoint"
+            );
+        }
     }
 
     #[test]
     fn unset_budget_defaults_to_all_vram_and_fits_full_resident() {
-        let plan = plan_mode(&hw24g(), &ModeOverrides::default(), &sizes()).unwrap();
+        let sizes = synthetic_sizes();
+        let plan = plan_mode(&hw24g(), &ModeOverrides::default(), &sizes).unwrap();
         assert_eq!(plan.mode, PerformanceMode::FullResident);
         assert!(plan.provenance.iter().any(|l| l.contains("scaled reserve")));
     }
 
     #[test]
     fn user_budget_rederives_to_streaming() {
+        let sizes = synthetic_sizes();
         let plan = plan_mode(
             &hw24g(),
             &ModeOverrides {
                 vram_budget_bytes: Some(18 << 30),
                 force_host_only: false,
             },
-            &sizes(),
+            &sizes,
         )
         .unwrap();
         assert_eq!(plan.mode, PerformanceMode::StreamingExperts);
@@ -290,6 +329,7 @@ mod tests {
 
     #[test]
     fn reserve_scales_below_the_crossover_on_small_pools() {
+        let sizes = synthetic_sizes();
         let hw = Hardware {
             total_vram_bytes: Some(8 << 30),
             free_vram_bytes: Some(7 << 30),
@@ -297,20 +337,21 @@ mod tests {
             host_memory_available_bytes: Some(16 << 30),
             unified_probe_failed: false,
         };
-        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
+        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes).unwrap();
         assert_eq!(plan.budget_bytes, (8 << 30) - (512 << 20));
         assert_eq!(plan.mode, PerformanceMode::StreamingExperts);
     }
 
     #[test]
     fn tight_budget_falls_to_host_only() {
+        let sizes = synthetic_sizes();
         let plan = plan_mode(
             &hw24g(),
             &ModeOverrides {
                 vram_budget_bytes: Some(1 << 30),
                 force_host_only: false,
             },
-            &sizes(),
+            &sizes,
         )
         .unwrap();
         assert_eq!(plan.mode, PerformanceMode::HostOnly);
@@ -318,6 +359,7 @@ mod tests {
 
     #[test]
     fn unified_pool_budgets_against_measured_availability() {
+        let sizes = synthetic_sizes();
         let hw = Hardware {
             total_vram_bytes: Some(6 << 30),
             free_vram_bytes: Some(7 << 29), // 3.5 GiB
@@ -325,7 +367,7 @@ mod tests {
             host_memory_available_bytes: Some(4 << 30),
             unified_probe_failed: false,
         };
-        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
+        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes).unwrap();
         let pool = 7 << 29; // min(4 GiB host view, 3.5 GiB device free view)
         let reserve = 512 << 20; // the shared formula's floor at a 6 GiB total
         assert_eq!(plan.budget_bytes, pool - reserve);
@@ -344,6 +386,7 @@ mod tests {
 
     #[test]
     fn unmeasurable_unified_pool_fails_closed_to_host_only() {
+        let sizes = synthetic_sizes();
         let hw = Hardware {
             total_vram_bytes: Some(16 << 30),
             free_vram_bytes: Some(15 << 30),
@@ -351,7 +394,7 @@ mod tests {
             host_memory_available_bytes: None,
             unified_probe_failed: false,
         };
-        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
+        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes).unwrap();
         assert_eq!(plan.mode, PerformanceMode::HostOnly);
         assert_eq!(plan.budget_bytes, 0);
         assert!(
@@ -363,6 +406,7 @@ mod tests {
 
     #[test]
     fn failed_topology_probe_fails_closed_to_host_only() {
+        let sizes = synthetic_sizes();
         // A failed probe cannot rule out a shared pool: planning as discrete
         // would reintroduce the very blind spot this closed (review finding,
         // mirroring ff-core's device_topology_probe_failed consumers).
@@ -373,7 +417,7 @@ mod tests {
             host_memory_available_bytes: None,
             unified_probe_failed: true,
         };
-        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
+        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes).unwrap();
         assert_eq!(plan.mode, PerformanceMode::HostOnly);
         assert!(
             plan.provenance
@@ -384,6 +428,7 @@ mod tests {
 
     #[test]
     fn unified_pool_without_a_device_free_view_fails_closed() {
+        let sizes = synthetic_sizes();
         // Symmetric with the missing-host-view case: both availability views
         // are binding for a shared pool (the ff-core contract).
         let hw = Hardware {
@@ -393,7 +438,7 @@ mod tests {
             host_memory_available_bytes: Some(8 << 30),
             unified_probe_failed: false,
         };
-        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
+        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes).unwrap();
         assert_eq!(plan.mode, PerformanceMode::HostOnly);
         assert!(
             plan.provenance
@@ -404,6 +449,7 @@ mod tests {
 
     #[test]
     fn unprobed_unified_topology_keeps_the_discrete_plan() {
+        let sizes = synthetic_sizes();
         // Today's production values on a discrete card: the integrated probe
         // failed or was skipped, so legacy split-axis planning must hold.
         let hw = Hardware {
@@ -413,7 +459,7 @@ mod tests {
             host_memory_available_bytes: None,
             unified_probe_failed: false,
         };
-        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes()).unwrap();
+        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes).unwrap();
         assert_eq!(plan.mode, PerformanceMode::FullResident);
         assert_eq!(plan.budget_bytes, (24 << 30) - (1 << 30));
         assert!(!plan.provenance.iter().any(|l| l.contains("unified pool")));
@@ -421,6 +467,7 @@ mod tests {
 
     #[test]
     fn unified_pool_with_a_user_budget_caps_to_the_measured_pool() {
+        let sizes = synthetic_sizes();
         let hw = Hardware {
             total_vram_bytes: Some(6 << 30),
             free_vram_bytes: Some(4 << 30),
@@ -434,7 +481,7 @@ mod tests {
                 vram_budget_bytes: Some(6 << 30),
                 force_host_only: false,
             },
-            &sizes(),
+            &sizes,
         )
         .unwrap();
         // The user asked for the whole 6 GiB total; the shared pool only
@@ -444,6 +491,7 @@ mod tests {
 
     #[test]
     fn no_vram_probe_is_host_only_with_provenance() {
+        let sizes = synthetic_sizes();
         let plan = plan_mode(
             &Hardware {
                 total_vram_bytes: None,
@@ -453,7 +501,7 @@ mod tests {
                 unified_probe_failed: false,
             },
             &ModeOverrides::default(),
-            &sizes(),
+            &sizes,
         )
         .unwrap();
         assert_eq!(plan.mode, PerformanceMode::HostOnly);

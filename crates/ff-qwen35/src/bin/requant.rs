@@ -1,6 +1,6 @@
 //! Offline requant: Qwen3.8-27B bf16 checkpoint -> groupwise affine int4
 //! (s*q + b, group 64, 8x int4 per U32 low-nibble-first — the edge0 byte
-//! layout, pinned in docs/qwen35-design.md). Per-group scale/bias by
+//! layout). Per-group scale/bias by
 //! iterated least squares on the bf16 values (2 rounds), deterministic.
 //!
 //! Usage: requant `<src_dir> <dst_dir> [threads]`
