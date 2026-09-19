@@ -10,6 +10,8 @@ fn task_help_exposes_3d_and_model_specific_options_without_loading_models() {
     for (task, adapter, operation, expected) in [
         ("text", "glm", "generate", "--expert-cache-mib"),
         ("text", "minicpm", "generate", "--draft-model"),
+        ("text", "edge0", "generate", "--resident-experts"),
+        ("text", "qwen35", "generate", "--image"),
         ("video", "h3", "generate", "--duration-seconds"),
         ("music", "music3", "generate", "--lyrics"),
         ("3d", "trellis", "generate", "--conditioner"),

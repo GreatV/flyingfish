@@ -818,9 +818,9 @@ impl Edge0Text {
             }
             anyhow::ensure!(
                 plan.mode == crate::mode::PerformanceMode::FullResident,
-                "EDGE0_GPU=full requested but the planner selected {:?} — rerun with \
-                 plain EDGE0_GPU=1 (static weights only) only if this device is \
-                 discrete; on a unified pool fix the availability probe first",
+                "expert residency was requested but the planner selected {:?} — a \
+                 discrete device can run with static weights only; on a unified \
+                 pool fix the availability probe first",
                 plan.mode
             );
         }

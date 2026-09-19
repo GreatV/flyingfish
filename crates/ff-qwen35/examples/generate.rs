@@ -13,7 +13,7 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let dir = args
         .next()
-        .unwrap_or_else(|| "models/Qwen/Qwen3.8-27B-int4".to_string());
+        .context("usage: generate <model_dir> [n_tokens] [prompt]")?;
     let n: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(8);
     let prompt = args
         .next()
@@ -255,30 +255,6 @@ fn main() -> anyhow::Result<()> {
         }
     }
     println!("prefill: {:.1}s", started.elapsed().as_secs_f32());
-    if std::env::var_os("QWEN35_DUMP_MIXER").is_some() {
-        let mut bytes = Vec::new();
-        for h in &model.mixer_dump {
-            for v in h {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        std::fs::write("/tmp/qwen_rust_mixer.bin", &bytes)?;
-        println!("mixer dumped {} vecs", model.mixer_dump.len());
-    }
-    if std::env::var_os("QWEN35_DUMP").is_some() {
-        let mut bytes = Vec::new();
-        for h in &model.dump {
-            for v in h {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        std::fs::write("/tmp/qwen_rust_dump.bin", &bytes)?;
-        println!(
-            "dumped {} layers x {} floats",
-            model.dump.len(),
-            model.dump[0].len()
-        );
-    }
 
     // QWEN35_MTP=1: measure acceptance off-path. QWEN35_MTP=spec: full
     // speculative loop on CPU (no time savings — it gates that speculation

@@ -8,10 +8,12 @@
 /// module that reaches into an adapter should say so at the use site.
 pub use ff_core as runtime;
 pub(crate) use ff_core::required_option;
+pub use ff_edge0 as edge0;
 pub use ff_glm as glm;
 pub use ff_h3 as h3;
 pub use ff_minicpm as minicpm;
 pub use ff_music as music;
+pub use ff_qwen35 as qwen35;
 pub use ff_trellis as trellis;
 
 pub mod calibration;

@@ -11,6 +11,7 @@ mod collective;
 mod conditioned;
 mod decode;
 mod denoise;
+mod edge0;
 mod generate;
 mod glm;
 mod glm_multi;
@@ -24,6 +25,7 @@ mod plan;
 mod probe;
 mod progress;
 mod prompt;
+mod qwen35;
 mod resource;
 mod trellis;
 mod trellis_generate;
@@ -1215,6 +1217,49 @@ fn mib_to_bytes(value: u64) -> Result<u64> {
     value
         .checked_mul(1024 * 1024)
         .context("MiB resource limit exceeds u64")
+}
+
+/// The int4 text adapters drive CUDA through cudarc contexts bound to
+/// device 0; other ordinals and Metal have no path to offer.
+enum TextDevice {
+    Cpu,
+    Cuda,
+}
+
+fn resolve_text_device(value: &str) -> Result<TextDevice> {
+    let selected = match value {
+        "cpu" => TextDevice::Cpu,
+        "auto" => {
+            if Device::cuda_if_available(0).is_ok_and(|device| device.is_cuda()) {
+                TextDevice::Cuda
+            } else {
+                TextDevice::Cpu
+            }
+        }
+        "cuda:0" => TextDevice::Cuda,
+        _ if value.starts_with("cuda:") => {
+            bail!("the int4 text adapters bind CUDA device 0; {value:?} is unsupported")
+        }
+        _ => bail!("unknown device {value:?}; use cpu, auto, or cuda:0"),
+    };
+    #[cfg(not(feature = "cuda"))]
+    if matches!(selected, TextDevice::Cuda) {
+        bail!("CUDA decoding requires a binary built with --features cuda");
+    }
+    Ok(selected)
+}
+
+fn greedy_token(logits: &[f32]) -> Result<u32> {
+    anyhow::ensure!(
+        logits.iter().all(|value| value.is_finite()),
+        "model produced non-finite logits"
+    );
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+        .map(|(index, _)| index as u32)
+        .context("model produced no logits")
 }
 
 fn resolve_optional_new_output(path: Option<PathBuf>, model: &Path) -> Result<Option<PathBuf>> {

@@ -385,6 +385,30 @@ mod tests {
     }
 
     #[test]
+    fn edge0_and_qwen35_checkpoints_select_their_adapters() {
+        let registry = Registry::new(BUILTINS);
+        let cases = [
+            (
+                serde_json::json!({"architectures":["Qwen3_5MoeForConditionalGeneration"]}),
+                "edge0",
+            ),
+            (serde_json::json!({"model_type":"qwen3_5_moe"}), "edge0"),
+            (
+                serde_json::json!({"architectures":["Qwen3_5ForConditionalGeneration"]}),
+                "qwen35",
+            ),
+        ];
+        for (metadata, expected) in cases {
+            let directory = checkpoint(metadata);
+            let selected = registry
+                .select(Task::Text, &args(directory.path()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected.id, expected);
+        }
+    }
+
+    #[test]
     fn both_trellis_generations_use_the_3d_task() {
         let registry = Registry::new(BUILTINS);
         for architecture in [
