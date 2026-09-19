@@ -385,6 +385,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
             selection.policy.cache_policy()?,
             &admission_snapshot,
         )
+        .map_err(anyhow::Error::from)
         .and_then(|()| match promotion_refusal {
             Some(message) => anyhow::bail!("{message}"),
             None => Ok(()),
@@ -424,6 +425,9 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
                 candidate.disposition =
                     flyingfish::runtime::resource_selection::CandidateDisposition::CapacityRejected;
                 candidate.reason = format!("refused by final admission: {error}");
+                candidate.shortfall = error
+                    .downcast_ref::<flyingfish::glm::admission::CapacityRejection>()
+                    .and_then(flyingfish::glm::admission::CapacityRejection::shortfall);
             }
         }
         let refusal = anyhow::Error::from(flyingfish::resource_policy::AdmissionRefused {

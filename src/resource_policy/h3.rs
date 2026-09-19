@@ -12,8 +12,9 @@ use crate::{
     runtime::{
         probe::{ResourceSnapshot, admission_reserve_bytes},
         resource_selection::{
-            CandidateDisposition, ResourceCandidateObservation, ResourcePhaseEstimate,
-            ResourcePolicyMode, ResourceSelectionProvenance, SelectedResourceAxis, SelectionOrigin,
+            CandidateDisposition, CapacityShortfall, ResourceCandidateObservation,
+            ResourcePhaseEstimate, ResourcePolicyMode, ResourceSelectionProvenance,
+            SelectedResourceAxis, SelectionOrigin,
         },
         weights::{WeightSource, accounting::CacheInventory},
     },
@@ -317,6 +318,7 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
             candidate_id,
             disposition: CandidateDisposition::NoBenefitEvidence,
             reason: "baseline_no_benefit_evidence".into(),
+            shortfall: None,
             expected_cost: None,
             evidence: vec![],
         };
@@ -376,6 +378,10 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
                 "H3 requires host {host} and compute {device} bytes; configured bounds are {:?} / {:?}",
                 request.budget.max_host_bytes, request.budget.max_device_bytes
             );
+            observation.shortfall = admitted
+                .violations
+                .first()
+                .map(|violation| violation.shortfall());
             observations.push(observation);
             continue;
         }
@@ -394,6 +400,13 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
             if host.checked_add(reserve).is_none_or(|n| n > available) {
                 observation.disposition = CandidateDisposition::CapacityRejected;
                 observation.reason = "host retention would consume the promotion reserve".into();
+                observation.shortfall =
+                    host.checked_add(reserve)
+                        .map(|needed_bytes| CapacityShortfall {
+                            predicate: "host_promotion_reserve".into(),
+                            needed_bytes,
+                            available_bytes: available,
+                        });
                 observations.push(observation);
                 continue;
             }
@@ -829,6 +842,21 @@ mod tests {
             .expect("refusal must carry its record, not a budget-recording error");
         assert_eq!(refusal.provenance.workload.get("refused"), Some(&1));
         assert!(!refusal.provenance.candidates.is_empty());
+        let rejection = refusal
+            .provenance
+            .candidates
+            .iter()
+            .find(|c| c.disposition == CandidateDisposition::CapacityRejected)
+            .expect("the budget rejection is recorded");
+        let shortfall = rejection
+            .shortfall
+            .as_ref()
+            .expect("the rejection binds by bytes");
+        assert_eq!(shortfall.predicate, "budget.host");
+        assert_eq!(
+            shortfall.needed_bytes - shortfall.available_bytes,
+            refusal.provenance.workload["selection_host_shortfall_bytes"]
+        );
         assert!(
             refusal
                 .provenance

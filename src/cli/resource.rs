@@ -266,10 +266,8 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
     let checked_host = host_peak
         .checked_add(phase.host_promotion_reserve_bytes)
         .context("H3 final promotion headroom overflow")?;
-    if !final_budget
-        .check_peaks(checked_host, device_peak)
-        .within_budget
-    {
+    let final_report = final_budget.check_peaks(checked_host, device_peak);
+    if !final_report.within_budget {
         // A bare error would leave the caller nothing to downcast.
         let mut provenance = selection.provenance.clone();
         flyingfish::resource_policy::h3::record_refused_final_admission(
@@ -287,6 +285,10 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
                 candidate.disposition =
                     flyingfish::runtime::resource_selection::CandidateDisposition::CapacityRejected;
                 candidate.reason = "refused by final H3 admission".into();
+                candidate.shortfall = final_report
+                    .violations
+                    .first()
+                    .map(|violation| violation.shortfall());
             }
         }
         return Err(flyingfish::resource_policy::AdmissionRefused {

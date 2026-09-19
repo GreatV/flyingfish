@@ -4,8 +4,9 @@ use crate::{
     runtime::{
         probe::ResourceSnapshot,
         resource_selection::{
-            CandidateDisposition, ResourceCandidateObservation, ResourcePhaseEstimate,
-            ResourcePolicyMode, ResourceSelectionProvenance, SelectedResourceAxis, SelectionOrigin,
+            CandidateDisposition, CapacityShortfall, ResourceCandidateObservation,
+            ResourcePhaseEstimate, ResourcePolicyMode, ResourceSelectionProvenance,
+            SelectedResourceAxis, SelectionOrigin,
         },
         weights::CachePolicy,
     },
@@ -22,6 +23,17 @@ pub struct GlmSelection {
 
 pub fn cache_policy(policy: &GlmExecutionPolicy) -> Result<CachePolicy> {
     policy.cache_policy()
+}
+
+/// The host peak a promotion phase draws from the pool it is judged against,
+/// with the device peak folded in under a unified topology.
+fn promotion_peak(phase: &ResourcePhaseEstimate, unified: bool) -> Option<u64> {
+    let peak = phase.host_peak_bytes().ok()?;
+    if unified {
+        let device = phase.device_peak_bytes().ok()?;
+        return peak.checked_add(device.unwrap_or(0));
+    }
+    Some(peak)
 }
 
 pub fn axes(policy: &GlmExecutionPolicy) -> Result<BTreeMap<String, String>> {
@@ -98,6 +110,7 @@ pub fn select(
             candidate_id,
             disposition: CandidateDisposition::NoBenefitEvidence,
             reason: "baseline_no_benefit_evidence".into(),
+            shortfall: None,
             expected_cost: None,
             evidence: vec![],
         };
@@ -119,13 +132,30 @@ pub fn select(
             observations.push(observation);
             continue;
         }
-        let cache = cache_policy(&candidate)?;
-        let expert_bytes = usize::try_from(candidate.expert_cache.maximum_bound_bytes)?;
-        if let Err(error) =
+        let cache = match cache_policy(&candidate) {
+            Ok(cache) => cache,
+            Err(error) => {
+                observation.disposition = CandidateDisposition::CapacityRejected;
+                observation.reason = format!("candidate cache policy is not executable: {error}");
+                observations.push(observation);
+                continue;
+            }
+        };
+        let expert_bytes = match usize::try_from(candidate.expert_cache.maximum_bound_bytes) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                observation.disposition = CandidateDisposition::CapacityRejected;
+                observation.reason = format!("expert-cache bound is not a byte count: {error}");
+                observations.push(observation);
+                continue;
+            }
+        };
+        if let Err(rejection) =
             breakdown.validate_capacity(candidate.resident_static, expert_bytes, cache, snapshot)
         {
             observation.disposition = CandidateDisposition::CapacityRejected;
-            observation.reason = error.to_string();
+            observation.reason = rejection.to_string();
+            observation.shortfall = rejection.shortfall();
             observations.push(observation);
             continue;
         }
@@ -135,46 +165,52 @@ pub fn select(
             let unified_pool = snapshot.unified_pool_available_bytes();
             let host = match unified_pool {
                 Some(pool) => pool,
-                None => crate::glm::admission::host_available(snapshot)
-                    .context("host capacity unavailable")?,
+                None => match crate::glm::admission::host_available(snapshot) {
+                    Some(host) => host,
+                    None => {
+                        observation.disposition = CandidateDisposition::CapacityRejected;
+                        observation.reason =
+                            "host capacity unavailable for the promotion check".into();
+                        observations.push(observation);
+                        continue;
+                    }
+                },
             };
             let reserve =
                 crate::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
                     snapshot,
                 );
-            if breakdown
-                .phases_with_safety(
-                    candidate.resident_static,
-                    expert_bytes,
-                    cache,
-                    breakdown.scaled_admission_safety_bytes(snapshot),
-                )?
-                .iter()
-                .any(|p| {
-                    let peak = match p.host_peak_bytes() {
-                        Ok(peak) => peak,
-                        Err(_) => return true,
-                    };
-                    let peak = if unified_pool.is_some() {
-                        match p
-                            .device_peak_bytes()
-                            .and_then(|d| {
-                                peak.checked_add(d.unwrap_or(0))
-                                    .context("unified promotion peak overflow")
-                            })
-                            .ok()
-                        {
-                            Some(peak) => peak,
-                            None => return true,
-                        }
-                    } else {
-                        peak
-                    };
-                    peak.checked_add(reserve).is_none_or(|n| n > host)
-                })
-            {
+            let promotion_phases = match breakdown.phases_with_safety(
+                candidate.resident_static,
+                expert_bytes,
+                cache,
+                breakdown.scaled_admission_safety_bytes(snapshot),
+            ) {
+                Ok(phases) => phases,
+                Err(error) => {
+                    observation.disposition = CandidateDisposition::CapacityRejected;
+                    observation.reason = format!("GLM phase estimate failed: {error}");
+                    observations.push(observation);
+                    continue;
+                }
+            };
+            let overspent =
+                promotion_phases
+                    .iter()
+                    .find(|p| match promotion_peak(p, unified_pool.is_some()) {
+                        Some(peak) => peak.checked_add(reserve).is_none_or(|n| n > host),
+                        None => true,
+                    });
+            if let Some(phase) = overspent {
                 observation.disposition = CandidateDisposition::CapacityRejected;
                 observation.reason = "host promotion would spend the safety reserve".into();
+                observation.shortfall = promotion_peak(phase, unified_pool.is_some())
+                    .and_then(|peak| peak.checked_add(reserve))
+                    .map(|needed_bytes| CapacityShortfall {
+                        predicate: "host_promotion_reserve".into(),
+                        needed_bytes,
+                        available_bytes: host,
+                    });
                 observations.push(observation);
                 continue;
             }
@@ -239,12 +275,20 @@ pub fn select(
                     continue;
                 }
             }
-            let phases = breakdown.phases_with_safety(
+            let phases = match breakdown.phases_with_safety(
                 candidate.resident_static,
                 expert_bytes,
                 cache,
                 breakdown.scaled_admission_safety_bytes(snapshot),
-            )?;
+            ) {
+                Ok(phases) => phases,
+                Err(error) => {
+                    observation.disposition = CandidateDisposition::CapacityRejected;
+                    observation.reason = format!("GLM phase estimate failed: {error}");
+                    observations.push(observation);
+                    continue;
+                }
+            };
             // The evidence is a process-RSS delta, which counts faulted
             // mmap-backed pages, so this bound adds reclaimable residency back.
             let host_peak = phases
@@ -927,5 +971,75 @@ mod tests {
             .provenance
             .validate_policy_binding(&serde_json::to_value(&selected.policy).unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn capacity_rejections_carry_a_structured_shortfall() {
+        let mut current = snapshot();
+        current.host_memory_available_bytes = Some(1);
+        current.cgroup_v2_memory_available_bytes = Some(1);
+        let error = match select(
+            &baseline(),
+            &breakdown(),
+            &current,
+            &context(),
+            ResourcePolicyMode::Conservative,
+            &BTreeSet::new(),
+            None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a snapshot below the peak must refuse the baseline"),
+        };
+        let refusal = error
+            .downcast_ref::<super::super::AdmissionRefused>()
+            .expect("the refusal carries its record");
+        let rejection = refusal
+            .provenance
+            .candidates
+            .iter()
+            .find(|c| c.disposition == CandidateDisposition::CapacityRejected)
+            .expect("the capacity rejection is recorded");
+        let shortfall = rejection
+            .shortfall
+            .as_ref()
+            .expect("the rejection binds by bytes");
+        assert_eq!(shortfall.predicate, "host_available");
+        assert_eq!(shortfall.available_bytes, 1);
+        assert!(shortfall.needed_bytes > 1);
+        refusal.provenance.validate().unwrap();
+    }
+
+    #[test]
+    fn unmeasured_capacity_is_a_recorded_rejection_not_an_abort() {
+        let mut current = snapshot();
+        current.host_memory_available_bytes = None;
+        current.cgroup_v2_memory_available_bytes = None;
+        let error = match select(
+            &baseline(),
+            &breakdown(),
+            &current,
+            &context(),
+            ResourcePolicyMode::Conservative,
+            &BTreeSet::new(),
+            None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an unmeasured snapshot must refuse the baseline"),
+        };
+        let refusal = error
+            .downcast_ref::<super::super::AdmissionRefused>()
+            .expect("the refusal carries its record");
+        let observation = &refusal.provenance.candidates[0];
+        assert_eq!(
+            observation.disposition,
+            CandidateDisposition::CapacityRejected
+        );
+        assert!(
+            observation
+                .reason
+                .contains("cannot measure free host memory")
+        );
+        assert!(observation.shortfall.is_none());
+        refusal.provenance.validate().unwrap();
     }
 }

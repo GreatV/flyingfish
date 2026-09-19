@@ -813,7 +813,7 @@ impl GlmAdmissionBreakdown {
         expert_cache_bytes: usize,
         cache_policy: CachePolicy,
         snapshot: &ResourceSnapshot,
-    ) -> Result<()> {
+    ) -> Result<(), CapacityRejection> {
         // A probed unified-memory topology (e.g. Jetson) charges host and
         // device peaks against one pool; independent per-axis checks would
         // admit a combined footprint the machine cannot hold. `None` (unprobed
@@ -821,49 +821,167 @@ impl GlmAdmissionBreakdown {
         // discrete checks is unsafe only when the pool is known shared, and
         // legacy records predate unified support entirely.
         let unified_pool = snapshot.unified_pool_available_bytes();
-        ensure!(
-            !snapshot.unified_accounting_is_undecidable(),
-            "GLM admission needs the shared host/device pool size on a unified-memory device, \
-             but one of the host and CUDA views could not be measured"
-        );
+        if snapshot.unified_accounting_is_undecidable() {
+            return Err(CapacityRejection::Unmeasured(
+                CapacityPredicate::UnifiedPool,
+            ));
+        }
         let safety = self.scaled_admission_safety_bytes(snapshot);
-        for phase in
-            self.phases_with_safety(resident_static, expert_cache_bytes, cache_policy, safety)?
-        {
-            let host_peak = phase.host_peak_bytes()?;
-            let device_peak = phase.device_peak_bytes()?;
+        let phases = self
+            .phases_with_safety(resident_static, expert_cache_bytes, cache_policy, safety)
+            .map_err(|error| CapacityRejection::Malformed(error.to_string()))?;
+        for phase in phases {
+            let host_peak = phase
+                .host_peak_bytes()
+                .map_err(|error| CapacityRejection::Malformed(error.to_string()))?;
+            let device_peak = phase
+                .device_peak_bytes()
+                .map_err(|error| CapacityRejection::Malformed(error.to_string()))?;
             if let Some(pool) = unified_pool {
-                let combined = host_peak
-                    .checked_add(device_peak.unwrap_or(0))
-                    .context("GLM unified-pool peak overflow")?;
-                ensure!(
-                    combined <= pool,
-                    "GLM {} needs {combined} bytes from the unified host/device pool, but only {pool} are available",
-                    phase.phase
-                );
+                let Some(combined) = host_peak.checked_add(device_peak.unwrap_or(0)) else {
+                    return Err(CapacityRejection::Malformed(
+                        "GLM unified-pool peak overflow".into(),
+                    ));
+                };
+                if combined > pool {
+                    return Err(CapacityRejection::Exceeded {
+                        predicate: CapacityPredicate::UnifiedPool,
+                        phase: phase.phase,
+                        needed_bytes: combined,
+                        available_bytes: pool,
+                    });
+                }
                 continue;
             }
-            let host = host_available(snapshot)
-                .context("cannot measure free host memory for GLM admission")?;
-            ensure!(
-                host_peak <= host,
-                "GLM {} needs {host_peak} free host bytes, but only {host} are available",
-                phase.phase
-            );
+            let Some(host) = host_available(snapshot) else {
+                return Err(CapacityRejection::Unmeasured(
+                    CapacityPredicate::HostAvailable,
+                ));
+            };
+            if host_peak > host {
+                return Err(CapacityRejection::Exceeded {
+                    predicate: CapacityPredicate::HostAvailable,
+                    phase: phase.phase,
+                    needed_bytes: host_peak,
+                    available_bytes: host,
+                });
+            }
             if let Some(required) = device_peak {
-                let free = snapshot
-                    .device_free_memory_bytes
-                    .context("cannot measure free CUDA memory for GLM admission")?;
-                ensure!(
-                    required <= free,
-                    "GLM {} needs {required} free CUDA bytes, but only {free} are available",
-                    phase.phase
-                );
+                let Some(free) = snapshot.device_free_memory_bytes else {
+                    return Err(CapacityRejection::Unmeasured(CapacityPredicate::DeviceFree));
+                };
+                if required > free {
+                    return Err(CapacityRejection::Exceeded {
+                        predicate: CapacityPredicate::DeviceFree,
+                        phase: phase.phase,
+                        needed_bytes: required,
+                        available_bytes: free,
+                    });
+                }
             }
         }
         Ok(())
     }
 }
+
+/// The capacity axis a check refused on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapacityPredicate {
+    HostAvailable,
+    DeviceFree,
+    UnifiedPool,
+}
+
+impl std::fmt::Display for CapacityPredicate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::HostAvailable => "host_available",
+            Self::DeviceFree => "device_free",
+            Self::UnifiedPool => "unified_pool",
+        })
+    }
+}
+
+/// Why a capacity check refused: the measurement it lacked, the byte bound it
+/// exceeded, or the estimate arithmetic that failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CapacityRejection {
+    Unmeasured(CapacityPredicate),
+    Exceeded {
+        predicate: CapacityPredicate,
+        phase: String,
+        needed_bytes: u64,
+        available_bytes: u64,
+    },
+    Malformed(String),
+}
+
+impl CapacityRejection {
+    /// The bound as a candidate-record shortfall, when the check compared bytes.
+    pub fn shortfall(&self) -> Option<ff_core::resource_selection::CapacityShortfall> {
+        match self {
+            Self::Exceeded {
+                predicate,
+                needed_bytes,
+                available_bytes,
+                ..
+            } => Some(ff_core::resource_selection::CapacityShortfall {
+                predicate: predicate.to_string(),
+                needed_bytes: *needed_bytes,
+                available_bytes: *available_bytes,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CapacityRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unmeasured(CapacityPredicate::UnifiedPool) => formatter.write_str(
+                "GLM admission needs the shared host/device pool size on a unified-memory device, \
+                 but one of the host and CUDA views could not be measured",
+            ),
+            Self::Unmeasured(CapacityPredicate::HostAvailable) => {
+                formatter.write_str("cannot measure free host memory for GLM admission")
+            }
+            Self::Unmeasured(CapacityPredicate::DeviceFree) => {
+                formatter.write_str("cannot measure free CUDA memory for GLM admission")
+            }
+            Self::Exceeded {
+                predicate: CapacityPredicate::UnifiedPool,
+                phase,
+                needed_bytes,
+                available_bytes,
+            } => write!(
+                formatter,
+                "GLM {phase} needs {needed_bytes} bytes from the unified host/device pool, \
+                 but only {available_bytes} are available"
+            ),
+            Self::Exceeded {
+                predicate: CapacityPredicate::HostAvailable,
+                phase,
+                needed_bytes,
+                available_bytes,
+            } => write!(
+                formatter,
+                "GLM {phase} needs {needed_bytes} free host bytes, but only {available_bytes} are available"
+            ),
+            Self::Exceeded {
+                predicate: CapacityPredicate::DeviceFree,
+                phase,
+                needed_bytes,
+                available_bytes,
+            } => write!(
+                formatter,
+                "GLM {phase} needs {needed_bytes} free CUDA bytes, but only {available_bytes} are available"
+            ),
+            Self::Malformed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CapacityRejection {}
 
 pub(crate) fn host_mask_bytes(tokens: usize, cpu: bool) -> Result<u64> {
     if cpu {
@@ -1155,10 +1273,13 @@ mod tests {
             assert_eq!(phase.device_peak_bytes().unwrap(), None);
             assert!(phase.required_host_bytes >= GLM_ADMISSION_SAFETY_BYTES);
         }
-        assert!(
-            cpu.validate_capacity(true, 0, CachePolicy::new(1), &snapshot(u64::MAX, 1, None))
-                .is_err()
-        );
+        let rejection = cpu
+            .validate_capacity(true, 0, CachePolicy::new(1), &snapshot(u64::MAX, 1, None))
+            .expect_err("host bytes below the peak are rejected");
+        let shortfall = rejection.shortfall().expect("the rejection binds by bytes");
+        assert_eq!(shortfall.predicate, "host_available");
+        assert_eq!(shortfall.available_bytes, 1);
+        assert!(shortfall.needed_bytes > 1);
         cpu.validate_capacity(
             true,
             0,
