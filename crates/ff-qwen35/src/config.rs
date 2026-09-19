@@ -1,9 +1,9 @@
 //! Qwen3.8-27B (dense `qwen3_5`) checkpoint configuration.
 //!
 //! Verified against `models/Qwen/Qwen3.8-27B/config.json` and the shard
-//! index on 2026-09-17; see docs/qwen35-design.md. The checkpoint is all
-//! BF16 — quantization is OURS (offline requant, groupwise affine int4,
-//! group 64, the edge0 byte layout).
+//! index on 2026-09-17. The checkpoint is all BF16 — quantization is OURS
+//! (offline requant, groupwise affine int4, group 64, the edge0 byte
+//! layout).
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;

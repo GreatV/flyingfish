@@ -2,7 +2,7 @@
 //!
 //! Every constant and default here was verified against
 //! `models/Edge0/Edge0-35B-A3B-preview/config.json` and the safetensors
-//! headers on 2026-09-16; see `docs/edge0-design.md` for provenance.
+//! headers on 2026-09-16.
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;

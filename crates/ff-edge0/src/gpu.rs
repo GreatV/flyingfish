@@ -953,8 +953,7 @@ pub struct GpuRuntime {
     pub batch_trace: std::sync::Mutex<BatchTrace>,
     x_bufs: std::sync::Mutex<std::collections::HashMap<usize, CudaSlice<f32>>>,
     // Per-SLOT inner buffers: same-width live inputs (4 expert inners +
-    // shared inner, all 512) cannot share a per-width buffer — see the
-    // aliasing trap in docs/edge0-design.md §3c(2).
+    // shared inner, all 512) cannot share a per-width buffer.
     inner_slots: std::sync::Mutex<Vec<Option<CudaSlice<f32>>>>,
     expert_ids: std::sync::Mutex<CudaSlice<i32>>,
     batched_gate_y: std::sync::Mutex<CudaSlice<f32>>,

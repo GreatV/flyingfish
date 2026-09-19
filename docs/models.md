@@ -12,6 +12,8 @@ Each row is one run; cases ran sequentially with OS caches retained. Wall time i
 | [MiniMax-H3](#minimax-h3) | Generated 107 frames in 49 evaluations for a 768p, 16:9, 4-second request | 1,853.57 s | 58.82 GiB | 20.92 GiB |
 | [MiniCPM5-2B](#minicpm5-2b-and-dspark) | Generated 31 tokens with a 32-token limit | 5.34 s | 1.10 GiB | 4.62 GiB |
 | [MiniCPM5-2B + DSpark](#minicpm5-2b-and-dspark) | Generated 31 tokens with a 32-token limit | 2.24 s | 1.10 GiB | 5.17 GiB |
+| [Edge0-35B-A3B](#edge0-35b-a3b) | Greedy text generation | — | — | — |
+| [Qwen3.8-27B](#qwen38-27b) | Greedy text generation, optional image input | — | — | — |
 | [CLIP ViT-L/14](#clip) | Scored two candidate texts against a 224×224 image | 2.44 s | 0.44 GiB | 0.99 GiB |
 | [TRELLIS-text-base](#trellis-1) | Generated 180,288 Gaussian splats from a text prompt | 8.96 s | 0.70 GiB | 3.98 GiB |
 | [TRELLIS-text-large](#trellis-1) | Generated 231,744 Gaussian splats from a text prompt | 21.95 s | 0.69 GiB | 5.41 GiB |
@@ -21,6 +23,8 @@ Each row is one run; cases ran sequentially with OS caches retained. Wall time i
 | [MiniMax-Music3](#minimax-music3) | Generated 8 s of audio in 30 denoise steps | 130.63 s | 2.11 GiB | 19.22 GiB |
 
 Image tests used a fixed procedural chair pattern at each required resolution. DINOv2/v3 are included in the corresponding TRELLIS pipeline timings. RMBG-2.0/BiRefNet currently has no inference adapter.
+
+The Edge0-35B-A3B and Qwen3.8-27B cells are blank: both models are pending a measured run under this setup.
 
 ## Usage
 
@@ -94,6 +98,39 @@ ff text generate \
     --draft-model "<dspark-checkpoint>" \
     --prompt 'Explain paging to a systems programmer.' \
     --device cuda:0 --max-new-tokens 32
+```
+
+### Edge0-35B-A3B
+
+Edge0-35B-A3B is a groupwise-int4 hybrid GDN/full-attention MoE checkpoint. Generation is greedy and stops at the checkpoint's end-of-sequence tokens or `--max-new-tokens`, whichever comes first. CUDA decoding binds device 0 and uploads the static projections; `--resident-experts` additionally uploads the MoE expert set after a capacity planner verifies the device can hold it.
+
+```bash
+ff text generate \
+    --model "<edge0-checkpoint>" \
+    --prompt 'Explain paging to a systems programmer.' \
+    --device cuda:0 --max-new-tokens 128
+
+ff text generate \
+    --model "<edge0-checkpoint>" \
+    --prompt 'Explain paging to a systems programmer.' \
+    --device cuda:0 --resident-experts --max-new-tokens 128
+```
+
+### Qwen3.8-27B
+
+Qwen3.8-27B is a dense groupwise-int4 checkpoint with an optional vision tower, with the same greedy decoding and end-of-sequence stop. Pass a PNG with `--image` to ground the prompt; the tower runs on the host. CUDA decoding binds device 0.
+
+```bash
+ff text generate \
+    --model "<qwen35-checkpoint>" \
+    --prompt 'Explain paging to a systems programmer.' \
+    --device cuda:0 --max-new-tokens 128
+
+ff text generate \
+    --model "<qwen35-checkpoint>" \
+    --image "<input.png>" \
+    --prompt 'What is on the table?' \
+    --device cuda:0 --max-new-tokens 128
 ```
 
 ### TRELLIS-1
