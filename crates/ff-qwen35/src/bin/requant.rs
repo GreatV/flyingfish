@@ -475,10 +475,19 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("requant-rel-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let cwd = std::env::current_dir().unwrap();
+        // CWD is process-global; restore on panic too, or every later
+        // relative-path consumer in this test process runs in the wrong dir.
+        struct RestoreCwd(PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).ok();
+            }
+        }
+        let _guard = RestoreCwd(cwd);
         std::env::set_current_dir(&tmp).unwrap();
         let abs = absolutize(Path::new("out")).unwrap();
-        std::env::set_current_dir(cwd).unwrap();
         assert_eq!(abs, tmp.canonicalize().unwrap().join("out"));
+        drop(_guard);
         std::fs::remove_dir_all(&tmp).ok();
     }
 
