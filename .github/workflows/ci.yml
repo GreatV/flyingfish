@@ -22,6 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      # No --features cuda: runners have no nvcc, matching scripts/premerge.sh.
+      # No --features cuda: runners have no nvcc.
       # CUDA-only examples are gated behind required-features and are skipped.
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
