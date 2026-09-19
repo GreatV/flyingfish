@@ -109,6 +109,10 @@ pub struct ResourcePhaseEstimate {
     pub phase: String,
     pub required_host_bytes: u64,
     pub optional_host_bytes: u64,
+    /// Headroom the promotion gate applied, stamped onto the record after
+    /// selection. Unlike `device_reserve_bytes` it is not folded into the
+    /// phase peak; the check that enforces it adds it to `host_peak_bytes`
+    /// itself.
     pub host_promotion_reserve_bytes: u64,
     /// Page-cache-resident bytes the kernel can reclaim under pressure (e.g.
     /// mmap'd weight shards). They are memory *performance*, not memory
@@ -125,6 +129,8 @@ pub struct ResourcePhaseEstimate {
 }
 
 impl ResourcePhaseEstimate {
+    /// Excludes `host_promotion_reserve_bytes`; a caller enforcing that
+    /// reserve adds it to this peak itself.
     pub fn host_peak_bytes(&self) -> Result<u64> {
         self.required_host_bytes
             .checked_add(self.optional_host_bytes)
