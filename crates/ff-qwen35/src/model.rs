@@ -1,11 +1,10 @@
 //! Dense Qwen3.8-27B text forward (CPU reference path first).
 //!
-//! Semantics ported from HF `modeling_qwen3_5.py` (transformers 5.8), NOT
-//! from ff-edge0: every RMSNorm here is the zero-centered variant
-//! (`x * rsqrt(mean(x^2)+eps) * (1 + w)`), attention q/k norms included;
-//! the GDN gated norm is plain (`norm(x) * w * silu(z)`). The GDN
-//! recurrence is update-then-read: S *= decay; kv = S^T k; delta =
-//! (v - kv) * beta; S += k ⊗ delta; out = S^T q.
+//! Semantics per HF `modeling_qwen3_5.py`: all RMSNorms zero-centered
+//! (`x * rsqrt(mean(x^2)+eps) * (1 + w)`), GDN gated norm plain
+//! (`norm(x) * w * silu(z)`), GDN recurrence update-then-read
+//! (S *= decay; kv = S^T k; delta = (v - kv) * beta; S += k ⊗ delta;
+//! out = S^T q).
 
 use crate::config::{LayerKind, Qwen35Config, TEXT_PREFIX};
 use crate::weights::Qwen35Weights;
@@ -82,8 +81,8 @@ struct KvCache {
 pub struct Qwen35Text {
     config: Qwen35Config,
     weights: Qwen35Weights,
-    /// Loaded-once quantized projections (a fresh GroupQuant per call would
-    /// re-copy ~13.5 GB per token).
+    /// Loaded-once quantized projections (a fresh GroupQuant per call
+    /// re-copies ~13.5 GB per token).
     cache: std::cell::RefCell<
         std::collections::HashMap<String, std::sync::Arc<ff_edge0::int4::GroupQuant>>,
     >,
@@ -163,8 +162,7 @@ impl Qwen35Text {
     }
 
     fn proj(&self, name: &str, x: &[f32]) -> Result<Vec<f32>> {
-        // QWEN35_BF16=1: run the raw bf16 checkpoint — the semantics
-        // discriminator (isolates quantization noise from porting bugs).
+        // QWEN35_BF16=1: read the raw bf16 checkpoint instead of int4.
         if std::env::var_os("QWEN35_BF16").is_some() {
             return self.weights.bf16_matvec(name, x);
         }
@@ -217,7 +215,7 @@ impl Qwen35Text {
         let mut hidden = hidden;
         self.pos3 = pos3;
         // QWEN35_BF16ROUND=1: round the residual stream to bf16 after each
-        // op, emulating HF's per-op casts — isolates dtype chaos from bugs.
+        // op (HF casts per op).
         let round_bf16 = std::env::var_os("QWEN35_BF16ROUND").is_some();
         let rnd = |v: &mut Vec<f32>| {
             if round_bf16 {
@@ -301,11 +299,10 @@ impl Qwen35Text {
         Ok(self.forward_raw(token)?.1)
     }
 
-    /// MTP draft (Qwen3-Next-style fusion, order resolved empirically by
-    /// acceptance): fc(cat([norm_hidden(h), norm_embed(embed(tok))])) ->
-    /// one full-attn decoder layer at `position` -> mtp.norm -> shared
-    /// lm_head. `h` is the PRE-final-norm hidden after the main model
-    /// processed `tok`'s predecessor.
+    /// MTP draft: fc(cat([norm_hidden(h), norm_embed(embed(tok))])) -> one
+    /// full-attn decoder layer at `position` -> mtp.norm -> shared lm_head.
+    /// Fusion order embed-then-hidden (measured 87% vs 0% acceptance).
+    /// `h` is the PRE-final-norm hidden after `tok`'s predecessor.
     pub fn mtp_draft(&mut self, h: &[f32], tok: u32, pos: usize) -> Result<Vec<f32>> {
         let text = &self.config.text_config;
         let eps = text.rms_norm_eps as f32;

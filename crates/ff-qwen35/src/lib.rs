@@ -1,4 +1,4 @@
-//! Qwen3.8-27B (dense qwen3_5) adapter — see docs/qwen35-design.md.
+//! Qwen3.8-27B (dense qwen3_5) adapter.
 
 pub mod config;
 #[cfg(feature = "cuda")]
