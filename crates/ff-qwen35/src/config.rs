@@ -191,7 +191,9 @@ impl Qwen35Config {
         let t = &self.text_config;
         ensure!(
             !t.eos_token_id.is_empty()
-                && t.eos_token_id.iter().all(|&id| (id as usize) < t.vocab_size),
+                && t.eos_token_id
+                    .iter()
+                    .all(|&id| (id as usize) < t.vocab_size),
             "invalid EOS token ids {:?}",
             t.eos_token_id
         );
