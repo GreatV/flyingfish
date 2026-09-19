@@ -35,6 +35,16 @@ fn l2norm(x: &[f32]) -> Vec<f32> {
 /// reference-diff harnesses.
 pub type BlockParts = (String, Vec<f32>, Vec<f32>, Vec<f32>);
 
+/// EDGE0_MAX_CTX override for the resident KV cache, default 4096 (the attn
+/// kernel's shared-memory cap is 8192, enforced at upload).
+pub fn configured_max_ctx() -> usize {
+    std::env::var("EDGE0_MAX_CTX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(4096)
+}
+
 struct GdnState {
     conv: Vec<f32>,
     recurrent: Vec<f32>,

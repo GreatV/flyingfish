@@ -1457,11 +1457,7 @@ impl ResidentState {
         kv_stride: usize,
         num_attn_layers: usize,
     ) -> Result<Self> {
-        let max_ctx = std::env::var("EDGE0_MAX_CTX")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or(4096);
+        let max_ctx = crate::model::configured_max_ctx();
         // edge0_attn_scores keeps the step scores in shared memory.
         ensure!(
             max_ctx <= 8192,

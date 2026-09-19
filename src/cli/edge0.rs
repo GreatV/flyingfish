@@ -1,7 +1,7 @@
 use super::*;
 use flyingfish::edge0::{
     config::{Edge0Config, chat_prompt},
-    model::Edge0Text,
+    model::{Edge0Text, configured_max_ctx},
 };
 
 #[derive(Debug, Subcommand)]
@@ -32,7 +32,7 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
         device,
         resident_experts,
     } = command;
-    let (device, _) = resolve_text_device(&device)?;
+    let (device, auto) = resolve_text_device(&device)?;
     let config = Edge0Config::from_model_dir(&model_dir)?;
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|error| anyhow::anyhow!("load tokenizer: {error}"))?;
@@ -48,6 +48,16 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
             .is_some_and(|total| total <= config.text_config.max_position_embeddings),
         "prompt and requested output exceed model context"
     );
+    let device = match device {
+        TextDevice::Cuda if auto && ids.len() + max_new_tokens.get() > configured_max_ctx() => {
+            eprintln!(
+                "auto: prompt + generation exceeds the {} KV-cache capacity; falling back to CPU",
+                configured_max_ctx()
+            );
+            TextDevice::Cpu
+        }
+        selected => selected,
+    };
     let eos_token_ids = config.eos_token_id.clone();
     let mut model = Edge0Text::load(&model_dir, config)?;
     let generated = match device {
