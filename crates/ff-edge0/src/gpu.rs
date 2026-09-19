@@ -364,6 +364,7 @@ impl GpuContext {
     /// tensor's first dim IS the expert index). Kernel-count first: the
     /// expected reading is 120 launches/token after this replaces the
     /// per-expert dispatch.
+    #[allow(clippy::too_many_arguments)]
     pub fn batched_expert_gemv_slotx(
         &self,
         experts: &GpuExperts,
@@ -401,6 +402,7 @@ impl GpuContext {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn batched_expert_gemv(
         &self,
         experts: &GpuExperts,
@@ -468,6 +470,7 @@ impl GpuContext {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn lora_add_test(
         &self,
         a: &CudaSlice<f32>,
@@ -1003,23 +1006,23 @@ impl GpuRuntime {
     }
 
     fn trace_seg(&self, layer: usize, seg: u8, since: std::time::Instant) {
-        if let Ok(mut tr) = self.moe_trace.lock() {
-            if let Some((l, t)) = tr.as_mut() {
-                if *l != layer {
-                    return;
+        if let Ok(mut tr) = self.moe_trace.lock()
+            && let Some((l, t)) = tr.as_mut()
+        {
+            if *l != layer {
+                return;
+            }
+            let us = since.elapsed().as_micros() as u64;
+            match seg {
+                0 => {
+                    t.router_us += us;
+                    t.calls += 1;
                 }
-                let us = since.elapsed().as_micros() as u64;
-                match seg {
-                    0 => {
-                        t.router_us += us;
-                        t.calls += 1;
-                    }
-                    1 => t.enq_us += us,
-                    2 => t.silu_us += us,
-                    3 => t.down_us += us,
-                    4 => t.shared_us += us,
-                    _ => t.tail_us += us,
-                }
+                1 => t.enq_us += us,
+                2 => t.silu_us += us,
+                3 => t.down_us += us,
+                4 => t.shared_us += us,
+                _ => t.tail_us += us,
             }
         }
     }
@@ -1063,6 +1066,7 @@ impl GpuRuntime {
     /// Resident variant: consumes the normed input from device memory and
     /// leaves the layer output in out_proj's y — no sync, no host round
     /// trip; the caller adds it into `hidden`.
+    #[allow(clippy::too_many_arguments)]
     pub fn gdn_layer_dx(
         &self,
         gdn_index: usize,
@@ -1358,6 +1362,7 @@ pub struct GpuGdn {
 }
 
 impl GpuGdn {
+    #[allow(clippy::too_many_arguments)]
     pub fn upload(
         ctx: &GpuContext,
         conv1d: &[f32],
@@ -1447,6 +1452,7 @@ pub struct ResidentState {
 }
 
 impl ResidentState {
+    #[allow(clippy::too_many_arguments)]
     pub fn upload(
         ctx: &GpuContext,
         hidden_size: usize,
@@ -1746,6 +1752,7 @@ impl GpuRuntime {
 
     /// Attention layer on device: q/k/v GEMVs on x1, norm+rope+KV append,
     /// scores+softmax+gate, o_proj — output lands in o_proj's y.
+    #[allow(clippy::too_many_arguments)]
     pub fn attn_layer(
         &self,
         kv_index: usize,
@@ -1868,6 +1875,7 @@ impl GpuRuntime {
     }
 
     /// Harness path for block_parts: host x in, synced layer output out.
+    #[allow(clippy::too_many_arguments)]
     pub fn gdn_layer_host(
         &self,
         gdn_index: usize,
@@ -2334,14 +2342,9 @@ impl GpuRuntime {
         {
             // top-k writes the batched-kernel id buffer directly — no d2d
             // copy node in the per-token graph.
-            let mut ids = self.expert_ids.lock().expect("expert ids");
-            self.ctx.glue_router_topk(
-                router.y_ref(),
-                &mut ids,
-                &res.topk_w,
-                router.out_dim,
-                top_k,
-            )?;
+            let ids = self.expert_ids.lock().expect("expert ids");
+            self.ctx
+                .glue_router_topk(router.y_ref(), &ids, &res.topk_w, router.out_dim, top_k)?;
             self.ctx.batched_expert_gemv(
                 experts,
                 layer,
@@ -2575,11 +2578,11 @@ impl GpuContext {
         let null_a: &CudaSlice<f32> = segs
             .iter()
             .find_map(|s| s.lora.as_ref().map(|(a, _)| *a))
-            .unwrap_or(&x as &CudaSlice<f32>);
+            .unwrap_or(x);
         let null_b: &CudaSlice<f32> = segs
             .iter()
             .find_map(|s| s.lora.as_ref().map(|(_, b)| *b))
-            .unwrap_or(&x as &CudaSlice<f32>);
+            .unwrap_or(x);
         unsafe {
             self.stream
                 .launch_builder(&self.k_group4)
@@ -2818,7 +2821,7 @@ impl GpuContext {
     /// Cold-bench helper: stream `bytes` of device memory to evict L2.
     pub fn flush_l2(&self, buf: &CudaSlice<f32>) -> Result<()> {
         use cudarc::driver::safe::DevicePtr;
-        let ptrs: Vec<u64> = vec![buf.device_ptr(&self.stream).0 as u64];
+        let ptrs: Vec<u64> = vec![buf.device_ptr(&self.stream).0];
         let tbl = self.ctx_u64(&ptrs)?;
         let scratch = self.upload_f32(&[0f32; 4])?;
         let n = (buf.len() / 4) as i64;

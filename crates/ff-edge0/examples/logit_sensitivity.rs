@@ -45,13 +45,10 @@ fn main() -> anyhow::Result<()> {
         hidden = Some(model.forward(best)?);
     }
     let tag = std::env::var("EDGE0_LOGIT_TAG").unwrap_or_else(|_| "default".into());
-    std::fs::write(
-        format!("/tmp/edge0_logits_{tag}.f32"),
-        bytemuck::cast_slice(&logits),
-    )?;
-    println!(
-        "wrote /tmp/edge0_logits_{tag}.f32 ({} floats)",
-        logits.len()
-    );
+    let dir = std::env::var("EDGE0_LOGIT_DIR").unwrap_or_else(|_| "output".into());
+    std::fs::create_dir_all(&dir)?;
+    let path = format!("{dir}/edge0_logits_{tag}.f32");
+    std::fs::write(&path, bytemuck::cast_slice(&logits))?;
+    println!("wrote {path} ({} floats)", logits.len());
     Ok(())
 }

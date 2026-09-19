@@ -740,10 +740,10 @@ impl Edge0Text {
     /// applies LoRA host-side after the kernel (rank 16, negligible).
     fn proj_matvec(&mut self, name: &str, x: &[f32]) -> Vec<f32> {
         #[cfg(feature = "cuda")]
-        if let Some(runtime) = &self.gpu {
-            if let Some(y) = runtime.prepared(name, x) {
-                return y.unwrap_or_else(|e| panic!("gpu matvec {name}: {e:?}"));
-            }
+        if let Some(runtime) = &self.gpu
+            && let Some(y) = runtime.prepared(name, x)
+        {
+            return y.unwrap_or_else(|e| panic!("gpu matvec {name}: {e:?}"));
         }
         let quant = self.quant_proj(name).expect("projection load");
         let lora = self.weights.lora_for(name);
@@ -1016,30 +1016,30 @@ impl Edge0Text {
         // on one upload + one sync; the intermediate projections stay on the
         // device.
         #[cfg(feature = "cuda")]
-        if let Some(rt) = &self.gpu {
-            if !rt.gdn.is_empty() {
-                let qkv = rt
-                    .proj
-                    .get(&format!("{prefix}.linear_attn.in_proj_qkv"))
-                    .context("gdn qkv resident")?;
-                let z = rt
-                    .proj
-                    .get(&format!("{prefix}.linear_attn.in_proj_z"))
-                    .context("gdn z resident")?;
-                let b = rt
-                    .proj
-                    .get(&format!("{prefix}.linear_attn.in_proj_b"))
-                    .context("gdn b resident")?;
-                let a = rt
-                    .proj
-                    .get(&format!("{prefix}.linear_attn.in_proj_a"))
-                    .context("gdn a resident")?;
-                let out_proj = rt
-                    .proj
-                    .get(&format!("{prefix}.linear_attn.out_proj"))
-                    .context("gdn out_proj resident")?;
-                return rt.gdn_layer_host(state_index, qkv, z, b, a, out_proj, x);
-            }
+        if let Some(rt) = &self.gpu
+            && !rt.gdn.is_empty()
+        {
+            let qkv = rt
+                .proj
+                .get(&format!("{prefix}.linear_attn.in_proj_qkv"))
+                .context("gdn qkv resident")?;
+            let z = rt
+                .proj
+                .get(&format!("{prefix}.linear_attn.in_proj_z"))
+                .context("gdn z resident")?;
+            let b = rt
+                .proj
+                .get(&format!("{prefix}.linear_attn.in_proj_b"))
+                .context("gdn b resident")?;
+            let a = rt
+                .proj
+                .get(&format!("{prefix}.linear_attn.in_proj_a"))
+                .context("gdn a resident")?;
+            let out_proj = rt
+                .proj
+                .get(&format!("{prefix}.linear_attn.out_proj"))
+                .context("gdn out_proj resident")?;
+            return rt.gdn_layer_host(state_index, qkv, z, b, a, out_proj, x);
         }
         let text = self.config.text_config.clone();
         let num_v = text.linear_num_value_heads;
@@ -1304,7 +1304,7 @@ impl Edge0Text {
         // at this shape (work per call ~= spawn cost), so parallelism here
         // is pure overhead — 79's falsifiable prediction is ~50 ms serial.
         #[cfg(feature = "cuda")]
-        let per_expert: Vec<Vec<f32>> = if self.gpu_experts.is_some() {
+        let per_expert: Vec<Vec<f32>> = if let Some(experts) = self.gpu_experts.as_ref() {
             let rt = self.gpu.as_ref().expect("gpu runtime");
             let router = rt
                 .proj
@@ -1326,7 +1326,6 @@ impl Edge0Text {
                 .proj
                 .get(&format!("{prefix}.mlp.shared_expert.down_proj"))
                 .expect("shared down");
-            let experts = self.gpu_experts.as_ref().expect("gpu experts");
             // Two-phase fused: router sync, then everything else (routed
             // gate/up/down + shared gate/up/down, GPU silu) on ONE more
             // sync — the inner never touches the host.

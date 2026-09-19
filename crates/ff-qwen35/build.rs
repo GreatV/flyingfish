@@ -1,6 +1,6 @@
 use std::{path::PathBuf, process::Command};
 
-// Kernels are emitted as compute_80 PTX; newer devices run the driver's translation of it.
+// Kernels are emitted as compute_80 PTX: Ampere or newer only, and newer devices run the driver's translation of it.
 fn main() {
     let kernels = [
         ("cuda/batch2.cu", "qwen_batch2.ptx"),
