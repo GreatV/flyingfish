@@ -1,5 +1,5 @@
 //! Greedy decode on the int4 CPU path; prints prompt/gen token ids as JSON
-//! for comparison against scripts/qwen35_reference.py (HF bf16).
+//! for comparison against the HF bf16 reference.
 //!
 //! Usage: generate <model_dir> [n_tokens] [prompt]
 

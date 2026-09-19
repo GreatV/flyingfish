@@ -833,8 +833,8 @@ mod tests {
         );
     }
 
-    /// Gate 2: mrope position builder must equal HF get_rope_index exactly
-    /// (scripts/qwen35_vision_reference.py rope), including the delta.
+    /// Gate 2: mrope position builder must equal HF get_rope_index exactly,
+    /// including the delta.
     #[test]
     fn positions_match_hf_rope_fixture() {
         let fixture = Path::new("src/testdata/vision_rope_fixture.json");
