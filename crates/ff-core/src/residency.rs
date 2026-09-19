@@ -586,6 +586,7 @@ fn decide_residency_within(
         } else {
             CandidateDisposition::CapacityRejected
         },
+        shortfall: None,
         reason: match (authorization, active) {
             (ResidencyAuthorization::NotAuthorized, _) => {
                 "no qualified paired evidence authorizes device residency".into()
@@ -613,6 +614,7 @@ fn decide_residency_within(
         } else {
             CandidateDisposition::Selected
         },
+        shortfall: None,
         reason: if active {
             "device residency supersedes streaming for the placed phases".into()
         } else {

@@ -75,12 +75,25 @@ impl ExpectedRequestCost {
     }
 }
 
+/// The byte bound that rejected a candidate: the predicate that bound, the
+/// bytes it needed and the bytes that existed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityShortfall {
+    pub predicate: String,
+    pub needed_bytes: u64,
+    pub available_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceCandidateObservation {
     pub candidate_id: String,
     pub disposition: CandidateDisposition,
     pub reason: String,
+    /// The binding bound, recorded when the rejection compares bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortfall: Option<CapacityShortfall>,
     #[serde(deserialize_with = "crate::required_option")]
     pub expected_cost: Option<ExpectedRequestCost>,
     /// What was measured for this candidate, recorded as the observations
@@ -244,6 +257,13 @@ impl ResourceSelectionProvenance {
         for candidate in &self.candidates {
             bounded_text(&candidate.candidate_id, 256)?;
             bounded_text(&candidate.reason, 4096)?;
+            if let Some(shortfall) = &candidate.shortfall {
+                bounded_text(&shortfall.predicate, 128)?;
+                ensure!(
+                    shortfall.needed_bytes > shortfall.available_bytes,
+                    "a recorded capacity shortfall does not bind"
+                );
+            }
             ensure!(
                 ids.insert(&candidate.candidate_id),
                 "duplicate resource candidate"
@@ -420,6 +440,7 @@ mod tests {
                 candidate_id: "baseline".into(),
                 disposition: CandidateDisposition::Selected,
                 reason: "baseline_no_benefit_evidence".into(),
+                shortfall: None,
                 expected_cost: None,
                 evidence: vec![],
             }],
@@ -470,6 +491,36 @@ mod tests {
             ..record.candidates[0].clone()
         });
         assert!(both.validate().is_err());
+    }
+
+    #[test]
+    fn shortfalls_round_trip_and_must_bind() {
+        let mut record = record();
+        record.workload.insert("refused".into(), 1);
+        record.candidates[0].disposition = CandidateDisposition::CapacityRejected;
+        record.candidates[0].shortfall = Some(CapacityShortfall {
+            predicate: "host_available".into(),
+            needed_bytes: 10,
+            available_bytes: 4,
+        });
+        let bytes = record.canonical_json().unwrap();
+        let round = ResourceSelectionProvenance::from_json(&bytes).unwrap();
+        assert_eq!(
+            round.candidates[0].shortfall,
+            record.candidates[0].shortfall
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["candidates"][0]["shortfall"]
+                ["needed_bytes"]
+                == serde_json::json!(10)
+        );
+        record.candidates[0].shortfall = Some(CapacityShortfall {
+            predicate: "host_available".into(),
+            needed_bytes: 4,
+            available_bytes: 4,
+        });
+        assert!(record.validate().is_err());
+        assert!(record.canonical_json().is_err());
     }
 
     #[test]

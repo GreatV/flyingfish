@@ -82,6 +82,19 @@ impl BudgetViolation {
             excess_bytes: estimated_bytes - limit_bytes,
         }
     }
+
+    /// The same bound as a candidate-record shortfall.
+    pub fn shortfall(&self) -> crate::resource_selection::CapacityShortfall {
+        crate::resource_selection::CapacityShortfall {
+            predicate: match self.domain {
+                ResourceDomain::Host => "budget.host",
+                ResourceDomain::Device => "budget.device",
+            }
+            .into(),
+            needed_bytes: self.estimated_bytes,
+            available_bytes: self.limit_bytes,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
