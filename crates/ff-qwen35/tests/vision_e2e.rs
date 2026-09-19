@@ -44,7 +44,9 @@ fn decode_rope_pos_matches_fixture_arithmetic() {
     assert!(delta < 0, "fixture should exercise the negative-delta path");
 }
 
+/// Debug-profile CPU decode runs ~50 minutes; opt in with `--ignored`.
 #[test]
+#[ignore]
 fn image_prompt_decode_matches_hf_fixture() {
     let dir = Path::new("../../models/Qwen/Qwen3.8-27B-int4");
     let fixture_path = Path::new("src/testdata/vision_e2e_fixture.json");
