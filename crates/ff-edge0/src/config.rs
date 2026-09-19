@@ -2,7 +2,7 @@
 //!
 //! Every constant and default here was verified against
 //! `models/Edge0/Edge0-35B-A3B-preview/config.json` and the safetensors
-//! headers on 2026-09-16; see `docs/edge0-design.md` for provenance.
+//! headers on 2026-09-16.
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -11,6 +11,10 @@ use std::{fs, path::Path};
 pub const EDGE0_ARCHITECTURE: &str = "Qwen3_5MoeForConditionalGeneration";
 pub const EDGE0_MODEL_TYPE: &str = "qwen3_5_moe";
 pub const EDGE0_TEXT_MODEL_TYPE: &str = "qwen3_5_moe_text";
+
+/// `quantization.mode` value in the checkpoint's config.json; an upstream
+/// BF16 Qwen3.5-MoE shares the architecture but carries no such object.
+pub const EDGE0_QUANTIZATION_MODE: &str = "affine";
 
 /// Groupwise affine quantization, verified from the checkpoint: body
 /// tensors carry 8x unsigned int4 per U32 word (low nibble first), the
@@ -130,8 +134,8 @@ impl QuantizationConfig {
             self.bits
         );
         ensure!(
-            self.mode == "affine",
-            "unsupported Edge0 quantization mode {:?}; expected affine",
+            self.mode == EDGE0_QUANTIZATION_MODE,
+            "unsupported Edge0 quantization mode {:?}; expected {EDGE0_QUANTIZATION_MODE}",
             self.mode
         );
         Ok(())
@@ -155,6 +159,9 @@ pub struct VisionConfig {
 pub struct Edge0Config {
     pub architectures: Vec<String>,
     pub model_type: String,
+    /// HF writes eos_token_id as one id or a list.
+    #[serde(deserialize_with = "token_id_list")]
+    pub eos_token_id: Vec<u32>,
     pub text_config: TextConfig,
     pub vision_config: VisionConfig,
     pub quantization: QuantizationConfig,
@@ -162,6 +169,26 @@ pub struct Edge0Config {
     pub image_token_id: Option<u32>,
     #[serde(default)]
     pub video_token_id: Option<u32>,
+}
+
+fn token_id_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<u32>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        One(u32),
+        Many(Vec<u32>),
+    }
+    Ok(match Repr::deserialize(deserializer)? {
+        Repr::One(id) => vec![id],
+        Repr::Many(ids) => ids,
+    })
+}
+
+/// The checkpoint's chat template: one user turn, then an assistant think block.
+pub fn chat_prompt(prompt: &str) -> String {
+    format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n")
 }
 
 impl Edge0Config {
@@ -187,6 +214,15 @@ impl Edge0Config {
             self.model_type
         );
         self.quantization.validate()?;
+        ensure!(
+            !self.eos_token_id.is_empty()
+                && self
+                    .eos_token_id
+                    .iter()
+                    .all(|&id| (id as usize) < self.text_config.vocab_size),
+            "invalid EOS token ids {:?}",
+            self.eos_token_id
+        );
         if let Some(list) = &self.text_config.layer_types {
             ensure!(
                 list.len() == self.text_config.num_hidden_layers,

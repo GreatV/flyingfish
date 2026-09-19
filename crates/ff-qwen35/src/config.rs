@@ -1,9 +1,9 @@
 //! Qwen3.8-27B (dense `qwen3_5`) checkpoint configuration.
 //!
 //! Verified against `models/Qwen/Qwen3.8-27B/config.json` and the shard
-//! index on 2026-09-17; see docs/qwen35-design.md. The checkpoint is all
-//! BF16 — quantization is OURS (offline requant, groupwise affine int4,
-//! group 64, the edge0 byte layout).
+//! index on 2026-09-17. The checkpoint is all BF16 — quantization is OURS
+//! (offline requant, groupwise affine int4, group 64, the edge0 byte
+//! layout).
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -11,6 +11,10 @@ use std::{fs, path::Path};
 
 pub const QWEN35_ARCHITECTURE: &str = "Qwen3_5ForConditionalGeneration";
 pub const QWEN35_TEXT_MODEL_TYPE: &str = "qwen3_5_text";
+
+/// `quantization.format` value the requantizer stamps into config.json; the
+/// upstream BF16 checkpoint shares the architecture but lacks this marker.
+pub const QUANTIZATION_FORMAT: &str = "groupwise-int4-u32";
 
 /// Tensor prefix differs from Edge0: `model.language_model.layers.N.*`.
 pub const TEXT_PREFIX: &str = "model.language_model";
@@ -62,6 +66,9 @@ pub struct TextConfig {
     /// Dense MLP width (no MoE in this family).
     pub intermediate_size: usize,
     pub vocab_size: usize,
+    /// HF writes eos_token_id as one id or a list.
+    #[serde(deserialize_with = "token_id_list")]
+    pub eos_token_id: Vec<u32>,
     pub rms_norm_eps: f64,
     pub max_position_embeddings: usize,
     #[serde(default)]
@@ -124,6 +131,36 @@ pub struct Qwen35Config {
     pub vision_end_token_id: Option<u32>,
 }
 
+fn token_id_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<u32>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        One(u32),
+        Many(Vec<u32>),
+    }
+    Ok(match Repr::deserialize(deserializer)? {
+        Repr::One(id) => vec![id],
+        Repr::Many(ids) => ids,
+    })
+}
+
+/// The system block the checkpoint's chat_template.jinja prepends.
+pub const SYSTEM_BLOCK: &str = "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n";
+
+/// The checkpoint's chat template for a text-only turn.
+pub fn chat_prompt(prompt: &str) -> String {
+    format!("{SYSTEM_BLOCK}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n")
+}
+
+/// The same, with one image pad run before the prompt text.
+pub fn chat_prompt_with_image(prompt: &str) -> String {
+    format!(
+        "{SYSTEM_BLOCK}<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    )
+}
+
 fn three() -> usize {
     3
 }
@@ -155,6 +192,14 @@ impl Qwen35Config {
             self.architectures
         );
         let t = &self.text_config;
+        ensure!(
+            !t.eos_token_id.is_empty()
+                && t.eos_token_id
+                    .iter()
+                    .all(|&id| (id as usize) < t.vocab_size),
+            "invalid EOS token ids {:?}",
+            t.eos_token_id
+        );
         ensure!(
             t.linear_conv_kernel_dim == 4,
             "conv kernel {}",

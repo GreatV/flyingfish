@@ -1,6 +1,6 @@
 // Fused groupwise-affine int4/int8 dequant GEMV for decode (batch 1).
 //
-// Layout (byte-level pinned in docs/edge0-design.md): payload U32 words
+// Layout (byte-level pinned): payload U32 words
 // pack 8x unsigned int4 (low nibble first) or 4x unsigned int8; scales and
 // biases are f32 [out, in/64] uploads. Exact reconstruction w = s*q + b:
 // y[o] = sum_g s[o,g]*dot_g + b[o,g]*groupsum_g.

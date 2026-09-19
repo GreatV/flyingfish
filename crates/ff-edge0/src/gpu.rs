@@ -953,8 +953,7 @@ pub struct GpuRuntime {
     pub batch_trace: std::sync::Mutex<BatchTrace>,
     x_bufs: std::sync::Mutex<std::collections::HashMap<usize, CudaSlice<f32>>>,
     // Per-SLOT inner buffers: same-width live inputs (4 expert inners +
-    // shared inner, all 512) cannot share a per-width buffer — see the
-    // aliasing trap in docs/edge0-design.md §3c(2).
+    // shared inner, all 512) cannot share a per-width buffer.
     inner_slots: std::sync::Mutex<Vec<Option<CudaSlice<f32>>>>,
     expert_ids: std::sync::Mutex<CudaSlice<i32>>,
     batched_gate_y: std::sync::Mutex<CudaSlice<f32>>,
@@ -1458,11 +1457,7 @@ impl ResidentState {
         kv_stride: usize,
         num_attn_layers: usize,
     ) -> Result<Self> {
-        let max_ctx = std::env::var("EDGE0_MAX_CTX")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or(4096);
+        let max_ctx = crate::model::configured_max_ctx();
         // edge0_attn_scores keeps the step scores in shared memory.
         ensure!(
             max_ctx <= 8192,

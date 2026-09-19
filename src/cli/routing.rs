@@ -385,6 +385,50 @@ mod tests {
     }
 
     #[test]
+    fn edge0_and_qwen35_checkpoints_select_their_adapters() {
+        let registry = Registry::new(BUILTINS);
+        let cases = [
+            (
+                serde_json::json!({"architectures":["Qwen3_5MoeForConditionalGeneration"],"quantization":{"mode":"affine"}}),
+                "edge0",
+            ),
+            (
+                serde_json::json!({"model_type":"qwen3_5_moe","quantization":{"mode":"affine"}}),
+                "edge0",
+            ),
+            (
+                serde_json::json!({"architectures":["Qwen3_5ForConditionalGeneration"],"quantization":{"format":"groupwise-int4-u32"}}),
+                "qwen35",
+            ),
+        ];
+        for (metadata, expected) in cases {
+            let directory = checkpoint(metadata);
+            let selected = registry
+                .select(Task::Text, &args(directory.path()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected.id, expected);
+        }
+        // The upstream BF16 checkpoints share the architectures but lack the
+        // quantization metadata: no adapter may claim them.
+        for metadata in [
+            serde_json::json!({"architectures":["Qwen3_5ForConditionalGeneration"]}),
+            serde_json::json!({"architectures":["Qwen3_5MoeForConditionalGeneration"]}),
+            serde_json::json!({"model_type":"qwen3_5_moe"}),
+        ] {
+            let directory = checkpoint(metadata);
+            let error = registry
+                .select(Task::Text, &args(directory.path()))
+                .err()
+                .expect("unstamped checkpoint must not be claimed");
+            assert!(
+                error.to_string().contains("no registered adapter"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn both_trellis_generations_use_the_3d_task() {
         let registry = Registry::new(BUILTINS);
         for architecture in [

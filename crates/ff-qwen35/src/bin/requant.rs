@@ -1,6 +1,6 @@
 //! Offline requant: Qwen3.8-27B bf16 checkpoint -> groupwise affine int4
 //! (s*q + b, group 64, 8x int4 per U32 low-nibble-first — the edge0 byte
-//! layout, pinned in docs/qwen35-design.md). Per-group scale/bias by
+//! layout). Per-group scale/bias by
 //! iterated least squares on the bf16 values (2 rounds), deterministic.
 //!
 //! Usage: requant `<src_dir> <dst_dir> [threads]`
@@ -381,8 +381,18 @@ fn main() -> Result<()> {
         dst.join("model.safetensors.index.json"),
         serde_json::to_string_pretty(&index)?,
     )?;
-    // Provenance + config passthrough.
-    std::fs::copy(src.join("config.json"), dst.join("config.json"))?;
+    // Provenance + config passthrough, stamped with the quantization format
+    // so routing can tell this output apart from the BF16 source checkpoint.
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(src.join("config.json"))?)?;
+    config["quantization"] = serde_json::json!({
+        "format": ff_qwen35::config::QUANTIZATION_FORMAT,
+        "group_size": 64,
+    });
+    std::fs::write(
+        dst.join("config.json"),
+        serde_json::to_string_pretty(&config)?,
+    )?;
     for extra in [
         "tokenizer.json",
         "tokenizer_config.json",

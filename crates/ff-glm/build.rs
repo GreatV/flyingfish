@@ -8,6 +8,7 @@ use std::{path::PathBuf, process::Command};
 /// toolkit version below records the compiler used.
 const REFERENCE_NVCC_VERSION: &str = "13.2.86";
 
+// Kernels are emitted as compute_80 PTX; newer devices run the driver's translation of it.
 fn main() {
     println!("cargo:rerun-if-changed=cuda/rsqrt_f32.cu");
     println!("cargo:rerun-if-changed=cuda/fp8_dequant.cu");

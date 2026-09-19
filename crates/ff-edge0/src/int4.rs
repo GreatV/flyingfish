@@ -1,6 +1,6 @@
 //! Groupwise affine int4/int8 quantized weights: decoding and fused matvec.
 //!
-//! Format (byte-level pinned; see docs/edge0-design.md §2): payload words
+//! Format (byte-level pinned): payload words
 //! are little-endian U32 packing 8x unsigned int4 (low nibble first; the
 //! MLX `gather_qmm` convention) or 4x unsigned int8; scales and biases are
 //! bf16 `[out, in/group_size]`, independently rounded by the encoder. The

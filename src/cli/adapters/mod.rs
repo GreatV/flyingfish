@@ -1,10 +1,12 @@
 //! Model-specific command schemas and execution behind task-based routing.
 
 mod clip;
+mod edge0;
 mod glm;
 mod h3;
 mod minicpm;
 mod music;
+mod qwen35;
 mod trellis;
 
 pub(super) use glm::GlmCommand;
@@ -90,6 +92,14 @@ impl Metadata {
     pub(super) fn model_type(&self, name: &str) -> bool {
         self.0["model_type"] == name
     }
+
+    pub(super) fn quantization_format(&self, name: &str) -> bool {
+        self.0["quantization"]["format"] == name
+    }
+
+    pub(super) fn quantization_mode(&self, name: &str) -> bool {
+        self.0["quantization"]["mode"] == name
+    }
 }
 
 /// Registering another model supplies its recognition, CLI and execution in
@@ -106,6 +116,8 @@ pub(super) struct Adapter {
 pub(super) const BUILTINS: &[Adapter] = &[
     glm::ADAPTER,
     minicpm::ADAPTER,
+    edge0::ADAPTER,
+    qwen35::ADAPTER,
     h3::ADAPTER,
     music::ADAPTER,
     trellis::ADAPTER,

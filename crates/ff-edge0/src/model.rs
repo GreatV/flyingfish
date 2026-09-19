@@ -35,6 +35,16 @@ fn l2norm(x: &[f32]) -> Vec<f32> {
 /// reference-diff harnesses.
 pub type BlockParts = (String, Vec<f32>, Vec<f32>, Vec<f32>);
 
+/// EDGE0_MAX_CTX override for the resident KV cache, default 4096 (the attn
+/// kernel's shared-memory cap is 8192, enforced at upload).
+pub fn configured_max_ctx() -> usize {
+    std::env::var("EDGE0_MAX_CTX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(4096)
+}
+
 struct GdnState {
     conv: Vec<f32>,
     recurrent: Vec<f32>,
@@ -179,6 +189,22 @@ impl Edge0Text {
     #[cfg(feature = "cuda")]
     pub fn is_resident(&self) -> bool {
         self.gpu.as_ref().is_some_and(|rt| rt.res.is_some())
+    }
+
+    /// The closed decode loop requires the resident expert set, not just the
+    /// static projections.
+    #[cfg(feature = "cuda")]
+    pub fn has_resident_experts(&self) -> bool {
+        self.gpu_experts.is_some()
+    }
+
+    /// The resident KV-cache capacity (EDGE0_MAX_CTX, default 4096).
+    #[cfg(feature = "cuda")]
+    pub fn gpu_max_ctx(&self) -> Option<usize> {
+        self.gpu
+            .as_ref()
+            .and_then(|rt| rt.res.as_ref())
+            .map(|res| res.max_ctx)
     }
 
     /// Device-resident decode step: hidden never leaves the GPU except as
@@ -818,9 +844,9 @@ impl Edge0Text {
             }
             anyhow::ensure!(
                 plan.mode == crate::mode::PerformanceMode::FullResident,
-                "EDGE0_GPU=full requested but the planner selected {:?} — rerun with \
-                 plain EDGE0_GPU=1 (static weights only) only if this device is \
-                 discrete; on a unified pool fix the availability probe first",
+                "expert residency was requested but the planner selected {:?} — a \
+                 discrete device can run with static weights only; on a unified \
+                 pool fix the availability probe first",
                 plan.mode
             );
         }
