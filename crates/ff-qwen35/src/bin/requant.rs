@@ -217,6 +217,27 @@ struct Job {
     data_offsets: (usize, usize),
 }
 
+/// Absolute form of a possibly-nonexistent path (nearest existing ancestor
+/// canonicalized, missing tail re-attached).
+fn absolutize(p: &Path) -> Result<PathBuf> {
+    let mut ancestor = p;
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        match ancestor.file_name() {
+            Some(name) => {
+                missing.push(name);
+                ancestor = ancestor.parent().context("no ancestor")?;
+            }
+            None => break,
+        }
+    }
+    let mut abs = ancestor.canonicalize()?;
+    for name in missing.iter().rev() {
+        abs = abs.join(name);
+    }
+    Ok(abs)
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let src = PathBuf::from(
@@ -228,11 +249,17 @@ fn main() -> Result<()> {
             .context("usage: requant <src> <dst> [threads]")?,
     );
     let threads: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(8);
-    // Checkpoints are read-only inputs: never write into src, never
-    // overwrite a non-empty dst.
+    // Checkpoints are read-only inputs. Equality is not enough: dst nested
+    // inside src (e.g. requant model model/out) is still a write into the
+    // checkpoint. Compare absolute ancestry — dst may not exist yet, so
+    // canonicalize its nearest existing ancestor and re-attach the tail.
+    let src_abs = src.canonicalize()?;
+    let dst_abs = absolutize(&dst)?;
     ensure!(
-        src.canonicalize()? != dst.canonicalize().unwrap_or(dst.clone()),
-        "dst must differ from src (checkpoints are read-only)"
+        !dst_abs.starts_with(&src_abs),
+        "dst {} is inside src {} (checkpoints are read-only)",
+        dst.display(),
+        src.display()
     );
     if dst.exists() {
         ensure!(
@@ -418,6 +445,24 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_dst_is_detected() {
+        let tmp = std::env::temp_dir().join(format!("requant-test-{}", std::process::id()));
+        let src = tmp.join("model");
+        std::fs::create_dir_all(&src).unwrap();
+        let src_abs = src.canonicalize().unwrap();
+        // Equal, nested, and deeply-nested all start with src_abs.
+        assert!(absolutize(&src).unwrap().starts_with(&src_abs));
+        assert!(absolutize(&src.join("out")).unwrap().starts_with(&src_abs));
+        assert!(
+            absolutize(&src.join("sub/deep"))
+                .unwrap()
+                .starts_with(&src_abs)
+        );
+        assert!(!absolutize(&tmp.join("out")).unwrap().starts_with(&src_abs));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 
     #[test]
     fn group_roundtrip_and_packing() {
