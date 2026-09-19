@@ -98,7 +98,7 @@ fn decode_from_hidden(
         let logits = model.logits(hidden.as_ref().context("missing prefill state")?)?;
         let best = greedy_token(&logits)?;
         generated.push(best);
-        if eos_token_ids.contains(&best) {
+        if eos_token_ids.contains(&best) || generated.len() == max_new_tokens {
             break;
         }
         hidden = Some(model.forward(best)?);

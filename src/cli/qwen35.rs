@@ -63,7 +63,6 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
     let total = ids
         .len()
         .checked_add(max_new_tokens.get())
-        .and_then(|total| total.checked_add(4))
         .context("prompt and requested output overflow the context arithmetic")?;
     anyhow::ensure!(
         total <= config.text_config.max_position_embeddings,
@@ -102,7 +101,9 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
                 let logits = model.logits(&hidden)?;
                 let best = greedy_token(&logits)?;
                 generated.push(best);
-                if config.text_config.eos_token_id.contains(&best) {
+                if config.text_config.eos_token_id.contains(&best)
+                    || generated.len() == max_new_tokens.get()
+                {
                     break;
                 }
                 hidden = model.forward(best)?;
@@ -265,7 +266,7 @@ fn generate_cuda(
 ) -> Result<Vec<u32>> {
     use flyingfish::qwen35::gpu::QwenGpu;
 
-    let total = ids.len() + max_new_tokens + 4;
+    let total = ids.len() + max_new_tokens;
     anyhow::ensure!(
         total <= GPU_CONTEXT_CAP,
         "prompt + generation {total} exceeds the {GPU_CONTEXT_CAP} kernel cap"
