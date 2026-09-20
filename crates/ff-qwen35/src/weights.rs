@@ -6,10 +6,13 @@ use ff_edge0::int4::{GROUP_SIZE, GroupQuant, bf16_to_f32};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::{fs::File, path::Path};
 
 struct Shard {
-    _map: Mmap,
+    /// Keeps the mapping alive for the 'static SafeTensors view and any
+    /// PackedView::Mmap handed out of here.
+    map: Arc<Mmap>,
     tensors: SafeTensors<'static>,
 }
 
@@ -47,7 +50,7 @@ impl Qwen35Weights {
                 index.insert(name.to_string(), position);
             }
             shards.push(Shard {
-                _map: map,
+                map: Arc::new(map),
                 tensors: shard,
             });
         }
@@ -224,13 +227,14 @@ impl Qwen35Weights {
         );
         let packed = if (packed_bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u32>())
         {
-            // The mmap outlives the weights (view_ref hands out 'static).
-            PackedView::Mmap(unsafe {
-                std::slice::from_raw_parts(
-                    packed_bytes.as_ptr() as *const u32,
-                    packed_bytes.len() / 4,
-                )
-            })
+            let shard = *self.index.get(&format!("{name}.weight")).expect("view_ref found it");
+            let map = self.shards[shard].map.clone();
+            let offset = packed_bytes.as_ptr() as usize - map.as_ptr() as usize;
+            PackedView::Mmap {
+                map,
+                offset,
+                words: packed_bytes.len() / 4,
+            }
         } else {
             PackedView::Owned(
                 packed_bytes
@@ -252,14 +256,21 @@ impl Qwen35Weights {
 /// Packed int4 weights: a u32 view over the mmap when aligned, an owned
 /// copy otherwise.
 pub enum PackedView {
-    Mmap(&'static [u32]),
+    /// The mapping is owned here; `as_slice` borrows from it.
+    Mmap {
+        map: Arc<Mmap>,
+        offset: usize,
+        words: usize,
+    },
     Owned(Vec<u32>),
 }
 
 impl PackedView {
     pub fn as_slice(&self) -> &[u32] {
         match self {
-            Self::Mmap(words) => words,
+            Self::Mmap { map, offset, words } => unsafe {
+                std::slice::from_raw_parts(map.as_ptr().add(*offset) as *const u32, *words)
+            },
             Self::Owned(words) => words,
         }
     }

@@ -586,13 +586,11 @@ impl StreamState {
         Ok(())
     }
 
-    /// Fill the ring ahead of the range's first layer.
+    /// Fill the ring's first slot ahead of the range's first layer; the
+    /// layer+1 fetch rides the compute-wait of `begin_layer`, so priming the
+    /// second layer here would be uploaded twice.
     fn prime(&mut self) -> Result<()> {
-        self.fetch(self.range.0)?;
-        if self.range.0 + 1 < self.range.1 {
-            self.fetch(self.range.0 + 1)?;
-        }
-        Ok(())
+        self.fetch(self.range.0)
     }
 
     /// The compute stream waits the layer's slot; layer+1 prefetches into
