@@ -8,13 +8,16 @@ fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=src/cuda_utils.cuh");
     println!("cargo::rerun-if-changed=src/binary_op_macros.cuh");
 
-    // Build for PTX
+    // Build for PTX at the fleet baseline: PTX cannot be lowered below its
+    // virtual architecture, so a newer-than-sm_80 emission would leave older
+    // fleet devices with neither cubin nor loadable fallback.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ptx_path = out_dir.join("ptx.rs");
     let is_target_msvc = matches!(env::var("TARGET"), Ok(t) if t.contains("msvc"));
     let mut ptx_builder = KernelBuilder::new()
         .source_dir("src") // Scan src/ for .cu files
         .exclude(&["moe_*.cu", "mmvq_gguf.cu", "mmq_*.cu"]) // Exclude statically compiled kernels from ptx build
+        .compute_cap_arch("80")
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
         .arg("-O3");

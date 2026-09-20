@@ -102,9 +102,10 @@ pub fn resolve_ptxas(nvcc: &std::ffi::OsStr) -> std::ffi::OsString {
 /// Which real architectures to translate the PTX to ahead of time.
 ///
 /// `FF_CUDA_ARCHS=80,89,120` names them explicitly. Absent that, the build
-/// emits the union of the fleet list and whatever the build host has, the way
-/// a `CMAKE_CUDA_ARCHITECTURES`-less build does. A device with no matching
-/// cubin takes the driver's own translation of the same PTX.
+/// emits the union of the fleet list, `CUDA_COMPUTE_CAP` (the documented
+/// GPU-less-build override, written 86 or 8.6), and whatever the build host
+/// has, the way a `CMAKE_CUDA_ARCHITECTURES`-less build does. A device with
+/// no matching cubin takes the driver's own translation of the same PTX.
 pub fn resolve_target_architectures() -> Vec<u32> {
     let requested = std::env::var_os(ARCHITECTURE_ENVIRONMENT_VARIABLE);
     let mut architectures = if let Some(requested) = requested {
@@ -124,6 +125,24 @@ pub fn resolve_target_architectures() -> Vec<u32> {
             .collect()
     } else {
         let mut detected = detect_local_architectures();
+        if let Some(cap) = std::env::var_os("CUDA_COMPUTE_CAP") {
+            let cap = cap.to_string_lossy().into_owned();
+            let parsed = if let Some((major, minor)) = cap.trim().split_once('.') {
+                (
+                    major.trim().parse::<u32>().ok(),
+                    minor.trim().parse::<u32>().ok(),
+                )
+            } else {
+                cap.trim()
+                    .parse::<u32>()
+                    .ok()
+                    .map(|plain| (plain / 10, plain % 10))
+                    .unzip()
+            };
+            if let (Some(major), Some(minor)) = parsed {
+                detected.push(major * 10 + minor);
+            }
+        }
         detected.extend_from_slice(&FLEET_ARCHITECTURES);
         detected
     };
@@ -223,15 +242,22 @@ pub fn assemble_cubin(
 ) -> bool {
     let input = out_dir.join(format!("{stem}.ptx"));
     let output_path = out_dir.join(format!("{stem}.sm_{architecture}.cubin"));
-    let Ok(output) = Command::new(ptxas)
+    let output = match Command::new(ptxas)
         .arg(format!("-arch=sm_{architecture}"))
         .arg("-O3")
         .arg(&input)
         .arg("-o")
         .arg(&output_path)
         .output()
-    else {
-        return false;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            println!(
+                "cargo:warning=failed to execute {ptxas:?} for {stem} sm_{architecture}; that \
+                 device will load the {PTX_ARCHITECTURE} PTX instead: {error}"
+            );
+            return false;
+        }
     };
     if !output.status.success() {
         println!(
@@ -304,6 +330,7 @@ pub fn run(specs: &[KernelSpec], source_root: &Path) -> Option<BuildReport> {
     }
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=PTXAS");
+    println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
     println!("cargo:rerun-if-env-changed={ARCHITECTURE_ENVIRONMENT_VARIABLE}");
 
     std::env::var_os("CARGO_FEATURE_CUDA")?;
