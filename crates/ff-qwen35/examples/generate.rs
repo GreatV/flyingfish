@@ -150,49 +150,81 @@ fn main() -> anyhow::Result<()> {
             let mut spec = ff_qwen35::spec::QwenSpec::new(&gpu, &weights)?;
             let mut generated: Vec<u32> = Vec::new();
             let (mut accepts, mut rejects) = (0usize, 0usize);
+            let gate: Option<f32> = std::env::var("QWEN35_SPEC_GATE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|t| *t > 0.0);
+            spec.margins_enabled = gate.is_some();
             let mut pending = gpu.read_token()?;
             spec.draft(&gpu, Some(&gpu.hidden), pending)?;
+            let mut have_draft = true;
             let started = Instant::now();
             let (mut t_verify, mut t_draft, mut t_rounds) = (0.0f64, 0.0f64, 0usize);
+            let mut skips = 0usize;
             while generated.len() < n {
                 // Stage the real token into the A-side input buffer.
                 gpu.ctx
                     .stream
                     .memcpy_htod(&[pending as i32], &mut gpu.next_token)?;
-                let tv = Instant::now();
-                let (a, b) = spec.verify_round(&mut gpu)?;
-                t_verify += tv.elapsed().as_secs_f64();
-                t_rounds += 1;
-                if a == spec.draft_id {
-                    accepts += 1;
-                    generated.push(pending);
-                    generated.push(spec.draft_id);
-                    gpu.ctx.glue_inc(&mut gpu.pos)?;
-                    gpu.ctx.glue_inc(&mut gpu.pos)?;
-                    gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
-                    gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
-                    gpu.position += 2;
-                    pending = b;
-                    let td = Instant::now();
-                    spec.draft(&gpu, None, b)?;
-                    t_draft += td.elapsed().as_secs_f64();
+                if have_draft {
+                    let tv = Instant::now();
+                    let (a, b) = spec.verify_round(&mut gpu)?;
+                    t_verify += tv.elapsed().as_secs_f64();
+                    t_rounds += 1;
+                    let accepted = a == spec.draft_id;
+                    if accepted {
+                        accepts += 1;
+                        generated.push(pending);
+                        generated.push(spec.draft_id);
+                        gpu.ctx.glue_inc(&mut gpu.pos)?;
+                        gpu.ctx.glue_inc(&mut gpu.pos)?;
+                        gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
+                        gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
+                        gpu.position += 2;
+                        pending = b;
+                        have_draft = gate.is_none_or(|t| spec.margin_b >= t);
+                    } else {
+                        rejects += 1;
+                        generated.push(pending);
+                        spec.reject_restore(&mut gpu)?;
+                        gpu.ctx.glue_inc(&mut gpu.pos)?;
+                        gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
+                        gpu.position += 1;
+                        pending = a;
+                        have_draft = gate.is_none_or(|t| spec.margin_a >= t);
+                    }
+                    if have_draft {
+                        let td = Instant::now();
+                        if accepted {
+                            spec.draft(&gpu, None, b)?;
+                        } else {
+                            spec.draft(&gpu, Some(&gpu.hidden), a)?;
+                        }
+                        t_draft += td.elapsed().as_secs_f64();
+                    } else {
+                        skips += 1;
+                    }
                 } else {
-                    rejects += 1;
+                    // The gate skipped the draft: a plain decode step,
+                    // bit-identical to the non-speculative path.
                     generated.push(pending);
-                    spec.reject_restore(&mut gpu)?;
-                    gpu.ctx.glue_inc(&mut gpu.pos)?;
-                    gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
-                    gpu.position += 1;
-                    pending = a;
-                    let td = Instant::now();
-                    spec.draft(&gpu, Some(&gpu.hidden), a)?;
-                    t_draft += td.elapsed().as_secs_f64();
+                    gpu.step()?;
+                    pending = gpu.read_token()?;
+                    let m = spec.step_margin(&gpu)?;
+                    have_draft = gate.is_none_or(|t| m >= t);
+                    if have_draft {
+                        let td = Instant::now();
+                        spec.draft(&gpu, Some(&gpu.hidden), pending)?;
+                        t_draft += td.elapsed().as_secs_f64();
+                    } else {
+                        skips += 1;
+                    }
                 }
             }
             let el = started.elapsed().as_secs_f64();
-            let total = accepts * 2 + rejects;
+            let total = accepts * 2 + rejects + skips;
             println!(
-                "spec decode: {total} tokens in {el:.2}s = {:.1} tok/s; accepts {accepts} rejects {rejects}",
+                "spec decode: {total} tokens in {el:.2}s = {:.1} tok/s; accepts {accepts} rejects {rejects} skips {skips}",
                 total as f64 / el
             );
             println!(

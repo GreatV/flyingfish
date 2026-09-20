@@ -67,6 +67,27 @@ pub struct QwenSpec {
     concat: cudarc::driver::safe::CudaFunction,
     /// Host mirror of the draft id written to `nt_draft`.
     pub draft_id: u32,
+    /// top1-top2 logit gaps of the last verify round's two columns.
+    pub margin_a: f32,
+    pub margin_b: f32,
+    /// Margins cost a logits dtoh per round; only paid when gating is on.
+    pub margins_enabled: bool,
+    logits_host_a: Vec<f32>,
+    logits_host_b: Vec<f32>,
+}
+
+/// top1 - top2 logit gap: the confidence signal for draft gating.
+pub fn margin(logits: &[f32]) -> f32 {
+    let (mut top, mut second) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for &v in logits {
+        if v > top {
+            second = top;
+            top = v;
+        } else if v > second {
+            second = v;
+        }
+    }
+    top - second
 }
 
 impl QwenSpec {
@@ -176,6 +197,11 @@ impl QwenSpec {
             mtp_tok: ctx.upload_i32(&[0])?,
             nt_draft: ctx.upload_i32(&[0])?,
             draft_id: 0,
+            margin_a: 0.0,
+            margin_b: 0.0,
+            margins_enabled: false,
+            logits_host_a: vec![0.0; gpu.proj.get("lm_head").context("lm_head")?.out_dim],
+            logits_host_b: vec![0.0; gpu.proj.get("lm_head").context("lm_head")?.out_dim],
             mtp_proj,
             mtp_pre_embed_w: ctx
                 .upload_f32(&weights.f32_named("mtp.pre_fc_norm_embedding.weight")?)?,
@@ -586,8 +612,32 @@ impl QwenSpec {
         let mut ids = [0i32, 0i32];
         gpu.ctx.stream.memcpy_dtoh(&self.out_a, &mut ids[..1])?;
         gpu.ctx.stream.memcpy_dtoh(&self.out_b, &mut ids[1..])?;
+        if self.margins_enabled {
+            gpu.ctx
+                .stream
+                .memcpy_dtoh(lm.y_ref(), &mut self.logits_host_a)?;
+            let y_b_lm = &self.y_b["lm_head"];
+            gpu.ctx
+                .stream
+                .memcpy_dtoh(y_b_lm, &mut self.logits_host_b)?;
+        }
         gpu.ctx.counted_sync()?;
+        if self.margins_enabled {
+            self.margin_a = margin(&self.logits_host_a);
+            self.margin_b = margin(&self.logits_host_b);
+        }
         Ok((ids[0] as u32, ids[1] as u32))
+    }
+
+    /// Margin of the last plain decode step's logits (lm.y_ref() after
+    /// `gpu.step()`): the gating signal for rounds without a staged draft.
+    pub fn step_margin(&mut self, gpu: &QwenGpu) -> Result<f32> {
+        let lm = gpu.proj.get("lm_head").context("lm_head resident")?;
+        gpu.ctx
+            .stream
+            .memcpy_dtoh(lm.y_ref(), &mut self.logits_host_a)?;
+        gpu.ctx.counted_sync()?;
+        Ok(margin(&self.logits_host_a))
     }
 
     /// GPU MTP draft: mtp.fc(cat([norm_embed(embed(tok)), norm_hidden(h)]))
