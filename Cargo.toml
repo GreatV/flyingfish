@@ -17,10 +17,12 @@ edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
 
-# Vendored CUDA fixes: pre-Ampere intrinsics on CUDA 12.6+ and MSVC preprocessing.
-# See third_party/candle-kernels/.
+# Vendored CUDA fixes: pre-Ampere intrinsics on CUDA 12.6+ and MSVC preprocessing,
+# plus the cubin image selection that lets kernels load on drivers whose PTX ISA
+# predates the build toolkit. See third_party/.
 [patch.crates-io]
 candle-kernels = { path = "third_party/candle-kernels" }
+candle-core = { path = "third_party/candle-core" }
 
 [workspace.dependencies]
 anyhow = "1.0"

@@ -215,7 +215,12 @@ fn stage_ptx(source_root: &Path, out_dir: &Path, spec: &KernelSpec) {
 /// Returns `false` when this toolkit cannot target the architecture, which is
 /// a reason to emit fewer cubins and not a reason to fail the build: the PTX
 /// remains loadable on that device through the driver.
-fn assemble_cubin(ptxas: &std::ffi::OsStr, out_dir: &Path, stem: &str, architecture: u32) -> bool {
+pub fn assemble_cubin(
+    ptxas: &std::ffi::OsStr,
+    out_dir: &Path,
+    stem: &str,
+    architecture: u32,
+) -> bool {
     let input = out_dir.join(format!("{stem}.ptx"));
     let output_path = out_dir.join(format!("{stem}.sm_{architecture}.cubin"));
     let Ok(output) = Command::new(ptxas)
