@@ -96,6 +96,10 @@ impl QwenSpec {
             gpu.peers.is_empty(),
             "speculative decode drives a single device"
         );
+        anyhow::ensure!(
+            !gpu.is_streaming(),
+            "speculative decode requires resident weights"
+        );
         let ctx = &gpu.ctx;
         let text = &gpu.config.text_config;
         let n = text.hidden_size;

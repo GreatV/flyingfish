@@ -188,4 +188,88 @@ impl Qwen35Weights {
             Ok(2 * weight.len() as u64)
         }
     }
+
+    /// (out_dim, in_dim) implied by the packed width and the scales.
+    pub fn projection_shape(&self, name: &str) -> Result<(usize, usize)> {
+        let (shape, _packed) = self.view_ref(&format!("{name}.weight"))?;
+        ensure!(shape.len() == 2, "{name}.weight is not 2-D: {shape:?}");
+        let out_dim = shape[0];
+        let (_s, scales) = self.view_ref(&format!("{name}.scales"))?;
+        let groups = scales.len() / 2 / out_dim.max(1);
+        Ok((out_dim, groups * GROUP_SIZE))
+    }
+
+    /// One projection kept on the host for slot upload: the packed
+    /// weights as a view when the mmap bytes are u32-aligned, plus the
+    /// scales and biases widened to f32 once.
+    pub fn host_projection(&self, name: &str) -> Result<HostProjection> {
+        let (shape, packed_bytes) = self.view_ref(&format!("{name}.weight"))?;
+        ensure!(shape.len() == 2, "{name}.weight is not 2-D: {shape:?}");
+        let out_dim = shape[0];
+        let (_s, scales) = self.view_ref(&format!("{name}.scales"))?;
+        let (_b, biases) = self.view_ref(&format!("{name}.biases"))?;
+        let scales = bf16_to_f32(scales);
+        let biases = bf16_to_f32(biases);
+        let groups = scales.len() / out_dim;
+        let in_dim = groups * GROUP_SIZE;
+        ensure!(
+            shape[1] * 8 == in_dim,
+            "{name}: weight width {} words implies in={} but scales imply {in_dim}",
+            shape[1],
+            shape[1] * 8
+        );
+        ensure!(
+            packed_bytes.len() % std::mem::size_of::<u32>() == 0,
+            "{name}.weight byte length is not a whole u32 count"
+        );
+        let packed = if (packed_bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u32>())
+        {
+            // The mmap outlives the weights (view_ref hands out 'static).
+            PackedView::Mmap(unsafe {
+                std::slice::from_raw_parts(
+                    packed_bytes.as_ptr() as *const u32,
+                    packed_bytes.len() / 4,
+                )
+            })
+        } else {
+            PackedView::Owned(
+                packed_bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            )
+        };
+        Ok(HostProjection {
+            packed,
+            scales,
+            biases,
+            out_dim,
+            in_dim,
+        })
+    }
+}
+
+/// Packed int4 weights: a u32 view over the mmap when aligned, an owned
+/// copy otherwise.
+pub enum PackedView {
+    Mmap(&'static [u32]),
+    Owned(Vec<u32>),
+}
+
+impl PackedView {
+    pub fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Mmap(words) => words,
+            Self::Owned(words) => words,
+        }
+    }
+}
+
+/// One projection's weights on the host, ready for slot upload.
+pub struct HostProjection {
+    pub packed: PackedView,
+    pub scales: Vec<f32>,
+    pub biases: Vec<f32>,
+    pub out_dim: usize,
+    pub in_dim: usize,
 }

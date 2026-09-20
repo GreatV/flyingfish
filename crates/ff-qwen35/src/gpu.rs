@@ -3,15 +3,19 @@
 //! values live in device buffers (position counter, next_token) so the
 //! step is graph-capturable later. Multiple ordinals partition the layer
 //! stack across devices; hidden and x1 hop between devices through host
-//! staging (one blocking copy per hop).
+//! staging (one blocking copy per hop). A device whose range exceeds free
+//! memory streams its int4 projections through a two-slot ring on a
+//! prefetch stream instead.
 
 use crate::config::{LayerKind, Qwen35Config, TEXT_PREFIX, TextConfig};
-use crate::weights::Qwen35Weights;
+use crate::weights::{HostProjection, Qwen35Weights};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::safe::CudaSlice;
-use ff_edge0::gpu::{GpuContext, GpuGdn, GpuQuant};
+use cudarc::driver::safe::{CudaEvent, CudaSlice, CudaStream};
+use ff_edge0::gpu::{GpuContext, GpuGdn, GpuQuant, GroupSeg};
+use ff_edge0::int4::GROUP_SIZE;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 type CudaSliceF = CudaSlice<f32>;
 type CudaSliceI = CudaSlice<i32>;
@@ -110,6 +114,142 @@ pub fn partition_layers(
     Ok(split_layers_by_bytes(&layer_bytes, parts))
 }
 
+/// Env var that skips the resident plan and forces the streaming path.
+pub const FORCE_STREAM_ENV: &str = "QWEN35_FORCE_STREAM";
+
+/// The int4 projections the streaming path re-uploads per layer, as
+/// layer-relative suffixes.
+fn streaming_names(kind: LayerKind) -> &'static [&'static str] {
+    match kind {
+        LayerKind::LinearAttention => &[
+            "linear_attn.in_proj_qkv",
+            "linear_attn.in_proj_z",
+            "linear_attn.in_proj_b",
+            "linear_attn.in_proj_a",
+            "linear_attn.out_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ],
+        LayerKind::FullAttention => &[
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ],
+    }
+}
+
+/// On-device bytes of one layer's streaming projections.
+fn streamed_layer_bytes(
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer: usize,
+) -> Result<u64> {
+    let prefix = format!("{TEXT_PREFIX}.layers.{layer}");
+    let mut total = 0u64;
+    for suffix in streaming_names(config.text_config.layer_kind(layer)) {
+        total += weights.tensor_device_bytes(&format!("{prefix}.{suffix}"))?;
+    }
+    Ok(total)
+}
+
+/// One streaming slot: every layer-kind projection name's buffers, sized
+/// to the name's shape (a slot serves any layer of either kind).
+fn slot_union_bytes(weights: &Qwen35Weights, config: &Qwen35Config) -> Result<u64> {
+    let text = &config.text_config;
+    let mut total = 0u64;
+    let mut seen: Vec<&str> = Vec::new();
+    for layer in 0..text.num_hidden_layers {
+        for &suffix in streaming_names(text.layer_kind(layer)) {
+            if seen.contains(&suffix) {
+                continue;
+            }
+            seen.push(suffix);
+            let name = format!("{TEXT_PREFIX}.layers.{layer}.{suffix}");
+            let (out_dim, _) = weights.projection_shape(&name)?;
+            total += weights.tensor_device_bytes(&name)? + 4 * out_dim as u64;
+        }
+    }
+    Ok(total)
+}
+
+/// How one device hosts its layer range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Residency {
+    Resident,
+    Streaming,
+    Insufficient,
+}
+
+/// One device's residency decision with the bytes behind it.
+#[derive(Clone, Copy, Debug)]
+pub struct DevicePlan {
+    pub residency: Residency,
+    pub resident_bytes: u64,
+    pub streaming_bytes: u64,
+    pub free: u64,
+}
+
+fn decide_residency(
+    resident_bytes: u64,
+    streaming_bytes: u64,
+    free: u64,
+    force_stream: bool,
+) -> Residency {
+    if !force_stream && resident_bytes <= free {
+        Residency::Resident
+    } else if streaming_bytes <= free {
+        Residency::Streaming
+    } else {
+        Residency::Insufficient
+    }
+}
+
+/// Resident/streaming/fail per device; `free` carries one entry per range.
+/// streaming_bytes = range_device_bytes - the streamed projection bytes +
+/// the two ring slots (+ device-0 statics in both plans).
+pub fn plan_residency(
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    ranges: &[(usize, usize)],
+    max_ctx: usize,
+    free: &[u64],
+) -> Result<Vec<DevicePlan>> {
+    ensure!(
+        ranges.len() == free.len(),
+        "{} ranges for {} free-memory values",
+        ranges.len(),
+        free.len()
+    );
+    let force_stream = std::env::var_os(FORCE_STREAM_ENV).is_some();
+    let slots = 2 * slot_union_bytes(weights, config)?;
+    let mut plans = Vec::with_capacity(ranges.len());
+    for (i, &(start, end)) in ranges.iter().enumerate() {
+        let mut resident = range_device_bytes(weights, config, start..end, max_ctx)?;
+        let mut streamed = 0u64;
+        for layer in start..end {
+            streamed += streamed_layer_bytes(weights, config, layer)?;
+        }
+        let mut streaming = resident - streamed + slots;
+        if i == 0 {
+            let statics = static_device_bytes(weights, config)?;
+            resident += statics;
+            streaming += statics;
+        }
+        plans.push(DevicePlan {
+            residency: decide_residency(resident, streaming, free[i], force_stream),
+            resident_bytes: resident,
+            streaming_bytes: streaming,
+            free: free[i],
+        });
+    }
+    Ok(plans)
+}
+
 /// Contiguous layer ranges, one per device, boundaries placed closest to
 /// each device's share of the total bytes.
 pub(crate) fn split_layers_by_bytes(layer_bytes: &[u64], parts: usize) -> Vec<(usize, usize)> {
@@ -149,38 +289,6 @@ fn upload_boundary(
     ctx.upload_f32(&weights.f32_named(&name)?)
 }
 
-fn preflight(
-    contexts: &[GpuContext],
-    ordinals: &[usize],
-    ranges: &[(usize, usize)],
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    max_ctx: usize,
-) -> Result<()> {
-    let mut report = String::new();
-    let mut fits = true;
-    for (i, ctx) in contexts.iter().enumerate() {
-        let (start, end) = ranges[i];
-        let mut required = range_device_bytes(weights, config, start..end, max_ctx)?;
-        if i == 0 {
-            required += static_device_bytes(weights, config)?;
-        }
-        let free = ctx.context.mem_get_info().context("mem_get_info")?.0;
-        if required > free as u64 {
-            fits = false;
-        }
-        report.push_str(&format!(
-            "device {}: layers {start}..{end} need {required} B, {free} B free\n",
-            ordinals[i]
-        ));
-    }
-    ensure!(
-        fits,
-        "device memory short of the partitioned plan:\n{report}pass more device ordinals to spread the layer stack"
-    );
-    Ok(())
-}
-
 struct LayerUploads {
     proj: HashMap<String, GpuQuant>,
     ln: Vec<[CudaSliceF; 2]>,
@@ -196,6 +304,7 @@ fn upload_stack(
     text: &TextConfig,
     layers: Range<usize>,
     max_ctx: usize,
+    resident_projections: bool,
 ) -> Result<LayerUploads> {
     let kv_stride = text.num_key_value_heads * text.head_dim;
     let conv_dim = text.conv_dim();
@@ -216,16 +325,18 @@ fn upload_stack(
         ]);
         match text.layer_kind(layer) {
             LayerKind::LinearAttention => {
-                for p in [
-                    "in_proj_qkv",
-                    "in_proj_z",
-                    "in_proj_b",
-                    "in_proj_a",
-                    "out_proj",
-                ] {
-                    let name = format!("{prefix}.linear_attn.{p}");
-                    let q = weights.quant_projection(&name)?;
-                    proj.insert(name, ctx.upload(&q, None)?);
+                if resident_projections {
+                    for p in [
+                        "in_proj_qkv",
+                        "in_proj_z",
+                        "in_proj_b",
+                        "in_proj_a",
+                        "out_proj",
+                    ] {
+                        let name = format!("{prefix}.linear_attn.{p}");
+                        let q = weights.quant_projection(&name)?;
+                        proj.insert(name, ctx.upload(&q, None)?);
+                    }
                 }
                 gdn.push(GpuGdn::upload(
                     ctx,
@@ -243,10 +354,12 @@ fn upload_stack(
                 )?);
             }
             LayerKind::FullAttention => {
-                for p in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-                    let name = format!("{prefix}.self_attn.{p}");
-                    let q = weights.quant_projection(&name)?;
-                    proj.insert(name, ctx.upload(&q, None)?);
+                if resident_projections {
+                    for p in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                        let name = format!("{prefix}.self_attn.{p}");
+                        let q = weights.quant_projection(&name)?;
+                        proj.insert(name, ctx.upload(&q, None)?);
+                    }
                 }
                 attn_norms.push([
                     ctx.upload_f32(
@@ -268,10 +381,12 @@ fn upload_stack(
                 );
             }
         }
-        for p in ["gate_proj", "up_proj", "down_proj"] {
-            let name = format!("{prefix}.mlp.{p}");
-            let q = weights.quant_projection(&name)?;
-            proj.insert(name, ctx.upload(&q, None)?);
+        if resident_projections {
+            for p in ["gate_proj", "up_proj", "down_proj"] {
+                let name = format!("{prefix}.mlp.{p}");
+                let q = weights.quant_projection(&name)?;
+                proj.insert(name, ctx.upload(&q, None)?);
+            }
         }
     }
     Ok(LayerUploads {
@@ -282,6 +397,168 @@ fn upload_stack(
         kv_keys,
         kv_values,
     })
+}
+
+/// One projection name's device buffers inside a streaming slot.
+struct SlotBuf {
+    packed: CudaSlice<u32>,
+    scales: CudaSlice<f32>,
+    biases: CudaSlice<f32>,
+    y: CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+}
+
+/// Per-device streaming state: a two-slot ring refilled on a prefetch
+/// stream, ordered against the compute stream by fill/free events. A
+/// layer's slot is its index parity, so consecutive tokens reuse the
+/// same two slots.
+pub(crate) struct StreamState {
+    prefetch: Arc<CudaStream>,
+    slots: [HashMap<String, SlotBuf>; 2],
+    filled: [CudaEvent; 2],
+    freed: [CudaEvent; 2],
+    host: Vec<HashMap<String, HostProjection>>,
+    range: (usize, usize),
+}
+
+impl StreamState {
+    fn slot_of(layer: usize) -> usize {
+        layer & 1
+    }
+
+    fn build(
+        ctx: &GpuContext,
+        weights: &Qwen35Weights,
+        text: &TextConfig,
+        range: (usize, usize),
+    ) -> Result<Self> {
+        let prefetch = ctx.context.new_stream().context("prefetch stream")?;
+        let mut host = Vec::with_capacity(range.1 - range.0);
+        let mut dims: HashMap<String, (usize, usize)> = HashMap::new();
+        for layer in range.0..range.1 {
+            let prefix = format!("{TEXT_PREFIX}.layers.{layer}");
+            let mut per_layer = HashMap::new();
+            for &suffix in streaming_names(text.layer_kind(layer)) {
+                let projection = weights.host_projection(&format!("{prefix}.{suffix}"))?;
+                let shape = (projection.out_dim, projection.in_dim);
+                match dims.get(suffix) {
+                    Some(seen) => ensure!(
+                        *seen == shape,
+                        "{prefix}.{suffix} shape {shape:?} differs from earlier layers"
+                    ),
+                    None => {
+                        dims.insert(suffix.to_string(), shape);
+                    }
+                }
+                per_layer.insert(suffix.to_string(), projection);
+            }
+            host.push(per_layer);
+        }
+        let mut slots = [HashMap::new(), HashMap::new()];
+        for (suffix, (out_dim, in_dim)) in &dims {
+            let words = out_dim * in_dim / 8;
+            let groups = out_dim * in_dim / GROUP_SIZE;
+            for map in slots.iter_mut() {
+                map.insert(
+                    suffix.clone(),
+                    SlotBuf {
+                        packed: ctx
+                            .stream
+                            .alloc_zeros::<u32>(words)
+                            .context("slot packed")?,
+                        scales: ctx
+                            .stream
+                            .alloc_zeros::<f32>(groups)
+                            .context("slot scales")?,
+                        biases: ctx
+                            .stream
+                            .alloc_zeros::<f32>(groups)
+                            .context("slot biases")?,
+                        y: ctx.stream.alloc_zeros::<f32>(*out_dim).context("slot y")?,
+                        out_dim: *out_dim,
+                        in_dim: *in_dim,
+                    },
+                );
+            }
+        }
+        let filled = [
+            ctx.context.new_event(None).context("fill event")?,
+            ctx.context.new_event(None).context("fill event")?,
+        ];
+        let freed = [
+            ctx.context.new_event(None).context("free event")?,
+            ctx.context.new_event(None).context("free event")?,
+        ];
+        for event in &freed {
+            event.record(&ctx.stream).context("initial free record")?;
+        }
+        ctx.stream.synchronize().context("slot alloc sync")?;
+        Ok(Self {
+            prefetch,
+            slots,
+            filled,
+            freed,
+            host,
+            range,
+        })
+    }
+
+    fn slot_buf(&self, layer: usize, suffix: &str) -> Result<&SlotBuf> {
+        self.slots[Self::slot_of(layer)]
+            .get(suffix)
+            .with_context(|| format!("{suffix} missing from slot"))
+    }
+
+    /// Queue one layer's projections into its slot on the prefetch
+    /// stream; the slot's previous reader frees it first.
+    fn fetch(&mut self, layer: usize) -> Result<()> {
+        let slot = Self::slot_of(layer);
+        self.prefetch
+            .wait(&self.freed[slot])
+            .context("prefetch wait")?;
+        let entries = &self.host[layer - self.range.0];
+        let bufs = &mut self.slots[slot];
+        for (suffix, projection) in entries {
+            let buf = bufs
+                .get_mut(suffix)
+                .with_context(|| format!("{suffix} slot missing"))?;
+            self.prefetch
+                .memcpy_htod(projection.packed.as_slice(), &mut buf.packed)?;
+            self.prefetch
+                .memcpy_htod(&projection.scales, &mut buf.scales)?;
+            self.prefetch
+                .memcpy_htod(&projection.biases, &mut buf.biases)?;
+        }
+        self.filled[slot].record(&self.prefetch)?;
+        Ok(())
+    }
+
+    /// Fill the ring ahead of the range's first layer.
+    fn prime(&mut self) -> Result<()> {
+        self.fetch(self.range.0)?;
+        if self.range.0 + 1 < self.range.1 {
+            self.fetch(self.range.0 + 1)?;
+        }
+        Ok(())
+    }
+
+    /// The compute stream waits the layer's slot; layer+1 prefetches into
+    /// the slot the previous layer freed.
+    fn begin_layer(&mut self, ctx: &GpuContext, layer: usize) -> Result<()> {
+        ctx.stream.wait(&self.filled[Self::slot_of(layer)])?;
+        if layer + 1 < self.range.1 {
+            self.fetch(layer + 1)?;
+        }
+        Ok(())
+    }
+
+    /// The slot is reusable once the layer's last projection reader — the
+    /// closing residual norm — is enqueued.
+    fn end_layer(&mut self, ctx: &GpuContext, layer: usize) -> Result<()> {
+        self.freed[Self::slot_of(layer)].record(&ctx.stream)?;
+        Ok(())
+    }
 }
 
 pub(crate) struct PeerGpu {
@@ -304,6 +581,7 @@ pub(crate) struct PeerGpu {
     pos: CudaSliceI,
     rope_pos: CudaSliceI,
     boundary_norm: CudaSliceF,
+    streaming: Option<StreamState>,
 }
 
 pub struct QwenGpu {
@@ -355,6 +633,8 @@ pub struct QwenGpu {
     pub(crate) ranges: Vec<(usize, usize)>,
     /// Host buffer for the hidden/x1 device hops.
     staging: Vec<f32>,
+    /// dev0's streaming weights; None runs its range resident.
+    pub(crate) streaming: Option<StreamState>,
 }
 
 impl QwenGpu {
@@ -379,14 +659,55 @@ impl QwenGpu {
             .iter()
             .map(|&ordinal| GpuContext::new(ordinal))
             .collect::<Result<_>>()?;
-        preflight(&contexts, ordinals, &ranges, weights, config, max_ctx)?;
+        let free: Vec<u64> = contexts
+            .iter()
+            .map(|ctx| Ok(ctx.context.mem_get_info().context("mem_get_info")?.0 as u64))
+            .collect::<Result<_>>()?;
+        let plans = plan_residency(weights, config, &ranges, max_ctx, &free)?;
+        let mut shortage = String::new();
+        for (i, plan) in plans.iter().enumerate() {
+            if plan.residency == Residency::Insufficient {
+                shortage.push_str(&format!(
+                    "device {}: layers {}..{} resident {} B / streaming {} B, {} B free\n",
+                    ordinals[i],
+                    ranges[i].0,
+                    ranges[i].1,
+                    plan.resident_bytes,
+                    plan.streaming_bytes,
+                    plan.free
+                ));
+            }
+        }
+        ensure!(
+            shortage.is_empty(),
+            "device memory short of resident and streaming plans:\n{shortage}pass more device ordinals or free device memory"
+        );
+        for (i, plan) in plans.iter().enumerate() {
+            if plan.residency == Residency::Streaming {
+                eprintln!(
+                    "qwen35: device {} streams layers {}..{} (resident needs {} B, {} B free)",
+                    ordinals[i], ranges[i].0, ranges[i].1, plan.resident_bytes, plan.free
+                );
+            }
+        }
         let text = &config.text_config;
         let mut contexts = contexts.into_iter();
         let ctx = contexts.next().expect("ordinals checked non-empty");
         let wide = crate::wide::WideKernels::load(&ctx)?;
         let hidden_size = text.hidden_size;
 
-        let mut stack = upload_stack(&ctx, weights, text, ranges[0].0..ranges[0].1, max_ctx)?;
+        let resident0 = plans[0].residency == Residency::Resident;
+        let mut stack = upload_stack(
+            &ctx,
+            weights,
+            text,
+            ranges[0].0..ranges[0].1,
+            max_ctx,
+            resident0,
+        )?;
+        let streaming = (plans[0].residency == Residency::Streaming)
+            .then(|| StreamState::build(&ctx, weights, text, ranges[0]))
+            .transpose()?;
         let embed = weights.quant_projection(&format!("{TEXT_PREFIX}.embed_tokens"))?;
         let embed = ctx.upload(&embed, None)?;
         let lm = weights.quant_projection("lm_head")?;
@@ -408,13 +729,18 @@ impl QwenGpu {
         }
         for (i, pctx) in contexts.enumerate() {
             let pwide = crate::wide::WideKernels::load(&pctx)?;
+            let resident = plans[i + 1].residency == Residency::Resident;
             let pstack = upload_stack(
                 &pctx,
                 weights,
                 text,
                 ranges[i + 1].0..ranges[i + 1].1,
                 max_ctx,
+                resident,
             )?;
+            let pstreaming = (plans[i + 1].residency == Residency::Streaming)
+                .then(|| StreamState::build(&pctx, weights, text, ranges[i + 1]))
+                .transpose()?;
             let boundary_norm = if i + 2 < ranges.len() {
                 upload_boundary(&pctx, weights, ranges[i + 2].0)?
             } else {
@@ -453,6 +779,7 @@ impl QwenGpu {
                 pos: pctx.upload_i32(&[0])?,
                 rope_pos: pctx.upload_i32(&[0, 0, 0])?,
                 boundary_norm,
+                streaming: pstreaming,
                 ctx: pctx,
                 wide: pwide,
                 proj: pstack.proj,
@@ -501,12 +828,18 @@ impl QwenGpu {
             boundary_norms,
             ranges,
             staging: vec![0f32; 2 * hidden_size],
+            streaming,
         })
     }
 
     /// The layer range each device ordinal hosts.
     pub fn layer_ranges(&self) -> &[(usize, usize)] {
         &self.ranges
+    }
+
+    /// True when any device streams its layer range.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming.is_some() || self.peers.iter().any(|peer| peer.streaming.is_some())
     }
 
     fn get(&self, name: &str) -> Result<&GpuQuant> {
@@ -529,8 +862,12 @@ impl QwenGpu {
         );
         // QWEN35_GRAPH=1: capture the step once, replay after. pos and
         // next_token are device-read, so the step needs no host input.
-        // Host staging in the multi-device path cannot be captured.
-        if self.peers.is_empty() && std::env::var_os("QWEN35_GRAPH").is_some() {
+        // Host staging in the multi-device path and the prefetch stream of
+        // the streaming path cannot be captured.
+        if self.streaming.is_none()
+            && self.peers.is_empty()
+            && std::env::var_os("QWEN35_GRAPH").is_some()
+        {
             if let Some(g) = &self.decode_graph {
                 g.0.launch().context("decode graph replay")?;
                 self.position += 1;
@@ -595,7 +932,7 @@ impl QwenGpu {
         self.ctx
             .glue_rmsnorm_zc(&self.hidden, &self.ln[0][0], &self.x1, n, eps)?;
         run_stack(
-            &StackView {
+            &mut StackView {
                 ctx: &self.ctx,
                 wide: &self.wide,
                 proj: &self.proj,
@@ -615,6 +952,7 @@ impl QwenGpu {
                 hidden: &self.hidden,
                 x1: &self.x1,
                 boundary_norm: self.boundary_norms.first().unwrap_or(&self.final_norm_w),
+                stream: self.streaming.as_mut(),
             },
             self.ranges[0].0..self.ranges[0].1,
             &text,
@@ -636,6 +974,7 @@ impl QwenGpu {
                     .stream
                     .memcpy_dtoh(&prev.x1, &mut self.staging[n..])?;
             }
+            let (start, end) = self.ranges[i + 1];
             {
                 let peer = &mut self.peers[i];
                 peer.ctx
@@ -644,34 +983,33 @@ impl QwenGpu {
                 peer.ctx
                     .stream
                     .memcpy_htod(&self.staging[n..], &mut peer.x1)?;
+                run_stack(
+                    &mut StackView {
+                        ctx: &peer.ctx,
+                        wide: &peer.wide,
+                        proj: &peer.proj,
+                        ln: &peer.ln,
+                        attn_norms: &peer.attn_norms,
+                        gdn: &peer.gdn,
+                        kv_keys: &peer.kv_keys,
+                        kv_values: &peer.kv_values,
+                        q_out: &peer.q_out,
+                        gate_out: &peer.gate_out,
+                        attn_out: &peer.attn_out,
+                        inner: &peer.inner,
+                        scr_gu: &peer.scr_gu,
+                        scr_down: &peer.scr_down,
+                        pos: &peer.pos,
+                        rope_pos: &peer.rope_pos,
+                        hidden: &peer.hidden,
+                        x1: &peer.x1,
+                        boundary_norm: &peer.boundary_norm,
+                        stream: peer.streaming.as_mut(),
+                    },
+                    start..end,
+                    &text,
+                )?;
             }
-            let (start, end) = self.ranges[i + 1];
-            let peer = &self.peers[i];
-            run_stack(
-                &StackView {
-                    ctx: &peer.ctx,
-                    wide: &peer.wide,
-                    proj: &peer.proj,
-                    ln: &peer.ln,
-                    attn_norms: &peer.attn_norms,
-                    gdn: &peer.gdn,
-                    kv_keys: &peer.kv_keys,
-                    kv_values: &peer.kv_values,
-                    q_out: &peer.q_out,
-                    gate_out: &peer.gate_out,
-                    attn_out: &peer.attn_out,
-                    inner: &peer.inner,
-                    scr_gu: &peer.scr_gu,
-                    scr_down: &peer.scr_down,
-                    pos: &peer.pos,
-                    rope_pos: &peer.rope_pos,
-                    hidden: &peer.hidden,
-                    x1: &peer.x1,
-                    boundary_norm: &peer.boundary_norm,
-                },
-                start..end,
-                &text,
-            )?;
         }
         if let Some(last) = self.peers.last() {
             last.ctx
@@ -783,33 +1121,122 @@ struct StackView<'a> {
     hidden: &'a CudaSliceF,
     x1: &'a CudaSliceF,
     boundary_norm: &'a CudaSliceF,
+    /// Streaming weights for this range; None runs fully resident.
+    stream: Option<&'a mut StreamState>,
 }
 
-fn stack_get<'a>(proj: &'a HashMap<String, GpuQuant>, name: &str) -> Result<&'a GpuQuant> {
-    proj.get(name)
-        .with_context(|| format!("{name} not resident"))
+/// A projection either resident (GpuQuant) or in this layer's slot.
+enum ProjHandle<'a> {
+    Resident(&'a GpuQuant),
+    Slot(&'a SlotBuf),
+}
+
+impl ProjHandle<'_> {
+    fn y_ref(&self) -> &CudaSlice<f32> {
+        match self {
+            Self::Resident(q) => q.y_ref(),
+            Self::Slot(b) => &b.y,
+        }
+    }
+
+    fn tensors(&self) -> (&CudaSlice<u32>, &CudaSlice<f32>, &CudaSlice<f32>) {
+        match self {
+            Self::Resident(q) => q.tensors(),
+            Self::Slot(b) => (&b.packed, &b.scales, &b.biases),
+        }
+    }
+
+    fn group_seg(&self) -> GroupSeg<'_> {
+        match self {
+            Self::Resident(q) => q.group_seg(),
+            Self::Slot(b) => GroupSeg {
+                packed: &b.packed,
+                scales: &b.scales,
+                biases: &b.biases,
+                y: &b.y,
+                rows: b.out_dim,
+                lora: None,
+            },
+        }
+    }
+
+    /// A zero-row segment reusing the projection's pointers.
+    fn empty_seg_like(&self) -> GroupSeg<'_> {
+        match self {
+            Self::Resident(q) => q.empty_seg_like(),
+            Self::Slot(b) => GroupSeg {
+                packed: &b.packed,
+                scales: &b.scales,
+                biases: &b.biases,
+                y: &b.y,
+                rows: 0,
+                lora: None,
+            },
+        }
+    }
+
+    fn out_dim(&self) -> usize {
+        match self {
+            Self::Resident(q) => q.out_dim,
+            Self::Slot(b) => b.out_dim,
+        }
+    }
+
+    fn in_dim(&self) -> usize {
+        match self {
+            Self::Resident(q) => q.in_dim,
+            Self::Slot(b) => b.in_dim,
+        }
+    }
+}
+
+fn layer_proj<'a>(
+    view: &'a StackView,
+    stream: Option<&'a StreamState>,
+    layer: usize,
+    suffix: &str,
+) -> Result<ProjHandle<'a>> {
+    match stream {
+        Some(state) => Ok(ProjHandle::Slot(state.slot_buf(layer, suffix)?)),
+        None => {
+            let name = format!("{TEXT_PREFIX}.layers.{layer}.{suffix}");
+            view.proj
+                .get(&name)
+                .map(ProjHandle::Resident)
+                .with_context(|| format!("{name} not resident"))
+        }
+    }
 }
 
 /// Attention + MLP for one device's contiguous layer range. `x1` enters
 /// normed for the range's first layer and leaves normed by the range's
-/// boundary norm; `hidden` carries the residual across.
-fn run_stack(view: &StackView, layers: Range<usize>, text: &TextConfig) -> Result<()> {
+/// boundary norm; `hidden` carries the residual across. A streaming view
+/// waits each layer's slot fill, refills the ring one layer ahead, and
+/// frees the slot once the layer's last projection reader is enqueued.
+fn run_stack(view: &mut StackView, layers: Range<usize>, text: &TextConfig) -> Result<()> {
     let eps = text.rms_norm_eps as f32;
     let n = text.hidden_size;
     let mut gdn_index = 0usize;
     let mut kv_index = 0usize;
     let start = layers.start;
     let end = layers.end;
+    let mut stream = view.stream.take();
+    if let Some(state) = stream.as_mut() {
+        state.prime()?;
+    }
     for layer in layers {
-        let prefix = format!("{TEXT_PREFIX}.layers.{layer}");
         let local = layer - start;
+        if let Some(state) = stream.as_mut() {
+            state.begin_layer(view.ctx, layer)?;
+        }
         // x1 enters holding rmsnorm_zc(hidden, ln_in).
         if text.layer_kind(layer) == LayerKind::LinearAttention {
-            let qkv = stack_get(view.proj, &format!("{prefix}.linear_attn.in_proj_qkv"))?;
-            let z = stack_get(view.proj, &format!("{prefix}.linear_attn.in_proj_z"))?;
-            let b = stack_get(view.proj, &format!("{prefix}.linear_attn.in_proj_b"))?;
-            let a = stack_get(view.proj, &format!("{prefix}.linear_attn.in_proj_a"))?;
-            let out_proj = stack_get(view.proj, &format!("{prefix}.linear_attn.out_proj"))?;
+            let projs = stream.as_deref();
+            let qkv = layer_proj(view, projs, layer, "linear_attn.in_proj_qkv")?;
+            let z = layer_proj(view, projs, layer, "linear_attn.in_proj_z")?;
+            let b = layer_proj(view, projs, layer, "linear_attn.in_proj_b")?;
+            let a = layer_proj(view, projs, layer, "linear_attn.in_proj_a")?;
+            let out_proj = layer_proj(view, projs, layer, "linear_attn.out_proj")?;
             let segs = [qkv.group_seg(), z.group_seg(), b.group_seg(), a.group_seg()];
             view.wide.group(
                 view.ctx,
@@ -817,7 +1244,7 @@ fn run_stack(view: &StackView, layers: Range<usize>, text: &TextConfig) -> Resul
                 [qkv.y_ref(), z.y_ref(), b.y_ref(), a.y_ref()],
                 view.x1,
                 view.x1,
-                qkv.in_dim,
+                qkv.in_dim(),
                 1,
             )?;
             let g = &view.gdn[gdn_index];
@@ -836,7 +1263,7 @@ fn run_stack(view: &StackView, layers: Range<usize>, text: &TextConfig) -> Resul
                 [out_proj.y_ref(); 4],
                 gout,
                 gout,
-                out_proj.in_dim,
+                out_proj.in_dim(),
                 1,
             )?;
             view.ctx.glue_add_rmsnorm_zc(
@@ -849,10 +1276,11 @@ fn run_stack(view: &StackView, layers: Range<usize>, text: &TextConfig) -> Resul
             )?;
             gdn_index += 1;
         } else {
-            let q = stack_get(view.proj, &format!("{prefix}.self_attn.q_proj"))?;
-            let k = stack_get(view.proj, &format!("{prefix}.self_attn.k_proj"))?;
-            let v = stack_get(view.proj, &format!("{prefix}.self_attn.v_proj"))?;
-            let o = stack_get(view.proj, &format!("{prefix}.self_attn.o_proj"))?;
+            let projs = stream.as_deref();
+            let q = layer_proj(view, projs, layer, "self_attn.q_proj")?;
+            let k = layer_proj(view, projs, layer, "self_attn.k_proj")?;
+            let v = layer_proj(view, projs, layer, "self_attn.v_proj")?;
+            let o = layer_proj(view, projs, layer, "self_attn.o_proj")?;
             let segs = [
                 q.group_seg(),
                 k.group_seg(),
@@ -865,7 +1293,7 @@ fn run_stack(view: &StackView, layers: Range<usize>, text: &TextConfig) -> Resul
                 [q.y_ref(), k.y_ref(), v.y_ref(), q.y_ref()],
                 view.x1,
                 view.x1,
-                q.in_dim,
+                q.in_dim(),
                 1,
             )?;
             let [qn, kn] = &view.attn_norms[kv_index];
@@ -917,7 +1345,7 @@ fn run_stack(view: &StackView, layers: Range<usize>, text: &TextConfig) -> Resul
                 [o.y_ref(); 4],
                 view.attn_out,
                 view.attn_out,
-                o.in_dim,
+                o.in_dim(),
                 1,
             )?;
             view.ctx.glue_add_rmsnorm_zc(
@@ -932,9 +1360,10 @@ fn run_stack(view: &StackView, layers: Range<usize>, text: &TextConfig) -> Resul
         }
         // Dense MLP on x1, then the fused residual + next-layer's norm
         // (the boundary norm after the range's last layer).
-        let gate = stack_get(view.proj, &format!("{prefix}.mlp.gate_proj"))?;
-        let up = stack_get(view.proj, &format!("{prefix}.mlp.up_proj"))?;
-        let down = stack_get(view.proj, &format!("{prefix}.mlp.down_proj"))?;
+        let projs = stream.as_deref();
+        let gate = layer_proj(view, projs, layer, "mlp.gate_proj")?;
+        let up = layer_proj(view, projs, layer, "mlp.up_proj")?;
+        let down = layer_proj(view, projs, layer, "mlp.down_proj")?;
         let (gp, gs, gb) = gate.tensors();
         let (up_, us, ub) = up.tensors();
         view.wide.down(
@@ -948,8 +1377,8 @@ fn run_stack(view: &StackView, layers: Range<usize>, text: &TextConfig) -> Resul
             gate.y_ref(),
             view.scr_gu,
             view.scr_gu,
-            gate.out_dim,
-            gate.in_dim,
+            gate.out_dim(),
+            gate.in_dim(),
             1,
             1,
         )?;
@@ -964,8 +1393,8 @@ fn run_stack(view: &StackView, layers: Range<usize>, text: &TextConfig) -> Resul
             up.y_ref(),
             view.scr_gu,
             view.scr_gu,
-            up.out_dim,
-            up.in_dim,
+            up.out_dim(),
+            up.in_dim(),
             1,
             1,
         )?;
@@ -983,8 +1412,8 @@ fn run_stack(view: &StackView, layers: Range<usize>, text: &TextConfig) -> Resul
             down.y_ref(),
             view.scr_down,
             view.scr_down,
-            down.out_dim,
-            down.in_dim,
+            down.out_dim(),
+            down.in_dim(),
             4,
             1,
         )?;
@@ -995,13 +1424,41 @@ fn run_stack(view: &StackView, layers: Range<usize>, text: &TextConfig) -> Resul
         };
         view.ctx
             .glue_add_rmsnorm_zc(view.hidden, down.y_ref(), next_w, view.x1, n, eps)?;
+        if let Some(state) = stream.as_mut() {
+            state.end_layer(view.ctx, layer)?;
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{layer_device_bytes, split_layers_by_bytes};
+    use super::{
+        Residency, StreamState, decide_residency, layer_device_bytes, plan_residency,
+        split_layers_by_bytes,
+    };
+
+    #[test]
+    fn residency_picks_the_cheapest_fitting_plan() {
+        use Residency::{Insufficient, Resident, Streaming};
+        assert_eq!(decide_residency(100, 40, 200, false), Resident);
+        assert_eq!(decide_residency(100, 40, 100, false), Resident);
+        assert_eq!(decide_residency(100, 40, 99, false), Streaming);
+        assert_eq!(decide_residency(100, 40, 40, false), Streaming);
+        assert_eq!(decide_residency(100, 40, 39, false), Insufficient);
+        assert_eq!(decide_residency(100, 40, 200, true), Streaming);
+        assert_eq!(decide_residency(100, 40, 40, true), Streaming);
+        assert_eq!(decide_residency(100, 40, 39, true), Insufficient);
+    }
+
+    #[test]
+    fn slot_ring_alternates_and_wraps_across_tokens() {
+        for layer in 0..128usize {
+            assert_eq!(StreamState::slot_of(layer), layer % 2);
+        }
+        assert_eq!(StreamState::slot_of(62), 0);
+        assert_eq!(StreamState::slot_of(63), 1);
+    }
 
     #[test]
     fn split_covers_all_layers_contiguously() {
@@ -1068,5 +1525,27 @@ mod tests {
                 assert!(bytes[start..end].iter().sum::<u64>() <= ideal + widest);
             }
         }
+    }
+
+    #[test]
+    fn plan_residency_falls_back_to_streaming_on_real_bytes() {
+        let dir = std::path::Path::new("../../models/Qwen/Qwen3.8-27B-int4");
+        if !dir.exists() {
+            return;
+        }
+        let weights = crate::weights::Qwen35Weights::open(dir).unwrap();
+        let config = crate::config::Qwen35Config::from_model_dir(dir).unwrap();
+        let ranges = super::partition_layers(&weights, &config, 1).unwrap();
+        let plans = plan_residency(&weights, &config, &ranges, 4096, &[u64::MAX]).unwrap();
+        assert_eq!(plans[0].residency, Residency::Resident);
+        assert!(plans[0].streaming_bytes < plans[0].resident_bytes);
+        let resident = plans[0].resident_bytes;
+        let streaming = plans[0].streaming_bytes;
+        let plans = plan_residency(&weights, &config, &ranges, 4096, &[streaming]).unwrap();
+        assert_eq!(plans[0].residency, Residency::Streaming);
+        let plans = plan_residency(&weights, &config, &ranges, 4096, &[streaming - 1]).unwrap();
+        assert_eq!(plans[0].residency, Residency::Insufficient);
+        let plans = plan_residency(&weights, &config, &ranges, 4096, &[resident - 1]).unwrap();
+        assert_eq!(plans[0].residency, Residency::Streaming);
     }
 }

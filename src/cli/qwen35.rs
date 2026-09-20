@@ -84,7 +84,7 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
                     true => TextDevice::Cuda(ordinals),
                     false if auto => {
                         eprintln!(
-                            "auto: checkpoint and KV cache exceed free VRAM; falling back to CPU"
+                            "auto: resident and streaming plans exceed free VRAM; falling back to CPU"
                         );
                         TextDevice::Cpu
                     }
@@ -95,7 +95,7 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
                             .collect::<Vec<_>>()
                             .join(",");
                         bail!(
-                            "checkpoint and KV cache exceed free VRAM on cuda:{list}; \
+                            "resident and streaming plans exceed free VRAM on cuda:{list}; \
                              pass another --device (cuda:N with more memory, or cpu)"
                         )
                     }
@@ -176,9 +176,10 @@ fn run_vision_tower(
     tower.forward(&patches, grid)
 }
 
-/// The CUDA path uploads every projection; the weights dominate device
-/// memory. Multi-device fits only when every device in the list has free
-/// bytes ≥ its share of the same byte-balanced partition the runtime builds.
+/// The runtime's own residency decision: a device whose range fits stays
+/// resident, one that cannot fit falls back to streaming, and only a
+/// device that can host neither (statics, slots, KV, scratch) rejects
+/// the request.
 #[cfg(feature = "cuda")]
 fn checkpoint_fits_free_vram(
     ordinals: &[usize],
@@ -198,21 +199,18 @@ fn checkpoint_fits_free_vram(
     let weights = Qwen35Weights::open(model_dir)
         .with_context(|| format!("open weights for {}", model_dir.display()))?;
     let ranges = flyingfish::qwen35::gpu::partition_layers(&weights, config, ordinals.len())?;
-    for (index, (start, end)) in ranges.iter().enumerate() {
-        let mut bytes =
-            flyingfish::qwen35::gpu::range_device_bytes(&weights, config, *start..*end, max_ctx)?;
-        if index == 0 {
-            bytes += flyingfish::qwen35::gpu::static_device_bytes(&weights, config)?;
-        }
-        let ordinal = ordinals[index];
-        let context = cudarc::driver::CudaContext::new(ordinal)
-            .with_context(|| format!("open CUDA device {ordinal}"))?;
-        let (free, _) = context.mem_get_info().context("mem_get_info")?;
-        if bytes > free as u64 {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    let free: Vec<u64> = ordinals
+        .iter()
+        .map(|&ordinal| {
+            let context = cudarc::driver::CudaContext::new(ordinal)
+                .with_context(|| format!("open CUDA device {ordinal}"))?;
+            Ok(context.mem_get_info().context("mem_get_info")?.0 as u64)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let plans = flyingfish::qwen35::gpu::plan_residency(&weights, config, &ranges, max_ctx, &free)?;
+    Ok(plans
+        .iter()
+        .all(|plan| plan.residency != flyingfish::qwen35::gpu::Residency::Insufficient))
 }
 
 #[cfg(not(feature = "cuda"))]
