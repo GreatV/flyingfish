@@ -176,10 +176,9 @@ fn run_vision_tower(
     tower.forward(&patches, grid)
 }
 
-/// The runtime's own residency decision: a device whose range fits stays
-/// resident, one that cannot fit falls back to streaming, and only a
-/// device that can host neither (statics, slots, KV, scratch) rejects
-/// the request.
+/// The runtime's own residency decision: a device keeps a resident prefix
+/// of its layers and streams the rest; only a device that cannot host the
+/// always-resident set (statics, slots, KV, scratch) rejects the request.
 #[cfg(feature = "cuda")]
 fn checkpoint_fits_free_vram(
     ordinals: &[usize],

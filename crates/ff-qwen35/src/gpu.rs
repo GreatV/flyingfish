@@ -31,29 +31,18 @@ pub fn layer_device_bytes(
     let prefix = format!("{TEXT_PREFIX}.layers.{layer}");
     let mut total = weights.tensor_device_bytes(&format!("{prefix}.input_layernorm"))?
         + weights.tensor_device_bytes(&format!("{prefix}.post_attention_layernorm"))?;
+    total += streamed_layer_bytes(weights, config, layer)?;
     match text.layer_kind(layer) {
         LayerKind::LinearAttention => {
-            for p in [
-                "in_proj_qkv",
-                "in_proj_z",
-                "in_proj_b",
-                "in_proj_a",
-                "out_proj",
-            ] {
-                total += weights.tensor_device_bytes(&format!("{prefix}.linear_attn.{p}"))?;
-            }
             for p in ["conv1d", "A_log", "dt_bias", "norm"] {
                 total += weights.tensor_device_bytes(&format!("{prefix}.linear_attn.{p}"))?;
             }
         }
         LayerKind::FullAttention => {
-            for p in ["q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"] {
+            for p in ["q_norm", "k_norm"] {
                 total += weights.tensor_device_bytes(&format!("{prefix}.self_attn.{p}"))?;
             }
         }
-    }
-    for p in ["gate_proj", "up_proj", "down_proj"] {
-        total += weights.tensor_device_bytes(&format!("{prefix}.mlp.{p}"))?;
     }
     Ok(total)
 }
@@ -114,8 +103,30 @@ pub fn partition_layers(
     Ok(split_layers_by_bytes(&layer_bytes, parts))
 }
 
-/// Env var that skips the resident plan and forces the streaming path.
+/// Env var that drops the resident prefix and streams every layer.
 pub const FORCE_STREAM_ENV: &str = "QWEN35_FORCE_STREAM";
+
+/// Env var that replaces every device's free-memory reading with the
+/// given MiB count inside the residency plan.
+pub const FREE_OVERRIDE_MIB_ENV: &str = "QWEN35_FREE_OVERRIDE_MIB";
+
+fn free_override_mib() -> Result<Option<u64>> {
+    let Some(value) = std::env::var(FREE_OVERRIDE_MIB_ENV).ok() else {
+        return Ok(None);
+    };
+    let mib = value
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("{FREE_OVERRIDE_MIB_ENV}: {value:?} is not a MiB count"))?;
+    Ok(Some(mib * 1024 * 1024))
+}
+
+fn override_free(free: &[u64], override_bytes: Option<u64>) -> Vec<u64> {
+    match override_bytes {
+        Some(bytes) => vec![bytes; free.len()],
+        None => free.to_vec(),
+    }
+}
 
 /// The int4 projections the streaming path re-uploads per layer, as
 /// layer-relative suffixes.
@@ -143,7 +154,7 @@ fn streaming_names(kind: LayerKind) -> &'static [&'static str] {
     }
 }
 
-/// On-device bytes of one layer's streaming projections.
+/// On-device bytes of one layer's streaming projections, y buffers included.
 fn streamed_layer_bytes(
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -152,7 +163,9 @@ fn streamed_layer_bytes(
     let prefix = format!("{TEXT_PREFIX}.layers.{layer}");
     let mut total = 0u64;
     for suffix in streaming_names(config.text_config.layer_kind(layer)) {
-        total += weights.tensor_device_bytes(&format!("{prefix}.{suffix}"))?;
+        let name = format!("{prefix}.{suffix}");
+        let (out_dim, _) = weights.projection_shape(&name)?;
+        total += weights.tensor_device_bytes(&name)? + 4 * out_dim as u64;
     }
     Ok(total)
 }
@@ -189,29 +202,42 @@ pub enum Residency {
 #[derive(Clone, Copy, Debug)]
 pub struct DevicePlan {
     pub residency: Residency,
+    /// Layers below this layer number (global numbering) stay resident;
+    /// the range's suffix above it streams through the slot ring.
+    pub resident_through: usize,
     pub resident_bytes: u64,
+    /// The chosen plan's footprint (full residency when Resident).
     pub streaming_bytes: u64,
     pub free: u64,
 }
 
-fn decide_residency(
-    resident_bytes: u64,
-    streaming_bytes: u64,
-    free: u64,
-    force_stream: bool,
-) -> Residency {
-    if !force_stream && resident_bytes <= free {
-        Residency::Resident
-    } else if streaming_bytes <= free {
-        Residency::Streaming
-    } else {
-        Residency::Insufficient
+/// The largest streamed-suffix prefix count whose footprint stays within
+/// `free`: `base + the first k projection byte sums`.
+fn choose_resident_through(base: u64, projs: &[u64], free: u64) -> Option<usize> {
+    if base > free {
+        return None;
     }
+    let mut prefix = 0u64;
+    for (k, &proj) in projs.iter().enumerate() {
+        if base + prefix + proj > free {
+            return Some(k);
+        }
+        prefix += proj;
+    }
+    Some(projs.len())
 }
 
-/// Resident/streaming/fail per device; `free` carries one entry per range.
-/// streaming_bytes = range_device_bytes - the streamed projection bytes +
-/// the two ring slots (+ device-0 statics in both plans).
+/// Headroom the residency planner leaves unallocated per device: driver and
+/// launch-time allocations the byte accounting cannot see.
+pub const RESIDENCY_MARGIN_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Residency plan per device; `free` carries one entry per range. Each
+/// device keeps a resident prefix of its range and streams the suffix:
+/// hybrid(k) = range_device_bytes − Σ streamed_layer_bytes +
+/// Σ_{l<k} streamed_layer_bytes(l) + 2×slot_union (+ device-0 statics in
+/// every plan). Resident is the k=end case without the slot ring.
+/// QWEN35_FREE_OVERRIDE_MIB replaces the free readings; QWEN35_FORCE_STREAM
+/// drops the prefix entirely.
 pub fn plan_residency(
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -226,24 +252,44 @@ pub fn plan_residency(
         free.len()
     );
     let force_stream = std::env::var_os(FORCE_STREAM_ENV).is_some();
+    let free = override_free(free, free_override_mib()?);
+    let budget = |i: usize| free[i].saturating_sub(RESIDENCY_MARGIN_BYTES);
     let slots = 2 * slot_union_bytes(weights, config)?;
     let mut plans = Vec::with_capacity(ranges.len());
     for (i, &(start, end)) in ranges.iter().enumerate() {
-        let mut resident = range_device_bytes(weights, config, start..end, max_ctx)?;
+        let resident = range_device_bytes(weights, config, start..end, max_ctx)?;
+        let mut projs = Vec::with_capacity(end - start);
         let mut streamed = 0u64;
         for layer in start..end {
-            streamed += streamed_layer_bytes(weights, config, layer)?;
+            let proj = streamed_layer_bytes(weights, config, layer)?;
+            projs.push(proj);
+            streamed += proj;
         }
-        let mut streaming = resident - streamed + slots;
-        if i == 0 {
-            let statics = static_device_bytes(weights, config)?;
-            resident += statics;
-            streaming += statics;
-        }
+        let statics = if i == 0 {
+            static_device_bytes(weights, config)?
+        } else {
+            0
+        };
+        let resident_bytes = resident + statics;
+        let base = resident - streamed + slots + statics;
+        let (residency, resident_through, streaming_bytes) =
+            if !force_stream && resident_bytes <= budget(i) {
+                (Residency::Resident, end, resident_bytes)
+            } else {
+                match choose_resident_through(base, &projs, budget(i)) {
+                    Some(k) => {
+                        let k = if force_stream { 0 } else { k };
+                        let prefix: u64 = projs[..k].iter().sum();
+                        (Residency::Streaming, start + k, base + prefix)
+                    }
+                    None => (Residency::Insufficient, start, base),
+                }
+            };
         plans.push(DevicePlan {
-            residency: decide_residency(resident, streaming, free[i], force_stream),
-            resident_bytes: resident,
-            streaming_bytes: streaming,
+            residency,
+            resident_through,
+            resident_bytes,
+            streaming_bytes,
             free: free[i],
         });
     }
@@ -304,7 +350,7 @@ fn upload_stack(
     text: &TextConfig,
     layers: Range<usize>,
     max_ctx: usize,
-    resident_projections: bool,
+    resident_through: usize,
 ) -> Result<LayerUploads> {
     let kv_stride = text.num_key_value_heads * text.head_dim;
     let conv_dim = text.conv_dim();
@@ -325,7 +371,7 @@ fn upload_stack(
         ]);
         match text.layer_kind(layer) {
             LayerKind::LinearAttention => {
-                if resident_projections {
+                if layer < resident_through {
                     for p in [
                         "in_proj_qkv",
                         "in_proj_z",
@@ -354,7 +400,7 @@ fn upload_stack(
                 )?);
             }
             LayerKind::FullAttention => {
-                if resident_projections {
+                if layer < resident_through {
                     for p in ["q_proj", "k_proj", "v_proj", "o_proj"] {
                         let name = format!("{prefix}.self_attn.{p}");
                         let q = weights.quant_projection(&name)?;
@@ -381,7 +427,7 @@ fn upload_stack(
                 );
             }
         }
-        if resident_projections {
+        if layer < resident_through {
             for p in ["gate_proj", "up_proj", "down_proj"] {
                 let name = format!("{prefix}.mlp.{p}");
                 let q = weights.quant_projection(&name)?;
@@ -685,8 +731,12 @@ impl QwenGpu {
         for (i, plan) in plans.iter().enumerate() {
             if plan.residency == Residency::Streaming {
                 eprintln!(
-                    "qwen35: device {} streams layers {}..{} (resident needs {} B, {} B free)",
-                    ordinals[i], ranges[i].0, ranges[i].1, plan.resident_bytes, plan.free
+                    "qwen35: device {}: {} layers resident, {} streamed (full residency needs {} B, {} B free)",
+                    ordinals[i],
+                    plan.resident_through - ranges[i].0,
+                    ranges[i].1 - plan.resident_through,
+                    plan.resident_bytes,
+                    plan.free
                 );
             }
         }
@@ -696,17 +746,23 @@ impl QwenGpu {
         let wide = crate::wide::WideKernels::load(&ctx)?;
         let hidden_size = text.hidden_size;
 
-        let resident0 = plans[0].residency == Residency::Resident;
         let mut stack = upload_stack(
             &ctx,
             weights,
             text,
             ranges[0].0..ranges[0].1,
             max_ctx,
-            resident0,
+            plans[0].resident_through,
         )?;
         let streaming = (plans[0].residency == Residency::Streaming)
-            .then(|| StreamState::build(&ctx, weights, text, ranges[0]))
+            .then(|| {
+                StreamState::build(
+                    &ctx,
+                    weights,
+                    text,
+                    (plans[0].resident_through, ranges[0].1),
+                )
+            })
             .transpose()?;
         let embed = weights.quant_projection(&format!("{TEXT_PREFIX}.embed_tokens"))?;
         let embed = ctx.upload(&embed, None)?;
@@ -729,17 +785,23 @@ impl QwenGpu {
         }
         for (i, pctx) in contexts.enumerate() {
             let pwide = crate::wide::WideKernels::load(&pctx)?;
-            let resident = plans[i + 1].residency == Residency::Resident;
             let pstack = upload_stack(
                 &pctx,
                 weights,
                 text,
                 ranges[i + 1].0..ranges[i + 1].1,
                 max_ctx,
-                resident,
+                plans[i + 1].resident_through,
             )?;
             let pstreaming = (plans[i + 1].residency == Residency::Streaming)
-                .then(|| StreamState::build(&pctx, weights, text, ranges[i + 1]))
+                .then(|| {
+                    StreamState::build(
+                        &pctx,
+                        weights,
+                        text,
+                        (plans[i + 1].resident_through, ranges[i + 1].1),
+                    )
+                })
                 .transpose()?;
             let boundary_norm = if i + 2 < ranges.len() {
                 upload_boundary(&pctx, weights, ranges[i + 2].0)?
@@ -837,7 +899,7 @@ impl QwenGpu {
         &self.ranges
     }
 
-    /// True when any device streams its layer range.
+    /// True when any device streams part of its layer range.
     pub fn is_streaming(&self) -> bool {
         self.streaming.is_some() || self.peers.iter().any(|peer| peer.streaming.is_some())
     }
@@ -1197,8 +1259,10 @@ fn layer_proj<'a>(
     suffix: &str,
 ) -> Result<ProjHandle<'a>> {
     match stream {
-        Some(state) => Ok(ProjHandle::Slot(state.slot_buf(layer, suffix)?)),
-        None => {
+        Some(state) if layer >= state.range.0 => {
+            Ok(ProjHandle::Slot(state.slot_buf(layer, suffix)?))
+        }
+        _ => {
             let name = format!("{TEXT_PREFIX}.layers.{layer}.{suffix}");
             view.proj
                 .get(&name)
@@ -1224,9 +1288,14 @@ fn run_stack(view: &mut StackView, layers: Range<usize>, text: &TextConfig) -> R
     if let Some(state) = stream.as_mut() {
         state.prime()?;
     }
+    // stream.range.0 is the resident prefix boundary; layers below it run
+    // from the resident projection map and skip the slot ring entirely.
+    let resident_through = stream.as_ref().map_or(end, |state| state.range.0);
     for layer in layers {
         let local = layer - start;
-        if let Some(state) = stream.as_mut() {
+        if layer >= resident_through
+            && let Some(state) = stream.as_mut()
+        {
             state.begin_layer(view.ctx, layer)?;
         }
         // x1 enters holding rmsnorm_zc(hidden, ln_in).
@@ -1424,7 +1493,9 @@ fn run_stack(view: &mut StackView, layers: Range<usize>, text: &TextConfig) -> R
         };
         view.ctx
             .glue_add_rmsnorm_zc(view.hidden, down.y_ref(), next_w, view.x1, n, eps)?;
-        if let Some(state) = stream.as_mut() {
+        if layer >= resident_through
+            && let Some(state) = stream.as_mut()
+        {
             state.end_layer(view.ctx, layer)?;
         }
     }
@@ -1434,21 +1505,27 @@ fn run_stack(view: &mut StackView, layers: Range<usize>, text: &TextConfig) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        Residency, StreamState, decide_residency, layer_device_bytes, plan_residency,
-        split_layers_by_bytes,
+        Residency, StreamState, choose_resident_through, layer_device_bytes, override_free,
+        plan_residency, split_layers_by_bytes,
     };
 
     #[test]
-    fn residency_picks_the_cheapest_fitting_plan() {
-        use Residency::{Insufficient, Resident, Streaming};
-        assert_eq!(decide_residency(100, 40, 200, false), Resident);
-        assert_eq!(decide_residency(100, 40, 100, false), Resident);
-        assert_eq!(decide_residency(100, 40, 99, false), Streaming);
-        assert_eq!(decide_residency(100, 40, 40, false), Streaming);
-        assert_eq!(decide_residency(100, 40, 39, false), Insufficient);
-        assert_eq!(decide_residency(100, 40, 200, true), Streaming);
-        assert_eq!(decide_residency(100, 40, 40, true), Streaming);
-        assert_eq!(decide_residency(100, 40, 39, true), Insufficient);
+    fn resident_through_takes_the_fitting_prefix() {
+        let projs = [10u64, 20, 30];
+        assert_eq!(choose_resident_through(5, &projs, 4), None);
+        assert_eq!(choose_resident_through(5, &projs, 5), Some(0));
+        assert_eq!(choose_resident_through(5, &projs, 12), Some(0));
+        assert_eq!(choose_resident_through(5, &projs, 15), Some(1));
+        assert_eq!(choose_resident_through(5, &projs, 42), Some(2));
+        assert_eq!(choose_resident_through(5, &projs, 65), Some(3));
+        assert_eq!(choose_resident_through(5, &[], 5), Some(0));
+    }
+
+    #[test]
+    fn free_override_replaces_every_device() {
+        assert_eq!(override_free(&[10, 20], None), vec![10, 20]);
+        assert_eq!(override_free(&[10, 20], Some(7)), vec![7, 7]);
+        assert!(override_free(&[], Some(7)).is_empty());
     }
 
     #[test]
@@ -1528,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_residency_falls_back_to_streaming_on_real_bytes() {
+    fn plan_residency_picks_a_hybrid_prefix_on_real_bytes() {
         let dir = std::path::Path::new("../../models/Qwen/Qwen3.8-27B-int4");
         if !dir.exists() {
             return;
@@ -1538,14 +1615,27 @@ mod tests {
         let ranges = super::partition_layers(&weights, &config, 1).unwrap();
         let plans = plan_residency(&weights, &config, &ranges, 4096, &[u64::MAX]).unwrap();
         assert_eq!(plans[0].residency, Residency::Resident);
-        assert!(plans[0].streaming_bytes < plans[0].resident_bytes);
-        let resident = plans[0].resident_bytes;
-        let streaming = plans[0].streaming_bytes;
-        let plans = plan_residency(&weights, &config, &ranges, 4096, &[streaming]).unwrap();
+        assert_eq!(plans[0].resident_through, ranges[0].1);
+        assert_eq!(plans[0].streaming_bytes, plans[0].resident_bytes);
+        // free = 0 names the minimum footprint (nothing resident); the plan
+        // also needs RESIDENCY_MARGIN_BYTES of headroom on top of it.
+        let base =
+            plan_residency(&weights, &config, &ranges, 4096, &[0]).unwrap()[0].streaming_bytes;
+        let floor = base + super::RESIDENCY_MARGIN_BYTES;
+        let plans = plan_residency(&weights, &config, &ranges, 4096, &[floor]).unwrap();
         assert_eq!(plans[0].residency, Residency::Streaming);
-        let plans = plan_residency(&weights, &config, &ranges, 4096, &[streaming - 1]).unwrap();
+        assert_eq!(plans[0].resident_through, ranges[0].0);
+        assert!(plans[0].streaming_bytes <= floor);
+        let plans = plan_residency(&weights, &config, &ranges, 4096, &[floor - 1]).unwrap();
         assert_eq!(plans[0].residency, Residency::Insufficient);
-        let plans = plan_residency(&weights, &config, &ranges, 4096, &[resident - 1]).unwrap();
-        assert_eq!(plans[0].residency, Residency::Streaming);
+        // The prefix grows with free memory and the plan always fits.
+        let mut last = ranges[0].0;
+        for free in [floor, floor + (1u64 << 30), floor + (4u64 << 30), u64::MAX] {
+            let plan = plan_residency(&weights, &config, &ranges, 4096, &[free]).unwrap()[0];
+            assert!(plan.resident_through >= last);
+            assert!(plan.streaming_bytes <= free);
+            last = plan.resident_through;
+        }
+        assert_eq!(last, ranges[0].1);
     }
 }
