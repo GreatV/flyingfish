@@ -30,6 +30,8 @@ pub mod artifact;
 pub mod bounds;
 mod calibration_identity;
 pub mod cold_cache;
+#[cfg(feature = "cuda")]
+pub mod cuda_kernel_assets;
 pub mod frame_manifest;
 pub mod identity;
 pub mod interconnect;

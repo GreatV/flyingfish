@@ -82,40 +82,18 @@ impl GpuContext {
         // Safe here: every slice is allocated, used, and dropped on this
         // one stream, the only cross-stream rule the events enforce.
         unsafe { context.disable_event_tracking() };
-        let ptx =
-            cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/edge0_gemv.ptx")));
-        let module = context
-            .load_module(ptx)
-            .context("failed to load edge0 PTX module")?;
-        let silu_ptx = cudarc::nvrtc::Ptx::from_src(include_str!(concat!(
-            env!("OUT_DIR"),
-            "/edge0_silu_mul.ptx"
-        )));
-        let silu_module = context
-            .load_module(silu_ptx)
-            .context("failed to load silu PTX module")?;
-        let batched_ptx = cudarc::nvrtc::Ptx::from_src(include_str!(concat!(
-            env!("OUT_DIR"),
-            "/edge0_batched_gemv.ptx"
-        )));
-        let batched_module = context
-            .load_module(batched_ptx)
-            .context("failed to load batched PTX module")?;
-        let lora_ptx =
-            cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/lora_add.ptx")));
-        let lora_module = context
-            .load_module(lora_ptx)
-            .context("failed to load lora PTX module")?;
-        let gdn_ptx =
-            cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/edge0_gdn.ptx")));
-        let gdn_module = context
-            .load_module(gdn_ptx)
-            .context("failed to load gdn PTX module")?;
-        let glue_ptx =
-            cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/edge0_glue.ptx")));
-        let glue_module = context
-            .load_module(glue_ptx)
-            .context("failed to load glue PTX module")?;
+        let module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_GEMV)?;
+        let silu_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_SILU_MUL)?;
+        let batched_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_BATCHED_GEMV)?;
+        let lora_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::LORA_ADD)?;
+        let gdn_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_GDN)?;
+        let glue_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_GLUE)?;
         let gemv4 = module
             .load_function("edge0_gemv4")
             .context("edge0_gemv4 missing")?;
@@ -175,11 +153,8 @@ impl GpuContext {
         let k_group4 = glue_module
             .load_function("edge0_gemv_group4_lora")
             .context("edge0_gemv_group4_lora missing")?;
-        let mega_ptx =
-            cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/edge0_mega.ptx")));
-        let mega_module = context
-            .load_module(mega_ptx)
-            .context("failed to load mega PTX module")?;
+        let mega_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_MEGA)?;
         let k_moe_mega = mega_module
             .load_function("edge0_moe_mega")
             .context("edge0_moe_mega missing")?;

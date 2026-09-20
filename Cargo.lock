@@ -693,6 +693,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff-cuda-build"
+version = "0.1.0"
+
+[[package]]
 name = "ff-edge0"
 version = "0.1.0"
 dependencies = [
@@ -702,6 +706,7 @@ dependencies = [
  "candle-nn",
  "cudarc 0.19.9",
  "ff-core",
+ "ff-cuda-build",
  "half",
  "memmap2",
  "safetensors 0.8.0",
@@ -719,6 +724,7 @@ dependencies = [
  "candle-nn",
  "clap",
  "ff-core",
+ "ff-cuda-build",
  "float8",
  "half",
  "libc",
@@ -741,6 +747,7 @@ dependencies = [
  "clap",
  "cudarc 0.19.9",
  "ff-core",
+ "ff-cuda-build",
  "half",
  "hound",
  "memmap2",
@@ -793,6 +800,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "cudarc 0.19.9",
+ "ff-cuda-build",
  "ff-edge0",
  "half",
  "memmap2",

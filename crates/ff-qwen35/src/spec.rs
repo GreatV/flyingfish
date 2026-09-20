@@ -104,14 +104,8 @@ impl QwenSpec {
             .map(|k| k.len() / kv_stride)
             .unwrap_or(4096);
 
-        let ptx = cudarc::nvrtc::Ptx::from_src(include_str!(concat!(
-            env!("OUT_DIR"),
-            "/qwen_batch2.ptx"
-        )));
-        let module = ctx
-            .context
-            .load_module(ptx)
-            .map_err(|e| anyhow::anyhow!("batch2 module: {e:?}"))?;
+        let module =
+            ff_edge0::kernel_assets::load_module(&ctx.context, &crate::kernel_assets::QWEN_BATCH2)?;
         let load = |name: &str| {
             module
                 .load_function(name)

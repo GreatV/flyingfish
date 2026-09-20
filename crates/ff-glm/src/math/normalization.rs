@@ -195,12 +195,14 @@ impl candle_core::CustomOp1 for NormalizedF32 {
         let source = input.as_cuda_slice::<f32>()?;
         let source = source.slice(layout.start_offset()..);
         let mut output = unsafe { device.alloc::<f32>(rows * width) }?;
-        let kernel = device.get_or_load_custom_func(
-            "glm_normalized_f32",
+        let function = ff_core::cuda_kernel_assets::load_function(
+            &device,
+            &crate::kernel_assets::GLM_NORMALIZED_F32,
             "glm_reference_normalized_v1",
-            include_str!(concat!(env!("OUT_DIR"), "/glm_normalized_f32.ptx")),
+            "glm_normalized_f32",
         )?;
-        let mut launch = kernel.builder();
+        let stream = device.cuda_stream();
+        let mut launch = stream.launch_builder(&function);
         let width_i = width as i32;
         let vector_i = geometry.vector as i32;
         let block_x_i = geometry.block_x as i32;
@@ -263,12 +265,14 @@ impl candle_core::CustomOp1 for Rsqrt {
         let source = input.as_cuda_slice::<f32>()?;
         let source = source.slice(layout.start_offset()..);
         let mut output = unsafe { device.alloc::<f32>(count as usize) }?;
-        let kernel = device.get_or_load_custom_func(
-            "glm_rsqrt_f32",
+        let function = ff_core::cuda_kernel_assets::load_function(
+            &device,
+            &crate::kernel_assets::GLM_RSQRT_F32,
             "glm_reference_rsqrt_v1",
-            include_str!(concat!(env!("OUT_DIR"), "/glm_rsqrt_f32.ptx")),
+            "glm_rsqrt_f32",
         )?;
-        let mut launch = kernel.builder();
+        let stream = device.cuda_stream();
+        let mut launch = stream.launch_builder(&function);
         launch.arg(&count).arg(&source).arg(&mut output);
         unsafe { launch.launch(LaunchConfig::for_num_elems(count as u32)) }.w()?;
         Ok((
