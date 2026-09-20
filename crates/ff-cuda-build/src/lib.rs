@@ -21,6 +21,14 @@ pub const ARCHITECTURE_ENVIRONMENT_VARIABLE: &str = "FF_CUDA_ARCHS";
 /// The floor, and the architecture the PTX itself is generated for.
 pub const BASELINE_ARCHITECTURE: u32 = 80;
 
+/// Every architecture a shipped binary is expected to load on.
+///
+/// A cubin is the only image immune to the toolkit-newer-than-driver PTX ISA
+/// rejection, so the fleet — not the build host's own GPU — decides what a
+/// release carries. `ptxas` skips architectures it cannot target, so a toolkit
+/// older than the newest entry simply emits fewer cubins.
+pub const FLEET_ARCHITECTURES: [u32; 6] = [80, 86, 89, 90, 100, 120];
+
 /// One kernel's build inputs.
 pub struct KernelSpec {
     /// Artifact stem: `<stem>.ptx`, `<stem>.sm_NN.cubin`, manifest static name.
@@ -94,9 +102,9 @@ pub fn resolve_ptxas(nvcc: &std::ffi::OsStr) -> std::ffi::OsString {
 /// Which real architectures to translate the PTX to ahead of time.
 ///
 /// `FF_CUDA_ARCHS=80,89,120` names them explicitly. Absent that, the build
-/// asks the machine what it has, the way a `CMAKE_CUDA_ARCHITECTURES`-less
-/// build does. Absent that too, only the baseline is emitted and every device
-/// takes the driver's own translation of the same PTX.
+/// emits the union of the fleet list and whatever the build host has, the way
+/// a `CMAKE_CUDA_ARCHITECTURES`-less build does. A device with no matching
+/// cubin takes the driver's own translation of the same PTX.
 pub fn resolve_target_architectures() -> Vec<u32> {
     let requested = std::env::var_os(ARCHITECTURE_ENVIRONMENT_VARIABLE);
     let mut architectures = if let Some(requested) = requested {
@@ -115,7 +123,9 @@ pub fn resolve_target_architectures() -> Vec<u32> {
             })
             .collect()
     } else {
-        detect_local_architectures()
+        let mut detected = detect_local_architectures();
+        detected.extend_from_slice(&FLEET_ARCHITECTURES);
+        detected
     };
     architectures.push(BASELINE_ARCHITECTURE);
     architectures.sort_unstable();

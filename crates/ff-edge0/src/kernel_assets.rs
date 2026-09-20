@@ -125,13 +125,16 @@ mod tests {
             for cubin in assets.cubins {
                 let major = cubin.architecture / 10;
                 let minor = cubin.architecture % 10;
-                assert_eq!(
-                    assets.select((major as i32, (minor + 1) as i32)),
-                    ImageSelection::Ptx,
-                    "sm_{} cubin of {} must not serve a near miss",
-                    cubin.architecture,
-                    assets.name
-                );
+                for probe in [(major + 1, 0), (major, minor + 1), (7, 5)] {
+                    let architecture = probe.0 * 10 + probe.1;
+                    let selected = assets.select((probe.0 as i32, probe.1 as i32));
+                    assert!(
+                        selected == ImageSelection::Ptx
+                            || selected == ImageSelection::Cubin { architecture },
+                        "select({probe:?}) on {} returned {selected:?}, not its own architecture",
+                        assets.name
+                    );
+                }
                 assert_eq!(
                     assets.select((major as i32, minor as i32)),
                     ImageSelection::Cubin {

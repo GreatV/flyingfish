@@ -14,7 +14,7 @@ pub(super) enum Edge0Command {
         prompt: String,
         #[arg(long, default_value_t = NonZeroUsize::new(128).unwrap())]
         max_new_tokens: NonZeroUsize,
-        #[arg(long, default_value = "auto", help = "cpu, auto, or cuda:0")]
+        #[arg(long, default_value = "auto", help = "cpu, auto, or cuda:N")]
         device: String,
         #[arg(
             long,
@@ -49,7 +49,7 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
         "prompt and requested output exceed model context"
     );
     let device = match device {
-        TextDevice::Cuda if auto && ids.len() + max_new_tokens.get() > configured_max_ctx() => {
+        TextDevice::Cuda(_) if auto && ids.len() + max_new_tokens.get() > configured_max_ctx() => {
             eprintln!(
                 "auto: prompt + generation exceeds the {} KV-cache capacity; falling back to CPU",
                 configured_max_ctx()
@@ -68,7 +68,8 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
             );
             generate_greedy(&mut model, &ids, max_new_tokens.get(), &eos_token_ids)?
         }
-        TextDevice::Cuda => generate_cuda(
+        TextDevice::Cuda(ordinal) => generate_cuda(
+            ordinal,
             &mut model,
             &ids,
             max_new_tokens.get(),
@@ -118,13 +119,14 @@ fn decode_from_hidden(
 
 #[cfg(feature = "cuda")]
 fn generate_cuda(
+    ordinal: usize,
     model: &mut Edge0Text,
     ids: &[u32],
     max_new_tokens: usize,
     resident_experts: bool,
     eos_token_ids: &[u32],
 ) -> Result<Vec<u32>> {
-    model.enable_gpu(resident_experts)?;
+    model.enable_gpu(ordinal, resident_experts)?;
     let needed = ids.len() + max_new_tokens;
     let max_ctx = model.gpu_max_ctx().context("resident runtime")?;
     anyhow::ensure!(
@@ -149,6 +151,13 @@ fn generate_cuda(
 }
 
 #[cfg(not(feature = "cuda"))]
-fn generate_cuda(_: &mut Edge0Text, _: &[u32], _: usize, _: bool, _: &[u32]) -> Result<Vec<u32>> {
+fn generate_cuda(
+    _: usize,
+    _: &mut Edge0Text,
+    _: &[u32],
+    _: usize,
+    _: bool,
+    _: &[u32],
+) -> Result<Vec<u32>> {
     bail!("CUDA decoding requires a binary built with --features cuda")
 }

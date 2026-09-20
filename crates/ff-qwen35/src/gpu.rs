@@ -57,16 +57,17 @@ pub struct QwenGpu {
 }
 
 impl QwenGpu {
-    pub fn new(weights: &Qwen35Weights, config: &Qwen35Config) -> Result<Self> {
-        Self::with_max_ctx(weights, config, 4096)
+    pub fn new(ordinal: usize, weights: &Qwen35Weights, config: &Qwen35Config) -> Result<Self> {
+        Self::with_max_ctx(ordinal, weights, config, 4096)
     }
 
     pub fn with_max_ctx(
+        ordinal: usize,
         weights: &Qwen35Weights,
         config: &Qwen35Config,
         max_ctx: usize,
     ) -> Result<Self> {
-        let ctx = GpuContext::new()?;
+        let ctx = GpuContext::new(ordinal)?;
         let wide = crate::wide::WideKernels::load(&ctx)?;
         let text = &config.text_config;
         let hidden_size = text.hidden_size;

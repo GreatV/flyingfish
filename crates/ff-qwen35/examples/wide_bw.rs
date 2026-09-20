@@ -26,7 +26,7 @@ fn synth(rows: usize, in_dim: usize) -> GroupQuant {
 }
 
 fn main() -> anyhow::Result<()> {
-    let ctx = GpuContext::new()?;
+    let ctx = GpuContext::new(0)?;
     let flush_buf = ctx.upload_f32(&vec![0.5f32; 64 * 1024 * 1024])?;
     let launch_flush = || ctx.flush_l2(&flush_buf);
 

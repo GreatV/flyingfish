@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
     // ---- Part A: lora dump ----
     {
         let mut gpu = Edge0Text::load(model_dir, config.clone())?;
-        gpu.enable_gpu(true)?;
+        gpu.enable_gpu(0, true)?;
         let mut worst = 0.0f32;
         for (name, in_dim) in LORA_SAMPLES {
             let x: Vec<f32> = (0..*in_dim)
@@ -112,7 +112,7 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         let mut model = Edge0Text::load(model_dir, config.clone())?;
-        model.enable_gpu(true)?;
+        model.enable_gpu(0, true)?;
         let templated = ff_edge0::config::chat_prompt(prompt);
         let enc = tokenizer
             .encode(templated.as_str(), false)
@@ -144,7 +144,7 @@ fn main() -> anyhow::Result<()> {
         // from a Vec-path re-decode.
         drop(model);
         let mut model2 = Edge0Text::load(model_dir, config.clone())?;
-        model2.enable_gpu(true)?;
+        model2.enable_gpu(0, true)?;
         let mut hidden = None;
         for &id in ids {
             hidden = Some(model2.forward(id)?);

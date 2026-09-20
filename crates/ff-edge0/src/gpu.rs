@@ -74,8 +74,9 @@ pub struct GpuQuant {
 }
 
 impl GpuContext {
-    pub fn new() -> Result<Self> {
-        let context = CudaContext::new(0).context("failed to init CUDA context")?;
+    pub fn new(ordinal: usize) -> Result<Self> {
+        let context = CudaContext::new(ordinal)
+            .with_context(|| format!("failed to init CUDA context on device {ordinal}"))?;
         // cudarc's per-launch safety events turn on once a second stream
         // exists (the capture stream) and each launch then waits on events
         // recorded before capture — CUDA_ERROR_STREAM_CAPTURE_ISOLATION.
@@ -848,7 +849,7 @@ mod tests {
 
     #[test]
     fn gpu_gemv_matches_cpu_matvec_on_a_real_projection() {
-        let ctx = match GpuContext::new() {
+        let ctx = match GpuContext::new(0) {
             Ok(ctx) => ctx,
             Err(e) => {
                 eprintln!("no CUDA device ({e}); skipping gpu test");

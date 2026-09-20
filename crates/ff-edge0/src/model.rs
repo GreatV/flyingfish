@@ -792,8 +792,8 @@ impl Edge0Text {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn enable_gpu(&mut self, experts_resident: bool) -> Result<()> {
-        let ctx = crate::gpu::GpuContext::new()?;
+    pub fn enable_gpu(&mut self, ordinal: usize, experts_resident: bool) -> Result<()> {
+        let ctx = crate::gpu::GpuContext::new(ordinal)?;
         if experts_resident {
             // Let the mode.rs planner veto full residency (real VRAM probe)
             // before ~17 GiB of expert uploads OOM mid-way.

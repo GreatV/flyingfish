@@ -24,7 +24,7 @@ pub(super) enum Qwen35Command {
         image: Option<PathBuf>,
         #[arg(long, default_value_t = NonZeroUsize::new(128).unwrap())]
         max_new_tokens: NonZeroUsize,
-        #[arg(long, default_value = "auto", help = "cpu, auto, or cuda:0")]
+        #[arg(long, default_value = "auto", help = "cpu, auto, or cuda:N")]
         device: String,
     },
 }
@@ -69,7 +69,7 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
         "prompt and requested output exceed model context"
     );
     let device = match device {
-        TextDevice::Cuda => {
+        TextDevice::Cuda(ordinal) => {
             if total > GPU_CONTEXT_CAP {
                 if auto {
                     eprintln!(
@@ -79,11 +79,22 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
                 } else {
                     bail!("prompt + generation {total} exceeds the {GPU_CONTEXT_CAP} kernel cap");
                 }
-            } else if auto && !checkpoint_fits_free_vram(&model_dir, &config, total)? {
-                eprintln!("auto: checkpoint and KV cache exceed free VRAM; falling back to CPU");
-                TextDevice::Cpu
             } else {
-                TextDevice::Cuda
+                match checkpoint_fits_free_vram(ordinal, &model_dir, &config, total)? {
+                    true => TextDevice::Cuda(ordinal),
+                    false if auto => {
+                        eprintln!(
+                            "auto: checkpoint and KV cache exceed free VRAM; falling back to CPU"
+                        );
+                        TextDevice::Cpu
+                    }
+                    false => {
+                        bail!(
+                            "checkpoint and KV cache exceed free VRAM on cuda:{ordinal}; \
+                             pass another --device (cuda:N with more memory, or cpu)"
+                        )
+                    }
+                }
             }
         }
         TextDevice::Cpu => TextDevice::Cpu,
@@ -115,7 +126,8 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
             }
             generated
         }
-        TextDevice::Cuda => generate_cuda(
+        TextDevice::Cuda(ordinal) => generate_cuda(
+            ordinal,
             &model_dir,
             &config,
             &ids,
@@ -165,6 +177,7 @@ fn run_vision_tower(
 /// layer holds two f32 KV planes sized by the context the run will use.
 #[cfg(feature = "cuda")]
 fn checkpoint_fits_free_vram(
+    ordinal: usize,
     model_dir: &Path,
     config: &Qwen35Config,
     total_tokens: usize,
@@ -199,13 +212,14 @@ fn checkpoint_fits_free_vram(
     let kv =
         full_attention * 2 * max_ctx as u64 * (text.num_key_value_heads * text.head_dim) as u64 * 4;
     let required = bytes + bytes / 8 + kv;
-    let context = cudarc::driver::CudaContext::new(0).context("open CUDA device 0")?;
+    let context = cudarc::driver::CudaContext::new(ordinal)
+        .with_context(|| format!("open CUDA device {ordinal}"))?;
     let (free, _) = context.mem_get_info().context("mem_get_info")?;
     Ok(required <= free as u64)
 }
 
 #[cfg(not(feature = "cuda"))]
-fn checkpoint_fits_free_vram(_: &Path, _: &Qwen35Config, _: usize) -> Result<bool> {
+fn checkpoint_fits_free_vram(_: usize, _: &Path, _: &Qwen35Config, _: usize) -> Result<bool> {
     Ok(true)
 }
 
@@ -282,6 +296,7 @@ fn prefill(
 
 #[cfg(feature = "cuda")]
 fn generate_cuda(
+    ordinal: usize,
     model_dir: &Path,
     config: &Qwen35Config,
     ids: &[u32],
@@ -298,9 +313,9 @@ fn generate_cuda(
     );
     let weights = Qwen35Weights::open(model_dir)?;
     let mut gpu = if total > 4096 {
-        QwenGpu::with_max_ctx(&weights, config, total.next_power_of_two())?
+        QwenGpu::with_max_ctx(ordinal, &weights, config, total.next_power_of_two())?
     } else {
-        QwenGpu::new(&weights, config)?
+        QwenGpu::new(ordinal, &weights, config)?
     };
     match vision {
         Some((rows, _)) => {
@@ -340,6 +355,7 @@ fn generate_cuda(
 
 #[cfg(not(feature = "cuda"))]
 fn generate_cuda(
+    _: usize,
     _: &Path,
     _: &Qwen35Config,
     _: &[u32],
