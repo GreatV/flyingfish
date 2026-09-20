@@ -121,13 +121,13 @@ fn main() -> anyhow::Result<()> {
         let weights = ff_qwen35::weights::Qwen35Weights::open(dir)?;
         let mut gpu = if total_ctx > 4096 {
             ff_qwen35::gpu::QwenGpu::with_max_ctx(
-                0,
+                &[0],
                 &weights,
                 &config,
                 total_ctx.next_power_of_two(),
             )?
         } else {
-            ff_qwen35::gpu::QwenGpu::new(0, &weights, &config)?
+            ff_qwen35::gpu::QwenGpu::new(&[0], &weights, &config)?
         };
         let spec_mode = std::env::var("QWEN35_MTP").unwrap_or_default() == "spec";
         let started = Instant::now();

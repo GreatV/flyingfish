@@ -49,14 +49,27 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
         "prompt and requested output exceed model context"
     );
     let device = match device {
-        TextDevice::Cuda(_) if auto && ids.len() + max_new_tokens.get() > configured_max_ctx() => {
-            eprintln!(
-                "auto: prompt + generation exceeds the {} KV-cache capacity; falling back to CPU",
-                configured_max_ctx()
+        TextDevice::Cuda(ordinals) => {
+            anyhow::ensure!(
+                ordinals.len() == 1,
+                "edge0 decode is single-device; pass one --device (cuda:N or cpu), not cuda:{}",
+                ordinals
+                    .iter()
+                    .map(|o| o.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
-            TextDevice::Cpu
+            if auto && ids.len() + max_new_tokens.get() > configured_max_ctx() {
+                eprintln!(
+                    "auto: prompt + generation exceeds the {} KV-cache capacity; falling back to CPU",
+                    configured_max_ctx()
+                );
+                TextDevice::Cpu
+            } else {
+                TextDevice::Cuda(ordinals)
+            }
         }
-        selected => selected,
+        TextDevice::Cpu => TextDevice::Cpu,
     };
     let eos_token_ids = config.eos_token_id.clone();
     let mut model = Edge0Text::load(&model_dir, config)?;
@@ -68,8 +81,8 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
             );
             generate_greedy(&mut model, &ids, max_new_tokens.get(), &eos_token_ids)?
         }
-        TextDevice::Cuda(ordinal) => generate_cuda(
-            ordinal,
+        TextDevice::Cuda(ordinals) => generate_cuda(
+            ordinals[0],
             &mut model,
             &ids,
             max_new_tokens.get(),

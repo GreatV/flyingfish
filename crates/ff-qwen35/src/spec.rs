@@ -92,6 +92,10 @@ pub fn margin(logits: &[f32]) -> f32 {
 
 impl QwenSpec {
     pub fn new(gpu: &QwenGpu, weights: &crate::weights::Qwen35Weights) -> Result<Self> {
+        anyhow::ensure!(
+            gpu.peers.is_empty(),
+            "speculative decode drives a single device"
+        );
         let ctx = &gpu.ctx;
         let text = &gpu.config.text_config;
         let n = text.hidden_size;

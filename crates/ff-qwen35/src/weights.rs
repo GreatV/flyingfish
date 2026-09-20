@@ -168,4 +168,24 @@ impl Qwen35Weights {
         );
         GroupQuant::new(packed, scales, biases, out_dim, in_dim, 4)
     }
+
+    /// On-device bytes `{name}` occupies after upload: packed weight bytes
+    /// as stored, scales and biases widened bf16-to-f32; a plain bf16
+    /// tensor doubles. Suffix-less names (A_log, dt_bias) resolve bare.
+    pub fn tensor_device_bytes(&self, name: &str) -> Result<u64> {
+        let suffixed = format!("{name}.weight");
+        let key = if self.index.contains_key(&suffixed) {
+            &suffixed
+        } else {
+            name
+        };
+        let (_shape, weight) = self.view_ref(key)?;
+        if self.index.contains_key(&format!("{name}.scales")) {
+            let (_s, scales) = self.view_ref(&format!("{name}.scales"))?;
+            let (_s, biases) = self.view_ref(&format!("{name}.biases"))?;
+            Ok(weight.len() as u64 + 2 * (scales.len() + biases.len()) as u64)
+        } else {
+            Ok(2 * weight.len() as u64)
+        }
+    }
 }
