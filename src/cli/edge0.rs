@@ -50,15 +50,6 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
     );
     let device = match device {
         TextDevice::Cuda(ordinals) => {
-            anyhow::ensure!(
-                ordinals.len() == 1,
-                "edge0 decode is single-device; pass one --device (cuda:N or cpu), not cuda:{}",
-                ordinals
-                    .iter()
-                    .map(|o| o.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
             if auto && ids.len() + max_new_tokens.get() > configured_max_ctx() {
                 eprintln!(
                     "auto: prompt + generation exceeds the {} KV-cache capacity; falling back to CPU",
@@ -82,7 +73,7 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
             generate_greedy(&mut model, &ids, max_new_tokens.get(), &eos_token_ids)?
         }
         TextDevice::Cuda(ordinals) => generate_cuda(
-            ordinals[0],
+            &ordinals,
             &mut model,
             &ids,
             max_new_tokens.get(),
@@ -132,14 +123,21 @@ fn decode_from_hidden(
 
 #[cfg(feature = "cuda")]
 fn generate_cuda(
-    ordinal: usize,
+    ordinals: &[usize],
     model: &mut Edge0Text,
     ids: &[u32],
     max_new_tokens: usize,
     resident_experts: bool,
     eos_token_ids: &[u32],
 ) -> Result<Vec<u32>> {
-    model.enable_gpu(ordinal, resident_experts)?;
+    anyhow::ensure!(
+        !ordinals.is_empty(),
+        "--device cuda:N[,M...] requires at least one ordinal"
+    );
+    model.enable_gpu_multi(ordinals, resident_experts)?;
+    if ordinals.len() > 1 {
+        return generate_cuda_multi(model, ids, max_new_tokens, eos_token_ids);
+    }
     let needed = ids.len() + max_new_tokens;
     let max_ctx = model.gpu_max_ctx().context("resident runtime")?;
     anyhow::ensure!(
@@ -163,9 +161,38 @@ fn generate_cuda(
     decode_from_hidden(model, hidden, max_new_tokens, eos_token_ids)
 }
 
+#[cfg(feature = "cuda")]
+fn generate_cuda_multi(
+    model: &mut Edge0Text,
+    ids: &[u32],
+    max_new_tokens: usize,
+    eos_token_ids: &[u32],
+) -> Result<Vec<u32>> {
+    // Prefill runs on the multi-device runtime one token at a time so the
+    // device state (KV, GDN, position counters) is warm when decode starts.
+    // Single-device behaviour is bitwise-equivalent because each peer runs
+    // the same per-layer kernels as the single-context path.
+    let max_ctx = configured_max_ctx();
+    anyhow::ensure!(
+        ids.len() + max_new_tokens <= max_ctx,
+        "prompt + generation {} exceeds the {max_ctx} KV-cache capacity; \
+         raise EDGE0_MAX_CTX (kernel cap 8192)",
+        ids.len() + max_new_tokens,
+    );
+    for &id in ids {
+        model.forward_multi(id)?;
+    }
+    let mut generated = vec![model.first_token_multi()?];
+    while generated.len() < max_new_tokens && !eos_token_ids.contains(generated.last().unwrap()) {
+        let prev = *generated.last().expect("first token");
+        generated.push(model.forward_token_multi(prev)?);
+    }
+    Ok(generated)
+}
+
 #[cfg(not(feature = "cuda"))]
 fn generate_cuda(
-    _: usize,
+    _: &[usize],
     _: &mut Edge0Text,
     _: &[u32],
     _: usize,

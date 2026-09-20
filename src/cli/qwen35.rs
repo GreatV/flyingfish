@@ -333,9 +333,7 @@ fn generate_cuda(
             }
         }
         None => {
-            for &id in ids {
-                gpu.push_token(id)?;
-            }
+            gpu.push_tokens(ids)?;
         }
     }
     let mut generated = vec![gpu.read_token()?];

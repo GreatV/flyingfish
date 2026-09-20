@@ -128,6 +128,12 @@ fn override_free(free: &[u64], override_bytes: Option<u64>) -> Vec<u64> {
     }
 }
 
+/// Env var that falls back to per-token prefill.
+pub const TOKEN_PREFILL_ENV: &str = "QWEN35_TOKEN_PREFILL";
+
+/// Tokens per batched-prefill block.
+const PREFILL_BLOCK: usize = 32;
+
 /// The int4 projections the streaming path re-uploads per layer, as
 /// layer-relative suffixes.
 fn streaming_names(kind: LayerKind) -> &'static [&'static str] {
@@ -1009,8 +1015,8 @@ impl QwenGpu {
                 inner: &self.inner,
                 scr_gu: &self.scr_gu,
                 scr_down: &self.scr_down,
-                pos: &self.pos,
-                rope_pos: &self.rope_pos,
+                pos: &mut self.pos,
+                rope_pos: &mut self.rope_pos,
                 hidden: &self.hidden,
                 x1: &self.x1,
                 boundary_norm: self.boundary_norms.first().unwrap_or(&self.final_norm_w),
@@ -1061,8 +1067,8 @@ impl QwenGpu {
                         inner: &peer.inner,
                         scr_gu: &peer.scr_gu,
                         scr_down: &peer.scr_down,
-                        pos: &peer.pos,
-                        rope_pos: &peer.rope_pos,
+                        pos: &mut peer.pos,
+                        rope_pos: &mut peer.rope_pos,
                         hidden: &peer.hidden,
                         x1: &peer.x1,
                         boundary_norm: &peer.boundary_norm,
@@ -1131,6 +1137,213 @@ impl QwenGpu {
         self.step()
     }
 
+    /// Text-only batched prefill at consecutive text positions.
+    pub fn push_tokens(&mut self, tokens: &[u32]) -> Result<()> {
+        let base = self.position;
+        let pos3: Vec<[i32; 3]> = (base..base + tokens.len())
+            .map(|p| [p as i32, p as i32, p as i32])
+            .collect();
+        self.push_tokens_at(tokens, &pos3)
+    }
+
+    /// Batched prefill: blocks of tokens cross the stack layer-major, so
+    /// a streamed layer's weights flow once per block, not once per
+    /// token. Text only; vision rows keep the per-token path.
+    pub fn push_tokens_at(&mut self, tokens: &[u32], pos3: &[[i32; 3]]) -> Result<()> {
+        ensure!(!tokens.is_empty(), "empty prefill block");
+        ensure!(
+            pos3.len() == tokens.len(),
+            "{} positions for {} tokens",
+            pos3.len(),
+            tokens.len()
+        );
+        ensure!(
+            self.position + tokens.len() <= self.max_ctx,
+            "position {} + {} tokens exceeds max_ctx {} (KV cache capacity)",
+            self.position,
+            tokens.len(),
+            self.max_ctx
+        );
+        if std::env::var_os(TOKEN_PREFILL_ENV).is_some() {
+            for (&token, &p) in tokens.iter().zip(pos3) {
+                self.push_token_at(token, p)?;
+            }
+            return Ok(());
+        }
+        for (chunk, positions) in tokens.chunks(PREFILL_BLOCK).zip(pos3.chunks(PREFILL_BLOCK)) {
+            self.push_block(chunk, positions)?;
+        }
+        Ok(())
+    }
+
+    /// One block through the whole stack, layer-major on every device;
+    /// the tail mirrors step_layers (lm_head, argmax, counter bumps).
+    fn push_block(&mut self, tokens: &[u32], pos3: &[[i32; 3]]) -> Result<()> {
+        let text = self.config.text_config.clone();
+        let n = text.hidden_size;
+        let eps = text.rms_norm_eps as f32;
+        let base = self.position;
+        let embed_name = format!("{TEXT_PREFIX}.embed_tokens");
+        let mut hiddens: Vec<CudaSliceF> = Vec::with_capacity(tokens.len());
+        let mut x1s: Vec<CudaSliceF> = Vec::with_capacity(tokens.len());
+        for &token in tokens {
+            let embed = self
+                .proj
+                .get(&embed_name)
+                .context("embed_tokens resident")?;
+            self.ctx
+                .stream
+                .memcpy_htod(&[token as i32], &mut self.next_token)?;
+            let hidden = self.ctx.stream.alloc_zeros::<f32>(n)?;
+            self.ctx.glue_embed_row(embed, &self.next_token, &hidden)?;
+            let x1 = self.ctx.stream.alloc_zeros::<f32>(n)?;
+            hiddens.push(hidden);
+            x1s.push(x1);
+        }
+        for (hidden, x1) in hiddens.iter().zip(x1s.iter()) {
+            self.ctx
+                .glue_rmsnorm_zc(hidden, &self.ln[0][0], x1, n, eps)?;
+        }
+        let (start0, end0) = self.ranges[0];
+        run_block(
+            &mut StackView {
+                ctx: &self.ctx,
+                wide: &self.wide,
+                proj: &self.proj,
+                ln: &self.ln,
+                attn_norms: &self.attn_norms,
+                gdn: &self.gdn,
+                kv_keys: &self.kv_keys,
+                kv_values: &self.kv_values,
+                q_out: &self.q_out,
+                gate_out: &self.gate_out,
+                attn_out: &self.attn_out,
+                inner: &self.inner,
+                scr_gu: &self.scr_gu,
+                scr_down: &self.scr_down,
+                pos: &mut self.pos,
+                rope_pos: &mut self.rope_pos,
+                hidden: &self.hidden,
+                x1: &self.x1,
+                boundary_norm: self.boundary_norms.first().unwrap_or(&self.final_norm_w),
+                stream: self.streaming.as_mut(),
+            },
+            start0..end0,
+            &text,
+            base,
+            pos3,
+            &hiddens,
+            &x1s,
+        )?;
+        let mut hiddens = hiddens;
+        let mut x1s = x1s;
+        for i in 0..self.peers.len() {
+            let (start, end) = self.ranges[i + 1];
+            let src = if i == 0 {
+                &self.ctx
+            } else {
+                &self.peers[i - 1].ctx
+            };
+            let mut hop = vec![0f32; 2 * n * tokens.len()];
+            for t in 0..tokens.len() {
+                src.stream
+                    .memcpy_dtoh(&hiddens[t], &mut hop[2 * n * t..n * (2 * t + 1)])?;
+                src.stream
+                    .memcpy_dtoh(&x1s[t], &mut hop[n * (2 * t + 1)..2 * n * (t + 1)])?;
+            }
+            let mut ph: Vec<CudaSliceF> = Vec::with_capacity(tokens.len());
+            let mut px: Vec<CudaSliceF> = Vec::with_capacity(tokens.len());
+            {
+                let peer = &mut self.peers[i];
+                for t in 0..tokens.len() {
+                    let mut hidden = peer.ctx.stream.alloc_zeros::<f32>(n)?;
+                    let mut x1 = peer.ctx.stream.alloc_zeros::<f32>(n)?;
+                    peer.ctx
+                        .stream
+                        .memcpy_htod(&hop[2 * n * t..n * (2 * t + 1)], &mut hidden)?;
+                    peer.ctx
+                        .stream
+                        .memcpy_htod(&hop[n * (2 * t + 1)..2 * n * (t + 1)], &mut x1)?;
+                    ph.push(hidden);
+                    px.push(x1);
+                }
+                run_block(
+                    &mut StackView {
+                        ctx: &peer.ctx,
+                        wide: &peer.wide,
+                        proj: &peer.proj,
+                        ln: &peer.ln,
+                        attn_norms: &peer.attn_norms,
+                        gdn: &peer.gdn,
+                        kv_keys: &peer.kv_keys,
+                        kv_values: &peer.kv_values,
+                        q_out: &peer.q_out,
+                        gate_out: &peer.gate_out,
+                        attn_out: &peer.attn_out,
+                        inner: &peer.inner,
+                        scr_gu: &peer.scr_gu,
+                        scr_down: &peer.scr_down,
+                        pos: &mut peer.pos,
+                        rope_pos: &mut peer.rope_pos,
+                        hidden: &peer.hidden,
+                        x1: &peer.x1,
+                        boundary_norm: &peer.boundary_norm,
+                        stream: peer.streaming.as_mut(),
+                    },
+                    start..end,
+                    &text,
+                    base,
+                    pos3,
+                    &ph,
+                    &px,
+                )?;
+            }
+            hiddens = ph;
+            x1s = px;
+        }
+        let (last_ctx, last_x1) = if self.peers.is_empty() {
+            (&self.ctx, x1s.last().expect("checked non-empty"))
+        } else {
+            let peer = self.peers.last().expect("checked non-empty");
+            (&peer.ctx, x1s.last().expect("checked non-empty"))
+        };
+        last_ctx
+            .stream
+            .memcpy_dtoh(last_x1, &mut self.staging[..n])?;
+        self.ctx
+            .stream
+            .memcpy_htod(&self.staging[..n], &mut self.x1)?;
+        let lm = self.proj.get("lm_head").context("lm_head resident")?;
+        let segs = [
+            lm.group_seg(),
+            lm.empty_seg_like(),
+            lm.empty_seg_like(),
+            lm.empty_seg_like(),
+        ];
+        self.wide.group(
+            &self.ctx,
+            &segs,
+            [lm.y_ref(); 4],
+            &self.x1,
+            &self.x1,
+            lm.in_dim,
+            1,
+        )?;
+        let lm_out = lm.out_dim;
+        std::mem::swap(&mut self.next_token, &mut self.nt_spare);
+        self.ctx
+            .glue_argmax(lm.y_ref(), &mut self.nt_spare, lm_out)?;
+        std::mem::swap(&mut self.next_token, &mut self.nt_spare);
+        self.ctx.glue_inc(&mut self.pos)?;
+        self.ctx.glue_inc3(&mut self.rope_pos)?;
+        for peer in &mut self.peers {
+            peer.ctx.glue_inc(&mut peer.pos)?;
+            peer.ctx.glue_inc3(&mut peer.rope_pos)?;
+        }
+        self.position += tokens.len();
+        Ok(())
+    }
+
     /// Prefill one merged vision row into `hidden`. Eager — never
     /// graph-captured (the decode graph is splice-free).
     pub fn push_vision_row(&mut self, row: &[f32], pos3: [i32; 3]) -> Result<()> {
@@ -1178,8 +1391,8 @@ struct StackView<'a> {
     inner: &'a CudaSliceF,
     scr_gu: &'a CudaSliceF,
     scr_down: &'a CudaSliceF,
-    pos: &'a CudaSliceI,
-    rope_pos: &'a CudaSliceI,
+    pos: &'a mut CudaSliceI,
+    rope_pos: &'a mut CudaSliceI,
     hidden: &'a CudaSliceF,
     x1: &'a CudaSliceF,
     boundary_norm: &'a CudaSliceF,
@@ -1278,8 +1491,6 @@ fn layer_proj<'a>(
 /// waits each layer's slot fill, refills the ring one layer ahead, and
 /// frees the slot once the layer's last projection reader is enqueued.
 fn run_stack(view: &mut StackView, layers: Range<usize>, text: &TextConfig) -> Result<()> {
-    let eps = text.rms_norm_eps as f32;
-    let n = text.hidden_size;
     let mut gdn_index = 0usize;
     let mut kv_index = 0usize;
     let start = layers.start;
@@ -1298,207 +1509,308 @@ fn run_stack(view: &mut StackView, layers: Range<usize>, text: &TextConfig) -> R
         {
             state.begin_layer(view.ctx, layer)?;
         }
-        // x1 enters holding rmsnorm_zc(hidden, ln_in).
+        run_layer(
+            view,
+            text,
+            LayerSpan {
+                layer,
+                local,
+                range_end: end,
+                gdn_index,
+                kv_index,
+                hidden: view.hidden,
+                x1: view.x1,
+            },
+            stream.as_deref(),
+        )?;
         if text.layer_kind(layer) == LayerKind::LinearAttention {
-            let projs = stream.as_deref();
-            let qkv = layer_proj(view, projs, layer, "linear_attn.in_proj_qkv")?;
-            let z = layer_proj(view, projs, layer, "linear_attn.in_proj_z")?;
-            let b = layer_proj(view, projs, layer, "linear_attn.in_proj_b")?;
-            let a = layer_proj(view, projs, layer, "linear_attn.in_proj_a")?;
-            let out_proj = layer_proj(view, projs, layer, "linear_attn.out_proj")?;
-            let segs = [qkv.group_seg(), z.group_seg(), b.group_seg(), a.group_seg()];
-            view.wide.group(
-                view.ctx,
-                &segs,
-                [qkv.y_ref(), z.y_ref(), b.y_ref(), a.y_ref()],
-                view.x1,
-                view.x1,
-                qkv.in_dim(),
-                1,
-            )?;
-            let g = &view.gdn[gdn_index];
-            view.ctx
-                .gdn_conv_heads(g, qkv.y_ref(), z.y_ref(), b.y_ref(), a.y_ref())?;
-            let gout = view.ctx.gdn_out_buf(g);
-            let segs = [
-                out_proj.group_seg(),
-                out_proj.empty_seg_like(),
-                out_proj.empty_seg_like(),
-                out_proj.empty_seg_like(),
-            ];
-            view.wide.group(
-                view.ctx,
-                &segs,
-                [out_proj.y_ref(); 4],
-                gout,
-                gout,
-                out_proj.in_dim(),
-                1,
-            )?;
-            view.ctx.glue_add_rmsnorm_zc(
-                view.hidden,
-                out_proj.y_ref(),
-                &view.ln[local][1],
-                view.x1,
-                n,
-                eps,
-            )?;
             gdn_index += 1;
         } else {
-            let projs = stream.as_deref();
-            let q = layer_proj(view, projs, layer, "self_attn.q_proj")?;
-            let k = layer_proj(view, projs, layer, "self_attn.k_proj")?;
-            let v = layer_proj(view, projs, layer, "self_attn.v_proj")?;
-            let o = layer_proj(view, projs, layer, "self_attn.o_proj")?;
-            let segs = [
-                q.group_seg(),
-                k.group_seg(),
-                v.group_seg(),
-                q.empty_seg_like(),
-            ];
-            view.wide.group(
-                view.ctx,
-                &segs,
-                [q.y_ref(), k.y_ref(), v.y_ref(), q.y_ref()],
-                view.x1,
-                view.x1,
-                q.in_dim(),
-                1,
-            )?;
-            let [qn, kn] = &view.attn_norms[kv_index];
-            let rotary_dim = (text.head_dim as f64 * text.rope.partial_rotary_factor) as usize;
-            view.ctx.glue_attn_qk_zc_mrope(
-                q.y_ref(),
-                qn,
-                k.y_ref(),
-                kn,
-                v.y_ref(),
-                view.q_out,
-                view.gate_out,
-                &view.kv_keys[kv_index],
-                &view.kv_values[kv_index],
-                view.pos,
-                view.rope_pos,
-                text.num_key_value_heads * text.head_dim,
-                text.num_attention_heads,
-                text.num_key_value_heads,
-                text.head_dim,
-                rotary_dim,
-                text.rope.rope_theta,
-                text.rope.mrope_section[1],
-                text.rope.mrope_section[2],
-            )?;
-            let scale = 1.0 / (text.head_dim as f32).sqrt();
-            view.ctx.glue_attn_scores_raw(
-                view.q_out,
-                view.gate_out,
-                &view.kv_keys[kv_index],
-                &view.kv_values[kv_index],
-                view.attn_out,
-                view.pos,
-                text.num_key_value_heads * text.head_dim,
-                text.num_attention_heads,
-                text.num_key_value_heads,
-                text.head_dim,
-                scale,
-            )?;
-            let segs = [
-                o.group_seg(),
-                o.empty_seg_like(),
-                o.empty_seg_like(),
-                o.empty_seg_like(),
-            ];
-            view.wide.group(
-                view.ctx,
-                &segs,
-                [o.y_ref(); 4],
-                view.attn_out,
-                view.attn_out,
-                o.in_dim(),
-                1,
-            )?;
-            view.ctx.glue_add_rmsnorm_zc(
-                view.hidden,
-                o.y_ref(),
-                &view.ln[local][1],
-                view.x1,
-                n,
-                eps,
-            )?;
             kv_index += 1;
         }
-        // Dense MLP on x1, then the fused residual + next-layer's norm
-        // (the boundary norm after the range's last layer).
-        let projs = stream.as_deref();
-        let gate = layer_proj(view, projs, layer, "mlp.gate_proj")?;
-        let up = layer_proj(view, projs, layer, "mlp.up_proj")?;
-        let down = layer_proj(view, projs, layer, "mlp.down_proj")?;
-        let (gp, gs, gb) = gate.tensors();
-        let (up_, us, ub) = up.tensors();
-        view.wide.down(
-            view.ctx,
-            gp,
-            gs,
-            gb,
-            view.x1,
-            view.x1,
-            gate.y_ref(),
-            gate.y_ref(),
-            view.scr_gu,
-            view.scr_gu,
-            gate.out_dim(),
-            gate.in_dim(),
-            1,
-            1,
-        )?;
-        view.wide.down(
-            view.ctx,
-            up_,
-            us,
-            ub,
-            view.x1,
-            view.x1,
-            up.y_ref(),
-            up.y_ref(),
-            view.scr_gu,
-            view.scr_gu,
-            up.out_dim(),
-            up.in_dim(),
-            1,
-            1,
-        )?;
-        view.ctx
-            .silu_mul(gate.y_ref(), up.y_ref(), view.inner, text.intermediate_size)?;
-        let (dp, ds, db) = down.tensors();
-        view.wide.down(
-            view.ctx,
-            dp,
-            ds,
-            db,
-            view.inner,
-            view.inner,
-            down.y_ref(),
-            down.y_ref(),
-            view.scr_down,
-            view.scr_down,
-            down.out_dim(),
-            down.in_dim(),
-            4,
-            1,
-        )?;
-        let next_w: &CudaSliceF = if layer + 1 < end {
-            &view.ln[local + 1][0]
-        } else {
-            view.boundary_norm
-        };
-        view.ctx
-            .glue_add_rmsnorm_zc(view.hidden, down.y_ref(), next_w, view.x1, n, eps)?;
         if layer >= resident_through
             && let Some(state) = stream.as_mut()
         {
             state.end_layer(view.ctx, layer)?;
         }
     }
+    Ok(())
+}
+
+/// Layer-major prefill of one block on one device: a layer's weights
+/// (slot or resident) serve every token of the block before the next
+/// layer starts. Tokens keep their in-block order, so KV and GDN state
+/// evolve exactly as the per-token path; pos and rope_pos are staged per
+/// token instead of carried by the tail counter bumps.
+fn run_block(
+    view: &mut StackView,
+    layers: Range<usize>,
+    text: &TextConfig,
+    base: usize,
+    pos3: &[[i32; 3]],
+    hiddens: &[CudaSliceF],
+    x1s: &[CudaSliceF],
+) -> Result<()> {
+    let mut gdn_index = 0usize;
+    let mut kv_index = 0usize;
+    let start = layers.start;
+    let end = layers.end;
+    let mut stream = view.stream.take();
+    if let Some(state) = stream.as_mut() {
+        state.prime()?;
+    }
+    let resident_through = stream.as_ref().map_or(end, |state| state.range.0);
+    for layer in layers {
+        let local = layer - start;
+        if layer >= resident_through
+            && let Some(state) = stream.as_mut()
+        {
+            state.begin_layer(view.ctx, layer)?;
+        }
+        for (offset, hidden) in hiddens.iter().enumerate() {
+            view.ctx
+                .stream
+                .memcpy_htod(&[(base + offset) as i32], view.pos)?;
+            view.ctx.stream.memcpy_htod(&pos3[offset], view.rope_pos)?;
+            run_layer(
+                view,
+                text,
+                LayerSpan {
+                    layer,
+                    local,
+                    range_end: end,
+                    gdn_index,
+                    kv_index,
+                    hidden,
+                    x1: &x1s[offset],
+                },
+                stream.as_deref(),
+            )?;
+        }
+        if text.layer_kind(layer) == LayerKind::LinearAttention {
+            gdn_index += 1;
+        } else {
+            kv_index += 1;
+        }
+        if layer >= resident_through
+            && let Some(state) = stream.as_mut()
+        {
+            state.end_layer(view.ctx, layer)?;
+        }
+    }
+    Ok(())
+}
+
+/// One layer of one token: attention (GDN or full) on `x1`, the dense
+/// MLP, then the fused residual add and next-layer norm.
+struct LayerSpan<'a> {
+    layer: usize,
+    local: usize,
+    range_end: usize,
+    gdn_index: usize,
+    kv_index: usize,
+    hidden: &'a CudaSliceF,
+    x1: &'a CudaSliceF,
+}
+
+fn run_layer(
+    view: &StackView,
+    text: &TextConfig,
+    span: LayerSpan<'_>,
+    stream: Option<&StreamState>,
+) -> Result<()> {
+    let eps = text.rms_norm_eps as f32;
+    let n = text.hidden_size;
+    let LayerSpan {
+        layer,
+        local,
+        range_end: end,
+        gdn_index,
+        kv_index,
+        hidden,
+        x1,
+    } = span;
+    // x1 enters holding rmsnorm_zc(hidden, ln_in).
+    if text.layer_kind(layer) == LayerKind::LinearAttention {
+        let projs = stream;
+        let qkv = layer_proj(view, projs, layer, "linear_attn.in_proj_qkv")?;
+        let z = layer_proj(view, projs, layer, "linear_attn.in_proj_z")?;
+        let b = layer_proj(view, projs, layer, "linear_attn.in_proj_b")?;
+        let a = layer_proj(view, projs, layer, "linear_attn.in_proj_a")?;
+        let out_proj = layer_proj(view, projs, layer, "linear_attn.out_proj")?;
+        let segs = [qkv.group_seg(), z.group_seg(), b.group_seg(), a.group_seg()];
+        view.wide.group(
+            view.ctx,
+            &segs,
+            [qkv.y_ref(), z.y_ref(), b.y_ref(), a.y_ref()],
+            x1,
+            x1,
+            qkv.in_dim(),
+            1,
+        )?;
+        let g = &view.gdn[gdn_index];
+        view.ctx
+            .gdn_conv_heads(g, qkv.y_ref(), z.y_ref(), b.y_ref(), a.y_ref())?;
+        let gout = view.ctx.gdn_out_buf(g);
+        let segs = [
+            out_proj.group_seg(),
+            out_proj.empty_seg_like(),
+            out_proj.empty_seg_like(),
+            out_proj.empty_seg_like(),
+        ];
+        view.wide.group(
+            view.ctx,
+            &segs,
+            [out_proj.y_ref(); 4],
+            gout,
+            gout,
+            out_proj.in_dim(),
+            1,
+        )?;
+        view.ctx
+            .glue_add_rmsnorm_zc(hidden, out_proj.y_ref(), &view.ln[local][1], x1, n, eps)?;
+    } else {
+        let projs = stream;
+        let q = layer_proj(view, projs, layer, "self_attn.q_proj")?;
+        let k = layer_proj(view, projs, layer, "self_attn.k_proj")?;
+        let v = layer_proj(view, projs, layer, "self_attn.v_proj")?;
+        let o = layer_proj(view, projs, layer, "self_attn.o_proj")?;
+        let segs = [
+            q.group_seg(),
+            k.group_seg(),
+            v.group_seg(),
+            q.empty_seg_like(),
+        ];
+        view.wide.group(
+            view.ctx,
+            &segs,
+            [q.y_ref(), k.y_ref(), v.y_ref(), q.y_ref()],
+            x1,
+            x1,
+            q.in_dim(),
+            1,
+        )?;
+        let [qn, kn] = &view.attn_norms[kv_index];
+        let rotary_dim = (text.head_dim as f64 * text.rope.partial_rotary_factor) as usize;
+        view.ctx.glue_attn_qk_zc_mrope(
+            q.y_ref(),
+            qn,
+            k.y_ref(),
+            kn,
+            v.y_ref(),
+            view.q_out,
+            view.gate_out,
+            &view.kv_keys[kv_index],
+            &view.kv_values[kv_index],
+            view.pos,
+            view.rope_pos,
+            text.num_key_value_heads * text.head_dim,
+            text.num_attention_heads,
+            text.num_key_value_heads,
+            text.head_dim,
+            rotary_dim,
+            text.rope.rope_theta,
+            text.rope.mrope_section[1],
+            text.rope.mrope_section[2],
+        )?;
+        let scale = 1.0 / (text.head_dim as f32).sqrt();
+        view.ctx.glue_attn_scores_raw(
+            view.q_out,
+            view.gate_out,
+            &view.kv_keys[kv_index],
+            &view.kv_values[kv_index],
+            view.attn_out,
+            view.pos,
+            text.num_key_value_heads * text.head_dim,
+            text.num_attention_heads,
+            text.num_key_value_heads,
+            text.head_dim,
+            scale,
+        )?;
+        let segs = [
+            o.group_seg(),
+            o.empty_seg_like(),
+            o.empty_seg_like(),
+            o.empty_seg_like(),
+        ];
+        view.wide.group(
+            view.ctx,
+            &segs,
+            [o.y_ref(); 4],
+            view.attn_out,
+            view.attn_out,
+            o.in_dim(),
+            1,
+        )?;
+        view.ctx
+            .glue_add_rmsnorm_zc(hidden, o.y_ref(), &view.ln[local][1], x1, n, eps)?;
+    }
+    // Dense MLP on x1, then the fused residual + next-layer's norm
+    // (the boundary norm after the range's last layer).
+    let projs = stream;
+    let gate = layer_proj(view, projs, layer, "mlp.gate_proj")?;
+    let up = layer_proj(view, projs, layer, "mlp.up_proj")?;
+    let down = layer_proj(view, projs, layer, "mlp.down_proj")?;
+    let (gp, gs, gb) = gate.tensors();
+    let (up_, us, ub) = up.tensors();
+    view.wide.down(
+        view.ctx,
+        gp,
+        gs,
+        gb,
+        x1,
+        x1,
+        gate.y_ref(),
+        gate.y_ref(),
+        view.scr_gu,
+        view.scr_gu,
+        gate.out_dim(),
+        gate.in_dim(),
+        1,
+        1,
+    )?;
+    view.wide.down(
+        view.ctx,
+        up_,
+        us,
+        ub,
+        x1,
+        x1,
+        up.y_ref(),
+        up.y_ref(),
+        view.scr_gu,
+        view.scr_gu,
+        up.out_dim(),
+        up.in_dim(),
+        1,
+        1,
+    )?;
+    view.ctx
+        .silu_mul(gate.y_ref(), up.y_ref(), view.inner, text.intermediate_size)?;
+    let (dp, ds, db) = down.tensors();
+    view.wide.down(
+        view.ctx,
+        dp,
+        ds,
+        db,
+        view.inner,
+        view.inner,
+        down.y_ref(),
+        down.y_ref(),
+        view.scr_down,
+        view.scr_down,
+        down.out_dim(),
+        down.in_dim(),
+        4,
+        1,
+    )?;
+    let next_w: &CudaSliceF = if layer + 1 < end {
+        &view.ln[local + 1][0]
+    } else {
+        view.boundary_norm
+    };
+    view.ctx
+        .glue_add_rmsnorm_zc(hidden, down.y_ref(), next_w, x1, n, eps)?;
     Ok(())
 }
 

@@ -146,9 +146,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         } else {
-            for &id in &ids {
-                gpu.push_token(id)?;
-            }
+            gpu.push_tokens(&ids)?;
         }
         println!("prefill: {:.2}s (gpu)", started.elapsed().as_secs_f32());
         if spec_mode {

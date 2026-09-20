@@ -7,6 +7,8 @@ use crate::weights::Edge0Weights;
 use anyhow::Context;
 use anyhow::Result;
 #[cfg(feature = "cuda")]
+use anyhow::ensure;
+#[cfg(feature = "cuda")]
 use cudarc::driver::sys;
 use std::path::Path;
 
@@ -63,11 +65,11 @@ struct LayerNorms {
     post: Vec<f32>,
 }
 
-struct GdnWeights {
-    conv1d: Vec<f32>,
-    dt_bias: Vec<f32>,
-    a_log: Vec<f32>,
-    norm: Vec<f32>,
+pub(crate) struct GdnWeights {
+    pub(crate) conv1d: Vec<f32>,
+    pub(crate) dt_bias: Vec<f32>,
+    pub(crate) a_log: Vec<f32>,
+    pub(crate) norm: Vec<f32>,
 }
 
 struct AttnNorms {
@@ -108,6 +110,8 @@ pub struct Edge0Text {
     pub gpu: Option<crate::gpu::GpuRuntime>,
     #[cfg(feature = "cuda")]
     pub gpu_experts: Option<crate::gpu::GpuExperts>,
+    #[cfg(feature = "cuda")]
+    pub gpu_multi: Option<crate::gpu::Edge0Multi>,
     #[cfg(feature = "cuda")]
     decode_graph: Option<crate::gpu::DecodeGraph>,
     pub timing: Timing,
@@ -176,6 +180,8 @@ impl Edge0Text {
             gpu: None,
             #[cfg(feature = "cuda")]
             gpu_experts: None,
+            #[cfg(feature = "cuda")]
+            gpu_multi: None,
             #[cfg(feature = "cuda")]
             decode_graph: None,
             timing: Timing::default(),
@@ -998,6 +1004,299 @@ impl Edge0Text {
             Some(res),
             self.weights.lora_rank,
         ));
+        Ok(())
+    }
+
+    /// Multi-device orchestration entry point. Mirrors the qwen35 port
+    /// (commits 9b6ead8, acc252d).
+    ///
+    /// `ordinals.len() == 1` routes to the existing single-context path
+    /// bitwise-identical to `enable_gpu(ordinals[0], experts_resident)`.
+    /// `ordinals.len() > 1` builds one `GpuRuntime` per ordinal for its
+    /// byte-balanced layer range, verifies the residency plan fits every
+    /// device, and decodes through `forward_multi`/`forward_token_multi`.
+    /// Whole-expert residency stays single-device (bails on multiple
+    /// ordinals); streamed experts keep their per-layer host round-trip.
+    #[cfg(feature = "cuda")]
+    pub fn enable_gpu_multi(&mut self, ordinals: &[usize], experts_resident: bool) -> Result<()> {
+        ensure!(!ordinals.is_empty(), "at least one ordinal required");
+        if ordinals.len() == 1 {
+            return self.enable_gpu(ordinals[0], experts_resident);
+        }
+        if experts_resident {
+            // Whole-expert residency is single-device today. The
+            // multi-device expert attribution (per-layer expert split
+            // across device ranges) requires a refactor of the
+            // stacked-expert upload in `enable_gpu`. Keep the existing
+            // semantics: refuse multi-device full-residency rather
+            // than silently uploading the full ~17 GiB to one card.
+            anyhow::bail!(
+                "--resident-experts across multiple devices is not yet wired; \
+                 use --device cuda:N for single-GPU full residency"
+            );
+        }
+        let config = self.config.clone();
+        let mut free_bytes = Vec::with_capacity(ordinals.len());
+        for &ordinal in ordinals {
+            let ctx = crate::gpu::GpuContext::new(ordinal)
+                .with_context(|| format!("init CUDA context on device {ordinal}"))?;
+            let (free, _) = ctx
+                .context
+                .mem_get_info()
+                .with_context(|| format!("mem_get_info on cuda:{ordinal}"))?;
+            free_bytes.push(free as u64);
+        }
+        let plans = crate::gpu::plan_residency(
+            &self.weights,
+            &config,
+            ordinals,
+            configured_max_ctx(),
+            &free_bytes,
+        )?;
+        for plan in &plans {
+            eprintln!(
+                "edge0_multi_plan cuda:{} range={}..{} projection={} MiB kv={} MiB static={} MiB \
+                 total={} MiB free={} MiB fits={}",
+                plan.ordinal,
+                plan.range.start,
+                plan.range.end,
+                plan.projection_bytes / (1024 * 1024),
+                plan.kv_bytes / (1024 * 1024),
+                plan.static_bytes / (1024 * 1024),
+                plan.total_bytes / (1024 * 1024),
+                plan.free_bytes / (1024 * 1024),
+                plan.total_bytes <= plan.free_bytes,
+            );
+        }
+        for plan in &plans {
+            anyhow::ensure!(
+                plan.total_bytes <= plan.free_bytes,
+                "cuda:{} cannot hold the layer range ({} MiB > {} MiB free)",
+                plan.ordinal,
+                plan.total_bytes / (1024 * 1024),
+                plan.free_bytes / (1024 * 1024),
+            );
+        }
+        // Flatten the layer-norm buffers (input/post per layer) and the
+        // attention-norm buffers (q/k per FullAttention layer) into
+        // the slices `Edge0Multi::new` expects.
+        let text = &config.text_config;
+        let mut layer_norms = Vec::with_capacity(text.num_hidden_layers * 2);
+        for n in &self.layer_norms {
+            layer_norms.push(n.input.clone());
+            layer_norms.push(n.post.clone());
+        }
+        let mut attn_norms_flat = Vec::with_capacity(self.attn_norms.len() * 2);
+        for n in &self.attn_norms {
+            attn_norms_flat.push(n.q.clone());
+            attn_norms_flat.push(n.k.clone());
+        }
+        self.gpu_multi = Some(crate::gpu::Edge0Multi::new(
+            ordinals,
+            &self.weights,
+            &config,
+            &layer_norms,
+            &attn_norms_flat,
+            &self.gdn_weights,
+            &self.embed,
+            &self.final_norm,
+        )?);
+        Ok(())
+    }
+
+    /// First decode token from the multi-device prefill state (no forward).
+    #[cfg(feature = "cuda")]
+    pub fn first_token_multi(&mut self) -> Result<u32> {
+        let multi = self.gpu_multi.as_mut().expect("multi-device runtime");
+        multi.peers[0].argmax_x1()
+    }
+
+    /// Multi-device closed decode step: layers + final norm + lm_head +
+    /// argmax + position bump, with `hidden` host-hopping between peers.
+    /// Harness path only — resident experts stay single-device.
+    #[cfg(feature = "cuda")]
+    pub fn forward_token_multi(&mut self, prev: u32) -> Result<u32> {
+        let mut multi = self.gpu_multi.take().expect("multi-device runtime");
+        multi.peers[0]
+            .ctx
+            .counted_sync()
+            .context("peer0 embed pre-sync")?;
+        multi.peers[0].embed_into_hidden(prev)?;
+        self.multi_layer_pass(&mut multi)?;
+        multi.peers[0].final_norm()?;
+        let token = multi.peers[0].argmax_x1()?;
+        for peer in &multi.peers {
+            peer.bump_position()?;
+        }
+        self.position += 1;
+        self.gpu_multi = Some(multi);
+        Ok(token)
+    }
+
+    /// Multi-device prefill step: same layer pass as the decode step, but
+    /// returns the final-normed hidden instead of an argmaxed token. The
+    /// device state (KV, GDN, position counters) advances exactly as in
+    /// decode, so the decode chain continues from a warm state.
+    #[cfg(feature = "cuda")]
+    pub fn forward_multi(&mut self, token: u32) -> Result<Vec<f32>> {
+        let mut multi = self.gpu_multi.take().expect("multi-device runtime");
+        multi.peers[0]
+            .ctx
+            .counted_sync()
+            .context("peer0 embed pre-sync")?;
+        multi.peers[0].embed_into_hidden(token)?;
+        self.multi_layer_pass(&mut multi)?;
+        multi.peers[0].final_norm()?;
+        let mut hidden = std::mem::take(&mut multi.staging_hidden);
+        {
+            let res = multi.peers[0].res.as_ref().expect("peer0 resident");
+            multi.peers[0]
+                .ctx
+                .stream
+                .memcpy_dtoh(&res.x1, &mut hidden)?;
+        }
+        multi.staging_hidden = vec![0f32; hidden.len()];
+        for peer in &multi.peers {
+            peer.bump_position()?;
+        }
+        self.position += 1;
+        self.gpu_multi = Some(multi);
+        Ok(hidden)
+    }
+
+    /// The layer pass shared by multi-device prefill and decode: every peer
+    /// runs its range, then `hidden` hops host-mediated to the next peer
+    /// (the last peer's hidden hops back to peer 0).
+    #[cfg(feature = "cuda")]
+    fn multi_layer_pass(&mut self, multi: &mut crate::gpu::Edge0Multi) -> Result<()> {
+        let peer_count = multi.peers.len();
+        for peer_index in 0..peer_count {
+            let range = multi.ranges[peer_index].clone();
+            multi.peers[peer_index]
+                .ctx
+                .counted_sync()
+                .context("peer pre-layer sync")?;
+            let mut gdn_index_in_peer = 0usize;
+            let mut kv_index_in_peer = 0usize;
+            for local in range.clone() {
+                let peer_layer = local - range.start;
+                let prefix = format!("{P}.layers.{local}");
+                multi.peers[peer_index].rmsnorm_x1(peer_layer, 0)?;
+                let is_gdn =
+                    self.config.text_config.layer_kind(local) == LayerKind::LinearAttention;
+                if is_gdn {
+                    let qkv = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.linear_attn.in_proj_qkv"))
+                        .context("qkv resident")?;
+                    let z = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.linear_attn.in_proj_z"))
+                        .context("z resident")?;
+                    let b = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.linear_attn.in_proj_b"))
+                        .context("b resident")?;
+                    let a = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.linear_attn.in_proj_a"))
+                        .context("a resident")?;
+                    let out_proj = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.linear_attn.out_proj"))
+                        .context("out_proj resident")?;
+                    multi.peers[peer_index].gdn_layer_dx(
+                        gdn_index_in_peer,
+                        qkv,
+                        z,
+                        b,
+                        a,
+                        out_proj,
+                        multi.peers[peer_index].hidden_x1(),
+                    )?;
+                    multi.peers[peer_index].add_norm_x1(peer_layer, 1, out_proj.y_ref())?;
+                } else {
+                    let q = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.self_attn.q_proj"))
+                        .context("q resident")?;
+                    let k = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.self_attn.k_proj"))
+                        .context("k resident")?;
+                    let v = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.self_attn.v_proj"))
+                        .context("v resident")?;
+                    let o = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.self_attn.o_proj"))
+                        .context("o resident")?;
+                    let rotary_dim = (self.config.text_config.head_dim as f64
+                        * self.config.text_config.rope.partial_rotary_factor)
+                        as usize;
+                    multi.peers[peer_index].attn_layer(
+                        kv_index_in_peer,
+                        q,
+                        k,
+                        v,
+                        o,
+                        self.config.text_config.num_attention_heads,
+                        self.config.text_config.num_key_value_heads,
+                        self.config.text_config.head_dim,
+                        rotary_dim,
+                        self.config.text_config.rope.rope_theta,
+                    )?;
+                    multi.peers[peer_index].add_norm_x1(peer_layer, 1, o.y_ref())?;
+                }
+                gdn_index_in_peer += is_gdn as usize;
+                kv_index_in_peer += !is_gdn as usize;
+                // Host MoE round-trip — same numerics as the single-device
+                // harness path.
+                let x1_host = multi.peers[peer_index].read_hidden_x1()?;
+                // Drop the multi borrow before calling self so the
+                // borrow checker accepts the simultaneous self-borrow.
+                let moe_out = self.moe_forward(local, &prefix, &x1_host)?;
+                multi.peers[peer_index].add_moe_residual(&moe_out)?;
+            }
+            // Hop: dtoh from this peer's hidden, htod to next peer's hidden.
+            // The peer chain is closed by peer 0 doing final_norm + argmax,
+            // so the last peer's hidden hops back to peer 0.
+            multi.peers[peer_index]
+                .ctx
+                .counted_sync()
+                .context("peer post-layer sync")?;
+            // Snapshot staging_hidden so we can release the multi borrow
+            // before issuing the two memcpys (which need mutable access
+            // to two peers at once).
+            let mut staging = std::mem::take(&mut multi.staging_hidden);
+            {
+                let res = multi.peers[peer_index]
+                    .res
+                    .as_ref()
+                    .expect("resident state");
+                multi.peers[peer_index]
+                    .ctx
+                    .stream
+                    .memcpy_dtoh(&res.hidden, &mut staging)?;
+            }
+            let next_index = if peer_index + 1 < peer_count {
+                peer_index + 1
+            } else {
+                0
+            };
+            // Hop write: capture the stream borrow before holding the
+            // device-buffer borrow.
+            let stream = multi.peers[next_index].ctx.stream.clone();
+            {
+                let dst = multi.peers[next_index]
+                    .res
+                    .as_mut()
+                    .expect("next peer resident");
+                stream.memcpy_htod(&staging, &mut dst.hidden)?;
+            }
+            multi.staging_hidden = staging;
+        }
         Ok(())
     }
 
