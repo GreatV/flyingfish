@@ -37,6 +37,15 @@ pub fn layer_device_bytes(
             for p in ["conv1d", "A_log", "dt_bias", "norm"] {
                 total += weights.tensor_device_bytes(&format!("{prefix}.linear_attn.{p}"))?;
             }
+            // GpuGdn::upload's conv, recurrent, and output buffers.
+            let conv_dim = text.conv_dim();
+            let buffers = conv_dim * (text.linear_conv_kernel_dim - 1)
+                + text.linear_num_value_heads
+                    * text.linear_key_head_dim
+                    * text.linear_value_head_dim
+                + conv_dim
+                + text.linear_num_value_heads * text.linear_value_head_dim;
+            total += (buffers * std::mem::size_of::<f32>()) as u64;
         }
         LayerKind::FullAttention => {
             for p in ["q_norm", "k_norm"] {

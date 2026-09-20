@@ -1020,20 +1020,13 @@ impl Edge0Text {
     #[cfg(feature = "cuda")]
     pub fn enable_gpu_multi(&mut self, ordinals: &[usize], experts_resident: bool) -> Result<()> {
         ensure!(!ordinals.is_empty(), "at least one ordinal required");
+        for (i, &a) in ordinals.iter().enumerate() {
+            for &b in &ordinals[i + 1..] {
+                ensure!(a != b, "device ordinal {a} listed twice");
+            }
+        }
         if ordinals.len() == 1 {
             return self.enable_gpu(ordinals[0], experts_resident);
-        }
-        if experts_resident {
-            // Whole-expert residency is single-device today. The
-            // multi-device expert attribution (per-layer expert split
-            // across device ranges) requires a refactor of the
-            // stacked-expert upload in `enable_gpu`. Keep the existing
-            // semantics: refuse multi-device full-residency rather
-            // than silently uploading the full ~17 GiB to one card.
-            anyhow::bail!(
-                "--resident-experts across multiple devices is not yet wired; \
-                 use --device cuda:N for single-GPU full residency"
-            );
         }
         let config = self.config.clone();
         let mut free_bytes = Vec::with_capacity(ordinals.len());
@@ -1052,16 +1045,18 @@ impl Edge0Text {
             ordinals,
             configured_max_ctx(),
             &free_bytes,
+            experts_resident,
         )?;
         for plan in &plans {
             eprintln!(
-                "edge0_multi_plan cuda:{} range={}..{} projection={} MiB kv={} MiB static={} MiB \
-                 total={} MiB free={} MiB fits={}",
+                "edge0_multi_plan cuda:{} range={}..{} projection={} MiB kv={} MiB expert={} MiB \
+                 static={} MiB total={} MiB free={} MiB fits={}",
                 plan.ordinal,
                 plan.range.start,
                 plan.range.end,
                 plan.projection_bytes / (1024 * 1024),
                 plan.kv_bytes / (1024 * 1024),
+                plan.expert_bytes / (1024 * 1024),
                 plan.static_bytes / (1024 * 1024),
                 plan.total_bytes / (1024 * 1024),
                 plan.free_bytes / (1024 * 1024),
@@ -1071,10 +1066,15 @@ impl Edge0Text {
         for plan in &plans {
             anyhow::ensure!(
                 plan.total_bytes <= plan.free_bytes,
-                "cuda:{} cannot hold the layer range ({} MiB > {} MiB free)",
+                "cuda:{} cannot hold the layer range ({} MiB > {} MiB free; \
+                 projection={} MiB kv={} MiB expert={} MiB static={} MiB)",
                 plan.ordinal,
                 plan.total_bytes / (1024 * 1024),
                 plan.free_bytes / (1024 * 1024),
+                plan.projection_bytes / (1024 * 1024),
+                plan.kv_bytes / (1024 * 1024),
+                plan.expert_bytes / (1024 * 1024),
+                plan.static_bytes / (1024 * 1024),
             );
         }
         // Flatten the layer-norm buffers (input/post per layer) and the
@@ -1100,6 +1100,7 @@ impl Edge0Text {
             &self.gdn_weights,
             &self.embed,
             &self.final_norm,
+            experts_resident,
         )?);
         Ok(())
     }
@@ -1113,7 +1114,9 @@ impl Edge0Text {
 
     /// Multi-device closed decode step: layers + final norm + lm_head +
     /// argmax + position bump, with `hidden` host-hopping between peers.
-    /// Harness path only — resident experts stay single-device.
+    /// Supports both the harness path (host MoE round-trip) and the
+    /// resident path (on-device `moe_closed` per peer, scoped to that
+    /// peer's layer range).
     #[cfg(feature = "cuda")]
     pub fn forward_token_multi(&mut self, prev: u32) -> Result<u32> {
         let mut multi = self.gpu_multi.take().expect("multi-device runtime");
@@ -1251,13 +1254,53 @@ impl Edge0Text {
                 }
                 gdn_index_in_peer += is_gdn as usize;
                 kv_index_in_peer += !is_gdn as usize;
-                // Host MoE round-trip — same numerics as the single-device
-                // harness path.
-                let x1_host = multi.peers[peer_index].read_hidden_x1()?;
-                // Drop the multi borrow before calling self so the
-                // borrow checker accepts the simultaneous self-borrow.
-                let moe_out = self.moe_forward(local, &prefix, &x1_host)?;
-                multi.peers[peer_index].add_moe_residual(&moe_out)?;
+                // MoE step: closed on device when experts are resident
+                // (mirrors `forward_resident_inner`'s Some(experts) branch),
+                // otherwise the harness-style host round-trip — same
+                // numerics as the single-device path.
+                if multi.experts_resident {
+                    let experts = multi
+                        .peer_experts
+                        .get(peer_index)
+                        .and_then(Option::as_ref)
+                        .context("peer experts missing despite experts_resident")?;
+                    let router = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.mlp.gate"))
+                        .context("router resident")?;
+                    let shared_gate = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.mlp.shared_expert.gate_proj"))
+                        .context("sg resident")?;
+                    let shared_up = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.mlp.shared_expert.up_proj"))
+                        .context("su resident")?;
+                    let shared_scalar = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.mlp.shared_expert_gate"))
+                        .context("ss resident")?;
+                    let shared_down = multi.peers[peer_index]
+                        .proj
+                        .get(&format!("{prefix}.mlp.shared_expert.down_proj"))
+                        .context("sd resident")?;
+                    // The peer's `GpuExperts` is indexed by `peer_layer`,
+                    // matching the peer's own layer-range slice.
+                    multi.peers[peer_index].moe_closed(
+                        peer_layer,
+                        router,
+                        experts,
+                        (shared_gate, shared_up, shared_scalar, shared_down),
+                        multi.peers[peer_index].hidden_x1(),
+                        self.config.text_config.effective_top_k(),
+                    )?;
+                } else {
+                    let x1_host = multi.peers[peer_index].read_hidden_x1()?;
+                    // Drop the multi borrow before calling self so the
+                    // borrow checker accepts the simultaneous self-borrow.
+                    let moe_out = self.moe_forward(local, &prefix, &x1_host)?;
+                    multi.peers[peer_index].add_moe_residual(&moe_out)?;
+                }
             }
             // Hop: dtoh from this peer's hidden, htod to next peer's hidden.
             // The peer chain is closed by peer 0 doing final_norm + argmax,

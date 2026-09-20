@@ -227,7 +227,10 @@ impl Qwen35Weights {
         );
         let packed = if (packed_bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u32>())
         {
-            let shard = *self.index.get(&format!("{name}.weight")).expect("view_ref found it");
+            let shard = *self
+                .index
+                .get(&format!("{name}.weight"))
+                .expect("view_ref found it");
             let map = self.shards[shard].map.clone();
             let offset = packed_bytes.as_ptr() as usize - map.as_ptr() as usize;
             PackedView::Mmap {

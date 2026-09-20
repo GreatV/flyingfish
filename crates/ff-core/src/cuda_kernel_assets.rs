@@ -118,8 +118,11 @@ pub fn compute_capability(device: &CudaDevice) -> candle_core::Result<(i32, i32)
 
 type ModuleKey = (DeviceId, &'static str);
 
-fn module_cache() -> &'static Mutex<HashMap<ModuleKey, Arc<CudaModule>>> {
-    static CACHE: OnceLock<Mutex<HashMap<ModuleKey, Arc<CudaModule>>>> = OnceLock::new();
+/// Weak entries keep no CUDA resource alive when the owning device dies;
+/// a dead entry is rebuilt on next use and dropped from the map.
+fn module_cache() -> &'static Mutex<HashMap<ModuleKey, std::sync::Weak<CudaModule>>> {
+    static CACHE: OnceLock<Mutex<HashMap<ModuleKey, std::sync::Weak<CudaModule>>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -137,10 +140,16 @@ pub fn load_function(
 
     let key = (device.id(), module_name);
     let cached = {
-        let cache = module_cache()
+        let mut cache = module_cache()
             .lock()
             .map_err(|_| candle_core::Error::Msg("CUDA kernel module cache is poisoned".into()))?;
-        cache.get(&key).cloned()
+        match cache.get(&key).and_then(|weak| weak.upgrade()) {
+            hit @ Some(_) => hit,
+            None => {
+                cache.remove(&key);
+                None
+            }
+        }
     };
     let module = match cached {
         Some(module) => module,
@@ -159,7 +168,13 @@ pub fn load_function(
             let mut cache = module_cache().lock().map_err(|_| {
                 candle_core::Error::Msg("CUDA kernel module cache is poisoned".into())
             })?;
-            cache.entry(key).or_insert(module).clone()
+            match cache.get(&key).and_then(|weak| weak.upgrade()) {
+                Some(existing) => existing,
+                None => {
+                    cache.insert(key, Arc::downgrade(&module));
+                    module
+                }
+            }
         }
     };
     module.load_function(function_name).w()

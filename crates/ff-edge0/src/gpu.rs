@@ -42,6 +42,9 @@ pub struct DevicePlan {
     pub range: std::ops::Range<usize>,
     pub projection_bytes: u64,
     pub kv_bytes: u64,
+    /// Routed-expert bytes for this device's range (only nonzero when
+    /// `experts_resident` is true).
+    pub expert_bytes: u64,
     pub static_bytes: u64,
     pub total_bytes: u64,
     pub free_bytes: u64,
@@ -151,18 +154,30 @@ fn projection_bytes_for(weights: &super::weights::Edge0Weights, name: &str) -> R
 /// final RMSNorm. Mirrors the same shape on the production upload path.
 fn static_skeleton_bytes(weights: &super::weights::Edge0Weights) -> Result<u64> {
     let mut total = 0u64;
+    if weights.has("language_model.model.norm.weight") {
+        let shape = weights.shape("language_model.model.norm.weight")?;
+        let numel: u64 = shape.iter().product::<usize>() as u64;
+        // bf16 on disk (2 bytes/elem); uploaded as f32 doubles it.
+        total = total
+            .checked_add(numel.checked_mul(4).context("static bf16 overflow")?)
+            .context("static bf16 overflow")?;
+    }
     for name in [
-        "language_model.model.embed_tokens.weight",
+        "language_model.model.embed_tokens",
         "language_model.lm_head",
-        "language_model.model.norm.weight",
     ] {
-        if weights.has(name) {
-            let shape = weights.shape(name)?;
-            let numel: u64 = shape.iter().product::<usize>() as u64;
-            // bf16 on disk (2 bytes/elem); uploaded as f32 doubles it.
+        if weights.has(&format!("{name}.weight")) {
             total = total
-                .checked_add(numel.checked_mul(4).context("static bf16 overflow")?)
-                .context("static bf16 overflow")?;
+                .checked_add(projection_bytes_for(weights, name)?)
+                .context("static projection bytes overflow")?;
+            let shape = weights.shape(&format!("{name}.weight"))?;
+            total = total
+                .checked_add(
+                    (shape[0] as u64)
+                        .checked_mul(4)
+                        .context("static y overflow")?,
+                )
+                .context("static y overflow")?;
         }
     }
     Ok(total)
@@ -178,6 +193,7 @@ pub fn plan_residency(
     ordinals: &[usize],
     max_ctx: usize,
     free_bytes: &[u64],
+    experts_resident: bool,
 ) -> Result<Vec<DevicePlan>> {
     ensure!(
         !ordinals.is_empty(),
@@ -202,13 +218,36 @@ pub fn plan_residency(
     } else {
         static_skeleton_bytes(weights)?
     };
+    // Per-layer expert bytes. edge0's expert geometry is uniform across
+    // layers (enable_gpu enforces `rows[i] == r && in_dim[i] == d`); the
+    // per-layer count is therefore the total expert byte budget divided by
+    // the layer count, with bf16 scales/biases doubled for the device
+    // upload. Using `bucket_bytes` keeps the audit on the same path the
+    // single-device planner uses.
+    let expert_bytes_per_layer: Vec<u64> = if experts_resident && text.num_hidden_layers > 0 {
+        let (expert_packed, expert_sb, _statik_packed, _statik_sb, _embed_packed, _embed_sb) =
+            weights.bucket_bytes()?;
+        // Upload multiplies scales/biases by 2x for f32 device storage;
+        // packed weights stay at their on-disk bytes.
+        let total_device = expert_packed
+            .checked_add(expert_sb.checked_mul(2).context("expert sb overflow")?)
+            .context("expert total overflow")?;
+        let per = total_device / text.num_hidden_layers as u64;
+        vec![per; text.num_hidden_layers]
+    } else {
+        vec![0u64; text.num_hidden_layers]
+    };
     let mut plans = Vec::with_capacity(ordinals.len());
     for (index, (ordinal, range)) in ordinals.iter().zip(ranges.iter()).enumerate() {
         let mut projection_bytes = 0u64;
+        let mut expert_bytes = 0u64;
         for layer in range.clone() {
             projection_bytes = projection_bytes
                 .checked_add(layer_projection_bytes(weights, text, layer)?)
                 .context("per-device projection bytes overflow")?;
+            expert_bytes = expert_bytes
+                .checked_add(expert_bytes_per_layer[layer])
+                .context("per-device expert bytes overflow")?;
         }
         let full_attention_in_range = (range.clone())
             .filter(|&l| text.layer_kind(l) == crate::config::LayerKind::FullAttention)
@@ -218,6 +257,7 @@ pub fn plan_residency(
             .context("KV bytes overflow")?;
         let total_bytes = projection_bytes
             .checked_add(kv_bytes)
+            .and_then(|v| v.checked_add(expert_bytes))
             .and_then(|v| v.checked_add(if index == 0 { static_bytes } else { 0 }))
             .context("per-device total overflow")?;
         plans.push(DevicePlan {
@@ -225,6 +265,7 @@ pub fn plan_residency(
             range: range.clone(),
             projection_bytes,
             kv_bytes,
+            expert_bytes,
             static_bytes: if index == 0 { static_bytes } else { 0 },
             total_bytes,
             free_bytes: free_bytes[index],
@@ -3101,11 +3142,21 @@ pub struct Edge0Multi {
     pub ranges: Vec<std::ops::Range<usize>>,
     /// Host staging for the cross-device hidden hop.
     pub(crate) staging_hidden: Vec<f32>,
+    /// Per-peer resident expert sets (only Some when `experts_resident` is
+    /// true). Each `GpuExperts` is scoped to that peer's layer range,
+    /// indexed by `peer_layer = global_layer - range.start`.
+    pub(crate) peer_experts: Vec<Option<GpuExperts>>,
+    /// True when every peer's `MoE` step closes on-device via
+    /// `moe_closed`; false when each layer does a host round-trip.
+    pub experts_resident: bool,
 }
 
 impl Edge0Multi {
     /// Build one `GpuRuntime` per ordinal for its byte-balanced layer range.
-    /// Static (embed, lm_head, final_norm) lives on peer 0 only.
+    /// Static (embed, lm_head, final_norm) lives on peer 0 only. When
+    /// `experts_resident` is true, each peer also uploads the routed
+    /// experts for its layer range — `GpuExperts.stacked[peer_layer]`
+    /// indexes the local position, not the global layer index.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ordinals: &[usize],
@@ -3116,6 +3167,7 @@ impl Edge0Multi {
         gdn_weights: &[crate::model::GdnWeights],
         embed: &GroupQuant,
         final_norm: &[f32],
+        experts_resident: bool,
     ) -> Result<Self> {
         ensure!(
             !ordinals.is_empty(),
@@ -3123,6 +3175,7 @@ impl Edge0Multi {
         );
         let ranges = partition_layers(config.text_config.num_hidden_layers, ordinals.len());
         let mut peers = Vec::with_capacity(ordinals.len());
+        let mut peer_experts = Vec::with_capacity(ordinals.len());
         for (device_index, (&ordinal, range)) in ordinals.iter().zip(ranges.iter()).enumerate() {
             let ctx = GpuContext::new(ordinal)
                 .with_context(|| format!("init CUDA context on device {ordinal}"))?;
@@ -3151,6 +3204,17 @@ impl Edge0Multi {
             let gdn_devices =
                 gdn_devices_for_range(&ctx, gdn_weights, &config.text_config, range.clone())?;
             let rt = GpuRuntime::new(ctx, proj, gdn_devices, Some(res), weights.lora_rank);
+            let per_peer_experts = if experts_resident {
+                Some(build_peer_experts(
+                    &rt.ctx,
+                    weights,
+                    &config.text_config,
+                    range.clone(),
+                )?)
+            } else {
+                None
+            };
+            peer_experts.push(per_peer_experts);
             peers.push(rt);
         }
         let staging_hidden = vec![0f32; config.text_config.hidden_size];
@@ -3158,8 +3222,72 @@ impl Edge0Multi {
             peers,
             ranges,
             staging_hidden,
+            peer_experts,
+            experts_resident,
         })
     }
+}
+
+/// Build one `GpuExperts` over a layer range. The stacked tensors are
+/// indexed by `peer_layer = global_layer - range.start`; the kernel reads
+/// them through `batched_expert_gemv(experts, peer_layer, ...)`.
+fn build_peer_experts(
+    ctx: &GpuContext,
+    weights: &super::weights::Edge0Weights,
+    text: &crate::config::TextConfig,
+    range: std::ops::Range<usize>,
+) -> Result<GpuExperts> {
+    let mut stacked = Vec::with_capacity(range.len());
+    let mut stacked_scales = Vec::with_capacity(range.len());
+    let mut stacked_biases = Vec::with_capacity(range.len());
+    let mut rows = [0usize; 3];
+    let mut in_dim = [0usize; 3];
+    for (peer_layer, global_layer) in range.clone().enumerate() {
+        let mut row_p = Vec::with_capacity(3);
+        let mut row_s = Vec::with_capacity(3);
+        let mut row_b = Vec::with_capacity(3);
+        for (i, part) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
+            let (packed, s, b, r, d) = weights.stacked_projection(global_layer, part)?;
+            if peer_layer == 0 {
+                anyhow::ensure!(
+                    d / 8 <= 256,
+                    "{part}: words_per_row {} exceeds the batched-gemv cap 256",
+                    d / 8
+                );
+                rows[i] = r;
+                in_dim[i] = d;
+            } else {
+                anyhow::ensure!(
+                    rows[i] == r && in_dim[i] == d,
+                    "layer {global_layer} {part}: expert geometry drifted ({r}x{d} vs {}x{})",
+                    rows[i],
+                    in_dim[i]
+                );
+            }
+            row_p.push(ctx.upload_slice(&packed)?);
+            row_s.push(ctx.upload_f32(&s)?);
+            row_b.push(ctx.upload_f32(&b)?);
+        }
+        stacked.push(row_p.try_into().unwrap());
+        stacked_scales.push(row_s.try_into().unwrap());
+        stacked_biases.push(row_b.try_into().unwrap());
+    }
+    // Reuse the same hard-cap the single-device path enforces.
+    if std::env::var_os("EDGE0_MEGA").is_some() {
+        anyhow::ensure!(
+            text.effective_top_k() == 4,
+            "moe_mega kernel hardcodes 4 expert slots, config top_k={} \
+             — unset EDGE0_MEGA",
+            text.effective_top_k()
+        );
+    }
+    Ok(GpuExperts {
+        stacked,
+        stacked_scales,
+        stacked_biases,
+        rows,
+        in_dim,
+    })
 }
 
 const P_EMBED: &str = "language_model.model.embed_tokens";
