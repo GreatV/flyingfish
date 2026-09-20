@@ -11,3 +11,5 @@ pub mod weights;
 
 #[cfg(feature = "cuda")]
 pub mod gpu;
+#[cfg(feature = "cuda")]
+pub mod kernel_assets;

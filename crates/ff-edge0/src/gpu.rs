@@ -6,6 +6,317 @@ use anyhow::{Context, Result, ensure};
 use cudarc::driver::safe::{CudaContext, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
+// Multi-device scaffolding (mirrors crates/ff-qwen35/src/gpu.rs).
+//
+// `Edge0Gpu` wraps N per-device `GpuContext`s plus a contiguous layer range
+// per device. The single-device case (`Edge0Gpu::new(&[0], ...)`) routes
+// through the existing `Edge0Text::enable_gpu(0, ...)` so token IDs match
+// the current production path bitwise. The multi-device decode-loop
+// integration is the next port and is not wired in this scaffolding pass.
+
+/// Contiguous split of `total_layers` into `n_devices` groups whose layer
+/// counts differ by at most one. Hybrid GDN/full-attention layers have
+/// similar byte weight, so a contiguous split tracks the byte-balance the
+/// runtime will produce without per-layer measurement at planning time.
+pub fn partition_layers(total_layers: usize, n_devices: usize) -> Vec<std::ops::Range<usize>> {
+    assert!(n_devices > 0, "partition_layers requires n_devices > 0");
+    let per = total_layers / n_devices;
+    let extra = total_layers % n_devices;
+    let mut out = Vec::with_capacity(n_devices);
+    let mut start = 0usize;
+    for index in 0..n_devices {
+        let take = per + usize::from(index < extra);
+        out.push(start..start + take);
+        start += take;
+    }
+    out
+}
+
+/// Per-device residency plan: the static layer ranges and the byte totals the
+/// planner verified. The streaming-overlay field is reserved for the next
+/// pass; today the device either holds the whole layer range resident or
+/// falls back to CPU streaming via `Edge0Text::enable_gpu`.
+#[derive(Debug, Clone)]
+pub struct DevicePlan {
+    pub ordinal: usize,
+    pub range: std::ops::Range<usize>,
+    pub projection_bytes: u64,
+    pub kv_bytes: u64,
+    /// Routed-expert bytes for this device's range (only nonzero when
+    /// `experts_resident` is true).
+    pub expert_bytes: u64,
+    pub static_bytes: u64,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+}
+
+impl DevicePlan {
+    /// Free bytes minus the headroom the plan refuses to allocate against.
+    pub fn budget(&self) -> u64 {
+        self.free_bytes.saturating_sub(RESIDENCY_MARGIN_BYTES)
+    }
+
+    pub fn fits(&self) -> bool {
+        self.total_bytes <= self.budget()
+    }
+}
+
+/// Byte cost of one text layer on device, including its two norms and the
+/// kind-specific attention/GDN block plus the shared-expert MLP. We use
+/// `Edge0Weights::shape` for the integer dimensions and apply the int4
+/// u32-packed payload + bf16 scales/biases (uploaded as f32) formula that
+/// matches the production upload path.
+fn layer_projection_bytes(
+    weights: &super::weights::Edge0Weights,
+    text: &crate::config::TextConfig,
+    layer: usize,
+) -> Result<u64> {
+    let prefix = format!("language_model.model.layers.{layer}");
+    let mut total = 0u64;
+    for suffix in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+        let shape = weights.shape(&format!("{prefix}.{suffix}"))?;
+        let numel: u64 = shape.iter().product::<usize>() as u64;
+        // bf16 disk bytes; uploaded as f32 doubles the residency.
+        total = total
+            .checked_add(numel.checked_mul(4).context("layer norm bytes overflow")?)
+            .context("layer norm bytes overflow")?;
+    }
+    let (blocks, norms): (&[&str], &[&str]) = match text.layer_kind(layer) {
+        crate::config::LayerKind::LinearAttention => (
+            &[
+                "linear_attn.in_proj_qkv",
+                "linear_attn.in_proj_z",
+                "linear_attn.in_proj_b",
+                "linear_attn.in_proj_a",
+                "linear_attn.out_proj",
+            ],
+            &[
+                "linear_attn.conv1d.weight",
+                "linear_attn.A_log",
+                "linear_attn.dt_bias",
+                "linear_attn.norm.weight",
+            ],
+        ),
+        crate::config::LayerKind::FullAttention => (
+            &[
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+            ],
+            &["self_attn.q_norm.weight", "self_attn.k_norm.weight"],
+        ),
+    };
+    for block in blocks {
+        let name = format!("{prefix}.{block}");
+        total = total
+            .checked_add(projection_bytes_for(weights, &name)?)
+            .context("projection bytes overflow")?;
+        total = total
+            .checked_add(projection_state_bytes(weights, &name)?)
+            .context("projection state bytes overflow")?;
+    }
+    if text.layer_kind(layer) == crate::config::LayerKind::LinearAttention {
+        // GpuGdn::upload's conv, recurrent, and output buffers.
+        let conv_dim = 2 * text.linear_num_key_heads * text.linear_key_head_dim
+            + text.linear_num_value_heads * text.linear_value_head_dim;
+        let buffers = conv_dim * (text.linear_conv_kernel_dim - 1)
+            + text.linear_num_value_heads * text.linear_key_head_dim * text.linear_value_head_dim
+            + conv_dim
+            + text.linear_num_value_heads * text.linear_value_head_dim;
+        total = total
+            .checked_add((buffers * std::mem::size_of::<f32>()) as u64)
+            .context("gdn buffer bytes overflow")?;
+    }
+    for norm in norms {
+        let name = format!("{prefix}.{norm}");
+        if weights.has(&name) {
+            let shape = weights.shape(&name)?;
+            let numel: u64 = shape.iter().product::<usize>() as u64;
+            total = total
+                .checked_add(numel.checked_mul(4).context("norm bf16 bytes overflow")?)
+                .context("norm bf16 bytes overflow")?;
+        }
+    }
+    // Shared expert + its gate, plus the routing gate.
+    for block in [
+        "mlp.gate",
+        "mlp.shared_expert.gate_proj",
+        "mlp.shared_expert.up_proj",
+        "mlp.shared_expert.down_proj",
+        "mlp.shared_expert_gate",
+    ] {
+        let name = format!("{prefix}.{block}");
+        if weights.has(&format!("{name}.weight")) {
+            total = total
+                .checked_add(projection_bytes_for(weights, &name)?)
+                .context("shared expert bytes overflow")?;
+        }
+    }
+    Ok(total)
+}
+
+fn projection_bytes_for(weights: &super::weights::Edge0Weights, name: &str) -> Result<u64> {
+    let quant = weights
+        .quant_projection(name)
+        .with_context(|| format!("byte estimate for {name}"))?;
+    // packed: u32, scales/biases: f32 on device.
+    let packed = (quant.packed.len() as u64)
+        .checked_mul(4)
+        .context("packed bytes overflow")?;
+    let scales = (quant.scales.len() as u64)
+        .checked_mul(4)
+        .context("scale bytes overflow")?;
+    let biases = (quant.biases.len() as u64)
+        .checked_mul(4)
+        .context("bias bytes overflow")?;
+    packed
+        .checked_add(scales)
+        .and_then(|s| s.checked_add(biases))
+        .context("projection byte sum overflow")
+}
+
+/// Persistent buffers one uploaded projection carries: the y output buffer
+/// and, when present, the LoRA pair.
+fn projection_state_bytes(weights: &super::weights::Edge0Weights, name: &str) -> Result<u64> {
+    let shape = weights.shape(&format!("{name}.weight"))?;
+    let y = (shape[0] as u64).checked_mul(4).context("y overflow")?;
+    let lora = match weights.lora_for(name) {
+        Some((a, b, _)) => (a.len() + b.len()) as u64 * 4,
+        None => 0,
+    };
+    Ok(y + lora)
+}
+
+/// Static skeleton that lives on the first device: embed_tokens, lm_head,
+/// final RMSNorm. Mirrors the same shape on the production upload path.
+fn static_skeleton_bytes(weights: &super::weights::Edge0Weights) -> Result<u64> {
+    let mut total = 0u64;
+    if weights.has("language_model.model.norm.weight") {
+        let shape = weights.shape("language_model.model.norm.weight")?;
+        let numel: u64 = shape.iter().product::<usize>() as u64;
+        // bf16 on disk (2 bytes/elem); uploaded as f32 doubles it.
+        total = total
+            .checked_add(numel.checked_mul(4).context("static bf16 overflow")?)
+            .context("static bf16 overflow")?;
+    }
+    for name in [
+        "language_model.model.embed_tokens",
+        "language_model.lm_head",
+    ] {
+        if weights.has(&format!("{name}.weight")) {
+            total = total
+                .checked_add(projection_bytes_for(weights, name)?)
+                .context("static projection bytes overflow")?;
+            let shape = weights.shape(&format!("{name}.weight"))?;
+            total = total
+                .checked_add(
+                    (shape[0] as u64)
+                        .checked_mul(4)
+                        .context("static y overflow")?,
+                )
+                .context("static y overflow")?;
+        }
+    }
+    Ok(total)
+}
+
+/// Headroom the Edge0 residency plan leaves unallocated per device: module
+/// images, runtime scratch, and launch-time allocations the byte accounting
+/// cannot see.
+pub const RESIDENCY_MARGIN_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Per-device byte-balanced residency plan for the static projections, KV
+/// cache, and shared skeleton. Each device receives the projections of its
+/// contiguous layer range plus its share of the KV cache; ordinals[0] also
+/// owns the static skeleton. Roomed against `free_bytes[i]` per device.
+pub fn plan_residency(
+    weights: &super::weights::Edge0Weights,
+    config: &crate::config::Edge0Config,
+    ordinals: &[usize],
+    max_ctx: usize,
+    free_bytes: &[u64],
+    experts_resident: bool,
+) -> Result<Vec<DevicePlan>> {
+    ensure!(
+        !ordinals.is_empty(),
+        "plan_residency requires at least one ordinal"
+    );
+    ensure!(
+        ordinals.len() == free_bytes.len(),
+        "ordinals and free_bytes length mismatch ({} vs {})",
+        ordinals.len(),
+        free_bytes.len()
+    );
+    let text = &config.text_config;
+    let ranges = partition_layers(text.num_hidden_layers, ordinals.len());
+    let kv_stride = (text.num_key_value_heads * text.head_dim) as u64;
+    let kv_per_layer = 2u64
+        .checked_mul(max_ctx as u64)
+        .and_then(|v| v.checked_mul(kv_stride))
+        .and_then(|v| v.checked_mul(4))
+        .context("KV byte arithmetic overflow")?;
+    let static_bytes = if ordinals.len() == 1 {
+        0
+    } else {
+        static_skeleton_bytes(weights)?
+    };
+    // Per-layer expert bytes. edge0's expert geometry is uniform across
+    // layers (enable_gpu enforces `rows[i] == r && in_dim[i] == d`); the
+    // per-layer count is therefore the total expert byte budget divided by
+    // the layer count, with bf16 scales/biases doubled for the device
+    // upload. Using `bucket_bytes` keeps the audit on the same path the
+    // single-device planner uses.
+    let expert_bytes_per_layer: Vec<u64> = if experts_resident && text.num_hidden_layers > 0 {
+        let (expert_packed, expert_sb, _statik_packed, _statik_sb, _embed_packed, _embed_sb) =
+            weights.bucket_bytes()?;
+        // Upload multiplies scales/biases by 2x for f32 device storage;
+        // packed weights stay at their on-disk bytes.
+        let total_device = expert_packed
+            .checked_add(expert_sb.checked_mul(2).context("expert sb overflow")?)
+            .context("expert total overflow")?;
+        let per = total_device / text.num_hidden_layers as u64;
+        vec![per; text.num_hidden_layers]
+    } else {
+        vec![0u64; text.num_hidden_layers]
+    };
+    let mut plans = Vec::with_capacity(ordinals.len());
+    for (index, (ordinal, range)) in ordinals.iter().zip(ranges.iter()).enumerate() {
+        let mut projection_bytes = 0u64;
+        let mut expert_bytes = 0u64;
+        for layer in range.clone() {
+            projection_bytes = projection_bytes
+                .checked_add(layer_projection_bytes(weights, text, layer)?)
+                .context("per-device projection bytes overflow")?;
+            expert_bytes = expert_bytes
+                .checked_add(expert_bytes_per_layer[layer])
+                .context("per-device expert bytes overflow")?;
+        }
+        let full_attention_in_range = (range.clone())
+            .filter(|&l| text.layer_kind(l) == crate::config::LayerKind::FullAttention)
+            .count() as u64;
+        let kv_bytes = kv_per_layer
+            .checked_mul(full_attention_in_range)
+            .context("KV bytes overflow")?;
+        let total_bytes = projection_bytes
+            .checked_add(kv_bytes)
+            .and_then(|v| v.checked_add(expert_bytes))
+            .and_then(|v| v.checked_add(if index == 0 { static_bytes } else { 0 }))
+            .context("per-device total overflow")?;
+        plans.push(DevicePlan {
+            ordinal: *ordinal,
+            range: range.clone(),
+            projection_bytes,
+            kv_bytes,
+            expert_bytes,
+            static_bytes: if index == 0 { static_bytes } else { 0 },
+            total_bytes,
+            free_bytes: free_bytes[index],
+        });
+    }
+    Ok(plans)
+}
+
 pub struct GpuContext {
     pub context: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
@@ -74,48 +385,27 @@ pub struct GpuQuant {
 }
 
 impl GpuContext {
-    pub fn new() -> Result<Self> {
-        let context = CudaContext::new(0).context("failed to init CUDA context")?;
+    pub fn new(ordinal: usize) -> Result<Self> {
+        let context = CudaContext::new(ordinal)
+            .with_context(|| format!("failed to init CUDA context on device {ordinal}"))?;
         // cudarc's per-launch safety events turn on once a second stream
         // exists (the capture stream) and each launch then waits on events
         // recorded before capture — CUDA_ERROR_STREAM_CAPTURE_ISOLATION.
         // Safe here: every slice is allocated, used, and dropped on this
         // one stream, the only cross-stream rule the events enforce.
         unsafe { context.disable_event_tracking() };
-        let ptx =
-            cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/edge0_gemv.ptx")));
-        let module = context
-            .load_module(ptx)
-            .context("failed to load edge0 PTX module")?;
-        let silu_ptx = cudarc::nvrtc::Ptx::from_src(include_str!(concat!(
-            env!("OUT_DIR"),
-            "/edge0_silu_mul.ptx"
-        )));
-        let silu_module = context
-            .load_module(silu_ptx)
-            .context("failed to load silu PTX module")?;
-        let batched_ptx = cudarc::nvrtc::Ptx::from_src(include_str!(concat!(
-            env!("OUT_DIR"),
-            "/edge0_batched_gemv.ptx"
-        )));
-        let batched_module = context
-            .load_module(batched_ptx)
-            .context("failed to load batched PTX module")?;
-        let lora_ptx =
-            cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/lora_add.ptx")));
-        let lora_module = context
-            .load_module(lora_ptx)
-            .context("failed to load lora PTX module")?;
-        let gdn_ptx =
-            cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/edge0_gdn.ptx")));
-        let gdn_module = context
-            .load_module(gdn_ptx)
-            .context("failed to load gdn PTX module")?;
-        let glue_ptx =
-            cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/edge0_glue.ptx")));
-        let glue_module = context
-            .load_module(glue_ptx)
-            .context("failed to load glue PTX module")?;
+        let module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_GEMV)?;
+        let silu_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_SILU_MUL)?;
+        let batched_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_BATCHED_GEMV)?;
+        let lora_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::LORA_ADD)?;
+        let gdn_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_GDN)?;
+        let glue_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_GLUE)?;
         let gemv4 = module
             .load_function("edge0_gemv4")
             .context("edge0_gemv4 missing")?;
@@ -175,11 +465,8 @@ impl GpuContext {
         let k_group4 = glue_module
             .load_function("edge0_gemv_group4_lora")
             .context("edge0_gemv_group4_lora missing")?;
-        let mega_ptx =
-            cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/edge0_mega.ptx")));
-        let mega_module = context
-            .load_module(mega_ptx)
-            .context("failed to load mega PTX module")?;
+        let mega_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_MEGA)?;
         let k_moe_mega = mega_module
             .load_function("edge0_moe_mega")
             .context("edge0_moe_mega missing")?;
@@ -873,7 +1160,7 @@ mod tests {
 
     #[test]
     fn gpu_gemv_matches_cpu_matvec_on_a_real_projection() {
-        let ctx = match GpuContext::new() {
+        let ctx = match GpuContext::new(0) {
             Ok(ctx) => ctx,
             Err(e) => {
                 eprintln!("no CUDA device ({e}); skipping gpu test");
@@ -2841,4 +3128,320 @@ impl GpuContext {
         .map_err(|e| anyhow::anyhow!("flush launch failed: {e}"))?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn partition_layers_is_contiguous_and_covers_all_layers() {
+        let ranges = partition_layers(40, 3);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0], 0..14);
+        assert_eq!(ranges[1], 14..27);
+        assert_eq!(ranges[2], 27..40);
+        assert_eq!(ranges.iter().map(|r| r.end - r.start).sum::<usize>(), 40);
+        for window in ranges.windows(2) {
+            assert_eq!(window[0].end, window[1].start);
+        }
+    }
+
+    #[test]
+    fn partition_layers_single_device_is_identity() {
+        assert_eq!(partition_layers(40, 1), vec![0..40]);
+        assert_eq!(partition_layers(1, 1), vec![0..1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "n_devices > 0")]
+    fn partition_layers_rejects_zero() {
+        let _ = partition_layers(40, 0);
+    }
+}
+
+/// Multi-device orchestration for the base (non-resident-experts) path.
+///
+/// Each peer holds one `GpuRuntime` over its layer range's projections and
+/// the KV/GDN state owned by that range. dev0 (peer 0) additionally owns
+/// embed_tokens, lm_head, final_norm, and a positional counter. Per-token
+/// `hidden` hops host-mediated between devices; `x1` is derived locally
+/// from each peer's own `input_layernorm` for its first layer.
+///
+/// Single-device bitwise equivalence: the per-peer kernels are the same
+/// ones the single-context path launches, in the same order, on the same
+/// data (after the lossless host memcpy). The MoE round-trip on each
+/// peer reuses `Edge0Text::moe_forward` and adds the result back via
+/// `add_moe_residual` — same as the single-device harness path.
+///
+/// This is the base multi-device decode only. Resident-experts multi-device
+/// is a follow-up (per-layer expert attribution requires a refactor of the
+/// stacked-expert upload in `enable_gpu`); see `enable_gpu_multi`.
+pub struct Edge0Multi {
+    /// One entry per ordinal, in the same order as `ordinals`. peer 0
+    /// additionally owns embed/lm_head/final_norm.
+    pub peers: Vec<GpuRuntime>,
+    /// Layer range per peer, indexed identically to `peers`.
+    pub ranges: Vec<std::ops::Range<usize>>,
+    /// Host staging for the cross-device hidden hop.
+    pub(crate) staging_hidden: Vec<f32>,
+    /// Per-peer resident expert sets (only Some when `experts_resident` is
+    /// true). Each `GpuExperts` is scoped to that peer's layer range,
+    /// indexed by `peer_layer = global_layer - range.start`.
+    pub(crate) peer_experts: Vec<Option<GpuExperts>>,
+    /// True when every peer's `MoE` step closes on-device via
+    /// `moe_closed`; false when each layer does a host round-trip.
+    pub experts_resident: bool,
+}
+
+impl Edge0Multi {
+    /// Build one `GpuRuntime` per ordinal for its byte-balanced layer range.
+    /// Static (embed, lm_head, final_norm) lives on peer 0 only. When
+    /// `experts_resident` is true, each peer also uploads the routed
+    /// experts for its layer range — `GpuExperts.stacked[peer_layer]`
+    /// indexes the local position, not the global layer index.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        ordinals: &[usize],
+        weights: &super::weights::Edge0Weights,
+        config: &crate::config::Edge0Config,
+        layer_norms: &[Vec<f32>],
+        attn_norms: &[Vec<f32>],
+        gdn_weights: &[crate::model::GdnWeights],
+        embed: &GroupQuant,
+        final_norm: &[f32],
+        experts_resident: bool,
+    ) -> Result<Self> {
+        ensure!(
+            !ordinals.is_empty(),
+            "Edge0Multi::new requires at least one ordinal"
+        );
+        let ranges = partition_layers(config.text_config.num_hidden_layers, ordinals.len());
+        let mut peers = Vec::with_capacity(ordinals.len());
+        let mut peer_experts = Vec::with_capacity(ordinals.len());
+        for (device_index, (&ordinal, range)) in ordinals.iter().zip(ranges.iter()).enumerate() {
+            let ctx = GpuContext::new(ordinal)
+                .with_context(|| format!("init CUDA context on device {ordinal}"))?;
+            let mut proj = std::collections::HashMap::new();
+            for layer in range.clone() {
+                upload_layer_projections(weights, &config.text_config, layer, &ctx, &mut proj)?;
+            }
+            if device_index == 0 {
+                proj.insert(P_EMBED.to_string(), ctx.upload(embed, None)?);
+                let lm = weights.quant_projection("language_model.lm_head")?;
+                proj.insert("language_model.lm_head".to_string(), ctx.upload(&lm, None)?);
+            }
+            let (ln_pairs, attn_pairs) =
+                layer_norm_pairs(layer_norms, attn_norms, &config.text_config, range.clone());
+            let kv_slot_count = kv_slot_count_for_range(&config.text_config, range.clone());
+            let res = ResidentState::upload(
+                &ctx,
+                config.text_config.hidden_size,
+                &ln_pairs,
+                &attn_pairs,
+                if device_index == 0 { final_norm } else { &[] },
+                config.text_config.num_attention_heads * config.text_config.head_dim,
+                config.text_config.num_key_value_heads * config.text_config.head_dim,
+                kv_slot_count,
+            )?;
+            let gdn_devices =
+                gdn_devices_for_range(&ctx, gdn_weights, &config.text_config, range.clone())?;
+            let rt = GpuRuntime::new(ctx, proj, gdn_devices, Some(res), weights.lora_rank);
+            let per_peer_experts = if experts_resident {
+                Some(build_peer_experts(
+                    &rt.ctx,
+                    weights,
+                    &config.text_config,
+                    range.clone(),
+                )?)
+            } else {
+                None
+            };
+            peer_experts.push(per_peer_experts);
+            peers.push(rt);
+        }
+        let staging_hidden = vec![0f32; config.text_config.hidden_size];
+        Ok(Self {
+            peers,
+            ranges,
+            staging_hidden,
+            peer_experts,
+            experts_resident,
+        })
+    }
+}
+
+/// Build one `GpuExperts` over a layer range. The stacked tensors are
+/// indexed by `peer_layer = global_layer - range.start`; the kernel reads
+/// them through `batched_expert_gemv(experts, peer_layer, ...)`.
+fn build_peer_experts(
+    ctx: &GpuContext,
+    weights: &super::weights::Edge0Weights,
+    text: &crate::config::TextConfig,
+    range: std::ops::Range<usize>,
+) -> Result<GpuExperts> {
+    let mut stacked = Vec::with_capacity(range.len());
+    let mut stacked_scales = Vec::with_capacity(range.len());
+    let mut stacked_biases = Vec::with_capacity(range.len());
+    let mut rows = [0usize; 3];
+    let mut in_dim = [0usize; 3];
+    for (peer_layer, global_layer) in range.clone().enumerate() {
+        let mut row_p = Vec::with_capacity(3);
+        let mut row_s = Vec::with_capacity(3);
+        let mut row_b = Vec::with_capacity(3);
+        for (i, part) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
+            let (packed, s, b, r, d) = weights.stacked_projection(global_layer, part)?;
+            if peer_layer == 0 {
+                anyhow::ensure!(
+                    d / 8 <= 256,
+                    "{part}: words_per_row {} exceeds the batched-gemv cap 256",
+                    d / 8
+                );
+                rows[i] = r;
+                in_dim[i] = d;
+            } else {
+                anyhow::ensure!(
+                    rows[i] == r && in_dim[i] == d,
+                    "layer {global_layer} {part}: expert geometry drifted ({r}x{d} vs {}x{})",
+                    rows[i],
+                    in_dim[i]
+                );
+            }
+            row_p.push(ctx.upload_slice(&packed)?);
+            row_s.push(ctx.upload_f32(&s)?);
+            row_b.push(ctx.upload_f32(&b)?);
+        }
+        stacked.push(row_p.try_into().unwrap());
+        stacked_scales.push(row_s.try_into().unwrap());
+        stacked_biases.push(row_b.try_into().unwrap());
+    }
+    // Reuse the same hard-cap the single-device path enforces.
+    if std::env::var_os("EDGE0_MEGA").is_some() {
+        anyhow::ensure!(
+            text.effective_top_k() == 4,
+            "moe_mega kernel hardcodes 4 expert slots, config top_k={} \
+             — unset EDGE0_MEGA",
+            text.effective_top_k()
+        );
+    }
+    Ok(GpuExperts {
+        stacked,
+        stacked_scales,
+        stacked_biases,
+        rows,
+        in_dim,
+    })
+}
+
+const P_EMBED: &str = "language_model.model.embed_tokens";
+
+fn upload_layer_projections(
+    weights: &super::weights::Edge0Weights,
+    text: &crate::config::TextConfig,
+    layer: usize,
+    ctx: &GpuContext,
+    proj: &mut std::collections::HashMap<String, GpuQuant>,
+) -> Result<()> {
+    let prefix = format!("language_model.model.layers.{layer}");
+    let blocks: &[&str] = match text.layer_kind(layer) {
+        crate::config::LayerKind::LinearAttention => &[
+            "linear_attn.in_proj_qkv",
+            "linear_attn.in_proj_z",
+            "linear_attn.in_proj_b",
+            "linear_attn.in_proj_a",
+            "linear_attn.out_proj",
+        ],
+        crate::config::LayerKind::FullAttention => &[
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+        ],
+    };
+    let mut all: Vec<String> = blocks.iter().map(|b| format!("{prefix}.{b}")).collect();
+    all.push(format!("{prefix}.mlp.gate"));
+    for part in ["gate_proj", "up_proj", "down_proj"] {
+        all.push(format!("{prefix}.mlp.shared_expert.{part}"));
+    }
+    all.push(format!("{prefix}.mlp.shared_expert_gate"));
+    for name in all {
+        let quant = weights
+            .quant_projection(&name)
+            .with_context(|| format!("projection {name}"))?;
+        proj.insert(name.clone(), ctx.upload(&quant, weights.lora_for(&name))?);
+    }
+    Ok(())
+}
+
+#[allow(clippy::type_complexity)]
+fn layer_norm_pairs(
+    layer_norms: &[Vec<f32>],
+    attn_norms: &[Vec<f32>],
+    text: &crate::config::TextConfig,
+    range: std::ops::Range<usize>,
+) -> (Vec<(Vec<f32>, Vec<f32>)>, Vec<(Vec<f32>, Vec<f32>)>) {
+    let mut ln = Vec::with_capacity(range.len());
+    let mut an = Vec::new();
+    let mut attn_layer_idx = (0..range.start)
+        .filter(|&l| text.layer_kind(l) == crate::config::LayerKind::FullAttention)
+        .count();
+    for layer in range {
+        ln.push((
+            layer_norms[layer * 2].clone(),
+            layer_norms[layer * 2 + 1].clone(),
+        ));
+        if text.layer_kind(layer) == crate::config::LayerKind::FullAttention {
+            an.push((
+                attn_norms[attn_layer_idx * 2].clone(),
+                attn_norms[attn_layer_idx * 2 + 1].clone(),
+            ));
+            attn_layer_idx += 1;
+        }
+    }
+    (ln, an)
+}
+
+fn kv_slot_count_for_range(
+    text: &crate::config::TextConfig,
+    range: std::ops::Range<usize>,
+) -> usize {
+    range
+        .filter(|&l| text.layer_kind(l) == crate::config::LayerKind::FullAttention)
+        .count()
+}
+
+fn gdn_devices_for_range(
+    ctx: &GpuContext,
+    gdn_weights: &[crate::model::GdnWeights],
+    text: &crate::config::TextConfig,
+    range: std::ops::Range<usize>,
+) -> Result<Vec<GpuGdn>> {
+    let mut out = Vec::new();
+    let mut gdn_layer_idx = (0..range.start)
+        .filter(|&l| text.layer_kind(l) == crate::config::LayerKind::LinearAttention)
+        .count();
+    for layer in range {
+        if text.layer_kind(layer) == crate::config::LayerKind::LinearAttention {
+            let w = gdn_weights
+                .get(gdn_layer_idx)
+                .context("gdn weights layer index")?;
+            out.push(GpuGdn::upload(
+                ctx,
+                &w.conv1d,
+                &w.a_log,
+                &w.dt_bias,
+                &w.norm,
+                2 * text.linear_num_key_heads * text.linear_key_head_dim
+                    + text.linear_num_value_heads * text.linear_value_head_dim,
+                text.linear_conv_kernel_dim,
+                text.linear_num_value_heads,
+                text.linear_num_key_heads,
+                text.linear_key_head_dim,
+                text.linear_value_head_dim,
+                text.rms_norm_eps as f32,
+            )?);
+            gdn_layer_idx += 1;
+        }
+    }
+    Ok(out)
 }

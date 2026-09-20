@@ -1219,11 +1219,10 @@ fn mib_to_bytes(value: u64) -> Result<u64> {
         .context("MiB resource limit exceeds u64")
 }
 
-/// The int4 text adapters drive CUDA through cudarc contexts bound to
-/// device 0.
+/// The int4 text adapters drive CUDA through cudarc contexts.
 enum TextDevice {
     Cpu,
-    Cuda,
+    Cuda(Vec<usize>),
 }
 
 fn resolve_text_device(value: &str) -> Result<(TextDevice, bool)> {
@@ -1233,19 +1232,35 @@ fn resolve_text_device(value: &str) -> Result<(TextDevice, bool)> {
             if Device::cuda_if_available(0)
                 .is_ok_and(|device| device.is_cuda() && ptx_floor_supported(&device))
             {
-                TextDevice::Cuda
+                TextDevice::Cuda(vec![0])
             } else {
                 TextDevice::Cpu
             }
         }
-        "cuda:0" => TextDevice::Cuda,
         _ if value.starts_with("cuda:") => {
-            bail!("the int4 text adapters bind CUDA device 0; {value:?} is unsupported")
+            let tail = &value["cuda:".len()..];
+            let ordinals: Result<Vec<usize>> = tail
+                .split(',')
+                .map(|segment| {
+                    let trimmed = segment.trim();
+                    anyhow::ensure!(
+                        !trimmed.is_empty(),
+                        "empty ordinal in device list {value:?}"
+                    );
+                    trimmed.parse::<usize>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "malformed ordinal {trimmed:?} in device list {value:?}; \
+                             use cpu, auto, or cuda:N[,M...]"
+                        )
+                    })
+                })
+                .collect();
+            TextDevice::Cuda(ordinals?)
         }
-        _ => bail!("unknown device {value:?}; use cpu, auto, or cuda:0"),
+        _ => bail!("unknown device {value:?}; use cpu, auto, or cuda:N[,M...]"),
     };
     #[cfg(not(feature = "cuda"))]
-    if matches!(selected, TextDevice::Cuda) {
+    if matches!(selected, TextDevice::Cuda(_)) {
         bail!("CUDA decoding requires a binary built with --features cuda");
     }
     Ok((selected, value == "auto"))

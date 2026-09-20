@@ -252,10 +252,11 @@ impl Staging {
             DType::F32 => "glm_fp8_dequant_f32",
             _ => unreachable!(),
         };
-        let kernel = device.get_or_load_custom_func(
-            name,
+        let function = ff_core::cuda_kernel_assets::load_function(
+            device,
+            &crate::kernel_assets::GLM_FP8_DEQUANT,
             "glm_fp8_dequant_v1",
-            include_str!(concat!(env!("OUT_DIR"), "/glm_fp8_dequant.ptx")),
+            name,
         )?;
         let raw = slot.weight.slice(..count);
         let scales = slot.scales.slice(..meta.scale_count);
@@ -269,7 +270,7 @@ impl Staging {
                 let block_ready =
                     compute.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
                 stream.wait(&block_ready)?;
-                let mut launch = stream.launch_builder(&kernel);
+                let mut launch = stream.launch_builder(&function);
                 launch
                     .arg(&raw)
                     .arg(&scales)

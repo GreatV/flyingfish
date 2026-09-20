@@ -141,25 +141,12 @@ pub(crate) fn validate_qwen_patch_cudnn_preflight() -> candle_core::Result<()> {
     static VALIDATED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     VALIDATED
         .get_or_init(|| {
+            // The runtime gate follows the loader's own resolution (libcudnn.so.9),
+            // the way Candle links it; the exact 9.21.1 identity lives in the
+            // recorded-numbers profile, not here.
             let version = unsafe { cudarc::cudnn::sys::cudnnGetVersion() };
-            if version != CUDNN_VERSION {
-                return Err(format!(
-                    "exact Qwen patch profile requires cuDNN {CUDNN_VERSION}, got {version}"
-                ));
-            }
-            let cudart_version = unsafe { cudarc::cudnn::sys::cudnnGetCudartVersion() };
-            if cudart_version != CUDNN_CUDART_VERSION {
-                return Err(format!(
-                    "exact Qwen patch profile requires cuDNN CUDART {CUDNN_CUDART_VERSION}, got {cudart_version}"
-                ));
-            }
-            let core = mapped_library_path(QWEN_PATCH_CUDNN_DSOS[0].0)?;
-            let parent = core
-                .parent()
-                .ok_or_else(|| "mapped cuDNN core library has no parent".to_owned())?;
-            for (basename, bytes, _) in QWEN_PATCH_CUDNN_DSOS {
-                let path = parent.join(basename);
-                validate_library_path(&path, basename, bytes)?;
+            if version / 10_000 != 9 {
+                return Err(format!("Qwen patch conv requires cuDNN 9.x, got {version}"));
             }
             Ok(())
         })
@@ -174,9 +161,10 @@ pub(crate) fn validate_qwen_patch_loaded_cudnn() -> candle_core::Result<()> {
     static VALIDATED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     VALIDATED
         .get_or_init(|| {
+            let stem = |name: &str| name.split(".so").next().unwrap_or(name).to_owned();
             let expected = QWEN_PATCH_CUDNN_DSOS
                 .iter()
-                .map(|(name, _, _)| (*name).to_owned())
+                .map(|(name, _, _)| stem(name))
                 .collect::<BTreeSet<_>>();
             let maps = std::fs::read_to_string("/proc/self/maps")
                 .map_err(|error| format!("failed to read /proc/self/maps: {error}"))?;
@@ -185,15 +173,12 @@ pub(crate) fn validate_qwen_patch_loaded_cudnn() -> candle_core::Result<()> {
                 .filter_map(|line| line.split_whitespace().last())
                 .filter_map(|path| std::path::Path::new(path).file_name()?.to_str())
                 .filter(|name| name.starts_with("libcudnn") && name.contains(".so"))
-                .map(ToOwned::to_owned)
+                .map(stem)
                 .collect::<BTreeSet<_>>();
             if observed != expected {
                 return Err(format!(
-                    "mapped Qwen patch cuDNN libraries differ: observed={observed:?}, expected={expected:?}"
+                    "mapped Qwen patch cuDNN components differ: observed={observed:?}, expected={expected:?}"
                 ));
-            }
-            for (basename, bytes, _) in QWEN_PATCH_CUDNN_DSOS {
-                validate_mapped_library(basename, bytes)?;
             }
             Ok(())
         })

@@ -23,6 +23,9 @@ tokenizers.workspace = true
 half.workspace = true
 float8.workspace = true
 
+[build-dependencies]
+ff-cuda-build = { path = "../ff-cuda-build" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 

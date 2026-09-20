@@ -24,7 +24,7 @@ pub(super) enum Qwen35Command {
         image: Option<PathBuf>,
         #[arg(long, default_value_t = NonZeroUsize::new(128).unwrap())]
         max_new_tokens: NonZeroUsize,
-        #[arg(long, default_value = "auto", help = "cpu, auto, or cuda:0")]
+        #[arg(long, default_value = "auto", help = "cpu, auto, or cuda:N[,M...]")]
         device: String,
     },
 }
@@ -69,7 +69,7 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
         "prompt and requested output exceed model context"
     );
     let device = match device {
-        TextDevice::Cuda => {
+        TextDevice::Cuda(ordinals) => {
             if total > GPU_CONTEXT_CAP {
                 if auto {
                     eprintln!(
@@ -79,11 +79,27 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
                 } else {
                     bail!("prompt + generation {total} exceeds the {GPU_CONTEXT_CAP} kernel cap");
                 }
-            } else if auto && !checkpoint_fits_free_vram(&model_dir, &config, total)? {
-                eprintln!("auto: checkpoint and KV cache exceed free VRAM; falling back to CPU");
-                TextDevice::Cpu
             } else {
-                TextDevice::Cuda
+                match checkpoint_fits_free_vram(&ordinals, &model_dir, &config, total)? {
+                    true => TextDevice::Cuda(ordinals),
+                    false if auto => {
+                        eprintln!(
+                            "auto: resident and streaming plans exceed free VRAM; falling back to CPU"
+                        );
+                        TextDevice::Cpu
+                    }
+                    false => {
+                        let list = ordinals
+                            .iter()
+                            .map(|o| o.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        bail!(
+                            "resident and streaming plans exceed free VRAM on cuda:{list}; \
+                             pass another --device (cuda:N with more memory, or cpu)"
+                        )
+                    }
+                }
             }
         }
         TextDevice::Cpu => TextDevice::Cpu,
@@ -115,7 +131,8 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
             }
             generated
         }
-        TextDevice::Cuda => generate_cuda(
+        TextDevice::Cuda(ordinals) => generate_cuda(
+            &ordinals,
             &model_dir,
             &config,
             &ids,
@@ -159,53 +176,44 @@ fn run_vision_tower(
     tower.forward(&patches, grid)
 }
 
-/// The CUDA path uploads every projection; the weights dominate device
-/// memory, so the safetensors bytes are the fit estimate. Scale/bias rows
-/// upload as f32 (double their bf16 share on disk), and each full-attention
-/// layer holds two f32 KV planes sized by the context the run will use.
+/// The runtime's own residency decision: a device keeps a resident prefix
+/// of its layers and streams the rest; only a device that cannot host the
+/// always-resident set (statics, slots, KV, scratch) rejects the request.
 #[cfg(feature = "cuda")]
 fn checkpoint_fits_free_vram(
+    ordinals: &[usize],
     model_dir: &Path,
     config: &Qwen35Config,
     total_tokens: usize,
 ) -> Result<bool> {
-    let mut bytes = 0u64;
-    for entry in std::fs::read_dir(model_dir)? {
-        let entry = entry?;
-        if entry
-            .path()
-            .extension()
-            .is_some_and(|ext| ext == "safetensors")
-        {
-            bytes += entry.metadata()?.len();
-        }
-    }
     anyhow::ensure!(
-        bytes > 0,
-        "no safetensors shards in {}",
-        model_dir.display()
+        !ordinals.is_empty(),
+        "--device cuda:N[,M...] requires at least one ordinal"
     );
-    let text = &config.text_config;
     let max_ctx = if total_tokens > 4096 {
         total_tokens.next_power_of_two()
     } else {
         4096
     };
-    let full_attention = (0..text.num_hidden_layers)
-        .filter(|&layer| {
-            text.layer_kind(layer) == flyingfish::qwen35::config::LayerKind::FullAttention
+    let weights = Qwen35Weights::open(model_dir)
+        .with_context(|| format!("open weights for {}", model_dir.display()))?;
+    let ranges = flyingfish::qwen35::gpu::partition_layers(&weights, config, ordinals.len())?;
+    let free: Vec<u64> = ordinals
+        .iter()
+        .map(|&ordinal| {
+            let context = cudarc::driver::CudaContext::new(ordinal)
+                .with_context(|| format!("open CUDA device {ordinal}"))?;
+            Ok(context.mem_get_info().context("mem_get_info")?.0 as u64)
         })
-        .count() as u64;
-    let kv =
-        full_attention * 2 * max_ctx as u64 * (text.num_key_value_heads * text.head_dim) as u64 * 4;
-    let required = bytes + bytes / 8 + kv;
-    let context = cudarc::driver::CudaContext::new(0).context("open CUDA device 0")?;
-    let (free, _) = context.mem_get_info().context("mem_get_info")?;
-    Ok(required <= free as u64)
+        .collect::<Result<Vec<_>>>()?;
+    let plans = flyingfish::qwen35::gpu::plan_residency(&weights, config, &ranges, max_ctx, &free)?;
+    Ok(plans
+        .iter()
+        .all(|plan| plan.residency != flyingfish::qwen35::gpu::Residency::Insufficient))
 }
 
 #[cfg(not(feature = "cuda"))]
-fn checkpoint_fits_free_vram(_: &Path, _: &Qwen35Config, _: usize) -> Result<bool> {
+fn checkpoint_fits_free_vram(_: &[usize], _: &Path, _: &Qwen35Config, _: usize) -> Result<bool> {
     Ok(true)
 }
 
@@ -282,6 +290,7 @@ fn prefill(
 
 #[cfg(feature = "cuda")]
 fn generate_cuda(
+    ordinals: &[usize],
     model_dir: &Path,
     config: &Qwen35Config,
     ids: &[u32],
@@ -291,6 +300,10 @@ fn generate_cuda(
 ) -> Result<Vec<u32>> {
     use flyingfish::qwen35::gpu::QwenGpu;
 
+    anyhow::ensure!(
+        !ordinals.is_empty(),
+        "--device cuda:N[,M...] requires at least one ordinal"
+    );
     let total = ids.len() + max_new_tokens;
     anyhow::ensure!(
         total <= GPU_CONTEXT_CAP,
@@ -298,9 +311,9 @@ fn generate_cuda(
     );
     let weights = Qwen35Weights::open(model_dir)?;
     let mut gpu = if total > 4096 {
-        QwenGpu::with_max_ctx(&weights, config, total.next_power_of_two())?
+        QwenGpu::with_max_ctx(ordinals, &weights, config, total.next_power_of_two())?
     } else {
-        QwenGpu::new(&weights, config)?
+        QwenGpu::new(ordinals, &weights, config)?
     };
     match vision {
         Some((rows, _)) => {
@@ -320,9 +333,7 @@ fn generate_cuda(
             }
         }
         None => {
-            for &id in ids {
-                gpu.push_token(id)?;
-            }
+            gpu.push_tokens(ids)?;
         }
     }
     let mut generated = vec![gpu.read_token()?];
@@ -340,6 +351,7 @@ fn generate_cuda(
 
 #[cfg(not(feature = "cuda"))]
 fn generate_cuda(
+    _: &[usize],
     _: &Path,
     _: &Qwen35Config,
     _: &[u32],

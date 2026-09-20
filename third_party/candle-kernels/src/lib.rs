@@ -2,6 +2,16 @@ mod ptx {
     include!(concat!(env!("OUT_DIR"), "/ptx.rs"));
 }
 
+mod cubins {
+    include!(concat!(env!("OUT_DIR"), "/cubins.rs"));
+}
+
+/// One architecture's translation of a module's PTX.
+pub struct Cubin {
+    pub architecture: u32,
+    pub image: &'static [u8],
+}
+
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Id {
@@ -35,6 +45,7 @@ pub const ALL_IDS: [Id; 11] = [
 pub struct Module {
     index: usize,
     ptx: &'static str,
+    cubins: &'static [Cubin],
 }
 
 impl Module {
@@ -44,6 +55,12 @@ impl Module {
 
     pub fn ptx(&self) -> &'static str {
         self.ptx
+    }
+
+    /// Per-architecture translations of the PTX. Only an exact architecture
+    /// match may be loaded; a near miss falls through to the PTX.
+    pub fn cubins(&self) -> &'static [Cubin] {
+        self.cubins
     }
 }
 
@@ -63,6 +80,7 @@ macro_rules! mdl {
         pub const $cst: Module = Module {
             index: module_index(Id::$id),
             ptx: ptx::$cst,
+            cubins: cubins::$cst,
         };
     };
 }

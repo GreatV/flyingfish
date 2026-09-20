@@ -35,6 +35,9 @@ half = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 
+[build-dependencies]
+ff-cuda-build = { path = "../ff-cuda-build" }
+
 
 [lints]
 workspace = true

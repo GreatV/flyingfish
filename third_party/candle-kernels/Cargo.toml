@@ -38,3 +38,6 @@ path = "src/lib.rs"
 
 [build-dependencies.cudaforge]
 version = "0.1.2"
+
+[build-dependencies.ff-cuda-build]
+path = "../../crates/ff-cuda-build"

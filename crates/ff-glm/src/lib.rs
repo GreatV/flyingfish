@@ -21,6 +21,8 @@ pub mod execution_policy;
 pub mod expert_cache;
 pub mod expert_cache_manager;
 pub mod fp8;
+#[cfg(feature = "cuda")]
+pub mod kernel_assets;
 pub mod math;
 mod model;
 pub mod partition;

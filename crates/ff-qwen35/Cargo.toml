@@ -19,6 +19,9 @@ candle-nn.workspace = true
 png = "0.18"
 cudarc = { workspace = true, optional = true }
 
+[build-dependencies]
+ff-cuda-build = { path = "../ff-cuda-build" }
+
 [features]
 cuda = ["ff-edge0/cuda", "dep:cudarc"]
 

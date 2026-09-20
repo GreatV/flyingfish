@@ -92,6 +92,14 @@ pub fn margin(logits: &[f32]) -> f32 {
 
 impl QwenSpec {
     pub fn new(gpu: &QwenGpu, weights: &crate::weights::Qwen35Weights) -> Result<Self> {
+        anyhow::ensure!(
+            gpu.peers.is_empty(),
+            "speculative decode drives a single device"
+        );
+        anyhow::ensure!(
+            !gpu.is_streaming(),
+            "speculative decode requires resident weights"
+        );
         let ctx = &gpu.ctx;
         let text = &gpu.config.text_config;
         let n = text.hidden_size;
@@ -104,14 +112,8 @@ impl QwenSpec {
             .map(|k| k.len() / kv_stride)
             .unwrap_or(4096);
 
-        let ptx = cudarc::nvrtc::Ptx::from_src(include_str!(concat!(
-            env!("OUT_DIR"),
-            "/qwen_batch2.ptx"
-        )));
-        let module = ctx
-            .context
-            .load_module(ptx)
-            .map_err(|e| anyhow::anyhow!("batch2 module: {e:?}"))?;
+        let module =
+            ff_edge0::kernel_assets::load_module(&ctx.context, &crate::kernel_assets::QWEN_BATCH2)?;
         let load = |name: &str| {
             module
                 .load_function(name)

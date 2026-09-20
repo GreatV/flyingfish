@@ -312,10 +312,11 @@ impl CustomOp2 for Dequantize<'_> {
             DType::F32 => "glm_fp8_dequant_f32",
             _ => candle_core::bail!("GLM FP8 output must be BF16 or F32"),
         };
-        let kernel = device.get_or_load_custom_func(
-            name,
+        let function = ff_core::cuda_kernel_assets::load_function(
+            &device,
+            &crate::kernel_assets::GLM_FP8_DEQUANT,
             "glm_fp8_dequant_v1",
-            include_str!(concat!(env!("OUT_DIR"), "/glm_fp8_dequant.ptx")),
+            name,
         )?;
         macro_rules! execute {
             ($t:ty) => {{
@@ -325,7 +326,8 @@ impl CustomOp2 for Dequantize<'_> {
                         None => device.alloc::<$t>(count as usize),
                     }
                 }?;
-                let mut launch = kernel.builder();
+                let stream = device.cuda_stream();
+                let mut launch = stream.launch_builder(&function);
                 launch
                     .arg(&raw)
                     .arg(&scales)

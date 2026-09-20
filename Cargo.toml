@@ -8,7 +8,7 @@ publish = false
 
 [workspace]
 resolver = "3"
-members = ["crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35"]
+members = ["crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35", "crates/ff-cuda-build"]
 default-members = [".", "crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35"]
 
 [workspace.package]
@@ -17,10 +17,12 @@ edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
 
-# Vendored CUDA fixes: pre-Ampere intrinsics on CUDA 12.6+ and MSVC preprocessing.
-# See third_party/candle-kernels/.
+# Vendored CUDA fixes: pre-Ampere intrinsics on CUDA 12.6+ and MSVC preprocessing,
+# plus the cubin image selection that lets kernels load on drivers whose PTX ISA
+# predates the build toolkit. See third_party/.
 [patch.crates-io]
 candle-kernels = { path = "third_party/candle-kernels" }
+candle-core = { path = "third_party/candle-core" }
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -31,7 +33,8 @@ candle-nn = "=0.11.0"
 # Names the E4M3 element type candle already stores FP8 checkpoints in.
 float8 = "=0.7.0"
 clap = { version = "4.5", features = ["derive", "string"] }
-cudarc = { version = "=0.19.9", default-features = false, features = ["std", "driver", "nvrtc", "cublaslt", "cudnn", "f16", "cuda-version-from-build-system"] }
+# Bindings target CUDA 13.2; a newer toolkit on the build host still links and loads.
+cudarc = { version = "=0.19.9", default-features = false, features = ["std", "driver", "nvrtc", "cublaslt", "cudnn", "f16", "cuda-13020"] }
 hound = "3.5"
 half = "=2.7.1"
 memmap2 = "0.9"
@@ -93,7 +96,7 @@ ff-qwen35 = { path = "crates/ff-qwen35" }
 anyhow = "1.0"
 candle-core = "=0.11.0"
 clap = { version = "4.5", features = ["derive", "string"] }
-cudarc = { version = "=0.19.9", optional = true, default-features = false, features = ["std", "driver", "cublaslt", "cudnn", "f16", "cuda-version-from-build-system"] }
+cudarc = { version = "=0.19.9", optional = true, default-features = false, features = ["std", "driver", "cublaslt", "cudnn", "f16", "cuda-13020"] }
 half.workspace = true
 hound = "3.5"
 memmap2 = "0.9"

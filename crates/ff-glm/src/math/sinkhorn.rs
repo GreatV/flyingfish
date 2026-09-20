@@ -183,12 +183,14 @@ impl candle_core::CustomOp1 for SinkhornLoop {
         let source = input.as_cuda_slice::<f32>()?;
         let source = source.slice(layout.start_offset()..);
         let mut output = unsafe { device.alloc::<f32>(count) }?;
-        let kernel = device.get_or_load_custom_func(
-            "glm_mhc_sinkhorn_loop_f32_v1",
+        let function = ff_core::cuda_kernel_assets::load_function(
+            &device,
+            &crate::kernel_assets::GLM_MHC_SINKHORN_LOOP_F32,
             "glm_mhc_sinkhorn_loop_f32",
-            include_str!(concat!(env!("OUT_DIR"), "/glm_mhc_sinkhorn_loop_f32.ptx")),
+            "glm_mhc_sinkhorn_loop_f32_v1",
         )?;
-        let mut launch = kernel.builder();
+        let stream = device.cuda_stream();
+        let mut launch = stream.launch_builder(&function);
         launch
             .arg(&source)
             .arg(&mut output)

@@ -22,12 +22,9 @@ pub struct WideKernels {
 
 impl WideKernels {
     pub fn load(ctx: &GpuContext) -> Result<Self> {
-        let ptx =
-            cudarc::nvrtc::Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/wide_gemv.ptx")));
-        let module = ctx
-            .context
-            .load_module(ptx)
-            .context("wide_gemv module load failed")?;
+        let module =
+            ff_edge0::kernel_assets::load_module(&ctx.context, &crate::kernel_assets::WIDE_GEMV)
+                .context("wide_gemv module load failed")?;
         Ok(Self {
             splitk: module
                 .load_function("edge0_wide_gemv4_splitk")

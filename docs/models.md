@@ -104,7 +104,7 @@ ff text generate \
 
 ### Edge0-35B-A3B
 
-Edge0-35B-A3B is a groupwise-int4 hybrid GDN/full-attention MoE checkpoint. Generation is greedy and stops at the checkpoint's end-of-sequence tokens or `--max-new-tokens`, whichever comes first. CUDA decoding binds device 0 and uploads the static projections; `--resident-experts` additionally uploads the MoE expert set after a capacity planner verifies the device can hold it.
+Edge0-35B-A3B is a groupwise-int4 hybrid GDN/full-attention MoE checkpoint. Generation is greedy and stops at the checkpoint's end-of-sequence tokens or `--max-new-tokens`, whichever comes first. CUDA decoding uploads the static projections to the `--device` ordinal; `--resident-experts` additionally uploads the MoE expert set after a capacity planner verifies the device can hold it.
 
 ```bash
 ff text generate \
@@ -120,7 +120,7 @@ ff text generate \
 
 ### Qwen3.8-27B
 
-Qwen3.8-27B is a dense groupwise-int4 checkpoint with an optional vision tower, with the same greedy decoding and end-of-sequence stop. Pass a PNG with `--image` to ground the prompt; the tower runs on the host. CUDA decoding binds device 0.
+Qwen3.8-27B is a dense groupwise-int4 checkpoint with an optional vision tower, with the same greedy decoding and end-of-sequence stop. Pass a PNG with `--image` to ground the prompt; the tower runs on the host. CUDA decoding partitions the layer stack across the `--device` ordinals (`cuda:0,1` spreads it over two cards); the run fails fast with a per-device required/free table when the checkpoint and KV cache exceed free VRAM.
 
 ```bash
 ff text generate \

@@ -3,6 +3,8 @@
 pub mod config;
 #[cfg(feature = "cuda")]
 pub mod gpu;
+#[cfg(feature = "cuda")]
+pub mod kernel_assets;
 pub mod model;
 #[cfg(feature = "cuda")]
 pub mod spec;

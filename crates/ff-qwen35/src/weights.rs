@@ -6,10 +6,13 @@ use ff_edge0::int4::{GROUP_SIZE, GroupQuant, bf16_to_f32};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::{fs::File, path::Path};
 
 struct Shard {
-    _map: Mmap,
+    /// Keeps the mapping alive for the 'static SafeTensors view and any
+    /// PackedView::Mmap handed out of here.
+    map: Arc<Mmap>,
     tensors: SafeTensors<'static>,
 }
 
@@ -47,7 +50,7 @@ impl Qwen35Weights {
                 index.insert(name.to_string(), position);
             }
             shards.push(Shard {
-                _map: map,
+                map: Arc::new(map),
                 tensors: shard,
             });
         }
@@ -168,4 +171,119 @@ impl Qwen35Weights {
         );
         GroupQuant::new(packed, scales, biases, out_dim, in_dim, 4)
     }
+
+    /// On-device bytes `{name}` occupies after upload: packed weight bytes
+    /// as stored, scales and biases widened bf16-to-f32; a plain bf16
+    /// tensor doubles. Suffix-less names (A_log, dt_bias) resolve bare.
+    pub fn tensor_device_bytes(&self, name: &str) -> Result<u64> {
+        let suffixed = format!("{name}.weight");
+        let key = if self.index.contains_key(&suffixed) {
+            &suffixed
+        } else {
+            name
+        };
+        let (_shape, weight) = self.view_ref(key)?;
+        if self.index.contains_key(&format!("{name}.scales")) {
+            let (_s, scales) = self.view_ref(&format!("{name}.scales"))?;
+            let (_s, biases) = self.view_ref(&format!("{name}.biases"))?;
+            Ok(weight.len() as u64 + 2 * (scales.len() + biases.len()) as u64)
+        } else {
+            Ok(2 * weight.len() as u64)
+        }
+    }
+
+    /// (out_dim, in_dim) implied by the packed width and the scales.
+    pub fn projection_shape(&self, name: &str) -> Result<(usize, usize)> {
+        let (shape, _packed) = self.view_ref(&format!("{name}.weight"))?;
+        ensure!(shape.len() == 2, "{name}.weight is not 2-D: {shape:?}");
+        let out_dim = shape[0];
+        let (_s, scales) = self.view_ref(&format!("{name}.scales"))?;
+        let groups = scales.len() / 2 / out_dim.max(1);
+        Ok((out_dim, groups * GROUP_SIZE))
+    }
+
+    /// One projection kept on the host for slot upload: the packed
+    /// weights as a view when the mmap bytes are u32-aligned, plus the
+    /// scales and biases widened to f32 once.
+    pub fn host_projection(&self, name: &str) -> Result<HostProjection> {
+        let (shape, packed_bytes) = self.view_ref(&format!("{name}.weight"))?;
+        ensure!(shape.len() == 2, "{name}.weight is not 2-D: {shape:?}");
+        let out_dim = shape[0];
+        let (_s, scales) = self.view_ref(&format!("{name}.scales"))?;
+        let (_b, biases) = self.view_ref(&format!("{name}.biases"))?;
+        let scales = bf16_to_f32(scales);
+        let biases = bf16_to_f32(biases);
+        let groups = scales.len() / out_dim;
+        let in_dim = groups * GROUP_SIZE;
+        ensure!(
+            shape[1] * 8 == in_dim,
+            "{name}: weight width {} words implies in={} but scales imply {in_dim}",
+            shape[1],
+            shape[1] * 8
+        );
+        ensure!(
+            packed_bytes.len() % std::mem::size_of::<u32>() == 0,
+            "{name}.weight byte length is not a whole u32 count"
+        );
+        let packed = if (packed_bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u32>())
+        {
+            let shard = *self
+                .index
+                .get(&format!("{name}.weight"))
+                .expect("view_ref found it");
+            let map = self.shards[shard].map.clone();
+            let offset = packed_bytes.as_ptr() as usize - map.as_ptr() as usize;
+            PackedView::Mmap {
+                map,
+                offset,
+                words: packed_bytes.len() / 4,
+            }
+        } else {
+            PackedView::Owned(
+                packed_bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            )
+        };
+        Ok(HostProjection {
+            packed,
+            scales,
+            biases,
+            out_dim,
+            in_dim,
+        })
+    }
+}
+
+/// Packed int4 weights: a u32 view over the mmap when aligned, an owned
+/// copy otherwise.
+pub enum PackedView {
+    /// The mapping is owned here; `as_slice` borrows from it.
+    Mmap {
+        map: Arc<Mmap>,
+        offset: usize,
+        words: usize,
+    },
+    Owned(Vec<u32>),
+}
+
+impl PackedView {
+    pub fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Mmap { map, offset, words } => unsafe {
+                std::slice::from_raw_parts(map.as_ptr().add(*offset) as *const u32, *words)
+            },
+            Self::Owned(words) => words,
+        }
+    }
+}
+
+/// One projection's weights on the host, ready for slot upload.
+pub struct HostProjection {
+    pub packed: PackedView,
+    pub scales: Vec<f32>,
+    pub biases: Vec<f32>,
+    pub out_dim: usize,
+    pub in_dim: usize,
 }

@@ -48,7 +48,9 @@ CUDA builds require the CUDA toolkit, `nvcc` on `PATH`, and a host C++ compiler.
 
 When building without a visible GPU, set `CUDA_COMPUTE_CAP` to the target GPU's compute capability, such as `80` for 8.0.
 
-Select a device with `--device cpu`, `--device cuda:0` or `--device metal:0`. In a CUDA build, `auto` attempts `cuda:0`; builds without CUDA use CPU for `auto`. Select Metal explicitly. GLM generation defaults to `cuda:0`.
+Each in-repo CUDA kernel ships as one `compute_80` PTX — the sealed numerical contract — plus cubins `ptxas` translates it to ahead of time. The runtime loads a cubin only on an exact architecture match and falls back to the PTX otherwise; a cubin is the same instructions pre-translated, so the choice never changes numerics, but only a cubin loads on a driver whose PTX ISA predates the build toolkit's. `FF_CUDA_ARCHS=80,86,89,90,100,120` overrides the translated set; the default covers the supported fleet. The cudarc bindings are pinned to CUDA 13.2 (`cuda-13020`): the pin selects the FFI binding set, not the machine's toolkit, so any 11.8-or-newer toolkit builds and any same-major driver runs.
+
+Select a device with `--device cpu`, `--device cuda:N` or `--device metal:0`. In a CUDA build, `auto` attempts `cuda:0`; builds without CUDA use CPU for `auto`. Select Metal explicitly. GLM generation defaults to `cuda:0`.
 
 ## Quick start
 
