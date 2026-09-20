@@ -193,6 +193,9 @@ fn main() -> anyhow::Result<()> {
                         pending = a;
                         have_draft = gate.is_none_or(|t| spec.margin_a >= t);
                     }
+                    if generated.len() >= n {
+                        break;
+                    }
                     if have_draft {
                         let td = Instant::now();
                         if accepted {
@@ -210,6 +213,9 @@ fn main() -> anyhow::Result<()> {
                     generated.push(pending);
                     gpu.step()?;
                     pending = gpu.read_token()?;
+                    if generated.len() >= n {
+                        break;
+                    }
                     let m = spec.step_margin(&gpu)?;
                     have_draft = gate.is_none_or(|t| m >= t);
                     if have_draft {
