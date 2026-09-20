@@ -120,7 +120,7 @@ ff text generate \
 
 ### Qwen3.8-27B
 
-Qwen3.8-27B is a dense groupwise-int4 checkpoint with an optional vision tower, with the same greedy decoding and end-of-sequence stop. Pass a PNG with `--image` to ground the prompt; the tower runs on the host. CUDA decoding uploads all projections to the `--device` ordinal; the run fails fast when the checkpoint and KV cache exceed free VRAM.
+Qwen3.8-27B is a dense groupwise-int4 checkpoint with an optional vision tower, with the same greedy decoding and end-of-sequence stop. Pass a PNG with `--image` to ground the prompt; the tower runs on the host. CUDA decoding partitions the layer stack across the `--device` ordinals (`cuda:0,1` spreads it over two cards); the run fails fast with a per-device required/free table when the checkpoint and KV cache exceed free VRAM.
 
 ```bash
 ff text generate \
