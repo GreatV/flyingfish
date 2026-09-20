@@ -1120,6 +1120,14 @@ impl Edge0Text {
     #[cfg(feature = "cuda")]
     pub fn forward_token_multi(&mut self, prev: u32) -> Result<u32> {
         let mut multi = self.gpu_multi.take().expect("multi-device runtime");
+        if let Some(res) = &multi.peers[0].res {
+            anyhow::ensure!(
+                self.position < res.max_ctx,
+                "position {} reached max_ctx {} (KV cache capacity)",
+                self.position,
+                res.max_ctx
+            );
+        }
         multi.peers[0]
             .ctx
             .counted_sync()
@@ -1143,6 +1151,14 @@ impl Edge0Text {
     #[cfg(feature = "cuda")]
     pub fn forward_multi(&mut self, token: u32) -> Result<Vec<f32>> {
         let mut multi = self.gpu_multi.take().expect("multi-device runtime");
+        if let Some(res) = &multi.peers[0].res {
+            anyhow::ensure!(
+                self.position < res.max_ctx,
+                "position {} reached max_ctx {} (KV cache capacity)",
+                self.position,
+                res.max_ctx
+            );
+        }
         multi.peers[0]
             .ctx
             .counted_sync()
