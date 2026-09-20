@@ -37,6 +37,7 @@ fn main() -> Result<()> {
         use std::fmt::Write as _;
         println!("cargo:rerun-if-env-changed=NVCC");
         println!("cargo:rerun-if-env-changed=PTXAS");
+        println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
         println!(
             "cargo:rerun-if-env-changed={}",
             ff_cuda_build::ARCHITECTURE_ENVIRONMENT_VARIABLE

@@ -50,6 +50,17 @@ pub struct DevicePlan {
     pub free_bytes: u64,
 }
 
+impl DevicePlan {
+    /// Free bytes minus the headroom the plan refuses to allocate against.
+    pub fn budget(&self) -> u64 {
+        self.free_bytes.saturating_sub(RESIDENCY_MARGIN_BYTES)
+    }
+
+    pub fn fits(&self) -> bool {
+        self.total_bytes <= self.budget()
+    }
+}
+
 /// Byte cost of one text layer on device, including its two norms and the
 /// kind-specific attention/GDN block plus the shared-expert MLP. We use
 /// `Edge0Weights::shape` for the integer dimensions and apply the int4
@@ -101,6 +112,21 @@ fn layer_projection_bytes(
         total = total
             .checked_add(projection_bytes_for(weights, &name)?)
             .context("projection bytes overflow")?;
+        total = total
+            .checked_add(projection_state_bytes(weights, &name)?)
+            .context("projection state bytes overflow")?;
+    }
+    if text.layer_kind(layer) == crate::config::LayerKind::LinearAttention {
+        // GpuGdn::upload's conv, recurrent, and output buffers.
+        let conv_dim = 2 * text.linear_num_key_heads * text.linear_key_head_dim
+            + text.linear_num_value_heads * text.linear_value_head_dim;
+        let buffers = conv_dim * (text.linear_conv_kernel_dim - 1)
+            + text.linear_num_value_heads * text.linear_key_head_dim * text.linear_value_head_dim
+            + conv_dim
+            + text.linear_num_value_heads * text.linear_value_head_dim;
+        total = total
+            .checked_add((buffers * std::mem::size_of::<f32>()) as u64)
+            .context("gdn buffer bytes overflow")?;
     }
     for norm in norms {
         let name = format!("{prefix}.{norm}");
@@ -150,6 +176,18 @@ fn projection_bytes_for(weights: &super::weights::Edge0Weights, name: &str) -> R
         .context("projection byte sum overflow")
 }
 
+/// Persistent buffers one uploaded projection carries: the y output buffer
+/// and, when present, the LoRA pair.
+fn projection_state_bytes(weights: &super::weights::Edge0Weights, name: &str) -> Result<u64> {
+    let shape = weights.shape(&format!("{name}.weight"))?;
+    let y = (shape[0] as u64).checked_mul(4).context("y overflow")?;
+    let lora = match weights.lora_for(name) {
+        Some((a, b, _)) => (a.len() + b.len()) as u64 * 4,
+        None => 0,
+    };
+    Ok(y + lora)
+}
+
 /// Static skeleton that lives on the first device: embed_tokens, lm_head,
 /// final RMSNorm. Mirrors the same shape on the production upload path.
 fn static_skeleton_bytes(weights: &super::weights::Edge0Weights) -> Result<u64> {
@@ -182,6 +220,11 @@ fn static_skeleton_bytes(weights: &super::weights::Edge0Weights) -> Result<u64> 
     }
     Ok(total)
 }
+
+/// Headroom the Edge0 residency plan leaves unallocated per device: module
+/// images, runtime scratch, and launch-time allocations the byte accounting
+/// cannot see.
+pub const RESIDENCY_MARGIN_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Per-device byte-balanced residency plan for the static projections, KV
 /// cache, and shared skeleton. Each device receives the projections of its

@@ -1060,12 +1060,12 @@ impl Edge0Text {
                 plan.static_bytes / (1024 * 1024),
                 plan.total_bytes / (1024 * 1024),
                 plan.free_bytes / (1024 * 1024),
-                plan.total_bytes <= plan.free_bytes,
+                plan.fits(),
             );
         }
         for plan in &plans {
             anyhow::ensure!(
-                plan.total_bytes <= plan.free_bytes,
+                plan.fits(),
                 "cuda:{} cannot hold the layer range ({} MiB > {} MiB free; \
                  projection={} MiB kv={} MiB expert={} MiB static={} MiB)",
                 plan.ordinal,
