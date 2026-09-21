@@ -473,7 +473,7 @@ fn dsv41_capture_parity_publishes_layer_snapshots_outside_the_model() {
         .args(["text", "capture-parity", "--adapter", "dsv41"])
         .arg("--model")
         .arg(&model)
-        .args(["--prompt", "tok1 tok2", "--output"])
+        .args(["--prompt", "tok1 tok2", "--device", "cpu", "--output"])
         .arg(&capture)
         .output()
         .unwrap();
@@ -489,4 +489,113 @@ fn dsv41_capture_parity_publishes_layer_snapshots_outside_the_model() {
     assert!(loaded.contains_key("layer_01"));
     assert!(loaded.contains_key("prompt_tokens"));
     assert!(!model.join("parity.safetensors").exists());
+}
+
+#[test]
+fn dsv41_rejects_unwired_surfaces_loudly() {
+    let root = tempfile::tempdir().unwrap();
+    write_fixture(root.path());
+    let model = root.path().join("DeepSeek-V4.1-mini");
+    let base = |model: &std::path::Path| -> Vec<String> {
+        vec![
+            "text".into(),
+            "generate".into(),
+            "--adapter".into(),
+            "dsv41".into(),
+            "--model".into(),
+            model.to_string_lossy().into_owned(),
+            "--prompt".into(),
+            "tok1".into(),
+        ]
+    };
+    for (extra, message) in [
+        (
+            vec!["--device", "cuda:0"],
+            "CUDA and Metal inference for dsv41 are not wired yet",
+        ),
+        (
+            vec!["--device", "cpu", "--weight-source", "memory"],
+            "weight sources are not wired for dsv41",
+        ),
+        (
+            vec!["--device", "cpu", "--host-cache-mib", "4"],
+            "host cache ceilings are not wired for dsv41",
+        ),
+    ] {
+        let mut argv = base(&model);
+        argv.extend(extra.iter().map(|flag| flag.to_string()));
+        let output = ff().args(&argv).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{extra:?} should have been rejected"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "{extra:?}: {stderr}");
+    }
+}
+
+#[test]
+fn dsv41_generate_emits_json_and_writes_output_atomically() {
+    let root = tempfile::tempdir().unwrap();
+    write_fixture(root.path());
+    let model = root.path().join("DeepSeek-V4.1-mini");
+    let out = root.path().join("result.txt");
+    let output = ff()
+        .args(["text", "generate", "--adapter", "dsv41"])
+        .arg("--model")
+        .arg(&model)
+        .args([
+            "--prompt",
+            "tok1 tok2",
+            "--device",
+            "cpu",
+            "--max-new-tokens",
+            "2",
+            "--json",
+        ])
+        .arg("--output")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out.is_file());
+    let parsed: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!(parsed["model_family"], "deepseek_v41");
+    assert!(parsed["text"].is_string());
+    // The file is outside the model directory.
+    assert!(!model.join("result.txt").exists());
+}
+
+#[test]
+fn dsv41_prompt_plus_budget_beyond_the_request_limit_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    write_fixture(root.path());
+    let model = root.path().join("DeepSeek-V4.1-mini");
+    // Prompt of 3 tokens (BOS/user/assistant markers collapse in the fixture
+    // tokenizer) plus 2048 requested new tokens exceeds the 128 default cap.
+    let output = ff()
+        .args(["text", "generate", "--adapter", "dsv41"])
+        .arg("--model")
+        .arg(&model)
+        .args([
+            "--prompt",
+            "tok1 tok2",
+            "--device",
+            "cpu",
+            "--max-new-tokens",
+            "2000",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        (stderr.contains("exceeds the") && stderr.contains("request limit"))
+            || stderr.contains("exceeds the model"),
+        "{stderr}"
+    );
 }

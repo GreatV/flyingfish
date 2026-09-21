@@ -1,10 +1,13 @@
-use crate::cli::output_hygiene::{ensure_new_output, resolve_output_outside_model};
-use crate::cli::{Result, WeightCacheArgs, kit};
-use anyhow::bail;
-use candle_core::Tensor;
+use crate::cli::output_hygiene::{
+    ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
+};
+use crate::cli::{CachePolicy, Result, WeightCacheArgs, WeightSource, kit};
+use anyhow::{Context, bail};
+use candle_core::{Device, Tensor};
 use clap::Subcommand;
 use flyingfish::dsv41::config::DeepseekV41Config;
 use flyingfish::dsv41::weights::TransformerLoader;
+use rand::{Rng as _, SeedableRng, rngs::StdRng};
 use std::{num::NonZeroUsize, path::PathBuf};
 
 #[derive(Debug, Subcommand)]
@@ -97,6 +100,101 @@ pub(super) enum Dsv41Command {
     },
 }
 
+/// Greedy pick from a logits row.
+fn greedy(values: &[f32]) -> Result<u32> {
+    anyhow::ensure!(
+        values.iter().all(|value| value.is_finite()),
+        "model produced non-finite logits"
+    );
+    values
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.partial_cmp(right.1).expect("finite logits"))
+        .map(|(index, _)| index as u32)
+        .context("model produced no logits")
+}
+
+/// Nucleus sampling with a seeded generator; mirrors the GLM reference
+/// (softmax over the vocabulary, keep the smallest prefix reaching `top_p`).
+fn sample_token(logits: &Tensor, temperature: f64, top_p: f64, rng: &mut StdRng) -> Result<u32> {
+    if temperature == 0.0 {
+        return greedy(&logits.flatten_all()?.to_vec1::<f32>()?);
+    }
+    anyhow::ensure!(
+        temperature.is_finite() && temperature > 0.0 && temperature.recip().is_finite(),
+        "sampling temperature must be positive and safely invertible"
+    );
+    let values = logits
+        .to_dtype(candle_core::DType::F32)?
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    anyhow::ensure!(!values.is_empty(), "logits are empty");
+    anyhow::ensure!(
+        values.iter().all(|value| value.is_finite()),
+        "logits contain a non-finite value"
+    );
+    let inverse = 1.0 / temperature;
+    let mut order = (0..values.len()).collect::<Vec<_>>();
+    order.sort_unstable_by(|&left, &right| values[right].total_cmp(&values[left]));
+    let maximum = values[order[0]] as f64 * inverse;
+    let mut probabilities = order
+        .iter()
+        .map(|&index| (values[index] as f64 * inverse - maximum).exp())
+        .collect::<Vec<_>>();
+    let total = probabilities.iter().sum::<f64>();
+    anyhow::ensure!(
+        total.is_finite() && total > 0.0,
+        "softmax normalization is invalid"
+    );
+    for probability in &mut probabilities {
+        *probability /= total;
+    }
+    let mut retained = 0usize;
+    let mut cumulative = 0.0;
+    for probability in &probabilities {
+        cumulative += *probability;
+        retained += 1;
+        if cumulative >= top_p {
+            break;
+        }
+    }
+    let retained_total = probabilities[..retained].iter().sum::<f64>();
+    let target = rng.random::<f64>() * retained_total;
+    let mut cumulative = 0.0;
+    for (rank, probability) in probabilities[..retained].iter().enumerate() {
+        cumulative += *probability;
+        if target <= cumulative {
+            return u32::try_from(order[rank]).context("token id exceeds u32");
+        }
+    }
+    u32::try_from(order[retained - 1]).context("token id exceeds u32")
+}
+
+fn reject_unsupported_device(device: &str) -> Result<()> {
+    anyhow::ensure!(
+        device == "cpu",
+        "CUDA and Metal inference for dsv41 are not wired yet; pass --device cpu"
+    );
+    Ok(())
+}
+
+fn reject_nondefault_weights(weights: &WeightCacheArgs) -> Result<()> {
+    anyhow::ensure!(
+        weights.weight_source == WeightSource::Mmap,
+        "streamed and in-memory weight sources are not wired for dsv41 yet; keep the mmap default"
+    );
+    anyhow::ensure!(
+        weights.host_cache_mib.is_none(),
+        "host cache ceilings are not wired for dsv41 yet; drop --host-cache-mib"
+    );
+    anyhow::ensure!(
+        weights.cache_policy()? == CachePolicy::new(1),
+        "weight-cache granularity other than the shard default is not wired for dsv41 yet"
+    );
+    Ok(())
+}
+
 pub(super) fn run(command: Dsv41Command) -> Result<()> {
     match command {
         Dsv41Command::Generate {
@@ -116,11 +214,12 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             let effort = flyingfish::dsv41::encoding::ReasoningEffort::parse(&reasoning_effort)
                 .map_err(|error| anyhow::anyhow!(error))?;
             if image.is_some() {
-                anyhow::bail!(
+                bail!(
                     "--image generation is not wired yet; the vision tower runs only in capture-parity fixtures"
                 );
             }
-            let _ = &weights;
+            reject_unsupported_device(&device.device)?;
+            reject_nondefault_weights(&weights)?;
             let loader = TransformerLoader::open(&model_dir)?;
             admit_resident_footprint(&loader)?;
             let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -149,21 +248,57 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
                 ids.len(),
                 max_context
             );
-            let _ = &device;
-            let max_seq =
-                max_context.max(config.text_config.max_position_embeddings.min(max_context));
+            // The sequence budget covers the prompt plus every requested
+            // generation step; it must fit both the request limit and the
+            // model's trained span.
+            let budget = limits.max_new_tokens.get();
+            let needed = ids
+                .len()
+                .checked_add(budget)
+                .context("request length overflows usize")?;
+            anyhow::ensure!(
+                needed <= max_context,
+                "prompt of {} tokens plus {} new tokens exceeds the {}-token request limit",
+                ids.len(),
+                budget,
+                max_context
+            );
+            anyhow::ensure!(
+                needed <= config.text_config.max_position_embeddings,
+                "prompt of {} tokens plus {} new tokens exceeds the model's {}-token span",
+                ids.len(),
+                budget,
+                config.text_config.max_position_embeddings
+            );
+            let max_seq = needed;
             let mut transformer = loader.load(Some(&tokenizer), max_seq)?;
-            let device = candle_core::Device::Cpu;
+            let device = Device::Cpu;
+            let mut rng = StdRng::seed_from_u64(sampling.seed);
             let mut position = 0usize;
             let chunk = Tensor::from_vec(ids.clone(), (1, ids.len()), &device)?;
             let (mut token, logits) = transformer.forward(&chunk, position)?;
+            if sampling.temperature != 0.0 {
+                token = sample_token(&logits, sampling.temperature, sampling.top_p, &mut rng)?;
+            }
+            // The prompt already answered: an immediate EOS ends the turn
+            // before any decode step runs.
+            if token == config.eos_token_id {
+                let text = tokenizer
+                    .decode(&[] as &[u32], true)
+                    .map_err(|error| anyhow::anyhow!("decode output: {error}"))?;
+                emit_result(&output, &model_dir, &text, &[], sampling.temperature == 0.0)?;
+                return Ok(());
+            }
             let mut generated = vec![token];
             position = ids.len();
-            let budget = limits.max_new_tokens.get();
             while generated.len() < budget {
                 let step = Tensor::from_vec(vec![token], (1, 1), &device)?;
-                let (next, _) = transformer.forward(&step, position)?;
-                token = next;
+                let (next, logits) = transformer.forward(&step, position)?;
+                token = if sampling.temperature != 0.0 {
+                    sample_token(&logits, sampling.temperature, sampling.top_p, &mut rng)?
+                } else {
+                    next
+                };
                 generated.push(token);
                 position += 1;
                 if token == config.eos_token_id {
@@ -174,10 +309,8 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             let text = tokenizer
                 .decode(&generated, true)
                 .map_err(|error| anyhow::anyhow!("decode output: {error}"))?;
-            let _ = (sampling, &logits, &output);
-            println!("{text}");
-            eprintln!("generated {} tokens (greedy)", generated.len());
-            Ok(())
+            let greedy = sampling.temperature == 0.0;
+            emit_result(&output, &model_dir, &text, &generated, greedy)
         }
         Dsv41Command::CaptureParity {
             model: model_dir,
@@ -189,7 +322,9 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             no_progress,
             output,
         } => {
-            let _ = (device, weights, no_progress);
+            reject_unsupported_device(&device)?;
+            reject_nondefault_weights(&weights)?;
+            let _ = no_progress;
             let effort = flyingfish::dsv41::encoding::ReasoningEffort::parse(&reasoning_effort)
                 .map_err(|error| anyhow::anyhow!(error))?;
             let loader = TransformerLoader::open(&model_dir)?;
@@ -206,7 +341,7 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             anyhow::ensure!(!ids.is_empty(), "prompt tokenized to an empty sequence");
             ids.truncate(limit);
             let mut transformer = loader.load(Some(&tokenizer), limit.max(ids.len()))?;
-            let device = candle_core::Device::Cpu;
+            let device = Device::Cpu;
             let chunk = Tensor::from_vec(ids.clone(), (1, ids.len()), &device)?;
             let mut snapshots = Vec::new();
             let (token, _) = transformer.forward_with_capture(&chunk, 0, Some(&mut snapshots))?;
@@ -240,14 +375,73 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
     }
 }
 
-/// Refuse loudly when the dequantized resident set cannot fit this host, in
-/// line with the design doc's admission stance for oversized checkpoints.
+fn emit_result(
+    output: &kit::OutputArgs,
+    model_dir: &PathBuf,
+    text: &str,
+    generated: &[u32],
+    greedy: bool,
+) -> Result<()> {
+    let telemetry_path = output
+        .telemetry_json
+        .as_ref()
+        .map(|path| resolve_output_outside_model(path, model_dir))
+        .transpose()?;
+    if let Some(path) = &telemetry_path {
+        ensure_new_output(path, "telemetry output")?;
+    }
+    let rendered = if output.json {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "model_family": "deepseek_v41",
+            "model": model_dir,
+            "text": text,
+            "generated_token_ids": generated,
+            "sampling": {
+                "greedy": greedy,
+            },
+        }))?
+    } else {
+        text.to_owned()
+    };
+    if let Some(path) = output.output.as_ref() {
+        let path = resolve_output_outside_model(path, model_dir)?;
+        ensure_new_output(&path, "dsv41 output")?;
+        let staging = flyingfish::runtime::artifact::ArtifactStaging::new(&path)
+            .with_context(|| format!("failed to stage dsv41 output {}", path.display()))?;
+        publish_staged_bytes(staging, rendered.as_bytes())?;
+        eprintln!("saved dsv41 output to {}", path.display());
+    } else {
+        println!("{rendered}");
+    }
+    if let Some(path) = telemetry_path {
+        let report = flyingfish::runtime::telemetry::TelemetryMonitor::start(
+            Some(Device::Cpu),
+            std::time::Duration::from_millis(250),
+        )?
+        .finish()?;
+        let bytes = serde_json::to_vec_pretty(&report)?;
+        let staging = flyingfish::runtime::artifact::ArtifactStaging::new(&path)
+            .with_context(|| format!("failed to stage dsv41 telemetry {}", path.display()))?;
+        publish_staged_bytes(staging, &bytes)?;
+        eprintln!("saved dsv41 runtime telemetry to {}", path.display());
+    } else {
+        eprintln!(
+            "generated {} tokens ({})",
+            generated.len(),
+            if greedy { "greedy" } else { "sampled" }
+        );
+    }
+    Ok(())
+}
+
+/// Refuse loudly when the dequantized resident set cannot fit this host.
 fn admit_resident_footprint(loader: &TransformerLoader) -> Result<()> {
     let needed = loader.resident_f32_bytes()?;
     let available = host_available_bytes();
     anyhow::ensure!(
         needed <= available,
-        "the resident F32 load needs {} GiB but only {} GiB is available;          the routed experts need streaming, which is not wired yet",
+        "the resident F32 load needs {} GiB but only {} GiB is available; the routed experts need streaming, which is not wired yet",
         needed / (1 << 30),
         available / (1 << 30),
     );
