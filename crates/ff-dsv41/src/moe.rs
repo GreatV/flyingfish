@@ -155,7 +155,7 @@ impl Expert {
             .to_vec1::<f32>()?;
         let limit = self.swiglu_limit as f32;
         let mut output = vec![0.0f32; tokens * hidden];
-        for token in 0..tokens {
+        for (token, &weight) in weights.iter().enumerate() {
             let base = token * hidden;
             let mut inner = vec![0.0f32; inter];
             for row in 0..inter {
@@ -172,7 +172,7 @@ impl Expert {
                 } else {
                     up
                 };
-                inner[row] = silu(gate) * up * weights[token];
+                inner[row] = silu(gate) * up * weight;
             }
             for column in 0..hidden {
                 let mut sum = 0.0f32;
