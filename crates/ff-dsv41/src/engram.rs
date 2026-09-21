@@ -271,16 +271,19 @@ impl NgramHashState {
                     for i in 1..ngram {
                         let product = (tokens[i] as i64).wrapping_mul(multipliers[i] as i64);
                         rolling ^= product;
-                        let head = (i - 1) % heads;
+                        // One rolling hash broadcasts across every head bucket of
+                        // this n-gram size; each head reads its own prime range.
                         let ngram_index = i - 1;
-                        let bucket = self.layout.primes[layer][ngram_index][head];
-                        let offset = self.layout.offsets[layer]
-                            .get(ngram_index * heads + head)
-                            .copied()
-                            .unwrap_or(0);
-                        let column = ngram_index * heads + head;
-                        hashes[((b * seqlen + s) * layers + layer) * cols + column] =
-                            rolling.rem_euclid(bucket as i64) + offset as i64;
+                        for head in 0..heads {
+                            let bucket = self.layout.primes[layer][ngram_index][head];
+                            let offset = self.layout.offsets[layer]
+                                .get(ngram_index * heads + head)
+                                .copied()
+                                .unwrap_or(0);
+                            let column = ngram_index * heads + head;
+                            hashes[((b * seqlen + s) * layers + layer) * cols + column] =
+                                rolling.rem_euclid(bucket as i64) + offset as i64;
+                        }
                     }
                 }
             }
@@ -385,8 +388,7 @@ pub fn engram_forward(
                     gate = 0.0;
                 }
                 for d in 0..hidden {
-                    output[((b * seq + s) * hc + copy) * hidden + d] +=
-                        gate * value[copy * hidden + d];
+                    output[((b * seq + s) * hc + copy) * hidden + d] += gate * value[d];
                 }
             }
         }
@@ -443,6 +445,78 @@ mod tests {
             layout.offsets[0][2],
             layout.primes[0][0][0] + layout.primes[0][0][1]
         );
+    }
+
+    #[test]
+    fn engram_value_broadcasts_across_hc_copies() {
+        let device = candle_core::Device::Cpu;
+        let (batch, seq, hc, hidden, head_dim, cols) = (1, 1, 2, 4, 3, 2);
+        let x = Tensor::zeros((batch, seq, hc, hidden), DType::F32, &device).unwrap();
+        // Embedded hash rows with a distinct value scale per column.
+        let mut embedded = vec![0.0f32; batch * seq * cols * head_dim];
+        for c in 0..cols {
+            for d in 0..head_dim {
+                embedded[c * head_dim + d] = (c as f32 + 1.0) * 0.1;
+            }
+        }
+        let embedded = Tensor::from_vec(embedded, (batch, seq, cols, head_dim), &device).unwrap();
+        // wkv: key rows zero, one shared value row = column sums.
+        let mut wkv = vec![0.0f32; hidden * (hc + 1) * cols * head_dim];
+        let value_base = hc * hidden;
+        for c in 0..cols {
+            for d in 0..head_dim {
+                for channel in 0..hidden {
+                    wkv[(value_base + channel) * cols * head_dim + c * head_dim + d] =
+                        (c as f32 + 1.0) * 0.1;
+                }
+            }
+        }
+        let wkv = Tensor::from_vec(wkv, (hidden * (hc + 1), cols * head_dim), &device).unwrap();
+        let q_weight = Tensor::ones(hc * hidden, DType::F32, &device).unwrap();
+        let k_weight = Tensor::ones(hc * hidden, DType::F32, &device).unwrap();
+        let out = engram_forward(&x, &embedded, &wkv, &q_weight, &k_weight, None).unwrap();
+        let values = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // Zero stream and zero gate input (sigmoid(0)-ish via clamped dot at 0):
+        // gate = sigmoid(sqrt(clamp(0))) = sigmoid(0) = 0.5. Both hc copies add
+        // the same shared value row; an offset-into-value indexing (copy*hidden)
+        // would read zeros for copy 0 (value starts at hc*hidden).
+        for copy in 0..hc {
+            for channel in 0..hidden {
+                let slot = copy * hidden + channel;
+                assert!(
+                    (values[slot] - values[channel]).abs() < 1e-5,
+                    "copy {copy} diverged: {values:?}"
+                );
+            }
+        }
+        assert!(values[0].abs() > 1e-3, "value row never added: {values:?}");
+    }
+
+    #[test]
+    fn every_head_bucket_gets_a_hash_column() {
+        // One layer, three heads, 2-gram: the single rolling hash must land in
+        // all three head buckets, each with its own prime and offset.
+        let layout = EngramLayout {
+            max_ngram_size: 2,
+            layer_ids: vec![1],
+            num_embeddings: vec![10],
+            primes: vec![vec![vec![7, 11, 13]]],
+            offsets: vec![vec![0, 0, 0]],
+            n_heads: 3,
+            head_dim: 2,
+        };
+        let token_map = vec![0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let mut state = NgramHashState::new(layout, token_map, 1, 8).unwrap();
+        let ids = Tensor::from_vec(vec![5u32], (1, 1), &candle_core::Device::Cpu).unwrap();
+        let hashes = state.forward(&ids, 0, None).unwrap();
+        assert_eq!(hashes.dims(), [1, 1, 1, 3]);
+        let values = hashes.flatten_all().unwrap().to_vec1::<i64>().unwrap();
+        let m = hash_multipliers(1, 99_092, 2).unwrap();
+        let rolling = (5i64).wrapping_mul(m[0] as i64) ^ (2i64).wrapping_mul(m[1] as i64);
+        let residue = rolling.rem_euclid(7);
+        assert_eq!(values[0], residue);
+        assert_eq!(values[1], rolling.rem_euclid(11));
+        assert_eq!(values[2], rolling.rem_euclid(13));
     }
 
     #[test]

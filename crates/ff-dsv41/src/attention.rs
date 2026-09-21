@@ -204,7 +204,7 @@ impl Compressor {
         }
         let device = norm_weight.device();
         let kv_state = Tensor::zeros((batch, ratio, head_dim), DType::F32, device)?;
-        let score_state = Tensor::full(f32::NEG_INFINITY, (batch, ratio), device)?;
+        let score_state = Tensor::full(f32::NEG_INFINITY, (batch, ratio, head_dim), device)?;
         Ok(Self {
             ratio,
             head_dim,
@@ -357,7 +357,7 @@ impl Compressor {
 
         self.kv_state = Tensor::from_vec(kv_state, (batch, ratio, head_dim), x.device())
             .map_err(anyhow::Error::from)?;
-        self.score_state = Tensor::from_vec(score_state, (batch, ratio), x.device())
+        self.score_state = Tensor::from_vec(score_state, (batch, ratio, head_dim), x.device())
             .map_err(anyhow::Error::from)?;
         if produced == 0 {
             return Ok(None);
@@ -379,7 +379,9 @@ fn stash(
     for (target, value) in kv_state[base..base + kv.len()].iter_mut().zip(kv.iter()) {
         *target = *value;
     }
-    for (target, value) in score_state[batch * ratio + slot..batch * ratio + slot + 1]
+    // The gate is per channel: one score per head_dim slot of the group.
+    let base = (batch * ratio + slot) * gate.len();
+    for (target, value) in score_state[base..base + gate.len()]
         .iter_mut()
         .zip(gate.iter())
     {
@@ -395,12 +397,13 @@ fn pool_group(
     head_dim: usize,
 ) -> Vec<f32> {
     let mut pooled = Vec::with_capacity(head_dim);
-    let scores = (0..ratio)
-        .map(|slot| score_state[batch * ratio + slot])
-        .collect::<Vec<_>>();
-    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let total: f32 = scores.iter().map(|score| (score - max).exp()).sum();
+    // Softmax weights are per channel: channel d pools its own group slots.
     for d in 0..head_dim {
+        let scores = (0..ratio)
+            .map(|slot| score_state[(batch * ratio + slot) * head_dim + d])
+            .collect::<Vec<_>>();
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let total: f32 = scores.iter().map(|score| (score - max).exp()).sum();
         let mut value = 0.0;
         for slot in 0..ratio {
             let weight = (scores[slot] - max).exp() / total;
@@ -470,6 +473,37 @@ mod tests {
             "{} vs {}",
             values[1],
             expected1
+        );
+    }
+
+    #[test]
+    fn compressor_pools_each_channel_with_its_own_gate() {
+        let device = Device::Cpu;
+        let head_dim = 2;
+        let hidden = 2;
+        let norm = Tensor::ones(head_dim, DType::F32, &device).unwrap();
+        let wkv =
+            Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], (head_dim, hidden), &device).unwrap();
+        // Gate strongly favors token 0 on channel 0 and token 1 on channel 1.
+        let wgate =
+            Tensor::from_vec(vec![5.0f32, -5.0, -5.0, 5.0], (head_dim, hidden), &device).unwrap();
+        let mut compressor = Compressor::new(2, head_dim, norm, wkv, Some(wgate), 1).unwrap();
+        // wkv maps channel 0 -> x0 and channel 1 -> x1; the gate favors
+        // token 0 on channel 0 and token 1 on channel 1.
+        let x = Tensor::from_vec(
+            vec![1.0f32, 0.0, 1.0, 0.0, 3.0, 0.0, 4.0, 7.0],
+            (1, 4, hidden),
+            &device,
+        )
+        .unwrap();
+        let latents = compressor.forward(&x, 0).unwrap().unwrap();
+        let values = latents.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // Channel 1 pools (0, 7) with token-1 weight ~1: the latent is close
+        // to 7 before normalization. A single shared score (channel 0's gate)
+        // would weight token 0 instead and shrink channel 1 toward 0.
+        assert!(
+            values[3] > values[2],
+            "channel 1 must outweigh channel 0: {values:?}"
         );
     }
 

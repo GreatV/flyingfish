@@ -269,17 +269,22 @@ impl TransformerLoader {
         &self.config
     }
 
+    #[cfg(test)]
+    pub(crate) fn layer_tensor_names_for_test(&mut self, name: &str) -> Result<()> {
+        let _ = self.tensors(name)?;
+        Ok(())
+    }
+
     fn tensors(&mut self, name: &str) -> Result<&safetensors::SafeTensors<'static>> {
         let shard = self
             .layout
             .shard_of(name)
             .with_context(|| format!("{name} is not in the index"))?
             .to_owned();
-        let model_dir = self.model_dir.clone();
-        let entry = self.shards.entry(shard).or_insert_with(|| {
-            open_shard(&model_dir, self.layout.shard_of(name).unwrap_or_default()).unwrap()
-        });
-        let (_, tensors) = entry;
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.shards.entry(shard.clone()) {
+            entry.insert(open_shard(&self.model_dir, &shard)?);
+        }
+        let (_, tensors) = self.shards.get_mut(&shard).expect("just inserted");
         Ok(tensors)
     }
 
@@ -501,6 +506,8 @@ impl TransformerLoader {
             index_head_dim: self.config.text_config.index_head_dim,
             index_heads: self.config.text_config.index_n_heads,
             index_topk: self.config.text_config.index_topk,
+            candidate_topk_blocks: self.config.text_config.candidate_topk_blocks,
+            candidate_block_size: self.config.text_config.candidate_block_size,
         };
 
         let ffn = self.load_ffn(layer)?;
@@ -692,6 +699,38 @@ mod tests {
             assert_eq!(layout.shard_role(shard), Some(ShardRole::Engram));
             assert_eq!(layout.tensors_in(shard).len(), 6);
         }
+    }
+
+    #[test]
+    fn a_broken_shard_reports_an_error_instead_of_panicking() {
+        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        if !dir.join("model.safetensors.index.json").exists() {
+            return;
+        }
+        // Point the loader at a directory whose shard file is absent: opening
+        // must surface an io error through Result, not an unwrap panic.
+        let scratch = std::env::temp_dir().join(format!("ff-dsv41-broken-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::copy(
+            dir.join("model.safetensors.index.json"),
+            scratch.join("model.safetensors.index.json"),
+        )
+        .unwrap();
+        std::fs::copy(dir.join("config.json"), scratch.join("config.json")).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let mut loader = crate::weights::TransformerLoader::open(&scratch).unwrap();
+            loader.layer_tensor_names_for_test("layers.6.attn.wq_a.weight")
+        });
+        std::fs::remove_dir_all(&scratch).ok();
+        let error = match result {
+            Ok(Err(error)) => error,
+            Ok(Ok(())) => panic!("missing shard must be an error"),
+            Err(_) => panic!("missing shard panicked instead of erroring"),
+        };
+        assert!(
+            error.to_string().contains("No such file") || error.to_string().contains("open model-"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

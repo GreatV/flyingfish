@@ -425,6 +425,8 @@ mod tests {
             index_head_dim: 32,
             index_heads: 2,
             index_topk: 2,
+            candidate_topk_blocks: 4,
+            candidate_block_size: 4,
         };
         let block = |ratio: usize, kv: bool, index: bool| BlockWeights {
             attention: attention(ratio),

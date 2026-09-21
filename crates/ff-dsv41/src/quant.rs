@@ -25,7 +25,7 @@ pub fn e4m3_byte_to_f32(bits: u8) -> f32 {
     let exponent = ((bits >> 3) & 0x0f) as i32;
     let mantissa = (bits & 0x07) as i32;
     if exponent == 0 {
-        sign * (mantissa as f32) * 2.0f32.powi(-6)
+        sign * (mantissa as f32) * 2.0f32.powi(-9)
     } else {
         sign * ((1 << 3 | mantissa) as f32) * 2.0f32.powi(exponent - 10)
     }
@@ -171,6 +171,19 @@ mod tests {
         let decoded = dequantize_fp8_block(&weight, &[127; 6], &Device::Cpu).unwrap();
         assert_eq!(decoded.dims(), [33, 65]);
         assert!(dequantize_fp8_block(&weight, &[127; 4], &Device::Cpu).is_err());
+    }
+
+    #[test]
+    fn e4m3_subnormals_decode_on_the_m8_scale() {
+        // Exponent 0 bytes are subnormals: m/8 * 2^-6 = m * 2^-9.
+        assert_eq!(e4m3_byte_to_f32(0x01), 2.0f32.powi(-9));
+        assert_eq!(e4m3_byte_to_f32(0x07), 7.0 * 2.0f32.powi(-9));
+        assert_eq!(e4m3_byte_to_f32(0x81), -2.0f32.powi(-9));
+        // Normal range stays on the 2^(exp-10) scale; 0x08 is the smallest
+        // normal (m=0, exp=1), not a subnormal.
+        assert_eq!(e4m3_byte_to_f32(0x08), 2.0f32.powi(-6));
+        assert_eq!(e4m3_byte_to_f32(0x38), 1.0);
+        assert_eq!(e4m3_byte_to_f32(0x40), 2.0);
     }
 
     #[test]

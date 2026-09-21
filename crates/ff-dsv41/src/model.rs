@@ -77,6 +77,8 @@ impl WindowRing {
                 values[base..base + head_dim]
                     .copy_from_slice(&incoming[b * head_dim..(b + 1) * head_dim]);
             }
+            // The returned view is oldest-first; the caller's indices address
+            // this rank order, matching the reference's ring layout.
             let mut ordered = Vec::with_capacity(batch * window * head_dim);
             for b in 0..batch {
                 let oldest = slot + 1;
@@ -91,12 +93,12 @@ impl WindowRing {
                     );
                 }
             }
-            let mut cache = self.cache.clone();
-            std::mem::swap(&mut cache, &mut self.cache);
-            let rotated = Tensor::from_vec(ordered, (batch, window, head_dim), kv.device())
+            self.cache = Tensor::from_vec(values, (batch, window, head_dim), kv.device())
                 .map_err(anyhow::Error::from)?;
-            std::mem::swap(&mut cache, &mut self.cache);
-            Ok(rotated)
+            Ok(
+                Tensor::from_vec(ordered, (batch, window, head_dim), kv.device())
+                    .map_err(anyhow::Error::from)?,
+            )
         }
     }
 }
@@ -120,15 +122,16 @@ pub fn window_topk_idxs(window: usize, batch: usize, seqlen: usize, start_pos: u
         )
         .unwrap()
     } else {
+        // Rank r in the rotated view is the r-th oldest row; the physical
+        // slot it came from is (oldest + r) mod window, valid once the
+        // sequence has reached that slot.
         let oldest = start_pos % window + 1;
         for _ in 0..batch {
             for _ in 0..seqlen {
-                for position in oldest..window {
-                    idxs.push(position as i64);
-                }
-                for position in 0..oldest {
+                for rank in 0..window {
+                    let position = (oldest + rank) % window;
                     idxs.push(if position <= start_pos {
-                        position as i64
+                        rank as i64
                     } else {
                         -1
                     });
@@ -161,6 +164,8 @@ pub struct AttentionCore {
     pub index_head_dim: usize,
     pub index_heads: usize,
     pub index_topk: usize,
+    pub candidate_topk_blocks: usize,
+    pub candidate_block_size: usize,
 }
 
 fn linear_rows(weight: &Tensor, input: &[f32], out: usize, inn: usize) -> Result<Vec<f32>> {
@@ -296,10 +301,10 @@ pub fn indexer_forward(
     }
     let scores_tensor = Tensor::from_vec(scores.clone(), (batch, seqlen, k_positions), x.device())
         .map_err(anyhow::Error::from)?;
-    let candidate_mask =
-        candidates.map(|_| select_candidate_blocks(&scores_tensor, compress_len, 2048, 8).unwrap());
-    if let Some(mask) = &candidate_mask {
-        let mask_values = mask.flatten_all().unwrap().to_vec1::<u8>().unwrap();
+    // `candidates` is the bool mask the source layer published; consumers
+    // mask by it without recomputing.
+    if let Some(mask) = candidates {
+        let mask_values = mask.flatten_all()?.to_vec1::<u8>()?;
         for (slot, keep) in scores.iter_mut().zip(mask_values.iter()) {
             if *keep == 0 {
                 *slot = f32::NEG_INFINITY;
@@ -448,14 +453,17 @@ impl AttentionCore {
             .to_vec1::<f32>()?
             .to_vec();
         let window_len = kv_values.len() / (batch * head_dim);
-        let mut topk: Vec<i64> = window_topk_idxs(
-            if start_pos == 0 { seqlen } else { window_len },
-            batch,
-            seqlen,
-            start_pos,
-        )
-        .flatten_all()?
-        .to_vec1::<i64>()?;
+        let ring_window = if start_pos == 0 {
+            self.ring.window.min(seqlen).max(1)
+        } else {
+            self.ring.window
+        };
+        let window_picks = window_topk_idxs(ring_window, batch, seqlen, start_pos)
+            .flatten_all()?
+            .to_vec1::<i64>()?;
+        let window_width = window_picks.len() / (batch * seqlen);
+        let mut compress_picks: Vec<i64> = Vec::new();
+        let mut topk: Vec<i64> = window_picks;
 
         let mut latents = None;
         if ratio > 0 {
@@ -568,15 +576,15 @@ impl AttentionCore {
                     },
                 )?;
                 if candidate_source {
-                    runtime.candidates = Some(scores);
+                    runtime.candidates = Some(select_candidate_blocks(
+                        &scores,
+                        compress_len,
+                        self.candidate_topk_blocks,
+                        self.candidate_block_size,
+                    )?);
                 }
                 runtime.topk_idxs = Some(idxs.clone());
-                topk.extend(
-                    idxs.flatten_all()?
-                        .to_vec1::<i64>()?
-                        .into_iter()
-                        .collect::<Vec<_>>(),
-                );
+                compress_picks = idxs.flatten_all()?.to_vec1::<i64>()?;
             } else {
                 let shared = runtime
                     .topk_idxs
@@ -621,12 +629,29 @@ impl AttentionCore {
                 kv_values
                     .extend_from_slice(&self.compress_cache[row * head_dim..(row + 1) * head_dim]);
             }
-            runtime.compress_kv = Some(Tensor::from_vec(
-                self.compress_cache[..(compress_len * batch).min(self.compress_cache.len())]
-                    .to_vec(),
-                (batch, compress_len.min(cache_rows / batch), head_dim),
-                device,
-            )?);
+            if is_kv_source {
+                runtime.compress_kv = Some(Tensor::from_vec(
+                    self.compress_cache[..(compress_len * batch).min(self.compress_cache.len())]
+                        .to_vec(),
+                    (batch, compress_len.min(cache_rows / batch), head_dim),
+                    device,
+                )?);
+            }
+        }
+
+        // sparse_attn reads one pick row per query: interleave the window and
+        // compressed picks per (batch, query) instead of concatenating blocks.
+        if !compress_picks.is_empty() {
+            let compress_width = compress_picks.len() / (batch * seqlen);
+            let mut interleaved =
+                Vec::with_capacity(batch * seqlen * (window_width + compress_width));
+            for row in 0..batch * seqlen {
+                interleaved.extend_from_slice(&topk[row * window_width..(row + 1) * window_width]);
+                interleaved.extend_from_slice(
+                    &compress_picks[row * compress_width..(row + 1) * compress_width],
+                );
+            }
+            topk = interleaved;
         }
 
         let total_rows = kv_values.len() / (batch * head_dim);
@@ -907,6 +932,287 @@ mod tests {
     }
 
     #[test]
+    fn candidate_consumers_mask_by_the_published_mask() {
+        let device = Device::Cpu;
+        let hidden = 32usize;
+        let qlora = 16usize;
+        let x = Tensor::from_vec(
+            (0..4 * hidden)
+                .map(|index| (index % 5) as f32 / 31.0)
+                .collect(),
+            (1, 4, hidden),
+            &device,
+        )
+        .unwrap();
+        let qr = Tensor::zeros((1, 4, qlora), DType::F32, &device).unwrap();
+        let wq_b = {
+            let mut values = vec![0.0f32; 2 * 32 * qlora];
+            for row in 0..2 * 32 {
+                values[row * qlora + (row % qlora)] = 0.1;
+            }
+            Tensor::from_vec(values, (2 * 32, qlora), &device).unwrap()
+        };
+        let weights_proj =
+            Tensor::from_vec(vec![0.5f32; 2 * hidden], (2, hidden), &device).unwrap();
+        // Position 1 scores higher than position 0; masking position 1 must
+        // flip the top pick to position 0 — the mask steers selection, and a
+        // consumer that recomputed its own candidates would ignore it.
+        let index_k = Tensor::zeros((1, 2, 32), DType::F32, &device).unwrap();
+        let open = Tensor::from_vec(vec![1u8; 4 * 2], (1, 4, 2), &device).unwrap();
+        let mut masked = vec![1u8; 4 * 2];
+        for row in masked.chunks_mut(2) {
+            row[1] = 0;
+        }
+        let masked = Tensor::from_vec(masked, (1, 4, 2), &device).unwrap();
+        let (open_picks, _) = indexer_forward(
+            &x,
+            &qr,
+            None,
+            0,
+            4,
+            &wq_b,
+            &weights_proj,
+            2,
+            32,
+            2,
+            2,
+            &index_k,
+            Some(&open),
+        )
+        .unwrap();
+        let open_picks = open_picks.flatten_all().unwrap().to_vec1::<i64>().unwrap();
+        let (masked_picks, _) = indexer_forward(
+            &x,
+            &qr,
+            None,
+            0,
+            4,
+            &wq_b,
+            &weights_proj,
+            2,
+            32,
+            2,
+            2,
+            &index_k,
+            Some(&masked),
+        )
+        .unwrap();
+        let masked_picks = masked_picks
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<i64>()
+            .unwrap();
+        assert_eq!(open_picks.len(), 4 * 2);
+        assert_eq!(masked_picks.len(), 4 * 2);
+        assert!(
+            open_picks.iter().any(|pick| *pick != masked_picks[0]),
+            "mask did not steer selection: {open_picks:?} vs {masked_picks:?}"
+        );
+    }
+
+    #[test]
+    fn window_and_compress_picks_interleave_per_query() {
+        use crate::math::precompute_freqs_cis;
+        let device = Device::Cpu;
+        let heads = 2usize;
+        let head_dim = 32usize;
+        let hidden = 32usize;
+        let qlora = 16usize;
+        let ones = |rows: usize, columns: usize| {
+            Tensor::from_vec(
+                (0..rows * columns)
+                    .map(|index| ((index % 7) as f32 - 3.0) / 97.0)
+                    .collect(),
+                (rows, columns),
+                &device,
+            )
+            .unwrap()
+        };
+        let build = || AttentionCore {
+            sink: Tensor::zeros(heads, DType::F32, &device).unwrap(),
+            wq_a: ones(qlora, hidden),
+            q_norm: Tensor::ones(qlora, DType::F32, &device).unwrap(),
+            wq_b: ones(heads * head_dim, qlora),
+            wkv: ones(head_dim, hidden),
+            kv_norm: Tensor::ones(head_dim, DType::F32, &device).unwrap(),
+            wo_a: ones(2 * 16, head_dim),
+            wo_b: ones(hidden, 2 * 16),
+            compressor: Some(
+                Compressor::new(
+                    2,
+                    head_dim,
+                    Tensor::ones(head_dim, DType::F32, &device).unwrap(),
+                    ones(head_dim, hidden),
+                    Some(ones(head_dim, hidden)),
+                    1,
+                )
+                .unwrap(),
+            ),
+            compress_cache: Vec::new(),
+            index_k_cache: Vec::new(),
+            ring: WindowRing::new(1, 4, head_dim, &device).unwrap(),
+            indexer_wq_b: Some(ones(2 * 32, qlora)),
+            indexer_wk: Some(ones(32, head_dim)),
+            indexer_k_norm: Some(Tensor::ones(32, DType::F32, &device).unwrap()),
+            weights_proj: Some(ones(2, hidden)),
+            freqs: precompute_freqs_cis(8, 16, 0, 1600.0, 1.0, 32, 1, &device).unwrap(),
+            index_head_dim: 32,
+            index_heads: 2,
+            index_topk: 2,
+            candidate_topk_blocks: 4,
+            candidate_block_size: 4,
+        };
+        let base = |scale: f32| {
+            Tensor::from_vec(
+                (0..4 * hidden)
+                    .map(|index| if index >= 3 * hidden { scale } else { 0.0 })
+                    .collect(),
+                (1, 4, hidden),
+                &device,
+            )
+            .unwrap()
+        };
+        // Two identical runs except token 3's magnitude: query 0's window is
+        // only itself (-1 sentinels for the rest), so its output row must be
+        // identical across the two runs once picks interleave per query.
+        let mut quiet = build();
+        let mut loud = build();
+        let out_quiet = quiet
+            .forward(
+                &base(0.0),
+                0,
+                &mut SharedAttentionRuntime::default(),
+                2,
+                true,
+                true,
+                false,
+                false,
+                0.5f64.sqrt(),
+                8,
+                16,
+                2,
+                heads,
+                head_dim,
+                hidden,
+            )
+            .unwrap();
+        let out_loud = loud
+            .forward(
+                &base(5.0),
+                0,
+                &mut SharedAttentionRuntime::default(),
+                2,
+                true,
+                true,
+                false,
+                false,
+                0.5f64.sqrt(),
+                8,
+                16,
+                2,
+                heads,
+                head_dim,
+                hidden,
+            )
+            .unwrap();
+        let quiet = out_quiet.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let loud = out_loud.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for channel in 0..hidden {
+            assert!(
+                (quiet[channel] - loud[channel]).abs() < 1e-4,
+                "query 0 changed with token 3: {quiet:?} vs {loud:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_source_layers_leave_the_shared_compress_cache_intact() {
+        use crate::math::precompute_freqs_cis;
+        let device = Device::Cpu;
+        let heads = 2usize;
+        let head_dim = 32usize;
+        let hidden = 32usize;
+        let qlora = 16usize;
+        let ones = |rows: usize, columns: usize| {
+            Tensor::from_vec(
+                (0..rows * columns)
+                    .map(|index| ((index % 7) as f32 - 3.0) / 97.0)
+                    .collect(),
+                (rows, columns),
+                &device,
+            )
+            .unwrap()
+        };
+        let core = AttentionCore {
+            sink: Tensor::zeros(heads, DType::F32, &device).unwrap(),
+            wq_a: ones(qlora, hidden),
+            q_norm: Tensor::ones(qlora, DType::F32, &device).unwrap(),
+            wq_b: ones(heads * head_dim, qlora),
+            wkv: ones(head_dim, hidden),
+            kv_norm: Tensor::ones(head_dim, DType::F32, &device).unwrap(),
+            wo_a: ones(2 * 16, head_dim),
+            wo_b: ones(hidden, 2 * 16),
+            compressor: None,
+            compress_cache: Vec::new(),
+            index_k_cache: Vec::new(),
+            ring: WindowRing::new(1, 4, head_dim, &device).unwrap(),
+            indexer_wq_b: None,
+            indexer_wk: None,
+            indexer_k_norm: None,
+            weights_proj: None,
+            freqs: precompute_freqs_cis(8, 16, 0, 1600.0, 1.0, 32, 1, &device).unwrap(),
+            index_head_dim: 32,
+            index_heads: 2,
+            index_topk: 2,
+            candidate_topk_blocks: 4,
+            candidate_block_size: 4,
+        };
+        let mut core = core;
+        let published = Tensor::ones((1, 2, head_dim), DType::F32, &device).unwrap();
+        let mut runtime = SharedAttentionRuntime {
+            compress_kv: Some(published.clone()),
+            index_k: Some(Tensor::zeros((1, 2, 32), DType::F32, &device).unwrap()),
+            topk_idxs: Some(Tensor::from_vec(vec![0i64, 0], (1, 1, 2), &device).unwrap()),
+            candidates: None,
+        };
+        let x = Tensor::from_vec(
+            (0..4 * hidden)
+                .map(|index| (index % 5) as f32 / 31.0)
+                .collect(),
+            (1, 4, hidden),
+            &device,
+        )
+        .unwrap();
+        core.forward(
+            &x,
+            0,
+            &mut runtime,
+            2,
+            false,
+            false,
+            false,
+            false,
+            0.5f64.sqrt(),
+            8,
+            16,
+            2,
+            heads,
+            head_dim,
+            hidden,
+        )
+        .unwrap();
+        let after = runtime
+            .compress_kv
+            .expect("non-source layer must not drop the shared cache");
+        assert_eq!(after.dims(), published.dims());
+        let kept = after.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            kept.iter().all(|value| *value == 1.0),
+            "shared cache overwritten: {kept:?}"
+        );
+    }
+
+    #[test]
     fn attention_layer_forward_runs_prefill_and_decode() {
         use crate::math::precompute_freqs_cis;
         let device = Device::Cpu;
@@ -960,6 +1266,8 @@ mod tests {
             index_head_dim: 32,
             index_heads: 2,
             index_topk: 2,
+            candidate_topk_blocks: 4,
+            candidate_block_size: 4,
         };
         let mut runtime = SharedAttentionRuntime {
             compress_kv: Some(Tensor::zeros((1, 8, head_dim), DType::F32, &device).unwrap()),
@@ -1027,6 +1335,68 @@ mod tests {
         assert_eq!(output.dims(), [1, 1, hidden]);
         let values = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn decode_picks_address_rank_order_with_sentinels_for_unfilled_slots() {
+        // start_pos 7 with window 4: slots hold positions 4..7 and the view is
+        // oldest-first, so every rank is filled and in range.
+        let idxs = window_topk_idxs(4, 1, 1, 7);
+        let flat = idxs.flatten_all().unwrap().to_vec1::<i64>().unwrap();
+        assert_eq!(flat, [0, 1, 2, 3]);
+        // start_pos 2 (early decode, ring still filling): rank 0 maps to
+        // physical slot 3, which the sequence never reached, so it is -1; the
+        // remaining ranks cover slots 0..2.
+        let idxs = window_topk_idxs(4, 1, 1, 2);
+        let flat = idxs.flatten_all().unwrap().to_vec1::<i64>().unwrap();
+        assert_eq!(flat, [-1, 1, 2, 3]);
+    }
+
+    #[test]
+    fn prefill_window_picks_stay_within_the_configured_window() {
+        let idxs = window_topk_idxs(4, 1, 6, 0);
+        // Six-token prefill with a 4-row window: each query row carries at
+        // most 4 picks and the earliest queries see -1 for slots before the
+        // sequence started.
+        assert_eq!(idxs.dims(), [1, 6, 4]);
+        let flat = idxs.flatten_all().unwrap().to_vec1::<i64>().unwrap();
+        assert_eq!(flat[..4], [-1, -1, -1, 0]);
+        assert_eq!(flat[5 * 4..6 * 4], [2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn window_ring_persists_decoded_rows_across_steps() {
+        let device = Device::Cpu;
+        let mut ring = WindowRing::new(1, 4, 2, &device).unwrap();
+        let prefill = Tensor::from_vec(
+            (0..8).map(|index| index as f32).collect(),
+            (1, 4, 2),
+            &device,
+        )
+        .unwrap();
+        ring.write(&prefill, 0).unwrap();
+        // Two decode steps: position 4 -> slot 0, position 5 -> slot 1.
+        for (position, tag) in [(4usize, 100.0f32), (5, 200.0)] {
+            let step = Tensor::from_vec(vec![tag, tag + 1.0], (1, 1, 2), &device).unwrap();
+            ring.write(&step, position).unwrap();
+        }
+        // The third decode read must still see position 4's row somewhere in
+        // the ring; a cache that never persisted writes would show zeros.
+        let step = Tensor::from_vec(vec![300.0f32, 301.0], (1, 1, 2), &device).unwrap();
+        let view = ring.write(&step, 6).unwrap();
+        let values = view.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            values
+                .windows(2)
+                .any(|pair| pair[0] == 100.0 && pair[1] == 101.0),
+            "position 4 lost from the ring: {values:?}"
+        );
+        assert!(
+            values
+                .windows(2)
+                .any(|pair| pair[0] == 200.0 && pair[1] == 201.0),
+            "position 5 lost from the ring: {values:?}"
+        );
     }
 
     #[test]

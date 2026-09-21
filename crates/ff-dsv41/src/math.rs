@@ -30,7 +30,7 @@ pub fn precompute_freqs_cis(
     ensure!(dim.is_multiple_of(2), "rotary dimension {dim} must be even");
     let half = dim / 2;
     let exponent = (0..half as u64)
-        .map(|index| index as f64 / dim as f64)
+        .map(|index| 2.0 * index as f64 / dim as f64)
         .collect::<Vec<_>>();
     let mut freqs = exponent
         .into_iter()
@@ -381,15 +381,35 @@ mod tests {
     }
 
     #[test]
+    fn rope_frequencies_use_even_exponents_only() {
+        // torch computes arange(0, dim, 2)/dim, so dim 4 gives exponents
+        // {0, 1/2}, not {0, 1/4}: position 1 of frequency slot 1 must land on
+        // angle 10000^-0.5, which differs from the wrong 10000^-0.25.
+        let device = Device::Cpu;
+        let freqs = precompute_freqs_cis(4, 100, 0, 10_000.0, 1.0, 32, 1, &device).unwrap();
+        let values = freqs.to_vec3::<f32>().unwrap();
+        // Position 100 of slot 1: correct angle 1.0 rad, wrong exponent gives
+        // 100 * 10^-2.5 = 0.316 rad — cos separates them by 0.4.
+        let expected = (99.0f64 * 10_000f64.powf(-0.5)).cos() as f32;
+        assert!(
+            (values[99][1][0] - expected).abs() < 1e-4,
+            "{} vs {expected}",
+            values[99][1][0]
+        );
+    }
+
+    #[test]
     fn yarn_fades_only_dimensions_inside_the_transition_band() {
         let device = Device::Cpu;
-        let plain = precompute_freqs_cis(8, 64, 0, 10_000.0, 16.0, 32, 1, &device).unwrap();
-        let yarn = precompute_freqs_cis(8, 64, 65_536, 10_000.0, 16.0, 32, 1, &device).unwrap();
+        let plain = precompute_freqs_cis(8, 2048, 0, 10_000.0, 16.0, 32, 1, &device).unwrap();
+        let yarn = precompute_freqs_cis(8, 2048, 65_536, 10_000.0, 16.0, 32, 1, &device).unwrap();
         let plain = plain.to_vec3::<f32>().unwrap();
         let yarn = yarn.to_vec3::<f32>().unwrap();
-        // Outside the ramp the frequency is untouched; inside it the position-1
-        // angle moves.
-        let position = 63;
+        // dim 8: the YaRN band covers indices above ~2.5, so index 0 keeps its
+        // plain frequency and index 3 is faded toward the factor. The faded
+        // frequency is ~1e-3, so the position must be large enough for the
+        // angle difference to move cos visibly.
+        let position = 2047;
         assert!((yarn[position][0][0] - plain[position][0][0]).abs() < 1e-4);
         assert!((yarn[position][3][0] - plain[position][3][0]).abs() > 1e-2);
     }

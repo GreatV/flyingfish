@@ -74,9 +74,18 @@ fn vision_cos_sin(
     ))
 }
 
-fn apply_half_rotary(values: &mut [f32], token: usize, heads: usize, cos: &[f32], sin: &[f32]) {
-    let head_dim = cos.len();
-    let half = head_dim / 2;
+fn apply_half_rotary(
+    values: &mut [f32],
+    token: usize,
+    heads: usize,
+    head_dim: usize,
+    cos: &[f32],
+    sin: &[f32],
+) {
+    // The per-token angle row spans rope_dim = cos.len() channels; each head
+    // rotates that span of its own channels, split into halves.
+    let span = cos.len();
+    let half = span / 2;
     for head in 0..heads {
         let base = token * heads * head_dim + head * head_dim;
         for d in 0..half {
@@ -163,24 +172,27 @@ impl VisionTower {
             dims.len() == 3 && dims[0] == rows * columns,
             "patches must be [tokens, 3, patch²]"
         );
-        let patch = dims[2];
         let device = patches.device();
-        let flat = patches
+        let patch_values = patches
             .to_dtype(DType::F32)?
-            .flatten_from(1)?
-            .flatten_to(0)?
-            .contiguous()?;
-        let patch_values = flat.to_vec1::<f32>().context("read flattened patches")?;
+            .flatten_all()?
+            .to_vec1::<f32>()
+            .context("read flattened patches")?;
         let hidden = self.config.hidden_size;
         let heads = self.config.num_attention_heads;
         let head_dim = hidden / heads;
-        let mut values = linear_with_bias(
-            &self.patch_weight,
-            &self.patch_bias,
-            &patch_values,
-            hidden,
-            3 * patch * patch,
-        )?;
+        let patch_width = dims[2];
+        let tokens = patch_values.len() / patch_width;
+        let mut values = Vec::with_capacity(tokens * hidden);
+        for token in 0..tokens {
+            values.extend(linear_with_bias(
+                &self.patch_weight,
+                &self.patch_bias,
+                &patch_values[token * patch_width..(token + 1) * patch_width],
+                hidden,
+                patch_width,
+            )?);
+        }
         let rope_dim = head_dim / 2;
         let (cos, sin) = vision_cos_sin(rows, columns, rope_dim, self.config.rope_theta, device)?;
         let cos_values = cos.to_vec1::<f32>()?;
@@ -209,10 +221,10 @@ impl VisionTower {
                 }
             }
             for token in 0..tokens {
-                let cos_token = &cos_values[token * rope_dim * 2..(token + 1) * rope_dim * 2];
-                let sin_token = &sin_values[token * rope_dim * 2..(token + 1) * rope_dim * 2];
-                apply_half_rotary(&mut q, token, heads, cos_token, sin_token);
-                apply_half_rotary(&mut k, token, heads, cos_token, sin_token);
+                let cos_token = &cos_values[token * rope_dim..(token + 1) * rope_dim];
+                let sin_token = &sin_values[token * rope_dim..(token + 1) * rope_dim];
+                apply_half_rotary(&mut q, token, heads, head_dim, cos_token, sin_token);
+                apply_half_rotary(&mut k, token, heads, head_dim, cos_token, sin_token);
             }
             let attended = attention(
                 &q,
@@ -350,9 +362,13 @@ impl Aligner {
                 self.hidden,
                 cell,
             )?;
+            // GELU, tanh approximation (matching torch's approximate="tanh").
             let activated = hidden_state
                 .iter()
-                .map(|value| 0.5 * value * (1.0 + (value / 2f32.sqrt()).tanh()))
+                .map(|value| {
+                    let inner = 0.797_884_6f32 * (value + 0.044715 * value * value * value);
+                    0.5 * value * (1.0 + inner.tanh())
+                })
                 .collect::<Vec<_>>();
             output.extend(linear_with_bias(
                 &self.w2_weight,
@@ -383,6 +399,108 @@ mod tests {
         let token = 5;
         assert!((cos_values[token * 4] - 1.0f64.cos() as f32).abs() < 1e-4);
         assert!((cos_values[token * 4 + 2] - 2.0f64.cos() as f32).abs() < 1e-4);
+    }
+
+    #[test]
+    fn tower_projects_each_patch_and_rotates_the_rope_span() {
+        let device = candle_core::Device::Cpu;
+        let hidden = 8;
+        let heads = 2;
+        let config = crate::config::VisionConfig {
+            num_hidden_layers: 1,
+            hidden_size: hidden,
+            num_attention_heads: heads,
+            intermediate_size: 8,
+            patch_size: 2,
+            rope_theta: 100.0,
+            downsample_ratio: 1,
+            max_image_tokens: 64,
+            min_pixels: 16,
+            max_wh_ratio: None,
+        };
+        let weight = |rows: usize, columns: usize| {
+            Tensor::from_vec(
+                (0..rows * columns)
+                    .map(|index| ((index % 5) as f32 - 2.0) / 32.0)
+                    .collect(),
+                (rows, columns),
+                &device,
+            )
+            .unwrap()
+        };
+        let ones = |rows: usize| Tensor::from_vec(vec![1.0f32; rows], (rows,), &device).unwrap();
+        let block = VisionBlock {
+            norm1: ones(hidden),
+            wqkv_weight: weight(3 * hidden, hidden),
+            wqkv_bias: Tensor::zeros(3 * hidden, DType::F32, &device).unwrap(),
+            wo_weight: weight(hidden, hidden),
+            wo_bias: Tensor::zeros(hidden, DType::F32, &device).unwrap(),
+            norm2: ones(hidden),
+            w1_weight: weight(2 * 8, hidden),
+            w1_bias: Tensor::zeros(2 * 8, DType::F32, &device).unwrap(),
+            w2_weight: weight(hidden, 8),
+            w2_bias: Tensor::zeros(hidden, DType::F32, &device).unwrap(),
+        };
+        let tower = VisionTower {
+            config,
+            patch_weight: weight(hidden, 3 * 2 * 2),
+            patch_bias: Tensor::zeros(hidden, DType::F32, &device).unwrap(),
+            blocks: vec![block],
+            norm_weight: ones(hidden),
+        };
+        // A 2x3 patch grid: six patches, each [3, 2, 2].
+        let patches = Tensor::from_vec(
+            (0..6 * 3 * 4)
+                .map(|index| ((index % 7) as f32 - 3.0) / 16.0)
+                .collect(),
+            (6, 3, 4),
+            &device,
+        )
+        .unwrap();
+        let output = tower.forward(&patches, 2, 3).unwrap();
+        assert_eq!(output.dims(), [6, hidden]);
+        let values = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(values.iter().all(|value| value.is_finite()));
+        // Distinct patch inputs must reach distinct outputs; a projection that
+        // collapsed all patches onto one row would emit identical rows.
+        let rows: Vec<&[f32]> = values.chunks(hidden).collect();
+        assert!(
+            rows.windows(2).any(|pair| pair[0] != pair[1]),
+            "all patch rows identical: {values:?}"
+        );
+    }
+
+    #[test]
+    fn aligner_gelu_follows_the_tanh_approximation() {
+        // gelu(1) via the tanh form is 0.841192; the earlier wrong formula
+        // (tanh(x/sqrt(2))) gives 0.813 SME — the gap pins the constants.
+        let device = candle_core::Device::Cpu;
+        let features = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &device).unwrap();
+        let identity = |rows: usize| {
+            let mut values = vec![0.0f32; rows * rows];
+            for index in 0..rows {
+                values[index * rows + index] = 1.0;
+            }
+            Tensor::from_vec(values, (rows, rows), &device).unwrap()
+        };
+        let aligner = Aligner {
+            downsample_ratio: 1,
+            w1_weight: identity(2),
+            w1_bias: Tensor::zeros(2, DType::F32, &device).unwrap(),
+            w2_weight: identity(2),
+            w2_bias: Tensor::zeros(2, DType::F32, &device).unwrap(),
+            hidden: 2,
+        };
+        let output = aligner.forward(&features, 1, 1).unwrap();
+        let values = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let inner = 0.797_884_6f32 * (1.0 + 0.044715 * 1.0);
+        let expected = 0.5 * (1.0 + inner.tanh());
+        assert!(
+            (values[0] - expected).abs() < 1e-5,
+            "{} vs {expected}",
+            values[0]
+        );
+        assert_eq!(values[1], 0.0);
     }
 
     #[test]
