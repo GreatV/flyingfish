@@ -102,7 +102,9 @@ fn softplus(value: f32) -> f32 {
     if value > 20.0 {
         value
     } else {
-        (1.0 + value.exp()).ln()
+        // ln(1 + e^x) loses small negative scores to F32 spacing; ln_1p
+        // evaluates them accurately instead of rounding to zero.
+        value.exp().ln_1p()
     }
 }
 
@@ -117,9 +119,19 @@ pub struct Expert {
 
 impl Expert {
     pub fn forward(&self, x: &Tensor, weight: f32) -> Result<Tensor> {
+        let tokens = x.dims()[0];
+        self.forward_weighted(x, &vec![weight; tokens])
+    }
+
+    pub fn forward_weighted(&self, x: &Tensor, weights: &[f32]) -> Result<Tensor> {
         let dims = x.dims();
         ensure!(dims.len() == 2, "expert input must be [tokens, hidden]");
         let [tokens, hidden] = [dims[0], dims[1]];
+        ensure!(
+            weights.len() == tokens,
+            "expert weights {} do not cover {tokens} rows",
+            weights.len()
+        );
         let inter = self.w1.dims()[0];
         let x_values = x
             .to_dtype(DType::F32)?
@@ -160,7 +172,7 @@ impl Expert {
                 } else {
                     up
                 };
-                inner[row] = silu(gate) * up * weight;
+                inner[row] = silu(gate) * up * weights[token];
             }
             for column in 0..hidden {
                 let mut sum = 0.0f32;
@@ -182,6 +194,16 @@ fn silu(value: f32) -> f32 {
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    #[test]
+    fn sqrt_softplus_preserves_small_negative_scores() {
+        // (1 + e^x).ln() rounds to zero below about -17 in F32; ln_1p keeps
+        // the positive score the reference softplus produces.
+        let small = softplus(-20.0);
+        assert!(small > 0.0, "softplus(-20) collapsed to zero");
+        assert!((small - (-20.0f32).exp()).abs() < 1e-9, "{small}");
+        assert_eq!(softplus(25.0), 25.0);
+    }
 
     fn two_expert_gate() -> Gate {
         let device = Device::Cpu;

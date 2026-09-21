@@ -45,28 +45,40 @@ pub fn moe_forward(ffn: &FfnWeights, x: &Tensor, image_mask: Option<&[bool]>) ->
     );
     let mut output = vec![0.0f32; tokens * hidden];
     for (expert_index, expert) in ffn.experts.iter().enumerate() {
+        // Gather every row routed to this expert so its resident weights are
+        // read once per layer instead of once per route.
+        let mut routed_tokens = Vec::new();
+        let mut routed_weights = Vec::new();
         for token in 0..tokens {
             for slot in 0..topk {
-                if indices[token * topk + slot] as usize != expert_index {
-                    continue;
+                if indices[token * topk + slot] as usize == expert_index {
+                    routed_tokens.push(token);
+                    routed_weights.push(weights[token * topk + slot]);
                 }
-                let weight = weights[token * topk + slot];
-                let row = Tensor::from_vec(
-                    x_values[token * hidden..(token + 1) * hidden].to_vec(),
-                    (1, hidden),
-                    x.device(),
-                )?;
-                let evaluated = expert.forward(&row, weight)?;
-                let values = evaluated
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?;
-                for (slot, value) in output[token * hidden..(token + 1) * hidden]
-                    .iter_mut()
-                    .zip(values.iter())
-                {
-                    *slot += value;
-                }
+            }
+        }
+        if routed_tokens.is_empty() {
+            continue;
+        }
+        let rows = Tensor::from_vec(
+            routed_tokens
+                .iter()
+                .flat_map(|token| x_values[token * hidden..(token + 1) * hidden].to_vec())
+                .collect::<Vec<_>>(),
+            (routed_weights.len(), hidden),
+            x.device(),
+        )?;
+        let evaluated = expert.forward_weighted(&rows, &routed_weights)?;
+        let values = evaluated
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (row, token) in routed_tokens.iter().enumerate() {
+            for (slot, value) in output[token * hidden..(token + 1) * hidden]
+                .iter_mut()
+                .zip(values[row * hidden..(row + 1) * hidden].iter())
+            {
+                *slot += value;
             }
         }
     }

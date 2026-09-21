@@ -190,16 +190,20 @@ impl NgramHashState {
         token_map: Vec<u32>,
         batch: usize,
         max_seq: usize,
+        compressed_vocab_size: u32,
+        pad_token_id: u32,
     ) -> Result<Self> {
         let multipliers = layout
             .layer_ids
             .iter()
             .map(|layer| {
-                hash_multipliers(*layer, 99_092, layout.max_ngram_size)
+                hash_multipliers(*layer, compressed_vocab_size, layout.max_ngram_size)
                     .with_context(|| format!("hash multipliers for engram layer {layer}"))
             })
             .collect::<Result<Vec<Vec<u64>>>>()?;
-        let pad_id = token_map[2];
+        let pad_id = *token_map
+            .get(pad_token_id as usize)
+            .with_context(|| format!("pad token id {pad_token_id} is not in the token map"))?;
         Ok(Self {
             layout,
             multipliers,
@@ -506,7 +510,7 @@ mod tests {
             head_dim: 2,
         };
         let token_map = vec![0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let mut state = NgramHashState::new(layout, token_map, 1, 8).unwrap();
+        let mut state = NgramHashState::new(layout, token_map, 1, 8, 99_092, 2).unwrap();
         let ids = Tensor::from_vec(vec![5u32], (1, 1), &candle_core::Device::Cpu).unwrap();
         let hashes = state.forward(&ids, 0, None).unwrap();
         assert_eq!(hashes.dims(), [1, 1, 1, 3]);
@@ -517,6 +521,26 @@ mod tests {
         assert_eq!(values[0], residue);
         assert_eq!(values[1], rolling.rem_euclid(11));
         assert_eq!(values[2], rolling.rem_euclid(13));
+    }
+
+    #[test]
+    fn construction_uses_the_configured_vocab_and_pad() {
+        let layout = || EngramLayout {
+            max_ngram_size: 2,
+            layer_ids: vec![1],
+            num_embeddings: vec![10],
+            primes: vec![vec![vec![7, 11, 13]]],
+            offsets: vec![vec![0, 0, 0]],
+            n_heads: 3,
+            head_dim: 2,
+        };
+        let state =
+            NgramHashState::new(layout(), vec![10u32, 11, 12, 13, 14, 15], 1, 8, 77, 3).unwrap();
+        assert_eq!(state.pad_id, 13);
+        assert!(
+            NgramHashState::new(layout(), vec![10u32], 1, 8, 99_092, 9).is_err(),
+            "an out-of-map pad id must be rejected"
+        );
     }
 
     #[test]
@@ -532,7 +556,7 @@ mod tests {
             head_dim: 2,
         };
         let token_map = vec![0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let mut state = NgramHashState::new(layout, token_map, 1, 8).unwrap();
+        let mut state = NgramHashState::new(layout, token_map, 1, 8, 99_092, 2).unwrap();
         let ids = Tensor::from_vec(vec![3u32, 3], (1, 2), &candle_core::Device::Cpu).unwrap();
         let hashes = state.forward(&ids, 0, None).unwrap();
         let values = hashes.flatten_all().unwrap().to_vec1::<i64>().unwrap();

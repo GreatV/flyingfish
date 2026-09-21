@@ -345,15 +345,18 @@ impl TransformerLoader {
                 .layout
                 .shard_role(shard)
                 .with_context(|| format!("shard {shard} has no role"))?;
-            // The DSpark draft and the 189 GiB engram embed table stay
-            // lookup-backed; the engram projections (wkv, q/k weights) are
+            // The DSpark draft, the vision tower (unwired on the text path),
+            // and the 189 GiB engram embed table stay lookup-backed or
+            // unloaded; the engram projections (wkv, q/k weights) are
             // dequantized resident at load time, so they count here.
             let lookup_backed = match role {
-                ShardRole::Dspark => true,
+                ShardRole::Dspark | ShardRole::Vision => true,
                 ShardRole::Engram => tensor.contains(".engram.embed."),
                 _ => false,
             };
-            if lookup_backed {
+            // Quantization scales are read transiently while dequantizing;
+            // only the dequantized weights stay resident.
+            if lookup_backed || tensor.ends_with(".scale") {
                 continue;
             }
             if !headers.contains_key(shard) {
@@ -428,7 +431,14 @@ impl TransformerLoader {
                 text.engram_compressed_vocab_size
             );
             let layout = EngramLayout::from_config(text)?;
-            Some(NgramHashState::new(layout, token_map, 1, max_seq)?)
+            Some(NgramHashState::new(
+                layout,
+                token_map,
+                1,
+                max_seq,
+                self.config.text_config.engram_compressed_vocab_size,
+                self.config.text_config.engram_pad_token_id,
+            )?)
         };
 
         let mut blocks = Vec::with_capacity(text.num_hidden_layers);
@@ -937,7 +947,7 @@ mod tests {
         let mut projections = 0u64;
         for (tensor, shard) in &layout.tensors {
             let role = layout.shard_role(shard).unwrap();
-            if matches!(role, ShardRole::Dspark) {
+            if matches!(role, ShardRole::Dspark | ShardRole::Vision) || tensor.ends_with(".scale") {
                 continue;
             }
             if !headers.contains_key(shard) {

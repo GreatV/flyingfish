@@ -402,24 +402,34 @@ impl AttentionCore {
             .context("read attention input")?;
 
         let qlora = self.wq_a.dims()[0];
+        let wq_a = self
+            .wq_a
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         let mut qr = Vec::with_capacity(batch * seqlen * qlora);
         for token in 0..batch * seqlen {
-            let projected = linear_rows(
-                &self.wq_a,
+            let projected = linear_rows_from_slice(
+                &wq_a,
                 &x_values[token * hidden..(token + 1) * hidden],
                 qlora,
                 hidden,
-            )?;
+            );
             qr.extend(rms_norm_slice(&projected, &self.q_norm, self.norm_eps));
         }
+        let wq_b = self
+            .wq_b
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         let mut q = Vec::with_capacity(batch * seqlen * heads * head_dim);
         for token in 0..batch * seqlen {
-            let projected = linear_rows(
-                &self.wq_b,
+            let projected = linear_rows_from_slice(
+                &wq_b,
                 &qr[token * qlora..(token + 1) * qlora],
                 heads * head_dim,
                 qlora,
-            )?;
+            );
             q.extend(projected);
         }
         apply_rotary_slice(
@@ -435,14 +445,19 @@ impl AttentionCore {
 
         // Window KV: shared latent, normalized, rotated, FP8-round-tripped,
         // written into the ring.
+        let wkv = self
+            .wkv
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         let mut window = Vec::with_capacity(batch * seqlen * head_dim);
         for token in 0..batch * seqlen {
-            let projected = linear_rows(
-                &self.wkv,
+            let projected = linear_rows_from_slice(
+                &wkv,
                 &x_values[token * hidden..(token + 1) * hidden],
                 head_dim,
                 hidden,
-            )?;
+            );
             window.extend(rms_norm_slice(&projected, &self.kv_norm, self.norm_eps));
         }
         apply_rotary_slice(
