@@ -345,7 +345,15 @@ impl TransformerLoader {
                 .layout
                 .shard_role(shard)
                 .with_context(|| format!("shard {shard} has no role"))?;
-            if matches!(role, ShardRole::Dspark | ShardRole::Engram) {
+            // The DSpark draft and the 189 GiB engram embed table stay
+            // lookup-backed; the engram projections (wkv, q/k weights) are
+            // dequantized resident at load time, so they count here.
+            let lookup_backed = match role {
+                ShardRole::Dspark => true,
+                ShardRole::Engram => tensor.contains(".engram.embed."),
+                _ => false,
+            };
+            if lookup_backed {
                 continue;
             }
             if !headers.contains_key(shard) {
@@ -628,18 +636,23 @@ impl TransformerLoader {
             .shard_of(&scale_name)
             .with_context(|| format!("{scale_name} is not in the index"))?
             .to_owned();
+        let (weight_map, weight_view) = open_shard(&model_dir, &weight_shard)
+            .with_context(|| format!("open engram payload shard {weight_shard}"))?;
+        let (scale_map, scale_view) = open_shard(&model_dir, &scale_shard)
+            .with_context(|| format!("open engram scale shard {scale_shard}"))?;
+        // The views sit on the same forged lifetime as the loader's shard
+        // cache; the mmaps move into the callback to keep the pages mapped.
+        let payload = weight_view
+            .tensor(&weight_name)
+            .with_context(|| format!("{weight_name} is not in {weight_shard}"))?
+            .data();
+        let scales = scale_view
+            .tensor(&scale_name)
+            .with_context(|| format!("{scale_name} is not in {scale_shard}"))?
+            .data();
         let lookup: EngramLookup = Box::new(move |ids: &[i64]| -> Vec<f32> {
+            let _keep_mapped = (&weight_map, &scale_map);
             let mut rows = Vec::with_capacity(ids.len() * head_dim);
-            let (weight_map, weight_view) =
-                open_shard(&model_dir, &weight_shard).expect("engram payload shard");
-            let (scale_map, scale_view) =
-                open_shard(&model_dir, &scale_shard).expect("engram scale shard");
-            let weight = weight_view
-                .tensor(&weight_name)
-                .expect("engram payload view");
-            let scale = scale_view.tensor(&scale_name).expect("engram scale view");
-            let payload = weight.data();
-            let scales = scale.data();
             for id in ids {
                 let row = *id as usize;
                 for d in 0..head_dim {
@@ -651,8 +664,6 @@ impl TransformerLoader {
                     rows.push(crate::quant::e4m3_byte_to_f32(byte) * 2.0f32.powi(exponent));
                 }
             }
-            drop(weight_map);
-            drop(scale_map);
             rows
         });
         Ok(EngramCore {
@@ -889,5 +900,91 @@ mod tests {
         assert!(embed.contains(&"image_start"));
         assert!(embed.contains(&"image_end"));
         assert!(embed.contains(&"image_newline"));
+    }
+
+    fn exact_f32_bytes(shape: &[usize], dtype: safetensors::Dtype) -> u64 {
+        let elements: u64 = shape.iter().map(|d| *d as u64).product();
+        let element_bytes = match dtype {
+            safetensors::Dtype::F32 => 4,
+            safetensors::Dtype::BF16
+            | safetensors::Dtype::F8_E4M3
+            | safetensors::Dtype::F8_E8M0 => 4,
+            safetensors::Dtype::I8 => 8,
+            other => panic!("unexpected dtype {other:?}"),
+        };
+        elements * element_bytes
+    }
+
+    #[test]
+    fn admission_counts_engram_projections_but_not_the_embed_table() {
+        let Some(layout) = layout() else {
+            return;
+        };
+        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let exact = TransformerLoader::open(dir)
+            .unwrap()
+            .resident_f32_bytes()
+            .unwrap();
+        // Recompute both parts independently from the shard headers: the old
+        // rule skipped the whole Engram role; the new rule keeps only the
+        // resident projections (wkv, q/k weights) out of it.
+        let mut headers: HashMap<String, (memmap2::Mmap, safetensors::SafeTensors<'static>)> =
+            HashMap::new();
+        let mut skeleton = 0u64;
+        let mut projections = 0u64;
+        for (tensor, shard) in &layout.tensors {
+            let role = layout.shard_role(shard).unwrap();
+            if matches!(role, ShardRole::Dspark) {
+                continue;
+            }
+            if !headers.contains_key(shard) {
+                headers.insert(shard.clone(), open_shard(dir, shard).unwrap());
+            }
+            let (_, header) = headers.get(shard).unwrap();
+            let view = header.tensor(tensor).unwrap();
+            match role {
+                ShardRole::Engram if tensor.contains(".engram.embed.") => {}
+                ShardRole::Engram => projections += exact_f32_bytes(view.shape(), view.dtype()),
+                _ => skeleton += exact_f32_bytes(view.shape(), view.dtype()),
+            }
+        }
+        assert!(
+            projections > 0,
+            "engram projections exist on this checkpoint"
+        );
+        assert_eq!(exact, skeleton + projections);
+    }
+
+    #[test]
+    fn a_missing_engram_shard_is_an_error_not_a_panic() {
+        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        if !dir.join("config.json").exists() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::copy(dir.join("config.json"), temp.path().join("config.json")).unwrap();
+        let index = serde_json::json!({
+            "metadata": {"total_size": 0},
+            "weight_map": {
+                "layers.1.engram.embed.weight": "model-00001-of-00001.safetensors",
+                "layers.1.engram.embed.scale": "model-00001-of-00001.safetensors",
+                "layers.1.engram.wkv.weight": "model-00001-of-00001.safetensors",
+                "layers.1.engram.q_weight": "model-00001-of-00001.safetensors",
+                "layers.1.engram.k_weight": "model-00001-of-00001.safetensors",
+            }
+        });
+        std::fs::write(
+            temp.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let mut loader = TransformerLoader::open(temp.path()).unwrap();
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader.load_engram(1, 0)));
+        let Err(error) = outcome.expect("load_engram panicked") else {
+            panic!("load_engram unexpectedly succeeded against a missing shard")
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("engram payload shard"), "{message}");
     }
 }

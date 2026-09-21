@@ -874,3 +874,32 @@ fn dsv41_telemetry_is_written_even_for_an_immediate_eos() {
     );
     assert!(telemetry.is_file(), "telemetry sidecar missing");
 }
+
+#[test]
+fn dsv41_rejects_an_existing_primary_output_before_loading() {
+    let root = tempfile::tempdir().unwrap();
+    write_fixture(root.path());
+    let model = root.path().join("DeepSeek-V4.1-mini");
+    let out = root.path().join("result.txt");
+    std::fs::write(&out, b"old").unwrap();
+    let output = ff()
+        .args(["text", "generate", "--adapter", "dsv41"])
+        .arg("--model")
+        .arg(&model)
+        .args([
+            "--prompt",
+            "tok1 tok2",
+            "--device",
+            "cpu",
+            "--max-new-tokens",
+            "2",
+        ])
+        .arg("--output")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"old");
+}

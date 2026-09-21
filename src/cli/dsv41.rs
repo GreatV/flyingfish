@@ -295,6 +295,14 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
                 })
                 .transpose()?;
             {
+                let primary = output
+                    .output
+                    .as_deref()
+                    .map(|path| resolve_output_outside_model(path, &model_dir))
+                    .transpose()?;
+                if let Some(primary) = &primary {
+                    ensure_new_output(primary, "generation output")?;
+                }
                 let telemetry = output
                     .telemetry_json
                     .as_deref()
@@ -303,10 +311,9 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
                 if let Some(telemetry) = &telemetry {
                     ensure_new_output(telemetry, "telemetry output")?;
                 }
-                if let (Some(telemetry), Some(primary)) = (&telemetry, output.output.as_deref()) {
-                    let primary = resolve_output_outside_model(primary, &model_dir)?;
+                if let (Some(telemetry), Some(primary)) = (&telemetry, &primary) {
                     anyhow::ensure!(
-                        telemetry != &primary,
+                        telemetry != primary,
                         "telemetry output conflicts with the primary output: {}",
                         telemetry.display()
                     );
@@ -563,8 +570,6 @@ mod tests {
         // Valid edges still sample.
         sample_token(&logits, 1.0, 1.0, &mut rng).unwrap();
     }
-
-    use super::*;
 
     #[test]
     fn unreadable_meminfo_fails_closed() {

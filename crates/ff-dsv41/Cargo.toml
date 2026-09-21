@@ -25,3 +25,6 @@ cuda = ["ff-core/cuda", "candle-core/cuda", "candle-nn/cuda", "dep:cudarc"]
 
 [lints.rust]
 warnings = "deny"
+
+[dev-dependencies]
+tempfile.workspace = true
