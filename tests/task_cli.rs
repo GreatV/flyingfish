@@ -12,6 +12,7 @@ fn task_help_exposes_3d_and_model_specific_options_without_loading_models() {
         ("text", "minicpm", "generate", "--draft-model"),
         ("text", "edge0", "generate", "--resident-experts"),
         ("text", "qwen35", "generate", "--image"),
+        ("text", "dsv41", "generate", "--thinking-mode"),
         ("video", "h3", "generate", "--duration-seconds"),
         ("music", "music3", "generate", "--lyrics"),
         ("3d", "trellis", "generate", "--conditioner"),
@@ -102,5 +103,32 @@ fn both_3d_architectures_select_the_registered_generation_schema() {
             help.contains("--conditioner") && help.contains("--resolution"),
             "{help}"
         );
+    }
+}
+
+#[test]
+fn dsv41_help_renders_the_full_kit_surface() {
+    let output = ff()
+        .args(["text", "generate", "--adapter", "dsv41", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8(output.stdout).unwrap();
+    for flag in [
+        "--temperature",
+        "--top-p",
+        "--seed",
+        "--device",
+        "--max-new-tokens",
+        "--max-context-tokens",
+        "--telemetry-json",
+        "--thinking-mode",
+        "--reasoning-effort",
+    ] {
+        assert!(help.contains(flag), "missing {flag} in:\n{help}");
     }
 }

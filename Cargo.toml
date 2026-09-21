@@ -8,8 +8,8 @@ publish = false
 
 [workspace]
 resolver = "3"
-members = ["crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35", "crates/ff-cuda-build"]
-default-members = [".", "crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35"]
+members = ["crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35", "crates/ff-dsv41", "crates/ff-cuda-build"]
+default-members = [".", "crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35", "crates/ff-dsv41"]
 
 [workspace.package]
 version = "0.1.0"
@@ -78,6 +78,7 @@ cuda = [
     "ff-music/cuda",
     "ff-edge0/cuda",
     "ff-qwen35/cuda",
+    "ff-dsv41/cuda",
     "candle-core/cuda",
     "dep:cudarc",
 ]
@@ -93,6 +94,7 @@ ff-minicpm = { path = "crates/ff-minicpm" }
 ff-music = { path = "crates/ff-music" }
 ff-edge0 = { path = "crates/ff-edge0" }
 ff-qwen35 = { path = "crates/ff-qwen35" }
+ff-dsv41 = { path = "crates/ff-dsv41" }
 anyhow = "1.0"
 candle-core = "=0.11.0"
 clap = { version = "4.5", features = ["derive", "string"] }
@@ -109,6 +111,7 @@ serde_json.workspace = true
 tokenizers = "=0.22.2"
 
 [dev-dependencies]
+anyhow = "1.0"
 tempfile = "3.20"
 
 [profile.release]
