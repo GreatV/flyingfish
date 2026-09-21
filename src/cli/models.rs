@@ -1,6 +1,11 @@
-use super::*;
+use super::WeightCacheArgs;
+use super::device_parse::parse_device;
+use anyhow::Result;
+use clap::Subcommand;
 use flyingfish::models::{LocalModel, discover};
+use flyingfish::runtime::weights::{CachePolicy, WeightSource};
 use serde::Serialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Subcommand)]
 pub(super) enum ModelsCommand {

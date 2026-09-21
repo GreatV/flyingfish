@@ -1,5 +1,3 @@
-use crate::cli::*;
-
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub(in crate::cli) enum GlmCommand {
@@ -27,20 +25,8 @@ pub(in crate::cli) enum GlmCommand {
         max_context_tokens: NonZeroUsize,
         #[arg(long, default_value = "max", value_parser = ["low", "high", "max"])]
         reasoning_effort: String,
-        #[arg(
-            long,
-            default_value_t = 1.0,
-            help = "Sampling temperature; zero selects greedy decoding"
-        )]
-        temperature: f64,
-        #[arg(
-            long,
-            default_value_t = 0.95,
-            help = "Nucleus probability; no additional top-k filter is applied"
-        )]
-        top_p: f64,
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
+        #[command(flatten)]
+        sampling: kit::SamplingArgs,
         #[arg(long, default_value = "cuda:0")]
         device: String,
         #[command(flatten)]
@@ -108,18 +94,8 @@ pub(in crate::cli) enum GlmCommand {
         expert_cache_min_mib: Option<u64>,
         #[arg(long, help = "Suppress per-token progress on stderr")]
         no_progress: bool,
-        #[arg(long, help = "Emit one JSON result instead of plain generated text")]
-        json: bool,
-        #[arg(
-            long,
-            help = "Atomically write the generated text or JSON result outside the model directory"
-        )]
-        output: Option<PathBuf>,
-        #[arg(
-            long,
-            help = "Write sampled RSS/CUDA peaks to a new JSON file outside the model"
-        )]
-        telemetry_json: Option<PathBuf>,
+        #[command(flatten)]
+        output: kit::OutputArgs,
         #[arg(
             long,
             help = "Atomically write a bounded router-only trace outside the model"
@@ -210,7 +186,13 @@ impl GlmCommand {
 }
 
 use super::{Adapter, Task};
-use clap::FromArgMatches;
+use crate::cli::glm_multi;
+use crate::cli::{OptionalWeightCacheArgs, WeightCacheArgs, glm, kit};
+use anyhow::Result;
+use clap::{FromArgMatches, Subcommand};
+use flyingfish::glm::{ExpertCacheLayout, ExpertCacheReplacementPolicy};
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
 
 pub(super) const ADAPTER: Adapter = Adapter {
     id: "glm",

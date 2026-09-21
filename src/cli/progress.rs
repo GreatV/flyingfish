@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
 use flyingfish::h3::pipeline::{DenoisePreparationEvent, DenoiseStepEvent};
-use std::{
-    collections::VecDeque,
-    io::{IsTerminal, Write},
-    time::Duration,
-};
+use std::collections::VecDeque;
+use std::io::{IsTerminal, Write};
+use std::time::Duration;
 
 const DEFAULT_TRAILING_WINDOW: usize = 5;
 const DEFAULT_LOG_EVALUATION_INTERVAL: usize = 5;

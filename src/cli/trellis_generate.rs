@@ -1,13 +1,17 @@
-use super::*;
-use flyingfish::{
-    runtime::artifact::ArtifactStaging,
-    trellis::{
-        checkpoint::TrellisCheckpoint,
-        generation::{self, GenerationOptions},
-        sparse::Grid,
-    },
-};
+use super::DeviceCacheArgs;
+use super::device_parse::parse_device;
+use super::output_hygiene::{ensure_new_output, resolve_output_outside_model};
+use anyhow::{Context, Result, bail};
+use candle_core::{Device, Tensor, safetensors};
+use flyingfish::runtime::artifact::ArtifactStaging;
+use flyingfish::runtime::weights::DeviceCache;
+use flyingfish::trellis::checkpoint::TrellisCheckpoint;
+use flyingfish::trellis::generation::{self, GenerationOptions};
+use flyingfish::trellis::sparse::Grid;
+use std::collections::HashMap;
 use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Debug, clap::Args)]
 pub(super) struct GenerateArgs {
@@ -152,7 +156,7 @@ pub(super) fn generate(args: GenerateArgs) -> Result<()> {
     };
     let demands =
         generation::residency_demands(&args.model, args.models_root.as_deref(), &device, &options)?;
-    options.device_cache = super::decide_auto_residency_with_required_memory(
+    options.device_cache = super::resource::decide_auto_residency_with_required_memory(
         &demands,
         &device,
         args.device_cache,
@@ -318,7 +322,7 @@ pub(super) fn decode(args: DecodeArgs) -> Result<()> {
         &grid,
         &latents,
         args.attention_query_chunk_size,
-        super::decide_auto_residency_with_required_memory(
+        super::resource::decide_auto_residency_with_required_memory(
             &demands,
             &device,
             args.device_cache,

@@ -265,7 +265,7 @@ fn help_exposes_the_composable_and_unified_workflows() {
             "missing command about {phrase:?} in:\n{stdout}"
         );
     }
-    let h3 = successful_output(ff().arg("h3").arg("--help"));
+    let h3 = successful_output(ff().args(["video", "--adapter", "h3", "--help"]));
     let h3_help = String::from_utf8(h3.stdout).unwrap();
     assert!(
         h3_help.contains("Decode H3 audio or video latents"),
@@ -304,9 +304,10 @@ fn help_exposes_the_composable_and_unified_workflows() {
         "inspect help still lists --execution-plan:\n{inspect_help}"
     );
 
-    let denoise_help =
-        String::from_utf8(successful_output(ff().args(["h3", "denoise", "--help"])).stdout)
-            .unwrap();
+    let denoise_help = String::from_utf8(
+        successful_output(ff().args(["video", "denoise", "--adapter", "h3", "--help"])).stdout,
+    )
+    .unwrap();
     assert!(
         denoise_help.contains("--host-cache-mib"),
         "h3 denoise help is missing --host-cache-mib:\n{denoise_help}"
@@ -320,8 +321,10 @@ fn help_exposes_the_composable_and_unified_workflows() {
         "hidden --component leaked into h3 denoise help:\n{denoise_help}"
     );
 
-    let plan_help =
-        String::from_utf8(successful_output(ff().args(["h3", "plan", "--help"])).stdout).unwrap();
+    let plan_help = String::from_utf8(
+        successful_output(ff().args(["video", "plan", "--adapter", "h3", "--help"])).stdout,
+    )
+    .unwrap();
     assert!(
         plan_help.contains("--execution-plan"),
         "h3 plan help is missing --execution-plan:\n{plan_help}"
@@ -508,7 +511,7 @@ fn unified_generation_resume_matches_uninterrupted_latents_and_refuses_policy_ch
 
     let partial = fixture._temporary.path().join("partial.safetensors");
     successful_output(
-        ff().args(["h3", "denoise"])
+        ff().args(["video", "denoise", "--adapter", "h3"])
             .arg("--model")
             .arg(&fixture.model)
             .arg("--inputs")
@@ -535,7 +538,7 @@ fn unified_generation_resume_matches_uninterrupted_latents_and_refuses_policy_ch
 
     let uninterrupted = fixture._temporary.path().join("uninterrupted.safetensors");
     successful_output(
-        ff().args(["h3", "denoise"])
+        ff().args(["video", "denoise", "--adapter", "h3"])
             .arg("--model")
             .arg(&fixture.model)
             .arg("--inputs")
@@ -621,7 +624,7 @@ fn non_terminal_denoise_progress_is_sparse_and_excludes_the_cold_first_step_from
         .path()
         .join("progress-output.safetensors");
     let output = ff()
-        .args(["h3", "denoise"])
+        .args(["video", "denoise", "--adapter", "h3"])
         .arg("--model")
         .arg(&fixture.model)
         .arg("--inputs")
@@ -668,7 +671,7 @@ fn denoise_checkpoint_is_atomically_published_without_clobbering() {
     let fixture = RunnableCalibrationFixture::new();
     let checkpoint = fixture._temporary.path().join("checkpoint.safetensors");
     let run = |inputs: &std::path::Path, output: &std::path::Path| {
-        ff().args(["h3", "denoise"])
+        ff().args(["video", "denoise", "--adapter", "h3"])
             .arg("--model")
             .arg(&fixture.model)
             .arg("--inputs")
@@ -750,7 +753,7 @@ fn an_incompatible_checkpoint_is_auditable_but_resume_refuses_before_model_paylo
         .path()
         .join("current-checkpoint.safetensors");
     let first = ff()
-        .args(["h3", "denoise"])
+        .args(["video", "denoise", "--adapter", "h3"])
         .arg("--model")
         .arg(&fixture.model)
         .arg("--inputs")
@@ -830,7 +833,7 @@ fn an_incompatible_checkpoint_is_auditable_but_resume_refuses_before_model_paylo
 
     let audit = fixture._temporary.path().join("legacy-history.json");
     let shown = ff()
-        .args(["h3", "history"])
+        .args(["video", "history", "--adapter", "h3"])
         .arg("--checkpoint")
         .arg(&legacy)
         .arg("--output")
@@ -854,7 +857,7 @@ fn an_incompatible_checkpoint_is_auditable_but_resume_refuses_before_model_paylo
     .unwrap();
     let refused_output = fixture._temporary.path().join("must-not-exist.safetensors");
     let refused = ff()
-        .args(["h3", "denoise"])
+        .args(["video", "denoise", "--adapter", "h3"])
         .arg("--model")
         .arg(&fixture.model)
         .arg("--inputs")
@@ -879,7 +882,7 @@ fn denoise_publishes_each_absolute_evaluation_checkpoint_and_extends_resume_hist
     let first_output = fixture._temporary.path().join("first-output.safetensors");
     let first_checkpoints = fixture._temporary.path().join("first-checkpoints");
     let first = ff()
-        .args(["h3", "denoise"])
+        .args(["video", "denoise", "--adapter", "h3"])
         .arg("--model")
         .arg(&fixture.model)
         .arg("--inputs")
@@ -942,7 +945,7 @@ fn denoise_publishes_each_absolute_evaluation_checkpoint_and_extends_resume_hist
         .path()
         .join("rejected-output.safetensors");
     let rejected = ff()
-        .args(["h3", "denoise"])
+        .args(["video", "denoise", "--adapter", "h3"])
         .arg("--model")
         .arg(&fixture.model)
         .arg("--inputs")
@@ -977,7 +980,7 @@ fn denoise_publishes_each_absolute_evaluation_checkpoint_and_extends_resume_hist
     let resumed_output = fixture._temporary.path().join("resumed-output.safetensors");
     let resumed_checkpoints = fixture._temporary.path().join("resumed-checkpoints");
     let resumed = ff()
-        .args(["h3", "denoise"])
+        .args(["video", "denoise", "--adapter", "h3"])
         .arg("--model")
         .arg(&fixture.model)
         .arg("--inputs")
@@ -1039,7 +1042,7 @@ fn denoise_stops_when_its_pre_execution_record_cannot_be_published() {
         .arg("-c")
         .arg("umask 0777; exec \"$0\" \"$@\"")
         .arg(env!("CARGO_BIN_EXE_ff"))
-        .args(["h3", "denoise"])
+        .args(["video", "denoise", "--adapter", "h3"])
         .arg("--model")
         .arg(&fixture.model)
         .arg("--inputs")
@@ -1077,7 +1080,7 @@ fn calibrates_a_tiny_cpu_policy_in_two_isolated_trajectory_warmed_trials() {
     let fixture = RunnableCalibrationFixture::new();
     let report_path = fixture.report();
     let output = successful_output(
-        ff().args(["h3", "calibrate"])
+        ff().args(["video", "calibrate", "--adapter", "h3"])
             .arg("--model")
             .arg(&fixture.model)
             .arg("--inputs")
@@ -1166,7 +1169,7 @@ fn calibration_rejects_resume_inputs_and_malformed_hidden_requests() {
     safetensors::save(&values, &resume_inputs).unwrap();
     let report = fixture._temporary.path().join("rejected-report.json");
     let output = ff()
-        .args(["h3", "calibrate"])
+        .args(["video", "calibrate", "--adapter", "h3"])
         .arg("--model")
         .arg(&fixture.model)
         .arg("--inputs")
@@ -1444,7 +1447,7 @@ fn transformer_inspection_verification_and_tensor_loading_cross_the_binary_bound
 fn tiny_t2va_resource_plan_is_machine_readable_at_the_binary_boundary() {
     let fixture = TinyTransformerFixture::new();
     let output = successful_output(
-        ff().args(["h3", "plan"])
+        ff().args(["video", "plan", "--adapter", "h3"])
             .arg("--model")
             .arg(fixture.model())
             .args([
@@ -1512,7 +1515,7 @@ fn h3_plan_lists_execution_stages() {
     let plan = || {
         let mut command = ff();
         command
-            .args(["h3", "plan"])
+            .args(["video", "plan", "--adapter", "h3"])
             .arg("--model")
             .arg(fixture.model())
             .args([
@@ -1582,7 +1585,7 @@ fn conservative_t2va_solver_is_deterministic_and_reports_truncation() {
     let fixture = TinyTransformerFixture::new();
     let run = || {
         successful_output(
-            ff().args(["h3", "solve"])
+            ff().args(["video", "solve", "--adapter", "h3"])
                 .arg("--model")
                 .arg(fixture.model())
                 .args([
@@ -1719,7 +1722,7 @@ fn conservative_t2va_solver_is_deterministic_and_reports_truncation() {
 fn non_cuda_binary_emits_a_bound_symbolic_cuda_solver_policy() {
     let fixture = TinyTransformerFixture::new();
     let output = successful_output(
-        ff().args(["h3", "solve"])
+        ff().args(["video", "solve", "--adapter", "h3"])
             .arg("--model")
             .arg(fixture.model())
             .args([
@@ -1772,7 +1775,7 @@ fn non_cuda_binary_emits_a_bound_symbolic_cuda_solver_policy() {
 fn conservative_t2va_solver_rejects_an_unsatisfiable_hard_budget() {
     let fixture = TinyTransformerFixture::new();
     let output = ff()
-        .args(["h3", "solve"])
+        .args(["video", "solve", "--adapter", "h3"])
         .arg("--model")
         .arg(fixture.model())
         .args([
@@ -1822,7 +1825,7 @@ fn prepare_t2va_inputs_writes_expected_tiny_tensor_shapes() {
     let run = || {
         let mut command = ff();
         command
-            .args(["h3", "prepare"])
+            .args(["video", "prepare", "--adapter", "h3"])
             .arg("--model")
             .arg(fixture.model())
             .arg("--prompt-encoding")
@@ -1881,7 +1884,7 @@ fn prepare_t2va_inputs_writes_expected_tiny_tensor_shapes() {
     let initialize = || {
         let mut command = ff();
         command
-            .args(["h3", "init"])
+            .args(["video", "init", "--adapter", "h3"])
             .arg("--inputs")
             .arg(&prepared)
             .arg("--output")
@@ -1956,7 +1959,7 @@ fn resource_benchmark_producer_retains_real_tiny_pairs_and_loadable_evidence() {
     let output = fixture._temporary.path().join("resource-pairs");
     fs::write(&plan,serde_json::to_vec(&serde_json::json!({
         "schema_version":1,"family":"h3","cache_state":"uncontrolled","pairs":3,"minimum_improvement_basis_points":200,
-        "common_args":["h3","denoise","--model",fixture.model,"--inputs",fixture.inputs,"--device","cpu","--sigma-points","3","--max-steps","1","--no-progress"],
+        "common_args":["video","denoise","--adapter","h3","--model",fixture.model,"--inputs",fixture.inputs,"--device","cpu","--sigma-points","3","--max-steps","1","--no-progress"],
         "baseline_args":[],"candidate_args":["--host-cache-mib","1"]
     })).unwrap()).unwrap();
     let completed = Command::new("python3")
@@ -2000,7 +2003,7 @@ fn denoise_selection_records_effective_explicit_budgets_at_both_boundaries() {
     let fixture = RunnableCalibrationFixture::new();
     let output = fixture._temporary.path().join("budget-check.safetensors");
     successful_output(
-        ff().args(["h3", "denoise"])
+        ff().args(["video", "denoise", "--adapter", "h3"])
             .arg("--model")
             .arg(&fixture.model)
             .arg("--inputs")
@@ -2081,7 +2084,7 @@ fn trellis_inspect_reports_components_and_cross_checkpoint_references() {
     .unwrap();
 
     let output = successful_output(
-        ff().args(["trellis", "inspect"])
+        ff().args(["3d", "inspect", "--adapter", "trellis"])
             .arg("--model")
             .arg(&text)
             .arg("--models-root")
@@ -2141,7 +2144,7 @@ fn trellis_structure_refuses_a_conditioner_the_pipeline_does_not_name() {
     std::fs::create_dir_all(&elsewhere).unwrap();
 
     let output = ff()
-        .args(["trellis", "structure"])
+        .args(["3d", "structure", "--adapter", "trellis"])
         .arg("--model")
         .arg(&text)
         .arg("--conditioner")

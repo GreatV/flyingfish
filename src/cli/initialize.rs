@@ -1,9 +1,13 @@
-use super::*;
-use flyingfish::{
-    h3::conditioning_provenance::H3ConditioningProvenance,
-    recovery::{MAX_RECOVERY_CHECKPOINT_BYTES, validate_t2va_schedule},
-    runtime::artifact::{ArtifactStaging, read_artifact_snapshot},
+use super::H3Command;
+use anyhow::{Context, Result, bail};
+use candle_core::{Device, Tensor, safetensors};
+use flyingfish::h3::conditioning_provenance::H3ConditioningProvenance;
+use flyingfish::recovery::{
+    CheckpointIdentity, MAX_RECOVERY_CHECKPOINT_BYTES, PolicyHistory,
+    take_t2va_checkpoint_metadata, validate_t2va_schedule,
 };
+use flyingfish::runtime::artifact::{ArtifactStaging, read_artifact_snapshot};
+use std::collections::HashMap;
 
 pub(super) fn run_initialize_t2va_checkpoint(command: H3Command) -> Result<()> {
     let H3Command::InitializeT2vaCheckpoint {

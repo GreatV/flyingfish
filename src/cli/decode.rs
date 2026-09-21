@@ -1,5 +1,19 @@
-use super::*;
+use super::H3DecodeCommand;
+use super::checkpoint::resolve_component;
+use super::device_parse::parse_device;
+use super::output_hygiene::{
+    create_new_directory, ensure_new_output, publish_png_frame_manifest,
+    resolve_output_outside_model, write_telemetry,
+};
+use super::prompt::take_input;
+use super::{ensure_optional_output_is_distinct, resolve_optional_new_output};
+use anyhow::{Context, Result, bail};
+use candle_core::safetensors;
+use flyingfish::h3::audio_vae::{StreamedAudioVae, write_wav};
+use flyingfish::h3::video_vae::StreamedVideoVae;
 use flyingfish::runtime::artifact::ArtifactStaging;
+use flyingfish::runtime::telemetry::TelemetryMonitor;
+use std::time::Duration;
 
 pub(super) fn run_decode_audio(command: H3DecodeCommand) -> Result<()> {
     let H3DecodeCommand::Audio {

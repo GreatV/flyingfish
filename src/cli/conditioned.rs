@@ -1,22 +1,72 @@
-use super::*;
-use candle_core::DType;
-use flyingfish::{
-    h3::audio_vae_encoder::StreamedAudioVaeEncoder,
-    h3::fl2va::{Fl2vaCanvas, Fl2vaOptions, PreparedFl2va, prepare_fl2va},
-    h3::h3_conditioning::{
-        ConditionedLayout, KeyframeAnchor, ReferenceBlock, denoise_conditioned_with_observer,
-    },
-    h3::multimodal_text_encoder::{
-        RgbImage, StreamedMultimodalTextEncoder, resolve_fl2va_canvas_size,
-    },
-    h3::ref2va::{PreparedRef2va, Ref2vaPipeline, Ref2vaReference, Ref2vaTarget},
-    h3::video_vae_encoder::StreamedVideoVaeEncoder,
-    recovery::PolicyHistory,
-    runtime::artifact::ArtifactStaging,
-    runtime::frame_manifest::{MAX_PNG_FRAME_BYTES, MAX_PNG_FRAME_SET_MANIFEST_JSON_BYTES},
+use super::H3Command;
+use super::checkpoint::resolve_component;
+use super::denoise::{
+    CliDenoiseObserver, report_h3_device_cache, resolve_execution_policy,
+    select_resume_execution_policy, validate_executable_policy,
 };
+use super::device_parse::parse_device;
+use super::output_hygiene::{
+    create_new_directory, ensure_new_output, resolve_output_outside_model, write_telemetry,
+};
+use super::prompt::{sorted_tensor_names, take_input};
+use super::qwen_numerical::validate_qwen_numerical_contract;
+use super::{
+    build_transformer_options, ensure_optional_output_is_distinct, resolve_optional_new_output,
+};
+use anyhow::{Context, Result, bail};
+use candle_core::{DType, Device, Tensor, safetensors};
+use flyingfish::h3::audio_vae_encoder::StreamedAudioVaeEncoder;
+use flyingfish::h3::config::TransformerConfig;
+use flyingfish::h3::cuda::profile::validate_selected_device as validate_h3_selected_cuda_profile;
+use flyingfish::h3::fl2va::{Fl2vaCanvas, Fl2vaOptions, PreparedFl2va, prepare_fl2va};
+use flyingfish::h3::h3_conditioning::{
+    ConditionedLayout, KeyframeAnchor, ReferenceBlock, denoise_conditioned_with_observer,
+};
+use flyingfish::h3::model::{
+    StreamedTransformer, StreamedTransformerOptions, validate_h3_numerical_backend,
+};
+use flyingfish::h3::multimodal_text_encoder::{
+    RgbImage, StreamedMultimodalTextEncoder, resolve_fl2va_canvas_size,
+};
+use flyingfish::h3::pipeline::{
+    DenoiseCheckpointEvent, DenoiseObserver, DenoisePreparationEvent, DenoiseStepEvent,
+    T2vaExecutionOptions, T2vaSchedule,
+};
+use flyingfish::h3::policy::{ExecutionPolicy, H3QwenNumericalContract, H3QwenVisionGridModality};
+use flyingfish::h3::ref2va::{PreparedRef2va, Ref2vaPipeline, Ref2vaReference, Ref2vaTarget};
+use flyingfish::h3::video_vae_encoder::StreamedVideoVaeEncoder;
+use flyingfish::recovery::PolicyHistory;
+use flyingfish::runtime::artifact::ArtifactStaging;
+use flyingfish::runtime::frame_manifest::{
+    MAX_PNG_FRAME_BYTES, MAX_PNG_FRAME_SET_MANIFEST_JSON_BYTES, PngFrameSetManifest,
+};
+use flyingfish::runtime::telemetry::TelemetryMonitor;
+use rand::{SeedableRng, rngs::StdRng};
 use serde::Deserialize;
-use std::{fs, io::BufReader};
+use std::collections::HashMap;
+use std::fs;
+use std::io::BufReader;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokenizers::Tokenizer;
+
+/// One line stating what an official target resolved to, including the aligned
+/// duration, which frame alignment can push past the request.
+pub(crate) fn describe_h3_target(
+    target: &flyingfish::h3::target_geometry::H3TargetGeometry,
+) -> String {
+    format!(
+        "official target: short_edge {} aspect_ratio {} duration_seconds {} -> {}x{}, {} frames ({:.3} s)",
+        target.short_edge,
+        target.aspect_ratio,
+        target.duration_seconds,
+        target.canvas_width,
+        target.canvas_height,
+        target.num_frames,
+        target.aligned_duration_seconds()
+    )
+}
 
 const CONDITIONED_SCHEMA_VERSION: u32 = 2;
 const QWEN_IMAGE_PAD_TOKEN_ID: u32 = 151_655;
@@ -1947,7 +1997,9 @@ fn ensure_checkpoint_outputs_are_disjoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use crate::cli::default_execution_policy;
+    use crate::cli::{adapters, routing};
+    use flyingfish::h3::policy::H3QwenVisionLinearGeometry;
 
     fn audit_only_qwen_contract(language_rows: usize) -> H3QwenNumericalContract {
         H3QwenNumericalContract::for_verified_target(
@@ -2397,10 +2449,13 @@ mod tests {
 
     #[test]
     fn conditioned_cli_surface_parses_all_staged_commands() {
+        let registry = routing::Registry::new(adapters::BUILTINS);
+        let adapter = adapters::BUILTINS
+            .iter()
+            .find(|adapter| adapter.id == "h3")
+            .expect("adapter id");
         for arguments in [
             vec![
-                "ff",
-                "h3",
                 "prepare-fl2va",
                 "--model",
                 "model",
@@ -2412,8 +2467,6 @@ mod tests {
                 "prepared.safetensors",
             ],
             vec![
-                "ff",
-                "h3",
                 "prepare-ref2va",
                 "--model",
                 "model",
@@ -2429,8 +2482,6 @@ mod tests {
                 "prepared.safetensors",
             ],
             vec![
-                "ff",
-                "h3",
                 "denoise-conditioned",
                 "--model",
                 "model",
@@ -2442,7 +2493,10 @@ mod tests {
                 "checkpoints",
             ],
         ] {
-            Args::try_parse_from(arguments).unwrap();
+            registry
+                .selected_task_command(adapter)
+                .try_get_matches_from(std::iter::once("ff").chain(arguments))
+                .unwrap();
         }
     }
 }

@@ -1,19 +1,15 @@
-use super::*;
+use super::WeightCacheArgs;
+use super::device_parse::parse_device;
+use anyhow::Result;
+use flyingfish::runtime::weights::ModelWeights;
+use std::path::PathBuf;
 
-pub(super) fn run_inspect(command: Command) -> Result<()> {
-    let Command::Inspect {
-        checkpoint,
-        weights: weight_args,
-        verify,
-    } = command
-    else {
-        bail!("internal CLI dispatch mismatch for inspect");
-    };
-    let weights = ModelWeights::open(
-        &checkpoint,
-        weight_args.weight_source,
-        weight_args.cache_policy()?,
-    )?;
+pub(super) fn run_inspect(
+    checkpoint: PathBuf,
+    weights: WeightCacheArgs,
+    verify: bool,
+) -> Result<()> {
+    let weights = ModelWeights::open(&checkpoint, weights.weight_source, weights.cache_policy()?)?;
     let inventory = weights.inventory();
     println!("checkpoint: {}", checkpoint.display());
     println!("index: {}", weights.index_path().display());
@@ -35,21 +31,13 @@ pub(super) fn run_inspect(command: Command) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn run_tensor(command: Command) -> Result<()> {
-    let Command::Tensor {
-        checkpoint,
-        name,
-        device,
-        weights: weight_args,
-    } = command
-    else {
-        bail!("internal CLI dispatch mismatch for tensor");
-    };
-    let weights = ModelWeights::open(
-        checkpoint,
-        weight_args.weight_source,
-        weight_args.cache_policy()?,
-    )?;
+pub(super) fn run_tensor(
+    checkpoint: PathBuf,
+    name: String,
+    device: String,
+    weights: WeightCacheArgs,
+) -> Result<()> {
+    let weights = ModelWeights::open(checkpoint, weights.weight_source, weights.cache_policy()?)?;
     let metadata = weights.metadata(&name)?;
     println!(
         "{}: dtype={}, shape={:?}, bytes={}, shard={}",

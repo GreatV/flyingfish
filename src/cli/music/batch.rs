@@ -1,11 +1,20 @@
-use super::*;
-use anyhow::ensure;
+use crate::cli::device_parse::parse_device;
+use crate::cli::output_hygiene::{
+    ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
+};
+use crate::cli::resource::decide_auto_residency_with_required_memory;
+use crate::cli::{DeviceCacheArgs, WeightCacheArgs};
+use anyhow::{Context, Result, ensure};
+use flyingfish::h3::audio_vae::{WavSampleFormat, write_wav};
+use flyingfish::music::pipeline::{Music3, Options};
+use flyingfish::runtime::artifact::ArtifactStaging;
+use flyingfish::runtime::weights::DeviceCache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct Args {

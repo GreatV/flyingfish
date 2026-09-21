@@ -1,16 +1,178 @@
-use super::*;
-use flyingfish::{
-    h3::{
-        policy::ExecutionBackendPolicy,
-        resources::{ResourceAssumptions, SequenceRows},
-    },
-    resource_policy::{
-        evidence::{EvidenceContext, ResourceEvidence},
-        h3::{H3Selection, H3SelectionRequest},
-    },
-    runtime::{probe::ResourceSnapshot, resource_selection::SelectionOrigin},
+use super::output_hygiene::{ensure_new_output, mib_to_bytes};
+use super::{
+    DEFAULT_FLASH_BACKEND_WORKSPACE_MIB, DEFAULT_NON_FLASH_BACKEND_WORKSPACE_MIB, DeviceCacheArgs,
+    H3AdmissionArgs, H3ResourceArgs, OptionalWeightCacheArgs,
+};
+use anyhow::{Context, Result, bail};
+use candle_core::{Device, Tensor};
+use flyingfish::h3::config::TransformerConfig;
+use flyingfish::h3::execution::H3ExecutionPlan;
+use flyingfish::h3::model::validate_h3_numerical_backend;
+use flyingfish::h3::policy::ExecutionBackendPolicy;
+use flyingfish::h3::policy::ExecutionPolicy;
+use flyingfish::h3::resources::{ResourceAssumptions, SequenceRows, T2vaGeometry};
+use flyingfish::resource_policy::evidence::{EvidenceContext, ResourceEvidence};
+use flyingfish::resource_policy::h3::{H3Selection, H3SelectionRequest};
+use flyingfish::runtime::probe::ResourceSnapshot;
+use flyingfish::runtime::resource_selection::SelectionOrigin;
+use flyingfish::runtime::weights::{
+    CachePolicy, DeviceCache, DeviceCachePolicy, ModelWeights, WeightSource,
 };
 use std::collections::BTreeSet;
+use std::path::Path;
+
+/// Headroom the residency ladder leaves free on the device for activations,
+/// workspaces and allocator slack: the shared admission-reserve shape (5% of
+/// the pool total, capped at 1 GiB), so small and unified pools are not
+/// over-reserved — a 24 GiB discrete card keeps the historical flat 1 GiB
+/// exactly.
+///
+/// A declared margin, not a measured requirement. Adapters add known request
+/// allocations separately. Runtime cache demotion can recover weight-load
+/// allocation failures; this margin does not guarantee that every activation
+/// allocation will fit.
+pub(crate) fn device_residency_reserve_bytes(
+    snapshot: &flyingfish::runtime::probe::ResourceSnapshot,
+) -> u64 {
+    let total = if snapshot.host_device_memory_is_unified == Some(true) {
+        [
+            snapshot.host_pool_total_bytes(),
+            snapshot.device_total_memory_bytes,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    } else {
+        snapshot.device_total_memory_bytes
+    };
+    // The free-view fallback below is for legacy recorded snapshots only: a
+    // live capture produces the device total and free together (both come
+    // from the same CUDA device handle).
+    flyingfish::runtime::probe::admission_reserve_bytes(total.or(snapshot.device_free_memory_bytes))
+}
+
+/// Default CUDA placement for adapters with request tensor estimates. Explicit
+/// ceilings (including zero) and non-CUDA devices keep their existing behavior.
+/// `required_device_bytes` is one caller's device charge and is multiplied by
+/// `unified_share`, the number of callers drawing from this pool.
+/// `unified_host_bytes` is already the total across every concurrent host
+/// allocation, because those exist per caller whether or not the caller shares
+/// this pool — the two counts differ and only the caller knows the second. All
+/// of it applies under the fold alone.
+pub(crate) fn decide_auto_residency_with_required_memory(
+    demands: &[flyingfish::runtime::residency::PhaseResidencyDemand],
+    device: &candle_core::Device,
+    args: DeviceCacheArgs,
+    required_device_bytes: u64,
+    unified_host_bytes: u64,
+    unified_share: u64,
+) -> Result<DeviceCache> {
+    use flyingfish::runtime::{probe::ResourceSnapshot, residency::plan_device_residency};
+    if !device.is_cuda() || args.device_cache_mib.is_some() {
+        return decide_residency_with_required_memory(
+            demands,
+            device,
+            args,
+            required_device_bytes,
+            unified_host_bytes,
+            unified_share,
+        );
+    }
+    let snapshot = ResourceSnapshot::capture(Some(device));
+    // Each concurrent caller needs its own fixed margin, but only where the
+    // pool is actually shared; a discrete device owes nothing to the others.
+    let shared = snapshot.unified_pool_available_bytes().is_some();
+    let share = if shared { unified_share.max(1) } else { 1 };
+    let reserve = required_device_bytes
+        .saturating_mul(share)
+        .checked_add(device_residency_reserve_bytes(&snapshot).saturating_mul(share))
+        .context("device residency reserve overflow")?;
+    let capacity = if snapshot.unified_accounting_is_undecidable() {
+        0
+    } else {
+        snapshot
+            .unified_pool_available_bytes()
+            .or(snapshot.device_free_memory_bytes)
+            .unwrap_or(0)
+    };
+    let reserve = if shared {
+        reserve
+            .checked_add(unified_host_bytes)
+            .context("unified host reserve overflow")?
+    } else {
+        reserve
+    };
+    // Reserving each concurrent caller's charges is not enough: the remainder
+    // is also shared, so one caller may retain only its portion of it.
+    let available = capacity.saturating_sub(reserve) / share;
+    let plan = plan_device_residency(demands, available, 0)?;
+    eprintln!(
+        "device residency: auto retains {} MiB in {}/{} weight groups after reserving {} MiB for request tensors and workspace",
+        plan.resident_bytes / (1 << 20),
+        plan.placed.len(),
+        demands.len(),
+        reserve / (1 << 20),
+    );
+    Ok(DeviceCache::with_selected_phases(
+        DeviceCachePolicy::with_max_bytes(plan.resident_bytes)
+            .with_cuda_allocator(args.device_cache_allocator),
+        plan.placed,
+    ))
+}
+
+pub(crate) fn decide_residency_with_required_memory(
+    demands: &[flyingfish::runtime::residency::PhaseResidencyDemand],
+    device: &candle_core::Device,
+    args: DeviceCacheArgs,
+    required_device_bytes: u64,
+    unified_host_bytes: u64,
+    unified_share: u64,
+) -> Result<DeviceCache> {
+    use flyingfish::runtime::{probe::ResourceSnapshot, residency::decide_device_residency};
+    let snapshot = ResourceSnapshot::capture(Some(device));
+    let shared = snapshot.unified_pool_available_bytes().is_some();
+    let share = if shared { unified_share.max(1) } else { 1 };
+    let reserve = device_residency_reserve_bytes(&snapshot)
+        .saturating_mul(share)
+        .checked_add(required_device_bytes.saturating_mul(share))
+        .context("device residency reserve overflow")?;
+    // An explicit ceiling is still clamped against the shared pool, so the
+    // caller's separately modelled host allocation is reserved here too.
+    let reserve = if shared {
+        reserve
+            .checked_add(unified_host_bytes)
+            .context("unified host reserve overflow")?
+    } else {
+        reserve
+    };
+    // The share is taken before planning, by withholding the other callers'
+    // portions as reserve: dividing the decision afterwards would leave a plan
+    // built against the whole remainder, selecting phases that can never be
+    // retained. The operator's own ceiling still clamps on top, so a ceiling
+    // that already fits the share is not reduced.
+    let reserve = match snapshot.unified_pool_available_bytes() {
+        Some(pool) if share > 1 => pool.saturating_sub(pool.saturating_sub(reserve) / share),
+        _ => reserve,
+    };
+    let decision = decide_device_residency(&snapshot, demands, reserve, args.authorization()?)?;
+    if decision.authorized_budget_bytes > 0 {
+        eprintln!(
+            "device residency: {} MiB authorized, {}/{} phase working sets fit, {} MiB planned weight peak",
+            decision.authorized_budget_bytes / (1 << 20),
+            decision.plan.placed.len(),
+            demands.len(),
+            decision.plan.resident_bytes / (1 << 20),
+        );
+        for phase in &decision.plan.spilled {
+            eprintln!("device residency: {phase} cannot be retained in full within this budget");
+        }
+    }
+    Ok(DeviceCache::with_selected_phases(
+        DeviceCachePolicy::with_max_bytes(decision.authorized_budget_bytes)
+            .with_cuda_allocator(args.device_cache_allocator),
+        decision.plan.placed,
+    ))
+}
 
 pub(super) struct H3ResourceRequest<'a> {
     pub component: &'a Path,
@@ -167,7 +329,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         additional_host_allowance_bytes: request
             .additional_host_allowance_bytes
             .checked_add(if unified {
-                super::device_residency_reserve_bytes(&snapshot)
+                device_residency_reserve_bytes(&snapshot)
             } else {
                 0
             })
@@ -179,7 +341,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
     let headroom_bytes = if unified {
         0
     } else {
-        super::device_residency_reserve_bytes(&snapshot)
+        device_residency_reserve_bytes(&snapshot)
     };
     let automatic_cache = flyingfish::resource_policy::h3::automatic_device_cache(
         &selection_request,
@@ -216,7 +378,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
             // reserve: the phase type invariant rejects the combination, and
             // the sizing already accounted the headroom against the pool.
             if phase.required_device_bytes.is_some() {
-                phase.device_reserve_bytes = super::device_residency_reserve_bytes(&snapshot);
+                phase.device_reserve_bytes = device_residency_reserve_bytes(&snapshot);
             }
         }
     }
@@ -437,6 +599,8 @@ pub(super) fn verify_evidence(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::DenoiseChunkArgs;
+    use crate::cli::denoise::resolve_execution_policy;
     #[test]
     fn selection_output_conflicts_are_refused_before_publication() {
         let root = tempfile::tempdir().unwrap();

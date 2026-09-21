@@ -1,11 +1,12 @@
-use super::*;
-use flyingfish::{runtime::artifact::ArtifactStaging, runtime::identity::WeakModelIdentity};
+use super::output_hygiene::{
+    ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
+};
+use anyhow::{Context, Result};
+use flyingfish::runtime::artifact::ArtifactStaging;
+use flyingfish::runtime::identity::WeakModelIdentity;
+use std::path::PathBuf;
 
-pub(super) fn run_identify_model(command: Command) -> Result<()> {
-    let Command::Identify { checkpoint, output } = command else {
-        bail!("internal CLI dispatch mismatch for identify");
-    };
-
+pub(super) fn run_identify_model(checkpoint: PathBuf, output: PathBuf) -> Result<()> {
     let component_dir = std::fs::canonicalize(&checkpoint).with_context(|| {
         format!(
             "failed to resolve checkpoint directory {}",

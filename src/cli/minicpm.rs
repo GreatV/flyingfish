@@ -1,10 +1,16 @@
-use super::*;
-use flyingfish::minicpm::{Config, Decoder, dspark};
+use super::device_parse::parse_device;
+use super::{DeviceCacheArgs, WeightCacheArgs, kit};
+use anyhow::{Context, Result, bail};
+use clap::Subcommand;
+use flyingfish::minicpm::Config;
+use session::{Worker, WorkerOptions};
 use std::io::Write;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use tokenizers::Tokenizer;
 
 mod batch;
 mod session;
-use session::{Worker, WorkerOptions};
 
 #[derive(Debug, Subcommand)]
 pub(super) enum MiniCpmCommand {
@@ -27,10 +33,10 @@ pub(super) enum MiniCpmCommand {
         prompt: Option<String>,
         #[arg(long, conflicts_with = "prompt")]
         prompt_file: Option<PathBuf>,
-        #[arg(long, default_value_t = 128)]
-        max_new_tokens: usize,
-        #[arg(long, default_value = "auto")]
-        device: String,
+        #[arg(long, default_value_t = NonZeroUsize::new(128).unwrap())]
+        max_new_tokens: NonZeroUsize,
+        #[command(flatten)]
+        device: kit::DeviceArgs,
         #[arg(long, default_value_t = 32)]
         attention_query_chunk_size: usize,
         #[arg(
@@ -68,7 +74,8 @@ pub(super) fn run(command: MiniCpmCommand) -> Result<()> {
     else {
         unreachable!()
     };
-    anyhow::ensure!(max_new_tokens > 0, "--max-new-tokens must be positive");
+    let kit::DeviceArgs { device } = device;
+    let max_new_tokens = max_new_tokens.get();
     let prompt = match (prompt, prompt_file) {
         (Some(text), None) => text,
         (None, Some(path)) => std::fs::read_to_string(path).context("read prompt file")?,

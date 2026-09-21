@@ -1,7 +1,196 @@
-use super::*;
+use super::H3Command;
+use super::checkpoint::resolve_component;
+use super::device_parse::parse_device;
+use super::output_hygiene::{
+    create_new_directory, ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
+    write_telemetry,
+};
+use super::progress;
+use super::prompt::{sorted_tensor_names, take_input};
+use super::qwen_numerical::validate_qwen_numerical_contract;
+use super::{
+    TransformerChunkArgs, build_transformer_options, ensure_optional_output_is_distinct,
+    resolve_optional_new_output,
+};
+use anyhow::{Context, Result, bail};
+use candle_core::{Device, Tensor, safetensors};
+use flyingfish::h3::conditioning_provenance::{ExternalPromptProvenance, H3ConditioningProvenance};
+use flyingfish::h3::config::TransformerConfig;
+use flyingfish::h3::core::AttentionKeyChunkPolicy;
+use flyingfish::h3::model::StreamedTransformer;
+use flyingfish::h3::pipeline::{
+    DenoiseCheckpointEvent, DenoiseObserver, DenoisePreparationEvent, DenoiseStepEvent,
+    T2vaExecutionOptions, T2vaLatents, T2vaSchedule, denoise_t2va_with_options_and_observer,
+};
+use flyingfish::h3::policy::ExecutionPolicy;
+use flyingfish::h3::resources::T2vaGeometry;
+use flyingfish::recovery::{CheckpointIdentity, PolicyHistory, take_t2va_checkpoint_metadata};
 use flyingfish::runtime::artifact::{ArtifactStaging, PublishedArtifact};
+use flyingfish::runtime::telemetry::TelemetryMonitor;
+use flyingfish::runtime::weights::{CachePolicy, WeightSource};
 use memmap2::MmapOptions;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+pub(crate) struct CliDenoiseObserver {
+    progress: progress::DenoiseProgress,
+}
+
+impl CliDenoiseObserver {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            progress: progress::DenoiseProgress::for_stderr(enabled),
+        }
+    }
+}
+
+impl DenoiseObserver for CliDenoiseObserver {
+    fn synchronize_device_timings(&self) -> bool {
+        self.progress.synchronize_device_timings()
+    }
+
+    fn on_preparation_completed(&mut self, event: DenoisePreparationEvent) -> Result<()> {
+        self.progress
+            .on_preparation_completed(event, &mut std::io::stderr().lock())
+    }
+
+    fn on_step_completed(&mut self, event: DenoiseStepEvent) -> Result<()> {
+        self.progress
+            .on_step_completed(event, &mut std::io::stderr().lock())
+    }
+}
+
+pub(crate) fn report_h3_device_cache(transformer: &StreamedTransformer) {
+    if let Some(plan) = transformer.host_residency_plan() {
+        eprintln!(
+            "H3 host cache: {}",
+            serde_json::json!({"planned_resident_bytes":plan.resident_bytes,"stats":transformer.cache_stats()})
+        );
+    }
+    if let Some(plan) = transformer.device_residency_plan() {
+        eprintln!(
+            "H3 device cache: {}",
+            serde_json::json!({
+                "planned_resident_bytes": plan.resident_bytes,
+                "stats": transformer.device_cache_stats(),
+            })
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_execution_policy(
+    path: Option<&Path>,
+    device: &Device,
+    weight_source: WeightSource,
+    cache_policy: CachePolicy,
+    chunks: TransformerChunkArgs,
+    flash_attention: bool,
+    precompute_adaln: bool,
+) -> Result<ExecutionPolicy> {
+    let policy = match path {
+        Some(path) => ExecutionPolicy::load(path)?,
+        None => ExecutionPolicy::from_runtime(
+            device,
+            weight_source,
+            cache_policy,
+            chunks.model_chunking(),
+            flash_attention,
+            precompute_adaln,
+        )?,
+    };
+    validate_executable_policy(&policy, device)?;
+    Ok(policy)
+}
+
+pub(crate) fn validate_executable_policy(policy: &ExecutionPolicy, device: &Device) -> Result<()> {
+    policy.validate_device(device)?;
+    anyhow::ensure!(
+        !policy.flash_attention() || cfg!(feature = "flash-attn"),
+        "execution policy selects FlashAttention, but this binary was not compiled with --features flash-attn"
+    );
+    Ok(())
+}
+
+/// Choose an attention backend the request can actually run on.
+///
+/// The exact full-softmax path covers a bounded number of packed rows. Past
+/// that bound it is not that the operator prefers another backend -- full
+/// softmax does not run the request at all -- and the row count is known here.
+/// Online softmax processes keys in blocks instead, so the bound applies per
+/// block rather than to the sequence.
+///
+/// The block is the largest the verified exact-softmax kernels cover, which is
+/// the same bound the full path ran out of: larger blocks mean fewer passes,
+/// and the modelled peak grows slowly enough with block size that memory does
+/// not decide this. A pinned or replayed policy is left alone, and so is one
+/// that already names a backend without the bound.
+pub(crate) fn promote_attention_backend_for_rows(
+    policy: &mut ExecutionPolicy,
+    on_cuda: bool,
+    packed_rows: u64,
+    operator_named_the_backend: bool,
+) -> Result<()> {
+    use flyingfish::h3::core::CUDA_EXACT_SOFTMAX_MAX_KEY_ROWS;
+    use flyingfish::h3::policy::AttentionBackendPolicy;
+
+    let bound = u64::try_from(CUDA_EXACT_SOFTMAX_MAX_KEY_ROWS)
+        .context("exact softmax row bound exceeds u64")?;
+    if operator_named_the_backend
+        || !on_cuda
+        || policy.attention.backend != AttentionBackendPolicy::FullSoftmax
+        || packed_rows <= bound
+    {
+        return Ok(());
+    }
+    policy.attention.backend = AttentionBackendPolicy::OnlineSoftmax;
+    policy.attention.configured_key_rows = Some(bound);
+    policy.rebind_attention_numerics()?;
+    eprintln!(
+        "attention: {packed_rows} packed rows exceed the {bound} full softmax covers; \
+         using online softmax over {bound}-row key blocks"
+    );
+    Ok(())
+}
+
+pub(crate) fn select_resume_execution_policy(
+    mut requested: ExecutionPolicy,
+    recorded: Option<&ExecutionPolicy>,
+    explicit_policy: bool,
+    explicit_policy_settings: bool,
+    requires_recorded_policy: bool,
+) -> Result<ExecutionPolicy> {
+    match recorded {
+        Some(recorded) => {
+            if explicit_policy || explicit_policy_settings {
+                // Device residency is planned against whatever the card has
+                // free at that moment, so the recorded ceiling describes the
+                // first run's machine rather than anything the operator asked
+                // for. Two runs minutes apart can plan differently and agree on
+                // every choice a person made. Carry the recorded ceiling
+                // forward -- keeping the run's placement stable across a
+                // resume -- and let admission decide whether it still fits;
+                // refusing the resume for it would name a field no H3 command
+                // even exposes as a flag.
+                if !explicit_policy {
+                    requested.weights.device_cache = recorded.weights.device_cache;
+                }
+                if let Some(field) = recorded.first_difference(&requested) {
+                    bail!(
+                        "the checkpoint's execution policy disagrees with the requested one at {field}"
+                    );
+                }
+                Ok(requested)
+            } else {
+                Ok(recorded.clone())
+            }
+        }
+        None if requires_recorded_policy => bail!("checkpoint has no execution policy"),
+        None => Ok(requested),
+    }
+}
 
 const CONDITIONED_SCHEMA_MARKER: &str = "conditioned_schema_version";
 const CONDITIONED_MODE_MARKER: &str = "conditioned_mode";
@@ -796,6 +985,7 @@ pub(super) fn run_denoise_t2va(command: H3Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::default_execution_policy;
 
     #[test]
     fn external_checkpoint_writer_and_classifier_use_the_same_metadata() {

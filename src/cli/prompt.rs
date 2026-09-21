@@ -1,5 +1,30 @@
-use super::*;
+use super::H3Command;
+use super::checkpoint::resolve_component;
+use super::device_parse::parse_device;
+use super::generate::make_t2va_noise;
+use super::output_hygiene::{ensure_new_output, resolve_output_outside_model};
+use super::qwen_numerical::validate_qwen_numerical_contract;
+use anyhow::{Context, Result, bail};
+use candle_core::{Tensor, safetensors};
+use flyingfish::h3::config::TransformerConfig;
+use flyingfish::h3::cuda::profile::validate_selected_device as validate_h3_selected_cuda_profile;
+use flyingfish::h3::policy::H3QwenNumericalContract;
+use flyingfish::h3::text_encoder::StreamedTextEncoder;
 use flyingfish::runtime::artifact::ArtifactStaging;
+use std::collections::HashMap;
+use tokenizers::Tokenizer;
+
+pub(crate) fn take_input(values: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
+    values
+        .remove(name)
+        .with_context(|| format!("input safetensors is missing {name}"))
+}
+
+pub(crate) fn sorted_tensor_names(values: &HashMap<String, Tensor>) -> Vec<String> {
+    let mut names = values.keys().cloned().collect::<Vec<_>>();
+    names.sort_unstable();
+    names
+}
 
 pub(super) fn run_encode_prompt(command: H3Command) -> Result<()> {
     let H3Command::EncodePrompt {

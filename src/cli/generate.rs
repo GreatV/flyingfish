@@ -1,23 +1,64 @@
-use super::denoise::{EvaluationCheckpointObserver, publish_t2va_checkpoint};
-use super::*;
-use flyingfish::{
-    h3::audio_vae::AudioVaeConfig,
-    h3::policy::ExecutionBackendPolicy,
-    h3::resources::{H3ResourceBudgetExt, ResourceDomain, format_bytes},
-    h3::video_vae::VideoVaeConfig,
-    runtime::artifact::{ArtifactStaging, FileStat, read_artifact_snapshot, sync_parent_directory},
-    runtime::frame_manifest::MAX_PNG_FRAME_SET_MANIFEST_JSON_BYTES,
-    runtime::probe::ResourceSnapshot,
-    runtime::storage::{RECOMMENDED_READ_AHEAD_BYTES, read_ahead_window},
+use super::H3Command;
+use super::checkpoint::resolve_component;
+use super::denoise::{
+    CliDenoiseObserver, EvaluationCheckpointObserver, publish_t2va_checkpoint,
+    report_h3_device_cache, resolve_execution_policy, select_resume_execution_policy,
+    validate_executable_policy,
 };
+use super::device_parse::parse_device;
+use super::output_hygiene::{
+    create_new_directory, ensure_new_output, mib_to_bytes, publish_png_frame_manifest,
+    publish_staged_bytes, resolve_output_outside_model, write_telemetry,
+};
+use super::prompt::{sorted_tensor_names, take_input};
+use super::qwen_numerical::{build_qwen_numerical_contract, validate_qwen_numerical_contract};
+use super::{
+    DEFAULT_FLASH_BACKEND_WORKSPACE_MIB, DEFAULT_NON_FLASH_BACKEND_WORKSPACE_MIB, H3AdmissionArgs,
+    H3ResourceArgs, OptionalWeightCacheArgs, build_transformer_options,
+    ensure_optional_output_is_distinct, resolve_optional_new_output,
+};
+use anyhow::{Context, Result, bail};
+use candle_core::{Device, Tensor, safetensors};
+use flyingfish::h3::audio_vae::AudioVaeConfig;
+use flyingfish::h3::audio_vae::{StreamedAudioVae, WavSampleFormat, write_wav};
+use flyingfish::h3::conditioning_provenance::H3ConditioningProvenance;
+use flyingfish::h3::config::TransformerConfig;
+use flyingfish::h3::model::{
+    StreamedTransformer, TransformerChunking, validate_h3_numerical_backend,
+};
+use flyingfish::h3::pipeline::{
+    T2vaExecutionOptions, T2vaLatents, T2vaSchedule, denoise_t2va_with_options_and_observer,
+};
+use flyingfish::h3::policy::ExecutionBackendPolicy;
+use flyingfish::h3::policy::{ExecutionPolicy, H3QwenNumericalContract};
+use flyingfish::h3::resources::{
+    H3ResourceBudgetExt, ResourceAssumptions, ResourceBudget, ResourceDomain, ResourceEstimate,
+    T2vaGeometry, format_bytes,
+};
+use flyingfish::h3::text_encoder::StreamedTextEncoder;
+use flyingfish::h3::video_vae::StreamedVideoVae;
+use flyingfish::h3::video_vae::VideoVaeConfig;
+use flyingfish::recovery::{CheckpointIdentity, PolicyHistory, take_t2va_checkpoint_metadata};
+use flyingfish::runtime::artifact::{
+    ArtifactStaging, FileStat, read_artifact_snapshot, sync_parent_directory,
+};
+use flyingfish::runtime::frame_manifest::{
+    MAX_PNG_FRAME_SET_MANIFEST_JSON_BYTES, PngFrameSetManifest,
+};
+use flyingfish::runtime::probe::ResourceSnapshot;
+use flyingfish::runtime::storage::{RECOMMENDED_READ_AHEAD_BYTES, read_ahead_window};
+use flyingfish::runtime::telemetry::TelemetryMonitor;
+use flyingfish::runtime::weights::{CachePolicy, ModelWeights, WeightSource};
+use rand::{SeedableRng, rngs::StdRng};
+use rand_distr::{Distribution, StandardNormal};
 use serde::{Deserialize, Serialize};
-use std::{
-    any::Any,
-    collections::BTreeMap,
-    fs,
-    sync::atomic::{AtomicU64, Ordering},
-    thread,
-};
+use std::any::Any;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use std::{fs, thread};
+use tokenizers::Tokenizer;
 
 const GENERATION_REQUEST_SCHEMA_VERSION: u32 = 1;
 const GENERATION_INITIALIZATION_SCHEMA_VERSION: u32 = 2;
@@ -26,6 +67,53 @@ const GENERATION_INITIALIZATION_FILE: &str = "generation-initialization.json";
 const GENERATION_READY_FILE: &str = "generation-ready";
 const EXECUTION_POLICY_FILE: &str = "execution-policy.json";
 const RESOURCE_SELECTION_FILE: &str = "resource-selection.json";
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_t2va_noise(
+    config: &TransformerConfig,
+    latent_frames: usize,
+    latent_height: usize,
+    latent_width: usize,
+    audio_frames: usize,
+    audio_channels: usize,
+    seed: u64,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let video_count = config
+        .in_channels
+        .checked_mul(latent_frames)
+        .and_then(|value| value.checked_mul(latent_height))
+        .and_then(|value| value.checked_mul(latent_width))
+        .context("video latent element count overflow")?;
+    let video_values = (0..video_count)
+        .map(|_| StandardNormal.sample(&mut rng))
+        .collect::<Vec<f32>>();
+    let video_latents = Tensor::from_vec(
+        video_values,
+        (
+            1,
+            config.in_channels,
+            latent_frames,
+            latent_height,
+            latent_width,
+        ),
+        device,
+    )?;
+    let audio_count = audio_channels
+        .checked_mul(config.audio_in_channels)
+        .and_then(|value| value.checked_mul(audio_frames))
+        .context("audio latent element count overflow")?;
+    let audio_values = (0..audio_count)
+        .map(|_| StandardNormal.sample(&mut rng))
+        .collect::<Vec<f32>>();
+    let audio_latents = Tensor::from_vec(
+        audio_values,
+        (audio_channels, config.audio_in_channels, audio_frames),
+        device,
+    )?;
+    Ok((video_latents, audio_latents))
+}
 
 /// A preflight rejected for capacity; only this becomes a refusal. It carries
 /// the observation that rejected the run, not just its text: a record naming
@@ -862,7 +950,7 @@ fn select_generation_resources(
         backend_workspace_mib,
     } = request;
     let transformer_dir = resolve_component(model, Path::new("transformer"))?;
-    super::promote_attention_backend_for_rows(
+    super::denoise::promote_attention_backend_for_rows(
         execution_policy,
         device.is_cuda(),
         // Row count only: the chunk fields play no part in it.
@@ -1782,7 +1870,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
 
     let transformer_dir = resolve_component(&model, Path::new("transformer"))?;
     let transformer_config = TransformerConfig::from_file(transformer_dir.join("config.json"))?;
-    super::promote_attention_backend_for_rows(
+    super::denoise::promote_attention_backend_for_rows(
         &mut execution_policy,
         device.is_cuda(),
         // Row count only: the chunk fields below do not take part in it.
@@ -2132,7 +2220,7 @@ fn preflight_generation(
             budget
                 .max_host_bytes
                 .context("unified generation preflight needs a host bound")?
-                .saturating_sub(super::device_residency_reserve_bytes(&snapshot)),
+                .saturating_sub(super::resource::device_residency_reserve_bytes(&snapshot)),
         );
     }
 
@@ -3038,8 +3126,13 @@ fn validate_existing_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::default_execution_policy;
     use candle_core::{DType, Shape, safetensors};
+    use flyingfish::h3::conditioning_provenance::ExternalPromptProvenance;
+    use flyingfish::h3::core::AttentionKeyChunkPolicy;
+    use flyingfish::h3::policy::H3QwenVisionLinearGeometry;
     use serde_json::json;
+    use std::num::NonZeroUsize;
     use std::{
         collections::HashMap,
         sync::{Arc, Barrier},

@@ -1,14 +1,12 @@
 //! `ff bench collective`.
 
-use super::{ensure_new_output, publish_staged_bytes};
+use super::output_hygiene::{ensure_new_output, publish_staged_bytes};
 use anyhow::{Context, Result, bail};
-use flyingfish::{
-    collective_benchmark::{
-        CollectiveBenchmarkOptions, CollectiveBenchmarkReport, CostModelBaseline, CostModelVerdict,
-        PointToPointReference, RankCountMeasurement, measure_collective_benchmark,
-    },
-    runtime::artifact::ArtifactStaging,
+use flyingfish::collective_benchmark::{
+    CollectiveBenchmarkOptions, CollectiveBenchmarkReport, CostModelBaseline, CostModelVerdict,
+    PointToPointReference, RankCountMeasurement, measure_collective_benchmark,
 };
+use flyingfish::runtime::artifact::ArtifactStaging;
 use std::path::PathBuf;
 
 pub(super) fn run_collective(

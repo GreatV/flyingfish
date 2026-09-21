@@ -1,5 +1,5 @@
-use super::{Command, parse_device};
-use anyhow::{Result, bail};
+use super::device_parse::parse_device;
+use anyhow::Result;
 use flyingfish::runtime::probe::{DeviceBackend, HardwareFingerprint, ResourceSnapshot};
 use serde::Serialize;
 
@@ -10,10 +10,7 @@ struct ProbeReport {
     snapshot: ResourceSnapshot,
 }
 
-pub(super) fn run_probe(command: Command) -> Result<()> {
-    let Command::Probe { device, json } = command else {
-        bail!("internal CLI dispatch mismatch for probe")
-    };
+pub(super) fn run_probe(device: String, json: bool) -> Result<()> {
     let device = parse_device(&device)?;
     let fingerprint = HardwareFingerprint::collect(&device);
     let report = ProbeReport {

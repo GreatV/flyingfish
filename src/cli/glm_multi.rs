@@ -1,6 +1,7 @@
 use anyhow::{Result, ensure};
 use clap::Args as ClapArgs;
-use std::{num::NonZeroUsize, path::PathBuf};
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
 #[derive(Debug, ClapArgs)]
 pub(super) struct Args {

@@ -1,24 +1,37 @@
-use super::*;
-use flyingfish::{
-    calibration::{
-        CalibrationCacheCondition, CalibrationReport, CalibrationSchedule,
-        CalibrationTimingProtocol, CalibrationTrialObservations, CalibrationTrialRequest,
-        CalibrationTrialRequestSpec, CalibrationTrialResult, T2vaLatentSummary,
-        validate_calibration_policy,
-    },
-    h3::policy::ExecutionBackendPolicy,
-    runtime::artifact::ArtifactStaging,
-    runtime::identity::{InputIdentity, WeakModelIdentity},
-    runtime::probe::{HardwareFingerprint, ResourceSnapshot},
-    runtime::telemetry::{process_wide_io_fault_delta, process_wide_io_fault_sample},
+use super::H3Command;
+use super::build_transformer_options;
+use super::checkpoint::resolve_component;
+use super::denoise::validate_executable_policy;
+use super::device_parse::parse_device;
+use super::output_hygiene::{
+    ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
 };
+use super::prompt::{sorted_tensor_names, take_input};
+use anyhow::{Context, Result, bail};
+use candle_core::{Device, safetensors};
+use flyingfish::calibration::{
+    CalibrationCacheCondition, CalibrationReport, CalibrationSchedule, CalibrationTimingProtocol,
+    CalibrationTrialObservations, CalibrationTrialRequest, CalibrationTrialRequestSpec,
+    CalibrationTrialResult, T2vaLatentSummary, validate_calibration_policy,
+};
+use flyingfish::h3::conditioning_provenance::H3ConditioningProvenance;
+use flyingfish::h3::model::StreamedTransformer;
+use flyingfish::h3::pipeline::{
+    T2vaExecutionOptions, T2vaSchedule, denoise_t2va_with_options_and_observer,
+};
+use flyingfish::h3::policy::ExecutionBackendPolicy;
+use flyingfish::h3::policy::ExecutionPolicy;
+use flyingfish::recovery::take_t2va_checkpoint_metadata;
+use flyingfish::runtime::artifact::ArtifactStaging;
+use flyingfish::runtime::identity::{InputIdentity, WeakModelIdentity};
+use flyingfish::runtime::probe::{HardwareFingerprint, ResourceSnapshot};
+use flyingfish::runtime::telemetry::{process_wide_io_fault_delta, process_wide_io_fault_sample};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeSet,
-    fs::File,
-    io::{Read, Write},
-    process::{Command as ProcessCommand, Stdio},
-};
+use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 
 const TRIAL_WORKER_REQUEST_SCHEMA_VERSION: u32 = 1;
 const TRIAL_WORKER_RESPONSE_SCHEMA_VERSION: u32 = 1;

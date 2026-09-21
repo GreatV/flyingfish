@@ -1,8 +1,12 @@
-use super::*;
-use flyingfish::edge0::{
-    config::{Edge0Config, chat_prompt},
-    model::{Edge0Text, configured_max_ctx},
-};
+use super::kit;
+use super::text_runtime::{TextDevice, greedy_token, resolve_text_device};
+use anyhow::{Context, Result, bail};
+use clap::Subcommand;
+use flyingfish::edge0::config::{Edge0Config, chat_prompt};
+use flyingfish::edge0::model::{Edge0Text, configured_max_ctx};
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use tokenizers::Tokenizer;
 
 #[derive(Debug, Subcommand)]
 pub(super) enum Edge0Command {
@@ -14,8 +18,8 @@ pub(super) enum Edge0Command {
         prompt: String,
         #[arg(long, default_value_t = NonZeroUsize::new(128).unwrap())]
         max_new_tokens: NonZeroUsize,
-        #[arg(long, default_value = "auto", help = "cpu, auto, or cuda:N")]
-        device: String,
+        #[command(flatten)]
+        device: kit::DeviceArgs,
         #[arg(
             long,
             help = "Upload the MoE expert set to the device; a capacity planner verifies it first"
@@ -32,6 +36,7 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
         device,
         resident_experts,
     } = command;
+    let kit::DeviceArgs { device } = device;
     let (device, auto) = resolve_text_device(&device)?;
     let config = Edge0Config::from_model_dir(&model_dir)?;
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))

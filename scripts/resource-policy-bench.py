@@ -141,7 +141,7 @@ def run_trial(root, binary, plan, pair, role, *, resource_policy='conservative',
     case = root / f'pair-{pair:02d}-{role}'
     case.mkdir()
     glm = plan['family'] == 'glm'
-    whole_h3 = not glm and plan['common_args'][:2] == ['h3', 'generate']
+    whole_h3 = not glm and plan['common_args'][:2] == ['video', 'generate']
     result_path = case / ('result.json' if glm else 'latents.safetensors')
     if whole_h3:
         result_path = case/'run'/'denoised-latents.safetensors'
@@ -251,7 +251,7 @@ def run(args):
     for key in ['common_args', 'baseline_args', 'candidate_args']:
         if not isinstance(plan[key], list) or any(not isinstance(x, str) for x in plan[key]):
             raise ValueError('arguments must be string arrays')
-    expected = [['glm','generate']] if plan['family']=='glm' else [['h3','denoise'],['h3','denoise-conditioned'],['h3','generate']]
+    expected = [['text','generate']] if plan['family']=='glm' else [['video','denoise'],['video','denoise-conditioned'],['video','generate']]
     if plan['common_args'][:2] not in expected:
         raise ValueError('unsupported benchmark command for this family')
     root = args.output.resolve()
@@ -300,7 +300,7 @@ def run(args):
         budget=good[0]['candidate']['policy']['expert_cache']['maximum_bound_bytes']
         if budget%(1024*1024):
             raise RuntimeError('CLI replay requires an integral MiB budget')
-        subprocess.run([str(binary),'glm','replay-routing','--trace',str(trace),'--output',str(replay),
+        subprocess.run([str(binary),'text','replay-routing','--adapter','glm','--trace',str(trace),'--output',str(replay),
                         '--segment-lengths','4,16','--cache-mib',str(budget//(1024*1024))],check=True,
                        stdout=(root/'replay.log').open('w'),stderr=subprocess.STDOUT)
         candidate['routing_trace']=file_ref(root,trace)

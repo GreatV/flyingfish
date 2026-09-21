@@ -1,5 +1,11 @@
-use super::*;
-use flyingfish::trellis::{clip::ClipModel, clip_text::ClipTokenizer};
+use super::WeightCacheArgs;
+use super::device_parse::parse_device;
+use anyhow::{Context, Result, bail};
+use candle_core::{Device, Tensor};
+use clap::Subcommand;
+use flyingfish::trellis::clip::ClipModel;
+use flyingfish::trellis::clip_text::ClipTokenizer;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Subcommand)]
 pub(super) enum ClipCommand {
