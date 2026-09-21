@@ -76,7 +76,7 @@ pub(super) enum Dsv41Command {
             help = "Reasoning budget: low, high, max, or an integer 1-100"
         )]
         reasoning_effort: String,
-        #[arg(long, default_value = "cuda:0")]
+        #[arg(long, default_value = "cpu")]
         device: String,
         #[command(flatten)]
         weights: WeightCacheArgs,
@@ -172,6 +172,11 @@ fn sample_token(logits: &Tensor, temperature: f64, top_p: f64, rng: &mut StdRng)
 }
 
 fn reject_unsupported_device(device: &str) -> Result<()> {
+    // auto lands on CPU here: nothing GPU-side is wired, so the automatic
+    // choice must resolve rather than fail.
+    if device == "auto" {
+        return Ok(());
+    }
     anyhow::ensure!(
         device == "cpu",
         "CUDA and Metal inference for dsv41 are not wired yet; pass --device cpu"
@@ -271,6 +276,34 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
                 config.text_config.max_position_embeddings
             );
             let max_seq = needed;
+            let telemetry_monitor = output
+                .telemetry_json
+                .as_ref()
+                .map(|_| {
+                    flyingfish::runtime::telemetry::TelemetryMonitor::start(
+                        Some(Device::Cpu),
+                        std::time::Duration::from_millis(250),
+                    )
+                })
+                .transpose()?;
+            {
+                let telemetry = output
+                    .telemetry_json
+                    .as_deref()
+                    .map(|path| resolve_output_outside_model(path, &model_dir))
+                    .transpose()?;
+                if let Some(telemetry) = &telemetry {
+                    ensure_new_output(telemetry, "telemetry output")?;
+                }
+                if let (Some(telemetry), Some(primary)) = (&telemetry, output.output.as_deref()) {
+                    let primary = resolve_output_outside_model(primary, &model_dir)?;
+                    anyhow::ensure!(
+                        telemetry != &primary,
+                        "telemetry output conflicts with the primary output: {}",
+                        telemetry.display()
+                    );
+                }
+            }
             let mut transformer = loader.load(Some(&tokenizer), max_seq)?;
             let device = Device::Cpu;
             let mut rng = StdRng::seed_from_u64(sampling.seed);
@@ -286,7 +319,14 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
                 let text = tokenizer
                     .decode(&[] as &[u32], true)
                     .map_err(|error| anyhow::anyhow!("decode output: {error}"))?;
-                emit_result(&output, &model_dir, &text, &[], sampling.temperature == 0.0)?;
+                emit_result(
+                    &output,
+                    &model_dir,
+                    &text,
+                    &[],
+                    sampling.temperature == 0.0,
+                    telemetry_monitor,
+                )?;
                 return Ok(());
             }
             let mut generated = vec![token];
@@ -310,7 +350,14 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
                 .decode(&generated, true)
                 .map_err(|error| anyhow::anyhow!("decode output: {error}"))?;
             let greedy = sampling.temperature == 0.0;
-            emit_result(&output, &model_dir, &text, &generated, greedy)
+            emit_result(
+                &output,
+                &model_dir,
+                &text,
+                &generated,
+                greedy,
+                telemetry_monitor,
+            )
         }
         Dsv41Command::CaptureParity {
             model: model_dir,
@@ -397,6 +444,7 @@ fn emit_result(
     text: &str,
     generated: &[u32],
     greedy: bool,
+    telemetry_monitor: Option<flyingfish::runtime::telemetry::TelemetryMonitor>,
 ) -> Result<()> {
     let telemetry_path = output
         .telemetry_json
@@ -430,12 +478,8 @@ fn emit_result(
     } else {
         println!("{rendered}");
     }
-    if let Some(path) = telemetry_path {
-        let report = flyingfish::runtime::telemetry::TelemetryMonitor::start(
-            Some(Device::Cpu),
-            std::time::Duration::from_millis(250),
-        )?
-        .finish()?;
+    if let (Some(path), Some(monitor)) = (telemetry_path, telemetry_monitor) {
+        let report = monitor.finish()?;
         let bytes = serde_json::to_vec_pretty(&report)?;
         let staging = flyingfish::runtime::artifact::ArtifactStaging::new(&path)
             .with_context(|| format!("failed to stage dsv41 telemetry {}", path.display()))?;

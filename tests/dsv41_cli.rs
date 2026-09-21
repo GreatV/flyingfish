@@ -776,3 +776,101 @@ fn dsv41_capture_parity_publishes_atomically_and_never_clobbers() {
             .starts_with(".ff-stage")
     }));
 }
+
+#[test]
+fn dsv41_default_invocations_run_without_an_explicit_device() {
+    let root = tempfile::tempdir().unwrap();
+    write_fixture(root.path());
+    let model = root.path().join("DeepSeek-V4.1-mini");
+    let generate = ff()
+        .args(["text", "generate", "--adapter", "dsv41"])
+        .arg("--model")
+        .arg(&model)
+        .args(["--prompt", "tok1 tok2", "--max-new-tokens", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        generate.status.success(),
+        "bare generate failed: {}",
+        String::from_utf8_lossy(&generate.stderr)
+    );
+    let capture = root.path().join("parity.safetensors");
+    let parity = ff()
+        .args(["text", "capture-parity", "--adapter", "dsv41"])
+        .arg("--model")
+        .arg(&model)
+        .args(["--prompt", "tok1 tok2"])
+        .arg("--output")
+        .arg(&capture)
+        .output()
+        .unwrap();
+    assert!(
+        parity.status.success(),
+        "bare capture-parity failed: {}",
+        String::from_utf8_lossy(&parity.stderr)
+    );
+    assert!(capture.is_file());
+}
+
+#[test]
+fn dsv41_rejects_a_telemetry_path_identical_to_the_output() {
+    let root = tempfile::tempdir().unwrap();
+    write_fixture(root.path());
+    let model = root.path().join("DeepSeek-V4.1-mini");
+    let same = root.path().join("out.bin");
+    let output = ff()
+        .args(["text", "generate", "--adapter", "dsv41"])
+        .arg("--model")
+        .arg(&model)
+        .args([
+            "--prompt",
+            "tok1",
+            "--device",
+            "cpu",
+            "--max-new-tokens",
+            "1",
+        ])
+        .arg("--output")
+        .arg(&same)
+        .arg("--telemetry-json")
+        .arg(&same)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conflicts with the primary output"),
+        "{stderr}"
+    );
+    assert!(!same.exists(), "no partial artifact may appear");
+}
+
+#[test]
+fn dsv41_telemetry_is_written_even_for_an_immediate_eos() {
+    let root = tempfile::tempdir().unwrap();
+    write_fixture_with_biased_eos(root.path());
+    let model = root.path().join("DeepSeek-V4.1-mini");
+    let telemetry = root.path().join("telemetry.json");
+    let output = ff()
+        .args(["text", "generate", "--adapter", "dsv41"])
+        .arg("--model")
+        .arg(&model)
+        .args([
+            "--prompt",
+            "tok1 tok2",
+            "--temperature",
+            "0",
+            "--max-new-tokens",
+            "4",
+        ])
+        .arg("--telemetry-json")
+        .arg(&telemetry)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(telemetry.is_file(), "telemetry sidecar missing");
+}

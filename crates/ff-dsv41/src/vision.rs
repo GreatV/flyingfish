@@ -82,19 +82,18 @@ fn apply_half_rotary(
     cos: &[f32],
     sin: &[f32],
 ) {
-    // The per-token angle row spans rope_dim = cos.len() channels; each head
-    // rotates that span of its own channels, split into halves.
-    let span = cos.len();
-    let half = span / 2;
+    // The angle row spans rope_dim = cos.len() channels; the head's front
+    // half pairs with its back half across the full set of angles.
+    let rope = cos.len();
     for head in 0..heads {
         let base = token * heads * head_dim + head * head_dim;
-        for d in 0..half {
+        for d in 0..rope {
             let x1 = values[base + d];
-            let x2 = values[base + half + d];
+            let x2 = values[base + rope + d];
             let c = cos[d];
             let s = sin[d];
             values[base + d] = x1 * c - x2 * s;
-            values[base + half + d] = x2 * c + x1 * s;
+            values[base + rope + d] = x2 * c + x1 * s;
         }
     }
 }
@@ -185,7 +184,9 @@ impl VisionTower {
         let hidden = self.config.hidden_size;
         let heads = self.config.num_attention_heads;
         let head_dim = hidden / heads;
-        let patch_width = dims[2];
+        // One patch row spans every channel axis: [tokens, 3, p*p] flattens
+        // to rows of dims[1] * dims[2] features.
+        let patch_width = dims[1] * dims[2];
         let tokens = patch_values.len() / patch_width;
         let mut values = Vec::with_capacity(tokens * hidden);
         for token in 0..tokens {
@@ -403,6 +404,79 @@ mod tests {
         let token = 5;
         assert!((cos_values[token * 4] - 1.0f64.cos() as f32).abs() < 1e-4);
         assert!((cos_values[token * 4 + 2] - 2.0f64.cos() as f32).abs() < 1e-4);
+    }
+
+    #[test]
+    fn patch_projection_covers_every_channel_per_patch() {
+        let device = candle_core::Device::Cpu;
+        let hidden = 12;
+        let config = crate::config::VisionConfig {
+            num_hidden_layers: 0,
+            hidden_size: hidden,
+            num_attention_heads: 2,
+            intermediate_size: 8,
+            patch_size: 2,
+            rope_theta: 100.0,
+            downsample_ratio: 1,
+            max_image_tokens: 64,
+            min_pixels: 16,
+            max_wh_ratio: None,
+        };
+        let mut weight = vec![0.0f32; hidden * 3 * 4];
+        // Row r responds only to channel r/4 of the flattened patch row, so
+        // the output exposes which input channels each row consumed.
+        for row in 0..hidden {
+            weight[row * 12 + (row / 4) * 4] = 1.0;
+        }
+        let tower = VisionTower {
+            config,
+            patch_weight: Tensor::from_vec(weight, (hidden, 12), &device).unwrap(),
+            patch_bias: Tensor::zeros(hidden, DType::F32, &device).unwrap(),
+            blocks: vec![],
+            norm_weight: Tensor::ones(hidden, DType::F32, &device).unwrap(),
+        };
+        // Three patches of [3 channels, 2x2]: distinct channel values.
+        let mut patches = vec![0.0f32; 3 * 3 * 4];
+        for patch in 0..3 {
+            for channel in 0..3 {
+                for inner in 0..4 {
+                    patches[patch * 12 + channel * 4 + inner] =
+                        (patch + 1) as f32 * 10.0 + channel as f32 + inner as f32 * 0.1;
+                }
+            }
+        }
+        let patches = Tensor::from_vec(patches, (3, 3, 4), &device).unwrap();
+        let output = tower.forward(&patches, 1, 3).unwrap();
+        // One row per patch; the wrong width (dims[2] alone) would triple
+        // the token count.
+        assert_eq!(output.dims(), [3, hidden]);
+        let values = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // Patch 0's rows carry only channel values <= 2.x; patch 3's channel
+        // values start at 30 — a projection reading only p*p of the row
+        // would mix patches into every row.
+        let first = &values[..hidden];
+        assert!(
+            first.iter().all(|value| *value < 5.0),
+            "patch 0 leaked later patches: {first:?}"
+        );
+    }
+
+    #[test]
+    fn half_rotary_pairs_head_halves_across_all_angles() {
+        // With identity angles (cos 1, sin 0) the rotation is the identity
+        // whatever the pairing; use a 90-degree angle in the second slot to
+        // expose the pairing: channel 0 pairs with channel rope+0 only.
+        let mut values = vec![1.0f32, 2.0, 3.0, 4.0];
+        let head_dim = 4usize;
+        let cos = vec![1.0f32, 0.0];
+        let sin = vec![0.0f32, 1.0];
+        apply_half_rotary(&mut values, 0, 1, head_dim, &cos, &sin);
+        // Slot 0 (angle 0): pair (v0,v2)=(1,3) unchanged; slot 1 (90 deg):
+        // (v1,v3)=(2,4) -> (-4, 2). A same-half pairing would touch (1,2).
+        assert_eq!(values[0], 1.0);
+        assert_eq!(values[2], 3.0);
+        assert_eq!(values[1], -4.0);
+        assert_eq!(values[3], 2.0);
     }
 
     #[test]

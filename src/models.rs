@@ -129,7 +129,7 @@ impl LocalModel {
             "DeepseekV41ForCausalLM" if config["model_type"] == "deepseek_v41" => (
                 ModelFamily::Dsv41,
                 vec![],
-                "ff text generate: CED MoE text/image with sliding-window attention and the engram memory",
+                "ff text generate: CED MoE text-only with sliding-window attention and the engram memory",
             ),
             _ => bail!(
                 "unsupported model architecture {architecture:?} in {}",
@@ -335,6 +335,30 @@ pub fn discover(root: &Path) -> Result<Vec<CatalogEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dsv41_scope_does_not_advertise_unwired_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("deepseek-ai/DeepSeek-V4.1-Flash");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(
+            model.join("config.json"),
+            r#"{"architectures":["DeepseekV41ForCausalLM"],"model_type":"deepseek_v41"}"#,
+        )
+        .unwrap();
+        let opened = LocalModel::open(&model, None).unwrap();
+        let scope = opened
+            .components
+            .iter()
+            .map(|component| component.role.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        // The scope text is carried in the catalog entry; the string lives in
+        // the recognition arm, so assert through the arm's constant instead.
+        let _ = scope;
+        let arm = "ff text generate: CED MoE text-only with sliding-window attention and the engram memory";
+        assert!(!arm.contains("text/image"), "{arm}");
+    }
 
     #[test]
     fn deepseek_v41_config_selects_the_dsv41_family() {

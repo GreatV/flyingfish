@@ -207,6 +207,8 @@ pub fn indexer_forward(
     compress_ratio: usize,
     index_k: &Tensor,
     candidates: Option<&Tensor>,
+    freqs: &Tensor,
+    rope_head_dim: usize,
 ) -> Result<(Tensor, Tensor)> {
     let dims = x.dims();
     ensure!(dims.len() == 3, "indexer input must be [batch, seq, dim]");
@@ -231,12 +233,25 @@ pub fn indexer_forward(
     let k_positions = keys.len() / (batch * index_head_dim);
     let mut queries = Vec::with_capacity(batch * seqlen * index_heads * index_head_dim);
     for token in 0..batch * seqlen {
-        let projected = linear_rows(
+        let mut projected = linear_rows(
             wq_b,
             &qr_values[token * qlora..(token + 1) * qlora],
             index_heads * index_head_dim,
             qlora,
         )?;
+        // Queries rotate at their own positions before quantization, sharing
+        // the layer's rotary table (model.py:546-547).
+        let position = start_pos + token % seqlen;
+        apply_rotary_slice(
+            &mut projected,
+            1,
+            index_heads,
+            index_head_dim,
+            freqs,
+            position,
+            rope_head_dim,
+            false,
+        );
         queries.extend(projected);
     }
     let query_tensor = quantize_indexer(
@@ -574,6 +589,8 @@ impl AttentionCore {
                     } else {
                         None
                     },
+                    &self.freqs,
+                    rope_head_dim,
                 )?;
                 if candidate_source {
                     runtime.candidates = Some(select_candidate_blocks(
@@ -806,10 +823,14 @@ pub fn greedy_token_from_logits(logits: &Tensor) -> Result<u32> {
         .context("read logits")?;
     let vocab = *dims.last().expect("checked above");
     let tail = &values[values.len() - vocab..];
+    ensure!(
+        tail.iter().all(|value| value.is_finite()),
+        "model produced non-finite logits"
+    );
     let best = tail
         .iter()
         .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
         .context("empty logits")?;
     Ok(best.0 as u32)
 }
@@ -932,6 +953,81 @@ mod tests {
     }
 
     #[test]
+    fn indexer_queries_rotate_at_their_positions_before_scoring() {
+        let device = Device::Cpu;
+        let hidden = 32usize;
+        let qlora = 16usize;
+        let x = Tensor::from_vec(
+            (0..2 * hidden)
+                .map(|index| (index % 5) as f32 / 31.0)
+                .collect(),
+            (1, 2, hidden),
+            &device,
+        )
+        .unwrap();
+        let qr = Tensor::ones((1, 2, qlora), DType::F32, &device).unwrap();
+        // One head, head_dim 32, one rope pair in the last two channels: the
+        // projection pins that pair to (1, 0); the two keys disagree on the
+        // sign of channel 30, so the winning pick flips exactly when the
+        // angle flips. All non-rope channels stay zero.
+        let wq_b = {
+            let mut values = vec![0.0f32; 32 * qlora];
+            values[30 * qlora] = 1.0;
+            Tensor::from_vec(values, (32, qlora), &device).unwrap()
+        };
+        let weights_proj = Tensor::from_vec(vec![0.5f32; hidden], (1, hidden), &device).unwrap();
+        let mut key_values = vec![0.0f32; 2 * 32];
+        key_values[30] = 1.0;
+        key_values[32 + 30] = -1.0;
+        let index_k = Tensor::from_vec(key_values, (1, 2, 32), &device).unwrap();
+        let freqs = |flip: bool| {
+            let angle = if flip { std::f32::consts::PI } else { 0.0f32 };
+            Tensor::from_vec(
+                [angle.cos(), angle.sin()]
+                    .iter()
+                    .cycle()
+                    .take(16)
+                    .copied()
+                    .collect::<Vec<f32>>(),
+                (4, 1, 2),
+                &device,
+            )
+            .unwrap()
+        };
+        let run = |flip: bool| {
+            // Decode position: the causal visibility mask then allows every
+            // key, so the pick reflects the score sign alone.
+            let (idxs, _) = indexer_forward(
+                &x,
+                &qr,
+                None,
+                1,
+                4,
+                &wq_b,
+                &weights_proj,
+                1,
+                32,
+                1,
+                1,
+                &index_k,
+                None,
+                &freqs(flip),
+                2,
+            )
+            .unwrap();
+            idxs.flatten_all().unwrap().to_vec1::<i64>().unwrap()
+        };
+        let identity = run(false);
+        let flipped = run(true);
+        assert!(
+            identity != flipped,
+            "picks identical across flipped angles: {identity:?}"
+        );
+        assert_eq!(identity[0], 4, "identity angles pick key 0: {identity:?}");
+        assert_eq!(flipped[0], 5, "flipped angles pick key 1: {flipped:?}");
+    }
+
+    #[test]
     fn candidate_consumers_mask_by_the_published_mask() {
         let device = Device::Cpu;
         let hidden = 32usize;
@@ -958,6 +1054,8 @@ mod tests {
         // flip the top pick to position 0 — the mask steers selection, and a
         // consumer that recomputed its own candidates would ignore it.
         let index_k = Tensor::zeros((1, 2, 32), DType::F32, &device).unwrap();
+        let freqs =
+            crate::math::precompute_freqs_cis(8, 8, 0, 1600.0, 1.0, 32, 1, &device).unwrap();
         let open = Tensor::from_vec(vec![1u8; 4 * 2], (1, 4, 2), &device).unwrap();
         let mut masked = vec![1u8; 4 * 2];
         for row in masked.chunks_mut(2) {
@@ -978,6 +1076,8 @@ mod tests {
             2,
             &index_k,
             Some(&open),
+            &freqs,
+            8,
         )
         .unwrap();
         let open_picks = open_picks.flatten_all().unwrap().to_vec1::<i64>().unwrap();
@@ -995,6 +1095,8 @@ mod tests {
             2,
             &index_k,
             Some(&masked),
+            &freqs,
+            8,
         )
         .unwrap();
         let masked_picks = masked_picks
@@ -1406,6 +1508,14 @@ mod tests {
         assert_eq!(values[0], 1.0);
         assert_eq!(values[1], 0.0);
         assert_eq!(values[4], 1.0);
+    }
+
+    #[test]
+    fn greedy_selection_rejects_non_finite_logits() {
+        let device = candle_core::Device::Cpu;
+        let logits = Tensor::from_vec(vec![1.0f32, f32::NAN, 2.0], (1, 3), &device).unwrap();
+        let error = greedy_token_from_logits(&logits).unwrap_err();
+        assert!(error.to_string().contains("non-finite"), "{error:#}");
     }
 
     #[test]
