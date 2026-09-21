@@ -212,10 +212,6 @@ pub struct Transformer {
     pub norm_weight: Tensor,
     pub head: Tensor,
     pub ngram: Option<NgramHashState>,
-    // Flattened views of the vocabulary tables, materialized once rather
-    // than on every forward.
-    pub embed_flat: Option<Vec<f32>>,
-    pub head_flat: Option<Vec<f32>>,
 }
 
 impl Transformer {
@@ -246,15 +242,8 @@ impl Transformer {
             .flatten_all()?
             .to_vec1::<u32>()
             .context("read input ids")?;
-        if self.embed_flat.is_none() {
-            self.embed_flat = Some(
-                self.embed
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?,
-            );
-        }
-        let table = self.embed_flat.as_ref().expect("just materialized");
+        let (embed_guard, _) = crate::math::resident_f32(&self.embed)?;
+        let table = crate::math::resident_f32_slice(&embed_guard)?;
         let mut embedded = Vec::with_capacity(ids.len() * hidden);
         for id in &ids {
             ensure!(*id < self.params.vocab as u32, "token id {id} out of range");
@@ -310,15 +299,8 @@ impl Transformer {
         let collapsed = hc_pre(&stream, &pre_mix)?;
         let normed = rms_norm(&collapsed, &self.norm_weight, self.params.norm_eps)?;
         let last = normed.narrow(1, seq - 1, 1)?;
-        if self.head_flat.is_none() {
-            self.head_flat = Some(
-                self.head
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?,
-            );
-        }
-        let head = self.head_flat.as_ref().expect("just materialized");
+        let (head_guard, _) = crate::math::resident_f32(&self.head)?;
+        let head = crate::math::resident_f32_slice(&head_guard)?;
         ensure!(
             head.len() == self.params.vocab * hidden,
             "head must be [vocab, hidden]"
@@ -477,8 +459,6 @@ mod tests {
             candidate_source: false,
         };
         let mut transformer = Transformer {
-            embed_flat: None,
-            head_flat: None,
             params,
             embed: ones(params.vocab, hidden, &device),
             blocks: vec![block(0, false, false), block(2, true, true)],

@@ -236,11 +236,12 @@ pub fn indexer_forward(
         .to_vec1::<f32>()
         .context("read index keys")?;
     let k_positions = keys.len() / (batch * index_head_dim);
-    let wq_b = wq_b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let (wq_b_guard, _) = crate::math::resident_f32(wq_b)?;
+    let wq_b = crate::math::resident_f32_slice(&wq_b_guard)?;
     let mut queries = Vec::with_capacity(batch * seqlen * index_heads * index_head_dim);
     for token in 0..batch * seqlen {
         let mut projected = linear_rows_from_slice(
-            &wq_b,
+            wq_b,
             &qr_values[token * qlora..(token + 1) * qlora],
             index_heads * index_head_dim,
             qlora,
@@ -403,30 +404,24 @@ impl AttentionCore {
             .context("read attention input")?;
 
         let qlora = self.wq_a.dims()[0];
-        let wq_a = self
-            .wq_a
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
+        let (wq_a_guard, _) = crate::math::resident_f32(&self.wq_a)?;
+        let wq_a = crate::math::resident_f32_slice(&wq_a_guard)?;
         let mut qr = Vec::with_capacity(batch * seqlen * qlora);
         for token in 0..batch * seqlen {
             let projected = linear_rows_from_slice(
-                &wq_a,
+                wq_a,
                 &x_values[token * hidden..(token + 1) * hidden],
                 qlora,
                 hidden,
             );
             qr.extend(rms_norm_slice(&projected, &self.q_norm, self.norm_eps));
         }
-        let wq_b = self
-            .wq_b
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
+        let (wq_b_guard, _) = crate::math::resident_f32(&self.wq_b)?;
+        let wq_b = crate::math::resident_f32_slice(&wq_b_guard)?;
         let mut q = Vec::with_capacity(batch * seqlen * heads * head_dim);
         for token in 0..batch * seqlen {
             let projected = linear_rows_from_slice(
-                &wq_b,
+                wq_b,
                 &qr[token * qlora..(token + 1) * qlora],
                 heads * head_dim,
                 qlora,
@@ -446,15 +441,12 @@ impl AttentionCore {
 
         // Window KV: shared latent, normalized, rotated, FP8-round-tripped,
         // written into the ring.
-        let wkv = self
-            .wkv
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
+        let (wkv_guard, _) = crate::math::resident_f32(&self.wkv)?;
+        let wkv = crate::math::resident_f32_slice(&wkv_guard)?;
         let mut window = Vec::with_capacity(batch * seqlen * head_dim);
         for token in 0..batch * seqlen {
             let projected = linear_rows_from_slice(
-                &wkv,
+                wkv,
                 &x_values[token * hidden..(token + 1) * hidden],
                 head_dim,
                 hidden,
@@ -735,13 +727,8 @@ impl AttentionCore {
         let group_heads = heads / o_groups;
         let group_width = group_heads * head_dim;
         let mut collapsed = Vec::with_capacity(batch * seqlen * o_groups * o_lora_rank);
-        let wo_a = self
-            .wo_a
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?
-            .to_vec();
-        let _ = &wo_a;
+        let (wo_a_guard, _) = crate::math::resident_f32(&self.wo_a)?;
+        let wo_a = crate::math::resident_f32_slice(&wo_a_guard)?;
         for token in 0..batch * seqlen {
             for group in 0..o_groups {
                 for rank in 0..o_lora_rank {
@@ -757,14 +744,11 @@ impl AttentionCore {
             }
         }
         let mut projected = Vec::with_capacity(batch * seqlen * hidden);
-        let wo_b = self
-            .wo_b
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
+        let (wo_b_guard, _) = crate::math::resident_f32(&self.wo_b)?;
+        let wo_b = crate::math::resident_f32_slice(&wo_b_guard)?;
         for token in 0..batch * seqlen {
             projected.extend(linear_rows_from_slice(
-                &wo_b,
+                wo_b,
                 &collapsed[token * o_groups * o_lora_rank..(token + 1) * o_groups * o_lora_rank],
                 hidden,
                 o_groups * o_lora_rank,

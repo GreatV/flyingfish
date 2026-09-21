@@ -337,11 +337,8 @@ pub fn engram_forward(
         .flatten_all()?
         .to_vec1::<f32>()
         .context("read engram embeddings")?;
-    let wkv = wkv
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()
-        .context("read engram wkv")?;
+    let (wkv_guard, _) = crate::math::resident_f32(wkv)?;
+    let wkv = crate::math::resident_f32_slice(&wkv_guard)?;
     let q_weight = q_weight
         .to_dtype(DType::F32)?
         .flatten_all()?

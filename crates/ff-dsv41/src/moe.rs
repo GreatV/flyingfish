@@ -138,21 +138,12 @@ impl Expert {
             .flatten_all()?
             .to_vec1::<f32>()
             .context("read expert input")?;
-        let w1 = self
-            .w1
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let w2 = self
-            .w2
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let w3 = self
-            .w3
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
+        let (w1_guard, _) = crate::math::resident_f32(&self.w1)?;
+        let w1 = crate::math::resident_f32_slice(&w1_guard)?;
+        let (w2_guard, _) = crate::math::resident_f32(&self.w2)?;
+        let w2 = crate::math::resident_f32_slice(&w2_guard)?;
+        let (w3_guard, _) = crate::math::resident_f32(&self.w3)?;
+        let w3 = crate::math::resident_f32_slice(&w3_guard)?;
         let limit = self.swiglu_limit as f32;
         let mut output = vec![0.0f32; tokens * hidden];
         for (token, &weight) in weights.iter().enumerate() {

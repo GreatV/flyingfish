@@ -8,6 +8,29 @@
 use anyhow::{Context, Result, ensure};
 use candle_core::{DType, Tensor};
 
+/// A read guard over a resident tensor's storage; keeps the pages borrowed
+/// while a slice is read from them instead of copying the tensor to a Vec.
+pub type StorageGuard<'a> = std::sync::RwLockReadGuard<'a, candle_core::Storage>;
+
+/// Borrow a resident tensor without materializing it. The projection must be
+/// CPU-resident, contiguous, and F32 (every loader-built weight is).
+pub fn resident_f32(tensor: &Tensor) -> Result<(StorageGuard<'_>, usize)> {
+    let (guard, layout) = tensor.storage_and_layout();
+    anyhow::ensure!(
+        layout.is_contiguous() && layout.start_offset() == 0,
+        "resident projection must be contiguous"
+    );
+    Ok((guard, layout.shape().elem_count()))
+}
+
+/// The F32 slice behind a guard from `resident_f32`.
+pub fn resident_f32_slice<'a>(guard: &'a StorageGuard<'_>) -> Result<&'a [f32]> {
+    let candle_core::Storage::Cpu(cpu) = &**guard else {
+        anyhow::bail!("resident projection is not CPU storage")
+    };
+    cpu.as_slice::<f32>().map_err(anyhow::Error::from)
+}
+
 pub const FP8_MAX: f32 = 448.0;
 pub const FP4_MAX: f32 = 6.0;
 

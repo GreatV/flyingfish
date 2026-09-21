@@ -411,9 +411,8 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             let effort = flyingfish::dsv41::encoding::ReasoningEffort::parse(&reasoning_effort)
                 .map_err(|error| anyhow::anyhow!(error))?;
             let loader = TransformerLoader::open(&model_dir)?;
-            admit_resident_footprint(&loader)?;
             let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
-                .map_err(|error| anyhow::anyhow!("load tokenizer: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("tokenize prompt: {error}"))?;
             let encoded = flyingfish::dsv41::encoding::chat_prompt(&prompt, None, true, effort);
             let ids = tokenizer
                 .encode(encoded, false)
@@ -439,6 +438,15 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             );
             // A single prefill only needs the prompt's own span; sizing the
             // state to a user-supplied context limit can allocate for nothing.
+            // Admission charges the capture itself too: one F32 hc stream per
+            // block plus the serialization buffer of about the same size.
+            let config = loader.config();
+            let snapshot_bytes = config.text_config.num_hidden_layers as u64
+                * ids.len() as u64
+                * config.text_config.hc_mult as u64
+                * config.text_config.hidden_size as u64
+                * 4;
+            admit_resident_footprint_with(&loader, 2 * snapshot_bytes)?;
             let output = resolve_output_outside_model(&output, &model_dir)?;
             ensure_new_output(&output, "parity capture output")?;
             let parent = output.parent().unwrap_or(std::path::Path::new("."));
@@ -550,7 +558,14 @@ fn emit_result(
 
 /// Refuse loudly when the dequantized resident set cannot fit this host.
 fn admit_resident_footprint(loader: &TransformerLoader) -> Result<()> {
-    let needed = loader.resident_f32_bytes()?;
+    admit_resident_footprint_with(loader, 0)
+}
+
+fn admit_resident_footprint_with(loader: &TransformerLoader, workspace_bytes: u64) -> Result<()> {
+    let needed = loader
+        .resident_f32_bytes()?
+        .checked_add(workspace_bytes)
+        .context("resident footprint estimate overflows u64")?;
     let host = host_available_bytes("/proc/meminfo")?;
     // meminfo is host-wide; a cgroup-v2 container may hold a smaller budget.
     let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&Device::Cpu));
