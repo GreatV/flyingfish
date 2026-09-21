@@ -1,4 +1,4 @@
-use crate::cli::*;
+use crate::cli::trellis;
 
 #[derive(Debug, Subcommand)]
 pub(in crate::cli) enum TrellisCommand {
@@ -72,7 +72,11 @@ impl TrellisCommand {
 }
 
 use super::{Adapter, Task};
-use clap::FromArgMatches;
+use crate::cli::trellis_generate;
+use anyhow::Result;
+use clap::{FromArgMatches, Subcommand};
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
 pub(super) const ADAPTER: Adapter = Adapter {
     id: "trellis",

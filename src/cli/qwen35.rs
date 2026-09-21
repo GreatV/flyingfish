@@ -1,10 +1,14 @@
-use super::*;
-use flyingfish::qwen35::{
-    config::{Qwen35Config, chat_prompt, chat_prompt_with_image},
-    model::Qwen35Text,
-    vision::{self, VisionGrid},
-    weights::Qwen35Weights,
-};
+use super::kit;
+use super::text_runtime::{TextDevice, greedy_token, resolve_text_device};
+use anyhow::{Context, Result, bail};
+use clap::Subcommand;
+use flyingfish::qwen35::config::{Qwen35Config, chat_prompt, chat_prompt_with_image};
+use flyingfish::qwen35::model::Qwen35Text;
+use flyingfish::qwen35::vision::{self, VisionGrid};
+use flyingfish::qwen35::weights::Qwen35Weights;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use tokenizers::Tokenizer;
 
 /// The attn_scores CUDA kernel's shared-memory bound.
 const GPU_CONTEXT_CAP: usize = 8192;
@@ -24,8 +28,8 @@ pub(super) enum Qwen35Command {
         image: Option<PathBuf>,
         #[arg(long, default_value_t = NonZeroUsize::new(128).unwrap())]
         max_new_tokens: NonZeroUsize,
-        #[arg(long, default_value = "auto", help = "cpu, auto, or cuda:N[,M...]")]
-        device: String,
+        #[command(flatten)]
+        device: kit::DeviceArgs,
     },
 }
 
@@ -37,6 +41,7 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
         max_new_tokens,
         device,
     } = command;
+    let kit::DeviceArgs { device } = device;
     let (device, auto) = resolve_text_device(&device)?;
     let config = Qwen35Config::from_model_dir(&model_dir)?;
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))

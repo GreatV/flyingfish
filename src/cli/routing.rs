@@ -2,11 +2,33 @@
 
 use super::adapters::{Adapter, BUILTINS, Metadata, Task};
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Arg, Command, CommandFactory, FromArgMatches};
-use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
+use clap::{Arg, ArgAction, Command, CommandFactory, FromArgMatches};
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
 
 pub(super) struct Registry<'a> {
     adapters: &'a [Adapter],
+}
+
+/// Task routing's view of argv before any one adapter's schema is chosen.
+#[derive(Default)]
+struct PreArgs {
+    help: bool,
+    adapters: Vec<OsString>,
+    models: Vec<OsString>,
+    operation: Option<OsString>,
+}
+
+/// The single definition of the routed `--adapter` flag.
+fn adapter_argument(ids: &[&'static str]) -> Arg {
+    Arg::new("adapter")
+        .long("adapter")
+        .value_name("ADAPTER")
+        .global(true)
+        .action(ArgAction::Append)
+        .value_parser(clap::builder::PossibleValuesParser::new(ids.to_vec()))
+        .help("Select a model adapter explicitly; otherwise detect from --model")
 }
 
 impl<'a> Registry<'a> {
@@ -20,13 +42,97 @@ impl<'a> Registry<'a> {
             .filter(move |adapter| adapter.task == task)
     }
 
+    /// Parse with every provider flag declared so unknown-to-routing options keep
+    /// their arity and cannot swallow `--model` or `--adapter` values. Only the
+    /// router's own arguments are read; provider values are collected as raw
+    /// `OsString`s and never interpreted.
+    fn pre_parse(&self, task: Task, args: &[OsString]) -> PreArgs {
+        let providers = self.for_task(task).collect::<Vec<_>>();
+        let ids = providers
+            .iter()
+            .map(|adapter| adapter.id)
+            .collect::<Vec<_>>();
+        let mut command = Command::new(task.name())
+            .ignore_errors(true)
+            .disable_help_flag(true)
+            .arg(adapter_argument(&ids).value_parser(clap::builder::OsStringValueParser::new()))
+            .arg(
+                Arg::new("model")
+                    .long("model")
+                    .action(ArgAction::Append)
+                    .value_parser(clap::builder::OsStringValueParser::new()),
+            )
+            .arg(
+                Arg::new("help")
+                    .long("help")
+                    .short('h')
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("operation")
+                    .num_args(1)
+                    .value_parser(clap::builder::OsStringValueParser::new()),
+            );
+        for provider in &providers {
+            for operation in (provider.command)().get_subcommands() {
+                for source in operation.get_arguments() {
+                    let Some(long) = source.get_long() else {
+                        continue;
+                    };
+                    if long == "model" || long == "adapter" {
+                        continue;
+                    }
+                    if command
+                        .get_arguments()
+                        .any(|known| known.get_long() == Some(long))
+                    {
+                        continue;
+                    }
+                    let mut arg = Arg::new(format!("pre_{long}"))
+                        .long(long.to_owned())
+                        .action(source.get_action().clone())
+                        .value_parser(clap::builder::OsStringValueParser::new());
+                    if let Some(count) = source.get_num_args() {
+                        arg = arg.num_args(count);
+                    }
+                    command = command.arg(arg);
+                }
+            }
+        }
+        let Ok(matches) = command.try_get_matches_from(
+            std::iter::once(OsString::from("ff")).chain(args.iter().cloned()),
+        ) else {
+            return PreArgs::default();
+        };
+        PreArgs {
+            help: matches.get_flag("help"),
+            adapters: matches
+                .get_many("adapter")
+                .map(|values| values.cloned().collect())
+                .unwrap_or_default(),
+            models: matches
+                .get_many("model")
+                .map(|values| values.cloned().collect())
+                .unwrap_or_default(),
+            operation: matches.get_one::<OsString>("operation").cloned(),
+        }
+    }
+
     fn select(&self, task: Task, args: &[OsString]) -> Result<Option<&'a Adapter>> {
-        let explicit = option_value(args, "--adapter");
-        let model = option_value(args, "--model").map(PathBuf::from);
-        let help = args.iter().any(|arg| arg == "--help" || arg == "-h");
+        let pre = self.pre_parse(task, args);
+        ensure!(
+            pre.adapters.len() <= 1,
+            "the argument '--adapter' cannot be used multiple times"
+        );
+        ensure!(
+            pre.models.len() <= 1,
+            "the argument '--model' cannot be used multiple times"
+        );
+        let explicit = pre.adapters.first();
+        let model = pre.models.first().map(PathBuf::from);
+        let help = pre.help;
         let providers = self.for_task(task).collect::<Vec<_>>();
         let selected = explicit
-            .as_ref()
             .map(|id| {
                 providers
                     .iter()
@@ -107,16 +213,13 @@ impl<'a> Registry<'a> {
         }
         // Operations on saved artifacts may have no model argument. A unique
         // provider can still own such an operation (for example video history).
-        let operation = args
-            .iter()
-            .filter_map(|value| value.to_str())
-            .find(|value| {
-                providers.iter().any(|adapter| {
-                    (adapter.command)()
-                        .get_subcommands()
-                        .any(|command| command.get_name() == *value)
-                })
-            });
+        let operation = pre.operation.as_deref().filter(|name| {
+            providers.iter().any(|adapter| {
+                (adapter.command)()
+                    .get_subcommands()
+                    .any(|command| command.get_name() == *name)
+            })
+        });
         let candidates = providers
             .into_iter()
             .filter(|adapter| {
@@ -167,19 +270,17 @@ impl<'a> Registry<'a> {
             .about(task.about())
             .subcommand_required(true)
             .arg_required_else_help(true)
-            .arg(
-                Arg::new("adapter")
-                    .long("adapter")
-                    .value_name("ADAPTER")
-                    .global(true)
-                    .value_parser(clap::builder::PossibleValuesParser::new(ids.clone()))
-                    .help("Select a model adapter explicitly; otherwise detect from --model"),
-            );
+            .arg(adapter_argument(&ids));
         command.after_help(format!(
             "Adapters: {}. Options and defaults follow the selected model.\n\
              To see a model's full options without a checkpoint, use --adapter <name> with --help.",
             ids.join(", ")
         ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn selected_task_command(&self, adapter: &Adapter) -> Command {
+        self.task_command(adapter.task, Some(adapter))
     }
 
     fn root_command(&self, selected: Option<&Adapter>) -> Command {
@@ -190,11 +291,6 @@ impl<'a> Registry<'a> {
             .collect::<Vec<_>>();
         for (index, name) in utilities.iter().enumerate() {
             root = root.mut_subcommand(name, |command| command.display_order(100 + index));
-        }
-        // Existing automation can still invoke the old model entry points.
-        // Newly registered adapters are reached entirely through task commands.
-        for alias in ["h3", "glm", "minicpm", "trellis", "clip"] {
-            root = root.mut_subcommand(alias, |command| command.hide(true));
         }
         for (index, task) in Task::ALL.into_iter().enumerate() {
             let chosen = selected.filter(|adapter| adapter.task == task);
@@ -246,23 +342,6 @@ fn common_command(name: &str, providers: &[Command]) -> Command {
         command = command.arg(arg);
     }
     command.after_help("Use --adapter <name> with --help for a model's full options and defaults.")
-}
-
-fn option_value(args: &[OsString], name: &str) -> Option<OsString> {
-    let prefix = format!("{name}=");
-    let mut values = args.iter();
-    let mut result = None;
-    while let Some(value) = values.next() {
-        if value == "--" {
-            break;
-        }
-        if value == name {
-            result = values.next().cloned();
-        } else if let Some(value) = value.to_str().and_then(|value| value.strip_prefix(&prefix)) {
-            result = Some(value.into());
-        }
-    }
-    result
 }
 
 pub(super) fn run() -> Result<()> {
@@ -339,6 +418,80 @@ mod tests {
             .try_get_matches_from(argv)
             .unwrap();
         (selected.run)(matches.subcommand_matches("text").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn repeated_model_or_adapter_arguments_are_rejected() {
+        let directory = checkpoint(
+            serde_json::json!({"architectures":["LlamaForCausalLM"],"model_type":"llama"}),
+        );
+        let registry = Registry::new(BUILTINS);
+        let mut arguments = args(directory.path());
+        arguments.extend(["--model".into(), "other".into()]);
+        let error = registry
+            .select(Task::Text, &arguments)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("cannot be used multiple times"), "{error}");
+
+        let mut arguments = args(directory.path());
+        arguments.extend([
+            "--adapter".into(),
+            "glm".into(),
+            "--adapter".into(),
+            "glm".into(),
+        ]);
+        let error = registry
+            .select(Task::Text, &arguments)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("cannot be used multiple times"), "{error}");
+    }
+
+    #[test]
+    fn a_valueless_model_flag_does_not_swallow_the_next_flag() {
+        let registry = Registry::new(BUILTINS);
+        let arguments = vec![
+            "generate".into(),
+            "--model".into(),
+            "--adapter".into(),
+            "glm".into(),
+        ];
+        let selected = registry.select(Task::Text, &arguments).unwrap().unwrap();
+        assert_eq!(selected.id, "glm");
+    }
+
+    #[test]
+    fn model_after_adapter_specific_flags_still_routes() {
+        let directory = checkpoint(serde_json::json!({
+            "architectures":["Qwen3_5MoeForConditionalGeneration"],
+            "quantization":{"mode":"affine"}
+        }));
+        let registry = Registry::new(BUILTINS);
+        let arguments = vec![
+            "generate".into(),
+            "--max-new-tokens".into(),
+            "128".into(),
+            "--resident-experts".into(),
+            "--model".into(),
+            directory.path().into(),
+        ];
+        let selected = registry.select(Task::Text, &arguments).unwrap().unwrap();
+        assert_eq!(selected.id, "edge0");
+    }
+
+    #[test]
+    fn help_with_an_unreadable_model_keeps_the_generic_surface() {
+        let registry = Registry::new(BUILTINS);
+        let arguments = vec![
+            "generate".into(),
+            "--model".into(),
+            "missing-checkpoint".into(),
+            "--help".into(),
+        ];
+        assert!(registry.select(Task::Text, &arguments).unwrap().is_none());
     }
 
     #[test]

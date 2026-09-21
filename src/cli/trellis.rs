@@ -1,11 +1,11 @@
-use super::{TrellisCommand, ensure_new_output, parse_device, publish_staged_bytes};
+use super::TrellisCommand;
+use super::device_parse::parse_device;
+use super::output_hygiene::{ensure_new_output, publish_staged_bytes};
 use anyhow::{Context, Result};
 use flyingfish::runtime::artifact::ArtifactStaging;
-use flyingfish::trellis::{
-    checkpoint::TrellisCheckpoint,
-    pipeline::{StructureOutcome, TextToStructure},
-    sampler::SamplerParameters,
-};
+use flyingfish::trellis::checkpoint::TrellisCheckpoint;
+use flyingfish::trellis::pipeline::{StructureOutcome, TextToStructure};
+use flyingfish::trellis::sampler::SamplerParameters;
 use serde_json::json;
 use std::time::Instant;
 

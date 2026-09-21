@@ -9,11 +9,23 @@ fn ff() -> Command {
 #[test]
 fn model_paths_are_required_instead_of_assuming_a_local_directory_layout() {
     for (args, missing) in [
-        (vec!["minicpm", "generate", "--prompt", "hello"], "--model"),
+        (
+            vec![
+                "text",
+                "generate",
+                "--adapter",
+                "minicpm",
+                "--prompt",
+                "hello",
+            ],
+            "--model",
+        ),
         (
             vec![
                 "music",
                 "generate",
+                "--adapter",
+                "music3",
                 "--prompt",
                 "piano",
                 "--lyrics",
@@ -25,8 +37,10 @@ fn model_paths_are_required_instead_of_assuming_a_local_directory_layout() {
         ),
         (
             vec![
-                "clip",
+                "similarity",
                 "score",
+                "--adapter",
+                "clip",
                 "--image",
                 "input.png",
                 "--text",
@@ -36,8 +50,10 @@ fn model_paths_are_required_instead_of_assuming_a_local_directory_layout() {
         ),
         (
             vec![
-                "trellis",
+                "3d",
                 "generate",
+                "--adapter",
+                "trellis",
                 "--conditioner",
                 "encoder",
                 "--prompt",
@@ -49,10 +65,10 @@ fn model_paths_are_required_instead_of_assuming_a_local_directory_layout() {
         ),
         (
             vec![
-                "trellis",
+                "3d",
                 "generate",
-                "--model",
-                "checkpoint",
+                "--adapter",
+                "trellis",
                 "--prompt",
                 "a rabbit",
                 "--output",
@@ -62,8 +78,10 @@ fn model_paths_are_required_instead_of_assuming_a_local_directory_layout() {
         ),
         (
             vec![
-                "trellis",
+                "3d",
                 "decode-gaussians",
+                "--adapter",
+                "trellis",
                 "--inputs",
                 "input.safetensors",
                 "--output",

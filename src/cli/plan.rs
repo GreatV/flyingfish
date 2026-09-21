@@ -1,5 +1,29 @@
-use super::*;
-use flyingfish::h3::resources::H3ResourceBudgetExt;
+use super::H3Command;
+use super::checkpoint::resolve_component;
+use super::device_parse::parse_device;
+use super::output_hygiene::mib_to_bytes;
+use super::{
+    DEFAULT_FLASH_BACKEND_WORKSPACE_MIB, DEFAULT_NON_FLASH_BACKEND_WORKSPACE_MIB, H3AdmissionArgs,
+    OptionalWeightCacheArgs,
+};
+use anyhow::{Context, Result, bail};
+use flyingfish::h3::config::TransformerConfig;
+use flyingfish::h3::core::{
+    AttentionKeyChunkPolicy, CUDA_EXACT_SOFTMAX_MAX_KEY_ROWS,
+    DEFAULT_ATTENTION_PROJECTION_CHUNK_SIZE, DEFAULT_ATTENTION_QUERY_CHUNK_SIZE,
+    DEFAULT_FFN_TOKEN_CHUNK_SIZE,
+};
+use flyingfish::h3::execution::H3ExecutionPlan;
+use flyingfish::h3::model::DEFAULT_OUTPUT_TOKEN_CHUNK_SIZE;
+use flyingfish::h3::policy::ExecutionPolicy;
+use flyingfish::h3::resources::{
+    H3ResourceBudgetExt, ResourceAssumptions, ResourceBudget, ResourceEstimate, T2vaGeometry,
+    TransformerShape,
+};
+use flyingfish::h3::solver::{
+    AttentionBackendAllowlist, PolicySearchSpace, solve_feasible_policies,
+};
+use flyingfish::runtime::weights::{CacheGranularity, CachePolicy, ModelWeights, WeightSource};
 
 #[derive(serde::Serialize)]
 struct SolveT2vaCandidate {
@@ -630,34 +654,10 @@ fn display_optional_budget_bytes(value: Option<u64>) -> String {
     value.map_or_else(|| "unbounded".to_owned(), |value| format!("{value} bytes"))
 }
 
-pub(super) fn run_compare_tensors(command: Command) -> Result<()> {
-    let Command::Diff {
-        reference,
-        actual,
-        atol,
-        rtol,
-        allow_unexpected,
-    } = command
-    else {
-        bail!("internal CLI dispatch mismatch for compare-tensors");
-    };
-    let mut report = compare_safetensors(&reference, &actual, ParityTolerance::new(atol, rtol)?)?;
-    if allow_unexpected {
-        report = report.allow_unexpected();
-    }
-    println!("{}", report.to_pretty_json()?);
-    anyhow::ensure!(
-        report.passed,
-        "tensor parity failed: {} tensors and {} elements outside tolerance",
-        report.failed_tensor_count,
-        report.mismatched_elements
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::Device;
 
     #[test]
     fn symbolic_cuda_solver_policy_is_bound_without_a_cuda_build() {

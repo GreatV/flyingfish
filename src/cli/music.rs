@@ -1,7 +1,15 @@
-use super::*;
 mod batch;
+use super::device_parse::parse_device;
+use super::output_hygiene::{ensure_new_output, resolve_output_outside_model};
+use super::{DeviceCacheArgs, WeightCacheArgs};
+use anyhow::{Result, bail};
+use clap::Subcommand;
+use flyingfish::h3::audio_vae::{WavSampleFormat, write_wav};
 use flyingfish::music::pipeline::{Music3, Options};
 use flyingfish::runtime::artifact::ArtifactStaging;
+use flyingfish::runtime::weights::DeviceCache;
+use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Debug, Subcommand)]
 pub(super) enum MusicCommand {
@@ -107,7 +115,7 @@ pub(super) fn run(command: MusicCommand) -> Result<()> {
         memory.autoregressive_activation_bytes,
         memory.acoustic.device_peak_bytes
     );
-    model.configure_device_cache(super::decide_auto_residency_with_required_memory(
+    model.configure_device_cache(super::resource::decide_auto_residency_with_required_memory(
         &demands,
         &device,
         device_cache,

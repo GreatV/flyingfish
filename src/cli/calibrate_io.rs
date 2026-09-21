@@ -1,39 +1,35 @@
-use super::{
-    BenchCommand, IoBenchmarkProfile, ensure_new_output, parse_device, publish_staged_bytes,
-    resolve_output_outside_model,
+use super::IoBenchmarkProfile;
+use super::device_parse::parse_device;
+use super::output_hygiene::{
+    ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
 };
 use anyhow::{Context, Result, bail};
-use flyingfish::{
-    interconnect_benchmark::{
-        DEFAULT_LOCAL_IO_SAMPLE_ITERATIONS, DEFAULT_LOCAL_IO_WARMUP_ITERATIONS,
-        LocalIoBenchmarkOptions, LocalIoBenchmarkReport, PeerD2dMeasurement,
-        measure_local_io_benchmark,
-    },
-    runtime::artifact::ArtifactStaging,
-    runtime::io_calibration::{
-        IO_PAYLOAD_FORMAT_RAW_SEQUENTIAL, IoCalibrationReport, measure_io_bandwidth,
-        validate_payload_format,
-    },
+use flyingfish::interconnect_benchmark::{
+    DEFAULT_LOCAL_IO_SAMPLE_ITERATIONS, DEFAULT_LOCAL_IO_WARMUP_ITERATIONS,
+    LocalIoBenchmarkOptions, LocalIoBenchmarkReport, PeerD2dMeasurement,
+    measure_local_io_benchmark,
 };
+use flyingfish::runtime::artifact::ArtifactStaging;
+use flyingfish::runtime::io_calibration::{
+    IO_PAYLOAD_FORMAT_RAW_SEQUENTIAL, IoCalibrationReport, measure_io_bandwidth,
+    validate_payload_format,
+};
+use std::path::PathBuf;
 
-pub(super) fn run_calibrate_io(command: BenchCommand) -> Result<()> {
-    let BenchCommand::Io {
-        profile,
-        payload,
-        model,
-        output,
-        device,
-        format,
-        peer_device,
-        warmups,
-        samples,
-        expert_layer,
-        expert_index,
-    } = command
-    else {
-        bail!("the I/O calibration profiles do not implement this bench command");
-    };
-
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_calibrate_io(
+    profile: IoBenchmarkProfile,
+    payload: Option<PathBuf>,
+    model: Option<PathBuf>,
+    output: PathBuf,
+    device: String,
+    format: String,
+    peer_device: Option<String>,
+    warmups: usize,
+    samples: usize,
+    expert_layer: usize,
+    expert_index: usize,
+) -> Result<()> {
     match profile {
         IoBenchmarkProfile::Sequential => run_sequential(
             payload,

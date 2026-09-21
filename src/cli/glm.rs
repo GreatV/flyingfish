@@ -1,23 +1,23 @@
-use super::{
-    GlmCommand, ensure_new_output, parse_device, publish_staged_bytes, resolve_optional_new_output,
-    resolve_output_outside_model,
+use super::device_parse::parse_device;
+use super::output_hygiene::{
+    ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
 };
+use super::{GlmCommand, kit, resolve_optional_new_output};
 use anyhow::{Context, Result, bail, ensure};
 use candle_core::{Device, Tensor, safetensors};
-use flyingfish::{
-    glm::{
-        GlmGenerationOptions, GlmParityCapture, RoutingReplayOptions, RoutingReplayReport,
-        RoutingTrace, StreamedGlm, StreamedGlmOptions,
-        config::GlmConfig,
-        routing_trace::{MAX_ROUTING_TRACE_JSON_BYTES, validate_routing_trace_domain},
-    },
-    runtime::artifact::{ArtifactStaging, read_artifact_snapshot},
-    runtime::telemetry::TelemetryMonitor,
-    runtime::weights::{WeightAccessStats, WeightSource},
+use flyingfish::glm::config::GlmConfig;
+use flyingfish::glm::routing_trace::{MAX_ROUTING_TRACE_JSON_BYTES, validate_routing_trace_domain};
+use flyingfish::glm::{
+    GlmGenerationOptions, GlmParityCapture, RoutingReplayOptions, RoutingReplayReport,
+    RoutingTrace, StreamedGlm, StreamedGlmOptions,
 };
+use flyingfish::runtime::artifact::{ArtifactStaging, read_artifact_snapshot};
+use flyingfish::runtime::telemetry::TelemetryMonitor;
+use flyingfish::runtime::weights::{WeightAccessStats, WeightSource};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::Path;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 const GLM_PARITY_CAPTURE_SCHEMA_VERSION: u32 = 2;
 
@@ -64,9 +64,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         max_new_tokens,
         max_context_tokens,
         reasoning_effort,
-        temperature,
-        top_p,
-        seed,
+        sampling,
         device,
         weights,
         resource_policy,
@@ -84,9 +82,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         expert_cache_readmit,
         expert_cache_min_mib,
         no_progress,
-        json: emit_json,
         output,
-        telemetry_json,
         routing_trace,
         routing_trace_domain,
         execution_manifest,
@@ -94,6 +90,16 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
     else {
         unreachable!("run_generate received a non-generate GLM command")
     };
+    let kit::SamplingArgs {
+        temperature,
+        top_p,
+        seed,
+    } = sampling;
+    let kit::OutputArgs {
+        output,
+        json: emit_json,
+        telemetry_json,
+    } = output;
     let mut explicit_axes = std::collections::BTreeSet::new();
     for (present, axis) in [
         (weights.weight_source.is_some(), "weights.source"),
@@ -198,9 +204,11 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         ("GLM execution manifest", execution_manifest.as_deref()),
     ])?;
     let cache_policy = weights.cache_policy()?;
-    let expert_cache_bytes = usize::try_from(super::mib_to_bytes(expert_cache_mib)?)?;
-    let expert_cache_min_bytes =
-        usize::try_from(super::mib_to_bytes(expert_cache_min_mib.unwrap_or(0))?)?;
+    let expert_cache_bytes =
+        usize::try_from(super::output_hygiene::mib_to_bytes(expert_cache_mib)?)?;
+    let expert_cache_min_bytes = usize::try_from(super::output_hygiene::mib_to_bytes(
+        expert_cache_min_mib.unwrap_or(0),
+    )?)?;
     ensure!(
         !expert_cache_readmit || expert_cache_bytes > 0,
         "--expert-cache-readmit requires a positive --expert-cache-mib maximum"
@@ -640,7 +648,7 @@ pub(super) fn run_replay_routing(command: GlmCommand) -> Result<()> {
             .collect(),
         cache_mib
             .into_iter()
-            .map(|mib| super::mib_to_bytes(mib.get()))
+            .map(|mib| super::output_hygiene::mib_to_bytes(mib.get()))
             .collect::<Result<Vec<_>>>()?,
     )?;
     let snapshot = read_artifact_snapshot(

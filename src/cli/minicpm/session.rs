@@ -1,5 +1,11 @@
-use super::*;
+use crate::cli::{DeviceCacheArgs, WeightCacheArgs};
+use anyhow::Result;
+use candle_core::Device;
+use flyingfish::minicpm::dspark;
 use flyingfish::minicpm::memory::{RequestGeometry, estimate_request_memory};
+use flyingfish::minicpm::{Config, Decoder};
+use flyingfish::runtime::weights::{DeviceCache, ModelWeights};
+use std::path::Path;
 
 pub(super) struct WorkerOptions<'a> {
     pub model: &'a Path,
@@ -82,7 +88,7 @@ impl Worker {
             "request tensor budget: {} bytes KV peak, {} bytes activation estimate, {} bytes weight-load reserve; library/allocator margin added separately",
             memory.kv.peak_bytes, memory.activation_peak_bytes, memory.streamed_weight_bytes
         );
-        let cache = super::super::decide_auto_residency_with_required_memory(
+        let cache = crate::cli::resource::decide_auto_residency_with_required_memory(
             &demands,
             &options.device,
             options.device_cache,

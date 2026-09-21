@@ -1,7 +1,28 @@
 mod adapters;
 mod routing;
 
+use output_hygiene::{ensure_new_output, mib_to_bytes, resolve_output_outside_model};
+
 use adapters::{GlmCommand, H3Command, H3DecodeCommand, TrellisCommand};
+use anyhow::{Context, Result, bail};
+use candle_core::Device;
+use clap::{Parser, Subcommand};
+use flyingfish::h3::core::{
+    AttentionChunking, AttentionKeyChunkPolicy, AttentionKeyChunkSize,
+    DEFAULT_ATTENTION_PROJECTION_CHUNK_SIZE, DEFAULT_ATTENTION_QUERY_CHUNK_SIZE,
+    DEFAULT_FFN_TOKEN_CHUNK_SIZE, DEFAULT_FLASH_ATTENTION_PROJECTION_CHUNK_SIZE,
+};
+use flyingfish::h3::model::{
+    DEFAULT_OUTPUT_TOKEN_CHUNK_SIZE, StreamedTransformerOptions, TransformerChunking,
+};
+use flyingfish::h3::policy::ExecutionPolicy;
+use flyingfish::h3::target_geometry::{
+    H3AspectRatio, H3TargetGeometry, resolve_h3_target_geometry,
+};
+use flyingfish::runtime::residency::ResidencyAuthorization;
+use flyingfish::runtime::weights::{CacheGranularity, CachePolicy, WeightSource};
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 
 mod calibrate;
 mod calibrate_io;
@@ -11,6 +32,8 @@ mod collective;
 mod conditioned;
 mod decode;
 mod denoise;
+mod device_parse;
+mod diff;
 mod edge0;
 mod generate;
 mod glm;
@@ -18,137 +41,24 @@ mod glm_multi;
 mod identity;
 mod initialize;
 mod inspect;
+mod kit;
 mod minicpm;
 mod models;
 mod music;
+mod output_hygiene;
 mod plan;
 mod probe;
 mod progress;
 mod prompt;
 mod qwen35;
+mod qwen_numerical;
 mod resource;
+mod text_runtime;
 mod trellis;
 mod trellis_generate;
 
-use anyhow::{Context, Result, bail};
-use candle_core::{Device, Tensor, safetensors};
-use clap::{Parser, Subcommand};
-use flyingfish::{
-    glm::{ExpertCacheLayout, ExpertCacheReplacementPolicy},
-    h3::audio_vae::{StreamedAudioVae, WavSampleFormat, write_wav},
-    h3::conditioning_provenance::{ExternalPromptProvenance, H3ConditioningProvenance},
-    h3::config::TransformerConfig,
-    h3::core::{
-        AttentionChunking, AttentionKeyChunkPolicy, AttentionKeyChunkSize,
-        CUDA_EXACT_SOFTMAX_MAX_KEY_ROWS, DEFAULT_ATTENTION_PROJECTION_CHUNK_SIZE,
-        DEFAULT_ATTENTION_QUERY_CHUNK_SIZE, DEFAULT_FFN_TOKEN_CHUNK_SIZE,
-        DEFAULT_FLASH_ATTENTION_PROJECTION_CHUNK_SIZE,
-    },
-    h3::cuda::profile::validate_selected_device as validate_h3_selected_cuda_profile,
-    h3::execution::H3ExecutionPlan,
-    h3::model::{
-        DEFAULT_OUTPUT_TOKEN_CHUNK_SIZE, StreamedTransformer, StreamedTransformerOptions,
-        TransformerChunking, validate_h3_numerical_backend,
-    },
-    h3::pipeline::{
-        DenoiseCheckpointEvent, DenoiseObserver, DenoisePreparationEvent, DenoiseStepEvent,
-        T2vaExecutionOptions, T2vaLatents, T2vaSchedule, denoise_t2va_with_options_and_observer,
-    },
-    h3::policy::{
-        ExecutionPolicy, H3QwenNumericalContract, H3QwenVisionGridModality,
-        H3QwenVisionLinearGeometry,
-    },
-    h3::resources::{
-        ResourceAssumptions, ResourceBudget, ResourceEstimate, T2vaGeometry, TransformerShape,
-    },
-    h3::solver::{AttentionBackendAllowlist, PolicySearchSpace, solve_feasible_policies},
-    h3::target_geometry::{H3AspectRatio, H3TargetGeometry, resolve_h3_target_geometry},
-    h3::text_encoder::StreamedTextEncoder,
-    h3::video_vae::StreamedVideoVae,
-    recovery::{CheckpointIdentity, PolicyHistory, take_t2va_checkpoint_metadata},
-    runtime::artifact::sync_parent_directory,
-    runtime::frame_manifest::PngFrameSetManifest,
-    runtime::parity::{ParityTolerance, compare_safetensors},
-    runtime::residency::ResidencyAuthorization,
-    runtime::telemetry::TelemetryMonitor,
-    runtime::weights::{
-        CacheGranularity, CachePolicy, DeviceCache, DeviceCachePolicy, ModelWeights, WeightSource,
-    },
-};
-use rand::{SeedableRng, rngs::StdRng};
-use rand_distr::{Distribution, StandardNormal};
-use std::{
-    collections::HashMap,
-    num::{NonZeroU64, NonZeroUsize},
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
-use tokenizers::Tokenizer;
-
 const DEFAULT_NON_FLASH_BACKEND_WORKSPACE_MIB: u64 = 1536;
 const DEFAULT_FLASH_BACKEND_WORKSPACE_MIB: u64 = 3584;
-
-fn build_qwen_numerical_contract(
-    device: &Device,
-    configured_query_rows: usize,
-    language_rows: usize,
-    image_total_patch_rows: usize,
-    video_total_patch_rows: usize,
-    max_vision_segment_rows: usize,
-) -> Result<H3QwenNumericalContract> {
-    let configured_query_rows = NonZeroUsize::new(configured_query_rows)
-        .context("Qwen configured query rows must be non-zero")?;
-    let language_rows =
-        NonZeroUsize::new(language_rows).context("Qwen language rows must be non-zero")?;
-    let geometry = H3QwenVisionLinearGeometry::from_patch_rows(
-        image_total_patch_rows,
-        video_total_patch_rows,
-    )?;
-    let backend = flyingfish::h3::policy::ExecutionBackendPolicy::from_device(device);
-    let contract = H3QwenNumericalContract::for_target_with_grids(
-        backend,
-        backend
-            .is_cuda()
-            .then(|| flyingfish::h3::policy::CudaCapabilities::from_device(device)),
-        configured_query_rows,
-        language_rows,
-        max_vision_segment_rows,
-        geometry,
-        &[],
-    )?;
-    contract.validate_for(
-        device,
-        configured_query_rows,
-        language_rows,
-        max_vision_segment_rows,
-        geometry,
-    )?;
-    Ok(contract)
-}
-
-fn validate_qwen_numerical_contract(
-    contract: &H3QwenNumericalContract,
-    device: &Device,
-    language_rows: usize,
-    image_total_patch_rows: usize,
-    video_total_patch_rows: usize,
-    max_vision_segment_rows: usize,
-) -> Result<()> {
-    contract.validate_for(
-        device,
-        NonZeroUsize::new(
-            usize::try_from(contract.configured_query_rows)
-                .context("recorded Qwen configured query rows exceed usize")?,
-        )
-        .context("recorded Qwen configured query rows must be non-zero")?,
-        NonZeroUsize::new(language_rows).context("Qwen language rows must be non-zero")?,
-        max_vision_segment_rows,
-        H3QwenVisionLinearGeometry::from_patch_rows(
-            image_total_patch_rows,
-            video_total_patch_rows,
-        )?,
-    )
-}
 
 #[derive(Debug, Parser)]
 #[command(name = "ff", about = "Checkpoint and inference toolkit")]
@@ -223,7 +133,7 @@ impl TargetGeometryArgs {
         let Some(target) = self.resolve(None)? else {
             return Ok(explicit);
         };
-        eprintln!("{}", describe_h3_target(&target));
+        eprintln!("{}", conditioned::describe_h3_target(&target));
         Ok((
             target.latent_frames,
             target.latent_height,
@@ -240,7 +150,7 @@ impl TargetGeometryArgs {
         explicit: (Option<usize>, Option<usize>, Option<usize>, Option<usize>),
     ) -> Result<(usize, usize, usize, usize)> {
         if let Some(target) = self.resolve(None)? {
-            eprintln!("{}", describe_h3_target(&target));
+            eprintln!("{}", conditioned::describe_h3_target(&target));
             return Ok((
                 target.latent_frames,
                 target.latent_height,
@@ -277,7 +187,7 @@ impl TargetGeometryArgs {
             );
             return Ok((height.zip(width), explicit_num_frames));
         };
-        eprintln!("{}", describe_h3_target(&target));
+        eprintln!("{}", conditioned::describe_h3_target(&target));
         Ok((
             Some((target.canvas_height, target.canvas_width)),
             target.requested_num_frames,
@@ -285,23 +195,8 @@ impl TargetGeometryArgs {
     }
 }
 
-/// One line stating what an official target resolved to, including the aligned
-/// duration, which frame alignment can push past the request.
-fn describe_h3_target(target: &H3TargetGeometry) -> String {
-    format!(
-        "official target: short_edge {} aspect_ratio {} duration_seconds {} -> {}x{}, {} frames ({:.3} s)",
-        target.short_edge,
-        target.aspect_ratio,
-        target.duration_seconds,
-        target.canvas_width,
-        target.canvas_height,
-        target.num_frames,
-        target.aligned_duration_seconds()
-    )
-}
-
 #[derive(Clone, Copy, Debug, clap::Args)]
-struct TransformerChunkArgs {
+pub(crate) struct TransformerChunkArgs {
     #[arg(help = "Number of attention query rows evaluated per bounded score chunk")]
     #[arg(
         long,
@@ -470,7 +365,7 @@ impl WeightCacheArgs {
 /// the shared `WeightCacheArgs` because H3's commands route residency through
 /// their own policy machinery.
 #[derive(Clone, Copy, Debug, Default, clap::Args)]
-struct DeviceCacheArgs {
+pub(crate) struct DeviceCacheArgs {
     #[arg(
         long,
         help = "Device residency ceiling in MiB per device, shared by the request's checkpoints on that device; zero disables retention, absent uses the adapter's default"
@@ -497,157 +392,6 @@ impl DeviceCacheArgs {
             None => ResidencyAuthorization::NotAuthorized,
         })
     }
-}
-
-/// Headroom the residency ladder leaves free on the device for activations,
-/// workspaces and allocator slack: the shared admission-reserve shape (5% of
-/// the pool total, capped at 1 GiB), so small and unified pools are not
-/// over-reserved — a 24 GiB discrete card keeps the historical flat 1 GiB
-/// exactly.
-///
-/// A declared margin, not a measured requirement. Adapters add known request
-/// allocations separately. Runtime cache demotion can recover weight-load
-/// allocation failures; this margin does not guarantee that every activation
-/// allocation will fit.
-fn device_residency_reserve_bytes(snapshot: &flyingfish::runtime::probe::ResourceSnapshot) -> u64 {
-    let total = if snapshot.host_device_memory_is_unified == Some(true) {
-        [
-            snapshot.host_pool_total_bytes(),
-            snapshot.device_total_memory_bytes,
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-    } else {
-        snapshot.device_total_memory_bytes
-    };
-    // The free-view fallback below is for legacy recorded snapshots only: a
-    // live capture produces the device total and free together (both come
-    // from the same CUDA device handle).
-    flyingfish::runtime::probe::admission_reserve_bytes(total.or(snapshot.device_free_memory_bytes))
-}
-
-/// Default CUDA placement for adapters with request tensor estimates. Explicit
-/// ceilings (including zero) and non-CUDA devices keep their existing behavior.
-/// `required_device_bytes` is one caller's device charge and is multiplied by
-/// `unified_share`, the number of callers drawing from this pool.
-/// `unified_host_bytes` is already the total across every concurrent host
-/// allocation, because those exist per caller whether or not the caller shares
-/// this pool — the two counts differ and only the caller knows the second. All
-/// of it applies under the fold alone.
-fn decide_auto_residency_with_required_memory(
-    demands: &[flyingfish::runtime::residency::PhaseResidencyDemand],
-    device: &candle_core::Device,
-    args: DeviceCacheArgs,
-    required_device_bytes: u64,
-    unified_host_bytes: u64,
-    unified_share: u64,
-) -> Result<DeviceCache> {
-    use flyingfish::runtime::{probe::ResourceSnapshot, residency::plan_device_residency};
-    if !device.is_cuda() || args.device_cache_mib.is_some() {
-        return decide_residency_with_required_memory(
-            demands,
-            device,
-            args,
-            required_device_bytes,
-            unified_host_bytes,
-            unified_share,
-        );
-    }
-    let snapshot = ResourceSnapshot::capture(Some(device));
-    // Each concurrent caller needs its own fixed margin, but only where the
-    // pool is actually shared; a discrete device owes nothing to the others.
-    let shared = snapshot.unified_pool_available_bytes().is_some();
-    let share = if shared { unified_share.max(1) } else { 1 };
-    let reserve = required_device_bytes
-        .saturating_mul(share)
-        .checked_add(device_residency_reserve_bytes(&snapshot).saturating_mul(share))
-        .context("device residency reserve overflow")?;
-    let capacity = if snapshot.unified_accounting_is_undecidable() {
-        0
-    } else {
-        snapshot
-            .unified_pool_available_bytes()
-            .or(snapshot.device_free_memory_bytes)
-            .unwrap_or(0)
-    };
-    let reserve = if shared {
-        reserve
-            .checked_add(unified_host_bytes)
-            .context("unified host reserve overflow")?
-    } else {
-        reserve
-    };
-    // Reserving each concurrent caller's charges is not enough: the remainder
-    // is also shared, so one caller may retain only its portion of it.
-    let available = capacity.saturating_sub(reserve) / share;
-    let plan = plan_device_residency(demands, available, 0)?;
-    eprintln!(
-        "device residency: auto retains {} MiB in {}/{} weight groups after reserving {} MiB for request tensors and workspace",
-        plan.resident_bytes / (1 << 20),
-        plan.placed.len(),
-        demands.len(),
-        reserve / (1 << 20),
-    );
-    Ok(DeviceCache::with_selected_phases(
-        DeviceCachePolicy::with_max_bytes(plan.resident_bytes)
-            .with_cuda_allocator(args.device_cache_allocator),
-        plan.placed,
-    ))
-}
-
-fn decide_residency_with_required_memory(
-    demands: &[flyingfish::runtime::residency::PhaseResidencyDemand],
-    device: &candle_core::Device,
-    args: DeviceCacheArgs,
-    required_device_bytes: u64,
-    unified_host_bytes: u64,
-    unified_share: u64,
-) -> Result<DeviceCache> {
-    use flyingfish::runtime::{probe::ResourceSnapshot, residency::decide_device_residency};
-    let snapshot = ResourceSnapshot::capture(Some(device));
-    let shared = snapshot.unified_pool_available_bytes().is_some();
-    let share = if shared { unified_share.max(1) } else { 1 };
-    let reserve = device_residency_reserve_bytes(&snapshot)
-        .saturating_mul(share)
-        .checked_add(required_device_bytes.saturating_mul(share))
-        .context("device residency reserve overflow")?;
-    // An explicit ceiling is still clamped against the shared pool, so the
-    // caller's separately modelled host allocation is reserved here too.
-    let reserve = if shared {
-        reserve
-            .checked_add(unified_host_bytes)
-            .context("unified host reserve overflow")?
-    } else {
-        reserve
-    };
-    // The share is taken before planning, by withholding the other callers'
-    // portions as reserve: dividing the decision afterwards would leave a plan
-    // built against the whole remainder, selecting phases that can never be
-    // retained. The operator's own ceiling still clamps on top, so a ceiling
-    // that already fits the share is not reduced.
-    let reserve = match snapshot.unified_pool_available_bytes() {
-        Some(pool) if share > 1 => pool.saturating_sub(pool.saturating_sub(reserve) / share),
-        _ => reserve,
-    };
-    let decision = decide_device_residency(&snapshot, demands, reserve, args.authorization()?)?;
-    if decision.authorized_budget_bytes > 0 {
-        eprintln!(
-            "device residency: {} MiB authorized, {}/{} phase working sets fit, {} MiB planned weight peak",
-            decision.authorized_budget_bytes / (1 << 20),
-            decision.plan.placed.len(),
-            demands.len(),
-            decision.plan.resident_bytes / (1 << 20),
-        );
-        for phase in &decision.plan.spilled {
-            eprintln!("device residency: {phase} cannot be retained in full within this budget");
-        }
-    }
-    Ok(DeviceCache::with_selected_phases(
-        DeviceCachePolicy::with_max_bytes(decision.authorized_budget_bytes)
-            .with_cuda_allocator(args.device_cache_allocator),
-        decision.plan.placed,
-    ))
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::Args)]
@@ -709,15 +453,6 @@ struct H3AdmissionArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[command(subcommand, about = "Score image/text similarity with CLIP")]
-    Clip(clip::ClipCommand),
-    #[command(
-        subcommand,
-        about = "Generate music from lyrics and a caption with MiniMax Music3"
-    )]
-    Music(music::MusicCommand),
-    #[command(subcommand, about = "Run disk-streamed MiniCPM5 text generation")]
-    Minicpm(minicpm::MiniCpmCommand),
     #[command(
         subcommand,
         about = "Discover, inspect and load local model components"
@@ -793,15 +528,6 @@ enum Command {
     #[command(subcommand)]
     #[command(about = "Measure explicit sequential and local-interconnect I/O profiles")]
     Bench(BenchCommand),
-    #[command(subcommand)]
-    #[command(about = "Run MiniMax-H3 text-to-video-and-audio commands")]
-    H3(H3Command),
-    #[command(subcommand)]
-    #[command(about = "Run disk-streamed GLM-5.3-Flash text commands")]
-    Glm(GlmCommand),
-    #[command(subcommand)]
-    #[command(about = "Run TRELLIS structured-3D-latent commands")]
-    Trellis(TrellisCommand),
     #[command(about = "Internal one-trial worker. The request is read from bounded stdin")]
     #[command(name = "__calibrate-t2va-trial", hide = true)]
     CalibrateT2vaTrial,
@@ -925,18 +651,6 @@ enum BenchCommand {
     },
 }
 
-struct CliDenoiseObserver {
-    progress: progress::DenoiseProgress,
-}
-
-impl CliDenoiseObserver {
-    fn new(enabled: bool) -> Self {
-        Self {
-            progress: progress::DenoiseProgress::for_stderr(enabled),
-        }
-    }
-}
-
 fn build_transformer_options(
     device: Device,
     policy: &ExecutionPolicy,
@@ -953,138 +667,8 @@ fn build_transformer_options(
     })
 }
 
-fn report_h3_device_cache(transformer: &StreamedTransformer) {
-    if let Some(plan) = transformer.host_residency_plan() {
-        eprintln!(
-            "H3 host cache: {}",
-            serde_json::json!({"planned_resident_bytes":plan.resident_bytes,"stats":transformer.cache_stats()})
-        );
-    }
-    if let Some(plan) = transformer.device_residency_plan() {
-        eprintln!(
-            "H3 device cache: {}",
-            serde_json::json!({
-                "planned_resident_bytes": plan.resident_bytes,
-                "stats": transformer.device_cache_stats(),
-            })
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn resolve_execution_policy(
-    path: Option<&Path>,
-    device: &Device,
-    weight_source: WeightSource,
-    cache_policy: CachePolicy,
-    chunks: TransformerChunkArgs,
-    flash_attention: bool,
-    precompute_adaln: bool,
-) -> Result<ExecutionPolicy> {
-    let policy = match path {
-        Some(path) => ExecutionPolicy::load(path)?,
-        None => ExecutionPolicy::from_runtime(
-            device,
-            weight_source,
-            cache_policy,
-            chunks.model_chunking(),
-            flash_attention,
-            precompute_adaln,
-        )?,
-    };
-    validate_executable_policy(&policy, device)?;
-    Ok(policy)
-}
-
-fn validate_executable_policy(policy: &ExecutionPolicy, device: &Device) -> Result<()> {
-    policy.validate_device(device)?;
-    anyhow::ensure!(
-        !policy.flash_attention() || cfg!(feature = "flash-attn"),
-        "execution policy selects FlashAttention, but this binary was not compiled with --features flash-attn"
-    );
-    Ok(())
-}
-
-/// Choose an attention backend the request can actually run on.
-///
-/// The exact full-softmax path covers a bounded number of packed rows. Past
-/// that bound it is not that the operator prefers another backend -- full
-/// softmax does not run the request at all -- and the row count is known here.
-/// Online softmax processes keys in blocks instead, so the bound applies per
-/// block rather than to the sequence.
-///
-/// The block is the largest the verified exact-softmax kernels cover, which is
-/// the same bound the full path ran out of: larger blocks mean fewer passes,
-/// and the modelled peak grows slowly enough with block size that memory does
-/// not decide this. A pinned or replayed policy is left alone, and so is one
-/// that already names a backend without the bound.
-fn promote_attention_backend_for_rows(
-    policy: &mut ExecutionPolicy,
-    on_cuda: bool,
-    packed_rows: u64,
-    operator_named_the_backend: bool,
-) -> Result<()> {
-    use flyingfish::h3::core::CUDA_EXACT_SOFTMAX_MAX_KEY_ROWS;
-    use flyingfish::h3::policy::AttentionBackendPolicy;
-
-    let bound = u64::try_from(CUDA_EXACT_SOFTMAX_MAX_KEY_ROWS)
-        .context("exact softmax row bound exceeds u64")?;
-    if operator_named_the_backend
-        || !on_cuda
-        || policy.attention.backend != AttentionBackendPolicy::FullSoftmax
-        || packed_rows <= bound
-    {
-        return Ok(());
-    }
-    policy.attention.backend = AttentionBackendPolicy::OnlineSoftmax;
-    policy.attention.configured_key_rows = Some(bound);
-    policy.rebind_attention_numerics()?;
-    eprintln!(
-        "attention: {packed_rows} packed rows exceed the {bound} full softmax covers; \
-         using online softmax over {bound}-row key blocks"
-    );
-    Ok(())
-}
-
-fn select_resume_execution_policy(
-    mut requested: ExecutionPolicy,
-    recorded: Option<&ExecutionPolicy>,
-    explicit_policy: bool,
-    explicit_policy_settings: bool,
-    requires_recorded_policy: bool,
-) -> Result<ExecutionPolicy> {
-    match recorded {
-        Some(recorded) => {
-            if explicit_policy || explicit_policy_settings {
-                // Device residency is planned against whatever the card has
-                // free at that moment, so the recorded ceiling describes the
-                // first run's machine rather than anything the operator asked
-                // for. Two runs minutes apart can plan differently and agree on
-                // every choice a person made. Carry the recorded ceiling
-                // forward -- keeping the run's placement stable across a
-                // resume -- and let admission decide whether it still fits;
-                // refusing the resume for it would name a field no H3 command
-                // even exposes as a flag.
-                if !explicit_policy {
-                    requested.weights.device_cache = recorded.weights.device_cache;
-                }
-                if let Some(field) = recorded.first_difference(&requested) {
-                    bail!(
-                        "the checkpoint's execution policy disagrees with the requested one at {field}"
-                    );
-                }
-                Ok(requested)
-            } else {
-                Ok(recorded.clone())
-            }
-        }
-        None if requires_recorded_policy => bail!("checkpoint has no execution policy"),
-        None => Ok(requested),
-    }
-}
-
 #[cfg(test)]
-fn default_execution_policy(device: &Device) -> ExecutionPolicy {
+pub(crate) fn default_execution_policy(device: &Device) -> ExecutionPolicy {
     ExecutionPolicy::from_runtime(
         device,
         WeightSource::Mmap,
@@ -1096,39 +680,37 @@ fn default_execution_policy(device: &Device) -> ExecutionPolicy {
     .expect("default execution policy is valid")
 }
 
-impl DenoiseObserver for CliDenoiseObserver {
-    fn synchronize_device_timings(&self) -> bool {
-        self.progress.synchronize_device_timings()
-    }
-
-    fn on_preparation_completed(&mut self, event: DenoisePreparationEvent) -> Result<()> {
-        self.progress
-            .on_preparation_completed(event, &mut std::io::stderr().lock())
-    }
-
-    fn on_step_completed(&mut self, event: DenoiseStepEvent) -> Result<()> {
-        self.progress
-            .on_step_completed(event, &mut std::io::stderr().lock())
-    }
-}
-
 pub(crate) fn run() -> Result<()> {
     routing::run()
 }
 
 fn dispatch(command: Command) -> Result<()> {
     match command {
-        Command::Clip(command) => clip::run(command),
-        Command::Music(command) => music::run(command),
-        Command::Minicpm(command) => minicpm::run(command),
         Command::Models(command) => models::run(command),
         Command::VerifyResourceEvidence { input } => resource::verify_evidence(&input),
         Command::Checkpoint(command) => checkpoint::run(command),
-        command @ Command::Probe { .. } => probe::run_probe(command),
-        command @ Command::Inspect { .. } => inspect::run_inspect(command),
-        command @ Command::Tensor { .. } => inspect::run_tensor(command),
-        command @ Command::Identify { .. } => identity::run_identify_model(command),
-        command @ Command::Diff { .. } => plan::run_compare_tensors(command),
+        Command::Probe { device, json } => probe::run_probe(device, json),
+        Command::Inspect {
+            checkpoint,
+            weights,
+            verify,
+        } => inspect::run_inspect(checkpoint, weights, verify),
+        Command::Tensor {
+            checkpoint,
+            name,
+            device,
+            weights,
+        } => inspect::run_tensor(checkpoint, name, device, weights),
+        Command::Identify { checkpoint, output } => {
+            identity::run_identify_model(checkpoint, output)
+        }
+        Command::Diff {
+            reference,
+            actual,
+            atol,
+            rtol,
+            allow_unexpected,
+        } => diff::run_compare_tensors(reference, actual, atol, rtol, allow_unexpected),
         Command::Bench(BenchCommand::Collective {
             output,
             devices,
@@ -1146,153 +728,33 @@ fn dispatch(command: Command) -> Result<()> {
             warmups,
             samples,
         ),
-        Command::Bench(command) => calibrate_io::run_calibrate_io(command),
-        Command::H3(command) => command.run(),
-        Command::Trellis(command) => command.run(),
-        Command::Glm(command) => command.run(),
+        Command::Bench(BenchCommand::Io {
+            profile,
+            payload,
+            model,
+            output,
+            device,
+            format,
+            peer_device,
+            warmups,
+            samples,
+            expert_layer,
+            expert_index,
+        }) => calibrate_io::run_calibrate_io(
+            profile,
+            payload,
+            model,
+            output,
+            device,
+            format,
+            peer_device,
+            warmups,
+            samples,
+            expert_layer,
+            expert_index,
+        ),
         Command::CalibrateT2vaTrial => calibrate::run_calibrate_t2va_trial(),
     }
-}
-
-fn take_input(values: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
-    values
-        .remove(name)
-        .with_context(|| format!("input safetensors is missing {name}"))
-}
-
-fn sorted_tensor_names(values: &HashMap<String, Tensor>) -> Vec<String> {
-    let mut names = values.keys().cloned().collect::<Vec<_>>();
-    names.sort_unstable();
-    names
-}
-
-#[allow(clippy::too_many_arguments)]
-fn make_t2va_noise(
-    config: &TransformerConfig,
-    latent_frames: usize,
-    latent_height: usize,
-    latent_width: usize,
-    audio_frames: usize,
-    audio_channels: usize,
-    seed: u64,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let video_count = config
-        .in_channels
-        .checked_mul(latent_frames)
-        .and_then(|value| value.checked_mul(latent_height))
-        .and_then(|value| value.checked_mul(latent_width))
-        .context("video latent element count overflow")?;
-    let video_values = (0..video_count)
-        .map(|_| StandardNormal.sample(&mut rng))
-        .collect::<Vec<f32>>();
-    let video_latents = Tensor::from_vec(
-        video_values,
-        (
-            1,
-            config.in_channels,
-            latent_frames,
-            latent_height,
-            latent_width,
-        ),
-        device,
-    )?;
-    let audio_count = audio_channels
-        .checked_mul(config.audio_in_channels)
-        .and_then(|value| value.checked_mul(audio_frames))
-        .context("audio latent element count overflow")?;
-    let audio_values = (0..audio_count)
-        .map(|_| StandardNormal.sample(&mut rng))
-        .collect::<Vec<f32>>();
-    let audio_latents = Tensor::from_vec(
-        audio_values,
-        (audio_channels, config.audio_in_channels, audio_frames),
-        device,
-    )?;
-    Ok((video_latents, audio_latents))
-}
-
-fn mib_to_bytes(value: u64) -> Result<u64> {
-    value
-        .checked_mul(1024 * 1024)
-        .context("MiB resource limit exceeds u64")
-}
-
-/// The int4 text adapters drive CUDA through cudarc contexts.
-enum TextDevice {
-    Cpu,
-    Cuda(Vec<usize>),
-}
-
-fn resolve_text_device(value: &str) -> Result<(TextDevice, bool)> {
-    let selected = match value {
-        "cpu" => TextDevice::Cpu,
-        "auto" => {
-            if Device::cuda_if_available(0)
-                .is_ok_and(|device| device.is_cuda() && ptx_floor_supported(&device))
-            {
-                TextDevice::Cuda(vec![0])
-            } else {
-                TextDevice::Cpu
-            }
-        }
-        _ if value.starts_with("cuda:") => {
-            let tail = &value["cuda:".len()..];
-            let ordinals: Result<Vec<usize>> = tail
-                .split(',')
-                .map(|segment| {
-                    let trimmed = segment.trim();
-                    anyhow::ensure!(
-                        !trimmed.is_empty(),
-                        "empty ordinal in device list {value:?}"
-                    );
-                    trimmed.parse::<usize>().map_err(|_| {
-                        anyhow::anyhow!(
-                            "malformed ordinal {trimmed:?} in device list {value:?}; \
-                             use cpu, auto, or cuda:N[,M...]"
-                        )
-                    })
-                })
-                .collect();
-            TextDevice::Cuda(ordinals?)
-        }
-        _ => bail!("unknown device {value:?}; use cpu, auto, or cuda:N[,M...]"),
-    };
-    #[cfg(not(feature = "cuda"))]
-    if matches!(selected, TextDevice::Cuda(_)) {
-        bail!("CUDA decoding requires a binary built with --features cuda");
-    }
-    Ok((selected, value == "auto"))
-}
-
-/// The int4 text adapters' kernels ship as compute_80 PTX; older GPUs cannot
-/// JIT it, so `auto` must not select them.
-#[cfg(feature = "cuda")]
-fn ptx_floor_supported(device: &Device) -> bool {
-    device
-        .as_cuda_device()
-        .ok()
-        .and_then(|cuda| cuda.cuda_stream().context().compute_capability().ok())
-        .is_some_and(|(major, _)| major >= 8)
-}
-
-#[cfg(not(feature = "cuda"))]
-fn ptx_floor_supported(_: &Device) -> bool {
-    false
-}
-
-fn greedy_token(logits: &[f32]) -> Result<u32> {
-    anyhow::ensure!(
-        logits.iter().all(|value| value.is_finite()),
-        "model produced non-finite logits"
-    );
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
-        .map(|(index, _)| index as u32)
-        .context("model produced no logits")
 }
 
 fn resolve_optional_new_output(path: Option<PathBuf>, model: &Path) -> Result<Option<PathBuf>> {
@@ -1315,162 +777,50 @@ fn ensure_optional_output_is_distinct(path: Option<&Path>, reserved: &[&Path]) -
     Ok(())
 }
 
-/// The directory a new output will be created in.
-///
-/// `Path::parent` answers `Some("")` for a bare relative file name, not `None`,
-/// so `unwrap_or(".")` never fires there and leaves an empty path that every
-/// later `is_dir` or `canonicalize` rejects. Both spellings name the working
-/// directory. `ArtifactStaging` already resolves this the same way.
-fn output_parent(path: &Path) -> &Path {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    }
-}
-
-fn ensure_new_output(path: &Path, label: &str) -> Result<()> {
-    anyhow::ensure!(!path.exists(), "{label} already exists: {}", path.display());
-    let parent = output_parent(path);
-    anyhow::ensure!(
-        parent.is_dir(),
-        "{label} parent directory does not exist: {}",
-        parent.display()
-    );
-    Ok(())
-}
-
-fn create_new_directory(path: &Path, label: &str) -> Result<()> {
-    std::fs::create_dir(path)
-        .with_context(|| format!("failed to create {label} {}", path.display()))?;
-    let parent = output_parent(path);
-    sync_parent_directory(parent)
-        .with_context(|| format!("failed to synchronize {label} parent {}", parent.display()))?;
-    Ok(())
-}
-
-fn resolve_output_outside_model(path: &Path, model: &Path) -> Result<PathBuf> {
-    let model = std::fs::canonicalize(model)
-        .with_context(|| format!("failed to resolve model directory {}", model.display()))?;
-    let candidate = if std::fs::symlink_metadata(path).is_ok() {
-        std::fs::canonicalize(path)
-            .with_context(|| format!("failed to resolve existing output {}", path.display()))?
-    } else {
-        let parent = output_parent(path);
-        let parent = std::fs::canonicalize(parent)
-            .with_context(|| format!("failed to resolve output parent {}", parent.display()))?;
-        match path.file_name() {
-            Some(name) => parent.join(name),
-            None => parent,
-        }
-    };
-    anyhow::ensure!(
-        !candidate.starts_with(&model),
-        "refusing to write output inside the model directory: {}",
-        candidate.display()
-    );
-    Ok(candidate)
-}
-
-fn write_telemetry(path: &Path, monitor: TelemetryMonitor) -> Result<()> {
-    let report = monitor.finish()?;
-    let json = serde_json::to_vec_pretty(&report)?;
-    let staging = flyingfish::runtime::artifact::ArtifactStaging::new(path)
-        .with_context(|| format!("failed to stage telemetry report {}", path.display()))?;
-    publish_staged_bytes(staging, &json)?;
-    println!("saved runtime telemetry to {}", path.display());
-    Ok(())
-}
-
-fn publish_staged_bytes(
-    staging: flyingfish::runtime::artifact::ArtifactStaging,
-    bytes: &[u8],
-) -> Result<flyingfish::runtime::artifact::PublishedArtifact> {
-    staging.write_bytes(bytes)?;
-    Ok(staging.publish()?)
-}
-
-fn publish_png_frame_manifest(directory: &Path, frame_count: usize) -> Result<()> {
-    const FILE_NAME: &str = "frames.manifest.json";
-    let manifest = PngFrameSetManifest::collect(directory, FILE_NAME, frame_count)?;
-    let json = manifest.canonical_json()?;
-    let path = directory.join(FILE_NAME);
-    let staging_parent = directory
-        .parent()
-        .context("PNG frame directory has no staging parent")?;
-    let staging = flyingfish::runtime::artifact::ArtifactStaging::new_with_staging_parent(
-        &path,
-        staging_parent,
-    )
-    .with_context(|| format!("failed to stage PNG frame-set manifest {}", path.display()))?;
-    publish_staged_bytes(staging, &json)?;
-    manifest.verify_completed_directory(directory, FILE_NAME)?;
-    Ok(())
-}
-
-fn resolve_component(model: &Path, component: &Path) -> Result<PathBuf> {
-    anyhow::ensure!(
-        model.is_dir(),
-        "model directory does not exist: {}",
-        model.display()
-    );
-    anyhow::ensure!(
-        !component.is_absolute(),
-        "component must be relative to the model directory"
-    );
-    anyhow::ensure!(
-        component
-            .components()
-            .all(|part| matches!(part, std::path::Component::Normal(_))),
-        "component path may not contain . or .."
-    );
-    let model = std::fs::canonicalize(model)
-        .with_context(|| format!("failed to resolve model directory {}", model.display()))?;
-    let unresolved = model.join(component);
-    let result = std::fs::canonicalize(&unresolved).with_context(|| {
-        format!(
-            "failed to resolve component directory {}",
-            unresolved.display()
-        )
-    })?;
-    anyhow::ensure!(
-        result.is_dir(),
-        "component directory does not exist: {}",
-        result.display()
-    );
-    anyhow::ensure!(
-        result.starts_with(&model),
-        "component directory escapes the model root: {}",
-        result.display()
-    );
-    Ok(result)
-}
-
-fn parse_device(value: &str) -> Result<Device> {
-    if value == "cpu" {
-        return Ok(Device::Cpu);
-    }
-    if value == "auto" {
-        return Device::cuda_if_available(0).context("failed to initialize automatic device");
-    }
-    if let Some(ordinal) = value.strip_prefix("cuda:") {
-        let ordinal = ordinal
-            .parse::<usize>()
-            .context("invalid CUDA device ordinal")?;
-        return Device::new_cuda(ordinal).context("failed to initialize CUDA device");
-    }
-    if let Some(ordinal) = value.strip_prefix("metal:") {
-        let ordinal = ordinal
-            .parse::<usize>()
-            .context("invalid Metal device ordinal")?;
-        return Device::new_metal(ordinal).context("failed to initialize Metal device");
-    }
-    bail!("unknown device {value:?}; use cpu, auto, cuda:N, or metal:N")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::{Tensor, safetensors};
+    use checkpoint::resolve_component;
     use clap::CommandFactory;
+    use clap::FromArgMatches as _;
+    use denoise::{
+        promote_attention_backend_for_rows, select_resume_execution_policy,
+        validate_executable_policy,
+    };
+    use flyingfish::glm::{ExpertCacheLayout, ExpertCacheReplacementPolicy};
+    use flyingfish::h3::audio_vae::WavSampleFormat;
+    use flyingfish::recovery::PolicyHistory;
+    use flyingfish::runtime::telemetry::TelemetryMonitor;
+    use flyingfish::runtime::weights::DeviceCachePolicy;
+    use output_hygiene::write_telemetry;
+    use resource::device_residency_reserve_bytes;
+    use std::collections::HashMap;
+    use std::num::NonZeroU64;
+    use std::time::Duration;
+
+    fn try_task_matches(
+        adapter_id: &str,
+        arguments: &[&str],
+    ) -> Result<clap::ArgMatches, clap::Error> {
+        let adapter = adapters::BUILTINS
+            .iter()
+            .find(|adapter| adapter.id == adapter_id)
+            .expect("adapter id");
+        routing::Registry::new(adapters::BUILTINS)
+            .selected_task_command(adapter)
+            .try_get_matches_from(
+                std::iter::once("ff").chain(
+                    ["--adapter", adapter_id]
+                        .into_iter()
+                        .chain(arguments.iter().copied()),
+                ),
+            )
+    }
+
+    fn task_matches(adapter_id: &str, arguments: &[&str]) -> clap::ArgMatches {
+        try_task_matches(adapter_id, arguments).unwrap()
+    }
 
     fn snap(
         unified: Option<bool>,
@@ -1616,27 +966,28 @@ mod tests {
 
     #[test]
     fn parses_resource_plan_command() {
-        let args = Args::try_parse_from([
-            "ff",
+        let command = H3Command::from_arg_matches(&task_matches(
             "h3",
-            "plan",
-            "--model",
-            "model",
-            "--text-rows",
-            "12",
-            "--max-device-mib",
-            "8192",
-            "--json",
-        ])
+            &[
+                "plan",
+                "--model",
+                "model",
+                "--text-rows",
+                "12",
+                "--max-device-mib",
+                "8192",
+                "--json",
+            ],
+        ))
         .unwrap();
-        match args.command {
-            Command::H3(H3Command::PlanT2va {
+        match command {
+            H3Command::PlanT2va {
                 text_rows,
                 chunks,
                 max_device_mib,
                 json,
                 ..
-            }) => {
+            } => {
                 assert_eq!(text_rows, 12);
                 let exact = chunks.configured(false);
                 assert_eq!(
@@ -1673,50 +1024,53 @@ mod tests {
     #[test]
     fn shared_chunk_args_reject_zero_and_flash_conflicts() {
         assert!(
-            Args::try_parse_from([
-                "ff",
+            try_task_matches(
                 "h3",
-                "plan",
-                "--model",
-                "model",
-                "--text-rows",
-                "1",
-                "--attention-query-chunk-size",
-                "0",
-            ])
+                &[
+                    "plan",
+                    "--model",
+                    "model",
+                    "--text-rows",
+                    "1",
+                    "--attention-query-chunk-size",
+                    "0",
+                ]
+            )
             .is_err()
         );
         assert!(
-            Args::try_parse_from([
-                "ff",
+            try_task_matches(
                 "h3",
-                "denoise",
-                "--model",
-                "model",
-                "--inputs",
-                "inputs.safetensors",
-                "--output",
-                "output.safetensors",
-                "--attention-key-chunk-size",
-                "128",
-                "--flash-attention",
-            ])
+                &[
+                    "denoise",
+                    "--model",
+                    "model",
+                    "--inputs",
+                    "inputs.safetensors",
+                    "--output",
+                    "output.safetensors",
+                    "--attention-key-chunk-size",
+                    "128",
+                    "--flash-attention",
+                ]
+            )
             .is_err()
         );
         assert!(
-            Args::try_parse_from([
-                "ff",
+            try_task_matches(
                 "h3",
-                "generate",
-                "--model",
-                "model",
-                "--prompt",
-                "test",
-                "--output-dir",
-                "output",
-                "--attention-key-chunk-size",
-                "0",
-            ])
+                &[
+                    "generate",
+                    "--model",
+                    "model",
+                    "--prompt",
+                    "test",
+                    "--output-dir",
+                    "output",
+                    "--attention-key-chunk-size",
+                    "0",
+                ]
+            )
             .is_err()
         );
     }
@@ -1740,19 +1094,20 @@ mod tests {
         assert_eq!(weights.weight_source, WeightSource::Memory);
         assert_eq!(weights.host_cache_mib, Some(4));
 
-        let args = Args::try_parse_from([
-            "ff",
+        let command = H3Command::from_arg_matches(&task_matches(
             "h3",
-            "denoise",
-            "--model",
-            "model",
-            "--inputs",
-            "inputs.safetensors",
-            "--output",
-            "output.safetensors",
-        ])
+            &[
+                "denoise",
+                "--model",
+                "model",
+                "--inputs",
+                "inputs.safetensors",
+                "--output",
+                "output.safetensors",
+            ],
+        ))
         .unwrap();
-        let Command::H3(H3Command::DenoiseT2va { weights, .. }) = args.command else {
+        let H3Command::DenoiseT2va { weights, .. } = command else {
             panic!("expected denoise command")
         };
         assert!(!weights.is_explicit());
@@ -1784,21 +1139,22 @@ mod tests {
         assert_eq!(policy.max_bytes, Some(2 * 1024 * 1024));
         assert_eq!(policy.max_shards, usize::MAX);
         assert!(
-            Args::try_parse_from([
-                "ff",
+            try_task_matches(
                 "h3",
-                "denoise",
-                "--model",
-                "model",
-                "--inputs",
-                "input",
-                "--output",
-                "output",
-                "--policy",
-                "policy.json",
-                "--host-cache-granularity",
-                "tensor"
-            ])
+                &[
+                    "denoise",
+                    "--model",
+                    "model",
+                    "--inputs",
+                    "input",
+                    "--output",
+                    "output",
+                    "--policy",
+                    "policy.json",
+                    "--host-cache-granularity",
+                    "tensor"
+                ]
+            )
             .is_err()
         );
     }
@@ -1841,21 +1197,22 @@ mod tests {
             CachePolicy::unbounded_units().with_max_bytes(8 * 1024 * 1024)
         );
 
-        let args = Args::try_parse_from([
-            "ff",
+        let command = H3Command::from_arg_matches(&task_matches(
             "h3",
-            "denoise",
-            "--model",
-            "model",
-            "--inputs",
-            "inputs.safetensors",
-            "--output",
-            "output.safetensors",
-            "--host-cache-mib",
-            "4",
-        ])
+            &[
+                "denoise",
+                "--model",
+                "model",
+                "--inputs",
+                "inputs.safetensors",
+                "--output",
+                "output.safetensors",
+                "--host-cache-mib",
+                "4",
+            ],
+        ))
         .unwrap();
-        let Command::H3(H3Command::DenoiseT2va { weights, .. }) = args.command else {
+        let H3Command::DenoiseT2va { weights, .. } = command else {
             panic!("expected denoise command")
         };
         let policy = weights.configured().cache_policy().unwrap();
@@ -1879,9 +1236,25 @@ mod tests {
             .is_err()
         );
         assert!(
-            Args::try_parse_from([
-                "ff",
+            try_task_matches(
                 "h3",
+                &[
+                    "denoise",
+                    "--model",
+                    "model",
+                    "--inputs",
+                    "inputs.safetensors",
+                    "--output",
+                    "output.safetensors",
+                    "--host-cache-shards",
+                    "2",
+                ]
+            )
+            .is_err()
+        );
+        let command = H3Command::from_arg_matches(&task_matches(
+            "h3",
+            &[
                 "denoise",
                 "--model",
                 "model",
@@ -1889,26 +1262,12 @@ mod tests {
                 "inputs.safetensors",
                 "--output",
                 "output.safetensors",
-                "--host-cache-shards",
-                "2",
-            ])
-            .is_err()
-        );
-        let args = Args::try_parse_from([
-            "ff",
-            "h3",
-            "denoise",
-            "--model",
-            "model",
-            "--inputs",
-            "inputs.safetensors",
-            "--output",
-            "output.safetensors",
-            "--component",
-            "FL2VA/transformer",
-        ])
+                "--component",
+                "FL2VA/transformer",
+            ],
+        ))
         .unwrap();
-        let Command::H3(H3Command::DenoiseT2va { component, .. }) = args.command else {
+        let H3Command::DenoiseT2va { component, .. } = command else {
             panic!("expected denoise command")
         };
         assert_eq!(component, PathBuf::from("FL2VA/transformer"));
@@ -1938,8 +1297,6 @@ mod tests {
     #[test]
     fn pinned_policy_conflicts_with_resource_flags_but_allows_device_selection() {
         let base = [
-            "ff",
-            "h3",
             "denoise",
             "--model",
             "model",
@@ -1952,15 +1309,15 @@ mod tests {
         ];
         let mut with_chunk = base.to_vec();
         with_chunk.extend(["--ffn-token-chunk-size", "64"]);
-        assert!(Args::try_parse_from(with_chunk).is_err());
+        assert!(try_task_matches("h3", &with_chunk).is_err());
 
         let mut with_weights = base.to_vec();
         with_weights.extend(["--host-cache-mib", "2"]);
-        assert!(Args::try_parse_from(with_weights).is_err());
+        assert!(try_task_matches("h3", &with_weights).is_err());
 
         let mut with_device = base.to_vec();
         with_device.extend(["--device", "cpu"]);
-        assert!(Args::try_parse_from(with_device).is_ok());
+        assert!(try_task_matches("h3", &with_device).is_ok());
     }
 
     #[test]
@@ -2151,21 +1508,22 @@ mod tests {
                 .contains("disagrees")
         );
 
-        let args = Args::try_parse_from([
-            "ff",
+        let command = H3Command::from_arg_matches(&task_matches(
             "h3",
-            "denoise",
-            "--model",
-            "model",
-            "--inputs",
-            "inputs.safetensors",
-            "--output",
-            "output.safetensors",
-            "--ffn-token-chunk-size",
-            "256",
-        ])
+            &[
+                "denoise",
+                "--model",
+                "model",
+                "--inputs",
+                "inputs.safetensors",
+                "--output",
+                "output.safetensors",
+                "--ffn-token-chunk-size",
+                "256",
+            ],
+        ))
         .unwrap();
-        let Command::H3(H3Command::DenoiseT2va { chunks, .. }) = args.command else {
+        let H3Command::DenoiseT2va { chunks, .. } = command else {
             panic!("expected denoise command")
         };
         assert!(
@@ -2193,7 +1551,6 @@ mod tests {
         recorded.execution_backend = flyingfish::h3::policy::ExecutionBackendPolicy::Cuda;
         *recorded.numerics = flyingfish::h3::policy::H3NumericalContract::for_verified_target(
             flyingfish::h3::policy::ExecutionBackendPolicy::Cuda,
-            flyingfish::h3::policy::AttentionBackendPolicy::FullSoftmax,
         )
         .unwrap();
         recorded.validate().unwrap();
@@ -2209,7 +1566,6 @@ mod tests {
                 tuned_kernels: false,
                 reference_libraries: true,
             }),
-            flyingfish::h3::policy::AttentionBackendPolicy::FullSoftmax,
         )
         .unwrap();
         requested.validate().unwrap();
@@ -2332,36 +1688,37 @@ mod tests {
 
     #[test]
     fn parses_unified_generation_command() {
-        let args = Args::try_parse_from([
-            "ff",
+        let command = H3Command::from_arg_matches(&task_matches(
             "h3",
-            "generate",
-            "--model",
-            "model",
-            "--prompt",
-            "a kite",
-            "--output-dir",
-            "output",
-            "--target-hidden-state",
-            "37",
-            "--attention-projection-chunk-size",
-            "64",
-            "--ffn-token-chunk-size",
-            "64",
-            "--output-token-chunk-size",
-            "128",
-            "--wav-format",
-            "float32",
-        ])
+            &[
+                "generate",
+                "--model",
+                "model",
+                "--prompt",
+                "a kite",
+                "--output-dir",
+                "output",
+                "--target-hidden-state",
+                "37",
+                "--attention-projection-chunk-size",
+                "64",
+                "--ffn-token-chunk-size",
+                "64",
+                "--output-token-chunk-size",
+                "128",
+                "--wav-format",
+                "float32",
+            ],
+        ))
         .unwrap();
-        match args.command {
-            Command::H3(H3Command::GenerateT2va {
+        match command {
+            H3Command::GenerateT2va {
                 prompt,
                 target_hidden_state,
                 chunks,
                 wav_format,
                 ..
-            }) => {
+            } => {
                 assert_eq!(prompt, "a kite");
                 assert_eq!(target_hidden_state, 37);
                 assert_eq!(chunks.attention_projection_chunk_size.unwrap().get(), 64);
@@ -2375,70 +1732,69 @@ mod tests {
 
     #[test]
     fn parses_glm_generation_and_residency_policy() {
-        let args = Args::try_parse_from([
-            "ff",
+        let command = GlmCommand::from_arg_matches(&task_matches(
             "glm",
-            "generate",
-            "--model",
-            "GLM-5.3-Flash",
-            "--prompt",
-            "17*23=",
-            "--max-new-tokens",
-            "32",
-            "--max-context-tokens",
-            "64",
-            "--reasoning-effort",
-            "low",
-            "--temperature",
-            "0",
-            "--resident-static",
-            "--expert-cache-mib",
-            "4096",
-            "--expert-cache-layout",
-            "shared-pool",
-            "--expert-cache-replacement",
-            "lfu",
-            "--expert-cache-readmit",
-            "--expert-cache-min-mib",
-            "1024",
-            "--execution-manifest",
-            "output/glm-execution.json",
-            "--json",
-            "--telemetry-json",
-            "output/glm-telemetry.json",
-            "--routing-trace",
-            "output/glm-routing.json",
-            "--routing-trace-domain",
-            "arithmetic",
-        ])
+            &[
+                "generate",
+                "--model",
+                "GLM-5.3-Flash",
+                "--prompt",
+                "17*23=",
+                "--max-new-tokens",
+                "32",
+                "--max-context-tokens",
+                "64",
+                "--reasoning-effort",
+                "low",
+                "--temperature",
+                "0",
+                "--resident-static",
+                "--expert-cache-mib",
+                "4096",
+                "--expert-cache-layout",
+                "shared-pool",
+                "--expert-cache-replacement",
+                "lfu",
+                "--expert-cache-readmit",
+                "--expert-cache-min-mib",
+                "1024",
+                "--execution-manifest",
+                "output/glm-execution.json",
+                "--json",
+                "--telemetry-json",
+                "output/glm-telemetry.json",
+                "--routing-trace",
+                "output/glm-routing.json",
+                "--routing-trace-domain",
+                "arithmetic",
+            ],
+        ))
         .unwrap();
-        match args.command {
-            Command::Glm(GlmCommand::Generate {
+        match command {
+            GlmCommand::Generate {
                 prompt,
                 max_new_tokens,
                 max_context_tokens,
                 reasoning_effort,
-                temperature,
-                top_p,
+                sampling,
                 resident_static,
                 expert_cache_mib,
                 expert_cache_layout,
                 expert_cache_replacement,
                 expert_cache_readmit,
                 expert_cache_min_mib,
-                json,
-                telemetry_json,
+                output,
                 routing_trace,
                 routing_trace_domain,
                 execution_manifest,
                 ..
-            }) => {
+            } => {
                 assert_eq!(prompt, "17*23=");
                 assert_eq!(max_new_tokens.get(), 32);
                 assert_eq!(max_context_tokens.get(), 64);
                 assert_eq!(reasoning_effort, "low");
-                assert_eq!(temperature, 0.0);
-                assert_eq!(top_p, 0.95);
+                assert_eq!(sampling.temperature, 0.0);
+                assert_eq!(sampling.top_p, 0.95);
                 assert_eq!(resident_static, Some(true));
                 assert_eq!(expert_cache_mib, Some(4096));
                 assert_eq!(expert_cache_layout, Some(ExpertCacheLayout::SharedPool));
@@ -2448,9 +1804,9 @@ mod tests {
                 );
                 assert!(expert_cache_readmit);
                 assert_eq!(expert_cache_min_mib, Some(1024));
-                assert!(json);
+                assert!(output.json);
                 assert_eq!(
-                    telemetry_json,
+                    output.telemetry_json,
                     Some(PathBuf::from("output/glm-telemetry.json"))
                 );
                 assert_eq!(
@@ -2469,17 +1825,9 @@ mod tests {
 
     #[test]
     fn glm_residency_flags_distinguish_absent_from_explicit_zero_and_false() {
-        let base = [
-            "ff",
-            "glm",
-            "generate",
-            "--model",
-            "GLM-5.3-Flash",
-            "--prompt",
-            "hello",
-        ];
-        let defaults = Args::try_parse_from(base).unwrap();
-        let Command::Glm(GlmCommand::Generate {
+        let base = ["generate", "--model", "GLM-5.3-Flash", "--prompt", "hello"];
+        let defaults = GlmCommand::from_arg_matches(&task_matches("glm", &base)).unwrap();
+        let GlmCommand::Generate {
             weights,
             resource_policy,
             resident_static,
@@ -2488,7 +1836,7 @@ mod tests {
             expert_cache_layout,
             expert_cache_replacement,
             ..
-        }) = defaults.command
+        } = defaults
         else {
             panic!("wrong command")
         };
@@ -2503,24 +1851,30 @@ mod tests {
         assert_eq!(expert_cache_layout, None);
         assert_eq!(expert_cache_replacement, None);
 
-        let args = Args::try_parse_from(base.into_iter().chain([
-            "--no-resident-static",
-            "--expert-cache-mib",
-            "0",
-            "--weight-source",
-            "mmap",
-            "--expert-cache-layout",
-            "shared-pool",
-        ]))
+        let args = GlmCommand::from_arg_matches(&task_matches(
+            "glm",
+            &base
+                .into_iter()
+                .chain([
+                    "--no-resident-static",
+                    "--expert-cache-mib",
+                    "0",
+                    "--weight-source",
+                    "mmap",
+                    "--expert-cache-layout",
+                    "shared-pool",
+                ])
+                .collect::<Vec<_>>(),
+        ))
         .unwrap();
-        let Command::Glm(GlmCommand::Generate {
+        let GlmCommand::Generate {
             weights,
             resident_static,
             no_resident_static,
             expert_cache_mib,
             expert_cache_layout,
             ..
-        }) = args.command
+        } = args
         else {
             panic!("wrong command")
         };
@@ -2530,17 +1884,26 @@ mod tests {
         assert_eq!(weights.weight_source, Some(WeightSource::Mmap));
         assert_eq!(expert_cache_layout, Some(ExpertCacheLayout::SharedPool));
         assert!(
-            Args::try_parse_from(
-                base.into_iter()
+            try_task_matches(
+                "glm",
+                &base
+                    .into_iter()
                     .chain(["--resident-static", "--no-resident-static"])
+                    .collect::<Vec<_>>(),
             )
             .is_err()
         );
-        let explicit_false =
-            Args::try_parse_from(base.into_iter().chain(["--resident-static=false"])).unwrap();
-        let Command::Glm(GlmCommand::Generate {
+        let explicit_false = GlmCommand::from_arg_matches(&task_matches(
+            "glm",
+            &base
+                .into_iter()
+                .chain(["--resident-static=false"])
+                .collect::<Vec<_>>(),
+        ))
+        .unwrap();
+        let GlmCommand::Generate {
             resident_static, ..
-        }) = explicit_false.command
+        } = explicit_false
         else {
             panic!("wrong command")
         };
@@ -2549,27 +1912,28 @@ mod tests {
 
     #[test]
     fn parses_glm_routing_replay_lists() {
-        let args = Args::try_parse_from([
-            "ff",
+        let command = GlmCommand::from_arg_matches(&task_matches(
             "glm",
-            "replay-routing",
-            "--trace",
-            "routing.json",
-            "--output",
-            "replay.json",
-            "--segment-lengths",
-            "2,8",
-            "--cache-mib",
-            "64,128",
-        ])
+            &[
+                "replay-routing",
+                "--trace",
+                "routing.json",
+                "--output",
+                "replay.json",
+                "--segment-lengths",
+                "2,8",
+                "--cache-mib",
+                "64,128",
+            ],
+        ))
         .unwrap();
-        match args.command {
-            Command::Glm(GlmCommand::ReplayRouting {
+        match command {
+            GlmCommand::ReplayRouting {
                 trace,
                 output,
                 segment_lengths,
                 cache_mib,
-            }) => {
+            } => {
                 assert_eq!(trace, PathBuf::from("routing.json"));
                 assert_eq!(output, PathBuf::from("replay.json"));
                 assert_eq!(
@@ -2593,32 +1957,33 @@ mod tests {
 
     #[test]
     fn parses_bounded_glm_parity_capture() {
-        let args = Args::try_parse_from([
-            "ff",
+        let command = GlmCommand::from_arg_matches(&task_matches(
             "glm",
-            "capture-parity",
-            "--model",
-            "GLM-5.3-Flash",
-            "--prompt",
-            "17*23=",
-            "--max-context-tokens",
-            "128",
-            "--reasoning-effort",
-            "max",
-            "--resident-static",
-            "--output",
-            "capture.safetensors",
-        ])
+            &[
+                "capture-parity",
+                "--model",
+                "GLM-5.3-Flash",
+                "--prompt",
+                "17*23=",
+                "--max-context-tokens",
+                "128",
+                "--reasoning-effort",
+                "max",
+                "--resident-static",
+                "--output",
+                "capture.safetensors",
+            ],
+        ))
         .unwrap();
-        match args.command {
-            Command::Glm(GlmCommand::CaptureParity {
+        match command {
+            GlmCommand::CaptureParity {
                 prompt,
                 max_context_tokens,
                 reasoning_effort,
                 resident_static,
                 output,
                 ..
-            }) => {
+            } => {
                 assert_eq!(prompt, "17*23=");
                 assert_eq!(max_context_tokens.get(), 128);
                 assert_eq!(reasoning_effort, "max");
@@ -2631,45 +1996,44 @@ mod tests {
 
     #[test]
     fn adaptive_glm_cache_requires_its_audit_manifest_and_gate() {
-        let base = [
-            "ff", "glm", "generate", "--model", "model", "--prompt", "prompt",
-        ];
+        let base = ["generate", "--model", "model", "--prompt", "prompt"];
         let mut readmit_without_manifest = base.to_vec();
         readmit_without_manifest.push("--expert-cache-readmit");
-        assert!(Args::try_parse_from(readmit_without_manifest).is_err());
+        assert!(try_task_matches("glm", &readmit_without_manifest).is_err());
 
         let mut floor_without_readmit = base.to_vec();
         floor_without_readmit.extend(["--expert-cache-min-mib", "1"]);
-        assert!(Args::try_parse_from(floor_without_readmit).is_err());
+        assert!(try_task_matches("glm", &floor_without_readmit).is_err());
     }
 
     #[test]
     fn parses_resumable_denoise_and_online_attention() {
-        let args = Args::try_parse_from([
-            "ff",
+        let command = H3Command::from_arg_matches(&task_matches(
             "h3",
-            "denoise",
-            "--model",
-            "model",
-            "--inputs",
-            "checkpoint.safetensors",
-            "--output",
-            "next.safetensors",
-            "--checkpoint-dir",
-            "checkpoints",
-            "--max-steps",
-            "2",
-            "--attention-key-chunk-size",
-            "1024",
-        ])
+            &[
+                "denoise",
+                "--model",
+                "model",
+                "--inputs",
+                "checkpoint.safetensors",
+                "--output",
+                "next.safetensors",
+                "--checkpoint-dir",
+                "checkpoints",
+                "--max-steps",
+                "2",
+                "--attention-key-chunk-size",
+                "1024",
+            ],
+        ))
         .unwrap();
-        match args.command {
-            Command::H3(H3Command::DenoiseT2va {
+        match command {
+            H3Command::DenoiseT2va {
                 max_steps,
                 chunks,
                 checkpoint_dir,
                 ..
-            }) => {
+            } => {
                 assert_eq!(max_steps.map(NonZeroUsize::get), Some(2));
                 assert_eq!(checkpoint_dir, Some(PathBuf::from("checkpoints")));
                 assert_eq!(
@@ -2772,18 +2136,18 @@ mod tests {
     fn extracted_handler_can_be_tested_directly() {
         let root = tempfile::tempdir().unwrap();
         let missing_model = root.path().join("missing-model");
-        let command = Args::try_parse_from([
-            "ff",
-            "tensor",
-            "--checkpoint",
-            missing_model.to_str().unwrap(),
-            "--name",
-            "probe.weight",
-        ])
-        .unwrap()
-        .command;
 
-        let error = inspect::run_tensor(command).unwrap_err();
+        let error = inspect::run_tensor(
+            missing_model,
+            "probe.weight".to_owned(),
+            "cpu".to_owned(),
+            WeightCacheArgs {
+                weight_source: WeightSource::Mmap,
+                host_cache_mib: None,
+                host_cache_granularity: CacheGranularity::default(),
+            },
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2917,8 +2281,6 @@ mod tests {
     #[test]
     fn the_official_and_explicit_generate_targets_are_mutually_exclusive() {
         let base = [
-            "ff",
-            "h3",
             "generate",
             "--model",
             "model",
@@ -2928,27 +2290,54 @@ mod tests {
             "out",
         ];
         assert!(
-            Args::try_parse_from(base.iter().copied().chain([
-                "--short-edge",
-                "768",
-                "--duration-seconds",
-                "10",
-                "--latent-frames",
-                "72",
-            ]))
+            try_task_matches(
+                "h3",
+                &base
+                    .iter()
+                    .copied()
+                    .chain([
+                        "--short-edge",
+                        "768",
+                        "--duration-seconds",
+                        "10",
+                        "--latent-frames",
+                        "72",
+                    ])
+                    .collect::<Vec<_>>(),
+            )
             .is_err()
         );
-        assert!(Args::try_parse_from(base.iter().copied().chain(["--short-edge", "768"])).is_err());
         assert!(
-            Args::try_parse_from(base.iter().copied().chain(["--duration-seconds", "10"])).is_err()
+            try_task_matches(
+                "h3",
+                &base
+                    .iter()
+                    .copied()
+                    .chain(["--short-edge", "768"])
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
         );
         assert!(
-            Args::try_parse_from(base.iter().copied().chain([
-                "--short-edge",
-                "768",
-                "--duration-seconds",
-                "10"
-            ]))
+            try_task_matches(
+                "h3",
+                &base
+                    .iter()
+                    .copied()
+                    .chain(["--duration-seconds", "10"])
+                    .collect::<Vec<_>>(),
+            )
+            .is_err()
+        );
+        assert!(
+            try_task_matches(
+                "h3",
+                &base
+                    .iter()
+                    .copied()
+                    .chain(["--short-edge", "768", "--duration-seconds", "10"])
+                    .collect::<Vec<_>>(),
+            )
             .is_ok()
         );
     }
@@ -2956,8 +2345,6 @@ mod tests {
     #[test]
     fn prepare_commands_accept_either_geometry_form_but_require_one() {
         let prepare = [
-            "ff",
-            "h3",
             "prepare",
             "--model",
             "model",
@@ -2966,20 +2353,20 @@ mod tests {
             "--output",
             "out.safetensors",
         ];
-        assert!(Args::try_parse_from(prepare).is_err());
+        assert!(try_task_matches("h3", &prepare).is_err());
         assert!(
-            Args::try_parse_from(prepare.iter().copied().chain([
-                "--short-edge",
-                "768",
-                "--duration-seconds",
-                "10"
-            ]))
+            try_task_matches(
+                "h3",
+                &prepare
+                    .iter()
+                    .copied()
+                    .chain(["--short-edge", "768", "--duration-seconds", "10"])
+                    .collect::<Vec<_>>(),
+            )
             .is_ok()
         );
 
         let ref2va = [
-            "ff",
-            "h3",
             "prepare-ref2va",
             "--model",
             "model",
@@ -2990,14 +2377,16 @@ mod tests {
             "--output",
             "out",
         ];
-        assert!(Args::try_parse_from(ref2va).is_err());
+        assert!(try_task_matches("h3", &ref2va).is_err());
         assert!(
-            Args::try_parse_from(ref2va.iter().copied().chain([
-                "--short-edge",
-                "768",
-                "--duration-seconds",
-                "10"
-            ]))
+            try_task_matches(
+                "h3",
+                &ref2va
+                    .iter()
+                    .copied()
+                    .chain(["--short-edge", "768", "--duration-seconds", "10"])
+                    .collect::<Vec<_>>(),
+            )
             .is_ok()
         );
     }

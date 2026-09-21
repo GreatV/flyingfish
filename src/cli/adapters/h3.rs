@@ -1,5 +1,3 @@
-use crate::cli::*;
-
 #[derive(Debug, Subcommand)]
 pub(in crate::cli) enum H3Command {
     #[command(
@@ -672,7 +670,17 @@ impl H3Command {
 }
 
 use super::{Adapter, Task};
-use clap::FromArgMatches;
+use crate::cli::{
+    DenoiseChunkArgs, H3AdmissionArgs, H3ResourceArgs, OptionalWeightCacheArgs, TargetGeometryArgs,
+    WeightCacheArgs,
+};
+use crate::cli::{calibrate, conditioned, decode, denoise, generate, initialize, plan, prompt};
+use anyhow::Result;
+use clap::{FromArgMatches, Subcommand};
+use flyingfish::h3::audio_vae::WavSampleFormat;
+use flyingfish::h3::core::DEFAULT_ATTENTION_QUERY_CHUNK_SIZE;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
 pub(super) const ADAPTER: Adapter = Adapter {
     id: "h3",
