@@ -34,6 +34,7 @@ mod decode;
 mod denoise;
 mod device_parse;
 mod diff;
+mod dsv41;
 mod edge0;
 mod generate;
 mod glm;

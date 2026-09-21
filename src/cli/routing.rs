@@ -582,6 +582,34 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v41_metadata_selects_the_dsv41_adapter() {
+        let registry = Registry::new(BUILTINS);
+        let cases = [(
+            serde_json::json!({
+                "architectures":["DeepseekV41ForCausalLM"],
+                "model_type":"deepseek_v41"
+            }),
+            "dsv41",
+        )];
+        for (metadata, expected) in cases {
+            let directory = checkpoint(metadata);
+            let selected = registry
+                .select(Task::Text, &args(directory.path()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected.id, expected);
+        }
+        // The architecture without the model_type belt is not claimed.
+        let directory = checkpoint(serde_json::json!({"architectures":["DeepseekV41ForCausalLM"]}));
+        let error = registry
+            .select(Task::Text, &args(directory.path()))
+            .err()
+            .expect("unbelted metadata must not be claimed")
+            .to_string();
+        assert!(error.contains("no registered adapter"), "{error}");
+    }
+
+    #[test]
     fn both_trellis_generations_use_the_3d_task() {
         let registry = Registry::new(BUILTINS);
         for architecture in [

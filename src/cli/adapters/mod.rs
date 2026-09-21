@@ -1,6 +1,7 @@
 //! Model-specific command schemas and execution behind task-based routing.
 
 mod clip;
+mod dsv41;
 mod edge0;
 mod glm;
 mod h3;
@@ -115,6 +116,7 @@ pub(super) struct Adapter {
 
 pub(super) const BUILTINS: &[Adapter] = &[
     glm::ADAPTER,
+    dsv41::ADAPTER,
     minicpm::ADAPTER,
     edge0::ADAPTER,
     qwen35::ADAPTER,

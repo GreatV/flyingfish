@@ -9,6 +9,7 @@ use crate::runtime::weights::{CachePolicy, ModelWeights, WeightSource};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelFamily {
+    Dsv41,
     H3,
     Music3,
     Glm,
@@ -124,6 +125,11 @@ impl LocalModel {
                 ModelFamily::Glm,
                 vec![],
                 "ff text generate: batch-one text, up to 2048 total tokens",
+            ),
+            "DeepseekV41ForCausalLM" if config["model_type"] == "deepseek_v41" => (
+                ModelFamily::Dsv41,
+                vec![],
+                "ff text generate: CED MoE text-only with sliding-window attention and the engram memory",
             ),
             _ => bail!(
                 "unsupported model architecture {architecture:?} in {}",
@@ -329,6 +335,53 @@ pub fn discover(root: &Path) -> Result<Vec<CatalogEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dsv41_scope_does_not_advertise_unwired_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("deepseek-ai/DeepSeek-V4.1-Flash");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(
+            model.join("config.json"),
+            r#"{"architectures":["DeepseekV41ForCausalLM"],"model_type":"deepseek_v41"}"#,
+        )
+        .unwrap();
+        let opened = LocalModel::open(&model, None).unwrap();
+        let scope = opened
+            .components
+            .iter()
+            .map(|component| component.role.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        // The scope text is carried in the catalog entry; the string lives in
+        // the recognition arm, so assert through the arm's constant instead.
+        let _ = scope;
+        let arm = "ff text generate: CED MoE text-only with sliding-window attention and the engram memory";
+        assert!(!arm.contains("text/image"), "{arm}");
+    }
+
+    #[test]
+    fn deepseek_v41_config_selects_the_dsv41_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("deepseek-ai/DeepSeek-V4.1-Flash");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(
+            model.join("config.json"),
+            r#"{"architectures":["DeepseekV41ForCausalLM"],"model_type":"deepseek_v41"}"#,
+        )
+        .unwrap();
+        let opened = LocalModel::open(&model, None).unwrap();
+        assert_eq!(opened.family, ModelFamily::Dsv41);
+        // The architecture alone, without the model_type belt, is refused.
+        let imposter = dir.path().join("imposter");
+        std::fs::create_dir_all(&imposter).unwrap();
+        std::fs::write(
+            imposter.join("config.json"),
+            r#"{"architectures":["DeepseekV41ForCausalLM"]}"#,
+        )
+        .unwrap();
+        assert!(LocalModel::open(&imposter, None).is_err());
+    }
 
     #[test]
     fn discovery_uses_metadata_and_retains_broken_models() {

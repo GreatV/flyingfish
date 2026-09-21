@@ -696,6 +696,24 @@ name = "ff-cuda-build"
 version = "0.1.0"
 
 [[package]]
+name = "ff-dsv41"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "cudarc 0.19.9",
+ "ff-core",
+ "half",
+ "memmap2",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokenizers",
+]
+
+[[package]]
 name = "ff-edge0"
 version = "0.1.0"
 dependencies = [
@@ -863,6 +881,7 @@ dependencies = [
  "clap",
  "cudarc 0.19.9",
  "ff-core",
+ "ff-dsv41",
  "ff-edge0",
  "ff-glm",
  "ff-h3",

@@ -1,6 +1,6 @@
 //! Shared argument groups for model adapters.
 
-use std::path::PathBuf;
+use std::{num::NonZeroUsize, path::PathBuf};
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct SamplingArgs {
@@ -45,4 +45,12 @@ pub struct OutputArgs {
         help = "Write sampled RSS/CUDA peaks to a new JSON file outside the model"
     )]
     pub telemetry_json: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, clap::Args)]
+pub struct DecodeLimitArgs {
+    #[arg(long, default_value_t = NonZeroUsize::new(128).unwrap())]
+    pub max_new_tokens: NonZeroUsize,
+    #[arg(long, default_value_t = NonZeroUsize::new(2048).unwrap())]
+    pub max_context_tokens: NonZeroUsize,
 }

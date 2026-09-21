@@ -1,0 +1,30 @@
+[package]
+name = "ff-dsv41"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ff-core = { path = "../ff-core" }
+anyhow.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+half.workspace = true
+memmap2.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokenizers.workspace = true
+cudarc = { workspace = true, optional = true }
+
+[features]
+default = []
+cuda = ["ff-core/cuda", "candle-core/cuda", "candle-nn/cuda", "dep:cudarc"]
+
+[lints.rust]
+warnings = "deny"
+
+[dev-dependencies]
+tempfile.workspace = true
