@@ -115,7 +115,6 @@ pub fn sparse_attn(
 /// Returns a U8 mask shaped like `scores`, 1 where the position survives.
 pub fn select_candidate_blocks(
     scores: &Tensor,
-    compress_lens: usize,
     topk_blocks: usize,
     block_size: usize,
 ) -> Result<Tensor> {
@@ -139,9 +138,15 @@ pub fn select_candidate_blocks(
                 *score = score.max(values[row * width + column]);
             }
         }
-        let last = compress_lens as isize - 1;
-        if last >= 0 {
-            block_scores[(last / block_size as isize) as usize] = f32::INFINITY;
+        // Pin the block holding this query's newest reachable position: the
+        // causal mask has already driven every unreachable score to -inf, so
+        // the last finite column is the query's own visible end. A chunk-wide
+        // end would pin a block this query cannot legally attend to.
+        let last_visible = (0..width)
+            .rev()
+            .find(|column| values[row * width + column].is_finite());
+        if let Some(last_visible) = last_visible {
+            block_scores[last_visible / block_size] = f32::INFINITY;
         }
         let mut order = (0..blocks).collect::<Vec<_>>();
         order.sort_by(|a, b| {
@@ -508,9 +513,12 @@ mod tests {
     }
 
     #[test]
-    fn candidate_blocks_pin_the_newest_block_and_drop_unreachable_ones() {
+    fn candidate_blocks_pin_each_querys_newest_reachable_block() {
         let device = Device::Cpu;
-        // 8 positions, block size 4; position 7 is the newest reachable one.
+        // Two queries, 8 positions, block size 4. The early query reaches
+        // only block 0; the late query reaches both. Pinning follows each
+        // query's own finite end, so the early query never keeps a block it
+        // cannot attend to.
         let scores = Tensor::from_vec(
             vec![
                 1.0f32,
@@ -521,19 +529,30 @@ mod tests {
                 f32::NEG_INFINITY,
                 f32::NEG_INFINITY,
                 f32::NEG_INFINITY,
+                0.5f32,
+                0.0,
+                0.0,
+                0.0,
+                9.0,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
             ],
-            (1, 8),
+            (2, 8),
             &device,
         )
         .unwrap();
-        let mask = select_candidate_blocks(&scores, 8, 1, 4).unwrap();
+        let mask = select_candidate_blocks(&scores, 1, 4).unwrap();
         let values = mask.flatten_all().unwrap().to_vec1::<u8>().unwrap();
-        // The second block is pinned even though its scores are -inf.
-        assert_eq!(values, [0, 0, 0, 0, 1, 1, 1, 1]);
-        // With two blocks wanted, the high-scoring first block joins it.
-        let mask = select_candidate_blocks(&scores, 8, 2, 4).unwrap();
+        assert_eq!(values[..8], [1, 1, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(values[8..], [0, 0, 0, 0, 1, 1, 1, 1]);
+        // A chunk-wide pin would hand the early query block 1 — causally
+        // unreachable — and could starve its own reachable block when
+        // topk_blocks runs out.
+        let mask = select_candidate_blocks(&scores, 2, 4).unwrap();
         let values = mask.flatten_all().unwrap().to_vec1::<u8>().unwrap();
-        assert_eq!(values, [1, 1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(values[..8], [1, 1, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(values[8..], [1, 1, 1, 1, 1, 1, 1, 1]);
     }
 
     #[test]

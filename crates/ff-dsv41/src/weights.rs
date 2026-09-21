@@ -337,7 +337,8 @@ impl TransformerLoader {
     pub fn resident_f32_bytes(&self) -> Result<u64> {
         // Header reads are cheap: one per shard, then each tensor's exact
         // dtype and shape decide its dequantized size.
-        let mut headers: HashMap<String, safetensors::SafeTensors<'static>> = HashMap::new();
+        let mut headers: HashMap<String, (memmap2::Mmap, safetensors::SafeTensors<'static>)> =
+            HashMap::new();
         let mut total = 0u64;
         for (tensor, shard) in &self.layout.tensors {
             let role = self
@@ -348,10 +349,9 @@ impl TransformerLoader {
                 continue;
             }
             if !headers.contains_key(shard) {
-                let (_, opened) = open_shard(&self.model_dir, shard)?;
-                headers.insert(shard.clone(), opened);
+                headers.insert(shard.clone(), open_shard(&self.model_dir, shard)?);
             }
-            let header = headers.get(shard).expect("just inserted");
+            let (_, header) = headers.get(shard).expect("just inserted");
             let view = header
                 .tensor(tensor)
                 .with_context(|| format!("{tensor} is not in {shard}"))?;
@@ -723,6 +723,26 @@ mod tests {
             assert_eq!(layout.shard_role(shard), Some(ShardRole::Engram));
             assert_eq!(layout.tensors_in(shard).len(), 6);
         }
+    }
+
+    #[test]
+    fn repeated_estimate_calls_stay_valid_after_map_release() {
+        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        if !dir.join("model.safetensors.index.json").exists() {
+            return;
+        }
+        let first = TransformerLoader::open(dir)
+            .unwrap()
+            .resident_f32_bytes()
+            .unwrap();
+        // Each call builds and drops its own header set; a dangling mmap
+        // would read freed storage on the second pass.
+        let second = TransformerLoader::open(dir)
+            .unwrap()
+            .resident_f32_bytes()
+            .unwrap();
+        assert_eq!(first, second);
+        assert!(first > 0);
     }
 
     #[test]

@@ -117,12 +117,20 @@ fn greedy(values: &[f32]) -> Result<u32> {
 /// Nucleus sampling with a seeded generator; mirrors the GLM reference
 /// (softmax over the vocabulary, keep the smallest prefix reaching `top_p`).
 fn sample_token(logits: &Tensor, temperature: f64, top_p: f64, rng: &mut StdRng) -> Result<u32> {
+    anyhow::ensure!(
+        temperature.is_finite() && temperature >= 0.0,
+        "sampling temperature must be finite and non-negative"
+    );
+    anyhow::ensure!(
+        top_p.is_finite() && top_p > 0.0 && top_p <= 1.0,
+        "top-p must lie in (0, 1]"
+    );
     if temperature == 0.0 {
         return greedy(&logits.flatten_all()?.to_vec1::<f32>()?);
     }
     anyhow::ensure!(
-        temperature.is_finite() && temperature > 0.0 && temperature.recip().is_finite(),
-        "sampling temperature must be positive and safely invertible"
+        temperature.recip().is_finite(),
+        "sampling temperature must be safely invertible"
     );
     let values = logits
         .to_dtype(candle_core::DType::F32)?
@@ -387,12 +395,19 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             let limit = max_context_tokens.get();
             anyhow::ensure!(!ids.is_empty(), "prompt tokenized to an empty sequence");
             // Truncating would silently drop the assistant/thinking header
-            // the template appended; refuse an oversized prompt instead.
+            // the template appended; refuse an oversized prompt instead. The
+            // model's trained span is a second gate, same as generate.
             anyhow::ensure!(
                 ids.len() <= limit,
                 "prompt of {} tokens exceeds the {}-token capture limit",
                 ids.len(),
                 limit
+            );
+            anyhow::ensure!(
+                ids.len() <= loader.config().text_config.max_position_embeddings,
+                "prompt of {} tokens exceeds the model's {}-token span",
+                ids.len(),
+                loader.config().text_config.max_position_embeddings
             );
             let mut transformer = loader.load(Some(&tokenizer), limit.max(ids.len()))?;
             let device = Device::Cpu;
@@ -522,6 +537,33 @@ fn host_available_bytes(source: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn sampler_rejects_out_of_range_top_p_and_temperature() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 3), &device).unwrap();
+        let mut rng = StdRng::seed_from_u64(0);
+        for (temperature, top_p) in [
+            (1.0f64, 0.0f64),
+            (1.0, -1.0),
+            (1.0, f64::NAN),
+            (1.0, 1.5),
+            (-1.0, 0.95),
+            (f64::INFINITY, 0.95),
+        ] {
+            let error = sample_token(&logits, temperature, top_p, &mut rng)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("top-p") || error.contains("temperature"),
+                "({temperature}, {top_p}): {error}"
+            );
+        }
+        // Valid edges still sample.
+        sample_token(&logits, 1.0, 1.0, &mut rng).unwrap();
+    }
+
     use super::*;
 
     #[test]

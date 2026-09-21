@@ -595,7 +595,6 @@ impl AttentionCore {
                 if candidate_source {
                     runtime.candidates = Some(select_candidate_blocks(
                         &scores,
-                        compress_len,
                         self.candidate_topk_blocks,
                         self.candidate_block_size,
                     )?);
@@ -607,7 +606,7 @@ impl AttentionCore {
                     .topk_idxs
                     .as_ref()
                     .context("non-index layer read picks before any source wrote them")?;
-                topk.extend(shared.flatten_all()?.to_vec1::<i64>()?);
+                compress_picks = shared.flatten_all()?.to_vec1::<i64>()?;
             }
             if let Some(latent) = latents {
                 // The latent stands for the first token of its group; decode
@@ -640,20 +639,28 @@ impl AttentionCore {
                 .to_vec1::<f32>()?;
                 self.compress_cache.extend(quantized);
             }
-            let cache_rows = self.compress_cache.len() / head_dim;
-            let rows = cache_rows.min(compress_len * batch);
-            for row in 0..rows {
-                kv_values
-                    .extend_from_slice(&self.compress_cache[row * head_dim..(row + 1) * head_dim]);
-            }
-            if is_kv_source {
+            // Consumers append the source's published rows into their own
+            // attention input so the compressed picks index real rows;
+            // sources publish from their own cache instead of reading.
+            let shared_rows: Vec<f32> = if is_kv_source {
+                let cache_rows = self.compress_cache.len() / head_dim;
+                let rows = cache_rows.min(compress_len * batch);
                 runtime.compress_kv = Some(Tensor::from_vec(
-                    self.compress_cache[..(compress_len * batch).min(self.compress_cache.len())]
-                        .to_vec(),
-                    (batch, compress_len.min(cache_rows / batch), head_dim),
+                    self.compress_cache[..rows * head_dim].to_vec(),
+                    (batch, rows / batch.max(1), head_dim),
                     device,
                 )?);
-            }
+                self.compress_cache[..rows * head_dim].to_vec()
+            } else {
+                runtime
+                    .compress_kv
+                    .as_ref()
+                    .context("non-source layer read compressed KV before any source wrote it")?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+            };
+            kv_values.extend(shared_rows);
         }
 
         // sparse_attn reads one pick row per query: interleave the window and
@@ -1113,6 +1120,144 @@ mod tests {
     }
 
     #[test]
+    fn consumer_layers_attend_over_the_published_compressed_rows() {
+        use crate::math::precompute_freqs_cis;
+        let device = Device::Cpu;
+        let heads = 2usize;
+        let head_dim = 32usize;
+        let hidden = 32usize;
+        let qlora = 16usize;
+        let ones = |rows: usize, columns: usize| {
+            Tensor::from_vec(
+                (0..rows * columns)
+                    .map(|index| ((index % 7) as f32 - 3.0) / 97.0)
+                    .collect(),
+                (rows, columns),
+                &device,
+            )
+            .unwrap()
+        };
+        let build = || AttentionCore {
+            sink: Tensor::zeros(heads, DType::F32, &device).unwrap(),
+            wq_a: ones(qlora, hidden),
+            q_norm: Tensor::ones(qlora, DType::F32, &device).unwrap(),
+            wq_b: ones(heads * head_dim, qlora),
+            wkv: ones(head_dim, hidden),
+            kv_norm: Tensor::ones(head_dim, DType::F32, &device).unwrap(),
+            wo_a: ones(2 * 16, head_dim),
+            wo_b: ones(hidden, 2 * 16),
+            compressor: Some(
+                Compressor::new(
+                    2,
+                    head_dim,
+                    Tensor::ones(head_dim, DType::F32, &device).unwrap(),
+                    ones(head_dim, hidden),
+                    Some(ones(head_dim, hidden)),
+                    1,
+                )
+                .unwrap(),
+            ),
+            compress_cache: Vec::new(),
+            index_k_cache: Vec::new(),
+            ring: WindowRing::new(1, 4, head_dim, &device).unwrap(),
+            indexer_wq_b: Some(ones(2 * 32, qlora)),
+            indexer_wk: Some(ones(32, head_dim)),
+            indexer_k_norm: Some(Tensor::ones(32, DType::F32, &device).unwrap()),
+            weights_proj: Some(ones(2, hidden)),
+            freqs: precompute_freqs_cis(8, 16, 0, 1600.0, 1.0, 32, 1, &device).unwrap(),
+            index_head_dim: 32,
+            index_heads: 2,
+            index_topk: 2,
+            candidate_topk_blocks: 4,
+            candidate_block_size: 4,
+        };
+        let x = Tensor::from_vec(
+            (0..2 * hidden)
+                .map(|index| (index % 5) as f32 / 31.0)
+                .collect(),
+            (1, 2, hidden),
+            &device,
+        )
+        .unwrap();
+        let run = |shared: f32| {
+            let mut source = build();
+            let mut source_runtime = SharedAttentionRuntime::default();
+            source
+                .forward(
+                    &x,
+                    0,
+                    &mut source_runtime,
+                    2,
+                    true,
+                    true,
+                    false,
+                    false,
+                    0.5f64.sqrt(),
+                    8,
+                    16,
+                    2,
+                    heads,
+                    head_dim,
+                    hidden,
+                )
+                .unwrap();
+            let published = source_runtime.compress_kv.clone().unwrap();
+            let published_dims = published.dims().to_vec();
+            let published_count = published
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .len();
+            let mut consumer = build();
+            let mut runtime = SharedAttentionRuntime {
+                compress_kv: Some(published),
+                index_k: source_runtime.index_k.clone(),
+                topk_idxs: source_runtime.topk_idxs.clone(),
+                candidates: None,
+            };
+            // Overwrite every published row with a constant: the consumer's
+            // attention output must move with it. A layer that ignored the
+            // shared rows (or sized its pick row against an empty kv)
+            // either crashes or stays identical.
+            let shape = published_dims;
+            let count = published_count;
+            runtime.compress_kv =
+                Some(Tensor::from_vec(vec![shared; count], shape, &device).unwrap());
+            let output = consumer
+                .forward(
+                    &x,
+                    0,
+                    &mut runtime,
+                    2,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0.5f64.sqrt(),
+                    8,
+                    16,
+                    2,
+                    heads,
+                    head_dim,
+                    hidden,
+                )
+                .unwrap();
+            output.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        let quiet = run(0.0);
+        let loud = run(9.0);
+        assert_eq!(quiet.len(), 2 * hidden);
+        assert!(
+            quiet
+                .iter()
+                .zip(loud.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-3),
+            "consumer output ignored the shared compressed rows: {quiet:?} vs {loud:?}"
+        );
+    }
+
+    #[test]
     fn window_and_compress_picks_interleave_per_query() {
         use crate::math::precompute_freqs_cis;
         let device = Device::Cpu;
@@ -1271,8 +1416,9 @@ mod tests {
         };
         let mut core = core;
         let published = Tensor::ones((1, 2, head_dim), DType::F32, &device).unwrap();
+        let expected = published.clone();
         let mut runtime = SharedAttentionRuntime {
-            compress_kv: Some(published.clone()),
+            compress_kv: Some(published),
             index_k: Some(Tensor::zeros((1, 2, 32), DType::F32, &device).unwrap()),
             topk_idxs: Some(Tensor::from_vec(vec![0i64, 0], (1, 1, 2), &device).unwrap()),
             candidates: None,
@@ -1306,7 +1452,7 @@ mod tests {
         let after = runtime
             .compress_kv
             .expect("non-source layer must not drop the shared cache");
-        assert_eq!(after.dims(), published.dims());
+        assert_eq!(after.dims(), expected.dims());
         let kept = after.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(
             kept.iter().all(|value| *value == 1.0),
