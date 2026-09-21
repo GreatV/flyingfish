@@ -159,7 +159,10 @@ pub fn hc_post(x: &Tensor, residual: &Tensor, post: &Tensor, comb: &Tensor) -> R
                 for d in 0..hidden {
                     let mut value = scale * sublayer[token * hidden + d];
                     for source in 0..hc {
-                        value += comb_values[(token * hc + copy) * hc + source]
+                        // comb's first axis is the source stream and the
+                        // second the destination, matching the reference mHC
+                        // contraction (and ff-glm's explicit transpose).
+                        value += comb_values[(token * hc + source) * hc + copy]
                             * stream[(token * hc + source) * hidden + d];
                     }
                     output[(token * hc + copy) * hidden + d] = value;
@@ -247,5 +250,25 @@ mod tests {
         assert_eq!(out[0], values[0]);
         assert_eq!(out[4], values[0]);
         assert_eq!(out[8], values[4]);
+    }
+
+    #[test]
+    fn hc_post_contracts_comb_by_source_rows_not_destination_rows() {
+        let device = candle_core::Device::Cpu;
+        // One token, hc=2, hidden=1, non-symmetric comb: source 0 feeds only
+        // destination 1. The reference contraction reads comb[source][dest],
+        // so destination 0 receives nothing and destination 1 receives
+        // comb[0][1] * stream[0]. Reading comb[dest][source] instead (the old
+        // behaviour) moves the value to destination 0.
+        // comb[0][1] * stream[0] = 1.0 * 2.0 = 2.0 lands at destination 1;
+        // destination 0 receives nothing. The transposed (old) contraction
+        // would produce [3.0, 0.0] instead.
+        let comb = Tensor::from_vec(vec![0.0f32, 1.0, 0.0, 0.0], (1, 1, 2, 2), &device).unwrap();
+        let residual = Tensor::from_vec(vec![2.0f32, 3.0], (1, 1, 2, 1), &device).unwrap();
+        let sublayer = Tensor::from_vec(vec![9.0f32], (1, 1, 1), &device).unwrap();
+        let post = Tensor::zeros((1, 1, 2), DType::F32, &device).unwrap();
+        let out = hc_post(&sublayer, &residual, &post, &comb).unwrap();
+        let values = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(values, [0.0, 2.0]);
     }
 }
