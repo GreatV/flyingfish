@@ -112,7 +112,6 @@ fn attention(
     let mut output = vec![0.0f32; tokens * heads * head_dim];
     for head in 0..heads {
         let mut scores = vec![0.0f32; tokens * tokens];
-        let mut max = f32::NEG_INFINITY;
         for query in 0..tokens {
             for key in 0..tokens {
                 let mut dot = 0.0;
@@ -121,12 +120,17 @@ fn attention(
                         * k[(key * heads + head) * head_dim + d];
                 }
                 scores[query * tokens + key] = dot * scale;
-                max = max.max(scores[query * tokens + key]);
             }
         }
         for query in 0..tokens {
             let mut total = 0.0;
             let mut weights = vec![0.0f32; tokens];
+            // The stabilization max belongs to this query's row; a shared one
+            // underflows every logit when another row towers over it.
+            let max = scores[query * tokens..(query + 1) * tokens]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
             for key in 0..tokens {
                 weights[key] = (scores[query * tokens + key] - max).exp();
                 total += weights[key];
@@ -399,6 +403,40 @@ mod tests {
         let token = 5;
         assert!((cos_values[token * 4] - 1.0f64.cos() as f32).abs() < 1e-4);
         assert!((cos_values[token * 4 + 2] - 2.0f64.cos() as f32).abs() < 1e-4);
+    }
+
+    #[test]
+    fn vision_softmax_resets_its_max_per_query_row() {
+        let tokens = 2usize;
+        let heads = 1usize;
+        let head_dim = 4usize;
+        // Query 0 towers over query 1 by ~1e4; under a shared max every
+        // logit of query 1 underflows, total hits zero, and the output goes
+        // NaN. Per-row max keeps both rows normalized.
+        let mut q = vec![0.0f32; tokens * heads * head_dim];
+        for d in 0..head_dim {
+            q[d] = 100.0;
+            q[head_dim + d] = 0.001;
+        }
+        let k = vec![1.0f32; tokens * heads * head_dim];
+        // Value rows carry 1.0 in channel 0 only, so channel 0 of the output
+        // is the row's softmax total and every other channel is zero.
+        let mut v = vec![0.0f32; tokens * heads * head_dim];
+        for key in 0..tokens {
+            v[key * head_dim] = 1.0;
+        }
+        let output = attention(&q, &k, &v, tokens, heads, head_dim, 1.0);
+        assert!(
+            output.iter().all(|value| value.is_finite()),
+            "output went non-finite: {output:?}"
+        );
+        for query in 0..tokens {
+            assert!(
+                (output[query * head_dim] - 1.0).abs() < 1e-4,
+                "row {query} sums to {}",
+                output[query * head_dim]
+            );
+        }
     }
 
     #[test]

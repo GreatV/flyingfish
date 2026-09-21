@@ -701,3 +701,78 @@ fn dsv41_generate_returns_an_empty_completion_when_prefill_hits_eos() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.trim().is_empty(), "stdout not empty: {stdout:?}");
 }
+
+#[test]
+fn dsv41_capture_parity_refuses_an_oversized_prompt_instead_of_truncating() {
+    let root = tempfile::tempdir().unwrap();
+    write_fixture(root.path());
+    let model = root.path().join("DeepSeek-V4.1-mini");
+    let capture = root.path().join("parity.safetensors");
+    let output = ff()
+        .args(["text", "capture-parity", "--adapter", "dsv41"])
+        .arg("--model")
+        .arg(&model)
+        .args([
+            "--prompt",
+            "tok1 tok2 tok3 tok4 tok5 tok6 tok7 tok8 tok9 tok10 tok11 tok12 tok13 tok14 tok15 tok16 tok17 tok18 tok19 tok20",
+            "--device",
+            "cpu",
+            "--max-context-tokens",
+            "4",
+            "--output",
+        ])
+        .arg(&capture)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("exceeds the") && stderr.contains("capture limit"),
+        "{stderr}"
+    );
+    assert!(!capture.exists(), "no partial capture may be written");
+}
+
+#[test]
+fn dsv41_capture_parity_publishes_atomically_and_never_clobbers() {
+    let root = tempfile::tempdir().unwrap();
+    write_fixture(root.path());
+    let model = root.path().join("DeepSeek-V4.1-mini");
+    let capture = root.path().join("parity.safetensors");
+    let output = ff()
+        .args(["text", "capture-parity", "--adapter", "dsv41"])
+        .arg("--model")
+        .arg(&model)
+        .args(["--prompt", "tok1 tok2", "--device", "cpu"])
+        .arg("--output")
+        .arg(&capture)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let original = std::fs::read(&capture).unwrap();
+    candle_core::safetensors::load(&capture, &candle_core::Device::Cpu).unwrap();
+    // A second run at the same path fails before writing: the first capture
+    // is untouched and no staging directories leak.
+    let second = ff()
+        .args(["text", "capture-parity", "--adapter", "dsv41"])
+        .arg("--model")
+        .arg(&model)
+        .args(["--prompt", "tok1 tok2", "--device", "cpu"])
+        .arg("--output")
+        .arg(&capture)
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert_eq!(std::fs::read(&capture).unwrap(), original);
+    assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".ff-stage")
+    }));
+}

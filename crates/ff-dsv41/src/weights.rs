@@ -335,6 +335,9 @@ impl TransformerLoader {
     /// Dequantized sizes of every tensor the resident load would hold, by
     /// checkpoint role. FP8 and FP4 grow 4x and 8x to F32; BF16 grows 2x.
     pub fn resident_f32_bytes(&self) -> Result<u64> {
+        // Header reads are cheap: one per shard, then each tensor's exact
+        // dtype and shape decide its dequantized size.
+        let mut headers: HashMap<String, safetensors::SafeTensors<'static>> = HashMap::new();
         let mut total = 0u64;
         for (tensor, shard) in &self.layout.tensors {
             let role = self
@@ -344,15 +347,36 @@ impl TransformerLoader {
             if matches!(role, ShardRole::Dspark | ShardRole::Engram) {
                 continue;
             }
-            let bytes = std::fs::metadata(self.model_dir.join(shard))?.len();
-            let per_shard_tensors = self.layout.tensors_in(shard).len() as u64;
-            let tensor_bytes = bytes.checked_div(per_shard_tensors).unwrap_or(0);
-            let factor = if tensor.starts_with("layers.") && tensor.contains(".experts.") {
-                8
-            } else {
-                4
-            };
-            total += tensor_bytes * factor;
+            if !headers.contains_key(shard) {
+                let (_, opened) = open_shard(&self.model_dir, shard)?;
+                headers.insert(shard.clone(), opened);
+            }
+            let header = headers.get(shard).expect("just inserted");
+            let view = header
+                .tensor(tensor)
+                .with_context(|| format!("{tensor} is not in {shard}"))?;
+            let elements: u64 = view
+                .shape()
+                .iter()
+                .map(|dimension| *dimension as u64)
+                .product::<u64>();
+            // F32 stays 4 bytes; BF16 and FP8 double/quadruple to 4; a packed
+            // FP4 byte (I8 view, two values per byte) becomes eight F32 bytes.
+            let element_bytes = match view.dtype() {
+                safetensors::Dtype::F32 => 4,
+                safetensors::Dtype::BF16
+                | safetensors::Dtype::F8_E4M3
+                | safetensors::Dtype::F8_E8M0 => 4,
+                safetensors::Dtype::I8 => 8,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "{tensor} in {shard} has unexpected dtype {other:?}"
+                    ));
+                }
+            } as u64;
+            total += elements
+                .checked_mul(element_bytes)
+                .with_context(|| format!("{tensor} resident size overflows u64"))?;
         }
         Ok(total)
     }
@@ -699,6 +723,45 @@ mod tests {
             assert_eq!(layout.shard_role(shard), Some(ShardRole::Engram));
             assert_eq!(layout.tensors_in(shard).len(), 6);
         }
+    }
+
+    #[test]
+    fn resident_estimate_sums_exact_tensor_sizes_not_shard_averages() {
+        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        if !dir.join("model.safetensors.index.json").exists() {
+            return;
+        }
+        let loader = TransformerLoader::open(dir).unwrap();
+        let exact = loader.resident_f32_bytes().unwrap();
+        // Cross-check a few known tensors against the same header math the
+        // loader uses: a BF16 head row-block and an FP8 body projection.
+        let layout = CheckpointLayout::open(dir).unwrap();
+        let (_, views) =
+            open_shard(dir, layout.shard_of("layers.6.attn.wq_a.weight").unwrap()).unwrap();
+        let view = views.tensor("layers.6.attn.wq_a.weight").unwrap();
+        let elements: u64 = view.shape().iter().map(|d| *d as u64).product();
+        assert_eq!(
+            (elements, view.dtype()),
+            (1280 * 5120, safetensors::Dtype::F8_E4M3)
+        );
+        // The old shard-averaged estimate rounded every tensor to
+        // bytes/tensor_count and mislabeled BF16 embeds as 4x; the exact sum
+        // is strictly smaller than bytes*4 summed over the same set.
+        let mut naive = 0u64;
+        for (tensor, shard) in &layout.tensors {
+            let role = layout.shard_role(shard).unwrap();
+            if matches!(role, ShardRole::Dspark | ShardRole::Engram) {
+                continue;
+            }
+            let bytes = std::fs::metadata(dir.join(shard)).unwrap().len();
+            let per = layout.tensors_in(shard).len() as u64;
+            naive += bytes / per * if tensor.contains(".experts.") { 8 } else { 4 };
+        }
+        assert!(
+            exact < naive,
+            "exact estimate {exact} should undercut the averaged {naive}"
+        );
+        assert!(exact > 0);
     }
 
     #[test]

@@ -332,14 +332,21 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
                 .map_err(|error| anyhow::anyhow!("load tokenizer: {error}"))?;
             let encoded = flyingfish::dsv41::encoding::chat_prompt(&prompt, None, true, effort);
-            let mut ids = tokenizer
+            let ids = tokenizer
                 .encode(encoded, false)
                 .map_err(|error| anyhow::anyhow!("tokenize prompt: {error}"))?
                 .get_ids()
                 .to_vec();
             let limit = max_context_tokens.get();
             anyhow::ensure!(!ids.is_empty(), "prompt tokenized to an empty sequence");
-            ids.truncate(limit);
+            // Truncating would silently drop the assistant/thinking header
+            // the template appended; refuse an oversized prompt instead.
+            anyhow::ensure!(
+                ids.len() <= limit,
+                "prompt of {} tokens exceeds the {}-token capture limit",
+                ids.len(),
+                limit
+            );
             let mut transformer = loader.load(Some(&tokenizer), limit.max(ids.len()))?;
             let device = Device::Cpu;
             let chunk = Tensor::from_vec(ids.clone(), (1, ids.len()), &device)?;
@@ -365,7 +372,16 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
                 "parity output parent {} does not exist",
                 parent.display()
             );
-            candle_core::safetensors::save(&tensors, &output)?;
+            // Serialize to memory first, then publish through the staging
+            // path: a failed write never replaces a complete capture.
+            let bytes = safetensors::serialize(
+                tensors.iter().map(|(name, tensor)| (name.as_str(), tensor)),
+                None,
+            )
+            .map_err(|error| anyhow::anyhow!("serialize parity capture: {error}"))?;
+            let staging = flyingfish::runtime::artifact::ArtifactStaging::new(&output)
+                .with_context(|| format!("failed to stage parity capture {}", output.display()))?;
+            publish_staged_bytes(staging, &bytes)?;
             println!("saved parity capture to {}", output.display());
             Ok(())
         }
@@ -438,7 +454,7 @@ fn emit_result(
 /// Refuse loudly when the dequantized resident set cannot fit this host.
 fn admit_resident_footprint(loader: &TransformerLoader) -> Result<()> {
     let needed = loader.resident_f32_bytes()?;
-    let available = host_available_bytes();
+    let available = host_available_bytes("/proc/meminfo")?;
     anyhow::ensure!(
         needed <= available,
         "the resident F32 load needs {} GiB but only {} GiB is available; the routed experts need streaming, which is not wired yet",
@@ -448,18 +464,42 @@ fn admit_resident_footprint(loader: &TransformerLoader) -> Result<()> {
     Ok(())
 }
 
-fn host_available_bytes() -> u64 {
-    std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .find(|line| line.starts_with("MemAvailable:"))
-                .and_then(|line| {
-                    line.split_whitespace()
-                        .nth(1)
-                        .and_then(|kib| kib.parse::<u64>().ok())
-                })
-                .map(|kib| kib * 1024)
-        })
-        .unwrap_or(u64::MAX)
+fn host_available_bytes(source: &str) -> Result<u64> {
+    let text = std::fs::read_to_string(source)
+        .with_context(|| format!("read {source} to measure host memory"))?;
+    let kib = text
+        .lines()
+        .find(|line| line.starts_with("MemAvailable:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|kib| kib.parse::<u64>().ok())
+        .with_context(|| format!("parse MemAvailable from {source}"))?;
+    Ok(kib * 1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_meminfo_fails_closed() {
+        let error = host_available_bytes("/nonexistent/meminfo").unwrap_err();
+        assert!(
+            error.to_string().contains("measure host memory"),
+            "{error:#}"
+        );
+        let scratch = std::env::temp_dir().join(format!("ff-dsv41-meminfo-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(
+            scratch.join("meminfo"),
+            b"MemTotal:       1 kB
+",
+        )
+        .unwrap();
+        let error = host_available_bytes(scratch.join("meminfo").to_str().unwrap()).unwrap_err();
+        assert!(
+            error.to_string().contains("parse MemAvailable"),
+            "{error:#}"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
+    }
 }
