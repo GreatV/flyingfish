@@ -236,14 +236,15 @@ pub fn indexer_forward(
         .to_vec1::<f32>()
         .context("read index keys")?;
     let k_positions = keys.len() / (batch * index_head_dim);
+    let wq_b = wq_b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
     let mut queries = Vec::with_capacity(batch * seqlen * index_heads * index_head_dim);
     for token in 0..batch * seqlen {
-        let mut projected = linear_rows(
-            wq_b,
+        let mut projected = linear_rows_from_slice(
+            &wq_b,
             &qr_values[token * qlora..(token + 1) * qlora],
             index_heads * index_head_dim,
             qlora,
-        )?;
+        );
         // Queries rotate at their own positions before quantization, sharing
         // the layer's rotary table (model.py:546-547).
         let position = start_pos + token % seqlen;

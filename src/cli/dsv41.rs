@@ -190,6 +190,10 @@ fn validate_sampling(sampling: &kit::SamplingArgs) -> Result<()> {
         "sampling temperature must be finite and non-negative"
     );
     anyhow::ensure!(
+        sampling.temperature == 0.0 || sampling.temperature.recip().is_finite(),
+        "sampling temperature must be safely invertible"
+    );
+    anyhow::ensure!(
         sampling.top_p.is_finite() && sampling.top_p > 0.0 && sampling.top_p <= 1.0,
         "top-p must lie in (0, 1]"
     );

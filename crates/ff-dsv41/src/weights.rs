@@ -385,8 +385,16 @@ impl TransformerLoader {
                     ));
                 }
             } as u64;
+            // The vocabulary tables are additionally held as flattened
+            // copies across decode steps, so they cost two representations.
+            let representations: u64 = if matches!(tensor.as_str(), "embed.weight" | "head.weight")
+            {
+                2
+            } else {
+                1
+            };
             total += elements
-                .checked_mul(element_bytes)
+                .checked_mul(element_bytes * representations)
                 .with_context(|| format!("{tensor} resident size overflows u64"))?;
         }
         Ok(total)
@@ -960,7 +968,14 @@ mod tests {
             match role {
                 ShardRole::Engram if tensor.contains(".engram.embed.") => {}
                 ShardRole::Engram => projections += exact_f32_bytes(view.shape(), view.dtype()),
-                _ => skeleton += exact_f32_bytes(view.shape(), view.dtype()),
+                _ => {
+                    let bytes = exact_f32_bytes(view.shape(), view.dtype());
+                    skeleton += if matches!(tensor.as_str(), "embed.weight" | "head.weight") {
+                        2 * bytes
+                    } else {
+                        bytes
+                    };
+                }
             }
         }
         assert!(
