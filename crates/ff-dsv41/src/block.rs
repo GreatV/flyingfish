@@ -52,11 +52,8 @@ pub fn hc_mixes(
         .flatten_all()?
         .to_vec1::<f32>()
         .context("read hc stream")?;
-    let weights = hc_fn
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()
-        .context("read hc_fn")?;
+    let (hc_fn_guard, _) = crate::math::resident_f32(hc_fn)?;
+    let weights = crate::math::resident_f32_slice(&hc_fn_guard)?;
     let mut mixes = Vec::with_capacity(tokens * mix_width);
     for token in 0..tokens {
         let base = token * hc_mult * hidden;

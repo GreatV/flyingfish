@@ -655,14 +655,35 @@ impl TransformerLoader {
             .with_context(|| format!("open engram scale shard {scale_shard}"))?;
         // The views sit on the same forged lifetime as the loader's shard
         // cache; the mmaps move into the callback to keep the pages mapped.
-        let payload = weight_view
+        // Validate the table shape before any lookup trusts its row indexes.
+        let weight = weight_view
             .tensor(&weight_name)
-            .with_context(|| format!("{weight_name} is not in {weight_shard}"))?
-            .data();
-        let scales = scale_view
+            .with_context(|| format!("{weight_name} is not in {weight_shard}"))?;
+        let scale = scale_view
             .tensor(&scale_name)
-            .with_context(|| format!("{scale_name} is not in {scale_shard}"))?
-            .data();
+            .with_context(|| format!("{scale_name} is not in {scale_shard}"))?;
+        let expected_rows = text
+            .engram_num_embeddings
+            .get(hash_index)
+            .copied()
+            .with_context(|| format!("no engram table configured for index {hash_index}"))?;
+        let scale_width = head_dim / crate::config::FP8_WEIGHT_BLOCK;
+        anyhow::ensure!(
+            weight.dtype() == safetensors::Dtype::F8_E4M3
+                && weight.shape() == [expected_rows as usize, head_dim].as_slice(),
+            "{weight_name} must be F8_E4M3 [{expected_rows}, {head_dim}], found {:?} {:?}",
+            weight.dtype(),
+            weight.shape()
+        );
+        anyhow::ensure!(
+            scale.dtype() == safetensors::Dtype::F8_E8M0
+                && scale.shape() == [expected_rows as usize, scale_width].as_slice(),
+            "{scale_name} must be F8_E8M0 [{expected_rows}, {scale_width}], found {:?} {:?}",
+            scale.dtype(),
+            scale.shape()
+        );
+        let payload = weight.data();
+        let scales = scale.data();
         let lookup: EngramLookup = Box::new(move |ids: &[i64]| -> Vec<f32> {
             let _keep_mapped = (&weight_map, &scale_map);
             let mut rows = Vec::with_capacity(ids.len() * head_dim);

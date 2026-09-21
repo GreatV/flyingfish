@@ -256,7 +256,6 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             reject_nondefault_weights(&weights)?;
             validate_sampling(&sampling)?;
             let loader = TransformerLoader::open(&model_dir)?;
-            admit_resident_footprint(&loader)?;
             let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
                 .map_err(|error| anyhow::anyhow!("load tokenizer: {error}"))?;
             let thinking = match thinking_mode.as_str() {
@@ -298,6 +297,25 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
                 budget,
                 max_context
             );
+            // Admission covers the context-dependent state too: the rotary
+            // table every layer builds at this sequence length, the hc
+            // residual streams, the n-gram cache, and the window ring.
+            let text = &loader.config().text_config;
+            let needed_u64 = needed as u64;
+            let freqs_bytes =
+                text.num_hidden_layers as u64 * needed_u64 * (text.qk_rope_head_dim as u64 / 2) * 8;
+            let stream_bytes = 2 * needed_u64 * text.hc_mult as u64 * text.hidden_size as u64 * 4;
+            let cache_bytes = needed_u64 * 8;
+            let ring_bytes = text.num_hidden_layers as u64
+                * text.sliding_window as u64
+                * text.head_dim as u64
+                * 4;
+            let workspace = freqs_bytes
+                .checked_add(stream_bytes)
+                .and_then(|total| total.checked_add(cache_bytes))
+                .and_then(|total| total.checked_add(ring_bytes))
+                .context("runtime workspace estimate overflows u64")?;
+            admit_resident_footprint_with(&loader, workspace)?;
             anyhow::ensure!(
                 needed <= config.text_config.max_position_embeddings,
                 "prompt of {} tokens plus {} new tokens exceeds the model's {}-token span",
@@ -557,10 +575,6 @@ fn emit_result(
 }
 
 /// Refuse loudly when the dequantized resident set cannot fit this host.
-fn admit_resident_footprint(loader: &TransformerLoader) -> Result<()> {
-    admit_resident_footprint_with(loader, 0)
-}
-
 fn admit_resident_footprint_with(loader: &TransformerLoader, workspace_bytes: u64) -> Result<()> {
     let needed = loader
         .resident_f32_bytes()?

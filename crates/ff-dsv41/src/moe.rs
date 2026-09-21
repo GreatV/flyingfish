@@ -34,12 +34,8 @@ impl Gate {
             .flatten_all()?
             .to_vec1::<f32>()
             .context("read gate input")?;
-        let weight = self
-            .weight
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()
-            .context("read gate weight")?;
+        let (weight_guard, _) = crate::math::resident_f32(&self.weight)?;
+        let weight = crate::math::resident_f32_slice(&weight_guard)?;
         let bias = self
             .bias
             .to_dtype(DType::F32)?
