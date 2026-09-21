@@ -22,7 +22,7 @@ pub struct SamplingArgs {
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct DeviceArgs {
-    #[arg(long, default_value = "auto", help = "cpu, auto, cuda:N[,M…], metal:0")]
+    #[arg(long, default_value = "auto", help = "cpu, auto, or cuda:N; some adapters also accept cuda:N[,M...] or metal:N")]
     pub device: String,
 }
 
