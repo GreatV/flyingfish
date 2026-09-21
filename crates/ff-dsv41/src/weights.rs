@@ -481,6 +481,7 @@ impl TransformerLoader {
                 self.f32(&format!("{prefix}wkv.weight"))?,
                 Some(self.f32(&format!("{prefix}wgate.weight"))?),
                 1,
+                self.config.text_config.rms_norm_eps,
             )?)
         } else if ratio == 1 && is_kv_source {
             let prefix = format!("{attn}compressor.");
@@ -491,6 +492,7 @@ impl TransformerLoader {
                 self.f32(&format!("{prefix}wkv.weight"))?,
                 None,
                 1,
+                self.config.text_config.rms_norm_eps,
             )?)
         } else {
             None
@@ -540,6 +542,7 @@ impl TransformerLoader {
             index_topk: self.config.text_config.index_topk,
             candidate_topk_blocks: self.config.text_config.candidate_topk_blocks,
             candidate_block_size: self.config.text_config.candidate_block_size,
+            norm_eps: self.config.text_config.rms_norm_eps,
         };
 
         let ffn = self.load_ffn(layer)?;

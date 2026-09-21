@@ -903,3 +903,39 @@ fn dsv41_rejects_an_existing_primary_output_before_loading() {
     assert!(error.contains("already exists"), "{error}");
     assert_eq!(std::fs::read(&out).unwrap(), b"old");
 }
+
+#[test]
+fn dsv41_capture_parity_persists_logits_and_honors_no_progress() {
+    let root = tempfile::tempdir().unwrap();
+    write_fixture(root.path());
+    let model = root.path().join("DeepSeek-V4.1-mini");
+    let capture = root.path().join("parity.safetensors");
+    let run = |args: &[&str]| {
+        ff().args(["text", "capture-parity", "--adapter", "dsv41"])
+            .arg("--model")
+            .arg(&model)
+            .args(["--prompt", "tok1 tok2", "--device", "cpu"])
+            .args(args)
+            .arg("--output")
+            .arg(&capture)
+            .output()
+            .unwrap()
+    };
+    let loud = run(&[]);
+    assert!(loud.status.success());
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("captured block"),
+        "{}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+    let tensors = candle_core::safetensors::load(&capture, &candle_core::Device::Cpu).unwrap();
+    assert!(tensors.contains_key("logits"));
+    std::fs::remove_file(&capture).unwrap();
+    let quiet = run(&["--no-progress"]);
+    assert!(quiet.status.success());
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("captured block"),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+}

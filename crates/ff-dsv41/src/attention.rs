@@ -184,6 +184,7 @@ pub struct Compressor {
     pub wgate: Option<Tensor>,
     pub kv_state: Tensor,
     pub score_state: Tensor,
+    pub norm_eps: f64,
     batch: usize,
 }
 
@@ -195,6 +196,7 @@ impl Compressor {
         wkv: Tensor,
         wgate: Option<Tensor>,
         batch: usize,
+        norm_eps: f64,
     ) -> Result<Self> {
         ensure!(ratio > 0, "compress ratio must be positive");
         ensure!(
@@ -218,6 +220,7 @@ impl Compressor {
             wgate,
             kv_state,
             score_state,
+            norm_eps,
             batch,
         })
     }
@@ -277,7 +280,7 @@ impl Compressor {
         let norm = |pooled: Vec<f32>, produced: usize| -> Result<Tensor> {
             let tensor = Tensor::from_vec(pooled, (batch, produced, head_dim), x.device())
                 .map_err(anyhow::Error::from)?;
-            let normalized = rms_norm(&tensor, &self.norm_weight, 1e-20)?;
+            let normalized = rms_norm(&tensor, &self.norm_weight, self.norm_eps)?;
             Ok(normalized.to_dtype(x.dtype())?)
         };
 
@@ -492,7 +495,8 @@ mod tests {
         // Gate strongly favors token 0 on channel 0 and token 1 on channel 1.
         let wgate =
             Tensor::from_vec(vec![5.0f32, -5.0, -5.0, 5.0], (head_dim, hidden), &device).unwrap();
-        let mut compressor = Compressor::new(2, head_dim, norm, wkv, Some(wgate), 1).unwrap();
+        let mut compressor =
+            Compressor::new(2, head_dim, norm, wkv, Some(wgate), 1, 1e-20).unwrap();
         // wkv maps channel 0 -> x0 and channel 1 -> x1; the gate favors
         // token 0 on channel 0 and token 1 on channel 1.
         let x = Tensor::from_vec(
@@ -573,7 +577,8 @@ mod tests {
             &device,
         )
         .unwrap();
-        let mut compressor = Compressor::new(2, head_dim, norm, wkv, Some(wgate), 1).unwrap();
+        let mut compressor =
+            Compressor::new(2, head_dim, norm, wkv, Some(wgate), 1, 1e-20).unwrap();
         // Prefill five tokens: two complete groups plus a one-token tail.
         let x = Tensor::from_vec(
             vec![

@@ -386,7 +386,6 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
         } => {
             reject_unsupported_device(&device)?;
             reject_nondefault_weights(&weights)?;
-            let _ = no_progress;
             let effort = flyingfish::dsv41::encoding::ReasoningEffort::parse(&reasoning_effort)
                 .map_err(|error| anyhow::anyhow!(error))?;
             let loader = TransformerLoader::open(&model_dir)?;
@@ -420,7 +419,12 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             let device = Device::Cpu;
             let chunk = Tensor::from_vec(ids.clone(), (1, ids.len()), &device)?;
             let mut snapshots = Vec::new();
-            let (token, _) = transformer.forward_with_capture(&chunk, 0, Some(&mut snapshots))?;
+            let mut progress = |captured: usize| {
+                eprintln!("parity prefill: captured block {captured}");
+            };
+            let observer = (!no_progress).then_some(&mut progress as &mut dyn FnMut(usize));
+            let (token, logits) =
+                transformer.forward_with_capture(&chunk, 0, Some(&mut snapshots), observer)?;
             anyhow::ensure!(
                 snapshots.iter().all(|snapshot| snapshot.dims().len() == 4),
                 "layer snapshots must keep the hc stream shape"
@@ -431,6 +435,9 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             }
             let prompt_tensor = Tensor::from_vec(ids.clone(), (1, ids.len()), &device)?;
             tensors.insert("prompt_tokens".to_owned(), prompt_tensor);
+            // The argmax alone cannot see a final-norm/head error; keep the
+            // full logits row in the capture, as the GLM parity path does.
+            tensors.insert("logits".to_owned(), logits);
             let logits_row = Tensor::from_vec(vec![token], (1,), &device)?;
             tensors.insert("greedy_token".to_owned(), logits_row);
             let output = resolve_output_outside_model(&output, &model_dir)?;
@@ -520,7 +527,12 @@ fn emit_result(
 /// Refuse loudly when the dequantized resident set cannot fit this host.
 fn admit_resident_footprint(loader: &TransformerLoader) -> Result<()> {
     let needed = loader.resident_f32_bytes()?;
-    let available = host_available_bytes("/proc/meminfo")?;
+    let host = host_available_bytes("/proc/meminfo")?;
+    // meminfo is host-wide; a cgroup-v2 container may hold a smaller budget.
+    let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&Device::Cpu));
+    let available = snapshot
+        .cgroup_v2_memory_available_bytes
+        .map_or(host, |limit| host.min(limit));
     anyhow::ensure!(
         needed <= available,
         "the resident F32 load needs {} GiB but only {} GiB is available; the routed experts need streaming, which is not wired yet",

@@ -166,6 +166,7 @@ pub struct AttentionCore {
     pub index_topk: usize,
     pub candidate_topk_blocks: usize,
     pub candidate_block_size: usize,
+    pub norm_eps: f64,
 }
 
 fn linear_rows(weight: &Tensor, input: &[f32], out: usize, inn: usize) -> Result<Vec<f32>> {
@@ -405,7 +406,7 @@ impl AttentionCore {
                 qlora,
                 hidden,
             )?;
-            qr.extend(rms_norm_slice(&projected, &self.q_norm));
+            qr.extend(rms_norm_slice(&projected, &self.q_norm, self.norm_eps));
         }
         let mut q = Vec::with_capacity(batch * seqlen * heads * head_dim);
         for token in 0..batch * seqlen {
@@ -438,7 +439,7 @@ impl AttentionCore {
                 head_dim,
                 hidden,
             )?;
-            window.extend(rms_norm_slice(&projected, &self.kv_norm));
+            window.extend(rms_norm_slice(&projected, &self.kv_norm, self.norm_eps));
         }
         apply_rotary_slice(
             &mut window,
@@ -523,7 +524,7 @@ impl AttentionCore {
                             self.index_head_dim,
                             head_dim,
                         )?;
-                        keys.extend(rms_norm_slice(&projected, k_norm));
+                        keys.extend(rms_norm_slice(&projected, k_norm, self.norm_eps));
                     }
                     for group in 0..produced {
                         apply_rotary_slice(
@@ -757,7 +758,7 @@ impl AttentionCore {
     }
 }
 
-fn rms_norm_slice(values: &[f32], weight: &Tensor) -> Vec<f32> {
+fn rms_norm_slice(values: &[f32], weight: &Tensor, eps: f64) -> Vec<f32> {
     let weight = weight
         .to_dtype(DType::F32)
         .unwrap()
@@ -767,7 +768,7 @@ fn rms_norm_slice(values: &[f32], weight: &Tensor) -> Vec<f32> {
         .unwrap();
     let width = weight.len();
     let squares = values.iter().map(|value| value * value).sum::<f32>() / width as f32;
-    let rstd = 1.0 / (squares + 1e-20).sqrt();
+    let rstd = 1.0 / (squares + eps as f32).sqrt();
     values
         .iter()
         .zip(weight.iter())
@@ -1154,6 +1155,7 @@ mod tests {
                     ones(head_dim, hidden),
                     Some(ones(head_dim, hidden)),
                     1,
+                    1e-20,
                 )
                 .unwrap(),
             ),
@@ -1170,6 +1172,7 @@ mod tests {
             index_topk: 2,
             candidate_topk_blocks: 4,
             candidate_block_size: 4,
+            norm_eps: 1e-20,
         };
         let x = Tensor::from_vec(
             (0..2 * hidden)
@@ -1292,6 +1295,7 @@ mod tests {
                     ones(head_dim, hidden),
                     Some(ones(head_dim, hidden)),
                     1,
+                    1e-20,
                 )
                 .unwrap(),
             ),
@@ -1308,6 +1312,7 @@ mod tests {
             index_topk: 2,
             candidate_topk_blocks: 4,
             candidate_block_size: 4,
+            norm_eps: 1e-20,
         };
         let base = |scale: f32| {
             Tensor::from_vec(
@@ -1413,6 +1418,7 @@ mod tests {
             index_topk: 2,
             candidate_topk_blocks: 4,
             candidate_block_size: 4,
+            norm_eps: 1e-20,
         };
         let mut core = core;
         let published = Tensor::ones((1, 2, head_dim), DType::F32, &device).unwrap();
@@ -1502,6 +1508,7 @@ mod tests {
                     ones(head_dim, hidden),
                     Some(ones(head_dim, hidden)),
                     1,
+                    1e-20,
                 )
                 .unwrap(),
             ),
@@ -1516,6 +1523,7 @@ mod tests {
             index_topk: 2,
             candidate_topk_blocks: 4,
             candidate_block_size: 4,
+            norm_eps: 1e-20,
         };
         let mut runtime = SharedAttentionRuntime {
             compress_kv: Some(Tensor::zeros((1, 8, head_dim), DType::F32, &device).unwrap()),

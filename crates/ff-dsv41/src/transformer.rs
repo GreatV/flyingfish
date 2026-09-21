@@ -206,7 +206,7 @@ impl Transformer {
     /// One forward over `[batch, seq]` token ids. Returns the greedy token
     /// from the last position's logits and the logits themselves.
     pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<(u32, Tensor)> {
-        self.forward_with_capture(input_ids, start_pos, None)
+        self.forward_with_capture(input_ids, start_pos, None, None)
     }
 
     /// The same forward, optionally snapshotting the residual stream after
@@ -216,6 +216,7 @@ impl Transformer {
         input_ids: &Tensor,
         start_pos: usize,
         mut capture: Option<&mut Vec<Tensor>>,
+        mut observer: Option<&mut dyn FnMut(usize)>,
     ) -> Result<(u32, Tensor)> {
         let dims = input_ids.dims();
         ensure!(dims.len() == 2, "input ids must be [batch, seq]");
@@ -281,6 +282,9 @@ impl Transformer {
             pre_mix = next_pre;
             if let Some(capture) = capture.as_deref_mut() {
                 capture.push(stream.contiguous()?);
+                if let Some(observer) = observer.as_deref_mut() {
+                    observer(capture.len());
+                }
             }
         }
         let collapsed = hc_pre(&stream, &pre_mix)?;
@@ -392,6 +396,7 @@ mod tests {
                         ones(head_dim, hidden, &device),
                         Some(ones(head_dim, hidden, &device)),
                         1,
+                        1e-20,
                     )
                     .unwrap(),
                 )
@@ -427,6 +432,7 @@ mod tests {
             index_topk: 2,
             candidate_topk_blocks: 4,
             candidate_block_size: 4,
+            norm_eps: 1e-20,
         };
         let block = |ratio: usize, kv: bool, index: bool| BlockWeights {
             attention: attention(ratio),
