@@ -852,12 +852,16 @@ pub fn greedy_token_from_logits(logits: &Tensor) -> Result<u32> {
         tail.iter().all(|value| value.is_finite()),
         "model produced non-finite logits"
     );
-    let best = tail
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
-        .context("empty logits")?;
-    Ok(best.0 as u32)
+    // max_by returns the LAST equal maximum; argmax semantics keep the first.
+    let mut best = 0usize;
+    let mut best_value = f32::NEG_INFINITY;
+    for (index, value) in tail.iter().enumerate() {
+        if *value > best_value {
+            best = index;
+            best_value = *value;
+        }
+    }
+    Ok(best as u32)
 }
 
 /// Prefill/decode helper shared by the model: expand the embedding into
@@ -943,6 +947,14 @@ pub fn layer_freqs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn greedy_keeps_the_first_of_tied_maxima() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![1.0f32, 5.0, 5.0, 2.0], (1, 4), &device).unwrap();
+        // max_by would return index 2 (the last tie); argmax semantics keep 1.
+        assert_eq!(greedy_token_from_logits(&logits).unwrap(), 1);
+    }
     use candle_core::Device;
 
     #[test]

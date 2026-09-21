@@ -446,6 +446,8 @@ impl TransformerLoader {
             blocks.push(self.load_block(layer, max_seq, &ngram)?);
         }
         Ok(Transformer {
+            embed_flat: None,
+            head_flat: None,
             params,
             embed,
             blocks,

@@ -102,16 +102,21 @@ pub(super) enum Dsv41Command {
 
 /// Greedy pick from a logits row.
 fn greedy(values: &[f32]) -> Result<u32> {
+    anyhow::ensure!(!values.is_empty(), "model produced no logits");
     anyhow::ensure!(
         values.iter().all(|value| value.is_finite()),
         "model produced non-finite logits"
     );
-    values
-        .iter()
-        .enumerate()
-        .max_by(|left, right| left.1.partial_cmp(right.1).expect("finite logits"))
-        .map(|(index, _)| index as u32)
-        .context("model produced no logits")
+    // max_by returns the LAST equal maximum; argmax semantics keep the first.
+    let mut best = 0usize;
+    let mut best_value = f32::NEG_INFINITY;
+    for (index, value) in values.iter().enumerate() {
+        if *value > best_value {
+            best = index;
+            best_value = *value;
+        }
+    }
+    Ok(best as u32)
 }
 
 /// Nucleus sampling with a seeded generator; mirrors the GLM reference
@@ -179,6 +184,18 @@ fn sample_token(logits: &Tensor, temperature: f64, top_p: f64, rng: &mut StdRng)
     u32::try_from(order[retained - 1]).context("token id exceeds u32")
 }
 
+fn validate_sampling(sampling: &kit::SamplingArgs) -> Result<()> {
+    anyhow::ensure!(
+        sampling.temperature.is_finite() && sampling.temperature >= 0.0,
+        "sampling temperature must be finite and non-negative"
+    );
+    anyhow::ensure!(
+        sampling.top_p.is_finite() && sampling.top_p > 0.0 && sampling.top_p <= 1.0,
+        "top-p must lie in (0, 1]"
+    );
+    Ok(())
+}
+
 fn reject_unsupported_device(device: &str) -> Result<()> {
     // auto lands on CPU here: nothing GPU-side is wired, so the automatic
     // choice must resolve rather than fail.
@@ -233,6 +250,7 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             }
             reject_unsupported_device(&device.device)?;
             reject_nondefault_weights(&weights)?;
+            validate_sampling(&sampling)?;
             let loader = TransformerLoader::open(&model_dir)?;
             admit_resident_footprint(&loader)?;
             let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))

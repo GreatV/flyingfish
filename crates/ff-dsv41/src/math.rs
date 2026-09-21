@@ -211,25 +211,20 @@ fn round_e2m1(x: &Tensor) -> Result<Tensor> {
 }
 
 fn round_e2m1_value(value: f32) -> f32 {
+    const GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let magnitude = value.abs();
-    let rounded = if magnitude < 0.25 {
-        0.0
-    } else if magnitude < 0.75 {
-        0.5
-    } else if magnitude < 1.25 {
-        1.0
-    } else if magnitude < 1.75 {
-        1.5
-    } else if magnitude < 2.5 {
-        2.0
-    } else if magnitude < 3.5 {
-        3.0
-    } else if magnitude < 5.0 {
-        4.0
-    } else {
-        6.0
-    };
-    value.signum() * rounded
+    // Nearest grid value; exact midpoints take the encoding with the even
+    // index, matching the reference float4 cast's round-to-nearest-even.
+    let mut best = 0usize;
+    let mut best_distance = f32::INFINITY;
+    for (index, point) in GRID.iter().enumerate() {
+        let distance = (magnitude - point).abs();
+        if distance < best_distance || (distance == best_distance && index % 2 == 0) {
+            best = index;
+            best_distance = distance;
+        }
+    }
+    value.signum() * GRID[best]
 }
 
 /// The mHC coefficient split: pre and post from the first `2 * streams` mix
@@ -354,6 +349,26 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e2m1_midpoints_round_ties_to_even() {
+        // Exact midpoints between adjacent grid values take the encoding
+        // with the even index; strict-threshold rounding pushes them upward.
+        for (midpoint, expected) in [
+            (0.25f32, 0.0),
+            (0.75, 1.0),
+            (1.25, 1.0),
+            (1.75, 2.0),
+            (2.5, 2.0),
+            (3.5, 4.0),
+            (5.0, 4.0),
+        ] {
+            assert_eq!(round_e2m1_value(midpoint), expected, "{midpoint}");
+            assert_eq!(round_e2m1_value(-midpoint), -expected, "-{midpoint}");
+        }
+        assert_eq!(round_e2m1_value(0.6), 0.5);
+        assert_eq!(round_e2m1_value(0.9), 1.0);
+    }
     use candle_core::Device;
 
     #[test]
