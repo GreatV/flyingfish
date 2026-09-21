@@ -180,6 +180,10 @@ fn linear_rows(weight: &Tensor, input: &[f32], out: usize, inn: usize) -> Result
         .flatten_all()?
         .to_vec1::<f32>()
         .context("read projection weight")?;
+    Ok(linear_rows_from_slice(&weights, input, out, inn))
+}
+
+fn linear_rows_from_slice(weights: &[f32], input: &[f32], out: usize, inn: usize) -> Vec<f32> {
     let mut output = vec![0.0f32; out];
     for (row, slot) in output.iter_mut().enumerate() {
         let mut sum = 0.0;
@@ -188,7 +192,7 @@ fn linear_rows(weight: &Tensor, input: &[f32], out: usize, inn: usize) -> Result
         }
         *slot = sum;
     }
-    Ok(output)
+    output
 }
 
 /// The indexer scores compressed positions and returns the top-k picks each
@@ -741,17 +745,15 @@ impl AttentionCore {
             .wo_b
             .to_dtype(DType::F32)?
             .flatten_all()?
-            .to_vec1::<f32>()?
-            .to_vec();
+            .to_vec1::<f32>()?;
         for token in 0..batch * seqlen {
-            projected.extend(linear_rows(
-                &self.wo_b,
+            projected.extend(linear_rows_from_slice(
+                &wo_b,
                 &collapsed[token * o_groups * o_lora_rank..(token + 1) * o_groups * o_lora_rank],
                 hidden,
                 o_groups * o_lora_rank,
-            )?);
+            ));
         }
-        let _ = wo_b;
         output = Tensor::from_vec(projected, (batch, seqlen, hidden), device)
             .map_err(anyhow::Error::from)?;
         Ok(output)

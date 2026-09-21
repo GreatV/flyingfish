@@ -415,7 +415,17 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
                 ids.len(),
                 loader.config().text_config.max_position_embeddings
             );
-            let mut transformer = loader.load(Some(&tokenizer), limit.max(ids.len()))?;
+            // A single prefill only needs the prompt's own span; sizing the
+            // state to a user-supplied context limit can allocate for nothing.
+            let output = resolve_output_outside_model(&output, &model_dir)?;
+            ensure_new_output(&output, "parity capture output")?;
+            let parent = output.parent().unwrap_or(std::path::Path::new("."));
+            anyhow::ensure!(
+                parent.is_dir(),
+                "parity output parent {} does not exist",
+                parent.display()
+            );
+            let mut transformer = loader.load(Some(&tokenizer), ids.len())?;
             let device = Device::Cpu;
             let chunk = Tensor::from_vec(ids.clone(), (1, ids.len()), &device)?;
             let mut snapshots = Vec::new();
@@ -440,14 +450,6 @@ pub(super) fn run(command: Dsv41Command) -> Result<()> {
             tensors.insert("logits".to_owned(), logits);
             let logits_row = Tensor::from_vec(vec![token], (1,), &device)?;
             tensors.insert("greedy_token".to_owned(), logits_row);
-            let output = resolve_output_outside_model(&output, &model_dir)?;
-            ensure_new_output(&output, "parity capture output")?;
-            let parent = output.parent().unwrap_or(std::path::Path::new("."));
-            anyhow::ensure!(
-                parent.is_dir(),
-                "parity output parent {} does not exist",
-                parent.display()
-            );
             // Serialize to memory first, then publish through the staging
             // path: a failed write never replaces a complete capture.
             let bytes = safetensors::serialize(
