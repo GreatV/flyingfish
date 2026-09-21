@@ -89,6 +89,73 @@ fn f32_values(rows: usize, columns: usize) -> Vec<f32> {
         .collect()
 }
 
+fn write_fixture_with_biased_eos(root: &Path) {
+    // Same fixture, but every head row is zero except the EOS row (id 1)
+    // which carries a large positive constant: the greedy pick becomes EOS
+    // whenever the final hidden state has a positive channel sum, which the
+    // all-ones norm direction of this fixture guarantees.
+    write_fixture(root);
+    let model = root.join("DeepSeek-V4.1-mini");
+    let shard_bytes = std::fs::read(model.join("model-00001-of-00001.safetensors")).unwrap();
+    let views = safetensors::SafeTensors::deserialize(&shard_bytes).unwrap();
+    // Rewrite the single shard: every BF16/F32 payload becomes its absolute
+    // value (non-negative weights keep the hidden state non-negative), and the
+    // head zeroes every row except EOS (id 1) at a large positive constant —
+    // the greedy pick is then EOS because the final hidden state has a
+    // strictly positive channel sum.
+    let mut out: Vec<(String, TensorView<'static>)> = Vec::new();
+    for (name, view) in views.iter() {
+        let shape = view.shape().to_vec();
+        let dtype = view.dtype();
+        if name == "head.weight" {
+            let mut values = vec![0.0f32; VOCAB * HIDDEN];
+            for channel in 0..HIDDEN {
+                values[HIDDEN + channel] = 48.0;
+            }
+            out.push((
+                name.to_owned(),
+                TensorView::new(SdDtype::BF16, shape, leak(bf16_bytes(values))).unwrap(),
+            ));
+            continue;
+        }
+        let bytes: Vec<u8> = view.data().to_vec();
+        let bytes = match dtype {
+            SdDtype::BF16 => {
+                let mut values = Vec::with_capacity(bytes.len() / 2);
+                for pair in bytes.chunks_exact(2) {
+                    let bits = u16::from_le_bytes([pair[0], pair[1]]);
+                    let value = half::bf16::from_bits(bits).to_f32();
+                    values.push(value.abs());
+                }
+                leak(bf16_bytes(values))
+            }
+            SdDtype::F32 => {
+                let mut values = Vec::with_capacity(bytes.len() / 4);
+                for quad in bytes.chunks_exact(4) {
+                    let bits = u32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]);
+                    values.push(f32::from_bits(bits).abs());
+                }
+                let bytes: Vec<u8> = values
+                    .into_iter()
+                    .flat_map(|value| value.to_bits().to_le_bytes())
+                    .collect();
+                leak(bytes)
+            }
+            _ => leak(bytes),
+        };
+        out.push((
+            name.to_owned(),
+            TensorView::new(dtype, shape, bytes).unwrap(),
+        ));
+    }
+    safetensors::serialize_to_file(
+        out.iter().map(|(name, view)| (name.as_str(), view)),
+        None,
+        &model.join("model-00001-of-00001.safetensors"),
+    )
+    .unwrap();
+}
+
 fn write_fixture(root: &Path) {
     let model = root.join("DeepSeek-V4.1-mini");
     fs::create_dir_all(&model).unwrap();
@@ -598,4 +665,39 @@ fn dsv41_prompt_plus_budget_beyond_the_request_limit_is_refused() {
             || stderr.contains("exceeds the model"),
         "{stderr}"
     );
+}
+
+#[test]
+fn dsv41_generate_returns_an_empty_completion_when_prefill_hits_eos() {
+    let root = tempfile::tempdir().unwrap();
+    write_fixture_with_biased_eos(root.path());
+    let model = root.path().join("DeepSeek-V4.1-mini");
+    let output = ff()
+        .args(["text", "generate", "--adapter", "dsv41"])
+        .arg("--model")
+        .arg(&model)
+        .args([
+            "--prompt",
+            "tok1 tok2",
+            "--device",
+            "cpu",
+            "--temperature",
+            "0",
+            "--max-new-tokens",
+            "4",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("generated 0 tokens"),
+        "expected an immediate EOS completion: {stderr}"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.trim().is_empty(), "stdout not empty: {stdout:?}");
 }
