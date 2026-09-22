@@ -83,6 +83,8 @@ ff video generate \
 
 The target resolves to **1344×768, 107 frames (4.458 s)**. Total time was **30m 53.57s**, with a steady denoise rate of **24.2 s/evaluation**. Text encoding took 49.06 s, static-context preparation including weight loading took 434.99 s, and overlapping video/audio decode took 152.96 s. Total time includes these stages.
 
+On CUDA, H3 prefetches each stage's weights on a second stream while the current stage computes, which shortens cold runs by roughly a quarter; `FF_H3_PREFETCH=0` restores synchronous loading.
+
 A successful run writes PNGs under `frames/`, `generated.wav` and recovery checkpoints. Reusing the output directory resumes an interrupted run. Use `ff video --help` for first/last-frame and reference-conditioning workflows.
 
 ### MiniCPM5-2B and DSpark
@@ -120,7 +122,7 @@ ff text generate \
 
 ### Qwen3.8-27B
 
-Qwen3.8-27B is a dense groupwise-int4 checkpoint with an optional vision tower, with the same greedy decoding and end-of-sequence stop. Pass a PNG with `--image` to ground the prompt; the tower runs on the host. CUDA decoding partitions the layer stack across the `--device` ordinals (`cuda:0,1` spreads it over two cards); the run fails fast with a per-device required/free table when the checkpoint and KV cache exceed free VRAM.
+Qwen3.8-27B is a dense groupwise-int4 checkpoint with an optional vision tower, with the same greedy decoding and end-of-sequence stop. Pass a PNG with `--image` to ground the prompt; the tower runs on the host. CUDA decoding uploads all projections to the `--device` ordinal; the run fails fast when the checkpoint and KV cache exceed free VRAM.
 
 ```bash
 ff text generate \
@@ -133,6 +135,17 @@ ff text generate \
     --image "<input.png>" \
     --prompt 'What is on the table?' \
     --device cuda:0 --max-new-tokens 128
+```
+
+### DeepSeek-V4.1-Flash
+
+DeepSeek-V4.1-Flash is a 552B-parameter causal encoder–decoder MoE (8B activated prefill, 16B activated decode) with FP8 block-scaled body weights and FP4 block-scaled routed experts, sliding-window attention with a sparse indexer on every layer, Hyper-Connections (`hc_mult=4`), Engram n-gram conditional memory at layers 1 and 14, an optional DSpark speculative draft, and a DeepSeek-ViT vision tower behind a 3×3 aligner. Its checkpoint is FP8+FP4, not groupwise-int4. The adapter runs batch-size-one, single-turn text or one-image generation on the host: the static skeleton loads from the FP8/FP4 shards and the routed experts stream per use.
+
+```bash
+ff text generate \
+    --model "<dsv41-checkpoint>" \
+    --prompt 'Explain paging to a systems programmer.' \
+    --max-new-tokens 128
 ```
 
 ### TRELLIS-1
