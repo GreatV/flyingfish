@@ -26,6 +26,8 @@ pub use device_cache::{
     CudaWeightAllocator, DeviceCache, DeviceCacheDemotion, DeviceCachePolicy, DeviceCacheStats,
     DeviceCacheStore, DeviceResidentBytes, TensorAxis, TensorPartition,
 };
+#[cfg(all(unix, feature = "cuda"))]
+pub use cuda_allocation::fill_pinned_from_checkpoint;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
