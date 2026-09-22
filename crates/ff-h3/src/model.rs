@@ -1316,7 +1316,12 @@ impl StreamedTransformer {
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            prefetcher.prefetch(&self.weights, &next_names)?;
+            // A failed kick — typically an allocation that cannot fit beside
+            // the live stage — degrades this one prefetch to the streaming
+            // path; the next stage's take finds an empty slot and loads.
+            if let Err(error) = prefetcher.prefetch(&self.weights, &next_names) {
+                eprintln!("H3 stage prefetch skipped ({error:#}); the next stage streams");
+            }
         }
         let fill = fill_started.elapsed();
         if timed {

@@ -1618,10 +1618,13 @@ fn directory_tree_bytes(root: &Path) -> Result<u64> {
             .with_context(|| format!("failed to list {}", path.display()))?;
         for entry in entries {
             let entry = entry.with_context(|| format!("failed to list {}", path.display()))?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
             let metadata = entry
                 .metadata()
                 .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
-            if metadata.is_dir() {
+            if file_type.is_dir() {
                 queue.push(entry.path());
             } else {
                 total = total.saturating_add(metadata.len());
@@ -1665,6 +1668,7 @@ fn load_or_capture_topology(primary: &Device) -> Result<flyingfish::runtime::top
 fn derive_t2va_configuration(
     model_root: &Path,
     geometry: T2vaGeometry,
+    flash_attention: bool,
     ordinal: usize,
     primary: &Device,
 ) -> Result<(ff_core::configure::DerivedConfig, Option<u64>)> {
@@ -1675,7 +1679,8 @@ fn derive_t2va_configuration(
     let estimate =
         ResourceEstimate::for_t2va(&config, geometry, ResourceAssumptions::h3_bf16_mmap())?;
     let encoder_bytes = directory_tree_bytes(&model_root.join("text_encoder"))?;
-    let requirement = H3T2vaRequirement::from_estimate(&estimate, encoder_bytes)?;
+    let requirement =
+        H3T2vaRequirement::from_estimate(&estimate, encoder_bytes, flash_attention)?;
     let profile = load_or_capture_topology(primary)?;
     let derived = ff_core::configure::derive(ordinal, &profile, &requirement)?;
     let host_bound_bytes = match (derived.weight_source, derived.host_cache_ceiling_bytes) {
@@ -1834,10 +1839,11 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         let (derived, host_bound_bytes) = derive_t2va_configuration(
             &model_root,
             geometry,
+            flash_attention,
             selected_device_ordinal,
             &device,
         )?;
-        derived_host_bound_mib = host_bound_bytes.map(|bytes| bytes >> 20);
+        derived_host_bound_mib = host_bound_bytes.map(|bytes| bytes.div_ceil(1 << 20));
         Some(derived)
     };
     let derived_source = derived.as_ref().map(|derived| match derived.weight_source {
@@ -1857,6 +1863,23 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         optional_weight_args.with_derived(derived_source, derived_host_cache_mib);
     let optional_chunks = optional_chunks.with_derived(derived.as_ref().and_then(|d| d.chunks));
     let max_host_mib = max_host_mib.or(derived_host_bound_mib);
+    if let Some(bound_bytes) = derived_host_bound_mib.map(|mib| mib << 20) {
+        let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device));
+        let available = snapshot
+            .cgroup_v2_memory_available_bytes
+            .into_iter()
+            .chain(snapshot.host_memory_available_bytes)
+            .min();
+        if let Some(available) = available
+            && bound_bytes > available
+        {
+            eprintln!(
+                "config: derived host bound {} B exceeds available host memory {} B; \
+                 expect swapping unless the host frees up",
+                bound_bytes, available
+            );
+        }
+    }
     if explain_config {
         match &derived {
             Some(derived) => {

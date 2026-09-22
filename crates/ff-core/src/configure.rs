@@ -80,7 +80,6 @@ pub struct DerivedConfig {
     /// what the host holds beside its reserve and what materializes at all.
     /// `None` when the derivation streams through mmap.
     pub host_cache_ceiling_bytes: Option<u64>,
-    pub residency_budget_bytes: u64,
     pub chunks: Option<ChunkPlan>,
     pub provenance: Vec<DerivationStep>,
 }
@@ -98,8 +97,7 @@ impl fmt::Display for DerivationStep {
 /// otherwise (FlexGen's fastest-tier placement; single-pass mmap measured
 /// 180-490s -> 48s on the H3 text encoder). Rule 2 picks the largest chunk
 /// plan whose activation peak leaves the reserve inside the selected
-/// device's memory. Rule 3 gives the residency planner everything that device
-/// has left after the activation peak and the admission reserve.
+/// device's memory.
 pub fn derive(
     ordinal: usize,
     profile: &TopologyProfile,
@@ -152,38 +150,27 @@ pub fn derive(
         .devices
         .get(ordinal)
         .and_then(|device| device.total_memory_bytes);
-    let (chunks, residency_budget_bytes) = match device_memory {
+    let chunks = match device_memory {
         Some(device_memory) => {
             let device_reserve = admission_reserve_bytes(Some(device_memory));
             let activation_budget = device_memory.saturating_sub(device_reserve);
             let chunks = requirement.largest_chunk_plan_within(activation_budget)?;
             let peak = requirement.activation_peak_bytes()?;
-            let residency_budget = device_memory
-                .saturating_sub(peak)
-                .saturating_sub(device_reserve);
             provenance.push(DerivationStep {
                 rule: "rule-2-chunks",
                 detail: format!(
                     "activation budget {activation_budget} B of {device_memory} B selects \
-                     {:?} at peak {peak} B",
-                    chunks
+                     {chunks:?} at peak {peak} B"
                 ),
             });
-            provenance.push(DerivationStep {
-                rule: "rule-3-residency",
-                detail: format!(
-                    "{device_memory} B - peak {peak} B - reserve {device_reserve} B leaves \
-                     {residency_budget} B for weight residency"
-                ),
-            });
-            (chunks, residency_budget)
+            chunks
         }
         None => {
             provenance.push(DerivationStep {
                 rule: "rule-2-chunks",
                 detail: "no CUDA device recorded; chunks stay at the defaults".to_owned(),
             });
-            (None, 0)
+            None
         }
     };
     if profile.devices.len() > 1 {
@@ -200,7 +187,6 @@ pub fn derive(
         steady_weight_bytes: steady,
         host_reserve_bytes: reserve,
         host_cache_ceiling_bytes,
-        residency_budget_bytes,
         chunks,
         provenance,
     })
@@ -286,7 +272,6 @@ mod tests {
         let unknown = derive(0, &profile(None, None), &bare).unwrap();
         assert_eq!(unknown.weight_source, WeightSourceChoice::Mmap);
         assert_eq!(unknown.chunks, None);
-        assert_eq!(unknown.residency_budget_bytes, 0);
     }
 
     #[test]
@@ -307,21 +292,16 @@ mod tests {
     }
 
     #[test]
-    fn residency_budget_subtracts_peak_and_reserve() {
+    fn chunk_selection_stays_inside_the_device_budget() {
         let gib = 1u64 << 30;
         let bare = Bare {
             weights: 10 * gib,
             activations: 4 * gib,
         };
         let derived = derive(0, &profile(Some(100 * gib), Some(24 * gib)), &bare).unwrap();
-        let reserve = admission_reserve_bytes(Some(24 * gib));
-        assert_eq!(
-            derived.residency_budget_bytes,
-            24 * gib - 4 * gib - reserve
-        );
         assert!(derived
             .provenance
             .iter()
-            .any(|step| step.rule == "rule-3-residency"));
+            .any(|step| step.rule == "rule-2-chunks"));
     }
 }

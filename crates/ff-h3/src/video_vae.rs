@@ -32,14 +32,14 @@ pub struct PngFrameSink {
 /// PNG encoding and per-frame fsync on a writer thread, so the decoder's next
 /// chunk runs while the previous chunk's files are being produced.
 struct FrameWriter {
-    sender: Option<std::sync::mpsc::Sender<(usize, Tensor)>>,
+    sender: Option<std::sync::mpsc::SyncSender<(usize, Tensor)>>,
     handle: Option<std::thread::JoinHandle<()>>,
     failure: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl FrameWriter {
     fn spawn(directory: PathBuf) -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel::<(usize, Tensor)>();
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(usize, Tensor)>(2);
         let failure = Arc::new(std::sync::Mutex::new(None));
         let thread_failure = Arc::clone(&failure);
         let handle = std::thread::spawn(move || {

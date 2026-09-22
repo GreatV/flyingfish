@@ -848,6 +848,7 @@ impl H3T2vaRequirement {
     pub fn from_estimate(
         estimate: &ResourceEstimate,
         encoder_weight_bytes: u64,
+        flash_attention: bool,
     ) -> Result<Self> {
         let traffic = &estimate.compute_and_traffic;
         let steady = traffic.transformer_weight_bytes_per_evaluation_with_adaln_precompute;
@@ -856,7 +857,7 @@ impl H3T2vaRequirement {
             .saturating_sub(steady)
             .saturating_add(encoder_weight_bytes);
         let mut assumptions = estimate.assumptions;
-        assumptions.use_flash_attention = true;
+        assumptions.use_flash_attention = flash_attention;
         let mut chunk_ladder = Vec::with_capacity(CHUNK_LADDER.len());
         for (projection, feed_forward, output) in CHUNK_LADDER {
             let mut geometry = estimate.geometry;

@@ -1079,7 +1079,7 @@ fn conditioned_rows_and_timestep_tables_are_charged_without_changing_t2va_defaul
 #[test]
 fn t2va_requirement_exposes_the_deriver_fields() {
     let estimate = default_estimate(1);
-    let requirement = H3T2vaRequirement::from_estimate(&estimate, 63_000_000_000).unwrap();
+    let requirement = H3T2vaRequirement::from_estimate(&estimate, 63_000_000_000, true).unwrap();
     use ff_core::configure::ModelRequirement as _;
     let traffic = &estimate.compute_and_traffic;
     assert_eq!(
@@ -1126,7 +1126,7 @@ fn derivation_reproduces_the_measured_machine_configurations() {
     use ff_core::configure::{self, WeightSourceChoice};
     let gib = 1u64 << 30;
     let estimate = default_estimate(357);
-    let requirement = H3T2vaRequirement::from_estimate(&estimate, 0).unwrap();
+    let requirement = H3T2vaRequirement::from_estimate(&estimate, 0, true).unwrap();
 
     let rtx4090 = configure::derive(
         0,
@@ -1147,7 +1147,6 @@ fn derivation_reproduces_the_measured_machine_configurations() {
             output: 1024
         })
     );
-    assert!(rtx4090.residency_budget_bytes > 15 * gib);
 
     let blackwell = configure::derive(
         0,
@@ -1157,7 +1156,6 @@ fn derivation_reproduces_the_measured_machine_configurations() {
     .unwrap();
     assert_eq!(blackwell.weight_source, WeightSourceChoice::Memory);
     assert_eq!(blackwell.chunks, rtx4090.chunks);
-    assert!(blackwell.residency_budget_bytes > 80 * gib);
 
     let dual_a4000_host = configure::derive(
         0,
@@ -1176,7 +1174,6 @@ fn derivation_reproduces_the_measured_machine_configurations() {
     .unwrap();
     assert_eq!(knife_edge_host.weight_source, WeightSourceChoice::Mmap);
     assert_eq!(dual_a4000_host.chunks, rtx4090.chunks);
-    assert!(dual_a4000_host.residency_budget_bytes > 10 * gib);
 }
 
 
