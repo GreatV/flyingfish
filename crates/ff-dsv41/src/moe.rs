@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, ensure};
 use candle_core::{DType, Tensor};
+use ff_core::math::{silu, softplus};
 
 #[derive(Clone, Debug)]
 pub struct Gate {
@@ -94,16 +95,6 @@ impl Gate {
     }
 }
 
-fn softplus(value: f32) -> f32 {
-    if value > 20.0 {
-        value
-    } else {
-        // ln(1 + e^x) loses small negative scores to F32 spacing; ln_1p
-        // evaluates them accurately instead of rounding to zero.
-        value.exp().ln_1p()
-    }
-}
-
 /// One SwiGLU FFN. The clamps come straight from training: the up branch is
 /// clamped on both sides, the gate branch only from above.
 pub struct Expert {
@@ -171,10 +162,6 @@ impl Expert {
         }
         Tensor::from_vec(output, (tokens, hidden), x.device()).map_err(anyhow::Error::from)
     }
-}
-
-fn silu(value: f32) -> f32 {
-    value / (1.0 + (-value).exp())
 }
 
 #[cfg(test)]

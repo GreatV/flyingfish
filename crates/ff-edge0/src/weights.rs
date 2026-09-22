@@ -217,6 +217,7 @@ impl Edge0Weights {
             "{projection}.weight is not 2-D: {shape:?}"
         );
         let out_dim = shape[0];
+        ensure!(out_dim > 0, "{projection}.weight has zero rows");
         let scales = self.f32_named(&format!("{projection}.scales"))?;
         let biases = self.f32_named(&format!("{projection}.biases"))?;
         let groups = scales.len() / out_dim;
@@ -266,6 +267,11 @@ impl Edge0Weights {
         let biases = self.view(&format!("{name}.biases"))?;
         let shape = weight.shape();
         ensure!(shape.len() == 3, "{name}.weight is not stacked: {shape:?}");
+        ensure!(
+            expert < shape[0],
+            "{name}: expert {expert} out of range; tensor stacks {}",
+            shape[0]
+        );
         let rows = shape[1];
         let packed_cols = shape[2];
         let in_dim = packed_cols * 8;
@@ -276,15 +282,21 @@ impl Edge0Weights {
         let offset = expert * word_bytes;
         let words = le_words(&payload[offset..offset + word_bytes]);
 
-        let slice_bf16 = |view: &safetensors::tensor::TensorView<'static>| -> Vec<f32> {
+        let slice_bf16 = |view: &safetensors::tensor::TensorView<'static>| -> Result<Vec<f32>> {
             let raw = view.data();
             let start = expert * rows * groups * 2;
-            bf16_to_f32(&raw[start..start + rows * groups * 2])
+            let end = start + rows * groups * 2;
+            ensure!(
+                end <= raw.len(),
+                "{name}.scales/biases too short for expert {expert}: need {end} bytes, have {}",
+                raw.len()
+            );
+            Ok(bf16_to_f32(&raw[start..end]))
         };
         GroupQuant::new(
             words,
-            slice_bf16(&scales),
-            slice_bf16(&biases),
+            slice_bf16(&scales)?,
+            slice_bf16(&biases)?,
             rows,
             in_dim,
             4,
