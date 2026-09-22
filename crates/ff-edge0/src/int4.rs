@@ -280,7 +280,29 @@ impl GroupQuant {
     /// would force 2.6 GiB of full-precision residency; see the design
     /// doc's LoRA decision).
     pub fn matvec(&self, x: &[f32], lora: Option<(&[f32], &[f32], usize)>) -> Vec<f32> {
-        debug_assert_eq!(x.len(), self.in_dim);
+        assert_eq!(
+            x.len(),
+            self.in_dim,
+            "matvec input has {} elements, projection expects {}",
+            x.len(),
+            self.in_dim
+        );
+        if let Some((a, b, rank)) = lora {
+            assert_eq!(
+                a.len(),
+                rank * self.in_dim,
+                "lora A has {} elements, expected [rank {rank}, in {}]",
+                a.len(),
+                self.in_dim
+            );
+            assert_eq!(
+                b.len(),
+                self.out_dim * rank,
+                "lora B has {} elements, expected [out {}, rank {rank}]",
+                b.len(),
+                self.out_dim
+            );
+        }
         let groups = self.in_dim / GROUP_SIZE;
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())

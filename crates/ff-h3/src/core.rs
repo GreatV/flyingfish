@@ -755,23 +755,7 @@ fn swiglu(weights: &BTreeMap<String, Tensor>, prefix: &str, normalized: &Tensor)
         .map_err(Into::into)
 }
 
-/// Matches PyTorch's half-precision SiLU evaluation boundary.
-///
-/// PyTorch evaluates `silu` from a BF16/F16 input in F32 and casts the result
-/// once. Candle's half kernel follows a different approximation and diverges
-/// before the first H3 feed-forward residual. Keep full-precision inputs on
-/// their existing path and explicitly reproduce the promoted half path.
-pub(crate) fn silu_with_reference_rounding(input: &Tensor) -> Result<Tensor> {
-    let dtype = input.dtype();
-    match dtype {
-        candle_core::DType::BF16 | candle_core::DType::F16 => {
-            ops::silu(&input.to_dtype(candle_core::DType::F32)?)?
-                .to_dtype(dtype)
-                .map_err(Into::into)
-        }
-        _ => ops::silu(input).map_err(Into::into),
-    }
-}
+pub(crate) use ff_core::math::silu_with_reference_rounding;
 
 pub(crate) fn qwen_gelu_erf_with_reference_rounding(input: &Tensor) -> Result<Tensor> {
     let dtype = input.dtype();

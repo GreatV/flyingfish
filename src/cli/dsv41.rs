@@ -7,7 +7,7 @@ use candle_core::{Device, Tensor};
 use clap::Subcommand;
 use flyingfish::dsv41::config::DeepseekV41Config;
 use flyingfish::dsv41::weights::TransformerLoader;
-use rand::{Rng as _, SeedableRng, rngs::StdRng};
+use rand::{SeedableRng, rngs::StdRng};
 use std::{num::NonZeroUsize, path::PathBuf};
 
 #[derive(Debug, Subcommand)]
@@ -102,86 +102,20 @@ pub(super) enum Dsv41Command {
 
 /// Greedy pick from a logits row.
 fn greedy(values: &[f32]) -> Result<u32> {
-    anyhow::ensure!(!values.is_empty(), "model produced no logits");
-    anyhow::ensure!(
-        values.iter().all(|value| value.is_finite()),
-        "model produced non-finite logits"
-    );
-    // max_by returns the LAST equal maximum; argmax semantics keep the first.
-    let mut best = 0usize;
-    let mut best_value = f32::NEG_INFINITY;
-    for (index, value) in values.iter().enumerate() {
-        if *value > best_value {
-            best = index;
-            best_value = *value;
-        }
-    }
-    Ok(best as u32)
+    ff_core::math::argmax(values)
 }
 
-/// Nucleus sampling with a seeded generator; mirrors the GLM reference
-/// (softmax over the vocabulary, keep the smallest prefix reaching `top_p`).
+/// Nucleus sampling with a seeded generator over the flattened logits.
 fn sample_token(logits: &Tensor, temperature: f64, top_p: f64, rng: &mut StdRng) -> Result<u32> {
-    anyhow::ensure!(
-        temperature.is_finite() && temperature >= 0.0,
-        "sampling temperature must be finite and non-negative"
-    );
-    anyhow::ensure!(
-        top_p.is_finite() && top_p > 0.0 && top_p <= 1.0,
-        "top-p must lie in (0, 1]"
-    );
     if temperature == 0.0 {
         return greedy(&logits.flatten_all()?.to_vec1::<f32>()?);
     }
-    anyhow::ensure!(
-        temperature.recip().is_finite(),
-        "sampling temperature must be safely invertible"
-    );
     let values = logits
         .to_dtype(candle_core::DType::F32)?
         .to_device(&Device::Cpu)?
         .flatten_all()?
         .to_vec1::<f32>()?;
-    anyhow::ensure!(!values.is_empty(), "logits are empty");
-    anyhow::ensure!(
-        values.iter().all(|value| value.is_finite()),
-        "logits contain a non-finite value"
-    );
-    let inverse = 1.0 / temperature;
-    let mut order = (0..values.len()).collect::<Vec<_>>();
-    order.sort_unstable_by(|&left, &right| values[right].total_cmp(&values[left]));
-    let maximum = values[order[0]] as f64 * inverse;
-    let mut probabilities = order
-        .iter()
-        .map(|&index| (values[index] as f64 * inverse - maximum).exp())
-        .collect::<Vec<_>>();
-    let total = probabilities.iter().sum::<f64>();
-    anyhow::ensure!(
-        total.is_finite() && total > 0.0,
-        "softmax normalization is invalid"
-    );
-    for probability in &mut probabilities {
-        *probability /= total;
-    }
-    let mut retained = 0usize;
-    let mut cumulative = 0.0;
-    for probability in &probabilities {
-        cumulative += *probability;
-        retained += 1;
-        if cumulative >= top_p {
-            break;
-        }
-    }
-    let retained_total = probabilities[..retained].iter().sum::<f64>();
-    let target = rng.random::<f64>() * retained_total;
-    let mut cumulative = 0.0;
-    for (rank, probability) in probabilities[..retained].iter().enumerate() {
-        cumulative += *probability;
-        if target <= cumulative {
-            return u32::try_from(order[rank]).context("token id exceeds u32");
-        }
-    }
-    u32::try_from(order[retained - 1]).context("token id exceeds u32")
+    ff_core::math::nucleus_sample(&values, temperature, top_p, rng)
 }
 
 fn validate_sampling(sampling: &kit::SamplingArgs) -> Result<()> {

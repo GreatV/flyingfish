@@ -29,52 +29,54 @@ pub struct SharedAttentionRuntime {
 /// the chunk, decode writes one slot per step and attends over the whole
 /// ring, oldest first.
 pub struct WindowRing {
-    pub cache: Tensor,
-    pub window: usize,
+    values: Vec<f32>,
+    window: usize,
     batch: usize,
+    head_dim: usize,
 }
 
 impl WindowRing {
-    pub fn new(
-        batch: usize,
-        window: usize,
-        head_dim: usize,
-        device: &candle_core::Device,
-    ) -> Result<Self> {
-        Ok(Self {
-            cache: Tensor::zeros((batch, window, head_dim), DType::F32, device)?,
+    pub fn new(batch: usize, window: usize, head_dim: usize) -> Self {
+        Self {
+            values: vec![0.0; batch * window * head_dim],
             window,
             batch,
-        })
+            head_dim,
+        }
     }
 
     /// Seed or step the ring; returns the KV rows this step attends over.
     pub fn write(&mut self, kv: &Tensor, start_pos: usize) -> Result<Tensor> {
         let dims = kv.dims();
         ensure!(dims.len() == 3, "window kv must be [batch, seq, head_dim]");
+        ensure!(
+            dims[0] == self.batch && dims[2] == self.head_dim,
+            "window kv dims {dims:?} do not match the ring's batch {} and head_dim {}",
+            self.batch,
+            self.head_dim
+        );
         let seqlen = dims[1];
-        let mut values = self.cache.flatten_all()?.to_vec1::<f32>()?;
         let incoming = kv.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let head_dim = dims[2];
+        let head_dim = self.head_dim;
         let (batch, window) = (self.batch, self.window);
         if start_pos == 0 {
             if seqlen <= window {
-                values[..incoming.len()].copy_from_slice(&incoming);
+                self.values[..incoming.len()].copy_from_slice(&incoming);
             } else {
                 let cutoff = seqlen % window;
                 let tail = &incoming[(seqlen - window) * head_dim..];
-                values[cutoff * head_dim..].copy_from_slice(&tail[..(window - cutoff) * head_dim]);
-                values[..cutoff * head_dim].copy_from_slice(&tail[(window - cutoff) * head_dim..]);
+                self.values[cutoff * head_dim..]
+                    .copy_from_slice(&tail[..(window - cutoff) * head_dim]);
+                self.values[..cutoff * head_dim]
+                    .copy_from_slice(&tail[(window - cutoff) * head_dim..]);
             }
-            self.cache = Tensor::from_vec(values, (batch, window, head_dim), kv.device())
-                .map_err(anyhow::Error::from)?;
             Ok(kv.clone())
         } else {
             ensure!(seqlen == 1, "decode writes one token at a time");
             let slot = start_pos % window;
             for b in 0..batch {
                 let base = (b * window + slot) * head_dim;
-                values[base..base + head_dim]
+                self.values[base..base + head_dim]
                     .copy_from_slice(&incoming[b * head_dim..(b + 1) * head_dim]);
             }
             // The returned view is oldest-first; the caller's indices address
@@ -84,27 +86,27 @@ impl WindowRing {
                 let oldest = slot + 1;
                 for position in oldest..window {
                     ordered.extend_from_slice(
-                        &values[(b * window + position) * head_dim..][..head_dim],
+                        &self.values[(b * window + position) * head_dim..][..head_dim],
                     );
                 }
                 for position in 0..oldest {
                     ordered.extend_from_slice(
-                        &values[(b * window + position) * head_dim..][..head_dim],
+                        &self.values[(b * window + position) * head_dim..][..head_dim],
                     );
                 }
             }
-            self.cache = Tensor::from_vec(values, (batch, window, head_dim), kv.device())
-                .map_err(anyhow::Error::from)?;
-            Ok(
-                Tensor::from_vec(ordered, (batch, window, head_dim), kv.device())
-                    .map_err(anyhow::Error::from)?,
-            )
+            Ok(Tensor::from_vec(ordered, (batch, window, head_dim), kv.device())?)
         }
     }
 }
 
 /// Which sliding-window slots each query attends to; `-1` marks an empty slot.
-pub fn window_topk_idxs(window: usize, batch: usize, seqlen: usize, start_pos: usize) -> Tensor {
+pub fn window_topk_idxs(
+    window: usize,
+    batch: usize,
+    seqlen: usize,
+    start_pos: usize,
+) -> Result<Tensor> {
     let mut idxs = Vec::with_capacity(batch * seqlen * window);
     if start_pos == 0 {
         for _ in 0..batch {
@@ -115,12 +117,11 @@ pub fn window_topk_idxs(window: usize, batch: usize, seqlen: usize, start_pos: u
                 }
             }
         }
-        Tensor::from_vec(
+        Ok(Tensor::from_vec(
             idxs,
-            (batch, seqlen, window.min(seqlen).max(window)),
+            (batch, seqlen, window),
             &candle_core::Device::Cpu,
-        )
-        .unwrap()
+        )?)
     } else {
         // Rank r in the rotated view is the r-th oldest row; the physical
         // slot it came from is (oldest + r) mod window, valid once the
@@ -138,7 +139,11 @@ pub fn window_topk_idxs(window: usize, batch: usize, seqlen: usize, start_pos: u
                 }
             }
         }
-        Tensor::from_vec(idxs, (batch, seqlen, window), &candle_core::Device::Cpu).unwrap()
+        Ok(Tensor::from_vec(
+            idxs,
+            (batch, seqlen, window),
+            &candle_core::Device::Cpu,
+        )?)
     }
 }
 
@@ -258,7 +263,7 @@ pub fn indexer_forward(
             position,
             rope_head_dim,
             false,
-        );
+        )?;
         queries.extend(projected);
     }
     let query_tensor = quantize_indexer(
@@ -414,7 +419,7 @@ impl AttentionCore {
                 qlora,
                 hidden,
             );
-            qr.extend(rms_norm_slice(&projected, &self.q_norm, self.norm_eps));
+            qr.extend(rms_norm_slice(&projected, &self.q_norm, self.norm_eps)?);
         }
         let (wq_b_guard, _) = crate::math::resident_f32(&self.wq_b)?;
         let wq_b = crate::math::resident_f32_slice(&wq_b_guard)?;
@@ -437,7 +442,7 @@ impl AttentionCore {
             start_pos,
             rope_head_dim,
             false,
-        );
+        )?;
 
         // Window KV: shared latent, normalized, rotated, FP8-round-tripped,
         // written into the ring.
@@ -451,7 +456,7 @@ impl AttentionCore {
                 head_dim,
                 hidden,
             );
-            window.extend(rms_norm_slice(&projected, &self.kv_norm, self.norm_eps));
+            window.extend(rms_norm_slice(&projected, &self.kv_norm, self.norm_eps)?);
         }
         apply_rotary_slice(
             &mut window,
@@ -462,7 +467,7 @@ impl AttentionCore {
             start_pos,
             rope_head_dim,
             false,
-        );
+        )?;
         let window_tensor = quantize_window_kv(&Tensor::from_vec(
             window.clone(),
             (batch, seqlen, head_dim),
@@ -486,7 +491,7 @@ impl AttentionCore {
         } else {
             self.ring.window
         };
-        let window_picks = window_topk_idxs(ring_window, batch, seqlen, start_pos)
+        let window_picks = window_topk_idxs(ring_window, batch, seqlen, start_pos)?
             .flatten_all()?
             .to_vec1::<i64>()?;
         let window_width = window_picks.len() / (batch * seqlen);
@@ -536,7 +541,7 @@ impl AttentionCore {
                             self.index_head_dim,
                             head_dim,
                         )?;
-                        keys.extend(rms_norm_slice(&projected, k_norm, self.norm_eps));
+                        keys.extend(rms_norm_slice(&projected, k_norm, self.norm_eps)?);
                     }
                     for group in 0..produced {
                         apply_rotary_slice(
@@ -553,7 +558,7 @@ impl AttentionCore {
                             },
                             rope_head_dim,
                             false,
-                        );
+                        )?;
                     }
                     let quantized = quantize_indexer(
                         &Tensor::from_vec(keys, (batch, produced, self.index_head_dim), device)
@@ -640,7 +645,7 @@ impl AttentionCore {
                         },
                         rope_head_dim,
                         false,
-                    );
+                    )?;
                 }
                 let quantized = quantize_compressed_kv(&Tensor::from_vec(
                     rotated,
@@ -722,7 +727,7 @@ impl AttentionCore {
             start_pos,
             rope_head_dim,
             true,
-        );
+        )?;
         // wo_a is block-diagonal over groups; each group projects its own heads.
         let group_heads = heads / o_groups;
         let group_width = group_heads * head_dim;
@@ -760,22 +765,19 @@ impl AttentionCore {
     }
 }
 
-fn rms_norm_slice(values: &[f32], weight: &Tensor, eps: f64) -> Vec<f32> {
+fn rms_norm_slice(values: &[f32], weight: &Tensor, eps: f64) -> Result<Vec<f32>> {
     let weight = weight
-        .to_dtype(DType::F32)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
+        .to_dtype(DType::F32)?
+        .flatten_all()?
         .to_vec1::<f32>()
-        .unwrap();
-    let width = weight.len();
-    let squares = values.iter().map(|value| value * value).sum::<f32>() / width as f32;
-    let rstd = 1.0 / (squares + eps as f32).sqrt();
-    values
-        .iter()
-        .zip(weight.iter())
-        .map(|(value, scale)| value * rstd * scale)
-        .collect()
+        .context("read norm weight")?;
+    ensure!(
+        weight.len() == values.len(),
+        "norm weight of {} does not match the {}-wide activation",
+        weight.len(),
+        values.len()
+    );
+    Ok(ff_core::math::rms_norm(values, &weight, eps as f32))
 }
 
 /// In-place rotary over the trailing `rope_dim` channels of each head, using
@@ -790,20 +792,29 @@ fn apply_rotary_slice(
     offset: usize,
     rope_dim: usize,
     inverse: bool,
-) {
-    assert!(
+) -> Result<()> {
+    ensure!(
         head_dim >= rope_dim,
         "rotary span {rope_dim} exceeds the {head_dim}-wide channel"
     );
-    let rows = values.len() / (seqlen * heads * head_dim);
+    let stride = seqlen * heads * head_dim;
+    ensure!(
+        stride > 0 && values.len().is_multiple_of(stride),
+        "rotary input of {} does not split into {seqlen} x {heads} x {head_dim}",
+        values.len()
+    );
+    let rows = values.len() / stride;
     let angles = freqs
-        .to_dtype(DType::F32)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
+        .to_dtype(DType::F32)?
+        .flatten_all()?
         .to_vec1::<f32>()
-        .unwrap();
+        .context("read rotary table")?;
     let half = rope_dim / 2;
+    ensure!(
+        angles.len() >= (offset + seqlen) * half * 2,
+        "rotary table covers {} positions but the step starts at {offset} and spans {seqlen}",
+        angles.len() / (half * 2).max(1)
+    );
     for row in 0..rows {
         for token in 0..seqlen {
             let angle_base = (offset + token) * half * 2;
@@ -821,32 +832,25 @@ fn apply_rotary_slice(
             }
         }
     }
+    Ok(())
 }
 
 /// Greedy pick from the last position's logits.
 pub fn greedy_token_from_logits(logits: &Tensor) -> Result<u32> {
     let dims = logits.dims();
-    ensure!(dims.last().is_some(), "logits must have a vocab axis");
+    let vocab = *dims.last().context("logits must have a vocab axis")?;
+    ensure!(vocab > 0, "logits vocab axis is empty");
     let values = logits
         .flatten_all()?
         .to_vec1::<f32>()
         .context("read logits")?;
-    let vocab = *dims.last().expect("checked above");
-    let tail = &values[values.len() - vocab..];
     ensure!(
-        tail.iter().all(|value| value.is_finite()),
-        "model produced non-finite logits"
+        values.len() >= vocab,
+        "logits flatten to {} values under a {vocab}-wide vocab axis",
+        values.len()
     );
-    // max_by returns the LAST equal maximum; argmax semantics keep the first.
-    let mut best = 0usize;
-    let mut best_value = f32::NEG_INFINITY;
-    for (index, value) in tail.iter().enumerate() {
-        if *value > best_value {
-            best = index;
-            best_value = *value;
-        }
-    }
-    Ok(best as u32)
+    let tail = &values[values.len() - vocab..];
+    ff_core::math::argmax(tail)
 }
 
 /// Prefill/decode helper shared by the model: expand the embedding into
@@ -945,7 +949,7 @@ mod tests {
     #[test]
     fn window_ring_seeds_prefill_and_rotates_decode() {
         let device = Device::Cpu;
-        let mut ring = WindowRing::new(1, 4, 2, &device).unwrap();
+        let mut ring = WindowRing::new(1, 4, 2);
         // Prefill six tokens: the ring keeps the last four.
         let prefill = Tensor::from_vec(
             (0..12).map(|index| index as f32).collect(),
@@ -967,7 +971,7 @@ mod tests {
         assert_eq!(values[6], 100.0);
         // Prefill top-k: every query sees its own causal window, the earliest
         // queries see nothing, the last sees the trailing four positions.
-        let idxs = window_topk_idxs(4, 1, 6, 0);
+        let idxs = window_topk_idxs(4, 1, 6, 0).unwrap();
         assert_eq!(idxs.dims(), [1, 6, 4]);
         let flat = idxs.flatten_all().unwrap().to_vec1::<i64>().unwrap();
         assert_eq!(flat[..4], [-1, -1, -1, 0]);
@@ -1175,7 +1179,7 @@ mod tests {
             ),
             compress_cache: Vec::new(),
             index_k_cache: Vec::new(),
-            ring: WindowRing::new(1, 4, head_dim, &device).unwrap(),
+            ring: WindowRing::new(1, 4, head_dim),
             indexer_wq_b: Some(ones(2 * 32, qlora)),
             indexer_wk: Some(ones(32, head_dim)),
             indexer_k_norm: Some(Tensor::ones(32, DType::F32, &device).unwrap()),
@@ -1315,7 +1319,7 @@ mod tests {
             ),
             compress_cache: Vec::new(),
             index_k_cache: Vec::new(),
-            ring: WindowRing::new(1, 4, head_dim, &device).unwrap(),
+            ring: WindowRing::new(1, 4, head_dim),
             indexer_wq_b: Some(ones(2 * 32, qlora)),
             indexer_wk: Some(ones(32, head_dim)),
             indexer_k_norm: Some(Tensor::ones(32, DType::F32, &device).unwrap()),
@@ -1421,7 +1425,7 @@ mod tests {
             compressor: None,
             compress_cache: Vec::new(),
             index_k_cache: Vec::new(),
-            ring: WindowRing::new(1, 4, head_dim, &device).unwrap(),
+            ring: WindowRing::new(1, 4, head_dim),
             indexer_wq_b: None,
             indexer_wk: None,
             indexer_k_norm: None,
@@ -1526,7 +1530,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            ring: WindowRing::new(1, window, head_dim, &device).unwrap(),
+            ring: WindowRing::new(1, window, head_dim),
             indexer_wq_b: Some(ones(2 * 32, qlora)),
             indexer_wk: Some(ones(32, head_dim)),
             indexer_k_norm: Some(Tensor::ones(32, DType::F32, &device).unwrap()),
@@ -1611,20 +1615,20 @@ mod tests {
     fn decode_picks_address_rank_order_with_sentinels_for_unfilled_slots() {
         // start_pos 7 with window 4: slots hold positions 4..7 and the view is
         // oldest-first, so every rank is filled and in range.
-        let idxs = window_topk_idxs(4, 1, 1, 7);
+        let idxs = window_topk_idxs(4, 1, 1, 7).unwrap();
         let flat = idxs.flatten_all().unwrap().to_vec1::<i64>().unwrap();
         assert_eq!(flat, [0, 1, 2, 3]);
         // start_pos 2 (early decode, ring still filling): rank 0 maps to
         // physical slot 3, which the sequence never reached, so it is -1; the
         // remaining ranks cover slots 0..2.
-        let idxs = window_topk_idxs(4, 1, 1, 2);
+        let idxs = window_topk_idxs(4, 1, 1, 2).unwrap();
         let flat = idxs.flatten_all().unwrap().to_vec1::<i64>().unwrap();
         assert_eq!(flat, [-1, 1, 2, 3]);
     }
 
     #[test]
     fn prefill_window_picks_stay_within_the_configured_window() {
-        let idxs = window_topk_idxs(4, 1, 6, 0);
+        let idxs = window_topk_idxs(4, 1, 6, 0).unwrap();
         // Six-token prefill with a 4-row window: each query row carries at
         // most 4 picks and the earliest queries see -1 for slots before the
         // sequence started.
@@ -1637,7 +1641,7 @@ mod tests {
     #[test]
     fn window_ring_persists_decoded_rows_across_steps() {
         let device = Device::Cpu;
-        let mut ring = WindowRing::new(1, 4, 2, &device).unwrap();
+        let mut ring = WindowRing::new(1, 4, 2);
         let prefill = Tensor::from_vec(
             (0..8).map(|index| index as f32).collect(),
             (1, 4, 2),

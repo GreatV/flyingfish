@@ -10,28 +10,10 @@ use anyhow::Result;
 use anyhow::ensure;
 #[cfg(feature = "cuda")]
 use cudarc::driver::sys;
+use ff_core::math::{l2norm, rms_norm, silu, softplus};
 use std::path::Path;
 
 const P: &str = "language_model.model";
-
-fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
-    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
-    let inv = 1.0 / (mean_sq + eps).sqrt();
-    x.iter().zip(weight).map(|(&v, &w)| v * inv * w).collect()
-}
-
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
-
-fn softplus(x: f32) -> f32 {
-    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
-}
-
-fn l2norm(x: &[f32]) -> Vec<f32> {
-    let norm = (x.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
-    x.iter().map(|v| v / norm).collect()
-}
 
 /// (kind, normed input, attention-block output, moe output) — for the
 /// reference-diff harnesses.
@@ -643,7 +625,7 @@ impl Edge0Text {
         for layer in 0..text.num_hidden_layers {
             let prefix = format!("{P}.layers.{layer}");
             let inner_started = std::time::Instant::now();
-            let normed = rmsnorm(
+            let normed = rms_norm(
                 &hidden,
                 &self.layer_norms[layer].input,
                 text.rms_norm_eps as f32,
@@ -658,7 +640,7 @@ impl Edge0Text {
             for (h, a) in hidden.iter_mut().zip(&attn_out) {
                 *h += a;
             }
-            let normed = rmsnorm(
+            let normed = rms_norm(
                 &hidden,
                 &self.layer_norms[layer].post,
                 text.rms_norm_eps as f32,
@@ -691,7 +673,7 @@ impl Edge0Text {
         }
         self.position += 1;
         // Final norm is plain RMSNorm (checkpoint norm weights unshifted).
-        Ok(rmsnorm(&hidden, &self.final_norm, text.rms_norm_eps as f32))
+        Ok(rms_norm(&hidden, &self.final_norm, text.rms_norm_eps as f32))
     }
 
     pub fn logits(&mut self, hidden: &[f32]) -> Result<Vec<f32>> {
@@ -715,7 +697,7 @@ impl Edge0Text {
     pub fn block_parts(&mut self, layer: usize, x: &[f32]) -> Result<BlockParts> {
         let text = self.config.text_config.clone();
         let prefix = format!("{P}.layers.{layer}");
-        let normed = rmsnorm(x, &self.layer_norms[layer].input, text.rms_norm_eps as f32);
+        let normed = rms_norm(x, &self.layer_norms[layer].input, text.rms_norm_eps as f32);
         let kind = if text.layer_kind(layer) == LayerKind::LinearAttention {
             "gdn"
         } else {
@@ -733,7 +715,7 @@ impl Edge0Text {
             self.full_attention_forward(kv_index, &prefix, &normed, &text)
         };
         let residual: Vec<f32> = x.iter().zip(&attn_out).map(|(&a, &b)| a + b).collect();
-        let moe_in = rmsnorm(
+        let moe_in = rms_norm(
             &residual,
             &self.layer_norms[layer].post,
             text.rms_norm_eps as f32,
@@ -1565,7 +1547,7 @@ impl Edge0Text {
         let mut k_stored = vec![0f32; kv_stride];
         for kv_head in 0..kv_heads {
             let mut k = k_raw[kv_head * head_dim..(kv_head + 1) * head_dim].to_vec();
-            k = rmsnorm(&k, k_norm, text.rms_norm_eps as f32);
+            k = rms_norm(&k, k_norm, text.rms_norm_eps as f32);
             apply_rope(&mut k, position, rotary_dim, text.rope.rope_theta);
             k_stored[kv_head * head_dim..(kv_head + 1) * head_dim].copy_from_slice(&k);
         }
@@ -1580,13 +1562,13 @@ impl Edge0Text {
             println!("attn v[:6] {:?}", &v_raw[..6]);
             println!(
                 "attn k_normed[:6] {:?}",
-                rmsnorm(&k_raw[..head_dim], k_norm, text.rms_norm_eps as f32)
+                rms_norm(&k_raw[..head_dim], k_norm, text.rms_norm_eps as f32)
             );
         }
         for head in 0..heads {
             let kv_head = head / (heads / kv_heads);
             let mut q = query[head * head_dim..(head + 1) * head_dim].to_vec();
-            q = rmsnorm(&q, q_norm, text.rms_norm_eps as f32);
+            q = rms_norm(&q, q_norm, text.rms_norm_eps as f32);
             apply_rope(&mut q, position, rotary_dim, text.rope.rope_theta);
             let mut scores = Vec::with_capacity(cache.len);
             for step in 0..cache.len {
