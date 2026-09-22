@@ -1151,7 +1151,7 @@ fn load_or_initialize_state(
     audio_channels: usize,
     seed: u64,
     _weight_source: WeightSource,
-    execution_cache_policy: CachePolicy,
+    _execution_cache_policy: CachePolicy,
     transformer_chunking: TransformerChunking,
 ) -> Result<GenerationState> {
     Ok(match resume_checkpoint {
@@ -1175,10 +1175,12 @@ fn load_or_initialize_state(
             let encode_start = Instant::now();
             // Encode is one-pass: every encoder weight is read exactly once,
             // so stream mmap with drop-behind instead of retaining 63 GiB.
+            // A one-shard policy evicts behind the scan; the transformer's
+            // own cache policy would let encoder pages compete with it.
             let mut encoder = StreamedTextEncoder::open(
                 resolve_component(model, Path::new("text_encoder"))?,
                 WeightSource::Mmap,
-                execution_cache_policy,
+                CachePolicy::new(1),
                 device.clone(),
                 target_hidden_state,
                 transformer_chunking.attention.query_chunk_size.get(),

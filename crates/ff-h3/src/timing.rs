@@ -51,6 +51,7 @@ struct Collector {
     buckets: BTreeMap<&'static str, BucketTotals>,
     prefetch_stages: u64,
     prefetch_fallback_tensors: u64,
+    prefetch_skipped: u64,
     prefetch_fill: Duration,
 }
 
@@ -80,6 +81,7 @@ struct StageRecord {
 struct PrefetchSummary {
     stages: u64,
     fallback_tensors: u64,
+    skipped_resident: u64,
     fill_s: f64,
 }
 
@@ -115,6 +117,7 @@ impl Collector {
             buckets: BTreeMap::new(),
             prefetch_stages: 0,
             prefetch_fallback_tensors: 0,
+            prefetch_skipped: 0,
             prefetch_fill: Duration::ZERO,
         })
     }
@@ -153,6 +156,7 @@ impl Collector {
         let prefetch = (self.prefetch_stages > 0).then_some(PrefetchSummary {
             stages: self.prefetch_stages,
             fallback_tensors: self.prefetch_fallback_tensors,
+            skipped_resident: std::mem::take(&mut self.prefetch_skipped),
             fill_s: std::mem::take(&mut self.prefetch_fill).as_secs_f64(),
         });
         self.prefetch_stages = 0;
@@ -222,12 +226,18 @@ pub(crate) fn record_stage(bucket: &'static str, load: Duration, compute: Durati
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) fn record_prefetch(stages: u64, fallback_tensors: u64, fill: Duration) {
+pub(crate) fn record_prefetch(
+    stages: u64,
+    fallback_tensors: u64,
+    skipped_resident: u64,
+    fill: Duration,
+) {
     let Some(mut collector) = collector().and_then(|collector| collector.lock().ok()) else {
         return;
     };
     collector.prefetch_stages += stages;
     collector.prefetch_fallback_tensors += fallback_tensors;
+    collector.prefetch_skipped += skipped_resident;
     collector.prefetch_fill += fill;
 }
 
@@ -266,6 +276,7 @@ mod tests {
             buckets: BTreeMap::new(),
             prefetch_stages: 0,
             prefetch_fallback_tensors: 0,
+            prefetch_skipped: 0,
             prefetch_fill: Duration::ZERO,
         }
     }

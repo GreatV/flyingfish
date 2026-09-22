@@ -1309,6 +1309,7 @@ impl StreamedTransformer {
         }
         let load = load_started.elapsed();
         let fill_started = std::time::Instant::now();
+        let mut skipped_resident = 0u64;
         if let Some(next) = self.plan.stages().get(stage_index + 1) {
             let next_names = next
                 .tensor_names
@@ -1318,13 +1319,16 @@ impl StreamedTransformer {
             // A failed kick — typically an allocation that cannot fit beside
             // the live stage — degrades this one prefetch to the streaming
             // path; the next stage's take finds an empty slot and loads.
-            if let Err(error) = prefetcher.prefetch(&self.weights, &next_names) {
-                eprintln!("H3 stage prefetch skipped ({error:#}); the next stage streams");
+            match prefetcher.prefetch(&self.weights, &next_names) {
+                Ok(skipped) => skipped_resident = skipped,
+                Err(error) => {
+                    eprintln!("H3 stage prefetch skipped ({error:#}); the next stage streams");
+                }
             }
         }
         let fill = fill_started.elapsed();
         if timed {
-            crate::timing::record_prefetch(1, missing.len() as u64, fill);
+            crate::timing::record_prefetch(1, missing.len() as u64, skipped_resident, fill);
         }
         let compute_started = std::time::Instant::now();
         let result = self.compute_with_oom_recovery(stage, &loaded, &mut f);

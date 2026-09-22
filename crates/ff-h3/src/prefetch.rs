@@ -53,7 +53,7 @@ impl StagePrefetcher {
         })
     }
 
-    pub(crate) fn prefetch(&mut self, weights: &ModelWeights, names: &[&str]) -> Result<()> {
+    pub(crate) fn prefetch(&mut self, weights: &ModelWeights, names: &[&str]) -> Result<u64> {
         let mut tensors = BTreeMap::new();
         self.stream
             .context()
@@ -62,7 +62,16 @@ impl StagePrefetcher {
         self.stream
             .synchronize()
             .context("drain the prefetch stream before slab reuse")?;
-        let total: usize = names
+        // Device-resident names already live in VRAM; re-uploading them would
+        // pay H2D twice and hold a second copy beside the cache's own.
+        let device = candle_core::Device::Cuda(self.device.clone());
+        let pending: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| !weights.device_resident(name, &device).unwrap_or(false))
+            .collect();
+        let skipped = (names.len() - pending.len()) as u64;
+        let total: usize = pending
             .iter()
             .map(|&name| {
                 weights
@@ -73,7 +82,7 @@ impl StagePrefetcher {
             .sum();
         self.ensure_slab(total)?;
         let mut offset = 0usize;
-        for &name in names {
+        for &name in &pending {
             if let Some((tensor, consumed)) = upload_async(
                 weights,
                 name,
