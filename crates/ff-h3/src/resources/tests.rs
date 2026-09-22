@@ -1075,3 +1075,120 @@ fn conditioned_rows_and_timestep_tables_are_charged_without_changing_t2va_defaul
     rows.total += 1;
     assert!(ResourceEstimate::for_shape_rows(model, geometry, conditioned, rows).is_err());
 }
+
+#[test]
+fn t2va_requirement_exposes_the_deriver_fields() {
+    let estimate = default_estimate(1);
+    let requirement = H3T2vaRequirement::from_estimate(&estimate, 63_000_000_000).unwrap();
+    use ff_core::configure::ModelRequirement as _;
+    let traffic = &estimate.compute_and_traffic;
+    assert_eq!(
+        requirement.steady_weight_bytes().unwrap(),
+        traffic.transformer_weight_bytes_per_evaluation_with_adaln_precompute
+    );
+    assert_eq!(
+        requirement.single_pass_weight_bytes().unwrap(),
+        traffic.transformer_weight_bytes_per_evaluation_without_adaln_precompute
+            - traffic.transformer_weight_bytes_per_evaluation_with_adaln_precompute
+            + 63_000_000_000
+    );
+    assert!(
+        requirement.activation_peak_bytes().unwrap() > 0,
+        "the flash-mode activation peak must be positive"
+    );
+    assert_eq!(
+        requirement.flops_per_evaluation().unwrap(),
+        traffic.total_flops_per_evaluation
+    );
+}
+
+fn machine_profile(host_bytes: u64, device_bytes: u64) -> ff_core::topology::TopologyProfile {
+    use ff_core::probe::{DeviceBackend, HardwareFingerprint};
+    use ff_core::topology::{InterconnectLevel, TopologyDevice};
+    ff_core::topology::TopologyProfile {
+        schema_version: ff_core::topology::TOPOLOGY_PROFILE_SCHEMA_VERSION,
+        fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu),
+        host_memory_total_bytes: Some(host_bytes),
+        devices: vec![TopologyDevice {
+            ordinal: 0,
+            backend: DeviceBackend::Cuda,
+            name: Some("fixture".to_owned()),
+            total_memory_bytes: Some(device_bytes),
+            compute_capability: None,
+        }],
+        interconnect: InterconnectLevel::SingleDevice,
+        storage_bytes_per_second: None,
+    }
+}
+
+#[test]
+fn derivation_reproduces_the_measured_machine_configurations() {
+    use ff_core::configure::{self, WeightSourceChoice};
+    let gib = 1u64 << 30;
+    let estimate = default_estimate(357);
+    let requirement = H3T2vaRequirement::from_estimate(&estimate, 0).unwrap();
+
+    let rtx4090 = configure::derive(
+        0,
+        &machine_profile(67_200_000_000, 24 * gib),
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(rtx4090.weight_source, WeightSourceChoice::Memory);
+    assert!(
+        rtx4090.host_cache_ceiling_bytes.unwrap() > 60 * gib,
+        "the cache ceiling must cover the full transformer materialization"
+    );
+    assert_eq!(
+        rtx4090.chunks,
+        Some(configure::ChunkPlan {
+            attention_projection: 4096,
+            feed_forward: 1024,
+            output: 1024
+        })
+    );
+    assert!(rtx4090.residency_budget_bytes > 15 * gib);
+
+    let blackwell = configure::derive(
+        0,
+        &machine_profile(1007 * gib, 96 * gib),
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(blackwell.weight_source, WeightSourceChoice::Memory);
+    assert_eq!(blackwell.chunks, rtx4090.chunks);
+    assert!(blackwell.residency_budget_bytes > 80 * gib);
+
+    let dual_a4000_host = configure::derive(
+        0,
+        &machine_profile(30_000_000_000, 16 * gib),
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(dual_a4000_host.weight_source, WeightSourceChoice::Mmap);
+    assert_eq!(dual_a4000_host.host_cache_ceiling_bytes, None);
+
+    let knife_edge_host = configure::derive(
+        0,
+        &machine_profile(62 * gib, 24 * gib),
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(knife_edge_host.weight_source, WeightSourceChoice::Mmap);
+    assert_eq!(dual_a4000_host.chunks, rtx4090.chunks);
+    assert!(dual_a4000_host.residency_budget_bytes > 10 * gib);
+}
+
+
+
+#[test]
+fn scratch_host_overhead_numbers() {
+    let estimate = default_estimate(357);
+    println!(
+        "peak_host={:.3} GiB workspace={:.3} GiB static_ctx={:.3} persistent={:.3}",
+        estimate.peak_host_bytes as f64 / 2f64.powi(30),
+        estimate.host_runtime_workspace_bytes as f64 / 2f64.powi(30),
+        estimate.activations.static_context_bytes as f64 / 2f64.powi(30),
+        estimate.activations.persistent_pipeline_bytes as f64 / 2f64.powi(30)
+    );
+}

@@ -283,6 +283,27 @@ impl DenoiseChunkArgs {
             || self.output_token_chunk_size.is_some()
     }
 
+    fn with_derived(self, plan: Option<ff_core::configure::ChunkPlan>) -> Self {
+        let Some(plan) = plan else {
+            return self;
+        };
+        Self {
+            attention_query_chunk_size: self
+                .attention_query_chunk_size
+                .or_else(|| NonZeroUsize::new(plan.attention_projection)),
+            attention_projection_chunk_size: self
+                .attention_projection_chunk_size
+                .or_else(|| NonZeroUsize::new(plan.attention_projection)),
+            attention_key_chunk_size: self.attention_key_chunk_size,
+            ffn_token_chunk_size: self
+                .ffn_token_chunk_size
+                .or_else(|| NonZeroUsize::new(plan.feed_forward)),
+            output_token_chunk_size: self
+                .output_token_chunk_size
+                .or_else(|| NonZeroUsize::new(plan.output)),
+        }
+    }
+
     /// Resolve every unstated chunk to its documented default.
     ///
     /// The projection chunk has two defaults because it means two things. On
@@ -418,6 +439,18 @@ impl OptionalWeightCacheArgs {
         self.weight_source.is_some()
             || self.host_cache_mib.is_some()
             || self.host_cache_granularity.is_some()
+    }
+
+    fn with_derived(
+        self,
+        source: Option<WeightSource>,
+        host_cache_mib: Option<u64>,
+    ) -> Self {
+        Self {
+            weight_source: self.weight_source.or(source),
+            host_cache_mib: self.host_cache_mib.or(host_cache_mib),
+            host_cache_granularity: self.host_cache_granularity,
+        }
     }
 
     fn configured(self) -> WeightCacheArgs {
