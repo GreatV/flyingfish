@@ -441,11 +441,7 @@ impl OptionalWeightCacheArgs {
             || self.host_cache_granularity.is_some()
     }
 
-    fn with_derived(
-        self,
-        source: Option<WeightSource>,
-        host_cache_mib: Option<u64>,
-    ) -> Self {
+    fn with_derived(self, source: Option<WeightSource>, host_cache_mib: Option<u64>) -> Self {
         Self {
             weight_source: self.weight_source.or(source),
             host_cache_mib: self.host_cache_mib.or(host_cache_mib),

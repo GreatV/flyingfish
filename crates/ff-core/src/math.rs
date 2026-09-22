@@ -169,8 +169,16 @@ mod tests {
             .to_dtype(DType::BF16)
             .unwrap();
         assert_eq!(
-            actual.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap(),
-            expected.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap()
+            actual
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            expected
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
         );
     }
 
@@ -196,7 +204,10 @@ mod tests {
     #[test]
     fn zero_temperature_sampling_is_greedy() {
         let mut rng = StdRng::seed_from_u64(7);
-        assert_eq!(nucleus_sample(&[-1.0, 3., 2.], 0.0, 0.95, &mut rng).unwrap(), 1);
+        assert_eq!(
+            nucleus_sample(&[-1.0, 3., 2.], 0.0, 0.95, &mut rng).unwrap(),
+            1
+        );
     }
 
     #[test]

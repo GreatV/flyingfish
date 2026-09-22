@@ -1128,12 +1128,8 @@ fn derivation_reproduces_the_measured_machine_configurations() {
     let estimate = default_estimate(357);
     let requirement = H3T2vaRequirement::from_estimate(&estimate, 0, true).unwrap();
 
-    let rtx4090 = configure::derive(
-        0,
-        &machine_profile(67_200_000_000, 24 * gib),
-        &requirement,
-    )
-    .unwrap();
+    let rtx4090 =
+        configure::derive(0, &machine_profile(67_200_000_000, 24 * gib), &requirement).unwrap();
     assert_eq!(rtx4090.weight_source, WeightSourceChoice::Memory);
     assert!(
         rtx4090.host_cache_ceiling_bytes.unwrap() > 60 * gib,
@@ -1148,35 +1144,21 @@ fn derivation_reproduces_the_measured_machine_configurations() {
         })
     );
 
-    let blackwell = configure::derive(
-        0,
-        &machine_profile(1007 * gib, 96 * gib),
-        &requirement,
-    )
-    .unwrap();
+    let blackwell =
+        configure::derive(0, &machine_profile(1007 * gib, 96 * gib), &requirement).unwrap();
     assert_eq!(blackwell.weight_source, WeightSourceChoice::Memory);
     assert_eq!(blackwell.chunks, rtx4090.chunks);
 
-    let dual_a4000_host = configure::derive(
-        0,
-        &machine_profile(30_000_000_000, 16 * gib),
-        &requirement,
-    )
-    .unwrap();
+    let dual_a4000_host =
+        configure::derive(0, &machine_profile(30_000_000_000, 16 * gib), &requirement).unwrap();
     assert_eq!(dual_a4000_host.weight_source, WeightSourceChoice::Mmap);
     assert_eq!(dual_a4000_host.host_cache_ceiling_bytes, None);
 
-    let knife_edge_host = configure::derive(
-        0,
-        &machine_profile(62 * gib, 24 * gib),
-        &requirement,
-    )
-    .unwrap();
+    let knife_edge_host =
+        configure::derive(0, &machine_profile(62 * gib, 24 * gib), &requirement).unwrap();
     assert_eq!(knife_edge_host.weight_source, WeightSourceChoice::Mmap);
     assert_eq!(dual_a4000_host.chunks, rtx4090.chunks);
 }
-
-
 
 #[test]
 fn scratch_host_overhead_numbers() {

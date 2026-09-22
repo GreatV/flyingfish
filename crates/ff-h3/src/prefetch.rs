@@ -64,14 +64,24 @@ impl StagePrefetcher {
             .context("drain the prefetch stream before slab reuse")?;
         let total: usize = names
             .iter()
-            .map(|&name| weights.metadata(name).map(|metadata| metadata.bytes).unwrap_or(0))
+            .map(|&name| {
+                weights
+                    .metadata(name)
+                    .map(|metadata| metadata.bytes)
+                    .unwrap_or(0)
+            })
             .sum();
         self.ensure_slab(total)?;
         let mut offset = 0usize;
         for &name in names {
-            if let Some((tensor, consumed)) =
-                upload_async(weights, name, &self.stream, &self.device, &mut self.slab, offset)?
-            {
+            if let Some((tensor, consumed)) = upload_async(
+                weights,
+                name,
+                &self.stream,
+                &self.device,
+                &mut self.slab,
+                offset,
+            )? {
                 offset += consumed;
                 tensors.insert(name.to_owned(), tensor);
             }
@@ -175,42 +185,46 @@ fn upload_async(
     let slab = slab
         .as_mut()
         .with_context(|| format!("prefetch slab is not allocated for {name}"))?;
-    weights.with_tensor_bytes(name, move |bytes| {
-        ensure!(
-            bytes.len() == bytes_len,
-            "prefetch byte count mismatch for {name}"
-        );
-        let staged = slab.as_mut_slice()
-            .with_context(|| format!("lock the prefetch slab for {name}"))?;
-        fill_parallel(&mut staged[offset..offset + bytes_len], bytes);
-        let host = slab
-            .as_slice()
-            .with_context(|| format!("lock the prefetch slab for {name}"))?;
-        let staged = &host[offset..offset + bytes_len];
-        macro_rules! upload {
-            ($element:ty) => {{
-                let bytes = count * std::mem::size_of::<$element>();
-                let mut slice = unsafe { stream.alloc::<$element>(count)? };
-                let pointer = slice.device_ptr_mut(stream).0;
-                unsafe { result::memcpy_htod_async(pointer, &staged[..bytes], stream.cu_stream()) }
+    weights
+        .with_tensor_bytes(name, move |bytes| {
+            ensure!(
+                bytes.len() == bytes_len,
+                "prefetch byte count mismatch for {name}"
+            );
+            let staged = slab
+                .as_mut_slice()
+                .with_context(|| format!("lock the prefetch slab for {name}"))?;
+            fill_parallel(&mut staged[offset..offset + bytes_len], bytes);
+            let host = slab
+                .as_slice()
+                .with_context(|| format!("lock the prefetch slab for {name}"))?;
+            let staged = &host[offset..offset + bytes_len];
+            macro_rules! upload {
+                ($element:ty) => {{
+                    let bytes = count * std::mem::size_of::<$element>();
+                    let mut slice = unsafe { stream.alloc::<$element>(count)? };
+                    let pointer = slice.device_ptr_mut(stream).0;
+                    unsafe {
+                        result::memcpy_htod_async(pointer, &staged[..bytes], stream.cu_stream())
+                    }
                     .with_context(|| format!("enqueue prefetch copy for {name}"))?;
-                Ok(Tensor::from_storage(
-                    Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
-                        slice,
-                        device.clone(),
-                    )),
-                    metadata.shape.clone(),
-                    BackpropOp::none(),
-                    false,
-                ))
-            }};
-        }
-        match dtype {
-            DType::BF16 => upload!(half::bf16),
-            DType::F16 => upload!(half::f16),
-            DType::F32 => upload!(f32),
-            _ => unreachable!("prefetch dtype filtered above"),
-        }
-    })
-    .map(|tensor| Some((tensor, bytes_len)))
+                    Ok(Tensor::from_storage(
+                        Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+                            slice,
+                            device.clone(),
+                        )),
+                        metadata.shape.clone(),
+                        BackpropOp::none(),
+                        false,
+                    ))
+                }};
+            }
+            match dtype {
+                DType::BF16 => upload!(half::bf16),
+                DType::F16 => upload!(half::f16),
+                DType::F32 => upload!(f32),
+                _ => unreachable!("prefetch dtype filtered above"),
+            }
+        })
+        .map(|tensor| Some((tensor, bytes_len)))
 }

@@ -1614,8 +1614,8 @@ fn directory_tree_bytes(root: &Path) -> Result<u64> {
     let mut total = 0u64;
     let mut queue = vec![root.to_path_buf()];
     while let Some(path) = queue.pop() {
-        let entries = fs::read_dir(&path)
-            .with_context(|| format!("failed to list {}", path.display()))?;
+        let entries =
+            fs::read_dir(&path).with_context(|| format!("failed to list {}", path.display()))?;
         for entry in entries {
             let entry = entry.with_context(|| format!("failed to list {}", path.display()))?;
             let file_type = entry
@@ -1634,7 +1634,9 @@ fn directory_tree_bytes(root: &Path) -> Result<u64> {
     Ok(total)
 }
 
-fn load_or_capture_topology(primary: &Device) -> Result<flyingfish::runtime::topology::TopologyProfile> {
+fn load_or_capture_topology(
+    primary: &Device,
+) -> Result<flyingfish::runtime::topology::TopologyProfile> {
     use flyingfish::runtime::topology::TopologyProfile;
     let Some(path) = std::env::var_os("FF_TOPOLOGY_PROFILE") else {
         return Ok(TopologyProfile::capture(primary));
@@ -1650,10 +1652,14 @@ fn load_or_capture_topology(primary: &Device) -> Result<flyingfish::runtime::top
                     flyingfish::runtime::topology::TopologyProfileAbsence::NotFound(_) => {
                         "absent"
                     }
-                    flyingfish::runtime::topology::TopologyProfileAbsence::ForeignHost { .. } => {
+                    flyingfish::runtime::topology::TopologyProfileAbsence::ForeignHost {
+                        ..
+                    } => {
                         "recorded on another machine"
                     }
-                    flyingfish::runtime::topology::TopologyProfileAbsence::StaleSchema { .. } => {
+                    flyingfish::runtime::topology::TopologyProfileAbsence::StaleSchema {
+                        ..
+                    } => {
                         "recorded under an older schema"
                     }
                 }
@@ -1679,8 +1685,7 @@ fn derive_t2va_configuration(
     let estimate =
         ResourceEstimate::for_t2va(&config, geometry, ResourceAssumptions::h3_bf16_mmap())?;
     let encoder_bytes = directory_tree_bytes(&model_root.join("text_encoder"))?;
-    let requirement =
-        H3T2vaRequirement::from_estimate(&estimate, encoder_bytes, flash_attention)?;
+    let requirement = H3T2vaRequirement::from_estimate(&estimate, encoder_bytes, flash_attention)?;
     let profile = load_or_capture_topology(primary)?;
     let derived = ff_core::configure::derive(ordinal, &profile, &requirement)?;
     let host_bound_bytes = match (derived.weight_source, derived.host_cache_ceiling_bytes) {

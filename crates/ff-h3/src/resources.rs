@@ -841,8 +841,12 @@ pub struct H3T2vaRequirement {
 /// The chunk ladder the deriver searches, largest last. The top entry is the
 /// measured performance optimum of the 2026-09 chunk scan; larger entries fit
 /// more devices but compute slower.
-const CHUNK_LADDER: [(usize, usize, usize); 4] =
-    [(512, 128, 512), (1024, 256, 1024), (2048, 512, 1024), (4096, 1024, 1024)];
+const CHUNK_LADDER: [(usize, usize, usize); 4] = [
+    (512, 128, 512),
+    (1024, 256, 1024),
+    (2048, 512, 1024),
+    (4096, 1024, 1024),
+];
 
 impl H3T2vaRequirement {
     pub fn from_estimate(

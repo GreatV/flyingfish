@@ -115,10 +115,7 @@ impl VideoOutputSink for PngFrameSink {
             "video chunks must be consecutive: expected frame {}, got {first_frame}",
             self.next_frame
         );
-        let writer = self
-            .writer
-            .as_mut()
-            .context("PNG sink already finished")?;
+        let writer = self.writer.as_mut().context("PNG sink already finished")?;
         let frames = rgb
             .dims5()
             .context("video chunk must have shape [1, 3, frames, height, width]")?
@@ -1508,7 +1505,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let frames = directory.path().join("frames");
         fs::create_dir(&frames).unwrap();
-        let values: Vec<f32> = (0..2 * 3 * 2 * 3).map(|index| index as f32 / 36.0).collect();
+        let values: Vec<f32> = (0..2 * 3 * 2 * 3)
+            .map(|index| index as f32 / 36.0)
+            .collect();
         let whole = Tensor::from_vec(values, (1, 3, 2, 2, 3), &Device::Cpu).unwrap();
         let split = [
             whole.narrow(2, 0, 1).unwrap(),

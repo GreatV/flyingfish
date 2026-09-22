@@ -1256,11 +1256,10 @@ impl StreamedTransformer {
             return self.execute_stage_prefetched(prefetcher, stage_index, f);
         }
         if crate::timing::enabled() {
-            let mut record = |bucket: &'static str,
-                              load: std::time::Duration,
-                              compute: std::time::Duration| {
-                crate::timing::record_stage(bucket, load, compute);
-            };
+            let mut record =
+                |bucket: &'static str, load: std::time::Duration, compute: std::time::Duration| {
+                    crate::timing::record_stage(bucket, load, compute);
+                };
             return self.plan.with_stage_timed(
                 &self.weights,
                 stage_index,
@@ -1331,7 +1330,11 @@ impl StreamedTransformer {
         let result = self.compute_with_oom_recovery(stage, &loaded, &mut f);
         if timed {
             self.device.synchronize()?;
-            crate::timing::record_stage(stage.kind.timing_bucket(), load, compute_started.elapsed());
+            crate::timing::record_stage(
+                stage.kind.timing_bucket(),
+                load,
+                compute_started.elapsed(),
+            );
         }
         drop(prefetcher);
         result

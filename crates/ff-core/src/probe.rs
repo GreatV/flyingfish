@@ -491,7 +491,10 @@ pub fn admission_reserve_bytes(pool_total: Option<u64>) -> u64 {
 /// The CUDA device UUID is the strongest identifier available; the host fields
 /// catch a profile carried between machines that happen to hold the same card
 /// model.
-pub fn describes_same_machine(recorded: &HardwareFingerprint, current: &HardwareFingerprint) -> bool {
+pub fn describes_same_machine(
+    recorded: &HardwareFingerprint,
+    current: &HardwareFingerprint,
+) -> bool {
     recorded.validate().is_ok()
         && current.validate().is_ok()
         && recorded.backend == current.backend

@@ -188,8 +188,7 @@ fn open_append(path: &Path) -> Result<File> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     OpenOptions::new()
         .create(true)
@@ -287,7 +286,11 @@ mod tests {
         let mut collector = test_collector();
         collector.record_stage("adaln", Duration::from_millis(10), Duration::from_millis(5));
         collector.record_stage("adaln", Duration::from_millis(1), Duration::from_millis(2));
-        collector.record_stage("attention", Duration::from_millis(3), Duration::from_millis(7));
+        collector.record_stage(
+            "attention",
+            Duration::from_millis(3),
+            Duration::from_millis(7),
+        );
         let record = collector.take_stage_record("eval", Some(12), None);
         assert_eq!(record.step, Some(12));
         assert_eq!(record.stages.stages, 3);

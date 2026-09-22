@@ -141,7 +141,10 @@ pub fn derive(
                  {single_pass} B; cache ceiling {:?} B{}",
                 profile.host_memory_total_bytes,
                 host_cache_ceiling_bytes,
-                mmap_cost.as_deref().map(|cost| format!("; {cost}")).unwrap_or_default()
+                mmap_cost
+                    .as_deref()
+                    .map(|cost| format!("; {cost}"))
+                    .unwrap_or_default()
             )
         },
     }];
@@ -219,13 +222,15 @@ mod tests {
             fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu),
             host_memory_total_bytes: host,
             devices: device
-                .map(|bytes| vec![TopologyDevice {
-                    ordinal: 0,
-                    backend: DeviceBackend::Cuda,
-                    name: Some("fixture".to_owned()),
-                    total_memory_bytes: Some(bytes),
-                    compute_capability: None,
-                }])
+                .map(|bytes| {
+                    vec![TopologyDevice {
+                        ordinal: 0,
+                        backend: DeviceBackend::Cuda,
+                        name: Some("fixture".to_owned()),
+                        total_memory_bytes: Some(bytes),
+                        compute_capability: None,
+                    }]
+                })
                 .unwrap_or_default(),
             interconnect: InterconnectLevel::SingleDevice,
             storage_bytes_per_second: None,
@@ -242,10 +247,7 @@ mod tests {
         assert_eq!(bare.activation_peak_bytes().unwrap(), 100);
         assert_eq!(bare.single_pass_weight_bytes().unwrap(), 0);
         assert_eq!(bare.flops_per_evaluation().unwrap(), 0);
-        assert_eq!(
-            bare.largest_chunk_plan_within(u64::MAX).unwrap(),
-            None
-        );
+        assert_eq!(bare.largest_chunk_plan_within(u64::MAX).unwrap(), None);
     }
 
     #[test]
@@ -299,9 +301,11 @@ mod tests {
             activations: 4 * gib,
         };
         let derived = derive(0, &profile(Some(100 * gib), Some(24 * gib)), &bare).unwrap();
-        assert!(derived
-            .provenance
-            .iter()
-            .any(|step| step.rule == "rule-2-chunks"));
+        assert!(
+            derived
+                .provenance
+                .iter()
+                .any(|step| step.rule == "rule-2-chunks")
+        );
     }
 }

@@ -1,8 +1,8 @@
 use super::kit;
 use super::text_runtime::{TextDevice, greedy_token, resolve_text_device};
-use anyhow::{Context, Result};
 #[cfg(not(feature = "cuda"))]
 use anyhow::bail;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use flyingfish::edge0::config::{Edge0Config, chat_prompt};
 use flyingfish::edge0::model::{Edge0Text, configured_max_ctx};

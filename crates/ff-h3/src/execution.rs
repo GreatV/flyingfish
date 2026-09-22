@@ -192,11 +192,7 @@ impl H3ExecutionPlan {
         let compute_started = Instant::now();
         let result = f(stage, &loaded);
         device.synchronize()?;
-        record(
-            stage.kind.timing_bucket(),
-            load,
-            compute_started.elapsed(),
-        );
+        record(stage.kind.timing_bucket(), load, compute_started.elapsed());
         result
     }
 }

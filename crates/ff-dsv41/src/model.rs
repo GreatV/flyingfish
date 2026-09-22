@@ -95,7 +95,11 @@ impl WindowRing {
                     );
                 }
             }
-            Ok(Tensor::from_vec(ordered, (batch, window, head_dim), kv.device())?)
+            Ok(Tensor::from_vec(
+                ordered,
+                (batch, window, head_dim),
+                kv.device(),
+            )?)
         }
     }
 }

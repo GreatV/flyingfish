@@ -673,7 +673,11 @@ impl Edge0Text {
         }
         self.position += 1;
         // Final norm is plain RMSNorm (checkpoint norm weights unshifted).
-        Ok(rms_norm(&hidden, &self.final_norm, text.rms_norm_eps as f32))
+        Ok(rms_norm(
+            &hidden,
+            &self.final_norm,
+            text.rms_norm_eps as f32,
+        ))
     }
 
     pub fn logits(&mut self, hidden: &[f32]) -> Result<Vec<f32>> {

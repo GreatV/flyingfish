@@ -57,7 +57,10 @@ pub enum TopologyProfileAbsence {
         recorded_device: Option<String>,
         current_device: Option<String>,
     },
-    StaleSchema { path: PathBuf, recorded: u32 },
+    StaleSchema {
+        path: PathBuf,
+        recorded: u32,
+    },
 }
 
 impl TopologyProfile {
@@ -156,7 +159,10 @@ mod tests {
     fn cpu_capture_records_the_host_without_devices() {
         let profile = cpu_profile();
         assert_eq!(profile.schema_version, TOPOLOGY_PROFILE_SCHEMA_VERSION);
-        assert_eq!(profile.fingerprint.schema_version, HARDWARE_FINGERPRINT_SCHEMA_VERSION);
+        assert_eq!(
+            profile.fingerprint.schema_version,
+            HARDWARE_FINGERPRINT_SCHEMA_VERSION
+        );
         assert!(profile.host_memory_total_bytes.is_some());
         assert!(profile.devices.is_empty());
         assert_eq!(profile.interconnect, InterconnectLevel::SingleDevice);
@@ -178,7 +184,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("absent.json");
         assert_eq!(
-            TopologyProfile::load(&path, &Device::Cpu).unwrap().unwrap_err(),
+            TopologyProfile::load(&path, &Device::Cpu)
+                .unwrap()
+                .unwrap_err(),
             TopologyProfileAbsence::NotFound(path.clone())
         );
     }
@@ -192,7 +200,10 @@ mod tests {
         let mut edited: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         edited["fingerprint"]["logical_cpu_count"] = 1_000_000.into();
         std::fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
-        match TopologyProfile::load(&path, &Device::Cpu).unwrap().unwrap_err() {
+        match TopologyProfile::load(&path, &Device::Cpu)
+            .unwrap()
+            .unwrap_err()
+        {
             TopologyProfileAbsence::ForeignHost { .. } => {}
             other => panic!("expected a foreign host, got {other:?}"),
         }
@@ -207,7 +218,10 @@ mod tests {
         let mut edited: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         edited["schema_version"] = (TOPOLOGY_PROFILE_SCHEMA_VERSION + 1).into();
         std::fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
-        match TopologyProfile::load(&path, &Device::Cpu).unwrap().unwrap_err() {
+        match TopologyProfile::load(&path, &Device::Cpu)
+            .unwrap()
+            .unwrap_err()
+        {
             TopologyProfileAbsence::StaleSchema { recorded, .. } => {
                 assert_eq!(recorded, TOPOLOGY_PROFILE_SCHEMA_VERSION + 1)
             }
