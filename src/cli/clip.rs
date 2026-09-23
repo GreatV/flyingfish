@@ -1,5 +1,5 @@
 use super::WeightCacheArgs;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use anyhow::{Context, Result, bail};
 use candle_core::{Device, Tensor};
 use clap::Subcommand;
@@ -37,7 +37,7 @@ pub(super) fn run(command: ClipCommand) -> Result<()> {
         device,
         weights,
     } = command;
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     let encoder = ClipModel::open(
         &model,
         &device,

@@ -1,5 +1,5 @@
 use super::DeviceCacheArgs;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::output_hygiene::{ensure_new_output, resolve_output_outside_model};
 use anyhow::{Context, Result, bail};
 use candle_core::{Device, Tensor, safetensors};
@@ -145,7 +145,7 @@ pub(super) fn generate(args: GenerateArgs) -> Result<()> {
         .map(ArtifactStaging::new_for_path_producer)
         .transpose()?;
     let started = Instant::now();
-    let device = parse_device(&args.device)?;
+    let device = parse_device_single(&args.device)?;
     let mut options = GenerationOptions {
         seed: args.seed,
         structure_steps: args.structure_steps,
@@ -309,7 +309,7 @@ pub(super) fn decode(args: DecodeArgs) -> Result<()> {
     let latents = values
         .remove("slat_latents")
         .context("missing structured latents")?;
-    let device = parse_device(&args.device)?;
+    let device = parse_device_single(&args.device)?;
     let demands = generation::residency_demands(
         &args.model,
         args.models_root.as_deref(),

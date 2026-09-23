@@ -1,4 +1,4 @@
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::{DeviceCacheArgs, WeightCacheArgs, kit};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
@@ -90,7 +90,7 @@ pub(super) fn run(command: MiniCpmCommand) -> Result<()> {
             model: &model,
             draft_model: draft_model.as_deref(),
             config,
-            device: parse_device(&device)?,
+            device: parse_device_single(&device)?,
             weights,
             device_cache,
             query_chunk: attention_query_chunk_size,

@@ -1,6 +1,6 @@
 use super::H3Command;
 use super::checkpoint::resolve_component;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::generate::make_t2va_noise;
 use super::output_hygiene::{ensure_new_output, resolve_output_outside_model};
 use super::qwen_numerical::validate_qwen_numerical_contract;
@@ -52,7 +52,7 @@ pub(super) fn run_encode_prompt(command: H3Command) -> Result<()> {
     ensure_new_output(&output, "prompt encoding output")?;
     let output_staging = ArtifactStaging::new_for_path_producer(&output)
         .with_context(|| format!("failed to stage prompt encoding {}", output.display()))?;
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     validate_h3_selected_cuda_profile(&device)
         .context("prompt encoding exact CUDA profile preflight")?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| {
@@ -136,7 +136,7 @@ pub(super) fn run_prepare_t2va_inputs(command: H3Command) -> Result<()> {
     ] {
         anyhow::ensure!(value > 0, "{name} must be non-zero");
     }
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     let mut values = safetensors::load(&prompt_encoding, &device).with_context(|| {
         format!(
             "failed to load prompt encoding {}",

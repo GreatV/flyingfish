@@ -1,5 +1,5 @@
 use super::WeightCacheArgs;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use anyhow::Result;
 use clap::Subcommand;
 use flyingfish::models::{LocalModel, discover};
@@ -143,7 +143,7 @@ pub(super) fn run(command: ModelsCommand) -> Result<()> {
             let model = LocalModel::open(model, models_root.as_deref())?;
             let component = model.component(&component)?;
             let weights = component.open_weights(weights.weight_source, weights.cache_policy()?)?;
-            let tensor = weights.load(&name, &parse_device(&device)?)?;
+            let tensor = weights.load(&name, &parse_device_single(&device)?)?;
             println!(
                 "{name}: dtype={:?}, shape={:?}, device={:?}",
                 tensor.dtype(),

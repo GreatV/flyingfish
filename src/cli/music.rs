@@ -1,5 +1,5 @@
 mod batch;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::output_hygiene::{ensure_new_output, resolve_output_outside_model};
 use super::{DeviceCacheArgs, WeightCacheArgs};
 use anyhow::{Result, bail};
@@ -98,7 +98,7 @@ pub(super) fn run(command: MusicCommand) -> Result<()> {
         seed,
         attention_query_chunk: attention_query_chunk_size,
     };
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     let mut model = Music3::open(
         &model,
         &device,

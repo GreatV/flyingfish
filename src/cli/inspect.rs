@@ -1,5 +1,5 @@
 use super::WeightCacheArgs;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use anyhow::Result;
 use flyingfish::runtime::weights::ModelWeights;
 use std::path::PathBuf;
@@ -47,7 +47,7 @@ pub(super) fn run_tensor(
         metadata.bytes,
         metadata.shard.display()
     );
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     let tensor = weights.load(&name, &device)?;
     println!("materialized on {:?}: {:?}", device, tensor.shape());
     Ok(())

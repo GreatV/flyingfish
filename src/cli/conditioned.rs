@@ -4,7 +4,7 @@ use super::denoise::{
     CliDenoiseObserver, report_h3_device_cache, resolve_execution_policy,
     select_resume_execution_policy, validate_executable_policy,
 };
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::output_hygiene::{
     create_new_directory, ensure_new_output, resolve_output_outside_model, write_telemetry,
 };
@@ -241,7 +241,7 @@ pub(super) fn run_prepare_fl2va(command: H3Command) -> Result<()> {
     let canvas = canvas
         .map(|(height, width)| Fl2vaCanvas::new(height, width))
         .transpose()?;
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     validate_h3_selected_cuda_profile(&device)
         .context("FL2VA preparation exact CUDA profile preflight")?;
     let cache_policy = weights.cache_policy()?;
@@ -406,7 +406,7 @@ pub(super) fn run_denoise_conditioned(command: H3Command) -> Result<()> {
         weights.is_explicit() || chunks.is_explicit() || no_precompute_adaln || flash_attention;
     let configured_weights = weights.configured();
     let configured_chunks = chunks.configured(flash_attention);
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     validate_h3_selected_cuda_profile(&device)
         .context("conditioned denoise exact CUDA profile preflight")?;
     let mut bundle = load_bundle(&inputs, &device)?;
@@ -672,7 +672,7 @@ pub(super) fn run_prepare_ref2va(command: H3Command) -> Result<()> {
     ensure_new_output(&output, "conditioned bundle output")?;
     let telemetry_json = resolve_optional_new_output(telemetry_json, &model)?;
     ensure_optional_output_is_distinct(telemetry_json.as_deref(), &[&output])?;
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     validate_h3_selected_cuda_profile(&device)
         .context("Ref2VA preparation exact CUDA profile preflight")?;
     let cache_policy = weights.cache_policy()?;

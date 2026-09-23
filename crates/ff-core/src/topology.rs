@@ -224,9 +224,14 @@ fn capture_peer_links(device_count: usize) -> Vec<PeerLink> {
     let mut links = Vec::new();
     for a in 0..device_count {
         for b in (a + 1)..device_count {
-            let reachable = crate::probe::can_access_peer(a as u32, b as u32)
-                .or_else(|| crate::probe::can_access_peer(b as u32, a as u32))
-                .unwrap_or(false);
+            // Peer access is directional: either direction is enough, and a
+            // confirmed no in one direction still lets the reverse answer.
+            let reachable = match crate::probe::can_access_peer(a as u32, b as u32) {
+                Some(true) => true,
+                Some(false) | None => {
+                    crate::probe::can_access_peer(b as u32, a as u32).unwrap_or(false)
+                }
+            };
             links.push(PeerLink {
                 a,
                 b,

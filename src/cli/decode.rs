@@ -1,6 +1,6 @@
 use super::H3DecodeCommand;
 use super::checkpoint::resolve_component;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::output_hygiene::{
     create_new_directory, ensure_new_output, publish_png_frame_manifest,
     resolve_output_outside_model, write_telemetry,
@@ -39,7 +39,7 @@ pub(super) fn run_decode_audio(command: H3DecodeCommand) -> Result<()> {
     ensure_new_output(&output, "audio output")?;
     let output_staging = ArtifactStaging::new_for_path_producer(&output)
         .with_context(|| format!("failed to stage audio output {}", output.display()))?;
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     let telemetry_json = resolve_optional_new_output(telemetry_json, &model)?;
     ensure_optional_output_is_distinct(telemetry_json.as_deref(), &[&output])?;
     let telemetry = telemetry_json
@@ -98,7 +98,7 @@ pub(super) fn run_decode_video(command: H3DecodeCommand) -> Result<()> {
         inputs.display()
     );
     ensure_new_output(&output_dir, "output directory")?;
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     let telemetry_json = resolve_optional_new_output(telemetry_json, &model)?;
     ensure_optional_output_is_distinct(telemetry_json.as_deref(), &[&output_dir])?;
     let telemetry = telemetry_json

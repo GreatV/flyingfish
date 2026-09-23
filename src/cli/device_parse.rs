@@ -29,12 +29,27 @@ pub(crate) fn parse_device(value: &str) -> Result<Device> {
 /// The ordinals behind a `cuda:N[,M...]` device list, deduplicated in order.
 /// `cpu` and `auto` carry no ordinals; a list is the multi-device generation
 /// request.
+/// Like [`parse_device`], but a comma-separated `cuda:N[,M...]` list is
+/// rejected: for commands that run exactly one device pipeline, silently
+/// dropping the trailing devices would run less than the operator asked for.
+pub(crate) fn parse_device_single(value: &str) -> Result<Device> {
+    anyhow::ensure!(
+        parse_device_ordinals(value)
+            .map(|ordinals| ordinals.len() <= 1)
+            .unwrap_or(true),
+        "comma-separated CUDA device lists are only accepted by commands that run one \
+         pipeline per device"
+    );
+    parse_device(value)
+}
+
 pub(crate) fn parse_device_ordinals(value: &str) -> Result<Vec<usize>> {
     if value == "cpu" || value == "auto" {
         return Ok(Vec::new());
     }
+    // metal: and unknown backends carry no ordinals; parse_device owns them.
     let Some(list) = value.strip_prefix("cuda:") else {
-        bail!("multi-device generation requires --device cuda:N[,M...]");
+        return Ok(Vec::new());
     };
     let mut ordinals = Vec::new();
     for token in list.split(',') {

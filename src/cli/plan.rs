@@ -1,6 +1,6 @@
 use super::H3Command;
 use super::checkpoint::resolve_component;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::output_hygiene::mib_to_bytes;
 use super::{
     DEFAULT_FLASH_BACKEND_WORKSPACE_MIB, DEFAULT_NON_FLASH_BACKEND_WORKSPACE_MIB, H3AdmissionArgs,
@@ -250,7 +250,7 @@ pub(super) fn run_solve_t2va(command: H3Command) -> Result<()> {
             .as_deref()
             .map(|name| -> Result<_> {
                 Ok(flyingfish::runtime::probe::ResourceSnapshot::capture(Some(
-                    &parse_device(name)?,
+                    &parse_device_single(name)?,
                 )))
             })
             .transpose()?;
@@ -301,7 +301,7 @@ pub(super) fn run_solve_t2va(command: H3Command) -> Result<()> {
         base_policy.weights.cache_bytes = Some(mib_to_bytes(mib)?);
     }
     let weight_selection = if let Some(device_name) = device {
-        let device = parse_device(&device_name)?;
+        let device = parse_device_single(&device_name)?;
         anyhow::ensure!(
             device.is_cpu() == cpu,
             "--device must match the --cpu modeling choice"
