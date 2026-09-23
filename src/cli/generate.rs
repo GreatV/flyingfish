@@ -57,6 +57,7 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
@@ -160,6 +161,7 @@ const MAX_GENERATION_INITIALIZATION_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_EXECUTION_POLICY_BYTES: u64 = 1024 * 1024;
 const MAX_GENERATION_COMPLETION_BYTES: u64 = 1024 * 1024;
 const GENERATION_READY_BYTES: &[u8] = b"flyingfish-h3-generation-schema-2\n";
+#[cfg(test)]
 static FRAME_STAGING_NONCE: AtomicU64 = AtomicU64::new(0);
 
 const GENERATION_COMPLETION_SCHEMA_VERSION: u32 = 1;
@@ -1483,13 +1485,18 @@ impl DecodeStage<'_> {
                         DecodeBranchAction::VerifiedExisting,
                     ));
                 }
-                let staging_directory = create_frame_staging_directory(staging_dir)?;
                 // Adaptive VAE residency: start with the derived cap; on
                 // device OOM halve and retry, falling back to full streaming.
                 let mut cache_cap = vae_resident_bytes;
                 let video_device = video_device.clone();
+                let mut attempt = 0usize;
                 let frames = loop {
-                    let decode_result = (|| -> Result<usize> {
+                    attempt += 1;
+                    let attempt_staging = staging_dir
+                        .join(format!(".vae-attempt-{attempt}"))
+                        .join("frames");
+                    std::fs::create_dir_all(&attempt_staging)?;
+                    let decode_result = (|| -> Result<(usize, PathBuf)> {
                         let decoder = match cache_cap {
                             Some(cap) => StreamedVideoVae::open_with_resident_weights(
                                 video_vae_dir,
@@ -1508,24 +1515,29 @@ impl DecodeStage<'_> {
                             )?,
                         };
                         let frames = decoder
-                            .decode_to_png_frames(&video_latents, &staging_directory)
+                            .decode_to_png_frames(&video_latents, &attempt_staging)
                             .with_context(|| {
                                 format!(
                                     "video decode failed; incomplete frames remain isolated at {}",
-                                    staging_directory.display()
+                                    attempt_staging.display()
                                 )
                             })?;
-                        publish_png_frame_manifest(&staging_directory, frames)?;
-                        Ok(frames)
+                        publish_png_frame_manifest(&attempt_staging, frames)?;
+                        Ok((frames, attempt_staging))
                     })();
                     match decode_result {
-                        Ok(frames) => break Ok(frames),
+                        Ok((frames, dir)) => break Ok((frames, dir)),
                         Err(error) => {
-                            let next = cache_cap.map(|c| c / 2);
+                            let is_oom = error.to_string().to_lowercase().contains("out of memory")
+                                || error
+                                    .to_string()
+                                    .to_lowercase()
+                                    .contains("cuda_error_out_of_memory");
+                            let next = cache_cap.filter(|_| is_oom).map(|c| c / 2);
                             match next {
                                 Some(new_cap) if new_cap >= (1 << 20) => {
                                     eprintln!(
-                                        "VAE decode failed ({}); retrying with {} MiB cache cap",
+                                        "VAE decode OOM ({}); retrying with {} MiB cache cap",
                                         error,
                                         new_cap / (1024 * 1024),
                                     );
@@ -1536,7 +1548,7 @@ impl DecodeStage<'_> {
                         }
                     }
                 };
-                let frames = frames?;
+                let (frames, staging_directory) = frames?;
                 Ok((
                     PreparedVideoDecode::Staged {
                         directory: staging_directory,
@@ -2542,7 +2554,8 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
         unsafe {
             use candle_core::cuda_backend::cudarc::driver::sys;
             let mut pool: sys::CUmemoryPool = std::mem::zeroed();
-            let status = sys::cuDeviceGetDefaultMemPool(&mut pool, 0);
+            let ordinal = ctx.ordinals.first().copied().unwrap_or(0) as i32;
+            let status = sys::cuDeviceGetDefaultMemPool(&mut pool, ordinal);
             if status == sys::CUresult::CUDA_SUCCESS {
                 sys::cuMemPoolTrimTo(pool, 0);
             }
@@ -3047,6 +3060,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     run_single_device_pipeline(device_run)
 }
 
+#[cfg(test)]
 fn create_frame_staging_directory(staging_dir: &Path) -> Result<PathBuf> {
     validate_staging_directory(staging_dir)?;
     for _ in 0..1024 {

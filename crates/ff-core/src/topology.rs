@@ -220,7 +220,18 @@ fn capture_peer_links(device_count: usize) -> Vec<PeerLink> {
     if device_count < 2 {
         return Vec::new();
     }
-    let labels = nvidia_smi_link_labels(device_count);
+    // `nvidia-smi topo -m` labels use physical GPU numbers. When
+    // CUDA_VISIBLE_DEVICES filters or reorders, CUDA ordinals diverge from
+    // physical numbering and the labels would be pasted onto the wrong card
+    // pairs; degrade to `None` rather than misreport.
+    let cvd_mismaps = std::env::var("CUDA_VISIBLE_DEVICES")
+        .map(|v| !v.is_empty() && v != "all")
+        .unwrap_or(false);
+    let labels = if cvd_mismaps {
+        vec![None; device_count * device_count]
+    } else {
+        nvidia_smi_link_labels(device_count)
+    };
     let mut links = Vec::new();
     for a in 0..device_count {
         for b in (a + 1)..device_count {
