@@ -12,7 +12,23 @@ use std::path::{Path, PathBuf};
 
 use crate::probe::{CudaComputeCapability, DeviceBackend, HardwareFingerprint, ResourceSnapshot};
 
-pub const TOPOLOGY_PROFILE_SCHEMA_VERSION: u32 = 2;
+pub const TOPOLOGY_PROFILE_SCHEMA_VERSION: u32 = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkClass {
+    Nvlink,
+    PciExpress,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerLink {
+    pub a: usize,
+    pub b: usize,
+    pub reachable: bool,
+    pub link_class: Option<LinkClass>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -46,6 +62,7 @@ pub struct TopologyProfile {
     /// same.
     pub cgroup_memory_limit_bytes: Option<u64>,
     pub devices: Vec<TopologyDevice>,
+    pub peer_links: Vec<PeerLink>,
     pub interconnect: InterconnectLevel,
     pub storage_bytes_per_second: Option<u64>,
 }
@@ -79,17 +96,15 @@ impl TopologyProfile {
             _ => None,
         };
         let devices = enumerate_devices(&fingerprint);
-        let interconnect = if devices.len() > 1 {
-            InterconnectLevel::Unknown
-        } else {
-            InterconnectLevel::SingleDevice
-        };
+        let peer_links = capture_peer_links(devices.len());
+        let interconnect = synthesize_interconnect(devices.len(), &peer_links);
         Self {
             schema_version: TOPOLOGY_PROFILE_SCHEMA_VERSION,
             fingerprint,
             host_memory_total_bytes,
             cgroup_memory_limit_bytes,
             devices,
+            peer_links,
             interconnect,
             storage_bytes_per_second: None,
         }
@@ -198,6 +213,114 @@ fn device_uuid_sequence(devices: &[TopologyDevice]) -> Vec<Option<String>> {
         .iter()
         .map(|device| device.cuda_device_uuid.clone())
         .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn capture_peer_links(device_count: usize) -> Vec<PeerLink> {
+    if device_count < 2 {
+        return Vec::new();
+    }
+    let labels = nvidia_smi_link_labels(device_count);
+    let mut links = Vec::new();
+    for a in 0..device_count {
+        for b in (a + 1)..device_count {
+            let reachable = crate::probe::can_access_peer(a as u32, b as u32)
+                .or_else(|| crate::probe::can_access_peer(b as u32, a as u32))
+                .unwrap_or(false);
+            links.push(PeerLink {
+                a,
+                b,
+                reachable,
+                link_class: labels[a * device_count + b],
+            });
+        }
+    }
+    links
+}
+
+#[cfg(not(feature = "cuda"))]
+fn capture_peer_links(_device_count: usize) -> Vec<PeerLink> {
+    Vec::new()
+}
+
+/// The synthesis records link facts only. Link labels come from the
+/// topology table, and `nvidia-smi topo -m` was measured not to predict
+/// concurrent transfer behaviour on this fleet, so nothing downstream may
+/// read a bandwidth figure out of these levels.
+fn synthesize_interconnect(device_count: usize, links: &[PeerLink]) -> InterconnectLevel {
+    if device_count < 2 {
+        return InterconnectLevel::SingleDevice;
+    }
+    let any_nvlink = links
+        .iter()
+        .any(|link| link.reachable && link.link_class == Some(LinkClass::Nvlink));
+    if any_nvlink {
+        return InterconnectLevel::Nvlink;
+    }
+    let any_pcie_peer = links
+        .iter()
+        .any(|link| link.reachable && link.link_class == Some(LinkClass::PciExpress))
+        || links.iter().any(|link| link.reachable);
+    if any_pcie_peer {
+        return InterconnectLevel::PciExpressPeer;
+    }
+    InterconnectLevel::Unknown
+}
+
+/// One link class per ordinal pair, read from `nvidia-smi topo -m`'s matrix.
+/// Unreadable cells stay `None` rather than guessing.
+#[cfg(feature = "cuda")]
+fn nvidia_smi_link_labels(device_count: usize) -> Vec<Option<LinkClass>> {
+    let Ok(output) = std::process::Command::new("nvidia-smi")
+        .args(["topo", "-m"])
+        .output()
+    else {
+        return vec![None; device_count * device_count];
+    };
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return vec![None; device_count * device_count];
+    };
+    parse_topo_matrix(&text, device_count)
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn parse_topo_matrix(text: &str, device_count: usize) -> Vec<Option<LinkClass>> {
+    let mut labels = vec![None; device_count * device_count];
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let header: Vec<Option<usize>> = lines
+        .next()
+        .map(|line| {
+            line.split_whitespace()
+                .filter_map(|token| token.strip_prefix("GPU"))
+                .map(|suffix| suffix.parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    for line in lines {
+        let mut tokens = line.split_whitespace();
+        let Some(row) = tokens
+            .next()
+            .and_then(|token| token.strip_prefix("GPU"))
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        for (column, token) in tokens.enumerate() {
+            let Some(column_device) = header.get(column).copied().flatten() else {
+                break;
+            };
+            if row >= device_count || column_device >= device_count {
+                continue;
+            }
+            let class = match token {
+                value if value.starts_with("NV") => Some(LinkClass::Nvlink),
+                "PIX" | "PHB" | "NODE" | "SYS" => Some(LinkClass::PciExpress),
+                _ => None,
+            };
+            labels[row * device_count + column_device] = class;
+        }
+    }
+    labels
 }
 
 /// Whether a profile recorded on this machine still describes it.
@@ -323,5 +446,53 @@ mod tests {
             &profile.fingerprint,
             &profile.devices
         ));
+    }
+
+    #[test]
+    fn interconnect_levels_follow_the_measured_links() {
+        let link = |reachable: bool, class: Option<LinkClass>| PeerLink {
+            a: 0,
+            b: 1,
+            reachable,
+            link_class: class,
+        };
+        assert_eq!(
+            synthesize_interconnect(1, &[link(true, Some(LinkClass::Nvlink))]),
+            InterconnectLevel::SingleDevice
+        );
+        assert_eq!(
+            synthesize_interconnect(
+                2,
+                &[
+                    link(true, Some(LinkClass::Nvlink)),
+                    link(true, Some(LinkClass::PciExpress))
+                ]
+            ),
+            InterconnectLevel::Nvlink
+        );
+        assert_eq!(
+            synthesize_interconnect(2, &[link(true, None)]),
+            InterconnectLevel::PciExpressPeer
+        );
+        assert_eq!(
+            synthesize_interconnect(2, &[link(false, Some(LinkClass::Nvlink))]),
+            InterconnectLevel::Unknown
+        );
+    }
+
+    #[test]
+    fn topo_matrix_parses_nvlink_and_pcie_cells() {
+        let text = "\
+            \tGPU0\tGPU1\tGPU2\tCPU Affinity\tNUMA Affinity\n\
+            GPU0\tX\tNV1\tPIX\t0-31\t0\n\
+            GPU1\tNV1\tX\tPHB\t0-31\t0\n\
+            GPU2\tPIX\tPHB\tX\t0-31\t0\n";
+        let labels = parse_topo_matrix(text, 3);
+        let (gpu0, gpu1, gpu2) = (0usize, 1usize, 2usize);
+        assert_eq!(labels[gpu0 * 3 + gpu1], Some(LinkClass::Nvlink));
+        assert_eq!(labels[gpu1 * 3 + gpu0], Some(LinkClass::Nvlink));
+        assert_eq!(labels[gpu0 * 3 + gpu2], Some(LinkClass::PciExpress));
+        assert_eq!(labels[gpu1 * 3 + gpu2], Some(LinkClass::PciExpress));
+        assert_eq!(labels[gpu2 * 3 + gpu2], None);
     }
 }
