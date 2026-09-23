@@ -1111,6 +1111,7 @@ fn machine_profile(host_bytes: u64, device_bytes: u64) -> ff_core::topology::Top
         fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu),
         host_memory_total_bytes: Some(host_bytes),
         cgroup_memory_limit_bytes: None,
+        peer_links: Vec::new(),
         devices: vec![TopologyDevice {
             ordinal: 0,
             backend: DeviceBackend::Cuda,

@@ -251,6 +251,7 @@ mod tests {
             fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu),
             host_memory_total_bytes: host,
             cgroup_memory_limit_bytes: None,
+            peer_links: Vec::new(),
             devices: device
                 .map(|bytes| {
                     vec![TopologyDevice {

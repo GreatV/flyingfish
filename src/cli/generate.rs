@@ -1,3 +1,4 @@
+use super::DenoiseChunkArgs;
 use super::H3Command;
 use super::checkpoint::resolve_component;
 use super::denoise::{
@@ -5,7 +6,7 @@ use super::denoise::{
     report_h3_device_cache, resolve_execution_policy, select_resume_execution_policy,
     validate_executable_policy,
 };
-use super::device_parse::parse_device;
+use super::device_parse::{parse_device, parse_device_ordinals};
 use super::output_hygiene::{
     create_new_directory, ensure_new_output, mib_to_bytes, publish_png_frame_manifest,
     publish_staged_bytes, resolve_output_outside_model, write_telemetry,
@@ -45,6 +46,7 @@ use flyingfish::runtime::artifact::{
 use flyingfish::runtime::frame_manifest::{
     MAX_PNG_FRAME_SET_MANIFEST_JSON_BYTES, PngFrameSetManifest,
 };
+use flyingfish::runtime::io_calibration::IoCalibrationReport;
 use flyingfish::runtime::probe::ResourceSnapshot;
 use flyingfish::runtime::storage::{RECOMMENDED_READ_AHEAD_BYTES, read_ahead_window};
 use flyingfish::runtime::telemetry::TelemetryMonitor;
@@ -1153,6 +1155,7 @@ fn load_or_initialize_state(
     _weight_source: WeightSource,
     _execution_cache_policy: CachePolicy,
     transformer_chunking: TransformerChunking,
+    pre_encoded: Option<&flyingfish::h3::text_encoder::PromptEncoding>,
 ) -> Result<GenerationState> {
     Ok(match resume_checkpoint {
         Some(checkpoint) => {
@@ -1172,33 +1175,47 @@ fn load_or_initialize_state(
             )?
         }
         None => {
-            let encode_start = Instant::now();
-            // Encode is one-pass: every encoder weight is read exactly once,
-            // so stream mmap with drop-behind instead of retaining 63 GiB.
-            // A one-shard policy evicts behind the scan; the transformer's
-            // own cache policy would let encoder pages compete with it.
-            let mut encoder = StreamedTextEncoder::open(
-                resolve_component(model, Path::new("text_encoder"))?,
-                WeightSource::Mmap,
-                CachePolicy::new(1),
-                device.clone(),
-                target_hidden_state,
-                transformer_chunking.attention.query_chunk_size.get(),
-            )?;
-            encoder.set_drop_evicted_pages(true);
-            let encoded = encoder.encode_prompt(tokenizer, prompt)?;
-            anyhow::ensure!(
-                encoded.token_ids == token_ids,
-                "tokenizer output changed after preflight"
-            );
-            drop(encoder);
-            if !no_progress {
-                eprintln!(
-                    "encode: {} prompt tokens completed in {:.2}s",
-                    encoded.token_ids.len(),
-                    encode_start.elapsed().as_secs_f64(),
-                );
-            }
+            let encoded_owned;
+            let encoded = match pre_encoded {
+                Some(encoded) => {
+                    anyhow::ensure!(
+                        encoded.token_ids == token_ids,
+                        "tokenizer output changed after preflight"
+                    );
+                    encoded
+                }
+                None => {
+                    let encode_start = Instant::now();
+                    // Encode is one-pass: every encoder weight is read exactly once,
+                    // so stream mmap with drop-behind instead of retaining 63 GiB.
+                    // A one-shard policy evicts behind the scan; the transformer's
+                    // own cache policy would let encoder pages compete with it.
+                    let mut encoder = StreamedTextEncoder::open(
+                        resolve_component(model, Path::new("text_encoder"))?,
+                        WeightSource::Mmap,
+                        CachePolicy::new(1),
+                        device.clone(),
+                        target_hidden_state,
+                        transformer_chunking.attention.query_chunk_size.get(),
+                    )?;
+                    encoder.set_drop_evicted_pages(true);
+                    let encoded = encoder.encode_prompt(tokenizer, prompt)?;
+                    anyhow::ensure!(
+                        encoded.token_ids == token_ids,
+                        "tokenizer output changed after preflight"
+                    );
+                    drop(encoder);
+                    if !no_progress {
+                        eprintln!(
+                            "encode: {} prompt tokens completed in {:.2}s",
+                            encoded.token_ids.len(),
+                            encode_start.elapsed().as_secs_f64(),
+                        );
+                    }
+                    encoded_owned = encoded;
+                    &encoded_owned
+                }
+            };
             let (video_latents, audio_latents) = make_t2va_noise(
                 transformer_config,
                 latent_frames,
@@ -1215,14 +1232,14 @@ fn load_or_initialize_state(
                 device,
             )?;
             GenerationState {
-                prompt_embeddings: encoded.embeddings,
+                prompt_embeddings: encoded.embeddings.to_device(device)?,
                 text_token_tags_tensor,
-                text_token_tags: encoded.text_token_tags,
+                text_token_tags: encoded.text_token_tags.clone(),
                 video_latents,
                 audio_latents,
                 completed_steps: 0,
                 policy_history: PolicyHistory::new(),
-                qwen_numerical_contract: encoded.numerical_contract,
+                qwen_numerical_contract: encoded.numerical_contract.clone(),
             }
         }
     })
@@ -1599,13 +1616,6 @@ impl DecodeExpectations {
     }
 }
 
-fn device_ordinal(device: &str) -> usize {
-    device
-        .strip_prefix("cuda:")
-        .and_then(|ordinal| ordinal.parse().ok())
-        .unwrap_or(0)
-}
-
 fn directory_tree_bytes(root: &Path) -> Result<u64> {
     if !root
         .try_exists()
@@ -1683,9 +1693,10 @@ struct T2vaDerivation<'a> {
     geometry: T2vaGeometry,
     flash_attention: bool,
     evaluations: usize,
+    io_bandwidth_bytes_per_second: Option<u64>,
     max_host_mib: Option<u64>,
     max_device_mib: Option<u64>,
-    ordinal: usize,
+    ordinals: Vec<usize>,
 }
 
 fn derive_t2va_configuration(
@@ -1700,9 +1711,10 @@ fn derive_t2va_configuration(
         geometry,
         flash_attention,
         evaluations,
+        io_bandwidth_bytes_per_second,
         max_host_mib,
         max_device_mib,
-        ordinal,
+        ordinals,
     } = request;
     let config = TransformerConfig::from_file(model_root.join("transformer/config.json"))?;
     let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
@@ -1761,7 +1773,22 @@ fn derive_t2va_configuration(
         workspace_bytes,
         materialization_bytes,
     )?;
-    let mut profile = load_or_capture_topology(primary)?;
+    let mut profile =
+        load_or_capture_topology(primary)?.with_storage_bandwidth(io_bandwidth_bytes_per_second);
+    // Multi-device lists select chunks conservatively: the least-capable
+    // listed device decides, so every worker's admission sees a plan that
+    // fits its card.
+    let ordinal = ordinals
+        .iter()
+        .copied()
+        .min_by_key(|ordinal| {
+            profile
+                .devices
+                .get(*ordinal)
+                .and_then(|device| device.total_memory_bytes)
+                .unwrap_or(u64::MAX)
+        })
+        .unwrap_or(0);
     // Operator caps bound what the derivation may hand out; the profile the
     // rules see is the capped machine, not the physical one.
     if let Some(mib) = max_host_mib {
@@ -1812,107 +1839,89 @@ fn derive_t2va_configuration(
     Ok((derived, host_bound_bytes))
 }
 
-pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
-    let H3Command::GenerateT2va {
-        resources,
-        model,
-        prompt,
-        output_dir,
-        device,
-        policy,
-        weights: optional_weight_args,
-        latent_frames,
-        latent_height,
-        latent_width,
-        audio_frames,
-        audio_channels,
-        target,
-        wav_format,
-        seed,
-        target_hidden_state,
-        chunks: optional_chunks,
-        sigma_points,
-        video_shift,
-        audio_shift,
-        no_precompute_adaln,
-        flash_attention,
-        no_progress,
-        explain_config,
-        telemetry_json,
-        max_host_mib,
-        max_device_mib,
-        backend_workspace_mib,
-    } = command
-    else {
-        bail!("internal CLI dispatch mismatch for generate-t2va");
-    };
+/// One worker's share of a generation run: the device it owns, the slice of
+/// the output tree it writes, and the inputs that were produced once for all
+/// workers.
+struct DeviceRunContext<'a> {
+    ordinals: Vec<usize>,
+    device: Device,
+    output_dir: PathBuf,
+    existing_run: bool,
+    seed: u64,
+    prompt: String,
+    tokenizer: &'a Tokenizer,
+    model: PathBuf,
+    model_root: PathBuf,
+    /// Encoding produced once for all workers; resume workers ignore it.
+    prompt_embeddings_pre_encoded: Option<&'a flyingfish::h3::text_encoder::PromptEncoding>,
+    token_ids: Vec<u32>,
+    sigma_points: usize,
+    video_shift: f32,
+    audio_shift: f32,
+    latent_frames: usize,
+    latent_height: usize,
+    latent_width: usize,
+    audio_frames: usize,
+    audio_channels: usize,
+    target_hidden_state: usize,
+    wav_format: WavSampleFormat,
+    max_device_mib: Option<u64>,
+    backend_workspace_mib: Option<u64>,
+    telemetry_json: Option<PathBuf>,
+    no_progress: bool,
+    explain_config: bool,
+    resources: H3ResourceArgs,
+    policy: Option<PathBuf>,
+    host_profile: Option<PathBuf>,
+    optional_weight_args: OptionalWeightCacheArgs,
+    optional_chunks: DenoiseChunkArgs,
+    no_precompute_adaln: bool,
+    flash_attention: bool,
+    max_host_mib: Option<u64>,
+}
 
-    let (latent_frames, latent_height, latent_width, audio_frames) = target
-        .resolve_latent_geometry((latent_frames, latent_height, latent_width, audio_frames))?;
-
-    let supplied_output_metadata =
-        symlink_metadata_if_exists(&output_dir, "generation output directory")?;
-    anyhow::ensure!(
-        supplied_output_metadata
-            .as_ref()
-            .is_none_or(|metadata| !metadata.file_type().is_symlink()),
-        "generation output directory must not be a symlink: {}",
-        output_dir.display()
-    );
-    let model_root = fs::canonicalize(&model)
-        .with_context(|| format!("failed to resolve model directory {}", model.display()))?;
+/// The single-device generation pipeline: resource selection, the
+/// transformer, the denoise loop, decoding, and publication. One context per
+/// device; multi-device runs call it once per worker thread.
+fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
+    let output_dir = ctx.output_dir.clone();
+    let existing_run = ctx.existing_run;
+    let seed = ctx.seed;
+    let tokenizer = ctx.tokenizer;
+    let token_ids = &ctx.token_ids;
+    let sigma_points = ctx.sigma_points;
+    let video_shift = ctx.video_shift;
+    let audio_shift = ctx.audio_shift;
+    let latent_frames = ctx.latent_frames;
+    let latent_height = ctx.latent_height;
+    let latent_width = ctx.latent_width;
+    let audio_frames = ctx.audio_frames;
+    let audio_channels = ctx.audio_channels;
+    let target_hidden_state = ctx.target_hidden_state;
+    let wav_format = ctx.wav_format;
+    let max_device_mib = ctx.max_device_mib;
+    let backend_workspace_mib = ctx.backend_workspace_mib;
+    let telemetry_json = ctx.telemetry_json.clone();
+    let no_progress = ctx.no_progress;
+    let explain_config = ctx.explain_config;
+    let resources = ctx.resources;
+    let policy = ctx.policy.clone();
+    let device = &ctx.device;
+    let host_profile = ctx.host_profile.clone();
+    let model = ctx.model.clone();
+    let model_root = ctx.model_root.clone();
     let model_root_record = model_root
         .to_str()
         .context("resolved model directory is not valid UTF-8")?
         .to_owned();
-    let output_dir = resolve_output_outside_model(&output_dir, &model_root)?;
-    let existing_run = output_dir.exists();
-    if existing_run {
-        anyhow::ensure!(
-            output_dir.is_dir(),
-            "generation output exists but is not a directory: {}",
-            output_dir.display()
-        );
-    } else {
-        ensure_new_output(&output_dir, "output directory")?;
-    }
-    let telemetry_json = resolve_optional_new_output(telemetry_json, &model)?;
-    ensure_optional_output_is_distinct(telemetry_json.as_deref(), &[&output_dir])?;
-    if let Some(telemetry_json) = telemetry_json.as_deref() {
-        anyhow::ensure!(
-            !telemetry_json.starts_with(&output_dir) && !output_dir.starts_with(telemetry_json),
-            "generation telemetry output must be disjoint from the resumable run directory: {}",
-            telemetry_json.display()
-        );
-    }
-    for (name, value) in [
-        ("latent_frames", latent_frames),
-        ("latent_height", latent_height),
-        ("latent_width", latent_width),
-        ("audio_frames", audio_frames),
-        ("audio_channels", audio_channels),
-    ] {
-        anyhow::ensure!(value > 0, "{name} must be non-zero");
-    }
-    anyhow::ensure!(sigma_points >= 2, "sigma_points must be at least two");
-
-    let selected_device_ordinal = device_ordinal(&device);
-    let device = parse_device(&device)?;
-    let tokenizer_path = required_model_file(&model, Path::new("tokenizer/tokenizer.json"))?;
-    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to load tokenizer {}: {error}",
-            tokenizer_path.display()
-        )
-    })?;
-    let tokenization = tokenizer
-        .encode(prompt.as_str(), false)
-        .map_err(|error| anyhow::anyhow!("failed to tokenize prompt: {error}"))?;
-    let token_ids = tokenization.get_ids().to_vec();
-    anyhow::ensure!(
-        !token_ids.is_empty(),
-        "prompt tokenized to an empty sequence"
-    );
+    let prompt = ctx.prompt.clone();
+    let ordinals = ctx.ordinals.clone();
+    let optional_weight_args = ctx.optional_weight_args;
+    let optional_chunks = ctx.optional_chunks;
+    let no_precompute_adaln = ctx.no_precompute_adaln;
+    let flash_attention = ctx.flash_attention;
+    let max_host_mib = ctx.max_host_mib;
+    let _ = ctx.prompt_embeddings_pre_encoded;
 
     let explicit_policy = policy.is_some();
     let explicit_policy_settings = optional_weight_args.is_explicit()
@@ -1929,17 +1938,34 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         geometry.latent_width = latent_width;
         geometry.audio_frames = audio_frames;
         geometry.audio_channels = audio_channels;
+        let io_bandwidth_bytes_per_second = host_profile
+            .as_deref()
+            .map(|path| -> Result<u64> {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("read host profile {}", path.display()))?;
+                IoCalibrationReport::from_json(&bytes)
+                    .map(|report| report.host_sequential_read.bytes_per_second as u64)
+                    .with_context(|| format!("invalid host profile {}", path.display()))
+            })
+            .transpose()
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "config: host profile unused ({error:#}); storage bandwidth is unmeasured"
+                );
+                None
+            });
         let (derived, host_bound_bytes) = derive_t2va_configuration(
             T2vaDerivation {
                 model_root: &model_root,
                 geometry,
                 flash_attention,
                 evaluations: sigma_points - 1,
+                io_bandwidth_bytes_per_second,
                 max_host_mib,
                 max_device_mib,
-                ordinal: selected_device_ordinal,
+                ordinals: ordinals.clone(),
             },
-            &device,
+            device,
         )?;
         derived_host_bound_mib = host_bound_bytes.map(|bytes| bytes.div_ceil(1 << 20));
         Some(derived)
@@ -1948,6 +1974,12 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         ff_core::configure::WeightSourceChoice::Memory => WeightSource::Memory,
         ff_core::configure::WeightSourceChoice::Mmap => WeightSource::Mmap,
     });
+    if ctx.ordinals.len() > 1 && matches!(derived_source, Some(WeightSource::Memory)) {
+        anyhow::bail!(
+            "multi-device generation streams through mmap; the memory source is a \
+             single-device configuration"
+        );
+    }
     let effective_source = optional_weight_args.weight_source.or(derived_source);
     let derived_host_cache_mib = matches!(effective_source, Some(WeightSource::Memory))
         .then(|| {
@@ -1962,7 +1994,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     let optional_chunks = optional_chunks.with_derived(derived.as_ref().and_then(|d| d.chunks));
     let max_host_mib = max_host_mib.or(derived_host_bound_mib);
     if let Some(bound_bytes) = derived_host_bound_mib.map(|mib| mib << 20) {
-        let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device));
+        let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(device));
         let available = snapshot
             .cgroup_v2_memory_available_bytes
             .into_iter()
@@ -1992,7 +2024,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     let chunks = optional_chunks.configured(flash_attention);
     let requested_policy = resolve_execution_policy(
         policy.as_deref(),
-        &device,
+        device,
         weight_args.weight_source,
         weight_args.cache_policy()?,
         chunks,
@@ -2031,7 +2063,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         checkpoint
             .identity
             .policy_history
-            .validate_resume_numerics(&device)
+            .validate_resume_numerics(device)
             .context(
                 "generation checkpoint policy history cannot resume on the selected runtime",
             )?;
@@ -2047,7 +2079,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         explicit_policy_settings,
         recorded_initialization.is_some(),
     )?;
-    validate_executable_policy(&execution_policy, &device)?;
+    validate_executable_policy(&execution_policy, device)?;
     let mut policy_origin =
         if recorded_initialization.is_some() && !explicit_policy && !explicit_policy_settings {
             PolicyOrigin::Recorded
@@ -2072,12 +2104,12 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
             refusal_sidecar: &refusal_artifact_path(&output_dir),
             model: &model,
             model_root_record: &model_root_record,
-            device: &device,
+            device,
             resources: &resources,
             optional_weight_args,
             checkpoint_policy,
             explicit_policy,
-            token_ids: &token_ids,
+            token_ids,
             prompt: &prompt,
             latent_frames,
             latent_height,
@@ -2120,7 +2152,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         &execution_policy,
     )?;
     let qwen_numerical_contract = build_qwen_numerical_contract(
-        &device,
+        device,
         usize::try_from(execution_policy.attention.configured_query_rows)
             .context("execution-policy Qwen query rows exceed usize")?,
         token_ids.len(),
@@ -2201,7 +2233,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
             max_host_mib,
             max_device_mib,
             backend_workspace_mib,
-            &device,
+            device,
         );
         let preflight = match preflight {
             Ok(preflight) => preflight,
@@ -2313,12 +2345,12 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         resume_checkpoint,
         schedule_steps,
         no_progress,
-        &device,
+        device,
         &transformer_config,
         &generation_request,
         &model,
-        &tokenizer,
-        &token_ids,
+        tokenizer,
+        token_ids,
         &prompt,
         target_hidden_state,
         latent_frames,
@@ -2330,11 +2362,30 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         weight_source,
         execution_cache_policy,
         transformer_chunking,
+        ctx.prompt_embeddings_pre_encoded,
     )?;
-    anyhow::ensure!(
-        state.qwen_numerical_contract == generation_initialization.qwen_numerical_contract,
-        "generation prompt/checkpoint Qwen numerical contract disagrees with initialization"
-    );
+    // The shared multi-device encoding carries the orchestrator's chunk
+    // metadata: its device axes are re-validated against this worker's card,
+    // while chunk-derived fields describe the shared encode and are accepted
+    // as encoded (verified chunk sizes produce identical encoder output).
+    if ctx.prompt_embeddings_pre_encoded.is_some() {
+        anyhow::ensure!(
+            state.qwen_numerical_contract.execution_backend
+                == generation_initialization
+                    .qwen_numerical_contract
+                    .execution_backend
+                && state.qwen_numerical_contract.cuda_capabilities
+                    == generation_initialization
+                        .qwen_numerical_contract
+                        .cuda_capabilities,
+            "generation Qwen numerical contract device axes disagree with initialization"
+        );
+    } else {
+        anyhow::ensure!(
+            state.qwen_numerical_contract == generation_initialization.qwen_numerical_contract,
+            "generation prompt/checkpoint Qwen numerical contract disagrees with initialization"
+        );
+    }
     let conditioning_provenance =
         H3ConditioningProvenance::FlyingfishQwen(Box::new(state.qwen_numerical_contract.clone()));
 
@@ -2343,7 +2394,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     let (result, policy_history, transformer_stats) = denoise_remaining_steps(
         state,
         schedule_steps,
-        &device,
+        device,
         &execution_policy,
         transformer_dir,
         &conditioning_provenance,
@@ -2400,7 +2451,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     )?;
 
     let frames = DecodeStage {
-        device: &device,
+        device,
         output_dir: &output_dir,
         staging_dir: &staging_dir,
         completion_path: &completion_path,
@@ -2446,6 +2497,227 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         write_telemetry(path, monitor)?;
     }
     Ok(())
+}
+
+pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
+    let H3Command::GenerateT2va {
+        resources,
+        model,
+        prompt,
+        output_dir,
+        device,
+        policy,
+        weights: optional_weight_args,
+        latent_frames,
+        latent_height,
+        latent_width,
+        audio_frames,
+        audio_channels,
+        target,
+        wav_format,
+        seed,
+        target_hidden_state,
+        chunks: optional_chunks,
+        sigma_points,
+        video_shift,
+        audio_shift,
+        no_precompute_adaln,
+        flash_attention,
+        host_profile,
+        no_progress,
+        explain_config,
+        telemetry_json,
+        max_host_mib,
+        max_device_mib,
+        backend_workspace_mib,
+    } = command
+    else {
+        bail!("internal CLI dispatch mismatch for generate-t2va");
+    };
+
+    let (latent_frames, latent_height, latent_width, audio_frames) = target
+        .resolve_latent_geometry((latent_frames, latent_height, latent_width, audio_frames))?;
+
+    let supplied_output_metadata =
+        symlink_metadata_if_exists(&output_dir, "generation output directory")?;
+    anyhow::ensure!(
+        supplied_output_metadata
+            .as_ref()
+            .is_none_or(|metadata| !metadata.file_type().is_symlink()),
+        "generation output directory must not be a symlink: {}",
+        output_dir.display()
+    );
+    let model_root = fs::canonicalize(&model)
+        .with_context(|| format!("failed to resolve model directory {}", model.display()))?;
+    let output_dir = resolve_output_outside_model(&output_dir, &model_root)?;
+    let existing_run = output_dir.exists();
+    if existing_run {
+        anyhow::ensure!(
+            output_dir.is_dir(),
+            "generation output exists but is not a directory: {}",
+            output_dir.display()
+        );
+    } else {
+        ensure_new_output(&output_dir, "output directory")?;
+    }
+    let telemetry_json = resolve_optional_new_output(telemetry_json, &model)?;
+    ensure_optional_output_is_distinct(telemetry_json.as_deref(), &[&output_dir])?;
+    if let Some(telemetry_json) = telemetry_json.as_deref() {
+        anyhow::ensure!(
+            !telemetry_json.starts_with(&output_dir) && !output_dir.starts_with(telemetry_json),
+            "generation telemetry output must be disjoint from the resumable run directory: {}",
+            telemetry_json.display()
+        );
+    }
+    for (name, value) in [
+        ("latent_frames", latent_frames),
+        ("latent_height", latent_height),
+        ("latent_width", latent_width),
+        ("audio_frames", audio_frames),
+        ("audio_channels", audio_channels),
+    ] {
+        anyhow::ensure!(value > 0, "{name} must be non-zero");
+    }
+    anyhow::ensure!(sigma_points >= 2, "sigma_points must be at least two");
+
+    let ordinals = parse_device_ordinals(&device)?;
+    let device = parse_device(&device)?;
+    let tokenizer_path = required_model_file(&model, Path::new("tokenizer/tokenizer.json"))?;
+    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to load tokenizer {}: {error}",
+            tokenizer_path.display()
+        )
+    })?;
+    let tokenization = tokenizer
+        .encode(prompt.as_str(), false)
+        .map_err(|error| anyhow::anyhow!("failed to tokenize prompt: {error}"))?;
+    let token_ids = tokenization.get_ids().to_vec();
+    anyhow::ensure!(
+        !token_ids.is_empty(),
+        "prompt tokenized to an empty sequence"
+    );
+
+    // Multi-device workers share one encoding, computed here on the
+    // primary device; each worker copies the embeddings to its own.
+    let pre_encoded = if ordinals.len() > 1 {
+        let encode_start = Instant::now();
+        let mut encoder = StreamedTextEncoder::open(
+            resolve_component(&model, Path::new("text_encoder"))?,
+            WeightSource::Mmap,
+            CachePolicy::new(1),
+            device.clone(),
+            target_hidden_state,
+            optional_chunks
+                .configured(flash_attention)
+                .attention_query_chunk_size
+                .get(),
+        )?;
+        encoder.set_drop_evicted_pages(true);
+        let encoded = encoder.encode_prompt(&tokenizer, prompt.as_str())?;
+        drop(encoder);
+        if !no_progress {
+            eprintln!(
+                "encode: {} prompt tokens completed in {:.2}s (shared across devices)",
+                encoded.token_ids.len(),
+                encode_start.elapsed().as_secs_f64(),
+            );
+        }
+        Some(encoded)
+    } else {
+        None
+    };
+    let worker_context =
+        |ordinal: usize, worker_index: usize, worker_root: PathBuf, device: Device| {
+            let telemetry_json = telemetry_json.as_ref().map(|path| {
+                let file_name = path
+                    .file_name()
+                    .map(|name| format!("gpu{ordinal}-{}", name.to_string_lossy()))
+                    .unwrap_or_else(|| format!("gpu{ordinal}-telemetry.json"));
+                path.with_file_name(file_name)
+            });
+            DeviceRunContext {
+                ordinals: ordinals.clone(),
+                device,
+                existing_run: worker_root.exists(),
+                output_dir: worker_root,
+                seed: seed.wrapping_add(worker_index as u64),
+                prompt: prompt.clone(),
+                tokenizer: &tokenizer,
+                model: model.clone(),
+                model_root: model_root.clone(),
+                prompt_embeddings_pre_encoded: pre_encoded.as_ref(),
+                token_ids: token_ids.clone(),
+                sigma_points,
+                video_shift,
+                audio_shift,
+                latent_frames,
+                latent_height,
+                latent_width,
+                audio_frames,
+                audio_channels,
+                target_hidden_state,
+                wav_format,
+                max_device_mib,
+                backend_workspace_mib,
+                telemetry_json,
+                no_progress,
+                explain_config,
+                resources: resources.clone(),
+                policy: policy.clone(),
+                host_profile: host_profile.clone(),
+                optional_weight_args,
+                optional_chunks,
+                no_precompute_adaln,
+                flash_attention,
+                max_host_mib,
+            }
+        };
+    if ordinals.len() > 1 {
+        // The single-device path creates its output directory inside the
+        // pipeline; the multi-device workers each create their own root under
+        // a parent the orchestrator makes first.
+        create_new_directory(&output_dir, "generation output directory")?;
+        std::thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::new();
+            for (worker_index, ordinal) in ordinals.iter().enumerate() {
+                let worker_root = output_dir.join(format!("gpu{ordinal}"));
+                anyhow::ensure!(
+                    worker_root != output_dir,
+                    "worker root equals the run root for device {ordinal}"
+                );
+                create_new_directory(&worker_root, "worker output directory")?;
+                let device = Device::new_cuda(*ordinal)
+                    .with_context(|| format!("failed to initialize CUDA device {ordinal}"))?;
+                let device_run = worker_context(*ordinal, worker_index, worker_root, device);
+                handles.push(scope.spawn(move || run_single_device_pipeline(device_run)));
+            }
+            let mut first_error = None;
+            for handle in handles {
+                let outcome = handle
+                    .join()
+                    .map_err(|payload| anyhow::anyhow!("worker panicked: {payload:?}"))
+                    .and_then(|outcome| outcome);
+                if first_error.is_none() {
+                    first_error = outcome.err();
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            Ok(())
+        })?;
+        return Ok(());
+    }
+    // cpu/auto carry no ordinals; the single-device path owns the device as
+    // parsed.
+    let device_run = worker_context(
+        ordinals.first().copied().unwrap_or(0),
+        0,
+        output_dir.clone(),
+        device.clone(),
+    );
+    run_single_device_pipeline(device_run)
 }
 
 fn create_frame_staging_directory(staging_dir: &Path) -> Result<PathBuf> {
