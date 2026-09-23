@@ -10,13 +10,9 @@ use candle_core::Device;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::probe::{
-    CudaComputeCapability, DeviceBackend, HardwareFingerprint, ResourceSnapshot,
-    describes_same_machine,
-};
+use crate::probe::{CudaComputeCapability, DeviceBackend, HardwareFingerprint, ResourceSnapshot};
 
 pub const TOPOLOGY_PROFILE_SCHEMA_VERSION: u32 = 2;
-const MAX_ENUMERATED_DEVICES: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -161,7 +157,7 @@ impl TopologyProfile {
                     .and_then(|device| device.name.clone()),
             }));
         }
-        if !describes_same_machine(&recorded.fingerprint, &current) {
+        if !same_host(&recorded.fingerprint, &current, &current_devices) {
             return Ok(Err(TopologyProfileAbsence::ForeignHost {
                 path: path.to_path_buf(),
                 recorded_device: recorded.fingerprint.device_name.clone(),
@@ -181,10 +177,8 @@ fn enumerate_devices(primary: &HardwareFingerprint) -> Vec<TopologyDevice> {
     if primary.backend != DeviceBackend::Cuda {
         return devices;
     }
-    for ordinal in 0..MAX_ENUMERATED_DEVICES {
-        let Ok(device) = Device::new_cuda(ordinal) else {
-            break;
-        };
+    let mut ordinal = 0;
+    while let Ok(device) = Device::new_cuda(ordinal) {
         let fingerprint = HardwareFingerprint::collect(&device);
         devices.push(TopologyDevice {
             ordinal,
@@ -194,6 +188,7 @@ fn enumerate_devices(primary: &HardwareFingerprint) -> Vec<TopologyDevice> {
             compute_capability: fingerprint.cuda_compute_capability,
             cuda_device_uuid: fingerprint.cuda_device_uuid,
         });
+        ordinal += 1;
     }
     devices
 }
@@ -203,6 +198,38 @@ fn device_uuid_sequence(devices: &[TopologyDevice]) -> Vec<Option<String>> {
         .iter()
         .map(|device| device.cuda_device_uuid.clone())
         .collect()
+}
+
+/// Whether a profile recorded on this machine still describes it.
+///
+/// The profile is keyed to the host rather than to one card: the recorded
+/// card only has to be among the devices the machine still enumerates, so a
+/// run selecting a different ordinal reuses it.
+fn same_host(
+    recorded: &HardwareFingerprint,
+    current: &HardwareFingerprint,
+    current_devices: &[TopologyDevice],
+) -> bool {
+    recorded.validate().is_ok()
+        && current.validate().is_ok()
+        && recorded.backend == current.backend
+        && recorded.architecture == current.architecture
+        && recorded.operating_system == current.operating_system
+        && recorded.logical_cpu_count == current.logical_cpu_count
+        && match &recorded.cuda_device_uuid {
+            Some(recorded_uuid) => current_devices
+                .iter()
+                .find(|device| device.cuda_device_uuid.as_ref() == Some(recorded_uuid))
+                .is_some_and(|device| {
+                    device.name.as_deref() == recorded.device_name.as_deref()
+                        && device.total_memory_bytes == recorded.device_total_memory_bytes
+                }),
+            None => {
+                recorded.device_name == current.device_name
+                    && recorded.device_total_memory_bytes == current.device_total_memory_bytes
+                    && current.backend != DeviceBackend::Cuda
+            }
+        }
 }
 
 #[cfg(test)]
@@ -291,9 +318,10 @@ mod tests {
     #[test]
     fn fingerprints_of_one_machine_agree_with_themselves() {
         let profile = cpu_profile();
-        assert!(describes_same_machine(
+        assert!(same_host(
             &profile.fingerprint,
-            &profile.fingerprint
+            &profile.fingerprint,
+            &profile.devices
         ));
     }
 }

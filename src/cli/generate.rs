@@ -1678,17 +1678,32 @@ fn load_or_capture_topology(
     }
 }
 
-fn derive_t2va_configuration(
-    model_root: &Path,
+struct T2vaDerivation<'a> {
+    model_root: &'a Path,
     geometry: T2vaGeometry,
     flash_attention: bool,
     evaluations: usize,
+    max_host_mib: Option<u64>,
+    max_device_mib: Option<u64>,
     ordinal: usize,
+}
+
+fn derive_t2va_configuration(
+    request: T2vaDerivation<'_>,
     primary: &Device,
 ) -> Result<(ff_core::configure::DerivedConfig, Option<u64>)> {
     use flyingfish::h3::resources::{
         H3T2vaRequirement, ResourceAssumptions, ResourceEstimate, cache_charge,
     };
+    let T2vaDerivation {
+        model_root,
+        geometry,
+        flash_attention,
+        evaluations,
+        max_host_mib,
+        max_device_mib,
+        ordinal,
+    } = request;
     let config = TransformerConfig::from_file(model_root.join("transformer/config.json"))?;
     let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
     assumptions.evaluation_count = evaluations as u64;
@@ -1746,7 +1761,20 @@ fn derive_t2va_configuration(
         workspace_bytes,
         materialization_bytes,
     )?;
-    let profile = load_or_capture_topology(primary)?;
+    let mut profile = load_or_capture_topology(primary)?;
+    // Operator caps bound what the derivation may hand out; the profile the
+    // rules see is the capped machine, not the physical one.
+    if let Some(mib) = max_host_mib {
+        profile.host_memory_total_bytes = profile
+            .host_memory_total_bytes
+            .map(|total| total.min(mib << 20));
+    }
+    if let Some(mib) = max_device_mib
+        && let Some(device) = profile.devices.get_mut(ordinal)
+        && let Some(total) = device.total_memory_bytes
+    {
+        device.total_memory_bytes = Some(total.min(mib << 20));
+    }
     let derived = ff_core::configure::derive(ordinal, &profile, &requirement)?;
     let host_bound_bytes = match (derived.weight_source, derived.host_cache_ceiling_bytes) {
         (ff_core::configure::WeightSourceChoice::Memory, Some(ceiling)) => {
@@ -1902,11 +1930,15 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         geometry.audio_frames = audio_frames;
         geometry.audio_channels = audio_channels;
         let (derived, host_bound_bytes) = derive_t2va_configuration(
-            &model_root,
-            geometry,
-            flash_attention,
-            sigma_points - 1,
-            selected_device_ordinal,
+            T2vaDerivation {
+                model_root: &model_root,
+                geometry,
+                flash_attention,
+                evaluations: sigma_points - 1,
+                max_host_mib,
+                max_device_mib,
+                ordinal: selected_device_ordinal,
+            },
             &device,
         )?;
         derived_host_bound_mib = host_bound_bytes.map(|bytes| bytes.div_ceil(1 << 20));
