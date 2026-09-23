@@ -54,6 +54,13 @@ pub trait ModelRequirement {
     fn memory_materialization_bytes(&self) -> Result<u64> {
         Ok(self.steady_weight_bytes()? + self.single_pass_weight_bytes()?)
     }
+
+    /// Weight bytes of the decode-stage model (the visual VAE for H3), which
+    /// runs after the denoise phases end. Zero when the architecture has no
+    /// separate decode-stage model (derivation rule 6 then stays silent).
+    fn vae_weight_bytes(&self) -> Result<u64> {
+        Ok(0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +77,14 @@ pub struct ChunkPlan {
 pub struct SelectedChunkPlan {
     pub plan: ChunkPlan,
     pub peak_device_bytes: u64,
+}
+
+/// Rule 6's outcome for the decode-stage model: `Some(bytes)` reserves that
+/// many device bytes for a resident decoder; `None` streams it per layer
+/// group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VaeResidency {
+    pub weight_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +108,7 @@ pub struct DerivedConfig {
     /// what the host holds beside its reserve and what materializes at all.
     /// `None` when the derivation streams through mmap.
     pub host_cache_ceiling_bytes: Option<u64>,
+    pub vae_resident_bytes: Option<u64>,
     pub chunks: Option<ChunkPlan>,
     pub provenance: Vec<DerivationStep>,
 }
@@ -119,6 +135,7 @@ pub fn derive(
     let steady = requirement.steady_weight_bytes()?;
     let single_pass = requirement.single_pass_weight_bytes()?;
     let materialization = requirement.memory_materialization_bytes()?;
+    let vae_weight_bytes = requirement.vae_weight_bytes()?;
     let reserve = admission_reserve_bytes(profile.host_memory_total_bytes);
     let weight_source = match profile.host_memory_total_bytes {
         Some(host) if materialization.saturating_add(OS_ALLOWANCE_BYTES) <= host => {
@@ -166,6 +183,7 @@ pub fn derive(
         .devices
         .get(ordinal)
         .and_then(|device| device.total_memory_bytes);
+    let mut vae_resident_bytes = None;
     let chunks = match device_memory {
         Some(device_memory) => {
             let device_reserve = admission_reserve_bytes(Some(device_memory));
@@ -195,6 +213,52 @@ pub fn derive(
                 rule: "rule-2-chunks",
                 detail,
             });
+            // Rule 6: the decode-stage model runs after the denoise phases
+            // end, so the device it sees is free of the denoise residency.
+            // The cache cap must leave room for the decode workspace and the
+            // admission reserve beside the VAE weights.
+            let decode_workspace = vae_weight_bytes / 4;
+            let vae_resident = if vae_weight_bytes > 0 {
+                let available_for_vae = device_memory
+                    .saturating_sub(device_reserve)
+                    .saturating_sub(decode_workspace);
+                (available_for_vae >= vae_weight_bytes).then_some(vae_weight_bytes)
+            } else {
+                None
+            };
+            let vae_detail = if vae_weight_bytes == 0 {
+                None
+            } else {
+                let device_reserve = admission_reserve_bytes(Some(device_memory));
+                let resident_note = vae_resident
+                    .map(|cap| {
+                        format!(
+                            "resident; decoder cache capped at {:.1} GiB",
+                            cap as f64 / 1073741824.0
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "device cannot hold the decoder beside its workspace; streaming per \
+                         layer-group"
+                            .to_owned()
+                    });
+                Some(format!(
+                    "vae {:.1} GiB; decode workspace {:.1} GiB; reserve {:.1} GiB; device \
+                     {:.1} GiB at the decode boundary (transformer residency dropped) -> {}",
+                    vae_weight_bytes as f64 / 1073741824.0,
+                    decode_workspace as f64 / 1073741824.0,
+                    device_reserve as f64 / 1073741824.0,
+                    device_memory as f64 / 1073741824.0,
+                    resident_note
+                ))
+            };
+            if let Some(vae_detail) = vae_detail {
+                provenance.push(DerivationStep {
+                    rule: "rule-6-vae-residency",
+                    detail: vae_detail,
+                });
+            }
+            vae_resident_bytes = vae_resident;
             selected.map(|selected| selected.plan)
         }
         None => {
@@ -219,6 +283,7 @@ pub fn derive(
         steady_weight_bytes: steady,
         host_reserve_bytes: reserve,
         host_cache_ceiling_bytes,
+        vae_resident_bytes,
         chunks,
         provenance,
     })
@@ -251,6 +316,7 @@ mod tests {
             fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu),
             host_memory_total_bytes: host,
             cgroup_memory_limit_bytes: None,
+            peer_links: Vec::new(),
             devices: device
                 .map(|bytes| {
                     vec![TopologyDevice {

@@ -1,4 +1,4 @@
-use crate::cli::device_parse::parse_device;
+use crate::cli::device_parse::parse_device_single;
 use crate::cli::output_hygiene::{
     ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
 };
@@ -142,7 +142,7 @@ pub(super) fn run(args: Args) -> Result<()> {
         .iter()
         .take(requests.len())
         .filter(|name| {
-            parse_device(name).is_ok_and(|device| {
+            parse_device_single(name).is_ok_and(|device| {
                 flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device))
                     .unified_pool_available_bytes()
                     .is_some()
@@ -161,7 +161,7 @@ pub(super) fn run(args: Args) -> Result<()> {
             let args = &args;
             handles.push(scope.spawn(move || -> Result<()> {
                 let run = || -> Result<()> {
-                    let device = parse_device(name)?;
+                    let device = parse_device_single(name)?;
                     let mut model = Music3::open(
                         &args.model,
                         &device,

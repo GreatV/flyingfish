@@ -3,7 +3,7 @@ use crate::vae_tiling::split_tiles;
 use anyhow::{Context, Result};
 use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{Linear, Module, ops};
-use ff_core::weights::{CachePolicy, ModelWeights, WeightSource};
+use ff_core::weights::{CachePolicy, DeviceCache, DeviceCachePolicy, ModelWeights, WeightSource};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -358,6 +358,43 @@ impl StreamedVideoVae {
             tile_size: 256,
             tile_overlap: 64,
         })
+    }
+
+    /// Open the decoder with its weights resident on the device: every
+    /// decoder weight is admitted into a device cache capped at `device_cache`,
+    /// so repeated reads across clips, chunks, and tiles hit VRAM instead of
+    /// re-streaming the component.
+    pub fn open_with_resident_weights(
+        component_dir: impl AsRef<Path>,
+        source: WeightSource,
+        cache_policy: CachePolicy,
+        device: Device,
+        attention_query_chunk_size: usize,
+        device_cache: DeviceCachePolicy,
+    ) -> Result<Self> {
+        let component_dir = component_dir.as_ref();
+        let mut vae = Self::open(
+            component_dir,
+            source,
+            cache_policy,
+            device.clone(),
+            attention_query_chunk_size,
+        )?;
+        let mut names = Vec::new();
+        for layer in 0..vae.config.decoder_num_layers {
+            names.extend(Self::block_weight_names(layer));
+        }
+        names.extend([
+            "decoder.norm_out.weight".to_owned(),
+            "decoder.norm_out.bias".to_owned(),
+            "decoder.proj_in.weight".to_owned(),
+            "decoder.proj_out.weight".to_owned(),
+            "post_quant_conv.weight".to_owned(),
+            "decoder.register_tokens".to_owned(),
+        ]);
+        vae.weights
+            .configure_device_cache_with_priority(DeviceCache::new(device_cache), names)?;
+        Ok(vae)
     }
 
     pub fn config(&self) -> &VideoVaeConfig {

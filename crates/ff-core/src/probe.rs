@@ -1057,6 +1057,28 @@ fn populate_cuda_fingerprint(device: &Device, fingerprint: &mut HardwareFingerpr
     );
 }
 
+/// Directional peer reachability from the driver's own device query.
+///
+/// The answer says only whether a peer mapping is possible; it says nothing
+/// about the link's class or speed.
+#[cfg(feature = "cuda")]
+pub fn can_access_peer(device: u32, peer_device: u32) -> Option<bool> {
+    use candle_core::cuda_backend::cudarc::driver::sys;
+
+    let mut reachable: i32 = 0;
+    let status = unsafe {
+        sys::cuDeviceCanAccessPeer(
+            &mut reachable,
+            device as sys::CUdevice,
+            peer_device as sys::CUdevice,
+        )
+    };
+    if status != sys::CUresult::CUDA_SUCCESS {
+        return None;
+    }
+    Some(reachable != 0)
+}
+
 #[cfg(feature = "cuda")]
 fn cuda_pci_bus_id(
     device: candle_core::cuda_backend::cudarc::driver::sys::CUdevice,

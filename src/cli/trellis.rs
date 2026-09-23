@@ -1,5 +1,5 @@
 use super::TrellisCommand;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::output_hygiene::{ensure_new_output, publish_staged_bytes};
 use anyhow::{Context, Result};
 use flyingfish::runtime::artifact::ArtifactStaging;
@@ -99,7 +99,7 @@ pub(super) fn run_structure(command: TrellisCommand) -> Result<()> {
     if let Some(output) = &output {
         ensure_new_output(output, "voxel output")?;
     }
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
 
     let loading = Instant::now();
     let pipeline = TextToStructure::load(&model, &conditioner, &device, models_root.as_deref())?;

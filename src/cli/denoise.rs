@@ -1,6 +1,6 @@
 use super::H3Command;
 use super::checkpoint::resolve_component;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::output_hygiene::{
     create_new_directory, ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
     write_telemetry,
@@ -652,7 +652,7 @@ pub(super) fn run_denoise_t2va(command: H3Command) -> Result<()> {
         || flash_attention;
     let weight_args = optional_weight_args.configured();
     let chunks = chunks.configured(flash_attention);
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     let telemetry_json = resolve_optional_new_output(telemetry_json, &model)?;
     ensure_optional_output_is_distinct(telemetry_json.as_deref(), &[&output])?;
     let checkpoint_dir = checkpoint_dir

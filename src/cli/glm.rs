@@ -1,4 +1,4 @@
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::output_hygiene::{
     ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
 };
@@ -217,7 +217,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         expert_cache_min_bytes <= expert_cache_bytes,
         "--expert-cache-min-mib exceeds --expert-cache-mib"
     );
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     ensure!(
         device.is_cpu() || device.is_cuda(),
         "GLM text inference currently supports CPU or CUDA devices"
@@ -711,7 +711,7 @@ pub(super) fn run_capture_parity(command: GlmCommand) -> Result<()> {
         "GLM parity capture max_context_tokens exceeds index_topk {}",
         config.text_config.index_topk
     );
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     ensure!(
         device.is_cpu() || device.is_cuda(),
         "GLM parity capture supports CPU or CUDA"

@@ -2,7 +2,7 @@ use super::H3Command;
 use super::build_transformer_options;
 use super::checkpoint::resolve_component;
 use super::denoise::validate_executable_policy;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::output_hygiene::{
     ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
 };
@@ -433,7 +433,7 @@ fn execute_trial(request: &TrialWorkerRequest) -> Result<CalibrationTrialResult>
         sorted_tensor_names(&values).join(", ")
     );
 
-    let device = parse_device(&request.calibration.device_selector)?;
+    let device = parse_device_single(&request.calibration.device_selector)?;
     validate_executable_policy(&observed_policy, &device)?;
     let prompt_embeddings = prompt_embeddings.to_device(&device)?;
     let video_latents = video_latents.to_device(&device)?;

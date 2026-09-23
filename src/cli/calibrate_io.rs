@@ -1,5 +1,5 @@
 use super::IoBenchmarkProfile;
-use super::device_parse::parse_device;
+use super::device_parse::parse_device_single;
 use super::output_hygiene::{
     ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
 };
@@ -81,7 +81,7 @@ fn run_sequential(
         "local-interconnect-only options cannot be used with --profile sequential"
     );
     validate_payload_format(&format)?;
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     let payload = payload.context("--payload is required for --profile sequential")?;
     let payload = std::fs::canonicalize(&payload).with_context(|| {
         format!(
@@ -165,7 +165,7 @@ fn run_local_interconnect(
         peer_cuda_ordinal != Some(primary_cuda_ordinal),
         "--peer-device must differ from --device"
     );
-    let device = parse_device(&device)?;
+    let device = parse_device_single(&device)?;
     let output = resolve_output_outside_model(&output, &model)?;
     ensure_new_output(&output, "local-interconnect I/O output")?;
     let staging = ArtifactStaging::new(&output).with_context(|| {

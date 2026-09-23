@@ -414,6 +414,12 @@ pub(in crate::cli) enum H3Command {
         #[arg(help = "Use optional CUDA FlashAttention (requires the flash-attn build feature)")]
         #[arg(long)]
         flash_attention: bool,
+        #[arg(
+            help = "Host profile measured on this machine by `ff calibrate-io`; feeds the \
+                    measured storage bandwidth into the configuration derivation"
+        )]
+        #[arg(long)]
+        host_profile: Option<PathBuf>,
         #[arg(long)]
         no_progress: bool,
         #[arg(help = "Print the topology-derived configuration and its provenance to stderr")]

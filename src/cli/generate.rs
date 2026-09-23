@@ -1,3 +1,4 @@
+use super::DenoiseChunkArgs;
 use super::H3Command;
 use super::checkpoint::resolve_component;
 use super::denoise::{
@@ -5,7 +6,7 @@ use super::denoise::{
     report_h3_device_cache, resolve_execution_policy, select_resume_execution_policy,
     validate_executable_policy,
 };
-use super::device_parse::parse_device;
+use super::device_parse::{parse_device, parse_device_ordinals};
 use super::output_hygiene::{
     create_new_directory, ensure_new_output, mib_to_bytes, publish_png_frame_manifest,
     publish_staged_bytes, resolve_output_outside_model, write_telemetry,
@@ -45,6 +46,7 @@ use flyingfish::runtime::artifact::{
 use flyingfish::runtime::frame_manifest::{
     MAX_PNG_FRAME_SET_MANIFEST_JSON_BYTES, PngFrameSetManifest,
 };
+use flyingfish::runtime::io_calibration::IoCalibrationReport;
 use flyingfish::runtime::probe::ResourceSnapshot;
 use flyingfish::runtime::storage::{RECOMMENDED_READ_AHEAD_BYTES, read_ahead_window};
 use flyingfish::runtime::telemetry::TelemetryMonitor;
@@ -159,6 +161,8 @@ const MAX_EXECUTION_POLICY_BYTES: u64 = 1024 * 1024;
 const MAX_GENERATION_COMPLETION_BYTES: u64 = 1024 * 1024;
 const GENERATION_READY_BYTES: &[u8] = b"flyingfish-h3-generation-schema-2\n";
 static FRAME_STAGING_NONCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "cuda")]
+const AUDIO_VAE_ACTIVATION_ALLOWANCE_BYTES: u64 = 256 << 20;
 
 const GENERATION_COMPLETION_SCHEMA_VERSION: u32 = 1;
 
@@ -1153,6 +1157,7 @@ fn load_or_initialize_state(
     _weight_source: WeightSource,
     _execution_cache_policy: CachePolicy,
     transformer_chunking: TransformerChunking,
+    pre_encoded: Option<&flyingfish::h3::text_encoder::PromptEncoding>,
 ) -> Result<GenerationState> {
     Ok(match resume_checkpoint {
         Some(checkpoint) => {
@@ -1172,33 +1177,47 @@ fn load_or_initialize_state(
             )?
         }
         None => {
-            let encode_start = Instant::now();
-            // Encode is one-pass: every encoder weight is read exactly once,
-            // so stream mmap with drop-behind instead of retaining 63 GiB.
-            // A one-shard policy evicts behind the scan; the transformer's
-            // own cache policy would let encoder pages compete with it.
-            let mut encoder = StreamedTextEncoder::open(
-                resolve_component(model, Path::new("text_encoder"))?,
-                WeightSource::Mmap,
-                CachePolicy::new(1),
-                device.clone(),
-                target_hidden_state,
-                transformer_chunking.attention.query_chunk_size.get(),
-            )?;
-            encoder.set_drop_evicted_pages(true);
-            let encoded = encoder.encode_prompt(tokenizer, prompt)?;
-            anyhow::ensure!(
-                encoded.token_ids == token_ids,
-                "tokenizer output changed after preflight"
-            );
-            drop(encoder);
-            if !no_progress {
-                eprintln!(
-                    "encode: {} prompt tokens completed in {:.2}s",
-                    encoded.token_ids.len(),
-                    encode_start.elapsed().as_secs_f64(),
-                );
-            }
+            let encoded_owned;
+            let encoded = match pre_encoded {
+                Some(encoded) => {
+                    anyhow::ensure!(
+                        encoded.token_ids == token_ids,
+                        "tokenizer output changed after preflight"
+                    );
+                    encoded
+                }
+                None => {
+                    let encode_start = Instant::now();
+                    // Encode is one-pass: every encoder weight is read exactly once,
+                    // so stream mmap with drop-behind instead of retaining 63 GiB.
+                    // A one-shard policy evicts behind the scan; the transformer's
+                    // own cache policy would let encoder pages compete with it.
+                    let mut encoder = StreamedTextEncoder::open(
+                        resolve_component(model, Path::new("text_encoder"))?,
+                        WeightSource::Mmap,
+                        CachePolicy::new(1),
+                        device.clone(),
+                        target_hidden_state,
+                        transformer_chunking.attention.query_chunk_size.get(),
+                    )?;
+                    encoder.set_drop_evicted_pages(true);
+                    let encoded = encoder.encode_prompt(tokenizer, prompt)?;
+                    anyhow::ensure!(
+                        encoded.token_ids == token_ids,
+                        "tokenizer output changed after preflight"
+                    );
+                    drop(encoder);
+                    if !no_progress {
+                        eprintln!(
+                            "encode: {} prompt tokens completed in {:.2}s",
+                            encoded.token_ids.len(),
+                            encode_start.elapsed().as_secs_f64(),
+                        );
+                    }
+                    encoded_owned = encoded;
+                    &encoded_owned
+                }
+            };
             let (video_latents, audio_latents) = make_t2va_noise(
                 transformer_config,
                 latent_frames,
@@ -1215,14 +1234,14 @@ fn load_or_initialize_state(
                 device,
             )?;
             GenerationState {
-                prompt_embeddings: encoded.embeddings,
+                prompt_embeddings: encoded.embeddings.to_device(device)?,
                 text_token_tags_tensor,
-                text_token_tags: encoded.text_token_tags,
+                text_token_tags: encoded.text_token_tags.clone(),
                 video_latents,
                 audio_latents,
                 completed_steps: 0,
                 policy_history: PolicyHistory::new(),
-                qwen_numerical_contract: encoded.numerical_contract,
+                qwen_numerical_contract: encoded.numerical_contract.clone(),
             }
         }
     })
@@ -1350,6 +1369,10 @@ struct DecodeStage<'a> {
     execution_cache_policy: CachePolicy,
     transformer_chunking: TransformerChunking,
     no_progress: bool,
+    /// Rule 6's verdict: `Some(cap)` opens the visual decoder with its weights
+    /// resident under this device-cache ceiling; `None` streams per layer
+    /// group.
+    vae_resident_bytes: Option<u64>,
 }
 
 impl DecodeStage<'_> {
@@ -1375,6 +1398,7 @@ impl DecodeStage<'_> {
             execution_cache_policy,
             transformer_chunking,
             no_progress,
+            vae_resident_bytes,
         } = self;
         let frames = if symlink_metadata_if_exists(completion_path, "generation completion")?
             .is_some()
@@ -1461,23 +1485,67 @@ impl DecodeStage<'_> {
                         DecodeBranchAction::VerifiedExisting,
                     ));
                 }
-                let staging_directory = create_frame_staging_directory(staging_dir)?;
-                let decoder = StreamedVideoVae::open(
-                    video_vae_dir,
-                    weight_source,
-                    execution_cache_policy,
-                    video_device,
-                    transformer_chunking.attention.query_chunk_size.get(),
-                )?;
-                let frames = decoder
-                    .decode_to_png_frames(&video_latents, &staging_directory)
-                    .with_context(|| {
-                        format!(
-                            "video decode failed; incomplete frames remain isolated at {}",
-                            staging_directory.display()
-                        )
-                    })?;
-                publish_png_frame_manifest(&staging_directory, frames)?;
+                // Adaptive VAE residency: start with the derived cap; on
+                // device OOM halve and retry, falling back to full streaming.
+                let mut cache_cap = vae_resident_bytes;
+                let video_device = video_device.clone();
+                let mut attempt = 0usize;
+                let frames = loop {
+                    attempt += 1;
+                    let attempt_root = create_vae_attempt_directory(staging_dir, attempt)?;
+                    let attempt_staging = attempt_root.join("frames");
+                    std::fs::create_dir_all(&attempt_staging)?;
+                    let decode_result = (|| -> Result<(usize, PathBuf)> {
+                        let decoder = match cache_cap {
+                            Some(cap) => StreamedVideoVae::open_with_resident_weights(
+                                video_vae_dir,
+                                weight_source,
+                                execution_cache_policy,
+                                video_device.clone(),
+                                transformer_chunking.attention.query_chunk_size.get(),
+                                ff_core::weights::DeviceCachePolicy::with_max_bytes(cap),
+                            )?,
+                            None => StreamedVideoVae::open(
+                                video_vae_dir,
+                                weight_source,
+                                execution_cache_policy,
+                                video_device.clone(),
+                                transformer_chunking.attention.query_chunk_size.get(),
+                            )?,
+                        };
+                        let frames = decoder
+                            .decode_to_png_frames(&video_latents, &attempt_staging)
+                            .with_context(|| {
+                                format!(
+                                    "video decode failed; incomplete frames remain isolated at {}",
+                                    attempt_staging.display()
+                                )
+                            })?;
+                        publish_png_frame_manifest(&attempt_staging, frames)?;
+                        Ok((frames, attempt_staging))
+                    })();
+                    match decode_result {
+                        Ok((frames, dir)) => break Ok((frames, dir)),
+                        Err(error) => {
+                            let chain = format!("{error:#}").to_lowercase();
+                            let is_oom = chain.contains("out of memory")
+                                || chain.contains("cuda_error_out_of_memory");
+                            let next = cache_cap.filter(|_| is_oom).map(|c| c / 2);
+                            match next {
+                                Some(new_cap) if new_cap >= (1 << 20) => {
+                                    eprintln!(
+                                        "VAE decode OOM ({}); retrying with {} MiB cache cap",
+                                        error,
+                                        new_cap / (1024 * 1024),
+                                    );
+                                    cache_cap = Some(new_cap);
+                                }
+                                _ => break Err(error),
+                            }
+                        }
+                    }
+                };
+                let (frames, staging_directory) = frames?;
                 Ok((
                     PreparedVideoDecode::Staged {
                         directory: staging_directory,
@@ -1599,13 +1667,6 @@ impl DecodeExpectations {
     }
 }
 
-fn device_ordinal(device: &str) -> usize {
-    device
-        .strip_prefix("cuda:")
-        .and_then(|ordinal| ordinal.parse().ok())
-        .unwrap_or(0)
-}
-
 fn directory_tree_bytes(root: &Path) -> Result<u64> {
     if !root
         .try_exists()
@@ -1683,9 +1744,10 @@ struct T2vaDerivation<'a> {
     geometry: T2vaGeometry,
     flash_attention: bool,
     evaluations: usize,
+    io_bandwidth_bytes_per_second: Option<u64>,
     max_host_mib: Option<u64>,
     max_device_mib: Option<u64>,
-    ordinal: usize,
+    ordinals: Vec<usize>,
 }
 
 fn derive_t2va_configuration(
@@ -1700,9 +1762,10 @@ fn derive_t2va_configuration(
         geometry,
         flash_attention,
         evaluations,
+        io_bandwidth_bytes_per_second,
         max_host_mib,
         max_device_mib,
-        ordinal,
+        ordinals,
     } = request;
     let config = TransformerConfig::from_file(model_root.join("transformer/config.json"))?;
     let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
@@ -1735,6 +1798,29 @@ fn derive_t2va_configuration(
             None
         }
     };
+    let vae_bytes = match flyingfish::runtime::weights::ModelWeights::open(
+        model_root.join("vae"),
+        WeightSource::Memory,
+        CachePolicy::new(1),
+    )
+    .and_then(|weights| weights.cache_inventory())
+    {
+        Ok(inventory) => Some(
+            inventory.total_bytes(ff_core::weights::CacheGranularity::Tensor)?
+                + inventory
+                    .shards
+                    .iter()
+                    .map(|shard| shard.header_bytes)
+                    .sum::<u64>(),
+        ),
+        Err(error) => {
+            eprintln!(
+                "config: video VAE catalog was not read ({}); rule 6 assumes no decoder",
+                error
+            );
+            None
+        }
+    };
     let materialization_bytes = catalog
         .as_ref()
         .map(|inventory| -> Result<u64> {
@@ -1757,11 +1843,27 @@ fn derive_t2va_configuration(
     let requirement = H3T2vaRequirement::from_estimate(
         &estimate,
         encoder_bytes,
+        vae_bytes.unwrap_or(0),
         flash_attention,
         workspace_bytes,
         materialization_bytes,
     )?;
-    let mut profile = load_or_capture_topology(primary)?;
+    let mut profile =
+        load_or_capture_topology(primary)?.with_storage_bandwidth(io_bandwidth_bytes_per_second);
+    // Multi-device lists select chunks conservatively: the least-capable
+    // listed device decides, so every worker's admission sees a plan that
+    // fits its card.
+    let ordinal = ordinals
+        .iter()
+        .copied()
+        .min_by_key(|ordinal| {
+            profile
+                .devices
+                .get(*ordinal)
+                .and_then(|device| device.total_memory_bytes)
+                .unwrap_or(u64::MAX)
+        })
+        .unwrap_or(0);
     // Operator caps bound what the derivation may hand out; the profile the
     // rules see is the capped machine, not the physical one.
     if let Some(mib) = max_host_mib {
@@ -1812,107 +1914,89 @@ fn derive_t2va_configuration(
     Ok((derived, host_bound_bytes))
 }
 
-pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
-    let H3Command::GenerateT2va {
-        resources,
-        model,
-        prompt,
-        output_dir,
-        device,
-        policy,
-        weights: optional_weight_args,
-        latent_frames,
-        latent_height,
-        latent_width,
-        audio_frames,
-        audio_channels,
-        target,
-        wav_format,
-        seed,
-        target_hidden_state,
-        chunks: optional_chunks,
-        sigma_points,
-        video_shift,
-        audio_shift,
-        no_precompute_adaln,
-        flash_attention,
-        no_progress,
-        explain_config,
-        telemetry_json,
-        max_host_mib,
-        max_device_mib,
-        backend_workspace_mib,
-    } = command
-    else {
-        bail!("internal CLI dispatch mismatch for generate-t2va");
-    };
+/// One worker's share of a generation run: the device it owns, the slice of
+/// the output tree it writes, and the inputs that were produced once for all
+/// workers.
+struct DeviceRunContext<'a> {
+    ordinals: Vec<usize>,
+    device: Device,
+    output_dir: PathBuf,
+    existing_run: bool,
+    seed: u64,
+    prompt: String,
+    tokenizer: &'a Tokenizer,
+    model: PathBuf,
+    model_root: PathBuf,
+    /// Encoding produced once for all workers; resume workers ignore it.
+    prompt_embeddings_pre_encoded: Option<&'a flyingfish::h3::text_encoder::PromptEncoding>,
+    token_ids: Vec<u32>,
+    sigma_points: usize,
+    video_shift: f32,
+    audio_shift: f32,
+    latent_frames: usize,
+    latent_height: usize,
+    latent_width: usize,
+    audio_frames: usize,
+    audio_channels: usize,
+    target_hidden_state: usize,
+    wav_format: WavSampleFormat,
+    max_device_mib: Option<u64>,
+    backend_workspace_mib: Option<u64>,
+    telemetry_json: Option<PathBuf>,
+    no_progress: bool,
+    explain_config: bool,
+    resources: H3ResourceArgs,
+    policy: Option<PathBuf>,
+    host_profile: Option<PathBuf>,
+    optional_weight_args: OptionalWeightCacheArgs,
+    optional_chunks: DenoiseChunkArgs,
+    no_precompute_adaln: bool,
+    flash_attention: bool,
+    max_host_mib: Option<u64>,
+}
 
-    let (latent_frames, latent_height, latent_width, audio_frames) = target
-        .resolve_latent_geometry((latent_frames, latent_height, latent_width, audio_frames))?;
-
-    let supplied_output_metadata =
-        symlink_metadata_if_exists(&output_dir, "generation output directory")?;
-    anyhow::ensure!(
-        supplied_output_metadata
-            .as_ref()
-            .is_none_or(|metadata| !metadata.file_type().is_symlink()),
-        "generation output directory must not be a symlink: {}",
-        output_dir.display()
-    );
-    let model_root = fs::canonicalize(&model)
-        .with_context(|| format!("failed to resolve model directory {}", model.display()))?;
+/// The single-device generation pipeline: resource selection, the
+/// transformer, the denoise loop, decoding, and publication. One context per
+/// device; multi-device runs call it once per worker thread.
+fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
+    let output_dir = ctx.output_dir.clone();
+    let existing_run = ctx.existing_run;
+    let seed = ctx.seed;
+    let tokenizer = ctx.tokenizer;
+    let token_ids = &ctx.token_ids;
+    let sigma_points = ctx.sigma_points;
+    let video_shift = ctx.video_shift;
+    let audio_shift = ctx.audio_shift;
+    let latent_frames = ctx.latent_frames;
+    let latent_height = ctx.latent_height;
+    let latent_width = ctx.latent_width;
+    let audio_frames = ctx.audio_frames;
+    let audio_channels = ctx.audio_channels;
+    let target_hidden_state = ctx.target_hidden_state;
+    let wav_format = ctx.wav_format;
+    let max_device_mib = ctx.max_device_mib;
+    let backend_workspace_mib = ctx.backend_workspace_mib;
+    let telemetry_json = ctx.telemetry_json.clone();
+    let no_progress = ctx.no_progress;
+    let explain_config = ctx.explain_config;
+    let resources = ctx.resources;
+    let policy = ctx.policy.clone();
+    let device = &ctx.device;
+    let host_profile = ctx.host_profile.clone();
+    let model = ctx.model.clone();
+    let model_root = ctx.model_root.clone();
     let model_root_record = model_root
         .to_str()
         .context("resolved model directory is not valid UTF-8")?
         .to_owned();
-    let output_dir = resolve_output_outside_model(&output_dir, &model_root)?;
-    let existing_run = output_dir.exists();
-    if existing_run {
-        anyhow::ensure!(
-            output_dir.is_dir(),
-            "generation output exists but is not a directory: {}",
-            output_dir.display()
-        );
-    } else {
-        ensure_new_output(&output_dir, "output directory")?;
-    }
-    let telemetry_json = resolve_optional_new_output(telemetry_json, &model)?;
-    ensure_optional_output_is_distinct(telemetry_json.as_deref(), &[&output_dir])?;
-    if let Some(telemetry_json) = telemetry_json.as_deref() {
-        anyhow::ensure!(
-            !telemetry_json.starts_with(&output_dir) && !output_dir.starts_with(telemetry_json),
-            "generation telemetry output must be disjoint from the resumable run directory: {}",
-            telemetry_json.display()
-        );
-    }
-    for (name, value) in [
-        ("latent_frames", latent_frames),
-        ("latent_height", latent_height),
-        ("latent_width", latent_width),
-        ("audio_frames", audio_frames),
-        ("audio_channels", audio_channels),
-    ] {
-        anyhow::ensure!(value > 0, "{name} must be non-zero");
-    }
-    anyhow::ensure!(sigma_points >= 2, "sigma_points must be at least two");
-
-    let selected_device_ordinal = device_ordinal(&device);
-    let device = parse_device(&device)?;
-    let tokenizer_path = required_model_file(&model, Path::new("tokenizer/tokenizer.json"))?;
-    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to load tokenizer {}: {error}",
-            tokenizer_path.display()
-        )
-    })?;
-    let tokenization = tokenizer
-        .encode(prompt.as_str(), false)
-        .map_err(|error| anyhow::anyhow!("failed to tokenize prompt: {error}"))?;
-    let token_ids = tokenization.get_ids().to_vec();
-    anyhow::ensure!(
-        !token_ids.is_empty(),
-        "prompt tokenized to an empty sequence"
-    );
+    let prompt = ctx.prompt.clone();
+    let ordinals = ctx.ordinals.clone();
+    let optional_weight_args = ctx.optional_weight_args;
+    let optional_chunks = ctx.optional_chunks;
+    let no_precompute_adaln = ctx.no_precompute_adaln;
+    let flash_attention = ctx.flash_attention;
+    let max_host_mib = ctx.max_host_mib;
+    let _ = ctx.prompt_embeddings_pre_encoded;
 
     let explicit_policy = policy.is_some();
     let explicit_policy_settings = optional_weight_args.is_explicit()
@@ -1920,6 +2004,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         || no_precompute_adaln
         || flash_attention;
     let mut derived_host_bound_mib: Option<u64> = None;
+    let mut vae_resident_bytes: Option<u64> = None;
     let derived = if explicit_policy {
         None
     } else {
@@ -1929,19 +2014,37 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         geometry.latent_width = latent_width;
         geometry.audio_frames = audio_frames;
         geometry.audio_channels = audio_channels;
+        let io_bandwidth_bytes_per_second = host_profile
+            .as_deref()
+            .map(|path| -> Result<u64> {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("read host profile {}", path.display()))?;
+                IoCalibrationReport::from_json(&bytes)
+                    .map(|report| report.host_sequential_read.bytes_per_second as u64)
+                    .with_context(|| format!("invalid host profile {}", path.display()))
+            })
+            .transpose()
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "config: host profile unused ({error:#}); storage bandwidth is unmeasured"
+                );
+                None
+            });
         let (derived, host_bound_bytes) = derive_t2va_configuration(
             T2vaDerivation {
                 model_root: &model_root,
                 geometry,
                 flash_attention,
                 evaluations: sigma_points - 1,
+                io_bandwidth_bytes_per_second,
                 max_host_mib,
                 max_device_mib,
-                ordinal: selected_device_ordinal,
+                ordinals: ordinals.clone(),
             },
-            &device,
+            device,
         )?;
         derived_host_bound_mib = host_bound_bytes.map(|bytes| bytes.div_ceil(1 << 20));
+        vae_resident_bytes = derived.vae_resident_bytes;
         Some(derived)
     };
     let derived_source = derived.as_ref().map(|derived| match derived.weight_source {
@@ -1949,6 +2052,12 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         ff_core::configure::WeightSourceChoice::Mmap => WeightSource::Mmap,
     });
     let effective_source = optional_weight_args.weight_source.or(derived_source);
+    if ctx.ordinals.len() > 1 && matches!(effective_source, Some(WeightSource::Memory)) {
+        anyhow::bail!(
+            "multi-device generation streams through mmap; the memory source is a \
+             single-device configuration"
+        );
+    }
     let derived_host_cache_mib = matches!(effective_source, Some(WeightSource::Memory))
         .then(|| {
             derived
@@ -1962,7 +2071,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     let optional_chunks = optional_chunks.with_derived(derived.as_ref().and_then(|d| d.chunks));
     let max_host_mib = max_host_mib.or(derived_host_bound_mib);
     if let Some(bound_bytes) = derived_host_bound_mib.map(|mib| mib << 20) {
-        let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device));
+        let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(device));
         let available = snapshot
             .cgroup_v2_memory_available_bytes
             .into_iter()
@@ -1992,7 +2101,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     let chunks = optional_chunks.configured(flash_attention);
     let requested_policy = resolve_execution_policy(
         policy.as_deref(),
-        &device,
+        device,
         weight_args.weight_source,
         weight_args.cache_policy()?,
         chunks,
@@ -2031,7 +2140,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         checkpoint
             .identity
             .policy_history
-            .validate_resume_numerics(&device)
+            .validate_resume_numerics(device)
             .context(
                 "generation checkpoint policy history cannot resume on the selected runtime",
             )?;
@@ -2047,7 +2156,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         explicit_policy_settings,
         recorded_initialization.is_some(),
     )?;
-    validate_executable_policy(&execution_policy, &device)?;
+    validate_executable_policy(&execution_policy, device)?;
     let mut policy_origin =
         if recorded_initialization.is_some() && !explicit_policy && !explicit_policy_settings {
             PolicyOrigin::Recorded
@@ -2072,12 +2181,12 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
             refusal_sidecar: &refusal_artifact_path(&output_dir),
             model: &model,
             model_root_record: &model_root_record,
-            device: &device,
+            device,
             resources: &resources,
             optional_weight_args,
             checkpoint_policy,
             explicit_policy,
-            token_ids: &token_ids,
+            token_ids,
             prompt: &prompt,
             latent_frames,
             latent_height,
@@ -2120,7 +2229,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         &execution_policy,
     )?;
     let qwen_numerical_contract = build_qwen_numerical_contract(
-        &device,
+        device,
         usize::try_from(execution_policy.attention.configured_query_rows)
             .context("execution-policy Qwen query rows exceed usize")?,
         token_ids.len(),
@@ -2201,7 +2310,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
             max_host_mib,
             max_device_mib,
             backend_workspace_mib,
-            &device,
+            device,
         );
         let preflight = match preflight {
             Ok(preflight) => preflight,
@@ -2313,12 +2422,12 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         resume_checkpoint,
         schedule_steps,
         no_progress,
-        &device,
+        device,
         &transformer_config,
         &generation_request,
         &model,
-        &tokenizer,
-        &token_ids,
+        tokenizer,
+        token_ids,
         &prompt,
         target_hidden_state,
         latent_frames,
@@ -2330,11 +2439,30 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         weight_source,
         execution_cache_policy,
         transformer_chunking,
+        ctx.prompt_embeddings_pre_encoded,
     )?;
-    anyhow::ensure!(
-        state.qwen_numerical_contract == generation_initialization.qwen_numerical_contract,
-        "generation prompt/checkpoint Qwen numerical contract disagrees with initialization"
-    );
+    // The shared multi-device encoding carries the orchestrator's chunk
+    // metadata: its device axes are re-validated against this worker's card,
+    // while chunk-derived fields describe the shared encode and are accepted
+    // as encoded (verified chunk sizes produce identical encoder output).
+    if ctx.prompt_embeddings_pre_encoded.is_some() {
+        anyhow::ensure!(
+            state.qwen_numerical_contract.execution_backend
+                == generation_initialization
+                    .qwen_numerical_contract
+                    .execution_backend
+                && state.qwen_numerical_contract.cuda_capabilities
+                    == generation_initialization
+                        .qwen_numerical_contract
+                        .cuda_capabilities,
+            "generation Qwen numerical contract device axes disagree with initialization"
+        );
+    } else {
+        anyhow::ensure!(
+            state.qwen_numerical_contract == generation_initialization.qwen_numerical_contract,
+            "generation prompt/checkpoint Qwen numerical contract disagrees with initialization"
+        );
+    }
     let conditioning_provenance =
         H3ConditioningProvenance::FlyingfishQwen(Box::new(state.qwen_numerical_contract.clone()));
 
@@ -2343,7 +2471,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     let (result, policy_history, transformer_stats) = denoise_remaining_steps(
         state,
         schedule_steps,
-        &device,
+        device,
         &execution_policy,
         transformer_dir,
         &conditioning_provenance,
@@ -2399,8 +2527,76 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         latent_width,
     )?;
 
+    // At the decode boundary, measure the actual device free memory and
+    // compute the VAE cache cap from what is really available, not from the
+    // derivation's ideal. This accounts for the transformer's residual
+    // device allocations, fragmentation, and cudarc pool retention.
+    #[cfg(feature = "cuda")]
+    let vae_resident_bytes = if device.is_cuda() {
+        let mut free_before: usize = 0;
+        let mut total: usize = 0;
+        unsafe {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let _ = sys::cuMemGetInfo_v2(&mut free_before, &mut total);
+        }
+        // Flush pending stream work so stream-ordered allocations have
+        // returned to their pools before the trim.
+        unsafe {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let _ = sys::cuCtxSynchronize();
+        }
+        // Trim the device's default memory pool: stream-ordered allocations
+        // freed during denoise are still held in the pool and are not
+        // reflected in `cuMemGetInfo`'s free count until trimmed.
+        unsafe {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let mut pool: sys::CUmemoryPool = std::mem::zeroed();
+            let ordinal = ctx.ordinals.first().copied().unwrap_or(0) as i32;
+            let status = sys::cuDeviceGetDefaultMemPool(&mut pool, ordinal);
+            if status == sys::CUresult::CUDA_SUCCESS {
+                sys::cuMemPoolTrimTo(pool, 0);
+            }
+        }
+        let mut free_after: usize = 0;
+        unsafe {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let _ = sys::cuMemGetInfo_v2(&mut free_after, &mut total);
+        }
+        let free_u64 = free_after as u64;
+        let total_u64 = total as u64;
+        // A safety margin for the decode workspace and CUDA context
+        // overhead, plus the audio decode that runs concurrently on this
+        // device: its weights and activations.
+        let margin: u64 = (2u64 << 30)
+            .saturating_add(directory_tree_bytes(&audio_vae_dir)?)
+            .saturating_add(AUDIO_VAE_ACTIVATION_ALLOWANCE_BYTES);
+        // Cards with less than half their memory free at the decode boundary
+        // won't benefit enough from partial residency to offset the cost.
+        let cap = vae_resident_bytes
+            .filter(|_| free_u64 * 2 > total_u64)
+            .map(|ideal| ideal.min(free_u64.saturating_sub(margin)))
+            .filter(|&cap| cap > (1 << 30)); // below 1 GiB, streaming is better
+        eprintln!(
+            "decode boundary: memory pool trimmed, free {} -> {} MiB / {} MiB total; \
+             margin {} MiB; VAE cache cap {} ({})",
+            free_before / (1024 * 1024),
+            free_after / (1024 * 1024),
+            total / (1024 * 1024),
+            margin / (1024 * 1024),
+            cap.map(|c| format!("{} MiB", c / (1024 * 1024)))
+                .unwrap_or_else(|| "streaming".to_owned()),
+            if cap.is_some() {
+                "resident"
+            } else {
+                "streaming"
+            },
+        );
+        cap
+    } else {
+        vae_resident_bytes
+    };
     let frames = DecodeStage {
-        device: &device,
+        device,
         output_dir: &output_dir,
         staging_dir: &staging_dir,
         completion_path: &completion_path,
@@ -2419,6 +2615,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         execution_cache_policy,
         transformer_chunking,
         no_progress,
+        vae_resident_bytes,
     }
     .run(&result)?;
 
@@ -2448,6 +2645,446 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
+    let H3Command::GenerateT2va {
+        resources,
+        model,
+        prompt,
+        output_dir,
+        device,
+        policy,
+        weights: optional_weight_args,
+        latent_frames,
+        latent_height,
+        latent_width,
+        audio_frames,
+        audio_channels,
+        target,
+        wav_format,
+        seed,
+        target_hidden_state,
+        chunks: optional_chunks,
+        sigma_points,
+        video_shift,
+        audio_shift,
+        no_precompute_adaln,
+        flash_attention,
+        host_profile,
+        no_progress,
+        explain_config,
+        telemetry_json,
+        max_host_mib,
+        max_device_mib,
+        backend_workspace_mib,
+    } = command
+    else {
+        bail!("internal CLI dispatch mismatch for generate-t2va");
+    };
+
+    let (latent_frames, latent_height, latent_width, audio_frames) = target
+        .resolve_latent_geometry((latent_frames, latent_height, latent_width, audio_frames))?;
+
+    let supplied_output_metadata =
+        symlink_metadata_if_exists(&output_dir, "generation output directory")?;
+    anyhow::ensure!(
+        supplied_output_metadata
+            .as_ref()
+            .is_none_or(|metadata| !metadata.file_type().is_symlink()),
+        "generation output directory must not be a symlink: {}",
+        output_dir.display()
+    );
+    let model_root = fs::canonicalize(&model)
+        .with_context(|| format!("failed to resolve model directory {}", model.display()))?;
+    let output_dir = resolve_output_outside_model(&output_dir, &model_root)?;
+    let existing_run = output_dir.exists();
+    if existing_run {
+        anyhow::ensure!(
+            output_dir.is_dir(),
+            "generation output exists but is not a directory: {}",
+            output_dir.display()
+        );
+    } else {
+        ensure_new_output(&output_dir, "output directory")?;
+    }
+    let telemetry_json = resolve_optional_new_output(telemetry_json, &model)?;
+    ensure_optional_output_is_distinct(telemetry_json.as_deref(), &[&output_dir])?;
+    if let Some(telemetry_json) = telemetry_json.as_deref() {
+        anyhow::ensure!(
+            !telemetry_json.starts_with(&output_dir) && !output_dir.starts_with(telemetry_json),
+            "generation telemetry output must be disjoint from the resumable run directory: {}",
+            telemetry_json.display()
+        );
+    }
+    for (name, value) in [
+        ("latent_frames", latent_frames),
+        ("latent_height", latent_height),
+        ("latent_width", latent_width),
+        ("audio_frames", audio_frames),
+        ("audio_channels", audio_channels),
+    ] {
+        anyhow::ensure!(value > 0, "{name} must be non-zero");
+    }
+    anyhow::ensure!(sigma_points >= 2, "sigma_points must be at least two");
+
+    let ordinals = parse_device_ordinals(&device)?;
+    let device = parse_device(&device)?;
+    let tokenizer_path = required_model_file(&model, Path::new("tokenizer/tokenizer.json"))?;
+    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to load tokenizer {}: {error}",
+            tokenizer_path.display()
+        )
+    })?;
+    let tokenization = tokenizer
+        .encode(prompt.as_str(), false)
+        .map_err(|error| anyhow::anyhow!("failed to tokenize prompt: {error}"))?;
+    let token_ids = tokenization.get_ids().to_vec();
+    anyhow::ensure!(
+        !token_ids.is_empty(),
+        "prompt tokenized to an empty sequence"
+    );
+
+    let explicit_policy = policy.is_some();
+    // The gate only needs the explicit flag; the settings flag is the
+    // pipeline's own pinning signal and stays there.
+    let _explicit_policy_settings = optional_weight_args.is_explicit()
+        || optional_chunks.is_explicit()
+        || no_precompute_adaln
+        || flash_attention;
+    let model_root_record = model_root
+        .to_str()
+        .context("resolved model directory is not valid UTF-8")?
+        .to_owned();
+
+    // Cold-cache preparation evicts and re-reads shared shard files; it
+    // runs once here rather than racing across workers.
+    if resources.resource_cold_cache {
+        flyingfish::resource_policy::prepare_cold_cache_components(&[
+            model_root.join("transformer")
+        ])?;
+    }
+    let worker_resources = H3ResourceArgs {
+        resource_policy: resources.resource_policy,
+        resource_evidence: resources.resource_evidence.clone(),
+        resource_cold_cache: false,
+    };
+
+    if ordinals.len() > 1 {
+        // Pre-validation runs before the shared encode: worker roots must be
+        // real directories (no symlink escape), every listed ordinal must
+        // initialize, and each worker's resume state is discovered so a
+        // broken worker fails before any other starts, the admission gate
+        // charges only the evaluations that remain, and the encode is skipped
+        // when every worker resumes.
+        let mut worker_resume: Vec<Option<usize>> = Vec::new();
+        for (worker_index, ordinal) in ordinals.iter().enumerate() {
+            let worker_root = output_dir.join(format!("gpu{ordinal}"));
+            anyhow::ensure!(
+                worker_root != output_dir,
+                "worker root equals the run root for device {ordinal}"
+            );
+            if let Some(metadata) =
+                symlink_metadata_if_exists(&worker_root, "worker output directory")?
+            {
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "worker output directory must not be a symlink: {}",
+                    worker_root.display()
+                );
+            }
+            Device::new_cuda(*ordinal)
+                .with_context(|| format!("failed to initialize CUDA device {ordinal}"))?;
+            let recorded = RecordedRun::discover(
+                worker_root.exists(),
+                &worker_root,
+                &worker_root.join(GENERATION_INITIALIZATION_FILE),
+                &worker_root.join(GENERATION_READY_FILE),
+                &worker_root.join(EXECUTION_POLICY_FILE),
+                &worker_root.join(GENERATION_REQUEST_FILE),
+                &worker_root.join(STAGING_DIRECTORY),
+                &worker_root.join(CHECKPOINT_DIRECTORY),
+                &worker_root.join(FINAL_LATENTS_FILE),
+                sigma_points,
+            )?;
+            if let Some(resume) = recorded.resume_from() {
+                resume
+                    .identity
+                    .policy_history
+                    .validate_resume_numerics(&device)
+                    .with_context(|| {
+                        format!(
+                            "worker {worker_index} (device {ordinal}) checkpoint cannot resume \
+                             on the selected runtime"
+                        )
+                    })?;
+            }
+            worker_resume.push(
+                recorded
+                    .resume_from()
+                    .map(|checkpoint| checkpoint.identity.completed_evaluations as usize),
+            );
+        }
+        // The single-device path creates its output directory inside the
+        // pipeline; the multi-device workers each create their own root under
+        // a parent the orchestrator makes first. Existing directories stay as
+        // they are so a partial run can resume. A pre-existing root that is
+        // not a recognised multi-device run is refused.
+        if output_dir.exists() {
+            let has_gpu_layout = ordinals
+                .iter()
+                .any(|ordinal| output_dir.join(format!("gpu{ordinal}")).is_dir());
+            let has_init = output_dir.join(GENERATION_INITIALIZATION_FILE).is_file();
+            anyhow::ensure!(
+                has_gpu_layout || has_init,
+                "multi-device generation output directory {} exists but has no gpu{{N}} \\
+                 subdirectories or initialization record",
+                output_dir.display()
+            );
+        } else {
+            create_new_directory(&output_dir, "generation output directory")?;
+        }
+        for ordinal in &ordinals {
+            let worker_root = output_dir.join(format!("gpu{ordinal}"));
+            if !worker_root.exists() {
+                create_new_directory(&worker_root, "worker output directory")?;
+            }
+        }
+
+        // Surface admission refusals before paying for the shared encode, and
+        // aggregate the per-worker host peaks against this machine. Each
+        // worker is charged only for the evaluations its resume state leaves.
+        let mut worker_peaks: Vec<u64> = Vec::new();
+        let mut shared_mapped_bytes = 0u64;
+        let gate_weight_args = optional_weight_args.configured();
+        for (worker_index, (ordinal, completed)) in ordinals.iter().zip(&worker_resume).enumerate()
+        {
+            let gate_device = Device::new_cuda(*ordinal)
+                .with_context(|| format!("failed to initialize CUDA device {ordinal}"))?;
+            let mut gate_policy = resolve_execution_policy(
+                policy.as_deref(),
+                &gate_device,
+                gate_weight_args.weight_source,
+                gate_weight_args.cache_policy()?,
+                optional_chunks.configured(flash_attention),
+                flash_attention,
+                !no_precompute_adaln,
+            )?;
+            let mut gate_origin = PolicyOrigin::Defaults;
+            let remaining = (sigma_points - 1).saturating_sub(completed.unwrap_or(0));
+            let selection = select_generation_resources(
+                remaining,
+                &mut gate_policy,
+                &mut gate_origin,
+                GenerationResourceRequest {
+                    refusal_sidecar: &refusal_artifact_path(&output_dir),
+                    model: &model,
+                    model_root_record: &model_root_record,
+                    device: &gate_device,
+                    resources: &worker_resources,
+                    optional_weight_args,
+                    checkpoint_policy: None,
+                    explicit_policy,
+                    token_ids: &token_ids,
+                    prompt: &prompt,
+                    latent_frames,
+                    latent_height,
+                    latent_width,
+                    audio_frames,
+                    audio_channels,
+                    sigma_points,
+                    seed: seed.wrapping_add(worker_index as u64),
+                    target_hidden_state,
+                    video_shift,
+                    audio_shift,
+                    wav_format,
+                    max_host_mib,
+                    max_device_mib,
+                    backend_workspace_mib,
+                },
+            )?;
+            if let Some(selection) = &selection {
+                let mapped = selection.estimate.assumptions.mapped_weight_residency_bytes;
+                shared_mapped_bytes = shared_mapped_bytes.max(mapped);
+                worker_peaks.push(selection.estimate.peak_host_bytes.saturating_sub(mapped));
+            }
+        }
+        // The mapped weight residency is shared across workers (same files,
+        // same page cache, same process): it counts once in the aggregate.
+        // Each worker's remaining peak (workspace, activations) is exclusive.
+        let total_worker_peaks: u64 = worker_peaks.iter().sum();
+        let aggregate_host_peak = total_worker_peaks.saturating_add(shared_mapped_bytes);
+        let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device));
+        // The aggregate ceiling is the tighter of the machine's available
+        // host memory and the operator's --max-host-mib hard cap.
+        let available = snapshot
+            .cgroup_v2_memory_available_bytes
+            .into_iter()
+            .chain(snapshot.host_memory_available_bytes)
+            .chain(max_host_mib.map(|mib| mib << 20))
+            .min();
+        if let Some(available) = available {
+            anyhow::ensure!(
+                aggregate_host_peak <= available,
+                "multi-device generation needs {} B of host across workers but the host limit \
+                 is {} B",
+                aggregate_host_peak,
+                available
+            );
+        }
+
+        // All workers resuming means the shared encode already happened in the
+        // run being resumed: skip it entirely. Otherwise it runs here, under the
+        // policy the workers will actually use, and every worker receives it.
+        let any_fresh = worker_resume.iter().any(|completed| completed.is_none());
+        let encode_chunk_size = resolve_execution_policy(
+            policy.as_deref(),
+            &device,
+            optional_weight_args.configured().weight_source,
+            optional_weight_args.configured().cache_policy()?,
+            optional_chunks.configured(flash_attention),
+            flash_attention,
+            !no_precompute_adaln,
+        )?
+        .transformer_chunking()?
+        .attention
+        .query_chunk_size
+        .get();
+        let pre_encoded = if any_fresh {
+            let encode_start = Instant::now();
+            let mut encoder = StreamedTextEncoder::open(
+                resolve_component(&model, Path::new("text_encoder"))?,
+                WeightSource::Mmap,
+                CachePolicy::new(1),
+                device.clone(),
+                target_hidden_state,
+                encode_chunk_size,
+            )?;
+            encoder.set_drop_evicted_pages(true);
+            let encoded = encoder.encode_prompt(&tokenizer, prompt.as_str())?;
+            drop(encoder);
+            if !no_progress {
+                eprintln!(
+                    "encode: {} prompt tokens completed in {:.2}s (shared across devices)",
+                    encoded.token_ids.len(),
+                    encode_start.elapsed().as_secs_f64(),
+                );
+            }
+            Some(encoded)
+        } else {
+            None
+        };
+
+        std::thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::new();
+            for (worker_index, ordinal) in ordinals.iter().enumerate() {
+                let worker_root = output_dir.join(format!("gpu{ordinal}"));
+                let worker_telemetry = telemetry_json.as_ref().map(|path| {
+                    let file_name = path
+                        .file_name()
+                        .map(|name| format!("gpu{ordinal}-{}", name.to_string_lossy()))
+                        .unwrap_or_else(|| format!("gpu{ordinal}-telemetry.json"));
+                    path.with_file_name(file_name)
+                });
+                let device = Device::new_cuda(*ordinal)
+                    .with_context(|| format!("failed to initialize CUDA device {ordinal}"))?;
+                let device_run = DeviceRunContext {
+                    ordinals: ordinals.clone(),
+                    device,
+                    existing_run: worker_root.exists(),
+                    output_dir: worker_root,
+                    seed: seed.wrapping_add(worker_index as u64),
+                    prompt: prompt.clone(),
+                    tokenizer: &tokenizer,
+                    model: model.clone(),
+                    model_root: model_root.clone(),
+                    prompt_embeddings_pre_encoded: pre_encoded.as_ref(),
+                    token_ids: token_ids.clone(),
+                    sigma_points,
+                    video_shift,
+                    audio_shift,
+                    latent_frames,
+                    latent_height,
+                    latent_width,
+                    audio_frames,
+                    audio_channels,
+                    target_hidden_state,
+                    wav_format,
+                    max_device_mib,
+                    backend_workspace_mib,
+                    telemetry_json: worker_telemetry,
+                    no_progress,
+                    explain_config,
+                    resources: worker_resources.clone(),
+                    policy: policy.clone(),
+                    host_profile: host_profile.clone(),
+                    optional_weight_args,
+                    optional_chunks,
+                    no_precompute_adaln,
+                    flash_attention,
+                    max_host_mib,
+                };
+                handles.push(scope.spawn(move || run_single_device_pipeline(device_run)));
+            }
+            let mut first_error = None;
+            for handle in handles {
+                let outcome = handle
+                    .join()
+                    .map_err(|payload| anyhow::anyhow!("worker panicked: {payload:?}"))
+                    .and_then(|outcome| outcome);
+                if first_error.is_none() {
+                    first_error = outcome.err();
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            Ok(())
+        })?;
+        return Ok(());
+    }
+
+    // cpu/auto carry no ordinals; the single-device path owns the device as
+    // parsed. Its telemetry keeps the operator's path unprefixed.
+    let device_run = DeviceRunContext {
+        ordinals: ordinals.clone(),
+        device: device.clone(),
+        existing_run: output_dir.exists(),
+        output_dir: output_dir.clone(),
+        seed,
+        prompt: prompt.clone(),
+        tokenizer: &tokenizer,
+        model: model.clone(),
+        model_root: model_root.clone(),
+        prompt_embeddings_pre_encoded: None,
+        token_ids: token_ids.clone(),
+        sigma_points,
+        video_shift,
+        audio_shift,
+        latent_frames,
+        latent_height,
+        latent_width,
+        audio_frames,
+        audio_channels,
+        target_hidden_state,
+        wav_format,
+        max_device_mib,
+        backend_workspace_mib,
+        telemetry_json: telemetry_json.clone(),
+        no_progress,
+        explain_config,
+        resources: worker_resources.clone(),
+        policy: policy.clone(),
+        host_profile: host_profile.clone(),
+        optional_weight_args,
+        optional_chunks,
+        no_precompute_adaln,
+        flash_attention,
+        max_host_mib,
+    };
+    run_single_device_pipeline(device_run)
+}
+
+#[cfg(test)]
 fn create_frame_staging_directory(staging_dir: &Path) -> Result<PathBuf> {
     validate_staging_directory(staging_dir)?;
     for _ in 0..1024 {
@@ -2468,6 +3105,32 @@ fn create_frame_staging_directory(staging_dir: &Path) -> Result<PathBuf> {
     }
     bail!(
         "failed to allocate a unique frame staging directory in {}",
+        staging_dir.display()
+    )
+}
+
+fn create_vae_attempt_directory(staging_dir: &Path, attempt: usize) -> Result<PathBuf> {
+    for _ in 0..1024 {
+        let nonce = FRAME_STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = staging_dir.join(format!(
+            ".vae-attempt-{attempt}-{}-{nonce:016x}",
+            std::process::id()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create VAE attempt staging directory {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!(
+        "failed to allocate a unique VAE attempt staging directory in {}",
         staging_dir.display()
     )
 }
@@ -3517,6 +4180,17 @@ mod tests {
         let path = directory.join(format!("checkpoint-step{completed_steps:06}.safetensors"));
         publish_checkpoint_at(&path, completed_steps);
         path
+    }
+
+    #[test]
+    fn vae_attempt_directories_never_reuse_a_leftover_attempt_path() {
+        let staging_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(staging_dir.path().join(".vae-attempt-1")).unwrap();
+        let first = create_vae_attempt_directory(staging_dir.path(), 1).unwrap();
+        let second = create_vae_attempt_directory(staging_dir.path(), 1).unwrap();
+        assert_ne!(first, second);
+        assert!(first.is_dir());
+        assert!(second.is_dir());
     }
 
     #[test]

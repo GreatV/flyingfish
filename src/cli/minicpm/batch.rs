@@ -1,5 +1,5 @@
 use super::{Worker, WorkerOptions, encode_prompt};
-use crate::cli::device_parse::parse_device;
+use crate::cli::device_parse::parse_device_single;
 use crate::cli::output_hygiene::{
     ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
 };
@@ -187,7 +187,7 @@ pub(super) fn run(args: Args) -> Result<()> {
                 let mut guard = CancelOnFailure { cancelled, completed: false };
                 let mut worker = Worker::open(WorkerOptions {
                     model: &args.model, draft_model: args.draft_model.as_deref(), config: config.clone(),
-                    device: parse_device(name)?, weights: args.weights, device_cache: args.device_cache,
+                    device: parse_device_single(name)?, weights: args.weights, device_cache: args.device_cache,
                     query_chunk: args.attention_query_chunk_size, batch_invariant: args.batch_invariant_decode,
                 }, geometries)?;
                 while !cancelled.load(Ordering::Acquire) {

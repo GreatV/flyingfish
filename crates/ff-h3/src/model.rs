@@ -18,7 +18,7 @@ use ff_core::{
         WeightAccessStats, WeightSource,
     },
 };
-use std::{collections::BTreeMap, num::NonZeroUsize, ops::Range, path::Path};
+use std::{collections::BTreeMap, num::NonZeroUsize, ops::Range, path::Path, sync::Arc};
 
 pub const DEFAULT_OUTPUT_TOKEN_CHUNK_SIZE: usize = 256;
 pub const H3_FLASH_ATTENTION_BACKEND: &str = core::H3_FLASH_ATTENTION_BACKEND;
@@ -131,7 +131,7 @@ struct BlockExecutionContext<'a> {
 }
 
 pub struct StreamedTransformer {
-    weights: ModelWeights,
+    weights: Arc<ModelWeights>,
     config: TransformerConfig,
     plan: H3ExecutionPlan,
     device: Device,
@@ -401,7 +401,7 @@ impl StreamedTransformer {
             _ => None,
         };
         Ok(Self {
-            weights,
+            weights: Arc::new(weights),
             config,
             plan,
             device: options.device,

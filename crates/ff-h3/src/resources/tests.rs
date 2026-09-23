@@ -1080,7 +1080,7 @@ fn conditioned_rows_and_timestep_tables_are_charged_without_changing_t2va_defaul
 fn t2va_requirement_exposes_the_deriver_fields() {
     let estimate = default_estimate(1);
     let requirement =
-        H3T2vaRequirement::from_estimate(&estimate, 63_000_000_000, true, 0, None).unwrap();
+        H3T2vaRequirement::from_estimate(&estimate, 63_000_000_000, 0, true, 0, None).unwrap();
     use ff_core::configure::ModelRequirement as _;
     let traffic = &estimate.compute_and_traffic;
     assert_eq!(
@@ -1111,6 +1111,7 @@ fn machine_profile(host_bytes: u64, device_bytes: u64) -> ff_core::topology::Top
         fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu),
         host_memory_total_bytes: Some(host_bytes),
         cgroup_memory_limit_bytes: None,
+        peer_links: Vec::new(),
         devices: vec![TopologyDevice {
             ordinal: 0,
             backend: DeviceBackend::Cuda,
@@ -1129,7 +1130,7 @@ fn derivation_reproduces_the_measured_machine_configurations() {
     use ff_core::configure::{self, WeightSourceChoice};
     let gib = 1u64 << 30;
     let estimate = default_estimate(357);
-    let requirement = H3T2vaRequirement::from_estimate(&estimate, 0, true, 0, None).unwrap();
+    let requirement = H3T2vaRequirement::from_estimate(&estimate, 0, 0, true, 0, None).unwrap();
 
     let rtx4090 =
         configure::derive(0, &machine_profile(67_200_000_000, 24 * gib), &requirement).unwrap();
