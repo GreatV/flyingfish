@@ -1528,11 +1528,9 @@ impl DecodeStage<'_> {
                     match decode_result {
                         Ok((frames, dir)) => break Ok((frames, dir)),
                         Err(error) => {
-                            let is_oom = error.to_string().to_lowercase().contains("out of memory")
-                                || error
-                                    .to_string()
-                                    .to_lowercase()
-                                    .contains("cuda_error_out_of_memory");
+                            let chain = format!("{error:#}").to_lowercase();
+                            let is_oom = chain.contains("out of memory")
+                                || chain.contains("cuda_error_out_of_memory");
                             let next = cache_cap.filter(|_| is_oom).map(|c| c / 2);
                             match next {
                                 Some(new_cap) if new_cap >= (1 << 20) => {
@@ -2825,8 +2823,20 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         // The single-device path creates its output directory inside the
         // pipeline; the multi-device workers each create their own root under
         // a parent the orchestrator makes first. Existing directories stay as
-        // they are so a partial run can resume.
-        if !output_dir.exists() {
+        // they are so a partial run can resume. A pre-existing root that is
+        // not a recognised multi-device run is refused.
+        if output_dir.exists() {
+            let has_gpu_layout = ordinals
+                .iter()
+                .any(|ordinal| output_dir.join(format!("gpu{ordinal}")).is_dir());
+            let has_init = output_dir.join(GENERATION_INITIALIZATION_FILE).is_file();
+            anyhow::ensure!(
+                has_gpu_layout || has_init,
+                "multi-device generation output directory {} exists but has no gpu{{N}} \\
+                 subdirectories or initialization record",
+                output_dir.display()
+            );
+        } else {
             create_new_directory(&output_dir, "generation output directory")?;
         }
         for ordinal in &ordinals {
@@ -2839,7 +2849,8 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         // Surface admission refusals before paying for the shared encode, and
         // aggregate the per-worker host peaks against this machine. Each
         // worker is charged only for the evaluations its resume state leaves.
-        let mut aggregate_host_peak = 0u64;
+        let mut worker_peaks: Vec<u64> = Vec::new();
+        let mut shared_mapped_bytes = 0u64;
         let gate_weight_args = optional_weight_args.configured();
         for (worker_index, (ordinal, completed)) in ordinals.iter().zip(&worker_resume).enumerate()
         {
@@ -2888,10 +2899,16 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
                 },
             )?;
             if let Some(selection) = &selection {
-                aggregate_host_peak =
-                    aggregate_host_peak.saturating_add(selection.estimate.peak_host_bytes);
+                let mapped = selection.estimate.assumptions.mapped_weight_residency_bytes;
+                shared_mapped_bytes = shared_mapped_bytes.max(mapped);
+                worker_peaks.push(selection.estimate.peak_host_bytes.saturating_sub(mapped));
             }
         }
+        // The mapped weight residency is shared across workers (same files,
+        // same page cache, same process): it counts once in the aggregate.
+        // Each worker's remaining peak (workspace, activations) is exclusive.
+        let total_worker_peaks: u64 = worker_peaks.iter().sum();
+        let aggregate_host_peak = total_worker_peaks.saturating_add(shared_mapped_bytes);
         let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device));
         let available = snapshot
             .cgroup_v2_memory_available_bytes
