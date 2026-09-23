@@ -853,6 +853,8 @@ impl H3T2vaRequirement {
         estimate: &ResourceEstimate,
         encoder_weight_bytes: u64,
         flash_attention: bool,
+        backend_workspace_bytes: u64,
+        materialization_override: Option<u64>,
     ) -> Result<Self> {
         let traffic = &estimate.compute_and_traffic;
         let steady = traffic.transformer_weight_bytes_per_evaluation_with_adaln_precompute;
@@ -876,16 +878,20 @@ impl H3T2vaRequirement {
                     feed_forward,
                     output,
                 },
-                entry.peak_device_bytes,
+                entry
+                    .peak_device_bytes
+                    .saturating_add(backend_workspace_bytes),
             ));
         }
         Ok(Self {
             steady_weight_bytes: steady,
             single_pass_weight_bytes: single_pass,
-            memory_materialization_bytes: estimate
-                .weights
-                .checkpoint_bytes
-                .context("resource estimate carries no transformer checkpoint size")?,
+            memory_materialization_bytes: materialization_override.unwrap_or(
+                estimate
+                    .weights
+                    .checkpoint_bytes
+                    .context("resource estimate carries no transformer checkpoint size")?,
+            ),
             activation_peak_bytes: chunk_ladder
                 .last()
                 .map(|(_, peak)| *peak)

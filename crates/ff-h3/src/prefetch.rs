@@ -103,7 +103,7 @@ impl StagePrefetcher {
             })
             .transpose()?;
         self.slot = Some(Slot { tensors, ready });
-        Ok(())
+        Ok(skipped)
     }
 
     fn ensure_slab(&mut self, bytes: usize) -> Result<()> {

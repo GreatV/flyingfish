@@ -1079,7 +1079,8 @@ fn conditioned_rows_and_timestep_tables_are_charged_without_changing_t2va_defaul
 #[test]
 fn t2va_requirement_exposes_the_deriver_fields() {
     let estimate = default_estimate(1);
-    let requirement = H3T2vaRequirement::from_estimate(&estimate, 63_000_000_000, true).unwrap();
+    let requirement =
+        H3T2vaRequirement::from_estimate(&estimate, 63_000_000_000, true, 0, None).unwrap();
     use ff_core::configure::ModelRequirement as _;
     let traffic = &estimate.compute_and_traffic;
     assert_eq!(
@@ -1126,7 +1127,7 @@ fn derivation_reproduces_the_measured_machine_configurations() {
     use ff_core::configure::{self, WeightSourceChoice};
     let gib = 1u64 << 30;
     let estimate = default_estimate(357);
-    let requirement = H3T2vaRequirement::from_estimate(&estimate, 0, true).unwrap();
+    let requirement = H3T2vaRequirement::from_estimate(&estimate, 0, true, 0, None).unwrap();
 
     let rtx4090 =
         configure::derive(0, &machine_profile(67_200_000_000, 24 * gib), &requirement).unwrap();

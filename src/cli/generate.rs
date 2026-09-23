@@ -1677,6 +1677,7 @@ fn derive_t2va_configuration(
     model_root: &Path,
     geometry: T2vaGeometry,
     flash_attention: bool,
+    evaluations: usize,
     ordinal: usize,
     primary: &Device,
 ) -> Result<(ff_core::configure::DerivedConfig, Option<u64>)> {
@@ -1684,32 +1685,68 @@ fn derive_t2va_configuration(
         H3T2vaRequirement, ResourceAssumptions, ResourceEstimate, cache_charge,
     };
     let config = TransformerConfig::from_file(model_root.join("transformer/config.json"))?;
-    let estimate =
-        ResourceEstimate::for_t2va(&config, geometry, ResourceAssumptions::h3_bf16_mmap())?;
+    let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
+    assumptions.evaluation_count = evaluations as u64;
+    assumptions.precompute_adaln_steps = evaluations as u64;
+    let estimate = ResourceEstimate::for_t2va(&config, geometry, assumptions)?;
     let encoder_bytes = directory_tree_bytes(&model_root.join("text_encoder"))?;
-    let requirement = H3T2vaRequirement::from_estimate(&estimate, encoder_bytes, flash_attention)?;
+    // The catalog is header-only. Its payload total is the materialization
+    // rule 1 charges, and the residency charge reuses it for the bound.
+    let catalog = match flyingfish::runtime::weights::ModelWeights::open(
+        model_root.join("transformer"),
+        WeightSource::Memory,
+        CachePolicy::new(1),
+    )
+    .and_then(|weights| weights.cache_inventory())
+    {
+        Ok(inventory) => Some(inventory),
+        Err(error) => {
+            eprintln!(
+                "config: transformer catalog was not read ({}); the derivation falls back to \
+                 the checkpoint constants",
+                error
+            );
+            None
+        }
+    };
+    let materialization_bytes = catalog
+        .as_ref()
+        .map(|inventory| inventory.total_bytes(ff_core::weights::CacheGranularity::Tensor))
+        .transpose()?;
+    let workspace_bytes = if flash_attention {
+        super::DEFAULT_FLASH_BACKEND_WORKSPACE_MIB << 20
+    } else {
+        super::DEFAULT_NON_FLASH_BACKEND_WORKSPACE_MIB << 20
+    };
+    let requirement = H3T2vaRequirement::from_estimate(
+        &estimate,
+        encoder_bytes,
+        flash_attention,
+        workspace_bytes,
+        materialization_bytes,
+    )?;
     let profile = load_or_capture_topology(primary)?;
     let derived = ff_core::configure::derive(ordinal, &profile, &requirement)?;
     let host_bound_bytes = match (derived.weight_source, derived.host_cache_ceiling_bytes) {
         (ff_core::configure::WeightSourceChoice::Memory, Some(ceiling)) => {
             match (|| -> Result<u64> {
-                // The two steps admission itself performs: charge the cache at
-                // the backfilled cap's exact integer, then read the estimate's
-                // host peak with that charge. Both numbers agree bit for bit.
-                let weights = flyingfish::runtime::weights::ModelWeights::open(
-                    model_root.join("transformer"),
-                    WeightSource::Memory,
-                    CachePolicy::new(1),
-                )?;
-                let inventory = weights.cache_inventory()?;
+                let inventory = catalog
+                    .as_ref()
+                    .context("transformer catalog unavailable")?;
                 let charge = cache_charge(
-                    &inventory,
+                    inventory,
                     WeightSource::Memory,
                     CachePolicy::unbounded_units().with_max_bytes((ceiling >> 20) << 20),
                 )?;
                 let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
                 assumptions.host_weight_cache_bytes = charge.owned_weight_bytes;
-                Ok(ResourceEstimate::for_t2va(&config, geometry, assumptions)?.peak_host_bytes)
+                assumptions.evaluation_count = evaluations as u64;
+                assumptions.precompute_adaln_steps = evaluations as u64;
+                // The prefetcher's pinned slab grows to the largest stage.
+                let charged = ResourceEstimate::for_t2va(&config, geometry, assumptions)?;
+                Ok(charged
+                    .peak_host_bytes
+                    .saturating_add(charged.weights.peak_materialized_bytes))
             })() {
                 Ok(demand) => Some(demand),
                 Err(error) => {
@@ -1847,6 +1884,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
             &model_root,
             geometry,
             flash_attention,
+            sigma_points - 1,
             selected_device_ordinal,
             &device,
         )?;

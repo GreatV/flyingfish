@@ -101,14 +101,21 @@ impl TopologyProfile {
         }
         let bytes = std::fs::read(path)
             .with_context(|| format!("read topology profile {}", path.display()))?;
-        let recorded = Self::from_json(&bytes)
-            .with_context(|| format!("invalid topology profile {}", path.display()))?;
-        if recorded.schema_version != TOPOLOGY_PROFILE_SCHEMA_VERSION {
+        // The schema version is read loosely first: a newer schema's fields
+        // would fail the strict decode before the version check could name
+        // the real reason.
+        let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value.get("schema_version").and_then(|v| v.as_u64()))
+            .unwrap_or(0) as u32;
+        if version != TOPOLOGY_PROFILE_SCHEMA_VERSION {
             return Ok(Err(TopologyProfileAbsence::StaleSchema {
                 path: path.to_path_buf(),
-                recorded: recorded.schema_version,
+                recorded: version,
             }));
         }
+        let recorded = Self::from_json(&bytes)
+            .with_context(|| format!("invalid topology profile {}", path.display()))?;
         let current = HardwareFingerprint::collect(primary);
         if !describes_same_machine(&recorded.fingerprint, &current) {
             return Ok(Err(TopologyProfileAbsence::ForeignHost {

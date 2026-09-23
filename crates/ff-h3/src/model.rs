@@ -141,6 +141,8 @@ pub struct StreamedTransformer {
     device_residency_plan: Option<DeviceResidencyPlan>,
     host_residency_plan: Option<DeviceResidencyPlan>,
     #[cfg(feature = "cuda")]
+    precomputed_adaln: bool,
+    #[cfg(feature = "cuda")]
     prefetcher: Option<std::sync::Mutex<crate::prefetch::StagePrefetcher>>,
 }
 
@@ -156,6 +158,9 @@ pub struct StreamedTransformerOptions {
     pub device_cache_policy: DeviceCachePolicy,
     /// Protect recurrent raw weights in a bounded tensor-granularity host cache.
     pub host_phase_priority: bool,
+    /// Whether the denoise loop executes AdaLN stages through the prepared
+    /// schedule, which skips every BlockAdaLn stage of the plan.
+    pub precomputed_adaln: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -253,6 +258,7 @@ impl StreamedTransformerOptions {
             flash_attention: false,
             device_cache_policy: DeviceCachePolicy::DISABLED,
             host_phase_priority: false,
+            precomputed_adaln: false,
         }
     }
 
@@ -404,6 +410,8 @@ impl StreamedTransformer {
             flash_attention: options.flash_attention,
             device_residency_plan,
             host_residency_plan,
+            #[cfg(feature = "cuda")]
+            precomputed_adaln: options.precomputed_adaln,
             #[cfg(feature = "cuda")]
             prefetcher,
         })
@@ -1310,7 +1318,15 @@ impl StreamedTransformer {
         let load = load_started.elapsed();
         let fill_started = std::time::Instant::now();
         let mut skipped_resident = 0u64;
-        if let Some(next) = self.plan.stages().get(stage_index + 1) {
+        let mut kick_target = stage_index + 1;
+        if self.precomputed_adaln {
+            while let Some(stage) = self.plan.stages().get(kick_target)
+                && matches!(stage.kind, StageKind::BlockAdaLn(_))
+            {
+                kick_target += 1;
+            }
+        }
+        if let Some(next) = self.plan.stages().get(kick_target) {
             let next_names = next
                 .tensor_names
                 .iter()

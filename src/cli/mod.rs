@@ -694,6 +694,7 @@ fn build_transformer_options(
         flash_attention: policy.flash_attention(),
         device_cache_policy: policy.weights.device_cache,
         host_phase_priority: policy.weights.host_phase_priority,
+        precomputed_adaln: policy.precompute_adaln,
     })
 }
 
