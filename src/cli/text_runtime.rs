@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use candle_core::Device;
 
 /// The int4 text adapters drive CUDA through cudarc contexts.
@@ -65,14 +65,5 @@ fn ptx_floor_supported(_: &Device) -> bool {
 }
 
 pub(crate) fn greedy_token(logits: &[f32]) -> Result<u32> {
-    anyhow::ensure!(
-        logits.iter().all(|value| value.is_finite()),
-        "model produced non-finite logits"
-    );
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
-        .map(|(index, _)| index as u32)
-        .context("model produced no logits")
+    ff_core::math::argmax(logits)
 }

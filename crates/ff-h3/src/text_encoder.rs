@@ -245,6 +245,11 @@ impl StreamedTextEncoder {
         self.weights.access_stats()
     }
 
+    /// Drop shard pages behind the read cursor; for one-pass encode scans.
+    pub fn set_drop_evicted_pages(&mut self, enabled: bool) {
+        self.weights.drop_evicted_pages(enabled);
+    }
+
     pub fn encode_prompt(&self, tokenizer: &Tokenizer, prompt: &str) -> Result<PromptEncoding> {
         let encoding = tokenizer
             .encode(prompt, false)

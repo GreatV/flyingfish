@@ -197,8 +197,9 @@ impl Qwen35Weights {
         let (shape, _packed) = self.view_ref(&format!("{name}.weight"))?;
         ensure!(shape.len() == 2, "{name}.weight is not 2-D: {shape:?}");
         let out_dim = shape[0];
+        ensure!(out_dim > 0, "{name}.weight has zero rows");
         let (_s, scales) = self.view_ref(&format!("{name}.scales"))?;
-        let groups = scales.len() / 2 / out_dim.max(1);
+        let groups = scales.len() / 2 / out_dim;
         Ok((out_dim, groups * GROUP_SIZE))
     }
 
@@ -213,6 +214,18 @@ impl Qwen35Weights {
         let (_b, biases) = self.view_ref(&format!("{name}.biases"))?;
         let scales = bf16_to_f32(scales);
         let biases = bf16_to_f32(biases);
+        ensure!(out_dim > 0, "{name}.weight has zero rows");
+        ensure!(
+            scales.len().is_multiple_of(out_dim),
+            "{name}.scales has {} rows, not a multiple of out_dim {out_dim}",
+            scales.len()
+        );
+        ensure!(
+            biases.len() == scales.len(),
+            "{name}.biases has {} rows but .scales has {}",
+            biases.len(),
+            scales.len()
+        );
         let groups = scales.len() / out_dim;
         let in_dim = groups * GROUP_SIZE;
         ensure!(

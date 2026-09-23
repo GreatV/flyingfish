@@ -279,7 +279,7 @@ fn run_cuda(args: Args, ordinals: Vec<usize>) -> Result<()> {
     let write = |path: &std::path::Path, bytes: &[u8]| -> Result<()> {
         let staging =
             ArtifactStaging::new(path).with_context(|| format!("stage {}", path.display()))?;
-        super::publish_staged_bytes(staging, bytes)?;
+        super::output_hygiene::publish_staged_bytes(staging, bytes)?;
         Ok(())
     };
     let options = GlmGenerationOptions {

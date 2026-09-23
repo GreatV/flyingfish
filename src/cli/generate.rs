@@ -1150,8 +1150,8 @@ fn load_or_initialize_state(
     audio_frames: usize,
     audio_channels: usize,
     seed: u64,
-    weight_source: WeightSource,
-    execution_cache_policy: CachePolicy,
+    _weight_source: WeightSource,
+    _execution_cache_policy: CachePolicy,
     transformer_chunking: TransformerChunking,
 ) -> Result<GenerationState> {
     Ok(match resume_checkpoint {
@@ -1173,14 +1173,19 @@ fn load_or_initialize_state(
         }
         None => {
             let encode_start = Instant::now();
-            let encoder = StreamedTextEncoder::open(
+            // Encode is one-pass: every encoder weight is read exactly once,
+            // so stream mmap with drop-behind instead of retaining 63 GiB.
+            // A one-shard policy evicts behind the scan; the transformer's
+            // own cache policy would let encoder pages compete with it.
+            let mut encoder = StreamedTextEncoder::open(
                 resolve_component(model, Path::new("text_encoder"))?,
-                weight_source,
-                execution_cache_policy,
+                WeightSource::Mmap,
+                CachePolicy::new(1),
                 device.clone(),
                 target_hidden_state,
                 transformer_chunking.attention.query_chunk_size.get(),
             )?;
+            encoder.set_drop_evicted_pages(true);
             let encoded = encoder.encode_prompt(tokenizer, prompt)?;
             anyhow::ensure!(
                 encoded.token_ids == token_ids,
@@ -1594,6 +1599,219 @@ impl DecodeExpectations {
     }
 }
 
+fn device_ordinal(device: &str) -> usize {
+    device
+        .strip_prefix("cuda:")
+        .and_then(|ordinal| ordinal.parse().ok())
+        .unwrap_or(0)
+}
+
+fn directory_tree_bytes(root: &Path) -> Result<u64> {
+    if !root
+        .try_exists()
+        .with_context(|| format!("failed to inspect {}", root.display()))?
+    {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    let mut queue = vec![root.to_path_buf()];
+    while let Some(path) = queue.pop() {
+        let entries =
+            fs::read_dir(&path).with_context(|| format!("failed to list {}", path.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("failed to list {}", path.display()))?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+            let metadata = entry
+                .metadata()
+                .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+            if file_type.is_dir() {
+                queue.push(entry.path());
+            } else {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn load_or_capture_topology(
+    primary: &Device,
+) -> Result<flyingfish::runtime::topology::TopologyProfile> {
+    use flyingfish::runtime::topology::TopologyProfile;
+    let Some(path) = std::env::var_os("FF_TOPOLOGY_PROFILE") else {
+        return Ok(TopologyProfile::capture(primary));
+    };
+    let path = std::path::PathBuf::from(path);
+    match TopologyProfile::load(&path, primary)? {
+        Ok(profile) => Ok(profile),
+        Err(absence) => {
+            eprintln!(
+                "topology profile {} is not reusable ({}); recapturing",
+                path.display(),
+                match absence {
+                    flyingfish::runtime::topology::TopologyProfileAbsence::NotFound(_) => {
+                        "absent"
+                    }
+                    flyingfish::runtime::topology::TopologyProfileAbsence::ForeignHost {
+                        ..
+                    } => {
+                        "recorded on another machine"
+                    }
+                    flyingfish::runtime::topology::TopologyProfileAbsence::StaleSchema {
+                        ..
+                    } => {
+                        "recorded under an older schema"
+                    }
+                    flyingfish::runtime::topology::TopologyProfileAbsence::CgroupLimitChanged {
+                        ..
+                    } => {
+                        "recorded under a different cgroup memory limit"
+                    }
+                }
+            );
+            let profile = TopologyProfile::capture(primary);
+            profile.save(&path)?;
+            Ok(profile)
+        }
+    }
+}
+
+struct T2vaDerivation<'a> {
+    model_root: &'a Path,
+    geometry: T2vaGeometry,
+    flash_attention: bool,
+    evaluations: usize,
+    max_host_mib: Option<u64>,
+    max_device_mib: Option<u64>,
+    ordinal: usize,
+}
+
+fn derive_t2va_configuration(
+    request: T2vaDerivation<'_>,
+    primary: &Device,
+) -> Result<(ff_core::configure::DerivedConfig, Option<u64>)> {
+    use flyingfish::h3::resources::{
+        H3T2vaRequirement, ResourceAssumptions, ResourceEstimate, cache_charge,
+    };
+    let T2vaDerivation {
+        model_root,
+        geometry,
+        flash_attention,
+        evaluations,
+        max_host_mib,
+        max_device_mib,
+        ordinal,
+    } = request;
+    let config = TransformerConfig::from_file(model_root.join("transformer/config.json"))?;
+    let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
+    assumptions.evaluation_count = evaluations as u64;
+    assumptions.precompute_adaln_steps = evaluations as u64;
+    if !primary.is_cuda() {
+        // The CPU preflight promotes weights to F32 and folds the device
+        // peak into the host ledger; the bound mirrors that accounting.
+        assumptions.weight_element_bytes = 4;
+        assumptions.device_memory_is_host = true;
+    }
+    let estimate = ResourceEstimate::for_t2va(&config, geometry, assumptions)?;
+    let encoder_bytes = directory_tree_bytes(&model_root.join("text_encoder"))?;
+    // The catalog is header-only. Its payload total is the materialization
+    // rule 1 charges, and the residency charge reuses it for the bound.
+    let catalog = match flyingfish::runtime::weights::ModelWeights::open(
+        model_root.join("transformer"),
+        WeightSource::Memory,
+        CachePolicy::new(1),
+    )
+    .and_then(|weights| weights.cache_inventory())
+    {
+        Ok(inventory) => Some(inventory),
+        Err(error) => {
+            eprintln!(
+                "config: transformer catalog was not read ({}); the derivation falls back to \
+                 the checkpoint constants",
+                error
+            );
+            None
+        }
+    };
+    let materialization_bytes = catalog
+        .as_ref()
+        .map(|inventory| -> Result<u64> {
+            // Shard-granularity retention holds whole files: the payload
+            // total plus every safetensors header.
+            let payload = inventory.total_bytes(ff_core::weights::CacheGranularity::Tensor)?;
+            let headers = inventory
+                .shards
+                .iter()
+                .map(|shard| shard.header_bytes)
+                .sum::<u64>();
+            Ok(payload.saturating_add(headers))
+        })
+        .transpose()?;
+    let workspace_bytes = if flash_attention {
+        super::DEFAULT_FLASH_BACKEND_WORKSPACE_MIB << 20
+    } else {
+        super::DEFAULT_NON_FLASH_BACKEND_WORKSPACE_MIB << 20
+    };
+    let requirement = H3T2vaRequirement::from_estimate(
+        &estimate,
+        encoder_bytes,
+        flash_attention,
+        workspace_bytes,
+        materialization_bytes,
+    )?;
+    let mut profile = load_or_capture_topology(primary)?;
+    // Operator caps bound what the derivation may hand out; the profile the
+    // rules see is the capped machine, not the physical one.
+    if let Some(mib) = max_host_mib {
+        profile.host_memory_total_bytes = profile
+            .host_memory_total_bytes
+            .map(|total| total.min(mib << 20));
+    }
+    if let Some(mib) = max_device_mib
+        && let Some(device) = profile.devices.get_mut(ordinal)
+        && let Some(total) = device.total_memory_bytes
+    {
+        device.total_memory_bytes = Some(total.min(mib << 20));
+    }
+    let derived = ff_core::configure::derive(ordinal, &profile, &requirement)?;
+    let host_bound_bytes = match (derived.weight_source, derived.host_cache_ceiling_bytes) {
+        (ff_core::configure::WeightSourceChoice::Memory, Some(ceiling)) => {
+            match (|| -> Result<u64> {
+                let inventory = catalog
+                    .as_ref()
+                    .context("transformer catalog unavailable")?;
+                let charge = cache_charge(
+                    inventory,
+                    WeightSource::Memory,
+                    CachePolicy::unbounded_units().with_max_bytes((ceiling >> 20) << 20),
+                )?;
+                let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
+                assumptions.host_weight_cache_bytes = charge.owned_weight_bytes;
+                assumptions.evaluation_count = evaluations as u64;
+                assumptions.precompute_adaln_steps = evaluations as u64;
+                // The prefetcher's pinned slab grows to the largest stage.
+                let charged = ResourceEstimate::for_t2va(&config, geometry, assumptions)?;
+                Ok(charged
+                    .peak_host_bytes
+                    .saturating_add(charged.weights.peak_materialized_bytes))
+            })() {
+                Ok(demand) => Some(demand),
+                Err(error) => {
+                    eprintln!(
+                        "config: host bound was not derived ({}); the admission default applies",
+                        error
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    Ok((derived, host_bound_bytes))
+}
+
 pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     let H3Command::GenerateT2va {
         resources,
@@ -1619,6 +1837,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         no_precompute_adaln,
         flash_attention,
         no_progress,
+        explain_config,
         telemetry_json,
         max_host_mib,
         max_device_mib,
@@ -1677,6 +1896,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     }
     anyhow::ensure!(sigma_points >= 2, "sigma_points must be at least two");
 
+    let selected_device_ordinal = device_ordinal(&device);
     let device = parse_device(&device)?;
     let tokenizer_path = required_model_file(&model, Path::new("tokenizer/tokenizer.json"))?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| {
@@ -1699,6 +1919,75 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         || optional_chunks.is_explicit()
         || no_precompute_adaln
         || flash_attention;
+    let mut derived_host_bound_mib: Option<u64> = None;
+    let derived = if explicit_policy {
+        None
+    } else {
+        let mut geometry = T2vaGeometry::h3_default(token_ids.len());
+        geometry.latent_frames = latent_frames;
+        geometry.latent_height = latent_height;
+        geometry.latent_width = latent_width;
+        geometry.audio_frames = audio_frames;
+        geometry.audio_channels = audio_channels;
+        let (derived, host_bound_bytes) = derive_t2va_configuration(
+            T2vaDerivation {
+                model_root: &model_root,
+                geometry,
+                flash_attention,
+                evaluations: sigma_points - 1,
+                max_host_mib,
+                max_device_mib,
+                ordinal: selected_device_ordinal,
+            },
+            &device,
+        )?;
+        derived_host_bound_mib = host_bound_bytes.map(|bytes| bytes.div_ceil(1 << 20));
+        Some(derived)
+    };
+    let derived_source = derived.as_ref().map(|derived| match derived.weight_source {
+        ff_core::configure::WeightSourceChoice::Memory => WeightSource::Memory,
+        ff_core::configure::WeightSourceChoice::Mmap => WeightSource::Mmap,
+    });
+    let effective_source = optional_weight_args.weight_source.or(derived_source);
+    let derived_host_cache_mib = matches!(effective_source, Some(WeightSource::Memory))
+        .then(|| {
+            derived
+                .as_ref()
+                .and_then(|derived| derived.host_cache_ceiling_bytes)
+                .map(|bytes| bytes.div_ceil(1 << 20))
+        })
+        .flatten();
+    let optional_weight_args =
+        optional_weight_args.with_derived(derived_source, derived_host_cache_mib);
+    let optional_chunks = optional_chunks.with_derived(derived.as_ref().and_then(|d| d.chunks));
+    let max_host_mib = max_host_mib.or(derived_host_bound_mib);
+    if let Some(bound_bytes) = derived_host_bound_mib.map(|mib| mib << 20) {
+        let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device));
+        let available = snapshot
+            .cgroup_v2_memory_available_bytes
+            .into_iter()
+            .chain(snapshot.host_memory_available_bytes)
+            .min();
+        if let Some(available) = available
+            && bound_bytes > available
+        {
+            eprintln!(
+                "config: derived host bound {} B exceeds available host memory {} B; \
+                 expect swapping unless the host frees up",
+                bound_bytes, available
+            );
+        }
+    }
+    if explain_config {
+        match &derived {
+            Some(derived) => {
+                for step in &derived.provenance {
+                    eprintln!("config: {step}");
+                }
+            }
+            None => eprintln!("config: policy is operator-pinned; derivation skipped"),
+        }
+    }
     let weight_args = optional_weight_args.configured();
     let chunks = optional_chunks.configured(flash_attention);
     let requested_policy = resolve_execution_policy(

@@ -16,6 +16,8 @@ pub mod model;
 pub mod multimodal_text_encoder;
 pub mod pipeline;
 pub mod policy;
+#[cfg(feature = "cuda")]
+pub(crate) mod prefetch;
 pub mod ref2va;
 pub mod resources;
 pub mod scheduler;
@@ -23,6 +25,7 @@ pub mod solver;
 pub mod target_geometry;
 pub mod tensor_parallel;
 pub mod text_encoder;
+pub mod timing;
 mod vae_tiling;
 pub mod video_vae;
 pub mod video_vae_encoder;

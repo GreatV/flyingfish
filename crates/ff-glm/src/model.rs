@@ -18,7 +18,7 @@ use candle_core::{D, DType, Device, Tensor};
 use candle_nn::ops;
 use ff_core::probe::ResourceSnapshot;
 use ff_core::weights::{CachePolicy, CacheStats, ModelWeights, WeightAccessStats, WeightSource};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{SeedableRng, rngs::StdRng};
 use std::ops::Not;
 use std::{
     cmp::Ordering,
@@ -2763,72 +2763,18 @@ fn argmax_token(logits: &Tensor) -> Result<u32> {
         .to_dtype(DType::F32)?
         .to_device(&Device::Cpu)?
         .to_vec1::<f32>()?;
-    ensure!(
-        values.iter().all(|value| value.is_finite()),
-        "GLM logits contain a non-finite value"
-    );
-    ensure!(!values.is_empty(), "GLM logits are empty");
-    let mut index = 0usize;
-    for (candidate, value) in values.iter().enumerate().skip(1) {
-        if *value > values[index] {
-            index = candidate;
-        }
-    }
-    u32::try_from(index).context("GLM token id exceeds u32")
+    ff_core::math::argmax(&values)
 }
 
 fn sample_token(logits: &Tensor, temperature: f64, top_p: f64, rng: &mut StdRng) -> Result<u32> {
     if temperature == 0.0 {
         return argmax_token(logits);
     }
-    ensure!(
-        temperature.is_finite() && temperature > 0.0 && temperature.recip().is_finite(),
-        "GLM sampling temperature must be positive and safely invertible"
-    );
     let values = logits
         .to_dtype(DType::F32)?
         .to_device(&Device::Cpu)?
         .to_vec1::<f32>()?;
-    ensure!(!values.is_empty(), "GLM logits are empty");
-    ensure!(
-        values.iter().all(|value| value.is_finite()),
-        "GLM logits contain a non-finite value"
-    );
-    let inverse_temperature = 1.0 / temperature;
-    let mut order = (0..values.len()).collect::<Vec<_>>();
-    order.sort_unstable_by(|&left, &right| values[right].total_cmp(&values[left]));
-    let maximum = values[order[0]] as f64 * inverse_temperature;
-    let mut probabilities = order
-        .iter()
-        .map(|&index| (values[index] as f64 * inverse_temperature - maximum).exp())
-        .collect::<Vec<_>>();
-    let total = probabilities.iter().sum::<f64>();
-    ensure!(
-        total.is_finite() && total > 0.0,
-        "GLM softmax normalization is invalid"
-    );
-    for probability in &mut probabilities {
-        *probability /= total;
-    }
-    let mut retained = 0usize;
-    let mut cumulative = 0.0;
-    for probability in &probabilities {
-        cumulative += *probability;
-        retained += 1;
-        if cumulative >= top_p {
-            break;
-        }
-    }
-    let retained_total = probabilities[..retained].iter().sum::<f64>();
-    let target = rng.random::<f64>() * retained_total;
-    let mut cumulative = 0.0;
-    for (rank, probability) in probabilities[..retained].iter().enumerate() {
-        cumulative += *probability;
-        if target <= cumulative {
-            return u32::try_from(order[rank]).context("GLM token id exceeds u32");
-        }
-    }
-    u32::try_from(order[retained - 1]).context("GLM token id exceeds u32")
+    ff_core::math::nucleus_sample(&values, temperature, top_p, rng)
 }
 
 #[cfg(test)]

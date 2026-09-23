@@ -140,6 +140,10 @@ pub struct StreamedTransformer {
     flash_attention: bool,
     device_residency_plan: Option<DeviceResidencyPlan>,
     host_residency_plan: Option<DeviceResidencyPlan>,
+    #[cfg(feature = "cuda")]
+    precomputed_adaln: bool,
+    #[cfg(feature = "cuda")]
+    prefetcher: Option<std::sync::Mutex<crate::prefetch::StagePrefetcher>>,
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +158,9 @@ pub struct StreamedTransformerOptions {
     pub device_cache_policy: DeviceCachePolicy,
     /// Protect recurrent raw weights in a bounded tensor-granularity host cache.
     pub host_phase_priority: bool,
+    /// Whether the denoise loop executes AdaLN stages through the prepared
+    /// schedule, which skips every BlockAdaLn stage of the plan.
+    pub precomputed_adaln: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -251,6 +258,7 @@ impl StreamedTransformerOptions {
             flash_attention: false,
             device_cache_policy: DeviceCachePolicy::DISABLED,
             host_phase_priority: false,
+            precomputed_adaln: false,
         }
     }
 
@@ -376,6 +384,22 @@ impl StreamedTransformer {
         } else {
             None
         };
+        #[cfg(feature = "cuda")]
+        let prefetcher = match &options.device {
+            Device::Cuda(cuda) if crate::prefetch::requested() => {
+                match crate::prefetch::StagePrefetcher::new(cuda) {
+                    Ok(prefetcher) => Some(std::sync::Mutex::new(prefetcher)),
+                    Err(error) => {
+                        eprintln!(
+                            "H3 stage prefetch is unavailable ({}); streaming without it",
+                            error
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         Ok(Self {
             weights,
             config,
@@ -386,6 +410,10 @@ impl StreamedTransformer {
             flash_attention: options.flash_attention,
             device_residency_plan,
             host_residency_plan,
+            #[cfg(feature = "cuda")]
+            precomputed_adaln: options.precomputed_adaln,
+            #[cfg(feature = "cuda")]
+            prefetcher,
         })
     }
 
@@ -519,6 +547,7 @@ impl StreamedTransformer {
             )
         })?;
 
+        self.finish_timing_phase("context", None);
         Ok(PreparedTransformerContext {
             refined_text,
             rotary_cos,
@@ -599,6 +628,7 @@ impl StreamedTransformer {
                 Ok(())
             })?;
         }
+        self.finish_timing_phase("adaln_schedule", None);
         Ok(PreparedDenoiseSchedule { steps })
     }
 
@@ -613,7 +643,7 @@ impl StreamedTransformer {
             self.project_latents(tensors, inputs)
         })?;
         let timestep = self.project_timestep(inputs.timestep)?;
-        self.forward_projected(
+        let output = self.forward_projected(
             prepared,
             inputs,
             ProjectedStepInputs {
@@ -622,7 +652,9 @@ impl StreamedTransformer {
                 timestep,
             },
             None,
-        )
+        )?;
+        self.finish_timing_phase("eval", None);
+        Ok(output)
     }
 
     pub fn forward_precomputed_step(
@@ -646,7 +678,7 @@ impl StreamedTransformer {
             self.project_latents(tensors, inputs)
         })?;
         let timestep = step.timestep_embedding.to_device(&self.device)?;
-        self.forward_projected(
+        let output = self.forward_projected(
             prepared,
             inputs,
             ProjectedStepInputs {
@@ -655,7 +687,9 @@ impl StreamedTransformer {
                 timestep,
             },
             Some(&step.modulations),
-        )
+        )?;
+        self.finish_timing_phase("eval", Some(step_index));
+        Ok(output)
     }
 
     fn forward_projected(
@@ -1212,17 +1246,127 @@ impl StreamedTransformer {
         Ok(())
     }
 
+    fn finish_timing_phase(&self, phase: &'static str, step: Option<usize>) {
+        if !crate::timing::enabled() {
+            return;
+        }
+        let cache = serde_json::to_value(self.weights.device_cache_stats()).ok();
+        crate::timing::finish_phase_with_cache(phase, step, cache);
+    }
+
     fn execute_stage<T>(
         &self,
         stage_index: usize,
         mut f: impl FnMut(&ExecutionStage, &BTreeMap<String, Tensor>) -> Result<T>,
     ) -> Result<T> {
+        #[cfg(feature = "cuda")]
+        if let Some(prefetcher) = self.prefetcher.as_ref() {
+            return self.execute_stage_prefetched(prefetcher, stage_index, f);
+        }
+        if crate::timing::enabled() {
+            let mut record =
+                |bucket: &'static str, load: std::time::Duration, compute: std::time::Duration| {
+                    crate::timing::record_stage(bucket, load, compute);
+                };
+            return self.plan.with_stage_timed(
+                &self.weights,
+                stage_index,
+                &self.device,
+                &mut record,
+                |stage, tensors| self.compute_with_oom_recovery(stage, tensors, &mut f),
+            );
+        }
         self.plan.with_stage(
             &self.weights,
             stage_index,
             &self.device,
             |stage, tensors| self.compute_with_oom_recovery(stage, tensors, &mut f),
         )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn execute_stage_prefetched<T>(
+        &self,
+        prefetcher: &std::sync::Mutex<crate::prefetch::StagePrefetcher>,
+        stage_index: usize,
+        mut f: impl FnMut(&ExecutionStage, &BTreeMap<String, Tensor>) -> Result<T>,
+    ) -> Result<T> {
+        let stage = self
+            .plan
+            .stages()
+            .get(stage_index)
+            .with_context(|| format!("execution stage {stage_index} is out of range"))?;
+        let names = stage
+            .tensor_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut prefetcher = prefetcher.lock().expect("H3 prefetcher lock");
+        let timed = crate::timing::enabled();
+        let load_started = std::time::Instant::now();
+        let prefetched = prefetcher.take(&names)?;
+        let missing = names
+            .iter()
+            .copied()
+            .filter(|name| !prefetched.contains_key(*name))
+            .collect::<Vec<_>>();
+        let mut loaded = ff_core::residency::materialize(&self.weights, &missing, &self.device)?;
+        loaded.extend(prefetched);
+        if timed {
+            self.device.synchronize()?;
+        }
+        let load = load_started.elapsed();
+        let fill_started = std::time::Instant::now();
+        let mut skipped_resident = 0u64;
+        let mut kick_target = stage_index + 1;
+        // In the precomputed denoise loop the next executed stage after the
+        // latent input and each feed-forward is not the following AdaLN but
+        // the one after it. Everywhere else — the preparation sequence and
+        // the AdaLN stages themselves — the next plan slot is what runs.
+        let skip_adaln = self.precomputed_adaln
+            && matches!(
+                self.plan.stages().get(stage_index).map(|stage| &stage.kind),
+                Some(StageKind::LatentInput | StageKind::BlockFeedForward(_))
+            );
+        if skip_adaln {
+            while let Some(stage) = self.plan.stages().get(kick_target)
+                && matches!(stage.kind, StageKind::BlockAdaLn(_))
+            {
+                kick_target += 1;
+            }
+        }
+        if let Some(next) = self.plan.stages().get(kick_target) {
+            let next_names = next
+                .tensor_names
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            // A failed kick — typically an allocation that cannot fit beside
+            // the live stage — degrades this one prefetch to the streaming
+            // path; the next stage's take finds an empty slot and loads.
+            match prefetcher.prefetch(&self.weights, &next_names) {
+                Ok(skipped) => skipped_resident = skipped,
+                Err(error) => {
+                    eprintln!("H3 stage prefetch skipped ({error:#}); the next stage streams");
+                }
+            }
+        }
+        let fill = fill_started.elapsed();
+        if timed {
+            crate::timing::record_prefetch(1, missing.len() as u64, skipped_resident, fill);
+        }
+        let compute_started = std::time::Instant::now();
+        let result = self.compute_with_oom_recovery(stage, &loaded, &mut f);
+        if timed {
+            self.device.synchronize()?;
+            crate::timing::record_stage(
+                stage.kind.timing_bucket(),
+                load,
+                compute_started.elapsed(),
+            );
+        }
+        drop(prefetcher);
+        result
     }
 
     fn compute_with_oom_recovery<T>(

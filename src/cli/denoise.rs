@@ -400,6 +400,7 @@ impl DenoiseObserver for EvaluationCheckpointObserver<'_> {
         let destination = directory.join(format!(
             "checkpoint-step{completed_evaluations:06}.safetensors"
         ));
+        let write_started = std::time::Instant::now();
         let (published, identity) = publish_t2va_checkpoint(
             &destination,
             self.staging_parent.as_deref(),
@@ -415,6 +416,11 @@ impl DenoiseObserver for EvaluationCheckpointObserver<'_> {
         .with_context(|| {
             format!("failed to publish evaluation checkpoint {completed_evaluations}")
         })?;
+        flyingfish::h3::timing::record_checkpoint_write(
+            u64::try_from(completed_evaluations)
+                .context("completed evaluation count exceeds u64")?,
+            write_started.elapsed(),
+        );
         anyhow::ensure!(
             identity.completed_evaluations
                 == u64::try_from(completed_evaluations)

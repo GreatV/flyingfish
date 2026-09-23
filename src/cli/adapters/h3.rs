@@ -416,6 +416,9 @@ pub(in crate::cli) enum H3Command {
         flash_attention: bool,
         #[arg(long)]
         no_progress: bool,
+        #[arg(help = "Print the topology-derived configuration and its provenance to stderr")]
+        #[arg(long)]
+        explain_config: bool,
         #[arg(help = "Write sampled RSS/CUDA peaks as JSON after a successful run")]
         #[arg(long)]
         telemetry_json: Option<PathBuf>,
