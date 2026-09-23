@@ -922,17 +922,20 @@ impl ff_core::configure::ModelRequirement for H3T2vaRequirement {
     fn largest_chunk_plan_within(
         &self,
         activation_budget_bytes: u64,
-    ) -> Result<Option<ff_core::configure::ChunkPlan>> {
+    ) -> Result<Option<ff_core::configure::SelectedChunkPlan>> {
         Ok(self
             .chunk_ladder
             .iter()
             .filter(|(_, peak)| *peak <= activation_budget_bytes)
-            .map(|(plan, _)| *plan)
-            .max_by_key(|plan| plan.feed_forward)
+            .max_by_key(|(plan, _)| plan.feed_forward)
             // Nothing fits: hand over the smallest plan rather than the
             // caller's static defaults, which are the most expensive ones.
             // Admission still sees the real peak and refuses honestly.
-            .or_else(|| self.chunk_ladder.first().map(|(plan, _)| *plan)))
+            .or_else(|| self.chunk_ladder.first())
+            .map(|(plan, peak)| ff_core::configure::SelectedChunkPlan {
+                plan: *plan,
+                peak_device_bytes: *peak,
+            }))
     }
 
     fn memory_materialization_bytes(&self) -> Result<u64> {

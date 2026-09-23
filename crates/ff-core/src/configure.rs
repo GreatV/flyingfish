@@ -37,9 +37,13 @@ pub trait ModelRequirement {
     }
 
     /// The largest chunk plan whose activation peak fits
-    /// `activation_budget_bytes`, or `None` when the architecture models no
-    /// chunk ladder (derivation rule 2 keeps the defaults then).
-    fn largest_chunk_plan_within(&self, activation_budget_bytes: u64) -> Result<Option<ChunkPlan>> {
+    /// `activation_budget_bytes`, with that plan's own peak; `None` when the
+    /// architecture models no chunk ladder (derivation rule 2 keeps the
+    /// defaults then).
+    fn largest_chunk_plan_within(
+        &self,
+        activation_budget_bytes: u64,
+    ) -> Result<Option<SelectedChunkPlan>> {
         let _ = activation_budget_bytes;
         Ok(None)
     }
@@ -57,6 +61,15 @@ pub struct ChunkPlan {
     pub attention_projection: usize,
     pub feed_forward: usize,
     pub output: usize,
+}
+
+/// A selected chunk plan and the activation peak it was measured with, so
+/// rule 2 can report the selected peak while rule 3 keeps the conservative
+/// ladder-top figure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectedChunkPlan {
+    pub plan: ChunkPlan,
+    pub peak_device_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,26 +170,32 @@ pub fn derive(
         Some(device_memory) => {
             let device_reserve = admission_reserve_bytes(Some(device_memory));
             let activation_budget = device_memory.saturating_sub(device_reserve);
-            let chunks = requirement.largest_chunk_plan_within(activation_budget)?;
-            let peak = requirement.activation_peak_bytes()?;
-            let over_budget = chunks.is_some() && peak > activation_budget;
-            let detail = if over_budget {
-                format!(
+            let selected = requirement.largest_chunk_plan_within(activation_budget)?;
+            // Rule 3's residency figure stays on the ladder-top peak: it is
+            // the conservative envelope the planner charges against.
+            let _top_peak = requirement.activation_peak_bytes()?;
+            let detail = match &selected {
+                Some(selected) if selected.peak_device_bytes > activation_budget => format!(
                     "activation budget {activation_budget} B of {device_memory} B selects \
-                     {chunks:?} at peak {peak} B; no modeled plan fits, so the smallest is \
-                     selected and admission is expected to refuse"
-                )
-            } else {
-                format!(
+                     {:?} at its own peak {} B; no modeled plan fits, so the smallest is \
+                     selected and admission is expected to refuse",
+                    selected.plan, selected.peak_device_bytes
+                ),
+                Some(selected) => format!(
                     "activation budget {activation_budget} B of {device_memory} B selects \
-                     {chunks:?} at peak {peak} B"
-                )
+                     {:?} at peak {} B",
+                    selected.plan, selected.peak_device_bytes
+                ),
+                None => format!(
+                    "activation budget {activation_budget} B of {device_memory} B; the \
+                     architecture models no chunk plan, defaults apply"
+                ),
             };
             provenance.push(DerivationStep {
                 rule: "rule-2-chunks",
                 detail,
             });
-            chunks
+            selected.map(|selected| selected.plan)
         }
         None => {
             provenance.push(DerivationStep {

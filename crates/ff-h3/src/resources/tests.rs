@@ -1157,6 +1157,23 @@ fn derivation_reproduces_the_measured_machine_configurations() {
     assert_eq!(dual_a4000_host.weight_source, WeightSourceChoice::Mmap);
     assert_eq!(dual_a4000_host.host_cache_ceiling_bytes, None);
 
+    // A 3.5 GiB card fits only the middle of the ladder: the selection peak
+    // is the selected plan's own, not the ladder top.
+    let tiny_card = configure::derive(
+        0,
+        &machine_profile(67_200_000_000, 3_758_096_384),
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(
+        tiny_card.chunks,
+        Some(configure::ChunkPlan {
+            attention_projection: 2048,
+            feed_forward: 512,
+            output: 1024
+        })
+    );
+
     let knife_edge_host =
         configure::derive(0, &machine_profile(62 * gib, 24 * gib), &requirement).unwrap();
     assert_eq!(knife_edge_host.weight_source, WeightSourceChoice::Mmap);
