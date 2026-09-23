@@ -319,7 +319,7 @@ fn parse_topo_matrix(text: &str, device_count: usize) -> Vec<Option<LinkClass>> 
             }
             let class = match token {
                 value if value.starts_with("NV") => Some(LinkClass::Nvlink),
-                "PIX" | "PHB" | "NODE" | "SYS" => Some(LinkClass::PciExpress),
+                "PIX" | "PHB" | "PXB" | "NODE" | "SYS" => Some(LinkClass::PciExpress),
                 _ => None,
             };
             labels[row * device_count + column_device] = class;

@@ -215,28 +215,41 @@ pub fn derive(
             });
             // Rule 6: the decode-stage model runs after the denoise phases
             // end, so the device it sees is free of the denoise residency.
-            let vae_resident = (vae_weight_bytes > 0
-                && vae_weight_bytes + admission_reserve_bytes(Some(device_memory))
-                    <= device_memory)
-                .then_some(vae_weight_bytes);
+            // The cache cap must leave room for the decode workspace and the
+            // admission reserve beside the VAE weights.
+            let decode_workspace = vae_weight_bytes / 4;
+            let vae_resident = if vae_weight_bytes > 0 {
+                let available_for_vae = device_memory
+                    .saturating_sub(device_reserve)
+                    .saturating_sub(decode_workspace);
+                (available_for_vae >= vae_weight_bytes).then_some(vae_weight_bytes)
+            } else {
+                None
+            };
             let vae_detail = if vae_weight_bytes == 0 {
                 None
-            } else if let Some(resident) = vae_resident {
-                Some(format!(
-                    "rule-6-vae-residency: vae {:.1} GiB + reserve against {:.1} GiB device at \
-                     the decode boundary (transformer residency dropped) -> resident; decoder \
-                     cache capped at {:.1} GiB",
-                    vae_weight_bytes as f64 / 1073741824.0,
-                    device_memory as f64 / 1073741824.0,
-                    resident as f64 / 1073741824.0
-                ))
             } else {
+                let device_reserve = admission_reserve_bytes(Some(device_memory));
+                let resident_note = vae_resident
+                    .map(|cap| {
+                        format!(
+                            "resident; decoder cache capped at {:.1} GiB",
+                            cap as f64 / 1073741824.0
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "device cannot hold the decoder beside its workspace; streaming per \
+                         layer-group"
+                            .to_owned()
+                    });
                 Some(format!(
-                    "rule-6-vae-residency: device {:.1} GiB cannot hold the {:.1} GiB decoder \
-                     at the decode boundary (transformer residency dropped) -> streaming per \
-                     layer-group",
+                    "vae {:.1} GiB; decode workspace {:.1} GiB; reserve {:.1} GiB; device \
+                     {:.1} GiB at the decode boundary (transformer residency dropped) -> {}",
+                    vae_weight_bytes as f64 / 1073741824.0,
+                    decode_workspace as f64 / 1073741824.0,
+                    device_reserve as f64 / 1073741824.0,
                     device_memory as f64 / 1073741824.0,
-                    vae_weight_bytes as f64 / 1073741824.0
+                    resident_note
                 ))
             };
             if let Some(vae_detail) = vae_detail {

@@ -1484,32 +1484,59 @@ impl DecodeStage<'_> {
                     ));
                 }
                 let staging_directory = create_frame_staging_directory(staging_dir)?;
-                let decoder = match vae_resident_bytes {
-                    Some(cap) => StreamedVideoVae::open_with_resident_weights(
-                        video_vae_dir,
-                        weight_source,
-                        execution_cache_policy,
-                        video_device,
-                        transformer_chunking.attention.query_chunk_size.get(),
-                        ff_core::weights::DeviceCachePolicy::with_max_bytes(cap),
-                    )?,
-                    None => StreamedVideoVae::open(
-                        video_vae_dir,
-                        weight_source,
-                        execution_cache_policy,
-                        video_device,
-                        transformer_chunking.attention.query_chunk_size.get(),
-                    )?,
+                // Adaptive VAE residency: start with the derived cap; on
+                // device OOM halve and retry, falling back to full streaming.
+                let mut cache_cap = vae_resident_bytes;
+                let video_device = video_device.clone();
+                let frames = loop {
+                    let decode_result = (|| -> Result<usize> {
+                        let decoder = match cache_cap {
+                            Some(cap) => StreamedVideoVae::open_with_resident_weights(
+                                video_vae_dir,
+                                weight_source,
+                                execution_cache_policy,
+                                video_device.clone(),
+                                transformer_chunking.attention.query_chunk_size.get(),
+                                ff_core::weights::DeviceCachePolicy::with_max_bytes(cap),
+                            )?,
+                            None => StreamedVideoVae::open(
+                                video_vae_dir,
+                                weight_source,
+                                execution_cache_policy,
+                                video_device.clone(),
+                                transformer_chunking.attention.query_chunk_size.get(),
+                            )?,
+                        };
+                        let frames = decoder
+                            .decode_to_png_frames(&video_latents, &staging_directory)
+                            .with_context(|| {
+                                format!(
+                                    "video decode failed; incomplete frames remain isolated at {}",
+                                    staging_directory.display()
+                                )
+                            })?;
+                        publish_png_frame_manifest(&staging_directory, frames)?;
+                        Ok(frames)
+                    })();
+                    match decode_result {
+                        Ok(frames) => break Ok(frames),
+                        Err(error) => {
+                            let next = cache_cap.map(|c| c / 2);
+                            match next {
+                                Some(new_cap) if new_cap >= (1 << 20) => {
+                                    eprintln!(
+                                        "VAE decode failed ({}); retrying with {} MiB cache cap",
+                                        error,
+                                        new_cap / (1024 * 1024),
+                                    );
+                                    cache_cap = Some(new_cap);
+                                }
+                                _ => break Err(error),
+                            }
+                        }
+                    }
                 };
-                let frames = decoder
-                    .decode_to_png_frames(&video_latents, &staging_directory)
-                    .with_context(|| {
-                        format!(
-                            "video decode failed; incomplete frames remain isolated at {}",
-                            staging_directory.display()
-                        )
-                    })?;
-                publish_png_frame_manifest(&staging_directory, frames)?;
+                let frames = frames?;
                 Ok((
                     PreparedVideoDecode::Staged {
                         directory: staging_directory,
@@ -1763,7 +1790,7 @@ fn derive_t2va_configuration(
         }
     };
     let vae_bytes = match flyingfish::runtime::weights::ModelWeights::open(
-        model_root.join("video_vae"),
+        model_root.join("vae"),
         WeightSource::Memory,
         CachePolicy::new(1),
     )
@@ -2491,6 +2518,68 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
         latent_width,
     )?;
 
+    // At the decode boundary, measure the actual device free memory and
+    // compute the VAE cache cap from what is really available, not from the
+    // derivation's ideal. This accounts for the transformer's residual
+    // device allocations, fragmentation, and cudarc pool retention.
+    #[cfg(feature = "cuda")]
+    let vae_resident_bytes = if device.is_cuda() {
+        let mut free_before: usize = 0;
+        let mut total: usize = 0;
+        unsafe {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let _ = sys::cuMemGetInfo_v2(&mut free_before, &mut total);
+        }
+        // Flush pending stream work so stream-ordered allocations have
+        // returned to their pools before the trim.
+        unsafe {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let _ = sys::cuCtxSynchronize();
+        }
+        // Trim the device's default memory pool: stream-ordered allocations
+        // freed during denoise are still held in the pool and are not
+        // reflected in `cuMemGetInfo`'s free count until trimmed.
+        unsafe {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let mut pool: sys::CUmemoryPool = std::mem::zeroed();
+            let status = sys::cuDeviceGetDefaultMemPool(&mut pool, 0);
+            if status == sys::CUresult::CUDA_SUCCESS {
+                sys::cuMemPoolTrimTo(pool, 0);
+            }
+        }
+        let mut free_after: usize = 0;
+        unsafe {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let _ = sys::cuMemGetInfo_v2(&mut free_after, &mut total);
+        }
+        let free_u64 = free_after as u64;
+        let total_u64 = total as u64;
+        // A safety margin for the decode workspace and CUDA context overhead.
+        let margin: u64 = 2 << 30; // 2 GiB
+        // Cards with less than half their memory free at the decode boundary
+        // won't benefit enough from partial residency to offset the cost.
+        let cap = vae_resident_bytes
+            .filter(|_| free_u64 * 2 > total_u64)
+            .map(|ideal| ideal.min(free_u64.saturating_sub(margin)))
+            .filter(|&cap| cap > (1 << 30)); // below 1 GiB, streaming is better
+        eprintln!(
+            "decode boundary: memory pool trimmed, free {} -> {} MiB / {} MiB total; \\
+             VAE cache cap {} ({})",
+            free_before / (1024 * 1024),
+            free_after / (1024 * 1024),
+            total / (1024 * 1024),
+            cap.map(|c| format!("{} MiB", c / (1024 * 1024)))
+                .unwrap_or_else(|| "streaming".to_owned()),
+            if cap.is_some() {
+                "resident"
+            } else {
+                "streaming"
+            },
+        );
+        cap
+    } else {
+        vae_resident_bytes
+    };
     let frames = DecodeStage {
         device,
         output_dir: &output_dir,
