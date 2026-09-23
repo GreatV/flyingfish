@@ -49,6 +49,9 @@ impl FrameWriter {
                     if failure.is_none() {
                         *failure = Some(format!("{error:#}"));
                     }
+                    // Stop receiving: a full disk would otherwise have the
+                    // decoder finish every remaining chunk into a dead sink.
+                    break;
                 }
             }
         });

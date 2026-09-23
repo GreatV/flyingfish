@@ -1117,6 +1117,7 @@ fn machine_profile(host_bytes: u64, device_bytes: u64) -> ff_core::topology::Top
             name: Some("fixture".to_owned()),
             total_memory_bytes: Some(device_bytes),
             compute_capability: None,
+            cuda_device_uuid: None,
         }],
         interconnect: InterconnectLevel::SingleDevice,
         storage_bytes_per_second: None,

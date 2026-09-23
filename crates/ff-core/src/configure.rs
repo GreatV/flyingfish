@@ -159,12 +159,22 @@ pub fn derive(
             let activation_budget = device_memory.saturating_sub(device_reserve);
             let chunks = requirement.largest_chunk_plan_within(activation_budget)?;
             let peak = requirement.activation_peak_bytes()?;
-            provenance.push(DerivationStep {
-                rule: "rule-2-chunks",
-                detail: format!(
+            let over_budget = chunks.is_some() && peak > activation_budget;
+            let detail = if over_budget {
+                format!(
+                    "activation budget {activation_budget} B of {device_memory} B selects \
+                     {chunks:?} at peak {peak} B; no modeled plan fits, so the smallest is \
+                     selected and admission is expected to refuse"
+                )
+            } else {
+                format!(
                     "activation budget {activation_budget} B of {device_memory} B selects \
                      {chunks:?} at peak {peak} B"
-                ),
+                )
+            };
+            provenance.push(DerivationStep {
+                rule: "rule-2-chunks",
+                detail,
             });
             chunks
         }
@@ -230,6 +240,7 @@ mod tests {
                         name: Some("fixture".to_owned()),
                         total_memory_bytes: Some(bytes),
                         compute_capability: None,
+                        cuda_device_uuid: None,
                     }]
                 })
                 .unwrap_or_default(),

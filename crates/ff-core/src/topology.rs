@@ -36,6 +36,7 @@ pub struct TopologyDevice {
     pub name: Option<String>,
     pub total_memory_bytes: Option<u64>,
     pub compute_capability: Option<CudaComputeCapability>,
+    pub cuda_device_uuid: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -143,7 +144,23 @@ impl TopologyProfile {
                 current: current_limit,
             }));
         }
+        // A CUDA_VISIBLE_DEVICES reorder keeps the machine but renumbers the
+        // ordinals, so the recorded per-ordinal capacity map no longer
+        // applies; the derivation recaptures under the new mapping.
         let current = HardwareFingerprint::collect(primary);
+        let current_devices = enumerate_devices(&current);
+        if device_uuid_sequence(&recorded.devices) != device_uuid_sequence(&current_devices) {
+            return Ok(Err(TopologyProfileAbsence::ForeignHost {
+                path: path.to_path_buf(),
+                recorded_device: recorded
+                    .devices
+                    .first()
+                    .and_then(|device| device.name.clone()),
+                current_device: current_devices
+                    .first()
+                    .and_then(|device| device.name.clone()),
+            }));
+        }
         if !describes_same_machine(&recorded.fingerprint, &current) {
             return Ok(Err(TopologyProfileAbsence::ForeignHost {
                 path: path.to_path_buf(),
@@ -175,9 +192,17 @@ fn enumerate_devices(primary: &HardwareFingerprint) -> Vec<TopologyDevice> {
             name: fingerprint.device_name,
             total_memory_bytes: fingerprint.device_total_memory_bytes,
             compute_capability: fingerprint.cuda_compute_capability,
+            cuda_device_uuid: fingerprint.cuda_device_uuid,
         });
     }
     devices
+}
+
+fn device_uuid_sequence(devices: &[TopologyDevice]) -> Vec<Option<String>> {
+    devices
+        .iter()
+        .map(|device| device.cuda_device_uuid.clone())
+        .collect()
 }
 
 #[cfg(test)]

@@ -928,7 +928,11 @@ impl ff_core::configure::ModelRequirement for H3T2vaRequirement {
             .iter()
             .filter(|(_, peak)| *peak <= activation_budget_bytes)
             .map(|(plan, _)| *plan)
-            .max_by_key(|plan| plan.feed_forward))
+            .max_by_key(|plan| plan.feed_forward)
+            // Nothing fits: hand over the smallest plan rather than the
+            // caller's static defaults, which are the most expensive ones.
+            // Admission still sees the real peak and refuses honestly.
+            .or_else(|| self.chunk_ladder.first().map(|(plan, _)| *plan)))
     }
 
     fn memory_materialization_bytes(&self) -> Result<u64> {
