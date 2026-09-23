@@ -833,6 +833,7 @@ pub struct H3T2vaRequirement {
     steady_weight_bytes: u64,
     single_pass_weight_bytes: u64,
     memory_materialization_bytes: u64,
+    vae_bytes: u64,
     activation_peak_bytes: u64,
     flops_per_evaluation: u64,
     chunk_ladder: Vec<(ff_core::configure::ChunkPlan, u64)>,
@@ -852,6 +853,7 @@ impl H3T2vaRequirement {
     pub fn from_estimate(
         estimate: &ResourceEstimate,
         encoder_weight_bytes: u64,
+        vae_bytes: u64,
         flash_attention: bool,
         backend_workspace_bytes: u64,
         materialization_override: Option<u64>,
@@ -892,6 +894,7 @@ impl H3T2vaRequirement {
                     .checkpoint_bytes
                     .context("resource estimate carries no transformer checkpoint size")?,
             ),
+            vae_bytes,
             activation_peak_bytes: chunk_ladder
                 .last()
                 .map(|(_, peak)| *peak)
@@ -940,6 +943,10 @@ impl ff_core::configure::ModelRequirement for H3T2vaRequirement {
 
     fn memory_materialization_bytes(&self) -> Result<u64> {
         Ok(self.memory_materialization_bytes)
+    }
+
+    fn vae_weight_bytes(&self) -> Result<u64> {
+        Ok(self.vae_bytes)
     }
 }
 

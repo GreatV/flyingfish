@@ -1367,6 +1367,10 @@ struct DecodeStage<'a> {
     execution_cache_policy: CachePolicy,
     transformer_chunking: TransformerChunking,
     no_progress: bool,
+    /// Rule 6's verdict: `Some(cap)` opens the visual decoder with its weights
+    /// resident under this device-cache ceiling; `None` streams per layer
+    /// group.
+    vae_resident_bytes: Option<u64>,
 }
 
 impl DecodeStage<'_> {
@@ -1392,6 +1396,7 @@ impl DecodeStage<'_> {
             execution_cache_policy,
             transformer_chunking,
             no_progress,
+            vae_resident_bytes,
         } = self;
         let frames = if symlink_metadata_if_exists(completion_path, "generation completion")?
             .is_some()
@@ -1479,13 +1484,23 @@ impl DecodeStage<'_> {
                     ));
                 }
                 let staging_directory = create_frame_staging_directory(staging_dir)?;
-                let decoder = StreamedVideoVae::open(
-                    video_vae_dir,
-                    weight_source,
-                    execution_cache_policy,
-                    video_device,
-                    transformer_chunking.attention.query_chunk_size.get(),
-                )?;
+                let decoder = match vae_resident_bytes {
+                    Some(cap) => StreamedVideoVae::open_with_resident_weights(
+                        video_vae_dir,
+                        weight_source,
+                        execution_cache_policy,
+                        video_device,
+                        transformer_chunking.attention.query_chunk_size.get(),
+                        ff_core::weights::DeviceCachePolicy::with_max_bytes(cap),
+                    )?,
+                    None => StreamedVideoVae::open(
+                        video_vae_dir,
+                        weight_source,
+                        execution_cache_policy,
+                        video_device,
+                        transformer_chunking.attention.query_chunk_size.get(),
+                    )?,
+                };
                 let frames = decoder
                     .decode_to_png_frames(&video_latents, &staging_directory)
                     .with_context(|| {
@@ -1747,6 +1762,29 @@ fn derive_t2va_configuration(
             None
         }
     };
+    let vae_bytes = match flyingfish::runtime::weights::ModelWeights::open(
+        model_root.join("video_vae"),
+        WeightSource::Memory,
+        CachePolicy::new(1),
+    )
+    .and_then(|weights| weights.cache_inventory())
+    {
+        Ok(inventory) => Some(
+            inventory.total_bytes(ff_core::weights::CacheGranularity::Tensor)?
+                + inventory
+                    .shards
+                    .iter()
+                    .map(|shard| shard.header_bytes)
+                    .sum::<u64>(),
+        ),
+        Err(error) => {
+            eprintln!(
+                "config: video VAE catalog was not read ({}); rule 6 assumes no decoder",
+                error
+            );
+            None
+        }
+    };
     let materialization_bytes = catalog
         .as_ref()
         .map(|inventory| -> Result<u64> {
@@ -1769,6 +1807,7 @@ fn derive_t2va_configuration(
     let requirement = H3T2vaRequirement::from_estimate(
         &estimate,
         encoder_bytes,
+        vae_bytes.unwrap_or(0),
         flash_attention,
         workspace_bytes,
         materialization_bytes,
@@ -1929,6 +1968,7 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
         || no_precompute_adaln
         || flash_attention;
     let mut derived_host_bound_mib: Option<u64> = None;
+    let mut vae_resident_bytes: Option<u64> = None;
     let derived = if explicit_policy {
         None
     } else {
@@ -1968,6 +2008,7 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
             device,
         )?;
         derived_host_bound_mib = host_bound_bytes.map(|bytes| bytes.div_ceil(1 << 20));
+        vae_resident_bytes = derived.vae_resident_bytes;
         Some(derived)
     };
     let derived_source = derived.as_ref().map(|derived| match derived.weight_source {
@@ -2470,6 +2511,7 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
         execution_cache_policy,
         transformer_chunking,
         no_progress,
+        vae_resident_bytes,
     }
     .run(&result)?;
 
@@ -2623,15 +2665,84 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         resource_cold_cache: false,
     };
 
-    // Surface admission refusals before paying for the shared encode, and
-    // aggregate the per-worker host peaks against this machine. Every listed
-    // ordinal is probed here, so a missing device fails before any encode.
     if ordinals.len() > 1 {
-        let mut aggregate_host_peak = 0u64;
+        // Pre-validation runs before the shared encode: worker roots must be
+        // real directories (no symlink escape), every listed ordinal must
+        // initialize, and each worker's resume state is discovered so a
+        // broken worker fails before any other starts, the admission gate
+        // charges only the evaluations that remain, and the encode is skipped
+        // when every worker resumes.
+        let mut worker_resume: Vec<Option<usize>> = Vec::new();
+        for (worker_index, ordinal) in ordinals.iter().enumerate() {
+            let worker_root = output_dir.join(format!("gpu{ordinal}"));
+            anyhow::ensure!(
+                worker_root != output_dir,
+                "worker root equals the run root for device {ordinal}"
+            );
+            if let Some(metadata) =
+                symlink_metadata_if_exists(&worker_root, "worker output directory")?
+            {
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "worker output directory must not be a symlink: {}",
+                    worker_root.display()
+                );
+            }
+            Device::new_cuda(*ordinal)
+                .with_context(|| format!("failed to initialize CUDA device {ordinal}"))?;
+            let recorded = RecordedRun::discover(
+                worker_root.exists(),
+                &worker_root,
+                &worker_root.join(GENERATION_INITIALIZATION_FILE),
+                &worker_root.join(GENERATION_READY_FILE),
+                &worker_root.join(EXECUTION_POLICY_FILE),
+                &worker_root.join(GENERATION_REQUEST_FILE),
+                &worker_root.join(STAGING_DIRECTORY),
+                &worker_root.join(CHECKPOINT_DIRECTORY),
+                &worker_root.join(FINAL_LATENTS_FILE),
+                sigma_points,
+            )?;
+            if let Some(resume) = recorded.resume_from() {
+                resume
+                    .identity
+                    .policy_history
+                    .validate_resume_numerics(&device)
+                    .with_context(|| {
+                        format!(
+                            "worker {worker_index} (device {ordinal}) checkpoint cannot resume \
+                             on the selected runtime"
+                        )
+                    })?;
+            }
+            worker_resume.push(
+                recorded
+                    .resume_from()
+                    .map(|checkpoint| checkpoint.identity.completed_evaluations as usize),
+            );
+        }
+        // The single-device path creates its output directory inside the
+        // pipeline; the multi-device workers each create their own root under
+        // a parent the orchestrator makes first. Existing directories stay as
+        // they are so a partial run can resume.
+        if !output_dir.exists() {
+            create_new_directory(&output_dir, "generation output directory")?;
+        }
         for ordinal in &ordinals {
+            let worker_root = output_dir.join(format!("gpu{ordinal}"));
+            if !worker_root.exists() {
+                create_new_directory(&worker_root, "worker output directory")?;
+            }
+        }
+
+        // Surface admission refusals before paying for the shared encode, and
+        // aggregate the per-worker host peaks against this machine. Each
+        // worker is charged only for the evaluations its resume state leaves.
+        let mut aggregate_host_peak = 0u64;
+        let gate_weight_args = optional_weight_args.configured();
+        for (worker_index, (ordinal, completed)) in ordinals.iter().zip(&worker_resume).enumerate()
+        {
             let gate_device = Device::new_cuda(*ordinal)
                 .with_context(|| format!("failed to initialize CUDA device {ordinal}"))?;
-            let gate_weight_args = optional_weight_args.configured();
             let mut gate_policy = resolve_execution_policy(
                 policy.as_deref(),
                 &gate_device,
@@ -2642,8 +2753,9 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
                 !no_precompute_adaln,
             )?;
             let mut gate_origin = PolicyOrigin::Defaults;
+            let remaining = (sigma_points - 1).saturating_sub(completed.unwrap_or(0));
             let selection = select_generation_resources(
-                sigma_points - 1,
+                remaining,
                 &mut gate_policy,
                 &mut gate_origin,
                 GenerationResourceRequest {
@@ -2663,7 +2775,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
                     audio_frames,
                     audio_channels,
                     sigma_points,
-                    seed,
+                    seed: seed.wrapping_add(worker_index as u64),
                     target_hidden_state,
                     video_shift,
                     audio_shift,
@@ -2693,101 +2805,53 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
                 available
             );
         }
-    }
 
-    // Multi-device workers share one encoding, computed here on the
-    // primary device; each worker copies the embeddings to its own.
-    let pre_encoded = if ordinals.len() > 1 {
-        let encode_start = Instant::now();
-        let mut encoder = StreamedTextEncoder::open(
-            resolve_component(&model, Path::new("text_encoder"))?,
-            WeightSource::Mmap,
-            CachePolicy::new(1),
-            device.clone(),
-            target_hidden_state,
-            optional_chunks
-                .configured(flash_attention)
-                .attention_query_chunk_size
-                .get(),
-        )?;
-        encoder.set_drop_evicted_pages(true);
-        let encoded = encoder.encode_prompt(&tokenizer, prompt.as_str())?;
-        drop(encoder);
-        if !no_progress {
-            eprintln!(
-                "encode: {} prompt tokens completed in {:.2}s (shared across devices)",
-                encoded.token_ids.len(),
-                encode_start.elapsed().as_secs_f64(),
-            );
-        }
-        Some(encoded)
-    } else {
-        None
-    };
-
-    let worker_context = |worker_index: usize,
-                          worker_root: PathBuf,
-                          device: Device,
-                          telemetry_json: Option<PathBuf>| {
-        DeviceRunContext {
-            ordinals: ordinals.clone(),
-            device,
-            existing_run: worker_root.exists(),
-            output_dir: worker_root,
-            seed: seed.wrapping_add(worker_index as u64),
-            prompt: prompt.clone(),
-            tokenizer: &tokenizer,
-            model: model.clone(),
-            model_root: model_root.clone(),
-            prompt_embeddings_pre_encoded: pre_encoded.as_ref(),
-            token_ids: token_ids.clone(),
-            sigma_points,
-            video_shift,
-            audio_shift,
-            latent_frames,
-            latent_height,
-            latent_width,
-            audio_frames,
-            audio_channels,
-            target_hidden_state,
-            wav_format,
-            max_device_mib,
-            backend_workspace_mib,
-            telemetry_json,
-            no_progress,
-            explain_config,
-            resources: worker_resources.clone(),
-            policy: policy.clone(),
-            host_profile: host_profile.clone(),
-            optional_weight_args,
-            optional_chunks,
-            no_precompute_adaln,
+        // All workers resuming means the shared encode already happened in the
+        // run being resumed: skip it entirely. Otherwise it runs here, under the
+        // policy the workers will actually use, and every worker receives it.
+        let any_fresh = worker_resume.iter().any(|completed| completed.is_none());
+        let encode_chunk_size = resolve_execution_policy(
+            policy.as_deref(),
+            &device,
+            optional_weight_args.configured().weight_source,
+            optional_weight_args.configured().cache_policy()?,
+            optional_chunks.configured(flash_attention),
             flash_attention,
-            max_host_mib,
-        }
-    };
+            !no_precompute_adaln,
+        )?
+        .transformer_chunking()?
+        .attention
+        .query_chunk_size
+        .get();
+        let pre_encoded = if any_fresh {
+            let encode_start = Instant::now();
+            let mut encoder = StreamedTextEncoder::open(
+                resolve_component(&model, Path::new("text_encoder"))?,
+                WeightSource::Mmap,
+                CachePolicy::new(1),
+                device.clone(),
+                target_hidden_state,
+                encode_chunk_size,
+            )?;
+            encoder.set_drop_evicted_pages(true);
+            let encoded = encoder.encode_prompt(&tokenizer, prompt.as_str())?;
+            drop(encoder);
+            if !no_progress {
+                eprintln!(
+                    "encode: {} prompt tokens completed in {:.2}s (shared across devices)",
+                    encoded.token_ids.len(),
+                    encode_start.elapsed().as_secs_f64(),
+                );
+            }
+            Some(encoded)
+        } else {
+            None
+        };
 
-    if ordinals.len() > 1 {
-        // The single-device path creates its output directory inside the
-        // pipeline; the multi-device workers each create their own root under
-        // a parent the orchestrator makes first. Existing directories stay as
-        // they are so a partial run can resume.
-        if !output_dir.exists() {
-            create_new_directory(&output_dir, "generation output directory")?;
-        }
         std::thread::scope(|scope| -> Result<()> {
             let mut handles = Vec::new();
             for (worker_index, ordinal) in ordinals.iter().enumerate() {
                 let worker_root = output_dir.join(format!("gpu{ordinal}"));
-                anyhow::ensure!(
-                    worker_root != output_dir,
-                    "worker root equals the run root for device {ordinal}"
-                );
-                if !worker_root.exists() {
-                    create_new_directory(&worker_root, "worker output directory")?;
-                }
-                let device = Device::new_cuda(*ordinal)
-                    .with_context(|| format!("failed to initialize CUDA device {ordinal}"))?;
                 let worker_telemetry = telemetry_json.as_ref().map(|path| {
                     let file_name = path
                         .file_name()
@@ -2795,8 +2859,44 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
                         .unwrap_or_else(|| format!("gpu{ordinal}-telemetry.json"));
                     path.with_file_name(file_name)
                 });
-                let device_run =
-                    worker_context(worker_index, worker_root, device, worker_telemetry);
+                let device = Device::new_cuda(*ordinal)
+                    .with_context(|| format!("failed to initialize CUDA device {ordinal}"))?;
+                let device_run = DeviceRunContext {
+                    ordinals: ordinals.clone(),
+                    device,
+                    existing_run: worker_root.exists(),
+                    output_dir: worker_root,
+                    seed: seed.wrapping_add(worker_index as u64),
+                    prompt: prompt.clone(),
+                    tokenizer: &tokenizer,
+                    model: model.clone(),
+                    model_root: model_root.clone(),
+                    prompt_embeddings_pre_encoded: pre_encoded.as_ref(),
+                    token_ids: token_ids.clone(),
+                    sigma_points,
+                    video_shift,
+                    audio_shift,
+                    latent_frames,
+                    latent_height,
+                    latent_width,
+                    audio_frames,
+                    audio_channels,
+                    target_hidden_state,
+                    wav_format,
+                    max_device_mib,
+                    backend_workspace_mib,
+                    telemetry_json: worker_telemetry,
+                    no_progress,
+                    explain_config,
+                    resources: worker_resources.clone(),
+                    policy: policy.clone(),
+                    host_profile: host_profile.clone(),
+                    optional_weight_args,
+                    optional_chunks,
+                    no_precompute_adaln,
+                    flash_attention,
+                    max_host_mib,
+                };
                 handles.push(scope.spawn(move || run_single_device_pipeline(device_run)));
             }
             let mut first_error = None;
@@ -2819,12 +2919,42 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
 
     // cpu/auto carry no ordinals; the single-device path owns the device as
     // parsed. Its telemetry keeps the operator's path unprefixed.
-    let device_run = worker_context(
-        0,
-        output_dir.clone(),
-        device.clone(),
-        telemetry_json.clone(),
-    );
+    let device_run = DeviceRunContext {
+        ordinals: ordinals.clone(),
+        device: device.clone(),
+        existing_run: output_dir.exists(),
+        output_dir: output_dir.clone(),
+        seed,
+        prompt: prompt.clone(),
+        tokenizer: &tokenizer,
+        model: model.clone(),
+        model_root: model_root.clone(),
+        prompt_embeddings_pre_encoded: None,
+        token_ids: token_ids.clone(),
+        sigma_points,
+        video_shift,
+        audio_shift,
+        latent_frames,
+        latent_height,
+        latent_width,
+        audio_frames,
+        audio_channels,
+        target_hidden_state,
+        wav_format,
+        max_device_mib,
+        backend_workspace_mib,
+        telemetry_json: telemetry_json.clone(),
+        no_progress,
+        explain_config,
+        resources: worker_resources.clone(),
+        policy: policy.clone(),
+        host_profile: host_profile.clone(),
+        optional_weight_args,
+        optional_chunks,
+        no_precompute_adaln,
+        flash_attention,
+        max_host_mib,
+    };
     run_single_device_pipeline(device_run)
 }
 
