@@ -109,6 +109,7 @@ impl StagePrefetcher {
     fn ensure_slab(&mut self, bytes: usize) -> Result<()> {
         if bytes > 0 && self.slab_bytes < bytes {
             self.slab = None;
+            self.slab_bytes = 0;
             self.slab = Some(
                 unsafe { self.stream.context().alloc_pinned::<u8>(bytes) }
                     .with_context(|| format!("pin the {bytes}-byte prefetch slab"))?,
