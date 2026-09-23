@@ -160,20 +160,7 @@ impl HostProfile {
 /// transfer rate actually belongs to; the host fields catch a profile carried
 /// between machines that happen to hold the same card model.
 fn describes_same_host(recorded: &HardwareFingerprint, current: &HardwareFingerprint) -> bool {
-    recorded.validate().is_ok()
-        && current.validate().is_ok()
-        && recorded.backend == current.backend
-        && recorded.architecture == current.architecture
-        && recorded.operating_system == current.operating_system
-        && recorded.logical_cpu_count == current.logical_cpu_count
-        && recorded.device_name == current.device_name
-        && recorded.device_total_memory_bytes == current.device_total_memory_bytes
-        && match (&recorded.cuda_device_uuid, &current.cuda_device_uuid) {
-            (Some(recorded), Some(current)) => recorded == current,
-            // A non-CUDA host has no UUID to agree on; the fields above stand.
-            (None, None) => recorded.backend != crate::runtime::probe::DeviceBackend::Cuda,
-            _ => false,
-        }
+    crate::runtime::probe::describes_same_machine(recorded, current)
 }
 
 #[cfg(test)]

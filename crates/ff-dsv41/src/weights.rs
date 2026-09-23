@@ -541,7 +541,7 @@ impl TransformerLoader {
             compressor,
             compress_cache: Vec::new(),
             index_k_cache: Vec::new(),
-            ring: WindowRing::new(1, sliding_window, head_dim, &device)?,
+            ring: WindowRing::new(1, sliding_window, head_dim),
             indexer_wq_b,
             indexer_wk,
             indexer_k_norm,

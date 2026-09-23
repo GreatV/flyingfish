@@ -85,18 +85,7 @@ pub fn rms_norm_gated(input: &Tensor, weight: &Tensor, gate: &Tensor, eps: f64) 
         .map_err(Into::into)
 }
 
-/// PyTorch evaluates half-precision SiLU in F32 and casts only its result.
-pub(crate) fn silu_with_reference_rounding(input: &Tensor) -> Result<Tensor> {
-    let dtype = input.dtype();
-    match dtype {
-        DType::BF16 | DType::F16 => input
-            .to_dtype(DType::F32)?
-            .silu()?
-            .to_dtype(dtype)
-            .map_err(Into::into),
-        _ => input.silu().map_err(Into::into),
-    }
-}
+pub(crate) use ff_core::math::silu_with_reference_rounding;
 
 /// The native half-precision sigmoid also computes its intermediates in F32.
 pub(crate) fn sigmoid_with_reference_rounding(input: &Tensor) -> Result<Tensor> {

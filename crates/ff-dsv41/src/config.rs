@@ -140,6 +140,12 @@ pub struct VisionConfig {
     pub max_image_tokens: usize,
     pub min_pixels: usize,
     pub max_wh_ratio: Option<f64>,
+    #[serde(default = "default_rms_norm_eps")]
+    pub rms_norm_eps: f64,
+}
+
+fn default_rms_norm_eps() -> f64 {
+    1e-6
 }
 
 impl DeepseekV41Config {
@@ -270,6 +276,7 @@ mod tests {
         assert_eq!(v.hidden_size, 1024);
         assert_eq!(v.patch_size, 14);
         assert_eq!(v.downsample_ratio, 3);
+        assert_eq!(v.rms_norm_eps, 1e-6);
     }
 
     #[test]

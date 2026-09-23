@@ -78,7 +78,6 @@ cuda = [
     "ff-music/cuda",
     "ff-edge0/cuda",
     "ff-qwen35/cuda",
-    "ff-dsv41/cuda",
     "candle-core/cuda",
     "dep:cudarc",
 ]

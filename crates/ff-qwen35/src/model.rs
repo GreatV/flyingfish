@@ -10,11 +10,7 @@
 use crate::config::{LayerKind, Qwen35Config, TEXT_PREFIX};
 use crate::weights::Qwen35Weights;
 use anyhow::Result;
-
-#[inline]
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
+use ff_core::math::{l2norm, silu};
 
 /// Zero-centered RMSNorm: `x * rsqrt(mean(x^2)+eps) * (1 + w)`.
 fn rmsnorm_zc(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
@@ -25,12 +21,6 @@ fn rmsnorm_zc(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         .zip(weight)
         .map(|(&v, &w)| v * inv * (1.0 + w))
         .collect()
-}
-
-/// l2norm with the HF kernel eps.
-fn l2norm(x: &[f32]) -> Vec<f32> {
-    let norm = (x.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
-    x.iter().map(|v| v / norm).collect()
 }
 
 /// Interleaved mrope: freq i picks axis h (i%3==1 && i<3*sec[1]), w

@@ -486,6 +486,30 @@ pub fn admission_reserve_bytes(pool_total: Option<u64>) -> u64 {
     })
 }
 
+/// Whether two fingerprints describe the same machine.
+///
+/// The CUDA device UUID is the strongest identifier available; the host fields
+/// catch a profile carried between machines that happen to hold the same card
+/// model.
+pub fn describes_same_machine(
+    recorded: &HardwareFingerprint,
+    current: &HardwareFingerprint,
+) -> bool {
+    recorded.validate().is_ok()
+        && current.validate().is_ok()
+        && recorded.backend == current.backend
+        && recorded.architecture == current.architecture
+        && recorded.operating_system == current.operating_system
+        && recorded.logical_cpu_count == current.logical_cpu_count
+        && recorded.device_name == current.device_name
+        && recorded.device_total_memory_bytes == current.device_total_memory_bytes
+        && match (&recorded.cuda_device_uuid, &current.cuda_device_uuid) {
+            (Some(recorded), Some(current)) => recorded == current,
+            (None, None) => recorded.backend != DeviceBackend::Cuda,
+            _ => false,
+        }
+}
+
 trait ProbeSource {
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
 

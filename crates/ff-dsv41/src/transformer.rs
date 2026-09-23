@@ -411,7 +411,7 @@ mod tests {
             },
             compress_cache: Vec::new(),
             index_k_cache: Vec::new(),
-            ring: WindowRing::new(1, window, head_dim, &device).unwrap(),
+            ring: WindowRing::new(1, window, head_dim),
             indexer_wq_b: if ratio > 1 {
                 Some(ones(2 * 32, 16, &device))
             } else {

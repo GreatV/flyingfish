@@ -70,7 +70,7 @@ Use `--device cuda:0` or `--device metal:0` with the corresponding build.
 
 ## Model guide
 
-See [Model guide](docs/models.md) for per-model commands, measured performance and adapter development.
+See [Model guide](docs/models.md) for per-model commands, measured performance and adapter development. See [Topology-aware configuration](docs/topology-aware-config.md) for how performance settings are derived from the machine profile.
 
 ## License
 

@@ -11,6 +11,7 @@ use std::{
     fs,
     io::BufWriter,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 pub trait VideoOutputSink {
@@ -25,6 +26,73 @@ pub trait VideoOutputSink {
 pub struct PngFrameSink {
     directory: PathBuf,
     next_frame: usize,
+    writer: Option<FrameWriter>,
+}
+
+/// PNG encoding and per-frame fsync on a writer thread, so the decoder's next
+/// chunk runs while the previous chunk's files are being produced.
+struct FrameWriter {
+    sender: Option<std::sync::mpsc::SyncSender<(usize, Tensor)>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    failure: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl FrameWriter {
+    fn spawn(directory: PathBuf) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(usize, Tensor)>(2);
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        let thread_failure = Arc::clone(&failure);
+        let handle = std::thread::spawn(move || {
+            for (first_frame, chunk) in receiver {
+                if let Err(error) = write_png_chunk(&directory, first_frame, &chunk) {
+                    let mut failure = thread_failure.lock().expect("PNG writer lock");
+                    if failure.is_none() {
+                        *failure = Some(format!("{error:#}"));
+                    }
+                    // Stop receiving: a full disk would otherwise have the
+                    // decoder finish every remaining chunk into a dead sink.
+                    break;
+                }
+            }
+        });
+        Self {
+            sender: Some(sender),
+            handle: Some(handle),
+            failure,
+        }
+    }
+
+    fn send(&self, first_frame: usize, rgb: &Tensor) -> Result<()> {
+        let sender = self
+            .sender
+            .as_ref()
+            .context("PNG writer already finished")?;
+        sender
+            .send((first_frame, rgb.clone()))
+            .map_err(|_| anyhow::anyhow!("PNG writer stopped early"))
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(sender) = self.sender.take() {
+            drop(sender);
+        }
+        let handle = self.handle.take();
+        if let Some(handle) = handle {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("PNG writer panicked"))?;
+        }
+        match self.failure.lock().expect("PNG writer lock").take() {
+            Some(failure) => Err(anyhow::anyhow!(failure)),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for FrameWriter {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
 }
 
 impl PngFrameSink {
@@ -34,6 +102,7 @@ impl PngFrameSink {
         Ok(Self {
             directory: directory.to_owned(),
             next_frame: 0,
+            writer: Some(FrameWriter::spawn(directory.to_owned())),
         })
     }
 
@@ -49,7 +118,12 @@ impl VideoOutputSink for PngFrameSink {
             "video chunks must be consecutive: expected frame {}, got {first_frame}",
             self.next_frame
         );
-        let frames = write_png_chunk(&self.directory, first_frame, rgb)?;
+        let writer = self.writer.as_mut().context("PNG sink already finished")?;
+        let frames = rgb
+            .dims5()
+            .context("video chunk must have shape [1, 3, frames, height, width]")?
+            .2;
+        writer.send(first_frame, rgb)?;
         self.next_frame = self
             .next_frame
             .checked_add(frames)
@@ -63,6 +137,9 @@ impl VideoOutputSink for PngFrameSink {
             "decoder produced {total_frames} frames but PNG sink wrote {}",
             self.next_frame
         );
+        if let Some(mut writer) = self.writer.take() {
+            writer.finish()?;
+        }
         sync_frame_directory(&self.directory)?;
         Ok(())
     }
@@ -1424,6 +1501,40 @@ mod tests {
         let video = Tensor::zeros((1, 3, 1, 1, 1), DType::F32, &Device::Cpu).unwrap();
         assert!(write_png_frames(&frames, &video).is_err());
         assert_eq!(fs::read(target).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn async_png_sink_matches_inline_bytes_and_reports_worker_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let frames = directory.path().join("frames");
+        fs::create_dir(&frames).unwrap();
+        let values: Vec<f32> = (0..2 * 3 * 2 * 3)
+            .map(|index| index as f32 / 36.0)
+            .collect();
+        let whole = Tensor::from_vec(values, (1, 3, 2, 2, 3), &Device::Cpu).unwrap();
+        let split = [
+            whole.narrow(2, 0, 1).unwrap(),
+            whole.narrow(2, 1, 1).unwrap(),
+        ];
+        let inline = tempfile::tempdir().unwrap();
+        let inline_dir = inline.path().join("frames");
+        fs::create_dir(&inline_dir).unwrap();
+        assert_eq!(write_png_frames(&inline_dir, &whole).unwrap(), 2);
+        let mut sink = PngFrameSink::new(&frames).unwrap();
+        sink.write_chunk(0, &split[0]).unwrap();
+        sink.write_chunk(1, &split[1]).unwrap();
+        sink.finish(2).unwrap();
+        for frame in 0..2 {
+            let name = format!("frame_{frame:05}.png");
+            assert_eq!(
+                fs::read(frames.join(&name)).unwrap(),
+                fs::read(inline_dir.join(&name)).unwrap()
+            );
+        }
+        let mut conflict = PngFrameSink::new(&frames).unwrap();
+        conflict.write_chunk(0, &split[0]).unwrap();
+        let error = conflict.finish(1).unwrap_err().to_string();
+        assert!(error.contains("failed to create frame"), "{error}");
     }
 
     #[test]

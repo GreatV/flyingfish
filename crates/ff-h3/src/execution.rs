@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use ff_core::{residency, weights::ModelWeights};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fmt};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -38,6 +39,22 @@ impl fmt::Display for StageKind {
             Self::BlockAttention(i) => write!(f, "block-{i}-attention"),
             Self::BlockFeedForward(i) => write!(f, "block-{i}-feed-forward"),
             Self::Output => write!(f, "output"),
+        }
+    }
+}
+
+impl StageKind {
+    /// The timing bucket a stage's load and compute durations accumulate into.
+    pub(crate) fn timing_bucket(&self) -> &'static str {
+        match self {
+            Self::BlockAdaLn(_) => "adaln",
+            Self::BlockAttention(_) | Self::RefinerAttention(_) => "attention",
+            Self::BlockFeedForward(_) | Self::RefinerFeedForward(_) => "feed_forward",
+            Self::ContextInput
+            | Self::TimeInput
+            | Self::LatentInput
+            | Self::RefinerOutputNorm
+            | Self::Output => "other",
         }
     }
 }
@@ -146,6 +163,37 @@ impl H3ExecutionPlan {
             .map(String::as_str)
             .collect::<Vec<_>>();
         residency::with_tensors(weights, &names, device, |loaded| f(stage, loaded))
+    }
+
+    /// `with_stage` with the weight load and the stage computation timed
+    /// separately; each phase ends at a device synchronization before its
+    /// duration is read.
+    pub fn with_stage_timed<T>(
+        &self,
+        weights: &ModelWeights,
+        stage_index: usize,
+        device: &Device,
+        record: &mut dyn FnMut(&'static str, Duration, Duration),
+        f: impl FnOnce(&ExecutionStage, &BTreeMap<String, Tensor>) -> Result<T>,
+    ) -> Result<T> {
+        let stage = self
+            .stages
+            .get(stage_index)
+            .with_context(|| format!("execution stage {stage_index} is out of range"))?;
+        let names = stage
+            .tensor_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let load_started = Instant::now();
+        let loaded = residency::materialize(weights, &names, device)?;
+        device.synchronize()?;
+        let load = load_started.elapsed();
+        let compute_started = Instant::now();
+        let result = f(stage, &loaded);
+        device.synchronize()?;
+        record(stage.kind.timing_bucket(), load, compute_started.elapsed());
+        result
     }
 }
 
@@ -292,6 +340,24 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn with_stage_timed_records_the_bucket_once_per_stage() {
+        let (_dir, weights, plan) = toy_plan();
+        let mut recorded = Vec::new();
+        let value = plan
+            .with_stage_timed(
+                &weights,
+                6,
+                &Device::Cpu,
+                &mut |bucket, load, compute| recorded.push((bucket, load, compute)),
+                |_stage, _tensors| Ok(11u32),
+            )
+            .unwrap();
+        assert_eq!(value, 11);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "adaln");
     }
 
     #[test]

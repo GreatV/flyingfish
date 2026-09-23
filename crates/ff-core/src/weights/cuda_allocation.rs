@@ -63,9 +63,10 @@ fn upload_slice<T: DeviceRepr>(
 }
 
 /// Fill pinned memory with parallel positional reads.
+/// Host-side only; the caller issues the H2D copy on its own stream.
 /// Returns `None` on allocation or read failure so the caller can use the mmap.
 #[cfg(unix)]
-fn fill_pinned_from_checkpoint(
+pub fn fill_pinned_from_checkpoint(
     file: &std::fs::File,
     offset: usize,
     len: usize,

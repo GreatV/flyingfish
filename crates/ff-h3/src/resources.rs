@@ -13,7 +13,7 @@ use std::fmt;
 mod activations;
 mod host;
 pub use ff_core::bounds;
-pub use host::host_weight_residency_charges;
+pub use host::{cache_charge, host_weight_residency_charges};
 mod traffic;
 mod weights;
 
@@ -455,7 +455,6 @@ impl ResourceEstimate {
         estimate.validate()?;
         Ok(estimate)
     }
-
     pub fn for_t2va(
         config: &TransformerConfig,
         geometry: T2vaGeometry,
@@ -825,6 +824,123 @@ fn checked_sum(label: &'static str, values: &[u64]) -> Result<u64> {
 
 fn as_u64(value: usize, label: &'static str) -> Result<u64> {
     u64::try_from(value).with_context(|| format!("{label} does not fit in u64"))
+}
+
+/// The `ModelRequirement` view of one T2VA request: the per-evaluation re-read
+/// set is the steady demand, the AdaLN projections and the text encoder
+/// stream once.
+pub struct H3T2vaRequirement {
+    steady_weight_bytes: u64,
+    single_pass_weight_bytes: u64,
+    memory_materialization_bytes: u64,
+    activation_peak_bytes: u64,
+    flops_per_evaluation: u64,
+    chunk_ladder: Vec<(ff_core::configure::ChunkPlan, u64)>,
+}
+
+/// The chunk ladder the deriver searches, largest last. The top entry is the
+/// measured performance optimum of the 2026-09 chunk scan; larger entries fit
+/// more devices but compute slower.
+const CHUNK_LADDER: [(usize, usize, usize); 4] = [
+    (512, 128, 512),
+    (1024, 256, 1024),
+    (2048, 512, 1024),
+    (4096, 1024, 1024),
+];
+
+impl H3T2vaRequirement {
+    pub fn from_estimate(
+        estimate: &ResourceEstimate,
+        encoder_weight_bytes: u64,
+        flash_attention: bool,
+        backend_workspace_bytes: u64,
+        materialization_override: Option<u64>,
+    ) -> Result<Self> {
+        let traffic = &estimate.compute_and_traffic;
+        let steady = traffic.transformer_weight_bytes_per_evaluation_with_adaln_precompute;
+        let single_pass = traffic
+            .transformer_weight_bytes_per_evaluation_without_adaln_precompute
+            .saturating_sub(steady)
+            .saturating_add(encoder_weight_bytes);
+        let mut assumptions = estimate.assumptions;
+        assumptions.use_flash_attention = flash_attention;
+        let mut chunk_ladder = Vec::with_capacity(CHUNK_LADDER.len());
+        for (projection, feed_forward, output) in CHUNK_LADDER {
+            let mut geometry = estimate.geometry;
+            geometry.attention_projection_chunk_size = projection;
+            geometry.attention_query_chunk_size = projection;
+            geometry.ffn_token_chunk_size = feed_forward;
+            geometry.output_token_chunk_size = output;
+            let entry = ResourceEstimate::for_shape(estimate.model, geometry, assumptions)?;
+            chunk_ladder.push((
+                ff_core::configure::ChunkPlan {
+                    attention_projection: projection,
+                    feed_forward,
+                    output,
+                },
+                entry
+                    .peak_device_bytes
+                    .saturating_add(backend_workspace_bytes),
+            ));
+        }
+        Ok(Self {
+            steady_weight_bytes: steady,
+            single_pass_weight_bytes: single_pass,
+            memory_materialization_bytes: materialization_override.unwrap_or(
+                estimate
+                    .weights
+                    .checkpoint_bytes
+                    .context("resource estimate carries no transformer checkpoint size")?,
+            ),
+            activation_peak_bytes: chunk_ladder
+                .last()
+                .map(|(_, peak)| *peak)
+                .context("the chunk ladder is empty")?,
+            flops_per_evaluation: traffic.total_flops_per_evaluation,
+            chunk_ladder,
+        })
+    }
+}
+
+impl ff_core::configure::ModelRequirement for H3T2vaRequirement {
+    fn steady_weight_bytes(&self) -> Result<u64> {
+        Ok(self.steady_weight_bytes)
+    }
+
+    fn activation_peak_bytes(&self) -> Result<u64> {
+        Ok(self.activation_peak_bytes)
+    }
+
+    fn single_pass_weight_bytes(&self) -> Result<u64> {
+        Ok(self.single_pass_weight_bytes)
+    }
+
+    fn flops_per_evaluation(&self) -> Result<u64> {
+        Ok(self.flops_per_evaluation)
+    }
+
+    fn largest_chunk_plan_within(
+        &self,
+        activation_budget_bytes: u64,
+    ) -> Result<Option<ff_core::configure::SelectedChunkPlan>> {
+        Ok(self
+            .chunk_ladder
+            .iter()
+            .filter(|(_, peak)| *peak <= activation_budget_bytes)
+            .max_by_key(|(plan, _)| plan.feed_forward)
+            // Nothing fits: hand over the smallest plan rather than the
+            // caller's static defaults, which are the most expensive ones.
+            // Admission still sees the real peak and refuses honestly.
+            .or_else(|| self.chunk_ladder.first())
+            .map(|(plan, peak)| ff_core::configure::SelectedChunkPlan {
+                plan: *plan,
+                peak_device_bytes: *peak,
+            }))
+    }
+
+    fn memory_materialization_bytes(&self) -> Result<u64> {
+        Ok(self.memory_materialization_bytes)
+    }
 }
 
 #[cfg(test)]

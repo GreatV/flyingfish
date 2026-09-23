@@ -204,7 +204,13 @@ impl VisionTower {
         let sin_values = sin.to_vec1::<f32>()?;
         let tokens = rows * columns;
         for block in &self.blocks {
-            let normed = rms_norm_flat(&values, &block.norm1, tokens, hidden)?;
+            let normed = rms_norm_flat(
+                &values,
+                &block.norm1,
+                tokens,
+                hidden,
+                self.config.rms_norm_eps,
+            )?;
             let mut qkv = Vec::with_capacity(tokens * 3 * hidden);
             for token in 0..tokens {
                 qkv.extend(linear_with_bias(
@@ -253,7 +259,13 @@ impl VisionTower {
             for (slot, delta) in values.iter_mut().zip(projected.iter()) {
                 *slot += delta;
             }
-            let normed = rms_norm_flat(&values, &block.norm2, tokens, hidden)?;
+            let normed = rms_norm_flat(
+                &values,
+                &block.norm2,
+                tokens,
+                hidden,
+                self.config.rms_norm_eps,
+            )?;
             let mut mlp = Vec::with_capacity(tokens * hidden);
             let inter = self.config.intermediate_size;
             for token in 0..tokens {
@@ -282,7 +294,13 @@ impl VisionTower {
                 *slot += delta;
             }
         }
-        let normalized = rms_norm_flat(&values, &self.norm_weight, tokens, hidden)?;
+        let normalized = rms_norm_flat(
+            &values,
+            &self.norm_weight,
+            tokens,
+            hidden,
+            self.config.rms_norm_eps,
+        )?;
         Tensor::from_vec(normalized, (tokens, hidden), device).map_err(anyhow::Error::from)
     }
 }
@@ -292,10 +310,11 @@ fn rms_norm_flat(
     weight: &Tensor,
     tokens: usize,
     hidden: usize,
+    eps: f64,
 ) -> Result<Vec<f32>> {
     let tensor = Tensor::from_vec(values.to_vec(), (tokens, hidden), weight.device())
         .map_err(anyhow::Error::from)?;
-    Ok(rms_norm(&tensor, weight, 1e-6)?
+    Ok(rms_norm(&tensor, weight, eps)?
         .flatten_all()?
         .to_vec1::<f32>()?)
 }
@@ -421,6 +440,7 @@ mod tests {
             max_image_tokens: 64,
             min_pixels: 16,
             max_wh_ratio: None,
+            rms_norm_eps: 1e-6,
         };
         let mut weight = vec![0.0f32; hidden * 3 * 4];
         // Row r responds only to channel r/4 of the flattened patch row, so
@@ -529,6 +549,7 @@ mod tests {
             max_image_tokens: 64,
             min_pixels: 16,
             max_wh_ratio: None,
+            rms_norm_eps: 1e-6,
         };
         let weight = |rows: usize, columns: usize| {
             Tensor::from_vec(
