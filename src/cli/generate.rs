@@ -57,7 +57,6 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
@@ -161,8 +160,9 @@ const MAX_GENERATION_INITIALIZATION_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_EXECUTION_POLICY_BYTES: u64 = 1024 * 1024;
 const MAX_GENERATION_COMPLETION_BYTES: u64 = 1024 * 1024;
 const GENERATION_READY_BYTES: &[u8] = b"flyingfish-h3-generation-schema-2\n";
-#[cfg(test)]
 static FRAME_STAGING_NONCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "cuda")]
+const AUDIO_VAE_ACTIVATION_ALLOWANCE_BYTES: u64 = 256 << 20;
 
 const GENERATION_COMPLETION_SCHEMA_VERSION: u32 = 1;
 
@@ -1492,9 +1492,8 @@ impl DecodeStage<'_> {
                 let mut attempt = 0usize;
                 let frames = loop {
                     attempt += 1;
-                    let attempt_staging = staging_dir
-                        .join(format!(".vae-attempt-{attempt}"))
-                        .join("frames");
+                    let attempt_root = create_vae_attempt_directory(staging_dir, attempt)?;
+                    let attempt_staging = attempt_root.join("frames");
                     std::fs::create_dir_all(&attempt_staging)?;
                     let decode_result = (|| -> Result<(usize, PathBuf)> {
                         let decoder = match cache_cap {
@@ -2565,8 +2564,12 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
         }
         let free_u64 = free_after as u64;
         let total_u64 = total as u64;
-        // A safety margin for the decode workspace and CUDA context overhead.
-        let margin: u64 = 2 << 30; // 2 GiB
+        // A safety margin for the decode workspace and CUDA context
+        // overhead, plus the audio decode that runs concurrently on this
+        // device: its weights and activations.
+        let margin: u64 = (2u64 << 30)
+            .saturating_add(directory_tree_bytes(&audio_vae_dir)?)
+            .saturating_add(AUDIO_VAE_ACTIVATION_ALLOWANCE_BYTES);
         // Cards with less than half their memory free at the decode boundary
         // won't benefit enough from partial residency to offset the cost.
         let cap = vae_resident_bytes
@@ -2574,11 +2577,12 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
             .map(|ideal| ideal.min(free_u64.saturating_sub(margin)))
             .filter(|&cap| cap > (1 << 30)); // below 1 GiB, streaming is better
         eprintln!(
-            "decode boundary: memory pool trimmed, free {} -> {} MiB / {} MiB total; \\
-             VAE cache cap {} ({})",
+            "decode boundary: memory pool trimmed, free {} -> {} MiB / {} MiB total; \
+             margin {} MiB; VAE cache cap {} ({})",
             free_before / (1024 * 1024),
             free_after / (1024 * 1024),
             total / (1024 * 1024),
+            margin / (1024 * 1024),
             cap.map(|c| format!("{} MiB", c / (1024 * 1024)))
                 .unwrap_or_else(|| "streaming".to_owned()),
             if cap.is_some() {
@@ -3098,6 +3102,32 @@ fn create_frame_staging_directory(staging_dir: &Path) -> Result<PathBuf> {
     }
     bail!(
         "failed to allocate a unique frame staging directory in {}",
+        staging_dir.display()
+    )
+}
+
+fn create_vae_attempt_directory(staging_dir: &Path, attempt: usize) -> Result<PathBuf> {
+    for _ in 0..1024 {
+        let nonce = FRAME_STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = staging_dir.join(format!(
+            ".vae-attempt-{attempt}-{}-{nonce:016x}",
+            std::process::id()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create VAE attempt staging directory {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!(
+        "failed to allocate a unique VAE attempt staging directory in {}",
         staging_dir.display()
     )
 }
@@ -4147,6 +4177,17 @@ mod tests {
         let path = directory.join(format!("checkpoint-step{completed_steps:06}.safetensors"));
         publish_checkpoint_at(&path, completed_steps);
         path
+    }
+
+    #[test]
+    fn vae_attempt_directories_never_reuse_a_leftover_attempt_path() {
+        let staging_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(staging_dir.path().join(".vae-attempt-1")).unwrap();
+        let first = create_vae_attempt_directory(staging_dir.path(), 1).unwrap();
+        let second = create_vae_attempt_directory(staging_dir.path(), 1).unwrap();
+        assert_ne!(first, second);
+        assert!(first.is_dir());
+        assert!(second.is_dir());
     }
 
     #[test]
