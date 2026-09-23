@@ -2914,16 +2914,19 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         let total_worker_peaks: u64 = worker_peaks.iter().sum();
         let aggregate_host_peak = total_worker_peaks.saturating_add(shared_mapped_bytes);
         let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device));
+        // The aggregate ceiling is the tighter of the machine's available
+        // host memory and the operator's --max-host-mib hard cap.
         let available = snapshot
             .cgroup_v2_memory_available_bytes
             .into_iter()
             .chain(snapshot.host_memory_available_bytes)
+            .chain(max_host_mib.map(|mib| mib << 20))
             .min();
         if let Some(available) = available {
             anyhow::ensure!(
                 aggregate_host_peak <= available,
-                "multi-device generation needs {} B of host across workers but only {} B is \
-                 available",
+                "multi-device generation needs {} B of host across workers but the host limit \
+                 is {} B",
                 aggregate_host_peak,
                 available
             );
