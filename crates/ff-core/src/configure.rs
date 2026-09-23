@@ -221,6 +221,7 @@ mod tests {
             schema_version: crate::topology::TOPOLOGY_PROFILE_SCHEMA_VERSION,
             fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu),
             host_memory_total_bytes: host,
+            cgroup_memory_limit_bytes: None,
             devices: device
                 .map(|bytes| {
                     vec![TopologyDevice {

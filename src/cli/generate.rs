@@ -1664,6 +1664,11 @@ fn load_or_capture_topology(
                     } => {
                         "recorded under an older schema"
                     }
+                    flyingfish::runtime::topology::TopologyProfileAbsence::CgroupLimitChanged {
+                        ..
+                    } => {
+                        "recorded under a different cgroup memory limit"
+                    }
                 }
             );
             let profile = TopologyProfile::capture(primary);
@@ -1688,6 +1693,12 @@ fn derive_t2va_configuration(
     let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
     assumptions.evaluation_count = evaluations as u64;
     assumptions.precompute_adaln_steps = evaluations as u64;
+    if !primary.is_cuda() {
+        // The CPU preflight promotes weights to F32 and folds the device
+        // peak into the host ledger; the bound mirrors that accounting.
+        assumptions.weight_element_bytes = 4;
+        assumptions.device_memory_is_host = true;
+    }
     let estimate = ResourceEstimate::for_t2va(&config, geometry, assumptions)?;
     let encoder_bytes = directory_tree_bytes(&model_root.join("text_encoder"))?;
     // The catalog is header-only. Its payload total is the materialization
@@ -1711,7 +1722,17 @@ fn derive_t2va_configuration(
     };
     let materialization_bytes = catalog
         .as_ref()
-        .map(|inventory| inventory.total_bytes(ff_core::weights::CacheGranularity::Tensor))
+        .map(|inventory| -> Result<u64> {
+            // Shard-granularity retention holds whole files: the payload
+            // total plus every safetensors header.
+            let payload = inventory.total_bytes(ff_core::weights::CacheGranularity::Tensor)?;
+            let headers = inventory
+                .shards
+                .iter()
+                .map(|shard| shard.header_bytes)
+                .sum::<u64>();
+            Ok(payload.saturating_add(headers))
+        })
         .transpose()?;
     let workspace_bytes = if flash_attention {
         super::DEFAULT_FLASH_BACKEND_WORKSPACE_MIB << 20
@@ -1901,7 +1922,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
             derived
                 .as_ref()
                 .and_then(|derived| derived.host_cache_ceiling_bytes)
-                .map(|bytes| bytes >> 20)
+                .map(|bytes| bytes.div_ceil(1 << 20))
         })
         .flatten();
     let optional_weight_args =

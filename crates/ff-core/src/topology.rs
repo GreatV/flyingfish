@@ -15,7 +15,7 @@ use crate::probe::{
     describes_same_machine,
 };
 
-pub const TOPOLOGY_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const TOPOLOGY_PROFILE_SCHEMA_VERSION: u32 = 2;
 const MAX_ENUMERATED_DEVICES: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -44,6 +44,10 @@ pub struct TopologyProfile {
     pub schema_version: u32,
     pub fingerprint: HardwareFingerprint,
     pub host_memory_total_bytes: Option<u64>,
+    /// The cgroup limit at capture time: a container whose limit changes
+    /// invalidates the recorded pool total even though the machine is the
+    /// same.
+    pub cgroup_memory_limit_bytes: Option<u64>,
     pub devices: Vec<TopologyDevice>,
     pub interconnect: InterconnectLevel,
     pub storage_bytes_per_second: Option<u64>,
@@ -61,12 +65,22 @@ pub enum TopologyProfileAbsence {
         path: PathBuf,
         recorded: u32,
     },
+    CgroupLimitChanged {
+        path: PathBuf,
+        recorded: Option<u64>,
+        current: Option<u64>,
+    },
 }
 
 impl TopologyProfile {
     pub fn capture(primary: &Device) -> Self {
         let fingerprint = HardwareFingerprint::collect(primary);
-        let host_memory_total_bytes = ResourceSnapshot::capture(None).host_pool_total_bytes();
+        let snapshot = ResourceSnapshot::capture(None);
+        let host_memory_total_bytes = snapshot.host_pool_total_bytes();
+        let cgroup_memory_limit_bytes = match snapshot.cgroup_v2_memory_limit {
+            Some(crate::probe::CgroupMemoryLimit::Bytes(bytes)) => Some(bytes),
+            _ => None,
+        };
         let devices = enumerate_devices(&fingerprint);
         let interconnect = if devices.len() > 1 {
             InterconnectLevel::Unknown
@@ -77,6 +91,7 @@ impl TopologyProfile {
             schema_version: TOPOLOGY_PROFILE_SCHEMA_VERSION,
             fingerprint,
             host_memory_total_bytes,
+            cgroup_memory_limit_bytes,
             devices,
             interconnect,
             storage_bytes_per_second: None,
@@ -116,6 +131,18 @@ impl TopologyProfile {
         }
         let recorded = Self::from_json(&bytes)
             .with_context(|| format!("invalid topology profile {}", path.display()))?;
+        let current_snapshot = ResourceSnapshot::capture(None);
+        let current_limit = match current_snapshot.cgroup_v2_memory_limit {
+            Some(crate::probe::CgroupMemoryLimit::Bytes(bytes)) => Some(bytes),
+            _ => None,
+        };
+        if recorded.cgroup_memory_limit_bytes != current_limit {
+            return Ok(Err(TopologyProfileAbsence::CgroupLimitChanged {
+                path: path.to_path_buf(),
+                recorded: recorded.cgroup_memory_limit_bytes,
+                current: current_limit,
+            }));
+        }
         let current = HardwareFingerprint::collect(primary);
         if !describes_same_machine(&recorded.fingerprint, &current) {
             return Ok(Err(TopologyProfileAbsence::ForeignHost {

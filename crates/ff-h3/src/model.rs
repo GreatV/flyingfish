@@ -1319,7 +1319,16 @@ impl StreamedTransformer {
         let fill_started = std::time::Instant::now();
         let mut skipped_resident = 0u64;
         let mut kick_target = stage_index + 1;
-        if self.precomputed_adaln {
+        // In the precomputed denoise loop the next executed stage after the
+        // latent input and each feed-forward is not the following AdaLN but
+        // the one after it. Everywhere else — the preparation sequence and
+        // the AdaLN stages themselves — the next plan slot is what runs.
+        let skip_adaln = self.precomputed_adaln
+            && matches!(
+                self.plan.stages().get(stage_index).map(|stage| &stage.kind),
+                Some(StageKind::LatentInput | StageKind::BlockFeedForward(_))
+            );
+        if skip_adaln {
             while let Some(stage) = self.plan.stages().get(kick_target)
                 && matches!(stage.kind, StageKind::BlockAdaLn(_))
             {

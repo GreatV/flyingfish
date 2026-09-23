@@ -1110,6 +1110,7 @@ fn machine_profile(host_bytes: u64, device_bytes: u64) -> ff_core::topology::Top
         schema_version: ff_core::topology::TOPOLOGY_PROFILE_SCHEMA_VERSION,
         fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu),
         host_memory_total_bytes: Some(host_bytes),
+        cgroup_memory_limit_bytes: None,
         devices: vec![TopologyDevice {
             ordinal: 0,
             backend: DeviceBackend::Cuda,
