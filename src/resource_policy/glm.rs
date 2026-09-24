@@ -70,7 +70,6 @@ pub fn axes(policy: &GlmExecutionPolicy) -> Result<BTreeMap<String, String>> {
     Ok(result)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn select(
     baseline: &GlmExecutionPolicy,
     breakdown: &GlmAdmissionBreakdown,
@@ -538,6 +537,7 @@ mod tests {
         },
     };
     use candle_core::Device;
+    use ff_glm::execution_policy::ExpertCacheOptions;
 
     fn baseline() -> GlmExecutionPolicy {
         GlmExecutionPolicy::from_runtime(
@@ -546,11 +546,13 @@ mod tests {
             CachePolicy::new(1),
             false,
             32,
-            ExpertCacheLayout::PerLayerSplit,
-            ExpertCacheReplacementPolicy::Lru,
-            0,
-            0,
-            false,
+            ExpertCacheOptions {
+                layout: ExpertCacheLayout::PerLayerSplit,
+                replacement: ExpertCacheReplacementPolicy::Lru,
+                maximum_bound_bytes: 0,
+                minimum_bound_bytes: 0,
+                adaptive: false,
+            },
         )
         .unwrap()
     }

@@ -76,6 +76,7 @@ impl GlmPartitionPolicy {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
+    use crate::execution_policy::ExpertCacheOptions;
     #[test]
     fn partition_policy_binds_devices_scopes_and_consistent_numerics() {
         use crate::{
@@ -89,11 +90,13 @@ mod tests {
             CachePolicy::new(1),
             true,
             8,
-            ExpertCacheLayout::PerLayerSplit,
-            ExpertCacheReplacementPolicy::Lru,
-            1024,
-            1024,
-            false,
+            ExpertCacheOptions {
+                layout: ExpertCacheLayout::PerLayerSplit,
+                replacement: ExpertCacheReplacementPolicy::Lru,
+                maximum_bound_bytes: 1024,
+                minimum_bound_bytes: 1024,
+                adaptive: false,
+            },
         )
         .unwrap();
         execution.backend = GlmExecutionBackend::Cuda;

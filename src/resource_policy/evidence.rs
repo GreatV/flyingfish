@@ -652,6 +652,7 @@ impl MeasuredCandidate {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use ff_glm::execution_policy::ExpertCacheOptions;
 
     #[test]
     fn executable_matching_uses_stat_metadata_rather_than_content() -> Result<()> {
@@ -735,11 +736,13 @@ pub(crate) mod tests {
             CachePolicy::new(1),
             false,
             32,
-            ExpertCacheLayout::PerLayerSplit,
-            ExpertCacheReplacementPolicy::Lru,
-            0,
-            0,
-            false,
+            ExpertCacheOptions {
+                layout: ExpertCacheLayout::PerLayerSplit,
+                replacement: ExpertCacheReplacementPolicy::Lru,
+                maximum_bound_bytes: 0,
+                minimum_bound_bytes: 0,
+                adaptive: false,
+            },
         )
         .unwrap();
         let mut policy = base.clone();

@@ -408,20 +408,40 @@ pub(crate) struct RoutingTraceBuilder {
     max_routed_tokens: usize,
 }
 
+/// The router's scoring configuration a routing trace describes.
+pub struct RoutingSource {
+    pub cache_entry_dtype: ExpertCacheEntryDtype,
+    pub routed_scaling_factor: f64,
+    pub norm_topk_prob: bool,
+}
+
+/// The sparse-layer geometry a routing trace describes.
+pub struct RoutingLayerGeometry {
+    pub num_hidden_layers: usize,
+    pub num_experts: usize,
+    pub experts_per_token: usize,
+}
+
 impl RoutingTraceBuilder {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         domain: &str,
-        cache_entry_dtype: ExpertCacheEntryDtype,
-        routed_scaling_factor: f64,
-        norm_topk_prob: bool,
-        num_hidden_layers: usize,
-        num_experts: usize,
-        experts_per_token: usize,
+        source: &RoutingSource,
+        geometry: &RoutingLayerGeometry,
         prompt_tokens: usize,
         max_routed_tokens: usize,
         layers: Vec<RoutingTraceLayer>,
     ) -> Result<Self> {
+        let RoutingSource {
+            cache_entry_dtype,
+            routed_scaling_factor,
+            norm_topk_prob,
+        } = *source;
+        let RoutingLayerGeometry {
+            num_hidden_layers,
+            num_experts,
+            experts_per_token,
+        } = *geometry;
+
         validate_routing_trace_domain(domain)?;
         ensure!(
             max_routed_tokens > 0 && max_routed_tokens <= MAX_ROUTING_TRACE_TOKENS,
