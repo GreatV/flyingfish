@@ -1582,6 +1582,7 @@ mod tests {
         recorded.execution_backend = flyingfish::h3::policy::ExecutionBackendPolicy::Cuda;
         *recorded.numerics = flyingfish::h3::policy::H3NumericalContract::for_verified_target(
             flyingfish::h3::policy::ExecutionBackendPolicy::Cuda,
+            flyingfish::h3::policy::AttentionBackendPolicy::FullSoftmax,
         )
         .unwrap();
         recorded.validate().unwrap();
@@ -1597,6 +1598,7 @@ mod tests {
                 tuned_kernels: false,
                 reference_libraries: true,
             }),
+            flyingfish::h3::policy::AttentionBackendPolicy::FullSoftmax,
         )
         .unwrap();
         requested.validate().unwrap();

@@ -1167,11 +1167,15 @@ mod tests {
                 return;
             }
         };
-        let weights = Edge0Weights::open(Path::new(concat!(
+        let checkpoint = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../models/Edge0/Edge0-35B-A3B-preview"
-        )))
-        .unwrap();
+        ));
+        if !checkpoint.is_dir() {
+            eprintln!("no Edge0 checkpoint; skipping gpu test");
+            return;
+        }
+        let weights = Edge0Weights::open(checkpoint).unwrap();
         let name = "language_model.model.layers.3.self_attn.q_proj";
         let quant = weights.quant_projection(name).unwrap();
         let gpu = ctx.upload(&quant, None).unwrap();

@@ -296,7 +296,7 @@ pub(super) fn run_solve_t2va(command: H3Command) -> Result<()> {
         output_token_chunk_size: DEFAULT_OUTPUT_TOKEN_CHUNK_SIZE,
     };
     let model_shape = TransformerShape::from_config(&config);
-    let mut base_policy = conservative_solver_base_policy(cpu)?;
+    let mut base_policy = ExecutionPolicy::conservative(cpu)?;
     if let Some(mib) = host_cache_mib {
         base_policy.weights.cache_bytes = Some(mib_to_bytes(mib)?);
     }
@@ -567,46 +567,6 @@ fn resource_budget(
     })
 }
 
-fn conservative_solver_base_policy(cpu: bool) -> Result<ExecutionPolicy> {
-    use flyingfish::h3::policy::{
-        AttentionBackendPolicy, AttentionExecutionPolicy, EXECUTION_POLICY_SCHEMA_VERSION,
-        ExecutionBackendPolicy, H3NumericalContract, WeightExecutionPolicy, WeightSourcePolicy,
-    };
-
-    let execution_backend = if cpu {
-        ExecutionBackendPolicy::Cpu
-    } else {
-        ExecutionBackendPolicy::Cuda
-    };
-    let policy = ExecutionPolicy {
-        schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
-        execution_backend,
-        numerics: Box::new(H3NumericalContract::for_verified_target(
-            execution_backend,
-            AttentionBackendPolicy::FullSoftmax,
-        )?),
-        attention: AttentionExecutionPolicy {
-            backend: AttentionBackendPolicy::FullSoftmax,
-            configured_projection_rows: 1,
-            configured_query_rows: 1,
-            configured_key_rows: None,
-        },
-        configured_ffn_rows: 1,
-        configured_output_rows: 1,
-        weights: WeightExecutionPolicy {
-            host_phase_priority: false,
-            device_cache: Default::default(),
-            source: WeightSourcePolicy::Mmap,
-            cache_shards: 1,
-            cache_bytes: None,
-            granularity: CacheGranularity::Shard,
-        },
-        precompute_adaln: true,
-    };
-    policy.validate()?;
-    Ok(policy)
-}
-
 fn print_execution_plan_stages(plan: &H3ExecutionPlan) {
     for stage in plan.stages() {
         println!(
@@ -657,11 +617,12 @@ fn display_optional_budget_bytes(value: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "cuda"))]
     use candle_core::Device;
 
     #[test]
     fn symbolic_cuda_solver_policy_is_bound_without_a_cuda_build() {
-        let policy = conservative_solver_base_policy(false).unwrap();
+        let policy = ExecutionPolicy::conservative(false).unwrap();
         assert_eq!(
             policy.execution_backend,
             flyingfish::h3::policy::ExecutionBackendPolicy::Cuda
