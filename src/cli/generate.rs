@@ -2,7 +2,7 @@ use super::DenoiseChunkArgs;
 use super::H3Command;
 use super::checkpoint::resolve_component;
 use super::denoise::{
-    CliDenoiseObserver, EvaluationCheckpointObserver, publish_t2va_checkpoint,
+    CheckpointContent, CliDenoiseObserver, EvaluationCheckpointObserver, publish_t2va_checkpoint,
     report_h3_device_cache, resolve_execution_policy, select_resume_execution_policy,
     validate_executable_policy,
 };
@@ -70,17 +70,28 @@ const GENERATION_READY_FILE: &str = "generation-ready";
 const EXECUTION_POLICY_FILE: &str = "execution-policy.json";
 const RESOURCE_SELECTION_FILE: &str = "resource-selection.json";
 
-#[allow(clippy::too_many_arguments)]
+/// The latent geometry the noise tensors are shaped by.
+pub(crate) struct LatentShape {
+    pub latent_frames: usize,
+    pub latent_height: usize,
+    pub latent_width: usize,
+    pub audio_frames: usize,
+    pub audio_channels: usize,
+}
+
 pub(crate) fn make_t2va_noise(
     config: &TransformerConfig,
-    latent_frames: usize,
-    latent_height: usize,
-    latent_width: usize,
-    audio_frames: usize,
-    audio_channels: usize,
+    shape: LatentShape,
     seed: u64,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
+    let LatentShape {
+        latent_frames,
+        latent_height,
+        latent_width,
+        audio_frames,
+        audio_channels,
+    } = shape;
     let mut rng = StdRng::seed_from_u64(seed);
     let video_count = config
         .in_channels
@@ -917,7 +928,6 @@ struct GenerationResourceRequest<'a> {
 /// the policy it resumed with. Otherwise the planner may promote the baseline,
 /// which is a change to both the policy and its recorded provenance, so it
 /// reports both rather than leaving the caller to infer the second.
-#[allow(clippy::too_many_arguments)]
 fn select_generation_resources(
     remaining_evaluations: usize,
     execution_policy: &mut ExecutionPolicy,
@@ -1039,6 +1049,18 @@ fn select_generation_resources(
 /// it was sealed under, and how far denoising actually got. Answering them in
 /// one place is what keeps a half-initialized directory from being read as a
 /// resumable one.
+/// The on-disk paths one generation run reads at discovery time.
+struct RunPaths<'a> {
+    output_dir: &'a Path,
+    initialization_path: &'a Path,
+    ready_path: &'a Path,
+    policy_path: &'a Path,
+    request_path: &'a Path,
+    staging_dir: &'a Path,
+    checkpoint_dir: &'a Path,
+    latent_path: &'a Path,
+}
+
 struct RecordedRun {
     initialization: Option<GenerationInitialization>,
     initialization_complete: bool,
@@ -1048,19 +1070,18 @@ struct RecordedRun {
 }
 
 impl RecordedRun {
-    #[allow(clippy::too_many_arguments)]
-    fn discover(
-        existing_run: bool,
-        output_dir: &Path,
-        initialization_path: &Path,
-        ready_path: &Path,
-        policy_path: &Path,
-        request_path: &Path,
-        staging_dir: &Path,
-        checkpoint_dir: &Path,
-        latent_path: &Path,
-        sigma_points: usize,
-    ) -> Result<Self> {
+    fn discover(existing_run: bool, paths: &RunPaths<'_>, sigma_points: usize) -> Result<Self> {
+        let RunPaths {
+            output_dir,
+            initialization_path,
+            ready_path,
+            policy_path,
+            request_path,
+            staging_dir,
+            checkpoint_dir,
+            latent_path,
+        } = *paths;
+
         let recorded_initialization = if existing_run && initialization_path.exists() {
             Some(load_generation_initialization(initialization_path)?)
         } else {
@@ -1135,30 +1156,46 @@ impl RecordedRun {
 /// Both paths have to produce a state the sealed initialization accepts, so
 /// they are written as the two arms of one decision rather than as two places
 /// that separately decide what a starting state is.
-#[allow(clippy::too_many_arguments)]
+/// The prompt and model sources one generation state is built from.
+struct GenerationInputs<'a> {
+    device: &'a Device,
+    transformer_config: &'a TransformerConfig,
+    generation_request: &'a GenerationRequest,
+    model: &'a Path,
+    tokenizer: &'a Tokenizer,
+    token_ids: &'a [u32],
+    prompt: &'a str,
+    target_hidden_state: usize,
+    pre_encoded: Option<&'a flyingfish::h3::text_encoder::PromptEncoding>,
+}
+
 fn load_or_initialize_state(
     resume_checkpoint: Option<&ResumeCheckpoint>,
     schedule_steps: usize,
     no_progress: bool,
-    device: &Device,
-    transformer_config: &TransformerConfig,
-    generation_request: &GenerationRequest,
-    model: &Path,
-    tokenizer: &Tokenizer,
-    token_ids: &[u32],
-    prompt: &str,
-    target_hidden_state: usize,
-    latent_frames: usize,
-    latent_height: usize,
-    latent_width: usize,
-    audio_frames: usize,
-    audio_channels: usize,
+    inputs: GenerationInputs<'_>,
+    shape: LatentShape,
     seed: u64,
-    _weight_source: WeightSource,
-    _execution_cache_policy: CachePolicy,
     transformer_chunking: TransformerChunking,
-    pre_encoded: Option<&flyingfish::h3::text_encoder::PromptEncoding>,
 ) -> Result<GenerationState> {
+    let GenerationInputs {
+        device,
+        transformer_config,
+        generation_request,
+        model,
+        tokenizer,
+        token_ids,
+        prompt,
+        target_hidden_state,
+        pre_encoded,
+    } = inputs;
+    let LatentShape {
+        latent_frames,
+        latent_height,
+        latent_width,
+        audio_frames,
+        audio_channels,
+    } = shape;
     Ok(match resume_checkpoint {
         Some(checkpoint) => {
             if !no_progress {
@@ -1220,11 +1257,13 @@ fn load_or_initialize_state(
             };
             let (video_latents, audio_latents) = make_t2va_noise(
                 transformer_config,
-                latent_frames,
-                latent_height,
-                latent_width,
-                audio_frames,
-                audio_channels,
+                LatentShape {
+                    latent_frames,
+                    latent_height,
+                    latent_width,
+                    audio_frames,
+                    audio_channels,
+                },
                 seed,
                 device,
             )?;
@@ -1261,22 +1300,43 @@ type DenoiseOutcome = (
 /// A resumed run whose checkpoint is already at the final evaluation must not
 /// open the transformer at all: doing so would spend the residency budget and
 /// the load time on a model with no work left for it.
-#[allow(clippy::too_many_arguments)]
+/// The run directories the denoise loop reads and publishes into.
+struct DenoisePaths<'a> {
+    transformer_dir: &'a Path,
+    checkpoint_dir: &'a Path,
+    staging_dir: &'a Path,
+    output_dir: &'a Path,
+}
+
+/// The schedule and progress options of one denoise pass.
+struct DenoiseOptions {
+    sigma_points: usize,
+    video_shift: f32,
+    audio_shift: f32,
+    no_progress: bool,
+}
+
 fn denoise_remaining_steps(
     state: GenerationState,
     schedule_steps: usize,
     device: &Device,
     execution_policy: &ExecutionPolicy,
-    transformer_dir: PathBuf,
+    paths: DenoisePaths<'_>,
     conditioning_provenance: &H3ConditioningProvenance,
-    checkpoint_dir: &Path,
-    staging_dir: &Path,
-    output_dir: &Path,
-    sigma_points: usize,
-    video_shift: f32,
-    audio_shift: f32,
-    no_progress: bool,
+    options: DenoiseOptions,
 ) -> Result<DenoiseOutcome> {
+    let DenoisePaths {
+        transformer_dir,
+        checkpoint_dir,
+        staging_dir,
+        output_dir,
+    } = paths;
+    let DenoiseOptions {
+        sigma_points,
+        video_shift,
+        audio_shift,
+        no_progress,
+    } = options;
     Ok(if state.completed_steps < schedule_steps {
         let transformer_options = build_transformer_options(device.clone(), execution_policy)?;
         let transformer = StreamedTransformer::open(transformer_dir, transformer_options)?;
@@ -1406,15 +1466,19 @@ impl DecodeStage<'_> {
             let completion = load_generation_completion(completion_path)?;
             validate_completed_decode(
                 &completion,
-                wav_path,
-                frames_dir,
-                audio_vae_config.sampling_rate,
-                audio_channels,
-                expected_audio_samples,
-                wav_format,
-                expected_frame_count,
-                expected_frame_width,
-                expected_frame_height,
+                &WavExpectations {
+                    wav_path,
+                    sample_rate: audio_vae_config.sampling_rate,
+                    channels: audio_channels,
+                    samples_per_channel: expected_audio_samples,
+                    format: wav_format,
+                },
+                &FrameExpectations {
+                    frames_dir,
+                    count: expected_frame_count,
+                    width: expected_frame_width,
+                    height: expected_frame_height,
+                },
             )?;
             if !no_progress {
                 eprintln!(
@@ -2138,14 +2202,16 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
 
     let recorded = RecordedRun::discover(
         existing_run,
-        &output_dir,
-        &initialization_path,
-        &ready_path,
-        &policy_path,
-        &request_path,
-        &staging_dir,
-        &checkpoint_dir,
-        &latent_path,
+        &RunPaths {
+            output_dir: &output_dir,
+            initialization_path: &initialization_path,
+            ready_path: &ready_path,
+            policy_path: &policy_path,
+            request_path: &request_path,
+            staging_dir: &staging_dir,
+            checkpoint_dir: &checkpoint_dir,
+            latent_path: &latent_path,
+        },
         sigma_points,
     )?;
     let recorded_initialization = recorded.initialization.clone();
@@ -2323,9 +2389,11 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
                 output_token_chunk_size: transformer_chunking.output_chunk_size.get(),
             },
             schedule_steps - start_step,
-            max_host_mib,
-            max_device_mib,
-            backend_workspace_mib,
+            OperatorCaps {
+                max_host_mib,
+                max_device_mib,
+                backend_workspace_mib,
+            },
             device,
         );
         let preflight = match preflight {
@@ -2438,24 +2506,26 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
         resume_checkpoint,
         schedule_steps,
         no_progress,
-        device,
-        &transformer_config,
-        &generation_request,
-        &model,
-        tokenizer,
-        token_ids,
-        &prompt,
-        target_hidden_state,
-        latent_frames,
-        latent_height,
-        latent_width,
-        audio_frames,
-        audio_channels,
+        GenerationInputs {
+            device,
+            transformer_config: &transformer_config,
+            generation_request: &generation_request,
+            model: &model,
+            tokenizer,
+            token_ids,
+            prompt: &prompt,
+            target_hidden_state,
+            pre_encoded: ctx.prompt_embeddings_pre_encoded,
+        },
+        LatentShape {
+            latent_frames,
+            latent_height,
+            latent_width,
+            audio_frames,
+            audio_channels,
+        },
         seed,
-        weight_source,
-        execution_cache_policy,
         transformer_chunking,
-        ctx.prompt_embeddings_pre_encoded,
     )?;
     // The shared multi-device encoding carries the orchestrator's chunk
     // metadata: its device axes are re-validated against this worker's card,
@@ -2489,15 +2559,19 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
         schedule_steps,
         device,
         &execution_policy,
-        transformer_dir,
+        DenoisePaths {
+            transformer_dir: &transformer_dir,
+            checkpoint_dir: &checkpoint_dir,
+            staging_dir: &staging_dir,
+            output_dir: &output_dir,
+        },
         &conditioning_provenance,
-        &checkpoint_dir,
-        &staging_dir,
-        &output_dir,
-        sigma_points,
-        video_shift,
-        audio_shift,
-        no_progress,
+        DenoiseOptions {
+            sigma_points,
+            video_shift,
+            audio_shift,
+            no_progress,
+        },
     )?;
 
     if latent_path.exists() {
@@ -2510,13 +2584,15 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
         publish_t2va_checkpoint(
             &latent_path,
             Some(&staging_dir),
-            &result,
-            &prompt_embeddings,
-            &text_token_tags_tensor,
+            &CheckpointContent {
+                latents: &result,
+                prompt_embeddings: &prompt_embeddings,
+                text_token_tags: &text_token_tags_tensor,
+                policy_history: &policy_history,
+            },
             sigma_points,
             video_shift,
             audio_shift,
-            &policy_history,
             &conditioning_provenance,
         )
         .with_context(|| {
@@ -2812,14 +2888,16 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
                 .with_context(|| format!("failed to initialize CUDA device {ordinal}"))?;
             let recorded = RecordedRun::discover(
                 worker_root.exists(),
-                &worker_root,
-                &worker_root.join(GENERATION_INITIALIZATION_FILE),
-                &worker_root.join(GENERATION_READY_FILE),
-                &worker_root.join(EXECUTION_POLICY_FILE),
-                &worker_root.join(GENERATION_REQUEST_FILE),
-                &worker_root.join(STAGING_DIRECTORY),
-                &worker_root.join(CHECKPOINT_DIRECTORY),
-                &worker_root.join(FINAL_LATENTS_FILE),
+                &RunPaths {
+                    output_dir: &worker_root,
+                    initialization_path: &worker_root.join(GENERATION_INITIALIZATION_FILE),
+                    ready_path: &worker_root.join(GENERATION_READY_FILE),
+                    policy_path: &worker_root.join(EXECUTION_POLICY_FILE),
+                    request_path: &worker_root.join(GENERATION_REQUEST_FILE),
+                    staging_dir: &worker_root.join(STAGING_DIRECTORY),
+                    checkpoint_dir: &worker_root.join(CHECKPOINT_DIRECTORY),
+                    latent_path: &worker_root.join(FINAL_LATENTS_FILE),
+                },
                 sigma_points,
             )?;
             if let Some(resume) = recorded.resume_from() {
@@ -3151,18 +3229,27 @@ fn create_vae_attempt_directory(staging_dir: &Path, attempt: usize) -> Result<Pa
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The operator-supplied admission caps preflight budgets against.
+struct OperatorCaps {
+    max_host_mib: Option<u64>,
+    max_device_mib: Option<u64>,
+    backend_workspace_mib: Option<u64>,
+}
+
 fn preflight_generation(
     transformer_dir: &Path,
     config: &TransformerConfig,
     policy: &ExecutionPolicy,
     geometry: T2vaGeometry,
     evaluation_count: usize,
-    max_host_mib: Option<u64>,
-    max_device_mib: Option<u64>,
-    backend_workspace_mib: Option<u64>,
+    caps: OperatorCaps,
     device: &Device,
 ) -> Result<GenerationPreflight> {
+    let OperatorCaps {
+        max_host_mib,
+        max_device_mib,
+        backend_workspace_mib,
+    } = caps;
     policy.validate_device(device)?;
     let sequence_rows = geometry.sequence_rows(config.patch_size)?;
     validate_h3_numerical_backend(
@@ -3490,19 +3577,41 @@ fn frame_manifest_bytes(directory: &Path) -> Result<u64> {
     u64::try_from(snapshot.bytes.len()).context("frame manifest size exceeds u64")
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The published WAV a completed decode is validated against.
+struct WavExpectations<'a> {
+    wav_path: &'a Path,
+    sample_rate: u32,
+    channels: usize,
+    samples_per_channel: usize,
+    format: WavSampleFormat,
+}
+
+/// The published PNG frames a completed decode is validated against.
+struct FrameExpectations<'a> {
+    frames_dir: &'a Path,
+    count: usize,
+    width: usize,
+    height: usize,
+}
+
 fn validate_completed_decode(
     completion: &GenerationCompletion,
-    wav_path: &Path,
-    frames_dir: &Path,
-    expected_sample_rate: u32,
-    expected_channels: usize,
-    expected_samples_per_channel: usize,
-    expected_format: WavSampleFormat,
-    expected_frame_count: usize,
-    expected_frame_width: usize,
-    expected_frame_height: usize,
+    wav: &WavExpectations<'_>,
+    frames: &FrameExpectations<'_>,
 ) -> Result<()> {
+    let WavExpectations {
+        wav_path,
+        sample_rate: expected_sample_rate,
+        channels: expected_channels,
+        samples_per_channel: expected_samples_per_channel,
+        format: expected_format,
+    } = *wav;
+    let FrameExpectations {
+        frames_dir,
+        count: expected_frame_count,
+        width: expected_frame_width,
+        height: expected_frame_height,
+    } = *frames;
     completion.validate()?;
     validate_existing_wav(
         wav_path,
@@ -4180,13 +4289,15 @@ mod tests {
         publish_t2va_checkpoint(
             path,
             None,
-            &latents,
-            &prompt,
-            &tags,
+            &CheckpointContent {
+                latents: &latents,
+                prompt_embeddings: &prompt,
+                text_token_tags: &tags,
+                policy_history: &history,
+            },
             4,
             12.0,
             3.0,
-            &history,
             &H3ConditioningProvenance::FlyingfishQwen(Box::new(qwen_contract(&policy, 1))),
         )
         .unwrap();
@@ -4231,13 +4342,15 @@ mod tests {
         let error = publish_t2va_checkpoint(
             &path,
             None,
-            &latents,
-            &prompt,
-            &tags,
+            &CheckpointContent {
+                latents: &latents,
+                prompt_embeddings: &prompt,
+                text_token_tags: &tags,
+                policy_history: &PolicyHistory::new(),
+            },
             2,
             12.0,
             3.0,
-            &PolicyHistory::new(),
             &invalid,
         )
         .unwrap_err();
@@ -4556,15 +4669,19 @@ mod tests {
         assert_eq!(loaded, completion);
         validate_completed_decode(
             &loaded,
-            &concurrent_wav,
-            &concurrent_frames,
-            32_000,
-            2,
-            6,
-            WavSampleFormat::Pcm16,
-            1,
-            2,
-            2,
+            &WavExpectations {
+                wav_path: &concurrent_wav,
+                sample_rate: 32_000,
+                channels: 2,
+                samples_per_channel: 6,
+                format: WavSampleFormat::Pcm16,
+            },
+            &FrameExpectations {
+                frames_dir: &concurrent_frames,
+                count: 1,
+                width: 2,
+                height: 2,
+            },
         )
         .unwrap();
     }
@@ -4995,9 +5112,11 @@ mod tests {
                 output_token_chunk_size: 1,
             },
             1,
-            Some(0),
-            None,
-            Some(0),
+            OperatorCaps {
+                max_host_mib: Some(0),
+                max_device_mib: None,
+                backend_workspace_mib: Some(0),
+            },
             &Device::Cpu,
         )
         .unwrap_err();
