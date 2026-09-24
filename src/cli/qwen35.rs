@@ -111,7 +111,8 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
                     bail!("prompt + generation {total} exceeds the {GPU_CONTEXT_CAP} kernel cap");
                 }
             } else {
-                match checkpoint_fits_free_vram(&ordinals, &model_dir, &config, total)? {
+                match checkpoint_fits_free_vram(&ordinals, &model_dir, &config, total, speculative)?
+                {
                     true => TextDevice::Cuda(ordinals),
                     false if auto => {
                         eprintln!(
@@ -233,6 +234,7 @@ fn checkpoint_fits_free_vram(
     model_dir: &Path,
     config: &Qwen35Config,
     total_tokens: usize,
+    speculative: bool,
 ) -> Result<bool> {
     anyhow::ensure!(
         !ordinals.is_empty(),
@@ -246,6 +248,10 @@ fn checkpoint_fits_free_vram(
     let weights = Qwen35Weights::open(model_dir)
         .with_context(|| format!("open weights for {}", model_dir.display()))?;
     let ranges = flyingfish::qwen35::gpu::partition_layers(&weights, config, ordinals.len())?;
+    // QwenSpec adds the B-column activation set, a whole extra MTP decoder
+    // layer and its own KV cache on top of the resident plan; reserve for
+    // them up front so admission reflects the speculative footprint.
+    const SPEC_VRAM_RESERVE_BYTES: u64 = 2 << 30;
     let free: Vec<u64> = ordinals
         .iter()
         .map(|&ordinal| {
@@ -254,14 +260,43 @@ fn checkpoint_fits_free_vram(
             Ok(context.mem_get_info().context("mem_get_info")?.0 as u64)
         })
         .collect::<Result<Vec<_>>>()?;
+    let free = free
+        .into_iter()
+        .map(|free| {
+            if speculative {
+                free.saturating_sub(SPEC_VRAM_RESERVE_BYTES)
+            } else {
+                free
+            }
+        })
+        .collect::<Vec<_>>();
     let plans = flyingfish::qwen35::gpu::plan_residency(&weights, config, &ranges, max_ctx, &free)?;
-    Ok(plans
-        .iter()
-        .all(|plan| plan.residency != flyingfish::qwen35::gpu::Residency::Insufficient))
+    let residency_ok = if speculative {
+        plans
+            .iter()
+            .all(|plan| plan.residency == flyingfish::qwen35::gpu::Residency::Resident)
+    } else {
+        plans
+            .iter()
+            .all(|plan| plan.residency != flyingfish::qwen35::gpu::Residency::Insufficient)
+    };
+    if speculative && !residency_ok {
+        eprintln!(
+            "--speculative needs a fully resident plan with a 2 GiB reserve; \
+                   this device only admits streaming or too-tight residency"
+        );
+    }
+    Ok(residency_ok)
 }
 
 #[cfg(not(feature = "cuda"))]
-fn checkpoint_fits_free_vram(_: &[usize], _: &Path, _: &Qwen35Config, _: usize) -> Result<bool> {
+fn checkpoint_fits_free_vram(
+    _: &[usize],
+    _: &Path,
+    _: &Qwen35Config,
+    _: usize,
+    _: bool,
+) -> Result<bool> {
     Ok(true)
 }
 
@@ -439,9 +474,16 @@ fn generate_cuda_speculative(
     let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
     let (mut accepts, mut rejects, mut skips) = (0usize, 0usize, 0usize);
     let mut pending = gpu.read_token()?;
-    spec.draft(gpu, Some(&gpu.hidden), pending)?;
-    let mut have_draft = true;
     let started = Instant::now();
+    // The first round gates its draft on the post-prefill margin exactly
+    // like every later round.
+    let initial_margin = spec.step_margin(gpu)?;
+    let mut have_draft = gate.is_none_or(|t| initial_margin >= t);
+    if have_draft {
+        spec.draft(gpu, Some(&gpu.hidden), pending)?;
+    } else {
+        skips += 1;
+    }
     while generated.len() < max_new_tokens {
         // `pending` is a model-confirmed token carried from the previous
         // round (or the prefill's first); emit it alone and stop when it is
@@ -486,7 +528,10 @@ fn generate_cuda_speculative(
             if generated.len() >= max_new_tokens {
                 break;
             }
-            if have_draft {
+            // Draft for the next round only when that round can actually
+            // verify: two free slots and a non-EOS pending. Otherwise the
+            // draft would be computed and thrown away.
+            if have_draft && generated.len() + 2 <= max_new_tokens && !eos(&pending) {
                 if accepted {
                     spec.draft(gpu, None, b)?;
                 } else {
