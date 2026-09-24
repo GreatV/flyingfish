@@ -13,7 +13,9 @@ use crate::config::{LayerKind, TEXT_PREFIX};
 use crate::gpu::QwenGpu;
 use anyhow::{Context, Result};
 use cudarc::driver::safe::{CudaSlice, LaunchConfig, PushKernelArg};
-use ff_edge0::gpu::{GpuQuant, GroupSeg};
+use ff_edge0::gpu::{
+    AttnGeom, GpuQuant, GroupSeg, KvCache, QkGeom, QkOutputs, QkvNorm, ScoreBuffers,
+};
 
 pub struct QwenSpec {
     conv2: cudarc::driver::safe::CudaFunction,
@@ -453,67 +455,95 @@ impl QwenSpec {
                 )?;
                 let [qn, kn] = &gpu.attn_norms[kv_index];
                 gpu.ctx.glue_attn_qk_raw(
-                    q.y_ref(),
-                    qn,
-                    k.y_ref(),
-                    kn,
-                    v.y_ref(),
-                    &gpu.q_out,
-                    &gpu.gate_out,
-                    &gpu.kv_keys[kv_index],
-                    &gpu.kv_values[kv_index],
+                    &QkvNorm {
+                        q_raw: q.y_ref(),
+                        q_norm_w: qn,
+                        k_raw: k.y_ref(),
+                        k_norm_w: kn,
+                        v_raw: v.y_ref(),
+                    },
+                    &QkOutputs {
+                        q_out: &gpu.q_out,
+                        gate_out: &gpu.gate_out,
+                    },
+                    &KvCache {
+                        keys: &gpu.kv_keys[kv_index],
+                        values: &gpu.kv_values[kv_index],
+                        stride: kv_stride,
+                    },
                     &gpu.pos,
-                    kv_stride,
-                    text.num_attention_heads,
-                    text.num_key_value_heads,
-                    text.head_dim,
-                    rotary_dim,
-                    text.rope.rope_theta,
+                    &QkGeom {
+                        heads: text.num_attention_heads,
+                        kv_heads: text.num_key_value_heads,
+                        head_dim: text.head_dim,
+                        rotary_dim,
+                        theta: text.rope.rope_theta,
+                    },
                     true,
                 )?;
                 gpu.ctx.glue_attn_qk_raw(
-                    &self.y_b[&qname],
-                    qn,
-                    &self.y_b[&kname],
-                    kn,
-                    &self.y_b[&vname],
-                    &self.q_out_b,
-                    &self.gate_out_b,
-                    &gpu.kv_keys[kv_index],
-                    &gpu.kv_values[kv_index],
+                    &QkvNorm {
+                        q_raw: &self.y_b[&qname],
+                        q_norm_w: qn,
+                        k_raw: &self.y_b[&kname],
+                        k_norm_w: kn,
+                        v_raw: &self.y_b[&vname],
+                    },
+                    &QkOutputs {
+                        q_out: &self.q_out_b,
+                        gate_out: &self.gate_out_b,
+                    },
+                    &KvCache {
+                        keys: &gpu.kv_keys[kv_index],
+                        values: &gpu.kv_values[kv_index],
+                        stride: kv_stride,
+                    },
                     &self.pos_b,
-                    kv_stride,
-                    text.num_attention_heads,
-                    text.num_key_value_heads,
-                    text.head_dim,
-                    rotary_dim,
-                    text.rope.rope_theta,
+                    &QkGeom {
+                        heads: text.num_attention_heads,
+                        kv_heads: text.num_key_value_heads,
+                        head_dim: text.head_dim,
+                        rotary_dim,
+                        theta: text.rope.rope_theta,
+                    },
                     true,
                 )?;
                 gpu.ctx.glue_attn_scores_raw(
-                    &gpu.q_out,
-                    &gpu.gate_out,
-                    &gpu.kv_keys[kv_index],
-                    &gpu.kv_values[kv_index],
-                    &gpu.attn_out,
+                    &ScoreBuffers {
+                        q: &gpu.q_out,
+                        gate: &gpu.gate_out,
+                        out: &gpu.attn_out,
+                    },
+                    &KvCache {
+                        keys: &gpu.kv_keys[kv_index],
+                        values: &gpu.kv_values[kv_index],
+                        stride: kv_stride,
+                    },
                     &gpu.pos,
-                    kv_stride,
-                    text.num_attention_heads,
-                    text.num_key_value_heads,
-                    text.head_dim,
+                    &AttnGeom {
+                        heads: text.num_attention_heads,
+                        kv_heads: text.num_key_value_heads,
+                        head_dim: text.head_dim,
+                    },
                     scale,
                 )?;
                 gpu.ctx.glue_attn_scores_raw(
-                    &self.q_out_b,
-                    &self.gate_out_b,
-                    &gpu.kv_keys[kv_index],
-                    &gpu.kv_values[kv_index],
-                    &self.attn_out_b,
+                    &ScoreBuffers {
+                        q: &self.q_out_b,
+                        gate: &self.gate_out_b,
+                        out: &self.attn_out_b,
+                    },
+                    &KvCache {
+                        keys: &gpu.kv_keys[kv_index],
+                        values: &gpu.kv_values[kv_index],
+                        stride: kv_stride,
+                    },
                     &self.pos_b,
-                    kv_stride,
-                    text.num_attention_heads,
-                    text.num_key_value_heads,
-                    text.head_dim,
+                    &AttnGeom {
+                        heads: text.num_attention_heads,
+                        kv_heads: text.num_key_value_heads,
+                        head_dim: text.head_dim,
+                    },
                     scale,
                 )?;
                 self.group2_wide(
@@ -712,35 +742,49 @@ impl QwenSpec {
         ];
         gpu.ctx.glue_group4(&segs, &self.mtp_x1, q.in_dim, 0)?;
         gpu.ctx.glue_attn_qk_raw(
-            q.y_ref(),
-            &self.mtp_qnorm,
-            k.y_ref(),
-            &self.mtp_knorm,
-            v.y_ref(),
-            &self.mtp_q_out,
-            &self.mtp_gate_out,
-            &self.mtp_kv_keys,
-            &self.mtp_kv_values,
+            &QkvNorm {
+                q_raw: q.y_ref(),
+                q_norm_w: &self.mtp_qnorm,
+                k_raw: k.y_ref(),
+                k_norm_w: &self.mtp_knorm,
+                v_raw: v.y_ref(),
+            },
+            &QkOutputs {
+                q_out: &self.mtp_q_out,
+                gate_out: &self.mtp_gate_out,
+            },
+            &KvCache {
+                keys: &self.mtp_kv_keys,
+                values: &self.mtp_kv_values,
+                stride: kv_stride,
+            },
             &self.mtp_pos,
-            kv_stride,
-            heads,
-            kv_heads,
-            head_dim,
-            rotary_dim,
-            text.rope.rope_theta,
+            &QkGeom {
+                heads,
+                kv_heads,
+                head_dim,
+                rotary_dim,
+                theta: text.rope.rope_theta,
+            },
             true,
         )?;
         gpu.ctx.glue_attn_scores_raw(
-            &self.mtp_q_out,
-            &self.mtp_gate_out,
-            &self.mtp_kv_keys,
-            &self.mtp_kv_values,
-            &self.mtp_attn_out,
+            &ScoreBuffers {
+                q: &self.mtp_q_out,
+                gate: &self.mtp_gate_out,
+                out: &self.mtp_attn_out,
+            },
+            &KvCache {
+                keys: &self.mtp_kv_keys,
+                values: &self.mtp_kv_values,
+                stride: kv_stride,
+            },
             &self.mtp_pos,
-            kv_stride,
-            heads,
-            kv_heads,
-            head_dim,
+            &AttnGeom {
+                heads,
+                kv_heads,
+                head_dim,
+            },
             scale,
         )?;
         let o = self.mtp_proj.get("mtp.layers.0.self_attn.o_proj").unwrap();
