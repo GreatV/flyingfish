@@ -86,6 +86,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         routing_trace,
         routing_trace_domain,
         execution_manifest,
+        explain_config,
     } = command
     else {
         unreachable!("run_generate received a non-generate GLM command")
@@ -217,6 +218,11 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         expert_cache_min_bytes <= expert_cache_bytes,
         "--expert-cache-min-mib exceeds --expert-cache-mib"
     );
+    let cuda_ordinal = device
+        .strip_prefix("cuda:")
+        .and_then(|rest| rest.split(',').next())
+        .and_then(|ordinal| ordinal.parse::<usize>().ok())
+        .unwrap_or(0);
     let device = parse_device_single(&device)?;
     ensure!(
         device.is_cpu() || device.is_cuda(),
@@ -377,6 +383,44 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
     }
     prepared.select_execution_policy(&selection.policy)?;
     resident_static = selection.policy.resident_static;
+    if explain_config {
+        // Explained against the settled policy, so the printed bound is the
+        // one this run acts on. GLM streams through mmap by contract, so the
+        // weight-source rules do not describe this runtime; the pool rule is
+        // the derived guidance.
+        let profile = ff_core::topology::TopologyProfile::capture(prepared.device());
+        let derived = flyingfish::glm::resources::derive_glm_configuration(
+            &breakdown,
+            resident_static,
+            selection.policy.cache_policy()?,
+            &profile,
+            cuda_ordinal,
+        )?;
+        for step in derived
+            .provenance
+            .iter()
+            .filter(|step| step.rule == ff_core::configure::RULE_POOL_RESIDENCY)
+        {
+            eprintln!("config: {step}");
+        }
+        // Rule 7 reports the topology ceiling; the settled bound below is
+        // what this run's expert cache actually uses, which an explicit
+        // `--expert-cache-mib` or the live auto-sizer can set well under
+        // that ceiling.
+        let bound_source = if explicit_axes.contains("expert_cache.maximum_bound_bytes") {
+            "operator-specified"
+        } else if automatic_axes.contains(&"expert_cache.maximum_bound_bytes") {
+            "auto-derived from a live snapshot"
+        } else if evidence.is_some() {
+            "selected from resource evidence"
+        } else {
+            "default; auto-sizing did not run"
+        };
+        eprintln!(
+            "config: settled expert-cache bound for this run: {} B ({bound_source})",
+            selection.policy.expert_cache.maximum_bound_bytes,
+        );
+    }
     let admission_snapshot =
         flyingfish::runtime::probe::ResourceSnapshot::capture(Some(prepared.device()));
     // A promotion was admitted only because its peaks plus the promotion

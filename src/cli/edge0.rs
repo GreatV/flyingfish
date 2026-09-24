@@ -27,6 +27,11 @@ pub(super) enum Edge0Command {
             help = "Upload the MoE expert set to the device; a capacity planner verifies it first"
         )]
         resident_experts: bool,
+        #[arg(
+            help = "Print the topology-derived expert-residency bound and its provenance to stderr"
+        )]
+        #[arg(long)]
+        explain_config: bool,
     },
 }
 
@@ -37,6 +42,7 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
         max_new_tokens,
         device,
         resident_experts,
+        explain_config,
     } = command;
     let kit::DeviceArgs { device } = device;
     let (device, auto) = resolve_text_device(&device)?;
@@ -69,6 +75,49 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
         }
         TextDevice::Cpu => TextDevice::Cpu,
     };
+    if explain_config {
+        match &device {
+            TextDevice::Cuda(ordinals) if ordinals.len() > 1 => {
+                eprintln!(
+                    "config: rule-7-pool-residency: {} devices selected; multi-device \
+                     expert-residency is not derived (enable_gpu_multi partitions layer \
+                     ranges per device, which this derivation does not model)",
+                    ordinals.len()
+                );
+            }
+            _ => {
+                let weights = flyingfish::edge0::weights::Edge0Weights::open(&model_dir)
+                    .context("open edge0 checkpoint for the configuration derivation")?;
+                let sizes = flyingfish::edge0::mode::WeightSizes::from_weights(&weights)?;
+                let selected_ordinal = match &device {
+                    TextDevice::Cuda(ordinals) => ordinals.first().copied().unwrap_or(0),
+                    TextDevice::Cpu => 0,
+                };
+                let capture_device = match &device {
+                    TextDevice::Cuda(_) => candle_core::Device::new_cuda(selected_ordinal)?,
+                    TextDevice::Cpu => candle_core::Device::Cpu,
+                };
+                let profile = ff_core::topology::TopologyProfile::capture(&capture_device);
+                let derived = flyingfish::edge0::resources::derive_edge0_configuration(
+                    &sizes,
+                    &profile,
+                    selected_ordinal,
+                )?;
+                // GLM and edge0 stream through mmap by contract, so the
+                // weight-source rules do not describe their runtimes; the
+                // pool rule is the derived guidance. Explained against the
+                // device this run actually settled on (post auto-fallback),
+                // not the one initially requested.
+                for step in derived
+                    .provenance
+                    .iter()
+                    .filter(|step| step.rule == ff_core::configure::RULE_POOL_RESIDENCY)
+                {
+                    eprintln!("config: {step}");
+                }
+            }
+        }
+    }
     let eos_token_ids = config.eos_token_id.clone();
     let mut model = Edge0Text::load(&model_dir, config)?;
     let generated = match device {

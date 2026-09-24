@@ -1369,7 +1369,7 @@ struct DecodeStage<'a> {
     execution_cache_policy: CachePolicy,
     transformer_chunking: TransformerChunking,
     no_progress: bool,
-    /// Rule 6's verdict: `Some(cap)` opens the visual decoder with its weights
+    /// Rule 7's verdict: `Some(cap)` opens the visual decoder with its weights
     /// resident under this device-cache ceiling; `None` streams per layer
     /// group.
     vae_resident_bytes: Option<u64>,
@@ -1739,6 +1739,11 @@ fn load_or_capture_topology(
     }
 }
 
+/// Below this, the decode-boundary clamp streams the VAE instead of caching
+/// it (see the `cap` computation in the video decode closure); rule 7's
+/// reported residency is normalized to the same floor.
+const H3_VAE_CACHE_FLOOR_BYTES: u64 = 1 << 30;
+
 struct T2vaDerivation<'a> {
     model_root: &'a Path,
     geometry: T2vaGeometry,
@@ -1815,7 +1820,7 @@ fn derive_t2va_configuration(
         ),
         Err(error) => {
             eprintln!(
-                "config: video VAE catalog was not read ({}); rule 6 assumes no decoder",
+                "config: video VAE catalog was not read ({}); rule 7 assumes no decoder",
                 error
             );
             None
@@ -1877,7 +1882,7 @@ fn derive_t2va_configuration(
     {
         device.total_memory_bytes = Some(total.min(mib << 20));
     }
-    let derived = ff_core::configure::derive(ordinal, &profile, &requirement)?;
+    let mut derived = ff_core::configure::derive(ordinal, &profile, &requirement)?;
     let host_bound_bytes = match (derived.weight_source, derived.host_cache_ceiling_bytes) {
         (ff_core::configure::WeightSourceChoice::Memory, Some(ceiling)) => {
             match (|| -> Result<u64> {
@@ -1911,6 +1916,16 @@ fn derive_t2va_configuration(
         }
         _ => None,
     };
+    if let Some(bytes) = derived.pool_resident_bytes
+        && bytes > 0
+        && bytes <= H3_VAE_CACHE_FLOOR_BYTES
+    {
+        derived.snap_pool_residency_to_streaming(&format!(
+            "below the {} MiB floor the decode boundary streams instead of caching, so \
+             residency snaps to full streaming",
+            H3_VAE_CACHE_FLOOR_BYTES >> 20
+        ));
+    }
     Ok((derived, host_bound_bytes))
 }
 
@@ -2044,7 +2059,8 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
             device,
         )?;
         derived_host_bound_mib = host_bound_bytes.map(|bytes| bytes.div_ceil(1 << 20));
-        vae_resident_bytes = derived.vae_resident_bytes;
+        // A zero-cap pool streams by convention, which is today's None path.
+        vae_resident_bytes = derived.pool_resident_bytes.filter(|bytes| *bytes > 0);
         Some(derived)
     };
     let derived_source = derived.as_ref().map(|derived| match derived.weight_source {
@@ -2575,7 +2591,7 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
         let cap = vae_resident_bytes
             .filter(|_| free_u64 * 2 > total_u64)
             .map(|ideal| ideal.min(free_u64.saturating_sub(margin)))
-            .filter(|&cap| cap > (1 << 30)); // below 1 GiB, streaming is better
+            .filter(|&cap| cap > H3_VAE_CACHE_FLOOR_BYTES); // below this, streaming is better
         eprintln!(
             "decode boundary: memory pool trimmed, free {} -> {} MiB / {} MiB total; \
              margin {} MiB; VAE cache cap {} ({})",
