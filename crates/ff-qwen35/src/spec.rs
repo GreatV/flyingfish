@@ -11,6 +11,7 @@
 
 use crate::config::{LayerKind, TEXT_PREFIX};
 use crate::gpu::QwenGpu;
+use crate::wide::{DownBuffers, GroupPair, WideGeom};
 use anyhow::{Context, Result};
 use cudarc::driver::safe::{CudaSlice, LaunchConfig, PushKernelArg};
 use ff_edge0::gpu::{
@@ -242,15 +243,13 @@ impl QwenSpec {
                 &gpu.ctx,
                 &[s0, s1, s2, s3],
                 [y0, y1, y2, y3],
-                xa,
-                xb,
+                &GroupPair { x: xa, xb },
                 in_dim,
                 2,
             )
             .context("group2_wide")
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn down2_wide(
         &self,
         gpu: &QwenGpu,
@@ -264,19 +263,23 @@ impl QwenSpec {
         gpu.wide
             .down(
                 &gpu.ctx,
-                p,
-                s,
-                b,
-                xa,
-                xb,
-                q.y_ref(),
-                yb,
-                &self.scr,
-                &self.scr_b,
-                q.out_dim,
-                q.in_dim,
-                split,
-                2,
+                &DownBuffers {
+                    packed: p,
+                    scales: s,
+                    biases: b,
+                    x: xa,
+                    xb,
+                    y: q.y_ref(),
+                    yb,
+                    scratch: &self.scr,
+                    scratch_b: &self.scr_b,
+                },
+                &WideGeom {
+                    rows: q.out_dim,
+                    in_dim: q.in_dim,
+                    split,
+                    cols: 2,
+                },
             )
             .context("down2_wide")
     }
@@ -635,7 +638,17 @@ impl QwenSpec {
             &self.y_b["lm_head"],
         ];
         gpu.wide
-            .group(&gpu.ctx, &lsegs, lyb, &gpu.x1, &self.x1_b, lm.in_dim, 2)
+            .group(
+                &gpu.ctx,
+                &lsegs,
+                lyb,
+                &GroupPair {
+                    x: &gpu.x1,
+                    xb: &self.x1_b,
+                },
+                lm.in_dim,
+                2,
+            )
             .context("lm cols=2")?;
         gpu.ctx
             .glue_argmax(lm.y_ref(), &mut self.out_a, lm.out_dim)?;

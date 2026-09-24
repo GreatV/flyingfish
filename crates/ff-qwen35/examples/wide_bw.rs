@@ -11,6 +11,7 @@
 
 use ff_edge0::gpu::GpuContext;
 use ff_edge0::int4::GroupQuant;
+use ff_qwen35::wide::{DownBuffers, WideGeom};
 use std::time::Instant;
 
 fn synth(rows: usize, in_dim: usize) -> GroupQuant {
@@ -101,8 +102,24 @@ fn main() -> anyhow::Result<()> {
             let cpu = q.matvec(&x, None);
             let scratch = ctx.upload_f32(&vec![0f32; rows])?;
             wk.down(
-                &ctx, packed, scales, biases, &dx, &dx, &y, &y, &scratch, &scratch, rows, in_dim,
-                1, 1,
+                &ctx,
+                &DownBuffers {
+                    packed,
+                    scales,
+                    biases,
+                    x: &dx,
+                    xb: &dx,
+                    y: &y,
+                    yb: &y,
+                    scratch: &scratch,
+                    scratch_b: &scratch,
+                },
+                &WideGeom {
+                    rows,
+                    in_dim,
+                    split: 1,
+                    cols: 1,
+                },
             )?;
             let got = ctx.dtoh(&y)?;
             let rel = cpu
@@ -114,8 +131,24 @@ fn main() -> anyhow::Result<()> {
             for _ in 0..2 {
                 launch_flush()?;
                 wk.down(
-                    &ctx, packed, scales, biases, &dx, &dx, &y, &y, &scratch, &scratch, rows,
-                    in_dim, 1, 1,
+                    &ctx,
+                    &DownBuffers {
+                        packed,
+                        scales,
+                        biases,
+                        x: &dx,
+                        xb: &dx,
+                        y: &y,
+                        yb: &y,
+                        scratch: &scratch,
+                        scratch_b: &scratch,
+                    },
+                    &WideGeom {
+                        rows,
+                        in_dim,
+                        split: 1,
+                        cols: 1,
+                    },
                 )?;
             }
             let iters = 30usize;
@@ -123,8 +156,24 @@ fn main() -> anyhow::Result<()> {
             for _ in 0..iters {
                 launch_flush()?;
                 wk.down(
-                    &ctx, packed, scales, biases, &dx, &dx, &y, &y, &scratch, &scratch, rows,
-                    in_dim, 1, 1,
+                    &ctx,
+                    &DownBuffers {
+                        packed,
+                        scales,
+                        biases,
+                        x: &dx,
+                        xb: &dx,
+                        y: &y,
+                        yb: &y,
+                        scratch: &scratch,
+                        scratch_b: &scratch,
+                    },
+                    &WideGeom {
+                        rows,
+                        in_dim,
+                        split: 1,
+                        cols: 1,
+                    },
                 )?;
             }
             ctx.stream.synchronize()?;
@@ -143,8 +192,24 @@ fn main() -> anyhow::Result<()> {
         for split in [2usize, 4, 8] {
             let scratch = ctx.upload_f32(&vec![0f32; split * rows])?;
             wk.down(
-                &ctx, packed, scales, biases, &dx, &dx, &y, &y, &scratch, &scratch, rows, in_dim,
-                split, 1,
+                &ctx,
+                &DownBuffers {
+                    packed,
+                    scales,
+                    biases,
+                    x: &dx,
+                    xb: &dx,
+                    y: &y,
+                    yb: &y,
+                    scratch: &scratch,
+                    scratch_b: &scratch,
+                },
+                &WideGeom {
+                    rows,
+                    in_dim,
+                    split,
+                    cols: 1,
+                },
             )?;
             let got = ctx.dtoh(&y)?;
             let rel = cpu
@@ -155,8 +220,24 @@ fn main() -> anyhow::Result<()> {
             for _ in 0..2 {
                 launch_flush()?;
                 wk.down(
-                    &ctx, packed, scales, biases, &dx, &dx, &y, &y, &scratch, &scratch, rows,
-                    in_dim, split, 1,
+                    &ctx,
+                    &DownBuffers {
+                        packed,
+                        scales,
+                        biases,
+                        x: &dx,
+                        xb: &dx,
+                        y: &y,
+                        yb: &y,
+                        scratch: &scratch,
+                        scratch_b: &scratch,
+                    },
+                    &WideGeom {
+                        rows,
+                        in_dim,
+                        split,
+                        cols: 1,
+                    },
                 )?;
             }
             let iters = 30usize;
@@ -164,8 +245,24 @@ fn main() -> anyhow::Result<()> {
             for _ in 0..iters {
                 launch_flush()?;
                 wk.down(
-                    &ctx, packed, scales, biases, &dx, &dx, &y, &y, &scratch, &scratch, rows,
-                    in_dim, split, 1,
+                    &ctx,
+                    &DownBuffers {
+                        packed,
+                        scales,
+                        biases,
+                        x: &dx,
+                        xb: &dx,
+                        y: &y,
+                        yb: &y,
+                        scratch: &scratch,
+                        scratch_b: &scratch,
+                    },
+                    &WideGeom {
+                        rows,
+                        in_dim,
+                        split,
+                        cols: 1,
+                    },
                 )?;
             }
             ctx.stream.synchronize()?;
@@ -204,14 +301,48 @@ fn main() -> anyhow::Result<()> {
         let iters = 200usize;
         for _ in 0..20 {
             wk.down(
-                &ctx, packed, scales, biases, &dx, &dx, &y, &y, &scr, &scr, rows, in_dim, 4, 1,
+                &ctx,
+                &DownBuffers {
+                    packed,
+                    scales,
+                    biases,
+                    x: &dx,
+                    xb: &dx,
+                    y: &y,
+                    yb: &y,
+                    scratch: &scr,
+                    scratch_b: &scr,
+                },
+                &WideGeom {
+                    rows,
+                    in_dim,
+                    split: 4,
+                    cols: 1,
+                },
             )?;
         }
         ctx.stream.synchronize()?;
         let t = Instant::now();
         for _ in 0..iters {
             wk.down(
-                &ctx, packed, scales, biases, &dx, &dx, &y, &y, &scr, &scr, rows, in_dim, 4, 1,
+                &ctx,
+                &DownBuffers {
+                    packed,
+                    scales,
+                    biases,
+                    x: &dx,
+                    xb: &dx,
+                    y: &y,
+                    yb: &y,
+                    scratch: &scr,
+                    scratch_b: &scr,
+                },
+                &WideGeom {
+                    rows,
+                    in_dim,
+                    split: 4,
+                    cols: 1,
+                },
             )?;
         }
         ctx.stream.synchronize()?;
@@ -242,7 +373,24 @@ fn main() -> anyhow::Result<()> {
         let bytes = rows as f64 * (in_dim as f64 / 2.0 + in_dim as f64 / 64.0 * 8.0);
 
         wk.down_v4(
-            &ctx, packed, scales, biases, &dx, &dx, &y, &y, &scr, &scr, rows, in_dim, 4, 1,
+            &ctx,
+            &DownBuffers {
+                packed,
+                scales,
+                biases,
+                x: &dx,
+                xb: &dx,
+                y: &y,
+                yb: &y,
+                scratch: &scr,
+                scratch_b: &scr,
+            },
+            &WideGeom {
+                rows,
+                in_dim,
+                split: 4,
+                cols: 1,
+            },
         )?;
         let got = ctx.dtoh(&y)?;
         let rel = cpu
@@ -263,7 +411,24 @@ fn main() -> anyhow::Result<()> {
             let y1 = ctx.upload_f32(&vec![0f32; 5120])?;
             let scr1 = ctx.upload_f32(&vec![0f32; 5120])?;
             wk.down_v4(
-                &ctx, p1, s1c, b1, &dx1, &dx1, &y1, &y1, &scr1, &scr1, 5120, 5120, 1, 1,
+                &ctx,
+                &DownBuffers {
+                    packed: p1,
+                    scales: s1c,
+                    biases: b1,
+                    x: &dx1,
+                    xb: &dx1,
+                    y: &y1,
+                    yb: &y1,
+                    scratch: &scr1,
+                    scratch_b: &scr1,
+                },
+                &WideGeom {
+                    rows: 5120,
+                    in_dim: 5120,
+                    split: 1,
+                    cols: 1,
+                },
             )?;
             let got1 = ctx.dtoh(&y1)?;
             let cpu1 = q1.matvec(&x1, None);
@@ -282,7 +447,24 @@ fn main() -> anyhow::Result<()> {
                     launch_flush()?;
                 }
                 wk.down_v4(
-                    &ctx, packed, scales, biases, &dx, &dx, &y, &y, &scr, &scr, rows, in_dim, 4, 1,
+                    &ctx,
+                    &DownBuffers {
+                        packed,
+                        scales,
+                        biases,
+                        x: &dx,
+                        xb: &dx,
+                        y: &y,
+                        yb: &y,
+                        scratch: &scr,
+                        scratch_b: &scr,
+                    },
+                    &WideGeom {
+                        rows,
+                        in_dim,
+                        split: 4,
+                        cols: 1,
+                    },
                 )?;
             }
             ctx.stream.synchronize()?;
@@ -293,7 +475,24 @@ fn main() -> anyhow::Result<()> {
                     launch_flush()?;
                 }
                 wk.down_v4(
-                    &ctx, packed, scales, biases, &dx, &dx, &y, &y, &scr, &scr, rows, in_dim, 4, 1,
+                    &ctx,
+                    &DownBuffers {
+                        packed,
+                        scales,
+                        biases,
+                        x: &dx,
+                        xb: &dx,
+                        y: &y,
+                        yb: &y,
+                        scratch: &scr,
+                        scratch_b: &scr,
+                    },
+                    &WideGeom {
+                        rows,
+                        in_dim,
+                        split: 4,
+                        cols: 1,
+                    },
                 )?;
             }
             ctx.stream.synchronize()?;
@@ -337,8 +536,24 @@ fn main() -> anyhow::Result<()> {
         let split = 4usize;
 
         wk.down(
-            &ctx, packed, scales, biases, &dxa, &dxb, &ya, &yb, &scr, &scr_b, rows, in_dim, split,
-            2,
+            &ctx,
+            &DownBuffers {
+                packed,
+                scales,
+                biases,
+                x: &dxa,
+                xb: &dxb,
+                y: &ya,
+                yb: &yb,
+                scratch: &scr,
+                scratch_b: &scr_b,
+            },
+            &WideGeom {
+                rows,
+                in_dim,
+                split,
+                cols: 2,
+            },
         )?;
         let ga = ctx.dtoh(&ya)?;
         let gb = ctx.dtoh(&yb)?;
@@ -354,8 +569,24 @@ fn main() -> anyhow::Result<()> {
             .fold(0.0f32, f32::max);
         let y_only = ctx.upload_f32(&vec![0f32; rows])?;
         wk.down(
-            &ctx, packed, scales, biases, &dxa, &dxa, &y_only, &y_only, &scr, &scr, rows, in_dim,
-            split, 1,
+            &ctx,
+            &DownBuffers {
+                packed,
+                scales,
+                biases,
+                x: &dxa,
+                xb: &dxa,
+                y: &y_only,
+                yb: &y_only,
+                scratch: &scr,
+                scratch_b: &scr,
+            },
+            &WideGeom {
+                rows,
+                in_dim,
+                split,
+                cols: 1,
+            },
         )?;
         let go = ctx.dtoh(&y_only)?;
         let identical = ga.iter().zip(&go).all(|(p, r)| p.to_bits() == r.to_bits());
@@ -364,8 +595,24 @@ fn main() -> anyhow::Result<()> {
         for _ in 0..2 {
             launch_flush()?;
             wk.down(
-                &ctx, packed, scales, biases, &dxa, &dxb, &ya, &yb, &scr, &scr_b, rows, in_dim,
-                split, 2,
+                &ctx,
+                &DownBuffers {
+                    packed,
+                    scales,
+                    biases,
+                    x: &dxa,
+                    xb: &dxb,
+                    y: &ya,
+                    yb: &yb,
+                    scratch: &scr,
+                    scratch_b: &scr_b,
+                },
+                &WideGeom {
+                    rows,
+                    in_dim,
+                    split,
+                    cols: 2,
+                },
             )?;
         }
         ctx.stream.synchronize()?;
@@ -374,8 +621,24 @@ fn main() -> anyhow::Result<()> {
         for _ in 0..iters {
             launch_flush()?;
             wk.down(
-                &ctx, packed, scales, biases, &dxa, &dxb, &ya, &yb, &scr, &scr_b, rows, in_dim,
-                split, 2,
+                &ctx,
+                &DownBuffers {
+                    packed,
+                    scales,
+                    biases,
+                    x: &dxa,
+                    xb: &dxb,
+                    y: &ya,
+                    yb: &yb,
+                    scratch: &scr,
+                    scratch_b: &scr_b,
+                },
+                &WideGeom {
+                    rows,
+                    in_dim,
+                    split,
+                    cols: 2,
+                },
             )?;
         }
         ctx.stream.synchronize()?;
@@ -384,12 +647,44 @@ fn main() -> anyhow::Result<()> {
         for _ in 0..iters {
             launch_flush()?;
             wk.down(
-                &ctx, packed, scales, biases, &dxa, &dxa, &ya, &ya, &scr, &scr, rows, in_dim,
-                split, 1,
+                &ctx,
+                &DownBuffers {
+                    packed,
+                    scales,
+                    biases,
+                    x: &dxa,
+                    xb: &dxa,
+                    y: &ya,
+                    yb: &ya,
+                    scratch: &scr,
+                    scratch_b: &scr,
+                },
+                &WideGeom {
+                    rows,
+                    in_dim,
+                    split,
+                    cols: 1,
+                },
             )?;
             wk.down(
-                &ctx, packed, scales, biases, &dxb, &dxb, &yb, &yb, &scr, &scr, rows, in_dim,
-                split, 1,
+                &ctx,
+                &DownBuffers {
+                    packed,
+                    scales,
+                    biases,
+                    x: &dxb,
+                    xb: &dxb,
+                    y: &yb,
+                    yb: &yb,
+                    scratch: &scr,
+                    scratch_b: &scr,
+                },
+                &WideGeom {
+                    rows,
+                    in_dim,
+                    split,
+                    cols: 1,
+                },
             )?;
         }
         ctx.stream.synchronize()?;
