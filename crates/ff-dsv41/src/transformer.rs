@@ -146,7 +146,6 @@ pub struct TransformerParams {
 /// One block's forward: attention and FFN each wrapped in their own
 /// hyper-connection expand/collapse, the coefficients of a sublayer consumed
 /// by the next one. Returns the stream and the FFN's `pre` mix.
-#[allow(clippy::too_many_arguments)]
 pub fn block_forward(
     block: &mut BlockWeights,
     x: &Tensor,
@@ -156,36 +155,33 @@ pub fn block_forward(
     params: TransformerParams,
     image_mask: Option<&[bool]>,
 ) -> Result<(Tensor, Tensor)> {
+    let sources = crate::model::AttentionSources {
+        ratio: block.ratio,
+        is_kv_source: block.is_kv_source,
+        is_index_source: block.is_index_source,
+        uses_candidates: block.uses_candidates,
+        candidate_source: block.candidate_source,
+    };
+    let shapes = crate::model::AttentionShapes {
+        heads: params.heads,
+        head_dim: params.head_dim,
+        hidden: params.hidden,
+        rope_head_dim: params.rope_head_dim,
+        o_lora_rank: params.o_lora_rank,
+        o_groups: params.o_groups,
+        softmax_scale: (params.head_dim as f64).recip().sqrt(),
+    };
     let attention = &mut block.attention;
     let attn_mixes = hc_mixes(
         x,
         &block.hc_attn_fn,
         &block.hc_attn_scale,
         &block.hc_attn_base,
-        params.hc_mult,
-        params.hc_sinkhorn_iters,
-        params.hc_eps,
-        params.norm_eps,
+        &params,
     )?;
     let mut collapsed = hc_pre(x, pre_mix)?;
     let normed = rms_norm(&collapsed, &block.attn_norm, params.norm_eps)?;
-    let attended = attention.forward(
-        &normed,
-        start_pos,
-        runtime,
-        block.ratio,
-        block.is_kv_source,
-        block.is_index_source,
-        block.uses_candidates,
-        block.candidate_source,
-        (params.head_dim as f64).recip().sqrt(),
-        params.rope_head_dim,
-        params.o_lora_rank,
-        params.o_groups,
-        params.heads,
-        params.head_dim,
-        params.hidden,
-    )?;
+    let attended = attention.forward(&normed, start_pos, runtime, &sources, &shapes)?;
     let mut stream = hc_post(&attended, x, &attn_mixes.post, &attn_mixes.comb)?;
 
     let ffn_mixes = hc_mixes(
@@ -193,10 +189,7 @@ pub fn block_forward(
         &block.hc_ffn_fn,
         &block.hc_ffn_scale,
         &block.hc_ffn_base,
-        params.hc_mult,
-        params.hc_sinkhorn_iters,
-        params.hc_eps,
-        params.norm_eps,
+        &params,
     )?;
     collapsed = hc_pre(&stream, &attn_mixes.pre)?;
     let normed = rms_norm(&collapsed, &block.ffn_norm, params.norm_eps)?;
@@ -326,7 +319,7 @@ impl Transformer {
 mod tests {
     use super::*;
     use crate::attention::Compressor;
-    use crate::math::precompute_freqs_cis;
+    use crate::math::{YarnScaling, precompute_freqs_cis};
     use crate::model::WindowRing;
     use crate::moe::Gate;
     use candle_core::Device;
@@ -432,7 +425,8 @@ mod tests {
             } else {
                 None
             },
-            freqs: precompute_freqs_cis(rope, 32, 0, 1600.0, 1.0, 32, 1, &device).unwrap(),
+            freqs: precompute_freqs_cis(rope, 32, 1600.0, &device, YarnScaling::disabled())
+                .unwrap(),
             index_head_dim: 32,
             index_heads: 2,
             index_topk: 2,

@@ -36,20 +36,42 @@ pub const FP4_MAX: f32 = 6.0;
 
 /// Rotary frequencies as cos/sin rows, one per position.
 ///
-/// With `original_seq_len > 0` this applies YaRN exactly as the reference
-/// does: ramp across `beta_fast..beta_slow`, smooth dimensions keep their
-/// frequency and ramped ones are divided by `factor`.
-#[allow(clippy::too_many_arguments)]
+/// YaRN context-extension scaling; `original_seq_len == 0` disables it, in
+/// which case the rotary table is the unscaled one and the other fields are
+/// ignored.
+#[derive(Clone, Copy, Debug)]
+pub struct YarnScaling {
+    pub original_seq_len: usize,
+    pub factor: f64,
+    pub beta_fast: usize,
+    pub beta_slow: usize,
+}
+
+impl YarnScaling {
+    /// The unscaled rotary table.
+    pub const fn disabled() -> Self {
+        Self {
+            original_seq_len: 0,
+            factor: 1.0,
+            beta_fast: 32,
+            beta_slow: 1,
+        }
+    }
+}
+
 pub fn precompute_freqs_cis(
     dim: usize,
     seqlen: usize,
-    original_seq_len: usize,
     base: f64,
-    factor: f64,
-    beta_fast: usize,
-    beta_slow: usize,
     device: &candle_core::Device,
+    yarn: YarnScaling,
 ) -> Result<Tensor> {
+    let YarnScaling {
+        original_seq_len,
+        factor,
+        beta_fast,
+        beta_slow,
+    } = yarn;
     ensure!(dim.is_multiple_of(2), "rotary dimension {dim} must be even");
     let half = dim / 2;
     let exponent = (0..half as u64)
@@ -397,7 +419,7 @@ mod tests {
     #[test]
     fn rotary_rotates_pairs_and_inverse_restores() {
         let device = Device::Cpu;
-        let freqs = precompute_freqs_cis(4, 3, 0, 10_000.0, 1.0, 32, 1, &device).unwrap();
+        let freqs = precompute_freqs_cis(4, 3, 10_000.0, &device, YarnScaling::disabled()).unwrap();
         assert_eq!(freqs.dims(), [3, 2, 2]);
         let x = Tensor::from_vec(
             vec![
@@ -424,7 +446,8 @@ mod tests {
         // {0, 1/2}, not {0, 1/4}: position 1 of frequency slot 1 must land on
         // angle 10000^-0.5, which differs from the wrong 10000^-0.25.
         let device = Device::Cpu;
-        let freqs = precompute_freqs_cis(4, 100, 0, 10_000.0, 1.0, 32, 1, &device).unwrap();
+        let freqs =
+            precompute_freqs_cis(4, 100, 10_000.0, &device, YarnScaling::disabled()).unwrap();
         let values = freqs.to_vec3::<f32>().unwrap();
         // Position 100 of slot 1: correct angle 1.0 rad, wrong exponent gives
         // 100 * 10^-2.5 = 0.316 rad — cos separates them by 0.4.
@@ -439,8 +462,21 @@ mod tests {
     #[test]
     fn yarn_fades_only_dimensions_inside_the_transition_band() {
         let device = Device::Cpu;
-        let plain = precompute_freqs_cis(8, 2048, 0, 10_000.0, 16.0, 32, 1, &device).unwrap();
-        let yarn = precompute_freqs_cis(8, 2048, 65_536, 10_000.0, 16.0, 32, 1, &device).unwrap();
+        let plain =
+            precompute_freqs_cis(8, 2048, 10_000.0, &device, YarnScaling::disabled()).unwrap();
+        let yarn = precompute_freqs_cis(
+            8,
+            2048,
+            10_000.0,
+            &device,
+            YarnScaling {
+                original_seq_len: 65_536,
+                factor: 16.0,
+                beta_fast: 32,
+                beta_slow: 1,
+            },
+        )
+        .unwrap();
         let plain = plain.to_vec3::<f32>().unwrap();
         let yarn = yarn.to_vec3::<f32>().unwrap();
         // dim 8: the YaRN band covers indices above ~2.5, so index 0 keeps its

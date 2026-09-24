@@ -13,7 +13,7 @@ use crate::attention::{
     select_candidate_blocks, sparse_attn,
 };
 use crate::config::TextConfig;
-use crate::math::precompute_freqs_cis;
+use crate::math::{YarnScaling, precompute_freqs_cis};
 
 /// The four slots attention layers hand down the stack. Sources write before
 /// their consumers read, so one slot each is enough.
@@ -206,24 +206,57 @@ fn linear_rows_from_slice(weights: &[f32], input: &[f32], out: usize, inn: usize
 
 /// The indexer scores compressed positions and returns the top-k picks each
 /// query attends to, in position order, offset past the window rows.
-#[allow(clippy::too_many_arguments)]
+/// The tensors one indexer call reads.
+pub struct IndexerTensors<'a> {
+    pub x: &'a Tensor,
+    pub qr: &'a Tensor,
+    pub latent: Option<&'a Tensor>,
+    pub candidates: Option<&'a Tensor>,
+    pub freqs: &'a Tensor,
+}
+
+/// The indexer's weights.
+pub struct IndexerWeights<'a> {
+    pub wq_b: &'a Tensor,
+    pub weights_proj: &'a Tensor,
+    pub index_k: &'a Tensor,
+}
+
+/// The indexer's config scalars.
+pub struct IndexerParams {
+    pub index_heads: usize,
+    pub index_head_dim: usize,
+    pub index_topk: usize,
+    pub compress_ratio: usize,
+    pub rope_head_dim: usize,
+}
+
 pub fn indexer_forward(
-    x: &Tensor,
-    qr: &Tensor,
-    latent: Option<&Tensor>,
+    t: &IndexerTensors<'_>,
     start_pos: usize,
     offset: usize,
-    wq_b: &Tensor,
-    weights_proj: &Tensor,
-    index_heads: usize,
-    index_head_dim: usize,
-    index_topk: usize,
-    compress_ratio: usize,
-    index_k: &Tensor,
-    candidates: Option<&Tensor>,
-    freqs: &Tensor,
-    rope_head_dim: usize,
+    w: &IndexerWeights<'_>,
+    params: IndexerParams,
 ) -> Result<(Tensor, Tensor)> {
+    let IndexerTensors {
+        x,
+        qr,
+        latent,
+        candidates,
+        freqs,
+    } = *t;
+    let IndexerWeights {
+        wq_b,
+        weights_proj,
+        index_k,
+    } = *w;
+    let IndexerParams {
+        index_heads,
+        index_head_dim,
+        index_topk,
+        compress_ratio,
+        rope_head_dim,
+    } = params;
     let dims = x.dims();
     ensure!(dims.len() == 3, "indexer input must be [batch, seq, dim]");
     let [batch, seqlen, hidden] = [dims[0], dims[1], dims[2]];
@@ -260,12 +293,14 @@ pub fn indexer_forward(
         let position = start_pos + token % seqlen;
         apply_rotary_slice(
             &mut projected,
-            1,
-            index_heads,
-            index_head_dim,
+            RotaryShape {
+                seqlen: 1,
+                heads: index_heads,
+                head_dim: index_head_dim,
+                rope_dim: rope_head_dim,
+            },
             freqs,
             position,
-            rope_head_dim,
             false,
         )?;
         queries.extend(projected);
@@ -382,26 +417,49 @@ pub fn indexer_forward(
 /// One full attention layer forward: window KV ring plus, when this layer
 /// compresses, the shared compressed KV and indexer picks, concatenated into
 /// one sparse-attention call. Reference: `Attention.forward`.
+/// Where one attention layer routes: the per-layer ratio and source flags
+/// its forward consults on every call.
+pub struct AttentionSources {
+    pub ratio: usize,
+    pub is_kv_source: bool,
+    pub is_index_source: bool,
+    pub uses_candidates: bool,
+    pub candidate_source: bool,
+}
+
+/// The model-geometry values an attention layer's forward reads, plus the
+/// softmax scale its caller derives from that geometry.
+pub struct AttentionShapes {
+    pub heads: usize,
+    pub head_dim: usize,
+    pub hidden: usize,
+    pub rope_head_dim: usize,
+    pub o_lora_rank: usize,
+    pub o_groups: usize,
+    pub softmax_scale: f64,
+}
+
 impl AttentionCore {
-    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &mut self,
         x: &Tensor,
         start_pos: usize,
         runtime: &mut SharedAttentionRuntime,
-        ratio: usize,
-        is_kv_source: bool,
-        is_index_source: bool,
-        uses_candidates: bool,
-        candidate_source: bool,
-        softmax_scale: f64,
-        rope_head_dim: usize,
-        o_lora_rank: usize,
-        o_groups: usize,
-        heads: usize,
-        head_dim: usize,
-        hidden: usize,
+        sources: &AttentionSources,
+        shapes: &AttentionShapes,
     ) -> Result<Tensor> {
+        let ratio = sources.ratio;
+        let is_kv_source = sources.is_kv_source;
+        let is_index_source = sources.is_index_source;
+        let uses_candidates = sources.uses_candidates;
+        let candidate_source = sources.candidate_source;
+        let rope_head_dim = shapes.rope_head_dim;
+        let o_lora_rank = shapes.o_lora_rank;
+        let o_groups = shapes.o_groups;
+        let heads = shapes.heads;
+        let head_dim = shapes.head_dim;
+        let hidden = shapes.hidden;
+        let softmax_scale = shapes.softmax_scale;
         let dims = x.dims();
         ensure!(dims.len() == 3, "attention input must be [batch, seq, dim]");
         let [batch, seqlen, _] = [dims[0], dims[1], dims[2]];
@@ -439,12 +497,14 @@ impl AttentionCore {
         }
         apply_rotary_slice(
             &mut q,
-            seqlen,
-            heads,
-            head_dim,
+            RotaryShape {
+                seqlen,
+                heads,
+                head_dim,
+                rope_dim: rope_head_dim,
+            },
             &self.freqs,
             start_pos,
-            rope_head_dim,
             false,
         )?;
 
@@ -464,12 +524,14 @@ impl AttentionCore {
         }
         apply_rotary_slice(
             &mut window,
-            seqlen,
-            1,
-            head_dim,
+            RotaryShape {
+                seqlen,
+                heads: 1,
+                head_dim,
+                rope_dim: rope_head_dim,
+            },
             &self.freqs,
             start_pos,
-            rope_head_dim,
             false,
         )?;
         let window_tensor = quantize_window_kv(&Tensor::from_vec(
@@ -551,16 +613,18 @@ impl AttentionCore {
                         apply_rotary_slice(
                             &mut keys
                                 [group * self.index_head_dim..(group + 1) * self.index_head_dim],
-                            1,
-                            1,
-                            self.index_head_dim,
+                            RotaryShape {
+                                seqlen: 1,
+                                heads: 1,
+                                head_dim: self.index_head_dim,
+                                rope_dim: rope_head_dim,
+                            },
                             &self.freqs.clone(),
                             if start_pos == 0 {
                                 group * ratio
                             } else {
                                 start_pos + 1 - ratio
                             },
-                            rope_head_dim,
                             false,
                         )?;
                     }
@@ -587,32 +651,40 @@ impl AttentionCore {
                 let qr_tensor = Tensor::from_vec(qr.clone(), (batch, seqlen, qlora), device)
                     .map_err(anyhow::Error::from)?;
                 let (idxs, scores) = indexer_forward(
-                    x,
-                    &qr_tensor,
-                    None,
+                    &IndexerTensors {
+                        x,
+                        qr: &qr_tensor,
+                        latent: None,
+                        candidates: if uses_candidates {
+                            runtime.candidates.as_ref()
+                        } else {
+                            None
+                        },
+                        freqs: &self.freqs,
+                    },
                     start_pos,
                     window_len,
-                    self.indexer_wq_b
-                        .as_ref()
-                        .context("index source needs indexer wq_b")?,
-                    self.weights_proj
-                        .as_ref()
-                        .context("index source needs weights_proj")?,
-                    self.index_heads,
-                    self.index_head_dim,
-                    self.index_topk,
-                    ratio,
-                    runtime
-                        .index_k
-                        .as_ref()
-                        .context("index keys missing before first index source")?,
-                    if uses_candidates {
-                        runtime.candidates.as_ref()
-                    } else {
-                        None
+                    &IndexerWeights {
+                        wq_b: self
+                            .indexer_wq_b
+                            .as_ref()
+                            .context("index source needs indexer wq_b")?,
+                        weights_proj: self
+                            .weights_proj
+                            .as_ref()
+                            .context("index source needs weights_proj")?,
+                        index_k: runtime
+                            .index_k
+                            .as_ref()
+                            .context("index keys missing before first index source")?,
                     },
-                    &self.freqs,
-                    rope_head_dim,
+                    IndexerParams {
+                        index_heads: self.index_heads,
+                        index_head_dim: self.index_head_dim,
+                        index_topk: self.index_topk,
+                        compress_ratio: ratio,
+                        rope_head_dim,
+                    },
                 )?;
                 if candidate_source {
                     runtime.candidates = Some(select_candidate_blocks(
@@ -638,16 +710,18 @@ impl AttentionCore {
                 for group in 0..produced {
                     apply_rotary_slice(
                         &mut rotated[group * head_dim..(group + 1) * head_dim],
-                        1,
-                        1,
-                        head_dim,
+                        RotaryShape {
+                            seqlen: 1,
+                            heads: 1,
+                            head_dim,
+                            rope_dim: rope_head_dim,
+                        },
                         &self.freqs,
                         if start_pos == 0 {
                             group * ratio
                         } else {
                             start_pos + 1 - ratio
                         },
-                        rope_head_dim,
                         false,
                     )?;
                 }
@@ -724,12 +798,14 @@ impl AttentionCore {
             .to_vec();
         apply_rotary_slice(
             &mut o,
-            seqlen,
-            heads,
-            head_dim,
+            RotaryShape {
+                seqlen,
+                heads,
+                head_dim,
+                rope_dim: rope_head_dim,
+            },
             &self.freqs,
             start_pos,
-            rope_head_dim,
             true,
         )?;
         // wo_a is block-diagonal over groups; each group projects its own heads.
@@ -786,17 +862,26 @@ fn rms_norm_slice(values: &[f32], weight: &Tensor, eps: f64) -> Result<Vec<f32>>
 
 /// In-place rotary over the trailing `rope_dim` channels of each head, using
 /// rows `[offset, offset + seqlen)` of `freqs`.
-#[allow(clippy::too_many_arguments)]
-fn apply_rotary_slice(
-    values: &mut [f32],
+struct RotaryShape {
     seqlen: usize,
     heads: usize,
     head_dim: usize,
+    rope_dim: usize,
+}
+
+fn apply_rotary_slice(
+    values: &mut [f32],
+    shape: RotaryShape,
     freqs: &Tensor,
     offset: usize,
-    rope_dim: usize,
     inverse: bool,
 ) -> Result<()> {
+    let RotaryShape {
+        seqlen,
+        heads,
+        head_dim,
+        rope_dim,
+    } = shape;
     ensure!(
         head_dim >= rope_dim,
         "rotary span {rope_dim} exceeds the {head_dim}-wide channel"
@@ -907,18 +992,9 @@ pub fn layer_freqs(
         return precompute_freqs_cis(
             rope_head_dim,
             max_seq,
-            0,
             config.rope_theta,
-            1.0,
-            config
-                .rope_scaling
-                .as_ref()
-                .map_or(32, |scaling| scaling.beta_fast),
-            config
-                .rope_scaling
-                .as_ref()
-                .map_or(1, |scaling| scaling.beta_slow),
             device,
+            YarnScaling::disabled(),
         );
     }
     let scaling = config
@@ -928,12 +1004,14 @@ pub fn layer_freqs(
     precompute_freqs_cis(
         rope_head_dim,
         max_seq,
-        scaling.original_max_position_embeddings,
         config.compress_rope_theta,
-        scaling.factor,
-        scaling.beta_fast,
-        scaling.beta_slow,
         device,
+        YarnScaling {
+            original_seq_len: scaling.original_max_position_embeddings,
+            factor: scaling.factor,
+            beta_fast: scaling.beta_fast,
+            beta_slow: scaling.beta_slow,
+        },
     )
 }
 
@@ -1028,21 +1106,27 @@ mod tests {
             // Decode position: the causal visibility mask then allows every
             // key, so the pick reflects the score sign alone.
             let (idxs, _) = indexer_forward(
-                &x,
-                &qr,
-                None,
+                &IndexerTensors {
+                    x: &x,
+                    qr: &qr,
+                    latent: None,
+                    candidates: None,
+                    freqs: &freqs(flip),
+                },
                 1,
                 4,
-                &wq_b,
-                &weights_proj,
-                1,
-                32,
-                1,
-                1,
-                &index_k,
-                None,
-                &freqs(flip),
-                2,
+                &IndexerWeights {
+                    wq_b: &wq_b,
+                    weights_proj: &weights_proj,
+                    index_k: &index_k,
+                },
+                IndexerParams {
+                    index_heads: 1,
+                    index_head_dim: 32,
+                    index_topk: 1,
+                    compress_ratio: 1,
+                    rope_head_dim: 2,
+                },
             )
             .unwrap();
             idxs.flatten_all().unwrap().to_vec1::<i64>().unwrap()
@@ -1085,7 +1169,8 @@ mod tests {
         // consumer that recomputed its own candidates would ignore it.
         let index_k = Tensor::zeros((1, 2, 32), DType::F32, &device).unwrap();
         let freqs =
-            crate::math::precompute_freqs_cis(8, 8, 0, 1600.0, 1.0, 32, 1, &device).unwrap();
+            crate::math::precompute_freqs_cis(8, 8, 1600.0, &device, YarnScaling::disabled())
+                .unwrap();
         let open = Tensor::from_vec(vec![1u8; 4 * 2], (1, 4, 2), &device).unwrap();
         let mut masked = vec![1u8; 4 * 2];
         for row in masked.chunks_mut(2) {
@@ -1093,40 +1178,52 @@ mod tests {
         }
         let masked = Tensor::from_vec(masked, (1, 4, 2), &device).unwrap();
         let (open_picks, _) = indexer_forward(
-            &x,
-            &qr,
-            None,
+            &IndexerTensors {
+                x: &x,
+                qr: &qr,
+                latent: None,
+                candidates: Some(&open),
+                freqs: &freqs,
+            },
             0,
             4,
-            &wq_b,
-            &weights_proj,
-            2,
-            32,
-            2,
-            2,
-            &index_k,
-            Some(&open),
-            &freqs,
-            8,
+            &IndexerWeights {
+                wq_b: &wq_b,
+                weights_proj: &weights_proj,
+                index_k: &index_k,
+            },
+            IndexerParams {
+                index_heads: 2,
+                index_head_dim: 32,
+                index_topk: 2,
+                compress_ratio: 2,
+                rope_head_dim: 8,
+            },
         )
         .unwrap();
         let open_picks = open_picks.flatten_all().unwrap().to_vec1::<i64>().unwrap();
         let (masked_picks, _) = indexer_forward(
-            &x,
-            &qr,
-            None,
+            &IndexerTensors {
+                x: &x,
+                qr: &qr,
+                latent: None,
+                candidates: Some(&masked),
+                freqs: &freqs,
+            },
             0,
             4,
-            &wq_b,
-            &weights_proj,
-            2,
-            32,
-            2,
-            2,
-            &index_k,
-            Some(&masked),
-            &freqs,
-            8,
+            &IndexerWeights {
+                wq_b: &wq_b,
+                weights_proj: &weights_proj,
+                index_k: &index_k,
+            },
+            IndexerParams {
+                index_heads: 2,
+                index_head_dim: 32,
+                index_topk: 2,
+                compress_ratio: 2,
+                rope_head_dim: 8,
+            },
         )
         .unwrap();
         let masked_picks = masked_picks
@@ -1144,7 +1241,7 @@ mod tests {
 
     #[test]
     fn consumer_layers_attend_over_the_published_compressed_rows() {
-        use crate::math::precompute_freqs_cis;
+        use crate::math::{YarnScaling, precompute_freqs_cis};
         let device = Device::Cpu;
         let heads = 2usize;
         let head_dim = 32usize;
@@ -1188,7 +1285,7 @@ mod tests {
             indexer_wk: Some(ones(32, head_dim)),
             indexer_k_norm: Some(Tensor::ones(32, DType::F32, &device).unwrap()),
             weights_proj: Some(ones(2, hidden)),
-            freqs: precompute_freqs_cis(8, 16, 0, 1600.0, 1.0, 32, 1, &device).unwrap(),
+            freqs: precompute_freqs_cis(8, 16, 1600.0, &device, YarnScaling::disabled()).unwrap(),
             index_head_dim: 32,
             index_heads: 2,
             index_topk: 2,
@@ -1212,18 +1309,22 @@ mod tests {
                     &x,
                     0,
                     &mut source_runtime,
-                    2,
-                    true,
-                    true,
-                    false,
-                    false,
-                    0.5f64.sqrt(),
-                    8,
-                    16,
-                    2,
-                    heads,
-                    head_dim,
-                    hidden,
+                    &AttentionSources {
+                        ratio: 2,
+                        is_kv_source: true,
+                        is_index_source: true,
+                        uses_candidates: false,
+                        candidate_source: false,
+                    },
+                    &AttentionShapes {
+                        heads,
+                        head_dim,
+                        hidden,
+                        rope_head_dim: 8,
+                        o_lora_rank: 16,
+                        o_groups: 2,
+                        softmax_scale: 0.5f64.sqrt(),
+                    },
                 )
                 .unwrap();
             let published = source_runtime.compress_kv.clone().unwrap();
@@ -1254,18 +1355,22 @@ mod tests {
                     &x,
                     0,
                     &mut runtime,
-                    2,
-                    false,
-                    false,
-                    false,
-                    false,
-                    0.5f64.sqrt(),
-                    8,
-                    16,
-                    2,
-                    heads,
-                    head_dim,
-                    hidden,
+                    &AttentionSources {
+                        ratio: 2,
+                        is_kv_source: false,
+                        is_index_source: false,
+                        uses_candidates: false,
+                        candidate_source: false,
+                    },
+                    &AttentionShapes {
+                        heads,
+                        head_dim,
+                        hidden,
+                        rope_head_dim: 8,
+                        o_lora_rank: 16,
+                        o_groups: 2,
+                        softmax_scale: 0.5f64.sqrt(),
+                    },
                 )
                 .unwrap();
             output.flatten_all().unwrap().to_vec1::<f32>().unwrap()
@@ -1284,7 +1389,7 @@ mod tests {
 
     #[test]
     fn window_and_compress_picks_interleave_per_query() {
-        use crate::math::precompute_freqs_cis;
+        use crate::math::{YarnScaling, precompute_freqs_cis};
         let device = Device::Cpu;
         let heads = 2usize;
         let head_dim = 32usize;
@@ -1328,7 +1433,7 @@ mod tests {
             indexer_wk: Some(ones(32, head_dim)),
             indexer_k_norm: Some(Tensor::ones(32, DType::F32, &device).unwrap()),
             weights_proj: Some(ones(2, hidden)),
-            freqs: precompute_freqs_cis(8, 16, 0, 1600.0, 1.0, 32, 1, &device).unwrap(),
+            freqs: precompute_freqs_cis(8, 16, 1600.0, &device, YarnScaling::disabled()).unwrap(),
             index_head_dim: 32,
             index_heads: 2,
             index_topk: 2,
@@ -1356,18 +1461,22 @@ mod tests {
                 &base(0.0),
                 0,
                 &mut SharedAttentionRuntime::default(),
-                2,
-                true,
-                true,
-                false,
-                false,
-                0.5f64.sqrt(),
-                8,
-                16,
-                2,
-                heads,
-                head_dim,
-                hidden,
+                &AttentionSources {
+                    ratio: 2,
+                    is_kv_source: true,
+                    is_index_source: true,
+                    uses_candidates: false,
+                    candidate_source: false,
+                },
+                &AttentionShapes {
+                    heads,
+                    head_dim,
+                    hidden,
+                    rope_head_dim: 8,
+                    o_lora_rank: 16,
+                    o_groups: 2,
+                    softmax_scale: 0.5f64.sqrt(),
+                },
             )
             .unwrap();
         let out_loud = loud
@@ -1375,18 +1484,22 @@ mod tests {
                 &base(5.0),
                 0,
                 &mut SharedAttentionRuntime::default(),
-                2,
-                true,
-                true,
-                false,
-                false,
-                0.5f64.sqrt(),
-                8,
-                16,
-                2,
-                heads,
-                head_dim,
-                hidden,
+                &AttentionSources {
+                    ratio: 2,
+                    is_kv_source: true,
+                    is_index_source: true,
+                    uses_candidates: false,
+                    candidate_source: false,
+                },
+                &AttentionShapes {
+                    heads,
+                    head_dim,
+                    hidden,
+                    rope_head_dim: 8,
+                    o_lora_rank: 16,
+                    o_groups: 2,
+                    softmax_scale: 0.5f64.sqrt(),
+                },
             )
             .unwrap();
         let quiet = out_quiet.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -1401,7 +1514,7 @@ mod tests {
 
     #[test]
     fn non_source_layers_leave_the_shared_compress_cache_intact() {
-        use crate::math::precompute_freqs_cis;
+        use crate::math::{YarnScaling, precompute_freqs_cis};
         let device = Device::Cpu;
         let heads = 2usize;
         let head_dim = 32usize;
@@ -1434,7 +1547,7 @@ mod tests {
             indexer_wk: None,
             indexer_k_norm: None,
             weights_proj: None,
-            freqs: precompute_freqs_cis(8, 16, 0, 1600.0, 1.0, 32, 1, &device).unwrap(),
+            freqs: precompute_freqs_cis(8, 16, 1600.0, &device, YarnScaling::disabled()).unwrap(),
             index_head_dim: 32,
             index_heads: 2,
             index_topk: 2,
@@ -1463,18 +1576,22 @@ mod tests {
             &x,
             0,
             &mut runtime,
-            2,
-            false,
-            false,
-            false,
-            false,
-            0.5f64.sqrt(),
-            8,
-            16,
-            2,
-            heads,
-            head_dim,
-            hidden,
+            &AttentionSources {
+                ratio: 2,
+                is_kv_source: false,
+                is_index_source: false,
+                uses_candidates: false,
+                candidate_source: false,
+            },
+            &AttentionShapes {
+                heads,
+                head_dim,
+                hidden,
+                rope_head_dim: 8,
+                o_lora_rank: 16,
+                o_groups: 2,
+                softmax_scale: 0.5f64.sqrt(),
+            },
         )
         .unwrap();
         let after = runtime
@@ -1490,7 +1607,7 @@ mod tests {
 
     #[test]
     fn attention_layer_forward_runs_prefill_and_decode() {
-        use crate::math::precompute_freqs_cis;
+        use crate::math::{YarnScaling, precompute_freqs_cis};
         let device = Device::Cpu;
         let heads = 2usize;
         let head_dim = 32usize;
@@ -1510,7 +1627,8 @@ mod tests {
             )
             .unwrap()
         };
-        let freqs = precompute_freqs_cis(rope, 16, 0, 1600.0, 1.0, 32, 1, &device).unwrap();
+        let freqs =
+            precompute_freqs_cis(rope, 16, 1600.0, &device, YarnScaling::disabled()).unwrap();
         let core = AttentionCore {
             sink: Tensor::zeros(heads, DType::F32, &device).unwrap(),
             wq_a: ones(qlora, hidden),
@@ -1567,18 +1685,22 @@ mod tests {
                 &x,
                 0,
                 &mut runtime,
-                2,
-                true,
-                true,
-                false,
-                false,
-                0.5f64.sqrt(),
-                rope,
-                o_lora,
-                groups,
-                heads,
-                head_dim,
-                hidden,
+                &AttentionSources {
+                    ratio: 2,
+                    is_kv_source: true,
+                    is_index_source: true,
+                    uses_candidates: false,
+                    candidate_source: false,
+                },
+                &AttentionShapes {
+                    heads,
+                    head_dim,
+                    hidden,
+                    rope_head_dim: rope,
+                    o_lora_rank: o_lora,
+                    o_groups: groups,
+                    softmax_scale: 0.5f64.sqrt(),
+                },
             )
             .unwrap();
         assert_eq!(output.dims(), [1, 6, hidden]);
@@ -1596,18 +1718,22 @@ mod tests {
                 &step,
                 6,
                 &mut runtime,
-                2,
-                true,
-                true,
-                false,
-                false,
-                0.5f64.sqrt(),
-                rope,
-                o_lora,
-                groups,
-                heads,
-                head_dim,
-                hidden,
+                &AttentionSources {
+                    ratio: 2,
+                    is_kv_source: true,
+                    is_index_source: true,
+                    uses_candidates: false,
+                    candidate_source: false,
+                },
+                &AttentionShapes {
+                    heads,
+                    head_dim,
+                    hidden,
+                    rope_head_dim: rope,
+                    o_lora_rank: o_lora,
+                    o_groups: groups,
+                    softmax_scale: 0.5f64.sqrt(),
+                },
             )
             .unwrap();
         assert_eq!(output.dims(), [1, 1, hidden]);
