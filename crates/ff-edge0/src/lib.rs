@@ -7,6 +7,7 @@ pub mod config;
 pub mod int4;
 pub mod mode;
 pub mod model;
+pub mod resources;
 pub mod weights;
 
 #[cfg(feature = "cuda")]

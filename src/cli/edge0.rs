@@ -27,6 +27,9 @@ pub(super) enum Edge0Command {
             help = "Upload the MoE expert set to the device; a capacity planner verifies it first"
         )]
         resident_experts: bool,
+        #[arg(help = "Print the topology-derived expert-residency bound and its provenance to stderr")]
+        #[arg(long)]
+        explain_config: bool,
     },
 }
 
@@ -37,10 +40,37 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
         max_new_tokens,
         device,
         resident_experts,
+        explain_config,
     } = command;
     let kit::DeviceArgs { device } = device;
     let (device, auto) = resolve_text_device(&device)?;
     let config = Edge0Config::from_model_dir(&model_dir)?;
+    if explain_config {
+        let weights = flyingfish::edge0::weights::Edge0Weights::open(&model_dir)
+            .context("open edge0 checkpoint for the configuration derivation")?;
+        let sizes = flyingfish::edge0::mode::WeightSizes::from_weights(&weights)?;
+        let selected_ordinal = match &device {
+            TextDevice::Cuda(ordinals) => ordinals.first().copied().unwrap_or(0),
+            TextDevice::Cpu => 0,
+        };
+        let capture_device = match &device {
+            TextDevice::Cuda(_) => candle_core::Device::new_cuda(selected_ordinal)?,
+            TextDevice::Cpu => candle_core::Device::Cpu,
+        };
+        let profile = ff_core::topology::TopologyProfile::capture(&capture_device);
+        let derived =
+            flyingfish::edge0::resources::derive_edge0_configuration(&sizes, &profile, selected_ordinal)?;
+        // GLM and edge0 stream through mmap by contract, so the weight-source
+        // rules do not describe their runtimes; the pool rule is the derived
+        // guidance.
+        for step in derived
+            .provenance
+            .iter()
+            .filter(|step| step.rule == ff_core::configure::RULE_POOL_RESIDENCY)
+        {
+            eprintln!("config: {step}");
+        }
+    }
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|error| anyhow::anyhow!("load tokenizer: {error}"))?;
     let ids = tokenizer

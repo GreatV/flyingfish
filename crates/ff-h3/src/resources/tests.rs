@@ -1182,6 +1182,36 @@ fn derivation_reproduces_the_measured_machine_configurations() {
 }
 
 #[test]
+fn decoder_residency_derives_a_partial_cap_when_the_vae_cannot_reside_whole() {
+    use ff_core::configure::{self, ModelRequirement as _, ResidencyDomain};
+    let gib = 1u64 << 30;
+    let estimate = default_estimate(357);
+    let vae_bytes = 8 * gib;
+    let requirement =
+        H3T2vaRequirement::from_estimate(&estimate, 0, vae_bytes, true, 0, None).unwrap();
+    assert_eq!(requirement.poolable_resident_bytes().unwrap(), vae_bytes);
+    assert_eq!(requirement.poolable_fixed_bytes().unwrap(), 2 * gib);
+    assert_eq!(
+        requirement.poolable_residency_domain(),
+        ResidencyDomain::Device
+    );
+
+    let full =
+        configure::derive(0, &machine_profile(67_200_000_000, 24 * gib), &requirement).unwrap();
+    assert_eq!(full.pool_resident_bytes, Some(vae_bytes));
+
+    // A 4 GiB card holds the 512 MiB reserve and the 2 GiB decode workspace
+    // beside only 1.5 GiB of decoder weights; the derivation hands that
+    // partial cap to the decode loop instead of streaming from zero.
+    let partial =
+        configure::derive(0, &machine_profile(67_200_000_000, 4 * gib), &requirement).unwrap();
+    assert_eq!(
+        partial.pool_resident_bytes,
+        Some(4 * gib - (512 << 20) - 2 * gib)
+    );
+}
+
+#[test]
 fn scratch_host_overhead_numbers() {
     let estimate = default_estimate(357);
     println!(

@@ -112,6 +112,9 @@ pub(in crate::cli) enum GlmCommand {
             help = "Atomically write the versioned GLM policy and cache-residency manifest"
         )]
         execution_manifest: Option<PathBuf>,
+        #[arg(help = "Print the topology-derived expert-cache bound and its provenance to stderr")]
+        #[arg(long)]
+        explain_config: bool,
     },
     #[command(
         name = "capture-parity",

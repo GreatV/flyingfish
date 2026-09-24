@@ -26,6 +26,7 @@ pub mod kernel_assets;
 pub mod math;
 mod model;
 pub mod partition;
+pub mod resources;
 pub mod routing_trace;
 
 pub use execution_manifest::GlmExecutionManifest;

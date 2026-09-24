@@ -1369,7 +1369,7 @@ struct DecodeStage<'a> {
     execution_cache_policy: CachePolicy,
     transformer_chunking: TransformerChunking,
     no_progress: bool,
-    /// Rule 6's verdict: `Some(cap)` opens the visual decoder with its weights
+    /// Rule 7's verdict: `Some(cap)` opens the visual decoder with its weights
     /// resident under this device-cache ceiling; `None` streams per layer
     /// group.
     vae_resident_bytes: Option<u64>,
@@ -1815,7 +1815,7 @@ fn derive_t2va_configuration(
         ),
         Err(error) => {
             eprintln!(
-                "config: video VAE catalog was not read ({}); rule 6 assumes no decoder",
+                "config: video VAE catalog was not read ({}); rule 7 assumes no decoder",
                 error
             );
             None
@@ -2044,7 +2044,8 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
             device,
         )?;
         derived_host_bound_mib = host_bound_bytes.map(|bytes| bytes.div_ceil(1 << 20));
-        vae_resident_bytes = derived.vae_resident_bytes;
+        // A zero-cap pool streams by convention, which is today's None path.
+        vae_resident_bytes = derived.pool_resident_bytes.filter(|bytes| *bytes > 0);
         Some(derived)
     };
     let derived_source = derived.as_ref().map(|derived| match derived.weight_source {

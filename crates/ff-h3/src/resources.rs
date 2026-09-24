@@ -945,8 +945,12 @@ impl ff_core::configure::ModelRequirement for H3T2vaRequirement {
         Ok(self.memory_materialization_bytes)
     }
 
-    fn vae_weight_bytes(&self) -> Result<u64> {
+    fn poolable_resident_bytes(&self) -> Result<u64> {
         Ok(self.vae_bytes)
+    }
+
+    fn poolable_fixed_bytes(&self) -> Result<u64> {
+        Ok(self.vae_bytes / 4)
     }
 }
 

@@ -55,13 +55,33 @@ pub trait ModelRequirement {
         Ok(self.steady_weight_bytes()? + self.single_pass_weight_bytes()?)
     }
 
-    /// Weight bytes of the decode-stage model (the visual VAE for H3), which
-    /// runs after the denoise phases end. Zero when the architecture has no
-    /// separate decode-stage model (derivation rule 6 then stays silent).
-    fn vae_weight_bytes(&self) -> Result<u64> {
+    /// Total bytes of the streamable pool a partial residency can hold: all
+    /// routed experts, or all decode-stage model weights. Zero when the
+    /// architecture has nothing poolable (rule 7 stays silent).
+    fn poolable_resident_bytes(&self) -> Result<u64> {
         Ok(0)
     }
+
+    /// Fixed bytes drawn from the same budget before the pool: the cost that
+    /// stays resident beside a partial pool at the pool's own phase boundary.
+    fn poolable_fixed_bytes(&self) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// The memory pool rule 7's partial residency draws from.
+    fn poolable_residency_domain(&self) -> ResidencyDomain {
+        ResidencyDomain::Device
+    }
 }
+
+/// Which memory pool rule 7's partial residency draws from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidencyDomain {
+    Host,
+    Device,
+}
+
+pub const RULE_POOL_RESIDENCY: &str = "rule-7-pool-residency";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChunkPlan {
@@ -77,14 +97,6 @@ pub struct ChunkPlan {
 pub struct SelectedChunkPlan {
     pub plan: ChunkPlan,
     pub peak_device_bytes: u64,
-}
-
-/// Rule 6's outcome for the decode-stage model: `Some(bytes)` reserves that
-/// many device bytes for a resident decoder; `None` streams it per layer
-/// group.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VaeResidency {
-    pub weight_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,7 +120,11 @@ pub struct DerivedConfig {
     /// what the host holds beside its reserve and what materializes at all.
     /// `None` when the derivation streams through mmap.
     pub host_cache_ceiling_bytes: Option<u64>,
-    pub vae_resident_bytes: Option<u64>,
+    /// Rule 7's pool residency: `Some(bytes)` caps the resident pool there,
+    /// `Some(0)` means the budget covers none of the pool (full streaming),
+    /// and `None` means nothing is poolable or the domain's pool went
+    /// unmeasured.
+    pub pool_resident_bytes: Option<u64>,
     pub chunks: Option<ChunkPlan>,
     pub provenance: Vec<DerivationStep>,
 }
@@ -135,7 +151,6 @@ pub fn derive(
     let steady = requirement.steady_weight_bytes()?;
     let single_pass = requirement.single_pass_weight_bytes()?;
     let materialization = requirement.memory_materialization_bytes()?;
-    let vae_weight_bytes = requirement.vae_weight_bytes()?;
     let reserve = admission_reserve_bytes(profile.host_memory_total_bytes);
     let weight_source = match profile.host_memory_total_bytes {
         Some(host) if materialization.saturating_add(OS_ALLOWANCE_BYTES) <= host => {
@@ -183,7 +198,6 @@ pub fn derive(
         .devices
         .get(ordinal)
         .and_then(|device| device.total_memory_bytes);
-    let mut vae_resident_bytes = None;
     let chunks = match device_memory {
         Some(device_memory) => {
             let device_reserve = admission_reserve_bytes(Some(device_memory));
@@ -213,52 +227,6 @@ pub fn derive(
                 rule: "rule-2-chunks",
                 detail,
             });
-            // Rule 6: the decode-stage model runs after the denoise phases
-            // end, so the device it sees is free of the denoise residency.
-            // The cache cap must leave room for the decode workspace and the
-            // admission reserve beside the VAE weights.
-            let decode_workspace = vae_weight_bytes / 4;
-            let vae_resident = if vae_weight_bytes > 0 {
-                let available_for_vae = device_memory
-                    .saturating_sub(device_reserve)
-                    .saturating_sub(decode_workspace);
-                (available_for_vae >= vae_weight_bytes).then_some(vae_weight_bytes)
-            } else {
-                None
-            };
-            let vae_detail = if vae_weight_bytes == 0 {
-                None
-            } else {
-                let device_reserve = admission_reserve_bytes(Some(device_memory));
-                let resident_note = vae_resident
-                    .map(|cap| {
-                        format!(
-                            "resident; decoder cache capped at {:.1} GiB",
-                            cap as f64 / 1073741824.0
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        "device cannot hold the decoder beside its workspace; streaming per \
-                         layer-group"
-                            .to_owned()
-                    });
-                Some(format!(
-                    "vae {:.1} GiB; decode workspace {:.1} GiB; reserve {:.1} GiB; device \
-                     {:.1} GiB at the decode boundary (transformer residency dropped) -> {}",
-                    vae_weight_bytes as f64 / 1073741824.0,
-                    decode_workspace as f64 / 1073741824.0,
-                    device_reserve as f64 / 1073741824.0,
-                    device_memory as f64 / 1073741824.0,
-                    resident_note
-                ))
-            };
-            if let Some(vae_detail) = vae_detail {
-                provenance.push(DerivationStep {
-                    rule: "rule-6-vae-residency",
-                    detail: vae_detail,
-                });
-            }
-            vae_resident_bytes = vae_resident;
             selected.map(|selected| selected.plan)
         }
         None => {
@@ -269,6 +237,8 @@ pub fn derive(
             None
         }
     };
+    let pool_resident_bytes =
+        rule7_pool_residency(profile, device_memory, requirement, &mut provenance)?;
     if profile.devices.len() > 1 {
         provenance.push(DerivationStep {
             rule: "rule-5-multi-device",
@@ -283,10 +253,62 @@ pub fn derive(
         steady_weight_bytes: steady,
         host_reserve_bytes: reserve,
         host_cache_ceiling_bytes,
-        vae_resident_bytes,
+        pool_resident_bytes,
         chunks,
         provenance,
     })
+}
+
+/// Rule 7: bound the poolable partial residency by what its domain's pool
+/// holds beside the admission reserve and the pool's fixed cost. `None` when
+/// the architecture has nothing poolable or the domain's pool went unmeasured.
+fn rule7_pool_residency(
+    profile: &TopologyProfile,
+    device_memory: Option<u64>,
+    requirement: &dyn ModelRequirement,
+    provenance: &mut Vec<DerivationStep>,
+) -> Result<Option<u64>> {
+    let pool_total = requirement.poolable_resident_bytes()?;
+    if pool_total == 0 {
+        return Ok(None);
+    }
+    let fixed = requirement.poolable_fixed_bytes()?;
+    let (pool_memory, pool_name) = match requirement.poolable_residency_domain() {
+        ResidencyDomain::Device => (device_memory, "device"),
+        ResidencyDomain::Host => (profile.host_memory_total_bytes, "host"),
+    };
+    let Some(pool_memory) = pool_memory else {
+        provenance.push(DerivationStep {
+            rule: RULE_POOL_RESIDENCY,
+            detail: format!(
+                "poolable {pool_total} B but no {pool_name} memory recorded; pool residency \
+                 not derived"
+            ),
+        });
+        return Ok(None);
+    };
+    let reserve = admission_reserve_bytes(Some(pool_memory));
+    let resident = pool_memory
+        .saturating_sub(reserve)
+        .saturating_sub(fixed)
+        .min(pool_total);
+    let outcome = if resident > 0 {
+        format!("resident cap {:.1} GiB", resident as f64 / 1073741824.0)
+    } else {
+        "budget covers none of the pool; full streaming".to_owned()
+    };
+    provenance.push(DerivationStep {
+        rule: RULE_POOL_RESIDENCY,
+        detail: format!(
+            "pool {:.1} GiB; fixed {:.1} GiB; reserve {:.1} GiB; {pool_name} {:.1} GiB -> \
+             {outcome}",
+            pool_total as f64 / 1073741824.0,
+            fixed as f64 / 1073741824.0,
+            reserve as f64 / 1073741824.0,
+            pool_memory as f64 / 1073741824.0,
+        ),
+    });
+    Ok(Some(resident))
 }
 
 #[cfg(test)]
@@ -403,6 +425,141 @@ mod tests {
                 .provenance
                 .iter()
                 .any(|step| step.rule == "rule-2-chunks")
+        );
+    }
+
+    struct Pooled {
+        weights: u64,
+        activations: u64,
+        pool_total: u64,
+        fixed: u64,
+        domain: ResidencyDomain,
+    }
+
+    impl ModelRequirement for Pooled {
+        fn steady_weight_bytes(&self) -> Result<u64> {
+            Ok(self.weights)
+        }
+
+        fn activation_peak_bytes(&self) -> Result<u64> {
+            Ok(self.activations)
+        }
+
+        fn poolable_resident_bytes(&self) -> Result<u64> {
+            Ok(self.pool_total)
+        }
+
+        fn poolable_fixed_bytes(&self) -> Result<u64> {
+            Ok(self.fixed)
+        }
+
+        fn poolable_residency_domain(&self) -> ResidencyDomain {
+            self.domain
+        }
+    }
+
+    #[test]
+    fn pool_residency_takes_the_leftover_device_budget() {
+        let gib = 1u64 << 30;
+        let pooled = Pooled {
+            weights: 10 * gib,
+            activations: gib,
+            pool_total: 10 * gib,
+            fixed: 2 * gib,
+            domain: ResidencyDomain::Device,
+        };
+        let roomy = derive(0, &profile(Some(100 * gib), Some(24 * gib)), &pooled).unwrap();
+        // 24 GiB device: 1 GiB reserve + 2 GiB fixed leaves room for the
+        // whole 10 GiB pool.
+        assert_eq!(roomy.pool_resident_bytes, Some(10 * gib));
+        assert!(
+            roomy
+                .provenance
+                .iter()
+                .any(|step| step.rule == RULE_POOL_RESIDENCY)
+        );
+
+        let tight = Pooled {
+            pool_total: 10 * gib,
+            fixed: 7 * gib,
+            ..pooled
+        };
+        let partial = derive(0, &profile(Some(100 * gib), Some(8 * gib)), &tight).unwrap();
+        // 8 GiB device: the 512 MiB reserve + 7 GiB fixed leaves 512 MiB of
+        // the pool resident.
+        assert_eq!(partial.pool_resident_bytes, Some(512 << 20));
+
+        let swamped = Pooled {
+            pool_total: 10 * gib,
+            fixed: 8 * gib,
+            ..pooled
+        };
+        let streaming = derive(0, &profile(Some(100 * gib), Some(8 * gib)), &swamped).unwrap();
+        assert_eq!(streaming.pool_resident_bytes, Some(0));
+        assert!(
+            streaming
+                .provenance
+                .iter()
+                .any(|step| step.detail.contains("full streaming"))
+        );
+    }
+
+    #[test]
+    fn pool_residency_draws_from_the_declared_domain() {
+        let gib = 1u64 << 30;
+        let host_pool = Pooled {
+            weights: 10 * gib,
+            activations: gib,
+            pool_total: 30 * gib,
+            fixed: 2 * gib,
+            domain: ResidencyDomain::Host,
+        };
+        // 20 GiB host: the reserve sits at its 1 GiB cap, so 17 GiB of the
+        // 30 GiB pool is resident.
+        let derived = derive(0, &profile(Some(20 * gib), None), &host_pool).unwrap();
+        assert_eq!(derived.pool_resident_bytes, Some(17 * gib));
+
+        let device_pool = Pooled {
+            domain: ResidencyDomain::Device,
+            ..host_pool
+        };
+        let unmeasured = derive(0, &profile(Some(20 * gib), None), &device_pool).unwrap();
+        assert_eq!(unmeasured.pool_resident_bytes, None);
+        assert!(
+            unmeasured
+                .provenance
+                .iter()
+                .any(|step| step.detail.contains("no device memory recorded"))
+        );
+
+        let host_unmeasured = Pooled {
+            domain: ResidencyDomain::Host,
+            ..host_pool
+        };
+        let derived = derive(0, &profile(None, Some(24 * gib)), &host_unmeasured).unwrap();
+        assert_eq!(derived.pool_resident_bytes, None);
+        assert!(
+            derived
+                .provenance
+                .iter()
+                .any(|step| step.detail.contains("no host memory recorded"))
+        );
+    }
+
+    #[test]
+    fn an_empty_pool_skips_rule_seven() {
+        let gib = 1u64 << 30;
+        let bare = Bare {
+            weights: 10 * gib,
+            activations: gib,
+        };
+        let derived = derive(0, &profile(Some(100 * gib), Some(24 * gib)), &bare).unwrap();
+        assert_eq!(derived.pool_resident_bytes, None);
+        assert!(
+            !derived
+                .provenance
+                .iter()
+                .any(|step| step.rule == RULE_POOL_RESIDENCY)
         );
     }
 }
