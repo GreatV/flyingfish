@@ -71,16 +71,9 @@ pub fn derive_edge0_configuration(
     if let Some(bytes) = derived.pool_resident_bytes
         && bytes < requirement.expert_total_bytes
     {
-        derived.pool_resident_bytes = Some(0);
-        for step in &mut derived.provenance {
-            if step.rule == ff_core::configure::RULE_POOL_RESIDENCY {
-                step.detail = format!(
-                    "{}; edge0 has no partial expert cache, so residency snaps to full host \
-                     streaming",
-                    step.detail
-                );
-            }
-        }
+        derived.snap_pool_residency_to_streaming(
+            "edge0 has no partial expert cache, so residency snaps to full host streaming",
+        );
     }
     Ok(derived)
 }

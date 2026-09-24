@@ -133,6 +133,21 @@ pub struct DerivedConfig {
     pub provenance: Vec<DerivationStep>,
 }
 
+impl DerivedConfig {
+    /// Zero out rule 7's pool residency and record why, so an adapter whose
+    /// execution modes cannot realize the derived partial cap (an
+    /// all-or-nothing cache, or a cap too small to be worth using) reports a
+    /// cap the run can actually achieve.
+    pub fn snap_pool_residency_to_streaming(&mut self, reason: &str) {
+        self.pool_resident_bytes = Some(0);
+        for step in &mut self.provenance {
+            if step.rule == RULE_POOL_RESIDENCY {
+                step.detail = format!("{}; {reason}", step.detail);
+            }
+        }
+    }
+}
+
 impl fmt::Display for DerivationStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.rule, self.detail)
@@ -564,6 +579,31 @@ mod tests {
                 .provenance
                 .iter()
                 .any(|step| step.rule == RULE_POOL_RESIDENCY)
+        );
+    }
+
+    #[test]
+    fn snapping_pool_residency_zeroes_the_value_and_annotates_the_step() {
+        let gib = 1u64 << 30;
+        let pooled = Pooled {
+            weights: 10 * gib,
+            activations: gib,
+            pool_total: 10 * gib,
+            fixed: 2 * gib,
+            domain: ResidencyDomain::Device,
+        };
+        let mut derived = derive(0, &profile(Some(100 * gib), Some(24 * gib)), &pooled).unwrap();
+        assert_eq!(derived.pool_resident_bytes, Some(10 * gib));
+
+        derived.snap_pool_residency_to_streaming("caller-specific reason");
+
+        assert_eq!(derived.pool_resident_bytes, Some(0));
+        assert!(
+            derived
+                .provenance
+                .iter()
+                .find(|step| step.rule == RULE_POOL_RESIDENCY)
+                .is_some_and(|step| step.detail.ends_with("caller-specific reason"))
         );
     }
 }
