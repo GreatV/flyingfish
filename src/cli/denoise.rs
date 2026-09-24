@@ -20,7 +20,8 @@ use flyingfish::h3::core::AttentionKeyChunkPolicy;
 use flyingfish::h3::model::StreamedTransformer;
 use flyingfish::h3::pipeline::{
     DenoiseCheckpointEvent, DenoiseObserver, DenoisePreparationEvent, DenoiseStepEvent,
-    T2vaExecutionOptions, T2vaLatents, T2vaSchedule, denoise_t2va_with_options_and_observer,
+    PromptConditioning, T2vaExecutionOptions, T2vaInitialLatents, T2vaLatents, T2vaSchedule,
+    denoise_t2va_with_options_and_observer,
 };
 use flyingfish::h3::policy::ExecutionPolicy;
 use flyingfish::h3::resources::T2vaGeometry;
@@ -851,10 +852,14 @@ pub(super) fn run_denoise_t2va(command: H3Command) -> Result<()> {
     };
     let result = denoise_t2va_with_options_and_observer(
         &transformer,
-        &prompt_embeddings,
-        &text_token_tags,
-        &video_latents,
-        &audio_latents,
+        PromptConditioning {
+            embeddings: &prompt_embeddings,
+            text_token_tags: &text_token_tags,
+        },
+        T2vaInitialLatents {
+            video: &video_latents,
+            audio: &audio_latents,
+        },
         T2vaSchedule {
             sigma_points,
             video_shift,

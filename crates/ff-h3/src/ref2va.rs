@@ -14,13 +14,15 @@ use crate::policy::H3QwenNumericalContract;
 use crate::{
     audio_vae_encoder::StreamedAudioVaeEncoder,
     h3_conditioning::{
-        CONDITION_VIDEO_TIMESTEP, ConditionedLayout, ReferenceBlock,
+        CONDITION_VIDEO_TIMESTEP, ConditionedDenoiseInputs, ConditionedLayout, ReferenceBlock,
         denoise_conditioned_with_observer,
     },
-    layout,
+    layout::{self, LatentGeometry},
     model::StreamedTransformer,
     multimodal_text_encoder::{PreprocessedVision, RgbImage, StreamedMultimodalTextEncoder},
-    pipeline::{DenoiseObserver, T2vaExecutionOptions, T2vaLatents, T2vaSchedule},
+    pipeline::{
+        DenoiseObserver, PromptConditioning, T2vaExecutionOptions, T2vaLatents, T2vaSchedule,
+    },
     scheduler::H3Scheduler,
     text_encoder::PromptEncoding,
     video_vae_encoder::{StreamedVideoVaeEncoder, VideoVaeEncoderConfig},
@@ -66,6 +68,13 @@ pub struct Ref2vaTarget {
     pub width: usize,
 }
 
+/// The schedule and execution options of one denoise run.
+#[derive(Clone, Copy, Debug)]
+pub struct DenoiseSettings {
+    pub schedule: T2vaSchedule,
+    pub options: T2vaExecutionOptions,
+}
+
 /// All immutable conditioning and initial target noise needed by the existing
 /// conditioned denoising loop.
 pub struct PreparedRef2va {
@@ -95,12 +104,16 @@ impl PreparedRef2va {
     ) -> Result<T2vaLatents> {
         denoise_conditioned_with_observer(
             transformer,
-            &self.prompt_embeddings,
-            &self.text_token_tags,
-            &self.condition_video_rows,
-            &self.condition_audio_rows,
-            &self.initial_target_video_latents,
-            &self.initial_target_audio_latents,
+            PromptConditioning {
+                embeddings: &self.prompt_embeddings,
+                text_token_tags: &self.text_token_tags,
+            },
+            ConditionedDenoiseInputs {
+                condition_video_rows: &self.condition_video_rows,
+                condition_audio_rows: &self.condition_audio_rows,
+                initial_target_video_latents: &self.initial_target_video_latents,
+                initial_target_audio_latents: &self.initial_target_audio_latents,
+            },
             &self.layout,
             schedule,
             options,
@@ -323,8 +336,10 @@ impl<'a> Ref2vaPipeline<'a> {
             encoded,
             resolved,
             self.transformer_ref.config().patch_size,
-            self.video_encoder.config().latent_channels,
-            self.audio_encoder.config().latent_channels,
+            LatentChannels {
+                video: self.video_encoder.config().latent_channels,
+                audio: self.audio_encoder.config().latent_channels,
+            },
             seed,
             self.transformer_ref.device(),
         )
@@ -332,17 +347,16 @@ impl<'a> Ref2vaPipeline<'a> {
 
     /// Convenience end-to-end path through conditioning and the existing H3
     /// denoiser. Decoding remains shared with the T2VA/FL2VA output modules.
-    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
         prompt: &str,
         references: &[Ref2vaReference],
         target: Ref2vaTarget,
         seed: u64,
-        schedule: T2vaSchedule,
-        options: T2vaExecutionOptions,
+        settings: DenoiseSettings,
         observer: &mut dyn DenoiseObserver,
     ) -> Result<T2vaLatents> {
+        let DenoiseSettings { schedule, options } = settings;
         self.prepare(prompt, references, target, seed)?.denoise(
             self.transformer_ref,
             schedule,
@@ -407,27 +421,36 @@ struct VideoPresentation {
     timestamps: Vec<f64>,
 }
 
-#[allow(clippy::too_many_arguments)]
+struct LatentChannels {
+    video: usize,
+    audio: usize,
+}
+
 fn assemble_encoded(
     prompt: PromptEncoding,
     encoded: Vec<EncodedReference>,
     target: ResolvedTarget,
     patch_size: [usize; 3],
-    video_latent_channels: usize,
-    audio_latent_channels: usize,
+    channels: LatentChannels,
     seed: u64,
     device: &Device,
 ) -> Result<PreparedRef2va> {
+    let LatentChannels {
+        video: video_latent_channels,
+        audio: audio_latent_channels,
+    } = channels;
     let reference_blocks = encoded.iter().map(|entry| entry.block).collect::<Vec<_>>();
     let layout = ConditionedLayout::ref2va(
         &prompt.text_token_tags,
         &reference_blocks,
-        target.latent_frames,
-        target.latent_height,
-        target.latent_width,
-        target.audio_latents,
-        patch_size,
-        2,
+        LatentGeometry {
+            latent_frames: target.latent_frames,
+            latent_height: target.latent_height,
+            latent_width: target.latent_width,
+            audio_latents: target.audio_latents,
+            patch_size,
+            audio_channels: 2,
+        },
         device,
     )?;
 
@@ -1039,8 +1062,7 @@ mod tests {
             encoded,
             resolved,
             [1, 2, 2],
-            1,
-            2,
+            LatentChannels { video: 1, audio: 2 },
             7,
             &Device::Cpu,
         )

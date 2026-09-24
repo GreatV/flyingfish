@@ -83,6 +83,20 @@ pub struct T2vaExecutionOptions {
     pub max_steps: Option<usize>,
 }
 
+/// The prompt a denoise loop attends to, embeddings plus per-row modality tags.
+#[derive(Clone, Copy)]
+pub struct PromptConditioning<'a> {
+    pub embeddings: &'a Tensor,
+    pub text_token_tags: &'a [u32],
+}
+
+/// The initial noise a T2VA denoise loop starts from.
+#[derive(Clone, Copy)]
+pub struct T2vaInitialLatents<'a> {
+    pub video: &'a Tensor,
+    pub audio: &'a Tensor,
+}
+
 impl Default for T2vaExecutionOptions {
     fn default() -> Self {
         Self {
@@ -108,17 +122,22 @@ impl Default for T2vaSchedule {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn denoise_t2va_with_options_and_observer(
     transformer: &StreamedTransformer,
-    prompt_embeddings: &Tensor,
-    text_token_tags: &[u32],
-    initial_video_latents: &Tensor,
-    initial_audio_latents: &Tensor,
+    prompt: PromptConditioning<'_>,
+    initial_latents: T2vaInitialLatents<'_>,
     schedule: T2vaSchedule,
     options: T2vaExecutionOptions,
     observer: &mut dyn DenoiseObserver,
 ) -> Result<T2vaLatents> {
+    let PromptConditioning {
+        embeddings: prompt_embeddings,
+        text_token_tags,
+    } = prompt;
+    let T2vaInitialLatents {
+        video: initial_video_latents,
+        audio: initial_audio_latents,
+    } = initial_latents;
     let config = transformer.config();
     anyhow::ensure!(
         prompt_embeddings.device().same_device(transformer.device()),
@@ -319,12 +338,14 @@ fn run_t2va_loop_with_synchronizer<C>(
     let end_step = start_step + run_steps;
     let layout = PackedLayout::t2va(
         text_token_tags,
-        video_dims[2],
-        video_dims[3],
-        video_dims[4],
-        audio_frames,
-        patch_size,
-        audio_channels,
+        layout::LatentGeometry {
+            latent_frames: video_dims[2],
+            latent_height: video_dims[3],
+            latent_width: video_dims[4],
+            audio_latents: audio_frames,
+            patch_size,
+            audio_channels,
+        },
         device,
     )?;
     let mut video_rows = layout::patchify_video(initial_video_latents, patch_size)?;

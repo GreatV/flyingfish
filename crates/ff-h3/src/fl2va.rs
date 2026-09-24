@@ -9,13 +9,15 @@
 use crate::{
     config::TransformerConfig,
     h3_conditioning::{
-        CONDITION_VIDEO_TIMESTEP, ConditionedLayout, KeyframeAnchor,
+        CONDITION_VIDEO_TIMESTEP, ConditionedDenoiseInputs, ConditionedLayout, KeyframeAnchor,
         denoise_conditioned_with_observer,
     },
-    layout,
+    layout::{self, LatentGeometry},
     model::StreamedTransformer,
     multimodal_text_encoder::{RgbImage, StreamedMultimodalTextEncoder, resolve_fl2va_canvas_size},
-    pipeline::{DenoiseObserver, T2vaExecutionOptions, T2vaLatents, T2vaSchedule},
+    pipeline::{
+        DenoiseObserver, PromptConditioning, T2vaExecutionOptions, T2vaLatents, T2vaSchedule,
+    },
     scheduler::H3Scheduler,
     text_encoder::PromptEncoding,
     video_vae_encoder::StreamedVideoVaeEncoder,
@@ -101,6 +103,13 @@ pub struct Fl2vaFrameGeometry {
     pub num_frames: usize,
     pub num_latent_frames: usize,
     pub num_audio_latents: usize,
+}
+
+/// The optional first/last keyframe images of an FL2VA request.
+#[derive(Clone, Copy)]
+pub struct Fl2vaKeyframeImages<'a> {
+    pub first: Option<&'a RgbImage>,
+    pub last: Option<&'a RgbImage>,
 }
 
 pub struct PreparedFl2vaKeyframes {
@@ -264,12 +273,16 @@ impl PreparedFl2va {
         self.validate_transformer(transformer)?;
         denoise_conditioned_with_observer(
             transformer,
-            &self.prompt.embeddings,
-            &self.prompt.text_token_tags,
-            &self.condition_video_rows,
-            &self.condition_audio_rows,
-            &self.initial_target_video_latents,
-            &self.initial_target_audio_latents,
+            PromptConditioning {
+                embeddings: &self.prompt.embeddings,
+                text_token_tags: &self.prompt.text_token_tags,
+            },
+            ConditionedDenoiseInputs {
+                condition_video_rows: &self.condition_video_rows,
+                condition_audio_rows: &self.condition_audio_rows,
+                initial_target_video_latents: &self.initial_target_video_latents,
+                initial_target_audio_latents: &self.initial_target_audio_latents,
+            },
             &self.layout,
             schedule,
             options,
@@ -284,14 +297,12 @@ impl PreparedFl2va {
 /// keyframe-condition draws in packed order, then target-video noise, then target-audio noise.
 /// VAE posterior sampling remains independently fixed at seed 42 inside
 /// [`StreamedVideoVaeEncoder`].
-#[allow(clippy::too_many_arguments)]
 pub fn prepare_fl2va(
     text_encoder: &StreamedMultimodalTextEncoder,
     video_vae: &StreamedVideoVaeEncoder,
     tokenizer: &Tokenizer,
     prompt: &str,
-    first_image: Option<&RgbImage>,
-    last_image: Option<&RgbImage>,
+    keyframes: Fl2vaKeyframeImages<'_>,
     options: Fl2vaOptions,
     request_rng: &mut StdRng,
 ) -> Result<PreparedFl2va> {
@@ -300,8 +311,7 @@ pub fn prepare_fl2va(
         video_vae,
         tokenizer,
         prompt,
-        first_image,
-        last_image,
+        keyframes,
         options,
         request_rng,
     )
@@ -548,17 +558,19 @@ impl Fl2vaVaeBackend for StreamedVideoVaeEncoder {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn prepare_fl2va_with(
     text_encoder: &impl Fl2vaPromptBackend,
     video_vae: &impl Fl2vaVaeBackend,
     tokenizer: &Tokenizer,
     prompt_text: &str,
-    first_image: Option<&RgbImage>,
-    last_image: Option<&RgbImage>,
+    keyframes: Fl2vaKeyframeImages<'_>,
     options: Fl2vaOptions,
     request_rng: &mut StdRng,
 ) -> Result<PreparedFl2va> {
+    let Fl2vaKeyframeImages {
+        first: first_image,
+        last: last_image,
+    } = keyframes;
     anyhow::ensure!(
         first_image.is_some() || last_image.is_some(),
         "FL2VA requires a first image, a last image, or both"
@@ -644,12 +656,14 @@ fn prepare_fl2va_with(
 
     let layout = ConditionedLayout::fl2va(
         &prompt.text_token_tags,
-        frame_geometry.num_latent_frames,
-        latent_height,
-        latent_width,
-        frame_geometry.num_audio_latents,
-        options.patch_size,
-        options.audio_channels,
+        LatentGeometry {
+            latent_frames: frame_geometry.num_latent_frames,
+            latent_height,
+            latent_width,
+            audio_latents: frame_geometry.num_audio_latents,
+            patch_size: options.patch_size,
+            audio_channels: options.audio_channels,
+        },
         &prepared_keyframes.anchors,
         &execution_device,
     )?;
@@ -1242,8 +1256,10 @@ mod tests {
             &vae,
             &tokenizer,
             "a paper boat on a stream",
-            Some(&first),
-            Some(&last),
+            Fl2vaKeyframeImages {
+                first: Some(&first),
+                last: Some(&last),
+            },
             options,
             &mut rng,
         )
@@ -1348,8 +1364,10 @@ mod tests {
             &vae,
             &tokenizer,
             "arrive at this frame",
-            None,
-            Some(&last),
+            Fl2vaKeyframeImages {
+                first: None,
+                last: Some(&last),
+            },
             options,
             &mut rng,
         )
@@ -1378,8 +1396,10 @@ mod tests {
                 &vae,
                 &tokenizer,
                 "prompt",
-                None,
-                None,
+                Fl2vaKeyframeImages {
+                    first: None,
+                    last: None,
+                },
                 Fl2vaOptions::official(120),
                 &mut rng,
             )
@@ -1391,8 +1411,10 @@ mod tests {
                 &vae,
                 &tokenizer,
                 "",
-                Some(&first),
-                None,
+                Fl2vaKeyframeImages {
+                    first: Some(&first),
+                    last: None,
+                },
                 Fl2vaOptions::official(120),
                 &mut rng,
             )
@@ -1406,8 +1428,10 @@ mod tests {
                 &vae,
                 &tokenizer,
                 "prompt",
-                Some(&first),
-                None,
+                Fl2vaKeyframeImages {
+                    first: Some(&first),
+                    last: None,
+                },
                 wrong_patch,
                 &mut rng,
             )
@@ -1420,8 +1444,10 @@ mod tests {
                 &vae,
                 &tokenizer,
                 "prompt",
-                Some(&first),
-                None,
+                Fl2vaKeyframeImages {
+                    first: Some(&first),
+                    last: None,
+                },
                 unaligned,
                 &mut rng,
             )

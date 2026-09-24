@@ -124,12 +124,6 @@ struct ProjectedStepInputs {
     timestep: Tensor,
 }
 
-struct BlockExecutionContext<'a> {
-    adaln_indices: &'a Tensor,
-    rotary_cos: &'a Tensor,
-    rotary_sin: &'a Tensor,
-}
-
 pub struct StreamedTransformer {
     weights: Arc<ModelWeights>,
     config: TransformerConfig,
@@ -497,22 +491,16 @@ impl StreamedTransformer {
                         tensors,
                         &prefix,
                         &refined_text,
-                        self.config.num_attention_heads,
-                        self.config.attention_head_dim,
+                        self.attention_params(),
                         self.chunking.attention.query_chunk_size,
-                        self.config.norm_eps,
-                        self.config.qk_norm_eps,
                     )
                 } else {
                     core::refiner_attention(
                         tensors,
                         &prefix,
                         &refined_text,
-                        self.config.num_attention_heads,
-                        self.config.attention_head_dim,
+                        self.attention_params(),
                         self.chunking.attention.query_chunk_size,
-                        self.config.norm_eps,
-                        self.config.qk_norm_eps,
                     )
                 }
                 #[cfg(not(feature = "flash-attn"))]
@@ -520,11 +508,8 @@ impl StreamedTransformer {
                     tensors,
                     &prefix,
                     &refined_text,
-                    self.config.num_attention_heads,
-                    self.config.attention_head_dim,
+                    self.attention_params(),
                     self.chunking.attention.query_chunk_size,
-                    self.config.norm_eps,
-                    self.config.qk_norm_eps,
                 )
             })?;
             let feed_forward_stage = self.required_stage(&StageKind::RefinerFeedForward(layer))?;
@@ -702,12 +687,16 @@ impl StreamedTransformer {
         let video = projected.video.to_dtype(prepared.refined_text.dtype())?;
         let audio = projected.audio.to_dtype(prepared.refined_text.dtype())?;
         let packed = pack_projected_modalities(
-            &prepared.refined_text,
-            &audio,
-            &video,
-            &prepared.text_indices,
-            &prepared.audio_indices,
-            &prepared.video_indices,
+            ProjectedModalities {
+                text: &prepared.refined_text,
+                audio: &audio,
+                video: &video,
+            },
+            ModalityIndices {
+                text: &prepared.text_indices,
+                audio: &prepared.audio_indices,
+                video: &prepared.video_indices,
+            },
             prepared.sequence_length,
             prepared.canonical_layout_order,
         )?;
@@ -722,7 +711,7 @@ impl StreamedTransformer {
                 0..self.config.num_layers,
                 &packed,
                 modulations,
-                BlockExecutionContext {
+                core::BlockContext {
                     adaln_indices: &adaln_indices,
                     rotary_cos: &prepared.rotary_cos,
                     rotary_sin: &prepared.rotary_sin,
@@ -733,7 +722,7 @@ impl StreamedTransformer {
                 0..self.config.num_layers,
                 &packed,
                 &projected.timestep,
-                BlockExecutionContext {
+                core::BlockContext {
                     adaln_indices: &adaln_indices,
                     rotary_cos: &prepared.rotary_cos,
                     rotary_sin: &prepared.rotary_sin,
@@ -760,7 +749,7 @@ impl StreamedTransformer {
             block_range,
             hidden_states,
             timestep_embedding,
-            BlockExecutionContext {
+            core::BlockContext {
                 adaln_indices,
                 rotary_cos,
                 rotary_sin,
@@ -773,7 +762,7 @@ impl StreamedTransformer {
         block_range: Range<usize>,
         hidden_states: &Tensor,
         timestep_embedding: &Tensor,
-        context: BlockExecutionContext<'_>,
+        context: core::BlockContext<'_>,
     ) -> Result<Tensor> {
         self.validate_block_range(&block_range)?;
         self.validate_block_inputs(
@@ -796,14 +785,7 @@ impl StreamedTransformer {
                     self.config.hidden_size,
                 )
             })?;
-            hidden_states = self.forward_block(
-                block,
-                &hidden_states,
-                &modulation,
-                context.adaln_indices,
-                context.rotary_cos,
-                context.rotary_sin,
-            )?;
+            hidden_states = self.forward_block(block, &hidden_states, &modulation, &context)?;
         }
         Ok(hidden_states)
     }
@@ -813,7 +795,7 @@ impl StreamedTransformer {
         block_range: Range<usize>,
         hidden_states: &Tensor,
         modulations: &[core::AdaLnModulation],
-        context: BlockExecutionContext<'_>,
+        context: core::BlockContext<'_>,
     ) -> Result<Tensor> {
         self.validate_block_range(&block_range)?;
         self.validate_block_inputs(
@@ -830,14 +812,7 @@ impl StreamedTransformer {
         for block in block_range {
             let modulation = &modulations[block];
             let modulation = modulation_to_device(modulation, &self.device)?;
-            hidden_states = self.forward_block(
-                block,
-                &hidden_states,
-                &modulation,
-                context.adaln_indices,
-                context.rotary_cos,
-                context.rotary_sin,
-            )?;
+            hidden_states = self.forward_block(block, &hidden_states, &modulation, &context)?;
         }
         Ok(hidden_states)
     }
@@ -859,15 +834,12 @@ impl StreamedTransformer {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn forward_block(
         &self,
         block: usize,
         hidden_states: &Tensor,
         modulation: &core::AdaLnModulation,
-        adaln_indices: &Tensor,
-        rotary_cos: &Tensor,
-        rotary_sin: &Tensor,
+        context: &core::BlockContext<'_>,
     ) -> Result<Tensor> {
         let prefix = format!("transformer_blocks.{block}");
         let attention_stage = self.required_stage(&StageKind::BlockAttention(block))?;
@@ -879,14 +851,9 @@ impl StreamedTransformer {
                     &prefix,
                     hidden_states,
                     modulation,
-                    adaln_indices,
-                    rotary_cos,
-                    rotary_sin,
-                    self.config.num_attention_heads,
-                    self.config.attention_head_dim,
+                    context,
+                    self.attention_params(),
                     self.chunking.attention,
-                    self.config.norm_eps,
-                    self.config.qk_norm_eps,
                 )
             } else {
                 core::attention_with_projection_chunks(
@@ -894,14 +861,9 @@ impl StreamedTransformer {
                     &prefix,
                     hidden_states,
                     modulation,
-                    adaln_indices,
-                    rotary_cos,
-                    rotary_sin,
-                    self.config.num_attention_heads,
-                    self.config.attention_head_dim,
+                    context,
+                    self.attention_params(),
                     self.chunking.attention,
-                    self.config.norm_eps,
-                    self.config.qk_norm_eps,
                 )
             }
             #[cfg(not(feature = "flash-attn"))]
@@ -910,14 +872,9 @@ impl StreamedTransformer {
                 &prefix,
                 hidden_states,
                 modulation,
-                adaln_indices,
-                rotary_cos,
-                rotary_sin,
-                self.config.num_attention_heads,
-                self.config.attention_head_dim,
+                context,
+                self.attention_params(),
                 self.chunking.attention,
-                self.config.norm_eps,
-                self.config.qk_norm_eps,
             )
         })?;
         let feed_forward_stage = self.required_stage(&StageKind::BlockFeedForward(block))?;
@@ -927,11 +884,20 @@ impl StreamedTransformer {
                 &prefix,
                 &hidden_states,
                 modulation,
-                adaln_indices,
+                context.adaln_indices,
                 self.chunking.feed_forward_chunk_size,
                 self.config.norm_eps,
             )
         })
+    }
+
+    fn attention_params(&self) -> core::AttentionParams {
+        core::AttentionParams {
+            heads: self.config.num_attention_heads,
+            head_dim: self.config.attention_head_dim,
+            norm_eps: self.config.norm_eps,
+            qk_norm_eps: self.config.qk_norm_eps,
+        }
     }
 
     fn validate_block_inputs(
@@ -1066,11 +1032,15 @@ impl StreamedTransformer {
         project_output_full_sequence_chunks(
             weights,
             hidden,
-            &prepared.video_indices,
-            &prepared.audio_indices,
-            inputs.timestep_indices,
-            &shift,
-            &scale,
+            OutputRowIndices {
+                video_indices: &prepared.video_indices,
+                audio_indices: &prepared.audio_indices,
+                timestep_indices: inputs.timestep_indices,
+            },
+            OutputModulation {
+                shift: &shift,
+                scale: &scale,
+            },
             norm_weight,
             self.chunking.output_chunk_size,
             self.config.final_norm_eps,
@@ -1413,17 +1383,34 @@ impl StreamedTransformer {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct ProjectedModalities<'a> {
+    text: &'a Tensor,
+    audio: &'a Tensor,
+    video: &'a Tensor,
+}
+
+struct ModalityIndices<'a> {
+    text: &'a Tensor,
+    audio: &'a Tensor,
+    video: &'a Tensor,
+}
+
 fn pack_projected_modalities(
-    refined_text: &Tensor,
-    audio: &Tensor,
-    video: &Tensor,
-    text_indices: &Tensor,
-    audio_indices: &Tensor,
-    video_indices: &Tensor,
+    modalities: ProjectedModalities<'_>,
+    indices: ModalityIndices<'_>,
     sequence_length: usize,
     canonical_layout_order: bool,
 ) -> Result<Tensor> {
+    let ProjectedModalities {
+        text: refined_text,
+        audio,
+        video,
+    } = modalities;
+    let ModalityIndices {
+        text: text_indices,
+        audio: audio_indices,
+        video: video_indices,
+    } = indices;
     let (batch, text_rows, hidden) = refined_text
         .dims3()
         .context("refined text must be [batch, rows, hidden]")?;
@@ -1469,19 +1456,32 @@ fn pack_projected_modalities(
         .map_err(Into::into)
 }
 
-#[allow(clippy::too_many_arguments)]
+struct OutputRowIndices<'a> {
+    video_indices: &'a Tensor,
+    audio_indices: &'a Tensor,
+    timestep_indices: &'a Tensor,
+}
+
+struct OutputModulation<'a> {
+    shift: &'a Tensor,
+    scale: &'a Tensor,
+}
+
 fn project_output_full_sequence_chunks(
     weights: &BTreeMap<String, Tensor>,
     hidden: &Tensor,
-    video_indices: &Tensor,
-    audio_indices: &Tensor,
-    timestep_indices: &Tensor,
-    shift: &Tensor,
-    scale: &Tensor,
+    indices: OutputRowIndices<'_>,
+    modulation: OutputModulation<'_>,
     norm_weight: &Tensor,
     chunk_size: NonZeroUsize,
     norm_eps: f64,
 ) -> Result<TransformerOutput> {
+    let OutputRowIndices {
+        video_indices,
+        audio_indices,
+        timestep_indices,
+    } = indices;
+    let OutputModulation { shift, scale } = modulation;
     let (batch, sequence, hidden_size) = hidden
         .dims3()
         .context("output hidden states must be [batch, sequence, hidden]")?;
@@ -1623,17 +1623,19 @@ mod tests {
         Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn reference_full_sequence_output_heads(
         weights: &BTreeMap<String, Tensor>,
         hidden: &Tensor,
         timestep: &Tensor,
-        timestep_indices: &Tensor,
-        video_indices: &Tensor,
-        audio_indices: &Tensor,
+        indices: OutputRowIndices<'_>,
         hidden_size: usize,
         norm_eps: f64,
     ) -> Result<TransformerOutput> {
+        let OutputRowIndices {
+            video_indices,
+            audio_indices,
+            timestep_indices,
+        } = indices;
         let modulation = linear(weights, "norm_out.linear", &ops::silu(timestep)?)?;
         let shift = modulation.narrow(1, 0, hidden_size)?.contiguous()?;
         let scale = modulation
@@ -1650,14 +1652,11 @@ mod tests {
         Ok(TransformerOutput { video, audio })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn chunked_output_heads_for_test(
         weights: &BTreeMap<String, Tensor>,
         hidden: &Tensor,
         timestep: &Tensor,
-        timestep_indices: &Tensor,
-        video_indices: &Tensor,
-        audio_indices: &Tensor,
+        indices: OutputRowIndices<'_>,
         hidden_size: usize,
         chunk_size: usize,
         norm_eps: f64,
@@ -1671,11 +1670,11 @@ mod tests {
         project_output_full_sequence_chunks(
             weights,
             hidden,
-            video_indices,
-            audio_indices,
-            timestep_indices,
-            &shift,
-            &scale,
+            indices,
+            OutputModulation {
+                shift: &shift,
+                scale: &scale,
+            },
             norm_weight,
             non_zero(chunk_size),
             norm_eps,
@@ -1896,9 +1895,11 @@ mod tests {
             &weights,
             &hidden,
             &timestep,
-            &timestep_indices,
-            &video_indices,
-            &audio_indices,
+            OutputRowIndices {
+                video_indices: &video_indices,
+                audio_indices: &audio_indices,
+                timestep_indices: &timestep_indices,
+            },
             hidden_size,
             1e-5,
         )
@@ -1909,9 +1910,11 @@ mod tests {
                 &weights,
                 &hidden,
                 &timestep,
-                &timestep_indices,
-                &video_indices,
-                &audio_indices,
+                OutputRowIndices {
+                    video_indices: &video_indices,
+                    audio_indices: &audio_indices,
+                    timestep_indices: &timestep_indices,
+                },
                 hidden_size,
                 chunk_size,
                 1e-5,
@@ -1933,12 +1936,16 @@ mod tests {
         let canonical_audio = Tensor::new(&[2u32, 3], &Device::Cpu).unwrap();
         let canonical_video = Tensor::new(&[4u32, 5, 6], &Device::Cpu).unwrap();
         let canonical = pack_projected_modalities(
-            &text,
-            &audio,
-            &video,
-            &canonical_text,
-            &canonical_audio,
-            &canonical_video,
+            ProjectedModalities {
+                text: &text,
+                audio: &audio,
+                video: &video,
+            },
+            ModalityIndices {
+                text: &canonical_text,
+                audio: &canonical_audio,
+                video: &canonical_video,
+            },
             7,
             true,
         )
@@ -1954,12 +1961,16 @@ mod tests {
         let arbitrary_audio = Tensor::new(&[0u32, 5], &Device::Cpu).unwrap();
         let arbitrary_video = Tensor::new(&[2u32, 3, 6], &Device::Cpu).unwrap();
         let fallback = pack_projected_modalities(
-            &text,
-            &audio,
-            &video,
-            &arbitrary_text,
-            &arbitrary_audio,
-            &arbitrary_video,
+            ProjectedModalities {
+                text: &text,
+                audio: &audio,
+                video: &video,
+            },
+            ModalityIndices {
+                text: &arbitrary_text,
+                audio: &arbitrary_audio,
+                video: &arbitrary_video,
+            },
             7,
             false,
         )
@@ -2370,7 +2381,7 @@ mod tests {
                 0..layers,
                 &input,
                 &prepared_step.modulations,
-                BlockExecutionContext {
+                core::BlockContext {
                     adaln_indices: &indices,
                     rotary_cos: &cos,
                     rotary_sin: &sin,
@@ -2385,7 +2396,7 @@ mod tests {
                     0..cut,
                     &input,
                     &prepared_step.modulations,
-                    BlockExecutionContext {
+                    core::BlockContext {
                         adaln_indices: &indices,
                         rotary_cos: &cos,
                         rotary_sin: &sin,
@@ -2397,7 +2408,7 @@ mod tests {
                     cut..layers,
                     &prefix,
                     &prepared_step.modulations,
-                    BlockExecutionContext {
+                    core::BlockContext {
                         adaln_indices: &indices,
                         rotary_cos: &cos,
                         rotary_sin: &sin,
@@ -2432,7 +2443,7 @@ mod tests {
                 1..2,
                 &input,
                 &prepared_step.modulations,
-                BlockExecutionContext {
+                core::BlockContext {
                     adaln_indices: &indices,
                     rotary_cos: &cos,
                     rotary_sin: &sin,
