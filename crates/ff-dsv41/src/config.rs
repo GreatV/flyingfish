@@ -232,10 +232,14 @@ impl TextConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ff_core::paths::checkpoint_dir;
 
     #[test]
     fn parses_the_real_checkpoint_config() {
-        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
+            return;
+        };
+        let dir = &dir;
         if !dir.exists() {
             return;
         }
@@ -281,7 +285,10 @@ mod tests {
 
     #[test]
     fn mismatched_engram_arrays_are_rejected() {
-        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
+            return;
+        };
+        let dir = &dir;
         if !dir.exists() {
             return;
         }

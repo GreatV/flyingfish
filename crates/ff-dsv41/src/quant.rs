@@ -139,6 +139,7 @@ pub fn dequantize_fp4_packed(
 mod tests {
     use super::*;
     use candle_core::safetensors::Load as _;
+    use ff_core::paths::checkpoint_dir;
 
     #[test]
     fn e8m0_decodes_powers_of_two() {
@@ -188,7 +189,10 @@ mod tests {
 
     #[test]
     fn dequantization_round_trips_a_real_shard_payload() {
-        let dir = std::path::Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
+            return;
+        };
+        let dir = &dir;
         let path = dir.join("model-00009-of-00048.safetensors");
         if !path.exists() {
             return;

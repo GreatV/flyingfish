@@ -766,6 +766,7 @@ pub fn multimodal_positions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ff_core::paths::checkpoint_dir;
 
     /// Gate 1: preprocessing vs the HF processor fixture (grid exact,
     /// pixels to 1e-6).
@@ -875,7 +876,10 @@ mod tests {
     /// at the bf16 rounding floor class (measured margins, not bit-exact).
     #[test]
     fn tower_matches_hf_fixture() {
-        let dir = Path::new("../../models/Qwen/Qwen3.8-27B-int4");
+        let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4") else {
+            return;
+        };
+        let dir = &dir;
         let fixture_path = Path::new("src/testdata/vision_tower_fixture.json");
         let png = Path::new("src/testdata/vision_test.png");
         if !dir.exists() || !fixture_path.exists() || !png.exists() {

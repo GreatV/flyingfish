@@ -231,7 +231,7 @@ pub fn plan_mode(
 mod tests {
     use super::*;
     use crate::weights::Edge0Weights;
-    use std::path::Path;
+    use ff_core::paths::checkpoint_dir;
 
     /// The real checkpoint's weighed sizes as five constants; the audit test
     /// holds this fixture to the checkpoint where one is present.
@@ -247,10 +247,7 @@ mod tests {
 
     /// Weighed against the real checkpoint; the audit test skips without it.
     fn sizes() -> Option<WeightSizes> {
-        let dir = Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../models/Edge0/Edge0-35B-A3B-preview"
-        ));
+        let dir = &checkpoint_dir("Edge0/Edge0-35B-A3B-preview")?;
         if !dir.is_dir() {
             return None;
         }

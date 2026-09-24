@@ -15,7 +15,6 @@
 
 use ff_edge0::config::Edge0Config;
 use ff_edge0::model::Edge0Text;
-use std::path::Path;
 
 /// (projection name, in_dim) — one per adapter family.
 const LORA_SAMPLES: &[(&str, usize)] = &[
@@ -49,7 +48,10 @@ const EXPECT2: &[u32] = &[
 ];
 
 fn main() -> anyhow::Result<()> {
-    let model_dir = Path::new("models/Edge0/Edge0-35B-A3B-preview");
+    let Some(model_dir) = ff_core::paths::checkpoint_dir("Edge0/Edge0-35B-A3B-preview") else {
+        anyhow::bail!("set FF_MODELS_DIR to the local models root");
+    };
+    let model_dir = &model_dir;
     let config = Edge0Config::from_model_dir(model_dir)?;
     let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;

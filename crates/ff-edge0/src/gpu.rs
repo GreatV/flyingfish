@@ -1156,7 +1156,7 @@ impl GpuQuant {
 mod tests {
     use super::*;
     use crate::weights::Edge0Weights;
-    use std::path::Path;
+    use ff_core::paths::checkpoint_dir;
 
     #[test]
     fn gpu_gemv_matches_cpu_matvec_on_a_real_projection() {
@@ -1167,15 +1167,15 @@ mod tests {
                 return;
             }
         };
-        let checkpoint = Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../models/Edge0/Edge0-35B-A3B-preview"
-        ));
+        let Some(checkpoint) = checkpoint_dir("Edge0/Edge0-35B-A3B-preview") else {
+            eprintln!("FF_MODELS_DIR unset; skipping gpu test");
+            return;
+        };
         if !checkpoint.is_dir() {
             eprintln!("no Edge0 checkpoint; skipping gpu test");
             return;
         }
-        let weights = Edge0Weights::open(checkpoint).unwrap();
+        let weights = Edge0Weights::open(&checkpoint).unwrap();
         let name = "language_model.model.layers.3.self_attn.q_proj";
         let quant = weights.quant_projection(name).unwrap();
         let gpu = ctx.upload(&quant, None).unwrap();
