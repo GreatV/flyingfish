@@ -400,6 +400,7 @@ pub fn engram_forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ff_core::paths::checkpoint_dir;
 
     #[test]
     fn prime_chain_starts_above_the_vocabulary() {
@@ -429,7 +430,10 @@ mod tests {
 
     #[test]
     fn layout_sizes_match_the_configuration() {
-        let dir = std::path::Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
+            return;
+        };
+        let dir = &dir;
         if !dir.exists() {
             return;
         }

@@ -39,6 +39,7 @@ pub mod interconnect;
 pub mod io_calibration;
 pub mod math;
 pub mod parity;
+pub mod paths;
 pub mod probe;
 pub mod residency;
 pub mod resource_selection;

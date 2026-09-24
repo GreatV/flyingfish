@@ -228,10 +228,14 @@ impl Qwen35Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ff_core::paths::checkpoint_dir;
 
     #[test]
     fn parses_the_real_checkpoint_config() {
-        let dir = Path::new("../../models/Qwen/Qwen3.8-27B");
+        let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B") else {
+            return;
+        };
+        let dir = &dir;
         if !dir.exists() {
             return;
         }

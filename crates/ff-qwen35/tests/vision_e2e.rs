@@ -1,5 +1,6 @@
 //! E2E vision acceptance vs the HF fixtures (skips without the model dir).
 
+use ff_core::paths::checkpoint_dir;
 use ff_qwen35::config::Qwen35Config;
 use ff_qwen35::model::Qwen35Text;
 use ff_qwen35::vision::{
@@ -48,7 +49,10 @@ fn decode_rope_pos_matches_fixture_arithmetic() {
 #[test]
 #[ignore]
 fn image_prompt_decode_matches_hf_fixture() {
-    let dir = Path::new("../../models/Qwen/Qwen3.8-27B-int4");
+    let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4") else {
+        return;
+    };
+    let dir = &dir;
     let fixture_path = Path::new("src/testdata/vision_e2e_fixture.json");
     let png = Path::new("src/testdata/vision_test.png");
     if !dir.exists() || !fixture_path.exists() {

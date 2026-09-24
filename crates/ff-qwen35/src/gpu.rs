@@ -1827,6 +1827,7 @@ mod tests {
         Residency, StreamState, choose_resident_through, layer_device_bytes, override_free,
         plan_residency, split_layers_by_bytes,
     };
+    use ff_core::paths::checkpoint_dir;
 
     #[test]
     fn resident_through_takes_the_fitting_prefix() {
@@ -1896,7 +1897,10 @@ mod tests {
 
     #[test]
     fn split_balances_the_real_checkpoint_layers() {
-        let dir = std::path::Path::new("../../models/Qwen/Qwen3.8-27B-int4");
+        let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4") else {
+            return;
+        };
+        let dir = &dir;
         if !dir.exists() {
             return;
         }
@@ -1925,7 +1929,10 @@ mod tests {
 
     #[test]
     fn plan_residency_picks_a_hybrid_prefix_on_real_bytes() {
-        let dir = std::path::Path::new("../../models/Qwen/Qwen3.8-27B-int4");
+        let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4") else {
+            return;
+        };
+        let dir = &dir;
         if !dir.exists() {
             return;
         }

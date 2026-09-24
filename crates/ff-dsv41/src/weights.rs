@@ -714,9 +714,10 @@ impl TransformerLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ff_core::paths::checkpoint_dir;
 
     fn layout() -> Option<CheckpointLayout> {
-        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let dir = &checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")?;
         if !dir.join("model.safetensors.index.json").exists() {
             return None;
         }
@@ -772,7 +773,10 @@ mod tests {
 
     #[test]
     fn repeated_estimate_calls_stay_valid_after_map_release() {
-        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
+            return;
+        };
+        let dir = &dir;
         if !dir.join("model.safetensors.index.json").exists() {
             return;
         }
@@ -792,7 +796,10 @@ mod tests {
 
     #[test]
     fn resident_estimate_sums_exact_tensor_sizes_not_shard_averages() {
-        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
+            return;
+        };
+        let dir = &dir;
         if !dir.join("model.safetensors.index.json").exists() {
             return;
         }
@@ -831,7 +838,10 @@ mod tests {
 
     #[test]
     fn a_broken_shard_reports_an_error_instead_of_panicking() {
-        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
+            return;
+        };
+        let dir = &dir;
         if !dir.join("model.safetensors.index.json").exists() {
             return;
         }
@@ -863,7 +873,10 @@ mod tests {
 
     #[test]
     fn layer_assembly_materializes_the_real_projections() {
-        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
+            return;
+        };
+        let dir = &dir;
         if !dir.join("model.safetensors.index.json").exists() {
             return;
         }
@@ -954,7 +967,10 @@ mod tests {
         let Some(layout) = layout() else {
             return;
         };
-        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
+            return;
+        };
+        let dir = &dir;
         let exact = TransformerLoader::open(dir)
             .unwrap()
             .resident_f32_bytes()
@@ -991,7 +1007,10 @@ mod tests {
 
     #[test]
     fn a_missing_engram_shard_is_an_error_not_a_panic() {
-        let dir = Path::new("../../models/deepseek-ai/DeepSeek-V4.1-Flash");
+        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
+            return;
+        };
+        let dir = &dir;
         if !dir.join("config.json").exists() {
             return;
         }
