@@ -9,6 +9,7 @@
 
 use crate::config::{LayerKind, Qwen35Config, TEXT_PREFIX, TextConfig};
 use crate::weights::{HostProjection, Qwen35Weights};
+use crate::wide::{DownBuffers, GroupPair, WideGeom};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::safe::{CudaEvent, CudaSlice, CudaStream};
 use ff_edge0::gpu::{GpuContext, GpuGdn, GpuQuant, GroupSeg};
@@ -1106,8 +1107,10 @@ impl QwenGpu {
             &self.ctx,
             &segs,
             [lm.y_ref(); 4],
-            &self.x1,
-            &self.x1,
+            &GroupPair {
+                x: &self.x1,
+                xb: &self.x1,
+            },
             lm.in_dim,
             1,
         )?;
@@ -1331,8 +1334,10 @@ impl QwenGpu {
             &self.ctx,
             &segs,
             [lm.y_ref(); 4],
-            &self.x1,
-            &self.x1,
+            &GroupPair {
+                x: &self.x1,
+                xb: &self.x1,
+            },
             lm.in_dim,
             1,
         )?;
@@ -1650,8 +1655,7 @@ fn run_layer(
             view.ctx,
             &segs,
             [qkv.y_ref(), z.y_ref(), b.y_ref(), a.y_ref()],
-            x1,
-            x1,
+            &GroupPair { x: x1, xb: x1 },
             qkv.in_dim(),
             1,
         )?;
@@ -1669,8 +1673,7 @@ fn run_layer(
             view.ctx,
             &segs,
             [out_proj.y_ref(); 4],
-            gout,
-            gout,
+            &GroupPair { x: gout, xb: gout },
             out_proj.in_dim(),
             1,
         )?;
@@ -1692,8 +1695,7 @@ fn run_layer(
             view.ctx,
             &segs,
             [q.y_ref(), k.y_ref(), v.y_ref(), q.y_ref()],
-            x1,
-            x1,
+            &GroupPair { x: x1, xb: x1 },
             q.in_dim(),
             1,
         )?;
@@ -1744,8 +1746,10 @@ fn run_layer(
             view.ctx,
             &segs,
             [o.y_ref(); 4],
-            view.attn_out,
-            view.attn_out,
+            &GroupPair {
+                x: view.attn_out,
+                xb: view.attn_out,
+            },
             o.in_dim(),
             1,
         )?;
@@ -1762,54 +1766,66 @@ fn run_layer(
     let (up_, us, ub) = up.tensors();
     view.wide.down(
         view.ctx,
-        gp,
-        gs,
-        gb,
-        x1,
-        x1,
-        gate.y_ref(),
-        gate.y_ref(),
-        view.scr_gu,
-        view.scr_gu,
-        gate.out_dim(),
-        gate.in_dim(),
-        1,
-        1,
+        &DownBuffers {
+            packed: gp,
+            scales: gs,
+            biases: gb,
+            x: x1,
+            xb: x1,
+            y: gate.y_ref(),
+            yb: gate.y_ref(),
+            scratch: view.scr_gu,
+            scratch_b: view.scr_gu,
+        },
+        &WideGeom {
+            rows: gate.out_dim(),
+            in_dim: gate.in_dim(),
+            split: 1,
+            cols: 1,
+        },
     )?;
     view.wide.down(
         view.ctx,
-        up_,
-        us,
-        ub,
-        x1,
-        x1,
-        up.y_ref(),
-        up.y_ref(),
-        view.scr_gu,
-        view.scr_gu,
-        up.out_dim(),
-        up.in_dim(),
-        1,
-        1,
+        &DownBuffers {
+            packed: up_,
+            scales: us,
+            biases: ub,
+            x: x1,
+            xb: x1,
+            y: up.y_ref(),
+            yb: up.y_ref(),
+            scratch: view.scr_gu,
+            scratch_b: view.scr_gu,
+        },
+        &WideGeom {
+            rows: up.out_dim(),
+            in_dim: up.in_dim(),
+            split: 1,
+            cols: 1,
+        },
     )?;
     view.ctx
         .silu_mul(gate.y_ref(), up.y_ref(), view.inner, text.intermediate_size)?;
     let (dp, ds, db) = down.tensors();
     view.wide.down(
         view.ctx,
-        dp,
-        ds,
-        db,
-        view.inner,
-        view.inner,
-        down.y_ref(),
-        down.y_ref(),
-        view.scr_down,
-        view.scr_down,
-        down.out_dim(),
-        down.in_dim(),
-        4,
-        1,
+        &DownBuffers {
+            packed: dp,
+            scales: ds,
+            biases: db,
+            x: view.inner,
+            xb: view.inner,
+            y: down.y_ref(),
+            yb: down.y_ref(),
+            scratch: view.scr_down,
+            scratch_b: view.scr_down,
+        },
+        &WideGeom {
+            rows: down.out_dim(),
+            in_dim: down.in_dim(),
+            split: 4,
+            cols: 1,
+        },
     )?;
     let next_w: &CudaSliceF = if layer + 1 < end {
         &view.ln[local + 1][0]

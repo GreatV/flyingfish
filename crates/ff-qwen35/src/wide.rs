@@ -20,6 +20,35 @@ pub struct WideKernels {
     group_v4: cudarc::driver::safe::CudaFunction,
 }
 
+/// Every buffer and geometry value one wide `down` GEMV launch reads, named
+/// one-to-one with the launcher's parameters.
+pub struct DownBuffers<'a> {
+    pub packed: &'a CudaSlice<u32>,
+    pub scales: &'a CudaSlice<f32>,
+    pub biases: &'a CudaSlice<f32>,
+    pub x: &'a CudaSlice<f32>,
+    pub xb: &'a CudaSlice<f32>,
+    pub y: &'a CudaSlice<f32>,
+    pub yb: &'a CudaSlice<f32>,
+    pub scratch: &'a CudaSlice<f32>,
+    pub scratch_b: &'a CudaSlice<f32>,
+}
+
+/// Copy the launch geometry for one wide `down` GEMV.
+#[derive(Clone, Copy)]
+pub struct WideGeom {
+    pub rows: usize,
+    pub in_dim: usize,
+    pub split: usize,
+    pub cols: u32,
+}
+
+/// The input/output buffer pair one `group` launch reads.
+pub struct GroupPair<'a> {
+    pub x: &'a CudaSlice<f32>,
+    pub xb: &'a CudaSlice<f32>,
+}
+
 impl WideKernels {
     pub fn load(ctx: &GpuContext) -> Result<Self> {
         let module =
@@ -49,24 +78,25 @@ impl WideKernels {
     /// cols == 1 pass x/y/scratch as the b-arguments too — the kernel
     /// only takes the B path when gridDim.y == 2, so the aliases are
     /// never dereferenced.
-    #[allow(clippy::too_many_arguments)]
-    pub fn down(
-        &self,
-        ctx: &GpuContext,
-        packed: &CudaSlice<u32>,
-        scales: &CudaSlice<f32>,
-        biases: &CudaSlice<f32>,
-        x: &CudaSlice<f32>,
-        xb: &CudaSlice<f32>,
-        y: &CudaSlice<f32>,
-        yb: &CudaSlice<f32>,
-        scratch: &CudaSlice<f32>,
-        scratch_b: &CudaSlice<f32>,
-        rows: usize,
-        in_dim: usize,
-        split: usize,
-        cols: u32,
-    ) -> Result<()> {
+    pub fn down(&self, ctx: &GpuContext, b: &DownBuffers<'_>, geom: &WideGeom) -> Result<()> {
+        let DownBuffers {
+            packed,
+            scales,
+            biases,
+            x,
+            xb,
+            y,
+            yb,
+            scratch,
+            scratch_b,
+            ..
+        } = *b;
+        let WideGeom {
+            rows,
+            in_dim,
+            split,
+            cols,
+        } = *geom;
         // The splitk row loop is #pragma-unrolled with no tail guard
         // (guarded variants miscompiled) — rows must be a full RPB multiple.
         anyhow::ensure!(
@@ -169,17 +199,17 @@ impl WideKernels {
     /// cols == 2). yb entries are per-segment B outputs; for cols == 1
     /// pass the A slices again (aliases are never dereferenced at
     /// gridDim.y == 1).
-    #[allow(clippy::too_many_arguments)]
     pub fn group(
         &self,
         ctx: &GpuContext,
         segs: &[ff_edge0::gpu::GroupSeg; 4],
         yb: [&CudaSlice<f32>; 4],
-        x: &CudaSlice<f32>,
-        xb: &CudaSlice<f32>,
+        pair: &GroupPair<'_>,
         in_dim: usize,
         cols: u32,
     ) -> Result<()> {
+        let GroupPair { x, xb } = *pair;
+
         let [s0, s1, s2, s3] = [&segs[0], &segs[1], &segs[2], &segs[3]];
         for s in [s0, s1, s2, s3] {
             anyhow::ensure!(s.lora.is_none(), "wide group kernel has no lora path");
@@ -280,24 +310,25 @@ impl WideKernels {
 impl WideKernels {
     /// uint4-widened splitk A/B twin of `down` (same contract; requires
     /// slice_words % 4 == 0). Uses the SAME columned combine.
-    #[allow(clippy::too_many_arguments)]
-    pub fn down_v4(
-        &self,
-        ctx: &GpuContext,
-        packed: &CudaSlice<u32>,
-        scales: &CudaSlice<f32>,
-        biases: &CudaSlice<f32>,
-        x: &CudaSlice<f32>,
-        xb: &CudaSlice<f32>,
-        y: &CudaSlice<f32>,
-        yb: &CudaSlice<f32>,
-        scratch: &CudaSlice<f32>,
-        scratch_b: &CudaSlice<f32>,
-        rows: usize,
-        in_dim: usize,
-        split: usize,
-        cols: u32,
-    ) -> Result<()> {
+    pub fn down_v4(&self, ctx: &GpuContext, b: &DownBuffers<'_>, geom: &WideGeom) -> Result<()> {
+        let DownBuffers {
+            packed,
+            scales,
+            biases,
+            x,
+            xb,
+            y,
+            yb,
+            scratch,
+            scratch_b,
+            ..
+        } = *b;
+        let WideGeom {
+            rows,
+            in_dim,
+            split,
+            cols,
+        } = *geom;
         let words = in_dim / 8;
         let slice_words = words / split;
         anyhow::ensure!(
