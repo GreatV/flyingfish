@@ -28,6 +28,18 @@ pub(super) enum Qwen35Command {
         image: Option<PathBuf>,
         #[arg(long, default_value_t = NonZeroUsize::new(128).unwrap())]
         max_new_tokens: NonZeroUsize,
+        #[arg(
+            help = "Draft one token per round with the checkpoint's MTP head and verify both \
+                    (CUDA, resident weights, single device)"
+        )]
+        #[arg(long)]
+        speculative: bool,
+        #[arg(
+            help = "Skip drafting when the model's top1-top2 logit margin falls below this \
+                    threshold; requires --speculative"
+        )]
+        #[arg(long)]
+        speculative_gate: Option<f32>,
         #[command(flatten)]
         device: kit::DeviceArgs,
     },
@@ -39,10 +51,24 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
         prompt,
         image,
         max_new_tokens,
+        speculative,
+        speculative_gate,
         device,
     } = command;
     let kit::DeviceArgs { device } = device;
     let (device, auto) = resolve_text_device(&device)?;
+    if speculative && image.is_some() {
+        bail!("--speculative is text-only; it cannot be combined with --image");
+    }
+    if speculative_gate.is_some() && !speculative {
+        bail!("--speculative-gate requires --speculative");
+    }
+    if let Some(gate) = speculative_gate {
+        anyhow::ensure!(
+            gate > 0.0,
+            "--speculative-gate must be positive, got {gate}"
+        );
+    }
     let config = Qwen35Config::from_model_dir(&model_dir)?;
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|error| anyhow::anyhow!("load tokenizer: {error}"))?;
@@ -109,6 +135,9 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
         }
         TextDevice::Cpu => TextDevice::Cpu,
     };
+    if speculative && matches!(device, TextDevice::Cpu) {
+        bail!("--speculative requires CUDA decode; the resolved device is cpu");
+    }
     let vision = match vision_input {
         Some((patches, grid)) => {
             Some((run_vision_tower(&model_dir, &config, patches, grid)?, grid))
@@ -136,15 +165,29 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
             }
             generated
         }
-        TextDevice::Cuda(ordinals) => generate_cuda(
-            &ordinals,
-            &model_dir,
-            &config,
-            &ids,
-            &pos3,
-            vision.as_ref(),
-            max_new_tokens.get(),
-        )?,
+        TextDevice::Cuda(ordinals) => {
+            #[cfg(feature = "cuda")]
+            {
+                generate_cuda(CudaDecode {
+                    ordinals: &ordinals,
+                    model_dir: &model_dir,
+                    config: &config,
+                    ids: &ids,
+                    pos3: &pos3,
+                    vision: vision.as_ref(),
+                    max_new_tokens: max_new_tokens.get(),
+                    speculative,
+                    gate: speculative_gate,
+                })?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                bail!(
+                    "CUDA decoding requires a binary built with --features cuda \
+                     (requested ordinals {ordinals:?})"
+                );
+            }
+        }
     };
     let text = tokenizer
         .decode(&generated, true)
@@ -293,17 +336,36 @@ fn prefill(
     hidden.context("missing prefill state")
 }
 
+/// One CUDA decode request: everything `generate_cuda` needs to open the
+/// checkpoint, run prefill, and decode.
 #[cfg(feature = "cuda")]
-fn generate_cuda(
-    ordinals: &[usize],
-    model_dir: &Path,
-    config: &Qwen35Config,
-    ids: &[u32],
-    pos3: &[[i32; 3]],
-    vision: Option<&(Vec<f32>, VisionGrid)>,
+struct CudaDecode<'a> {
+    ordinals: &'a [usize],
+    model_dir: &'a Path,
+    config: &'a Qwen35Config,
+    ids: &'a [u32],
+    pos3: &'a [[i32; 3]],
+    vision: Option<&'a (Vec<f32>, VisionGrid)>,
     max_new_tokens: usize,
-) -> Result<Vec<u32>> {
+    speculative: bool,
+    gate: Option<f32>,
+}
+
+#[cfg(feature = "cuda")]
+fn generate_cuda(request: CudaDecode<'_>) -> Result<Vec<u32>> {
     use flyingfish::qwen35::gpu::QwenGpu;
+
+    let CudaDecode {
+        ordinals,
+        model_dir,
+        config,
+        ids,
+        pos3,
+        vision,
+        max_new_tokens,
+        speculative,
+        gate,
+    } = request;
 
     anyhow::ensure!(
         !ordinals.is_empty(),
@@ -341,6 +403,9 @@ fn generate_cuda(
             gpu.push_tokens(ids)?;
         }
     }
+    if speculative {
+        return generate_cuda_speculative(&mut gpu, &weights, config, max_new_tokens, gate);
+    }
     let mut generated = vec![gpu.read_token()?];
     while generated.len() < max_new_tokens
         && !config
@@ -354,15 +419,110 @@ fn generate_cuda(
     Ok(generated)
 }
 
-#[cfg(not(feature = "cuda"))]
-fn generate_cuda(
-    _: &[usize],
-    _: &Path,
-    _: &Qwen35Config,
-    _: &[u32],
-    _: &[[i32; 3]],
-    _: Option<&(Vec<f32>, VisionGrid)>,
-    _: usize,
+/// Greedy decode with one MTP-drafted token verified per round. The emitted
+/// ids are the non-speculative path's by construction: a draft is only
+/// emitted after the model's own greedy token confirmed it.
+#[cfg(feature = "cuda")]
+fn generate_cuda_speculative(
+    gpu: &mut flyingfish::qwen35::gpu::QwenGpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    max_new_tokens: usize,
+    gate: Option<f32>,
 ) -> Result<Vec<u32>> {
-    bail!("CUDA decoding requires a binary built with --features cuda")
+    use flyingfish::qwen35::spec::QwenSpec;
+    use std::time::Instant;
+
+    let eos = |token: &u32| config.text_config.eos_token_id.contains(token);
+    let mut spec = QwenSpec::new(gpu, weights)?;
+    spec.margins_enabled = gate.is_some();
+    let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
+    let (mut accepts, mut rejects, mut skips) = (0usize, 0usize, 0usize);
+    let mut pending = gpu.read_token()?;
+    spec.draft(gpu, Some(&gpu.hidden), pending)?;
+    let mut have_draft = true;
+    let started = Instant::now();
+    while generated.len() < max_new_tokens {
+        // `pending` is a model-confirmed token carried from the previous
+        // round (or the prefill's first); emit it alone and stop when it is
+        // EOS rather than staging it under a fresh draft.
+        if eos(&pending) {
+            generated.push(pending);
+            break;
+        }
+        gpu.ctx
+            .stream
+            .memcpy_htod(&[pending as i32], &mut gpu.next_token)?;
+        // A verify round emits two tokens, so it needs two slots; the last
+        // slot fills with a plain step's verified token instead of an
+        // unverified draft.
+        if have_draft && generated.len() + 2 <= max_new_tokens {
+            let (a, b) = spec.verify_round(gpu)?;
+            let accepted = a == spec.draft_id;
+            if accepted {
+                accepts += 1;
+                generated.push(pending);
+                generated.push(spec.draft_id);
+                gpu.ctx.glue_inc(&mut gpu.pos)?;
+                gpu.ctx.glue_inc(&mut gpu.pos)?;
+                gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
+                gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
+                gpu.position += 2;
+                pending = b;
+                have_draft = gate.is_none_or(|t| spec.margin_b >= t);
+            } else {
+                rejects += 1;
+                generated.push(pending);
+                spec.reject_restore(gpu)?;
+                gpu.ctx.glue_inc(&mut gpu.pos)?;
+                gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
+                gpu.position += 1;
+                pending = a;
+                have_draft = gate.is_none_or(|t| spec.margin_a >= t);
+            }
+            if accepted && eos(&spec.draft_id) {
+                break;
+            }
+            if generated.len() >= max_new_tokens {
+                break;
+            }
+            if have_draft {
+                if accepted {
+                    spec.draft(gpu, None, b)?;
+                } else {
+                    spec.draft(gpu, Some(&gpu.hidden), a)?;
+                }
+            } else {
+                skips += 1;
+            }
+        } else {
+            generated.push(pending);
+            if generated.len() >= max_new_tokens {
+                break;
+            }
+            gpu.step()?;
+            pending = gpu.read_token()?;
+            let margin = spec.step_margin(gpu)?;
+            have_draft = gate.is_none_or(|t| margin >= t);
+            if have_draft {
+                spec.draft(gpu, Some(&gpu.hidden), pending)?;
+            } else {
+                skips += 1;
+            }
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let emitted = generated.len();
+    let rounds = accepts + rejects;
+    let rate = if rounds > 0 {
+        accepts as f64 / rounds as f64 * 100.0
+    } else {
+        0.0
+    };
+    eprintln!(
+        "spec decode: {emitted} tokens in {elapsed:.2}s = {:.1} tok/s; accepts {accepts} \
+         rejects {rejects} skips {skips} (accept rate {rate:.0}%)",
+        emitted as f64 / elapsed
+    );
+    Ok(generated)
 }
