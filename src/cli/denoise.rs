@@ -342,13 +342,15 @@ impl DenoiseObserver for EvaluationCheckpointObserver<'_> {
         let (published, identity) = publish_t2va_checkpoint(
             &destination,
             self.staging_parent.as_deref(),
-            event.latents,
-            self.prompt_embeddings,
-            self.text_token_tags,
+            &CheckpointContent {
+                latents: event.latents,
+                prompt_embeddings: self.prompt_embeddings,
+                text_token_tags: self.text_token_tags,
+                policy_history: &policy_history,
+            },
             self.sigma_points,
             self.video_shift,
             self.audio_shift,
-            &policy_history,
             self.conditioning_provenance,
         )
         .with_context(|| {
@@ -387,19 +389,29 @@ impl DenoiseObserver for EvaluationCheckpointObserver<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The tensors and history one published checkpoint carries.
+pub(super) struct CheckpointContent<'a> {
+    pub latents: &'a T2vaLatents,
+    pub prompt_embeddings: &'a Tensor,
+    pub text_token_tags: &'a Tensor,
+    pub policy_history: &'a PolicyHistory,
+}
+
 pub(super) fn publish_t2va_checkpoint(
     destination: &Path,
     staging_parent: Option<&Path>,
-    latents: &T2vaLatents,
-    prompt_embeddings: &Tensor,
-    text_token_tags: &Tensor,
+    content: &CheckpointContent<'_>,
     sigma_points: usize,
     video_shift: f32,
     audio_shift: f32,
-    policy_history: &PolicyHistory,
     conditioning_provenance: &H3ConditioningProvenance,
 ) -> Result<(PublishedArtifact, CheckpointIdentity)> {
+    let CheckpointContent {
+        latents,
+        prompt_embeddings,
+        text_token_tags,
+        policy_history,
+    } = *content;
     let device = latents.video.device();
     anyhow::ensure!(
         latents.audio.device().same_device(device)
@@ -875,13 +887,15 @@ pub(super) fn run_denoise_t2va(command: H3Command) -> Result<()> {
     let (published, published_identity) = publish_t2va_checkpoint(
         &output,
         None,
-        &result,
-        &prompt_embeddings,
-        &text_token_tags_tensor,
+        &CheckpointContent {
+            latents: &result,
+            prompt_embeddings: &prompt_embeddings,
+            text_token_tags: &text_token_tags_tensor,
+            policy_history: &policy_history,
+        },
         sigma_points,
         video_shift,
         audio_shift,
-        &policy_history,
         &conditioning_provenance,
     )
     .with_context(|| format!("failed to publish denoise output {}", output.display()))?;

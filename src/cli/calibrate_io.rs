@@ -16,61 +16,43 @@ use flyingfish::runtime::io_calibration::{
 };
 use std::path::PathBuf;
 
-#[allow(clippy::too_many_arguments)]
+/// The shared operator inputs of every IO-calibration profile.
+pub(super) struct CalibrateIoConfig {
+    pub(super) payload: Option<PathBuf>,
+    pub(super) model: Option<PathBuf>,
+    pub(super) output: PathBuf,
+    pub(super) device: String,
+    pub(super) format: String,
+    pub(super) peer_device: Option<String>,
+    pub(super) warmups: usize,
+    pub(super) samples: usize,
+    pub(super) expert_layer: usize,
+    pub(super) expert_index: usize,
+}
+
 pub(super) fn run_calibrate_io(
     profile: IoBenchmarkProfile,
-    payload: Option<PathBuf>,
-    model: Option<PathBuf>,
-    output: PathBuf,
-    device: String,
-    format: String,
-    peer_device: Option<String>,
-    warmups: usize,
-    samples: usize,
-    expert_layer: usize,
-    expert_index: usize,
+    config: CalibrateIoConfig,
 ) -> Result<()> {
     match profile {
-        IoBenchmarkProfile::Sequential => run_sequential(
-            payload,
-            model,
-            output,
-            device,
-            format,
-            peer_device,
-            warmups,
-            samples,
-            expert_layer,
-            expert_index,
-        ),
-        IoBenchmarkProfile::LocalInterconnect => run_local_interconnect(
-            payload,
-            model,
-            output,
-            device,
-            format,
-            peer_device,
-            warmups,
-            samples,
-            expert_layer,
-            expert_index,
-        ),
+        IoBenchmarkProfile::Sequential => run_sequential(config),
+        IoBenchmarkProfile::LocalInterconnect => run_local_interconnect(config),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_sequential(
-    payload: Option<std::path::PathBuf>,
-    model: Option<std::path::PathBuf>,
-    output: std::path::PathBuf,
-    device: String,
-    format: String,
-    peer_device: Option<String>,
-    warmups: usize,
-    samples: usize,
-    expert_layer: usize,
-    expert_index: usize,
-) -> Result<()> {
+fn run_sequential(config: CalibrateIoConfig) -> Result<()> {
+    let CalibrateIoConfig {
+        payload,
+        model,
+        output,
+        device,
+        format,
+        peer_device,
+        warmups,
+        samples,
+        expert_layer,
+        expert_index,
+    } = config;
     anyhow::ensure!(
         model.is_none()
             && peer_device.is_none()
@@ -134,19 +116,19 @@ fn run_sequential(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_local_interconnect(
-    payload: Option<std::path::PathBuf>,
-    model: Option<std::path::PathBuf>,
-    output: std::path::PathBuf,
-    device: String,
-    format: String,
-    peer_device: Option<String>,
-    warmups: usize,
-    samples: usize,
-    expert_layer: usize,
-    expert_index: usize,
-) -> Result<()> {
+fn run_local_interconnect(config: CalibrateIoConfig) -> Result<()> {
+    let CalibrateIoConfig {
+        payload,
+        model,
+        output,
+        device,
+        format,
+        peer_device,
+        warmups,
+        samples,
+        expert_layer,
+        expert_index,
+    } = config;
     anyhow::ensure!(
         payload.is_none(),
         "--payload cannot be used with --profile local-interconnect"
@@ -283,18 +265,18 @@ mod tests {
 
         let temporary = tempfile::tempdir().unwrap();
         let output = temporary.path().join("must-not-exist.json");
-        let error = run_local_interconnect(
-            None,
-            Some(temporary.path().join("missing-model")),
-            output.clone(),
-            "auto".to_owned(),
-            IO_PAYLOAD_FORMAT_RAW_SEQUENTIAL.to_owned(),
-            None,
-            1,
-            1,
-            3,
-            0,
-        )
+        let error = run_local_interconnect(CalibrateIoConfig {
+            payload: None,
+            model: Some(temporary.path().join("missing-model")),
+            output: output.clone(),
+            device: "auto".to_owned(),
+            format: IO_PAYLOAD_FORMAT_RAW_SEQUENTIAL.to_owned(),
+            peer_device: None,
+            warmups: 1,
+            samples: 1,
+            expert_layer: 3,
+            expert_index: 0,
+        })
         .unwrap_err();
         assert!(error.to_string().contains("explicit cuda:N"));
         assert!(!output.exists());

@@ -1,7 +1,7 @@
 use super::H3Command;
 use super::checkpoint::resolve_component;
 use super::device_parse::parse_device_single;
-use super::generate::make_t2va_noise;
+use super::generate::{LatentShape, make_t2va_noise};
 use super::output_hygiene::{ensure_new_output, resolve_output_outside_model};
 use super::qwen_numerical::validate_qwen_numerical_contract;
 use anyhow::{Context, Result, bail};
@@ -183,11 +183,13 @@ pub(super) fn run_prepare_t2va_inputs(command: H3Command) -> Result<()> {
     validate_qwen_numerical_contract(&qwen_contract, &device, prompt_rows, 0, 0, 0)?;
     let (video_latents, audio_latents) = make_t2va_noise(
         &config,
-        latent_frames,
-        latent_height,
-        latent_width,
-        audio_frames,
-        audio_channels,
+        LatentShape {
+            latent_frames,
+            latent_height,
+            latent_width,
+            audio_frames,
+            audio_channels,
+        },
         seed,
         &device,
     )?;
