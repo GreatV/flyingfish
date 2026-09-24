@@ -403,6 +403,19 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         {
             eprintln!("config: {step}");
         }
+        // Rule 7 reports the topology ceiling; the settled bound below is
+        // what this run's expert cache actually uses, which an explicit
+        // `--expert-cache-mib` or the live auto-sizer can set well under
+        // that ceiling.
+        eprintln!(
+            "config: settled expert-cache bound for this run: {} B ({})",
+            selection.policy.expert_cache.maximum_bound_bytes,
+            if automatic_axes.contains(&"expert_cache.maximum_bound_bytes") {
+                "auto-derived from a live snapshot"
+            } else {
+                "operator-specified"
+            }
+        );
     }
     let admission_snapshot =
         flyingfish::runtime::probe::ResourceSnapshot::capture(Some(prepared.device()));

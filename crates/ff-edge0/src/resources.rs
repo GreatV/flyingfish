@@ -51,6 +51,11 @@ impl ModelRequirement for Edge0Requirement {
 }
 
 /// Derive the zero-flag configuration for the device at CUDA `ordinal`.
+///
+/// Edge0 has no partial expert cache: `--resident-experts` uploads every
+/// expert or the planner refuses (`crates/ff-edge0/src/model.rs`
+/// `enable_gpu`'s `FullResident`-only gate). A partial rule-7 cap is snapped
+/// down to zero so the reported residency matches an achievable mode.
 pub fn derive_edge0_configuration(
     sizes: &WeightSizes,
     profile: &TopologyProfile,
@@ -62,7 +67,13 @@ pub fn derive_edge0_configuration(
         .iter()
         .position(|device| device.ordinal == ordinal)
         .unwrap_or(ordinal);
-    ff_core::configure::derive(index, profile, &requirement)
+    let mut derived = ff_core::configure::derive(index, profile, &requirement)?;
+    if let Some(bytes) = derived.pool_resident_bytes
+        && bytes < requirement.expert_total_bytes
+    {
+        derived.pool_resident_bytes = Some(0);
+    }
+    Ok(derived)
 }
 
 #[cfg(test)]
@@ -123,9 +134,10 @@ mod tests {
         assert_eq!(plan.mode, crate::mode::PerformanceMode::FullResident);
         assert_eq!(derived.pool_resident_bytes, Some(expert_total));
 
-        // The same arithmetic with no operator override: both sides budget
-        // against the same 8 GiB pool and its admission reserve, and agree
-        // on the resident byte count.
+        // A budget too small for full residency: mode.rs's planner still
+        // computes an advisory partial figure (it refuses the run instead of
+        // executing a partial cache), so the derivation snaps its own
+        // partial cap to zero rather than echoing an unachievable number.
         let small_hardware = crate::mode::Hardware {
             total_vram_bytes: Some(8 << 30),
             free_vram_bytes: Some(7 << 30),
@@ -136,15 +148,8 @@ mod tests {
         let plan = crate::mode::plan_mode(&small_hardware, &Default::default(), &sizes).unwrap();
         let derived = derive_edge0_configuration(&sizes, &profile(60 << 30, 8 << 30), 0).unwrap();
         assert_eq!(plan.mode, crate::mode::PerformanceMode::StreamingExperts);
-        assert_eq!(
-            plan.expert_bytes_resident,
-            derived.pool_resident_bytes.unwrap()
-        );
-        let reserve = ff_core::probe::admission_reserve_bytes(Some(8 << 30));
-        assert_eq!(
-            derived.pool_resident_bytes,
-            Some((8 << 30) - reserve - fixed)
-        );
+        assert!(plan.expert_bytes_resident > 0 && plan.expert_bytes_resident < expert_total);
+        assert_eq!(derived.pool_resident_bytes, Some(0));
         assert_eq!(
             requirement.poolable_residency_domain(),
             ResidencyDomain::Device

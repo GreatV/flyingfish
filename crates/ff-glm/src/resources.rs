@@ -70,6 +70,10 @@ impl ModelRequirement for GlmRequirement {
     }
 
     fn poolable_residency_domain(&self) -> ResidencyDomain {
+        // CPU runs (`compute_on_host`) have no CUDA device for this domain to
+        // resolve, so rule 7 correctly declines rather than inventing a cap;
+        // the live auto-sizer (`automatic_expert_cache_bytes_against_host`)
+        // returns zero for the same case rather than deriving a host figure.
         ResidencyDomain::Device
     }
 }

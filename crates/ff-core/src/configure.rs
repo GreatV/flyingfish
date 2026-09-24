@@ -75,6 +75,10 @@ pub trait ModelRequirement {
 }
 
 /// Which memory pool rule 7's partial residency draws from.
+///
+/// `Device` budgets against the device's own total, independent of host
+/// memory; `TopologyProfile` carries no unified-memory signal yet, so this is
+/// unsound on integrated/unified hardware where the two share one pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResidencyDomain {
     Host,
