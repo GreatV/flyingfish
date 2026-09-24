@@ -1308,12 +1308,29 @@ impl QwenGpu {
             hiddens = ph;
             x1s = px;
         }
-        let (last_ctx, last_x1) = if self.peers.is_empty() {
-            (&self.ctx, x1s.last().expect("checked non-empty"))
+        let (last_ctx, last_hidden, last_x1) = if self.peers.is_empty() {
+            (
+                &self.ctx,
+                hiddens.last().expect("checked non-empty"),
+                x1s.last().expect("checked non-empty"),
+            )
         } else {
             let peer = self.peers.last().expect("checked non-empty");
-            (&peer.ctx, x1s.last().expect("checked non-empty"))
+            (
+                &peer.ctx,
+                hiddens.last().expect("checked non-empty"),
+                x1s.last().expect("checked non-empty"),
+            )
         };
+        // The final token's hidden state feeds the next step's and the
+        // speculative draft's reads of `self.hidden`; prefill is the only
+        // writer, so hop it here the same way x1 hops.
+        last_ctx
+            .stream
+            .memcpy_dtoh(last_hidden, &mut self.staging[..n])?;
+        self.ctx
+            .stream
+            .memcpy_htod(&self.staging[..n], &mut self.hidden)?;
         last_ctx
             .stream
             .memcpy_dtoh(last_x1, &mut self.staging[..n])?;

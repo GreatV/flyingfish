@@ -1023,7 +1023,6 @@ impl ExecutionPolicy {
     /// Resolve the policy for a run: load a recorded one from `path`, or
     /// build one from the runtime inputs, then check it can execute on
     /// `device`.
-    #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         path: Option<&Path>,
         device: &Device,
