@@ -469,6 +469,9 @@ fn generate_cuda_speculative(
     use std::time::Instant;
 
     let eos = |token: &u32| config.text_config.eos_token_id.contains(token);
+    // A draft is only worth computing when the next round can verify it:
+    // two free slots for the (staged, drafted) pair, and no pending EOS.
+    let can_verify = |len: usize, tok: u32| len + 2 <= max_new_tokens && !eos(&tok);
     let mut spec = QwenSpec::new(gpu, weights)?;
     spec.margins_enabled = gate.is_some();
     let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
@@ -479,7 +482,7 @@ fn generate_cuda_speculative(
     // like every later round.
     let initial_margin = spec.step_margin(gpu)?;
     let mut have_draft = gate.is_none_or(|t| initial_margin >= t);
-    if have_draft {
+    if have_draft && can_verify(generated.len(), pending) {
         spec.draft(gpu, Some(&gpu.hidden), pending)?;
     } else {
         skips += 1;
@@ -531,7 +534,7 @@ fn generate_cuda_speculative(
             // Draft for the next round only when that round can actually
             // verify: two free slots and a non-EOS pending. Otherwise the
             // draft would be computed and thrown away.
-            if have_draft && generated.len() + 2 <= max_new_tokens && !eos(&pending) {
+            if have_draft && can_verify(generated.len(), pending) {
                 if accepted {
                     spec.draft(gpu, None, b)?;
                 } else {
@@ -549,7 +552,7 @@ fn generate_cuda_speculative(
             pending = gpu.read_token()?;
             let margin = spec.step_margin(gpu)?;
             have_draft = gate.is_none_or(|t| margin >= t);
-            if have_draft {
+            if have_draft && can_verify(generated.len(), pending) {
                 spec.draft(gpu, Some(&gpu.hidden), pending)?;
             } else {
                 skips += 1;
