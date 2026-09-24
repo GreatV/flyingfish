@@ -355,6 +355,7 @@ impl GlmExecutionManifestRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_policy::ExpertCacheOptions;
     use crate::{
         expert_cache::ExpertCacheReplacementPolicy, expert_cache_manager::ExpertCacheLayout,
     };
@@ -368,11 +369,13 @@ mod tests {
             CachePolicy::new(1),
             false,
             8,
-            ExpertCacheLayout::SharedPool,
-            ExpertCacheReplacementPolicy::Lru,
-            100,
-            if adaptive { 20 } else { 100 },
-            adaptive,
+            ExpertCacheOptions {
+                layout: ExpertCacheLayout::SharedPool,
+                replacement: ExpertCacheReplacementPolicy::Lru,
+                maximum_bound_bytes: 100,
+                minimum_bound_bytes: if adaptive { 20 } else { 100 },
+                adaptive,
+            },
         )
         .unwrap()
     }

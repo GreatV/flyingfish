@@ -1,3 +1,4 @@
+use super::routing_trace::{RoutingLayerGeometry, RoutingSource};
 use super::{
     config::{AttentionKind, GlmConfig, GlmGenerationConfig, MlpKind},
     execution_manifest::{
@@ -684,11 +685,13 @@ impl StreamedGlm {
             options.cache_policy,
             options.resident_static,
             config.text_config.index_topk,
-            options.expert_cache_layout,
-            options.expert_cache_replacement,
-            options.expert_cache_bytes,
-            expert_cache_min_bytes,
-            options.adaptive_expert_cache,
+            crate::execution_policy::ExpertCacheOptions {
+                layout: options.expert_cache_layout,
+                replacement: options.expert_cache_replacement,
+                maximum_bound_bytes: options.expert_cache_bytes,
+                minimum_bound_bytes: expert_cache_min_bytes,
+                adaptive: options.adaptive_expert_cache,
+            },
         )?;
         if options.cpu_fp8_dequantization {
             execution_policy.cpu_fp8_dequantization = true;
@@ -2100,12 +2103,16 @@ impl StreamedGlm {
         }
         RoutingTraceBuilder::new(
             domain,
-            cache_entry_dtype,
-            text.routed_scaling_factor,
-            text.norm_topk_prob,
-            text.num_hidden_layers,
-            text.n_routed_experts,
-            text.num_experts_per_tok,
+            &RoutingSource {
+                cache_entry_dtype,
+                routed_scaling_factor: text.routed_scaling_factor,
+                norm_topk_prob: text.norm_topk_prob,
+            },
+            &RoutingLayerGeometry {
+                num_hidden_layers: text.num_hidden_layers,
+                num_experts: text.n_routed_experts,
+                experts_per_token: text.num_experts_per_tok,
+            },
             prompt_tokens,
             max_routed_tokens,
             layers,
@@ -2780,6 +2787,7 @@ fn sample_token(logits: &Tensor, temperature: f64, top_p: f64, rng: &mut StdRng)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_policy::ExpertCacheOptions;
     use crate::{config::GlmTextConfig, execution_policy::GLM_ADMISSION_SAFETY_BYTES};
     use ff_core::weights::{CachePolicy, WeightSource};
 
@@ -2921,11 +2929,13 @@ mod tests {
             CachePolicy::new(1),
             false,
             8,
-            ExpertCacheLayout::SharedPool,
-            ExpertCacheReplacementPolicy::Lfu,
-            100,
-            20,
-            true,
+            ExpertCacheOptions {
+                layout: ExpertCacheLayout::SharedPool,
+                replacement: ExpertCacheReplacementPolicy::Lfu,
+                maximum_bound_bytes: 100,
+                minimum_bound_bytes: 20,
+                adaptive: true,
+            },
         )
         .unwrap();
         let safety = GLM_ADMISSION_SAFETY_BYTES as usize;

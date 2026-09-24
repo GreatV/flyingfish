@@ -72,6 +72,16 @@ pub struct GlmHostWeightPolicy {
     pub granularity: CacheGranularity,
 }
 
+/// The operator-selectable expert-cache options `from_runtime` consumes;
+/// the entry unit is not selectable.
+pub struct ExpertCacheOptions {
+    pub layout: ExpertCacheLayout,
+    pub replacement: ExpertCacheReplacementPolicy,
+    pub maximum_bound_bytes: usize,
+    pub minimum_bound_bytes: usize,
+    pub adaptive: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlmExpertCacheExecutionPolicy {
@@ -125,19 +135,22 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl GlmExecutionPolicy {
-    #[allow(clippy::too_many_arguments)]
     pub fn from_runtime(
         device: &Device,
         weight_source: WeightSource,
         host_cache: CachePolicy,
         resident_static: bool,
         dsa_context_bound_tokens: usize,
-        layout: ExpertCacheLayout,
-        replacement: ExpertCacheReplacementPolicy,
-        maximum_bound_bytes: usize,
-        minimum_bound_bytes: usize,
-        adaptive: bool,
+        expert_cache: ExpertCacheOptions,
     ) -> Result<Self> {
+        let ExpertCacheOptions {
+            layout,
+            replacement,
+            maximum_bound_bytes,
+            minimum_bound_bytes,
+            adaptive,
+        } = expert_cache;
+
         ensure!(
             weight_source == WeightSource::Mmap,
             "GLM execution policy supports only mmap weights"
@@ -297,11 +310,13 @@ mod tests {
             CachePolicy::new(1),
             false,
             2_048,
-            ExpertCacheLayout::SharedPool,
-            ExpertCacheReplacementPolicy::Lfu,
-            4_096,
-            if adaptive { 1_024 } else { 4_096 },
-            adaptive,
+            ExpertCacheOptions {
+                layout: ExpertCacheLayout::SharedPool,
+                replacement: ExpertCacheReplacementPolicy::Lfu,
+                maximum_bound_bytes: 4_096,
+                minimum_bound_bytes: if adaptive { 1_024 } else { 4_096 },
+                adaptive,
+            },
         )
         .unwrap()
     }
