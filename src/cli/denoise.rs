@@ -80,7 +80,7 @@ pub(crate) fn report_h3_device_cache(transformer: &StreamedTransformer) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Load, or build from `chunks` and resolve to an executable policy.
 pub(crate) fn resolve_execution_policy(
     path: Option<&Path>,
     device: &Device,
@@ -90,106 +90,44 @@ pub(crate) fn resolve_execution_policy(
     flash_attention: bool,
     precompute_adaln: bool,
 ) -> Result<ExecutionPolicy> {
-    let policy = match path {
-        Some(path) => ExecutionPolicy::load(path)?,
-        None => ExecutionPolicy::from_runtime(
-            device,
-            weight_source,
-            cache_policy,
-            chunks.model_chunking(),
-            flash_attention,
-            precompute_adaln,
-        )?,
-    };
-    validate_executable_policy(&policy, device)?;
-    Ok(policy)
+    ExecutionPolicy::resolve(
+        path,
+        device,
+        weight_source,
+        cache_policy,
+        chunks.model_chunking(),
+        flash_attention,
+        precompute_adaln,
+    )
 }
 
 pub(crate) fn validate_executable_policy(policy: &ExecutionPolicy, device: &Device) -> Result<()> {
-    policy.validate_device(device)?;
-    anyhow::ensure!(
-        !policy.flash_attention() || cfg!(feature = "flash-attn"),
-        "execution policy selects FlashAttention, but this binary was not compiled with --features flash-attn"
-    );
-    Ok(())
+    policy.validate_executable(device)
 }
 
-/// Choose an attention backend the request can actually run on.
-///
-/// The exact full-softmax path covers a bounded number of packed rows. Past
-/// that bound it is not that the operator prefers another backend -- full
-/// softmax does not run the request at all -- and the row count is known here.
-/// Online softmax processes keys in blocks instead, so the bound applies per
-/// block rather than to the sequence.
-///
-/// The block is the largest the verified exact-softmax kernels cover, which is
-/// the same bound the full path ran out of: larger blocks mean fewer passes,
-/// and the modelled peak grows slowly enough with block size that memory does
-/// not decide this. A pinned or replayed policy is left alone, and so is one
-/// that already names a backend without the bound.
 pub(crate) fn promote_attention_backend_for_rows(
     policy: &mut ExecutionPolicy,
     on_cuda: bool,
     packed_rows: u64,
     operator_named_the_backend: bool,
 ) -> Result<()> {
-    use flyingfish::h3::core::CUDA_EXACT_SOFTMAX_MAX_KEY_ROWS;
-    use flyingfish::h3::policy::AttentionBackendPolicy;
-
-    let bound = u64::try_from(CUDA_EXACT_SOFTMAX_MAX_KEY_ROWS)
-        .context("exact softmax row bound exceeds u64")?;
-    if operator_named_the_backend
-        || !on_cuda
-        || policy.attention.backend != AttentionBackendPolicy::FullSoftmax
-        || packed_rows <= bound
-    {
-        return Ok(());
-    }
-    policy.attention.backend = AttentionBackendPolicy::OnlineSoftmax;
-    policy.attention.configured_key_rows = Some(bound);
-    policy.rebind_attention_numerics()?;
-    eprintln!(
-        "attention: {packed_rows} packed rows exceed the {bound} full softmax covers; \
-         using online softmax over {bound}-row key blocks"
-    );
-    Ok(())
+    policy.promote_attention_backend_for_rows(on_cuda, packed_rows, operator_named_the_backend)
 }
 
 pub(crate) fn select_resume_execution_policy(
-    mut requested: ExecutionPolicy,
+    requested: ExecutionPolicy,
     recorded: Option<&ExecutionPolicy>,
     explicit_policy: bool,
     explicit_policy_settings: bool,
     requires_recorded_policy: bool,
 ) -> Result<ExecutionPolicy> {
-    match recorded {
-        Some(recorded) => {
-            if explicit_policy || explicit_policy_settings {
-                // Device residency is planned against whatever the card has
-                // free at that moment, so the recorded ceiling describes the
-                // first run's machine rather than anything the operator asked
-                // for. Two runs minutes apart can plan differently and agree on
-                // every choice a person made. Carry the recorded ceiling
-                // forward -- keeping the run's placement stable across a
-                // resume -- and let admission decide whether it still fits;
-                // refusing the resume for it would name a field no H3 command
-                // even exposes as a flag.
-                if !explicit_policy {
-                    requested.weights.device_cache = recorded.weights.device_cache;
-                }
-                if let Some(field) = recorded.first_difference(&requested) {
-                    bail!(
-                        "the checkpoint's execution policy disagrees with the requested one at {field}"
-                    );
-                }
-                Ok(requested)
-            } else {
-                Ok(recorded.clone())
-            }
-        }
-        None if requires_recorded_policy => bail!("checkpoint has no execution policy"),
-        None => Ok(requested),
-    }
+    ExecutionPolicy::select_for_resume(
+        requested,
+        recorded,
+        explicit_policy,
+        explicit_policy_settings,
+        requires_recorded_policy,
+    )
 }
 
 const CONDITIONED_SCHEMA_MARKER: &str = "conditioned_schema_version";

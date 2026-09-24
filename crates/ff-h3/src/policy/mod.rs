@@ -1020,6 +1020,164 @@ impl ExecutionPolicy {
             .with_context(|| format!("failed to load execution policy {}", path.display()))
     }
 
+    /// Resolve the policy for a run: load a recorded one from `path`, or
+    /// build one from the runtime inputs, then check it can execute on
+    /// `device`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve(
+        path: Option<&Path>,
+        device: &Device,
+        weight_source: WeightSource,
+        cache_policy: CachePolicy,
+        chunks: TransformerChunking,
+        flash_attention: bool,
+        precompute_adaln: bool,
+    ) -> Result<Self> {
+        let policy = match path {
+            Some(path) => Self::load(path)?,
+            None => Self::from_runtime(
+                device,
+                weight_source,
+                cache_policy,
+                chunks,
+                flash_attention,
+                precompute_adaln,
+            )?,
+        };
+        policy.validate_executable(device)?;
+        Ok(policy)
+    }
+
+    /// Check the policy can actually run on `device` with this build.
+    pub fn validate_executable(&self, device: &Device) -> Result<()> {
+        self.validate_device(device)?;
+        anyhow::ensure!(
+            !self.flash_attention() || cfg!(feature = "flash-attn"),
+            "execution policy selects FlashAttention, but this binary was not compiled with \
+             --features flash-attn"
+        );
+        Ok(())
+    }
+
+    /// Choose an attention backend the request can actually run on.
+    ///
+    /// The exact full-softmax path covers a bounded number of packed rows.
+    /// Past that bound it is not that the operator prefers another backend --
+    /// full softmax does not run the request at all -- and the row count is
+    /// known here. Online softmax processes keys in blocks instead, so the
+    /// bound applies per block rather than to the sequence.
+    ///
+    /// The block is the largest the verified exact-softmax kernels cover,
+    /// which is the same bound the full path ran out of: larger blocks mean
+    /// fewer passes, and the modelled peak grows slowly enough with block
+    /// size that memory does not decide this. A pinned or replayed policy is
+    /// left alone, and so is one that already names a backend without the
+    /// bound.
+    pub fn promote_attention_backend_for_rows(
+        &mut self,
+        on_cuda: bool,
+        packed_rows: u64,
+        operator_named_the_backend: bool,
+    ) -> Result<()> {
+        let bound = u64::try_from(crate::core::CUDA_EXACT_SOFTMAX_MAX_KEY_ROWS)
+            .context("exact softmax row bound exceeds u64")?;
+        if operator_named_the_backend
+            || !on_cuda
+            || self.attention.backend != AttentionBackendPolicy::FullSoftmax
+            || packed_rows <= bound
+        {
+            return Ok(());
+        }
+        self.attention.backend = AttentionBackendPolicy::OnlineSoftmax;
+        self.attention.configured_key_rows = Some(bound);
+        self.rebind_attention_numerics()?;
+        eprintln!(
+            "attention: {packed_rows} packed rows exceed the {bound} full softmax covers; \
+             using online softmax over {bound}-row key blocks"
+        );
+        Ok(())
+    }
+
+    /// Select the policy for a resume: check the requested policy against
+    /// the recorded one, fall back to the recorded one, or require one is
+    /// present.
+    pub fn select_for_resume(
+        requested: Self,
+        recorded: Option<&Self>,
+        explicit_policy: bool,
+        explicit_policy_settings: bool,
+        requires_recorded_policy: bool,
+    ) -> Result<Self> {
+        let mut requested = requested;
+        match recorded {
+            Some(recorded) => {
+                if explicit_policy || explicit_policy_settings {
+                    // Device residency is planned against whatever the card
+                    // has free at that moment, so the recorded ceiling
+                    // describes the first run's machine rather than anything
+                    // the operator asked for. Two runs minutes apart can plan
+                    // differently and agree on every choice a person made.
+                    // Carry the recorded ceiling forward -- keeping the run's
+                    // placement stable across a resume -- and let admission
+                    // decide whether it still fits; refusing the resume for
+                    // it would name a field no H3 command even exposes as a
+                    // flag.
+                    if !explicit_policy {
+                        requested.weights.device_cache = recorded.weights.device_cache;
+                    }
+                    if let Some(field) = recorded.first_difference(&requested) {
+                        bail!(
+                            "the checkpoint's execution policy disagrees with the requested one \
+                             at {field}"
+                        );
+                    }
+                    Ok(requested)
+                } else {
+                    Ok(recorded.clone())
+                }
+            }
+            None if requires_recorded_policy => bail!("checkpoint has no execution policy"),
+            None => Ok(requested),
+        }
+    }
+
+    /// A conservative baseline policy (minimal chunk sizes) for a solver to
+    /// search upward from.
+    pub fn conservative(cpu: bool) -> Result<Self> {
+        let execution_backend = if cpu {
+            ExecutionBackendPolicy::Cpu
+        } else {
+            ExecutionBackendPolicy::Cuda
+        };
+        let policy = Self {
+            schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+            execution_backend,
+            numerics: Box::new(H3NumericalContract::for_verified_target(
+                execution_backend,
+                AttentionBackendPolicy::FullSoftmax,
+            )?),
+            attention: AttentionExecutionPolicy {
+                backend: AttentionBackendPolicy::FullSoftmax,
+                configured_projection_rows: 1,
+                configured_query_rows: 1,
+                configured_key_rows: None,
+            },
+            configured_ffn_rows: 1,
+            configured_output_rows: 1,
+            weights: WeightExecutionPolicy {
+                host_phase_priority: false,
+                device_cache: Default::default(),
+                source: WeightSourcePolicy::Mmap,
+                cache_shards: 1,
+                cache_bytes: None,
+                granularity: CacheGranularity::Shard,
+            },
+            precompute_adaln: true,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn canonical_json(&self) -> Result<Vec<u8>> {
         self.validate()?;
         serde_json::to_vec(self).context("failed to serialize execution policy")
