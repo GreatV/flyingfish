@@ -253,7 +253,17 @@ impl Edge0Text {
                     .proj
                     .get(&format!("{prefix}.linear_attn.out_proj"))
                     .context("out_proj resident")?;
-                rt.gdn_layer_dx(gdn_index, qkv, z, b, a, out_proj, rt.hidden_x1())?;
+                rt.gdn_layer_dx(
+                    gdn_index,
+                    &crate::gpu::GdnProjections {
+                        qkv,
+                        z,
+                        b,
+                        a,
+                        out_proj,
+                    },
+                    rt.hidden_x1(),
+                )?;
                 rt.add_norm_x1(layer, 1, out_proj.y_ref())?;
             } else {
                 let q = rt
@@ -275,15 +285,14 @@ impl Edge0Text {
                 let rotary_dim = (text.head_dim as f64 * text.rope.partial_rotary_factor) as usize;
                 rt.attn_layer(
                     kv_index,
-                    q,
-                    k,
-                    v,
-                    o,
-                    text.num_attention_heads,
-                    text.num_key_value_heads,
-                    text.head_dim,
-                    rotary_dim,
-                    text.rope.rope_theta,
+                    &crate::gpu::AttnQuants { q, k, v, o_proj: o },
+                    &crate::gpu::QkGeom {
+                        heads: text.num_attention_heads,
+                        kv_heads: text.num_key_value_heads,
+                        head_dim: text.head_dim,
+                        rotary_dim,
+                        theta: text.rope.rope_theta,
+                    },
                 )?;
                 rt.add_norm_x1(layer, 1, o.y_ref())?;
             }
@@ -326,9 +335,14 @@ impl Edge0Text {
                 .context("sd resident")?;
             rt.moe_closed(
                 layer,
-                router,
+                &crate::gpu::SharedMoeQuant {
+                    router,
+                    ss: shared_scalar,
+                    sg: shared_gate,
+                    su: shared_up,
+                    sd: shared_down,
+                },
                 experts,
-                (shared_gate, shared_up, shared_scalar, shared_down),
                 rt.hidden_x1(),
                 text.effective_top_k(),
             )?;
@@ -513,7 +527,17 @@ impl Edge0Text {
                     .proj
                     .get(&format!("{prefix}.linear_attn.out_proj"))
                     .context("out_proj resident")?;
-                rt.gdn_layer_dx(gdn_index, qkv, z, b, a, out_proj, rt.hidden_x1())?;
+                rt.gdn_layer_dx(
+                    gdn_index,
+                    &crate::gpu::GdnProjections {
+                        qkv,
+                        z,
+                        b,
+                        a,
+                        out_proj,
+                    },
+                    rt.hidden_x1(),
+                )?;
                 rt.add_norm_x1(layer, 1, out_proj.y_ref())?;
             } else {
                 let q = rt
@@ -535,15 +559,14 @@ impl Edge0Text {
                 let rotary_dim = (text.head_dim as f64 * text.rope.partial_rotary_factor) as usize;
                 rt.attn_layer(
                     kv_index,
-                    q,
-                    k,
-                    v,
-                    o,
-                    text.num_attention_heads,
-                    text.num_key_value_heads,
-                    text.head_dim,
-                    rotary_dim,
-                    text.rope.rope_theta,
+                    &crate::gpu::AttnQuants { q, k, v, o_proj: o },
+                    &crate::gpu::QkGeom {
+                        heads: text.num_attention_heads,
+                        kv_heads: text.num_key_value_heads,
+                        head_dim: text.head_dim,
+                        rotary_dim,
+                        theta: text.rope.rope_theta,
+                    },
                 )?;
                 rt.add_norm_x1(layer, 1, o.y_ref())?;
             }
@@ -572,9 +595,14 @@ impl Edge0Text {
                 .context("sd resident")?;
             rt.moe_closed(
                 layer,
-                router,
+                &crate::gpu::SharedMoeQuant {
+                    router,
+                    ss: shared_scalar,
+                    sg: shared_gate,
+                    su: shared_up,
+                    sd: shared_down,
+                },
                 experts,
-                (shared_gate, shared_up, shared_scalar, shared_down),
                 rt.hidden_x1(),
                 text.effective_top_k(),
             )?;
@@ -891,13 +919,15 @@ impl Edge0Text {
             .collect();
         let res = crate::gpu::ResidentState::upload(
             &ctx,
-            text.hidden_size,
-            &ln_tuples,
-            &attn_tuples,
-            &self.final_norm,
-            text.num_attention_heads * text.head_dim,
-            text.num_key_value_heads * text.head_dim,
-            self.kv.len(),
+            crate::gpu::ResidentUpload {
+                hidden_size: text.hidden_size,
+                layer_norms: &ln_tuples,
+                attn_norms: &attn_tuples,
+                final_norm: &self.final_norm,
+                q_total: text.num_attention_heads * text.head_dim,
+                kv_stride: text.num_key_value_heads * text.head_dim,
+                num_attn_layers: self.kv.len(),
+            },
         )?;
         let gdn_devices = self
             .gdn_weights
@@ -905,18 +935,20 @@ impl Edge0Text {
             .map(|w| {
                 crate::gpu::GpuGdn::upload(
                     &ctx,
-                    &w.conv1d,
-                    &w.a_log,
-                    &w.dt_bias,
-                    &w.norm,
-                    2 * text.linear_num_key_heads * text.linear_key_head_dim
-                        + text.linear_num_value_heads * text.linear_value_head_dim,
-                    text.linear_conv_kernel_dim,
-                    text.linear_num_value_heads,
-                    text.linear_num_key_heads,
-                    text.linear_key_head_dim,
-                    text.linear_value_head_dim,
-                    text.rms_norm_eps as f32,
+                    crate::gpu::GdnUpload {
+                        conv1d: &w.conv1d,
+                        a_log: &w.a_log,
+                        dt_bias: &w.dt_bias,
+                        norm: &w.norm,
+                        conv_dim: 2 * text.linear_num_key_heads * text.linear_key_head_dim
+                            + text.linear_num_value_heads * text.linear_value_head_dim,
+                        kernel: text.linear_conv_kernel_dim,
+                        num_v: text.linear_num_value_heads,
+                        num_k: text.linear_num_key_heads,
+                        dk: text.linear_key_head_dim,
+                        dv: text.linear_value_head_dim,
+                        eps: text.rms_norm_eps as f32,
+                    },
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1081,11 +1113,13 @@ impl Edge0Text {
             ordinals,
             &self.weights,
             &config,
-            &layer_norms,
-            &attn_norms_flat,
-            &self.gdn_weights,
-            &self.embed,
-            &self.final_norm,
+            &crate::gpu::MultiNorms {
+                layer_norms: &layer_norms,
+                attn_norms: &attn_norms_flat,
+                gdn_weights: &self.gdn_weights,
+                embed: &self.embed,
+                final_norm: &self.final_norm,
+            },
             experts_resident,
         )?);
         Ok(())
@@ -1212,11 +1246,13 @@ impl Edge0Text {
                         .context("out_proj resident")?;
                     multi.peers[peer_index].gdn_layer_dx(
                         gdn_index_in_peer,
-                        qkv,
-                        z,
-                        b,
-                        a,
-                        out_proj,
+                        &crate::gpu::GdnProjections {
+                            qkv,
+                            z,
+                            b,
+                            a,
+                            out_proj,
+                        },
                         multi.peers[peer_index].hidden_x1(),
                     )?;
                     multi.peers[peer_index].add_norm_x1(peer_layer, 1, out_proj.y_ref())?;
@@ -1242,15 +1278,14 @@ impl Edge0Text {
                         as usize;
                     multi.peers[peer_index].attn_layer(
                         kv_index_in_peer,
-                        q,
-                        k,
-                        v,
-                        o,
-                        self.config.text_config.num_attention_heads,
-                        self.config.text_config.num_key_value_heads,
-                        self.config.text_config.head_dim,
-                        rotary_dim,
-                        self.config.text_config.rope.rope_theta,
+                        &crate::gpu::AttnQuants { q, k, v, o_proj: o },
+                        &crate::gpu::QkGeom {
+                            heads: self.config.text_config.num_attention_heads,
+                            kv_heads: self.config.text_config.num_key_value_heads,
+                            head_dim: self.config.text_config.head_dim,
+                            rotary_dim,
+                            theta: self.config.text_config.rope.rope_theta,
+                        },
                     )?;
                     multi.peers[peer_index].add_norm_x1(peer_layer, 1, o.y_ref())?;
                 }
@@ -1290,9 +1325,14 @@ impl Edge0Text {
                     // matching the peer's own layer-range slice.
                     multi.peers[peer_index].moe_closed(
                         peer_layer,
-                        router,
+                        &crate::gpu::SharedMoeQuant {
+                            router,
+                            ss: shared_scalar,
+                            sg: shared_gate,
+                            su: shared_up,
+                            sd: shared_down,
+                        },
                         experts,
-                        (shared_gate, shared_up, shared_scalar, shared_down),
                         multi.peers[peer_index].hidden_x1(),
                         self.config.text_config.effective_top_k(),
                     )?;
@@ -1383,7 +1423,17 @@ impl Edge0Text {
                 .proj
                 .get(&format!("{prefix}.linear_attn.out_proj"))
                 .context("gdn out_proj resident")?;
-            return rt.gdn_layer_host(state_index, qkv, z, b, a, out_proj, x);
+            return rt.gdn_layer_host(
+                state_index,
+                &crate::gpu::GdnProjections {
+                    qkv,
+                    z,
+                    b,
+                    a,
+                    out_proj,
+                },
+                x,
+            );
         }
         let text = self.config.text_config.clone();
         let num_v = text.linear_num_value_heads;

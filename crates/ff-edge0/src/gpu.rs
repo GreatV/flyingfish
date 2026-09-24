@@ -645,23 +645,172 @@ impl GpuContext {
     }
 }
 
+/// The slot-batched gate/up activations, down output and slot count the
+/// silu-folding GEMV writes.
+pub struct SiluBatch<'a> {
+    pub g: &'a CudaSlice<f32>,
+    pub u: &'a CudaSlice<f32>,
+    pub w: &'a CudaSlice<f32>,
+    pub y: &'a CudaSlice<f32>,
+    pub slots: usize,
+}
+
+/// The expert-id and activation buffers one batched GEMV launch reads.
+pub struct GemvBatch<'a> {
+    pub ids: &'a CudaSlice<i32>,
+    pub x: &'a CudaSlice<f32>,
+    pub y: &'a CudaSlice<f32>,
+    pub slots: usize,
+}
+
+/// The router plus shared-expert projections the mega kernel reads.
+pub struct SharedMoeQuant<'a> {
+    pub router: &'a GpuQuant,
+    pub ss: &'a GpuQuant,
+    pub sg: &'a GpuQuant,
+    pub su: &'a GpuQuant,
+    pub sd: &'a GpuQuant,
+}
+
+/// The mega kernel's activation, routing and barrier buffers.
+pub struct MegaIo<'a> {
+    pub x: &'a CudaSlice<f32>,
+    pub ids: &'a CudaSlice<i32>,
+    pub w: &'a CudaSlice<f32>,
+    pub gate_y: &'a CudaSlice<f32>,
+    pub up_y: &'a CudaSlice<f32>,
+    pub down_y: &'a CudaSlice<f32>,
+    pub hidden: &'a CudaSlice<f32>,
+    pub bar: &'a CudaSlice<i32>,
+}
+
+/// The host-side GDN weights and geometry one upload materializes.
+pub struct GdnUpload<'a> {
+    pub conv1d: &'a [f32],
+    pub a_log: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub norm: &'a [f32],
+    pub conv_dim: usize,
+    pub kernel: usize,
+    pub num_v: usize,
+    pub num_k: usize,
+    pub dk: usize,
+    pub dv: usize,
+    pub eps: f32,
+}
+
+/// The norm tables and geometry one resident-state upload materializes.
+pub struct ResidentUpload<'a> {
+    pub hidden_size: usize,
+    pub layer_norms: &'a [(Vec<f32>, Vec<f32>)],
+    pub attn_norms: &'a [(Vec<f32>, Vec<f32>)],
+    pub final_norm: &'a [f32],
+    pub q_total: usize,
+    pub kv_stride: usize,
+    pub num_attn_layers: usize,
+}
+
+/// The per-peer weight tables an Edge0Multi peer upload reads.
+pub(crate) struct MultiNorms<'a> {
+    pub layer_norms: &'a [Vec<f32>],
+    pub attn_norms: &'a [Vec<f32>],
+    pub gdn_weights: &'a [crate::model::GdnWeights],
+    pub embed: &'a GroupQuant,
+    pub final_norm: &'a [f32],
+}
+
+/// The raw QKV projections and their per-head norm weights, pre-rotation.
+pub struct QkvNorm<'a> {
+    pub q_raw: &'a CudaSlice<f32>,
+    pub q_norm_w: &'a CudaSlice<f32>,
+    pub k_raw: &'a CudaSlice<f32>,
+    pub k_norm_w: &'a CudaSlice<f32>,
+    pub v_raw: &'a CudaSlice<f32>,
+}
+
+/// The attention head geometry: query heads, KV heads, channels per head.
+pub struct AttnGeom {
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+}
+
+/// The geometry and rotary parameters the QK glue kernels apply.
+pub struct QkGeom {
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub rotary_dim: usize,
+    pub theta: f64,
+}
+
+/// The mrope variant: three-axis rope positions plus the section splits.
+pub struct MropeGeom {
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub rotary_dim: usize,
+    pub theta: f64,
+    pub sec_h: usize,
+    pub sec_w: usize,
+}
+
+/// The shared KV cache buffers, keys before values, with their row stride.
+pub struct KvCache<'a> {
+    pub keys: &'a CudaSlice<f32>,
+    pub values: &'a CudaSlice<f32>,
+    pub stride: usize,
+}
+
+/// The score-stage buffers: queries and gate input in, gated scores out.
+pub struct ScoreBuffers<'a> {
+    pub q: &'a CudaSlice<f32>,
+    pub gate: &'a CudaSlice<f32>,
+    pub out: &'a CudaSlice<f32>,
+}
+
+/// The QK-stage outputs: rotated queries and gated values.
+pub struct QkOutputs<'a> {
+    pub q_out: &'a CudaSlice<f32>,
+    pub gate_out: &'a CudaSlice<f32>,
+}
+
+/// The four attention projections of one layer, in forward order.
+pub struct AttnQuants<'a> {
+    pub q: &'a GpuQuant,
+    pub k: &'a GpuQuant,
+    pub v: &'a GpuQuant,
+    pub o_proj: &'a GpuQuant,
+}
+
+/// The five GDN projections of one layer, in forward order.
+pub struct GdnProjections<'a> {
+    pub qkv: &'a GpuQuant,
+    pub z: &'a GpuQuant,
+    pub b: &'a GpuQuant,
+    pub a: &'a GpuQuant,
+    pub out_proj: &'a GpuQuant,
+}
+
 impl GpuContext {
     /// Batched expert GEMV: one launch covers all 4 routed experts for
     /// one projection of one layer (gather_qmm shape — the stacked
     /// tensor's first dim IS the expert index). Kernel-count first: the
     /// expected reading is 120 launches/token after this replaces the
     /// per-expert dispatch.
-    #[allow(clippy::too_many_arguments)]
     pub fn batched_expert_gemv_slotx(
         &self,
         experts: &GpuExperts,
         layer: usize,
         part: usize,
-        expert_ids: &CudaSlice<i32>,
-        x: &CudaSlice<f32>,
-        y: &CudaSlice<f32>,
-        slots: usize,
+        batch: &GemvBatch<'_>,
     ) -> Result<()> {
+        let GemvBatch {
+            ids: expert_ids,
+            x,
+            y,
+            slots,
+        } = *batch;
         let rows = experts.rows[part] as i32;
         let in_dim = experts.in_dim[part] as i32;
         let slots_i = slots as i32;
@@ -689,17 +838,19 @@ impl GpuContext {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn batched_expert_gemv(
         &self,
         experts: &GpuExperts,
         layer: usize,
         part: usize,
-        expert_ids: &CudaSlice<i32>,
-        x: &CudaSlice<f32>,
-        y: &CudaSlice<f32>, // [slots, rows]
-        slots: usize,
+        batch: &GemvBatch<'_>,
     ) -> Result<()> {
+        let GemvBatch {
+            ids: expert_ids,
+            x,
+            y,
+            slots,
+        } = *batch;
         let rows = experts.rows[part] as i32;
         let in_dim = experts.in_dim[part] as i32;
         let slots_i = slots as i32;
@@ -757,54 +908,15 @@ impl GpuContext {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn lora_add_test(
-        &self,
-        a: &CudaSlice<f32>,
-        b: &CudaSlice<f32>,
-        x: &CudaSlice<f32>,
-        y: &CudaSlice<f32>,
-        rank: usize,
-        in_dim: usize,
-        out_dim: usize,
-        blocks: usize,
-    ) -> Result<()> {
-        let rank_i = rank as i32;
-        let in_i = in_dim as i32;
-        let out_i = out_dim as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.lora_add)
-                .arg(a)
-                .arg(b)
-                .arg(x)
-                .arg(y)
-                .arg(&rank_i)
-                .arg(&in_i)
-                .arg(&out_i)
-                .launch(LaunchConfig {
-                    grid_dim: (blocks as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-        }
-        .map_err(|e| anyhow::anyhow!("lora launch failed: {e}"))?;
-        Ok(())
-    }
-
     /// slotx down with silu + router-weight fold inline (§3c(3)).
-    #[allow(clippy::too_many_arguments)]
     pub fn batched_expert_gemv_slotx_silu(
         &self,
         experts: &GpuExperts,
         layer: usize,
         expert_ids: &CudaSlice<i32>,
-        g: &CudaSlice<f32>,
-        u: &CudaSlice<f32>,
-        w: &CudaSlice<f32>,
-        y: &CudaSlice<f32>,
-        slots: usize,
+        silu: &SiluBatch<'_>,
     ) -> Result<()> {
+        let SiluBatch { g, u, w, y, slots } = *silu;
         let rows = experts.rows[2] as i32;
         let in_dim = experts.in_dim[2] as i32;
         let slots_i = slots as i32;
@@ -1357,17 +1469,19 @@ impl GpuRuntime {
     /// Resident variant: consumes the normed input from device memory and
     /// leaves the layer output in out_proj's y — no sync, no host round
     /// trip; the caller adds it into `hidden`.
-    #[allow(clippy::too_many_arguments)]
     pub fn gdn_layer_dx(
         &self,
         gdn_index: usize,
-        qkv: &GpuQuant,
-        z: &GpuQuant,
-        b: &GpuQuant,
-        a: &GpuQuant,
-        out_proj: &GpuQuant,
+        proj: &GdnProjections<'_>,
         dx: &CudaSlice<f32>,
     ) -> Result<()> {
+        let GdnProjections {
+            qkv,
+            z,
+            b,
+            a,
+            out_proj,
+        } = *proj;
         let g = &self.gdn[gdn_index];
         // One launch for qkv/z/b/a: same x, all int4, LoRA folded in the
         // epilogue (was 4 GEMVs + 4 lora_adds).
@@ -1437,19 +1551,23 @@ impl GpuRuntime {
                 experts,
                 layer,
                 0,
-                &ids,
-                dx,
-                &self.batched_gate_y.lock().expect("gy"),
-                slots,
+                &GemvBatch {
+                    ids: &ids,
+                    x: dx,
+                    y: &self.batched_gate_y.lock().expect("gy"),
+                    slots,
+                },
             )?;
             self.ctx.batched_expert_gemv(
                 experts,
                 layer,
                 1,
-                &ids,
-                dx,
-                &self.batched_up_y.lock().expect("uy"),
-                slots,
+                &GemvBatch {
+                    ids: &ids,
+                    x: dx,
+                    y: &self.batched_up_y.lock().expect("uy"),
+                    slots,
+                },
             )?;
         }
         shared.0.launch(&self.ctx, dx, shared.0.y_ref())?;
@@ -1478,10 +1596,12 @@ impl GpuRuntime {
             experts,
             layer,
             2,
-            &self.expert_ids.lock().expect("expert ids"),
-            &self.batched_inner_y.lock().expect("iy"),
-            &self.batched_down_y.lock().expect("dy"),
-            chosen.len(),
+            &GemvBatch {
+                ids: &self.expert_ids.lock().expect("expert ids"),
+                x: &self.batched_inner_y.lock().expect("iy"),
+                y: &self.batched_down_y.lock().expect("dy"),
+                slots: chosen.len(),
+            },
         )?;
         self.trace_seg(layer, 3, t2);
         let t3 = std::time::Instant::now();
@@ -1653,21 +1773,20 @@ pub struct GpuGdn {
 }
 
 impl GpuGdn {
-    #[allow(clippy::too_many_arguments)]
-    pub fn upload(
-        ctx: &GpuContext,
-        conv1d: &[f32],
-        a_log: &[f32],
-        dt_bias: &[f32],
-        norm: &[f32],
-        conv_dim: usize,
-        kernel: usize,
-        num_v: usize,
-        num_k: usize,
-        dk: usize,
-        dv: usize,
-        eps: f32,
-    ) -> Result<Self> {
+    pub fn upload(ctx: &GpuContext, gdn: GdnUpload<'_>) -> Result<Self> {
+        let GdnUpload {
+            conv1d,
+            a_log,
+            dt_bias,
+            norm,
+            conv_dim,
+            kernel,
+            num_v,
+            num_k,
+            dk,
+            dv,
+            eps,
+        } = gdn;
         Ok(Self {
             conv1d_w: ctx.upload_f32(conv1d)?,
             a_log: ctx.upload_f32(a_log)?,
@@ -1743,17 +1862,16 @@ pub struct ResidentState {
 }
 
 impl ResidentState {
-    #[allow(clippy::too_many_arguments)]
-    pub fn upload(
-        ctx: &GpuContext,
-        hidden_size: usize,
-        layer_norms: &[(Vec<f32>, Vec<f32>)],
-        attn_norms: &[(Vec<f32>, Vec<f32>)],
-        final_norm: &[f32],
-        q_total: usize,
-        kv_stride: usize,
-        num_attn_layers: usize,
-    ) -> Result<Self> {
+    pub fn upload(ctx: &GpuContext, norms: ResidentUpload<'_>) -> Result<Self> {
+        let ResidentUpload {
+            hidden_size,
+            layer_norms,
+            attn_norms,
+            final_norm,
+            q_total,
+            kv_stride,
+            num_attn_layers,
+        } = norms;
         let max_ctx = crate::model::configured_max_ctx();
         // edge0_attn_scores keeps the step scores in shared memory.
         ensure!(
@@ -1916,23 +2034,28 @@ impl GpuContext {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn glue_attn_qk(
         &self,
         res: &ResidentState,
         kv_index: usize,
-        q_raw: &CudaSlice<f32>,
-        q_norm_w: &CudaSlice<f32>,
-        k_raw: &CudaSlice<f32>,
-        k_norm_w: &CudaSlice<f32>,
-        v_raw: &CudaSlice<f32>,
+        proj: &QkvNorm<'_>,
         position: &CudaSlice<i32>,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        rotary_dim: usize,
-        theta: f64,
+        geom: &QkGeom,
     ) -> Result<()> {
+        let QkvNorm {
+            q_raw,
+            q_norm_w,
+            k_raw,
+            k_norm_w,
+            v_raw,
+        } = *proj;
+        let QkGeom {
+            heads,
+            kv_heads,
+            head_dim,
+            rotary_dim,
+            theta,
+        } = *geom;
         let kv_stride_i = res.kv_stride as i32;
         let heads_i = heads as i32;
         let kv_heads_i = kv_heads as i32;
@@ -1967,20 +2090,21 @@ impl GpuContext {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn glue_attn_scores(
         &self,
         res: &ResidentState,
         kv_index: usize,
-        q: &CudaSlice<f32>,
-        gate: &CudaSlice<f32>,
-        out: &CudaSlice<f32>,
+        bufs: &ScoreBuffers<'_>,
         position: &CudaSlice<i32>,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
+        geom: &AttnGeom,
         scale: f32,
     ) -> Result<()> {
+        let ScoreBuffers { q, gate, out } = *bufs;
+        let AttnGeom {
+            heads,
+            kv_heads,
+            head_dim,
+        } = *geom;
         let kv_stride_i = res.kv_stride as i32;
         let heads_i = heads as i32;
         let kv_heads_i = kv_heads as i32;
@@ -2043,20 +2167,20 @@ impl GpuRuntime {
 
     /// Attention layer on device: q/k/v GEMVs on x1, norm+rope+KV append,
     /// scores+softmax+gate, o_proj — output lands in o_proj's y.
-    #[allow(clippy::too_many_arguments)]
     pub fn attn_layer(
         &self,
         kv_index: usize,
-        q: &GpuQuant,
-        k: &GpuQuant,
-        v: &GpuQuant,
-        o_proj: &GpuQuant,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        rotary_dim: usize,
-        theta: f64,
+        quants: &AttnQuants<'_>,
+        geom: &QkGeom,
     ) -> Result<()> {
+        let AttnQuants { q, k, v, o_proj } = *quants;
+        let QkGeom {
+            heads,
+            kv_heads,
+            head_dim,
+            rotary_dim,
+            theta,
+        } = *geom;
         let res = self.res.as_ref().expect("resident state");
         let pos = res.pos_buf.lock().expect("pos");
         let segs = [
@@ -2075,29 +2199,37 @@ impl GpuRuntime {
         self.ctx.glue_attn_qk(
             res,
             kv_index,
-            q.y_ref(),
-            &norms[0],
-            k.y_ref(),
-            &norms[1],
-            v.y_ref(),
+            &QkvNorm {
+                q_raw: q.y_ref(),
+                q_norm_w: &norms[0],
+                k_raw: k.y_ref(),
+                k_norm_w: &norms[1],
+                v_raw: v.y_ref(),
+            },
             &pos,
-            heads,
-            kv_heads,
-            head_dim,
-            rotary_dim,
-            theta,
+            &QkGeom {
+                heads,
+                kv_heads,
+                head_dim,
+                rotary_dim,
+                theta,
+            },
         )?;
         let scale = 1.0 / (head_dim as f32).sqrt();
         self.ctx.glue_attn_scores(
             res,
             kv_index,
-            &res.q_out,
-            &res.gate_out,
-            &res.attn_scratch,
+            &ScoreBuffers {
+                q: &res.q_out,
+                gate: &res.gate_out,
+                out: &res.attn_scratch,
+            },
             &pos,
-            heads,
-            kv_heads,
-            head_dim,
+            &AttnGeom {
+                heads,
+                kv_heads,
+                head_dim,
+            },
             scale,
         )?;
         let segs = [
@@ -2166,19 +2298,31 @@ impl GpuRuntime {
     }
 
     /// Harness path for block_parts: host x in, synced layer output out.
-    #[allow(clippy::too_many_arguments)]
     pub fn gdn_layer_host(
         &self,
         gdn_index: usize,
-        qkv: &GpuQuant,
-        z: &GpuQuant,
-        b: &GpuQuant,
-        a: &GpuQuant,
-        out_proj: &GpuQuant,
+        proj: &GdnProjections<'_>,
         x: &[f32],
     ) -> Result<Vec<f32>> {
+        let GdnProjections {
+            qkv,
+            z,
+            b,
+            a,
+            out_proj,
+        } = *proj;
         let dx = self.ctx.stream.clone_htod(x).context("harness x upload")?;
-        self.gdn_layer_dx(gdn_index, qkv, z, b, a, out_proj, &dx)?;
+        self.gdn_layer_dx(
+            gdn_index,
+            &GdnProjections {
+                qkv,
+                z,
+                b,
+                a,
+                out_proj,
+            },
+            &dx,
+        )?;
         self.ctx.counted_sync()?;
         self.read_y(out_proj)
     }
@@ -2375,27 +2519,35 @@ impl GpuContext {
     /// Buffer-level attention prephase (qwen3_5: zc=true for the
     /// zero-centered q/k norms). Everything edge0's glue_attn_qk does, but
     /// with explicit buffers instead of ResidentState.
-    #[allow(clippy::too_many_arguments)]
     pub fn glue_attn_qk_raw(
         &self,
-        q_raw: &CudaSlice<f32>,
-        q_norm_w: &CudaSlice<f32>,
-        k_raw: &CudaSlice<f32>,
-        k_norm_w: &CudaSlice<f32>,
-        v_raw: &CudaSlice<f32>,
-        q_out: &CudaSlice<f32>,
-        gate_out: &CudaSlice<f32>,
-        kv_keys: &CudaSlice<f32>,
-        kv_values: &CudaSlice<f32>,
+        proj: &QkvNorm<'_>,
+        out: &QkOutputs<'_>,
+        kv: &KvCache<'_>,
         position: &CudaSlice<i32>,
-        kv_stride: usize,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        rotary_dim: usize,
-        theta: f64,
+        geom: &QkGeom,
         zc: bool,
     ) -> Result<()> {
+        let QkvNorm {
+            q_raw,
+            q_norm_w,
+            k_raw,
+            k_norm_w,
+            v_raw,
+        } = *proj;
+        let QkOutputs { q_out, gate_out } = *out;
+        let KvCache {
+            keys: kv_keys,
+            values: kv_values,
+            stride: kv_stride,
+        } = *kv;
+        let QkGeom {
+            heads,
+            kv_heads,
+            head_dim,
+            rotary_dim,
+            theta,
+        } = *geom;
         let kv_stride_i = kv_stride as i32;
         let heads_i = heads as i32;
         let kv_heads_i = kv_heads as i32;
@@ -2437,21 +2589,25 @@ impl GpuContext {
     }
 
     /// Buffer-level scores/softmax/gated-V (see glue_attn_qk_raw).
-    #[allow(clippy::too_many_arguments)]
     pub fn glue_attn_scores_raw(
         &self,
-        q: &CudaSlice<f32>,
-        gate: &CudaSlice<f32>,
-        kv_keys: &CudaSlice<f32>,
-        kv_values: &CudaSlice<f32>,
-        out: &CudaSlice<f32>,
+        bufs: &ScoreBuffers<'_>,
+        kv: &KvCache<'_>,
         position: &CudaSlice<i32>,
-        kv_stride: usize,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
+        geom: &AttnGeom,
         scale: f32,
     ) -> Result<()> {
+        let ScoreBuffers { q, gate, out } = *bufs;
+        let KvCache {
+            keys: kv_keys,
+            values: kv_values,
+            stride: kv_stride,
+        } = *kv;
+        let AttnGeom {
+            heads,
+            kv_heads,
+            head_dim,
+        } = *geom;
         let kv_stride_i = kv_stride as i32;
         let heads_i = heads as i32;
         let kv_heads_i = kv_heads as i32;
@@ -2514,29 +2670,37 @@ impl GpuContext {
 
     /// glue_attn_qk_raw with 3-axis mrope (rope from rope_pos[3]; KV length
     /// from `position`). Bit-identical at rope_pos == [pos, pos, pos].
-    #[allow(clippy::too_many_arguments)]
     pub fn glue_attn_qk_zc_mrope(
         &self,
-        q_raw: &CudaSlice<f32>,
-        q_norm_w: &CudaSlice<f32>,
-        k_raw: &CudaSlice<f32>,
-        k_norm_w: &CudaSlice<f32>,
-        v_raw: &CudaSlice<f32>,
-        q_out: &CudaSlice<f32>,
-        gate_out: &CudaSlice<f32>,
-        kv_keys: &CudaSlice<f32>,
-        kv_values: &CudaSlice<f32>,
+        proj: &QkvNorm<'_>,
+        out: &QkOutputs<'_>,
+        kv: &KvCache<'_>,
         position: &CudaSlice<i32>,
         rope_pos: &CudaSlice<i32>,
-        kv_stride: usize,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        rotary_dim: usize,
-        theta: f64,
-        sec_h: usize,
-        sec_w: usize,
+        geom: &MropeGeom,
     ) -> Result<()> {
+        let QkvNorm {
+            q_raw,
+            q_norm_w,
+            k_raw,
+            k_norm_w,
+            v_raw,
+        } = *proj;
+        let QkOutputs { q_out, gate_out } = *out;
+        let KvCache {
+            keys: kv_keys,
+            values: kv_values,
+            stride: kv_stride,
+        } = *kv;
+        let MropeGeom {
+            heads,
+            kv_heads,
+            head_dim,
+            rotary_dim,
+            theta,
+            sec_h,
+            sec_w,
+        } = *geom;
         let kv_stride_i = kv_stride as i32;
         let heads_i = heads as i32;
         let kv_heads_i = kv_heads as i32;
@@ -2581,16 +2745,22 @@ impl GpuContext {
 impl GpuRuntime {
     /// Closed MoE block: router GEMV -> device top-k -> batched experts +
     /// shared -> device combine into hidden. No sync, no host data.
-    #[allow(clippy::too_many_arguments)]
     pub fn moe_closed(
         &self,
         layer: usize,
-        router: &GpuQuant,
+        moe: &SharedMoeQuant<'_>,
         experts: &GpuExperts,
-        shared: (&GpuQuant, &GpuQuant, &GpuQuant, &GpuQuant),
         dx: &CudaSlice<f32>,
         top_k: usize,
     ) -> Result<()> {
+        let SharedMoeQuant {
+            router,
+            ss,
+            sg,
+            su,
+            sd,
+        } = *moe;
+        let shared = (sg, su, ss, sd);
         let res = self.res.as_ref().expect("resident state");
         let rows = experts.rows;
         if self.use_moe_mega {
@@ -2599,21 +2769,25 @@ impl GpuRuntime {
             let uy = self.batched_up_y.lock().expect("uy");
             let dy = self.batched_down_y.lock().expect("dy");
             return self.ctx.moe_mega_launch(
-                router,
-                shared.2,
-                shared.0,
-                shared.1,
-                shared.3,
+                &SharedMoeQuant {
+                    router,
+                    ss: shared.2,
+                    sg: shared.0,
+                    su: shared.1,
+                    sd: shared.3,
+                },
                 experts,
                 layer,
-                dx,
-                &ids,
-                &res.topk_w,
-                &gy,
-                &uy,
-                &dy,
-                &res.hidden,
-                &self.mega_bar,
+                &MegaIo {
+                    x: dx,
+                    ids: &ids,
+                    w: &res.topk_w,
+                    gate_y: &gy,
+                    up_y: &uy,
+                    down_y: &dy,
+                    hidden: &res.hidden,
+                    bar: &self.mega_bar,
+                },
                 if shared.0.lora.is_some() {
                     self.lora_rank
                 } else {
@@ -2640,10 +2814,12 @@ impl GpuRuntime {
                 experts,
                 layer,
                 0,
-                &ids,
-                dx,
-                &self.batched_gate_y.lock().expect("gy"),
-                top_k,
+                &GemvBatch {
+                    ids: &ids,
+                    x: dx,
+                    y: &self.batched_gate_y.lock().expect("gy"),
+                    slots: top_k,
+                },
             )?;
             if kt {
                 self.ctx.stream.synchronize().ok();
@@ -2654,10 +2830,12 @@ impl GpuRuntime {
                 experts,
                 layer,
                 1,
-                &ids,
-                dx,
-                &self.batched_up_y.lock().expect("uy"),
-                top_k,
+                &GemvBatch {
+                    ids: &ids,
+                    x: dx,
+                    y: &self.batched_up_y.lock().expect("uy"),
+                    slots: top_k,
+                },
             )?;
             if kt {
                 self.ctx.stream.synchronize().ok();
@@ -2689,11 +2867,13 @@ impl GpuRuntime {
                 experts,
                 layer,
                 &ids2,
-                &g,
-                &u,
-                &res.topk_w,
-                &self.batched_down_y.lock().expect("dy"),
-                top_k,
+                &SiluBatch {
+                    g: &g,
+                    u: &u,
+                    w: &res.topk_w,
+                    y: &self.batched_down_y.lock().expect("dy"),
+                    slots: top_k,
+                },
             )?;
         }
         if kt {
@@ -2954,27 +3134,32 @@ impl GpuContext {
 
 impl GpuContext {
     /// moe_mega: the whole MoE block in one launch (4 grid barriers).
-    #[allow(clippy::too_many_arguments)]
     pub fn moe_mega_launch(
         &self,
-        router: &GpuQuant,
-        ss: &GpuQuant,
-        sg: &GpuQuant,
-        su: &GpuQuant,
-        sd: &GpuQuant,
+        moe: &SharedMoeQuant<'_>,
         experts: &GpuExperts,
         layer: usize,
-        x: &CudaSlice<f32>,
-        ids: &CudaSlice<i32>,
-        w: &CudaSlice<f32>,
-        gate_y: &CudaSlice<f32>,
-        up_y: &CudaSlice<f32>,
-        down_y: &CudaSlice<f32>,
-        hidden: &CudaSlice<f32>,
-        bar: &CudaSlice<i32>,
+        io: &MegaIo<'_>,
         rank: usize,
         top_k: usize,
     ) -> Result<()> {
+        let SharedMoeQuant {
+            router,
+            ss,
+            sg,
+            su,
+            sd,
+        } = *moe;
+        let MegaIo {
+            x,
+            ids,
+            w,
+            gate_y,
+            up_y,
+            down_y,
+            hidden,
+            bar,
+        } = *io;
         self.launch_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The kernel's expert slots are structurally 4 — check, don't assume.
@@ -3204,18 +3389,20 @@ impl Edge0Multi {
     /// `experts_resident` is true, each peer also uploads the routed
     /// experts for its layer range — `GpuExperts.stacked[peer_layer]`
     /// indexes the local position, not the global layer index.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ordinals: &[usize],
         weights: &super::weights::Edge0Weights,
         config: &crate::config::Edge0Config,
-        layer_norms: &[Vec<f32>],
-        attn_norms: &[Vec<f32>],
-        gdn_weights: &[crate::model::GdnWeights],
-        embed: &GroupQuant,
-        final_norm: &[f32],
+        norms: &MultiNorms<'_>,
         experts_resident: bool,
     ) -> Result<Self> {
+        let MultiNorms {
+            layer_norms,
+            attn_norms,
+            gdn_weights,
+            embed,
+            final_norm,
+        } = *norms;
         ensure!(
             !ordinals.is_empty(),
             "Edge0Multi::new requires at least one ordinal"
@@ -3240,13 +3427,15 @@ impl Edge0Multi {
             let kv_slot_count = kv_slot_count_for_range(&config.text_config, range.clone());
             let res = ResidentState::upload(
                 &ctx,
-                config.text_config.hidden_size,
-                &ln_pairs,
-                &attn_pairs,
-                if device_index == 0 { final_norm } else { &[] },
-                config.text_config.num_attention_heads * config.text_config.head_dim,
-                config.text_config.num_key_value_heads * config.text_config.head_dim,
-                kv_slot_count,
+                ResidentUpload {
+                    hidden_size: config.text_config.hidden_size,
+                    layer_norms: &ln_pairs,
+                    attn_norms: &attn_pairs,
+                    final_norm: if device_index == 0 { final_norm } else { &[] },
+                    q_total: config.text_config.num_attention_heads * config.text_config.head_dim,
+                    kv_stride: config.text_config.num_key_value_heads * config.text_config.head_dim,
+                    num_attn_layers: kv_slot_count,
+                },
             )?;
             let gdn_devices =
                 gdn_devices_for_range(&ctx, gdn_weights, &config.text_config, range.clone())?;
@@ -3431,18 +3620,20 @@ fn gdn_devices_for_range(
                 .context("gdn weights layer index")?;
             out.push(GpuGdn::upload(
                 ctx,
-                &w.conv1d,
-                &w.a_log,
-                &w.dt_bias,
-                &w.norm,
-                2 * text.linear_num_key_heads * text.linear_key_head_dim
-                    + text.linear_num_value_heads * text.linear_value_head_dim,
-                text.linear_conv_kernel_dim,
-                text.linear_num_value_heads,
-                text.linear_num_key_heads,
-                text.linear_key_head_dim,
-                text.linear_value_head_dim,
-                text.rms_norm_eps as f32,
+                GdnUpload {
+                    conv1d: &w.conv1d,
+                    a_log: &w.a_log,
+                    dt_bias: &w.dt_bias,
+                    norm: &w.norm,
+                    conv_dim: 2 * text.linear_num_key_heads * text.linear_key_head_dim
+                        + text.linear_num_value_heads * text.linear_value_head_dim,
+                    kernel: text.linear_conv_kernel_dim,
+                    num_v: text.linear_num_value_heads,
+                    num_k: text.linear_num_key_heads,
+                    dk: text.linear_key_head_dim,
+                    dv: text.linear_value_head_dim,
+                    eps: text.rms_norm_eps as f32,
+                },
             )?);
             gdn_layer_idx += 1;
         }

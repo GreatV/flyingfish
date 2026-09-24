@@ -11,7 +11,10 @@ use crate::config::{LayerKind, Qwen35Config, TEXT_PREFIX, TextConfig};
 use crate::weights::{HostProjection, Qwen35Weights};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::safe::{CudaEvent, CudaSlice, CudaStream};
-use ff_edge0::gpu::{GpuContext, GpuGdn, GpuQuant, GroupSeg};
+use ff_edge0::gpu::{
+    AttnGeom, GdnUpload, GpuContext, GpuGdn, GpuQuant, GroupSeg, KvCache, MropeGeom, QkOutputs,
+    QkvNorm, ScoreBuffers,
+};
 use ff_edge0::int4::GROUP_SIZE;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -401,17 +404,20 @@ fn upload_stack(
                 }
                 gdn.push(GpuGdn::upload(
                     ctx,
-                    &weights.f32_named(&format!("{prefix}.linear_attn.conv1d.weight"))?,
-                    &weights.f32_named(&format!("{prefix}.linear_attn.A_log"))?,
-                    &weights.f32_named(&format!("{prefix}.linear_attn.dt_bias"))?,
-                    &weights.f32_named(&format!("{prefix}.linear_attn.norm.weight"))?,
-                    conv_dim,
-                    text.linear_conv_kernel_dim,
-                    text.linear_num_value_heads,
-                    text.linear_num_key_heads,
-                    text.linear_key_head_dim,
-                    text.linear_value_head_dim,
-                    eps,
+                    GdnUpload {
+                        conv1d: &weights
+                            .f32_named(&format!("{prefix}.linear_attn.conv1d.weight"))?,
+                        a_log: &weights.f32_named(&format!("{prefix}.linear_attn.A_log"))?,
+                        dt_bias: &weights.f32_named(&format!("{prefix}.linear_attn.dt_bias"))?,
+                        norm: &weights.f32_named(&format!("{prefix}.linear_attn.norm.weight"))?,
+                        conv_dim,
+                        kernel: text.linear_conv_kernel_dim,
+                        num_v: text.linear_num_value_heads,
+                        num_k: text.linear_num_key_heads,
+                        dk: text.linear_key_head_dim,
+                        dv: text.linear_value_head_dim,
+                        eps,
+                    },
                 )?);
             }
             LayerKind::FullAttention => {
@@ -1700,38 +1706,52 @@ fn run_layer(
         let [qn, kn] = &view.attn_norms[kv_index];
         let rotary_dim = (text.head_dim as f64 * text.rope.partial_rotary_factor) as usize;
         view.ctx.glue_attn_qk_zc_mrope(
-            q.y_ref(),
-            qn,
-            k.y_ref(),
-            kn,
-            v.y_ref(),
-            view.q_out,
-            view.gate_out,
-            &view.kv_keys[kv_index],
-            &view.kv_values[kv_index],
+            &QkvNorm {
+                q_raw: q.y_ref(),
+                q_norm_w: qn,
+                k_raw: k.y_ref(),
+                k_norm_w: kn,
+                v_raw: v.y_ref(),
+            },
+            &QkOutputs {
+                q_out: view.q_out,
+                gate_out: view.gate_out,
+            },
+            &KvCache {
+                keys: &view.kv_keys[kv_index],
+                values: &view.kv_values[kv_index],
+                stride: text.num_key_value_heads * text.head_dim,
+            },
             view.pos,
             view.rope_pos,
-            text.num_key_value_heads * text.head_dim,
-            text.num_attention_heads,
-            text.num_key_value_heads,
-            text.head_dim,
-            rotary_dim,
-            text.rope.rope_theta,
-            text.rope.mrope_section[1],
-            text.rope.mrope_section[2],
+            &MropeGeom {
+                heads: text.num_attention_heads,
+                kv_heads: text.num_key_value_heads,
+                head_dim: text.head_dim,
+                rotary_dim,
+                theta: text.rope.rope_theta,
+                sec_h: text.rope.mrope_section[1],
+                sec_w: text.rope.mrope_section[2],
+            },
         )?;
         let scale = 1.0 / (text.head_dim as f32).sqrt();
         view.ctx.glue_attn_scores_raw(
-            view.q_out,
-            view.gate_out,
-            &view.kv_keys[kv_index],
-            &view.kv_values[kv_index],
-            view.attn_out,
+            &ScoreBuffers {
+                q: view.q_out,
+                gate: view.gate_out,
+                out: view.attn_out,
+            },
+            &KvCache {
+                keys: &view.kv_keys[kv_index],
+                values: &view.kv_values[kv_index],
+                stride: text.num_key_value_heads * text.head_dim,
+            },
             view.pos,
-            text.num_key_value_heads * text.head_dim,
-            text.num_attention_heads,
-            text.num_key_value_heads,
-            text.head_dim,
+            &AttnGeom {
+                heads: text.num_attention_heads,
+                kv_heads: text.num_key_value_heads,
+                head_dim: text.head_dim,
+            },
             scale,
         )?;
         let segs = [
