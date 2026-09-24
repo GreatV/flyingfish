@@ -407,14 +407,18 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         // what this run's expert cache actually uses, which an explicit
         // `--expert-cache-mib` or the live auto-sizer can set well under
         // that ceiling.
+        let bound_source = if explicit_axes.contains("expert_cache.maximum_bound_bytes") {
+            "operator-specified"
+        } else if automatic_axes.contains(&"expert_cache.maximum_bound_bytes") {
+            "auto-derived from a live snapshot"
+        } else if evidence.is_some() {
+            "selected from resource evidence"
+        } else {
+            "default; auto-sizing did not run"
+        };
         eprintln!(
-            "config: settled expert-cache bound for this run: {} B ({})",
+            "config: settled expert-cache bound for this run: {} B ({bound_source})",
             selection.policy.expert_cache.maximum_bound_bytes,
-            if automatic_axes.contains(&"expert_cache.maximum_bound_bytes") {
-                "auto-derived from a live snapshot"
-            } else {
-                "operator-specified"
-            }
         );
     }
     let admission_snapshot =

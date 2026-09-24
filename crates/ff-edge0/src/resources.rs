@@ -72,6 +72,15 @@ pub fn derive_edge0_configuration(
         && bytes < requirement.expert_total_bytes
     {
         derived.pool_resident_bytes = Some(0);
+        for step in &mut derived.provenance {
+            if step.rule == ff_core::configure::RULE_POOL_RESIDENCY {
+                step.detail = format!(
+                    "{}; edge0 has no partial expert cache, so residency snaps to full host \
+                     streaming",
+                    step.detail
+                );
+            }
+        }
     }
     Ok(derived)
 }
@@ -150,6 +159,14 @@ mod tests {
         assert_eq!(plan.mode, crate::mode::PerformanceMode::StreamingExperts);
         assert!(plan.expert_bytes_resident > 0 && plan.expert_bytes_resident < expert_total);
         assert_eq!(derived.pool_resident_bytes, Some(0));
+        assert!(
+            derived
+                .provenance
+                .iter()
+                .find(|step| step.rule == ff_core::configure::RULE_POOL_RESIDENCY)
+                .is_some_and(|step| step.detail.contains("no partial expert cache")
+                    && step.detail.contains("full host streaming"))
+        );
         assert_eq!(
             requirement.poolable_residency_domain(),
             ResidencyDomain::Device
