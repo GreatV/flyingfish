@@ -9,6 +9,7 @@ use anyhow::{Context, Result, ensure};
 use candle_core::{DType, Tensor};
 
 use crate::math::{hc_split_sinkhorn, rms_norm};
+use crate::transformer::TransformerParams;
 
 /// Coefficient sets one `hc_mixes` projection yields.
 pub struct HcMixes {
@@ -19,17 +20,20 @@ pub struct HcMixes {
 
 /// Project the flattened stream, normalized over the whole `hc * dim` width,
 /// and split the result through the Sinkhorn mixer.
-#[allow(clippy::too_many_arguments)]
 pub fn hc_mixes(
     x: &Tensor,
     hc_fn: &Tensor,
     hc_scale: &Tensor,
     hc_base: &Tensor,
-    hc_mult: usize,
-    sinkhorn_iters: usize,
-    hc_eps: f64,
-    norm_eps: f64,
+    params: &TransformerParams,
 ) -> Result<HcMixes> {
+    let TransformerParams {
+        hc_mult,
+        hc_sinkhorn_iters: sinkhorn_iters,
+        hc_eps,
+        norm_eps,
+        ..
+    } = *params;
     let dims = x.dims();
     ensure!(
         dims.len() == 4 && dims[2] == hc_mult,
@@ -203,7 +207,20 @@ mod tests {
         .unwrap();
         let scale = Tensor::from_vec(vec![1.0f32, 1.0, 1.0], (3,), &device).unwrap();
         let base = Tensor::zeros(3, candle_core::DType::F32, &device).unwrap();
-        let mixes = hc_mixes(&x, &hc_fn, &scale, &base, hc, 4, 1e-6, 1e-20).unwrap();
+        let params = TransformerParams {
+            heads: 1,
+            head_dim: hidden,
+            rope_head_dim: 0,
+            o_lora_rank: 0,
+            o_groups: 1,
+            hc_mult: hc,
+            hc_sinkhorn_iters: 4,
+            hc_eps: 1e-6,
+            norm_eps: 1e-20,
+            vocab: 0,
+            hidden,
+        };
+        let mixes = hc_mixes(&x, &hc_fn, &scale, &base, &params).unwrap();
         // Per-token stats make the scaled mixes scale-invariant: both tokens
         // land at 1/sqrt(hidden), so their pre coefficients agree. A global
         // statistic would keep them 100x apart.
