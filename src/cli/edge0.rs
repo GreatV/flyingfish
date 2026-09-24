@@ -27,7 +27,9 @@ pub(super) enum Edge0Command {
             help = "Upload the MoE expert set to the device; a capacity planner verifies it first"
         )]
         resident_experts: bool,
-        #[arg(help = "Print the topology-derived expert-residency bound and its provenance to stderr")]
+        #[arg(
+            help = "Print the topology-derived expert-residency bound and its provenance to stderr"
+        )]
         #[arg(long)]
         explain_config: bool,
     },
@@ -58,8 +60,11 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
             TextDevice::Cpu => candle_core::Device::Cpu,
         };
         let profile = ff_core::topology::TopologyProfile::capture(&capture_device);
-        let derived =
-            flyingfish::edge0::resources::derive_edge0_configuration(&sizes, &profile, selected_ordinal)?;
+        let derived = flyingfish::edge0::resources::derive_edge0_configuration(
+            &sizes,
+            &profile,
+            selected_ordinal,
+        )?;
         // GLM and edge0 stream through mmap by contract, so the weight-source
         // rules do not describe their runtimes; the pool rule is the derived
         // guidance.

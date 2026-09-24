@@ -149,17 +149,11 @@ mod tests {
             requirement.poolable_residency_domain(),
             ResidencyDomain::Device
         );
-        assert_eq!(
-            requirement.steady_weight_bytes().unwrap(),
-            expert_total
-        );
+        assert_eq!(requirement.steady_weight_bytes().unwrap(), expert_total);
         assert_eq!(
             requirement.memory_materialization_bytes().unwrap(),
             expert_total + fixed
         );
-        assert_eq!(
-            derived.weight_source,
-            WeightSourceChoice::Memory
-        );
+        assert_eq!(derived.weight_source, WeightSourceChoice::Memory);
     }
 }

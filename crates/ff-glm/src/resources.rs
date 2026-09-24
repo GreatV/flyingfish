@@ -32,11 +32,9 @@ impl GlmRequirement {
             ExpertCacheBound::new(0, crate::expert_cache_manager::ExpertCacheLayout::default()),
             cache_policy,
         )?;
-        let fixed_bytes = phases
-            .iter()
-            .try_fold(0u64, |peak, phase| {
-                Ok::<_, anyhow::Error>(peak.max(phase.required_device_bytes.unwrap_or(0)))
-            })?;
+        let fixed_bytes = phases.iter().try_fold(0u64, |peak, phase| {
+            Ok::<_, anyhow::Error>(peak.max(phase.required_device_bytes.unwrap_or(0)))
+        })?;
         let entry_bytes = breakdown.expert_cache_entry_bytes();
         let expert_pool_bytes = entry_bytes
             .checked_mul(3)
