@@ -236,6 +236,23 @@ pub struct AdaLnModulation {
     pub gate_feed_forward: Tensor,
 }
 
+/// The per-row tables every transformer-block stage shares.
+#[derive(Clone, Copy)]
+pub struct BlockContext<'a> {
+    pub adaln_indices: &'a Tensor,
+    pub rotary_cos: &'a Tensor,
+    pub rotary_sin: &'a Tensor,
+}
+
+/// Head geometry and normalization epsilons of one attention configuration.
+#[derive(Clone, Copy, Debug)]
+pub struct AttentionParams {
+    pub heads: usize,
+    pub head_dim: usize,
+    pub norm_eps: f64,
+    pub qk_norm_eps: f64,
+}
+
 pub fn adaln(
     weights: &BTreeMap<String, Tensor>,
     prefix: &str,
@@ -296,21 +313,26 @@ pub(crate) fn linear_with_reference_bias(
         .map_err(Into::into)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn attention_with_projection_chunks(
     weights: &BTreeMap<String, Tensor>,
     prefix: &str,
     hidden_states: &Tensor,
     modulation: &AdaLnModulation,
-    adaln_indices: &Tensor,
-    rotary_cos: &Tensor,
-    rotary_sin: &Tensor,
-    heads: usize,
-    head_dim: usize,
+    context: &BlockContext<'_>,
+    params: AttentionParams,
     chunking: AttentionChunking,
-    norm_eps: f64,
-    qk_norm_eps: f64,
 ) -> Result<Tensor> {
+    let BlockContext {
+        adaln_indices,
+        rotary_cos,
+        rotary_sin,
+    } = *context;
+    let AttentionParams {
+        heads,
+        head_dim,
+        norm_eps,
+        qk_norm_eps,
+    } = params;
     let (batch, sequence, _) = hidden_states
         .dims3()
         .context("hidden states must be [batch, sequence, hidden]")?;
@@ -428,22 +450,27 @@ pub fn attention_with_projection_chunks(
     concatenate_chunks(chunks, 1)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "flash-attn")]
 pub fn attention_flash_with_projection_chunks(
     weights: &BTreeMap<String, Tensor>,
     prefix: &str,
     hidden_states: &Tensor,
     modulation: &AdaLnModulation,
-    adaln_indices: &Tensor,
-    rotary_cos: &Tensor,
-    rotary_sin: &Tensor,
-    heads: usize,
-    head_dim: usize,
+    context: &BlockContext<'_>,
+    params: AttentionParams,
     chunking: AttentionChunking,
-    norm_eps: f64,
-    qk_norm_eps: f64,
 ) -> Result<Tensor> {
+    let BlockContext {
+        adaln_indices,
+        rotary_cos,
+        rotary_sin,
+    } = *context;
+    let AttentionParams {
+        heads,
+        head_dim,
+        norm_eps,
+        qk_norm_eps,
+    } = params;
     let (batch, sequence, _) = hidden_states
         .dims3()
         .context("hidden states must be [batch, sequence, hidden]")?;
@@ -576,17 +603,19 @@ pub fn attention_flash_with_projection_chunks(
     concatenate_chunks(output_chunks, 1)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn refiner_attention(
     weights: &BTreeMap<String, Tensor>,
     prefix: &str,
     hidden_states: &Tensor,
-    heads: usize,
-    head_dim: usize,
+    params: AttentionParams,
     query_chunk_size: NonZeroUsize,
-    norm_eps: f64,
-    qk_norm_eps: f64,
 ) -> Result<Tensor> {
+    let AttentionParams {
+        heads,
+        head_dim,
+        norm_eps,
+        qk_norm_eps,
+    } = params;
     let normalized = rms_norm(
         hidden_states,
         required(weights, &format!("{prefix}.norm1.weight"))?,
@@ -620,18 +649,20 @@ pub fn refiner_attention(
     hidden_states.add(&output).map_err(Into::into)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "flash-attn")]
 pub fn refiner_attention_flash(
     weights: &BTreeMap<String, Tensor>,
     prefix: &str,
     hidden_states: &Tensor,
-    heads: usize,
-    head_dim: usize,
+    params: AttentionParams,
     _query_chunk_size: NonZeroUsize,
-    norm_eps: f64,
-    qk_norm_eps: f64,
 ) -> Result<Tensor> {
+    let AttentionParams {
+        heads,
+        head_dim,
+        norm_eps,
+        qk_norm_eps,
+    } = params;
     anyhow::ensure!(
         hidden_states.device().is_cuda(),
         "refiner FlashAttention requires CUDA tensors"
@@ -1420,20 +1451,25 @@ mod tests {
             .with_context(|| format!("failed to reshape reference with {key_sequence} key rows"))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn attention_reference(
         weights: &BTreeMap<String, Tensor>,
         prefix: &str,
         hidden_states: &Tensor,
         modulation: &AdaLnModulation,
-        adaln_indices: &Tensor,
-        rotary_cos: &Tensor,
-        rotary_sin: &Tensor,
-        heads: usize,
-        head_dim: usize,
-        norm_eps: f64,
-        qk_norm_eps: f64,
+        context: &BlockContext<'_>,
+        params: AttentionParams,
     ) -> Result<Tensor> {
+        let BlockContext {
+            adaln_indices,
+            rotary_cos,
+            rotary_sin,
+        } = *context;
+        let AttentionParams {
+            heads,
+            head_dim,
+            norm_eps,
+            qk_norm_eps,
+        } = params;
         let normalized = rms_norm(
             hidden_states,
             required(weights, &format!("{prefix}.norm1.weight"))?,
@@ -1532,13 +1568,17 @@ mod tests {
             prefix,
             &hidden,
             &modulation,
-            &adaln_indices,
-            &rotary_cos,
-            &rotary_sin,
-            heads,
-            head_dim,
-            1e-5,
-            1e-5,
+            &BlockContext {
+                adaln_indices: &adaln_indices,
+                rotary_cos: &rotary_cos,
+                rotary_sin: &rotary_sin,
+            },
+            AttentionParams {
+                heads,
+                head_dim,
+                norm_eps: 1e-5,
+                qk_norm_eps: 1e-5,
+            },
         )
         .unwrap();
 
@@ -1549,14 +1589,18 @@ mod tests {
                     prefix,
                     &hidden,
                     &modulation,
-                    &adaln_indices,
-                    &rotary_cos,
-                    &rotary_sin,
-                    heads,
-                    head_dim,
+                    &BlockContext {
+                        adaln_indices: &adaln_indices,
+                        rotary_cos: &rotary_cos,
+                        rotary_sin: &rotary_sin,
+                    },
+                    AttentionParams {
+                        heads,
+                        head_dim,
+                        norm_eps: 1e-5,
+                        qk_norm_eps: 1e-5,
+                    },
                     attention_chunking(query_chunk_size, query_chunk_size, Some(key_chunk_size)),
-                    1e-5,
-                    1e-5,
                 )
                 .unwrap();
                 assert_eq!(chunked.dims(), &[2, sequence, hidden_size]);
@@ -1578,18 +1622,22 @@ mod tests {
                 prefix,
                 &hidden,
                 &modulation,
-                &adaln_indices,
-                &rotary_cos,
-                &rotary_sin,
-                heads,
-                head_dim,
+                &BlockContext {
+                    adaln_indices: &adaln_indices,
+                    rotary_cos: &rotary_cos,
+                    rotary_sin: &rotary_sin,
+                },
+                AttentionParams {
+                    heads,
+                    head_dim,
+                    norm_eps: 1e-5,
+                    qk_norm_eps: 1e-5,
+                },
                 attention_chunking(
                     projection_chunk_size,
                     score_query_chunk_size,
                     Some(key_chunk_size),
                 ),
-                1e-5,
-                1e-5,
             )
             .unwrap();
             assert_eq!(independently_chunked.dims(), &[2, sequence, hidden_size]);
@@ -1601,14 +1649,18 @@ mod tests {
             prefix,
             &hidden,
             &modulation,
-            &adaln_indices,
-            &rotary_cos,
-            &rotary_sin,
-            heads,
-            head_dim,
+            &BlockContext {
+                adaln_indices: &adaln_indices,
+                rotary_cos: &rotary_cos,
+                rotary_sin: &rotary_sin,
+            },
+            AttentionParams {
+                heads,
+                head_dim,
+                norm_eps: 1e-5,
+                qk_norm_eps: 1e-5,
+            },
             attention_chunking(3, 3, None),
-            1e-5,
-            1e-5,
         )
         .unwrap();
         assert_close(&explicit_full_key, &reference, 2e-5);
@@ -1807,14 +1859,18 @@ mod tests {
             prefix,
             &hidden,
             &modulation,
-            &indices,
-            &cos,
-            &sin,
-            heads,
-            head_dim,
+            &BlockContext {
+                adaln_indices: &indices,
+                rotary_cos: &cos,
+                rotary_sin: &sin,
+            },
+            AttentionParams {
+                heads,
+                head_dim,
+                norm_eps: 1e-5,
+                qk_norm_eps: 1e-5,
+            },
             attention_chunking(1, 1, Some(2)),
-            1e-5,
-            1e-5,
         )
         .unwrap();
         let hidden_full = attention_with_projection_chunks(
@@ -1822,14 +1878,18 @@ mod tests {
             prefix,
             &hidden,
             &modulation,
-            &indices,
-            &cos,
-            &sin,
-            heads,
-            head_dim,
+            &BlockContext {
+                adaln_indices: &indices,
+                rotary_cos: &cos,
+                rotary_sin: &sin,
+            },
+            AttentionParams {
+                heads,
+                head_dim,
+                norm_eps: 1e-5,
+                qk_norm_eps: 1e-5,
+            },
             attention_chunking(2, 2, None),
-            1e-5,
-            1e-5,
         )
         .unwrap();
         assert_eq!(hidden_chunked.dims(), &[1, 2, hidden_size]);

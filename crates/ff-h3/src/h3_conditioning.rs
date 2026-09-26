@@ -5,14 +5,14 @@
 //! rows a fixed conditioning timestep, and update only the generated suffix.
 
 use crate::{
-    layout::{self, AUDIO_TAG, TEXT_TAG, VIDEO_TAG},
+    layout::{self, AUDIO_TAG, LatentGeometry, TEXT_TAG, VIDEO_TAG},
     model::{
         PreparedDenoiseSchedule, PreparedTransformerContext, StreamedTransformer,
         TransformerStaticInputs, TransformerStepInputs,
     },
     pipeline::{
         DenoiseCheckpointEvent, DenoiseObserver, DenoisePreparationEvent, DenoiseStepEvent,
-        T2vaExecutionOptions, T2vaLatents, T2vaSchedule, resolve_run_steps,
+        PromptConditioning, T2vaExecutionOptions, T2vaLatents, T2vaSchedule, resolve_run_steps,
     },
     scheduler::H3Scheduler,
 };
@@ -69,19 +69,34 @@ pub struct ConditionedLayout {
     target_audio_rows: usize,
 }
 
+struct ConditionedLayoutParts {
+    positions: Vec<f64>,
+    tags: Vec<u32>,
+    text_indices: Vec<u32>,
+    video_indices_host: Vec<u32>,
+    audio_indices_host: Vec<u32>,
+    text_rows: usize,
+    condition_video_rows: usize,
+    condition_audio_rows: usize,
+    target_video_rows: usize,
+    target_audio_rows: usize,
+}
+
 impl ConditionedLayout {
-    #[allow(clippy::too_many_arguments)]
     pub fn fl2va(
         text_token_tags: &[u32],
-        target_latent_frames: usize,
-        latent_height: usize,
-        latent_width: usize,
-        target_audio_latents: usize,
-        patch_size: [usize; 3],
-        audio_channels: usize,
+        geometry: LatentGeometry,
         anchors: &[KeyframeAnchor],
         device: &Device,
     ) -> Result<Self> {
+        let LatentGeometry {
+            latent_frames: target_latent_frames,
+            latent_height,
+            latent_width,
+            audio_latents: target_audio_latents,
+            patch_size,
+            audio_channels,
+        } = geometry;
         validate_common(
             text_token_tags,
             target_latent_frames,
@@ -169,32 +184,36 @@ impl ConditionedLayout {
         assign_tags(&mut tags, &video_indices_host, VIDEO_TAG)?;
         assign_tags(&mut tags, &audio_indices_host, AUDIO_TAG)?;
         Self::from_parts(
-            positions,
-            tags,
-            text_indices,
-            video_indices_host,
-            audio_indices_host,
-            text_rows,
-            condition_video_rows,
-            0,
-            target_video_rows,
-            target_audio_rows,
+            ConditionedLayoutParts {
+                positions,
+                tags,
+                text_indices,
+                video_indices_host,
+                audio_indices_host,
+                text_rows,
+                condition_video_rows,
+                condition_audio_rows: 0,
+                target_video_rows,
+                target_audio_rows,
+            },
             device,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn ref2va(
         text_token_tags: &[u32],
         references: &[ReferenceBlock],
-        target_latent_frames: usize,
-        target_latent_height: usize,
-        target_latent_width: usize,
-        target_audio_latents: usize,
-        patch_size: [usize; 3],
-        audio_channels: usize,
+        geometry: LatentGeometry,
         device: &Device,
     ) -> Result<Self> {
+        let LatentGeometry {
+            latent_frames: target_latent_frames,
+            latent_height: target_latent_height,
+            latent_width: target_latent_width,
+            audio_latents: target_audio_latents,
+            patch_size,
+            audio_channels,
+        } = geometry;
         validate_common(
             text_token_tags,
             target_latent_frames,
@@ -394,6 +413,24 @@ impl ConditionedLayout {
         assign_tags(&mut tags, &video_indices_host, VIDEO_TAG)?;
         assign_tags(&mut tags, &audio_indices_host, AUDIO_TAG)?;
         Self::from_parts(
+            ConditionedLayoutParts {
+                positions,
+                tags,
+                text_indices,
+                video_indices_host,
+                audio_indices_host,
+                text_rows,
+                condition_video_rows,
+                condition_audio_rows,
+                target_video_rows,
+                target_audio_rows,
+            },
+            device,
+        )
+    }
+
+    fn from_parts(parts: ConditionedLayoutParts, device: &Device) -> Result<Self> {
+        let ConditionedLayoutParts {
             positions,
             tags,
             text_indices,
@@ -404,24 +441,7 @@ impl ConditionedLayout {
             condition_audio_rows,
             target_video_rows,
             target_audio_rows,
-            device,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn from_parts(
-        positions: Vec<f64>,
-        tags: Vec<u32>,
-        text_indices: Vec<u32>,
-        video_indices_host: Vec<u32>,
-        audio_indices_host: Vec<u32>,
-        text_rows: usize,
-        condition_video_rows: usize,
-        condition_audio_rows: usize,
-        target_video_rows: usize,
-        target_audio_rows: usize,
-        device: &Device,
-    ) -> Result<Self> {
+        } = parts;
         let sequence_length = tags.len();
         ensure!(
             sequence_length
@@ -572,20 +592,34 @@ enum PreparedConditionedExecution {
     Precomputed(PreparedTransformerContext, PreparedDenoiseSchedule),
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The frozen condition rows and initial target noise of a conditioned denoise.
+#[derive(Clone, Copy)]
+pub struct ConditionedDenoiseInputs<'a> {
+    pub condition_video_rows: &'a Tensor,
+    pub condition_audio_rows: &'a Tensor,
+    pub initial_target_video_latents: &'a Tensor,
+    pub initial_target_audio_latents: &'a Tensor,
+}
+
 pub fn denoise_conditioned_with_observer(
     transformer: &StreamedTransformer,
-    prompt_embeddings: &Tensor,
-    text_token_tags: &[u32],
-    condition_video_rows: &Tensor,
-    condition_audio_rows: &Tensor,
-    initial_target_video_latents: &Tensor,
-    initial_target_audio_latents: &Tensor,
+    prompt: PromptConditioning<'_>,
+    inputs: ConditionedDenoiseInputs<'_>,
     layout: &ConditionedLayout,
     schedule: T2vaSchedule,
     options: T2vaExecutionOptions,
     observer: &mut dyn DenoiseObserver,
 ) -> Result<T2vaLatents> {
+    let PromptConditioning {
+        embeddings: prompt_embeddings,
+        text_token_tags,
+    } = prompt;
+    let ConditionedDenoiseInputs {
+        condition_video_rows,
+        condition_audio_rows,
+        initial_target_video_latents,
+        initial_target_audio_latents,
+    } = inputs;
     let device = transformer.device();
     let config = transformer.config();
     let (video_batch, video_channels, video_frames, video_height, video_width) =
@@ -1062,12 +1096,14 @@ mod tests {
     fn fl2va_places_frozen_video_before_target_audio_and_video() {
         let layout = ConditionedLayout::fl2va(
             &[TEXT_TAG, TEXT_TAG],
-            2,
-            2,
-            4,
-            3,
-            [1, 2, 2],
-            2,
+            LatentGeometry {
+                latent_frames: 2,
+                latent_height: 2,
+                latent_width: 4,
+                audio_latents: 3,
+                patch_size: [1, 2, 2],
+                audio_channels: 2,
+            },
             &[KeyframeAnchor::First, KeyframeAnchor::Last],
             &Device::Cpu,
         )
@@ -1108,12 +1144,14 @@ mod tests {
                     audio_latents: 1,
                 },
             ],
-            1,
-            2,
-            4,
-            1,
-            [1, 2, 2],
-            2,
+            LatentGeometry {
+                latent_frames: 1,
+                latent_height: 2,
+                latent_width: 4,
+                audio_latents: 1,
+                patch_size: [1, 2, 2],
+                audio_channels: 2,
+            },
             &Device::Cpu,
         )
         .unwrap();
@@ -1163,12 +1201,14 @@ mod tests {
                     },
                     ReferenceBlock::Audio { audio_latents: 0 },
                 ],
-                1,
-                2,
-                2,
-                1,
-                [1, 2, 2],
-                2,
+                LatentGeometry {
+                    latent_frames: 1,
+                    latent_height: 2,
+                    latent_width: 2,
+                    audio_latents: 1,
+                    patch_size: [1, 2, 2],
+                    audio_channels: 2,
+                },
                 &Device::Cpu,
             )
             .is_err()
@@ -1176,12 +1216,14 @@ mod tests {
         assert!(
             ConditionedLayout::fl2va(
                 &[TEXT_TAG],
-                1,
-                2,
-                2,
-                0,
-                [1, 2, 2],
-                2,
+                LatentGeometry {
+                    latent_frames: 1,
+                    latent_height: 2,
+                    latent_width: 2,
+                    audio_latents: 0,
+                    patch_size: [1, 2, 2],
+                    audio_channels: 2,
+                },
                 &[KeyframeAnchor::First],
                 &Device::Cpu,
             )

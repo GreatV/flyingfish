@@ -628,7 +628,6 @@ impl H3QwenNumericalContract {
     }
 
     /// The Qwen contract for a target with the capabilities its device affords.
-    #[allow(clippy::too_many_arguments)]
     pub fn for_target_with_grids(
         execution_backend: ExecutionBackendPolicy,
         capabilities: Option<CudaCapabilities>,

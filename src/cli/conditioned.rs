@@ -18,10 +18,14 @@ use candle_core::{DType, Device, Tensor, safetensors};
 use flyingfish::h3::audio_vae_encoder::StreamedAudioVaeEncoder;
 use flyingfish::h3::config::TransformerConfig;
 use flyingfish::h3::cuda::profile::validate_selected_device as validate_h3_selected_cuda_profile;
-use flyingfish::h3::fl2va::{Fl2vaCanvas, Fl2vaOptions, PreparedFl2va, prepare_fl2va};
-use flyingfish::h3::h3_conditioning::{
-    ConditionedLayout, KeyframeAnchor, ReferenceBlock, denoise_conditioned_with_observer,
+use flyingfish::h3::fl2va::{
+    Fl2vaCanvas, Fl2vaKeyframeImages, Fl2vaOptions, PreparedFl2va, prepare_fl2va,
 };
+use flyingfish::h3::h3_conditioning::{
+    ConditionedDenoiseInputs, ConditionedLayout, KeyframeAnchor, ReferenceBlock,
+    denoise_conditioned_with_observer,
+};
+use flyingfish::h3::layout::LatentGeometry;
 use flyingfish::h3::model::{
     StreamedTransformer, StreamedTransformerOptions, validate_h3_numerical_backend,
 };
@@ -30,7 +34,7 @@ use flyingfish::h3::multimodal_text_encoder::{
 };
 use flyingfish::h3::pipeline::{
     DenoiseCheckpointEvent, DenoiseObserver, DenoisePreparationEvent, DenoiseStepEvent,
-    T2vaExecutionOptions, T2vaSchedule,
+    PromptConditioning, T2vaExecutionOptions, T2vaSchedule,
 };
 use flyingfish::h3::policy::{ExecutionPolicy, H3QwenNumericalContract, H3QwenVisionGridModality};
 use flyingfish::h3::ref2va::{PreparedRef2va, Ref2vaPipeline, Ref2vaReference, Ref2vaTarget};
@@ -281,8 +285,10 @@ pub(super) fn run_prepare_fl2va(command: H3Command) -> Result<()> {
         &video_encoder,
         &tokenizer,
         &prompt,
-        first_image.as_ref(),
-        last_image.as_ref(),
+        Fl2vaKeyframeImages {
+            first: first_image.as_ref(),
+            last: last_image.as_ref(),
+        },
         options,
         &mut request_rng,
     )?;
@@ -589,12 +595,16 @@ pub(super) fn run_denoise_conditioned(command: H3Command) -> Result<()> {
     };
     let result = denoise_conditioned_with_observer(
         &transformer,
-        &bundle.prompt_embeddings,
-        &tags,
-        &bundle.condition_video_rows,
-        &bundle.condition_audio_rows,
-        &bundle.video_latents,
-        &bundle.audio_latents,
+        PromptConditioning {
+            embeddings: &bundle.prompt_embeddings,
+            text_token_tags: &tags,
+        },
+        ConditionedDenoiseInputs {
+            condition_video_rows: &bundle.condition_video_rows,
+            condition_audio_rows: &bundle.condition_audio_rows,
+            initial_target_video_latents: &bundle.video_latents,
+            initial_target_audio_latents: &bundle.audio_latents,
+        },
         &bundle.layout,
         T2vaSchedule {
             sigma_points: bundle.sigma_points,
@@ -1361,12 +1371,14 @@ fn load_bundle(path: &Path, device: &Device) -> Result<ConditionedBundle> {
             let (_, _, target_audio_frames) = audio_latents.dims3()?;
             let layout = ConditionedLayout::fl2va(
                 &tags,
-                target_frames,
-                latent_height,
-                latent_width,
-                target_audio_frames,
-                patch_size,
-                audio_channels,
+                LatentGeometry {
+                    latent_frames: target_frames,
+                    latent_height,
+                    latent_width,
+                    audio_latents: target_audio_frames,
+                    patch_size,
+                    audio_channels,
+                },
                 &anchors,
                 device,
             )?;
@@ -1437,12 +1449,14 @@ fn load_bundle(path: &Path, device: &Device) -> Result<ConditionedBundle> {
             let layout = ConditionedLayout::ref2va(
                 &tags,
                 &references,
-                target_frames,
-                latent_height,
-                latent_width,
-                target_audio_frames,
-                patch_size,
-                audio_channels,
+                LatentGeometry {
+                    latent_frames: target_frames,
+                    latent_height,
+                    latent_width,
+                    audio_latents: target_audio_frames,
+                    patch_size,
+                    audio_channels,
+                },
                 device,
             )?;
             (BundleLayout::Ref2va { references }, layout)
@@ -2016,9 +2030,20 @@ mod tests {
         let device = Device::Cpu;
         let tags = vec![1u32, 0];
         let anchors = vec![KeyframeAnchor::First];
-        let layout =
-            ConditionedLayout::fl2va(&tags, 37, 2, 2, 207, [1, 2, 2], 2, &anchors, &device)
-                .unwrap();
+        let layout = ConditionedLayout::fl2va(
+            &tags,
+            LatentGeometry {
+                latent_frames: 37,
+                latent_height: 2,
+                latent_width: 2,
+                audio_latents: 207,
+                patch_size: [1, 2, 2],
+                audio_channels: 2,
+            },
+            &anchors,
+            &device,
+        )
+        .unwrap();
         ConditionedBundle {
             mode: ConditionedMode::Fl2va,
             num_frames: 124,
@@ -2055,12 +2080,14 @@ mod tests {
         bundle.layout = ConditionedLayout::ref2va(
             &[1u32, 0],
             &references,
-            37,
-            2,
-            2,
-            207,
-            [1, 2, 2],
-            2,
+            LatentGeometry {
+                latent_frames: 37,
+                latent_height: 2,
+                latent_width: 2,
+                audio_latents: 207,
+                patch_size: [1, 2, 2],
+                audio_channels: 2,
+            },
             &Device::Cpu,
         )
         .unwrap();
@@ -2075,9 +2102,20 @@ mod tests {
         let device = Device::Cpu;
         let tags = vec![1u32; token_ids.len()];
         let anchors = vec![KeyframeAnchor::First];
-        let layout =
-            ConditionedLayout::fl2va(&tags, 37, 2, 2, 207, [1, 2, 2], 2, &anchors, &device)
-                .unwrap();
+        let layout = ConditionedLayout::fl2va(
+            &tags,
+            LatentGeometry {
+                latent_frames: 37,
+                latent_height: 2,
+                latent_width: 2,
+                audio_latents: 207,
+                patch_size: [1, 2, 2],
+                audio_channels: 2,
+            },
+            &anchors,
+            &device,
+        )
+        .unwrap();
         let (mut image_rows, mut video_rows, mut max_segment) = (0usize, 0usize, 0usize);
         for &(modality, temporal, height, width) in grids {
             let segment = height.checked_mul(width).unwrap();

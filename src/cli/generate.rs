@@ -28,7 +28,8 @@ use flyingfish::h3::model::{
     StreamedTransformer, TransformerChunking, validate_h3_numerical_backend,
 };
 use flyingfish::h3::pipeline::{
-    T2vaExecutionOptions, T2vaLatents, T2vaSchedule, denoise_t2va_with_options_and_observer,
+    PromptConditioning, T2vaExecutionOptions, T2vaInitialLatents, T2vaLatents, T2vaSchedule,
+    denoise_t2va_with_options_and_observer,
 };
 use flyingfish::h3::policy::ExecutionBackendPolicy;
 use flyingfish::h3::policy::{ExecutionPolicy, H3QwenNumericalContract};
@@ -1356,10 +1357,14 @@ fn denoise_remaining_steps(
         };
         let result = denoise_t2va_with_options_and_observer(
             &transformer,
-            &state.prompt_embeddings,
-            &state.text_token_tags,
-            &state.video_latents,
-            &state.audio_latents,
+            PromptConditioning {
+                embeddings: &state.prompt_embeddings,
+                text_token_tags: &state.text_token_tags,
+            },
+            T2vaInitialLatents {
+                video: &state.video_latents,
+                audio: &state.audio_latents,
+            },
             T2vaSchedule {
                 sigma_points,
                 video_shift,

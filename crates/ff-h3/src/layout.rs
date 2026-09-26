@@ -8,6 +8,17 @@ const ROPE_FRAME_RESCALE: f64 = 5. / 3.;
 const ROPE_FRAMES_PER_LATENT: [f64; 5] = [1., 4., 4., 4., 4.];
 const ROPE_SPATIAL_SCALE: f64 = 32.;
 
+/// The latent canvas, audio grid, and patch every packed layout shares.
+#[derive(Clone, Copy, Debug)]
+pub struct LatentGeometry {
+    pub latent_frames: usize,
+    pub latent_height: usize,
+    pub latent_width: usize,
+    pub audio_latents: usize,
+    pub patch_size: [usize; 3],
+    pub audio_channels: usize,
+}
+
 pub struct PackedLayout {
     position_ids: Tensor,
     token_tags: Tensor,
@@ -21,17 +32,19 @@ pub struct PackedLayout {
 }
 
 impl PackedLayout {
-    #[allow(clippy::too_many_arguments)]
     pub fn t2va(
         text_token_tags: &[u32],
-        num_latent_frames: usize,
-        latent_height: usize,
-        latent_width: usize,
-        num_audio_latents: usize,
-        patch_size: [usize; 3],
-        audio_channels: usize,
+        geometry: LatentGeometry,
         device: &Device,
     ) -> Result<Self> {
+        let LatentGeometry {
+            latent_frames: num_latent_frames,
+            latent_height,
+            latent_width,
+            audio_latents: num_audio_latents,
+            patch_size,
+            audio_channels,
+        } = geometry;
         let [patch_t, patch_h, patch_w] = patch_size;
         anyhow::ensure!(
             patch_t == 1,
@@ -344,12 +357,14 @@ mod tests {
     fn t2va_layout_orders_text_audio_then_video() {
         let layout = PackedLayout::t2va(
             &[TEXT_TAG, TEXT_TAG],
-            2,
-            2,
-            4,
-            3,
-            [1, 2, 2],
-            2,
+            LatentGeometry {
+                latent_frames: 2,
+                latent_height: 2,
+                latent_width: 4,
+                audio_latents: 3,
+                patch_size: [1, 2, 2],
+                audio_channels: 2,
+            },
             &Device::Cpu,
         )
         .unwrap();
@@ -379,12 +394,14 @@ mod tests {
         for (frames, height, width) in [(0, 2, 4), (1, 0, 4), (1, 2, 0)] {
             let error = PackedLayout::t2va(
                 &[TEXT_TAG],
-                frames,
-                height,
-                width,
-                3,
-                [1, 2, 2],
-                2,
+                LatentGeometry {
+                    latent_frames: frames,
+                    latent_height: height,
+                    latent_width: width,
+                    audio_latents: 3,
+                    patch_size: [1, 2, 2],
+                    audio_channels: 2,
+                },
                 &Device::Cpu,
             )
             .err()
@@ -401,12 +418,14 @@ mod tests {
     fn zero_audio_rows_omit_the_audio_timestep() {
         let layout = PackedLayout::t2va(
             &[TEXT_TAG, TEXT_TAG],
-            1,
-            2,
-            4,
-            0,
-            [1, 2, 2],
-            2,
+            LatentGeometry {
+                latent_frames: 1,
+                latent_height: 2,
+                latent_width: 4,
+                audio_latents: 0,
+                patch_size: [1, 2, 2],
+                audio_channels: 2,
+            },
             &Device::Cpu,
         )
         .unwrap();
