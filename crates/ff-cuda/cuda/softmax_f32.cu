@@ -8,8 +8,8 @@
 // The upstream code is distributed under PyTorch's BSD-style license. See
 // https://github.com/pytorch/pytorch/blob/7269437d655783a26cba32aa88195b741ff496aa/LICENSE
 //
-// The H3 wrappers cover exactly the complete persistent dispatch range,
-// widths 1..=2048 (log2_elements 0..=11). The Qwen wrappers additionally
+// The persistent wrappers cover exactly the complete persistent dispatch range,
+// widths 1..=2048 (log2_elements 0..=11). The regular wrappers additionally
 // transcribe SoftMax.cu's regular register kernel for widths 2049..=9216
 // (1024 threads and reg_count 3..=9). There is no fallback approximation.
 
@@ -200,7 +200,7 @@ __device__ __forceinline__ void regular_softmax_forward(
 }  // namespace
 
 #define DEFINE_PERSISTENT_SOFTMAX_WRAPPER(LOG2)                              \
-  extern "C" __global__ void h3_sdpa_softmax_f32_log2_##LOG2(               \
+  extern "C" __global__ void softmax_persistent_f32_log2_##LOG2(               \
       const float* __restrict__ input,                                       \
       float* __restrict__ output,                                            \
       int rows,                                                              \
@@ -221,18 +221,18 @@ DEFINE_PERSISTENT_SOFTMAX_WRAPPER(9)
 DEFINE_PERSISTENT_SOFTMAX_WRAPPER(10)
 DEFINE_PERSISTENT_SOFTMAX_WRAPPER(11)
 
-#define DEFINE_QWEN_REGULAR_SOFTMAX_WRAPPER(REGISTERS)                      \
-  extern "C" __global__ void qwen_softmax_regular_f32_reg_##REGISTERS(     \
+#define DEFINE_REGULAR_SOFTMAX_WRAPPER(REGISTERS)                      \
+  extern "C" __global__ void softmax_regular_f32_reg_##REGISTERS(     \
       const float* __restrict__ input,                                      \
       float* __restrict__ output,                                           \
       long long width) {                                                    \
     regular_softmax_forward<REGISTERS>(input, output, width);               \
   }
 
-DEFINE_QWEN_REGULAR_SOFTMAX_WRAPPER(3)
-DEFINE_QWEN_REGULAR_SOFTMAX_WRAPPER(4)
-DEFINE_QWEN_REGULAR_SOFTMAX_WRAPPER(5)
-DEFINE_QWEN_REGULAR_SOFTMAX_WRAPPER(6)
-DEFINE_QWEN_REGULAR_SOFTMAX_WRAPPER(7)
-DEFINE_QWEN_REGULAR_SOFTMAX_WRAPPER(8)
-DEFINE_QWEN_REGULAR_SOFTMAX_WRAPPER(9)
+DEFINE_REGULAR_SOFTMAX_WRAPPER(3)
+DEFINE_REGULAR_SOFTMAX_WRAPPER(4)
+DEFINE_REGULAR_SOFTMAX_WRAPPER(5)
+DEFINE_REGULAR_SOFTMAX_WRAPPER(6)
+DEFINE_REGULAR_SOFTMAX_WRAPPER(7)
+DEFINE_REGULAR_SOFTMAX_WRAPPER(8)
+DEFINE_REGULAR_SOFTMAX_WRAPPER(9)

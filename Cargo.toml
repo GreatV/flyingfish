@@ -8,7 +8,7 @@ publish = false
 
 [workspace]
 resolver = "3"
-members = ["crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35", "crates/ff-dsv41", "crates/ff-cuda-build"]
+members = ["crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35", "crates/ff-dsv41", "crates/ff-cuda"]
 default-members = [".", "crates/ff-core", "crates/ff-h3", "crates/ff-glm", "crates/ff-trellis", "crates/ff-minicpm", "crates/ff-music", "crates/ff-edge0", "crates/ff-qwen35", "crates/ff-dsv41"]
 
 [workspace.package]
@@ -25,6 +25,7 @@ candle-kernels = { path = "third_party/candle-kernels" }
 candle-core = { path = "third_party/candle-core" }
 
 [workspace.dependencies]
+sha2 = "0.10.9"
 anyhow = "1.0"
 candle-core = "=0.11.0"
 candle-kernels = "=0.11.0"
@@ -108,10 +109,13 @@ safetensors = "=0.8.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
 tokenizers = "=0.22.2"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "time"] }
 
 [dev-dependencies]
 anyhow = "1.0"
 tempfile = "3.20"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = "thin"

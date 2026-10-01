@@ -20,7 +20,7 @@ __device__ __forceinline__ BFloat16Bits float_to_bf16(float value) {
   return result;
 }
 
-extern "C" __global__ void qwen_attention_scale_bf16(
+extern "C" __global__ void scale_bf16(
     int elements,
     float scale,
     const BFloat16Bits* __restrict__ input,

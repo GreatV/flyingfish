@@ -10,10 +10,7 @@ use candle_core::cuda_backend::CudaDevice;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// Compute capability of a CUDA device, cached per device.
-///
-/// Cached because it is queried on the first launch of every kernel and the
-/// driver call is not free, and because it cannot change for a live device.
+/// Device capabilities are captured once for the live device.
 pub(crate) fn compute_capability(device: &CudaDevice) -> candle_core::Result<(i32, i32)> {
     use candle_core::cuda_backend::DeviceId;
     use cudarc::driver::sys::CUdevice_attribute;
@@ -73,7 +70,7 @@ pub(crate) fn tuned_kernels_available(device: &candle_core::Device) -> bool {
 
 /// Refuse a device that cannot execute the transcribed kernels.
 ///
-/// Called at the head of every kernel compiled from `src/cuda/*.cu`.
+/// Called at the head of every kernel compiled from `crates/ff-cuda/cuda/*.cu`.
 pub(crate) fn require_tuned_kernel(device: &CudaDevice) -> candle_core::Result<()> {
     super::profile::validate_process_numerics()?;
     let capability = compute_capability(device)?;

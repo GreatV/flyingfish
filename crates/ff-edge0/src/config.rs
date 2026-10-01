@@ -1,16 +1,12 @@
-//! Edge0 (Qwen3.5-MoE multimodal) checkpoint configuration.
-//!
-//! Every constant and default here was verified against
-//! `models/Edge0/Edge0-35B-A3B-preview/config.json` and the safetensors
-//! headers on 2026-09-16.
+//! Edge0 groupwise-quantized Qwen3.5-MoE checkpoint configuration.
 
 use anyhow::{Context, Result, ensure};
+use ff_core::quant::QuantFormat;
 use serde::Deserialize;
 use std::{fs, path::Path};
 
 pub const EDGE0_ARCHITECTURE: &str = "Qwen3_5MoeForConditionalGeneration";
 pub const EDGE0_MODEL_TYPE: &str = "qwen3_5_moe";
-pub const EDGE0_TEXT_MODEL_TYPE: &str = "qwen3_5_moe_text";
 
 /// `quantization.mode` value in the checkpoint's config.json; an upstream
 /// BF16 Qwen3.5-MoE shares the architecture but carries no such object.
@@ -19,9 +15,7 @@ pub const EDGE0_QUANTIZATION_MODE: &str = "affine";
 /// Groupwise affine quantization, verified from the checkpoint: body
 /// tensors carry 8x unsigned int4 per U32 word (low nibble first), the
 /// router and shared-expert gates carry 4x unsigned int8.
-pub const EDGE0_GROUP_SIZE: usize = 64;
 pub const EDGE0_BODY_BITS: u32 = 4;
-pub const EDGE0_GATE_BITS: u32 = 8;
 
 /// Runtime routing width. The base model's trained width
 /// (`num_experts_per_tok`) is 8; the official edge0 pipeline truncates to 4
@@ -115,34 +109,6 @@ impl TextConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-pub struct QuantizationConfig {
-    pub group_size: usize,
-    pub bits: u32,
-    pub mode: String,
-}
-
-impl QuantizationConfig {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.group_size == EDGE0_GROUP_SIZE,
-            "unsupported Edge0 group size {}; expected {EDGE0_GROUP_SIZE}",
-            self.group_size
-        );
-        ensure!(
-            self.bits == EDGE0_BODY_BITS,
-            "unsupported Edge0 body bits {}; expected {EDGE0_BODY_BITS}",
-            self.bits
-        );
-        ensure!(
-            self.mode == EDGE0_QUANTIZATION_MODE,
-            "unsupported Edge0 quantization mode {:?}; expected {EDGE0_QUANTIZATION_MODE}",
-            self.mode
-        );
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct VisionConfig {
     pub depth: usize,
     pub hidden_size: usize,
@@ -164,11 +130,47 @@ pub struct Edge0Config {
     pub eos_token_id: Vec<u32>,
     pub text_config: TextConfig,
     pub vision_config: VisionConfig,
-    pub quantization: QuantizationConfig,
+    #[serde(rename = "quantization", deserialize_with = "affine_int4")]
+    pub quant: QuantFormat,
     #[serde(default)]
     pub image_token_id: Option<u32>,
     #[serde(default)]
     pub video_token_id: Option<u32>,
+}
+
+fn affine_int4<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<QuantFormat, D::Error> {
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    struct Raw {
+        group_size: usize,
+        bits: u32,
+        mode: String,
+    }
+    let raw = Raw::deserialize(deserializer)?;
+    if raw.mode != EDGE0_QUANTIZATION_MODE {
+        return Err(D::Error::custom(format!(
+            "unsupported Edge0 quantization mode {:?}; expected {EDGE0_QUANTIZATION_MODE}",
+            raw.mode
+        )));
+    }
+    if raw.bits != EDGE0_BODY_BITS {
+        return Err(D::Error::custom(format!(
+            "unsupported Edge0 body bits {}; expected {EDGE0_BODY_BITS}",
+            raw.bits
+        )));
+    }
+    if raw.group_size != crate::int4::GROUP_SIZE {
+        return Err(D::Error::custom(format!(
+            "unsupported Edge0 group size {}; expected {}",
+            raw.group_size,
+            crate::int4::GROUP_SIZE
+        )));
+    }
+    Ok(QuantFormat::GroupAffine {
+        group: raw.group_size,
+    })
 }
 
 fn token_id_list<'de, D: serde::Deserializer<'de>>(
@@ -213,7 +215,6 @@ impl Edge0Config {
             self.architectures,
             self.model_type
         );
-        self.quantization.validate()?;
         ensure!(
             !self.eos_token_id.is_empty()
                 && self
@@ -263,5 +264,29 @@ mod tests {
         assert_eq!(config.text_config.effective_top_k(), 4);
         assert_eq!(config.text_config.num_experts, 256);
         config.validate().unwrap();
+        assert_eq!(config.quant, QuantFormat::GroupAffine { group: 64 });
+    }
+
+    #[test]
+    fn parses_the_real_checkpoint_config() {
+        let Some(dir) = ff_core::paths::checkpoint_dir("Edge0/Edge0-35B-A3B-preview") else {
+            return;
+        };
+        if !dir.exists() {
+            return;
+        }
+        let config = Edge0Config::from_model_dir(&dir).unwrap();
+        assert_eq!(config.quant, QuantFormat::GroupAffine { group: 64 });
+    }
+
+    #[test]
+    fn an_unsupported_group_size_names_the_value() {
+        let mut config: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/config.json")).unwrap();
+        config["quantization"]["group_size"] = serde_json::json!(32);
+        let error = serde_json::from_value::<Edge0Config>(config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("group size 32"), "{error}");
     }
 }

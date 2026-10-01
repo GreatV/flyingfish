@@ -21,12 +21,8 @@ pub type BlockParts = (String, Vec<f32>, Vec<f32>, Vec<f32>);
 
 /// EDGE0_MAX_CTX override for the resident KV cache, default 4096 (the attn
 /// kernel's shared-memory cap is 8192, enforced at upload).
-pub fn configured_max_ctx() -> usize {
-    std::env::var("EDGE0_MAX_CTX")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(4096)
+pub fn configured_max_ctx() -> Result<usize> {
+    ff_core::probe::env_usize("EDGE0_MAX_CTX", 4096, 1, 8192)
 }
 
 struct GdnState {
@@ -40,8 +36,7 @@ struct KvCache {
     len: usize,
 }
 
-/// Converted once at load — the hot path used to re-convert these from bf16
-/// every token (~1.3M converts + ~150 Vec allocs/token across 40 layers).
+/// Layer normalization weights converted once at load.
 struct LayerNorms {
     input: Vec<f32>,
     post: Vec<f32>,
@@ -174,11 +169,6 @@ impl Edge0Text {
         self.position
     }
 
-    #[cfg(feature = "cuda")]
-    pub fn is_resident(&self) -> bool {
-        self.gpu.as_ref().is_some_and(|rt| rt.res.is_some())
-    }
-
     /// The closed decode loop requires the resident expert set, not just the
     /// static projections.
     #[cfg(feature = "cuda")]
@@ -254,6 +244,7 @@ impl Edge0Text {
                     .get(&format!("{prefix}.linear_attn.out_proj"))
                     .context("out_proj resident")?;
                 rt.gdn_layer_dx(
+                    layer,
                     gdn_index,
                     &crate::gpu::GdnProjections {
                         qkv,
@@ -284,6 +275,7 @@ impl Edge0Text {
                     .context("o resident")?;
                 let rotary_dim = (text.head_dim as f64 * text.rope.partial_rotary_factor) as usize;
                 rt.attn_layer(
+                    layer,
                     kv_index,
                     &crate::gpu::AttnQuants { q, k, v, o_proj: o },
                     &crate::gpu::QkGeom {
@@ -306,11 +298,6 @@ impl Edge0Text {
                 let moe_out = self.moe_forward(layer, &prefix, &x1_host)?;
                 rt.add_moe_residual(&moe_out)?;
                 self.timing.moe_ms += moe_started.elapsed().as_secs_f64() * 1000.0;
-                if std::env::var_os("EDGE0_DEBUG_RES").is_some() {
-                    let h = rt.debug_hidden().unwrap();
-                    let norm = h.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    println!("gpu layer {layer}: |h| = {norm:.4}");
-                }
                 continue;
             };
             let router = rt
@@ -346,19 +333,7 @@ impl Edge0Text {
                 rt.hidden_x1(),
                 text.effective_top_k(),
             )?;
-            if std::env::var_os("EDGE0_LAYER_TIMES").is_some() {
-                rt.ctx.stream.synchronize().ok();
-                eprintln!(
-                    "DBG vec layer {layer} t {:.2}",
-                    started.elapsed().as_secs_f64() * 1e3
-                );
-            }
             self.timing.moe_ms += moe_started.elapsed().as_secs_f64() * 1000.0;
-            if std::env::var_os("EDGE0_DEBUG_RES").is_some() {
-                let h = rt.debug_hidden().unwrap();
-                let norm = h.iter().map(|v| v * v).sum::<f32>().sqrt();
-                println!("gpu layer {layer}: |h| = {norm:.4} first8 {:?}", &h[..8]);
-            }
         }
         self.timing.forward_ms += started.elapsed().as_secs_f64() * 1000.0;
         self.timing.gpu_syncs = rt.ctx.sync_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -366,17 +341,6 @@ impl Edge0Text {
         rt.bump_position()?;
         rt.final_norm()?;
         rt.read_hidden_x1()
-    }
-
-    /// Closed decode step: layers + final norm + lm_head + device argmax.
-    /// One dtoh per call (the token id).
-    /// Enqueue n decode steps with no intermediate syncs (GPU-time probe).
-    #[cfg(feature = "cuda")]
-    pub fn run_burst(&mut self, n: usize) -> Result<()> {
-        let rt = self.gpu.take().expect("resident runtime");
-        let r = (0..n).try_for_each(|_| self.enqueue_decode_step(&rt));
-        self.gpu = Some(rt);
-        r
     }
 
     /// Harness: quantized projection + lora pair by name (read-only).
@@ -389,34 +353,11 @@ impl Edge0Text {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn forward_token_pub(&mut self, prev: u32) -> Result<u32> {
-        self.forward_token(prev)
-    }
-
-    #[cfg(feature = "cuda")]
     pub fn set_next_token_harness(&mut self, token: u32) -> Result<()> {
         self.gpu
             .as_ref()
             .expect("resident runtime")
             .set_next_token(token)
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn read_next_token_harness(&mut self) -> Result<u32> {
-        self.gpu
-            .as_ref()
-            .expect("resident runtime")
-            .read_next_token()
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn decode_graph_take(&mut self) -> Option<crate::gpu::DecodeGraph> {
-        self.decode_graph.take()
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn restore_graph(&mut self, g: Option<crate::gpu::DecodeGraph>) {
-        self.decode_graph = g;
     }
 
     /// First decode token from the post-prefill state (no forward).
@@ -425,18 +366,20 @@ impl Edge0Text {
         self.gpu.as_ref().expect("resident runtime").argmax_x1()
     }
 
-    /// Closed decode step; public for the generate loop.
+    /// Closed decode step on the loaded runtime: layers + final norm + lm_head + argmax + position bump.
     #[cfg(feature = "cuda")]
     pub fn forward_token(&mut self, prev: u32) -> Result<u32> {
-        let rt_owned = self.gpu.take().expect("resident runtime");
-        let result = self.forward_resident_token(&rt_owned, prev);
-        self.gpu = Some(rt_owned);
+        if self.gpu_multi.is_some() {
+            return self.forward_token_multi(prev);
+        }
+        let rt = self.gpu.take().expect("resident runtime");
+        let result = self.forward_token_single(&rt, prev);
+        self.gpu = Some(rt);
         result
     }
 
     #[cfg(feature = "cuda")]
-    #[cfg(feature = "cuda")]
-    fn forward_resident_token(&mut self, rt: &crate::gpu::GpuRuntime, prev: u32) -> Result<u32> {
+    fn forward_token_single(&mut self, rt: &crate::gpu::GpuRuntime, prev: u32) -> Result<u32> {
         let started = std::time::Instant::now();
         if let Some(res) = &rt.res {
             anyhow::ensure!(
@@ -446,26 +389,10 @@ impl Edge0Text {
                 res.max_ctx
             );
         }
-        // Graph capture is opt-in (EDGE0_GRAPH): replay measured 26 ms/token
-        // vs 2.4 eager — at ~2 us kernels the per-node overhead dominates a
-        // ~1200-node graph on this driver. Kept for fusion experiments.
-        if std::env::var_os("EDGE0_GRAPH").is_none() {
-            self.enqueue_decode_step(rt)?;
-            let token = rt.read_next_token()?;
-            self.timing.forward_ms += started.elapsed().as_secs_f64() * 1000.0;
-            self.timing.gpu_syncs = rt.ctx.sync_count.load(std::sync::atomic::Ordering::Relaxed);
-            self.position += 1;
-            return Ok(token);
-        }
         if let Some(graph) = &self.decode_graph {
             graph.0.launch().context("decode graph replay")?;
         } else {
-            rt.ctx
-                .stream
-                .begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_GLOBAL,
-                )
-                .context("capture begin")?;
+            crate::gpu::begin_decode_capture(&rt.ctx.stream).context("capture begin")?;
             // prev is advisory: the embed kernel reads next_token, which the
             // previous token's argmax (or prefill) already set on device.
             let _ = prev;
@@ -497,7 +424,6 @@ impl Edge0Text {
     /// argmax -> position bump. Every varying value is device-resident.
     #[cfg(feature = "cuda")]
     fn enqueue_decode_step(&mut self, rt: &crate::gpu::GpuRuntime) -> Result<()> {
-        let layer_timer = std::time::Instant::now();
         let text = self.config.text_config.clone();
         let mut gdn_index = 0usize;
         let mut kv_index = 0usize;
@@ -528,6 +454,7 @@ impl Edge0Text {
                     .get(&format!("{prefix}.linear_attn.out_proj"))
                     .context("out_proj resident")?;
                 rt.gdn_layer_dx(
+                    layer,
                     gdn_index,
                     &crate::gpu::GdnProjections {
                         qkv,
@@ -558,6 +485,7 @@ impl Edge0Text {
                     .context("o resident")?;
                 let rotary_dim = (text.head_dim as f64 * text.rope.partial_rotary_factor) as usize;
                 rt.attn_layer(
+                    layer,
                     kv_index,
                     &crate::gpu::AttnQuants { q, k, v, o_proj: o },
                     &crate::gpu::QkGeom {
@@ -606,13 +534,6 @@ impl Edge0Text {
                 rt.hidden_x1(),
                 text.effective_top_k(),
             )?;
-            if std::env::var_os("EDGE0_LAYER_TIMES").is_some() {
-                rt.ctx.stream.synchronize().ok();
-                eprintln!(
-                    "DBG layer {layer} t {:.2}",
-                    layer_timer.elapsed().as_secs_f64() * 1e3
-                );
-            }
         }
         rt.final_norm()?;
         rt.finalize_token()?;
@@ -661,7 +582,7 @@ impl Edge0Text {
             let attn_out = if text.layer_kind(layer) == LayerKind::LinearAttention {
                 self.gdn_forward(gdn_index, &prefix, &normed)?
             } else {
-                self.full_attention_forward(kv_index, &prefix, &normed, &text)
+                self.full_attention_forward(kv_index, &prefix, &normed, &text)?
             };
             gdn_index += (text.layer_kind(layer) == LayerKind::LinearAttention) as usize;
             kv_index += (text.layer_kind(layer) == LayerKind::FullAttention) as usize;
@@ -680,20 +601,9 @@ impl Edge0Text {
             for (h, m) in hidden.iter_mut().zip(&moe_out) {
                 *h += m;
             }
-            if std::env::var_os("EDGE0_DEBUG_RES").is_some() {
-                let norm = hidden.iter().map(|v| v * v).sum::<f32>().sqrt();
-                println!("cpu layer {layer}: |h| = {norm:.4}");
-            }
-            if std::env::var_os("EDGE0_DEBUG").is_some() {
-                let norm = hidden.iter().map(|v| v * v).sum::<f32>().sqrt();
-                println!("layer {layer}: |h| = {norm:.3}");
-            }
         }
-        // Layer-outer: post-loop norm + zero-init are outer; embed already
-        // measured. Sum into outer_ms.
-        let outer_elapsed = outer_started.elapsed().as_secs_f64() * 1000.0;
+        // Embed time is accounted separately from the layer loop.
         self.timing.outer_ms += embed_done.as_secs_f64() * 1000.0;
-        let _ = outer_elapsed;
         self.timing.forward_ms += started.elapsed().as_secs_f64() * 1000.0;
         #[cfg(feature = "cuda")]
         if let Some(rt) = &self.gpu {
@@ -744,7 +654,7 @@ impl Edge0Text {
         let attn_out = if kind == "gdn" {
             self.gdn_forward(gdn_index, &prefix, &normed)?
         } else {
-            self.full_attention_forward(kv_index, &prefix, &normed, &text)
+            self.full_attention_forward(kv_index, &prefix, &normed, &text)?
         };
         let residual: Vec<f32> = x.iter().zip(&attn_out).map(|(&a, &b)| a + b).collect();
         let moe_in = rms_norm(
@@ -794,21 +704,17 @@ impl Edge0Text {
     }
 
     #[cfg(feature = "cuda")]
-    fn batch_proj(&self, names: &[String], x: &[f32]) -> Option<Vec<Vec<f32>>> {
+    fn batch_proj(&self, names: &[String], x: &[f32]) -> Option<Result<Vec<Vec<f32>>>> {
         let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        self.gpu.as_ref()?.batch_matvec(&refs, x)?.ok()
-    }
-
-    /// Upload static projections to the GPU (gdn/attn projections, router,
-    /// shared experts, embed, lm_head). Experts stay host-side in v1.
-    #[cfg(feature = "cuda")]
-    pub fn moe_trace_summary(&self) -> Option<(usize, crate::gpu::MoeTrace)> {
-        self.gpu.as_ref()?.moe_trace_summary()
+        self.gpu.as_ref()?.batch_matvec(&refs, x)
     }
 
     #[cfg(feature = "cuda")]
-    pub fn batch_trace_summary(&self) -> Option<crate::gpu::BatchTrace> {
-        self.gpu.as_ref().map(|rt| rt.batch_trace_summary())
+    pub fn batch_trace_summary(&self) -> Result<Option<crate::gpu::BatchTrace>> {
+        self.gpu
+            .as_ref()
+            .map(|rt| rt.batch_trace_summary())
+            .transpose()
     }
 
     #[cfg(feature = "cuda")]
@@ -843,7 +749,8 @@ impl Edge0Text {
             // probe. MemAvailable ignores a container's memory ceiling, so
             // the host view is clamped to the cgroup available where one
             // applies (the clamp ff-core's unified-pool helper performs).
-            let snapshot = ff_core::probe::ResourceSnapshot::capture(None);
+            let snapshot =
+                ff_core::probe::ResourceSnapshot::capture(None).context("resource probe failed")?;
             let host_available = snapshot.host_memory_available_bytes.map(|host| {
                 match snapshot.cgroup_v2_memory_available_bytes {
                     Some(cgroup) => host.min(cgroup),
@@ -991,8 +898,8 @@ impl Edge0Text {
                         );
                     }
                     row_p.push(ctx.upload_slice(&packed)?);
-                    row_s.push(ctx.upload_f32(&s)?);
-                    row_b.push(ctx.upload_f32(&b)?);
+                    row_s.push(ctx.stream.clone_htod(&crate::int4::f32_to_bf16_bits(&s))?);
+                    row_b.push(ctx.stream.clone_htod(&crate::int4::f32_to_bf16_bits(&b))?);
                 }
                 stacked.push(row_p.try_into().unwrap());
                 stacked_scales.push(row_s.try_into().unwrap());
@@ -1021,7 +928,192 @@ impl Edge0Text {
             gdn_devices,
             Some(res),
             self.weights.lora_rank,
+            self.config.text_config.num_hidden_layers,
         ));
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn group_key(
+        &self,
+        rt: &crate::gpu::GpuRuntime,
+        binary: &ff_core::identity::BinaryIdentity,
+    ) -> Result<serde_json::Value> {
+        let text = &self.config.text_config;
+        let res = rt.res.as_ref().context("group4 resident state missing")?;
+        let device = rt.ctx.context.ordinal();
+        let fingerprint =
+            ff_core::probe::HardwareFingerprint::collect(&candle_core::Device::new_cuda(device)?)?;
+        let geometry = serde_json::json!({"layers":text.num_hidden_layers,"hidden":text.hidden_size,"heads":text.num_attention_heads,"kv_heads":text.num_key_value_heads,"head_dim":text.head_dim,"vocab":text.vocab_size,"experts":text.num_experts,"top_k":text.effective_top_k(),"moe_intermediate":text.moe_intermediate_size,"shared_intermediate":text.shared_expert_intermediate_size,"lora_rank":self.weights.lora_rank,"gdn":[text.linear_num_key_heads,text.linear_num_value_heads,text.linear_key_head_dim,text.linear_value_head_dim,text.linear_conv_kernel_dim],"layers_kind":(0..text.num_hidden_layers).map(|l|text.layer_kind(l)==LayerKind::LinearAttention).collect::<Vec<_>>()});
+        Ok(
+            serde_json::json!({"adapter":"edge0","device":device,"cols":1,"geometry":geometry,"class":if self.gpu_experts.is_some() {"resident_graph"} else {"host_expert"},"settings":{"max_context":res.max_ctx,"mega":std::env::var_os("EDGE0_MEGA").is_some(),"devices":self.gpu_multi.as_ref().map(|m|m.peers.iter().map(|p|p.ctx.context.ordinal()).collect::<Vec<_>>()).unwrap_or_else(||vec![device])},"fingerprint":fingerprint,"binary":{"schema_version":binary.schema_version,"package_name":binary.package_name,"package_version":binary.package_version,"compiled_features":binary.compiled_features},"image":rt.ctx.group.image()}),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn bind_groups(
+        &mut self,
+        records: &[ff_core::probe::DecodeChoice],
+        binary: &ff_core::identity::BinaryIdentity,
+    ) -> Result<()> {
+        if let Some(rt) = self.gpu.as_ref() {
+            eprintln!(
+                "group4 runtime split: {:?}",
+                (
+                    rt.ctx.context.ordinal(),
+                    0,
+                    self.config.text_config.num_hidden_layers
+                )
+            );
+            let key = self.group_key(rt, binary)?;
+            self.gpu.as_mut().unwrap().ctx.group.apply(&key, records)?;
+        }
+        if let Some(multi) = self.gpu_multi.as_ref() {
+            eprintln!("group4 runtime split: {:?}", multi.ranges);
+            let keys = multi
+                .peers
+                .iter()
+                .map(|rt| self.group_key(rt, binary))
+                .collect::<Result<Vec<_>>>()?;
+            for (rt, key) in self.gpu_multi.as_mut().unwrap().peers.iter_mut().zip(keys) {
+                rt.ctx.group.apply(&key, records)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn forced_group(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|rt| rt.ctx.group.forced())
+            || self
+                .gpu_multi
+                .as_ref()
+                .is_some_and(|m| m.peers[0].ctx.group.forced())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn calibration_records(
+        &self,
+        binary: &ff_core::identity::BinaryIdentity,
+    ) -> Result<Vec<ff_core::probe::DecodeChoice>> {
+        let mut records = Vec::new();
+        let runtimes = if let Some(rt) = &self.gpu {
+            vec![rt]
+        } else {
+            self.gpu_multi
+                .as_ref()
+                .context("group4 runtime missing")?
+                .peers
+                .iter()
+                .collect()
+        };
+        let split = if let Some(m) = &self.gpu_multi {
+            m.peers
+                .iter()
+                .zip(&m.ranges)
+                .map(|(rt, r)| (rt.ctx.context.ordinal(), r.start, r.end, r.end))
+                .collect()
+        } else {
+            vec![(
+                runtimes[0].ctx.context.ordinal(),
+                0,
+                self.config.text_config.num_hidden_layers,
+                self.config.text_config.num_hidden_layers,
+            )]
+        };
+        for rt in runtimes {
+            for mut record in rt.ctx.group.choices() {
+                record.set_key(&self.group_key(rt, binary)?, split.clone())?;
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn calibrate_group(&mut self) -> Result<()> {
+        let mut rt = self
+            .gpu
+            .take()
+            .context("group4 calibration runtime missing")?;
+        let saved_timing = std::mem::take(&mut self.timing);
+        let saved_position = self.position;
+        let stream = rt.ctx.stream.clone();
+        let device = rt.ctx.context.ordinal();
+        let capacity = rt
+            .res
+            .as_ref()
+            .context("group4 calibration resident state missing")?
+            .max_ctx;
+        let started = std::time::Instant::now();
+        let mut graphs = [None, None];
+        if self.gpu_experts.is_some() {
+            for (body, slot) in graphs.iter_mut().enumerate() {
+                rt.ctx.group.capture_body(Some(body))?;
+                rt.reset_probe_state()?;
+                self.position = 0;
+                crate::gpu::begin_decode_capture(&stream)
+                    .context("group4 decode candidate capture begin")?;
+                if let Err(e) = self.enqueue_decode_step(&rt) {
+                    let _ = stream.end_capture(sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
+                    return Err(e.context("group4 decode candidate enqueue"));
+                }
+                *slot = Some(stream.end_capture(sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH).context("group4 decode candidate capture end")?.context("group4 decode candidate graph missing")?);
+            }
+        }
+        let capture_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let runtime = std::cell::RefCell::new(rt);
+        let model = std::cell::RefCell::new(&mut *self);
+        let pending = std::cell::Cell::new(0u32);
+        let choice = crate::gpu::probe_decode(
+            &stream,
+            crate::gpu::DecodeProgram {
+                device,
+                cols: 1,
+                capacity,
+                capture_ms,
+                state_bytes: 0,
+                seed_token: 0,
+                topology: if graphs[0].is_some() {
+                    "resident closed decode graph"
+                } else {
+                    "resident projections; production host-expert step"
+                }
+                .into(),
+            },
+            |body| {
+                let mut rt = runtime.borrow_mut();
+                rt.ctx.group.capture_body(Some(body))?;
+                rt.reset_probe_state()?;
+                model.borrow_mut().position = 0;
+                pending.set(0);
+                Ok(())
+            },
+            |body, repeats| {
+                if let Some(graph) = &graphs[body] {
+                    for _ in 0..repeats {
+                        graph.launch().context("group4 decode candidate replay")?;
+                    }
+                } else {
+                    let rt = runtime.borrow();
+                    let mut model = model.borrow_mut();
+                    for _ in 0..repeats {
+                        model.forward_resident_inner(&rt, pending.get())?;
+                        pending.set(rt.argmax_x1()?);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        let mut rt = runtime.into_inner();
+        rt.ctx.group.bind(choice);
+        rt.ctx.group.capture_body(None)?;
+        rt.reset_probe_state()?;
+        let model = model.into_inner();
+        model.decode_graph = None;
+        model.position = saved_position;
+        model.timing = saved_timing;
+        model.gpu = Some(rt);
         Ok(())
     }
 
@@ -1032,7 +1124,7 @@ impl Edge0Text {
     /// bitwise-identical to `enable_gpu(ordinals[0], experts_resident)`.
     /// `ordinals.len() > 1` builds one `GpuRuntime` per ordinal for its
     /// byte-balanced layer range, verifies the residency plan fits every
-    /// device, and decodes through `forward_multi`/`forward_token_multi`.
+    /// device, and decodes through `forward_multi`/`forward_token`.
     /// Whole-expert residency stays single-device (bails on multiple
     /// ordinals); streamed experts keep their per-layer host round-trip.
     #[cfg(feature = "cuda")]
@@ -1061,7 +1153,7 @@ impl Edge0Text {
             &self.weights,
             &config,
             ordinals,
-            configured_max_ctx(),
+            configured_max_ctx()?,
             &free_bytes,
             experts_resident,
         )?;
@@ -1125,6 +1217,88 @@ impl Edge0Text {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    pub fn calibrate_multi_groups(&mut self) -> Result<()> {
+        let mut multi = self
+            .gpu_multi
+            .take()
+            .context("group4 multi runtime missing")?;
+        let timing = std::mem::take(&mut self.timing);
+        let position = self.position;
+        let devices = multi.peers.len();
+        let capacity = multi
+            .peers
+            .iter()
+            .map(|peer| {
+                peer.res
+                    .as_ref()
+                    .map(|res| res.max_ctx)
+                    .context("group4 multi resident state missing")
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .min()
+            .context("group4 multi peers missing")?;
+        let mut selected = vec![0; devices];
+        for device in 0..devices {
+            let ordinal = multi.peers[device].ctx.context.ordinal();
+            let stream = multi.peers[0].ctx.stream.clone();
+            let runtime = std::cell::RefCell::new(&mut multi);
+            let model = std::cell::RefCell::new(&mut *self);
+            let pending = std::cell::Cell::new(0u32);
+            let choice = crate::gpu::probe_decode(
+                &stream,
+                crate::gpu::DecodeProgram {
+                    device: ordinal,
+                    cols: 1,
+                    capacity,
+                    capture_ms: 0.0,
+                    state_bytes: 0,
+                    seed_token: 0,
+                    topology: "multi-device production host-expert step".into(),
+                },
+                |body| {
+                    let mut multi = runtime.borrow_mut();
+                    for (i, peer) in multi.peers.iter_mut().enumerate() {
+                        peer.ctx.group.capture_body(Some(if i == device {
+                            body
+                        } else {
+                            selected[i]
+                        }))?;
+                        peer.reset_probe_state()?;
+                    }
+                    pending.set(0);
+                    model.borrow_mut().position = 0;
+                    Ok(())
+                },
+                |_, repeats| {
+                    let mut multi = runtime.borrow_mut();
+                    let mut model = model.borrow_mut();
+                    for _ in 0..repeats {
+                        multi.peers[0].embed_into_hidden(pending.get())?;
+                        model.multi_layer_pass(&mut multi)?;
+                        multi.peers[0].final_norm()?;
+                        pending.set(multi.peers[0].argmax_x1()?);
+                        for peer in &multi.peers {
+                            peer.bump_position()?;
+                        }
+                        model.position += 1;
+                    }
+                    Ok(())
+                },
+            )?;
+            selected[device] = runtime.borrow_mut().peers[device].ctx.group.bind(choice);
+        }
+        for peer in &mut multi.peers {
+            peer.reset_probe_state()?;
+            peer.ctx.group.capture_body(None)?;
+        }
+        self.position = position;
+        self.timing = timing;
+        self.gpu_multi = Some(multi);
+        Ok(())
+    }
+
     /// First decode token from the multi-device prefill state (no forward).
     #[cfg(feature = "cuda")]
     pub fn first_token_multi(&mut self) -> Result<u32> {
@@ -1132,13 +1306,9 @@ impl Edge0Text {
         multi.peers[0].argmax_x1()
     }
 
-    /// Multi-device closed decode step: layers + final norm + lm_head +
-    /// argmax + position bump, with `hidden` host-hopping between peers.
-    /// Supports both the harness path (host MoE round-trip) and the
-    /// resident path (on-device `moe_closed` per peer, scoped to that
-    /// peer's layer range).
+    /// Multi-device decode step, with `hidden` host-hopping between peers; harness (host MoE round-trip) and resident (`moe_closed` per peer) paths.
     #[cfg(feature = "cuda")]
-    pub fn forward_token_multi(&mut self, prev: u32) -> Result<u32> {
+    fn forward_token_multi(&mut self, prev: u32) -> Result<u32> {
         let mut multi = self.gpu_multi.take().expect("multi-device runtime");
         if let Some(res) = &multi.peers[0].res {
             anyhow::ensure!(
@@ -1245,6 +1415,7 @@ impl Edge0Text {
                         .get(&format!("{prefix}.linear_attn.out_proj"))
                         .context("out_proj resident")?;
                     multi.peers[peer_index].gdn_layer_dx(
+                        peer_layer,
                         gdn_index_in_peer,
                         &crate::gpu::GdnProjections {
                             qkv,
@@ -1277,6 +1448,7 @@ impl Edge0Text {
                         * self.config.text_config.rope.partial_rotary_factor)
                         as usize;
                     multi.peers[peer_index].attn_layer(
+                        peer_layer,
                         kv_index_in_peer,
                         &crate::gpu::AttnQuants { q, k, v, o_proj: o },
                         &crate::gpu::QkGeom {
@@ -1452,14 +1624,16 @@ impl Edge0Text {
                 .map(|p| format!("{prefix}.linear_attn.in_proj_{p}"))
                 .collect();
             #[cfg(feature = "cuda")]
-            if let Some(mut outs) = self.batch_proj(&names, x) {
-                let a = outs.pop().unwrap();
-                let b = outs.pop().unwrap();
-                let z = outs.pop().unwrap();
-                let q = outs.pop().unwrap();
-                (q, z, b, a)
-            } else {
-                self.proj_matvec_fallback(&names, x)
+            match self.batch_proj(&names, x) {
+                Some(Ok(mut outs)) => {
+                    let a = outs.pop().unwrap();
+                    let b = outs.pop().unwrap();
+                    let z = outs.pop().unwrap();
+                    let q = outs.pop().unwrap();
+                    (q, z, b, a)
+                }
+                Some(Err(e)) => return Err(e.context("GDN input projections failed on GPU")),
+                None => self.proj_matvec_fallback(&names, x),
             }
             #[cfg(not(feature = "cuda"))]
             self.proj_matvec_fallback(&names, x)
@@ -1476,21 +1650,6 @@ impl Edge0Text {
             &statics.norm,
         );
 
-        if std::env::var_os("EDGE0_DEBUG").is_some() {
-            let w = self
-                .weights
-                .quant_projection(&format!("{prefix}.linear_attn.in_proj_qkv"))
-                .unwrap();
-            let r0 = w.row(0);
-            println!("gdn qkv_w row0[:8] {:?}", &r0[..8]);
-            println!("gdn qkv scales row0[:4] {:?}", &w.scales[..4]);
-            println!("gdn qkv biases row0[:4] {:?}", &w.biases[..4]);
-            let packed0: Vec<u32> = w.packed[..4].to_vec();
-            println!("gdn qkv packed words[:4] {packed0:?}");
-            println!("gdn qkv[:6] {:?}", &qkv[..6]);
-            println!("gdn z[:6] {:?}", &z_proj[..6]);
-            println!("gdn a[:6] {:?} b[:6] {:?}", &a_proj[..6], &b_proj[..6]);
-        }
         let state = &mut self.gdn[state_index];
         let mut conv_in = state.conv.clone();
         conv_in.extend_from_slice(&qkv);
@@ -1553,7 +1712,7 @@ impl Edge0Text {
         prefix: &str,
         x: &[f32],
         text: &crate::config::TextConfig,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>> {
         let heads = text.num_attention_heads;
         let kv_heads = text.num_key_value_heads;
         let head_dim = text.head_dim;
@@ -1566,13 +1725,15 @@ impl Edge0Text {
                 .map(|p| format!("{prefix}.self_attn.{p}_proj"))
                 .collect();
             #[cfg(feature = "cuda")]
-            if let Some(mut outs) = self.batch_proj(&names, x) {
-                let v = outs.pop().unwrap();
-                let k = outs.pop().unwrap();
-                let q = outs.pop().unwrap();
-                (q, k, v)
-            } else {
-                self.proj_matvec3_fallback(&names, x)
+            match self.batch_proj(&names, x) {
+                Some(Ok(mut outs)) => {
+                    let v = outs.pop().unwrap();
+                    let k = outs.pop().unwrap();
+                    let q = outs.pop().unwrap();
+                    (q, k, v)
+                }
+                Some(Err(e)) => return Err(e.context("attention projections failed on GPU")),
+                None => self.proj_matvec3_fallback(&names, x),
             }
             #[cfg(not(feature = "cuda"))]
             self.proj_matvec3_fallback(&names, x)
@@ -1611,14 +1772,6 @@ impl Edge0Text {
 
         let mut attn_out = vec![0f32; q_total];
         let scale = 1.0 / (head_dim as f32).sqrt();
-        if std::env::var_os("EDGE0_DEBUG").is_some() {
-            println!("attn q_raw[:6] {:?}", &q_raw[..6]);
-            println!("attn v[:6] {:?}", &v_raw[..6]);
-            println!(
-                "attn k_normed[:6] {:?}",
-                rms_norm(&k_raw[..head_dim], k_norm, text.rms_norm_eps as f32)
-            );
-        }
         for head in 0..heads {
             let kv_head = head / (heads / kv_heads);
             let mut q = query[head * head_dim..(head + 1) * head_dim].to_vec();
@@ -1635,9 +1788,8 @@ impl Edge0Text {
             }
             let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let sum: f32 = scores.iter().map(|s| (s - max).exp()).sum();
-            #[allow(clippy::needless_range_loop)] // step couples scores + kv stride
-            for step in 0..cache.len {
-                let weight = (scores[step] - max).exp() / sum;
+            for (step, score) in scores.iter().enumerate() {
+                let weight = (score - max).exp() / sum;
                 let v = &cache.values[step * kv_stride + kv_head * head_dim..][..head_dim];
                 for (index, out_slot) in attn_out[head * head_dim..(head + 1) * head_dim]
                     .iter_mut()
@@ -1653,7 +1805,7 @@ impl Edge0Text {
         }
         let result = self.proj_matvec(&format!("{prefix}.self_attn.o_proj"), &attn_out);
         self.timing.attn_proj_ms += attn_started.elapsed().as_secs_f64() * 1000.0;
-        result
+        Ok(result)
     }
 
     fn moe_forward(&mut self, layer: usize, prefix: &str, x: &[f32]) -> Result<Vec<f32>> {
@@ -1724,7 +1876,7 @@ impl Edge0Text {
             // gate/up/down + shared gate/up/down, GPU silu) on ONE more
             // sync — the inner never touches the host.
             let dx = rt.ctx.stream.clone_htod(x).expect("moe x upload");
-            let logits = rt.moe_router_dx(layer, router, &dx).expect("router");
+            let logits = rt.moe_router_dx(router, &dx).expect("router");
             let mut order: Vec<usize> = (0..logits.len()).collect();
             order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
             let chosen_vec: Vec<usize> = order[..top_k].to_vec();
@@ -1875,9 +2027,7 @@ fn gdn_head(out: &mut [f32], s: &mut [f32], head: usize, ctx: &GdnHeadCtx) {
     for element in s.iter_mut() {
         *element *= decay;
     }
-    // Row-major SIMD shape: per row, dv contiguous cells take two fmax
-    // passes (kv_mem accumulation, then post-update output accumulation) —
-    // the old column loop walked stride-dv, defeating vectorization.
+    // Each row contributes contiguous value cells before the state update.
     let mut kv_mem = vec![0f32; *dv];
     for row in 0..*dk {
         let kr = k[row];

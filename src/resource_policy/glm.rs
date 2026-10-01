@@ -7,9 +7,9 @@ use crate::{
     runtime::{
         probe::ResourceSnapshot,
         resource_selection::{
-            CandidateDisposition, CapacityShortfall, ResourceCandidateObservation,
-            ResourcePhaseEstimate, ResourcePolicyMode, ResourceSelectionProvenance,
-            SelectedResourceAxis, SelectionOrigin,
+            CandidateDisposition, CapacityShortfall, RESOURCE_SELECTION_SCHEMA_VERSION,
+            ResourceCandidateObservation, ResourcePhaseEstimate, ResourcePolicyMode,
+            ResourceSelectionProvenance, SelectedResourceAxis, SelectionOrigin,
         },
         weights::CachePolicy,
     },
@@ -51,7 +51,6 @@ pub fn axes(policy: &GlmExecutionPolicy) -> Result<BTreeMap<String, String>> {
         "expert_cache.maximum_bound_bytes",
         "expert_cache.minimum_bound_bytes",
         "expert_cache.layout",
-        "expert_cache.replacement",
         "expert_cache.readmission_interval_tokens",
     ] {
         let value = name.split('.').fold(&p, |v, key| &v[key]);
@@ -181,12 +180,12 @@ pub fn select(
             let reserve =
                 crate::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
                     snapshot,
-                );
+                )?;
             let promotion_phases = match breakdown.phases_with_safety(
                 candidate.resident_static,
                 expert_cache,
                 cache,
-                breakdown.scaled_admission_safety_bytes(snapshot),
+                breakdown.scaled_admission_safety_bytes(snapshot)?,
             ) {
                 Ok(phases) => phases,
                 Err(error) => {
@@ -281,7 +280,7 @@ pub fn select(
                 candidate.resident_static,
                 expert_cache,
                 cache,
-                breakdown.scaled_admission_safety_bytes(snapshot),
+                breakdown.scaled_admission_safety_bytes(snapshot)?,
             ) {
                 Ok(phases) => phases,
                 Err(error) => {
@@ -407,7 +406,7 @@ pub fn select(
                             refused: bool|
      -> Result<ResourceSelectionProvenance> {
         Ok(ResourceSelectionProvenance {
-            schema_version: 1,
+            schema_version: RESOURCE_SELECTION_SCHEMA_VERSION,
             policy: serde_json::to_value(policy)?,
             selector_revision: "resource-policy-measured-v1".into(),
             request: context.request.clone(),
@@ -437,7 +436,7 @@ pub fn select(
                 // calibration reader needs the number, not the rule.
                 (
                     "admission_safety_bytes_applied".into(),
-                    breakdown.scaled_admission_safety_bytes(snapshot),
+                    breakdown.scaled_admission_safety_bytes(snapshot)?,
                 ),
                 (
                     "expert_cache_requested_bytes".into(),
@@ -469,13 +468,14 @@ pub fn select(
                 } else {
                     SelectionOrigin::Baseline
                 },
+                inputs: vec![],
             })
             .collect();
         let refusal_phases = breakdown.phases_with_safety(
             baseline.resident_static,
             ExpertCacheBound::from_policy(&baseline.expert_cache)?,
             cache_policy(baseline)?,
-            breakdown.scaled_admission_safety_bytes(snapshot),
+            breakdown.scaled_admission_safety_bytes(snapshot)?,
         )?;
         let provenance =
             build_provenance(baseline, refusal_axes, refusal_phases, observations, true)?;
@@ -499,6 +499,7 @@ pub fn select(
                 axis,
                 value,
                 origin,
+                inputs: vec![],
             }
         })
         .collect();
@@ -506,14 +507,14 @@ pub fn select(
         policy.resident_static,
         ExpertCacheBound::from_policy(&policy.expert_cache)?,
         cache_policy(&policy)?,
-        breakdown.scaled_admission_safety_bytes(snapshot),
+        breakdown.scaled_admission_safety_bytes(snapshot)?,
     )?;
     if policy.weights != baseline.weights {
         for phase in &mut phases {
             phase.host_promotion_reserve_bytes =
                 crate::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
                     snapshot,
-                );
+                )?;
         }
     }
     let provenance = build_provenance(&policy, selected_axes, phases, observations, false)?;
@@ -526,7 +527,7 @@ pub fn select(
 mod tests {
     use super::*;
     use crate::{
-        glm::{ExpertCacheLayout, ExpertCacheReplacementPolicy},
+        glm::ExpertCacheLayout,
         resource_policy::evidence::{EvidenceArtifact, MeasuredCandidate, PairedObservation},
         runtime::{
             probe::{CgroupMemoryLimit, ResourceMeasurementScopes},
@@ -548,7 +549,6 @@ mod tests {
             32,
             ExpertCacheOptions {
                 layout: ExpertCacheLayout::PerLayerSplit,
-                replacement: ExpertCacheReplacementPolicy::Lru,
                 maximum_bound_bytes: 0,
                 minimum_bound_bytes: 0,
                 adaptive: false,
@@ -561,7 +561,7 @@ mod tests {
     }
     fn snapshot() -> ResourceSnapshot {
         ResourceSnapshot {
-            schema_version: 1,
+            schema_version: crate::runtime::probe::RESOURCE_SNAPSHOT_SCHEMA_VERSION,
             measured_at_unix_ms: 1,
             host_memory_available_bytes: Some(8 << 30),
             cgroup_v2_memory_available_bytes: Some(8 << 30),
@@ -569,8 +569,7 @@ mod tests {
             cgroup_v2_memory_current_bytes: Some(0),
             device_free_memory_bytes: None,
             host_device_memory_is_unified: None,
-            device_topology_probe_failed: false,
-            host_memory_total_bytes: None,
+            host_memory_total_bytes: Some(8 << 30),
             device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
@@ -589,7 +588,7 @@ mod tests {
             cpu_fp8_dequantization: false,
             pinned_transfer_bytes: 0,
             pinned_fill_ahead_bytes: 0,
-            concurrent_loads: 0,
+            concurrent_loads: 1,
             static_load_device_bytes: 0,
             expert_load_device_bytes: 0,
             compute_on_host: true,
@@ -779,10 +778,11 @@ mod tests {
         // reserve fits with room to spare.
         let mut unified_snapshot = snapshot();
         unified_snapshot.host_memory_total_bytes = Some(8 << 30);
+        unified_snapshot.device_total_memory_bytes = Some(8 << 30);
         unified_snapshot.device_free_memory_bytes = Some(966_367_640); // 0.9 GiB
         unified_snapshot.host_device_memory_is_unified = Some(true);
         let mut discrete_snapshot = unified_snapshot.clone();
-        discrete_snapshot.host_device_memory_is_unified = None;
+        discrete_snapshot.host_device_memory_is_unified = Some(false);
         discrete_snapshot.device_free_memory_bytes = Some(2 << 30);
 
         let selected = select(

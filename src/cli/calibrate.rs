@@ -269,7 +269,7 @@ pub(super) fn run_calibrate_t2va(command: H3Command) -> Result<()> {
         u64::try_from(policies.len()).context("calibration policy count exceeds u64")?;
 
     let current_exe = std::env::current_exe().context("failed to locate current ff executable")?;
-    let binary_identity = flyingfish::collect_binary_identity(&current_exe)?;
+    let binary_identity = flyingfish::collect_binary_identity()?;
     let model_identity = WeakModelIdentity::collect(&component_dir)?;
     let input_identity = InputIdentity::collect(&inputs)?;
 
@@ -382,8 +382,7 @@ pub(super) fn run_calibrate_t2va_trial() -> Result<()> {
 
 fn execute_trial(request: &TrialWorkerRequest) -> Result<CalibrationTrialResult> {
     request.validate()?;
-    let current_exe = std::env::current_exe().context("failed to locate trial executable")?;
-    let observed_binary_identity = flyingfish::collect_binary_identity(&current_exe)?;
+    let observed_binary_identity = flyingfish::collect_binary_identity()?;
     let component_dir = resolve_component(&request.model, &request.component)?;
     let observed_model_identity = WeakModelIdentity::collect(&component_dir)?;
     let input_bytes = read_bounded_file(
@@ -442,9 +441,10 @@ fn execute_trial(request: &TrialWorkerRequest) -> Result<CalibrationTrialResult>
     let transformer_options = build_transformer_options(device.clone(), &observed_policy)?;
     let transformer = StreamedTransformer::open(&component_dir, transformer_options)?;
 
-    let hardware_fingerprint = HardwareFingerprint::collect(&device);
+    let hardware_fingerprint = HardwareFingerprint::collect(&device)?;
     hardware_fingerprint.validate()?;
-    let resource_snapshot_before = ResourceSnapshot::capture(Some(&device));
+    let resource_snapshot_before =
+        ResourceSnapshot::capture(Some(&device)).context("resource probe failed")?;
     let cache_stats_before = transformer.cache_stats();
     let weight_access_stats_before = transformer.access_stats();
     let process_before = process_wide_io_fault_sample();
@@ -483,7 +483,8 @@ fn execute_trial(request: &TrialWorkerRequest) -> Result<CalibrationTrialResult>
     device.synchronize()?;
     let process_after = process_wide_io_fault_sample();
     let process_wide_io_fault_delta = process_wide_io_fault_delta(&process_before, &process_after);
-    let resource_snapshot_after = ResourceSnapshot::capture(Some(&device));
+    let resource_snapshot_after =
+        ResourceSnapshot::capture(Some(&device)).context("resource probe failed")?;
     let cache_stats_after = transformer.cache_stats();
     let weight_access_stats_after = transformer.access_stats();
     let timings = recorder.finish()?;

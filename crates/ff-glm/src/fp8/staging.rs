@@ -7,15 +7,12 @@ use candle_core::cuda_backend::cudarc::driver::{
 };
 use candle_core::{DType, Storage, Tensor, op::BackpropOp};
 use ff_core::weights::ModelWeights;
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 /// Preserve cudarc's pinned-memory event guard when copying only a prefix.
 struct Prefix<'a, T> {
     data: &'a mut PinnedHostSlice<T>,
-    /// Payload offset after an aligned direct read (`file_offset % 4096`).
+    /// Payload offset within the aligned direct-read span.
     offset: usize,
     len: usize,
 }
@@ -68,12 +65,6 @@ impl Slot {
     }
 }
 
-struct Trace {
-    kind: &'static str,
-    start: CudaEvent,
-    end: CudaEvent,
-}
-
 pub(super) struct Staging {
     stream: Arc<CudaStream>,
     slots: [Option<Slot>; 2],
@@ -81,27 +72,20 @@ pub(super) struct Staging {
     uploads: u64,
     uploaded_bytes: u64,
     slot_allocations: u64,
-    epoch: Option<CudaEvent>,
-    trace: VecDeque<Trace>,
+    read: (usize, Option<usize>),
 }
 
 impl Staging {
-    pub(super) fn new(device: &candle_core::CudaDevice, trace: bool) -> Result<Self> {
+    pub(super) fn new(
+        device: &candle_core::CudaDevice,
+        read: (usize, Option<usize>),
+    ) -> Result<Self> {
         ensure!(
             device.cuda_stream().context().is_event_tracking(),
             "pinned FP8 transfer requires CUDA event tracking"
         );
         let compute = device.cuda_stream();
         let stream = compute.context().new_stream()?;
-        let epoch = if trace {
-            let epoch = device
-                .cuda_stream()
-                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-            stream.wait(&epoch)?;
-            Some(epoch)
-        } else {
-            None
-        };
         Ok(Self {
             stream,
             slots: [None, None],
@@ -109,32 +93,8 @@ impl Staging {
             uploads: 0,
             uploaded_bytes: 0,
             slot_allocations: 0,
-            epoch,
-            trace: VecDeque::new(),
+            read,
         })
-    }
-
-    pub(super) fn begin(&self, stream: &CudaStream) -> Result<Option<CudaEvent>> {
-        self.epoch
-            .as_ref()
-            .map(|_| stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)))
-            .transpose()
-            .map_err(Into::into)
-    }
-    pub(super) fn end(
-        &mut self,
-        kind: &'static str,
-        start: Option<CudaEvent>,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        if let Some(start) = start {
-            let end = stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-            if self.trace.len() == 128 {
-                self.trace.pop_front();
-            }
-            self.trace.push_back(Trace { kind, start, end });
-        }
-        Ok(())
     }
     pub(super) fn bytes(&self) -> u64 {
         self.slots.iter().flatten().map(Slot::bytes).sum::<usize>() as u64
@@ -147,25 +107,14 @@ impl Staging {
             .map_err(Into::into)
     }
 
-    pub(super) fn stats(&self) -> Result<super::Fp8TransferStats> {
-        let mut result = super::Fp8TransferStats {
+    pub(super) fn stats(&self) -> super::Fp8TransferStats {
+        super::Fp8TransferStats {
             uploads: self.uploads,
             uploaded_bytes: self.uploaded_bytes,
             slot_allocations: self.slot_allocations,
             staging_bytes_per_tier: self.slots.iter().flatten().map(Slot::bytes).sum::<usize>()
                 as u64,
-            trace: vec![],
-        };
-        if let Some(epoch) = &self.epoch {
-            for event in &self.trace {
-                result.trace.push(super::Fp8TransferInterval {
-                    kind: event.kind.into(),
-                    start_ms: epoch.elapsed_ms(&event.start)?,
-                    end_ms: epoch.elapsed_ms(&event.end)?,
-                });
-            }
         }
-        Ok(result)
     }
 
     pub(super) fn load(
@@ -190,12 +139,8 @@ impl Staging {
             &meta,
             &mut slot.host_weight,
             &mut slot.host_scales,
+            self.read,
         )?;
-        let start = self
-            .epoch
-            .as_ref()
-            .map(|_| stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)))
-            .transpose()?;
         stream.memcpy_htod(
             &Prefix {
                 data: &mut slot.host_weight,
@@ -212,7 +157,6 @@ impl Staging {
             },
             &mut slot.scales.slice_mut(..meta.scale_count),
         )?;
-        self.end("h2d", start, &stream)?;
         self.dequant_launched(device, dtype, pool, &meta)
     }
 
@@ -292,10 +236,6 @@ impl Staging {
             .uploaded_bytes
             .checked_add((count + meta.scale_count * 4) as u64)
             .context("FP8 transfer byte counter overflow")?;
-        #[cfg(test)]
-        if std::env::var_os("FF_GLM_SYNC_FP8_UPLOAD").is_some() {
-            self.stream.synchronize()?;
-        }
         Ok(Tensor::from_storage(
             Storage::Cuda(output),
             meta.shape.clone(),
@@ -323,11 +263,6 @@ impl Staging {
         let index = self.next;
         self.ensure_slot(index, meta)?;
         let slot = self.slots[index].as_mut().unwrap();
-        let start = self
-            .epoch
-            .as_ref()
-            .map(|_| stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)))
-            .transpose()?;
         stream.memcpy_htod(
             &Prefix {
                 data: &mut buffer.host_weight,
@@ -344,7 +279,6 @@ impl Staging {
             },
             &mut slot.scales.slice_mut(..meta.scale_count),
         )?;
-        self.end("h2d", start, &stream)?;
         let drained = stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
         let tensor = self.dequant_launched(device, dtype, pool, meta)?;
         Ok((tensor, drained))
@@ -464,6 +398,7 @@ pub(crate) fn fill_prepared(
     scale_name: &str,
     dtype: DType,
     buffer: &mut FillBuffer,
+    read: (usize, Option<usize>),
 ) -> Result<FillMeta> {
     super::validate_block_fp8_metadata(weights, name, scale_name, dtype)?;
     let meta = FillMeta::of(weights, name, scale_name)?;
@@ -478,6 +413,7 @@ pub(crate) fn fill_prepared(
         &meta,
         &mut buffer.host_weight,
         &mut buffer.host_scales,
+        read,
     )?;
     Ok(meta)
 }
@@ -492,22 +428,25 @@ fn fill_prepared_into(
     meta: &FillMeta,
     host_weight: &mut PinnedHostSlice<u8>,
     host_scales: &mut PinnedHostSlice<f32>,
+    read: (usize, Option<usize>),
 ) -> Result<u32> {
-    // Prefer positional reads into pinned memory; fall back to the mmap view.
-    let weight_delta = match fill_pinned_from_checkpoint(weights, name, meta.count, host_weight)? {
-        Some(delta) => delta,
-        None => {
-            weights.with_tensor_bytes(name, |bytes| {
-                ensure!(
-                    bytes.len() == meta.count,
-                    "FP8 byte length changed after metadata inspection"
-                );
-                host_weight.as_mut_slice()?[..meta.count].copy_from_slice(bytes);
-                Ok(())
-            })?;
-            0
-        }
-    };
+    // Platforms without positional pinned reads use the mmap view.
+    let weight_delta =
+        match fill_pinned_from_checkpoint(weights, name, meta.count, host_weight, read)? {
+            Some(delta) => delta,
+            None => {
+                weights.with_tensor_bytes(name, |bytes| {
+                    ensure!(
+                        bytes.len() == meta.count,
+                        "FP8 byte length changed after metadata inspection"
+                    );
+                    host_weight.as_mut_slice()?[..meta.count].copy_from_slice(bytes);
+                    Ok(())
+                })?;
+                crate::io_trace::record_fill(crate::io_trace::FillKind::Mmap)?;
+                0
+            }
+        };
     weights.with_tensor_bytes(scale_name, |bytes| {
         ensure!(
             bytes.len() == meta.scale_count * 4,
@@ -533,62 +472,55 @@ fn fill_pinned_from_checkpoint(
     name: &str,
     count: usize,
     host: &mut PinnedHostSlice<u8>,
+    read: (usize, Option<usize>),
 ) -> Result<Option<u32>> {
-    let metadata = match weights.raw_tensor_metadata(name) {
-        Ok(metadata) => metadata,
-        Err(_) => return Ok(None),
-    };
-    if metadata.bytes != count {
-        return Ok(None);
-    }
+    let metadata = weights.raw_tensor_metadata(name)?;
+    ensure!(
+        metadata.bytes == count,
+        "FP8 checkpoint byte length changed for {name}"
+    );
     let path = weights.root().join(&metadata.shard);
     let base = metadata.file_offset as u64;
     #[cfg(target_os = "linux")]
-    if direct_fill_enabled()
-        && let Ok(Some(delta)) = fill_direct(&path, base, count, host)
+    if direct_fill_enabled()?
+        && let Some(delta) = fill_direct(&path, base, count, host, read)?
     {
+        crate::io_trace::record_fill(crate::io_trace::FillKind::Direct)?;
         return Ok(Some(delta));
     }
-    // Limit readers to roughly one per 2 MiB.
-    let readers = pinned_fill_threads().min((count / (2 << 20)).max(1));
-    // A shard that moved or failed to reopen leaves the retained mapping usable,
-    // so report it as unavailable rather than aborting the load.
-    if ff_core::storage::read_parallel_into(
-        ff_core::storage::ParallelReadSource::Reopen(&path),
-        base,
-        &mut host.as_mut_slice()?[..count],
-        readers,
-    )
-    .is_err()
-    {
-        return Ok(None);
-    }
+    crate::model::read_buffered(&path, base, &mut host.as_mut_slice()?[..count], read)
+        .with_context(|| format!("buffered pinned fill failed for {name}"))?;
+    crate::io_trace::record_fill(crate::io_trace::FillKind::Buffered)?;
     Ok(Some(0))
 }
 
-/// Read a 4 KiB-aligned span with O_DIRECT, returning its payload offset.
-/// An uncovered tail returns `Ok(None)`; failures also trigger buffered fallback.
+/// Read a system-aligned span with O_DIRECT, returning its payload offset.
+/// An uncovered aligned span returns `Ok(None)` before reading.
 #[cfg(target_os = "linux")]
 fn fill_direct(
     path: &std::path::Path,
     base: u64,
     count: usize,
     host: &mut PinnedHostSlice<u8>,
+    read: (usize, Option<usize>),
 ) -> Result<Option<u32>> {
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
-    const ALIGN: u64 = DIRECT_FILL_ALIGN;
-    let aligned_base = base & !(ALIGN - 1);
-    let delta = u32::try_from(base - aligned_base).expect("direct fill delta is below 4096");
-    let mut span = (delta as usize + count).next_multiple_of(ALIGN as usize);
+    let Some(alignment) = read.1 else {
+        return Ok(None);
+    };
+    let alignment = u64::try_from(alignment)?;
+    let aligned_base = base & !(alignment - 1);
+    let delta = u32::try_from(base - aligned_base).context("direct fill offset exceeds u32")?;
+    let mut span = (delta as usize + count).next_multiple_of(alignment as usize);
     let pointer = host.as_mut_ptr()? as usize;
-    if !pointer.is_multiple_of(ALIGN as usize) || span > host.len() {
+    if !pointer.is_multiple_of(alignment as usize) || span > host.len() {
         return Ok(None);
     }
     // Use buffered reads if the payload extends beyond the aligned file end.
     let file_bytes = std::fs::metadata(path)
         .with_context(|| format!("failed to stat FP8 checkpoint shard {}", path.display()))?
         .len();
-    let aligned_file_end = file_bytes & !(ALIGN - 1);
+    let aligned_file_end = file_bytes & !(alignment - 1);
     if aligned_base + span as u64 > aligned_file_end {
         if base + count as u64 > aligned_file_end {
             return Ok(None);
@@ -596,8 +528,8 @@ fn fill_direct(
         span = usize::try_from(aligned_file_end - aligned_base)
             .context("direct fill span no longer covers its payload")?;
     }
-    let readers = pinned_fill_threads().min((span / (2 << 20)).max(1));
-    let chunk = span.div_ceil(readers).next_multiple_of(ALIGN as usize);
+    let chunk = crate::model::reader_chunk(span, read.0, read.1);
+    let readers = span.div_ceil(chunk);
     std::thread::scope(|scope| -> Result<()> {
         let mut handles = Vec::new();
         for reader in 0..readers {
@@ -625,7 +557,7 @@ fn fill_direct(
                     ensure!(read > 0, "checkpoint shard ended mid-tensor");
                     // Keep the next read offset sector-aligned after a short read.
                     ensure!(
-                        read.is_multiple_of(ALIGN as usize),
+                        read.is_multiple_of(alignment as usize),
                         "direct read returned {read} unaligned bytes"
                     );
                     offset += read;
@@ -643,32 +575,28 @@ fn fill_direct(
     Ok(Some(delta))
 }
 
-/// FF_GLM_DIRECT_FILL=0 disables direct reads; failures fall back to buffered I/O.
+/// FF_GLM_DIRECT_FILL=1 enables direct reads for covered aligned spans.
 #[cfg(target_os = "linux")]
-fn direct_fill_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !std::env::var("FF_GLM_DIRECT_FILL").is_ok_and(|v| v == "0"))
+fn direct_fill_enabled() -> Result<bool> {
+    static ENABLED: std::sync::OnceLock<std::result::Result<usize, String>> =
+        std::sync::OnceLock::new();
+    Ok(ff_core::probe::cached_env_usize(&ENABLED, "FF_GLM_DIRECT_FILL", 0, 0, 1)? == 1)
 }
 
 /// Whether direct fills are enabled, allowing device page warming to be skipped.
 #[cfg(target_os = "linux")]
-pub(crate) fn direct_fill_active() -> bool {
+pub(crate) fn direct_fill_active() -> Result<bool> {
     direct_fill_enabled()
 }
 
 /// Other platforms use buffered reads and benefit from page warming.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn direct_fill_active() -> bool {
-    false
+pub(crate) fn direct_fill_active() -> Result<bool> {
+    Ok(false)
 }
 
-/// Padding for up to one alignment block before and after the payload.
-const DIRECT_FILL_SLACK: usize = 8192;
-
-/// Alignment for O_DIRECT buffer addresses, offsets and read lengths.
-const DIRECT_FILL_ALIGN: u64 = 4096;
-
-const _: () = assert!(DIRECT_FILL_SLACK as u64 >= 2 * DIRECT_FILL_ALIGN);
+/// Direct spans that exceed this reserved padding use buffered reads.
+const DIRECT_FILL_SLACK: usize = super::PINNED_FILL_PADDING_BYTES;
 
 #[cfg(not(unix))]
 fn fill_pinned_from_checkpoint(
@@ -676,17 +604,9 @@ fn fill_pinned_from_checkpoint(
     _name: &str,
     _count: usize,
     _host: &mut PinnedHostSlice<u8>,
+    _read: (usize, Option<usize>),
 ) -> Result<Option<u32>> {
     Ok(None)
-}
-
-/// Readers filling one pinned buffer (`FF_GLM_PINNED_FILL_THREADS`, default 4).
-fn pinned_fill_threads() -> usize {
-    std::env::var("FF_GLM_PINNED_FILL_THREADS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(4)
-        .max(1)
 }
 
 impl Drop for Staging {

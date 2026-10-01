@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce the checked-in Qwen GELU PTX with pinned NVRTC 13.0."""
+"""Reproduce the checked-in GELU PTX with pinned NVRTC 13.0."""
 
 from __future__ import annotations
 

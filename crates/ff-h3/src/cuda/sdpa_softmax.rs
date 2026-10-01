@@ -10,7 +10,7 @@
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp1, Layout, Shape, Tensor};
 
-const CUDA_MODULE: &str = "flyingfish_h3_sdpa_softmax_pytorch_7269437";
+const CUDA_MODULE: &str = "flyingfish_softmax_pytorch_7269437";
 
 pub(crate) const BACKEND: &str =
     "pytorch-persistent-softmax-f32-1..2048@7269437d655783a26cba32aa88195b741ff496aa/compute_80";
@@ -81,10 +81,10 @@ impl CustomOp1 for H3SdpaSoftmaxF32 {
         let input = input.slice(layout.start_offset()..);
         let mut output = unsafe { device.alloc::<f32>(elements) }?;
         let log2 = usize::BITS - (width - 1).leading_zeros();
-        let function_name = format!("h3_sdpa_softmax_f32_log2_{log2}");
+        let function_name = format!("softmax_persistent_f32_log2_{log2}");
         let function = crate::cuda::kernel_assets::load_function(
             &device,
-            &crate::cuda::kernel_assets::H3_SDPA_SOFTMAX_F32,
+            &crate::cuda::kernel_assets::SOFTMAX_F32,
             CUDA_MODULE,
             &function_name,
         )?;
@@ -166,10 +166,10 @@ impl CustomOp1 for RegularSoftmaxF32 {
         let input = input.as_cuda_slice::<f32>()?;
         let input = input.slice(layout.start_offset()..);
         let mut output = unsafe { device.alloc::<f32>(elements) }?;
-        let function_name = format!("qwen_softmax_regular_f32_reg_{register_count}");
+        let function_name = format!("softmax_regular_f32_reg_{register_count}");
         let function = crate::cuda::kernel_assets::load_function(
             &device,
-            &crate::cuda::kernel_assets::H3_SDPA_SOFTMAX_F32,
+            &crate::cuda::kernel_assets::SOFTMAX_F32,
             CUDA_MODULE,
             &function_name,
         )?;

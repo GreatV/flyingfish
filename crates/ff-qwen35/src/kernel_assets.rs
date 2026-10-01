@@ -3,13 +3,23 @@
 pub(crate) use ff_edge0::kernel_assets::{Cubin, KernelAssets};
 
 include!(concat!(env!("OUT_DIR"), "/cuda_kernel_manifest.rs"));
+include!(concat!(env!("OUT_DIR"), "/int4_gemv_wide_defines.rs"));
+include!(concat!(env!("OUT_DIR"), "/mma_defines.rs"));
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ff_edge0::kernel_assets::ImageSelection;
 
-    const ALL: [&KernelAssets; 2] = [&QWEN_BATCH2, &WIDE_GEMV];
+    const ALL: [&KernelAssets; 7] = [
+        &QWEN_BATCH2,
+        &INT4_GEMV_WIDE,
+        &GEMV16,
+        &PREFILL_ROWS,
+        &MMA,
+        &GDN_PREFILL,
+        &ATTN_PREFILL,
+    ];
 
     #[test]
     fn every_kernel_carries_the_portable_baseline() {

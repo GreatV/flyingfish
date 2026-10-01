@@ -1,7 +1,4 @@
-use super::{
-    expert_cache::ExpertCacheReplacementPolicy, expert_cache_manager::ExpertCacheLayout,
-    routing_trace::RoutingModelFamily,
-};
+use super::{expert_cache_manager::ExpertCacheLayout, routing_trace::RoutingModelFamily};
 use anyhow::{Context, Result, ensure};
 use candle_core::Device;
 use ff_core::weights::{CacheGranularity, CachePolicy, WeightSource};
@@ -76,18 +73,17 @@ pub struct GlmHostWeightPolicy {
 /// the entry unit is not selectable.
 pub struct ExpertCacheOptions {
     pub layout: ExpertCacheLayout,
-    pub replacement: ExpertCacheReplacementPolicy,
     pub maximum_bound_bytes: usize,
     pub minimum_bound_bytes: usize,
     pub adaptive: bool,
 }
 
+/// The recorded expert-cache policy. Unknown keys are ignored so policies
+/// recorded before the replacement choice was removed still parse.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GlmExpertCacheExecutionPolicy {
     pub entry_unit: GlmExpertCacheEntryUnit,
     pub layout: ExpertCacheLayout,
-    pub replacement: ExpertCacheReplacementPolicy,
     pub maximum_bound_bytes: u64,
     pub minimum_bound_bytes: u64,
     #[serde(deserialize_with = "crate::required_option")]
@@ -104,15 +100,7 @@ pub struct GlmExecutionPolicy {
     pub prefill_math: GlmPrefillMath,
     pub normalization_math: GlmNormalizationMath,
     pub routing_math: GlmRoutingMath,
-    /// The share of each routed miss set evaluated on the host rather than
-    /// moved to the device, in parts per thousand.
-    ///
-    /// Recorded because it changes which arithmetic ran, not merely where: the
-    /// host path sums an expert in F32 through the fused block-FP8 matvec while
-    /// the device path runs its own GEMM over dequantized weights. Per mille
-    /// rather than a float so the policy stays exactly comparable. Zero, the
-    /// default, means every expert went to the device and the policy describes
-    /// the same execution it always did.
+    /// Records whether host or device arithmetic converted FP8 weights.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub host_expert_share_per_mille: u32,
     pub cpu_fp8_dequantization: bool,
@@ -145,7 +133,6 @@ impl GlmExecutionPolicy {
     ) -> Result<Self> {
         let ExpertCacheOptions {
             layout,
-            replacement,
             maximum_bound_bytes,
             minimum_bound_bytes,
             adaptive,
@@ -189,7 +176,6 @@ impl GlmExecutionPolicy {
             expert_cache: GlmExpertCacheExecutionPolicy {
                 entry_unit: GlmExpertCacheEntryUnit::DequantizedProjectionTensor,
                 layout,
-                replacement,
                 maximum_bound_bytes: u64::try_from(maximum_bound_bytes)
                     .context("GLM expert-cache maximum exceeds u64")?,
                 minimum_bound_bytes: u64::try_from(minimum_bound_bytes)
@@ -312,7 +298,6 @@ mod tests {
             2_048,
             ExpertCacheOptions {
                 layout: ExpertCacheLayout::SharedPool,
-                replacement: ExpertCacheReplacementPolicy::Lfu,
                 maximum_bound_bytes: 4_096,
                 minimum_bound_bytes: if adaptive { 1_024 } else { 4_096 },
                 adaptive,
@@ -346,13 +331,13 @@ mod tests {
     }
 
     #[test]
-    fn canonical_policy_preserves_cache_topology_replacement_and_bounds() {
+    fn canonical_policy_preserves_cache_topology_and_bounds() {
         let first = policy(true);
         let json = first.canonical_json().unwrap();
         assert_eq!(GlmExecutionPolicy::from_json(&json).unwrap(), first);
         assert_eq!(
             String::from_utf8(json).unwrap(),
-            r#"{"schema_version":8,"model_family":"glm5_next","execution_profile":"text_only_exact_dsa_short_context","activation_math":"f32_silu_and_sigmoid_then_input_dtype_cast_v1","prefill_math":"layer_batched_kda64_grouped_experts_v1","normalization_math":"cpu_tensor_cuda_torch_ordered_v1","routing_math":"cpu_score_sorted_cuda_threshold_scan_v1","cpu_fp8_dequantization":true,"backend":"cpu","resident_static":false,"dsa_context_bound_tokens":2048,"admission_safety_bytes":1073741824,"weights":{"source":"mmap","cache_shards":1,"cache_bytes":null},"expert_cache":{"entry_unit":"dequantized_projection_tensor","layout":"shared_pool","replacement":"lfu","maximum_bound_bytes":4096,"minimum_bound_bytes":1024,"readmission_interval_tokens":1}}"#
+            r#"{"schema_version":8,"model_family":"glm5_next","execution_profile":"text_only_exact_dsa_short_context","activation_math":"f32_silu_and_sigmoid_then_input_dtype_cast_v1","prefill_math":"layer_batched_kda64_grouped_experts_v1","normalization_math":"cpu_tensor_cuda_torch_ordered_v1","routing_math":"cpu_score_sorted_cuda_threshold_scan_v1","cpu_fp8_dequantization":true,"backend":"cpu","resident_static":false,"dsa_context_bound_tokens":2048,"admission_safety_bytes":1073741824,"weights":{"source":"mmap","cache_shards":1,"cache_bytes":null},"expert_cache":{"entry_unit":"dequantized_projection_tensor","layout":"shared_pool","maximum_bound_bytes":4096,"minimum_bound_bytes":1024,"readmission_interval_tokens":1}}"#
         );
         let mut changed = first.clone();
         changed.expert_cache.maximum_bound_bytes += 1;
@@ -362,12 +347,6 @@ mod tests {
         );
         let mut changed = first.clone();
         changed.expert_cache.layout = ExpertCacheLayout::PerLayerSplit;
-        assert_ne!(
-            first.canonical_json().unwrap(),
-            changed.canonical_json().unwrap()
-        );
-        let mut changed = first.clone();
-        changed.expert_cache.replacement = ExpertCacheReplacementPolicy::Lru;
         assert_ne!(
             first.canonical_json().unwrap(),
             changed.canonical_json().unwrap()
@@ -474,9 +453,7 @@ mod tests {
             missing.as_object_mut().unwrap().remove(field);
             assert!(GlmExecutionPolicy::from_json(&serde_json::to_vec(&missing).unwrap()).is_err());
         }
-        // The PTX digest keys these policies once carried are no longer
-        // tolerated on the way in: the format migrated in one step rather than
-        // keeping a parallel path for records that name a digest.
+        // Policies reject removed digest fields.
         for legacy_field in ["cuda_normalization_ptx_sha256", "cuda_fp8_ptx_sha256"] {
             let mut legacy: serde_json::Value = serde_json::from_slice(&json).unwrap();
             legacy[legacy_field] = serde_json::json!("a legacy digest");

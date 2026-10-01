@@ -1,86 +1,50 @@
 //! Mmap-backed tensor access for the Edge0 checkpoint.
 
 use crate::int4::{GROUP_SIZE, GroupQuant, bf16_to_f32};
-use anyhow::{Context, Result, ensure};
-use memmap2::Mmap;
-use safetensors::SafeTensors;
+use anyhow::{Result, ensure};
+use ff_core::weights::{CachePolicy, ModelWeights, WeightSource};
+use safetensors::Dtype;
 use std::collections::HashMap;
-use std::{fs::File, path::Path};
+use std::path::Path;
 
 /// Whole stacked expert tensor: packed payload + scales/biases + geometry.
 pub type StackedProjection = (Vec<u32>, Vec<f32>, Vec<f32>, usize, usize);
 
-struct Shard {
-    _map: Mmap,
-    tensors: SafeTensors<'static>,
-}
-
-impl Shard {
-    fn open(path: &Path) -> Result<Self> {
-        let map = unsafe { Mmap::map(&File::open(path)?) }?;
-        let bytes: &'static [u8] = unsafe { std::mem::transmute(&map[..]) };
-        Ok(Self {
-            _map: map,
-            tensors: SafeTensors::deserialize(bytes)?,
-        })
-    }
-}
-
 pub struct Edge0Weights {
-    shards: Vec<Shard>,
-    index: HashMap<String, usize>,
+    weights: ModelWeights,
     lora: HashMap<String, (Vec<f32>, Vec<f32>)>,
     pub lora_rank: usize,
 }
 
 const LORA_FILE: &str = "lora_edge0_35b.safetensors";
 
+fn open_source(root: &Path, file: Option<&str>) -> Result<ModelWeights> {
+    let policy = CachePolicy::unbounded_units();
+    match file {
+        Some(file) => ModelWeights::open_component(root, file, WeightSource::Mmap, policy),
+        None => ModelWeights::open(root, WeightSource::Mmap, policy),
+    }
+}
+
 impl Edge0Weights {
     pub fn open(model_dir: &Path) -> Result<Self> {
-        let mut shard_paths: Vec<_> = std::fs::read_dir(model_dir)?
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("model-") && n.ends_with(".safetensors"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        shard_paths.sort();
-        ensure!(
-            !shard_paths.is_empty(),
-            "no model-*.safetensors under {}",
-            model_dir.display()
-        );
-        let mut shards = Vec::new();
-        let mut index = HashMap::new();
-        for (position, path) in shard_paths.iter().enumerate() {
-            let shard =
-                Shard::open(path).with_context(|| format!("failed to mmap {}", path.display()))?;
-            for name in shard.tensors.names() {
-                index.insert(name.to_string(), position);
-            }
-            shards.push(shard);
-        }
+        let weights = open_source(model_dir, None)?;
         let mut lora = HashMap::new();
         let mut lora_rank = 0usize;
-        let lora_path = model_dir.join(LORA_FILE);
-        if lora_path.is_file() {
-            let map = unsafe { Mmap::map(&File::open(&lora_path)?) }?;
-            let bytes: &'static [u8] = unsafe { std::mem::transmute(&map[..]) };
-            let view = SafeTensors::deserialize(bytes)?;
+        if model_dir.join(LORA_FILE).is_file() {
+            let adapter = open_source(model_dir, Some(LORA_FILE))?;
             let mut pairs: HashMap<String, (Vec<f32>, Vec<f32>)> = HashMap::new();
             let mut pair_rank: HashMap<String, usize> = HashMap::new();
-            for name in view.names() {
+            for name in adapter.tensor_names() {
                 let base = name.rsplit_once(".lora_").map(|(b, _)| b.to_string());
                 let Some(base) = base else { continue };
-                let tensor = view.tensor(name)?;
+                let shape = adapter.raw_tensor_metadata(name)?.shape;
                 let is_a = name.ends_with("lora_A");
-                let values = f16_to_f32(tensor.data());
+                let values = adapter.with_tensor_bytes(name, |data| Ok(f16_to_f32(data)))?;
                 let rank = if is_a {
-                    values.len() / tensor.shape()[1]
+                    values.len() / shape[1]
                 } else {
-                    tensor.shape()[1]
+                    shape[1]
                 };
                 if let Some(prev) = pair_rank.insert(base.clone(), rank) {
                     anyhow::ensure!(
@@ -97,8 +61,7 @@ impl Edge0Weights {
                     entry.1 = values;
                 }
             }
-            // The kernels take one rank per launch — verify uniform instead
-            // of the old silent global-max.
+            // All adapter pairs must have the same rank.
             for (base, (a, b)) in &pairs {
                 anyhow::ensure!(
                     !a.is_empty() && !b.is_empty(),
@@ -118,56 +81,35 @@ impl Edge0Weights {
             lora = pairs;
         }
         Ok(Self {
-            shards,
-            index,
+            weights,
             lora,
             lora_rank,
         })
     }
 
     pub fn lora_for(&self, projection: &str) -> Option<(&[f32], &[f32], usize)> {
-        if let Some(skip) = std::env::var_os("EDGE0_SKIP_LORA") {
-            let skip = skip.to_string_lossy();
-            if skip
-                .split(',')
-                .any(|p| !p.is_empty() && projection.contains(p))
-            {
-                return None;
-            }
-        }
         self.lora
             .get(projection)
             .map(|(a, b)| (a.as_slice(), b.as_slice(), self.lora_rank))
     }
 
-    fn view(&self, name: &str) -> Result<safetensors::tensor::TensorView<'static>> {
-        let shard = self
-            .index
-            .get(name)
-            .and_then(|position| self.shards.get(*position))
-            .with_context(|| format!("tensor {name} not found"))?;
-        shard
-            .tensors
-            .tensor(name)
-            .with_context(|| format!("failed to view {name}"))
-    }
-
     pub fn has(&self, name: &str) -> bool {
-        self.index.contains_key(name)
+        self.weights.contains(name)
     }
 
     pub fn f32_named(&self, name: &str) -> Result<Vec<f32>> {
-        let tensor = self.view(name)?;
-        let data = tensor.data();
-        Ok(match tensor.dtype() {
-            safetensors::Dtype::BF16 => bf16_to_f32(data),
-            safetensors::Dtype::F16 => f16_to_f32(data),
-            other => anyhow::bail!("tensor {name} is {other:?}, expected bf16/f16"),
+        let dtype = self.weights.raw_tensor_metadata(name)?.dtype;
+        self.weights.with_tensor_bytes(name, |data| {
+            Ok(match dtype {
+                Dtype::BF16 => bf16_to_f32(data),
+                Dtype::F16 => f16_to_f32(data),
+                other => anyhow::bail!("tensor {name} is {other:?}, expected bf16/f16"),
+            })
         })
     }
 
     pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
-        Ok(self.view(name)?.shape().to_vec())
+        Ok(self.weights.raw_tensor_metadata(name)?.shape)
     }
 
     /// Weighed (not derived) weight bytes by bucket: experts, static, and
@@ -177,18 +119,8 @@ impl Edge0Weights {
         let mut expert = (0u64, 0u64);
         let mut statik = (0u64, 0u64);
         let mut embed = (0u64, 0u64);
-        for name in self.index.keys() {
-            let tensor = self.view(name)?;
-            let dtype_size = match tensor.dtype() {
-                safetensors::Dtype::U32 | safetensors::Dtype::F32 => 4,
-                safetensors::Dtype::BF16
-                | safetensors::Dtype::F16
-                | safetensors::Dtype::I16
-                | safetensors::Dtype::U16 => 2,
-                safetensors::Dtype::U8 | safetensors::Dtype::I8 => 1,
-                other => anyhow::bail!("unexpected dtype {other:?} for {name}"),
-            };
-            let bytes: u64 = tensor.shape().iter().map(|d| *d as u64).product::<u64>() * dtype_size;
+        for name in self.weights.tensor_names() {
+            let bytes = self.weights.raw_tensor_metadata(name)?.bytes as u64;
             let is_sb = name.ends_with(".scales") || name.ends_with(".biases");
             let bucket = if name.contains(".switch_mlp.") {
                 &mut expert
@@ -210,8 +142,9 @@ impl Edge0Weights {
     /// and `{projection}.biases`. The width (4 or 8 bits) is derived from
     /// the scales shape, which pins the true input dimension.
     pub fn quant_projection(&self, projection: &str) -> Result<GroupQuant> {
-        let weight = self.view(&format!("{projection}.weight"))?;
-        let shape = weight.shape();
+        let weight_name = format!("{projection}.weight");
+        let meta = self.weights.raw_tensor_metadata(&weight_name)?;
+        let shape = meta.shape;
         ensure!(
             shape.len() == 2,
             "{projection}.weight is not 2-D: {shape:?}"
@@ -232,7 +165,14 @@ impl Edge0Weights {
                 shape[1]
             )
         };
-        let packed = packed_words(&weight)?;
+        ensure!(
+            meta.dtype == Dtype::U32,
+            "expected U32 payload, got {:?}",
+            meta.dtype
+        );
+        let packed = self
+            .weights
+            .with_tensor_bytes(&weight_name, |data| Ok(le_words(data)))?;
         GroupQuant::new(packed, scales, biases, out_dim, in_dim, bits)
     }
 
@@ -241,17 +181,22 @@ impl Edge0Weights {
     /// kernel's base+expert-index addressing needs whole-tensor residency.
     pub fn stacked_projection(&self, layer: usize, projection: &str) -> Result<StackedProjection> {
         let name = format!("language_model.model.layers.{layer}.mlp.switch_mlp.{projection}");
-        let weight = self.view(&format!("{name}.weight"))?;
-        let scales = self.view(&format!("{name}.scales"))?;
-        let biases = self.view(&format!("{name}.biases"))?;
-        let shape = weight.shape();
+        let weight_name = format!("{name}.weight");
+        let shape = self.weights.raw_tensor_metadata(&weight_name)?.shape;
         ensure!(shape.len() == 3, "{name}.weight is not stacked: {shape:?}");
         let rows = shape[1];
         let in_dim = shape[2] * 8;
-        let packed = le_words(weight.data());
-        let s = bf16_to_f32(scales.data());
-        let b = bf16_to_f32(biases.data());
+        let packed = self
+            .weights
+            .with_tensor_bytes(&weight_name, |data| Ok(le_words(data)))?;
+        let s = self.bf16_named(&format!("{name}.scales"))?;
+        let b = self.bf16_named(&format!("{name}.biases"))?;
         Ok((packed, s, b, rows, in_dim))
+    }
+
+    fn bf16_named(&self, name: &str) -> Result<Vec<f32>> {
+        self.weights
+            .with_tensor_bytes(name, |data| Ok(bf16_to_f32(data)))
     }
 
     /// Load one expert's projection from the stacked `switch_mlp` tensor.
@@ -262,10 +207,8 @@ impl Edge0Weights {
         projection: &str,
     ) -> Result<GroupQuant> {
         let name = format!("language_model.model.layers.{layer}.mlp.switch_mlp.{projection}");
-        let weight = self.view(&format!("{name}.weight"))?;
-        let scales = self.view(&format!("{name}.scales"))?;
-        let biases = self.view(&format!("{name}.biases"))?;
-        let shape = weight.shape();
+        let weight_name = format!("{name}.weight");
+        let shape = self.weights.raw_tensor_metadata(&weight_name)?.shape;
         ensure!(shape.len() == 3, "{name}.weight is not stacked: {shape:?}");
         ensure!(
             expert < shape[0],
@@ -278,25 +221,31 @@ impl Edge0Weights {
         let groups = in_dim / GROUP_SIZE;
 
         let word_bytes = rows * packed_cols * 4;
-        let payload = weight.data();
         let offset = expert * word_bytes;
-        let words = le_words(&payload[offset..offset + word_bytes]);
-
-        let slice_bf16 = |view: &safetensors::tensor::TensorView<'static>| -> Result<Vec<f32>> {
-            let raw = view.data();
-            let start = expert * rows * groups * 2;
-            let end = start + rows * groups * 2;
+        let words = self.weights.with_tensor_bytes(&weight_name, |payload| {
             ensure!(
-                end <= raw.len(),
-                "{name}.scales/biases too short for expert {expert}: need {end} bytes, have {}",
-                raw.len()
+                offset + word_bytes <= payload.len(),
+                "{weight_name}: expert {expert} lies past the payload"
             );
-            Ok(bf16_to_f32(&raw[start..end]))
+            Ok(le_words(&payload[offset..offset + word_bytes]))
+        })?;
+
+        let slice_bf16 = |tensor: &str| -> Result<Vec<f32>> {
+            self.weights.with_tensor_bytes(tensor, |raw| {
+                let start = expert * rows * groups * 2;
+                let end = start + rows * groups * 2;
+                ensure!(
+                    end <= raw.len(),
+                    "{tensor} too short for expert {expert}: need {end} bytes, have {}",
+                    raw.len()
+                );
+                Ok(bf16_to_f32(&raw[start..end]))
+            })
         };
         GroupQuant::new(
             words,
-            slice_bf16(&scales)?,
-            slice_bf16(&biases)?,
+            slice_bf16(&format!("{name}.scales"))?,
+            slice_bf16(&format!("{name}.biases"))?,
             rows,
             in_dim,
             4,
@@ -320,11 +269,143 @@ fn le_words(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-fn packed_words(view: &safetensors::tensor::TensorView<'static>) -> Result<Vec<u32>> {
-    ensure!(
-        view.dtype() == safetensors::Dtype::U32,
-        "expected U32 payload, got {:?}",
-        view.dtype()
-    );
-    Ok(le_words(view.data()))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use safetensors::tensor::TensorView;
+
+    const DENSE: &str = "language_model.model.layers.0.self_attn.q_proj";
+
+    fn words(count: usize) -> Vec<u8> {
+        (0..count as u32)
+            .flat_map(|w| w.wrapping_mul(2654435761).to_le_bytes())
+            .collect()
+    }
+
+    fn halves(count: usize, one: u16) -> Vec<u8> {
+        (0..count as u16)
+            .flat_map(|v| (one + v).to_le_bytes())
+            .collect()
+    }
+
+    fn write(path: &Path, tensors: &[(&str, Dtype, Vec<usize>, Vec<u8>)]) {
+        let views: Vec<_> = tensors
+            .iter()
+            .map(|(name, dtype, shape, data)| {
+                (*name, TensorView::new(*dtype, shape.clone(), data).unwrap())
+            })
+            .collect();
+        safetensors::serialize_to_file(views, None, path).unwrap();
+    }
+
+    fn fixture(dir: &Path) -> Vec<(&'static str, Dtype, Vec<usize>, Vec<u8>)> {
+        let tensors = vec![
+            (
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight",
+                Dtype::U32,
+                vec![2, 3, 8],
+                words(48),
+            ),
+            (
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales",
+                Dtype::BF16,
+                vec![2, 3, 1],
+                halves(6, 0x3f80),
+            ),
+            (
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases",
+                Dtype::BF16,
+                vec![2, 3, 1],
+                halves(6, 0x3e80),
+            ),
+            (
+                "language_model.model.layers.0.self_attn.q_proj.weight",
+                Dtype::U32,
+                vec![3, 8],
+                words(24),
+            ),
+            (
+                "language_model.model.layers.0.self_attn.q_proj.scales",
+                Dtype::BF16,
+                vec![3, 1],
+                halves(3, 0x3f80),
+            ),
+            (
+                "language_model.model.layers.0.self_attn.q_proj.biases",
+                Dtype::BF16,
+                vec![3, 1],
+                halves(3, 0x3e80),
+            ),
+        ];
+        write(&dir.join("model-00001-of-00001.safetensors"), &tensors);
+        let map: serde_json::Map<String, serde_json::Value> = tensors
+            .iter()
+            .map(|(name, ..)| (name.to_string(), "model-00001-of-00001.safetensors".into()))
+            .collect();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {"total_size": 0},
+                "weight_map": map,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write(
+            &dir.join(LORA_FILE),
+            &[
+                ("proj.lora_A", Dtype::F16, vec![2, 4], halves(8, 0x3c00)),
+                ("proj.lora_B", Dtype::F16, vec![3, 2], halves(6, 0x3c00)),
+            ],
+        );
+        tensors
+    }
+
+    #[test]
+    fn shared_traversal_yields_the_tensors_of_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = fixture(dir.path());
+        let weights = Edge0Weights::open(dir.path()).unwrap();
+        for (name, dtype, shape, data) in &tensors {
+            assert!(weights.has(name), "{name}");
+            assert_eq!(&weights.shape(name).unwrap(), shape, "{name}");
+            let meta = weights.weights.raw_tensor_metadata(name).unwrap();
+            assert_eq!(meta.dtype, *dtype, "{name}");
+            let bytes = weights
+                .weights
+                .with_tensor_bytes(name, |bytes| Ok(bytes.to_vec()))
+                .unwrap();
+            assert_eq!(&bytes, data, "{name}");
+        }
+        let total: u64 = tensors.iter().map(|t| t.3.len() as u64).sum();
+        let (ep, es, sp, ss, hp, hs) = weights.bucket_bytes().unwrap();
+        assert_eq!(ep + es + sp + ss + hp + hs, total);
+
+        let stacked = weights.stacked_projection(0, "gate_proj").unwrap();
+        assert_eq!(stacked.0, le_words(&tensors[0].3));
+        assert_eq!((stacked.3, stacked.4), (3, 64));
+        assert_eq!(stacked.1, bf16_to_f32(&tensors[1].3));
+        assert_eq!(stacked.2, bf16_to_f32(&tensors[2].3));
+
+        let expert = weights.quant_expert(0, 1, "gate_proj").unwrap();
+        assert_eq!(expert.packed, le_words(&tensors[0].3[96..]));
+        assert_eq!(expert.scales, bf16_to_f32(&tensors[1].3[6..]));
+        assert_eq!(expert.biases, bf16_to_f32(&tensors[2].3[6..]));
+        assert!(weights.quant_expert(0, 2, "gate_proj").is_err());
+
+        let dense = weights.quant_projection(DENSE).unwrap();
+        assert_eq!(dense.packed, le_words(&tensors[3].3));
+        assert_eq!(weights.lora_rank, 2);
+        let (a, b, rank) = weights.lora_for("proj").unwrap();
+        assert_eq!((a.len(), b.len(), rank), (8, 6, 2));
+    }
+
+    #[test]
+    fn a_missing_tensor_names_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let weights = Edge0Weights::open(dir.path()).unwrap();
+        let error = weights.shape("absent.weight").unwrap_err();
+        assert!(format!("{error:#}").contains("absent.weight"));
+    }
 }

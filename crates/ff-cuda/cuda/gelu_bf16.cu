@@ -26,7 +26,7 @@ __device__ __forceinline__ BFloat16Bits float_to_bf16(float value) {
   return result;
 }
 
-extern "C" __global__ void qwen_gelu_tanh_bf16(
+extern "C" __global__ void gelu_tanh_bf16(
     int elements,
     const BFloat16Bits* __restrict__ input,
     BFloat16Bits* __restrict__ output) {
@@ -43,7 +43,7 @@ extern "C" __global__ void qwen_gelu_tanh_bf16(
   }
 }
 
-extern "C" __global__ void qwen_gelu_erf_bf16(
+extern "C" __global__ void gelu_erf_bf16(
     int elements,
     const BFloat16Bits* __restrict__ input,
     BFloat16Bits* __restrict__ output) {

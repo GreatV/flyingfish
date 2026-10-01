@@ -1,53 +1,23 @@
 # Third-party notices
 
-`crates/ff-music/src/` contains Rust adaptations of the MiniMax Music3 model
-and pipeline algorithms in Hugging Face Diffusers.
+`crates/ff-music/src/` contains Rust adaptations of the MiniMax Music3 model and pipeline algorithms in Hugging Face Diffusers.
 Copyright 2026 The MiniMax Team and The HuggingFace Team. All rights reserved.
-These adaptations change the execution backend to Candle and stream projection
-weights; they retain the upstream Apache-2.0 license, included in [LICENSE](LICENSE).
+These adaptations change the execution backend to Candle and stream projection weights; they retain the upstream Apache-2.0 license, included in [LICENSE](LICENSE).
 
-`crates/ff-minicpm/src/dspark.rs` adapts the DSpark/DFlash architecture and
-verification contract from [SGLang](https://github.com/sgl-project/sglang),
-Copyright 2023-2024 SGLang Team, under Apache-2.0. The implementation uses
-Candle projections and a local KV cache instead of SGLang's execution runtime.
+`crates/ff-minicpm/src/dspark.rs` adapts the DSpark/DFlash architecture and verification contract from [SGLang](https://github.com/sgl-project/sglang), Copyright 2023-2024 SGLang Team, under Apache-2.0. The implementation uses Candle projections and a local KV cache instead of SGLang's execution runtime.
 
-The CLIP dual-encoder implementation follows Transformers'
-CLIP architecture, Copyright 2021 The OpenAI Team Authors and The HuggingFace
-Team, under Apache-2.0. The Rust vision path streams weights through Candle.
+The CLIP dual-encoder implementation follows Transformers' CLIP architecture, Copyright 2021 The OpenAI Team Authors and The HuggingFace Team, under Apache-2.0. The Rust vision path streams weights through Candle.
 
-The DINOv2/DINOv3 conditioners follow the Transformers implementations under
-Apache-2.0. DINOv2: Copyright 2024 Meta Inc. and the HuggingFace Inc. team.
-DINOv3: Copyright 2025 Meta AI and The HuggingFace Inc. team. All rights reserved.
-Downloaded pretrained DINO weights retain their original model licenses and
-are not redistributed in this repository.
+The DINOv2/DINOv3 conditioners follow the Transformers implementations under Apache-2.0. DINOv2: Copyright 2024 Meta Inc. and the HuggingFace Inc. team. DINOv3: Copyright 2025 Meta AI and The HuggingFace Inc. team. All rights reserved. Downloaded pretrained DINO weights retain their original model licenses and are not redistributed in this repository.
 
-The following Flyingfish sources contain specialized transcriptions of CUDA
-algorithms from PyTorch:
+The following Flyingfish sources contain specialized transcriptions of CUDA algorithms from PyTorch:
 
-- `src/cuda/h3_rms_norm_bf16.cu`, from
-  `aten/src/ATen/native/cuda/layer_norm_kernel.cu` and
-  `aten/src/ATen/native/cuda/thread_constants.h`;
-- `src/cuda/h3_sdpa_softmax_f32.cu`, from
-  `aten/src/ATen/native/cuda/PersistentSoftmax.cuh` and
-  `aten/src/ATen/native/cuda/SoftMax.cu`, including the block reduction order
-  defined by `aten/src/ATen/native/cuda/block_reduce.cuh`;
-- `src/cuda/qwen_layer_norm_bf16.cu`, from
-  `aten/src/ATen/native/cuda/layer_norm_kernel.cu`,
-  `aten/src/ATen/native/cuda/thread_constants.h`, and
-  `c10/cuda/CUDAMathCompat.h`;
-- `src/cuda/qwen_gelu_bf16.cu`, from
-  `aten/src/ATen/native/cuda/ActivationGeluKernel.cu` and
-  `c10/cuda/CUDAMathCompat.h`; the checked-in
-  `src/cuda/qwen_gelu_bf16_nvrtc130.ptx` is generated from that transcription
-  by `scripts/compile-qwen-gelu-nvrtc.py` because the pinned official Torch
-  wheel's CUDA 13.0 `erf` implementation is part of the numerical contract;
-- `src/cuda/qwen_attention_scale_bf16.cu`, from
-  `aten/src/ATen/native/cuda/BinaryMulKernel.cu` and
-  `aten/src/ATen/native/cuda/Loops.cuh`;
-- `src/cuda/qwen_head_mean_f32.cu`, from
-  `aten/src/ATen/native/cuda/ReduceMomentKernel.cu`,
-  `aten/src/ATen/native/cuda/Reduce.cuh`, and
-  `aten/src/ATen/native/SharedReduceOps.h`.
+- `crates/ff-cuda/cuda/rms_norm_bf16.cu`, from `aten/src/ATen/native/cuda/layer_norm_kernel.cu` and `aten/src/ATen/native/cuda/thread_constants.h`;
+- `crates/ff-cuda/cuda/softmax_f32.cu`, from `aten/src/ATen/native/cuda/PersistentSoftmax.cuh` and `aten/src/ATen/native/cuda/SoftMax.cu`, including the block reduction order defined by `aten/src/ATen/native/cuda/block_reduce.cuh`;
+- `crates/ff-cuda/cuda/layer_norm_bf16.cu`, from `aten/src/ATen/native/cuda/layer_norm_kernel.cu`, `aten/src/ATen/native/cuda/thread_constants.h`, and `c10/cuda/CUDAMathCompat.h`;
+- `crates/ff-cuda/cuda/gelu_bf16.cu`, from `aten/src/ATen/native/cuda/ActivationGeluKernel.cu` and `c10/cuda/CUDAMathCompat.h`; the checked-in `crates/ff-cuda/cuda/gelu_bf16_nvrtc130.ptx` is generated from that transcription by `scripts/compile-gelu-nvrtc.py` because the pinned official Torch wheel's CUDA 13.0 `erf` implementation is part of the numerical contract;
+- `crates/ff-cuda/cuda/scale_bf16.cu`, from `aten/src/ATen/native/cuda/BinaryMulKernel.cu` and `aten/src/ATen/native/cuda/Loops.cuh`;
+- `crates/ff-cuda/cuda/mean_f32.cu`, from `aten/src/ATen/native/cuda/ReduceMomentKernel.cu`, `aten/src/ATen/native/cuda/Reduce.cuh`, and `aten/src/ATen/native/SharedReduceOps.h`.
 
 PyTorch's BSD-style license notice follows.
 
@@ -138,25 +108,9 @@ CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
 
-## NVIDIA CUDA and cuDNN runtime libraries
-
-The CUDA execution paths dynamically use external NVIDIA runtime libraries,
-including cuBLAS, cuBLASLt, and cuDNN. These binary libraries are not source
-files in this repository and are not relicensed under Flyingfish's Apache-2.0
-license or PyTorch's BSD-style license. Their use and any redistribution of a
-binary or container that includes them remain governed by NVIDIA's applicable
-[CUDA Toolkit EULA](https://docs.nvidia.com/cuda/eula/) and
-[cuDNN Software License Agreement](https://docs.nvidia.com/deeplearning/cudnn/latest/reference/eula.html).
-The cuDNN agreement identifies runtime `.so` and `.dll` files as distributable
-under that agreement; distributors must independently satisfy its current
-conditions.
-
 ## TRELLIS and TRELLIS.2
 
-The sparse operators, flow models, Gaussian decoding and dual-grid mesh/VAEs
-in `crates/ff-trellis` are Rust adaptations of Microsoft TRELLIS and TRELLIS.2.
-The implementation changes the execution backend to Candle, uses bounded
-im2col/attention work, and exposes local PLY output. Upstream's MIT notice follows.
+The sparse operators, flow models, Gaussian decoding and dual-grid mesh/VAEs in `crates/ff-trellis` are Rust adaptations of Microsoft TRELLIS and TRELLIS.2. The implementation changes the execution backend to Candle, uses bounded im2col/attention work, and exposes local PLY output. Upstream's MIT notice follows.
 
 ```text
 MIT License
@@ -182,19 +136,5 @@ MIT License
     SOFTWARE
 ```
 
-`third_party/candle-kernels/` is a vendored copy of `candle-kernels` 0.11.0
-from the Candle project, redirected into this workspace through
-`[patch.crates-io]`.
-Copyright (c) 2023 Hugging Face. Licensed under MIT OR Apache-2.0; this
-workspace uses it under Apache-2.0, the same licence it carries here.
-
-Local changes:
-
-- `src/compatibility.cuh` guards the pre-Ampere `__hmax_nan` and `__hmin_nan` definitions with `CUDA_VERSION < 12060` and includes `<cuda.h>`. CUDA 12.6 and later already supply these intrinsics.
-- `build.rs` enables MSVC's conforming preprocessor for PTX and static CUDA kernel builds, as required by CUDA 13.3's CCCL headers.
-
-Compiled from a single path, so that nvcc's file-derived symbol prefixes and
-embedded `__FILE__` strings are held constant, the compatibility-header change made all twelve kernels emit
-byte-identical PTX at `compute_89` before and after the change. At
-`compute_75` the upstream copy compiles two of twelve and the vendored copy
-compiles twelve.
+`third_party/candle-kernels/` is a vendored copy of `candle-kernels` 0.11.0 from the Candle project, redirected into this workspace through `[patch.crates-io]`.
+Copyright (c) 2023 Hugging Face. Licensed under MIT OR Apache-2.0; this workspace uses it under Apache-2.0, the same licence it carries here.

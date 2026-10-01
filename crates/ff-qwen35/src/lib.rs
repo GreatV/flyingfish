@@ -2,10 +2,16 @@
 
 pub mod config;
 #[cfg(feature = "cuda")]
+pub mod gemv16;
+#[cfg(feature = "cuda")]
 pub mod gpu;
 #[cfg(feature = "cuda")]
 pub mod kernel_assets;
+#[cfg(feature = "cuda")]
+pub mod mma;
 pub mod model;
+#[cfg(feature = "cuda")]
+pub mod prefill;
 #[cfg(feature = "cuda")]
 pub mod spec;
 pub mod vision;

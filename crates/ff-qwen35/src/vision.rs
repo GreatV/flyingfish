@@ -508,7 +508,7 @@ impl VisionTower {
         let device = Device::Cpu;
         let mut tensors = BTreeMap::new();
         let mut load = |name: &str| -> Result<()> {
-            let (shape, values) = weights.bf16_tensor(name)?;
+            let (shape, values) = weights.tensor_f32(name)?;
             tensors.insert(name.to_string(), Tensor::from_vec(values, shape, &device)?);
             Ok(())
         };
@@ -876,7 +876,7 @@ mod tests {
     /// at the bf16 rounding floor class (measured margins, not bit-exact).
     #[test]
     fn tower_matches_hf_fixture() {
-        let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4") else {
+        let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4-rtn") else {
             return;
         };
         let dir = &dir;

@@ -18,47 +18,17 @@ use flyingfish::runtime::resource_selection::SelectionOrigin;
 use flyingfish::runtime::weights::{
     CachePolicy, DeviceCache, DeviceCachePolicy, ModelWeights, WeightSource,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// Headroom the residency ladder leaves free on the device for activations,
-/// workspaces and allocator slack: the shared admission-reserve shape (5% of
-/// the pool total, capped at 1 GiB), so small and unified pools are not
-/// over-reserved — a 24 GiB discrete card keeps the historical flat 1 GiB
-/// exactly.
-///
-/// A declared margin, not a measured requirement. Adapters add known request
-/// allocations separately. Runtime cache demotion can recover weight-load
-/// allocation failures; this margin does not guarantee that every activation
-/// allocation will fit.
-pub(crate) fn device_residency_reserve_bytes(
-    snapshot: &flyingfish::runtime::probe::ResourceSnapshot,
-) -> u64 {
-    let total = if snapshot.host_device_memory_is_unified == Some(true) {
-        [
-            snapshot.host_pool_total_bytes(),
-            snapshot.device_total_memory_bytes,
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-    } else {
-        snapshot.device_total_memory_bytes
-    };
-    // The free-view fallback below is for legacy recorded snapshots only: a
-    // live capture produces the device total and free together (both come
-    // from the same CUDA device handle).
-    flyingfish::runtime::probe::admission_reserve_bytes(total.or(snapshot.device_free_memory_bytes))
+/// Device headroom for activations, workspace and allocator slack; request tensor allocations are charged separately.
+pub(crate) fn device_residency_reserve_bytes(snapshot: &ResourceSnapshot) -> Result<u64> {
+    Ok(flyingfish::runtime::probe::admission_reserve_bytes(Some(
+        snapshot.pool_total(true)?,
+    )))
 }
 
-/// Default CUDA placement for adapters with request tensor estimates. Explicit
-/// ceilings (including zero) and non-CUDA devices keep their existing behavior.
-/// `required_device_bytes` is one caller's device charge and is multiplied by
-/// `unified_share`, the number of callers drawing from this pool.
-/// `unified_host_bytes` is already the total across every concurrent host
-/// allocation, because those exist per caller whether or not the caller shares
-/// this pool — the two counts differ and only the caller knows the second. All
-/// of it applies under the fold alone.
+/// Default CUDA placement includes per-caller device charges and the aggregate shared host charge; explicit ceilings take precedence.
 pub(crate) fn decide_auto_residency_with_required_memory(
     demands: &[flyingfish::runtime::residency::PhaseResidencyDemand],
     device: &candle_core::Device,
@@ -78,23 +48,16 @@ pub(crate) fn decide_auto_residency_with_required_memory(
             unified_share,
         );
     }
-    let snapshot = ResourceSnapshot::capture(Some(device));
+    let snapshot = ResourceSnapshot::capture(Some(device)).context("resource probe failed")?;
     // Each concurrent caller needs its own fixed margin, but only where the
     // pool is actually shared; a discrete device owes nothing to the others.
     let shared = snapshot.unified_pool_available_bytes().is_some();
     let share = if shared { unified_share.max(1) } else { 1 };
     let reserve = required_device_bytes
         .saturating_mul(share)
-        .checked_add(device_residency_reserve_bytes(&snapshot).saturating_mul(share))
+        .checked_add(device_residency_reserve_bytes(&snapshot)?.saturating_mul(share))
         .context("device residency reserve overflow")?;
-    let capacity = if snapshot.unified_accounting_is_undecidable() {
-        0
-    } else {
-        snapshot
-            .unified_pool_available_bytes()
-            .or(snapshot.device_free_memory_bytes)
-            .unwrap_or(0)
-    };
+    let capacity = snapshot.device_capacity()?;
     let reserve = if shared {
         reserve
             .checked_add(unified_host_bytes)
@@ -129,10 +92,10 @@ pub(crate) fn decide_residency_with_required_memory(
     unified_share: u64,
 ) -> Result<DeviceCache> {
     use flyingfish::runtime::{probe::ResourceSnapshot, residency::decide_device_residency};
-    let snapshot = ResourceSnapshot::capture(Some(device));
+    let snapshot = ResourceSnapshot::capture(Some(device)).context("resource probe failed")?;
     let shared = snapshot.unified_pool_available_bytes().is_some();
     let share = if shared { unified_share.max(1) } else { 1 };
-    let reserve = device_residency_reserve_bytes(&snapshot)
+    let reserve = device_residency_reserve_bytes(&snapshot)?
         .saturating_mul(share)
         .checked_add(required_device_bytes.saturating_mul(share))
         .context("device residency reserve overflow")?;
@@ -175,6 +138,7 @@ pub(crate) fn decide_residency_with_required_memory(
 }
 
 pub(super) struct H3ResourceRequest<'a> {
+    pub model: &'a Path,
     pub component: &'a Path,
     pub device: &'a Device,
     pub baseline: &'a ExecutionPolicy,
@@ -186,6 +150,7 @@ pub(super) struct H3ResourceRequest<'a> {
     pub resources: &'a H3ResourceArgs,
     pub weights: OptionalWeightCacheArgs,
     pub locked_origin: Option<SelectionOrigin>,
+    pub derived_axes: &'a BTreeMap<String, Vec<String>>,
     pub resident_input_bytes: u64,
     pub additional_host_allowance_bytes: u64,
     pub request: serde_json::Value,
@@ -213,16 +178,15 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
     };
     let mut context =
         EvidenceContext::collect(request.component, request.device, request.request.clone())?;
-    let cold_components = vec![request.component.to_owned()];
     let cache_preparation = if request.resources.resource_cold_cache {
-        let observed =
-            flyingfish::resource_policy::prepare_cold_cache_components(&cold_components)?;
+        let observed = flyingfish::resource_policy::prepare_cold_cache_model(request.model)?;
         context.cache_state = flyingfish::resource_policy::evidence::CacheState::Cold;
         Some(observed)
     } else {
         None
     };
-    let snapshot = ResourceSnapshot::capture(Some(request.device));
+    let snapshot =
+        ResourceSnapshot::capture(Some(request.device)).context("resource probe failed")?;
     let budget = super::generate::probed_budget(
         &snapshot,
         request.baseline.execution_backend,
@@ -302,7 +266,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
             "weights.host_phase_priority",
         ),
     ] {
-        if present {
+        if present && !request.derived_axes.contains_key(axis) {
             explicit.insert(axis.to_owned());
         }
     }
@@ -318,6 +282,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         context: &context,
         mode: request.resources.resource_policy,
         explicit_axes: &explicit,
+        derived_axes: request.derived_axes,
         evidence: evidence.as_ref().map(|(record, _)| record),
         locked_origin: request.locked_origin,
         resident_input_bytes: request.resident_input_bytes,
@@ -329,7 +294,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         additional_host_allowance_bytes: request
             .additional_host_allowance_bytes
             .checked_add(if unified {
-                device_residency_reserve_bytes(&snapshot)
+                device_residency_reserve_bytes(&snapshot)?
             } else {
                 0
             })
@@ -341,7 +306,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
     let headroom_bytes = if unified {
         0
     } else {
-        device_residency_reserve_bytes(&snapshot)
+        device_residency_reserve_bytes(&snapshot)?
     };
     let automatic_cache = flyingfish::resource_policy::h3::automatic_device_cache(
         &selection_request,
@@ -378,14 +343,14 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
             // reserve: the phase type invariant rejects the combination, and
             // the sizing already accounted the headroom against the pool.
             if phase.required_device_bytes.is_some() {
-                phase.device_reserve_bytes = device_residency_reserve_bytes(&snapshot);
+                phase.device_reserve_bytes = device_residency_reserve_bytes(&snapshot)?;
             }
         }
     }
-    selection.provenance.workload.insert(
-        "identity_component_count".into(),
-        cold_components.len() as u64,
-    );
+    selection
+        .provenance
+        .workload
+        .insert("identity_component_count".into(), 1);
     if let Some(cache) = cache_preparation {
         selection
             .provenance
@@ -400,7 +365,8 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
             .workload
             .insert("cold_cache_resident_pages".into(), cache.resident_pages);
     }
-    let final_observation = ResourceSnapshot::capture(Some(request.device));
+    let final_observation =
+        ResourceSnapshot::capture(Some(request.device)).context("resource probe failed")?;
     let final_budget = super::generate::probed_budget(
         &final_observation,
         selection.policy.execution_backend,
@@ -565,7 +531,8 @@ pub(super) fn validate_recorded_selection(path: &Path, policy: &ExecutionPolicy)
     )?;
     let record = flyingfish::runtime::resource_selection::ResourceSelectionProvenance::from_json(
         &bytes.bytes,
-    )?;
+    )
+    .with_context(|| format!("resource selection record {}", path.display()))?;
     anyhow::ensure!(
         !record.is_refusal(),
         "recorded resource selection at {} is a refusal record, not an admitted selection",
@@ -629,12 +596,12 @@ mod tests {
         .unwrap();
         validate_recorded_selection(&path, &policy).unwrap();
         let recorded_policy = serde_json::to_value(&policy).unwrap();
-        let record = serde_json::json!({"schema_version":1,"policy":recorded_policy,"selector_revision":"test",
+        let record = serde_json::json!({"schema_version":2,"policy":recorded_policy,"selector_revision":"test",
             "request":{"command":"test"},"model":{"component":"transformer"},"mode":"performance",
-            "selection_snapshot":ResourceSnapshot::capture(None),"final_admission_snapshot":null,
+            "selection_snapshot":ResourceSnapshot::capture(None).unwrap(),"final_admission_snapshot":null,
             "already_present_at_capture":["metadata"],"inventory":{"shards":[{"name":"a.safetensors","file_bytes":8,"header_bytes":8,"selected_tensor_bytes":0,"selected_tensor_count":1,"largest_tensor_bytes":0}]},
             "phases":[{"phase":"denoise","required_host_bytes":1,"optional_host_bytes":0,"host_promotion_reserve_bytes":0,"required_device_bytes":null,"optional_device_bytes":null,"device_reserve_bytes":0}],
-            "axes":[{"axis":"weights.source","value":"mmap","origin":"baseline"}],
+            "axes":[{"axis":"weights.source","value":"mmap","origin":"baseline","inputs":[]}],
             "candidates":[{"candidate_id":"baseline","disposition":"selected","reason":"test","expected_cost":null,"evidence":[]}]});
         std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         validate_recorded_selection(&path, &policy).unwrap();

@@ -28,9 +28,7 @@ pub mod recovery;
 pub mod resource_policy;
 
 /// Bind the application's identity rather than the collecting dependency's.
-pub fn collect_binary_identity(
-    path: &std::path::Path,
-) -> anyhow::Result<runtime::identity::BinaryIdentity> {
+pub fn collect_binary_identity() -> anyhow::Result<runtime::identity::BinaryIdentity> {
     let mut features = Vec::new();
     if cfg!(feature = "cuda") {
         features.push("cuda");
@@ -42,7 +40,6 @@ pub fn collect_binary_identity(
         features.push("metal");
     }
     runtime::identity::BinaryIdentity::collect(
-        path,
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
         &features,

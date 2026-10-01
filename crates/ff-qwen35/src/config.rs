@@ -1,16 +1,10 @@
-//! Qwen3.8-27B (dense `qwen3_5`) checkpoint configuration.
-//!
-//! Verified against `models/Qwen/Qwen3.8-27B/config.json` and the shard
-//! index on 2026-09-17. The checkpoint is all BF16 — quantization is OURS
-//! (offline requant, groupwise affine int4, group 64, the edge0 byte
-//! layout).
+//! Dense Qwen3.8-27B configuration; affine int4 requantization uses groups of 64.
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::{fs, path::Path};
 
 pub const QWEN35_ARCHITECTURE: &str = "Qwen3_5ForConditionalGeneration";
-pub const QWEN35_TEXT_MODEL_TYPE: &str = "qwen3_5_text";
 
 /// `quantization.format` value the requantizer stamps into config.json; the
 /// upstream BF16 checkpoint shares the architecture but lacks this marker.
@@ -18,9 +12,6 @@ pub const QUANTIZATION_FORMAT: &str = "groupwise-int4-u32";
 
 /// Tensor prefix differs from Edge0: `model.language_model.layers.N.*`.
 pub const TEXT_PREFIX: &str = "model.language_model";
-
-pub const REQUANT_GROUP_SIZE: usize = 64;
-pub const REQUANT_BITS: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]

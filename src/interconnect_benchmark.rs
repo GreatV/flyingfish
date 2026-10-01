@@ -3,10 +3,7 @@
 //! "Local" here means the interconnects inside one machine — device-to-device,
 //! pinned host staging and TCP loopback — as opposed to a LAN.
 //!
-//! The legacy payload-driven I/O calibration remains schema 1 in
-//! `io_calibration`.  This module owns a separate closed schema because its
-//! fixed H3 cut and GLM expert geometries are not interchangeable with an
-//! arbitrary sequential file payload.
+//! Sequential payload calibration has a separate format in `io_calibration`.
 
 use crate::{
     glm::{
@@ -33,7 +30,7 @@ use std::{
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaContext, CudaSlice};
 
-pub const LOCAL_IO_BENCHMARK_SCHEMA_VERSION: u32 = 1;
+pub const LOCAL_IO_BENCHMARK_SCHEMA_VERSION: u32 = 3;
 pub const H3_STANDARD_BLOCK_CUT_BYTES: u64 = 405_468_672;
 pub const H3_STANDARD_BLOCK_CUT_ROWS: usize = 37_711;
 pub const H3_HIDDEN_SIZE: usize = 5_376;
@@ -523,11 +520,44 @@ impl ElapsedStatistics {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ReaderMeasurement {
+    pub prefetch: usize,
+    pub fill: usize,
+    pub series: BandwidthSeries,
+    pub cpu_percent: Vec<f64>,
+}
+
+fn choose_readers(measurements: &[ReaderMeasurement], prefetch: bool) -> Result<usize> {
+    let group = measurements
+        .iter()
+        .filter(|row| (row.prefetch > 0) == prefetch)
+        .collect::<Vec<_>>();
+    let best = group
+        .iter()
+        .min_by_key(|row| row.series.statistics.median_elapsed_ns)
+        .context("reader calibration has no candidates")?;
+    let best = &best.series.statistics;
+    group
+        .iter()
+        .filter(|row| {
+            let range = &row.series.statistics;
+            range.minimum_elapsed_ns <= best.maximum_elapsed_ns
+                && range.maximum_elapsed_ns >= best.minimum_elapsed_ns
+        })
+        .map(|row| if prefetch { row.prefetch } else { row.fill })
+        .min()
+        .context("reader calibration has no overlapping range")
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlmExpertMeasurements {
     pub geometry: GlmExpertGeometry,
     pub pinned_host_to_device_b_p: BandwidthSeries,
     pub host_evaluation_b_h: ExpertEvaluationSeries,
     pub b_p_over_b_h: f64,
+    pub reader_sweeps: Vec<ReaderMeasurement>,
+    pub reader_counts: [usize; 2],
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -535,15 +565,16 @@ pub struct GlmExpertMeasurements {
 pub struct LocalIoBenchmarkReport {
     pub schema_version: u32,
     pub measured_at_unix_ms: u64,
-    pub model_root: String,
-    pub model_config: FileStamp,
+    pub model_root: Option<String>,
+    pub model_config: Option<FileStamp>,
     pub primary_cuda_ordinal: u32,
     pub visible_cuda_devices: u32,
     pub fingerprint: HardwareFingerprint,
     pub warmup_iterations: u32,
     pub sample_iterations: u32,
-    pub h3_standard_block_cut: H3CutMeasurements,
-    pub glm_routed_expert: GlmExpertMeasurements,
+    pub h3_standard_block_cut: Option<H3CutMeasurements>,
+    pub glm_routed_expert: Option<GlmExpertMeasurements>,
+    pub group4: Vec<crate::runtime::probe::DecodeChoice>,
 }
 
 impl LocalIoBenchmarkReport {
@@ -552,8 +583,17 @@ impl LocalIoBenchmarkReport {
             !bytes.is_empty() && bytes.len() <= MAX_LOCAL_IO_REPORT_BYTES,
             "local I/O benchmark JSON must contain 1..={MAX_LOCAL_IO_REPORT_BYTES} bytes"
         );
-        let report: Self =
+        let value: serde_json::Value =
             serde_json::from_slice(bytes).context("invalid local I/O benchmark JSON")?;
+        ensure!(
+            value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(LOCAL_IO_BENCHMARK_SCHEMA_VERSION.into()),
+            "unsupported local I/O benchmark schema; rerun ff bench io --profile local-interconnect"
+        );
+        let report: Self =
+            serde_json::from_value(value).context("invalid local I/O benchmark JSON")?;
         report.validate()?;
         Ok(report)
     }
@@ -561,14 +601,30 @@ impl LocalIoBenchmarkReport {
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.schema_version == LOCAL_IO_BENCHMARK_SCHEMA_VERSION,
-            "unsupported local I/O benchmark schema {}; this build supports {LOCAL_IO_BENCHMARK_SCHEMA_VERSION}",
+            "unsupported local I/O benchmark schema {}; rerun ff bench io --profile local-interconnect for schema {LOCAL_IO_BENCHMARK_SCHEMA_VERSION}",
             self.schema_version
         );
         ensure!(
-            self.measured_at_unix_ms > 0 && !self.model_root.trim().is_empty(),
-            "local I/O report is missing its timestamp or model root"
+            self.measured_at_unix_ms > 0,
+            "host profile has no measurement time"
         );
-        self.model_config.validate()?;
+        ensure!(
+            self.model_root.is_some() == self.model_config.is_some()
+                && self.model_root.is_some() == self.glm_routed_expert.is_some(),
+            "GLM profile metadata/section disagree"
+        );
+        if let Some(config) = &self.model_config {
+            config.validate()?;
+        }
+        if let Some(root) = &self.model_root {
+            ensure!(!root.trim().is_empty(), "GLM profile has no model root");
+        }
+        ensure!(
+            self.h3_standard_block_cut.is_some()
+                || self.glm_routed_expert.is_some()
+                || !self.group4.is_empty(),
+            "host profile has no measured sections; run ff bench group4 or ff bench io --profile local-interconnect"
+        );
         self.fingerprint.validate()?;
         ensure!(
             self.fingerprint.backend == crate::runtime::probe::DeviceBackend::Cuda,
@@ -577,118 +633,168 @@ impl LocalIoBenchmarkReport {
         ensure!(
             self.visible_cuda_devices > 0
                 && self.primary_cuda_ordinal < self.visible_cuda_devices
-                && usize::try_from(self.warmup_iterations).context("warmups exceed usize")?
-                    <= MAX_LOCAL_IO_WARMUP_ITERATIONS
-                && (1..=MAX_LOCAL_IO_SAMPLE_ITERATIONS).contains(
-                    &usize::try_from(self.sample_iterations).context("samples exceed usize")?,
-                ),
+                && (self.h3_standard_block_cut.is_none() && self.glm_routed_expert.is_none()
+                    || usize::try_from(self.warmup_iterations).context("warmups exceed usize")?
+                        <= MAX_LOCAL_IO_WARMUP_ITERATIONS
+                        && (1..=MAX_LOCAL_IO_SAMPLE_ITERATIONS).contains(
+                            &usize::try_from(self.sample_iterations)
+                                .context("samples exceed usize")?,
+                        )),
             "local I/O report iteration/device counts are invalid"
         );
-        ensure!(
-            self.h3_standard_block_cut.packed_rows == H3_STANDARD_BLOCK_CUT_ROWS
-                && self.h3_standard_block_cut.hidden_size == H3_HIDDEN_SIZE
-                && self.h3_standard_block_cut.dtype == "bf16"
-                && self.h3_standard_block_cut.bytes == H3_STANDARD_BLOCK_CUT_BYTES
-                && u64::try_from(H3_STANDARD_BLOCK_CUT_ROWS)
-                    .context("H3 packed rows exceed u64")?
-                    .checked_mul(
-                        u64::try_from(H3_HIDDEN_SIZE).context("H3 hidden size exceeds u64")?
-                    )
-                    .and_then(|value| value.checked_mul(2))
-                    == Some(H3_STANDARD_BLOCK_CUT_BYTES),
-            "H3 block-cut geometry or byte count changed"
-        );
-        let roundtrip_bytes = H3_STANDARD_BLOCK_CUT_BYTES
-            .checked_mul(2)
-            .context("H3 roundtrip byte count overflow")?;
-        for (series, operation, bytes) in [
-            (
-                &self.h3_standard_block_cut.same_device_d2d,
-                "same_device_cuda_d2d",
-                H3_STANDARD_BLOCK_CUT_BYTES,
-            ),
-            (
-                &self.h3_standard_block_cut.pinned_device_to_host,
-                "cuda_device_to_pinned_host",
-                H3_STANDARD_BLOCK_CUT_BYTES,
-            ),
-            (
-                &self.h3_standard_block_cut.pinned_host_to_device,
-                "pinned_host_to_cuda_device",
-                H3_STANDARD_BLOCK_CUT_BYTES,
-            ),
-            (
-                &self.h3_standard_block_cut.pinned_host_staged_roundtrip,
-                "pinned_host_staged_cuda_roundtrip",
-                roundtrip_bytes,
-            ),
-            (
-                &self.h3_standard_block_cut.tcp_loopback_roundtrip,
-                "tcp_ipv4_loopback_framed_roundtrip",
-                H3_STANDARD_BLOCK_CUT_BYTES,
-            ),
-        ] {
-            series.validate()?;
+        if let Some(cut) = &self.h3_standard_block_cut {
             ensure!(
-                series.operation == operation
-                    && series.bytes_per_iteration == bytes
-                    && series.warmup_iterations == self.warmup_iterations
-                    && series.samples.len()
-                        == usize::try_from(self.sample_iterations)
-                            .context("sample count exceeds usize")?,
-                "local I/O series identity or iteration counts disagree with the report"
+                cut.packed_rows == H3_STANDARD_BLOCK_CUT_ROWS
+                    && cut.hidden_size == H3_HIDDEN_SIZE
+                    && cut.dtype == "bf16"
+                    && cut.bytes == H3_STANDARD_BLOCK_CUT_BYTES
+                    && u64::try_from(H3_STANDARD_BLOCK_CUT_ROWS)
+                        .context("H3 packed rows exceed u64")?
+                        .checked_mul(
+                            u64::try_from(H3_HIDDEN_SIZE).context("H3 hidden size exceeds u64")?
+                        )
+                        .and_then(|value| value.checked_mul(2))
+                        == Some(H3_STANDARD_BLOCK_CUT_BYTES),
+                "H3 block-cut geometry or byte count changed"
+            );
+            let roundtrip_bytes = H3_STANDARD_BLOCK_CUT_BYTES
+                .checked_mul(2)
+                .context("H3 roundtrip byte count overflow")?;
+            for (series, operation, bytes) in [
+                (
+                    &cut.same_device_d2d,
+                    "same_device_cuda_d2d",
+                    H3_STANDARD_BLOCK_CUT_BYTES,
+                ),
+                (
+                    &cut.pinned_device_to_host,
+                    "cuda_device_to_pinned_host",
+                    H3_STANDARD_BLOCK_CUT_BYTES,
+                ),
+                (
+                    &cut.pinned_host_to_device,
+                    "pinned_host_to_cuda_device",
+                    H3_STANDARD_BLOCK_CUT_BYTES,
+                ),
+                (
+                    &cut.pinned_host_staged_roundtrip,
+                    "pinned_host_staged_cuda_roundtrip",
+                    roundtrip_bytes,
+                ),
+                (
+                    &cut.tcp_loopback_roundtrip,
+                    "tcp_ipv4_loopback_framed_roundtrip",
+                    H3_STANDARD_BLOCK_CUT_BYTES,
+                ),
+            ] {
+                series.validate()?;
+                ensure!(
+                    series.operation == operation
+                        && series.bytes_per_iteration == bytes
+                        && series.warmup_iterations == self.warmup_iterations
+                        && series.samples.len()
+                            == usize::try_from(self.sample_iterations)
+                                .context("sample count exceeds usize")?,
+                    "local I/O series identity or iteration counts disagree with the report"
+                );
+            }
+            validate_peer_measurement(
+                &cut.peer_device_d2d,
+                self.primary_cuda_ordinal,
+                self.visible_cuda_devices,
+                self.warmup_iterations,
+                self.sample_iterations,
+            )?;
+        }
+        if let Some(expert) = &self.glm_routed_expert {
+            expert.geometry.validate()?;
+            expert.pinned_host_to_device_b_p.validate()?;
+            expert.host_evaluation_b_h.validate()?;
+            ensure!(
+                expert.pinned_host_to_device_b_p.operation
+                    == "glm_expert_pinned_host_to_device_b_p"
+                    && expert.pinned_host_to_device_b_p.bytes_per_iteration
+                        == expert.geometry.logical_transfer_bytes
+                    && expert.pinned_host_to_device_b_p.warmup_iterations == self.warmup_iterations
+                    && expert.pinned_host_to_device_b_p.samples.len()
+                        == self.sample_iterations as usize
+                    && expert.host_evaluation_b_h.warmup_iterations == self.warmup_iterations
+                    && expert.host_evaluation_b_h.samples.len() == self.sample_iterations as usize,
+                "B_P/B_H identity, geometry, or iteration counts disagree with the report"
+            );
+            let expected_ratio = expert
+                .pinned_host_to_device_b_p
+                .statistics
+                .median_bytes_per_second
+                / expert.host_evaluation_b_h.median_service_bytes_per_second;
+            ensure!(
+                approximately_equal(expert.b_p_over_b_h, expected_ratio),
+                "B_P/B_H ratio disagrees with measured medians"
+            );
+
+            ensure!(
+                !expert.reader_sweeps.is_empty(),
+                "missing GLM reader calibration; rerun ff bench io --profile local-interconnect"
+            );
+            let mut counts = std::collections::BTreeSet::new();
+            let mut bytes = [None, None];
+            for row in &expert.reader_sweeps {
+                row.series.validate()?;
+                ensure!(
+                    counts.insert([row.prefetch, row.fill]),
+                    "duplicate reader calibration candidate"
+                );
+                ensure!(
+                    row.series.warmup_iterations == self.warmup_iterations
+                        && row.series.samples.len() == self.sample_iterations as usize
+                        && row.cpu_percent.len() == row.series.samples.len()
+                        && row.cpu_percent.iter().all(|v| v.is_finite() && *v >= 0.0),
+                    "reader calibration sample counts or CPU values are invalid"
+                );
+                let operation = if row.prefetch == 0 {
+                    "glm_buffered_pinned_fill"
+                } else {
+                    "glm_page_warming"
+                };
+                ensure!(
+                    row.series.operation == operation
+                        && row.series.timing_scope
+                            == "verified_cold_checkpoint_expert_spans_with_runtime_pinned_fills",
+                    "unknown reader calibration operation or scope"
+                );
+                let expected = bytes[usize::from(row.prefetch > 0)]
+                    .get_or_insert(row.series.bytes_per_iteration);
+                ensure!(
+                    *expected == row.series.bytes_per_iteration,
+                    "reader candidates measured different byte counts"
+                );
+            }
+            let expected = [2, 4, 8, 12, 16]
+                .map(|value| [value, 4])
+                .into_iter()
+                .chain([2, 4, 8, 16].map(|value| [0, value]))
+                .collect::<std::collections::BTreeSet<_>>();
+            ensure!(counts == expected, "reader calibration sweep is incomplete");
+            ensure!(
+                expert.reader_counts
+                    == [
+                        choose_readers(&expert.reader_sweeps, true)?,
+                        choose_readers(&expert.reader_sweeps, false)?,
+                    ],
+                "reader choice disagrees with measured ranges"
             );
         }
-        validate_peer_measurement(
-            &self.h3_standard_block_cut.peer_device_d2d,
-            self.primary_cuda_ordinal,
-            self.visible_cuda_devices,
-            self.warmup_iterations,
-            self.sample_iterations,
-        )?;
-        self.glm_routed_expert.geometry.validate()?;
-        self.glm_routed_expert
-            .pinned_host_to_device_b_p
-            .validate()?;
-        self.glm_routed_expert.host_evaluation_b_h.validate()?;
-        ensure!(
-            self.glm_routed_expert.pinned_host_to_device_b_p.operation
-                == "glm_expert_pinned_host_to_device_b_p"
-                && self
-                    .glm_routed_expert
-                    .pinned_host_to_device_b_p
-                    .bytes_per_iteration
-                    == self.glm_routed_expert.geometry.logical_transfer_bytes
-                && self
-                    .glm_routed_expert
-                    .pinned_host_to_device_b_p
-                    .warmup_iterations
-                    == self.warmup_iterations
-                && self
-                    .glm_routed_expert
-                    .pinned_host_to_device_b_p
-                    .samples
-                    .len()
-                    == self.sample_iterations as usize
-                && self.glm_routed_expert.host_evaluation_b_h.warmup_iterations
-                    == self.warmup_iterations
-                && self.glm_routed_expert.host_evaluation_b_h.samples.len()
-                    == self.sample_iterations as usize,
-            "B_P/B_H identity, geometry, or iteration counts disagree with the report"
-        );
-        let expected_ratio = self
-            .glm_routed_expert
-            .pinned_host_to_device_b_p
-            .statistics
-            .median_bytes_per_second
-            / self
-                .glm_routed_expert
-                .host_evaluation_b_h
-                .median_service_bytes_per_second;
-        ensure!(
-            approximately_equal(self.glm_routed_expert.b_p_over_b_h, expected_ratio),
-            "B_P/B_H ratio disagrees with measured medians"
-        );
+        let mut keys = Vec::new();
+        for choice in &self.group4 {
+            choice.validate()?;
+            ensure!(
+                !keys
+                    .iter()
+                    .any(|old: &&crate::runtime::probe::DecodeChoice| old.matches(choice)),
+                "duplicate group4 profile key; run ff bench group4"
+            );
+            keys.push(choice);
+        }
         Ok(())
     }
 }
@@ -826,11 +932,12 @@ pub fn measure_local_io_benchmark(
             glm_model_root.display()
         )
     })?;
+    eprintln!("calibration model: {}", model_root.display());
     let config_path = model_root.join("config.json");
     let model_config = stamp_file(&config_path)?;
     model_config.validate()?;
     let config = GlmConfig::from_file(&config_path)?;
-    let fingerprint = HardwareFingerprint::collect(device);
+    let fingerprint = HardwareFingerprint::collect(device)?;
     fingerprint.validate()?;
 
     let selected = Device::new_cuda(options.primary_cuda_ordinal).with_context(|| {
@@ -839,7 +946,7 @@ pub fn measure_local_io_benchmark(
             options.primary_cuda_ordinal
         )
     })?;
-    let selected_fingerprint = HardwareFingerprint::collect(&selected);
+    let selected_fingerprint = HardwareFingerprint::collect(&selected)?;
     selected_fingerprint.validate()?;
     ensure!(
         fingerprint == selected_fingerprint,
@@ -898,6 +1005,11 @@ pub fn measure_local_io_benchmark(
     )?;
     let b_p_over_b_h = pinned_host_to_device_b_p.statistics.median_bytes_per_second
         / host_evaluation_b_h.median_service_bytes_per_second;
+    let reader_sweeps = measure_readers(&model_root, device, options)?;
+    let reader_counts = [
+        choose_readers(&reader_sweeps, true)?,
+        choose_readers(&reader_sweeps, false)?,
+    ];
     let report = LocalIoBenchmarkReport {
         schema_version: LOCAL_IO_BENCHMARK_SCHEMA_VERSION,
         measured_at_unix_ms: u64::try_from(
@@ -907,11 +1019,13 @@ pub fn measure_local_io_benchmark(
                 .as_millis(),
         )
         .context("measurement timestamp exceeds u64")?,
-        model_root: model_root
-            .to_str()
-            .context("resolved GLM model root is not valid UTF-8")?
-            .to_owned(),
-        model_config,
+        model_root: Some(
+            model_root
+                .to_str()
+                .context("resolved GLM model root is not valid UTF-8")?
+                .to_owned(),
+        ),
+        model_config: Some(model_config),
         primary_cuda_ordinal: u32::try_from(options.primary_cuda_ordinal)
             .context("primary CUDA ordinal exceeds u32")?,
         visible_cuda_devices: u32::try_from(visible_cuda_devices)
@@ -921,7 +1035,7 @@ pub fn measure_local_io_benchmark(
             .context("warmup count exceeds u32")?,
         sample_iterations: u32::try_from(options.sample_iterations)
             .context("sample count exceeds u32")?,
-        h3_standard_block_cut: H3CutMeasurements {
+        h3_standard_block_cut: Some(H3CutMeasurements {
             packed_rows: H3_STANDARD_BLOCK_CUT_ROWS,
             hidden_size: H3_HIDDEN_SIZE,
             dtype: "bf16".to_owned(),
@@ -932,13 +1046,16 @@ pub fn measure_local_io_benchmark(
             pinned_host_staged_roundtrip: pinned_roundtrip,
             tcp_loopback_roundtrip,
             peer_device_d2d,
-        },
-        glm_routed_expert: GlmExpertMeasurements {
+        }),
+        glm_routed_expert: Some(GlmExpertMeasurements {
             geometry,
             pinned_host_to_device_b_p,
             host_evaluation_b_h,
             b_p_over_b_h,
-        },
+            reader_sweeps,
+            reader_counts,
+        }),
+        group4: Vec::new(),
     };
     report.validate()?;
     Ok(report)
@@ -954,6 +1071,72 @@ fn visible_cuda_device_count() -> Result<usize> {
 #[cfg(not(feature = "cuda"))]
 fn visible_cuda_device_count() -> Result<usize> {
     bail!("local-interconnect I/O benchmark requires a build with the cuda feature")
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn measure_readers(
+    model: &Path,
+    device: &Device,
+    options: LocalIoBenchmarkOptions,
+) -> Result<Vec<ReaderMeasurement>> {
+    let candidates = [2, 4, 8, 12, 16]
+        .map(|value| [value, 4])
+        .into_iter()
+        .chain([2, 4, 8, 16].map(|value| [0, value]))
+        .collect::<Vec<_>>();
+    let samples = crate::glm::StreamedGlm::measure_readers(
+        model,
+        device,
+        &candidates,
+        [options.warmup_iterations, options.sample_iterations],
+        options.expert_index,
+    )?;
+    let mut measurements = Vec::new();
+    for (readers, (bytes, samples)) in candidates.into_iter().zip(samples) {
+        let cpu_percent = samples
+            .iter()
+            .map(|[wall, cpu]| 100.0 * *cpu as f64 / *wall as f64)
+            .collect();
+        let operation = if readers[0] == 0 {
+            "glm_buffered_pinned_fill"
+        } else {
+            "glm_page_warming"
+        };
+        let series = BandwidthSeries::new(
+            operation,
+            "verified_cold_checkpoint_expert_spans_with_runtime_pinned_fills",
+            bytes,
+            options.warmup_iterations,
+            samples
+                .into_iter()
+                .map(|[wall, _]| Duration::from_nanos(wall))
+                .collect(),
+        )?;
+        eprintln!(
+            "GLM reader calibration: prefetch={}, fill={}; median {} ns [{}..{}]; CPU%={cpu_percent:?}",
+            readers[0],
+            readers[1],
+            series.statistics.median_elapsed_ns,
+            series.statistics.minimum_elapsed_ns,
+            series.statistics.maximum_elapsed_ns
+        );
+        measurements.push(ReaderMeasurement {
+            prefetch: readers[0],
+            fill: readers[1],
+            series,
+            cpu_percent,
+        });
+    }
+    Ok(measurements)
+}
+
+#[cfg(not(all(feature = "cuda", target_os = "linux")))]
+fn measure_readers(
+    _model: &Path,
+    _device: &Device,
+    _options: LocalIoBenchmarkOptions,
+) -> Result<Vec<ReaderMeasurement>> {
+    bail!("GLM reader calibration requires Linux with CUDA")
 }
 
 fn inspect_glm_expert_geometry(
@@ -1265,7 +1448,7 @@ fn measure_peer_d2d(
         .context("peer CUDA ordinal is required when multiple devices are visible")?;
     let peer_device = Device::new_cuda(peer_ordinal)
         .with_context(|| format!("failed to initialize peer CUDA device {peer_ordinal}"))?;
-    let destination_fingerprint = HardwareFingerprint::collect(&peer_device);
+    let destination_fingerprint = HardwareFingerprint::collect(&peer_device)?;
     destination_fingerprint.validate()?;
     let peer_stream = peer_device
         .as_cuda_device()
@@ -1580,6 +1763,115 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reader_profile_validates_evidence_and_recomputed_choices() {
+        let mut report =
+            LocalIoBenchmarkReport::from_json(include_bytes!("testdata/local-io-report.json"))
+                .unwrap();
+        report
+            .glm_routed_expert
+            .as_mut()
+            .unwrap()
+            .reader_sweeps
+            .clear();
+        report.schema_version = LOCAL_IO_BENCHMARK_SCHEMA_VERSION;
+        let candidates = [2, 4, 8, 12, 16]
+            .map(|value| [value, 4])
+            .into_iter()
+            .chain([2, 4, 8, 16].map(|value| [0, value]));
+        for [prefetch, fill] in candidates {
+            let operation = if prefetch == 0 {
+                "glm_buffered_pinned_fill"
+            } else {
+                "glm_page_warming"
+            };
+            let ns = 1000 + (prefetch + fill) as u64;
+            report
+                .glm_routed_expert
+                .as_mut()
+                .unwrap()
+                .reader_sweeps
+                .push(ReaderMeasurement {
+                    prefetch,
+                    fill,
+                    series: BandwidthSeries::new(
+                        operation,
+                        "verified_cold_checkpoint_expert_spans_with_runtime_pinned_fills",
+                        8192,
+                        report.warmup_iterations as usize,
+                        vec![Duration::from_nanos(ns); report.sample_iterations as usize],
+                    )
+                    .unwrap(),
+                    cpu_percent: vec![20.0; report.sample_iterations as usize],
+                });
+        }
+        report.glm_routed_expert.as_mut().unwrap().reader_counts = [
+            choose_readers(
+                &report.glm_routed_expert.as_mut().unwrap().reader_sweeps,
+                true,
+            )
+            .unwrap(),
+            choose_readers(
+                &report.glm_routed_expert.as_mut().unwrap().reader_sweeps,
+                false,
+            )
+            .unwrap(),
+        ];
+        report.validate().unwrap();
+        assert_eq!(
+            LocalIoBenchmarkReport::from_json(&serde_json::to_vec(&report).unwrap()).unwrap(),
+            report
+        );
+        let mut bad = report.clone();
+        bad.glm_routed_expert.as_mut().unwrap().reader_counts = [32, 32];
+        assert!(bad.validate().is_err());
+        let mut bad = report.clone();
+        bad.glm_routed_expert.as_mut().unwrap().reader_sweeps[0]
+            .cpu_percent
+            .pop();
+        assert!(bad.validate().is_err());
+        let mut bad = report.clone();
+        bad.glm_routed_expert.as_mut().unwrap().reader_sweeps.pop();
+        assert!(bad.validate().is_err());
+        let mut bad = report;
+        bad.schema_version = 1;
+        assert!(bad.validate().is_err());
+        let error =
+            LocalIoBenchmarkReport::from_json(&serde_json::to_vec(&bad).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("ff bench io"));
+    }
+
+    #[test]
+    fn reader_selection_uses_elapsed_overlap_not_cpu_cost() {
+        let measured = |prefetch, fill, ns: [u64; 3], cpu| ReaderMeasurement {
+            prefetch,
+            fill,
+            series: BandwidthSeries::new(
+                "test",
+                "test",
+                8192,
+                0,
+                ns.into_iter().map(Duration::from_nanos).collect(),
+            )
+            .unwrap(),
+            cpu_percent: vec![cpu; 3],
+        };
+        let mut rows = vec![
+            measured(2, 4, [300, 400, 500], 10.0),
+            measured(4, 4, [100, 110, 120], 20.0),
+            measured(8, 4, [90, 95, 100], 500.0),
+            measured(12, 4, [93, 96, 99], 5.0),
+            measured(0, 2, [200, 300, 400], 5.0),
+            measured(0, 8, [70, 80, 90], 500.0),
+            measured(0, 16, [75, 79, 85], 5.0),
+        ];
+        assert_eq!(choose_readers(&rows, true).unwrap(), 4);
+        assert_eq!(choose_readers(&rows, false).unwrap(), 8);
+        rows[1] = measured(4, 4, [101, 110, 120], 20.0);
+        assert_eq!(choose_readers(&rows, true).unwrap(), 8);
+        assert!(choose_readers(&[], true).is_err());
+    }
+
+    #[test]
     fn sample_statistics_are_derived_and_tampering_is_rejected() {
         let series = BandwidthSeries::new(
             "test_copy",
@@ -1664,6 +1956,28 @@ mod tests {
     }
 
     #[test]
+    fn profile_schema_rejects_old_empty_and_inconsistent_sections() {
+        let bytes = include_bytes!("testdata/local-io-report.json");
+        let mut old: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        old["schema_version"] = serde_json::json!(2);
+        assert!(LocalIoBenchmarkReport::from_json(&serde_json::to_vec(&old).unwrap()).is_err());
+        let mut report = LocalIoBenchmarkReport::from_json(bytes).unwrap();
+        report.glm_routed_expert = None;
+        assert!(report.validate().is_err());
+        report.model_root = None;
+        report.model_config = None;
+        report.validate().unwrap();
+        report.h3_standard_block_cut = None;
+        assert!(
+            report
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("no measured sections")
+        );
+    }
+
+    #[test]
     fn local_io_report_fixture_passes_the_strict_schema() {
         let report =
             LocalIoBenchmarkReport::from_json(include_bytes!("testdata/local-io-report.json"))
@@ -1671,12 +1985,19 @@ mod tests {
         assert_eq!(report.visible_cuda_devices, 1);
         assert_eq!(report.sample_iterations, 11);
         assert!(matches!(
-            report.h3_standard_block_cut.peer_device_d2d,
+            report
+                .h3_standard_block_cut
+                .as_ref()
+                .unwrap()
+                .peer_device_d2d,
             PeerD2dMeasurement::Unavailable {
                 reason: PeerD2dUnavailableReason::FewerThanTwoVisibleCudaDevices,
                 visible_cuda_devices: 1,
             }
         ));
-        assert!((report.glm_routed_expert.b_p_over_b_h - 36.18138119669186).abs() < 1e-12);
+        assert!(
+            (report.glm_routed_expert.as_ref().unwrap().b_p_over_b_h - 36.18138119669186).abs()
+                < 1e-12
+        );
     }
 }

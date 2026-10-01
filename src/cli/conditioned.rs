@@ -535,6 +535,8 @@ pub(super) fn run_denoise_conditioned(command: H3Command) -> Result<()> {
     });
     let mut selected = match super::resource::select_h3(super::resource::H3ResourceRequest {
         additional_host_allowance_bytes: 0,
+        model: &model,
+        derived_axes: &Default::default(),
         component: &transformer_dir,
         device: &device,
         baseline: &execution_policy,

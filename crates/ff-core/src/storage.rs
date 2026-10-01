@@ -10,54 +10,133 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Tell the kernel a file's pages are not worth retaining, dropping the clean
-/// ones already cached, and report whether there was a primitive to do it with.
-///
-/// This is the opposite of a prefetch hint and exists for one measured reason.
-/// A checkpoint larger than host memory is read cyclically -- every evaluation
-/// walks every block -- which is the worst case for an LRU page cache: by the
-/// time the scan returns to the first shard it has been evicted by the last,
-/// so nothing is ever reused and the cache still pays to hold it. Measured on
-/// the pinned host against MiniMax-H3's 61.7 GiB transformer on a 62 GiB
-/// machine, a full scan ran at 0.30 GB/s and a second scan at 0.13 GB/s --
-/// slower, because by then the cache was full of pages that would not be hit.
-/// Dropping each shard behind the read held 1.82 GB/s on the same scan, and
-/// left 35 GiB of host memory free instead of filled.
-///
-/// A checkpoint that does fit is a different case entirely and must not be
-/// advised this way: there the retention is the whole point.
-///
-/// Unix only. Windows exposes no equivalent for a file's cached pages, so this
-/// reports `false` there rather than pretending the advice landed.
-pub(crate) fn advise_dropped(file: &File) -> bool {
-    platform_advise_dropped(file)
+/// The system page alignment used for weight-reader partitions.
+pub fn read_alignment() -> std::io::Result<Option<usize>> {
+    #[cfg(unix)]
+    {
+        let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = usize::try_from(value).map_err(|_| {
+            std::io::Error::other(format!("sysconf page alignment failed: {value}"))
+        })?;
+        if !page.is_power_of_two() {
+            return Err(std::io::Error::other(format!(
+                "invalid system page alignment: {page}"
+            )));
+        }
+        Ok(Some(page))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
+    }
 }
 
-#[cfg(unix)]
-fn platform_advise_dropped(file: &File) -> bool {
-    use std::os::fd::AsRawFd;
-    // Length zero means "to end of file".
-    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) == 0 }
+/// Checks sustained reads on the backing block device during calibration.
+#[cfg(target_os = "linux")]
+pub struct ReadHealth {
+    device: PathBuf,
+    counters: Vec<u64>,
+    sampled: std::time::Instant,
 }
 
-#[cfg(not(unix))]
-fn platform_advise_dropped(_file: &File) -> bool {
-    false
+#[cfg(target_os = "linux")]
+impl ReadHealth {
+    pub fn new(path: &Path) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let (major, minor) = device_numbers(path)
+            .with_context(|| format!("cannot identify storage device for {}", path.display()))?;
+        let device = std::fs::canonicalize(format!("/sys/dev/block/{major}:{minor}"))
+            .with_context(|| format!("cannot resolve storage device {major}:{minor}"))?;
+        let counters = Self::read(&device)?;
+        Ok(Self {
+            device,
+            counters,
+            sampled: std::time::Instant::now(),
+        })
+    }
+
+    fn read(device: &Path) -> anyhow::Result<Vec<u64>> {
+        use anyhow::Context;
+        let path = device.join("stat");
+        let counters = std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read storage counters {}", path.display()))?
+            .split_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| format!("invalid storage counters {}", path.display()))?;
+        anyhow::ensure!(
+            counters.len() >= 11,
+            "incomplete storage counters {}",
+            path.display()
+        );
+        Ok(counters)
+    }
+
+    pub fn check(&mut self) -> anyhow::Result<()> {
+        let elapsed = self.sampled.elapsed();
+        if elapsed < std::time::Duration::from_secs(1) {
+            return Ok(());
+        }
+        let now = Self::read(&self.device)?;
+        Self::validate(&self.device, &self.counters, &now, elapsed.as_secs_f64())?;
+        self.counters = now;
+        self.sampled = std::time::Instant::now();
+        Ok(())
+    }
+
+    fn validate(device: &Path, before: &[u64], after: &[u64], seconds: f64) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let delta = |index: usize| {
+            after[index]
+                .checked_sub(before[index])
+                .with_context(|| format!("storage counter reset on {}", device.display()))
+        };
+        let reads = delta(0)? as f64;
+        let bytes_per_second = delta(2)? as f64 * 512.0 / seconds;
+        let await_ms = delta(3)? as f64 / reads.max(1.0);
+        let queue = delta(10)? as f64 / (seconds * 1000.0);
+        let busy = delta(9)? as f64 / (seconds * 1000.0);
+        if reads > 0.0 && busy >= 0.8 {
+            anyhow::ensure!(
+                queue > 0.0,
+                "missing busy queue time on {}",
+                device.display()
+            );
+            anyhow::ensure!(
+                bytes_per_second >= 300_000_000.0 && await_ms / queue <= 1.5,
+                "storage degraded on {}: {bytes_per_second:.0} B/s, r_await {await_ms:.3} ms, aqu-sz {queue:.3}, service {:.3} ms",
+                device.display(),
+                await_ms / queue
+            );
+        }
+        Ok(())
+    }
 }
 
-/// The kernel readahead window that bounds streaming from `path`'s device.
-///
-/// The mmap fault-in that materializes a stage never issues larger I/O than
-/// this window allows, so it sets the ceiling on streaming throughput.
-///
-/// Measured on the pinned RTX 4090 host against a 294 MiB attention stage:
-/// 594 MB/s at 128 KiB (the Linux default), 2,046 MB/s at 2 MiB, 2,428 MB/s at
-/// 8 MiB. The window is a runtime setting, not a device property: the same
-/// NVMe reads at either rate depending on it.
-///
-/// It is Linux's mechanism specifically — Windows' cache manager sizes
-/// readahead itself — so `read_ahead_window` reports `None` off Unix rather
-/// than inventing advice that would not apply.
+/// Advise away clean file-cache pages in a byte range; zero length means through EOF.
+pub(crate) fn advise_dropped(file: &File, offset: u64, len: u64) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let (Ok(offset), Ok(len)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len))
+        else {
+            return false;
+        };
+        if offset.checked_add(len).is_none() {
+            return false;
+        }
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_DONTNEED) == 0
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, offset, len);
+        false
+    }
+}
+
+/// Kernel readahead window for the device backing a path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadAheadWindow {
     pub bytes: u64,
@@ -66,11 +145,7 @@ pub struct ReadAheadWindow {
     pub control_file: PathBuf,
 }
 
-/// The window below which weight streaming is meaningfully throttled.
-///
-/// The Linux default of 128 KiB sits far under this; 2 MiB reached within 20%
-/// of the best measured rate on the pinned host, and larger windows returned
-/// little more.
+/// Recommended minimum readahead window for weight streaming.
 pub const RECOMMENDED_READ_AHEAD_BYTES: u64 = 2 * 1024 * 1024;
 
 impl ReadAheadWindow {
@@ -81,12 +156,7 @@ impl ReadAheadWindow {
     }
 }
 
-/// Read the window for the device backing `path`, or `None` where the platform
-/// does not expose one.
-///
-/// This is a best-effort observation, like the rest of the probe: an absent or
-/// unreadable value is reported as unknown rather than as an error, because no
-/// decision depends on it.
+/// Read the backing device's readahead window, or None when unavailable.
 pub fn read_ahead_window(path: &Path) -> Option<ReadAheadWindow> {
     read_ahead_window_under(Path::new("/sys/dev/block"), path)
 }
@@ -193,24 +263,7 @@ fn windows_open_with_identity_flags(path: &Path, extra: u32) -> std::io::Result<
         .open(path)
 }
 
-/// Replace `destination` with `source` atomically, tolerating readers.
-///
-/// Windows offers three ways to replace a file and only this one keeps both
-/// properties the protocol needs. Measured on Windows 10.0.26200:
-///
-/// - `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` is atomic for a reader, but
-///   refuses with access denied whenever *anyone* holds the destination open,
-///   including a reader that is only mid-`read`.
-/// - `ReplaceFileW` tolerates an open destination but unlinks before it
-///   renames, so a concurrent reader can observe the path missing.
-/// - `FileRenameInfoEx` with POSIX semantics does both, which is what it exists
-///   for. Over 200 replacements against a reader looping on the destination it
-///   failed zero times and the reader never once saw the path absent.
-///
-/// It carries no write-through flag, so this reports only atomic visibility --
-/// the same level a Unix `rename` reaches before its parent is flushed.
-/// Available since Windows 10 1607; older releases fall back to `MoveFileEx`,
-/// which is atomic but cannot proceed against an open destination.
+/// Atomically replace the destination while allowing shared readers; InvalidInput retries MoveFileEx.
 #[cfg(windows)]
 pub(crate) fn windows_replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::os::windows::{ffi::OsStrExt as _, fs::OpenOptionsExt as _, io::AsRawHandle as _};
@@ -263,19 +316,7 @@ pub(crate) fn windows_replace_file(source: &Path, destination: &Path) -> std::io
     }
 }
 
-/// Move `source` onto `destination`, flushed to disk before returning.
-///
-/// This is the whole of Windows' answer to "link or rename, then make the
-/// directory entry durable". Without `MOVEFILE_REPLACE_EXISTING` the call fails
-/// when the destination exists, which is the never-clobber half;
-/// `MOVEFILE_WRITE_THROUGH` does not return until the move is on disk, which is
-/// the durability half. Windows offers no way to flush a directory's own
-/// metadata, so this pairing is what stands in for it.
-///
-/// Measured on Windows 10.0.26200: refusing an existing destination leaves that
-/// destination unchanged and the source intact, a same-volume move preserves
-/// the file index so the moved file is still provably the one that was
-/// verified, and write-through costs about 2.2x a plain move.
+/// Move source to destination with write-through durability; replace_existing controls destination replacement.
 #[cfg(windows)]
 pub(crate) fn windows_move_file(
     source: &Path,
@@ -302,74 +343,38 @@ pub(crate) fn windows_move_file(
     Ok(())
 }
 
-/// Open a directory, for platforms that need to be told that is the intent.
-///
-/// Unix opens a directory like any other path. Windows refuses unless
-/// `FILE_FLAG_BACKUP_SEMANTICS` is set, which is why a plain `File::open` on a
-/// directory fails there with access denied.
-pub fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
-    #[cfg(windows)]
-    {
-        windows_open_with_identity_flags(path, 0)
-    }
-    #[cfg(not(windows))]
-    {
-        std::fs::File::open(path)
-    }
-}
-
-/// The resolved spelling of `path`, in the form a caller would write.
-///
-/// `fs::canonicalize` answers with the operating system's own canonical form,
-/// which on Windows carries the `\\?\` extended-length prefix that no caller
-/// types and no configuration file contains. A check that compares a supplied
-/// path against the resolved one has to compare like with like, or it can never
-/// hold on Windows.
-///
-/// The prefix is presentational, not semantic: it only lifts the legacy path
-/// length limit. Removing it for comparison keeps the check exactly as strong
-/// as it is on Unix -- the path must already be the resolved one, with no
-/// relative components and no symbolic links left to follow.
-pub fn canonical_comparable_path(path: &Path) -> std::io::Result<PathBuf> {
-    let canonical = std::fs::canonicalize(path)?;
-    #[cfg(windows)]
-    {
-        Ok(strip_verbatim_prefix(&canonical))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(canonical)
-    }
-}
-
-#[cfg(windows)]
-fn strip_verbatim_prefix(path: &Path) -> PathBuf {
-    use std::path::{Component, Prefix};
-
-    let mut components = path.components();
-    let Some(Component::Prefix(prefix)) = components.next() else {
-        return path.to_path_buf();
-    };
-    match prefix.kind() {
-        Prefix::VerbatimDisk(letter) => {
-            let mut rebuilt = PathBuf::from(format!("{}:\\", letter as char));
-            rebuilt.extend(components.filter(|part| !matches!(part, Component::RootDir)));
-            rebuilt
-        }
-        Prefix::VerbatimUNC(server, share) => {
-            let mut rebuilt = PathBuf::from(r"\\");
-            rebuilt.push(server);
-            rebuilt.push(share);
-            rebuilt.extend(components.filter(|part| !matches!(part, Component::RootDir)));
-            rebuilt
-        }
-        _ => path.to_path_buf(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn calibration_rejects_sustained_degradation_without_rejecting_queue_depth() {
+        let before = [0; 11];
+        let mut after = [0; 11];
+        after[0] = 4_000;
+        after[2] = 1_000_000;
+        after[3] = 40_000;
+        after[9] = 1_000;
+        after[10] = 10_000;
+        let device = Path::new("test-device");
+        ReadHealth::validate(device, &before, &after, 1.0).unwrap();
+        after[0] = 475;
+        after[2] = 121_600;
+        after[3] = 7_016;
+        after[9] = 888;
+        after[10] = 7_020;
+        let error = ReadHealth::validate(device, &before, &after, 1.0).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("test-device") && message.contains("62259200 B/s"));
+        after[2] = 1_000_000;
+        assert!(ReadHealth::validate(device, &before, &after, 1.0).is_err());
+        after[3] = 475;
+        after[2] = 121_600;
+        assert!(ReadHealth::validate(device, &before, &after, 1.0).is_err());
+        ReadHealth::validate(device, &before, &before, 1.0).unwrap();
+        assert!(ReadHealth::validate(device, &after, &before, 1.0).is_err());
+    }
 
     #[test]
     fn a_missing_or_unreadable_window_is_unknown_rather_than_an_error() {

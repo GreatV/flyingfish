@@ -469,10 +469,7 @@ mod tests {
         }
     }
 
-    /// The shapes this module splits are the released ones, read from the
-    /// checkpoint's own safetensors header rather than derived from the config.
-    /// This is the test that caught the fused feed-forward: `ffn_dim` is
-    /// 14,336 and `ff.net.0.proj.weight` is 28,672 rows.
+    /// The released checkpoint has ffn_dim 14,336 and 28,672 fused projection rows.
     #[test]
     fn the_modelled_shapes_are_the_released_checkpoint_shapes() {
         let Some(root) = std::env::var_os("FF_H3_TRANSFORMER_CHECKPOINT") else {

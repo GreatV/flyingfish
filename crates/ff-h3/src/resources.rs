@@ -13,7 +13,7 @@ use std::fmt;
 mod activations;
 mod host;
 pub use ff_core::bounds;
-pub use host::{cache_charge, host_weight_residency_charges};
+pub use host::{cache_charge, fit_host_cache, host_weight_residency_charges};
 mod traffic;
 mod weights;
 
@@ -839,9 +839,7 @@ pub struct H3T2vaRequirement {
     chunk_ladder: Vec<(ff_core::configure::ChunkPlan, u64)>,
 }
 
-/// The chunk ladder the deriver searches, largest last. The top entry is the
-/// measured performance optimum of the 2026-09 chunk scan; larger entries fit
-/// more devices but compute slower.
+/// Candidate chunks in ascending size order.
 const CHUNK_LADDER: [(usize, usize, usize); 4] = [
     (512, 128, 512),
     (1024, 256, 1024),

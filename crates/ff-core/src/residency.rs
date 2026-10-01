@@ -182,9 +182,7 @@ pub struct PhaseResidencyDemand {
     pub transform_cost: u64,
     /// Reads of the phase per request; the reuse term of the ranking.
     pub reuse_count: u64,
-    /// Half-open lifetime on a caller-declared execution timeline. None means
-    /// retained for the whole request. Only declare disjoint intervals when
-    /// the runtime releases the earlier store before opening the next one.
+    /// Half-open execution lifetime; None retains the allocation for the entire request. Disjoint intervals require release before reuse.
     pub lifetime: Option<std::ops::Range<u64>>,
     /// Whether a rank holds this phase whole or holds a share of it. Ignored
     /// at one rank, which is why declaring it changes no existing behaviour.
@@ -451,15 +449,14 @@ pub fn decide_device_residency(
     reserve_bytes: u64,
     authorization: ResidencyAuthorization,
 ) -> Result<DeviceResidencyDecision> {
-    // On a shared pool the binding capacity is the smaller view, and a pool of
-    // unknown size gets none rather than the device view as a stand-in.
-    let capacity = if snapshot.unified_accounting_is_undecidable() {
+    let capacity = if snapshot.measurement_scope.device_memory.is_none()
+        && snapshot.device_total_memory_bytes.is_none()
+        && snapshot.device_free_memory_bytes.is_none()
+        && snapshot.host_device_memory_is_unified.is_none()
+    {
         0
     } else {
-        snapshot
-            .unified_pool_available_bytes()
-            .or(snapshot.device_free_memory_bytes)
-            .unwrap_or(0)
+        snapshot.device_capacity()?
     };
     decide_residency_within(capacity, demands, reserve_bytes, authorization)
 }
@@ -467,13 +464,19 @@ pub fn decide_device_residency(
 /// One device's capacity, as probed for that device. `ResourceSnapshot` reports
 /// a scalar `device_free_memory_bytes`, so a request spread over several
 /// devices captures one snapshot per device rather than reusing one.
-pub fn probe_rank_capacities(devices: &[Device]) -> Vec<u64> {
+pub fn probe_rank_capacities(devices: &[Device]) -> anyhow::Result<Vec<u64>> {
     devices
         .iter()
-        .map(|device| {
+        .enumerate()
+        .map(|(rank, device)| {
             ResourceSnapshot::capture(Some(device))
+                .map_err(|error| {
+                    anyhow::anyhow!("resource probe failed for rank {rank}: {error:#}")
+                })?
                 .device_free_memory_bytes
-                .unwrap_or(0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("resource probe could not read rank {rank}'s free memory")
+                })
         })
         .collect()
 }
@@ -489,16 +492,7 @@ pub struct RankResidencyDecision {
     pub decision: DeviceResidencyDecision,
 }
 
-/// Decide device residency for a request spread across ranks: one decision per
-/// rank, each against that rank's own measured capacity and that rank's own
-/// share of every sharded phase. `capacities` is in rank order, one entry per
-/// rank, and its length is the rank count.
-///
-/// A one-rank call is `decide_device_residency` against that one capacity —
-/// same demands, same fill, same record — which is the "no behaviour change at
-/// N=1" half of T1's gate. The reserve and the authorized ceiling apply to each
-/// rank, because both describe one device: a ceiling divided among ranks would
-/// be the defect this rewrite exists to avoid.
+/// Plan each rank against its measured capacity, per-rank demand, reserve and authorized ceiling.
 pub fn decide_rank_residency(
     capacities: &[u64],
     demands: &[PhaseResidencyDemand],
@@ -556,6 +550,7 @@ fn decide_residency_within(
         axis: "weights.device_cache_bytes".into(),
         value: authorized.to_string(),
         origin,
+        inputs: vec![],
     }];
 
     let placed: BTreeSet<&str> = plan.placed.iter().map(String::as_str).collect();
@@ -633,8 +628,120 @@ fn decide_residency_within(
     })
 }
 
+/// How one device hosts its layer range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Residency {
+    Resident,
+    Streaming,
+    Insufficient,
+}
+
+/// One device's placement: the residency, the first layer that streams, and the footprint.
+#[derive(Clone, Copy, Debug)]
+pub struct Placement {
+    pub residency: Residency,
+    pub through: usize,
+    pub bytes: u64,
+}
+
+impl Placement {
+    /// A plan with a larger workspace that keeps at least the residency of `plain`.
+    pub fn keeps(&self, plain: &Placement) -> bool {
+        self.residency != Residency::Insufficient && self.through >= plain.through
+    }
+}
+
+/// The largest streamed-suffix prefix count whose footprint stays within
+/// `free`: `base + the first k projection byte sums`.
+pub fn choose_resident_through(base: u64, projs: &[u64], free: u64) -> Option<usize> {
+    if base > free {
+        return None;
+    }
+    let mut prefix = 0u64;
+    for (k, &proj) in projs.iter().enumerate() {
+        if base + prefix + proj > free {
+            return Some(k);
+        }
+        prefix += proj;
+    }
+    Some(projs.len())
+}
+
+/// Resident when `resident` fits `free`, else the fitting streamed prefix over `base`.
+pub fn place(
+    resident: u64,
+    base: u64,
+    projs: &[u64],
+    start: usize,
+    free: u64,
+    force: bool,
+) -> Placement {
+    if !force && resident <= free {
+        Placement {
+            residency: Residency::Resident,
+            through: start + projs.len(),
+            bytes: resident,
+        }
+    } else {
+        match choose_resident_through(base, projs, free) {
+            Some(k) => {
+                let k = if force { 0 } else { k };
+                Placement {
+                    residency: Residency::Streaming,
+                    through: start + k,
+                    bytes: base + projs[..k].iter().sum::<u64>(),
+                }
+            }
+            None => Placement {
+                residency: Residency::Insufficient,
+                through: start,
+                bytes: base,
+            },
+        }
+    }
+}
+
+/// Contiguous layer ranges, one per device, boundaries placed closest to
+/// each device's share of the total bytes.
+pub fn split_layers_by_bytes(layer_bytes: &[u64], parts: usize) -> Vec<(usize, usize)> {
+    let total: u64 = layer_bytes.iter().sum();
+    let mut ranges = Vec::with_capacity(parts);
+    let mut start = 0usize;
+    for d in 1..parts {
+        let target = total * d as u64 / parts as u64;
+        let last_end = layer_bytes.len() - (parts - d);
+        let mut cum: u64 = layer_bytes[..start + 1].iter().sum();
+        let mut best = start + 1;
+        let mut best_err = cum.abs_diff(target);
+        let mut end = start + 2;
+        while end <= last_end {
+            cum += layer_bytes[end - 1];
+            let err = cum.abs_diff(target);
+            if err >= best_err {
+                break;
+            }
+            best_err = err;
+            best = end;
+            end += 1;
+        }
+        ranges.push((start, best));
+        start = best;
+    }
+    ranges.push((start, layer_bytes.len()));
+    ranges
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn probe_rank_capacities_names_the_rank_on_a_probe_failure() -> Result<()> {
+        // A CPU device cannot satisfy the CUDA probe; the error must name
+        // the rank instead of degrading to zero capacity.
+        let error = probe_rank_capacities(&[Device::Cpu]).expect_err("a failed capture must error");
+        assert!(error.to_string().contains("rank 0"), "{error}");
+        Ok(())
+    }
     use super::*;
     use crate::weights::{CachePolicy, WeightSource};
     use candle_core::{DType, Device, Tensor, safetensors};
@@ -888,17 +995,16 @@ mod tests {
     fn snapshot(device_free: Option<u64>) -> ResourceSnapshot {
         use crate::probe::ResourceMeasurementScopes;
         ResourceSnapshot {
-            schema_version: 1,
+            schema_version: crate::probe::RESOURCE_SNAPSHOT_SCHEMA_VERSION,
             measured_at_unix_ms: 1,
             host_memory_available_bytes: None,
             cgroup_v2_memory_limit: None,
             cgroup_v2_memory_current_bytes: None,
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: device_free,
-            host_device_memory_is_unified: None,
-            device_topology_probe_failed: false,
+            host_device_memory_is_unified: device_free.map(|_| false),
             host_memory_total_bytes: None,
-            device_total_memory_bytes: None,
+            device_total_memory_bytes: device_free,
             measurement_scope: ResourceMeasurementScopes {
                 host_memory: None,
                 cgroup_memory: None,
@@ -1104,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmed_shared_pool_of_unknown_size_authorizes_no_residency() {
+    fn unknown_shared_pool_requires_a_new_capture() {
         let demands = vec![demand("decode", 1 << 20, 1 << 20, 10)];
         let authorization = ResidencyAuthorization::MeasuredEvidence {
             ceiling_bytes: u64::MAX,
@@ -1116,19 +1222,15 @@ mod tests {
         assert!(discrete > 0, "the discrete path must still place weights");
         let unmeasurable = ResourceSnapshot {
             host_device_memory_is_unified: Some(true),
-            device_topology_probe_failed: false,
             ..snapshot(Some(8 << 30))
         };
         assert!(unmeasurable.unified_pool_is_unmeasurable());
-        assert_eq!(
-            decide_device_residency(&unmeasurable, &demands, 0, authorization)
-                .unwrap()
-                .authorized_budget_bytes,
-            0
-        );
+        let error = decide_device_residency(&unmeasurable, &demands, 0, authorization)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unified_pool_available_bytes") && error.contains("ff probe"));
         let measured = ResourceSnapshot {
             host_device_memory_is_unified: Some(true),
-            device_topology_probe_failed: false,
             host_memory_available_bytes: Some(8 << 30),
             ..snapshot(Some(8 << 30))
         };
@@ -1176,11 +1278,10 @@ mod tests {
         let demands = [sharded, demand("norms", 8, 8, 8)];
         let snapshot = ResourceSnapshot {
             device_free_memory_bytes: Some(96),
-            host_device_memory_is_unified: None,
-            device_topology_probe_failed: false,
+            host_device_memory_is_unified: Some(false),
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
-            ..ResourceSnapshot::capture(None)
+            ..ResourceSnapshot::capture(None).unwrap()
         };
         let authorization = ResidencyAuthorization::OperatorExplicit {
             ceiling_bytes: 1 << 20,
@@ -1248,5 +1349,55 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("at least one rank capacity"), "{error}");
+    }
+
+    #[test]
+    fn resident_through_takes_the_fitting_prefix() {
+        let projs = [10u64, 20, 30];
+        assert_eq!(choose_resident_through(5, &projs, 4), None);
+        assert_eq!(choose_resident_through(5, &projs, 5), Some(0));
+        assert_eq!(choose_resident_through(5, &projs, 12), Some(0));
+        assert_eq!(choose_resident_through(5, &projs, 15), Some(1));
+        assert_eq!(choose_resident_through(5, &projs, 42), Some(2));
+        assert_eq!(choose_resident_through(5, &projs, 65), Some(3));
+        assert_eq!(choose_resident_through(5, &[], 5), Some(0));
+    }
+
+    #[test]
+    fn split_covers_all_layers_contiguously() {
+        let uniform: Vec<u64> = vec![100; 64];
+        for parts in 1..=4usize {
+            let ranges = split_layers_by_bytes(&uniform, parts);
+            assert_eq!(ranges.len(), parts);
+            assert_eq!(ranges[0].0, 0);
+            assert_eq!(ranges.last().unwrap().1, 64);
+            for pair in ranges.windows(2) {
+                assert_eq!(pair[0].1, pair[1].0);
+            }
+            for &(start, end) in &ranges {
+                assert!(end > start);
+            }
+            if 64u64.is_multiple_of(parts as u64) {
+                for &(start, end) in &ranges {
+                    assert_eq!(end - start, 64 / parts);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_balances_lumpy_layers() {
+        let lumpy = [10u64, 10, 10, 10, 10, 100];
+        let ranges = split_layers_by_bytes(&lumpy, 2);
+        assert_eq!(ranges, vec![(0, 5), (5, 6)]);
+        let total: u64 = lumpy.iter().sum();
+        let ideal = total.div_ceil(2);
+        let widest = *lumpy.iter().max().unwrap();
+        for &(start, end) in &ranges {
+            assert!(lumpy[start..end].iter().sum::<u64>() <= ideal + widest);
+        }
+
+        let head = [100u64, 1, 1, 1, 1];
+        assert_eq!(split_layers_by_bytes(&head, 2), vec![(0, 1), (1, 5)]);
     }
 }

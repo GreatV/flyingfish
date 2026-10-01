@@ -12,9 +12,9 @@ use crate::{
     runtime::{
         probe::{ResourceSnapshot, admission_reserve_bytes},
         resource_selection::{
-            CandidateDisposition, CapacityShortfall, ResourceCandidateObservation,
-            ResourcePhaseEstimate, ResourcePolicyMode, ResourceSelectionProvenance,
-            SelectedResourceAxis, SelectionOrigin,
+            CandidateDisposition, CapacityShortfall, RESOURCE_SELECTION_SCHEMA_VERSION,
+            ResourceCandidateObservation, ResourcePhaseEstimate, ResourcePolicyMode,
+            ResourceSelectionProvenance, SelectedResourceAxis, SelectionOrigin,
         },
         weights::{WeightSource, accounting::CacheInventory},
     },
@@ -34,6 +34,8 @@ pub struct H3SelectionRequest<'a> {
     pub context: &'a EvidenceContext,
     pub mode: ResourcePolicyMode,
     pub explicit_axes: &'a BTreeSet<String>,
+    /// Axes whose baseline value came from the planner's derivation, with its steps.
+    pub derived_axes: &'a BTreeMap<String, Vec<String>>,
     pub evidence: Option<&'a ResourceEvidence>,
     pub locked_origin: Option<SelectionOrigin>,
     /// Inputs already present at capture, restricted to bytes also represented
@@ -390,12 +392,7 @@ pub fn select(request: H3SelectionRequest<'_>) -> Result<H3Selection> {
                 .budget
                 .max_host_bytes
                 .context("automatic host retention requires measured or explicit capacity")?;
-            // Same shape as every other admission reserve (see the GLM
-            // docstring): the reverse-scaled max() never shrank and grew with
-            // the pool, over-reserving small hosts. The denominator is the
-            // host POOL TOTAL, never an availability view — a reserve that
-            // shrank because the machine is busy would protect least exactly
-            // when protection matters.
+            // The promotion reserve scales from the host pool total.
             let reserve = admission_reserve_bytes(request.snapshot.host_pool_total_bytes());
             if host.checked_add(reserve).is_none_or(|n| n > available) {
                 observation.disposition = CandidateDisposition::CapacityRejected;
@@ -565,24 +562,32 @@ fn build_provenance(
     let selected_axes = axes(policy)?
         .into_iter()
         .map(|(axis, value)| {
+            let derived = request.derived_axes.get(&axis);
             let origin = request.locked_origin.unwrap_or_else(|| {
                 if request.explicit_axes.contains(&axis) {
                     SelectionOrigin::OperatorExplicit
                 } else if base_axes.get(&axis) != Some(&value) {
                     SelectionOrigin::MeasuredEvidence
+                } else if derived.is_some() {
+                    SelectionOrigin::CostModel
                 } else {
                     SelectionOrigin::Baseline
                 }
             });
+            let inputs = match origin {
+                SelectionOrigin::CostModel => derived.cloned().unwrap_or_default(),
+                _ => vec![],
+            };
             SelectedResourceAxis {
                 axis,
                 value,
                 origin,
+                inputs,
             }
         })
         .collect();
     let mut provenance = ResourceSelectionProvenance {
-        schema_version: 1,
+        schema_version: RESOURCE_SELECTION_SCHEMA_VERSION,
         policy: serde_json::to_value(policy)?,
         selector_revision: "h3-resource-measured-v1".into(),
         request: request.context.request.clone(),
@@ -722,7 +727,7 @@ mod tests {
     }
     fn snapshot() -> ResourceSnapshot {
         ResourceSnapshot {
-            schema_version: 1,
+            schema_version: crate::runtime::probe::RESOURCE_SNAPSHOT_SCHEMA_VERSION,
             measured_at_unix_ms: 1,
             host_memory_available_bytes: Some(8 << 30),
             cgroup_v2_memory_limit: None,
@@ -730,7 +735,6 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: None,
             host_device_memory_is_unified: None,
-            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
@@ -781,6 +785,23 @@ mod tests {
         budget: ResourceBudget,
         snapshot: &ResourceSnapshot,
     ) -> Result<H3Selection> {
+        run_with_axes(
+            policy,
+            locked,
+            evidence,
+            credit,
+            (budget, snapshot),
+            (&BTreeSet::new(), &BTreeMap::new()),
+        )
+    }
+    fn run_with_axes(
+        policy: &ExecutionPolicy,
+        locked: Option<SelectionOrigin>,
+        evidence: Option<&ResourceEvidence>,
+        credit: u64,
+        (budget, snapshot): (ResourceBudget, &ResourceSnapshot),
+        (explicit, derived): (&BTreeSet<String>, &BTreeMap<String, Vec<String>>),
+    ) -> Result<H3Selection> {
         let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
         assumptions.device_memory_is_host = true;
         assumptions.weight_element_bytes = 4;
@@ -796,13 +817,67 @@ mod tests {
             snapshot,
             context: &context(),
             mode: ResourcePolicyMode::Performance,
-            explicit_axes: &BTreeSet::new(),
+            explicit_axes: explicit,
+            derived_axes: derived,
             evidence,
             locked_origin: locked,
             resident_input_bytes: credit,
             additional_host_allowance_bytes: 0,
         })
     }
+    fn axis_record(
+        explicit: &[&str],
+        derived: &[&str],
+    ) -> Vec<crate::runtime::resource_selection::SelectedResourceAxis> {
+        let explicit = explicit.iter().map(|axis| (*axis).to_owned()).collect();
+        let derived = derived
+            .iter()
+            .map(|axis| ((*axis).to_owned(), vec!["rule 1: host bound".to_owned()]))
+            .collect();
+        let budget = ResourceBudget {
+            max_host_bytes: Some(8 << 30),
+            max_device_bytes: None,
+        };
+        run_with_axes(
+            &baseline(),
+            None,
+            None,
+            0,
+            (budget, &snapshot()),
+            (&explicit, &derived),
+        )
+        .unwrap()
+        .provenance
+        .axes
+    }
+
+    #[test]
+    fn a_derived_bound_records_as_cost_model_with_its_inputs() {
+        let axes = axis_record(&[], &["weights.cache_bytes"]);
+        let axis = axes
+            .iter()
+            .find(|a| a.axis == "weights.cache_bytes")
+            .unwrap();
+        assert_eq!(axis.origin, SelectionOrigin::CostModel);
+        assert_eq!(axis.inputs, vec!["rule 1: host bound".to_owned()]);
+        assert!(
+            axes.iter()
+                .filter(|a| a.axis != "weights.cache_bytes")
+                .all(|a| a.inputs.is_empty())
+        );
+    }
+
+    #[test]
+    fn an_operator_flag_records_as_operator_explicit_without_inputs() {
+        let axes = axis_record(&["weights.cache_bytes"], &[]);
+        let axis = axes
+            .iter()
+            .find(|a| a.axis == "weights.cache_bytes")
+            .unwrap();
+        assert_eq!(axis.origin, SelectionOrigin::OperatorExplicit);
+        assert!(axis.inputs.is_empty());
+    }
+
     #[test]
     fn a_refused_final_admission_records_its_snapshot_and_shortfall() {
         let mut record = run(&baseline(), None, None, 0).unwrap().provenance;
@@ -968,6 +1043,7 @@ mod tests {
             context: &context(),
             mode: ResourcePolicyMode::Performance,
             explicit_axes: &BTreeSet::new(),
+            derived_axes: &BTreeMap::new(),
             evidence: None,
             locked_origin: None,
             resident_input_bytes: 0,
@@ -1168,8 +1244,7 @@ mod tests {
             selected.provenance.phases[0].host_promotion_reserve_bytes,
             1 << 30
         );
-        // A 64 GiB host total caps at 1 GiB (the old reverse-scaled formula
-        // reserved 3.2 GiB there); a 6 GiB one keeps the 512 MiB floor.
+        // A 64 GiB total reaches the 1 GiB cap; a 6 GiB total reaches the 512 MiB floor.
         for (host_total, expected) in [(64 << 30, 1 << 30), (6 << 30, 512 << 20)] {
             let mut hw = snapshot();
             hw.host_memory_total_bytes = Some(host_total);

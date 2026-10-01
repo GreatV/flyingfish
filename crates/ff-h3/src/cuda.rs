@@ -6,10 +6,9 @@
 //! `multimodal_text_encoder` records the selected composition without claiming
 //! reference-library results on other hosts.
 //!
-//! The CUDA sources these compile from stay at their established workspace
-//! `src/cuda/*.cu` paths, which `build.rs` owns. Moving those files changes
-//! NVCC's anonymous shared-memory symbol names and therefore the sealed PTX
-//! identities; this Rust-side grouping deliberately leaves them untouched.
+//! The CUDA sources these compile from live in `crates/ff-cuda/cuda/*.cu`, which
+//! `build.rs` owns. A source path enters NVCC's anonymous shared-memory symbol
+//! names and therefore the sealed PTX identity.
 
 pub mod profile;
 
@@ -27,7 +26,7 @@ pub(crate) mod rms_norm;
 #[cfg(feature = "cuda")]
 pub(crate) mod sdpa_softmax;
 
-/// Whether this device can execute the kernels compiled from `src/cuda/*.cu`.
+/// Whether this device can execute the kernels compiled from `crates/ff-cuda/cuda/*.cu`.
 ///
 /// Feature-independent so the execution policy, which is compiled without CUDA
 /// as well, can record what a device afforded without knowing how this binary

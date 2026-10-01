@@ -7,29 +7,19 @@
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp1, Layout, Shape, Tensor};
 
-const CUDA_MODULE: &str = "flyingfish_qwen_gelu_pytorch_7269437";
+const CUDA_MODULE: &str = "flyingfish_gelu_pytorch_7269437";
 pub(crate) const TANH_BACKEND: &str = concat!(
     "pytorch-gelu-tanh-bf16-cuda@7269437d655783a26cba32aa88195b741ff496aa/",
-    "source-sha256:d896d28a6f0762f2b0bc64f2aaef5cefa86182344ec28017deb3a0962d41e6cc/",
     "nvrtc-",
-    env!("FLYINGFISH_QWEN_GELU_NVRTC_VERSION"),
-    "/nvrtc-sha256:",
-    env!("FLYINGFISH_QWEN_GELU_NVRTC_SHA256"),
-    "/builtins-sha256:",
-    env!("FLYINGFISH_QWEN_GELU_NVRTC_BUILTINS_SHA256"),
+    env!("FLYINGFISH_GELU_NVRTC_VERSION"),
     "/",
     env!("FLYINGFISH_H3_RMS_NORM_PTX_ARCH"),
     "/shape-profile:4032|28224x4304-v1"
 );
 pub(crate) const ERF_BACKEND: &str = concat!(
     "pytorch-gelu-erf-bf16-cuda@7269437d655783a26cba32aa88195b741ff496aa/",
-    "source-sha256:d896d28a6f0762f2b0bc64f2aaef5cefa86182344ec28017deb3a0962d41e6cc/",
     "nvrtc-",
-    env!("FLYINGFISH_QWEN_GELU_NVRTC_VERSION"),
-    "/nvrtc-sha256:",
-    env!("FLYINGFISH_QWEN_GELU_NVRTC_SHA256"),
-    "/builtins-sha256:",
-    env!("FLYINGFISH_QWEN_GELU_NVRTC_BUILTINS_SHA256"),
+    env!("FLYINGFISH_GELU_NVRTC_VERSION"),
     "/",
     env!("FLYINGFISH_H3_RMS_NORM_PTX_ARCH"),
     "/shape-profile:1008|7056x4608-v1"
@@ -108,12 +98,12 @@ impl CustomOp1 for QwenGeluBf16 {
         }
         let mut output = unsafe { device.alloc::<half::bf16>(elements) }?;
         let function_name = match self.kind {
-            GeluKind::Tanh => "qwen_gelu_tanh_bf16",
-            GeluKind::Erf => "qwen_gelu_erf_bf16",
+            GeluKind::Tanh => "gelu_tanh_bf16",
+            GeluKind::Erf => "gelu_erf_bf16",
         };
         let function = crate::cuda::kernel_assets::load_function(
             &device,
-            &crate::cuda::kernel_assets::QWEN_GELU_BF16,
+            &crate::cuda::kernel_assets::GELU_BF16,
             CUDA_MODULE,
             function_name,
         )?;

@@ -77,9 +77,13 @@ pub fn build_compressed_token_map(tokenizer: &tokenizers::Tokenizer) -> Result<(
     for (token_id, slot) in lookup.iter_mut().enumerate() {
         let text = tokenizer
             .decode(&[token_id as u32], false)
-            .unwrap_or_default();
+            .map_err(|error| {
+                anyhow::anyhow!("tokenizer decode of token id {token_id} failed: {error}")
+            })?;
         let key = if text.contains('\u{fffd}') {
-            tokenizer.id_to_token(token_id as u32).unwrap_or_default()
+            tokenizer.id_to_token(token_id as u32).ok_or_else(|| {
+                anyhow::anyhow!("token id {token_id} is missing from the tokenizer vocabulary")
+            })?
         } else {
             let mut normalized = NormalizedString::from(text.as_str());
             normalizer

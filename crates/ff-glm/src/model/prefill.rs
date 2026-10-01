@@ -77,7 +77,8 @@ impl StreamedGlm {
             sum.checked_add(bytes)
                 .context("GLM request admission bytes overflow")
         })?;
-        let snapshot = ResourceSnapshot::capture(Some(&self.device));
+        let snapshot =
+            ResourceSnapshot::capture(Some(&self.device)).context("resource probe failed")?;
         let available = if self.device.is_cpu() {
             crate::admission::host_available(&snapshot)
         } else if admission.unified_pool {
@@ -440,15 +441,14 @@ impl StreamedGlm {
             )?;
             let states = input.index_select(&indices, 0)?;
             let gate_up = Tensor::cat(&[&gate, &up], 0)?;
-            let projected = self.traced_linear(&states, &gate_up)?;
+            let projected = linear(&states, &gate_up)?;
             let width = gate.dim(0)?;
             let activated = math::clamped_swiglu(
                 &projected.narrow(1, 0, width)?,
                 &projected.narrow(1, width, width)?,
                 text.swiglu_limit,
             )?;
-            let contribution = self
-                .traced_linear(&activated, &down)?
+            let contribution = linear(&activated, &down)?
                 .to_dtype(DType::F32)?
                 .broadcast_mul(&Tensor::from_vec(
                     rows.iter().map(|(_, weight)| *weight).collect::<Vec<_>>(),
@@ -563,11 +563,11 @@ mod tests {
         }
         safetensors::save(&tensors, path)?;
         let open = |resident| {
-            StreamedGlm::open(
-                checkpoint.path(),
+            let mut options =
                 StreamedGlmOptions::new(WeightSource::Mmap, CachePolicy::new(1), device.clone())
-                    .with_resident_static(resident),
-            )
+                    .with_resident_static(resident);
+            options.io_readers = Some([0, 1]);
+            StreamedGlm::open(checkpoint.path(), options)
         };
         let resident = open(true)?;
         let streamed = open(false)?;
@@ -644,7 +644,10 @@ mod tests {
         let checkpoint = crate::test_support::tiny_checkpoint();
         let model = StreamedGlm::open(
             checkpoint.path(),
-            StreamedGlmOptions::new(WeightSource::Mmap, CachePolicy::new(1), Device::Cpu),
+            StreamedGlmOptions {
+                io_readers: Some([0, 1]),
+                ..StreamedGlmOptions::new(WeightSource::Mmap, CachePolicy::new(1), Device::Cpu)
+            },
         )
         .unwrap();
         let mut batched = DecoderState::new(&model.config, DType::F32, &Device::Cpu).unwrap();

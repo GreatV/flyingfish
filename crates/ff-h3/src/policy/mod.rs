@@ -52,20 +52,7 @@ impl ExecutionBackendPolicy {
     }
 }
 
-/// What a CUDA device afforded the operators, observed rather than assumed.
-///
-/// These two axes are independent and neither is a property of "which machine
-/// this is" as a whole, which is why one backend value plus this record says
-/// what a tier enum used to only approximate.
-///
-/// `tuned_kernels` covers the kernels compiled from this repository's own
-/// `src/cuda/*.cu`. Their numerics are fixed by that source and the single
-/// `compute_80` PTX it compiles to, so the only question is whether the
-/// hardware can execute those instructions.
-///
-/// `reference_libraries` covers the operators that call cuBLASLt or cuDNN.
-/// Those libraries select different kernels per architecture and per build, so
-/// reproducing a recorded result through them is a claim about one host.
+/// CUDA capabilities for repository kernels and reference libraries, recorded independently.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CudaCapabilities {
@@ -203,23 +190,7 @@ pub enum H3CollectiveReductionOrderContract {
     RingRankAscendingV1,
 }
 
-/// The partition and reduction order one run used, and the rank count they were
-/// resolved over.
-///
-/// The rank count is part of the identity because the same partition over a
-/// different number of ranks resolves a different sum. Recording the rank count
-/// in the contract is the cheap route, and the one that permanently splits the
-/// evidence base; the alternative is a rank-invariant reduction that would keep
-/// one contract for every configuration at a throughput cost. This field names
-/// what a run actually did; it does not choose between those futures, and a
-/// rank-invariant reduction would appear here as its own order rather than by
-/// removing the field.
-///
-/// A single-rank contract is the default and is omitted from the serialized
-/// form, so every policy recorded before this field existed keeps its bytes and
-/// therefore its hash: the evidence base splits only for the rank counts that
-/// genuinely differ. A build that predates the field rejects a multi-rank
-/// policy outright, because the contract denies unknown fields.
+/// Collective partition, reduction order and rank count used by the run; single-rank serialization is omitted.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct H3CollectiveContract {
@@ -1922,8 +1893,7 @@ mod tests {
         contract
             .insert_artifact_tensors(&mut encoded, &Device::Cpu)
             .unwrap();
-        // The contract and its schema; the digest tensor that used to sit
-        // beside them described the JSON already there.
+        // The artifact carries the numerical contract and its schema.
         assert_eq!(encoded.len(), 2);
         let mut loaded = encoded
             .iter()
@@ -1979,69 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cuda_code_annotations_are_preserved_but_not_gates() {
-        fn annotate(value: &mut serde_json::Value) {
-            match value {
-                serde_json::Value::Object(fields) => {
-                    for (name, value) in fields {
-                        if name.ends_with("_sha256") {
-                            *value = "legacy annotation, not a digest".into();
-                        } else {
-                            annotate(value);
-                        }
-                    }
-                }
-                serde_json::Value::Array(values) => values.iter_mut().for_each(annotate),
-                _ => {}
-            }
-        }
-        let h3 = H3NumericalContract::for_verified_target(
-            ExecutionBackendPolicy::Cuda,
-            AttentionBackendPolicy::FullSoftmax,
-        )
-        .unwrap();
-        let mut legacy = serde_json::to_value(&h3).unwrap();
-        annotate(&mut legacy["cuda_artifacts"]);
-        let loaded: H3NumericalContract = serde_json::from_value(legacy.clone()).unwrap();
-        loaded
-            .validate_for(
-                ExecutionBackendPolicy::Cuda,
-                Some(CudaCapabilities::REFERENCE),
-                AttentionBackendPolicy::FullSoftmax,
-            )
-            .unwrap();
-        assert_eq!(loaded, h3);
-        assert_eq!(serde_json::to_value(&loaded).unwrap(), legacy);
-
-        let qwen = vision_conditioning_contract(
-            ExecutionBackendPolicy::Cuda,
-            256,
-            1935,
-            &[(H3QwenVisionGridModality::Image, 1, 48, 84)],
-        );
-        let mut legacy = serde_json::to_value(&qwen).unwrap();
-        annotate(&mut legacy["cuda_artifacts"]);
-        let loaded: H3QwenNumericalContract = serde_json::from_value(legacy.clone()).unwrap();
-        loaded.validate().unwrap();
-        assert_eq!(loaded.first_difference(&qwen), None);
-        assert_eq!(loaded, qwen);
-        assert_eq!(serde_json::to_value(&loaded).unwrap(), legacy);
-        let mut tensors = HashMap::new();
-        loaded
-            .insert_artifact_tensors(&mut tensors, &Device::Cpu)
-            .unwrap();
-        let mut tensors = tensors
-            .into_iter()
-            .map(|(name, tensor)| (name.to_owned(), tensor))
-            .collect();
-        assert_eq!(
-            H3QwenNumericalContract::take_artifact_tensors(&mut tensors).unwrap(),
-            Some(loaded)
-        );
-    }
-
-    #[test]
-    fn conditioning_first_difference_and_hash_cover_geometry_and_cuda_artifacts() {
+    fn conditioning_identity_covers_geometry_and_cuda_artifacts() {
         let grids = [(H3QwenVisionGridModality::Image, 1, 48, 84)];
         let baseline =
             vision_conditioning_contract(ExecutionBackendPolicy::Cuda, 256, 1935, &grids);
@@ -2215,8 +2123,7 @@ mod tests {
         let mut bad_tail = fl.clone();
         bad_tail.ordered_vision_grids[0].query_tail_rows += 1;
         assert!(bad_tail.validate().is_err());
-        // The count bound the canonical encoder used to carry now lives in
-        // `validate`, so it still refuses a grid list no verified run produces.
+        // Validation rejects unsupported grid counts.
         let mut too_many = fl.clone();
         let grid = too_many.ordered_vision_grids[0].clone();
         too_many.ordered_vision_grids = (0..=MAX_QWEN_ORDERED_VISION_GRIDS)

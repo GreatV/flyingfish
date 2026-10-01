@@ -5,6 +5,8 @@ use float8::F8E4M3;
 use half::bf16;
 use std::num::NonZeroUsize;
 
+pub(crate) const PINNED_FILL_PADDING_BYTES: usize = 8192;
+
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda;
 #[cfg(feature = "cuda")]
@@ -16,13 +18,6 @@ pub struct Fp8TransferStats {
     pub uploaded_bytes: u64,
     pub slot_allocations: u64,
     pub staging_bytes_per_tier: u64,
-    pub trace: Vec<Fp8TransferInterval>,
-}
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct Fp8TransferInterval {
-    pub kind: String,
-    pub start_ms: f32,
-    pub end_ms: f32,
 }
 
 /// Block edge used by the official GLM-5.3-Flash fine-grained FP8 checkpoint.
@@ -292,23 +287,20 @@ impl CustomOp2 for FusedCpuDequantize {
 
 /// Divide CPU capacity across host experts to avoid nested thread oversubscription.
 /// FF_GLM_HOST_MATVEC_THREADS overrides the per-matvec worker count.
-fn host_matvec_workers() -> usize {
-    static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *WORKERS.get_or_init(|| {
-        let cores = std::thread::available_parallelism()
-            .map(NonZeroUsize::get)
-            .unwrap_or(1);
-        let host_workers = std::env::var("FF_GLM_HOST_THREADS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(4)
-            .max(1);
-        std::env::var("FF_GLM_HOST_MATVEC_THREADS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or((cores / host_workers).max(1))
-            .max(1)
-    })
+fn host_matvec_workers() -> Result<usize> {
+    static WORKERS: std::sync::OnceLock<std::result::Result<usize, String>> =
+        std::sync::OnceLock::new();
+    let cores = std::thread::available_parallelism()
+        .context("logical_cpu_count unavailable; run ff probe --json")?
+        .get();
+    let host_workers = ff_core::probe::env_usize("FF_GLM_HOST_THREADS", 4, 1, usize::MAX)?;
+    ff_core::probe::cached_env_usize(
+        &WORKERS,
+        "FF_GLM_HOST_MATVEC_THREADS",
+        (cores / host_workers).max(1),
+        1,
+        usize::MAX,
+    )
 }
 
 /// CPU matvec on `[rows, cols]` E4M3 weights and `[cols]` input, without a decoded matrix.
@@ -449,6 +441,7 @@ impl CustomOp3 for FusedCpuMatvec {
 
         let mut output = vec![0f32; rows];
         let workers = host_matvec_workers()
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?
             .min(rows.div_ceil(FP8_BLOCK_SIZE))
             .max(1);
         // Split on row-block boundaries so a worker owns whole blocks and never
@@ -576,13 +569,7 @@ fn validate_block_fp8_metadata(
     Ok(())
 }
 
-/// Load an unquantized BF16 linear weight, preserving BF16 unless F32 was
-/// explicitly requested.
-///
-/// `ModelWeights` promotes CPU BF16 tensors to F32 because Candle cannot run
-/// CPU half-precision matrix multiplication.  This function converts that
-/// promoted value back to BF16 when the caller explicitly requests BF16, so
-/// its result contract is independent of the selected device.
+/// CPU BF16 weights are promoted to F32 for ordinary Candle operations.
 pub fn load_bf16_weight(
     weights: &ModelWeights,
     weight_name: &str,

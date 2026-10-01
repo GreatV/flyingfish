@@ -1,26 +1,13 @@
-// Fused groupwise-affine int4/int8 dequant GEMV for decode (batch 1).
-//
-// Layout (byte-level pinned): payload U32 words
-// pack 8x unsigned int4 (low nibble first) or 4x unsigned int8; scales and
-// biases are f32 [out, in/64] uploads. Exact reconstruction w = s*q + b:
-// y[o] = sum_g s[o,g]*dot_g + b[o,g]*groupsum_g.
-//
-// RPB rows per block; x preloaded once into registers (x is
-// identical across a block's rows — the one-block-per-row shape staged 8x
-// more x traffic than weights and ran at ~16% of DRAM bandwidth). Threads
-// cover ceil(words/256) words each (int4 in 4096 = 512 words, int8 in
-// 4096 = 1024); per word the segment shuffle stays 8/16-aligned because
-// blockDim is a multiple of the segment width. Group leaders write
-// per-group partials; thread 0 sums them in fixed group order per row —
-// deterministic run-to-run. in_dim must be a multiple of 64, <= 4096.
+#include <cuda_bf16.h>
+// Groupwise affine GEMV: packed U32 int4/int8, F32 scales/biases per 64 inputs; w = s*q + b. Block rows reuse x; group partials are summed in fixed order. in_dim is a multiple of 64 and at most 4096.
 
 // RPB is a macro parameter (16 default, 4 for small out_dims)
 
 #define GEMV(NAME, BITS, PER_WORD, SEG, WPT_CAP, RPB)                         \
 extern "C" __global__ void edge0_gemv##NAME(                                  \
     const unsigned int* __restrict__ packed,                                  \
-    const float* __restrict__ scales,                                         \
-    const float* __restrict__ biases,                                         \
+    const __nv_bfloat16* __restrict__ scales,                                         \
+    const __nv_bfloat16* __restrict__ biases,                                         \
     const float* __restrict__ x,                                              \
     float* __restrict__ y,                                                    \
     int out_dim,                                                              \
@@ -37,8 +24,18 @@ extern "C" __global__ void edge0_gemv##NAME(                                  \
     __shared__ float rt[RPB];                                                 \
     if (tid < nrows) rt[tid] = 0.0f;                                          \
     __syncthreads();                                                          \
+    __shared__ float s_sc[RPB][64];                                           \
+    __shared__ float s_bi[RPB][64];                                           \
     for (int c0 = 0; c0 < in_dim; c0 += 4096) {                               \
         const int cin = min(4096, in_dim - c0);                               \
+        for (int i = tid; i < nrows * 64; i += blockDim.x) {                  \
+            const int sr = i / 64;                                            \
+            const int sg = i % 64;                                            \
+            const int gi = (row0 + sr) * groups + c0 / 64 + sg;               \
+            s_sc[sr][sg] = __bfloat162float(scales[gi]);                      \
+            s_bi[sr][sg] = __bfloat162float(biases[gi]);                      \
+        }                                                                     \
+        __syncthreads();                                                      \
         const int cwords = cin / PER_WORD;                                    \
         const int cwpt = (cwords + blockDim.x - 1) / blockDim.x;              \
         float xr[WPT_CAP][PER_WORD];                                          \
@@ -69,7 +66,6 @@ extern "C" __global__ void edge0_gemv##NAME(                                  \
         _Pragma("unroll")                                                     \
         for (int r = 0; r < RPB; r++) {                                       \
             if (r >= nrows) break;                                            \
-            const int row = row0 + r;                                         \
             _Pragma("unroll")                                                 \
             for (int k = 0; k < WPT_CAP; k++) {                               \
                 if (k >= cwpt) break;                                         \
@@ -92,9 +88,8 @@ extern "C" __global__ void edge0_gemv##NAME(                                  \
                 }                                                             \
                 if (w < cwords && (tid & (SEG - 1)) == 0) {                   \
                     const int group = c0 / 64 + w / (64 / PER_WORD);          \
-                    const int gi = row * groups + group;                      \
                     partials[r][group - c0 / 64] =                            \
-                        scales[gi] * dot + biases[gi] * sumx;                 \
+                        s_sc[r][w / (64 / PER_WORD)] * dot + s_bi[r][w / (64 / PER_WORD)] * sumx;                 \
                 }                                                             \
             }                                                                 \
         }                                                                     \

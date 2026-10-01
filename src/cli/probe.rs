@@ -1,4 +1,5 @@
 use super::device_parse::parse_device_single;
+use anyhow::Context;
 use anyhow::Result;
 use flyingfish::runtime::probe::{DeviceBackend, HardwareFingerprint, ResourceSnapshot};
 use serde::Serialize;
@@ -12,11 +13,11 @@ struct ProbeReport {
 
 pub(super) fn run_probe(device: String, json: bool) -> Result<()> {
     let device = parse_device_single(&device)?;
-    let fingerprint = HardwareFingerprint::collect(&device);
+    let fingerprint = HardwareFingerprint::collect(&device)?;
     let report = ProbeReport {
         calibration_cache_reuse_supported: fingerprint.supports_calibration_cache_reuse(),
         fingerprint,
-        snapshot: ResourceSnapshot::capture(Some(&device)),
+        snapshot: ResourceSnapshot::capture(Some(&device)).context("resource probe failed")?,
     };
 
     if json {

@@ -81,9 +81,6 @@ impl KernelAssets {
 }
 
 /// Compute capability of a CUDA device, cached per device.
-///
-/// Cached because it is queried on the first launch of every kernel and the
-/// driver call is not free, and because it cannot change for a live device.
 pub fn compute_capability(device: &CudaDevice) -> candle_core::Result<(i32, i32)> {
     use candle_core::cuda_backend::cudarc::driver::sys::CUdevice_attribute;
 

@@ -11,7 +11,7 @@ pub fn measure_io_bandwidth(
     payload_format: &str,
 ) -> Result<IoCalibrationReport> {
     validate_payload_format(payload_format)?;
-    let fingerprint = HardwareFingerprint::collect(device);
+    let fingerprint = HardwareFingerprint::collect(device)?;
     fingerprint.validate()?;
     let key = IoCalibrationKey::from_fingerprint(&fingerprint, payload_format)?;
 

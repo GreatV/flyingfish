@@ -103,7 +103,7 @@ __device__ __forceinline__ WelfordData compute_rms_stats(
 
 }  // namespace
 
-extern "C" __global__ void h3_rms_norm_bf16(
+extern "C" __global__ void rms_norm_bf16(
     int width,
     float epsilon,
     const __nv_bfloat16* __restrict__ input,
@@ -139,7 +139,7 @@ extern "C" __global__ void h3_rms_norm_bf16(
 // Qwen's unfused RMSNorm calls torch.rsqrt as a distinct F32 pointwise op.
 // Keep that operation distinct from sqrt+reciprocal, which is not bitwise
 // equivalent on CUDA.
-extern "C" __global__ void qwen_rsqrt_f32(
+extern "C" __global__ void rsqrt_f32(
     int elements,
     const float* __restrict__ input,
     float* __restrict__ output) {

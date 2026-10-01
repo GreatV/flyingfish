@@ -87,18 +87,18 @@ pub enum TopologyProfileAbsence {
 }
 
 impl TopologyProfile {
-    pub fn capture(primary: &Device) -> Self {
-        let fingerprint = HardwareFingerprint::collect(primary);
-        let snapshot = ResourceSnapshot::capture(None);
+    pub fn capture(primary: &Device) -> anyhow::Result<Self> {
+        let fingerprint = HardwareFingerprint::collect(primary)?;
+        let snapshot = ResourceSnapshot::capture(None).context("resource probe failed")?;
         let host_memory_total_bytes = snapshot.host_pool_total_bytes();
         let cgroup_memory_limit_bytes = match snapshot.cgroup_v2_memory_limit {
             Some(crate::probe::CgroupMemoryLimit::Bytes(bytes)) => Some(bytes),
             _ => None,
         };
-        let devices = enumerate_devices(&fingerprint);
-        let peer_links = capture_peer_links(devices.len());
+        let devices = enumerate_devices(&fingerprint)?;
+        let peer_links = capture_peer_links(devices.len())?;
         let interconnect = synthesize_interconnect(devices.len(), &peer_links);
-        Self {
+        Ok(Self {
             schema_version: TOPOLOGY_PROFILE_SCHEMA_VERSION,
             fingerprint,
             host_memory_total_bytes,
@@ -107,7 +107,7 @@ impl TopologyProfile {
             peer_links,
             interconnect,
             storage_bytes_per_second: None,
-        }
+        })
     }
 
     pub fn with_storage_bandwidth(mut self, bytes_per_second: Option<u64>) -> Self {
@@ -131,10 +131,12 @@ impl TopologyProfile {
         // The schema version is read loosely first: a newer schema's fields
         // would fail the strict decode before the version check could name
         // the real reason.
-        let version = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|value| value.get("schema_version").and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .context("invalid topology profile JSON; regenerate with ff probe --json")?;
+        let version = value.get("schema_version").and_then(|v| v.as_u64()).context("topology profile schema_version missing or invalid; regenerate with ff probe --json")?;
+        let version = u32::try_from(version).context(
+            "topology profile schema_version exceeds u32; regenerate with ff probe --json",
+        )?;
         if version != TOPOLOGY_PROFILE_SCHEMA_VERSION {
             return Ok(Err(TopologyProfileAbsence::StaleSchema {
                 path: path.to_path_buf(),
@@ -143,7 +145,7 @@ impl TopologyProfile {
         }
         let recorded = Self::from_json(&bytes)
             .with_context(|| format!("invalid topology profile {}", path.display()))?;
-        let current_snapshot = ResourceSnapshot::capture(None);
+        let current_snapshot = ResourceSnapshot::capture(None).context("resource probe failed")?;
         let current_limit = match current_snapshot.cgroup_v2_memory_limit {
             Some(crate::probe::CgroupMemoryLimit::Bytes(bytes)) => Some(bytes),
             _ => None,
@@ -155,11 +157,9 @@ impl TopologyProfile {
                 current: current_limit,
             }));
         }
-        // A CUDA_VISIBLE_DEVICES reorder keeps the machine but renumbers the
-        // ordinals, so the recorded per-ordinal capacity map no longer
-        // applies; the derivation recaptures under the new mapping.
-        let current = HardwareFingerprint::collect(primary);
-        let current_devices = enumerate_devices(&current);
+        // The recorded device UUID order must match the visible ordinals.
+        let current = HardwareFingerprint::collect(primary)?;
+        let current_devices = enumerate_devices(&current)?;
         if device_uuid_sequence(&recorded.devices) != device_uuid_sequence(&current_devices) {
             return Ok(Err(TopologyProfileAbsence::ForeignHost {
                 path: path.to_path_buf(),
@@ -187,14 +187,14 @@ impl TopologyProfile {
     }
 }
 
-fn enumerate_devices(primary: &HardwareFingerprint) -> Vec<TopologyDevice> {
+fn enumerate_devices(primary: &HardwareFingerprint) -> Result<Vec<TopologyDevice>> {
     let mut devices = Vec::new();
     if primary.backend != DeviceBackend::Cuda {
-        return devices;
+        return Ok(devices);
     }
     let mut ordinal = 0;
     while let Ok(device) = Device::new_cuda(ordinal) {
-        let fingerprint = HardwareFingerprint::collect(&device);
+        let fingerprint = HardwareFingerprint::collect(&device)?;
         devices.push(TopologyDevice {
             ordinal,
             backend: fingerprint.backend,
@@ -205,7 +205,7 @@ fn enumerate_devices(primary: &HardwareFingerprint) -> Vec<TopologyDevice> {
         });
         ordinal += 1;
     }
-    devices
+    Ok(devices)
 }
 
 fn device_uuid_sequence(devices: &[TopologyDevice]) -> Vec<Option<String>> {
@@ -216,9 +216,9 @@ fn device_uuid_sequence(devices: &[TopologyDevice]) -> Vec<Option<String>> {
 }
 
 #[cfg(feature = "cuda")]
-fn capture_peer_links(device_count: usize) -> Vec<PeerLink> {
+fn capture_peer_links(device_count: usize) -> Result<Vec<PeerLink>> {
     if device_count < 2 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // `nvidia-smi topo -m` labels use physical GPU numbers. When
     // CUDA_VISIBLE_DEVICES filters or reorders, CUDA ordinals diverge from
@@ -235,14 +235,7 @@ fn capture_peer_links(device_count: usize) -> Vec<PeerLink> {
     let mut links = Vec::new();
     for a in 0..device_count {
         for b in (a + 1)..device_count {
-            // Peer access is directional: either direction is enough, and a
-            // confirmed no in one direction still lets the reverse answer.
-            let reachable = match crate::probe::can_access_peer(a as u32, b as u32) {
-                Some(true) => true,
-                Some(false) | None => {
-                    crate::probe::can_access_peer(b as u32, a as u32).unwrap_or(false)
-                }
-            };
+            let reachable = peer_reachable(a, b, crate::probe::can_access_peer)?;
             links.push(PeerLink {
                 a,
                 b,
@@ -251,18 +244,30 @@ fn capture_peer_links(device_count: usize) -> Vec<PeerLink> {
             });
         }
     }
-    links
+    Ok(links)
 }
 
 #[cfg(not(feature = "cuda"))]
-fn capture_peer_links(_device_count: usize) -> Vec<PeerLink> {
-    Vec::new()
+fn capture_peer_links(_device_count: usize) -> Result<Vec<PeerLink>> {
+    Ok(Vec::new())
 }
 
-/// The synthesis records link facts only. Link labels come from the
-/// topology table, and `nvidia-smi topo -m` was measured not to predict
-/// concurrent transfer behaviour on this fleet, so nothing downstream may
-/// read a bandwidth figure out of these levels.
+#[cfg(any(feature = "cuda", test))]
+fn peer_reachable(
+    a: usize,
+    b: usize,
+    mut query: impl FnMut(u32, u32) -> Option<bool>,
+) -> Result<bool> {
+    let forward = query(u32::try_from(a)?, u32::try_from(b)?).with_context(|| {
+        format!("peer access {a}->{b} unavailable; run ff probe --device cuda:{a} --json")
+    })?;
+    let reverse = query(u32::try_from(b)?, u32::try_from(a)?).with_context(|| {
+        format!("peer access {b}->{a} unavailable; run ff probe --device cuda:{b} --json")
+    })?;
+    Ok(forward || reverse)
+}
+
+/// Link classes describe topology, not measured transfer bandwidth.
 fn synthesize_interconnect(device_count: usize, links: &[PeerLink]) -> InterconnectLevel {
     if device_count < 2 {
         return InterconnectLevel::SingleDevice;
@@ -299,7 +304,7 @@ fn nvidia_smi_link_labels(device_count: usize) -> Vec<Option<LinkClass>> {
     parse_topo_matrix(&text, device_count)
 }
 
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg(any(feature = "cuda", test))]
 fn parse_topo_matrix(text: &str, device_count: usize) -> Vec<Option<LinkClass>> {
     let mut labels = vec![None; device_count * device_count];
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
@@ -377,7 +382,48 @@ mod tests {
     use crate::probe::HARDWARE_FINGERPRINT_SCHEMA_VERSION;
 
     fn cpu_profile() -> TopologyProfile {
-        TopologyProfile::capture(&Device::Cpu)
+        TopologyProfile::capture(&Device::Cpu).unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires two CUDA devices"]
+    fn dual_cuda_capture_retains_driver_peer_answers() -> Result<()> {
+        let first = Device::new_cuda(0)?;
+        let _second = Device::new_cuda(1)?;
+        let profile = TopologyProfile::capture(&first)?;
+        anyhow::ensure!(
+            profile.devices.len() == 2,
+            "expected two visible CUDA devices"
+        );
+        anyhow::ensure!(
+            profile.peer_links.len() == 1,
+            "expected the one measured peer pair"
+        );
+        let link = &profile.peer_links[0];
+        let forward = crate::probe::can_access_peer(0, 1).context("peer 0->1 unavailable")?;
+        let reverse = crate::probe::can_access_peer(1, 0).context("peer 1->0 unavailable")?;
+        assert_eq!((link.a, link.b, link.reachable), (0, 1, forward || reverse));
+        println!("topology: {}", serde_json::to_string(&profile)?);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_peer_queries_name_the_pair_and_probe_command() {
+        for missing in [(0, 1), (1, 0)] {
+            let error = peer_reachable(
+                0,
+                1,
+                |a, b| if (a, b) == missing { None } else { Some(true) },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&format!("{}->{}", missing.0, missing.1))
+                    && error.contains("ff probe")
+            );
+        }
+        assert!(!peer_reachable(0, 1, |_, _| Some(false)).unwrap());
     }
 
     #[test]

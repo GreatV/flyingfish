@@ -22,22 +22,8 @@ use serde::Deserialize;
 use std::{collections::BTreeMap, fs, io::Cursor, num::NonZeroUsize, path::Path};
 use tokenizers::Tokenizer;
 
-/// Whether this device may run the pinned exact kernels.
-///
-/// Every exact-kernel dispatch in this crate goes through here, so a host the
-/// pinned profile does not cover takes the portable Candle path instead of
-/// failing at the first transcribed operator.
-/// Whether this device may run the kernels compiled from this repository.
-fn tuned_cuda(device: &candle_core::Device) -> bool {
-    crate::cuda::tuned_kernels_available(device)
-}
-
-/// Whether this host's vendor libraries are the reference ones, which is what
-/// the cuBLASLt and cuDNN operators reproduce.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn reference_cuda(device: &candle_core::Device) -> bool {
-    crate::cuda::profile::reference_libraries_available(device)
-}
+use crate::cuda::profile::reference_libraries_available as reference_cuda;
+use crate::cuda::tuned_kernels_available as tuned_cuda;
 
 const LAYER_NORM_EPS: f64 = 1e-6;
 const DEFAULT_TARGET_HIDDEN_STATE: usize = 50;

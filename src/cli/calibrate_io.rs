@@ -168,6 +168,14 @@ fn run_local_interconnect(config: CalibrateIoConfig) -> Result<()> {
             expert_index,
         },
     )?;
+    {
+        let [prefetch, fill] = report
+            .glm_routed_expert
+            .as_ref()
+            .context("local I/O report has no GLM section")?
+            .reader_counts;
+        println!("GLM calibrated readers: prefetch={prefetch}, fill={fill}");
+    }
     let json = serde_json::to_vec_pretty(&report)
         .context("failed to serialize local-interconnect I/O report")?;
     let _ = LocalIoBenchmarkReport::from_json(&json)?;
@@ -182,6 +190,8 @@ fn run_local_interconnect(config: CalibrateIoConfig) -> Result<()> {
         gib_per_second(
             report
                 .h3_standard_block_cut
+                .as_ref()
+                .context("local I/O report has no H3 section")?
                 .same_device_d2d
                 .statistics
                 .median_bytes_per_second,
@@ -189,6 +199,8 @@ fn run_local_interconnect(config: CalibrateIoConfig) -> Result<()> {
         gib_per_second(
             report
                 .h3_standard_block_cut
+                .as_ref()
+                .context("local I/O report has no H3 section")?
                 .pinned_host_staged_roundtrip
                 .statistics
                 .median_bytes_per_second,
@@ -196,12 +208,19 @@ fn run_local_interconnect(config: CalibrateIoConfig) -> Result<()> {
         gib_per_second(
             report
                 .h3_standard_block_cut
+                .as_ref()
+                .context("local I/O report has no H3 section")?
                 .tcp_loopback_roundtrip
                 .statistics
                 .median_bytes_per_second,
         ),
     );
-    match &report.h3_standard_block_cut.peer_device_d2d {
+    match &report
+        .h3_standard_block_cut
+        .as_ref()
+        .context("local I/O report has no H3 section")?
+        .peer_device_d2d
+    {
         PeerD2dMeasurement::Measured { series, .. } => println!(
             "peer-device D2D {:.3} GiB/s",
             gib_per_second(series.statistics.median_bytes_per_second)
@@ -218,6 +237,8 @@ fn run_local_interconnect(config: CalibrateIoConfig) -> Result<()> {
         gib_per_second(
             report
                 .glm_routed_expert
+                .as_ref()
+                .context("local I/O report has no GLM section")?
                 .pinned_host_to_device_b_p
                 .statistics
                 .median_bytes_per_second,
@@ -225,10 +246,16 @@ fn run_local_interconnect(config: CalibrateIoConfig) -> Result<()> {
         gib_per_second(
             report
                 .glm_routed_expert
+                .as_ref()
+                .context("local I/O report has no GLM section")?
                 .host_evaluation_b_h
                 .median_service_bytes_per_second,
         ),
-        report.glm_routed_expert.b_p_over_b_h,
+        report
+            .glm_routed_expert
+            .as_ref()
+            .context("local I/O report has no GLM section")?
+            .b_p_over_b_h,
     );
     Ok(())
 }
@@ -281,4 +308,191 @@ mod tests {
         assert!(error.to_string().contains("explicit cuda:N"));
         assert!(!output.exists());
     }
+}
+
+#[derive(Debug, clap::Args)]
+pub(super) struct Group4Args {
+    #[arg(long, value_parser=["qwen35", "edge0"])]
+    adapter: String,
+    #[arg(long)]
+    model: PathBuf,
+    #[arg(long)]
+    device: String,
+    #[arg(long)]
+    host_profile: PathBuf,
+    #[arg(long, default_value_t=std::num::NonZeroUsize::new(4096).unwrap())]
+    max_context: std::num::NonZeroUsize,
+    #[arg(long, requires = "rounds", conflicts_with = "resident_experts")]
+    speculative: bool,
+    #[arg(long, requires = "speculative")]
+    rounds: Option<std::num::NonZeroUsize>,
+    #[arg(long)]
+    resident_experts: bool,
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(super) fn run_group4(_args: Group4Args) -> Result<()> {
+    bail!("ff bench group4 requires --features cuda")
+}
+
+#[cfg(feature = "cuda")]
+pub(super) fn run_group4(args: Group4Args) -> Result<()> {
+    use flyingfish::{host_profile::HostProfile, runtime::probe::DecodeChoice};
+    anyhow::ensure!(
+        std::env::var_os("FF_GROUP4_BODY").is_none(),
+        "calibration refuses FF_GROUP4_BODY; unset it before ff bench group4"
+    );
+    anyhow::ensure!(
+        args.adapter != "qwen35" || std::env::var_os("QWEN35_GRAPH").is_none_or(|v| v != "0"),
+        "ff bench group4 measures graph replay; unset QWEN35_GRAPH=0"
+    );
+    let ordinals = super::device_parse::parse_device_ordinals(&args.device)?;
+    anyhow::ensure!(
+        !ordinals.is_empty() && args.device.starts_with("cuda:"),
+        "ff bench group4 requires explicit --device cuda:N[,M...]"
+    );
+    anyhow::ensure!(
+        args.adapter == "qwen35" || !args.speculative,
+        "Edge0 calibration does not support --speculative"
+    );
+    anyhow::ensure!(
+        args.adapter == "edge0" || !args.resident_experts,
+        "--resident-experts applies to Edge0"
+    );
+    let output = resolve_output_outside_model(&args.host_profile, &args.model)?;
+    eprintln!(
+        "model: {}; host profile: {}",
+        args.model.display(),
+        output.display()
+    );
+    let device = candle_core::Device::new_cuda(ordinals[0])?;
+    let mut report = if output.exists() {
+        HostProfile::load(&output, &device)?
+            .map_err(|e| anyhow::anyhow!("{e}; run ff bench group4"))?
+            .into_report()
+    } else {
+        LocalIoBenchmarkReport {
+            schema_version: flyingfish::interconnect_benchmark::LOCAL_IO_BENCHMARK_SCHEMA_VERSION,
+            measured_at_unix_ms: u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis(),
+            )?,
+            model_root: None,
+            model_config: None,
+            primary_cuda_ordinal: u32::try_from(ordinals[0])?,
+            visible_cuda_devices: u32::try_from(cudarc::driver::CudaContext::device_count()?)?,
+            fingerprint: flyingfish::runtime::probe::HardwareFingerprint::collect(&device).unwrap(),
+            warmup_iterations: 0,
+            sample_iterations: 0,
+            h3_standard_block_cut: None,
+            glm_routed_expert: None,
+            group4: Vec::new(),
+        }
+    };
+    let binary = flyingfish::collect_binary_identity()?;
+    let mut trials = Vec::new();
+    for trial in 0..3 {
+        eprintln!("group4 independent calibration {}/3", trial + 1);
+        let records = match args.adapter.as_str() {
+            "qwen35" => {
+                use flyingfish::qwen35::{
+                    config::Qwen35Config, gpu::QwenGpu, spec::QwenSpec, weights::Qwen35Weights,
+                };
+                let config = Qwen35Config::from_model_dir(&args.model)?;
+                anyhow::ensure!(
+                    args.max_context.get() <= config.text_config.max_position_embeddings,
+                    "calibration context exceeds model capacity"
+                );
+                let weights = Qwen35Weights::open(&args.model)?;
+                anyhow::ensure!(
+                    !weights.format().is_16bit(),
+                    "group4 calibration requires an int4 checkpoint"
+                );
+                let mut gpu = QwenGpu::with_max_ctx(
+                    &ordinals,
+                    &weights,
+                    &config,
+                    args.max_context.get(),
+                    ff_qwen35::gpu::force_stream_requested(),
+                )?;
+                gpu.calibrate_groups()?;
+                if args.speculative {
+                    let rounds = args
+                        .rounds
+                        .context("--rounds is required with --speculative")?
+                        .get();
+                    gpu.push_token(0)?;
+                    let mut spec = QwenSpec::new(&mut gpu, &weights, rounds)?;
+                    spec.calibrate_groups(&mut gpu)?;
+                }
+                gpu.calibration_records(&binary, args.rounds.map(|n| n.get()))?
+            }
+            "edge0" => {
+                use flyingfish::edge0::{
+                    config::Edge0Config,
+                    model::{Edge0Text, configured_max_ctx},
+                };
+                anyhow::ensure!(
+                    args.max_context.get() == configured_max_ctx()?,
+                    "Edge0 --max-context must match EDGE0_MAX_CTX ({})",
+                    configured_max_ctx()?
+                );
+                let config = Edge0Config::from_model_dir(&args.model)?;
+                let mut model = Edge0Text::load(&args.model, config)?;
+                model.enable_gpu_multi(&ordinals, args.resident_experts)?;
+                if ordinals.len() == 1 {
+                    model.calibrate_group()?;
+                } else {
+                    model.calibrate_multi_groups()?;
+                }
+                model.calibration_records(&binary)?
+            }
+            _ => bail!("unknown group4 adapter"),
+        };
+        trials.push(records);
+    }
+    let mut records = Vec::new();
+    for record in &trials[0] {
+        let repeated = trials
+            .iter()
+            .map(|trial| {
+                let matches = trial
+                    .iter()
+                    .filter(|other| record.matches(other))
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    matches.len() == 1,
+                    "group4 execution key changed between independent trials; rerun ff bench group4"
+                );
+                Ok(matches[0].clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        records.push(DecodeChoice::combine(repeated)?);
+    }
+    anyhow::ensure!(
+        trials.iter().all(|t| t.len() == records.len()),
+        "group4 program count changed during calibration"
+    );
+    for record in records {
+        eprintln!("group4 persisted: {record:?}");
+        report.group4.retain(|old| !old.matches(&record));
+        report.group4.push(record);
+    }
+    report.validate()?;
+    let json = serde_json::to_vec_pretty(&report)?;
+    LocalIoBenchmarkReport::from_json(&json)?;
+    let staging = ArtifactStaging::new(&output)?;
+    staging.write_bytes(&json)?;
+    std::fs::File::open(staging.producer_path())?.sync_all()?;
+    flyingfish::runtime::artifact::replace_file_durably(staging.producer_path(), &output)?;
+    flyingfish::runtime::artifact::sync_parent_directory(
+        output.parent().context("profile parent missing")?,
+    )?;
+    eprintln!(
+        "wrote host profile schema {}: {}",
+        report.schema_version,
+        output.display()
+    );
+    Ok(())
 }

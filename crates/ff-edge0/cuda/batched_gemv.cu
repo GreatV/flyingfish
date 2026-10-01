@@ -1,3 +1,4 @@
+#include <cuda_bf16.h>
 // Batched expert GEMV: one launch covers the 4 routed experts' SAME
 // projection (gate, up or down) over the fused stacked tensor. The
 // checkpoint stores switch_mlp.{proj} as ONE [256 experts, rows, in/8]
@@ -13,8 +14,8 @@
 
 extern "C" __global__ void edge0_batched_gemv4(
     const unsigned int* __restrict__ packed,   // [256, rows, words]
-    const float* __restrict__ scales,          // [256, rows, groups]
-    const float* __restrict__ biases,
+    const __nv_bfloat16* __restrict__ scales,          // [256, rows, groups]
+    const __nv_bfloat16* __restrict__ biases,
     const int* __restrict__ expert_ids,        // [slots]
     const float* __restrict__ x,               // shared input
     float* __restrict__ y,                     // [slots, rows] output
@@ -66,8 +67,8 @@ extern "C" __global__ void edge0_batched_gemv4(
         if (tid < words_per_row && (tid & 7) == 0) {
             const int group = tid >> 3;
             partials[r][group] =
-                scales[sb_base + group] * dot +
-                biases[sb_base + group] * sumx;
+                __bfloat162float(scales[sb_base + group]) * dot +
+                __bfloat162float(biases[sb_base + group]) * sumx;
         }
     }
     __syncthreads();
@@ -84,8 +85,8 @@ extern "C" __global__ void edge0_batched_gemv4(
 // expert's silu output differs. Same multi-row shape.
 extern "C" __global__ void edge0_batched_gemv4_slotx(
     const unsigned int* __restrict__ packed,
-    const float* __restrict__ scales,
-    const float* __restrict__ biases,
+    const __nv_bfloat16* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ biases,
     const int* __restrict__ expert_ids,
     const float* __restrict__ x,           // [slots, in_dim]
     float* __restrict__ y,                 // [slots, rows]
@@ -137,8 +138,8 @@ extern "C" __global__ void edge0_batched_gemv4_slotx(
         if (tid < words_per_row && (tid & 7) == 0) {
             const int group = tid >> 3;
             partials[r][group] =
-                scales[sb_base + group] * dot +
-                biases[sb_base + group] * sumx;
+                __bfloat162float(scales[sb_base + group]) * dot +
+                __bfloat162float(biases[sb_base + group]) * sumx;
         }
     }
     __syncthreads();
@@ -156,8 +157,8 @@ extern "C" __global__ void edge0_batched_gemv4_slotx(
 // inner, not to the down outputs). Deletes the routed silu_mul launch.
 extern "C" __global__ void edge0_batched_gemv4_slotx_silu(
     const unsigned int* __restrict__ packed,
-    const float* __restrict__ scales,
-    const float* __restrict__ biases,
+    const __nv_bfloat16* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ biases,
     const int* __restrict__ expert_ids,
     const float* __restrict__ g,           // [slots, in_dim]
     const float* __restrict__ u,           // [slots, in_dim]
@@ -216,8 +217,8 @@ extern "C" __global__ void edge0_batched_gemv4_slotx_silu(
         if (tid < words_per_row && (tid & 7) == 0) {
             const int group = tid >> 3;
             partials[r][group] =
-                scales[sb_base + group] * dot +
-                biases[sb_base + group] * sumx;
+                __bfloat162float(scales[sb_base + group]) * dot +
+                __bfloat162float(biases[sb_base + group]) * sumx;
         }
     }
     __syncthreads();

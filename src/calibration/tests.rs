@@ -10,8 +10,8 @@ use crate::{
     h3::pipeline::{DenoiseObserver, DenoisePreparationEvent, DenoiseStepEvent},
     h3::policy::ExecutionPolicy,
     runtime::identity::{
-        BinaryIdentity, CALIBRATION_IDENTITY_SCHEMA_VERSION, FileStamp, InputIdentity,
-        ModelIdentityStrength, NamedFileStamp, WeakModelIdentity, WeakShardIdentity,
+        BinaryIdentity, CALIBRATION_IDENTITY_SCHEMA_VERSION, InputIdentity, ModelIdentityStrength,
+        NamedFileStamp, WeakModelIdentity, WeakShardIdentity,
     },
     runtime::probe::{
         HardwareFingerprint, MemoryMeasurementScope, RESOURCE_SNAPSHOT_SCHEMA_VERSION,
@@ -67,10 +67,6 @@ fn binary_identity() -> BinaryIdentity {
         schema_version: CALIBRATION_IDENTITY_SCHEMA_VERSION,
         package_name: "flyingfish".to_owned(),
         package_version: "0.1.0-test".to_owned(),
-        executable: FileStamp {
-            bytes: 3,
-            modified_ns: 1,
-        },
         compiled_features: Vec::new(),
     }
 }
@@ -158,7 +154,6 @@ fn resource_snapshot(measured_at_unix_ms: u64) -> ResourceSnapshot {
         cgroup_v2_memory_available_bytes: None,
         device_free_memory_bytes: None,
         host_device_memory_is_unified: None,
-        device_topology_probe_failed: false,
         host_memory_total_bytes: None,
         device_total_memory_bytes: None,
         measurement_scope: ResourceMeasurementScopes {
@@ -212,7 +207,7 @@ fn trial(
             observed_binary_identity: binary_identity(),
             observed_model_identity: model_identity(),
             observed_input_identity: input_identity(),
-            hardware_fingerprint: HardwareFingerprint::collect(&Device::Cpu),
+            hardware_fingerprint: HardwareFingerprint::collect(&Device::Cpu).unwrap(),
             resource_snapshot_before: resource_snapshot(1),
             resource_snapshot_after: resource_snapshot(2),
             cache_stats_before: cache_stats(),

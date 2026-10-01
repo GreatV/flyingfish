@@ -4,14 +4,8 @@
 //! re-runs the whole derivation). Every decision carries a provenance line
 //! so a run's mode is attributable after the fact.
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use ff_core::probe::admission_reserve_bytes;
-
-/// Scale/bias bytes as a fraction of packed bytes — geometry-fixed by
-/// group_size 64 and the BF16 scales+biases pair, and WEIGHED exactly
-/// 12.5% from the checkpoint index (2026-09-17 audit). Single source for
-/// every traffic and residency budget in this crate.
-pub const SCALE_BIAS_OVERHEAD: f64 = 0.125;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hardware {
@@ -22,11 +16,7 @@ pub struct Hardware {
     /// Host availability already clamped to the cgroup limit where one
     /// applies (MemAvailable alone ignores a container's memory ceiling).
     pub host_memory_available_bytes: Option<u64>,
-    /// The topology query itself failed on a CUDA device. Distinct from
-    /// `unified_host_device: None` (never probed): a failed probe cannot
-    /// rule out a shared pool, so planning must refuse rather than assume
-    /// discrete — the same contract as ff-core's
-    /// `device_topology_probe_failed`.
+    /// A failed CUDA topology query; planning requires a successful probe.
     pub unified_probe_failed: bool,
 }
 
@@ -100,6 +90,10 @@ pub fn plan_mode(
         sizes.expert_packed, sizes.expert_scale_bias
     ));
 
+    ensure!(
+        !hardware.unified_probe_failed,
+        "unified_host_device probe failed; run ff probe --device cuda:N --json"
+    );
     if overrides.force_host_only {
         provenance.push("mode: HOST-ONLY forced by user override".into());
         return Ok(ModePlan {
@@ -111,6 +105,10 @@ pub fn plan_mode(
     }
 
     let Some(total) = hardware.total_vram_bytes else {
+        ensure!(
+            hardware.free_vram_bytes.is_none() && hardware.unified_host_device.is_none(),
+            "total_vram_bytes unavailable; run ff probe --device cuda:N --json"
+        );
         provenance.push("mode: HOST-ONLY — no VRAM reported by probe".into());
         return Ok(ModePlan {
             mode: PerformanceMode::HostOnly,
@@ -122,49 +120,23 @@ pub fn plan_mode(
 
     let reserve = admission_reserve_bytes(Some(total));
 
-    // Unified pools share one physical memory with the host, so the budget
-    // comes from the measured pool — the smaller of the two availability
-    // views — not from the device total alone (which on such devices IS the
-    // host's memory too). Any view the contract needs but cannot measure
-    // (host availability, the device free view, or the topology query
-    // itself) fails closed to host-only rather than planning a pool that may
-    // already be spent; `None` alone still means discrete, as in ff-core.
-    let fail_closed = |provenance_line: &str, provenance: &mut Vec<String>| {
-        provenance.push(provenance_line.to_owned());
-        ModePlan {
-            mode: PerformanceMode::HostOnly,
-            budget_bytes: 0,
-            expert_bytes_resident: 0,
-            provenance: std::mem::take(provenance),
-        }
-    };
-    let unified_pool: Option<u64> = if hardware.unified_probe_failed {
-        return Ok(fail_closed(
-            "mode: HOST-ONLY — topology probe failed; a shared pool cannot be ruled out",
-            &mut provenance,
+    let unified = hardware
+        .unified_host_device
+        .context("unified_host_device unavailable; run ff probe --device cuda:N --json")?;
+    let free = hardware
+        .free_vram_bytes
+        .context("free_vram_bytes unavailable; run ff probe --device cuda:N --json")?;
+    let unified_pool = if unified {
+        let host = hardware
+            .host_memory_available_bytes
+            .context("host_memory_available_bytes unavailable; run ff probe --json")?;
+        let pool = host.min(free);
+        provenance.push(format!(
+            "unified pool: host view {host} B, device free view {free} B -> pool {pool} B"
         ));
+        Some(pool)
     } else {
-        match hardware.unified_host_device {
-            None | Some(false) => None,
-            Some(true) => match (
-                hardware.host_memory_available_bytes,
-                hardware.free_vram_bytes,
-            ) {
-                (Some(host_available), Some(free)) => {
-                    let pool = host_available.min(free);
-                    provenance.push(format!(
-                        "unified pool: host view {host_available} B, device free view {free} B → pool {pool} B"
-                    ));
-                    Some(pool)
-                }
-                _ => {
-                    return Ok(fail_closed(
-                        "mode: HOST-ONLY — unified pool of unknown size (a required availability view is unmeasured)",
-                        &mut provenance,
-                    ));
-                }
-            },
-        }
+        None
     };
 
     let budget = match overrides.vram_budget_bytes {
@@ -382,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn unmeasurable_unified_pool_fails_closed_to_host_only() {
+    fn unmeasurable_unified_pool_errors() {
         let sizes = synthetic_sizes();
         let hw = Hardware {
             total_vram_bytes: Some(16 << 30),
@@ -391,22 +363,18 @@ mod tests {
             host_memory_available_bytes: None,
             unified_probe_failed: false,
         };
-        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes).unwrap();
-        assert_eq!(plan.mode, PerformanceMode::HostOnly);
-        assert_eq!(plan.budget_bytes, 0);
-        assert!(
-            plan.provenance
-                .iter()
-                .any(|l| l.contains("unified pool of unknown size"))
-        );
+        let error = plan_mode(&hw, &ModeOverrides::default(), &sizes)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("host_memory_available_bytes") && error.contains("ff probe"));
     }
 
     #[test]
-    fn failed_topology_probe_fails_closed_to_host_only() {
+    fn failed_topology_probe_errors() {
         let sizes = synthetic_sizes();
         // A failed probe cannot rule out a shared pool: planning as discrete
         // would reintroduce the very blind spot this closed (review finding,
-        // mirroring ff-core's device_topology_probe_failed consumers).
+        // mirroring ff-core's admission consumers).
         let hw = Hardware {
             total_vram_bytes: Some(24 << 30),
             free_vram_bytes: Some(23 << 30),
@@ -414,13 +382,10 @@ mod tests {
             host_memory_available_bytes: None,
             unified_probe_failed: true,
         };
-        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes).unwrap();
-        assert_eq!(plan.mode, PerformanceMode::HostOnly);
-        assert!(
-            plan.provenance
-                .iter()
-                .any(|l| l.contains("topology probe failed"))
-        );
+        let error = plan_mode(&hw, &ModeOverrides::default(), &sizes)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unified_host_device") && error.contains("ff probe"));
     }
 
     #[test]
@@ -435,20 +400,15 @@ mod tests {
             host_memory_available_bytes: Some(8 << 30),
             unified_probe_failed: false,
         };
-        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes).unwrap();
-        assert_eq!(plan.mode, PerformanceMode::HostOnly);
-        assert!(
-            plan.provenance
-                .iter()
-                .any(|l| l.contains("availability view is unmeasured"))
-        );
+        let error = plan_mode(&hw, &ModeOverrides::default(), &sizes)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("free_vram_bytes") && error.contains("ff probe"));
     }
 
     #[test]
-    fn unprobed_unified_topology_keeps_the_discrete_plan() {
+    fn unprobed_unified_topology_errors() {
         let sizes = synthetic_sizes();
-        // Today's production values on a discrete card: the integrated probe
-        // failed or was skipped, so legacy split-axis planning must hold.
         let hw = Hardware {
             total_vram_bytes: Some(24 << 30),
             free_vram_bytes: Some(23 << 30),
@@ -456,10 +416,10 @@ mod tests {
             host_memory_available_bytes: None,
             unified_probe_failed: false,
         };
-        let plan = plan_mode(&hw, &ModeOverrides::default(), &sizes).unwrap();
-        assert_eq!(plan.mode, PerformanceMode::FullResident);
-        assert_eq!(plan.budget_bytes, (24 << 30) - (1 << 30));
-        assert!(!plan.provenance.iter().any(|l| l.contains("unified pool")));
+        let error = plan_mode(&hw, &ModeOverrides::default(), &sizes)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unified_host_device") && error.contains("ff probe"));
     }
 
     #[test]

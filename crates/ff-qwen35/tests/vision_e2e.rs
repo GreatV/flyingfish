@@ -49,7 +49,7 @@ fn decode_rope_pos_matches_fixture_arithmetic() {
 #[test]
 #[ignore]
 fn image_prompt_decode_matches_hf_fixture() {
-    let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4") else {
+    let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4-rtn") else {
         return;
     };
     let dir = &dir;
@@ -147,12 +147,17 @@ fn image_prompt_decode_matches_hf_fixture() {
             fixture.gen_ids.len(),
             fixture.margins.get(prefix).copied().unwrap_or(f32::NAN)
         );
-        // Per-prompt measured baselines (flips sit at HF margins <= 0.50,
-        // the int4 quality class); GPU produced the same prefixes.
+        // Per-prompt measured baselines on Qwen3.8-27B-int4-rtn. Quality
+        // fact: on "What colors dominate?" RTN agrees with HF for only 3 of
+        // 32 tokens and the first flip sits at an HF margin of 2.375 — a
+        // confident flip, down from 11/32 with the community checkpoint
+        // these fixtures were generated against. The text weights differ
+        // between the two checkpoints; the vision tower is unquantized and
+        // byte-consistent with them.
         let baseline = ["Describe this image.", "What colors dominate?"]
             .iter()
             .position(|p| *p == fixture.prompt)
-            .map(|i| [17usize, 11][i])
+            .map(|i| [23usize, 3][i])
             .unwrap();
         assert!(
             prefix >= baseline,

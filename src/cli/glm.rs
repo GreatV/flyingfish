@@ -2,9 +2,10 @@ use super::device_parse::parse_device_single;
 use super::output_hygiene::{
     ensure_new_output, publish_staged_bytes, resolve_output_outside_model,
 };
-use super::{GlmCommand, kit, resolve_optional_new_output};
+use super::{GlmCommand, OptionalWeightCacheArgs, kit, resolve_optional_new_output};
 use anyhow::{Context, Result, bail, ensure};
 use candle_core::{Device, Tensor, safetensors};
+use flyingfish::glm::ExpertCacheLayout;
 use flyingfish::glm::config::GlmConfig;
 use flyingfish::glm::routing_trace::{MAX_ROUTING_TRACE_JSON_BYTES, validate_routing_trace_domain};
 use flyingfish::glm::{
@@ -16,8 +17,116 @@ use flyingfish::runtime::telemetry::TelemetryMonitor;
 use flyingfish::runtime::weights::{WeightAccessStats, WeightSource};
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::Path;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+#[derive(Debug, clap::Args)]
+pub(super) struct Args {
+    #[arg(long, help = "GLM-5.3-Flash checkpoint directory")]
+    pub(super) model: PathBuf,
+    #[arg(long)]
+    pub(super) prompt: String,
+    #[arg(long, default_value_t = NonZeroUsize::new(16).unwrap())]
+    pub(super) max_new_tokens: NonZeroUsize,
+    #[arg(
+        long,
+        default_value_t = NonZeroUsize::new(2048).unwrap(),
+        help = "Hard request limit; the exact short-context profile supports at most index_topk"
+    )]
+    pub(super) max_context_tokens: NonZeroUsize,
+    #[arg(long, default_value = "max", value_parser = ["low", "high", "max"])]
+    pub(super) reasoning_effort: String,
+    #[command(flatten)]
+    pub(super) sampling: kit::SamplingArgs,
+    #[arg(long, default_value = "cuda:0")]
+    pub(super) device: String,
+    #[command(flatten)]
+    pub(super) weights: OptionalWeightCacheArgs,
+    #[arg(long, value_enum, default_value_t = flyingfish::runtime::resource_selection::ResourcePolicyMode::Performance)]
+    pub(super) resource_policy: flyingfish::runtime::resource_selection::ResourcePolicyMode,
+    #[arg(long, help = "Qualified paired resource evidence")]
+    pub(super) resource_evidence: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Linux benchmark only: evict and verify checkpoint file-cache pages before payload loading"
+    )]
+    pub(super) resource_cold_cache: bool,
+    #[arg(long, help = "Write resource selection to a new JSON sidecar")]
+    pub(super) resource_selection: Option<PathBuf>,
+    #[arg(
+        long, num_args = 0..=1, default_missing_value = "true", require_equals = true,
+        conflicts_with = "no_resident_static",
+        help = "Keep the non-routed text skeleton (about 15.3 GiB); absent selects by CUDA capacity in performance mode"
+    )]
+    pub(super) resident_static: Option<bool>,
+    #[arg(
+        long,
+        conflicts_with = "resident_static",
+        help = "Explicitly keep the static skeleton streamed"
+    )]
+    pub(super) no_resident_static: bool,
+    #[arg(
+        long,
+        help = "Host profile measured on this machine by `ff bench io --profile \
+                local-interconnect`; reports the transfer-versus-host expert split"
+    )]
+    pub(super) host_profile: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Use the CPU FP8 conversion reference with CUDA (fallback and paired benchmarks)"
+    )]
+    pub(super) cpu_fp8_dequantization: bool,
+    #[arg(
+        long,
+        conflicts_with = "cpu_fp8_dequantization",
+        help = "Use reusable pinned buffers for FP8 uploads (experimental)"
+    )]
+    pub(super) pinned_fp8_transfer: bool,
+    #[arg(
+        long,
+        help = "Expert-cache budget in MiB; absent selects by CUDA capacity in performance mode, zero disables"
+    )]
+    pub(super) expert_cache_mib: Option<u64>,
+    #[arg(long, value_enum)]
+    pub(super) expert_cache_layout: Option<ExpertCacheLayout>,
+    #[arg(long, value_enum)]
+    #[arg(
+        long,
+        requires = "execution_manifest",
+        help = "Re-admit the expert-cache bound after every synchronized routed token"
+    )]
+    pub(super) expert_cache_readmit: bool,
+    #[arg(
+        long,
+        requires = "expert_cache_readmit",
+        help = "Hard adaptive expert-cache floor in MiB; defaults to zero"
+    )]
+    pub(super) expert_cache_min_mib: Option<u64>,
+    #[arg(long, help = "Suppress per-token progress on stderr")]
+    pub(super) no_progress: bool,
+    #[command(flatten)]
+    pub(super) output: kit::OutputArgs,
+    #[arg(
+        long,
+        help = "Atomically write a bounded router-only trace outside the model"
+    )]
+    pub(super) routing_trace: Option<PathBuf>,
+    #[arg(
+        long,
+        requires = "routing_trace",
+        help = "Bounded workload/domain label recorded in --routing-trace"
+    )]
+    pub(super) routing_trace_domain: Option<String>,
+    #[arg(
+        long,
+        help = "Atomically write the versioned GLM policy and cache-residency manifest"
+    )]
+    pub(super) execution_manifest: Option<PathBuf>,
+    #[arg(help = "Print the topology-derived expert-cache bound and its provenance to stderr")]
+    #[arg(long)]
+    pub(super) explain_config: bool,
+}
 
 const GLM_PARITY_CAPTURE_SCHEMA_VERSION: u32 = 2;
 
@@ -27,38 +136,36 @@ const GLM_PARITY_CAPTURE_SCHEMA_VERSION: u32 = 2;
 /// Both rates belong to this machine and to no other, so nothing is assumed in
 /// their absence: a run without a profile reports that rather than scheduling
 /// against a number it does not have.
-fn report_host_profile(
+pub(super) fn report_host_profile(
     explicit: Option<&Path>,
-    model: &Path,
     device: &candle_core::Device,
-) -> Result<f64> {
-    let path = explicit
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| model.join(flyingfish::host_profile::DEFAULT_HOST_PROFILE_NAME));
-    match flyingfish::host_profile::HostProfile::load(&path, device)? {
-        Ok(profile) => {
-            let rates = profile.expert_bandwidths();
-            eprintln!(
-                "preflight host profile: B_P {:.3} GiB/s, B_H {:.3} GiB/s evaluating \
-                 ({:.3} GiB/s end to end), B_P/B_H {:.2}; host share of a miss set {:.0}%",
-                rates.transfer_bytes_per_second / 1024f64.powi(3),
-                rates.host_evaluation_bytes_per_second / 1024f64.powi(3),
-                rates.host_service_bytes_per_second / 1024f64.powi(3),
-                rates.transfer_over_host(),
-                rates.host_share() * 100.0,
-            );
-            return Ok(rates.host_share());
+) -> Result<Option<flyingfish::host_profile::HostProfile>> {
+    let Some(path) = explicit else {
+        if ["FF_GLM_PREFETCH_THREADS", "FF_GLM_PINNED_FILL_THREADS"]
+            .iter()
+            .all(|name| std::env::var_os(name).is_some())
+        {
+            eprintln!("GLM readers: explicit overrides without a host profile");
+            return Ok(None);
         }
-        // An explicit path that yields nothing is an operator error; an
-        // unnamed one simply has no profile yet, which is not a failure.
-        Err(absence) if explicit.is_some() => bail!("{absence}"),
-        Err(_) => {}
+        bail!(
+            "missing --host-profile; run ff bench io --profile local-interconnect or supply both GLM reader overrides"
+        );
+    };
+    match flyingfish::host_profile::HostProfile::load(path, device)? {
+        Ok(profile) => {
+            eprintln!("host profile: {}", profile.path().display());
+            Ok(Some(profile))
+        }
+        Err(absence) => bail!(
+            "{absence}; GLM streaming requires ff bench io --profile local-interconnect or both reader overrides"
+        ),
     }
-    Ok(0.0)
 }
 
-pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
-    let GlmCommand::Generate {
+pub(super) fn run_generate(args: Args) -> Result<()> {
+    let mut load_io = flyingfish::glm::io_trace::IoTrace::from_env()?;
+    let Args {
         model,
         prompt,
         max_new_tokens,
@@ -78,7 +185,6 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         pinned_fp8_transfer,
         expert_cache_mib,
         expert_cache_layout,
-        expert_cache_replacement,
         expert_cache_readmit,
         expert_cache_min_mib,
         no_progress,
@@ -87,10 +193,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         routing_trace_domain,
         execution_manifest,
         explain_config,
-    } = command
-    else {
-        unreachable!("run_generate received a non-generate GLM command")
-    };
+    } = args;
     let kit::SamplingArgs {
         temperature,
         top_p,
@@ -124,10 +227,6 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         ),
         (expert_cache_layout.is_some(), "expert_cache.layout"),
         (
-            expert_cache_replacement.is_some(),
-            "expert_cache.replacement",
-        ),
-        (
             expert_cache_readmit,
             "expert_cache.readmission_interval_tokens",
         ),
@@ -139,7 +238,6 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
     let mut resident_static = resident_static.unwrap_or(false) && !no_resident_static;
     let expert_cache_mib = expert_cache_mib.unwrap_or(0);
     let expert_cache_layout = expert_cache_layout.unwrap_or_default();
-    let expert_cache_replacement = expert_cache_replacement.unwrap_or_default();
     let weights = weights.configured();
     let request_reasoning_effort = reasoning_effort.clone();
     let output = output
@@ -228,7 +326,25 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         device.is_cpu() || device.is_cuda(),
         "GLM text inference currently supports CPU or CUDA devices"
     );
-    let host_expert_share = report_host_profile(host_profile.as_deref(), &model, &device)?;
+    let profile = report_host_profile(host_profile.as_deref(), &device)?;
+    let io_readers = profile
+        .as_ref()
+        .map(|profile| profile.reader_counts(&model))
+        .transpose()?;
+    let host_expert_share = if let Some(profile) = profile.as_ref() {
+        let rates = profile.expert_bandwidths()?;
+        eprintln!(
+            "preflight host profile: B_P {:.3} GiB/s, B_H {:.3} GiB/s evaluating ({:.3} GiB/s end to end), B_P/B_H {:.2}; host share of a miss set {:.0}%",
+            rates.transfer_bytes_per_second / 1024f64.powi(3),
+            rates.host_evaluation_bytes_per_second / 1024f64.powi(3),
+            rates.host_service_bytes_per_second / 1024f64.powi(3),
+            rates.transfer_over_host(),
+            rates.host_share() * 100.0
+        );
+        rates.host_share()
+    } else {
+        0.0
+    };
     ensure!(
         weights.weight_source == WeightSource::Mmap,
         "GLM inference requires --weight-source mmap"
@@ -259,7 +375,8 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         .with_resident_static(resident_static)
         .with_progress(!no_progress)
         .with_expert_cache_bytes(expert_cache_bytes)
-        .with_expert_cache_policy(expert_cache_layout, expert_cache_replacement);
+        .with_expert_cache_policy(expert_cache_layout);
+    engine_options.io_readers = io_readers;
     if expert_cache_readmit {
         engine_options = engine_options.with_adaptive_expert_cache(expert_cache_min_bytes);
     }
@@ -292,7 +409,8 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
     };
     let breakdown = prepared.estimate(prompt_tokens)?;
     let selection_snapshot =
-        flyingfish::runtime::probe::ResourceSnapshot::capture(Some(prepared.device()));
+        flyingfish::runtime::probe::ResourceSnapshot::capture(Some(prepared.device()))
+            .context("resource probe failed")?;
     let mut baseline = prepared.execution_policy().clone();
     let mut automatic_axes = Vec::new();
     if prepared.device().is_cuda()
@@ -322,7 +440,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
                 baseline.resident_static,
                 flyingfish::glm::admission::ExpertCacheBound::new(0, baseline.expert_cache.layout),
                 baseline.cache_policy()?,
-                breakdown.scaled_admission_safety_bytes(&selection_snapshot),
+                breakdown.scaled_admission_safety_bytes(&selection_snapshot)?,
             )?;
             let bytes = breakdown.automatic_expert_cache_bytes(
                 &phases,
@@ -331,11 +449,6 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
             )? as u64;
             baseline.expert_cache.maximum_bound_bytes = bytes;
             baseline.expert_cache.minimum_bound_bytes = bytes;
-            if bytes > 0 && !explicit_axes.contains("expert_cache.replacement") {
-                baseline.expert_cache.replacement =
-                    flyingfish::glm::ExpertCacheReplacementPolicy::Lfu;
-                automatic_axes.push("expert_cache.replacement");
-            }
             automatic_axes.extend([
                 "expert_cache.maximum_bound_bytes",
                 "expert_cache.minimum_bound_bytes",
@@ -388,7 +501,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         // one this run acts on. GLM streams through mmap by contract, so the
         // weight-source rules do not describe this runtime; the pool rule is
         // the derived guidance.
-        let profile = ff_core::topology::TopologyProfile::capture(prepared.device());
+        let profile = ff_core::topology::TopologyProfile::capture(prepared.device())?;
         let derived = flyingfish::glm::resources::derive_glm_configuration(
             &breakdown,
             resident_static,
@@ -422,9 +535,9 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         );
     }
     let admission_snapshot =
-        flyingfish::runtime::probe::ResourceSnapshot::capture(Some(prepared.device()));
-    // A promotion was admitted only because its peaks plus the promotion
-    // reserve fitted; that gate is re-run here, not just the ordinary peaks.
+        flyingfish::runtime::probe::ResourceSnapshot::capture(Some(prepared.device()))
+            .context("resource probe failed")?;
+    // Recheck phase peaks plus the promotion reserve before materialization.
     let selection_cache =
         flyingfish::glm::admission::ExpertCacheBound::from_policy(&selection.policy.expert_cache)?;
     let promotion_refusal = if selection.policy.weights != baseline.weights {
@@ -434,7 +547,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
             selection_cache,
             selection.policy.cache_policy()?,
             &admission_snapshot,
-        )
+        )?
     } else {
         None
     };
@@ -457,7 +570,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         // reserve from that snapshot's pool, so selection-time phases and
         // applied reserve cannot reproduce the check that rejected the run.
         let mut provenance = selection.provenance.clone();
-        let final_safety = breakdown.scaled_admission_safety_bytes(&admission_snapshot);
+        let final_safety = breakdown.scaled_admission_safety_bytes(&admission_snapshot)?;
         provenance.phases = breakdown.phases_with_safety(
             resident_static,
             selection_cache,
@@ -471,7 +584,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
             let promotion =
                 flyingfish::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
                     &admission_snapshot,
-                );
+                )?;
             for phase in &mut provenance.phases {
                 phase.host_promotion_reserve_bytes = promotion;
             }
@@ -505,7 +618,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
     }
     // The admitted record is rebuilt from the same snapshot for the same
     // reason: what it reports must be what the final check actually applied.
-    let final_safety = breakdown.scaled_admission_safety_bytes(&admission_snapshot);
+    let final_safety = breakdown.scaled_admission_safety_bytes(&admission_snapshot)?;
     selection.provenance.phases = breakdown.phases_with_safety(
         resident_static,
         selection_cache,
@@ -520,7 +633,7 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         let promotion =
             flyingfish::glm::admission::GlmAdmissionBreakdown::scaled_promotion_reserve_bytes(
                 &admission_snapshot,
-            );
+            )?;
         for phase in &mut selection.provenance.phases {
             phase.host_promotion_reserve_bytes = promotion;
         }
@@ -542,6 +655,10 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
         flyingfish::resource_policy::publish_selection(path, &selection.provenance)?;
     }
     let engine = prepared.open(prompt_tokens, &admission_snapshot)?;
+    if let Some(trace) = &mut load_io {
+        trace.record("load", None);
+    }
+    let load_io = load_io.map(flyingfish::glm::io_trace::IoTrace::finish);
     let before = engine.access_stats();
     let generation_options = GlmGenerationOptions {
         max_new_tokens: max_new_tokens.get(),
@@ -637,6 +754,9 @@ pub(super) fn run_generate(command: GlmCommand) -> Result<()> {
                 "evictions": expert_cache.evictions,
             },
             "weight_access": weight_access_json(&access),
+            "load_io": load_io,
+            "io_trace": result.io_trace,
+            "fp8_transfers": engine.fp8_transfer_stats()?,
             "host_cache": cache,
         }))?
     } else {
@@ -888,6 +1008,14 @@ mod tests {
     };
 
     #[test]
+    fn absent_explicit_profile_names_calibration_instead_of_guessing_a_path() {
+        let error = report_host_profile(None, &Device::Cpu)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--host-profile") && error.contains("ff bench io"));
+    }
+
+    #[test]
     fn duration_conversion_rejects_u64_millisecond_overflow() {
         let duration = Duration::new(u64::MAX, 999_999_999);
         let error = duration_ms(duration).unwrap_err();
@@ -949,8 +1077,8 @@ mod tests {
         let sequence = [0, 0, 1, 0];
         let trace = RoutingTrace {
             schema_version: ROUTING_TRACE_SCHEMA_VERSION,
-            routed_scaling_factor: Some(1.0),
-            norm_topk_prob: Some(false),
+            routed_scaling_factor: 1.0,
+            norm_topk_prob: false,
             prefill_schedule: flyingfish::glm::routing_trace::RoutingPrefillSchedule::TokenSerial,
             model_family: RoutingModelFamily::Glm5Next,
             domain: "cli-test".to_owned(),

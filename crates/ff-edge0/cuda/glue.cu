@@ -1,9 +1,8 @@
+#include <cuda_bf16.h>
 // Decode glue: embed row-gather, rmsnorm variants, residual add, and the
 // full-attention decode path (q/gate deinterleave + per-head rmsnorm +
 // partial rope + KV append, then scores/softmax/weighted-V + output gate).
-// Reductions use fixed shapes (deterministic run-to-run); soft-max sums
-// and per-dimension accumulations stay in ascending step order to track
-// the host reference.
+// Reductions use fixed shapes and tile order.
 
 // In-place per-head rmsnorm over hd elements; blockDim must cover hd.
 __device__ __forceinline__ void rmsnorm_head(
@@ -47,8 +46,8 @@ __device__ __forceinline__ void rope_head(
 
 extern "C" __global__ void edge0_embed_row(
     const unsigned int* __restrict__ packed,  // [vocab, in_dim/8]
-    const float* __restrict__ scales,         // [vocab, in_dim/64]
-    const float* __restrict__ biases,
+    const __nv_bfloat16* __restrict__ scales,         // [vocab, in_dim/64]
+    const __nv_bfloat16* __restrict__ biases,
     const int* __restrict__ token,            // device: argmax output
     float* __restrict__ out,                  // [in_dim]
     int in_dim)
@@ -59,8 +58,8 @@ extern "C" __global__ void edge0_embed_row(
     const long long t = *token;
     const unsigned int word = packed[t * words + w];
     const int group = w >> 3;
-    const float s = scales[t * (in_dim >> 6) + group];
-    const float b = biases[t * (in_dim >> 6) + group];
+    const float s = __bfloat162float(scales[t * (in_dim >> 6) + group]);
+    const float b = __bfloat162float(biases[t * (in_dim >> 6) + group]);
     #pragma unroll
     for (int j = 0; j < 8; j++)
         out[w * 8 + j] = s * (float)((word >> (4 * j)) & 0xFu) + b;
@@ -156,7 +155,7 @@ extern "C" __global__ void edge0_add_rmsnorm_zc(
     int n,
     float eps)
 {
-    __shared__ float partials[256];
+    __shared__ float partials[1024];
     const int tid = threadIdx.x;
     float sq = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
@@ -164,10 +163,9 @@ extern "C" __global__ void edge0_add_rmsnorm_zc(
         acc[i] = s;
         sq += s * s;
     }
-    partials[tid] = sq;
+    if (tid < 1024) partials[tid] = sq;
     __syncthreads();
-    #pragma unroll
-    for (int off = 128; off > 0; off >>= 1) {
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
         if (tid < off) partials[tid] += partials[tid + off];
         __syncthreads();
     }
@@ -357,55 +355,107 @@ extern "C" __global__ void edge0_inc3(int* __restrict__ c)
     if (threadIdx.x == 0) { c[0]++; c[1]++; c[2]++; }
 }
 
-// One block per q head; thread d owns output dimension d. len <= 8192
-// (the shared scores cap; the host asserts max_ctx).
-extern "C" __global__ void edge0_attn_scores(
-    const float* __restrict__ q,            // [heads * head_dim]
-    const float* __restrict__ gate,         // [heads * head_dim]
-    const float* __restrict__ kv_keys,      // [max_ctx, kv_stride]
-    const float* __restrict__ kv_values,
-    float* __restrict__ out,                // [heads * head_dim]
-    const int* __restrict__ position,       // device counter; len = pos + 1
+__device__ float attention_reduce(float value, float* partial, bool maximum) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int offset = 16; offset; offset >>= 1) {
+        const float other = __shfl_down_sync(0xffffffffu, value, offset);
+        value = maximum ? fmaxf(value, other) : value + other;
+    }
+    if (lane == 0) partial[warp] = value;
+    __syncthreads();
+    value = threadIdx.x < 8 ? partial[lane] : (maximum ? -INFINITY : 0.0f);
+    if (warp == 0) {
+        for (int offset = 16; offset; offset >>= 1) {
+            const float other = __shfl_down_sync(0xffffffffu, value, offset);
+            value = maximum ? fmaxf(value, other) : value + other;
+        }
+        if (lane == 0) partial[0] = value;
+    }
+    __syncthreads();
+    value = partial[0];
+    __syncthreads();
+    return value;
+}
+
+__device__ float attention_load(float value) { return value; }
+__device__ float attention_load(unsigned short value) {
+    return __uint_as_float((unsigned int)value << 16);
+}
+
+template <typename T>
+__device__ void attention(
+    const float* __restrict__ q,
+    const float* __restrict__ gate,
+    const T* __restrict__ kv_keys,
+    const T* __restrict__ kv_values,
+    float* __restrict__ out,
+    const int* __restrict__ position,
     int kv_stride,
     int heads, int kv_heads, int head_dim,
     float scale)
 {
     const int len = *position + 1;
-    __shared__ float q_sh[256];
-    __shared__ float scores[8192];
     const int h = blockIdx.x;
     const int d = threadIdx.x;
-    const int hd = head_dim;
+    const int lane = d & 31;
+    const int warp = d >> 5;
     const int kv_head = h / (heads / kv_heads);
-    if (d < hd) q_sh[d] = q[(long long)h * hd + d];
+    __shared__ float query[256];
+    __shared__ float scores[256];
+    __shared__ float partial[8];
+    if (d < head_dim) query[d] = q[(long long)h * head_dim + d];
     __syncthreads();
-
-    for (int s = d; s < len; s += blockDim.x) {
-        const float* k = kv_keys + (long long)s * kv_stride + (long long)kv_head * hd;
-        float dot = 0.0f;
-        for (int j = 0; j < hd; j++) dot += q_sh[j] * k[j];
-        scores[s] = dot * scale;
-    }
-    __syncthreads();
-
-    if (d == 0) {
-        float max_v = -INFINITY;
-        for (int s = 0; s < len; s++) max_v = fmaxf(max_v, scores[s]);
-        float sum = 0.0f;
-        for (int s = 0; s < len; s++) {
-            const float e = __expf(scores[s] - max_v);
-            scores[s] = e;
-            sum += e;
-        }
-        for (int s = 0; s < len; s++) scores[s] /= sum;
-    }
-    __syncthreads();
-
     float acc = 0.0f;
-    for (int s = 0; s < len; s++)
-        acc += scores[s] * kv_values[(long long)s * kv_stride + (long long)kv_head * hd + d];
-    const float gv = gate[(long long)h * hd + d];
-    out[(long long)h * hd + d] = acc * (1.0f / (1.0f + __expf(-gv)));
+    float normalizer = 0.0f;
+    float maximum = -INFINITY;
+    for (int base = 0; base < len; base += 256) {
+        const int count = min(256, len - base);
+        for (int s = warp; s < 256; s += 8) {
+            float dot = 0.0f;
+            if (s < count) {
+                const T* k = kv_keys + (long long)(base + s) * kv_stride + (long long)kv_head * head_dim;
+                for (int j = lane; j < head_dim; j += 32) dot += query[j] * attention_load(k[j]);
+            }
+            for (int offset = 16; offset; offset >>= 1)
+                dot += __shfl_down_sync(0xffffffffu, dot, offset);
+            if (lane == 0) scores[s] = s < count ? dot * scale : -INFINITY;
+        }
+        __syncthreads();
+        const float next_max = fmaxf(maximum, attention_reduce(scores[d], partial, true));
+        const float weight = __expf(scores[d] - next_max);
+        scores[d] = weight;
+        const float sum = attention_reduce(weight, partial, false);
+        const float correction = __expf(maximum - next_max);
+        acc *= correction;
+        if (d < head_dim) {
+            for (int s = 0; s < count; s++)
+                acc += scores[s] * attention_load(kv_values[(long long)(base + s) * kv_stride + (long long)kv_head * head_dim + d]);
+        }
+        normalizer = normalizer * correction + sum;
+        maximum = next_max;
+        __syncthreads();
+    }
+    if (d < head_dim) {
+        const long long index = (long long)h * head_dim + d;
+        out[index] = acc / normalizer / (1.0f + __expf(-gate[index]));
+    }
+}
+
+extern "C" __global__ void edge0_attn_scores(
+    const float* q, const float* gate, const float* keys,
+    const float* values, float* out, const int* position,
+    int stride, int heads, int kv_heads, int dim, float scale)
+{
+    attention(q, gate, keys, values, out, position, stride, heads, kv_heads, dim, scale);
+}
+
+extern "C" __global__ void edge0_attn_scores_bf16(
+    const float* q, const float* gate, const unsigned short* keys,
+    const unsigned short* values, float* out, const int* position,
+    int stride, int heads, int kv_heads, int dim, float scale)
+{
+    attention(q, gate, keys, values, out, position, stride, heads, kv_heads, dim, scale);
 }
 
 // Router top-k over n logits (n <= 1024): k rounds of parallel argmax over
@@ -635,6 +685,174 @@ extern "C" __global__ void edge0_argmax_final(
     }
 }
 
+// Speculative accept: two-pass top-2 over the verify round's A and B
+// logit columns. The final pass writes one record:
+//   [0] accepted flag (1 if A's top-1 equals the drafted token)
+//   [1] next pending token (A's top-1 on reject, B's top-1 on accept)
+//   [2] margin A (top1 - top2)
+//   [3] margin B (top1 - top2)
+//   [4] A's top-1 id
+//   [5] B's top-1 id
+//   [6] the drafted token id
+// Comparators are (value, then greater index), matching edge0_argmax.
+__device__ __forceinline__ void spec_top2_merge(
+    float& v1, int& i1, float& v2, int& i2,
+    float ov1, int oi1, float ov2, int oi2)
+{
+    if (ov1 > v1 || (ov1 == v1 && oi1 > i1)) {
+        const bool second_is_v1 = v1 > ov2 || (v1 == ov2 && i1 > oi2);
+        v2 = second_is_v1 ? v1 : ov2;
+        i2 = second_is_v1 ? i1 : oi2;
+        v1 = ov1;
+        i1 = oi1;
+    } else {
+        const bool take_ov1 = ov1 > v2 || (ov1 == v2 && oi1 > i2);
+        v2 = take_ov1 ? ov1 : v2;
+        i2 = take_ov1 ? oi1 : i2;
+    }
+}
+
+extern "C" __global__ void edge0_spec_accept_part(
+    const float* __restrict__ logits_a,
+    const float* __restrict__ logits_b,
+    float* __restrict__ part_v,   // [nblocks, 4]: a1 b1 a2 b2
+    int* __restrict__ part_i,     // [nblocks, 4]
+    int n)
+{
+    const int tid = threadIdx.x;
+    const int per = (n + gridDim.x - 1) / gridDim.x;
+    const int lo = blockIdx.x * per;
+    const int hi = min(n, lo + per);
+    float av1 = -INFINITY, av2 = -INFINITY;
+    int ai1 = -1, ai2 = -1;
+    float bv1 = -INFINITY, bv2 = -INFINITY;
+    int bi1 = -1, bi2 = -1;
+    for (int i = lo + tid; i < hi; i += blockDim.x) {
+        const float va = logits_a[i];
+        if (va > av1 || (va == av1 && i > ai1)) {
+            av2 = av1; ai2 = ai1; av1 = va; ai1 = i;
+        } else if (va > av2) {
+            av2 = va; ai2 = i;
+        }
+        const float vb = logits_b[i];
+        if (vb > bv1 || (vb == bv1 && i > bi1)) {
+            bv2 = bv1; bi2 = bi1; bv1 = vb; bi1 = i;
+        } else if (vb > bv2) {
+            bv2 = vb; bi2 = i;
+        }
+    }
+    // Block reduce: pairwise top-2 merges across the warp, then across the
+    // first warps via shared memory.
+    for (int off = 16; off > 0; off >>= 1) {
+        spec_top2_merge(av1, ai1, av2, ai2,
+            __shfl_down_sync(0xffffffffu, av1, off), __shfl_down_sync(0xffffffffu, ai1, off),
+            __shfl_down_sync(0xffffffffu, av2, off), __shfl_down_sync(0xffffffffu, ai2, off));
+        spec_top2_merge(bv1, bi1, bv2, bi2,
+            __shfl_down_sync(0xffffffffu, bv1, off), __shfl_down_sync(0xffffffffu, bi1, off),
+            __shfl_down_sync(0xffffffffu, bv2, off), __shfl_down_sync(0xffffffffu, bi2, off));
+    }
+    __shared__ float s_a[4][2];
+    __shared__ int s_ai[4][2];
+    __shared__ float s_b[4][2];
+    __shared__ int s_bi[4][2];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) {
+        s_a[warp][0] = av1; s_a[warp][1] = av2;
+        s_ai[warp][0] = ai1; s_ai[warp][1] = ai2;
+        s_b[warp][0] = bv1; s_b[warp][1] = bv2;
+        s_bi[warp][0] = bi1; s_bi[warp][1] = bi2;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        av1 = (lane < 4) ? s_a[lane][0] : -INFINITY;
+        ai1 = (lane < 4) ? s_ai[lane][0] : -1;
+        av2 = (lane < 4) ? s_a[lane][1] : -INFINITY;
+        ai2 = (lane < 4) ? s_ai[lane][1] : -1;
+        bv1 = (lane < 4) ? s_b[lane][0] : -INFINITY;
+        bi1 = (lane < 4) ? s_bi[lane][0] : -1;
+        bv2 = (lane < 4) ? s_b[lane][1] : -INFINITY;
+        bi2 = (lane < 4) ? s_bi[lane][1] : -1;
+        for (int off = 2; off > 0; off >>= 1) {
+            spec_top2_merge(av1, ai1, av2, ai2,
+                __shfl_down_sync(0xffffffffu, av1, off), __shfl_down_sync(0xffffffffu, ai1, off),
+                __shfl_down_sync(0xffffffffu, av2, off), __shfl_down_sync(0xffffffffu, ai2, off));
+            spec_top2_merge(bv1, bi1, bv2, bi2,
+                __shfl_down_sync(0xffffffffu, bv1, off), __shfl_down_sync(0xffffffffu, bi1, off),
+                __shfl_down_sync(0xffffffffu, bv2, off), __shfl_down_sync(0xffffffffu, bi2, off));
+        }
+        if (lane == 0) {
+            part_v[blockIdx.x * 4 + 0] = av1;
+            part_v[blockIdx.x * 4 + 1] = bv1;
+            part_v[blockIdx.x * 4 + 2] = av2;
+            part_v[blockIdx.x * 4 + 3] = bv2;
+            part_i[blockIdx.x * 4 + 0] = ai1;
+            part_i[blockIdx.x * 4 + 1] = bi1;
+            part_i[blockIdx.x * 4 + 2] = ai2;
+            part_i[blockIdx.x * 4 + 3] = bi2;
+        }
+    }
+}
+
+extern "C" __global__ void edge0_spec_accept_final(
+    const float* __restrict__ part_v,
+    const int* __restrict__ part_i,
+    const int* __restrict__ draft_id,
+    const float* __restrict__ hidden_accept,
+    const float* __restrict__ hidden_reject,
+    float* __restrict__ hidden_sel,   // [h_len]: the next draft's input
+    int* __restrict__ mtp_tok,        // the next draft's embed token
+    int* __restrict__ next_token,     // the next round's A-column token
+    int* __restrict__ pos,            // main KV timeline, +2 accept / +1 reject
+    int* __restrict__ rope_pos,       // [3] mrope axes, same step count
+    int* __restrict__ pos_b,          // B-column timeline, kept at pos + 1
+    float* __restrict__ flag,         // accept flag, read by qwen_gdn_restore
+    float* __restrict__ record,       // ring of 7-float records
+    int* __restrict__ round_idx,
+    int nparts,
+    int h_len)
+{
+    float av1 = -INFINITY, av2 = -INFINITY;
+    int ai1 = -1, ai2 = -1;
+    float bv1 = -INFINITY, bv2 = -INFINITY;
+    int bi1 = -1, bi2 = -1;
+    for (int k = 0; k < nparts; k++) {
+        spec_top2_merge(av1, ai1, av2, ai2,
+            part_v[k * 4 + 0], part_i[k * 4 + 0],
+            part_v[k * 4 + 2], part_i[k * 4 + 2]);
+        spec_top2_merge(bv1, bi1, bv2, bi2,
+            part_v[k * 4 + 1], part_i[k * 4 + 1],
+            part_v[k * 4 + 3], part_i[k * 4 + 3]);
+    }
+    const int drafted = *draft_id;
+    const int accepted = (ai1 == drafted) ? 1 : 0;
+    const int pending = accepted ? bi1 : ai1;
+    if (threadIdx.x == 0) {
+        const int step = accepted ? 2 : 1;
+        float* rec = record + 7 * (*round_idx);
+        rec[0] = (float)accepted;
+        rec[1] = (float)pending;
+        rec[2] = av1 - av2;
+        rec[3] = bv1 - bv2;
+        rec[4] = (float)ai1;
+        rec[5] = (float)bi1;
+        rec[6] = (float)drafted;
+        *flag = (float)accepted;
+        *next_token = pending;
+        *pos += step;
+        rope_pos[0] += step;
+        rope_pos[1] += step;
+        rope_pos[2] += step;
+        *pos_b = *pos + 1;
+        (*round_idx)++;
+        *mtp_tok = accepted ? drafted : pending;
+    }
+    // The next draft's hidden input: B-side on accept, A-side on reject.
+    for (int i = threadIdx.x; i < h_len; i += blockDim.x) {
+        hidden_sel[i] = accepted ? hidden_accept[i] : hidden_reject[i];
+    }
+}
+
 // Grouped int4 GEMV: up to four projections over the SAME x and in_dim in
 // one launch, LoRA folded into the epilogue (replaces one GEMV + one
 // lora_add launch per member). Segments are 16-row aligned; padding rows
@@ -643,29 +861,29 @@ extern "C" __global__ void edge0_argmax_final(
 // matching the host's lora_delta.
 extern "C" __global__ void edge0_gemv_group4_lora(
     const unsigned int* __restrict__ packed0,
-    const float* __restrict__ scales0,
-    const float* __restrict__ biases0,
+    const __nv_bfloat16* __restrict__ scales0,
+    const __nv_bfloat16* __restrict__ biases0,
     const float* __restrict__ la0,     // [rank, in] or null
     const float* __restrict__ lb0,     // [rows0, rank] or null
     float* __restrict__ y0,
     int rows0,
     const unsigned int* __restrict__ packed1,
-    const float* __restrict__ scales1,
-    const float* __restrict__ biases1,
+    const __nv_bfloat16* __restrict__ scales1,
+    const __nv_bfloat16* __restrict__ biases1,
     const float* __restrict__ la1,
     const float* __restrict__ lb1,
     float* __restrict__ y1,
     int rows1,
     const unsigned int* __restrict__ packed2,
-    const float* __restrict__ scales2,
-    const float* __restrict__ biases2,
+    const __nv_bfloat16* __restrict__ scales2,
+    const __nv_bfloat16* __restrict__ biases2,
     const float* __restrict__ la2,
     const float* __restrict__ lb2,
     float* __restrict__ y2,
     int rows2,
     const unsigned int* __restrict__ packed3,
-    const float* __restrict__ scales3,
-    const float* __restrict__ biases3,
+    const __nv_bfloat16* __restrict__ scales3,
+    const __nv_bfloat16* __restrict__ biases3,
     const float* __restrict__ la3,
     const float* __restrict__ lb3,
     float* __restrict__ y3,
@@ -685,8 +903,8 @@ extern "C" __global__ void edge0_gemv_group4_lora(
     const int pad2 = (rows2 + 15) & ~15;
 
     const unsigned int* packed;
-    const float* scales;
-    const float* biases;
+    const __nv_bfloat16* scales;
+    const __nv_bfloat16* biases;
     const float* la;
     const float* lb;
     float* y;
@@ -709,6 +927,23 @@ extern "C" __global__ void edge0_gemv_group4_lora(
         }
         seg_has_lora = has_lora;
         if (row_base >= rows) return;
+    }
+
+    // The segment's scales and biases, widened once per group through one
+    // coalesced pass; the per-word reads below then hit shared memory.
+    __shared__ float s_sc[16][80];
+    __shared__ float s_bi[16][80];
+    {
+        const int srows = min(16, rows - row_base);
+        const int sgroups = in_dim >> 6;
+        for (int i = threadIdx.x; i < srows * sgroups; i += blockDim.x) {
+            const int r = i / sgroups;
+            const int g = i % sgroups;
+            const int gi = (row_base + r) * sgroups + g;
+            s_sc[r][g] = __bfloat162float(scales[gi]);
+            s_bi[r][g] = __bfloat162float(biases[gi]);
+        }
+        __syncthreads();
     }
 
     // Single-chunk shapes (in_dim <= 4096) keep the pre-chunking fast path
@@ -784,8 +1019,7 @@ extern "C" __global__ void edge0_gemv_group4_lora(
                     }
                     if (w < words_per_row && (tid & 7) == 0) {
                         const int group = w / 8;
-                        const int gi = (row_base + r) * groups + group;
-                        partials[r][group] = scales[gi] * dot + biases[gi] * sumx;
+                        partials[r][group] = s_sc[r][group] * dot + s_bi[r][group] * sumx;
                     }
                 }
             }
@@ -826,8 +1060,7 @@ extern "C" __global__ void edge0_gemv_group4_lora(
                 }
                 if (w < words_per_row && (tid & 7) == 0) {
                     const int group = w / 8;
-                    const int gi = rrow * (in_dim >> 6) + group;
-                    partials[group] = scales[gi] * dot + biases[gi] * sumx;
+                    partials[group] = s_sc[r][group] * dot + s_bi[r][group] * sumx;
                 }
             }
             __syncthreads();
@@ -848,7 +1081,6 @@ extern "C" __global__ void edge0_gemv_group4_lora(
 
     const int words_per_row = in_dim / 8;
     const int nrows = min(16, rows - row_base);
-    const int groups = in_dim >> 6;
     // in_dim chunked at 4096 columns (wpt <= 2 at 256 threads, 64-group
     // partials at any width). Per-lane column order is chunk-ascending,
     // identical to a flat sweep — single-chunk shapes stay bit-identical.
@@ -923,8 +1155,7 @@ extern "C" __global__ void edge0_gemv_group4_lora(
                 }
                 if (w < cwords && (tid & 7) == 0) {
                     const int group = w / 8;
-                    const int gi = (row_base + r) * groups + c0 / 64 + group;
-                    partials[r][group] = scales[gi] * dot + biases[gi] * sumx;
+                    partials[r][group] = s_sc[r][c0 / 64 + group] * dot + s_bi[r][c0 / 64 + group] * sumx;
                 }
             }
         }
@@ -969,7 +1200,7 @@ extern "C" __global__ void edge0_add_rmsnorm(
     int n,
     float eps)
 {
-    __shared__ float partials[256];
+    __shared__ float partials[1024];
     const int tid = threadIdx.x;
     float sq = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
@@ -977,10 +1208,9 @@ extern "C" __global__ void edge0_add_rmsnorm(
         acc[i] = s;
         sq += s * s;
     }
-    partials[tid] = sq;
+    if (tid < 1024) partials[tid] = sq;
     __syncthreads();
-    #pragma unroll
-    for (int off = 128; off > 0; off >>= 1) {
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
         if (tid < off) partials[tid] += partials[tid + off];
         __syncthreads();
     }
@@ -993,8 +1223,8 @@ extern "C" __global__ void edge0_add_rmsnorm(
 // (group-of-one with silu prologue) — the shared-expert down path.
 extern "C" __global__ void edge0_gemv1_silu_lora(
     const unsigned int* __restrict__ packed,
-    const float* __restrict__ scales,
-    const float* __restrict__ biases,
+    const __nv_bfloat16* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ biases,
     const float* __restrict__ la,
     const float* __restrict__ lb,
     float* __restrict__ y,
@@ -1067,7 +1297,7 @@ extern "C" __global__ void edge0_gemv1_silu_lora(
         if (tid < words_per_row && (tid & 7) == 0) {
             const int group = tid >> 3;
             const int gi = row * (in_dim >> 6) + group;
-            partials[r][group] = scales[gi] * dot + biases[gi] * sumx;
+            partials[r][group] = __bfloat162float(scales[gi]) * dot + __bfloat162float(biases[gi]) * sumx;
         }
     }
     __syncthreads();
@@ -1082,4 +1312,51 @@ extern "C" __global__ void edge0_gemv1_silu_lora(
         }
         y[row] = total;
     }
+}
+
+// ax[s][k] = dot(la_s[k], x): one block per (segment, rank row); the gemv's
+// per-row epilogue then reads ax instead of every block recomputing it.
+extern "C" __global__ void edge0_lora_ax(
+    const float* __restrict__ la0,
+    const float* __restrict__ la1,
+    const float* __restrict__ la2,
+    const float* __restrict__ la3,
+    const float* __restrict__ la4,
+    const float* __restrict__ la5,
+    float* __restrict__ ax0,
+    float* __restrict__ ax1,
+    float* __restrict__ ax2,
+    float* __restrict__ ax3,
+    float* __restrict__ ax4,
+    float* __restrict__ ax5,
+    const float* __restrict__ x,
+    int in_dim,
+    int rank,
+    int n_seg)
+{
+    const int k = blockIdx.x;
+    const int seg = blockIdx.y;
+    if (k >= rank || seg >= n_seg) return;
+    const float* la;
+    float* ax;
+    switch (seg) {
+    case 0: la = la0; ax = ax0; break;
+    case 1: la = la1; ax = ax1; break;
+    case 2: la = la2; ax = ax2; break;
+    case 3: la = la3; ax = ax3; break;
+    case 4: la = la4; ax = ax4; break;
+    default: la = la5; ax = ax5; break;
+    }
+    if (la == nullptr) return;
+    const float* row = la + (long long)k * in_dim;
+    float acc = 0.0f;
+    for (int c = threadIdx.x; c < in_dim; c += blockDim.x) acc += row[c] * x[c];
+    __shared__ float red[256];
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) red[threadIdx.x] += red[threadIdx.x + off];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) ax[k] = red[0];
 }

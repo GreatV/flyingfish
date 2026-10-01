@@ -843,7 +843,7 @@ pub fn measure_collective_benchmark(
     let fingerprints = devices
         .iter()
         .map(|device| {
-            let fingerprint = HardwareFingerprint::collect(device);
+            let fingerprint = HardwareFingerprint::collect(device)?;
             fingerprint.validate()?;
             ensure!(
                 fingerprint.backend == crate::runtime::probe::DeviceBackend::Cuda,
@@ -1432,10 +1432,7 @@ mod tests {
         );
     }
 
-    /// Supplied a baseline, the projection is exactly that baseline divided:
-    /// compute by the rank count, communication by the charged rate. These are
-    /// the numbers the retained RTX 4090 table was built from, now carried in
-    /// as measurements instead of compiled in as constants.
+    /// Projection divides the supplied compute baseline by ranks and communication by the charged rate.
     #[test]
     fn a_supplied_baseline_is_what_the_projection_divides() {
         let baseline = CostModelBaseline {

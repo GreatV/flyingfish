@@ -74,8 +74,6 @@ pub struct RoutingDecision {
     /// Expert identities in router-returned order (CUDA is not score-sorted).
     pub experts: Vec<u32>,
     /// Final mixture weights aligned with `experts`, after normalization and scaling.
-    /// Empty for schema-2 traces, which skip weight validation.
-    #[serde(default)]
     pub gate_weights: Vec<f32>,
 }
 
@@ -83,9 +81,8 @@ pub struct RoutingDecision {
 #[serde(deny_unknown_fields)]
 pub struct RoutingTrace {
     pub schema_version: u32,
-    /// Router scaling used to validate gate weights; absent before schema 3.
-    pub routed_scaling_factor: Option<f64>,
-    pub norm_topk_prob: Option<bool>,
+    pub routed_scaling_factor: f64,
+    pub norm_topk_prob: bool,
     pub prefill_schedule: RoutingPrefillSchedule,
     pub model_family: RoutingModelFamily,
     pub domain: String,
@@ -106,19 +103,14 @@ pub struct RoutingTrace {
 impl RoutingTrace {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            (2..=ROUTING_TRACE_SCHEMA_VERSION).contains(&self.schema_version),
-            "unsupported GLM routing-trace schema {}; this build supports schemas 2..={}",
+            self.schema_version == ROUTING_TRACE_SCHEMA_VERSION,
+            "unsupported GLM routing-trace schema_version {}; require schema {}; regenerate with ff text generate --adapter glm --routing-trace <path>",
             self.schema_version,
             ROUTING_TRACE_SCHEMA_VERSION
         );
-        // Schema 3 promises gate weights aligned with `experts`; only the
-        // schema-2 compatibility path may omit them and the router parameters.
-        let requires_gate_weights = self.schema_version >= 3;
         ensure!(
-            !requires_gate_weights
-                || (self.routed_scaling_factor.is_some() && self.norm_topk_prob.is_some()),
-            "routing-trace schema {} requires routed_scaling_factor and norm_topk_prob",
-            self.schema_version
+            self.routed_scaling_factor.is_finite() && self.routed_scaling_factor > 0.0,
+            "routed_scaling_factor must be finite and positive; regenerate with ff text generate --adapter glm --routing-trace <path>"
         );
         validate_routing_trace_domain(&self.domain)?;
         let hidden_layers = usize::try_from(self.num_hidden_layers)
@@ -253,7 +245,7 @@ impl RoutingTrace {
                 decision.experts.len()
             );
             ensure!(
-                !requires_gate_weights || !decision.gate_weights.is_empty(),
+                !decision.gate_weights.is_empty(),
                 "routing decision {sequence} has no gate weights; schema {} requires one per expert",
                 self.schema_version
             );
@@ -273,9 +265,8 @@ impl RoutingTrace {
                     "routing decision {sequence} gate weights must be finite and in 0..=1e3"
                 );
                 // Normalized weights must sum to the routed scaling factor.
-                if self.norm_topk_prob == Some(true)
-                    && let Some(routed_scaling) = self.routed_scaling_factor
-                {
+                if self.norm_topk_prob {
+                    let routed_scaling = self.routed_scaling_factor;
                     let sum: f64 = decision
                         .gate_weights
                         .iter()
@@ -311,7 +302,7 @@ impl RoutingTrace {
             bytes.len()
         );
         let trace: Self =
-            serde_json::from_slice(bytes).context("invalid GLM routing-trace JSON")?;
+            serde_json::from_slice(bytes).map_err(|error| anyhow::anyhow!("invalid GLM routing-trace JSON: {error}; regenerate with ff text generate --adapter glm --routing-trace <path>"))?;
         trace.validate()?;
         Ok(trace)
     }
@@ -479,8 +470,8 @@ impl RoutingTraceBuilder {
         );
         let trace = RoutingTrace {
             schema_version: ROUTING_TRACE_SCHEMA_VERSION,
-            routed_scaling_factor: Some(routed_scaling_factor),
-            norm_topk_prob: Some(norm_topk_prob),
+            routed_scaling_factor,
+            norm_topk_prob,
             prefill_schedule: RoutingPrefillSchedule::LayerBatchedExpertGrouped,
             model_family: RoutingModelFamily::Glm5Next,
             domain: domain.to_owned(),
@@ -2210,8 +2201,8 @@ mod tests {
             .collect();
         RoutingTrace {
             schema_version: ROUTING_TRACE_SCHEMA_VERSION,
-            routed_scaling_factor: Some(0.5),
-            norm_topk_prob: Some(true),
+            routed_scaling_factor: 0.5,
+            norm_topk_prob: true,
             prefill_schedule: RoutingPrefillSchedule::TokenSerial,
             model_family: RoutingModelFamily::Glm5Next,
             domain: "hand-calculated".to_owned(),
@@ -2232,6 +2223,25 @@ mod tests {
     }
 
     #[test]
+    fn schema_two_and_missing_router_fields_require_regeneration() {
+        let trace = hand_trace(&[0, 1, 0, 1]);
+        let mut value = serde_json::to_value(&trace).unwrap();
+        value["schema_version"] = serde_json::json!(2);
+        let error = RoutingTrace::from_json(&serde_json::to_vec(&value).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("schema_version") && error.contains("ff text generate"));
+        for field in ["routed_scaling_factor", "norm_topk_prob"] {
+            let mut value = serde_json::to_value(&trace).unwrap();
+            value.as_object_mut().unwrap().remove(field);
+            let error = RoutingTrace::from_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(field) && error.contains("ff text generate"));
+        }
+    }
+
+    #[test]
     fn strict_trace_round_trip_rejects_unknown_and_oversize_json() {
         let trace = hand_trace(&[0, 0, 1, 0]);
         let json = trace.canonical_json().unwrap();
@@ -2245,34 +2255,6 @@ mod tests {
         let error =
             RoutingTrace::from_json(&vec![b' '; MAX_ROUTING_TRACE_JSON_BYTES + 1]).unwrap_err();
         assert!(error.to_string().contains("exceeding"));
-    }
-
-    #[test]
-    fn schema_two_traces_validate_without_gate_weights() {
-        let trace = hand_trace(&[0, 0, 1, 0]);
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&trace.canonical_json().unwrap()).unwrap();
-        value["schema_version"] = serde_json::json!(2);
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("routed_scaling_factor");
-        value.as_object_mut().unwrap().remove("norm_topk_prob");
-        for decision in value["decisions"].as_array_mut().unwrap() {
-            decision.as_object_mut().unwrap().remove("gate_weights");
-        }
-        let v2 = RoutingTrace::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(v2.decisions.iter().all(|d| d.gate_weights.is_empty()));
-        assert_eq!(v2.routed_scaling_factor, None);
-        v2.validate().unwrap();
-
-        value["schema_version"] = serde_json::json!(ROUTING_TRACE_SCHEMA_VERSION + 1);
-        let error = RoutingTrace::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported GLM routing-trace schema")
-        );
     }
 
     #[test]
@@ -2301,24 +2283,6 @@ mod tests {
                 .to_string()
                 .contains("0..=1e3")
         );
-
-        // Schema 3 promises the router parameters that make the sum checkable.
-        let mut trace = hand_trace(&[0, 0, 1, 0]);
-        trace.norm_topk_prob = None;
-        assert!(
-            trace
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("norm_topk_prob")
-        );
-
-        // A schema-2 trace may carry weights without them; the sum goes unchecked.
-        let mut trace = hand_trace(&[0, 0, 1, 0]);
-        trace.schema_version = 2;
-        trace.norm_topk_prob = None;
-        trace.decisions[0].gate_weights = vec![0.4];
-        trace.validate().unwrap();
     }
 
     #[test]
@@ -2330,7 +2294,7 @@ mod tests {
             decision.as_object_mut().unwrap().remove("gate_weights");
         }
         let error = RoutingTrace::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
-        assert!(error.to_string().contains("no gate weights"));
+        assert!(error.to_string().contains("gate_weights"));
 
         let mut truncated = hand_trace(&[0, 0, 1, 0]);
         truncated.decisions[2].gate_weights.clear();
@@ -2340,16 +2304,6 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("no gate weights")
-        );
-
-        let mut without_scaling = hand_trace(&[0, 0, 1, 0]);
-        without_scaling.routed_scaling_factor = None;
-        assert!(
-            without_scaling
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("routed_scaling_factor")
         );
     }
 
@@ -2474,8 +2428,8 @@ mod tests {
         }
         let trace = RoutingTrace {
             schema_version: ROUTING_TRACE_SCHEMA_VERSION,
-            routed_scaling_factor: Some(0.5),
-            norm_topk_prob: Some(true),
+            routed_scaling_factor: 0.5,
+            norm_topk_prob: true,
             prefill_schedule: RoutingPrefillSchedule::TokenSerial,
             model_family: RoutingModelFamily::Glm5Next,
             domain: "pool-ablation".to_owned(),
@@ -2812,8 +2766,8 @@ mod tests {
         }
         let trace = RoutingTrace {
             schema_version: ROUTING_TRACE_SCHEMA_VERSION,
-            routed_scaling_factor: Some(1.0),
-            norm_topk_prob: Some(true),
+            routed_scaling_factor: 1.0,
+            norm_topk_prob: true,
             prefill_schedule: RoutingPrefillSchedule::TokenSerial,
             model_family: RoutingModelFamily::Glm5Next,
             domain: "a4-shape-synthetic-routes".to_owned(),

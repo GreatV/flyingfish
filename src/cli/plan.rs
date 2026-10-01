@@ -248,10 +248,11 @@ pub(super) fn run_solve_t2va(command: H3Command) -> Result<()> {
         // as such would emit a split-axis solution for an unknown topology.
         let probe = device
             .as_deref()
-            .map(|name| -> Result<_> {
-                Ok(flyingfish::runtime::probe::ResourceSnapshot::capture(Some(
-                    &parse_device_single(name)?,
-                )))
+            .map(|name| {
+                flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&parse_device_single(
+                    name,
+                )?))
+                .context("resource probe failed")
             })
             .transpose()?;
         anyhow::ensure!(
@@ -316,6 +317,8 @@ pub(super) fn run_solve_t2va(command: H3Command) -> Result<()> {
         )?;
         let selected = super::resource::select_h3(super::resource::H3ResourceRequest {
             additional_host_allowance_bytes: host_admission.additional_allowance_bytes,
+            model: &model,
+            derived_axes: &Default::default(),
             component: &component_dir,
             device: &device,
             baseline: &base_policy,

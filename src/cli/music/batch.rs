@@ -137,19 +137,16 @@ pub(super) fn run(args: Args) -> Result<()> {
     // the concurrent sum of both, and takes a share of what is left rather than
     // all of it. Discrete workers are unaffected: the fold does not apply.
     let concurrent_workers = args.devices.len().min(requests.len()).max(1) as u64;
-    let unified_workers = args
-        .devices
-        .iter()
-        .take(requests.len())
-        .filter(|name| {
-            parse_device_single(name).is_ok_and(|device| {
-                flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device))
-                    .unified_pool_available_bytes()
-                    .is_some()
-            })
-        })
-        .count()
-        .max(1) as u64;
+    let mut unified_workers = 0u64;
+    for name in args.devices.iter().take(requests.len()) {
+        let device = parse_device_single(name)?;
+        let unified = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device))
+            .context("resource probe failed")?
+            .unified_pool_available_bytes()
+            .is_some();
+        unified_workers += unified as u64;
+    }
+    let unified_workers = unified_workers.max(1);
     let worker_errors = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for name in args.devices.iter().take(requests.len()) {

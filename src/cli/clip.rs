@@ -93,10 +93,8 @@ fn read_pixels(path: &Path, size: usize, device: &Device) -> Result<Tensor> {
         png::ColorType::GrayscaleAlpha => (2, true),
         _ => bail!("unsupported CLIP PNG color type"),
     };
-    #[allow(clippy::excessive_precision)]
-    let mean = [0.48145466f32, 0.4578275, 0.40821073];
-    #[allow(clippy::excessive_precision)]
-    let std = [0.26862954f32, 0.26130258, 0.27577711];
+    let mean = [0.481_454_67f32, 0.457_827_5, 0.408_210_72];
+    let std = [0.268_629_55f32, 0.261_302_6, 0.275_777_1];
     let mut data = vec![0f32; 3 * size * size];
     for pixel in 0..size * size {
         for channel in 0..3 {
@@ -105,4 +103,46 @@ fn read_pixels(path: &Path, size: usize, device: &Device) -> Result<Tensor> {
         }
     }
     Ok(Tensor::from_vec(data, (1, 3, size, size), device)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_png_preserves_normalization_bits() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let bytes: Vec<u8> = (0..256u16)
+            .flat_map(|n| {
+                [
+                    n as u8,
+                    n.wrapping_mul(37).wrapping_add(11) as u8,
+                    (255 - n) as u8,
+                ]
+            })
+            .collect();
+        {
+            let mut encoder = png::Encoder::new(file.reopen()?, 16, 16);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header()?.write_image_data(&bytes)?;
+        }
+        let pixels = read_pixels(file.path(), 16, &Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mean = [0x3ef6813a, 0x3eea685e, 0x3ed100ff].map(f32::from_bits);
+        let std = [0x3e8989d0, 0x3e85c974, 0x3e8d32a8].map(f32::from_bits);
+        for (channel, plane) in pixels.chunks_exact(256).enumerate() {
+            for (pixel, &value) in plane.iter().enumerate() {
+                let raw = bytes[pixel * 3 + channel] as f32 / 255.;
+                let expected = (raw - mean[channel]) / std[channel];
+                assert_eq!(
+                    value.to_bits(),
+                    expected.to_bits(),
+                    "channel {channel}, pixel {pixel}"
+                );
+            }
+        }
+        Ok(())
+    }
 }

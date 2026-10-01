@@ -1108,7 +1108,7 @@ fn machine_profile(host_bytes: u64, device_bytes: u64) -> ff_core::topology::Top
     use ff_core::topology::{InterconnectLevel, TopologyDevice};
     ff_core::topology::TopologyProfile {
         schema_version: ff_core::topology::TOPOLOGY_PROFILE_SCHEMA_VERSION,
-        fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu),
+        fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu).unwrap(),
         host_memory_total_bytes: Some(host_bytes),
         cgroup_memory_limit_bytes: None,
         peer_links: Vec::new(),

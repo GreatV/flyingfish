@@ -62,6 +62,7 @@ impl KernelAssets {
 }
 
 include!(concat!(env!("OUT_DIR"), "/cuda_kernel_manifest.rs"));
+include!(concat!(env!("OUT_DIR"), "/int4_gemv_wide_defines.rs"));
 
 /// Load one kernel's selected image for this context's device.
 pub fn load_module(
@@ -96,7 +97,7 @@ mod tests {
 
     /// Every kernel this crate compiles, so the structural gate cannot silently
     /// miss one.
-    const ALL: [&KernelAssets; 7] = [
+    const ALL: [&KernelAssets; 8] = [
         &EDGE0_GEMV,
         &EDGE0_SILU_MUL,
         &EDGE0_BATCHED_GEMV,
@@ -104,6 +105,7 @@ mod tests {
         &EDGE0_GDN,
         &EDGE0_GLUE,
         &EDGE0_MEGA,
+        &INT4_GEMV_WIDE,
     ];
 
     #[test]

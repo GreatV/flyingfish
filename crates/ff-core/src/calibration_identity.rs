@@ -17,7 +17,7 @@ const INDEX_NAMES: [&str; 2] = [
 ];
 const CONFIG_NAME: &str = "config.json";
 const SINGLE_FILE_NAMES: [&str; 2] = ["diffusion_pytorch_model.safetensors", "model.safetensors"];
-const HASH_BUFFER_BYTES: usize = 1024 * 1024;
+const READ_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_MODEL_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IDENTITY_JSON_BYTES: usize = 16 * 1024 * 1024;
 
@@ -35,12 +35,7 @@ impl FileStamp {
     }
 }
 
-/// Stamp a file by what the filesystem already knows: its size and last
-/// modification time.
-///
-/// Reading the bytes to hash them would cost the whole file in disk bandwidth
-/// and CPU for a property no decision here depends on. The stamp changes
-/// whenever a write does, which is what a local cache key needs.
+/// Stamp a regular non-symlink file by its size and modification time.
 pub fn stamp_file(path: &Path) -> Result<FileStamp> {
     let path_before = FileStat::of_path(path)
         .with_context(|| format!("failed to inspect identity input {}", path.display()))?;
@@ -64,48 +59,42 @@ pub fn stamp_file(path: &Path) -> Result<FileStamp> {
     })
 }
 
-#[derive(Clone, Debug, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BinaryIdentity {
     pub schema_version: u32,
     pub package_name: String,
     pub package_version: String,
-    /// Legacy field, ignored when matching builds. New records omit it.
-    #[serde(
-        default = "absent_executable_digest",
-        skip_serializing_if = "executable_digest_absent"
-    )]
-    pub executable: FileStamp,
     pub compiled_features: Vec<String>,
 }
 
-fn absent_executable_digest() -> FileStamp {
-    FileStamp {
-        bytes: 0,
-        modified_ns: 0,
-    }
-}
-
-fn executable_digest_absent(value: &FileStamp) -> bool {
-    value.bytes == 0 && value.modified_ns == 0
-}
-
-impl PartialEq for BinaryIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        self.schema_version == other.schema_version
-            && self.package_name == other.package_name
-            && self.package_version == other.package_version
-            && self.compiled_features == other.compiled_features
+impl<'de> Deserialize<'de> for BinaryIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            schema_version: u32,
+            package_name: String,
+            package_version: String,
+            compiled_features: Vec<String>,
+        }
+        let wire = Wire::deserialize(deserializer).map_err(|error| {
+            serde::de::Error::custom(format!(
+                "{error}; regenerate the profile with ff bench io or ff bench group4"
+            ))
+        })?;
+        Ok(Self {
+            schema_version: wire.schema_version,
+            package_name: wire.package_name,
+            package_version: wire.package_version,
+            compiled_features: wire.compiled_features,
+        })
     }
 }
 
 impl BinaryIdentity {
-    pub fn collect(
-        _current_exe: &Path,
-        package_name: &str,
-        package_version: &str,
-        features: &[&str],
-    ) -> Result<Self> {
+    pub fn collect(package_name: &str, package_version: &str, features: &[&str]) -> Result<Self> {
         let mut compiled_features = features
             .iter()
             .map(|feature| (*feature).to_owned())
@@ -116,7 +105,6 @@ impl BinaryIdentity {
             schema_version: CALIBRATION_IDENTITY_SCHEMA_VERSION,
             package_name: package_name.to_owned(),
             package_version: package_version.to_owned(),
-            executable: absent_executable_digest(),
             compiled_features,
         };
         identity.validate()?;
@@ -478,6 +466,7 @@ struct SafetensorsIndex {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IndexMetadata {
+    #[serde(deserialize_with = "crate::weights::deserialize_index_size")]
     total_size: u64,
 }
 
@@ -518,7 +507,7 @@ fn read_file_bounded(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>
     bytes
         .try_reserve_exact(expected_bytes)
         .with_context(|| format!("failed to reserve {label} buffer for {}", path.display()))?;
-    let mut reader = BufReader::with_capacity(HASH_BUFFER_BYTES, file).take(read_limit);
+    let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file).take(read_limit);
     reader
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read {label} {}", path.display()))?;
@@ -583,11 +572,7 @@ fn single_model_file(root: &Path) -> Result<BTreeSet<String>> {
     Ok(found)
 }
 
-/// Locate the component's index, distinguishing "there is none" from "there is
-/// one and it is unusable".
-///
-/// Only the first answer may fall back to a single-file layout. Collapsing the
-/// two would let an unsafe index path silently downgrade to a different file.
+/// A checkpoint layout is indexed or single-file; malformed indexes are errors.
 fn find_model_index(root: &Path) -> Result<Option<(&'static str, PathBuf)>> {
     for name in INDEX_NAMES {
         let candidate = root.join(name);
@@ -742,6 +727,31 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn executable_stamp_is_rejected_with_a_recalibration_command() {
+        let mut value =
+            serde_json::to_value(BinaryIdentity::collect("ff", "1", &[]).unwrap()).unwrap();
+        value["executable"] = serde_json::json!({"bytes": 1, "modified_ns": 1});
+        let error = BinaryIdentity::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("executable") && error.contains("ff bench"));
+    }
+
+    #[test]
+    fn index_size_uses_the_shared_numeric_rule() {
+        let parsed: SafetensorsIndex = serde_json::from_str(
+            r#"{"metadata":{"total_size":55562855904.0},"weight_map":{"a":"a.safetensors"}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.metadata.total_size, 55_562_855_904);
+        for size in ["1.5", "-1.0", "9007199254740994.0"] {
+            assert!(
+                serde_json::from_str::<IndexMetadata>(&format!("{{\"total_size\":{size}}}"))
+                    .is_err()
+            );
+        }
+    }
+
     fn model_fixture(reverse_map_order: bool) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join(CONFIG_NAME), br#"{"hidden_size":8}"#).unwrap();
@@ -790,9 +800,7 @@ mod tests {
 
     #[test]
     fn binary_identity_round_trips_strictly() {
-        let executable = std::env::current_exe().unwrap();
-        let identity =
-            BinaryIdentity::collect(&executable, "example-app", "1.2.3", &["cuda"]).unwrap();
+        let identity = BinaryIdentity::collect("example-app", "1.2.3", &["cuda"]).unwrap();
         assert_eq!(identity.package_name, "example-app");
         assert_eq!(identity.package_version, "1.2.3");
         assert_eq!(identity.compiled_features, ["cuda"]);

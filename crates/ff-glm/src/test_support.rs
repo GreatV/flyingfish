@@ -242,8 +242,9 @@ pub(super) fn write_config(directory: &Path, qkv: usize) {
             "layer_types":["linear_attention","deepseek_sparse_attention"],
             "mlp_layer_types":["dense","sparse"],"indexer_types":["full","full"],
             "index_topk":8,"index_kpool":2,"index_kpool_always_select_tail":true,
-            "index_n_heads":1,"index_head_dim":2,"linear_num_heads":1,
-            "linear_head_dim":2,"linear_conv_kernel_dim":2,"linear_lower_bound":-5.0,
+            "index_n_heads":1,"index_head_dim":2,
+            "linear_attn_config":{"num_heads":1,"head_dim":2,"short_conv_kernel_size":2,
+                "gate_lower_bound":-5.0,"kda_layers":[0],"full_attn_layers":[1]},
             "hc_mult":2,"hc_eps":0.000001,"hc_sinkhorn_iters":3,
             "hidden_act":"silu","swiglu_limit":10.0,"rms_norm_eps":0.00001,
             "attention_bias":false,"attention_dropout":0.0,"max_position_embeddings":64,
@@ -257,7 +258,7 @@ pub(super) fn write_config(directory: &Path, qkv: usize) {
         "tie_word_embeddings":false
     }"#;
     let mut config: serde_json::Value = serde_json::from_str(config).unwrap();
-    config["text_config"]["linear_head_dim"] = json!(qkv);
+    config["text_config"]["linear_attn_config"]["head_dim"] = json!(qkv);
     fs::write(
         directory.join("config.json"),
         serde_json::to_vec(&config).unwrap(),
@@ -375,7 +376,9 @@ pub(super) fn tiny_checkpoint_with_kda_width(qkv: usize) -> tempfile::TempDir {
 }
 
 pub(super) fn tiny_options() -> StreamedGlmOptions {
-    StreamedGlmOptions::new(WeightSource::Mmap, CachePolicy::new(1), Device::Cpu)
+    let mut options = StreamedGlmOptions::new(WeightSource::Mmap, CachePolicy::new(1), Device::Cpu)
         .with_resident_static(true)
-        .with_expert_cache_bytes(1_024)
+        .with_expert_cache_bytes(1_024);
+    options.io_readers = Some([0, 1]);
+    options
 }

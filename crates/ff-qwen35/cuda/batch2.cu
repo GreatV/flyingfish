@@ -1,3 +1,4 @@
+#include <cuda_bf16.h>
 // Batch-2 decode kernels for MTP speculative verify: two token positions
 // share ONE weight read. x0/x1 are the two positions' inputs; y0/y1 the
 // outputs. Reduction shapes are the single-column kernel's, per column —
@@ -11,8 +12,8 @@
 
 extern "C" __global__ void qwen_gemv4_batch2(
     const unsigned int* __restrict__ packed,
-    const float* __restrict__ scales,
-    const float* __restrict__ biases,
+    const __nv_bfloat16* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ biases,
     const float* __restrict__ x0,
     const float* __restrict__ x1,
     float* __restrict__ y0,
@@ -88,8 +89,8 @@ extern "C" __global__ void qwen_gemv4_batch2(
                 }
                 if (w < cwords && (tid & 7) == 0) {
                     const int gi = row * groups + c0 / 64 + w / 8;
-                    partials0[r][w / 8] = scales[gi] * dot0 + biases[gi] * sum0;
-                    partials1[r][w / 8] = scales[gi] * dot1 + biases[gi] * sum1;
+                    partials0[r][w / 8] = __bfloat162float(scales[gi]) * dot0 + __bfloat162float(biases[gi]) * sum0;
+                    partials1[r][w / 8] = __bfloat162float(scales[gi]) * dot1 + __bfloat162float(biases[gi]) * sum1;
                 }
             }
         }
@@ -115,10 +116,10 @@ extern "C" __global__ void qwen_gemv4_batch2(
 // Batch-2 grouped GEMV (no LoRA in this checkpoint): four segments, two
 // input columns, one weight pass. Same chunking as edge0's group4.
 extern "C" __global__ void qwen_group4_batch2(
-    const unsigned int* __restrict__ packed0, const float* __restrict__ scales0, const float* __restrict__ biases0, float* __restrict__ y00, float* __restrict__ y01, int rows0,
-    const unsigned int* __restrict__ packed1, const float* __restrict__ scales1, const float* __restrict__ biases1, float* __restrict__ y10, float* __restrict__ y11, int rows1,
-    const unsigned int* __restrict__ packed2, const float* __restrict__ scales2, const float* __restrict__ biases2, float* __restrict__ y20, float* __restrict__ y21, int rows2,
-    const unsigned int* __restrict__ packed3, const float* __restrict__ scales3, const float* __restrict__ biases3, float* __restrict__ y30, float* __restrict__ y31, int rows3,
+    const unsigned int* __restrict__ packed0, const __nv_bfloat16* __restrict__ scales0, const __nv_bfloat16* __restrict__ biases0, float* __restrict__ y00, float* __restrict__ y01, int rows0,
+    const unsigned int* __restrict__ packed1, const __nv_bfloat16* __restrict__ scales1, const __nv_bfloat16* __restrict__ biases1, float* __restrict__ y10, float* __restrict__ y11, int rows1,
+    const unsigned int* __restrict__ packed2, const __nv_bfloat16* __restrict__ scales2, const __nv_bfloat16* __restrict__ biases2, float* __restrict__ y20, float* __restrict__ y21, int rows2,
+    const unsigned int* __restrict__ packed3, const __nv_bfloat16* __restrict__ scales3, const __nv_bfloat16* __restrict__ biases3, float* __restrict__ y30, float* __restrict__ y31, int rows3,
     const float* __restrict__ xa,
     const float* __restrict__ xb,
     int in_dim)
@@ -129,8 +130,8 @@ extern "C" __global__ void qwen_group4_batch2(
     const int pad2 = (rows2 + 15) & ~15;
 
     const unsigned int* packed;
-    const float* scales;
-    const float* biases;
+    const __nv_bfloat16* scales;
+    const __nv_bfloat16* biases;
     float* y0;
     float* y1;
     int rows;
@@ -217,8 +218,8 @@ extern "C" __global__ void qwen_group4_batch2(
                 }
                 if (w < cwords && (tid & 7) == 0) {
                     const int gi = (row_base + r) * groups + c0 / 64 + w / 8;
-                    p0[r][w / 8] = scales[gi] * d0 + biases[gi] * s0;
-                    p1[r][w / 8] = scales[gi] * d1 + biases[gi] * s1;
+                    p0[r][w / 8] = __bfloat162float(scales[gi]) * d0 + __bfloat162float(biases[gi]) * s0;
+                    p1[r][w / 8] = __bfloat162float(scales[gi]) * d1 + __bfloat162float(biases[gi]) * s1;
                 }
             }
         }
@@ -437,5 +438,29 @@ extern "C" __global__ void qwen_concat(
     if (i < n) {
         out[i] = a[i];
         out[n + i] = b[i];
+    }
+}
+
+// Reject path: reload the GDN conv/recurrent state saved at the A/B seam.
+// Predicated on the accept flag so the same launch is graph-capturable;
+// it exits without touching state on accept.
+extern "C" __global__ void qwen_gdn_restore(
+    float* __restrict__ conv_dst,
+    const float* __restrict__ conv_src,
+    float* __restrict__ rec_dst,
+    const float* __restrict__ rec_src,
+    const float* __restrict__ flag,
+    int conv_n,
+    int rec_n)
+{
+    if (*flag != 0.0f) return;
+    const int total = conv_n + rec_n;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += gridDim.x * blockDim.x) {
+        if (i < conv_n) {
+            conv_dst[i] = conv_src[i];
+        } else {
+            rec_dst[i - conv_n] = rec_src[i - conv_n];
+        }
     }
 }

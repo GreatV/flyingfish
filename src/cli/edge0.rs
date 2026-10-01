@@ -17,6 +17,8 @@ pub(super) enum Edge0Command {
         #[arg(long, help = "Edge0-35B-A3B checkpoint directory")]
         model: PathBuf,
         #[arg(long)]
+        host_profile: Option<PathBuf>,
+        #[arg(long)]
         prompt: String,
         #[arg(long, default_value_t = NonZeroUsize::new(128).unwrap())]
         max_new_tokens: NonZeroUsize,
@@ -38,12 +40,15 @@ pub(super) enum Edge0Command {
 pub(super) fn run(command: Edge0Command) -> Result<()> {
     let Edge0Command::Generate {
         model: model_dir,
+        host_profile,
         prompt,
         max_new_tokens,
         device,
         resident_experts,
         explain_config,
     } = command;
+    #[cfg(not(feature = "cuda"))]
+    let _ = &host_profile;
     let kit::DeviceArgs { device } = device;
     let (device, auto) = resolve_text_device(&device)?;
     let config = Edge0Config::from_model_dir(&model_dir)?;
@@ -63,10 +68,10 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
     );
     let device = match device {
         TextDevice::Cuda(ordinals) => {
-            if auto && ids.len() + max_new_tokens.get() > configured_max_ctx() {
+            if auto && ids.len() + max_new_tokens.get() > configured_max_ctx()? {
                 eprintln!(
                     "auto: prompt + generation exceeds the {} KV-cache capacity; falling back to CPU",
-                    configured_max_ctx()
+                    configured_max_ctx()?
                 );
                 TextDevice::Cpu
             } else {
@@ -97,7 +102,7 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
                     TextDevice::Cuda(_) => candle_core::Device::new_cuda(selected_ordinal)?,
                     TextDevice::Cpu => candle_core::Device::Cpu,
                 };
-                let profile = ff_core::topology::TopologyProfile::capture(&capture_device);
+                let profile = ff_core::topology::TopologyProfile::capture(&capture_device)?;
                 let derived = flyingfish::edge0::resources::derive_edge0_configuration(
                     &sizes,
                     &profile,
@@ -128,14 +133,26 @@ pub(super) fn run(command: Edge0Command) -> Result<()> {
             );
             generate_greedy(&mut model, &ids, max_new_tokens.get(), &eos_token_ids)?
         }
-        TextDevice::Cuda(ordinals) => generate_cuda(
-            &ordinals,
-            &mut model,
-            &ids,
-            max_new_tokens.get(),
-            resident_experts,
-            &eos_token_ids,
-        )?,
+        TextDevice::Cuda(ordinals) => {
+            #[cfg(feature = "cuda")]
+            {
+                model.enable_gpu_multi(&ordinals, resident_experts)?;
+                let (records, _) = flyingfish::host_profile::HostProfile::group_records(
+                    host_profile.as_deref(),
+                    ordinals[0],
+                    model.forced_group(),
+                )?;
+                model.bind_groups(&records, &flyingfish::collect_binary_identity()?)?;
+            }
+            generate_cuda(
+                &ordinals,
+                &mut model,
+                &ids,
+                max_new_tokens.get(),
+                resident_experts,
+                &eos_token_ids,
+            )?
+        }
     };
     let text = tokenizer
         .decode(&generated, true)
@@ -165,6 +182,7 @@ fn decode_from_hidden(
     eos_token_ids: &[u32],
 ) -> Result<Vec<u32>> {
     let mut generated = Vec::with_capacity(max_new_tokens);
+    let started = std::time::Instant::now();
     while generated.len() < max_new_tokens {
         let logits = model.logits(hidden.as_ref().context("missing prefill state")?)?;
         let best = greedy_token(&logits)?;
@@ -174,6 +192,12 @@ fn decode_from_hidden(
         }
         hidden = Some(model.forward(best)?);
     }
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "edge0 decode: {} tokens in {ms:.1} ms = {:.3} ms/token",
+        generated.len(),
+        ms / generated.len() as f64
+    );
     Ok(generated)
 }
 
@@ -190,7 +214,7 @@ fn generate_cuda(
         !ordinals.is_empty(),
         "--device cuda:N[,M...] requires at least one ordinal"
     );
-    model.enable_gpu_multi(ordinals, resident_experts)?;
+    let _ = resident_experts;
     if ordinals.len() > 1 {
         return generate_cuda_multi(model, ids, max_new_tokens, eos_token_ids);
     }
@@ -207,11 +231,18 @@ fn generate_cuda(
     }
     if model.has_resident_experts() {
         let mut generated = vec![model.first_token()?];
+        let started = std::time::Instant::now();
         while generated.len() < max_new_tokens && !eos_token_ids.contains(generated.last().unwrap())
         {
             let prev = *generated.last().expect("first token");
             generated.push(model.forward_token(prev)?);
         }
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "edge0 decode: {} tokens in {ms:.1} ms = {:.3} ms/token",
+            generated.len() - 1,
+            ms / (generated.len() - 1).max(1) as f64
+        );
         return Ok(generated);
     }
     decode_from_hidden(model, hidden, max_new_tokens, eos_token_ids)
@@ -224,11 +255,8 @@ fn generate_cuda_multi(
     max_new_tokens: usize,
     eos_token_ids: &[u32],
 ) -> Result<Vec<u32>> {
-    // Prefill runs on the multi-device runtime one token at a time so the
-    // device state (KV, GDN, position counters) is warm when decode starts.
-    // Single-device behaviour is bitwise-equivalent because each peer runs
-    // the same per-layer kernels as the single-context path.
-    let max_ctx = configured_max_ctx();
+    // Token-wise prefill populates each device's KV, GDN and position state before decode.
+    let max_ctx = configured_max_ctx()?;
     anyhow::ensure!(
         ids.len() + max_new_tokens <= max_ctx,
         "prompt + generation {} exceeds the {max_ctx} KV-cache capacity; \
@@ -239,10 +267,17 @@ fn generate_cuda_multi(
         model.forward_multi(id)?;
     }
     let mut generated = vec![model.first_token_multi()?];
+    let started = std::time::Instant::now();
     while generated.len() < max_new_tokens && !eos_token_ids.contains(generated.last().unwrap()) {
         let prev = *generated.last().expect("first token");
-        generated.push(model.forward_token_multi(prev)?);
+        generated.push(model.forward_token(prev)?);
     }
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "edge0 decode: {} tokens in {ms:.1} ms = {:.3} ms/token",
+        generated.len() - 1,
+        ms / (generated.len() - 1).max(1) as f64
+    );
     Ok(generated)
 }
 

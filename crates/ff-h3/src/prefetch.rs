@@ -19,9 +19,11 @@ use std::sync::Arc;
 pub(crate) const PREFETCH_ENVIRONMENT_VARIABLE: &str = "FF_H3_PREFETCH";
 
 pub(crate) fn requested() -> bool {
-    std::env::var(PREFETCH_ENVIRONMENT_VARIABLE)
-        .map(|value| value != "0")
-        .unwrap_or(true)
+    static VALUE: std::sync::OnceLock<std::result::Result<usize, String>> =
+        std::sync::OnceLock::new();
+    ff_core::probe::cached_env_usize(&VALUE, PREFETCH_ENVIRONMENT_VARIABLE, 1, 0, 1)
+        .expect("FF_H3_PREFETCH must be 0 or 1; supply a valid value and rerun ff")
+        == 1
 }
 
 pub(crate) struct StagePrefetcher {
@@ -237,4 +239,16 @@ fn upload_async(
             }
         })
         .map(|tensor| Some((tensor, bytes_len)))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn invalid_prefetch_switch_names_the_control() {
+        crate::cuda::profile::tests::rejects_invalid_switch(
+            super::PREFETCH_ENVIRONMENT_VARIABLE,
+            "prefetch::tests::invalid_prefetch_switch_names_the_control",
+            super::requested,
+        );
+    }
 }

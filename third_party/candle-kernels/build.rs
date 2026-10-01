@@ -40,11 +40,11 @@ fn main() -> Result<()> {
         println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
         println!(
             "cargo:rerun-if-env-changed={}",
-            ff_cuda_build::ARCHITECTURE_ENVIRONMENT_VARIABLE
+            ff_cuda::build::ARCHITECTURE_ENVIRONMENT_VARIABLE
         );
         let nvcc = std::env::var_os("NVCC").unwrap_or_else(|| "nvcc".into());
-        let ptxas = ff_cuda_build::resolve_ptxas(&nvcc);
-        let architectures = ff_cuda_build::resolve_target_architectures();
+        let ptxas = ff_cuda::build::resolve_ptxas(&nvcc);
+        let architectures = ff_cuda::build::resolve_target_architectures();
         let mut cubins_rs = String::new();
         let mut ptx_files: Vec<PathBuf> = std::fs::read_dir(&out_dir)?
             .filter_map(|entry| entry.ok())
@@ -58,7 +58,7 @@ fn main() -> Result<()> {
             let images: Vec<u32> = architectures
                 .iter()
                 .copied()
-                .filter(|&arch| ff_cuda_build::assemble_cubin(&ptxas, &out_dir, &stem, arch))
+                .filter(|&arch| ff_cuda::build::assemble_cubin(&ptxas, &out_dir, &stem, arch))
                 .collect();
             writeln!(
                 cubins_rs,

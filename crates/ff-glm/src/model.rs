@@ -6,7 +6,7 @@ use super::{
         GlmExecutionManifestRecorder,
     },
     execution_policy::GlmExecutionPolicy,
-    expert_cache::{ExpertCache, ExpertCacheReplacementPolicy, ExpertCacheStats},
+    expert_cache::{ExpertCache, ExpertCacheStats},
     expert_cache_manager::{ExpertCacheLayout, ExpertCacheManager},
     fp8, math,
     routing_trace::{
@@ -102,6 +102,7 @@ pub struct GlmGeneration {
     pub decode_elapsed: Duration,
     pub token_elapsed: Vec<Duration>,
     pub execution_manifest: GlmExecutionManifest,
+    pub io_trace: Option<Vec<crate::io_trace::IoStage>>,
 }
 
 pub struct GlmParityCapture {
@@ -119,7 +120,6 @@ pub struct StreamedGlmOptions {
     pub resident_static: bool,
     pub expert_cache_bytes: usize,
     pub expert_cache_layout: ExpertCacheLayout,
-    pub expert_cache_replacement: ExpertCacheReplacementPolicy,
     pub expert_cache_min_bytes: usize,
     pub adaptive_expert_cache: bool,
     pub cpu_fp8_dequantization: bool,
@@ -127,6 +127,8 @@ pub struct StreamedGlmOptions {
     /// Set through `with_host_expert_share` to match the policy's per-mille precision.
     host_expert_share: f64,
     pub pinned_fp8_transfer: bool,
+    /// Profile page-warming and pinned-fill counts, before environment overrides.
+    pub io_readers: Option<[usize; 2]>,
     /// Emit static-residency preload progress on stderr. Off by default so the
     /// library stays silent unless a caller asks for progress.
     pub progress: bool,
@@ -187,104 +189,152 @@ fn host_expert_share_per_mille(share: f64) -> u32 {
     (share.min(1.0) * 1000.0).round() as u32
 }
 
-/// Page-warming readers (`FF_GLM_PREFETCH_THREADS`, default 4).
-fn expert_prefetch_threads() -> usize {
-    std::env::var("FF_GLM_PREFETCH_THREADS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(4)
+pub(crate) fn reader_chunk(bytes: usize, readers: usize, alignment: Option<usize>) -> usize {
+    let chunk = bytes.div_ceil(readers.max(1)).max(1);
+    alignment.map_or(chunk, |alignment| chunk.next_multiple_of(alignment))
+}
+
+#[cfg(all(unix, any(feature = "cuda", test)))]
+pub(crate) fn read_buffered(
+    path: &Path,
+    base: u64,
+    bytes: &mut [u8],
+    read: (usize, Option<usize>),
+) -> std::io::Result<()> {
+    let count = bytes.len();
+    if count == 0 {
+        return Ok(());
+    }
+    let chunk = reader_chunk(count, read.0, read.1);
+    let source = ff_core::storage::ParallelReadSource::Reopen(path);
+    let complete = count / chunk;
+    if count.is_multiple_of(chunk) || complete == 0 {
+        return ff_core::storage::read_parallel_into(source, base, bytes, complete.max(1));
+    }
+    let split = complete * chunk;
+    let (prefix, tail) = bytes.split_at_mut(split);
+    std::thread::scope(|scope| {
+        let first = scope
+            .spawn(move || ff_core::storage::read_parallel_into(source, base, prefix, complete));
+        let last = ff_core::storage::read_parallel_into(source, base + split as u64, tail, 1);
+        first
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("pinned reader panicked")))
+            .and(last)
+    })
 }
 
 /// Host expert workers (`FF_GLM_HOST_THREADS`, default 4).
-fn host_evaluation_threads() -> usize {
-    std::env::var("FF_GLM_HOST_THREADS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(4)
+fn checked_host_share(value: Option<u32>) -> Result<Option<f64>> {
+    value
+        .map(|per_mille| {
+            ensure!(
+                per_mille <= 1000,
+                "FF_GLM_HOST_SHARE must be in 0..=1000; supply a valid value and rerun ff"
+            );
+            Ok(f64::from(per_mille) / 1000.0)
+        })
+        .transpose()
 }
 
-/// Read checkpoint ranges into the page cache. Failures leave demand reads unchanged.
+fn host_evaluation_threads() -> Result<usize> {
+    ff_core::probe::env_usize("FF_GLM_HOST_THREADS", 4, 1, usize::MAX)
+}
+
+/// Read checkpoint ranges into the page cache.
 #[cfg(unix)]
-fn warm_checkpoint_pages(ranges: &[(std::path::PathBuf, u64, u64)], next: &AtomicUsize) {
+fn warm_checkpoint_pages(
+    ranges: &[(std::path::PathBuf, u64, u64)],
+    next: &AtomicUsize,
+    buffer: &mut [u8],
+) -> Result<()> {
     use std::os::unix::fs::FileExt;
     let mut files: std::collections::HashMap<&Path, std::fs::File> =
         std::collections::HashMap::new();
-    let mut buffer = vec![0u8; 2 << 20];
     loop {
         let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some((path, offset, len)) = ranges.get(index) else {
-            return;
+            return Ok(());
         };
         let file = match files.entry(path.as_path()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let Ok(opened) = std::fs::File::open(path) else {
-                    continue;
-                };
+                let opened = std::fs::File::open(path)
+                    .with_context(|| format!("page-warming open failed: {}", path.display()))?;
                 entry.insert(opened)
             }
         };
         let mut position = *offset;
-        let end = offset.saturating_add(*len);
+        let end = offset
+            .checked_add(*len)
+            .context("page-warming range overflow")?;
         while position < end {
             let count = buffer.len().min((end - position) as usize);
-            match file.read_at(&mut buffer[..count], position) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => position += read as u64,
-            }
+            let read = file
+                .read_at(&mut buffer[..count], position)
+                .with_context(|| {
+                    format!("page-warming read failed: {} at {position}", path.display())
+                })?;
+            ensure!(
+                read > 0,
+                "page-warming file ended inside its range: {} at {position}",
+                path.display()
+            );
+            position += read as u64;
         }
     }
 }
 
 #[cfg(not(unix))]
-fn warm_checkpoint_pages(_ranges: &[(std::path::PathBuf, u64, u64)], _next: &AtomicUsize) {}
+fn warm_checkpoint_pages(
+    _ranges: &[(std::path::PathBuf, u64, u64)],
+    _next: &AtomicUsize,
+    _buffer: &mut [u8],
+) -> Result<()> {
+    bail!("page warming requires Unix positional reads")
+}
 
 /// Pinned staging the runtime may allocate: upload lanes, each holding two
 /// slots, and the fill-ahead ring depth chosen in `expert_contributions`.
 /// Admission reserves both, so the configured knobs cannot outgrow it.
 #[cfg(feature = "cuda")]
-pub(crate) fn pinned_staging_shape() -> (usize, usize) {
-    let workers = fill_ahead_count();
+pub(crate) fn pinned_staging_shape() -> Result<(usize, usize)> {
+    let workers = fill_ahead_count()?;
     let depth = if workers > 0 {
         workers.saturating_mul(2).max(4)
     } else {
         0
     };
-    (fp8::cuda::configured_lanes(), depth)
+    Ok((fp8::cuda::configured_lanes()?, depth))
 }
 
 /// Loads in flight for a configured transfer path: the foreground one plus any
 /// fill-ahead workers, and never fewer than the upload lanes. Fill-ahead only
 /// runs on the pinned path, so a non-pinned configuration has one loader.
-pub(crate) fn concurrent_load_count(pinned: bool) -> usize {
+pub(crate) fn concurrent_load_count(pinned: bool) -> Result<usize> {
     if !pinned {
-        return 1;
+        return Ok(1);
     }
     #[cfg(feature = "cuda")]
     {
-        let (lanes, _) = pinned_staging_shape();
-        fill_ahead_count().saturating_add(1).max(lanes)
+        let (lanes, _) = pinned_staging_shape()?;
+        Ok(fill_ahead_count()?.saturating_add(1).max(lanes))
     }
     #[cfg(not(feature = "cuda"))]
-    1
+    Ok(1)
 }
 
 #[cfg(not(feature = "cuda"))]
-pub(crate) fn pinned_staging_shape() -> (usize, usize) {
-    (1, 0)
+pub(crate) fn pinned_staging_shape() -> Result<(usize, usize)> {
+    Ok((1, 0))
 }
 
 /// Fill-ahead worker count (`FF_GLM_FILL_AHEAD`, default 0/off, maximum 8).
 #[cfg(feature = "cuda")]
-fn fill_ahead_count() -> usize {
-    static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *WORKERS.get_or_init(|| {
-        std::env::var("FF_GLM_FILL_AHEAD")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0)
-            .clamp(0, 8)
-    })
+fn fill_ahead_count() -> Result<usize> {
+    static WORKERS: std::sync::OnceLock<std::result::Result<usize, String>> =
+        std::sync::OnceLock::new();
+    ff_core::probe::cached_env_usize(&WORKERS, "FF_GLM_FILL_AHEAD", 0, 0, 8)
 }
 
 /// Shared by the model and by `StreamedGlmOptions`, so the rule can be checked
@@ -308,14 +358,31 @@ impl StreamedGlmOptions {
             resident_static: false,
             expert_cache_bytes: 0,
             expert_cache_layout: ExpertCacheLayout::PerLayerSplit,
-            expert_cache_replacement: ExpertCacheReplacementPolicy::Lru,
             expert_cache_min_bytes: 0,
             adaptive_expert_cache: false,
             cpu_fp8_dequantization: false,
             host_expert_share: 0.0,
             pinned_fp8_transfer: false,
+            io_readers: None,
             progress: false,
         }
+    }
+
+    fn readers(&self, overrides: [Option<usize>; 2]) -> Result<[usize; 2]> {
+        let mut readers = [0; 2];
+        for (index, name) in ["FF_GLM_PREFETCH_THREADS", "FF_GLM_PINNED_FILL_THREADS"]
+            .into_iter()
+            .enumerate()
+        {
+            readers[index] = overrides[index]
+                .or(self.io_readers.map(|counts| counts[index]))
+                .with_context(|| format!("missing GLM reader calibration: run ff bench io --profile local-interconnect or set {name} explicitly"))?;
+        }
+        ensure!(
+            readers[1] > 0,
+            "FF_GLM_PINNED_FILL_THREADS must be positive"
+        );
+        Ok(readers)
     }
 
     pub fn with_resident_static(mut self, resident: bool) -> Self {
@@ -356,13 +423,8 @@ impl StreamedGlmOptions {
         self
     }
 
-    pub fn with_expert_cache_policy(
-        mut self,
-        layout: ExpertCacheLayout,
-        replacement: ExpertCacheReplacementPolicy,
-    ) -> Self {
+    pub fn with_expert_cache_policy(mut self, layout: ExpertCacheLayout) -> Self {
         self.expert_cache_layout = layout;
-        self.expert_cache_replacement = replacement;
         self
     }
 
@@ -383,6 +445,13 @@ pub struct StreamedGlm {
     /// Fraction of a routed miss set to evaluate on the host, from a measured
     /// profile of this machine. Zero until one says otherwise.
     host_expert_share: f64,
+    #[cfg(feature = "cuda")]
+    io_readers: [usize; 2],
+    #[cfg(feature = "cuda")]
+    io_alignment: Option<usize>,
+    warm_buffer_bytes: usize,
+    warm_workers: usize,
+    warm_scratch: std::sync::Mutex<Vec<Vec<u8>>>,
     static_weights: BTreeMap<String, Tensor>,
     expert_cache: ExpertCacheManager,
     execution_policy: GlmExecutionPolicy,
@@ -390,6 +459,15 @@ pub struct StreamedGlm {
     admission_breakdown: Option<crate::admission::GlmAdmissionBreakdown>,
     #[cfg(feature = "cuda")]
     weight_pool: std::sync::OnceLock<Option<fp8::cuda::WeightPool>>,
+}
+
+impl Drop for StreamedGlm {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(device) = &self.device {
+            let _ = device.cuda_stream().context().bind_to_thread();
+        }
+    }
 }
 
 /// A validated metadata catalog with no weight payloads loaded. Capacity is
@@ -449,7 +527,6 @@ impl PreparedGlm {
             &layers,
             bytes,
             policy.expert_cache.layout,
-            policy.expert_cache.replacement,
         )?;
         self.model.execution_policy = policy.clone();
         self.resident_static = policy.resident_static;
@@ -530,7 +607,9 @@ impl PreparedGlm {
                     .max(breakdown.expert_load_device_bytes)
             })?,
             // The runtime guards must require the reserve admission granted.
-            safety_bytes: usize::try_from(breakdown.scaled_admission_safety_bytes(snapshot))?,
+            safety_bytes: usize::try_from(
+                breakdown.scaled_admission_safety_bytes(snapshot).unwrap(),
+            )?,
             unified_pool: snapshot.unified_pool_available_bytes().is_some(),
             prefill_host_charge_bytes: usize::try_from(breakdown.prefill_host_mask_bytes)?,
             // Resident-static preloads the FP8 weights below, which creates the
@@ -561,13 +640,16 @@ impl PreparedGlm {
                     // A tensor-granularity miss owns a header copy per loader.
                     .and_then(|n| {
                         n.checked_add(
-                            breakdown.largest_header_bytes(self.model.weights.cache_policy()),
+                            breakdown
+                                .largest_header_bytes(self.model.weights.cache_policy())
+                                .unwrap(),
                         )
                     })
                     .context("GLM unified host charge overflow")?,
             )?,
         });
         self.model.admission_breakdown = Some(breakdown);
+        self.model.prepare_warming()?;
         if self.resident_static {
             self.model.preload_static_weights(self.progress)?;
         }
@@ -584,10 +666,290 @@ struct FillPipeline<'a> {
     workers: usize,
 }
 
+#[cfg(any(test, all(feature = "cuda", target_os = "linux")))]
+fn reader_time_limit(slowest: Duration, count: usize, budget: u64, bytes: u64) -> Result<Duration> {
+    Duration::try_from_secs_f64(slowest.as_secs_f64() * count as f64 * budget as f64 / bytes as f64)
+        .context("reader calibration time envelope is invalid; rerun ff bench io")
+}
+
+#[cfg(any(test, all(feature = "cuda", target_os = "linux")))]
+fn check_reader_time(elapsed: Duration, limit: Option<Duration>) -> Result<()> {
+    ensure!(
+        limit.is_none_or(|limit| elapsed <= limit),
+        "reader calibration exceeded its measured time budget; rerun ff bench io"
+    );
+    Ok(())
+}
+
 impl StreamedGlm {
+    /// Interleaved cold expert-stream samples: bytes and wall/process-CPU nanoseconds per candidate.
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    pub fn measure_readers(
+        model_dir: &Path,
+        device: &Device,
+        candidates: &[[usize; 2]],
+        iterations: [usize; 2],
+        expert: usize,
+    ) -> Result<Vec<(u64, Vec<[u64; 2]>)>> {
+        ensure!(
+            device.is_cuda()
+                && !candidates.is_empty()
+                && candidates.iter().all(|r| r[1] > 0)
+                && iterations[1] > 0,
+            "invalid reader calibration configuration"
+        );
+        ensure!(
+            !fp8::staging::direct_fill_active()?,
+            "reader calibration requires buffered fills"
+        );
+        let mut models = Vec::new();
+        for &readers in candidates {
+            let mut options =
+                StreamedGlmOptions::new(WeightSource::Mmap, CachePolicy::new(1), device.clone())
+                    .with_pinned_fp8_transfer(true);
+            options.io_readers = Some(readers);
+            let model = Self::prepare(model_dir, options)?.model;
+            ensure!(
+                model.io_readers == readers,
+                "reader overrides conflict with the calibration sweep"
+            );
+            ensure!(
+                model.host_expert_share == 0.0 && model.fill_ahead_workers()? == 0,
+                "reader calibration requires device experts without fill-ahead"
+            );
+            model.ensure_weight_pool()?;
+            model.prepare_warming()?;
+            ensure!(
+                model.device_lanes() == 1,
+                "reader calibration requires one upload lane"
+            );
+            models.push(model);
+        }
+        let text = &models[0].config.text_config;
+        ensure!(
+            expert < text.n_routed_experts,
+            "calibration expert exceeds model geometry"
+        );
+        let hidden = Tensor::arange(0f32, text.hidden_size as f32, device)?
+            .affine(1.0 / text.hidden_size as f64, -0.5)?
+            .to_dtype(models[0].compute_dtype)?;
+        let mut selected = (0..text.num_experts_per_tok)
+            .map(|index| {
+                ((expert + index * text.n_routed_experts / text.num_experts_per_tok)
+                    % text.n_routed_experts) as u32
+            })
+            .collect::<Vec<_>>();
+        selected.sort_unstable();
+        let selected = selected
+            .into_iter()
+            .map(|index| (index, 1.0 / text.num_experts_per_tok as f32))
+            .collect::<Vec<_>>();
+        let layers = text
+            .mlp_layer_types
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, kind)| {
+                (*kind == MlpKind::Sparse)
+                    .then_some((layer, format!("model.language_model.layers.{layer}.mlp")))
+            })
+            .collect::<Vec<_>>();
+        let weights = &models[0].weights;
+        let budget = weights
+            .tensor_names()
+            .filter(|name| name.contains(".mlp.experts."))
+            .try_fold(0u64, |total, name| -> Result<u64> {
+                total
+                    .checked_add(weights.raw_tensor_metadata(name)?.bytes as u64)
+                    .context("reader calibration byte budget overflow")
+            })?;
+        let rounds = iterations[0]
+            .checked_add(iterations[1])
+            .context("reader calibration iteration overflow")?;
+        let mut layer_costs = Vec::new();
+        for (_, prefix) in &layers {
+            let mut routed = 0u64;
+            let mut shared = 0u64;
+            for (index, _) in &selected {
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    let name = format!("{prefix}.experts.{index}.{projection}.weight");
+                    for name in [name.clone(), format!("{name}_scale_inv")] {
+                        routed = routed
+                            .checked_add(weights.raw_tensor_metadata(&name)?.bytes as u64)
+                            .context("reader calibration span overflow")?;
+                    }
+                }
+            }
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                let name = format!("{prefix}.shared_experts.{projection}.weight");
+                for name in [name.clone(), format!("{name}_scale_inv")] {
+                    shared = shared
+                        .checked_add(weights.raw_tensor_metadata(&name)?.bytes as u64)
+                        .context("reader calibration shared span overflow")?;
+                }
+            }
+            let cost = candidates.iter().try_fold(0u64, |total, readers| {
+                let bytes = if readers[0] == 0 {
+                    Some(routed)
+                } else {
+                    routed.checked_mul(2).and_then(|n| n.checked_add(shared))
+                };
+                bytes
+                    .and_then(|bytes| total.checked_add(bytes))
+                    .context("reader calibration read budget overflow")
+            })?;
+            layer_costs.push(cost);
+        }
+        let indices = (1..=layers.len())
+            .rev()
+            .find_map(|count| {
+                let indices = (0..count)
+                    .map(|index| index * layers.len() / count)
+                    .collect::<Vec<_>>();
+                let cost = indices
+                    .iter()
+                    .try_fold(0u64, |total, &index| total.checked_add(layer_costs[index]))?
+                    .checked_mul(rounds as u64)?;
+                (cost <= budget).then_some(indices)
+            })
+            .with_context(|| {
+                format!(
+                    "one representative layer needs at least {} logical read bytes; checkpoint expert budget is {budget}",
+                    layer_costs.iter().min().copied().unwrap_or(0).saturating_mul(rounds as u64)
+                )
+            })?;
+        let round_bytes = indices.iter().map(|&index| layer_costs[index]).sum::<u64>();
+        ensure!(round_bytes > 0, "reader calibration has no expert payload");
+        let layers = indices
+            .iter()
+            .map(|&index| layers[index].clone())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "GLM reader budget: {} layers; {} logical read bytes / {budget} checkpoint expert bytes; {} rounds",
+            layers.len(),
+            round_bytes * rounds as u64,
+            rounds
+        );
+        let mut paths = std::collections::BTreeSet::new();
+        let mut names = Vec::new();
+        let mut measurements = Vec::new();
+        for model in &models {
+            let mut tensors = Vec::new();
+            for (_, prefix) in &layers {
+                for (index, _) in &selected {
+                    for projection in ["gate_proj", "up_proj", "down_proj"] {
+                        tensors.push(format!("{prefix}.experts.{index}.{projection}.weight"));
+                    }
+                }
+                if model.io_readers[0] > 0 {
+                    for projection in ["gate_proj", "up_proj", "down_proj"] {
+                        tensors.push(format!("{prefix}.shared_experts.{projection}.weight"));
+                    }
+                }
+            }
+            let mut bytes = 0u64;
+            for name in &tensors {
+                for key in [name.clone(), format!("{name}_scale_inv")] {
+                    let metadata = model.weights.raw_tensor_metadata(&key)?;
+                    paths.insert(model_dir.join(&metadata.shard));
+                    bytes = bytes
+                        .checked_add(metadata.bytes as u64)
+                        .context("calibration byte count overflow")?;
+                }
+            }
+            names.push(tensors);
+            measurements.push((bytes, Vec::with_capacity(iterations[1])));
+        }
+        let cpu_ns = || -> Result<u64> {
+            let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+            ensure!(
+                unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, time.as_mut_ptr()) }
+                    == 0,
+                "process CPU clock unavailable"
+            );
+            let time = unsafe { time.assume_init() };
+            Ok(u64::try_from(time.tv_sec)? * 1_000_000_000 + u64::try_from(time.tv_nsec)?)
+        };
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        let mut storage = ff_core::storage::ReadHealth::new(&paths[0])?;
+        let started = Instant::now();
+        let mut time_budget = None;
+        let mut slowest = Duration::ZERO;
+        for iteration in 0..rounds {
+            for step in 0..models.len() {
+                check_reader_time(started.elapsed(), time_budget)?;
+                let candidate_started = Instant::now();
+                let index = if iteration % 2 == 0 {
+                    step
+                } else {
+                    models.len() - step - 1
+                };
+                let model = &mut models[index];
+                for name in &names[index] {
+                    model.weights.raw_tensor_metadata(name)?;
+                    model
+                        .weights
+                        .raw_tensor_metadata(&format!("{name}_scale_inv"))?;
+                }
+                let cold = ff_core::cold_cache::evict_and_verify(&paths)?;
+                eprintln!(
+                    "GLM reader cache: iteration={iteration}, readers={:?}; {}",
+                    model.io_readers,
+                    serde_json::to_string(&cold)?
+                );
+                device.synchronize()?;
+                let cpu = cpu_ns()?;
+                let start = Instant::now();
+                if model.io_readers[0] == 0 {
+                    for name in &names[index] {
+                        let tensor = model.load_linear_weight(name)?;
+                        model.wait_lane_ready(0)?;
+                        std::hint::black_box(tensor);
+                        storage.check()?;
+                    }
+                } else {
+                    for (layer, prefix) in &layers {
+                        std::hint::black_box(model.expert_contributions(
+                            *layer,
+                            prefix,
+                            &hidden,
+                            selected.clone(),
+                        )?);
+                        storage.check()?;
+                    }
+                }
+                device.synchronize()?;
+                storage.check()?;
+                let elapsed = u64::try_from(start.elapsed().as_nanos())?;
+                let cpu = cpu_ns()?
+                    .checked_sub(cpu)
+                    .context("process CPU clock moved backwards")?;
+                if iteration >= iterations[0] {
+                    measurements[index].1.push([elapsed, cpu]);
+                }
+                model.weights =
+                    ModelWeights::open(model_dir, WeightSource::Mmap, CachePolicy::new(1))?;
+                if iteration == 0 {
+                    slowest = slowest.max(candidate_started.elapsed());
+                }
+            }
+            if iteration == 0 {
+                let limit = reader_time_limit(slowest, models.len(), budget, round_bytes)?;
+                eprintln!("GLM reader time budget: {:.3} s", limit.as_secs_f64());
+                time_budget = Some(limit);
+            }
+        }
+        check_reader_time(started.elapsed(), time_budget)?;
+        eprintln!(
+            "GLM reader calibration wall: {:.3} s",
+            started.elapsed().as_secs_f64()
+        );
+        Ok(measurements)
+    }
+
     pub fn open(model_dir: impl AsRef<Path>, options: StreamedGlmOptions) -> Result<Self> {
         let prepared = Self::prepare(model_dir, options)?;
-        let snapshot = ResourceSnapshot::capture(Some(prepared.device()));
+        let snapshot =
+            ResourceSnapshot::capture(Some(prepared.device())).context("resource probe failed")?;
         prepared.open(1, &snapshot)
     }
 
@@ -672,7 +1034,6 @@ impl StreamedGlm {
             &sparse_layers,
             options.expert_cache_bytes,
             options.expert_cache_layout,
-            options.expert_cache_replacement,
         )?;
         let expert_cache_min_bytes = if options.adaptive_expert_cache {
             options.expert_cache_min_bytes
@@ -687,7 +1048,6 @@ impl StreamedGlm {
             config.text_config.index_topk,
             crate::execution_policy::ExpertCacheOptions {
                 layout: options.expert_cache_layout,
-                replacement: options.expert_cache_replacement,
                 maximum_bound_bytes: options.expert_cache_bytes,
                 minimum_bound_bytes: expert_cache_min_bytes,
                 adaptive: options.adaptive_expert_cache,
@@ -698,13 +1058,51 @@ impl StreamedGlm {
         }
         execution_policy.pinned_fp8_transfer = options.pinned_fp8_transfer;
         // Resolve FF_GLM_HOST_SHARE (per-mille) here so the policy records the actual split.
-        let host_share_override = std::env::var("FF_GLM_HOST_SHARE")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .map(|per_mille| f64::from(per_mille.min(1000)) / 1000.0);
+        let host_share_override =
+            checked_host_share(ff_core::probe::env_value::<u32>("FF_GLM_HOST_SHARE")?)?;
         execution_policy.host_expert_share_per_mille =
             host_expert_share_per_mille(host_share_override.unwrap_or(options.host_expert_share));
         execution_policy.validate()?;
+        let [prefetch, fill] = ["FF_GLM_PREFETCH_THREADS", "FF_GLM_PINNED_FILL_THREADS"].map(
+            |name| match std::env::var(name) {
+                Ok(value) => value
+                    .parse::<usize>()
+                    .map(Some)
+                    .with_context(|| format!("invalid {name}: {value}")),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(error) => Err(error).with_context(|| format!("invalid {name}")),
+            },
+        );
+        let overrides = [prefetch?, fill?];
+        let io_readers = options.readers(overrides)?;
+        let io_alignment =
+            ff_core::storage::read_alignment().context("GLM read-alignment query failed")?;
+        let mut warm_buffer_bytes = 0;
+        let mut has_scales = false;
+        for name in weights
+            .tensor_names()
+            .filter(|name| name.contains(".mlp.experts."))
+        {
+            warm_buffer_bytes = warm_buffer_bytes.max(weights.raw_tensor_metadata(name)?.bytes);
+            has_scales |= name.ends_with("_scale_inv");
+        }
+        let warm_workers = if sparse_layers.is_empty() {
+            0
+        } else {
+            io_readers[0]
+                .min(config.text_config.num_experts_per_tok * 3 * (1 + usize::from(has_scales)))
+        };
+        let warm_buffer_bytes = reader_chunk(warm_buffer_bytes, 1, io_alignment);
+        eprintln!(
+            "GLM streaming readers: prefetch={}, fill={}; {}; overrides={overrides:?}",
+            io_readers[0],
+            io_readers[1],
+            if options.io_readers.is_some() {
+                "calibrated"
+            } else {
+                "explicit overrides"
+            }
+        );
         let model = Self {
             weights,
             config,
@@ -715,6 +1113,13 @@ impl StreamedGlm {
                 DType::BF16
             },
             host_expert_share: host_share_override.unwrap_or(options.host_expert_share),
+            #[cfg(feature = "cuda")]
+            io_readers,
+            #[cfg(feature = "cuda")]
+            io_alignment,
+            warm_buffer_bytes,
+            warm_workers,
+            warm_scratch: std::sync::Mutex::new(Vec::new()),
             device: options.device,
             tokenizer,
             static_weights: BTreeMap::new(),
@@ -733,12 +1138,20 @@ impl StreamedGlm {
             1,
             model.execution_policy.cpu_fp8_dequantization,
         )?;
+        breakdown.host_route_workspace_bytes = breakdown
+            .host_route_workspace_bytes
+            .checked_add(
+                (model.warm_buffer_bytes as u64)
+                    .checked_mul(model.warm_workers as u64)
+                    .context("warming buffer size overflow")?,
+            )
+            .context("warming workspace overflow")?;
         // Fill-ahead workers only run on the pinned path, so header copies are
         // charged for loaders that can actually exist.
         breakdown.concurrent_loads =
-            u64::try_from(concurrent_load_count(options.pinned_fp8_transfer))?;
+            u64::try_from(concurrent_load_count(options.pinned_fp8_transfer)?)?;
         if options.pinned_fp8_transfer {
-            let (lanes, fill_ring_depth) = pinned_staging_shape();
+            let (lanes, fill_ring_depth) = pinned_staging_shape()?;
             breakdown.enable_pinned_transfer(lanes, fill_ring_depth)?;
         }
         Ok(PreparedGlm {
@@ -796,34 +1209,6 @@ impl StreamedGlm {
             .transpose()
             .map(|n| n.unwrap_or(0))
     }
-    #[cfg(feature = "cuda")]
-    fn begin_expert_compute(
-        &self,
-    ) -> Result<Option<candle_core::cuda_backend::cudarc::driver::CudaEvent>> {
-        if !self.execution_policy.pinned_fp8_transfer {
-            return Ok(None);
-        }
-        if let (Some(pool), Device::Cuda(device)) = (
-            self.weight_pool.get().and_then(Option::as_ref),
-            &self.device,
-        ) {
-            return pool.begin_compute(device);
-        }
-        Ok(None)
-    }
-    #[cfg(feature = "cuda")]
-    fn end_expert_compute(
-        &self,
-        start: Option<candle_core::cuda_backend::cudarc::driver::CudaEvent>,
-    ) -> Result<()> {
-        if let (Some(pool), Device::Cuda(device)) = (
-            self.weight_pool.get().and_then(Option::as_ref),
-            &self.device,
-        ) {
-            pool.end_compute(device, start)?;
-        }
-        Ok(())
-    }
 
     pub fn expert_cache_stats(&self) -> ExpertCacheStats {
         self.expert_cache
@@ -849,7 +1234,8 @@ impl StreamedGlm {
             .admission
             .context("GLM runtime admission model is unavailable")?;
         let before = self.expert_cache.stats()?;
-        let snapshot = ResourceSnapshot::capture(Some(&self.device));
+        let snapshot =
+            ResourceSnapshot::capture(Some(&self.device)).context("resource probe failed")?;
         // Fold exactly as admission did.
         let (available, memory_kind) = if self.device.is_cpu() {
             (crate::admission::host_available(&snapshot), "host")
@@ -1072,6 +1458,7 @@ impl StreamedGlm {
 
         self.admit_prefill(prompt_ids.len())?;
         let mut state = DecoderState::new(&self.config, self.compute_dtype, &self.device)?;
+        let mut io_trace = crate::io_trace::IoTrace::from_env()?;
         let prefill_started = Instant::now();
         let mut hidden =
             self.forward_prefill(prompt_ids, &mut state, &mut routing_trace, options.progress)?;
@@ -1082,8 +1469,14 @@ impl StreamedGlm {
             &mut execution_recorder,
         )?;
         let prefill_elapsed = prefill_started.elapsed();
+        if let Some(trace) = &mut io_trace {
+            trace.record("prefill", None);
+        }
 
         let lm_head = self.load_linear_weight(LM_HEAD_WEIGHT)?;
+        if let Some(trace) = &mut io_trace {
+            trace.record("lm_head", None);
+        }
         let decode_started = Instant::now();
         let mut rng = StdRng::seed_from_u64(options.seed);
         let mut generated = Vec::with_capacity(options.max_new_tokens);
@@ -1104,6 +1497,9 @@ impl StreamedGlm {
                 );
             }
             if self.generation_config.eos_token_ids.contains(&token) {
+                if let Some(trace) = &mut io_trace {
+                    trace.record("decode_token", Some(step));
+                }
                 break;
             }
             if step + 1 < options.max_new_tokens {
@@ -1135,6 +1531,9 @@ impl StreamedGlm {
                     );
                 }
             }
+            if let Some(trace) = &mut io_trace {
+                trace.record("decode_token", Some(step));
+            }
         }
         let decode_elapsed = decode_started.elapsed();
         let text = self
@@ -1159,6 +1558,7 @@ impl StreamedGlm {
                 decode_elapsed,
                 token_elapsed,
                 execution_manifest,
+                io_trace: io_trace.map(crate::io_trace::IoTrace::finish),
             },
             routing_trace,
         ))
@@ -1451,6 +1851,44 @@ impl StreamedGlm {
         }
         let mut selected = indices.into_iter().zip(weights).collect::<Vec<_>>();
         selected.sort_unstable_by_key(|(expert, _)| *expert);
+        self.expert_contributions(layer, prefix, hidden, selected)
+    }
+
+    fn prepare_warming(&self) -> Result<()> {
+        let mut scratch = self
+            .warm_scratch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GLM warming scratch lock poisoned"))?;
+        if scratch.len() == self.warm_workers {
+            return Ok(());
+        }
+        let buffers = (0..self.warm_workers)
+            .map(|_| {
+                let mut buffer = Vec::new();
+                buffer
+                    .try_reserve_exact(self.warm_buffer_bytes)
+                    .with_context(|| {
+                        format!(
+                            "page warming needs {} host bytes per worker",
+                            self.warm_buffer_bytes
+                        )
+                    })?;
+                buffer.resize(self.warm_buffer_bytes, 0);
+                Ok(buffer)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        *scratch = buffers;
+        Ok(())
+    }
+
+    fn expert_contributions(
+        &self,
+        layer: usize,
+        prefix: &str,
+        hidden: &Tensor,
+        selected: Vec<(u32, f32)>,
+    ) -> Result<Tensor> {
+        let text = &self.config.text_config;
         let cache = self.expert_cache.cache_for_layer(layer)?;
         let mut pending = selected
             .into_iter()
@@ -1499,7 +1937,8 @@ impl StreamedGlm {
         // Warm pages for host experts and buffered device loads. O_DIRECT bypasses
         // the page cache, so warming direct device loads would duplicate disk reads.
         #[cfg(feature = "cuda")]
-        let skip_device_warm = fp8::staging::direct_fill_active();
+        let skip_device_warm =
+            self.execution_policy.pinned_fp8_transfer && fp8::staging::direct_fill_active()?;
         #[cfg(not(feature = "cuda"))]
         let skip_device_warm = false;
         let mut prefetch_names: Vec<&str> = Vec::new();
@@ -1540,19 +1979,20 @@ impl StreamedGlm {
             };
             for projection in projections {
                 for key in [projection.clone(), format!("{projection}_scale_inv")] {
-                    if let Ok(metadata) = self.weights.raw_tensor_metadata(&key) {
-                        prefetch_ranges.push((
-                            self.weights.root().join(&metadata.shard),
-                            metadata.file_offset as u64,
-                            metadata.bytes as u64,
-                        ));
+                    if key.ends_with("_scale_inv") && !self.weights.contains(&key) {
+                        continue;
                     }
+                    let metadata = self.weights.raw_tensor_metadata(&key)?;
+                    prefetch_ranges.push((
+                        self.weights.root().join(&metadata.shard),
+                        metadata.file_offset as u64,
+                        metadata.bytes as u64,
+                    ));
                 }
             }
         }
 
-        // The host input is captured once, on this thread, because reading it
-        // off the device is a device operation like any other.
+        // Capture the host input once on this thread.
         let host_input = host_work
             .is_empty()
             .not()
@@ -1570,7 +2010,7 @@ impl StreamedGlm {
         let next_range = AtomicUsize::new(0);
         let next_host = AtomicUsize::new(0);
         let next_device = AtomicUsize::new(0);
-        // Serialize matvecs because cuBLAS handles are not thread-safe; loads stay parallel.
+        // cuBLAS handles are serialized; weight loads remain parallel.
         let matvec_lock = std::sync::Mutex::new(());
         // Fill workers write pinned buffers; the main thread uploads and evaluates in
         // routing order. Shared state lives outside the scope closure to outlive worker joins.
@@ -1578,7 +2018,7 @@ impl StreamedGlm {
         #[cfg(feature = "cuda")]
         let mut fill_pipeline: Option<FillPipeline<'_>> = None;
         #[cfg(feature = "cuda")]
-        if device_lanes <= 1 && self.fill_ahead_workers() > 0 {
+        if device_lanes <= 1 && self.fill_ahead_workers()? > 0 {
             let mut fill_names: Vec<&str> = Vec::new();
             for expert in &device_work {
                 if expert.gate.is_none() {
@@ -1612,7 +2052,7 @@ impl StreamedGlm {
                     max_scales = max_scales.max(raw.bytes / 4);
                 }
             }
-            let workers = self.fill_ahead_workers().min(fill_names.len());
+            let workers = self.fill_ahead_workers()?.min(fill_names.len());
             if workers > 0 && block_fp8_only && max_bytes > 0 {
                 self.ensure_weight_pool()?;
                 if let (Some(pool), Device::Cuda(device)) = (
@@ -1635,22 +2075,27 @@ impl StreamedGlm {
         let fill_queue = fill_pipeline
             .as_ref()
             .map(|pipeline| fill_ahead::FillQueue::new(pipeline.ring.len(), pipeline.names.len()));
+        let mut scratch = self
+            .warm_scratch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GLM warming scratch lock poisoned"))?;
+        ensure!(
+            scratch.len() == self.warm_workers,
+            "GLM warming scratch was not prepared"
+        );
         std::thread::scope(|scope| -> Result<()> {
-            let warmers = expert_prefetch_threads().min(prefetch_ranges.len());
-            for _ in 0..warmers {
+            let warmers = self.warm_workers.min(prefetch_ranges.len());
+            let mut warming = Vec::with_capacity(warmers);
+            for buffer in scratch.iter_mut().take(warmers) {
                 let ranges = &prefetch_ranges;
                 let next = &next_range;
-                scope.spawn(move || warm_checkpoint_pages(ranges, next));
+                warming.push(scope.spawn(move || warm_checkpoint_pages(ranges, next, buffer)));
             }
-            // The whole point of the split: the host evaluates its share while
-            // this thread is inside the device path, not before or after it.
-            // Serially the host branch can only ever add its own time, which is
-            // what the first version of this measured.
             let host_queue = &host_work;
             let host_next = &next_host;
             let workers: Vec<_> = match host_input.as_ref() {
                 Some(input) => {
-                    let threads = host_evaluation_threads().max(1).min(host_queue.len());
+                    let threads = host_evaluation_threads()?.max(1).min(host_queue.len());
                     (0..threads)
                         .map(|_| {
                             scope.spawn(move || {
@@ -1719,6 +2164,7 @@ impl StreamedGlm {
                                         &scale_name,
                                         self.compute_dtype,
                                         &mut buffer,
+                                        (self.io_readers[1], self.io_alignment),
                                     )
                                     .with_context(|| format!("failed to fill FP8 weight {name}"))?;
                                     drop(buffer);
@@ -1784,18 +2230,21 @@ impl StreamedGlm {
                             cache,
                             &expert.gate_name,
                             expert.gate.clone(),
+                            #[cfg(feature = "cuda")]
                             0,
                         )?;
                         let up = self.complete_cached_weight_on_lane(
                             cache,
                             &expert.up_name,
                             expert.up.clone(),
+                            #[cfg(feature = "cuda")]
                             0,
                         )?;
                         let down = self.complete_cached_weight_on_lane(
                             cache,
                             &expert.down_name,
                             expert.down.clone(),
+                            #[cfg(feature = "cuda")]
                             0,
                         )?;
                         self.wait_lane_ready(0)?;
@@ -1826,18 +2275,21 @@ impl StreamedGlm {
                                 cache,
                                 &expert.gate_name,
                                 expert.gate.clone(),
+                                #[cfg(feature = "cuda")]
                                 lane,
                             )?;
                             let up = self.complete_cached_weight_on_lane(
                                 cache,
                                 &expert.up_name,
                                 expert.up.clone(),
+                                #[cfg(feature = "cuda")]
                                 lane,
                             )?;
                             let down = self.complete_cached_weight_on_lane(
                                 cache,
                                 &expert.down_name,
                                 expert.down.clone(),
+                                #[cfg(feature = "cuda")]
                                 lane,
                             )?;
                             self.wait_lane_ready(lane)?;
@@ -1879,8 +2331,14 @@ impl StreamedGlm {
                     ));
                 }
             }
+            for worker in warming {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("GLM page-warming worker panicked"))??;
+            }
             Ok(())
         })?;
+        drop(scratch);
         contributions.sort_unstable_by_key(|(expert, _)| *expert);
         let mut output = Tensor::zeros(text.hidden_size, self.compute_dtype, &self.device)?;
         for (_, contribution) in contributions {
@@ -1902,42 +2360,6 @@ impl StreamedGlm {
         self.mlp_with_weights(hidden, &gate_weight, &up_weight, &down_weight, mixture)
     }
 
-    fn traced_linear(&self, input: &Tensor, weight: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.execution_policy.pinned_fp8_transfer
-            && self
-                .weight_pool
-                .get()
-                .and_then(Option::as_ref)
-                .is_some_and(|p| p.tracing_enabled())
-        {
-            use candle_core::cuda_backend::{CudaStorageSlice, cudarc::driver::DevicePtr};
-            let stream = self.device.as_cuda_device()?.cuda_stream();
-            for tensor in [input, weight] {
-                let (storage, _) = tensor.storage_and_layout();
-                let candle_core::Storage::Cuda(storage) = &*storage else {
-                    bail!("expected CUDA matrix");
-                };
-                macro_rules! ready {
-                    ($data:expr) => {{
-                        let (_, _read) = $data.device_ptr(&stream);
-                    }};
-                }
-                match &storage.slice {
-                    CudaStorageSlice::BF16(x) => ready!(x),
-                    CudaStorageSlice::F16(x) => ready!(x),
-                    CudaStorageSlice::F32(x) => ready!(x),
-                    _ => bail!("unsupported matrix trace dtype"),
-                }
-            }
-            let start = self.begin_expert_compute()?;
-            let result = linear(input, weight)?;
-            self.end_expert_compute(start)?;
-            return Ok(result);
-        }
-        linear(input, weight)
-    }
-
     fn mlp_with_weights(
         &self,
         hidden: &Tensor,
@@ -1947,10 +2369,10 @@ impl StreamedGlm {
         mixture: Option<f64>,
     ) -> Result<Tensor> {
         let input = hidden.unsqueeze(0)?;
-        let gate = self.traced_linear(&input, gate_weight)?;
-        let up = self.traced_linear(&input, up_weight)?;
+        let gate = linear(&input, gate_weight)?;
+        let up = linear(&input, up_weight)?;
         let activated = math::clamped_swiglu(&gate, &up, self.config.text_config.swiglu_limit)?;
-        let output = self.traced_linear(&activated, down_weight)?.squeeze(0)?;
+        let output = linear(&activated, down_weight)?.squeeze(0)?;
         match mixture {
             Some(weight) => output
                 .to_dtype(DType::F32)?
@@ -1973,7 +2395,13 @@ impl StreamedGlm {
         name: String,
         cached: Option<Tensor>,
     ) -> Result<Tensor> {
-        self.complete_cached_weight_on_lane(cache, &name, cached, 0)
+        self.complete_cached_weight_on_lane(
+            cache,
+            &name,
+            cached,
+            #[cfg(feature = "cuda")]
+            0,
+        )
     }
 
     /// Use one consumer per upload lane, or a serial loop without a pinned pool.
@@ -1989,7 +2417,7 @@ impl StreamedGlm {
 
     /// Fill-ahead worker count when pinned transfers and CUDA async allocation are enabled.
     #[cfg(feature = "cuda")]
-    fn fill_ahead_workers(&self) -> usize {
+    fn fill_ahead_workers(&self) -> Result<usize> {
         #[cfg(feature = "cuda")]
         if self.execution_policy.pinned_fp8_transfer
             && let Device::Cuda(device) = &self.device
@@ -1997,7 +2425,7 @@ impl StreamedGlm {
         {
             return fill_ahead_count();
         }
-        0
+        Ok(0)
     }
 
     #[cfg(feature = "cuda")]
@@ -2006,7 +2434,10 @@ impl StreamedGlm {
             && let Device::Cuda(device) = &self.device
         {
             let pool = if device.cuda_stream().context().has_async_alloc() {
-                Some(fp8::cuda::WeightPool::new(device)?)
+                Some(fp8::cuda::WeightPool::new(
+                    device,
+                    (self.io_readers[1], self.io_alignment),
+                )?)
             } else {
                 None
             };
@@ -2020,12 +2451,16 @@ impl StreamedGlm {
         cache: &ExpertCache,
         name: &str,
         cached: Option<Tensor>,
-        lane: usize,
+        #[cfg(feature = "cuda")] lane: usize,
     ) -> Result<Tensor> {
         if let Some(tensor) = cached {
             return Ok(tensor);
         }
-        let tensor = self.load_linear_weight_on_lane(name, lane)?;
+        let tensor = self.load_linear_weight_on_lane(
+            name,
+            #[cfg(feature = "cuda")]
+            lane,
+        )?;
         cache.insert(name.to_owned(), tensor.clone());
         Ok(tensor)
     }
@@ -2135,14 +2570,18 @@ impl StreamedGlm {
     }
 
     fn load_linear_weight(&self, name: &str) -> Result<Tensor> {
-        self.load_linear_weight_on_lane(name, 0)
+        self.load_linear_weight_on_lane(
+            name,
+            #[cfg(feature = "cuda")]
+            0,
+        )
     }
 
     /// Load through the selected lane's pinned staging area.
     fn load_linear_weight_on_lane(
         &self,
         name: &str,
-        #[allow(unused)] lane: usize,
+        #[cfg(feature = "cuda")] lane: usize,
     ) -> Result<Tensor> {
         if let Some(tensor) = self.static_weights.get(name) {
             return Ok(tensor.clone());
@@ -2787,6 +3226,25 @@ fn sample_token(logits: &Tensor, temperature: f64, top_p: f64, rng: &mut StdRng)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_time_envelope_covers_later_variation_but_rejects_overruns() {
+        let initial = [
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+        ];
+        let slowest = *initial.iter().max().unwrap();
+        let limit = reader_time_limit(slowest, initial.len(), 18, 6).unwrap();
+        let later = Duration::from_secs(30);
+        let old_limit = initial.iter().sum::<Duration>() * 3;
+        assert!(later > old_limit);
+        check_reader_time(later, Some(limit)).unwrap();
+        let error = check_reader_time(Duration::from_secs(37), Some(limit))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reader calibration") && error.contains("ff bench io"));
+    }
     use crate::execution_policy::ExpertCacheOptions;
     use crate::{config::GlmTextConfig, execution_policy::GLM_ADMISSION_SAFETY_BYTES};
     use ff_core::weights::{CachePolicy, WeightSource};
@@ -2799,6 +3257,74 @@ mod tests {
     /// same number therefore have to split a miss set the same way, or the
     /// record would not describe the run: 0.2499 and 0.2501 both record 250,
     /// and un-quantised they straddle `round(2 * share)`.
+    #[test]
+    fn oversized_host_share_errors_instead_of_clamping() {
+        let error = checked_host_share(Some(1001)).unwrap_err().to_string();
+        assert!(error.contains("FF_GLM_HOST_SHARE") && error.contains("rerun ff"));
+        assert_eq!(checked_host_share(None).unwrap(), None);
+        assert_eq!(checked_host_share(Some(1000)).unwrap(), Some(1.0));
+    }
+
+    #[test]
+    fn profile_readers_precede_overrides_and_chunks_follow_alignment() {
+        let mut options = tiny_options();
+        options.io_readers = None;
+        assert!(options.readers([None, None]).is_err());
+        assert_eq!(options.readers([Some(0), Some(1)]).unwrap(), [0, 1]);
+        options.io_readers = Some([8, 16]);
+        assert_eq!(options.readers([None, None]).unwrap(), [8, 16]);
+        assert_eq!(options.readers([Some(0), None]).unwrap(), [0, 16]);
+        assert_eq!(options.readers([None, Some(2)]).unwrap(), [8, 2]);
+        assert!(options.readers([None, Some(0)]).is_err());
+        assert_eq!(reader_chunk(8 << 20, 16, Some(4096)), 512 << 10);
+        assert_eq!(reader_chunk(8193, 2, Some(4096)), 8192);
+        assert_eq!(reader_chunk(17, 4, None), 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aligned_reader_partitions_preserve_nonaligned_payloads() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let data = (0..30001).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        std::fs::write(file.path(), &data)?;
+        for readers in [1, 2, 3, 4, 8, 16] {
+            for alignment in [None, Some(4096)] {
+                let mut actual = vec![0; data.len() - 26];
+                read_buffered(file.path(), 13, &mut actual, (readers, alignment))?;
+                assert_eq!(actual, data[13..data.len() - 13]);
+            }
+        }
+        let mut small = [0; 3];
+        read_buffered(file.path(), 7, &mut small, (16, Some(4096)))?;
+        assert_eq!(small, data[7..10]);
+        assert!(
+            read_buffered(file.path(), data.len() as u64, &mut small, (2, Some(4096))).is_err()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn page_warming_reports_missing_files_and_short_ranges() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("weights");
+        let next = AtomicUsize::new(0);
+        assert!(
+            warm_checkpoint_pages(&[(path.clone(), 0, 1)], &next, &mut [0; 16])
+                .unwrap_err()
+                .to_string()
+                .contains("page-warming open")
+        );
+        std::fs::write(&path, [1u8; 16]).unwrap();
+        let next = AtomicUsize::new(0);
+        assert!(
+            warm_checkpoint_pages(&[(path, 0, 17)], &next, &mut [0; 16])
+                .unwrap_err()
+                .to_string()
+                .contains("ended inside")
+        );
+    }
+
     #[test]
     fn shares_that_record_alike_split_alike() {
         let options = |share: f64| {
@@ -2931,7 +3457,6 @@ mod tests {
             8,
             ExpertCacheOptions {
                 layout: ExpertCacheLayout::SharedPool,
-                replacement: ExpertCacheReplacementPolicy::Lfu,
                 maximum_bound_bytes: 100,
                 minimum_bound_bytes: 20,
                 adaptive: true,
@@ -3140,12 +3665,12 @@ mod tests {
         let checkpoint = tiny_checkpoint_with_kda_width(128);
         quantize_tiny_linears(checkpoint.path());
         let open = |pinned| {
-            StreamedGlm::open(
-                checkpoint.path(),
+            let mut options =
                 StreamedGlmOptions::new(WeightSource::Mmap, CachePolicy::new(1), device.clone())
                     .with_resident_static(true)
-                    .with_pinned_fp8_transfer(pinned),
-            )
+                    .with_pinned_fp8_transfer(pinned);
+            options.io_readers = Some([0, 1]);
+            StreamedGlm::open(checkpoint.path(), options)
         };
         let baseline = open(false)?;
         let pinned = open(true)?;
@@ -3186,6 +3711,66 @@ mod tests {
             assert_eq!(actual.text, expected.text);
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warming_scratch_is_reused_across_setup_and_decode() {
+        let checkpoint = tiny_checkpoint();
+        let mut options = tiny_options().with_expert_cache_bytes(0);
+        options.io_readers = Some([2, 1]);
+        let model = StreamedGlm::open(checkpoint.path(), options).unwrap();
+        let pointers = {
+            let mut scratch = model.warm_scratch.lock().unwrap();
+            assert_eq!(scratch.len(), 2);
+            for buffer in scratch.iter_mut() {
+                buffer.fill(17);
+            }
+            scratch
+                .iter()
+                .map(|buffer| buffer.as_ptr())
+                .collect::<Vec<_>>()
+        };
+        model.prepare_warming().unwrap();
+        assert!(
+            model
+                .warm_scratch
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|buffer| buffer[0] == 17)
+        );
+        let result = model
+            .generate(
+                "exercise every tiny GLM path",
+                &GlmGenerationOptions {
+                    max_new_tokens: 2,
+                    max_context_tokens: 8,
+                    reasoning_effort: "low".into(),
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    seed: 7,
+                    progress: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.generated_token_ids, [TARGET_TOKEN, TARGET_TOKEN]);
+        let after = model
+            .warm_scratch
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|buffer| buffer.as_ptr())
+            .collect::<Vec<_>>();
+        assert_eq!(pointers, after);
+        assert!(
+            model
+                .warm_scratch
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|buffer| buffer.iter().any(|byte| *byte != 17))
+        );
     }
 
     #[test]
@@ -3258,14 +3843,11 @@ mod tests {
             ExpertCacheLayout::PerLayerSplit,
             ExpertCacheLayout::SharedPool,
         ] {
-            for replacement in [
-                ExpertCacheReplacementPolicy::Lru,
-                ExpertCacheReplacementPolicy::Lfu,
-            ] {
+            {
                 let model = StreamedGlm::open(
                     checkpoint.path(),
                     tiny_options()
-                        .with_expert_cache_policy(layout, replacement)
+                        .with_expert_cache_policy(layout)
                         .with_adaptive_expert_cache(0),
                 )
                 .unwrap();
@@ -3281,10 +3863,6 @@ mod tests {
                 assert_eq!(
                     generated.execution_manifest.policy.expert_cache.layout,
                     layout
-                );
-                assert_eq!(
-                    generated.execution_manifest.policy.expert_cache.replacement,
-                    replacement
                 );
                 generated.execution_manifest.validate().unwrap();
             }
@@ -3325,19 +3903,17 @@ mod tests {
         use ff_core::weights::CacheGranularity;
         let checkpoint = tiny_checkpoint();
         let open = |granularity| {
-            StreamedGlm::open(
-                checkpoint.path(),
-                StreamedGlmOptions::new(
-                    WeightSource::Mmap,
-                    CachePolicy::new(1)
-                        .with_max_bytes(128)
-                        .with_granularity(granularity),
-                    Device::Cpu,
-                )
-                .with_resident_static(true)
-                .with_expert_cache_bytes(1024),
+            let mut options = StreamedGlmOptions::new(
+                WeightSource::Mmap,
+                CachePolicy::new(1)
+                    .with_max_bytes(128)
+                    .with_granularity(granularity),
+                Device::Cpu,
             )
-            .unwrap()
+            .with_resident_static(true)
+            .with_expert_cache_bytes(1024);
+            options.io_readers = Some([0, 1]);
+            StreamedGlm::open(checkpoint.path(), options).unwrap()
         };
         let shard = open(CacheGranularity::Shard);
         let tensor = open(CacheGranularity::Tensor);

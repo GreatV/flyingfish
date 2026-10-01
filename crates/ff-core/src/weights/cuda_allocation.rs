@@ -71,26 +71,24 @@ pub fn fill_pinned_from_checkpoint(
     offset: usize,
     len: usize,
     stream: &Arc<CudaStream>,
-) -> Option<candle_core::cuda_backend::cudarc::driver::PinnedHostSlice<u8>> {
-    let mut host = unsafe { stream.context().alloc_pinned::<u8>(len) }.ok()?;
-    let readers = warm_threads().min(len.div_ceil(2 << 20).max(1));
+) -> anyhow::Result<candle_core::cuda_backend::cudarc::driver::PinnedHostSlice<u8>> {
+    let mut host = unsafe { stream.context().alloc_pinned::<u8>(len) }
+        .map_err(|e| anyhow::anyhow!("pinned allocation of {len} bytes failed: {e}"))?;
+    let readers = warm_threads()?.min(len.div_ceil(2 << 20).max(1));
     crate::storage::read_parallel_into(
         crate::storage::ParallelReadSource::Shared(file),
         offset as u64,
-        host.as_mut_slice().ok()?,
+        host.as_mut_slice()
+            .context("pinned buffer is not addressable")?,
         readers,
     )
-    .ok()?;
-    Some(host)
+    .context("parallel checkpoint read into the pinned buffer failed")?;
+    Ok(host)
 }
 
 #[cfg(unix)]
-fn warm_threads() -> usize {
-    std::env::var("FF_WEIGHT_WARM_THREADS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(8)
-        .max(1)
+fn warm_threads() -> Result<usize> {
+    crate::probe::env_usize("FF_WEIGHT_WARM_THREADS", 8, 1, usize::MAX)
 }
 
 /// Upload file-backed bytes through a pinned buffer filled by parallel readers.
@@ -107,13 +105,10 @@ fn upload_slice_from_source<T: DeviceRepr>(
         count.checked_mul(std::mem::size_of::<T>()) == Some(len),
         "weight upload byte count mismatch"
     );
-    let Some(host) = fill_pinned_from_checkpoint(file, offset, len, stream) else {
-        return Ok(None);
-    };
-    let host_slice = match host.as_slice() {
-        Ok(slice) => slice,
-        Err(_) => return Ok(None),
-    };
+    let host = fill_pinned_from_checkpoint(file, offset, len, stream)?;
+    let host_slice = host
+        .as_slice()
+        .context("direct weight upload: pinned buffer is not addressable")?;
     stream.synchronize()?;
     stream.context().bind_to_thread()?;
     let mut output = unsafe { allocate::<T>(allocator, count, len, stream) }?;
@@ -127,8 +122,6 @@ fn upload_slice_from_source<T: DeviceRepr>(
     Ok(Some(output))
 }
 
-// `source` feeds only the #[cfg(unix)] upload_slice_from_source path.
-#[cfg_attr(not(unix), allow(unused_variables))]
 pub(super) fn upload(
     data: &[u8],
     source: Option<(&std::fs::File, usize, usize)>,
@@ -137,6 +130,8 @@ pub(super) fn upload(
     device: &CudaDevice,
     allocator: CudaWeightAllocator,
 ) -> Result<Tensor> {
+    #[cfg(not(unix))]
+    let _ = source;
     let count = shape
         .iter()
         .try_fold(1usize, |n, &dimension| n.checked_mul(dimension))

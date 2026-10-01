@@ -43,7 +43,6 @@ pub struct Config {
     sample_from_anchor: bool,
     #[serde(default)]
     is_causal: bool,
-    #[serde(default)]
     use_sliding_window: bool,
 }
 
@@ -84,7 +83,7 @@ impl Config {
 
     pub fn read(root: &Path) -> Result<Self> {
         serde_json::from_slice(&std::fs::read(root.join("config.json"))?)
-            .context("invalid DSpark config")
+            .map_err(|error| anyhow::anyhow!("invalid DSpark config: {error}; restore draft config.json and run ff text generate --adapter minicpm"))
     }
 
     pub fn validate_for(&self, target: &TargetConfig) -> Result<()> {
@@ -667,6 +666,26 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn omitted_sliding_window_fails_with_draft_restore_command() {
+        let mut value = draft_config();
+        assert!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("use_sliding_window")
+                .is_some()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let error = Config::read(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("use_sliding_window") && error.contains("ff text generate"));
+    }
+
+    #[test]
     fn partial_kv_replacement_failure_clears_state_and_allows_reuse() -> Result<()> {
         let (root, config) = fixture();
         let mut target = decoder(root.path(), config, 2);
@@ -816,8 +835,8 @@ mod tests {
         Ok(())
     }
 
-    fn draft_fixture(target: &Decoder) -> (tempfile::TempDir, Draft) {
-        let config: Config = serde_json::from_value(serde_json::json!({
+    fn draft_config() -> serde_json::Value {
+        serde_json::json!({
             "architectures": ["Qwen3DSparkModel"], "model_type": "qwen3", "hidden_size": 8,
             "intermediate_size": 12, "num_hidden_layers": 1, "num_attention_heads": 2,
             "num_key_value_heads": 1, "head_dim": 4, "vocab_size": 16, "draft_vocab_size": 16,
@@ -827,9 +846,12 @@ mod tests {
             "attention_bias": false, "mlp_bias": false, "hidden_act": "silu",
             "layer_types": ["full_attention"], "attention_mode": "gqa", "projector_type": "dspark",
             "markov_head_type": "vanilla", "markov_rank": 2, "enable_confidence_head": true,
-            "confidence_head_with_markov": true
-        }))
-        .unwrap();
+            "confidence_head_with_markov": true, "use_sliding_window": false
+        })
+    }
+
+    fn draft_fixture(target: &Decoder) -> (tempfile::TempDir, Draft) {
+        let config: Config = serde_json::from_value(draft_config()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut tensors = HashMap::new();
         let mut insert = |name: &str, shape: &[usize]| {

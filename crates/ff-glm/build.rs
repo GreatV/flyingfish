@@ -1,15 +1,10 @@
-/// The reference toolkit. A different one is recorded, not refused.
-///
-/// This used to be an assertion, which made a toolkit mismatch a build failure
-/// rather than a difference worth recording — and so made the crate
-/// unbuildable on any machine whose CUDA install was not this exact one. The
-/// toolkit version below records the compiler used.
+/// The tuned backend requires the pinned toolkit; other toolkit builds use the portable backend.
 const REFERENCE_NVCC_VERSION: &str = "13.2.86";
 
 // Kernels are emitted as compute_80 PTX plus per-architecture cubins; a device
 // with no matching cubin runs the driver's translation of the PTX.
 fn main() {
-    let spec = |stem, source, extra_flags| ff_cuda_build::KernelSpec {
+    let spec = |stem, source, extra_flags| ff_cuda::build::KernelSpec {
         stem,
         source: Some(source),
         staged_ptx: None,
@@ -30,10 +25,9 @@ fn main() {
             &["--fmad=false"],
         ),
     ];
-    let Some(report) = ff_cuda_build::run(
-        &specs,
-        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-    ) else {
+    let manifest_dir =
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR");
+    let Some(report) = ff_cuda::build::run(&specs, &std::path::PathBuf::from(manifest_dir)) else {
         return;
     };
     if report.nvcc_version != REFERENCE_NVCC_VERSION {

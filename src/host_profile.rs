@@ -1,19 +1,8 @@
-//! Measured properties of the machine a run is actually on.
-//!
-//! Everything here is a number this host produced about itself. None of it is
-//! a literal, because none of it transfers: `B_P` is whatever this PCIe link
-//! delivers, `B_H` is whatever these cores and this memory deliver, and a
-//! constant carrying one machine's answer would silently mis-schedule every
-//! other machine. `ff bench io --profile local-interconnect` writes the
-//! measurements; this reads them back and refuses any that were not taken
-//! here.
+//! Host-local measurements written by ff bench io; profiles are validated against the current machine.
 
 use crate::{interconnect_benchmark::LocalIoBenchmarkReport, runtime::probe::HardwareFingerprint};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-
-/// Where a run looks for its host profile when the operator names no path.
-pub const DEFAULT_HOST_PROFILE_NAME: &str = "host-profile.json";
 
 /// Why a profile is not in play. A run says which of these it is rather than
 /// quietly proceeding as though it had measurements.
@@ -58,17 +47,7 @@ impl std::fmt::Display for HostProfileAbsence {
     }
 }
 
-/// The transfer and host-evaluation rates a scheduling split is decided from,
-/// both over the same logical expert bytes.
-///
-/// `B_H` is reported two ways because only one of them decides a split. A miss
-/// has to be read out of the page cache whichever side handles it, so that
-/// read is common to both branches and cancels; what differs is the transfer
-/// against the evaluation. `host_evaluation_bytes_per_second` is the marginal
-/// rate and is what `host_share` uses. `host_service_bytes_per_second` adds the
-/// shared read back in and is the end-to-end cost of one expert on the host,
-/// which is the right number for asking whether the host path is worth having
-/// at all, and the wrong one for dividing a miss set.
+/// Host share compares PCIe transfer with marginal host evaluation; host service includes the common read cost.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExpertBandwidths {
     pub transfer_bytes_per_second: f64,
@@ -113,7 +92,7 @@ impl HostProfile {
             .with_context(|| format!("failed to read host profile {}", path.display()))?;
         let report = LocalIoBenchmarkReport::from_json(&bytes)
             .with_context(|| format!("invalid host profile {}", path.display()))?;
-        let current = HardwareFingerprint::collect(device);
+        let current = HardwareFingerprint::collect(device)?;
         if !describes_same_host(&report.fingerprint, &current) {
             return Ok(Err(HostProfileAbsence::ForeignHost {
                 path: path.to_path_buf(),
@@ -127,6 +106,30 @@ impl HostProfile {
         }))
     }
 
+    pub fn group_records(
+        path: Option<&Path>,
+        ordinal: usize,
+        forced: bool,
+    ) -> Result<(Vec<crate::runtime::probe::DecodeChoice>, f64)> {
+        let started = std::time::Instant::now();
+        if forced {
+            return Ok((Vec::new(), 0.0));
+        }
+        let path = path.context("group4 requires --host-profile <path>; run ff bench group4 or set FF_GROUP4_BODY=stock|xr16")?;
+        eprintln!("host profile: {}", path.display());
+        let device = candle_core::Device::new_cuda(ordinal)?;
+        let profile = Self::load(path, &device)
+            .context("group4 profile validation failed; run ff bench group4")?
+            .map_err(|e| anyhow::anyhow!("{e}; run ff bench group4"))?;
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("group4 profile read/validation: {elapsed:.6} ms");
+        Ok((profile.report.group4, elapsed))
+    }
+
+    pub fn into_report(self) -> LocalIoBenchmarkReport {
+        *self.report
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -135,9 +138,25 @@ impl HostProfile {
         &self.report.fingerprint
     }
 
-    pub fn expert_bandwidths(&self) -> ExpertBandwidths {
-        let expert = &self.report.glm_routed_expert;
-        ExpertBandwidths {
+    pub fn reader_counts(&self, model: &Path) -> Result<[usize; 2]> {
+        let expert = self.report.glm_routed_expert.as_ref().context(
+            "host profile has no GLM I/O section; rerun ff bench io --profile local-interconnect",
+        )?;
+        let root = std::fs::canonicalize(model)?;
+        anyhow::ensure!(
+            self.report.model_root.as_deref().is_some_and(|path| root == Path::new(path))
+                && &crate::runtime::identity::stamp_file(&root.join("config.json"))?
+                    == self.report.model_config.as_ref().context("host profile has no GLM config stamp; rerun ff bench io --profile local-interconnect")?,
+            "GLM reader profile does not match this checkpoint; rerun ff bench io --profile local-interconnect"
+        );
+        Ok(expert.reader_counts)
+    }
+
+    pub fn expert_bandwidths(&self) -> Result<ExpertBandwidths> {
+        let expert = self.report.glm_routed_expert.as_ref().context(
+            "host profile has no GLM I/O section; rerun ff bench io --profile local-interconnect",
+        )?;
+        Ok(ExpertBandwidths {
             transfer_bytes_per_second: expert
                 .pinned_host_to_device_b_p
                 .statistics
@@ -150,7 +169,7 @@ impl HostProfile {
             host_service_bytes_per_second: expert
                 .host_evaluation_b_h
                 .median_service_bytes_per_second,
-        }
+        })
     }
 }
 
@@ -173,9 +192,77 @@ mod tests {
     }
 
     #[test]
+    fn reader_counts_require_the_recorded_model() {
+        let root = tempfile::tempdir().unwrap();
+        let mut report = recorded();
+        let profile = HostProfile {
+            path: root.path().join("profile.json"),
+            report: Box::new(report.clone()),
+        };
+        assert!(profile.reader_counts(root.path()).is_err());
+        std::fs::write(root.path().join("config.json"), b"{}").unwrap();
+        report.model_root = Some(
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        report.model_config =
+            Some(crate::runtime::identity::stamp_file(&root.path().join("config.json")).unwrap());
+        report.glm_routed_expert.as_mut().unwrap().reader_counts = [8, 16];
+        let profile = HostProfile {
+            path: root.path().join("profile.json"),
+            report: Box::new(report),
+        };
+        assert_eq!(profile.reader_counts(root.path()).unwrap(), [8, 16]);
+        let other = tempfile::tempdir().unwrap();
+        assert!(profile.reader_counts(other.path()).is_err());
+        std::fs::write(root.path().join("config.json"), b"{\"changed\":true}").unwrap();
+        assert!(profile.reader_counts(root.path()).is_err());
+    }
+
+    #[test]
+    fn missing_group_profile_names_calibration_and_explicit_override_skips_read() {
+        let error = HostProfile::group_records(None, 0, false).unwrap_err();
+        assert!(error.to_string().contains("ff bench group4"));
+        let (records, cost) = HostProfile::group_records(None, 0, true).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn io_readers_require_their_own_measured_section() {
+        let mut report = recorded();
+        report.glm_routed_expert = None;
+        report.model_root = None;
+        report.model_config = None;
+        report.validate().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let profile = HostProfile {
+            path: root.path().join("profile.json"),
+            report: Box::new(report),
+        };
+        assert!(
+            profile
+                .reader_counts(root.path())
+                .unwrap_err()
+                .to_string()
+                .contains("ff bench io")
+        );
+        assert!(
+            profile
+                .expert_bandwidths()
+                .unwrap_err()
+                .to_string()
+                .contains("ff bench io")
+        );
+    }
+
+    #[test]
     fn a_missing_profile_is_named_rather_than_assumed() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join(DEFAULT_HOST_PROFILE_NAME);
+        let path = root.path().join("profile.json");
         let absence = HostProfile::load(&path, &Device::Cpu).unwrap().unwrap_err();
         assert_eq!(absence, HostProfileAbsence::NotFound(path.clone()));
         assert!(absence.to_string().contains("ff bench io"));
@@ -222,17 +309,28 @@ mod tests {
         let report = recorded();
         let expected_b_p = report
             .glm_routed_expert
+            .as_ref()
+            .unwrap()
             .pinned_host_to_device_b_p
             .statistics
             .median_bytes_per_second;
         let profile = HostProfile {
-            path: PathBuf::from(DEFAULT_HOST_PROFILE_NAME),
+            path: PathBuf::from("profile.json"),
             report: Box::new(report),
         };
         assert_eq!(
-            profile.expert_bandwidths().transfer_bytes_per_second,
+            profile
+                .expert_bandwidths()
+                .unwrap()
+                .transfer_bytes_per_second,
             expected_b_p
         );
-        assert!(profile.expert_bandwidths().host_evaluation_bytes_per_second > 0.0);
+        assert!(
+            profile
+                .expert_bandwidths()
+                .unwrap()
+                .host_evaluation_bytes_per_second
+                > 0.0
+        );
     }
 }
