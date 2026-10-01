@@ -652,19 +652,17 @@ mod tests {
             );
         }
     }
-    fn layout() -> Option<CheckpointLayout> {
-        let dir = &checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")?;
-        if !dir.join("model.safetensors.index.json").exists() {
-            return None;
-        }
-        Some(CheckpointLayout::open(dir).unwrap())
+    fn layout() -> CheckpointLayout {
+        let dir = &checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model.safetensors.index.json").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
+        CheckpointLayout::open(dir).unwrap()
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn shards_partition_into_six_roles() {
-        let Some(layout) = layout() else {
-            return;
-        };
+        let layout = layout();
         assert_eq!(layout.shard_count(ShardRole::Vision), 1);
         assert_eq!(layout.shard_count(ShardRole::Embed), 1);
         assert_eq!(layout.shard_count(ShardRole::Text), 40);
@@ -675,10 +673,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn role_assignment_matches_the_documented_shard_files() {
-        let Some(layout) = layout() else {
-            return;
-        };
+        let layout = layout();
         assert_eq!(
             layout.shard_role("model-00001-of-00048.safetensors"),
             Some(ShardRole::Vision)
@@ -708,14 +705,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn repeated_estimate_calls_stay_valid_after_map_release() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model.safetensors.index.json").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.join("model.safetensors.index.json").exists() {
-            return;
-        }
         let first = TransformerLoader::open(dir)
             .unwrap()
             .resident_f32_bytes()
@@ -731,14 +726,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn resident_estimate_sums_exact_tensor_sizes_not_shard_averages() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model.safetensors.index.json").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.join("model.safetensors.index.json").exists() {
-            return;
-        }
         let loader = TransformerLoader::open(dir).unwrap();
         let exact = loader.resident_f32_bytes().unwrap();
         // Cross-check a few known tensors against the same header math the
@@ -772,14 +765,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn a_missing_shard_is_an_error_at_open() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model.safetensors.index.json").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.join("model.safetensors.index.json").exists() {
-            return;
-        }
         let scratch = tempfile::tempdir().unwrap();
         for file in ["model.safetensors.index.json", "config.json"] {
             std::fs::copy(dir.join(file), scratch.path().join(file)).unwrap();
@@ -794,14 +785,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn layer_assembly_materializes_the_real_projections() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model.safetensors.index.json").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.join("model.safetensors.index.json").exists() {
-            return;
-        }
         let weights = LayerWeights::load_layer(&open_weights(dir).unwrap(), 6).unwrap();
         assert_eq!(weights.wq_a.dims(), [1280, 5120]);
         assert_eq!(weights.q_norm.dims(), [1280]);
@@ -828,10 +817,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn text_only_runs_open_42_shards_and_skip_optional_families() {
-        let Some(layout) = layout() else {
-            return;
-        };
+        let layout = layout();
         assert_eq!(layout.shards_to_open(OpenPlan::default()).len(), 42);
         assert_eq!(
             layout.shards_to_open(OpenPlan::default())[0],
@@ -850,10 +838,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn vision_tensors_never_share_a_shard_with_text_layers() {
-        let Some(layout) = layout() else {
-            return;
-        };
+        let layout = layout();
         let vision = layout.tensors_in("model-00001-of-00048.safetensors");
         assert!(vision.iter().any(|name| name.starts_with("vision.blocks.")));
         assert!(vision.contains(&"vision.norm.weight"));
@@ -884,14 +871,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn admission_counts_engram_projections_but_not_the_embed_table() {
-        let Some(layout) = layout() else {
-            return;
-        };
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
-        let dir = &dir;
+        let layout = layout();
+        let dir = &checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let exact = TransformerLoader::open(dir)
             .unwrap()
             .resident_f32_bytes()

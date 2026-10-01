@@ -180,15 +180,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn dequantization_round_trips_a_real_shard_payload() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model-00009-of-00048.safetensors").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        let path = dir.join("model-00009-of-00048.safetensors");
-        if !path.exists() {
-            return;
-        }
         let weights = ff_core::weights::ModelWeights::open(
             dir,
             ff_core::weights::WeightSource::Mmap,

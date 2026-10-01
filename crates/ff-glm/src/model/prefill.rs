@@ -615,10 +615,9 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "requires a CUDA device"]
     fn mhc_residency_matches_admission_and_streamed_output_cuda() -> Result<()> {
-        let Ok(device) = Device::new_cuda(0) else {
-            return Ok(());
-        };
+        let device = Device::new_cuda(0).expect("requires a CUDA device");
         check_mhc_residency(device)
     }
 

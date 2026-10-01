@@ -899,6 +899,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "requires a CUDA device"]
     fn dequantizes_aligned_blocks_on_cuda() {
         let device = Device::new_cuda(0).unwrap();
         let weight = fp8(vec![1.; 128 * 256], (128, 256))
@@ -925,6 +926,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "requires a CUDA device"]
     fn cuda_fp8_matches_cpu_all_encodings_scales_edges_and_offsets() {
         let device = Device::new_cuda(0).unwrap();
         let bytes: Vec<u8> = (0..130 * 259).map(|i| (i % 256) as u8).collect();

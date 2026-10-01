@@ -1266,7 +1266,10 @@ fn cpu_probe_json_separates_stable_identity_from_dynamic_measurements() {
         );
     }
 
-    assert_eq!(snapshot["schema_version"], 1);
+    assert_eq!(
+        snapshot["schema_version"],
+        flyingfish::runtime::probe::RESOURCE_SNAPSHOT_SCHEMA_VERSION
+    );
     assert!(snapshot["measured_at_unix_ms"].as_u64().unwrap() > 0);
     assert!(snapshot["host_memory_available_bytes"].is_u64());
     assert!(snapshot["device_free_memory_bytes"].is_null());

@@ -3350,7 +3350,10 @@ fn preflight_generation(
             budget
                 .max_host_bytes
                 .context("unified generation preflight needs a host bound")?
-                .saturating_sub(super::resource::device_residency_reserve_bytes(&snapshot)?),
+                .saturating_sub(super::resource::device_residency_reserve_bytes(
+                    &snapshot,
+                    ExecutionBackendPolicy::from_device(device),
+                )?),
         );
     }
 

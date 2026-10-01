@@ -229,12 +229,11 @@ mod tests {
     use ff_core::paths::checkpoint_dir;
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn missing_published_ids_and_dspark_fields_name_the_command() {
-        let Some(root) =
-            checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash").filter(|root| root.is_dir())
-        else {
-            return;
-        };
+        let root = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|root| root.is_dir())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         println!("config checkpoint: {}", root.display());
         let original: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
@@ -275,14 +274,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn parses_the_real_checkpoint_config() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.exists() {
-            return;
-        }
         let cfg = DeepseekV41Config::from_model_dir(dir).unwrap();
         assert_eq!(cfg.architectures, [DSV41_ARCHITECTURE]);
         assert_eq!(cfg.model_type, DSV41_MODEL_TYPE);
@@ -322,14 +319,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn mismatched_engram_arrays_are_rejected() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.exists() {
-            return;
-        }
         let mut cfg = DeepseekV41Config::from_model_dir(dir).unwrap();
         cfg.text_config.engram_num_embeddings.pop();
         assert!(cfg.validate().is_err());

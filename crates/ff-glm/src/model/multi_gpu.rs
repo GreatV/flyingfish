@@ -378,8 +378,9 @@ mod tests {
                 );
             }
         }
-        if let Some(model) =
-            ff_core::paths::checkpoint_dir("zai-org/GLM-5.3-Flash").filter(|path| path.is_dir())
+        let model = ff_core::paths::checkpoint_dir("zai-org/GLM-5.3-Flash")
+            .filter(|path| path.is_dir())
+            .expect("requires FF_MODELS_DIR with zai-org/GLM-5.3-Flash");
         {
             eprintln!("transport checkpoint: {}", model.display());
             let partition = LayerPartitionedGlm::prepare(

@@ -433,14 +433,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn layout_sizes_match_the_configuration() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.exists() {
-            return;
-        }
         let config = crate::config::DeepseekV41Config::from_model_dir(dir).unwrap();
         let layout = EngramLayout::from_config(&config.text_config).unwrap();
         assert_eq!(layout.n_hash_cols(), 24);

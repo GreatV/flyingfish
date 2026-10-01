@@ -265,13 +265,12 @@ mod tests {
         assert_bit_identical(&output, &input);
     }
 
-    // Requires an sm_80+ GPU; returns early when CUDA is unavailable.
+    // Requires an sm_80+ GPU.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "requires a CUDA device"]
     fn fused_loop_matches_reference_bit_exactly_on_cuda() {
-        let Ok(device) = Device::new_cuda(0) else {
-            return;
-        };
+        let device = Device::new_cuda(0).expect("requires a CUDA device");
         let input = anisotropic(3, 4, &device);
         let fused = fused_loop(&input, 19, 1e-6)
             .unwrap()

@@ -268,14 +268,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview"]
     fn parses_the_real_checkpoint_config() {
-        let Some(dir) = ff_core::paths::checkpoint_dir("Edge0/Edge0-35B-A3B-preview") else {
-            return;
-        };
-        if !dir.exists() {
-            return;
-        }
-        let config = Edge0Config::from_model_dir(&dir).unwrap();
+        let dir = ff_core::paths::checkpoint_dir("Edge0/Edge0-35B-A3B-preview")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview");
+        let dir = &dir;
+        let config = Edge0Config::from_model_dir(dir).unwrap();
         assert_eq!(config.quant, QuantFormat::GroupAffine { group: 64 });
     }
 

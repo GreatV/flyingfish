@@ -331,11 +331,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    #[ignore = "requires a CUDA device"]
-    fn mma_int4_matches_groupquant_matvec() -> Result<()> {
-        let ctx = GpuContext::new(0)?;
-        let kernels = MmaKernels::load(&ctx)?;
+    fn small_int4(ctx: &GpuContext, kernels: &MmaKernels) -> Result<()> {
         let (rows, in_dim, tokens) = (512usize, 512usize, 70usize);
         let packed: Vec<u32> = (0..rows * in_dim / 8)
             .map(|i| (i as u32).wrapping_mul(2654435761))
@@ -401,6 +397,7 @@ mod tests {
     fn int4_mma_fp64_relative_error() -> Result<()> {
         let ctx = GpuContext::new(0)?;
         let kernels = MmaKernels::load(&ctx)?;
+        small_int4(&ctx, &kernels)?;
         let shapes: [(&str, usize, usize); 9] = [
             ("small", 512, 512),
             ("qkvz", 10240, 5120),

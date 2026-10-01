@@ -1055,13 +1055,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with zai-org/GLM-5.3-Flash"]
     fn the_real_checkpoint_declares_the_128_block() {
-        let Some(dir) = ff_core::paths::checkpoint_dir("zai-org/GLM-5.3-Flash") else {
-            return;
-        };
-        if !dir.exists() {
-            return;
-        }
+        let dir = ff_core::paths::checkpoint_dir("zai-org/GLM-5.3-Flash")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with zai-org/GLM-5.3-Flash");
         let config = GlmConfig::from_model_dir(&dir).unwrap();
         assert_eq!(config.quant, QuantFormat::BlockFp8 { block: 128 });
     }

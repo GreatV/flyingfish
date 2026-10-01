@@ -11,7 +11,7 @@ use flyingfish::runtime::artifact::ArtifactStaging;
 use flyingfish::runtime::weights::DeviceCache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -137,16 +137,33 @@ pub(super) fn run(args: Args) -> Result<()> {
     // the concurrent sum of both, and takes a share of what is left rather than
     // all of it. Discrete workers are unaffected: the fold does not apply.
     let concurrent_workers = args.devices.len().min(requests.len()).max(1) as u64;
-    let mut unified_workers = 0u64;
-    for name in args.devices.iter().take(requests.len()) {
-        let device = parse_device_single(name)?;
-        let unified = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device))
-            .context("resource probe failed")?
-            .unified_pool_available_bytes()
-            .is_some();
-        unified_workers += unified as u64;
-    }
-    let unified_workers = unified_workers.max(1);
+    let preflight = || -> Result<u64> {
+        let mut unified_workers = 0u64;
+        for name in args.devices.iter().take(requests.len()) {
+            let device = parse_device_single(name)?;
+            let unified = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device))
+                .context("resource probe failed")?
+                .unified_pool_available_bytes()
+                .is_some();
+            unified_workers += unified as u64;
+        }
+        Ok(unified_workers.max(1))
+    };
+    let unified_workers = match preflight() {
+        Ok(count) => count,
+        Err(error) => {
+            publish_report(
+                &report_path,
+                started.elapsed().as_secs_f64(),
+                &requests,
+                Vec::new(),
+                vec![format!("{error:#}")],
+            )?;
+            return Err(error).with_context(|| {
+                format!("Music3 batch startup failed; see {}", report_path.display())
+            });
+        }
+    };
     let worker_errors = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for name in args.devices.iter().take(requests.len()) {
@@ -270,23 +287,16 @@ pub(super) fn run(args: Args) -> Result<()> {
             })
             .collect::<Vec<_>>()
     });
-    let mut completions = completions
+    let completions = completions
         .into_inner()
         .map_err(|_| anyhow::anyhow!("batch results lock poisoned"))?;
-    completions.sort_by_key(|entry| entry.index);
-    let skipped = requests
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !completions.iter().any(|c| c.index == *index))
-        .map(|(_, request)| request.id.as_str())
-        .collect::<Vec<_>>();
-    let failed = !worker_errors.is_empty()
-        || !skipped.is_empty()
-        || completions.iter().any(|c| c.error.is_some());
-    let report = serde_json::json!({"wall_seconds":started.elapsed().as_secs_f64(),
-        "requests":completions,"skipped":skipped,"worker_errors":worker_errors});
-    let staging = ArtifactStaging::new(&report_path)?;
-    publish_staged_bytes(staging, &serde_json::to_vec_pretty(&report)?)?;
+    let failed = publish_report(
+        &report_path,
+        started.elapsed().as_secs_f64(),
+        &requests,
+        completions,
+        worker_errors,
+    )?;
     ensure!(
         !failed,
         "Music3 batch failed; see {}",
@@ -298,6 +308,30 @@ pub(super) fn run(args: Args) -> Result<()> {
         report_path.display()
     );
     Ok(())
+}
+
+fn publish_report(
+    path: &Path,
+    wall_seconds: f64,
+    requests: &[Request],
+    mut completions: Vec<Completion>,
+    worker_errors: Vec<String>,
+) -> Result<bool> {
+    completions.sort_by_key(|entry| entry.index);
+    let skipped = requests
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !completions.iter().any(|c| c.index == *index))
+        .map(|(_, request)| request.id.as_str())
+        .collect::<Vec<_>>();
+    let failed = !worker_errors.is_empty()
+        || !skipped.is_empty()
+        || completions.iter().any(|c| c.error.is_some());
+    let report = serde_json::json!({"wall_seconds":wall_seconds,
+        "requests":completions,"skipped":skipped,"worker_errors":worker_errors});
+    let staging = ArtifactStaging::new(path)?;
+    publish_staged_bytes(staging, &serde_json::to_vec_pretty(&report)?)?;
+    Ok(failed)
 }
 
 #[cfg(test)]

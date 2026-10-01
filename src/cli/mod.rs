@@ -813,6 +813,7 @@ mod tests {
     };
     use flyingfish::glm::ExpertCacheLayout;
     use flyingfish::h3::audio_vae::WavSampleFormat;
+    use flyingfish::h3::policy::ExecutionBackendPolicy;
     use flyingfish::recovery::PolicyHistory;
     use flyingfish::runtime::telemetry::TelemetryMonitor;
     use flyingfish::runtime::weights::DeviceCachePolicy;
@@ -874,14 +875,17 @@ mod tests {
     fn device_residency_reserve_matches_the_flat_margin_on_a_24gib_card() {
         let snapshot = snap(Some(false), Some(64 << 30), Some(24 << 30), Some(20 << 30));
         // A 24 GiB total reaches the 1 GiB reserve cap.
-        assert_eq!(device_residency_reserve_bytes(&snapshot).unwrap(), 1 << 30);
+        assert_eq!(
+            device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::Cuda).unwrap(),
+            1 << 30
+        );
     }
 
     #[test]
     fn device_residency_reserve_scales_down_on_small_unified_pools() {
         let snapshot = snap(Some(true), Some(6 << 30), Some(6 << 30), Some(4 << 30));
         assert_eq!(
-            device_residency_reserve_bytes(&snapshot).unwrap(),
+            device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::Cuda).unwrap(),
             512 << 20
         );
     }
@@ -889,10 +893,31 @@ mod tests {
     #[test]
     fn missing_residency_total_names_the_capture_command() {
         let snapshot = snap(Some(false), None, None, Some(4 << 30));
-        let error = device_residency_reserve_bytes(&snapshot)
+        let error = device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::Cuda)
             .unwrap_err()
             .to_string();
         assert!(error.contains("device_total_memory_bytes") && error.contains("ff probe"));
+    }
+
+    #[test]
+    fn cpu_residency_needs_no_cuda_topology_but_unclassified_cuda_is_refused() {
+        let mut snapshot = snap(None, Some(64 << 30), None, None);
+        assert_eq!(
+            device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::Cpu).unwrap(),
+            0
+        );
+        for measured in [false, true] {
+            if measured {
+                snapshot.device_total_memory_bytes = Some(24 << 30);
+                snapshot.device_free_memory_bytes = Some(20 << 30);
+                snapshot.measurement_scope.device_memory =
+                    Some(flyingfish::runtime::probe::MemoryMeasurementScope::DeviceWide);
+            }
+            let error = device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::Cuda)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("host_device_memory_is_unified") && error.contains("ff probe"));
+        }
     }
 
     #[test]

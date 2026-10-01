@@ -5111,17 +5111,22 @@ mod tests {
         StreamState16, TEXT_PREFIX, layer_device_bytes, override_free, plan_residency,
         prefill_bytes, ring_geom, split_layers_by_bytes,
     };
-    use anyhow::Result;
-    use ff_core::paths::checkpoint_dir;
+    use anyhow::{Context, Result};
+
+    fn checkpoint_dir(name: &str) -> Result<std::path::PathBuf> {
+        let dir = ff_core::paths::checkpoint_dir(name)
+            .with_context(|| format!("set FF_MODELS_DIR with {name}"))?;
+        println!("checkpoint: {}", dir.display());
+        anyhow::ensure!(dir.is_dir(), "FF_MODELS_DIR must contain {name}");
+        Ok(dir)
+    }
 
     /// The bf16 cost model against a small budget: the plan's
     /// streaming_bytes never exceed the budget.
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with Qwen/Qwen3.8-27B"]
     fn bf16_cost_model_keeps_the_plan_within_a_small_budget() -> Result<()> {
-        let Some(dir) = ff_core::paths::checkpoint_dir("Qwen/Qwen3.8-27B") else {
-            eprintln!("FF_MODELS_DIR unset; skipping the cost-model test");
-            return Ok(());
-        };
+        let dir = checkpoint_dir("Qwen/Qwen3.8-27B")?;
         let weights = Qwen35Weights::open(&dir)?;
         let config = crate::config::Qwen35Config::from_model_dir(&dir)?;
         let granularity = 2 << 20;
@@ -5162,11 +5167,9 @@ mod tests {
     /// prefill_bytes carries the GDN workspace at chunk 64: it rises by
     /// exactly bytes(chunk 64) − bytes(chunk 16) over a chunk-16 charge.
     #[test]
-    fn prefill_bytes_charges_the_gdn_workspace_at_the_largest_chunk() {
-        let Some(dir) = ff_core::paths::checkpoint_dir("Qwen/Qwen3.8-27B") else {
-            eprintln!("FF_MODELS_DIR unset; skipping the gdn-charge test");
-            return;
-        };
+    #[ignore = "requires FF_MODELS_DIR with Qwen/Qwen3.8-27B"]
+    fn prefill_bytes_charges_the_gdn_workspace_at_the_largest_chunk() -> Result<()> {
+        let dir = checkpoint_dir("Qwen/Qwen3.8-27B")?;
         let weights = Qwen35Weights::open(&dir).unwrap();
         let config = crate::config::Qwen35Config::from_model_dir(&dir).unwrap();
         let format = weights.format();
@@ -5185,6 +5188,7 @@ mod tests {
             gdn64 - gdn16,
             "the rise must be exactly bytes(64) − bytes(16)"
         );
+        Ok(())
     }
 
     #[test]
@@ -5252,20 +5256,11 @@ mod tests {
     }
 
     #[test]
-    fn streamed_plan_constructs_and_prefills() {
-        let Ok(ctx) = GpuContext::new(0) else {
-            eprintln!("no CUDA device; skipping streamed-plan test");
-            return;
-        };
+    #[ignore = "requires CUDA and FF_MODELS_DIR with Qwen/Qwen3.8-27B-int4-rtn"]
+    fn streamed_plan_constructs_and_prefills() -> Result<()> {
+        let checkpoint = checkpoint_dir("Qwen/Qwen3.8-27B-int4-rtn")?;
+        let ctx = GpuContext::new(0)?;
         drop(ctx);
-        let Some(checkpoint) = checkpoint_dir("Qwen/Qwen3.8-27B-int4-rtn") else {
-            eprintln!("FF_MODELS_DIR unset; skipping streamed-plan test");
-            return;
-        };
-        if !checkpoint.is_dir() {
-            eprintln!("no Qwen checkpoint; skipping streamed-plan test");
-            return;
-        }
         let weights = Qwen35Weights::open(&checkpoint).unwrap();
         let config = crate::config::Qwen35Config::from_model_dir(&checkpoint).unwrap();
         let streamed = QwenGpu::new(&[0], &weights, &config, true);
@@ -5277,8 +5272,7 @@ mod tests {
                     text.contains("short of"),
                     "streamed construction failed: {text}"
                 );
-                eprintln!("streamed plan does not fit; skipping streamed-plan test");
-                return;
+                return Err(e);
             }
         };
         let vocab = config.text_config.vocab_size as u32;
@@ -5286,17 +5280,14 @@ mod tests {
         gpu.push_tokens(&ids).unwrap();
         let token = gpu.read_token().unwrap();
         assert!(token < vocab);
+        Ok(())
     }
 
     #[test]
-    fn split_balances_the_real_checkpoint_layers() {
-        let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4-rtn") else {
-            return;
-        };
+    #[ignore = "requires FF_MODELS_DIR with Qwen/Qwen3.8-27B-int4-rtn"]
+    fn split_balances_the_real_checkpoint_layers() -> Result<()> {
+        let dir = checkpoint_dir("Qwen/Qwen3.8-27B-int4-rtn")?;
         let dir = &dir;
-        if !dir.exists() {
-            return;
-        }
         let weights = crate::weights::Qwen35Weights::open(dir).unwrap();
         let config = crate::config::Qwen35Config::from_model_dir(dir).unwrap();
         let bytes: Vec<u64> = (0..config.text_config.num_hidden_layers)
@@ -5318,17 +5309,14 @@ mod tests {
                 assert!(bytes[start..end].iter().sum::<u64>() <= ideal + widest);
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn plan_residency_picks_a_hybrid_prefix_on_real_bytes() {
-        let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4-rtn") else {
-            return;
-        };
+    #[ignore = "requires FF_MODELS_DIR with Qwen/Qwen3.8-27B-int4-rtn"]
+    fn plan_residency_picks_a_hybrid_prefix_on_real_bytes() -> Result<()> {
+        let dir = checkpoint_dir("Qwen/Qwen3.8-27B-int4-rtn")?;
         let dir = &dir;
-        if !dir.exists() {
-            return;
-        }
         let weights = crate::weights::Qwen35Weights::open(dir).unwrap();
         let config = crate::config::Qwen35Config::from_model_dir(dir).unwrap();
         let ranges = super::partition_layers(&weights, &config, 1).unwrap();
@@ -5416,6 +5404,7 @@ mod tests {
             last = plan.resident_through;
         }
         assert_eq!(last, ranges[0].1);
+        Ok(())
     }
 
     /// One deterministic 16-bit value per element; norms get +1 so the
@@ -5676,13 +5665,8 @@ mod tests {
     #[test]
     #[ignore = "requires a CUDA device and the real bf16 checkpoint"]
     fn real_bf16_teacher_forced_logits_match() -> Result<()> {
-        let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B") else {
-            return Ok(());
-        };
+        let dir = checkpoint_dir("Qwen/Qwen3.8-27B")?;
         let dir = &dir;
-        if !dir.exists() {
-            return Ok(());
-        }
         let weights = Qwen35Weights::open(dir)?;
         assert_eq!(weights.format(), QuantFormat::Bf16);
         let config = crate::config::Qwen35Config::from_model_dir(dir)?;

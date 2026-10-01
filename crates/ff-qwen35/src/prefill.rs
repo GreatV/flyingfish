@@ -1008,15 +1008,12 @@ mod tests {
         }
     }
 
-    /// Every production projection shape at its production split must pass
-    /// the packed engine's shape guard and match the scalar GEMV. A
-    /// per-projection split that drifts (a hardcoded 1 reaching the down
-    /// shape) fails loudly here before any end-to-end run does.
     #[test]
     #[ignore = "requires a CUDA device"]
-    fn packed_covers_every_projection_shape() -> Result<()> {
+    fn packed_matches_scalar_bits() -> Result<()> {
         use ff_edge0::int4::GroupQuant;
         let ctx = GpuContext::new(0)?;
+        let packed = Packed::new(&ctx)?;
         let wide = WideKernels::load(&ctx)?;
         wide.capture_body(Some(0))?;
         let shapes: &[(usize, usize, &str)] = &[
@@ -1030,7 +1027,7 @@ mod tests {
             (17408, 4, "mlp.down_proj"),
         ];
         let rows = 32;
-        for &(cols, split, name) in shapes {
+        for (cols, split) in [(5120, 1), (6144, 1), (17408, 4)] {
             let words: Vec<u32> = (0..rows * cols / 8)
                 .map(|i| (i as u32).wrapping_mul(2654435761))
                 .collect();
@@ -1043,7 +1040,7 @@ mod tests {
             let (w, s, b) = q.tensors();
             let input: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.017).sin()).collect();
             let dx = ctx.upload_f32(&input)?;
-            let matrix = Matrix {
+            let matrix = || Matrix {
                 packed: w,
                 scales: s,
                 biases: b,
@@ -1055,42 +1052,24 @@ mod tests {
                 engine: Packed::new(&ctx)?,
                 scratch: ctx.stream.alloc_zeros::<f32>(rows * split)?,
             };
-            projector
-                .project(matrix, &dx, &mut y, 1, split)
-                .with_context(|| format!("{name} rejected by the packed engine"))?;
-            wide_reference(&ctx, &wide, &q, &dx, rows, cols)?;
-            let expect = ctx.dtoh(q.y_ref())?;
-            let got = ctx.dtoh(&y)?;
-            ensure!(
-                got.iter()
-                    .zip(&expect)
-                    .all(|(a, b)| (a - b).abs() <= 1e-4 * a.abs().max(1.0)),
-                "{name}: packed projection differs from the group kernel beyond 1e-4 relative"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires a CUDA device"]
-    fn packed_matches_scalar_bits() -> Result<()> {
-        use ff_edge0::int4::GroupQuant;
-        let ctx = GpuContext::new(0)?;
-        let packed = Packed::new(&ctx)?;
-        let wide = WideKernels::load(&ctx)?;
-        wide.capture_body(Some(0))?;
-        let rows = 32;
-        for (cols, split) in [(5120, 1), (17408, 4)] {
-            let words: Vec<u32> = (0..rows * cols / 8)
-                .map(|i| (i as u32).wrapping_mul(2654435761))
-                .collect();
-            let scales: Vec<f32> = (0..rows * cols / 64)
-                .map(|i| 0.01 + (i % 7) as f32 * 0.003)
-                .collect();
-            let biases = scales.iter().map(|s| -7.0 * s).collect();
-            let quant = GroupQuant::new(words, scales, biases, rows, cols, 4)?;
-            let q = ctx.upload(&quant, None)?;
-            let (w, s, b) = q.tensors();
+            for &(_, _, name) in shapes.iter().filter(|&&(c, s, _)| c == cols && s == split) {
+                projector
+                    .project(matrix(), &dx, &mut y, 1, split)
+                    .with_context(|| format!("{name} rejected by the packed engine"))?;
+                wide_reference(&ctx, &wide, &q, &dx, rows, cols)?;
+                let expect = ctx.dtoh(q.y_ref())?;
+                let got = ctx.dtoh(&y)?;
+                ensure!(
+                    got.iter()
+                        .zip(&expect)
+                        .all(|(a, b)| (a - b).abs() <= 1e-4 * a.abs().max(1.0)),
+                    "{name}: packed projection differs from the group kernel beyond 1e-4 relative"
+                );
+                println!("packed production {name}: cols={cols}, split={split}, tokens=1");
+            }
+            if cols == 6144 {
+                continue;
+            }
             for tokens in [1, 3, 33] {
                 let input: Vec<f32> = (0..tokens * cols)
                     .map(|i| {

@@ -206,7 +206,7 @@ mod tests {
     use ff_core::paths::checkpoint_dir;
 
     /// The real checkpoint's weighed sizes as five constants; the audit test
-    /// holds this fixture to the checkpoint where one is present.
+    /// holds this fixture to the checkpoint.
     fn synthetic_sizes() -> WeightSizes {
         WeightSizes {
             expert_packed: 15 << 30,
@@ -217,14 +217,13 @@ mod tests {
         }
     }
 
-    /// Weighed against the real checkpoint; the audit test skips without it.
-    fn sizes() -> Option<WeightSizes> {
-        let dir = &checkpoint_dir("Edge0/Edge0-35B-A3B-preview")?;
-        if !dir.is_dir() {
-            return None;
-        }
+    /// Weighed against the real checkpoint.
+    fn sizes() -> WeightSizes {
+        let dir = &checkpoint_dir("Edge0/Edge0-35B-A3B-preview")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview");
         let weights = Edge0Weights::open(dir).unwrap();
-        Some(WeightSizes::from_weights(&weights).unwrap())
+        WeightSizes::from_weights(&weights).unwrap()
     }
 
     fn hw24g() -> Hardware {
@@ -238,8 +237,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview"]
     fn weighed_sizes_match_the_index_audit() {
-        let Some(s) = sizes() else { return };
+        let s = sizes();
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         assert!((gib(s.expert_packed + s.expert_scale_bias) - 16.88).abs() < 0.05);
         assert!((s.expert_scale_bias as f64 / s.expert_packed as f64 - 0.125).abs() < 0.001);

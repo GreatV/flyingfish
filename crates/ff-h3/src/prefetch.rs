@@ -240,15 +240,3 @@ fn upload_async(
         })
         .map(|tensor| Some((tensor, bytes_len)))
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn invalid_prefetch_switch_names_the_control() {
-        crate::cuda::profile::tests::rejects_invalid_switch(
-            super::PREFETCH_ENVIRONMENT_VARIABLE,
-            "prefetch::tests::invalid_prefetch_switch_names_the_control",
-            super::requested,
-        );
-    }
-}

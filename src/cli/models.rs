@@ -209,14 +209,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with Qwen/Qwen3.8-27B and Qwen/Qwen3.8-27B-int4-rtn"]
     fn local_qwen_tensor_metadata_without_payload_access() -> Result<()> {
         for checkpoint in ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-int4-rtn"] {
-            let Some(model) = ff_core::paths::checkpoint_dir(checkpoint) else {
-                continue;
-            };
-            if !model.is_dir() {
-                continue;
-            }
+            let model = ff_core::paths::checkpoint_dir(checkpoint)
+                .filter(|model| model.is_dir())
+                .unwrap_or_else(|| panic!("requires FF_MODELS_DIR with {checkpoint}"));
             let model = model.canonicalize()?;
             println!("model: {}", model.display());
             run(ModelsCommand::Inspect {

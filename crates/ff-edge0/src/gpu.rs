@@ -1714,59 +1714,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a CUDA device"]
-    fn group4l_and_lora_ax_match_the_f64_reference() -> Result<()> {
-        let ctx = GpuContext::new(0).context("no cuda device")?;
-        let (ax_exact, y_dyadic_worst) =
-            harness_pass(&ctx, true, [true; 4], 0, (2048, [37, 1, 16, 5]), 16)?;
-        anyhow::ensure!(
-            ax_exact == 0.0,
-            "dyadic ax must be bit-exact, got {ax_exact:.3e}"
-        );
-        let (ax_rand_ratio, y_rand_ratio) =
-            harness_pass(&ctx, false, [true; 4], 0, (2048, [37, 1, 16, 5]), 16)?;
-        let eps = f32::EPSILON as f64;
-        const AX_TERMS: f64 = 2048.0;
-        const Y_TERMS: f64 = 178.0;
-        anyhow::ensure!(
-            ax_rand_ratio <= AX_TERMS * eps && y_rand_ratio <= Y_TERMS * eps,
-            "random pass exceeds k*eps*sum|terms|: ax ratio {ax_rand_ratio:.3e} vs {}, y ratio {y_rand_ratio:.3e} vs {}",
-            AX_TERMS * eps,
-            Y_TERMS * eps
-        );
-        println!(
-            "dyadic: ax exact, y worst rel {y_dyadic_worst:.3e}; random: worst |err|/sum|terms| ax {ax_rand_ratio:.3e} <= {axb:.3e}, y {y_rand_ratio:.3e} <= {yb:.3e}",
-            axb = AX_TERMS * eps,
-            yb = Y_TERMS * eps
-        );
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires a CUDA device"]
-    fn group4l_mixed_mask_matches_f64() -> Result<()> {
-        let ctx = GpuContext::new(0)?;
-        for mask in [
-            [true, false, true, false],
-            [true, false, false, false],
-            [false; 4],
-        ] {
-            for body in 0..2 {
-                for dyadic in [true, false] {
-                    let (_, error) =
-                        harness_pass(&ctx, dyadic, mask, body, (2048, [37, 1, 16, 5]), 16)?;
-                    println!(
-                        "body {body}, mask {mask:?}, dyadic={dyadic}: fp64 normalized error {error:e}"
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires a CUDA device"]
-    fn group4l_production_shapes_match_f64() -> Result<()> {
+    #[ignore = "requires CUDA and FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview"]
+    fn group4l_matches_f64() -> Result<()> {
         let model = checkpoint_dir("Edge0/Edge0-35B-A3B-preview")
             .context("group4 LoRA fixture requires FF_MODELS_DIR")?;
         println!("group4 LoRA fixture checkpoint: {}", model.display());
@@ -1796,7 +1745,46 @@ mod tests {
                 ));
             }
         }
-        let ctx = GpuContext::new(0)?;
+        let ctx = GpuContext::new(0).context("no cuda device")?;
+
+        let (ax_exact, y_dyadic_worst) =
+            harness_pass(&ctx, true, [true; 4], 0, (2048, [37, 1, 16, 5]), 16)?;
+        anyhow::ensure!(
+            ax_exact == 0.0,
+            "dyadic ax must be bit-exact, got {ax_exact:.3e}"
+        );
+        let (ax_rand_ratio, y_rand_ratio) =
+            harness_pass(&ctx, false, [true; 4], 0, (2048, [37, 1, 16, 5]), 16)?;
+        let eps = f32::EPSILON as f64;
+        const AX_TERMS: f64 = 2048.0;
+        const Y_TERMS: f64 = 178.0;
+        anyhow::ensure!(
+            ax_rand_ratio <= AX_TERMS * eps && y_rand_ratio <= Y_TERMS * eps,
+            "random pass exceeds k*eps*sum|terms|: ax ratio {ax_rand_ratio:.3e} vs {}, y ratio {y_rand_ratio:.3e} vs {}",
+            AX_TERMS * eps,
+            Y_TERMS * eps
+        );
+        println!(
+            "dyadic: ax exact, y worst rel {y_dyadic_worst:.3e}; random: worst |err|/sum|terms| ax {ax_rand_ratio:.3e} <= {axb:.3e}, y {y_rand_ratio:.3e} <= {yb:.3e}",
+            axb = AX_TERMS * eps,
+            yb = Y_TERMS * eps
+        );
+
+        for mask in [
+            [true, false, true, false],
+            [true, false, false, false],
+            [false; 4],
+        ] {
+            for body in 0..2 {
+                for dyadic in [true, false] {
+                    let (_, error) =
+                        harness_pass(&ctx, dyadic, mask, body, (2048, [37, 1, 16, 5]), 16)?;
+                    println!(
+                        "body {body}, mask {mask:?}, dyadic={dyadic}: fp64 normalized error {error:e}"
+                    );
+                }
+            }
+        }
         for shape in shapes {
             let mask = shape.1.map(|rows| rows > 0);
             for body in 0..2 {
@@ -2164,18 +2152,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a CUDA device"]
-    fn gpu_gemv_matches_cpu_matvec_on_a_real_projection() {
+    #[ignore = "requires CUDA and FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview"]
+    fn gpu_gemv_matches_cpu_matvec_on_a_real_projection() -> Result<()> {
+        let checkpoint = checkpoint_dir("Edge0/Edge0-35B-A3B-preview")
+            .context("set FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview")?;
+        ensure!(
+            checkpoint.is_dir(),
+            "FF_MODELS_DIR must contain Edge0/Edge0-35B-A3B-preview"
+        );
+        println!("projection checkpoint: {}", checkpoint.display());
         let ctx = GpuContext::new(0)
-            .expect("CUDA device 0 setup failed; run ff probe --device cuda:0 --json");
-        let Some(checkpoint) = checkpoint_dir("Edge0/Edge0-35B-A3B-preview") else {
-            eprintln!("FF_MODELS_DIR unset; skipping gpu test");
-            return;
-        };
-        if !checkpoint.is_dir() {
-            eprintln!("no Edge0 checkpoint; skipping gpu test");
-            return;
-        }
+            .context("CUDA device 0 setup failed; run ff probe --device cuda:0 --json")?;
         let weights = Edge0Weights::open(&checkpoint).unwrap();
         let name = "language_model.model.layers.3.self_attn.q_proj";
         let quant = weights.quant_projection(name).unwrap();
@@ -2197,6 +2184,7 @@ mod tests {
             &cpu[..4.min(cpu.len())]
         );
         assert!(max_rel < 1e-3, "gpu vs cpu max rel diff {max_rel}");
+        Ok(())
     }
 }
 
@@ -4409,10 +4397,15 @@ mod plan_tests {
     use ff_core::paths::checkpoint_dir;
 
     #[test]
-    fn layer_ranges_cover_the_real_checkpoint_contiguously() {
-        let Some(dir) = checkpoint_dir("Edge0/Edge0-35B-A3B-preview") else {
-            return;
-        };
+    #[ignore = "requires FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview"]
+    fn layer_ranges_cover_the_real_checkpoint_contiguously() -> Result<()> {
+        let dir = checkpoint_dir("Edge0/Edge0-35B-A3B-preview")
+            .context("set FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview")?;
+        ensure!(
+            dir.is_dir(),
+            "FF_MODELS_DIR must contain Edge0/Edge0-35B-A3B-preview"
+        );
+        println!("layer-range checkpoint: {}", dir.display());
         let weights = crate::weights::Edge0Weights::open(&dir).unwrap();
         let config = crate::config::Edge0Config::from_model_dir(&dir).unwrap();
         let text = &config.text_config;
@@ -4429,6 +4422,7 @@ mod plan_tests {
         }
         assert!(layer_ranges(&weights, text, 0).is_err());
         assert!(layer_ranges(&weights, text, 41).is_err());
+        Ok(())
     }
 }
 

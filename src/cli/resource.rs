@@ -22,7 +22,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Device headroom for activations, workspace and allocator slack; request tensor allocations are charged separately.
-pub(crate) fn device_residency_reserve_bytes(snapshot: &ResourceSnapshot) -> Result<u64> {
+pub(crate) fn device_residency_reserve_bytes(
+    snapshot: &ResourceSnapshot,
+    backend: ExecutionBackendPolicy,
+) -> Result<u64> {
+    if backend == ExecutionBackendPolicy::Cpu {
+        return Ok(0);
+    }
     Ok(flyingfish::runtime::probe::admission_reserve_bytes(Some(
         snapshot.pool_total(true)?,
     )))
@@ -55,7 +61,10 @@ pub(crate) fn decide_auto_residency_with_required_memory(
     let share = if shared { unified_share.max(1) } else { 1 };
     let reserve = required_device_bytes
         .saturating_mul(share)
-        .checked_add(device_residency_reserve_bytes(&snapshot)?.saturating_mul(share))
+        .checked_add(
+            device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::from_device(device))?
+                .saturating_mul(share),
+        )
         .context("device residency reserve overflow")?;
     let capacity = snapshot.device_capacity()?;
     let reserve = if shared {
@@ -95,10 +104,11 @@ pub(crate) fn decide_residency_with_required_memory(
     let snapshot = ResourceSnapshot::capture(Some(device)).context("resource probe failed")?;
     let shared = snapshot.unified_pool_available_bytes().is_some();
     let share = if shared { unified_share.max(1) } else { 1 };
-    let reserve = device_residency_reserve_bytes(&snapshot)?
-        .saturating_mul(share)
-        .checked_add(required_device_bytes.saturating_mul(share))
-        .context("device residency reserve overflow")?;
+    let reserve =
+        device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::from_device(device))?
+            .saturating_mul(share)
+            .checked_add(required_device_bytes.saturating_mul(share))
+            .context("device residency reserve overflow")?;
     // An explicit ceiling is still clamped against the shared pool, so the
     // caller's separately modelled host allocation is reserved here too.
     let reserve = if shared {
@@ -157,6 +167,7 @@ pub(super) struct H3ResourceRequest<'a> {
 }
 
 pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
+    let backend = ExecutionBackendPolicy::from_device(request.device);
     if request.limits.max_host_mib == Some(0) {
         bail!("H3 preflight refused: binding budget: host (zero byte limit)");
     }
@@ -294,7 +305,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
         additional_host_allowance_bytes: request
             .additional_host_allowance_bytes
             .checked_add(if unified {
-                device_residency_reserve_bytes(&snapshot)?
+                device_residency_reserve_bytes(&snapshot, backend)?
             } else {
                 0
             })
@@ -306,7 +317,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
     let headroom_bytes = if unified {
         0
     } else {
-        device_residency_reserve_bytes(&snapshot)?
+        device_residency_reserve_bytes(&snapshot, backend)?
     };
     let automatic_cache = flyingfish::resource_policy::h3::automatic_device_cache(
         &selection_request,
@@ -343,7 +354,7 @@ pub(super) fn select_h3(request: H3ResourceRequest<'_>) -> Result<H3Selection> {
             // reserve: the phase type invariant rejects the combination, and
             // the sizing already accounted the headroom against the pool.
             if phase.required_device_bytes.is_some() {
-                phase.device_reserve_bytes = device_residency_reserve_bytes(&snapshot)?;
+                phase.device_reserve_bytes = device_residency_reserve_bytes(&snapshot, backend)?;
             }
         }
     }

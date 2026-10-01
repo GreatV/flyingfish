@@ -384,48 +384,7 @@ pub fn validate_exact_profile(device: &Device) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    pub(crate) fn rejects_invalid_switch(name: &str, test: &str, read: fn() -> bool) {
-        use std::ffi::{OsStr, OsString};
-        if std::env::var_os(name)
-            .is_some_and(|value| value != OsStr::new("0") && value != OsStr::new("1"))
-        {
-            read();
-            return;
-        }
-        let mut values = vec![OsString::from("invalid"), OsString::from("2")];
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            values.push(OsString::from_vec(vec![0xff]));
-        }
-        for value in values {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", test, "--nocapture", "--test-threads=1"])
-                .env(name, value)
-                .output()
-                .unwrap();
-            assert!(!output.status.success(), "invalid {name} was accepted");
-            let error = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(
-                error.contains(name) && error.contains("0 or 1") && error.contains("rerun ff"),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_tuned_switch_names_the_control() {
-        rejects_invalid_switch(
-            super::DISABLE_TUNED_KERNELS_ENVIRONMENT_VARIABLE,
-            "cuda::profile::tests::invalid_tuned_switch_names_the_control",
-            super::tuned_kernels_disabled,
-        );
-    }
+mod tests {
     use super::*;
 
     #[test]

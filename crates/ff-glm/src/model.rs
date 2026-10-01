@@ -3660,6 +3660,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "requires a CUDA device"]
     fn pinned_fp8_generation_matches_cuda_reference() -> Result<()> {
         let device = Device::new_cuda(0)?;
         let checkpoint = tiny_checkpoint_with_kda_width(128);

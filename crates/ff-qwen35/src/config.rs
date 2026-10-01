@@ -222,14 +222,12 @@ mod tests {
     use ff_core::paths::checkpoint_dir;
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with Qwen/Qwen3.8-27B"]
     fn parses_the_real_checkpoint_config() {
-        let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B") else {
-            return;
-        };
+        let dir = checkpoint_dir("Qwen/Qwen3.8-27B")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with Qwen/Qwen3.8-27B");
         let dir = &dir;
-        if !dir.exists() {
-            return;
-        }
         let cfg = Qwen35Config::from_model_dir(dir).unwrap();
         let t = &cfg.text_config;
         assert_eq!(t.num_hidden_layers, 64);

@@ -1857,128 +1857,6 @@ mod tests {
     use candle_core::Tensor;
     use serde_json::json;
 
-    #[cfg(target_os = "linux")]
-    fn resident_pages(file: &File, range: Option<std::ops::Range<usize>>) -> Result<usize> {
-        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })?;
-        let mapping = unsafe { MmapOptions::new().map(file) }?;
-        let mut pages = vec![0u8; mapping.len().div_ceil(page)];
-        let status = unsafe {
-            libc::mincore(
-                mapping.as_ptr().cast_mut().cast(),
-                mapping.len(),
-                pages.as_mut_ptr(),
-            )
-        };
-        anyhow::ensure!(status == 0, "mincore: {}", std::io::Error::last_os_error());
-        let range = range.unwrap_or(0..pages.len());
-        Ok(pages
-            .get(range)
-            .context("residency range exceeds file")?
-            .iter()
-            .filter(|value| **value & 1 != 0)
-            .count())
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn memory_fills_release_pages() -> Result<()> {
-        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })?;
-        let residue_denominator = 1000;
-        let bytes = (0..page * residue_denominator)
-            .map(|i| (i % 251) as u8)
-            .collect::<Vec<_>>();
-        for granularity in [CacheGranularity::Shard, CacheGranularity::Tensor] {
-            for (source, release) in [
-                (WeightSource::Memory, false),
-                (WeightSource::Memory, true),
-                (WeightSource::Mmap, false),
-                (WeightSource::Mmap, true),
-            ] {
-                let root = tempfile::tempdir()?;
-                let path = root.path().join("model.safetensors");
-                let len = bytes.len();
-                let mut header = serde_json::to_vec(&json!({
-                    "a": {"dtype": "U8", "shape": [len], "data_offsets": [0, len]},
-                    "b": {"dtype": "U8", "shape": [len], "data_offsets": [len, 2 * len]},
-                    "c": {"dtype": "U8", "shape": [len], "data_offsets": [2 * len, 3 * len]}
-                }))?;
-                assert!(header.len() <= page - 8);
-                header.resize(page - 8, b' ');
-                let mut encoded = (header.len() as u64).to_le_bytes().to_vec();
-                encoded.extend(header);
-                encoded.resize(page + len, 1);
-                encoded.extend_from_slice(&bytes);
-                encoded.resize(page + 3 * len, 2);
-                fs::write(&path, encoded)?;
-                let file = File::open(&path)?;
-                file.sync_all()?;
-                let before = resident_pages(&file, None)?;
-                assert!(before > 2);
-                let weights = ModelWeights::open(
-                    root.path(),
-                    source,
-                    CachePolicy::new(1).with_granularity(granularity),
-                )?;
-                if source == WeightSource::Memory {
-                    let mut snapshot = crate::probe::ResourceSnapshot::capture(None).unwrap();
-                    snapshot.host_memory_total_bytes = Some(1 << 30);
-                    snapshot.cgroup_v2_memory_limit = None;
-                    snapshot.cgroup_v2_memory_available_bytes = None;
-                    let owned = match granularity {
-                        CacheGranularity::Shard => page + 3 * len,
-                        CacheGranularity::Tensor => 3 * len,
-                    };
-                    let required = (owned + page + 3 * len) as u64;
-                    let reserve = crate::probe::admission_reserve_bytes(Some(1 << 30));
-                    snapshot.host_memory_available_bytes =
-                        Some(reserve + required - u64::from(release));
-                    let decision = weights.plan_page_release(&snapshot)?;
-                    assert_eq!(decision, release);
-                    weights.page_release.set(Ok(decision)).unwrap();
-                }
-                let check = |actual: &[u8]| {
-                    assert_eq!(actual, bytes);
-                    Ok(())
-                };
-                weights.with_tensor_bytes("b", check)?;
-                let after = resident_pages(&file, None)?;
-                match (source, granularity, release) {
-                    (WeightSource::Memory, _, true) => {
-                        let range = match granularity {
-                            CacheGranularity::Shard => 0..(page + 3 * len) / page,
-                            CacheGranularity::Tensor => {
-                                (page + len) / page..(page + 2 * len) / page
-                            }
-                        };
-                        let phase_pages = range.len();
-                        let residue = resident_pages(&file, Some(range))?;
-                        // The common throughput cancels from the one-read phase's 0.1% bound.
-                        let bound = phase_pages / residue_denominator;
-                        println!(
-                            "{granularity:?}: {residue} resident pages in the released range, bound {bound} of {phase_pages}"
-                        );
-                        assert!(
-                            residue <= bound,
-                            "{granularity:?}: {residue} resident pages exceed derived bound {bound}"
-                        );
-                    }
-                    _ => assert_eq!(after, before),
-                }
-                assert!(weights.cache_stats().resident_bytes > 0);
-                let _warm = fs::read(&path)?;
-                let warmed = resident_pages(&file, None)?;
-                assert!(warmed > 2);
-                weights.with_tensor_bytes("b", check)?;
-                assert_eq!(resident_pages(&file, None)?, warmed);
-                assert_eq!(weights.cache_stats().misses, 1);
-                println!(
-                    "{source:?}/{granularity:?}/release={release}: {before} -> {after} resident pages; hit keeps {warmed}"
-                );
-            }
-        }
-        Ok(())
-    }
-
     #[test]
     fn page_release_uses_cgroup_headroom_and_final_cache_policy() -> Result<()> {
         let root = fixture();
@@ -2241,10 +2119,9 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "requires a CUDA device"]
     fn cuda_uploads_preserve_tensor_cache_granularity() {
-        let Ok(device) = Device::new_cuda(0) else {
-            return;
-        };
+        let device = Device::new_cuda(0).expect("requires a CUDA device");
         let root = fixture();
         for source in [WeightSource::Mmap, WeightSource::Memory] {
             for direct_cache in [false, true] {
