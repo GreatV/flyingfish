@@ -77,9 +77,13 @@ pub fn build_compressed_token_map(tokenizer: &tokenizers::Tokenizer) -> Result<(
     for (token_id, slot) in lookup.iter_mut().enumerate() {
         let text = tokenizer
             .decode(&[token_id as u32], false)
-            .unwrap_or_default();
+            .map_err(|error| {
+                anyhow::anyhow!("tokenizer decode of token id {token_id} failed: {error}")
+            })?;
         let key = if text.contains('\u{fffd}') {
-            tokenizer.id_to_token(token_id as u32).unwrap_or_default()
+            tokenizer.id_to_token(token_id as u32).ok_or_else(|| {
+                anyhow::anyhow!("token id {token_id} is missing from the tokenizer vocabulary")
+            })?
         } else {
             let mut normalized = NormalizedString::from(text.as_str());
             normalizer
@@ -429,14 +433,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn layout_sizes_match_the_configuration() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.exists() {
-            return;
-        }
         let config = crate::config::DeepseekV41Config::from_model_dir(dir).unwrap();
         let layout = EngramLayout::from_config(&config.text_config).unwrap();
         assert_eq!(layout.n_hash_cols(), 24);

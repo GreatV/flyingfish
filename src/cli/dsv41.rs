@@ -516,7 +516,8 @@ fn admit_resident_footprint_with(loader: &TransformerLoader, workspace_bytes: u6
         .context("resident footprint estimate overflows u64")?;
     let host = host_available_bytes("/proc/meminfo")?;
     // meminfo is host-wide; a cgroup-v2 container may hold a smaller budget.
-    let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&Device::Cpu));
+    let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&Device::Cpu))
+        .context("resource probe failed")?;
     let available = snapshot
         .cgroup_v2_memory_available_bytes
         .map_or(host, |limit| host.min(limit));

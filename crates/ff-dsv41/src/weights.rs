@@ -21,6 +21,10 @@ struct ShardIndex {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct ShardIndexMetadata {
+    #[serde(
+        default,
+        deserialize_with = "ff_core::weights::deserialize_optional_index_size"
+    )]
     pub total_size: Option<u64>,
 }
 
@@ -105,10 +109,6 @@ impl CheckpointLayout {
         self.total_size
     }
 
-    pub fn shard_of(&self, tensor: &str) -> Option<&str> {
-        self.tensors.get(tensor).map(String::as_str)
-    }
-
     pub fn shard_role(&self, shard: &str) -> Option<ShardRole> {
         self.shards.get(shard).copied()
     }
@@ -142,8 +142,8 @@ impl CheckpointLayout {
     }
 }
 
-use candle_core::safetensors::Load as _;
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
+use ff_core::weights::{CachePolicy, ModelWeights, WeightSource};
 
 /// The static projections one text layer needs on the host, materialized F32.
 pub struct LayerWeights {
@@ -157,76 +157,59 @@ pub struct LayerWeights {
     pub wo_b: Tensor,
 }
 
-fn open_shard(
-    model_dir: &Path,
-    shard: &str,
-) -> Result<(memmap2::Mmap, safetensors::SafeTensors<'static>)> {
-    let file =
-        std::fs::File::open(model_dir.join(shard)).with_context(|| format!("open {shard}"))?;
-    let map = unsafe { memmap2::Mmap::map(&file)? };
-    let bytes: &'static [u8] = unsafe { std::mem::transmute(&map[..]) };
-    let tensors = safetensors::SafeTensors::deserialize(bytes)?;
-    Ok((map, tensors))
+fn open_weights(model_dir: &Path) -> Result<ModelWeights> {
+    ModelWeights::open(model_dir, WeightSource::Mmap, CachePolicy::new(2))
+}
+
+fn f32_tensor(weights: &ModelWeights, name: &str) -> Result<Tensor> {
+    weights
+        .load(name, &Device::Cpu)
+        .with_context(|| format!("load {name} from {}", weights.root().display()))?
+        .to_dtype(DType::F32)
+        .with_context(|| format!("cast {name}"))
+}
+
+fn scale_bytes(weights: &ModelWeights, name: &str) -> Result<Vec<u8>> {
+    weights.with_tensor_bytes(name, |bytes| Ok(bytes.to_vec()))
 }
 
 /// `projection` is the name without the `.weight` suffix; the scale hangs off
 /// the projection name (`wq_a.weight` pairs with `wq_a.scale`).
-fn body_fp8(
-    tensors: &safetensors::SafeTensors<'_>,
-    projection: &str,
-    device: &Device,
-) -> Result<Tensor> {
+fn fp8_tensor(weights: &ModelWeights, projection: &str) -> Result<Tensor> {
+    let device = Device::Cpu;
     let weight_name = format!("{projection}.weight");
-    let scale_name = format!("{projection}.scale");
-    let weight = tensors
-        .tensor(&weight_name)
-        .with_context(|| weight_name.clone())?
-        .load(device)?;
-    let scale = tensors
-        .tensor(&scale_name)
-        .with_context(|| scale_name.clone())?;
-    crate::quant::dequantize_fp8_block(&weight, scale.data(), device)
+    let weight = weights.load(&weight_name, &device)?;
+    let scale = scale_bytes(weights, &format!("{projection}.scale"))?;
+    crate::quant::dequantize_fp8_block(&weight, &scale, &device)
         .with_context(|| format!("dequantize {weight_name}"))
 }
 
-fn bf16(tensors: &safetensors::SafeTensors<'_>, name: &str, device: &Device) -> Result<Tensor> {
-    Ok(tensors
-        .tensor(name)
-        .with_context(|| name.to_owned())?
-        .load(device)?
-        .to_dtype(candle_core::DType::F32)?)
+fn fp4_tensor(
+    weights: &ModelWeights,
+    weight_name: &str,
+    rows: usize,
+    columns: usize,
+) -> Result<Tensor> {
+    let scale = scale_bytes(weights, &weight_name.replace(".weight", ".scale"))?;
+    weights
+        .with_tensor_bytes(weight_name, |payload| {
+            crate::quant::dequantize_fp4_packed(payload, rows, columns, &scale, &Device::Cpu)
+        })
+        .with_context(|| format!("dequantize {weight_name}"))
 }
 
 impl LayerWeights {
-    pub fn load_layer(model_dir: &Path, layout: &CheckpointLayout, layer: usize) -> Result<Self> {
-        let device = Device::Cpu;
+    pub fn load_layer(weights: &ModelWeights, layer: usize) -> Result<Self> {
         let prefix = format!("layers.{layer}.attn.");
-        let shard_of = |name: &str| -> Result<(memmap2::Mmap, safetensors::SafeTensors<'static>)> {
-            let shard = layout
-                .shard_of(name)
-                .with_context(|| format!("{name} is not in the index"))?;
-            open_shard(model_dir, shard)
-        };
-        let sink = match shard_of(&format!("{prefix}attn_sink")) {
-            Ok((map, tensors)) => {
-                let loaded = bf16(&tensors, &format!("{prefix}attn_sink"), &device);
-                drop(map);
-                loaded?
-            }
-            Err(_) => Tensor::zeros(1, candle_core::DType::F32, &device)?,
-        };
-        // Every projection of one layer shares a shard in the real layout;
-        // open once through the first name and load the rest from it.
-        let (_map, tensors) = shard_of(&format!("{prefix}wq_a.weight"))?;
         Ok(Self {
-            sink,
-            wq_a: body_fp8(&tensors, &format!("{prefix}wq_a"), &device)?,
-            q_norm: bf16(&tensors, &format!("{prefix}q_norm.weight"), &device)?,
-            wq_b: body_fp8(&tensors, &format!("{prefix}wq_b"), &device)?,
-            wkv: body_fp8(&tensors, &format!("{prefix}wkv"), &device)?,
-            kv_norm: bf16(&tensors, &format!("{prefix}kv_norm.weight"), &device)?,
-            wo_a: body_fp8(&tensors, &format!("{prefix}wo_a"), &device)?,
-            wo_b: body_fp8(&tensors, &format!("{prefix}wo_b"), &device)?,
+            sink: f32_tensor(weights, &format!("{prefix}attn_sink"))?,
+            wq_a: fp8_tensor(weights, &format!("{prefix}wq_a"))?,
+            q_norm: f32_tensor(weights, &format!("{prefix}q_norm.weight"))?,
+            wq_b: fp8_tensor(weights, &format!("{prefix}wq_b"))?,
+            wkv: fp8_tensor(weights, &format!("{prefix}wkv"))?,
+            kv_norm: f32_tensor(weights, &format!("{prefix}kv_norm.weight"))?,
+            wo_a: fp8_tensor(weights, &format!("{prefix}wo_a"))?,
+            wo_b: fp8_tensor(weights, &format!("{prefix}wo_b"))?,
         })
     }
 }
@@ -240,7 +223,6 @@ use crate::transformer::{
     BlockWeights, EngramCore, EngramLookup, FfnWeights, Transformer, TransformerParams,
 };
 use anyhow::bail;
-use std::collections::HashMap;
 
 /// Assembles a host-reference `Transformer` from a checkpoint directory.
 /// Every projection is materialized F32 at load: the static skeleton and the
@@ -250,18 +232,19 @@ pub struct TransformerLoader {
     model_dir: std::path::PathBuf,
     config: DeepseekV41Config,
     layout: CheckpointLayout,
-    shards: HashMap<String, (memmap2::Mmap, safetensors::SafeTensors<'static>)>,
+    weights: std::sync::Arc<ModelWeights>,
 }
 
 impl TransformerLoader {
     pub fn open(model_dir: &Path) -> Result<Self> {
         let config = DeepseekV41Config::from_model_dir(model_dir)?;
         let layout = CheckpointLayout::open(model_dir)?;
+        let weights = std::sync::Arc::new(open_weights(model_dir)?);
         Ok(Self {
             model_dir: model_dir.to_owned(),
             config,
             layout,
-            shards: HashMap::new(),
+            weights,
         })
     }
 
@@ -269,76 +252,21 @@ impl TransformerLoader {
         &self.config
     }
 
-    #[cfg(test)]
-    pub(crate) fn layer_tensor_names_for_test(&mut self, name: &str) -> Result<()> {
-        let _ = self.tensors(name)?;
-        Ok(())
+    fn f32(&self, name: &str) -> Result<Tensor> {
+        f32_tensor(&self.weights, name)
     }
 
-    fn tensors(&mut self, name: &str) -> Result<&safetensors::SafeTensors<'static>> {
-        let shard = self
-            .layout
-            .shard_of(name)
-            .with_context(|| format!("{name} is not in the index"))?
-            .to_owned();
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.shards.entry(shard.clone()) {
-            entry.insert(open_shard(&self.model_dir, &shard)?);
-        }
-        let (_, tensors) = self.shards.get_mut(&shard).expect("just inserted");
-        Ok(tensors)
+    fn fp8(&self, projection: &str) -> Result<Tensor> {
+        fp8_tensor(&self.weights, projection)
     }
 
-    fn f32(&mut self, name: &str) -> Result<Tensor> {
-        let device = Device::Cpu;
-        let view = self
-            .tensors(name)?
-            .tensor(name)
-            .with_context(|| format!("view {name}"))?;
-        view.load(&device)
-            .with_context(|| format!("load {name}"))?
-            .to_dtype(candle_core::DType::F32)
-            .with_context(|| format!("cast {name}"))
-    }
-
-    fn fp8(&mut self, projection: &str) -> Result<Tensor> {
-        let device = Device::Cpu;
-        let weight_name = format!("{projection}.weight");
-        let scale_name = format!("{projection}.scale");
-        let weight = self
-            .tensors(&weight_name)?
-            .tensor(&weight_name)
-            .with_context(|| weight_name.clone())?
-            .load(&device)?;
-        let scale = self
-            .tensors(&scale_name)?
-            .tensor(&scale_name)
-            .with_context(|| scale_name.clone())?;
-        crate::quant::dequantize_fp8_block(&weight, scale.data(), &device)
-            .with_context(|| format!("dequantize {weight_name}"))
-    }
-
-    fn fp4(&mut self, weight_name: &str, rows: usize, columns: usize) -> Result<Tensor> {
-        let device = Device::Cpu;
-        let scale_name = weight_name.replace(".weight", ".scale");
-        let payload = self
-            .tensors(weight_name)?
-            .tensor(weight_name)
-            .with_context(|| weight_name.to_owned())?;
-        let scale = self
-            .tensors(&scale_name)?
-            .tensor(&scale_name)
-            .with_context(|| scale_name.to_owned())?;
-        crate::quant::dequantize_fp4_packed(payload.data(), rows, columns, scale.data(), &device)
-            .with_context(|| format!("dequantize {weight_name}"))
+    fn fp4(&self, weight_name: &str, rows: usize, columns: usize) -> Result<Tensor> {
+        fp4_tensor(&self.weights, weight_name, rows, columns)
     }
 
     /// Dequantized sizes of every tensor the resident load would hold, by
     /// checkpoint role. FP8 and FP4 grow 4x and 8x to F32; BF16 grows 2x.
     pub fn resident_f32_bytes(&self) -> Result<u64> {
-        // Header reads are cheap: one per shard, then each tensor's exact
-        // dtype and shape decide its dequantized size.
-        let mut headers: HashMap<String, (memmap2::Mmap, safetensors::SafeTensors<'static>)> =
-            HashMap::new();
         let mut total = 0u64;
         for (tensor, shard) in &self.layout.tensors {
             let role = self
@@ -359,21 +287,15 @@ impl TransformerLoader {
             if lookup_backed || tensor.ends_with(".scale") {
                 continue;
             }
-            if !headers.contains_key(shard) {
-                headers.insert(shard.clone(), open_shard(&self.model_dir, shard)?);
-            }
-            let (_, header) = headers.get(shard).expect("just inserted");
-            let view = header
-                .tensor(tensor)
-                .with_context(|| format!("{tensor} is not in {shard}"))?;
+            let view = self.weights.raw_tensor_metadata(tensor)?;
             let elements: u64 = view
-                .shape()
+                .shape
                 .iter()
                 .map(|dimension| *dimension as u64)
                 .product::<u64>();
             // F32 stays 4 bytes; BF16 and FP8 double/quadruple to 4; a packed
             // FP4 byte (I8 view, two values per byte) becomes eight F32 bytes.
-            let element_bytes = match view.dtype() {
+            let element_bytes = match view.dtype {
                 safetensors::Dtype::F32 => 4,
                 safetensors::Dtype::BF16
                 | safetensors::Dtype::F8_E4M3
@@ -395,7 +317,7 @@ impl TransformerLoader {
     /// Load the whole transformer onto the host. `tokenizer` is needed only
     /// when the checkpoint carries engram layers.
     pub fn load(
-        mut self,
+        self,
         tokenizer: Option<&tokenizers::Tokenizer>,
         max_seq: usize,
     ) -> Result<Transformer> {
@@ -456,7 +378,7 @@ impl TransformerLoader {
     }
 
     fn load_block(
-        &mut self,
+        &self,
         layer: usize,
         max_seq: usize,
         ngram: &Option<NgramHashState>,
@@ -585,7 +507,7 @@ impl TransformerLoader {
         })
     }
 
-    fn load_ffn(&mut self, layer: usize) -> Result<FfnWeights> {
+    fn load_ffn(&self, layer: usize) -> Result<FfnWeights> {
         let (routed, active, intermediate, hidden, swiglu_limit, norm_topk_prob, route_scale) = {
             let text = &self.config.text_config;
             (
@@ -612,7 +534,7 @@ impl TransformerLoader {
             norm_topk_prob,
             route_scale,
         };
-        let load_expert = |loader: &mut Self, projection: &str| -> Result<Expert> {
+        let load_expert = |loader: &Self, projection: &str| -> Result<Expert> {
             Ok(Expert {
                 w1: loader.fp4(&format!("{projection}.w1.weight"), intermediate, hidden)?,
                 w2: loader.fp4(&format!("{projection}.w2.weight"), hidden, intermediate)?,
@@ -632,36 +554,20 @@ impl TransformerLoader {
         })
     }
 
-    fn load_engram(&mut self, layer: usize, hash_index: usize) -> Result<EngramCore> {
+    fn load_engram(&self, layer: usize, hash_index: usize) -> Result<EngramCore> {
         let text = &self.config.text_config;
         let prefix = format!("layers.{layer}.engram.");
         let weight_name = format!("{prefix}embed.weight");
         let scale_name = format!("{prefix}embed.scale");
         let head_dim = text.engram_head_dim;
-        let model_dir = self.model_dir.clone();
-        let weight_shard = self
-            .layout
-            .shard_of(&weight_name)
-            .with_context(|| format!("{weight_name} is not in the index"))?
-            .to_owned();
-        let scale_shard = self
-            .layout
-            .shard_of(&scale_name)
-            .with_context(|| format!("{scale_name} is not in the index"))?
-            .to_owned();
-        let (weight_map, weight_view) = open_shard(&model_dir, &weight_shard)
-            .with_context(|| format!("open engram payload shard {weight_shard}"))?;
-        let (scale_map, scale_view) = open_shard(&model_dir, &scale_shard)
-            .with_context(|| format!("open engram scale shard {scale_shard}"))?;
-        // The views sit on the same forged lifetime as the loader's shard
-        // cache; the mmaps move into the callback to keep the pages mapped.
-        // Validate the table shape before any lookup trusts its row indexes.
-        let weight = weight_view
-            .tensor(&weight_name)
-            .with_context(|| format!("{weight_name} is not in {weight_shard}"))?;
-        let scale = scale_view
-            .tensor(&scale_name)
-            .with_context(|| format!("{scale_name} is not in {scale_shard}"))?;
+        let weight = self
+            .weights
+            .raw_tensor_metadata(&weight_name)
+            .with_context(|| format!("engram payload {weight_name}"))?;
+        let scale = self
+            .weights
+            .raw_tensor_metadata(&scale_name)
+            .with_context(|| format!("engram scale {scale_name}"))?;
         let expected_rows = text
             .engram_num_embeddings
             .get(hash_index)
@@ -669,35 +575,43 @@ impl TransformerLoader {
             .with_context(|| format!("no engram table configured for index {hash_index}"))?;
         let scale_width = head_dim / crate::config::FP8_WEIGHT_BLOCK;
         anyhow::ensure!(
-            weight.dtype() == safetensors::Dtype::F8_E4M3
-                && weight.shape() == [expected_rows as usize, head_dim].as_slice(),
+            weight.dtype == safetensors::Dtype::F8_E4M3
+                && weight.shape == [expected_rows as usize, head_dim].as_slice(),
             "{weight_name} must be F8_E4M3 [{expected_rows}, {head_dim}], found {:?} {:?}",
-            weight.dtype(),
-            weight.shape()
+            weight.dtype,
+            weight.shape
         );
         anyhow::ensure!(
-            scale.dtype() == safetensors::Dtype::F8_E8M0
-                && scale.shape() == [expected_rows as usize, scale_width].as_slice(),
+            scale.dtype == safetensors::Dtype::F8_E8M0
+                && scale.shape == [expected_rows as usize, scale_width].as_slice(),
             "{scale_name} must be F8_E8M0 [{expected_rows}, {scale_width}], found {:?} {:?}",
-            scale.dtype(),
-            scale.shape()
+            scale.dtype,
+            scale.shape
         );
-        let payload = weight.data();
-        let scales = scale.data();
+        let weights = std::sync::Arc::clone(&self.weights);
         let lookup: EngramLookup = Box::new(move |ids: &[i64]| -> Vec<f32> {
-            let _keep_mapped = (&weight_map, &scale_map);
             let mut rows = Vec::with_capacity(ids.len() * head_dim);
-            for id in ids {
-                let row = *id as usize;
-                for d in 0..head_dim {
-                    let byte = payload[row * head_dim + d];
-                    let group = d / crate::config::FP8_WEIGHT_BLOCK;
-                    let exponent =
-                        scales[row * (head_dim / crate::config::FP8_WEIGHT_BLOCK) + group] as i32
-                            - 127;
-                    rows.push(crate::quant::e4m3_byte_to_f32(byte) * 2.0f32.powi(exponent));
-                }
-            }
+            weights
+                .with_tensor_bytes(&weight_name, |payload| {
+                    weights.with_tensor_bytes(&scale_name, |scales| {
+                        for id in ids {
+                            let row = *id as usize;
+                            for d in 0..head_dim {
+                                let byte = payload[row * head_dim + d];
+                                let group = d / crate::config::FP8_WEIGHT_BLOCK;
+                                let exponent = scales
+                                    [row * (head_dim / crate::config::FP8_WEIGHT_BLOCK) + group]
+                                    as i32
+                                    - 127;
+                                rows.push(
+                                    crate::quant::e4m3_byte_to_f32(byte) * 2.0f32.powi(exponent),
+                                );
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .expect("engram tensors were validated at load");
             rows
         });
         Ok(EngramCore {
@@ -716,19 +630,39 @@ mod tests {
     use super::*;
     use ff_core::paths::checkpoint_dir;
 
-    fn layout() -> Option<CheckpointLayout> {
-        let dir = &checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")?;
-        if !dir.join("model.safetensors.index.json").exists() {
-            return None;
+    #[test]
+    fn index_size_uses_the_shared_optional_numeric_rule() {
+        for (metadata, expected) in [
+            ("{}", None),
+            (r#"{"total_size":null}"#, None),
+            (r#"{"total_size":55562855904.0}"#, Some(55_562_855_904)),
+            (r#"{"total_size":18446744073709551615}"#, Some(u64::MAX)),
+        ] {
+            let parsed: ShardIndex =
+                serde_json::from_str(&format!("{{\"metadata\":{metadata},\"weight_map\":{{}}}}"))
+                    .unwrap();
+            assert_eq!(parsed.metadata.total_size, expected);
         }
-        Some(CheckpointLayout::open(dir).unwrap())
+        let missing: ShardIndex = serde_json::from_str(r#"{"weight_map":{}}"#).unwrap();
+        assert_eq!(missing.metadata.total_size, None);
+        for size in ["1.5", "-1", "9007199254740994.0"] {
+            assert!(
+                serde_json::from_str::<ShardIndexMetadata>(&format!("{{\"total_size\":{size}}}"))
+                    .is_err()
+            );
+        }
+    }
+    fn layout() -> CheckpointLayout {
+        let dir = &checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model.safetensors.index.json").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
+        CheckpointLayout::open(dir).unwrap()
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn shards_partition_into_six_roles() {
-        let Some(layout) = layout() else {
-            return;
-        };
+        let layout = layout();
         assert_eq!(layout.shard_count(ShardRole::Vision), 1);
         assert_eq!(layout.shard_count(ShardRole::Embed), 1);
         assert_eq!(layout.shard_count(ShardRole::Text), 40);
@@ -739,10 +673,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn role_assignment_matches_the_documented_shard_files() {
-        let Some(layout) = layout() else {
-            return;
-        };
+        let layout = layout();
         assert_eq!(
             layout.shard_role("model-00001-of-00048.safetensors"),
             Some(ShardRole::Vision)
@@ -772,14 +705,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn repeated_estimate_calls_stay_valid_after_map_release() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model.safetensors.index.json").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.join("model.safetensors.index.json").exists() {
-            return;
-        }
         let first = TransformerLoader::open(dir)
             .unwrap()
             .resident_f32_bytes()
@@ -795,30 +726,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn resident_estimate_sums_exact_tensor_sizes_not_shard_averages() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model.safetensors.index.json").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.join("model.safetensors.index.json").exists() {
-            return;
-        }
         let loader = TransformerLoader::open(dir).unwrap();
         let exact = loader.resident_f32_bytes().unwrap();
         // Cross-check a few known tensors against the same header math the
         // loader uses: a BF16 head row-block and an FP8 body projection.
         let layout = CheckpointLayout::open(dir).unwrap();
-        let (_, views) =
-            open_shard(dir, layout.shard_of("layers.6.attn.wq_a.weight").unwrap()).unwrap();
-        let view = views.tensor("layers.6.attn.wq_a.weight").unwrap();
-        let elements: u64 = view.shape().iter().map(|d| *d as u64).product();
+        let view = open_weights(dir)
+            .unwrap()
+            .raw_tensor_metadata("layers.6.attn.wq_a.weight")
+            .unwrap();
+        let elements: u64 = view.shape.iter().map(|d| *d as u64).product();
         assert_eq!(
-            (elements, view.dtype()),
+            (elements, view.dtype),
             (1280 * 5120, safetensors::Dtype::F8_E4M3)
         );
-        // The old shard-averaged estimate rounded every tensor to
-        // bytes/tensor_count and mislabeled BF16 embeds as 4x; the exact sum
-        // is strictly smaller than bytes*4 summed over the same set.
+        // The exact tensor sum excludes unrelated payload and uses each tensor's stored dtype.
         let mut naive = 0u64;
         for (tensor, shard) in &layout.tensors {
             let role = layout.shard_role(shard).unwrap();
@@ -837,51 +765,33 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_shard_reports_an_error_instead_of_panicking() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
+    fn a_missing_shard_is_an_error_at_open() {
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model.safetensors.index.json").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.join("model.safetensors.index.json").exists() {
-            return;
+        let scratch = tempfile::tempdir().unwrap();
+        for file in ["model.safetensors.index.json", "config.json"] {
+            std::fs::copy(dir.join(file), scratch.path().join(file)).unwrap();
         }
-        // Point the loader at a directory whose shard file is absent: opening
-        // must surface an io error through Result, not an unwrap panic.
-        let scratch = std::env::temp_dir().join(format!("ff-dsv41-broken-{}", std::process::id()));
-        std::fs::create_dir_all(&scratch).unwrap();
-        std::fs::copy(
-            dir.join("model.safetensors.index.json"),
-            scratch.join("model.safetensors.index.json"),
-        )
-        .unwrap();
-        std::fs::copy(dir.join("config.json"), scratch.join("config.json")).unwrap();
-        let result = std::panic::catch_unwind(|| {
-            let mut loader = crate::weights::TransformerLoader::open(&scratch).unwrap();
-            loader.layer_tensor_names_for_test("layers.6.attn.wq_a.weight")
-        });
-        std::fs::remove_dir_all(&scratch).ok();
-        let error = match result {
-            Ok(Err(error)) => error,
-            Ok(Ok(())) => panic!("missing shard must be an error"),
-            Err(_) => panic!("missing shard panicked instead of erroring"),
+        let Err(error) = TransformerLoader::open(scratch.path()) else {
+            panic!("a checkpoint without its shards must not open");
         };
         assert!(
-            error.to_string().contains("No such file") || error.to_string().contains("open model-"),
+            format!("{error:#}").contains("weight shard is missing"),
             "unexpected error: {error:#}"
         );
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn layer_assembly_materializes_the_real_projections() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model.safetensors.index.json").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.join("model.safetensors.index.json").exists() {
-            return;
-        }
-        let layout = CheckpointLayout::open(dir).unwrap();
-        let weights = LayerWeights::load_layer(dir, &layout, 6).unwrap();
+        let weights = LayerWeights::load_layer(&open_weights(dir).unwrap(), 6).unwrap();
         assert_eq!(weights.wq_a.dims(), [1280, 5120]);
         assert_eq!(weights.q_norm.dims(), [1280]);
         // Main wq_b covers every head: 64 heads x 512 = 32768 rows.
@@ -907,10 +817,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn text_only_runs_open_42_shards_and_skip_optional_families() {
-        let Some(layout) = layout() else {
-            return;
-        };
+        let layout = layout();
         assert_eq!(layout.shards_to_open(OpenPlan::default()).len(), 42);
         assert_eq!(
             layout.shards_to_open(OpenPlan::default())[0],
@@ -929,10 +838,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn vision_tensors_never_share_a_shard_with_text_layers() {
-        let Some(layout) = layout() else {
-            return;
-        };
+        let layout = layout();
         let vision = layout.tensors_in("model-00001-of-00048.safetensors");
         assert!(vision.iter().any(|name| name.starts_with("vision.blocks.")));
         assert!(vision.contains(&"vision.norm.weight"));
@@ -963,23 +871,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn admission_counts_engram_projections_but_not_the_embed_table() {
-        let Some(layout) = layout() else {
-            return;
-        };
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
-        let dir = &dir;
+        let layout = layout();
+        let dir = &checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let exact = TransformerLoader::open(dir)
             .unwrap()
             .resident_f32_bytes()
             .unwrap();
-        // Recompute both parts independently from the shard headers: the old
-        // rule skipped the whole Engram role; the new rule keeps only the
-        // resident projections (wkv, q/k weights) out of it.
-        let mut headers: HashMap<String, (memmap2::Mmap, safetensors::SafeTensors<'static>)> =
-            HashMap::new();
+        // Only Engram resident projections are excluded from streamed payload.
+        let weights = open_weights(dir).unwrap();
         let mut skeleton = 0u64;
         let mut projections = 0u64;
         for (tensor, shard) in &layout.tensors {
@@ -987,15 +889,11 @@ mod tests {
             if matches!(role, ShardRole::Dspark | ShardRole::Vision) || tensor.ends_with(".scale") {
                 continue;
             }
-            if !headers.contains_key(shard) {
-                headers.insert(shard.clone(), open_shard(dir, shard).unwrap());
-            }
-            let (_, header) = headers.get(shard).unwrap();
-            let view = header.tensor(tensor).unwrap();
+            let view = weights.raw_tensor_metadata(tensor).unwrap();
             match role {
                 ShardRole::Engram if tensor.contains(".engram.embed.") => {}
-                ShardRole::Engram => projections += exact_f32_bytes(view.shape(), view.dtype()),
-                _ => skeleton += exact_f32_bytes(view.shape(), view.dtype()),
+                ShardRole::Engram => projections += exact_f32_bytes(&view.shape, view.dtype),
+                _ => skeleton += exact_f32_bytes(&view.shape, view.dtype),
             }
         }
         assert!(
@@ -1005,39 +903,112 @@ mod tests {
         assert_eq!(exact, skeleton + projections);
     }
 
-    #[test]
-    fn a_missing_engram_shard_is_an_error_not_a_panic() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
-        let dir = &dir;
-        if !dir.join("config.json").exists() {
-            return;
-        }
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::copy(dir.join("config.json"), temp.path().join("config.json")).unwrap();
-        let index = serde_json::json!({
-            "metadata": {"total_size": 0},
-            "weight_map": {
-                "layers.1.engram.embed.weight": "model-00001-of-00001.safetensors",
-                "layers.1.engram.embed.scale": "model-00001-of-00001.safetensors",
-                "layers.1.engram.wkv.weight": "model-00001-of-00001.safetensors",
-                "layers.1.engram.q_weight": "model-00001-of-00001.safetensors",
-                "layers.1.engram.k_weight": "model-00001-of-00001.safetensors",
-            }
-        });
+    fn write_fixture(dir: &Path) -> Vec<(String, safetensors::Dtype, Vec<usize>, Vec<u8>)> {
+        let tensors = vec![
+            (
+                "layers.0.attn.wq_a.weight".to_owned(),
+                safetensors::Dtype::F8_E4M3,
+                vec![128, 128],
+                (0..128 * 128).map(|i| (i % 120) as u8).collect::<Vec<u8>>(),
+            ),
+            (
+                "layers.0.attn.wq_a.scale".to_owned(),
+                safetensors::Dtype::F8_E8M0,
+                vec![4, 4],
+                vec![127u8; 16],
+            ),
+            (
+                "layers.0.attn.q_norm.weight".to_owned(),
+                safetensors::Dtype::BF16,
+                vec![4],
+                (1u16..=4)
+                    .flat_map(|v| (v * 0x3f80 / 2).to_le_bytes())
+                    .collect(),
+            ),
+        ];
+        let views: Vec<_> = tensors
+            .iter()
+            .map(|(name, dtype, shape, data)| {
+                (
+                    name.clone(),
+                    safetensors::tensor::TensorView::new(*dtype, shape.clone(), data).unwrap(),
+                )
+            })
+            .collect();
+        safetensors::serialize_to_file(views, None, &dir.join("model-00001-of-00001.safetensors"))
+            .unwrap();
+        let map: serde_json::Map<String, serde_json::Value> = tensors
+            .iter()
+            .map(|(name, ..)| {
+                (
+                    name.clone(),
+                    serde_json::json!("model-00001-of-00001.safetensors"),
+                )
+            })
+            .collect();
         std::fs::write(
-            temp.path().join("model.safetensors.index.json"),
-            serde_json::to_vec(&index).unwrap(),
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(
+                &serde_json::json!({ "metadata": {"total_size": 0}, "weight_map": map }),
+            )
+            .unwrap(),
         )
         .unwrap();
-        let mut loader = TransformerLoader::open(temp.path()).unwrap();
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader.load_engram(1, 0)));
-        let Err(error) = outcome.expect("load_engram panicked") else {
-            panic!("load_engram unexpectedly succeeded against a missing shard")
+        tensors
+    }
+
+    #[test]
+    fn shared_traversal_yields_the_bytes_and_dequantized_values_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = write_fixture(dir.path());
+        let weights = open_weights(dir.path()).unwrap();
+        let file = std::fs::read(dir.path().join("model-00001-of-00001.safetensors")).unwrap();
+        let direct = safetensors::SafeTensors::deserialize(&file).unwrap();
+        for (name, dtype, shape, data) in &tensors {
+            let meta = weights.raw_tensor_metadata(name).unwrap();
+            assert_eq!((meta.dtype, &meta.shape), (*dtype, shape), "{name}");
+            let bytes = weights
+                .with_tensor_bytes(name, |bytes| Ok(bytes.to_vec()))
+                .unwrap();
+            assert_eq!(&bytes, data, "{name}");
+            assert_eq!(direct.tensor(name).unwrap().data(), data, "{name}");
+        }
+        let via_traversal = fp8_tensor(&weights, "layers.0.attn.wq_a").unwrap();
+        let weight = Tensor::from_raw_buffer(
+            direct.tensor("layers.0.attn.wq_a.weight").unwrap().data(),
+            DType::F8E4M3,
+            &[128, 128],
+            &Device::Cpu,
+        )
+        .unwrap();
+        let expected = crate::quant::dequantize_fp8_block(
+            &weight,
+            direct.tensor("layers.0.attn.wq_a.scale").unwrap().data(),
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(
+            via_traversal
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            expected.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        let norm = f32_tensor(&weights, "layers.0.attn.q_norm.weight").unwrap();
+        assert_eq!(norm.dtype(), DType::F32);
+        assert_eq!(norm.dims(), [4]);
+    }
+
+    #[test]
+    fn a_layer_without_its_sink_fails_naming_the_tensor() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path());
+        let weights = open_weights(dir.path()).unwrap();
+        let Err(error) = LayerWeights::load_layer(&weights, 0) else {
+            panic!("a missing attn_sink must not load");
         };
         let message = format!("{error:#}");
-        assert!(message.contains("engram payload shard"), "{message}");
+        assert!(message.contains("layers.0.attn.attn_sink"), "{message}");
     }
 }

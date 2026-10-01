@@ -103,14 +103,15 @@ impl PreparedTransformerContext {
 /// size comes back to its start. An unreadable memory figure answers `true`,
 /// which leaves the kernel's ordinary behaviour in place rather than acting on
 /// a number this process does not have.
-fn host_can_retain(bytes: u64) -> bool {
-    let snapshot = ff_core::probe::ResourceSnapshot::capture(None);
-    snapshot
+fn host_can_retain(bytes: u64) -> Result<bool> {
+    let snapshot =
+        ff_core::probe::ResourceSnapshot::capture(None).context("resource probe failed")?;
+    Ok(snapshot
         .cgroup_v2_memory_available_bytes
         .into_iter()
         .chain(snapshot.host_memory_available_bytes)
         .min()
-        .is_none_or(|available| bytes <= available)
+        .is_none_or(|available| bytes <= available))
 }
 
 pub struct TransformerOutput {
@@ -304,7 +305,7 @@ impl StreamedTransformer {
     ) -> Result<Self> {
         let plan = H3ExecutionPlan::from_config(&weights, &config)?;
         // Drop evicted pages when evaluation weights exceed available host memory.
-        weights.drop_evicted_pages(!host_can_retain(plan.evaluation_weight_bytes()));
+        weights.drop_evicted_pages(!host_can_retain(plan.evaluation_weight_bytes())?);
         let phases = if options.device_cache_policy.is_enabled() || options.host_phase_priority {
             plan.stages()
                 .iter()

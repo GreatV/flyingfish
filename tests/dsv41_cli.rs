@@ -407,6 +407,9 @@ fn write_fixture(root: &Path) {
         serde_json::to_vec_pretty(&serde_json::json!({
             "architectures": ["DeepseekV41ForCausalLM"],
             "model_type": "deepseek_v41",
+            "bos_token_id": 0,
+            "eos_token_id": 1,
+            "pad_token_id": 2,
             "image_token_id": 47,
             "quantization_config": {
                 "quant_method": "fp8",
@@ -473,7 +476,13 @@ fn write_fixture(root: &Path) {
                 "engram_head_dim": 256,
                 "engram_pad_token_id": 2,
                 "engram_compressed_vocab_size": 40,
-                "num_nextn_predict_layers": 0
+                "num_nextn_predict_layers": 0,
+                "dspark_block_size": 0,
+                "dspark_noise_token_id": 0,
+                "dspark_target_layer_ids": [],
+                "dspark_markov_rank": 0,
+                "dspark_n_routed_experts": 0,
+                "dspark_num_experts_per_tok": 0
             }
         }))
         .unwrap(),

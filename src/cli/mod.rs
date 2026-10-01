@@ -304,18 +304,7 @@ impl DenoiseChunkArgs {
         }
     }
 
-    /// Resolve every unstated chunk to its documented default.
-    ///
-    /// The projection chunk has two defaults because it means two things. On
-    /// the exact path it only bounds the Q/K/V projection activations, so 32
-    /// rows costs nothing. Under FlashAttention it is additionally the query
-    /// span of each attention call, and a 32-row span runs that call an order
-    /// of magnitude below the device's achievable rate. An explicit
-    /// `--attention-projection-chunk-size` is always honoured as given.
-    /// The FlashAttention path also uses 1024-row FFN/output chunks, based on
-    /// the retained local H3 operator screening and two-evaluation execution.
-    /// These geometries are recorded in the execution policy, as chunk sizes
-    /// can affect vendor GEMM rounding. Explicit sizes always take precedence.
+    /// Resolve absent chunks to the backend's documented defaults; explicit sizes take precedence.
     fn configured(self, flash_attention: bool) -> TransformerChunkArgs {
         let default_projection_chunk_size = if flash_attention {
             DEFAULT_FLASH_ATTENTION_PROJECTION_CHUNK_SIZE
@@ -383,9 +372,7 @@ impl WeightCacheArgs {
     }
 }
 
-/// Device residency for adapters whose loaders stream weights per use. Kept off
-/// the shared `WeightCacheArgs` because H3's commands route residency through
-/// their own policy machinery.
+/// Device residency arguments for adapters with streamed weight loaders.
 #[derive(Clone, Copy, Debug, Default, clap::Args)]
 pub(crate) struct DeviceCacheArgs {
     #[arg(
@@ -596,6 +583,8 @@ enum IoBenchmarkProfile {
 
 #[derive(Debug, Subcommand)]
 enum BenchCommand {
+    #[command(about = "Calibrate and persist group4 decode bodies for this machine")]
+    Group4(calibrate_io::Group4Args),
     #[command(about = "Measure explicit sequential or local-interconnect I/O profiles")]
     Io {
         #[arg(long, value_enum, default_value = "sequential")]
@@ -742,6 +731,7 @@ fn dispatch(command: Command) -> Result<()> {
             rtol,
             allow_unexpected,
         } => diff::run_compare_tensors(reference, actual, atol, rtol, allow_unexpected),
+        Command::Bench(BenchCommand::Group4(args)) => calibrate_io::run_group4(args),
         Command::Bench(BenchCommand::Collective {
             output,
             devices,
@@ -821,8 +811,9 @@ mod tests {
         promote_attention_backend_for_rows, select_resume_execution_policy,
         validate_executable_policy,
     };
-    use flyingfish::glm::{ExpertCacheLayout, ExpertCacheReplacementPolicy};
+    use flyingfish::glm::ExpertCacheLayout;
     use flyingfish::h3::audio_vae::WavSampleFormat;
+    use flyingfish::h3::policy::ExecutionBackendPolicy;
     use flyingfish::recovery::PolicyHistory;
     use flyingfish::runtime::telemetry::TelemetryMonitor;
     use flyingfish::runtime::weights::DeviceCachePolicy;
@@ -870,7 +861,6 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: device_free,
             host_device_memory_is_unified: unified,
-            device_topology_probe_failed: false,
             host_memory_total_bytes: host_total,
             device_total_memory_bytes: device_total,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
@@ -884,27 +874,76 @@ mod tests {
     #[test]
     fn device_residency_reserve_matches_the_flat_margin_on_a_24gib_card() {
         let snapshot = snap(Some(false), Some(64 << 30), Some(24 << 30), Some(20 << 30));
-        // 24 GiB / 20 = 1.2 GiB > the 1 GiB cap: the historical flat margin,
-        // pinned so the baseline cannot drift.
-        assert_eq!(device_residency_reserve_bytes(&snapshot), 1 << 30);
+        // A 24 GiB total reaches the 1 GiB reserve cap.
+        assert_eq!(
+            device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::Cuda).unwrap(),
+            1 << 30
+        );
     }
 
     #[test]
     fn device_residency_reserve_scales_down_on_small_unified_pools() {
         let snapshot = snap(Some(true), Some(6 << 30), Some(6 << 30), Some(4 << 30));
-        assert_eq!(device_residency_reserve_bytes(&snapshot), 512 << 20);
+        assert_eq!(
+            device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::Cuda).unwrap(),
+            512 << 20
+        );
     }
 
     #[test]
-    fn device_residency_reserve_keeps_the_cap_without_totals() {
-        // No totals at all: the historical flat cap, not a free-view guess.
-        let snapshot = snap(None, None, None, None);
-        assert_eq!(device_residency_reserve_bytes(&snapshot), 1 << 30);
-        // A free view without a total is a LEGACY-RECORD shape only (a live
-        // capture produces the total and free together); it mirrors the GLM
-        // axis fallback so replayed selections reproduce their era's reserve.
-        let snapshot = snap(None, None, None, Some(4 << 30));
-        assert_eq!(device_residency_reserve_bytes(&snapshot), 512 << 20);
+    fn missing_residency_total_names_the_capture_command() {
+        let snapshot = snap(Some(false), None, None, Some(4 << 30));
+        let error = device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::Cuda)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("device_total_memory_bytes") && error.contains("ff probe"));
+    }
+
+    #[test]
+    fn cpu_residency_needs_no_cuda_topology_but_unclassified_cuda_is_refused() {
+        let mut snapshot = snap(None, Some(64 << 30), None, None);
+        assert_eq!(
+            device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::Cpu).unwrap(),
+            0
+        );
+        for measured in [false, true] {
+            if measured {
+                snapshot.device_total_memory_bytes = Some(24 << 30);
+                snapshot.device_free_memory_bytes = Some(20 << 30);
+                snapshot.measurement_scope.device_memory =
+                    Some(flyingfish::runtime::probe::MemoryMeasurementScope::DeviceWide);
+            }
+            let error = device_residency_reserve_bytes(&snapshot, ExecutionBackendPolicy::Cuda)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("host_device_memory_is_unified") && error.contains("ff probe"));
+        }
+    }
+
+    #[test]
+    fn group4_calibration_requires_an_explicit_profile_and_spec_ring() {
+        let base = [
+            "ff",
+            "bench",
+            "group4",
+            "--adapter",
+            "qwen35",
+            "--model",
+            "checkpoint",
+            "--device",
+            "cuda:0",
+        ];
+        assert!(Args::try_parse_from(base).is_err());
+        let mut args = base.to_vec();
+        args.extend(["--host-profile", "profile.json"]);
+        assert!(matches!(
+            Args::try_parse_from(&args).unwrap().command,
+            Command::Bench(BenchCommand::Group4(_))
+        ));
+        args.push("--speculative");
+        assert!(Args::try_parse_from(&args).is_err());
+        args.extend(["--rounds", "258"]);
+        assert!(Args::try_parse_from(&args).is_ok());
     }
 
     #[test]
@@ -1788,8 +1827,6 @@ mod tests {
                 "4096",
                 "--expert-cache-layout",
                 "shared-pool",
-                "--expert-cache-replacement",
-                "lfu",
                 "--expert-cache-readmit",
                 "--expert-cache-min-mib",
                 "1024",
@@ -1806,24 +1843,24 @@ mod tests {
         ))
         .unwrap();
         match command {
-            GlmCommand::Generate {
-                prompt,
-                max_new_tokens,
-                max_context_tokens,
-                reasoning_effort,
-                sampling,
-                resident_static,
-                expert_cache_mib,
-                expert_cache_layout,
-                expert_cache_replacement,
-                expert_cache_readmit,
-                expert_cache_min_mib,
-                output,
-                routing_trace,
-                routing_trace_domain,
-                execution_manifest,
-                ..
-            } => {
+            GlmCommand::Generate(args) => {
+                let glm::Args {
+                    prompt,
+                    max_new_tokens,
+                    max_context_tokens,
+                    reasoning_effort,
+                    sampling,
+                    resident_static,
+                    expert_cache_mib,
+                    expert_cache_layout,
+                    expert_cache_readmit,
+                    expert_cache_min_mib,
+                    output,
+                    routing_trace,
+                    routing_trace_domain,
+                    execution_manifest,
+                    ..
+                } = *args;
                 assert_eq!(prompt, "17*23=");
                 assert_eq!(max_new_tokens.get(), 32);
                 assert_eq!(max_context_tokens.get(), 64);
@@ -1833,10 +1870,6 @@ mod tests {
                 assert_eq!(resident_static, Some(true));
                 assert_eq!(expert_cache_mib, Some(4096));
                 assert_eq!(expert_cache_layout, Some(ExpertCacheLayout::SharedPool));
-                assert_eq!(
-                    expert_cache_replacement,
-                    Some(ExpertCacheReplacementPolicy::Lfu)
-                );
                 assert!(expert_cache_readmit);
                 assert_eq!(expert_cache_min_mib, Some(1024));
                 assert!(output.json);
@@ -1862,19 +1895,18 @@ mod tests {
     fn glm_residency_flags_distinguish_absent_from_explicit_zero_and_false() {
         let base = ["generate", "--model", "GLM-5.3-Flash", "--prompt", "hello"];
         let defaults = GlmCommand::from_arg_matches(&task_matches("glm", &base)).unwrap();
-        let GlmCommand::Generate {
+        let GlmCommand::Generate(parsed) = defaults else {
+            panic!("wrong command")
+        };
+        let glm::Args {
             weights,
             resource_policy,
             resident_static,
             no_resident_static,
             expert_cache_mib,
             expert_cache_layout,
-            expert_cache_replacement,
             ..
-        } = defaults
-        else {
-            panic!("wrong command")
-        };
+        } = *parsed;
         assert!(!weights.is_explicit());
         assert_eq!(
             resource_policy,
@@ -1884,7 +1916,6 @@ mod tests {
         assert!(!no_resident_static);
         assert_eq!(expert_cache_mib, None);
         assert_eq!(expert_cache_layout, None);
-        assert_eq!(expert_cache_replacement, None);
 
         let args = GlmCommand::from_arg_matches(&task_matches(
             "glm",
@@ -1902,17 +1933,17 @@ mod tests {
                 .collect::<Vec<_>>(),
         ))
         .unwrap();
-        let GlmCommand::Generate {
+        let GlmCommand::Generate(parsed) = args else {
+            panic!("wrong command")
+        };
+        let glm::Args {
             weights,
             resident_static,
             no_resident_static,
             expert_cache_mib,
             expert_cache_layout,
             ..
-        } = args
-        else {
-            panic!("wrong command")
-        };
+        } = *parsed;
         assert_eq!(resident_static, None);
         assert!(no_resident_static);
         assert_eq!(expert_cache_mib, Some(0));
@@ -1936,12 +1967,12 @@ mod tests {
                 .collect::<Vec<_>>(),
         ))
         .unwrap();
-        let GlmCommand::Generate {
-            resident_static, ..
-        } = explicit_false
-        else {
+        let GlmCommand::Generate(parsed) = explicit_false else {
             panic!("wrong command")
         };
+        let glm::Args {
+            resident_static, ..
+        } = *parsed;
         assert_eq!(resident_static, Some(false));
     }
 

@@ -28,7 +28,7 @@ __device__ __forceinline__ float add(float left, float right) {
 }  // namespace
 
 extern "C" __global__ __launch_bounds__(512, 4)
-void qwen_head_mean_width128_f32(
+void mean_width128_f32(
     int rows,
     const float* __restrict__ input,
     float* __restrict__ output) {
@@ -62,7 +62,7 @@ void qwen_head_mean_width128_f32(
 // reduction. Keep four independent accumulators across all 40 float4 loads,
 // then combine them before the warp reduction (Reduce.cuh).
 extern "C" __global__ __launch_bounds__(512, 4)
-void qwen_hidden_mean_width5120_f32(
+void mean_width5120_f32(
     int rows,
     const float* __restrict__ input,
     float* __restrict__ output) {

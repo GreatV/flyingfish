@@ -1,11 +1,4 @@
-//! FP8 and FP4 dequantization for the V4.1 checkpoint layout.
-//!
-//! Body weights are E4M3 with one E8M0 scale per 32-by-32 block (ceil-divided
-//! on both axes); routed experts are two E2M1 values per byte with one E8M0
-//! scale per 32 elements along the reduction axis. Scales arrive as raw
-//! E8M0 bytes because the expert payload's I8 dtype has no candle
-//! representation. Verified against the safetensors headers in
-//! `models/deepseek-ai/DeepSeek-V4.1-Flash`.
+//! V4.1 E4M3 body weights use E8M0 scales per 32-by-32 block; packed E2M1 experts use one E8M0 scale per 32 reduction elements.
 
 use anyhow::{Context, Result, ensure};
 use candle_core::{DType, Device, Tensor};
@@ -138,7 +131,6 @@ pub fn dequantize_fp4_packed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::safetensors::Load as _;
     use ff_core::paths::checkpoint_dir;
 
     #[test]
@@ -188,39 +180,46 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn dequantization_round_trips_a_real_shard_payload() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.join("model-00009-of-00048.safetensors").exists())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        let path = dir.join("model-00009-of-00048.safetensors");
-        if !path.exists() {
-            return;
-        }
-        let file = std::fs::File::open(&path).unwrap();
-        let mapped = unsafe { memmap2::Mmap::map(&file).unwrap() };
-        let tensors = safetensors::SafeTensors::deserialize(&mapped).unwrap();
-
-        let weight = tensors
-            .tensor("layers.6.attn.wq_a.weight")
-            .unwrap()
-            .load(&Device::Cpu)
+        let weights = ff_core::weights::ModelWeights::open(
+            dir,
+            ff_core::weights::WeightSource::Mmap,
+            ff_core::weights::CachePolicy::new(1),
+        )
+        .unwrap();
+        let weight = weights
+            .load("layers.6.attn.wq_a.weight", &Device::Cpu)
             .unwrap();
-        let scale_bytes = tensors.tensor("layers.6.attn.wq_a.scale").unwrap().data();
+        let scale_bytes = &weights
+            .with_tensor_bytes("layers.6.attn.wq_a.scale", |bytes| Ok(bytes.to_vec()))
+            .unwrap();
         assert_eq!(weight.dtype(), DType::F8E4M3);
         assert_eq!(weight.dims(), [1280, 5120]);
         assert_eq!(scale_bytes.len(), 40 * 160);
         let decoded = dequantize_fp8_block(&weight, scale_bytes, &Device::Cpu).unwrap();
         assert_eq!(decoded.dims(), [1280, 5120]);
 
-        let expert = tensors.tensor("layers.6.ffn.experts.3.w1.weight").unwrap();
-        assert_eq!(expert.dtype(), safetensors::Dtype::I8);
-        assert_eq!(expert.shape(), [2304, 2560]);
-        let expert_scale = tensors.tensor("layers.6.ffn.experts.3.w1.scale").unwrap();
-        assert_eq!(expert_scale.shape(), [2304, 160]);
-        let decoded =
-            dequantize_fp4_packed(expert.data(), 2304, 5120, expert_scale.data(), &Device::Cpu)
-                .unwrap();
+        let expert = weights
+            .raw_tensor_metadata("layers.6.ffn.experts.3.w1.weight")
+            .unwrap();
+        assert_eq!(expert.dtype, safetensors::Dtype::I8);
+        assert_eq!(expert.shape, [2304, 2560]);
+        let expert_scale = weights
+            .raw_tensor_metadata("layers.6.ffn.experts.3.w1.scale")
+            .unwrap();
+        assert_eq!(expert_scale.shape, [2304, 160]);
+        let decoded = weights
+            .with_tensor_bytes("layers.6.ffn.experts.3.w1.weight", |payload| {
+                let scales = weights
+                    .with_tensor_bytes("layers.6.ffn.experts.3.w1.scale", |s| Ok(s.to_vec()))?;
+                dequantize_fp4_packed(payload, 2304, 5120, &scales, &Device::Cpu)
+            })
+            .unwrap();
         assert_eq!(decoded.dims(), [2304, 5120]);
     }
 }

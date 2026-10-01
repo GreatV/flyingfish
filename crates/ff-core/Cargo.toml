@@ -12,6 +12,7 @@ cuda = ["candle-core/cuda"]
 metal = ["candle-core/metal"]
 
 [dependencies]
+sha2.workspace = true
 anyhow.workspace = true
 candle-core.workspace = true
 clap.workspace = true

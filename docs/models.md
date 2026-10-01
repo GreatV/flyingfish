@@ -2,14 +2,14 @@
 
 ## Performance
 
-Measurements used Linux, Intel i9-13900KF, 62 GiB RAM with 8 GiB swap, local NVMe storage, and one RTX 4090 with 24 GiB VRAM. The binary was built with Rust 1.95.0, CUDA 13.2 and `cargo build --locked --release --features flash-attn`.
+Except for H3, measurements used Linux, Intel i9-13900KF, 62 GiB RAM with 8 GiB swap, local NVMe storage, and one RTX 4090 with 24 GiB VRAM. The binary was built with Rust 1.95.0, CUDA 13.2 and `cargo build --locked --release --features flash-attn`. H3 used an RTX 5090, a 90 GiB cgroup with no swap, RAID storage, Rust 1.95.0 and CUDA 13.0 with `--features cuda`; its single-evaluation resource-fit test started with all T2VA component weight pages cold.
 
-Each row is one run; cases ran sequentially with OS caches retained, except the GLM-5.3-Flash row, which was re-measured as the middle of three back-to-back runs of its documented command; the Edge0-35B-A3B and Qwen3.8-27B rows were measured as the middle of three back-to-back runs of their documented commands, with `--features cuda` (which differs from `flash-attn` only in ff-h3 code paths these two adapters do not exercise). Wall time includes loading, initialization, inference and output writing. Peak RSS measures resident process memory and excludes the OS page cache. GPU usage is sampled across the device once per second, so brief peaks may be missed. Timings depend on inputs, cache state and hardware.
+Each row is one run; cases ran sequentially with OS caches retained, except the cold H3 test described below and the GLM-5.3-Flash row, which was re-measured as the middle of three back-to-back runs of its documented command; the Edge0-35B-A3B and Qwen3.8-27B rows were measured as the middle of three back-to-back runs of their documented commands, with `--features cuda` (which differs from `flash-attn` only in ff-h3 code paths these two adapters do not exercise). Wall time includes loading, initialization, inference and output writing. Peak RSS measures resident process memory and excludes the OS page cache. GPU usage is sampled across the device once per second, so brief peaks may be missed. Timings depend on inputs, cache state and hardware.
 
 | Model | Workload and output | Wall time | Peak RSS | Sampled GPU peak |
 |---|---|---:|---:|---:|
 | [GLM-5.3-Flash](#glm-53-flash) | Generated 32 tokens from a 20-token prompt | 74.80 s | 1.59 GiB | 21.59 GiB |
-| [MiniMax-H3](#minimax-h3) | Generated 107 frames in 49 evaluations for a 768p, 16:9, 4-second request | 1,853.57 s | 58.82 GiB | 20.92 GiB |
+| [MiniMax-H3](#minimax-h3) | Single-evaluation resource-fit test on RTX 5090: 107 frames and audio, 768p, 16:9, 4-second request | 342.10 s | 62.92 GiB | 31.17 GiB |
 | [MiniCPM5-2B](#minicpm5-2b-and-dspark) | Generated 31 tokens with a 32-token limit | 5.34 s | 1.10 GiB | 4.62 GiB |
 | [MiniCPM5-2B + DSpark](#minicpm5-2b-and-dspark) | Generated 31 tokens with a 32-token limit | 2.24 s | 1.10 GiB | 5.17 GiB |
 | [Edge0-35B-A3B](#edge0-35b-a3b) | Generated 128 tokens with a 128-token limit (streamed experts) | 17.50 s | 9.27 GiB | 2.14 GiB |
@@ -28,7 +28,7 @@ Image tests used a fixed procedural chair pattern at each required resolution. D
 
 From the repository root, install the CUDA CLI with `cargo install --locked --path . --features flash-attn`. The examples assume `ff` is on `PATH`.
 
-Replace checkpoint and image placeholders with your own paths. Use a fresh output path for each timed run. MiniCPM, Music3 and TRELLIS use automatic device residency; H3 and GLM use the cache settings shown below. Size memory budgets for your machine.
+Replace checkpoint and image placeholders with your own paths. Use a fresh output path for each timed run. MiniCPM, Music3 and TRELLIS use automatic device residency; H3 derives its host cache at setup, while GLM uses the cache settings shown below. Size explicit memory budgets for your machine.
 
 ```bash
 mkdir -p output
@@ -41,6 +41,8 @@ The recorded run achieved **0.87 tokens/s** of decode: 32 tokens in 36.663 s of 
 The host/device split is calibrated per machine and per run by `ff bench io`, and the generation command takes it from `--host-profile`; it is not a property of the binary. The calibration behind the recorded figures reported B_P 18.798 GiB/s and B_H 31.248 GiB/s evaluating (8.095 GiB/s end to end), B_P/B_H 0.60 — a 40% host share of a miss set, recorded by the run as `host_expert_share_per_mille: 398`. A prefill/decode split is a function of this calibration as much as of the code, and no recorded split is reproducible without it.
 
 The documented command sets six host expert workers; the three recorded runs used 372%, 373% and 377% of one CPU and read 137–147 GiB each from storage, against a 306 GiB checkpoint on a 62 GiB host. Wall time depends on available host CPU and storage state. The expert-cache counters did not move by a single count across the three recorded runs (2831 hits / 38140 misses / 26906 evictions at 256 entries), while the host weight-cache counters varied between them.
+
+The existing calibration also records streaming-reader timing ranges and CPU percentages on Linux. Its default one-warmup/five-sample sweep caps logical read work, including warming, at one checkpoint expert-payload pass and derives a wall-time allowance from the first candidate round. GLM generation requires an explicit `--host-profile`, or both `FF_GLM_PREFETCH_THREADS` and `FF_GLM_PINNED_FILL_THREADS` set; with neither the command refuses with `missing --host-profile` (src/cli/glm.rs:143-162), and a run that has a profile still takes its reader counts from it, with the overrides applying after setup selection. The profile is written under schema version 3 (`LOCAL_IO_BENCHMARK_SCHEMA_VERSION`, src/interconnect_benchmark.rs:33), and profiles from older schemas are rejected. A profile whose GLM I/O section or checkpoint config stamp does not match the current run is refused with a request to rerun `ff bench io --profile local-interconnect` (src/host_profile.rs:161-166).
 
 Create the profile on the machine running inference; calibration is separate from the generation timing:
 
@@ -56,17 +58,18 @@ ff text generate \
     --prompt 'Explain paging to a systems programmer.' \
     --device cuda:0 --max-new-tokens 32 --temperature 0 --seed 42 \
     --weight-source mmap \
-    --expert-cache-layout shared-pool --expert-cache-replacement lfu \
-    --expert-cache-mib 4096 \
+    --expert-cache-layout shared-pool --expert-cache-mib 4096 \
     --host-profile output/glm-host-profile.json --pinned-fp8-transfer \
     --json
 ```
 
-These settings use buffered reads, six host expert workers and one fill-ahead worker. The current GLM text profile handles one request at a time with at most 2,048 prompt-plus-generated tokens and requires `--weight-source mmap`. Use `ff text generate-multi --help` for CUDA layer partitioning across devices.
+These settings use buffered reads, six host expert workers and one fill-ahead worker (see [Environment variables](environment-variables.md#glm-53-flash)). The current GLM text profile handles one request at a time with at most 2,048 prompt-plus-generated tokens and requires `--weight-source mmap`. Use `ff text generate-multi --help` for CUDA layer partitioning across devices. Use `--transport host` for layer partitioning when peer copies are not reliable.
+
+The multi-device CLI sizes its KV allowance for the supplied requests while enforcing `--max-context-tokens` as the input limit. Automatic expert-cache sizing can use the resulting headroom. The default cache layout divides the total byte budget across sparse layers (`ExpertCacheLayout::PerLayerSplit`, crates/ff-glm/src/expert_cache_manager.rs:6-13; `--expert-cache-layout` resolves to it at src/cli/glm.rs:241) with least-frequently-used eviction that breaks ties on the access clock (crates/ff-glm/src/expert_cache.rs:44-51); `--expert-cache-layout shared-pool` lets all projections share one byte pool instead.
 
 ### MiniMax-H3
 
-The official example target is **768, 16:9, 4 s with 49 model evaluations**. The measured execution uses FlashAttention, larger compute chunks and a host cache that retains the transformer shards. Set `--max-host-mib` to a memory budget your host can sustain; the values here describe the measured machine.
+The official example target is **768, 16:9, 4 s with 49 model evaluations**. The measured resource-fit command below uses one evaluation, online attention and an automatically sized host cache. Its output is a load, numerical-identity and memory-fit test. For the 49-evaluation workload, set `--sigma-points 50`; FlashAttention additionally requires its build feature and `--flash-attention`.
 
 ```bash
 ff video generate \
@@ -74,16 +77,18 @@ ff video generate \
     --prompt 'A fishing boat crossing a calm lake at sunrise.' \
     --device cuda:0 \
     --short-edge 768 --aspect-ratio 16:9 --duration-seconds 4 \
-    --sigma-points 50 --seed 42 --flash-attention \
+    --sigma-points 2 --seed 42 --explain-config \
     --attention-projection-chunk-size 4096 \
     --ffn-token-chunk-size 1024 --output-token-chunk-size 1024 \
-    --weight-source memory --host-cache-mib 64700 --max-host-mib 66000 \
+    --weight-source memory \
     --output-dir output/h3-example
 ```
 
-The target resolves to **1344×768, 107 frames (4.458 s)**. Total time was **30m 53.57s**, with a steady denoise rate of **24.2 s/evaluation**. Text encoding took 49.06 s, static-context preparation including weight loading took 434.99 s, and overlapping video/audio decode took 152.96 s. Total time includes these stages.
+The target resolves to **1344×768, 107 frames (4.458 s)**. The RTX 5090 test took **342.10 s** monitored wall time: encoding 59.75 s, static-context preparation 17.48 s, one denoise evaluation 161.62 s, and overlapping video/audio decode 98.65 s. One eviction pass followed by a residency check found zero resident pages across all 32 T2VA weight files before launch. The sustained 4 GiB direct-read gate measured 5.01 GB/s. Completion monitoring adds up to one second to wall time.
 
-On CUDA, H3 prefetches each stage's weights on a second stream while the current stage computes, which shortens cold runs by roughly a quarter; `FF_H3_PREFETCH=0` restores synchronous loading.
+The derived host cache was 66,281,537,536 B, with a modeled bound of 62.23 GiB and a separate 1 GiB reservation. Observed process RSS peaked at 62.92 GiB and sampled cgroup usage at 68.24 GiB, below the 90 GiB hard limit; no soft-limit, hard-limit or OOM event occurred. The modeled allocation bound is not an observed RSS ceiling. The matched loader reference and modified builds produced byte-identical final latent files. Earlier local measurements encountered sustained storage degradation near 63 MB/s; storage health must be checked before interpreting cold-load timings. These one-evaluation figures do not provide a new timing for the 49-evaluation workload.
+
+On CUDA, H3 prefetches each stage's weights on a second stream while the current stage computes, which shortens cold runs by roughly a quarter; `FF_H3_PREFETCH` restores synchronous loading (see [Environment variables](environment-variables.md#minimax-h3)).
 
 A successful run writes PNGs under `frames/`, `generated.wav` and recovery checkpoints. Reusing the output directory resumes an interrupted run. Use `ff video --help` for first/last-frame and reference-conditioning workflows.
 
@@ -106,33 +111,44 @@ ff text generate \
 
 ### Edge0-35B-A3B
 
-Edge0-35B-A3B is a groupwise-int4 hybrid GDN/full-attention MoE checkpoint. Generation is greedy and stops at the checkpoint's end-of-sequence tokens or `--max-new-tokens`, whichever comes first. CUDA decoding uploads the static projections to the `--device` ordinal; `--resident-experts` additionally uploads the MoE expert set after a capacity planner verifies the device can hold it.
+Edge0-35B-A3B is a groupwise-int4 hybrid GDN/full-attention MoE checkpoint. Generation is greedy and stops at the checkpoint's end-of-sequence tokens or `--max-new-tokens`, whichever comes first. CUDA decoding uploads the static projections to the `--device` ordinal; `--resident-experts` additionally uploads the MoE expert set after a capacity planner verifies the device can hold it. CUDA runs also require a persisted group4 kernel-body record: pass `--host-profile <path>`, calibrated by `ff bench group4 --adapter edge0 --model "<edge0-checkpoint>" --device cuda:N --host-profile <path>`, or force a body explicitly with `FF_GROUP4_BODY` ([Environment variables](environment-variables.md#qwen38-27b); src/cli/edge0.rs:20, :140-141, crates/ff-edge0/src/gpu.rs:395-410).
+
+The `acceptance_gate` example runs the Edge0 acceptance checks: LoRA-presence and device-versus-host magnitude comparisons on representative lora'd projections, and greedy decode IDs against fixed reference prompts (`cargo run --locked --release -p ff-edge0 --features cuda --example acceptance_gate`; crates/ff-edge0/examples/acceptance_gate.rs:1-20).
 
 ```bash
 ff text generate \
     --model "<edge0-checkpoint>" \
     --prompt 'Explain paging to a systems programmer.' \
-    --device cuda:0 --max-new-tokens 128
+    --device cuda:0 --host-profile "<group4-profile>" --max-new-tokens 128
 
 ff text generate \
     --model "<edge0-checkpoint>" \
     --prompt 'Explain paging to a systems programmer.' \
-    --device cuda:0 --resident-experts --max-new-tokens 128
+    --device cuda:0 --resident-experts --host-profile "<group4-profile>" \
+    --max-new-tokens 128
 ```
 
 ### Qwen3.8-27B
 
+CUDA text generation uses packed int4 MLP prefill when it preserves weight residency, and falls back to GEMV when the packed workspace would reduce residency (crates/ff-qwen35/src/gpu.rs:786-792). `QWEN35_PREFILL` pins a backend explicitly (see [Environment variables](environment-variables.md#qwen38-27b)).
+
+`ff text serve` keeps the model loaded across independent greedy HTTP requests on one or multiple CUDA devices, including weight-streamed plans (src/cli/qwen35.rs:21-22; `--max-context` defaults to 4096 at src/cli/qwen35/serve.rs:19-20).
+
 Qwen3.8-27B is a dense groupwise-int4 checkpoint with an optional vision tower, with the same greedy decoding and end-of-sequence stop. Pass a PNG with `--image` to ground the prompt; the tower runs on the host. CUDA decoding accepts one ordinal or a comma-separated list (`cuda:0,1`), partitioning transformer layers across the listed devices in order; the run fails fast when the checkpoint and KV cache exceed free VRAM on the listed devices.
+
+CUDA int4 runs of `ff text generate` and `ff text serve` require a persisted group4 kernel-body record: pass `--host-profile <path>`, calibrated by `ff bench group4 --adapter qwen35 --model "<qwen35-checkpoint>" --device cuda:N --host-profile <path>`, or force a body explicitly with `FF_GROUP4_BODY` ([Environment variables](environment-variables.md#qwen38-27b)). 16-bit checkpoints skip the requirement (src/cli/qwen35.rs:548-551; the same check runs for serving at src/cli/qwen35/serve/engine.rs:43-48; the refusal text is at src/host_profile.rs:138-145). The calibration measures three independent replays of the real decode graph per body (src/cli/calibrate_io.rs:396). Speculative decoding reads a column-2 record: calibrate it with `ff bench group4 ... --speculative --rounds <rounds>`, where `--rounds` must cover the verify window (src/cli/qwen35.rs:557-559; the Edge0 error text names the pair at crates/ff-edge0/src/gpu.rs:405-409).
+
+The `logit_dump` example writes teacher-forced full-vocabulary logit dumps, self-checks greedy agreement, runs a perplexity pass and the 13-case numerical corpus comparison (`cargo run --locked --release -p ff-qwen35 --features cuda --example logit_dump`; crates/ff-qwen35/examples/logit_dump.rs:1-22). `QWEN35_CHECK_DEVICES` selects its device list (see [Environment variables](environment-variables.md#qwen38-27b)), and CUDA int4 runs of the example set `FF_GROUP4_BODY` as above.
 
 ```bash
 ff text generate \
     --model "<qwen35-checkpoint>" \
     --prompt 'Explain paging to a systems programmer.' \
-    --device cuda:0 --max-new-tokens 128
+    --device cuda:0 --host-profile "<group4-profile>" --max-new-tokens 128
 
 ff text generate \
     --model "<qwen35-checkpoint>" \
-    --device cuda:0,1 --max-new-tokens 128
+    --device cuda:0,1 --host-profile "<group4-profile>" --max-new-tokens 128
 ```
 
 The image example needs a prepared RGB PNG:

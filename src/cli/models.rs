@@ -154,3 +154,96 @@ pub(super) fn run(command: ModelsCommand) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{Device, Tensor};
+    use flyingfish::models::ModelFamily;
+    use flyingfish::qwen35::config::{QUANTIZATION_FORMAT, QWEN35_ARCHITECTURE};
+    use flyingfish::runtime::weights::CacheGranularity;
+    use serde_json::json;
+
+    #[test]
+    fn tensor_command_uses_qwen_model_components() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        Tensor::new(&[1f32, 2.], &Device::Cpu)?
+            .save_safetensors("weight", root.path().join("part.safetensors"))?;
+        std::fs::write(
+            root.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{"total_size":8.0},"weight_map":{"weight":"part.safetensors"}}"#,
+        )?;
+        let args = WeightCacheArgs {
+            weight_source: WeightSource::Mmap,
+            host_cache_mib: None,
+            host_cache_granularity: CacheGranularity::Shard,
+        };
+        for quantization in [
+            serde_json::Value::Null,
+            json!({"format": QUANTIZATION_FORMAT}),
+        ] {
+            let mut config = json!({"architectures": [QWEN35_ARCHITECTURE]});
+            if !quantization.is_null() {
+                config["quantization"] = quantization;
+            }
+            std::fs::write(
+                root.path().join("config.json"),
+                serde_json::to_vec(&config)?,
+            )?;
+            let model = LocalModel::open(root.path(), None)?;
+            assert_eq!(model.family, ModelFamily::Qwen35);
+            assert!(model.dependencies.is_empty());
+            assert_eq!(model.components.len(), 1);
+            assert_eq!(model.component("model")?.directory, root.path());
+            assert!(model.component("missing").is_err());
+            run(ModelsCommand::Tensor {
+                model: root.path().to_owned(),
+                models_root: None,
+                component: "model".into(),
+                name: "weight".into(),
+                device: "cpu".into(),
+                weights: args,
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires FF_MODELS_DIR with Qwen/Qwen3.8-27B and Qwen/Qwen3.8-27B-int4-rtn"]
+    fn local_qwen_tensor_metadata_without_payload_access() -> Result<()> {
+        for checkpoint in ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-int4-rtn"] {
+            let model = ff_core::paths::checkpoint_dir(checkpoint)
+                .filter(|model| model.is_dir())
+                .unwrap_or_else(|| panic!("requires FF_MODELS_DIR with {checkpoint}"));
+            let model = model.canonicalize()?;
+            println!("model: {}", model.display());
+            run(ModelsCommand::Inspect {
+                model: model.clone(),
+                models_root: None,
+                verify: false,
+                json: true,
+            })?;
+            let model = LocalModel::open(&model, None)?;
+            assert_eq!(model.family, ModelFamily::Qwen35);
+            let weights = model
+                .component("model")?
+                .open_weights(WeightSource::Mmap, CachePolicy::new(1))?;
+            let name = weights.tensor_names().next().unwrap();
+            let metadata = weights.raw_tensor_metadata(name)?;
+            let stats = weights.cache_stats();
+            assert_eq!(stats.misses, 0);
+            assert_eq!(stats.memory_source_reads, 0);
+            assert_eq!(stats.resident_bytes, 0);
+            assert_eq!(weights.access_stats().device_tensor_materializations, 0);
+            println!(
+                "{checkpoint}: indexed_bytes={:?}, {name} dtype={:?} shape={:?} bytes={}, payload_misses={}",
+                weights.inventory().indexed_bytes,
+                metadata.dtype,
+                metadata.shape,
+                metadata.bytes,
+                stats.misses,
+            );
+        }
+        Ok(())
+    }
+}

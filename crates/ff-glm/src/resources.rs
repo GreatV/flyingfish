@@ -112,7 +112,7 @@ mod tests {
     fn profile(device_bytes: u64) -> TopologyProfile {
         TopologyProfile {
             schema_version: ff_core::topology::TOPOLOGY_PROFILE_SCHEMA_VERSION,
-            fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu),
+            fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu).unwrap(),
             host_memory_total_bytes: Some(62 << 30),
             cgroup_memory_limit_bytes: None,
             peer_links: Vec::new(),

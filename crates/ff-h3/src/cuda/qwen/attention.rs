@@ -15,13 +15,12 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-const HEAD_MEAN_CUDA_MODULE: &str = "flyingfish_qwen_head_mean_pytorch_7269437";
+const HEAD_MEAN_CUDA_MODULE: &str = "flyingfish_mean_pytorch_7269437";
 
 pub(crate) const HEAD_RMS_NORM_BACKEND: &str = concat!(
     "pytorch-reduce-mean-f32-width128|5120@7269437d655783a26cba32aa88195b741ff496aa/",
-    "source-sha256:ece80cefdf02a3ccc1dc5dc360d3065fa34324d1cb221a3ad887c329aa663280/",
     env!("FLYINGFISH_H3_RMS_NORM_PTX_ARCH"),
-    "/qwen-rsqrt:pytorch-unary-rsqrt-f32@7269437d655783a26cba32aa88195b741ff496aa",
+    "/rsqrt:pytorch-unary-rsqrt-f32@7269437d655783a26cba32aa88195b741ff496aa",
     "/shape-profile:text357|1935|8620-q64|k8-head128-hidden5120-v4"
 );
 
@@ -78,12 +77,12 @@ impl CustomOp1 for PytorchMeanWidth128F32 {
         let mut output = unsafe { device.alloc::<f32>(rows) }?;
         let function = crate::cuda::kernel_assets::load_function(
             &device,
-            &crate::cuda::kernel_assets::QWEN_HEAD_MEAN_F32,
+            &crate::cuda::kernel_assets::MEAN_F32,
             HEAD_MEAN_CUDA_MODULE,
             if width == 128 {
-                "qwen_head_mean_width128_f32"
+                "mean_width128_f32"
             } else {
-                "qwen_hidden_mean_width5120_f32"
+                "mean_width5120_f32"
             },
         )?;
         let stream = device.cuda_stream();
@@ -140,7 +139,7 @@ pub(crate) fn hidden_rms_norm_width5120(
     }
     let input_f32 = input.to_dtype(DType::F32)?;
     let variance = input_f32.sqr()?.apply_op1_no_bwd(&PytorchMeanWidth128F32)?;
-    let inverse_root = crate::cuda::rms_norm::qwen_rsqrt(&(&variance + epsilon)?)?;
+    let inverse_root = crate::cuda::rms_norm::rsqrt(&(&variance + epsilon)?)?;
     weight.broadcast_mul(
         &input_f32
             .broadcast_mul(&inverse_root)?
@@ -177,7 +176,7 @@ pub(crate) fn head_rms_norm_width128(
     crate::cuda::device::require_tuned_kernel(cuda)?;
     let input_f32 = input.to_dtype(DType::F32)?;
     let variance = input_f32.sqr()?.apply_op1_no_bwd(&PytorchMeanWidth128F32)?;
-    let inverse_root = crate::cuda::rms_norm::qwen_rsqrt(&(&variance + epsilon)?)?;
+    let inverse_root = crate::cuda::rms_norm::rsqrt(&(&variance + epsilon)?)?;
     let pre_weight = input_f32
         .broadcast_mul(&inverse_root)?
         .to_dtype(DType::BF16)?;
@@ -185,10 +184,9 @@ pub(crate) fn head_rms_norm_width128(
 }
 
 pub(crate) const QK_PV_BACKEND: &str = "nvidia-rtx4090-sm89-sm128-driver595.84-cublaslt130401/bf16-compute32-no-bias/workspace-4194304/heuristic-first/official-strided-qk-pv-descriptors/shape-profile:text357-fullq357|text1935-query256-tail143|text8620-query256-tail172-operator-reference-q64-kv8-head128-v3";
-const SCALE_CUDA_MODULE: &str = "flyingfish_qwen_attention_scale_pytorch_7269437";
+const SCALE_CUDA_MODULE: &str = "flyingfish_scale_pytorch_7269437";
 pub(crate) const SCALE_BACKEND: &str = concat!(
     "pytorch-binary-mul-bf16-cuda@7269437d655783a26cba32aa88195b741ff496aa/",
-    "source-sha256:9dcf411ce2d3dfb5aeb708788488206e6761c8bf6dd0d6a0dbd2c41506e9306d/",
     env!("FLYINGFISH_H3_RMS_NORM_PTX_ARCH"),
     "/shape-profile:text357x357-query101|256|357|text1935x1935-query143|256|text8620x8620-query172|256-operator-reference|vision4032x4032-query192|256|4032-v3"
 );
@@ -250,9 +248,9 @@ impl candle_core::CustomOp1 for PytorchBf16Scale {
         let mut output = unsafe { device.alloc::<half::bf16>(elements) }?;
         let function = crate::cuda::kernel_assets::load_function(
             &device,
-            &crate::cuda::kernel_assets::QWEN_ATTENTION_SCALE_BF16,
+            &crate::cuda::kernel_assets::SCALE_BF16,
             SCALE_CUDA_MODULE,
-            "qwen_attention_scale_bf16",
+            "scale_bf16",
         )?;
         let stream = device.cuda_stream();
         let mut builder = stream.launch_builder(&function);

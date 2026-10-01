@@ -508,7 +508,7 @@ impl VisionTower {
         let device = Device::Cpu;
         let mut tensors = BTreeMap::new();
         let mut load = |name: &str| -> Result<()> {
-            let (shape, values) = weights.bf16_tensor(name)?;
+            let (shape, values) = weights.tensor_f32(name)?;
             tensors.insert(name.to_string(), Tensor::from_vec(values, shape, &device)?);
             Ok(())
         };
@@ -875,16 +875,18 @@ mod tests {
     /// vs the HF bf16 fixture. Our side is f32, HF runs bf16 — the gate is
     /// at the bf16 rounding floor class (measured margins, not bit-exact).
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with Qwen/Qwen3.8-27B-int4-rtn"]
     fn tower_matches_hf_fixture() {
-        let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4") else {
-            return;
-        };
+        let dir = checkpoint_dir("Qwen/Qwen3.8-27B-int4-rtn")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with Qwen/Qwen3.8-27B-int4-rtn");
         let dir = &dir;
         let fixture_path = Path::new("src/testdata/vision_tower_fixture.json");
         let png = Path::new("src/testdata/vision_test.png");
-        if !dir.exists() || !fixture_path.exists() || !png.exists() {
-            return;
-        }
+        assert!(
+            fixture_path.exists() && png.exists(),
+            "vision fixtures must be committed under src/testdata"
+        );
         #[derive(Deserialize)]
         struct TowerFixture {
             shape: Vec<usize>,

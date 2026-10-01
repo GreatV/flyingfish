@@ -1,6 +1,4 @@
-use super::expert_cache::{
-    ExpertCache, ExpertCacheReplacementPolicy, ExpertCacheResize, ExpertCacheStats,
-};
+use super::expert_cache::{ExpertCache, ExpertCacheResize, ExpertCacheStats};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +28,6 @@ pub struct ExpertCacheManagerResize {
 /// owns whether that bound is split or shared.
 pub struct ExpertCacheManager {
     layout: ExpertCacheLayout,
-    replacement: ExpertCacheReplacementPolicy,
     layer_to_cache: Vec<Option<usize>>,
     caches: Vec<ExpertCache>,
 }
@@ -42,7 +39,6 @@ impl ExpertCacheManager {
         sparse_layers: &[usize],
         total_max_bytes: usize,
         layout: ExpertCacheLayout,
-        replacement: ExpertCacheReplacementPolicy,
     ) -> Result<Self> {
         if sparse_layers.is_empty() {
             ensure!(
@@ -51,25 +47,17 @@ impl ExpertCacheManager {
             );
             return Ok(Self {
                 layout,
-                replacement,
                 layer_to_cache: vec![None; num_layers],
                 caches: vec![],
             });
         }
-        Self::new(
-            num_layers,
-            sparse_layers,
-            total_max_bytes,
-            layout,
-            replacement,
-        )
+        Self::new(num_layers, sparse_layers, total_max_bytes, layout)
     }
     pub fn new(
         num_layers: usize,
         sparse_layers: &[usize],
         total_max_bytes: usize,
         layout: ExpertCacheLayout,
-        replacement: ExpertCacheReplacementPolicy,
     ) -> Result<Self> {
         ensure!(num_layers > 0, "expert cache manager requires model layers");
         ensure!(
@@ -95,7 +83,7 @@ impl ExpertCacheManager {
                     .enumerate()
                     .map(|(cache_index, (layer, quota))| {
                         layer_to_cache[layer] = Some(cache_index);
-                        ExpertCache::with_replacement(quota, replacement)
+                        ExpertCache::new(quota)
                     })
                     .collect()
             }
@@ -103,12 +91,11 @@ impl ExpertCacheManager {
                 for &layer in sparse_layers {
                     layer_to_cache[layer] = Some(0);
                 }
-                vec![ExpertCache::with_replacement(total_max_bytes, replacement)]
+                vec![ExpertCache::new(total_max_bytes)]
             }
         };
         let manager = Self {
             layout,
-            replacement,
             layer_to_cache,
             caches,
         };
@@ -121,10 +108,6 @@ impl ExpertCacheManager {
 
     pub fn layout(&self) -> ExpertCacheLayout {
         self.layout
-    }
-
-    pub fn replacement(&self) -> ExpertCacheReplacementPolicy {
-        self.replacement
     }
 
     pub fn cache_for_layer(&self, layer: usize) -> Result<&ExpertCache> {
@@ -277,7 +260,6 @@ mod tests {
             &[12, 13],
             101,
             ExpertCacheLayout::PerLayerSplit,
-            ExpertCacheReplacementPolicy::Lru,
         )
         .unwrap();
         assert_eq!(cache.cache_for_layer(12).unwrap().stats().max_bytes, 51);
@@ -287,27 +269,11 @@ mod tests {
             ExpertCacheLayout::PerLayerSplit,
             ExpertCacheLayout::SharedPool,
         ] {
-            let empty = ExpertCacheManager::for_owned_layers(
-                45,
-                &[],
-                0,
-                layout,
-                ExpertCacheReplacementPolicy::Lru,
-            )
-            .unwrap();
+            let empty = ExpertCacheManager::for_owned_layers(45, &[], 0, layout).unwrap();
             assert_eq!(empty.stats().unwrap().max_bytes, 0);
             empty.resize(0).unwrap();
             assert!(empty.resize(1).is_err());
-            assert!(
-                ExpertCacheManager::for_owned_layers(
-                    45,
-                    &[],
-                    1,
-                    layout,
-                    ExpertCacheReplacementPolicy::Lru
-                )
-                .is_err()
-            );
+            assert!(ExpertCacheManager::for_owned_layers(45, &[], 1, layout).is_err());
         }
     }
     use candle_core::{DType, Device, Tensor};
@@ -322,14 +288,7 @@ mod tests {
             ExpertCacheLayout::PerLayerSplit,
             ExpertCacheLayout::SharedPool,
         ] {
-            let manager = ExpertCacheManager::new(
-                5,
-                &[1, 3, 4],
-                11,
-                layout,
-                ExpertCacheReplacementPolicy::Lru,
-            )
-            .unwrap();
+            let manager = ExpertCacheManager::new(5, &[1, 3, 4], 11, layout).unwrap();
             assert_eq!(manager.stats().unwrap().max_bytes, 11);
             assert!(manager.cache_for_layer(0).is_err());
             for layer in [1, 3, 4] {
@@ -340,14 +299,8 @@ mod tests {
 
     #[test]
     fn shared_pool_can_borrow_bytes_and_never_aliases_layer_keys() {
-        let manager = ExpertCacheManager::new(
-            2,
-            &[0, 1],
-            8,
-            ExpertCacheLayout::SharedPool,
-            ExpertCacheReplacementPolicy::Lru,
-        )
-        .unwrap();
+        let manager =
+            ExpertCacheManager::new(2, &[0, 1], 8, ExpertCacheLayout::SharedPool).unwrap();
         assert!(
             manager
                 .cache_for_layer(0)
@@ -383,9 +336,7 @@ mod tests {
             ExpertCacheLayout::PerLayerSplit,
             ExpertCacheLayout::SharedPool,
         ] {
-            let manager =
-                ExpertCacheManager::new(2, &[0, 1], 16, layout, ExpertCacheReplacementPolicy::Lfu)
-                    .unwrap();
+            let manager = ExpertCacheManager::new(2, &[0, 1], 16, layout).unwrap();
             for layer in [0, 1] {
                 let cache = manager.cache_for_layer(layer).unwrap();
                 assert!(cache.insert(format!("layer.{layer}.a"), tensor()));
@@ -420,25 +371,7 @@ mod tests {
 
     #[test]
     fn invalid_sparse_layer_maps_fail_closed() {
-        assert!(
-            ExpertCacheManager::new(
-                3,
-                &[1, 1],
-                8,
-                ExpertCacheLayout::PerLayerSplit,
-                ExpertCacheReplacementPolicy::Lru,
-            )
-            .is_err()
-        );
-        assert!(
-            ExpertCacheManager::new(
-                3,
-                &[3],
-                8,
-                ExpertCacheLayout::SharedPool,
-                ExpertCacheReplacementPolicy::Lru,
-            )
-            .is_err()
-        );
+        assert!(ExpertCacheManager::new(3, &[1, 1], 8, ExpertCacheLayout::PerLayerSplit,).is_err());
+        assert!(ExpertCacheManager::new(3, &[3], 8, ExpertCacheLayout::SharedPool,).is_err());
     }
 }

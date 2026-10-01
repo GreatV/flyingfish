@@ -3,39 +3,34 @@
 
 use crate::int4::GroupQuant;
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::safe::{CudaContext, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::safe::{
+    CudaContext, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg,
+};
 use std::sync::Arc;
 
-// Multi-device scaffolding (mirrors crates/ff-qwen35/src/gpu.rs).
-//
-// `Edge0Gpu` wraps N per-device `GpuContext`s plus a contiguous layer range
-// per device. The single-device case (`Edge0Gpu::new(&[0], ...)`) routes
-// through the existing `Edge0Text::enable_gpu(0, ...)` so token IDs match
-// the current production path bitwise. The multi-device decode-loop
-// integration is the next port and is not wired in this scaffolding pass.
+// Each device runtime owns a contiguous layer range.
 
-/// Contiguous split of `total_layers` into `n_devices` groups whose layer
-/// counts differ by at most one. Hybrid GDN/full-attention layers have
-/// similar byte weight, so a contiguous split tracks the byte-balance the
-/// runtime will produce without per-layer measurement at planning time.
-pub fn partition_layers(total_layers: usize, n_devices: usize) -> Vec<std::ops::Range<usize>> {
-    assert!(n_devices > 0, "partition_layers requires n_devices > 0");
-    let per = total_layers / n_devices;
-    let extra = total_layers % n_devices;
-    let mut out = Vec::with_capacity(n_devices);
-    let mut start = 0usize;
-    for index in 0..n_devices {
-        let take = per + usize::from(index < extra);
-        out.push(start..start + take);
-        start += take;
-    }
-    out
+/// Contiguous layer ranges balanced by projection bytes, one per device.
+fn layer_ranges(
+    weights: &super::weights::Edge0Weights,
+    text: &crate::config::TextConfig,
+    parts: usize,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    ensure!(
+        parts > 0 && parts <= text.num_hidden_layers,
+        "{parts} devices for {} layers",
+        text.num_hidden_layers
+    );
+    let bytes = (0..text.num_hidden_layers)
+        .map(|layer| layer_projection_bytes(weights, text, layer))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ff_core::residency::split_layers_by_bytes(&bytes, parts)
+        .into_iter()
+        .map(|(start, end)| start..end)
+        .collect())
 }
 
-/// Per-device residency plan: the static layer ranges and the byte totals the
-/// planner verified. The streaming-overlay field is reserved for the next
-/// pass; today the device either holds the whole layer range resident or
-/// falls back to CPU streaming via `Edge0Text::enable_gpu`.
+/// Per-device layer range and verified projection, KV and expert byte totals.
 #[derive(Debug, Clone)]
 pub struct DevicePlan {
     pub ordinal: usize,
@@ -53,7 +48,8 @@ pub struct DevicePlan {
 impl DevicePlan {
     /// Free bytes minus the headroom the plan refuses to allocate against.
     pub fn budget(&self) -> u64 {
-        self.free_bytes.saturating_sub(RESIDENCY_MARGIN_BYTES)
+        self.free_bytes
+            .saturating_sub(ff_core::probe::device_admission_reserve_bytes())
     }
 
     pub fn fits(&self) -> bool {
@@ -64,8 +60,8 @@ impl DevicePlan {
 /// Byte cost of one text layer on device, including its two norms and the
 /// kind-specific attention/GDN block plus the shared-expert MLP. We use
 /// `Edge0Weights::shape` for the integer dimensions and apply the int4
-/// u32-packed payload + bf16 scales/biases (uploaded as f32) formula that
-/// matches the production upload path.
+/// u32-packed payload + bf16 scales/biases formula that matches the
+/// production upload path (device bytes equal file bytes).
 fn layer_projection_bytes(
     weights: &super::weights::Edge0Weights,
     text: &crate::config::TextConfig,
@@ -160,15 +156,15 @@ fn projection_bytes_for(weights: &super::weights::Edge0Weights, name: &str) -> R
     let quant = weights
         .quant_projection(name)
         .with_context(|| format!("byte estimate for {name}"))?;
-    // packed: u32, scales/biases: f32 on device.
+    // packed: u32, scales/biases: bf16 on device, as in the file.
     let packed = (quant.packed.len() as u64)
         .checked_mul(4)
         .context("packed bytes overflow")?;
     let scales = (quant.scales.len() as u64)
-        .checked_mul(4)
+        .checked_mul(2)
         .context("scale bytes overflow")?;
     let biases = (quant.biases.len() as u64)
-        .checked_mul(4)
+        .checked_mul(2)
         .context("bias bytes overflow")?;
     packed
         .checked_add(scales)
@@ -221,11 +217,6 @@ fn static_skeleton_bytes(weights: &super::weights::Edge0Weights) -> Result<u64> 
     Ok(total)
 }
 
-/// Headroom the Edge0 residency plan leaves unallocated per device: module
-/// images, runtime scratch, and launch-time allocations the byte accounting
-/// cannot see.
-pub const RESIDENCY_MARGIN_BYTES: u64 = 128 * 1024 * 1024;
-
 /// Per-device byte-balanced residency plan for the static projections, KV
 /// cache, and shared skeleton. Each device receives the projections of its
 /// contiguous layer range plus its share of the KV cache; ordinals[0] also
@@ -249,7 +240,7 @@ pub fn plan_residency(
         free_bytes.len()
     );
     let text = &config.text_config;
-    let ranges = partition_layers(text.num_hidden_layers, ordinals.len());
+    let ranges = layer_ranges(weights, text, ordinals.len())?;
     let kv_stride = (text.num_key_value_heads * text.head_dim) as u64;
     let kv_per_layer = 2u64
         .checked_mul(max_ctx as u64)
@@ -264,16 +255,15 @@ pub fn plan_residency(
     // Per-layer expert bytes. edge0's expert geometry is uniform across
     // layers (enable_gpu enforces `rows[i] == r && in_dim[i] == d`); the
     // per-layer count is therefore the total expert byte budget divided by
-    // the layer count, with bf16 scales/biases doubled for the device
-    // upload. Using `bucket_bytes` keeps the audit on the same path the
+    // the layer count, with scales/biases at their bf16 file size on
+    // device. Using `bucket_bytes` keeps the audit on the same path the
     // single-device planner uses.
     let expert_bytes_per_layer: Vec<u64> = if experts_resident && text.num_hidden_layers > 0 {
         let (expert_packed, expert_sb, _statik_packed, _statik_sb, _embed_packed, _embed_sb) =
             weights.bucket_bytes()?;
-        // Upload multiplies scales/biases by 2x for f32 device storage;
-        // packed weights stay at their on-disk bytes.
+        // Scales/biases stay at their bf16 file size on device.
         let total_device = expert_packed
-            .checked_add(expert_sb.checked_mul(2).context("expert sb overflow")?)
+            .checked_add(expert_sb)
             .context("expert total overflow")?;
         let per = total_device / text.num_hidden_layers as u64;
         vec![per; text.num_hidden_layers]
@@ -317,6 +307,272 @@ pub fn plan_residency(
     Ok(plans)
 }
 
+use ff_core::probe::DecodeChoice;
+
+pub struct GroupKernels {
+    image: String,
+    funcs: [cudarc::driver::CudaFunction; 2],
+    capture: std::sync::atomic::AtomicUsize,
+    force: Option<usize>,
+    choices: std::collections::BTreeMap<u32, DecodeChoice>,
+}
+
+impl GroupKernels {
+    pub fn new(
+        module: &Arc<cudarc::driver::CudaModule>,
+        lora: bool,
+        context: &Arc<CudaContext>,
+        assets: &crate::kernel_assets::KernelAssets,
+    ) -> Result<Self> {
+        let bytes = match assets.select(context.compute_capability()?) {
+            crate::kernel_assets::ImageSelection::Cubin { architecture } => {
+                assets
+                    .cubins
+                    .iter()
+                    .find(|image| image.architecture == architecture)
+                    .context("selected group4 cubin missing")?
+                    .image
+            }
+            crate::kernel_assets::ImageSelection::Ptx => assets.ptx.as_bytes(),
+        };
+        let image = ff_core::probe::image_digest(bytes);
+        let force = match std::env::var("FF_GROUP4_BODY") {
+            Ok(s) => Some(match s.as_str() {
+                "stock" => 0,
+                "xr16" => 1,
+                _ => anyhow::bail!("FF_GROUP4_BODY={s}: expected stock or xr16"),
+            }),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(e) => anyhow::bail!("FF_GROUP4_BODY read failed: {e}"),
+        };
+        if let Some(body) = force {
+            eprintln!(
+                "group4 override: device {} body {}",
+                context.ordinal(),
+                if body == 0 { "stock" } else { "xr16" }
+            );
+        }
+        let names = if lora {
+            ["int4_group4_stock_l", "int4_group4_xr16_l"]
+        } else {
+            ["int4_group4_stock", "int4_group4_xr16"]
+        };
+        Ok(Self {
+            image,
+            funcs: [
+                module
+                    .load_function(names[0])
+                    .with_context(|| format!("{} missing", names[0]))?,
+                module
+                    .load_function(names[1])
+                    .with_context(|| format!("{} missing", names[1]))?,
+            ],
+            capture: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            force,
+            choices: Default::default(),
+        })
+    }
+
+    pub fn image(&self) -> &str {
+        &self.image
+    }
+
+    pub fn forced(&self) -> bool {
+        self.force.is_some()
+    }
+
+    pub fn apply(&mut self, key: &serde_json::Value, records: &[DecodeChoice]) -> Result<()> {
+        if self.force.is_some() {
+            return Ok(());
+        }
+        let matching: Vec<_> = records
+            .iter()
+            .filter(|choice| choice.key() == *key)
+            .collect();
+        ensure!(
+            matching.len() == 1,
+            "group4 record missing/mismatched/ambiguous for {key}; run ff bench group4 --adapter {} --model <checkpoint> --device cuda:{} --host-profile <profile>{}",
+            key["adapter"]
+                .as_str()
+                .context("group4 adapter key missing")?,
+            key["device"],
+            if key["cols"] == 2 {
+                " --speculative --rounds <rounds>"
+            } else {
+                ""
+            }
+        );
+        let choice = matching[0].clone();
+        choice.validate()?;
+        eprintln!("group4 profile: calibrated split {:?}", choice.split);
+        self.bind(choice);
+        Ok(())
+    }
+
+    pub fn capture_body(&self, body: Option<usize>) -> Result<()> {
+        ensure!(
+            body.is_none_or(|i| i < 2),
+            "group4 capture body outside stock/xr16"
+        );
+        self.capture.store(
+            body.unwrap_or(usize::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
+    pub fn fixed(&self, body: usize) -> Result<&cudarc::driver::CudaFunction> {
+        self.funcs
+            .get(body)
+            .context("group4 body outside stock/xr16")
+    }
+
+    pub fn function(&self, cols: u32) -> Result<&cudarc::driver::CudaFunction> {
+        let body = self.capture.load(std::sync::atomic::Ordering::Relaxed);
+        if body < 2 {
+            return self.fixed(body);
+        }
+        self.fixed(self.chosen(cols)?)
+    }
+
+    pub fn bind(&mut self, mut choice: DecodeChoice) -> usize {
+        let derived = usize::from(choice.derived == "xr16");
+        let body = self.force.unwrap_or(derived);
+        choice.body = ["stock", "xr16"][body].into();
+        eprintln!(
+            "group4 decode: device {} cols {} body {} derived {}: {}; stock {:?}, xr16 {:?}, repeats {}, spread {:.6}, capture {:.3} ms replay {:.3} ms total {:.3} ms",
+            choice.device,
+            choice.cols,
+            choice.body,
+            choice.derived,
+            choice.reason,
+            choice.stock,
+            choice.xr16,
+            choice.repeats,
+            choice.spread,
+            choice.capture_ms,
+            choice.replay_ms,
+            choice.setup_ms
+        );
+        self.choices.insert(choice.cols, choice);
+        body
+    }
+
+    pub fn chosen(&self, cols: u32) -> Result<usize> {
+        if let Some(body) = self.force {
+            return Ok(body);
+        }
+        let choice = self.choices.get(&cols).with_context(||format!("group4 record missing for cols {cols}; run ff bench group4 --model <checkpoint> --host-profile <profile>, or set FF_GROUP4_BODY=stock|xr16"))?;
+        Ok(usize::from(choice.body == "xr16"))
+    }
+
+    pub fn choices(&self) -> Vec<DecodeChoice> {
+        self.choices.values().cloned().collect()
+    }
+}
+
+pub struct DecodeProgram {
+    pub device: usize,
+    pub cols: u32,
+    pub capacity: usize,
+    pub capture_ms: f64,
+    pub state_bytes: usize,
+    pub seed_token: u32,
+    pub topology: String,
+}
+
+pub fn probe_decode(
+    stream: &Arc<CudaStream>,
+    program: DecodeProgram,
+    mut prepare: impl FnMut(usize) -> Result<()>,
+    mut run: impl FnMut(usize, usize) -> Result<()>,
+) -> Result<DecodeChoice> {
+    let DecodeProgram {
+        device,
+        cols,
+        capacity,
+        capture_ms,
+        state_bytes,
+        seed_token,
+        topology,
+    } = program;
+    let started = std::time::Instant::now();
+    let events = std::cell::RefCell::new([None, None]);
+    let measured = ff_core::probe::probe_replays(
+        2,
+        capacity,
+        &mut prepare,
+        |i, n| {
+            let start = stream
+                .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .context("decode probe start event")?;
+            run(i, n)?;
+            let end = stream
+                .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .context("decode probe end event")?;
+            events.borrow_mut()[i] = Some((start, end));
+            Ok(())
+        },
+        || stream.synchronize().context("decode probe fence"),
+        |i, _| {
+            let events = events.borrow();
+            let (start, end) = events[i].as_ref().context("decode probe events missing")?;
+            Ok(start
+                .elapsed_ms(end)
+                .context("decode probe elapsed event")? as f64)
+        },
+    )
+    .with_context(|| format!("decode graph probe device {device} cols {cols}"))?;
+    let (derived, separated) = ff_core::probe::probe_choice(&measured.ranges, Some(0))?;
+    let replay_ms = started.elapsed().as_secs_f64() * 1000.0;
+    Ok(DecodeChoice {
+        adapter: String::new(),
+        geometry: serde_json::Value::Null,
+        class: String::new(),
+        settings: serde_json::Value::Null,
+        split: Vec::new(),
+        fingerprint: None,
+        binary: None,
+        image: String::new(),
+        trials: vec![measured.clone()],
+        device,
+        cols,
+        derived: ["stock", "xr16"][derived].into(),
+        body: ["stock", "xr16"][derived].into(),
+        reason: if separated {
+            "separated fastest range"
+        } else {
+            "overlapping ranges; exact stock"
+        }
+        .into(),
+        stock: measured.ranges[0],
+        xr16: measured.ranges[1],
+        repeats: measured.repeats,
+        warmups: 3 * 2 * measured.batches,
+        samples: 12 * 2 * measured.batches,
+        capacity,
+        state_bytes,
+        seed_token,
+        topology,
+        pilot_spread: measured.pilot_spread,
+        spread: measured.spread,
+        capture_ms,
+        replay_ms,
+        setup_ms: capture_ms + replay_ms,
+    })
+}
+
+pub type QuantParts<'a> = (&'a CudaSlice<u32>, &'a CudaSlice<u16>, &'a CudaSlice<u16>);
+pub type GdnParts<'a> = (
+    &'a CudaSlice<f32>,
+    &'a CudaSlice<f32>,
+    &'a CudaSlice<f32>,
+    &'a CudaSlice<f32>,
+    &'a CudaSlice<f32>,
+    &'a CudaSlice<f32>,
+);
+pub type NormPair = (Vec<f32>, Vec<f32>);
+
 pub struct GpuContext {
     pub context: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
@@ -338,7 +594,10 @@ pub struct GpuContext {
     k_add: cudarc::driver::safe::CudaFunction,
     k_attn_qk: cudarc::driver::safe::CudaFunction,
     k_attn_scores: cudarc::driver::safe::CudaFunction,
+    k_attn_scores_bf16: cudarc::driver::safe::CudaFunction,
     k_group4: cudarc::driver::safe::CudaFunction,
+    pub(crate) group: GroupKernels,
+    k_lora_ax: cudarc::driver::safe::CudaFunction,
     k_moe_mega: cudarc::driver::safe::CudaFunction,
     /// Cached co-residency capacity for the mega grid (per-SM blocks x SMs);
     /// queried once — this path is sync-latency-bound.
@@ -350,6 +609,9 @@ pub struct GpuContext {
     k_argmax: cudarc::driver::safe::CudaFunction,
     k_argmax_part: cudarc::driver::safe::CudaFunction,
     k_argmax_final: cudarc::driver::safe::CudaFunction,
+    dummy_f32: CudaSlice<f32>,
+    k_spec_accept_part: cudarc::driver::safe::CudaFunction,
+    k_spec_accept_final: cudarc::driver::safe::CudaFunction,
     k_rmsnorm_zc: cudarc::driver::safe::CudaFunction,
     k_add_rmsnorm_zc: cudarc::driver::safe::CudaFunction,
     k_attn_qk_zc: cudarc::driver::safe::CudaFunction,
@@ -365,6 +627,8 @@ pub struct GpuContext {
     pub sync_count: std::sync::atomic::AtomicU64,
     /// Two-pass argmax partials (128 blocks).
     argmax_scratch: (CudaSlice<f32>, CudaSlice<i32>),
+    accept_scratch_v: CudaSlice<f32>,
+    accept_scratch_i: CudaSlice<i32>,
 }
 
 pub struct LoraGpu {
@@ -375,8 +639,8 @@ pub struct LoraGpu {
 
 pub struct GpuQuant {
     packed: CudaSlice<u32>,
-    scales: CudaSlice<f32>,
-    biases: CudaSlice<f32>,
+    scales: CudaSlice<u16>,
+    biases: CudaSlice<u16>,
     y: CudaSlice<f32>,
     lora: Option<LoraGpu>,
     pub out_dim: usize,
@@ -384,16 +648,45 @@ pub struct GpuQuant {
     bits: u32,
 }
 
+/// The verify round's buffers for [`GpuContext::glue_spec_accept`].
+pub struct SpecAcceptBuffers<'a> {
+    pub logits_a: &'a CudaSlice<f32>,
+    pub logits_b: &'a CudaSlice<f32>,
+    pub draft_id: &'a CudaSlice<i32>,
+    pub hidden_accept: &'a CudaSlice<f32>,
+    pub hidden_reject: &'a CudaSlice<f32>,
+    pub next_token: &'a CudaSlice<i32>,
+    pub pos: &'a CudaSlice<i32>,
+    pub rope_pos: &'a CudaSlice<i32>,
+    pub pos_b: &'a CudaSlice<i32>,
+    pub flag: &'a CudaSlice<f32>,
+}
+
+/// What [`GpuContext::glue_spec_accept`] writes back each round.
+pub struct SpecAcceptOutputs<'a> {
+    pub hidden_sel: &'a mut CudaSlice<f32>,
+    pub mtp_tok: &'a mut CudaSlice<i32>,
+    pub record: &'a mut CudaSlice<f32>,
+    pub round_idx: &'a mut CudaSlice<i32>,
+}
+
 impl GpuContext {
     pub fn new(ordinal: usize) -> Result<Self> {
-        let context = CudaContext::new(ordinal)
-            .with_context(|| format!("failed to init CUDA context on device {ordinal}"))?;
+        let context = CudaContext::new(ordinal).with_context(|| {
+            format!(
+                "CUDA device {ordinal} setup failed; run ff probe --device cuda:{ordinal} --json"
+            )
+        })?;
         // cudarc's per-launch safety events turn on once a second stream
         // exists (the capture stream) and each launch then waits on events
         // recorded before capture — CUDA_ERROR_STREAM_CAPTURE_ISOLATION.
         // Safe here: every slice is allocated, used, and dropped on this
         // one stream, the only cross-stream rule the events enforce.
         unsafe { context.disable_event_tracking() };
+        let dummy_f32 = context
+            .default_stream()
+            .alloc_zeros::<f32>(1)
+            .context("dummy lora alloc failed")?;
         let module =
             crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_GEMV)?;
         let silu_module =
@@ -462,9 +755,21 @@ impl GpuContext {
         let k_attn_scores = glue_module
             .load_function("edge0_attn_scores")
             .context("edge0_attn_scores missing")?;
+        let k_attn_scores_bf16 = glue_module.load_function("edge0_attn_scores_bf16")?;
         let k_group4 = glue_module
             .load_function("edge0_gemv_group4_lora")
             .context("edge0_gemv_group4_lora missing")?;
+        let wide_module =
+            crate::kernel_assets::load_module(&context, &crate::kernel_assets::INT4_GEMV_WIDE)?;
+        let group = GroupKernels::new(
+            &wide_module,
+            true,
+            &context,
+            &crate::kernel_assets::INT4_GEMV_WIDE,
+        )?;
+        let k_lora_ax = glue_module
+            .load_function("edge0_lora_ax")
+            .context("edge0_lora_ax missing")?;
         let mega_module =
             crate::kernel_assets::load_module(&context, &crate::kernel_assets::EDGE0_MEGA)?;
         let k_moe_mega = mega_module
@@ -491,6 +796,12 @@ impl GpuContext {
         let k_argmax_final = glue_module
             .load_function("edge0_argmax_final")
             .context("edge0_argmax_final missing")?;
+        let k_spec_accept_part = glue_module
+            .load_function("edge0_spec_accept_part")
+            .context("edge0_spec_accept_part missing")?;
+        let k_spec_accept_final = glue_module
+            .load_function("edge0_spec_accept_final")
+            .context("edge0_spec_accept_final missing")?;
         // qwen3_5 dense variants: zero-centered norms.
         let k_rmsnorm_zc = glue_module
             .load_function("edge0_rmsnorm_zc")
@@ -517,6 +828,12 @@ impl GpuContext {
             stream.alloc_zeros::<f32>(128).context("argmax pv")?,
             stream.alloc_zeros::<i32>(128).context("argmax pi")?,
         );
+        let accept_scratch_v = stream
+            .alloc_zeros::<f32>(128 * 4)
+            .context("accept scratch v")?;
+        let accept_scratch_i = stream
+            .alloc_zeros::<i32>(128 * 4)
+            .context("accept scratch i")?;
         Ok(Self {
             context,
             stream,
@@ -538,7 +855,10 @@ impl GpuContext {
             k_add,
             k_attn_qk,
             k_attn_scores,
+            k_attn_scores_bf16,
             k_group4,
+            group,
+            k_lora_ax,
             k_moe_mega,
             mega_coresident: std::sync::OnceLock::new(),
             k_read_scatter,
@@ -548,6 +868,9 @@ impl GpuContext {
             k_argmax,
             k_argmax_part,
             k_argmax_final,
+            dummy_f32,
+            k_spec_accept_part,
+            k_spec_accept_final,
             k_rmsnorm_zc,
             k_add_rmsnorm_zc,
             k_attn_qk_zc,
@@ -557,6 +880,8 @@ impl GpuContext {
             sync_count: std::sync::atomic::AtomicU64::new(0),
             launch_count: std::sync::atomic::AtomicU64::new(0),
             argmax_scratch,
+            accept_scratch_v,
+            accept_scratch_i,
         })
     }
 
@@ -621,11 +946,11 @@ impl GpuContext {
             .context("packed upload failed")?;
         let scales = self
             .stream
-            .clone_htod(&quant.scales)
+            .clone_htod(&crate::int4::f32_to_bf16_bits(&quant.scales))
             .context("scales upload failed")?;
         let biases = self
             .stream
-            .clone_htod(&quant.biases)
+            .clone_htod(&crate::int4::f32_to_bf16_bits(&quant.biases))
             .context("biases upload failed")?;
         self.stream.synchronize().context("upload sync failed")?;
         let y = self
@@ -702,8 +1027,8 @@ pub struct GdnUpload<'a> {
 /// The norm tables and geometry one resident-state upload materializes.
 pub struct ResidentUpload<'a> {
     pub hidden_size: usize,
-    pub layer_norms: &'a [(Vec<f32>, Vec<f32>)],
-    pub attn_norms: &'a [(Vec<f32>, Vec<f32>)],
+    pub layer_norms: &'a [NormPair],
+    pub attn_norms: &'a [NormPair],
     pub final_norm: &'a [f32],
     pub q_total: usize,
     pub kv_stride: usize,
@@ -721,11 +1046,11 @@ pub(crate) struct MultiNorms<'a> {
 
 /// The raw QKV projections and their per-head norm weights, pre-rotation.
 pub struct QkvNorm<'a> {
-    pub q_raw: &'a CudaSlice<f32>,
+    pub q_raw: CudaView<'a, f32>,
     pub q_norm_w: &'a CudaSlice<f32>,
-    pub k_raw: &'a CudaSlice<f32>,
+    pub k_raw: CudaView<'a, f32>,
     pub k_norm_w: &'a CudaSlice<f32>,
-    pub v_raw: &'a CudaSlice<f32>,
+    pub v_raw: CudaView<'a, f32>,
 }
 
 /// The attention head geometry: query heads, KV heads, channels per head.
@@ -756,23 +1081,23 @@ pub struct MropeGeom {
 }
 
 /// The shared KV cache buffers, keys before values, with their row stride.
-pub struct KvCache<'a> {
-    pub keys: &'a CudaSlice<f32>,
-    pub values: &'a CudaSlice<f32>,
+pub struct KvCache<'a, T = f32> {
+    pub keys: &'a CudaSlice<T>,
+    pub values: &'a CudaSlice<T>,
     pub stride: usize,
 }
 
 /// The score-stage buffers: queries and gate input in, gated scores out.
 pub struct ScoreBuffers<'a> {
-    pub q: &'a CudaSlice<f32>,
-    pub gate: &'a CudaSlice<f32>,
-    pub out: &'a CudaSlice<f32>,
+    pub q: CudaView<'a, f32>,
+    pub gate: CudaView<'a, f32>,
+    pub out: CudaView<'a, f32>,
 }
 
 /// The QK-stage outputs: rotated queries and gated values.
 pub struct QkOutputs<'a> {
-    pub q_out: &'a CudaSlice<f32>,
-    pub gate_out: &'a CudaSlice<f32>,
+    pub q_out: CudaView<'a, f32>,
+    pub gate_out: CudaView<'a, f32>,
 }
 
 /// The four attention projections of one layer, in forward order.
@@ -961,7 +1286,7 @@ impl GpuContext {
         // Dummy LoRA pointers when the projection has none.
         let (la, lb) = match &q.lora {
             Some(l) => (&l.a, &l.b),
-            None => (&q.scales, &q.biases),
+            None => (&self.dummy_f32, &self.dummy_f32),
         };
         self.launch_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1022,15 +1347,20 @@ impl GpuContext {
         Ok(())
     }
 
-    pub fn gdn_conv_launch(&self, g: &GpuGdn, qkv_y: &CudaSlice<f32>) -> Result<()> {
+    pub fn gdn_conv_launch(
+        &self,
+        g: &GpuGdn,
+        qkv_y: &impl cudarc::driver::DevicePtr<f32>,
+    ) -> Result<()> {
         let conv_dim = g.conv_dim as i32;
         let kernel = g.kernel as i32;
+        let (qkv_y, _qkv_y_guard) = qkv_y.device_ptr(&self.stream);
         self.launch_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             self.stream
                 .launch_builder(&self.gdn_conv)
-                .arg(qkv_y)
+                .arg(&qkv_y)
                 .arg(&g.conv1d_w)
                 .arg(&g.conv_state)
                 .arg(&g.conv_out)
@@ -1051,23 +1381,19 @@ impl GpuContext {
     pub fn gdn_conv_heads(
         &self,
         g: &GpuGdn,
-        qkv_y: &CudaSlice<f32>,
-        z: &CudaSlice<f32>,
-        b: &CudaSlice<f32>,
-        a: &CudaSlice<f32>,
+        qkv_y: &impl cudarc::driver::DevicePtr<f32>,
+        z: &impl cudarc::driver::DevicePtr<f32>,
+        b: &impl cudarc::driver::DevicePtr<f32>,
+        a: &impl cudarc::driver::DevicePtr<f32>,
+        out: &impl cudarc::driver::DevicePtr<f32>,
     ) -> Result<()> {
         self.gdn_conv_launch(g, qkv_y)?;
-        self.gdn_heads_launch(g, &g.conv_out, z, b, a)
+        self.gdn_heads_launch(g, &g.conv_out, z, b, a, out)
     }
 
     /// The heads kernel's output scratch (out_proj's input).
     pub fn gdn_out_buf<'a>(&self, g: &'a GpuGdn) -> &'a CudaSlice<f32> {
         &g.out
-    }
-
-    /// The conv kernel's output scratch (heads' input).
-    pub fn gdn_conv_buf<'a>(&self, g: &'a GpuGdn) -> &'a CudaSlice<f32> {
-        &g.conv_out
     }
 
     /// Mutable state accessors for the reject-restore (dtod scratch copy).
@@ -1078,22 +1404,8 @@ impl GpuContext {
         (&mut g.conv_state, &mut g.recurrent)
     }
 
-    /// Speculative-verify access to a GDN layer's tensors:
-    /// (conv_w, a_log, dt_bias, norm_w, conv_state, recurrent).
-    /// Kernels write the state buffers through these shared refs, as
-    /// everywhere else in this module.
-    #[allow(clippy::type_complexity)]
-    pub fn gdn_parts<'a>(
-        &self,
-        g: &'a GpuGdn,
-    ) -> (
-        &'a CudaSlice<f32>,
-        &'a CudaSlice<f32>,
-        &'a CudaSlice<f32>,
-        &'a CudaSlice<f32>,
-        &'a CudaSlice<f32>,
-        &'a CudaSlice<f32>,
-    ) {
+    /// GDN buffers: conv weights, a_log, dt_bias, norm weights, conv state and recurrent state.
+    pub fn gdn_parts<'a>(&self, g: &'a GpuGdn) -> GdnParts<'a> {
         (
             &g.conv1d_w,
             &g.a_log,
@@ -1108,28 +1420,33 @@ impl GpuContext {
         &self,
         g: &GpuGdn,
         conv_out: &CudaSlice<f32>,
-        z: &CudaSlice<f32>,
-        b: &CudaSlice<f32>,
-        a: &CudaSlice<f32>,
+        z: &impl cudarc::driver::DevicePtr<f32>,
+        b: &impl cudarc::driver::DevicePtr<f32>,
+        a: &impl cudarc::driver::DevicePtr<f32>,
+        out: &impl cudarc::driver::DevicePtr<f32>,
     ) -> Result<()> {
         let num_v = g.num_v as i32;
         let num_k = g.num_k as i32;
         let dk = g.dk as i32;
         let dv = g.dv as i32;
+        let (z, _z_guard) = z.device_ptr(&self.stream);
+        let (b, _b_guard) = b.device_ptr(&self.stream);
+        let (a, _a_guard) = a.device_ptr(&self.stream);
+        let (out, _out_guard) = out.device_ptr(&self.stream);
         self.launch_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             self.stream
                 .launch_builder(&self.gdn_heads)
                 .arg(conv_out)
-                .arg(z)
-                .arg(b)
-                .arg(a)
+                .arg(&z)
+                .arg(&b)
+                .arg(&a)
                 .arg(&g.a_log)
                 .arg(&g.dt_bias)
                 .arg(&g.norm_w)
                 .arg(&g.recurrent)
-                .arg(&g.out)
+                .arg(&out)
                 .arg(&num_v)
                 .arg(&num_k)
                 .arg(&dk)
@@ -1146,14 +1463,6 @@ impl GpuContext {
         Ok(())
     }
 
-    /// Harness getters for kernel-level parity checks.
-    pub fn gdn_conv_out(&self, g: &GpuGdn) -> Result<Vec<f32>> {
-        let mut host = vec![0f32; g.conv_out.len()];
-        self.stream.memcpy_dtoh(&g.conv_out, &mut host)?;
-        self.stream.synchronize()?;
-        Ok(host)
-    }
-
     pub fn gdn_out(&self, g: &GpuGdn) -> Result<Vec<f32>> {
         let mut host = vec![0f32; g.out.len()];
         self.stream.memcpy_dtoh(&g.out, &mut host)?;
@@ -1163,13 +1472,6 @@ impl GpuContext {
 }
 
 impl GpuQuant {
-    /// Raw weight buffers for the batch-2 verify GEMV (spec.rs drives its
-    /// own kernel; launch() stays the single-column path).
-    #[allow(clippy::type_complexity)]
-    pub fn gemv_parts(&self) -> (&CudaSlice<u32>, &CudaSlice<f32>, &CudaSlice<f32>) {
-        (&self.packed, &self.scales, &self.biases)
-    }
-
     /// Synchronous GEMV: uploads x, launches, copies y back.
     pub fn matvec_sync(&self, ctx: &GpuContext, x: &[f32]) -> Result<Vec<f32>> {
         ensure!(
@@ -1196,8 +1498,12 @@ impl GpuQuant {
         &self.y
     }
 
+    pub fn y_mut(&mut self) -> &mut CudaSlice<f32> {
+        &mut self.y
+    }
+
     /// Device buffers for external wide-shape kernels (additive).
-    pub fn tensors(&self) -> (&CudaSlice<u32>, &CudaSlice<f32>, &CudaSlice<f32>) {
+    pub fn tensors(&self) -> QuantParts<'_> {
         (&self.packed, &self.scales, &self.biases)
     }
 
@@ -1265,28 +1571,598 @@ impl GpuQuant {
 }
 
 #[cfg(test)]
+fn edge_group_names(linear: bool, mega: bool) -> Vec<Vec<&'static str>> {
+    let input = if linear {
+        vec![
+            "linear_attn.in_proj_qkv",
+            "linear_attn.in_proj_z",
+            "linear_attn.in_proj_b",
+            "linear_attn.in_proj_a",
+        ]
+    } else {
+        vec!["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+    };
+    let output = vec![if linear {
+        "linear_attn.out_proj"
+    } else {
+        "self_attn.o_proj"
+    }];
+    let mut groups = vec![input, output];
+    if !mega {
+        groups.push(vec![
+            "mlp.shared_expert.gate_proj",
+            "mlp.shared_expert.up_proj",
+        ]);
+    }
+    groups
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::weights::Edge0Weights;
     use ff_core::paths::checkpoint_dir;
 
+    /// fp64 harness for the v4l grouped gemv + its ax side kernel (the
+    /// report-27 gates). Two passes over the same odd-row shapes: Dyadic
+    /// values (la in {−1/32, 0, 1/32}, x multiples of 1/64 in [−8, 24)) keep
+    /// every partial sum under 2^11 with 2^-11 granularity, so each f32
+    /// accumulation is exact and the ax comparison is the sharpest indexing
+    /// check — bit-zero or it fails. Random bf16 values add the order-sensitive arm with the
+    /// bound stated in the test: |err| <= k*eps_f32*sum|terms|, k being the
+    /// accumulation length of the chain (2048 for ax; 178 for the gemv:
+    /// 64 dot + 64 sumx + 2 rescale + 32 group-sum + 16 epilogue).
     #[test]
-    fn gpu_gemv_matches_cpu_matvec_on_a_real_projection() {
-        let ctx = match GpuContext::new(0) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                eprintln!("no CUDA device ({e}); skipping gpu test");
-                return;
-            }
-        };
-        let Some(checkpoint) = checkpoint_dir("Edge0/Edge0-35B-A3B-preview") else {
-            eprintln!("FF_MODELS_DIR unset; skipping gpu test");
-            return;
-        };
-        if !checkpoint.is_dir() {
-            eprintln!("no Edge0 checkpoint; skipping gpu test");
-            return;
+    #[ignore = "requires a CUDA device"]
+    fn invalid_cuda_device_names_the_probe_command() {
+        let error = GpuContext::new(usize::MAX).err().unwrap().to_string();
+        assert!(error.contains("CUDA device") && error.contains("ff probe"));
+    }
+
+    #[test]
+    fn poisoned_trace_does_not_report_default_counters() {
+        let trace = std::sync::Mutex::new(BatchTrace::default());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = trace.lock().unwrap();
+            panic!("poison the trace");
+        });
+        let error = read_batch_trace(&trace).err().unwrap().to_string();
+        assert!(error.contains("batch_trace") && error.contains("ff text generate"));
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn spec_accept_matches_top2_and_ties() -> Result<()> {
+        let ctx = GpuContext::new(0)?;
+        let mut a = vec![-100.0; 16384];
+        for i in [31, 95, 127, 4095, 16255] {
+            a[i] = 8.0;
         }
+        let mut b = vec![-100.0; a.len()];
+        b[16300] = 16.0;
+        b[170] = 14.0;
+        let logits_a = ctx.upload_f32(&a)?;
+        let logits_b = ctx.upload_f32(&b)?;
+        let accepted_hidden = [5.0, 6.0, 7.0, 8.0, 9.0];
+        let rejected_hidden = [-1.0, -2.0, -3.0, -4.0, -5.0];
+        let hidden_accept = ctx.upload_f32(&accepted_hidden)?;
+        let hidden_reject = ctx.upload_f32(&rejected_hidden)?;
+        for (draft, accepted) in [(16255, true), (16254, false)] {
+            let draft_id = ctx.upload_i32(&[draft])?;
+            let next_token = ctx.upload_i32(&[0])?;
+            let pos = ctx.upload_i32(&[3])?;
+            let rope_pos = ctx.upload_i32(&[3; 3])?;
+            let pos_b = ctx.upload_i32(&[4])?;
+            let flag = ctx.upload_f32(&[0.0])?;
+            let mut hidden_sel = ctx.stream.alloc_zeros::<f32>(5)?;
+            let mut mtp_tok = ctx.upload_i32(&[0])?;
+            let mut record = ctx.stream.alloc_zeros::<f32>(7)?;
+            let mut round_idx = ctx.upload_i32(&[0])?;
+            ctx.glue_spec_accept(
+                &SpecAcceptBuffers {
+                    logits_a: &logits_a,
+                    logits_b: &logits_b,
+                    draft_id: &draft_id,
+                    hidden_accept: &hidden_accept,
+                    hidden_reject: &hidden_reject,
+                    next_token: &next_token,
+                    pos: &pos,
+                    rope_pos: &rope_pos,
+                    pos_b: &pos_b,
+                    flag: &flag,
+                },
+                &mut SpecAcceptOutputs {
+                    hidden_sel: &mut hidden_sel,
+                    mtp_tok: &mut mtp_tok,
+                    record: &mut record,
+                    round_idx: &mut round_idx,
+                },
+                a.len(),
+                5,
+            )?;
+            ctx.stream.synchronize()?;
+            let pending = if accepted { 16300 } else { 16255 };
+            let step = if accepted { 2 } else { 1 };
+            assert_eq!(
+                ctx.stream.clone_dtoh(&record)?,
+                [
+                    if accepted { 1.0 } else { 0.0 },
+                    pending as f32,
+                    0.0,
+                    2.0,
+                    16255.0,
+                    16300.0,
+                    draft as f32
+                ]
+            );
+            assert_eq!(
+                ctx.stream.clone_dtoh(&hidden_sel)?,
+                if accepted {
+                    accepted_hidden
+                } else {
+                    rejected_hidden
+                }
+            );
+            assert_eq!(ctx.stream.clone_dtoh(&next_token)?, [pending]);
+            assert_eq!(ctx.stream.clone_dtoh(&mtp_tok)?, [16255]);
+            assert_eq!(ctx.stream.clone_dtoh(&pos)?, [3 + step]);
+            assert_eq!(ctx.stream.clone_dtoh(&rope_pos)?, [3 + step; 3]);
+            assert_eq!(ctx.stream.clone_dtoh(&pos_b)?, [4 + step]);
+            assert_eq!(ctx.stream.clone_dtoh(&round_idx)?, [1]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA and FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview"]
+    fn group4l_matches_f64() -> Result<()> {
+        let model = checkpoint_dir("Edge0/Edge0-35B-A3B-preview")
+            .context("group4 LoRA fixture requires FF_MODELS_DIR")?;
+        println!("group4 LoRA fixture checkpoint: {}", model.display());
+        let config = crate::config::Edge0Config::from_model_dir(&model)?;
+        let weights = Edge0Weights::open(&model)?;
+        ensure!(
+            weights.lora_rank == 16,
+            "group4 LoRA fixture rank {} differs from 16",
+            weights.lora_rank
+        );
+        let mut shapes = std::collections::BTreeSet::new();
+        for layer in 0..config.text_config.num_hidden_layers {
+            let linear =
+                config.text_config.layer_kind(layer) == crate::config::LayerKind::LinearAttention;
+            for names in edge_group_names(linear, false) {
+                let dims = names
+                    .iter()
+                    .map(|name| {
+                        weights.shape(&format!(
+                            "language_model.model.layers.{layer}.{name}.scales"
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                shapes.insert((
+                    dims[0][1] * 64,
+                    std::array::from_fn::<_, 4, _>(|i| dims.get(i).map_or(0, |d| d[0])),
+                ));
+            }
+        }
+        let ctx = GpuContext::new(0).context("no cuda device")?;
+
+        let (ax_exact, y_dyadic_worst) =
+            harness_pass(&ctx, true, [true; 4], 0, (2048, [37, 1, 16, 5]), 16)?;
+        anyhow::ensure!(
+            ax_exact == 0.0,
+            "dyadic ax must be bit-exact, got {ax_exact:.3e}"
+        );
+        let (ax_rand_ratio, y_rand_ratio) =
+            harness_pass(&ctx, false, [true; 4], 0, (2048, [37, 1, 16, 5]), 16)?;
+        let eps = f32::EPSILON as f64;
+        const AX_TERMS: f64 = 2048.0;
+        const Y_TERMS: f64 = 178.0;
+        anyhow::ensure!(
+            ax_rand_ratio <= AX_TERMS * eps && y_rand_ratio <= Y_TERMS * eps,
+            "random pass exceeds k*eps*sum|terms|: ax ratio {ax_rand_ratio:.3e} vs {}, y ratio {y_rand_ratio:.3e} vs {}",
+            AX_TERMS * eps,
+            Y_TERMS * eps
+        );
+        println!(
+            "dyadic: ax exact, y worst rel {y_dyadic_worst:.3e}; random: worst |err|/sum|terms| ax {ax_rand_ratio:.3e} <= {axb:.3e}, y {y_rand_ratio:.3e} <= {yb:.3e}",
+            axb = AX_TERMS * eps,
+            yb = Y_TERMS * eps
+        );
+
+        for mask in [
+            [true, false, true, false],
+            [true, false, false, false],
+            [false; 4],
+        ] {
+            for body in 0..2 {
+                for dyadic in [true, false] {
+                    let (_, error) =
+                        harness_pass(&ctx, dyadic, mask, body, (2048, [37, 1, 16, 5]), 16)?;
+                    println!(
+                        "body {body}, mask {mask:?}, dyadic={dyadic}: fp64 normalized error {error:e}"
+                    );
+                }
+            }
+        }
+        for shape in shapes {
+            let mask = shape.1.map(|rows| rows > 0);
+            for body in 0..2 {
+                for dyadic in [true, false] {
+                    let (ax, y) = harness_pass(&ctx, dyadic, mask, body, shape, 16)?;
+                    ensure!(
+                        ax <= shape.0 as f64 * f32::EPSILON as f64,
+                        "group4 production ax {ax} exceeds bound"
+                    );
+                    println!(
+                        "group4 LoRA production {shape:?}, body {body}, dyadic={dyadic}: ax {ax}, y {y}"
+                    );
+                }
+            }
+        }
+        for body in 0..2 {
+            let (_, y) = harness_pass(&ctx, false, [false; 4], body, (2048, [37, 1, 16, 5]), 0)?;
+            println!("group4 LoRA rank-zero body {body}: y {y}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn lora_ax_preserves_segment_slots() -> Result<()> {
+        let ctx = GpuContext::new(0)?;
+        ctx.group.capture_body(Some(0))?;
+        let (in_dim, rows, rank) = (64, 4, 16);
+        let quant = crate::int4::GroupQuant::new(
+            vec![0; rows * in_dim / 8],
+            vec![1.0; rows],
+            vec![0.0; rows],
+            rows,
+            in_dim,
+            4,
+        )?;
+        let x_host: Vec<f32> = (0..in_dim).map(|c| (c % 11) as f32 / 16.0 - 0.25).collect();
+        let x = ctx.upload_f32(&x_host)?;
+        let mut projs = std::collections::HashMap::new();
+        let mut expected = [
+            vec![0.0_f32; rank],
+            vec![0.0; rank],
+            vec![0.0; rank],
+            vec![0.0; rank],
+        ];
+        for (s, want) in expected.iter_mut().enumerate() {
+            let a: Vec<f32> = (0..rank * in_dim)
+                .map(|i| {
+                    (s + 1) as f32 / 8.0 + (i / in_dim % 5) as f32 / 64.0
+                        - (i % in_dim % 7) as f32 / 128.0
+                })
+                .collect();
+            let b = vec![0.5; rows * rank];
+            let active = s % 2 == 0;
+            if active {
+                for (k, v) in want.iter_mut().enumerate() {
+                    *v = (0..in_dim).map(|c| a[k * in_dim + c] * x_host[c]).sum();
+                }
+            }
+            let q = ctx.upload(&quant, active.then_some((a.as_slice(), b.as_slice(), rank)))?;
+            projs.insert(s.to_string(), q);
+        }
+        let runtime = GpuRuntime::new(ctx, projs, vec![], None, rank, 1);
+        let qs: [&GpuQuant; 4] = std::array::from_fn(|s| &runtime.proj[&s.to_string()]);
+        runtime.lora_ax(0, 0, 4, qs, &x, in_dim)?;
+        let got = runtime.ctx.stream.clone_dtoh(&runtime.ax_scratch)?;
+        for (s, want) in expected.iter().enumerate() {
+            anyhow::ensure!(
+                &got[s * rank..(s + 1) * rank] == want.as_slice(),
+                "LoRA output slot {s} differs: {:?} vs {want:?}",
+                &got[s * rank..(s + 1) * rank]
+            );
+        }
+        runtime.lora_ax(0, 0, 2, [qs[1], qs[3], qs[1], qs[3]], &x, in_dim)?;
+        Ok(())
+    }
+
+    fn harness_pass(
+        ctx: &GpuContext,
+        dyadic: bool,
+        mask: [bool; 4],
+        body: usize,
+        shape: (usize, [usize; 4]),
+        launch_rank: usize,
+    ) -> Result<(f64, f64)> {
+        let glue =
+            crate::kernel_assets::load_module(&ctx.context, &crate::kernel_assets::EDGE0_GLUE)?;
+        let lora_ax = glue
+            .load_function("edge0_lora_ax")
+            .context("edge0_lora_ax missing")?;
+        let (in_dim, rows) = shape;
+        let rank = 16usize;
+        let groups = in_dim / 64;
+        let mut rng_state = if dyadic { 0x12345678u32 } else { 0x9e3779b9u32 };
+        let mut next = move || {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 17;
+            rng_state ^= rng_state << 5;
+            rng_state
+        };
+        fn to_bf16(f: f32) -> f32 {
+            f32::from_bits((f.to_bits() >> 16) << 16)
+        }
+        type Val = fn(f64) -> f32;
+        let (la_val, sc_val, bi_val): (Val, Val, Val) = if dyadic {
+            (
+                |u| ((u as u32) % 3) as f32 / 32.0 - 0.03125,
+                |u| ((u as u32) % 61) as f32 / 32.0,
+                |u| ((u as u32) % 89) as f32 / 32.0 - 1.375,
+            )
+        } else {
+            (
+                |u| to_bf16(((u as u32) % 97) as f32 / 96.0 - 0.5),
+                |u| to_bf16(((u as u32) % 61) as f32 / 48.0),
+                |u| to_bf16(((u as u32) % 89) as f32 / 48.0 - 0.9),
+            )
+        };
+        let x_val: fn(usize) -> f32 = if dyadic {
+            |i| i as f32 / 64.0 - 8.0
+        } else {
+            |i| to_bf16(((i * 7919) % 97) as f32 / 96.0 - 0.5)
+        };
+        let mut packed_host = Vec::new();
+        let mut sc_host = Vec::new();
+        let mut bi_host = Vec::new();
+        let mut lb_host = Vec::new();
+        for rows_n in rows {
+            for _r in 0..rows_n {
+                for _g in 0..groups {
+                    sc_host.push(sc_val(next() as f64));
+                    bi_host.push(bi_val(next() as f64));
+                }
+                for _w in 0..in_dim / 8 {
+                    packed_host.push(next());
+                }
+                for _k in 0..rank {
+                    lb_host.push(la_val(next() as f64));
+                }
+            }
+        }
+        let x_host: Vec<f32> = (0..in_dim).map(x_val).collect();
+        let la_host: Vec<f32> = (0..4 * rank * in_dim)
+            .map(|_| la_val(next() as f64))
+            .collect();
+        let mut seg_row_base = 0usize;
+        let mut seg_packed = Vec::new();
+        let mut seg_sc = Vec::new();
+        let mut seg_bi = Vec::new();
+        let mut lbs = Vec::new();
+        for &n in rows.iter() {
+            let packed =
+                &packed_host[seg_row_base * (in_dim / 8)..(seg_row_base + n) * (in_dim / 8)];
+            seg_packed.push(ctx.upload_slice(if packed.is_empty() { &[0] } else { packed })?);
+            seg_sc.push(
+                ctx.stream
+                    .clone_htod(
+                        sc_host[seg_row_base * groups..(seg_row_base + n) * groups]
+                            .iter()
+                            .map(|f| (f.to_bits() >> 16) as u16)
+                            .chain((n == 0).then_some(0))
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    )
+                    .context("segment scales upload")?,
+            );
+            seg_bi.push(
+                ctx.stream
+                    .clone_htod(
+                        bi_host[seg_row_base * groups..(seg_row_base + n) * groups]
+                            .iter()
+                            .map(|f| (f.to_bits() >> 16) as u16)
+                            .chain((n == 0).then_some(0))
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    )
+                    .context("segment biases upload")?,
+            );
+            let b = &lb_host[seg_row_base * rank..(seg_row_base + n) * rank];
+            lbs.push(ctx.upload_f32(if b.is_empty() { &[0.0] } else { b })?);
+            seg_row_base += n;
+        }
+        let x = ctx.upload_f32(&x_host)?;
+        let las: Vec<CudaSlice<f32>> = (0..4)
+            .map(|s| ctx.upload_f32(&la_host[s * rank * in_dim..(s + 1) * rank * in_dim]))
+            .collect::<std::result::Result<_, _>>()?;
+        let ys: Vec<CudaSlice<f32>> = (0..4)
+            .map(|s| ctx.stream.alloc_zeros::<f32>(rows[s].max(1)))
+            .collect::<std::result::Result<_, _>>()?;
+        let ax = ctx.stream.alloc_zeros::<f32>(4 * rank)?;
+
+        let in_i = in_dim as i32;
+        let rank_i = rank as i32;
+        let n_i = 4i32;
+        let dummy = &las[0];
+        let (a0, a1, a2, a3) = (
+            ax.slice(0..rank),
+            ax.slice(rank..2 * rank),
+            ax.slice(2 * rank..3 * rank),
+            ax.slice(3 * rank..4 * rank),
+        );
+        unsafe {
+            ctx.stream
+                .launch_builder(&lora_ax)
+                .arg(&las[0])
+                .arg(&las[1])
+                .arg(&las[2])
+                .arg(&las[3])
+                .arg(dummy)
+                .arg(dummy)
+                .arg(&a0)
+                .arg(&a1)
+                .arg(&a2)
+                .arg(&a3)
+                .arg(&a0)
+                .arg(&a0)
+                .arg(&x)
+                .arg(&in_i)
+                .arg(&rank_i)
+                .arg(&n_i)
+                .launch(LaunchConfig {
+                    grid_dim: (rank as u32, 4, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .map_err(|e| anyhow::anyhow!("lora_ax: {e}"))?;
+
+        let seg_build = |s: usize| GroupSeg {
+            packed: &seg_packed[s],
+            scales: &seg_sc[s],
+            biases: &seg_bi[s],
+            y: &ys[s],
+            rows: rows[s],
+            lora: mask[s].then_some((&las[s], &lbs[s])),
+        };
+        let segs = [seg_build(0), seg_build(1), seg_build(2), seg_build(3)];
+        ctx.group.capture_body(Some(body))?;
+        ctx.glue_group4_l(&segs, [&a0, &a1, &a2, &a3], &x, in_dim, launch_rank)?;
+        ctx.stream.synchronize()?;
+
+        let ax_host = ctx.stream.clone_dtoh(&ax)?;
+        let nib = |word: u32, j: usize| ((word >> (4 * j)) & 0xF) as f64;
+        let eps = f32::EPSILON as f64;
+        let mut ax_worst = 0f64;
+        for (i, &got32) in ax_host.iter().enumerate() {
+            let s = i / rank;
+            let k = i % rank;
+            let (mut want, mut sum_abs) = (0f64, 0f64);
+            for c in 0..in_dim {
+                let t = la_host[s * rank * in_dim + k * in_dim + c] as f64 * x_host[c] as f64;
+                want += t;
+                sum_abs += t.abs();
+            }
+            let got = got32 as f64;
+            let ratio = (got - want).abs() / sum_abs;
+            ax_worst = ax_worst.max(ratio);
+            if dyadic {
+                anyhow::ensure!(got == want, "dyadic ax[{i}] = {got}, want {want}");
+            }
+        }
+        let mut row_base = 0usize;
+        let mut y_worst = 0f64;
+        for s in 0..4 {
+            let y_host = ctx.stream.clone_dtoh(&ys[s])?;
+            for (r, &got32) in y_host.iter().take(rows[s]).enumerate() {
+                let row = row_base + r;
+                let (mut total, mut sum_abs) = (0f64, 0f64);
+                for g in 0..groups {
+                    let (mut dot, mut sumx) = (0f64, 0f64);
+                    for c in 0..64 {
+                        let word = packed_host[row * (in_dim / 8) + (g * 64 + c) / 8];
+                        dot += nib(word, (g * 64 + c) % 8) * x_host[g * 64 + c] as f64;
+                        sumx += x_host[g * 64 + c] as f64;
+                    }
+                    let t = sc_host[row * groups + g] as f64 * dot
+                        + bi_host[row * groups + g] as f64 * sumx;
+                    total += t;
+                    sum_abs += t.abs();
+                }
+                if mask[s] {
+                    for k in 0..rank {
+                        let t = lb_host[row * rank + k] as f64 * ax_host[s * rank + k] as f64;
+                        total += t;
+                        sum_abs += t.abs();
+                    }
+                }
+                let got = got32 as f64;
+                let ratio = (got - total).abs() / sum_abs;
+                y_worst = y_worst.max(ratio);
+                anyhow::ensure!(
+                    ratio <= (146 + groups) as f64 * eps,
+                    "segment {s} row {r}: {got} vs f64 {total} (ratio {ratio:.3e})"
+                );
+            }
+            row_base += rows[s];
+        }
+        if dyadic {
+            // Negative control: perturb one A element in a freshly uploaded
+            // device copy (the fixture arrays stay the reference); the ax
+            // kernel must see it at exactly that segment and row, and
+            // nowhere else.
+            let (ps, pk, pc) = (0usize, 3usize, 17usize);
+            let mut la_perturbed = la_host[ps * rank * in_dim..(ps + 1) * rank * in_dim].to_vec();
+            la_perturbed[pk * in_dim + pc] += 0.5;
+            let la_new = ctx.upload_f32(&la_perturbed)?;
+            unsafe {
+                ctx.stream
+                    .launch_builder(&lora_ax)
+                    .arg(&la_new)
+                    .arg(&las[1])
+                    .arg(&las[2])
+                    .arg(&las[3])
+                    .arg(dummy)
+                    .arg(dummy)
+                    .arg(&a0)
+                    .arg(&a1)
+                    .arg(&a2)
+                    .arg(&a3)
+                    .arg(&a0)
+                    .arg(&a0)
+                    .arg(&x)
+                    .arg(&in_i)
+                    .arg(&rank_i)
+                    .arg(&n_i)
+                    .launch(LaunchConfig {
+                        grid_dim: (rank as u32, 4, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(|e| anyhow::anyhow!("lora_ax control: {e}"))?;
+            ctx.stream.synchronize()?;
+            let ax_after = ctx.stream.clone_dtoh(&ax)?;
+            let la_row = &la_host[pk * in_dim..(pk + 1) * in_dim];
+            let want_clean: f64 = la_row
+                .iter()
+                .zip(x_host.iter())
+                .map(|(a, x)| *a as f64 * *x as f64)
+                .sum();
+            let got = ax_after[ps * rank + pk] as f64;
+            let want_perturbed = want_clean + 0.5 * x_host[pc] as f64;
+            anyhow::ensure!(
+                (got - want_perturbed).abs() <= 1.0e-3 * want_perturbed.abs().max(1.0),
+                "negative control: ax segment {ps} row {pk} = {got}, expected {want_perturbed}"
+            );
+            let leaked = (1..4).any(|s| {
+                (0..rank).any(|k| {
+                    let want: f64 = (0..in_dim)
+                        .map(|c| {
+                            la_host[s * rank * in_dim + k * in_dim + c] as f64 * x_host[c] as f64
+                        })
+                        .sum();
+                    (ax_after[s * rank + k] as f64 - want).abs() != 0.0
+                })
+            });
+            anyhow::ensure!(
+                !leaked,
+                "negative control: the perturbation leaked to other segments"
+            );
+            println!(
+                "negative control: ax[{ps}][{pk}] moved by the perturbation; other segments untouched"
+            );
+        }
+        Ok((ax_worst, y_worst))
+    }
+
+    #[test]
+    #[ignore = "requires CUDA and FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview"]
+    fn gpu_gemv_matches_cpu_matvec_on_a_real_projection() -> Result<()> {
+        let checkpoint = checkpoint_dir("Edge0/Edge0-35B-A3B-preview")
+            .context("set FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview")?;
+        ensure!(
+            checkpoint.is_dir(),
+            "FF_MODELS_DIR must contain Edge0/Edge0-35B-A3B-preview"
+        );
+        println!("projection checkpoint: {}", checkpoint.display());
+        let ctx = GpuContext::new(0)
+            .context("CUDA device 0 setup failed; run ff probe --device cuda:0 --json")?;
         let weights = Edge0Weights::open(&checkpoint).unwrap();
         let name = "language_model.model.layers.3.self_attn.q_proj";
         let quant = weights.quant_projection(name).unwrap();
@@ -1308,6 +2184,7 @@ mod tests {
             &cpu[..4.min(cpu.len())]
         );
         assert!(max_rel < 1e-3, "gpu vs cpu max rel diff {max_rel}");
+        Ok(())
     }
 }
 
@@ -1325,28 +2202,31 @@ pub struct BatchTrace {
     pub n_prepared: u64,
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct MoeTrace {
-    pub router_us: u64,
-    pub enq_us: u64,
-    pub silu_us: u64,
-    pub down_us: u64,
-    pub shared_us: u64,
-    pub tail_us: u64,
-    pub calls: u64,
+fn read_batch_trace(trace: &std::sync::Mutex<BatchTrace>) -> Result<BatchTrace> {
+    trace.lock().map(|trace| trace.clone()).map_err(|_| {
+        anyhow::anyhow!("batch_trace mutex poisoned; rerun ff text generate --adapter edge0")
+    })
 }
 
-/// Send wrapper: the decode graph is created, launched, and read from the
-/// single decode thread only — cudarc marks CudaGraph !thread-safe because
-/// concurrent graph API use is UB, and this runtime has no second thread.
+/// DecodeGraph is used only by its owning decode thread.
 pub struct DecodeGraph(pub cudarc::driver::safe::CudaGraph);
 unsafe impl Send for DecodeGraph {}
+
+/// Begin RELAXED capture while fill workers synchronize their own streams.
+pub fn begin_decode_capture(stream: &Arc<CudaStream>) -> Result<(), cudarc::driver::DriverError> {
+    stream.begin_capture(
+        cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_RELAXED,
+    )
+}
 
 pub struct GpuRuntime {
     pub ctx: GpuContext,
     pub proj: std::collections::HashMap<String, GpuQuant>,
     /// Uniform LoRA rank across adapters (0 = none resident).
     pub lora_rank: usize,
+    /// Precomputed ax per layer: 7 rank-wide slots — [0..4] the attention
+    /// block's projections, [4] out/o, [5..7] the shared gate/up pair.
+    pub ax_scratch: CudaSlice<f32>,
     /// GridBarrier state for moe_mega (count, sense — returns to 0/0 after
     /// an even number of barriers).
     pub mega_bar: CudaSlice<i32>,
@@ -1355,7 +2235,6 @@ pub struct GpuRuntime {
     /// Device-resident GDN layers, indexed by GDN-layer order.
     pub gdn: Vec<GpuGdn>,
     pub res: Option<ResidentState>,
-    moe_trace: std::sync::Mutex<Option<(usize, MoeTrace)>>,
     pub batch_trace: std::sync::Mutex<BatchTrace>,
     x_bufs: std::sync::Mutex<std::collections::HashMap<usize, CudaSlice<f32>>>,
     // Per-SLOT inner buffers: same-width live inputs (4 expert inners +
@@ -1375,7 +2254,12 @@ impl GpuRuntime {
         gdn: Vec<GpuGdn>,
         res: Option<ResidentState>,
         lora_rank: usize,
+        total_layers: usize,
     ) -> Self {
+        let ax_scratch = ctx
+            .stream
+            .alloc_zeros::<f32>(total_layers * 7 * lora_rank.max(1))
+            .expect("ax scratch");
         let expert_ids = ctx.stream.alloc_zeros::<i32>(4).expect("expert ids");
         let batched_gate_y = ctx.stream.alloc_zeros::<f32>(4 * 512).expect("gate y");
         let batched_up_y = ctx.stream.alloc_zeros::<f32>(4 * 512).expect("up y");
@@ -1389,6 +2273,7 @@ impl GpuRuntime {
             gdn,
             res,
             lora_rank,
+            ax_scratch,
             mega_bar,
             use_moe_mega,
             x_bufs: std::sync::Mutex::new(Default::default()),
@@ -1399,67 +2284,48 @@ impl GpuRuntime {
             batched_down_y: std::sync::Mutex::new(batched_down_y),
             batched_inner_y: std::sync::Mutex::new(batched_inner_y),
             batch_trace: std::sync::Mutex::new(Default::default()),
-            moe_trace: std::sync::Mutex::new(
-                std::env::var("EDGE0_TRACE_LAYER")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .map(|layer| (layer, MoeTrace::default())),
-            ),
         }
     }
 
-    fn trace_seg(&self, layer: usize, seg: u8, since: std::time::Instant) {
-        if let Ok(mut tr) = self.moe_trace.lock()
-            && let Some((l, t)) = tr.as_mut()
-        {
-            if *l != layer {
-                return;
-            }
-            let us = since.elapsed().as_micros() as u64;
-            match seg {
-                0 => {
-                    t.router_us += us;
-                    t.calls += 1;
-                }
-                1 => t.enq_us += us,
-                2 => t.silu_us += us,
-                3 => t.down_us += us,
-                4 => t.shared_us += us,
-                _ => t.tail_us += us,
-            }
+    pub(crate) fn reset_probe_state(&mut self) -> Result<()> {
+        self.ctx.stream.synchronize()?;
+        for g in &mut self.gdn {
+            self.ctx.stream.memset_zeros(&mut g.conv_state)?;
+            self.ctx.stream.memset_zeros(&mut g.recurrent)?;
+            self.ctx.stream.memset_zeros(&mut g.conv_out)?;
+            self.ctx.stream.memset_zeros(&mut g.out)?;
         }
+        self.ctx.stream.memset_zeros(&mut self.ax_scratch)?;
+        self.ctx.stream.memset_zeros(&mut self.mega_bar)?;
+        if let Some(res) = self.res.as_mut() {
+            self.ctx.stream.memset_zeros(&mut res.hidden)?;
+            self.ctx.stream.memset_zeros(&mut res.x1)?;
+            self.ctx.stream.memset_zeros(&mut res.q_out)?;
+            self.ctx.stream.memset_zeros(&mut res.gate_out)?;
+            self.ctx.stream.memset_zeros(&mut res.attn_scratch)?;
+            for value in res.kv_keys.iter_mut().chain(&mut res.kv_values) {
+                self.ctx.stream.memset_zeros(value)?;
+            }
+            self.ctx
+                .stream
+                .memset_zeros(&mut *res.next_token.lock().expect("next token"))?;
+            self.ctx
+                .stream
+                .memset_zeros(&mut *res.pos_buf.lock().expect("position"))?;
+        }
+        Ok(())
     }
 
-    pub fn moe_trace_summary(&self) -> Option<(usize, MoeTrace)> {
-        self.moe_trace.lock().ok().and_then(|t| *t)
+    pub fn batch_trace_summary(&self) -> Result<BatchTrace> {
+        read_batch_trace(&self.batch_trace)
     }
 
-    pub fn batch_trace_summary(&self) -> BatchTrace {
-        self.batch_trace
-            .lock()
-            .map(|t| t.clone())
-            .unwrap_or_default()
-    }
-
-    /// MoE block, three phases with THREE syncs per layer (router must be
-    /// read before routing is known): (1) router; (2) gate+up for routed
-    /// experts AND shared gate/up/gate-scalar on one x upload; (3) downs
-    /// into per-slot inner buffers. Host does silu-mul and the weighted
-    /// combine. Returns (router_logits, expert_outputs, shared_inner_ready)
-    /// with shared down output read separately via `read_shared`.
-    #[allow(clippy::type_complexity)]
-    pub fn moe_router_dx(
-        &self,
-        layer: usize,
-        router: &GpuQuant,
-        dx: &CudaSlice<f32>,
-    ) -> Result<Vec<f32>> {
-        let t0 = std::time::Instant::now();
+    /// Upload the router input, launch it and return host logits after completion.
+    pub fn moe_router_dx(&self, router: &GpuQuant, dx: &CudaSlice<f32>) -> Result<Vec<f32>> {
         router.launch(&self.ctx, dx, router.y_ref())?;
         self.ctx.counted_sync()?;
         let mut logits = vec![0f32; router.out_dim];
         self.ctx.stream.memcpy_dtoh(router.y_ref(), &mut logits)?;
-        self.trace_seg(layer, 0, t0);
         Ok(logits)
     }
 
@@ -1469,8 +2335,45 @@ impl GpuRuntime {
     /// Resident variant: consumes the normed input from device memory and
     /// leaves the layer output in out_proj's y — no sync, no host round
     /// trip; the caller adds it into `hidden`.
+    /// The layer's ax-scratch view for slot `slot` (7 per layer).
+    fn ax_slot(&self, layer: usize, slot: usize) -> CudaView<'_, f32> {
+        let rank = self.lora_rank.max(1);
+        let base = layer * 7 * rank + slot * rank;
+        self.ax_scratch.slice(base..base + rank)
+    }
+
+    /// ax for the first `n` projections' A rows against `x`, into the
+    /// layer's scratch slots starting at `slot`.
+    fn lora_ax(
+        &self,
+        layer: usize,
+        slot: usize,
+        n: usize,
+        quants: [&GpuQuant; 4],
+        x: &CudaSlice<f32>,
+        in_dim: usize,
+    ) -> Result<()> {
+        if self.lora_rank == 0 {
+            return Ok(());
+        }
+        let rank = self.lora_rank;
+        let active: Vec<_> = quants[..n]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, q)| q.lora.as_ref().map(|l| (i, &l.a)))
+            .collect();
+        let las: Vec<_> = active.iter().map(|(_, a)| *a).collect();
+        let axs: Vec<CudaView<f32>> = active
+            .iter()
+            .map(|(i, _)| self.ax_slot(layer, slot + i))
+            .collect();
+        let ax_refs: Vec<&CudaView<f32>> = axs.iter().collect();
+        self.ctx.glue_lora_ax(&las, &ax_refs, x, in_dim, rank)
+    }
+
     pub fn gdn_layer_dx(
         &self,
+        layer: usize,
         gdn_index: usize,
         proj: &GdnProjections<'_>,
         dx: &CudaSlice<f32>,
@@ -1483,30 +2386,44 @@ impl GpuRuntime {
             out_proj,
         } = *proj;
         let g = &self.gdn[gdn_index];
-        // One launch for qkv/z/b/a: same x, all int4, LoRA folded in the
-        // epilogue (was 4 GEMVs + 4 lora_adds).
+        // One launch for qkv/z/b/a: same x, all int4, ax precomputed once
+        // for the whole launch (was recomputed in every block).
         let segs = [qkv.group_seg(), z.group_seg(), b.group_seg(), a.group_seg()];
-        let rank = if segs.iter().any(|s| s.lora.is_some()) {
-            self.lora_rank
-        } else {
-            0
-        };
-        self.ctx.glue_group4(&segs, dx, qkv.in_dim, rank)?;
+        self.lora_ax(layer, 0, 4, [qkv, z, b, a], dx, qkv.in_dim)?;
+        let [a0, a1, a2, a3] = [
+            self.ax_slot(layer, 0),
+            self.ax_slot(layer, 1),
+            self.ax_slot(layer, 2),
+            self.ax_slot(layer, 3),
+        ];
+        let ax_refs: [&CudaView<f32>; 4] = [&a0, &a1, &a2, &a3];
+        self.ctx
+            .glue_group4_l(&segs, ax_refs, dx, qkv.in_dim, self.lora_rank)?;
         self.ctx.gdn_conv_launch(g, qkv.y_ref())?;
         self.ctx
-            .gdn_heads_launch(g, &g.conv_out, z.y_ref(), b.y_ref(), a.y_ref())?;
+            .gdn_heads_launch(g, &g.conv_out, z.y_ref(), b.y_ref(), a.y_ref(), &g.out)?;
         let segs = [
             out_proj.group_seg(),
             out_proj.empty_seg_like(),
             out_proj.empty_seg_like(),
             out_proj.empty_seg_like(),
         ];
-        let rank = if segs[0].lora.is_some() {
-            self.lora_rank
-        } else {
-            0
-        };
-        self.ctx.glue_group4(&segs, &g.out, out_proj.in_dim, rank)?;
+        self.lora_ax(
+            layer,
+            4,
+            1,
+            [out_proj, out_proj, out_proj, out_proj],
+            &g.out,
+            out_proj.in_dim,
+        )?;
+        let ax = self.ax_slot(layer, 4);
+        self.ctx.glue_group4_l(
+            &segs,
+            [&ax, &ax, &ax, &ax],
+            &g.out,
+            out_proj.in_dim,
+            self.lora_rank,
+        )?;
         Ok(())
     }
 
@@ -1514,15 +2431,10 @@ impl GpuRuntime {
         self.proj.get(name).map(|q| q.matvec_sync(&self.ctx, x))
     }
 
-    pub fn ctx_ref(&self) -> &GpuContext {
-        &self.ctx
-    }
-
     /// Two-phase MoE (router needs one sync for host top-k; everything
     /// else — routed gate/up/down for 4 experts AND shared gate/up/down —
     /// runs with GPU silu and ONE further sync). Returns weighted combine
     /// inputs: (down outputs for routed experts, shared down output).
-    #[allow(clippy::type_complexity)]
     pub fn moe_fused_dx(
         &self,
         experts: &GpuExperts,
@@ -1531,9 +2443,7 @@ impl GpuRuntime {
         shared: (&GpuQuant, &GpuQuant, &GpuQuant, &GpuQuant),
         dx: &CudaSlice<f32>,
     ) -> Result<(f32, Vec<Vec<f32>>)> {
-        let t0 = std::time::Instant::now();
-        // Batched gate/up: ONE launch per projection covers all routed
-        // experts (per-expert dispatch measured 54 µs/kernel × 8/layer).
+        // One batched launch per projection covers all chosen experts.
         let slots = chosen.len();
         let _rows = experts.rows[0];
         {
@@ -1573,8 +2483,6 @@ impl GpuRuntime {
         shared.0.launch(&self.ctx, dx, shared.0.y_ref())?;
         shared.1.launch(&self.ctx, dx, shared.1.y_ref())?;
         shared.2.launch(&self.ctx, dx, shared.2.y_ref())?;
-        self.trace_seg(layer, 1, t0);
-        let t1 = std::time::Instant::now();
         let width = experts.rows[0].max(1);
         let lanes = chosen.len() * width;
         {
@@ -1590,8 +2498,6 @@ impl GpuRuntime {
             }
             self.ctx.silu_mul(&g, &u, &inner, lanes)?;
         }
-        self.trace_seg(layer, 2, t1);
-        let t2 = std::time::Instant::now();
         self.ctx.batched_expert_gemv_slotx(
             experts,
             layer,
@@ -1603,8 +2509,6 @@ impl GpuRuntime {
                 slots: chosen.len(),
             },
         )?;
-        self.trace_seg(layer, 3, t2);
-        let t3 = std::time::Instant::now();
         let shared_w = shared.0.out_dim;
         // Shared expert: silu on device (its gate/up sit in their own
         // GpuQuant y buffers), down on the shared slot buffer.
@@ -1639,8 +2543,6 @@ impl GpuRuntime {
                 shared.3.y_ref(),
             )?;
         }
-        self.trace_seg(layer, 4, t3);
-        let t4 = std::time::Instant::now();
         self.ctx.counted_sync()?;
         // Batched down results from the scratch: [slots, rows].
         let down_rows = experts.rows[2];
@@ -1659,8 +2561,6 @@ impl GpuRuntime {
         self.ctx
             .stream
             .memcpy_dtoh(shared.2.y_ref(), std::slice::from_mut(&mut scalar))?;
-
-        self.trace_seg(layer, 5, t4);
         let mut all_outs = outs;
         all_outs.push(sv);
         Ok((scalar, all_outs))
@@ -1683,29 +2583,45 @@ impl GpuRuntime {
             .map(|n| self.proj.get(*n))
             .collect::<Option<Vec<_>>>()?;
         let t0 = std::time::Instant::now();
-        let mut guard = self.x_bufs.lock().ok()?;
+        let Ok(mut guard) = self.x_bufs.lock() else {
+            return Some(Err(anyhow::anyhow!("batch_matvec: x buffer lock poisoned")));
+        };
         let entry = guard.entry(x.len()).or_insert_with(|| {
             self.ctx
                 .stream
                 .alloc_zeros::<f32>(x.len())
                 .expect("x alloc")
         });
-        self.ctx.stream.memcpy_htod(x, entry).ok()?;
+        if let Err(e) = self.ctx.stream.memcpy_htod(x, entry) {
+            return Some(Err(anyhow::anyhow!(
+                "batch_matvec: x upload failed for {} projections: {e}",
+                quants.len()
+            )));
+        }
         let t1 = std::time::Instant::now();
         for q in &quants {
-            if q.launch(&self.ctx, entry, q.y_ref()).is_err() {
-                return None;
+            if let Err(e) = q.launch(&self.ctx, entry, q.y_ref()) {
+                return Some(Err(anyhow::anyhow!(
+                    "batch_matvec: projection launch failed: {e}"
+                )));
             }
         }
         drop(guard);
         let t2 = std::time::Instant::now();
-        self.ctx.counted_sync().ok()?;
+        if let Err(e) = self.ctx.counted_sync() {
+            return Some(Err(anyhow::anyhow!(
+                "batch_matvec: stream sync failed: {e}"
+            )));
+        }
         let t3 = std::time::Instant::now();
         let mut outs = Vec::with_capacity(quants.len());
         for q in &quants {
             let mut host = vec![0f32; q.out_dim];
-            if self.ctx.stream.memcpy_dtoh(q.y_ref(), &mut host).is_err() {
-                return None;
+            if let Err(e) = self.ctx.stream.memcpy_dtoh(q.y_ref(), &mut host) {
+                return Some(Err(anyhow::anyhow!(
+                    "batch_matvec: y download failed for a {}-row projection: {e}",
+                    q.out_dim
+                )));
             }
             outs.push(host);
         }
@@ -1825,8 +2741,8 @@ impl GpuGdn {
 /// kernels address experts by first-dim index (gather_qmm shape).
 pub struct GpuExperts {
     pub stacked: Vec<[CudaSlice<u32>; 3]>,
-    pub stacked_scales: Vec<[CudaSlice<f32>; 3]>,
-    pub stacked_biases: Vec<[CudaSlice<f32>; 3]>,
+    pub stacked_scales: Vec<[CudaSlice<u16>; 3]>,
+    pub stacked_biases: Vec<[CudaSlice<u16>; 3]>,
     /// Projection geometry: rows (out) and in_dim per projection part.
     pub rows: [usize; 3],
     pub in_dim: [usize; 3],
@@ -1872,11 +2788,11 @@ impl ResidentState {
             kv_stride,
             num_attn_layers,
         } = norms;
-        let max_ctx = crate::model::configured_max_ctx();
-        // edge0_attn_scores keeps the step scores in shared memory.
+        let max_ctx = crate::model::configured_max_ctx()?;
+        // Validated resident decode context limit.
         ensure!(
             max_ctx <= 8192,
-            "EDGE0_MAX_CTX {max_ctx} exceeds the kernel cap 8192"
+            "EDGE0_MAX_CTX {max_ctx} exceeds the validated context limit 8192"
         );
         let mut kv_keys = Vec::with_capacity(num_attn_layers);
         let mut kv_values = Vec::with_capacity(num_attn_layers);
@@ -1935,9 +2851,10 @@ impl GpuContext {
         &self,
         embed: &GpuQuant,
         token: &CudaSlice<i32>,
-        out: &CudaSlice<f32>,
+        out: &impl cudarc::driver::DevicePtr<f32>,
     ) -> Result<()> {
         let in_dim = embed.in_dim as i32;
+        let (out, _out_guard) = out.device_ptr(&self.stream);
         unsafe {
             self.stream
                 .launch_builder(&self.k_embed_row)
@@ -1945,7 +2862,7 @@ impl GpuContext {
                 .arg(&embed.scales)
                 .arg(&embed.biases)
                 .arg(token)
-                .arg(out)
+                .arg(&out)
                 .arg(&in_dim)
                 .launch(LaunchConfig {
                     grid_dim: ((in_dim as u32 / 8).div_ceil(256), 1, 1),
@@ -2048,7 +2965,7 @@ impl GpuContext {
             k_raw,
             k_norm_w,
             v_raw,
-        } = *proj;
+        } = proj;
         let QkGeom {
             heads,
             kv_heads,
@@ -2065,9 +2982,9 @@ impl GpuContext {
             self.stream
                 .launch_builder(&self.k_attn_qk)
                 .arg(q_raw)
-                .arg(q_norm_w)
+                .arg(*q_norm_w)
                 .arg(k_raw)
-                .arg(k_norm_w)
+                .arg(*k_norm_w)
                 .arg(v_raw)
                 .arg(&res.q_out)
                 .arg(&res.gate_out)
@@ -2099,38 +3016,17 @@ impl GpuContext {
         geom: &AttnGeom,
         scale: f32,
     ) -> Result<()> {
-        let ScoreBuffers { q, gate, out } = *bufs;
-        let AttnGeom {
-            heads,
-            kv_heads,
-            head_dim,
-        } = *geom;
-        let kv_stride_i = res.kv_stride as i32;
-        let heads_i = heads as i32;
-        let kv_heads_i = kv_heads as i32;
-        let hd_i = head_dim as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k_attn_scores)
-                .arg(q)
-                .arg(gate)
-                .arg(&res.kv_keys[kv_index])
-                .arg(&res.kv_values[kv_index])
-                .arg(out)
-                .arg(position)
-                .arg(&kv_stride_i)
-                .arg(&heads_i)
-                .arg(&kv_heads_i)
-                .arg(&hd_i)
-                .arg(&scale)
-                .launch(LaunchConfig {
-                    grid_dim: (heads as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-        }
-        .map_err(|e| anyhow::anyhow!("attn scores launch failed: {e}"))?;
-        Ok(())
+        self.glue_attn_scores_raw(
+            bufs,
+            &KvCache {
+                keys: &res.kv_keys[kv_index],
+                values: &res.kv_values[kv_index],
+                stride: res.kv_stride,
+            },
+            position,
+            geom,
+            scale,
+        )
     }
 }
 
@@ -2159,16 +3055,11 @@ impl GpuRuntime {
             .glue_rmsnorm(&res.hidden, &res.ln[layer][which], &res.x1, n, eps)
     }
 
-    pub fn add_residual(&self, delta: &CudaSlice<f32>) -> Result<()> {
-        let res = self.res.as_ref().expect("resident state");
-        let n = res.hidden.len();
-        self.ctx.glue_add_inplace(&res.hidden, delta, n)
-    }
-
     /// Attention layer on device: q/k/v GEMVs on x1, norm+rope+KV append,
     /// scores+softmax+gate, o_proj — output lands in o_proj's y.
     pub fn attn_layer(
         &self,
+        layer: usize,
         kv_index: usize,
         quants: &AttnQuants<'_>,
         geom: &QkGeom,
@@ -2189,22 +3080,25 @@ impl GpuRuntime {
             v.group_seg(),
             q.empty_seg_like(),
         ];
-        let rank = if segs.iter().any(|s| s.lora.is_some()) {
-            self.lora_rank
-        } else {
-            0
-        };
-        self.ctx.glue_group4(&segs, &res.x1, q.in_dim, rank)?;
+        self.lora_ax(layer, 0, 3, [q, k, v, o_proj], &res.x1, q.in_dim)?;
+        let [a0, a1, a2] = [
+            self.ax_slot(layer, 0),
+            self.ax_slot(layer, 1),
+            self.ax_slot(layer, 2),
+        ];
+        let ax_refs: [&CudaView<f32>; 4] = [&a0, &a1, &a2, &a0];
+        self.ctx
+            .glue_group4_l(&segs, ax_refs, &res.x1, q.in_dim, self.lora_rank)?;
         let norms = &res.attn_norms[kv_index];
         self.ctx.glue_attn_qk(
             res,
             kv_index,
             &QkvNorm {
-                q_raw: q.y_ref(),
+                q_raw: q.y_ref().as_view(),
                 q_norm_w: &norms[0],
-                k_raw: k.y_ref(),
+                k_raw: k.y_ref().as_view(),
                 k_norm_w: &norms[1],
-                v_raw: v.y_ref(),
+                v_raw: v.y_ref().as_view(),
             },
             &pos,
             &QkGeom {
@@ -2220,9 +3114,9 @@ impl GpuRuntime {
             res,
             kv_index,
             &ScoreBuffers {
-                q: &res.q_out,
-                gate: &res.gate_out,
-                out: &res.attn_scratch,
+                q: res.q_out.as_view(),
+                gate: res.gate_out.as_view(),
+                out: res.attn_scratch.as_view(),
             },
             &pos,
             &AttnGeom {
@@ -2238,13 +3132,22 @@ impl GpuRuntime {
             o_proj.empty_seg_like(),
             o_proj.empty_seg_like(),
         ];
-        let rank = if segs[0].lora.is_some() {
-            self.lora_rank
-        } else {
-            0
-        };
-        self.ctx
-            .glue_group4(&segs, &res.attn_scratch, o_proj.in_dim, rank)?;
+        self.lora_ax(
+            layer,
+            4,
+            1,
+            [o_proj, o_proj, o_proj, o_proj],
+            &res.attn_scratch,
+            o_proj.in_dim,
+        )?;
+        let ax = self.ax_slot(layer, 4);
+        self.ctx.glue_group4_l(
+            &segs,
+            [&ax, &ax, &ax, &ax],
+            &res.attn_scratch,
+            o_proj.in_dim,
+            self.lora_rank,
+        )?;
         Ok(())
     }
 
@@ -2266,17 +3169,6 @@ impl GpuRuntime {
 
     pub fn hidden_ref(&self) -> &CudaSlice<f32> {
         &self.res.as_ref().expect("resident state").hidden
-    }
-
-    /// lm_head GEMV over the device hidden — no htod of the hidden state.
-    pub fn lm_logits(&self) -> Result<Vec<f32>> {
-        let lm = self
-            .proj
-            .get("language_model.lm_head")
-            .expect("lm_head resident");
-        lm.launch(&self.ctx, self.hidden_ref(), lm.y_ref())?;
-        self.ctx.counted_sync()?;
-        self.read_y(lm)
     }
 
     /// Upload the host-combined MoE output into the y of a scratch GpuQuant
@@ -2313,6 +3205,7 @@ impl GpuRuntime {
         } = *proj;
         let dx = self.ctx.stream.clone_htod(x).context("harness x upload")?;
         self.gdn_layer_dx(
+            0,
             gdn_index,
             &GdnProjections {
                 qkv,
@@ -2456,6 +3349,65 @@ impl GpuContext {
         Ok(())
     }
 
+    /// Speculative-round accept: top-2 of the A and B logit columns, the
+    /// accept flag against the drafted token, and the next pending token
+    /// written into the round's 7-float ring slot; the round-control
+    /// counters (next_token, pos, rope_pos, pos_b) advance here so a round
+    /// is fully device-driven. Replaces two argmax launches, two logit
+    /// dtohs and the host accept/margin arithmetic.
+    pub fn glue_spec_accept(
+        &self,
+        bufs: &SpecAcceptBuffers<'_>,
+        out: &mut SpecAcceptOutputs<'_>,
+        n: usize,
+        h_len: usize,
+    ) -> Result<()> {
+        let nparts = 128i32;
+        let h_len_i = h_len as i32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.k_spec_accept_part)
+                .arg(bufs.logits_a)
+                .arg(bufs.logits_b)
+                .arg(&self.accept_scratch_v)
+                .arg(&self.accept_scratch_i)
+                .arg(&(n as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (nparts as u32, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("spec accept part launch failed: {e}"))?;
+            self.stream
+                .launch_builder(&self.k_spec_accept_final)
+                .arg(&self.accept_scratch_v)
+                .arg(&self.accept_scratch_i)
+                .arg(bufs.draft_id)
+                .arg(bufs.hidden_accept)
+                .arg(bufs.hidden_reject)
+                .arg(&mut *out.hidden_sel)
+                .arg(&mut *out.mtp_tok)
+                .arg(bufs.next_token)
+                .arg(bufs.pos)
+                .arg(bufs.rope_pos)
+                .arg(bufs.pos_b)
+                .arg(bufs.flag)
+                .arg(&mut *out.record)
+                .arg(&mut *out.round_idx)
+                .arg(&nparts)
+                .arg(&h_len_i)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("spec accept final launch failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Zero-centered rmsnorm (qwen3_5 dense): out = rms(x) * (1 + w).
     pub fn glue_rmsnorm_zc(
         &self,
@@ -2507,7 +3459,7 @@ impl GpuContext {
                 .arg(&eps)
                 .launch(LaunchConfig {
                     grid_dim: (1, 1, 1),
-                    block_dim: (256, 1, 1),
+                    block_dim: (n.min(1024) as u32, 1, 1),
                     shared_mem_bytes: 0,
                 })
                 .map(|_| ())
@@ -2534,8 +3486,8 @@ impl GpuContext {
             k_raw,
             k_norm_w,
             v_raw,
-        } = *proj;
-        let QkOutputs { q_out, gate_out } = *out;
+        } = proj;
+        let QkOutputs { q_out, gate_out } = out;
         let KvCache {
             keys: kv_keys,
             values: kv_values,
@@ -2562,9 +3514,9 @@ impl GpuContext {
             self.stream
                 .launch_builder(k)
                 .arg(q_raw)
-                .arg(q_norm_w)
+                .arg(*q_norm_w)
                 .arg(k_raw)
-                .arg(k_norm_w)
+                .arg(*k_norm_w)
                 .arg(v_raw)
                 .arg(q_out)
                 .arg(gate_out)
@@ -2593,11 +3545,34 @@ impl GpuContext {
         &self,
         bufs: &ScoreBuffers<'_>,
         kv: &KvCache<'_>,
-        position: &CudaSlice<i32>,
+        position: &impl cudarc::driver::DevicePtr<i32>,
         geom: &AttnGeom,
         scale: f32,
     ) -> Result<()> {
-        let ScoreBuffers { q, gate, out } = *bufs;
+        self.attention(&self.k_attn_scores, bufs, kv, position, geom, scale)
+    }
+
+    pub fn glue_attn_scores_bf16(
+        &self,
+        bufs: &ScoreBuffers<'_>,
+        kv: &KvCache<'_, half::bf16>,
+        position: &impl cudarc::driver::DevicePtr<i32>,
+        geom: &AttnGeom,
+        scale: f32,
+    ) -> Result<()> {
+        self.attention(&self.k_attn_scores_bf16, bufs, kv, position, geom, scale)
+    }
+
+    fn attention<T: cudarc::driver::DeviceRepr>(
+        &self,
+        kernel: &cudarc::driver::CudaFunction,
+        bufs: &ScoreBuffers<'_>,
+        kv: &KvCache<'_, T>,
+        position: &impl cudarc::driver::DevicePtr<i32>,
+        geom: &AttnGeom,
+        scale: f32,
+    ) -> Result<()> {
+        let ScoreBuffers { q, gate, out } = bufs;
         let KvCache {
             keys: kv_keys,
             values: kv_values,
@@ -2612,15 +3587,16 @@ impl GpuContext {
         let heads_i = heads as i32;
         let kv_heads_i = kv_heads as i32;
         let hd_i = head_dim as i32;
+        let (position, _position_guard) = position.device_ptr(&self.stream);
         unsafe {
             self.stream
-                .launch_builder(&self.k_attn_scores)
+                .launch_builder(kernel)
                 .arg(q)
                 .arg(gate)
                 .arg(kv_keys)
                 .arg(kv_values)
                 .arg(out)
-                .arg(position)
+                .arg(&position)
                 .arg(&kv_stride_i)
                 .arg(&heads_i)
                 .arg(&kv_heads_i)
@@ -2675,8 +3651,8 @@ impl GpuContext {
         proj: &QkvNorm<'_>,
         out: &QkOutputs<'_>,
         kv: &KvCache<'_>,
-        position: &CudaSlice<i32>,
-        rope_pos: &CudaSlice<i32>,
+        position: &impl cudarc::driver::DevicePtr<i32>,
+        rope_pos: &impl cudarc::driver::DevicePtr<i32>,
         geom: &MropeGeom,
     ) -> Result<()> {
         let QkvNorm {
@@ -2685,8 +3661,8 @@ impl GpuContext {
             k_raw,
             k_norm_w,
             v_raw,
-        } = *proj;
-        let QkOutputs { q_out, gate_out } = *out;
+        } = proj;
+        let QkOutputs { q_out, gate_out } = out;
         let KvCache {
             keys: kv_keys,
             values: kv_values,
@@ -2708,20 +3684,22 @@ impl GpuContext {
         let rot_i = rotary_dim as i32;
         let sec_h_i = sec_h as i32;
         let sec_w_i = sec_w as i32;
+        let (position, _position_guard) = position.device_ptr(&self.stream);
+        let (rope_pos, _rope_pos_guard) = rope_pos.device_ptr(&self.stream);
         unsafe {
             self.stream
                 .launch_builder(&self.k_attn_qk_zc_mrope)
                 .arg(q_raw)
-                .arg(q_norm_w)
+                .arg(*q_norm_w)
                 .arg(k_raw)
-                .arg(k_norm_w)
+                .arg(*k_norm_w)
                 .arg(v_raw)
                 .arg(q_out)
                 .arg(gate_out)
                 .arg(kv_keys)
                 .arg(kv_values)
-                .arg(position)
-                .arg(rope_pos)
+                .arg(&position)
+                .arg(&rope_pos)
                 .arg(&kv_stride_i)
                 .arg(&heads_i)
                 .arg(&kv_heads_i)
@@ -2796,14 +3774,7 @@ impl GpuRuntime {
                 top_k,
             );
         }
-        let kt = std::env::var_os("EDGE0_KERNEL_TIMES").is_some();
-        let mut kt_t = std::time::Instant::now();
         router.launch(&self.ctx, dx, router.y_ref())?;
-        if kt {
-            self.ctx.stream.synchronize().ok();
-            eprintln!("KT router {:.0}us", kt_t.elapsed().as_micros());
-            kt_t = std::time::Instant::now();
-        }
         {
             // top-k writes the batched-kernel id buffer directly — no d2d
             // copy node in the per-token graph.
@@ -2821,11 +3792,6 @@ impl GpuRuntime {
                     slots: top_k,
                 },
             )?;
-            if kt {
-                self.ctx.stream.synchronize().ok();
-                eprintln!("KT gate {:.0}us", kt_t.elapsed().as_micros());
-                kt_t = std::time::Instant::now();
-            }
             self.ctx.batched_expert_gemv(
                 experts,
                 layer,
@@ -2837,11 +3803,6 @@ impl GpuRuntime {
                     slots: top_k,
                 },
             )?;
-            if kt {
-                self.ctx.stream.synchronize().ok();
-                eprintln!("KT up {:.0}us", kt_t.elapsed().as_micros());
-                kt_t = std::time::Instant::now();
-            }
         }
         // shared.2 (the gate scalar) is int8 — the group kernel is int4-only.
         let segs = [
@@ -2850,12 +3811,18 @@ impl GpuRuntime {
             shared.0.empty_seg_like(),
             shared.0.empty_seg_like(),
         ];
-        let rank = if segs.iter().any(|s| s.lora.is_some()) {
-            self.lora_rank
-        } else {
-            0
-        };
-        self.ctx.glue_group4(&segs, dx, shared.0.in_dim, rank)?;
+        self.lora_ax(
+            layer,
+            5,
+            2,
+            [shared.0, shared.1, shared.0, shared.1],
+            dx,
+            shared.0.in_dim,
+        )?;
+        let [a0, a1] = [self.ax_slot(layer, 5), self.ax_slot(layer, 6)];
+        let ax_refs: [&CudaView<f32>; 4] = [&a0, &a1, &a0, &a1];
+        self.ctx
+            .glue_group4_l(&segs, ax_refs, dx, shared.0.in_dim, self.lora_rank)?;
         shared.2.launch(&self.ctx, dx, shared.2.y_ref())?;
 
         // Down pass: silu + router-weight fold inline (§3c(3) rules 2-3).
@@ -2876,11 +3843,6 @@ impl GpuRuntime {
                 },
             )?;
         }
-        if kt {
-            self.ctx.stream.synchronize().ok();
-            eprintln!("KT slotx_silu {:.0}us", kt_t.elapsed().as_micros());
-            kt_t = std::time::Instant::now();
-        }
         // Shared expert down over silu(g)*u with its LoRA folded in.
         let rank = if shared.3.lora.is_some() {
             self.lora_rank
@@ -2894,11 +3856,6 @@ impl GpuRuntime {
             shared.3.y_ref(),
             rank,
         )?;
-        if kt {
-            self.ctx.stream.synchronize().ok();
-            eprintln!("KT shared_down {:.0}us", kt_t.elapsed().as_micros());
-            kt_t = std::time::Instant::now();
-        }
         self.ctx.glue_moe_combine(
             &res.hidden,
             &self.batched_down_y.lock().expect("dy"),
@@ -2907,10 +3864,6 @@ impl GpuRuntime {
             rows[2],
             top_k,
         )?;
-        if kt {
-            self.ctx.stream.synchronize().ok();
-            eprintln!("KT combine {:.0}us", kt_t.elapsed().as_micros());
-        }
         Ok(())
     }
 
@@ -3016,8 +3969,8 @@ impl GpuRuntime {
 /// One grouped-GEMV segment: a projection's device tensors plus row count.
 pub struct GroupSeg<'a> {
     pub packed: &'a CudaSlice<u32>,
-    pub scales: &'a CudaSlice<f32>,
-    pub biases: &'a CudaSlice<f32>,
+    pub scales: &'a CudaSlice<u16>,
+    pub biases: &'a CudaSlice<u16>,
     pub y: &'a CudaSlice<f32>,
     pub rows: usize,
     /// LoRA pair for this segment, if any.
@@ -3099,6 +4052,129 @@ impl GpuContext {
                 })
         }
         .map_err(|e| anyhow::anyhow!("group4 launch failed: {e}"))?;
+        Ok(())
+    }
+
+    /// ax_s[k] = dot(la_s[k], x) for the first n segments; one launch per x
+    /// covers every gemv that consumes this x, so no gemv block recomputes it.
+    pub fn glue_lora_ax(
+        &self,
+        las: &[&CudaSlice<f32>],
+        axs: &[&CudaView<f32>],
+        x: &CudaSlice<f32>,
+        in_dim: usize,
+        rank: usize,
+    ) -> Result<()> {
+        let n_seg = las.len();
+        anyhow::ensure!(n_seg <= 6 && axs.len() == n_seg, "lora_ax segment count");
+        if n_seg == 0 {
+            return Ok(());
+        }
+        let dummy_la = las[0];
+        let dummy_ax = axs[0];
+        let [la0, la1, la2, la3, la4, la5] =
+            std::array::from_fn(|i| las.get(i).copied().unwrap_or(dummy_la));
+        let [ax0, ax1, ax2, ax3, ax4, ax5] =
+            std::array::from_fn(|i| axs.get(i).copied().unwrap_or(dummy_ax));
+        let in_i = in_dim as i32;
+        let rank_i = rank as i32;
+        let n_i = n_seg as i32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.k_lora_ax)
+                .arg(la0)
+                .arg(la1)
+                .arg(la2)
+                .arg(la3)
+                .arg(la4)
+                .arg(la5)
+                .arg(ax0)
+                .arg(ax1)
+                .arg(ax2)
+                .arg(ax3)
+                .arg(ax4)
+                .arg(ax5)
+                .arg(x)
+                .arg(&in_i)
+                .arg(&rank_i)
+                .arg(&n_i)
+                .launch(LaunchConfig {
+                    grid_dim: (rank as u32, n_seg as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .map_err(|e| anyhow::anyhow!("lora_ax launch failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Grouped int4 GEMV on the v4 body with a precomputed-ax low-rank
+    /// epilogue (`axs` per segment; `lora`'s A half is only read by
+    /// glue_lora_ax). Grid matches the v4 walk: one column, RPB row-blocks.
+    pub fn glue_group4_l(
+        &self,
+        segs: &[GroupSeg; 4],
+        axs: [&CudaView<f32>; 4],
+        x: &CudaSlice<f32>,
+        in_dim: usize,
+        rank: usize,
+    ) -> Result<()> {
+        let in_i = in_dim as i32;
+        let rank_i = rank as i32;
+        let mut rows = [0i32; 4];
+        let mut total_blocks = 0u32;
+        for (i, seg) in segs.iter().enumerate() {
+            rows[i] = seg.rows as i32;
+            total_blocks += (seg.rows as u32).div_ceil(crate::kernel_assets::RPB_V4 as u32);
+        }
+        use cudarc::driver::DevicePtr;
+        let lbs = segs
+            .each_ref()
+            .map(|seg| seg.lora.map(|(_, b)| b.device_ptr(&self.stream)));
+        let lb_ptrs = lbs
+            .each_ref()
+            .map(|lb| lb.as_ref().map_or(0, |(ptr, _)| *ptr));
+        unsafe {
+            self.stream
+                .launch_builder(self.group.function(1)?)
+                .arg(segs[0].packed)
+                .arg(segs[0].scales)
+                .arg(segs[0].biases)
+                .arg(segs[0].y)
+                .arg(&rows[0])
+                .arg(&lb_ptrs[0])
+                .arg(axs[0])
+                .arg(segs[1].packed)
+                .arg(segs[1].scales)
+                .arg(segs[1].biases)
+                .arg(segs[1].y)
+                .arg(&rows[1])
+                .arg(&lb_ptrs[1])
+                .arg(axs[1])
+                .arg(segs[2].packed)
+                .arg(segs[2].scales)
+                .arg(segs[2].biases)
+                .arg(segs[2].y)
+                .arg(&rows[2])
+                .arg(&lb_ptrs[2])
+                .arg(axs[2])
+                .arg(segs[3].packed)
+                .arg(segs[3].scales)
+                .arg(segs[3].biases)
+                .arg(segs[3].y)
+                .arg(&rows[3])
+                .arg(&lb_ptrs[3])
+                .arg(axs[3])
+                .arg(x)
+                .arg(&in_i)
+                .arg(&rank_i)
+                .launch(LaunchConfig {
+                    grid_dim: (1, total_blocks, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .map_err(|e| anyhow::anyhow!("group4l launch failed: {e}"))?;
         Ok(())
     }
 
@@ -3199,12 +4275,8 @@ impl GpuContext {
         let rank_i = rank as i32;
         let ex_rows = experts.rows[0] as i32;
         let down_rows = experts.rows[2] as i32;
-        let cap = if std::env::var_os("EDGE0_MEGA_NOCAP").is_some() {
-            0
-        } else {
-            50_000_000
-        };
-        let dummy = &router.scales;
+        let cap = 50_000_000;
+        let dummy = &self.dummy_f32;
         let (ra, rb) = match &router.lora {
             Some(l) => (&l.a, &l.b),
             None => (dummy, dummy),
@@ -3322,30 +4394,35 @@ impl GpuContext {
 #[cfg(test)]
 mod plan_tests {
     use super::*;
+    use ff_core::paths::checkpoint_dir;
 
     #[test]
-    fn partition_layers_is_contiguous_and_covers_all_layers() {
-        let ranges = partition_layers(40, 3);
-        assert_eq!(ranges.len(), 3);
-        assert_eq!(ranges[0], 0..14);
-        assert_eq!(ranges[1], 14..27);
-        assert_eq!(ranges[2], 27..40);
-        assert_eq!(ranges.iter().map(|r| r.end - r.start).sum::<usize>(), 40);
-        for window in ranges.windows(2) {
-            assert_eq!(window[0].end, window[1].start);
+    #[ignore = "requires FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview"]
+    fn layer_ranges_cover_the_real_checkpoint_contiguously() -> Result<()> {
+        let dir = checkpoint_dir("Edge0/Edge0-35B-A3B-preview")
+            .context("set FF_MODELS_DIR with Edge0/Edge0-35B-A3B-preview")?;
+        ensure!(
+            dir.is_dir(),
+            "FF_MODELS_DIR must contain Edge0/Edge0-35B-A3B-preview"
+        );
+        println!("layer-range checkpoint: {}", dir.display());
+        let weights = crate::weights::Edge0Weights::open(&dir).unwrap();
+        let config = crate::config::Edge0Config::from_model_dir(&dir).unwrap();
+        let text = &config.text_config;
+        assert_eq!(layer_ranges(&weights, text, 1).unwrap(), vec![0..40]);
+        assert_eq!(
+            layer_ranges(&weights, text, 2).unwrap(),
+            vec![0..20, 20..40]
+        );
+        let three = layer_ranges(&weights, text, 3).unwrap();
+        assert_eq!(three[0].start, 0);
+        assert_eq!(three[2].end, 40);
+        for pair in three.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
         }
-    }
-
-    #[test]
-    fn partition_layers_single_device_is_identity() {
-        assert_eq!(partition_layers(40, 1), vec![0..40]);
-        assert_eq!(partition_layers(1, 1), vec![0..1]);
-    }
-
-    #[test]
-    #[should_panic(expected = "n_devices > 0")]
-    fn partition_layers_rejects_zero() {
-        let _ = partition_layers(40, 0);
+        assert!(layer_ranges(&weights, text, 0).is_err());
+        assert!(layer_ranges(&weights, text, 41).is_err());
+        Ok(())
     }
 }
 
@@ -3407,7 +4484,7 @@ impl Edge0Multi {
             !ordinals.is_empty(),
             "Edge0Multi::new requires at least one ordinal"
         );
-        let ranges = partition_layers(config.text_config.num_hidden_layers, ordinals.len());
+        let ranges = layer_ranges(weights, &config.text_config, ordinals.len())?;
         let mut peers = Vec::with_capacity(ordinals.len());
         let mut peer_experts = Vec::with_capacity(ordinals.len());
         for (device_index, (&ordinal, range)) in ordinals.iter().zip(ranges.iter()).enumerate() {
@@ -3439,7 +4516,14 @@ impl Edge0Multi {
             )?;
             let gdn_devices =
                 gdn_devices_for_range(&ctx, gdn_weights, &config.text_config, range.clone())?;
-            let rt = GpuRuntime::new(ctx, proj, gdn_devices, Some(res), weights.lora_rank);
+            let rt = GpuRuntime::new(
+                ctx,
+                proj,
+                gdn_devices,
+                Some(res),
+                weights.lora_rank,
+                config.text_config.num_hidden_layers,
+            );
             let per_peer_experts = if experts_resident {
                 Some(build_peer_experts(
                     &rt.ctx,
@@ -3501,8 +4585,8 @@ fn build_peer_experts(
                 );
             }
             row_p.push(ctx.upload_slice(&packed)?);
-            row_s.push(ctx.upload_f32(&s)?);
-            row_b.push(ctx.upload_f32(&b)?);
+            row_s.push(ctx.stream.clone_htod(&crate::int4::f32_to_bf16_bits(&s))?);
+            row_b.push(ctx.stream.clone_htod(&crate::int4::f32_to_bf16_bits(&b))?);
         }
         stacked.push(row_p.try_into().unwrap());
         stacked_scales.push(row_s.try_into().unwrap());
@@ -3566,13 +4650,12 @@ fn upload_layer_projections(
     Ok(())
 }
 
-#[allow(clippy::type_complexity)]
 fn layer_norm_pairs(
     layer_norms: &[Vec<f32>],
     attn_norms: &[Vec<f32>],
     text: &crate::config::TextConfig,
     range: std::ops::Range<usize>,
-) -> (Vec<(Vec<f32>, Vec<f32>)>, Vec<(Vec<f32>, Vec<f32>)>) {
+) -> (Vec<NormPair>, Vec<NormPair>) {
     let mut ln = Vec::with_capacity(range.len());
     let mut an = Vec::new();
     let mut attn_layer_idx = (0..range.start)

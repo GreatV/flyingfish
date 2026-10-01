@@ -37,7 +37,6 @@ pub struct ModelEvidence {
     pub auxiliary_files: Vec<AuxiliaryFile>,
 }
 
-/// What the host was configured to do, as opposed to what it is.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentEvidence {
@@ -66,12 +65,6 @@ pub struct CgroupQuota {
     pub memory_max: Option<String>,
 }
 
-/// Everything a measurement is only valid under, recorded as itself.
-///
-/// These were four digests. A digest can say a replayed context differs but
-/// never which of the checkpoint, the request, the device or the environment
-/// moved, and it costs a read of everything it covers. Recording the material
-/// lets [`Self::first_difference`] name the field.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceContext {
@@ -147,7 +140,7 @@ impl EvidenceContext {
                 });
             }
         }
-        let hardware = HardwareFingerprint::collect(device);
+        let hardware = HardwareFingerprint::collect(device)?;
         hardware.validate()?;
         let root = std::fs::canonicalize(model)?;
         let storage = FileStat::of_target(&root)?;
@@ -475,8 +468,7 @@ impl ResourceEvidence {
                         "trial lacks phase, memory or counter observations"
                     );
                 }
-                // A policy that is faster because it computed something else is
-                // not faster. The two retained outputs decide that directly.
+                // The retained outputs must agree for a timing comparison.
                 pair.outputs_match = compare_artifact_files(
                     &outputs[0].0,
                     outputs[0].1,
@@ -537,7 +529,6 @@ impl ResourceEvidence {
                             "routing evidence dtype or access schedule differs from execution"
                         );
                         let layout = serde_json::to_value(policy.expert_cache.layout)?;
-                        let replacement = serde_json::to_value(policy.expert_cache.replacement)?;
                         let row = report
                             .cache_replays
                             .iter()
@@ -546,8 +537,6 @@ impl ResourceEvidence {
                                     == policy.expert_cache.maximum_bound_bytes
                                     && serde_json::to_value(row.cache_layout).ok().as_ref()
                                         == Some(&layout)
-                                    && serde_json::to_value(row.cache_policy).ok().as_ref()
-                                        == Some(&replacement)
                             })
                             .context(
                                 "routing replay has no matching candidate unit/layout/budget",
@@ -675,13 +664,11 @@ pub(crate) mod tests {
         Ok(())
     }
     use crate::{
-        glm::{ExpertCacheLayout, ExpertCacheReplacementPolicy},
+        glm::ExpertCacheLayout,
         runtime::weights::{CachePolicy, WeightSource},
     };
     use std::{collections::BTreeMap, fs};
 
-    /// A context standing for one machine, one checkpoint and one request.
-    /// Tests vary one field at a time to say which difference they mean.
     pub(crate) fn sample_context() -> EvidenceContext {
         let model_root = std::env::temp_dir()
             .join("flyingfish-evidence-test-model")
@@ -714,7 +701,7 @@ pub(crate) mod tests {
                 }],
             },
             request: serde_json::json!({"prompt": "a", "max_new_tokens": 4}),
-            hardware: HardwareFingerprint::collect(&Device::Cpu),
+            hardware: HardwareFingerprint::collect(&Device::Cpu).unwrap(),
             executable_metadata: None,
             environment: EnvironmentEvidence {
                 model_root,
@@ -738,7 +725,6 @@ pub(crate) mod tests {
             32,
             ExpertCacheOptions {
                 layout: ExpertCacheLayout::PerLayerSplit,
-                replacement: ExpertCacheReplacementPolicy::Lru,
                 maximum_bound_bytes: 0,
                 minimum_bound_bytes: 0,
                 adaptive: false,

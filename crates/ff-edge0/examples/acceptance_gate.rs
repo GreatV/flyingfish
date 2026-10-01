@@ -1,17 +1,4 @@
-//! Extended acceptance gate — the instrument the lora_add 1/32 bug proved
-//! missing. Two parts, both must pass (nonzero exit otherwise):
-//!
-//! A. LoRA-dump assertion: for a representative set of lora'd projections,
-//!    GPU (device lora) vs CPU (host lora) on a deterministic input, gated
-//!    at max_rel <= 1e-4 — the bug ran at ~3e-1 — PLUS an adapter-presence
-//!    check (with-lora vs without-lora must differ materially), the
-//!    failure mode where a path silently drops the adapter entirely.
-//!
-//! B. Greedy-decode token-id gates: the original 8-token prompt and a
-//!    second 32-token prompt against Python-reference ids (bit-equal
-//!    prompt ids, exact id sequence). Longer decode gives near-tie
-//!    margins more chances to cross — the 8-token gate stayed green
-//!    through the lora bug.
+//! LoRA projection parity and greedy reference-ID acceptance checks.
 
 use ff_edge0::config::Edge0Config;
 use ff_edge0::model::Edge0Text;
@@ -39,9 +26,6 @@ const PROMPT1: &str = "Explain paging to a systems programmer.";
 const EXPECT1: &[u32] = &[8160, 579, 264, 7047, 1817, 25, 271, 16];
 
 const PROMPT2: &str = "Describe how a CPU cache works, briefly.";
-// Regenerated 2026-09-18 with the fixed oracle (per-kv-head KV caches +
-// final_norm applied). Prompt 1's 8 ids reproduced unchanged; prompt 2
-// diverges from the pre-fix archive at token 16.
 const EXPECT2: &[u32] = &[
     8160, 579, 264, 7047, 1817, 25, 271, 16, 13, 220, 2972, 15771, 2598, 2570, 5952, 64700, 561,
     1156, 6587, 264, 348, 6449, 9, 3874, 314, 1204, 264, 13540, 6297, 4138, 13, 271,
@@ -70,8 +54,7 @@ fn main() -> anyhow::Result<()> {
                 let lora = gpu.weights_lora(name);
                 (quant.matvec(&x, lora), quant.matvec(&x, None))
             };
-            // Adapter presence: the delta must be materially nonzero
-            // (the shared-expert-missing bug was an entirely absent delta).
+            // The adapter contribution must be nonzero.
             let delta = cpu_full
                 .iter()
                 .zip(&cpu_bare)
@@ -81,7 +64,7 @@ fn main() -> anyhow::Result<()> {
                 delta > 1e-3,
                 "{name}: adapter delta is ~0 ({delta:e}) — a path dropped the lora"
             );
-            // GPU (device lora) vs CPU (host lora): the 1/32 bug ran ~3e-1.
+
             let out = gpu
                 .gpu
                 .as_ref()
@@ -130,10 +113,17 @@ fn main() -> anyhow::Result<()> {
         let mut got = Vec::new();
         let mut prev = model.first_token()?;
         got.push(prev);
+        let started = std::time::Instant::now();
         while got.len() < expect.len() {
-            prev = model.forward_token_pub(prev)?;
+            prev = model.forward_token(prev)?;
             got.push(prev);
         }
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "B: {tag} ids {got:?} decode {:.3} ms/token",
+            ms / (got.len() - 1).max(1) as f64
+        );
+
         if got.len() >= expect.len() && &got[..expect.len()] == expect {
             println!("B: {tag} gate PASS ({} ids exact)", expect.len());
             continue;

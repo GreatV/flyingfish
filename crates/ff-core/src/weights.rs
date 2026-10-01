@@ -9,7 +9,7 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -126,8 +126,7 @@ pub struct CacheStats {
     #[serde(deserialize_with = "crate::required_option")]
     pub max_bytes: Option<u64>,
     pub over_budget: bool,
-    /// Present even when empty in tensor mode. Omitted in the legacy shard
-    /// representation so existing sealed observation digests remain unchanged.
+    /// Present in tensor-granularity cache statistics, including an empty cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tensor_retention: Option<TensorRetentionStats>,
 }
@@ -326,7 +325,43 @@ struct SafetensorsIndex {
 
 #[derive(Debug, Deserialize)]
 struct IndexMetadata {
+    #[serde(deserialize_with = "deserialize_index_size")]
     total_size: u64,
+}
+
+/// Decode integer byte counts, including integral JSON floats through 2^53.
+pub fn deserialize_index_size<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u64, D::Error> {
+    let number = serde_json::Number::deserialize(deserializer).map_err(|error| {
+        serde::de::Error::custom(format_args!("unsupported total_size: {error}"))
+    })?;
+    number
+        .as_u64()
+        .or_else(|| {
+            number.as_f64().and_then(|value| {
+                (value.is_finite()
+                    && value >= 0.0
+                    && value.fract() == 0.0
+                    && value <= (1u64 << 53) as f64)
+                    .then_some(value as u64)
+            })
+        })
+        .ok_or_else(|| {
+            serde::de::Error::custom(
+                "unsupported total_size: expected a non-negative u64 integer or an integral float at most 2^53",
+            )
+        })
+}
+
+/// Preserve missing/null optional counts and apply the shared numeric rule.
+pub fn deserialize_optional_index_size<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error> {
+    Option::<serde_json::Number>::deserialize(deserializer)?
+        .map(deserialize_index_size)
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 enum ShardBytes {
@@ -351,7 +386,7 @@ impl Drop for MappedShard {
         if self.droppable
             && let Some(file) = &self.file
         {
-            let _ = crate::storage::advise_dropped(file);
+            let _ = crate::storage::advise_dropped(file, 0, 0);
         }
     }
 }
@@ -550,6 +585,21 @@ impl ShardData {
     }
 }
 
+/// Bytes of one tensor; holds its shard alive.
+#[derive(Clone)]
+pub struct TensorBytes {
+    shard: Arc<ShardData>,
+    range: std::ops::Range<usize>,
+}
+
+impl std::ops::Deref for TensorBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.shard.bytes()[self.range.clone()]
+    }
+}
+
 struct CacheLookup {
     shard: Arc<ShardData>,
 }
@@ -569,49 +619,52 @@ struct ShardCache {
     source: WeightSource,
     policy: CachePolicy,
     headers: ShardHeaderCatalog,
+    load_threads: usize,
     /// Whether an evicted shard should drop its cached pages, decided once from
     /// the checkpoint's own size against the host's own free memory.
     drop_evicted_pages: bool,
     state: Mutex<CacheState>,
 }
 
-/// Read a shard with parallel positional reads.
-/// FF_WEIGHT_LOAD_THREADS sets the reader count (default 8).
+/// Read disjoint ranges with independent readahead windows.
 #[cfg(unix)]
-fn read_shard_parallel(path: &Path) -> Result<Box<[u8]>> {
+fn read_shard_parallel(path: &Path, threads: usize, release_pages: bool) -> Result<Box<[u8]>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open weight shard {}", path.display()))?;
-    let len = usize::try_from(file.metadata()?.len()).context("weight shard size exceeds usize")?;
+    let file_bytes = file.metadata()?.len();
+    let len = usize::try_from(file_bytes).context("weight shard size exceeds usize")?;
     let mut bytes = vec![0u8; len];
-    let threads = std::env::var("FF_WEIGHT_LOAD_THREADS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(8usize)
-        .max(1)
-        .min(len.div_ceil(4 << 20).max(1));
+    let threads = threads.min(len.div_ceil(4 << 20).max(1));
     crate::storage::read_parallel_into(
-        crate::storage::ParallelReadSource::Shared(&file),
+        crate::storage::ParallelReadSource::Reopen(path),
         0,
         &mut bytes,
         threads,
     )
     .with_context(|| format!("failed to read weight shard {}", path.display()))?;
+    if release_pages {
+        crate::storage::advise_dropped(&file, 0, file_bytes);
+    }
     Ok(bytes.into_boxed_slice())
 }
 
 #[cfg(not(unix))]
-fn read_shard_parallel(path: &Path) -> Result<Box<[u8]>> {
+fn read_shard_parallel(path: &Path, _threads: usize, _release_pages: bool) -> Result<Box<[u8]>> {
     Ok(fs::read(path)
         .with_context(|| format!("failed to read weight shard {}", path.display()))?
         .into_boxed_slice())
 }
 
 impl ShardCache {
-    fn new(source: WeightSource, policy: CachePolicy) -> Self {
-        Self {
+    fn new(source: WeightSource, policy: CachePolicy) -> Result<Self> {
+        static THREADS: OnceLock<std::result::Result<usize, String>> = OnceLock::new();
+        let load_threads =
+            crate::probe::cached_env_usize(&THREADS, "FF_WEIGHT_LOAD_THREADS", 32, 1, usize::MAX)?;
+        Ok(Self {
             source,
             policy,
             headers: ShardHeaderCatalog::default(),
+            load_threads,
             drop_evicted_pages: false,
             state: Mutex::new(CacheState {
                 shards: HashMap::new(),
@@ -623,14 +676,14 @@ impl ShardCache {
                 memory_source_read_bytes: 0,
                 resident_bytes: 0,
             }),
-        }
+        })
     }
 
-    fn get(&self, path: &Path) -> Result<Arc<ShardData>> {
-        Ok(self.lookup(path)?.shard)
+    fn get(&self, path: &Path, release_pages: bool) -> Result<Arc<ShardData>> {
+        Ok(self.lookup(path, release_pages)?.shard)
     }
 
-    fn lookup(&self, path: &Path) -> Result<CacheLookup> {
+    fn lookup(&self, path: &Path, release_pages: bool) -> Result<CacheLookup> {
         anyhow::ensure!(
             self.policy.granularity == CacheGranularity::Shard,
             "whole-shard payload lookup is invalid under tensor granularity"
@@ -658,7 +711,9 @@ impl ShardCache {
                     droppable: self.drop_evicted_pages,
                 })
             }
-            WeightSource::Memory => ShardBytes::Memory(read_shard_parallel(path)?),
+            WeightSource::Memory => {
+                ShardBytes::Memory(read_shard_parallel(path, self.load_threads, release_pages)?)
+            }
         };
         let loaded = Arc::new(
             ShardData::new(storage, header)
@@ -754,6 +809,7 @@ pub struct ModelWeights {
     tensor_cache: Option<TensorCache>,
     device_cache: Option<AttachedDeviceCache>,
     host_complements_device: bool,
+    page_release: OnceLock<Result<bool>>,
     access: WeightAccessCounters,
 }
 
@@ -831,11 +887,12 @@ impl ModelWeights {
             root: root.to_path_buf(),
             index_path: model_path,
             index,
-            cache: ShardCache::new(source, cache_policy),
+            cache: ShardCache::new(source, cache_policy)?,
             tensor_cache: (cache_policy.granularity == CacheGranularity::Tensor)
                 .then(|| TensorCache::new(source, cache_policy)),
             device_cache: None,
             host_complements_device: false,
+            page_release: OnceLock::new(),
             access: WeightAccessCounters::default(),
         })
     }
@@ -901,33 +958,17 @@ impl ModelWeights {
             root: root.to_path_buf(),
             index_path,
             index,
-            cache: ShardCache::new(source, cache_policy),
+            cache: ShardCache::new(source, cache_policy)?,
             tensor_cache: (cache_policy.granularity == CacheGranularity::Tensor)
                 .then(|| TensorCache::new(source, cache_policy)),
             device_cache: None,
             host_complements_device: false,
+            page_release: OnceLock::new(),
             access: WeightAccessCounters::default(),
         })
     }
 
-    /// Drop a shard's cached pages when the shard is evicted.
-    ///
-    /// Only the caller knows whether this helps, because it depends entirely on
-    /// reuse distance and not on how large the checkpoint is. An adapter that
-    /// walks every block once per evaluation has a reuse distance of the whole
-    /// model: if that exceeds host memory, nothing it reads is ever hit again,
-    /// and the page cache pays to hold pages it will evict before their next
-    /// use. Dropping each shard behind that scan was measured at 1.82 GB/s
-    /// against 0.13 GB/s for the same scan without it.
-    ///
-    /// An adapter with locality wants the opposite, and a checkpoint far larger
-    /// than memory is no evidence against locality: GLM-5.3-Flash is 305 GiB
-    /// against 58 GiB of host memory, but its routed experts repeat across
-    /// tokens, and dropping its pages on eviction measured 53% slower
-    /// end-to-end. Size is not the signal; declared reuse is.
-    ///
-    /// Inert for `WeightSource::Memory`, which has no page cache behind it, and
-    /// off Unix, where there is no primitive for it.
+    /// Drop cached pages on eviction when enabled; inert for memory sources and non-Unix platforms.
     pub fn drop_evicted_pages(&mut self, enabled: bool) {
         self.cache.drop_evicted_pages = enabled && self.cache.source == WeightSource::Mmap;
     }
@@ -959,6 +1000,7 @@ impl ModelWeights {
         );
         self.cache.source = source;
         self.cache.policy = policy;
+        self.page_release.take();
         self.tensor_cache = (policy.granularity == CacheGranularity::Tensor)
             .then(|| TensorCache::new(source, policy));
         Ok(())
@@ -1331,6 +1373,29 @@ impl ModelWeights {
         self.with_view(name, |view, _| f(view.data()))
     }
 
+    /// A tensor's original bytes as an owned handle that keeps the shard
+    /// mapped after the cache evicts it. Shard granularity only.
+    pub fn tensor_bytes(&self, name: &str) -> Result<TensorBytes> {
+        anyhow::ensure!(
+            self.tensor_cache.is_none(),
+            "tensor handles need shard-granularity caching"
+        );
+        self.access.record_tensor_read(name);
+        let shard_name = self.index.weight_map.get(name).with_context(|| {
+            format!(
+                "tensor is not present in {}: {name}",
+                self.index_path.display()
+            )
+        })?;
+        let shard = self
+            .cache
+            .get(&self.root.join(shard_name), self.page_release()?)?;
+        let info = shard.tensor_info(name)?;
+        let range = info.offset..info.offset + info.len;
+        anyhow::ensure!(range.end <= shard.len(), "tensor {name} exceeds its shard");
+        Ok(TensorBytes { shard, range })
+    }
+
     fn materialize(&self, name: &str, device: &Device) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(cuda) = device {
@@ -1404,21 +1469,7 @@ impl ModelWeights {
         self.materialize(name, device)
     }
 
-    /// One rank's slice of a rank-two tensor, materialized on `device` and
-    /// retained under the slice's own cache identity.
-    ///
-    /// This is the loader a tensor split calls for. `load_rows` forgoes the
-    /// cache entirely because a gathered subset must
-    /// not be keyed by the tensor's name; a tensor split cannot forgo it and
-    /// keep its point, so the partition is part of the key instead. A
-    /// `TensorPartition::Whole` request is `load`, cache and all, which is why
-    /// nothing changes for a caller that does not split.
-    ///
-    /// `TensorAxis::Rows` is a contiguous range of a row-major checkpoint and
-    /// splits a linear's output features (Megatron's column-parallel case);
-    /// `TensorAxis::Columns` gathers a strided range and splits its input
-    /// features (the row-parallel case). Neither reorders anything within the
-    /// slice, so a rank computes over exactly the released numbers.
+    /// Materialize a rank-two tensor slice on the device and cache it under its partition identity.
     pub fn load_shard(
         &self,
         name: &str,
@@ -1605,6 +1656,66 @@ impl ModelWeights {
         }
     }
 
+    fn page_release(&self) -> Result<bool> {
+        if self.cache.source != WeightSource::Memory {
+            return Ok(false);
+        }
+        let snapshot =
+            crate::probe::ResourceSnapshot::capture(None).context("resource probe failed")?;
+        self.page_release
+            .get_or_init(|| self.plan_page_release(&snapshot))
+            .as_ref()
+            .copied()
+            .map_err(|error| anyhow::anyhow!("{error:#}"))
+    }
+
+    fn plan_page_release(&self, snapshot: &crate::probe::ResourceSnapshot) -> Result<bool> {
+        use accounting::{CacheLoadLifetimes, estimate_cache_residency};
+        let available = snapshot
+            .host_memory_available_bytes
+            .into_iter()
+            .chain(snapshot.cgroup_v2_memory_available_bytes)
+            .min();
+        let reserve = crate::probe::admission_reserve_bytes(snapshot.host_pool_total_bytes());
+        let budget = available.map(|bytes| bytes.saturating_sub(reserve));
+        let units = self
+            .cache
+            .policy
+            .max_shards
+            .saturating_add(1)
+            .min(self.inventory().shards) as u64;
+        if let Some(upper) = self.max_shard_file_bytes()?.checked_mul(units)
+            && let Some(budget) = budget
+            && upper.checked_mul(2).is_some_and(|bytes| bytes <= budget)
+        {
+            eprintln!(
+                "weights: page_release: off (owned <= {upper} B + source <= {upper} B; available {available:?} B, reserve {reserve} B, budget {budget} B)"
+            );
+            return Ok(false);
+        }
+        let inventory = self.cache_inventory()?;
+        let charge = |policy| {
+            estimate_cache_residency(
+                &inventory,
+                WeightSource::Memory,
+                policy,
+                CacheLoadLifetimes::SERIAL,
+            )
+        };
+        let owned = charge(self.cache.policy)?.owned_weight_bytes;
+        let source =
+            charge(self.cache.policy.with_granularity(CacheGranularity::Shard))?.owned_weight_bytes;
+        let required = owned
+            .checked_add(source)
+            .context("owned and source page-cache bytes overflow")?;
+        let release = budget.is_some_and(|bytes| required > bytes);
+        eprintln!(
+            "weights: page_release: {} (owned {owned} B + source {source} B; available {available:?} B, reserve {reserve} B, budget {budget:?} B)",
+            if release { "on" } else { "off" }
+        );
+        Ok(release)
+    }
+
     fn with_view<T>(
         &self,
         name: &str,
@@ -1617,12 +1728,13 @@ impl ModelWeights {
             )
         })?;
         let shard_path = self.root.join(shard_name);
+        let release_pages = self.page_release()?;
         if let Some(cache) = &self.tensor_cache {
             let header = self.cache.headers.get(&shard_path)?;
-            let lookup = cache.lookup(&shard_path, name, &header)?;
+            let lookup = cache.lookup(&shard_path, name, &header, release_pages)?;
             return f(&lookup.data.view()?, &shard_path);
         }
-        let shard = self.cache.get(&shard_path)?;
+        let shard = self.cache.get(&shard_path, release_pages)?;
         let view = shard.tensor_view(name).with_context(|| {
             format!(
                 "index maps {name} to {}, but it is absent",
@@ -1649,7 +1761,7 @@ impl ModelWeights {
             )
         })?;
         let shard_path = self.root.join(shard_name);
-        let shard = self.cache.get(&shard_path)?;
+        let shard = self.cache.get(&shard_path, self.page_release()?)?;
         let view = shard.tensor_view(name).with_context(|| {
             format!(
                 "index maps {name} to {}, but it is absent",
@@ -1745,6 +1857,59 @@ mod tests {
     use candle_core::Tensor;
     use serde_json::json;
 
+    #[test]
+    fn page_release_uses_cgroup_headroom_and_final_cache_policy() -> Result<()> {
+        let root = fixture();
+        let mut weights = ModelWeights::open(
+            root.path(),
+            WeightSource::Memory,
+            CachePolicy::unbounded_units(),
+        )?;
+        let total = fs::metadata(root.path().join("one.safetensors"))?.len()
+            + fs::metadata(root.path().join("two.safetensors"))?.len();
+        let mut snapshot = crate::probe::ResourceSnapshot::capture(None).unwrap();
+        snapshot.host_memory_total_bytes = Some(4 << 30);
+        snapshot.host_memory_available_bytes = Some(4 << 30);
+        snapshot.cgroup_v2_memory_limit = Some(crate::probe::CgroupMemoryLimit::Bytes(1 << 30));
+        let reserve = crate::probe::admission_reserve_bytes(snapshot.host_pool_total_bytes());
+        snapshot.cgroup_v2_memory_available_bytes = Some(reserve + 2 * total);
+        assert!(!weights.plan_page_release(&snapshot)?);
+        snapshot.cgroup_v2_memory_available_bytes = Some(reserve + 2 * total - 1);
+        assert!(weights.plan_page_release(&snapshot)?);
+        weights.page_release.set(Ok(true)).unwrap();
+        weights.configure_unloaded_cache(WeightSource::Mmap, CachePolicy::new(1))?;
+        assert!(weights.page_release.get().is_none());
+        assert!(!weights.page_release()?);
+        weights.configure_unloaded_cache(WeightSource::Memory, CachePolicy::new(1))?;
+        assert!(weights.page_release.get().is_none());
+        assert!(!weights.page_release()?);
+        weights.with_tensor_bytes("a", |_| Ok(()))?;
+        assert!(
+            weights
+                .configure_unloaded_cache(WeightSource::Memory, CachePolicy::new(1))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shard_readers_preserve_bytes_across_uneven_ranges() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let bytes = (0..(9 << 20) + 37)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(file.path(), &bytes)?;
+        for threads in [1, 3, 8] {
+            assert_eq!(
+                read_shard_parallel(file.path(), threads, false)?.as_ref(),
+                bytes
+            );
+        }
+        fs::write(file.path(), [])?;
+        assert!(read_shard_parallel(file.path(), 1, false)?.is_empty());
+        Ok(())
+    }
+
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         Tensor::new(&[1f32, 2., 3.], &Device::Cpu)
@@ -1806,6 +1971,45 @@ mod tests {
             ModelWeights::open(root.path(), WeightSource::Memory, CachePolicy::new(1)).unwrap();
         memory.drop_evicted_pages(true);
         assert!(!memory.cache.drop_evicted_pages);
+    }
+
+    #[test]
+    fn index_size_preserves_integers_and_bounds_float_counts() {
+        for (encoded, expected) in [
+            ("0", 0),
+            ("28", 28),
+            ("9007199254740993", 9_007_199_254_740_993),
+            ("18446744073709551615", u64::MAX),
+            ("0.0", 0),
+            ("55562855904.0", 55_562_855_904),
+            ("5.5562855904e10", 55_562_855_904),
+            ("9007199254740992.0", 1 << 53),
+        ] {
+            let parsed: IndexMetadata =
+                serde_json::from_str(&format!("{{\"total_size\":{encoded}}}")).unwrap();
+            assert_eq!(parsed.total_size, expected, "{encoded}");
+        }
+        for encoded in [
+            "1.5",
+            "-1",
+            "-1.0",
+            "9007199254740994.0",
+            "18446744073709551616",
+            "18446744073709551615.0",
+            "1e100",
+            "1e400",
+            "null",
+            "true",
+            "\"28\"",
+        ] {
+            let error =
+                serde_json::from_str::<IndexMetadata>(&format!("{{\"total_size\":{encoded}}}"))
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("unsupported total_size"),
+                "{encoded}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1915,10 +2119,9 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "requires a CUDA device"]
     fn cuda_uploads_preserve_tensor_cache_granularity() {
-        let Ok(device) = Device::new_cuda(0) else {
-            return;
-        };
+        let device = Device::new_cuda(0).expect("requires a CUDA device");
         let root = fixture();
         for source in [WeightSource::Mmap, WeightSource::Memory] {
             for direct_cache in [false, true] {
@@ -2037,19 +2240,19 @@ mod tests {
 
         weights
             .cache
-            .get(&dir.path().join("small.safetensors"))
+            .get(&dir.path().join("small.safetensors"), false)
             .unwrap();
         weights
             .cache
-            .get(&dir.path().join("large.safetensors"))
+            .get(&dir.path().join("large.safetensors"), false)
             .unwrap();
         weights
             .cache
-            .get(&dir.path().join("small.safetensors"))
+            .get(&dir.path().join("small.safetensors"), false)
             .unwrap();
         weights
             .cache
-            .get(&dir.path().join("medium.safetensors"))
+            .get(&dir.path().join("medium.safetensors"), false)
             .unwrap();
         let stats = weights.cache_stats();
         assert_eq!(stats.resident_shards, 2);
@@ -2061,11 +2264,11 @@ mod tests {
 
         weights
             .cache
-            .get(&dir.path().join("small.safetensors"))
+            .get(&dir.path().join("small.safetensors"), false)
             .unwrap();
         weights
             .cache
-            .get(&dir.path().join("large.safetensors"))
+            .get(&dir.path().join("large.safetensors"), false)
             .unwrap();
         let stats = weights.cache_stats();
         assert_eq!(stats.hits, 2);
@@ -2091,11 +2294,11 @@ mod tests {
         .unwrap();
         unit_bound
             .cache
-            .get(&dir.path().join("small.safetensors"))
+            .get(&dir.path().join("small.safetensors"), false)
             .unwrap();
         unit_bound
             .cache
-            .get(&dir.path().join("medium.safetensors"))
+            .get(&dir.path().join("medium.safetensors"), false)
             .unwrap();
         assert_eq!(unit_bound.cache_stats().resident_shards, 1);
 
@@ -2107,11 +2310,11 @@ mod tests {
         .unwrap();
         weights
             .cache
-            .get(&dir.path().join("small.safetensors"))
+            .get(&dir.path().join("small.safetensors"), false)
             .unwrap();
         weights
             .cache
-            .get(&dir.path().join("medium.safetensors"))
+            .get(&dir.path().join("medium.safetensors"), false)
             .unwrap();
         let stats = weights.cache_stats();
         assert_eq!(stats.resident_shards, 2);
@@ -2122,7 +2325,7 @@ mod tests {
 
         weights
             .cache
-            .get(&dir.path().join("large.safetensors"))
+            .get(&dir.path().join("large.safetensors"), false)
             .unwrap();
         let stats = weights.cache_stats();
         assert_eq!(stats.resident_shards, 1);
@@ -2140,12 +2343,12 @@ mod tests {
 
         weights
             .cache
-            .get(&dir.path().join("small.safetensors"))
+            .get(&dir.path().join("small.safetensors"), false)
             .unwrap();
         assert!(!weights.cache_stats().over_budget);
         weights
             .cache
-            .get(&dir.path().join("large.safetensors"))
+            .get(&dir.path().join("large.safetensors"), false)
             .unwrap();
         let stats = weights.cache_stats();
         assert_eq!(stats.resident_shards, 1);
@@ -2157,7 +2360,7 @@ mod tests {
 
         weights
             .cache
-            .get(&dir.path().join("small.safetensors"))
+            .get(&dir.path().join("small.safetensors"), false)
             .unwrap();
         let stats = weights.cache_stats();
         assert_eq!(stats.resident_shards, 1);
@@ -2302,10 +2505,7 @@ mod tests {
         assert_eq!(whole.dims(), [4, 4]);
     }
 
-    /// Under a tensor split, a resident slice must never answer a request for
-    /// the whole tensor, and two ranks' slices must not answer for each other —
-    /// on one device, under one name, at one dtype, which is the case the old
-    /// key could not tell apart.
+    /// Whole tensors and distinct partitions must have distinct cache identities.
     #[test]
     fn a_resident_split_never_answers_a_whole_tensor_read() {
         let dir = projection_fixture();

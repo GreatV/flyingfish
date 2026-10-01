@@ -98,6 +98,10 @@ impl Metadata {
         self.0["quantization"]["format"] == name
     }
 
+    pub(super) fn has_quantization(&self) -> bool {
+        !self.0["quantization"].is_null()
+    }
+
     pub(super) fn quantization_mode(&self, name: &str) -> bool {
         self.0["quantization"]["mode"] == name
     }

@@ -4,29 +4,10 @@ use candle_nn::{Linear, Module, ops};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use std::{collections::BTreeMap, fmt, num::NonZeroUsize, str::FromStr};
 
-/// Whether this device may run the kernels compiled from this repository.
-///
-/// Their numerics are fixed by their own source and the one `compute_80` PTX
-/// it is compiled to, so the question is only whether the hardware can execute
-/// those instructions. Every dispatch of a transcribed kernel goes through
-/// here.
 #[cfg(feature = "cuda")]
-fn tuned_cuda(device: &candle_core::Device) -> bool {
-    crate::cuda::tuned_kernels_available(device)
-}
-
-/// Whether the vendor libraries this host provides are the reference ones.
-///
-/// cuBLASLt and cuDNN choose different kernels per architecture and per library
-/// build, so an operator that reproduces a recorded vendor-library result is
-/// making a claim about one host. Compositions that exist to match PyTorch's
-/// operator order go through here rather than through [`tuned_cuda`]: they are
-/// parity paths, and on this tree's own measurements they are not the faster
-/// ones, so declining them elsewhere costs evidence and not speed.
-#[cfg(feature = "cuda")]
-fn reference_cuda(device: &candle_core::Device) -> bool {
-    crate::cuda::profile::reference_libraries_available(device)
-}
+use crate::cuda::{
+    profile::reference_libraries_available as reference_cuda, tuned_kernels_available as tuned_cuda,
+};
 
 pub const MODALITY_COUNT: usize = 3;
 
@@ -36,18 +17,7 @@ pub const DEFAULT_ATTENTION_PROJECTION_CHUNK_SIZE: usize = 32;
 
 pub const DEFAULT_ATTENTION_QUERY_CHUNK_SIZE: usize = 32;
 
-/// The projection chunk to use when FlashAttention is selected.
-///
-/// On the exact path the projection chunk is a pure memory bound and 32 rows
-/// is the conservative choice. Under FlashAttention it is also the query span
-/// of each attention call, because the query chunk bounds a score matrix that
-/// FlashAttention never materializes. That makes the span decide the kernel's
-/// arithmetic intensity: roughly one FLOP per byte per query row, against an
-/// RTX 4090 ridge point near 164. At the released 73,743-row T2VA shape a
-/// 32-row span measures 16.1 TFLOP/s and a 4,096-row span 157.7, against 162.9
-/// for a single whole-sequence call — so this recovers 97% of the achievable
-/// rate while holding the query and its normalization buffers to tens of
-/// megabytes. Admission still models and can refuse it.
+/// Default FlashAttention projection/query span; admission accounts for its activation buffers.
 pub const DEFAULT_FLASH_ATTENTION_PROJECTION_CHUNK_SIZE: usize = 4_096;
 
 /// Largest key width covered by PyTorch's CUDA persistent-softmax dispatch.
@@ -76,7 +46,6 @@ pub(crate) const QWEN_ATTENTION_SCORE_BACKEND: &str =
 pub(crate) const QWEN_ATTENTION_MASK_BACKEND: &str =
     "qwen3-vl-eager-causal-add-finfo-input-dtype-min-v1";
 pub(crate) const QWEN_SILU_BACKEND: &str = "qwen3-vl-f32-silu-single-input-dtype-cast-v1";
-pub const QWEN_GELU_BACKEND: &str = "qwen3-vl-f32-exact-erf-gelu-single-input-dtype-cast-v1";
 pub(crate) const QWEN_SOFTMAX_BACKEND: &str =
     "qwen3-vl-eager-f32-persistent-1..2048+regular-register-2049..9216-v1";
 
@@ -1098,7 +1067,7 @@ pub(crate) fn qwen_rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Result
     let variance_with_epsilon = (&variance + eps)?;
     #[cfg(feature = "cuda")]
     let inverse_root = if tuned_cuda(input.device()) {
-        crate::cuda::rms_norm::qwen_rsqrt(&variance_with_epsilon)?
+        crate::cuda::rms_norm::rsqrt(&variance_with_epsilon)?
     } else {
         variance_with_epsilon.sqrt()?.recip()?
     };

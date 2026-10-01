@@ -47,17 +47,18 @@ fn decode_rope_pos_matches_fixture_arithmetic() {
 
 /// Debug-profile CPU decode runs ~50 minutes; opt in with `--ignored`.
 #[test]
-#[ignore]
+#[ignore = "requires FF_MODELS_DIR with Qwen/Qwen3.8-27B-int4-rtn"]
 fn image_prompt_decode_matches_hf_fixture() {
-    let Some(dir) = checkpoint_dir("Qwen/Qwen3.8-27B-int4") else {
-        return;
-    };
+    let dir = checkpoint_dir("Qwen/Qwen3.8-27B-int4-rtn")
+        .filter(|dir| dir.is_dir())
+        .expect("requires FF_MODELS_DIR with Qwen/Qwen3.8-27B-int4-rtn");
     let dir = &dir;
     let fixture_path = Path::new("src/testdata/vision_e2e_fixture.json");
     let png = Path::new("src/testdata/vision_test.png");
-    if !dir.exists() || !fixture_path.exists() {
-        return;
-    }
+    assert!(
+        fixture_path.exists() && png.exists(),
+        "vision fixtures must be committed under src/testdata"
+    );
     let fixtures: Vec<E2eFixture> =
         serde_json::from_str(&std::fs::read_to_string(fixture_path).unwrap()).unwrap();
     let config = Qwen35Config::from_model_dir(dir).unwrap();
@@ -147,12 +148,17 @@ fn image_prompt_decode_matches_hf_fixture() {
             fixture.gen_ids.len(),
             fixture.margins.get(prefix).copied().unwrap_or(f32::NAN)
         );
-        // Per-prompt measured baselines (flips sit at HF margins <= 0.50,
-        // the int4 quality class); GPU produced the same prefixes.
+        // Per-prompt measured baselines on Qwen3.8-27B-int4-rtn. Quality
+        // fact: on "What colors dominate?" RTN agrees with HF for only 3 of
+        // 32 tokens and the first flip sits at an HF margin of 2.375 — a
+        // confident flip, down from 11/32 with the community checkpoint
+        // these fixtures were generated against. The text weights differ
+        // between the two checkpoints; the vision tower is unquantized and
+        // byte-consistent with them.
         let baseline = ["Describe this image.", "What colors dominate?"]
             .iter()
             .position(|p| *p == fixture.prompt)
-            .map(|i| [17usize, 11][i])
+            .map(|i| [23usize, 3][i])
             .unwrap();
         assert!(
             prefix >= baseline,

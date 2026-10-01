@@ -8,14 +8,14 @@
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp1, CustomOp2, Layout, Shape, Tensor};
 
-const CUDA_MODULE: &str = "flyingfish_h3_rms_norm_pytorch_7269437";
+const CUDA_MODULE: &str = "flyingfish_rms_norm_pytorch_7269437";
 
 pub(crate) const BACKEND: &str = concat!(
     "pytorch-vectorized-bf16-cuda@7269437d655783a26cba32aa88195b741ff496aa/",
     env!("FLYINGFISH_H3_RMS_NORM_PTX_ARCH"),
     "/shape-profile:width128|5376-v2"
 );
-pub(crate) const QWEN_RSQRT_BACKEND: &str = concat!(
+pub(crate) const RSQRT_BACKEND: &str = concat!(
     "pytorch-qwen-unfused-rsqrt-f32@7269437d655783a26cba32aa88195b741ff496aa/",
     env!("FLYINGFISH_H3_RMS_NORM_PTX_ARCH"),
 );
@@ -40,7 +40,7 @@ struct QwenRsqrtF32;
 
 impl CustomOp1 for QwenRsqrtF32 {
     fn name(&self) -> &'static str {
-        QWEN_RSQRT_BACKEND
+        RSQRT_BACKEND
     }
 
     fn cpu_fwd(
@@ -80,9 +80,9 @@ impl CustomOp1 for QwenRsqrtF32 {
         let mut output = unsafe { device.alloc::<f32>(elements) }?;
         let function = crate::cuda::kernel_assets::load_function(
             &device,
-            &crate::cuda::kernel_assets::H3_RMS_NORM_BF16,
+            &crate::cuda::kernel_assets::RMS_NORM_BF16,
             CUDA_MODULE,
-            "qwen_rsqrt_f32",
+            "rsqrt_f32",
         )?;
         let stream = device.cuda_stream();
         let mut builder = stream.launch_builder(&function);
@@ -172,9 +172,9 @@ impl CustomOp2 for H3RmsNormBf16 {
         let mut output = unsafe { device.alloc::<half::bf16>(input_layout.shape().elem_count()) }?;
         let function = crate::cuda::kernel_assets::load_function(
             &device,
-            &crate::cuda::kernel_assets::H3_RMS_NORM_BF16,
+            &crate::cuda::kernel_assets::RMS_NORM_BF16,
             CUDA_MODULE,
-            "h3_rms_norm_bf16",
+            "rms_norm_bf16",
         )?;
         let stream = device.cuda_stream();
         let mut builder = stream.launch_builder(&function);
@@ -208,7 +208,7 @@ pub(crate) fn rms_norm(
     )
 }
 
-pub(crate) fn qwen_rsqrt(input: &Tensor) -> candle_core::Result<Tensor> {
+pub(crate) fn rsqrt(input: &Tensor) -> candle_core::Result<Tensor> {
     input.apply_op1_no_bwd(&QwenRsqrtF32)
 }
 

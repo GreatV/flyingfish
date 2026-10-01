@@ -8,7 +8,7 @@
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp3, Layout, Shape, Tensor};
 
-const CUDA_MODULE: &str = "flyingfish_qwen_layer_norm_pytorch_7269437";
+const CUDA_MODULE: &str = "flyingfish_layer_norm_pytorch_7269437";
 const EPSILON: f64 = 1e-6;
 
 pub(crate) const BACKEND: &str = concat!(
@@ -142,9 +142,9 @@ impl CustomOp3 for QwenLayerNormBf16 {
         let mut output = unsafe { device.alloc::<half::bf16>(elements) }?;
         let function = crate::cuda::kernel_assets::load_function(
             &device,
-            &crate::cuda::kernel_assets::QWEN_LAYER_NORM_BF16,
+            &crate::cuda::kernel_assets::LAYER_NORM_BF16,
             CUDA_MODULE,
-            "qwen_layer_norm_bf16",
+            "layer_norm_bf16",
         )?;
         let stream = device.cuda_stream();
         let mut builder = stream.launch_builder(&function);

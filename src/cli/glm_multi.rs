@@ -27,9 +27,29 @@ pub(super) struct Args {
         help = "Ordered CUDA devices, e.g. cuda:0,cuda:1,cuda:2,cuda:3"
     )]
     devices: Vec<String>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Override the measured boundary transport; peer still requires bidirectional validation"
+    )]
+    transport: Option<flyingfish::glm::partition::GlmPartitionTransport>,
+    #[arg(
+        long,
+        help = "Host profile containing calibrated streaming reader counts"
+    )]
+    host_profile: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Linux benchmark only: evict and verify checkpoint file-cache pages before loading"
+    )]
+    resource_cold_cache: bool,
     #[arg(long, default_value = "16")]
     max_new_tokens: NonZeroUsize,
-    #[arg(long, default_value = "2048")]
+    #[arg(
+        long,
+        default_value = "2048",
+        help = "Hard request limit; memory admission uses the supplied prompts and output budget"
+    )]
     max_context_tokens: NonZeroUsize,
     #[arg(long, default_value = "max", value_parser = ["low","high","max"])]
     reasoning_effort: String,
@@ -49,12 +69,6 @@ pub(super) struct Args {
     expert_cache_mib: Option<u64>,
     #[arg(long, value_enum, default_value = "per-layer-split")]
     expert_cache_layout: flyingfish::glm::ExpertCacheLayout,
-    #[arg(
-        long,
-        value_enum,
-        help = "Expert replacement; automatic capacity defaults to LFU, explicit ceilings to LRU"
-    )]
-    expert_cache_replacement: Option<flyingfish::glm::ExpertCacheReplacementPolicy>,
     #[arg(long)]
     cpu_fp8_dequantization: bool,
     #[arg(
@@ -103,6 +117,24 @@ fn ordinals(values: &[String]) -> Result<Vec<usize>> {
             Ok(ordinal)
         })
         .collect()
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn request_bounds(prompts: &[usize], output: usize, limit: usize) -> Result<(usize, usize)> {
+    use anyhow::Context;
+    let largest = *prompts.iter().max().context("GLM prompt queue is empty")?;
+    ensure!(
+        output > 0 && prompts.iter().all(|&n| n > 0),
+        "GLM token budgets must be positive"
+    );
+    let total = largest
+        .checked_add(output)
+        .context("GLM request context overflow")?;
+    ensure!(
+        total <= limit,
+        "GLM prompt and output exceed request context"
+    );
+    Ok((largest, total))
 }
 
 pub(super) fn run(args: Args) -> Result<()> {
@@ -201,10 +233,13 @@ fn run_cuda(args: Args, ordinals: Vec<usize>) -> Result<()> {
         .iter()
         .map(|&ordinal| Device::new_cuda(ordinal))
         .collect::<candle_core::Result<Vec<_>>>()?;
+    let io_readers = super::glm::report_host_profile(args.host_profile.as_deref(), &devices[0])?
+        .map(|profile| profile.reader_counts(&args.model))
+        .transpose()?;
     let hardware = devices
         .iter()
         .map(HardwareFingerprint::collect)
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let monitors = if telemetry.is_some() {
         devices
             .iter()
@@ -213,23 +248,22 @@ fn run_cuda(args: Args, ordinals: Vec<usize>) -> Result<()> {
     } else {
         vec![]
     };
+    let cache_preparation = args
+        .resource_cold_cache
+        .then(|| flyingfish::resource_policy::prepare_cold_cache(&args.model))
+        .transpose()?;
     let mut engine = LayerPartitionedGlm::prepare(
         &args.model,
         devices,
         LayerPartitionOptions {
+            transport: args.transport,
+            io_readers,
             expert_cache_bytes_per_device: usize::try_from(super::mib_to_bytes(
                 args.expert_cache_mib.unwrap_or(0),
             )?)?,
             resident_static: args.resident_static.unwrap_or(false),
             cache_policy,
             cache_layout: args.expert_cache_layout,
-            replacement: args.expert_cache_replacement.unwrap_or_else(|| {
-                if args.expert_cache_mib.is_none() {
-                    flyingfish::glm::ExpertCacheReplacementPolicy::Lfu
-                } else {
-                    flyingfish::glm::ExpertCacheReplacementPolicy::Lru
-                }
-            }),
             cpu_fp8_dequantization: args.cpu_fp8_dequantization,
             pinned_fp8_transfer: args.pinned_fp8_transfer,
             max_context_tokens: Some(args.max_context_tokens.get()),
@@ -239,19 +273,15 @@ fn run_cuda(args: Args, ordinals: Vec<usize>) -> Result<()> {
         .iter()
         .map(|prompt| -> Result<usize> {
             let ids = engine.tokenize(prompt, &args.reasoning_effort)?;
-            ensure!(
-                ids.len()
-                    .checked_add(args.max_new_tokens.get())
-                    .is_some_and(|n| n <= args.max_context_tokens.get()),
-                "GLM prompt and output exceed request context"
-            );
             Ok(ids.len())
         })
         .collect::<Result<Vec<_>>>()?;
-    let largest_prompt = *prompt_tokens
-        .iter()
-        .max()
-        .context("GLM prompt queue is empty")?;
+    let (largest_prompt, planned_context) = request_bounds(
+        &prompt_tokens,
+        args.max_new_tokens.get(),
+        args.max_context_tokens.get(),
+    )?;
+    engine.limit_context(planned_context)?;
     if args.resident_static.is_none() || args.expert_cache_mib.is_none() {
         engine.configure_automatic_residency(
             largest_prompt,
@@ -262,6 +292,7 @@ fn run_cuda(args: Args, ordinals: Vec<usize>) -> Result<()> {
     let admission = engine.admission(largest_prompt)?;
     let policy = engine.policy().clone();
     let mut request = json!({
+        "planned_context_tokens":engine.context_bound(),
         "max_new_tokens":args.max_new_tokens.get(),"max_context_tokens":args.max_context_tokens.get(),
         "reasoning_effort":args.reasoning_effort,"temperature":args.temperature,"top_p":args.top_p,"seed":args.seed});
     if batch {
@@ -360,11 +391,11 @@ fn run_cuda(args: Args, ordinals: Vec<usize>) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     let record = if batch {
-        json!({"schema_version":2,"policy":policy,"request":request,
+        json!({"schema_version":2,"policy":policy,"request":request,"cache_preparation":cache_preparation,
             "hardware":hardware,"admission":admission,"results":results,
             "wall_seconds":started.elapsed().as_secs_f64(),"error":failure})
     } else {
-        json!({"schema_version":1,"policy":policy,"request":request,
+        json!({"schema_version":1,"policy":policy,"request":request,"cache_preparation":cache_preparation,
             "hardware":hardware,"admission":admission,"generation":single_generation})
     };
     let canonical = serde_json::to_vec(&record)?;
@@ -414,5 +445,16 @@ mod tests {
             ordinals(&["cuda:2".into(), "cuda:0".into()]).unwrap(),
             [2, 0]
         );
+    }
+
+    #[test]
+    fn request_bounds_cover_the_whole_queue_and_enforce_the_limit() {
+        assert_eq!(request_bounds(&[20, 50, 10], 32, 2048).unwrap(), (50, 82));
+        assert_eq!(request_bounds(&[20], 32, 52).unwrap(), (20, 52));
+        assert!(request_bounds(&[20, 50], 32, 81).is_err());
+        assert!(request_bounds(&[usize::MAX], 1, usize::MAX).is_err());
+        assert!(request_bounds(&[], 32, 2048).is_err());
+        assert!(request_bounds(&[0, 20], 32, 2048).is_err());
+        assert!(request_bounds(&[20], 0, 2048).is_err());
     }
 }

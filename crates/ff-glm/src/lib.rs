@@ -21,6 +21,7 @@ pub mod execution_policy;
 pub mod expert_cache;
 pub mod expert_cache_manager;
 pub mod fp8;
+pub mod io_trace;
 #[cfg(feature = "cuda")]
 pub mod kernel_assets;
 pub mod math;
@@ -31,7 +32,6 @@ pub mod routing_trace;
 
 pub use execution_manifest::GlmExecutionManifest;
 pub use execution_policy::GlmExecutionPolicy;
-pub use expert_cache::ExpertCacheReplacementPolicy;
 pub use expert_cache_manager::ExpertCacheLayout;
 pub use model::{
     GlmGeneration, GlmGenerationOptions, GlmParityCapture, PreparedGlm, StreamedGlm,

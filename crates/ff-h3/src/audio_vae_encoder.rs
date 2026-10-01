@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::{collections::BTreeMap, fs, path::Path};
 
 const LAYER_NORM_EPS: f64 = 1e-5;
-const DEFAULT_ATTENTION_QUERY_CHUNK_SIZE: usize = 128;
+const VAE_QUERY_CHUNK: usize = 128;
 const RESIDUAL_DILATIONS: [usize; 3] = [1, 3, 9];
 
 #[derive(Clone, Debug, Deserialize)]
@@ -119,7 +119,7 @@ impl StreamedAudioVaeEncoder {
             weights,
             config,
             device,
-            attention_query_chunk_size: DEFAULT_ATTENTION_QUERY_CHUNK_SIZE,
+            attention_query_chunk_size: VAE_QUERY_CHUNK,
         })
     }
 

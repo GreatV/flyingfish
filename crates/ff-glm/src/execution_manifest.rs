@@ -356,9 +356,7 @@ impl GlmExecutionManifestRecorder {
 mod tests {
     use super::*;
     use crate::execution_policy::ExpertCacheOptions;
-    use crate::{
-        expert_cache::ExpertCacheReplacementPolicy, expert_cache_manager::ExpertCacheLayout,
-    };
+    use crate::expert_cache_manager::ExpertCacheLayout;
     use candle_core::Device;
     use ff_core::weights::{CachePolicy, WeightSource};
 
@@ -371,7 +369,6 @@ mod tests {
             8,
             ExpertCacheOptions {
                 layout: ExpertCacheLayout::SharedPool,
-                replacement: ExpertCacheReplacementPolicy::Lru,
                 maximum_bound_bytes: 100,
                 minimum_bound_bytes: if adaptive { 20 } else { 100 },
                 adaptive,
@@ -517,8 +514,7 @@ mod tests {
             .unwrap();
         let mut value: serde_json::Value =
             serde_json::from_slice(&manifest.canonical_json().unwrap()).unwrap();
-        // The digest key these manifests once carried is no longer tolerated:
-        // the format migrated in one step rather than keeping a parallel path.
+        // Manifests reject removed digest fields.
         value["policy_sha256"] = serde_json::json!("00".repeat(32));
         assert!(GlmExecutionManifest::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
         assert!(

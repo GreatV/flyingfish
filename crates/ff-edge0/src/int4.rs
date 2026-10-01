@@ -17,7 +17,7 @@ use anyhow::{Result, ensure};
 
 pub const GROUP_SIZE: usize = 64;
 
-/// 8-accumulator scalar fallback for the group dot.
+/// Scalar group dot with eight accumulators.
 fn dot_scalar(u: &[f32], v: &[f32]) -> f32 {
     let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7) =
         (0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
@@ -38,27 +38,23 @@ fn dot_scalar(u: &[f32], v: &[f32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-#[allow(clippy::needless_range_loop)] // lane -> __m256 register mapping
 unsafe fn dot_avx2(u: &[f32], v: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-    // Eight independent f32x8 FMA chains cover the 64-wide group. The
-    // lane-indexed __m256 array is the algorithm — iterating it would
-    // obscure the register mapping.
     let mut acc = [_mm256_setzero_ps(); 8];
     let mut m = 0;
     while m < GROUP_SIZE {
-        for lane in 0..8 {
+        for (lane, value) in acc.iter_mut().enumerate() {
             unsafe {
                 let uu = _mm256_loadu_ps(u.as_ptr().add(m + lane * 8));
                 let vv = _mm256_loadu_ps(v.as_ptr().add(m + lane * 8));
-                acc[lane] = _mm256_fmadd_ps(uu, vv, acc[lane]);
+                *value = _mm256_fmadd_ps(uu, vv, *value);
             }
         }
         m += 64;
     }
     let mut sum = _mm256_setzero_ps();
-    for lane in 0..8 {
-        sum = _mm256_add_ps(sum, acc[lane]);
+    for value in acc {
+        sum = _mm256_add_ps(sum, value);
     }
     let mut out = [0f32; 8];
     unsafe { _mm256_storeu_ps(out.as_mut_ptr(), sum) };
@@ -128,11 +124,7 @@ unsafe fn row_dot_fused_avx2(
     total
 }
 
-/// AVX-512 variant: two words (16 nibbles) become one __m512 directly —
-/// byte-interleave of even/odd nibbles yields sequential columns with no
-/// 128-bit lane permute. Applied to instruction-bound buckets only; the
-/// lm_head is bandwidth-side after the AVX2 kernel, where wider lanes
-/// buy nothing.
+/// Decode two packed words into one AVX-512 vector; apply to the selected shape buckets.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
 unsafe fn row_dot_fused_avx512(
@@ -209,6 +201,34 @@ pub struct GroupQuant {
     pub out_dim: usize,
     pub in_dim: usize,
     pub bits: u32,
+    threads: usize,
+    inline: bool,
+}
+
+struct MatvecSetup {
+    cores: usize,
+    threads: Option<std::num::NonZeroUsize>,
+    inline: bool,
+}
+
+/// bf16 storage bytes to their u16 bit pattern (little-endian).
+pub fn bf16_bytes_to_u16(raw: &[u8]) -> Vec<u16> {
+    raw.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
+/// f32 to bf16 bits, round-to-nearest-even.
+pub fn f32_to_bf16_bits(values: &[f32]) -> Vec<u16> {
+    values
+        .iter()
+        .map(|&v| {
+            let bits = v.to_bits();
+            let lsb = (bits >> 16) & 1;
+            let rounded = bits + 0x7fff + lsb;
+            (rounded >> 16) as u16
+        })
+        .collect()
 }
 
 /// bf16 (little-endian u16 payload) -> f32.
@@ -243,6 +263,27 @@ impl GroupQuant {
             scales.len() == out_dim * groups && biases.len() == out_dim * groups,
             "scales/biases length disagrees with [{out_dim}, {groups}]"
         );
+        static SETUP: std::sync::OnceLock<std::result::Result<MatvecSetup, String>> =
+            std::sync::OnceLock::new();
+        let setup = SETUP
+            .get_or_init(|| {
+                let cores = std::thread::available_parallelism()
+                    .map_err(|error| {
+                        format!("logical_cpu_count unavailable: {error}; rerun ff probe")
+                    })?
+                    .get();
+                let threads = ff_core::probe::env_value("EDGE0_MATVEC_THREADS")
+                    .map_err(|error| error.to_string())?;
+                Ok(MatvecSetup {
+                    cores,
+                    threads,
+                    inline: std::env::var_os("EDGE0_MATVEC_INLINE").is_some(),
+                })
+            })
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let threads = (out_dim / 512).clamp(1, setup.cores);
+        let threads = setup.threads.map(|count| count.get()).unwrap_or(threads);
         Ok(Self {
             packed,
             scales,
@@ -250,6 +291,8 @@ impl GroupQuant {
             out_dim,
             in_dim,
             bits,
+            threads,
+            inline: setup.inline,
         })
     }
 
@@ -276,9 +319,7 @@ impl GroupQuant {
     /// Fused quantized matvec with an optional rank-`r` LoRA pair.
     ///
     /// `lora` is `(a, b)` with `a` `[r, in]` and `b` `[out, r]`, applied as
-    /// `y += b * (a * x)` — the adapters stay unmerged by design (merging
-    /// would force 2.6 GiB of full-precision residency; see the design
-    /// doc's LoRA decision).
+    /// `y += b * (a * x)`.
     pub fn matvec(&self, x: &[f32], lora: Option<(&[f32], &[f32], usize)>) -> Vec<f32> {
         assert_eq!(
             x.len(),
@@ -304,17 +345,7 @@ impl GroupQuant {
             );
         }
         let groups = self.in_dim / GROUP_SIZE;
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let num_threads = std::env::var("EDGE0_MATVEC_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or_else(|| (self.out_dim / 512).clamp(1, cores));
         let per_word = if self.bits == 4 { 8usize } else { 4 };
-        let shift = if self.bits == 4 { 4u32 } else { 8 };
-        let mask: u32 = (1 << shift) - 1;
         let words_per_row = self.in_dim / per_word;
         // Group sums of the input, hoisted out of the output loop.
         let mut group_sums = vec![0f32; groups];
@@ -322,12 +353,8 @@ impl GroupQuant {
             group_sums[column / GROUP_SIZE] += value;
         }
         let mut y = vec![0f32; self.out_dim];
-        // Expert slices and gates stay inline: spawn overhead beats
-        // parallelism at a few hundred rows.
-        let force_inline = std::env::var_os("EDGE0_MATVEC_INLINE").is_some();
-        if self.out_dim <= 512 || force_inline {
-            #[allow(clippy::needless_range_loop)] // row drives 4 slice views
-            for row in 0..self.out_dim {
+        if self.out_dim <= 512 || self.inline {
+            for (row, slot) in y.iter_mut().enumerate() {
                 if self.bits == 4
                     && let Some(value) = row_dot_fused(
                         &self.packed[row * words_per_row..(row + 1) * words_per_row],
@@ -338,11 +365,11 @@ impl GroupQuant {
                         groups,
                     )
                 {
-                    y[row] = value;
+                    *slot = value;
                     continue;
                 }
                 let mut unpacked = vec![0f32; self.in_dim];
-                y[row] = self.row_dot(row, x, &group_sums, groups, &mut unpacked);
+                *slot = self.row_dot(row, x, &group_sums, groups, &mut unpacked);
             }
             if let Some((a, b, rank)) = lora {
                 let delta = lora_delta(a, b, rank, x, self.in_dim, self.out_dim);
@@ -352,7 +379,7 @@ impl GroupQuant {
             }
             return y;
         }
-        let chunk = (self.out_dim / num_threads).max(1);
+        let chunk = (self.out_dim / self.threads).max(1);
         std::thread::scope(|scope| {
             let slices: Vec<&mut [f32]> = y.chunks_mut(chunk).collect();
             for (index, slice) in slices.into_iter().enumerate() {
@@ -377,24 +404,7 @@ impl GroupQuant {
                             *slot = value;
                             continue;
                         }
-                        for (word_index, &word) in row_words.iter().enumerate() {
-                            let base = word_index * per_word;
-                            for j in 0..per_word {
-                                unpacked[base + j] = ((word >> (shift * j as u32)) & mask) as f32;
-                            }
-                        }
-                        let mut total = 0f32;
-                        #[allow(clippy::needless_range_loop)] // 3-array group indexing
-                        for group in 0..groups {
-                            let start = group * GROUP_SIZE;
-                            let dot = group_dot(
-                                &unpacked[start..start + GROUP_SIZE],
-                                &x[start..start + GROUP_SIZE],
-                            );
-                            total += q.scales[row * groups + group] * dot
-                                + q.biases[row * groups + group] * sums[group];
-                        }
-                        *slot = total;
+                        *slot = q.row_dot(row, x, sums, groups, &mut unpacked);
                     }
                 });
             }
@@ -408,6 +418,7 @@ impl GroupQuant {
         y
     }
 
+    #[inline]
     fn row_dot(
         &self,
         row: usize,
@@ -420,23 +431,22 @@ impl GroupQuant {
         let shift = if self.bits == 4 { 4u32 } else { 8 };
         let mask: u32 = (1 << shift) - 1;
         let words_per_row = self.in_dim / per_word;
-        for word_index in 0..words_per_row {
-            let word = self.packed[row * words_per_row + word_index];
+        let words = &self.packed[row * words_per_row..(row + 1) * words_per_row];
+        for (word_index, &word) in words.iter().enumerate() {
             let base = word_index * per_word;
             for j in 0..per_word {
                 unpacked[base + j] = ((word >> (shift * j as u32)) & mask) as f32;
             }
         }
         let mut total = 0f32;
-        #[allow(clippy::needless_range_loop)] // 3-array group indexing
-        for group in 0..groups {
+        for (group, &sum) in group_sums.iter().enumerate() {
             let start = group * GROUP_SIZE;
             let dot = group_dot(
                 &unpacked[start..start + GROUP_SIZE],
                 &x[start..start + GROUP_SIZE],
             );
-            total += self.scales[row * groups + group] * dot
-                + self.biases[row * groups + group] * group_sums[group];
+            total +=
+                self.scales[row * groups + group] * dot + self.biases[row * groups + group] * sum;
         }
         total
     }
@@ -509,8 +519,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Format gate: 1 ULP because the Python reference computes `s*q+b`
-    /// in f64 (one rounding) while Rust rounds twice.
+    /// The decoded row matches the F64 reference within one F32 ULP.
     #[test]
     fn dequant_row_matches_the_python_reference_within_one_ulp() {
         let vectors = fixture();

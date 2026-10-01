@@ -605,8 +605,7 @@ mod tests {
 
     #[test]
     fn aligner_gelu_follows_the_tanh_approximation() {
-        // gelu(1) via the tanh form is 0.841192; the earlier wrong formula
-        // (tanh(x/sqrt(2))) gives 0.813 SME — the gap pins the constants.
+        // gelu(1) via the tanh form is 0.841192.
         let device = candle_core::Device::Cpu;
         let features = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &device).unwrap();
         let identity = |rows: usize| {

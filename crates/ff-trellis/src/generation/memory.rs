@@ -267,7 +267,8 @@ pub(crate) fn prepare(
     device.synchronize()?;
     // The same fold the other adapters apply: on a shared pool the device view
     // alone is not this cache's capacity.
-    let snapshot = ff_core::probe::ResourceSnapshot::capture(Some(device));
+    let snapshot =
+        ff_core::probe::ResourceSnapshot::capture(Some(device)).context("resource probe failed")?;
     let free = if snapshot.unified_accounting_is_undecidable() {
         0
     } else {

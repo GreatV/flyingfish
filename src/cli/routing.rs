@@ -553,6 +553,12 @@ mod tests {
                 serde_json::json!({"architectures":["Qwen3_5ForConditionalGeneration"],"quantization":{"format":"groupwise-int4-u32"}}),
                 "qwen35",
             ),
+            (
+                // The upstream 16-bit checkpoint: same architecture, no
+                // quantization marker.
+                serde_json::json!({"architectures":["Qwen3_5ForConditionalGeneration"]}),
+                "qwen35",
+            ),
         ];
         for (metadata, expected) in cases {
             let directory = checkpoint(metadata);
@@ -562,10 +568,9 @@ mod tests {
                 .unwrap();
             assert_eq!(selected.id, expected);
         }
-        // The upstream BF16 checkpoints share the architectures but lack the
-        // quantization metadata: no adapter may claim them.
+        // The upstream Edge0 checkpoints share the MoE architecture but lack
+        // the quantization metadata: no adapter may claim them.
         for metadata in [
-            serde_json::json!({"architectures":["Qwen3_5ForConditionalGeneration"]}),
             serde_json::json!({"architectures":["Qwen3_5MoeForConditionalGeneration"]}),
             serde_json::json!({"model_type":"qwen3_5_moe"}),
         ] {

@@ -1,17 +1,4 @@
-//! The compiled images of each transcribed kernel, and the choice between them.
-//!
-//! One PTX per kernel is the numerical contract: `build.rs` generates it at
-//! `compute_80` and nothing about the running device changes it. What the
-//! device does change is how that PTX reaches the hardware. A cubin is the same
-//! PTX already translated by `ptxas` for one architecture; loading it skips the
-//! driver's own translation of the identical instructions. When no cubin
-//! matches, the PTX is loaded and the driver translates it, which is the path
-//! every device had before any cubin existed.
-//!
-//! So the selection here is a load-time choice, not a numerical one. The
-//! architecture that was selected is still recorded, because "the same PTX"
-//! is a claim about the instructions and not a proof about the SASS a given
-//! `ptxas` emitted from them.
+//! Load an exact-architecture cubin when present; otherwise load the declared portable PTX and record the selected image.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -145,12 +132,12 @@ mod tests {
     /// Every kernel this crate compiles, so the structural gate cannot silently
     /// stop covering one that was added later.
     const ALL: [&KernelAssets; 6] = [
-        &H3_RMS_NORM_BF16,
-        &H3_SDPA_SOFTMAX_F32,
-        &QWEN_ATTENTION_SCALE_BF16,
-        &QWEN_HEAD_MEAN_F32,
-        &QWEN_LAYER_NORM_BF16,
-        &QWEN_GELU_BF16,
+        &RMS_NORM_BF16,
+        &SOFTMAX_F32,
+        &SCALE_BF16,
+        &MEAN_F32,
+        &LAYER_NORM_BF16,
+        &GELU_BF16,
     ];
 
     /// The baseline is what makes every device runnable, so it must exist for

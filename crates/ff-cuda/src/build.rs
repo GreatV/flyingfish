@@ -107,6 +107,8 @@ pub fn resolve_ptxas(nvcc: &std::ffi::OsStr) -> std::ffi::OsString {
 /// has, the way a `CMAKE_CUDA_ARCHITECTURES`-less build does. A device with
 /// no matching cubin takes the driver's own translation of the same PTX.
 pub fn resolve_target_architectures() -> Vec<u32> {
+    let cap = std::env::var_os("CUDA_COMPUTE_CAP")
+        .map(|value| compute_cap(&value).unwrap_or_else(|error| panic!("{error}")));
     let requested = std::env::var_os(ARCHITECTURE_ENVIRONMENT_VARIABLE);
     let mut architectures = if let Some(requested) = requested {
         let requested = requested.to_string_lossy().into_owned();
@@ -125,23 +127,8 @@ pub fn resolve_target_architectures() -> Vec<u32> {
             .collect()
     } else {
         let mut detected = detect_local_architectures();
-        if let Some(cap) = std::env::var_os("CUDA_COMPUTE_CAP") {
-            let cap = cap.to_string_lossy().into_owned();
-            let parsed = if let Some((major, minor)) = cap.trim().split_once('.') {
-                (
-                    major.trim().parse::<u32>().ok(),
-                    minor.trim().parse::<u32>().ok(),
-                )
-            } else {
-                cap.trim()
-                    .parse::<u32>()
-                    .ok()
-                    .map(|plain| (plain / 10, plain % 10))
-                    .unzip()
-            };
-            if let (Some(major), Some(minor)) = parsed {
-                detected.push(major * 10 + minor);
-            }
+        if let Some(cap) = cap {
+            detected.push(cap);
         }
         detected.extend_from_slice(&FLEET_ARCHITECTURES);
         detected
@@ -150,6 +137,32 @@ pub fn resolve_target_architectures() -> Vec<u32> {
     architectures.sort_unstable();
     architectures.dedup();
     architectures
+}
+
+fn compute_cap(value: &std::ffi::OsStr) -> Result<u32, String> {
+    let invalid = || {
+        format!(
+            "invalid CUDA_COMPUTE_CAP={value:?}; use a positive dot-less capability such as 86 or 120, or major.minor such as 8.6 or 12.0 (minor 0..=9)"
+        )
+    };
+    let text = value.to_str().ok_or_else(invalid)?.trim();
+    let cap = if let Some((major, minor)) = text.split_once('.') {
+        let major = major.trim().parse::<u32>().map_err(|_| invalid())?;
+        let minor = minor.trim().parse::<u32>().map_err(|_| invalid())?;
+        if major == 0 || minor > 9 {
+            return Err(invalid());
+        }
+        major
+            .checked_mul(10)
+            .and_then(|major| major.checked_add(minor))
+            .ok_or_else(invalid)?
+    } else {
+        text.parse::<u32>().map_err(|_| invalid())?
+    };
+    if cap < 10 {
+        return Err(invalid());
+    }
+    Ok(cap)
 }
 
 fn detect_local_architectures() -> Vec<u32> {
@@ -335,6 +348,8 @@ pub fn run(specs: &[KernelSpec], source_root: &Path) -> Option<BuildReport> {
 
     std::env::var_os("CARGO_FEATURE_CUDA")?;
 
+    let architectures = resolve_target_architectures();
+
     std::env::set_current_dir(&source_root).expect("cannot select the CUDA kernel source root");
 
     let nvcc = std::env::var_os("NVCC").unwrap_or_else(|| "nvcc".into());
@@ -348,7 +363,6 @@ pub fn run(specs: &[KernelSpec], source_root: &Path) -> Option<BuildReport> {
     }
 
     let ptxas = resolve_ptxas(&nvcc);
-    let architectures = resolve_target_architectures();
     let mut manifest_entries = Vec::new();
     let mut translated_all = Vec::new();
     for spec in specs {
@@ -377,4 +391,84 @@ pub fn run(specs: &[KernelSpec], source_root: &Path) -> Option<BuildReport> {
         target_architectures: architectures,
         translated_architectures: translated_all,
     })
+}
+
+/// Extracts `#define <name> <integer>` lines from a kernel source and writes
+/// each as `pub const <name>: usize = <value>;` into
+/// `<out_dir>/<stem>_defines.rs`, for a launcher that must derive its grid
+/// from the same tile constant the kernel was compiled with. Missing names
+/// fail the build. Prints rerun-if-changed for the source.
+pub fn write_defines_consts(out_dir: &Path, source: &Path, stem: &str, names: &[&str]) {
+    println!("cargo:rerun-if-changed={}", source.display());
+    let text = std::fs::read_to_string(source).expect("read kernel source for defines");
+    let mut generated = String::new();
+    for name in names {
+        let prefix = format!("#define {name} ");
+        let value = text
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("{source:?} does not define {name}"))
+            .trim()
+            .parse::<usize>()
+            .unwrap_or_else(|e| panic!("{name} in {source:?} is not an integer: {e}"));
+        generated += &format!("pub const {name}: usize = {value};\n");
+    }
+    std::fs::write(out_dir.join(format!("{stem}_defines.rs")), generated)
+        .expect("failed to write the kernel defines");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_cap_rejects_invalid_overrides_with_the_accepted_forms() {
+        if std::env::var_os("CUDA_COMPUTE_CAP")
+            .is_some_and(|value| value == std::ffi::OsStr::new("invalid"))
+        {
+            resolve_target_architectures();
+            return;
+        }
+        for (text, cap) in [("86", 86), ("8.6", 86), ("120", 120), ("12.0", 120)] {
+            assert_eq!(compute_cap(text.as_ref()).unwrap(), cap);
+        }
+        for text in ["invalid", "", "8.x", "8.10", "0", "0.0", "4294967295.9"] {
+            let error = compute_cap(text.as_ref()).unwrap_err();
+            assert!(
+                error.contains("CUDA_COMPUTE_CAP") && error.contains("86") && error.contains("8.6")
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(
+                compute_cap(std::ffi::OsStr::from_bytes(&[0xff]))
+                    .unwrap_err()
+                    .contains("CUDA_COMPUTE_CAP")
+            );
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "build::tests::compute_cap_rejects_invalid_overrides_with_the_accepted_forms",
+                "--nocapture",
+            ])
+            .env("CUDA_COMPUTE_CAP", "invalid")
+            .env(ARCHITECTURE_ENVIRONMENT_VARIABLE, "89")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "invalid CUDA_COMPUTE_CAP was ignored"
+        );
+        let error = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            error.contains("CUDA_COMPUTE_CAP") && error.contains("86") && error.contains("8.6"),
+            "{error}"
+        );
+    }
 }

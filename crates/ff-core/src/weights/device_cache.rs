@@ -1,21 +1,4 @@
-//! Device-resident tensor retention: the top tier of the residency ladder. A
-//! hit returns the tensor exactly as the loader produced it — same bytes, dtype
-//! and device — so caching cannot change an output. The byte charge is the
-//! tensor's logical element count multiplied by its dtype size. A zero byte
-//! budget — the default — disables the cache, and a tensor larger than the
-//! budget is never retained.
-//!
-//! One [`DeviceCache`] is a single ceiling shared by every store attached to
-//! it, **applied to each device separately**. A pipeline that opens several
-//! checkpoints hands the same handle to all of them, so the operator's ceiling
-//! bounds the request rather than each component separately; a process driving
-//! several devices spends that ceiling on each of them, because a ceiling one
-//! device's worth of memory wide, divided among four devices, is not what
-//! `--device-cache-mib` means. Retention, eviction and the priority reserve are
-//! therefore all scoped to a [`DeviceLocation`]; a single-device request sees
-//! exactly the behaviour it saw before. Stores are told apart by the id
-//! [`DeviceCache::attach`] returns, so two checkpoints that name a tensor alike
-//! never collide.
+//! Device tensor retention preserves bytes, dtype and location. Each attached store shares the per-device ceiling; zero disables retention.
 use candle_core::{DType, Device, DeviceLocation, Tensor};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -88,10 +71,7 @@ pub struct DeviceCacheStats {
     pub resident_tensors: usize,
     pub resident_bytes: u64,
     pub max_bytes: u64,
-    /// Set once a device allocation failed with tensors resident. The cache
-    /// released them and stopped retaining, so the request finishes from the
-    /// host tiers. It is reported because a demoted cache and a useless cache
-    /// look alike in the hit counters and are not the same problem.
+    /// Set after allocation failure demotes retained tensors to host storage.
     pub demoted: bool,
     /// Resident bytes currently protected by active phase priorities.
     #[serde(default)]
@@ -101,16 +81,14 @@ pub struct DeviceCacheStats {
     /// device is full. A single-device request reports one entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resident_bytes_by_device: Vec<DeviceResidentBytes>,
-    /// Inserts bypassed because they would displace a selected phase.
+    /// Inserts bypassed to preserve the selected phase.
     #[serde(default)]
     pub priority_bypasses: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub demotion: Option<DeviceCacheDemotion>,
 }
 
-/// One device's share of a [`DeviceCacheStats`]. The device is named the way
-/// the demotion record names it, by its `DeviceLocation`, because two `Device`
-/// handles for one location share storage and must not read as two devices.
+/// Statistics for one DeviceLocation, shared by every handle for that location.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceResidentBytes {
@@ -204,23 +182,13 @@ pub enum TensorAxis {
     Columns,
 }
 
-/// Which part of a named tensor an entry holds.
-///
-/// Under a tensor split two ranks hold different slices of one named tensor,
-/// and today they fail to collide only because their device locations differ.
-/// That is an accident, not a rule — one process could hold a slice and the
-/// whole tensor on one device — and a cache that returned the slice to a caller
-/// who asked for the whole tensor would silently change an output. So the
-/// slice's identity is part of the key. `Whole` is what every existing loader
-/// asks for, and is the only thing that can ever answer a whole-tensor read.
+/// A cached tensor's partition identity; Whole only answers whole-tensor reads.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TensorPartition {
     #[default]
     Whole,
-    /// Rank `rank` of `ranks`, along `axis`. The rank count is part of the
-    /// identity because the same rank of a different-sized ring is a different
-    /// slice.
+    /// Rank rank of ranks along axis; the rank count determines the slice.
     Shard {
         axis: TensorAxis,
         rank: u32,
@@ -1048,7 +1016,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allocator_policy_preserves_legacy_defaults() {
+    fn allocator_policy_defaults_to_stream_pool() {
         let policy: DeviceCachePolicy =
             serde_json::from_value(serde_json::json!({"max_bytes":64})).unwrap();
         assert_eq!(policy.cuda_allocator, CudaWeightAllocator::StreamPool);

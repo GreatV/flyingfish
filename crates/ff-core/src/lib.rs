@@ -41,6 +41,7 @@ pub mod math;
 pub mod parity;
 pub mod paths;
 pub mod probe;
+pub mod quant;
 pub mod residency;
 pub mod resource_selection;
 pub mod storage;

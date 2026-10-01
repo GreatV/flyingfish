@@ -10,12 +10,12 @@
 .target sm_80
 .address_size 64
 
-	// .globl	qwen_gelu_tanh_bf16
+	// .globl	gelu_tanh_bf16
 
-.visible .entry qwen_gelu_tanh_bf16(
-	.param .u32 qwen_gelu_tanh_bf16_param_0,
-	.param .u64 qwen_gelu_tanh_bf16_param_1,
-	.param .u64 qwen_gelu_tanh_bf16_param_2
+.visible .entry gelu_tanh_bf16(
+	.param .u32 gelu_tanh_bf16_param_0,
+	.param .u64 gelu_tanh_bf16_param_1,
+	.param .u64 gelu_tanh_bf16_param_2
 )
 {
 	.reg .pred 	%p<4>;
@@ -25,9 +25,9 @@
 	.reg .b64 	%rd<8>;
 
 
-	ld.param.u32 	%r2, [qwen_gelu_tanh_bf16_param_0];
-	ld.param.u64 	%rd1, [qwen_gelu_tanh_bf16_param_1];
-	ld.param.u64 	%rd2, [qwen_gelu_tanh_bf16_param_2];
+	ld.param.u32 	%r2, [gelu_tanh_bf16_param_0];
+	ld.param.u64 	%rd1, [gelu_tanh_bf16_param_1];
+	ld.param.u64 	%rd2, [gelu_tanh_bf16_param_2];
 	mov.u32 	%r3, %ctaid.x;
 	mov.u32 	%r4, %ntid.x;
 	mov.u32 	%r5, %tid.x;
@@ -84,11 +84,11 @@ $L__BB0_2:
 	ret;
 
 }
-	// .globl	qwen_gelu_erf_bf16
-.visible .entry qwen_gelu_erf_bf16(
-	.param .u32 qwen_gelu_erf_bf16_param_0,
-	.param .u64 qwen_gelu_erf_bf16_param_1,
-	.param .u64 qwen_gelu_erf_bf16_param_2
+	// .globl	gelu_erf_bf16
+.visible .entry gelu_erf_bf16(
+	.param .u32 gelu_erf_bf16_param_0,
+	.param .u64 gelu_erf_bf16_param_1,
+	.param .u64 gelu_erf_bf16_param_2
 )
 {
 	.reg .pred 	%p<4>;
@@ -98,9 +98,9 @@ $L__BB0_2:
 	.reg .b64 	%rd<10>;
 
 
-	ld.param.u32 	%r2, [qwen_gelu_erf_bf16_param_0];
-	ld.param.u64 	%rd2, [qwen_gelu_erf_bf16_param_1];
-	ld.param.u64 	%rd3, [qwen_gelu_erf_bf16_param_2];
+	ld.param.u32 	%r2, [gelu_erf_bf16_param_0];
+	ld.param.u64 	%rd2, [gelu_erf_bf16_param_1];
+	ld.param.u64 	%rd3, [gelu_erf_bf16_param_2];
 	mov.u32 	%r3, %ctaid.x;
 	mov.u32 	%r4, %ntid.x;
 	mov.u32 	%r5, %tid.x;

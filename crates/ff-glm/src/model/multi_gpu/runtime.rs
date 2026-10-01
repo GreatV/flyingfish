@@ -5,13 +5,175 @@ use crate::partition::{GlmPartitionPolicy, GlmPartitionTransport, GlmRankPolicy}
 use ff_core::resource_selection::ResourcePhaseEstimate;
 use serde::{Deserialize, Serialize};
 
+fn probe_transport(
+    devices: [&Device; 2],
+    pair: [usize; 2],
+    sizes: [usize; 2],
+    requested: Option<GlmPartitionTransport>,
+) -> Result<[(GlmPartitionTransport, String); 2]> {
+    use GlmPartitionTransport::{HostStagedCopyV1 as Host, SynchronizedCudaDeviceCopyV1 as Peer};
+    let snapshots: Vec<_> = devices
+        .iter()
+        .map(|device| ResourceSnapshot::capture(Some(device)).context("resource probe failed"))
+        .collect::<Result<Vec<_>>>()?;
+    let unified = snapshots
+        .iter()
+        .any(|s| s.host_device_memory_is_unified == Some(true));
+    let ordinals = [u32::try_from(pair[0])?, u32::try_from(pair[1])?];
+    let capability = [
+        ff_core::probe::can_access_peer(ordinals[0], ordinals[1]),
+        ff_core::probe::can_access_peer(ordinals[1], ordinals[0]),
+    ];
+    let mut choices = std::array::from_fn(|_| (Host, String::new()));
+    for (class, bytes) in sizes.into_iter().enumerate() {
+        let mut failures: [Option<String>; 2] = [None, None];
+        let mut input = None;
+        for direction in 0..2 {
+            let source = devices[direction];
+            let destination = devices[1 - direction];
+            let copied = |transport: GlmPartitionTransport,
+                          input: &Tensor,
+                          destination: &Device|
+             -> Result<Vec<u8>> {
+                let output = Tensor::zeros(bytes, DType::U8, destination)?;
+                transport.copy_into(input, &output, &mut vec![0u8; bytes])?;
+                Ok(output.to_vec1::<u8>()?)
+            };
+            let mut pattern = vec![0u8; bytes];
+            rand::Rng::fill(&mut rand::rng(), pattern.as_mut_slice());
+            pattern[0] = 1;
+            let tensor = Tensor::from_vec(pattern.clone(), bytes, source).with_context(|| {
+                format!(
+                    "{}→{} transport probe needs {bytes} device bytes",
+                    pair[direction],
+                    pair[1 - direction]
+                )
+            })?;
+            ensure!(
+                tensor.to_vec1::<u8>()? == pattern,
+                "{} source roundtrip validation failed at {bytes} bytes",
+                pair[direction]
+            );
+            if !unified {
+                match copied(Peer, &tensor, destination) {
+                    Ok(copied) if copied == pattern => {}
+                    Ok(_) => {
+                        failures[direction] =
+                            Some(format!("peer validation failed at {bytes} bytes"))
+                    }
+                    Err(error) => {
+                        failures[direction] = Some(format!(
+                            "peer validation failed at {bytes} bytes: {error:#}"
+                        ))
+                    }
+                }
+                eprintln!(
+                    "GLM peer validation {}→{} {bytes} B: {:?}",
+                    pair[direction],
+                    pair[1 - direction],
+                    failures[direction]
+                );
+            }
+            ensure!(
+                copied(Host, &tensor, destination)? == pattern,
+                "{}→{} host-staged validation failed at {bytes} bytes",
+                pair[direction],
+                pair[1 - direction]
+            );
+            if direction == 0 {
+                input = Some(tensor);
+            }
+        }
+        let mut timing = None;
+        if !unified && failures.iter().all(Option::is_none) {
+            'timing: {
+                let input = input.as_ref().context("missing transport probe input")?;
+                let output = Tensor::zeros(bytes, DType::U8, devices[1])?;
+                let mut host = vec![0u8; bytes];
+                let mut copy = |peer: bool| -> Result<()> {
+                    let transport = if peer { Peer } else { Host };
+                    transport.copy_into(input, &output, &mut host)
+                };
+                for _ in 0..5 {
+                    if let Err(error) = copy(true) {
+                        failures[0] =
+                            Some(format!("peer warmup failed at {bytes} bytes: {error:#}"));
+                        break 'timing;
+                    }
+                    copy(false).context("host warmup failed")?;
+                }
+                let mut elapsed = [[0u64; 2]; 20];
+                for (sample, values) in elapsed.iter_mut().enumerate() {
+                    for step in 0..2 {
+                        let path = (sample + step) % 2;
+                        let start = Instant::now();
+                        if let Err(error) = copy(path == 0) {
+                            if path == 0 {
+                                failures[0] =
+                                    Some(format!("peer timing failed at {bytes} bytes: {error:#}"));
+                                break 'timing;
+                            } else {
+                                return Err(error).context("host timing failed");
+                            }
+                        }
+                        values[path] = u64::try_from(start.elapsed().as_nanos())?;
+                    }
+                }
+                let spread = [0, 1].map(|path| {
+                    let mut samples = elapsed.map(|row| row[path]);
+                    samples.sort_unstable();
+                    [
+                        samples[0],
+                        samples[9] + (samples[10] - samples[9]) / 2,
+                        samples[19],
+                    ]
+                });
+                timing = Some((bytes, spread[0], spread[1]));
+                eprintln!(
+                    "GLM copy samples {}→{} {bytes} B peer/host ns: {elapsed:?}",
+                    pair[0], pair[1]
+                );
+            }
+        }
+        choices[class] = GlmPartitionPolicy::select_transport(
+            pair, capability, unified, failures, timing, requested,
+        )?;
+        for device in devices {
+            device.synchronize()?;
+        }
+    }
+    Ok(choices)
+}
+
+fn context_bytes(
+    breakdown: &mut GlmAdmissionBreakdown,
+    text: &crate::config::GlmTextConfig,
+    scope: GlmLayerScope,
+    tokens: usize,
+) -> Result<()> {
+    breakdown.maximum_dsa_cache_bytes = breakdown
+        .dsa_cache_bytes_per_token
+        .checked_mul(tokens)
+        .context("rank DSA context overflow")?;
+    let layers = text
+        .sparse_attention_layers()
+        .filter(|&n| scope.contains_layer(n))
+        .count();
+    breakdown.maximum_dsa_layer_cache_bytes = breakdown
+        .maximum_dsa_cache_bytes
+        .checked_div(layers)
+        .unwrap_or(0);
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct LayerPartitionOptions {
+    pub transport: Option<GlmPartitionTransport>,
+    pub io_readers: Option<[usize; 2]>,
     pub expert_cache_bytes_per_device: usize,
     pub resident_static: bool,
     pub cache_policy: CachePolicy,
     pub cache_layout: ExpertCacheLayout,
-    pub replacement: ExpertCacheReplacementPolicy,
     pub cpu_fp8_dequantization: bool,
     pub pinned_fp8_transfer: bool,
     pub max_context_tokens: Option<usize>,
@@ -19,11 +181,12 @@ pub struct LayerPartitionOptions {
 impl Default for LayerPartitionOptions {
     fn default() -> Self {
         Self {
+            transport: None,
+            io_readers: None,
             expert_cache_bytes_per_device: 0,
             resident_static: false,
             cache_policy: CachePolicy::new(1),
             cache_layout: ExpertCacheLayout::PerLayerSplit,
-            replacement: ExpertCacheReplacementPolicy::Lru,
             cpu_fp8_dequantization: false,
             pinned_fp8_transfer: false,
             max_context_tokens: None,
@@ -79,7 +242,8 @@ impl GlmPartitionAdmission {
                 .context("rank retained limit overflow")?;
             ensure!(
                 record.already_resident_device_bytes <= maximum_retained,
-                "rank retained credit exceeds its declared storage"
+                "rank {rank} retained credit {} exceeds its declared storage {maximum_retained}",
+                record.already_resident_device_bytes
             );
             let mut host_peak = 0;
             // Phases are mutually exclusive, so a rank contributes its peak; the
@@ -171,13 +335,17 @@ pub struct GlmPartitionGeneration {
     pub transfer_count: u64,
     pub transferred_bytes: u64,
     pub cache_before: Vec<GlmRankCacheStats>,
+    #[serde(default)]
+    pub cache_after_prefill: Vec<GlmRankCacheStats>,
     pub cache_after: Vec<GlmRankCacheStats>,
     #[serde(default)]
     pub fp8_transfers: Vec<fp8::Fp8TransferStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_trace: Option<Vec<crate::io_trace::IoStage>>,
 }
 
 impl LayerPartitionedGlm {
-    /// Prepare only metadata. No decoder state, static weights or experts are allocated.
+    /// Prepare metadata and probe boundary copies before allocating model state or weights.
     pub fn prepare(
         model: impl AsRef<Path>,
         devices: Vec<Device>,
@@ -208,12 +376,12 @@ impl LayerPartitionedGlm {
         let count = devices.len();
         for (rank, device) in devices.into_iter().enumerate() {
             let scope = GlmLayerScope::for_rank(config.text_config.num_hidden_layers, rank, count)?;
-            let prepared = StreamedGlm::prepare(
-                model.as_ref(),
+            let mut worker_options =
                 StreamedGlmOptions::new(WeightSource::Mmap, options.cache_policy, device)
                     .with_cpu_fp8_dequantization(options.cpu_fp8_dequantization)
-                    .with_pinned_fp8_transfer(options.pinned_fp8_transfer),
-            )?;
+                    .with_pinned_fp8_transfer(options.pinned_fp8_transfer);
+            worker_options.io_readers = options.io_readers;
+            let prepared = StreamedGlm::prepare(model.as_ref(), worker_options)?;
             let mut worker = prepared.model;
             let mut breakdown = GlmAdmissionBreakdown::from_metadata_for_scope(
                 &worker.weights,
@@ -223,27 +391,22 @@ impl LayerPartitionedGlm {
                 options.cpu_fp8_dequantization,
                 scope,
             )?;
+            breakdown.host_route_workspace_bytes = breakdown
+                .host_route_workspace_bytes
+                .checked_add(
+                    (worker.warm_buffer_bytes as u64)
+                        .checked_mul(worker.warm_workers as u64)
+                        .context("warming buffer size overflow")?,
+                )
+                .context("warming workspace overflow")?;
             breakdown.concurrent_loads = u64::try_from(crate::model::concurrent_load_count(
                 options.pinned_fp8_transfer,
-            ))?;
+            )?)?;
             if options.pinned_fp8_transfer {
-                let (lanes, fill_ring_depth) = crate::model::pinned_staging_shape();
+                let (lanes, fill_ring_depth) = crate::model::pinned_staging_shape()?;
                 breakdown.enable_pinned_transfer(lanes, fill_ring_depth)?;
             }
-            breakdown.maximum_dsa_cache_bytes = breakdown
-                .dsa_cache_bytes_per_token
-                .checked_mul(context)
-                .context("rank DSA context overflow")?;
-            let dsa_layers = worker
-                .config
-                .text_config
-                .sparse_attention_layers()
-                .filter(|&n| scope.contains_layer(n))
-                .count();
-            breakdown.maximum_dsa_layer_cache_bytes = breakdown
-                .maximum_dsa_cache_bytes
-                .checked_div(dsa_layers)
-                .unwrap_or(0);
+            context_bytes(&mut breakdown, &worker.config.text_config, scope, context)?;
             let sparse: Vec<_> = breakdown
                 .sparse_layers
                 .iter()
@@ -259,14 +422,12 @@ impl LayerPartitionedGlm {
                 &sparse,
                 budget,
                 options.cache_layout,
-                options.replacement,
             )?;
             worker.execution_policy.resident_static = options.resident_static;
             worker.execution_policy.dsa_context_bound_tokens = u32::try_from(context)?;
             worker.execution_policy.expert_cache.maximum_bound_bytes = u64::try_from(budget)?;
             worker.execution_policy.expert_cache.minimum_bound_bytes = u64::try_from(budget)?;
             worker.execution_policy.expert_cache.layout = options.cache_layout;
-            worker.execution_policy.expert_cache.replacement = options.replacement;
             let candle_core::DeviceLocation::Cuda { gpu_id: ordinal } = worker.device.location()
             else {
                 unreachable!()
@@ -279,12 +440,57 @@ impl LayerPartitionedGlm {
             breakdowns.push(breakdown);
             workers.push(worker);
         }
+        let boundary = config
+            .text_config
+            .hidden_size
+            .checked_mul(config.text_config.hc_mult)
+            .and_then(|n| n.checked_mul(workers[0].compute_dtype.size_in_bytes()))
+            .context("GLM boundary byte count overflow")?;
+        let sizes = [
+            boundary,
+            boundary
+                .checked_mul(context)
+                .context("GLM prefill boundary overflow")?,
+        ];
+        let mut transports = Vec::new();
+        for rank in 1..workers.len() {
+            let choice = probe_transport(
+                [&workers[rank - 1].device, &workers[rank].device],
+                [ranks[rank - 1].ordinal, ranks[rank].ordinal],
+                sizes,
+                options.transport,
+            )?;
+            for (class, (_, reason)) in ["decode", "prefill"].iter().zip(&choice) {
+                eprintln!("GLM boundary {class} transport: {reason}");
+            }
+            transports.push(choice);
+        }
         let policy = GlmPartitionPolicy {
-            schema_version: 1,
-            transport: GlmPartitionTransport::SynchronizedCudaDeviceCopyV1,
+            schema_version: 2,
+            transports,
             ranks,
         };
         policy.validate()?;
+        let dtype = workers[0].compute_dtype;
+        let buffers = policy
+            .transports
+            .iter()
+            .enumerate()
+            .map(|(boundary, classes)| {
+                let device = &workers[boundary + 1].device;
+                let buffer = |class: usize| -> Result<BoundaryBuffer> {
+                    let bytes = sizes[class];
+                    Ok(BoundaryBuffer {
+                        destination: Tensor::zeros(bytes / dtype.size_in_bytes(), dtype, device)?,
+                        host: match classes[class].0 {
+                            GlmPartitionTransport::HostStagedCopyV1 => vec![0; bytes],
+                            GlmPartitionTransport::SynchronizedCudaDeviceCopyV1 => vec![],
+                        },
+                    })
+                };
+                Ok([buffer(0)?, buffer(1)?])
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut owners = vec![0; config.text_config.num_hidden_layers];
         for (rank, p) in policy.ranks.iter().enumerate() {
             for owner in &mut owners[p.scope.start..p.scope.end] {
@@ -295,6 +501,7 @@ impl LayerPartitionedGlm {
             workers,
             owners,
             caches: vec![],
+            buffers,
             tokens: 0,
             transfers: 0,
             transferred_bytes: 0,
@@ -328,8 +535,12 @@ impl LayerPartitionedGlm {
                     continue;
                 }
                 self.policy.ranks[rank].execution.resident_static = true;
-                if self.admission(prompt_tokens)?.validate_capacity().is_err() {
+                if let Err(e) = self.admission(prompt_tokens)?.validate_capacity() {
                     self.policy.ranks[rank].execution.resident_static = false;
+                    eprintln!(
+                        "glm: rank {rank}: resident static requested but not admitted (\
+                         {e}); streaming that rank's static weights"
+                    );
                 }
                 self.workers[rank].execution_policy.resident_static =
                     self.policy.ranks[rank].execution.resident_static;
@@ -406,6 +617,30 @@ impl LayerPartitionedGlm {
     pub fn context_bound(&self) -> usize {
         self.policy.ranks[0].execution.dsa_context_bound_tokens as usize
     }
+
+    /// Reduce the prepared context before allocating request state.
+    pub fn limit_context(&mut self, tokens: usize) -> Result<()> {
+        ensure!(
+            !self.initialized && !self.failed && self.tokens == 0,
+            "context changes require empty request state"
+        );
+        ensure!(
+            tokens > 0 && tokens <= self.context_bound(),
+            "context limit must be positive and cannot grow"
+        );
+        let bound = u32::try_from(tokens)?;
+        for ((breakdown, worker), rank) in self
+            .breakdowns
+            .iter_mut()
+            .zip(&mut self.workers)
+            .zip(&mut self.policy.ranks)
+        {
+            context_bytes(breakdown, &worker.config.text_config, rank.scope, tokens)?;
+            rank.execution.dsa_context_bound_tokens = bound;
+            worker.execution_policy.dsa_context_bound_tokens = bound;
+        }
+        self.policy.validate()
+    }
     pub fn cache_stats(&self) -> Vec<GlmRankCacheStats> {
         self.workers
             .iter()
@@ -422,18 +657,6 @@ impl LayerPartitionedGlm {
                     static_resident_bytes: tensor_bytes(w.static_weights.values()),
                 }
             })
-            .collect()
-    }
-
-    pub fn enable_weight_read_audit(&self) {
-        for w in &self.workers {
-            w.weights.count_tensor_reads(true);
-        }
-    }
-    pub fn weight_reads(&self) -> Vec<BTreeMap<String, u64>> {
-        self.workers
-            .iter()
-            .map(|w| w.weights.tensor_reads())
             .collect()
     }
 
@@ -459,8 +682,8 @@ impl LayerPartitionedGlm {
         let snapshots: Vec<_> = self
             .workers
             .iter()
-            .map(|w| ResourceSnapshot::capture(Some(&w.device)))
-            .collect();
+            .map(|w| ResourceSnapshot::capture(Some(&w.device)).context("resource probe failed"))
+            .collect::<Result<Vec<_>>>()?;
         let mut required_host_bytes = 0u64;
         let mut ranks = Vec::new();
         for (rank, (base, worker)) in self.breakdowns.iter().zip(&self.workers).enumerate() {
@@ -478,7 +701,7 @@ impl LayerPartitionedGlm {
                     worker.expert_cache.layout(),
                 ),
                 worker.weights.cache_policy(),
-                b.scaled_admission_safety_bytes(&snapshots[rank]),
+                b.scaled_admission_safety_bytes(&snapshots[rank])?,
             )?;
             let mut host_peak = 0;
             let mut retained = tensor_bytes(worker.static_weights.values())
@@ -494,24 +717,30 @@ impl LayerPartitionedGlm {
                         .context("rank state bytes overflow")?;
                 }
             }
+            let device_buffers: usize = rank.checked_sub(1).map_or(0, |boundary| {
+                self.buffers[boundary]
+                    .iter()
+                    .map(BoundaryBuffer::device_bytes)
+                    .sum()
+            });
+            let host_buffers: usize = [rank.checked_sub(1), Some(rank)]
+                .into_iter()
+                .flatten()
+                .filter_map(|boundary| self.buffers.get(boundary))
+                .flat_map(|classes| classes.iter().map(|buffer| buffer.host.len()))
+                .sum();
             for phase in &mut phases {
-                let rows = if phase.phase == "prefill" {
-                    prompt_tokens
-                } else {
-                    1
-                };
-                let boundary = rows
-                    .checked_mul(text.hc_mult)
-                    .and_then(|n| n.checked_mul(text.hidden_size))
-                    .and_then(|n| n.checked_mul(4))
-                    .context("GLM transfer workspace overflow")?;
                 phase.required_device_bytes = Some(
                     phase
                         .required_device_bytes
                         .unwrap_or(0)
-                        .checked_add(boundary as u64)
+                        .checked_add(device_buffers as u64)
                         .context("rank transfer peak overflow")?,
                 );
+                phase.required_host_bytes = phase
+                    .required_host_bytes
+                    .checked_add(host_buffers as u64)
+                    .context("rank host transfer peak overflow")?;
                 host_peak = host_peak.max(phase.host_peak_bytes()?);
             }
             required_host_bytes = required_host_bytes
@@ -539,6 +768,16 @@ impl LayerPartitionedGlm {
         }
         for (rank, worker) in self.workers.iter_mut().enumerate() {
             let p = &self.policy.ranks[rank];
+            if worker
+                .config
+                .text_config
+                .mlp_layer_types
+                .iter()
+                .enumerate()
+                .any(|(layer, kind)| p.scope.contains_layer(layer) && *kind == MlpKind::Sparse)
+            {
+                worker.prepare_warming()?;
+            }
             for (name, linear_weight) in static_weight_specs(&worker.config.text_config) {
                 if !p.scope.contains_static(&name)
                     || (!p.execution.resident_static && name != LM_HEAD_WEIGHT)
@@ -575,7 +814,26 @@ impl LayerPartitionedGlm {
         for w in &self.workers {
             w.device.synchronize()?;
         }
-        self.caches.clear();
+        self.clear_caches()?;
+        for worker in &self.workers {
+            worker.device.synchronize()?;
+            if let Some(pool) = worker.weight_pool.get().and_then(Option::as_ref) {
+                pool.trim()?;
+            }
+            let ctx = worker
+                .device
+                .as_cuda_device()?
+                .cuda_stream()
+                .context()
+                .clone();
+            if ctx.has_async_alloc() {
+                use candle_core::cuda_backend::cudarc::driver::result;
+                ctx.bind_to_thread()?;
+                unsafe {
+                    result::mem_pool::trim_to(result::device::get_mem_pool(ctx.cu_device())?, 0)?;
+                }
+            }
+        }
         self.tokens = 0;
         self.transfers = 0;
         self.transferred_bytes = 0;
@@ -590,9 +848,7 @@ impl LayerPartitionedGlm {
         options: &GlmGenerationOptions,
     ) -> Result<GlmPartitionGeneration> {
         ensure!(
-            options.max_new_tokens > 0
-                && options.max_context_tokens > 0
-                && options.max_context_tokens <= self.context_bound(),
+            options.max_new_tokens > 0 && options.max_context_tokens > 0,
             "invalid GLM generation context limits"
         );
         ensure!(
@@ -609,8 +865,8 @@ impl LayerPartitionedGlm {
         ensure!(
             ids.len()
                 .checked_add(options.max_new_tokens)
-                .is_some_and(|n| n <= options.max_context_tokens),
-            "GLM prompt and output exceed request context"
+                .is_some_and(|n| n <= options.max_context_tokens && n <= self.context_bound()),
+            "GLM prompt and output exceed request or prepared context"
         );
         ensure!(
             !self.failed,
@@ -620,10 +876,15 @@ impl LayerPartitionedGlm {
             self.reset()?;
         }
         let cache_before = self.cache_stats();
+        let mut io_trace = crate::io_trace::IoTrace::from_env()?;
         let start = Instant::now();
         let mut logits = self.prefill_ids(&ids)?;
         self.workers.last().unwrap().device.synchronize()?;
         let prefill_elapsed_ms = millis(start.elapsed())?;
+        let cache_after_prefill = self.cache_stats();
+        if let Some(trace) = &mut io_trace {
+            trace.record("prefill", None);
+        }
         let start = Instant::now();
         let mut tokens = Vec::new();
         let mut times = Vec::new();
@@ -639,6 +900,9 @@ impl LayerPartitionedGlm {
                     .contains(&token)
                 {
                     times.push(millis(tick.elapsed())?);
+                    if let Some(trace) = &mut io_trace {
+                        trace.record("decode_token", Some(step));
+                    }
                     break;
                 }
                 if step + 1 < options.max_new_tokens {
@@ -646,6 +910,9 @@ impl LayerPartitionedGlm {
                     self.workers.last().unwrap().device.synchronize()?;
                 }
                 times.push(millis(tick.elapsed())?);
+                if let Some(trace) = &mut io_trace {
+                    trace.record("decode_token", Some(step));
+                }
                 if options.progress {
                     eprintln!(
                         "GLM partition token {}/{} id {token}",
@@ -674,7 +941,9 @@ impl LayerPartitionedGlm {
             transfer_count: self.transfers,
             transferred_bytes: self.transferred_bytes,
             cache_before,
+            cache_after_prefill,
             cache_after: self.cache_stats(),
+            io_trace: io_trace.map(crate::io_trace::IoTrace::finish),
             fp8_transfers: self
                 .workers
                 .iter()
@@ -750,7 +1019,6 @@ mod tests {
                 cgroup_v2_memory_available_bytes: Some(100),
                 device_free_memory_bytes: Some(10),
                 host_device_memory_is_unified: None,
-                device_topology_probe_failed: false,
                 host_memory_total_bytes: None,
                 device_total_memory_bytes: None,
                 measurement_scope: ResourceMeasurementScopes {

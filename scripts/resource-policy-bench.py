@@ -119,7 +119,7 @@ def file_ref(root, path):
 
 def collect_sample(pid):
     try:
-        # /usr/bin/time is the direct child; sample its ff child, not time's RSS.
+        # Sample the inference child of the timer process.
         children = Path(f'/proc/{pid}/task/{pid}/children').read_text().split()
         if not children:
             return None
@@ -135,7 +135,7 @@ def collect_sample(pid):
         return None
 
 
-def run_trial(root, binary, plan, pair, role, *, resource_policy='conservative', evidence=None):
+def run_trial(root, binary, plan, pair, role, timer, *, resource_policy='conservative', evidence=None):
     if resource_policy not in ['conservative', 'performance']:
         raise ValueError('invalid resource policy mode')
     case = root / f'pair-{pair:02d}-{role}'
@@ -165,7 +165,7 @@ def run_trial(root, binary, plan, pair, role, *, resource_policy='conservative',
     status(root, {'state': 'running', 'pair': pair, 'role': role, 'case': str(case)})
     samples = []
     with (case/'stdout.log').open('wb') as stdout, (case/'stderr.log').open('wb') as stderr:
-        process = subprocess.Popen(['/usr/bin/time', '-v', '-o', str(case/'time.txt'), *args], stdout=stdout, stderr=stderr)
+        process = subprocess.Popen([timer, '-v', '-o', str(case/'time.txt'), *args], stdout=stdout, stderr=stderr)
         while process.poll() is None:
             sample = collect_sample(process.pid)
             if sample:
@@ -242,6 +242,10 @@ def run_trial(root, binary, plan, pair, role, *, resource_policy='conservative',
 
 
 def run(args):
+    timer = shutil.which('time')
+    if timer is None:
+        raise RuntimeError('GNU time is required')
+    print(f'timer: {timer}', flush=True)
     plan = json.loads(args.plan.read_text())
     required = {'schema_version', 'family', 'common_args', 'baseline_args', 'candidate_args', 'pairs', 'minimum_improvement_basis_points', 'cache_state'}
     if set(plan) != required or plan['schema_version'] != 1 or plan['family'] not in ['h3', 'glm']:
@@ -270,7 +274,7 @@ def run(args):
     paired = []
     for pair in range(plan['pairs']):
         roles = ['baseline','candidate'] if pair%2 == 0 else ['candidate','baseline']
-        outcomes = {role:run_trial(root,binary,plan,pair,role) for role in roles}
+        outcomes = {role:run_trial(root,binary,plan,pair,role,timer) for role in roles}
         paired.append(outcomes)
     good = [p for p in paired if p['baseline'] and p['candidate']]
     if len(good) != plan['pairs']:

@@ -1,14 +1,390 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use candle_core::{Device, DeviceLocation};
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// A measured sample range in milliseconds.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProbeRange {
+    pub min: f64,
+    pub median: f64,
+    pub max: f64,
+}
+
+impl ProbeRange {
+    fn from_samples(samples: &mut [f64]) -> Result<Self> {
+        ensure!(
+            !samples.is_empty() && samples.iter().all(|v| v.is_finite() && *v > 0.0),
+            "probe samples must be nonempty, finite and positive"
+        );
+        samples.sort_by(f64::total_cmp);
+        Ok(Self {
+            min: samples[0],
+            median: samples[samples.len() / 2],
+            max: samples[samples.len() - 1],
+        })
+    }
+}
+
+/// Warm each candidate, then time candidates in interleaved order.
+pub fn probe(
+    candidates: usize,
+    mut prepare: impl FnMut(usize) -> Result<()>,
+    mut run: impl FnMut(usize) -> Result<()>,
+    mut fence: impl FnMut() -> Result<()>,
+    mut elapsed: impl FnMut(usize, Duration) -> Result<f64>,
+) -> Result<Vec<ProbeRange>> {
+    ensure!(candidates > 0, "probe has no candidates");
+    let mut samples = vec![Vec::with_capacity(12); candidates];
+    for rep in 0..15 {
+        for (i, values) in samples.iter_mut().enumerate() {
+            prepare(i).with_context(|| format!("probe candidate {i} preparation failed"))?;
+            fence().with_context(|| format!("probe candidate {i} preparation fence failed"))?;
+            let start = Instant::now();
+            run(i).with_context(|| format!("probe candidate {i} launch failed"))?;
+            fence().with_context(|| format!("probe candidate {i} completion fence failed"))?;
+            let ms = elapsed(i, start.elapsed())
+                .with_context(|| format!("probe candidate {i} duration measurement failed"))?;
+            ensure!(
+                ms.is_finite() && ms > 0.0,
+                "probe candidate {i} duration is invalid: {ms}"
+            );
+            if rep >= 3 {
+                values.push(ms);
+            }
+        }
+    }
+    samples
+        .iter_mut()
+        .enumerate()
+        .map(|(i, values)| {
+            ProbeRange::from_samples(values)
+                .with_context(|| format!("probe candidate {i} sample range failed"))
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReplayProbe {
+    pub batches: usize,
+    pub ranges: Vec<ProbeRange>,
+    pub repeats: usize,
+    pub pilot_spread: f64,
+    pub spread: f64,
+}
+
+pub fn probe_replays(
+    candidates: usize,
+    capacity: usize,
+    mut prepare: impl FnMut(usize) -> Result<()>,
+    mut run: impl FnMut(usize, usize) -> Result<()>,
+    mut fence: impl FnMut() -> Result<()>,
+    mut elapsed: impl FnMut(usize, Duration) -> Result<f64>,
+) -> Result<ReplayProbe> {
+    ensure!(capacity > 0, "decode probe has no replay-state capacity");
+    let mut repeats = 1;
+    let mut pilot_spread = None;
+    let mut batches = 0;
+    loop {
+        batches += 1;
+        let mut ranges = probe(
+            candidates,
+            &mut prepare,
+            |i| run(i, repeats),
+            &mut fence,
+            &mut elapsed,
+        )?;
+        for r in &mut ranges {
+            r.min /= repeats as f64;
+            r.median /= repeats as f64;
+            r.max /= repeats as f64;
+        }
+        let spread = ranges
+            .iter()
+            .map(|r| (r.max - r.min) / r.median)
+            .fold(0.0_f64, f64::max);
+        let pilot = *pilot_spread.get_or_insert(spread);
+        if spread <= 0.01 {
+            return Ok(ReplayProbe {
+                batches,
+                ranges,
+                repeats,
+                pilot_spread: pilot,
+                spread,
+            });
+        }
+        let required = (repeats as f64 * (spread / 0.01).powi(2)).ceil();
+        ensure!(
+            required.is_finite() && required <= capacity as f64,
+            "decode probe needs {required} replays to resolve 1%, state capacity {capacity}, measured spread {spread}"
+        );
+        let required = required as usize;
+        repeats = required.max(
+            repeats
+                .checked_add(1)
+                .context("decode probe replay count overflow")?,
+        );
+        ensure!(
+            repeats <= capacity,
+            "decode probe needs {repeats} replays, state capacity {capacity}"
+        );
+    }
+}
+
+/// Prefer a measured winner only when its whole range is faster.
+pub fn probe_choice(ranges: &[ProbeRange], preferred: Option<usize>) -> Result<(usize, bool)> {
+    ensure!(!ranges.is_empty(), "probe selection has no candidates");
+    if let Some(i) = preferred {
+        ensure!(i < ranges.len(), "probe preferred candidate {i} is absent");
+    }
+    for (i, r) in ranges.iter().enumerate() {
+        ensure!(
+            r.min.is_finite()
+                && r.median.is_finite()
+                && r.max.is_finite()
+                && r.min > 0.0
+                && r.min <= r.median
+                && r.median <= r.max,
+            "probe candidate {i} range is invalid: {r:?}"
+        );
+    }
+    let best = (0..ranges.len())
+        .min_by(|&a, &b| {
+            ranges[a]
+                .median
+                .total_cmp(&ranges[b].median)
+                .then(a.cmp(&b))
+        })
+        .context("probe selection has no median")?;
+    let separated = ranges
+        .iter()
+        .enumerate()
+        .all(|(i, r)| i == best || ranges[best].max < r.min);
+    Ok((
+        if separated {
+            best
+        } else {
+            preferred.unwrap_or(best)
+        },
+        separated,
+    ))
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodeChoice {
+    pub adapter: String,
+    pub geometry: serde_json::Value,
+    pub class: String,
+    pub settings: serde_json::Value,
+    pub split: Vec<Vec<(usize, usize, usize, usize)>>,
+    pub fingerprint: Option<HardwareFingerprint>,
+    pub binary: Option<crate::identity::BinaryIdentity>,
+    pub image: String,
+    pub trials: Vec<ReplayProbe>,
+    pub device: usize,
+    pub cols: u32,
+    pub derived: String,
+    pub body: String,
+    pub reason: String,
+    pub stock: ProbeRange,
+    pub xr16: ProbeRange,
+    pub repeats: usize,
+    pub warmups: usize,
+    pub samples: usize,
+    pub capacity: usize,
+    pub state_bytes: usize,
+    pub seed_token: u32,
+    pub topology: String,
+    pub pilot_spread: f64,
+    pub spread: f64,
+    pub capture_ms: f64,
+    pub replay_ms: f64,
+    pub setup_ms: f64,
+}
+
+impl DecodeChoice {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            ["qwen35", "edge0"].contains(&self.adapter.as_str()),
+            "unknown group4 adapter; run ff bench group4"
+        );
+        ensure!(
+            [
+                "resident_graph",
+                "streamed",
+                "host_expert",
+                "fully_streamed"
+            ]
+            .contains(&self.class.as_str()),
+            "unknown group4 execution class; run ff bench group4"
+        );
+        ensure!(
+            [1, 2].contains(&self.cols) && self.geometry.is_object() && self.settings.is_object(),
+            "invalid group4 program key; run ff bench group4"
+        );
+        ensure!(
+            ["stock", "xr16"].contains(&self.body.as_str()) && self.body == self.derived,
+            "invalid persisted group4 body; run ff bench group4"
+        );
+        ensure!(
+            self.image.len() == 64
+                && self
+                    .image
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "group4 kernel image digest missing/invalid; run ff bench group4"
+        );
+        let fingerprint = self
+            .fingerprint
+            .as_ref()
+            .context("group4 fingerprint missing; run ff bench group4")?;
+        fingerprint.validate()?;
+        ensure!(
+            fingerprint.backend == DeviceBackend::Cuda,
+            "group4 fingerprint is not CUDA; run ff bench group4"
+        );
+        for (field, present) in [
+            (
+                "operating_system_version",
+                fingerprint.operating_system_version.is_some(),
+            ),
+            ("device_name", fingerprint.device_name.is_some()),
+            (
+                "device_total_memory_bytes",
+                fingerprint.device_total_memory_bytes.is_some(),
+            ),
+            ("driver_version", fingerprint.driver_version.is_some()),
+            (
+                "cuda_compute_capability",
+                fingerprint.cuda_compute_capability.is_some(),
+            ),
+            ("cuda_device_uuid", fingerprint.cuda_device_uuid.is_some()),
+            (
+                "cuda_driver_api_version",
+                fingerprint.cuda_driver_api_version.is_some(),
+            ),
+            (
+                "cuda_binding_api_version",
+                fingerprint.cuda_binding_api_version.is_some(),
+            ),
+        ] {
+            ensure!(
+                present,
+                "group4 fingerprint {field} missing; run ff bench group4"
+            );
+        }
+        self.binary
+            .as_ref()
+            .context("group4 binary identity missing; run ff bench group4")?
+            .validate()?;
+        ensure!(
+            self.trials.len() == 3
+                && self.split.len() == 3
+                && self.split.iter().all(|s| !s.is_empty()
+                    && s.iter()
+                        .all(|&(_, a, resident, b)| a <= resident && resident <= b && a < b)),
+            "group4 needs three independent calibration trials; run ff bench group4"
+        );
+        let mut unanimous = true;
+        for trial in &self.trials {
+            ensure!(
+                trial.ranges.len() == 2
+                    && trial.repeats > 0
+                    && trial.batches > 0
+                    && trial.spread.is_finite()
+                    && trial.spread <= 0.01
+                    && trial.spread >= 0.0
+                    && trial.pilot_spread.is_finite()
+                    && trial.pilot_spread >= 0.0,
+                "invalid group4 trial; run ff bench group4"
+            );
+            let (body, separated) = probe_choice(&trial.ranges, Some(0))?;
+            unanimous &= body == 1 && separated;
+        }
+        ensure!(
+            self.body == if unanimous { "xr16" } else { "stock" },
+            "group4 body disagrees with independent evidence; run ff bench group4"
+        );
+        Ok(())
+    }
+
+    pub fn key(&self) -> serde_json::Value {
+        serde_json::json!({"adapter":self.adapter,"device":self.device,"cols":self.cols,"geometry":self.geometry,"class":self.class,"settings":self.settings,"fingerprint":self.fingerprint,"binary":self.binary.as_ref().map(|b| serde_json::json!({"schema_version":b.schema_version,"package_name":b.package_name,"package_version":b.package_version,"compiled_features":b.compiled_features})),"image":self.image})
+    }
+
+    pub fn set_key(
+        &mut self,
+        key: &serde_json::Value,
+        split: Vec<(usize, usize, usize, usize)>,
+    ) -> Result<()> {
+        self.adapter = serde_json::from_value(key["adapter"].clone())?;
+        self.geometry = key["geometry"].clone();
+        self.class = serde_json::from_value(key["class"].clone())?;
+        self.settings = key["settings"].clone();
+        self.fingerprint = Some(serde_json::from_value(key["fingerprint"].clone())?);
+        self.binary = Some(serde_json::from_value(key["binary"].clone())?);
+        self.image = serde_json::from_value(key["image"].clone())?;
+        self.split = vec![split];
+        Ok(())
+    }
+
+    pub fn combine(mut trials: Vec<Self>) -> Result<Self> {
+        ensure!(
+            trials.len() == 3,
+            "group4 needs three independent calibrations"
+        );
+        let mut record = trials.remove(0);
+        ensure!(
+            trials.iter().all(|t| record.matches(t)),
+            "group4 execution class changed during calibration; rerun ff bench group4"
+        );
+        for trial in trials {
+            record.capture_ms += trial.capture_ms;
+            record.replay_ms += trial.replay_ms;
+            record.setup_ms += trial.setup_ms;
+            record.trials.extend(trial.trials);
+            record.split.extend(trial.split);
+        }
+        let choices = record
+            .trials
+            .iter()
+            .map(|t| probe_choice(&t.ranges, Some(0)))
+            .collect::<Result<Vec<_>>>()?;
+        let xr16 = choices
+            .iter()
+            .all(|&(body, separated)| body == 1 && separated);
+        let agreed = choices
+            .iter()
+            .all(|&(body, separated)| body == choices[0].0 && separated);
+        record.body = if xr16 { "xr16" } else { "stock" }.into();
+        record.derived = record.body.clone();
+        record.reason = if agreed {
+            "independent separated trials agree"
+        } else {
+            "overlap or independent disagreement"
+        }
+        .into();
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn matches(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+pub fn image_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 pub const HARDWARE_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
-pub const RESOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const RESOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,7 +479,7 @@ pub struct HardwareFingerprint {
 }
 
 impl HardwareFingerprint {
-    pub fn collect(device: &Device) -> Self {
+    pub fn collect(device: &Device) -> Result<Self> {
         hardware_fingerprint_with_source(device, &SystemProbeSource)
     }
 
@@ -394,31 +770,28 @@ pub struct ResourceSnapshot {
     pub device_free_memory_bytes: Option<u64>,
     /// Whether host and device memory are one shared physical pool (the CUDA
     /// `integrated` device attribute, e.g. Jetson unified memory). `Some(true)`
-    /// switches admission to combined-pool accounting. `None` — legacy records,
-    /// non-CUDA backends, and (warned-once) failed probes — keeps the split
-    /// per-axis checks every consumer used before this field existed, as does
-    /// a confirmed-discrete `Some(false)`. The distinction that matters for
-    /// correctness is `Some(true)` versus everything else; the distinction
-    /// between `None` and `Some(false)` is provenance for diagnostics.
-    #[serde(default)]
+    /// switches admission to combined-pool accounting; `None` records a
+    /// non-CUDA backend or a topology the probe could not classify; a
+    /// confirmed-discrete `Some(false)` is split accounting. The field is
+    /// required in stored records: a record without it predates the probe
+    /// and must be recaptured.
+    #[serde(deserialize_with = "crate::required_option")]
     pub host_device_memory_is_unified: Option<bool>,
-    /// A failed live CUDA topology query, as distinct from a legacy record.
-    #[serde(default)]
-    pub device_topology_probe_failed: bool,
     /// Hardware-level totals (MemTotal / device total memory), unlike the
     /// instantaneous `*_available`/`device_free` views. Reserve sizes scale
     /// with totals so that a run's margin does not shrink when the machine is
     /// busy and sidecar-recorded reserves stay comparable across runs.
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required_option")]
     pub host_memory_total_bytes: Option<u64>,
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required_option")]
     pub device_total_memory_bytes: Option<u64>,
     pub measurement_scope: ResourceMeasurementScopes,
 }
 
 impl ResourceSnapshot {
-    pub fn capture(device: Option<&Device>) -> Self {
-        resource_snapshot_with_source(device, &SystemProbeSource, unix_time_ms())
+    pub fn capture(device: Option<&Device>) -> anyhow::Result<Self> {
+        resource_snapshot_with_source(device, &SystemProbeSource, unix_time_ms()?)
+            .context("resource probe failed")
     }
 
     /// Available bytes of the single memory pool when the probe confirmed a
@@ -453,10 +826,45 @@ impl ResourceSnapshot {
         }
     }
 
+    pub fn pool_total(&self, device: bool) -> Result<u64> {
+        let host = || {
+            self.host_memory_total_bytes
+                .filter(|&n| n > 0)
+                .map(|total| match self.cgroup_v2_memory_limit {
+                    Some(CgroupMemoryLimit::Bytes(limit)) => total.min(limit),
+                    _ => total,
+                })
+                .context("host_memory_total_bytes unavailable; recapture with ff probe --json")
+        };
+        if !device {
+            return host();
+        }
+        let unified = self.host_device_memory_is_unified.context("host_device_memory_is_unified unavailable; recapture with ff probe --device cuda:N --json")?;
+        let total = self.device_total_memory_bytes.filter(|&n| n > 0).context(
+            "device_total_memory_bytes unavailable; recapture with ff probe --device cuda:N --json",
+        )?;
+        if unified {
+            Ok(total.min(host()?))
+        } else {
+            Ok(total)
+        }
+    }
+
+    pub fn device_capacity(&self) -> Result<u64> {
+        let unified = self.host_device_memory_is_unified.context("host_device_memory_is_unified unavailable; recapture with ff probe --device cuda:N --json")?;
+        if unified {
+            self.unified_pool_available_bytes().context("unified_pool_available_bytes unavailable; recapture with ff probe --device cuda:N --json")
+        } else {
+            self.device_free_memory_bytes.context("device_free_memory_bytes unavailable; recapture with ff probe --device cuda:N --json")
+        }
+    }
+
     /// Whether admission must refuse rather than fall back to per-axis checks:
     /// a shared pool of unknown size, or a failed live topology query.
     pub fn unified_accounting_is_undecidable(&self) -> bool {
-        self.device_topology_probe_failed || self.unified_pool_is_unmeasurable()
+        self.unified_pool_is_unmeasurable()
+            || (self.host_device_memory_is_unified.is_none()
+                && self.measurement_scope.device_memory.is_some())
     }
 
     /// Whether a confirmed shared pool's size could not be measured.
@@ -469,21 +877,24 @@ impl ResourceSnapshot {
 /// Cap every pool-scaled admission reserve converges to: 1 GiB.
 pub const ADMISSION_RESERVE_CAP_BYTES: u64 = 1 << 30;
 
-/// Floor under every pool-scaled admission reserve: part of what a reserve
-/// covers is a fixed cost (a CUDA context is hundreds of MiB) that does not
-/// shrink with the pool, so the percentage alone would under-protect small
-/// machines — the inverse of the over-reservation this consolidates away.
+/// Minimum allowance for fixed context and allocator costs.
 pub const ADMISSION_RESERVE_FLOOR_BYTES: u64 = 512 << 20;
 
-/// The one admission-reserve shape: 5% of the pool total, floored at
-/// 512 MiB and capped at 1 GiB. Pools under 20 GiB scale below the cap so
-/// small and unified-memory machines are not over-reserved; pools under
-/// ~10 GiB keep the floor so the fixed component stays covered; an unknown
-/// pool keeps the full cap, matching the flat reserves this consolidates.
+/// Reserve 5% of the pool total, between 512 MiB and 1 GiB; an unknown total uses the cap.
 pub fn admission_reserve_bytes(pool_total: Option<u64>) -> u64 {
     pool_total.map_or(ADMISSION_RESERVE_CAP_BYTES, |total| {
         ADMISSION_RESERVE_FLOOR_BYTES.max(ADMISSION_RESERVE_CAP_BYTES.min(total / 20))
     })
+}
+
+/// Device-pool safety allowance for allocation rounding and unobserved transient usage.
+pub const DEVICE_RESERVE_SAFETY_BYTES: u64 = 64 << 20;
+
+/// The device-pool admission reserve: a fixed safety term over the charged
+/// transient planes. It does not scale with the pool — the planner's charge
+/// already carries the pool-dependent terms.
+pub fn device_admission_reserve_bytes() -> u64 {
+    DEVICE_RESERVE_SAFETY_BYTES
 }
 
 /// Whether two fingerprints describe the same machine.
@@ -568,18 +979,12 @@ fn windows_physical_memory_bytes() -> Option<(u64, u64)> {
 fn hardware_fingerprint_with_source(
     source_device: &Device,
     source: &impl ProbeSource,
-) -> HardwareFingerprint {
+) -> Result<HardwareFingerprint> {
     let cpu_info = source.read_to_string(Path::new("/proc/cpuinfo")).ok();
-    let logical_cpu_count = cpu_info
-        .as_deref()
-        .and_then(parse_logical_cpu_count)
-        .or_else(|| {
-            std::thread::available_parallelism()
-                .ok()
-                .map(|count| count.get())
-        })
-        .and_then(|count| u64::try_from(count).ok())
-        .unwrap_or(1);
+    let logical_cpu_count = cpu_count(
+        cpu_info.as_deref(),
+        std::thread::available_parallelism().ok().map(|n| n.get()),
+    )?;
     let os_version = source
         .read_to_string(Path::new("/proc/sys/kernel/osrelease"))
         .ok()
@@ -639,26 +1044,30 @@ fn hardware_fingerprint_with_source(
             populate_metal_fingerprint(source_device, &mut fingerprint);
         }
     }
-    fingerprint
+    Ok(fingerprint)
 }
 
 fn resource_snapshot_with_source(
     device: Option<&Device>,
     source: &impl ProbeSource,
     measured_at_unix_ms: u64,
-) -> ResourceSnapshot {
+) -> anyhow::Result<ResourceSnapshot> {
     let host_memory_available_bytes = source
         .read_to_string(Path::new("/proc/meminfo"))
         .ok()
         .as_deref()
         .and_then(|contents| parse_meminfo_bytes(contents, "MemAvailable"))
         .or_else(|| source.host_available_memory_bytes());
+    let views = read_cgroup_v2_memory(source)?.unwrap_or(CgroupMemoryViews {
+        limit: None,
+        current: None,
+        available: None,
+    });
     let (cgroup_v2_memory_limit, cgroup_v2_memory_current_bytes, cgroup_v2_memory_available_bytes) =
-        read_cgroup_v2_memory(source).unwrap_or((None, None, None));
+        (views.limit, views.current, views.available);
     let device_free_memory_bytes = device.and_then(device_free_memory);
-    let (host_device_memory_is_unified, device_topology_probe_failed) = device
-        .map(device_memory_is_unified)
-        .unwrap_or((None, false));
+    let host_device_memory_is_unified = device.map(device_memory_is_unified).transpose()?.flatten();
+    // Live topology-query errors propagate from capture.
     let host_memory_total_bytes = source
         .read_to_string(Path::new("/proc/meminfo"))
         .ok()
@@ -667,7 +1076,7 @@ fn resource_snapshot_with_source(
         .or_else(|| source.host_total_memory_bytes());
     let device_total_memory_bytes = device.and_then(device_total_memory);
 
-    ResourceSnapshot {
+    Ok(ResourceSnapshot {
         schema_version: RESOURCE_SNAPSHOT_SCHEMA_VERSION,
         measured_at_unix_ms,
         host_memory_available_bytes,
@@ -676,7 +1085,6 @@ fn resource_snapshot_with_source(
         cgroup_v2_memory_available_bytes,
         device_free_memory_bytes,
         host_device_memory_is_unified,
-        device_topology_probe_failed,
         host_memory_total_bytes,
         device_total_memory_bytes,
         measurement_scope: ResourceMeasurementScopes {
@@ -686,15 +1094,90 @@ fn resource_snapshot_with_source(
             .then_some(MemoryMeasurementScope::ProcessCgroupV2),
             device_memory: device_free_memory_bytes.map(|_| MemoryMeasurementScope::DeviceWide),
         },
-    }
+    })
 }
 
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
-        .unwrap_or(0)
+fn cpu_count(cpu_info: Option<&str>, platform_count: Option<usize>) -> Result<u64> {
+    let count = match cpu_info {
+        Some(info) => parse_logical_cpu_count(info),
+        None => platform_count,
+    }
+    .filter(|&count| count > 0)
+    .context("logical_cpu_count unavailable; run ff probe --device cpu --json")?;
+    u64::try_from(count).context("logical_cpu_count exceeds u64; run ff probe --device cpu --json")
+}
+
+fn unix_time_ms() -> Result<u64> {
+    timestamp_ms(SystemTime::now())
+}
+
+fn timestamp_ms(time: SystemTime) -> Result<u64> {
+    let elapsed = time.duration_since(UNIX_EPOCH).context(
+        "measured_at_unix_ms precedes the epoch; correct the clock and run ff probe --json",
+    )?;
+    u64::try_from(elapsed.as_millis())
+        .context("measured_at_unix_ms exceeds u64; correct the clock and run ff probe --json")
+}
+
+pub fn env_value<T: std::str::FromStr>(name: &str) -> Result<Option<T>>
+where
+    T::Err: std::fmt::Display,
+{
+    parse_env(name, std::env::var_os(name))
+}
+
+fn parse_env<T: std::str::FromStr>(
+    name: &str,
+    value: Option<std::ffi::OsString>,
+) -> Result<Option<T>>
+where
+    T::Err: std::fmt::Display,
+{
+    value
+        .map(|value| {
+            let value = value.into_string().map_err(|_| {
+                anyhow::anyhow!("{name} is not Unicode; supply a valid value and rerun ff")
+            })?;
+            value.parse::<T>().map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid {name}={value:?}: {error}; supply a valid value and rerun ff"
+                )
+            })
+        })
+        .transpose()
+}
+
+pub fn env_usize(name: &str, default: usize, min: usize, max: usize) -> Result<usize> {
+    parse_env_usize(name, std::env::var_os(name), default, min, max)
+}
+
+fn parse_env_usize(
+    name: &str,
+    source: Option<std::ffi::OsString>,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize> {
+    let value = parse_env(name, source)?.unwrap_or(default);
+    anyhow::ensure!(
+        (min..=max).contains(&value),
+        "{name} must be in {min}..={max}, got {value}; supply a valid value and rerun ff"
+    );
+    Ok(value)
+}
+
+pub fn cached_env_usize(
+    cache: &std::sync::OnceLock<std::result::Result<usize, String>>,
+    name: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize> {
+    cache
+        .get_or_init(|| env_usize(name, default, min, max).map_err(|error| error.to_string()))
+        .as_ref()
+        .copied()
+        .map_err(|error| anyhow::anyhow!(error.clone()))
 }
 
 fn nonempty_trimmed(value: &str) -> Option<String> {
@@ -813,57 +1296,97 @@ fn format_cuda_uuid(bytes: [u8; 16]) -> String {
     )
 }
 
-fn read_cgroup_v2_memory(
-    source: &impl ProbeSource,
-) -> Option<(Option<CgroupMemoryLimit>, Option<u64>, Option<u64>)> {
-    let cgroup = source.read_to_string(Path::new("/proc/self/cgroup")).ok()?;
-    let mountinfo = source
-        .read_to_string(Path::new("/proc/self/mountinfo"))
-        .ok()?;
-    let (mount_point, directory) = resolve_cgroup_v2_directory(&cgroup, &mountinfo)?;
-    let leaf_current = source
-        .read_to_string(&directory.join("memory.current"))
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok());
+/// The cgroup v2 views the admission reads: the effective limit, the leaf
+/// usage, and the usage net of reclaimable file cache.
+pub(crate) struct CgroupMemoryViews {
+    limit: Option<CgroupMemoryLimit>,
+    current: Option<u64>,
+    available: Option<u64>,
+}
 
-    let mut saw_limit = false;
+fn read_cgroup_v2_memory(source: &impl ProbeSource) -> anyhow::Result<Option<CgroupMemoryViews>> {
+    // Missing /proc entries mean the OS has no cgroup v2 hierarchy at all:
+    // not applicable, not a failure.
+    let cgroup = match source.read_to_string(Path::new("/proc/self/cgroup")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "cgroup v2 probe: read /proc/self/cgroup: {error}"
+            ));
+        }
+    };
+    let mountinfo = match source.read_to_string(Path::new("/proc/self/mountinfo")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "cgroup v2 probe: read /proc/self/mountinfo: {error}"
+            ));
+        }
+    };
+    let Some((mount_point, directory)) = resolve_cgroup_v2_directory(&cgroup, &mountinfo) else {
+        return Ok(None);
+    };
+    let leaf_current = read_cgroup_counter(source, &directory.join("memory.current"))?;
+
     let mut finite_limit: Option<u64> = None;
     let mut effective_available: Option<u64> = None;
-    let mut hierarchy_complete = true;
     for ancestor in directory.ancestors() {
         if !ancestor.starts_with(&mount_point) {
             break;
         }
-        let limit = source
-            .read_to_string(&ancestor.join("memory.max"))
-            .ok()
-            .as_deref()
-            .and_then(parse_cgroup_memory_limit);
+        let limit = read_cgroup_limit(source, &ancestor.join("memory.max"))?;
         let Some(limit) = limit else {
             if ancestor == mount_point {
-                saw_limit = true;
                 break;
             }
-            hierarchy_complete = false;
-            continue;
+            anyhow::bail!(
+                "cgroup v2 probe: {} has no readable memory.max",
+                ancestor.display()
+            );
         };
-        saw_limit = true;
+        // memory.high throttles before memory.max; the effective ceiling is
+        // the lower of whichever of the two is finite. The file itself is
+        // optional: no memory.high means no throttle.
+        let high = match source.read_to_string(&ancestor.join("memory.high")) {
+            Ok(text) => match parse_cgroup_memory_limit(&text) {
+                Some(limit) => Some(limit),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "cgroup v2 probe: unparsable memory.high in {}",
+                        ancestor.join("memory.high").display()
+                    ));
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "cgroup v2 probe: read {}: {error}",
+                    ancestor.join("memory.high").display()
+                ));
+            }
+        };
+        let limit = match high {
+            Some(CgroupMemoryLimit::Bytes(high)) => match limit {
+                CgroupMemoryLimit::Bytes(max) => CgroupMemoryLimit::Bytes(max.min(high)),
+                CgroupMemoryLimit::Unlimited => CgroupMemoryLimit::Bytes(high),
+            },
+            _ => limit,
+        };
         if let CgroupMemoryLimit::Bytes(bytes) = limit {
             finite_limit = Some(finite_limit.map_or(bytes, |current| current.min(bytes)));
-            let current = source
-                .read_to_string(&ancestor.join("memory.current"))
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok());
-            let Some(current) = current else {
-                hierarchy_complete = false;
-                continue;
-            };
+            let current = read_cgroup_counter(source, &ancestor.join("memory.current"))?;
             let reclaimable = source
                 .read_to_string(&ancestor.join("memory.stat"))
-                .ok()
-                .as_deref()
-                .and_then(cgroup_reclaimable_file_bytes)
-                .unwrap_or(0)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "cgroup v2 probe: read {}: {error}",
+                        ancestor.join("memory.stat").display()
+                    )
+                })?;
+            let reclaimable = cgroup_reclaimable_file_bytes(&reclaimable)
+                .context("cgroup v2 probe: unparsable memory.stat")?
                 .min(current);
             let available = bytes.saturating_sub(current - reclaimable);
             effective_available =
@@ -873,14 +1396,47 @@ fn read_cgroup_v2_memory(
             break;
         }
     }
-    let effective_limit = hierarchy_complete.then(|| {
-        finite_limit
-            .map(CgroupMemoryLimit::Bytes)
-            .unwrap_or(CgroupMemoryLimit::Unlimited)
-    });
-    let effective_available = hierarchy_complete.then_some(effective_available).flatten();
-    debug_assert!(!hierarchy_complete || saw_limit);
-    Some((effective_limit, leaf_current, effective_available))
+    let effective_limit = finite_limit
+        .map(CgroupMemoryLimit::Bytes)
+        .unwrap_or(CgroupMemoryLimit::Unlimited);
+    Ok(Some(CgroupMemoryViews {
+        limit: Some(effective_limit),
+        current: Some(leaf_current),
+        available: effective_available,
+    }))
+}
+
+/// One cgroup control file whose content is a byte count or the literal
+/// `max`. `Ok(None)` is a clean unlimited value; anything the OS cannot
+/// read is an error naming the file.
+fn read_cgroup_limit(
+    source: &impl ProbeSource,
+    path: &Path,
+) -> anyhow::Result<Option<CgroupMemoryLimit>> {
+    // A missing limit file means the controller exposes no ceiling here:
+    // clean unlimited, not a failure.
+    let text = match source.read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "cgroup v2 probe: read {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    parse_cgroup_memory_limit(&text)
+        .context("cgroup v2 probe: unparsable memory limit")
+        .map(Some)
+}
+
+fn read_cgroup_counter(source: &impl ProbeSource, path: &Path) -> anyhow::Result<u64> {
+    let text = source
+        .read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("cgroup v2 probe: read {}: {error}", path.display()))?;
+    text.trim()
+        .parse::<u64>()
+        .context("cgroup v2 probe: unparsable byte count")
 }
 
 fn cgroup_reclaimable_file_bytes(stat: &str) -> Option<u64> {
@@ -1161,12 +1717,11 @@ fn device_total_memory(_device: &Device) -> Option<u64> {
 /// silent: it warns once per process before falling back to `None`, so a real
 /// integrated device cannot regress to split-axis accounting unnoticed.
 #[cfg(feature = "cuda")]
-fn device_memory_is_unified(device: &Device) -> (Option<bool>, bool) {
+fn device_memory_is_unified(device: &Device) -> anyhow::Result<Option<bool>> {
     use candle_core::cuda_backend::cudarc::driver::sys;
 
-    static WARNED: std::sync::Once = std::sync::Once::new();
     let Ok(cuda) = device.as_cuda_device() else {
-        return (None, false);
+        return Ok(None);
     };
     let stream = cuda.cuda_stream();
     let mut value = 0_i32;
@@ -1178,25 +1733,276 @@ fn device_memory_is_unified(device: &Device) -> (Option<bool>, bool) {
         )
     };
     if result == sys::CUresult::CUDA_SUCCESS {
-        return (Some(value != 0), false);
+        return Ok(Some(value != 0));
     }
-    WARNED.call_once(|| {
-        eprintln!(
-            "warning: CUDA integrated-topology attribute query failed ({result:?}); \
-             this capture records host_device_memory_is_unified as unprobed"
-        );
-    });
-    (None, true)
+    Err(anyhow::anyhow!(
+        "CUDA integrated-topology attribute query failed: {result:?}"
+    ))
 }
 
 #[cfg(not(feature = "cuda"))]
-fn device_memory_is_unified(_device: &Device) -> (Option<bool>, bool) {
-    (None, false)
+fn device_memory_is_unified(_device: &Device) -> anyhow::Result<Option<bool>> {
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_measurements_name_the_field_and_recapture_command() {
+        let error = cpu_count(None, None).unwrap_err().to_string();
+        assert!(error.contains("logical_cpu_count") && error.contains("ff probe"));
+        let error = timestamp_ms(UNIX_EPOCH - Duration::from_secs(1))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("measured_at_unix_ms") && error.contains("ff probe"));
+        let mut snapshot = ResourceSnapshot::capture(None).unwrap();
+        snapshot.host_memory_total_bytes = None;
+        let error = snapshot.pool_total(false).unwrap_err().to_string();
+        assert!(error.contains("host_memory_total_bytes") && error.contains("ff probe"));
+        snapshot.host_device_memory_is_unified = Some(false);
+        snapshot.device_total_memory_bytes = None;
+        let error = snapshot.pool_total(true).unwrap_err().to_string();
+        assert!(error.contains("device_total_memory_bytes") && error.contains("ff probe"));
+        snapshot.device_free_memory_bytes = None;
+        let error = snapshot.device_capacity().unwrap_err().to_string();
+        assert!(error.contains("device_free_memory_bytes") && error.contains("ff probe"));
+        snapshot.device_free_memory_bytes = Some(0);
+        assert_eq!(snapshot.device_capacity().unwrap(), 0);
+        snapshot.host_device_memory_is_unified = None;
+        let error = snapshot.device_capacity().unwrap_err().to_string();
+        assert!(error.contains("host_device_memory_is_unified") && error.contains("ff probe"));
+    }
+
+    #[test]
+    fn invalid_overrides_error_instead_of_selecting_defaults() {
+        for value in ["wrong", "0", "9"] {
+            let error = parse_env_usize("FF_GLM_LOAD_LANES", Some(value.into()), 1, 1, 8)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("FF_GLM_LOAD_LANES") && error.contains("rerun ff"));
+        }
+        for field in ["FF_GLM_DIRECT_FILL", "FF_GLM_IO_TRACE", "QWEN35_GRAPH"] {
+            let error = parse_env_usize(field, Some("2".into()), 0, 0, 1)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(field) && error.contains("rerun ff"));
+            assert_eq!(
+                parse_env_usize(field, Some("0".into()), 1, 0, 1).unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            parse_env_usize("FF_GLM_LOAD_LANES", None, 1, 1, 8).unwrap(),
+            1
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let error = parse_env::<usize>(
+                "FF_WEIGHT_LOAD_THREADS",
+                Some(std::ffi::OsString::from_vec(vec![255])),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("FF_WEIGHT_LOAD_THREADS") && error.contains("rerun ff"));
+        }
+    }
+
+    #[test]
+    fn snapshots_require_explicit_total_fields() {
+        let snapshot = ResourceSnapshot::capture(None).unwrap();
+        for field in ["host_memory_total_bytes", "device_total_memory_bytes"] {
+            let mut value = serde_json::to_value(&snapshot).unwrap();
+            value.as_object_mut().unwrap().remove(field);
+            let error = serde_json::from_value::<ResourceSnapshot>(value)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(field));
+        }
+    }
+
+    #[test]
+    fn probe_range_rejects_invalid_samples() {
+        for mut values in [
+            vec![],
+            vec![0.0],
+            vec![-1.0],
+            vec![f64::NAN],
+            vec![f64::INFINITY],
+        ] {
+            assert!(ProbeRange::from_samples(&mut values).is_err());
+        }
+        let range = ProbeRange::from_samples(&mut [4.0, 1.0, 2.0]).unwrap();
+        assert_eq!((range.min, range.median, range.max), (1.0, 2.0, 4.0));
+    }
+
+    #[test]
+    fn probe_choice_requires_separated_ranges() {
+        let cases = [
+            ([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], Some(1), (0, true)),
+            ([4.0, 5.0, 6.0], [1.0, 2.0, 3.0], Some(0), (1, true)),
+            ([4.0, 6.0, 8.0], [3.5, 3.7, 5.0], Some(0), (0, false)),
+            ([4.0, 5.0, 6.0], [1.0, 2.0, 4.0], Some(0), (0, false)),
+            ([1.0, 4.0, 9.0], [2.0, 3.0, 5.0], None, (1, false)),
+            ([1.0, 2.0, 3.0], [1.0, 2.0, 3.0], Some(1), (1, false)),
+        ];
+        for (a, b, preferred, expected) in cases {
+            let ranges = [a, b].map(|[min, median, max]| ProbeRange { min, median, max });
+            assert_eq!(probe_choice(&ranges, preferred).unwrap(), expected);
+        }
+        let ranges = [
+            ProbeRange {
+                min: 1.0,
+                median: 2.0,
+                max: 4.0,
+            },
+            ProbeRange {
+                min: 5.0,
+                median: 6.0,
+                max: 7.0,
+            },
+            ProbeRange {
+                min: 3.0,
+                median: 8.0,
+                max: 9.0,
+            },
+        ];
+        assert_eq!(probe_choice(&ranges, Some(1)).unwrap(), (1, false));
+    }
+
+    #[test]
+    fn probe_choice_rejects_invalid_ranges() {
+        assert!(probe_choice(&[], None).is_err());
+        let valid = ProbeRange {
+            min: 1.0,
+            median: 2.0,
+            max: 3.0,
+        };
+        assert!(probe_choice(&[valid], Some(1)).is_err());
+        assert_eq!(probe_choice(&[valid], Some(0)).unwrap(), (0, true));
+        for bad in [
+            ProbeRange { min: 0.0, ..valid },
+            ProbeRange {
+                median: 0.5,
+                ..valid
+            },
+            ProbeRange { max: 1.5, ..valid },
+            ProbeRange {
+                median: f64::NAN,
+                ..valid
+            },
+            ProbeRange {
+                max: f64::INFINITY,
+                ..valid
+            },
+        ] {
+            assert!(probe_choice(&[bad], None).is_err());
+        }
+    }
+
+    #[test]
+    fn probe_interleaves_and_stops_on_error() {
+        let mut order = Vec::new();
+        let mut fences = 0;
+        let ranges = probe(
+            2,
+            |_| Ok(()),
+            |i| {
+                order.push(i);
+                Ok(())
+            },
+            || {
+                fences += 1;
+                Ok(())
+            },
+            |_, d| Ok(d.as_secs_f64() * 1000.0),
+        )
+        .unwrap();
+        assert_eq!(order, [0, 1].repeat(15));
+        assert_eq!(fences, 60);
+        assert_eq!(ranges.len(), 2);
+        order.clear();
+        let err = probe(
+            2,
+            |_| Ok(()),
+            |i| {
+                order.push(i);
+                ensure!(i != 1, "fixture launch error");
+                Ok(())
+            },
+            || Ok(()),
+            |_, d| Ok(d.as_secs_f64() * 1000.0),
+        )
+        .unwrap_err();
+        assert_eq!(order, [0, 1]);
+        assert!(format!("{err:#}").contains("probe candidate 1 launch failed"));
+        assert!(format!("{err:#}").contains("fixture launch error"));
+        assert!(
+            probe(
+                0,
+                |_| Ok(()),
+                |_| Ok(()),
+                || Ok(()),
+                |_, d| Ok(d.as_secs_f64() * 1000.0)
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn replay_probe_derives_count_and_names_capacity() {
+        use std::cell::Cell;
+        let count = Cell::new(0usize);
+        let batch = Cell::new(1usize);
+        let sample = Cell::new(0usize);
+        let result = probe_replays(
+            2,
+            1000,
+            |_| Ok(()),
+            |_, n| {
+                count.set(count.get() + n);
+                batch.set(n);
+                Ok(())
+            },
+            || Ok(()),
+            |_, _| {
+                let i = sample.get();
+                sample.set(i + 1);
+                Ok(10.0 * batch.get() as f64 + if (i / 2).is_multiple_of(2) { 0.0 } else { 0.3 })
+            },
+        )
+        .unwrap();
+        assert!(result.repeats > 1 && result.pilot_spread > 0.01 && result.spread <= 0.01);
+        assert!(count.get() >= 30 * result.repeats);
+        let tick = Cell::new(false);
+        let error = probe_replays(
+            1,
+            1,
+            |_| Ok(()),
+            |_, _| Ok(()),
+            || Ok(()),
+            |_, _| {
+                tick.set(!tick.get());
+                Ok(if tick.get() { 1.0 } else { 2.0 })
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("state capacity 1"));
+        assert!(
+            probe(
+                1,
+                |_| Ok(()),
+                |_| Ok(()),
+                || Ok(()),
+                |_, _| Err(anyhow::anyhow!("clock failed"))
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("duration measurement failed")
+        );
+    }
+
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -1251,7 +2057,6 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: None,
             host_device_memory_is_unified: None,
-            device_topology_probe_failed: false,
             host_memory_total_bytes: host,
             device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
@@ -1292,7 +2097,8 @@ mod tests {
                 total: Some(16 << 30),
             },
             1,
-        );
+        )
+        .unwrap();
         assert_eq!(snapshot.host_memory_available_bytes, Some(4 << 30));
         assert_eq!(snapshot.host_memory_total_bytes, Some(16 << 30));
         let blind = resource_snapshot_with_source(
@@ -1302,7 +2108,8 @@ mod tests {
                 total: None,
             },
             1,
-        );
+        )
+        .unwrap();
         assert_eq!(blind.host_memory_total_bytes, None);
     }
 
@@ -1313,7 +2120,8 @@ mod tests {
                 .with("/proc/cpuinfo", "processor: 0\nmodel name: Test CPU\n")
                 .with("/proc/meminfo", "MemTotal: 32768 kB\n")
                 .with("/proc/sys/kernel/osrelease", "6.8.0-test\n"),
-        );
+        )
+        .unwrap();
         fingerprint.backend = DeviceBackend::Cuda;
         fingerprint.driver_version = Some("570.124.06".to_owned());
         fingerprint.driver_version_source = Some(FingerprintValueSource::ProcfsNvidiaDriver);
@@ -1332,6 +2140,147 @@ mod tests {
             },
         );
         fingerprint
+    }
+
+    fn decode_record() -> DecodeChoice {
+        let stock = ProbeRange {
+            min: 10.0,
+            median: 10.01,
+            max: 10.02,
+        };
+        let xr16 = ProbeRange {
+            min: 9.0,
+            median: 9.01,
+            max: 9.02,
+        };
+        let fingerprint = valid_current_cuda_fingerprint();
+        DecodeChoice {
+            adapter: "qwen35".into(),
+            geometry: serde_json::json!({"hidden":1024}),
+            class: "streamed".into(),
+            settings: serde_json::json!({"max_context":4096}),
+            split: vec![vec![(0, 0, 52, 64)]],
+            fingerprint: Some(fingerprint),
+            binary: Some(crate::identity::BinaryIdentity {
+                schema_version: 1,
+                package_name: "ff".into(),
+                package_version: "0.1.0".into(),
+                compiled_features: vec!["cuda".into()],
+            }),
+            image: image_digest(b"kernel"),
+            trials: vec![ReplayProbe {
+                batches: 1,
+                ranges: vec![stock, xr16],
+                repeats: 1,
+                pilot_spread: 0.003,
+                spread: 0.003,
+            }],
+            device: 0,
+            cols: 1,
+            derived: "xr16".into(),
+            body: "xr16".into(),
+            reason: "separated".into(),
+            stock,
+            xr16,
+            repeats: 1,
+            warmups: 6,
+            samples: 24,
+            capacity: 4096,
+            state_bytes: 0,
+            seed_token: 0,
+            topology: "decode".into(),
+            pilot_spread: 0.003,
+            spread: 0.003,
+            capture_ms: 1.0,
+            replay_ms: 2.0,
+            setup_ms: 3.0,
+        }
+    }
+
+    #[test]
+    fn group4_record_keys_measured_content_and_execution_class() {
+        let record = decode_record();
+        let mut other = record.clone();
+        other.split = vec![vec![(0, 0, 51, 64)]];
+        assert!(record.matches(&other));
+        other.image = image_digest(b"changed kernel");
+        assert!(!record.matches(&other));
+        other = record.clone();
+        other.class = "resident_graph".into();
+        assert!(!record.matches(&other));
+        other = record.clone();
+        other.settings = serde_json::json!({"max_context":8192});
+        assert!(!record.matches(&other));
+        other = record.clone();
+        other.fingerprint.as_mut().unwrap().driver_version = Some("new driver".into());
+        assert!(!record.matches(&other));
+        other = record.clone();
+        other.binary.as_mut().unwrap().package_version = "0.2.0".into();
+        assert!(!record.matches(&other));
+        assert_eq!(
+            image_digest(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn group4_requires_the_loaded_driver_image_identity() {
+        let record = DecodeChoice::combine(vec![decode_record(); 3]).unwrap();
+        assert!(
+            record
+                .fingerprint
+                .as_ref()
+                .unwrap()
+                .runtime_version
+                .is_none()
+        );
+        assert!(
+            !record
+                .fingerprint
+                .as_ref()
+                .unwrap()
+                .supports_calibration_cache_reuse()
+        );
+        let mut missing = record.clone();
+        let fingerprint = missing.fingerprint.as_mut().unwrap();
+        fingerprint.cuda_driver_api_version = None;
+        fingerprint.cuda_driver_api_version_source = None;
+        fingerprint.cuda_driver_api_version_unavailable_reason =
+            Some(FingerprintUnavailableReason::CudaDriverApiQueryFailed);
+        assert!(
+            missing
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cuda_driver_api_version")
+        );
+    }
+
+    #[test]
+    fn group4_independent_disagreement_persists_stock() {
+        let record = decode_record();
+        let unanimous = DecodeChoice::combine(vec![record.clone(); 3]).unwrap();
+        assert_eq!(unanimous.body, "xr16");
+        assert_eq!(unanimous.setup_ms, 9.0);
+        let mut stock = record.clone();
+        stock.trials[0].ranges.swap(0, 1);
+        let stock = DecodeChoice::combine(vec![stock; 3]).unwrap();
+        assert_eq!(stock.body, "stock");
+        assert_eq!(stock.reason, "independent separated trials agree");
+        let mut overlap = record.clone();
+        overlap.trials[0].ranges[1] = overlap.stock;
+        let combined =
+            DecodeChoice::combine(vec![record.clone(), overlap, record.clone()]).unwrap();
+        assert_eq!(combined.body, "stock");
+        combined.validate().unwrap();
+        let mut corrupt = combined.clone();
+        corrupt.body = "xr16".into();
+        corrupt.derived = "xr16".into();
+        assert!(corrupt.validate().is_err());
+        assert!(DecodeChoice::combine(vec![record.clone(); 2]).is_err());
+        let mut wrong = record.clone();
+        wrong.cols = 2;
+        assert!(DecodeChoice::combine(vec![record.clone(), record, wrong]).is_err());
     }
 
     #[test]
@@ -1354,9 +2303,10 @@ mod tests {
             )
             .with("/sys/fs/cgroup/workload/memory.max", "1073741824\n")
             .with("/sys/fs/cgroup/workload/memory.current", "268435456\n")
+            .with("/sys/fs/cgroup/workload/memory.stat", "file 268435456\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n")
             .with("/sys/fs/cgroup/memory.max", "max\n");
 
-        let snapshot = resource_snapshot_with_source(None, &source, 1234);
+        let snapshot = resource_snapshot_with_source(None, &source, 1234).unwrap();
         assert_eq!(snapshot.measured_at_unix_ms, 1234);
         assert_eq!(snapshot.host_memory_available_bytes, Some(8 << 20));
         assert_eq!(
@@ -1364,10 +2314,9 @@ mod tests {
             Some(CgroupMemoryLimit::Bytes(1 << 30))
         );
         assert_eq!(snapshot.cgroup_v2_memory_current_bytes, Some(1 << 28));
-        assert_eq!(
-            snapshot.cgroup_v2_memory_available_bytes,
-            Some((1 << 30) - (1 << 28))
-        );
+        // The whole file-cache view is reclaimable, so the available bytes
+        // recover the full limit.
+        assert_eq!(snapshot.cgroup_v2_memory_available_bytes, Some(1 << 30));
         assert_eq!(
             snapshot.measurement_scope,
             ResourceMeasurementScopes {
@@ -1388,10 +2337,11 @@ mod tests {
             )
             .with("/sys/fs/cgroup unified/tenant/a/memory.max", "max\n")
             .with("/sys/fs/cgroup unified/tenant/a/memory.current", "42\n")
+            .with("/sys/fs/cgroup unified/tenant/a/memory.stat", "file 268435456\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n")
             .with("/sys/fs/cgroup unified/tenant/memory.max", "max\n")
             .with("/sys/fs/cgroup unified/memory.max", "max\n");
 
-        let snapshot = resource_snapshot_with_source(None, &source, 7);
+        let snapshot = resource_snapshot_with_source(None, &source, 7).unwrap();
         assert_eq!(
             snapshot.cgroup_v2_memory_limit,
             Some(CgroupMemoryLimit::Unlimited)
@@ -1421,11 +2371,11 @@ mod tests {
             )
         };
         let source = source.with("/sys/fs/cgroup/memory.stat", &stat(56 * gib));
-        let running = resource_snapshot_with_source(None, &source, 1);
+        let running = resource_snapshot_with_source(None, &source, 1).unwrap();
         assert_eq!(running.cgroup_v2_memory_available_bytes, Some(4 * gib));
 
         let source = source.with("/sys/fs/cgroup/memory.stat", &stat(0));
-        let exited = resource_snapshot_with_source(None, &source, 2);
+        let exited = resource_snapshot_with_source(None, &source, 2).unwrap();
         assert_eq!(exited.cgroup_v2_memory_current_bytes, Some(58 * gib));
         assert_eq!(exited.cgroup_v2_memory_available_bytes, Some(60 * gib));
     }
@@ -1465,7 +2415,7 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_capacity_bounds_cache_and_falls_back_when_stats_are_invalid() {
+    fn cgroup_capacity_bounds_cache_and_excludes_reclaimable_file_cache() {
         let source = FakeProbeSource::default()
             .with("/proc/self/cgroup", "0::/\n")
             .with(
@@ -1477,15 +2427,18 @@ mod tests {
         let stat =
             "file 300\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n";
         let source = source.with("/sys/fs/cgroup/memory.stat", stat);
-        let snapshot = resource_snapshot_with_source(None, &source, 1);
+        let snapshot = resource_snapshot_with_source(None, &source, 1).unwrap();
         assert_eq!(snapshot.cgroup_v2_memory_available_bytes, Some(100));
 
         let source = source.with("/sys/fs/cgroup/memory.current", "200");
-        let snapshot = resource_snapshot_with_source(None, &source, 2);
+        let snapshot = resource_snapshot_with_source(None, &source, 2).unwrap();
         assert_eq!(snapshot.cgroup_v2_memory_available_bytes, Some(1000));
 
-        let source = source.with("/sys/fs/cgroup/memory.stat", "file 300\n");
-        let snapshot = resource_snapshot_with_source(None, &source, 3);
+        let source = source.with(
+            "/sys/fs/cgroup/memory.stat",
+            "file 300\nshmem 300\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n",
+        );
+        let snapshot = resource_snapshot_with_source(None, &source, 3).unwrap();
         assert_eq!(snapshot.cgroup_v2_memory_available_bytes, Some(800));
     }
 
@@ -1499,34 +2452,42 @@ mod tests {
             )
             .with("/sys/fs/cgroup/tenant/child/memory.max", "max\n")
             .with("/sys/fs/cgroup/tenant/child/memory.current", "100\n")
+            .with("/sys/fs/cgroup/tenant/child/memory.stat", "file 268435456\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n")
             .with("/sys/fs/cgroup/tenant/memory.max", "1000\n")
             .with("/sys/fs/cgroup/tenant/memory.current", "900\n")
+            .with("/sys/fs/cgroup/tenant/memory.stat", "file 268435456\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n")
             .with("/sys/fs/cgroup/memory.max", "2000\n")
-            .with("/sys/fs/cgroup/memory.current", "1000\n");
+            .with("/sys/fs/cgroup/memory.current", "1000\n")
+            .with("/sys/fs/cgroup/memory.stat", "file 268435456\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n");
 
-        let snapshot = resource_snapshot_with_source(None, &source, 11);
+        let snapshot = resource_snapshot_with_source(None, &source, 11).unwrap();
         assert_eq!(
             snapshot.cgroup_v2_memory_limit,
             Some(CgroupMemoryLimit::Bytes(1000))
         );
         assert_eq!(snapshot.cgroup_v2_memory_current_bytes, Some(100));
-        assert_eq!(snapshot.cgroup_v2_memory_available_bytes, Some(100));
+        // The file cache is reclaimable, so /tenant's usage nets to zero and
+        // its full 1000-byte limit is available.
+        assert_eq!(snapshot.cgroup_v2_memory_available_bytes, Some(1000));
 
         let stat =
             "file 800\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n";
         let source = source
             .with("/sys/fs/cgroup/tenant/memory.stat", stat)
-            .with("/sys/fs/cgroup/memory.current", "1800\n");
-        let snapshot = resource_snapshot_with_source(None, &source, 12);
-        assert_eq!(snapshot.cgroup_v2_memory_available_bytes, Some(200));
+            .with("/sys/fs/cgroup/memory.current", "1800\n")
+            .with("/sys/fs/cgroup/memory.stat", "file 268435456\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n");
+        let snapshot = resource_snapshot_with_source(None, &source, 12).unwrap();
+        // /tenant nets to 1000 - (900 - 800) = 900; the root nets to zero.
+        assert_eq!(snapshot.cgroup_v2_memory_available_bytes, Some(900));
 
         let source = source.with("/sys/fs/cgroup/memory.stat", stat);
-        let snapshot = resource_snapshot_with_source(None, &source, 13);
+        let snapshot = resource_snapshot_with_source(None, &source, 13).unwrap();
+        // The root's file cache backfills its headroom again.
         assert_eq!(snapshot.cgroup_v2_memory_available_bytes, Some(900));
     }
 
     #[test]
-    fn incomplete_cgroup_hierarchy_never_reports_a_partial_capacity() {
+    fn incomplete_cgroup_hierarchy_errors_instead_of_partial_capacity() {
         let source = FakeProbeSource::default()
             .with("/proc/self/cgroup", "0::/tenant/child\n")
             .with(
@@ -1534,12 +2495,18 @@ mod tests {
                 "31 22 0:28 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
             )
             .with("/sys/fs/cgroup/tenant/child/memory.max", "1000\n")
-            .with("/sys/fs/cgroup/tenant/child/memory.current", "100\n");
+            .with("/sys/fs/cgroup/tenant/child/memory.current", "100\n")
+            .with(
+                "/sys/fs/cgroup/tenant/child/memory.stat",
+                "file 50\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n",
+            );
 
-        let snapshot = resource_snapshot_with_source(None, &source, 12);
-        assert_eq!(snapshot.cgroup_v2_memory_limit, None);
-        assert_eq!(snapshot.cgroup_v2_memory_current_bytes, Some(100));
-        assert_eq!(snapshot.cgroup_v2_memory_available_bytes, None);
+        let error = resource_snapshot_with_source(None, &source, 12)
+            .expect_err("an incomplete cgroup hierarchy must error, not degrade");
+        assert!(
+            error.to_string().contains("memory.max"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1552,20 +2519,53 @@ mod tests {
             )
             .with("/sys/fs/cgroup/tenant/child/memory.max", "max\n")
             .with("/sys/fs/cgroup/tenant/child/memory.current", "100\n")
+            .with("/sys/fs/cgroup/tenant/child/memory.stat", "file 268435456\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n")
             .with("/sys/fs/cgroup/tenant/memory.max", "1000\n")
-            .with("/sys/fs/cgroup/tenant/memory.current", "900\n");
+            .with("/sys/fs/cgroup/tenant/memory.current", "900\n")
+            .with(
+                "/sys/fs/cgroup/tenant/memory.stat",
+                "file 100\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\n",
+            );
 
-        let snapshot = resource_snapshot_with_source(None, &source, 13);
+        let snapshot = resource_snapshot_with_source(None, &source, 13).unwrap();
         assert_eq!(
             snapshot.cgroup_v2_memory_limit,
             Some(CgroupMemoryLimit::Bytes(1000))
         );
-        assert_eq!(snapshot.cgroup_v2_memory_available_bytes, Some(100));
+        assert_eq!(snapshot.cgroup_v2_memory_available_bytes, Some(200));
+    }
+
+    /// A stored record without the unified-topology field predates the
+    /// probe and must be recaptured, not silently treated as split.
+    #[test]
+    fn record_without_unified_field_fails_the_load() {
+        let old = serde_json::json!({
+            "schema_version": RESOURCE_SNAPSHOT_SCHEMA_VERSION,
+            "measured_at_unix_ms": 7,
+            "host_memory_available_bytes": null,
+            "cgroup_v2_memory_limit": null,
+            "cgroup_v2_memory_current_bytes": null,
+            "cgroup_v2_memory_available_bytes": null,
+            "device_free_memory_bytes": null,
+            "host_memory_total_bytes": null,
+            "device_total_memory_bytes": null,
+            "measurement_scope": {
+                "host_memory": null,
+                "cgroup_memory": null,
+                "device_memory": null
+            }
+        });
+        let error = serde_json::from_value::<ResourceSnapshot>(old)
+            .expect_err("a record missing host_device_memory_is_unified must fail");
+        assert!(
+            error.to_string().contains("host_device_memory_is_unified"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
     fn missing_proc_and_cgroup_files_are_reported_as_unavailable() {
-        let snapshot = resource_snapshot_with_source(None, &FakeProbeSource::default(), 9);
+        let snapshot = resource_snapshot_with_source(None, &FakeProbeSource::default(), 9).unwrap();
         assert_eq!(
             snapshot,
             ResourceSnapshot {
@@ -1577,7 +2577,6 @@ mod tests {
                 cgroup_v2_memory_available_bytes: None,
                 device_free_memory_bytes: None,
                 host_device_memory_is_unified: None,
-                device_topology_probe_failed: false,
                 host_memory_total_bytes: None,
                 device_total_memory_bytes: None,
                 measurement_scope: ResourceMeasurementScopes {
@@ -1600,7 +2599,6 @@ mod tests {
             cgroup_v2_memory_available_bytes: Some(8),
             device_free_memory_bytes: Some(6),
             host_device_memory_is_unified: unified,
-            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: ResourceMeasurementScopes {
@@ -1609,7 +2607,7 @@ mod tests {
                 device_memory: None,
             },
         };
-        // Unprobed (legacy) and confirmed-discrete records expose no pool.
+        // Only confirmed unified records expose a combined pool.
         assert_eq!(snapshot(None).unified_pool_available_bytes(), None);
         assert_eq!(snapshot(Some(false)).unified_pool_available_bytes(), None);
         // A probed unified topology binds on the smallest view of the pool.
@@ -1647,7 +2645,7 @@ mod tests {
             )
             .with("/proc/meminfo", "MemTotal: 32768 kB\nMemAvailable: 1 kB\n")
             .with("/proc/sys/kernel/osrelease", "6.8.0-test\n");
-        let fingerprint = hardware_fingerprint_with_source(&Device::Cpu, &source);
+        let fingerprint = hardware_fingerprint_with_source(&Device::Cpu, &source).unwrap();
 
         assert_eq!(
             fingerprint.schema_version,
@@ -1688,7 +2686,8 @@ mod tests {
             &Device::Cpu,
             &FakeProbeSource::default()
                 .with("/proc/cpuinfo", "processor: 0\nmodel name: Test CPU\n"),
-        );
+        )
+        .unwrap();
         apply_cuda_fingerprint_details(
             &mut fingerprint,
             CudaFingerprintDetails {
@@ -1789,7 +2788,8 @@ mod tests {
         let mut fingerprint = hardware_fingerprint_with_source(
             &Device::Cpu,
             &FakeProbeSource::default().with("/proc/cpuinfo", "processor: 0\n"),
-        );
+        )
+        .unwrap();
         apply_cuda_fingerprint_details(&mut fingerprint, CudaFingerprintDetails::default());
 
         assert_eq!(
@@ -1825,7 +2825,8 @@ mod tests {
         let mut fingerprint = hardware_fingerprint_with_source(
             &Device::Cpu,
             &FakeProbeSource::default().with("/proc/cpuinfo", "processor: 0\n"),
-        );
+        )
+        .unwrap();
         populate_cuda_driver_version(&source, &mut fingerprint);
 
         assert_eq!(fingerprint.driver_version.as_deref(), Some("570.124.06"));
@@ -1867,8 +2868,8 @@ mod tests {
 
     #[test]
     fn public_cpu_probe_works_without_a_gpu() {
-        let fingerprint = HardwareFingerprint::collect(&Device::Cpu);
-        let snapshot = ResourceSnapshot::capture(Some(&Device::Cpu));
+        let fingerprint = HardwareFingerprint::collect(&Device::Cpu).unwrap();
+        let snapshot = ResourceSnapshot::capture(Some(&Device::Cpu)).unwrap();
         assert_eq!(fingerprint.backend, DeviceBackend::Cpu);
         assert!(fingerprint.logical_cpu_count > 0);
         fingerprint.validate().unwrap();
@@ -1881,7 +2882,7 @@ mod tests {
 
     #[test]
     fn json_round_trip_preserves_versioned_probe_records() {
-        let fingerprint = HardwareFingerprint::collect(&Device::Cpu);
+        let fingerprint = HardwareFingerprint::collect(&Device::Cpu).unwrap();
         let encoded = serde_json::to_vec(&fingerprint).unwrap();
         let decoded = HardwareFingerprint::from_json(&encoded).unwrap();
         assert_eq!(decoded, fingerprint);
@@ -1897,7 +2898,7 @@ mod tests {
             .remove("cuda_device_uuid");
         assert!(HardwareFingerprint::from_json(&serde_json::to_vec(&incomplete).unwrap()).is_err());
 
-        let snapshot = ResourceSnapshot::capture(None);
+        let snapshot = ResourceSnapshot::capture(None).unwrap();
         let encoded = serde_json::to_vec(&snapshot).unwrap();
         let decoded: ResourceSnapshot = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, snapshot);

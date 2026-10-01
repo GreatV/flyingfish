@@ -11,13 +11,7 @@ use serde::Deserialize;
 use std::{collections::BTreeMap, fs, num::NonZeroUsize, path::Path};
 use tokenizers::Tokenizer;
 
-/// Whether the pinned text-attention kernel covers this request.
-///
-/// The kernel was transcribed for exactly the official coffee profile. Callers
-/// use this as a dispatch condition, not an admission check: everything else
-/// runs on the portable chunked path, which is what the recorded contract then
-/// names.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg(any(feature = "cuda", test))]
 fn exact_text_attention_covers(
     batch: usize,
     sequence: usize,
@@ -34,17 +28,9 @@ fn exact_text_attention_covers(
         && head_dim == 128
 }
 
-/// Whether this device may run the kernels compiled from this repository.
-fn tuned_cuda(device: &candle_core::Device) -> bool {
-    crate::cuda::tuned_kernels_available(device)
-}
-
-/// Whether this host's vendor libraries are the reference ones, which is what
-/// the cuBLASLt and cuDNN operators reproduce.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn reference_cuda(device: &candle_core::Device) -> bool {
-    crate::cuda::profile::reference_libraries_available(device)
-}
+#[cfg(feature = "cuda")]
+use crate::cuda::profile::reference_libraries_available as reference_cuda;
+use crate::cuda::tuned_kernels_available as tuned_cuda;
 
 const MAX_CACHED_CAUSAL_MASK_BYTES: usize = 8 * 1024 * 1024;
 

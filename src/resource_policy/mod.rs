@@ -16,10 +16,7 @@ pub fn publish_selection(path: &Path, record: &ResourceSelectionProvenance) -> R
     Ok(())
 }
 
-/// Remove an earlier attempt's refusal once this record is admitted: keeping
-/// both would describe one run as refused and admitted at once. Only this
-/// request's own refusal is removed — the reserved name can hold someone
-/// else's file, and a name is not ownership.
+/// Remove this request's refusal record after admission; verify ownership before replacement.
 pub fn remove_superseded_refusal(refusal: &Path, admitted: &ResourceSelectionProvenance) {
     if !refusal.exists() {
         return;
@@ -164,6 +161,26 @@ pub fn prepare_cold_cache(
 pub fn prepare_cold_cache_components(
     components: &[std::path::PathBuf],
 ) -> anyhow::Result<crate::runtime::cold_cache::ColdCacheObservation> {
+    let paths = cold_cache_files(components)?;
+    crate::runtime::cold_cache::evict_and_verify(&paths)
+}
+
+/// Establish one cold observation across every component the model's own index lists.
+pub fn prepare_cold_cache_model(
+    model: &std::path::Path,
+) -> anyhow::Result<crate::runtime::cold_cache::ColdCacheObservation> {
+    prepare_cold_cache_components(&model_component_dirs(model)?)
+}
+
+fn model_component_dirs(model: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    Ok(crate::models::LocalModel::open(model, None)?
+        .components
+        .into_iter()
+        .map(|component| component.directory)
+        .collect())
+}
+
+fn cold_cache_files(components: &[std::path::PathBuf]) -> anyhow::Result<Vec<std::path::PathBuf>> {
     use crate::runtime::weights::{CachePolicy, ModelWeights, WeightSource};
     let mut paths = std::collections::BTreeSet::new();
     for component in components {
@@ -172,7 +189,7 @@ pub fn prepare_cold_cache_components(
             paths.insert(std::fs::canonicalize(component.join(name))?);
         }
     }
-    crate::runtime::cold_cache::evict_and_verify(&paths.into_iter().collect::<Vec<_>>())
+    Ok(paths.into_iter().collect())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -216,5 +233,56 @@ mod cold_pipeline_tests {
             ),
         }
         assert!(prepare_cold_cache_components(&[]).is_err());
+    }
+
+    #[test]
+    fn model_cold_set_is_every_shard_of_every_indexed_component() {
+        let root = tempfile::tempdir().unwrap();
+        let roles = [
+            "audio_vae",
+            "text_encoder",
+            "transformer",
+            "transformer_ref",
+            "vae",
+        ];
+        let index: serde_json::Map<String, serde_json::Value> = roles
+            .iter()
+            .map(|role| {
+                (
+                    (*role).to_owned(),
+                    serde_json::json!(["diffusers", "Component"]),
+                )
+            })
+            .collect();
+        let mut index = serde_json::Value::Object(index);
+        index["_class_name"] = "MiniMaxH3ModularPipeline".into();
+        std::fs::write(
+            root.path().join("modular_model_index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let mut on_disk = std::collections::BTreeSet::new();
+        for role in roles {
+            let component = root.path().join(role);
+            std::fs::create_dir(&component).unwrap();
+            let path = component.join("model.safetensors");
+            let tensor = candle_core::Tensor::zeros(
+                1024,
+                candle_core::DType::F32,
+                &candle_core::Device::Cpu,
+            )
+            .unwrap();
+            candle_core::safetensors::save(
+                &std::collections::HashMap::from([("weight".to_owned(), tensor)]),
+                &path,
+            )
+            .unwrap();
+            on_disk.insert(std::fs::canonicalize(path).unwrap());
+        }
+        let cold = cold_cache_files(&model_component_dirs(root.path()).unwrap()).unwrap();
+        assert_eq!(
+            cold.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            on_disk
+        );
     }
 }

@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
+use ff_core::quant::QuantFormat;
 use serde::{Deserialize, Deserializer, de::Error as _};
 use std::{fs, path::Path};
 
 pub const GLM5_NEXT_ARCHITECTURE: &str = "Glm5NextForConditionalGeneration";
 pub const GLM5_NEXT_MODEL_TYPE: &str = "glm5_next";
 pub const GLM5_NEXT_TEXT_MODEL_TYPE: &str = "glm5_next_text";
-pub const FP8_WEIGHT_BLOCK_SIZE: [usize; 2] = [128, 128];
+pub const FP8_WEIGHT_BLOCK: usize = 128;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -28,39 +29,47 @@ pub enum IndexerKind {
     Shared,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-pub struct GlmQuantizationConfig {
-    pub quant_method: String,
-    pub activation_scheme: String,
-    pub fmt: String,
-    pub weight_block_size: [usize; 2],
-}
-
-impl GlmQuantizationConfig {
-    pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.quant_method == "fp8",
-            "unsupported GLM quantization method {:?}; expected fp8",
-            self.quant_method
-        );
-        anyhow::ensure!(
-            self.activation_scheme == "dynamic",
-            "unsupported GLM activation scheme {:?}; expected dynamic",
-            self.activation_scheme
-        );
-        anyhow::ensure!(
-            self.fmt == "e4m3",
-            "unsupported GLM FP8 format {:?}; expected e4m3",
-            self.fmt
-        );
-        anyhow::ensure!(
-            self.weight_block_size == FP8_WEIGHT_BLOCK_SIZE,
-            "unsupported GLM FP8 weight block {:?}; expected {:?}",
-            self.weight_block_size,
-            FP8_WEIGHT_BLOCK_SIZE
-        );
-        Ok(())
+fn fp8_e4m3_block<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<QuantFormat, D::Error> {
+    #[derive(Deserialize)]
+    struct Raw {
+        quant_method: String,
+        activation_scheme: String,
+        fmt: String,
+        weight_block_size: [usize; 2],
     }
+    let raw = Raw::deserialize(deserializer)?;
+    if raw.quant_method != "fp8" {
+        return Err(D::Error::custom(format!(
+            "unsupported GLM quantization method {:?}; expected fp8",
+            raw.quant_method
+        )));
+    }
+    if raw.activation_scheme != "dynamic" {
+        return Err(D::Error::custom(format!(
+            "unsupported GLM activation scheme {:?}; expected dynamic",
+            raw.activation_scheme
+        )));
+    }
+    if raw.fmt != "e4m3" {
+        return Err(D::Error::custom(format!(
+            "unsupported GLM FP8 format {:?}; expected e4m3",
+            raw.fmt
+        )));
+    }
+    let format = QuantFormat::block_fp8(raw.weight_block_size).map_err(D::Error::custom)?;
+    if format
+        != (QuantFormat::BlockFp8 {
+            block: FP8_WEIGHT_BLOCK,
+        })
+    {
+        return Err(D::Error::custom(format!(
+            "unsupported GLM FP8 weight block {:?}; expected {FP8_WEIGHT_BLOCK}",
+            raw.weight_block_size
+        )));
+    }
+    Ok(format)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -439,7 +448,6 @@ impl GlmTextConfig {
 #[derive(Debug, Deserialize)]
 struct RawGlmTextConfig {
     model_type: String,
-    #[serde(alias = "torch_dtype")]
     dtype: String,
     vocab_size: usize,
     hidden_size: usize,
@@ -468,8 +476,7 @@ struct RawGlmTextConfig {
     v_head_dim: usize,
     mhc: bool,
     mla_use_nope: bool,
-    #[serde(default)]
-    layer_types: Option<Vec<AttentionKind>>,
+    layer_types: Vec<AttentionKind>,
     mlp_layer_types: Vec<MlpKind>,
     indexer_types: Vec<IndexerKind>,
     index_topk: usize,
@@ -477,16 +484,7 @@ struct RawGlmTextConfig {
     index_kpool_always_select_tail: bool,
     index_n_heads: usize,
     index_head_dim: usize,
-    #[serde(default)]
-    linear_num_heads: Option<usize>,
-    #[serde(default)]
-    linear_head_dim: Option<usize>,
-    #[serde(default)]
-    linear_conv_kernel_dim: Option<usize>,
-    #[serde(default)]
-    linear_lower_bound: Option<f64>,
-    #[serde(default)]
-    linear_attn_config: Option<LegacyLinearAttentionConfig>,
+    linear_attn_config: LinearAttentionConfig,
     hc_mult: usize,
     hc_eps: f64,
     hc_sinkhorn_iters: usize,
@@ -504,15 +502,11 @@ struct RawGlmTextConfig {
 }
 
 #[derive(Debug, Deserialize)]
-struct LegacyLinearAttentionConfig {
-    #[serde(default)]
-    num_heads: Option<usize>,
-    #[serde(default)]
-    head_dim: Option<usize>,
-    #[serde(default)]
-    short_conv_kernel_size: Option<usize>,
-    #[serde(default)]
-    gate_lower_bound: Option<f64>,
+struct LinearAttentionConfig {
+    num_heads: usize,
+    head_dim: usize,
+    short_conv_kernel_size: usize,
+    gate_lower_bound: f64,
     #[serde(default)]
     kda_layers: Option<Vec<usize>>,
     #[serde(default)]
@@ -524,8 +518,16 @@ impl<'de> Deserialize<'de> for GlmTextConfig {
     where
         D: Deserializer<'de>,
     {
-        let raw = RawGlmTextConfig::deserialize(deserializer)?;
-        normalize_text_config(raw).map_err(D::Error::custom)
+        let raw = RawGlmTextConfig::deserialize(deserializer).map_err(|error| {
+            D::Error::custom(format!(
+                "{error}; restore GLM config.json and run ff text generate --adapter glm"
+            ))
+        })?;
+        normalize_text_config(raw).map_err(|error| {
+            D::Error::custom(format!(
+                "{error}; restore GLM config.json and run ff text generate --adapter glm"
+            ))
+        })
     }
 }
 
@@ -561,33 +563,32 @@ fn normalize_text_config(raw: RawGlmTextConfig) -> std::result::Result<GlmTextCo
             raw.qk_head_dim
         ));
     }
-    let legacy = raw.linear_attn_config.as_ref();
-    let linear_num_heads = reconcile(
-        "linear_num_heads",
-        raw.linear_num_heads,
-        legacy.and_then(|value| value.num_heads),
-    )?;
-    let linear_head_dim = reconcile(
-        "linear_head_dim",
-        raw.linear_head_dim,
-        legacy.and_then(|value| value.head_dim),
-    )?;
-    let linear_conv_kernel_dim = reconcile(
-        "linear_conv_kernel_dim",
-        raw.linear_conv_kernel_dim,
-        legacy.and_then(|value| value.short_conv_kernel_size),
-    )?;
-    let linear_lower_bound = Some(reconcile_f64(
-        "linear_lower_bound",
-        raw.linear_lower_bound,
-        legacy.and_then(|value| value.gate_lower_bound),
-    )?);
-
-    let layer_types = normalize_layer_schedule(
+    let linear = &raw.linear_attn_config;
+    let linear_num_heads = linear.num_heads;
+    let linear_head_dim = linear.head_dim;
+    let linear_conv_kernel_dim = linear.short_conv_kernel_size;
+    let linear_lower_bound = Some(linear.gate_lower_bound);
+    let layer_types = raw.layer_types;
+    if layer_types.len() != raw.num_hidden_layers {
+        return Err(format!(
+            "layer_types has {} entries, expected {}",
+            layer_types.len(),
+            raw.num_hidden_layers
+        ));
+    }
+    verify_layer_list(
+        "kda_layers",
+        linear.kda_layers.as_deref(),
         raw.num_hidden_layers,
-        raw.layer_types,
-        legacy.and_then(|value| value.kda_layers.as_deref()),
-        legacy.and_then(|value| value.full_attn_layers.as_deref()),
+        &layer_types,
+        AttentionKind::LinearAttention,
+    )?;
+    verify_layer_list(
+        "full_attn_layers",
+        linear.full_attn_layers.as_deref(),
+        raw.num_hidden_layers,
+        &layer_types,
+        AttentionKind::DeepseekSparseAttention,
     )?;
     let mlp_layer_types = raw.mlp_layer_types;
     let indexer_types = raw.indexer_types;
@@ -646,112 +647,7 @@ fn normalize_text_config(raw: RawGlmTextConfig) -> std::result::Result<GlmTextCo
     })
 }
 
-fn reconcile<T: Copy + PartialEq + std::fmt::Debug>(
-    name: &str,
-    canonical: Option<T>,
-    legacy: Option<T>,
-) -> std::result::Result<T, String> {
-    if let (Some(canonical), Some(legacy)) = (canonical, legacy)
-        && canonical != legacy
-    {
-        return Err(format!(
-            "conflicting {name}: canonical value {canonical:?}, linear_attn_config value {legacy:?}"
-        ));
-    }
-    canonical
-        .or(legacy)
-        .ok_or_else(|| format!("missing {name}; provide it directly or in linear_attn_config"))
-}
-
-fn reconcile_f64(
-    name: &str,
-    canonical: Option<f64>,
-    legacy: Option<f64>,
-) -> std::result::Result<f64, String> {
-    if let (Some(canonical), Some(legacy)) = (canonical, legacy)
-        && canonical.to_bits() != legacy.to_bits()
-    {
-        return Err(format!(
-            "conflicting {name}: canonical value {canonical:?}, linear_attn_config value {legacy:?}"
-        ));
-    }
-    canonical
-        .or(legacy)
-        .ok_or_else(|| format!("missing {name}; provide it directly or in linear_attn_config"))
-}
-
-fn normalize_layer_schedule(
-    num_layers: usize,
-    explicit: Option<Vec<AttentionKind>>,
-    legacy_kda: Option<&[usize]>,
-    legacy_full: Option<&[usize]>,
-) -> std::result::Result<Vec<AttentionKind>, String> {
-    let schedule = match explicit {
-        Some(schedule) => schedule,
-        None => schedule_from_legacy_lists(num_layers, legacy_kda, legacy_full)?,
-    };
-    if schedule.len() != num_layers {
-        return Err(format!(
-            "layer_types has {} entries, expected {num_layers}",
-            schedule.len()
-        ));
-    }
-    verify_legacy_layers(
-        "kda_layers",
-        legacy_kda,
-        num_layers,
-        &schedule,
-        AttentionKind::LinearAttention,
-    )?;
-    verify_legacy_layers(
-        "full_attn_layers",
-        legacy_full,
-        num_layers,
-        &schedule,
-        AttentionKind::DeepseekSparseAttention,
-    )?;
-    Ok(schedule)
-}
-
-fn schedule_from_legacy_lists(
-    num_layers: usize,
-    legacy_kda: Option<&[usize]>,
-    legacy_full: Option<&[usize]>,
-) -> std::result::Result<Vec<AttentionKind>, String> {
-    let kda = legacy_kda.ok_or_else(|| {
-        "missing layer_types and linear_attn_config.kda_layers; attention schedule is ambiguous"
-            .to_owned()
-    })?;
-    let full = legacy_full.ok_or_else(|| {
-        "missing layer_types and linear_attn_config.full_attn_layers; attention schedule is ambiguous"
-            .to_owned()
-    })?;
-    let mut schedule = vec![None; num_layers];
-    for (kind, layers) in [
-        (AttentionKind::LinearAttention, kda),
-        (AttentionKind::DeepseekSparseAttention, full),
-    ] {
-        for &layer in layers {
-            if layer >= num_layers {
-                return Err(format!(
-                    "legacy attention schedule contains out-of-range layer {layer}"
-                ));
-            }
-            if schedule[layer].replace(kind).is_some() {
-                return Err(format!("legacy attention schedule repeats layer {layer}"));
-            }
-        }
-    }
-    schedule
-        .into_iter()
-        .enumerate()
-        .map(|(layer, kind)| {
-            kind.ok_or_else(|| format!("legacy attention schedule does not classify layer {layer}"))
-        })
-        .collect()
-}
-
-fn verify_legacy_layers(
+fn verify_layer_list(
     name: &str,
     declared: Option<&[usize]>,
     num_layers: usize,
@@ -788,7 +684,8 @@ pub struct GlmConfig {
     pub architectures: Vec<String>,
     pub model_type: String,
     pub text_config: GlmTextConfig,
-    pub quantization_config: GlmQuantizationConfig,
+    #[serde(rename = "quantization_config", deserialize_with = "fp8_e4m3_block")]
+    pub quant: QuantFormat,
     pub tie_word_embeddings: bool,
 }
 
@@ -826,7 +723,6 @@ impl GlmConfig {
             "root tie_word_embeddings=true is not supported"
         );
         self.text_config.validate()?;
-        self.quantization_config.validate()?;
         anyhow::ensure!(
             self.tie_word_embeddings == self.text_config.tie_word_embeddings,
             "root and text_config disagree about tie_word_embeddings"
@@ -840,11 +736,8 @@ impl GlmConfig {
             architectures: vec![GLM5_NEXT_ARCHITECTURE.to_owned()],
             model_type: GLM5_NEXT_MODEL_TYPE.to_owned(),
             text_config: GlmTextConfig::tiny(),
-            quantization_config: GlmQuantizationConfig {
-                quant_method: "fp8".to_owned(),
-                activation_scheme: "dynamic".to_owned(),
-                fmt: "e4m3".to_owned(),
-                weight_block_size: FP8_WEIGHT_BLOCK_SIZE,
+            quant: QuantFormat::BlockFp8 {
+                block: FP8_WEIGHT_BLOCK,
             },
             tie_word_embeddings: false,
         }
@@ -1004,7 +897,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_legacy_nested_linear_attention_fields() {
+    fn alternate_linear_schema_fails_with_the_current_config_command() {
+        let mut value = small_text_json();
+        value.as_object_mut().unwrap().remove("linear_attn_config");
+        value["linear_num_heads"] = serde_json::json!(2);
+        value["linear_head_dim"] = serde_json::json!(4);
+        let error = serde_json::from_value::<GlmTextConfig>(value)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("linear_attn_config") && error.contains("ff text generate"));
+    }
+
+    #[test]
+    fn parses_nested_linear_attention_fields() {
         let config: GlmTextConfig = serde_json::from_value(small_text_json()).unwrap();
         config.validate().unwrap();
         assert_eq!(config.linear_num_heads, 2);
@@ -1019,28 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_linear_fields_may_agree_with_legacy_fields() {
-        let mut value = small_text_json();
-        value["linear_num_heads"] = json!(2);
-        value["linear_head_dim"] = json!(4);
-        value["linear_conv_kernel_dim"] = json!(4);
-        value["linear_lower_bound"] = json!(-5.0);
-        let config: GlmTextConfig = serde_json::from_value(value).unwrap();
-        config.validate().unwrap();
-    }
-
-    #[test]
-    fn conflicting_canonical_and_legacy_fields_fail_closed() {
-        let mut value = small_text_json();
-        value["linear_head_dim"] = json!(8);
-        let error = serde_json::from_value::<GlmTextConfig>(value)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("conflicting linear_head_dim"));
-    }
-
-    #[test]
-    fn legacy_layer_lists_must_match_the_explicit_schedule() {
+    fn layer_lists_match_the_explicit_schedule() {
         let mut value = small_text_json();
         value["linear_attn_config"]["full_attn_layers"] = json!([2]);
         let error = serde_json::from_value::<GlmTextConfig>(value)
@@ -1050,23 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_legacy_layer_lists_are_an_explicit_supported_schedule() {
-        let mut value = small_text_json();
-        value.as_object_mut().unwrap().remove("layer_types");
-        let config: GlmTextConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(
-            config.layer_types,
-            [
-                AttentionKind::LinearAttention,
-                AttentionKind::LinearAttention,
-                AttentionKind::LinearAttention,
-                AttentionKind::DeepseekSparseAttention,
-            ]
-        );
-    }
-
-    #[test]
-    fn incomplete_legacy_layer_lists_do_not_synthesize_a_schedule() {
+    fn missing_schedule_fails_closed() {
         let mut value = small_text_json();
         value.as_object_mut().unwrap().remove("layer_types");
         value["linear_attn_config"]
@@ -1076,7 +944,7 @@ mod tests {
         let error = serde_json::from_value::<GlmTextConfig>(value)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("attention schedule is ambiguous"));
+        assert!(error.contains("layer_types") && error.contains("ff text generate"));
     }
 
     #[test]
@@ -1098,10 +966,10 @@ mod tests {
         }
 
         for (field, error_field) in [
-            ("num_heads", "linear_num_heads"),
-            ("head_dim", "linear_head_dim"),
-            ("short_conv_kernel_size", "linear_conv_kernel_dim"),
-            ("gate_lower_bound", "linear_lower_bound"),
+            ("num_heads", "num_heads"),
+            ("head_dim", "head_dim"),
+            ("short_conv_kernel_size", "short_conv_kernel_size"),
+            ("gate_lower_bound", "gate_lower_bound"),
         ] {
             let mut value = small_text_json();
             value["linear_attn_config"]
@@ -1187,11 +1055,34 @@ mod tests {
     }
 
     #[test]
-    fn root_validation_requires_the_checkpoint_fp8_block() {
-        let mut config = GlmConfig::tiny();
-        config.quantization_config.weight_block_size = [64, 128];
-        let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("weight block"));
+    #[ignore = "requires FF_MODELS_DIR with zai-org/GLM-5.3-Flash"]
+    fn the_real_checkpoint_declares_the_128_block() {
+        let dir = ff_core::paths::checkpoint_dir("zai-org/GLM-5.3-Flash")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with zai-org/GLM-5.3-Flash");
+        let config = GlmConfig::from_model_dir(&dir).unwrap();
+        assert_eq!(config.quant, QuantFormat::BlockFp8 { block: 128 });
+    }
+
+    #[test]
+    fn the_fp8_block_is_the_checkpoint_value_or_an_error() {
+        let quant = |block: [usize; 2]| {
+            let value = serde_json::json!({
+                "quant_method": "fp8", "activation_scheme": "dynamic", "fmt": "e4m3",
+                "weight_block_size": block,
+            });
+            fp8_e4m3_block(value)
+        };
+        assert_eq!(
+            quant([128, 128]).unwrap(),
+            QuantFormat::BlockFp8 { block: 128 }
+        );
+        assert_eq!(
+            GlmConfig::tiny().quant,
+            QuantFormat::BlockFp8 { block: 128 }
+        );
+        let error = quant([64, 128]).unwrap_err().to_string();
+        assert!(error.contains("[64, 128]"), "{error}");
     }
 
     #[test]

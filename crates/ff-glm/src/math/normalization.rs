@@ -307,12 +307,11 @@ mod cuda_tests {
         Tensor::from_vec(values, (rows, width), device).unwrap()
     }
 
-    // Requires an sm_80+ GPU; returns early when CUDA is unavailable.
+    // Requires an sm_80+ GPU.
     #[test]
+    #[ignore = "requires a CUDA device"]
     fn fused_normalized_matches_reference_bit_exactly_on_cuda() {
-        let Ok(device) = Device::new_cuda(0) else {
-            return;
-        };
+        let device = Device::new_cuda(0).expect("requires a CUDA device");
         // Cover decode, prefill, grouped reduction, and padded fallback (1, 1536).
         for (rows, width) in [
             (1usize, 4096usize),

@@ -354,7 +354,7 @@ mod tests {
     fn profile(host: Option<u64>, device: Option<u64>) -> TopologyProfile {
         TopologyProfile {
             schema_version: crate::topology::TOPOLOGY_PROFILE_SCHEMA_VERSION,
-            fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu),
+            fingerprint: HardwareFingerprint::collect(&candle_core::Device::Cpu).unwrap(),
             host_memory_total_bytes: host,
             cgroup_memory_limit_bytes: None,
             peer_links: Vec::new(),

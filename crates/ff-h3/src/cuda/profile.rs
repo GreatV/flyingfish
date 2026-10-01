@@ -16,70 +16,27 @@ pub const CUBLAS_ENVIRONMENT_VARIABLES: [&str; 3] = [
 #[cfg(feature = "cuda")]
 pub const NVCC_VERSION: &str = env!("FLYINGFISH_CUDA_NVCC_VERSION");
 pub const CANDLE_KERNELS_CRATE_VERSION: &str = "0.11.0";
-pub const CANDLE_KERNELS_CRATE_CHECKSUM: &str =
-    "67450168a281bbb195a14cc85cf164c7a12023a54a03409a3324f476346e0789";
 pub const CANDLE_KERNELS_BUILD_FLAGS: &str =
     "cudaforge-build-ptx:--expt-relaxed-constexpr,-std=c++17,-O3;ug-disabled";
-pub const CANDLE_KERNELS_EMBEDDED_PTX_SHA256: &str =
-    "76ab472f7e3cf5feba6bc10f8379cc8ad3936555c0efd4ee54c92548f43d9000";
-pub const CANDLE_KERNELS_BACKEND: &str = "candle-kernels-0.11.0/crate-sha256:67450168a281bbb195a14cc85cf164c7a12023a54a03409a3324f476346e0789/nvcc-13.2.86/O3/embedded-ptx-manifest-sha256:76ab472f7e3cf5feba6bc10f8379cc8ad3936555c0efd4ee54c92548f43d9000/ug-disabled";
 pub const CANDLE_GEMM_REDUCED_PRECISION_F32: bool = false;
 pub const CANDLE_GEMM_REDUCED_PRECISION_F16: bool = false;
 pub const CANDLE_GEMM_REDUCED_PRECISION_BF16: bool = false;
 pub const CUBLAS_LIBRARY_BASENAME: &str = "libcublas.so.13.4.1.3";
 pub const CUBLAS_LIBRARY_BYTES: u64 = 54_198_912;
-pub const CUBLAS_LIBRARY_SHA256: &str =
-    "d089edf0a70ba75f0f422927da121f59018247f491741a3bf0b20637ed7c7b61";
 pub const CUBLASLT_LIBRARY_BASENAME: &str = "libcublasLt.so.13.4.1.3";
 pub const CUBLASLT_LIBRARY_BYTES: u64 = 508_260_928;
-pub const CUBLASLT_LIBRARY_SHA256: &str =
-    "8d702c94d90bd4bd0c032fd4207ae655b4a2d036bd31920c1fbf4ecaf3547c59";
 pub const CUDNN_VERSION: usize = 92_101;
 pub const CUDNN_CUDART_VERSION: usize = 13_020;
 pub const QWEN_PATCH_CUDNN_DSO_COUNT: usize = 8;
-pub const QWEN_PATCH_CUDNN_DSO_MANIFEST_SHA256: &str =
-    "e9a3eef4b024a94ef9469136df4ad8b8aba74bba7f195945e30ac99b317c2930";
-pub const QWEN_PATCH_CUDNN_DSOS: [(&str, u64, &str); QWEN_PATCH_CUDNN_DSO_COUNT] = [
-    (
-        "libcudnn.so.9.21.1",
-        129_240,
-        "29693d4cb390d13c48fa800b585b6f524678680c3ab918f9af5575efff68766a",
-    ),
-    (
-        "libcudnn_cnn.so.9.21.1",
-        2_468_752,
-        "58473cb364769723736cef291db78045dcb35defd9da945391beff94debe8dfd",
-    ),
-    (
-        "libcudnn_engines_precompiled.so.9.21.1",
-        246_182_656,
-        "0e42d76d4931da6e394a2956544f61f0b36527c0c6fdb5f4fee894f87f3808cb",
-    ),
-    (
-        "libcudnn_engines_runtime_compiled.so.9.21.1",
-        30_031_888,
-        "b4e5ecad078e0a394df888eb1aa8ffed1c9cd0261150de93ce37c0b2d6bf3049",
-    ),
-    (
-        "libcudnn_engines_tensor_ir.so.9.21.1",
-        242_382_936,
-        "9149d5cbcf55b25dceacd1919a5623cd6640498214733cb6a3fc1e07bbdf7d4b",
-    ),
-    (
-        "libcudnn_graph.so.9.21.1",
-        123_829_576,
-        "406445a88232425093da4c3f158d6343022bbbdb6584f571dad56071fd3baa03",
-    ),
-    (
-        "libcudnn_heuristic.so.9.21.1",
-        62_142_480,
-        "70c929e776269cf25ecbc2f95d5127361f7c95b6ba85d299a02df18c712e9d57",
-    ),
-    (
-        "libcudnn_ops.so.9.21.1",
-        38_010_464,
-        "adccaa0e31f49e551e8bf25c55f5d732c742b4cd598a136d734a89af52f75444",
-    ),
+pub const QWEN_PATCH_CUDNN_DSOS: [&str; QWEN_PATCH_CUDNN_DSO_COUNT] = [
+    "libcudnn.so.9.21.1",
+    "libcudnn_cnn.so.9.21.1",
+    "libcudnn_engines_precompiled.so.9.21.1",
+    "libcudnn_engines_runtime_compiled.so.9.21.1",
+    "libcudnn_engines_tensor_ir.so.9.21.1",
+    "libcudnn_graph.so.9.21.1",
+    "libcudnn_heuristic.so.9.21.1",
+    "libcudnn_ops.so.9.21.1",
 ];
 
 #[cfg(feature = "cuda")]
@@ -141,9 +98,7 @@ pub(crate) fn validate_qwen_patch_cudnn_preflight() -> candle_core::Result<()> {
     static VALIDATED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     VALIDATED
         .get_or_init(|| {
-            // The runtime gate follows the loader's own resolution (libcudnn.so.9),
-            // the way Candle links it; the exact 9.21.1 identity lives in the
-            // recorded-numbers profile, not here.
+            // The loader resolves libcudnn.so.9.
             let version = unsafe { cudarc::cudnn::sys::cudnnGetVersion() };
             if version / 10_000 != 9 {
                 return Err(format!("Qwen patch conv requires cuDNN 9.x, got {version}"));
@@ -164,7 +119,7 @@ pub(crate) fn validate_qwen_patch_loaded_cudnn() -> candle_core::Result<()> {
             let stem = |name: &str| name.split(".so").next().unwrap_or(name).to_owned();
             let expected = QWEN_PATCH_CUDNN_DSOS
                 .iter()
-                .map(|(name, _, _)| stem(name))
+                .map(|name| stem(name))
                 .collect::<BTreeSet<_>>();
             let maps = std::fs::read_to_string("/proc/self/maps")
                 .map_err(|error| format!("failed to read /proc/self/maps: {error}"))?;
@@ -263,10 +218,7 @@ fn validate_profile_values(
     Ok(())
 }
 
-/// Numerical state of this process, which no device attribute can supply.
-///
-/// Environment overrides and reduced-precision flags affect the selected
-/// arithmetic on every host. Kernel and library digests do not gate execution.
+/// Validate process-wide workspace overrides and reduced-precision flags.
 #[cfg(feature = "cuda")]
 pub(crate) fn validate_process_numerics() -> candle_core::Result<()> {
     use std::sync::OnceLock;
@@ -287,15 +239,7 @@ pub(crate) fn validate_process_numerics() -> candle_core::Result<()> {
         .map_err(candle_core::Error::Msg)
 }
 
-/// Whether the reference vendor-library profile covers this device.
-///
-/// Unlike [`validate_process_numerics`] this really is a question about one
-/// machine, and it governs exactly the operators that call into a vendor
-/// library: the cuBLASLt biased linear and QK/PV matmuls, and the cuDNN patch
-/// convolution. Those pick different kernels on different architectures and
-/// different library builds, so their recorded identity is a claim about a
-/// host. The kernels compiled from this repository's own sources make no such
-/// claim and do not consult this.
+/// Validate the device and library profile for reference cuBLASLt and cuDNN operators.
 #[cfg(feature = "cuda")]
 pub(crate) fn validate_cuda_device(
     device: &candle_core::cuda_backend::CudaDevice,
@@ -364,28 +308,19 @@ pub(crate) fn validate_cuda_device(
     Ok(())
 }
 
-/// Environment switch that turns the transcribed kernels off.
-///
-/// It exists so the Candle composition stays reachable for comparison on a
-/// machine the kernels do cover, which is the only way to measure what they are
-/// worth. It is not a correctness escape: both compositions execute.
+/// Environment switch that disables the transcribed kernels.
 pub const DISABLE_TUNED_KERNELS_ENVIRONMENT_VARIABLE: &str = "FF_CUDA_TUNED_KERNELS";
 
-/// Whether the operator has asked for Candle's kernels outright.
-///
-/// Device-independent, so commands that model a run without opening a device —
-/// `h3 plan` and the solver — can honour the same switch as execution does.
+/// Whether the operator selected Candle kernels.
 pub fn tuned_kernels_disabled() -> bool {
-    std::env::var_os(DISABLE_TUNED_KERNELS_ENVIRONMENT_VARIABLE).is_some_and(|value| value == "0")
+    static VALUE: std::sync::OnceLock<std::result::Result<usize, String>> =
+        std::sync::OnceLock::new();
+    ff_core::probe::cached_env_usize(&VALUE, DISABLE_TUNED_KERNELS_ENVIRONMENT_VARIABLE, 1, 0, 1)
+        .expect("FF_CUDA_TUNED_KERNELS must be 0 or 1; supply a valid value and rerun ff")
+        == 0
 }
 
-/// Whether this host's cuBLASLt and cuDNN are the reference builds.
-///
-/// A `false` answer is not an error and is not a statement about the device's
-/// capability: it says the operators that call those libraries take Candle's
-/// composition instead, because reproducing a recorded vendor-library result
-/// is a claim about one host. The kernels compiled from this repository do not
-/// consult this.
+/// Whether this host provides the reference cuBLASLt and cuDNN builds.
 #[cfg(feature = "cuda")]
 pub fn reference_libraries_available(device: &Device) -> bool {
     use candle_core::cuda_backend::DeviceId;
@@ -418,12 +353,7 @@ pub fn reference_libraries_available(_device: &Device) -> bool {
     false
 }
 
-/// Entry-point check for a device a command is about to use.
-///
-/// Only the process-level numerical state, which applies to every CUDA run
-/// whatever the device. The reference-library identities are checked by the
-/// operators that actually call those libraries, so a host without them runs
-/// the rest rather than being refused here.
+/// Validate process-wide numerical settings for CUDA execution.
 pub fn validate_selected_device(device: &Device) -> Result<()> {
     if !device.is_cuda() {
         return Ok(());
@@ -442,10 +372,6 @@ pub fn validate_exact_profile(device: &Device) -> Result<()> {
         validate_cuda_device(device).map_err(anyhow::Error::from)?;
     }
     Ok(())
-}
-
-pub fn validate_tensor_runtime_artifacts(device: &Device) -> Result<()> {
-    validate_exact_profile(device)
 }
 
 #[cfg(not(feature = "cuda"))]

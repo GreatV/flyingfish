@@ -4,6 +4,8 @@ use serde::Serialize;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
+use crate::edge0::config::EDGE0_ARCHITECTURE;
+use crate::qwen35::config::QWEN35_ARCHITECTURE;
 use crate::runtime::weights::{CachePolicy, ModelWeights, WeightSource};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -13,6 +15,8 @@ pub enum ModelFamily {
     H3,
     Music3,
     Glm,
+    Qwen35,
+    Edge0,
     #[serde(rename = "minicpm")]
     MiniCpm,
     #[serde(rename = "dspark")]
@@ -125,6 +129,16 @@ impl LocalModel {
                 ModelFamily::Glm,
                 vec![],
                 "ff text generate: batch-one text, up to 2048 total tokens",
+            ),
+            QWEN35_ARCHITECTURE => (
+                ModelFamily::Qwen35,
+                vec![],
+                "ff text generate: greedy text generation with optional image input",
+            ),
+            EDGE0_ARCHITECTURE => (
+                ModelFamily::Edge0,
+                vec![],
+                "ff text generate: greedy text generation; requires an Edge0 int4 checkpoint",
             ),
             "DeepseekV41ForCausalLM" if config["model_type"] == "deepseek_v41" => (
                 ModelFamily::Dsv41,
@@ -335,6 +349,56 @@ pub fn discover(root: &Path) -> Result<Vec<CatalogEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_families_are_discovered_as_model_components() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for (name, architecture, family) in [
+            (
+                "dense",
+                "Qwen3_5ForConditionalGeneration",
+                ModelFamily::Qwen35,
+            ),
+            (
+                "moe",
+                "Qwen3_5MoeForConditionalGeneration",
+                ModelFamily::Edge0,
+            ),
+        ] {
+            let path = root.path().join("owner").join(name);
+            std::fs::create_dir_all(&path)?;
+            std::fs::write(
+                path.join("config.json"),
+                serde_json::to_vec(&serde_json::json!({"architectures": [architecture]}))?,
+            )?;
+            let model = LocalModel::open(&path, None)?;
+            assert_eq!(model.family, family);
+            assert!(model.dependencies.is_empty());
+            assert_eq!(model.components.len(), 1);
+            let component = model.component("model")?;
+            assert_eq!(component.directory, path);
+            assert!(component.file_name.is_none());
+            if family == ModelFamily::Edge0 {
+                assert!(
+                    model
+                        .inference_scope
+                        .contains("requires an Edge0 int4 checkpoint")
+                );
+            }
+        }
+        let catalog = discover(root.path())?;
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(
+            catalog[0].model.as_ref().unwrap().family,
+            ModelFamily::Qwen35
+        );
+        assert_eq!(
+            catalog[1].model.as_ref().unwrap().family,
+            ModelFamily::Edge0
+        );
+        assert!(catalog.iter().all(|entry| entry.error.is_none()));
+        Ok(())
+    }
 
     #[test]
     fn dsv41_scope_does_not_advertise_unwired_inputs() {

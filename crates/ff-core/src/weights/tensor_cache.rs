@@ -148,6 +148,7 @@ impl TensorCache {
         path: &Path,
         name: &str,
         header: &ShardHeader,
+        release_pages: bool,
     ) -> Result<TensorLookup> {
         let key = Key {
             path: path.to_owned(),
@@ -201,6 +202,9 @@ impl TensorCache {
                     let mut bytes = vec![0; info.len];
                     file.read_exact(&mut bytes)
                         .with_context(|| format!("failed to read tensor {name}"))?;
+                    if release_pages {
+                        crate::storage::advise_dropped(&file, info.offset as u64, info.len as u64);
+                    }
                     ShardBytes::Memory(bytes.into_boxed_slice())
                 }
             }

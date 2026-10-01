@@ -8,17 +8,23 @@ use flyingfish::qwen35::vision::{self, VisionGrid};
 use flyingfish::qwen35::weights::Qwen35Weights;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokenizers::Tokenizer;
 
-/// The attn_scores CUDA kernel's shared-memory bound.
-const GPU_CONTEXT_CAP: usize = 8192;
+mod serve;
+
+/// Validated end-to-end CUDA context limit.
 
 #[derive(Debug, Subcommand)]
 pub(super) enum Qwen35Command {
+    #[command(about = "Keep a Qwen model loaded and serve sequential greedy requests over HTTP")]
+    Serve(serve::Args),
     #[command(about = "Generate text with a Qwen3.8-27B checkpoint using greedy decoding")]
     Generate {
         #[arg(long, help = "Qwen3.8-27B checkpoint directory")]
         model: PathBuf,
+        #[arg(long)]
+        host_profile: Option<PathBuf>,
         #[arg(long)]
         prompt: String,
         #[arg(
@@ -35,39 +41,48 @@ pub(super) enum Qwen35Command {
         #[arg(long)]
         speculative: bool,
         #[arg(
-            help = "Skip drafting when the model's top1-top2 logit margin falls below this \
-                    threshold; requires --speculative"
+            long,
+            help = "Write timings and generated token IDs to a new JSON file"
         )]
-        #[arg(long)]
-        speculative_gate: Option<f32>,
+        report: Option<PathBuf>,
         #[command(flatten)]
         device: kit::DeviceArgs,
     },
 }
 
 pub(super) fn run(command: Qwen35Command) -> Result<()> {
+    let started = Instant::now();
     let Qwen35Command::Generate {
         model: model_dir,
+        host_profile,
         prompt,
         image,
         max_new_tokens,
         speculative,
-        speculative_gate,
+        report,
         device,
-    } = command;
+    } = command
+    else {
+        let Qwen35Command::Serve(args) = command else {
+            unreachable!()
+        };
+        return serve::run(args);
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = &host_profile;
+    eprintln!("model: {}", model_dir.display());
+    let mut report_file = report
+        .as_ref()
+        .map(|path| {
+            eprintln!("report: {}", path.display());
+            std::fs::File::create_new(path)
+                .with_context(|| format!("create report {}", path.display()))
+        })
+        .transpose()?;
     let kit::DeviceArgs { device } = device;
     let (device, auto) = resolve_text_device(&device)?;
     if speculative && image.is_some() {
         bail!("--speculative is text-only; it cannot be combined with --image");
-    }
-    if speculative_gate.is_some() && !speculative {
-        bail!("--speculative-gate requires --speculative");
-    }
-    if let Some(gate) = speculative_gate {
-        anyhow::ensure!(
-            gate > 0.0,
-            "--speculative-gate must be positive, got {gate}"
-        );
     }
     let config = Qwen35Config::from_model_dir(&model_dir)?;
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -101,36 +116,24 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
     );
     let device = match device {
         TextDevice::Cuda(ordinals) => {
-            if total > GPU_CONTEXT_CAP {
-                if auto {
+            match checkpoint_fits_free_vram(&ordinals, &model_dir, &config, total, speculative)? {
+                true => TextDevice::Cuda(ordinals),
+                false if auto => {
                     eprintln!(
-                        "auto: prompt + generation {total} exceeds the {GPU_CONTEXT_CAP} kernel cap; falling back to CPU"
+                        "auto: resident and streaming plans exceed free VRAM at {total} tokens; falling back to CPU"
                     );
                     TextDevice::Cpu
-                } else {
-                    bail!("prompt + generation {total} exceeds the {GPU_CONTEXT_CAP} kernel cap");
                 }
-            } else {
-                match checkpoint_fits_free_vram(&ordinals, &model_dir, &config, total, speculative)?
-                {
-                    true => TextDevice::Cuda(ordinals),
-                    false if auto => {
-                        eprintln!(
-                            "auto: resident and streaming plans exceed free VRAM; falling back to CPU"
-                        );
-                        TextDevice::Cpu
-                    }
-                    false => {
-                        let list = ordinals
-                            .iter()
-                            .map(|o| o.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        bail!(
-                            "resident and streaming plans exceed free VRAM on cuda:{list}; \
-                             pass another --device (cuda:N with more memory, or cpu)"
-                        )
-                    }
+                false => {
+                    let list = ordinals
+                        .iter()
+                        .map(|o| o.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    bail!(
+                        "resident and streaming plans exceed free VRAM on cuda:{list} at {total} tokens; \
+                         pass another --device (cuda:N with more memory, or cpu)"
+                    )
                 }
             }
         }
@@ -145,18 +148,27 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
         }
         None => None,
     };
+    let mut timings = Timings::default();
     let generated = match device {
         TextDevice::Cpu => {
+            let load = Instant::now();
             let mut model = Qwen35Text::load(&model_dir, config.clone())?;
+            timings.load_ms = load.elapsed().as_secs_f64() * 1000.0;
+            let prefill_start = Instant::now();
             let mut hidden = prefill(&config, &mut model, &ids, &pos3, vision.as_ref())?;
             if vision.is_some() {
                 model.set_mrope_delta(mrope_delta);
             }
             let mut generated = Vec::with_capacity(max_new_tokens.get());
+            let mut decode_start = Instant::now();
             while generated.len() < max_new_tokens.get() {
                 let logits = model.logits(&hidden)?;
                 let best = greedy_token(&logits)?;
                 generated.push(best);
+                if generated.len() == 1 {
+                    timings.prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+                    decode_start = Instant::now();
+                }
                 if config.text_config.eos_token_id.contains(&best)
                     || generated.len() == max_new_tokens.get()
                 {
@@ -164,6 +176,7 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
                 }
                 hidden = model.forward(best)?;
             }
+            timings.decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
             generated
         }
         TextDevice::Cuda(ordinals) => {
@@ -171,6 +184,7 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
             {
                 generate_cuda(CudaDecode {
                     ordinals: &ordinals,
+                    host_profile: host_profile.as_deref(),
                     model_dir: &model_dir,
                     config: &config,
                     ids: &ids,
@@ -178,7 +192,7 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
                     vision: vision.as_ref(),
                     max_new_tokens: max_new_tokens.get(),
                     speculative,
-                    gate: speculative_gate,
+                    timings: &mut timings,
                 })?
             }
             #[cfg(not(feature = "cuda"))]
@@ -195,7 +209,80 @@ pub(super) fn run(command: Qwen35Command) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("decode output: {error}"))?;
     println!("{text}");
     eprintln!("generated {} tokens (greedy)", generated.len());
+    if let Some(file) = report_file.as_mut() {
+        let decode_tokens = generated.len().saturating_sub(1);
+        serde_json::to_writer_pretty(
+            file,
+            &serde_json::json!({
+                "schema_version": 1,
+                "prompt_tokens": ids.len(),
+                "generated_ids": generated,
+                "load_ms": timings.load_ms,
+                "profile_ms": timings.profile_ms,
+                "prefill_ms": timings.prefill_ms,
+                "prefill_packed_tokens": timings.prefill_packed_tokens,
+                "prefill_device_modes": timings.prefill_device_modes,
+                "prefill_block": timings.prefill_block,
+                "group4": timings.group4,
+                "decode_ms": timings.decode_ms,
+                "decode_tokens": decode_tokens,
+                "decode_tokens_per_second": if timings.decode_ms > 0.0 {
+                    Some(decode_tokens as f64 * 1000.0 / timings.decode_ms)
+                } else { None },
+                "total_ms": started.elapsed().as_secs_f64() * 1000.0,
+                "stream16": stream16_json(&timings),
+                "speculative": speculative,
+                "spec": spec_json(&timings),
+            }),
+        )?;
+    }
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn stream16_json(timings: &Timings) -> Option<serde_json::Value> {
+    timings.stream16.map(|s| {
+        serde_json::json!({
+            "fill_ms": s.fill_ms,
+            "gate_wait_ms": s.gate_wait_ms,
+            "h2d_ms": s.h2d_ms,
+            "h2d_bytes": s.h2d_bytes,
+        })
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn stream16_json(_timings: &Timings) -> Option<serde_json::Value> {
+    None
+}
+
+#[cfg(feature = "cuda")]
+fn spec_json(timings: &Timings) -> Option<serde_json::Value> {
+    timings
+        .spec
+        .as_ref()
+        .map(|s| serde_json::json!({"mode": s.mode, "r": s.r, "c": s.c}))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn spec_json(_timings: &Timings) -> Option<serde_json::Value> {
+    None
+}
+
+#[derive(Default)]
+struct Timings {
+    load_ms: f64,
+    profile_ms: f64,
+    prefill_ms: f64,
+    prefill_packed_tokens: usize,
+    prefill_device_modes: Vec<String>,
+    prefill_block: usize,
+    group4: serde_json::Value,
+    decode_ms: f64,
+    #[cfg(feature = "cuda")]
+    spec: Option<flyingfish::qwen35::spec::SpecStats>,
+    #[cfg(feature = "cuda")]
+    stream16: Option<flyingfish::qwen35::gpu::Stream16Stats>,
 }
 
 fn preprocess(model_dir: &Path, image: &Path) -> Result<(Vec<f32>, VisionGrid)> {
@@ -248,10 +335,16 @@ fn checkpoint_fits_free_vram(
     let weights = Qwen35Weights::open(model_dir)
         .with_context(|| format!("open weights for {}", model_dir.display()))?;
     let ranges = flyingfish::qwen35::gpu::partition_layers(&weights, config, ordinals.len())?;
-    // QwenSpec adds the B-column activation set, a whole extra MTP decoder
-    // layer and its own KV cache on top of the resident plan; reserve for
-    // them up front so admission reflects the speculative footprint.
-    const SPEC_VRAM_RESERVE_BYTES: u64 = 2 << 30;
+    // QwenSpec adds the B-column activation set, the A/B-seam GDN scratch,
+    // a whole extra MTP decoder layer with its own KV cache and weights,
+    // and the round ring on top of the resident plan; charge their derived
+    // size up front so admission reflects the speculative footprint.
+    let spec_bytes = flyingfish::qwen35::spec::workspace_bytes(
+        &weights,
+        &config.text_config,
+        max_ctx,
+        total_tokens + 2,
+    );
     let free: Vec<u64> = ordinals
         .iter()
         .map(|&ordinal| {
@@ -264,13 +357,31 @@ fn checkpoint_fits_free_vram(
         .into_iter()
         .map(|free| {
             if speculative {
-                free.saturating_sub(SPEC_VRAM_RESERVE_BYTES)
+                free.saturating_sub(spec_bytes)
             } else {
                 free
             }
         })
         .collect::<Vec<_>>();
-    let plans = flyingfish::qwen35::gpu::plan_residency(&weights, config, &ranges, max_ctx, &free)?;
+    let ring_slots = if weights.format().is_16bit() {
+        let context = cudarc::driver::CudaContext::new(ordinals[0])
+            .with_context(|| format!("open CUDA device {}", ordinals[0]))?;
+        flyingfish::qwen35::gpu::ring_geom(&context, &weights, config)?.depth
+    } else {
+        2
+    };
+    let plans = flyingfish::qwen35::gpu::plan_residency(
+        &weights,
+        config,
+        flyingfish::qwen35::gpu::PlanParams {
+            ranges: &ranges,
+            max_ctx,
+            free: &free,
+            ring_slots,
+            force_stream: ff_qwen35::gpu::force_stream_requested(),
+            granularity: ff_qwen35::gpu::pool_granularity_on(ordinals[0])?,
+        },
+    )?;
     let residency_ok = if speculative {
         plans
             .iter()
@@ -282,8 +393,9 @@ fn checkpoint_fits_free_vram(
     };
     if speculative && !residency_ok {
         eprintln!(
-            "--speculative needs a fully resident plan with a 2 GiB reserve; \
-                   this device only admits streaming or too-tight residency"
+            "--speculative needs a fully resident plan plus its {} MiB workspace; \
+                   this device only admits streaming or too-tight residency",
+            spec_bytes / (1 << 20)
         );
     }
     Ok(residency_ok)
@@ -376,6 +488,7 @@ fn prefill(
 #[cfg(feature = "cuda")]
 struct CudaDecode<'a> {
     ordinals: &'a [usize],
+    host_profile: Option<&'a Path>,
     model_dir: &'a Path,
     config: &'a Qwen35Config,
     ids: &'a [u32],
@@ -383,7 +496,7 @@ struct CudaDecode<'a> {
     vision: Option<&'a (Vec<f32>, VisionGrid)>,
     max_new_tokens: usize,
     speculative: bool,
-    gate: Option<f32>,
+    timings: &'a mut Timings,
 }
 
 #[cfg(feature = "cuda")]
@@ -392,6 +505,7 @@ fn generate_cuda(request: CudaDecode<'_>) -> Result<Vec<u32>> {
 
     let CudaDecode {
         ordinals,
+        host_profile,
         model_dir,
         config,
         ids,
@@ -399,7 +513,7 @@ fn generate_cuda(request: CudaDecode<'_>) -> Result<Vec<u32>> {
         vision,
         max_new_tokens,
         speculative,
-        gate,
+        timings,
     } = request;
 
     anyhow::ensure!(
@@ -408,15 +522,42 @@ fn generate_cuda(request: CudaDecode<'_>) -> Result<Vec<u32>> {
     );
     let total = ids.len() + max_new_tokens;
     anyhow::ensure!(
-        total <= GPU_CONTEXT_CAP,
-        "prompt + generation {total} exceeds the {GPU_CONTEXT_CAP} kernel cap"
+        total <= config.text_config.max_position_embeddings,
+        "prompt + generation {total} exceeds the model context {}",
+        config.text_config.max_position_embeddings
     );
+    let load = Instant::now();
     let weights = Qwen35Weights::open(model_dir)?;
     let mut gpu = if total > 4096 {
-        QwenGpu::with_max_ctx(ordinals, &weights, config, total.next_power_of_two())?
+        QwenGpu::with_max_ctx(
+            ordinals,
+            &weights,
+            config,
+            total.next_power_of_two(),
+            ff_qwen35::gpu::force_stream_requested(),
+        )?
     } else {
-        QwenGpu::new(ordinals, &weights, config)?
+        QwenGpu::new(
+            ordinals,
+            &weights,
+            config,
+            ff_qwen35::gpu::force_stream_requested(),
+        )?
     };
+    let (records, profile_ms) = flyingfish::host_profile::HostProfile::group_records(
+        host_profile,
+        ordinals[0],
+        gpu.forced_group() || weights.format().is_16bit(),
+    )?;
+    let binary = flyingfish::collect_binary_identity()?;
+    gpu.bind_groups(&records, &binary)?;
+    if speculative {
+        gpu.bind_round(&records, &binary, max_new_tokens + 2)?;
+    }
+    timings.profile_ms = profile_ms;
+    gpu.ctx.stream.synchronize()?;
+    timings.load_ms = load.elapsed().as_secs_f64() * 1000.0;
+    let prefill_start = Instant::now();
     match vision {
         Some((rows, _)) => {
             let hidden_size = config.text_config.hidden_size;
@@ -438,139 +579,36 @@ fn generate_cuda(request: CudaDecode<'_>) -> Result<Vec<u32>> {
             gpu.push_tokens(ids)?;
         }
     }
+    let first = gpu.read_token()?;
+    timings.prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+    timings.prefill_packed_tokens = gpu.prefill_packed_tokens();
+    timings.prefill_device_modes = gpu.prefill_modes().into_iter().map(str::to_owned).collect();
+    timings.prefill_block = gpu.prefill_block();
+    timings.group4 = serde_json::to_value(gpu.group_choices())?;
+    let decode_start = Instant::now();
     if speculative {
-        return generate_cuda_speculative(&mut gpu, &weights, config, max_new_tokens, gate);
+        let (generated, stats) =
+            generate_cuda_speculative(&mut gpu, &weights, config, max_new_tokens)?;
+        timings.decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+        timings.spec = Some(stats);
+        timings.group4 = serde_json::to_value(gpu.group_choices())?;
+        return Ok(generated);
     }
-    let mut generated = vec![gpu.read_token()?];
-    while generated.len() < max_new_tokens
-        && !config
-            .text_config
-            .eos_token_id
-            .contains(generated.last().unwrap())
-    {
-        gpu.step()?;
-        generated.push(gpu.read_token()?);
-    }
+    let generated = gpu.decode(first, max_new_tokens)?;
+    timings.decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+    timings.stream16 = gpu.stream16_stats();
     Ok(generated)
 }
 
-/// Greedy decode with one MTP-drafted token verified per round. The emitted
-/// ids are the non-speculative path's by construction: a draft is only
-/// emitted after the model's own greedy token confirmed it.
+/// Greedy decode with one MTP-drafted token verified per round; the round
+/// economics and the enablement rule live in [`flyingfish::qwen35::spec::decode`].
 #[cfg(feature = "cuda")]
 fn generate_cuda_speculative(
     gpu: &mut flyingfish::qwen35::gpu::QwenGpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     max_new_tokens: usize,
-    gate: Option<f32>,
-) -> Result<Vec<u32>> {
-    use flyingfish::qwen35::spec::QwenSpec;
-    use std::time::Instant;
-
+) -> Result<(Vec<u32>, flyingfish::qwen35::spec::SpecStats)> {
     let eos = |token: &u32| config.text_config.eos_token_id.contains(token);
-    // A draft is only worth computing when the next round can verify it:
-    // two free slots for the (staged, drafted) pair, and no pending EOS.
-    let can_verify = |len: usize, tok: u32| len + 2 <= max_new_tokens && !eos(&tok);
-    let mut spec = QwenSpec::new(gpu, weights)?;
-    spec.margins_enabled = gate.is_some();
-    let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
-    let (mut accepts, mut rejects, mut skips) = (0usize, 0usize, 0usize);
-    let mut pending = gpu.read_token()?;
-    let started = Instant::now();
-    // The first round gates its draft on the post-prefill margin exactly
-    // like every later round.
-    let initial_margin = spec.step_margin(gpu)?;
-    let mut have_draft = gate.is_none_or(|t| initial_margin >= t);
-    if have_draft && can_verify(generated.len(), pending) {
-        spec.draft(gpu, Some(&gpu.hidden), pending)?;
-    } else {
-        skips += 1;
-    }
-    while generated.len() < max_new_tokens {
-        // `pending` is a model-confirmed token carried from the previous
-        // round (or the prefill's first); emit it alone and stop when it is
-        // EOS rather than staging it under a fresh draft.
-        if eos(&pending) {
-            generated.push(pending);
-            break;
-        }
-        gpu.ctx
-            .stream
-            .memcpy_htod(&[pending as i32], &mut gpu.next_token)?;
-        // A verify round emits two tokens, so it needs two slots; the last
-        // slot fills with a plain step's verified token instead of an
-        // unverified draft.
-        if have_draft && generated.len() + 2 <= max_new_tokens {
-            let (a, b) = spec.verify_round(gpu)?;
-            let accepted = a == spec.draft_id;
-            if accepted {
-                accepts += 1;
-                generated.push(pending);
-                generated.push(spec.draft_id);
-                gpu.ctx.glue_inc(&mut gpu.pos)?;
-                gpu.ctx.glue_inc(&mut gpu.pos)?;
-                gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
-                gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
-                gpu.position += 2;
-                pending = b;
-                have_draft = gate.is_none_or(|t| spec.margin_b >= t);
-            } else {
-                rejects += 1;
-                generated.push(pending);
-                spec.reject_restore(gpu)?;
-                gpu.ctx.glue_inc(&mut gpu.pos)?;
-                gpu.ctx.glue_inc3(&mut gpu.rope_pos)?;
-                gpu.position += 1;
-                pending = a;
-                have_draft = gate.is_none_or(|t| spec.margin_a >= t);
-            }
-            if accepted && eos(&spec.draft_id) {
-                break;
-            }
-            if generated.len() >= max_new_tokens {
-                break;
-            }
-            // Draft for the next round only when that round can actually
-            // verify: two free slots and a non-EOS pending. Otherwise the
-            // draft would be computed and thrown away.
-            if have_draft && can_verify(generated.len(), pending) {
-                if accepted {
-                    spec.draft(gpu, None, b)?;
-                } else {
-                    spec.draft(gpu, Some(&gpu.hidden), a)?;
-                }
-            } else {
-                skips += 1;
-            }
-        } else {
-            generated.push(pending);
-            if generated.len() >= max_new_tokens {
-                break;
-            }
-            gpu.step()?;
-            pending = gpu.read_token()?;
-            let margin = spec.step_margin(gpu)?;
-            have_draft = gate.is_none_or(|t| margin >= t);
-            if have_draft && can_verify(generated.len(), pending) {
-                spec.draft(gpu, Some(&gpu.hidden), pending)?;
-            } else {
-                skips += 1;
-            }
-        }
-    }
-    let elapsed = started.elapsed().as_secs_f64();
-    let emitted = generated.len();
-    let rounds = accepts + rejects;
-    let rate = if rounds > 0 {
-        accepts as f64 / rounds as f64 * 100.0
-    } else {
-        0.0
-    };
-    eprintln!(
-        "spec decode: {emitted} tokens in {elapsed:.2}s = {:.1} tok/s; accepts {accepts} \
-         rejects {rejects} skips {skips} (accept rate {rate:.0}%)",
-        emitted as f64 / elapsed
-    );
-    Ok(generated)
+    flyingfish::qwen35::spec::decode(gpu, weights, &eos, max_new_tokens)
 }

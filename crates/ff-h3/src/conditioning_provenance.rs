@@ -414,8 +414,7 @@ mod tests {
         provenance
             .insert_artifact_tensors(&mut encoded, &Device::Cpu)
             .unwrap();
-        // The JSON and its schema; the digest tensor that used to sit beside
-        // them described data already there.
+        // The artifact contains the JSON and its schema.
         assert_eq!(encoded.len(), 2);
         let mut loaded = encoded
             .iter()

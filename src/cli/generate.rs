@@ -903,6 +903,7 @@ struct GenerationResourceRequest<'a> {
     device: &'a Device,
     resources: &'a H3ResourceArgs,
     optional_weight_args: OptionalWeightCacheArgs,
+    derived_axes: &'a BTreeMap<String, Vec<String>>,
     checkpoint_policy: Option<&'a ExecutionPolicy>,
     explicit_policy: bool,
     token_ids: &'a [u32],
@@ -945,6 +946,7 @@ fn select_generation_resources(
         device,
         resources,
         optional_weight_args,
+        derived_axes,
         checkpoint_policy,
         explicit_policy,
         token_ids,
@@ -1006,6 +1008,7 @@ fn select_generation_resources(
     };
     let selected = match super::resource::select_h3(super::resource::H3ResourceRequest {
         additional_host_allowance_bytes: 0,
+        model,
         component: &transformer_dir,
         device,
         baseline: execution_policy,
@@ -1020,6 +1023,7 @@ fn select_generation_resources(
         },
         resources,
         weights: optional_weight_args,
+        derived_axes,
         locked_origin,
         resident_input_bytes: 0,
         request: serde_json::json!({"command":"h3.generate", "model_root":model_root_record, "prompt":prompt,
@@ -1408,12 +1412,7 @@ fn denoise_remaining_steps(
     })
 }
 
-/// The decode phase: turn denoised latents into a WAV and a PNG frame set, or
-/// verify what an earlier run already published.
-///
-/// Both branches are gathered behind one call because they answer to the same
-/// expectations and the same atomic completion record. The phase reads a lot
-/// of the request, so it takes it as one value rather than twenty arguments.
+/// Decode denoised latents to WAV/PNG outputs or verify the already-published outputs against the same completion contract.
 struct DecodeStage<'a> {
     device: &'a Device,
     output_dir: &'a Path,
@@ -1685,12 +1684,7 @@ impl DecodeStage<'_> {
     }
 }
 
-/// What the checkpoint's own VAE configurations say the decoded outputs must
-/// be, resolved once so the verify and decode branches cannot disagree.
-///
-/// Both branches check the same shapes: one against files an earlier run left
-/// behind, the other against tensors it is about to write. Deriving them twice
-/// is how those two answers drift apart.
+/// Decoded output shapes derived once from the checkpoint's VAE configurations.
 struct DecodeExpectations {
     audio_vae_dir: PathBuf,
     audio_vae_config: AudioVaeConfig,
@@ -1771,40 +1765,15 @@ fn load_or_capture_topology(
 ) -> Result<flyingfish::runtime::topology::TopologyProfile> {
     use flyingfish::runtime::topology::TopologyProfile;
     let Some(path) = std::env::var_os("FF_TOPOLOGY_PROFILE") else {
-        return Ok(TopologyProfile::capture(primary));
+        return TopologyProfile::capture(primary);
     };
     let path = std::path::PathBuf::from(path);
     match TopologyProfile::load(&path, primary)? {
         Ok(profile) => Ok(profile),
-        Err(absence) => {
-            eprintln!(
-                "topology profile {} is not reusable ({}); recapturing",
-                path.display(),
-                match absence {
-                    flyingfish::runtime::topology::TopologyProfileAbsence::NotFound(_) => {
-                        "absent"
-                    }
-                    flyingfish::runtime::topology::TopologyProfileAbsence::ForeignHost {
-                        ..
-                    } => {
-                        "recorded on another machine"
-                    }
-                    flyingfish::runtime::topology::TopologyProfileAbsence::StaleSchema {
-                        ..
-                    } => {
-                        "recorded under an older schema"
-                    }
-                    flyingfish::runtime::topology::TopologyProfileAbsence::CgroupLimitChanged {
-                        ..
-                    } => {
-                        "recorded under a different cgroup memory limit"
-                    }
-                }
-            );
-            let profile = TopologyProfile::capture(primary);
-            profile.save(&path)?;
-            Ok(profile)
-        }
+        Err(absence) => bail!(
+            "FF_TOPOLOGY_PROFILE {} is invalid ({absence:?}); regenerate it with ff probe --json",
+            path.display()
+        ),
     }
 }
 
@@ -1814,6 +1783,8 @@ fn load_or_capture_topology(
 const H3_VAE_CACHE_FLOOR_BYTES: u64 = 1 << 30;
 
 struct T2vaDerivation<'a> {
+    weight_args: OptionalWeightCacheArgs,
+    snapshot: &'a flyingfish::runtime::probe::ResourceSnapshot,
     model_root: &'a Path,
     geometry: T2vaGeometry,
     flash_attention: bool,
@@ -1824,14 +1795,22 @@ struct T2vaDerivation<'a> {
     ordinals: Vec<usize>,
 }
 
+struct T2vaConfiguration {
+    derived: ff_core::configure::DerivedConfig,
+    host_bound_bytes: Option<u64>,
+    host_granularity: Option<ff_core::weights::CacheGranularity>,
+}
+
 fn derive_t2va_configuration(
     request: T2vaDerivation<'_>,
     primary: &Device,
-) -> Result<(ff_core::configure::DerivedConfig, Option<u64>)> {
+) -> Result<T2vaConfiguration> {
     use flyingfish::h3::resources::{
-        H3T2vaRequirement, ResourceAssumptions, ResourceEstimate, cache_charge,
+        H3T2vaRequirement, ResourceAssumptions, ResourceEstimate, cache_charge, fit_host_cache,
     };
     let T2vaDerivation {
+        weight_args,
+        snapshot,
         model_root,
         geometry,
         flash_attention,
@@ -1952,38 +1931,79 @@ fn derive_t2va_configuration(
         device.total_memory_bytes = Some(total.min(mib << 20));
     }
     let mut derived = ff_core::configure::derive(ordinal, &profile, &requirement)?;
-    let host_bound_bytes = match (derived.weight_source, derived.host_cache_ceiling_bytes) {
-        (ff_core::configure::WeightSourceChoice::Memory, Some(ceiling)) => {
-            match (|| -> Result<u64> {
-                let inventory = catalog
-                    .as_ref()
-                    .context("transformer catalog unavailable")?;
-                let charge = cache_charge(
-                    inventory,
-                    WeightSource::Memory,
-                    CachePolicy::unbounded_units().with_max_bytes((ceiling >> 20) << 20),
-                )?;
-                let mut assumptions = ResourceAssumptions::h3_bf16_mmap();
-                assumptions.host_weight_cache_bytes = charge.owned_weight_bytes;
-                assumptions.evaluation_count = evaluations as u64;
-                assumptions.precompute_adaln_steps = evaluations as u64;
-                // The prefetcher's pinned slab grows to the largest stage.
-                let charged = ResourceEstimate::for_t2va(&config, geometry, assumptions)?;
-                Ok(charged
-                    .peak_host_bytes
-                    .saturating_add(charged.weights.peak_materialized_bytes))
-            })() {
-                Ok(demand) => Some(demand),
-                Err(error) => {
-                    eprintln!(
-                        "config: host bound was not derived ({}); the admission default applies",
-                        error
-                    );
-                    None
-                }
+    let source = weight_args
+        .weight_source
+        .unwrap_or(match derived.weight_source {
+            ff_core::configure::WeightSourceChoice::Memory => WeightSource::Memory,
+            ff_core::configure::WeightSourceChoice::Mmap => WeightSource::Mmap,
+        });
+    let mut host_granularity = None;
+    let host_bound_bytes = if source == WeightSource::Memory {
+        let inventory = catalog
+            .as_ref()
+            .context("transformer catalog unavailable for host admission")?;
+        let available = snapshot
+            .cgroup_v2_memory_available_bytes
+            .into_iter()
+            .chain(snapshot.host_memory_available_bytes)
+            .min();
+        let reserve = ff_core::probe::admission_reserve_bytes(snapshot.host_pool_total_bytes());
+        let limit = max_host_mib
+            .map(|mib| mib << 20)
+            .or_else(|| available.map(|bytes| bytes.saturating_sub(reserve)))
+            .context("host memory availability is required to bound the H3 memory cache")?;
+        assumptions.device_memory_is_host =
+            !primary.is_cuda() || snapshot.host_device_memory_is_unified == Some(true);
+        assumptions.use_flash_attention = flash_attention;
+        let charged = ResourceEstimate::for_t2va(&config, geometry, assumptions)?;
+        let headers = inventory.header_bytes()?;
+        let staging = if primary.is_cuda() {
+            charged.weights.peak_materialized_bytes
+        } else {
+            0
+        };
+        let fixed = charged
+            .peak_host_bytes
+            .checked_add(staging)
+            .and_then(|bytes| bytes.checked_add(headers))
+            .context("H3 fixed host allocation overflow")?;
+        let mut cache = CachePolicy::unbounded_units()
+            .with_granularity(weight_args.host_cache_granularity.unwrap_or_default());
+        let (ceiling, demand) = if let Some(mib) = weight_args.host_cache_mib {
+            cache = cache.with_max_bytes(mib_to_bytes(mib)?);
+            let demand = cache_charge(inventory, WeightSource::Memory, cache)?
+                .owned_weight_bytes
+                .checked_add(fixed)
+                .context("H3 host bound overflow")?;
+            (mib_to_bytes(mib)?, demand)
+        } else {
+            let mut fit = fit_host_cache(inventory, cache, (limit >> 20) << 20, fixed)?;
+            if fit.is_none() && weight_args.host_cache_granularity.is_none() {
+                cache = cache.with_granularity(ff_core::weights::CacheGranularity::Tensor);
+                fit = fit_host_cache(inventory, cache, (limit >> 20) << 20, fixed)?;
             }
-        }
-        _ => None,
+            let minimum = cache_charge(
+                inventory,
+                WeightSource::Memory,
+                cache.with_max_bytes(1 << 20),
+            )?
+            .owned_weight_bytes
+            .checked_add(fixed)
+            .context("H3 host bound overflow")?;
+            fit.with_context(|| format!(
+                "H3 host memory requires at least {minimum} B for retained/loading units and fixed allocations; {limit} B available, short by {} B",
+                minimum.saturating_sub(limit)
+            ))?
+        };
+        derived.host_cache_ceiling_bytes = Some(ceiling);
+        host_granularity = Some(cache.granularity);
+        derived.provenance.push(ff_core::configure::DerivationStep {
+            rule: "h3-host-cache-bound",
+            detail: format!("available {available:?} B, reserve {reserve} B, limit {limit} B; {:?} cache {ceiling} B, peak {demand} B", cache.granularity),
+        });
+        Some(demand)
+    } else {
+        None
     };
     if let Some(bytes) = derived.pool_resident_bytes
         && bytes > 0
@@ -1995,7 +2015,11 @@ fn derive_t2va_configuration(
             H3_VAE_CACHE_FLOOR_BYTES >> 20
         ));
     }
-    Ok((derived, host_bound_bytes))
+    Ok(T2vaConfiguration {
+        derived,
+        host_bound_bytes,
+        host_granularity,
+    })
 }
 
 /// One worker's share of a generation run: the device it owns, the slice of
@@ -2087,6 +2111,9 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
         || optional_chunks.is_explicit()
         || no_precompute_adaln
         || flash_attention;
+    let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(device))
+        .context("resource probe failed")?;
+    let mut derived_host_granularity = None;
     let mut derived_host_bound_mib: Option<u64> = None;
     let mut vae_resident_bytes: Option<u64> = None;
     let derived = if explicit_policy {
@@ -2114,8 +2141,14 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
                 );
                 None
             });
-        let (derived, host_bound_bytes) = derive_t2va_configuration(
+        let T2vaConfiguration {
+            derived,
+            host_bound_bytes,
+            host_granularity,
+        } = derive_t2va_configuration(
             T2vaDerivation {
+                weight_args: optional_weight_args,
+                snapshot: &snapshot,
                 model_root: &model_root,
                 geometry,
                 flash_attention,
@@ -2127,6 +2160,7 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
             },
             device,
         )?;
+        derived_host_granularity = host_granularity;
         derived_host_bound_mib = host_bound_bytes.map(|bytes| bytes.div_ceil(1 << 20));
         // A zero-cap pool streams by convention, which is today's None path.
         vae_resident_bytes = derived.pool_resident_bytes.filter(|bytes| *bytes > 0);
@@ -2148,15 +2182,50 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
             derived
                 .as_ref()
                 .and_then(|derived| derived.host_cache_ceiling_bytes)
-                .map(|bytes| bytes.div_ceil(1 << 20))
+                .map(|bytes| bytes >> 20)
         })
         .flatten();
-    let optional_weight_args =
-        optional_weight_args.with_derived(derived_source, derived_host_cache_mib);
+    let derivation_steps: Vec<String> = derived
+        .iter()
+        .flat_map(|derived| derived.provenance.iter().map(ToString::to_string))
+        .collect();
+    let mut derived_axes = BTreeMap::new();
+    for (derived, axes) in [
+        (
+            optional_weight_args.weight_source.is_none() && derived_source.is_some(),
+            &["weights.source"][..],
+        ),
+        (
+            optional_weight_args.host_cache_mib.is_none() && derived_host_cache_mib.is_some(),
+            &["weights.cache_bytes", "weights.cache_shards"][..],
+        ),
+        (
+            optional_weight_args.host_cache_granularity.is_none()
+                && derived_host_granularity.is_some(),
+            &["weights.granularity"][..],
+        ),
+    ] {
+        if derived {
+            for axis in axes {
+                derived_axes.insert((*axis).to_owned(), derivation_steps.clone());
+            }
+        }
+    }
+    let optional_weight_args = OptionalWeightCacheArgs {
+        host_cache_granularity: optional_weight_args
+            .host_cache_granularity
+            .or(derived_host_granularity),
+        ..optional_weight_args.with_derived(derived_source, derived_host_cache_mib)
+    };
     let optional_chunks = optional_chunks.with_derived(derived.as_ref().and_then(|d| d.chunks));
     let max_host_mib = max_host_mib.or(derived_host_bound_mib);
-    if let Some(bound_bytes) = derived_host_bound_mib.map(|mib| mib << 20) {
-        let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(device));
+    if let Some(bound_bytes) = derived_host_bound_mib
+        .into_iter()
+        .chain(max_host_mib)
+        .chain(optional_weight_args.host_cache_mib)
+        .max()
+        .map(|mib| mib << 20)
+    {
         let available = snapshot
             .cgroup_v2_memory_available_bytes
             .into_iter()
@@ -2166,7 +2235,7 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
             && bound_bytes > available
         {
             eprintln!(
-                "config: derived host bound {} B exceeds available host memory {} B; \
+                "config: requested host bound {} B exceeds available host memory {} B; \
                  expect swapping unless the host frees up",
                 bound_bytes, available
             );
@@ -2271,6 +2340,7 @@ fn run_single_device_pipeline(ctx: DeviceRunContext<'_>) -> Result<()> {
             device,
             resources: &resources,
             optional_weight_args,
+            derived_axes: &derived_axes,
             checkpoint_policy,
             explicit_policy,
             token_ids,
@@ -2856,9 +2926,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
     // Cold-cache preparation evicts and re-reads shared shard files; it
     // runs once here rather than racing across workers.
     if resources.resource_cold_cache {
-        flyingfish::resource_policy::prepare_cold_cache_components(&[
-            model_root.join("transformer")
-        ])?;
+        flyingfish::resource_policy::prepare_cold_cache_model(&model_root)?;
     }
     let worker_resources = H3ResourceArgs {
         resource_policy: resources.resource_policy,
@@ -2981,6 +3049,7 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
                     device: &gate_device,
                     resources: &worker_resources,
                     optional_weight_args,
+                    derived_axes: &BTreeMap::new(),
                     checkpoint_policy: None,
                     explicit_policy,
                     token_ids: &token_ids,
@@ -3012,7 +3081,8 @@ pub(super) fn run_generate_t2va(command: H3Command) -> Result<()> {
         // Each worker's remaining peak (workspace, activations) is exclusive.
         let total_worker_peaks: u64 = worker_peaks.iter().sum();
         let aggregate_host_peak = total_worker_peaks.saturating_add(shared_mapped_bytes);
-        let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device));
+        let snapshot = flyingfish::runtime::probe::ResourceSnapshot::capture(Some(&device))
+            .context("resource probe failed")?;
         // The aggregate ceiling is the tighter of the machine's available
         // host memory and the operator's --max-host-mib hard cap.
         let available = snapshot
@@ -3266,7 +3336,7 @@ fn preflight_generation(
         2,
     )
     .context("generation numerical-backend preflight refused before model payload access")?;
-    let snapshot = ResourceSnapshot::capture(Some(device));
+    let snapshot = ResourceSnapshot::capture(Some(device)).context("resource probe failed")?;
     let mut budget = probed_budget(
         &snapshot,
         policy.execution_backend,
@@ -3280,7 +3350,10 @@ fn preflight_generation(
             budget
                 .max_host_bytes
                 .context("unified generation preflight needs a host bound")?
-                .saturating_sub(super::resource::device_residency_reserve_bytes(&snapshot)),
+                .saturating_sub(super::resource::device_residency_reserve_bytes(
+                    &snapshot,
+                    ExecutionBackendPolicy::from_device(device),
+                )?),
         );
     }
 
@@ -4941,7 +5014,6 @@ mod tests {
             cgroup_v2_memory_available_bytes: Some(8 * 1024 * 1024),
             device_free_memory_bytes: Some(6 * 1024 * 1024),
             host_device_memory_is_unified: None,
-            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
@@ -4980,7 +5052,6 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: None,
             host_device_memory_is_unified: None,
-            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {
@@ -5014,7 +5085,6 @@ mod tests {
             cgroup_v2_memory_available_bytes: None,
             device_free_memory_bytes: Some(6 * 1024 * 1024),
             host_device_memory_is_unified: unified,
-            device_topology_probe_failed: false,
             host_memory_total_bytes: None,
             device_total_memory_bytes: None,
             measurement_scope: flyingfish::runtime::probe::ResourceMeasurementScopes {

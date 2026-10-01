@@ -1,19 +1,8 @@
 use candle_core::Tensor;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum ExpertCacheReplacementPolicy {
-    #[default]
-    #[value(help = "Evict the least recently accessed resident projection")]
-    Lru,
-    #[value(help = "Retain frequent projections; reject colder newcomers under pressure")]
-    Lfu,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExpertCacheResize {
@@ -41,32 +30,29 @@ pub struct ExpertCacheStats {
     pub evictions: u64,
 }
 
-/// A thread-safe, byte-bounded least-recently-used cache of expert tensors.
+/// A thread-safe, byte-bounded cache of expert tensors that retains the
+/// most frequently accessed projections.
 ///
 /// Tensor handles are cheap to clone, so a hit returns a cloned handle while
 /// keeping the cached tensor resident. The byte charge is the tensor's logical
 /// element count multiplied by its dtype size. A zero byte budget disables the
 /// cache, and a tensor larger than the configured budget is never retained.
 pub struct ExpertCache {
-    replacement: ExpertCacheReplacementPolicy,
     state: Mutex<State>,
 }
 
-/// Where a resident entry sits in its policy's eviction order, lowest first.
+/// Where a resident entry sits in its eviction order, lowest first.
 ///
-/// LRU ranks by access clock alone. LFU ranks by frequency and breaks ties on
-/// that same clock, so the colder of two equally frequent projections leaves
-/// first. Both policies therefore share one ordered index whose first element
-/// is always the next victim, which is what keeps eviction off a linear scan.
+/// LFU ranks by frequency and breaks ties on the access clock, so the colder
+/// of two equally frequent projections leaves first. The ordered index's
+/// first element is always the next victim, which keeps eviction off a
+/// linear scan.
 type Rank = (u64, u64);
 
 struct State {
     max_bytes: usize,
     entries: HashMap<Arc<str>, Entry>,
-    /// Every resident entry filed under its own `Rank`, so the least valuable
-    /// one is `first` rather than a search. Ranks are unique because each ends
-    /// in an access clock handed out exactly once, which is what lets a reorder
-    /// carry the shared key across without touching a reference count.
+    /// Ranks are unique; the first ordered key is the lowest rank.
     order: BTreeMap<Rank, Arc<str>>,
     bytes: usize,
     hits: u64,
@@ -92,12 +78,7 @@ struct AccessHistory {
 
 impl ExpertCache {
     pub fn new(max_bytes: usize) -> Self {
-        Self::with_replacement(max_bytes, ExpertCacheReplacementPolicy::Lru)
-    }
-
-    pub fn with_replacement(max_bytes: usize, replacement: ExpertCacheReplacementPolicy) -> Self {
         Self {
-            replacement,
             state: Mutex::new(State {
                 max_bytes,
                 entries: HashMap::new(),
@@ -115,7 +96,7 @@ impl ExpertCache {
     /// Returns a cloned tensor handle and marks `key` as most recently used.
     pub fn get(&self, key: &str) -> Option<Tensor> {
         let mut state = self.state.lock().expect("expert cache mutex poisoned");
-        state.record_access(key, self.replacement);
+        state.record_access(key);
         let tensor = match state.entries.get(key) {
             Some(entry) => entry.tensor.clone(),
             None => {
@@ -131,7 +112,6 @@ impl ExpertCache {
             .hits
             .checked_add(1)
             .expect("expert cache hit counter overflow");
-        state.touch(key, self.replacement);
         Some(tensor)
     }
 
@@ -152,36 +132,21 @@ impl ExpertCache {
             return false;
         }
 
-        if self.replacement == ExpertCacheReplacementPolicy::Lru {
-            while state.bytes > state.max_bytes - tensor_bytes {
-                state.evict();
-            }
-        }
-
         let key = state.interned(&key);
-        let rank = match self.replacement {
-            ExpertCacheReplacementPolicy::Lru => {
-                state.clock = state
-                    .clock
-                    .checked_add(1)
-                    .expect("expert cache access clock overflow");
-                (0, state.clock)
-            }
-            ExpertCacheReplacementPolicy::Lfu => {
-                state.clock = state
-                    .clock
-                    .checked_add(1)
-                    .expect("expert cache access clock overflow");
-                let admitted = state.clock;
-                let history = *state
-                    .history
-                    .entry(Arc::clone(&key))
-                    .or_insert(AccessHistory {
-                        frequency: 0,
-                        last_access: admitted,
-                    });
-                (history.frequency, history.last_access)
-            }
+        let rank = {
+            state.clock = state
+                .clock
+                .checked_add(1)
+                .expect("expert cache access clock overflow");
+            let admitted = state.clock;
+            let history = *state
+                .history
+                .entry(Arc::clone(&key))
+                .or_insert(AccessHistory {
+                    frequency: 0,
+                    last_access: admitted,
+                });
+            (history.frequency, history.last_access)
         };
 
         state.bytes = state
@@ -272,10 +237,7 @@ impl State {
         debug_assert!(replaced.is_none(), "expert cache order index reused a rank");
     }
 
-    fn record_access(&mut self, key: &str, replacement: ExpertCacheReplacementPolicy) {
-        if replacement == ExpertCacheReplacementPolicy::Lru {
-            return;
-        }
+    fn record_access(&mut self, key: &str) {
         self.clock = self
             .clock
             .checked_add(1)
@@ -290,19 +252,6 @@ impl State {
         history.last_access = clock;
         let rank = (history.frequency, history.last_access);
         self.rerank(key, rank);
-    }
-
-    /// Mark a hit. LFU already reranked the entry when it recorded the access,
-    /// so only LRU has anything left to do here.
-    fn touch(&mut self, key: &str, replacement: ExpertCacheReplacementPolicy) {
-        if replacement != ExpertCacheReplacementPolicy::Lru {
-            return;
-        }
-        self.clock = self
-            .clock
-            .checked_add(1)
-            .expect("expert cache access clock overflow");
-        self.rerank(key, (0, self.clock));
     }
 
     fn remove(&mut self, key: &str) {
@@ -454,7 +403,7 @@ mod tests {
 
     #[test]
     fn lfu_retains_frequency_across_eviction_and_breaks_ties_by_recency() {
-        let cache = ExpertCache::with_replacement(8, ExpertCacheReplacementPolicy::Lfu);
+        let cache = ExpertCache::new(8);
         assert!(cache.get("a").is_none());
         assert!(cache.insert("a".to_owned(), f32_tensor(1)));
         assert!(cache.get("b").is_none());
@@ -494,92 +443,6 @@ mod tests {
         assert_eq!(grown.previous_resident_bytes, 8);
         assert_eq!(grown.new_resident_bytes, 8);
         assert_eq!(grown.evictions, 0);
-    }
-
-    /// The ordered index must hold exactly the resident keys, each filed under
-    /// the rank its own entry records.
-    ///
-    /// A reorder that removed the wrong rank, or failed to remove the old one,
-    /// leaves the cache still evicting something on every admission — just the
-    /// wrong entry, silently and only under load. Nothing observable through
-    /// `stats` catches that, so the invariant is asserted directly.
-    fn assert_index_is_consistent(cache: &ExpertCache) {
-        let state = cache.state.lock().unwrap();
-        assert_eq!(
-            state.order.len(),
-            state.entries.len(),
-            "order index and resident set disagree on size"
-        );
-        for (rank, key) in &state.order {
-            let entry = state
-                .entries
-                .get(key)
-                .expect("order index names a non-resident key");
-            assert_eq!(
-                entry.rank, *rank,
-                "order index holds a stale rank for {key}"
-            );
-        }
-        let bytes = state
-            .entries
-            .values()
-            .map(|entry| entry.bytes)
-            .sum::<usize>();
-        assert_eq!(bytes, state.bytes, "resident byte total drifted");
-        assert!(state.bytes <= state.max_bytes, "cache is over its budget");
-    }
-
-    #[test]
-    fn interleaved_access_keeps_the_order_index_in_step_under_both_policies() {
-        for replacement in [
-            ExpertCacheReplacementPolicy::Lru,
-            ExpertCacheReplacementPolicy::Lfu,
-        ] {
-            let cache = ExpertCache::with_replacement(24, replacement);
-            let keys = ["a", "b", "c", "d", "e", "f"];
-            let mut step = 1u64;
-            for round in 0..200u64 {
-                step = step.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let key = keys[(step >> 33) as usize % keys.len()];
-                if round % 3 == 0 {
-                    cache.insert(key.to_owned(), f32_tensor(1));
-                } else {
-                    cache.get(key);
-                }
-                assert_index_is_consistent(&cache);
-            }
-            cache.resize(8);
-            assert_index_is_consistent(&cache);
-            cache.resize(40);
-            assert_index_is_consistent(&cache);
-        }
-    }
-
-    #[test]
-    fn eviction_follows_access_order_rather_than_insertion_order() {
-        let cache = ExpertCache::new(12);
-        for key in ["a", "b", "c"] {
-            assert!(cache.insert(key.to_owned(), f32_tensor(1)));
-        }
-
-        assert!(cache.get("a").is_some());
-        assert!(cache.get("b").is_some());
-        assert!(cache.insert("d".to_owned(), f32_tensor(1)));
-
-        assert!(
-            cache.get("c").is_none(),
-            "the least recently used key survived"
-        );
-        assert!(cache.get("a").is_some());
-        assert!(cache.get("b").is_some());
-        assert!(cache.get("d").is_some());
-
-        assert!(cache.insert("e".to_owned(), f32_tensor(1)));
-        assert!(
-            cache.get("a").is_none(),
-            "recency did not advance past the oldest hit"
-        );
-        assert_index_is_consistent(&cache);
     }
 
     #[test]

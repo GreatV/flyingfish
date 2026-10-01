@@ -1,5 +1,5 @@
 [package]
-name = "ff-cuda-build"
+name = "ff-cuda"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

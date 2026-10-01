@@ -1,10 +1,7 @@
 //! DeepSeek-V4.1-Flash checkpoint configuration.
-//!
-//! Field names mirror `config.json` in the checkpoint; the constants and
-//! defaults were verified against
-//! `models/deepseek-ai/DeepSeek-V4.1-Flash/config.json` on 2026-09-20.
 
 use anyhow::{Context, Result, ensure};
+use ff_core::quant::QuantFormat;
 use serde::Deserialize;
 use std::{fs, path::Path};
 
@@ -20,35 +17,36 @@ pub const FP4_WEIGHT_BLOCK: usize = 32;
 pub struct DeepseekV41Config {
     pub architectures: Vec<String>,
     pub model_type: String,
-    #[serde(default = "default_bos")]
     pub bos_token_id: u32,
-    #[serde(default = "default_eos")]
     pub eos_token_id: u32,
-    #[serde(default = "default_pad")]
     pub pad_token_id: u32,
     pub image_token_id: u32,
-    pub quantization_config: QuantizationConfig,
+    #[serde(rename = "quantization_config", deserialize_with = "block_fp8")]
+    pub quant: QuantFormat,
     pub text_config: TextConfig,
     pub vision_config: Option<VisionConfig>,
 }
 
-fn default_bos() -> u32 {
-    0
-}
-fn default_eos() -> u32 {
-    1
-}
-fn default_pad() -> u32 {
-    2
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct QuantizationConfig {
-    pub quant_method: String,
-    pub activation_scheme: String,
-    pub weight_block_size: [usize; 2],
-    pub scale_fmt: String,
-    pub expert_dtype: String,
+fn block_fp8<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<QuantFormat, D::Error> {
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    struct Raw {
+        weight_block_size: [usize; 2],
+    }
+    let format = QuantFormat::block_fp8(Raw::deserialize(deserializer)?.weight_block_size)
+        .map_err(D::Error::custom)?;
+    if format
+        != (QuantFormat::BlockFp8 {
+            block: FP8_WEIGHT_BLOCK,
+        })
+    {
+        return Err(D::Error::custom(format!(
+            "unsupported DeepSeek-V4.1 FP8 weight block {format:?}; expected {FP8_WEIGHT_BLOCK}"
+        )));
+    }
+    Ok(format)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -114,17 +112,11 @@ pub struct TextConfig {
     pub engram_pad_token_id: u32,
     pub engram_compressed_vocab_size: u32,
     pub num_nextn_predict_layers: usize,
-    #[serde(default)]
     pub dspark_block_size: usize,
-    #[serde(default)]
     pub dspark_noise_token_id: u32,
-    #[serde(default)]
     pub dspark_target_layer_ids: Vec<usize>,
-    #[serde(default)]
     pub dspark_markov_rank: usize,
-    #[serde(default)]
     pub dspark_n_routed_experts: usize,
-    #[serde(default)]
     pub dspark_num_experts_per_tok: usize,
 }
 
@@ -150,9 +142,11 @@ fn default_rms_norm_eps() -> f64 {
 
 impl DeepseekV41Config {
     pub fn from_model_dir(dir: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(dir.join("config.json"))
-            .with_context(|| format!("config.json under {}", dir.display()))?;
-        let cfg: Self = serde_json::from_str(&raw).context("parse config.json")?;
+        let path = dir.join("config.json");
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let cfg: Self = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}; restore checkpoint config.json and run ff text generate --adapter dsv41", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -235,14 +229,57 @@ mod tests {
     use ff_core::paths::checkpoint_dir;
 
     #[test]
-    fn parses_the_real_checkpoint_config() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
-        let dir = &dir;
-        if !dir.exists() {
-            return;
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
+    fn missing_published_ids_and_dspark_fields_name_the_command() {
+        let root = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|root| root.is_dir())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
+        println!("config checkpoint: {}", root.display());
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        for field in [
+            "bos_token_id",
+            "eos_token_id",
+            "pad_token_id",
+            "dspark_block_size",
+            "dspark_noise_token_id",
+            "dspark_target_layer_ids",
+            "dspark_markov_rank",
+            "dspark_n_routed_experts",
+            "dspark_num_experts_per_tok",
+        ] {
+            let mut value = original.clone();
+            let object = if field.starts_with("dspark_") {
+                value["text_config"].as_object_mut().unwrap()
+            } else {
+                value.as_object_mut().unwrap()
+            };
+            assert!(
+                object.remove(field).is_some(),
+                "the published field must exist"
+            );
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+            let error = DeepseekV41Config::from_model_dir(directory.path()).unwrap_err();
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(field) && error.contains("ff text generate"),
+                "{error}"
+            );
         }
+    }
+
+    #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
+    fn parses_the_real_checkpoint_config() {
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
+        let dir = &dir;
         let cfg = DeepseekV41Config::from_model_dir(dir).unwrap();
         assert_eq!(cfg.architectures, [DSV41_ARCHITECTURE]);
         assert_eq!(cfg.model_type, DSV41_MODEL_TYPE);
@@ -272,9 +309,7 @@ mod tests {
         assert_eq!(t.num_nextn_predict_layers, 3);
         assert_eq!(t.dspark_n_routed_experts, 128);
         assert_eq!(t.dspark_num_experts_per_tok, 3);
-        assert_eq!(cfg.quantization_config.weight_block_size, [32, 32]);
-        assert_eq!(cfg.quantization_config.scale_fmt, "ue8m0");
-        assert_eq!(cfg.quantization_config.expert_dtype, "fp4");
+        assert_eq!(cfg.quant, QuantFormat::BlockFp8 { block: 32 });
         let v = cfg.vision().unwrap();
         assert_eq!(v.num_hidden_layers, 32);
         assert_eq!(v.hidden_size, 1024);
@@ -284,16 +319,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash"]
     fn mismatched_engram_arrays_are_rejected() {
-        let Some(dir) = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash") else {
-            return;
-        };
+        let dir = checkpoint_dir("deepseek-ai/DeepSeek-V4.1-Flash")
+            .filter(|dir| dir.is_dir())
+            .expect("requires FF_MODELS_DIR with deepseek-ai/DeepSeek-V4.1-Flash");
         let dir = &dir;
-        if !dir.exists() {
-            return;
-        }
         let mut cfg = DeepseekV41Config::from_model_dir(dir).unwrap();
         cfg.text_config.engram_num_embeddings.pop();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn the_fp8_block_is_the_checkpoint_value_or_an_error() {
+        let quant = |block: [usize; 2]| {
+            let value = serde_json::json!({ "weight_block_size": block });
+            block_fp8(value)
+        };
+        assert_eq!(
+            quant([32, 32]).unwrap(),
+            QuantFormat::BlockFp8 {
+                block: FP8_WEIGHT_BLOCK
+            }
+        );
+        let error = quant([128, 128]).unwrap_err().to_string();
+        assert!(error.contains("128"), "{error}");
+        assert!(quant([32, 64]).is_err());
     }
 }

@@ -1,3 +1,4 @@
+#include <cuda_bf16.h>
 // Mega-kernel scaffolding: sense-reversing arrival-counter grid barrier
 // (§6) with a spin cap that traps — a wrong grid-vs-residency answer must
 // fail loud, not hang. No cooperative launch: the barrier works in normal
@@ -106,7 +107,7 @@ extern "C" __global__ void edge0_mega_stub(
 // in_dim <= 2048 (words <= 256, one word per thread).
 
 __device__ __forceinline__ void gemv8_row_total(
-    const unsigned int* packed, const float* scales, const float* biases,
+    const unsigned int* packed, const __nv_bfloat16* scales, const __nv_bfloat16* biases,
     int row, const float* x, int in_dim, int rank,
     const float* la, const float* lb, const float* ax,
     int tid, float* partials, float* out_total)
@@ -135,7 +136,7 @@ __device__ __forceinline__ void gemv8_row_total(
         if (w < words_per_row && (tid & 15) == 0) {
             const int group = w / 16;
             const int gi = row * (in_dim >> 6) + group;
-            partials[group] = scales[gi] * dot + biases[gi] * sumx;
+            partials[group] = __bfloat162float(scales[gi]) * dot + __bfloat162float(biases[gi]) * sumx;
         }
     }
     __syncthreads();
@@ -155,7 +156,7 @@ __device__ __forceinline__ void gemv8_row_total(
 }
 
 __device__ __forceinline__ void gemv4_row_total(
-    const unsigned int* packed, const float* scales, const float* biases,
+    const unsigned int* packed, const __nv_bfloat16* scales, const __nv_bfloat16* biases,
     int row, const float* xr, int in_dim, int rank,
     const float* lb, const float* ax,
     int tid, float* partials, float* out_total)
@@ -179,7 +180,7 @@ __device__ __forceinline__ void gemv4_row_total(
     if (w < words_per_row && (tid & 7) == 0) {
         const int group = w / 8;
         const int gi = row * (in_dim >> 6) + group;
-        partials[group] = scales[gi] * dot + biases[gi] * sumx;
+        partials[group] = __bfloat162float(scales[gi]) * dot + __bfloat162float(biases[gi]) * sumx;
     }
     __syncthreads();
     if (tid == 0) {
@@ -228,19 +229,19 @@ __device__ __forceinline__ void lora_ax(
 extern "C" __global__ void edge0_moe_mega(
     GridBarrier* bar, int cap,
     const unsigned int* __restrict__ r_packed,
-    const float* __restrict__ r_scales, const float* __restrict__ r_biases,
+    const __nv_bfloat16* __restrict__ r_scales, const __nv_bfloat16* __restrict__ r_biases,
     const float* __restrict__ r_la, const float* __restrict__ r_lb,
     int r_rows,
     const unsigned int* __restrict__ ss_packed,
-    const float* __restrict__ ss_scales, const float* __restrict__ ss_biases,
+    const __nv_bfloat16* __restrict__ ss_scales, const __nv_bfloat16* __restrict__ ss_biases,
     const float* __restrict__ ss_la, const float* __restrict__ ss_lb,
     float* __restrict__ ss_y,
     const unsigned int* __restrict__ sg_packed,
-    const float* __restrict__ sg_scales, const float* __restrict__ sg_biases,
+    const __nv_bfloat16* __restrict__ sg_scales, const __nv_bfloat16* __restrict__ sg_biases,
     const float* __restrict__ sg_la, const float* __restrict__ sg_lb,
     int sg_rows, float* __restrict__ sg_y,
     const unsigned int* __restrict__ su_packed,
-    const float* __restrict__ su_scales, const float* __restrict__ su_biases,
+    const __nv_bfloat16* __restrict__ su_scales, const __nv_bfloat16* __restrict__ su_biases,
     const float* __restrict__ su_la, const float* __restrict__ su_lb,
     float* __restrict__ su_y,
     const float* __restrict__ x, int in_dim, int rank,
@@ -255,7 +256,7 @@ extern "C" __global__ void edge0_moe_mega(
     const float* __restrict__ exd_scales, const float* __restrict__ exd_biases,
     float* __restrict__ down_y, int down_rows,
     const unsigned int* __restrict__ sd_packed,
-    const float* __restrict__ sd_scales, const float* __restrict__ sd_biases,
+    const __nv_bfloat16* __restrict__ sd_scales, const __nv_bfloat16* __restrict__ sd_biases,
     const float* __restrict__ sd_la, const float* __restrict__ sd_lb,
     float* __restrict__ sd_y,
     float* __restrict__ hidden,

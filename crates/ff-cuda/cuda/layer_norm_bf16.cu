@@ -120,7 +120,7 @@ __device__ __forceinline__ WelfordData compute_stats(
 
 }  // namespace
 
-extern "C" __global__ void qwen_layer_norm_bf16(
+extern "C" __global__ void layer_norm_bf16(
     int width,
     float epsilon,
     const __nv_bfloat16* __restrict__ input,

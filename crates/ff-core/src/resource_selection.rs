@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const RESOURCE_SELECTION_SCHEMA_VERSION: u32 = 1;
+pub const RESOURCE_SELECTION_SCHEMA_VERSION: u32 = 2;
 pub const MAX_RESOURCE_SELECTION_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
@@ -36,6 +36,8 @@ pub struct SelectedResourceAxis {
     pub axis: String,
     pub value: String,
     pub origin: SelectionOrigin,
+    /// The derivation steps behind a `cost_model` value.
+    pub inputs: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -96,8 +98,7 @@ pub struct ResourceCandidateObservation {
     pub shortfall: Option<CapacityShortfall>,
     #[serde(deserialize_with = "crate::required_option")]
     pub expected_cost: Option<ExpectedRequestCost>,
-    /// What was measured for this candidate, recorded as the observations
-    /// themselves rather than as identities standing in for them.
+    /// Measured observations for this candidate.
     pub evidence: Vec<serde_json::Value>,
 }
 
@@ -155,12 +156,7 @@ impl ResourcePhaseEstimate {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// What a selection was made against, recorded as the material itself.
-///
-/// These fields were digests of that material. A digest can say two runs
-/// differ but never which field moved, and reading everything it covers is
-/// work the run does not otherwise need. Recording the material lets a
-/// mismatch name the field, and [`Self::first_difference`] is what names it.
+/// Selection inputs recorded as material; first_difference names the changed field.
 pub struct ResourceSelectionProvenance {
     pub schema_version: u32,
     pub policy: serde_json::Value,
@@ -212,12 +208,12 @@ impl ResourceSelectionProvenance {
         }
         ensure!(
             self.selection_snapshot.schema_version == RESOURCE_SNAPSHOT_SCHEMA_VERSION,
-            "unsupported selection snapshot schema"
+            "unsupported selection snapshot schema_version; recapture with ff probe --json"
         );
         if let Some(snapshot) = &self.final_admission_snapshot {
             ensure!(
                 snapshot.schema_version == RESOURCE_SNAPSHOT_SCHEMA_VERSION,
-                "unsupported final admission snapshot schema"
+                "unsupported final admission snapshot schema_version; recapture with ff probe --json"
             );
         }
         ensure!(
@@ -320,8 +316,18 @@ impl ResourceSelectionProvenance {
             bytes.len() <= MAX_RESOURCE_SELECTION_BYTES,
             "resource selection exceeds size limit"
         );
-        let value: Self =
-            serde_json::from_slice(bytes).context("invalid resource selection JSON")?;
+        #[derive(Deserialize)]
+        struct Version {
+            schema_version: u32,
+        }
+        let Version { schema_version } = serde_json::from_slice(bytes)
+            .context("invalid resource selection JSON; recapture with ff probe --json")?;
+        ensure!(
+            schema_version == RESOURCE_SELECTION_SCHEMA_VERSION,
+            "resource selection schema {schema_version}, expected {RESOURCE_SELECTION_SCHEMA_VERSION}; rerun the command that wrote it"
+        );
+        let value: Self = serde_json::from_slice(bytes)
+            .context("invalid resource selection JSON; recapture with ff probe --json")?;
         value.validate()?;
         Ok(value)
     }
@@ -380,7 +386,7 @@ mod tests {
 
     fn record() -> ResourceSelectionProvenance {
         ResourceSelectionProvenance {
-            schema_version: 1,
+            schema_version: RESOURCE_SELECTION_SCHEMA_VERSION,
             policy: json!({"weight_source": "mmap", "expert_cache_bytes": 0}),
             selector_revision: "resource-policy-v1".into(),
             request: json!({"prompt_tokens": 10, "max_new_tokens": 4}),
@@ -391,7 +397,7 @@ mod tests {
             environment: None,
             mode: ResourcePolicyMode::Performance,
             selection_snapshot: ResourceSnapshot {
-                schema_version: 1,
+                schema_version: RESOURCE_SNAPSHOT_SCHEMA_VERSION,
                 measured_at_unix_ms: 1,
                 host_memory_available_bytes: None,
                 cgroup_v2_memory_limit: None,
@@ -399,7 +405,6 @@ mod tests {
                 cgroup_v2_memory_available_bytes: None,
                 device_free_memory_bytes: None,
                 host_device_memory_is_unified: None,
-                device_topology_probe_failed: false,
                 host_memory_total_bytes: None,
                 device_total_memory_bytes: None,
                 measurement_scope: ResourceMeasurementScopes {
@@ -435,6 +440,7 @@ mod tests {
                 axis: "weights.source".into(),
                 value: "mmap".into(),
                 origin: SelectionOrigin::Baseline,
+                inputs: vec![],
             }],
             candidates: vec![ResourceCandidateObservation {
                 candidate_id: "baseline".into(),
@@ -444,6 +450,25 @@ mod tests {
                 expected_cost: None,
                 evidence: vec![],
             }],
+        }
+    }
+
+    #[test]
+    fn missing_snapshot_totals_name_the_field_and_capture_command() {
+        for field in ["host_memory_total_bytes", "device_total_memory_bytes"] {
+            let mut value = serde_json::to_value(record()).unwrap();
+            value["selection_snapshot"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let error =
+                ResourceSelectionProvenance::from_json(&serde_json::to_vec(&value).unwrap())
+                    .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(field) && error.contains("ff probe"),
+                "{error}"
+            );
         }
     }
 
@@ -535,5 +560,19 @@ mod tests {
         assert!(phase.device_peak_bytes().is_err());
         phase.required_device_bytes = None;
         assert!(phase.device_peak_bytes().is_err());
+    }
+
+    #[test]
+    fn an_old_schema_names_its_version_and_a_corrupt_one_does_not() {
+        let mut value = serde_json::to_value(record()).unwrap();
+        value["schema_version"] = 1.into();
+        let old = ResourceSelectionProvenance::from_json(&serde_json::to_vec(&value).unwrap())
+            .unwrap_err();
+        assert!(old.to_string().contains("schema 1, expected 2"), "{old:#}");
+        value["schema_version"] = RESOURCE_SELECTION_SCHEMA_VERSION.into();
+        value.as_object_mut().unwrap().remove("axes");
+        let corrupt = ResourceSelectionProvenance::from_json(&serde_json::to_vec(&value).unwrap())
+            .unwrap_err();
+        assert!(!format!("{corrupt:#}").contains("schema"), "{corrupt:#}");
     }
 }
