@@ -12,18 +12,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: rustfmt
+          toolchain: 1.99.0
+          components: rustfmt, clippy
       - run: cargo fmt --all --check
 
   clippy-no-cuda:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: clippy
+          toolchain: 1.99.0
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: no-cuda
@@ -42,7 +44,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config zstd
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable --component clippy
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 --component clippy --component rustfmt
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2

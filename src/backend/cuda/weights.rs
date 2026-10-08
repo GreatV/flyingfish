@@ -70,9 +70,7 @@ impl Loader<'_> {
             for chunk in t.data().chunks(self.staging.len() * 2) {
                 let len = chunk.len() / 2;
                 let buf = self.staging.as_mut_slice()?;
-                for (v, bytes) in buf[..len].iter_mut().zip(chunk.chunks_exact(2)) {
-                    *v = bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]]));
-                }
+                decode_bf16(chunk, &mut buf[..len]);
                 let mut view = dst.slice_mut(offset..offset + len);
                 self.stream
                     .memcpy_htod(&self.staging.as_slice()?[..len], &mut view)?;
@@ -140,6 +138,12 @@ pub(crate) fn checkpoint<T>(
     Ok(value)
 }
 
+fn decode_bf16(bytes: &[u8], values: &mut [bf16]) {
+    for (value, bytes) in values.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        *value = bf16::from_bits(u16::from_le_bytes(*bytes));
+    }
+}
+
 impl Weights {
     pub fn load(dir: &Path, c: &Config, d: &Device) -> Result<Self> {
         checkpoint(dir, d, |l| {
@@ -191,5 +195,21 @@ impl Weights {
                 bytes,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_bf16;
+    use half::bf16;
+
+    #[test]
+    fn checkpoint_bytes_preserve_bf16_bits() {
+        let bits = [0u16, 0x8000, 0x0001, 0x3f80, 0xbf80, 0x7f80, 0xff80, 0x7fc1];
+        let mut bytes: Vec<_> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        bytes.push(0xab);
+        let mut values = vec![bf16::ZERO; bits.len()];
+        decode_bf16(&bytes, &mut values);
+        assert_eq!(values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), bits);
     }
 }

@@ -48,8 +48,10 @@ impl Trace {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("missing trace tensor {name}"))?;
         Ok(bytes
-            .chunks_exact(4)
-            .map(|v| f32::from_le_bytes(v.try_into().expect("float width")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
             .collect())
     }
 
@@ -93,5 +95,32 @@ impl Trace {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("missing trace tensor {name}"))?
             .0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Trace;
+
+    #[test]
+    fn trace_values_preserve_ieee754_bits() {
+        let bits = [
+            0u32, 0x80000000, 1, 0x3f800000, 0xbf800000, 0x7f800000, 0xff800000, 0x7fc12345,
+        ];
+        let mut bytes: Vec<_> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        bytes.extend([0xaa, 0xbb, 0xcc]);
+        let mut trace = Trace::default();
+        trace
+            .tensors
+            .insert("raw".into(), (vec![bits.len()], bytes));
+        assert_eq!(
+            trace
+                .values("raw")
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            bits
+        );
     }
 }

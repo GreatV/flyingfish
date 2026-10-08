@@ -422,15 +422,17 @@ fn floats(t: TensorView<'_>) -> Result<Vec<f32>> {
     Ok(match t.dtype() {
         Dtype::F32 => t
             .data()
-            .chunks_exact(4)
-            .map(|v| f32::from_le_bytes(v.try_into().expect("float width")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
             .collect(),
         Dtype::BF16 => t
             .data()
-            .chunks_exact(2)
-            .map(|v| {
-                bf16::from_bits(u16::from_le_bytes(v.try_into().expect("BF16 width"))).to_f32()
-            })
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| bf16::from_bits(u16::from_le_bytes(*v)).to_f32())
             .collect(),
         dtype => anyhow::bail!("reference tensor has unsupported dtype {dtype:?}"),
     })
@@ -439,10 +441,10 @@ fn floats(t: TensorView<'_>) -> Result<Vec<f32>> {
 fn ids(t: TensorView<'_>) -> Result<Vec<u32>> {
     ensure!(t.dtype() == Dtype::I64, "reference token ids must be I64");
     t.data()
-        .chunks_exact(8)
-        .map(|v| {
-            u32::try_from(i64::from_le_bytes(v.try_into().expect("I64 width"))).map_err(Into::into)
-        })
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|v| u32::try_from(i64::from_le_bytes(*v)).map_err(Into::into))
         .collect()
 }
 
@@ -832,6 +834,41 @@ pub fn compare_saved(fixture: &Path, log: &Path, rules: &Rules) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_byte_decoding_preserves_bits_and_id_bounds() -> Result<()> {
+        let bits = [
+            0u32, 0x80000000, 1, 0x3f800000, 0xbf800000, 0x7f800000, 0xff800000, 0x7fc12345,
+        ];
+        let bytes: Vec<_> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tensor = TensorView::new(Dtype::F32, vec![bits.len()], &bytes)?;
+        assert_eq!(
+            floats(tensor)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            bits
+        );
+        let bits = [0u16, 0x8000, 1, 0x3f80, 0xbf80, 0x7f80, 0xff80, 0x7fc1];
+        let bytes: Vec<_> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tensor = TensorView::new(Dtype::BF16, vec![bits.len()], &bytes)?;
+        assert_eq!(
+            floats(tensor)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            bits.map(|v| u32::from(v) << 16)
+        );
+        let values = [0i64, 130559, i64::from(u32::MAX)];
+        let bytes: Vec<_> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tensor = TensorView::new(Dtype::I64, vec![values.len()], &bytes)?;
+        assert_eq!(ids(tensor)?, [0, 130559, u32::MAX]);
+        for value in [-1i64, i64::from(u32::MAX) + 1] {
+            let bytes = value.to_le_bytes();
+            assert!(ids(TensorView::new(Dtype::I64, vec![1], &bytes)?).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn systematic_gates_detect_small_but_persistent_errors() -> Result<()> {

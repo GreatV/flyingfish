@@ -13,22 +13,56 @@ fn tensor(d: &Device, path: &Path, name: &str, shape: &[usize]) -> Result<CudaSl
     let tensors = SafeTensors::deserialize(&map)?;
     let t = tensors.tensor(name)?;
     ensure!(t.shape() == shape, "test tensor {name}: wrong shape");
-    let values = match t.dtype() {
-        Dtype::BF16 => t
-            .data()
-            .chunks_exact(2)
-            .map(|v| bf16::from_bits(u16::from_le_bytes([v[0], v[1]])))
-            .collect::<Vec<_>>(),
-        Dtype::F32 => t
-            .data()
-            .chunks_exact(4)
-            .map(|v| bf16::from_f32(f32::from_le_bytes(v.try_into().expect("FP32 width"))))
-            .collect(),
-        dtype => anyhow::bail!("test tensor {name}: unsupported {dtype:?}"),
-    };
+    let values = tensor_values(t)?;
     let output = d.upload.clone_htod(&values)?;
     d.finish_upload()?;
     Ok(output)
+}
+
+fn tensor_values(t: safetensors::tensor::TensorView<'_>) -> Result<Vec<bf16>> {
+    Ok(match t.dtype() {
+        Dtype::BF16 => t
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| bf16::from_bits(u16::from_le_bytes(*v)))
+            .collect::<Vec<_>>(),
+        Dtype::F32 => t
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| bf16::from_f32(f32::from_le_bytes(*v)))
+            .collect(),
+        dtype => anyhow::bail!("test tensor has unsupported dtype {dtype:?}"),
+    })
+}
+
+#[test]
+fn markov_tensor_bytes_and_rounding() -> Result<()> {
+    use safetensors::tensor::TensorView;
+    let bits = [0u16, 0x8000, 1, 0x3f80, 0x7fc1];
+    let bytes: Vec<_> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let tensor = TensorView::new(Dtype::BF16, vec![bits.len()], &bytes)?;
+    assert_eq!(
+        tensor_values(tensor)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        bits
+    );
+    let values = [0u32, 0x80000000, 0x3f808000, 0x3f818000, 0xbf808000].map(f32::from_bits);
+    let bytes: Vec<_> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let tensor = TensorView::new(Dtype::F32, vec![values.len()], &bytes)?;
+    assert_eq!(
+        tensor_values(tensor)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        [0, 0x8000, 0x3f80, 0x3f82, 0xbf80]
+    );
+    Ok(())
 }
 
 fn weights(d: &Device) -> Result<(CudaSlice<bf16>, CudaSlice<bf16>)> {
