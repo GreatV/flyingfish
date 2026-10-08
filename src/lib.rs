@@ -1,0 +1,16 @@
+pub mod backend;
+pub mod bench;
+pub mod config;
+pub mod dspark;
+pub mod model;
+pub mod prefill;
+pub mod spec;
+pub mod tensors;
+pub mod tokenizer;
+pub mod trace;
+pub mod tree;
+pub mod tree_replay;
+pub mod verify;
+
+#[cfg(test)]
+mod build_arch;

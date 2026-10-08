@@ -1,0 +1,19 @@
+FlashAttention
+https://github.com/Dao-AILab/flash-attention
+Commit: 94e22c906678e5483fa0e9e24d8e787bc2c0ed4c
+License: BSD-3-Clause, retained at flash-attention/LICENSE.
+Copyright notices are retained in each upstream header.
+
+The vendored subset contains the FlashAttention-2 forward headers.
+flash_fwd_launch_template.h changes its CUDA exception header include to
+cuda_check.h, a standalone CUDA error adapter. The remaining upstream headers
+are unmodified. adapter.cu instantiates the upstream BF16, d128, dropout-free
+64x64 forward path with an explicit causal flag and exposes a C host interface.
+build.rs selects the native CUDA architectures. Q is strided
+inside the packed QKV projection; K/V retain the engine's head-major cache.
+
+CUTLASS
+https://github.com/NVIDIA/cutlass
+Commit: 7127592069c2fe01b041e174ba4345ef9b279671
+License: BSD-3-Clause, retained at cutlass/LICENSE.txt.
+Only C++ headers under include/ are vendored; no Python DSL code is included.
