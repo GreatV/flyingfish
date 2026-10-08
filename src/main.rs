@@ -412,8 +412,15 @@ fn bench(
     )
 }
 
+fn normalize_budget(cli: &mut Cli) {
+    if cli.draft_model.is_none() {
+        cli.kernels.spec_budget = backend::SpecBudget::Chain;
+    }
+}
+
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
+    normalize_budget(&mut cli);
     cli.model = cli
         .model
         .canonicalize()
@@ -867,6 +874,47 @@ mod tests {
         assert!(cli.draft_model.is_none());
         assert_eq!(cli.kernels.spec_budget, backend::SpecBudget::Tree16);
         assert_eq!(cli.capacity, 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn plain_generate_normalizes_budget_before_model_load() -> Result<()> {
+        let mut cli = Cli::try_parse_from([
+            "flyingfish",
+            "--model",
+            "model",
+            "--capacity",
+            "8",
+            "generate",
+            "--tokens",
+            "1,2,3,4,5,6,7",
+            "--max-new-tokens",
+            "1",
+        ])?;
+        assert_eq!(cli.kernels.spec_budget, backend::SpecBudget::Tree16);
+        normalize_budget(&mut cli);
+        let settings = cli.kernels.clone();
+        assert_eq!(settings.spec_budget, backend::SpecBudget::Chain);
+        assert!(!settings.spec_budget.is_tree());
+        assert!(settings.spec_budget.rows() <= cli.capacity);
+        check_generation_capacity(7, 1, cli.capacity)?;
+        Ok(())
+    }
+
+    #[test]
+    fn draft_generate_keeps_default_tree_budget() -> Result<()> {
+        let mut cli = Cli::try_parse_from([
+            "flyingfish",
+            "--model",
+            "model",
+            "--draft-model",
+            "draft",
+            "generate",
+            "--prompt",
+            "test",
+        ])?;
+        normalize_budget(&mut cli);
+        assert_eq!(cli.kernels.spec_budget, backend::SpecBudget::Tree16);
         Ok(())
     }
 
