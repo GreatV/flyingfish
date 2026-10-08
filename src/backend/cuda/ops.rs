@@ -12,6 +12,7 @@ pub struct Ops {
     pub kv_write: CudaFunction,
     pub act: CudaFunction,
     pub argmax: CudaFunction,
+    pub argmax_rows: CudaFunction,
     pub advance: CudaFunction,
     pub residual: CudaFunction,
 }
@@ -32,6 +33,7 @@ impl Ops {
             kv_write: rope.load_function("kv_write")?,
             act: act.load_function("silu_mul")?,
             argmax: sample.load_function("argmax")?,
+            argmax_rows: sample.load_function("argmax_rows_bf16")?,
             advance: sample.load_function("advance")?,
             residual: norm.load_function("residual")?,
         })
