@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy-no-cuda:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: no-cuda
+      - run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - run: cargo test --no-default-features --all-targets
+
+  clippy-cuda:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:13.2.0-devel-ubuntu24.04
+    env:
+      CUDA_ARCH_LIST: "8.6;8.9"
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - name: Install build tools and Rust
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config zstd
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable --component clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cuda-13.2-sm86-sm89
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST CUDA
+      - run: cargo clippy --all-targets -- -D warnings
