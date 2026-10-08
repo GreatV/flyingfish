@@ -414,10 +414,6 @@ fn bench(
 
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
-    ensure!(
-        !cli.kernels.spec_budget.is_tree() || cli.draft_model.is_some(),
-        "--spec-budget tree16/tree32/tree64 requires --draft-model"
-    );
     cli.model = cli
         .model
         .canonicalize()
@@ -819,13 +815,19 @@ mod tests {
     }
 
     #[test]
-    fn speculation_budget_cli_defaults_to_chain_and_rejects_unsupported_rows() {
+    fn speculation_budget_defaults_to_tree16() {
         let default = Cli::try_parse_from(["flyingfish", "--model", "model", "inspect"]).unwrap();
         assert_eq!(
             default.kernels.spec_budget,
-            flyingfish::backend::SpecBudget::Chain
+            flyingfish::backend::SpecBudget::Tree16
         );
-        for (value, rows) in [("tree16", 16), ("tree32", 32), ("tree64", 64)] {
+        assert_eq!(default.kernels.spec_budget, backend::SpecBudget::default());
+        assert_eq!(default.capacity, 4096);
+    }
+
+    #[test]
+    fn explicit_budgets_remain_selectable_and_reject_unsupported_rows() {
+        for (value, rows) in [("chain", 8), ("tree16", 16), ("tree32", 32), ("tree64", 64)] {
             let cli = Cli::try_parse_from([
                 "flyingfish",
                 "--model",
@@ -850,5 +852,73 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn default_generate_without_draft_parses() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "flyingfish",
+            "--model",
+            "model",
+            "generate",
+            "--prompt",
+            "test",
+        ])?;
+        assert!(cli.draft_model.is_none());
+        assert_eq!(cli.kernels.spec_budget, backend::SpecBudget::Tree16);
+        assert_eq!(cli.capacity, 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn flattened_global_budget_requires_top_level_draft_only_when_explicit() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        for command in [
+            vec!["inspect"],
+            vec!["generate", "--prompt", "test"],
+            vec!["bench", "--prompt", "test"],
+        ] {
+            let base = ["flyingfish", "--model", "model"];
+            let default =
+                Cli::try_parse_from(base.into_iter().chain(command.iter().copied())).unwrap();
+            assert_eq!(default.kernels.spec_budget, backend::SpecBudget::Tree16);
+            assert!(default.draft_model.is_none());
+            for budget in ["chain", "tree16", "tree32", "tree64"] {
+                for after_command in [false, true] {
+                    let mut args = base.to_vec();
+                    if after_command {
+                        args.extend(&command);
+                    }
+                    args.extend(["--spec-budget", budget]);
+                    if !after_command {
+                        args.extend(&command);
+                    }
+                    let error = Cli::try_parse_from(&args)
+                        .err()
+                        .expect("explicit budget needs draft");
+                    assert_eq!(
+                        error.kind(),
+                        clap::error::ErrorKind::MissingRequiredArgument
+                    );
+                    assert!(error.to_string().contains("--draft-model"));
+                    if after_command {
+                        args.extend(["--draft-model", "draft"]);
+                    } else {
+                        args.splice(3..3, ["--draft-model", "draft"]);
+                    }
+                    let cli = Cli::try_parse_from(args).unwrap();
+                    assert_eq!(cli.draft_model, Some(PathBuf::from("draft")));
+                    assert_eq!(
+                        cli.kernels.spec_budget.rows(),
+                        if budget == "chain" {
+                            8
+                        } else {
+                            budget[4..].parse::<usize>().unwrap()
+                        }
+                    );
+                }
+            }
+        }
     }
 }

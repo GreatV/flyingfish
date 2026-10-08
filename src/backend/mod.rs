@@ -40,10 +40,11 @@ impl Top4 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SpecBudget {
     Chain,
+    #[default]
     Tree16,
     Tree32,
     Tree64,
@@ -107,7 +108,7 @@ impl SpecBudget {
 pub struct Settings {
     #[arg(long, global = true, value_enum, default_value_t = TreeBuilder::Waves)]
     pub tree_builder: TreeBuilder,
-    #[arg(long, global = true, value_enum, default_value_t = SpecBudget::Chain)]
+    #[arg(long, global = true, value_enum, default_value_t = SpecBudget::default(), requires = "draft_model")]
     pub spec_budget: SpecBudget,
     #[arg(long, global = true, default_value_t = true, action = clap::ArgAction::Set)]
     pub spec_graph: bool,

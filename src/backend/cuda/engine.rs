@@ -12,9 +12,7 @@ use crate::{
     trace::Trace,
 };
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{
-    CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtrMut, PushKernelArg, sys,
-};
+use cudarc::driver::{CudaGraph, CudaSlice, CudaStream, DevicePtrMut, PushKernelArg, sys};
 use half::bf16;
 use std::{
     path::{Path, PathBuf},
@@ -163,7 +161,6 @@ struct Spec {
     inject_graphs: Vec<Option<CudaGraph>>,
     tree: Option<super::tree::State>,
     tree_attention: Option<super::verification::Verification>,
-    tree_argmax: Option<CudaFunction>,
     active_rows: usize,
     graph: bool,
     verification: Option<super::verification::Verification>,
@@ -171,6 +168,7 @@ struct Spec {
     capture: CudaSlice<bf16>,
     logits: CudaSlice<bf16>,
     predictions: CudaSlice<u32>,
+    row_counts: CudaSlice<i32>,
 }
 
 #[derive(Clone, Copy)]
@@ -857,34 +855,22 @@ impl Engine {
                         c.vocab_size,
                         h,
                     )?;
-                    if is_tree {
-                        let tree = spec.tree.as_ref().context("tree State is not enabled")?;
-                        unsafe {
-                            s.launch_builder(
-                                spec.tree_argmax
-                                    .as_ref()
-                                    .context("argmax_rows_bf16 is not loaded")?,
-                            )
+                    let valid_rows = if is_tree {
+                        spec.tree
+                            .as_ref()
+                            .context("tree State is not enabled")?
+                            .valid_rows()
+                            .slice(..1)
+                    } else {
+                        spec.row_counts.slice(rows - 1..rows)
+                    };
+                    unsafe {
+                        s.launch_builder(&self.ops.argmax_rows)
                             .arg(&spec.logits)
                             .arg(&mut spec.predictions)
                             .arg(&(c.vocab_size as i32))
-                            .arg(tree.valid_rows())
+                            .arg(&valid_rows)
                             .launch(grid(rows, 1024))?;
-                        }
-                    } else {
-                        for row in 0..rows {
-                            unsafe {
-                                s.launch_builder(&self.ops.argmax)
-                                    .arg(
-                                        &spec
-                                            .logits
-                                            .slice(row * c.vocab_size..(row + 1) * c.vocab_size),
-                                    )
-                                    .arg(&mut spec.predictions.slice_mut(row..row + 1))
-                                    .arg(&(c.vocab_size as i32))
-                                    .launch(grid(1, 1024))?;
-                            }
-                        }
                     }
                     spec.active_rows = step.rows;
                     return Ok(());
@@ -1288,6 +1274,9 @@ impl Engine {
                 .prepare(rows, self.config.vocab_size, self.config.hidden_size)?;
         }
         let s = &self.device.stream;
+        let count_values: Vec<_> = (1..=rows).map(|n| n as i32).collect();
+        let row_counts = s.clone_htod(&count_values)?;
+        s.synchronize()?;
         self.spec = Some(Spec {
             eos: Vec::new(),
             tree_verify_graph: None,
@@ -1304,7 +1293,6 @@ impl Engine {
                 None
             },
             tree_attention: None,
-            tree_argmax: None,
             active_rows: 0,
             graph: self.spec_graph,
             draft_graph: None,
@@ -1315,6 +1303,7 @@ impl Engine {
             capture: s.alloc_zeros(self.workspace_rows * 5 * self.config.hidden_size)?,
             logits: s.alloc_zeros(rows * self.config.vocab_size)?,
             predictions: s.alloc_zeros(rows)?,
+            row_counts,
         });
         eprintln!(
             "{}",
@@ -1389,16 +1378,12 @@ impl Engine {
             },
             plan,
         )?;
-        let argmax = super::cubin::module(&self.device.ctx, "sample")?
-            .load_function("argmax_rows_bf16")
-            .context("tree verification requires sample.cu argmax_rows_bf16")?;
         eprintln!(
             "{}",
             serde_json::json!({"backend_setup":{"role":"tree","rows":rows,"attention":plan,"selection":selection,"calibration":measured}})
         );
         let spec = self.spec.as_mut().context("tree requires draft State")?;
         spec.tree_attention = Some(attention);
-        spec.tree_argmax = Some(argmax);
         Ok(())
     }
 
@@ -2397,3 +2382,7 @@ impl Engine {
         Ok(output)
     }
 }
+
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod tests;

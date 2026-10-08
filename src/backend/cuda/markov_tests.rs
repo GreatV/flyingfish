@@ -7,6 +7,107 @@ use memmap2::MmapOptions;
 use safetensors::{Dtype, SafeTensors};
 use std::{hint::black_box, path::Path, time::Instant};
 
+#[path = "markov_reference.rs"]
+mod reference;
+
+const BATCH_COUNTS: [usize; 16] = [1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128, 129];
+
+#[derive(Default, serde::Serialize)]
+struct Differences {
+    requests: usize,
+    tokens: usize,
+    logp: usize,
+    lse: usize,
+    max_logp_abs: f64,
+    max_lse_abs: f64,
+    actual_mass_max: f64,
+}
+
+impl Differences {
+    fn track(
+        &mut self,
+        actual: &crate::backend::Top4,
+        expected: &crate::backend::Top4,
+        context: &str,
+        request: (u8, u32),
+    ) {
+        self.tokens += usize::from(actual.tokens != expected.tokens);
+        self.logp += usize::from(actual.logp.map(f32::to_bits) != expected.logp.map(f32::to_bits));
+        self.lse += usize::from(actual.lse.to_bits() != expected.lse.to_bits());
+        self.actual_mass_max = self
+            .actual_mass_max
+            .max(actual.logp.iter().map(|&v| f64::from(v).exp()).sum());
+        for (&a, &b) in actual.logp.iter().zip(&expected.logp) {
+            self.max_logp_abs = self.max_logp_abs.max((f64::from(a) - f64::from(b)).abs());
+        }
+        self.max_lse_abs = self
+            .max_lse_abs
+            .max((f64::from(actual.lse) - f64::from(expected.lse)).abs());
+        if !actual.bits_equal(expected) {
+            self.requests += 1;
+            if self.requests <= 8 {
+                println!(
+                    "{}",
+                    serde_json::json!({"markov_bit_difference":{"context":context,"request":request,
+                    "actual":{"tokens":actual.tokens,"logp":actual.logp,"lse":actual.lse,"logp_bits":actual.logp.map(f32::to_bits),"lse_bits":actual.lse.to_bits()},
+                    "expected":{"tokens":expected.tokens,"logp":expected.logp,"lse":expected.lse,"logp_bits":expected.logp.map(f32::to_bits),"lse_bits":expected.lse.to_bits()}}})
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bit_diagnostics_keep_float_and_token_differences_separate() {
+    let expected = crate::backend::Top4 {
+        tokens: [0, 1, 2, 3],
+        logp: [-4.0, -5.0, -6.0, -7.0],
+        lse: 1.0,
+    };
+    let mut actual = expected.clone();
+    actual.logp[0] = f32::from_bits(actual.logp[0].to_bits() + 1);
+    let mut stats = Differences::default();
+    stats.track(&actual, &expected, "one-ulp test", (0, 0));
+    assert_eq!(
+        (stats.requests, stats.tokens, stats.logp, stats.lse),
+        (1, 0, 1, 0)
+    );
+    assert_eq!(
+        stats.max_logp_abs,
+        (f64::from(actual.logp[0]) - f64::from(expected.logp[0])).abs()
+    );
+    actual = expected.clone();
+    actual.tokens[0] = 4;
+    actual.lse = f32::from_bits(actual.lse.to_bits() + 1);
+    stats.track(&actual, &expected, "token and lse test", (0, 0));
+    assert_eq!(
+        (stats.requests, stats.tokens, stats.logp, stats.lse),
+        (2, 1, 1, 1)
+    );
+}
+
+fn chain_requests(path: &Path) -> Result<Vec<(u8, u32)>> {
+    let trace = crate::trace::Trace::read(path)?;
+    let block = trace.values("draft_block_ids")?;
+    let proposals = trace.values("proposals")?;
+    ensure!(
+        block.len() == 7 && proposals.len() == 7,
+        "fixture chain extent mismatch"
+    );
+    Ok((0..7)
+        .map(|row| {
+            (
+                row as u8,
+                if row == 0 {
+                    block[0] as u32
+                } else {
+                    proposals[row - 1] as u32
+                },
+            )
+        })
+        .collect())
+}
+
 fn tensor(d: &Device, path: &Path, name: &str, shape: &[usize]) -> Result<CudaSlice<bf16>> {
     let file = std::fs::File::open(path)?;
     let map = unsafe { MmapOptions::new().map(&file)? };
@@ -102,6 +203,7 @@ fn batch_matches_single() -> Result<()> {
     let fixtures = std::env::var("FF_MARKOV_FIXTURES").context("FF_MARKOV_FIXTURES missing")?;
     let mut markov = Markov::new(&d)?;
     let mut compared = 0;
+    let mut differences = Differences::default();
     for (seed, file) in ["r0008", "r0042", "r0089", "r0140"].iter().enumerate() {
         let base = tensor(
             &d,
@@ -110,7 +212,20 @@ fn batch_matches_single() -> Result<()> {
             &[7, 130560],
         )?;
         assert!(markov.distributions_batch(&base, &w1, &w2, &[])?.is_empty());
-        for p in [1, 2, 7, 8, 9, 16, 32, 63, 64, 65, 128, 129] {
+        let req = chain_requests(&Path::new(&fixtures).join(format!("{file}.safetensors")))?;
+        let batch = markov.distributions_batch(&base, &w1, &w2, &req)?;
+        for (index, request) in req.iter().enumerate() {
+            let single = markov.distributions_batch(&base, &w1, &w2, &[*request])?;
+            differences.track(
+                &batch[index],
+                &single[0],
+                &format!("{file} chain row{index}"),
+                *request,
+            );
+            compared += 1;
+        }
+        for p in BATCH_COUNTS {
+            let before = differences.requests;
             let mut req = requests(p, seed);
             req.reverse();
             if p > 1 {
@@ -120,17 +235,17 @@ fn batch_matches_single() -> Result<()> {
             ensure!(batch.len() == req.len(), "batch lost requests");
             for (i, request) in req.iter().enumerate() {
                 let single = markov.distributions_batch(&base, &w1, &w2, &[*request])?;
-                ensure!(
-                    batch[i].bits_equal(&single[0]),
-                    "batch mismatch fixture={file} P={p} index={i} request={request:?} batch={:?} single={:?}",
-                    batch[i],
-                    single[0]
+                differences.track(
+                    &batch[i],
+                    &single[0],
+                    &format!("{file} P{p} index{i}"),
+                    *request,
                 );
                 compared += 1;
             }
             println!(
                 "{}",
-                serde_json::json!({"markov_batch_equivalence":{"fixture":file,"P":p,"pass":true,"bits":"tokens/u32, logp/f32, lse/f32"}})
+                serde_json::json!({"markov_batch_equivalence":{"fixture":file,"P":p,"pass":differences.requests==before,"bits":"tokens/u32, logp/f32, lse/f32"}})
             );
         }
         let mut invalid = requests(65, seed);
@@ -143,7 +258,78 @@ fn batch_matches_single() -> Result<()> {
     }
     println!(
         "{}",
-        serde_json::json!({"markov_batch_equivalence_summary":{"requests_compared":compared,"pass":true}})
+        serde_json::json!({"markov_batch_equivalence_summary":{"requests_compared":compared,"pass":differences.requests==0,"differences":differences}})
+    );
+    ensure!(
+        differences.requests == 0,
+        "Markov batch/single bit differences: {} requests",
+        differences.requests
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a reserved GPU window and FF_MARKOV_DRAFT/FF_MARKOV_FIXTURES/FF_MARKOV_V1_DIR"]
+fn top4_matches_reference() -> Result<()> {
+    let d = Device::new(0)?;
+    let (w1, w2) = weights(&d)?;
+    let fixtures = std::env::var("FF_MARKOV_FIXTURES").context("FF_MARKOV_FIXTURES missing")?;
+    let mut markov = Markov::new(&d)?;
+    let mut reference = reference::Reference::new(&d)?;
+    let mut compared = 0;
+    let mut differences = Differences::default();
+    for (seed, file) in ["r0008", "r0042", "r0089", "r0140"].iter().enumerate() {
+        let base = tensor(
+            &d,
+            &Path::new(&fixtures).join(format!("{file}.safetensors")),
+            "B",
+            &[7, 130560],
+        )?;
+        let req = chain_requests(&Path::new(&fixtures).join(format!("{file}.safetensors")))?;
+        let got = markov.distributions_batch(&base, &w1, &w2, &req)?;
+        let expected = reference.batch(&base, &w1, &w2, &req)?;
+        for (index, (actual, old)) in got.iter().zip(&expected).enumerate() {
+            differences.track(actual, old, &format!("{file} chain row{index}"), req[index]);
+            compared += 1;
+        }
+        for p in BATCH_COUNTS {
+            let before = differences.requests;
+            let before_tokens = differences.tokens;
+            let mut req = requests(p, seed);
+            req.reverse();
+            if p > 1 {
+                req[p - 1] = req[0];
+            }
+            let got = markov.distributions_batch(&base, &w1, &w2, &req)?;
+            let expected = reference.batch(&base, &w1, &w2, &req)?;
+            ensure!(
+                got.len() == req.len() && expected.len() == req.len(),
+                "reference batch lost requests"
+            );
+            for (index, (actual, old)) in got.iter().zip(&expected).enumerate() {
+                differences.track(
+                    actual,
+                    old,
+                    &format!("{file} P{p} index{index}"),
+                    req[index],
+                );
+                compared += 1;
+            }
+            println!(
+                "{}",
+                serde_json::json!({"markov_reference_equivalence":{"fixture":file,"P":p,"token_bit_gate":differences.tokens==before_tokens,"float_bit_differences_diagnostic":differences.requests-before}})
+            );
+        }
+    }
+    println!(
+        "{}",
+        serde_json::json!({"markov_reference_summary":{"requests_compared":compared,"pass":differences.tokens==0 && differences.actual_mass_max<=1.000001,"differences":differences,"rule":"top4 token bits equal; FP32 bit equality is diagnostic; FP64 accuracy checked separately"}})
+    );
+    ensure!(
+        differences.tokens == 0 && differences.actual_mass_max <= 1.000001,
+        "Markov v1/version token differences={} probability mass={}",
+        differences.tokens,
+        differences.actual_mass_max
     );
     Ok(())
 }

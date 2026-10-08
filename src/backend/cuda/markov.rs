@@ -21,20 +21,20 @@ impl Markov {
         let module = cubin::module(&d.ctx, "markov")?;
         let s = &d.stream;
         ensure!(
-            d.info.shared_bytes >= 40960,
-            "Markov kernels require 40960 bytes shared memory"
+            d.info.shared_bytes >= 32768,
+            "Markov v2 kernels require 32768 bytes static shared memory"
         );
         Ok(Self {
             stream: s.clone(),
             first: [1, 8, 64]
                 .iter()
-                .map(|p| module.load_function(&format!("markov_top4_phase1_p{p}")))
+                .map(|p| module.load_function(&format!("markov2_top4_phase1_p{p}")))
                 .collect::<std::result::Result<_, _>>()?,
-            second: module.load_function("markov_top4_phase2")?,
+            second: module.load_function("markov2_top4_phase2")?,
             tokens: s.alloc_zeros(64)?,
             rows: s.alloc_zeros(64)?,
-            partial_top: s.alloc_zeros(16320 * 64 * 8)?,
-            partial_lse: s.alloc_zeros(16320 * 64 * 2)?,
+            partial_top: s.alloc_zeros(510 * 64 * 8)?,
+            partial_lse: s.alloc_zeros(510 * 64 * 2)?,
             output: s.alloc_zeros(64 * 9)?,
         })
     }
@@ -93,9 +93,9 @@ impl Markov {
                 .arg(&256i32)
                 .arg(&(p as i32))
                 .launch(LaunchConfig {
-                    grid_dim: (16320, 1, 1),
+                    grid_dim: (510, 1, 1),
                     block_dim: (256, 1, 1),
-                    shared_mem_bytes: (616 * pt) as u32,
+                    shared_mem_bytes: 0,
                 })?;
             let mut output = self.output.slice_mut(..p * 9);
             let (mut top, mut floats) = output.split_at_mut(p * 4);
@@ -111,8 +111,8 @@ impl Markov {
                 .arg(&pt)
                 .launch(LaunchConfig {
                     grid_dim: (p as u32, 1, 1),
-                    block_dim: (1024, 1, 1),
-                    shared_mem_bytes: 40960,
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
                 })?;
         }
         let mut output = vec![0u32; p * 9];
