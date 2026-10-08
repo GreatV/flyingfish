@@ -252,6 +252,20 @@ fn output_path(path: &Path, model: &Path) -> Result<PathBuf> {
     Ok(result)
 }
 
+fn check_generation_capacity(prompt: usize, count: usize, capacity: usize) -> Result<()> {
+    ensure!(count > 0, "max-new-tokens must be positive");
+    // Prefill emits the first token; count - 1 decode steps each write one KV row.
+    // Graph capture requires at least one free slot after prefill.
+    let required = prompt
+        .checked_add((count - 1).max(1))
+        .context("prompt and generation required KV capacity overflows usize")?;
+    ensure!(
+        required <= capacity,
+        "prompt and generation require KV capacity {required}, got {capacity}"
+    );
+    Ok(())
+}
+
 fn generate(
     cli: &Cli,
     input: &Input,
@@ -314,12 +328,7 @@ fn generate(
         );
     }
 
-    ensure!(
-        ids.len()
-            .checked_add(count)
-            .is_some_and(|n| n <= cli.capacity),
-        "prompt and generation exceed KV capacity"
-    );
+    check_generation_capacity(ids.len(), count, cli.capacity)?;
     let dump = dump
         .as_ref()
         .map(|p| output_path(p, &cli.model))
@@ -794,6 +803,20 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_capacity_accounts_for_prefill_token_and_capture_slot() -> Result<()> {
+        for (count, required) in [(1, 4), (2, 4), (5, 7)] {
+            check_generation_capacity(3, count, required)?;
+            let error = check_generation_capacity(3, count, required - 1)
+                .expect_err("one-row-short generation capacity must fail")
+                .to_string();
+            assert!(error.contains(&format!("require KV capacity {required}")));
+        }
+        assert!(check_generation_capacity(3, 0, 4).is_err());
+        assert!(check_generation_capacity(usize::MAX, 1, usize::MAX).is_err());
+        Ok(())
+    }
 
     #[test]
     fn speculation_budget_cli_defaults_to_chain_and_rejects_unsupported_rows() {

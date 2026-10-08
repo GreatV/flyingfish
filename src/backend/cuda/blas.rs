@@ -128,16 +128,20 @@ impl Plan {
 impl Drop for Plan {
     fn drop(&mut self) {
         unsafe {
-            for x in [self.a, self.b, self.c] {
+            for (name, x) in [
+                ("destroy Lt layout A", self.a),
+                ("destroy Lt layout B", self.b),
+                ("destroy Lt layout C", self.c),
+            ] {
                 if !x.is_null() {
-                    lt::destroy_matrix_layout(x).expect("destroy Lt layout");
+                    drop_result(name, lt::destroy_matrix_layout(x));
                 }
             }
             if !self.desc.is_null() {
-                lt::destroy_matmul_desc(self.desc).expect("destroy Lt descriptor");
+                drop_result("destroy Lt descriptor", lt::destroy_matmul_desc(self.desc));
             }
             if !self.pref.is_null() {
-                lt::destroy_matmul_pref(self.pref).expect("destroy Lt preference");
+                drop_result("destroy Lt preference", lt::destroy_matmul_pref(self.pref));
             }
         }
     }
@@ -362,10 +366,29 @@ impl Blas {
 
 impl Drop for Blas {
     fn drop(&mut self) {
-        self.stream.synchronize().expect("synchronize BLAS stream");
+        drop_result("synchronize BLAS stream", self.stream.synchronize());
         self.plans.clear();
         unsafe {
-            lt::destroy_handle(self.handle).expect("destroy Lt handle");
+            drop_result("destroy Lt handle", lt::destroy_handle(self.handle));
         }
+    }
+}
+
+fn drop_result(name: &str, result: std::result::Result<(), impl std::fmt::Debug>) {
+    if let Err(error) = result {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "{name} failed during drop: {error:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cleanup_errors_do_not_panic() {
+        super::drop_result("cleanup test", Err("synthetic error"));
+        super::drop_result("cleanup test", Ok::<(), &str>(()));
     }
 }

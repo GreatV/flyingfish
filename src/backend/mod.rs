@@ -64,11 +64,7 @@ impl SpecBudget {
     }
 
     pub fn workspace_rows(self, chunk: usize) -> usize {
-        if self.is_tree() {
-            chunk.max(self.rows())
-        } else {
-            chunk
-        }
+        chunk.max(self.rows())
     }
 
     pub fn check_tree(self, step: Step<'_>, prefix: usize, capacity: usize) -> Result<()> {
@@ -308,6 +304,21 @@ mod tests {
         assert_eq!(SpecBudget::Tree64.workspace_rows(8), 64);
         assert_eq!(SpecBudget::Tree64.workspace_rows(256), 256);
         assert_eq!(SpecBudget::Chain.workspace_rows(8), 8);
+    }
+
+    #[test]
+    fn workspace_holds_validation_rows_for_small_prefill_chunks() {
+        for budget in [
+            SpecBudget::Chain,
+            SpecBudget::Tree16,
+            SpecBudget::Tree32,
+            SpecBudget::Tree64,
+        ] {
+            for chunk in 1..budget.rows() {
+                assert_eq!(budget.workspace_rows(chunk), budget.rows());
+            }
+            assert_eq!(budget.workspace_rows(256), 256);
+        }
     }
     #[test]
     fn verification_accepts_128_rows_and_rejects_cycles() {

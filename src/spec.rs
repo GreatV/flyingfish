@@ -25,6 +25,10 @@ pub fn check_tree_greedy(
     options: &Options,
     report: &Path,
 ) -> Result<()> {
+    ensure!(
+        options.backend.spec_budget.is_tree(),
+        "check-tree-greedy requires --spec-budget tree16, tree32 or tree64"
+    );
     check(ids, options)?;
     ensure!(
         options.ignore_eos,
@@ -373,6 +377,20 @@ mod tests {
             .expect_err("overflow must fail")
             .to_string();
         assert!(error.contains("Tree64") && error.contains("overflows usize"));
+    }
+
+    #[test]
+    fn tree_greedy_rejects_chain_before_report_or_model_access() {
+        let error = check_tree_greedy(
+            Path::new(""),
+            Path::new(""),
+            &[1],
+            &options(SpecBudget::Chain, 512),
+            Path::new(""),
+        )
+        .expect_err("chain cannot validate the tree path")
+        .to_string();
+        assert!(error.contains("requires --spec-budget tree16, tree32 or tree64"));
     }
 }
 

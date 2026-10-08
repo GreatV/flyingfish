@@ -121,13 +121,10 @@ impl DraftConfig {
             "DSpark requires 5 layers, gamma7 and markov rank256"
         );
         ensure!(
-            c.num_target_layers == target.num_hidden_layers
-                && c.target_layer_ids.len() == 5
-                && c.target_layer_ids
-                    .iter()
-                    .all(|&i| i < target.num_hidden_layers),
+            c.num_target_layers == target.num_hidden_layers,
             "invalid target hidden capture layers"
         );
+        check_capture_layers(&c.target_layer_ids, target.num_hidden_layers)?;
         ensure!(
             (c.mask_token_id as usize) < target.vocab_size
                 && c.rms_norm_eps.is_finite()
@@ -145,6 +142,20 @@ impl DraftConfig {
         );
         Ok(c)
     }
+}
+
+fn check_capture_layers(ids: &[usize], target_layers: usize) -> Result<()> {
+    ensure!(
+        ids.len() == 5 && ids.iter().all(|&i| i < target_layers),
+        "invalid target hidden capture layers"
+    );
+    for (index, &id) in ids.iter().enumerate() {
+        ensure!(
+            !ids[..index].contains(&id),
+            "duplicate target hidden capture layer {id}"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +188,17 @@ pub fn capture_slot(ids: &[usize], decoder_layer: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capture_layers_reject_duplicates_and_invalid_bounds() -> Result<()> {
+        check_capture_layers(&[1, 10, 20, 30, 39], 42)?;
+        let error = check_capture_layers(&[1, 10, 20, 30, 10], 42)
+            .expect_err("duplicate capture layer must fail")
+            .to_string();
+        assert!(error.contains("duplicate target hidden capture layer 10"));
+        assert!(check_capture_layers(&[1, 10, 20, 30, 42], 42).is_err());
+        assert!(check_capture_layers(&[1, 10, 20, 30], 42).is_err());
+        Ok(())
+    }
     #[test]
     fn rejection_commits_only_matching_prefix_and_target_bonus() {
         assert_eq!(
