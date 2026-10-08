@@ -1254,10 +1254,13 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        self.device
-            .stream
-            .synchronize()
-            .expect("synchronize model stream");
+        if let Err(error) = self.device.stream.synchronize() {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "model stream synchronization failed during drop: {error}"
+            );
+        }
     }
 }
 

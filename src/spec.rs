@@ -303,14 +303,77 @@ fn check(ids: &[u32], options: &Options) -> Result<()> {
         !ids.is_empty() && options.count > 0,
         "spec input and output count must be positive"
     );
+    let budget = options.backend.spec_budget;
+    let headroom = if budget.is_tree() { budget.rows() } else { 7 };
+    let required = ids
+        .len()
+        .checked_add(options.count)
+        .and_then(|v| v.checked_add(headroom))
+        .ok_or_else(|| {
+            anyhow::anyhow!("spec budget {budget:?} required KV capacity overflows usize")
+        })?;
     ensure!(
-        ids.len()
-            .checked_add(options.count)
-            .and_then(|v| v.checked_add(7))
-            .is_some_and(|v| v <= options.capacity),
-        "spec prompt/output plus 7-row validation headroom exceed KV capacity"
+        required <= options.capacity,
+        "spec budget {budget:?} requires KV capacity {required} (prompt {} + output {} + scratch {headroom}), got {}",
+        ids.len(),
+        options.count,
+        options.capacity
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{SpecBudget, TreeBuilder};
+
+    fn options(budget: SpecBudget, capacity: usize) -> Options {
+        Options {
+            device: 0,
+            capacity,
+            chunk: None,
+            backend: Settings {
+                tree_builder: TreeBuilder::Waves,
+                spec_budget: budget,
+                spec_graph: true,
+                linear_choices: Vec::new(),
+                runtime_dir: None,
+            },
+            count: 256,
+            ignore_eos: true,
+        }
+    }
+
+    #[test]
+    fn budget_capacity_accepts_exact_fit_and_rejects_one_row_short() -> Result<()> {
+        let ids = [1, 2, 3];
+        for (budget, headroom) in [
+            (SpecBudget::Chain, 7),
+            (SpecBudget::Tree16, 16),
+            (SpecBudget::Tree32, 32),
+            (SpecBudget::Tree64, 64),
+        ] {
+            let required = ids.len() + 256 + headroom;
+            check(&ids, &options(budget, required))?;
+            let error = check(&ids, &options(budget, required - 1))
+                .expect_err("one-row-short capacity must fail")
+                .to_string();
+            assert!(error.contains(&format!("{budget:?}")));
+            assert!(error.contains(&format!("requires KV capacity {required}")));
+            assert!(error.contains(&format!("got {}", required - 1)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn budget_capacity_rejects_overflow() {
+        let mut options = options(SpecBudget::Tree64, usize::MAX);
+        options.count = usize::MAX;
+        let error = check(&[1], &options)
+            .expect_err("overflow must fail")
+            .to_string();
+        assert!(error.contains("Tree64") && error.contains("overflows usize"));
+    }
 }
 
 pub fn generate(
@@ -337,9 +400,11 @@ pub fn generate(
     for (i, round) in result.rounds.iter().enumerate() {
         println!("{}", serde_json::json!({"spec_round":i,"stats":round}));
     }
+    // SGLang acceptance = output tokens / verify rounds, including the first prefill token.
+    let sglang_accept_len = result.ids.len() as f64 / result.rounds.len().max(1) as f64;
     println!(
         "{}",
-        serde_json::json!({"spec_generation":{"input_ids":ids,"generated_ids":result.ids,"text":tokenizer::decode(target,&result.ids)?,"prefill_ms":result.prefill_ms,"decode_ms":result.decode_ms,"decode_tok_s":(result.ids.len()-1) as f64*1000.0/result.decode_ms,"sglang_accept_len":result.ids.len() as f64/result.rounds.len().max(1) as f64,"end_to_end_tok_s":result.ids.len() as f64*1000.0/(result.prefill_ms+result.decode_ms),"mean_accept_including_bonus":result.rounds.iter().map(|r|r.accepted+1).sum::<usize>() as f64/result.rounds.len().max(1) as f64,"ignore_eos":options.ignore_eos,"draft_attention":"noncausal full block","verify_attention":model.verification_impl()}})
+        serde_json::json!({"spec_generation":{"input_ids":ids,"generated_ids":result.ids,"text":tokenizer::decode(target,&result.ids)?,"prefill_ms":result.prefill_ms,"decode_ms":result.decode_ms,"decode_tok_s":(result.ids.len()-1) as f64*1000.0/result.decode_ms,"sglang_accept_len":sglang_accept_len,"end_to_end_tok_s":result.ids.len() as f64*1000.0/(result.prefill_ms+result.decode_ms),"mean_accept_including_bonus":result.rounds.iter().map(|r|r.accepted+1).sum::<usize>() as f64/result.rounds.len().max(1) as f64,"ignore_eos":options.ignore_eos,"draft_attention":"noncausal full block","verify_attention":model.verification_impl()}})
     );
     Ok(())
 }
@@ -390,6 +455,8 @@ pub fn bench(
     end_to_end.sort_by(f64::total_cmp);
     let total_ms = (end_to_end[middle.floor() as usize] + end_to_end[middle.ceil() as usize]) / 2.0;
     let rounds = all_rounds.len() as f64;
+    // SGLang acceptance = output tokens / verify rounds, including the first prefill token.
+    let sglang_accept_len = options.count as f64 * runs as f64 / rounds;
     let trees: Vec<_> = all_rounds.iter().filter_map(|r| r.tree.as_ref()).collect();
     let tree_summary = (!trees.is_empty()).then(|| serde_json::json!({
         "builder": options.backend.tree_builder,
@@ -401,7 +468,7 @@ pub fn bench(
     }));
     println!(
         "{}",
-        serde_json::json!({"spec_benchmark":{"prompt_tokens":ids.len(),"output_tokens":options.count,"runs":runs,"warmup_runs":1,"decode_wall_ms_median":ms,"end_to_end_ms_median":total_ms,"end_to_end_tok_s":options.count as f64*1000.0/total_ms,"sglang_accept_len":options.count as f64*runs as f64/rounds,"decode_tok_s":(options.count-1) as f64*1000.0/ms,"mean_accept_including_bonus":all_rounds.iter().map(|r|r.accepted+1).sum::<usize>() as f64/rounds,"mean_emitted":all_rounds.iter().map(|r|r.committed).sum::<usize>() as f64/rounds,"draft_ms_per_round":all_rounds.iter().map(|r|r.draft_ms).sum::<f64>()/rounds,"verify_ms_per_round":all_rounds.iter().map(|r|r.verify_ms).sum::<f64>()/rounds,"inject_ms_per_round":all_rounds.iter().map(|r|r.inject_ms).sum::<f64>()/rounds,"timing":"wall time; token transfers and synchronization included; initial prefill excluded","draft_attention":"full block","verify":model.verification_impl(),"confidence_budget":"fixed 7","tree_build":tree_summary}})
+        serde_json::json!({"spec_benchmark":{"prompt_tokens":ids.len(),"output_tokens":options.count,"runs":runs,"warmup_runs":1,"decode_wall_ms_median":ms,"end_to_end_ms_median":total_ms,"end_to_end_tok_s":options.count as f64*1000.0/total_ms,"sglang_accept_len":sglang_accept_len,"decode_tok_s":(options.count-1) as f64*1000.0/ms,"mean_accept_including_bonus":all_rounds.iter().map(|r|r.accepted+1).sum::<usize>() as f64/rounds,"mean_emitted":all_rounds.iter().map(|r|r.committed).sum::<usize>() as f64/rounds,"draft_ms_per_round":all_rounds.iter().map(|r|r.draft_ms).sum::<f64>()/rounds,"verify_ms_per_round":all_rounds.iter().map(|r|r.verify_ms).sum::<f64>()/rounds,"inject_ms_per_round":all_rounds.iter().map(|r|r.inject_ms).sum::<f64>()/rounds,"timing":"wall time; token transfers and synchronization included; initial prefill excluded","draft_attention":"full block","verify":model.verification_impl(),"confidence_budget":"fixed 7","tree_build":tree_summary}})
     );
     Ok(())
 }
