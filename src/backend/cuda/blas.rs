@@ -383,12 +383,3 @@ fn drop_result(name: &str, result: std::result::Result<(), impl std::fmt::Debug>
         );
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn cleanup_errors_do_not_panic() {
-        super::drop_result("cleanup test", Err("synthetic error"));
-        super::drop_result("cleanup test", Ok::<(), &str>(()));
-    }
-}

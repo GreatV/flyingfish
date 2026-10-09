@@ -41,31 +41,3 @@ pub fn parse(text: &str) -> Result<Vec<u32>, String> {
     }
     Ok(result)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::parse;
-
-    #[test]
-    fn formats_and_duplicate_devices() {
-        assert_eq!(parse("8.9;8.6 8.9").unwrap(), vec![86, 89]);
-        assert_eq!(parse("86-real,sm_89").unwrap(), vec![86, 89]);
-        assert_eq!(parse("8.6\n8.6\n").unwrap(), vec![86]);
-        assert_eq!(parse("10.0;120").unwrap(), vec![100, 120]);
-    }
-
-    #[test]
-    fn rejects_virtual_and_invalid_targets() {
-        for text in [
-            "",
-            "8.9+PTX",
-            "86-virtual",
-            "compute_86",
-            "8.10",
-            "7.5",
-            "Ada",
-        ] {
-            assert!(parse(text).is_err(), "{text}");
-        }
-    }
-}

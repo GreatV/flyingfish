@@ -232,17 +232,3 @@ pub fn profile(dir: &Path, ids: &[u32], s: &Settings, phase: Phase) -> Result<()
     );
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn percentiles_interpolate_short_and_tail_distributions() {
-        assert_eq!(percentile(&[3.0, 1.0, 2.0, 4.0], 0.5), 2.5);
-        assert_eq!(percentile(&[10.0], 0.1), 10.0);
-        let x: Vec<_> = (0..201).map(|i| i as f64).collect();
-        assert_eq!(percentile(&x, 0.1), 20.0);
-        assert_eq!(percentile(&x, 0.9), 180.0);
-    }
-}

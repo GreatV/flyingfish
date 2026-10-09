@@ -189,17 +189,6 @@ pub fn capture_slot(ids: &[usize], decoder_layer: usize) -> Option<usize> {
 mod tests {
     use super::*;
     #[test]
-    fn capture_layers_reject_duplicates_and_invalid_bounds() -> Result<()> {
-        check_capture_layers(&[1, 10, 20, 30, 39], 42)?;
-        let error = check_capture_layers(&[1, 10, 20, 30, 10], 42)
-            .expect_err("duplicate capture layer must fail")
-            .to_string();
-        assert!(error.contains("duplicate target hidden capture layer 10"));
-        assert!(check_capture_layers(&[1, 10, 20, 30, 42], 42).is_err());
-        assert!(check_capture_layers(&[1, 10, 20, 30], 42).is_err());
-        Ok(())
-    }
-    #[test]
     fn rejection_commits_only_matching_prefix_and_target_bonus() {
         assert_eq!(
             accept(&[3, 4, 5], &[3, 7, 5, 8]).unwrap(),

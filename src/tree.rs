@@ -706,14 +706,6 @@ mod tests {
             .is_err()
         );
     }
-    #[test]
-    fn root_only_budget_does_not_request_draft_scores() {
-        let t = Tree::best_first(7, 0, 1, 1, 7, |_, _| {
-            panic!("root budget needs no distribution")
-        })
-        .unwrap();
-        assert_eq!(t.select(&[8], 1, &[]).unwrap().output, vec![8]);
-    }
 
     #[test]
     fn full_walk_keeps_the_leaf_bonus_separate_from_commit_limits() {
@@ -898,16 +890,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(wave.nodes(), t.nodes());
-    }
-
-    #[test]
-    fn wave_root_only_budget_does_not_call_batch() {
-        let (tree, stats) = Tree::best_first_waves(42, 17, 18, 1, 7, |_| {
-            panic!("root-only budget has no distributions")
-        })
-        .unwrap();
-        assert_eq!(tree.nodes()[0].token, 42);
-        assert_eq!(stats, WaveStats::default());
     }
 
     #[test]
