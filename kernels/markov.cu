@@ -603,6 +603,138 @@ __device__ __forceinline__ void markov2_p1_small_body(
   }
 }
 
+template <int PTB>
+__device__ __forceinline__ void markov2_p1_small_body_preF1(
+    const bf16* __restrict__ B, const bf16* __restrict__ w1c,
+    const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
+    const int* __restrict__ req_row, float* __restrict__ scratch_top4,
+    float* __restrict__ scratch_lse, int P) {
+  __shared__ __align__(16) bf16 esm[8 * MK2_DIM];         // 4096 B swizzled
+  // Merge arrays are indexed by act (0..7), independent of the scratch
+  // stride PTB: [8][8], 2560 B.
+  __shared__ float wsc[8][8][4];                          // per-warp top4
+  __shared__ unsigned wid[8][8][4];
+  __shared__ float wml[8][8][2];                          // per-warp (m, l)
+
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int vBlk0 = blockIdx.x * MK2_VT;
+
+  // Stage the e rows (acts); rows p >= P are zero-filled via src-size 0.
+  {
+    const int idx = tid;                                  // 8*32 = 256 = NT
+    const int p = idx >> 5, seg = idx & 31;
+    const unsigned tok = (p < P) ? req_tok[p] : 0u;
+    cp16(esm + p * MK2_DIM + swz(seg, p) * 8,
+         w1c + (size_t)tok * MK2_DIM + seg * 8, (p < P) ? 16 : 0);
+    cp_commit();
+    cp_wait0();
+    __syncthreads();
+  }
+
+  const int r0 = lane >> 2, c0 = (lane & 3) * 2;
+  const int act0 = c0, act1 = c0 + 1;
+  const int rr0 = (act0 < P) ? req_row[act0] : 0;
+  const int rr1 = (act1 < P) ? req_row[act1] : 0;
+  const bf16* Brow0 = B + (size_t)rr0 * MK2_VOCAB;
+  const bf16* Brow1 = B + (size_t)rr1 * MK2_VOCAB;
+
+  ActState st;
+  st.init();
+
+  const bf16* erow = esm + (lane & 7) * MK2_DIM;
+  const int eseg = lane & 7;
+
+  // gmem A-fragment row bases: lane covers rows vt0 + r0 and vt0 + r0 + 8,
+  // column pairs c0k = (lane%4)*2 (+8 for a2/a3) of each k16 slice.
+  const int coff = (lane & 3) * 2;
+
+#pragma unroll
+  for (int t = 0; t < 2; ++t) {
+    const int vt0 = vBlk0 + warp * 32 + t * 16;
+    const bf16* rA = w2c + (size_t)(vt0 + r0) * MK2_DIM + coff;
+    const bf16* rB_ = rA + 8 * MK2_DIM;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int kk = 0; kk < 16; ++kk) {
+      unsigned wa[4], eb[2];
+      wa[0] = *reinterpret_cast<const unsigned*>(rA + kk * 16);
+      wa[1] = *reinterpret_cast<const unsigned*>(rB_ + kk * 16);
+      wa[2] = *reinterpret_cast<const unsigned*>(rA + kk * 16 + 8);
+      wa[3] = *reinterpret_cast<const unsigned*>(rB_ + kk * 16 + 8);
+      ldsm_x2(eb, erow + swz((kk * 2 + (lane >> 3)) & 31, eseg) * 8);
+      mma_16816(acc, wa, eb);
+    }
+
+    const int vg = vt0 + r0;
+    if (act0 < P) {
+      const bf16 sv = __hadd(__float2bfloat16(acc[0]), Brow0[vg]);
+      st.add<0>(__bfloat162float(sv), (unsigned)vg);
+      MK2_DUMP_S_WRITE(act0, vg, __bfloat162float(sv));
+    }
+    if (act1 < P) {
+      const bf16 sv = __hadd(__float2bfloat16(acc[1]), Brow1[vg]);
+      st.add<1>(__bfloat162float(sv), (unsigned)vg);
+      MK2_DUMP_S_WRITE(act1, vg, __bfloat162float(sv));
+    }
+    if (act0 < P) {
+      const bf16 sv = __hadd(__float2bfloat16(acc[2]), Brow0[vg + 8]);
+      st.add<0>(__bfloat162float(sv), (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act0, vg + 8, __bfloat162float(sv));
+    }
+    if (act1 < P) {
+      const bf16 sv = __hadd(__float2bfloat16(acc[3]), Brow1[vg + 8]);
+      st.add<1>(__bfloat162float(sv), (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act1, vg + 8, __bfloat162float(sv));
+    }
+  }
+
+  st.merge_lanes();
+
+  // v is split across the 8 warps (nvs = 8): stage each warp's 32-row
+  // partials (lanes 0..3 hold all 8 acts after the in-warp merge) and merge
+  // across warps through smem. Warp w then owns act w's block merge.
+  if (lane < 4) {
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+      const int act = lane * 2 + q;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        wsc[warp][act][j] = st.t[q].s[j];
+        wid[warp][act][j] = st.t[q].i[j];
+      }
+      wml[warp][act][0] = st.m[q];
+      wml[warp][act][1] = st.l[q];
+    }
+  }
+  __syncthreads();
+  if (lane == 0) {
+    const int act = warp;
+    T4 t4; t4.init();
+    float m = -3.0e38f, l = 0.0f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+#pragma unroll
+      for (int j = 0; j < 4; ++j) t4.insert(wsc[w][act][j], wid[w][act][j]);
+      const float bm = wml[w][act][0], bl = wml[w][act][1];
+      const float mn = fmaxf(m, bm);
+      l = l * __expf(m - mn) + bl * __expf(bm - mn);
+      m = mn;
+    }
+    if (act < P) {
+      const size_t b4 = ((size_t)blockIdx.x * PTB + act) * 8;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        scratch_top4[b4 + j * 2] = t4.s[j];
+        *reinterpret_cast<unsigned*>(scratch_top4 + b4 + j * 2 + 1) = t4.i[j];
+      }
+      const size_t bl = ((size_t)blockIdx.x * PTB + act) * 2;
+      scratch_lse[bl] = m;
+      scratch_lse[bl + 1] = l;
+    }
+  }
+}
+
 extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_p8(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
@@ -629,6 +761,30 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_p1(
   __shared__ __align__(16) bf16 w2sm[4 * 16 * MK2_DIM];   // shared pool (as p8)
   markov2_p1_small_body<1>(B, w1c, w2c, req_tok, req_row, scratch_top4,
                            scratch_lse, P, w2sm);
+}
+
+// ---------------------------------------------------------------------------
+// preF1 variants: the small body with direct 32-bit global loads of w2 in
+// place of the cp.async stages. Same template instances, guards and launch
+// contract as the F1 entries; outputs are bitwise identical to them.
+extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_preF1_p8(
+    const bf16* __restrict__ B, const bf16* __restrict__ w1c,
+    const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
+    const int* __restrict__ req_row, float* __restrict__ scratch_top4,
+    float* __restrict__ scratch_lse, int V, int in, int P) {
+  MK2_GUARD_P1(8);
+  markov2_p1_small_body_preF1<8>(B, w1c, w2c, req_tok, req_row, scratch_top4,
+                                 scratch_lse, P);
+}
+
+extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_preF1_p1(
+    const bf16* __restrict__ B, const bf16* __restrict__ w1c,
+    const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
+    const int* __restrict__ req_row, float* __restrict__ scratch_top4,
+    float* __restrict__ scratch_lse, int V, int in, int P) {
+  MK2_GUARD_P1(1);
+  markov2_p1_small_body_preF1<1>(B, w1c, w2c, req_tok, req_row, scratch_top4,
+                                 scratch_lse, P);
 }
 
 #undef MK2_GUARD_P1

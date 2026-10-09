@@ -201,7 +201,10 @@ fn batch_matches_single() -> Result<()> {
     let d = Device::new(0)?;
     let (w1, w2) = weights(&d)?;
     let fixtures = std::env::var("FF_MARKOV_FIXTURES").context("FF_MARKOV_FIXTURES missing")?;
-    let mut markov = Markov::new(&d)?;
+    let ops = Ops::new(&d.ctx)?;
+    let runtime = std::env::temp_dir().join(format!("ff-markov-cal-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime)?;
+    let mut markov = Markov::new(&d, &ops, &runtime)?;
     let mut compared = 0;
     let mut differences = Differences::default();
     for (seed, file) in ["r0008", "r0042", "r0089", "r0140"].iter().enumerate() {
@@ -274,7 +277,10 @@ fn top4_matches_reference() -> Result<()> {
     let d = Device::new(0)?;
     let (w1, w2) = weights(&d)?;
     let fixtures = std::env::var("FF_MARKOV_FIXTURES").context("FF_MARKOV_FIXTURES missing")?;
-    let mut markov = Markov::new(&d)?;
+    let ops = Ops::new(&d.ctx)?;
+    let runtime = std::env::temp_dir().join(format!("ff-markov-cal-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime)?;
+    let mut markov = Markov::new(&d, &ops, &runtime)?;
     let mut reference = reference::Reference::new(&d)?;
     let mut compared = 0;
     let mut differences = Differences::default();
@@ -353,8 +359,10 @@ fn batch_wall() -> Result<()> {
         "B",
         &[7, 130560],
     )?;
-    let mut markov = Markov::new(&d)?;
     let ops = Ops::new(&d.ctx)?;
+    let runtime = std::env::temp_dir().join(format!("ff-markov-cal-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime)?;
+    let mut markov = Markov::new(&d, &ops, &runtime)?;
     let count = d.info.l2_bytes.max(1024 * 1024);
     let mut flush = d.stream.alloc_zeros::<bf16>(count)?;
     let zeros = d.stream.alloc_zeros::<bf16>(count)?;

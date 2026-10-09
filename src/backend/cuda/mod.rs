@@ -8,6 +8,7 @@ pub mod engine;
 pub mod flash;
 mod linear_calibrate;
 mod markov;
+mod markov_calibrate;
 pub mod multi_calibrate;
 pub mod ops;
 pub mod profile;

@@ -2316,6 +2316,8 @@ impl Engine {
             .context("tree round requires enabled draft State")?;
         spec.draft
             .setup_attention(&self.device, &self.ops, &self.config, &self.runtime)?;
+        spec.draft
+            .setup_markov(&self.device, &self.ops, &self.runtime)?;
         if graph {
             self.ensure_tree_draft_graph(start)?;
             self.spec
@@ -2428,7 +2430,7 @@ impl Engine {
                 7,
                 |requests| {
                     spec.draft
-                        .distributions_batch(&self.device, requests)?
+                        .distributions_batch(requests)?
                         .iter()
                         .map(crate::backend::Top4::distribution)
                         .collect()
@@ -2449,7 +2451,7 @@ impl Engine {
                         }
                         let value = spec
                             .draft
-                            .distributions_batch(&self.device, &[(row, token)])?
+                            .distributions_batch(&[(row, token)])?
                             .into_iter()
                             .next()
                             .context("empty serial Markov result")?
@@ -2489,7 +2491,12 @@ impl Engine {
             .as_mut()
             .context("draft state is not enabled")?
             .draft
-            .distributions_batch(&self.device, requests)
+            .setup_markov(&self.device, &self.ops, &self.runtime)?;
+        self.spec
+            .as_mut()
+            .context("draft state is not enabled")?
+            .draft
+            .distributions_batch(requests)
     }
 
     pub fn spec_state_bits(&self, start: usize, rows: usize) -> Result<Vec<u8>> {
