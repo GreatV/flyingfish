@@ -558,6 +558,75 @@ __device__ __forceinline__ void tcmqa_phase2_body(const float* __restrict__ p_m,
       __float2bfloat16(acc * inv);
 }
 
+__device__ __forceinline__ void tcmqa_phase2_short_body(
+    const float* __restrict__ p_m, const float* __restrict__ p_l,
+    const float* __restrict__ p_o, bf16* __restrict__ o, int nchunks,
+    int M, int o_tok_stride, int o_head_stride) {
+  extern __shared__ float sm[];
+  __shared__ float stats[2];
+  const int tid = threadIdx.x;
+  const int qi = blockIdx.x / HQ;
+  const int qh = blockIdx.x % HQ;
+  const int g = tid / DH;
+  const int d = tid % DH;
+  const int groups = blockDim.x / DH;
+  const size_t step = (size_t)GQA * M;
+  const size_t base = (size_t)(qh / GQA) * nchunks * step
+                   + (size_t)(qh % GQA) * M + qi;
+  float* red = sm + 2 * nchunks;
+
+  if (tid < warpSize) {
+    const int hi = tid + warpSize;
+    float m0 = -3.0e38f, m1 = -3.0e38f;
+    float l0 = 0.0f, l1 = 0.0f;
+    if (tid < nchunks) {
+      sm[tid] = p_m[base + (size_t)tid * step];
+      m0 = fmaxf(m0, sm[tid]);
+      l0 = p_l[base + (size_t)tid * step];
+    }
+    if (hi < nchunks) {
+      sm[hi] = p_m[base + (size_t)hi * step];
+      m1 = fmaxf(m1, sm[hi]);
+      l1 = p_l[base + (size_t)hi * step];
+    }
+    float mx = fmaxf(m0, m1);
+    for (int s = warpSize / 2; s > 0; s >>= 1) {
+      const float other = __shfl_down_sync(0xffffffffu, mx, s);
+      if (tid < s) mx = fmaxf(mx, other);
+    }
+    mx = __shfl_sync(0xffffffffu, mx, 0);
+    float p0 = 0.0f, p1 = 0.0f;
+    if (tid < nchunks) p0 += l0 * __expf(sm[tid] - mx);
+    if (hi < nchunks) p1 += l1 * __expf(sm[hi] - mx);
+    float sum = p0 + p1;
+    for (int s = warpSize / 2; s > 0; s >>= 1) {
+      const float other = __shfl_down_sync(0xffffffffu, sum, s);
+      if (tid < s) sum += other;
+    }
+    if (tid == 0) {
+      stats[0] = mx;
+      stats[1] = sum;
+    }
+  }
+  __syncthreads();
+
+  const float mx = stats[0];
+  const float sum = stats[1];
+  float acc = 0.0f;
+  for (int h = g; h < nchunks; h += groups) {
+    const float w = __expf(sm[h] - mx);
+    acc = fmaf(w, p_o[(base + (size_t)h * step) * DH + d], acc);
+  }
+  red[tid] = acc;
+  __syncthreads();
+  if (g == 0) {
+    for (int k = 1; k < groups; ++k) acc += red[k * DH + d];
+    const float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+    o[(size_t)qi * o_tok_stride + (size_t)qh * o_head_stride + d] =
+        __float2bfloat16(acc * inv);
+  }
+}
+
 // ======================================================== exported ABI =====
 #define FD_GUARD_P1 do {                                                                    \
   if (head_dim != DH || n_q_heads != HQ || n_kv_heads != HKV || gqa != GQA ||               \
@@ -682,6 +751,38 @@ extern "C" __global__ void tcmqa_phase2_host(float* __restrict__ scratch,
                                              int chunk) {
   FD_GUARD_P2;
   tcmqa_phase2_entry(scratch, o, L, M, chunk, n_q_heads, o_tok_stride, o_head_stride);
+}
+
+__device__ __forceinline__ void tcmqa_phase2_short_entry(
+    float* __restrict__ scratch, bf16* __restrict__ o, int L, int M,
+    int chunk, int o_tok_stride, int o_head_stride) {
+  const int nchunks = (L + M + chunk - 1) / chunk;
+  if (L < 0 || nchunks < 1 || nchunks > 2 * warpSize ||
+      (blockDim.x != 256 && blockDim.x != 512) ||
+      blockDim.y != 1 || blockDim.z != 1 ||
+      gridDim.x != HQ * M || gridDim.y != 1 || gridDim.z != 1) __trap();
+  const size_t nparts = (size_t)HKV * nchunks * GQA * M;
+  tcmqa_phase2_short_body(scratch, scratch + nparts, scratch + 2 * nparts,
+                         o, nchunks, M, o_tok_stride, o_head_stride);
+}
+
+extern "C" __global__ void tcmqa_phase2_short(
+    float* __restrict__ scratch, bf16* __restrict__ o,
+    const int* __restrict__ len_dev, int M,
+    int n_q_heads, int n_kv_heads, int gqa, int head_dim,
+    int o_tok_stride, int o_head_stride, int chunk) {
+  FD_GUARD_P2;
+  tcmqa_phase2_short_entry(scratch, o, *len_dev, M, chunk,
+                          o_tok_stride, o_head_stride);
+}
+
+extern "C" __global__ void tcmqa_phase2_short_host(
+    float* __restrict__ scratch, bf16* __restrict__ o, int L, int M,
+    int n_q_heads, int n_kv_heads, int gqa, int head_dim,
+    int o_tok_stride, int o_head_stride, int chunk) {
+  FD_GUARD_P2;
+  tcmqa_phase2_short_entry(scratch, o, L, M, chunk,
+                          o_tok_stride, o_head_stride);
 }
 
 #undef FD_GUARD_P1

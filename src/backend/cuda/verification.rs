@@ -36,12 +36,10 @@ pub struct Query<'a> {
 pub fn phase1_residency(ctx: &Arc<CudaContext>) -> Result<[usize; 3]> {
     let module = cubin::module(ctx, "tcmqa")?;
     let mut residency = [0usize; 3];
-    for (implementation, threads) in [(MultiImpl::Tcmqa, 128u32), (MultiImpl::TcmqaW, 256)] {
-        let symbol = match implementation {
-            MultiImpl::Tcmqa => "tcmqa_phase1",
-            MultiImpl::TcmqaW => "tcmqa_phase1_w",
-            MultiImpl::V1 => unreachable!(),
-        };
+    for (implementation, threads, symbol) in [
+        (MultiImpl::Tcmqa, 128u32, "tcmqa_phase1"),
+        (MultiImpl::TcmqaW, 256, "tcmqa_phase1_w"),
+    ] {
         let first = module.load_function(symbol)?;
         let smem = implementation.phase1_smem_bytes();
         if smem > 48 * 1024 {
@@ -95,6 +93,7 @@ impl Verification {
         } = shape;
         let plan = selected.launch;
         let implementation = selected.implementation;
+        let phase1 = implementation.phase1();
         ensure!(
             c.num_attention_heads == 16 && c.num_key_value_heads == 2 && c.head_dim == 128,
             "MQ attention requires 16 Q heads, 2 KV heads and head_dim 128"
@@ -128,16 +127,24 @@ impl Verification {
             "invalid MQ phase2 block size"
         );
         let chunks = capacity.div_ceil(plan.chunk);
-        let first_smem =
-            if implementation == MultiImpl::Tcmqa || implementation == MultiImpl::TcmqaW {
-                implementation.phase1_smem_bytes()
-            } else {
-                plan.qpack * (plan.threads as usize / 32) * 130 * 4
-            };
+        if implementation.short_merge() {
+            let warp = ctx
+                .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_WARP_SIZE)?
+                as usize;
+            ensure!(
+                chunks <= 2 * warp && matches!(plan.merge_threads, 256 | 512),
+                "TCMQA short merge requires at most two chunks per warp lane over the full capacity and 256 or 512 threads"
+            );
+        }
+        let first_smem = if phase1 != MultiImpl::V1 {
+            implementation.phase1_smem_bytes()
+        } else {
+            plan.qpack * (plan.threads as usize / 32) * 130 * 4
+        };
         let second_smem = (2 * chunks + plan.merge_threads as usize) * 4;
         // TcmqaW's 52,736 B phase-1 tile needs the per-function opt-in set
         // below; phase 2 has no opt-in anywhere, so it stays under 48 KiB.
-        let first_smem_limit = if implementation == MultiImpl::TcmqaW {
+        let first_smem_limit = if phase1 == MultiImpl::TcmqaW {
             101 * 1024
         } else {
             48 * 1024
@@ -160,27 +167,27 @@ impl Verification {
         )?;
         let symbol = match implementation {
             MultiImpl::V1 => format!("flash_decode_mq_phase1_q{}", plan.qpack),
-            MultiImpl::Tcmqa => "tcmqa_phase1".to_owned(),
-            MultiImpl::TcmqaW => "tcmqa_phase1_w".to_owned(),
+            MultiImpl::Tcmqa | MultiImpl::TcmqaShort => "tcmqa_phase1".to_owned(),
+            MultiImpl::TcmqaW | MultiImpl::TcmqaWShort => "tcmqa_phase1_w".to_owned(),
         };
         ensure!(
             implementation != MultiImpl::V1 || causal,
             "v1 MQ only supports causal attention"
         );
-        if implementation == MultiImpl::Tcmqa {
+        if phase1 == MultiImpl::Tcmqa {
             ensure!(
                 plan.threads == 128 && plan.chunk.is_multiple_of(64),
                 "TCMQA requires threads128 and chunk multiple64"
             );
         }
-        if implementation == MultiImpl::TcmqaW {
+        if phase1 == MultiImpl::TcmqaW {
             ensure!(
                 plan.threads == 256 && plan.chunk.is_multiple_of(64),
                 "TCMQA-W requires threads256 and chunk multiple64"
             );
         }
         let first = module.load_function(&symbol)?;
-        if implementation == MultiImpl::TcmqaW {
+        if phase1 == MultiImpl::TcmqaW {
             first.set_attribute(
                 cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 implementation.phase1_smem_bytes() as i32,
@@ -188,6 +195,8 @@ impl Verification {
         }
         let second = module.load_function(if implementation == MultiImpl::V1 {
             "flash_decode_mq_phase2"
+        } else if implementation.short_merge() {
+            "tcmqa_phase2_short"
         } else {
             "tcmqa_phase2"
         })?;
@@ -315,9 +324,7 @@ impl Verification {
                 first.arg(anc);
             }
             first.launch(LaunchConfig {
-                grid_dim: if self.implementation == MultiImpl::Tcmqa
-                    || self.implementation == MultiImpl::TcmqaW
-                {
+                grid_dim: if self.implementation != MultiImpl::V1 {
                     (
                         chunks as u32,
                         2,
@@ -327,9 +334,7 @@ impl Verification {
                     (chunks as u32, (16 / p.qpack) as u32, rows as u32)
                 },
                 block_dim: (p.threads, 1, 1),
-                shared_mem_bytes: if self.implementation == MultiImpl::Tcmqa
-                    || self.implementation == MultiImpl::TcmqaW
-                {
+                shared_mem_bytes: if self.implementation != MultiImpl::V1 {
                     self.implementation.phase1_smem_bytes() as u32
                 } else {
                     (p.qpack * (p.threads as usize / 32) * 130 * 4) as u32
@@ -362,6 +367,8 @@ impl Verification {
             MultiImpl::V1 => "v1 flash_decode_mq",
             MultiImpl::Tcmqa => "TCMQA",
             MultiImpl::TcmqaW => "TCMQA wide (128-row tile)",
+            MultiImpl::TcmqaShort => "TCMQA short merge",
+            MultiImpl::TcmqaWShort => "TCMQA wide (128-row tile), short merge",
         }
     }
 }

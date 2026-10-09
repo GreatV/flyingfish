@@ -6,8 +6,8 @@ use super::{
 };
 use crate::{
     backend::setup::{
-        ATTENTION_LENGTHS, AttentionPlan, CacheKey, MultiImpl, MultiPlan, MultiShape, Selection,
-        attention_bucket, attention_chunks,
+        ATTENTION_CAPACITIES, ATTENTION_LENGTHS, AttentionPlan, CacheKey, MultiImpl, MultiPlan,
+        MultiShape, Selection, attention_bucket, attention_chunks,
     },
     config::Config,
 };
@@ -82,9 +82,10 @@ struct Budget {
     kv_bytes_per_token: usize,
     l2_bytes: usize,
     sms: usize,
-    /// Resident phase-1 blocks per SM, indexed like `MultiImpl`.
+    /// Resident blocks for the V1, Tcmqa and TcmqaW phase-1 families.
     phase1_resident: [usize; 3],
     kv_heads: usize,
+    warp: usize,
 }
 
 fn budget(d: &Device, c: &Config) -> Result<Budget> {
@@ -94,6 +95,7 @@ fn budget(d: &Device, c: &Config) -> Result<Budget> {
         sms: d.info.sms,
         phase1_resident: phase1_residency(&d.ctx)?,
         kv_heads: c.num_key_value_heads,
+        warp: d.info.warp,
     })
 }
 
@@ -101,7 +103,7 @@ fn budget(d: &Device, c: &Config) -> Result<Budget> {
 /// resident blocks per SM for that implementation's block size and dynamic
 /// shared memory.
 fn phase1_slots(budget: Budget, implementation: MultiImpl) -> usize {
-    budget.sms * budget.phase1_resident[implementation as usize].max(1)
+    budget.sms * budget.phase1_resident[implementation.phase1() as usize].max(1)
 }
 
 /// KV capacity a calibration trial for this length bucket and row count
@@ -229,6 +231,27 @@ fn candidates(
                 },
             });
         }
+    }
+    let short_capacity = match bucket {
+        0 | 1 => Some(ATTENTION_CAPACITIES[bucket]),
+        _ => None,
+    };
+    if let Some(capacity) = short_capacity {
+        let short: Vec<_> = plans
+            .iter()
+            .filter_map(|p| {
+                let implementation = match p.implementation {
+                    MultiImpl::Tcmqa => MultiImpl::TcmqaShort,
+                    MultiImpl::TcmqaW => MultiImpl::TcmqaWShort,
+                    _ => return None,
+                };
+                (capacity.div_ceil(p.launch.chunk) <= 2 * budget.warp).then_some(MultiPlan {
+                    implementation,
+                    ..*p
+                })
+            })
+            .collect();
+        plans.extend(short);
     }
     plans
         .into_iter()
@@ -678,6 +701,7 @@ mod long_tests {
             sms: 48,
             phase1_resident: [0, 2, 1],
             kv_heads: 2,
+            warp: 32,
         };
         for (rows, causal, tree) in [
             (7, false, false),
@@ -691,11 +715,36 @@ mod long_tests {
                     driver_version: "test".into(),
                     binary_version: "test".into(),
                 };
+                let plans = candidates(bucket, rows, causal, tree, budget);
+                assert_eq!(
+                    plans.iter().any(|p| p.implementation.short_merge()),
+                    bucket < 2
+                );
+                for plan in &plans {
+                    if plan.implementation.short_merge() {
+                        assert!(bucket < 2);
+                        let upper = ATTENTION_CAPACITIES[bucket];
+                        assert_eq!(attention_bucket(upper)?, bucket);
+                        assert_eq!(attention_bucket(upper + 1)?, bucket + 1);
+                        assert!(upper.div_ceil(plan.launch.chunk) <= 2 * budget.warp);
+                        assert!(matches!(plan.launch.merge_threads, 256 | 512));
+                        let original = MultiPlan {
+                            implementation: plan.implementation.phase1(),
+                            ..*plan
+                        };
+                        assert!(plans.contains(&original));
+                        assert_eq!(
+                            phase1_slots(budget, plan.implementation),
+                            phase1_slots(budget, original.implementation)
+                        );
+                        assert_eq!(
+                            plan.implementation.phase1_smem_bytes(),
+                            original.implementation.phase1_smem_bytes()
+                        );
+                    }
+                }
                 let mut trials = Vec::new();
-                for (i, plan) in candidates(bucket, rows, causal, tree, budget)
-                    .into_iter()
-                    .enumerate()
-                {
+                for (i, plan) in plans.into_iter().enumerate() {
                     let capacity = calibration_capacity(length, rows);
                     assert!(capacity <= 131072);
                     assert!(
