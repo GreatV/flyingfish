@@ -59,6 +59,12 @@ pub(crate) struct Work {
     pub(crate) token: CudaSlice<u32>,
 }
 
+/// DSpark capture destination for one layer slot.
+struct Capture<'a> {
+    buffer: &'a mut CudaSlice<bf16>,
+    slot: usize,
+}
+
 impl Work {
     fn grow(&mut self, stream: &Arc<CudaStream>, c: &Config, rows: usize) -> Result<()> {
         ensure!(rows >= self.ids.len(), "workspace rows cannot shrink");
@@ -101,6 +107,47 @@ impl Work {
                 .arg(&(rows as i32))
                 .arg(&(c.hidden_size as i32))
                 .arg(&c.rms_norm_eps)
+                .launch(grid(rows, 256))?;
+        }
+        Ok(())
+    }
+
+    /// add_rmsnorm plus the DSpark capture mirror of the residual stream it
+    /// just wrote: capture[row][slot * hidden + d] = x[row][d]. Replaces the
+    /// separate 2D device-to-device column copy for capture layers.
+    fn add_norm_capture(
+        &mut self,
+        ops: &Ops,
+        stream: &Arc<CudaStream>,
+        weight: &CudaSlice<bf16>,
+        capture: Capture<'_>,
+        rows: usize,
+        c: &Config,
+    ) -> Result<()> {
+        let Capture {
+            buffer: capture,
+            slot,
+        } = capture;
+        ensure!(
+            capture.len() >= rows * 5 * c.hidden_size,
+            "DSpark capture buffer is too small for the capture column copy"
+        );
+        let (res, _res) = self.x.device_ptr_mut(stream);
+        let (cap, _cap) = capture.device_ptr_mut(stream);
+        unsafe {
+            stream
+                .launch_builder(&ops.add_norm_capture)
+                .arg(&self.out)
+                .arg(&res)
+                .arg(weight)
+                .arg(&mut self.n)
+                .arg(&res)
+                .arg(&cap)
+                .arg(&(rows as i32))
+                .arg(&(c.hidden_size as i32))
+                .arg(&c.rms_norm_eps)
+                .arg(&((5 * c.hidden_size) as i32))
+                .arg(&((slot * c.hidden_size) as i32))
                 .launch(grid(rows, 256))?;
         }
         Ok(())
@@ -622,6 +669,10 @@ impl Engine {
         self.run_operator(crate::backend::Operator::Head, 0, step, &mut trace)
     }
 
+    /// Host-side validation for the tree step. The metadata kernel is no longer
+    /// launched here: prepare_embed_norm (the Embed operator, which this always
+    /// precedes) writes ids/positions/slots/snapshot in the same launch as the
+    /// embedding gather and the layer-0 norm.
     fn prepare_tree(&mut self, step: crate::backend::Step<'_>) -> Result<()> {
         self.spec_budget
             .check_tree(step, self.position, self.capacity)?;
@@ -640,11 +691,6 @@ impl Engine {
         );
         self.views().check(step.rows)?;
         self.ensure_tree_attention()?;
-        let spec = self.spec.as_ref().context("draft is not enabled")?;
-        spec.tree
-            .as_ref()
-            .context("tree State is not enabled")?
-            .prepare(&self.work.position, &mut self.work.ids)?;
         Ok(())
     }
 
@@ -800,9 +846,8 @@ impl Engine {
                 .tree
                 .as_ref()
                 .context("tree State is not enabled")?;
-            tree.rope(&mut self.work.qkv)?;
             let kv = &mut self.kv[i];
-            return tree.write_kv(&self.work.qkv, &mut kv.k, &mut kv.v);
+            return tree.rope_kv(&mut self.work.qkv, &mut kv.k, &mut kv.v);
         }
         let rows = if is_tree {
             self.spec_budget.rows()
@@ -827,23 +872,36 @@ impl Engine {
         let layer = &self.weights.layers[i];
         match op {
             crate::backend::Operator::Embed => {
-                let ids = if use_token { &w.token } else { &w.ids };
-                unsafe {
-                    s.launch_builder(&self.ops.embed)
-                        .arg(&self.weights.embed)
-                        .arg(ids)
-                        .arg(&mut w.x)
-                        .arg(&nr)
-                        .arg(&hd)
-                        .launch(flat(rows * h))?;
-                }
-                trace_value(trace, s, "embed", &w.x, trace_rows, h)?;
-            }
-            crate::backend::Operator::Norm => {
-                if i == 0 {
+                // Fused gather + layer-0 RMSNorm: the Embed operator is always
+                // the step's first call and always immediately precedes layer 0,
+                // whose first operator is Norm, so the two launches belong in
+                // one. On the tree path prepare() joins the same launch.
+                if is_tree {
+                    let tree = self
+                        .spec
+                        .as_ref()
+                        .context("tree embed requires draft State")?
+                        .tree
+                        .as_ref()
+                        .context("tree State is not enabled")?;
+                    tree.prepare_embed_norm(
+                        &w.position,
+                        &self.weights.embed,
+                        &layer.input_norm,
+                        super::tree::EmbedOut {
+                            ids: &mut w.ids,
+                            x: &mut w.x,
+                            y: &mut w.n,
+                        },
+                        c,
+                    )?;
+                } else {
+                    let ids = if use_token { &w.token } else { &w.ids };
                     unsafe {
-                        s.launch_builder(&self.ops.norm)
-                            .arg(&w.x)
+                        s.launch_builder(&self.ops.embed_rmsnorm)
+                            .arg(&self.weights.embed)
+                            .arg(ids)
+                            .arg(&mut w.x)
                             .arg(&layer.input_norm)
                             .arg(&mut w.n)
                             .arg(&nr)
@@ -852,6 +910,11 @@ impl Engine {
                             .launch(grid(rows, 256))?;
                     }
                 }
+                trace_value(trace, s, "embed", &w.x, trace_rows, h)?;
+            }
+            crate::backend::Operator::Norm => {
+                // The layer-0 norm is folded into Embed above; for every other
+                // layer the Norm operator has no work.
             }
             crate::backend::Operator::Qkv => {
                 self.blas
@@ -870,20 +933,11 @@ impl Engine {
                 }
             }
             crate::backend::Operator::RopeKv => unsafe {
-                s.launch_builder(&self.ops.rope)
-                    .arg(&mut w.qkv)
-                    .arg(&w.position)
-                    .arg(&nr)
-                    .arg(&qh)
-                    .arg(&kh)
-                    .arg(&dim)
-                    .arg(&c.rope_theta)
-                    .launch(flat(
-                        rows * (c.num_attention_heads + c.num_key_value_heads) * c.head_dim / 2,
-                    ))?;
+                // Fused rotation + KV write: one launch over rows x 20 heads x
+                // (head_dim/2) element pairs, replacing (rope, kv_write).
                 let kv = &mut self.kv[i];
-                s.launch_builder(&self.ops.kv_write)
-                    .arg(&w.qkv)
+                s.launch_builder(&self.ops.rope_kv)
+                    .arg(&mut w.qkv)
                     .arg(&mut kv.k)
                     .arg(&mut kv.v)
                     .arg(&w.position)
@@ -891,8 +945,12 @@ impl Engine {
                     .arg(&qh)
                     .arg(&kh)
                     .arg(&dim)
+                    .arg(&c.rope_theta)
                     .arg(&cap)
-                    .launch(flat(rows * c.kv_dim()))?;
+                    .launch(flat(
+                        rows * (c.num_attention_heads + 2 * c.num_key_value_heads)
+                            * (c.head_dim / 2),
+                    ))?;
             },
             crate::backend::Operator::Attention => {
                 self.run_attention(i, step)?;
@@ -963,24 +1021,25 @@ impl Engine {
                 } else {
                     &self.weights.norm
                 };
-                w.add_norm(&self.ops, s, weight, rows, c)?;
                 if let Some(spec) = self.spec.as_mut()
                     && let Some(slot) =
                         crate::dspark::capture_slot(&spec.draft.config.target_layer_ids, i)
                 {
-                    super::copy::columns(
+                    // Capture layer: the residual stream this writes is the
+                    // capture source, so the copy is folded into the norm.
+                    w.add_norm_capture(
+                        &self.ops,
                         s,
-                        &w.x,
-                        &mut spec.capture,
-                        super::copy::Rect {
-                            rows,
-                            width: h,
-                            src_pitch: h,
-                            src_col: 0,
-                            dst_pitch: 5 * h,
-                            dst_col: slot * h,
+                        weight,
+                        Capture {
+                            buffer: &mut spec.capture,
+                            slot,
                         },
+                        rows,
+                        c,
                     )?;
+                } else {
+                    w.add_norm(&self.ops, s, weight, rows, c)?;
                 }
                 trace_value(trace, s, &format!("layer.{i}"), &w.x, trace_rows, h)?;
             }
