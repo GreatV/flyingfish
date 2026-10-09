@@ -539,14 +539,22 @@ impl Draft {
         Ok(())
     }
 
-    pub fn distributions_batch(
+    pub fn setup_markov(
         &mut self,
         d: &Device,
+        ops: &super::ops::Ops,
+        dir: &std::path::Path,
+    ) -> Result<()> {
+        if self.markov.is_none() {
+            self.markov = Some(super::markov::Markov::new(d, ops, dir)?);
+        }
+        Ok(())
+    }
+
+    pub fn distributions_batch(
+        &mut self,
         requests: &[(u8, u32)],
     ) -> Result<Vec<crate::backend::Top4>> {
-        if self.markov.is_none() {
-            self.markov = Some(super::markov::Markov::new(d)?);
-        }
         self.markov
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Markov module is not initialized"))?
