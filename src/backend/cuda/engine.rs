@@ -224,6 +224,7 @@ struct Spec {
     eos: Vec<u32>,
     tree_verify_graph: Option<CudaGraph>,
     tree_commit_graph: Option<CudaGraph>,
+    tree_draft_graph: Option<CudaGraph>,
     draft_graph: Option<CudaGraph>,
     verify_graph: Option<CudaGraph>,
     inject_graphs: Vec<Option<CudaGraph>>,
@@ -422,6 +423,7 @@ impl Engine {
                 eos: Vec::new(),
                 tree_verify_graph: None,
                 tree_commit_graph: None,
+                tree_draft_graph: None,
                 tree: if engine.spec_budget.is_tree() {
                     Some(super::tree::State::new(
                         &engine.device,
@@ -2062,6 +2064,56 @@ impl Engine {
         Ok(())
     }
 
+    fn run_tree_draft_device(&mut self, start: usize) -> Result<()> {
+        self.spec
+            .as_mut()
+            .context("draft is not enabled")?
+            .draft
+            .forward_base_device(
+                &self.work.token,
+                &self.work.position,
+                start,
+                &self.weights,
+                super::draft::Compute {
+                    ops: &self.ops,
+                    blas: &mut self.blas,
+                    config: &self.config,
+                },
+            )
+    }
+
+    fn ensure_tree_draft_graph(&mut self, start: usize) -> Result<()> {
+        if self
+            .spec
+            .as_ref()
+            .context("draft is not enabled")?
+            .tree_draft_graph
+            .is_some()
+        {
+            return Ok(());
+        }
+        let timer = std::time::Instant::now();
+        let s = self.device.stream.clone();
+        self.run_tree_draft_device(start)?;
+        s.synchronize()?;
+        s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let launched = self.run_tree_draft_device(start);
+        let captured = s.end_capture(sys::CUgraphInstantiate_flags(0));
+        launched?;
+        let graph = captured?.context("empty tree draft Graph")?;
+        graph.upload()?;
+        s.synchronize()?;
+        self.spec
+            .as_mut()
+            .context("draft is not enabled")?
+            .tree_draft_graph = Some(graph);
+        eprintln!(
+            "{}",
+            serde_json::json!({"tree_graph_setup":{"phase":"draft","rows":7,"capacity":self.capacity,"wall_ms":timer.elapsed().as_secs_f64()*1000.0}})
+        );
+        Ok(())
+    }
+
     pub fn spec_round(
         &mut self,
         limit: usize,
@@ -2253,22 +2305,42 @@ impl Engine {
         );
         let anchor = self.token()?;
         let draft_start = std::time::Instant::now();
+        let graph = self
+            .spec
+            .as_ref()
+            .context("tree round requires enabled draft State")?
+            .graph;
         let spec = self
             .spec
             .as_mut()
             .context("tree round requires enabled draft State")?;
         spec.draft
             .setup_attention(&self.device, &self.ops, &self.config, &self.runtime)?;
-        spec.draft.forward_base(
-            anchor,
-            start,
-            &self.weights,
-            super::draft::Compute {
-                ops: &self.ops,
-                blas: &mut self.blas,
-                config: &self.config,
-            },
-        )?;
+        if graph {
+            self.ensure_tree_draft_graph(start)?;
+            self.spec
+                .as_mut()
+                .context("tree round requires enabled draft State")?
+                .tree_draft_graph
+                .as_ref()
+                .context("tree draft Graph is not captured")?
+                .launch()?;
+        } else {
+            let spec = self
+                .spec
+                .as_mut()
+                .context("tree round requires enabled draft State")?;
+            spec.draft.forward_base(
+                anchor,
+                start,
+                &self.weights,
+                super::draft::Compute {
+                    ops: &self.ops,
+                    blas: &mut self.blas,
+                    config: &self.config,
+                },
+            )?;
+        }
         self.device.stream.synchronize()?;
         let base_ms = draft_start.elapsed().as_secs_f64() * 1000.0;
         let build_start = std::time::Instant::now();

@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{config::Config, dspark::DraftConfig, trace::Trace};
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtrMut, PushKernelArg};
 use half::bf16;
 use std::{path::Path, sync::Arc};
 
@@ -135,6 +135,7 @@ pub struct Draft {
     rows: usize,
     stream: Arc<CudaStream>,
     attention: Option<Verification>,
+    qknorm_rope_kv: cudarc::driver::CudaFunction,
     ids: CudaSlice<u32>,
     position: CudaSlice<i32>,
     x: CudaSlice<bf16>,
@@ -144,8 +145,6 @@ pub struct Draft {
     out: CudaSlice<bf16>,
     gu: CudaSlice<bf16>,
     act: CudaSlice<bf16>,
-    q_raw: CudaSlice<bf16>,
-    q_norm: CudaSlice<bf16>,
     k_raw: CudaSlice<bf16>,
     k_norm: CudaSlice<bf16>,
     v_raw: CudaSlice<bf16>,
@@ -222,6 +221,8 @@ impl Draft {
             config.num_hidden_layers * capacity * kv * 4
         );
         let mask = config.mask_token_id;
+        let qknorm_rope_kv =
+            super::cubin::module(&d.ctx, "rope")?.load_function("draft_qknorm_rope_kv")?;
         Ok(Self {
             markov: None,
             config,
@@ -231,6 +232,7 @@ impl Draft {
             rows,
             stream: s.clone(),
             attention: None,
+            qknorm_rope_kv,
             ids: s.clone_htod(&[mask; 7])?,
             position: s.alloc_zeros(1)?,
             x: s.alloc_zeros(7 * h)?,
@@ -240,8 +242,6 @@ impl Draft {
             out: s.alloc_zeros(7 * h)?,
             gu: s.alloc_zeros(7 * 2 * f)?,
             act: s.alloc_zeros(7 * f)?,
-            q_raw: s.alloc_zeros(7 * h)?,
-            q_norm: s.alloc_zeros(7 * h)?,
             k_raw: s.alloc_zeros(rows * kv)?,
             k_norm: s.alloc_zeros(rows * kv)?,
             v_raw: s.alloc_zeros(rows * kv)?,
@@ -524,6 +524,21 @@ impl Draft {
         Ok(())
     }
 
+    pub fn forward_base_device(
+        &mut self,
+        anchor: &CudaSlice<u32>,
+        position: &CudaSlice<i32>,
+        start: usize,
+        target: &Weights,
+        compute: Compute<'_>,
+    ) -> Result<()> {
+        self.stream
+            .memcpy_dtod(anchor, &mut self.ids.slice_mut(..1))?;
+        self.stream.memcpy_dtod(position, &mut self.position)?;
+        self.block(start, target, compute, None, None, Output::Base)?;
+        Ok(())
+    }
+
     pub fn distributions_batch(
         &mut self,
         d: &Device,
@@ -598,8 +613,29 @@ impl Draft {
         let s = &self.stream;
         let h = c.hidden_size;
         let f = c.intermediate_size;
-        let kv = c.kv_dim();
         let qkv = c.qkv_dim();
+        let eps = self.config.rms_norm_eps;
+        let add_norm = |ops: &Ops,
+                        res: &CudaSlice<bf16>,
+                        x: &mut CudaSlice<bf16>,
+                        weight: &CudaSlice<bf16>,
+                        output: &mut CudaSlice<bf16>|
+         -> Result<()> {
+            let (xp, _x) = x.device_ptr_mut(s);
+            unsafe {
+                s.launch_builder(&ops.add_norm)
+                    .arg(res)
+                    .arg(&xp)
+                    .arg(weight)
+                    .arg(output)
+                    .arg(&xp)
+                    .arg(&7i32)
+                    .arg(&(h as i32))
+                    .arg(&eps)
+                    .launch(grid(7, 256))?;
+            }
+            Ok(())
+        };
         unsafe {
             s.launch_builder(&ops.embed)
                 .arg(&target.embed)
@@ -610,15 +646,17 @@ impl Draft {
                 .launch(flat(7 * h))?;
         }
         for (i, layer) in self.weights.layers.iter().enumerate() {
-            norm(
-                s,
-                ops,
-                &self.x,
-                &layer.block.input_norm,
-                &mut self.n,
-                (7, h),
-                self.config.rms_norm_eps,
-            )?;
+            if i == 0 {
+                norm(
+                    s,
+                    ops,
+                    &self.x,
+                    &layer.block.input_norm,
+                    &mut self.n,
+                    (7, h),
+                    self.config.rms_norm_eps,
+                )?;
+            }
             blas.linear(
                 &layer.block.qkv,
                 &self.n.slice(..7 * h),
@@ -627,100 +665,26 @@ impl Draft {
                 qkv,
                 h,
             )?;
-            columns(
-                s,
-                &self.qkv,
-                &mut self.q_raw,
-                Rect {
-                    rows: 7,
-                    width: h,
-                    src_pitch: qkv,
-                    src_col: 0,
-                    dst_pitch: h,
-                    dst_col: 0,
-                },
-            )?;
-            norm(
-                s,
-                ops,
-                &self.q_raw,
-                &layer.q_norm,
-                &mut self.q_norm,
-                (7 * c.num_attention_heads, c.head_dim),
-                self.config.rms_norm_eps,
-            )?;
-            columns(
-                s,
-                &self.q_norm,
-                &mut self.qkv,
-                Rect {
-                    rows: 7,
-                    width: h,
-                    src_pitch: h,
-                    src_col: 0,
-                    dst_pitch: qkv,
-                    dst_col: 0,
-                },
-            )?;
-            columns(
-                s,
-                &self.qkv,
-                &mut self.k_raw,
-                Rect {
-                    rows: 7,
-                    width: kv,
-                    src_pitch: qkv,
-                    src_col: h,
-                    dst_pitch: kv,
-                    dst_col: 0,
-                },
-            )?;
-            norm(
-                s,
-                ops,
-                &self.k_raw,
-                &layer.k_norm,
-                &mut self.k_norm,
-                (7 * c.num_key_value_heads, c.head_dim),
-                self.config.rms_norm_eps,
-            )?;
-            columns(
-                s,
-                &self.k_norm,
-                &mut self.qkv,
-                Rect {
-                    rows: 7,
-                    width: kv,
-                    src_pitch: kv,
-                    src_col: 0,
-                    dst_pitch: qkv,
-                    dst_col: h,
-                },
-            )?;
             let cache = &mut self.kv[i];
             unsafe {
-                s.launch_builder(&ops.rope_float)
+                s.launch_builder(&self.qknorm_rope_kv)
                     .arg(&mut self.qkv)
-                    .arg(&self.position)
-                    .arg(&7i32)
-                    .arg(&(c.num_attention_heads as i32))
-                    .arg(&(c.num_key_value_heads as i32))
-                    .arg(&(c.head_dim as i32))
-                    .arg(&c.rope_theta)
-                    .launch(flat(
-                        7 * (c.num_attention_heads + c.num_key_value_heads) * c.head_dim / 2,
-                    ))?;
-                s.launch_builder(&ops.kv_write)
-                    .arg(&self.qkv)
-                    .arg(&mut cache.k)
-                    .arg(&mut cache.v)
+                    .arg(&cache.k)
+                    .arg(&cache.v)
+                    .arg(&layer.q_norm)
+                    .arg(&layer.k_norm)
                     .arg(&self.position)
                     .arg(&7i32)
                     .arg(&(c.num_attention_heads as i32))
                     .arg(&(c.num_key_value_heads as i32))
                     .arg(&(c.head_dim as i32))
                     .arg(&(self.capacity as i32))
-                    .launch(flat(7 * kv))?;
+                    .arg(&c.rope_theta)
+                    .arg(&self.config.rms_norm_eps)
+                    .launch(grid(
+                        7 * (c.num_attention_heads + 2 * c.num_key_value_heads),
+                        256,
+                    ))?;
             }
             self.attention
                 .as_mut()
@@ -748,21 +712,12 @@ impl Draft {
                 h,
                 h,
             )?;
-            unsafe {
-                s.launch_builder(&ops.residual)
-                    .arg(&mut self.x)
-                    .arg(&self.out)
-                    .arg(&((7 * h) as i32))
-                    .launch(flat(7 * h))?;
-            }
-            norm(
-                s,
+            add_norm(
                 ops,
-                &self.x,
+                &self.out,
+                &mut self.x,
                 &layer.block.post_norm,
                 &mut self.n,
-                (7, h),
-                self.config.rms_norm_eps,
             )?;
             blas.linear(
                 &layer.block.gu,
@@ -788,23 +743,13 @@ impl Draft {
                 h,
                 f,
             )?;
-            unsafe {
-                s.launch_builder(&ops.residual)
-                    .arg(&mut self.x)
-                    .arg(&self.out)
-                    .arg(&((7 * h) as i32))
-                    .launch(flat(7 * h))?;
-            }
+            let weight = if i + 1 < self.weights.layers.len() {
+                &self.weights.layers[i + 1].block.input_norm
+            } else {
+                &self.weights.norm
+            };
+            add_norm(ops, &self.out, &mut self.x, weight, &mut self.n)?;
         }
-        norm(
-            s,
-            ops,
-            &self.x,
-            &self.weights.norm,
-            &mut self.n,
-            (7, h),
-            self.config.rms_norm_eps,
-        )?;
         blas.linear(
             &target.head,
             &self.n.slice(..7 * h),
