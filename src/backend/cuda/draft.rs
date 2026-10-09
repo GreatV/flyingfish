@@ -457,8 +457,8 @@ impl Draft {
         if self.attention.is_some() {
             return Ok(());
         }
-        let measured = super::multi_calibrate::load(d, ops, c, dir, 7, false)?;
-        let (plan, selection) = measured.choose(self.capacity);
+        let measured = super::multi_calibrate::load(d, ops, c, dir, 7, false, self.capacity)?;
+        let (plan, selection) = measured.choose(self.capacity)?;
         eprintln!(
             "{}",
             serde_json::json!({"backend_setup":{"role":"draft","rows":7,"causal":false,"attention":plan,"selection":selection,"calibration":measured}})

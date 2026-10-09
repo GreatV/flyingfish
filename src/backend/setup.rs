@@ -146,3 +146,59 @@ impl Setup {
         Plan::new(c, capacity, requested, free, total, alignment, false)
     }
 }
+
+pub const ATTENTION_LENGTHS: [usize; 5] = [1024, 8192, 32768, 65536, 130752];
+
+pub fn attention_bucket(capacity: usize) -> Result<usize> {
+    ensure!(
+        (1..=131072).contains(&capacity),
+        "attention capacity {capacity} is outside 1..=131072"
+    );
+    Ok(match capacity {
+        1..=2048 => 0,
+        2049..=16384 => 1,
+        16385..=49152 => 2,
+        49153..=98304 => 3,
+        _ => 4,
+    })
+}
+
+pub fn attention_chunks(bucket: usize) -> &'static [usize] {
+    if bucket < 3 {
+        &[128, 256, 512, 1024]
+    } else {
+        &[256, 512, 1024, 2048, 4096]
+    }
+}
+
+#[cfg(test)]
+mod long_tests {
+    use super::*;
+
+    #[test]
+    fn long_buckets_cover_capacity_and_growth() -> Result<()> {
+        for (capacity, expected) in [
+            (2048, 0),
+            (2049, 1),
+            (16384, 1),
+            (16385, 2),
+            (33024, 2),
+            (66048, 3),
+            (131072, 4),
+        ] {
+            assert_eq!(attention_bucket(capacity)?, expected);
+        }
+        assert!(attention_bucket(0).is_err());
+        assert!(attention_bucket(131073).is_err());
+        for length in ATTENTION_LENGTHS {
+            assert!(length + 256 + 64 <= 131072);
+        }
+        for capacity in [66048usize, 131072] {
+            assert!(capacity * 128 < i32::MAX as usize);
+            for &chunk in attention_chunks(attention_bucket(capacity)?) {
+                assert!((2 * capacity.div_ceil(chunk) + 256) * 4 <= 49152);
+            }
+        }
+        Ok(())
+    }
+}

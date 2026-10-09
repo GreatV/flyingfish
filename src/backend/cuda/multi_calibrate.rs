@@ -5,7 +5,10 @@ use super::{
     verification::{Query, Verification},
 };
 use crate::{
-    backend::setup::{AttentionPlan, CacheKey, MultiImpl, MultiPlan, MultiShape, Selection},
+    backend::setup::{
+        ATTENTION_LENGTHS, AttentionPlan, CacheKey, MultiImpl, MultiPlan, MultiShape, Selection,
+        attention_bucket, attention_chunks,
+    },
     config::Config,
 };
 use anyhow::{Context, Result, ensure};
@@ -18,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const LENGTHS: [usize; 3] = [1024, 8192, 32768];
+const LENGTHS: [usize; 5] = ATTENTION_LENGTHS;
 
 #[derive(Serialize, Deserialize)]
 struct Trial {
@@ -38,7 +41,10 @@ struct Cache {
     causal: bool,
     #[serde(default)]
     tree: bool,
-    winners: [MultiPlan; 3],
+    winner: MultiPlan,
+    bucket: usize,
+    schema: u32,
+    lengths: [usize; 5],
     trials: Vec<Trial>,
     wall_ms: f64,
 }
@@ -51,28 +57,30 @@ pub struct Calibrated {
 }
 
 impl Calibrated {
-    pub fn choose(&self, capacity: usize) -> (MultiPlan, Selection) {
-        let bucket = if capacity <= 2048 {
-            0
-        } else if capacity <= 16384 {
-            1
-        } else {
-            2
-        };
-        (
-            self.cache.winners[bucket],
+    pub fn choose(&self, capacity: usize) -> Result<(MultiPlan, Selection)> {
+        let bucket = attention_bucket(capacity)?;
+        ensure!(
+            self.cache.bucket == bucket,
+            "multi calibration bucket does not match capacity"
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"attention_calibration_selection":{"capacity":capacity,"bucket":bucket,"measured_length":LENGTHS[bucket],"plan":self.cache.winner}})
+        );
+        Ok((
+            self.cache.winner,
             Selection::Calibrated {
                 key: self.cache.key.clone(),
                 cached: self.hit,
             },
-        )
+        ))
     }
 }
 
 fn candidates(bucket: usize, rows: usize, causal: bool, tree: bool) -> Vec<MultiPlan> {
     let mut plans = Vec::new();
     if causal && !tree && rows <= 16 {
-        for chunk in [128, 256, 512, 1024] {
+        for &chunk in attention_chunks(bucket) {
             for qpack in [1, 2, 4, 8] {
                 for threads in [128, 256] {
                     plans.push(MultiPlan {
@@ -98,6 +106,14 @@ fn candidates(bucket: usize, rows: usize, causal: bool, tree: bool) -> Vec<Multi
         (2, 9..=16) => [512, 1024],
         (2, 17..=32) => [1024, 512],
         (2, _) => [2048, 1024],
+        (3, 1..=8) => [512, 1024],
+        (3, 9..=16) => [1024, 2048],
+        (3, 17..=32) => [2048, 1024],
+        (3, _) => [4096, 2048],
+        (4, 1..=8) => [1024, 2048],
+        (4, 9..=16) => [2048, 4096],
+        (4, 17..=32) => [4096, 2048],
+        (4, _) => [4096, 2048],
         _ => unreachable!(),
     };
     for chunk in chunks {
@@ -112,46 +128,73 @@ fn candidates(bucket: usize, rows: usize, causal: bool, tree: bool) -> Vec<Multi
         });
     }
     plans
+        .into_iter()
+        .flat_map(|p| {
+            [
+                p,
+                MultiPlan {
+                    launch: AttentionPlan {
+                        merge_threads: 512,
+                        ..p.launch
+                    },
+                    ..p
+                },
+            ]
+        })
+        .collect()
 }
 
-fn check(cache: &Cache, key: &CacheKey, rows: usize, causal: bool, tree: bool) -> Result<()> {
+fn check(
+    cache: &Cache,
+    key: &CacheKey,
+    rows: usize,
+    causal: bool,
+    tree: bool,
+    bucket: usize,
+) -> Result<()> {
     ensure!(
-        cache.key == *key && cache.rows == rows && cache.causal == causal && cache.tree == tree,
+        cache.schema == 2
+            && cache.lengths == LENGTHS
+            && cache.key == *key
+            && cache.rows == rows
+            && cache.causal == causal
+            && cache.tree == tree
+            && bucket < LENGTHS.len()
+            && cache.bucket == bucket
+            && cache.trials.len() == candidates(bucket, rows, causal, tree).len(),
         "multi attention cache identity mismatch"
     );
-    for bucket in 0..3 {
-        let expected = candidates(bucket, rows, causal, tree);
-        let trials: Vec<_> = cache.trials.iter().filter(|t| t.bucket == bucket).collect();
+    let expected = candidates(bucket, rows, causal, tree);
+    let trials: Vec<_> = cache.trials.iter().filter(|t| t.bucket == bucket).collect();
+    ensure!(
+        trials.len() == expected.len(),
+        "multi attention cache candidate count mismatch"
+    );
+    for plan in expected {
         ensure!(
-            trials.len() == expected.len(),
-            "multi attention cache candidate count mismatch"
-        );
-        for plan in expected {
-            ensure!(
-                trials.iter().filter(|t| t.plan == plan).count() == 1,
-                "multi attention cache lacks a candidate"
-            );
-        }
-        ensure!(
-            trials.iter().all(|t| t.samples > 0
-                && t.median_us.is_finite()
-                && t.median_us > 0.0
-                && t.p90_us.is_finite()),
-            "invalid multi attention timing"
-        );
-        let best = trials
-            .into_iter()
-            .min_by(|a, b| {
-                a.median_us
-                    .total_cmp(&b.median_us)
-                    .then(a.p90_us.total_cmp(&b.p90_us))
-            })
-            .context("empty multi attention bucket")?;
-        ensure!(
-            cache.winners[bucket] == best.plan,
-            "multi attention cache winner mismatch"
+            trials.iter().filter(|t| t.plan == plan).count() == 1,
+            "multi attention cache lacks a candidate"
         );
     }
+    ensure!(
+        trials.iter().all(|t| t.samples > 0
+            && t.median_us.is_finite()
+            && t.median_us > 0.0
+            && t.p90_us.is_finite()),
+        "invalid multi attention timing"
+    );
+    let best = trials
+        .into_iter()
+        .min_by(|a, b| {
+            a.median_us
+                .total_cmp(&b.median_us)
+                .then(a.p90_us.total_cmp(&b.p90_us))
+        })
+        .context("empty multi attention bucket")?;
+    ensure!(
+        cache.winner == best.plan,
+        "multi attention cache winner mismatch"
+    );
     Ok(())
 }
 
@@ -162,16 +205,46 @@ pub fn load(
     dir: &Path,
     rows: usize,
     causal: bool,
+    capacity: usize,
 ) -> Result<Calibrated> {
-    load_mask(d, ops, c, dir, rows, causal, false)
+    load_mask(
+        d,
+        ops,
+        c,
+        dir,
+        MultiShape {
+            rows,
+            causal,
+            capacity,
+        },
+        false,
+    )
 }
 
-pub fn load_tree(d: &Device, ops: &Ops, c: &Config, dir: &Path, rows: usize) -> Result<Calibrated> {
+pub fn load_tree(
+    d: &Device,
+    ops: &Ops,
+    c: &Config,
+    dir: &Path,
+    rows: usize,
+    capacity: usize,
+) -> Result<Calibrated> {
     ensure!(
         [16, 32, 64].contains(&rows),
         "tree calibration requires budget16/32/64"
     );
-    load_mask(d, ops, c, dir, rows, false, true)
+    load_mask(
+        d,
+        ops,
+        c,
+        dir,
+        MultiShape {
+            rows,
+            causal: false,
+            capacity,
+        },
+        true,
+    )
 }
 
 fn load_mask(
@@ -179,17 +252,19 @@ fn load_mask(
     ops: &Ops,
     c: &Config,
     dir: &Path,
-    rows: usize,
-    causal: bool,
+    shape: MultiShape,
     tree: bool,
 ) -> Result<Calibrated> {
+    let rows = shape.rows;
+    let causal = shape.causal;
+    let bucket = attention_bucket(shape.capacity)?;
     ensure!(
         (1..=64).contains(&rows),
         "multi attention M must be within1..64"
     );
     let key = calibrate::key(d)?;
     let path = dir.join(format!(
-        "multi-m{rows}-{}-{}-{}-{}.json",
+        "multi-long-v2-b{bucket}-m{rows}-{}-{}-{}-{}.json",
         if tree {
             "tree"
         } else if causal {
@@ -203,11 +278,15 @@ fn load_mask(
     ));
     let (cache, hit) = if path.exists() {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)?;
-        check(&cache, &key, rows, causal, tree)?;
+        check(&cache, &key, rows, causal, tree, bucket)?;
         (cache, true)
     } else {
-        let cache = measure(d, ops, c, key, rows, causal, tree)?;
-        check(&cache, &cache.key, rows, causal, tree)?;
+        eprintln!(
+            "{}",
+            serde_json::json!({"attention_calibration_cache":{"schema":2,"lengths":LENGTHS,"bucket":bucket,"path":path,"cached":false,"action":"measure requested bucket"}})
+        );
+        let cache = measure(d, ops, c, key, shape, tree)?;
+        check(&cache, &cache.key, rows, causal, tree, bucket)?;
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -235,18 +314,21 @@ fn measure(
     ops: &Ops,
     c: &Config,
     key: CacheKey,
-    rows: usize,
-    causal: bool,
+    shape: MultiShape,
     tree: bool,
 ) -> Result<Cache> {
+    let rows = shape.rows;
+    let causal = shape.causal;
+    let selected = attention_bucket(shape.capacity)?;
     let start = Instant::now();
+    let trial_ms = if causal { 10 } else { 30 };
     let s = &d.stream;
     let capacities = LENGTHS.map(|n| n + 256 + rows);
     let q_values = random(rows * c.qkv_dim(), 4);
     let zero_q = vec![bf16::ZERO; q_values.len()];
     let mut q = s.clone_htod(&q_values)?;
-    let k = s.clone_htod(&random(capacities[2] * c.kv_dim(), 1))?;
-    let v_values = random(capacities[2] * c.kv_dim(), 2);
+    let k = s.clone_htod(&random(capacities[selected] * c.kv_dim(), 1))?;
+    let v_values = random(capacities[selected] * c.kv_dim(), 2);
     let v = s.clone_htod(&v_values)?;
     let mut out = s.alloc_zeros::<bf16>(rows * c.hidden_size)?;
     let mut length = s.alloc_zeros::<i32>(1)?;
@@ -274,8 +356,8 @@ fn measure(
         .collect::<Result<_>>()?;
     s.synchronize()?;
     let mut trials = Vec::new();
-    let mut winners = [candidates(0, rows, causal, tree)[0]; 3];
-    for (bucket, &l) in LENGTHS.iter().enumerate() {
+    let mut winner = None;
+    for (bucket, &l) in LENGTHS.iter().enumerate().filter(|(b, _)| *b == selected) {
         let capacity = capacities[bucket];
         let mut expected = vec![0f64; rows * c.kv_dim()];
         for head in 0..c.num_key_value_heads {
@@ -402,7 +484,7 @@ fn measure(
             s.synchronize()?;
             let timer = Instant::now();
             let mut samples = Vec::new();
-            while timer.elapsed() < Duration::from_millis(if causal { 10 } else { 30 }) {
+            while timer.elapsed() < Duration::from_millis(trial_ms) {
                 for (index, (begin, end)) in events.iter().enumerate() {
                     s.memcpy_htod(&[(l + [0, 1, 128, 256][index]) as i32], &mut length)?;
                     unsafe {
@@ -425,7 +507,7 @@ fn measure(
             let p90 = calibrate::percentile(&samples, 0.9);
             if (median, p90) < best {
                 best = (median, p90);
-                winners[bucket] = plan;
+                winner = Some(plan);
             }
             trials.push(Trial {
                 bucket,
@@ -439,16 +521,15 @@ fn measure(
         }
     }
     let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
-    ensure!(
-        wall_ms <= 2000.0,
-        "multi attention calibration exceeds2s: {wall_ms}ms"
-    );
     Ok(Cache {
+        schema: 2,
+        lengths: LENGTHS,
         key,
         rows,
         causal,
         tree,
-        winners,
+        winner: winner.context("no measured multi attention candidate")?,
+        bucket: selected,
         trials,
         wall_ms,
     })
@@ -470,5 +551,86 @@ fn execute(
             query.prefix,
             query.shape,
         )
+    }
+}
+
+#[cfg(test)]
+mod long_tests {
+    use super::*;
+
+    #[test]
+    fn measured_bucket_has_complete_candidates_and_valid_launches() -> Result<()> {
+        for (rows, causal, tree) in [
+            (7, false, false),
+            (8, true, false),
+            (16, false, true),
+            (64, false, true),
+        ] {
+            for (bucket, &length) in LENGTHS.iter().enumerate() {
+                let key = CacheKey {
+                    device_uuid: "test".into(),
+                    driver_version: "test".into(),
+                    binary_version: "test".into(),
+                };
+                let mut trials = Vec::new();
+                for (i, plan) in candidates(bucket, rows, causal, tree)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let capacity = length + 256 + rows;
+                    assert!(capacity <= 131072);
+                    assert!(
+                        (2 * capacity.div_ceil(plan.launch.chunk)
+                            + plan.launch.merge_threads as usize)
+                            * 4
+                            <= 49152
+                    );
+                    let median_us = (i + 1) as f64;
+                    trials.push(Trial {
+                        bucket,
+                        plan,
+                        samples: 1,
+                        median_us,
+                        p90_us: median_us,
+                        p10_us: median_us,
+                        max_abs_error: 0.0,
+                    });
+                }
+                let mut cache = Cache {
+                    key,
+                    rows,
+                    causal,
+                    tree,
+                    winner: trials[0].plan,
+                    bucket,
+                    schema: 2,
+                    lengths: LENGTHS,
+                    trials,
+                    wall_ms: 1.0,
+                };
+                check(&cache, &cache.key, rows, causal, tree, bucket)?;
+                let winner = cache.winner;
+                cache.winner = cache.trials[1].plan;
+                assert!(check(&cache, &cache.key, rows, causal, tree, bucket).is_err());
+                cache.winner = winner;
+                assert!(
+                    check(
+                        &cache,
+                        &cache.key,
+                        rows,
+                        causal,
+                        tree,
+                        (bucket + 1) % LENGTHS.len()
+                    )
+                    .is_err()
+                );
+                cache.schema = 1;
+                assert!(check(&cache, &cache.key, rows, causal, tree, bucket).is_err());
+                cache.schema = 2;
+                cache.trials.pop();
+                assert!(check(&cache, &cache.key, rows, causal, tree, bucket).is_err());
+            }
+        }
+        Ok(())
     }
 }

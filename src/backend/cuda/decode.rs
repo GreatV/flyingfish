@@ -21,6 +21,14 @@ pub struct Attention {
 }
 
 impl Attention {
+    pub fn phase1_blocks_per_sm(&self) -> Result<usize> {
+        Ok(self.first.occupancy_max_active_blocks_per_multiprocessor(
+            self.first_launch.block_dim.0,
+            self.first_launch.shared_mem_bytes as usize,
+            None,
+        )? as usize)
+    }
+
     pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,

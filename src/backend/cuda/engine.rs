@@ -490,9 +490,14 @@ impl Engine {
         if self.decode.is_some() {
             return Ok(());
         }
-        let calibrated =
-            super::calibrate::load(&self.device, &self.ops, &self.config, &self.runtime)
-                .context("attention setup calibration")?;
+        let calibrated = super::calibrate::load(
+            &self.device,
+            &self.ops,
+            &self.config,
+            &self.runtime,
+            self.capacity,
+        )
+        .context("attention setup calibration")?;
         let setup = crate::backend::setup::Setup::select(
             self.device.info.clone(),
             &self.config,
@@ -1401,9 +1406,10 @@ impl Engine {
             &self.runtime,
             8,
             true,
+            self.capacity,
         )
         .context("MQ verification setup calibration")?;
-        let (attention, selection) = calibrated.choose(self.capacity);
+        let (attention, selection) = calibrated.choose(self.capacity)?;
         eprintln!(
             "{}",
             serde_json::json!({"backend_setup":{
@@ -1442,8 +1448,9 @@ impl Engine {
             &self.config,
             &self.runtime,
             rows,
+            self.capacity,
         )?;
-        let (plan, selection) = measured.choose(self.capacity);
+        let (plan, selection) = measured.choose(self.capacity)?;
         let attention = super::verification::Verification::with_plan(
             &self.device.ctx,
             &self.device.stream,
