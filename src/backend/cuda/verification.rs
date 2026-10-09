@@ -104,13 +104,26 @@ impl Verification {
         let chunks = capacity.div_ceil(plan.chunk);
         let first_smem = if implementation == MultiImpl::Tcmqa {
             35328
+        } else if implementation == MultiImpl::TcmqaW {
+            52736
         } else {
             plan.qpack * (plan.threads as usize / 32) * 130 * 4
         };
         let second_smem = (2 * chunks + plan.merge_threads as usize) * 4;
+        // TcmqaW's 52,736 B phase-1 tile needs the per-function opt-in set
+        // below; phase 2 has no opt-in anywhere, so it stays under 48 KiB.
+        let first_smem_limit = if implementation == MultiImpl::TcmqaW {
+            101 * 1024
+        } else {
+            48 * 1024
+        };
         ensure!(
-            first_smem.max(second_smem) <= 48 * 1024,
-            "MQ shared memory exceeds 48 KiB"
+            first_smem <= first_smem_limit,
+            "MQ phase-1 shared memory exceeds its limit"
+        );
+        ensure!(
+            second_smem <= 48 * 1024,
+            "MQ phase-2 shared memory exceeds 48 KiB"
         );
         let module = cubin::module(
             ctx,
@@ -123,6 +136,7 @@ impl Verification {
         let symbol = match implementation {
             MultiImpl::V1 => format!("flash_decode_mq_phase1_q{}", plan.qpack),
             MultiImpl::Tcmqa => "tcmqa_phase1".to_owned(),
+            MultiImpl::TcmqaW => "tcmqa_phase1_w".to_owned(),
         };
         ensure!(
             implementation != MultiImpl::V1 || causal,
@@ -134,7 +148,19 @@ impl Verification {
                 "TCMQA requires threads128 and chunk multiple64"
             );
         }
+        if implementation == MultiImpl::TcmqaW {
+            ensure!(
+                plan.threads == 256 && plan.chunk.is_multiple_of(64),
+                "TCMQA-W requires threads256 and chunk multiple64"
+            );
+        }
         let first = module.load_function(&symbol)?;
+        if implementation == MultiImpl::TcmqaW {
+            first.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                52736,
+            )?;
+        }
         let second = module.load_function(if implementation == MultiImpl::V1 {
             "flash_decode_mq_phase2"
         } else {
@@ -162,7 +188,7 @@ impl Verification {
             scratch: stream.alloc_zeros(rows * 16 * chunks * 130)?,
             shape,
             implementation,
-            anc: if implementation == MultiImpl::Tcmqa {
+            anc: if implementation != MultiImpl::V1 {
                 Some(stream.clone_htod(&masks)?)
             } else {
                 None
@@ -195,7 +221,7 @@ impl Verification {
 
     pub fn run_tree(&mut self, query: Query<'_>, anc: &CudaSlice<u64>) -> Result<()> {
         ensure!(
-            self.implementation == MultiImpl::Tcmqa && !query.shape.causal,
+            self.implementation != MultiImpl::V1 && !query.shape.causal,
             "tree attention requires a TCMQA tree plan"
         );
         ensure!(
@@ -266,12 +292,16 @@ impl Verification {
             first.launch(LaunchConfig {
                 grid_dim: if self.implementation == MultiImpl::Tcmqa {
                     (chunks as u32, 2, (8 * shape.rows).div_ceil(64) as u32)
+                } else if self.implementation == MultiImpl::TcmqaW {
+                    (chunks as u32, 2, (8 * shape.rows).div_ceil(128) as u32)
                 } else {
                     (chunks as u32, (16 / p.qpack) as u32, rows as u32)
                 },
                 block_dim: (p.threads, 1, 1),
                 shared_mem_bytes: if self.implementation == MultiImpl::Tcmqa {
                     35328
+                } else if self.implementation == MultiImpl::TcmqaW {
+                    52736
                 } else {
                     (p.qpack * (p.threads as usize / 32) * 130 * 4) as u32
                 },
@@ -302,6 +332,7 @@ impl Verification {
         match self.implementation {
             MultiImpl::V1 => "v1 flash_decode_mq",
             MultiImpl::Tcmqa => "TCMQA",
+            MultiImpl::TcmqaW => "TCMQA wide (128-row tile)",
         }
     }
 }
