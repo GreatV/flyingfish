@@ -33,13 +33,17 @@ struct Cache {
     wall_ms: f64,
 }
 
+pub(super) fn supports(shape: LinearShape) -> bool {
+    shape.rows > 0
+        && shape.rows <= 16
+        && shape.output > 0
+        && shape.input > 0
+        && shape.input.is_multiple_of(256)
+}
+
 pub(super) fn check_extent(shape: LinearShape, weights: usize, inputs: usize) -> Result<()> {
     ensure!(
-        shape.rows > 0
-            && shape.rows <= 16
-            && shape.output > 0
-            && shape.input > 0
-            && shape.input.is_multiple_of(256),
+        supports(shape),
         "invalid linear calibration shape: {shape:?}"
     );
     let required_w = shape

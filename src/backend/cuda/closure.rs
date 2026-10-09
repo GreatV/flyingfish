@@ -36,12 +36,15 @@ pub(crate) struct Closure {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Profile {
     pub linear: BTreeSet<LinearShape>,
+    pub pairs: Pairs,
     capacity: usize,
     chunk: usize,
     budget: Option<usize>,
     model: String,
     draft: Option<String>,
 }
+
+type Pairs = BTreeSet<(usize, usize)>;
 
 #[derive(PartialEq, Eq, Serialize, Deserialize)]
 struct Manifest {
@@ -63,63 +66,49 @@ fn shapes(
     chunk: usize,
     budget: Option<SpecBudget>,
     dimensions: Option<(usize, usize)>,
-) -> Result<BTreeSet<LinearShape>> {
+) -> Result<(BTreeSet<LinearShape>, Pairs)> {
     let mut linear = BTreeSet::new();
-    let mut layers = |rows| {
+    let mut pairs = BTreeSet::new();
+    let mut add = |rows, output, input| {
+        pairs.insert((output, input));
+        let shape = LinearShape {
+            rows,
+            output,
+            input,
+        };
+        if super::linear_calibrate::supports(shape) {
+            linear.insert(shape);
+        }
+    };
+    for rows in
+        (1..=chunk.min(capacity).min(16)).chain(budget.into_iter().flat_map(|b| [7, b.rows()]))
+    {
         for (output, input) in [
             (c.qkv_dim(), c.hidden_size),
             (c.hidden_size, c.hidden_size),
             (2 * c.intermediate_size, c.hidden_size),
             (c.hidden_size, c.intermediate_size),
         ] {
-            if rows <= 16 && input.is_multiple_of(256) {
-                linear.insert(LinearShape {
-                    rows,
-                    output,
-                    input,
-                });
-            }
+            add(rows, output, input);
         }
-    };
-    for rows in 1..=chunk.min(capacity).min(16) {
-        layers(rows);
     }
-    if let Some(budget) = budget {
-        layers(7);
-        layers(budget.rows());
-    }
-    let head = |rows| LinearShape {
-        rows,
-        output: c.vocab_size,
-        input: c.hidden_size,
-    };
-    linear.insert(head(1));
+    add(1, c.vocab_size, c.hidden_size);
     if let Some(budget) = budget {
         let (context, rank) =
             dimensions.context("draft dimensions missing from closure declaration")?;
-        linear.insert(head(7));
-        if budget.rows() <= 16 {
-            linear.insert(head(budget.rows()));
-        }
+        add(7, c.vocab_size, c.hidden_size);
+        add(budget.rows(), c.vocab_size, c.hidden_size);
         let max = chunk.min(capacity).clamp(8, 16);
         for rows in 1..=max {
             for (output, input) in [(c.hidden_size, context), (c.kv_dim(), c.hidden_size)] {
-                linear.insert(LinearShape {
-                    rows,
-                    output,
-                    input,
-                });
+                add(rows, output, input);
             }
         }
         if !budget.is_tree() {
-            linear.insert(LinearShape {
-                rows: 1,
-                output: c.vocab_size,
-                input: rank,
-            });
+            add(1, c.vocab_size, rank);
         }
     }
-    Ok(linear)
+    Ok((linear, pairs))
 }
 
 impl Profile {
@@ -133,9 +122,10 @@ impl Profile {
         draft_config: Option<&crate::dspark::DraftConfig>,
     ) -> Result<Self> {
         let dimensions = draft_config.map(|d| (d.capture_width(), d.markov_rank));
-        let linear = shapes(c, capacity, chunk, budget, dimensions)?;
+        let (linear, pairs) = shapes(c, capacity, chunk, budget, dimensions)?;
         Ok(Self {
             linear,
+            pairs,
             capacity,
             chunk,
             budget: budget.map(SpecBudget::rows),
@@ -319,15 +309,20 @@ impl Closure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn shape_closure_covers_prefill_and_all_commits() -> Result<()> {
-        let c: Config = serde_json::from_value(serde_json::json!({
+
+    fn config() -> Result<Config> {
+        Ok(serde_json::from_value(serde_json::json!({
             "model_type":"llama", "hidden_size":2048, "intermediate_size":6144,
             "num_hidden_layers":42,"num_attention_heads":16,"num_key_value_heads":2,
             "head_dim":128,"vocab_size":130560,"max_position_embeddings":131072,
             "rms_norm_eps":0.00001,"rope_theta":10000.0,"hidden_act":"silu",
             "tie_word_embeddings":false,"torch_dtype":"bfloat16","eos_token_id":[2]
-        }))?;
+        }))?)
+    }
+
+    #[test]
+    fn shape_closure_covers_prefill_and_all_commits() -> Result<()> {
+        let c = config()?;
         let draft: crate::dspark::DraftConfig = serde_json::from_value(serde_json::json!({
             "model_type":"dflash","architectures":[],"dtype":"bfloat16",
             "hidden_size":2048,"intermediate_size":6144,"num_hidden_layers":5,
@@ -340,16 +335,20 @@ mod tests {
         assert_eq!(draft.num_target_layers, 42);
         assert_eq!(draft.capture_width(), 10240);
         let dimensions = Some((draft.capture_width(), draft.markov_rank));
-        assert_eq!(shapes(&c, 33824, 32768, None, None)?.len(), 65);
+        assert_eq!(shapes(&c, 33824, 32768, None, None)?.0.len(), 65);
         assert_eq!(
-            shapes(&c, 33824, 32768, Some(SpecBudget::Chain), dimensions)?.len(),
+            shapes(&c, 33824, 32768, Some(SpecBudget::Chain), dimensions)?
+                .0
+                .len(),
             100
         );
         assert_eq!(
-            shapes(&c, 33824, 32768, Some(SpecBudget::Tree16), dimensions)?.len(),
+            shapes(&c, 33824, 32768, Some(SpecBudget::Tree16), dimensions)?
+                .0
+                .len(),
             99
         );
-        let small = shapes(&c, 4096, 1, Some(SpecBudget::Tree16), dimensions)?;
+        let (small, _) = shapes(&c, 4096, 1, Some(SpecBudget::Tree16), dimensions)?;
         for rows in 1..=8 {
             for (output, input) in [(2048, 10240), (256, 2048)] {
                 assert!(small.contains(&LinearShape {
@@ -369,8 +368,81 @@ mod tests {
             output: 2560,
             input: 2048
         }));
-        let wide = shapes(&c, 33824, 32768, Some(SpecBudget::Tree64), dimensions)?;
+        let (wide, _) = shapes(&c, 33824, 32768, Some(SpecBudget::Tree64), dimensions)?;
         assert!(wide.iter().all(|s| s.rows <= 16));
+        Ok(())
+    }
+
+    #[test]
+    fn calibration_excludes_unaligned_inputs() -> Result<()> {
+        let mut c = config()?;
+        for (hidden, intermediate) in [(384, 768), (512, 640)] {
+            c.hidden_size = hidden;
+            c.intermediate_size = intermediate;
+            c.num_attention_heads = hidden / c.head_dim;
+            c.num_key_value_heads = 1;
+            for budget in [
+                None,
+                Some(SpecBudget::Chain),
+                Some(SpecBudget::Tree16),
+                Some(SpecBudget::Tree64),
+            ] {
+                let (linear, _) = shapes(&c, 33824, 32768, budget, Some((5 * hidden, 128)))?;
+                assert!(!linear.is_empty());
+                for &shape in &linear {
+                    super::super::linear_calibrate::check_extent(
+                        shape,
+                        shape.output * shape.input,
+                        shape.rows * shape.input,
+                    )?;
+                }
+                if !hidden.is_multiple_of(256) {
+                    assert!(linear.iter().all(|s| s.output != c.vocab_size));
+                }
+                if !intermediate.is_multiple_of(256) {
+                    assert!(
+                        !linear
+                            .iter()
+                            .any(|s| s.output == hidden && s.input == intermediate)
+                    );
+                }
+                assert!(!linear.iter().any(|s| s.input == 128));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coverage_keeps_all_uncalibrated_pairs() -> Result<()> {
+        let mut c = config()?;
+        c.hidden_size = 384;
+        c.intermediate_size = 640;
+        c.num_attention_heads = 3;
+        c.num_key_value_heads = 1;
+        let base = BTreeSet::from([
+            (c.qkv_dim(), 384),
+            (384, 384),
+            (1280, 384),
+            (384, 640),
+            (c.vocab_size, 384),
+        ]);
+        for budget in [
+            None,
+            Some(SpecBudget::Chain),
+            Some(SpecBudget::Tree16),
+            Some(SpecBudget::Tree64),
+        ] {
+            let (linear, pairs) = shapes(&c, 33824, 32768, budget, Some((1920, 128)))?;
+            assert!(linear.is_empty());
+            let mut expected = base.clone();
+            if let Some(budget) = budget {
+                expected.extend([(384, 1920), (128, 384)]);
+                if !budget.is_tree() {
+                    expected.insert((c.vocab_size, 128));
+                }
+            }
+            assert_eq!(pairs, expected);
+        }
         Ok(())
     }
     #[test]
@@ -411,6 +483,7 @@ mod tests {
             };
             let profile = || Profile {
                 linear: BTreeSet::new(),
+                pairs: BTreeSet::new(),
                 capacity: 16,
                 chunk: 16,
                 budget: Some(16),

@@ -2795,7 +2795,7 @@ impl Engine {
             draft,
             self.spec.as_ref().map(|s| &s.draft.config),
         )?;
-        self.blas.declare(self.workspace_rows, &profile.linear);
+        self.blas.declare(self.workspace_rows, &profile.pairs);
         let key = super::calibrate::key(&self.device)?;
         let bucket = crate::backend::setup::attention_bucket(self.capacity)?;
         let mut paths: Vec<_> = profile

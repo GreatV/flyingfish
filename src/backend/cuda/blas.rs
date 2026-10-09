@@ -218,8 +218,8 @@ impl Blas {
         })
     }
 
-    pub fn declare(&mut self, rows: usize, shapes: &std::collections::BTreeSet<LinearShape>) {
-        self.coverage = Some((rows, shapes.iter().map(|s| (s.output, s.input)).collect()));
+    pub fn declare(&mut self, rows: usize, pairs: &std::collections::BTreeSet<(usize, usize)>) {
+        self.coverage = Some((rows, pairs.clone()));
     }
     pub fn choice_path(&self, shape: LinearShape) -> PathBuf {
         self.calibration.path(shape)
@@ -256,10 +256,10 @@ impl Blas {
             input,
         };
         ensure!(
-            rows > 16 || !input.is_multiple_of(256) || self.choices.borrow().contains_key(&shape),
+            !linear_calibrate::supports(shape) || self.choices.borrow().contains_key(&shape),
             "missing frozen linear choice: {shape:?}; run calibrate for this deployment"
         );
-        if rows > 16 || !input.is_multiple_of(256) {
+        if !linear_calibrate::supports(shape) {
             let (limit, pairs) = self
                 .coverage
                 .as_ref()
