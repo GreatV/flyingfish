@@ -4,6 +4,7 @@ pub mod config;
 pub mod dspark;
 pub mod model;
 pub mod prefill;
+pub mod serve;
 pub mod spec;
 pub mod tensors;
 pub mod tokenizer;

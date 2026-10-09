@@ -90,6 +90,10 @@ enum Command {
         )]
         trace_layer: Option<usize>,
     },
+    Serve {
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
     Bench {
         #[command(flatten)]
         input: Input,
@@ -434,6 +438,28 @@ fn run() -> Result<()> {
             dump,
             trace_layer,
         } => generate(&cli, input, *max_new_tokens, *graph, dump, *trace_layer),
+        Command::Serve { port } => {
+            let draft = cli
+                .draft_model
+                .as_ref()
+                .context("serve requires --draft-model")?
+                .canonicalize()?;
+            eprintln!("draft_model={}", draft.display());
+            flyingfish::serve::run(
+                cli.model.clone(),
+                Some(draft),
+                flyingfish::spec::Options {
+                    device: cli.device,
+                    capacity: cli.capacity,
+                    chunk: cli.chunk,
+                    backend: cli.kernels.clone(),
+                    count: 256,
+                    ignore_eos: false,
+                },
+                cli.model.clone(),
+                *port,
+            )
+        }
         Command::Bench {
             input,
             steps,

@@ -9,7 +9,11 @@ cuda = ["dep:cudarc"]
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+minijinja = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time"] }
+futures-util = "0.3"
 cudarc = { optional = true, version = "=0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "cublaslt", "dynamic-loading", "cuda-version-from-build-system", "f16"] }
 half = { version = "2", features = ["bytemuck"] }
 memmap2 = "0.9"
