@@ -26,8 +26,16 @@ impl Trace {
 
     pub fn read(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)?;
+        let (_, metadata) = SafeTensors::read_metadata(&bytes)?;
         let tensors = SafeTensors::deserialize(&bytes)?;
-        let mut result = Self::default();
+        let mut result = Self {
+            device: metadata
+                .metadata()
+                .as_ref()
+                .and_then(|m| m.get("device"))
+                .cloned(),
+            ..Self::default()
+        };
         for (name, tensor) in tensors.tensors() {
             ensure!(tensor.dtype() == Dtype::F32, "trace {name} must be FP32");
             result
@@ -122,6 +130,42 @@ impl Trace {
 #[cfg(test)]
 mod tests {
     use super::Trace;
+    use anyhow::Result;
+
+    fn roundtrip(trace: &Trace, name: &str) -> Result<Trace> {
+        let path = std::env::temp_dir().join(format!(
+            "flyingfish-trace-{name}-{}.safetensors",
+            std::process::id()
+        ));
+        trace.save(&path)?;
+        let result = Trace::read(&path);
+        std::fs::remove_file(path)?;
+        result
+    }
+
+    #[test]
+    fn device_survives_empty_and_populated_trace_roundtrips() -> Result<()> {
+        let mut trace = Trace::default();
+        trace.set_device("NVIDIA GeForce RTX 4090")?;
+        let mut trace = roundtrip(&trace, "device")?;
+        assert_eq!(trace.device.as_deref(), Some("NVIDIA GeForce RTX 4090"));
+        trace.add("hidden".into(), vec![2], vec![1.0, -0.5])?;
+        let trace = roundtrip(&trace, "device")?;
+        assert_eq!(trace.device.as_deref(), Some("NVIDIA GeForce RTX 4090"));
+        assert_eq!(trace.values("hidden")?, vec![1.0, -0.5]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_trace_rejects_a_different_device() -> Result<()> {
+        let mut trace = Trace::default();
+        trace.set_device("NVIDIA GeForce RTX 4090")?;
+        let mut trace = roundtrip(&trace, "mixed-device")?;
+        assert!(trace.set_device("NVIDIA RTX A4000").is_err());
+        assert_eq!(trace.device.as_deref(), Some("NVIDIA GeForce RTX 4090"));
+        trace.set_device("NVIDIA GeForce RTX 4090")?;
+        Ok(())
+    }
 
     #[test]
     fn trace_values_preserve_ieee754_bits() {
