@@ -60,6 +60,27 @@ pub(crate) struct Work {
 }
 
 impl Work {
+    fn grow(&mut self, stream: &Arc<CudaStream>, c: &Config, rows: usize) -> Result<()> {
+        ensure!(rows >= self.ids.len(), "workspace rows cannot shrink");
+        let ids = stream.alloc_zeros(rows)?;
+        let x = stream.alloc_zeros(rows * c.hidden_size)?;
+        let n = stream.alloc_zeros(rows * c.hidden_size)?;
+        let qkv = stream.alloc_zeros(rows * c.qkv_dim())?;
+        let attn = stream.alloc_zeros(rows * c.hidden_size)?;
+        let out = stream.alloc_zeros(rows * c.hidden_size)?;
+        let gu = stream.alloc_zeros(rows * 2 * c.intermediate_size)?;
+        let act = stream.alloc_zeros(rows * c.intermediate_size)?;
+        self.ids = ids;
+        self.x = x;
+        self.n = n;
+        self.qkv = qkv;
+        self.attn = attn;
+        self.out = out;
+        self.gu = gu;
+        self.act = act;
+        Ok(())
+    }
+
     fn add_norm(
         &mut self,
         ops: &Ops,
@@ -274,27 +295,9 @@ impl Engine {
         }
         let ops = Ops::new(&device.ctx).context("load CUDA operator modules")?;
         eprintln!("{}", serde_json::json!({"backend_device":device.info}));
-        let mut blas = Blas::new(&device, &ops, &runtime, settings.linear_choices.clone())?;
-        let (free, total) = device.ctx.mem_get_info()?;
-        let plan = crate::prefill::Plan::new(
-            &config,
-            capacity,
-            requested_chunk,
-            free,
-            total,
-            Flash::tile()?,
-        )?;
-        eprintln!("{}", serde_json::json!({"prefill_memory_plan":plan}));
-        let chunk = plan.chunk;
-        let workspace_rows = settings.spec_budget.workspace_rows(chunk);
-        ensure!(
-            workspace_rows <= plan.row_limit,
-            "workspace {workspace_rows} rows exceeds memory row budget {}",
-            plan.row_limit
-        );
-        for (output, input) in [(config.qkv_dim(), h), (h, h), (2 * f, h), (h, f)] {
-            blas.prepare(chunk, output, input)?;
-        }
+        let blas = Blas::new(&device, &ops, &runtime, settings.linear_choices.clone())?;
+        let workspace_rows = settings.spec_budget.rows().min(capacity);
+        let chunk = workspace_rows;
         let mut work = Work {
             ids: s.alloc_zeros(workspace_rows)?,
             position: s.alloc_zeros(1)?,
@@ -312,15 +315,7 @@ impl Engine {
         s.memcpy_htod(&[1i32], &mut work.length)?;
         let flash = Flash::new(s.clone(), chunk, config.num_attention_heads)?;
         s.synchronize()?;
-        let (free, total) = device.ctx.mem_get_info()?;
-        eprintln!(
-            "weights_bytes={} kv_bytes={} device_used_bytes={} device_total_bytes={}",
-            weights.bytes,
-            2 * config.num_hidden_layers * capacity * config.kv_dim() * 2,
-            total - free,
-            total
-        );
-        let engine = Self {
+        let mut engine = Self {
             poisoned: false,
             spec_budget: settings.spec_budget,
             spec_graph: settings.spec_graph,
@@ -345,7 +340,150 @@ impl Engine {
             trace_layer: 0,
             position: 0,
         };
+        if let Some(path) = settings.draft_model {
+            let path = path.canonicalize()?;
+            ensure!(
+                engine.spec_budget.rows() <= engine.capacity,
+                "draft workspace needs {} KV rows but capacity is {}",
+                engine.spec_budget.rows(),
+                engine.capacity
+            );
+            let draft = super::draft::Draft::new(
+                &path,
+                &engine.device,
+                &engine.config,
+                engine.capacity,
+                engine.workspace_rows,
+                &mut engine.blas,
+            )?;
+            engine.prepare(8)?;
+            engine
+                .blas
+                .prepare(8, engine.config.vocab_size, engine.config.hidden_size)?;
+            let rows = engine.spec_budget.rows();
+            if engine.spec_budget.is_tree() {
+                engine.prepare(rows)?;
+                engine
+                    .blas
+                    .prepare(rows, engine.config.vocab_size, engine.config.hidden_size)?;
+            }
+            let s = &engine.device.stream;
+            let count_values: Vec<_> = (1..=rows).map(|n| n as i32).collect();
+            let row_counts = s.clone_htod(&count_values)?;
+            s.synchronize()?;
+            engine.spec = Some(Spec {
+                eos: Vec::new(),
+                tree_verify_graph: None,
+                tree_commit_graph: None,
+                tree: if engine.spec_budget.is_tree() {
+                    Some(super::tree::State::new(
+                        &engine.device,
+                        &engine.config,
+                        &engine.kv,
+                        engine.capacity,
+                        rows,
+                    )?)
+                } else {
+                    None
+                },
+                tree_attention: None,
+                active_rows: 0,
+                graph: engine.spec_graph,
+                draft_graph: None,
+                verify_graph: None,
+                inject_graphs: (0..8).map(|_| None).collect(),
+                verification: None,
+                draft,
+                capture: s.alloc_zeros(engine.workspace_rows * 5 * engine.config.hidden_size)?,
+                logits: s.alloc_zeros(rows * engine.config.vocab_size)?,
+                predictions: s.alloc_zeros(rows)?,
+                row_counts,
+            });
+        }
+        engine.size_workspace(requested_chunk)?;
+        if engine.spec.is_some() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"spec_execution":{"graph":engine.spec_graph,"budget":engine.spec_budget,"draft_rows":7,"verify_rows":engine.spec_budget.rows(),"workspace_rows":engine.workspace_rows,"inject_rows":"actual committed M1..8","acceptance":"host greedy prefix"}})
+            );
+        }
+        engine.device.stream.synchronize()?;
+        let (free, total) = engine.device.ctx.mem_get_info()?;
+        let kv_bytes: usize = engine
+            .kv
+            .iter()
+            .map(|kv| (kv.k.len() + kv.v.len()) * size_of::<bf16>())
+            .sum();
+        eprintln!(
+            "weights_bytes={} kv_bytes={} device_used_bytes={} device_total_bytes={}",
+            engine.weights.bytes,
+            kv_bytes,
+            total - free,
+            total
+        );
         Ok(engine)
+    }
+
+    fn grow_rows(&mut self, rows: usize, chunk: usize) -> Result<()> {
+        let old_rows = self.workspace_rows;
+        let old_chunk = self.chunk;
+        ensure!(rows >= old_rows, "workspace cannot shrink during load");
+        if rows != old_rows {
+            self.work.grow(&self.device.stream, &self.config, rows)?;
+            if let Some(spec) = &mut self.spec {
+                spec.draft.grow(&self.config, rows)?;
+                spec.capture = self
+                    .device
+                    .stream
+                    .alloc_zeros(rows * 5 * self.config.hidden_size)?;
+            }
+        }
+        if chunk != old_chunk {
+            self.flash = Flash::new(
+                self.device.stream.clone(),
+                chunk,
+                self.config.num_attention_heads,
+            )?;
+        }
+        self.workspace_rows = rows;
+        self.chunk = chunk;
+        Ok(())
+    }
+
+    fn size_workspace(&mut self, requested_chunk: Option<usize>) -> Result<()> {
+        self.device.finish_upload()?;
+        self.device.stream.synchronize()?;
+        let (free, total) = self.device.ctx.mem_get_info()?;
+        let plan = crate::prefill::Plan::new(
+            &self.config,
+            self.capacity,
+            requested_chunk,
+            free,
+            total,
+            Flash::tile()?,
+            self.spec.is_some(),
+        )?;
+        let rows = self.spec_budget.workspace_rows(plan.chunk);
+        let required = rows
+            .checked_mul(plan.row_bytes)
+            .context("workspace byte count overflow")?;
+        let available = free.saturating_sub(plan.reserve_bytes);
+        ensure!(
+            rows <= plan.row_limit,
+            "workspace {rows} rows exceeds row budget {}: required={required} available={available}",
+            plan.row_limit
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"prefill_memory_plan":plan,"draft_allocated":self.spec.is_some()})
+        );
+        self.poisoned = true;
+        self.grow_rows(rows, plan.chunk).with_context(|| {
+            format!("allocate prefill workspace: required={required} available={available}")
+        })?;
+        self.prepare(plan.chunk)?;
+        self.poisoned = false;
+        Ok(())
     }
 
     fn ensure_decode(&mut self) -> Result<()> {
@@ -1251,67 +1389,6 @@ impl Drop for Engine {
 }
 
 impl Engine {
-    pub fn enable_draft(&mut self, path: &Path) -> Result<()> {
-        ensure!(
-            self.position == 0 && self.graph.is_none() && self.spec.is_none(),
-            "enable draft before prefill/Graph capture"
-        );
-        let draft = super::draft::Draft::new(
-            path,
-            &self.device,
-            &self.config,
-            self.capacity,
-            self.workspace_rows,
-            &mut self.blas,
-        )?;
-        self.prepare(8)?;
-        self.blas
-            .prepare(8, self.config.vocab_size, self.config.hidden_size)?;
-        let rows = self.spec_budget.rows();
-        if self.spec_budget.is_tree() {
-            self.prepare(rows)?;
-            self.blas
-                .prepare(rows, self.config.vocab_size, self.config.hidden_size)?;
-        }
-        let s = &self.device.stream;
-        let count_values: Vec<_> = (1..=rows).map(|n| n as i32).collect();
-        let row_counts = s.clone_htod(&count_values)?;
-        s.synchronize()?;
-        self.spec = Some(Spec {
-            eos: Vec::new(),
-            tree_verify_graph: None,
-            tree_commit_graph: None,
-            tree: if self.spec_budget.is_tree() {
-                Some(super::tree::State::new(
-                    &self.device,
-                    &self.config,
-                    &self.kv,
-                    self.capacity,
-                    rows,
-                )?)
-            } else {
-                None
-            },
-            tree_attention: None,
-            active_rows: 0,
-            graph: self.spec_graph,
-            draft_graph: None,
-            verify_graph: None,
-            inject_graphs: (0..8).map(|_| None).collect(),
-            verification: None,
-            draft,
-            capture: s.alloc_zeros(self.workspace_rows * 5 * self.config.hidden_size)?,
-            logits: s.alloc_zeros(rows * self.config.vocab_size)?,
-            predictions: s.alloc_zeros(rows)?,
-            row_counts,
-        });
-        eprintln!(
-            "{}",
-            serde_json::json!({"spec_execution":{"graph":self.spec_graph,"budget":self.spec_budget,"draft_rows":7,"verify_rows":rows,"workspace_rows":self.workspace_rows,"inject_rows":"actual committed M1..8","acceptance":"host greedy prefix"}})
-        );
-        Ok(())
-    }
-
     fn ensure_verification(&mut self) -> Result<()> {
         let spec = self.spec.as_mut().context("draft state is not enabled")?;
         if spec.verification.is_some() {

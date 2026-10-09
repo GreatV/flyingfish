@@ -33,6 +33,7 @@ fn chain_argmax_matches_single_on_real_logits() -> Result<()> {
             spec_budget: SpecBudget::Chain,
             spec_graph: true,
             linear_choices: Vec::new(),
+            draft_model: None,
             runtime_dir: Some(runtime.clone()),
         };
         let mut model = Engine::load(
@@ -40,9 +41,9 @@ fn chain_argmax_matches_single_on_real_logits() -> Result<()> {
             0,
             (ids.input_ids.len() + 512).max(4096),
             None,
-            settings,
+            settings.with_draft(&draft),
         )?;
-        model.enable_draft(&draft)?;
+
         let first = model.prefill(&ids.input_ids, None)?;
         let mut actual_ids = vec![first];
         let mut old_ids = vec![first];

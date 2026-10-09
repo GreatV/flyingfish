@@ -119,14 +119,14 @@ pub fn run(target: &Path, draft: &Path, plan: &Path, dump: &Path, options: &Opti
         options.device,
         options.capacity,
         options.chunk,
-        options.backend.clone(),
+        options.backend.with_draft(draft),
     )?;
     ensure!(
         model.config.vocab_size == request.vocab_size
             && model.config.hidden_size == request.hidden_size,
         "request model dimensions mismatch"
     );
-    model.enable_draft(draft)?;
+
     let mut tensors = Tensors::default();
     ids(&mut tensors, "input_ids".into(), &request.input_ids)?;
     scalar(&mut tensors, "budget".into(), request.fixture_budget)?;
