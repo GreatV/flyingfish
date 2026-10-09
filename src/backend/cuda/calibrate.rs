@@ -121,7 +121,7 @@ impl Calibrated {
     }
 }
 
-pub fn runtime_dir(path: &Path, model: &Path) -> Result<PathBuf> {
+pub fn runtime_dir(path: &Path, model: &Path, create: bool) -> Result<PathBuf> {
     let full = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -152,8 +152,13 @@ pub fn runtime_dir(path: &Path, model: &Path) -> Result<PathBuf> {
                 .any(|c| matches!(c, Component::Normal(p) if p == "models")),
         "runtime directory must be outside all readonly models directories"
     );
-    std::fs::create_dir_all(&resolved)?;
-    ensure!(resolved.is_dir(), "runtime path is not a directory");
+    if create {
+        std::fs::create_dir_all(&resolved)?;
+    }
+    ensure!(
+        !resolved.exists() || resolved.is_dir(),
+        "runtime path is not a directory"
+    );
     Ok(resolved)
 }
 
@@ -283,8 +288,31 @@ fn check(cache: &Cache, key: &CacheKey, query_rows: Option<usize>, bucket: usize
     Ok(())
 }
 
-pub fn load(d: &Device, ops: &Ops, c: &Config, dir: &Path, capacity: usize) -> Result<Calibrated> {
-    load_kind(d, ops, c, dir, None, attention_bucket(capacity)?)
+pub(super) fn load(
+    d: &Device,
+    ops: &Ops,
+    c: &Config,
+    dir: &Path,
+    capacity: usize,
+    closure: &super::closure::Closure,
+) -> Result<Calibrated> {
+    load_kind(d, ops, c, dir, None, attention_bucket(capacity)?, closure)
+}
+
+pub(super) fn cache_path(
+    dir: &Path,
+    key: &CacheKey,
+    bucket: usize,
+    query_rows: Option<usize>,
+) -> PathBuf {
+    let name = query_rows.map_or_else(
+        || "attention".to_owned(),
+        |rows| format!("attention-mq{rows}"),
+    );
+    dir.join(format!(
+        "{name}-long-v2-b{bucket}-{}-{}-{}.json",
+        key.device_uuid, key.driver_version, key.binary_version
+    ))
 }
 
 fn load_kind(
@@ -294,17 +322,11 @@ fn load_kind(
     dir: &Path,
     query_rows: Option<usize>,
     bucket: usize,
+    closure: &super::closure::Closure,
 ) -> Result<Calibrated> {
     let key = key(d).context("calibration cache key")?;
-    let name = query_rows.map_or_else(
-        || "attention".to_owned(),
-        |rows| format!("attention-mq{rows}"),
-    );
-    let path = dir.join(format!(
-        "{name}-long-v2-b{bucket}-{}-{}-{}.json",
-        key.device_uuid, key.driver_version, key.binary_version
-    ));
-    let (cache, hit) = if path.exists() {
+    let path = cache_path(dir, &key, bucket, query_rows);
+    let (cache, hit) = if closure.access(&path)? {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)
             .with_context(|| format!("read calibration cache {}", path.display()))?;
         ensure!(cache.sms == d.info.sms, "attention cache SM count mismatch");
@@ -315,8 +337,8 @@ fn load_kind(
             "{}",
             serde_json::json!({"attention_calibration_cache":{"schema":2,"lengths":LENGTHS,"bucket":bucket,"path":path,"cached":false,"action":"measure requested bucket"}})
         );
-        let cache =
-            measure(d, ops, c, key, query_rows, bucket).context("measure attention candidates")?;
+        let cache = measure(d, ops, c, key, query_rows, bucket, closure)
+            .context("measure attention candidates")?;
         check(&cache, &cache.key, query_rows, bucket)?;
         let temp = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut file = std::fs::OpenOptions::new()
@@ -383,7 +405,9 @@ fn measure(
     key: CacheKey,
     query_rows: Option<usize>,
     selected: usize,
+    closure: &super::closure::Closure,
 ) -> Result<Cache> {
+    closure.measurement()?;
     let start = Instant::now();
     let s = &d.stream;
     let rows = query_rows.unwrap_or(1);

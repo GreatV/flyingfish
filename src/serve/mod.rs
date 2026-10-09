@@ -216,6 +216,11 @@ fn generate_once(
             }
         }
     });
+    let result = result.and_then(|output| {
+        model.check_ready()?;
+        eprintln!("{}", serde_json::json!({"serve_request":{"prefill_ms":output.prefill_ms,"decode_ms":output.decode_ms,"initial_rounds":output.rounds.iter().take(2).collect::<Vec<_>>()}}));
+        Ok(output)
+    });
     match result {
         Ok(output) => {
             if aborted {

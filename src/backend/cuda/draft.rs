@@ -182,6 +182,68 @@ fn norm(
 }
 
 impl Draft {
+    pub(super) fn calibrate_injection(
+        &self,
+        blas: &mut Blas,
+        input: &cudarc::driver::CudaView<'_, bf16>,
+        shape: crate::backend::setup::LinearShape,
+    ) -> Result<()> {
+        if shape.input == self.config.capture_width() && shape.output == self.config.hidden_size {
+            blas.calibrate_shape(&self.weights.fc, input, shape)
+        } else if shape.input == self.config.hidden_size
+            && shape.output == self.config.num_key_value_heads * self.config.head_dim
+        {
+            let h = self.config.hidden_size;
+            let kv = shape.output;
+            let weight = self.weights.layers[0].block.qkv.slice(h * h..(h + kv) * h);
+            blas.calibrate_shape(&weight, input, shape)
+        } else {
+            ensure!(
+                shape.rows == 1
+                    && shape.input == self.config.markov_rank
+                    && shape.output == self.config.vocab_size,
+                "unknown draft calibration shape: {shape:?}"
+            );
+            blas.calibrate_shape(&self.weights.w2, input, shape)
+        }
+    }
+    pub(super) fn reset_setup(&mut self) -> Result<()> {
+        let s = &self.stream;
+        let dim = self.config.head_dim;
+        for kv in &mut self.kv {
+            for head in 0..self.config.num_key_value_heads {
+                let lo = head * self.capacity * dim;
+                s.memset_zeros(&mut kv.k.slice_mut(lo..lo + 8 * dim))?;
+                s.memset_zeros(&mut kv.v.slice_mut(lo..lo + 8 * dim))?;
+            }
+        }
+        for value in [
+            &mut self.x,
+            &mut self.n,
+            &mut self.qkv,
+            &mut self.attn,
+            &mut self.out,
+            &mut self.gu,
+            &mut self.act,
+            &mut self.k_raw,
+            &mut self.k_norm,
+            &mut self.v_raw,
+            &mut self.projected,
+            &mut self.context,
+            &mut self.packed,
+            &mut self.base,
+            &mut self.scores,
+            &mut self.prev,
+        ] {
+            s.memset_zeros(value)?;
+        }
+        for value in [&mut self.token, &mut self.tokens] {
+            s.memset_zeros(value)?;
+        }
+        s.memset_zeros(&mut self.position)?;
+        s.memcpy_htod(&[self.config.mask_token_id; 7], &mut self.ids)?;
+        Ok(())
+    }
     pub fn new(
         path: &Path,
         d: &Device,
@@ -453,11 +515,29 @@ fn add_trace(
 }
 
 impl Draft {
-    pub fn setup_attention(&mut self, d: &Device, ops: &Ops, c: &Config, dir: &Path) -> Result<()> {
+    pub fn setup_attention(
+        &mut self,
+        d: &Device,
+        ops: &Ops,
+        c: &Config,
+        dir: &Path,
+        closure: &super::closure::Closure,
+    ) -> Result<()> {
         if self.attention.is_some() {
             return Ok(());
         }
-        let measured = super::multi_calibrate::load(d, ops, c, dir, 7, false, self.capacity)?;
+        let measured = super::multi_calibrate::load(
+            d,
+            ops,
+            c,
+            dir,
+            crate::backend::setup::MultiShape {
+                rows: 7,
+                causal: false,
+                capacity: self.capacity,
+            },
+            closure,
+        )?;
         let (plan, selection) = measured.choose(self.capacity)?;
         eprintln!(
             "{}",
@@ -544,9 +624,10 @@ impl Draft {
         d: &Device,
         ops: &super::ops::Ops,
         dir: &std::path::Path,
+        closure: &super::closure::Closure,
     ) -> Result<()> {
         if self.markov.is_none() {
-            self.markov = Some(super::markov::Markov::new(d, ops, dir)?);
+            self.markov = Some(super::markov::Markov::new(d, ops, dir, closure)?);
         }
         Ok(())
     }

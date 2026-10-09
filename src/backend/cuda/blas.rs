@@ -10,7 +10,14 @@ use cudarc::{
     },
 };
 use half::bf16;
-use std::{cell::RefCell, collections::BTreeMap, mem::size_of, path::Path, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    mem::size_of,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
 
 struct Plan {
     desc: sys::cublasLtMatmulDesc_t,
@@ -149,6 +156,7 @@ impl Drop for Plan {
 
 pub struct Blas {
     choices: RefCell<BTreeMap<LinearShape, LinearChoice>>,
+    coverage: Option<(usize, std::collections::BTreeSet<(usize, usize)>)>,
     calibration: linear_calibrate::Environment,
     skinny: CudaFunction,
     plans: BTreeMap<(usize, usize, usize), Plan>,
@@ -163,29 +171,10 @@ impl Blas {
         device: &Device,
         ops: &Ops,
         runtime: &Path,
-        measured: Vec<LinearChoice>,
+        closure: Rc<super::closure::Closure>,
     ) -> Result<Self> {
         let stream = device.stream.clone();
-        let calibration = linear_calibrate::Environment::new(device, ops, runtime)?;
-        let mut choices = BTreeMap::new();
-        for choice in measured {
-            ensure!(
-                choice.key == calibration.key,
-                "measured linear cache identity mismatch"
-            );
-            ensure!(
-                choice.shape.rows > 0
-                    && choice.shape.output > 0
-                    && choice.shape.input > 0
-                    && choice.median_us.is_finite()
-                    && choice.median_us > 0.0,
-                "invalid measured linear choice"
-            );
-            ensure!(
-                choices.insert(choice.shape, choice).is_none(),
-                "duplicate measured linear shape/M choice"
-            );
-        }
+        let calibration = linear_calibrate::Environment::new(device, ops, runtime, closure)?;
         let decode = CudaBlas::new(stream.clone())?;
         unsafe {
             bs::cublasSetMathMode(
@@ -197,7 +186,8 @@ impl Blas {
         let workspace = stream.alloc_zeros::<u8>(4 * 1024 * 1024)?;
         let handle = lt::create_handle()?;
         Ok(Self {
-            choices: RefCell::new(choices),
+            choices: RefCell::new(BTreeMap::new()),
+            coverage: None,
             calibration,
             skinny: cubin::module(&device.ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,
             plans: BTreeMap::new(),
@@ -208,6 +198,19 @@ impl Blas {
         })
     }
 
+    pub fn declare(&mut self, rows: usize, pairs: &std::collections::BTreeSet<(usize, usize)>) {
+        self.coverage = Some((rows, pairs.clone()));
+    }
+    pub fn choice_path(&self, shape: LinearShape) -> PathBuf {
+        self.calibration.path(shape)
+    }
+    pub fn load_choices(&mut self, shapes: &std::collections::BTreeSet<LinearShape>) -> Result<()> {
+        for &shape in shapes {
+            let choice = self.calibration.read(shape)?;
+            self.choices.borrow_mut().insert(shape, choice);
+        }
+        Ok(())
+    }
     pub fn prepare(&mut self, rows: usize, output: usize, input: usize) -> Result<()> {
         if rows > 1 && !self.plans.contains_key(&(rows, output, input)) {
             let p = Plan::new(self.handle, rows, output, input, self.workspace.len())
@@ -232,18 +235,19 @@ impl Blas {
             output,
             input,
         };
-        if rows <= 16 && input.is_multiple_of(256) && !self.choices.borrow().contains_key(&shape) {
-            let choice = self.calibration.load(shape, |implementation, out| {
-                let mut y = out.slice_mut(..rows * output);
-                match implementation {
-                    LinearImpl::Cublas => self.cublas(w, x, &mut y, rows, output, input),
-                    LinearImpl::Skinny => self.skinny(w, x, &mut y, shape),
-                    LinearImpl::Candidate(name) => {
-                        anyhow::bail!("unknown linear candidate {name}")
-                    }
-                }
-            })?;
-            self.choices.borrow_mut().insert(shape, choice);
+        ensure!(
+            !linear_calibrate::supports(shape) || self.choices.borrow().contains_key(&shape),
+            "missing frozen linear choice: {shape:?}; run calibrate for this deployment"
+        );
+        if !linear_calibrate::supports(shape) {
+            let (limit, pairs) = self
+                .coverage
+                .as_ref()
+                .context("linear coverage was not declared")?;
+            ensure!(
+                rows > 0 && rows <= *limit && pairs.contains(&(output, input)),
+                "linear shape outside cuBLAS-only coverage: {shape:?}"
+            );
         }
         if let Some(choice) = self.choices.borrow().get(&shape) {
             match &choice.implementation {
@@ -257,6 +261,30 @@ impl Blas {
         self.cublas(w, x, y, rows, output, input)
     }
 
+    pub fn calibrate_shape(
+        &mut self,
+        w: &impl DevicePtr<bf16>,
+        x: &CudaView<'_, bf16>,
+        shape: LinearShape,
+    ) -> Result<()> {
+        linear_calibrate::check_extent(shape, w.len(), x.len())?;
+        self.prepare(shape.rows, shape.output, shape.input)?;
+        let (rows, output, input) = (shape.rows, shape.output, shape.input);
+        {
+            let choice = self.calibration.load(shape, |implementation, out| {
+                let mut y = out.slice_mut(..rows * output);
+                match implementation {
+                    LinearImpl::Cublas => self.cublas(w, x, &mut y, rows, output, input),
+                    LinearImpl::Skinny => self.skinny(w, x, &mut y, shape),
+                    LinearImpl::Candidate(name) => {
+                        anyhow::bail!("unknown linear candidate {name}")
+                    }
+                }
+            })?;
+            self.choices.borrow_mut().insert(shape, choice);
+        }
+        Ok(())
+    }
     fn skinny(
         &self,
         w: &impl DevicePtr<bf16>,

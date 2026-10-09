@@ -144,13 +144,22 @@ fn check(cache: &Cache, key: &CacheKey) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn load(d: &Device, ops: &Ops, dir: &Path) -> Result<Calibrated> {
-    let key = super::calibrate::key(d)?;
-    let path = dir.join(format!(
+pub(super) fn cache_path(dir: &Path, key: &CacheKey) -> PathBuf {
+    dir.join(format!(
         "markov-phase1-v1-{}-{}-{}.json",
         key.device_uuid, key.driver_version, key.binary_version
-    ));
-    let (cache, hit) = if path.exists() {
+    ))
+}
+
+pub(super) fn load(
+    d: &Device,
+    ops: &Ops,
+    dir: &Path,
+    closure: &super::closure::Closure,
+) -> Result<Calibrated> {
+    let key = super::calibrate::key(d)?;
+    let path = cache_path(dir, &key);
+    let (cache, hit) = if closure.access(&path)? {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)?;
         check(&cache, &key)?;
         (cache, true)
@@ -159,7 +168,7 @@ pub(super) fn load(d: &Device, ops: &Ops, dir: &Path) -> Result<Calibrated> {
             "{}",
             serde_json::json!({"markov_phase1_calibration":{"schema":1,"buckets":BUCKETS,"path":path,"cached":false,"action":"measure both bodies"}})
         );
-        let cache = measure(d, ops, key.clone())?;
+        let cache = measure(d, ops, key.clone(), closure)?;
         check(&cache, &key)?;
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
@@ -183,7 +192,13 @@ fn random(n: usize, mut state: u32) -> Vec<bf16> {
         .collect()
 }
 
-fn measure(d: &Device, ops: &Ops, key: CacheKey) -> Result<Cache> {
+fn measure(
+    d: &Device,
+    ops: &Ops,
+    key: CacheKey,
+    closure: &super::closure::Closure,
+) -> Result<Cache> {
+    closure.measurement()?;
     let start = Instant::now();
     let s = &d.stream;
     let module = cubin::module(&d.ctx, "markov")?;

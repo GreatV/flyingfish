@@ -73,7 +73,11 @@ impl SpecBudget {
             self.is_tree(),
             "tree forward requires --spec-budget tree16, tree32 or tree64"
         );
-        step.check(self.rows())?;
+        step.check(
+            self.rows(),
+            self.rows(),
+            &std::collections::BTreeSet::from([self.rows()]),
+        )?;
         anyhow::ensure!(
             step.input == Input::Ids && step.head == Head::All,
             "tree verification requires token IDs and all-row logits"
@@ -112,8 +116,6 @@ pub struct Settings {
     pub spec_budget: SpecBudget,
     #[arg(long, global = true, default_value_t = true, action = clap::ArgAction::Set)]
     pub spec_graph: bool,
-    #[arg(skip)]
-    pub linear_choices: Vec<setup::LinearChoice>,
     #[arg(skip)]
     pub draft_model: Option<std::path::PathBuf>,
     #[arg(long, global = true, env = "FLYINGFISH_RUNTIME_DIR")]
@@ -194,7 +196,12 @@ pub struct Step<'a> {
 }
 
 impl Step<'_> {
-    pub fn check(&self, available_rows: usize) -> Result<()> {
+    pub fn check(
+        &self,
+        available_rows: usize,
+        linear_rows: usize,
+        declared_rows: &std::collections::BTreeSet<usize>,
+    ) -> Result<()> {
         anyhow::ensure!(
             self.rows > 0 && self.rows <= available_rows,
             "forward rows {} exceed workspace {}",
@@ -204,6 +211,16 @@ impl Step<'_> {
         anyhow::ensure!(
             self.input != Input::Token || self.rows == 1,
             "device token input requires exactly one row"
+        );
+        anyhow::ensure!(
+            linear_rows >= self.rows
+                && linear_rows <= available_rows
+                && (matches!(self.mask, Mask::Tree { .. }) || linear_rows == self.rows),
+            "physical linear rows do not match the forward layout"
+        );
+        anyhow::ensure!(
+            linear_rows > 16 || declared_rows.contains(&linear_rows),
+            "linear forward rows {linear_rows} are outside the declared profile {declared_rows:?}"
         );
         if let Mask::Tree { parents, positions } = self.mask {
             anyhow::ensure!(
@@ -344,8 +361,9 @@ mod tests {
                 positions: &positions,
             },
         };
-        assert!(step.check(128).is_ok());
-        assert!(step.check(127).is_err());
+        let declared = std::collections::BTreeSet::from([128]);
+        assert!(step.check(128, 128, &declared).is_ok());
+        assert!(step.check(127, 128, &declared).is_err());
         let mut invalid = parents.clone();
         invalid[64] = 64;
         assert!(
@@ -356,7 +374,7 @@ mod tests {
                 },
                 ..step
             }
-            .check(128)
+            .check(128, 128, &declared)
             .is_err()
         );
     }

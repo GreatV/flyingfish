@@ -1,5 +1,6 @@
 use super::{
     Device, calibrate,
+    closure::Closure,
     ops::{Ops, grid},
 };
 use crate::backend::setup::{CacheKey, LinearChoice, LinearImpl, LinearShape};
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     io::Write,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -31,6 +33,34 @@ struct Cache {
     wall_ms: f64,
 }
 
+pub(super) fn supports(shape: LinearShape) -> bool {
+    shape.rows > 0
+        && shape.rows <= 16
+        && shape.output > 0
+        && shape.input > 0
+        && shape.input.is_multiple_of(256)
+}
+
+pub(super) fn check_extent(shape: LinearShape, weights: usize, inputs: usize) -> Result<()> {
+    ensure!(
+        supports(shape),
+        "invalid linear calibration shape: {shape:?}"
+    );
+    let required_w = shape
+        .output
+        .checked_mul(shape.input)
+        .context("calibration weight extent overflow")?;
+    let required_x = shape
+        .rows
+        .checked_mul(shape.input)
+        .context("calibration input extent overflow")?;
+    ensure!(
+        weights == required_w && inputs == required_x,
+        "calibration matrix extent mismatch: {shape:?}; weights={weights} required={required_w}, inputs={inputs} required={required_x}"
+    );
+    Ok(())
+}
+
 pub(super) struct Environment {
     pub key: CacheKey,
     ctx: Arc<CudaContext>,
@@ -38,10 +68,11 @@ pub(super) struct Environment {
     residual: CudaFunction,
     l2_bytes: usize,
     runtime: PathBuf,
+    closure: Rc<Closure>,
 }
 
 impl Environment {
-    pub fn new(d: &Device, ops: &Ops, runtime: &Path) -> Result<Self> {
+    pub fn new(d: &Device, ops: &Ops, runtime: &Path, closure: Rc<Closure>) -> Result<Self> {
         ensure!(
             d.info.shared_bytes >= 40960,
             "skinny GEMM requires 40960 bytes shared memory"
@@ -53,9 +84,32 @@ impl Environment {
             residual: ops.residual.clone(),
             l2_bytes: d.info.l2_bytes,
             runtime: runtime.to_path_buf(),
+            closure,
         })
     }
 
+    pub fn path(&self, shape: LinearShape) -> PathBuf {
+        self.runtime.join(format!(
+            "linear-m{}-o{}-i{}-{}-{}-{}.json",
+            shape.rows,
+            shape.output,
+            shape.input,
+            self.key.device_uuid,
+            self.key.driver_version,
+            self.key.binary_version
+        ))
+    }
+    pub fn read(&self, shape: LinearShape) -> Result<LinearChoice> {
+        let path = self.path(shape);
+        ensure!(
+            self.closure.access(&path)?,
+            "missing linear cache {}",
+            path.display()
+        );
+        let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)?;
+        check(&cache, &self.key, shape)?;
+        Ok(cache.choice)
+    }
     pub fn load(
         &self,
         shape: LinearShape,
@@ -66,16 +120,8 @@ impl Environment {
                 == sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE,
             "linear calibration must finish before Graph capture: {shape:?}"
         );
-        let path = self.runtime.join(format!(
-            "linear-m{}-o{}-i{}-{}-{}-{}.json",
-            shape.rows,
-            shape.output,
-            shape.input,
-            self.key.device_uuid,
-            self.key.driver_version,
-            self.key.binary_version
-        ));
-        let (cache, hit) = if path.exists() {
+        let path = self.path(shape);
+        let (cache, hit) = if self.closure.access(&path)? {
             let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)?;
             check(&cache, &self.key, shape)?;
             (cache, true)
@@ -106,6 +152,7 @@ impl Environment {
         shape: LinearShape,
         launch: impl Fn(&LinearImpl, &mut CudaSlice<bf16>) -> Result<()>,
     ) -> Result<Cache> {
+        self.closure.measurement()?;
         let started = Instant::now();
         let s = &self.stream;
         let mut out = s.alloc_zeros::<bf16>(shape.rows * shape.output)?;
@@ -254,6 +301,25 @@ mod tests {
 
     #[test]
     fn cache_rejects_stale_identity_and_wrong_winner() {
+        let valid = LinearShape {
+            rows: 1,
+            output: 2048,
+            input: 10240,
+        };
+        check_extent(valid, 2048 * 10240, 10240).unwrap();
+        assert!(
+            check_extent(
+                LinearShape {
+                    input: 86016,
+                    ..valid
+                },
+                2048 * 10240,
+                86016
+            )
+            .is_err()
+        );
+        assert!(check_extent(valid, 2048 * 10240 - 1, 10240).is_err());
+        assert!(check_extent(valid, 2048 * 10240, 10239).is_err());
         let key = CacheKey {
             device_uuid: "device".into(),
             driver_version: "driver".into(),

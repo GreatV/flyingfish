@@ -12,12 +12,24 @@ pub struct Model {
 }
 
 impl Model {
+    pub fn check_ready(&self) -> Result<()> {
+        self.backend.check_ready()
+    }
     pub fn device_info(&self) -> &crate::backend::setup::DeviceInfo {
         self.backend.device_info()
     }
 
     pub fn decode_linear(&self) -> &'static str {
         self.backend.decode_linear()
+    }
+    pub fn calibrate(
+        dir: &Path,
+        ordinal: usize,
+        capacity: usize,
+        chunk: Option<usize>,
+        settings: Settings,
+    ) -> Result<()> {
+        Backend::calibrate(dir, ordinal, capacity, chunk, settings)
     }
     pub fn load(
         dir: &Path,

@@ -204,7 +204,11 @@ fn batch_matches_single() -> Result<()> {
     let ops = Ops::new(&d.ctx)?;
     let runtime = std::env::temp_dir().join(format!("ff-markov-cal-{}", std::process::id()));
     std::fs::create_dir_all(&runtime)?;
-    let mut markov = Markov::new(&d, &ops, &runtime)?;
+    let calibration = crate::backend::cuda::closure::Closure::new(
+        true,
+        "explicit Markov test calibration".into(),
+    );
+    let mut markov = Markov::new(&d, &ops, &runtime, &calibration)?;
     let mut compared = 0;
     let mut differences = Differences::default();
     for (seed, file) in ["r0008", "r0042", "r0089", "r0140"].iter().enumerate() {
@@ -280,7 +284,11 @@ fn top4_matches_reference() -> Result<()> {
     let ops = Ops::new(&d.ctx)?;
     let runtime = std::env::temp_dir().join(format!("ff-markov-cal-{}", std::process::id()));
     std::fs::create_dir_all(&runtime)?;
-    let mut markov = Markov::new(&d, &ops, &runtime)?;
+    let calibration = crate::backend::cuda::closure::Closure::new(
+        true,
+        "explicit Markov test calibration".into(),
+    );
+    let mut markov = Markov::new(&d, &ops, &runtime, &calibration)?;
     let mut reference = reference::Reference::new(&d)?;
     let mut compared = 0;
     let mut differences = Differences::default();
@@ -362,7 +370,11 @@ fn batch_wall() -> Result<()> {
     let ops = Ops::new(&d.ctx)?;
     let runtime = std::env::temp_dir().join(format!("ff-markov-cal-{}", std::process::id()));
     std::fs::create_dir_all(&runtime)?;
-    let mut markov = Markov::new(&d, &ops, &runtime)?;
+    let calibration = crate::backend::cuda::closure::Closure::new(
+        true,
+        "explicit Markov test calibration".into(),
+    );
+    let mut markov = Markov::new(&d, &ops, &runtime, &calibration)?;
     let count = d.info.l2_bytes.max(1024 * 1024);
     let mut flush = d.stream.alloc_zeros::<bf16>(count)?;
     let zeros = d.stream.alloc_zeros::<bf16>(count)?;

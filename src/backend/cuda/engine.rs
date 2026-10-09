@@ -16,7 +16,9 @@ use cudarc::driver::{CudaGraph, CudaSlice, CudaStream, DevicePtrMut, PushKernelA
 use half::bf16;
 use std::{
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
+    time::Instant,
 };
 
 fn trace_value(
@@ -277,7 +279,22 @@ impl Spec {
     }
 }
 
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Graph {
+    Decode,
+    Draft,
+    Verify,
+    TreeDraft,
+    TreeVerify,
+    TreeCommit,
+    Inject(usize),
+}
+
 pub struct Engine {
+    forward_rows: std::collections::BTreeSet<usize>,
+    graphs: Vec<Graph>,
+    closure: Rc<super::closure::Closure>,
     graph: Option<CudaGraph>,
     poisoned: bool,
     spec_budget: SpecBudget,
@@ -311,6 +328,56 @@ impl Engine {
         requested_chunk: Option<usize>,
         settings: Settings,
     ) -> Result<Self> {
+        Self::load_kind(dir, ordinal, capacity, requested_chunk, settings, false)
+    }
+    pub fn calibrate(
+        dir: &Path,
+        ordinal: usize,
+        capacity: usize,
+        chunk: Option<usize>,
+        settings: Settings,
+    ) -> Result<()> {
+        Self::load_kind(dir, ordinal, capacity, chunk, settings, true)?;
+        Ok(())
+    }
+    fn load_kind(
+        dir: &Path,
+        ordinal: usize,
+        capacity: usize,
+        requested_chunk: Option<usize>,
+        settings: Settings,
+        write: bool,
+    ) -> Result<Self> {
+        let started = Instant::now();
+        let draft_path = settings.draft_model.clone();
+        let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\"'\"'"));
+        let runtime_arg = settings
+            .runtime_dir
+            .as_deref()
+            .context("CUDA setup requires --runtime-dir or FLYINGFISH_RUNTIME_DIR")?;
+        let mut command = format!(
+            "{} --model {} --device {ordinal} --capacity {capacity} --runtime-dir {}",
+            quote(&std::env::current_exe()?),
+            quote(dir),
+            quote(runtime_arg)
+        );
+        if let Some(path) = &draft_path {
+            command.push_str(&format!(
+                " --draft-model {} --spec-budget {}",
+                quote(path),
+                match settings.spec_budget {
+                    SpecBudget::Chain => "chain",
+                    SpecBudget::Tree16 => "tree16",
+                    SpecBudget::Tree32 => "tree32",
+                    SpecBudget::Tree64 => "tree64",
+                }
+            ));
+        }
+        if let Some(chunk) = requested_chunk {
+            command.push_str(&format!(" --chunk {chunk}"));
+        }
+        command.push_str(" calibrate");
+        let closure = Rc::new(super::closure::Closure::new(write, command));
         let config = Config::read(dir)?;
         ensure!(
             capacity > 0
@@ -328,6 +395,7 @@ impl Engine {
                 "CUDA attention calibration requires --runtime-dir or FLYINGFISH_RUNTIME_DIR",
             )?,
             dir,
+            write,
         )?;
         let device = Device::new(ordinal)?;
         let weights = Weights::load(dir, &config, &device).context("load target weights")?;
@@ -343,7 +411,7 @@ impl Engine {
         }
         let ops = Ops::new(&device.ctx).context("load CUDA operator modules")?;
         eprintln!("{}", serde_json::json!({"backend_device":device.info}));
-        let blas = Blas::new(&device, &ops, &runtime, settings.linear_choices.clone())?;
+        let blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
         let workspace_rows = settings.spec_budget.rows().min(capacity);
         let chunk = workspace_rows;
         let mut work = Work {
@@ -361,9 +429,12 @@ impl Engine {
             token: s.alloc_zeros(1)?,
         };
         s.memcpy_htod(&[1i32], &mut work.length)?;
-        let flash = Flash::new(s.clone(), chunk, config.num_attention_heads)?;
+        let flash = Flash::new(s.clone(), workspace_rows, config.num_attention_heads)?;
         s.synchronize()?;
         let mut engine = Self {
+            forward_rows: std::collections::BTreeSet::new(),
+            graphs: Vec::new(),
+            closure,
             poisoned: false,
             spec_budget: settings.spec_budget,
             spec_graph: settings.spec_graph,
@@ -450,6 +521,7 @@ impl Engine {
             });
         }
         engine.size_workspace(requested_chunk)?;
+        engine.declare_graphs();
         if engine.spec.is_some() {
             eprintln!(
                 "{}",
@@ -470,6 +542,7 @@ impl Engine {
             total - free,
             total
         );
+        engine.initialize(dir, draft_path.as_deref(), write, started)?;
         Ok(engine)
     }
 
@@ -487,10 +560,10 @@ impl Engine {
                     .alloc_zeros(rows * 5 * self.config.hidden_size)?;
             }
         }
-        if chunk != old_chunk {
+        if rows != old_rows || chunk != old_chunk {
             self.flash = Flash::new(
                 self.device.stream.clone(),
-                chunk,
+                rows,
                 self.config.num_attention_heads,
             )?;
         }
@@ -545,6 +618,7 @@ impl Engine {
             &self.config,
             &self.runtime,
             self.capacity,
+            &self.closure,
         )
         .context("attention setup calibration")?;
         let setup = crate::backend::setup::Setup::select(
@@ -585,6 +659,59 @@ impl Engine {
         &self.device.info
     }
 
+    fn declare_graphs(&mut self) {
+        self.graphs = match &self.spec {
+            None => vec![Graph::Decode],
+            Some(spec) if !spec.graph => Vec::new(),
+            Some(spec) => {
+                let mut graphs = if self.spec_budget.is_tree() {
+                    vec![Graph::TreeDraft, Graph::TreeVerify, Graph::TreeCommit]
+                } else {
+                    vec![Graph::Draft, Graph::Verify]
+                };
+                graphs.extend((1..=spec.inject_graphs.len()).map(Graph::Inject));
+                graphs
+            }
+        };
+        eprintln!(
+            "{}",
+            serde_json::json!({"backend_graph_declaration":self.graphs})
+        );
+    }
+
+    fn has_graph(&self, graph: Graph) -> bool {
+        if matches!(graph, Graph::Decode) {
+            return self.graph.is_some();
+        }
+        let Some(spec) = &self.spec else {
+            return false;
+        };
+        match graph {
+            Graph::Decode => self.graph.is_some(),
+            Graph::Draft => spec.draft_graph.is_some(),
+            Graph::Verify => spec.verify_graph.is_some(),
+            Graph::TreeDraft => spec.tree_draft_graph.is_some(),
+            Graph::TreeVerify => spec.tree_verify_graph.is_some(),
+            Graph::TreeCommit => spec.tree_commit_graph.is_some(),
+            Graph::Inject(rows) => rows
+                .checked_sub(1)
+                .and_then(|r| spec.inject_graphs.get(r))
+                .is_some_and(Option::is_some),
+        }
+    }
+    fn check_graphs(&self) -> Result<()> {
+        for &graph in &self.graphs {
+            ensure!(
+                self.has_graph(graph),
+                "production Graph is missing: {graph:?}"
+            );
+        }
+        Ok(())
+    }
+    pub fn check_ready(&self) -> Result<()> {
+        self.closure.assert_ready()?;
+        self.check_graphs()
+    }
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -642,16 +769,59 @@ impl Engine {
         self.run_step(step, trace)
     }
 
+    fn check_step(&self, step: crate::backend::Step<'_>) -> Result<()> {
+        let linear_rows = if matches!(step.mask, crate::backend::Mask::Tree { .. }) {
+            self.spec_budget.rows()
+        } else {
+            step.rows
+        };
+        let available_rows = self
+            .workspace_rows
+            .min(self.capacity.saturating_sub(self.position));
+        step.check(available_rows, linear_rows, &self.forward_rows)?;
+        ensure!(
+            !self.poisoned,
+            "tree transaction failed; reset/reload is required"
+        );
+        ensure!(
+            !(self.spec_budget.is_tree()
+                && step.head == Head::All
+                && matches!(step.mask, crate::backend::Mask::Causal)),
+            "causal all-row verification requires a chain spec budget"
+        );
+        if step.input == crate::backend::Input::Ids
+            && step.head == Head::All
+            && matches!(step.mask, crate::backend::Mask::Causal)
+        {
+            ensure!(
+                step.rows == SpecBudget::Chain.rows(),
+                "causal all-row verification requires the declared eight-row chain shape"
+            );
+        }
+        Ok(())
+    }
+
+    fn prepare_step(&mut self, step: crate::backend::Step<'_>) -> Result<()> {
+        self.check_step(step)?;
+        let rows = if matches!(step.mask, crate::backend::Mask::Tree { .. }) {
+            self.spec_budget.rows()
+        } else {
+            step.rows
+        };
+        self.prepare(rows)?;
+        if step.head == Head::All {
+            self.blas
+                .prepare(rows, self.config.vocab_size, self.config.hidden_size)?;
+        }
+        Ok(())
+    }
+
     pub fn run_step(
         &mut self,
         step: crate::backend::Step<'_>,
         mut trace: Option<Target<'_>>,
     ) -> Result<()> {
-        step.check(self.workspace_rows)?;
-        ensure!(
-            !self.poisoned,
-            "tree transaction failed; reset/reload is required"
-        );
+        self.prepare_step(step)?;
         if matches!(step.mask, crate::backend::Mask::Tree { .. }) {
             self.prepare_tree(step)?;
         }
@@ -810,7 +980,7 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
-        step.check(self.workspace_rows)?;
+        self.prepare_step(step)?;
         ensure!(
             layer < self.config.num_hidden_layers,
             "backend layer {layer} is outside model"
@@ -834,7 +1004,7 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
-        step.check(self.workspace_rows)?;
+        self.prepare_step(step)?;
         ensure!(
             i < self.config.num_hidden_layers,
             "backend operator layer {i} is outside model"
@@ -1169,6 +1339,7 @@ impl Engine {
         mut trace: Option<&mut Trace>,
         keep: usize,
     ) -> Result<u32> {
+        self.closure.assert_ready()?;
         ensure!(
             !self.poisoned,
             "tree transaction failed; reset/reload is required"
@@ -1228,6 +1399,11 @@ impl Engine {
     }
 
     fn advance(&mut self, graph: bool, trace: Option<(&mut Trace, &str)>) -> Result<()> {
+        ensure!(
+            !graph || self.spec.is_none(),
+            "graph decode is not declared for draft-enabled engines"
+        );
+        self.closure.assert_ready()?;
         ensure!(
             !self.poisoned,
             "tree transaction failed; reset/reload is required"
@@ -1294,6 +1470,14 @@ impl Engine {
     }
 
     pub fn capture(&mut self) -> Result<()> {
+        ensure!(
+            self.spec.is_none(),
+            "graph decode is not declared for draft-enabled engines"
+        );
+        if self.graph.is_some() {
+            return Ok(());
+        }
+        self.closure.capture()?;
         self.ensure_decode()?;
         ensure!(
             self.position < self.capacity,
@@ -1469,9 +1653,12 @@ impl Engine {
             &self.ops,
             &self.config,
             &self.runtime,
-            8,
-            true,
-            self.capacity,
+            crate::backend::setup::MultiShape {
+                rows: 8,
+                causal: true,
+                capacity: self.capacity,
+            },
+            &self.closure,
         )
         .context("MQ verification setup calibration")?;
         let (attention, selection) = calibrated.choose(self.capacity)?;
@@ -1514,6 +1701,7 @@ impl Engine {
             &self.runtime,
             rows,
             self.capacity,
+            &self.closure,
         )?;
         let (plan, selection) = measured.choose(self.capacity)?;
         let attention = super::verification::Verification::with_plan(
@@ -1604,6 +1792,7 @@ impl Engine {
         {
             return Ok(());
         }
+        self.closure.capture()?;
         let s = self.device.stream.clone();
         let timer = std::time::Instant::now();
         let token = s.clone_dtoh(&self.work.token)?;
@@ -1641,6 +1830,7 @@ impl Engine {
     }
 
     fn capture_tree_commit(&mut self) -> Result<()> {
+        self.closure.capture()?;
         let s = self.device.stream.clone();
         s.synchronize()?;
         s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
@@ -1683,6 +1873,7 @@ impl Engine {
         {
             return Ok(());
         }
+        self.closure.capture()?;
         let s = self.device.stream.clone();
         self.tree_inject(start)?;
         s.synchronize()?;
@@ -2022,6 +2213,7 @@ impl Engine {
         {
             return Ok(());
         }
+        self.closure.capture()?;
         let timer = std::time::Instant::now();
         let s = self.device.stream.clone();
         let token = s.clone_dtoh(&self.work.token)?;
@@ -2092,6 +2284,7 @@ impl Engine {
         {
             return Ok(());
         }
+        self.closure.capture()?;
         let timer = std::time::Instant::now();
         let s = self.device.stream.clone();
         self.run_tree_draft_device(start)?;
@@ -2120,6 +2313,7 @@ impl Engine {
         mut trace: Option<&mut Trace>,
         prefix: &str,
     ) -> Result<crate::dspark::Round> {
+        self.closure.assert_ready()?;
         if self.spec_budget.is_tree() {
             return self.tree_round(limit, trace, prefix);
         }
@@ -2128,7 +2322,13 @@ impl Engine {
             .as_mut()
             .context("draft state is not enabled")?
             .draft
-            .setup_attention(&self.device, &self.ops, &self.config, &self.runtime)?;
+            .setup_attention(
+                &self.device,
+                &self.ops,
+                &self.config,
+                &self.runtime,
+                &self.closure,
+            )?;
         let _round_range = super::profile::Range::new(self.profile_rounds, c"dspark_round");
         ensure!(limit > 0, "spec round output limit must be positive");
         ensure!(
@@ -2268,6 +2468,10 @@ impl Engine {
 
     pub fn set_spec_graph(&mut self, graph: bool) -> Result<()> {
         self.device.stream.synchronize()?;
+        ensure!(
+            !graph || !self.graphs.is_empty(),
+            "spec Graphs were not prepared; load with --spec-graph true"
+        );
         self.spec.as_mut().context("draft is not enabled")?.graph = graph;
         eprintln!("{}", serde_json::json!({"spec_execution":{"graph":graph}}));
         Ok(())
@@ -2314,10 +2518,15 @@ impl Engine {
             .spec
             .as_mut()
             .context("tree round requires enabled draft State")?;
+        spec.draft.setup_attention(
+            &self.device,
+            &self.ops,
+            &self.config,
+            &self.runtime,
+            &self.closure,
+        )?;
         spec.draft
-            .setup_attention(&self.device, &self.ops, &self.config, &self.runtime)?;
-        spec.draft
-            .setup_markov(&self.device, &self.ops, &self.runtime)?;
+            .setup_markov(&self.device, &self.ops, &self.runtime, &self.closure)?;
         if graph {
             self.ensure_tree_draft_graph(start)?;
             self.spec
@@ -2487,11 +2696,11 @@ impl Engine {
         &mut self,
         requests: &[(u8, u32)],
     ) -> Result<Vec<crate::backend::Top4>> {
-        self.spec
-            .as_mut()
-            .context("draft state is not enabled")?
-            .draft
-            .setup_markov(&self.device, &self.ops, &self.runtime)?;
+        ensure!(
+            self.spec_budget.is_tree(),
+            "distributions_batch requires a tree spec budget"
+        );
+        self.closure.assert_ready()?;
         self.spec
             .as_mut()
             .context("draft state is not enabled")?
@@ -2533,6 +2742,12 @@ impl Engine {
     }
 
     pub fn inject_hidden(&mut self, hidden: &[f32], start: usize, rows: usize) -> Result<()> {
+        let limit =
+            super::closure::injection_limit(super::closure::small_rows(self.chunk, self.capacity));
+        ensure!(
+            rows > 0 && (rows > 16 || rows <= limit),
+            "injection rows {rows} exceed declared small-row limit {limit}"
+        );
         ensure!(
             hidden.len() == rows * 5 * self.config.hidden_size,
             "injected hidden shape mismatch"
@@ -2555,8 +2770,13 @@ impl Engine {
         forced: Option<&[u32]>,
     ) -> Result<Vec<u32>> {
         let spec = self.spec.as_mut().context("draft is not enabled")?;
-        spec.draft
-            .setup_attention(&self.device, &self.ops, &self.config, &self.runtime)?;
+        spec.draft.setup_attention(
+            &self.device,
+            &self.ops,
+            &self.config,
+            &self.runtime,
+            &self.closure,
+        )?;
         spec.draft.propose(
             anchor,
             position,
@@ -2606,6 +2826,315 @@ impl Engine {
             }
         }
         Ok(output)
+    }
+}
+
+impl Engine {
+    fn initialize(
+        &mut self,
+        model: &Path,
+        draft: Option<&Path>,
+        write: bool,
+        started: Instant,
+    ) -> Result<()> {
+        let timer = Instant::now();
+        let budget = self.spec.as_ref().map(|_| self.spec_budget);
+        self.forward_rows = super::closure::forward_rows(
+            super::closure::small_rows(self.chunk, self.capacity),
+            budget,
+        );
+        let profile = super::closure::Profile::new(
+            &self.config,
+            self.capacity,
+            self.chunk,
+            budget,
+            model,
+            draft,
+            self.spec.as_ref().map(|s| &s.draft.config),
+        )?;
+        self.blas.declare(self.workspace_rows, &profile.pairs);
+        let key = super::calibrate::key(&self.device)?;
+        let bucket = crate::backend::setup::attention_bucket(self.capacity)?;
+        let mut paths: Vec<_> = profile
+            .linear
+            .iter()
+            .map(|&shape| self.blas.choice_path(shape))
+            .collect();
+        use super::closure::Attention as Kind;
+        for &kind in &profile.attention {
+            paths.push(match kind {
+                Kind::Decode => super::calibrate::cache_path(&self.runtime, &key, bucket, None),
+                Kind::Draft => {
+                    super::multi_calibrate::cache_path(&self.runtime, &key, bucket, 7, false, false)
+                }
+                Kind::Verify | Kind::Tree => super::multi_calibrate::cache_path(
+                    &self.runtime,
+                    &key,
+                    bucket,
+                    self.spec_budget.rows(),
+                    kind == Kind::Verify,
+                    kind == Kind::Tree,
+                ),
+            });
+        }
+        if budget.is_some_and(SpecBudget::is_tree) {
+            paths.push(super::markov_calibrate::cache_path(&self.runtime, &key));
+        }
+        paths.push(profile.path(&self.runtime, &key)?);
+        self.closure.preflight(&paths)?;
+        if write {
+            let c = &self.config;
+            for &shape in &profile.linear {
+                let mut state = 1u32;
+                let values: Vec<_> = (0..shape.rows * shape.input)
+                    .map(|_| {
+                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                        bf16::from_f32((state >> 8) as f32 / 16777216.0 - 0.5)
+                    })
+                    .collect();
+                let input = self.device.stream.clone_htod(&values)?;
+                let layer = &self.weights.layers[0];
+                let weight = if shape.output == c.vocab_size && shape.input == c.hidden_size {
+                    Some(&self.weights.head)
+                } else {
+                    [
+                        (&layer.qkv, c.qkv_dim(), c.hidden_size),
+                        (&layer.o, c.hidden_size, c.hidden_size),
+                        (&layer.gu, 2 * c.intermediate_size, c.hidden_size),
+                        (&layer.down, c.hidden_size, c.intermediate_size),
+                    ]
+                    .into_iter()
+                    .find(|(_, o, i)| *o == shape.output && *i == shape.input)
+                    .map(|(w, _, _)| w)
+                };
+                if let Some(weight) = weight {
+                    self.blas.calibrate_shape(weight, &input.slice(..), shape)?;
+                } else {
+                    self.spec
+                        .as_ref()
+                        .context("draft shape without draft")?
+                        .draft
+                        .calibrate_injection(&mut self.blas, &input.slice(..), shape)?;
+                }
+            }
+        } else {
+            self.blas.load_choices(&profile.linear)?;
+        }
+        for &kind in &profile.attention {
+            match kind {
+                Kind::Decode => self.ensure_decode()?,
+                Kind::Draft => self
+                    .spec
+                    .as_mut()
+                    .context("draft state missing")?
+                    .draft
+                    .setup_attention(
+                        &self.device,
+                        &self.ops,
+                        &self.config,
+                        &self.runtime,
+                        &self.closure,
+                    )?,
+                Kind::Verify => self.ensure_verification()?,
+                Kind::Tree => self.ensure_tree_attention()?,
+            }
+        }
+        if budget.is_some_and(SpecBudget::is_tree) {
+            self.spec
+                .as_mut()
+                .context("draft state missing")?
+                .draft
+                .setup_markov(&self.device, &self.ops, &self.runtime, &self.closure)?;
+        }
+        self.device.stream.synchronize()?;
+        self.closure.finish(profile, &self.runtime, key)?;
+        let choices_ms = timer.elapsed().as_secs_f64() * 1000.0;
+        if write {
+            return Ok(());
+        }
+        let capture = Instant::now();
+        self.prepare_graphs()?;
+        self.closure.expect_captures(self.graphs.len())?;
+        self.check_graphs()?;
+        let capture_ms = capture.elapsed().as_secs_f64() * 1000.0;
+        let restore = Instant::now();
+        self.restore_setup()?;
+        eprintln!(
+            "{}",
+            serde_json::json!({"backend_setup_times":{"choices_ms":choices_ms,"graphs_ms":capture_ms,"restore_ms":restore.elapsed().as_secs_f64()*1000.0}})
+        );
+        self.closure.ready(started)
+    }
+
+    fn prepare_graphs(&mut self) -> Result<()> {
+        self.set_token(0)?;
+        if self.spec.is_none() {
+            self.capture()?;
+            self.graph
+                .as_ref()
+                .context("decode Graph missing")?
+                .launch()?;
+            self.device.stream.synchronize()?;
+            self.check_logits()?;
+            return Ok(());
+        }
+        if self.graphs.is_empty() {
+            return Ok(());
+        }
+        let injections: Vec<_> = self
+            .graphs
+            .iter()
+            .filter_map(|graph| match graph {
+                Graph::Inject(rows) => Some(*rows),
+                _ => None,
+            })
+            .collect();
+        if !self.spec_budget.is_tree() {
+            self.ensure_spec_graph(SpecPhase::Draft, 0)?;
+            self.ensure_spec_graph(SpecPhase::Verify, 0)?;
+            self.launch_spec_graph(SpecPhase::Draft)?;
+            self.launch_spec_graph(SpecPhase::Verify)?;
+            for rows in injections {
+                self.ensure_spec_graph(SpecPhase::Inject(rows), 0)?;
+                self.launch_spec_graph(SpecPhase::Inject(rows))?;
+            }
+        } else {
+            self.ensure_tree_draft_graph(0)?;
+            let count = self.spec_budget.rows();
+            let tokens: Vec<_> = (0..count)
+                .map(|r| if r < 8 { 0 } else { r as u32 })
+                .collect();
+            let parents: Vec<_> = (0..count)
+                .map(|r| {
+                    if r == 0 {
+                        -1
+                    } else if r < 8 {
+                        (r - 1) as i32
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            let tree = crate::tree::Tree::edges(&tokens, &parents, 0, self.capacity)?;
+            self.spec
+                .as_mut()
+                .context("draft state missing")?
+                .tree
+                .as_mut()
+                .context("tree state missing")?
+                .load(&tree)?;
+            let positions: Vec<_> = tree.nodes().iter().map(|n| n.position).collect();
+            let step = crate::backend::Step {
+                rows: count,
+                input: crate::backend::Input::Ids,
+                head: Head::All,
+                mask: crate::backend::Mask::Tree {
+                    parents: &parents,
+                    positions: &positions,
+                },
+            };
+            self.ensure_tree_verify_graph(step)?;
+            self.spec
+                .as_ref()
+                .context("draft state missing")?
+                .tree_verify_graph
+                .as_ref()
+                .context("tree verify Graph missing")?
+                .launch()?;
+            let predictions = vec![0; count];
+            for rows in injections {
+                let plan = tree.select(&predictions, rows, &[])?;
+                self.spec
+                    .as_mut()
+                    .context("draft state missing")?
+                    .tree
+                    .as_mut()
+                    .context("tree state missing")?
+                    .load_commit(&plan)?;
+                self.tree_gather_scatter()?;
+                if rows == 1 {
+                    self.capture_tree_commit()?;
+                }
+                self.spec
+                    .as_ref()
+                    .context("draft state missing")?
+                    .tree_commit_graph
+                    .as_ref()
+                    .context("tree commit Graph missing")?
+                    .launch()?;
+                self.capture_tree_inject(0, rows)?;
+                self.spec
+                    .as_ref()
+                    .context("draft state missing")?
+                    .inject_graphs[rows - 1]
+                    .as_ref()
+                    .context("tree inject Graph missing")?
+                    .launch()?;
+            }
+            let spec = self.spec.as_mut().context("draft state missing")?;
+            spec.tree_draft_graph
+                .as_ref()
+                .context("tree draft Graph missing")?
+                .launch()?;
+            for p in [1, 8, 64] {
+                spec.draft.distributions_batch(&vec![(0, 0); p])?;
+            }
+        }
+        self.device.stream.synchronize()?;
+        Ok(())
+    }
+
+    fn restore_setup(&mut self) -> Result<()> {
+        let s = self.device.stream.clone();
+        s.synchronize()?;
+        let rows = if self.spec.is_some() {
+            self.spec_budget.rows()
+        } else {
+            1
+        };
+        for kv in &mut self.kv {
+            for head in 0..self.config.num_key_value_heads {
+                let lo = head * self.capacity * self.config.head_dim;
+                let end = lo + rows * self.config.head_dim;
+                s.memset_zeros(&mut kv.k.slice_mut(lo..end))?;
+                s.memset_zeros(&mut kv.v.slice_mut(lo..end))?;
+            }
+        }
+        for value in [
+            &mut self.work.x,
+            &mut self.work.n,
+            &mut self.work.qkv,
+            &mut self.work.attn,
+            &mut self.work.out,
+            &mut self.work.gu,
+            &mut self.work.act,
+            &mut self.work.logits,
+        ] {
+            s.memset_zeros(value)?;
+        }
+        s.memset_zeros(&mut self.work.ids)?;
+        s.memset_zeros(&mut self.work.token)?;
+        if let Some(spec) = &mut self.spec {
+            spec.draft.reset_setup()?;
+            for value in [&mut spec.capture, &mut spec.logits] {
+                s.memset_zeros(value)?;
+            }
+            s.memset_zeros(&mut spec.predictions)?;
+            spec.active_rows = 0;
+            if let Some(tree) = &mut spec.tree {
+                tree.reset_setup()?;
+            }
+        }
+        self.reset()?;
+        s.synchronize()?;
+        ensure!(
+            self.position == 0
+                && self.token()? == 0
+                && s.clone_dtoh(&self.work.position)? == [0]
+                && s.clone_dtoh(&self.work.length)? == [1],
+            "setup state was not restored"
+        );
+        Ok(())
     }
 }
 

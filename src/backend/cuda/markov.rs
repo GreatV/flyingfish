@@ -17,14 +17,19 @@ pub struct Markov {
 }
 
 impl Markov {
-    pub fn new(d: &Device, ops: &super::ops::Ops, dir: &std::path::Path) -> Result<Self> {
+    pub fn new(
+        d: &Device,
+        ops: &super::ops::Ops,
+        dir: &std::path::Path,
+        closure: &super::closure::Closure,
+    ) -> Result<Self> {
         let module = cubin::module(&d.ctx, "markov")?;
         let s = &d.stream;
         ensure!(
             d.info.shared_bytes >= 32768,
             "Markov v2 kernels require 32768 bytes static shared memory"
         );
-        let calibration = super::markov_calibrate::load(d, ops, dir)?;
+        let calibration = super::markov_calibrate::load(d, ops, dir, closure)?;
         let (p1, p8) = (calibration.choice(1)?, calibration.choice(8)?);
         let first = [p1.symbol(1), p8.symbol(8), "markov2_top4_phase1_p64"]
             .iter()

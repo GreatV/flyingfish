@@ -8,6 +8,9 @@ use std::path::Path;
 
 pub enum Backend {}
 impl Backend {
+    pub fn check_ready(&self) -> Result<()> {
+        match *self {}
+    }
     pub fn device_info(&self) -> &crate::backend::setup::DeviceInfo {
         match *self {}
     }
@@ -22,6 +25,16 @@ impl Backend {
     }
     pub fn decode_linear(&self) -> &'static str {
         match *self {}
+    }
+    pub fn calibrate(
+        dir: &Path,
+        ordinal: usize,
+        capacity: usize,
+        chunk: Option<usize>,
+        settings: Settings,
+    ) -> Result<()> {
+        Self::load(dir, ordinal, capacity, chunk, settings)?;
+        Ok(())
     }
     pub fn load(
         _dir: &Path,
