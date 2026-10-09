@@ -77,7 +77,26 @@ impl Calibrated {
     }
 }
 
-fn candidates(bucket: usize, rows: usize, causal: bool, tree: bool) -> Vec<MultiPlan> {
+#[derive(Clone, Copy)]
+struct Budget {
+    kv_bytes_per_token: usize,
+    l2_bytes: usize,
+}
+
+fn budget(d: &Device, c: &Config) -> Budget {
+    Budget {
+        kv_bytes_per_token: c.kv_dim() * std::mem::size_of::<bf16>() * 2,
+        l2_bytes: d.info.l2_bytes,
+    }
+}
+
+fn candidates(
+    bucket: usize,
+    rows: usize,
+    causal: bool,
+    tree: bool,
+    budget: Budget,
+) -> Vec<MultiPlan> {
     let mut plans = Vec::new();
     if causal && !tree && rows <= 16 {
         for &chunk in attention_chunks(bucket) {
@@ -127,6 +146,25 @@ fn candidates(bucket: usize, rows: usize, causal: bool, tree: bool) -> Vec<Multi
             },
         });
     }
+    // 128-row tile variant. It reads each K/V tile once per launch; the 64-row
+    // variant reads it once per row tile, so it is offered only when the query
+    // rows span two or more 64-row tiles.
+    // One layer's K/V prefix at the bucket's measured length is
+    // LENGTHS[bucket] * kv_bytes_per_token bytes; the extra 64-row tile re-reads
+    // that prefix, so the variant is offered only where it exceeds the device L2.
+    if 8 * rows > 64 && LENGTHS[bucket] * budget.kv_bytes_per_token > budget.l2_bytes {
+        for chunk in chunks {
+            plans.push(MultiPlan {
+                implementation: MultiImpl::TcmqaW,
+                launch: AttentionPlan {
+                    chunk,
+                    qpack: 8,
+                    threads: 256,
+                    merge_threads: 256,
+                },
+            });
+        }
+    }
     plans
         .into_iter()
         .flat_map(|p| {
@@ -151,6 +189,7 @@ fn check(
     causal: bool,
     tree: bool,
     bucket: usize,
+    budget: Budget,
 ) -> Result<()> {
     ensure!(
         cache.schema == 2
@@ -161,10 +200,10 @@ fn check(
             && cache.tree == tree
             && bucket < LENGTHS.len()
             && cache.bucket == bucket
-            && cache.trials.len() == candidates(bucket, rows, causal, tree).len(),
+            && cache.trials.len() == candidates(bucket, rows, causal, tree, budget).len(),
         "multi attention cache identity mismatch"
     );
-    let expected = candidates(bucket, rows, causal, tree);
+    let expected = candidates(bucket, rows, causal, tree, budget);
     let trials: Vec<_> = cache.trials.iter().filter(|t| t.bucket == bucket).collect();
     ensure!(
         trials.len() == expected.len(),
@@ -278,7 +317,7 @@ fn load_mask(
     ));
     let (cache, hit) = if path.exists() {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)?;
-        check(&cache, &key, rows, causal, tree, bucket)?;
+        check(&cache, &key, rows, causal, tree, bucket, budget(d, c))?;
         (cache, true)
     } else {
         eprintln!(
@@ -286,7 +325,7 @@ fn load_mask(
             serde_json::json!({"attention_calibration_cache":{"schema":2,"lengths":LENGTHS,"bucket":bucket,"path":path,"cached":false,"action":"measure requested bucket"}})
         );
         let cache = measure(d, ops, c, key, shape, tree)?;
-        check(&cache, &cache.key, rows, causal, tree, bucket)?;
+        check(&cache, &cache.key, rows, causal, tree, bucket, budget(d, c))?;
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -404,7 +443,7 @@ fn measure(
             }
         }
         let mut best = (f64::INFINITY, f64::INFINITY);
-        for plan in candidates(bucket, rows, causal, tree) {
+        for plan in candidates(bucket, rows, causal, tree, budget(d, c)) {
             let mut op = Verification::with_plan(
                 &d.ctx,
                 s,
@@ -560,6 +599,10 @@ mod long_tests {
 
     #[test]
     fn measured_bucket_has_complete_candidates_and_valid_launches() -> Result<()> {
+        let budget = Budget {
+            kv_bytes_per_token: 2 * 128 * std::mem::size_of::<bf16>() * 2,
+            l2_bytes: 4 << 20,
+        };
         for (rows, causal, tree) in [
             (7, false, false),
             (8, true, false),
@@ -573,7 +616,7 @@ mod long_tests {
                     binary_version: "test".into(),
                 };
                 let mut trials = Vec::new();
-                for (i, plan) in candidates(bucket, rows, causal, tree)
+                for (i, plan) in candidates(bucket, rows, causal, tree, budget)
                     .into_iter()
                     .enumerate()
                 {
@@ -608,10 +651,10 @@ mod long_tests {
                     trials,
                     wall_ms: 1.0,
                 };
-                check(&cache, &cache.key, rows, causal, tree, bucket)?;
+                check(&cache, &cache.key, rows, causal, tree, bucket, budget)?;
                 let winner = cache.winner;
                 cache.winner = cache.trials[1].plan;
-                assert!(check(&cache, &cache.key, rows, causal, tree, bucket).is_err());
+                assert!(check(&cache, &cache.key, rows, causal, tree, bucket, budget).is_err());
                 cache.winner = winner;
                 assert!(
                     check(
@@ -620,15 +663,16 @@ mod long_tests {
                         rows,
                         causal,
                         tree,
-                        (bucket + 1) % LENGTHS.len()
+                        (bucket + 1) % LENGTHS.len(),
+                        budget,
                     )
                     .is_err()
                 );
                 cache.schema = 1;
-                assert!(check(&cache, &cache.key, rows, causal, tree, bucket).is_err());
+                assert!(check(&cache, &cache.key, rows, causal, tree, bucket, budget).is_err());
                 cache.schema = 2;
                 cache.trials.pop();
-                assert!(check(&cache, &cache.key, rows, causal, tree, bucket).is_err());
+                assert!(check(&cache, &cache.key, rows, causal, tree, bucket, budget).is_err());
             }
         }
         Ok(())

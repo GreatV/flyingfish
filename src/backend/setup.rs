@@ -40,6 +40,7 @@ pub struct AttentionPlan {
 pub enum MultiImpl {
     V1,
     Tcmqa,
+    TcmqaW,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
