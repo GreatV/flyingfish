@@ -85,7 +85,7 @@ pub struct LinearShape {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LinearImpl {
-    Cublas,
+    CublasLt(u32),
     Skinny,
     Candidate(String),
 }
