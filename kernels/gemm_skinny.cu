@@ -115,14 +115,18 @@ extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
   float* mg = reinterpret_cast<float*>(smm + MG_OFF / 2);   // [NW][RT][MA]
 
   // Per-warp tile bases.
-  bf16* my_wt[2] = {wt + warp * RT * LDS, wt + WT_BYTES / 2 + warp * RT * LDS};
-  bf16* my_xt[2] = {xt + warp * MA * LDS, xt + XT_BYTES / 2 + warp * MA * LDS};
+  bf16* const wt0 = wt + warp * RT * LDS;
+  bf16* const wt1 = wt0 + WT_BYTES / 2;
+  bf16* const xt0 = xt + warp * MA * LDS;
+  bf16* const xt1 = xt0 + XT_BYTES / 2;
 
   // Per-warp cp.async staging of one (wt, xt) pair for chunk c: 16B per
   // cp.async, src-size 0 zero-fills dead rows (OOB W rows / acts >= m).
   // W tile: 16 rows x 64 k = 2048 B = 128 x 16B -> 4 per lane.
   // X chunk: MA rows x 64 k -> MA*8 x 16B -> 4 per lane.
   auto stage_chunk = [&](int c, int buf) {
+    bf16* const wbuf = buf ? wt1 : wt0;
+    bf16* const xbuf = buf ? xt1 : xt0;
     const int k0 = kbeg + c * CK;
     const uint4* w0 = reinterpret_cast<const uint4*>(W) + (size_t)row0 * (ldw >> 3) + (k0 >> 3);
     const long wstride = ldw >> 3;                  // uint4 elements per W row
@@ -132,7 +136,7 @@ extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
       const int r = idx >> 3, seg = idx & 7;        // 16 rows x 8 segs (64 k)
       const bool live = row0 + r < out_features;
       const uint4* src = live ? w0 + (size_t)r * wstride + seg : w0;
-      const unsigned dst = smem_u32(my_wt[buf] + r * LDS + seg * 8);
+      const unsigned dst = smem_u32(wbuf + r * LDS + seg * 8);
       const int sz = live ? 16 : 0;
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                    :: "r"(dst), "l"(src), "r"(sz));
@@ -143,7 +147,7 @@ extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
       const int r = idx >> 3, seg = idx & 7;
       const bool live = r < m;
       const bf16* src = live ? X + (size_t)r * in_features + k0 + seg * 8 : X;
-      const unsigned dst = smem_u32(my_xt[buf] + r * LDS + seg * 8);
+      const unsigned dst = smem_u32(xbuf + r * LDS + seg * 8);
       const int sz = live ? 16 : 0;
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                    :: "r"(dst), "l"(src), "r"(sz));
@@ -151,11 +155,8 @@ extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
     asm volatile("cp.async.commit_group;\n");
   };
 
-  float acc[2][4];                                  // per n8 act tile: D frag
-#pragma unroll
-  for (int t = 0; t < 2; ++t)
-#pragma unroll
-    for (int j = 0; j < 4; ++j) acc[t][j] = 0.0f;
+  float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
   stage_chunk(0, 0);
   for (int c = 0; c < nck; ++c) {
@@ -165,20 +166,20 @@ extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
     if (c + 1 < nck) asm volatile("cp.async.wait_group 1;\n");
     else             asm volatile("cp.async.wait_group 0;\n");
     __syncwarp();
+    bf16* const wbuf = buf ? wt1 : wt0;
+    bf16* const xbuf = buf ? xt1 : xt0;
 #pragma unroll
     for (int kk = 0; kk < CK / 16; ++kk) {          // 4 k16 slices
       unsigned wa[4];
       // A 16x16 at rows [0,RT) x k [kk*16,+16) of the warp's W tile:
       // lane -> row lane%16, col kk*16 + (lane/16)*8.
-      ldsm_x4(wa, my_wt[buf] + (lane & 15) * LDS + kk * 16 + (lane >> 4) * 8);
-#pragma unroll
-      for (int t = 0; t < 2; ++t) {
-        if (t >= nacts) break;
-        unsigned xb[2];
-        // B k16 x n8(acts): plain ldmatrix on X[act][k] rows:
-        // mat0 lanes 0-7: act t*8+lane%8, k kk*16; mat1 lanes 8-15: k kk*16+8.
-        ldsm_x2(xb, my_xt[buf] + (t * 8 + (lane & 7)) * LDS + kk * 16 + (lane >> 3) * 8);
-        mma_16816(acc[t], wa, xb);
+      ldsm_x4(wa, wbuf + (lane & 15) * LDS + kk * 16 + (lane >> 4) * 8);
+      unsigned xb[2];
+      ldsm_x2(xb, xbuf + (lane & 7) * LDS + kk * 16 + (lane >> 3) * 8);
+      mma_16816(acc0, wa, xb);
+      if (nacts > 1) {
+        ldsm_x2(xb, xbuf + (8 + (lane & 7)) * LDS + kk * 16 + (lane >> 3) * 8);
+        mma_16816(acc1, wa, xb);
       }
     }
   }
@@ -186,12 +187,16 @@ extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
   // ---- cross-warp merge: each warp writes its fp32 partials, warp 0 sums --
   // D frag: lane l holds (row l/4, col (l%4)*2+{0,1}) and (row l/4+8, ...).
   __syncthreads();
-  for (int t = 0; t < nacts; ++t) {
-    const int c0 = t * 8 + (lane & 3) * 2;
-    mg[((warp * RT) + (lane >> 2)) * MA + c0] = acc[t][0];
-    mg[((warp * RT) + (lane >> 2)) * MA + c0 + 1] = acc[t][1];
-    mg[((warp * RT) + (lane >> 2) + 8) * MA + c0] = acc[t][2];
-    mg[((warp * RT) + (lane >> 2) + 8) * MA + c0 + 1] = acc[t][3];
+  const int c0 = (lane & 3) * 2;
+  mg[((warp * RT) + (lane >> 2)) * MA + c0] = acc0[0];
+  mg[((warp * RT) + (lane >> 2)) * MA + c0 + 1] = acc0[1];
+  mg[((warp * RT) + (lane >> 2) + 8) * MA + c0] = acc0[2];
+  mg[((warp * RT) + (lane >> 2) + 8) * MA + c0 + 1] = acc0[3];
+  if (nacts > 1) {
+    mg[((warp * RT) + (lane >> 2)) * MA + c0 + 8] = acc1[0];
+    mg[((warp * RT) + (lane >> 2)) * MA + c0 + 9] = acc1[1];
+    mg[((warp * RT) + (lane >> 2) + 8) * MA + c0 + 8] = acc1[2];
+    mg[((warp * RT) + (lane >> 2) + 8) * MA + c0 + 9] = acc1[3];
   }
   __syncthreads();
   if (warp != 0) return;
