@@ -364,6 +364,7 @@ impl Blas {
         }
         Ok(())
     }
+
     fn skinny(
         &self,
         w: &impl DevicePtr<bf16>,

@@ -41,15 +41,29 @@ pub enum MultiImpl {
     V1,
     Tcmqa,
     TcmqaW,
+    TcmqaShort,
+    TcmqaWShort,
 }
 
 impl MultiImpl {
+    pub fn phase1(self) -> Self {
+        match self {
+            Self::TcmqaShort => Self::Tcmqa,
+            Self::TcmqaWShort => Self::TcmqaW,
+            other => other,
+        }
+    }
+
+    pub fn short_merge(self) -> bool {
+        matches!(self, Self::TcmqaShort | Self::TcmqaWShort)
+    }
+
     /// Query rows covered by one phase-1 tile (blockIdx.z).
     pub fn phase1_tile_rows(self) -> usize {
         match self {
             MultiImpl::V1 => 64,
-            MultiImpl::Tcmqa => 64,
-            MultiImpl::TcmqaW => 128,
+            MultiImpl::Tcmqa | MultiImpl::TcmqaShort => 64,
+            MultiImpl::TcmqaW | MultiImpl::TcmqaWShort => 128,
         }
     }
 
@@ -57,8 +71,8 @@ impl MultiImpl {
     pub fn phase1_smem_bytes(self) -> usize {
         match self {
             MultiImpl::V1 => 0,
-            MultiImpl::Tcmqa => 35328,
-            MultiImpl::TcmqaW => 52736,
+            MultiImpl::Tcmqa | MultiImpl::TcmqaShort => 35328,
+            MultiImpl::TcmqaW | MultiImpl::TcmqaWShort => 52736,
         }
     }
 }
@@ -169,20 +183,16 @@ impl Setup {
     }
 }
 
+pub const ATTENTION_CAPACITIES: [usize; 5] = [2048, 16384, 49152, 98304, 131072];
+
 pub const ATTENTION_LENGTHS: [usize; 5] = [1024, 8192, 32768, 65536, 130752];
 
 pub fn attention_bucket(capacity: usize) -> Result<usize> {
     ensure!(
-        (1..=131072).contains(&capacity),
-        "attention capacity {capacity} is outside 1..=131072"
+        capacity > 0 && capacity <= ATTENTION_CAPACITIES[ATTENTION_CAPACITIES.len() - 1],
+        "attention capacity {capacity} is outside supported buckets"
     );
-    Ok(match capacity {
-        1..=2048 => 0,
-        2049..=16384 => 1,
-        16385..=49152 => 2,
-        49153..=98304 => 3,
-        _ => 4,
-    })
+    Ok(ATTENTION_CAPACITIES.partition_point(|&upper| upper < capacity))
 }
 
 pub fn attention_chunks(bucket: usize) -> &'static [usize] {
@@ -199,6 +209,13 @@ mod long_tests {
 
     #[test]
     fn long_buckets_cover_capacity_and_growth() -> Result<()> {
+        let mut lower = 1;
+        for (bucket, &upper) in ATTENTION_CAPACITIES.iter().enumerate() {
+            assert!(lower <= upper);
+            assert_eq!(attention_bucket(lower)?, bucket);
+            assert_eq!(attention_bucket(upper)?, bucket);
+            lower = upper + 1;
+        }
         for (capacity, expected) in [
             (2048, 0),
             (2049, 1),
