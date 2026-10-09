@@ -211,6 +211,10 @@ struct CommonParams {
     stop: Option<serde_json::Value>,
     #[serde(default)]
     stream: Option<bool>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(flatten)]
+    unrecognized: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -263,6 +267,32 @@ fn check_greedy(params: &CommonParams) -> Result<(), Box<Response>> {
     }
     if params.stop.is_some() {
         return Err(Box::new(bad_request("stop sequences are not supported")));
+    }
+    Ok(())
+}
+
+/// Rejects a model name other than the loaded model and any non-null
+/// parameter the server does not recognize.
+fn check_request(state: &AppState, params: &CommonParams) -> Result<(), Box<Response>> {
+    if let Some(model) = &params.model
+        && *model != state.model_name
+    {
+        return Err(Box::new(
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": {
+                    "message": format!("model {model:?} is not served; the loaded model is {:?}", state.model_name),
+                    "type": "invalid_request_error",
+                    "code": "model_not_found"
+                }})),
+            )
+                .into_response(),
+        ));
+    }
+    if let Some((name, _)) = params.unrecognized.iter().find(|(_, v)| !v.is_null()) {
+        return Err(Box::new(bad_request(&format!(
+            "unsupported parameter {name:?}"
+        ))));
     }
     Ok(())
 }
@@ -364,6 +394,9 @@ async fn completions(
     if let Err(response) = check_greedy(&body.params) {
         return *response;
     }
+    if let Err(response) = check_request(&state, &body.params) {
+        return *response;
+    }
     let ids = match prompt_to_ids(&state, body.prompt) {
         Ok(ids) => ids,
         Err(response) => return *response,
@@ -397,6 +430,9 @@ async fn chat_completions(
     Json(body): Json<ChatBody>,
 ) -> Response {
     if let Err(response) = check_greedy(&body.params) {
+        return *response;
+    }
+    if let Err(response) = check_request(&state, &body.params) {
         return *response;
     }
     let messages = match body.messages {
