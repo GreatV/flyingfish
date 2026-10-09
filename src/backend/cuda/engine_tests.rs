@@ -13,7 +13,7 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
         draft_model: None,
         runtime_dir: Some(runtime),
     };
-    Engine::calibrate(&target, 0, 33824, Some(1024), settings.clone())?;
+    Engine::calibrate(&target, 0, 33824, Some(16), settings.clone())?;
     let mut model = Engine::load(&target, 0, 33824, Some(1024), settings)?;
     model.check_ready()?;
     for kv in &model.kv {
@@ -214,6 +214,67 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
     model.spec.as_mut().context("draft missing")?.inject_graphs[2] = removed;
     model.check_ready()?;
     model.closure.expect_captures(model.graphs.len())?;
+    drop(model);
+    let settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Tree16,
+        spec_graph: true,
+        linear_choices: Vec::new(),
+        draft_model: Some(PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?)),
+        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+    };
+    Engine::calibrate(&target, 0, 33824, Some(8), settings.clone())?;
+    let mut model = Engine::load(&target, 0, 33824, Some(8), settings.clone())?;
+    model.prefill(&[1; 8], None)?;
+    let before = model.device.stream.clone_dtoh(&model.work.x)?;
+    for rows in 9..16 {
+        let step = crate::backend::Step {
+            rows,
+            input: crate::backend::Input::Ids,
+            head: Head::Last,
+            mask: crate::backend::Mask::Causal,
+        };
+        ensure!(
+            model.run_step(step, None).is_err(),
+            "undeclared forward rows passed admission"
+        );
+    }
+    ensure!(
+        model.device.stream.clone_dtoh(&model.work.x)? == before,
+        "rejected rows mutated workspace"
+    );
+    model.run_step(
+        crate::backend::Step {
+            rows: 16,
+            input: crate::backend::Input::Ids,
+            head: Head::Last,
+            mask: crate::backend::Mask::Causal,
+        },
+        None,
+    )?;
+    model.check_logits()?;
+    model.check_ready()?;
+    println!("small_chunk_forward tree16/chunk8 rejects9..15 without writes; declared16 PASS");
+    drop(model);
+    let settings = Settings {
+        spec_budget: SpecBudget::Tree64,
+        ..settings
+    };
+    Engine::calibrate(&target, 0, 33824, Some(8), settings.clone())?;
+    let mut model = Engine::load(&target, 0, 33824, Some(8), settings)?;
+    model.prefill(&[1; 8], None)?;
+    model.run_step(
+        crate::backend::Step {
+            rows: 17,
+            input: crate::backend::Input::Ids,
+            head: Head::Last,
+            mask: crate::backend::Mask::Causal,
+        },
+        None,
+    )?;
+    model.check_logits()?;
+    model.check_ready()?;
+    println!("small_chunk_forward tree64/chunk8 CublasOnly17 PASS");
     Ok(())
 }
 

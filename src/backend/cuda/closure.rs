@@ -39,7 +39,7 @@ pub(super) struct Profile {
     pub pairs: Pairs,
     pub attention: Vec<Attention>,
     capacity: usize,
-    chunk: usize,
+    small_rows: usize,
     budget: Option<usize>,
     model: String,
     draft: Option<String>,
@@ -82,14 +82,23 @@ pub(super) fn hash(bytes: &[u8]) -> String {
     format!("{:016x}", hash.finish())
 }
 
-pub(super) fn injection_limit(chunk: usize, capacity: usize) -> usize {
-    chunk.min(capacity).clamp(8, 16)
+pub(super) fn small_rows(chunk: usize, capacity: usize) -> usize {
+    chunk.min(capacity).min(16)
+}
+
+pub(super) fn injection_limit(small_rows: usize) -> usize {
+    small_rows.max(8)
+}
+
+pub(super) fn forward_rows(small_rows: usize, budget: Option<SpecBudget>) -> BTreeSet<usize> {
+    (1..=small_rows)
+        .chain(budget.into_iter().flat_map(|b| [7, b.rows()]))
+        .collect()
 }
 
 fn shapes(
     c: &Config,
-    capacity: usize,
-    chunk: usize,
+    small_rows: usize,
     budget: Option<SpecBudget>,
     dimensions: Option<(usize, usize)>,
 ) -> Result<(BTreeSet<LinearShape>, Pairs)> {
@@ -106,9 +115,7 @@ fn shapes(
             linear.insert(shape);
         }
     };
-    for rows in
-        (1..=chunk.min(capacity).min(16)).chain(budget.into_iter().flat_map(|b| [7, b.rows()]))
-    {
+    for rows in forward_rows(small_rows, budget) {
         for (output, input) in [
             (c.qkv_dim(), c.hidden_size),
             (c.hidden_size, c.hidden_size),
@@ -124,7 +131,7 @@ fn shapes(
             dimensions.context("draft dimensions missing from closure declaration")?;
         add(7, c.vocab_size, c.hidden_size);
         add(budget.rows(), c.vocab_size, c.hidden_size);
-        let max = injection_limit(chunk, capacity);
+        let max = injection_limit(small_rows);
         for rows in 1..=max {
             for (output, input) in [(c.hidden_size, context), (c.kv_dim(), c.hidden_size)] {
                 add(rows, output, input);
@@ -146,13 +153,15 @@ impl Profile {
         draft_config: Option<&crate::dspark::DraftConfig>,
     ) -> Result<Self> {
         let dimensions = draft_config.map(|d| (d.capture_width(), d.markov_rank));
-        let (linear, pairs) = shapes(c, capacity, chunk, budget, dimensions)?;
+        let small_rows = small_rows(chunk, capacity);
+        ensure!(small_rows > 0, "empty profile row bound");
+        let (linear, pairs) = shapes(c, small_rows, budget, dimensions)?;
         Ok(Self {
             linear,
             pairs,
             attention: attention(budget),
             capacity,
-            chunk,
+            small_rows,
             budget: budget.map(SpecBudget::rows),
             model: hash(&fs::read(model.join("config.json"))?),
             draft: draft
@@ -335,20 +344,24 @@ impl Closure {
 mod tests {
     use super::*;
 
-    fn config() -> Result<Config> {
-        Ok(serde_json::from_value(serde_json::json!({
+    fn config_value() -> serde_json::Value {
+        serde_json::json!({
             "model_type":"llama", "hidden_size":2048, "intermediate_size":6144,
             "num_hidden_layers":42,"num_attention_heads":16,"num_key_value_heads":2,
             "head_dim":128,"vocab_size":130560,"max_position_embeddings":131072,
             "rms_norm_eps":0.00001,"rope_theta":10000.0,"hidden_act":"silu",
             "tie_word_embeddings":false,"torch_dtype":"bfloat16","eos_token_id":[2]
-        }))?)
+        })
+    }
+
+    fn config() -> Result<Config> {
+        Ok(serde_json::from_value(config_value())?)
     }
 
     #[test]
     fn shape_closure_covers_prefill_and_all_commits() -> Result<()> {
         let c = config()?;
-        let draft: crate::dspark::DraftConfig = serde_json::from_value(serde_json::json!({
+        let draft_value = serde_json::json!({
             "model_type":"dflash","architectures":[],"dtype":"bfloat16",
             "hidden_size":2048,"intermediate_size":6144,"num_hidden_layers":5,
             "num_attention_heads":16,"num_key_value_heads":2,"head_dim":128,
@@ -356,21 +369,97 @@ mod tests {
             "block_size":8,"mask_token_id":0,"target_layer_ids":[1,10,20,30,39],
             "num_target_layers":42,"markov_rank":256,"markov_head_type":"markov",
             "projector_type":"linear","rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}
-        }))?;
+        });
+        let draft: crate::dspark::DraftConfig = serde_json::from_value(draft_value.clone())?;
         assert_eq!(draft.num_target_layers, 42);
         assert_eq!(draft.capture_width(), 10240);
         let dimensions = Some((draft.capture_width(), draft.markov_rank));
-        assert_eq!(shapes(&c, 33824, 32768, None, None)?.0.len(), 65);
+        let root = std::env::current_exe()?
+            .parent()
+            .context("test executable directory missing")?
+            .join(format!(
+                "profile-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+            ));
+        fs::create_dir(&root)?;
+        let identity = (|| -> Result<()> {
+            let model = root.join("target");
+            let draft_dir = root.join("draft");
+            fs::create_dir(&model)?;
+            fs::create_dir(&draft_dir)?;
+            fs::write(
+                model.join("config.json"),
+                serde_json::to_vec(&config_value())?,
+            )?;
+            fs::write(
+                draft_dir.join("config.json"),
+                serde_json::to_vec(&draft_value)?,
+            )?;
+            let key = CacheKey {
+                device_uuid: "test".into(),
+                driver_version: "test".into(),
+                binary_version: "test".into(),
+            };
+            for budget in [
+                None,
+                Some(SpecBudget::Chain),
+                Some(SpecBudget::Tree16),
+                Some(SpecBudget::Tree32),
+                Some(SpecBudget::Tree64),
+            ] {
+                let make = |chunk| {
+                    Profile::new(
+                        &c,
+                        33824,
+                        chunk,
+                        budget,
+                        &model,
+                        budget.map(|_| draft_dir.as_path()),
+                        budget.map(|_| &draft),
+                    )
+                };
+                let p16 = make(16)?;
+                for chunk in [256, 32768] {
+                    let other = make(chunk)?;
+                    assert_eq!(p16, other);
+                    assert_eq!(p16.path(&root, &key)?, other.path(&root, &key)?);
+                }
+                let p8 = make(8)?;
+                assert_ne!(p8, p16);
+                assert_ne!(p8.path(&root, &key)?, p16.path(&root, &key)?);
+            }
+            Ok(())
+        })();
+        fs::remove_dir_all(&root)?;
+        identity?;
+
         assert_eq!(
-            shapes(&c, 33824, 32768, Some(SpecBudget::Chain), dimensions)?
-                .0
-                .len(),
+            shapes(&c, small_rows(32768, 33824), None, None)?.0.len(),
+            65
+        );
+        assert_eq!(
+            shapes(
+                &c,
+                small_rows(32768, 33824),
+                Some(SpecBudget::Chain),
+                dimensions
+            )?
+            .0
+            .len(),
             100
         );
         assert_eq!(
-            shapes(&c, 33824, 32768, Some(SpecBudget::Tree16), dimensions)?
-                .0
-                .len(),
+            shapes(
+                &c,
+                small_rows(32768, 33824),
+                Some(SpecBudget::Tree16),
+                dimensions
+            )?
+            .0
+            .len(),
             100
         );
         for budget in [
@@ -379,7 +468,7 @@ mod tests {
             SpecBudget::Tree32,
             SpecBudget::Tree64,
         ] {
-            let (linear, pairs) = shapes(&c, 33824, 32768, Some(budget), dimensions)?;
+            let (linear, pairs) = shapes(&c, small_rows(32768, 33824), Some(budget), dimensions)?;
             assert!(linear.contains(&LinearShape {
                 rows: 1,
                 output: c.vocab_size,
@@ -402,10 +491,51 @@ mod tests {
             );
         }
         assert_eq!(attention(None), vec![Attention::Decode]);
-        for budget in [SpecBudget::Tree32, SpecBudget::Tree64] {
+        for budget in [
+            SpecBudget::Chain,
+            SpecBudget::Tree16,
+            SpecBudget::Tree32,
+            SpecBudget::Tree64,
+        ] {
             for chunk in [1, 8, 9, 15, 16, 32] {
-                let limit = injection_limit(chunk, 4096);
-                let (linear, pairs) = shapes(&c, 4096, chunk, Some(budget), dimensions)?;
+                let limit = injection_limit(small_rows(chunk, 4096));
+                let (linear, pairs) =
+                    shapes(&c, small_rows(chunk, 4096), Some(budget), dimensions)?;
+                let allowed = forward_rows(small_rows(chunk, 4096), Some(budget));
+                let workspace = budget.workspace_rows(chunk);
+                for rows in 1..=workspace {
+                    let step = crate::backend::Step {
+                        rows,
+                        input: crate::backend::Input::Ids,
+                        head: crate::backend::Head::Last,
+                        mask: crate::backend::Mask::Causal,
+                    };
+                    let declared = rows > 16
+                        || linear.contains(&LinearShape {
+                            rows,
+                            output: c.qkv_dim(),
+                            input: c.hidden_size,
+                        });
+                    assert_eq!(step.check(workspace, rows, &allowed).is_ok(), declared);
+                    assert_eq!(rows > 16 || allowed.contains(&rows), declared);
+                }
+                if budget.is_tree() {
+                    for rows in 1..=budget.rows() {
+                        let parents: Vec<_> =
+                            (0..rows).map(|r| if r == 0 { -1 } else { 0 }).collect();
+                        let positions: Vec<_> = (0..rows).map(|r| usize::from(r != 0)).collect();
+                        let step = crate::backend::Step {
+                            rows,
+                            input: crate::backend::Input::Ids,
+                            head: crate::backend::Head::All,
+                            mask: crate::backend::Mask::Tree {
+                                parents: &parents,
+                                positions: &positions,
+                            },
+                        };
+                        assert!(step.check(workspace, budget.rows(), &allowed).is_ok());
+                    }
+                }
                 for rows in 1..=16 {
                     assert_eq!(
                         linear.contains(&LinearShape {
@@ -427,7 +557,12 @@ mod tests {
                 assert!(pairs.contains(&(2048, 10240)) && pairs.contains(&(256, 2048)));
             }
         }
-        let (small, _) = shapes(&c, 4096, 1, Some(SpecBudget::Tree16), dimensions)?;
+        let (small, _) = shapes(
+            &c,
+            small_rows(1, 4096),
+            Some(SpecBudget::Tree16),
+            dimensions,
+        )?;
         for rows in 1..=8 {
             for (output, input) in [(2048, 10240), (256, 2048)] {
                 assert!(small.contains(&LinearShape {
@@ -447,7 +582,12 @@ mod tests {
             output: 2560,
             input: 2048
         }));
-        let (wide, _) = shapes(&c, 33824, 32768, Some(SpecBudget::Tree64), dimensions)?;
+        let (wide, _) = shapes(
+            &c,
+            small_rows(32768, 33824),
+            Some(SpecBudget::Tree64),
+            dimensions,
+        )?;
         assert!(wide.iter().all(|s| s.rows <= 16));
         Ok(())
     }
@@ -466,7 +606,12 @@ mod tests {
                 Some(SpecBudget::Tree16),
                 Some(SpecBudget::Tree64),
             ] {
-                let (linear, _) = shapes(&c, 33824, 32768, budget, Some((5 * hidden, 128)))?;
+                let (linear, _) = shapes(
+                    &c,
+                    small_rows(32768, 33824),
+                    budget,
+                    Some((5 * hidden, 128)),
+                )?;
                 assert!(!linear.is_empty());
                 for &shape in &linear {
                     super::super::linear_calibrate::check_extent(
@@ -511,7 +656,7 @@ mod tests {
             Some(SpecBudget::Tree16),
             Some(SpecBudget::Tree64),
         ] {
-            let (linear, pairs) = shapes(&c, 33824, 32768, budget, Some((1920, 128)))?;
+            let (linear, pairs) = shapes(&c, small_rows(32768, 33824), budget, Some((1920, 128)))?;
             assert!(linear.is_empty());
             let mut expected = base.clone();
             if budget.is_some() {
@@ -563,7 +708,7 @@ mod tests {
                 pairs: BTreeSet::new(),
                 attention: attention(Some(SpecBudget::Tree16)),
                 capacity: 16,
-                chunk: 16,
+                small_rows: 16,
                 budget: Some(16),
                 model: "test".into(),
                 draft: Some("test".into()),

@@ -292,6 +292,7 @@ enum Graph {
 }
 
 pub struct Engine {
+    forward_rows: std::collections::BTreeSet<usize>,
     graphs: Vec<Graph>,
     closure: Rc<super::closure::Closure>,
     graph: Option<CudaGraph>,
@@ -434,9 +435,10 @@ impl Engine {
             token: s.alloc_zeros(1)?,
         };
         s.memcpy_htod(&[1i32], &mut work.length)?;
-        let flash = Flash::new(s.clone(), chunk, config.num_attention_heads)?;
+        let flash = Flash::new(s.clone(), workspace_rows, config.num_attention_heads)?;
         s.synchronize()?;
         let mut engine = Self {
+            forward_rows: std::collections::BTreeSet::new(),
             graphs: Vec::new(),
             closure,
             poisoned: false,
@@ -564,10 +566,10 @@ impl Engine {
                     .alloc_zeros(rows * 5 * self.config.hidden_size)?;
             }
         }
-        if chunk != old_chunk {
+        if rows != old_rows || chunk != old_chunk {
             self.flash = Flash::new(
                 self.device.stream.clone(),
-                chunk,
+                rows,
                 self.config.num_attention_heads,
             )?;
         }
@@ -773,12 +775,16 @@ impl Engine {
         self.run_step(step, trace)
     }
 
-    pub fn run_step(
-        &mut self,
-        step: crate::backend::Step<'_>,
-        mut trace: Option<Target<'_>>,
-    ) -> Result<()> {
-        step.check(self.workspace_rows)?;
+    fn check_step(&self, step: crate::backend::Step<'_>) -> Result<()> {
+        let linear_rows = if matches!(step.mask, crate::backend::Mask::Tree { .. }) {
+            self.spec_budget.rows()
+        } else {
+            step.rows
+        };
+        let available_rows = self
+            .workspace_rows
+            .min(self.capacity.saturating_sub(self.position));
+        step.check(available_rows, linear_rows, &self.forward_rows)?;
         ensure!(
             !self.poisoned,
             "tree transaction failed; reset/reload is required"
@@ -789,6 +795,39 @@ impl Engine {
                 && matches!(step.mask, crate::backend::Mask::Causal)),
             "causal all-row verification requires a chain spec budget"
         );
+        if step.input == crate::backend::Input::Ids
+            && step.head == Head::All
+            && matches!(step.mask, crate::backend::Mask::Causal)
+        {
+            ensure!(
+                step.rows == SpecBudget::Chain.rows(),
+                "causal all-row verification requires the declared eight-row chain shape"
+            );
+        }
+        Ok(())
+    }
+
+    fn prepare_step(&mut self, step: crate::backend::Step<'_>) -> Result<()> {
+        self.check_step(step)?;
+        let rows = if matches!(step.mask, crate::backend::Mask::Tree { .. }) {
+            self.spec_budget.rows()
+        } else {
+            step.rows
+        };
+        self.prepare(rows)?;
+        if step.head == Head::All {
+            self.blas
+                .prepare(rows, self.config.vocab_size, self.config.hidden_size)?;
+        }
+        Ok(())
+    }
+
+    pub fn run_step(
+        &mut self,
+        step: crate::backend::Step<'_>,
+        mut trace: Option<Target<'_>>,
+    ) -> Result<()> {
+        self.prepare_step(step)?;
         if matches!(step.mask, crate::backend::Mask::Tree { .. }) {
             self.prepare_tree(step)?;
         }
@@ -947,7 +986,7 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
-        step.check(self.workspace_rows)?;
+        self.prepare_step(step)?;
         ensure!(
             layer < self.config.num_hidden_layers,
             "backend layer {layer} is outside model"
@@ -971,7 +1010,7 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
-        step.check(self.workspace_rows)?;
+        self.prepare_step(step)?;
         ensure!(
             i < self.config.num_hidden_layers,
             "backend operator layer {i} is outside model"
@@ -2709,7 +2748,8 @@ impl Engine {
     }
 
     pub fn inject_hidden(&mut self, hidden: &[f32], start: usize, rows: usize) -> Result<()> {
-        let limit = super::closure::injection_limit(self.chunk, self.capacity);
+        let limit =
+            super::closure::injection_limit(super::closure::small_rows(self.chunk, self.capacity));
         ensure!(
             rows > 0 && (rows > 16 || rows <= limit),
             "injection rows {rows} exceed declared small-row limit {limit}"
@@ -2805,6 +2845,10 @@ impl Engine {
     ) -> Result<()> {
         let timer = Instant::now();
         let budget = self.spec.as_ref().map(|_| self.spec_budget);
+        self.forward_rows = super::closure::forward_rows(
+            super::closure::small_rows(self.chunk, self.capacity),
+            budget,
+        );
         let profile = super::closure::Profile::new(
             &self.config,
             self.capacity,
