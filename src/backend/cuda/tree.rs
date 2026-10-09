@@ -13,9 +13,7 @@ use std::sync::Arc;
 struct Kernels {
     prepare: CudaFunction,
     rope: CudaFunction,
-    qkv_pad: CudaFunction,
     kv_write: CudaFunction,
-    kv_pad: CudaFunction,
     kv_gather: CudaFunction,
     kv_scatter: CudaFunction,
     hidden_gather: CudaFunction,
@@ -105,9 +103,7 @@ impl State {
         let kernels = Kernels {
             prepare: module.load_function("tree_prepare")?,
             rope: module.load_function("tree_rope")?,
-            qkv_pad: module.load_function("tree_qkv_pad")?,
             kv_write: module.load_function("tree_kv_write")?,
-            kv_pad: module.load_function("tree_kv_pad")?,
             kv_gather: module.load_function("tree_kv_gather")?,
             kv_scatter: module.load_function("tree_kv_scatter")?,
             hidden_gather: module.load_function("tree_hidden_gather")?,
@@ -301,22 +297,16 @@ impl State {
         let budget = self.budget as i32;
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.qkv_pad)
-                .arg(&mut *qkv)
-                .arg(&self.rows)
-                .arg(&budget)
-                .launch(flat(self.budget * 2560))
-                .context("tree QKV padding")?;
-            self.stream
                 .launch_builder(&self.kernels.rope)
                 .arg(qkv)
                 .arg(&self.positions)
                 .arg(&self.rows)
+                .arg(&budget)
                 .arg(&16i32)
                 .arg(&2i32)
                 .arg(&128i32)
                 .arg(&self.theta)
-                .launch(flat(self.budget * 18 * 64))
+                .launch(flat(self.budget * 20 * 64))
                 .context("tree indexed RoPE")?;
         }
         Ok(())
@@ -350,19 +340,10 @@ impl State {
                 .arg(&mut *v)
                 .arg(&self.prefix)
                 .arg(&self.rows)
-                .arg(&capacity)
-                .launch(flat(self.budget * 256))
-                .context("tree physical KV write")?;
-            self.stream
-                .launch_builder(&self.kernels.kv_pad)
-                .arg(k)
-                .arg(v)
-                .arg(&self.prefix)
-                .arg(&self.rows)
                 .arg(&budget)
                 .arg(&capacity)
                 .launch(flat(self.budget * 256))
-                .context("tree physical KV padding")?;
+                .context("tree physical KV write")?;
         }
         Ok(())
     }
