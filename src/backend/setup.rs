@@ -43,6 +43,26 @@ pub enum MultiImpl {
     TcmqaW,
 }
 
+impl MultiImpl {
+    /// Query rows covered by one phase-1 tile (blockIdx.z).
+    pub fn phase1_tile_rows(self) -> usize {
+        match self {
+            MultiImpl::V1 => 64,
+            MultiImpl::Tcmqa => 64,
+            MultiImpl::TcmqaW => 128,
+        }
+    }
+
+    /// Dynamic shared memory the phase-1 kernel is launched with.
+    pub fn phase1_smem_bytes(self) -> usize {
+        match self {
+            MultiImpl::V1 => 0,
+            MultiImpl::Tcmqa => 35328,
+            MultiImpl::TcmqaW => 52736,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultiPlan {
     pub implementation: MultiImpl,
