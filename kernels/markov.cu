@@ -49,9 +49,14 @@
 //     Block blk owns vocab rows [blk*VT, +VT) (VT = 256, NB = V/VT = 510)
 //     and writes, per act p < P, its local top-4 (4 (score, id) pairs) and
 //     its lse partial (m, l) to caller scratch. Slots p >= P are not written.
-//   phase 2 (markov2_top4_phase2): grid = dim3(P), block = 256. Merges the
-//     NB block partials per act (score-desc/id-asc merge; lse rescale) and
-//     writes top4/logp/lse. Reads exactly NB partials per act.
+//   phase 2 (markov2_top4_phase2): grid = dim3(P), block = 256. Each thread
+//     folds two of the NB block partials per act (vectorized reads,
+//     score-desc/id-asc merge; lse rescale), 5-round in-warp shfl
+//     butterflies, one __syncthreads, then warp 0 merges the 8 warp lists
+//     and writes top4/logp/lse. Reads exactly NB partials per act. The
+//     lse/logp merge association differs from the previous (smem halving
+//     tree) revision: top-4 ids are unchanged (deterministic total order),
+//     lse/logp can differ in the last fp32 ulp.
 //
 // Scratch (caller-allocated; PT = compiled max acts of the phase-1 instance):
 //   scratch_top4: [NB][PT][4] of (float score, u32 id) -- 8 B each
@@ -82,48 +87,6 @@
 //     void(const float* scratch_top4, const float* scratch_lse,
 //          unsigned* top4, float* logp, float* lse, int V, int P, int PT)
 //     launch: grid = dim3(P), block = 256, dynamic smem = 0
-//
-// HOST INTEGRATION (Codex-A):
-//   - One launch pair per tree depth: gather (parent_token, B_row) per node
-//     into the request arrays (device), then phase1 + phase2.
-//   - Dispatch: P == 1 -> p1; 2..8 -> p8; 9..64 -> p64. P is fixed per
-//     graph capture; capture one graph per P bucket actually run.
-//   - Scratch: one slab of NB*PT*40 bytes per PT bucket, reused across
-//     depths. The PT argument of phase 2 is the scratch stride.
-//   - Batch invariance (see above) holds by construction on one device;
-//     the p1 instance shares the p8 code path, so a single-node wave and
-//     a batched wave produce identical bits for the same request.
-//
-// Phase-1 organization (per PT instance):
-//   PT=64: 8 warps as 1(v-split) x 8(act-tiles): warp w owns acts
-//     [w*8, w*8+8) and sweeps the block's 256 v rows. w2 is cp.async-staged
-//     through a 4-buffer swizzled smem pipeline ([4][16][256] = 32768 B
-//     static smem, 16B-segment XOR swizzle seg ^ (row % 32), A operands via
-//     ldmatrix.x4). The e B-fragments are loaded from gmem into registers
-//     once per launch (32 x LDG.32 per lane; the 64 e rows are a 32 KB
-//     L2-resident working set). Per-thread running top-4 (2 act columns per
-//     lane under the m16n8 D layout) merges in-warp with __shfl_xor 4/8/16
-//     after the sweep. The (m, l) lse partials are canonicalized per 32-v
-//     group: after every two chunks the group partial is merged in-warp
-//     (offs 4/8/16) and folded into block accumulators in ascending-group
-//     order by the r0 == 0 lanes. 3 blocks are resident per SM at 32768 B
-//     static smem per block.
-//   PT=8 and PT=1 share one tensor-core body (PT=1 is the same code with
-//     scratch stride 1; e rows p >= P are zero-filled, padding acts are
-//     never written): 8 warps as 8(v-split) x 1: warp w owns v rows
-//     [blk*256 + w*32, +32) (2 m16 tiles) and all acts. A fragments are
-//     loaded from gmem into registers (4x LDG.32 per k16 slice per lane;
-//     within one k16 slice the a0/a2 loads cover every touched 32 B sector
-//     fully through L1, so w2 DRAM traffic is exactly V*256*2 B once per
-//     launch). e rows are staged in smem (4096 B swizzled) via ldmatrix.x2.
-//     Each warp covers exactly one 32-v group: its (m, l) partial after the
-//     in-warp butterfly is the canonical group partial; the 8 v-split warp
-//     partials merge through smem in ascending-warp order before one warp
-//     per act writes scratch (static smem 6656 B total).
-//   B (logits) loads are direct 2-byte gmem loads in all instances: within
-//     one mma acc tile a warp's loads for one act cover 16 consecutive v
-//     (one fully consumed 32 B sector via L1). req_tok/req_row are read
-//     only for p < P.
 // ============================================================================
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -140,6 +103,19 @@ using bf16 = __nv_bfloat16;
   if (V != MK2_VOCAB || in != MK2_DIM || P < 1 || P > PT ||                  \
       blockDim.x != MK2_NT || gridDim.x != MK2_NB2) __trap();                \
 } while (0)
+
+// Test-only score dump: with -DMK2_DUMP_S and a non-null g_mk2_dump, every
+// computed s is also stored at [act*V + v]. Compiles to nothing otherwise.
+#ifdef MK2_DUMP_S
+__device__ float* g_mk2_dump;
+// g_mk2_dump lives in this TU; the host installs the pointer by launching
+// this kernel (cudaMemcpyToSymbol across TUs fails without -rdc).
+extern "C" __global__ void mk2_set_dump(float* p) { g_mk2_dump = p; }
+#define MK2_DUMP_S_WRITE(act, v, s)                                          \
+  do { if (g_mk2_dump) g_mk2_dump[(size_t)(act) * MK2_VOCAB + (v)] = (s); } while (0)
+#else
+#define MK2_DUMP_S_WRITE(act, v, s) ((void)0)
+#endif
 
 namespace mk2p1 {
 
@@ -283,16 +259,17 @@ using namespace mk2p1;
 // resident per SM (24 warps), which restores DRAM saturation. Dynamic smem
 // with an opt-in is not an option: the fixed ABI launch contract does not
 // document one.
-extern "C" __global__ void __launch_bounds__(MK2_NT, 3) markov2_top4_phase1_p64(
+// Body shared by the fixed-P export and the device-P dispatcher (devp below).
+// The w2 pipeline buffer is caller-provided (16384 bf16 = 32768 B) so the
+// devp kernel can share one allocation across the three body branches.
+__device__ __forceinline__ void markov2_p1_body64(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
-    float* __restrict__ scratch_lse, int V, int in, int P) {
-  MK2_GUARD_P1(64);
+    float* __restrict__ scratch_lse, int P, bf16* __restrict__ w2sm) {
   constexpr int PT = 64;
   constexpr int NBUF = 4;                           // w2 chunk buffers
   constexpr int CH = 16;                            // rows per chunk
-  __shared__ __align__(16) bf16 w2sm[NBUF * CH * MK2_DIM];   // 32768 B swizzled
 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int vBlk0 = blockIdx.x * MK2_VT;
@@ -367,18 +344,22 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 3) markov2_top4_phase1_p64(
     if (act0 < P) {
       const bf16 sv = __hadd(__float2bfloat16(acc[0]), Brow0[vg]);
       st.add<0>(__bfloat162float(sv), (unsigned)vg);
+      MK2_DUMP_S_WRITE(act0, vg, __bfloat162float(sv));
     }
     if (act1 < P) {
       const bf16 sv = __hadd(__float2bfloat16(acc[1]), Brow1[vg]);
       st.add<1>(__bfloat162float(sv), (unsigned)vg);
+      MK2_DUMP_S_WRITE(act1, vg, __bfloat162float(sv));
     }
     if (act0 < P) {
       const bf16 sv = __hadd(__float2bfloat16(acc[2]), Brow0[vg + 8]);
       st.add<0>(__bfloat162float(sv), (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act0, vg + 8, __bfloat162float(sv));
     }
     if (act1 < P) {
       const bf16 sv = __hadd(__float2bfloat16(acc[3]), Brow1[vg + 8]);
       st.add<1>(__bfloat162float(sv), (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act1, vg + 8, __bfloat162float(sv));
     }
     if (c & 1) {                          // 32-v group complete
       st.merge_lanes_ml();
@@ -416,23 +397,44 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 3) markov2_top4_phase1_p64(
   }
 }
 
+extern "C" __global__ void __launch_bounds__(MK2_NT, 3) markov2_top4_phase1_p64(
+    const bf16* __restrict__ B, const bf16* __restrict__ w1c,
+    const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
+    const int* __restrict__ req_row, float* __restrict__ scratch_top4,
+    float* __restrict__ scratch_lse, int V, int in, int P) {
+  MK2_GUARD_P1(64);
+  __shared__ __align__(16) bf16 w2sm[4 * 16 * MK2_DIM];   // 32768 B swizzled
+  markov2_p1_body64(B, w1c, w2c, req_tok, req_row, scratch_top4, scratch_lse,
+                    P, w2sm);
+}
+
 // ==================================================== PT = 8 / PT = 1 ======
 // Shared tensor-core body for the small-PT instances. PT = 1 runs the same
 // mma code as PT = 8 (e rows p >= P are zero-filled, padding acts are never
 // written), so one request's bias and s bits are identical whether it runs
 // alone or inside a batch. Warp w owns v rows [blk*256 + w*32, +32) (2 m16
-// tiles), all acts. A fragments come straight from gmem (no w2 smem); e
-// rows are smem-staged and ldmatrix'd. Each warp covers exactly one 32-v
-// group: its (m, l) partial after the in-warp butterfly is the canonical
-// group partial; the 8 v-split warp partials merge through smem in
-// ascending-warp order before one warp per act writes scratch.
-// Static smem: e 4096 B + merge arrays 2560 B = 6656 B.
+// tiles), all acts. The w2 A-operands are cp.async-staged PER WARP: warp w
+// streams its own 32-row slice in [32 rows][32 k] chunks through its own
+// double buffer inside the caller-provided 32768 B pool (8 warps x 2 x
+// [32][32] x 2 B), wait_group + __syncwarp per chunk (the gemm_skinny
+// per-warp staging idiom) -- there is no block-wide barrier in the sweep,
+// so warps free-run. 16B-segment swizzle seg ^ ((row >> 1) & 3) keeps the
+// ldmatrix reads bank-conflict-free; A operands via ldmatrix.x4 on the
+// warp's own two m16 tiles. Per-acc k order stays kk = 0..15 ascending with
+// the same fragment values as the former gmem-direct loads, so outputs are
+// bitwise identical. w2 DRAM traffic is exactly V*256*2 B once per launch.
+// e rows are staged in smem (4096 B swizzled) via ldmatrix.x2, one ldsm per
+// k16 slice shared by both tiles. Each warp covers exactly one 32-v group:
+// its (m, l) partial after the in-warp butterfly is the canonical group
+// partial; the 8 v-split warp partials merge through smem in ascending-warp
+// order before one warp per act writes scratch.
+// Static smem: pool 32768 (caller's) + e 4096 + merge 2560 B.
 template <int PTB>
 __device__ __forceinline__ void markov2_p1_small_body(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
-    float* __restrict__ scratch_lse, int P) {
+    float* __restrict__ scratch_lse, int P, bf16* __restrict__ w2sm) {
   __shared__ __align__(16) bf16 esm[8 * MK2_DIM];         // 4096 B swizzled
   // Merge arrays are indexed by act (0..7), independent of the scratch
   // stride PTB: [8][8], 2560 B.
@@ -468,44 +470,90 @@ __device__ __forceinline__ void markov2_p1_small_body(
   const bf16* erow = esm + (lane & 7) * MK2_DIM;
   const int eseg = lane & 7;
 
-  // gmem A-fragment row bases: lane covers rows vt0 + r0 and vt0 + r0 + 8,
-  // column pairs c0k = (lane%4)*2 (+8 for a2/a3) of each k16 slice.
-  const int coff = (lane & 3) * 2;
+  // Per-warp w2 pipeline: warp w stages its own 32 rows x 32 k chunks into
+  // its own double buffer inside the pool (2 x [32][32] bf16 = 4096 B per
+  // warp, 32768 B total); cp.async per lane + wait_group + __syncwarp (the
+  // gemm_skinny per-warp idiom) -- no block-wide barrier in the sweep, so
+  // warps free-run. 16B-segment swizzle seg ^ ((row >> 1) & 3) keeps the
+  // ldmatrix reads bank-conflict-free. Same fragment values and ascending
+  // per-acc k order as the former gmem-direct loads -> bitwise-identical.
+  bf16* const myw2 = w2sm + warp * (2 * 32 * 32);
 
+  // Stage chunk c of this warp's slice (rows [w*32, +32), k [c*32, +32)):
+  // 32 rows x 4 x 16B = 4 cp.async per lane.
+  auto stage_w2 = [&](int c, int buf) {
+    const bf16* g = w2c + (size_t)(vBlk0 + warp * 32) * MK2_DIM + c * 32;
+    bf16* d = myw2 + buf * (32 * 32);
+#pragma unroll
+    for (int rep = 0; rep < 4; ++rep) {
+      const int idx = lane + rep * 32;
+      const int r = idx >> 2, seg = idx & 3;
+      cp16(d + r * 32 + ((seg ^ ((r >> 1) & 3)) << 3),
+           g + (size_t)r * MK2_DIM + seg * 8, 16);
+    }
+  };
+  stage_w2(0, 0);
+  cp_commit();
+
+  // Both m-tile accumulators persist across the k-chunk sweep; per acc the
+  // k16 slices arrive ascending kk = 0..15 with the same fragment values as
+  // the former gmem-direct A loads.
+  float acc[2][4];
+#pragma unroll
+  for (int t = 0; t < 2; ++t)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[t][j] = 0.0f;
+
+  const int trow = lane & 15;                           // m-tile row in [0,16)
+  const int rsw = (trow >> 1) & 3;                      // row swizzle term
+  const int trw1 = trow + 16;                           // tile t=1 row
+  const int rsw1 = (trw1 >> 1) & 3;
+
+  for (int c = 0; c < 8; ++c) {
+    cp_wait0();                           // this lane's chunk-c copies landed
+    __syncwarp();                         // ...and the warp's too
+    if (c + 1 < 8) { stage_w2(c + 1, (c + 1) & 1); cp_commit(); }
+    const bf16* buf = myw2 + (c & 1) * (32 * 32);
+#pragma unroll
+    for (int kq = 0; kq < 2; ++kq) {      // k16 slices 2c, 2c+1 of the chunk
+      const int kk = c * 2 + kq;
+      unsigned eb[2], wa[4];
+      // B k16 x n8(acts): plain ldmatrix on the e rows (unchanged path).
+      ldsm_x2(eb, erow + swz((kk * 2 + (lane >> 3)) & 31, eseg) * 8);
+      // A 16x16 tiles at rows [warp*32 + t*16, +16) x k [kk*16, +16):
+      // lane -> row lane%16 of the m-tile, k-offset kq*16 + (lane/16)*8.
+      const int ks = kq * 2 + (lane >> 4);                // logical 16B seg
+      ldsm_x4(wa, buf + trow * 32 + ((ks ^ rsw) << 3));
+      mma_16816(acc[0], wa, eb);
+      ldsm_x4(wa, buf + trw1 * 32 + ((ks ^ rsw1) << 3));
+      mma_16816(acc[1], wa, eb);
+    }
+  }
+
+  // Epilogue (t = 0 then t = 1, same per-lane add order as before): the two
+  // bf16 rounding points, then running top-4 / lse per act column.
 #pragma unroll
   for (int t = 0; t < 2; ++t) {
-    const int vt0 = vBlk0 + warp * 32 + t * 16;
-    const bf16* rA = w2c + (size_t)(vt0 + r0) * MK2_DIM + coff;
-    const bf16* rB_ = rA + 8 * MK2_DIM;
-
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-    for (int kk = 0; kk < 16; ++kk) {
-      unsigned wa[4], eb[2];
-      wa[0] = *reinterpret_cast<const unsigned*>(rA + kk * 16);
-      wa[1] = *reinterpret_cast<const unsigned*>(rB_ + kk * 16);
-      wa[2] = *reinterpret_cast<const unsigned*>(rA + kk * 16 + 8);
-      wa[3] = *reinterpret_cast<const unsigned*>(rB_ + kk * 16 + 8);
-      ldsm_x2(eb, erow + swz((kk * 2 + (lane >> 3)) & 31, eseg) * 8);
-      mma_16816(acc, wa, eb);
-    }
-
-    const int vg = vt0 + r0;
+    const int vg = vBlk0 + warp * 32 + t * 16 + r0;
     if (act0 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[0]), Brow0[vg]);
+      const bf16 sv = __hadd(__float2bfloat16(acc[t][0]), Brow0[vg]);
       st.add<0>(__bfloat162float(sv), (unsigned)vg);
+      MK2_DUMP_S_WRITE(act0, vg, __bfloat162float(sv));
     }
     if (act1 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[1]), Brow1[vg]);
+      const bf16 sv = __hadd(__float2bfloat16(acc[t][1]), Brow1[vg]);
       st.add<1>(__bfloat162float(sv), (unsigned)vg);
+      MK2_DUMP_S_WRITE(act1, vg, __bfloat162float(sv));
     }
     if (act0 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[2]), Brow0[vg + 8]);
+      const bf16 sv = __hadd(__float2bfloat16(acc[t][2]), Brow0[vg + 8]);
       st.add<0>(__bfloat162float(sv), (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act0, vg + 8, __bfloat162float(sv));
     }
     if (act1 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[3]), Brow1[vg + 8]);
+      const bf16 sv = __hadd(__float2bfloat16(acc[t][3]), Brow1[vg + 8]);
       st.add<1>(__bfloat162float(sv), (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act1, vg + 8, __bfloat162float(sv));
     }
   }
 
@@ -561,8 +609,11 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_p8(
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
     float* __restrict__ scratch_lse, int V, int in, int P) {
   MK2_GUARD_P1(8);
+  // 32768 B pool for the small body's w2 pipeline (sized to share one
+  // allocation with body64 inside the devp dispatcher).
+  __shared__ __align__(16) bf16 w2sm[4 * 16 * MK2_DIM];
   markov2_p1_small_body<8>(B, w1c, w2c, req_tok, req_row, scratch_top4,
-                           scratch_lse, P);
+                           scratch_lse, P, w2sm);
 }
 
 // ============================================================ PT = 1 =======
@@ -575,112 +626,119 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_p1(
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
     float* __restrict__ scratch_lse, int V, int in, int P) {
   MK2_GUARD_P1(1);
+  __shared__ __align__(16) bf16 w2sm[4 * 16 * MK2_DIM];   // shared pool (as p8)
   markov2_p1_small_body<1>(B, w1c, w2c, req_tok, req_row, scratch_top4,
-                           scratch_lse, P);
+                           scratch_lse, P, w2sm);
 }
 
 #undef MK2_GUARD_P1
 
 // ======================================================== phase 2 ==========
-// Static shared footprint of this kernel, in bytes (documentation only; the
-// launch passes dynamic smem = 0).
-#define MK2_P2_SMEM_BYTES (MK2_NT * 4 * 4 + MK2_NT * 4 * 4 + 2 * MK2_NT * 4)
+// Per act p = blockIdx.x: thread t folds the MK2_NB2 = 510 phase-1 partials
+// b in {t, t+256} & [0,510) (vectorized: 2 x float4 + 1 x float2 per
+// partial) into a private register-resident top-4 (T4; score desc, tie ->
+// smaller id) and an online (m, l) with __expf rescaling; a 5-round shfl
+// butterfly merges each warp's lanes; warp partials cross smem (one
+// __syncthreads) and warp 0 merges the 8 lists with a 3-round butterfly.
+// Lane 0 of warp 0 writes lse[p] = m + logsum, top4[p][*] and the stable
+// logp form logp[j] = (score_j - m) - logsum.
+// The lse/logp merge association differs from the pre-warp-tree revision:
+// top-4 ids are unchanged (deterministic total order), lse/logp can differ
+// in the last fp32 ulp.
+__device__ __forceinline__ void markov2_p2_body(
+    const float* __restrict__ scratch_top4, const float* __restrict__ scratch_lse,
+    unsigned* __restrict__ top4, float* __restrict__ logp, float* __restrict__ lse,
+    int P, int PT) {
+  __shared__ float ws_sc[8][4];                  // per-warp top4 partials
+  __shared__ unsigned ws_id[8][4];
+  __shared__ float ws_ml[8][2];                  // per-warp (m, l)
 
-// Sorted-insert into a 4-deep (score, id) list, score-desc / id-asc:
-// strictly greater wins, tie -> smaller id.
-__device__ __forceinline__ void mk2_top4_insert(float* sc, unsigned* id, float s, unsigned i) {
-  if (sc[3] > s || (sc[3] == s && id[3] < i)) return;      // can't enter
+  const int p = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+
+  // T4 is register-resident (an address-taken float* list would be demoted
+  // to local memory); comparator: strictly greater wins, tie -> smaller id.
+  T4 t4; t4.init();
+  float m = -3.0e38f, l = 0.0f;
 #pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const bool better = (s > sc[j]) || (s == sc[j] && i < id[j]);
-    if (better) {
+  for (int b = tid; b < MK2_NB2; b += MK2_NT) {
+    const float4 qa = *reinterpret_cast<const float4*>(scratch_top4 + ((size_t)b * PT + p) * 8);
+    const float4 qb = *reinterpret_cast<const float4*>(scratch_top4 + ((size_t)b * PT + p) * 8 + 4);
+    t4.insert(qa.x, __float_as_uint(qa.y));
+    t4.insert(qa.z, __float_as_uint(qa.w));
+    t4.insert(qb.x, __float_as_uint(qb.y));
+    t4.insert(qb.z, __float_as_uint(qb.w));
+    const float2 ml = *reinterpret_cast<const float2*>(scratch_lse + ((size_t)b * PT + p) * 2);
+    const float mn = fmaxf(m, ml.x);
+    l = l * __expf(m - mn) + ml.y * __expf(ml.x - mn);
+    m = mn;
+  }
 #pragma unroll
-      for (int q = 3; q > j; --q) { sc[q] = sc[q - 1]; id[q] = id[q - 1]; }
-      sc[j] = s; id[j] = i;
-      return;
+  for (int off = 16; off > 0; off >>= 1) {
+    float ps[4]; unsigned pi[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      ps[j] = __shfl_xor_sync(0xffffffffu, t4.s[j], off);
+      pi[j] = __shfl_xor_sync(0xffffffffu, t4.i[j], off);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) t4.insert(ps[j], pi[j]);
+    const float pm = __shfl_xor_sync(0xffffffffu, m, off);
+    const float pl = __shfl_xor_sync(0xffffffffu, l, off);
+    const float mn = fmaxf(m, pm);
+    l = l * __expf(m - mn) + pl * __expf(pm - mn);
+    m = mn;
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) { ws_sc[warp][j] = t4.s[j]; ws_id[warp][j] = t4.i[j]; }
+    ws_ml[warp][0] = m; ws_ml[warp][1] = l;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    T4 w4; w4.init();
+    float wm = -3.0e38f, wl = 0.0f;
+    if (lane < 8) {
+#pragma unroll
+      for (int j = 0; j < 4; ++j) { w4.s[j] = ws_sc[lane][j]; w4.i[j] = ws_id[lane][j]; }
+      wm = ws_ml[lane][0]; wl = ws_ml[lane][1];
+    }
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+      float ps[4]; unsigned pi[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        ps[j] = __shfl_xor_sync(0xffffffffu, w4.s[j], off);
+        pi[j] = __shfl_xor_sync(0xffffffffu, w4.i[j], off);
+      }
+#pragma unroll
+      for (int j = 0; j < 4; ++j) w4.insert(ps[j], pi[j]);
+      const float pm = __shfl_xor_sync(0xffffffffu, wm, off);
+      const float pl = __shfl_xor_sync(0xffffffffu, wl, off);
+      const float mn = fmaxf(wm, pm);
+      wl = wl * __expf(wm - mn) + pl * __expf(pm - mn);
+      wm = mn;
+    }
+    if (lane == 0) {
+      const float logsum = logf(wl);
+      lse[p] = wm + logsum;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        top4[(size_t)p * 4 + j] = w4.i[j];
+        // stable form: (score - m) - log(sum); score <= m, so the first
+        // subtraction loses no bits to cancellation and logsum is never
+        // rounded into the fp32 lse before it is subtracted.
+        logp[(size_t)p * 4 + j] = (w4.s[j] - wm) - logsum;
+      }
     }
   }
 }
 
-// Per act p = blockIdx.x:
-//   * thread t folds the MK2_NB2 = 510 phase-1 partials b in {t, t+256} &
-//     [0,510) into a private top-4 (score desc, tie -> smaller id) and an
-//     online (m, l) logsumexp partial with __expf rescaling;
-//   * a shared-memory halving tree merges the 256 private top-4 lists and
-//     the 256 (m, l) pairs;
-//   * thread 0 writes lse[p] = m + logsum, top4[p][*] and the stable logp
-//     form logp[j] = (score_j - m) - logsum.
-// Static shared: ssc [MK2_NT][4] fp32 scores, sid [MK2_NT][4] u32 ids,
-// sred [2][MK2_NT] fp32 (m, l) -- 10240 B total.
 extern "C" __global__ void __launch_bounds__(MK2_NT) markov2_top4_phase2(
     const float* __restrict__ scratch_top4, const float* __restrict__ scratch_lse,
     unsigned* __restrict__ top4, float* __restrict__ logp, float* __restrict__ lse,
     int V, int P, int PT) {
   if (V != MK2_VOCAB || P < 1 || P > 64 || blockDim.x != MK2_NT) __trap();
-
-  __shared__ __align__(16) float  ssc[MK2_NT * 4];   // [MK2_NT][4] scores
-  __shared__          unsigned sid[MK2_NT * 4];     // [MK2_NT][4] ids
-  __shared__          float  sred[2 * MK2_NT];      // [2][MK2_NT] (m, l)
-
-  const int p = blockIdx.x;
-  const int tid = threadIdx.x;
-
-  // Private top-4 + online lse over the partials b = tid, tid+256, ... < 510.
-  float sc[4]; unsigned id[4];
-#pragma unroll
-  for (int j = 0; j < 4; ++j) { sc[j] = -INFINITY; id[j] = 0xFFFFFFFFu; }
-  float m = -3.0e38f, l = 0.0f;
-#pragma unroll 1
-  for (int b = tid; b < MK2_NB2; b += MK2_NT) {
-    const size_t base = ((size_t)b * PT + p) * 8;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const float s = scratch_top4[base + j * 2];
-      const unsigned i = *reinterpret_cast<const unsigned*>(scratch_top4 + base + j * 2 + 1);
-      mk2_top4_insert(sc, id, s, i);
-    }
-    const float bm = scratch_lse[((size_t)b * PT + p) * 2];
-    const float bl = scratch_lse[((size_t)b * PT + p) * 2 + 1];
-    const float mn = fmaxf(m, bm);
-    l = l * __expf(m - mn) + bl * __expf(bm - mn);
-    m = mn;
-  }
-#pragma unroll
-  for (int j = 0; j < 4; ++j) { ssc[tid * 4 + j] = sc[j]; sid[tid * 4 + j] = id[j]; }
-  sred[tid] = m; sred[MK2_NT + tid] = l;
-  __syncthreads();
-
-  // Tree-merge the 256 local top-4 lists: levels by halving in smem.
-  for (int w = MK2_NT / 2; w > 0; w >>= 1) {
-    if (tid < w) {
-      float asc[4]; unsigned aid[4];
-#pragma unroll
-      for (int j = 0; j < 4; ++j) { asc[j] = ssc[tid * 4 + j]; aid[j] = sid[tid * 4 + j]; }
-#pragma unroll
-      for (int j = 0; j < 4; ++j)
-        mk2_top4_insert(asc, aid, ssc[(tid + w) * 4 + j], sid[(tid + w) * 4 + j]);
-#pragma unroll
-      for (int j = 0; j < 4; ++j) { ssc[tid * 4 + j] = asc[j]; sid[tid * 4 + j] = aid[j]; }
-      const float m1 = sred[tid], m2 = sred[tid + w];
-      const float l1 = sred[MK2_NT + tid], l2 = sred[MK2_NT + tid + w];
-      const float mn = fmaxf(m1, m2);
-      sred[tid] = mn;
-      sred[MK2_NT + tid] = l1 * __expf(m1 - mn) + l2 * __expf(m2 - mn);
-    }
-    __syncthreads();
-  }
-
-  if (tid == 0) {
-    const float mm = sred[0];
-    const float logsum = logf(sred[MK2_NT]);
-    lse[p] = mm + logsum;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      top4[(size_t)p * 4 + j] = sid[j];
-      // stable form: (score - m) - log(sum); score <= m, so the first
-      // subtraction loses no bits to cancellation and logsum is never
-      // rounded into the fp32 lse before it is subtracted.
-      logp[(size_t)p * 4 + j] = (ssc[j] - mm) - logsum;
-    }
-  }
+  markov2_p2_body(scratch_top4, scratch_lse, top4, logp, lse, P, PT);
 }
