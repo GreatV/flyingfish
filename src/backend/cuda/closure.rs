@@ -37,6 +37,7 @@ pub(crate) struct Closure {
 pub(super) struct Profile {
     pub linear: BTreeSet<LinearShape>,
     pub pairs: Pairs,
+    pub attention: Vec<Attention>,
     capacity: usize,
     chunk: usize,
     budget: Option<usize>,
@@ -45,6 +46,27 @@ pub(super) struct Profile {
 }
 
 type Pairs = BTreeSet<(usize, usize)>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum Attention {
+    Decode,
+    Draft,
+    Verify,
+    Tree,
+}
+
+fn attention(budget: Option<SpecBudget>) -> Vec<Attention> {
+    let mut kinds = vec![Attention::Decode];
+    if let Some(budget) = budget {
+        kinds.push(Attention::Draft);
+        kinds.push(if budget.is_tree() {
+            Attention::Tree
+        } else {
+            Attention::Verify
+        });
+    }
+    kinds
+}
 
 #[derive(PartialEq, Eq, Serialize, Deserialize)]
 struct Manifest {
@@ -104,9 +126,7 @@ fn shapes(
                 add(rows, output, input);
             }
         }
-        if !budget.is_tree() {
-            add(1, c.vocab_size, rank);
-        }
+        add(1, c.vocab_size, rank);
     }
     Ok((linear, pairs))
 }
@@ -126,6 +146,7 @@ impl Profile {
         Ok(Self {
             linear,
             pairs,
+            attention: attention(budget),
             capacity,
             chunk,
             budget: budget.map(SpecBudget::rows),
@@ -346,8 +367,36 @@ mod tests {
             shapes(&c, 33824, 32768, Some(SpecBudget::Tree16), dimensions)?
                 .0
                 .len(),
-            99
+            100
         );
+        for budget in [
+            SpecBudget::Chain,
+            SpecBudget::Tree16,
+            SpecBudget::Tree32,
+            SpecBudget::Tree64,
+        ] {
+            let (linear, pairs) = shapes(&c, 33824, 32768, Some(budget), dimensions)?;
+            assert!(linear.contains(&LinearShape {
+                rows: 1,
+                output: c.vocab_size,
+                input: draft.markov_rank
+            }));
+            assert!(pairs.contains(&(c.vocab_size, draft.markov_rank)));
+            let kinds = attention(Some(budget));
+            assert_eq!(
+                kinds,
+                vec![
+                    Attention::Decode,
+                    Attention::Draft,
+                    if budget.is_tree() {
+                        Attention::Tree
+                    } else {
+                        Attention::Verify
+                    }
+                ]
+            );
+        }
+        assert_eq!(attention(None), vec![Attention::Decode]);
         let (small, _) = shapes(&c, 4096, 1, Some(SpecBudget::Tree16), dimensions)?;
         for rows in 1..=8 {
             for (output, input) in [(2048, 10240), (256, 2048)] {
@@ -435,11 +484,9 @@ mod tests {
             let (linear, pairs) = shapes(&c, 33824, 32768, budget, Some((1920, 128)))?;
             assert!(linear.is_empty());
             let mut expected = base.clone();
-            if let Some(budget) = budget {
+            if budget.is_some() {
                 expected.extend([(384, 1920), (128, 384)]);
-                if !budget.is_tree() {
-                    expected.insert((c.vocab_size, 128));
-                }
+                expected.insert((c.vocab_size, 128));
             }
             assert_eq!(pairs, expected);
         }
@@ -484,6 +531,7 @@ mod tests {
             let profile = || Profile {
                 linear: BTreeSet::new(),
                 pairs: BTreeSet::new(),
+                attention: attention(Some(SpecBudget::Tree16)),
                 capacity: 16,
                 chunk: 16,
                 budget: Some(16),

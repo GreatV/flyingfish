@@ -132,6 +132,13 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
         }
     }
     model.prefill(&[1], None)?;
+    let token = model.decode(false, None)?;
+    model.step(false)?;
+    model.check_logits()?;
+    model.check_ready()?;
+    println!("draft_profile_eager_decode tree16 decode/step PASS token={token}");
+    model.reset()?;
+    model.prefill(&[1], None)?;
     let start = model.position();
     let tokens: Vec<_> = (0..16).map(|r| if r < 8 { 0 } else { r }).collect();
     let parents: Vec<_> = (0..16)

@@ -2649,11 +2649,11 @@ impl Engine {
         &mut self,
         requests: &[(u8, u32)],
     ) -> Result<Vec<crate::backend::Top4>> {
-        self.spec
-            .as_mut()
-            .context("draft state is not enabled")?
-            .draft
-            .setup_markov(&self.device, &self.ops, &self.runtime, &self.closure)?;
+        ensure!(
+            self.spec_budget.is_tree(),
+            "distributions_batch requires a tree spec budget"
+        );
+        self.closure.assert_ready()?;
         self.spec
             .as_mut()
             .context("draft state is not enabled")?
@@ -2803,30 +2803,22 @@ impl Engine {
             .iter()
             .map(|&shape| self.blas.choice_path(shape))
             .collect();
-        if let Some(budget) = budget {
-            paths.push(super::multi_calibrate::cache_path(
-                &self.runtime,
-                &key,
-                bucket,
-                7,
-                false,
-                false,
-            ));
-            paths.push(super::multi_calibrate::cache_path(
-                &self.runtime,
-                &key,
-                bucket,
-                budget.rows(),
-                !budget.is_tree(),
-                budget.is_tree(),
-            ));
-        } else {
-            paths.push(super::calibrate::cache_path(
-                &self.runtime,
-                &key,
-                bucket,
-                None,
-            ));
+        use super::closure::Attention as Kind;
+        for &kind in &profile.attention {
+            paths.push(match kind {
+                Kind::Decode => super::calibrate::cache_path(&self.runtime, &key, bucket, None),
+                Kind::Draft => {
+                    super::multi_calibrate::cache_path(&self.runtime, &key, bucket, 7, false, false)
+                }
+                Kind::Verify | Kind::Tree => super::multi_calibrate::cache_path(
+                    &self.runtime,
+                    &key,
+                    bucket,
+                    self.spec_budget.rows(),
+                    kind == Kind::Verify,
+                    kind == Kind::Tree,
+                ),
+            });
         }
         if budget.is_some_and(SpecBudget::is_tree) {
             paths.push(super::markov_calibrate::cache_path(&self.runtime, &key));
@@ -2871,30 +2863,31 @@ impl Engine {
         } else {
             self.blas.load_choices(&profile.linear)?;
         }
-        if self.spec.is_some() {
+        for &kind in &profile.attention {
+            match kind {
+                Kind::Decode => self.ensure_decode()?,
+                Kind::Draft => self
+                    .spec
+                    .as_mut()
+                    .context("draft state missing")?
+                    .draft
+                    .setup_attention(
+                        &self.device,
+                        &self.ops,
+                        &self.config,
+                        &self.runtime,
+                        &self.closure,
+                    )?,
+                Kind::Verify => self.ensure_verification()?,
+                Kind::Tree => self.ensure_tree_attention()?,
+            }
+        }
+        if budget.is_some_and(SpecBudget::is_tree) {
             self.spec
                 .as_mut()
                 .context("draft state missing")?
                 .draft
-                .setup_attention(
-                    &self.device,
-                    &self.ops,
-                    &self.config,
-                    &self.runtime,
-                    &self.closure,
-                )?;
-            if self.spec_budget.is_tree() {
-                self.ensure_tree_attention()?;
-                self.spec
-                    .as_mut()
-                    .context("draft state missing")?
-                    .draft
-                    .setup_markov(&self.device, &self.ops, &self.runtime, &self.closure)?;
-            } else {
-                self.ensure_verification()?;
-            }
-        } else {
-            self.ensure_decode()?;
+                .setup_markov(&self.device, &self.ops, &self.runtime, &self.closure)?;
         }
         self.device.stream.synchronize()?;
         self.closure.finish(profile, &self.runtime, key)?;
