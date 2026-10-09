@@ -57,6 +57,35 @@ impl Differences {
     }
 }
 
+#[test]
+fn bit_diagnostics_keep_float_and_token_differences_separate() {
+    let expected = crate::backend::Top4 {
+        tokens: [0, 1, 2, 3],
+        logp: [-4.0, -5.0, -6.0, -7.0],
+        lse: 1.0,
+    };
+    let mut actual = expected.clone();
+    actual.logp[0] = f32::from_bits(actual.logp[0].to_bits() + 1);
+    let mut stats = Differences::default();
+    stats.track(&actual, &expected, "one-ulp test", (0, 0));
+    assert_eq!(
+        (stats.requests, stats.tokens, stats.logp, stats.lse),
+        (1, 0, 1, 0)
+    );
+    assert_eq!(
+        stats.max_logp_abs,
+        (f64::from(actual.logp[0]) - f64::from(expected.logp[0])).abs()
+    );
+    actual = expected.clone();
+    actual.tokens[0] = 4;
+    actual.lse = f32::from_bits(actual.lse.to_bits() + 1);
+    stats.track(&actual, &expected, "token and lse test", (0, 0));
+    assert_eq!(
+        (stats.requests, stats.tokens, stats.logp, stats.lse),
+        (2, 1, 1, 1)
+    );
+}
+
 fn chain_requests(path: &Path) -> Result<Vec<(u8, u32)>> {
     let trace = crate::trace::Trace::read(path)?;
     let block = trace.values("draft_block_ids")?;
