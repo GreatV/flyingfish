@@ -58,6 +58,7 @@ impl Slot {
 pub struct Backend {
     commands: mpsc::Sender<EngineCommand>,
     slot: Arc<Mutex<Slot>>,
+    options: SpecOptions,
 }
 
 impl Backend {
@@ -84,6 +85,10 @@ impl Backend {
             .send(EngineCommand::Abort)
             .context("engine thread has exited")
     }
+
+    pub fn options(&self) -> SpecOptions {
+        self.options.clone()
+    }
 }
 
 fn load_model(target: &Path, draft: Option<&Path>, options: &SpecOptions) -> Result<Model> {
@@ -109,25 +114,33 @@ pub fn run(
 ) -> Result<()> {
     let (command_tx, command_rx) = mpsc::channel::<EngineCommand>();
     let slot = Arc::new(Mutex::new(Slot::Idle));
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
     let backend = Backend {
         commands: command_tx,
         slot: slot.clone(),
+        options: options.clone(),
     };
     // Model is loaded inside the engine thread: it holds CUDA handles
-    // that are not Send, and the engine thread is their only user.
+    // that are not Send, and the engine thread is their only user. The
+    // readiness channel carries the load result to `serve` before it
+    // binds, so a failed load fails startup.
     let handle = thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
             let model = match load_model(&target, draft.as_deref(), &options) {
                 Ok(model) => model,
                 Err(error) => {
-                    eprintln!("engine load: {error:#}");
+                    let _ = ready_tx.send(Err(error));
                     return;
                 }
             };
+            let _ = ready_tx.send(Ok(()));
             engine_loop(model, options, command_rx, slot)
         })
         .context("spawn engine thread")?;
+    ready_rx
+        .recv()
+        .context("engine thread exited before reporting readiness")??;
     http::serve(backend, tokenizer_dir, port, handle)
 }
 
