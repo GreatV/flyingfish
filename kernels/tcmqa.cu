@@ -74,6 +74,13 @@
 // Out-of-extent tile rows are zero-filled on load (NaN-safe: P is 0 there and
 // 0*0 = 0 in the PV MMA).
 //
+// T3: K/V tile staging uses cp.async instead of LDG->STS (this dev copy's
+// ONLY change vs the repo file): the prologue stages K(t=0); per tile the
+// code waits for K(t) (cp.async.wait_group 0), barriers, stages V(t) (it
+// flies during the S mma + softmax), waits for V(t), barriers, and stages
+// K(t+1) (flying during the PV mma). Same smem bytes/layouts, same two
+// barriers per tile, same zero-fill of dead rows, same consume addresses --
+// outputs are bitwise identical to the repo build.
 // KV layouts (strides in bf16 ELEMENTS, multiples of 8 for 16B alignment):
 //   position-major [pos][kv][d]:  head_stride = 128,     pos_stride = 256
 //   head-major     [kv][pos][d]:  head_stride = Lh*128,  pos_stride = 128
@@ -213,6 +220,17 @@ __device__ __forceinline__ unsigned pack_bf16x2(float lo, float hi) {
   const __nv_bfloat162 t = __floats2bfloat162_rn(lo, hi);
   return *reinterpret_cast<const unsigned*>(&t);
 }
+// cp.async 16B copy; sz = 0 zero-fills the destination (dead rows).
+__device__ __forceinline__ void cp16(void* dst, const void* src, int sz) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+               :: "r"(smem_u32(dst)), "l"(src), "r"(sz));
+}
+__device__ __forceinline__ void cp_commit() {
+  asm volatile("cp.async.commit_group;\n");
+}
+__device__ __forceinline__ void cp_wait0() {
+  asm volatile("cp.async.wait_group 0;\n");
+}
 
 // -------------------------------------------------------- phase 1 body ----
 // Block (ch, kv, rt): sweeps chunk ch of kv-head kv in KT-pos tiles; warp w
@@ -278,33 +296,46 @@ __device__ __forceinline__ void tcmqa_phase1_body(
     for (int j = 0; j < 4; ++j) acc[n][j] = 0.0f;
 
   // ---- sweep the chunk in KT-position tiles ----
+  // T3: K/V tiles are staged with cp.async instead of LDG->STS, keeping the
+  // same 35,328 B smem, the same two __syncthreads per tile, the same smem
+  // layouts and the same consume addresses -- so fragment values, mma order,
+  // softmax order, masking and the epilogue are bitwise unchanged. Pipeline:
+  // the prologue stages K(t=0); per tile, CP1 waits for K(t) (wait_group 0:
+  // exact, it is the newest committed group), barriers, then stages V(t)
+  // which flies during the S mma + softmax; CP2 waits for V(t), barriers,
+  // then stages K(t+1) which flies during the PV mma. Staging overwrites the
+  // smem tile consumed one phase earlier; the intervening __syncthreads
+  // makes the overwrite safe block-wide.
   const int ntiles = (pos_end > pos_beg) ? ((pos_end - pos_beg + KT - 1) / KT) : 0;
-  for (int t = 0; t < ntiles; ++t) {
-    const int t0 = pos_beg + t * KT;
-    __syncthreads();                                  // previous tile fully consumed
 
-    // Cooperative 16B load of the K/V tiles; out-of-extent rows zero-filled.
-    {
-      const int nvec = KT * (DH / 8);                 // 512 uint4 per tensor
+  // Stage one 32-pos tile of a KV tensor into `dst` ([KT][LDS]) via cp.async
+  // 16B copies; out-of-extent rows are zero-filled (src-size 0).
+  auto stage_kv = [&](const bf16* src, int head_stride, int pos_stride, int t,
+                      bf16* dst) {
+    const int tt0 = pos_beg + t * KT;
 #pragma unroll
-      for (int rep = 0; rep < 4; ++rep) {
-        const int idx = tid + rep * NT;
-        if (idx < nvec) {
-          const int r = idx >> 4, seg = idx & 15;
-          const int pos = t0 + r;
-          uint4 kk = make_uint4(0u, 0u, 0u, 0u), vv = make_uint4(0u, 0u, 0u, 0u);
-          if (pos < pos_end) {
-            kk = *reinterpret_cast<const uint4*>(Kc + (size_t)kv * k_head_stride +
-                                                 (size_t)pos * k_pos_stride + seg * 8);
-            vv = *reinterpret_cast<const uint4*>(Vc + (size_t)kv * v_head_stride +
-                                                 (size_t)pos * v_pos_stride + seg * 8);
-          }
-          *reinterpret_cast<uint4*>(ksm + r * LDS + seg * 8) = kk;
-          *reinterpret_cast<uint4*>(vsm + r * LDS + seg * 8) = vv;
-        }
+    for (int rep = 0; rep < 4; ++rep) {
+      const int idx = tid + rep * NT;
+      if (idx < KT * (DH / 8)) {
+        const int r = idx >> 4, seg = idx & 15;
+        const int pos = tt0 + r;
+        const bool live = pos < pos_end;
+        const bf16* g = live ? src + (size_t)kv * head_stride +
+                                     (size_t)pos * pos_stride + seg * 8
+                             : src;                       // valid dummy
+        cp16(dst + r * LDS + seg * 8, g, live ? 16 : 0);
       }
     }
-    __syncthreads();                                  // tiles resident
+  };
+
+  if (ntiles > 0) { stage_kv(Kc, k_head_stride, k_pos_stride, 0, ksm); cp_commit(); }
+
+  for (int t = 0; t < ntiles; ++t) {
+    const int t0 = pos_beg + t * KT;
+    cp_wait0();                                       // K(t) landed (newest group)
+    __syncthreads();                                  // K(t) visible; V(t-1) consumed by all
+    stage_kv(Vc, v_head_stride, v_pos_stride, t, vsm);
+    cp_commit();                                      // V(t) flies during S + softmax
 
     // ---- S = Q_w * K_tile^T : 8 k16 x 4 n8 mma, per-warp row slab ----
     float sf[4][4];                                   // 4 n8-slices x 4 fp32
@@ -385,6 +416,14 @@ __device__ __forceinline__ void tcmqa_phase1_body(
         acc[n][half * 2 + 0] *= cf;
         acc[n][half * 2 + 1] *= cf;
       }
+    }
+
+    // ---- CP2: V(t) landed; stage K(t+1) into the just-consumed K tile ----
+    cp_wait0();                                       // V(t) landed
+    __syncthreads();                                  // V(t) visible; K(t) consumed by all
+    if (t + 1 < ntiles) {
+      stage_kv(Kc, k_head_stride, k_pos_stride, t + 1, ksm);
+      cp_commit();                                    // K(t+1) flies during PV
     }
 
     // ---- O += P * V : P bf16 repack, then 2 k16 x 16 n8 mma ----
