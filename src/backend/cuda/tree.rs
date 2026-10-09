@@ -1,4 +1,4 @@
-use super::{Device, cubin, engine::Kv, ops::flat};
+use super::{Device, cubin, engine::Kv, ops::flat, ops::grid};
 use crate::{
     config::Config,
     tree::{Commit, Tree},
@@ -11,9 +11,8 @@ use half::bf16;
 use std::sync::Arc;
 
 struct Kernels {
-    prepare: CudaFunction,
-    rope: CudaFunction,
-    kv_write: CudaFunction,
+    prepare_embed_norm: CudaFunction,
+    rope_kv: CudaFunction,
     kv_gather: CudaFunction,
     kv_scatter: CudaFunction,
     hidden_gather: CudaFunction,
@@ -45,6 +44,13 @@ pub(crate) struct State {
     addresses: Vec<(u64, u64)>,
     compact: CudaSlice<bf16>,
     hidden: CudaSlice<bf16>,
+}
+
+/// Workspace buffers the fused tree prepare writes.
+pub(crate) struct EmbedOut<'a> {
+    pub ids: &'a mut CudaSlice<u32>,
+    pub x: &'a mut CudaSlice<bf16>,
+    pub y: &'a mut CudaSlice<bf16>,
 }
 
 impl State {
@@ -100,10 +106,11 @@ impl State {
             values.push(layer.v.device_ptr(&stream).0);
         }
         let module = cubin::module(&device.ctx, "tree/meta")?;
+        let fused = cubin::module(&device.ctx, "tree/tree_rope_kv")?;
+        let norm = cubin::module(&device.ctx, "embed_rmsnorm")?;
         let kernels = Kernels {
-            prepare: module.load_function("tree_prepare")?,
-            rope: module.load_function("tree_rope")?,
-            kv_write: module.load_function("tree_kv_write")?,
+            prepare_embed_norm: norm.load_function("tree_prepare_embed_norm")?,
+            rope_kv: fused.load_function("tree_rope_kv")?,
             kv_gather: module.load_function("tree_kv_gather")?,
             kv_scatter: module.load_function("tree_kv_scatter")?,
             hidden_gather: module.load_function("tree_hidden_gather")?,
@@ -265,15 +272,32 @@ impl State {
         Ok(())
     }
 
-    pub(crate) fn prepare(&self, prefix: &CudaSlice<i32>, ids: &mut CudaSlice<u32>) -> Result<()> {
+    /// tree_prepare's metadata writes fused with the embedding gather and the
+    /// layer-0 RMSNorm. Replaces (tree_prepare, embed, rms_norm); the metadata
+    /// still lands before anything reads it, because this is the same point in
+    /// the step where tree_prepare used to run.
+    pub(crate) fn prepare_embed_norm(
+        &self,
+        prefix: &CudaSlice<i32>,
+        table: &CudaSlice<bf16>,
+        weight: &CudaSlice<bf16>,
+        out: EmbedOut<'_>,
+        c: &Config,
+    ) -> Result<()> {
         ensure!(self.tree.is_some(), "tree prepare requires loaded metadata");
+        let EmbedOut { ids, x, y } = out;
         self.buffer(prefix, 1)?;
         self.buffer(ids, self.budget)?;
+        self.buffer(x, self.budget * c.hidden_size)?;
+        self.buffer(y, self.budget * c.hidden_size)?;
         let budget = self.budget as i32;
         let capacity = self.capacity as i32;
+        let dim = c.hidden_size as i32;
+        let eps = c.rms_norm_eps;
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.prepare)
+                .launch_builder(&self.kernels.prepare_embed_norm)
+                .arg(table)
                 .arg(&self.tokens)
                 .arg(&self.depth)
                 .arg(&self.rows)
@@ -283,45 +307,29 @@ impl State {
                 .arg(ids)
                 .arg(&self.positions)
                 .arg(&self.slots)
+                .arg(weight)
+                .arg(x)
+                .arg(y)
                 .arg(&budget)
                 .arg(&capacity)
-                .launch(flat(self.budget))
-                .context("tree metadata preparation")?;
+                .arg(&dim)
+                .arg(&eps)
+                .launch(grid(self.rows(), 256))
+                .context("tree metadata preparation, embedding gather and RMSNorm")?;
         }
         Ok(())
     }
 
-    pub(crate) fn rope(&self, qkv: &mut CudaSlice<bf16>) -> Result<()> {
-        ensure!(self.tree.is_some(), "tree RoPE requires loaded metadata");
-        self.buffer(qkv, self.budget * 2560)?;
-        let budget = self.budget as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.kernels.rope)
-                .arg(qkv)
-                .arg(&self.positions)
-                .arg(&self.rows)
-                .arg(&budget)
-                .arg(&16i32)
-                .arg(&2i32)
-                .arg(&128i32)
-                .arg(&self.theta)
-                .launch(flat(self.budget * 20 * 64))
-                .context("tree indexed RoPE")?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn write_kv(
+    /// Fused tree RoPE and physical KV write: rotates the valid q/k rows in
+    /// place, stores K and V into the cache and zeroes the padding rows of both,
+    /// replacing (tree_rope, tree_kv_write) with one launch.
+    pub(crate) fn rope_kv(
         &self,
-        qkv: &CudaSlice<bf16>,
+        qkv: &mut CudaSlice<bf16>,
         k: &mut CudaSlice<bf16>,
         v: &mut CudaSlice<bf16>,
     ) -> Result<()> {
-        ensure!(
-            self.tree.is_some(),
-            "tree KV write requires loaded metadata"
-        );
+        ensure!(self.tree.is_some(), "tree RoPE requires loaded metadata");
         self.buffer(qkv, self.budget * 2560)?;
         self.buffer(k, self.capacity * 256)?;
         self.buffer(v, self.capacity * 256)?;
@@ -334,16 +342,21 @@ impl State {
         let capacity = self.capacity as i32;
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.kv_write)
+                .launch_builder(&self.kernels.rope_kv)
                 .arg(qkv)
                 .arg(&mut *k)
                 .arg(&mut *v)
-                .arg(&self.prefix)
+                .arg(&self.positions)
                 .arg(&self.rows)
+                .arg(&self.prefix)
                 .arg(&budget)
                 .arg(&capacity)
-                .launch(flat(self.budget * 256))
-                .context("tree physical KV write")?;
+                .arg(&16i32)
+                .arg(&2i32)
+                .arg(&128i32)
+                .arg(&self.theta)
+                .launch(flat(self.budget * 20 * 64))
+                .context("tree indexed RoPE and KV write")?;
         }
         Ok(())
     }
