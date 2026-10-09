@@ -314,7 +314,7 @@ impl State {
                 .arg(&capacity)
                 .arg(&dim)
                 .arg(&eps)
-                .launch(grid(self.rows(), 256))
+                .launch(grid(self.budget, 256))
                 .context("tree metadata preparation, embedding gather and RMSNorm")?;
         }
         Ok(())
@@ -471,3 +471,7 @@ impl State {
         &self.hidden
     }
 }
+
+#[cfg(test)]
+#[path = "tree_tests.rs"]
+mod tests;
