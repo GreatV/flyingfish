@@ -399,6 +399,7 @@ pub fn generate(
     )?;
 
     let mut trace = Trace::default();
+    trace.set_device(&model.device_info().name)?;
     let result = produce(&mut model, ids, options, dump.map(|_| &mut trace))?;
     if let Some(dump) = dump {
         trace.save(dump)?;

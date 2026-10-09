@@ -48,6 +48,7 @@ impl Device {
         eprintln!("cuda_sm={sm} native cubins selected");
         use cudarc::driver::sys::CUdevice_attribute as A;
         let info = DeviceInfo {
+            name: ctx.name()?,
             arch: sm,
             sms: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize,
             l2_bytes: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)? as usize,

@@ -8,6 +8,10 @@ use std::path::Path;
 
 pub enum Backend {}
 impl Backend {
+    pub fn device_info(&self) -> &crate::backend::setup::DeviceInfo {
+        match *self {}
+    }
+
     pub fn profile_rounds(&mut self, enabled: bool) {
         let _ = enabled;
         match *self {}
