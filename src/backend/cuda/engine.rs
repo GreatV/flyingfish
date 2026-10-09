@@ -2129,11 +2129,6 @@ impl Engine {
             .context("draft state is not enabled")?
             .draft
             .setup_attention(&self.device, &self.ops, &self.config, &self.runtime)?;
-        self.spec
-            .as_mut()
-            .context("draft state is not enabled")?
-            .draft
-            .setup_markov(&self.device, &self.ops, &self.runtime)?;
         let _round_range = super::profile::Range::new(self.profile_rounds, c"dspark_round");
         ensure!(limit > 0, "spec round output limit must be positive");
         ensure!(
@@ -2562,8 +2557,6 @@ impl Engine {
         let spec = self.spec.as_mut().context("draft is not enabled")?;
         spec.draft
             .setup_attention(&self.device, &self.ops, &self.config, &self.runtime)?;
-        spec.draft
-            .setup_markov(&self.device, &self.ops, &self.runtime)?;
         spec.draft.propose(
             anchor,
             position,

@@ -240,7 +240,7 @@ fn measure(d: &Device, ops: &Ops, key: CacheKey) -> Result<Cache> {
             let timer = Instant::now();
             let mut burst_means = Vec::new();
             let mut cold_firsts = Vec::new();
-            while timer.elapsed() < Duration::from_millis(40) {
+            while timer.elapsed() < Duration::from_millis(40) || burst_means.len() < 12 {
                 unsafe {
                     s.launch_builder(&ops.residual)
                         .arg(&mut flush)
