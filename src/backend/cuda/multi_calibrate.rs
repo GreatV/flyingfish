@@ -2,7 +2,7 @@ use super::{
     Device, calibrate,
     flash::Shape,
     ops::{Ops, grid},
-    verification::{Query, Verification},
+    verification::{Query, Verification, phase1_residency},
 };
 use crate::{
     backend::setup::{
@@ -81,12 +81,81 @@ impl Calibrated {
 struct Budget {
     kv_bytes_per_token: usize,
     l2_bytes: usize,
+    sms: usize,
+    /// Resident phase-1 blocks per SM, indexed like `MultiImpl`.
+    phase1_resident: [usize; 3],
+    kv_heads: usize,
 }
 
-fn budget(d: &Device, c: &Config) -> Budget {
-    Budget {
+fn budget(d: &Device, c: &Config) -> Result<Budget> {
+    Ok(Budget {
         kv_bytes_per_token: c.kv_dim() * std::mem::size_of::<bf16>() * 2,
         l2_bytes: d.info.l2_bytes,
+        sms: d.info.sms,
+        phase1_resident: phase1_residency(&d.ctx)?,
+        kv_heads: c.num_key_value_heads,
+    })
+}
+
+/// Phase-1 CTAs that fit on the whole device: SM count times the driver-reported
+/// resident blocks per SM for that implementation's block size and dynamic
+/// shared memory.
+fn phase1_slots(budget: Budget, implementation: MultiImpl) -> usize {
+    budget.sms * budget.phase1_resident[implementation as usize].max(1)
+}
+
+/// KV capacity a calibration trial for this length bucket and row count
+/// allocates and launches with.
+fn calibration_capacity(length: usize, rows: usize) -> usize {
+    length + 256 + rows
+}
+
+/// Chunks whose phase-1 grid fills one and two whole waves of resident CTAs:
+/// rounding the chunk up to a 64-position step keeps the grid at or under the
+/// wave, so no tail block is launched. The grid is
+/// ceil(calibration_capacity / chunk) chunks per KV head times the row tiles.
+fn wave_chunks(
+    length: usize,
+    rows: usize,
+    kv_heads: usize,
+    budget: Budget,
+    implementation: MultiImpl,
+) -> Vec<usize> {
+    let tiles = (8 * rows)
+        .div_ceil(implementation.phase1_tile_rows())
+        .max(1);
+    let per_wave = (phase1_slots(budget, implementation) / (kv_heads * tiles)).max(1);
+    let work = calibration_capacity(length, rows);
+    let mut chunks: Vec<usize> = [1usize, 2]
+        .into_iter()
+        .map(|waves| work.div_ceil(per_wave * waves).div_ceil(64) * 64)
+        .collect();
+    chunks.sort_unstable();
+    chunks.dedup();
+    chunks
+}
+
+/// Baseline chunk candidates, always offered alongside the derived ones.
+fn baseline_chunks(bucket: usize, rows: usize) -> [usize; 2] {
+    match (bucket, rows) {
+        (0, 1..=32) => [64, 128],
+        (0, _) => [128, 64],
+        (1, 1..=8) => [128, 256],
+        (1, 9..=32) => [256, 128],
+        (1, _) => [512, 256],
+        (2, 1..=8) => [256, 512],
+        (2, 9..=16) => [512, 1024],
+        (2, 17..=32) => [1024, 512],
+        (2, _) => [2048, 1024],
+        (3, 1..=8) => [512, 1024],
+        (3, 9..=16) => [1024, 2048],
+        (3, 17..=32) => [2048, 1024],
+        (3, _) => [4096, 2048],
+        (4, 1..=8) => [1024, 2048],
+        (4, 9..=16) => [2048, 4096],
+        (4, 17..=32) => [4096, 2048],
+        (4, _) => [4096, 2048],
+        _ => unreachable!(),
     }
 }
 
@@ -115,27 +184,23 @@ fn candidates(
             }
         }
     }
-    let chunks = match (bucket, rows) {
-        (0, 1..=32) => [64, 128],
-        (0, _) => [128, 64],
-        (1, 1..=8) => [128, 256],
-        (1, 9..=32) => [256, 128],
-        (1, _) => [512, 256],
-        (2, 1..=8) => [256, 512],
-        (2, 9..=16) => [512, 1024],
-        (2, 17..=32) => [1024, 512],
-        (2, _) => [2048, 1024],
-        (3, 1..=8) => [512, 1024],
-        (3, 9..=16) => [1024, 2048],
-        (3, 17..=32) => [2048, 1024],
-        (3, _) => [4096, 2048],
-        (4, 1..=8) => [1024, 2048],
-        (4, 9..=16) => [2048, 4096],
-        (4, 17..=32) => [4096, 2048],
-        (4, _) => [4096, 2048],
-        _ => unreachable!(),
+    let chunks = baseline_chunks(bucket, rows);
+    // Each implementation sweeps its baseline seeds plus the two whole-wave
+    // chunks derived from its own tile height and residency.
+    let with_waves = |implementation: MultiImpl| -> Vec<usize> {
+        let mut derived = wave_chunks(
+            LENGTHS[bucket],
+            rows,
+            budget.kv_heads,
+            budget,
+            implementation,
+        );
+        derived.extend_from_slice(&chunks);
+        derived.sort_unstable();
+        derived.dedup();
+        derived
     };
-    for chunk in chunks {
+    for chunk in with_waves(MultiImpl::Tcmqa) {
         plans.push(MultiPlan {
             implementation: MultiImpl::Tcmqa,
             launch: AttentionPlan {
@@ -153,7 +218,7 @@ fn candidates(
     // LENGTHS[bucket] * kv_bytes_per_token bytes; the extra 64-row tile re-reads
     // that prefix, so the variant is offered only where it exceeds the device L2.
     if 8 * rows > 64 && LENGTHS[bucket] * budget.kv_bytes_per_token > budget.l2_bytes {
-        for chunk in chunks {
+        for chunk in with_waves(MultiImpl::TcmqaW) {
             plans.push(MultiPlan {
                 implementation: MultiImpl::TcmqaW,
                 launch: AttentionPlan {
@@ -317,7 +382,7 @@ fn load_mask(
     ));
     let (cache, hit) = if path.exists() {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)?;
-        check(&cache, &key, rows, causal, tree, bucket, budget(d, c))?;
+        check(&cache, &key, rows, causal, tree, bucket, budget(d, c)?)?;
         (cache, true)
     } else {
         eprintln!(
@@ -325,7 +390,15 @@ fn load_mask(
             serde_json::json!({"attention_calibration_cache":{"schema":2,"lengths":LENGTHS,"bucket":bucket,"path":path,"cached":false,"action":"measure requested bucket"}})
         );
         let cache = measure(d, ops, c, key, shape, tree)?;
-        check(&cache, &cache.key, rows, causal, tree, bucket, budget(d, c))?;
+        check(
+            &cache,
+            &cache.key,
+            rows,
+            causal,
+            tree,
+            bucket,
+            budget(d, c)?,
+        )?;
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -362,7 +435,7 @@ fn measure(
     let start = Instant::now();
     let trial_ms = if causal { 10 } else { 30 };
     let s = &d.stream;
-    let capacities = LENGTHS.map(|n| n + 256 + rows);
+    let capacities = LENGTHS.map(|n| calibration_capacity(n, rows));
     let q_values = random(rows * c.qkv_dim(), 4);
     let zero_q = vec![bf16::ZERO; q_values.len()];
     let mut q = s.clone_htod(&q_values)?;
@@ -443,7 +516,7 @@ fn measure(
             }
         }
         let mut best = (f64::INFINITY, f64::INFINITY);
-        for plan in candidates(bucket, rows, causal, tree, budget(d, c)) {
+        for plan in candidates(bucket, rows, causal, tree, budget(d, c)?) {
             let mut op = Verification::with_plan(
                 &d.ctx,
                 s,
@@ -602,6 +675,9 @@ mod long_tests {
         let budget = Budget {
             kv_bytes_per_token: 2 * 128 * std::mem::size_of::<bf16>() * 2,
             l2_bytes: 4 << 20,
+            sms: 48,
+            phase1_resident: [0, 2, 1],
+            kv_heads: 2,
         };
         for (rows, causal, tree) in [
             (7, false, false),
@@ -620,7 +696,7 @@ mod long_tests {
                     .into_iter()
                     .enumerate()
                 {
-                    let capacity = length + 256 + rows;
+                    let capacity = calibration_capacity(length, rows);
                     assert!(capacity <= 131072);
                     assert!(
                         (2 * capacity.div_ceil(plan.launch.chunk)

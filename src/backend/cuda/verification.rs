@@ -30,6 +30,32 @@ pub struct Query<'a> {
     pub shape: Shape,
 }
 
+/// Resident phase-1 blocks per SM, queried from the driver for each loaded
+/// kernel with its real block size and dynamic shared memory. Indexed like
+/// `MultiImpl`: V1, Tcmqa, TcmqaW.
+pub fn phase1_residency(ctx: &Arc<CudaContext>) -> Result<[usize; 3]> {
+    let module = cubin::module(ctx, "tcmqa")?;
+    let mut residency = [0usize; 3];
+    for (implementation, threads) in [(MultiImpl::Tcmqa, 128u32), (MultiImpl::TcmqaW, 256)] {
+        let symbol = match implementation {
+            MultiImpl::Tcmqa => "tcmqa_phase1",
+            MultiImpl::TcmqaW => "tcmqa_phase1_w",
+            MultiImpl::V1 => unreachable!(),
+        };
+        let first = module.load_function(symbol)?;
+        let smem = implementation.phase1_smem_bytes();
+        if smem > 48 * 1024 {
+            first.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                smem as i32,
+            )?;
+        }
+        residency[implementation as usize] =
+            first.occupancy_max_active_blocks_per_multiprocessor(threads, smem, None)? as usize;
+    }
+    Ok(residency)
+}
+
 impl Verification {
     pub fn candidate(
         ctx: &Arc<CudaContext>,
@@ -102,13 +128,12 @@ impl Verification {
             "invalid MQ phase2 block size"
         );
         let chunks = capacity.div_ceil(plan.chunk);
-        let first_smem = if implementation == MultiImpl::Tcmqa {
-            35328
-        } else if implementation == MultiImpl::TcmqaW {
-            52736
-        } else {
-            plan.qpack * (plan.threads as usize / 32) * 130 * 4
-        };
+        let first_smem =
+            if implementation == MultiImpl::Tcmqa || implementation == MultiImpl::TcmqaW {
+                implementation.phase1_smem_bytes()
+            } else {
+                plan.qpack * (plan.threads as usize / 32) * 130 * 4
+            };
         let second_smem = (2 * chunks + plan.merge_threads as usize) * 4;
         // TcmqaW's 52,736 B phase-1 tile needs the per-function opt-in set
         // below; phase 2 has no opt-in anywhere, so it stays under 48 KiB.
@@ -158,7 +183,7 @@ impl Verification {
         if implementation == MultiImpl::TcmqaW {
             first.set_attribute(
                 cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                52736,
+                implementation.phase1_smem_bytes() as i32,
             )?;
         }
         let second = module.load_function(if implementation == MultiImpl::V1 {
@@ -290,18 +315,22 @@ impl Verification {
                 first.arg(anc);
             }
             first.launch(LaunchConfig {
-                grid_dim: if self.implementation == MultiImpl::Tcmqa {
-                    (chunks as u32, 2, (8 * shape.rows).div_ceil(64) as u32)
-                } else if self.implementation == MultiImpl::TcmqaW {
-                    (chunks as u32, 2, (8 * shape.rows).div_ceil(128) as u32)
+                grid_dim: if self.implementation == MultiImpl::Tcmqa
+                    || self.implementation == MultiImpl::TcmqaW
+                {
+                    (
+                        chunks as u32,
+                        2,
+                        (8 * shape.rows).div_ceil(self.implementation.phase1_tile_rows()) as u32,
+                    )
                 } else {
                     (chunks as u32, (16 / p.qpack) as u32, rows as u32)
                 },
                 block_dim: (p.threads, 1, 1),
-                shared_mem_bytes: if self.implementation == MultiImpl::Tcmqa {
-                    35328
-                } else if self.implementation == MultiImpl::TcmqaW {
-                    52736
+                shared_mem_bytes: if self.implementation == MultiImpl::Tcmqa
+                    || self.implementation == MultiImpl::TcmqaW
+                {
+                    self.implementation.phase1_smem_bytes() as u32
                 } else {
                     (p.qpack * (p.threads as usize / 32) * 130 * 4) as u32
                 },
