@@ -104,10 +104,16 @@ fn phase1_slots(budget: Budget, implementation: MultiImpl) -> usize {
     budget.sms * budget.phase1_resident[implementation as usize].max(1)
 }
 
+/// KV capacity a calibration trial for this length bucket and row count
+/// allocates and launches with.
+fn calibration_capacity(length: usize, rows: usize) -> usize {
+    length + 256 + rows
+}
+
 /// Chunks whose phase-1 grid fills one and two whole waves of resident CTAs:
 /// rounding the chunk up to a 64-position step keeps the grid at or under the
 /// wave, so no tail block is launched. The grid is
-/// ceil((length + rows) / chunk) chunks per KV head times the row tiles.
+/// ceil(calibration_capacity / chunk) chunks per KV head times the row tiles.
 fn wave_chunks(
     length: usize,
     rows: usize,
@@ -119,7 +125,7 @@ fn wave_chunks(
         .div_ceil(implementation.phase1_tile_rows())
         .max(1);
     let per_wave = (phase1_slots(budget, implementation) / (kv_heads * tiles)).max(1);
-    let work = length + rows;
+    let work = calibration_capacity(length, rows);
     let mut chunks: Vec<usize> = [1usize, 2]
         .into_iter()
         .map(|waves| work.div_ceil(per_wave * waves).div_ceil(64) * 64)
@@ -429,7 +435,7 @@ fn measure(
     let start = Instant::now();
     let trial_ms = if causal { 10 } else { 30 };
     let s = &d.stream;
-    let capacities = LENGTHS.map(|n| n + 256 + rows);
+    let capacities = LENGTHS.map(|n| calibration_capacity(n, rows));
     let q_values = random(rows * c.qkv_dim(), 4);
     let zero_q = vec![bf16::ZERO; q_values.len()];
     let mut q = s.clone_htod(&q_values)?;
@@ -690,7 +696,7 @@ mod long_tests {
                     .into_iter()
                     .enumerate()
                 {
-                    let capacity = length + 256 + rows;
+                    let capacity = calibration_capacity(length, rows);
                     assert!(capacity <= 131072);
                     assert!(
                         (2 * capacity.div_ceil(plan.launch.chunk)
