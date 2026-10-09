@@ -68,6 +68,7 @@ struct Plan {
     pref: sys::cublasLtMatmulPreference_t,
     algo: Option<sys::cublasLtMatmulAlgo_t>,
     algo_index: u32,
+    algo_count: usize,
     waves: f32,
     workspace: usize,
 }
@@ -93,7 +94,7 @@ impl Plan {
         Ok(value)
     }
 
-    fn describe(&self, rows: usize, output: usize, input: usize, algo_index: u32) -> Result<()> {
+    fn describe(&self, rows: usize, output: usize, input: usize) -> Result<()> {
         use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
         eprintln!(
             "{}",
@@ -121,6 +122,7 @@ impl Plan {
             pref: std::ptr::null_mut(),
             algo: None,
             algo_index: 0,
+            algo_count: 0,
             waves: 0.0,
             workspace: 0,
         };
@@ -159,6 +161,7 @@ impl Plan {
                 "Lt heuristic returned {} algos; index {algo_index} unavailable",
                 algos.len()
             );
+            p.algo_count = algos.len();
             let heuristic = &algos[algo_index as usize];
             heuristic.state.result()?;
             p.waves = heuristic.wavesCount;
@@ -287,12 +290,23 @@ impl Blas {
                 algo_index,
             )
             .with_context(|| format!("Lt plan rows={rows} output={output} input={input}"))?;
-            p.describe(rows, output, input, algo_index)?;
+            p.describe(rows, output, input)?;
             self.plans
                 .borrow_mut()
                 .insert((rows, output, input, algo_index), p);
         }
         Ok(())
+    }
+
+    pub fn lt_algo_count(&self, rows: usize, output: usize, input: usize) -> Result<u32> {
+        self.prepare_with(rows, output, input, 0)?;
+        let count = self
+            .plans
+            .borrow()
+            .get(&(rows, output, input, 0))
+            .context("Lt plan missing")?
+            .algo_count;
+        Ok(count as u32)
     }
 
     pub fn linear(
@@ -345,9 +359,10 @@ impl Blas {
     ) -> Result<()> {
         linear_calibrate::check_extent(shape, w.len(), x.len())?;
         self.prepare(shape.rows, shape.output, shape.input)?;
+        let algos = self.lt_algo_count(shape.rows, shape.output, shape.input)?;
         let (rows, output, input) = (shape.rows, shape.output, shape.input);
         {
-            let choice = self.calibration.load(shape, |implementation, out| {
+            let choice = self.calibration.load(shape, algos, |implementation, out| {
                 let mut y = out.slice_mut(..rows * output);
                 match implementation {
                     LinearImpl::CublasLt(algo) => {

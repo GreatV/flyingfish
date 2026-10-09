@@ -113,6 +113,7 @@ impl Environment {
     pub fn load(
         &self,
         shape: LinearShape,
+        algo_count: u32,
         launch: impl Fn(&LinearImpl, &mut CudaSlice<bf16>) -> Result<()>,
     ) -> Result<LinearChoice> {
         ensure!(
@@ -126,7 +127,7 @@ impl Environment {
             check(&cache, &self.key, shape)?;
             (cache, true)
         } else {
-            let cache = self.measure(shape, launch)?;
+            let cache = self.measure(shape, algo_count, launch)?;
             check(&cache, &self.key, shape)?;
             let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
             let mut f = std::fs::OpenOptions::new()
@@ -150,6 +151,7 @@ impl Environment {
     fn measure(
         &self,
         shape: LinearShape,
+        algo_count: u32,
         launch: impl Fn(&LinearImpl, &mut CudaSlice<bf16>) -> Result<()>,
     ) -> Result<Cache> {
         self.closure.measurement()?;
@@ -160,7 +162,7 @@ impl Environment {
         let reference = s.clone_dtoh(&out)?;
         let signal: f64 = reference.iter().map(|v| (v.to_f32() as f64).powi(2)).sum();
         let mut rel_rmse = 0.0f64;
-        for implementation in (1..blas::LT_CANDIDATES)
+        for implementation in (1..blas::LT_CANDIDATES.min(algo_count))
             .map(LinearImpl::CublasLt)
             .chain([LinearImpl::Skinny])
         {
@@ -197,7 +199,7 @@ impl Environment {
             .ctx
             .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
         let mut trials = Vec::new();
-        let candidates: Vec<LinearImpl> = (0..blas::LT_CANDIDATES)
+        let candidates: Vec<LinearImpl> = (0..blas::LT_CANDIDATES.min(algo_count))
             .map(LinearImpl::CublasLt)
             .chain([LinearImpl::Skinny])
             .collect();
@@ -267,18 +269,25 @@ fn check(cache: &Cache, key: &CacheKey, shape: LinearShape) -> Result<()> {
         cache.choice.key == *key && cache.choice.shape == shape,
         "linear cache identity mismatch"
     );
+    let lt_indices: Vec<u32> = cache
+        .trials
+        .iter()
+        .filter_map(|t| match t.implementation {
+            LinearImpl::CublasLt(index) => Some(index),
+            LinearImpl::Skinny | LinearImpl::Candidate(_) => None,
+        })
+        .collect();
     ensure!(
-        cache.trials.len() == blas::LT_CANDIDATES as usize + 1
-            && (0..blas::LT_CANDIDATES).all(|k| cache
-                .trials
-                .iter()
-                .any(|t| matches!(t.implementation, LinearImpl::CublasLt(k))))
+        lt_indices.len() >= 1
+            && lt_indices.len() <= blas::LT_CANDIDATES as usize
+            && lt_indices.iter().enumerate().all(|(i, &index)| index == i as u32)
             && cache
                 .trials
                 .iter()
                 .filter(|t| matches!(t.implementation, LinearImpl::Skinny))
                 .count()
-                == 1,
+                == 1
+            && cache.trials.len() == lt_indices.len() + 1,
         "linear cache candidate list mismatch"
     );
     ensure!(
