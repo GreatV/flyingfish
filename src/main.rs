@@ -413,6 +413,7 @@ fn bench(
 }
 
 fn normalize_budget(cli: &mut Cli) {
+    cli.kernels.draft_model = cli.draft_model.clone();
     if cli.draft_model.is_none() {
         cli.kernels.spec_budget = backend::SpecBudget::Chain;
     }

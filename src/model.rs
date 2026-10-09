@@ -170,9 +170,6 @@ impl Model {
     pub fn tree_injected_hidden(&self) -> Result<Vec<f32>> {
         self.backend.tree_injected_hidden()
     }
-    pub fn enable_draft(&mut self, path: &Path) -> Result<()> {
-        self.backend.enable_draft(path)
-    }
     pub fn spec_round(
         &mut self,
         limit: usize,

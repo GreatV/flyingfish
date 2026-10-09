@@ -256,6 +256,25 @@ impl Draft {
         })
     }
 
+    pub(super) fn grow(&mut self, c: &Config, rows: usize) -> Result<()> {
+        ensure!(rows >= self.rows, "draft workspace rows cannot shrink");
+        let s = &self.stream;
+        let k_raw = s.alloc_zeros(rows * c.kv_dim())?;
+        let k_norm = s.alloc_zeros(rows * c.kv_dim())?;
+        let v_raw = s.alloc_zeros(rows * c.kv_dim())?;
+        let projected = s.alloc_zeros(rows * c.hidden_size)?;
+        let context = s.alloc_zeros(rows * c.hidden_size)?;
+        let packed = s.alloc_zeros(rows * 2 * c.kv_dim())?;
+        self.k_raw = k_raw;
+        self.k_norm = k_norm;
+        self.v_raw = v_raw;
+        self.projected = projected;
+        self.context = context;
+        self.packed = packed;
+        self.rows = rows;
+        Ok(())
+    }
+
     pub fn inject(
         &mut self,
         input: &CudaSlice<bf16>,

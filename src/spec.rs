@@ -43,10 +43,11 @@ pub fn check_tree_greedy(
         options.device,
         options.capacity,
         options.chunk,
-        options.backend.clone(),
+        options.backend.with_draft(draft),
     )?;
-    model.enable_draft(draft)?;
+
     let mut plain_settings = options.backend.clone();
+    plain_settings.draft_model = None;
     plain_settings.spec_budget = crate::backend::SpecBudget::Chain;
     let mut plain = Model::load(
         target,
@@ -122,9 +123,9 @@ pub fn compare_padding(
         options.device,
         options.capacity,
         options.chunk,
-        options.backend.clone(),
+        options.backend.with_draft(draft),
     )?;
-    model.enable_draft(draft)?;
+
     let anchor = model.prefill(ids, None)?;
     let mut tokens = vec![anchor];
     tokens.extend((1..nodes).map(|i| ((anchor as usize + i) % model.config.vocab_size) as u32));
@@ -180,9 +181,9 @@ pub fn compare_graph(target: &Path, draft: &Path, ids: &[u32], options: &Options
         options.device,
         options.capacity,
         options.chunk,
-        options.backend.clone(),
+        options.backend.with_draft(draft),
     )?;
-    model.enable_draft(draft)?;
+
     model.set_spec_graph(false)?;
     model.reset()?;
     let first = model.prefill(ids, None)?;
@@ -341,6 +342,7 @@ mod tests {
                 spec_budget: budget,
                 spec_graph: true,
                 linear_choices: Vec::new(),
+                draft_model: None,
                 runtime_dir: None,
             },
             count: 256,
@@ -393,9 +395,9 @@ pub fn generate(
         options.device,
         options.capacity,
         options.chunk,
-        options.backend.clone(),
+        options.backend.with_draft(draft),
     )?;
-    model.enable_draft(draft)?;
+
     let mut trace = Trace::default();
     let result = produce(&mut model, ids, options, dump.map(|_| &mut trace))?;
     if let Some(dump) = dump {
@@ -430,9 +432,9 @@ pub fn bench(
         options.device,
         options.capacity,
         options.chunk,
-        options.backend.clone(),
+        options.backend.with_draft(draft),
     )?;
-    model.enable_draft(draft)?;
+
     produce(&mut model, ids, options, None)?;
     let mut times = Vec::new();
     let mut end_to_end = Vec::new();
@@ -488,9 +490,9 @@ pub fn compare_builders(target: &Path, draft: &Path, ids: &[u32], options: &Opti
         options.device,
         options.capacity,
         options.chunk,
-        options.backend.clone(),
+        options.backend.with_draft(draft),
     )?;
-    model.enable_draft(draft)?;
+
     model.compare_tree_builders(true)?;
     let result = produce(&mut model, ids, options, None)?;
     for (index, round) in result.rounds.iter().enumerate() {
@@ -523,9 +525,9 @@ pub fn profile(target: &Path, draft: &Path, ids: &[u32], options: &Options) -> R
         options.device,
         options.capacity,
         options.chunk,
-        options.backend.clone(),
+        options.backend.with_draft(draft),
     )?;
-    model.enable_draft(draft)?;
+
     model.prefill(ids, None)?;
     model.spec_round(8, None, "")?;
     model.reset()?;
@@ -579,21 +581,23 @@ pub fn verify_greedy(
         rules.is_none() || reference.is_some(),
         "formal logits gates require the FP32 reference fixture"
     );
+    let mut plain_settings = options.backend.clone();
+    plain_settings.draft_model = None;
     let mut plain = Model::load(
         target,
         options.device,
         options.capacity,
         options.chunk,
-        options.backend.clone(),
+        plain_settings,
     )?;
     let mut spec = Model::load(
         target,
         options.device,
         options.capacity,
         options.chunk,
-        options.backend.clone(),
+        options.backend.with_draft(draft),
     )?;
-    spec.enable_draft(draft)?;
+
     let first = plain.prefill(ids, None)?;
     let spec_first = spec.prefill(ids, None)?;
     let mut logit_metrics = Vec::new();
@@ -815,9 +819,9 @@ pub fn replay(
         options.device,
         options.capacity,
         options.chunk,
-        options.backend.clone(),
+        options.backend.with_draft(draft),
     )?;
-    model.enable_draft(draft)?;
+
     let mut position = inject_reference(&mut model, &replay.initial, &rules)?;
     let mut near = 0;
     let mut exact = 0;

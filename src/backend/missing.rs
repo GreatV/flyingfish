@@ -206,10 +206,6 @@ impl Backend {
     pub fn tree_injected_hidden(&self) -> Result<Vec<f32>> {
         match *self {}
     }
-    pub fn enable_draft(&mut self, path: &Path) -> Result<()> {
-        let _ = path;
-        match *self {}
-    }
     pub fn spec_round(
         &mut self,
         limit: usize,

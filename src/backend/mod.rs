@@ -114,8 +114,18 @@ pub struct Settings {
     pub spec_graph: bool,
     #[arg(skip)]
     pub linear_choices: Vec<setup::LinearChoice>,
+    #[arg(skip)]
+    pub draft_model: Option<std::path::PathBuf>,
     #[arg(long, global = true, env = "FLYINGFISH_RUNTIME_DIR")]
     pub runtime_dir: Option<std::path::PathBuf>,
+}
+
+impl Settings {
+    pub fn with_draft(&self, path: &std::path::Path) -> Self {
+        let mut settings = self.clone();
+        settings.draft_model = Some(path.to_owned());
+        settings
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize)]
