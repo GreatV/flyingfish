@@ -2,6 +2,7 @@ use crate::{backend::Settings, dspark::Round, model::Model, tokenizer, trace::Tr
 use anyhow::{Result, ensure};
 use std::{path::Path, time::Instant};
 
+#[derive(Clone)]
 pub struct Options {
     pub device: usize,
     pub capacity: usize,
@@ -253,7 +254,27 @@ fn produce(
     m: &mut Model,
     ids: &[u32],
     options: &Options,
+    trace: Option<&mut Trace>,
+) -> Result<Output> {
+    produce_events(m, ids, options, trace, &mut |_| true)
+}
+
+/// One emission step of `produce_events`: the prefill's first token, then
+/// each committed round.
+pub enum Step<'a> {
+    First(u32),
+    Round(&'a Round),
+}
+
+/// `on_step` runs for the first emitted token and after each committed
+/// round; returning false stops the loop (abort) and the returned Output
+/// reflects the rounds completed.
+pub fn produce_events(
+    m: &mut Model,
+    ids: &[u32],
+    options: &Options,
     mut trace: Option<&mut Trace>,
+    on_step: &mut dyn FnMut(Step) -> bool,
 ) -> Result<Output> {
     let eos = if options.ignore_eos {
         Vec::new()
@@ -266,6 +287,16 @@ fn produce(
     let first = m.prefill(ids, None)?;
     let prefill_ms = start.elapsed().as_secs_f64() * 1000.0;
     let mut output = vec![first];
+    if !on_step(Step::First(first)) {
+        m.synchronize()?;
+        m.check_logits()?;
+        return Ok(Output {
+            ids: output,
+            rounds: Vec::new(),
+            decode_ms: start.elapsed().as_secs_f64() * 1000.0,
+            prefill_ms,
+        });
+    }
     let mut rounds = Vec::new();
     let start = Instant::now();
     while output.len() < options.count
@@ -291,7 +322,11 @@ fn produce(
             round.position = position;
         }
         output.extend(&round.output);
+        let stop = !on_step(Step::Round(&round));
         rounds.push(round);
+        if stop {
+            break;
+        }
     }
     m.synchronize()?;
     m.check_logits()?;
@@ -303,7 +338,7 @@ fn produce(
     })
 }
 
-fn check(ids: &[u32], options: &Options) -> Result<()> {
+pub fn check(ids: &[u32], options: &Options) -> Result<()> {
     ensure!(
         !ids.is_empty() && options.count > 0,
         "spec input and output count must be positive"
