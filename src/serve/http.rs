@@ -7,7 +7,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use futures_util::stream::{StreamExt, unfold};
+use futures_util::stream::unfold;
 use minijinja::{Environment, Value};
 use serde::Deserialize;
 use serde_json::json;
@@ -155,6 +155,9 @@ fn template_string_methods(
     Err(unknown(method))
 }
 
+/// Message roles the MiniCPM5-2B chat template renders.
+const TEMPLATE_ROLES: [&str; 4] = ["system", "user", "assistant", "tool"];
+
 fn read_chat_template(model_dir: &std::path::Path) -> Result<String> {
     std::fs::read_to_string(model_dir.join("chat_template.jinja"))
         .context("chat_template.jinja missing or unreadable in the model directory")
@@ -204,6 +207,8 @@ struct CommonParams {
     max_tokens: Option<usize>,
     #[serde(default)]
     max_completion_tokens: Option<usize>,
+    #[serde(default)]
+    stop: Option<serde_json::Value>,
     #[serde(default)]
     stream: Option<bool>,
 }
@@ -256,6 +261,9 @@ fn check_greedy(params: &CommonParams) -> Result<(), Box<Response>> {
             "greedy only: frequency_penalty must be 0 or absent",
         )));
     }
+    if params.stop.is_some() {
+        return Err(Box::new(bad_request("stop sequences are not supported")));
+    }
     Ok(())
 }
 
@@ -271,6 +279,12 @@ fn resolve_max_tokens(params: &CommonParams) -> Result<usize, Box<Response>> {
 }
 
 fn check_validity(state: &AppState, ids: &[u32], max_tokens: usize) -> Result<(), Box<Response>> {
+    let vocab_size = state.backend.vocab_size();
+    if let Some(id) = ids.iter().find(|&&id| id as usize >= vocab_size) {
+        return Err(Box::new(bad_request(&format!(
+            "prompt token id {id} is outside the vocabulary of size {vocab_size}"
+        ))));
+    }
     let options = crate::spec::Options {
         count: max_tokens,
         ..state.backend.options()
@@ -390,10 +404,16 @@ async fn chat_completions(
         _ => return bad_request("messages must be a non-empty array"),
     };
     for message in &messages {
-        if message.get("role").and_then(|r| r.as_str()).is_none()
-            || message.get("content").and_then(|c| c.as_str()).is_none()
-        {
+        let Some(role) = message.get("role").and_then(|r| r.as_str()) else {
             return bad_request("each message needs string role and content");
+        };
+        if message.get("content").and_then(|c| c.as_str()).is_none() {
+            return bad_request("each message needs string role and content");
+        }
+        if !TEMPLATE_ROLES.contains(&role) {
+            return bad_request(&format!(
+                "role {role:?} is not rendered by the chat template; expected one of {TEMPLATE_ROLES:?}"
+            ));
         }
     }
     let max_tokens = match resolve_max_tokens(&body.params) {
@@ -453,35 +473,64 @@ async fn respond(
 ) -> Response {
     if stream {
         let model = state.model_name.clone();
-        let mut detok = state.shared.detok();
-        let sse = unfold(events, |mut events| async move {
-            events.recv().await.map(|event| (event, events))
-        })
-        .map(move |event| sse_event(&event, &model, &id, is_chat, &mut detok));
+        let detok = state.shared.detok();
+        let sse = unfold(
+            StreamState::Running(events, Box::new(detok)),
+            move |stream_state| {
+                let model = model.clone();
+                let id = id.clone();
+                async move {
+                    match stream_state {
+                        StreamState::Running(mut events, mut detok) => match events.recv().await {
+                            Some(event) => {
+                                let item = sse_event(&event, &model, &id, is_chat, &mut detok);
+                                let next = match event {
+                                    EngineEvent::Tokens { .. } => {
+                                        StreamState::Running(events, detok)
+                                    }
+                                    EngineEvent::Done { .. } | EngineEvent::Aborted { .. } => {
+                                        StreamState::Sentinel
+                                    }
+                                    EngineEvent::Failed(_) => StreamState::End,
+                                };
+                                Some((item, next))
+                            }
+                            None => Some((
+                                sse_json(&json!({"error": {
+                                    "message": ENGINE_EOF,
+                                    "type": "server_error"
+                                }})),
+                                StreamState::End,
+                            )),
+                        },
+                        StreamState::Sentinel => {
+                            Some((Ok(Event::default().data("[DONE]")), StreamState::End))
+                        }
+                        StreamState::End => None,
+                    }
+                }
+            },
+        );
         return Sse::new(sse)
             .keep_alive(KeepAlive::default())
             .into_response();
     }
     let mut detok = state.shared.detok();
-    let mut finish_reason = "stop";
-    while let Some(event) = events.recv().await {
-        match event {
-            EngineEvent::Tokens { ids, .. } => {
+    let finish_reason = loop {
+        match events.recv().await {
+            Some(EngineEvent::Tokens { ids, .. }) => {
                 if detok.push(&ids).is_err() {
                     return error_response("detokenize failed".into());
                 }
             }
-            EngineEvent::Done { length_reached, .. } => {
-                finish_reason = if length_reached { "length" } else { "stop" };
-                break;
+            Some(EngineEvent::Done { length_reached, .. }) => {
+                break if length_reached { "length" } else { "stop" };
             }
-            EngineEvent::Aborted { .. } => {
-                finish_reason = "aborted";
-                break;
-            }
-            EngineEvent::Failed(message) => return error_response(message),
+            Some(EngineEvent::Aborted { .. }) => break "aborted",
+            Some(EngineEvent::Failed(message)) => return error_response(message),
+            None => return error_response(ENGINE_EOF.into()),
         }
-    }
+    };
     if detok.finish().is_err() {
         return error_response("detokenize failed".into());
     }
@@ -507,6 +556,14 @@ async fn respond(
         })
     };
     Json(body).into_response()
+}
+
+const ENGINE_EOF: &str = "engine stopped before completing the request";
+
+enum StreamState {
+    Running(tokio_mpsc::Receiver<EngineEvent>, Box<super::detok::Detok>),
+    Sentinel,
+    End,
 }
 
 fn sse_event(
