@@ -306,6 +306,7 @@ pub fn run(target: &Path, draft: &Path, plan: &Path, dump: &Path, options: &Opti
         );
     }
     let mut metadata = HashMap::new();
+    metadata.insert("device".into(), model.device_info().name.clone());
     for (k, v) in [
         ("schema", "tree-verify-v1"),
         ("role", "engine"),

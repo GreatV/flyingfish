@@ -3,14 +3,27 @@ use safetensors::{
     Dtype, SafeTensors,
     tensor::{TensorView, serialize_to_file},
 };
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 #[derive(Default)]
 pub struct Trace {
     tensors: BTreeMap<String, (Vec<usize>, Vec<u8>)>,
+    device: Option<String>,
 }
 
 impl Trace {
+    pub(crate) fn set_device(&mut self, name: &str) -> Result<()> {
+        ensure!(
+            self.device.as_deref().is_none_or(|device| device == name),
+            "trace contains tensors from different devices"
+        );
+        self.device = Some(name.to_owned());
+        Ok(())
+    }
+
     pub fn read(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)?;
         let tensors = SafeTensors::deserialize(&bytes)?;
@@ -73,6 +86,10 @@ impl Trace {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("trace device metadata is missing"))?;
         let views = self
             .tensors
             .iter()
@@ -83,7 +100,11 @@ impl Trace {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        serialize_to_file(views, None, path)?;
+        serialize_to_file(
+            views,
+            Some(HashMap::from([("device".into(), device.clone())])),
+            path,
+        )?;
         Ok(())
     }
 }

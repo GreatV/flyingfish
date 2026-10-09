@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeviceInfo {
+    pub name: String,
     pub arch: u32,
     pub sms: usize,
     pub l2_bytes: usize,

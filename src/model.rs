@@ -12,6 +12,10 @@ pub struct Model {
 }
 
 impl Model {
+    pub fn device_info(&self) -> &crate::backend::setup::DeviceInfo {
+        self.backend.device_info()
+    }
+
     pub fn decode_linear(&self) -> &'static str {
         self.backend.decode_linear()
     }
@@ -29,13 +33,20 @@ impl Model {
     pub fn reset(&mut self) -> Result<()> {
         self.backend.reset()
     }
-    pub fn prefill(&mut self, ids: &[u32], trace: Option<&mut Trace>) -> Result<u32> {
+    pub fn prefill(&mut self, ids: &[u32], mut trace: Option<&mut Trace>) -> Result<u32> {
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.set_device(&self.device_info().name)?;
+        }
         self.backend.prefill(ids, trace)
     }
     pub fn prefill_tail(&mut self, ids: &[u32], trace: &mut Trace, keep: usize) -> Result<u32> {
+        trace.set_device(&self.device_info().name)?;
         self.backend.prefill_tail(ids, trace, keep)
     }
-    pub fn decode(&mut self, graph: bool, trace: Option<(&mut Trace, &str)>) -> Result<u32> {
+    pub fn decode(&mut self, graph: bool, mut trace: Option<(&mut Trace, &str)>) -> Result<u32> {
+        if let Some((trace, _)) = trace.as_mut() {
+            trace.set_device(&self.device_info().name)?;
+        }
         self.backend.decode(graph, trace)
     }
     pub fn step(&mut self, graph: bool) -> Result<()> {
@@ -133,8 +144,11 @@ impl Model {
     pub fn verify_tree(
         &mut self,
         tree: &crate::tree::Tree,
-        trace: Option<crate::backend::Target<'_>>,
+        mut trace: Option<crate::backend::Target<'_>>,
     ) -> Result<Vec<u32>> {
+        if let Some(trace) = trace.as_mut() {
+            trace.trace.set_device(&self.device_info().name)?;
+        }
         self.backend.verify_tree(tree, trace)
     }
     pub fn tree_metadata(&self) -> Result<crate::backend::TreeMetadata> {
@@ -173,9 +187,12 @@ impl Model {
     pub fn spec_round(
         &mut self,
         limit: usize,
-        trace: Option<&mut Trace>,
+        mut trace: Option<&mut Trace>,
         prefix: &str,
     ) -> Result<crate::dspark::Round> {
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.set_device(&self.device_info().name)?;
+        }
         self.backend.spec_round(limit, trace, prefix)
     }
     pub fn set_spec_graph(&mut self, graph: bool) -> Result<()> {
@@ -198,10 +215,12 @@ impl Model {
         prefix: &str,
         forced: Option<&[u32]>,
     ) -> Result<Vec<u32>> {
+        trace.set_device(&self.device_info().name)?;
         self.backend
             .draft_proposals(anchor, position, trace, prefix, forced)
     }
     pub fn draft_kv(&self, trace: &mut Trace, start: usize, rows: usize) -> Result<()> {
+        trace.set_device(&self.device_info().name)?;
         self.backend.draft_kv(trace, start, rows)
     }
     pub fn position(&self) -> usize {

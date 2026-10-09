@@ -532,6 +532,10 @@ impl Engine {
         }
     }
 
+    pub fn device_info(&self) -> &crate::backend::setup::DeviceInfo {
+        &self.device.info
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
     }
