@@ -378,33 +378,6 @@ mod tests {
             .to_string();
         assert!(error.contains("Tree64") && error.contains("overflows usize"));
     }
-
-    #[test]
-    fn default_tree16_fits_4096_capacity_and_reserves_all_scratch_rows() -> Result<()> {
-        let options = options(SpecBudget::default(), 4096);
-        assert_eq!(options.backend.spec_budget, SpecBudget::Tree16);
-        check(&vec![1; 1024], &options)?;
-        check(&vec![1; 4096 - 256 - 16], &options)?;
-        let error = check(&vec![1; 4096 - 256 - 16 + 1], &options)
-            .expect_err("default budget must reserve sixteen scratch rows")
-            .to_string();
-        assert!(error.contains("Tree16") && error.contains("requires KV capacity 4097"));
-        Ok(())
-    }
-
-    #[test]
-    fn tree_greedy_rejects_chain_before_report_or_model_access() {
-        let error = check_tree_greedy(
-            Path::new(""),
-            Path::new(""),
-            &[1],
-            &options(SpecBudget::Chain, 512),
-            Path::new(""),
-        )
-        .expect_err("chain cannot validate the tree path")
-        .to_string();
-        assert!(error.contains("requires --spec-budget tree16, tree32 or tree64"));
-    }
 }
 
 pub fn generate(

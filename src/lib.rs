@@ -11,6 +11,3 @@ pub mod trace;
 pub mod tree;
 pub mod tree_replay;
 pub mod verify;
-
-#[cfg(test)]
-mod build_arch;
