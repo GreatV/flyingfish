@@ -299,6 +299,9 @@ impl Blas {
     }
 
     pub fn lt_algo_count(&self, rows: usize, output: usize, input: usize) -> Result<u32> {
+        if rows <= 1 {
+            return Ok(1);
+        }
         self.prepare_with(rows, output, input, 0)?;
         let count = self
             .plans
