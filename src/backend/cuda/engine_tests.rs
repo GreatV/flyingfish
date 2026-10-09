@@ -135,6 +135,7 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
     let token = model.decode(false, None)?;
     model.step(false)?;
     model.check_logits()?;
+    assert!(model.capture().is_err());
     model.check_ready()?;
     println!("draft_profile_eager_decode tree16 decode/step PASS token={token}");
     model.reset()?;

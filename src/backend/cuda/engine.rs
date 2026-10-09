@@ -1360,6 +1360,10 @@ impl Engine {
     }
 
     fn advance(&mut self, graph: bool, trace: Option<(&mut Trace, &str)>) -> Result<()> {
+        ensure!(
+            !graph || self.spec.is_none(),
+            "graph decode is not declared for draft-enabled engines"
+        );
         self.closure.assert_ready()?;
         ensure!(
             !self.poisoned,
@@ -1427,6 +1431,10 @@ impl Engine {
     }
 
     pub fn capture(&mut self) -> Result<()> {
+        ensure!(
+            self.spec.is_none(),
+            "graph decode is not declared for draft-enabled engines"
+        );
         if self.graph.is_some() {
             return Ok(());
         }
