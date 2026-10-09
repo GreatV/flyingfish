@@ -82,6 +82,10 @@ pub(super) fn hash(bytes: &[u8]) -> String {
     format!("{:016x}", hash.finish())
 }
 
+pub(super) fn injection_limit(chunk: usize, capacity: usize) -> usize {
+    chunk.min(capacity).clamp(8, 16)
+}
+
 fn shapes(
     c: &Config,
     capacity: usize,
@@ -120,7 +124,7 @@ fn shapes(
             dimensions.context("draft dimensions missing from closure declaration")?;
         add(7, c.vocab_size, c.hidden_size);
         add(budget.rows(), c.vocab_size, c.hidden_size);
-        let max = chunk.min(capacity).clamp(8, 16);
+        let max = injection_limit(chunk, capacity);
         for rows in 1..=max {
             for (output, input) in [(c.hidden_size, context), (c.kv_dim(), c.hidden_size)] {
                 add(rows, output, input);
@@ -383,6 +387,7 @@ mod tests {
             }));
             assert!(pairs.contains(&(c.vocab_size, draft.markov_rank)));
             let kinds = attention(Some(budget));
+            assert_eq!(kinds.contains(&Attention::Verify), !budget.is_tree());
             assert_eq!(
                 kinds,
                 vec![
@@ -397,6 +402,31 @@ mod tests {
             );
         }
         assert_eq!(attention(None), vec![Attention::Decode]);
+        for budget in [SpecBudget::Tree32, SpecBudget::Tree64] {
+            for chunk in [1, 8, 9, 15, 16, 32] {
+                let limit = injection_limit(chunk, 4096);
+                let (linear, pairs) = shapes(&c, 4096, chunk, Some(budget), dimensions)?;
+                for rows in 1..=16 {
+                    assert_eq!(
+                        linear.contains(&LinearShape {
+                            rows,
+                            output: 2048,
+                            input: 10240
+                        }),
+                        rows <= limit
+                    );
+                    assert_eq!(
+                        linear.contains(&LinearShape {
+                            rows,
+                            output: 256,
+                            input: 2048
+                        }),
+                        rows <= limit
+                    );
+                }
+                assert!(pairs.contains(&(2048, 10240)) && pairs.contains(&(256, 2048)));
+            }
+        }
         let (small, _) = shapes(&c, 4096, 1, Some(SpecBudget::Tree16), dimensions)?;
         for rows in 1..=8 {
             for (output, input) in [(2048, 10240), (256, 2048)] {

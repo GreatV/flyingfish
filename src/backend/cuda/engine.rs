@@ -783,6 +783,12 @@ impl Engine {
             !self.poisoned,
             "tree transaction failed; reset/reload is required"
         );
+        ensure!(
+            !(self.spec_budget.is_tree()
+                && step.head == Head::All
+                && matches!(step.mask, crate::backend::Mask::Causal)),
+            "causal all-row verification requires a chain spec budget"
+        );
         if matches!(step.mask, crate::backend::Mask::Tree { .. }) {
             self.prepare_tree(step)?;
         }
@@ -2703,6 +2709,11 @@ impl Engine {
     }
 
     pub fn inject_hidden(&mut self, hidden: &[f32], start: usize, rows: usize) -> Result<()> {
+        let limit = super::closure::injection_limit(self.chunk, self.capacity);
+        ensure!(
+            rows > 0 && (rows > 16 || rows <= limit),
+            "injection rows {rows} exceed declared small-row limit {limit}"
+        );
         ensure!(
             hidden.len() == rows * 5 * self.config.hidden_size,
             "injected hidden shape mismatch"
