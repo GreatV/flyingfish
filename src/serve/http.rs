@@ -509,44 +509,54 @@ async fn respond(
 ) -> Response {
     if stream {
         let model = state.model_name.clone();
-        let detok = state.shared.detok();
-        let sse = unfold(
-            StreamState::Running(events, Box::new(detok)),
-            move |stream_state| {
-                let model = model.clone();
-                let id = id.clone();
-                async move {
-                    match stream_state {
-                        StreamState::Running(mut events, mut detok) => match events.recv().await {
-                            Some(event) => {
-                                let item = sse_event(&event, &model, &id, is_chat, &mut detok);
-                                let next = match event {
-                                    EngineEvent::Tokens { .. } => {
-                                        StreamState::Running(events, detok)
-                                    }
-                                    EngineEvent::Done { .. } | EngineEvent::Aborted { .. } => {
-                                        StreamState::Sentinel
-                                    }
-                                    EngineEvent::Failed(_) => StreamState::End,
-                                };
-                                Some((item, next))
-                            }
-                            None => Some((
-                                sse_json(&json!({"error": {
-                                    "message": ENGINE_EOF,
-                                    "type": "server_error"
-                                }})),
-                                StreamState::End,
-                            )),
-                        },
-                        StreamState::Sentinel => {
-                            Some((Ok(Event::default().data("[DONE]")), StreamState::End))
+        let detok = Box::new(state.shared.detok());
+        let start = if is_chat {
+            StreamState::Role(events, detok)
+        } else {
+            StreamState::Running(events, detok)
+        };
+        let sse = unfold(start, move |stream_state| {
+            let model = model.clone();
+            let id = id.clone();
+            async move {
+                match stream_state {
+                    StreamState::Role(events, detok) => Some((
+                        sse_json(&json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": now_secs(),
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]
+                        })),
+                        StreamState::Running(events, detok),
+                    )),
+                    StreamState::Running(mut events, mut detok) => match events.recv().await {
+                        Some(event) => {
+                            let item = sse_event(&event, &model, &id, is_chat, &mut detok);
+                            let next = match event {
+                                EngineEvent::Tokens { .. } => StreamState::Running(events, detok),
+                                EngineEvent::Done { .. } | EngineEvent::Aborted { .. } => {
+                                    StreamState::Sentinel
+                                }
+                                EngineEvent::Failed(_) => StreamState::End,
+                            };
+                            Some((item, next))
                         }
-                        StreamState::End => None,
+                        None => Some((
+                            sse_json(&json!({"error": {
+                                "message": ENGINE_EOF,
+                                "type": "server_error"
+                            }})),
+                            StreamState::End,
+                        )),
+                    },
+                    StreamState::Sentinel => {
+                        Some((Ok(Event::default().data("[DONE]")), StreamState::End))
                     }
+                    StreamState::End => None,
                 }
-            },
-        );
+            }
+        });
         return Sse::new(sse)
             .keep_alive(KeepAlive::default())
             .into_response();
@@ -597,6 +607,7 @@ async fn respond(
 const ENGINE_EOF: &str = "engine stopped before completing the request";
 
 enum StreamState {
+    Role(tokio_mpsc::Receiver<EngineEvent>, Box<super::detok::Detok>),
     Running(tokio_mpsc::Receiver<EngineEvent>, Box<super::detok::Detok>),
     Sentinel,
     End,
