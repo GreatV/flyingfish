@@ -1,5 +1,6 @@
 pub mod blas;
 pub mod calibrate;
+mod closure;
 pub mod copy;
 pub mod cubin;
 pub mod decode;

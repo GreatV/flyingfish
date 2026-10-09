@@ -290,6 +290,7 @@ pub fn produce_events(
     if !on_step(Step::First(first)) {
         m.synchronize()?;
         m.check_logits()?;
+        m.check_ready()?;
         return Ok(Output {
             ids: output,
             rounds: Vec::new(),
@@ -330,6 +331,7 @@ pub fn produce_events(
     }
     m.synchronize()?;
     m.check_logits()?;
+    m.check_ready()?;
     Ok(Output {
         ids: output,
         rounds,

@@ -74,6 +74,7 @@ impl Input {
 
 #[derive(Subcommand)]
 enum Command {
+    Calibrate,
     Generate {
         #[command(flatten)]
         input: Input,
@@ -431,6 +432,14 @@ fn run() -> Result<()> {
         .context("resolve model directory")?;
     eprintln!("model={}", cli.model.display());
     match &cli.command {
+        Command::Calibrate => {
+            let settings = if let Some(draft) = &cli.draft_model {
+                cli.kernels.with_draft(&draft.canonicalize()?)
+            } else {
+                cli.kernels.clone()
+            };
+            Model::calibrate(&cli.model, cli.device, cli.capacity, cli.chunk, settings)
+        }
         Command::Generate {
             input,
             max_new_tokens,

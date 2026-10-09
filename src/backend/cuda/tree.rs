@@ -54,6 +54,29 @@ pub(crate) struct EmbedOut<'a> {
 }
 
 impl State {
+    pub(crate) fn reset_setup(&mut self) -> Result<()> {
+        self.outside_capture()?;
+        self.tree = None;
+        self.keep = 0;
+        self.stream.memset_zeros(&mut self.tokens)?;
+        self.stream.memset_zeros(&mut self.anc)?;
+        for value in [
+            &mut self.depth,
+            &mut self.rows,
+            &mut self.expected,
+            &mut self.prefix,
+            &mut self.positions,
+            &mut self.slots,
+            &mut self.path,
+            &mut self.count,
+            &mut self.logits_row,
+        ] {
+            self.stream.memset_zeros(value)?;
+        }
+        self.stream.memset_zeros(&mut self.compact)?;
+        self.stream.memset_zeros(&mut self.hidden)?;
+        Ok(())
+    }
     pub(crate) fn new(
         device: &Device,
         config: &Config,

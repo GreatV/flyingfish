@@ -237,36 +237,25 @@ fn check(
     Ok(())
 }
 
-pub fn load(
+pub(super) fn load(
     d: &Device,
     ops: &Ops,
     c: &Config,
     dir: &Path,
-    rows: usize,
-    causal: bool,
-    capacity: usize,
+    shape: MultiShape,
+    closure: &super::closure::Closure,
 ) -> Result<Calibrated> {
-    load_mask(
-        d,
-        ops,
-        c,
-        dir,
-        MultiShape {
-            rows,
-            causal,
-            capacity,
-        },
-        false,
-    )
+    load_mask(d, ops, c, dir, shape, false, closure)
 }
 
-pub fn load_tree(
+pub(super) fn load_tree(
     d: &Device,
     ops: &Ops,
     c: &Config,
     dir: &Path,
     rows: usize,
     capacity: usize,
+    closure: &super::closure::Closure,
 ) -> Result<Calibrated> {
     ensure!(
         [16, 32, 64].contains(&rows),
@@ -283,26 +272,19 @@ pub fn load_tree(
             capacity,
         },
         true,
+        closure,
     )
 }
 
-fn load_mask(
-    d: &Device,
-    ops: &Ops,
-    c: &Config,
+pub(super) fn cache_path(
     dir: &Path,
-    shape: MultiShape,
+    key: &CacheKey,
+    bucket: usize,
+    rows: usize,
+    causal: bool,
     tree: bool,
-) -> Result<Calibrated> {
-    let rows = shape.rows;
-    let causal = shape.causal;
-    let bucket = attention_bucket(shape.capacity)?;
-    ensure!(
-        (1..=64).contains(&rows),
-        "multi attention M must be within1..64"
-    );
-    let key = calibrate::key(d)?;
-    let path = dir.join(format!(
+) -> PathBuf {
+    dir.join(format!(
         "multi-long-v2-b{bucket}-m{rows}-{}-{}-{}-{}.json",
         if tree {
             "tree"
@@ -314,8 +296,28 @@ fn load_mask(
         key.device_uuid,
         key.driver_version,
         key.binary_version
-    ));
-    let (cache, hit) = if path.exists() {
+    ))
+}
+
+fn load_mask(
+    d: &Device,
+    ops: &Ops,
+    c: &Config,
+    dir: &Path,
+    shape: MultiShape,
+    tree: bool,
+    closure: &super::closure::Closure,
+) -> Result<Calibrated> {
+    let rows = shape.rows;
+    let causal = shape.causal;
+    let bucket = attention_bucket(shape.capacity)?;
+    ensure!(
+        (1..=64).contains(&rows),
+        "multi attention M must be within1..64"
+    );
+    let key = calibrate::key(d)?;
+    let path = cache_path(dir, &key, bucket, rows, causal, tree);
+    let (cache, hit) = if closure.access(&path)? {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)?;
         check(&cache, &key, rows, causal, tree, bucket, budget(d, c))?;
         (cache, true)
@@ -324,7 +326,7 @@ fn load_mask(
             "{}",
             serde_json::json!({"attention_calibration_cache":{"schema":2,"lengths":LENGTHS,"bucket":bucket,"path":path,"cached":false,"action":"measure requested bucket"}})
         );
-        let cache = measure(d, ops, c, key, shape, tree)?;
+        let cache = measure(d, ops, c, key, shape, tree, closure)?;
         check(&cache, &cache.key, rows, causal, tree, bucket, budget(d, c))?;
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
@@ -355,7 +357,9 @@ fn measure(
     key: CacheKey,
     shape: MultiShape,
     tree: bool,
+    closure: &super::closure::Closure,
 ) -> Result<Cache> {
+    closure.measurement()?;
     let rows = shape.rows;
     let causal = shape.causal;
     let selected = attention_bucket(shape.capacity)?;

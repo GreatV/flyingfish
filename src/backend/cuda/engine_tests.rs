@@ -1,6 +1,215 @@
 use super::*;
 
 #[test]
+#[ignore = "requires a reserved GPU window and FF_ARGMAX_MODEL/FF_ARGMAX_DRAFT/FLYINGFISH_RUNTIME_DIR"]
+fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
+    let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
+    let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+    let settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        linear_choices: Vec::new(),
+        draft_model: None,
+        runtime_dir: Some(runtime),
+    };
+    Engine::calibrate(&target, 0, 33824, Some(1024), settings.clone())?;
+    let mut model = Engine::load(&target, 0, 33824, Some(1024), settings)?;
+    model.check_ready()?;
+    for kv in &model.kv {
+        for head in 0..model.config.num_key_value_heads {
+            let lo = head * model.capacity * model.config.head_dim;
+            for values in [&kv.k, &kv.v] {
+                ensure!(
+                    model
+                        .device
+                        .stream
+                        .clone_dtoh(&values.slice(lo..lo + model.config.head_dim))?
+                        .iter()
+                        .all(|v| v.to_bits() == 0),
+                    "setup left target KV data"
+                );
+            }
+        }
+    }
+    for rows in (1..=17).chain([1024, 8192, 32768]) {
+        let ids = vec![1; rows];
+        model.reset()?;
+        let first = model.prefill(&ids, None)?;
+        let mut eager = Vec::new();
+        for _ in 0..8 {
+            let token = model.decode(false, None)?;
+            eager.push((
+                token,
+                model
+                    .decode_logits()?
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        let kv = model.kv_snapshot(rows, 8)?;
+        model.reset()?;
+        ensure!(model.prefill(&ids, None)? == first, "prefill token changed");
+        let poison = vec![bf16::from_bits(0x7fc0); 8 * model.config.head_dim];
+        for cache in &mut model.kv {
+            for head in 0..model.config.num_key_value_heads {
+                let lo = (head * model.capacity + rows) * model.config.head_dim;
+                model
+                    .device
+                    .stream
+                    .memcpy_htod(&poison, &mut cache.k.slice_mut(lo..lo + poison.len()))?;
+                model
+                    .device
+                    .stream
+                    .memcpy_htod(&poison, &mut cache.v.slice_mut(lo..lo + poison.len()))?;
+            }
+        }
+        model.capture()?;
+        for (token, logits) in eager {
+            ensure!(
+                model.decode(true, None)? == token,
+                "Graph token changed at prefill rows {rows}"
+            );
+            ensure!(
+                model
+                    .decode_logits()?
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+                    == logits,
+                "Graph logits changed at prefill rows {rows}"
+            );
+        }
+        ensure!(
+            model.kv_snapshot(rows, 8)? == kv,
+            "Graph KV changed at prefill rows {rows}"
+        );
+        model.check_ready()?;
+        model.closure.expect_captures(model.graphs.len())?;
+    }
+    println!(
+        "closure_target_graph rows1..17/1k/8k/32k token/logits/KV bitwise PASS; unwritten KV poisoned"
+    );
+    drop(model);
+    let draft = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
+    let settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Tree16,
+        spec_graph: true,
+        linear_choices: Vec::new(),
+        draft_model: Some(draft),
+        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+    };
+    Engine::calibrate(&target, 0, 33824, Some(1024), settings.clone())?;
+    let mut model = Engine::load(&target, 0, 33824, Some(1024), settings)?;
+    let spec = model.spec.as_ref().context("draft missing")?;
+    let state = spec.tree.as_ref().context("tree missing")?;
+    ensure!(
+        state.rows() == 0 && state.keep() == 0 && spec.active_rows == 0,
+        "setup left active tree metadata"
+    );
+    let mut cleared = Vec::new();
+    spec.draft.state_bits(0, 8, &mut cleared)?;
+    ensure!(
+        cleared.iter().all(|&v| v == 0),
+        "setup left draft state or KV data"
+    );
+    for kv in &model.kv {
+        for head in 0..model.config.num_key_value_heads {
+            let lo = head * model.capacity * model.config.head_dim;
+            for values in [&kv.k, &kv.v] {
+                ensure!(
+                    model
+                        .device
+                        .stream
+                        .clone_dtoh(&values.slice(lo..lo + 16 * model.config.head_dim))?
+                        .iter()
+                        .all(|v| v.to_bits() == 0),
+                    "setup left tree KV/padding data"
+                );
+            }
+        }
+    }
+    model.prefill(&[1], None)?;
+    let start = model.position();
+    let tokens: Vec<_> = (0..16).map(|r| if r < 8 { 0 } else { r }).collect();
+    let parents: Vec<_> = (0..16)
+        .map(|r| {
+            if r == 0 {
+                -1
+            } else if r < 8 {
+                r - 1
+            } else {
+                0
+            }
+        })
+        .collect();
+    let tree = crate::tree::Tree::edges(&tokens, &parents, start, model.capacity)?;
+    model.verify_tree(&tree, None)?;
+    for rows in 1..=8 {
+        let plan = tree.select(&[0; 16], rows, &[])?;
+        model
+            .spec
+            .as_mut()
+            .context("draft missing")?
+            .tree
+            .as_mut()
+            .context("tree missing")?
+            .load_commit(&plan)?;
+        model.tree_gather_scatter()?;
+        model.tree_inject(start)?;
+        let mut expected = Vec::new();
+        model
+            .spec
+            .as_ref()
+            .context("draft missing")?
+            .draft
+            .state_bits(start, rows, &mut expected)?;
+        ensure!(
+            expected.iter().any(|&v| v != 0),
+            "inject control has no nonzero signal"
+        );
+        let zero = model.device.stream.alloc_zeros::<bf16>(rows * 10240)?;
+        model.spec.as_mut().context("draft missing")?.draft.inject(
+            &zero,
+            rows,
+            start,
+            super::super::draft::Compute {
+                ops: &model.ops,
+                blas: &mut model.blas,
+                config: &model.config,
+            },
+            None,
+        )?;
+        model.spec.as_ref().context("draft missing")?.inject_graphs[rows - 1]
+            .as_ref()
+            .context("inject Graph missing")?
+            .launch()?;
+        let mut actual = Vec::new();
+        model
+            .spec
+            .as_ref()
+            .context("draft missing")?
+            .draft
+            .state_bits(start, rows, &mut actual)?;
+        ensure!(
+            actual == expected,
+            "inject M{rows} Graph differs from eager"
+        );
+    }
+    let removed = model.spec.as_mut().context("draft missing")?.inject_graphs[2].take();
+    ensure!(
+        model.check_ready().is_err(),
+        "missing inject Graph passed Ready validation"
+    );
+    model.spec.as_mut().context("draft missing")?.inject_graphs[2] = removed;
+    model.check_ready()?;
+    model.closure.expect_captures(model.graphs.len())?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires a reserved GPU window and FF_ARGMAX_MODEL/FF_ARGMAX_DRAFT/FF_ARGMAX_INPUTS/FLYINGFISH_RUNTIME_DIR"]
 fn chain_argmax_matches_single_on_real_logits() -> Result<()> {
     let target =

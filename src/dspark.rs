@@ -93,6 +93,9 @@ impl Rules {
 }
 
 impl DraftConfig {
+    pub fn capture_width(&self) -> usize {
+        self.target_layer_ids.len() * self.hidden_size
+    }
     pub fn read(path: &Path, target: &Config) -> Result<Self> {
         let path = path.join("config.json");
         let c: Self = serde_json::from_slice(
