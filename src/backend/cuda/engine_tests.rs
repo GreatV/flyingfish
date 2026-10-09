@@ -9,7 +9,6 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
         spec_graph: true,
-        linear_choices: Vec::new(),
         draft_model: None,
         runtime_dir: Some(runtime),
     };
@@ -97,7 +96,6 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Tree16,
         spec_graph: true,
-        linear_choices: Vec::new(),
         draft_model: Some(draft),
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
     };
@@ -219,7 +217,6 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Tree16,
         spec_graph: true,
-        linear_choices: Vec::new(),
         draft_model: Some(PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?)),
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
     };
@@ -310,7 +307,6 @@ fn chain_argmax_matches_single_on_real_logits() -> Result<()> {
             tree_builder: TreeBuilder::Waves,
             spec_budget: SpecBudget::Chain,
             spec_graph: true,
-            linear_choices: Vec::new(),
             draft_model: None,
             runtime_dir: Some(runtime.clone()),
         };

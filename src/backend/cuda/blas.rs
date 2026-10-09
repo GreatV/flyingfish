@@ -171,30 +171,10 @@ impl Blas {
         device: &Device,
         ops: &Ops,
         runtime: &Path,
-        measured: Vec<LinearChoice>,
         closure: Rc<super::closure::Closure>,
     ) -> Result<Self> {
         let stream = device.stream.clone();
         let calibration = linear_calibrate::Environment::new(device, ops, runtime, closure)?;
-        let mut choices = BTreeMap::new();
-        for choice in measured {
-            ensure!(
-                choice.key == calibration.key,
-                "measured linear cache identity mismatch"
-            );
-            ensure!(
-                choice.shape.rows > 0
-                    && choice.shape.output > 0
-                    && choice.shape.input > 0
-                    && choice.median_us.is_finite()
-                    && choice.median_us > 0.0,
-                "invalid measured linear choice"
-            );
-            ensure!(
-                choices.insert(choice.shape, choice).is_none(),
-                "duplicate measured linear shape/M choice"
-            );
-        }
         let decode = CudaBlas::new(stream.clone())?;
         unsafe {
             bs::cublasSetMathMode(
@@ -206,7 +186,7 @@ impl Blas {
         let workspace = stream.alloc_zeros::<u8>(4 * 1024 * 1024)?;
         let handle = lt::create_handle()?;
         Ok(Self {
-            choices: RefCell::new(choices),
+            choices: RefCell::new(BTreeMap::new()),
             coverage: None,
             calibration,
             skinny: cubin::module(&device.ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,

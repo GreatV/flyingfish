@@ -378,7 +378,6 @@ mod tests {
                 tree_builder: TreeBuilder::Waves,
                 spec_budget: budget,
                 spec_graph: true,
-                linear_choices: Vec::new(),
                 draft_model: None,
                 runtime_dir: None,
             },

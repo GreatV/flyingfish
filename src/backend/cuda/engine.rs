@@ -411,13 +411,7 @@ impl Engine {
         }
         let ops = Ops::new(&device.ctx).context("load CUDA operator modules")?;
         eprintln!("{}", serde_json::json!({"backend_device":device.info}));
-        let blas = Blas::new(
-            &device,
-            &ops,
-            &runtime,
-            settings.linear_choices.clone(),
-            closure.clone(),
-        )?;
+        let blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
         let workspace_rows = settings.spec_budget.rows().min(capacity);
         let chunk = workspace_rows;
         let mut work = Work {

@@ -117,8 +117,6 @@ pub struct Settings {
     #[arg(long, global = true, default_value_t = true, action = clap::ArgAction::Set)]
     pub spec_graph: bool,
     #[arg(skip)]
-    pub linear_choices: Vec<setup::LinearChoice>,
-    #[arg(skip)]
     pub draft_model: Option<std::path::PathBuf>,
     #[arg(long, global = true, env = "FLYINGFISH_RUNTIME_DIR")]
     pub runtime_dir: Option<std::path::PathBuf>,
