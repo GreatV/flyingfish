@@ -1,5 +1,5 @@
 use super::{
-    Device, calibrate,
+    Device, blas, calibrate,
     closure::Closure,
     ops::{Ops, grid},
 };
@@ -113,6 +113,7 @@ impl Environment {
     pub fn load(
         &self,
         shape: LinearShape,
+        algo_count: u32,
         launch: impl Fn(&LinearImpl, &mut CudaSlice<bf16>) -> Result<()>,
     ) -> Result<LinearChoice> {
         ensure!(
@@ -126,7 +127,7 @@ impl Environment {
             check(&cache, &self.key, shape)?;
             (cache, true)
         } else {
-            let cache = self.measure(shape, launch)?;
+            let cache = self.measure(shape, algo_count, launch)?;
             check(&cache, &self.key, shape)?;
             let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
             let mut f = std::fs::OpenOptions::new()
@@ -150,31 +151,39 @@ impl Environment {
     fn measure(
         &self,
         shape: LinearShape,
+        algo_count: u32,
         launch: impl Fn(&LinearImpl, &mut CudaSlice<bf16>) -> Result<()>,
     ) -> Result<Cache> {
         self.closure.measurement()?;
         let started = Instant::now();
         let s = &self.stream;
         let mut out = s.alloc_zeros::<bf16>(shape.rows * shape.output)?;
-        launch(&LinearImpl::Cublas, &mut out)?;
+        launch(&LinearImpl::CublasLt(0), &mut out)?;
         let reference = s.clone_dtoh(&out)?;
-        launch(&LinearImpl::Skinny, &mut out)?;
-        let actual = s.clone_dtoh(&out)?;
-        ensure!(
-            reference.iter().chain(&actual).all(|v| v.is_finite()),
-            "nonfinite linear calibration output: {shape:?}"
-        );
         let signal: f64 = reference.iter().map(|v| (v.to_f32() as f64).powi(2)).sum();
-        let error: f64 = actual
-            .iter()
-            .zip(&reference)
-            .map(|(a, b)| (a.to_f32() as f64 - b.to_f32() as f64).powi(2))
-            .sum();
-        let rel_rmse = (error / signal.max(1e-30)).sqrt();
-        ensure!(
-            rel_rmse <= 0.02,
-            "skinny/cuBLAS calibration rel_rmse={rel_rmse} exceeds 0.02 for {shape:?}"
-        );
+        let mut rel_rmse = 0.0f64;
+        for implementation in (1..blas::LT_CANDIDATES.min(algo_count))
+            .map(LinearImpl::CublasLt)
+            .chain([LinearImpl::Skinny])
+        {
+            launch(&implementation, &mut out)?;
+            let actual = s.clone_dtoh(&out)?;
+            ensure!(
+                reference.iter().chain(&actual).all(|v| v.is_finite()),
+                "nonfinite linear calibration output: {shape:?}"
+            );
+            let error: f64 = actual
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a.to_f32() as f64 - b.to_f32() as f64).powi(2))
+                .sum();
+            let candidate = (error / signal.max(1e-30)).sqrt();
+            ensure!(
+                candidate <= 0.02,
+                "{implementation:?} calibration rel_rmse={candidate} exceeds 0.02 for {shape:?}"
+            );
+            rel_rmse = rel_rmse.max(candidate);
+        }
         let count = self.l2_bytes.max(1024 * 1024);
         let mut flush = s.alloc_zeros::<bf16>(count)?;
         let zeros = s.alloc_zeros::<bf16>(count)?;
@@ -190,7 +199,11 @@ impl Environment {
             .ctx
             .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
         let mut trials = Vec::new();
-        for implementation in [LinearImpl::Cublas, LinearImpl::Skinny] {
+        let candidates: Vec<LinearImpl> = (0..blas::LT_CANDIDATES.min(algo_count))
+            .map(LinearImpl::CublasLt)
+            .chain([LinearImpl::Skinny])
+            .collect();
+        for implementation in candidates {
             launch(&implementation, &mut out)?;
             s.synchronize()?;
             s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
@@ -256,20 +269,28 @@ fn check(cache: &Cache, key: &CacheKey, shape: LinearShape) -> Result<()> {
         cache.choice.key == *key && cache.choice.shape == shape,
         "linear cache identity mismatch"
     );
+    let lt_indices: Vec<u32> = cache
+        .trials
+        .iter()
+        .filter_map(|t| match t.implementation {
+            LinearImpl::CublasLt(index) => Some(index),
+            LinearImpl::Skinny | LinearImpl::Candidate(_) => None,
+        })
+        .collect();
     ensure!(
-        cache.trials.len() == 2
-            && cache
-                .trials
+        !lt_indices.is_empty()
+            && lt_indices.len() <= blas::LT_CANDIDATES as usize
+            && lt_indices
                 .iter()
-                .filter(|t| matches!(t.implementation, LinearImpl::Cublas))
-                .count()
-                == 1
+                .enumerate()
+                .all(|(i, &index)| index == i as u32)
             && cache
                 .trials
                 .iter()
                 .filter(|t| matches!(t.implementation, LinearImpl::Skinny))
                 .count()
-                == 1,
+                == 1
+            && cache.trials.len() == lt_indices.len() + 1,
         "linear cache candidate list mismatch"
     );
     ensure!(
@@ -287,8 +308,7 @@ fn check(cache: &Cache, key: &CacheKey, shape: LinearShape) -> Result<()> {
     );
     let best = best(&cache.trials)?;
     ensure!(
-        std::mem::discriminant(&cache.choice.implementation)
-            == std::mem::discriminant(&best.implementation)
+        cache.choice.implementation == best.implementation
             && cache.choice.median_us == best.median_us,
         "linear cache winner mismatch"
     );
@@ -339,11 +359,18 @@ mod tests {
             },
             trials: vec![
                 Trial {
-                    implementation: LinearImpl::Cublas,
+                    implementation: LinearImpl::CublasLt(0),
                     samples: 12,
                     median_us: 20.0,
                     p10_us: 18.0,
                     p90_us: 22.0,
+                },
+                Trial {
+                    implementation: LinearImpl::CublasLt(1),
+                    samples: 12,
+                    median_us: 21.0,
+                    p10_us: 19.0,
+                    p90_us: 23.0,
                 },
                 Trial {
                     implementation: LinearImpl::Skinny,
@@ -365,7 +392,7 @@ mod tests {
                 .to_string()
                 .contains("identity")
         );
-        cache.choice.implementation = LinearImpl::Cublas;
+        cache.choice.implementation = LinearImpl::CublasLt(0);
         assert!(
             check(&cache, &key, shape)
                 .unwrap_err()

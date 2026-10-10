@@ -1,4 +1,50 @@
 use super::{Device, cubin, linear_calibrate, ops::Ops};
+
+/// Uniform number of cuBLASLt heuristic candidates per linear shape: every
+/// shape trials CublasLt(0..LT_CANDIDATES) plus Skinny; calibration picks
+/// per shape. LT-AUTOTUNE (2026-10-09): K=2 captures all measured wins.
+pub const LT_CANDIDATES: u32 = 2;
+
+unsafe fn heuristic_algos(
+    handle: sys::cublasLtHandle_t,
+    desc: sys::cublasLtMatmulDesc_t,
+    a: sys::cublasLtMatrixLayout_t,
+    b: sys::cublasLtMatrixLayout_t,
+    c: sys::cublasLtMatrixLayout_t,
+    pref: sys::cublasLtMatmulPreference_t,
+) -> Result<Vec<sys::cublasLtMatmulHeuristicResult_t>> {
+    let mut results = vec![
+        std::mem::MaybeUninit::<sys::cublasLtMatmulHeuristicResult_t>::uninit();
+        LT_CANDIDATES as usize
+    ];
+    let mut count = 0i32;
+    unsafe {
+        sys::cublasLtMatmulAlgoGetHeuristic(
+            handle,
+            desc,
+            a,
+            b,
+            c,
+            c,
+            pref,
+            LT_CANDIDATES as i32,
+            results.as_mut_ptr().cast(),
+            &mut count,
+        )
+        .result()?;
+    }
+    ensure!(count >= 1, "cuBLASLt returned no algorithm");
+    results.truncate(count as usize);
+    let ok: Vec<sys::cublasLtMatmulHeuristicResult_t> = results
+        .into_iter()
+        .filter_map(|r| {
+            let r = unsafe { r.assume_init() };
+            r.state.result().is_ok().then_some(r)
+        })
+        .collect();
+    ensure!(!ok.is_empty(), "cuBLASLt returned no successful algorithm");
+    Ok(ok)
+}
 use crate::backend::setup::{LinearChoice, LinearImpl, LinearShape};
 use anyhow::{Context, Result, ensure};
 use cudarc::{
@@ -26,6 +72,8 @@ struct Plan {
     c: sys::cublasLtMatrixLayout_t,
     pref: sys::cublasLtMatmulPreference_t,
     algo: Option<sys::cublasLtMatmulAlgo_t>,
+    algo_index: u32,
+    algo_count: usize,
     waves: f32,
     workspace: usize,
 }
@@ -69,6 +117,7 @@ impl Plan {
         output: usize,
         input: usize,
         workspace: usize,
+        algo_index: u32,
     ) -> Result<Self> {
         let mut p = Self {
             desc: std::ptr::null_mut(),
@@ -77,6 +126,8 @@ impl Plan {
             c: std::ptr::null_mut(),
             pref: std::ptr::null_mut(),
             algo: None,
+            algo_index: 0,
+            algo_count: 0,
             waves: 0.0,
             workspace: 0,
         };
@@ -109,12 +160,19 @@ impl Plan {
                 (&workspace as *const usize).cast(),
                 size_of::<usize>(),
             )?;
-            let heuristic =
-                lt::get_matmul_algo_heuristic(handle, p.desc, p.a, p.b, p.c, p.c, p.pref)?;
+            let algos = heuristic_algos(handle, p.desc, p.a, p.b, p.c, p.pref)?;
+            ensure!(
+                (algo_index as usize) < algos.len(),
+                "Lt heuristic returned {} algos; index {algo_index} unavailable",
+                algos.len()
+            );
+            p.algo_count = algos.len();
+            let heuristic = &algos[algo_index as usize];
             heuristic.state.result()?;
             p.waves = heuristic.wavesCount;
             p.workspace = heuristic.workspaceSize;
             p.algo = Some(heuristic.algo);
+            p.algo_index = algo_index;
         }
         let split_k =
             p.attr(sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?;
@@ -159,7 +217,7 @@ pub struct Blas {
     coverage: Option<(usize, std::collections::BTreeSet<(usize, usize)>)>,
     calibration: linear_calibrate::Environment,
     skinny: CudaFunction,
-    plans: BTreeMap<(usize, usize, usize), Plan>,
+    plans: RefCell<BTreeMap<(usize, usize, usize, u32), Plan>>,
     handle: sys::cublasLtHandle_t,
     decode: CudaBlas,
     workspace: CudaSlice<u8>,
@@ -190,7 +248,7 @@ impl Blas {
             coverage: None,
             calibration,
             skinny: cubin::module(&device.ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,
-            plans: BTreeMap::new(),
+            plans: RefCell::new(BTreeMap::new()),
             handle,
             decode,
             workspace,
@@ -212,13 +270,51 @@ impl Blas {
         Ok(())
     }
     pub fn prepare(&mut self, rows: usize, output: usize, input: usize) -> Result<()> {
-        if rows > 1 && !self.plans.contains_key(&(rows, output, input)) {
-            let p = Plan::new(self.handle, rows, output, input, self.workspace.len())
-                .with_context(|| format!("Lt plan rows={rows} output={output} input={input}"))?;
+        self.prepare_with(rows, output, input, 0)
+    }
+
+    pub fn prepare_with(
+        &self,
+        rows: usize,
+        output: usize,
+        input: usize,
+        algo_index: u32,
+    ) -> Result<()> {
+        if rows > 1
+            && !self
+                .plans
+                .borrow()
+                .contains_key(&(rows, output, input, algo_index))
+        {
+            let p = Plan::new(
+                self.handle,
+                rows,
+                output,
+                input,
+                self.workspace.len(),
+                algo_index,
+            )
+            .with_context(|| format!("Lt plan rows={rows} output={output} input={input}"))?;
             p.describe(rows, output, input)?;
-            self.plans.insert((rows, output, input), p);
+            self.plans
+                .borrow_mut()
+                .insert((rows, output, input, algo_index), p);
         }
         Ok(())
+    }
+
+    pub fn lt_algo_count(&self, rows: usize, output: usize, input: usize) -> Result<u32> {
+        if rows <= 1 {
+            return Ok(1);
+        }
+        self.prepare_with(rows, output, input, 0)?;
+        let count = self
+            .plans
+            .borrow()
+            .get(&(rows, output, input, 0))
+            .context("Lt plan missing")?
+            .algo_count;
+        Ok(count as u32)
     }
 
     pub fn linear(
@@ -249,16 +345,18 @@ impl Blas {
                 "linear shape outside cuBLAS-only coverage: {shape:?}"
             );
         }
+        let mut algo = 0u32;
         if let Some(choice) = self.choices.borrow().get(&shape) {
             match &choice.implementation {
-                LinearImpl::Cublas => {}
+                LinearImpl::CublasLt(index) => algo = *index,
                 LinearImpl::Skinny => return self.skinny(w, x, y, shape),
                 LinearImpl::Candidate(name) => {
                     anyhow::bail!("linear candidate {name} has not been registered for {shape:?}")
                 }
             }
         }
-        self.cublas(w, x, y, rows, output, input)
+        self.prepare_with(rows, output, input, algo)?;
+        self.cublas(w, x, y, shape, algo)
     }
 
     pub fn calibrate_shape(
@@ -269,12 +367,16 @@ impl Blas {
     ) -> Result<()> {
         linear_calibrate::check_extent(shape, w.len(), x.len())?;
         self.prepare(shape.rows, shape.output, shape.input)?;
+        let algos = self.lt_algo_count(shape.rows, shape.output, shape.input)?;
         let (rows, output, input) = (shape.rows, shape.output, shape.input);
         {
-            let choice = self.calibration.load(shape, |implementation, out| {
+            let choice = self.calibration.load(shape, algos, |implementation, out| {
                 let mut y = out.slice_mut(..rows * output);
                 match implementation {
-                    LinearImpl::Cublas => self.cublas(w, x, &mut y, rows, output, input),
+                    LinearImpl::CublasLt(algo) => {
+                        self.prepare_with(rows, output, input, *algo)?;
+                        self.cublas(w, x, &mut y, shape, *algo)
+                    }
                     LinearImpl::Skinny => self.skinny(w, x, &mut y, shape),
                     LinearImpl::Candidate(name) => {
                         anyhow::bail!("unknown linear candidate {name}")
@@ -285,6 +387,7 @@ impl Blas {
         }
         Ok(())
     }
+
     fn skinny(
         &self,
         w: &impl DevicePtr<bf16>,
@@ -336,10 +439,14 @@ impl Blas {
         w: &impl DevicePtr<bf16>,
         x: &CudaView<'_, bf16>,
         y: &mut CudaViewMut<'_, bf16>,
-        rows: usize,
-        output: usize,
-        input: usize,
+        shape: LinearShape,
+        algo_index: u32,
     ) -> Result<()> {
+        let LinearShape {
+            rows,
+            output,
+            input,
+        } = shape;
         if rows == 1 {
             let cfg = GemmConfig {
                 transa: bs::cublasOperation_t::CUBLAS_OP_T,
@@ -357,9 +464,9 @@ impl Blas {
                 self.decode.gemm(cfg, w, x, y)?;
             }
         } else {
-            let p = self
-                .plans
-                .get(&(rows, output, input))
+            let plans = self.plans.borrow();
+            let p = plans
+                .get(&(rows, output, input, algo_index))
                 .context("Lt shape was not prepared")?;
             let (a, _ra) = w.device_ptr(&self.stream);
             let (b, _rb) = x.device_ptr(&self.stream);
@@ -395,7 +502,7 @@ impl Blas {
 impl Drop for Blas {
     fn drop(&mut self) {
         drop_result("synchronize BLAS stream", self.stream.synchronize());
-        self.plans.clear();
+        self.plans.borrow_mut().clear();
         unsafe {
             drop_result("destroy Lt handle", lt::destroy_handle(self.handle));
         }
