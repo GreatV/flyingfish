@@ -806,10 +806,6 @@ extern "C" __global__ void tcmqa_phase2_short_host(
                           o_tok_stride, o_head_stride);
 }
 
-#undef FD_GUARD_P1
-#undef FD_GUARD_P1W
-#undef FD_GUARD_P2
-
 // ---------------------------------------------- reduced-smem wide entry ----
 // Reduced-shared-memory wide variant: Q and K tiles lose the +8 element row
 // padding (both stay 16-byte aligned, since DH = 128 elements = 256 B), the V
@@ -841,6 +837,7 @@ extern "C" __global__ void __launch_bounds__(256) tcmqa_phase1_ws(
     int q_tok_stride, int q_head_stride,
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride,
     int chunk, const unsigned long long* __restrict__ anc) {
+  FD_GUARD_P1W;
   tcmqa_phase1_entry_ws(q, k, v, scratch, anc, *len_dev, M, chunk,
                         q_tok_stride, q_head_stride,
                         k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
@@ -853,7 +850,12 @@ extern "C" __global__ void __launch_bounds__(256) tcmqa_phase1_ws_host(
     int q_tok_stride, int q_head_stride,
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride,
     int chunk, const unsigned long long* __restrict__ anc) {
+  FD_GUARD_P1W;
   tcmqa_phase1_entry_ws(q, k, v, scratch, anc, L, M, chunk,
                         q_tok_stride, q_head_stride,
                         k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
 }
+
+#undef FD_GUARD_P1
+#undef FD_GUARD_P1W
+#undef FD_GUARD_P2
