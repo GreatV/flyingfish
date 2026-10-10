@@ -18,27 +18,32 @@ unsafe fn heuristic_algos(
         LT_CANDIDATES as usize
     ];
     let mut count = 0i32;
-    sys::cublasLtMatmulAlgoGetHeuristic(
-        handle,
-        desc,
-        a,
-        b,
-        c,
-        c,
-        pref,
-        LT_CANDIDATES as i32,
-        results.as_mut_ptr().cast(),
-        &mut count,
-    )
-    .result()?;
+    unsafe {
+        sys::cublasLtMatmulAlgoGetHeuristic(
+            handle,
+            desc,
+            a,
+            b,
+            c,
+            c,
+            pref,
+            LT_CANDIDATES as i32,
+            results.as_mut_ptr().cast(),
+            &mut count,
+        )
+        .result()?;
+    }
     ensure!(count >= 1, "cuBLASLt returned no algorithm");
     results.truncate(count as usize);
-    Ok(unsafe {
-        std::mem::transmute::<
-            Vec<std::mem::MaybeUninit<sys::cublasLtMatmulHeuristicResult_t>>,
-            Vec<sys::cublasLtMatmulHeuristicResult_t>,
-        >(results)
-    })
+    let ok: Vec<sys::cublasLtMatmulHeuristicResult_t> = results
+        .into_iter()
+        .filter_map(|r| {
+            let r = unsafe { r.assume_init() };
+            r.state.result().is_ok().then_some(r)
+        })
+        .collect();
+    ensure!(!ok.is_empty(), "cuBLASLt returned no successful algorithm");
+    Ok(ok)
 }
 use crate::backend::setup::{LinearChoice, LinearImpl, LinearShape};
 use anyhow::{Context, Result, ensure};
@@ -155,7 +160,7 @@ impl Plan {
                 (&workspace as *const usize).cast(),
                 size_of::<usize>(),
             )?;
-            let algos = unsafe { heuristic_algos(handle, p.desc, p.a, p.b, p.c, p.pref)? };
+            let algos = heuristic_algos(handle, p.desc, p.a, p.b, p.c, p.pref)?;
             ensure!(
                 (algo_index as usize) < algos.len(),
                 "Lt heuristic returned {} algos; index {algo_index} unavailable",
@@ -351,7 +356,7 @@ impl Blas {
             }
         }
         self.prepare_with(rows, output, input, algo)?;
-        self.cublas(w, x, y, rows, output, input, algo)
+        self.cublas(w, x, y, shape, algo)
     }
 
     pub fn calibrate_shape(
@@ -370,7 +375,7 @@ impl Blas {
                 match implementation {
                     LinearImpl::CublasLt(algo) => {
                         self.prepare_with(rows, output, input, *algo)?;
-                        self.cublas(w, x, &mut y, rows, output, input, *algo)
+                        self.cublas(w, x, &mut y, shape, *algo)
                     }
                     LinearImpl::Skinny => self.skinny(w, x, &mut y, shape),
                     LinearImpl::Candidate(name) => {
@@ -434,11 +439,14 @@ impl Blas {
         w: &impl DevicePtr<bf16>,
         x: &CudaView<'_, bf16>,
         y: &mut CudaViewMut<'_, bf16>,
-        rows: usize,
-        output: usize,
-        input: usize,
+        shape: LinearShape,
         algo_index: u32,
     ) -> Result<()> {
+        let LinearShape {
+            rows,
+            output,
+            input,
+        } = shape;
         if rows == 1 {
             let cfg = GemmConfig {
                 transa: bs::cublasOperation_t::CUBLAS_OP_T,

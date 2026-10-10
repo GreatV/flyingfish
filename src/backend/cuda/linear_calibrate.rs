@@ -278,9 +278,12 @@ fn check(cache: &Cache, key: &CacheKey, shape: LinearShape) -> Result<()> {
         })
         .collect();
     ensure!(
-        lt_indices.len() >= 1
+        !lt_indices.is_empty()
             && lt_indices.len() <= blas::LT_CANDIDATES as usize
-            && lt_indices.iter().enumerate().all(|(i, &index)| index == i as u32)
+            && lt_indices
+                .iter()
+                .enumerate()
+                .all(|(i, &index)| index == i as u32)
             && cache
                 .trials
                 .iter()
@@ -305,8 +308,7 @@ fn check(cache: &Cache, key: &CacheKey, shape: LinearShape) -> Result<()> {
     );
     let best = best(&cache.trials)?;
     ensure!(
-        std::mem::discriminant(&cache.choice.implementation)
-            == std::mem::discriminant(&best.implementation)
+        cache.choice.implementation == best.implementation
             && cache.choice.median_us == best.median_us,
         "linear cache winner mismatch"
     );
