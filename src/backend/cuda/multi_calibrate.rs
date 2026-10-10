@@ -82,8 +82,9 @@ struct Budget {
     kv_bytes_per_token: usize,
     l2_bytes: usize,
     sms: usize,
-    /// Resident blocks for the V1, Tcmqa and TcmqaW phase-1 families.
-    phase1_resident: [usize; 3],
+    /// Resident phase-1 blocks per SM, one entry per phase-1 body in
+    /// `MultiImpl` order: V1, Tcmqa, TcmqaW, TcmqaWs.
+    phase1_resident: [usize; 4],
     kv_heads: usize,
     warp: usize,
 }
@@ -186,23 +187,21 @@ fn candidates(
             }
         }
     }
-    let chunks = baseline_chunks(bucket, rows);
-    // Each implementation sweeps its baseline seeds plus the two whole-wave
-    // chunks derived from its own tile height and residency.
-    let with_waves = |implementation: MultiImpl| -> Vec<usize> {
-        let mut derived = wave_chunks(
+    // Chunk lattice shared by all phase-1 variants: baseline seeds plus every
+    // variant's whole-wave chunks.
+    let mut chunks: Vec<usize> = baseline_chunks(bucket, rows).to_vec();
+    for implementation in [MultiImpl::Tcmqa, MultiImpl::TcmqaW, MultiImpl::TcmqaWs] {
+        chunks.extend(wave_chunks(
             LENGTHS[bucket],
             rows,
             budget.kv_heads,
             budget,
             implementation,
-        );
-        derived.extend_from_slice(&chunks);
-        derived.sort_unstable();
-        derived.dedup();
-        derived
-    };
-    for chunk in with_waves(MultiImpl::Tcmqa) {
+        ));
+    }
+    chunks.sort_unstable();
+    chunks.dedup();
+    for &chunk in &chunks {
         plans.push(MultiPlan {
             implementation: MultiImpl::Tcmqa,
             launch: AttentionPlan {
@@ -220,9 +219,20 @@ fn candidates(
     // LENGTHS[bucket] * kv_bytes_per_token bytes; the extra 64-row tile re-reads
     // that prefix, so the variant is offered only where it exceeds the device L2.
     if 8 * rows > 64 && LENGTHS[bucket] * budget.kv_bytes_per_token > budget.l2_bytes {
-        for chunk in with_waves(MultiImpl::TcmqaW) {
+        for &chunk in &chunks {
             plans.push(MultiPlan {
                 implementation: MultiImpl::TcmqaW,
+                launch: AttentionPlan {
+                    chunk,
+                    qpack: 8,
+                    threads: 256,
+                    merge_threads: 256,
+                },
+            });
+        }
+        for &chunk in &chunks {
+            plans.push(MultiPlan {
+                implementation: MultiImpl::TcmqaWs,
                 launch: AttentionPlan {
                     chunk,
                     qpack: 8,
@@ -703,7 +713,7 @@ mod long_tests {
             kv_bytes_per_token: 2 * 128 * std::mem::size_of::<bf16>() * 2,
             l2_bytes: 4 << 20,
             sms: 48,
-            phase1_resident: [0, 2, 1],
+            phase1_resident: [0, 2, 1, 2],
             kv_heads: 2,
             warp: 32,
         };
@@ -746,6 +756,24 @@ mod long_tests {
                             original.implementation.phase1_smem_bytes()
                         );
                     }
+                }
+                let mut union: Vec<usize> = baseline_chunks(bucket, rows).to_vec();
+                for variant in [MultiImpl::Tcmqa, MultiImpl::TcmqaW, MultiImpl::TcmqaWs] {
+                    union.extend(wave_chunks(length, rows, budget.kv_heads, budget, variant));
+                }
+                union.sort_unstable();
+                union.dedup();
+                for variant in [MultiImpl::Tcmqa, MultiImpl::TcmqaW, MultiImpl::TcmqaWs] {
+                    let mut offered: Vec<usize> = plans
+                        .iter()
+                        .filter(|p| p.implementation == variant)
+                        .map(|p| p.launch.chunk)
+                        .collect();
+                    offered.sort_unstable();
+                    offered.dedup();
+                    assert!(offered.is_empty() || offered == union);
+                    let own = wave_chunks(length, rows, budget.kv_heads, budget, variant);
+                    assert!(own.iter().all(|chunk| union.contains(chunk)));
                 }
                 let mut trials = Vec::new();
                 for (i, plan) in plans.into_iter().enumerate() {
