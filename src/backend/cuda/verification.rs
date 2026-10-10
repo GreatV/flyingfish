@@ -32,13 +32,14 @@ pub struct Query<'a> {
 
 /// Resident phase-1 blocks per SM, queried from the driver for each loaded
 /// kernel with its real block size and dynamic shared memory. Indexed like
-/// `MultiImpl`: V1, Tcmqa, TcmqaW.
-pub fn phase1_residency(ctx: &Arc<CudaContext>) -> Result<[usize; 3]> {
+/// `MultiImpl`: V1, Tcmqa, TcmqaW, TcmqaWs.
+pub fn phase1_residency(ctx: &Arc<CudaContext>) -> Result<[usize; 4]> {
     let module = cubin::module(ctx, "tcmqa")?;
-    let mut residency = [0usize; 3];
+    let mut residency = [0usize; 4];
     for (implementation, threads, symbol) in [
         (MultiImpl::Tcmqa, 128u32, "tcmqa_phase1"),
         (MultiImpl::TcmqaW, 256, "tcmqa_phase1_w"),
+        (MultiImpl::TcmqaWs, 256, "tcmqa_phase1_ws"),
     ] {
         let first = module.load_function(symbol)?;
         let smem = implementation.phase1_smem_bytes();
@@ -144,7 +145,7 @@ impl Verification {
         let second_smem = (2 * chunks + plan.merge_threads as usize) * 4;
         // TcmqaW's 52,736 B phase-1 tile needs the per-function opt-in set
         // below; phase 2 has no opt-in anywhere, so it stays under 48 KiB.
-        let first_smem_limit = if phase1 == MultiImpl::TcmqaW {
+        let first_smem_limit = if matches!(phase1, MultiImpl::TcmqaW | MultiImpl::TcmqaWs) {
             101 * 1024
         } else {
             48 * 1024
@@ -169,6 +170,7 @@ impl Verification {
             MultiImpl::V1 => format!("flash_decode_mq_phase1_q{}", plan.qpack),
             MultiImpl::Tcmqa | MultiImpl::TcmqaShort => "tcmqa_phase1".to_owned(),
             MultiImpl::TcmqaW | MultiImpl::TcmqaWShort => "tcmqa_phase1_w".to_owned(),
+            MultiImpl::TcmqaWs => "tcmqa_phase1_ws".to_owned(),
         };
         ensure!(
             implementation != MultiImpl::V1 || causal,
@@ -186,8 +188,14 @@ impl Verification {
                 "TCMQA-W requires threads256 and chunk multiple64"
             );
         }
+        if implementation == MultiImpl::TcmqaWs {
+            ensure!(
+                plan.threads == 256 && plan.chunk.is_multiple_of(64),
+                "TCMQA-WS requires threads256 and chunk multiple64"
+            );
+        }
         let first = module.load_function(&symbol)?;
-        if phase1 == MultiImpl::TcmqaW {
+        if matches!(phase1, MultiImpl::TcmqaW | MultiImpl::TcmqaWs) {
             first.set_attribute(
                 cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 implementation.phase1_smem_bytes() as i32,
@@ -367,6 +375,7 @@ impl Verification {
             MultiImpl::V1 => "v1 flash_decode_mq",
             MultiImpl::Tcmqa => "TCMQA",
             MultiImpl::TcmqaW => "TCMQA wide (128-row tile)",
+            MultiImpl::TcmqaWs => "TCMQA wide, reduced smem (128-row tile)",
             MultiImpl::TcmqaShort => "TCMQA short merge",
             MultiImpl::TcmqaWShort => "TCMQA wide (128-row tile), short merge",
         }

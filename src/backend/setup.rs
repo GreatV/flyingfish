@@ -41,6 +41,7 @@ pub enum MultiImpl {
     V1,
     Tcmqa,
     TcmqaW,
+    TcmqaWs,
     TcmqaShort,
     TcmqaWShort,
 }
@@ -63,7 +64,7 @@ impl MultiImpl {
         match self {
             MultiImpl::V1 => 64,
             MultiImpl::Tcmqa | MultiImpl::TcmqaShort => 64,
-            MultiImpl::TcmqaW | MultiImpl::TcmqaWShort => 128,
+            MultiImpl::TcmqaW | MultiImpl::TcmqaWShort | MultiImpl::TcmqaWs => 128,
         }
     }
 
@@ -73,6 +74,7 @@ impl MultiImpl {
             MultiImpl::V1 => 0,
             MultiImpl::Tcmqa | MultiImpl::TcmqaShort => 35328,
             MultiImpl::TcmqaW | MultiImpl::TcmqaWShort => 52736,
+            MultiImpl::TcmqaWs => 50176,
         }
     }
 }
