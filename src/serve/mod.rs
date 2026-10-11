@@ -64,23 +64,54 @@ pub struct Backend {
     vocab_size: usize,
 }
 
+/// Owns admission until the engine has accepted the request.
+pub(super) struct Admission<'a> {
+    backend: &'a Backend,
+    pending: bool,
+}
+
+impl Admission<'_> {
+    fn send(mut self, request: Request, events: tokio_mpsc::Sender<EngineEvent>) -> Result<()> {
+        self.backend
+            .commands
+            .send(EngineCommand::Generate { request, events })
+            .context("engine thread has exited")?;
+        self.pending = false;
+        Ok(())
+    }
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            let mut slot = self
+                .backend
+                .slot
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *slot = Slot::Idle;
+        }
+    }
+}
+
 impl Backend {
+    fn reserve(&self) -> Result<Admission<'_>> {
+        self.slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("slot mutex poisoned"))?
+            .admit()?;
+        Ok(Admission {
+            backend: self,
+            pending: true,
+        })
+    }
+
     pub fn add_request(
         &self,
         request: Request,
         events: tokio_mpsc::Sender<EngineEvent>,
     ) -> Result<()> {
-        self.slot.lock().expect("slot mutex poisoned").admit()?;
-        match self
-            .commands
-            .send(EngineCommand::Generate { request, events })
-        {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                *self.slot.lock().expect("slot mutex poisoned") = Slot::Idle;
-                Err(anyhow::Error::from(error)).context("engine thread has exited")
-            }
-        }
+        self.reserve()?.send(request, events)
     }
 
     pub fn abort(&self) -> Result<()> {
@@ -163,10 +194,11 @@ fn engine_loop(
         match command {
             EngineCommand::Generate { request, events } => {
                 generate_once(&mut model, &options, request, events, &commands);
+                *slot.lock().expect("slot mutex poisoned") = Slot::Idle;
             }
+            // A stale abort must not release a slot held by image preprocessing.
             EngineCommand::Abort => {}
         }
-        *slot.lock().expect("slot mutex poisoned") = Slot::Idle;
     }
 }
 

@@ -535,6 +535,10 @@ fn image_dimensions(bytes: &[u8], mime: Option<&str>) -> Result<(usize, usize)> 
             decoder.set_ignore_text_chunk(true);
             decoder.set_ignore_iccp_chunk(true);
             let reader = decoder.read_info()?;
+            ensure!(
+                reader.info().animation_control.is_none(),
+                "animated PNG not supported"
+            );
             Ok((reader.info().width as usize, reader.info().height as usize))
         }
         ImageFormat::Jpeg => {
@@ -559,6 +563,10 @@ fn decode_png(bytes: &[u8]) -> Result<RgbImage> {
     decoder.set_ignore_text_chunk(true);
     decoder.set_ignore_iccp_chunk(true);
     let mut reader = decoder.read_info()?;
+    ensure!(
+        reader.info().animation_control.is_none(),
+        "animated PNG not supported"
+    );
     let width = reader.info().width as usize;
     let height = reader.info().height as usize;
     let count = checked_pixels(width, height)?;

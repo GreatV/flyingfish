@@ -405,6 +405,7 @@ fn add_request(
     ids: Vec<u32>,
     max_tokens: usize,
     images: Option<super::image::PreparedImages>,
+    admission: Option<super::Admission<'_>>,
 ) -> Result<tokio_mpsc::Receiver<EngineEvent>, Box<Response>> {
     let (event_tx, event_rx) = tokio_mpsc::channel::<EngineEvent>(64);
     let request = Request {
@@ -412,18 +413,21 @@ fn add_request(
         max_new_tokens: max_tokens,
         images,
     };
-    state
-        .backend
-        .add_request(request, event_tx)
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("busy") {
-                Box::new(busy_response())
-            } else {
-                Box::new(error_response(message))
-            }
-        })?;
+    let result = match admission {
+        Some(admission) => admission.send(request, event_tx),
+        None => state.backend.add_request(request, event_tx),
+    };
+    result.map_err(admission_error)?;
     Ok(event_rx)
+}
+
+fn admission_error(error: anyhow::Error) -> Box<Response> {
+    let message = error.to_string();
+    if message.contains("busy") {
+        Box::new(busy_response())
+    } else {
+        Box::new(error_response(message))
+    }
 }
 
 async fn completions(
@@ -448,7 +452,7 @@ async fn completions(
         return *response;
     }
     let prompt_tokens = ids.len();
-    let events = match add_request(&state, ids, max_tokens, None) {
+    let events = match add_request(&state, ids, max_tokens, None, None) {
         Ok(events) => events,
         Err(response) => return *response,
     };
@@ -521,6 +525,7 @@ async fn chat_completions(
         Ok(ids) => ids,
         Err(e) => return bad_request(&format!("tokenize: {e}")),
     };
+    let mut admission = None;
     let images = if images.is_empty() {
         None
     } else {
@@ -538,6 +543,10 @@ async fn chat_completions(
         ) {
             return bad_request(&format!("image input: {error}"));
         }
+        admission = match state.backend.reserve() {
+            Ok(reservation) => Some(reservation),
+            Err(error) => return *admission_error(error),
+        };
         let images = match images
             .into_iter()
             .map(|image| processor.prepare_planned(image))
@@ -558,7 +567,7 @@ async fn chat_completions(
         return *response;
     }
     let prompt_tokens = ids.len();
-    let events = match add_request(&state, ids, max_tokens, images) {
+    let events = match add_request(&state, ids, max_tokens, images, admission) {
         Ok(events) => events,
         Err(response) => return *response,
     };
@@ -975,9 +984,9 @@ mod tests {
         worker.join().unwrap();
     }
 
-    #[tokio::test]
-    async fn multi_image_budget_rejects_before_any_pixel_decode() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("ff-image-budget-{}", std::process::id()));
+    fn image_processor(tag: &str) -> Result<super::super::image::Processor> {
+        let dir =
+            std::env::temp_dir().join(format!("ff-image-header-{tag}-{}", std::process::id()));
         std::fs::create_dir(&dir)?;
         std::fs::write(
             dir.join("config.json"),
@@ -996,6 +1005,146 @@ mod tests {
         )?;
         let processor = super::super::image::Processor::load(&dir)?.context("processor")?;
         std::fs::remove_dir_all(dir)?;
+        Ok(processor)
+    }
+
+    fn image_request_state(
+        slot: Slot,
+        tag: &str,
+    ) -> Result<(Arc<AppState>, mpsc::Receiver<EngineCommand>)> {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(
+                [("[UNK]".into(), 0), ("<|image_pad|>".into(), 248056)]
+                    .into_iter()
+                    .collect(),
+            )
+            .unk_token("[UNK]".into())
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (mut state, commands) = state(
+            Shared::new(tokenizers::Tokenizer::new(model)),
+            "<|image_pad|>".into(),
+            String::new(),
+            256,
+            slot,
+        );
+        Arc::get_mut(&mut state).unwrap().image_processor = Some(image_processor(tag)?);
+        Ok((state, commands))
+    }
+
+    fn pixel_fixture(animated: bool) -> Result<String> {
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            if animated {
+                encoder.set_animated(2, 0)?;
+            }
+            let mut writer = encoder.write_header()?;
+            writer.write_image_data(&[1, 2, 3])?;
+            if animated {
+                writer.write_image_data(&[3, 2, 1])?;
+            }
+        }
+        // Header stays readable, but no frame can be decoded.
+        let idat = png
+            .windows(4)
+            .position(|bytes| bytes == b"IDAT")
+            .context("IDAT")?;
+        png.truncate(idat + 4);
+        Ok(format!("data:image/png;base64,{}", base64::encode(png)))
+    }
+
+    async fn image_response(state: Arc<AppState>, url: &str) -> Response {
+        let request = serde_json::from_value(json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":url}}
+        ]}],"max_tokens":1}))
+        .unwrap();
+        chat_completions(State(state), Json(request)).await
+    }
+
+    #[test]
+    fn admission_guard_releases_on_drop_and_engine_disconnect() -> Result<()> {
+        let (state, commands) = test_state(256, Slot::Idle);
+        let admission = state.backend.reserve()?;
+        assert!(state.backend.reserve().is_err());
+        drop(admission);
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        let admission = state.backend.reserve()?;
+        drop(commands);
+        let (events, _receiver) = tokio_mpsc::channel(1);
+        assert!(
+            admission
+                .send(
+                    Request {
+                        ids: vec![1],
+                        max_new_tokens: 1,
+                        images: None
+                    },
+                    events
+                )
+                .is_err()
+        );
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_image_request_rejects_before_pixel_decode() -> Result<()> {
+        let (state, commands) = image_request_state(Slot::Running, "busy")?;
+        let url = pixel_fixture(false)?;
+        let processor = state.image_processor.as_ref().unwrap();
+        assert_eq!(processor.plan_url(&url)?.feature_rows()?, 64);
+        assert!(processor.prepare_url(&url).is_err());
+        let response = image_response(state.clone(), &url).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(commands.try_recv().is_err());
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Running);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn image_decode_failure_releases_admission() -> Result<()> {
+        let (state, commands) = image_request_state(Slot::Idle, "decode-error")?;
+        let response = image_response(state.clone(), &pixel_fixture(false)?).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let message = body_json(response).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(message.contains("image input:"), "{message}");
+        assert!(commands.try_recv().is_err());
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        // A second reservation proves the failed request did not retain ownership.
+        drop(state.backend.reserve()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn animated_png_rejects_before_frame_decode() -> Result<()> {
+        let (state, commands) = image_request_state(Slot::Idle, "apng")?;
+        let url = pixel_fixture(true)?;
+        let error = super::super::image::load_image(&url)
+            .err()
+            .context("APNG decoded")?;
+        assert_eq!(error.to_string(), "animated PNG not supported");
+        let response = image_response(state.clone(), &url).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("animated PNG not supported")
+        );
+        assert!(commands.try_recv().is_err());
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_image_budget_rejects_before_any_pixel_decode() -> Result<()> {
+        let processor = image_processor("budget")?;
         let mut png = Vec::new();
         {
             let mut encoder = png::Encoder::new(&mut png, 1, 1);
