@@ -281,9 +281,9 @@ fn generate(
 ) -> Result<()> {
     ensure!(count > 0, "max-new-tokens must be positive");
     if let Some(layer) = trace_layer {
-        let config = Config::read(&cli.model)?;
+        let config = flyingfish::model_spec::ModelSpec::read(&cli.model)?;
         ensure!(
-            layer < config.num_hidden_layers,
+            layer < config.layers.len(),
             "trace layer {layer} is outside model"
         );
     }

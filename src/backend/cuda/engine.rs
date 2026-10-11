@@ -21,6 +21,11 @@ use std::{
     time::Instant,
 };
 
+#[path = "engine_qwen.rs"]
+mod qwen;
+#[path = "engine_vision.rs"]
+mod vision_runtime;
+
 fn trace_value(
     trace: &mut Option<Target<'_>>,
     stream: &Arc<CudaStream>,
@@ -59,6 +64,30 @@ pub(crate) struct Work {
     pub(crate) act: CudaSlice<bf16>,
     pub(crate) logits: CudaSlice<bf16>,
     pub(crate) token: CudaSlice<u32>,
+    pub(crate) mixer: Option<MixerWork>,
+}
+
+pub(crate) struct MixerWork {
+    pub(crate) q: CudaSlice<bf16>,
+    pub(crate) gate: CudaSlice<bf16>,
+    pub(crate) ab: CudaSlice<bf16>,
+}
+impl MixerWork {
+    fn new(
+        stream: &Arc<CudaStream>,
+        shape: &crate::work_layout::RowWorkSpec,
+        rows: usize,
+    ) -> Result<Option<Self>> {
+        use crate::work_layout::RowWorkSpec as W;
+        if !shape.extra_mixer {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            q: stream.alloc_zeros(W::elements(rows, shape.mixer)?)?,
+            gate: stream.alloc_zeros(W::elements(rows, shape.mixer)?)?,
+            ab: stream.alloc_zeros(W::elements(rows, shape.ab)?)?,
+        }))
+    }
 }
 
 /// DSpark capture destination for one layer slot.
@@ -68,16 +97,59 @@ struct Capture<'a> {
 }
 
 impl Work {
-    fn grow(&mut self, stream: &Arc<CudaStream>, c: &Config, rows: usize) -> Result<()> {
+    fn new(
+        stream: &Arc<CudaStream>,
+        spec: &crate::model_spec::ModelSpec,
+        rows: usize,
+    ) -> Result<Self> {
+        use crate::work_layout::RowWorkSpec as W;
+        let shape = W::new(spec)?;
+        Ok(Self {
+            ids: stream.alloc_zeros(rows)?,
+            position: stream.alloc_zeros(1)?,
+            length: stream.alloc_zeros(1)?,
+            x: stream.alloc_zeros(W::elements(rows, shape.hidden)?)?,
+            n: stream.alloc_zeros(W::elements(rows, shape.hidden)?)?,
+            qkv: stream.alloc_zeros(W::elements(rows, shape.projection)?)?,
+            attn: stream.alloc_zeros(W::elements(rows, shape.mixer)?)?,
+            out: stream.alloc_zeros(W::elements(rows, shape.hidden)?)?,
+            gu: stream.alloc_zeros(W::elements(
+                rows,
+                shape
+                    .intermediate
+                    .checked_mul(2)
+                    .context("MLP width overflow")?,
+            )?)?,
+            act: stream.alloc_zeros(W::elements(rows, shape.intermediate)?)?,
+            logits: stream.alloc_zeros(spec.vocab as usize)?,
+            token: stream.alloc_zeros(1)?,
+            mixer: MixerWork::new(stream, &shape, rows)?,
+        })
+    }
+    fn grow(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        spec: &crate::model_spec::ModelSpec,
+        rows: usize,
+    ) -> Result<()> {
+        use crate::work_layout::RowWorkSpec as W;
         ensure!(rows >= self.ids.len(), "workspace rows cannot shrink");
+        let shape = W::new(spec)?;
         let ids = stream.alloc_zeros(rows)?;
-        let x = stream.alloc_zeros(rows * c.hidden_size)?;
-        let n = stream.alloc_zeros(rows * c.hidden_size)?;
-        let qkv = stream.alloc_zeros(rows * c.qkv_dim())?;
-        let attn = stream.alloc_zeros(rows * c.hidden_size)?;
-        let out = stream.alloc_zeros(rows * c.hidden_size)?;
-        let gu = stream.alloc_zeros(rows * 2 * c.intermediate_size)?;
-        let act = stream.alloc_zeros(rows * c.intermediate_size)?;
+        let x = stream.alloc_zeros(W::elements(rows, shape.hidden)?)?;
+        let n = stream.alloc_zeros(W::elements(rows, shape.hidden)?)?;
+        let qkv = stream.alloc_zeros(W::elements(rows, shape.projection)?)?;
+        let attn = stream.alloc_zeros(W::elements(rows, shape.mixer)?)?;
+        let out = stream.alloc_zeros(W::elements(rows, shape.hidden)?)?;
+        let gu = stream.alloc_zeros(W::elements(
+            rows,
+            shape
+                .intermediate
+                .checked_mul(2)
+                .context("MLP width overflow")?,
+        )?)?;
+        let act = stream.alloc_zeros(W::elements(rows, shape.intermediate)?)?;
+        let mixer = MixerWork::new(stream, &shape, rows)?;
         self.ids = ids;
         self.x = x;
         self.n = n;
@@ -86,6 +158,7 @@ impl Work {
         self.out = out;
         self.gu = gu;
         self.act = act;
+        self.mixer = mixer;
         Ok(())
     }
 
@@ -292,6 +365,8 @@ enum Graph {
 }
 
 pub struct Engine {
+    #[cfg(test)]
+    capture_fail_after_layer: Option<(usize, usize)>,
     forward_rows: std::collections::BTreeSet<usize>,
     graphs: Vec<Graph>,
     closure: Rc<super::closure::Closure>,
@@ -304,15 +379,19 @@ pub struct Engine {
     profile_rounds: bool,
     runtime: PathBuf,
     spec: Option<Spec>,
+    qwen: Option<qwen::Runtime>,
+    images: Option<vision_runtime::EncodedImages>,
     weights: Weights,
-    kv: Vec<Kv>,
+    state: super::state::StateStore,
+    capture_checkpoint: Option<super::state::StateCheckpoint>,
     work: Work,
     ops: Ops,
     blas: Blas,
-    flash: Flash,
+    flash: Option<Flash>,
     decode: Option<Attention>,
     device: Device,
     config: Config,
+    model_spec: crate::model_spec::ModelSpec,
     capacity: usize,
     chunk: usize,
     workspace_rows: usize,
@@ -349,6 +428,18 @@ impl Engine {
         write: bool,
     ) -> Result<Self> {
         let started = Instant::now();
+        let model_spec = crate::model_spec::ModelSpec::read(dir)?;
+        if model_spec.architecture == crate::model_spec::Architecture::Qwen35Text {
+            return Self::load_qwen(
+                dir,
+                ordinal,
+                capacity,
+                requested_chunk,
+                settings,
+                write,
+                model_spec,
+            );
+        }
         let draft_path = settings.draft_model.clone();
         let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\"'\"'"));
         let runtime_arg = settings
@@ -379,6 +470,7 @@ impl Engine {
         command.push_str(" calibrate");
         let closure = Rc::new(super::closure::Closure::new(write, command));
         let config = Config::read(dir)?;
+        let model_spec = crate::model_spec::ModelSpec::from_llama(&config)?;
         ensure!(
             capacity > 0
                 && capacity <= config.max_position_embeddings
@@ -400,38 +492,27 @@ impl Engine {
         let device = Device::new(ordinal)?;
         let weights = Weights::load(dir, &config, &device).context("load target weights")?;
         let s = &device.stream;
-        let h = config.hidden_size;
-        let f = config.intermediate_size;
-        let mut kv = Vec::new();
-        for _ in 0..config.num_hidden_layers {
-            kv.push(Kv {
-                k: s.alloc_zeros(capacity * config.kv_dim())?,
-                v: s.alloc_zeros(capacity * config.kv_dim())?,
-            });
-        }
+        let state = super::state::StateStore::new(&model_spec, capacity, s)?;
+        let capture_checkpoint = Some(super::state::StateCheckpoint::new(
+            &state,
+            &model_spec,
+            1,
+            s,
+        )?);
         let ops = Ops::new(&device.ctx).context("load CUDA operator modules")?;
         eprintln!("{}", serde_json::json!({"backend_device":device.info}));
         let blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
         let workspace_rows = settings.spec_budget.rows().min(capacity);
         let chunk = workspace_rows;
-        let mut work = Work {
-            ids: s.alloc_zeros(workspace_rows)?,
-            position: s.alloc_zeros(1)?,
-            length: s.alloc_zeros(1)?,
-            x: s.alloc_zeros(workspace_rows * h)?,
-            n: s.alloc_zeros(workspace_rows * h)?,
-            qkv: s.alloc_zeros(workspace_rows * config.qkv_dim())?,
-            attn: s.alloc_zeros(workspace_rows * h)?,
-            out: s.alloc_zeros(workspace_rows * h)?,
-            gu: s.alloc_zeros(workspace_rows * 2 * f)?,
-            act: s.alloc_zeros(workspace_rows * f)?,
-            logits: s.alloc_zeros(config.vocab_size)?,
-            token: s.alloc_zeros(1)?,
-        };
+        let mut work = Work::new(s, &model_spec, workspace_rows)?;
         s.memcpy_htod(&[1i32], &mut work.length)?;
         let flash = Flash::new(s.clone(), workspace_rows, config.num_attention_heads)?;
         s.synchronize()?;
         let mut engine = Self {
+            #[cfg(test)]
+            capture_fail_after_layer: None,
+            qwen: None,
+            images: None,
             forward_rows: std::collections::BTreeSet::new(),
             graphs: Vec::new(),
             closure,
@@ -445,14 +526,16 @@ impl Engine {
             spec: None,
             graph: None,
             weights,
-            kv,
+            state,
+            capture_checkpoint,
             work,
             ops,
             blas,
-            flash,
+            flash: Some(flash),
             decode: None,
             device,
             config,
+            model_spec,
             capacity,
             chunk,
             workspace_rows,
@@ -499,7 +582,7 @@ impl Engine {
                     Some(super::tree::State::new(
                         &engine.device,
                         &engine.config,
-                        &engine.kv,
+                        &engine.state.kv,
                         engine.capacity,
                         rows,
                     )?)
@@ -531,6 +614,7 @@ impl Engine {
         engine.device.stream.synchronize()?;
         let (free, total) = engine.device.ctx.mem_get_info()?;
         let kv_bytes: usize = engine
+            .state
             .kv
             .iter()
             .map(|kv| (kv.k.len() + kv.v.len()) * size_of::<bf16>())
@@ -551,7 +635,8 @@ impl Engine {
         let old_chunk = self.chunk;
         ensure!(rows >= old_rows, "workspace cannot shrink during load");
         if rows != old_rows {
-            self.work.grow(&self.device.stream, &self.config, rows)?;
+            self.work
+                .grow(&self.device.stream, &self.model_spec, rows)?;
             if let Some(spec) = &mut self.spec {
                 spec.draft.grow(&self.config, rows)?;
                 spec.capture = self
@@ -561,11 +646,11 @@ impl Engine {
             }
         }
         if rows != old_rows || chunk != old_chunk {
-            self.flash = Flash::new(
+            self.flash = Some(Flash::new(
                 self.device.stream.clone(),
                 rows,
                 self.config.num_attention_heads,
-            )?;
+            )?);
         }
         self.workspace_rows = rows;
         self.chunk = chunk;
@@ -582,7 +667,7 @@ impl Engine {
             requested_chunk,
             free,
             total,
-            Flash::tile()?,
+            Flash::tile(self.config.head_dim)?,
             self.spec.is_some(),
         )?;
         let rows = self.spec_budget.workspace_rows(plan.chunk);
@@ -609,6 +694,9 @@ impl Engine {
     }
 
     fn ensure_decode(&mut self) -> Result<()> {
+        if self.qwen.is_some() {
+            return Ok(());
+        }
         if self.decode.is_some() {
             return Ok(());
         }
@@ -647,7 +735,7 @@ impl Engine {
             device: &self.device,
             config: &self.config,
             weights: &self.weights,
-            kv: &mut self.kv,
+            kv: &mut self.state.kv,
             work: &mut self.work,
             capacity: self.capacity,
             head_stride: self.capacity * self.config.head_dim,
@@ -709,6 +797,10 @@ impl Engine {
         Ok(())
     }
     pub fn check_ready(&self) -> Result<()> {
+        ensure!(
+            !self.poisoned,
+            "engine state is poisoned; reset/reload is required"
+        );
         self.closure.assert_ready()?;
         self.check_graphs()
     }
@@ -717,6 +809,9 @@ impl Engine {
     }
 
     fn prepare(&mut self, rows: usize) -> Result<()> {
+        if self.qwen.is_some() {
+            return self.prepare_qwen(rows);
+        }
         let c = &self.config;
         for (o, i) in [
             (c.qkv_dim(), c.hidden_size),
@@ -770,6 +865,12 @@ impl Engine {
     }
 
     fn check_step(&self, step: crate::backend::Step<'_>) -> Result<()> {
+        if self.qwen.is_some() {
+            ensure!(
+                matches!(step.mask, crate::backend::Mask::Causal) && step.head != Head::All,
+                "Q38 only supports causal text forward with optional last-row head"
+            );
+        }
         let linear_rows = if matches!(step.mask, crate::backend::Mask::Tree { .. }) {
             self.spec_budget.rows()
         } else {
@@ -817,6 +918,18 @@ impl Engine {
     }
 
     pub fn run_step(
+        &mut self,
+        step: crate::backend::Step<'_>,
+        trace: Option<Target<'_>>,
+    ) -> Result<()> {
+        let result = self.run_step_inner(step, trace);
+        if self.qwen.is_some() && result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn run_step_inner(
         &mut self,
         step: crate::backend::Step<'_>,
         mut trace: Option<Target<'_>>,
@@ -873,7 +986,7 @@ impl Engine {
                 .as_mut()
                 .context("tree attention requires draft State")?;
             let tree = spec.tree.as_ref().context("tree State is not enabled")?;
-            let kv = &self.kv[layer];
+            let kv = &self.state.kv[layer];
             return spec
                 .tree_attention
                 .as_mut()
@@ -891,6 +1004,7 @@ impl Engine {
                             q_heads: self.config.num_attention_heads,
                             kv_heads: self.config.num_key_value_heads,
                             capacity: self.capacity,
+                            head_dim: self.config.head_dim,
                             causal: false,
                         },
                     },
@@ -901,7 +1015,7 @@ impl Engine {
             self.ensure_decode()?;
         }
         let w = &mut self.work;
-        let kv = &self.kv[layer];
+        let kv = &self.state.kv[layer];
         let c = &self.config;
         if step.input == crate::backend::Input::Token {
             self.decode
@@ -922,6 +1036,7 @@ impl Engine {
                 q_heads: c.num_attention_heads,
                 kv_heads: c.num_key_value_heads,
                 capacity: self.capacity,
+                head_dim: c.head_dim,
                 causal: true,
             };
             if step.head == Head::All {
@@ -933,7 +1048,17 @@ impl Engine {
                     .context("verification attention has not been initialized")?
                     .run(&w.qkv, &kv.k, &kv.v, &mut w.attn, &w.position, shape)
             } else {
-                self.flash.run(&w.qkv, &kv.k, &kv.v, &mut w.attn, shape)
+                self.flash
+                    .as_mut()
+                    .context("Llama prefill attention is not bound")?
+                    .run(
+                        &w.qkv,
+                        (c.num_attention_heads + 2 * c.num_key_value_heads) * c.head_dim,
+                        &kv.k,
+                        &kv.v,
+                        &mut w.attn,
+                        shape,
+                    )
             }
         }
     }
@@ -985,15 +1110,62 @@ impl Engine {
             layer < self.config.num_hidden_layers,
             "backend layer {layer} is outside model"
         );
-        for op in crate::model::LAYER {
-            self.run_operator(op, layer, step, trace)?;
+        if self.qwen.is_some() {
+            self.qwen_layer_begin(layer, step)?;
+        }
+        for stage in crate::model::layer_program(&self.model_spec, layer)? {
+            match stage {
+                crate::model::LayerStage::Common(op) => {
+                    self.run_operator(op, layer, step, trace)?
+                }
+                crate::model::LayerStage::Mixer(mixer) => {
+                    self.run_mixer(mixer, layer, step, trace)?
+                }
+            }
+        }
+        #[cfg(test)]
+        if let Some((fail_layer, remaining)) = &mut self.capture_fail_after_layer
+            && *fail_layer == layer
+        {
+            *remaining = remaining
+                .checked_sub(1)
+                .context("invalid failure injection countdown")?;
+            ensure!(
+                *remaining != 0,
+                "injected capture failure after layer {layer}"
+            );
         }
         Ok(())
+    }
+
+    fn run_mixer(
+        &mut self,
+        mixer: crate::model_spec::Mixer,
+        layer: usize,
+        step: crate::backend::Step<'_>,
+        trace: &mut Option<Target<'_>>,
+    ) -> Result<()> {
+        use crate::model_spec::{Architecture, Mixer};
+        match (self.model_spec.architecture, mixer) {
+            (Architecture::Qwen35Text, _) => self.qwen_mixer(layer, step, trace),
+            (Architecture::Llama, Mixer::FullAttention) => {
+                for op in crate::model::LLAMA_MIXER {
+                    self.run_operator(op, layer, step, trace)?;
+                }
+                Ok(())
+            }
+            _ => anyhow::bail!(
+                "mixer {mixer:?} has no bound layer runtime; Q38 setup is not complete"
+            ),
+        }
     }
 
     pub fn run_decode_step(&mut self, trace: Option<Target<'_>>) -> Result<()> {
         self.ensure_decode()?;
         self.forward(1, true, true, trace)?;
+        if self.qwen.is_some() {
+            return self.qwen_advance();
+        }
         self.work.advance(&self.ops, &self.device.stream)
     }
 
@@ -1009,6 +1181,9 @@ impl Engine {
             i < self.config.num_hidden_layers,
             "backend operator layer {i} is outside model"
         );
+        if self.qwen.is_some() {
+            return self.qwen_operator(op, i, step, trace);
+        }
         let is_tree = matches!(step.mask, crate::backend::Mask::Tree { .. });
         if is_tree && matches!(op, crate::backend::Operator::RopeKv) {
             let tree = self
@@ -1018,7 +1193,7 @@ impl Engine {
                 .tree
                 .as_ref()
                 .context("tree State is not enabled")?;
-            let kv = &mut self.kv[i];
+            let kv = &mut self.state.kv[i];
             return tree.rope_kv(&mut self.work.qkv, &mut kv.k, &mut kv.v);
         }
         let rows = if is_tree {
@@ -1107,7 +1282,7 @@ impl Engine {
             crate::backend::Operator::RopeKv => unsafe {
                 // Fused rotation + KV write: one launch over rows x 20 heads x
                 // (head_dim/2) element pairs, replacing (rope, kv_write).
-                let kv = &mut self.kv[i];
+                let kv = &mut self.state.kv[i];
                 s.launch_builder(&self.ops.rope_kv)
                     .arg(&mut w.qkv)
                     .arg(&mut kv.k)
@@ -1306,8 +1481,11 @@ impl Engine {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        self.poisoned = true;
         self.device.stream.synchronize()?;
-        self.poisoned = false;
+        self.images = None;
+        self.reset_qwen_positions()?;
+        self.state.reset(&self.device.stream)?;
         if let Some(spec) = self.spec.as_mut() {
             spec.active_rows = 0;
         }
@@ -1318,6 +1496,7 @@ impl Engine {
         self.device
             .stream
             .memcpy_htod(&[1i32], &mut self.work.length)?;
+        self.poisoned = false;
         Ok(())
     }
 
@@ -1345,6 +1524,15 @@ impl Engine {
             "tree transaction failed; reset/reload is required"
         );
         ensure!(!ids.is_empty(), "empty input token ids");
+        let all_layers = trace.as_ref().is_some_and(|t| t.all_layers);
+        ensure!(
+            !all_layers
+                || (self.qwen.is_some()
+                    && self.position == 0
+                    && ids.len() <= self.chunk
+                    && keep == ids.len()),
+            "all-layer trace requires one complete Qwen prefill from position zero"
+        );
         ensure!(
             self.position + ids.len() <= self.capacity,
             "prefill exceeds KV capacity"
@@ -1360,13 +1548,25 @@ impl Engine {
             let skip = trace_start.saturating_sub(self.position).min(chunk.len());
             let selected = trace.is_some() && skip < chunk.len();
             self.prepare(chunk.len())?;
+            if self.qwen.is_some() {
+                self.state.set_sequence(
+                    &self.device.stream,
+                    self.position as u32,
+                    chunk.len() as u32,
+                    self.workspace_rows as u32,
+                )?;
+            }
             self.device
                 .stream
                 .memcpy_htod(chunk, &mut self.work.ids.slice_mut(..chunk.len()))?;
             self.device
                 .stream
                 .memcpy_htod(&[self.position as i32], &mut self.work.position)?;
-            let prefix = format!("prefill.{part}");
+            let prefix = if all_layers {
+                "layer".to_owned()
+            } else {
+                format!("prefill.{part}")
+            };
             self.forward(
                 chunk.len(),
                 false,
@@ -1395,6 +1595,14 @@ impl Engine {
         self.device
             .stream
             .memcpy_htod(&[(self.position + 1) as i32], &mut self.work.length)?;
+        if self.qwen.is_some() && self.position < self.capacity {
+            self.state.set_sequence(
+                &self.device.stream,
+                self.position as u32,
+                1,
+                self.workspace_rows as u32,
+            )?;
+        }
         self.token()
     }
 
@@ -1414,10 +1622,15 @@ impl Engine {
             "graph tracing is unsupported; use eager tracing"
         );
         if graph {
-            self.graph
+            let result = self
+                .graph
                 .as_ref()
                 .context("decode graph is not captured")?
-                .launch()?;
+                .launch();
+            if let Err(error) = result {
+                self.poisoned = true;
+                return Err(error.into());
+            }
         } else {
             self.run_decode_step(trace.map(|(trace, prefix)| Target {
                 trace,
@@ -1440,6 +1653,10 @@ impl Engine {
 
     pub fn rewind(&mut self, position: usize, token: u32) -> Result<()> {
         ensure!(
+            self.qwen.is_none(),
+            "Q38 rewind requires a committed GDN checkpoint; scalar rewind is unsupported"
+        );
+        ensure!(
             position <= self.position,
             "rewind position exceeds current cache length"
         );
@@ -1457,7 +1674,7 @@ impl Engine {
     }
 
     pub fn weight_bytes(&self) -> usize {
-        self.weights.bytes
+        self.weights.bytes + self.qwen.as_ref().map_or(0, qwen::Runtime::vision_bytes)
     }
 
     pub fn decode_weight_bytes(&self) -> usize {
@@ -1466,7 +1683,7 @@ impl Engine {
     }
 
     pub fn kv_read_bytes(&self, tokens: usize) -> usize {
-        2 * self.config.num_hidden_layers * tokens * self.config.kv_dim() * size_of::<bf16>()
+        2 * self.state.kv.len() * tokens * self.config.kv_dim() * size_of::<bf16>()
     }
 
     pub fn capture(&mut self) -> Result<()> {
@@ -1483,36 +1700,54 @@ impl Engine {
             self.position < self.capacity,
             "graph capture exceeds KV capacity"
         );
-        let saved = self.token()?;
-        let saved_position = self.device.stream.clone_dtoh(&self.work.position)?;
-        let saved_length = self.device.stream.clone_dtoh(&self.work.length)?;
-        self.run_decode_step(None)?;
-        self.device.stream.synchronize()?;
-        self.device
-            .stream
-            .memcpy_htod(&saved_position, &mut self.work.position)?;
-        self.device
-            .stream
-            .memcpy_htod(&saved_length, &mut self.work.length)?;
-        self.device
-            .stream
-            .memcpy_htod(&[saved], &mut self.work.token)?;
-        self.device.stream.synchronize()?;
-        self.device
-            .stream
-            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-        let result = (|| -> Result<()> {
+        ensure!(!self.poisoned, "capture requires healthy engine state");
+        let s = self.device.stream.clone();
+        let saved_position = s.clone_dtoh(&self.work.position)?;
+        let saved_length = s.clone_dtoh(&self.work.length)?;
+        let mut checkpoint = self
+            .capture_checkpoint
+            .take()
+            .context("capture checkpoint missing")?;
+        let result = (|| -> Result<CudaGraph> {
+            checkpoint.save(&self.state, &self.work.token, self.position, &s)?;
             self.run_decode_step(None)?;
+            s.synchronize()?;
+            checkpoint.restore(&mut self.state, &mut self.work.token, &s)?;
+            s.memcpy_htod(&saved_position, &mut self.work.position)?;
+            s.memcpy_htod(&saved_length, &mut self.work.length)?;
+            s.synchronize()?;
+            s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            let launches = self.run_decode_step(None);
+            // End capture even when a host-side launch check fails.
+            let captured = s.end_capture(sys::CUgraphInstantiate_flags(0));
+            launches?;
+            let graph = captured?.context("empty decode graph")?;
+            graph.upload()?;
+            s.synchronize()?;
+            Ok(graph)
+        })();
+        let restored = (|| -> Result<()> {
+            checkpoint.restore(&mut self.state, &mut self.work.token, &s)?;
+            s.memcpy_htod(&saved_position, &mut self.work.position)?;
+            s.memcpy_htod(&saved_length, &mut self.work.length)?;
+            s.synchronize()?;
             Ok(())
         })();
-        let graph = self
-            .device
-            .stream
-            .end_capture(sys::CUgraphInstantiate_flags(0));
-        result?;
-        self.graph = Some(graph?.context("empty decode graph")?);
-        self.graph.as_ref().context("missing graph")?.upload()?;
-        self.device.stream.synchronize()?;
+        self.capture_checkpoint = Some(checkpoint);
+        if let Err(error) = restored {
+            self.poisoned = true;
+            return Err(error.context(format!(
+                "capture state restore failed; capture error: {:?}",
+                result.as_ref().err()
+            )));
+        }
+        match result {
+            Ok(graph) => self.graph = Some(graph),
+            Err(error) => {
+                self.poisoned = true;
+                return Err(error.context("decode capture transaction failed"));
+            }
+        }
         Ok(())
     }
 
@@ -1614,6 +1849,9 @@ impl Engine {
     }
 
     pub fn decode_linear(&self) -> &'static str {
+        if self.qwen.is_some() {
+            return "fp8-storage-gemv/fp32-accum; fixed-bf16-lt";
+        }
         self.blas.decode_impl()
     }
 
@@ -1825,8 +2063,8 @@ impl Engine {
     fn tree_gather_scatter(&mut self) -> Result<()> {
         let spec = self.spec.as_mut().context("draft State is not enabled")?;
         let state = spec.tree.as_mut().context("tree State is not enabled")?;
-        state.gather_path(&self.kv, &spec.capture)?;
-        state.scatter(&mut self.kv)
+        state.gather_path(&self.state.kv, &spec.capture)?;
+        state.scatter(&mut self.state.kv)
     }
 
     fn capture_tree_commit(&mut self) -> Result<()> {
@@ -1936,7 +2174,7 @@ impl Engine {
         );
         let d = self.config.head_dim;
         let values = vec![bf16::NAN; (budget - n) * d];
-        for kv in &mut self.kv {
+        for kv in &mut self.state.kv {
             for head in 0..self.config.num_key_value_heads {
                 let lo = (head * self.capacity + tree.prefix() + n) * d;
                 self.device
@@ -2085,7 +2323,7 @@ impl Engine {
         );
         let mut result = Vec::new();
         let d = self.config.head_dim;
-        for layer in &self.kv {
+        for layer in &self.state.kv {
             for data in [&layer.k, &layer.v] {
                 for head in 0..self.config.num_key_value_heads {
                     for &row in path {
@@ -2720,7 +2958,7 @@ impl Engine {
         super::copy::bits(s, &spec.logits, &mut out)?;
         spec.draft.state_bits(start, rows, &mut out)?;
         let d = self.config.head_dim;
-        for kv in &self.kv {
+        for kv in &self.state.kv {
             for head in 0..self.config.num_key_value_heads {
                 let lo = (head * self.capacity + start) * d;
                 let hi = lo + rows * d;
@@ -2814,7 +3052,7 @@ impl Engine {
         );
         let c = &self.config;
         let mut output = Vec::new();
-        for layer in &self.kv {
+        for layer in &self.state.kv {
             for buffer in [&layer.k, &layer.v] {
                 for head in 0..c.num_key_value_heads {
                     let values = self.device.stream.clone_dtoh(&buffer.slice(
@@ -3092,7 +3330,7 @@ impl Engine {
         } else {
             1
         };
-        for kv in &mut self.kv {
+        for kv in &mut self.state.kv {
             for head in 0..self.config.num_key_value_heads {
                 let lo = head * self.capacity * self.config.head_dim;
                 let end = lo + rows * self.config.head_dim;

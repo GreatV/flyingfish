@@ -8,6 +8,13 @@ use std::path::Path;
 
 pub enum Backend {}
 impl Backend {
+    pub fn prefill_multimodal(
+        &mut self,
+        _input: &crate::vision_input::MultimodalInput<'_>,
+        _trace: Option<&mut Trace>,
+    ) -> Result<u32> {
+        match *self {}
+    }
     pub fn check_ready(&self) -> Result<()> {
         match *self {}
     }

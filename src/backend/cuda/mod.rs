@@ -1,20 +1,26 @@
+pub(crate) mod attention_d256;
 pub mod blas;
 pub mod calibrate;
 mod closure;
+pub(crate) mod contracts;
 pub mod copy;
 pub mod cubin;
 pub mod decode;
 pub mod draft;
 pub mod engine;
 pub mod flash;
+pub(crate) mod gdn;
+pub(crate) mod linear;
 mod linear_calibrate;
 mod markov;
 mod markov_calibrate;
 pub mod multi_calibrate;
 pub mod ops;
 pub mod profile;
+pub(crate) mod state;
 pub(crate) mod tree;
 pub mod verification;
+pub(crate) mod vision;
 pub mod weights;
 
 use crate::backend::setup::DeviceInfo;
@@ -88,3 +94,6 @@ impl Device {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod q38_tests;

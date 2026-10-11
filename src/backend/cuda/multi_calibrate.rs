@@ -571,6 +571,7 @@ fn measure(
                 q_heads: 16,
                 kv_heads: 2,
                 capacity,
+                head_dim: 128,
                 causal,
             };
             s.memcpy_htod(&zero_q, &mut q)?;

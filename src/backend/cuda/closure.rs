@@ -251,6 +251,21 @@ impl Closure {
         self.captures.set(self.captures.get() + 1);
         Ok(())
     }
+    /// A fixed operator plan has no measured choices or calibration files.
+    pub fn freeze_fixed(&self) -> Result<()> {
+        ensure!(
+            self.stage.get() == Stage::Setup
+                && self.measurements.get() == 0
+                && self.files.borrow().is_empty(),
+            "fixed plan cannot reuse measured calibration"
+        );
+        self.stage.set(Stage::Frozen);
+        eprintln!(
+            "{}",
+            serde_json::json!({"fixed_operator_closure":{"selection_source":"fixed","measurements":0,"files":0}})
+        );
+        Ok(())
+    }
     pub(super) fn finish(&self, profile: Profile, dir: &Path, key: CacheKey) -> Result<()> {
         ensure!(
             self.stage.get() == Stage::Setup,

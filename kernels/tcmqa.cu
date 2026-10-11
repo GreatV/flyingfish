@@ -128,7 +128,7 @@
 //   smem  = (2*nchunks + threads2) * 4 bytes, <= 48 KB
 // nchunks must be identical in both phases for the same (L, M, chunk).
 //
-// HOST INTEGRATION (Codex-A):
+// Host integration:
 //   - phase-1: grid = dim3(nchunks, 2, ceil(8M/64)), block = 128,
 //     smem = 35328 B (< 48 KB: no cudaFuncSetAttribute opt-in needed).
 //   - phase-1 wide (tcmqa_phase1_w): grid = dim3(nchunks, 2, ceil(8M/128)),

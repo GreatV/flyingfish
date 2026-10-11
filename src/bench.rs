@@ -1,5 +1,6 @@
 use crate::backend;
 use crate::model::Model;
+use crate::model_spec::{Architecture, ModelSpec};
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use std::{path::Path, time::Instant};
@@ -49,7 +50,12 @@ fn event(model: &Model) -> Result<backend::Event> {
     model.event()
 }
 
-fn check(ids: &[u32], s: &Settings) -> Result<()> {
+fn check(dir: &Path, ids: &[u32], s: &Settings) -> Result<()> {
+    let architecture = ModelSpec::read(dir)?.architecture;
+    ensure!(
+        architecture == Architecture::Llama,
+        "benchmark accounting is not implemented for {architecture:?}; only Llama models are supported"
+    );
     ensure!(
         s.dram_gb_s.is_finite() && s.dram_gb_s > 0.0,
         "dram-gb-s must be finite and positive"
@@ -88,7 +94,7 @@ fn warm(model: &mut Model, ids: &[u32], s: &Settings) -> Result<u32> {
 }
 
 pub fn run(dir: &Path, ids: &[u32], s: &Settings) -> Result<()> {
-    check(ids, s)?;
+    check(dir, ids, s)?;
     ensure!(
         s.steps >= 200,
         "benchmark requires at least 200 measured steps per run"
@@ -200,7 +206,7 @@ pub fn run(dir: &Path, ids: &[u32], s: &Settings) -> Result<()> {
 }
 
 pub fn profile(dir: &Path, ids: &[u32], s: &Settings, phase: Phase) -> Result<()> {
-    check(ids, s)?;
+    check(dir, ids, s)?;
     let mut model = Model::load(dir, s.device, s.capacity, s.chunk, s.kernels.clone())?;
     warm(&mut model, ids, s)?;
     if matches!(phase, Phase::Prefill) {
@@ -236,6 +242,48 @@ pub fn profile(dir: &Path, ids: &[u32], s: &Settings, phase: Phase) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_llama_accounting_is_rejected_before_loading_weights() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-bench-accounting-{}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        std::fs::write(
+            dir.join("config.json"),
+            include_bytes!("../tests/data/q38-config.json"),
+        )?;
+        let settings = Settings {
+            device: 0,
+            capacity: 512,
+            dram_gb_s: 1.0,
+            gemm_tflops: 1.0,
+            chunk: None,
+            kernels: backend::Settings {
+                tree_builder: backend::TreeBuilder::Waves,
+                spec_budget: backend::SpecBudget::Chain,
+                spec_graph: false,
+                draft_model: None,
+                runtime_dir: None,
+            },
+            steps: 200,
+            warmup: 0,
+            runs: 1,
+            graph: false,
+        };
+        let results = [
+            run(&dir, &[0], &settings),
+            profile(&dir, &[0], &settings, Phase::Decode),
+            profile(&dir, &[0], &settings, Phase::Prefill),
+        ];
+        std::fs::remove_dir_all(&dir)?;
+        for result in results {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("accounting is not implemented for Qwen35Text"),
+                "{error}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn percentiles_interpolate_short_and_tail_distributions() {

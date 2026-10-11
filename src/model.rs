@@ -51,6 +51,17 @@ impl Model {
         }
         self.backend.prefill(ids, trace)
     }
+    /// Prefill one complete processor-packed image/text prompt after reset.
+    pub fn prefill_multimodal(
+        &mut self,
+        input: &crate::vision_input::MultimodalInput<'_>,
+        mut trace: Option<&mut Trace>,
+    ) -> Result<u32> {
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.set_device(&self.device_info().name)?;
+        }
+        self.backend.prefill_multimodal(input, trace)
+    }
     pub fn prefill_tail(&mut self, ids: &[u32], trace: &mut Trace, keep: usize) -> Result<u32> {
         trace.set_device(&self.device_info().name)?;
         self.backend.prefill_tail(ids, trace, keep)
@@ -147,6 +158,42 @@ pub const LAYER: [crate::backend::Operator; 10] = [
     crate::backend::Operator::Activate,
     crate::backend::Operator::Down,
     crate::backend::Operator::NextNorm,
+];
+
+/// Model-independent layer skeleton. A mixer replaces the four Llama attention steps.
+#[derive(Clone, Copy, Debug)]
+pub enum LayerStage {
+    Common(crate::backend::Operator),
+    Mixer(crate::model_spec::Mixer),
+}
+
+pub fn layer_program(
+    spec: &crate::model_spec::ModelSpec,
+    layer: usize,
+) -> anyhow::Result<[LayerStage; 7]> {
+    use crate::backend::Operator as O;
+    use anyhow::Context;
+    let mixer = spec
+        .layers
+        .get(layer)
+        .context("layer outside model plan")?
+        .mixer;
+    Ok([
+        LayerStage::Common(O::Norm),
+        LayerStage::Mixer(mixer),
+        LayerStage::Common(O::PostNorm),
+        LayerStage::Common(O::GateUp),
+        LayerStage::Common(O::Activate),
+        LayerStage::Common(O::Down),
+        LayerStage::Common(O::NextNorm),
+    ])
+}
+
+pub const LLAMA_MIXER: [crate::backend::Operator; 4] = [
+    crate::backend::Operator::Qkv,
+    crate::backend::Operator::RopeKv,
+    crate::backend::Operator::Attention,
+    crate::backend::Operator::Output,
 ];
 
 impl Model {
