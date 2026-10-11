@@ -40,6 +40,7 @@ extern "C" __global__ void q38_vision_position_add(
             if (index < 0 || index >= 2304 || !isfinite(w)) { __trap(); return; }
             sum = __fadd_rn(sum, __fmul_rn(__bfloat162float(table[uint64_t(index) * 1152 + d]), w));
         }
+        if (!isfinite(sum)) { __trap(); return; }
         interpolated[i] = sum;
         hidden[i] = __hadd(patches[i], __float2bfloat16_rn(sum));
     }

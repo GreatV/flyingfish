@@ -275,6 +275,22 @@ pub struct Blas {
     stream: Arc<CudaStream>,
 }
 
+/// Only the paths that cast dimensions to i32 are bounded here: the M1 legacy
+/// cuBLAS branch and the skinny kernel. The cuBLASLt path passes rows, output
+/// and input as u64/i64 layouts and is not bounded.
+fn checked_dims(rows: usize, output: usize, input: usize) -> Result<()> {
+    ensure!(
+        rows > 0
+            && output > 0
+            && input > 0
+            && rows <= i32::MAX as usize
+            && output <= i32::MAX as usize
+            && input <= i32::MAX as usize,
+        "linear dimensions must fit i32: rows={rows} output={output} input={input}"
+    );
+    Ok(())
+}
+
 impl Blas {
     pub fn new(
         device: &Device,
@@ -453,6 +469,7 @@ impl Blas {
             shape.rows > 0 && shape.rows <= 16 && shape.input.is_multiple_of(256),
             "unsupported skinny GEMM shape: {shape:?}"
         );
+        checked_dims(shape.rows, shape.output, shape.input)?;
         let (wp, _w) = w.device_ptr(&self.stream);
         let (xp, _x) = x.device_ptr(&self.stream);
         let (yp, _y) = y.device_ptr_mut(&self.stream);
@@ -502,6 +519,9 @@ impl Blas {
             input,
         } = shape;
         if rows == 1 {
+            // This branch casts the dimensions to i32; the Lt path below passes
+            // u64/i64 layouts and is unbounded.
+            checked_dims(rows, output, input)?;
             let cfg = GemmConfig {
                 transa: bs::cublasOperation_t::CUBLAS_OP_T,
                 transb: bs::cublasOperation_t::CUBLAS_OP_N,
@@ -788,5 +808,24 @@ impl Blas {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the paths that cast dimensions to i32 are guarded: the M1 legacy cuBLAS
+    /// branch and the skinny kernel. The cuBLASLt path passes rows, output and input
+    /// as u64/i64 and is deliberately unbounded, so a large multi-row shape never
+    /// reaches this check.
+    #[test]
+    fn linear_dimensions_must_fit_i32() {
+        checked_dims(1, 5120, 17408).expect("Q38 M1 shape");
+        checked_dims(16, 17408, 5120).expect("skinny-bounded rows");
+        checked_dims(2048, 17408, 5120).expect("multi-row Lt shape passes the pure check");
+        assert!(checked_dims(1, (i32::MAX as usize) + 1, 17408).is_err());
+        assert!(checked_dims(1, 5120, (i32::MAX as usize) + 1).is_err());
+        assert!(checked_dims(0, 5120, 17408).is_err());
     }
 }
