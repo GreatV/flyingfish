@@ -1,5 +1,6 @@
 pub mod detok;
 pub mod http;
+pub mod image;
 
 use crate::model::Model;
 use crate::spec::{self, Options as SpecOptions, Step};
@@ -13,6 +14,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 pub struct Request {
     pub ids: Vec<u32>,
     pub max_new_tokens: usize,
+    pub images: Option<image::PreparedImages>,
 }
 
 pub enum EngineCommand {
@@ -96,27 +98,26 @@ impl Backend {
     }
 }
 
-fn load_model(target: &Path, draft: Option<&Path>, options: &SpecOptions) -> Result<Model> {
-    let mut settings = options.backend.clone();
-    if let Some(draft) = draft {
-        settings = settings.with_draft(draft);
-    }
+fn load_model(target: &Path, options: &SpecOptions) -> Result<Model> {
     Model::load(
         target,
         options.device,
         options.capacity,
         options.chunk,
-        settings,
+        options.backend.clone(),
     )
 }
 
 pub fn run(
     target: PathBuf,
     draft: Option<PathBuf>,
-    options: SpecOptions,
+    mut options: SpecOptions,
     tokenizer_dir: PathBuf,
     port: u16,
 ) -> Result<()> {
+    if let Some(draft) = &draft {
+        options.backend = options.backend.with_draft(draft);
+    }
     let (command_tx, command_rx) = mpsc::channel::<EngineCommand>();
     let slot = Arc::new(Mutex::new(Slot::Idle));
     let (ready_tx, ready_rx) = mpsc::channel::<Result<usize>>();
@@ -129,7 +130,7 @@ pub fn run(
     let handle = thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
-            let model = match load_model(&target, draft.as_deref(), &engine_options) {
+            let model = match load_model(&target, &engine_options) {
                 Ok(model) => model,
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
@@ -180,22 +181,25 @@ fn generate_once(
         count: request.max_new_tokens,
         ..options.clone()
     };
-    if let Err(error) = spec::check(&request.ids, &run_options) {
+    if let Err(error) = check_request(&request.ids, &run_options) {
         let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
         return;
     }
+    if request.images.is_some() && run_options.backend.draft_model.is_some() {
+        let _ = events.blocking_send(EngineEvent::Failed(
+            "image input does not support a draft model".into(),
+        ));
+        return;
+    }
+    let input_dump = match trace_image_input(&request) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
+            return;
+        }
+    };
     let mut aborted = false;
-    let result = spec::produce_events(model, &request.ids, &run_options, None, &mut |step| {
-        let event = match step {
-            Step::First(token) => EngineEvent::Tokens {
-                ids: vec![token],
-                accepted: 0,
-            },
-            Step::Round(round) => EngineEvent::Tokens {
-                ids: round.output.clone(),
-                accepted: round.accepted,
-            },
-        };
+    let mut on_event = |event| {
         if events.blocking_send(event).is_err() {
             aborted = true;
             return false;
@@ -215,10 +219,44 @@ fn generate_once(
                 false
             }
         }
-    });
+    };
+    let result = if run_options.backend.draft_model.is_some() {
+        spec::produce_events(model, &request.ids, &run_options, None, &mut |step| {
+            on_event(match step {
+                Step::First(token) => EngineEvent::Tokens {
+                    ids: vec![token],
+                    accepted: 0,
+                },
+                Step::Round(round) => EngineEvent::Tokens {
+                    ids: round.output.clone(),
+                    accepted: round.accepted,
+                },
+            })
+        })
+    } else {
+        produce_plain_events(
+            model,
+            &request.ids,
+            request.images.as_ref(),
+            &run_options,
+            &mut |token| {
+                on_event(EngineEvent::Tokens {
+                    ids: vec![token],
+                    accepted: 0,
+                })
+            },
+        )
+    };
     let result = result.and_then(|output| {
         model.check_ready()?;
-        eprintln!("{}", serde_json::json!({"serve_request":{"prefill_ms":output.prefill_ms,"decode_ms":output.decode_ms,"initial_rounds":output.rounds.iter().take(2).collect::<Vec<_>>()}}));
+        let mut record = serde_json::json!({"serve_request":{"prefill_ms":output.prefill_ms,"decode_ms":output.decode_ms,"initial_rounds":output.rounds.iter().take(2).collect::<Vec<_>>()}});
+        if std::env::var("FLYINGFISH_SERVE_TRACE_IDS").is_ok_and(|value| value == "1") {
+            record["serve_request"]["generated_ids"] = serde_json::json!(output.ids);
+            record["serve_request"]["aborted"] = serde_json::json!(aborted);
+            record["serve_request"]["input_ids"] = serde_json::json!(request.ids);
+            record["serve_request"]["image_input"] = serde_json::json!(input_dump);
+        }
+        eprintln!("{record}");
         Ok(output)
     });
     match result {
@@ -245,6 +283,76 @@ fn generate_once(
             let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
         }
     }
+}
+
+fn trace_image_input(request: &Request) -> Result<Option<std::path::PathBuf>> {
+    if !std::env::var("FLYINGFISH_SERVE_TRACE_IDS").is_ok_and(|v| v == "1") {
+        return Ok(None);
+    }
+    let (Some(images), Some(dir)) = (
+        &request.images,
+        std::env::var_os("FLYINGFISH_SERVE_TRACE_INPUT_DIR"),
+    ) else {
+        return Ok(None);
+    };
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!(
+        "image-input-{}-{sequence}.safetensors",
+        std::process::id()
+    ));
+    images.save(&request.ids, &path)?;
+    Ok(Some(path))
+}
+
+fn check_request(ids: &[u32], options: &SpecOptions) -> Result<()> {
+    ensure!(!ids.is_empty(), "prompt must not be empty");
+    if options.backend.draft_model.is_some() {
+        spec::check(ids, options)
+    } else {
+        crate::model::check_generation_capacity(ids.len(), options.count, options.capacity)
+    }
+}
+
+fn produce_plain_events(
+    model: &mut Model,
+    ids: &[u32],
+    images: Option<&image::PreparedImages>,
+    options: &SpecOptions,
+    on_token: &mut dyn FnMut(u32) -> bool,
+) -> Result<spec::Output> {
+    model.reset()?;
+    let output = match images {
+        Some(images) => crate::model::generate_multimodal(
+            model,
+            &images.input(ids),
+            options.count,
+            options.ignore_eos,
+            true,
+            None,
+            on_token,
+        )?,
+        None => crate::model::generate_plain(
+            model,
+            ids,
+            options.count,
+            options.ignore_eos,
+            true,
+            None,
+            on_token,
+        )?,
+    };
+    model.synchronize()?;
+    model.check_logits()?;
+    model.check_ready()?;
+    Ok(spec::Output {
+        ids: output.ids,
+        rounds: Vec::new(),
+        decode_ms: output.decode_ms,
+        prefill_ms: output.prefill_ms,
+    })
 }
 
 #[cfg(test)]

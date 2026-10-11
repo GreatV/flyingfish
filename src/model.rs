@@ -3,8 +3,124 @@ use crate::{
     config::Config,
     trace::Trace,
 };
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use std::path::Path;
+use std::time::Instant;
+
+pub fn check_generation_capacity(prompt: usize, count: usize, capacity: usize) -> Result<()> {
+    ensure!(count > 0, "max-new-tokens must be positive");
+    // Prefill emits the first token; graph capture needs one free KV row.
+    let required = prompt
+        .checked_add((count - 1).max(1))
+        .context("prompt and generation required KV capacity overflows usize")?;
+    ensure!(
+        required <= capacity,
+        "prompt and generation require KV capacity {required}, got {capacity}"
+    );
+    Ok(())
+}
+
+pub struct GenerationOutput {
+    pub ids: Vec<u32>,
+    pub prefill_ms: f64,
+    pub capture_ms: f64,
+    pub decode_ms: f64,
+}
+
+pub fn generate_plain(
+    model: &mut Model,
+    ids: &[u32],
+    count: usize,
+    ignore_eos: bool,
+    graph: bool,
+    trace: Option<&mut Trace>,
+    on_token: &mut dyn FnMut(u32) -> bool,
+) -> Result<GenerationOutput> {
+    generate_input(
+        model,
+        GenerationInput::Text(ids),
+        count,
+        ignore_eos,
+        graph,
+        trace,
+        on_token,
+    )
+}
+
+pub fn generate_multimodal(
+    model: &mut Model,
+    input: &crate::vision_input::MultimodalInput<'_>,
+    count: usize,
+    ignore_eos: bool,
+    graph: bool,
+    trace: Option<&mut Trace>,
+    on_token: &mut dyn FnMut(u32) -> bool,
+) -> Result<GenerationOutput> {
+    generate_input(
+        model,
+        GenerationInput::Image(input),
+        count,
+        ignore_eos,
+        graph,
+        trace,
+        on_token,
+    )
+}
+
+enum GenerationInput<'a> {
+    Text(&'a [u32]),
+    Image(&'a crate::vision_input::MultimodalInput<'a>),
+}
+
+fn generate_input(
+    model: &mut Model,
+    input: GenerationInput<'_>,
+    count: usize,
+    ignore_eos: bool,
+    graph: bool,
+    mut trace: Option<&mut Trace>,
+    on_token: &mut dyn FnMut(u32) -> bool,
+) -> Result<GenerationOutput> {
+    ensure!(count > 0, "max-new-tokens must be positive");
+    let start = Instant::now();
+    let first = match input {
+        GenerationInput::Text(ids) => model.prefill(ids, trace.as_deref_mut())?,
+        GenerationInput::Image(input) => model.prefill_multimodal(input, trace.as_deref_mut())?,
+    };
+    let prefill_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let mut generated = vec![first];
+    let mut running = on_token(first);
+    let capture_start = Instant::now();
+    if running && graph && count > 1 && (ignore_eos || !model.config.eos_token_id.contains(&first))
+    {
+        model.capture()?;
+    }
+    let capture_ms = if graph {
+        capture_start.elapsed().as_secs_f64() * 1000.0
+    } else {
+        0.0
+    };
+    let start = Instant::now();
+    while running
+        && generated.len() < count
+        && (ignore_eos
+            || !model
+                .config
+                .eos_token_id
+                .contains(generated.last().context("generated token missing")?))
+    {
+        let prefix = format!("decode.{}", generated.len() - 1);
+        let token = model.decode(graph, trace.as_deref_mut().map(|t| (t, prefix.as_str())))?;
+        generated.push(token);
+        running = on_token(token);
+    }
+    Ok(GenerationOutput {
+        ids: generated,
+        prefill_ms,
+        capture_ms,
+        decode_ms: start.elapsed().as_secs_f64() * 1000.0,
+    })
+}
 
 pub struct Model {
     backend: Backend,
