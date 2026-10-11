@@ -267,15 +267,30 @@ impl MtpRuntime {
         state: &mut StateStore,
         input: RunInput<'_>,
     ) -> Result<Dump> {
-        self.run_inner(execution, state, input, None, self.plan.phase, true)
+        self.run_inner(
+            execution,
+            state,
+            input,
+            None,
+            self.plan.phase,
+            OutputMode::Predict,
+        )
     }
     fn run_decode(
         &mut self,
         execution: Execution<'_>,
         state: &mut StateStore,
         input: RunInput<'_>,
+        output: OutputMode,
     ) -> Result<Dump> {
-        self.run_inner(execution, state, input, None, ExecutionPhase::Decode, true)
+        self.run_inner(
+            execution,
+            state,
+            input,
+            None,
+            ExecutionPhase::Decode,
+            output,
+        )
     }
     fn run_prefill(
         &mut self,
@@ -298,7 +313,7 @@ impl MtpRuntime {
             },
             Some(hidden),
             ExecutionPhase::Prefill,
-            false,
+            OutputMode::StateOnly,
         )?;
         Ok(())
     }
@@ -309,7 +324,7 @@ impl MtpRuntime {
         input: RunInput<'_>,
         device_hidden: Option<Tensor<bf16, 2>>,
         phase: ExecutionPhase,
-        predict: bool,
+        output: OutputMode,
     ) -> Result<Dump> {
         let Execution {
             device,
@@ -343,7 +358,7 @@ impl MtpRuntime {
             "MTP decode requires one row"
         );
         ensure!(
-            !predict || rows <= self.head_rows,
+            output == OutputMode::StateOnly || rows <= self.head_rows,
             "MTP head rows exceed binding"
         );
         let attention = self
@@ -665,15 +680,26 @@ impl MtpRuntime {
         if detailed {
             dump.device("post_mtp_norm", s, &self.work.n, 0, rows, HIDDEN)?;
         }
-        if !predict {
-            let source = matrix(&self.work.n, s, 0, rows, HIDDEN)?;
-            let destination = matrix(&self.hidden, s, 0, rows, HIDDEN)?;
-            unsafe {
-                s.launch_builder(&self.copy_finite)
-                    .arg(&source.ptr)
-                    .arg(&destination.ptr)
-                    .arg(&((rows * HIDDEN) as u64))
-                    .launch(flat(rows * HIDDEN))?;
+        if output == OutputMode::StateOnly {
+            if phase == ExecutionPhase::Decode {
+                // Repair failures must remain recoverable by the transaction's
+                // restore path. Check on the host instead of trapping the GPU.
+                ensure!(
+                    s.clone_dtoh(&self.work.n.slice(..rows * HIDDEN))?
+                        .iter()
+                        .all(|h| h.is_finite()),
+                    "nonfinite MTP normalized hidden"
+                );
+            } else {
+                let source = matrix(&self.work.n, s, 0, rows, HIDDEN)?;
+                let destination = matrix(&self.hidden, s, 0, rows, HIDDEN)?;
+                unsafe {
+                    s.launch_builder(&self.copy_finite)
+                        .arg(&source.ptr)
+                        .arg(&destination.ptr)
+                        .arg(&((rows * HIDDEN) as u64))
+                        .launch(flat(rows * HIDDEN))?;
+                }
             }
             return Ok(dump);
         }
@@ -690,6 +716,12 @@ impl MtpRuntime {
         dump.device("logits", s, &self.logits, 0, rows, VOCAB)?;
         Ok(dump)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputMode {
+    Predict,
+    StateOnly,
 }
 
 struct RunInput<'a> {

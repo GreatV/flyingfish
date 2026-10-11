@@ -81,7 +81,8 @@ fn canonical(e: &mut Engine, inputs: &[u32]) -> Result<Vec<u32>> {
             } else {
                 &frame[(row - 1) * HIDDEN..row * HIDDEN]
             };
-            b.row(token, h)?;
+            // Retain the old head-producing row as the canonical state oracle.
+            b.row(token, h, OutputMode::Predict)?;
         }
         b.chain.last_target = frame[(inputs.len() - 1) * HIDDEN..].to_vec();
         b.chain.committed_position = b.engine.position;
@@ -127,9 +128,15 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
                             forced[j] = (forced[j] + 1) % VOCAB as u32;
                         }
                         c.force_proposals = Some(forced);
+                        let head_runs = c.runtime.head_runs;
                         let before = counts(&e)?;
                         let r = e.mtp_batch_round(64, None)?;
                         let after = counts(&e)?;
+                        ensure!(
+                            e.mtp.as_ref().context("MTP missing")?.runtime.head_runs - head_runs
+                                == k,
+                            "canonical repair evaluated an unused MTP head"
+                        );
                         let mut tokens = full[..j].to_vec();
                         tokens.push(*expected.last().context("empty canonical head")?);
                         ensure!(

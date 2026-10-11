@@ -131,7 +131,7 @@ struct Bound<'a> {
 }
 
 impl Bound<'_> {
-    fn row(&mut self, input: u32, hidden: &[bf16]) -> Result<u32> {
+    fn row(&mut self, input: u32, hidden: &[bf16], mode: OutputMode) -> Result<Option<u32>> {
         let e = &mut self.engine;
         let c = &mut self.chain;
         let state = e.mtp_state.as_mut().context("MTP state missing")?;
@@ -153,14 +153,22 @@ impl Bound<'_> {
                 control: Control::None,
                 detailed: false,
             },
+            mode,
         )?;
         let output = match c.options.recurrent_tap {
             MtpRecurrentTap::PreMtpNorm => &c.runtime.work.x,
             MtpRecurrentTap::PostMtpNorm => &c.runtime.work.n,
         };
         c.recurrent = e.device.stream.clone_dtoh(&output.slice(..HIDDEN))?;
+        ensure!(
+            c.recurrent.iter().all(|h| h.is_finite()),
+            "nonfinite MTP recurrent hidden"
+        );
         c.cursor += 1;
         state.set_sequence(&e.device.stream, c.cursor as u32, 1, 1)?;
+        if mode == OutputMode::StateOnly {
+            return Ok(None);
+        }
         let (_, shape, bytes) = dump.tensors.get("logits").context("MTP head missing")?;
         ensure!(shape == &[1, VOCAB], "MTP head extent mismatch");
         let mut best = (0u32, f32::NEG_INFINITY);
@@ -170,7 +178,7 @@ impl Bound<'_> {
                 best = (i as u32, value);
             }
         }
-        Ok(best.0)
+        Ok(Some(best.0))
     }
 }
 
@@ -249,7 +257,9 @@ impl Backend for Bound<'_> {
         } else {
             self.chain.recurrent.clone()
         };
-        let token = self.row(input, &hidden)?;
+        let token = self
+            .row(input, &hidden, OutputMode::Predict)?
+            .context("MTP prediction missing")?;
         #[cfg(test)]
         let token = self
             .chain
@@ -280,7 +290,7 @@ impl Backend for Bound<'_> {
             "MTP canonical position mismatch"
         );
         let hidden = self.chain.last_target.clone();
-        self.row(input, &hidden)?;
+        self.row(input, &hidden, OutputMode::StateOnly)?;
         Ok(())
     }
 }

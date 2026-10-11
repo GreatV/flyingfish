@@ -94,7 +94,9 @@ pub(super) fn ordinary(e: &mut Engine, count: usize) -> Result<Vec<u32>> {
         };
         for _ in 0..count {
             let token = b.pending()?;
-            b.canonical_row(token)?;
+            // Keep the old head-producing canonical row as the state oracle.
+            let hidden = b.chain.last_target.clone();
+            b.row(token, &hidden, OutputMode::Predict)?;
             out.push(b.target_decode(token)?);
         }
         b.chain.committed_position = b.engine.position;
@@ -247,7 +249,13 @@ pub(crate) fn q38_mtp_transaction_gpu() -> Result<()> {
                             proposals[j] = (proposals[j] + 1) % VOCAB as u32;
                         }
                         e.mtp.as_mut().context("MTP missing")?.force_proposals = Some(proposals);
+                        let head_runs = e.mtp.as_ref().context("MTP missing")?.runtime.head_runs;
                         let round = e.mtp_round(64, None)?;
+                        ensure!(
+                            e.mtp.as_ref().context("MTP missing")?.runtime.head_runs - head_runs
+                                == k,
+                            "M2a canonical repair evaluated an unused MTP head"
+                        );
                         ensure!(
                             round.accepted == j && round.tokens == expected,
                             "wrong forced acceptance count/output"

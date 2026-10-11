@@ -401,6 +401,86 @@ fn q38_mtp_cached_rows_gpu() -> Result<()> {
 }
 
 #[test]
+#[ignore = "authorized GPU window; StateOnly Decode must preserve every intermediate and KV bit"]
+fn q38_mtp_state_only_decode_gpu() -> Result<()> {
+    let probe = Probe::new()?;
+    let fixture = Fixture::load(&probe.root, "math1")?;
+    let s = &probe.device.stream;
+    for h2 in [MtpHiddenTap::PreFinalNorm, MtpHiddenTap::PostFinalNorm] {
+        for h5 in [MtpRecurrentTap::PreMtpNorm, MtpRecurrentTap::PostMtpNorm] {
+            let mut p = plan(h2, 1, 64, ExecutionPhase::Decode);
+            p.recurrent_tap = h5;
+            let mut full_state = probe.state(p.capacity)?;
+            let mut light_state = probe.state(p.capacity)?;
+            let mut full = probe.runtime(p, &full_state)?;
+            let mut light = probe.runtime(p, &light_state)?;
+            let sentinel = vec![bf16::from_f32(-17.0); VOCAB];
+            s.memcpy_htod(&sentinel, &mut light.logits)?;
+            let mut hidden = fixture.hidden(h2)[..HIDDEN].to_vec();
+            for prefix in 0..8 {
+                let input = || RunInput {
+                    prefix,
+                    ids: &fixture.sequence[prefix + 1..prefix + 2],
+                    hidden: &hidden,
+                    control: Control::None,
+                    detailed: true,
+                };
+                let mut full_dump = probe.run(&mut full, &mut full_state, input())?;
+                let light_dump = light.run_decode(
+                    Execution {
+                        device: &probe.device,
+                        ops: &probe.ops,
+                        blas: &probe.blas,
+                        catalog: &probe.catalog,
+                        embedding: probe
+                            .catalog
+                            .bf16("model.language_model.embed_tokens.weight")?,
+                        head: probe.catalog.bf16("lm_head.weight")?,
+                    },
+                    &mut light_state,
+                    input(),
+                    OutputMode::StateOnly,
+                )?;
+                assert!(full_dump.tensors.remove("logits").is_some());
+                assert_eq!(full_dump.tensors, light_dump.tensors);
+                assert_eq!(full.head_runs, prefix + 1);
+                assert_eq!(light.head_runs, 0);
+                let bits = |v: Vec<bf16>| v.into_iter().map(bf16::to_bits).collect::<Vec<_>>();
+                assert_eq!(bits(s.clone_dtoh(&light.logits)?), bits(sentinel.clone()));
+                for (a, b) in [
+                    (&full_state.kv[0].k, &light_state.kv[0].k),
+                    (&full_state.kv[0].v, &light_state.kv[0].v),
+                ] {
+                    assert_eq!(bits(s.clone_dtoh(a)?), bits(s.clone_dtoh(b)?));
+                }
+                assert_eq!(
+                    s.clone_dtoh(
+                        full_state
+                            .sequence
+                            .as_ref()
+                            .context("full metadata missing")?
+                    )?,
+                    s.clone_dtoh(
+                        light_state
+                            .sequence
+                            .as_ref()
+                            .context("StateOnly metadata missing")?
+                    )?
+                );
+                hidden = s.clone_dtoh(
+                    &match h5 {
+                        MtpRecurrentTap::PreMtpNorm => &full.work.x,
+                        MtpRecurrentTap::PostMtpNorm => &full.work.n,
+                    }
+                    .slice(..HIDDEN),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "authorized MTP GPU window; headless Prefill must preserve hidden and KV bits"]
 fn q38_mtp_headless_prefill_gpu() -> Result<()> {
     let probe = Probe::new()?;

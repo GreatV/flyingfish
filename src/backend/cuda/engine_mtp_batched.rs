@@ -343,7 +343,7 @@ impl BatchedBackend for Bound<'_> {
             } else {
                 &frame[(row - 1) * HIDDEN..row * HIDDEN]
             };
-            self.row(token, hidden)?;
+            self.row(token, hidden, OutputMode::StateOnly)?;
             #[cfg(test)]
             ensure!(
                 self.chain
