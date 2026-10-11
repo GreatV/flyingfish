@@ -240,14 +240,21 @@ impl Closure {
         self.measurements.set(self.measurements.get() + 1);
         Ok(())
     }
-    pub fn capture(&self) -> Result<()> {
+    fn before_ready(&self, action: &str) -> Result<()> {
         if self.stage.get() == Stage::Ready {
             self.late_attempts.set(self.late_attempts.get() + 1);
         }
         ensure!(
             self.stage.get() == Stage::Frozen,
-            "production Graph capture requires frozen choices and must precede Ready"
+            "{action} requires frozen choices and must precede Ready"
         );
+        Ok(())
+    }
+    pub fn bind_fixed(&self) -> Result<()> {
+        self.before_ready("fixed operator binding")
+    }
+    pub fn capture(&self) -> Result<()> {
+        self.before_ready("production Graph capture")?;
         self.captures.set(self.captures.get() + 1);
         Ok(())
     }
@@ -755,6 +762,19 @@ mod tests {
         closure.ready(Instant::now())?;
         assert!(closure.capture().is_err());
         assert!(closure.assert_ready().is_err());
+        Ok(())
+    }
+    #[test]
+    fn fixed_binding_requires_frozen_setup_without_counting_captures() -> Result<()> {
+        let closure = Closure::new(false, "fixed setup".into());
+        assert!(closure.bind_fixed().is_err());
+        closure.freeze_fixed()?;
+        closure.bind_fixed()?;
+        closure.expect_captures(0)?;
+        closure.ready(Instant::now())?;
+        assert!(closure.bind_fixed().is_err());
+        assert!(closure.assert_ready().is_err());
+        closure.expect_captures(0)?;
         Ok(())
     }
 }

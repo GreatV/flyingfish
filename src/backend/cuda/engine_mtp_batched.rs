@@ -8,6 +8,13 @@ use crate::{
 };
 use cudarc::driver::{CudaGraph, sys};
 
+fn optional_verify_graphs<G>(
+    graph: bool,
+    capture: impl FnOnce() -> Result<Vec<G>>,
+) -> Result<Vec<G>> {
+    if graph { capture() } else { Ok(Vec::new()) }
+}
+
 pub(super) struct Batch {
     logits: CudaSlice<bf16>,
     predictions: CudaSlice<u32>,
@@ -36,7 +43,8 @@ impl Engine {
         );
         ensure!(self.workspace_rows >= 4, "M2b requires four workspace rows");
         // This guard rejects late setup before allocating or binding anything.
-        self.closure.capture()?;
+        self.closure.bind_fixed()?;
+        let graph = self.mtp.as_ref().context("MTP missing")?.options.graph;
         let s = self.device.stream.clone();
         let journal = self
             .mtp
@@ -81,6 +89,22 @@ impl Engine {
             batch.capture_checkpoint.bytes() == journal,
             "M2b journal ledger mismatch"
         );
+        batch.graphs = optional_verify_graphs(graph, || self.mtp_batch_capture(&mut batch))?;
+        let graph_shapes = if batch.graphs.is_empty() {
+            "none"
+        } else {
+            "1,2,3,4"
+        };
+        self.mtp.as_mut().context("MTP missing")?.batch = Some(batch);
+        eprintln!(
+            "MTP_M2B_MEMORY additional_device_bytes={needed} capture_checkpoint_bytes={journal} graph_shapes={graph_shapes}"
+        );
+        Ok(())
+    }
+
+    fn mtp_batch_capture(&mut self, batch: &mut Batch) -> Result<Vec<CudaGraph>> {
+        self.closure.capture()?;
+        let s = self.device.stream.clone();
         batch
             .capture_checkpoint
             .save(&self.state, &self.work.token, 0, &s)?;
@@ -91,7 +115,7 @@ impl Engine {
                 if rows > 1 {
                     self.closure.capture()?;
                 }
-                self.mtp_batch_launch(&mut batch, rows)?;
+                self.mtp_batch_launch(batch, rows)?;
                 s.synchronize()?;
                 batch
                     .capture_checkpoint
@@ -104,7 +128,7 @@ impl Engine {
                     "injected batch capture begin failure"
                 );
                 s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                let launches = self.mtp_batch_launch(&mut batch, rows);
+                let launches = self.mtp_batch_launch(batch, rows);
                 let captured = s.end_capture(sys::CUgraphInstantiate_flags(0));
                 launches?;
                 #[cfg(test)]
@@ -142,17 +166,12 @@ impl Engine {
             return Err(error.context("M2b capture restore failed"));
         }
         match result {
-            Ok(graphs) => batch.graphs = graphs,
+            Ok(graphs) => Ok(graphs),
             Err(error) => {
                 self.poisoned = true;
-                return Err(error.context("M2b capture transaction failed"));
+                Err(error.context("M2b capture transaction failed"))
             }
         }
-        self.mtp.as_mut().context("MTP missing")?.batch = Some(batch);
-        eprintln!(
-            "MTP_M2B_MEMORY additional_device_bytes={needed} capture_checkpoint_bytes={journal} graph_shapes=1,2,3,4"
-        );
-        Ok(())
     }
 
     /// Capture-safe: no host transfers/allocations, all plans prebound. Metadata

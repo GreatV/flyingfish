@@ -1,6 +1,30 @@
 use super::super::tests::{configure, load, options, output, prompt, restore, save, state_bits};
 use super::*;
 
+#[test]
+fn eager_setup_creates_no_verify_graphs_or_capture_work() -> Result<()> {
+    let graphs = optional_verify_graphs::<()>(false, || {
+        anyhow::bail!("capture is unavailable; eager setup must never call this transaction")
+    })?;
+    assert!(graphs.is_empty());
+    Ok(())
+}
+
+#[test]
+fn graph_setup_preserves_capture_results_and_errors() -> Result<()> {
+    let mut calls = 0;
+    let graphs = optional_verify_graphs(true, || {
+        calls += 1;
+        Ok(vec![1, 2, 3, 4])
+    })?;
+    assert_eq!(graphs, [1, 2, 3, 4]);
+    assert_eq!(calls, 1);
+    let error = optional_verify_graphs::<()>(true, || anyhow::bail!("capture failed"))
+        .expect_err("graph setup must propagate capture failure");
+    assert_eq!(error.to_string(), "capture failed");
+    Ok(())
+}
+
 pub(super) fn staged() -> Result<Engine> {
     let mut e = load(true)?;
     e.mtp_enable(options(
