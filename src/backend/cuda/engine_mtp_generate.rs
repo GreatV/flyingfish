@@ -23,10 +23,6 @@ impl Engine {
                 && options.count > 0
                 && ids
                     .len()
-                    .checked_add(1)
-                    .is_some_and(|n| n < options.capacity)
-                && ids
-                    .len()
                     .checked_add(options.count)
                     .is_some_and(|n| n <= options.capacity),
             "MTP request needs a nonempty prompt, positive output count and a reserved next-token slot"
@@ -52,15 +48,15 @@ impl Engine {
         let mut settings = options.backend.clone();
         settings.spec_budget = SpecBudget::Chain;
         settings.spec_graph = false;
-        let mut engine = Self::load_kind(
+        let mut engine = Self::load_kind_for(
             dir,
             options.device,
             options.capacity,
             options.chunk,
             settings,
-            true,
+            SetupMode::Mtp,
         )?;
-        engine.mtp_enable(mtp)?;
+        engine.mtp_enable_for_prompt(mtp, ids.len())?;
         engine.mtp_batch_enable()?;
         if graph {
             engine.capture()?;

@@ -401,6 +401,85 @@ fn q38_mtp_cached_rows_gpu() -> Result<()> {
 }
 
 #[test]
+#[ignore = "authorized MTP GPU window; headless Prefill must preserve hidden and KV bits"]
+fn q38_mtp_headless_prefill_gpu() -> Result<()> {
+    let probe = Probe::new()?;
+    let fixture = Fixture::load(&probe.root, "math1")?;
+    let s = &probe.device.stream;
+    for rows in [1, 2, 16] {
+        let p = plan(
+            MtpHiddenTap::PostFinalNorm,
+            rows,
+            64,
+            ExecutionPhase::Prefill,
+        );
+        let mut full_state = probe.state(p.capacity)?;
+        let mut light_state = probe.state(p.capacity)?;
+        let mut full = probe.runtime(p, &full_state)?;
+        let mut light = MtpRuntime::allocate(
+            &probe.device,
+            &probe.spec,
+            &probe.catalog,
+            &light_state,
+            &probe.blas,
+            p,
+            1,
+        )?;
+        let hidden = &fixture.hidden(p.hidden_tap)[..rows * HIDDEN];
+        let device_hidden = s.clone_htod(hidden)?;
+        let ids = &fixture.sequence[1..=rows];
+        probe.run(
+            &mut full,
+            &mut full_state,
+            RunInput {
+                prefix: 0,
+                ids,
+                hidden,
+                control: Control::None,
+                detailed: false,
+            },
+        )?;
+        light.run_prefill(
+            Execution {
+                device: &probe.device,
+                ops: &probe.ops,
+                blas: &probe.blas,
+                catalog: &probe.catalog,
+                embedding: probe
+                    .catalog
+                    .bf16("model.language_model.embed_tokens.weight")?,
+                head: probe.catalog.bf16("lm_head.weight")?,
+            },
+            &mut light_state,
+            0,
+            ids,
+            matrix(&device_hidden, s, 0, rows, HIDDEN)?,
+        )?;
+        assert_eq!(full.head_runs, 1);
+        assert_eq!(light.head_runs, 0);
+        assert_eq!(light.logits.len(), VOCAB);
+        let bits = |v: Vec<bf16>| v.into_iter().map(bf16::to_bits).collect::<Vec<_>>();
+        for (a, b) in [(&full.work.x, &light.work.x), (&full.work.n, &light.work.n)] {
+            assert_eq!(
+                bits(s.clone_dtoh(&a.slice(..rows * HIDDEN))?),
+                bits(s.clone_dtoh(&b.slice(..rows * HIDDEN))?)
+            );
+        }
+        for (a, b) in [
+            (&full_state.kv[0].k, &light_state.kv[0].k),
+            (&full_state.kv[0].v, &light_state.kv[0].v),
+        ] {
+            assert_eq!(bits(s.clone_dtoh(a)?), bits(s.clone_dtoh(b)?));
+        }
+        assert_eq!(
+            s.clone_dtoh(full_state.sequence.as_ref().unwrap())?,
+            s.clone_dtoh(light_state.sequence.as_ref().unwrap())?
+        );
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "local 4090 MTP window; exports controls for independent OpRef judgement"]
 fn q38_mtp_negative_controls_gpu() -> Result<()> {
     let probe = Probe::new()?;

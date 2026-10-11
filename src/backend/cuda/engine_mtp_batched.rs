@@ -45,9 +45,11 @@ impl Engine {
             .target_checkpoint
             .bytes();
         let buffers = 4 * VOCAB * size_of::<bf16>() + size_of::<[i32; 8]>();
-        let needed = journal
-            .checked_add(buffers)
-            .context("M2b budget overflow")?;
+        let needed = crate::mtp::batch_bytes(&self.model_spec)?;
+        ensure!(
+            needed == journal + buffers,
+            "M2b budget/attachment mismatch"
+        );
         let (free, total) = self.device.ctx.mem_get_info()?;
         ensure!(
             free.checked_sub(total / 16).is_some_and(|n| needed <= n),

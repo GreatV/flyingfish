@@ -419,3 +419,74 @@ fn q38_mtp_batch_chain_gpu() -> Result<()> {
         serde_json::json!({"result":"EXPORTED_PENDING_DREF","cases":cases,"eager_graph_tokens":"BIT_EQUAL","rule":"DRef G7 ARGMAX/NEAR-TIE/DEFECT T=1.0; zero DEFECT required"}),
     )
 }
+
+#[test]
+#[ignore = "authorized review GPU window; frozen K2 bootstrap acceptance regression"]
+fn q38_mtp_bootstrap_acceptance_gpu() -> Result<()> {
+    let mut e = super::super::tests::load_capacity(true, 512)?;
+    let selected = options(
+        2,
+        MtpHiddenTap::PostFinalNorm,
+        MtpRecurrentTap::PostMtpNorm,
+        true,
+    );
+    e.mtp_enable(selected)?;
+    e.mtp_batch_enable()?;
+    e.capture()?;
+    let inputs = ["math1", "code1", "gen1", "gen2", "math2"]
+        .into_iter()
+        .map(|name| Ok((name, prompt(name)?)))
+        .collect::<Result<Vec<_>>>()?;
+    for (_, ids) in &inputs {
+        for chunk in ids.chunks(e.chunk) {
+            e.prepare(chunk.len())?;
+        }
+    }
+    e.closure.ready(std::time::Instant::now())?;
+    e.model_spec.eos.clear();
+    let (mut published, mut rounds) = (0usize, 0usize);
+    let mut cases = Vec::new();
+    for (name, ids) in &inputs {
+        for iteration in 0..5 {
+            let mut tokens = vec![e.mtp_prefill(ids)?];
+            let (mut emitted, mut count) = (0usize, 0usize);
+            while emitted < 32 {
+                let r = e.mtp_batch_round(32 - emitted, None)?.round;
+                ensure!(!r.tokens.is_empty(), "bootstrap warmup stopped early");
+                emitted += r.tokens.len();
+                tokens.extend(r.tokens);
+            }
+            emitted = 0;
+            while emitted < 200 {
+                let r = e.mtp_batch_round(200 - emitted, None)?.round;
+                ensure!(!r.tokens.is_empty(), "bootstrap measurement stopped early");
+                emitted += r.tokens.len();
+                count += 1;
+                tokens.extend(r.tokens);
+            }
+            ensure!(
+                emitted == 200 && tokens.len() == 233,
+                "bootstrap output budget changed"
+            );
+            published += emitted;
+            rounds += count;
+            cases.push(serde_json::json!({"case":name,"iteration":iteration,"tokens":tokens,"measured_tokens":emitted,"rounds":count}));
+        }
+    }
+    let reference = 5000.0 / 1920.0;
+    let actual = published as f64 / rounds as f64;
+    let pass = (reference * 0.97..=reference * 1.03).contains(&actual);
+    receipt(
+        "bootstrap-acceptance",
+        serde_json::json!({
+            "result":if pass {"PASS"} else {"FAIL"},"depth":2,"warmup_tokens":32,
+            "reference_tokens":5000,"reference_rounds":1920,"relative_limit":0.03,
+            "published":published,"rounds":rounds,"mean_tokens_per_round":actual,"cases":cases
+        }),
+    )?;
+    ensure!(
+        pass,
+        "K2 bootstrap acceptance {actual} is outside +/-3% of {reference}"
+    );
+    Ok(())
+}

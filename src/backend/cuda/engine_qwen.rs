@@ -528,9 +528,11 @@ impl Engine {
         capacity: usize,
         requested_chunk: Option<usize>,
         settings: Settings,
-        write: bool,
+        mode: super::SetupMode,
         model_spec: crate::model_spec::ModelSpec,
     ) -> Result<Self> {
+        let write = !matches!(mode, super::SetupMode::Ready);
+        let reserve_mtp = matches!(mode, super::SetupMode::Mtp);
         let started = Instant::now();
         ensure!(
             settings.draft_model.is_none(),
@@ -575,6 +577,9 @@ impl Engine {
         blas.enable_fp8(&device.ctx)?;
         device.finish_upload()?;
         let (free, total) = device.ctx.mem_get_info()?;
+        let mtp_budget = reserve_mtp
+            .then(|| crate::mtp::AttachmentBudget::new(&model_spec, capacity))
+            .transpose()?;
         let budget = crate::prefill::WorkspaceBudget::new(
             crate::prefill::WorkspaceRequest {
                 capacity,
@@ -582,16 +587,37 @@ impl Engine {
                 free_after_resident: free,
                 total,
                 alignment: 32,
-                row_bytes: Runtime::row_bytes(&model_spec)?,
-                fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?,
+                row_bytes: Runtime::row_bytes(&model_spec)?
+                    .checked_add(mtp_budget.as_ref().map_or(0, |b| b.row_bytes))
+                    .context("combined row bytes overflow")?,
+                fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
+                    .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
+                    .context("combined fixed bytes overflow")?,
             },
-            |rows| Runtime::workspace(rows, capacity),
+            |rows| {
+                let target = Runtime::workspace(rows, capacity)?;
+                target
+                    .checked_add(
+                        mtp_budget
+                            .as_ref()
+                            .map(|b| b.workspace(rows))
+                            .transpose()?
+                            .unwrap_or(0),
+                    )
+                    .context("Q38 combined workspace overflow")
+            },
         )?;
         let rows = budget.plan.chunk;
+        ensure!(
+            !reserve_mtp || rows >= 4,
+            "MTP workspace cannot fit four verification rows"
+        );
+        let target_workspace = Runtime::workspace(rows, capacity)?;
         eprintln!(
             "{}",
             serde_json::json!({
                 "q38_memory_plan": budget,
+                "mtp_attachment_planned_bytes": if reserve_mtp { crate::mtp::attachment_bytes(&model_spec, capacity, rows, true)? } else { 0 },
                 "resident_weights_bytes": weights.bytes,
                 "persistent_state_bytes": state.bytes(),
                 "capture_checkpoint_bytes": capture_checkpoint.as_ref().context("capture checkpoint missing")?.bytes(),
@@ -609,7 +635,7 @@ impl Engine {
                 "selection_source": "fixed"
             })
         );
-        let scratch_buffer = s.alloc_zeros::<u8>(budget.operator_workspace_bytes)?;
+        let scratch_buffer = s.alloc_zeros::<u8>(target_workspace)?;
         let work = Work::new(s, &model_spec, rows)?;
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
         let config = model_spec.config();

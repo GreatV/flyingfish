@@ -379,6 +379,13 @@ enum CaptureFault {
     Instantiate,
 }
 
+#[derive(Clone, Copy)]
+enum SetupMode {
+    Ready,
+    Prepare,
+    Mtp,
+}
+
 pub struct Engine {
     qwen_device_prefix: bool,
     #[cfg(test)]
@@ -448,6 +455,28 @@ impl Engine {
         settings: Settings,
         write: bool,
     ) -> Result<Self> {
+        Self::load_kind_for(
+            dir,
+            ordinal,
+            capacity,
+            requested_chunk,
+            settings,
+            if write {
+                SetupMode::Prepare
+            } else {
+                SetupMode::Ready
+            },
+        )
+    }
+    fn load_kind_for(
+        dir: &Path,
+        ordinal: usize,
+        capacity: usize,
+        requested_chunk: Option<usize>,
+        settings: Settings,
+        mode: SetupMode,
+    ) -> Result<Self> {
+        let write = !matches!(mode, SetupMode::Ready);
         let started = Instant::now();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
         if model_spec.architecture == crate::model_spec::Architecture::Qwen35Text {
@@ -457,7 +486,7 @@ impl Engine {
                 capacity,
                 requested_chunk,
                 settings,
-                write,
+                mode,
                 model_spec,
             );
         }
@@ -1548,8 +1577,18 @@ impl Engine {
     fn prefill_inner(
         &mut self,
         ids: &[u32],
+        trace: Option<&mut Trace>,
+        keep: usize,
+    ) -> Result<u32> {
+        self.prefill_chunks(ids, trace, keep, |_, _| Ok(()))
+    }
+
+    fn prefill_chunks(
+        &mut self,
+        ids: &[u32],
         mut trace: Option<&mut Trace>,
         keep: usize,
+        mut after_chunk: impl FnMut(&mut Self, &[u32]) -> Result<()>,
     ) -> Result<u32> {
         self.closure.assert_ready()?;
         ensure!(
@@ -1614,6 +1653,7 @@ impl Engine {
                     None
                 },
             )?;
+            after_chunk(self, chunk)?;
             if selected {
                 part += 1;
             }

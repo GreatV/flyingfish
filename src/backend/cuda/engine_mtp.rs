@@ -5,6 +5,8 @@ use super::{
 };
 #[cfg(test)]
 use crate::backend::cuda::closure::Closure;
+#[cfg(test)]
+use crate::model_spec::{LayerPlan, Mixer};
 use crate::{
     backend::cuda::{
         Device,
@@ -12,7 +14,7 @@ use crate::{
             AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings,
         },
         blas::Blas,
-        contracts::{RowDomain, TensorMut},
+        contracts::{RowDomain, Tensor, TensorMut},
         cubin,
         flash::{Flash, Shape},
         linear::LayerLinearPlan,
@@ -22,7 +24,7 @@ use crate::{
     },
     checkpoint::LoadPolicy,
     linear_plan::LayerDequantPlan,
-    model_spec::{LayerPlan, Mixer, ModelSpec},
+    model_spec::ModelSpec,
     mtp::{HIDDEN, MtpHiddenTap, MtpPlan, MtpRecurrentTap, VOCAB},
     op_contract::ExecutionPhase,
 };
@@ -57,7 +59,12 @@ struct MtpRuntime {
     scratch: CudaSlice<u8>,
     mask: CudaSlice<u64>,
     linear: LayerLinearPlan,
-    attention: FullAttentionPlan,
+    attention: BTreeMap<usize, FullAttentionPlan>,
+    max_position: usize,
+    head_rows: usize,
+    copy_finite: CudaFunction,
+    #[cfg(test)]
+    head_runs: usize,
     common: CommonOpsRef,
     multiply: CudaFunction,
     flash: Flash,
@@ -107,6 +114,7 @@ impl MtpRuntime {
             + self.scratch.len()
             + self.plan.max_rows * 24 * size_of::<f32>() // Flash's setup-bound LSE.
     }
+    #[cfg(test)]
     fn new(
         device: &Device,
         spec: &ModelSpec,
@@ -115,6 +123,17 @@ impl MtpRuntime {
         blas: &Blas,
         plan: MtpPlan,
     ) -> Result<Self> {
+        Self::allocate(device, spec, catalog, state, blas, plan, plan.max_rows)
+    }
+    fn allocate(
+        device: &Device,
+        spec: &ModelSpec,
+        catalog: &WeightCatalog,
+        state: &StateStore,
+        blas: &Blas,
+        plan: MtpPlan,
+        head_rows: usize,
+    ) -> Result<Self> {
         plan.validate(spec)?;
         let s = &device.stream;
         let rows = plan.max_rows;
@@ -122,7 +141,7 @@ impl MtpRuntime {
         let embedding = s.alloc_zeros(rows * HIDDEN)?;
         let hidden = s.alloc_zeros(rows * HIDDEN)?;
         let concat = s.alloc_zeros(rows * HIDDEN * 2)?;
-        let logits = s.alloc_zeros(rows * VOCAB)?;
+        let logits = s.alloc_zeros(head_rows * VOCAB)?;
         let positions = s.alloc_zeros(rows * 3)?;
         let dequant = LayerDequantPlan::mtp(&catalog.manifest)?;
         ensure!(
@@ -130,7 +149,7 @@ impl MtpRuntime {
             "unexpected MTP materialization layout"
         );
         let arena = s.alloc_zeros(dequant.bytes as usize)?;
-        let scratch_buffer = s.alloc_zeros(plan.memory(spec)?.scratch)?;
+        let scratch_buffer = s.alloc_zeros(plan.memory_with_head_rows(spec, head_rows)?.scratch)?;
         let mask = s.clone_htod(
             &(0..64)
                 .map(|i| {
@@ -143,53 +162,10 @@ impl MtpRuntime {
                 .collect::<Vec<_>>(),
         )?;
         let mut linear = LayerLinearPlan::bind(&dequant, catalog, &scratch(&arena, s), s)?;
-        linear.prepare(blas, rows as u32)?;
-        blas.prepare_fixed(rows as u32, HIDDEN as u32, (2 * HIDDEN) as u32)?;
-        blas.prepare_fixed(rows as u32, VOCAB as u32, HIDDEN as u32)?;
         linear.materialize(blas.fp8_ops()?, s)?;
         let common = CommonOpsRef::new(&device.ctx)?;
-        let mixer = work.mixer.as_ref().context("MTP Q/gate buffers missing")?;
-        let kv = &state.kv[0];
-        let attention = FullAttentionOps::prepare(
-            &device.ctx,
-            &crate::op_contract::FullAttentionSpec::q38(),
-            limits(rows, plan.capacity)?,
-            AttentionBindings {
-                q_gate: heads(&work.qkv, s, 0, rows, 24, 512)?,
-                k: heads(&work.qkv, s, rows * 12288, rows, 4, 256)?,
-                v: heads(&work.qkv, s, rows * (12288 + 1024), rows, 4, 256)?,
-                q: TensorMut(heads(&mixer.q, s, 0, rows, 24, 256)?),
-                gate: TensorMut(heads(&mixer.gate, s, 0, rows, 24, 256)?),
-                k_cache: TensorMut(view(
-                    &kv.k,
-                    s,
-                    0,
-                    [4, plan.capacity as u32, 256],
-                    [(plan.capacity * 256) as u64, 256, 1],
-                )?),
-                v_cache: TensorMut(view(
-                    &kv.v,
-                    s,
-                    0,
-                    [4, plan.capacity as u32, 256],
-                    [(plan.capacity * 256) as u64, 256, 1],
-                )?),
-                core_out: TensorMut(heads(&work.attn, s, 0, rows, 24, 256)?),
-                q_norm: vector(catalog.bf16("mtp.layers.0.self_attn.q_norm.weight")?, s)?,
-                k_norm: vector(catalog.bf16("mtp.layers.0.self_attn.k_norm.weight")?, s)?,
-                causal_mask: view(&mask, s, 0, [64], [1])?,
-                positions: PositionBindings::Axes(view(
-                    &positions,
-                    s,
-                    0,
-                    [rows as u32, 3],
-                    [3, 1],
-                )?),
-            },
-            common.clone(),
-        )?;
         let multiply = cubin::module(&device.ctx, "q38_common")?.load_function("q38_multiply")?;
-        Ok(Self {
+        let mut runtime = Self {
             plan,
             work,
             embedding,
@@ -201,18 +177,139 @@ impl MtpRuntime {
             scratch: scratch_buffer,
             mask,
             linear,
-            attention,
+            attention: BTreeMap::new(),
+            max_position: spec.max_position as usize,
+            head_rows,
+            copy_finite: cubin::module(&device.ctx, "q38_common")?
+                .load_function("q38_copy_finite_bf16")?,
+            #[cfg(test)]
+            head_runs: 0,
             common,
             multiply,
             flash: Flash::new(s.clone(), rows, 24)?,
-        })
+        };
+        runtime.prepare_rows(device, catalog, state, blas, rows)?;
+        Ok(runtime)
+    }
+    fn prepare_rows(
+        &mut self,
+        device: &Device,
+        catalog: &WeightCatalog,
+        state: &StateStore,
+        blas: &Blas,
+        rows: usize,
+    ) -> Result<()> {
+        ensure!(
+            rows > 0 && rows <= self.plan.max_rows,
+            "MTP binding exceeds workspace"
+        );
+        if self.attention.contains_key(&rows) {
+            return Ok(());
+        }
+        let s = &device.stream;
+        self.linear.prepare(blas, rows as u32)?;
+        blas.prepare_fixed(rows as u32, HIDDEN as u32, (2 * HIDDEN) as u32)?;
+        if rows <= self.head_rows {
+            blas.prepare_fixed(rows as u32, VOCAB as u32, HIDDEN as u32)?;
+        }
+        let mixer = self
+            .work
+            .mixer
+            .as_ref()
+            .context("MTP Q/gate buffers missing")?;
+        let kv = &state.kv[0];
+        let attention = FullAttentionOps::prepare(
+            &device.ctx,
+            &crate::op_contract::FullAttentionSpec::q38(),
+            limits(rows, self.plan.capacity)?,
+            AttentionBindings {
+                q_gate: heads(&self.work.qkv, s, 0, rows, 24, 512)?,
+                k: heads(&self.work.qkv, s, rows * 12288, rows, 4, 256)?,
+                v: heads(&self.work.qkv, s, rows * (12288 + 1024), rows, 4, 256)?,
+                q: TensorMut(heads(&mixer.q, s, 0, rows, 24, 256)?),
+                gate: TensorMut(heads(&mixer.gate, s, 0, rows, 24, 256)?),
+                k_cache: TensorMut(view(
+                    &kv.k,
+                    s,
+                    0,
+                    [4, self.plan.capacity as u32, 256],
+                    [(self.plan.capacity * 256) as u64, 256, 1],
+                )?),
+                v_cache: TensorMut(view(
+                    &kv.v,
+                    s,
+                    0,
+                    [4, self.plan.capacity as u32, 256],
+                    [(self.plan.capacity * 256) as u64, 256, 1],
+                )?),
+                core_out: TensorMut(heads(&self.work.attn, s, 0, rows, 24, 256)?),
+                q_norm: vector(catalog.bf16("mtp.layers.0.self_attn.q_norm.weight")?, s)?,
+                k_norm: vector(catalog.bf16("mtp.layers.0.self_attn.k_norm.weight")?, s)?,
+                causal_mask: view(&self.mask, s, 0, [64], [1])?,
+                positions: PositionBindings::Axes(view(
+                    &self.positions,
+                    s,
+                    0,
+                    [rows as u32, 3],
+                    [3, 1],
+                )?),
+            },
+            self.common.clone(),
+        )?;
+        self.attention.insert(rows, attention);
+        Ok(())
     }
 
+    #[cfg(test)]
     fn run(
         &mut self,
         execution: Execution<'_>,
         state: &mut StateStore,
         input: RunInput<'_>,
+    ) -> Result<Dump> {
+        self.run_inner(execution, state, input, None, self.plan.phase, true)
+    }
+    fn run_decode(
+        &mut self,
+        execution: Execution<'_>,
+        state: &mut StateStore,
+        input: RunInput<'_>,
+    ) -> Result<Dump> {
+        self.run_inner(execution, state, input, None, ExecutionPhase::Decode, true)
+    }
+    fn run_prefill(
+        &mut self,
+        execution: Execution<'_>,
+        state: &mut StateStore,
+        prefix: usize,
+        ids: &[u32],
+        hidden: Tensor<bf16, 2>,
+    ) -> Result<()> {
+        self.run_inner(
+            execution,
+            state,
+            RunInput {
+                prefix,
+                ids,
+                hidden: &[],
+                detailed: false,
+                #[cfg(test)]
+                control: Control::None,
+            },
+            Some(hidden),
+            ExecutionPhase::Prefill,
+            false,
+        )?;
+        Ok(())
+    }
+    fn run_inner(
+        &mut self,
+        execution: Execution<'_>,
+        state: &mut StateStore,
+        input: RunInput<'_>,
+        device_hidden: Option<Tensor<bf16, 2>>,
+        phase: ExecutionPhase,
+        predict: bool,
     ) -> Result<Dump> {
         let Execution {
             device,
@@ -239,9 +336,22 @@ impl MtpRuntime {
         #[cfg(not(test))]
         let (shift_position, standard_norm, swap_concat) = (false, false, false);
         let rows = ids.len();
-        self.plan.check_rows(prefix, rows)?;
+        self.plan
+            .check_absolute_rows(prefix, rows, self.max_position)?;
         ensure!(
-            rows == self.plan.max_rows && hidden.len() == rows * HIDDEN,
+            phase != ExecutionPhase::Decode || rows == 1,
+            "MTP decode requires one row"
+        );
+        ensure!(
+            !predict || rows <= self.head_rows,
+            "MTP head rows exceed binding"
+        );
+        let attention = self
+            .attention
+            .get(&rows)
+            .context("MTP rows were not bound before Ready")?;
+        ensure!(
+            device_hidden.is_some() || hidden.len() == rows * HIDDEN,
             "MTP call does not match bound rows/hidden"
         );
         ensure!(
@@ -250,15 +360,33 @@ impl MtpRuntime {
         );
         let s = &device.stream;
         state.set_sequence(s, prefix as u32, rows as u32, self.plan.max_rows as u32)?;
-        s.memcpy_htod(ids, &mut self.work.ids)?;
-        s.memcpy_htod(hidden, &mut self.hidden)?;
+        s.memcpy_htod(ids, &mut self.work.ids.slice_mut(..rows))?;
+        if let Some(source) = device_hidden {
+            source.validate()?;
+            ensure!(
+                source.shape == [rows as u32, HIDDEN as u32]
+                    && source.stride == [HIDDEN as u64, 1]
+                    && !detailed,
+                "invalid device MTP hidden view"
+            );
+            let destination = matrix(&self.hidden, s, 0, rows, HIDDEN)?;
+            unsafe {
+                s.launch_builder(&self.copy_finite)
+                    .arg(&source.ptr)
+                    .arg(&destination.ptr)
+                    .arg(&((rows * HIDDEN) as u64))
+                    .launch(flat(rows * HIDDEN))?;
+            }
+        } else {
+            s.memcpy_htod(hidden, &mut self.hidden.slice_mut(..rows * HIDDEN))?;
+        }
         let axes: Vec<i32> = (0..rows)
             .flat_map(|r| {
                 let pos = (prefix + r + 1) as i32 + i32::from(shift_position);
                 [pos; 3]
             })
             .collect();
-        s.memcpy_htod(&axes, &mut self.positions)?;
+        s.memcpy_htod(&axes, &mut self.positions.slice_mut(..rows * 3))?;
         let domain = RowDomain {
             meta: state.seq_ref(s)?,
             row_base: 0,
@@ -312,7 +440,7 @@ impl MtpRuntime {
             )?;
         }
         if detailed {
-            let cat = s.clone_dtoh(&self.concat)?;
+            let cat = s.clone_dtoh(&self.concat.slice(..rows * 2 * HIDDEN))?;
             for (name, half) in [("pre_fc_norm_embedding", 0), ("pre_fc_norm_hidden", 1)] {
                 let half = half ^ usize::from(swap_concat);
                 dump.bf16(
@@ -328,7 +456,7 @@ impl MtpRuntime {
             dump.bf16("concat", vec![rows, 2 * HIDDEN], cat)?;
         }
         blas.linear_typed(
-            self.plan.phase,
+            phase,
             catalog.linear_ref("mtp.fc.weight", s)?,
             matrix(&self.concat, s, 0, rows, 2 * HIDDEN)?,
             &mut TensorMut(matrix(&self.work.x, s, 0, rows, HIDDEN)?),
@@ -365,7 +493,7 @@ impl MtpRuntime {
             self.linear.run(
                 blas,
                 role,
-                self.plan.phase,
+                phase,
                 matrix(&self.work.n, s, 0, rows, HIDDEN)?,
                 &mut TensorMut(matrix(&self.work.qkv, s, offset, rows, width)?),
             )?;
@@ -406,14 +534,9 @@ impl MtpRuntime {
             )?;
             dump.device("k_norm", s, &self.work.n, 0, rows, 1024)?;
         }
-        match self.plan.phase {
+        match phase {
             ExecutionPhase::Prefill => {
-                FullAttentionOps::preprocess(
-                    &self.attention,
-                    s,
-                    domain.meta,
-                    scratch(&self.scratch, s),
-                )?;
+                FullAttentionOps::preprocess(attention, s, domain.meta, scratch(&self.scratch, s))?;
                 self.flash.run(
                     &mixer.q,
                     6144,
@@ -432,7 +555,7 @@ impl MtpRuntime {
                 )?;
             }
             ExecutionPhase::Decode => {
-                FullAttentionOps::run(&self.attention, s, domain.meta, scratch(&self.scratch, s))?
+                FullAttentionOps::run(attention, s, domain.meta, scratch(&self.scratch, s))?
             }
         }
         if detailed {
@@ -456,7 +579,7 @@ impl MtpRuntime {
         self.linear.run(
             blas,
             "self_attn.o_proj.weight",
-            self.plan.phase,
+            phase,
             matrix(&self.work.attn, s, 0, rows, 6144)?,
             &mut TensorMut(matrix(&self.work.out, s, 0, rows, HIDDEN)?),
         )?;
@@ -488,7 +611,7 @@ impl MtpRuntime {
             self.linear.run(
                 blas,
                 role,
-                self.plan.phase,
+                phase,
                 matrix(&self.work.n, s, 0, rows, HIDDEN)?,
                 &mut TensorMut(matrix(&self.work.gu, s, offset, rows, 17408)?),
             )?;
@@ -521,7 +644,7 @@ impl MtpRuntime {
         self.linear.run(
             blas,
             "mlp.down_proj.weight",
-            self.plan.phase,
+            phase,
             a,
             &mut TensorMut(matrix(&self.work.out, s, 0, rows, HIDDEN)?),
         )?;
@@ -542,8 +665,24 @@ impl MtpRuntime {
         if detailed {
             dump.device("post_mtp_norm", s, &self.work.n, 0, rows, HIDDEN)?;
         }
+        if !predict {
+            let source = matrix(&self.work.n, s, 0, rows, HIDDEN)?;
+            let destination = matrix(&self.hidden, s, 0, rows, HIDDEN)?;
+            unsafe {
+                s.launch_builder(&self.copy_finite)
+                    .arg(&source.ptr)
+                    .arg(&destination.ptr)
+                    .arg(&((rows * HIDDEN) as u64))
+                    .launch(flat(rows * HIDDEN))?;
+            }
+            return Ok(dump);
+        }
+        #[cfg(test)]
+        {
+            self.head_runs += 1;
+        }
         blas.linear_typed(
-            self.plan.phase,
+            phase,
             crate::backend::cuda::linear::LinearWeightRef::Bf16(matrix(head, s, 0, VOCAB, HIDDEN)?),
             matrix(&self.work.n, s, 0, rows, HIDDEN)?,
             &mut TensorMut(matrix(&self.logits, s, 0, rows, VOCAB)?),

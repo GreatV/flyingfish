@@ -8,6 +8,16 @@ __device__ __forceinline__ float sigmoid(float x) {
     float e=expf(x); return e/(1.0f+e);
 }
 __device__ __forceinline__ float silu(float x) {return x*sigmoid(x);}
+extern "C" __global__ void q38_copy_finite_bf16(const __nv_bfloat16* source,
+                                               __nv_bfloat16* destination,
+                                               uint64_t count) {
+    for (uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+         i<count; i+=uint64_t(gridDim.x)*blockDim.x) {
+        __nv_bfloat16 value=source[i];
+        if (!isfinite(__bfloat162float(value))) { __trap(); return; }
+        destination[i]=value;
+    }
+}
 extern "C" __global__ void q38_bias_add(__nv_bfloat16* y,const __nv_bfloat16* bias,uint64_t count,uint32_t width) {
     for(uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*blockDim.x)
         y[i]=__hadd(y[i],bias[i%width]);

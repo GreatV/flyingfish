@@ -25,6 +25,93 @@ pub(crate) struct Chain {
     #[cfg(test)]
     force_proposals: Option<Vec<u32>>,
     batch: Option<batched::Batch>,
+    bootstrap: Bootstrap,
+}
+
+struct Bootstrap {
+    target: CudaSlice<bf16>,
+    pairs: CudaSlice<bf16>,
+    carry: CudaSlice<bf16>,
+    last_rows: usize,
+}
+impl Bootstrap {
+    fn new(stream: &Arc<CudaStream>, rows: usize) -> Result<Self> {
+        Ok(Self {
+            target: stream.alloc_zeros(rows * HIDDEN)?,
+            pairs: stream.alloc_zeros(rows * HIDDEN)?,
+            carry: stream.alloc_zeros(HIDDEN)?,
+            last_rows: 0,
+        })
+    }
+    fn bytes(&self) -> usize {
+        (self.target.len() + self.pairs.len() + self.carry.len()) * size_of::<bf16>()
+    }
+}
+impl Chain {
+    fn bootstrap_chunk(&mut self, e: &mut Engine, ids: &[u32]) -> Result<()> {
+        let rows = ids.len();
+        let s = &e.device.stream;
+        let b = &mut self.bootstrap;
+        match self.options.hidden_tap {
+            MtpHiddenTap::PreFinalNorm => s.memcpy_dtod(
+                &e.work.x.slice(..rows * HIDDEN),
+                &mut b.target.slice_mut(..rows * HIDDEN),
+            )?,
+            MtpHiddenTap::PostFinalNorm => self.runtime.common.norm.rms_with(
+                s,
+                RowDomain {
+                    meta: e.state.seq_ref(s)?,
+                    row_base: 0,
+                    row_capacity: rows as u32,
+                },
+                heads(&e.work.x, s, 0, rows, 1, HIDDEN as u32)?,
+                vector(&e.weights.norm, s)?,
+                &mut TensorMut(heads(&b.target, s, 0, rows, 1, HIDDEN as u32)?),
+                RmsOptions {
+                    mode: RmsMode::ZeroCentered,
+                    eps: 1e-6,
+                },
+            )?,
+        }
+        let first = e.position == 0;
+        let inputs = if first { &ids[1..] } else { ids };
+        let paired = inputs.len();
+        if paired > 0 {
+            let offset = usize::from(!first) * HIDDEN;
+            if !first {
+                s.memcpy_dtod(&b.carry, &mut b.pairs.slice_mut(..HIDDEN))?;
+            }
+            if rows > 1 {
+                s.memcpy_dtod(
+                    &b.target.slice(..(rows - 1) * HIDDEN),
+                    &mut b.pairs.slice_mut(offset..offset + (rows - 1) * HIDDEN),
+                )?;
+            }
+            let state = e.mtp_state.as_mut().context("MTP state missing")?;
+            self.runtime.run_prefill(
+                Execution {
+                    device: &e.device,
+                    ops: &e.ops,
+                    blas: &e.blas,
+                    catalog: &self.catalog,
+                    embedding: &e.weights.embed,
+                    head: &e.weights.head,
+                },
+                state,
+                self.cursor,
+                inputs,
+                matrix(&b.pairs, s, 0, paired, HIDDEN)?,
+            )?;
+            self.cursor += paired;
+            state.set_sequence(s, self.cursor as u32, 1, 1)?;
+            b.last_rows = paired;
+        }
+        s.memcpy_dtod(
+            &b.target.slice((rows - 1) * HIDDEN..rows * HIDDEN),
+            &mut b.carry,
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -48,7 +135,7 @@ impl Bound<'_> {
         let e = &mut self.engine;
         let c = &mut self.chain;
         let state = e.mtp_state.as_mut().context("MTP state missing")?;
-        let dump = c.runtime.run(
+        let dump = c.runtime.run_decode(
             Execution {
                 device: &e.device,
                 ops: &e.ops,
@@ -84,36 +171,6 @@ impl Bound<'_> {
             }
         }
         Ok(best.0)
-    }
-
-    fn tap_prefill(&mut self, pre: &[bf16]) -> Result<Vec<bf16>> {
-        if self.chain.options.hidden_tap == MtpHiddenTap::PreFinalNorm {
-            return Ok(pre.to_vec());
-        }
-        let e = &self.engine;
-        let r = &mut self.chain.runtime;
-        let s = &e.device.stream;
-        s.memcpy_htod(pre, &mut r.hidden)?;
-        r.common.norm.rms_with(
-            s,
-            RowDomain {
-                meta: e
-                    .mtp_state
-                    .as_ref()
-                    .context("MTP state missing")?
-                    .seq_ref(s)?,
-                row_base: 0,
-                row_capacity: 1,
-            },
-            heads(&r.hidden, s, 0, 1, 1, HIDDEN as u32)?,
-            vector(&e.weights.norm, s)?,
-            &mut TensorMut(heads(&r.embedding, s, 0, 1, 1, HIDDEN as u32)?),
-            RmsOptions {
-                mode: RmsMode::ZeroCentered,
-                eps: 1e-6,
-            },
-        )?;
-        Ok(s.clone_dtoh(&r.embedding)?)
     }
 }
 
@@ -229,10 +286,21 @@ impl Backend for Bound<'_> {
 }
 
 impl Engine {
+    #[cfg(test)]
     pub(in crate::backend::cuda::engine) fn mtp_enable(
         &mut self,
         options: MtpOptions,
     ) -> Result<()> {
+        self.mtp_enable_bound(options, &(1..=self.chunk).collect::<Vec<_>>())
+    }
+    pub(in crate::backend::cuda::engine) fn mtp_enable_for_prompt(
+        &mut self,
+        options: MtpOptions,
+        prompt: usize,
+    ) -> Result<()> {
+        self.mtp_enable_bound(options, &crate::mtp::bootstrap_rows(prompt, self.chunk)?)
+    }
+    fn mtp_enable_bound(&mut self, options: MtpOptions, rows: &[usize]) -> Result<()> {
         options.validate()?;
         ensure!(
             self.qwen.is_some()
@@ -244,15 +312,12 @@ impl Engine {
         let plan = MtpPlan {
             hidden_tap: options.hidden_tap,
             recurrent_tap: options.recurrent_tap,
-            max_rows: 1,
+            max_rows: self.chunk,
             capacity: self.capacity,
-            phase: ExecutionPhase::Decode,
+            phase: ExecutionPhase::Prefill,
         };
-        let memory = plan.memory(&self.model_spec)?;
-        let journal = 156_893_184usize + 4 * 65_536 + 36 + 4 * 4096 + 36;
-        let needed = memory.total - crate::mtp::PROBE_WEIGHT_BYTES - memory.blas
-            + crate::mtp::WEIGHT_BYTES
-            + journal;
+        let needed =
+            crate::mtp::attachment_bytes(&self.model_spec, self.capacity, self.chunk, false)?;
         let (free, total) = self.device.ctx.mem_get_info()?;
         ensure!(
             free.checked_sub(total / 16).is_some_and(|n| needed <= n),
@@ -273,32 +338,33 @@ impl Engine {
             catalog.bytes == crate::mtp::WEIGHT_BYTES && catalog.tensors.len() == 22,
             "MTP-only ledger mismatch"
         );
-        let mut spec = self.model_spec.clone();
-        spec.layers = vec![LayerPlan {
-            mixer: Mixer::FullAttention,
-            state_index: 0,
-        }];
+        let spec = crate::mtp::component_spec(&self.model_spec);
         let state = StateStore::new(&spec, self.capacity, &self.device.stream)?;
-        let runtime = MtpRuntime::new(
+        let mut runtime = MtpRuntime::allocate(
             &self.device,
             &self.model_spec,
             &catalog,
             &state,
             &self.blas,
             plan,
+            1,
         )?;
-        ensure!(
-            runtime.allocation_bytes() + state.bytes()
-                == memory.total - memory.weights - memory.blas,
-            "MTP attachment allocation/budget mismatch"
-        );
+        for &rows in rows {
+            runtime.prepare_rows(&self.device, &catalog, &state, &self.blas, rows)?;
+        }
+        let bootstrap = Bootstrap::new(&self.device.stream, self.chunk)?;
         let target_checkpoint =
             StateCheckpoint::new(&self.state, &self.model_spec, 4, &self.device.stream)?;
-        let mtp_checkpoint =
-            StateCheckpoint::new(&state, &self.model_spec, 4, &self.device.stream)?;
+        let mtp_checkpoint = StateCheckpoint::new(&state, &spec, 4, &self.device.stream)?;
+        let journal = target_checkpoint.bytes() + mtp_checkpoint.bytes();
         ensure!(
-            target_checkpoint.bytes() + mtp_checkpoint.bytes() == journal,
-            "MTP journal budget mismatch"
+            runtime.allocation_bytes()
+                + state.bytes()
+                + catalog.bytes
+                + journal
+                + bootstrap.bytes()
+                == needed,
+            "MTP attachment allocation/budget mismatch"
         );
         self.device.stream.synchronize()?;
         self.mtp_state = Some(state);
@@ -317,6 +383,7 @@ impl Engine {
             #[cfg(test)]
             force_proposals: None,
             batch: None,
+            bootstrap,
         });
         eprintln!(
             "MTP_M2A_MEMORY additional_device_bytes={needed} checkpoint_bytes={journal} shared_weights_duplicated=0"
@@ -326,7 +393,7 @@ impl Engine {
 
     pub(in crate::backend::cuda::engine) fn mtp_prefill(&mut self, ids: &[u32]) -> Result<u32> {
         ensure!(
-            !ids.is_empty() && ids.len() < self.capacity - 1,
+            !ids.is_empty() && ids.len() < self.capacity,
             "MTP prefill needs room for decode"
         );
         let mut chain = self.mtp.take().context("MTP not enabled")?;
@@ -345,42 +412,36 @@ impl Engine {
             }
             chain.last_target.fill(bf16::ZERO);
             chain.recurrent.fill(bf16::ZERO);
-            // The M2a baseline observes the existing prefill without changing its
-            // chunk partition or target math. Only the final layer is consumed.
-            let mut trace = crate::trace::Trace::default();
-            let token = self.prefill(ids, Some(&mut trace))?;
-            let chunk = self.chunk;
-            let mut bound = Bound {
-                engine: self,
-                chain: &mut chain,
-            };
-            let mut seen = 0;
-            for (part, tokens) in ids.chunks(chunk).enumerate() {
-                let pre = trace.values(&format!("prefill.{part}.layer.63"))?;
-                ensure!(
-                    pre.len() == tokens.len() * HIDDEN,
-                    "MTP prefill hidden extent mismatch"
-                );
-                for (row, &input) in tokens.iter().enumerate() {
-                    if seen > 0 {
-                        let hidden = bound.chain.last_target.clone();
-                        bound.row(input, &hidden)?;
-                    }
-                    let hidden: Vec<_> = pre[row * HIDDEN..(row + 1) * HIDDEN]
-                        .iter()
-                        .copied()
-                        .map(bf16::from_f32)
-                        .collect();
-                    bound.chain.last_target = bound.tap_prefill(&hidden)?;
-                    seen += 1;
-                }
+            chain.bootstrap.last_rows = 0;
+            let token = self.prefill_chunks(ids, None, ids.len(), |engine, chunk| {
+                chain.bootstrap_chunk(engine, chunk)
+            })?;
+            chain.last_target = self.device.stream.clone_dtoh(&chain.bootstrap.carry)?;
+            if chain.bootstrap.last_rows > 0 {
+                let row = chain.bootstrap.last_rows - 1;
+                let hidden = match chain.options.recurrent_tap {
+                    MtpRecurrentTap::PreMtpNorm => &chain.runtime.work.x,
+                    MtpRecurrentTap::PostMtpNorm => &chain.runtime.work.n,
+                };
+                chain.recurrent = self
+                    .device
+                    .stream
+                    .clone_dtoh(&hidden.slice(row * HIDDEN..(row + 1) * HIDDEN))?;
             }
             ensure!(
-                bound.chain.cursor + 1 == bound.engine.position,
+                chain
+                    .last_target
+                    .iter()
+                    .chain(&chain.recurrent)
+                    .all(|x| x.is_finite()),
+                "nonfinite MTP bootstrap boundary"
+            );
+            ensure!(
+                chain.cursor + 1 == self.position,
                 "MTP bootstrap prefix mismatch"
             );
-            bound.chain.committed_position = bound.engine.position;
-            bound.chain.epoch = bound.engine.mtp_epoch;
+            chain.committed_position = self.position;
+            chain.epoch = self.mtp_epoch;
             Ok(token)
         })();
         if result.is_err() {

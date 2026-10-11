@@ -3,6 +3,9 @@ use crate::backend::{Settings, SpecBudget, TreeBuilder};
 use std::path::PathBuf;
 
 pub(super) fn load(write: bool) -> Result<Engine> {
+    load_capacity(write, 128)
+}
+pub(super) fn load_capacity(write: bool, capacity: usize) -> Result<Engine> {
     ensure!(
         std::env::var("FF_Q38_FULL_MODEL_WINDOW").as_deref() == Ok("granted"),
         "M2a requires a separate full-model cloud window"
@@ -14,7 +17,7 @@ pub(super) fn load(write: bool) -> Result<Engine> {
     Engine::load_kind(
         &dir,
         0,
-        128,
+        capacity,
         Some(16),
         Settings {
             tree_builder: TreeBuilder::Waves,

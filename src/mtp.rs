@@ -102,7 +102,7 @@ impl MtpPlan {
         );
         ensure!(
             self.capacity >= 32
-                && self.capacity < spec.max_position as usize
+                && self.capacity <= spec.max_position as usize
                 && self.capacity < i32::MAX as usize,
             "invalid MTP capacity/absolute position range"
         );
@@ -125,30 +125,45 @@ impl MtpPlan {
         );
         Ok(())
     }
+    pub fn check_absolute_rows(
+        &self,
+        prefix: usize,
+        rows: usize,
+        max_position: usize,
+    ) -> Result<()> {
+        self.check_rows(prefix, rows)?;
+        ensure!(
+            prefix
+                .checked_add(rows)
+                .is_some_and(|last| last < max_position),
+            "MTP shifted absolute position exceeds model limit"
+        );
+        Ok(())
+    }
     pub fn key_chunk(&self) -> u32 {
         256.min((self.capacity / 32 * 32) as u32)
     }
     pub fn memory(&self, spec: &ModelSpec) -> Result<MtpMemory> {
+        self.memory_with_head_rows(spec, self.max_rows)
+    }
+    pub fn memory_with_head_rows(&self, spec: &ModelSpec, head_rows: usize) -> Result<MtpMemory> {
         self.validate(spec)?;
+        ensure!(
+            head_rows > 0 && head_rows <= self.max_rows,
+            "invalid MTP head capacity"
+        );
         let mul = |a: usize, b: usize| {
             a.checked_mul(b)
                 .context("MTP memory multiplication overflow")
         };
         let rows = self.max_rows;
         let kv = mul(self.capacity, KV_ROW_BYTES)?;
-        let row_work = mul(rows, RowWorkSpec::new(spec)?.row_bytes()?)?;
+        let row_work = mul(rows, runtime_row_bytes(spec)?)?;
         // Work includes one logits row plus token/position/length. Extra storage
         // holds concat, embedding, incoming hidden, all-row head and positions.
-        let extra = mul(rows, 4 * HIDDEN * 2 + VOCAB * 2 + 3 * 4 + 24 * 4)?;
+        let extra = mul(head_rows, VOCAB * 2)?;
         let fixed = VOCAB * 2 + 12 + 64 * 8 + 32;
-        let prep = (mul(rows, 2048)?
-            .checked_add(255)
-            .context("MTP scratch overflow")?)
-            & !255;
-        let decode = usize::try_from(
-            AttentionWorkspace::q38(1, self.capacity as u32, self.key_chunk())?.bytes,
-        )?;
-        let scratch = prep.max(decode);
+        let scratch = scratch_bytes(self.capacity, rows)?;
         let blas = 4 * 1024 * 1024;
         let total = [
             PROBE_WEIGHT_BYTES,
@@ -174,6 +189,152 @@ impl MtpPlan {
             total,
         })
     }
+}
+
+fn runtime_row_bytes(spec: &ModelSpec) -> Result<usize> {
+    RowWorkSpec::new(spec)?
+        .row_bytes()?
+        .checked_add(4 * HIDDEN * 2 + 3 * 4 + 24 * 4)
+        .context("MTP runtime row bytes overflow")
+}
+fn scratch_bytes(capacity: usize, rows: usize) -> Result<usize> {
+    let prep = rows
+        .checked_mul(2048)
+        .and_then(|n| n.checked_add(255))
+        .context("MTP scratch overflow")?
+        & !255;
+    let decode = usize::try_from(
+        AttentionWorkspace::q38(1, capacity as u32, 256.min((capacity / 32 * 32) as u32))?.bytes,
+    )?;
+    Ok(prep.max(decode))
+}
+#[cfg(any(feature = "cuda", test))]
+pub(crate) struct AttachmentBudget {
+    pub fixed_bytes: usize,
+    pub row_bytes: usize,
+    capacity: usize,
+}
+#[cfg(any(feature = "cuda", test))]
+impl AttachmentBudget {
+    pub fn new(spec: &ModelSpec, capacity: usize) -> Result<Self> {
+        let row_bytes = runtime_row_bytes(spec)?
+            .checked_add(2 * HIDDEN * 2)
+            .context("MTP bootstrap row overflow")?;
+        let scratch = scratch_bytes(capacity, 1)?;
+        let fixed_bytes = attachment_bytes(spec, capacity, 1, true)?
+            .checked_sub(row_bytes)
+            .and_then(|n| n.checked_sub(scratch))
+            .context("MTP fixed budget underflow")?;
+        Ok(Self {
+            fixed_bytes,
+            row_bytes,
+            capacity,
+        })
+    }
+    pub fn workspace(&self, rows: usize) -> Result<usize> {
+        scratch_bytes(self.capacity, rows)
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn checkpoint_bytes(spec: &ModelSpec, rows: usize) -> Result<usize> {
+    use crate::{model_spec::Mixer, op_contract::GdnSpec};
+    ensure!(rows > 0, "empty checkpoint window");
+    let kv = rows
+        .checked_mul(spec.kv_heads as usize)
+        .and_then(|n| n.checked_mul(spec.head_dim as usize))
+        .and_then(|n| n.checked_mul(4))
+        .context("checkpoint KV overflow")?;
+    let g = GdnSpec::q38();
+    let gdn = usize::try_from(
+        g.state_bytes()?
+            .checked_add(g.history_bytes()?)
+            .context("GDN checkpoint overflow")?,
+    )?;
+    let mut bytes: usize = if spec.architecture == Architecture::Qwen35Text {
+        36
+    } else {
+        4
+    };
+    for layer in &spec.layers {
+        bytes = bytes
+            .checked_add(match layer.mixer {
+                Mixer::FullAttention => kv,
+                Mixer::Gdn => gdn,
+            })
+            .context("checkpoint byte count overflow")?;
+    }
+    Ok(bytes)
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn component_spec(spec: &ModelSpec) -> ModelSpec {
+    let mut component = spec.clone();
+    component.layers = vec![crate::model_spec::LayerPlan {
+        mixer: crate::model_spec::Mixer::FullAttention,
+        state_index: 0,
+    }];
+    component
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn batch_bytes(spec: &ModelSpec) -> Result<usize> {
+    checkpoint_bytes(spec, 4)?
+        .checked_add(4 * VOCAB * 2 + 32)
+        .context("MTP batch buffer overflow")
+}
+
+/// Additional resident and workspace bytes, excluding the Engine's shared BLAS.
+/// The ordinary workspace planner applies its existing reserve to this total.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn attachment_bytes(
+    spec: &ModelSpec,
+    capacity: usize,
+    rows: usize,
+    batched: bool,
+) -> Result<usize> {
+    let plan = MtpPlan {
+        hidden_tap: MtpHiddenTap::PostFinalNorm,
+        recurrent_tap: MtpRecurrentTap::PostMtpNorm,
+        max_rows: rows,
+        capacity,
+        phase: ExecutionPhase::Prefill,
+    };
+    let memory = plan.memory_with_head_rows(spec, 1)?;
+    let bootstrap = rows
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_mul(HIDDEN * 2))
+        .context("MTP bootstrap buffer overflow")?;
+    [
+        memory.total - memory.weights - memory.blas,
+        WEIGHT_BYTES,
+        checkpoint_bytes(spec, 4)?,
+        checkpoint_bytes(&component_spec(spec), 4)?,
+        bootstrap,
+        if batched { batch_bytes(spec)? } else { 0 },
+    ]
+    .into_iter()
+    .try_fold(0usize, |sum, n| {
+        sum.checked_add(n).context("MTP attachment byte overflow")
+    })
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn bootstrap_rows(prompt: usize, chunk: usize) -> Result<Vec<usize>> {
+    ensure!(prompt > 0 && chunk > 0, "empty MTP bootstrap shape");
+    let mut rows = std::collections::BTreeSet::from([1]);
+    let first = prompt.min(chunk);
+    if first > 1 {
+        rows.insert(first - 1);
+    }
+    let mut remaining = prompt - first;
+    while remaining > 0 {
+        let count = remaining.min(chunk);
+        rows.insert(count);
+        remaining -= count;
+    }
+    Ok(rows.into_iter().collect())
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -299,5 +460,92 @@ mod tests {
         assert!(!L::MtpProbe.selects(S::Vision));
         assert!(!L::TextOnly.selects(S::Mtp));
         assert!(L::TextWithMtp.selects(S::Text));
+    }
+
+    #[test]
+    fn maximum_capacity_checks_shifted_positions_at_execution() -> Result<()> {
+        let mut s = spec();
+        s.max_position = 128;
+        let p = MtpPlan {
+            max_rows: 16,
+            capacity: 128,
+            ..plan()
+        };
+        p.validate(&s)?;
+        p.check_absolute_rows(125, 2, 128)?;
+        assert!(p.check_absolute_rows(126, 2, 128).is_err());
+        assert!(p.check_absolute_rows(usize::MAX, 1, 128).is_err());
+        assert!(MtpPlan { capacity: 129, ..p }.validate(&s).is_err());
+        assert!(p.check_rows(127, 1).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_tails_and_attachment_share_the_workspace_budget() -> Result<()> {
+        assert_eq!(bootstrap_rows(1, 16)?, [1]);
+        assert_eq!(bootstrap_rows(16, 16)?, [1, 15]);
+        assert_eq!(bootstrap_rows(17, 16)?, [1, 15]);
+        assert_eq!(bootstrap_rows(33, 16)?, [1, 15, 16]);
+        assert_eq!(bootstrap_rows(53, 16)?, [1, 5, 15, 16]);
+        let s = spec();
+        let p = MtpPlan {
+            max_rows: 16,
+            capacity: 128,
+            ..plan()
+        };
+        assert_eq!(
+            p.memory(&s)?.total - p.memory_with_head_rows(&s, 1)?.total,
+            15 * VOCAB * 2
+        );
+        let b = AttachmentBudget::new(&s, 128)?;
+        for rows in [1, 2, 15, 16, 32, 128] {
+            assert_eq!(
+                b.fixed_bytes + rows * b.row_bytes + b.workspace(rows)?,
+                attachment_bytes(&s, 128, rows, true)?
+            );
+        }
+        let total = 8usize << 30;
+        let request = crate::prefill::WorkspaceRequest {
+            capacity: 128,
+            requested: None,
+            total,
+            alignment: 8,
+            free_after_resident: total / 16
+                + b.fixed_bytes
+                + 20 * (64 + b.row_bytes)
+                + b.workspace(20)?
+                + 1024,
+            row_bytes: 64,
+            fixed_transient_bytes: 0,
+        };
+        let plain = crate::prefill::WorkspaceBudget::new(request, |_| Ok(1024))?;
+        let combined = crate::prefill::WorkspaceBudget::new(
+            crate::prefill::WorkspaceRequest {
+                row_bytes: request.row_bytes + b.row_bytes,
+                fixed_transient_bytes: b.fixed_bytes,
+                ..request
+            },
+            |rows| Ok(1024 + b.workspace(rows)?),
+        )?;
+        assert!(combined.plan.chunk < plain.plan.chunk);
+        assert_eq!(combined.plan.chunk, 16);
+        assert_eq!(combined.plan.reserve_bytes, total / 16);
+        assert!(
+            combined.planned_transient_bytes + combined.plan.reserve_bytes
+                <= request.free_after_resident
+        );
+        assert!(
+            crate::prefill::WorkspaceBudget::new(
+                crate::prefill::WorkspaceRequest {
+                    requested: Some(32),
+                    row_bytes: request.row_bytes + b.row_bytes,
+                    fixed_transient_bytes: b.fixed_bytes,
+                    ..request
+                },
+                |rows| Ok(1024 + b.workspace(rows)?)
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }
