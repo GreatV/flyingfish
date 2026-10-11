@@ -1,7 +1,13 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use flyingfish::backend;
-use flyingfish::{bench as measure, config::Config, model::Model, tokenizer, trace::Trace};
+use flyingfish::{
+    bench as measure,
+    config::Config,
+    model::{Model, check_generation_capacity},
+    tokenizer,
+    trace::Trace,
+};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -90,6 +96,11 @@ enum Command {
             help = "Zero-based decoder layer for operator trace"
         )]
         trace_layer: Option<usize>,
+        #[arg(
+            long,
+            help = "Processor-packed image input saved by the serve input trace"
+        )]
+        image_tensors: Option<PathBuf>,
     },
     Serve {
         #[arg(long, default_value_t = 8080)]
@@ -257,20 +268,6 @@ fn output_path(path: &Path, model: &Path) -> Result<PathBuf> {
     Ok(result)
 }
 
-fn check_generation_capacity(prompt: usize, count: usize, capacity: usize) -> Result<()> {
-    ensure!(count > 0, "max-new-tokens must be positive");
-    // Prefill emits the first token; count - 1 decode steps each write one KV row.
-    // Graph capture requires at least one free slot after prefill.
-    let required = prompt
-        .checked_add((count - 1).max(1))
-        .context("prompt and generation required KV capacity overflows usize")?;
-    ensure!(
-        required <= capacity,
-        "prompt and generation require KV capacity {required}, got {capacity}"
-    );
-    Ok(())
-}
-
 fn generate(
     cli: &Cli,
     input: &Input,
@@ -278,6 +275,7 @@ fn generate(
     graph: bool,
     dump: &Option<PathBuf>,
     trace_layer: Option<usize>,
+    image_tensors: &Option<PathBuf>,
 ) -> Result<()> {
     ensure!(count > 0, "max-new-tokens must be positive");
     if let Some(layer) = trace_layer {
@@ -292,6 +290,20 @@ fn generate(
         "--graph and --dump cannot be combined"
     );
     let ids = input.read(&cli.model)?;
+    ensure!(
+        image_tensors.is_none() || cli.draft_model.is_none(),
+        "image input does not support a draft model"
+    );
+    let images = image_tensors
+        .as_ref()
+        .map(|path| flyingfish::serve::image::PreparedImages::read(path, &ids))
+        .transpose()?;
+    if let Some(images) = &images {
+        images.input(&ids).validate(
+            &flyingfish::model_spec::ModelSpec::read(&cli.model)?,
+            cli.capacity,
+        )?;
+    }
     if let Some(draft) = &cli.draft_model {
         ensure!(
             trace_layer.is_none(),
@@ -351,43 +363,60 @@ fn generate(
     }
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
     let mut trace = dump.as_ref().map(|_| Trace::default());
-    let start = Instant::now();
-    let first = m.prefill(&ids, trace.as_mut())?;
-    let prefill_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let mut generated = vec![first];
-    let capture_start = Instant::now();
-    if graph && count > 1 && !m.config.eos_token_id.contains(&first) {
-        m.capture()?;
-    }
-    let capture_ms = if graph {
-        capture_start.elapsed().as_secs_f64() * 1000.0
+    let output = if let Some(images) = &images {
+        flyingfish::model::generate_multimodal(
+            &mut m,
+            &images.input(&ids),
+            count,
+            false,
+            graph,
+            trace.as_mut(),
+            &mut |_| true,
+        )?
     } else {
-        0.0
+        flyingfish::model::generate_plain(
+            &mut m,
+            &ids,
+            count,
+            false,
+            graph,
+            trace.as_mut(),
+            &mut |_| true,
+        )?
     };
-    let start = Instant::now();
-    while generated.len() < count
-        && !m
-            .config
-            .eos_token_id
-            .contains(generated.last().context("generated token missing")?)
-    {
-        let prefix = format!("decode.{}", generated.len() - 1);
-        generated.push(m.decode(graph, trace.as_mut().map(|t| (t, prefix.as_str())))?);
-    }
-    let decode_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let decode_steps = generated.len() - 1;
     if let (Some(t), Some(path)) = (&trace, &dump) {
         t.save(path)?;
     }
     println!(
         "{}",
-        serde_json::json!({ "input_ids": ids, "generated_ids": generated,
-        "text": tokenizer::decode(&cli.model, &generated)?, "load_ms": load_ms, "prefill_ms": prefill_ms,
-        "capture_ms": capture_ms, "decode_ms": decode_ms, "decode_steps": decode_steps,
-        "decode_tok_s": if decode_steps > 0 { Some(decode_steps as f64 * 1000.0 / decode_ms) } else { None },
-        "graph": graph, "dump": dump, "trace_layer": trace_layer.unwrap_or(0) })
+        generation_report(
+            &ids,
+            &output,
+            tokenizer::decode(&cli.model, &output.ids)?,
+            load_ms,
+            graph,
+            &dump,
+            trace_layer,
+        )
     );
     Ok(())
+}
+
+fn generation_report(
+    ids: &[u32],
+    output: &flyingfish::model::GenerationOutput,
+    text: String,
+    load_ms: f64,
+    graph: bool,
+    dump: &Option<PathBuf>,
+    trace_layer: Option<usize>,
+) -> serde_json::Value {
+    let decode_steps = output.ids.len() - 1;
+    serde_json::json!({ "input_ids": ids, "generated_ids": output.ids,
+        "text": text, "load_ms": load_ms, "prefill_ms": output.prefill_ms,
+        "capture_ms": output.capture_ms, "decode_ms": output.decode_ms, "decode_steps": decode_steps,
+        "decode_tok_s": if decode_steps > 0 { Some(decode_steps as f64 * 1000.0 / output.decode_ms) } else { None },
+        "graph": graph, "dump": dump, "trace_layer": trace_layer.unwrap_or(0) })
 }
 
 fn bench(
@@ -446,17 +475,28 @@ fn run() -> Result<()> {
             graph,
             dump,
             trace_layer,
-        } => generate(&cli, input, *max_new_tokens, *graph, dump, *trace_layer),
+            image_tensors,
+        } => generate(
+            &cli,
+            input,
+            *max_new_tokens,
+            *graph,
+            dump,
+            *trace_layer,
+            image_tensors,
+        ),
         Command::Serve { port } => {
             let draft = cli
                 .draft_model
                 .as_ref()
-                .context("serve requires --draft-model")?
-                .canonicalize()?;
-            eprintln!("draft_model={}", draft.display());
+                .map(|path| path.canonicalize())
+                .transpose()?;
+            if let Some(draft) = &draft {
+                eprintln!("draft_model={}", draft.display());
+            }
             flyingfish::serve::run(
                 cli.model.clone(),
-                Some(draft),
+                draft,
                 flyingfish::spec::Options {
                     device: cli.device,
                     capacity: cli.capacity,
@@ -841,6 +881,45 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generate_graph_json_contract_is_unchanged() {
+        let output = flyingfish::model::GenerationOutput {
+            ids: vec![7, 8, 9],
+            prefill_ms: 2.0,
+            capture_ms: 1.25,
+            decode_ms: 4.0,
+        };
+        let report = generation_report(&[1, 2], &output, "answer".into(), 5.0, true, &None, None);
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "input_ids": [1, 2], "generated_ids": [7, 8, 9], "text": "answer",
+                "load_ms": 5.0, "prefill_ms": 2.0, "capture_ms": 1.25,
+                "decode_ms": 4.0, "decode_steps": 2, "decode_tok_s": 500.0,
+                "graph": true, "dump": null, "trace_layer": 0
+            })
+        );
+        let first_only = flyingfish::model::GenerationOutput {
+            ids: vec![7],
+            ..output
+        };
+        let first_report = generation_report(
+            &[1, 2],
+            &first_only,
+            "answer".into(),
+            5.0,
+            true,
+            &None,
+            None,
+        );
+        assert_eq!(first_report["decode_steps"], 0);
+        assert_eq!(first_report["decode_tok_s"], serde_json::Value::Null);
+        assert_eq!(
+            first_report.as_object().unwrap().keys().collect::<Vec<_>>(),
+            report.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn generation_capacity_accounts_for_prefill_token_and_capture_slot() -> Result<()> {

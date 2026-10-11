@@ -22,9 +22,13 @@ impl Shared {
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))
             .context("detok init")?;
-        Ok(Self {
+        Ok(Self::new(tokenizer))
+    }
+
+    pub(super) fn new(tokenizer: Tokenizer) -> Self {
+        Self {
             tokenizer: Arc::new(tokenizer),
-        })
+        }
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
