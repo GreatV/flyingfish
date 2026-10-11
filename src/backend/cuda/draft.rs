@@ -790,6 +790,7 @@ impl Draft {
                         q_heads: c.num_attention_heads,
                         kv_heads: c.num_key_value_heads,
                         capacity: self.capacity,
+                        head_dim: c.head_dim,
                         causal: false,
                     },
                 )?;

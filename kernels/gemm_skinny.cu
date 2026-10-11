@@ -42,7 +42,7 @@
 //          long ldw, int m)
 //     launch: grid = dim3(ceil(out/16)), block = 128, smem = 40960
 //
-// HOST INTEGRATION (Codex-A):
+// Host integration:
 //   - Selection between this kernel and the cuBLAS path is a setup-time
 //     calibration per (device, shape, M bucket): measure both, persist the
 //     winner. (4090 measured: skinny wins for M >= 7 in-graph; A4000 picks

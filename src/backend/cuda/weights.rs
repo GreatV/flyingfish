@@ -3,12 +3,9 @@ use crate::config::Config;
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaSlice, CudaStream, PinnedHostSlice};
 use half::bf16;
-use memmap2::{Mmap, MmapOptions};
 use safetensors::{Dtype, SafeTensors};
-use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
     path::Path,
     sync::Arc,
 };
@@ -30,23 +27,29 @@ pub struct Weights {
     pub bytes: usize,
 }
 
-#[derive(Deserialize)]
-struct Index {
-    weight_map: BTreeMap<String, String>,
-}
+use crate::checkpoint::{Index, MappedCheckpoint, TensorManifest};
 
 pub(crate) struct Loader<'a> {
+    source: &'a MappedCheckpoint,
+    read_buffer: Vec<u8>,
     tensors: BTreeMap<String, SafeTensors<'a>>,
     index: Index,
     seen: BTreeSet<String>,
     staging: PinnedHostSlice<bf16>,
     stream: Arc<CudaStream>,
+    byte_staging: Option<PinnedHostSlice<u8>>,
+    verify_upload: bool,
     pub(crate) bytes: usize,
 }
 
 impl Loader<'_> {
     pub(crate) fn load(&mut self, specs: &[(String, Vec<usize>)]) -> Result<CudaSlice<bf16>> {
-        let count: usize = specs.iter().map(|(_, s)| s.iter().product::<usize>()).sum();
+        let count = specs.iter().try_fold(0usize, |total, (_, shape)| {
+            let n = shape.iter().try_fold(1usize, |n, &d| {
+                n.checked_mul(d).context("weight shape overflow")
+            })?;
+            total.checked_add(n).context("weight allocation overflow")
+        })?;
         let mut dst = unsafe { self.stream.alloc::<bf16>(count)? };
         let mut offset = 0;
         for (name, shape) in specs {
@@ -67,17 +70,47 @@ impl Loader<'_> {
                 t.shape()
             );
             ensure!(self.seen.insert(name.clone()), "tensor {name} loaded twice");
-            for chunk in t.data().chunks(self.staging.len() * 2) {
+            for mapped_chunk in t.data().chunks(self.staging.len() * 2) {
+                let chunk = if self.verify_upload {
+                    let len = mapped_chunk.len();
+                    self.source.read_mapped_range(
+                        file,
+                        mapped_chunk,
+                        &mut self.read_buffer[..len],
+                    )?;
+                    &self.read_buffer[..len]
+                } else {
+                    mapped_chunk
+                };
                 let len = chunk.len() / 2;
                 let buf = self.staging.as_mut_slice()?;
                 decode_bf16(chunk, &mut buf[..len]);
+                if self.verify_upload {
+                    ensure!(
+                        buf[..len].iter().all(|v| v.to_f32().is_finite()),
+                        "nonfinite BF16 tensor {name}"
+                    );
+                }
                 let mut view = dst.slice_mut(offset..offset + len);
                 self.stream
                     .memcpy_htod(&self.staging.as_slice()?[..len], &mut view)?;
                 self.stream.synchronize()?;
+                if self.verify_upload {
+                    let received = self.stream.clone_dtoh(&view)?;
+                    ensure!(
+                        received
+                            .iter()
+                            .flat_map(|v| v.to_bits().to_le_bytes())
+                            .eq(chunk.iter().copied()),
+                        "upload byte mismatch for {name}"
+                    );
+                }
                 offset += len;
             }
-            self.bytes += t.data().len();
+            self.bytes = self
+                .bytes
+                .checked_add(t.data().len())
+                .context("uploaded byte count overflow")?;
         }
         Ok(dst)
     }
@@ -88,44 +121,52 @@ pub(crate) fn checkpoint<T>(
     d: &Device,
     read: impl FnOnce(&mut Loader<'_>) -> Result<T>,
 ) -> Result<T> {
-    let index: Index = if dir.join("model.safetensors.index.json").is_file() {
-        serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json"))?)?
-    } else {
-        let file = File::open(dir.join("model.safetensors"))?;
-        let map = unsafe { MmapOptions::new().map(&file)? };
-        let tensors = SafeTensors::deserialize(&map)?;
-        Index {
-            weight_map: tensors
-                .names()
-                .into_iter()
-                .map(|name| (name.to_owned(), "model.safetensors".to_owned()))
-                .collect(),
+    let mapped = MappedCheckpoint::open(dir)?;
+    checkpoint_mapped(&mapped, d, None, read)
+}
+
+pub(super) fn checkpoint_mapped<T>(
+    mapped: &MappedCheckpoint,
+    d: &Device,
+    manifest: Option<&TensorManifest>,
+    read: impl FnOnce(&mut Loader<'_>) -> Result<T>,
+) -> Result<T> {
+    let index = mapped.index.clone();
+    let tensors = mapped.views()?;
+    // Verified uploads read staging on the CPU, so they need cacheable pinned memory.
+    let staging = unsafe {
+        if manifest.is_some() {
+            d.ctx.alloc_pinned_with_flags::<bf16>(1024 * 1024, 0)?
+        } else {
+            d.ctx.alloc_pinned::<bf16>(1024 * 1024)?
         }
     };
-    let mut maps: BTreeMap<String, Mmap> = BTreeMap::new();
-    for name in index.weight_map.values() {
-        ensure!(
-            Path::new(name)
-                .components()
-                .all(|c| matches!(c, std::path::Component::Normal(_))),
-            "unsafe shard path {name}"
-        );
-        if !maps.contains_key(name) {
-            let file = File::open(dir.join(name)).with_context(|| format!("open shard {name}"))?;
-            maps.insert(name.clone(), unsafe { MmapOptions::new().map(&file)? });
-        }
-    }
-    let tensors = maps
-        .iter()
-        .map(|(name, map)| Ok((name.clone(), SafeTensors::deserialize(map)?)))
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let staging = unsafe { d.ctx.alloc_pinned::<bf16>(1024 * 1024)? };
     let mut l = Loader {
+        source: mapped,
+        read_buffer: if manifest.is_some() {
+            vec![0; 2 * 1024 * 1024]
+        } else {
+            Vec::new()
+        },
         tensors,
         index,
-        seen: BTreeSet::new(),
+        seen: manifest
+            .map(|m| {
+                m.entries
+                    .iter()
+                    .filter(|(_, e)| !e.load)
+                    .map(|(n, _)| n.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
         staging,
         stream: d.upload.clone(),
+        byte_staging: if manifest.is_some() {
+            Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(2 * 1024 * 1024, 0)? })
+        } else {
+            None
+        },
+        verify_upload: manifest.is_some(),
         bytes: 0,
     };
     let value = read(&mut l)?;
@@ -195,6 +236,128 @@ impl Weights {
                 bytes,
             })
         })
+    }
+}
+
+impl Loader<'_> {
+    pub(super) fn load_fp8(&mut self, name: &str, shape: &[usize]) -> Result<CudaSlice<u8>> {
+        let file = self
+            .index
+            .weight_map
+            .get(name)
+            .with_context(|| format!("missing tensor {name}"))?;
+        let t = self.tensors[file].tensor(name)?;
+        ensure!(
+            t.dtype() == Dtype::F8_E4M3 && t.shape() == shape,
+            "FP8 dtype/shape mismatch: {name}"
+        );
+        ensure!(
+            self.seen.insert(name.into()),
+            "tensor {name} consumed twice"
+        );
+        let staging = self
+            .byte_staging
+            .as_mut()
+            .context("FP8 upload requires audited manifest")?;
+        let mut dst = unsafe { self.stream.alloc::<u8>(t.data().len())? };
+        for (i, mapped_chunk) in t.data().chunks(staging.len()).enumerate() {
+            let len = mapped_chunk.len();
+            self.source.read_mapped_range(
+                file,
+                mapped_chunk,
+                &mut staging.as_mut_slice()?[..len],
+            )?;
+            ensure!(
+                staging.as_slice()?[..len].iter().all(|c| c & 0x7f != 0x7f),
+                "nonfinite FP8 code in {name}"
+            );
+            let start = i * staging.len();
+            let mut view = dst.slice_mut(start..start + len);
+            self.stream
+                .memcpy_htod(&staging.as_slice()?[..len], &mut view)?;
+            self.stream.synchronize()?;
+            let received = self.stream.clone_dtoh(&view)?;
+            ensure!(
+                received.as_slice() == &staging.as_slice()?[..len],
+                "FP8 upload byte mismatch for {name}"
+            );
+        }
+
+        self.bytes = self
+            .bytes
+            .checked_add(t.data().len())
+            .context("uploaded byte count overflow")?;
+        Ok(dst)
+    }
+}
+
+pub(crate) enum StoredTensor {
+    Bf16(CudaSlice<bf16>),
+    Fp8(CudaSlice<u8>),
+}
+pub(crate) struct WeightCatalog {
+    pub tensors: BTreeMap<String, StoredTensor>,
+    pub manifest: TensorManifest,
+    pub bytes: usize,
+}
+impl WeightCatalog {
+    /// Move shared global tensors into the existing Engine weight owner.
+    pub fn take_globals(&mut self) -> Result<Weights> {
+        let mut take = |name: &str| match self.tensors.remove(name) {
+            Some(StoredTensor::Bf16(v)) => Ok(v),
+            _ => anyhow::bail!("missing/non-BF16 global tensor {name}"),
+        };
+        Ok(Weights {
+            embed: take("model.language_model.embed_tokens.weight")?,
+            norm: take("model.language_model.norm.weight")?,
+            head: take("lm_head.weight")?,
+            layers: Vec::new(),
+            bytes: self.bytes,
+        })
+    }
+    pub fn load(dir: &Path, spec: &crate::model_spec::ModelSpec, d: &Device) -> Result<Self> {
+        Self::load_with_policy(dir, spec, d, crate::checkpoint::LoadPolicy::TextOnly)
+    }
+    pub fn load_with_policy(
+        dir: &Path,
+        spec: &crate::model_spec::ModelSpec,
+        d: &Device,
+        policy: crate::checkpoint::LoadPolicy,
+    ) -> Result<Self> {
+        let mapped = MappedCheckpoint::open(dir)?;
+        let manifest = mapped.q38_manifest_with_policy(spec, policy)?;
+        let (tensors, bytes) = checkpoint_mapped(&mapped, d, Some(&manifest), |loader| {
+            let mut tensors = BTreeMap::new();
+            for (name, entry) in &manifest.entries {
+                if !entry.load {
+                    continue;
+                }
+                let value = match entry.dtype {
+                    Dtype::BF16 => {
+                        StoredTensor::Bf16(loader.load(&[(name.clone(), entry.shape.clone())])?)
+                    }
+                    Dtype::F8_E4M3 => StoredTensor::Fp8(loader.load_fp8(name, &entry.shape)?),
+                    _ => anyhow::bail!("unsupported loaded dtype for {name}"),
+                };
+                tensors.insert(name.clone(), value);
+            }
+            Ok((tensors, loader.bytes))
+        })?;
+        ensure!(
+            bytes == manifest.resident_bytes,
+            "resident/upload byte count mismatch"
+        );
+        Ok(Self {
+            tensors,
+            manifest,
+            bytes,
+        })
+    }
+    pub fn bf16(&self, name: &str) -> Result<&CudaSlice<bf16>> {
+        match self.tensors.get(name) {
+            Some(StoredTensor::Bf16(v)) => Ok(v),
+            _ => anyhow::bail!("missing/non-BF16 tensor {name}"),
+        }
     }
 }
 

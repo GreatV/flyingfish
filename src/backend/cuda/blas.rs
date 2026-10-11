@@ -2,7 +2,7 @@ use super::{Device, cubin, linear_calibrate, ops::Ops};
 
 /// Uniform number of cuBLASLt heuristic candidates per linear shape: every
 /// shape trials CublasLt(0..LT_CANDIDATES) plus Skinny; calibration picks
-/// per shape. LT-AUTOTUNE (2026-10-09): K=2 captures all measured wins.
+/// per shape; calibration considers two Lt heuristic candidates.
 pub const LT_CANDIDATES: u32 = 2;
 
 unsafe fn heuristic_algos(
@@ -119,6 +119,18 @@ impl Plan {
         workspace: usize,
         algo_index: u32,
     ) -> Result<Self> {
+        Self::new_with_bias(handle, rows, output, input, workspace, algo_index, None)
+    }
+
+    fn new_with_bias(
+        handle: sys::cublasLtHandle_t,
+        rows: usize,
+        output: usize,
+        input: usize,
+        workspace: usize,
+        algo_index: u32,
+        bias: Option<u64>,
+    ) -> Result<Self> {
         let mut p = Self {
             desc: std::ptr::null_mut(),
             a: std::ptr::null_mut(),
@@ -145,13 +157,41 @@ impl Plan {
             )?;
         }
         let dtype = sys::cudaDataType_t::CUDA_R_16BF;
+        if let Some(ptr) = bias {
+            let epilogue = sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
+            unsafe {
+                lt::set_matmul_desc_attribute(
+                    p.desc,
+                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
+                    (&epilogue as *const sys::cublasLtEpilogue_t).cast(),
+                    size_of::<sys::cublasLtEpilogue_t>(),
+                )?;
+                lt::set_matmul_desc_attribute(
+                    p.desc,
+                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                    (&ptr as *const u64).cast(),
+                    size_of::<u64>(),
+                )?;
+                lt::set_matmul_desc_attribute(
+                    p.desc,
+                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                    (&dtype as *const sys::cudaDataType_t).cast(),
+                    size_of::<sys::cudaDataType_t>(),
+                )?;
+            }
+        }
         p.a = lt::create_matrix_layout(dtype, input as u64, output as u64, input as i64)?;
         p.b = lt::create_matrix_layout(dtype, input as u64, rows as u64, input as i64)?;
         p.c = lt::create_matrix_layout(dtype, output as u64, rows as u64, output as i64)?;
         p.pref = lt::create_matmul_pref()?;
         unsafe {
-            let reduction_mask =
-                sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
+            // Split-K bias epilogues can round the reduced output before bias.
+            // Keep biased plans single-pass to preserve BeforeOutputRound.
+            let reduction_mask = if bias.is_some() {
+                sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_NONE as u32
+            } else {
+                sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32
+            };
             lt::set_matmul_pref_attribute(p.pref, sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
                 (&reduction_mask as *const u32).cast(), size_of::<u32>())?;
             lt::set_matmul_pref_attribute(
@@ -179,6 +219,14 @@ impl Plan {
         let reduction = p.attr(
             sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
         )?;
+        if bias.is_some() {
+            ensure!(
+                split_k == 1
+                    && reduction
+                        == sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_NONE as i32,
+                "biased Lt plan must add bias before output rounding: split_k={split_k}, reduction={reduction}"
+            );
+        }
         ensure!(
             split_k <= 1
                 || reduction
@@ -216,8 +264,11 @@ pub struct Blas {
     choices: RefCell<BTreeMap<LinearShape, LinearChoice>>,
     coverage: Option<(usize, std::collections::BTreeSet<(usize, usize)>)>,
     calibration: linear_calibrate::Environment,
+    fp8: Option<super::linear::Fp8Ops>,
     skinny: CudaFunction,
     plans: RefCell<BTreeMap<(usize, usize, usize, u32), Plan>>,
+    biased_plans: RefCell<BTreeMap<(u32, u32, u32, u64), Plan>>,
+    bias_add: Option<CudaFunction>,
     handle: sys::cublasLtHandle_t,
     decode: CudaBlas,
     workspace: CudaSlice<u8>,
@@ -247,8 +298,11 @@ impl Blas {
             choices: RefCell::new(BTreeMap::new()),
             coverage: None,
             calibration,
+            fp8: None,
             skinny: cubin::module(&device.ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,
             plans: RefCell::new(BTreeMap::new()),
+            biased_plans: RefCell::new(BTreeMap::new()),
+            bias_add: None,
             handle,
             decode,
             workspace,
@@ -503,6 +557,7 @@ impl Drop for Blas {
     fn drop(&mut self) {
         drop_result("synchronize BLAS stream", self.stream.synchronize());
         self.plans.borrow_mut().clear();
+        self.biased_plans.borrow_mut().clear();
         unsafe {
             drop_result("destroy Lt handle", lt::destroy_handle(self.handle));
         }
@@ -516,5 +571,222 @@ fn drop_result(name: &str, result: std::result::Result<(), impl std::fmt::Debug>
             std::io::stderr().lock(),
             "{name} failed during drop: {error:?}"
         );
+    }
+}
+
+impl Blas {
+    pub(crate) fn enable_fp8(&mut self, ctx: &Arc<cudarc::driver::CudaContext>) -> Result<()> {
+        ensure!(self.fp8.is_none(), "FP8 operators already bound");
+        self.fp8 = Some(super::linear::Fp8Ops::new(ctx)?);
+        Ok(())
+    }
+    pub(crate) fn fp8_ops(&self) -> Result<&super::linear::Fp8Ops> {
+        self.fp8.as_ref().context("FP8 operators not bound")
+    }
+    // Setup/eager binding only. M1 Prefill also uses Lt BF16.
+    pub(crate) fn prepare_fixed(&self, rows: u32, output: u32, input: u32) -> Result<()> {
+        ensure!(
+            [rows, output, input]
+                .iter()
+                .all(|&n| n > 0 && n <= i32::MAX as u32),
+            "invalid fixed linear dimensions"
+        );
+        let key = (rows as usize, output as usize, input as usize, 0);
+        if !self.plans.borrow().contains_key(&key) {
+            let p = Plan::new(self.handle, key.0, key.1, key.2, self.workspace.len(), 0)?;
+            self.plans.borrow_mut().insert(key, p);
+        }
+        Ok(())
+    }
+    pub(crate) fn linear_typed(
+        &self,
+        phase: crate::op_contract::ExecutionPhase,
+        weight: super::linear::LinearWeightRef,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        use super::linear::LinearWeightRef;
+        if phase == crate::op_contract::ExecutionPhase::Decode {
+            ensure!(x.shape[0] == 1, "Decode requires M1");
+        }
+        match weight {
+            LinearWeightRef::BlockFp8 { codes, scale } => {
+                ensure!(
+                    phase == crate::op_contract::ExecutionPhase::Decode,
+                    "Prefill requires materialized BF16 weight"
+                );
+                self.fp8_ops()?.gemv(&self.stream, codes, scale, x, y)
+            }
+            LinearWeightRef::Bf16(w) => {
+                w.validate()?;
+                super::linear::validate_call(w.shape, x, &y.0)?;
+                super::linear::disjoint(&w, &y.0)?;
+                ensure!(
+                    w.stride == [u64::from(w.shape[1]), 1],
+                    "BF16 linear requires row-major weight"
+                );
+                let plans = self.plans.borrow();
+                let p = plans
+                    .get(&(
+                        x.shape[0] as usize,
+                        w.shape[0] as usize,
+                        w.shape[1] as usize,
+                        0,
+                    ))
+                    .context("fixed Lt plan missing; bind before run/capture")?;
+                let (workspace, _r) = self.workspace.device_ptr(&self.stream);
+                let alpha = 1f32;
+                let beta = 0f32;
+                unsafe {
+                    lt::matmul(
+                        self.handle,
+                        p.desc,
+                        (&alpha as *const f32).cast(),
+                        (&beta as *const f32).cast(),
+                        w.ptr as _,
+                        p.a,
+                        x.ptr as _,
+                        p.b,
+                        y.0.ptr as _,
+                        p.c,
+                        y.0.ptr as _,
+                        p.c,
+                        p.algo.as_ref().context("fixed Lt algo missing")?,
+                        workspace as _,
+                        self.workspace.len(),
+                        self.stream.cu_stream() as _,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Blas {
+    /// Bind a BF16 bias epilogue before run/capture. The stable bias pointer is
+    /// part of the plan key; descriptor mutation is never needed during run.
+    pub(crate) fn prepare_biased(
+        &mut self,
+        rows: u32,
+        output: u32,
+        input: u32,
+        bias: super::contracts::Tensor<bf16, 1>,
+        mode: super::linear::LinearBiasMode,
+    ) -> Result<()> {
+        ensure!(
+            [rows, output, input]
+                .iter()
+                .all(|&n| n > 0 && n <= i32::MAX as u32),
+            "invalid biased linear dimensions"
+        );
+        bias.validate()?;
+        ensure!(
+            bias.shape == [output] && bias.stride == [1],
+            "linear bias shape mismatch"
+        );
+        if mode == super::linear::LinearBiasMode::AfterOutputRound {
+            self.prepare_fixed(rows, output, input)?;
+            if self.bias_add.is_none() {
+                self.bias_add = Some(
+                    cubin::module(self.stream.context(), "q38_common")?
+                        .load_function("q38_bias_add")?,
+                );
+            }
+            return Ok(());
+        }
+        let key = (rows, output, input, bias.ptr);
+        let mut plans = self.biased_plans.borrow_mut();
+        if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry(key) {
+            let plan = Plan::new_with_bias(
+                self.handle,
+                rows as usize,
+                output as usize,
+                input as usize,
+                self.workspace.len(),
+                0,
+                Some(bias.ptr),
+            )?;
+            plan.describe(rows as usize, output as usize, input as usize)?;
+            entry.insert(plan);
+        }
+        Ok(())
+    }
+
+    /// BF16 inputs/weights/bias and FP32 accumulation. The explicit mode selects
+    /// bias before the output conversion or a subsequent BF16 bias add.
+    pub(crate) fn linear_biased(
+        &self,
+        weight: super::contracts::Tensor<bf16, 2>,
+        bias: super::contracts::Tensor<bf16, 1>,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<bf16, 2>,
+        mode: super::linear::LinearBiasMode,
+    ) -> Result<()> {
+        weight.validate()?;
+        bias.validate()?;
+        super::linear::validate_call(weight.shape, x, &y.0)?;
+        ensure!(
+            weight.stride == [u64::from(weight.shape[1]), 1]
+                && bias.shape == [weight.shape[0]]
+                && bias.stride == [1],
+            "biased linear layout mismatch"
+        );
+        super::linear::disjoint(&weight, &y.0)?;
+        super::linear::disjoint(&bias, &y.0)?;
+        if mode == super::linear::LinearBiasMode::AfterOutputRound {
+            let add = self
+                .bias_add
+                .as_ref()
+                .context("bias add kernel not prepared")?;
+            self.linear_typed(
+                crate::op_contract::ExecutionPhase::Prefill,
+                super::linear::LinearWeightRef::Bf16(weight),
+                x,
+                y,
+            )?;
+            let count = u64::from(y.0.shape[0]) * u64::from(y.0.shape[1]);
+            unsafe {
+                self.stream
+                    .launch_builder(add)
+                    .arg(&y.0.ptr)
+                    .arg(&bias.ptr)
+                    .arg(&count)
+                    .arg(&y.0.shape[1])
+                    .launch(super::ops::grid(
+                        count.div_ceil(256).min(65535) as usize,
+                        256,
+                    ))?;
+            }
+            return Ok(());
+        }
+        let plans = self.biased_plans.borrow();
+        let p = plans
+            .get(&(x.shape[0], weight.shape[0], weight.shape[1], bias.ptr))
+            .context("biased Lt plan missing; bind before run/capture")?;
+        let (workspace, _read) = self.workspace.device_ptr(&self.stream);
+        let alpha = 1f32;
+        let beta = 0f32;
+        unsafe {
+            lt::matmul(
+                self.handle,
+                p.desc,
+                (&alpha as *const f32).cast(),
+                (&beta as *const f32).cast(),
+                weight.ptr as _,
+                p.a,
+                x.ptr as _,
+                p.b,
+                y.0.ptr as _,
+                p.c,
+                y.0.ptr as _,
+                p.c,
+                p.algo.as_ref().context("biased Lt algo missing")?,
+                workspace as _,
+                self.workspace.len(),
+                self.stream.cu_stream() as _,
+            )?;
+        }
+        Ok(())
     }
 }
