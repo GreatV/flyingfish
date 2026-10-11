@@ -407,41 +407,6 @@ impl GdnOps {
         let el_bf = size_of::<bf16>() as u64;
         let ws_ptr = scratch.ptr;
 
-        // A column window of conv_out: a [rows, heads, DV] view with the FULL row stride cd,
-        // starting at `base + offset` inside the buffer.
-        //
-        // The capacity handed to Tensor::new is `span - offset`, measured from the WINDOW's
-        // own base -- NOT the whole buffer's span. That distinction is load-bearing. A
-        // column window's extent is (rows-1)*cd + heads*DV elements, far more than
-        // heads*DV*2 per row, so it needs a generous capacity; but granting it the buffer's
-        // FULL span over-grants by exactly `offset`, and Tensor's own extent validation then
-        // cannot reject a window that runs off the end. That is how a wrong column offset
-        // read 8 KB past the buffer without any check firing. With `span - offset` the same
-        // wrong offset is rejected in run(), before a single launch.
-        fn as3(
-            base: u64,
-            rows: u32,
-            heads: u32,
-            cd: u32,
-            span: u64,
-            offset: u64,
-        ) -> Result<Tensor<bf16, 3>> {
-            ensure!(cd.is_multiple_of(DV), "conv_dim must be a multiple of DV");
-            let cap = span
-                .checked_sub(offset)
-                .context("GDN column window starts past the end of the buffer")?;
-            let ptr = base
-                .checked_add(offset)
-                .context("GDN column window address overflow")?;
-            unsafe {
-                Tensor::new(
-                    ptr,
-                    [rows, heads, DV],
-                    [u64::from(cd), u64::from(DV), 1],
-                    cap,
-                )
-            }
-        }
         let span = mul(mul(u64::from(cd), el_bf)?, u64::from(rows))?;
         // Column offsets into `qkv`, in BYTES. ABI section 6: Q at offset 0 width HK*DK,
         // K next width HK*DK, V next width HV*DV. So the V start is TWO key-head blocks,
@@ -529,6 +494,9 @@ impl GdnOps {
                 g: &mut g,
             },
         )?;
+        // V is read in place from its conv_out columns through the same validated
+        // window helper as Q and K: a drifted offset is rejected here, not read.
+        let v_bf16 = as3(conv_ptr, rows, HV, cd, span, v_off)?;
         // ---- 6. exact widens. beta FIRST: both cores declare `const float* beta`, and
         // handing them the BF16 buffer is a silent 2-byte/4-byte stride bug.
         unsafe {
@@ -539,13 +507,13 @@ impl GdnOps {
                 .arg(&meta.ptr)
                 .launch(plan.beta_cfg)?;
             // q/k widened and BOTH GQA-expanded to value heads; Q scaled by 1/sqrt(DK)
-            // after the widen. V is read in place from its conv_out columns, whose row
-            // stride is conv_dim, so the stride is passed explicitly.
+            // after the widen. V stays a conv_out column window: the kernel still takes
+            // the row stride (conv_dim) as its scalar.
             stream
                 .launch_builder(&plan.kernels.prep)
                 .arg(&q_bf16.0.ptr)
                 .arg(&k_bf16.0.ptr)
-                .arg(&(conv_ptr + v_off))
+                .arg(&v_bf16.ptr)
                 .arg(&q_fp32.0.ptr)
                 .arg(&k_fp32.0.ptr)
                 .arg(&v_fp32.0.ptr)
@@ -605,6 +573,42 @@ impl GdnOps {
             };
         }
         Ok(())
+    }
+}
+
+/// A column window of conv_out: a `[rows, heads, DV]` view with the FULL row stride cd,
+/// starting at `base + offset` inside the buffer.
+///
+/// The capacity handed to Tensor::new is `span - offset`, measured from the WINDOW's
+/// own base -- NOT the whole buffer's span. That distinction is load-bearing. A
+/// column window's extent is (rows-1)*cd + heads*DV elements, far more than
+/// heads*DV*2 per row, so it needs a generous capacity; but granting it the buffer's
+/// FULL span over-grants by exactly `offset`, and Tensor's own extent validation then
+/// cannot reject a window that runs off the end. That is how a wrong column offset
+/// read 8 KB past the buffer without any check firing. With `span - offset` the same
+/// wrong offset is rejected in run(), before a single launch.
+fn as3(
+    base: u64,
+    rows: u32,
+    heads: u32,
+    cd: u32,
+    span: u64,
+    offset: u64,
+) -> Result<Tensor<bf16, 3>> {
+    ensure!(cd.is_multiple_of(DV), "conv_dim must be a multiple of DV");
+    let cap = span
+        .checked_sub(offset)
+        .context("GDN column window starts past the end of the buffer")?;
+    let ptr = base
+        .checked_add(offset)
+        .context("GDN column window address overflow")?;
+    unsafe {
+        Tensor::new(
+            ptr,
+            [rows, heads, DV],
+            [u64::from(cd), u64::from(DV), 1],
+            cap,
+        )
     }
 }
 
@@ -674,9 +678,7 @@ fn ws_f32_3(r: Region, ptr: u64, rows: u32, h: u32, d: u32) -> Result<TensorMut<
 fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32) -> Result<()> {
     b.qkv.validate()?;
     ensure!(
-        b.qkv.shape[1] == conv_dim
-            && b.qkv.stride[1] == 1
-            && b.qkv.stride[0] >= u64::from(conv_dim),
+        b.qkv.shape[1] == conv_dim && b.qkv.stride == [u64::from(conv_dim), 1],
         "GDN qkv must be [max_rows, conv_dim] with stride [conv_dim, 1]"
     );
     ensure!(
@@ -711,21 +713,17 @@ fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32) -> Result<()> {
         b.core_out.0.shape[0] == rows
             && b.core_out.0.shape[1] == HV
             && b.core_out.0.shape[2] == DV
-            && b.core_out.0.stride[2] == 1
-            && b.core_out.0.stride[1] >= u64::from(DV),
+            && b.core_out.0.stride == [u64::from(HV * DV), u64::from(DV), 1],
         "GDN core_out must be [max_rows, 48, 128] with strides [6144, 128, 1]"
     );
     b.s.0.validate()?;
     ensure!(
-        b.s.0.shape == [HV, DK, DV]
-            && b.s.0.stride[2] == 1
-            && b.s.0.stride[1] >= u64::from(DV)
-            && b.s.0.stride[0] >= u64::from(DK * DV),
+        b.s.0.shape == [HV, DK, DV] && b.s.0.stride == [u64::from(DK * DV), u64::from(DV), 1],
         "GDN S must be [48, 128, 128] on (value_head, key_dim, value_dim) with strides [16384, 128, 1]"
     );
     b.history.0.validate()?;
     ensure!(
-        b.history.0.shape == [conv_dim, 3] && b.history.0.stride[1] == 1,
+        b.history.0.shape == [conv_dim, 3] && b.history.0.stride == [3, 1],
         "GDN history must be [conv_dim, 3] oldest->newest with stride [3, 1]"
     );
     Ok(())
@@ -891,6 +889,112 @@ mod tests {
         let spec = GdnSpec::q38();
         assert_eq!(spec.conv_dim().expect("conv_dim"), GDN_CONV_DIM);
         assert_eq!(GDN_CONV_DIM, 2 * HK * DK + HV * DV);
+    }
+
+    fn valid_bindings(rows: u32) -> GdnBindings {
+        let cd = GDN_CONV_DIM;
+        let bf = size_of::<bf16>() as u64;
+        let f32b = size_of::<f32>() as u64;
+        let r = u64::from(rows);
+        let head = u64::from(HV);
+        let d = u64::from(DV);
+        let dk = u64::from(DK);
+        // Span headroom so a widened stride fails the stride check, not extent
+        // validation: a row-padded buffer with spare bytes is the dangerous case.
+        let padded = |bytes: u64| bytes + 1024 * 1024;
+        unsafe {
+            GdnBindings {
+                qkv: Tensor::new(
+                    0x1000,
+                    [rows, cd],
+                    [u64::from(cd), 1],
+                    padded(r * u64::from(cd) * bf),
+                )
+                .expect("qkv"),
+                a: Tensor::new(0x1000, [rows, HV], [head, 1], padded(r * head * bf)).expect("a"),
+                b: Tensor::new(0x1000, [rows, HV], [head, 1], padded(r * head * bf)).expect("b"),
+                conv_weight: Tensor::new(0x1000, [cd, 4], [4, 1], padded(u64::from(cd) * 4 * bf))
+                    .expect("conv_weight"),
+                a_log: Tensor::new(0x1000, [HV], [1], padded(head * bf)).expect("a_log"),
+                dt_bias: Tensor::new(0x1000, [HV], [1], padded(head * bf)).expect("dt_bias"),
+                core_out: TensorMut::new(
+                    0x1000,
+                    [rows, HV, DV],
+                    [head * d, d, 1],
+                    padded(r * head * d * bf),
+                )
+                .expect("core_out"),
+                s: TensorMut::new(
+                    0x1000,
+                    [HV, DK, DV],
+                    [dk * d, d, 1],
+                    padded(head * dk * d * f32b),
+                )
+                .expect("s"),
+                history: TensorMut::new(0x1000, [cd, 3], [3, 1], padded(u64::from(cd) * 3 * f32b))
+                    .expect("history"),
+            }
+        }
+    }
+
+    /// The cores bake their strides in (`out[(gr * HEADS + head) * DV + ...]`,
+    /// `S[head * DK * DV + ...]`, `history[ch * 3 + ...]`, `qkv[row * conv_dim + ch]`),
+    /// so a binding with a wider stride passes extent validation and still lands every
+    /// row/head at the wrong address. Each padded binding must be rejected by the
+    /// binding guard, not by extent validation.
+    #[test]
+    fn bindings_must_carry_the_kernel_strides() {
+        let rows = 4u32;
+        check_bindings(&valid_bindings(rows), rows, GDN_CONV_DIM)
+            .expect("dense bindings must pass");
+        let reject = |name: &str, mangle: &dyn Fn(&mut GdnBindings)| {
+            let mut b = valid_bindings(rows);
+            mangle(&mut b);
+            let error = check_bindings(&b, rows, GDN_CONV_DIM)
+                .expect_err("{name} binding must be rejected");
+            assert!(
+                error.to_string().contains("GDN"),
+                "{name}: expected the binding stride guard, got {error:?}"
+            );
+        };
+        reject("qkv row stride", &|b: &mut GdnBindings| {
+            b.qkv.stride[0] += 1
+        });
+        reject("core_out row stride", &|b: &mut GdnBindings| {
+            b.core_out.0.stride[0] += 1
+        });
+        reject("core_out head stride", &|b: &mut GdnBindings| {
+            b.core_out.0.stride[1] += 1
+        });
+        reject("S head stride", &|b: &mut GdnBindings| b.s.0.stride[0] += 1);
+        reject("S key stride", &|b: &mut GdnBindings| b.s.0.stride[1] += 1);
+        reject("history channel stride", &|b: &mut GdnBindings| {
+            b.history.0.stride[0] += 1
+        });
+    }
+
+    /// The V window must go through the same `as3` construction as Q and K, so a
+    /// wrong column offset is rejected in run() instead of reading past conv_out.
+    #[test]
+    fn v_window_offsets_are_validated_before_launch() {
+        let cd = u64::from(GDN_CONV_DIM);
+        let el = size_of::<bf16>() as u64;
+        // ABI section 6: Q at 0 width HK*DK, K next, V next width HV*DV -- in BYTES.
+        let v_off = 2 * u64::from(HK * DK) * el;
+        assert_eq!(v_off, 8192, "V starts two key-head blocks in");
+        // The defect, reconstructed: V's own width added where K's belongs.
+        let v_off_bug = u64::from(HV * DV) * el + u64::from(HK * DK) * el;
+        assert_eq!(v_off_bug, 16384, "the historical bug sat 8192 B too far in");
+        for rows in [1u32, 64] {
+            let span = cd * el * u64::from(rows);
+            let window = as3(0x1000, rows, HV, GDN_CONV_DIM, span, v_off).expect("V window");
+            assert_eq!(window.shape, [rows, HV, DV]);
+            assert_eq!(window.stride, [cd, u64::from(DV), 1]);
+            assert!(
+                as3(0x1000, rows, HV, GDN_CONV_DIM, span, v_off_bug).is_err(),
+                "v_off {v_off_bug} must be rejected before any launch (rows={rows})"
+            );
+        }
     }
 }
 

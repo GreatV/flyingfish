@@ -58,6 +58,7 @@ void gdn_recurrent_core_t(
 
     if (VSPLIT < 1 || VSPLIT > 4 || blockDim.x != GDN_THREADS ||
         blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1 ||
+        gridDim.y != GDN_HEADS || gridDim.x != VSPLIT ||
         !aligned16(q) || !aligned16(k) || !aligned16(v) ||
         !aligned16(S) || !aligned16(out)) {
         __trap(); return;

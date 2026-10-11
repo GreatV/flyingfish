@@ -81,6 +81,10 @@ impl Flash {
         shape: Shape,
     ) -> Result<()> {
         ensure!(
+            shape.causal,
+            "FA2 prefill is causal-only; the non-causal path selects a zero-width local window"
+        );
+        ensure!(
             shape.head_dim == 128 || shape.head_dim == 256,
             "FA2 binds head dims 128 and 256 (got {})",
             shape.head_dim

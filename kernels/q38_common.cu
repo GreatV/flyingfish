@@ -14,7 +14,10 @@ extern "C" __global__ void q38_bias_add(__nv_bfloat16* y,const __nv_bfloat16* bi
 }
 extern "C" __global__ void q38_advance(Q38SequenceMeta* meta) {
     q38_meta_guard(meta);
-    if(threadIdx.x==0 && blockIdx.x==0) { ++meta->prefix; ++meta->key_count; }
+    if(threadIdx.x==0 && blockIdx.x==0) {
+        if (meta->key_count >= meta->capacity) { __trap(); return; }
+        ++meta->prefix; ++meta->key_count;
+    }
 }
 extern "C" __global__ void q38_multiply(const __nv_bfloat16* a,const __nv_bfloat16* b,__nv_bfloat16* y,uint64_t count) {
     for(uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*blockDim.x)

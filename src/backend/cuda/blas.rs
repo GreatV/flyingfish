@@ -275,6 +275,22 @@ pub struct Blas {
     stream: Arc<CudaStream>,
 }
 
+/// The cuBLAS and skinny paths feed rows/output/input to cuBLAS and the skinny
+/// kernel as i32 scalars; the dimensions are bounded once here, at prepare time,
+/// so the i32 casts at the launch sites are exact.
+fn checked_dims(rows: usize, output: usize, input: usize) -> Result<()> {
+    ensure!(
+        rows > 0
+            && output > 0
+            && input > 0
+            && rows <= i32::MAX as usize
+            && output <= i32::MAX as usize
+            && input <= i32::MAX as usize,
+        "linear dimensions must fit i32: rows={rows} output={output} input={input}"
+    );
+    Ok(())
+}
+
 impl Blas {
     pub fn new(
         device: &Device,
@@ -334,6 +350,7 @@ impl Blas {
         input: usize,
         algo_index: u32,
     ) -> Result<()> {
+        checked_dims(rows, output, input)?;
         if rows > 1
             && !self
                 .plans
@@ -453,6 +470,7 @@ impl Blas {
             shape.rows > 0 && shape.rows <= 16 && shape.input.is_multiple_of(256),
             "unsupported skinny GEMM shape: {shape:?}"
         );
+        checked_dims(shape.rows, shape.output, shape.input)?;
         let (wp, _w) = w.device_ptr(&self.stream);
         let (xp, _x) = x.device_ptr(&self.stream);
         let (yp, _y) = y.device_ptr_mut(&self.stream);
@@ -788,5 +806,23 @@ impl Blas {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rows/output/input become the cuBLAS m/k/ld scalars and the skinny kernel's
+    /// i32 arguments; a dimension past i32::MAX must be rejected at prepare time,
+    /// never truncated.
+    #[test]
+    fn linear_dimensions_must_fit_i32() {
+        checked_dims(1, 5120, 17408).expect("Q38 decode shape");
+        checked_dims(2048, 17408, 5120).expect("Q38 prefill shape");
+        assert!(checked_dims((i32::MAX as usize) + 1, 5120, 17408).is_err());
+        assert!(checked_dims(16, (i32::MAX as usize) + 1, 17408).is_err());
+        assert!(checked_dims(16, 5120, (i32::MAX as usize) + 1).is_err());
+        assert!(checked_dims(0, 5120, 17408).is_err());
     }
 }
