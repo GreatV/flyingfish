@@ -687,7 +687,9 @@ impl Engine {
         i: usize,
         step: crate::backend::Step<'_>,
     ) -> Result<()> {
-        if step.input == crate::backend::Input::Ids {
+        if step.input == crate::backend::Input::Ids
+            && !crate::linear_plan::direct_fp8_rows(step.rows)
+        {
             self.qwen.as_mut().context("Q38 runtime missing")?.layers[i]
                 .linear
                 .materialize(self.blas.fp8_ops()?, &self.device.stream)?;
