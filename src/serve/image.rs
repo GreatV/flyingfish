@@ -19,6 +19,18 @@ pub struct PackedImage {
     pub pixel_values: Vec<f32>,
 }
 
+pub struct PlannedImage {
+    bytes: Vec<u8>,
+    mime: String,
+    grid: ImageGrid,
+}
+
+impl PlannedImage {
+    pub fn feature_rows(&self) -> Result<usize> {
+        self.grid.feature_rows()
+    }
+}
+
 pub struct PreparedImages {
     pub modality_ids: Vec<u8>,
     pub pixel_values: Vec<f32>,
@@ -234,7 +246,56 @@ impl Processor {
     }
 
     pub fn prepare_url(&self, url: &str) -> Result<PackedImage> {
-        self.prepare_rgb(&load_image(url)?)
+        self.prepare_planned(self.plan_url(url)?)
+    }
+
+    pub fn plan_url(&self, url: &str) -> Result<PlannedImage> {
+        let (bytes, mime) = load_encoded(url)?;
+        let (width, height) = image_dimensions(&bytes, Some(&mime))?;
+        let (height, width) = smart_resize(
+            height,
+            width,
+            self.config.size.shortest_edge,
+            self.config.size.longest_edge,
+        )?;
+        Ok(PlannedImage {
+            bytes,
+            mime,
+            grid: ImageGrid {
+                t: 1,
+                h: (height / 16) as u32,
+                w: (width / 16) as u32,
+            },
+        })
+    }
+
+    pub fn prepare_planned(&self, image: PlannedImage) -> Result<PackedImage> {
+        let packed = self.prepare_rgb(&decode_image(&image.bytes, Some(&image.mime))?)?;
+        ensure!(
+            packed.grid == image.grid,
+            "decoded image grid differs from header"
+        );
+        Ok(packed)
+    }
+
+    pub fn expanded_token_count(&self, ids: &[u32], images: &[PlannedImage]) -> Result<usize> {
+        let vision = self
+            .spec
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        let placeholders = ids.iter().filter(|&&id| id == vision.image_token).count();
+        ensure!(
+            placeholders == images.len(),
+            "image placeholder count differs from supplied images"
+        );
+        images
+            .iter()
+            .try_fold(ids.len() - placeholders, |total, image| {
+                total
+                    .checked_add(image.feature_rows()?)
+                    .context("image token count overflow")
+            })
     }
 
     pub fn expand(
@@ -414,6 +475,11 @@ fn resize_bicubic(image: &RgbImage, width: usize, height: usize) -> Vec<u8> {
 }
 
 pub fn load_image(url: &str) -> Result<RgbImage> {
+    let (bytes, mime) = load_encoded(url)?;
+    decode_image(&bytes, Some(&mime))
+}
+
+fn load_encoded(url: &str) -> Result<(Vec<u8>, String)> {
     let (bytes, mime) = if url.starts_with("data:") {
         let (header, data) = url.split_once(',').context("invalid image data URL")?;
         let mime = header
@@ -428,14 +494,19 @@ pub fn load_image(url: &str) -> Result<RgbImage> {
             data.len() <= MAX_ENCODED_BYTES * 4 / 3 + 4,
             "encoded image exceeds byte limit"
         );
-        (base64::decode(data)?, Some(mime))
+        (base64::decode(data)?, mime.to_owned())
     } else {
         bail!("image URL must be a base64 data URL");
     };
-    decode_image(&bytes, mime)
+    Ok((bytes, mime))
 }
 
-pub(super) fn decode_image(bytes: &[u8], mime: Option<&str>) -> Result<RgbImage> {
+enum ImageFormat {
+    Png,
+    Jpeg,
+}
+
+fn image_format(bytes: &[u8], mime: Option<&str>) -> Result<ImageFormat> {
     ensure!(
         bytes.len() <= MAX_ENCODED_BYTES,
         "encoded image exceeds byte limit"
@@ -445,15 +516,40 @@ pub(super) fn decode_image(bytes: &[u8], mime: Option<&str>) -> Result<RgbImage>
             mime.is_none_or(|m| m == "image/png"),
             "image MIME does not match PNG data"
         );
-        decode_png(bytes)
+        Ok(ImageFormat::Png)
     } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         ensure!(
             mime.is_none_or(|m| m != "image/png"),
             "image MIME does not match JPEG data"
         );
-        decode_jpeg(bytes)
+        Ok(ImageFormat::Jpeg)
     } else {
         bail!("image is not PNG or JPEG");
+    }
+}
+
+fn image_dimensions(bytes: &[u8], mime: Option<&str>) -> Result<(usize, usize)> {
+    match image_format(bytes, mime)? {
+        ImageFormat::Png => {
+            let mut decoder = png::Decoder::new(Cursor::new(bytes));
+            decoder.set_ignore_text_chunk(true);
+            decoder.set_ignore_iccp_chunk(true);
+            let reader = decoder.read_info()?;
+            Ok((reader.info().width as usize, reader.info().height as usize))
+        }
+        ImageFormat::Jpeg => {
+            let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(bytes));
+            decoder.read_info()?;
+            let info = decoder.info().context("JPEG has no image info")?;
+            Ok((usize::from(info.width), usize::from(info.height)))
+        }
+    }
+}
+
+pub(super) fn decode_image(bytes: &[u8], mime: Option<&str>) -> Result<RgbImage> {
+    match image_format(bytes, mime)? {
+        ImageFormat::Png => decode_png(bytes),
+        ImageFormat::Jpeg => decode_jpeg(bytes),
     }
 }
 

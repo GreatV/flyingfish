@@ -527,6 +527,25 @@ async fn chat_completions(
         let Some(processor) = &state.image_processor else {
             return bad_request("this model does not support image input");
         };
+        let expanded_tokens = match processor.expanded_token_count(&ids, &images) {
+            Ok(count) => count,
+            Err(error) => return bad_request(&format!("image input: {error}")),
+        };
+        if let Err(error) = crate::model::check_generation_capacity(
+            expanded_tokens,
+            max_tokens,
+            state.backend.options().capacity,
+        ) {
+            return bad_request(&format!("image input: {error}"));
+        }
+        let images = match images
+            .into_iter()
+            .map(|image| processor.prepare_planned(image))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(images) => images,
+            Err(error) => return bad_request(&format!("image input: {error}")),
+        };
         match processor.expand(&ids, images, state.backend.options().capacity) {
             Ok((expanded, prepared)) => {
                 ids = expanded;
@@ -558,8 +577,9 @@ async fn chat_completions(
 fn prepare_message_images(
     state: &AppState,
     messages: &mut [serde_json::Value],
-) -> Result<Vec<super::image::PackedImage>> {
+) -> Result<Vec<super::image::PlannedImage>> {
     let mut images = Vec::new();
+    let mut image_tokens = 0usize;
     for message in messages {
         let is_system = message["role"] == "system";
         let Some(parts) = message.get_mut("content").and_then(|v| v.as_array_mut()) else {
@@ -587,7 +607,15 @@ fn prepare_message_images(
                         .and_then(|v| v.get("url"))
                         .and_then(|v| v.as_str())
                         .context("image_url needs a string url")?;
-                    images.push(processor.prepare_url(url)?);
+                    let image = processor.plan_url(url)?;
+                    image_tokens = image_tokens
+                        .checked_add(image.feature_rows()?)
+                        .context("image token count overflow")?;
+                    anyhow::ensure!(
+                        image_tokens <= state.backend.options().capacity,
+                        "image tokens exceed request capacity before pixel preprocessing"
+                    );
+                    images.push(image);
                     *part = json!({"type":"image"});
                 }
                 _ => anyhow::bail!("content part type must be text or image_url"),
@@ -945,6 +973,66 @@ mod tests {
             json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
         );
         worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn multi_image_budget_rejects_before_any_pixel_decode() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-image-budget-{}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        std::fs::write(
+            dir.join("config.json"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/q38-config.json"
+            )),
+        )?;
+        std::fs::write(
+            dir.join("preprocessor_config.json"),
+            serde_json::to_vec(&json!({
+                "size":{"shortest_edge":65536,"longest_edge":16777216},
+                "patch_size":16,"temporal_patch_size":2,"merge_size":2,
+                "image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5]
+            }))?,
+        )?;
+        let processor = super::super::image::Processor::load(&dir)?.context("processor")?;
+        std::fs::remove_dir_all(dir)?;
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header()?.write_image_data(&[1, 2, 3])?;
+        }
+        let idat = png
+            .windows(4)
+            .position(|bytes| bytes == b"IDAT")
+            .context("IDAT")?;
+        png.truncate(idat + 4);
+        let url = format!("data:image/png;base64,{}", base64::encode(png));
+        assert_eq!(processor.plan_url(&url)?.feature_rows()?, 64);
+        assert!(
+            processor.prepare_url(&url).is_err(),
+            "fixture must reject pixel decoding"
+        );
+        let (mut state, commands) = test_state(64, Slot::Idle);
+        Arc::get_mut(&mut state).unwrap().image_processor = Some(processor);
+        let request = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":url}},
+                {"type":"image_url","image_url":{"url":url}}
+            ]}],"max_tokens":1
+        }))?;
+        let response = chat_completions(State(state.clone()), Json(request)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("image tokens exceed request capacity before pixel preprocessing")
+        );
+        assert!(commands.try_recv().is_err());
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        Ok(())
     }
 
     #[tokio::test]
