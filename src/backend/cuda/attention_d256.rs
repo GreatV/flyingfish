@@ -268,10 +268,9 @@ impl FullAttentionOps {
         // one it bound, so `run` never re-decides.
         let (rope_q_entry, rope_k_entry) = match &bindings.positions {
             PositionBindings::Linear => ("tcmqa_d256_rope_q", "tcmqa_d256_rope_k_scatter"),
-            PositionBindings::Axes(_) => (
-                "tcmqa_d256_rope_q_axes",
-                "tcmqa_d256_rope_k_scatter_axes",
-            ),
+            PositionBindings::Axes(_) => {
+                ("tcmqa_d256_rope_q_axes", "tcmqa_d256_rope_k_scatter_axes")
+            }
         };
         let kernels = Kernels {
             qg_split: module.load_function("tcmqa_d256_qg_split")?,
@@ -972,9 +971,7 @@ mod tests {
             causal_mask: view(&dev_mask, stream, [MASK_LEN], [1])?,
             positions: match axes {
                 None => PositionBindings::Linear,
-                Some(table) => {
-                    PositionBindings::Axes(view(table, stream, [max_rows, 3], [3, 1])?)
-                }
+                Some(table) => PositionBindings::Axes(view(table, stream, [max_rows, 3], [3, 1])?),
             },
         };
         let common = CommonOpsRef::new(&device.ctx)?;
@@ -1156,7 +1153,9 @@ mod tests {
                 "degenerate axes changed {name}: the pure-text path must be bit-identical"
             );
         }
-        eprintln!("P1D_BINDER_AXES degenerate=bitwise_identical over q/core_out/k_cache/v_cache/gate");
+        eprintln!(
+            "P1D_BINDER_AXES degenerate=bitwise_identical over q/core_out/k_cache/v_cache/gate"
+        );
 
         // W = physical + 7 is not the pure-text coordinate, so the oracle does
         // not apply; the claim is only that the table is really read.
