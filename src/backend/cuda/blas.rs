@@ -603,7 +603,7 @@ impl Blas {
     pub(crate) fn fp8_ops(&self) -> Result<&super::linear::Fp8Ops> {
         self.fp8.as_ref().context("FP8 operators not bound")
     }
-    // Setup/eager binding only. M1 Prefill also uses Lt BF16.
+    // Setup/eager binding for the fixed BF16 Lt path.
     pub(crate) fn prepare_fixed(&self, rows: u32, output: u32, input: u32) -> Result<()> {
         ensure!(
             [rows, output, input]
@@ -632,10 +632,10 @@ impl Blas {
         match weight {
             LinearWeightRef::BlockFp8 { codes, scale } => {
                 ensure!(
-                    phase == crate::op_contract::ExecutionPhase::Decode,
-                    "Prefill requires materialized BF16 weight"
+                    crate::linear_plan::direct_fp8_rows(x.shape[0] as usize),
+                    "M>5 Prefill requires materialized BF16 weight"
                 );
-                self.fp8_ops()?.gemv(&self.stream, codes, scale, x, y)
+                self.fp8_ops()?.small_gemm(&self.stream, codes, scale, x, y)
             }
             LinearWeightRef::Bf16(w) => {
                 w.validate()?;

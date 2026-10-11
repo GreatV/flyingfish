@@ -1,5 +1,5 @@
 // Q38 ABI v1: row-major E4M3 codes, BF16 [ceil(N/128),ceil(K/128)] scales.
-// Prefill materializes effective BF16 weights. Decode forms the same rounded
+// M>5 prefill materializes effective BF16 weights. M1..5 forms the same rounded
 // weight in registers, accumulates FP32, and writes BF16; no matrix scratch.
 // Format source: NVIDIA CUDA 13.0 Math API, __nv_fp8_e4m3.
 #include <cuda_runtime.h>
@@ -38,7 +38,64 @@ extern "C" __global__ void fp8_dequant_bf16(
         out[i] = weight_at(w,scales,i/uint64_t(k),i%uint64_t(k),k,scale_stride);
     }
 }
-// launch: grid ceil(N/4), block128. One warp per output, lanes partition K.
+__device__ __forceinline__ float2 gemv_decode_pair(uint16_t packed) {
+#if __CUDA_ARCH__ >= 890
+    uint32_t halfs;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(halfs) : "h"(packed));
+    float2 values = make_float2(__half2float(__ushort_as_half(uint16_t(halfs))),
+                               __half2float(__ushort_as_half(uint16_t(halfs >> 16))));
+    const uint32_t low = packed & 255u, high = packed >> 8;
+    if ((low & 127u) == 127u)
+        values.x = __uint_as_float(((low & 128u) << 24) | 0x7fc00000u);
+    if ((high & 127u) == 127u)
+        values.y = __uint_as_float(((high & 128u) << 24) | 0x7fc00000u);
+    return values;
+#else
+    return make_float2(e4m3_decode(uint8_t(packed)), e4m3_decode(uint8_t(packed >> 8)));
+#endif
+}
+
+__device__ __forceinline__ void gemv_load_pair(const uint8_t* first,
+                                              uint4& a, uint4& b) {
+    asm volatile(
+        "ld.global.v4.u32 {%0,%1,%2,%3}, [%8];\n\t"
+        "ld.global.v4.u32 {%4,%5,%6,%7}, [%9];"
+        : "=r"(a.x), "=r"(a.y), "=r"(a.z), "=r"(a.w),
+          "=r"(b.x), "=r"(b.y), "=r"(b.z), "=r"(b.w)
+        : "l"(first), "l"(first + 512));
+}
+
+__device__ __forceinline__ void gemv_accumulate_tiles(
+        uint4 first, uint4 next, const __nv_bfloat16* x,
+        float scale0, float scale1, float& a0, float& a1, float& a2, float& a3) {
+    const uint4 x0 = __ldg(reinterpret_cast<const uint4*>(x));
+    const uint4 x1 = __ldg(reinterpret_cast<const uint4*>(x + 8));
+    const uint4 x2 = __ldg(reinterpret_cast<const uint4*>(x + 512));
+    const uint4 x3 = __ldg(reinterpret_cast<const uint4*>(x + 520));
+    const uint32_t code0[4] = {first.x, first.y, first.z, first.w};
+    const uint32_t code1[4] = {next.x, next.y, next.z, next.w};
+    const uint32_t inputs0[8] = {x0.x,x0.y,x0.z,x0.w,x1.x,x1.y,x1.z,x1.w};
+    const uint32_t inputs1[8] = {x2.x,x2.y,x2.z,x2.w,x3.x,x3.y,x3.z,x3.w};
+    float accum[4] = {a0,a1,a2,a3};
+    #pragma unroll
+    for (int j=0; j<4; ++j) {
+        #pragma unroll
+        for (int byte=0; byte<4; ++byte) {
+            // Pairing one code from each vector makes conversion depend on both loads.
+            const uint16_t pair = uint16_t(__byte_perm(code0[j], code1[j], byte | ((byte+4)<<4)));
+            const float2 values = gemv_decode_pair(pair);
+            const float w0 = __bfloat162float(__float2bfloat16_rn(values.x * scale0));
+            const float w1 = __bfloat162float(__float2bfloat16_rn(values.y * scale1));
+            const uint32_t in0 = inputs0[2*j+byte/2] >> ((byte&1)*16);
+            const uint32_t in1 = inputs1[2*j+byte/2] >> ((byte&1)*16);
+            accum[byte] = fmaf(w0, __bfloat162float(__ushort_as_bfloat16(uint16_t(in0))), accum[byte]);
+            accum[(byte+2)&3] = fmaf(w1, __bfloat162float(__ushort_as_bfloat16(uint16_t(in1))), accum[(byte+2)&3]);
+        }
+    }
+    a0=accum[0]; a1=accum[1]; a2=accum[2]; a3=accum[3];
+}
+
+// launch: grid ceil(N/4), block128. Q38 shapes have K divisible by1024.
 extern "C" __global__ void fp8_gemv_bf16(
         const uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
         const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y,
@@ -53,10 +110,116 @@ extern "C" __global__ void fp8_gemv_bf16(
     if (row >= uint64_t(n)) return;
     const uint64_t scale_stride = (uint64_t(k)+127)/128;
     float acc=0.0f;
-    for (uint64_t col=lane; col<uint64_t(k); col+=32) {
-        const float weight = __bfloat162float(weight_at(w,scales,row,col,k,scale_stride));
-        acc = fmaf(weight,__bfloat162float(x[col]),acc);
+    if ((k & 1023) == 0) {
+        float a0=0.0f, a1=0.0f, a2=0.0f, a3=0.0f;
+        const uint8_t* const row_codes = w + row * uint64_t(k);
+        const __nv_bfloat16* const row_scales = scales + (row / 128) * scale_stride;
+        for (int base=0; base<k; base+=1024) {
+            const int col = base + int(lane) * 16;
+            uint4 first, next;
+            gemv_load_pair(row_codes + col, first, next);
+            float scale0=0.0f, scale1=0.0f;
+            if ((lane & 7u) == 0) {
+                scale0 = __bfloat162float(__ldg(row_scales + col / 128));
+                scale1 = __bfloat162float(__ldg(row_scales + (col + 512) / 128));
+            }
+            scale0 = __shfl_sync(0xffffffffu, scale0, 0, 8);
+            scale1 = __shfl_sync(0xffffffffu, scale1, 0, 8);
+            gemv_accumulate_tiles(first, next, x + col, scale0, scale1, a0, a1, a2, a3);
+        }
+        acc = (a0+a1)+(a2+a3);
+    } else {
+        for (uint64_t col=lane; col<uint64_t(k); col+=32) {
+            const float weight = __bfloat162float(weight_at(w,scales,row,col,k,scale_stride));
+            acc = fmaf(weight,__bfloat162float(x[col]),acc);
+        }
     }
     for (int shift=16; shift>0; shift/=2) acc += __shfl_down_sync(0xffffffffu,acc,shift);
     if (lane==0) y[row]=__float2bfloat16_rn(acc);
 }
+
+template<int M>
+__device__ __forceinline__ void fp8_skinny(
+        const uint8_t* w, const __nv_bfloat16* scales,
+        const __nv_bfloat16* x, __nv_bfloat16* y, int n, int k) {
+    if (n <= 0 || k <= 0 || blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.y != 1 || gridDim.z != 1 || uint64_t(gridDim.x) != (uint64_t(n)+3)/4 ||
+        !aligned16(w) || !aligned16(scales) || !aligned16(x) || !aligned16(y)) {
+        __trap(); return;
+    }
+    const uint64_t row = uint64_t(blockIdx.x)*4 + threadIdx.x/32;
+    const uint32_t lane = threadIdx.x%32;
+    if (row >= uint64_t(n)) return;
+    const uint64_t stride = (uint64_t(k)+127)/128;
+    float sums[M][4] = {};
+    if ((k & 1023) == 0) {
+        const uint8_t* const codes = w + row*uint64_t(k);
+        const __nv_bfloat16* const row_scales = scales + (row/128)*stride;
+        for (int base=0; base<k; base+=1024) {
+            const int col = base + int(lane)*16;
+            uint4 first, next;
+            gemv_load_pair(codes+col, first, next);
+            float s0=0.0f,s1=0.0f;
+            if ((lane&7u)==0) {
+                s0=__bfloat162float(__ldg(row_scales+col/128));
+                s1=__bfloat162float(__ldg(row_scales+(col+512)/128));
+            }
+            s0=__shfl_sync(0xffffffffu,s0,0,8);
+            s1=__shfl_sync(0xffffffffu,s1,0,8);
+            const uint32_t c0[4]={first.x,first.y,first.z,first.w};
+            const uint32_t c1[4]={next.x,next.y,next.z,next.w};
+            #pragma unroll
+            for (int word=0; word<4; ++word) {
+                uint32_t effective[4];
+                #pragma unroll
+                for (int byte=0; byte<4; ++byte) {
+                    const uint16_t pair=uint16_t(__byte_perm(c0[word],c1[word],byte|((byte+4)<<4)));
+                    const float2 values=gemv_decode_pair(pair);
+                    const uint32_t a=__bfloat16_as_ushort(__float2bfloat16_rn(values.x*s0));
+                    const uint32_t b=__bfloat16_as_ushort(__float2bfloat16_rn(values.y*s1));
+                    effective[byte]=a|(b<<16);
+                }
+                #pragma unroll
+                for (int m=0; m<M; ++m) {
+                    const __nv_bfloat16* const row_x=x+uint64_t(m)*uint64_t(k)+col+4*word;
+                    const uint2 x0=__ldg(reinterpret_cast<const uint2*>(row_x));
+                    const uint2 x1=__ldg(reinterpret_cast<const uint2*>(row_x+512));
+                    const uint32_t a[2]={x0.x,x0.y}, b[2]={x1.x,x1.y};
+                    #pragma unroll
+                    for (int byte=0; byte<4; ++byte) {
+                        const float w0=__bfloat162float(__ushort_as_bfloat16(uint16_t(effective[byte])));
+                        const float w1=__bfloat162float(__ushort_as_bfloat16(uint16_t(effective[byte]>>16)));
+                        const float v0=__bfloat162float(__ushort_as_bfloat16(uint16_t(a[byte/2]>>((byte&1)*16))));
+                        const float v1=__bfloat162float(__ushort_as_bfloat16(uint16_t(b[byte/2]>>((byte&1)*16))));
+                        sums[m][byte]=fmaf(w0,v0,sums[m][byte]);
+                        sums[m][(byte+2)&3]=fmaf(w1,v1,sums[m][(byte+2)&3]);
+                    }
+                }
+            }
+        }
+    } else {
+        for (uint64_t col=lane; col<uint64_t(k); col+=32) {
+            const float weight=__bfloat162float(weight_at(w,scales,row,col,k,stride));
+            #pragma unroll
+            for (int m=0; m<M; ++m)
+                sums[m][0]=fmaf(weight,__bfloat162float(x[uint64_t(m)*uint64_t(k)+col]),sums[m][0]);
+        }
+    }
+    #pragma unroll
+    for (int m=0; m<M; ++m) {
+        float value=(sums[m][0]+sums[m][1])+(sums[m][2]+sums[m][3]);
+        for (int shift=16; shift>0; shift/=2)
+            value+=__shfl_down_sync(0xffffffffu,value,shift);
+        if (lane==0) y[uint64_t(m)*uint64_t(n)+row]=__float2bfloat16_rn(value);
+    }
+}
+
+#define FP8_SKINNY_ENTRY(M) \
+extern "C" __global__ __launch_bounds__(128, 5) void fp8_skinny_bf16_m##M( \
+    const uint8_t* w, const __nv_bfloat16* scales, const __nv_bfloat16* x, \
+    __nv_bfloat16* y, int n, int k) { fp8_skinny<M>(w,scales,x,y,n,k); }
+FP8_SKINNY_ENTRY(2)
+FP8_SKINNY_ENTRY(3)
+FP8_SKINNY_ENTRY(4)
+FP8_SKINNY_ENTRY(5)
+#undef FP8_SKINNY_ENTRY

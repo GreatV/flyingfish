@@ -3,6 +3,10 @@ use crate::checkpoint::TensorManifest;
 use anyhow::{Context, Result, ensure};
 use safetensors::Dtype;
 use std::collections::BTreeMap;
+
+pub const fn direct_fp8_rows(rows: usize) -> bool {
+    rows >= 1 && rows <= 5
+}
 #[derive(Debug)]
 pub struct DequantSlot {
     pub offset_bytes: u64,

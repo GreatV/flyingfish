@@ -1,7 +1,7 @@
 use super::detok::Shared;
 use super::{Backend, EngineEvent, Request};
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -23,6 +23,7 @@ struct AppState {
     model_name: String,
     bos_token: String,
     request_counter: AtomicU64,
+    image_processor: Option<super::image::Processor>,
 }
 
 pub fn serve(
@@ -35,6 +36,7 @@ pub fn serve(
     let template_text = read_chat_template(&model_dir)?;
     let mut env = Environment::new();
     env.set_unknown_method_callback(template_string_methods);
+    env.add_function("raise_exception", template_exception);
     env.add_template_owned("chat", template_text)
         .map_err(|e| anyhow::anyhow!("chat template parse: {e}"))
         .context("serve init")?;
@@ -43,6 +45,7 @@ pub fn serve(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "flyingfish".into());
     let bos_token = read_bos_token(&model_dir)?;
+    let image_processor = super::image::Processor::load(&model_dir)?;
     let state = Arc::new(AppState {
         backend,
         shared,
@@ -50,10 +53,12 @@ pub fn serve(
         model_name,
         bos_token,
         request_counter: AtomicU64::new(0),
+        image_processor,
     });
     let app = Router::new()
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
         .with_state(state);
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("bind 127.0.0.1:{port}"))?;
@@ -90,11 +95,18 @@ fn read_bos_token(model_dir: &std::path::Path) -> Result<String> {
             .with_context(|| format!("open {}", model_dir.display()))?,
     )
     .context("parse tokenizer_config.json")?;
-    tok_config
-        .get("bos_token")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .context("tokenizer_config.json has no bos_token")
+    match tok_config.get("bos_token") {
+        None | Some(serde_json::Value::Null) => Ok(String::new()),
+        Some(serde_json::Value::String(token)) => Ok(token.clone()),
+        _ => anyhow::bail!("tokenizer_config.json bos_token must be a string or null"),
+    }
+}
+
+fn template_exception(message: String) -> Result<Value, minijinja::Error> {
+    Err(minijinja::Error::new(
+        minijinja::ErrorKind::InvalidOperation,
+        message,
+    ))
 }
 
 /// String methods the MiniCPM5-2B chat template calls that core minijinja
@@ -229,8 +241,33 @@ struct CompletionsBody {
 struct ChatBody {
     #[serde(default)]
     messages: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    chat_template_kwargs: ChatTemplateOptions,
     #[serde(flatten)]
     params: CommonParams,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatTemplateOptions {
+    enable_thinking: Option<bool>,
+}
+
+fn render_chat(
+    env: &Environment<'_>,
+    messages: &[serde_json::Value],
+    bos_token: &str,
+    options: &ChatTemplateOptions,
+) -> Result<String, minijinja::Error> {
+    let mut context = json!({
+        "messages": messages,
+        "add_generation_prompt": true,
+        "bos_token": bos_token,
+    });
+    if let Some(thinking) = options.enable_thinking {
+        context["enable_thinking"] = json!(thinking);
+    }
+    env.get_template("chat")?.render(context)
 }
 
 fn check_greedy(params: &CommonParams) -> Result<(), Box<Response>> {
@@ -319,7 +356,7 @@ fn check_validity(state: &AppState, ids: &[u32], max_tokens: usize) -> Result<()
         count: max_tokens,
         ..state.backend.options()
     };
-    crate::spec::check(ids, &options)
+    super::check_request(ids, &options)
         .map_err(|error| Box::new(bad_request(&format!("request rejected: {error}"))))
 }
 
@@ -367,24 +404,30 @@ fn add_request(
     state: &AppState,
     ids: Vec<u32>,
     max_tokens: usize,
+    images: Option<super::image::PreparedImages>,
+    admission: Option<super::Admission<'_>>,
 ) -> Result<tokio_mpsc::Receiver<EngineEvent>, Box<Response>> {
     let (event_tx, event_rx) = tokio_mpsc::channel::<EngineEvent>(64);
     let request = Request {
         ids,
         max_new_tokens: max_tokens,
+        images,
     };
-    state
-        .backend
-        .add_request(request, event_tx)
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("busy") {
-                Box::new(busy_response())
-            } else {
-                Box::new(error_response(message))
-            }
-        })?;
+    let result = match admission {
+        Some(admission) => admission.send(request, event_tx),
+        None => state.backend.add_request(request, event_tx),
+    };
+    result.map_err(admission_error)?;
     Ok(event_rx)
+}
+
+fn admission_error(error: anyhow::Error) -> Box<Response> {
+    let message = error.to_string();
+    if message.contains("busy") {
+        Box::new(busy_response())
+    } else {
+        Box::new(error_response(message))
+    }
 }
 
 async fn completions(
@@ -409,7 +452,7 @@ async fn completions(
         return *response;
     }
     let prompt_tokens = ids.len();
-    let events = match add_request(&state, ids, max_tokens) {
+    let events = match add_request(&state, ids, max_tokens, None, None) {
         Ok(events) => events,
         Err(response) => return *response,
     };
@@ -435,7 +478,7 @@ async fn chat_completions(
     if let Err(response) = check_request(&state, &body.params) {
         return *response;
     }
-    let messages = match body.messages {
+    let mut messages = match body.messages {
         Some(messages) if !messages.is_empty() => messages,
         _ => return bad_request("messages must be a non-empty array"),
     };
@@ -443,8 +486,11 @@ async fn chat_completions(
         let Some(role) = message.get("role").and_then(|r| r.as_str()) else {
             return bad_request("each message needs string role and content");
         };
-        if message.get("content").and_then(|c| c.as_str()).is_none() {
-            return bad_request("each message needs string role and content");
+        if !message
+            .get("content")
+            .is_some_and(|c| c.is_string() || c.is_array())
+        {
+            return bad_request("message content must be a string or content-parts array");
         }
         if !TEMPLATE_ROLES.contains(&role) {
             return bad_request(&format!(
@@ -452,20 +498,20 @@ async fn chat_completions(
             ));
         }
     }
+    let images = match prepare_message_images(&state, &mut messages) {
+        Ok(images) => images,
+        Err(error) => return bad_request(&format!("image input: {error}")),
+    };
     let max_tokens = match resolve_max_tokens(&body.params) {
         Ok(v) => v,
         Err(response) => return *response,
     };
-    let rendered = match state
-        .env
-        .get_template("chat")
-        .and_then(|template| {
-            template.render(minijinja::context! {
-                messages => messages,
-                add_generation_prompt => true,
-                bos_token => state.bos_token,
-            })
-        }) {
+    let rendered = match render_chat(
+        &state.env,
+        &messages,
+        &state.bos_token,
+        &body.chat_template_kwargs,
+    ) {
         Ok(rendered) => rendered,
         Err(error) => {
             return (
@@ -475,15 +521,53 @@ async fn chat_completions(
                 .into_response()
         }
     };
-    let ids = match state.shared.encode_chat(&rendered) {
+    let mut ids = match state.shared.encode_chat(&rendered) {
         Ok(ids) => ids,
         Err(e) => return bad_request(&format!("tokenize: {e}")),
+    };
+    let mut admission = None;
+    let images = if images.is_empty() {
+        None
+    } else {
+        let Some(processor) = &state.image_processor else {
+            return bad_request("this model does not support image input");
+        };
+        let expanded_tokens = match processor.expanded_token_count(&ids, &images) {
+            Ok(count) => count,
+            Err(error) => return bad_request(&format!("image input: {error}")),
+        };
+        if let Err(error) = crate::model::check_generation_capacity(
+            expanded_tokens,
+            max_tokens,
+            state.backend.options().capacity,
+        ) {
+            return bad_request(&format!("image input: {error}"));
+        }
+        admission = match state.backend.reserve() {
+            Ok(reservation) => Some(reservation),
+            Err(error) => return *admission_error(error),
+        };
+        let images = match images
+            .into_iter()
+            .map(|image| processor.prepare_planned(image))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(images) => images,
+            Err(error) => return bad_request(&format!("image input: {error}")),
+        };
+        match processor.expand(&ids, images, state.backend.options().capacity) {
+            Ok((expanded, prepared)) => {
+                ids = expanded;
+                Some(prepared)
+            }
+            Err(error) => return bad_request(&format!("image input: {error}")),
+        }
     };
     if let Err(response) = check_validity(&state, &ids, max_tokens) {
         return *response;
     }
     let prompt_tokens = ids.len();
-    let events = match add_request(&state, ids, max_tokens) {
+    let events = match add_request(&state, ids, max_tokens, images, admission) {
         Ok(events) => events,
         Err(response) => return *response,
     };
@@ -497,6 +581,69 @@ async fn chat_completions(
         prompt_tokens,
     )
     .await
+}
+
+fn prepare_message_images(
+    state: &AppState,
+    messages: &mut [serde_json::Value],
+) -> Result<Vec<super::image::PlannedImage>> {
+    let mut images = Vec::new();
+    let mut image_tokens = 0usize;
+    for message in messages {
+        let is_system = message["role"] == "system";
+        let Some(parts) = message.get_mut("content").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            match part.get("type").and_then(|v| v.as_str()) {
+                Some("text") => {
+                    if part.get("text").and_then(|v| v.as_str()).is_none() {
+                        anyhow::bail!("text content part needs a string text field");
+                    }
+                }
+                Some("image_url") => {
+                    anyhow::ensure!(!is_system, "system messages cannot contain images");
+                    anyhow::ensure!(
+                        state.backend.options().backend.draft_model.is_none(),
+                        "image input does not support a draft model"
+                    );
+                    let processor = state
+                        .image_processor
+                        .as_ref()
+                        .context("this model does not support image input")?;
+                    let url = part
+                        .get("image_url")
+                        .and_then(|v| v.get("url"))
+                        .and_then(|v| v.as_str())
+                        .context("image_url needs a string url")?;
+                    let image = processor.plan_url(url)?;
+                    image_tokens = image_tokens
+                        .checked_add(image.feature_rows()?)
+                        .context("image token count overflow")?;
+                    anyhow::ensure!(
+                        image_tokens <= state.backend.options().capacity,
+                        "image tokens exceed request capacity before pixel preprocessing"
+                    );
+                    images.push(image);
+                    *part = json!({"type":"image"});
+                }
+                _ => anyhow::bail!("content part type must be text or image_url"),
+            }
+        }
+        if parts.iter().all(|p| p["type"] == "text") {
+            let text = parts
+                .iter()
+                .map(|p| {
+                    p["text"]
+                        .as_str()
+                        .context("text content part needs a string text field")
+                })
+                .collect::<Result<Vec<_>>>()?
+                .concat();
+            message["content"] = json!(text);
+        }
+    }
+    Ok(images)
 }
 
 async fn respond(
@@ -666,5 +813,616 @@ fn chunk_payload(
             "model": model,
             "choices": [{"index": 0, "text": text, "finish_reason": finish}]
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{Settings, SpecBudget, TreeBuilder};
+    use crate::serve::{EngineCommand, Slot};
+    use anyhow::ensure;
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
+    fn state(
+        shared: Shared,
+        template: String,
+        bos_token: String,
+        capacity: usize,
+        slot: Slot,
+    ) -> (Arc<AppState>, mpsc::Receiver<EngineCommand>) {
+        let (commands, receiver) = mpsc::channel();
+        let mut env = Environment::new();
+        env.set_unknown_method_callback(template_string_methods);
+        env.add_function("raise_exception", template_exception);
+        env.add_template_owned("chat", template).expect("template");
+        let backend = Backend {
+            commands,
+            slot: Arc::new(Mutex::new(slot)),
+            vocab_size: 300_000,
+            options: crate::spec::Options {
+                device: 0,
+                capacity,
+                chunk: None,
+                backend: Settings {
+                    tree_builder: TreeBuilder::Waves,
+                    spec_budget: SpecBudget::Chain,
+                    spec_graph: true,
+                    draft_model: None,
+                    runtime_dir: None,
+                },
+                count: 256,
+                ignore_eos: false,
+            },
+        };
+        (
+            Arc::new(AppState {
+                backend,
+                shared,
+                env,
+                model_name: "test".into(),
+                bos_token,
+                request_counter: AtomicU64::new(0),
+                image_processor: None,
+            }),
+            receiver,
+        )
+    }
+
+    fn test_state(capacity: usize, slot: Slot) -> (Arc<AppState>, mpsc::Receiver<EngineCommand>) {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab([("[UNK]".into(), 0), ("a".into(), 1)].into_iter().collect())
+            .unk_token("[UNK]".into())
+            .build()
+            .expect("word-level model");
+        state(
+            Shared::new(tokenizers::Tokenizer::new(model)),
+            "{{ messages[0].content }}".into(),
+            String::new(),
+            capacity,
+            slot,
+        )
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("response bytes");
+        serde_json::from_slice(&bytes).expect("JSON response")
+    }
+
+    #[tokio::test]
+    async fn oversized_prompt_is_rejected_before_admission() {
+        let (state, commands) = test_state(2, Slot::Idle);
+        let request =
+            serde_json::from_value(json!({"prompt": [1, 1], "max_tokens": 1})).expect("request");
+        let response = completions(State(state.clone()), Json(request)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("KV capacity 3")
+        );
+        assert!(commands.try_recv().is_err());
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+    }
+
+    #[tokio::test]
+    async fn concurrent_request_gets_documented_busy_response() {
+        let (state, commands) = test_state(16, Slot::Running);
+        let request =
+            serde_json::from_value(json!({"prompt": [1], "max_tokens": 1})).expect("request");
+        let response = completions(State(state), Json(request)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["error"]["type"], "server_busy");
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_closes_engine_event_receiver() {
+        let (state, commands) = test_state(16, Slot::Idle);
+        let request =
+            serde_json::from_value(json!({"prompt": [1], "max_tokens": 8, "stream": true}))
+                .expect("request");
+        let response = completions(State(state), Json(request)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let EngineCommand::Generate { events, .. } = commands.try_recv().expect("generate") else {
+            panic!("expected Generate");
+        };
+        assert!(!events.is_closed());
+        drop(response);
+        assert!(events.is_closed());
+        assert!(
+            events
+                .send(EngineEvent::Tokens {
+                    ids: vec![1],
+                    accepted: 0
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_respects_exact_plain_capacity_and_counts() {
+        let (state, commands) = test_state(2, Slot::Idle);
+        let worker = std::thread::spawn(move || {
+            let EngineCommand::Generate { request, events } =
+                commands.recv_timeout(Duration::from_secs(5)).unwrap()
+            else {
+                panic!("expected Generate");
+            };
+            assert_eq!(request.ids, [1]);
+            assert_eq!(request.max_new_tokens, 1);
+            events
+                .blocking_send(EngineEvent::Tokens {
+                    ids: vec![1],
+                    accepted: 0,
+                })
+                .unwrap();
+            events
+                .blocking_send(EngineEvent::Done {
+                    ids: vec![1],
+                    rounds: 0,
+                    length_reached: true,
+                })
+                .unwrap();
+        });
+        let request = serde_json::from_value(json!({"prompt": [1], "max_tokens": 1})).unwrap();
+        let response = completions(State(state), Json(request)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["choices"][0]["text"], "a");
+        assert_eq!(body["choices"][0]["finish_reason"], "length");
+        assert_eq!(
+            body["usage"],
+            json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
+        );
+        worker.join().unwrap();
+    }
+
+    fn image_processor(tag: &str) -> Result<super::super::image::Processor> {
+        let dir =
+            std::env::temp_dir().join(format!("ff-image-header-{tag}-{}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        std::fs::write(
+            dir.join("config.json"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/q38-config.json"
+            )),
+        )?;
+        std::fs::write(
+            dir.join("preprocessor_config.json"),
+            serde_json::to_vec(&json!({
+                "size":{"shortest_edge":65536,"longest_edge":16777216},
+                "patch_size":16,"temporal_patch_size":2,"merge_size":2,
+                "image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5]
+            }))?,
+        )?;
+        let processor = super::super::image::Processor::load(&dir)?.context("processor")?;
+        std::fs::remove_dir_all(dir)?;
+        Ok(processor)
+    }
+
+    fn image_request_state(
+        slot: Slot,
+        tag: &str,
+    ) -> Result<(Arc<AppState>, mpsc::Receiver<EngineCommand>)> {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(
+                [("[UNK]".into(), 0), ("<|image_pad|>".into(), 248056)]
+                    .into_iter()
+                    .collect(),
+            )
+            .unk_token("[UNK]".into())
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (mut state, commands) = state(
+            Shared::new(tokenizers::Tokenizer::new(model)),
+            "<|image_pad|>".into(),
+            String::new(),
+            256,
+            slot,
+        );
+        Arc::get_mut(&mut state).unwrap().image_processor = Some(image_processor(tag)?);
+        Ok((state, commands))
+    }
+
+    fn pixel_fixture(animated: bool) -> Result<String> {
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            if animated {
+                encoder.set_animated(2, 0)?;
+            }
+            let mut writer = encoder.write_header()?;
+            writer.write_image_data(&[1, 2, 3])?;
+            if animated {
+                writer.write_image_data(&[3, 2, 1])?;
+            }
+        }
+        // Header stays readable, but no frame can be decoded.
+        let idat = png
+            .windows(4)
+            .position(|bytes| bytes == b"IDAT")
+            .context("IDAT")?;
+        png.truncate(idat + 4);
+        Ok(format!("data:image/png;base64,{}", base64::encode(png)))
+    }
+
+    async fn image_response(state: Arc<AppState>, url: &str) -> Response {
+        let request = serde_json::from_value(json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":url}}
+        ]}],"max_tokens":1}))
+        .unwrap();
+        chat_completions(State(state), Json(request)).await
+    }
+
+    #[test]
+    fn admission_guard_releases_on_drop_and_engine_disconnect() -> Result<()> {
+        let (state, commands) = test_state(256, Slot::Idle);
+        let admission = state.backend.reserve()?;
+        assert!(state.backend.reserve().is_err());
+        drop(admission);
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        let admission = state.backend.reserve()?;
+        drop(commands);
+        let (events, _receiver) = tokio_mpsc::channel(1);
+        assert!(
+            admission
+                .send(
+                    Request {
+                        ids: vec![1],
+                        max_new_tokens: 1,
+                        images: None
+                    },
+                    events
+                )
+                .is_err()
+        );
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_image_request_rejects_before_pixel_decode() -> Result<()> {
+        let (state, commands) = image_request_state(Slot::Running, "busy")?;
+        let url = pixel_fixture(false)?;
+        let processor = state.image_processor.as_ref().unwrap();
+        assert_eq!(processor.plan_url(&url)?.feature_rows()?, 64);
+        assert!(processor.prepare_url(&url).is_err());
+        let response = image_response(state.clone(), &url).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(commands.try_recv().is_err());
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Running);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn image_decode_failure_releases_admission() -> Result<()> {
+        let (state, commands) = image_request_state(Slot::Idle, "decode-error")?;
+        let response = image_response(state.clone(), &pixel_fixture(false)?).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let message = body_json(response).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(message.contains("image input:"), "{message}");
+        assert!(commands.try_recv().is_err());
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        // A second reservation proves the failed request did not retain ownership.
+        drop(state.backend.reserve()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn animated_png_rejects_before_frame_decode() -> Result<()> {
+        let (state, commands) = image_request_state(Slot::Idle, "apng")?;
+        let url = pixel_fixture(true)?;
+        let error = super::super::image::load_image(&url)
+            .err()
+            .context("APNG decoded")?;
+        assert_eq!(error.to_string(), "animated PNG not supported");
+        let response = image_response(state.clone(), &url).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("animated PNG not supported")
+        );
+        assert!(commands.try_recv().is_err());
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_image_budget_rejects_before_any_pixel_decode() -> Result<()> {
+        let processor = image_processor("budget")?;
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header()?.write_image_data(&[1, 2, 3])?;
+        }
+        let idat = png
+            .windows(4)
+            .position(|bytes| bytes == b"IDAT")
+            .context("IDAT")?;
+        png.truncate(idat + 4);
+        let url = format!("data:image/png;base64,{}", base64::encode(png));
+        assert_eq!(processor.plan_url(&url)?.feature_rows()?, 64);
+        assert!(
+            processor.prepare_url(&url).is_err(),
+            "fixture must reject pixel decoding"
+        );
+        let (mut state, commands) = test_state(64, Slot::Idle);
+        Arc::get_mut(&mut state).unwrap().image_processor = Some(processor);
+        let request = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":url}},
+                {"type":"image_url","image_url":{"url":url}}
+            ]}],"max_tokens":1
+        }))?;
+        let response = chat_completions(State(state.clone()), Json(request)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("image tokens exceed request capacity before pixel preprocessing")
+        );
+        assert!(commands.try_recv().is_err());
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_content_parts_are_rejected_before_admission() {
+        for content in [
+            json!([{"type":"text","text":2}]),
+            json!([{"type":"video_url","video_url":{"url":"file:///a"}}]),
+            json!([{"type":"image_url","image_url":{"url":"file:///a"}}]),
+        ] {
+            let (state, commands) = test_state(256, Slot::Idle);
+            let request = serde_json::from_value(json!({
+                "messages":[{"role":"user","content":content}], "max_tokens":1
+            }))
+            .unwrap();
+            let response = chat_completions(State(state.clone()), Json(request)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(commands.try_recv().is_err());
+            assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FF_IMAGE_CHAT_REFERENCE generated by the HF processor"]
+    async fn image_chat_matches_hf_ids_and_grids() -> Result<()> {
+        let reference = std::env::var("FF_IMAGE_CHAT_REFERENCE")?;
+        let reference: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(reference)?)?;
+        let model = std::path::Path::new(reference["model"].as_str().context("model path")?);
+        for (index, case) in reference["cases"]
+            .as_array()
+            .context("cases")?
+            .iter()
+            .enumerate()
+        {
+            let expected: Vec<u32> = serde_json::from_value(case["input_ids"].clone())?;
+            let mut content = Vec::new();
+            for file in case["files"].as_array().context("image files")? {
+                let file = file.as_str().context("image file")?;
+                let bytes = std::fs::read(file)?;
+                let url = format!("data:image/png;base64,{}", base64::encode(bytes));
+                content.push(json!({"type":"image_url","image_url":{"url":url}}));
+            }
+            content.push(json!({"type":"text","text":case["prompt"]}));
+            let (mut state, commands) = state(
+                Shared::load(model)?,
+                read_chat_template(model)?,
+                read_bos_token(model)?,
+                expected.len() + 1,
+                Slot::Idle,
+            );
+            Arc::get_mut(&mut state).unwrap().image_processor =
+                super::super::image::Processor::load(model)?;
+            if index == 0 {
+                let rejected = serde_json::from_value(json!({
+                    "messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///etc/passwd"}}]}],
+                    "max_tokens":1
+                }))?;
+                let response = chat_completions(State(state.clone()), Json(rejected)).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(
+                    body_json(response).await["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("base64 data URL")
+                );
+                assert!(commands.try_recv().is_err());
+                assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+            }
+            let request = serde_json::from_value(json!({
+                "messages":[{"role":"user","content":content}], "max_tokens":1,
+                "chat_template_kwargs":{"enable_thinking":false}, "stream":true
+            }))?;
+            let response = chat_completions(State(state), Json(request)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{}", case["name"]);
+            let EngineCommand::Generate { request, events } = commands.try_recv()? else {
+                panic!("expected Generate");
+            };
+            assert_eq!(request.ids, expected, "{} chat IDs", case["name"]);
+            let prepared = request.images.context("image payload")?;
+            let grids: Vec<_> = prepared.grids.iter().map(|g| [g.t, g.h, g.w]).collect();
+            assert_eq!(
+                serde_json::to_value(&grids)?,
+                case["grids"],
+                "{} grids",
+                case["name"]
+            );
+            let features: usize = prepared
+                .grids
+                .iter()
+                .map(|g| g.feature_rows().unwrap())
+                .sum();
+            assert_eq!(
+                prepared.modality_ids.iter().filter(|&&v| v == 1).count(),
+                features
+            );
+            assert_eq!(prepared.pixel_values.len(), features * 4 * 1536);
+            let processor = super::super::image::Processor::load(model)?.context("processor")?;
+            let mut direct_pixels = Vec::new();
+            for file in case["files"].as_array().unwrap() {
+                let image = super::super::image::decode_image(
+                    &std::fs::read(file.as_str().unwrap())?,
+                    None,
+                )?;
+                direct_pixels.extend(processor.prepare_rgb(&image)?.pixel_values);
+            }
+            assert!(
+                prepared
+                    .pixel_values
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .eq(direct_pixels.iter().map(|v| v.to_bits())),
+                "HTTP pixels differ from direct Rust preprocessing"
+            );
+            let path = std::env::temp_dir().join(format!(
+                "flyingfish-image-roundtrip-{}-{index}.safetensors",
+                std::process::id()
+            ));
+            prepared.save(&request.ids, &path)?;
+            let replay = super::super::image::PreparedImages::read(&path, &request.ids)?;
+            assert!(super::super::image::PreparedImages::read(&path, &[0]).is_err());
+            std::fs::remove_file(&path)?;
+            assert_eq!(replay.grids, prepared.grids);
+            assert_eq!(replay.modality_ids, prepared.modality_ids);
+            assert!(
+                replay
+                    .pixel_values
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .eq(prepared.pixel_values.iter().map(|v| v.to_bits())),
+                "input trace changed pixel bits"
+            );
+            events
+                .send(EngineEvent::Done {
+                    ids: vec![],
+                    rounds: 0,
+                    length_reached: true,
+                })
+                .await?;
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await?;
+            assert!(std::str::from_utf8(&bytes)?.contains("data: [DONE]"));
+            println!(
+                "{}: {} IDs, {} images exact",
+                case["name"],
+                expected.len(),
+                grids.len()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FF_CHAT_REFERENCE generated by the HF processor and its local model files"]
+    async fn qwen_chat_matches_hf_processor_and_serves_both_response_modes() -> Result<()> {
+        let reference = std::env::var("FF_CHAT_REFERENCE").context("FF_CHAT_REFERENCE")?;
+        let reference: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(reference)?)?;
+        let model = std::path::Path::new(reference["model"].as_str().context("model path")?);
+        let cases = reference["cases"].as_array().context("cases")?;
+        ensure!(!cases.is_empty(), "reference must contain cases");
+        for (index, case) in cases.iter().enumerate() {
+            let shared = Shared::load(model)?;
+            let output = shared.encode_chat("4")?;
+            let expected: Vec<u32> = serde_json::from_value(case["input_ids"].clone())?;
+            let (state, commands) = state(
+                shared,
+                read_chat_template(model)?,
+                read_bos_token(model)?,
+                4096,
+                Slot::Idle,
+            );
+            let messages =
+                serde_json::from_value::<Vec<serde_json::Value>>(case["messages"].clone())?;
+            let options = serde_json::from_value(case["kwargs"].clone())?;
+            let rendered = render_chat(&state.env, &messages, &state.bos_token, &options)?;
+            assert_eq!(
+                rendered,
+                case["rendered"].as_str().unwrap(),
+                "{} text",
+                case["name"]
+            );
+            assert_eq!(
+                state.shared.encode_chat(&rendered)?,
+                expected,
+                "{} ids",
+                case["name"]
+            );
+            let worker = std::thread::spawn(move || {
+                let EngineCommand::Generate { request, events } =
+                    commands.recv_timeout(Duration::from_secs(5)).unwrap()
+                else {
+                    panic!("expected Generate");
+                };
+                events
+                    .blocking_send(EngineEvent::Tokens {
+                        ids: output.clone(),
+                        accepted: 0,
+                    })
+                    .unwrap();
+                events
+                    .blocking_send(EngineEvent::Done {
+                        ids: output,
+                        rounds: 0,
+                        length_reached: true,
+                    })
+                    .unwrap();
+                request.ids
+            });
+            let stream = index % 2 == 0;
+            let request = serde_json::from_value(json!({
+                "messages": case["messages"], "chat_template_kwargs": case["kwargs"],
+                "temperature": 0, "max_tokens": 1, "stream": stream,
+            }))?;
+            let response = chat_completions(State(state), Json(request)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{}", case["name"]);
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await?;
+            if stream {
+                let text = std::str::from_utf8(&bytes)?;
+                assert!(text.contains("data: [DONE]"));
+                let mut generated = String::new();
+                for line in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                    if line == "[DONE]" {
+                        continue;
+                    }
+                    let chunk: serde_json::Value = serde_json::from_str(line)?;
+                    if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
+                        generated.push_str(content);
+                    }
+                }
+                assert_eq!(generated, "4");
+            } else {
+                let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+                assert_eq!(body["choices"][0]["message"]["content"], "4");
+                assert_eq!(body["usage"]["prompt_tokens"], expected.len());
+            }
+            assert_eq!(
+                worker.join().expect("mock worker"),
+                expected,
+                "{} HTTP ids",
+                case["name"]
+            );
+        }
+        Ok(())
     }
 }

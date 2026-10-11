@@ -23,14 +23,20 @@ pub(crate) enum LinearWeightRef {
 }
 pub(crate) struct Fp8Ops {
     dequant: CudaFunction,
-    gemv: CudaFunction,
+    small: [CudaFunction; 5],
 }
 impl Fp8Ops {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let m = super::cubin::module(ctx, "fp8_linear")?;
         Ok(Self {
             dequant: m.load_function("fp8_dequant_bf16")?,
-            gemv: m.load_function("fp8_gemv_bf16")?,
+            small: [
+                m.load_function("fp8_gemv_bf16")?,
+                m.load_function("fp8_skinny_bf16_m2")?,
+                m.load_function("fp8_skinny_bf16_m3")?,
+                m.load_function("fp8_skinny_bf16_m4")?,
+                m.load_function("fp8_skinny_bf16_m5")?,
+            ],
         })
     }
     fn check(codes: &Tensor<u8, 2>, scale: &Tensor<bf16, 2>) -> Result<()> {
@@ -79,7 +85,7 @@ impl Fp8Ops {
         }
         Ok(())
     }
-    pub fn gemv(
+    pub fn small_gemm(
         &self,
         stream: &Arc<CudaStream>,
         codes: Tensor<u8, 2>,
@@ -89,12 +95,15 @@ impl Fp8Ops {
     ) -> Result<()> {
         Self::check(&codes, &scale)?;
         validate_call(codes.shape, x, &y.0)?;
-        ensure!(x.shape[0] == 1, "FP8 GEMV requires Decode M1");
+        ensure!(
+            crate::linear_plan::direct_fp8_rows(x.shape[0] as usize),
+            "direct FP8 linear requires M1..5"
+        );
         disjoint(&codes, &y.0)?;
         disjoint(&scale, &y.0)?;
         unsafe {
             stream
-                .launch_builder(&self.gemv)
+                .launch_builder(&self.small[x.shape[0] as usize - 1])
                 .arg(&codes.ptr)
                 .arg(&scale.ptr)
                 .arg(&x.ptr)
@@ -278,7 +287,9 @@ impl LayerLinearPlan {
             .projections
             .get(role)
             .with_context(|| format!("layer projection not bound: {role}"))?;
-        let weight = if phase == crate::op_contract::ExecutionPhase::Prefill {
+        let weight = if phase == crate::op_contract::ExecutionPhase::Prefill
+            && !crate::linear_plan::direct_fp8_rows(x.shape[0] as usize)
+        {
             LinearWeightRef::Bf16(p.prefill)
         } else {
             p.resident
