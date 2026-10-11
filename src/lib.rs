@@ -7,6 +7,7 @@ pub mod fp8;
 pub mod linear_plan;
 pub mod model;
 pub mod model_spec;
+pub mod mtp;
 pub mod op_contract;
 pub mod prefill;
 pub mod serve;

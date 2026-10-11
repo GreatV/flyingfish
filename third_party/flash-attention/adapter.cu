@@ -53,7 +53,7 @@ bool hdim256_big_tile() {
 template <int D, typename Traits>
 int run_impl(void* q, void* k, void* v, void* out, void* lse, int rows, int start, int q_heads,
              int kv_heads, int capacity, int64_t q_row_stride, int causal,
-             cudaStream_t stream) {
+             cudaStream_t stream, int* seqused_k = nullptr) {
     if (rows <= 0 || start < 0 || start + rows > capacity || kv_heads <= 0 || q_heads <= 0 ||
         q_heads % kv_heads != 0 || q_row_stride < int64_t(q_heads) * D) {
         error = "invalid FA2 shape or cache range";
@@ -78,7 +78,8 @@ int run_impl(void* q, void* k, void* v, void* out, void* lse, int rows, int star
     p.h_h_k_ratio = q_heads / kv_heads;
     p.b = 1;
     p.seqlen_q = rows;
-    p.seqlen_k = start + rows;
+    p.seqlen_k = seqused_k ? capacity : start + rows;
+    p.seqused_k = seqused_k;
     p.seqlen_q_rounded = (rows + 127) / 128 * 128;
     p.seqlen_k_rounded = (p.seqlen_k + 127) / 128 * 128;
     p.d = p.d_rounded = D;
@@ -97,7 +98,48 @@ int run_impl(void* q, void* k, void* v, void* out, void* lse, int rows, int star
     else flash::run_flash_fwd<Traits, false, false>(p, stream);
     return 0;
 }
+
+int dispatch(void* q, void* k, void* v, void* out, void* lse, int rows, int start,
+                          int q_heads, int kv_heads, int capacity, int head_dim,
+                          int64_t q_row_stride, int causal, cudaStream_t stream, int* seqused_k) {
+    try {
+        if (head_dim == 128) {
+            return run_impl<128, Traits128>(q, k, v, out, lse, rows, start, q_heads, kv_heads,
+                                            capacity, q_row_stride, causal, stream, seqused_k);
+        }
+        if (head_dim == 256) {
+            if (hdim256_big_tile()) {
+                using Traits =
+                    Flash_fwd_kernel_traits<256, 128, 64, 8, false, false, cutlass::bfloat16_t>;
+                return run_impl<256, Traits>(q, k, v, out, lse, rows, start, q_heads, kv_heads,
+                                             capacity, q_row_stride, causal, stream, seqused_k);
+            }
+            using Traits =
+                Flash_fwd_kernel_traits<256, 64, 64, 4, false, false, cutlass::bfloat16_t>;
+            return run_impl<256, Traits>(q, k, v, out, lse, rows, start, q_heads, kv_heads,
+                                         capacity, q_row_stride, causal, stream, seqused_k);
+        }
+        error = "unsupported FA2 head dim";
+        return -1;
+    } catch (const std::exception& e) {
+        error = e.what();
+        return -1;
+    }
+}
+
 }  // namespace
+
+// Fixed query shape, device-resident key count. The caller writes start+rows
+// before this launch and guarantees rows <= *seqused_k <= capacity. Host sizes
+// describe the allocation; the causal alignment and CTA bounds use seqused_k.
+extern "C" int ff_fa2_run_device(void* q, void* k, void* v, void* out, void* lse,
+                                int rows, int* seqused_k, int q_heads, int kv_heads,
+                                int capacity, int head_dim, int64_t q_row_stride,
+                                int causal, cudaStream_t stream) {
+    if (!seqused_k) { error = "missing FA2 device key count"; return -1; }
+    return dispatch(q, k, v, out, lse, rows, 0, q_heads, kv_heads, capacity,
+                    head_dim, q_row_stride, causal, stream, seqused_k);
+}
 
 // kBlockM FA2 uses for this head dim on the current device: 64 for d128, 128 or
 // 64 for d256 per the query above. 0 = unsupported head dim.
@@ -114,27 +156,6 @@ extern "C" int ff_fa2_tile(int head_dim) {
 extern "C" int ff_fa2_run(void* q, void* k, void* v, void* out, void* lse, int rows, int start,
                           int q_heads, int kv_heads, int capacity, int head_dim,
                           int64_t q_row_stride, int causal, cudaStream_t stream) {
-    try {
-        if (head_dim == 128) {
-            return run_impl<128, Traits128>(q, k, v, out, lse, rows, start, q_heads, kv_heads,
-                                            capacity, q_row_stride, causal, stream);
-        }
-        if (head_dim == 256) {
-            if (hdim256_big_tile()) {
-                using Traits =
-                    Flash_fwd_kernel_traits<256, 128, 64, 8, false, false, cutlass::bfloat16_t>;
-                return run_impl<256, Traits>(q, k, v, out, lse, rows, start, q_heads, kv_heads,
-                                             capacity, q_row_stride, causal, stream);
-            }
-            using Traits =
-                Flash_fwd_kernel_traits<256, 64, 64, 4, false, false, cutlass::bfloat16_t>;
-            return run_impl<256, Traits>(q, k, v, out, lse, rows, start, q_heads, kv_heads,
-                                         capacity, q_row_stride, causal, stream);
-        }
-        error = "unsupported FA2 head dim";
-        return -1;
-    } catch (const std::exception& e) {
-        error = e.what();
-        return -1;
-    }
+    return dispatch(q, k, v, out, lse, rows, start, q_heads, kv_heads, capacity,
+                    head_dim, q_row_stride, causal, stream, nullptr);
 }

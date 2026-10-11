@@ -8,6 +8,16 @@ __device__ __forceinline__ float sigmoid(float x) {
     float e=expf(x); return e/(1.0f+e);
 }
 __device__ __forceinline__ float silu(float x) {return x*sigmoid(x);}
+extern "C" __global__ void q38_copy_finite_bf16(const __nv_bfloat16* source,
+                                               __nv_bfloat16* destination,
+                                               uint64_t count) {
+    for (uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+         i<count; i+=uint64_t(gridDim.x)*blockDim.x) {
+        __nv_bfloat16 value=source[i];
+        if (!isfinite(__bfloat162float(value))) { __trap(); return; }
+        destination[i]=value;
+    }
+}
 extern "C" __global__ void q38_bias_add(__nv_bfloat16* y,const __nv_bfloat16* bias,uint64_t count,uint32_t width) {
     for(uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*blockDim.x)
         y[i]=__hadd(y[i],bias[i%width]);
@@ -15,6 +25,24 @@ extern "C" __global__ void q38_bias_add(__nv_bfloat16* y,const __nv_bfloat16* bi
 extern "C" __global__ void q38_advance(Q38SequenceMeta* meta) {
     q38_meta_guard(meta);
     if(threadIdx.x==0 && blockIdx.x==0) { ++meta->prefix; ++meta->key_count; }
+}
+// Fixed-row MTP verification graphs read a changing device position. Keep the
+// final physical slot available for the next-row decode metadata.
+extern "C" __global__ void q38_batch_meta(const int32_t* position,
+                                         Q38SequenceMeta* meta, int32_t rows,
+                                         int32_t capacity) {
+    if (gridDim.x != 1 || gridDim.y != 1 || gridDim.z != 1 ||
+        blockDim.x != 1 || blockDim.y != 1 || blockDim.z != 1) {
+        __trap(); return;
+    }
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int32_t p = *position;
+        if (p < 0 || rows < 1 || rows > 4 || int64_t(p) + rows >= capacity) {
+            __trap(); return;
+        }
+        *meta = {p, rows, p + rows, capacity, 1, {0, 0, 0}};
+        q38_meta_guard(meta);
+    }
 }
 extern "C" __global__ void q38_multiply(const __nv_bfloat16* a,const __nv_bfloat16* b,__nv_bfloat16* y,uint64_t count) {
     for(uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*blockDim.x)

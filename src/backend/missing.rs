@@ -8,6 +8,17 @@ use std::path::Path;
 
 pub enum Backend {}
 impl Backend {
+    pub(crate) fn generate_mtp(
+        _dir: &Path,
+        _ids: &[u32],
+        _options: &crate::spec::Options,
+        _depth: usize,
+        _policy: crate::mtp::VerifyPolicy,
+        _graph: bool,
+    ) -> Result<crate::mtp::Output> {
+        bail!("MTP generation requires the CUDA backend; rebuild with --features cuda")
+    }
+
     pub fn prefill_multimodal(
         &mut self,
         _input: &crate::vision_input::MultimodalInput<'_>,

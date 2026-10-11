@@ -128,6 +128,18 @@ pub struct Model {
 }
 
 impl Model {
+    /// Generate one Q38 text request using its checkpoint's MTP component.
+    pub fn generate_mtp(
+        dir: &Path,
+        ids: &[u32],
+        options: &crate::spec::Options,
+        depth: usize,
+        policy: crate::mtp::VerifyPolicy,
+        graph: bool,
+    ) -> Result<crate::mtp::Output> {
+        Backend::generate_mtp(dir, ids, options, depth, policy, graph)
+    }
+
     pub fn check_ready(&self) -> Result<()> {
         self.backend.check_ready()
     }

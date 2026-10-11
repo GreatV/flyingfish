@@ -63,7 +63,7 @@ enum BoundMixer {
         decode: Box<GdnPlan>,
     },
 }
-fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
+pub(super) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     b: &CudaSlice<T>,
     s: &Arc<CudaStream>,
     offset: usize,
@@ -94,7 +94,7 @@ fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     let (ptr, _read) = b.device_ptr(s);
     unsafe { Tensor::new(ptr + (offset * size_of::<T>()) as u64, shape, stride, bytes) }
 }
-fn matrix(
+pub(super) fn matrix(
     b: &CudaSlice<bf16>,
     s: &Arc<CudaStream>,
     offset: usize,
@@ -109,7 +109,7 @@ fn matrix(
         [width as u64, 1],
     )
 }
-fn heads(
+pub(super) fn heads(
     b: &CudaSlice<bf16>,
     s: &Arc<CudaStream>,
     offset: usize,
@@ -125,17 +125,17 @@ fn heads(
         [u64::from(h) * u64::from(d), u64::from(d), 1],
     )
 }
-fn vector(b: &CudaSlice<bf16>, s: &Arc<CudaStream>) -> Result<Tensor<bf16, 1>> {
+pub(super) fn vector(b: &CudaSlice<bf16>, s: &Arc<CudaStream>) -> Result<Tensor<bf16, 1>> {
     view(b, s, 0, [u32::try_from(b.len())?], [1])
 }
-fn scratch(b: &CudaSlice<u8>, s: &Arc<CudaStream>) -> Scratch {
+pub(super) fn scratch(b: &CudaSlice<u8>, s: &Arc<CudaStream>) -> Scratch {
     let (ptr, _read) = b.device_ptr(s);
     Scratch {
         ptr,
         bytes: b.len() as u64,
     }
 }
-fn limits(rows: usize, capacity: usize) -> Result<AttentionLimits> {
+pub(super) fn limits(rows: usize, capacity: usize) -> Result<AttentionLimits> {
     ensure!(capacity >= 32, "Q38 attention capacity must be at least 32");
     Ok(AttentionLimits {
         max_rows: u32::try_from(rows)?,
@@ -145,6 +145,9 @@ fn limits(rows: usize, capacity: usize) -> Result<AttentionLimits> {
     })
 }
 impl Runtime {
+    pub(super) fn checkpoint_path(&self) -> &Path {
+        &self.checkpoint_dir
+    }
     #[cfg(test)]
     pub(super) fn position_values(&self, stream: &Arc<CudaStream>) -> Result<Vec<i32>> {
         Ok(stream.clone_dtoh(&self.positions)?)
@@ -525,9 +528,11 @@ impl Engine {
         capacity: usize,
         requested_chunk: Option<usize>,
         settings: Settings,
-        write: bool,
+        mode: super::SetupMode,
         model_spec: crate::model_spec::ModelSpec,
     ) -> Result<Self> {
+        let write = !matches!(mode, super::SetupMode::Ready);
+        let reserve_mtp = matches!(mode, super::SetupMode::Mtp);
         let started = Instant::now();
         ensure!(
             settings.draft_model.is_none(),
@@ -572,6 +577,9 @@ impl Engine {
         blas.enable_fp8(&device.ctx)?;
         device.finish_upload()?;
         let (free, total) = device.ctx.mem_get_info()?;
+        let mtp_budget = reserve_mtp
+            .then(|| crate::mtp::AttachmentBudget::new(&model_spec, capacity))
+            .transpose()?;
         let budget = crate::prefill::WorkspaceBudget::new(
             crate::prefill::WorkspaceRequest {
                 capacity,
@@ -579,16 +587,37 @@ impl Engine {
                 free_after_resident: free,
                 total,
                 alignment: 32,
-                row_bytes: Runtime::row_bytes(&model_spec)?,
-                fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?,
+                row_bytes: Runtime::row_bytes(&model_spec)?
+                    .checked_add(mtp_budget.as_ref().map_or(0, |b| b.row_bytes))
+                    .context("combined row bytes overflow")?,
+                fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
+                    .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
+                    .context("combined fixed bytes overflow")?,
             },
-            |rows| Runtime::workspace(rows, capacity),
+            |rows| {
+                let target = Runtime::workspace(rows, capacity)?;
+                target
+                    .checked_add(
+                        mtp_budget
+                            .as_ref()
+                            .map(|b| b.workspace(rows))
+                            .transpose()?
+                            .unwrap_or(0),
+                    )
+                    .context("Q38 combined workspace overflow")
+            },
         )?;
         let rows = budget.plan.chunk;
+        ensure!(
+            !reserve_mtp || rows >= 4,
+            "MTP workspace cannot fit four verification rows"
+        );
+        let target_workspace = Runtime::workspace(rows, capacity)?;
         eprintln!(
             "{}",
             serde_json::json!({
                 "q38_memory_plan": budget,
+                "mtp_attachment_planned_bytes": if reserve_mtp { crate::mtp::attachment_bytes(&model_spec, capacity, rows, true)? } else { 0 },
                 "resident_weights_bytes": weights.bytes,
                 "persistent_state_bytes": state.bytes(),
                 "capture_checkpoint_bytes": capture_checkpoint.as_ref().context("capture checkpoint missing")?.bytes(),
@@ -606,13 +635,16 @@ impl Engine {
                 "selection_source": "fixed"
             })
         );
-        let scratch_buffer = s.alloc_zeros::<u8>(budget.operator_workspace_bytes)?;
+        let scratch_buffer = s.alloc_zeros::<u8>(target_workspace)?;
         let work = Work::new(s, &model_spec, rows)?;
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
         let config = model_spec.config();
         let mut engine = Self {
             #[cfg(test)]
             capture_fail_after_layer: None,
+            #[cfg(test)]
+            capture_fail_stage: None,
+            qwen_device_prefix: false,
             forward_rows: (1..=rows.min(16)).collect(),
             graphs: vec![Graph::Decode],
             closure,
@@ -642,6 +674,9 @@ impl Engine {
             trace_layer: 0,
             position: 0,
             qwen: None,
+            mtp: None,
+            mtp_state: None,
+            mtp_epoch: 0,
             images: None,
         };
         engine.qwen = Some(Runtime::new(&engine, dir, catalog, arena, scratch_buffer)?);
@@ -751,25 +786,32 @@ impl Engine {
                         };
                         FullAttentionOps::preprocess(prefill, s, meta, scratch(&q.scratch, s))?;
                         let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
+                        let shape = Shape {
+                            rows,
+                            start: self.position,
+                            q_heads: 24,
+                            kv_heads: 4,
+                            capacity: self.capacity,
+                            head_dim: 256,
+                            causal: true,
+                        };
+                        let launch = if self.qwen_device_prefix {
+                            super::super::flash::Launch::Device {
+                                shape,
+                                key_count: self
+                                    .state
+                                    .sequence
+                                    .as_ref()
+                                    .context("Q38 sequence missing")?
+                                    .slice(2..3),
+                            }
+                        } else {
+                            shape.into()
+                        };
                         self.flash
                             .as_mut()
                             .context("Q38 prefill attention is not bound")?
-                            .run(
-                                &mw.q,
-                                24 * 256,
-                                &kv.k,
-                                &kv.v,
-                                &mut w.attn,
-                                Shape {
-                                    rows,
-                                    start: self.position,
-                                    q_heads: 24,
-                                    kv_heads: 4,
-                                    capacity: self.capacity,
-                                    head_dim: 256,
-                                    causal: true,
-                                },
-                            )?;
+                            .run(&mw.q, 24 * 256, &kv.k, &kv.v, &mut w.attn, launch)?;
                     }
                     ExecutionPhase::Decode => {
                         FullAttentionOps::run(decode, s, meta, scratch(&q.scratch, s))?;

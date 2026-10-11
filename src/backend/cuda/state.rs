@@ -149,6 +149,7 @@ pub(crate) struct StateCheckpoint {
     token: CudaSlice<u32>,
     prefix: usize,
     rows: usize,
+    active_rows: usize,
     heads: usize,
     dim: usize,
     capacity: usize,
@@ -195,6 +196,7 @@ impl StateCheckpoint {
             token: stream.alloc_zeros(1)?,
             prefix: 0,
             rows,
+            active_rows: 0,
             heads,
             dim,
             capacity: store.capacity as usize,
@@ -239,12 +241,10 @@ impl StateCheckpoint {
         self.valid = false;
         self.check(store)?;
         ensure!(
-            token.len() == 1
-                && prefix
-                    .checked_add(self.rows)
-                    .is_some_and(|n| n <= self.capacity),
+            token.len() == 1 && prefix < self.capacity,
             "checkpoint writes exceed capacity"
         );
+        let active_rows = self.rows.min(self.capacity - prefix);
         if let Some(seq) = &store.sequence {
             let host = stream.clone_dtoh(seq)?;
             ensure!(
@@ -273,7 +273,7 @@ impl StateCheckpoint {
                     b,
                     super::copy::Rect {
                         rows: self.heads,
-                        width: self.rows * self.dim,
+                        width: active_rows * self.dim,
                         src_pitch: self.capacity * self.dim,
                         src_col: prefix * self.dim,
                         dst_pitch: self.rows * self.dim,
@@ -287,6 +287,7 @@ impl StateCheckpoint {
         }
         stream.memcpy_dtod(token, &mut self.token)?;
         self.prefix = prefix;
+        self.active_rows = active_rows;
         self.valid = true;
         Ok(())
     }
@@ -311,7 +312,7 @@ impl StateCheckpoint {
                     b,
                     super::copy::Rect {
                         rows: self.heads,
-                        width: self.rows * self.dim,
+                        width: self.active_rows * self.dim,
                         src_pitch: self.rows * self.dim,
                         src_col: 0,
                         dst_pitch: self.capacity * self.dim,

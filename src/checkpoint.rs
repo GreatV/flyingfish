@@ -178,7 +178,7 @@ impl MappedCheckpoint {
             spec.architecture == Architecture::Qwen35Text,
             "Q38 manifest requires text spec"
         );
-        if policy != LoadPolicy::TextOnly {
+        if matches!(policy, LoadPolicy::TextWithVision | LoadPolicy::VisionOnly) {
             spec.vision
                 .as_ref()
                 .context("vision load policy requires vision configuration")?
@@ -306,7 +306,7 @@ impl MappedCheckpoint {
                 ensure!(name.starts_with("model.visual."), "unknown non-text scope");
                 TensorScope::Vision
             };
-            let load = policy.selects(scope);
+            let load = policy.selects_tensor(scope, name);
             let t = views[shard].tensor(name)?;
             ensure!(
                 t.dtype() == dtype && t.shape() == shape,
@@ -372,6 +372,10 @@ impl MappedCheckpoint {
             LoadPolicy::TextOnly => 29_468_003_328,
             LoadPolicy::TextWithVision => 30_389_463_520,
             LoadPolicy::VisionOnly => 921_460_192,
+            LoadPolicy::TextWithMtp => 29_945_203_072,
+            #[cfg(test)]
+            LoadPolicy::MtpProbe => 5_562_793_344,
+            LoadPolicy::MtpOnly => 477_199_744,
         };
         ensure!(
             expected.is_empty() && resident_bytes == expected_bytes,
@@ -397,15 +401,42 @@ pub enum LoadPolicy {
     TextWithVision,
     /// For the standalone vision component; cannot construct a text Engine.
     VisionOnly,
+    TextWithMtp,
+    /// Only MTP and the shared embedding/head; no target layers or final norm.
+    #[cfg(test)]
+    MtpProbe,
+    /// Attach to an Engine that already owns the shared embedding/head.
+    MtpOnly,
 }
 
 impl LoadPolicy {
     pub fn selects(self, scope: TensorScope) -> bool {
+        #[cfg(test)]
+        if self == Self::MtpProbe {
+            return scope == TensorScope::Mtp;
+        }
         matches!(
             (self, scope),
-            (Self::TextOnly | Self::TextWithVision, TensorScope::Text)
-                | (Self::TextWithVision | Self::VisionOnly, TensorScope::Vision)
+            (
+                Self::TextOnly | Self::TextWithVision | Self::TextWithMtp,
+                TensorScope::Text
+            ) | (Self::TextWithVision | Self::VisionOnly, TensorScope::Vision)
+                | (Self::TextWithMtp | Self::MtpOnly, TensorScope::Mtp)
         )
+    }
+
+    pub fn selects_tensor(self, scope: TensorScope, _name: &str) -> bool {
+        #[cfg(test)]
+        if self == Self::MtpProbe
+            && scope == TensorScope::Text
+            && matches!(
+                _name,
+                "model.language_model.embed_tokens.weight" | "lm_head.weight"
+            )
+        {
+            return true;
+        }
+        self.selects(scope)
     }
 }
 #[derive(Debug, serde::Serialize)]

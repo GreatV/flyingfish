@@ -227,12 +227,12 @@ impl LayerLinearPlan {
         stream: &Arc<CudaStream>,
     ) -> Result<Self> {
         arena.validate(plan.bytes)?;
-        let prefix = format!("model.language_model.layers.{}.", plan.layer);
+        let prefix = &plan.prefix;
         let mut projections = std::collections::BTreeMap::new();
         let mut materialize = Vec::new();
         for (name, entry) in &catalog.manifest.entries {
             if !entry.load
-                || !name.starts_with(&prefix)
+                || !name.starts_with(prefix)
                 || !name.ends_with(".weight")
                 || entry.shape.len() != 2
             {
@@ -249,7 +249,10 @@ impl LayerLinearPlan {
                     w
                 }
             };
-            projections.insert(entry.role.clone(), BoundProjection { resident, prefill });
+            projections.insert(
+                name[prefix.len()..].to_owned(),
+                BoundProjection { resident, prefill },
+            );
         }
         ensure!(
             materialize.len() == plan.slots.len(),
