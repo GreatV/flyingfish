@@ -1,5 +1,5 @@
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, CudaStream, CudaView, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::{
     ffi::{CStr, c_char, c_void},
@@ -7,6 +7,22 @@ use std::{
 };
 
 unsafe extern "C" {
+    fn ff_fa2_run_device(
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        out: *mut c_void,
+        lse: *mut c_void,
+        rows: i32,
+        key_count: *const i32,
+        q_heads: i32,
+        kv_heads: i32,
+        capacity: i32,
+        head_dim: i32,
+        q_row_stride: i64,
+        causal: i32,
+        stream: *mut c_void,
+    ) -> i32;
     fn ff_fa2_tile(head_dim: i32) -> i32;
     fn ff_fa2_error() -> *const c_char;
     fn ff_fa2_run(
@@ -31,6 +47,7 @@ unsafe extern "C" {
 /// `[start, start + rows)` against the head-major KV caches of `capacity`
 /// positions. Q rows are `q_heads * head_dim` wide with head stride `head_dim`;
 /// the row pitch is stated at the call site.
+#[derive(Clone, Copy)]
 pub struct Shape {
     pub rows: usize,
     pub start: usize,
@@ -39,6 +56,21 @@ pub struct Shape {
     pub capacity: usize,
     pub head_dim: usize,
     pub causal: bool,
+}
+
+/// Device mode ignores Shape.start. The producer must validate and write
+/// rows <= key_count <= capacity before launch, on this stream.
+pub enum Launch<'a> {
+    Host(Shape),
+    Device {
+        shape: Shape,
+        key_count: CudaView<'a, i32>,
+    },
+}
+impl From<Shape> for Launch<'_> {
+    fn from(shape: Shape) -> Self {
+        Self::Host(shape)
+    }
 }
 
 pub struct Flash {
@@ -71,15 +103,38 @@ impl Flash {
     /// `v` are the head-major caches `[kv_heads, capacity, head_dim]` that
     /// `tcmqa_d256_rope_k_scatter` / `_v_scatter` write, holding every position
     /// `[0, start + rows)`.
-    pub fn run(
+    pub fn run<'a>(
         &mut self,
         q: &CudaSlice<bf16>,
         q_row_stride: usize,
         k: &CudaSlice<bf16>,
         v: &CudaSlice<bf16>,
         out: &mut CudaSlice<bf16>,
-        shape: Shape,
+        launch: impl Into<Launch<'a>>,
     ) -> Result<()> {
+        let (shape, key_count) = match launch.into() {
+            Launch::Host(shape) => (shape, None),
+            Launch::Device {
+                mut shape,
+                key_count,
+            } => {
+                ensure!(key_count.len() == 1, "FA2 needs one device key count");
+                shape.start = 0;
+                (shape, Some(key_count))
+            }
+        };
+        ensure!(
+            [
+                shape.rows,
+                shape.start,
+                shape.capacity,
+                shape.q_heads,
+                shape.kv_heads
+            ]
+            .iter()
+            .all(|&x| x <= i32::MAX as usize),
+            "FA2 dimensions exceed i32"
+        );
         ensure!(
             shape.causal,
             "FA2 prefill is causal-only; the non-causal path selects a zero-width local window"
@@ -95,7 +150,10 @@ impl Flash {
             "FA2 query heads must be a multiple of the KV heads"
         );
         ensure!(
-            shape.start + shape.rows <= shape.capacity,
+            shape
+                .start
+                .checked_add(shape.rows)
+                .is_some_and(|end| end <= shape.capacity),
             "FA2 range exceeds cache"
         );
         ensure!(
@@ -127,23 +185,45 @@ impl Flash {
         let (v, _v) = v.device_ptr(&self.stream);
         let (out, _out) = out.device_ptr_mut(&self.stream);
         let (lse, _lse) = self.lse.device_ptr_mut(&self.stream);
-        let status = unsafe {
-            ff_fa2_run(
-                q as _,
-                k as _,
-                v as _,
-                out as _,
-                lse as _,
-                shape.rows as i32,
-                shape.start as i32,
-                shape.q_heads as i32,
-                shape.kv_heads as i32,
-                shape.capacity as i32,
-                shape.head_dim as i32,
-                q_row_stride as i64,
-                i32::from(shape.causal),
-                self.stream.cu_stream() as _,
-            )
+        let status = if let Some(count) = key_count {
+            let (count, _count) = count.device_ptr(&self.stream);
+            unsafe {
+                ff_fa2_run_device(
+                    q as _,
+                    k as _,
+                    v as _,
+                    out as _,
+                    lse as _,
+                    shape.rows as i32,
+                    count as _,
+                    shape.q_heads as i32,
+                    shape.kv_heads as i32,
+                    shape.capacity as i32,
+                    shape.head_dim as i32,
+                    q_row_stride as i64,
+                    i32::from(shape.causal),
+                    self.stream.cu_stream() as _,
+                )
+            }
+        } else {
+            unsafe {
+                ff_fa2_run(
+                    q as _,
+                    k as _,
+                    v as _,
+                    out as _,
+                    lse as _,
+                    shape.rows as i32,
+                    shape.start as i32,
+                    shape.q_heads as i32,
+                    shape.kv_heads as i32,
+                    shape.capacity as i32,
+                    shape.head_dim as i32,
+                    q_row_stride as i64,
+                    i32::from(shape.causal),
+                    self.stream.cu_stream() as _,
+                )
+            }
         };
         if status != 0 {
             let error = unsafe { CStr::from_ptr(ff_fa2_error()) }.to_string_lossy();
@@ -152,3 +232,7 @@ impl Flash {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "flash_prefix_tests.rs"]
+mod prefix_tests;

@@ -1,0 +1,379 @@
+use super::*;
+use crate::backend::{Settings, SpecBudget, TreeBuilder};
+use std::path::PathBuf;
+
+pub(super) fn load(write: bool) -> Result<Engine> {
+    ensure!(
+        std::env::var("FF_Q38_FULL_MODEL_WINDOW").as_deref() == Ok("granted"),
+        "M2a requires a separate full-model cloud window"
+    );
+    let dir = PathBuf::from(std::env::var_os("FF_Q38_MODEL").context("FF_Q38_MODEL missing")?);
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+    );
+    Engine::load_kind(
+        &dir,
+        0,
+        128,
+        Some(16),
+        Settings {
+            tree_builder: TreeBuilder::Waves,
+            spec_budget: SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            runtime_dir: Some(runtime),
+        },
+        write,
+    )
+}
+pub(super) fn options(k: usize, h2: MtpHiddenTap, h5: MtpRecurrentTap, graph: bool) -> MtpOptions {
+    MtpOptions {
+        depth: k,
+        hidden_tap: h2,
+        recurrent_tap: h5,
+        graph,
+    }
+}
+pub(super) fn configure(e: &mut Engine, o: MtpOptions) -> Result<()> {
+    e.reset()?;
+    if let Some(c) = e.mtp.as_mut() {
+        o.validate()?;
+        c.options = o;
+        c.runtime.plan.hidden_tap = o.hidden_tap;
+        c.runtime.plan.recurrent_tap = o.recurrent_tap;
+    } else {
+        e.mtp_enable(o)?;
+    }
+    Ok(())
+}
+pub(super) fn prompt(case: &str) -> Result<Vec<u32>> {
+    let root = PathBuf::from(
+        std::env::var_os("FF_Q38_MTP_REF_ROOT").context("FF_Q38_MTP_REF_ROOT missing")?,
+    );
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        root.join(format!("inputs/{case}.input_ids.json")),
+    )?)?;
+    Ok(serde_json::from_value(v["input_ids"].clone())?)
+}
+pub(super) fn output() -> Result<PathBuf> {
+    let p =
+        PathBuf::from(std::env::var_os("FF_Q38_MTP_OUTPUT").context("FF_Q38_MTP_OUTPUT missing")?);
+    std::fs::create_dir_all(&p)?;
+    Ok(p)
+}
+pub(super) fn save(e: &mut Engine) -> Result<()> {
+    let mut c = e.mtp.take().context("MTP missing")?;
+    let r = Bound {
+        engine: e,
+        chain: &mut c,
+    }
+    .save(4);
+    e.mtp = Some(c);
+    r
+}
+pub(super) fn restore(e: &mut Engine) -> Result<()> {
+    let mut c = e.mtp.take().context("MTP missing")?;
+    let r = Bound {
+        engine: e,
+        chain: &mut c,
+    }
+    .restore();
+    e.mtp = Some(c);
+    r
+}
+pub(super) fn ordinary(e: &mut Engine, count: usize) -> Result<Vec<u32>> {
+    let mut c = e.mtp.take().context("MTP missing")?;
+    let result = (|| -> Result<Vec<u32>> {
+        let mut out = Vec::new();
+        let mut b = Bound {
+            engine: e,
+            chain: &mut c,
+        };
+        for _ in 0..count {
+            let token = b.pending()?;
+            b.canonical_row(token)?;
+            out.push(b.target_decode(token)?);
+        }
+        b.chain.committed_position = b.engine.position;
+        Ok(out)
+    })();
+    e.mtp = Some(c);
+    result
+}
+pub(super) fn state_bits(e: &Engine) -> Result<Vec<u8>> {
+    let s = &e.device.stream;
+    let mut bits = Vec::new();
+    for store in [&e.state, e.mtp_state.as_ref().context("MTP state missing")?] {
+        for g in &store.gdn {
+            for buf in [&g.s, &g.history] {
+                for v in s.clone_dtoh(buf)? {
+                    bits.extend_from_slice(&v.to_bits().to_le_bytes());
+                }
+            }
+        }
+        for kv in &store.kv {
+            for buf in [&kv.k, &kv.v] {
+                for v in s.clone_dtoh(buf)? {
+                    bits.extend_from_slice(&v.to_bits().to_le_bytes());
+                }
+            }
+        }
+        for v in s.clone_dtoh(store.sequence.as_ref().context("metadata missing")?)? {
+            bits.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    for buf in [&e.work.position, &e.work.length] {
+        for v in s.clone_dtoh(buf)? {
+            bits.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    for v in s.clone_dtoh(&e.work.token)? {
+        bits.extend_from_slice(&v.to_le_bytes());
+    }
+    // Before the first prefill, logits are scratch, including capture warmup.
+    if e.position > 0 {
+        for v in s.clone_dtoh(&e.work.logits)? {
+            bits.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+    }
+    let c = e.mtp.as_ref().context("MTP missing")?;
+    for buf in [&c.last_target, &c.recurrent] {
+        for v in buf {
+            bits.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+    }
+    for n in [e.position, c.cursor, c.committed_position] {
+        bits.extend_from_slice(&n.to_le_bytes());
+    }
+    bits.extend_from_slice(&e.mtp_epoch.to_le_bytes());
+    bits.extend_from_slice(&c.epoch.to_le_bytes());
+    for v in e
+        .qwen
+        .as_ref()
+        .context("Qwen missing")?
+        .position_values(s)?
+    {
+        bits.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok(bits)
+}
+
+pub(crate) fn q38_mtp_chain_gpu() -> Result<()> {
+    let mut e = load(false)?;
+    let out = output()?;
+    for k in 1..=3 {
+        for h2 in [MtpHiddenTap::PreFinalNorm, MtpHiddenTap::PostFinalNorm] {
+            for h5 in [MtpRecurrentTap::PreMtpNorm, MtpRecurrentTap::PostMtpNorm] {
+                for case in ["math1", "code1", "gen1", "gen2", "math2"] {
+                    configure(&mut e, options(k, h2, h5, true))?;
+                    let ids = prompt(case)?;
+                    let first = e.prefill(&ids, None)?;
+                    // The ordinary target consumes the same pending-anchor convention.
+                    let mut plain = vec![first];
+                    for _ in 1..64 {
+                        if e.model_spec
+                            .eos
+                            .contains(plain.last().context("no target output")?)
+                        {
+                            break;
+                        }
+                        let t = e.decode(true, None)?;
+                        plain.push(t);
+                        if e.model_spec.eos.contains(&t) {
+                            break;
+                        }
+                    }
+                    // Rebuild the prompt; a four-row transaction journal cannot
+                    // rewind a complete 64-token baseline trajectory.
+                    ensure!(
+                        e.mtp_prefill(&ids)? == first,
+                        "MTP bootstrap changed target prefill"
+                    );
+                    let mut got = vec![first];
+                    let mut rounds = Vec::new();
+                    while got.len() < plain.len()
+                        && !e.model_spec.eos.contains(got.last().context("no output")?)
+                    {
+                        let r = e.mtp_round(plain.len() - got.len(), None)?;
+                        ensure!(!r.tokens.is_empty(), "MTP stopped before target budget");
+                        rounds.push(serde_json::json!({"matched":r.matched,"accepted":r.accepted,"consumed":r.consumed,"proposals":r.proposals,"tokens":r.tokens}));
+                        got.extend_from_slice(&r.tokens);
+                    }
+                    ensure!(
+                        got == plain,
+                        "M2a token divergence {case} K{k} {h2:?}/{h5:?}"
+                    );
+                    std::fs::write(
+                        out.join(format!("{case}-K{k}-{h2:?}-{h5:?}.json")),
+                        serde_json::to_vec_pretty(
+                            &serde_json::json!({"case":case,"depth":k,"h2":h2,"h5":h5,"tokens":got,"plain_tokens":plain,"rounds":rounds,"target_token_gate":"BIT_EQUAL","recursive_numeric_gate":"requires corrected 6d chain fixture; old 0de341ed not qualified"}),
+                        )?,
+                    )?;
+                    eprintln!("M2A_CHAIN {case} K{k} {h2:?}/{h5:?} target_token_bits PASS");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn q38_mtp_transaction_gpu() -> Result<()> {
+    let mut e = load(false)?;
+    let ids = prompt("math1")?;
+    for graph in [false, true] {
+        for k in 1..=3 {
+            for h2 in [MtpHiddenTap::PreFinalNorm, MtpHiddenTap::PostFinalNorm] {
+                for h5 in [MtpRecurrentTap::PreMtpNorm, MtpRecurrentTap::PostMtpNorm] {
+                    configure(&mut e, options(k, h2, h5, graph))?;
+                    e.mtp_prefill(&ids)?;
+                    save(&mut e)?;
+                    let predictions = ordinary(&mut e, k + 1)?;
+                    restore(&mut e)?;
+                    ensure!(
+                        !predictions[..k]
+                            .iter()
+                            .any(|t| e.model_spec.eos.contains(t)),
+                        "transaction fixture hit EOS; use an earlier prefix"
+                    );
+                    for j in 0..=k {
+                        let expected = ordinary(&mut e, j + 1)?;
+                        let bits = state_bits(&e)?;
+                        restore(&mut e)?;
+                        let mut proposals = predictions[..k].to_vec();
+                        if j < k {
+                            proposals[j] = (proposals[j] + 1) % VOCAB as u32;
+                        }
+                        e.mtp.as_mut().context("MTP missing")?.force_proposals = Some(proposals);
+                        let round = e.mtp_round(64, None)?;
+                        ensure!(
+                            round.accepted == j && round.tokens == expected,
+                            "wrong forced acceptance count/output"
+                        );
+                        ensure!(
+                            state_bits(&e)? == bits,
+                            "M2a committed S/history/KV/meta/hidden mismatch at K{k}/j{j}/{h2:?}/{h5:?}/graph{graph}"
+                        );
+                        restore(&mut e)?;
+                        e.mtp.as_mut().context("MTP missing")?.force_proposals = None;
+                    }
+                }
+            }
+        }
+    }
+    // A snapshot near the last consumable slot must clip its copy window.
+    configure(
+        &mut e,
+        options(
+            3,
+            MtpHiddenTap::PreFinalNorm,
+            MtpRecurrentTap::PostMtpNorm,
+            true,
+        ),
+    )?;
+    let mut tail = ids;
+    tail.resize(e.capacity - 2, 1);
+    e.mtp_prefill(&tail)?;
+    save(&mut e)?;
+    let expected = ordinary(&mut e, 1)?;
+    let bits = state_bits(&e)?;
+    restore(&mut e)?;
+    let r = e.mtp_round(64, None)?;
+    ensure!(
+        r.tokens == expected && state_bits(&e)? == bits,
+        "last consumable slot mismatch"
+    );
+    ensure!(
+        e.mtp_round(64, None)?.tokens.is_empty(),
+        "MTP ran beyond legal next-row metadata"
+    );
+    // A different prefill with the same length must not revive an old MTP cache.
+    let ids = prompt("math1")?;
+    e.mtp_prefill(&ids)?;
+    e.reset()?;
+    e.prefill(&ids, None)?;
+    let before = state_bits(&e)?;
+    ensure!(
+        e.mtp_round(1, None).is_err(),
+        "MTP accepted a stale state epoch"
+    );
+    ensure!(
+        state_bits(&e)? == before,
+        "stale-epoch rejection mutated state"
+    );
+    Ok(())
+}
+
+pub(crate) fn q38_mtp_failure_and_capture_gpu() -> Result<()> {
+    let mut e = load(true)?;
+    e.mtp_enable(options(
+        3,
+        MtpHiddenTap::PreFinalNorm,
+        MtpRecurrentTap::PostMtpNorm,
+        true,
+    ))?;
+    let before = state_bits(&e)?;
+    for occurrence in [1, 2] {
+        e.capture_fail_after_layer = Some((0, occurrence));
+        ensure!(e.capture().is_err(), "capture fault ignored");
+        ensure!(
+            e.poisoned && e.graph.is_none() && state_bits(&e)? == before,
+            "capture failed to restore state or published graph"
+        );
+        e.capture_fail_after_layer = None;
+        e.poisoned = false;
+    }
+    use crate::backend::cuda::engine::CaptureFault;
+    for fault in [
+        CaptureFault::Begin,
+        CaptureFault::End,
+        CaptureFault::Instantiate,
+    ] {
+        e.capture_fail_stage = Some(fault);
+        ensure!(
+            e.capture().is_err(),
+            "capture stage fault ignored: {fault:?}"
+        );
+        ensure!(
+            e.poisoned && e.graph.is_none() && state_bits(&e)? == before,
+            "capture stage rollback/publication failure: {fault:?}"
+        );
+        e.capture_fail_stage = None;
+        e.poisoned = false;
+    }
+    e.capture()?;
+    ensure!(
+        state_bits(&e)? == before,
+        "capture changed target/MTP state"
+    );
+    e.closure.ready(std::time::Instant::now())?;
+    e.mtp_prefill(&prompt("math1")?)?;
+    save(&mut e)?;
+    let predictions = ordinary(&mut e, 4)?;
+    restore(&mut e)?;
+    e.mtp.as_mut().context("MTP missing")?.force_proposals = Some(predictions[..3].to_vec());
+    let mut points = vec![Fault::AfterRestore, Fault::BeforePublish];
+    points.extend((0..3).map(Fault::AfterDraft));
+    points.extend((0..4).map(Fault::AfterVerify));
+    points.extend((0..4).map(Fault::AfterCanonical));
+    points.extend((0..4).map(Fault::AfterReplay));
+    let before = state_bits(&e)?;
+    for fault in points {
+        ensure!(
+            e.mtp_round(64, Some(fault)).is_err(),
+            "MTP fault ignored: {fault:?}"
+        );
+        ensure!(
+            !e.poisoned && state_bits(&e)? == before,
+            "rollback state mismatch: {fault:?}"
+        );
+    }
+    let expected = ordinary(&mut e, 4)?;
+    let bits = state_bits(&e)?;
+    restore(&mut e)?;
+    let round = e.mtp_round(64, None)?;
+    ensure!(
+        round.tokens == expected && state_bits(&e)? == bits,
+        "retry after rollback differs from ordinary decode"
+    );
+    Ok(())
+}

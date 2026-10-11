@@ -388,10 +388,12 @@ fn vision_load_policy_checks_all_headers_without_loading_payloads() -> Result<()
         std::path::PathBuf::from(std::env::var_os("FF_Q38_MODEL").context("FF_Q38_MODEL missing")?);
     let s = ModelSpec::read(&dir)?;
     let mapped = MappedCheckpoint::open(&dir)?;
-    for (policy, bytes, vision_count, text_count) in [
-        (LoadPolicy::TextOnly, 29_468_003_328, 0, 1251),
-        (LoadPolicy::TextWithVision, 30_389_463_520, 333, 1251),
-        (LoadPolicy::VisionOnly, 921_460_192, 333, 0),
+    for (policy, bytes, vision_count, text_count, mtp_count) in [
+        (LoadPolicy::TextOnly, 29_468_003_328, 0, 1251, 0),
+        (LoadPolicy::TextWithVision, 30_389_463_520, 333, 1251, 0),
+        (LoadPolicy::VisionOnly, 921_460_192, 333, 0, 0),
+        (LoadPolicy::TextWithMtp, 29_945_203_072, 0, 1251, 22),
+        (LoadPolicy::MtpOnly, 477_199_744, 0, 0, 22),
     ] {
         let m = mapped.q38_manifest_with_policy(&s, policy)?;
         assert_eq!(m.resident_bytes, bytes);
@@ -409,12 +411,18 @@ fn vision_load_policy_checks_all_headers_without_loading_payloads() -> Result<()
                 .count(),
             text_count
         );
-        assert!(
+        assert_eq!(
             m.entries
                 .values()
-                .filter(|e| e.scope == TensorScope::Mtp)
-                .all(|e| !e.load)
+                .filter(|e| e.scope == TensorScope::Mtp && e.load)
+                .count(),
+            mtp_count
         );
+        if mtp_count > 0 {
+            let plan = flyingfish::linear_plan::LayerDequantPlan::mtp(&m)?;
+            assert_eq!(plan.bytes as usize, flyingfish::mtp::ARENA_BYTES);
+            assert_eq!(plan.slots.len(), 7);
+        }
         assert_eq!(
             m.entries
                 .values()

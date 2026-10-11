@@ -13,12 +13,21 @@ pub struct DequantSlot {
 #[derive(Debug)]
 pub struct LayerDequantPlan {
     pub layer: u32,
+    pub prefix: String,
     pub bytes: u64,
     pub slots: BTreeMap<String, DequantSlot>,
 }
 impl LayerDequantPlan {
     pub fn from_manifest(manifest: &TensorManifest, layer: u32) -> Result<Self> {
         let prefix = format!("model.language_model.layers.{layer}.");
+        Self::build(manifest, layer, prefix)
+    }
+
+    pub fn mtp(manifest: &TensorManifest) -> Result<Self> {
+        Self::build(manifest, 0, "mtp.layers.0.".into())
+    }
+
+    fn build(manifest: &TensorManifest, layer: u32, prefix: String) -> Result<Self> {
         let mut bytes = 0u64;
         let mut slots = BTreeMap::new();
         for (name, e) in &manifest.entries {
@@ -66,6 +75,7 @@ impl LayerDequantPlan {
         bytes = bytes.checked_add(255).context("arena size overflow")? & !255;
         Ok(Self {
             layer,
+            prefix,
             bytes,
             slots,
         })

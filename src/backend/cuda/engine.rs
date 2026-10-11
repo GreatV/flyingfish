@@ -21,6 +21,13 @@ use std::{
     time::Instant,
 };
 
+#[path = "engine_mtp.rs"]
+mod mtp;
+#[path = "engine_mtp_generate.rs"]
+mod mtp_generate;
+#[cfg(test)]
+#[path = "engine_mtp_launch_tests.rs"]
+mod mtp_launch_tests;
 #[path = "engine_qwen.rs"]
 mod qwen;
 #[path = "engine_vision.rs"]
@@ -364,9 +371,20 @@ enum Graph {
     Inject(usize),
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureFault {
+    Begin,
+    End,
+    Instantiate,
+}
+
 pub struct Engine {
+    qwen_device_prefix: bool,
     #[cfg(test)]
     capture_fail_after_layer: Option<(usize, usize)>,
+    #[cfg(test)]
+    capture_fail_stage: Option<CaptureFault>,
     forward_rows: std::collections::BTreeSet<usize>,
     graphs: Vec<Graph>,
     closure: Rc<super::closure::Closure>,
@@ -380,6 +398,9 @@ pub struct Engine {
     runtime: PathBuf,
     spec: Option<Spec>,
     qwen: Option<qwen::Runtime>,
+    mtp: Option<mtp::Chain>,
+    mtp_state: Option<super::state::StateStore>,
+    mtp_epoch: u64,
     images: Option<vision_runtime::EncodedImages>,
     weights: Weights,
     state: super::state::StateStore,
@@ -511,8 +532,14 @@ impl Engine {
         let mut engine = Self {
             #[cfg(test)]
             capture_fail_after_layer: None,
+            #[cfg(test)]
+            capture_fail_stage: None,
             qwen: None,
+            mtp: None,
+            mtp_state: None,
+            mtp_epoch: 0,
             images: None,
+            qwen_device_prefix: false,
             forward_rows: std::collections::BTreeSet::new(),
             graphs: Vec::new(),
             closure,
@@ -1482,6 +1509,12 @@ impl Engine {
 
     pub fn reset(&mut self) -> Result<()> {
         self.poisoned = true;
+        {
+            self.mtp_epoch = self
+                .mtp_epoch
+                .checked_add(1)
+                .context("MTP state epoch exhausted")?;
+        }
         self.device.stream.synchronize()?;
         self.images = None;
         self.reset_qwen_positions()?;
@@ -1716,12 +1749,29 @@ impl Engine {
             s.memcpy_htod(&saved_position, &mut self.work.position)?;
             s.memcpy_htod(&saved_length, &mut self.work.length)?;
             s.synchronize()?;
+            #[cfg(test)]
+            ensure!(
+                self.capture_fail_stage != Some(CaptureFault::Begin),
+                "injected capture begin failure"
+            );
             s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
             let launches = self.run_decode_step(None);
             // End capture even when a host-side launch check fails.
             let captured = s.end_capture(sys::CUgraphInstantiate_flags(0));
             launches?;
+            #[cfg(test)]
+            ensure!(
+                self.capture_fail_stage != Some(CaptureFault::End),
+                "injected capture end failure"
+            );
             let graph = captured?.context("empty decode graph")?;
+            // end_capture also instantiates; injection here exercises disposal
+            // of that local graph and rollback before it can be published.
+            #[cfg(test)]
+            ensure!(
+                self.capture_fail_stage != Some(CaptureFault::Instantiate),
+                "injected capture instantiate failure"
+            );
             graph.upload()?;
             s.synchronize()?;
             Ok(graph)

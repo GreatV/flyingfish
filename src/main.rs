@@ -82,6 +82,8 @@ enum Command {
         max_new_tokens: usize,
         #[arg(long)]
         graph: bool,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3), conflicts_with = "draft_model", help = "Use Qwen3.8 MTP with 1–3 draft tokens; plain generation is the default")]
+        mtp: Option<u8>,
         #[arg(long)]
         dump: Option<PathBuf>,
         #[arg(
@@ -278,6 +280,7 @@ fn generate(
     graph: bool,
     dump: &Option<PathBuf>,
     trace_layer: Option<usize>,
+    mtp: Option<u8>,
 ) -> Result<()> {
     ensure!(count > 0, "max-new-tokens must be positive");
     if let Some(layer) = trace_layer {
@@ -292,6 +295,46 @@ fn generate(
         "--graph and --dump cannot be combined"
     );
     let ids = input.read(&cli.model)?;
+    if let Some(depth) = mtp {
+        ensure!(
+            cli.draft_model.is_none() && dump.is_none() && trace_layer.is_none(),
+            "MTP generate cannot combine --draft-model, --dump or --trace-layer"
+        );
+        let policy = flyingfish::mtp::VerifyPolicy::default();
+        let output = Model::generate_mtp(
+            &cli.model,
+            &ids,
+            &flyingfish::spec::Options {
+                device: cli.device,
+                capacity: cli.capacity,
+                chunk: cli.chunk,
+                backend: cli.kernels.clone(),
+                count,
+                ignore_eos: false,
+            },
+            usize::from(depth),
+            policy,
+            graph,
+        )?;
+        let decode_steps = output.ids.len().saturating_sub(1);
+        println!(
+            "{}",
+            serde_json::json!({
+                "input_ids": ids,
+                "generated_ids": output.ids,
+                "text": tokenizer::decode(&cli.model, &output.ids)?,
+                "load_ms": output.load_ms,
+                "prefill_ms": output.prefill_ms,
+                "decode_ms": output.decode_ms,
+                "decode_steps": decode_steps,
+                "decode_tok_s": if decode_steps > 0 { Some(decode_steps as f64 * 1000.0 / output.decode_ms) } else { None },
+                "graph": graph,
+                "mtp_depth": depth,
+                "mtp_verify": policy,
+            })
+        );
+        return Ok(());
+    }
     if let Some(draft) = &cli.draft_model {
         ensure!(
             trace_layer.is_none(),
@@ -446,7 +489,16 @@ fn run() -> Result<()> {
             graph,
             dump,
             trace_layer,
-        } => generate(&cli, input, *max_new_tokens, *graph, dump, *trace_layer),
+            mtp,
+        } => generate(
+            &cli,
+            input,
+            *max_new_tokens,
+            *graph,
+            dump,
+            *trace_layer,
+            *mtp,
+        ),
         Command::Serve { port } => {
             let draft = cli
                 .draft_model
@@ -841,6 +893,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtp_is_opt_in_and_cannot_select_an_external_draft() -> Result<()> {
+        let args = [
+            "flyingfish",
+            "--model",
+            "model",
+            "generate",
+            "--tokens",
+            "1",
+        ];
+        assert!(matches!(
+            Cli::try_parse_from(args)?.command,
+            Command::Generate { mtp: None, .. }
+        ));
+        for depth in ["1", "2", "3"] {
+            let cli = Cli::try_parse_from(args.into_iter().chain(["--mtp", depth]))?;
+            assert!(
+                matches!(cli.command, Command::Generate { mtp: Some(k), .. } if k.to_string() == depth)
+            );
+        }
+        for depth in ["0", "4"] {
+            assert!(Cli::try_parse_from(args.into_iter().chain(["--mtp", depth])).is_err());
+        }
+        assert!(
+            Cli::try_parse_from(
+                args.into_iter()
+                    .chain(["--mtp", "2", "--draft-model", "draft"])
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn generation_capacity_accounts_for_prefill_token_and_capture_slot() -> Result<()> {
