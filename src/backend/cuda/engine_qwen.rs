@@ -656,7 +656,8 @@ impl Engine {
         let mtp_budget = reserve_mtp
             .then(|| crate::mtp::AttachmentBudget::new(&model_spec, capacity))
             .transpose()?;
-        let budget = crate::prefill::WorkspaceBudget::new(
+        let mut admitted_default_chunk = None;
+        let budget = crate::prefill::WorkspaceBudget::with_default_chunk(
             crate::prefill::WorkspaceRequest {
                 capacity,
                 requested: requested_chunk,
@@ -682,8 +683,26 @@ impl Engine {
                     )
                     .context("Q38 combined workspace overflow")
             },
+            |admitted| {
+                admitted_default_chunk = Some(admitted);
+                let bounds = gdn_policy.buckets(u32::try_from(admitted)?);
+                Ok(bounds.last().map_or(admitted, |&rows| rows as usize))
+            },
         )?;
         let rows = budget.plan.chunk;
+        if let Some(admitted) = admitted_default_chunk
+            && admitted != rows
+        {
+            eprintln!(
+                "{}",
+                serde_json::json!({"q38_default_chunk_policy": {
+                    "admitted_chunk": admitted, "selected_chunk": rows,
+                    "qualified_bounds": gdn_policy.buckets(u32::try_from(admitted)?),
+                    "arch": device.info.arch, "sms": device.info.sms,
+                    "requested_chunk": requested_chunk,
+                }})
+            );
+        }
         ensure!(
             !reserve_mtp || rows >= 4,
             "MTP workspace cannot fit four verification rows"
