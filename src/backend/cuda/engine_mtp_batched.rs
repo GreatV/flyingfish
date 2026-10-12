@@ -18,6 +18,7 @@ fn optional_verify_graphs<G>(
 pub(super) struct Batch {
     logits: CudaSlice<bf16>,
     predictions: CudaSlice<u32>,
+    nonfinite: CudaSlice<u32>,
     row_counts: CudaSlice<i32>,
     meta: CudaFunction,
     common: CommonOpsRef,
@@ -52,7 +53,7 @@ impl Engine {
             .context("MTP missing")?
             .target_checkpoint
             .bytes();
-        let buffers = 4 * VOCAB * size_of::<bf16>() + size_of::<[i32; 8]>();
+        let buffers = 4 * VOCAB * size_of::<bf16>() + size_of::<[i32; 9]>();
         let needed = crate::mtp::batch_bytes(&self.model_spec)?;
         ensure!(
             needed == journal + buffers,
@@ -71,6 +72,7 @@ impl Engine {
         let mut batch = Batch {
             logits: s.alloc_zeros(4 * VOCAB)?,
             predictions: s.alloc_zeros(4)?,
+            nonfinite: s.alloc_zeros(1)?,
             row_counts: s.clone_htod(&[1, 2, 3, 4])?,
             meta: cubin::module(&self.device.ctx, "q38_common")?.load_function("q38_batch_meta")?,
             common: CommonOpsRef::new(&self.device.ctx)?,
@@ -234,6 +236,14 @@ impl Engine {
                 .arg(&batch.row_counts.slice(rows - 1..rows))
                 .launch(grid(rows, 1024))?;
         }
+        s.memset_zeros(&mut batch.nonfinite)?;
+        unsafe {
+            s.launch_builder(&self.ops.finite_bf16)
+                .arg(&batch.logits)
+                .arg(&mut batch.nonfinite)
+                .arg(&((rows * VOCAB) as u64))
+                .launch(crate::backend::cuda::ops::flat(rows * VOCAB))?;
+        }
         s.memcpy_dtod(
             &batch.logits.slice((rows - 1) * VOCAB..rows * VOCAB),
             &mut self.work.logits,
@@ -307,8 +317,8 @@ impl BatchedBackend for Bound<'_> {
             e.mtp_batch_launch(batch, rows)?;
         }
         let predictions = s.clone_dtoh(&batch.predictions.slice(..rows))?;
-        let logits = s.clone_dtoh(&batch.logits.slice(..rows * VOCAB))?;
-        ensure!(logits.iter().all(|v| v.is_finite()), "nonfinite M2b head");
+        let nonfinite = s.clone_dtoh(&batch.nonfinite)?;
+        ensure!(nonfinite[0] == 0, "nonfinite M2b head");
         let hidden = match c.options.hidden_tap {
             MtpHiddenTap::PreFinalNorm => &e.work.x,
             MtpHiddenTap::PostFinalNorm => &e.work.n,

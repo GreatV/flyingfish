@@ -55,6 +55,7 @@ struct MtpRuntime {
     concat: CudaSlice<bf16>,
     logits: CudaSlice<bf16>,
     positions: CudaSlice<i32>,
+    prediction: CudaSlice<u32>,
     arena: CudaSlice<u8>,
     scratch: CudaSlice<u8>,
     mask: CudaSlice<u64>,
@@ -107,7 +108,8 @@ impl MtpRuntime {
                 + w.position.len()
                 + w.length.len()
                 + w.token.len()
-                + self.positions.len())
+                + self.positions.len()
+                + self.prediction.len())
                 * 4
             + self.mask.len() * 8
             + self.arena.len()
@@ -173,6 +175,7 @@ impl MtpRuntime {
             concat,
             logits,
             positions,
+            prediction: s.alloc_zeros(2)?,
             arena,
             scratch: scratch_buffer,
             mask,
@@ -283,6 +286,11 @@ impl MtpRuntime {
         input: RunInput<'_>,
         output: OutputMode,
     ) -> Result<Dump> {
+        let output = if output == OutputMode::Predict && !input.detailed {
+            OutputMode::PredictDevice
+        } else {
+            output
+        };
         self.run_inner(
             execution,
             state,
@@ -416,8 +424,11 @@ impl MtpRuntime {
             eps: 1e-6,
         };
         let mut dump = Dump::default();
-        dump.i32("positions", vec![rows, 3], &axes)?;
-        dump.u32("input_ids", vec![rows], ids)?;
+        let dumping = detailed || output == OutputMode::Predict;
+        if dumping {
+            dump.i32("positions", vec![rows, 3], &axes)?;
+            dump.u32("input_ids", vec![rows], ids)?;
+        }
         if detailed {
             dump.bf16("hidden_input", vec![rows, HIDDEN], hidden.to_vec())?;
         }
@@ -713,7 +724,28 @@ impl MtpRuntime {
             matrix(&self.work.n, s, 0, rows, HIDDEN)?,
             &mut TensorMut(matrix(&self.logits, s, 0, rows, VOCAB)?),
         )?;
-        dump.device("logits", s, &self.logits, 0, rows, VOCAB)?;
+        if output == OutputMode::PredictDevice {
+            ensure!(rows == 1, "device draft head requires one row");
+            s.memset_zeros(&mut self.prediction)?;
+            unsafe {
+                s.launch_builder(&ops.argmax)
+                    .arg(&self.logits)
+                    .arg(&mut self.prediction.slice_mut(..1))
+                    .arg(&(VOCAB as i32))
+                    .launch(crate::backend::cuda::ops::grid(1, 1024))?;
+                s.launch_builder(&ops.finite_bf16)
+                    .arg(&self.logits)
+                    .arg(&mut self.prediction.slice_mut(1..2))
+                    .arg(&(VOCAB as u64))
+                    .launch(flat(VOCAB))?;
+            }
+            let result = s.clone_dtoh(&self.prediction)?;
+            ensure!(result[1] == 0, "nonfinite MTP dump logits");
+            ensure!((result[0] as usize) < VOCAB, "invalid MTP argmax ID");
+            dump.prediction = Some(result[0]);
+        } else {
+            dump.device("logits", s, &self.logits, 0, rows, VOCAB)?;
+        }
         Ok(dump)
     }
 }
@@ -721,6 +753,7 @@ impl MtpRuntime {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputMode {
     Predict,
+    PredictDevice,
     StateOnly,
 }
 
@@ -735,6 +768,7 @@ struct RunInput<'a> {
 
 #[derive(Default)]
 struct Dump {
+    prediction: Option<u32>,
     tensors: BTreeMap<String, (safetensors::Dtype, Vec<usize>, Vec<u8>)>,
 }
 impl Dump {

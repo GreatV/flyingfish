@@ -145,3 +145,12 @@ extern "C" __global__ void __launch_bounds__(1024) argmax_rows_bf16(
 extern "C" __global__ void advance(int* position) {
     if (threadIdx.x == 0) ++*position;
 }
+
+// A call-scoped sticky error flag. The caller clears it before the first scan.
+extern "C" __global__ void finite_bf16(
+    const __nv_bfloat16* values, uint32_t* nonfinite, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count && !isfinite(__bfloat162float(values[i]))) {
+        atomicOr(nonfinite, 1u);
+    }
+}

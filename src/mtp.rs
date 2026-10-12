@@ -162,7 +162,7 @@ impl MtpPlan {
         // Work includes one logits row plus token/position/length. Extra storage
         // holds concat, embedding, incoming hidden, all-row head and positions.
         let extra = mul(head_rows, VOCAB * 2)?;
-        let fixed = VOCAB * 2 + 12 + 64 * 8 + 32;
+        let fixed = VOCAB * 2 + 12 + 64 * 8 + 32 + 8;
         let scratch = scratch_bytes(self.capacity, rows)?;
         let blas = 4 * 1024 * 1024;
         let total = [
@@ -280,7 +280,7 @@ pub(crate) fn component_spec(spec: &ModelSpec) -> ModelSpec {
 #[cfg(any(feature = "cuda", test))]
 pub(crate) fn batch_bytes(spec: &ModelSpec) -> Result<usize> {
     checkpoint_bytes(spec, 4)?
-        .checked_add(4 * VOCAB * 2 + 32)
+        .checked_add(4 * VOCAB * 2 + 36)
         .context("MTP batch buffer overflow")
 }
 
