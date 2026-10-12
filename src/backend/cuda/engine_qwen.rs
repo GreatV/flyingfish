@@ -8,6 +8,7 @@ use crate::backend::cuda::{
     ops::{CommonOpsRef, GatedRmsInput, RmsMode, RmsOptions},
     weights::WeightCatalog,
 };
+use crate::gdn_plan::GdnPolicy;
 use crate::{
     linear_plan::LayerDequantPlan,
     model_spec::Mixer,
@@ -44,6 +45,7 @@ pub(super) struct Runtime {
     multiply: CudaFunction,
     advance: CudaFunction,
     prepared: BTreeSet<u32>,
+    gdn_policy: GdnPolicy,
 }
 struct Layer {
     linear: LayerLinearPlan,
@@ -60,6 +62,7 @@ enum BoundMixer {
     Gdn {
         norm: Tensor<bf16, 1>,
         prefill: Box<GdnPlan>,
+        scan: Vec<(u32, Box<GdnPlan>)>,
         decode: Box<GdnPlan>,
     },
 }
@@ -168,13 +171,13 @@ impl Runtime {
             .and_then(|n| n.checked_add(spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>()))
             .context("Q38 fixed workspace overflow")
     }
-    fn workspace(rows: usize, capacity: usize) -> Result<usize> {
+    fn workspace(rows: usize, capacity: usize, policy: GdnPolicy) -> Result<usize> {
         let attention_prefill = FullAttentionOps::preprocess_workspace(limits(rows, capacity)?)?;
         let attention_decode =
             FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(1, capacity)?)?;
         let spec = crate::op_contract::GdnSpec::q38();
-        let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?)?;
-        let decode = GdnOps::workspace(&spec, 1)?;
+        let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?, policy)?;
+        let decode = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY)?;
         ensure!(
             [
                 attention_prefill.alignment,
@@ -203,6 +206,7 @@ impl Runtime {
     ) -> Result<Self> {
         let s = &engine.device.stream;
         let rows = engine.workspace_rows;
+        let gdn_policy = GdnPolicy::for_device(engine.device.info.arch, engine.device.info.sms);
         let common = CommonOpsRef::new(&engine.device.ctx)?;
         let positions = s.clone_htod(
             &crate::vision_input::PositionPlan::text(1, engine.capacity)?.packed_axes()?,
@@ -303,7 +307,7 @@ impl Runtime {
                     let cd = spec.conv_dim()?;
                     let state = &engine.state.gdn[layout.state_index as usize];
                     let conv = catalog.bf16(&format!("{prefix}linear_attn.conv1d.weight"))?;
-                    let bind = |active_rows| {
+                    let bind = |active_rows, scan| {
                         GdnOps::prepare(
                             &engine.device.ctx,
                             &spec,
@@ -355,12 +359,27 @@ impl Runtime {
                                 )?),
                             },
                             common.clone(),
+                            scan,
                         )
                     };
+                    let scan = gdn_policy
+                        .buckets(rows as u32)
+                        .into_iter()
+                        .map(|bound| {
+                            let plan = bind(bound as usize, true)?;
+                            ensure!(
+                                gdn_policy.workspace(&spec, bound)?.bytes
+                                    <= scratch_buffer.len() as u64,
+                                "GDN scan exceeds shared scratch budget"
+                            );
+                            Ok((bound, Box::new(plan)))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
                     BoundMixer::Gdn {
                         norm: weight("linear_attn.norm.weight")?,
-                        prefill: Box::new(bind(rows)?),
-                        decode: Box::new(bind(1)?),
+                        prefill: Box::new(bind(rows, false)?),
+                        decode: Box::new(bind(1, false)?),
+                        scan,
                     }
                 }
             };
@@ -394,6 +413,7 @@ impl Runtime {
             multiply: module.load_function("q38_multiply")?,
             advance: module.load_function("q38_advance")?,
             prepared: BTreeSet::new(),
+            gdn_policy,
         })
     }
     fn prepare(
@@ -543,7 +563,7 @@ impl Engine {
             "invalid Q38 capacity"
         );
         // Reject an incomplete operator plan before allocating model weights.
-        Runtime::workspace(1, capacity)?;
+        Runtime::workspace(1, capacity, GdnPolicy::LEGACY)?;
         let runtime = settings
             .runtime_dir
             .as_deref()
@@ -555,6 +575,7 @@ impl Engine {
             "Q38 uses fixed operator plans".into(),
         ));
         let device = Device::new(ordinal)?;
+        let gdn_policy = GdnPolicy::for_device(device.info.arch, device.info.sms);
         let mut catalog = WeightCatalog::load(dir, &model_spec, &device)?;
         let weights = catalog.take_globals()?;
         let s = &device.stream;
@@ -595,7 +616,7 @@ impl Engine {
                     .context("combined fixed bytes overflow")?,
             },
             |rows| {
-                let target = Runtime::workspace(rows, capacity)?;
+                let target = Runtime::workspace(rows, capacity, gdn_policy)?;
                 target
                     .checked_add(
                         mtp_budget
@@ -612,7 +633,7 @@ impl Engine {
             !reserve_mtp || rows >= 4,
             "MTP workspace cannot fit four verification rows"
         );
-        let target_workspace = Runtime::workspace(rows, capacity)?;
+        let target_workspace = Runtime::workspace(rows, capacity, gdn_policy)?;
         eprintln!(
             "{}",
             serde_json::json!({
@@ -627,11 +648,13 @@ impl Engine {
                 "attention_decode_workspace_bytes": FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(1, capacity)?)?.bytes,
                 "attention_prefill_backend": "FA2 d256",
                 "attention_decode_backend": "TCMQA d256",
-                "gdn_prefill_workspace_bytes": GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), u32::try_from(rows)?)?.bytes,
-                "gdn_decode_workspace_bytes": GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), 1)?.bytes,
+                "gdn_prefill_workspace_bytes": GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), u32::try_from(rows)?, gdn_policy)?.bytes,
+                "gdn_decode_workspace_bytes": GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), 1, GdnPolicy::LEGACY)?.bytes,
                 "bound_prefill_max_rows": rows,
                 "bound_decode_max_rows": 1,
-                "gdn_plan": crate::op_contract::GdnSpec::PLAN_ID,
+                "gdn_plan": gdn_policy.identity(),
+                "gdn_scan_buckets": gdn_policy.buckets(rows as u32),
+                "gdn_workspace_policy": "max_complete_prebound_plan_not_sum",
                 "selection_source": "fixed"
             })
         );
@@ -836,6 +859,7 @@ impl Engine {
                 norm,
                 prefill,
                 decode,
+                scan,
             } => {
                 let spec = crate::op_contract::GdnSpec::q38();
                 let conv = spec.conv_dim()? as usize;
@@ -860,10 +884,23 @@ impl Engine {
                         &mut TensorMut(matrix(output, s, offset, rows, width)?),
                     )?;
                 }
-                let plan = match phase {
-                    ExecutionPhase::Prefill => prefill,
-                    ExecutionPhase::Decode => decode,
-                };
+                let plan =
+                    match q
+                        .gdn_policy
+                        .select(self.workspace_rows as u32, rows as u32, phase)?
+                    {
+                        Some(bound) => {
+                            &scan
+                                .iter()
+                                .find(|(rows, _)| *rows == bound)
+                                .context("GDN structural bound has no prepared bucket")?
+                                .1
+                        }
+                        None => match phase {
+                            ExecutionPhase::Prefill => prefill,
+                            ExecutionPhase::Decode => decode,
+                        },
+                    };
                 GdnOps::run(plan, s, meta, phase, scratch(&q.scratch, s))?;
                 q.common.norm.rms_gated(
                     s,
@@ -1145,12 +1182,16 @@ mod tests {
         let total = 1 << 30;
         let fixed = spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>() + capacity * 12;
         for rows in [1, 65, 128] {
-            let scratch = Runtime::workspace(rows, capacity)?;
+            let scratch = Runtime::workspace(rows, capacity, GdnPolicy::LEGACY)?;
             for required in [
                 FullAttentionOps::preprocess_workspace(limits(rows, capacity)?)?,
                 FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(1, capacity)?)?,
-                GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), rows as u32)?,
-                GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), 1)?,
+                GdnOps::workspace(
+                    &crate::op_contract::GdnSpec::q38(),
+                    rows as u32,
+                    GdnPolicy::LEGACY,
+                )?,
+                GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), 1, GdnPolicy::LEGACY)?,
             ] {
                 ensure!(
                     scratch as u64 >= required.bytes,
@@ -1168,7 +1209,9 @@ mod tests {
                 row_bytes: Runtime::row_bytes(&spec)?,
                 fixed_transient_bytes: fixed,
             };
-            let budget = WorkspaceBudget::new(request, |r| Runtime::workspace(r, capacity))?;
+            let budget = WorkspaceBudget::new(request, |r| {
+                Runtime::workspace(r, capacity, GdnPolicy::LEGACY)
+            })?;
             assert_eq!(budget.planned_transient_bytes, allocated);
             assert_eq!(budget.plan.row_limit, rows);
             // The same request must fail if even one byte of the allocation is missing.
@@ -1178,7 +1221,53 @@ mod tests {
                         free_after_resident: request.free_after_resident - 1,
                         ..request
                     },
-                    |r| Runtime::workspace(r, capacity),
+                    |r| Runtime::workspace(r, capacity, GdnPolicy::LEGACY),
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn scan_budget_accounts_for_every_prebound_bucket() -> Result<()> {
+        let spec = crate::model_spec::ModelSpec::qwen(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/q38-config.json"
+            )))?,
+            &serde_json::json!({}),
+        )?;
+        let policy = GdnPolicy::for_device(89, 128);
+        let capacity = 8192;
+        let total = 8usize << 30;
+        let row_bytes = Runtime::row_bytes(&spec)?;
+        let fixed = Runtime::fixed_bytes(&spec, capacity)?;
+        for rows in [512, 513, 1021, 1024, 2048, 4096, 8192] {
+            let scratch = Runtime::workspace(rows, capacity, policy)?;
+            let gdn = policy.workspace(&crate::op_contract::GdnSpec::q38(), rows as u32)?;
+            assert!(scratch as u64 >= gdn.bytes);
+            let required = rows * row_bytes + fixed + scratch;
+            let request = WorkspaceRequest {
+                capacity,
+                requested: Some(rows),
+                free_after_resident: total / 16 + required,
+                total,
+                alignment: 32,
+                row_bytes,
+                fixed_transient_bytes: fixed,
+            };
+            let budget =
+                WorkspaceBudget::new(request, |r| Runtime::workspace(r, capacity, policy))?;
+            assert_eq!(budget.plan.chunk, rows);
+            assert_eq!(budget.operator_workspace_bytes, scratch);
+            assert_eq!(budget.planned_transient_bytes, required);
+            assert!(
+                WorkspaceBudget::new(
+                    WorkspaceRequest {
+                        free_after_resident: request.free_after_resident - 1,
+                        ..request
+                    },
+                    |r| Runtime::workspace(r, capacity, policy)
                 )
                 .is_err()
             );

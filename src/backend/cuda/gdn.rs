@@ -57,6 +57,7 @@ pub(crate) fn take_phase_log() -> Vec<&'static str> {
 use super::contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut};
 use super::cubin;
 use super::ops::{CommonOpsRef, GdnGateBindings};
+use crate::gdn_plan::{GdnPolicy, GdnWorkspace, Region, ScanWorkspace, add, mul, shared};
 use crate::op_contract::{ExecutionPhase, GdnSpec, WorkspaceReq};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
@@ -115,127 +116,17 @@ pub(crate) struct GdnBindings {
     pub history: TensorMut<f32, 2>,
 }
 
-/// One named region of the single Engine slice. The binder defines its layout
-/// and allocates no workspace of its own (ABI §6).
-#[derive(Clone, Copy, Debug)]
-pub struct Region {
-    offset: u64,
-    bytes: u64,
-}
-
-/// The GDN workspace. Every intermediate the binder produces is listed here with
-/// its own offset, so the Engine never has to guess and never hard-codes a total.
-///
-/// `workspace()` is the ONLY source of the Engine's byte accounting. The Engine
-/// binds two plans — prefill (`max_rows = chunk`) and decode (`max_rows = 1`) —
-/// and shares ONE scratch sized to the larger request, the pattern it already
-/// uses for HD256. Nothing here depends on `prepare` having run.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct GdnWorkspace {
-    /// `[R, conv_dim]` BF16 — the conv result, then SiLU'd IN PLACE. ABI §5: the
-    /// conv output cast may not be elided; the common `silu` reads and writes BF16
-    /// over the same bytes, so there is no separate `act` region.
-    pub conv_out: Region,
-    /// `[R, 16, 128]` BF16 — Q after `l2_heads`, KEY heads, before the widen.
-    pub q_bf16: Region,
-    /// `[R, 16, 128]` BF16 — K after `l2_heads`, KEY heads.
-    pub k_bf16: Region,
-    // There is deliberately no `v_bf16` region, and its absence is deliberate rather than an
-    // oversight: V is never transformed (ABI section 5 norms Q and K only), so it is not an
-    // intermediate. `gdn_prep_fp32` reads it in place from the V columns of `conv_out`,
-    // whose row stride is conv_dim, which is why that kernel takes an explicit
-    // `v_row_stride`. Declaring the region would have been a dead 20,480 B/row.
-    /// `[R, 48]` BF16 — `beta = BF16(sigmoid(b))`, as emitted by `gdn_gates`.
-    pub beta: Region,
-    /// `[R, 48]` FP32 — the exact, value-preserving widen of `beta`. Both cores
-    /// declare `const float* beta`, so this widen is required, not optional.
-    pub beta_fp32: Region,
-    /// `[R, 48]` FP32 — `g = -exp(A_log) * softplus(a + dt_bias)`.
-    pub g: Region,
-    /// `[R, 48, 128]` FP32 — Q widened, GQA-expanded and scaled by `1/sqrt(DK)`.
-    pub q_fp32: Region,
-    /// `[R, 48, 128]` FP32 — K widened and expanded to VALUE heads.
-    pub k_fp32: Region,
-    /// `[R, 48, 128]` FP32 — V widened.
-    pub v_fp32: Region,
-    pub bytes: u64,
-    pub alignment: u64,
-}
-
-fn mul(a: u64, b: u64) -> Result<u64> {
-    a.checked_mul(b)
-        .context("GDN workspace multiplication overflow")
-}
-fn add(a: u64, b: u64) -> Result<u64> {
-    a.checked_add(b).context("GDN workspace addition overflow")
-}
-fn align(n: u64) -> Result<u64> {
-    Ok(add(n, 255)? & !255)
-}
-
-impl GdnWorkspace {
-    /// CPU-only checked sizing: reads no GPU state and allocates nothing.
-    ///
-    /// `max_rows` is a WORKSPACE capacity, not a device row count. `prefix` and
-    /// `capacity` are per-call and arrive in `GdnMeta`; there is deliberately no
-    /// `capacity >= prefix + max_rows` check here, because `prepare` has no
-    /// `meta` and the real device-side condition is
-    /// `capacity >= prefix + valid_rows` with `valid_rows <= max_rows`.
-    pub fn q38(spec: &GdnSpec, max_rows: u32) -> Result<Self> {
-        spec.validate()?;
-        ensure!(max_rows > 0, "GDN max_rows must be positive");
-        let conv_dim = u64::from(spec.conv_dim()?);
-        let rows = u64::from(max_rows);
-        let hd = u64::from(HV);
-        let dv = u64::from(DV);
-        let hk = u64::from(HK);
-        let dk = u64::from(DK);
-
-        // Every region is [rows, heads, dim]; the per-row byte count is heads*dim*elem.
-        // `act` is absent: the common silu runs in place over `conv_out`.
-        let hd_dv = mul(hd, dv)?;
-        let hk_dk = mul(hk, dk)?;
-        let sizes = [
-            mul(rows, mul(conv_dim, 2)?)?, // conv_out  BF16 [R, conv_dim]
-            mul(rows, mul(hk_dk, 2)?)?,    // q_bf16     BF16 [R, 16, 128] KEY heads
-            mul(rows, mul(hk_dk, 2)?)?,    // k_bf16     BF16 [R, 16, 128] KEY heads
-            mul(rows, mul(hd, 2)?)?,       // beta       BF16 [R, 48]
-            mul(rows, mul(hd, 4)?)?,       // beta_fp32  FP32 [R, 48]
-            mul(rows, mul(hd, 4)?)?,       // g          FP32 [R, 48]
-            mul(rows, mul(hd_dv, 4)?)?,    // q_fp32     FP32 [R, 48, 128]
-            mul(rows, mul(hd_dv, 4)?)?,    // k_fp32     FP32 [R, 48, 128]
-            mul(rows, mul(hd_dv, 4)?)?,    // v_fp32     FP32 [R, 48, 128]
-        ];
-        let mut off = 0u64;
-        let mut r = [Region {
-            offset: 0,
-            bytes: 0,
-        }; 9];
-        for (i, s) in sizes.iter().enumerate() {
-            let padded = align(*s)?;
-            r[i] = Region {
-                offset: off,
-                bytes: padded,
-            };
-            off = align(add(off, padded)?)?;
-        }
-        Ok(Self {
-            conv_out: r[0],
-            q_bf16: r[1],
-            k_bf16: r[2],
-            beta: r[3],
-            beta_fp32: r[4],
-            g: r[5],
-            q_fp32: r[6],
-            k_fp32: r[7],
-            v_fp32: r[8],
-            bytes: off,
-            alignment: 256,
-        })
-    }
+struct ScanKernels {
+    guard: CudaFunction,
+    p1: CudaFunction,
+    leaf: CudaFunction,
+    up: CudaFunction,
+    down: CudaFunction,
+    p3: CudaFunction,
 }
 
 struct Kernels {
+    scan: Option<ScanKernels>,
     conv: CudaFunction,
     hist_update: CudaFunction,
     prep: CudaFunction,
@@ -267,15 +158,15 @@ pub(crate) struct GdnOps;
 pub(crate) const GDN_CONV_DIM: u32 = 10_240;
 
 impl GdnOps {
-    /// CPU-only checked sizing: reads no GPU state and allocates nothing.
+    /// CPU-only checked sizing: reads no GPU state and allocates no GPU memory.
     ///
     /// This is the ONLY source of the Engine's byte accounting for GDN.
-    pub(crate) fn workspace(spec: &GdnSpec, max_rows: u32) -> Result<WorkspaceReq> {
-        let ws = GdnWorkspace::q38(spec, max_rows)?;
-        Ok(WorkspaceReq {
-            bytes: ws.bytes,
-            alignment: ws.alignment,
-        })
+    pub(crate) fn workspace(
+        spec: &GdnSpec,
+        max_rows: u32,
+        policy: GdnPolicy,
+    ) -> Result<WorkspaceReq> {
+        policy.workspace(spec, max_rows)
     }
 
     /// Setup binder: loads its own kernels, validates the registered layout, opts
@@ -286,13 +177,25 @@ impl GdnOps {
         max_rows: u32,
         bindings: GdnBindings,
         common: CommonOpsRef,
+        scan: bool,
     ) -> Result<GdnPlan> {
         spec.validate()?;
         ensure!(
             HK * GQA == HV,
             "GDN GQA {GQA} does not expand {HK} key heads to {HV} value heads"
         );
-        let ws = GdnWorkspace::q38(spec, max_rows)?;
+        let ws = if scan {
+            use cudarc::driver::sys::CUdevice_attribute as A;
+            let arch = cubin::capability(ctx)?;
+            let sms = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
+            ensure!(
+                GdnPolicy::for_device(arch, sms) != GdnPolicy::LEGACY,
+                "GDN scan requires qualified sm89/128SM"
+            );
+            GdnWorkspace::with_scan(spec, max_rows)?
+        } else {
+            GdnWorkspace::q38(spec, max_rows)?
+        };
         // conv_dim is derived in exactly ONE place, then asserted against the
         // constant compiled into the kernel. The formula is not restated here.
         let conv_dim = spec.conv_dim()?;
@@ -339,7 +242,35 @@ impl GdnOps {
             }
         }
 
+        let scan_kernels = if scan {
+            let module = cubin::module(ctx, "gdn/gdn_b")?;
+            let p3 = module.load_function("gdn_b_p3")?;
+            p3.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared::P3_BYTES as i32)?;
+            for bytes in [
+                shared::P1_BYTES,
+                shared::LEAF_BYTES,
+                shared::UP_BYTES,
+                shared::DOWN_BYTES,
+                shared::P3_BYTES,
+            ] {
+                ensure!(
+                    u64::from(bytes) <= optin,
+                    "GDN scan shared memory exceeds opt-in limit"
+                );
+            }
+            Some(ScanKernels {
+                guard: module.load_function("gdn_b_guard")?,
+                p1: module.load_function("gdn_b_p1")?,
+                leaf: module.load_function("gdn_b_leaf")?,
+                up: module.load_function("gdn_b_up")?,
+                down: module.load_function("gdn_b_down")?,
+                p3,
+            })
+        } else {
+            None
+        };
         let kernels = Kernels {
+            scan: scan_kernels,
             conv: f_conv,
             hist_update: f_hist,
             prep: f_prep,
@@ -400,6 +331,10 @@ impl GdnOps {
         scratch: Scratch,
     ) -> Result<()> {
         meta.validate()?;
+        ensure!(
+            phase == ExecutionPhase::Prefill || plan.kernels.scan.is_none(),
+            "scan plan cannot decode"
+        );
         scratch.validate(plan.ws.bytes)?;
         let b = &plan.bindings;
         let cd = plan.conv_dim;
@@ -435,6 +370,19 @@ impl GdnOps {
         let l2_eps = plan.l2_eps;
         let conv_ptr = conv_out.0.ptr;
 
+        // Validate the selected bucket before any persistent history update. The
+        // live count remains device data; this launch is fixed in each scan plan.
+        if let Some(scan) = &plan.kernels.scan {
+            let geometry = plan.ws.scan.context("missing scan geometry")?;
+            unsafe {
+                stream
+                    .launch_builder(&scan.guard)
+                    .arg(&meta.ptr)
+                    .arg(&(plan.max_rows as i32))
+                    .arg(&(geometry.leaves as i32))
+                    .launch(scan_cfg(1, 1, 0))?;
+            }
+        }
         // ---- 1. conv: qkv -> conv_out. ABI §5: this BF16 cast may not be elided.
         unsafe {
             stream
@@ -531,34 +479,52 @@ impl GdnOps {
         // precisely the trap this assertion was meant to avoid. Test-only; compiles out.
         #[cfg(test)]
         record_phase(match phase {
+            ExecutionPhase::Prefill if plan.kernels.scan.is_some() => "bscan",
             ExecutionPhase::Prefill => "chunked",
             ExecutionPhase::Decode => "recurrent",
         });
         unsafe {
             match phase {
-                ExecutionPhase::Prefill => stream
-                    .launch_builder(&plan.kernels.chunked)
-                    .arg(&q_fp32.0.ptr)
-                    .arg(&k_fp32.0.ptr)
-                    .arg(&v_fp32.0.ptr)
-                    .arg(&beta_fp32.0.ptr)
-                    .arg(&g.0.ptr)
-                    .arg(&b.s.0.ptr)
-                    .arg(&b.core_out.0.ptr)
-                    .arg(&meta.ptr)
-                    // The trailing scalar is `valid_rows_in`, resolved as
-                    //     valid_rows = valid_rows_in > 0 ? valid_rows_in : meta->valid_rows
-                    // so 0 is the sentinel meaning "read it from the device". It MUST be 0.
-                    //
-                    // Passing the plan's max_rows is wrong twice over. On a tail chunk
-                    // (valid_rows < max_rows) it makes the kernel process max_rows rows,
-                    // tripping its own key_count guard and advancing state over rows that
-                    // do not exist. And it bakes a HOST value into the launch, so a captured
-                    // Graph replays a stale row count instead of re-reading valid_rows from
-                    // meta every replay. Grid SIZE may derive from max_rows; the row COUNT
-                    // may not.
-                    .arg(&0i32)
-                    .launch(plan.chunked_cfg)?,
+                ExecutionPhase::Prefill if plan.kernels.scan.is_some() => {
+                    launch_scan(
+                        plan,
+                        stream,
+                        meta,
+                        ws_ptr,
+                        [
+                            q_fp32.0.ptr,
+                            k_fp32.0.ptr,
+                            v_fp32.0.ptr,
+                            beta_fp32.0.ptr,
+                            g.0.ptr,
+                        ],
+                    )?;
+                }
+                ExecutionPhase::Prefill => {
+                    stream
+                        .launch_builder(&plan.kernels.chunked)
+                        .arg(&q_fp32.0.ptr)
+                        .arg(&k_fp32.0.ptr)
+                        .arg(&v_fp32.0.ptr)
+                        .arg(&beta_fp32.0.ptr)
+                        .arg(&g.0.ptr)
+                        .arg(&b.s.0.ptr)
+                        .arg(&b.core_out.0.ptr)
+                        .arg(&meta.ptr)
+                        // The trailing scalar is `valid_rows_in`, resolved as
+                        //     valid_rows = valid_rows_in > 0 ? valid_rows_in : meta->valid_rows
+                        // so 0 is the sentinel meaning "read it from the device". It MUST be 0.
+                        //
+                        // Passing the plan's max_rows is wrong twice over. On a tail chunk
+                        // (valid_rows < max_rows) it makes the kernel process max_rows rows,
+                        // tripping its own key_count guard and advancing state over rows that
+                        // do not exist. And it bakes a HOST value into the launch, so a captured
+                        // Graph replays a stale row count instead of re-reading valid_rows from
+                        // meta every replay. Grid SIZE may derive from max_rows; the row COUNT
+                        // may not.
+                        .arg(&0i32)
+                        .launch(plan.chunked_cfg)?;
+                }
                 ExecutionPhase::Decode => stream
                     .launch_builder(&plan.kernels.recurrent)
                     .arg(&q_fp32.0.ptr)
@@ -569,7 +535,8 @@ impl GdnOps {
                     .arg(&b.s.0.ptr)
                     .arg(&b.core_out.0.ptr)
                     .arg(&meta.ptr)
-                    .launch(plan.recurrent_cfg)?,
+                    .launch(plan.recurrent_cfg)
+                    .map(|_| ())?,
             };
         }
         Ok(())
@@ -610,6 +577,101 @@ fn as3(
             cap,
         )
     }
+}
+
+fn scan_cfg(x: u32, threads: u32, smem: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (x, if threads == 1 { 1 } else { HV }, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: smem,
+    }
+}
+
+fn launch_scan(
+    plan: &GdnPlan,
+    stream: &Arc<CudaStream>,
+    meta: SeqRef,
+    scratch: u64,
+    inputs: [u64; 5],
+) -> Result<()> {
+    let k = plan.kernels.scan.as_ref().context("missing scan kernels")?;
+    let ScanWorkspace {
+        t,
+        maps,
+        entries,
+        leaves,
+    } = plan.ws.scan.context("missing scan workspace")?;
+    let t = add(scratch, t.offset)?;
+    let maps = add(scratch, maps.offset)?;
+    let entries = add(scratch, entries.offset)?;
+    let [q, key, v, beta, g] = inputs;
+    let bound = plan.max_rows as i32;
+    let leaf_count = leaves as i32;
+    let levels = leaves.ilog2();
+    let b = &plan.bindings;
+    unsafe {
+        stream
+            .launch_builder(&k.p1)
+            .arg(&key)
+            .arg(&beta)
+            .arg(&g)
+            .arg(&t)
+            .arg(&meta.ptr)
+            .arg(&bound)
+            .arg(&leaf_count)
+            .launch(scan_cfg(leaves * 4, 128, shared::P1_BYTES))?;
+        stream
+            .launch_builder(&k.leaf)
+            .arg(&key)
+            .arg(&v)
+            .arg(&beta)
+            .arg(&g)
+            .arg(&t)
+            .arg(&b.s.0.ptr)
+            .arg(&maps)
+            .arg(&entries)
+            .arg(&meta.ptr)
+            .arg(&bound)
+            .arg(&leaf_count)
+            .launch(scan_cfg(leaves * 4, 256, shared::LEAF_BYTES))?;
+        for depth in (1..levels).rev() {
+            stream
+                .launch_builder(&k.up)
+                .arg(&maps)
+                .arg(&meta.ptr)
+                .arg(&bound)
+                .arg(&leaf_count)
+                .arg(&(depth as i32))
+                .launch(scan_cfg((1 << depth) * 16, 256, shared::UP_BYTES))?;
+        }
+        for depth in 0..levels {
+            stream
+                .launch_builder(&k.down)
+                .arg(&maps)
+                .arg(&entries)
+                .arg(&meta.ptr)
+                .arg(&bound)
+                .arg(&leaf_count)
+                .arg(&(depth as i32))
+                .launch(scan_cfg((1 << depth) * 16, 256, shared::DOWN_BYTES))?;
+        }
+        stream
+            .launch_builder(&k.p3)
+            .arg(&q)
+            .arg(&key)
+            .arg(&v)
+            .arg(&beta)
+            .arg(&g)
+            .arg(&b.s.0.ptr)
+            .arg(&b.core_out.0.ptr)
+            .arg(&t)
+            .arg(&entries)
+            .arg(&meta.ptr)
+            .arg(&bound)
+            .arg(&leaf_count)
+            .launch(scan_cfg(leaves, 512, shared::P3_BYTES))?;
+    }
+    Ok(())
 }
 
 fn ws_region(r: Region, rows: u32, cols: u32, elem: u64) -> Result<()> {
@@ -822,13 +884,13 @@ mod tests {
     #[test]
     fn workspace_is_pure_and_matches_the_plan() {
         let spec = GdnSpec::q38();
-        let a = GdnOps::workspace(&spec, 2048).expect("workspace");
-        let b = GdnOps::workspace(&spec, 2048).expect("workspace");
+        let a = GdnOps::workspace(&spec, 2048, GdnPolicy::LEGACY).expect("workspace");
+        let b = GdnOps::workspace(&spec, 2048, GdnPolicy::LEGACY).expect("workspace");
         assert_eq!(a.bytes, b.bytes);
         assert_eq!(a.alignment, 256);
         assert_eq!(a.bytes, GdnWorkspace::q38(&spec, 2048).expect("ws").bytes);
         // decode's plan is max_rows = 1; the Engine shares one scratch sized to the larger.
-        let d = GdnOps::workspace(&spec, 1).expect("decode workspace");
+        let d = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY).expect("decode workspace");
         assert!(
             d.bytes < a.bytes,
             "a 1-row plan must not exceed the prefill plan"
@@ -1275,7 +1337,7 @@ mod gpu_probe {
         let dev_core = s.clone_htod(&core)?;
         let dev_s = s.clone_htod(&s_init)?;
         let dev_hist = s.clone_htod(&hist_init)?;
-        let req = GdnOps::workspace(&GdnSpec::q38(), man.plan_rows)?;
+        let req = GdnOps::workspace(&GdnSpec::q38(), man.plan_rows, GdnPolicy::LEGACY)?;
         let scratch_buf = s.alloc_zeros::<u8>(req.bytes as usize)?;
         Ok(Case {
             man,
@@ -1365,7 +1427,14 @@ mod gpu_probe {
     ) -> Result<()> {
         let s = &device.stream;
         let b = bindings(c, s, swap_gates)?;
-        let plan = GdnOps::prepare(&device.ctx, &GdnSpec::q38(), c.man.plan_rows, b, common)?;
+        let plan = GdnOps::prepare(
+            &device.ctx,
+            &GdnSpec::q38(),
+            c.man.plan_rows,
+            b,
+            common,
+            false,
+        )?;
         let (meta_buf, meta) = meta_device(
             s,
             c.man.prefix,
