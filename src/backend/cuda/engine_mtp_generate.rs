@@ -12,8 +12,7 @@ impl Engine {
         graph: bool,
     ) -> Result<Output> {
         crate::mtp::check_request(ids.len(), options.count, options.capacity)?;
-        let (mut engine, load_ms) =
-            Self::load_mtp_inner(dir, options, depth, graph, Some(ids.len()))?;
+        let (mut engine, load_ms) = Self::load_mtp_inner(dir, options, depth, graph, Some(ids))?;
         let mut output = engine.generate_mtp_prepared(
             ids,
             options.count,
@@ -40,7 +39,7 @@ impl Engine {
         options: &crate::spec::Options,
         depth: usize,
         graph: bool,
-        prompt: Option<usize>,
+        prompt: Option<&[u32]>,
     ) -> Result<(Self, f64)> {
         let mtp = MtpOptions {
             depth,
@@ -62,6 +61,13 @@ impl Engine {
             spec.architecture == crate::model_spec::Architecture::Qwen35Text,
             "MTP generation is supported only for Qwen3.8 text"
         );
+        if let Some(ids) = prompt {
+            ensure!(
+                ids.iter().all(|&t| t < spec.vocab),
+                "MTP prompt token exceeds vocabulary"
+            );
+        }
+        let prompt = prompt.map(<[u32]>::len);
         let load_start = Instant::now();
         let mut settings = options.backend.clone();
         settings.spec_budget = SpecBudget::Chain;
