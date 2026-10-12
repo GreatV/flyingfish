@@ -221,7 +221,7 @@ impl MtpRuntime {
             .as_ref()
             .context("MTP Q/gate buffers missing")?;
         let kv = &state.kv[0];
-        let attention = FullAttentionOps::prepare(
+        let attention = FullAttentionOps::prepare_reusing(
             &device.ctx,
             &crate::op_contract::FullAttentionSpec::q38(),
             limits(rows, self.plan.capacity)?,
@@ -258,6 +258,7 @@ impl MtpRuntime {
                 )?),
             },
             self.common.clone(),
+            self.attention.values().next(),
         )?;
         self.attention.insert(rows, attention);
         Ok(())

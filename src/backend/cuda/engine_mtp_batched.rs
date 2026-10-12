@@ -34,6 +34,14 @@ pub(super) struct Batch {
     pub(super) mtp_restores: usize,
 }
 
+impl Batch {
+    pub(super) fn invalidate_frame(&mut self) {
+        self.frame.clear();
+        self.frame_position = 0;
+        self.frame_rows = 0;
+    }
+}
+
 impl Engine {
     /// Setup before Ready; four fixed query shapes cover K1..3 and every partial
     /// replay (including R1 with Prefill phase). No new measured choices.

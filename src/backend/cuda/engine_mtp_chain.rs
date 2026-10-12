@@ -306,6 +306,54 @@ impl Engine {
     ) -> Result<()> {
         self.mtp_enable_bound(options, &(1..=self.chunk).collect::<Vec<_>>())
     }
+    pub(in crate::backend::cuda::engine) fn mtp_enable_resident(
+        &mut self,
+        options: MtpOptions,
+    ) -> Result<()> {
+        self.mtp_enable_bound(options, &(1..=self.chunk).collect::<Vec<_>>())
+    }
+    pub(in crate::backend::cuda::engine) fn check_mtp_mode(&self, graph: bool) -> Result<()> {
+        ensure!(
+            self.mtp
+                .as_ref()
+                .context("MTP not configured")?
+                .options
+                .graph
+                == graph,
+            "MTP graph mode differs from setup"
+        );
+        Ok(())
+    }
+    pub(crate) fn reset_mtp(&mut self) -> Result<()> {
+        let mut chain = self.mtp.take().context("MTP not configured")?;
+        let result = (|| -> Result<()> {
+            self.reset()?;
+            self.mtp_state
+                .as_mut()
+                .context("MTP state missing")?
+                .reset(&self.device.stream)?;
+            chain.cursor = 0;
+            chain.committed_position = 0;
+            chain.epoch = self.mtp_epoch;
+            chain.saved = None;
+            chain.last_target.fill(bf16::ZERO);
+            chain.recurrent.fill(bf16::ZERO);
+            chain.bootstrap.last_rows = 0;
+            self.device
+                .stream
+                .memset_zeros(&mut chain.bootstrap.carry)?;
+            if let Some(batch) = chain.batch.as_mut() {
+                batch.invalidate_frame();
+            }
+            self.device.stream.synchronize()?;
+            Ok(())
+        })();
+        self.mtp = Some(chain);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
     pub(in crate::backend::cuda::engine) fn mtp_enable_for_prompt(
         &mut self,
         options: MtpOptions,
@@ -426,6 +474,9 @@ impl Engine {
             chain.last_target.fill(bf16::ZERO);
             chain.recurrent.fill(bf16::ZERO);
             chain.bootstrap.last_rows = 0;
+            if let Some(batch) = chain.batch.as_mut() {
+                batch.invalidate_frame();
+            }
             let token = self.prefill_chunks(ids, None, ids.len(), |engine, chunk| {
                 chain.bootstrap_chunk(engine, chunk)
             })?;
