@@ -25,11 +25,10 @@
 //! overwrote `history[]` while blocks with `blockIdx.y == 0` were still reading
 //! it to seed their window, which made `valid_rows > 32` nondeterministic.
 //!
-//! `phase` selects the core. ABI §6 makes it EXPLICIT: `Prefill` with `M == 1`
-//! is still `Prefill` and still takes the chunked path. `run` never reads a host
-//! `valid_rows` to choose a path — only the chunked core's own internal dispatch
-//! on `valid_rows == 1` does, and that is inside the kernel, where the device
-//! value lives.
+//! Ordinary `run` selects by phase: even M1 Prefill uses chunked. The Engine's
+//! MTP device-prefix transaction calls `run_verify`, which retains Prefill and
+//! all batched preparation but uses the R1..4 recurrent core on sm89. Modules
+//! and launch bounds are prepared before Ready; live rows remain device data.
 //!
 //! Rows are LOCAL. `qkv` and `core_out` are this call's `[M, ...]`; `prefix` rows
 //! precede the call and are reachable only through `history[]`. `GdnMeta.prefix`
@@ -133,6 +132,7 @@ struct Kernels {
     beta_widen: CudaFunction,
     chunked: CudaFunction,
     recurrent: CudaFunction,
+    rstep: Option<CudaFunction>,
 }
 
 pub(crate) struct GdnPlan {
@@ -317,7 +317,14 @@ impl GdnOps {
         } else {
             None
         };
+        // Bind before Ready. Unsupported architectures retain their exact core route.
+        let rstep = if cubin::capability(ctx)? == 89 && !scan {
+            Some(cubin::module(ctx, "gdn/gdn_rstep")?.load_function("gdn_rstep_core_v1")?)
+        } else {
+            None
+        };
         let kernels = Kernels {
+            rstep,
             scan: scan_kernels,
             conv: f_conv,
             hist_update: f_hist,
@@ -378,6 +385,41 @@ impl GdnOps {
         phase: ExecutionPhase,
         scratch: Scratch,
     ) -> Result<()> {
+        Self::run_core(plan, stream, meta, phase, scratch, false)
+    }
+
+    /// Batched target verification/replay, identified by the Engine's device-prefix
+    /// transaction. Phase stays Prefill; only the prepared core is substituted.
+    pub(crate) fn run_verify(
+        plan: &GdnPlan,
+        stream: &Arc<CudaStream>,
+        meta: SeqRef,
+        scratch: Scratch,
+    ) -> Result<()> {
+        ensure!(
+            plan.kernels.rstep.is_none() || (1..=4).contains(&plan.max_rows),
+            "verify GDN bound must be 1..4"
+        );
+        ensure!(
+            plan.kernels.scan.is_none(),
+            "verify GDN cannot use scan plan"
+        );
+        Self::run_core(plan, stream, meta, ExecutionPhase::Prefill, scratch, true)
+    }
+
+    fn run_core(
+        plan: &GdnPlan,
+        stream: &Arc<CudaStream>,
+        meta: SeqRef,
+        phase: ExecutionPhase,
+        scratch: Scratch,
+        verify: bool,
+    ) -> Result<()> {
+        let rstep = if verify {
+            plan.kernels.rstep.as_ref()
+        } else {
+            None
+        };
         meta.validate()?;
         ensure!(
             phase == ExecutionPhase::Prefill || plan.kernels.scan.is_none(),
@@ -528,6 +570,7 @@ impl GdnOps {
         #[cfg(test)]
         record_phase(match phase {
             ExecutionPhase::Prefill if plan.kernels.scan.is_some() => "bscan",
+            ExecutionPhase::Prefill if rstep.is_some() => "rstep",
             ExecutionPhase::Prefill => "chunked",
             ExecutionPhase::Decode => "recurrent",
         });
@@ -547,6 +590,21 @@ impl GdnOps {
                             g.0.ptr,
                         ],
                     )?;
+                }
+                ExecutionPhase::Prefill if rstep.is_some() => {
+                    let core = rstep.context("missing prepared rstep core")?;
+                    stream
+                        .launch_builder(core)
+                        .arg(&q_fp32.0.ptr)
+                        .arg(&k_fp32.0.ptr)
+                        .arg(&v_fp32.0.ptr)
+                        .arg(&beta_fp32.0.ptr)
+                        .arg(&g.0.ptr)
+                        .arg(&b.s.0.ptr)
+                        .arg(&b.core_out.0.ptr)
+                        .arg(&meta.ptr)
+                        .arg(&(rows as i32))
+                        .launch(plan.recurrent_cfg)?;
                 }
                 ExecutionPhase::Prefill => {
                     stream

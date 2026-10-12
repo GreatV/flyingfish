@@ -484,11 +484,14 @@ impl Runtime {
 impl Engine {
     #[cfg(test)]
     pub(super) fn qwen_full_prefill_for_test(&mut self, full: bool) -> Result<()> {
+        // The state oracle may widen FA, but sm89 MTP must retain the same
+        // R-step core/partition. C32 is a numerical oracle, not a bitwise one.
+        let full_gdn = full && self.device.info.arch != 89;
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         for layer in &mut q.layers {
             match &mut layer.mixer {
                 BoundMixer::Attention { text_prefill, .. } => text_prefill.force_full = full,
-                BoundMixer::Gdn { prefill, .. } => prefill.force_full = full,
+                BoundMixer::Gdn { prefill, .. } => prefill.force_full = full_gdn,
             }
         }
         Ok(())
@@ -952,7 +955,15 @@ impl Engine {
                             ExecutionPhase::Decode => decode.as_ref(),
                         },
                     };
-                GdnOps::run(plan, s, meta, phase, scratch(&q.scratch, s))?;
+                if self.qwen_device_prefix {
+                    ensure!(
+                        phase == ExecutionPhase::Prefill,
+                        "MTP verify must remain Prefill"
+                    );
+                    GdnOps::run_verify(plan, s, meta, scratch(&q.scratch, s))?;
+                } else {
+                    GdnOps::run(plan, s, meta, phase, scratch(&q.scratch, s))?;
+                }
                 q.common.norm.rms_gated(
                     s,
                     domain,
