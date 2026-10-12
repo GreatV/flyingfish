@@ -8,6 +8,28 @@ use std::path::Path;
 
 pub enum Backend {}
 impl Backend {
+    pub(crate) fn load_mtp(
+        _: &std::path::Path,
+        _: &crate::spec::Options,
+        _: usize,
+        _: bool,
+    ) -> Result<Self> {
+        anyhow::bail!("CUDA backend is disabled")
+    }
+    pub(crate) fn generate_mtp_prepared(
+        &mut self,
+        _: &[u32],
+        _: usize,
+        _: bool,
+        _: crate::mtp::VerifyPolicy,
+        _: bool,
+        _: &mut dyn FnMut(&[u32], usize) -> bool,
+    ) -> Result<crate::mtp::Output> {
+        anyhow::bail!("CUDA backend is disabled")
+    }
+    pub(crate) fn reset_mtp(&mut self) -> Result<()> {
+        anyhow::bail!("CUDA backend is disabled")
+    }
     pub(crate) fn generate_mtp(
         _dir: &Path,
         _ids: &[u32],

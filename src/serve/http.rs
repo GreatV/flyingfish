@@ -356,8 +356,12 @@ fn check_validity(state: &AppState, ids: &[u32], max_tokens: usize) -> Result<()
         count: max_tokens,
         ..state.backend.options()
     };
-    super::check_request(ids, &options)
-        .map_err(|error| Box::new(bad_request(&format!("request rejected: {error}"))))
+    (if state.backend.mtp {
+        crate::mtp::check_request(ids.len(), max_tokens, options.capacity)
+    } else {
+        super::check_request(ids, &options)
+    })
+    .map_err(|error| Box::new(bad_request(&format!("request rejected: {error}"))))
 }
 
 fn prompt_to_ids(
@@ -602,6 +606,7 @@ fn prepare_message_images(
                     }
                 }
                 Some("image_url") => {
+                    anyhow::ensure!(!state.backend.mtp, "image input does not support MTP");
                     anyhow::ensure!(!is_system, "system messages cannot contain images");
                     anyhow::ensure!(
                         state.backend.options().backend.draft_model.is_none(),
@@ -841,6 +846,7 @@ mod tests {
             commands,
             slot: Arc::new(Mutex::new(slot)),
             vocab_size: 300_000,
+            mtp: false,
             options: crate::spec::Options {
                 device: 0,
                 capacity,

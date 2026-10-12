@@ -107,6 +107,8 @@ enum Command {
     Serve {
         #[arg(long, default_value_t = 8080)]
         port: u16,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3), conflicts_with = "draft_model")]
+        mtp: Option<u8>,
     },
     Bench {
         #[command(flatten)]
@@ -540,7 +542,7 @@ fn run() -> Result<()> {
                 )
             }
         }
-        Command::Serve { port } => {
+        Command::Serve { port, mtp } => {
             let draft = cli
                 .draft_model
                 .as_ref()
@@ -548,6 +550,22 @@ fn run() -> Result<()> {
                 .transpose()?;
             if let Some(draft) = &draft {
                 eprintln!("draft_model={}", draft.display());
+            }
+            if let Some(depth) = mtp {
+                return flyingfish::serve::run_mtp(
+                    cli.model.clone(),
+                    flyingfish::spec::Options {
+                        device: cli.device,
+                        capacity: cli.capacity,
+                        chunk: cli.chunk,
+                        backend: cli.kernels.clone(),
+                        count: 256,
+                        ignore_eos: false,
+                    },
+                    cli.model.clone(),
+                    *port,
+                    usize::from(*depth),
+                );
             }
             flyingfish::serve::run(
                 cli.model.clone(),

@@ -288,6 +288,17 @@ impl FullAttentionOps {
         bindings: AttentionBindings,
         common: CommonOpsRef,
     ) -> Result<FullAttentionPlan> {
+        Self::prepare_reusing(ctx, spec, limits, bindings, common, None)
+    }
+
+    pub(crate) fn prepare_reusing(
+        ctx: &Arc<CudaContext>,
+        spec: &FullAttentionSpec,
+        limits: AttentionLimits,
+        bindings: AttentionBindings,
+        common: CommonOpsRef,
+        template: Option<&FullAttentionPlan>,
+    ) -> Result<FullAttentionPlan> {
         spec.validate()?;
         check_limits(limits)?;
         check_bindings(&bindings, limits)?;
@@ -318,32 +329,44 @@ impl FullAttentionOps {
             );
         }
 
-        let module = cubin::module(ctx, "tcmqa_d256")?;
-        let phase1 = module.load_function("tcmqa_d256_phase1")?;
-        let phase2 = module.load_function("tcmqa_d256_phase2")?;
-        for (function, bytes) in [(&phase1, PHASE1_SMEM), (&phase2, phase2_smem)] {
-            if bytes > 48 * 1024 {
-                function.set_attribute(
+        let kernels = if let Some(template) = template {
+            ensure!(
+                template.limits.capacity == limits.capacity
+                    && template.max_parts == max_parts
+                    && template.phase2_cfg.shared_mem_bytes >= phase2_smem
+                    && std::mem::discriminant(&template.bindings.positions)
+                        == std::mem::discriminant(&bindings.positions),
+                "shared attention kernels have incompatible geometry/coordinates"
+            );
+            template.kernels.clone()
+        } else {
+            let module = cubin::module(ctx, "tcmqa_d256")?;
+            let phase1 = module.load_function("tcmqa_d256_phase1")?;
+            let phase2 = module.load_function("tcmqa_d256_phase2")?;
+            for (function, bytes) in [(&phase1, PHASE1_SMEM), (&phase2, phase2_smem)] {
+                if bytes > 48 * 1024 {
+                    function.set_attribute(
                     cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     bytes as i32,
                 )?;
+                }
             }
-        }
-        // The coordinate source picks the RoPE entries; the plan stores which
-        // one it bound, so `run` never re-decides.
-        let (rope_q_entry, rope_k_entry) = match &bindings.positions {
-            PositionBindings::Linear => ("tcmqa_d256_rope_q", "tcmqa_d256_rope_k_scatter"),
-            PositionBindings::Axes(_) => {
-                ("tcmqa_d256_rope_q_axes", "tcmqa_d256_rope_k_scatter_axes")
-            }
-        };
-        let kernels = Kernels {
-            qg_split: module.load_function("tcmqa_d256_qg_split")?,
-            rope_q: module.load_function(rope_q_entry)?,
-            rope_k_scatter: module.load_function(rope_k_entry)?,
-            v_scatter: module.load_function("tcmqa_d256_v_scatter")?,
-            phase1,
-            phase2,
+            // The coordinate source picks the RoPE entries; the plan stores which
+            // one it bound, so `run` never re-decides.
+            let (rope_q_entry, rope_k_entry) = match &bindings.positions {
+                PositionBindings::Linear => ("tcmqa_d256_rope_q", "tcmqa_d256_rope_k_scatter"),
+                PositionBindings::Axes(_) => {
+                    ("tcmqa_d256_rope_q_axes", "tcmqa_d256_rope_k_scatter_axes")
+                }
+            };
+            Arc::new(Kernels {
+                qg_split: module.load_function("tcmqa_d256_qg_split")?,
+                rope_q: module.load_function(rope_q_entry)?,
+                rope_k_scatter: module.load_function(rope_k_entry)?,
+                v_scatter: module.load_function("tcmqa_d256_v_scatter")?,
+                phase1,
+                phase2,
+            })
         };
 
         let rows = limits.max_rows;
@@ -374,7 +397,7 @@ impl FullAttentionOps {
             shared_mem_bytes: phase2_smem,
         };
         Ok(FullAttentionPlan {
-            kernels: Arc::new(kernels),
+            kernels,
             bindings,
             common,
             limits,

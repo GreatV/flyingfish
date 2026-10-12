@@ -18,6 +18,14 @@ pub enum VerifyPolicy {
     Batched,
 }
 
+pub fn check_request(prompt: usize, count: usize, capacity: usize) -> Result<()> {
+    ensure!(
+        prompt > 0 && count > 0 && prompt.checked_add(count).is_some_and(|n| n <= capacity),
+        "MTP request needs a nonempty prompt, positive output count and a reserved next-token slot"
+    );
+    Ok(())
+}
+
 /// Token publication times exclude model setup and graph capture.
 pub struct Output {
     pub ids: Vec<u32>,
@@ -547,5 +555,35 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+    #[test]
+    fn resident_shapes_cover_every_first_and_tail_partition() -> Result<()> {
+        for chunk in [4, 16, 32, 2048] {
+            for prompt in 1..=3 * chunk + 1 {
+                assert!(
+                    bootstrap_rows(prompt, chunk)?
+                        .iter()
+                        .all(|&r| (1..=chunk).contains(&r))
+                );
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn request_reserves_next_slot_and_rejects_overflow() {
+        assert!(check_request(31, 1, 32).is_ok());
+        for (p, n, c) in [
+            (0, 1, 32),
+            (1, 0, 32),
+            (32, 1, 32),
+            (usize::MAX, 1, usize::MAX),
+        ] {
+            assert!(check_request(p, n, c).is_err());
+        }
     }
 }

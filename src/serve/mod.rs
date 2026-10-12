@@ -47,10 +47,15 @@ pub enum EngineEvent {
 pub enum Slot {
     Idle,
     Running,
+    Unavailable,
 }
 
 impl Slot {
     fn admit(&mut self) -> Result<()> {
+        ensure!(
+            *self != Slot::Unavailable,
+            "unavailable: engine recovery failed"
+        );
         ensure!(*self == Slot::Idle, "busy: a request is already running");
         *self = Slot::Running;
         Ok(())
@@ -62,6 +67,7 @@ pub struct Backend {
     slot: Arc<Mutex<Slot>>,
     options: SpecOptions,
     vocab_size: usize,
+    mtp: bool,
 }
 
 /// Owns admission until the engine has accepted the request.
@@ -142,9 +148,28 @@ fn load_model(target: &Path, options: &SpecOptions) -> Result<Model> {
 pub fn run(
     target: PathBuf,
     draft: Option<PathBuf>,
+    options: SpecOptions,
+    tokenizer_dir: PathBuf,
+    port: u16,
+) -> Result<()> {
+    run_inner(target, draft, options, tokenizer_dir, port, None)
+}
+pub fn run_mtp(
+    target: PathBuf,
+    options: SpecOptions,
+    tokenizer_dir: PathBuf,
+    port: u16,
+    depth: usize,
+) -> Result<()> {
+    run_inner(target, None, options, tokenizer_dir, port, Some(depth))
+}
+fn run_inner(
+    target: PathBuf,
+    draft: Option<PathBuf>,
     mut options: SpecOptions,
     tokenizer_dir: PathBuf,
     port: u16,
+    mtp: Option<usize>,
 ) -> Result<()> {
     if let Some(draft) = &draft {
         options.backend = options.backend.with_draft(draft);
@@ -161,7 +186,12 @@ pub fn run(
     let handle = thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
-            let model = match load_model(&target, &engine_options) {
+            let loaded = if let Some(depth) = mtp {
+                Model::load_mtp(&target, &engine_options, depth, true)
+            } else {
+                load_model(&target, &engine_options)
+            };
+            let model = match loaded {
                 Ok(model) => model,
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
@@ -169,7 +199,13 @@ pub fn run(
                 }
             };
             let _ = ready_tx.send(Ok(model.config.vocab_size));
-            engine_loop(model, engine_options, command_rx, engine_slot)
+            engine_loop(
+                model,
+                engine_options,
+                command_rx,
+                engine_slot,
+                mtp.is_some(),
+            )
         })
         .context("spawn engine thread")?;
     let vocab_size = ready_rx
@@ -180,6 +216,7 @@ pub fn run(
         slot,
         options,
         vocab_size,
+        mtp: mtp.is_some(),
     };
     http::serve(backend, tokenizer_dir, port, handle)
 }
@@ -189,12 +226,22 @@ fn engine_loop(
     options: SpecOptions,
     commands: mpsc::Receiver<EngineCommand>,
     slot: Arc<Mutex<Slot>>,
+    mtp: bool,
 ) {
     while let Ok(command) = commands.recv() {
         match command {
             EngineCommand::Generate { request, events } => {
-                generate_once(&mut model, &options, request, events, &commands);
-                *slot.lock().expect("slot mutex poisoned") = Slot::Idle;
+                generate_once(&mut model, &options, request, events, &commands, mtp);
+                let recovered = if mtp { model.reset_mtp() } else { Ok(()) };
+                let mut state = slot.lock().unwrap_or_else(|e| e.into_inner());
+                *state = if recovered.is_ok() {
+                    Slot::Idle
+                } else {
+                    Slot::Unavailable
+                };
+                if let Err(error) = recovered {
+                    eprintln!("serve recovery failed: {error:#}");
+                }
             }
             // A stale abort must not release a slot held by image preprocessing.
             EngineCommand::Abort => {}
@@ -208,16 +255,22 @@ fn generate_once(
     request: Request,
     events: tokio_mpsc::Sender<EngineEvent>,
     commands: &mpsc::Receiver<EngineCommand>,
+    mtp: bool,
 ) {
     let run_options = SpecOptions {
         count: request.max_new_tokens,
         ..options.clone()
     };
-    if let Err(error) = check_request(&request.ids, &run_options) {
+    let checked = if mtp {
+        crate::mtp::check_request(request.ids.len(), run_options.count, run_options.capacity)
+    } else {
+        check_request(&request.ids, &run_options)
+    };
+    if let Err(error) = checked {
         let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
         return;
     }
-    if request.images.is_some() && run_options.backend.draft_model.is_some() {
+    if request.images.is_some() && (mtp || run_options.backend.draft_model.is_some()) {
         let _ = events.blocking_send(EngineEvent::Failed(
             "image input does not support a draft model".into(),
         ));
@@ -252,7 +305,28 @@ fn generate_once(
             }
         }
     };
-    let result = if run_options.backend.draft_model.is_some() {
+    let mut mtp_rounds = 0usize;
+    let result = if mtp {
+        let mut first = true;
+        model
+            .generate_mtp_reuse(&request.ids, &run_options, true, &mut |ids, accepted| {
+                if first {
+                    first = false;
+                } else {
+                    mtp_rounds += 1;
+                }
+                on_event(EngineEvent::Tokens {
+                    ids: ids.to_vec(),
+                    accepted,
+                })
+            })
+            .map(|output| spec::Output {
+                ids: output.ids,
+                rounds: Vec::new(),
+                prefill_ms: output.prefill_ms,
+                decode_ms: output.decode_ms,
+            })
+    } else if run_options.backend.draft_model.is_some() {
         spec::produce_events(model, &request.ids, &run_options, None, &mut |step| {
             on_event(match step {
                 Step::First(token) => EngineEvent::Tokens {
@@ -281,7 +355,7 @@ fn generate_once(
     };
     let result = result.and_then(|output| {
         model.check_ready()?;
-        let mut record = serde_json::json!({"serve_request":{"prefill_ms":output.prefill_ms,"decode_ms":output.decode_ms,"initial_rounds":output.rounds.iter().take(2).collect::<Vec<_>>()}});
+        let mut record = serde_json::json!({"serve_request":{"prefill_ms":output.prefill_ms,"decode_ms":output.decode_ms,"initial_rounds":output.rounds.iter().take(2).collect::<Vec<_>>(),"mtp":mtp,"mtp_rounds":mtp_rounds}});
         if std::env::var("FLYINGFISH_SERVE_TRACE_IDS").is_ok_and(|value| value == "1") {
             record["serve_request"]["generated_ids"] = serde_json::json!(output.ids);
             record["serve_request"]["aborted"] = serde_json::json!(aborted);
@@ -294,7 +368,9 @@ fn generate_once(
     match result {
         Ok(output) => {
             if aborted {
-                let _ = model.reset();
+                if !mtp {
+                    let _ = model.reset();
+                }
                 let _ = events.blocking_send(EngineEvent::Aborted { ids: output.ids });
             } else {
                 let eos_hit = !run_options.ignore_eos
@@ -305,13 +381,15 @@ fn generate_once(
                 let length_reached = output.ids.len() >= run_options.count && !eos_hit;
                 let _ = events.blocking_send(EngineEvent::Done {
                     ids: output.ids,
-                    rounds: output.rounds.len(),
+                    rounds: if mtp { mtp_rounds } else { output.rounds.len() },
                     length_reached,
                 });
             }
         }
         Err(error) => {
-            let _ = model.reset();
+            if !mtp {
+                let _ = model.reset();
+            }
             let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
         }
     }
@@ -399,5 +477,16 @@ mod tests {
         assert!(error.to_string().contains("busy"));
         slot = Slot::Idle;
         slot.admit().expect("admission after idle");
+    }
+    #[test]
+    fn unavailable_engine_never_admits_a_new_request() {
+        let mut slot = Slot::Unavailable;
+        assert!(
+            slot.admit()
+                .expect_err("failed recovery stays unavailable")
+                .to_string()
+                .contains("unavailable")
+        );
+        assert_eq!(slot, Slot::Unavailable);
     }
 }

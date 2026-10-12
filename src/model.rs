@@ -140,6 +140,36 @@ impl Model {
         Backend::generate_mtp(dir, ids, options, depth, policy, graph)
     }
 
+    pub fn load_mtp(
+        dir: &Path,
+        options: &crate::spec::Options,
+        depth: usize,
+        graph: bool,
+    ) -> Result<Self> {
+        let backend = Backend::load_mtp(dir, options, depth, graph)?;
+        let config = backend.config().clone();
+        Ok(Self { backend, config })
+    }
+    pub fn generate_mtp_reuse(
+        &mut self,
+        ids: &[u32],
+        options: &crate::spec::Options,
+        graph: bool,
+        on_tokens: &mut dyn FnMut(&[u32], usize) -> bool,
+    ) -> Result<crate::mtp::Output> {
+        self.backend.generate_mtp_prepared(
+            ids,
+            options.count,
+            options.ignore_eos,
+            crate::mtp::VerifyPolicy::default(),
+            graph,
+            on_tokens,
+        )
+    }
+    pub fn reset_mtp(&mut self) -> Result<()> {
+        self.backend.reset_mtp()
+    }
+
     pub fn check_ready(&self) -> Result<()> {
         self.backend.check_ready()
     }
