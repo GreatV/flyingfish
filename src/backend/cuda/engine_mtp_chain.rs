@@ -169,6 +169,9 @@ impl Bound<'_> {
         if mode == OutputMode::StateOnly {
             return Ok(None);
         }
+        if let Some(token) = dump.prediction {
+            return Ok(Some(token));
+        }
         let (_, shape, bytes) = dump.tensors.get("logits").context("MTP head missing")?;
         ensure!(shape == &[1, VOCAB], "MTP head extent mismatch");
         let mut best = (0u32, f32::NEG_INFINITY);

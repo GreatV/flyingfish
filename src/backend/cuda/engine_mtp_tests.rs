@@ -890,3 +890,107 @@ fn q38_mtp_recursive_fixture_gpu() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn mtp_dump_retains_bits_and_rejects_nonfinite_logits() -> Result<()> {
+    let mut dump = Dump::default();
+    let values = vec![bf16::from_bits(0x8000), bf16::ZERO, bf16::from_f32(1.0)];
+    dump.bf16("logits", vec![1, 3], values)?;
+    assert_eq!(dump.tensors["logits"].2, [0, 128, 0, 0, 128, 63]);
+    for bits in [0x7fc0, 0x7f80, 0xff80] {
+        let error = Dump::default()
+            .bf16("logits", vec![1, 1], vec![bf16::from_bits(bits)])
+            .expect_err("nonfinite logits must retain the existing error");
+        assert_eq!(error.to_string(), "nonfinite MTP dump logits");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "authorized GPU window; argmax ties, finite flag, sticky/reset and tail controls"]
+fn q38_mtp_host_trim_primitives_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_MTP_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let device = Device::new(0)?;
+    let ops = Ops::new(&device.ctx)?;
+    let s = &device.stream;
+    let mut results = Vec::new();
+    for count in [1usize, 7, 8, 31, 1025, VOCAB, 4 * VOCAB] {
+        for offset in [0usize, 1] {
+            for case in ["ties", "zeros", "negative", "nan", "posinf", "neginf"] {
+                let mut host = vec![bf16::from_f32(-2.0); count + offset + 1];
+                let values = &mut host[offset..offset + count];
+                match case {
+                    "ties" => {
+                        values[count / 3] = bf16::from_f32(4.0);
+                        values[count - 1] = bf16::from_f32(4.0);
+                    }
+                    "zeros" => {
+                        values.fill(bf16::from_bits(0x8000));
+                        values[count - 1] = bf16::ZERO;
+                    }
+                    "negative" => values[count - 1] = bf16::from_f32(-1.0),
+                    "nan" => values[count - 1] = bf16::from_bits(0x7fc0),
+                    "posinf" => values[count - 1] = bf16::from_bits(0x7f80),
+                    "neginf" => values[count - 1] = bf16::from_bits(0xff80),
+                    _ => unreachable!(),
+                }
+                let finite = values.iter().all(|x| x.is_finite());
+                let mut expected = (0u32, f32::NEG_INFINITY);
+                for (i, value) in values.iter().enumerate() {
+                    if value.to_f32() > expected.1 {
+                        expected = (i as u32, value.to_f32());
+                    }
+                }
+                host[offset + count] = bf16::from_bits(0x7fc0);
+                let input = s.clone_htod(&host)?;
+                let view = input.slice(offset..offset + count);
+                let mut token = s.alloc_zeros::<u32>(1)?;
+                let mut flag = s.alloc_zeros::<u32>(1)?;
+                let scan = |flag: &mut CudaSlice<u32>| -> Result<()> {
+                    unsafe {
+                        s.launch_builder(&ops.finite_bf16)
+                            .arg(&view)
+                            .arg(flag)
+                            .arg(&(count as u64))
+                            .launch(flat(count))?;
+                    }
+                    Ok(())
+                };
+                unsafe {
+                    s.launch_builder(&ops.argmax)
+                        .arg(&view)
+                        .arg(&mut token)
+                        .arg(&(count as i32))
+                        .launch(crate::backend::cuda::ops::grid(1, 1024))?;
+                }
+                scan(&mut flag)?;
+                let id = s.clone_dtoh(&token)?[0];
+                let bad = s.clone_dtoh(&flag)?[0];
+                s.memcpy_htod(&[1u32], &mut flag)?;
+                scan(&mut flag)?;
+                let sticky = s.clone_dtoh(&flag)?[0];
+                s.memset_zeros(&mut flag)?;
+                scan(&mut flag)?;
+                let reset = s.clone_dtoh(&flag)?[0];
+                results.push(serde_json::json!({"count":count,"offset":offset,"case":case,"id":id,"expected":expected.0,"bad":bad,"finite":finite,"sticky":sticky,"reset":reset}));
+                if let Some(out) = std::env::var_os("FF_Q38_MTP_OUTPUT") {
+                    let out = std::path::PathBuf::from(out);
+                    std::fs::create_dir_all(&out)?;
+                    std::fs::write(
+                        out.join("primitive-observations.json"),
+                        serde_json::to_vec_pretty(&results)?,
+                    )?;
+                }
+                ensure!(
+                    bad == u32::from(!finite) && reset == bad && sticky == 1,
+                    "finite/sticky/reset/tail mismatch"
+                );
+                ensure!(!finite || id == expected.0, "lowest-index argmax mismatch");
+            }
+        }
+    }
+    Ok(())
+}

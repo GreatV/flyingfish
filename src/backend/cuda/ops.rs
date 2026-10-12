@@ -15,6 +15,7 @@ pub struct Ops {
     pub act: CudaFunction,
     pub argmax: CudaFunction,
     pub argmax_rows: CudaFunction,
+    pub finite_bf16: CudaFunction,
     pub advance: CudaFunction,
     pub residual: CudaFunction,
 }
@@ -41,6 +42,7 @@ impl Ops {
             act: act.load_function("silu_mul")?,
             argmax: sample.load_function("argmax")?,
             argmax_rows: sample.load_function("argmax_rows_bf16")?,
+            finite_bf16: sample.load_function("finite_bf16")?,
             advance: sample.load_function("advance")?,
             residual: norm.load_function("residual")?,
         })
