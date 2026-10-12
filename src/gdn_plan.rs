@@ -247,6 +247,9 @@ mod tests {
         assert_eq!(scan.buckets(4096), vec![512, 1024, 2048]);
         for (rows, want) in [
             (1, None),
+            (2, None),
+            (3, None),
+            (4, None),
             (5, None),
             (511, None),
             (512, Some(512)),
@@ -258,6 +261,23 @@ mod tests {
             (2049, None),
         ] {
             assert_eq!(scan.select(4096, rows, ExecutionPhase::Prefill)?, want);
+            assert_eq!(scan.select(4096, rows, ExecutionPhase::Decode)?, None);
+            assert_eq!(
+                GdnPolicy::LEGACY.select(4096, rows, ExecutionPhase::Prefill)?,
+                None
+            );
+            let legacy = GdnWorkspace::q38(&GdnSpec::q38(), rows)?;
+            assert!(legacy.scan.is_none());
+            if let Some(bucket) = want {
+                assert!(
+                    GdnWorkspace::with_scan(&GdnSpec::q38(), bucket)?
+                        .scan
+                        .is_some()
+                );
+            }
+            if rows <= 4 {
+                assert!(GdnWorkspace::with_scan(&GdnSpec::q38(), rows).is_err());
+            }
         }
         assert_eq!(scan.select(1021, 513, ExecutionPhase::Prefill)?, Some(1021));
         assert_eq!(scan.select(2048, 1, ExecutionPhase::Decode)?, None);
