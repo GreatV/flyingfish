@@ -8,6 +8,12 @@ use std::path::Path;
 
 pub enum Backend {}
 impl Backend {
+    pub(crate) fn check_resident_vision_budget(_: &Path, _: &crate::spec::Options) -> Result<()> {
+        bail!("CUDA backend is disabled")
+    }
+    pub fn prepare_resident_vision(&mut self) -> Result<()> {
+        match *self {}
+    }
     pub(crate) fn load_mtp(
         _: &std::path::Path,
         _: &crate::spec::Options,

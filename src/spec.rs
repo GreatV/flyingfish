@@ -447,7 +447,7 @@ pub fn generate(
     let sglang_accept_len = result.ids.len() as f64 / result.rounds.len().max(1) as f64;
     println!(
         "{}",
-        serde_json::json!({"spec_generation":{"input_ids":ids,"generated_ids":result.ids,"text":tokenizer::decode(target,&result.ids)?,"prefill_ms":result.prefill_ms,"decode_ms":result.decode_ms,"decode_tok_s":(result.ids.len()-1) as f64*1000.0/result.decode_ms,"sglang_accept_len":sglang_accept_len,"end_to_end_tok_s":result.ids.len() as f64*1000.0/(result.prefill_ms+result.decode_ms),"mean_accept_including_bonus":result.rounds.iter().map(|r|r.accepted+1).sum::<usize>() as f64/result.rounds.len().max(1) as f64,"ignore_eos":options.ignore_eos,"draft_attention":"noncausal full block","verify_attention":model.verification_impl()}})
+        serde_json::json!({"spec_generation":{"mode":"draft","mtp_depth":0,"input_ids":ids,"generated_ids":result.ids,"text":tokenizer::decode(target,&result.ids)?,"prefill_ms":result.prefill_ms,"decode_ms":result.decode_ms,"decode_tok_s":(result.ids.len()-1) as f64*1000.0/result.decode_ms,"sglang_accept_len":sglang_accept_len,"end_to_end_tok_s":result.ids.len() as f64*1000.0/(result.prefill_ms+result.decode_ms),"mean_accept_including_bonus":result.rounds.iter().map(|r|r.accepted+1).sum::<usize>() as f64/result.rounds.len().max(1) as f64,"ignore_eos":options.ignore_eos,"draft_attention":"noncausal full block","verify_attention":model.verification_impl()}})
     );
     Ok(())
 }

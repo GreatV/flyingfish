@@ -544,6 +544,85 @@ impl Engine {
             input,
             self.capacity,
         )?;
+        self.prepare_vision_weights(request_bytes)?;
+        let q = self.qwen.as_mut().context("Q38 runtime missing")?;
+        let vision = q.vision.as_ref().context("vision runtime missing")?;
+        let (free, total) = self.device.ctx.mem_get_info()?;
+        ensure!(
+            free.checked_sub(total / 16)
+                .is_some_and(|n| request_bytes <= n),
+            "vision request exceeds memory budget: required={request_bytes} free={free}"
+        );
+        self.poisoned = true;
+        let request = vision.prepare(&self.device, &mut self.blas, input, self.capacity)?;
+        let images = vision.encode(&self.device.stream, &self.blas, request, trace)?;
+        self.device
+            .stream
+            .memcpy_htod(&positions, &mut q.positions)?;
+        self.device.stream.synchronize()?;
+        self.images = Some(images);
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub fn prepare_resident_vision(&mut self) -> Result<()> {
+        if self.model_spec.vision.is_some() {
+            self.prepare_vision_weights(0)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_resident_vision_budget(
+        dir: &Path,
+        options: &crate::spec::Options,
+    ) -> Result<()> {
+        let spec = crate::model_spec::ModelSpec::read(dir)?;
+        if spec.vision.is_none() {
+            return Ok(());
+        }
+        let checkpoint = crate::checkpoint::MappedCheckpoint::open(dir)?;
+        let main_bytes = checkpoint.q38_manifest(&spec)?.resident_bytes;
+        let vision_bytes = checkpoint
+            .q38_manifest_with_policy(&spec, crate::checkpoint::LoadPolicy::VisionOnly)?
+            .resident_bytes;
+        let kv_bytes = spec
+            .layers
+            .iter()
+            .filter(|layer| layer.mixer == Mixer::FullAttention)
+            .count()
+            .checked_mul(options.capacity)
+            .and_then(|n| n.checked_mul(spec.kv_heads as usize))
+            .and_then(|n| n.checked_mul(spec.head_dim as usize))
+            .and_then(|n| n.checked_mul(4))
+            .context("resident KV byte count overflow")?;
+        let mtp_bytes = crate::mtp::attachment_bytes(&spec, options.capacity, 1, true)?;
+        let minimum = [main_bytes, vision_bytes, kv_bytes, mtp_bytes]
+            .into_iter()
+            .try_fold(0usize, |sum, n| {
+                sum.checked_add(n).context("resident byte count overflow")
+            })?;
+        let device = Device::new(options.device)?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        ensure!(
+            free.checked_sub(total / 16).is_some_and(|n| minimum <= n),
+            "co-resident MTP/vision/KV minimum exceeds memory budget: main_weights_bytes={main_bytes} mtp_minimum_bytes={mtp_bytes} vision_bytes={vision_bytes} kv_bytes={kv_bytes} minimum_required_bytes={minimum} free_bytes={free} reserve_bytes={}",
+            total / 16
+        );
+        Ok(())
+    }
+
+    fn prepare_vision_weights(&mut self, request_bytes: usize) -> Result<()> {
+        let kv_bytes = self
+            .state
+            .kv
+            .iter()
+            .map(|v| (v.k.len() + v.v.len()) * size_of::<bf16>())
+            .sum::<usize>();
+        let mtp_bytes = if self.mtp.is_some() {
+            crate::mtp::attachment_bytes(&self.model_spec, self.capacity, self.chunk, true)?
+        } else {
+            0
+        };
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         if q.vision.is_none() {
             let manifest = crate::checkpoint::MappedCheckpoint::open(&q.checkpoint_dir)?
@@ -556,9 +635,20 @@ impl Engine {
                 .checked_add(request_bytes)
                 .context("vision resident/workspace overflow")?;
             let (free, total) = self.device.ctx.mem_get_info()?;
+            eprintln!(
+                "{}",
+                serde_json::json!({"serve_resident_budget": {
+                    "main_weights_bytes": self.weights.bytes, "mtp_attachment_bytes": mtp_bytes,
+                    "vision_weights_bytes": manifest.resident_bytes, "kv_bytes": kv_bytes,
+                    "request_bytes": request_bytes, "free_bytes": free, "reserve_bytes": total / 16,
+                    "additional_required_bytes": needed, "chunk": self.chunk,
+                }})
+            );
             ensure!(
                 free.checked_sub(total / 16).is_some_and(|n| needed <= n),
-                "vision weights and request exceed memory budget: required={needed} free={free}"
+                "co-resident MTP/vision/KV exceeds memory budget: mtp_bytes={mtp_bytes} vision_bytes={} kv_bytes={kv_bytes} request_bytes={request_bytes} additional_required_bytes={needed} free_bytes={free} reserve_bytes={}",
+                manifest.resident_bytes,
+                total / 16
             );
             self.poisoned = true;
             let mut catalog = WeightCatalog::load_with_policy(
@@ -578,22 +668,6 @@ impl Engine {
             self.device.finish_upload()?;
             self.poisoned = false;
         }
-        let vision = q.vision.as_ref().context("vision runtime missing")?;
-        let (free, total) = self.device.ctx.mem_get_info()?;
-        ensure!(
-            free.checked_sub(total / 16)
-                .is_some_and(|n| request_bytes <= n),
-            "vision request exceeds memory budget: required={request_bytes} free={free}"
-        );
-        self.poisoned = true;
-        let request = vision.prepare(&self.device, &mut self.blas, input, self.capacity)?;
-        let images = vision.encode(&self.device.stream, &self.blas, request, trace)?;
-        self.device
-            .stream
-            .memcpy_htod(&positions, &mut q.positions)?;
-        self.device.stream.synchronize()?;
-        self.images = Some(images);
-        self.poisoned = false;
         Ok(())
     }
 

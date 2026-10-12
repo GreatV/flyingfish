@@ -170,6 +170,17 @@ impl Model {
         self.backend.reset_mtp()
     }
 
+    pub fn prepare_resident_vision(&mut self) -> Result<()> {
+        self.backend.prepare_resident_vision()
+    }
+
+    pub(crate) fn check_resident_vision_budget(
+        dir: &Path,
+        options: &crate::spec::Options,
+    ) -> Result<()> {
+        Backend::check_resident_vision_budget(dir, options)
+    }
+
     pub fn check_ready(&self) -> Result<()> {
         self.backend.check_ready()
     }

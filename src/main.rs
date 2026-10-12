@@ -88,7 +88,7 @@ enum Command {
         max_new_tokens: usize,
         #[arg(long)]
         graph: bool,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3), conflicts_with = "draft_model", help = "Use Qwen3.8 MTP with 1–3 draft tokens; plain generation is the default")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=3), help = "MTP depth; defaults to 3 when the checkpoint contains MTP weights; 0 selects plain generation")]
         mtp: Option<u8>,
         #[arg(long)]
         dump: Option<PathBuf>,
@@ -107,7 +107,7 @@ enum Command {
     Serve {
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3), conflicts_with = "draft_model")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=3), help = "MTP depth; defaults to 3 when the checkpoint contains MTP weights; 0 selects plain serving")]
         mtp: Option<u8>,
     },
     Bench {
@@ -305,6 +305,7 @@ fn generate_mtp(cli: &Cli, input: &Input, count: usize, graph: bool, depth: u8) 
             "decode_tok_s": if decode_steps > 0 { Some(decode_steps as f64 * 1000.0 / output.decode_ms) } else { None },
             "graph": graph,
             "mtp_depth": depth,
+            "mode": "mtp",
             "mtp_verify": policy,
         })
     );
@@ -459,7 +460,7 @@ fn generation_report(
         "text": text, "load_ms": load_ms, "prefill_ms": output.prefill_ms,
         "capture_ms": output.capture_ms, "decode_ms": output.decode_ms, "decode_steps": decode_steps,
         "decode_tok_s": if decode_steps > 0 { Some(decode_steps as f64 * 1000.0 / output.decode_ms) } else { None },
-        "graph": graph, "dump": dump, "trace_layer": trace_layer.unwrap_or(0) })
+        "graph": graph, "dump": dump, "trace_layer": trace_layer.unwrap_or(0), "mode": "plain" })
 }
 
 fn bench(
@@ -495,6 +496,31 @@ fn normalize_budget(cli: &mut Cli) {
     }
 }
 
+fn resolve_mtp(requested: Option<u8>, component: bool, plain_selected: bool) -> Result<Option<u8>> {
+    match requested {
+        Some(0) => Ok(None),
+        Some(depth) => {
+            ensure!(depth <= 3, "MTP depth must be 0..=3");
+            ensure!(
+                !plain_selected,
+                "MTP cannot combine --draft-model, --dump, --trace-layer or --image-tensors"
+            );
+            ensure!(component, "checkpoint has no MTP component");
+            Ok(Some(depth))
+        }
+        None => Ok((component && !plain_selected).then_some(3)),
+    }
+}
+
+fn checkpoint_mtp(dir: &Path, requested: Option<u8>, plain_selected: bool) -> Result<Option<u8>> {
+    let component = if requested == Some(0) || (requested.is_none() && plain_selected) {
+        false
+    } else {
+        flyingfish::checkpoint::has_mtp_component(dir)?
+    };
+    resolve_mtp(requested, component, plain_selected)
+}
+
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
     normalize_budget(&mut cli);
@@ -521,14 +547,11 @@ fn run() -> Result<()> {
             image_tensors,
             mtp,
         } => {
-            if let Some(depth) = *mtp {
-                ensure!(
-                    cli.draft_model.is_none()
-                        && dump.is_none()
-                        && trace_layer.is_none()
-                        && image_tensors.is_none(),
-                    "MTP generate cannot combine --draft-model, --dump, --trace-layer or --image-tensors"
-                );
+            let plain_selected = cli.draft_model.is_some()
+                || dump.is_some()
+                || trace_layer.is_some()
+                || image_tensors.is_some();
+            if let Some(depth) = checkpoint_mtp(&cli.model, *mtp, plain_selected)? {
                 generate_mtp(&cli, input, *max_new_tokens, *graph, depth)
             } else {
                 generate(
@@ -551,7 +574,7 @@ fn run() -> Result<()> {
             if let Some(draft) = &draft {
                 eprintln!("draft_model={}", draft.display());
             }
-            if let Some(depth) = mtp {
+            if let Some(depth) = checkpoint_mtp(&cli.model, *mtp, draft.is_some())? {
                 return flyingfish::serve::run_mtp(
                     cli.model.clone(),
                     flyingfish::spec::Options {
@@ -564,7 +587,7 @@ fn run() -> Result<()> {
                     },
                     cli.model.clone(),
                     *port,
-                    usize::from(*depth),
+                    usize::from(depth),
                 );
             }
             flyingfish::serve::run(
@@ -956,7 +979,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mtp_is_opt_in_and_cannot_select_an_external_draft() -> Result<()> {
+    fn mtp_default_resolves_from_checkpoint_and_explicit_plain_modes() -> Result<()> {
         let args = [
             "flyingfish",
             "--model",
@@ -969,27 +992,30 @@ mod tests {
             Cli::try_parse_from(args)?.command,
             Command::Generate { mtp: None, .. }
         ));
-        for depth in ["1", "2", "3"] {
+        for depth in ["0", "1", "2", "3"] {
             let cli = Cli::try_parse_from(args.into_iter().chain(["--mtp", depth]))?;
             assert!(
                 matches!(cli.command, Command::Generate { mtp: Some(k), .. } if k.to_string() == depth)
             );
         }
-        for depth in ["0", "4"] {
-            assert!(Cli::try_parse_from(args.into_iter().chain(["--mtp", depth])).is_err());
+        assert!(Cli::try_parse_from(args.into_iter().chain(["--mtp", "4"])).is_err());
+        assert_eq!(resolve_mtp(None, true, false)?, Some(3));
+        assert_eq!(resolve_mtp(None, false, false)?, None);
+        for component in [false, true] {
+            assert_eq!(resolve_mtp(Some(0), component, false)?, None);
+            assert_eq!(resolve_mtp(Some(0), component, true)?, None);
+            assert_eq!(resolve_mtp(None, component, true)?, None);
         }
-        assert!(
-            Cli::try_parse_from(
-                args.into_iter()
-                    .chain(["--mtp", "2", "--draft-model", "draft"])
-            )
-            .is_err()
-        );
+        for depth in 1..=3 {
+            assert_eq!(resolve_mtp(Some(depth), true, false)?, Some(depth));
+            assert!(resolve_mtp(Some(depth), false, false).is_err());
+            assert!(resolve_mtp(Some(depth), true, true).is_err());
+        }
         Ok(())
     }
 
     #[test]
-    fn generate_graph_json_contract_is_unchanged() {
+    fn generate_graph_json_records_the_resolved_plain_mode() {
         let output = flyingfish::model::GenerationOutput {
             ids: vec![7, 8, 9],
             prefill_ms: 2.0,
@@ -1003,7 +1029,7 @@ mod tests {
                 "input_ids": [1, 2], "generated_ids": [7, 8, 9], "text": "answer",
                 "load_ms": 5.0, "prefill_ms": 2.0, "capture_ms": 1.25,
                 "decode_ms": 4.0, "decode_steps": 2, "decode_tok_s": 500.0,
-                "graph": true, "dump": null, "trace_layer": 0
+                "graph": true, "dump": null, "trace_layer": 0, "mode": "plain"
             })
         );
         let first_only = flyingfish::model::GenerationOutput {
