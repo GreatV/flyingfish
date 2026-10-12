@@ -187,7 +187,12 @@ fn run_inner(
         .name("engine".into())
         .spawn(move || {
             let loaded = if let Some(depth) = mtp {
-                Model::load_mtp(&target, &engine_options, depth, true)
+                Model::check_resident_vision_budget(&target, &engine_options)
+                    .and_then(|()| Model::load_mtp(&target, &engine_options, depth, true))
+                    .and_then(|mut model| {
+                        model.prepare_resident_vision()?;
+                        Ok(model)
+                    })
             } else {
                 load_model(&target, &engine_options)
             };
@@ -257,6 +262,14 @@ fn generate_once(
     commands: &mpsc::Receiver<EngineCommand>,
     mtp: bool,
 ) {
+    let mtp = mtp && request.images.is_none();
+    let route = if request.images.is_some() {
+        "plain_image"
+    } else if mtp {
+        "mtp"
+    } else {
+        "plain"
+    };
     let run_options = SpecOptions {
         count: request.max_new_tokens,
         ..options.clone()
@@ -270,7 +283,7 @@ fn generate_once(
         let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
         return;
     }
-    if request.images.is_some() && (mtp || run_options.backend.draft_model.is_some()) {
+    if request.images.is_some() && run_options.backend.draft_model.is_some() {
         let _ = events.blocking_send(EngineEvent::Failed(
             "image input does not support a draft model".into(),
         ));
@@ -355,7 +368,7 @@ fn generate_once(
     };
     let result = result.and_then(|output| {
         model.check_ready()?;
-        let mut record = serde_json::json!({"serve_request":{"prefill_ms":output.prefill_ms,"decode_ms":output.decode_ms,"initial_rounds":output.rounds.iter().take(2).collect::<Vec<_>>(),"mtp":mtp,"mtp_rounds":mtp_rounds}});
+        let mut record = serde_json::json!({"serve_request":{"prefill_ms":output.prefill_ms,"decode_ms":output.decode_ms,"initial_rounds":output.rounds.iter().take(2).collect::<Vec<_>>(),"mtp":mtp,"route":route,"mtp_rounds":mtp_rounds}});
         if std::env::var("FLYINGFISH_SERVE_TRACE_IDS").is_ok_and(|value| value == "1") {
             record["serve_request"]["generated_ids"] = serde_json::json!(output.ids);
             record["serve_request"]["aborted"] = serde_json::json!(aborted);

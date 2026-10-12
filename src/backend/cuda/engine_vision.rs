@@ -907,8 +907,20 @@ impl EncodedImages {
             stream,
             [u32::try_from(self.positions.feature_rows())?, OUTPUT],
         )?;
-        for range in self.positions.splices(first..end)? {
-            self.io.splice(stream, features, output, &range)?;
+        let splices = self.positions.splices(first..end)?;
+        for range in &splices {
+            self.io.splice(stream, features, output, range)?;
+        }
+        if !splices.is_empty()
+            && std::env::var("FLYINGFISH_SERVE_TRACE_IDS").is_ok_and(|value| value == "1")
+        {
+            eprintln!(
+                "{}",
+                serde_json::json!({"image_splice_hook": {
+                    "images": self.positions.slots().len(), "splice_calls": splices.len(),
+                    "feature_rows": self.positions.feature_rows(), "first": first, "end": end,
+                }})
+            );
         }
         Ok(())
     }

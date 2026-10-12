@@ -345,7 +345,12 @@ fn resolve_max_tokens(params: &CommonParams) -> Result<usize, Box<Response>> {
     }
 }
 
-fn check_validity(state: &AppState, ids: &[u32], max_tokens: usize) -> Result<(), Box<Response>> {
+fn check_validity(
+    state: &AppState,
+    ids: &[u32],
+    max_tokens: usize,
+    image: bool,
+) -> Result<(), Box<Response>> {
     let vocab_size = state.backend.vocab_size();
     if let Some(id) = ids.iter().find(|&&id| id as usize >= vocab_size) {
         return Err(Box::new(bad_request(&format!(
@@ -356,7 +361,7 @@ fn check_validity(state: &AppState, ids: &[u32], max_tokens: usize) -> Result<()
         count: max_tokens,
         ..state.backend.options()
     };
-    (if state.backend.mtp {
+    (if state.backend.mtp && !image {
         crate::mtp::check_request(ids.len(), max_tokens, options.capacity)
     } else {
         super::check_request(ids, &options)
@@ -452,7 +457,7 @@ async fn completions(
         Ok(v) => v,
         Err(response) => return *response,
     };
-    if let Err(response) = check_validity(&state, &ids, max_tokens) {
+    if let Err(response) = check_validity(&state, &ids, max_tokens, false) {
         return *response;
     }
     let prompt_tokens = ids.len();
@@ -567,7 +572,7 @@ async fn chat_completions(
             Err(error) => return bad_request(&format!("image input: {error}")),
         }
     };
-    if let Err(response) = check_validity(&state, &ids, max_tokens) {
+    if let Err(response) = check_validity(&state, &ids, max_tokens, images.is_some()) {
         return *response;
     }
     let prompt_tokens = ids.len();
@@ -606,7 +611,6 @@ fn prepare_message_images(
                     }
                 }
                 Some("image_url") => {
-                    anyhow::ensure!(!state.backend.mtp, "image input does not support MTP");
                     anyhow::ensure!(!is_system, "system messages cannot contain images");
                     anyhow::ensure!(
                         state.backend.options().backend.draft_model.is_none(),

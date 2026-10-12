@@ -51,6 +51,17 @@ pub struct MappedCheckpoint {
     #[cfg(feature = "cuda")]
     files: BTreeMap<String, File>,
 }
+
+pub fn has_mtp_component(dir: &Path) -> Result<bool> {
+    let path = dir.join("model.safetensors.index.json");
+    let index = if path.is_file() {
+        serde_json::from_slice::<Index>(&std::fs::read(path)?)?
+    } else {
+        MappedCheckpoint::open(dir)?.index
+    };
+    Ok(index.weight_map.keys().any(|name| name.starts_with("mtp.")))
+}
+
 impl MappedCheckpoint {
     pub fn open(dir: &Path) -> Result<Self> {
         let indexed = dir.join("model.safetensors.index.json");
@@ -457,4 +468,34 @@ pub struct TensorEntry {
 pub struct TensorManifest {
     pub entries: BTreeMap<String, TensorEntry>,
     pub resident_bytes: usize,
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::*;
+
+    #[test]
+    fn mtp_presence_comes_from_checkpoint_tensor_names() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("flyingfish-mtp-component-{}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("model.safetensors.index.json");
+        std::fs::write(
+            &path,
+            br#"{"weight_map":{"model.layers.0.weight":"model.safetensors"}}"#,
+        )?;
+        assert!(!has_mtp_component(&root)?);
+        std::fs::write(
+            &path,
+            br#"{"weight_map":{"mtp.fc.weight":"model.safetensors"}}"#,
+        )?;
+        assert!(has_mtp_component(&root)?);
+        std::fs::write(
+            &path,
+            br#"{"weight_map":{"mtp.fc.weight":"a","mtp.fc.weight":"b"}}"#,
+        )?;
+        assert!(has_mtp_component(&root).is_err());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }
