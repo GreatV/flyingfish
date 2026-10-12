@@ -59,6 +59,18 @@ impl<T: Copy, const R: usize> Tensor<T, R> {
             .context("tensor address overflow")?;
         Ok(())
     }
+
+    /// Narrow the logical leading dimension without relocating physical storage.
+    pub fn prefix_rows(self, rows: u32) -> Result<Self> {
+        self.validate()?;
+        ensure!(
+            rows > 0 && rows <= self.shape[0],
+            "rows outside tensor view"
+        );
+        let mut view = self;
+        view.shape[0] = rows;
+        Ok(view)
+    }
 }
 impl<T: Copy, const R: usize> TensorMut<T, R> {
     /// # Safety
@@ -124,6 +136,39 @@ impl Scratch {
         self.ptr
             .checked_add(self.bytes)
             .context("scratch address overflow")?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use half::bf16;
+
+    #[test]
+    fn prefix_rows_preserves_physical_projection_offsets() -> Result<()> {
+        // Synthetic addresses are used only for CPU layout validation.
+        let workspace = 2048u64;
+        for (offset, width) in [(0, 12288), (12288, 1024), (13312, 1024), (48, 48)] {
+            let full = Tensor::<bf16, 2> {
+                ptr: 0x1000 + workspace * offset * 2,
+                shape: [workspace as u32, width as u32],
+                stride: [width, 1],
+                span_bytes: workspace * width * 2,
+                marker: PhantomData,
+            };
+            for rows in 1..=4 {
+                let small = full.prefix_rows(rows)?;
+                small.validate()?;
+                assert_eq!(small.ptr, full.ptr);
+                assert_eq!(small.shape, [rows, width as u32]);
+                assert_eq!(small.stride, full.stride);
+                assert_eq!(small.span_bytes, full.span_bytes);
+            }
+            assert!(full.prefix_rows(0).is_err());
+            assert!(full.prefix_rows(workspace as u32 + 1).is_err());
+            assert!(full.prefix_rows(2)?.prefix_rows(3).is_err());
+        }
         Ok(())
     }
 }

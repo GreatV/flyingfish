@@ -96,7 +96,7 @@ struct Kernels {
 }
 
 pub(crate) struct FullAttentionPlan {
-    kernels: Kernels,
+    kernels: Arc<Kernels>,
     bindings: AttentionBindings,
     common: CommonOpsRef,
     limits: AttentionLimits,
@@ -108,6 +108,71 @@ pub(crate) struct FullAttentionPlan {
     scatter_cfg: LaunchConfig,
     phase1_cfg: LaunchConfig,
     phase2_cfg: LaunchConfig,
+}
+
+impl FullAttentionPlan {
+    /// Setup-only prefix view with the original coordinate mode and addresses.
+    pub(crate) fn for_rows(&self, rows: u32) -> Result<Self> {
+        ensure!(
+            rows > 0 && rows <= self.limits.max_rows,
+            "attention rows outside binding"
+        );
+        let b = &self.bindings;
+        let positions = match b.positions {
+            PositionBindings::Linear => PositionBindings::Linear,
+            PositionBindings::Axes(axes) => PositionBindings::Axes(axes.prefix_rows(rows)?),
+        };
+        let bindings = AttentionBindings {
+            q_gate: b.q_gate.prefix_rows(rows)?,
+            k: b.k.prefix_rows(rows)?,
+            v: b.v.prefix_rows(rows)?,
+            q: TensorMut(b.q.read().prefix_rows(rows)?),
+            gate: TensorMut(b.gate.read().prefix_rows(rows)?),
+            k_cache: TensorMut(b.k_cache.read()),
+            v_cache: TensorMut(b.v_cache.read()),
+            core_out: TensorMut(b.core_out.read().prefix_rows(rows)?),
+            q_norm: b.q_norm,
+            k_norm: b.k_norm,
+            causal_mask: b.causal_mask,
+            positions,
+        };
+        let limits = AttentionLimits {
+            max_rows: rows,
+            ..self.limits
+        };
+        check_limits(limits)?;
+        check_bindings(&bindings, limits)?;
+        let ws = AttentionWorkspace::q38(rows, limits.capacity, limits.key_chunk)?;
+        let segment_rows = u32::try_from(ws.segment_rows)?;
+        let mut split_cfg = self.split_cfg;
+        split_cfg.grid_dim.0 = rows
+            .checked_mul(HQ * D)
+            .context("split grid overflow")?
+            .div_ceil(PREP_THREADS);
+        let mut scatter_cfg = self.scatter_cfg;
+        scatter_cfg.grid_dim.0 = rows
+            .checked_mul(HKV * D)
+            .context("scatter grid overflow")?
+            .div_ceil(PREP_THREADS);
+        let mut phase1_cfg = self.phase1_cfg;
+        phase1_cfg.grid_dim.2 = (GQA * segment_rows).div_ceil(SEG_MAX);
+        let mut phase2_cfg = self.phase2_cfg;
+        phase2_cfg.grid_dim.0 = HQ * segment_rows;
+        Ok(Self {
+            kernels: self.kernels.clone(),
+            bindings,
+            common: self.common.clone(),
+            limits,
+            ws,
+            segment_rows,
+            max_parts: self.max_parts,
+            segments: rows.div_ceil(segment_rows),
+            split_cfg,
+            scatter_cfg,
+            phase1_cfg,
+            phase2_cfg,
+        })
+    }
 }
 
 pub(crate) struct FullAttentionOps;
@@ -309,7 +374,7 @@ impl FullAttentionOps {
             shared_mem_bytes: phase2_smem,
         };
         Ok(FullAttentionPlan {
-            kernels,
+            kernels: Arc::new(kernels),
             bindings,
             common,
             limits,

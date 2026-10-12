@@ -136,7 +136,7 @@ struct Kernels {
 }
 
 pub(crate) struct GdnPlan {
-    kernels: Kernels,
+    kernels: Arc<Kernels>,
     bindings: GdnBindings,
     common: CommonOpsRef,
     ws: GdnWorkspace,
@@ -151,6 +151,54 @@ pub(crate) struct GdnPlan {
     hist_cfg: LaunchConfig,
     chunked_cfg: LaunchConfig,
     recurrent_cfg: LaunchConfig,
+}
+
+impl GdnPlan {
+    /// Setup-only prefix view. Reuse loaded modules and physical addresses.
+    pub(crate) fn for_rows(&self, rows: u32) -> Result<Self> {
+        ensure!(
+            self.kernels.scan.is_none(),
+            "scan plan cannot narrow to legacy rows"
+        );
+        ensure!(
+            rows > 0 && rows <= self.max_rows,
+            "GDN rows outside binding"
+        );
+        let b = &self.bindings;
+        let bindings = GdnBindings {
+            qkv: b.qkv.prefix_rows(rows)?,
+            a: b.a.prefix_rows(rows)?,
+            b: b.b.prefix_rows(rows)?,
+            conv_weight: b.conv_weight,
+            a_log: b.a_log,
+            dt_bias: b.dt_bias,
+            core_out: TensorMut(b.core_out.read().prefix_rows(rows)?),
+            s: TensorMut(b.s.read()),
+            history: TensorMut(b.history.read()),
+        };
+        check_bindings(&bindings, rows, self.conv_dim)?;
+        let mut prep_cfg = self.prep_cfg;
+        prep_cfg.grid_dim.2 = rows;
+        let mut beta_cfg = self.beta_cfg;
+        beta_cfg.grid_dim.1 = rows;
+        let mut conv_cfg = self.conv_cfg;
+        conv_cfg.grid_dim.1 = rows.div_ceil(CONV_ROWS);
+        Ok(Self {
+            kernels: self.kernels.clone(),
+            bindings,
+            common: self.common.clone(),
+            ws: GdnWorkspace::q38(&GdnSpec::q38(), rows)?,
+            conv_dim: self.conv_dim,
+            l2_eps: self.l2_eps,
+            max_rows: rows,
+            prep_cfg,
+            beta_cfg,
+            conv_cfg,
+            hist_cfg: self.hist_cfg,
+            chunked_cfg: self.chunked_cfg,
+            recurrent_cfg: self.recurrent_cfg,
+        })
+    }
 }
 
 pub(crate) struct GdnOps;
@@ -282,7 +330,7 @@ impl GdnOps {
         // valid_rows, so a captured Graph replays an identical launch sequence.
         let conv_rows = max_rows.div_ceil(CONV_ROWS);
         Ok(GdnPlan {
-            kernels,
+            kernels: Arc::new(kernels),
             bindings,
             common,
             ws,

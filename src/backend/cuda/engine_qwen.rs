@@ -56,15 +56,51 @@ struct Layer {
 enum BoundMixer {
     Attention {
         prefill: Box<FullAttentionPlan>,
-        text_prefill: Box<FullAttentionPlan>,
+        text_prefill: PrefillPlans<FullAttentionPlan>,
         decode: Box<FullAttentionPlan>,
     },
     Gdn {
         norm: Tensor<bf16, 1>,
-        prefill: Box<GdnPlan>,
+        prefill: PrefillPlans<GdnPlan>,
         scan: Vec<(u32, Box<GdnPlan>)>,
         decode: Box<GdnPlan>,
     },
+}
+
+/// Prebound logical extents for MTP verify/replay. All plans share the Engine's
+/// existing allocations; projection offsets remain based on workspace_rows.
+struct PrefillPlans<T> {
+    full: Box<T>,
+    small: Vec<T>,
+    max_rows: usize,
+    #[cfg(test)]
+    force_full: bool,
+}
+impl<T> PrefillPlans<T> {
+    fn bind(full: T, max_rows: usize, narrow: impl Fn(&T, u32) -> Result<T>) -> Result<Self> {
+        ensure!(max_rows > 0, "prefill plan requires rows");
+        let small = (1..=4.min(max_rows))
+            .map(|rows| narrow(&full, rows as u32))
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            full: Box::new(full),
+            small,
+            max_rows,
+            #[cfg(test)]
+            force_full: false,
+        })
+    }
+    fn select(&self, rows: usize) -> Result<&T> {
+        ensure!(
+            rows > 0 && rows <= self.max_rows,
+            "prefill rows outside binding"
+        );
+        #[cfg(test)]
+        if self.force_full {
+            return Ok(&self.full);
+        }
+        Ok(self.small.get(rows - 1).unwrap_or(&self.full))
+    }
 }
 pub(super) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     b: &CudaSlice<T>,
@@ -298,7 +334,11 @@ impl Runtime {
                                 [3, 1],
                             )?),
                         )?),
-                        text_prefill: Box::new(bind(rows, PositionBindings::Linear)?),
+                        text_prefill: PrefillPlans::bind(
+                            bind(rows, PositionBindings::Linear)?,
+                            rows,
+                            FullAttentionPlan::for_rows,
+                        )?,
                         decode: Box::new(decode),
                     }
                 }
@@ -377,7 +417,7 @@ impl Runtime {
                         .collect::<Result<Vec<_>>>()?;
                     BoundMixer::Gdn {
                         norm: weight("linear_attn.norm.weight")?,
-                        prefill: Box::new(bind(rows, false)?),
+                        prefill: PrefillPlans::bind(bind(rows, false)?, rows, GdnPlan::for_rows)?,
                         decode: Box::new(bind(1, false)?),
                         scan,
                     }
@@ -442,6 +482,18 @@ impl Runtime {
     }
 }
 impl Engine {
+    #[cfg(test)]
+    pub(super) fn qwen_full_prefill_for_test(&mut self, full: bool) -> Result<()> {
+        let q = self.qwen.as_mut().context("Q38 runtime missing")?;
+        for layer in &mut q.layers {
+            match &mut layer.mixer {
+                BoundMixer::Attention { text_prefill, .. } => text_prefill.force_full = full,
+                BoundMixer::Gdn { prefill, .. } => prefill.force_full = full,
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn reset_qwen_positions(&mut self) -> Result<()> {
         if let Some(q) = self.qwen.as_mut() {
             let positions =
@@ -805,7 +857,7 @@ impl Engine {
                         let prefill = if self.images.is_some() {
                             prefill
                         } else {
-                            text_prefill
+                            text_prefill.select(rows)?
                         };
                         FullAttentionOps::preprocess(prefill, s, meta, scratch(&q.scratch, s))?;
                         let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
@@ -889,16 +941,15 @@ impl Engine {
                         .gdn_policy
                         .select(self.workspace_rows as u32, rows as u32, phase)?
                     {
-                        Some(bound) => {
-                            &scan
-                                .iter()
-                                .find(|(rows, _)| *rows == bound)
-                                .context("GDN structural bound has no prepared bucket")?
-                                .1
-                        }
+                        Some(bound) => scan
+                            .iter()
+                            .find(|(rows, _)| *rows == bound)
+                            .context("GDN structural bound has no prepared bucket")?
+                            .1
+                            .as_ref(),
                         None => match phase {
-                            ExecutionPhase::Prefill => prefill,
-                            ExecutionPhase::Decode => decode,
+                            ExecutionPhase::Prefill => prefill.select(rows)?,
+                            ExecutionPhase::Decode => decode.as_ref(),
                         },
                     };
                 GdnOps::run(plan, s, meta, phase, scratch(&q.scratch, s))?;
@@ -1169,6 +1220,43 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::prefill::{WorkspaceBudget, WorkspaceRequest};
+
+    #[test]
+    fn small_prefill_plans_select_structural_rows_without_rebinding() -> Result<()> {
+        for capacity in [1, 2, 3, 4, 5, 16, 2048, 4096] {
+            let plans = PrefillPlans::bind(capacity, capacity, |&full, rows| {
+                assert_eq!(full, capacity);
+                Ok(rows as usize)
+            })?;
+            assert_eq!(plans.small, (1..=4.min(capacity)).collect::<Vec<_>>());
+            for rows in 1..=capacity {
+                assert_eq!(
+                    *plans.select(rows)?,
+                    if rows <= 4 { rows } else { capacity }
+                );
+            }
+            assert!(plans.select(0).is_err());
+            assert!(plans.select(capacity + 1).is_err());
+            assert!(plans.select(usize::MAX).is_err());
+            let budget = Runtime::workspace(capacity, 4096, GdnPolicy::for_device(89, 128))? as u64;
+            for rows in 1..=4.min(capacity) {
+                assert!(
+                    GdnOps::workspace(
+                        &crate::op_contract::GdnSpec::q38(),
+                        rows as u32,
+                        GdnPolicy::LEGACY
+                    )?
+                    .bytes
+                        <= budget
+                );
+                assert!(
+                    FullAttentionOps::preprocess_workspace(limits(rows, 4096)?)?.bytes <= budget
+                );
+            }
+        }
+        assert!(PrefillPlans::bind(0, 0, |_, rows| Ok(rows as usize)).is_err());
+        Ok(())
+    }
 
     #[test]
     fn fa2_workspace_budget_includes_lse_and_decode_scratch() -> Result<()> {

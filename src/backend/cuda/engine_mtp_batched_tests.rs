@@ -89,7 +89,12 @@ fn proposals(e: &mut Engine, k: usize) -> Result<Vec<u32>> {
 // rows directly from C(P)'s H2 and that batch's H2 rows. It never invokes the
 // transaction controller, restore_mtp or repair_mtp.
 fn canonical(e: &mut Engine, inputs: &[u32]) -> Result<Vec<u32>> {
-    call(e, |b| {
+    ensure!(
+        !e.mtp.as_ref().context("MTP missing")?.options.graph,
+        "full-binding oracle must run eagerly"
+    );
+    e.qwen_full_prefill_for_test(true)?;
+    let result = call(e, |b| {
         let hidden = b.chain.last_target.clone();
         let predictions = b.verify_batch(inputs)?;
         let frame = b
@@ -111,7 +116,9 @@ fn canonical(e: &mut Engine, inputs: &[u32]) -> Result<Vec<u32>> {
         b.chain.last_target = frame[(inputs.len() - 1) * HIDDEN..].to_vec();
         b.chain.committed_position = b.engine.position;
         Ok(predictions)
-    })
+    });
+    e.qwen_full_prefill_for_test(false)?;
+    result
 }
 fn receipt(name: &str, value: serde_json::Value) -> Result<()> {
     std::fs::write(
