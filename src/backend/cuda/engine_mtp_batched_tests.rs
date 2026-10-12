@@ -87,11 +87,12 @@ fn proposals(e: &mut Engine, k: usize) -> Result<Vec<u32>> {
 }
 // Independent same-partition rebuild: one target batch, then canonical MTP
 // rows directly from C(P)'s H2 and that batch's H2 rows. It never invokes the
-// transaction controller, restore_mtp or repair_mtp.
+// transaction controller, restore_mtp or repair_mtp. Keep the prepared R-row
+// core: a full C32 binding has a different floating-point evaluation order.
 fn canonical(e: &mut Engine, inputs: &[u32]) -> Result<Vec<u32>> {
     ensure!(
         !e.mtp.as_ref().context("MTP missing")?.options.graph,
-        "full-binding oracle must run eagerly"
+        "same-partition oracle must run eagerly"
     );
     e.qwen_full_prefill_for_test(true)?;
     let result = call(e, |b| {
