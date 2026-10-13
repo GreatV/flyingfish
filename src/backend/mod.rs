@@ -122,6 +122,8 @@ pub struct Settings {
     pub spec_graph: bool,
     #[arg(skip)]
     pub draft_model: Option<std::path::PathBuf>,
+    #[arg(long, global = true, default_value_t = false, action = clap::ArgAction::Set)]
+    pub prefix_cache: bool,
     #[arg(long, global = true, env = "FLYINGFISH_RUNTIME_DIR")]
     pub runtime_dir: Option<std::path::PathBuf>,
 }

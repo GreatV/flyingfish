@@ -131,6 +131,7 @@ impl Engine {
                     .capture_checkpoint
                     .restore(&mut self.state, &mut self.work.token, &s)?;
                 s.memcpy_htod(&logits, &mut self.work.logits)?;
+                self.logits_cache.mark_valid();
                 s.synchronize()?;
                 #[cfg(test)]
                 ensure!(
@@ -158,6 +159,7 @@ impl Engine {
                     .capture_checkpoint
                     .restore(&mut self.state, &mut self.work.token, &s)?;
                 s.memcpy_htod(&logits, &mut self.work.logits)?;
+                self.logits_cache.mark_valid();
                 s.synchronize()?;
                 graphs.push(graph);
             }
@@ -168,6 +170,7 @@ impl Engine {
                 .capture_checkpoint
                 .restore(&mut self.state, &mut self.work.token, &s)?;
             s.memcpy_htod(&logits, &mut self.work.logits)?;
+            self.logits_cache.mark_valid();
             s.synchronize()?;
             Ok(())
         })();
@@ -260,6 +263,7 @@ impl Engine {
             &batch.predictions.slice(rows - 1..rows),
             &mut self.work.token,
         )?;
+        self.logits_cache.mark_valid();
         Ok(())
     }
 

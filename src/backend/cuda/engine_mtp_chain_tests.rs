@@ -25,6 +25,7 @@ pub(super) fn load_capacity(write: bool, capacity: usize) -> Result<Engine> {
             spec_graph: false,
             draft_model: None,
             runtime_dir: Some(runtime),
+            prefix_cache: false,
         },
         write,
     )

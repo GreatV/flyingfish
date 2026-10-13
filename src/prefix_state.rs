@@ -8,12 +8,10 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use crate::{
-    checkpoint::MappedCheckpoint,
     model_spec::{Architecture, Mixer, ModelSpec},
     op_contract::GdnSpec,
 };
@@ -25,135 +23,6 @@ pub fn sha256(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     encode_hex(&h.finalize())
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PrefixFileFingerprint {
-    pub name: String,
-    pub device: u64,
-    pub inode: u64,
-    pub size: u64,
-    pub mtime_seconds: i64,
-    pub mtime_nanoseconds: i64,
-}
-
-fn fingerprint(dir: &Path, name: &str) -> Result<PrefixFileFingerprint> {
-    let path = dir.join(name);
-    let metadata =
-        std::fs::metadata(&path).with_context(|| format!("stat prefix identity file {name}"))?;
-    Ok(PrefixFileFingerprint {
-        name: name.to_owned(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        size: metadata.size(),
-        mtime_seconds: metadata.mtime(),
-        mtime_nanoseconds: metadata.mtime_nsec(),
-    })
-}
-
-pub fn checkpoint_file_fingerprints(
-    dir: &Path,
-    spec: &ModelSpec,
-) -> Result<Vec<PrefixFileFingerprint>> {
-    let (selected, _) = loaded_weight_shards(dir, spec)?;
-    let mut names = vec!["config.json".to_owned()];
-    if dir.join("model.safetensors.index.json").is_file() {
-        names.push("model.safetensors.index.json".to_owned());
-    }
-    names.extend(selected.into_iter().map(|(name, _)| name));
-    fingerprints_for_names(dir, names)
-}
-
-fn fingerprints_for_names(dir: &Path, names: Vec<String>) -> Result<Vec<PrefixFileFingerprint>> {
-    names
-        .into_iter()
-        .map(|name| fingerprint(dir, &name))
-        .collect()
-}
-
-pub fn validate_transfer_bytes(bytes: usize) -> Result<()> {
-    ensure!(bytes > 0, "prefix transfer bytes must be nonzero");
-    ensure!(
-        bytes.is_multiple_of(16),
-        "prefix transfer bytes must be 16-byte aligned"
-    );
-    Ok(())
-}
-
-fn file_sha256(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("open identity file {}", path.display()))?;
-    let mut h = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .with_context(|| format!("read identity file {}", path.display()))?;
-        if count == 0 {
-            break;
-        }
-        h.update(&buffer[..count]);
-    }
-    Ok(encode_hex(&h.finalize()))
-}
-
-type WeightRanges = Vec<(u64, u64)>;
-
-fn loaded_weight_shards(
-    dir: &Path,
-    spec: &ModelSpec,
-) -> Result<(Vec<(String, WeightRanges)>, String)> {
-    let mapped = MappedCheckpoint::open(dir)?;
-    let manifest = mapped.q38_manifest(spec)?;
-    let mut by_shard: BTreeMap<String, WeightRanges> = BTreeMap::new();
-    for entry in manifest.entries.values().filter(|entry| entry.load) {
-        let start = entry
-            .data_start
-            .checked_add(entry.data_offsets[0])
-            .context("loaded tensor start overflow")?;
-        let len = entry.data_offsets[1]
-            .checked_sub(entry.data_offsets[0])
-            .context("invalid loaded tensor extent")?;
-        by_shard
-            .entry(entry.shard.clone())
-            .or_default()
-            .push((start, len));
-    }
-    ensure!(
-        !by_shard.is_empty(),
-        "prefix identity has no loaded weights"
-    );
-    let mut shards: Vec<_> = by_shard.into_iter().collect();
-    for ranges in &mut shards {
-        ranges.1.sort_unstable();
-    }
-    let manifest_sha = sha256(&canonical(&manifest)?);
-    Ok((shards, manifest_sha))
-}
-
-fn selected_file_bytes_sha256(path: &Path, ranges: &WeightRanges) -> Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut h = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
-    for &(start, len) in ranges {
-        h.update(start.to_le_bytes());
-        h.update(len.to_le_bytes());
-        file.seek(SeekFrom::Start(start))
-            .with_context(|| format!("seek identity weight bytes {}", path.display()))?;
-        let mut left = len;
-        while left > 0 {
-            let want = buffer
-                .len()
-                .min(usize::try_from(left).context("range length overflow")?);
-            let got = file
-                .read(&mut buffer[..want])
-                .with_context(|| format!("read identity weight bytes {}", path.display()))?;
-            ensure!(got > 0, "identity weight range ended early");
-            h.update(&buffer[..got]);
-            left -= u64::try_from(got).context("read length overflow")?;
-        }
-    }
-    Ok(encode_hex(&h.finalize()))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -185,6 +54,55 @@ pub struct PrefixIdentity {
     pub tensor_semantics: PrefixTensorSemantics,
 }
 
+pub fn validate_transfer_bytes(bytes: usize) -> Result<()> {
+    ensure!(bytes > 0, "prefix transfer bytes must be nonzero");
+    ensure!(
+        bytes.is_multiple_of(16),
+        "prefix transfer bytes must be 16-byte aligned"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PrefixLogitsCache {
+    valid: bool,
+}
+
+impl PrefixLogitsCache {
+    pub fn mark_valid(&mut self) {
+        self.valid = true;
+    }
+
+    pub fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    pub fn read(&self) -> Result<()> {
+        ensure!(
+            self.valid,
+            "decode logits are invalid after prefix restore; run one step or prefill first"
+        );
+        Ok(())
+    }
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open identity file {}", path.display()))?;
+    let mut h = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("read identity file {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        h.update(&buffer[..count]);
+    }
+    Ok(encode_hex(&h.finalize()))
+}
+
 impl PrefixIdentity {
     pub fn new(
         model_id: impl Into<String>,
@@ -212,152 +130,70 @@ impl PrefixIdentity {
         })
     }
 
-    /// Derive checkpoint identity from actual local bytes, not caller labels.
-    ///
-    /// Every loaded safetensors byte range is streamed and hashed in parallel by
-    /// shard.  Config/index/tokenizer metadata and the canonical ModelSpec are
-    /// included as well; no optional checksum file is trusted.  This function is
-    /// intentionally lazy at save/restore time because tokenizer files are not
-    /// required merely to load and serve model weights.
-    pub fn for_checkpoint(dir: &Path, rope: &str, spec: &ModelSpec) -> Result<Self> {
-        Self::for_checkpoint_with_fingerprints(dir, rope, spec, None)
-    }
-
-    pub fn for_checkpoint_with_fingerprints(
+    /// Build identity from the SHA-256 computed while the exact upload bytes
+    /// were read.  This is deliberately not lazy and never re-reads weight files.
+    pub fn from_prefix_cache(
         dir: &Path,
         rope: &str,
         spec: &ModelSpec,
-        expected: Option<&[PrefixFileFingerprint]>,
+        upload_content_sha256: &str,
+        upload_hashed_bytes: usize,
     ) -> Result<Self> {
-        if let Some(expected) = expected {
-            let actual = checkpoint_file_fingerprints(dir, spec)?;
-            ensure!(
-                actual.as_slice() == expected,
-                "checkpoint identity files changed after engine load"
-            );
-        }
         let config = dir.join("config.json");
         let index = dir.join("model.safetensors.index.json");
         let tokenizer_json = dir.join("tokenizer.json");
         let tokenizer_config = dir.join("tokenizer_config.json");
-
         let config_sha = file_sha256(&config)?;
         let index_sha = if index.is_file() {
-            Some(file_sha256(&index)?)
+            file_sha256(&index)?
         } else {
-            None
+            "single-file-model.safetensors".to_owned()
         };
-        let model_id = format!("config-sha256:{config_sha}");
         for path in [&tokenizer_json, &tokenizer_config] {
             ensure!(
                 path.is_file(),
-                "prefix identity requires {}",
+                "prefix-cache identity requires {}",
                 path.display()
             );
         }
-
-        let (selected, loaded_manifest_sha) = loaded_weight_shards(dir, spec)?;
-        let hashed_weight_bytes = selected
-            .iter()
-            .map(|(_, ranges)| ranges.iter().map(|&(_, len)| len).sum::<u64>())
-            .try_fold(0usize, |sum, len| {
-                sum.checked_add(usize::try_from(len).context("weight byte overflow")?)
-                    .context("weight byte total overflow")
-            })?;
-        let shards: Vec<_> = selected
-            .into_iter()
-            .map(|(name, ranges)| {
-                let path = dir.join(&name);
-                (name, path, ranges)
-            })
-            .collect();
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, 8)
-            .min(shards.len());
-        let mut hashed = Vec::new();
-        std::thread::scope(|scope| -> Result<()> {
-            let mut handles = Vec::with_capacity(workers);
-            for worker in 0..workers {
-                let shards = &shards;
-                handles.push(scope.spawn(move || -> Result<Vec<(usize, String)>> {
-                    let mut output = Vec::new();
-                    for position in (worker..shards.len()).step_by(workers) {
-                        let (name, path, ranges) = &shards[position];
-                        let digest = selected_file_bytes_sha256(path, ranges)
-                            .with_context(|| format!("hash model shard {name}"))?;
-                        output.push((position, digest));
-                    }
-                    Ok(output)
-                }));
-            }
-            for handle in handles {
-                let output = handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("model shard hash worker panicked"))??;
-                hashed.extend(output);
-            }
-            Ok(())
-        })?;
-        hashed.sort_unstable_by_key(|(position, _)| *position);
-        ensure!(
-            hashed.len() == shards.len(),
-            "model shard hash coverage mismatch"
-        );
-        let digests: Vec<_> = hashed.into_iter().map(|(_, digest)| digest).collect();
-
+        let mut tokenizer = Sha256::new();
+        for path in [tokenizer_json, tokenizer_config] {
+            let digest = file_sha256(&path)?;
+            tokenizer.update(
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or(""),
+            );
+            tokenizer.update([0]);
+            tokenizer.update(digest.as_bytes());
+            tokenizer.update([0]);
+        }
         let mut revision = Sha256::new();
         for (name, digest) in [
-            ("config.json", config_sha),
-            (
-                "model.safetensors.index.json",
-                index_sha.unwrap_or_else(|| "absent".to_owned()),
-            ),
-            ("loaded-tensor-manifest", loaded_manifest_sha),
+            ("config.json", config_sha.clone()),
+            ("model.safetensors.index.json", index_sha),
+            ("uploaded-tensor-bytes", upload_content_sha256.to_owned()),
         ] {
             revision.update(name.as_bytes());
             revision.update([0]);
             revision.update(digest.as_bytes());
             revision.update([0]);
         }
-        for ((name, _, _), digest) in shards.into_iter().zip(digests) {
-            revision.update(name.as_bytes());
-            revision.update([0]);
-            revision.update(digest.as_bytes());
-            revision.update([0]);
-        }
-        let model_revision = format!(
-            "checkpoint-bytes-sha256:{}",
-            encode_hex(&revision.finalize())
-        );
-
-        let mut tokenizer = Sha256::new();
-        for path in [tokenizer_json, tokenizer_config] {
-            ensure!(
-                path.is_file(),
-                "prefix identity requires {}",
-                path.display()
-            );
-            let name = path
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or("")
-                .to_owned();
-            let digest = file_sha256(&path)?;
-            tokenizer.update(name.as_bytes());
-            tokenizer.update([0]);
-            tokenizer.update(digest.as_bytes());
-            tokenizer.update([0]);
-        }
-        let tokenizer_identity = format!("tokenizer-sha256:{}", encode_hex(&tokenizer.finalize()));
-        let mut identity = Self::new(model_id, model_revision, tokenizer_identity, rope, spec)?;
-        identity.hashed_weight_bytes = hashed_weight_bytes;
+        let identity = Self::new(
+            format!("config-sha256:{config_sha}"),
+            format!("uploaded-bytes-sha256:{:x}", revision.finalize()),
+            format!("tokenizer-sha256:{:x}", tokenizer.finalize()),
+            rope,
+            spec,
+        )?;
         ensure!(
-            identity.hashed_weight_bytes > 0,
-            "prefix identity did not hash actual weight bytes"
+            upload_hashed_bytes > 0 && identity.hashed_weight_bytes == 0,
+            "invalid prefix-cache upload byte accounting"
         );
-        Ok(identity)
+        Ok(Self {
+            hashed_weight_bytes: upload_hashed_bytes,
+            ..identity
+        })
     }
 
     fn validate(&self) -> Result<()> {
@@ -484,7 +320,7 @@ pub struct PrefixSaveReceipt {
     pub state_root: String,
     pub total_state_bytes: usize,
     pub transfer_bytes: usize,
-    pub identity_hash_ms: f64,
+    pub identity_load_ms: f64,
     pub identity_hashed_bytes: usize,
     pub wall_ms: f64,
 }
@@ -495,7 +331,7 @@ pub struct PrefixRestoreReceipt {
     pub state_root: String,
     pub total_state_bytes: usize,
     pub transfer_bytes: usize,
-    pub identity_hash_ms: f64,
+    pub identity_load_ms: f64,
     pub identity_hashed_bytes: usize,
     pub wall_ms: f64,
 }
@@ -1364,38 +1200,24 @@ mod tests {
     }
 
     #[test]
-    fn identity_hash_changes_for_actual_selected_weight_bytes() -> Result<()> {
+    fn prefix_cache_identity_uses_exact_upload_digest_and_single_file_layout() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
-            "flyingfish-prefix-weight-identity-{}-{}",
+            "flyingfish-prefix-cache-identity-{}-{}",
             std::process::id(),
             line!()
         ));
         std::fs::create_dir_all(&root)?;
-        let shard = root.join("shard-a.bin");
-        std::fs::write(&shard, b"actual-weight-bytes-a")?;
-        let ranges = vec![(0u64, shard.metadata()?.len())];
-        let first = selected_file_bytes_sha256(&shard, &ranges)?;
-        std::fs::write(&shard, b"actual-weight-bytes-b")?;
-        let second = selected_file_bytes_sha256(&shard, &ranges)?;
+        std::fs::write(root.join("config.json"), b"config")?;
+        std::fs::write(root.join("model.safetensors"), b"weights")?;
+        std::fs::write(root.join("tokenizer.json"), b"tokenizer")?;
+        std::fs::write(root.join("tokenizer_config.json"), b"tokenizer-config")?;
+        let spec = spec();
+        let first = PrefixIdentity::from_prefix_cache(&root, "rope", &spec, "digest-a", 3)?;
+        first.validate()?;
+        let second = PrefixIdentity::from_prefix_cache(&root, "rope", &spec, "digest-b", 3)?;
         assert_ne!(first, second);
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn lazy_identity_requires_tokenizer_files_before_hashing() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "flyingfish-prefix-tokenizer-identity-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::create_dir_all(&root)?;
-        std::fs::write(root.join("config.json"), b"config-a")?;
-        std::fs::write(root.join("model.safetensors.index.json"), b"index-a")?;
-        let err = PrefixIdentity::for_checkpoint(&root, "rope-a", &spec())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("tokenizer.json"), "{err}");
+        assert_eq!(second.hashed_weight_bytes, 3);
+        assert!(!root.join("model.safetensors.index.json").exists());
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -1408,46 +1230,14 @@ mod tests {
     }
 
     #[test]
-    fn identity_fingerprint_detects_file_replacement() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "flyingfish-prefix-fingerprint-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::create_dir_all(&root)?;
-        std::fs::write(root.join("shard.bin"), b"first")?;
-        let first = fingerprint(&root, "shard.bin")?;
-        std::fs::write(root.join("shard.bin"), b"second")?;
-        let second = fingerprint(&root, "shard.bin")?;
-        assert_ne!(first, second);
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn single_file_checkpoint_fingerprints_do_not_require_index() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "flyingfish-prefix-single-file-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::create_dir_all(&root)?;
-        std::fs::write(root.join("config.json"), b"config")?;
-        std::fs::write(root.join("model.safetensors"), b"safetensors")?;
-        let fingerprints = fingerprints_for_names(
-            &root,
-            vec!["config.json".into(), "model.safetensors".into()],
-        )?;
-        assert_eq!(
-            fingerprints
-                .iter()
-                .map(|x| x.name.as_str())
-                .collect::<Vec<_>>(),
-            ["config.json", "model.safetensors"]
-        );
-        assert!(!root.join("model.safetensors.index.json").exists());
-        std::fs::remove_dir_all(root)?;
-        Ok(())
+    fn restored_logits_are_invalid_until_next_forward() {
+        let mut cache = PrefixLogitsCache::default();
+        assert!(cache.read().is_err());
+        cache.mark_valid();
+        assert!(cache.read().is_ok());
+        cache.invalidate();
+        let error = cache.read().unwrap_err().to_string();
+        assert!(error.contains("decode logits are invalid"), "{error}");
     }
 
     #[test]

@@ -53,6 +53,8 @@ struct Args {
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
     #[arg(long)]
+    prefix_cache: bool,
+    #[arg(long)]
     expected_identity: Option<PathBuf>,
 }
 
@@ -135,6 +137,7 @@ fn main() -> Result<()> {
             spec_graph: true,
             draft_model: None,
             runtime_dir: args.runtime_dir.clone(),
+            prefix_cache: args.prefix_cache,
         };
         let mut engine = Backend::load(&args.model, args.device, args.capacity, None, settings)?;
         engine.prefill(&prefix, None)?;
@@ -212,7 +215,7 @@ fn main() -> Result<()> {
         );
         drop(negative_readback);
         let committed_decode_token = saved.snapshot.manifest.boundary.pending_next_token;
-        engine.step(false)?;
+        engine.step(true)?;
         let mut decoded_prefix = prefix.clone();
         decoded_prefix.push(committed_decode_token);
         let decoded_saved = engine.save_text_prefix(TextPrefixSaveRequest {
@@ -227,7 +230,7 @@ fn main() -> Result<()> {
             "decoded boundary pending token changed before save completed"
         );
         let decoded_boundary_logits = engine.decode_logits()?;
-        engine.step(false)?;
+        engine.step(true)?;
         let baseline_pending_token = engine.token()?;
         let baseline_pending_logits = engine.decode_logits()?;
         let baseline_token = engine.prefill(&suffix, None)?;
@@ -260,7 +263,16 @@ fn main() -> Result<()> {
             restored_boundary_pending_token == decoded_boundary_pending_token,
             "restored boundary pending token differs before the compared decode step"
         );
-        engine.step(false)?;
+        let stale_logits_error = engine
+            .decode_logits()
+            .expect_err("decode logits must be invalid immediately after restore");
+        ensure!(
+            stale_logits_error
+                .to_string()
+                .contains("decode logits are invalid after prefix restore"),
+            "unexpected stale-logits rejection: {stale_logits_error}"
+        );
+        engine.step(true)?;
         let restored_pending_token = engine.token()?;
         let restored_pending_logits = engine.decode_logits()?;
         ensure!(
@@ -331,6 +343,8 @@ fn main() -> Result<()> {
             "manifest_only_foreign_rejected_by_internal_consistency": true,
             "internally_consistent_foreign_rejected_by_engine_identity": true,
             "foreign_identity_rejected_before_mutation": true,
+            "restored_logits_invalid_until_step": true,
+            "post_restore_step_used_graph": true,
             "post_foreign_identity_readback_state_root":
                 saved.snapshot.manifest.state_root.clone(),
             "restore": restore,

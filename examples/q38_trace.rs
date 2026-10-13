@@ -76,6 +76,7 @@ fn main() -> Result<()> {
         spec_graph: false,
         draft_model: None,
         runtime_dir: Some(paths[3].clone()),
+        prefix_cache: false,
     };
     let mut model = Model::load(&paths[0], 0, capacity, Some(chunk), settings)?;
     model.check_ready()?;

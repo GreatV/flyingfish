@@ -9,7 +9,6 @@ use crate::backend::cuda::{
     weights::WeightCatalog,
 };
 use crate::gdn_plan::GdnPolicy;
-use crate::prefix_state::checkpoint_file_fingerprints;
 use crate::{
     linear_plan::LayerDequantPlan,
     model_spec::Mixer,
@@ -706,7 +705,35 @@ impl Engine {
         ));
         let device = Device::new(ordinal)?;
         let gdn_policy = GdnPolicy::for_device(device.info.arch, device.info.sms);
-        let mut catalog = WeightCatalog::load(dir, &model_spec, &device)?;
+        let prefix_cache = settings.prefix_cache;
+        let mut catalog = if prefix_cache {
+            WeightCatalog::load_for_prefix_cache(dir, &model_spec, &device)?
+        } else {
+            WeightCatalog::load(dir, &model_spec, &device)?
+        };
+        let prefix_identity_load_ms = catalog.load_wall_ms;
+        let prefix_identity = if prefix_cache {
+            let upload_sha = catalog
+                .upload_content_sha256
+                .clone()
+                .context("prefix-cache upload hash missing")?;
+            let upload_bytes = catalog
+                .upload_hashed_bytes
+                .context("prefix-cache upload byte count missing")?;
+            ensure!(
+                upload_bytes == catalog.bytes,
+                "prefix-cache upload hash byte count differs from uploaded weights"
+            );
+            Some(PrefixIdentity::from_prefix_cache(
+                dir,
+                &text_rope_context_sha256(capacity)?,
+                &model_spec,
+                &upload_sha,
+                upload_bytes,
+            )?)
+        } else {
+            None
+        };
         let weights = catalog.take_globals()?;
         let s = &device.stream;
         let state = super::super::state::StateStore::new(&model_spec, capacity, s)?;
@@ -789,6 +816,11 @@ impl Engine {
                 "q38_memory_plan": budget,
                 "mtp_attachment_planned_bytes": if reserve_mtp { crate::mtp::attachment_bytes(&model_spec, capacity, rows, true)? } else { 0 },
                 "resident_weights_bytes": weights.bytes,
+                "prefix_cache": {
+                    "enabled": prefix_cache,
+                    "load_wall_ms": prefix_identity_load_ms,
+                    "hashed_bytes": catalog.upload_hashed_bytes.unwrap_or(0)
+                },
                 "persistent_state_bytes": state.bytes(),
                 "capture_checkpoint_bytes": capture_checkpoint.as_ref().context("capture checkpoint missing")?.bytes(),
                 "layer_arena_bytes": arena_bytes,
@@ -811,7 +843,6 @@ impl Engine {
         let work = Work::new(s, &model_spec, rows)?;
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
         let config = model_spec.config();
-        let prefix_file_fingerprints = Some(checkpoint_file_fingerprints(dir, &model_spec)?);
         let mut engine = Self {
             #[cfg(test)]
             capture_fail_after_layer: None,
@@ -846,9 +877,9 @@ impl Engine {
             workspace_rows: rows,
             trace_layer: 0,
             position: 0,
-            prefix_identity: None,
-            prefix_identity_hash_ms: None,
-            prefix_file_fingerprints,
+            prefix_identity,
+            prefix_identity_load_ms,
+            logits_cache: PrefixLogitsCache::default(),
             committed_prefix_ids: Vec::new(),
             pending_token: None,
             resident_ids_len: 0,

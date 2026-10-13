@@ -11,8 +11,8 @@ use crate::{
     backend::{Event, Head, Logits, Settings, SpecBudget, Target, TreeBuilder},
     config::Config,
     prefix_state::{
-        PrefixBoundary, PrefixBuilder, PrefixFileFingerprint, PrefixGeometry, PrefixIdentity,
-        PrefixLastInputKind, PrefixRecordKind, PrefixRestoreReceipt, PrefixSaveReceipt,
+        PrefixBoundary, PrefixBuilder, PrefixGeometry, PrefixIdentity, PrefixLastInputKind,
+        PrefixLogitsCache, PrefixRecordKind, PrefixRestoreReceipt, PrefixSaveReceipt,
         PrefixSnapshot, sha256, token_ids_sha256, validate_transfer_bytes,
     },
     trace::Trace,
@@ -436,8 +436,8 @@ pub struct Engine {
     trace_layer: usize,
     position: usize,
     prefix_identity: Option<PrefixIdentity>,
-    prefix_identity_hash_ms: Option<f64>,
-    prefix_file_fingerprints: Option<Vec<PrefixFileFingerprint>>,
+    prefix_identity_load_ms: f64,
+    logits_cache: PrefixLogitsCache,
     committed_prefix_ids: Vec<u32>,
     pending_token: Option<u32>,
     resident_ids_len: usize,
@@ -750,8 +750,8 @@ impl Engine {
             trace_layer: 0,
             position: 0,
             prefix_identity: None,
-            prefix_identity_hash_ms: None,
-            prefix_file_fingerprints: None,
+            prefix_identity_load_ms: 0.0,
+            logits_cache: PrefixLogitsCache::default(),
             committed_prefix_ids: Vec::new(),
             pending_token: None,
             resident_ids_len: 0,
@@ -1166,7 +1166,13 @@ impl Engine {
         for i in 0..self.config.num_hidden_layers {
             self.run_layer(i, step, &mut trace)?;
         }
-        self.run_operator(crate::backend::Operator::Head, 0, step, &mut trace)
+        self.run_operator(crate::backend::Operator::Head, 0, step, &mut trace)?;
+        if step.head == Head::None {
+            self.logits_cache.invalidate();
+        } else {
+            self.logits_cache.mark_valid();
+        }
+        Ok(())
     }
 
     /// Host-side validation for the tree step. The metadata kernel is no longer
@@ -1711,6 +1717,7 @@ impl Engine {
             spec.active_rows = 0;
         }
         self.position = 0;
+        self.logits_cache.invalidate();
         self.committed_prefix_ids.clear();
         self.pending_token = None;
         self.resident_ids_len = 0;
@@ -1747,35 +1754,13 @@ impl Engine {
             .memcpy_htod(&[1i32], &mut self.work.length)?;
         self.set_token(0)?;
         self.position = 0;
+        self.logits_cache.invalidate();
         self.committed_prefix_ids.clear();
         self.pending_token = Some(0);
         self.resident_ids_len = 0;
         self.last_input_kind = None;
         self.device.stream.synchronize()?;
         Ok(())
-    }
-
-    fn ensure_text_prefix_identity(&mut self) -> Result<(PrefixIdentity, f64)> {
-        if let Some(identity) = self.prefix_identity.clone() {
-            return Ok((identity, 0.0));
-        }
-        let qwen = self
-            .qwen
-            .as_ref()
-            .context("text prefix identity requires Qwen3.8")?;
-        let checkpoint_dir = qwen.checkpoint_path().to_owned();
-        let fingerprints = self.prefix_file_fingerprints.clone();
-        let started = Instant::now();
-        let identity = PrefixIdentity::for_checkpoint_with_fingerprints(
-            &checkpoint_dir,
-            &text_rope_context_sha256(self.capacity)?,
-            &self.model_spec,
-            fingerprints.as_deref(),
-        )?;
-        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-        self.prefix_identity = Some(identity.clone());
-        self.prefix_identity_hash_ms = Some(elapsed);
-        Ok((identity, elapsed))
     }
 
     pub fn save_text_prefix(
@@ -1794,7 +1779,11 @@ impl Engine {
             self.spec.as_ref().is_none_or(|spec| spec.active_rows == 0),
             "cannot save during a speculative transaction"
         );
-        let (prefix_identity, identity_hash_ms) = self.ensure_text_prefix_identity()?;
+        let prefix_identity = self
+            .prefix_identity
+            .clone()
+            .context("prefix save requires --prefix-cache at engine load")?;
+        let identity_load_ms = self.prefix_identity_load_ms;
         let prefix = request.prefix_ids.len();
         ensure!(
             prefix > 0 && prefix == self.position,
@@ -1898,7 +1887,7 @@ impl Engine {
             state_root: snapshot.manifest.state_root.clone(),
             total_state_bytes: snapshot.manifest.total_state_bytes,
             transfer_bytes: request.transfer_bytes,
-            identity_hash_ms,
+            identity_load_ms,
             identity_hashed_bytes: prefix_identity.hashed_weight_bytes,
             wall_ms: started.elapsed().as_secs_f64() * 1000.0,
         };
@@ -2010,7 +1999,11 @@ impl Engine {
             self.spec.as_ref().is_none_or(|spec| spec.active_rows == 0),
             "cannot restore during a speculative transaction"
         );
-        let (prefix_identity, identity_hash_ms) = self.ensure_text_prefix_identity()?;
+        let prefix_identity = self
+            .prefix_identity
+            .clone()
+            .context("prefix restore requires --prefix-cache at engine load")?;
+        let identity_load_ms = self.prefix_identity_load_ms;
         ensure!(
             snapshot.manifest.identity == prefix_identity,
             "prefix snapshot identity differs from the loaded engine"
@@ -2030,6 +2023,7 @@ impl Engine {
         );
         let ring = pinned_transfer_ring(&self.device.ctx, intent.transfer_bytes)?;
         self.device.stream.synchronize()?;
+        self.logits_cache.invalidate();
         self.poisoned = true;
         let result = self.restore_text_prefix_from(snapshot, intent.prefix_ids, ring);
         if let Err(error) = result {
@@ -2044,12 +2038,13 @@ impl Engine {
             spec.active_rows = 0;
         }
         self.poisoned = false;
+        // It remains invalid until the restored pending token is actually run.
         Ok(PrefixRestoreReceipt {
             prefix_tokens: snapshot.manifest.boundary.prefix_tokens,
             state_root: snapshot.manifest.state_root.clone(),
             total_state_bytes: snapshot.manifest.total_state_bytes,
             transfer_bytes: intent.transfer_bytes,
-            identity_hash_ms,
+            identity_load_ms,
             identity_hashed_bytes: prefix_identity.hashed_weight_bytes,
             wall_ms: started.elapsed().as_secs_f64() * 1000.0,
         })
@@ -2306,6 +2301,7 @@ impl Engine {
                 self.poisoned = true;
                 return Err(error.into());
             }
+            self.logits_cache.mark_valid();
         } else {
             self.run_decode_step(trace.map(|(trace, prefix)| Target {
                 trace,
@@ -2466,6 +2462,7 @@ impl Engine {
     }
 
     pub fn decode_logits(&self) -> Result<Vec<f32>> {
+        self.logits_cache.read()?;
         let values = self
             .device
             .stream
@@ -2498,6 +2495,7 @@ impl Engine {
     }
 
     pub fn copy_logits(&self, dst: &mut Logits, step: usize) -> Result<()> {
+        self.logits_cache.read()?;
         let width = self.config.vocab_size;
         ensure!(
             (step + 1)
@@ -2990,6 +2988,7 @@ impl Engine {
             s.memcpy_htod(&[(plan.position + 1) as i32], &mut self.work.length)?;
             s.memcpy_htod(&[plan.next], &mut self.work.token)?;
             s.synchronize()?;
+            self.logits_cache.mark_valid();
             tree.finish(plan, predictions, eos, &mut cursor)?;
             self.position = cursor.position;
             Ok(())
@@ -3370,6 +3369,7 @@ impl Engine {
             ),
             &mut self.work.logits,
         )?;
+        self.logits_cache.mark_valid();
         self.rewind(start + committed, bonus)?;
         if let Some(t) = trace {
             t.add(

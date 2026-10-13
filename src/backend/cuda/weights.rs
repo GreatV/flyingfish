@@ -4,10 +4,12 @@ use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaSlice, CudaStream, PinnedHostSlice};
 use half::bf16;
 use safetensors::{Dtype, SafeTensors};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::Arc,
+    sync::mpsc,
 };
 
 pub struct Layer {
@@ -39,7 +41,76 @@ pub(crate) struct Loader<'a> {
     stream: Arc<CudaStream>,
     byte_staging: Option<PinnedHostSlice<u8>>,
     verify_upload: bool,
+    upload_hashers: BTreeMap<String, UploadHashWorker>,
     pub(crate) bytes: usize,
+}
+
+enum UploadHashMessage {
+    Begin(String),
+    Bytes(Vec<u8>),
+}
+
+struct UploadHashWorker {
+    sender: mpsc::SyncSender<UploadHashMessage>,
+    handle: Option<std::thread::JoinHandle<(usize, String)>>,
+}
+
+impl UploadHashWorker {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let handle = std::thread::spawn(move || {
+            let mut hash = Sha256::new();
+            let mut hashed_bytes = 0usize;
+            let mut tensor_open = false;
+            for message in receiver {
+                match message {
+                    UploadHashMessage::Begin(name) => {
+                        if tensor_open {
+                            hash.update([0]);
+                        }
+                        hash.update(name.as_bytes());
+                        hash.update([0]);
+                        tensor_open = true;
+                    }
+                    UploadHashMessage::Bytes(bytes) => {
+                        hashed_bytes = hashed_bytes.saturating_add(bytes.len());
+                        hash.update(&bytes);
+                    }
+                }
+            }
+            if tensor_open {
+                hash.update([0]);
+            }
+            (hashed_bytes, format!("{:x}", hash.finalize()))
+        });
+        Self {
+            sender,
+            handle: Some(handle),
+        }
+    }
+
+    fn begin(&self, name: &str) -> Result<()> {
+        self.sender
+            .send(UploadHashMessage::Begin(name.to_owned()))
+            .context("upload hash worker exited")
+    }
+
+    fn bytes(&self, bytes: &[u8]) -> Result<()> {
+        self.sender
+            .send(UploadHashMessage::Bytes(bytes.to_vec()))
+            .context("upload hash worker exited")
+    }
+
+    fn finish(mut self) -> Result<(usize, String)> {
+        let handle = self
+            .handle
+            .take()
+            .context("upload hash worker already finished")?;
+        drop(self.sender);
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("upload hash worker panicked"))
+    }
 }
 
 impl Loader<'_> {
@@ -70,6 +141,9 @@ impl Loader<'_> {
                 t.shape()
             );
             ensure!(self.seen.insert(name.clone()), "tensor {name} loaded twice");
+            if let Some(hasher) = self.upload_hashers.get(file) {
+                hasher.begin(name)?;
+            }
             for mapped_chunk in t.data().chunks(self.staging.len() * 2) {
                 let chunk = if self.verify_upload {
                     let len = mapped_chunk.len();
@@ -82,6 +156,9 @@ impl Loader<'_> {
                 } else {
                     mapped_chunk
                 };
+                if let Some(hasher) = self.upload_hashers.get(file) {
+                    hasher.bytes(chunk)?;
+                }
                 let len = chunk.len() / 2;
                 let buf = self.staging.as_mut_slice()?;
                 decode_bf16(chunk, &mut buf[..len]);
@@ -122,15 +199,17 @@ pub(crate) fn checkpoint<T>(
     read: impl FnOnce(&mut Loader<'_>) -> Result<T>,
 ) -> Result<T> {
     let mapped = MappedCheckpoint::open(dir)?;
-    checkpoint_mapped(&mapped, d, None, read)
+    let (value, _) = checkpoint_mapped(&mapped, d, None, false, read)?;
+    Ok(value)
 }
 
 pub(super) fn checkpoint_mapped<T>(
     mapped: &MappedCheckpoint,
     d: &Device,
     manifest: Option<&TensorManifest>,
+    hash_uploads: bool,
     read: impl FnOnce(&mut Loader<'_>) -> Result<T>,
-) -> Result<T> {
+) -> Result<(T, Option<(usize, String)>)> {
     let index = mapped.index.clone();
     let tensors = mapped.views()?;
     // Verified uploads read staging on the CPU, so they need cacheable pinned memory.
@@ -140,6 +219,20 @@ pub(super) fn checkpoint_mapped<T>(
         } else {
             d.ctx.alloc_pinned::<bf16>(1024 * 1024)?
         }
+    };
+    let upload_shards = if hash_uploads {
+        manifest
+            .map(|manifest| {
+                manifest
+                    .entries
+                    .values()
+                    .filter(|entry| entry.load)
+                    .map(|entry| entry.shard.clone())
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        BTreeSet::new()
     };
     let mut l = Loader {
         source: mapped,
@@ -167,16 +260,36 @@ pub(super) fn checkpoint_mapped<T>(
             None
         },
         verify_upload: manifest.is_some(),
+        upload_hashers: upload_shards
+            .into_iter()
+            .map(|shard| (shard.clone(), UploadHashWorker::new()))
+            .collect(),
         bytes: 0,
     };
     let value = read(&mut l)?;
+    let upload_digest = if hash_uploads {
+        let mut aggregate = Sha256::new();
+        let mut hashed_bytes = 0usize;
+        let upload_hashers = std::mem::take(&mut l.upload_hashers);
+        for (shard, worker) in upload_hashers {
+            let (count, digest) = worker.finish()?;
+            hashed_bytes = hashed_bytes.saturating_add(count);
+            aggregate.update(shard.as_bytes());
+            aggregate.update([0]);
+            aggregate.update(digest.as_bytes());
+            aggregate.update([0]);
+        }
+        Some((hashed_bytes, format!("{:x}", aggregate.finalize())))
+    } else {
+        None
+    };
     ensure!(
         l.seen.len() == l.index.weight_map.len(),
         "checkpoint contains unexpected tensors"
     );
     drop(l);
     d.finish_upload()?;
-    Ok(value)
+    Ok((value, upload_digest))
 }
 
 fn decode_bf16(bytes: &[u8], values: &mut [bf16]) {
@@ -255,6 +368,9 @@ impl Loader<'_> {
             self.seen.insert(name.into()),
             "tensor {name} consumed twice"
         );
+        if let Some(hasher) = self.upload_hashers.get(file) {
+            hasher.begin(name)?;
+        }
         let staging = self
             .byte_staging
             .as_mut()
@@ -267,6 +383,9 @@ impl Loader<'_> {
                 mapped_chunk,
                 &mut staging.as_mut_slice()?[..len],
             )?;
+            if let Some(hasher) = self.upload_hashers.get(file) {
+                hasher.bytes(&staging.as_slice()?[..len])?;
+            }
             ensure!(
                 staging.as_slice()?[..len].iter().all(|c| c & 0x7f != 0x7f),
                 "nonfinite FP8 code in {name}"
@@ -299,6 +418,9 @@ pub(crate) struct WeightCatalog {
     pub tensors: BTreeMap<String, StoredTensor>,
     pub manifest: TensorManifest,
     pub bytes: usize,
+    pub upload_content_sha256: Option<String>,
+    pub upload_hashed_bytes: Option<usize>,
+    pub load_wall_ms: f64,
 }
 impl WeightCatalog {
     /// Move shared global tensors into the existing Engine weight owner.
@@ -316,7 +438,15 @@ impl WeightCatalog {
         })
     }
     pub fn load(dir: &Path, spec: &crate::model_spec::ModelSpec, d: &Device) -> Result<Self> {
-        Self::load_with_policy(dir, spec, d, crate::checkpoint::LoadPolicy::TextOnly)
+        Self::load_inner(dir, spec, d, crate::checkpoint::LoadPolicy::TextOnly, false)
+    }
+
+    pub fn load_for_prefix_cache(
+        dir: &Path,
+        spec: &crate::model_spec::ModelSpec,
+        d: &Device,
+    ) -> Result<Self> {
+        Self::load_inner(dir, spec, d, crate::checkpoint::LoadPolicy::TextOnly, true)
     }
     pub fn load_with_policy(
         dir: &Path,
@@ -324,25 +454,37 @@ impl WeightCatalog {
         d: &Device,
         policy: crate::checkpoint::LoadPolicy,
     ) -> Result<Self> {
+        Self::load_inner(dir, spec, d, policy, false)
+    }
+
+    fn load_inner(
+        dir: &Path,
+        spec: &crate::model_spec::ModelSpec,
+        d: &Device,
+        policy: crate::checkpoint::LoadPolicy,
+        hash_uploads: bool,
+    ) -> Result<Self> {
+        let started = std::time::Instant::now();
         let mapped = MappedCheckpoint::open(dir)?;
         let manifest = mapped.q38_manifest_with_policy(spec, policy)?;
-        let (tensors, bytes) = checkpoint_mapped(&mapped, d, Some(&manifest), |loader| {
-            let mut tensors = BTreeMap::new();
-            for (name, entry) in &manifest.entries {
-                if !entry.load {
-                    continue;
-                }
-                let value = match entry.dtype {
-                    Dtype::BF16 => {
-                        StoredTensor::Bf16(loader.load(&[(name.clone(), entry.shape.clone())])?)
+        let ((tensors, bytes), upload_digest) =
+            checkpoint_mapped(&mapped, d, Some(&manifest), hash_uploads, |loader| {
+                let mut tensors = BTreeMap::new();
+                for (name, entry) in &manifest.entries {
+                    if !entry.load {
+                        continue;
                     }
-                    Dtype::F8_E4M3 => StoredTensor::Fp8(loader.load_fp8(name, &entry.shape)?),
-                    _ => anyhow::bail!("unsupported loaded dtype for {name}"),
-                };
-                tensors.insert(name.clone(), value);
-            }
-            Ok((tensors, loader.bytes))
-        })?;
+                    let value = match entry.dtype {
+                        Dtype::BF16 => {
+                            StoredTensor::Bf16(loader.load(&[(name.clone(), entry.shape.clone())])?)
+                        }
+                        Dtype::F8_E4M3 => StoredTensor::Fp8(loader.load_fp8(name, &entry.shape)?),
+                        _ => anyhow::bail!("unsupported loaded dtype for {name}"),
+                    };
+                    tensors.insert(name.clone(), value);
+                }
+                Ok((tensors, loader.bytes))
+            })?;
         ensure!(
             bytes == manifest.resident_bytes,
             "resident/upload byte count mismatch"
@@ -351,6 +493,9 @@ impl WeightCatalog {
             tensors,
             manifest,
             bytes,
+            upload_content_sha256: upload_digest.as_ref().map(|x| x.1.clone()),
+            upload_hashed_bytes: upload_digest.map(|x| x.0),
+            load_wall_ms: started.elapsed().as_secs_f64() * 1000.0,
         })
     }
     pub fn bf16(&self, name: &str) -> Result<&CudaSlice<bf16>> {
@@ -363,8 +508,9 @@ impl WeightCatalog {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_bf16;
+    use super::*;
     use half::bf16;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn checkpoint_bytes_preserve_bf16_bits() {
@@ -374,5 +520,26 @@ mod tests {
         let mut values = vec![bf16::ZERO; bits.len()];
         decode_bf16(&bytes, &mut values);
         assert_eq!(values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), bits);
+    }
+
+    #[test]
+    fn upload_hash_worker_hashes_exact_tensor_bytes() {
+        let worker = UploadHashWorker::new();
+        worker.begin("tensor.a").unwrap();
+        worker.bytes(b"abc").unwrap();
+        worker.begin("tensor.b").unwrap();
+        worker.bytes(b"de").unwrap();
+        let (count, digest) = worker.finish().unwrap();
+        let mut expected = Sha256::new();
+        expected.update(b"tensor.a");
+        expected.update([0]);
+        expected.update(b"abc");
+        expected.update([0]);
+        expected.update(b"tensor.b");
+        expected.update([0]);
+        expected.update(b"de");
+        expected.update([0]);
+        assert_eq!(count, 5);
+        assert_eq!(digest, format!("{:x}", expected.finalize()));
     }
 }
