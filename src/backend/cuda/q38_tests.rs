@@ -99,7 +99,7 @@ fn q38_primitives_gpu() -> Result<()> {
             entries: BTreeMap::new(),
             resident_bytes: codes.len() + scales.len(),
         };
-        super::weights::checkpoint_mapped(&mapped, &d, Some(&manifest), |loader| {
+        super::weights::checkpoint_mapped::<()>(&mapped, &d, Some(&manifest), false, |loader| {
             let w = loader.load_fp8("w", &[129, 257])?;
             let scale = loader.load(&[("s".into(), vec![2, 3])])?;
             ensure!(
@@ -119,6 +119,7 @@ fn q38_primitives_gpu() -> Result<()> {
             );
             Ok(())
         })
+        .map(|(value, _)| value)
     })();
     std::fs::remove_dir_all(&fixture_dir)?;
     uploaded?;
@@ -302,23 +303,24 @@ fn q38_primitives_gpu() -> Result<()> {
             entries: std::collections::BTreeMap::new(),
             resident_bytes: 204497280,
         };
-        let uploaded = super::weights::checkpoint_mapped(&mapped, &d, Some(&manifest), |loader| {
-            let mut values = Vec::new();
-            for (label, n, k) in [
-                ("q", 12288u32, 5120u32),
-                ("gdn", 10240, 5120),
-                ("mlp", 17408, 5120),
-            ] {
-                let codes =
-                    loader.load_fp8(&format!("{label}.weight"), &[n as usize, k as usize])?;
-                let scales = loader.load(&[(
-                    format!("{label}.weight_scale_inv"),
-                    vec![n.div_ceil(128) as usize, k.div_ceil(128) as usize],
-                )])?;
-                values.push((label, n, k, codes, scales));
-            }
-            Ok(values)
-        })?;
+        let (uploaded, _) =
+            super::weights::checkpoint_mapped(&mapped, &d, Some(&manifest), false, |loader| {
+                let mut values = Vec::new();
+                for (label, n, k) in [
+                    ("q", 12288u32, 5120u32),
+                    ("gdn", 10240, 5120),
+                    ("mlp", 17408, 5120),
+                ] {
+                    let codes =
+                        loader.load_fp8(&format!("{label}.weight"), &[n as usize, k as usize])?;
+                    let scales = loader.load(&[(
+                        format!("{label}.weight_scale_inv"),
+                        vec![n.div_ceil(128) as usize, k.div_ceil(128) as usize],
+                    )])?;
+                    values.push((label, n, k, codes, scales));
+                }
+                Ok(values)
+            })?;
         for (label, n, k, codes, scales) in uploaded {
             let source = tensors.tensor(&format!("{label}.weight"))?;
             let scale_source = tensors.tensor(&format!("{label}.weight_scale_inv"))?;

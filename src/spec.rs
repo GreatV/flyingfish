@@ -380,6 +380,7 @@ mod tests {
                 spec_graph: true,
                 draft_model: None,
                 runtime_dir: None,
+                prefix_cache: false,
             },
             count: 256,
             ignore_eos: true,

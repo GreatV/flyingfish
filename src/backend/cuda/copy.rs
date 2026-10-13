@@ -1,5 +1,5 @@
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, sys};
+use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, PinnedHostSlice, sys};
 use half::bf16;
 use std::sync::Arc;
 
@@ -60,6 +60,82 @@ pub fn columns(
     };
     unsafe {
         sys::cuMemcpy2DAsync_v2(&params, s.cu_stream()).result()?;
+    }
+    Ok(())
+}
+
+fn checked_byte_span<T>(
+    elements: usize,
+    byte_offset: usize,
+    byte_count: usize,
+) -> Result<(usize, usize)> {
+    let size = std::mem::size_of::<T>();
+    ensure!(byte_count > 0, "CUDA byte-span copy requires bytes");
+    ensure!(
+        byte_offset
+            .checked_add(byte_count)
+            .is_some_and(|end| end <= elements * size),
+        "CUDA byte-span copy exceeds source"
+    );
+    Ok((byte_offset, byte_count))
+}
+
+pub fn dtoh_bytes<T: cudarc::driver::DeviceRepr>(
+    s: &Arc<CudaStream>,
+    src: &impl DevicePtr<T>,
+    src_byte_offset: usize,
+    dst: &mut PinnedHostSlice<u8>,
+    dst_offset: usize,
+    bytes: usize,
+) -> Result<()> {
+    let (src_offset, bytes) = checked_byte_span::<T>(src.len(), src_byte_offset, bytes)?;
+    ensure!(
+        dst_offset
+            .checked_add(bytes)
+            .is_some_and(|end| end <= dst.len()),
+        "CUDA D2H byte span exceeds pinned destination"
+    );
+    s.context().bind_to_thread()?;
+    let (src_ptr, _guard) = src.device_ptr(s);
+    let dst_ptr = dst.as_mut_ptr().map_err(anyhow::Error::from)?;
+    unsafe {
+        sys::cuMemcpyDtoHAsync_v2(
+            dst_ptr.add(dst_offset).cast(),
+            src_ptr + src_offset as u64,
+            bytes,
+            s.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+pub fn htod_bytes<T: cudarc::driver::DeviceRepr>(
+    s: &Arc<CudaStream>,
+    dst: &mut impl DevicePtrMut<T>,
+    dst_byte_offset: usize,
+    src: &PinnedHostSlice<u8>,
+    src_offset: usize,
+    bytes: usize,
+) -> Result<()> {
+    let (dst_offset, bytes) = checked_byte_span::<T>(dst.len(), dst_byte_offset, bytes)?;
+    ensure!(
+        src_offset
+            .checked_add(bytes)
+            .is_some_and(|end| end <= src.len()),
+        "CUDA H2D byte span exceeds pinned source"
+    );
+    s.context().bind_to_thread()?;
+    let (dst_ptr, _guard) = dst.device_ptr_mut(s);
+    let src_ptr = src.as_ptr().map_err(anyhow::Error::from)?;
+    unsafe {
+        sys::cuMemcpyHtoDAsync_v2(
+            dst_ptr + dst_offset as u64,
+            src_ptr.add(src_offset).cast(),
+            bytes,
+            s.cu_stream(),
+        )
+        .result()?;
     }
     Ok(())
 }

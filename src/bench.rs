@@ -263,6 +263,7 @@ mod tests {
                 spec_graph: false,
                 draft_model: None,
                 runtime_dir: None,
+                prefix_cache: false,
             },
             steps: 200,
             warmup: 0,

@@ -241,6 +241,7 @@ impl Backend for Bound<'_> {
         s.memcpy_htod(&saved.logits, &mut e.work.logits)?;
         s.synchronize()?;
         e.position = saved.position;
+        e.logits_cache.mark_valid();
         e.poisoned = false;
         c.last_target = saved.last_target.clone();
         c.recurrent = saved.recurrent.clone();

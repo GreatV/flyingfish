@@ -6,6 +6,10 @@ pub mod setup;
 pub(crate) mod cuda;
 #[cfg(feature = "cuda")]
 pub use cuda::engine::Engine as Backend;
+#[cfg(feature = "cuda")]
+pub use cuda::engine::TextPrefixSaveOutput;
+#[cfg(feature = "cuda")]
+pub use cuda::engine::{TextPrefixRestoreIntent, TextPrefixSaveRequest};
 #[cfg(not(feature = "cuda"))]
 mod missing;
 #[cfg(not(feature = "cuda"))]
@@ -118,6 +122,8 @@ pub struct Settings {
     pub spec_graph: bool,
     #[arg(skip)]
     pub draft_model: Option<std::path::PathBuf>,
+    #[arg(long, global = true, default_value_t = false, action = clap::ArgAction::Set)]
+    pub prefix_cache: bool,
     #[arg(long, global = true, env = "FLYINGFISH_RUNTIME_DIR")]
     pub runtime_dir: Option<std::path::PathBuf>,
 }

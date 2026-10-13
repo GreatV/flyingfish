@@ -11,6 +11,7 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
         spec_graph: true,
         draft_model: None,
         runtime_dir: Some(runtime),
+        prefix_cache: false,
     };
     Engine::calibrate(&target, 0, 33824, Some(16), settings.clone())?;
     let mut model = Engine::load(&target, 0, 33824, Some(1024), settings)?;
@@ -98,6 +99,7 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
         spec_graph: true,
         draft_model: Some(draft),
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        prefix_cache: false,
     };
     Engine::calibrate(&target, 0, 33824, Some(1024), settings.clone())?;
     let mut model = Engine::load(&target, 0, 33824, Some(1024), settings)?;
@@ -219,6 +221,7 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
         spec_graph: true,
         draft_model: Some(PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?)),
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        prefix_cache: false,
     };
     Engine::calibrate(&target, 0, 33824, Some(8), settings.clone())?;
     let mut model = Engine::load(&target, 0, 33824, Some(8), settings.clone())?;
@@ -309,6 +312,7 @@ fn chain_argmax_matches_single_on_real_logits() -> Result<()> {
             spec_graph: true,
             draft_model: None,
             runtime_dir: Some(runtime.clone()),
+            prefix_cache: false,
         };
         let mut model = Engine::load(
             &target,
@@ -397,6 +401,7 @@ fn q38_engine_capture_gpu() -> Result<()> {
         spec_graph: false,
         draft_model: None,
         runtime_dir: Some(runtime),
+        prefix_cache: false,
     };
     // Calibration/setup returns Frozen before production graph capture for a fixed plan.
     let image_fixture = std::env::var_os("FF_Q38_IMAGE_CAPTURE_FIXTURE");
