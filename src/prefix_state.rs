@@ -56,11 +56,15 @@ pub fn checkpoint_file_fingerprints(
     spec: &ModelSpec,
 ) -> Result<Vec<PrefixFileFingerprint>> {
     let (selected, _) = loaded_weight_shards(dir, spec)?;
-    let mut names = vec![
-        "config.json".to_owned(),
-        "model.safetensors.index.json".to_owned(),
-    ];
+    let mut names = vec!["config.json".to_owned()];
+    if dir.join("model.safetensors.index.json").is_file() {
+        names.push("model.safetensors.index.json".to_owned());
+    }
     names.extend(selected.into_iter().map(|(name, _)| name));
+    fingerprints_for_names(dir, names)
+}
+
+fn fingerprints_for_names(dir: &Path, names: Vec<String>) -> Result<Vec<PrefixFileFingerprint>> {
     names
         .into_iter()
         .map(|name| fingerprint(dir, &name))
@@ -238,7 +242,11 @@ impl PrefixIdentity {
         let tokenizer_config = dir.join("tokenizer_config.json");
 
         let config_sha = file_sha256(&config)?;
-        let index_sha = file_sha256(&index)?;
+        let index_sha = if index.is_file() {
+            Some(file_sha256(&index)?)
+        } else {
+            None
+        };
         let model_id = format!("config-sha256:{config_sha}");
         for path in [&tokenizer_json, &tokenizer_config] {
             ensure!(
@@ -302,7 +310,10 @@ impl PrefixIdentity {
         let mut revision = Sha256::new();
         for (name, digest) in [
             ("config.json", config_sha),
-            ("model.safetensors.index.json", index_sha),
+            (
+                "model.safetensors.index.json",
+                index_sha.unwrap_or_else(|| "absent".to_owned()),
+            ),
             ("loaded-tensor-manifest", loaded_manifest_sha),
         ] {
             revision.update(name.as_bytes());
@@ -1409,6 +1420,32 @@ mod tests {
         std::fs::write(root.join("shard.bin"), b"second")?;
         let second = fingerprint(&root, "shard.bin")?;
         assert_ne!(first, second);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn single_file_checkpoint_fingerprints_do_not_require_index() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "flyingfish-prefix-single-file-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("config.json"), b"config")?;
+        std::fs::write(root.join("model.safetensors"), b"safetensors")?;
+        let fingerprints = fingerprints_for_names(
+            &root,
+            vec!["config.json".into(), "model.safetensors".into()],
+        )?;
+        assert_eq!(
+            fingerprints
+                .iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>(),
+            ["config.json", "model.safetensors"]
+        );
+        assert!(!root.join("model.safetensors.index.json").exists());
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

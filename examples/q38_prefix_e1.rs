@@ -372,10 +372,10 @@ fn ensure_counts(prefix: &[u32], suffix: &[u32], capacity: usize) -> Result<()> 
     anyhow::ensure!(
         prefix
             .len()
-            .checked_add(1)
+            .checked_add(2)
             .and_then(|x| x.checked_add(suffix.len()))
             .is_some_and(|x| x <= capacity),
-        "prefix plus one pending decode token plus suffix exceeds capacity"
+        "prefix plus two decode tokens plus suffix exceeds capacity"
     );
     Ok(())
 }
@@ -388,12 +388,12 @@ mod tests {
     fn capacity_includes_prefix_pending_token_and_suffix() {
         let prefix = vec![1; 32_768];
         let suffix = vec![2; 1_024];
-        ensure_counts(&prefix, &suffix, 33_793).unwrap();
-        assert!(ensure_counts(&prefix, &suffix, 33_792).is_err());
+        ensure_counts(&prefix, &suffix, 33_794).unwrap();
+        assert!(ensure_counts(&prefix, &suffix, 33_793).is_err());
 
         let prefix_128k = vec![1; 131_072];
-        ensure_counts(&prefix_128k, &suffix, 132_097).unwrap();
-        assert!(ensure_counts(&prefix_128k, &suffix, 132_096).is_err());
+        ensure_counts(&prefix_128k, &suffix, 132_098).unwrap();
+        assert!(ensure_counts(&prefix_128k, &suffix, 132_097).is_err());
     }
 
     #[test]
