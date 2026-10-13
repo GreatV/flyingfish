@@ -11,6 +11,13 @@ pub mod shared {
     include!(concat!(env!("OUT_DIR"), "/gdn_b_shared.rs"));
 }
 
+/// Chunkwise P1 core shared-memory bytes per value split, from
+/// `kernels/gdn/gdn_cw_p1_layout.h`. The kernel static_asserts its arena against the
+/// same constants, so the launcher and the kernel derive the size from one definition.
+pub mod cw_p1 {
+    include!(concat!(env!("OUT_DIR"), "/gdn_cw_p1_shared.rs"));
+}
+
 /// Immutable device qualification; no runtime GPU query or tuning in a forward.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct GdnPolicy {

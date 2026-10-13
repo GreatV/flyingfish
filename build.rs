@@ -68,11 +68,25 @@ fn main() {
         assert!(value <= 101_376);
         shared.push_str(&format!("pub const {name}_BYTES: u32 = {value};\n"));
     }
-    fs::write(
-        PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR missing")).join("gdn_b_shared.rs"),
-        shared,
-    )
-    .expect("write shared GDN constants");
+    let cw_header = "kernels/gdn/gdn_cw_p1_layout.h";
+    println!("cargo:rerun-if-changed={cw_header}");
+    let text = fs::read_to_string(cw_header).expect("read chunkwise P1 layout header");
+    let mut cw = String::new();
+    for name in ["S4", "S8", "S16"] {
+        let prefix = format!("#define GDN_CW_P1_{name}_BYTES ");
+        let value = text
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("missing chunkwise P1 shared-memory constant")
+            .parse::<u32>()
+            .expect("numeric shared-memory size");
+        assert!(value <= 101_376);
+        cw.push_str(&format!("pub const {name}_BYTES: u32 = {value};\n"));
+    }
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR missing"));
+    fs::write(out.join("gdn_b_shared.rs"), shared).expect("write shared GDN constants");
+    fs::write(out.join("gdn_cw_p1_shared.rs"), cw).expect("write chunkwise P1 constants");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;

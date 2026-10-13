@@ -391,6 +391,10 @@ impl Runtime {
                             },
                             common.clone(),
                             scan,
+                            // Phase-2 chunkwise P1 core: 0 keeps the shipped recursive
+                            // core. Landing it is the model gate's ruling, not a tuning
+                            // knob, so no plan here selects it.
+                            0,
                         )
                     };
                     let scan = gdn_policy
