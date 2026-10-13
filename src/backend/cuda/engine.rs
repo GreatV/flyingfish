@@ -11,8 +11,9 @@ use crate::{
     backend::{Event, Head, Logits, Settings, SpecBudget, Target, TreeBuilder},
     config::Config,
     prefix_state::{
-        PrefixBoundary, PrefixBuilder, PrefixGeometry, PrefixIdentity, PrefixRecordKind,
-        PrefixRestoreReceipt, PrefixSaveReceipt, PrefixSnapshot, sha256, token_ids_sha256,
+        PrefixBoundary, PrefixBuilder, PrefixGeometry, PrefixIdentity, PrefixLastInputKind,
+        PrefixRecordKind, PrefixRestoreReceipt, PrefixSaveReceipt, PrefixSnapshot, sha256,
+        token_ids_sha256,
     },
     trace::Trace,
     vision_input::PositionPlan,
@@ -435,9 +436,11 @@ pub struct Engine {
     trace_layer: usize,
     position: usize,
     prefix_identity: Option<PrefixIdentity>,
+    prefix_identity_hash_ms: Option<f64>,
     committed_prefix_ids: Vec<u32>,
     pending_token: Option<u32>,
     resident_ids_len: usize,
+    last_input_kind: Option<PrefixLastInputKind>,
 }
 
 pub struct TextPrefixSaveRequest<'a> {
@@ -746,9 +749,11 @@ impl Engine {
             trace_layer: 0,
             position: 0,
             prefix_identity: None,
+            prefix_identity_hash_ms: None,
             committed_prefix_ids: Vec::new(),
             pending_token: None,
             resident_ids_len: 0,
+            last_input_kind: None,
         };
         if let Some(path) = settings.draft_model {
             let path = path.canonicalize()?;
@@ -1707,6 +1712,7 @@ impl Engine {
         self.committed_prefix_ids.clear();
         self.pending_token = None;
         self.resident_ids_len = 0;
+        self.last_input_kind = None;
         self.device
             .stream
             .memcpy_htod(&[0i32], &mut self.work.position)?;
@@ -1742,8 +1748,30 @@ impl Engine {
         self.committed_prefix_ids.clear();
         self.pending_token = Some(0);
         self.resident_ids_len = 0;
+        self.last_input_kind = None;
         self.device.stream.synchronize()?;
         Ok(())
+    }
+
+    fn ensure_text_prefix_identity(&mut self) -> Result<(PrefixIdentity, f64)> {
+        if let Some(identity) = self.prefix_identity.clone() {
+            return Ok((identity, 0.0));
+        }
+        let qwen = self
+            .qwen
+            .as_ref()
+            .context("text prefix identity requires Qwen3.8")?;
+        let checkpoint_dir = qwen.checkpoint_path().to_owned();
+        let started = Instant::now();
+        let identity = PrefixIdentity::for_checkpoint(
+            &checkpoint_dir,
+            &text_rope_context_sha256(self.capacity)?,
+            &self.model_spec,
+        )?;
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        self.prefix_identity = Some(identity.clone());
+        self.prefix_identity_hash_ms = Some(elapsed);
+        Ok((identity, elapsed))
     }
 
     pub fn save_text_prefix(
@@ -1751,10 +1779,6 @@ impl Engine {
         request: TextPrefixSaveRequest<'_>,
     ) -> Result<TextPrefixSaveOutput> {
         let started = Instant::now();
-        let prefix_identity = self
-            .prefix_identity
-            .clone()
-            .context("text prefix identity missing")?;
         self.closure.assert_ready()?;
         ensure!(!self.poisoned, "cannot save a poisoned engine prefix");
         ensure!(self.qwen.is_some(), "text prefix save requires Qwen3.8");
@@ -1766,6 +1790,7 @@ impl Engine {
             self.spec.as_ref().is_none_or(|spec| spec.active_rows == 0),
             "cannot save during a speculative transaction"
         );
+        let (prefix_identity, identity_hash_ms) = self.ensure_text_prefix_identity()?;
         let prefix = request.prefix_ids.len();
         ensure!(
             prefix > 0 && prefix == self.position,
@@ -1818,16 +1843,29 @@ impl Engine {
             (pending_next_token as usize) < self.config.vocab_size,
             "pending prefix token outside vocabulary"
         );
-        let resident_ids = self.device.stream.clone_dtoh(&self.work.ids)?;
-        ensure!(
-            self.resident_ids_len > 0,
-            "engine has no resident prefill ids to audit"
-        );
-        let last_input_index = self.resident_ids_len - 1;
-        ensure!(
-            resident_ids.get(last_input_index).copied() == Some(last_token),
-            "last prefix input differs from the resident last submitted chunk"
-        );
+        let last_input_kind = self
+            .last_input_kind
+            .context("engine has no committed text input source")?;
+        match last_input_kind {
+            PrefixLastInputKind::PrefillChunk => {
+                let resident_ids = self.device.stream.clone_dtoh(&self.work.ids)?;
+                ensure!(
+                    self.resident_ids_len > 0,
+                    "engine has no resident prefill ids to audit"
+                );
+                let last_input_index = self.resident_ids_len - 1;
+                ensure!(
+                    resident_ids.get(last_input_index).copied() == Some(last_token),
+                    "last prefix input differs from the resident last submitted chunk"
+                );
+            }
+            PrefixLastInputKind::DecodeToken => {
+                ensure!(
+                    self.committed_prefix_ids.last().copied() == Some(last_token),
+                    "last prefix input differs from the committed decode token"
+                );
+            }
+        }
         let geometry = PrefixGeometry::new(
             &self.model_spec,
             self.capacity,
@@ -1838,6 +1876,7 @@ impl Engine {
         let boundary = PrefixBoundary {
             prefix_tokens: prefix,
             last_token,
+            last_input_kind,
             pending_next_token,
             token_ids_sha256: token_ids_sha256(request.prefix_ids)?,
             rope_context_sha256: text_rope_context_sha256(self.capacity)?,
@@ -1855,6 +1894,8 @@ impl Engine {
             state_root: snapshot.manifest.state_root.clone(),
             total_state_bytes: snapshot.manifest.total_state_bytes,
             transfer_bytes: request.transfer_bytes,
+            identity_hash_ms,
+            identity_hashed_bytes: prefix_identity.hashed_weight_bytes,
             wall_ms: started.elapsed().as_secs_f64() * 1000.0,
         };
         Ok(TextPrefixSaveOutput { snapshot, receipt })
@@ -1948,11 +1989,23 @@ impl Engine {
         intent: TextPrefixRestoreIntent<'_>,
     ) -> Result<PrefixRestoreReceipt> {
         let started = Instant::now();
-        let prefix_identity = self
-            .prefix_identity
-            .clone()
-            .context("text prefix identity missing")?;
-        snapshot.verify_prefix_and_pending(intent.prefix_ids, intent.pending_next_token)?;
+        snapshot.verify_prefix_and_pending_within_vocab(
+            intent.prefix_ids,
+            intent.pending_next_token,
+            self.config.vocab_size,
+        )?;
+        self.closure.assert_ready()?;
+        ensure!(!self.poisoned, "cannot restore into a poisoned engine");
+        ensure!(self.qwen.is_some(), "text prefix restore requires Qwen3.8");
+        ensure!(
+            self.images.is_none(),
+            "multimodal prefix restore is unsupported"
+        );
+        ensure!(
+            self.spec.as_ref().is_none_or(|spec| spec.active_rows == 0),
+            "cannot restore during a speculative transaction"
+        );
+        let (prefix_identity, identity_hash_ms) = self.ensure_text_prefix_identity()?;
         ensure!(
             snapshot.manifest.identity == prefix_identity,
             "prefix snapshot identity differs from the loaded engine"
@@ -1969,16 +2022,6 @@ impl Engine {
             snapshot.manifest.boundary.rope_context_sha256
                 == text_rope_context_sha256(self.capacity)?,
             "prefix rope context differs from this engine"
-        );
-        ensure!(!self.poisoned, "cannot restore into a poisoned engine");
-        ensure!(self.qwen.is_some(), "text prefix restore requires Qwen3.8");
-        ensure!(
-            self.images.is_none(),
-            "multimodal prefix restore is unsupported"
-        );
-        ensure!(
-            self.spec.as_ref().is_none_or(|spec| spec.active_rows == 0),
-            "cannot restore during a speculative transaction"
         );
         self.device.stream.synchronize()?;
         self.poisoned = true;
@@ -2001,6 +2044,8 @@ impl Engine {
             state_root: snapshot.manifest.state_root.clone(),
             total_state_bytes: snapshot.manifest.total_state_bytes,
             transfer_bytes: intent.transfer_bytes,
+            identity_hash_ms,
+            identity_hashed_bytes: prefix_identity.hashed_weight_bytes,
             wall_ms: started.elapsed().as_secs_f64() * 1000.0,
         })
     }
@@ -2076,22 +2121,32 @@ impl Engine {
             }
         }
         let prefix = snapshot.manifest.boundary.prefix_tokens;
-        let resident_len = prefix.min(self.chunk);
-        let resident_ids_start = prefix - resident_len;
+        let last_input_kind = snapshot.manifest.boundary.last_input_kind;
         stream.synchronize()?;
         self.state
             .set_sequence(&stream, prefix as u32, 1, self.workspace_rows as u32)?;
         self.reset_qwen_positions()?;
         stream.memcpy_htod(&[prefix as i32], &mut self.work.position)?;
         stream.memcpy_htod(&[prefix as i32 + 1], &mut self.work.length)?;
-        stream.memcpy_htod(
-            &prefix_ids[resident_ids_start..],
-            &mut self.work.ids.slice_mut(..resident_len),
-        )?;
+        let resident_len = match last_input_kind {
+            PrefixLastInputKind::PrefillChunk => {
+                let resident_len = prefix.min(self.chunk);
+                let resident_ids_start = prefix - resident_len;
+                stream.memcpy_htod(
+                    &prefix_ids[resident_ids_start..],
+                    &mut self.work.ids.slice_mut(..resident_len),
+                )?;
+                resident_len
+            }
+            // The committed decode input is host-audited; the next prefill
+            // overwrites work.ids before it can be consumed.
+            PrefixLastInputKind::DecodeToken => self.resident_ids_len.min(self.chunk),
+        };
         self.set_token(snapshot.manifest.boundary.pending_next_token)?;
         self.position = prefix;
         self.committed_prefix_ids = prefix_ids.to_vec();
         self.resident_ids_len = resident_len;
+        self.last_input_kind = Some(last_input_kind);
         stream.synchronize()?;
         Ok(())
     }
@@ -2166,6 +2221,7 @@ impl Engine {
                 .stream
                 .memcpy_htod(chunk, &mut self.work.ids.slice_mut(..chunk.len()))?;
             self.resident_ids_len = chunk.len();
+            self.last_input_kind = Some(PrefixLastInputKind::PrefillChunk);
             self.device
                 .stream
                 .memcpy_htod(&[self.position as i32], &mut self.work.position)?;
@@ -2255,6 +2311,7 @@ impl Engine {
         }
         self.committed_prefix_ids.push(committed_token);
         self.pending_token = None;
+        self.last_input_kind = Some(PrefixLastInputKind::DecodeToken);
         self.position += 1;
         Ok(())
     }

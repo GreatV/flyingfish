@@ -119,31 +119,72 @@ fn main() -> Result<()> {
                 "engine-derived prefix identity differs from expected identity file"
             );
         }
-        engine.step(false)?;
-        let baseline_pending_token = engine.token()?;
-        let baseline_pending_logits = engine.decode_logits()?;
-        let baseline_token = engine.prefill(&suffix, None)?;
-        let baseline_logits = engine.decode_logits()?;
-        engine.poison_state_for_prefix_e1()?;
-        let restore = engine.restore_text_prefix(
-            &saved.snapshot,
-            TextPrefixRestoreIntent {
-                prefix_ids: &prefix,
-                pending_next_token: saved.snapshot.manifest.boundary.pending_next_token,
-                transfer_bytes: args.transfer_bytes,
-            },
-        )?;
-        let readback = engine.save_text_prefix(TextPrefixSaveRequest {
+        let mut foreign = saved.snapshot.clone();
+        foreign
+            .manifest
+            .identity
+            .model_id
+            .push_str("-foreign-negative-control");
+        let foreign_error = engine
+            .restore_text_prefix(
+                &foreign,
+                TextPrefixRestoreIntent {
+                    prefix_ids: &prefix,
+                    pending_next_token: saved.snapshot.manifest.boundary.pending_next_token,
+                    transfer_bytes: args.transfer_bytes,
+                },
+            )
+            .expect_err("foreign identity snapshot must be rejected");
+        ensure!(
+            foreign_error
+                .to_string()
+                .contains("prefix snapshot identity differs"),
+            "unexpected foreign-identity rejection: {foreign_error}"
+        );
+        engine.check_ready()?;
+        let negative_readback = engine.save_text_prefix(TextPrefixSaveRequest {
             prefix_ids: &prefix,
             block_tokens: args.block_tokens,
             transfer_bytes: args.transfer_bytes,
         })?;
         ensure!(
-            saved.snapshot.manifest.state_root == readback.snapshot.manifest.state_root,
+            saved.snapshot.manifest.state_root == negative_readback.snapshot.manifest.state_root
+                && saved.snapshot.manifest.records == negative_readback.snapshot.manifest.records,
+            "foreign identity rejection changed resident prefix state"
+        );
+        drop(negative_readback);
+        engine.step(false)?;
+        let baseline_pending_token = engine.token()?;
+        let mut decoded_prefix = prefix.clone();
+        decoded_prefix.push(baseline_pending_token);
+        let decoded_saved = engine.save_text_prefix(TextPrefixSaveRequest {
+            prefix_ids: &decoded_prefix,
+            block_tokens: args.block_tokens,
+            transfer_bytes: args.transfer_bytes,
+        })?;
+        let baseline_pending_logits = engine.decode_logits()?;
+        let baseline_token = engine.prefill(&suffix, None)?;
+        let baseline_logits = engine.decode_logits()?;
+        engine.poison_state_for_prefix_e1()?;
+        let restore = engine.restore_text_prefix(
+            &decoded_saved.snapshot,
+            TextPrefixRestoreIntent {
+                prefix_ids: &decoded_prefix,
+                pending_next_token: decoded_saved.snapshot.manifest.boundary.pending_next_token,
+                transfer_bytes: args.transfer_bytes,
+            },
+        )?;
+        let readback = engine.save_text_prefix(TextPrefixSaveRequest {
+            prefix_ids: &decoded_prefix,
+            block_tokens: args.block_tokens,
+            transfer_bytes: args.transfer_bytes,
+        })?;
+        ensure!(
+            decoded_saved.snapshot.manifest.state_root == readback.snapshot.manifest.state_root,
             "post-restore readback state root differs"
         );
         ensure!(
-            saved.snapshot.manifest.records == readback.snapshot.manifest.records,
+            decoded_saved.snapshot.manifest.records == readback.snapshot.manifest.records,
             "post-restore readback receipts differ"
         );
         drop(readback);
@@ -184,14 +225,20 @@ fn main() -> Result<()> {
             "capacity": args.capacity,
             "prefix_tokens": prefix.len(),
             "suffix_tokens": suffix.len(),
+            "decode_committed_prefix_tokens": decoded_prefix.len(),
             "block_tokens": args.block_tokens,
             "transfer_bytes": args.transfer_bytes,
             "save": saved.receipt,
+            "decode_boundary_save": decoded_saved.receipt,
+            "foreign_identity_negative_control": true,
+            "foreign_identity_rejected_before_mutation": true,
+            "post_foreign_identity_readback_state_root":
+                saved.snapshot.manifest.state_root.clone(),
             "restore": restore,
             "baseline_pending_next_token": baseline_pending_token,
             "restored_pending_next_token": restored_pending_token,
             "pending_decode_logits_bit_equal": true,
-            "post_restore_readback_state_root": saved.snapshot.manifest.state_root,
+            "post_decode_restore_readback_state_root": decoded_saved.snapshot.manifest.state_root,
             "post_restore_readback_pass": true,
             "baseline_suffix_token": baseline_token,
             "restored_suffix_token": restored_token,

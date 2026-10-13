@@ -8,10 +8,11 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
 use crate::{
+    checkpoint::MappedCheckpoint,
     model_spec::{Architecture, Mixer, ModelSpec},
     op_contract::GdnSpec,
 };
@@ -42,6 +43,65 @@ fn file_sha256(path: &Path) -> Result<String> {
     Ok(encode_hex(&h.finalize()))
 }
 
+type WeightRanges = Vec<(u64, u64)>;
+
+fn loaded_weight_shards(
+    dir: &Path,
+    spec: &ModelSpec,
+) -> Result<(Vec<(String, WeightRanges)>, String)> {
+    let mapped = MappedCheckpoint::open(dir)?;
+    let manifest = mapped.q38_manifest(spec)?;
+    let mut by_shard: BTreeMap<String, WeightRanges> = BTreeMap::new();
+    for entry in manifest.entries.values().filter(|entry| entry.load) {
+        let start = entry
+            .data_start
+            .checked_add(entry.data_offsets[0])
+            .context("loaded tensor start overflow")?;
+        let len = entry.data_offsets[1]
+            .checked_sub(entry.data_offsets[0])
+            .context("invalid loaded tensor extent")?;
+        by_shard
+            .entry(entry.shard.clone())
+            .or_default()
+            .push((start, len));
+    }
+    ensure!(
+        !by_shard.is_empty(),
+        "prefix identity has no loaded weights"
+    );
+    let mut shards: Vec<_> = by_shard.into_iter().collect();
+    for ranges in &mut shards {
+        ranges.1.sort_unstable();
+    }
+    let manifest_sha = sha256(&canonical(&manifest)?);
+    Ok((shards, manifest_sha))
+}
+
+fn selected_file_bytes_sha256(path: &Path, ranges: &WeightRanges) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    for &(start, len) in ranges {
+        h.update(start.to_le_bytes());
+        h.update(len.to_le_bytes());
+        file.seek(SeekFrom::Start(start))
+            .with_context(|| format!("seek identity weight bytes {}", path.display()))?;
+        let mut left = len;
+        while left > 0 {
+            let want = buffer
+                .len()
+                .min(usize::try_from(left).context("range length overflow")?);
+            let got = file
+                .read(&mut buffer[..want])
+                .with_context(|| format!("read identity weight bytes {}", path.display()))?;
+            ensure!(got > 0, "identity weight range ended early");
+            h.update(&buffer[..got]);
+            left -= u64::try_from(got).context("read length overflow")?;
+        }
+    }
+    Ok(encode_hex(&h.finalize()))
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -63,6 +123,7 @@ pub struct PrefixIdentity {
     pub model_revision: String,
     pub tokenizer: String,
     pub model_spec_sha256: String,
+    pub hashed_weight_bytes: usize,
     pub attention_kv_dtype: String,
     pub gdn_dtype: String,
     pub layer_layout: String,
@@ -88,6 +149,7 @@ impl PrefixIdentity {
             model_revision: model_revision.into(),
             tokenizer: tokenizer.into(),
             model_spec_sha256: sha256(&canonical(spec)?),
+            hashed_weight_bytes: 0,
             attention_kv_dtype: "BF16".into(),
             gdn_dtype: "F32".into(),
             layer_layout: "layer-major natural engine layout".into(),
@@ -96,48 +158,110 @@ impl PrefixIdentity {
         })
     }
 
-    /// Derive checkpoint identity from local metadata rather than caller labels.
+    /// Derive checkpoint identity from actual local bytes, not caller labels.
     ///
-    /// The hashes intentionally cover the model index/checksum metadata and the
-    /// tokenizer files.  This is not a proof of every weight byte, but it is
-    /// independent of the prefix IDs supplied to save/restore.
+    /// Every loaded safetensors byte range is streamed and hashed in parallel by
+    /// shard.  Config/index/tokenizer metadata and the canonical ModelSpec are
+    /// included as well; no optional checksum file is trusted.  This function is
+    /// intentionally lazy at save/restore time because tokenizer files are not
+    /// required merely to load and serve model weights.
     pub fn for_checkpoint(dir: &Path, rope: &str, spec: &ModelSpec) -> Result<Self> {
         let config = dir.join("config.json");
         let index = dir.join("model.safetensors.index.json");
-        let checksums = dir.join("safetensors-md5sum.txt");
         let tokenizer_json = dir.join("tokenizer.json");
         let tokenizer_config = dir.join("tokenizer_config.json");
 
         let config_sha = file_sha256(&config)?;
         let index_sha = file_sha256(&index)?;
-        let checksum_sha = if checksums.exists() {
-            Some(file_sha256(&checksums)?)
-        } else {
-            None
-        };
         let model_id = format!("config-sha256:{config_sha}");
-        let revision_seed = [
+        for path in [&tokenizer_json, &tokenizer_config] {
+            ensure!(
+                path.is_file(),
+                "prefix identity requires {}",
+                path.display()
+            );
+        }
+
+        let (selected, loaded_manifest_sha) = loaded_weight_shards(dir, spec)?;
+        let hashed_weight_bytes = selected
+            .iter()
+            .map(|(_, ranges)| ranges.iter().map(|&(_, len)| len).sum::<u64>())
+            .try_fold(0usize, |sum, len| {
+                sum.checked_add(usize::try_from(len).context("weight byte overflow")?)
+                    .context("weight byte total overflow")
+            })?;
+        let shards: Vec<_> = selected
+            .into_iter()
+            .map(|(name, ranges)| {
+                let path = dir.join(&name);
+                (name, path, ranges)
+            })
+            .collect();
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(shards.len());
+        let mut hashed = Vec::new();
+        std::thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::with_capacity(workers);
+            for worker in 0..workers {
+                let shards = &shards;
+                handles.push(scope.spawn(move || -> Result<Vec<(usize, String)>> {
+                    let mut output = Vec::new();
+                    for position in (worker..shards.len()).step_by(workers) {
+                        let (name, path, ranges) = &shards[position];
+                        let digest = selected_file_bytes_sha256(path, ranges)
+                            .with_context(|| format!("hash model shard {name}"))?;
+                        output.push((position, digest));
+                    }
+                    Ok(output)
+                }));
+            }
+            for handle in handles {
+                let output = handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("model shard hash worker panicked"))??;
+                hashed.extend(output);
+            }
+            Ok(())
+        })?;
+        hashed.sort_unstable_by_key(|(position, _)| *position);
+        ensure!(
+            hashed.len() == shards.len(),
+            "model shard hash coverage mismatch"
+        );
+        let digests: Vec<_> = hashed.into_iter().map(|(_, digest)| digest).collect();
+
+        let mut revision = Sha256::new();
+        for (name, digest) in [
             ("config.json", config_sha),
             ("model.safetensors.index.json", index_sha),
-            (
-                "safetensors-md5sum.txt",
-                checksum_sha.unwrap_or_else(|| "absent".into()),
-            ),
-        ];
-        let mut revision = Sha256::new();
-        for (name, digest) in revision_seed {
+            ("loaded-tensor-manifest", loaded_manifest_sha),
+        ] {
+            revision.update(name.as_bytes());
+            revision.update([0]);
+            revision.update(digest.as_bytes());
+            revision.update([0]);
+        }
+        for ((name, _, _), digest) in shards.into_iter().zip(digests) {
             revision.update(name.as_bytes());
             revision.update([0]);
             revision.update(digest.as_bytes());
             revision.update([0]);
         }
         let model_revision = format!(
-            "checkpoint-metadata-sha256:{}",
+            "checkpoint-bytes-sha256:{}",
             encode_hex(&revision.finalize())
         );
 
         let mut tokenizer = Sha256::new();
         for path in [tokenizer_json, tokenizer_config] {
+            ensure!(
+                path.is_file(),
+                "prefix identity requires {}",
+                path.display()
+            );
             let name = path
                 .file_name()
                 .and_then(std::ffi::OsStr::to_str)
@@ -150,7 +274,13 @@ impl PrefixIdentity {
             tokenizer.update([0]);
         }
         let tokenizer_identity = format!("tokenizer-sha256:{}", encode_hex(&tokenizer.finalize()));
-        Self::new(model_id, model_revision, tokenizer_identity, rope, spec)
+        let mut identity = Self::new(model_id, model_revision, tokenizer_identity, rope, spec)?;
+        identity.hashed_weight_bytes = hashed_weight_bytes;
+        ensure!(
+            identity.hashed_weight_bytes > 0,
+            "prefix identity did not hash actual weight bytes"
+        );
+        Ok(identity)
     }
 
     fn validate(&self) -> Result<()> {
@@ -236,9 +366,24 @@ pub struct PrefixRecordReceipt {
 pub struct PrefixBoundary {
     pub prefix_tokens: usize,
     pub last_token: u32,
+    pub last_input_kind: PrefixLastInputKind,
     pub pending_next_token: u32,
     pub token_ids_sha256: String,
     pub rope_context_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixLastInputKind {
+    PrefillChunk,
+    DecodeToken,
+}
+
+fn last_input_tag(kind: PrefixLastInputKind) -> &'static str {
+    match kind {
+        PrefixLastInputKind::PrefillChunk => "prefill_chunk",
+        PrefixLastInputKind::DecodeToken => "decode_token",
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -262,6 +407,8 @@ pub struct PrefixSaveReceipt {
     pub state_root: String,
     pub total_state_bytes: usize,
     pub transfer_bytes: usize,
+    pub identity_hash_ms: f64,
+    pub identity_hashed_bytes: usize,
     pub wall_ms: f64,
 }
 
@@ -271,6 +418,8 @@ pub struct PrefixRestoreReceipt {
     pub state_root: String,
     pub total_state_bytes: usize,
     pub transfer_bytes: usize,
+    pub identity_hash_ms: f64,
+    pub identity_hashed_bytes: usize,
     pub wall_ms: f64,
 }
 
@@ -627,11 +776,12 @@ impl PrefixBuilder {
         let gdn_root = merkle(&gdn_hashes);
         let state_root = sha256(
             format!(
-                "capacity={};block={};prefix={};token_ids={};rope={};pending={};root={}",
+                "capacity={};block={};prefix={};token_ids={};last_input={};rope={};pending={};root={}",
                 self.geometry.capacity,
                 self.geometry.block_tokens,
                 self.boundary.prefix_tokens,
                 self.boundary.token_ids_sha256,
+                last_input_tag(self.boundary.last_input_kind),
                 self.boundary.rope_context_sha256,
                 self.boundary.pending_next_token,
                 merkle(&[
@@ -760,11 +910,12 @@ impl PrefixSnapshot {
         );
         let state_root = sha256(
             format!(
-                "capacity={};block={};prefix={};token_ids={};rope={};pending={};root={}",
+                "capacity={};block={};prefix={};token_ids={};last_input={};rope={};pending={};root={}",
                 self.manifest.capacity,
                 self.manifest.block_tokens,
                 self.manifest.boundary.prefix_tokens,
                 self.manifest.boundary.token_ids_sha256,
+                last_input_tag(self.manifest.boundary.last_input_kind),
                 self.manifest.boundary.rope_context_sha256,
                 self.manifest.boundary.pending_next_token,
                 merkle(&[
@@ -811,6 +962,25 @@ impl PrefixSnapshot {
         ensure!(
             self.manifest.boundary.pending_next_token == pending_next_token,
             "prefix pending next-token mismatch"
+        );
+        Ok(())
+    }
+
+    pub fn verify_prefix_and_pending_within_vocab(
+        &self,
+        prefix_ids: &[u32],
+        pending_next_token: u32,
+        vocab: usize,
+    ) -> Result<()> {
+        self.verify_prefix_and_pending(prefix_ids, pending_next_token)?;
+        ensure!(vocab > 0, "empty vocabulary");
+        ensure!(
+            prefix_ids.iter().all(|token| (*token as usize) < vocab),
+            "prefix token outside vocabulary"
+        );
+        ensure!(
+            (pending_next_token as usize) < vocab,
+            "pending prefix token outside vocabulary"
         );
         Ok(())
     }
@@ -951,13 +1121,17 @@ mod tests {
     }
 
     fn identity(spec: &ModelSpec) -> PrefixIdentity {
-        PrefixIdentity::new("test-model", "rev1", "test-tokenizer", "rope-v1", spec).unwrap()
+        let mut identity =
+            PrefixIdentity::new("test-model", "rev1", "test-tokenizer", "rope-v1", spec).unwrap();
+        identity.hashed_weight_bytes = 1;
+        identity
     }
 
     fn boundary(ids: &[u32]) -> PrefixBoundary {
         PrefixBoundary {
             prefix_tokens: ids.len(),
             last_token: *ids.last().unwrap(),
+            last_input_kind: PrefixLastInputKind::PrefillChunk,
             pending_next_token: 77,
             token_ids_sha256: token_ids_sha256(ids).unwrap(),
             rope_context_sha256: sha256(b"text-rope"),
@@ -1007,6 +1181,48 @@ mod tests {
     }
 
     #[test]
+    fn decode_committed_boundary_is_representable_and_verified() -> Result<()> {
+        let spec = spec();
+        let ids = [7u32, 8, 9, 10];
+        let mut boundary = boundary(&ids);
+        boundary.last_input_kind = PrefixLastInputKind::DecodeToken;
+        let geometry = geometry(&spec, ids.len(), 2);
+        let mut builder = PrefixBuilder::new(geometry, boundary)?;
+        for layer in [1usize, 3] {
+            for block in 0..2 {
+                let valid = ids.len().min((block + 1) * 2) - block * 2;
+                builder.add(
+                    PrefixRecordKind::AttentionKvBlock,
+                    layer,
+                    block,
+                    vec![9; builder.geometry.attention_block_bytes(valid)?],
+                )?;
+            }
+        }
+        for layer in [0usize, 2] {
+            builder.add(
+                PrefixRecordKind::GdnS,
+                layer,
+                0,
+                vec![9; builder.geometry.gdn_s_bytes],
+            )?;
+            builder.add(
+                PrefixRecordKind::GdnHistory,
+                layer,
+                0,
+                vec![9; builder.geometry.gdn_history_bytes],
+            )?;
+        }
+        let package = builder.finish()?;
+        assert_eq!(
+            package.manifest.boundary.last_input_kind,
+            PrefixLastInputKind::DecodeToken
+        );
+        package.verify_prefix_and_pending_within_vocab(&ids, 77, 100)?;
+        Ok(())
+    }
+
+    #[test]
     fn geometry_counts_partial_blocks_and_exact_bytes() {
         let spec = spec();
         let geometry = geometry(&spec, 5, 2);
@@ -1035,23 +1251,38 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_identity_is_derived_from_local_metadata() -> Result<()> {
+    fn identity_hash_changes_for_actual_selected_weight_bytes() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
-            "flyingfish-prefix-identity-{}-{}",
+            "flyingfish-prefix-weight-identity-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let shard = root.join("shard-a.bin");
+        std::fs::write(&shard, b"actual-weight-bytes-a")?;
+        let ranges = vec![(0u64, shard.metadata()?.len())];
+        let first = selected_file_bytes_sha256(&shard, &ranges)?;
+        std::fs::write(&shard, b"actual-weight-bytes-b")?;
+        let second = selected_file_bytes_sha256(&shard, &ranges)?;
+        assert_ne!(first, second);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_identity_requires_tokenizer_files_before_hashing() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "flyingfish-prefix-tokenizer-identity-{}-{}",
             std::process::id(),
             line!()
         ));
         std::fs::create_dir_all(&root)?;
         std::fs::write(root.join("config.json"), b"config-a")?;
         std::fs::write(root.join("model.safetensors.index.json"), b"index-a")?;
-        std::fs::write(root.join("tokenizer.json"), b"tokenizer-a")?;
-        std::fs::write(root.join("tokenizer_config.json"), b"tokenizer-config-a")?;
-        let spec = spec();
-        let first = PrefixIdentity::for_checkpoint(&root, "rope-a", &spec)?;
-        first.validate()?;
-        std::fs::write(root.join("tokenizer_config.json"), b"tokenizer-config-b")?;
-        let second = PrefixIdentity::for_checkpoint(&root, "rope-a", &spec)?;
-        assert_ne!(first, second);
+        let err = PrefixIdentity::for_checkpoint(&root, "rope-a", &spec())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tokenizer.json"), "{err}");
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -1137,6 +1368,26 @@ mod tests {
         let mut stale_sha = package.clone();
         stale_sha.manifest.boundary.token_ids_sha256 = sha256(b"stale-prefix");
         assert!(stale_sha.verify_prefix(&[7, 8, 9, 10]).is_err());
+    }
+
+    #[test]
+    fn out_of_vocabulary_prefix_or_pending_is_rejected_before_restore() {
+        let package = full_package();
+        assert!(
+            package
+                .verify_prefix_and_pending_within_vocab(&[7, 8, 9, 10], 77, 100)
+                .is_ok()
+        );
+        assert!(
+            package
+                .verify_prefix_and_pending_within_vocab(&[7, 8, 9, 100], 77, 100)
+                .is_err()
+        );
+        assert!(
+            package
+                .verify_prefix_and_pending_within_vocab(&[7, 8, 9, 10], 100, 100)
+                .is_err()
+        );
     }
 
     #[test]
