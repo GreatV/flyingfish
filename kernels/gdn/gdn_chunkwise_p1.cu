@@ -503,13 +503,19 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
         for (int rr = 1; rr < P1_SUB; ++rr) {
             if (tid < P1_C) {
                 const int blk = tid >> 4;
-                float* row = sA + (size_t)(blk * P1_SUB + rr) * P1_A_LD;
+                // Both the substituted row AND the rows it reads live in the diagonal
+                // block's COLUMN window [blk*P1_SUB, blk*P1_SUB+P1_SUB); without the
+                // column offset the pass substitutes the off-diagonal block at columns
+                // 0..15 instead, destroying the original A[b,a] the merges consume.
+                const int c0 = blk * P1_SUB;
+                float* row = sA + (size_t)(blk * P1_SUB + rr) * P1_A_LD + c0;
                 for (int j = 0; j < rr; ++j) {
                     float acc = row[j];
                     #pragma unroll
                     for (int m = j + 1; m < P1_SUB; ++m) {
                         if (m < rr)
-                            acc = fmaf(row[m], sA[(size_t)(blk * P1_SUB + m) * P1_A_LD + j],
+                            acc = fmaf(row[m],
+                                       sA[(size_t)(blk * P1_SUB + m) * P1_A_LD + c0 + j],
                                        acc);
                     }
                     row[j] = acc;
@@ -552,25 +558,29 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             }
             __syncthreads();
             if (warp < 2) {                       // 2 column tiles of a 16-wide block
+                const int nt = warp;              // tile a in [nt*8, nt*8+8)
                 float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 const AFrag a = p1_a_sbf(sT, P1_T_LD, b0, b0, gid, t2);
-                const BFrag b = p1_b_sbf(sV, 32, gid, 0, t2);
+                const BFrag b = p1_b_sbf(sV, 32, gid + nt * 8, 0, t2);
                 P1_MMA(d, a, b);
-                p1_store_f32(sVn, P1_SUB, 0, 0, gid, t2, d);
+                p1_store_f32(sVn, P1_SUB, 0, nt * 8, gid, t2, d);
             }
             __syncthreads();
             for (int idx = tid; idx < P1_SUB * P1_SUB; idx += P1_THREADS) {
                 const int al = idx / P1_SUB, bl = idx - al * P1_SUB;
-                sVnB[512 + bl * 32 + al] = __float2bfloat16_rn(
+                // memory[n=a][k=a'] must hold T11[a'][a]: the destination is indexed
+                // [al][bl] (row a, column a'), the source [b=a'][a=al] of sT.
+                sVnB[512 + al * 32 + bl] = __float2bfloat16_rn(
                     sT[(size_t)(a0 + bl) * P1_T_LD + (a0 + al)]);
             }
             __syncthreads();
             if (warp < 2) {
+                const int nt = warp;              // tile a in [nt*8, nt*8+8)
                 float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 const AFrag a = p1_a_sf32(sVn, P1_SUB, 0, 0, gid, t2);
-                const BFrag b = p1_b_sbf(sVnB + 512, 32, gid, 0, t2);
+                const BFrag b = p1_b_sbf(sVnB + 512, 32, gid + nt * 8, 0, t2);
                 P1_MMA(d, a, b);
-                p1_store_bf16(sT, P1_T_LD, b0, a0, gid, t2, d);
+                p1_store_bf16(sT, P1_T_LD, b0, a0 + nt * 8, gid, t2, d);
             }
             __syncthreads();
         }
@@ -854,7 +864,9 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             const float gl = sG[P1_C - 1];
             #pragma unroll
             for (int nt = 0; nt < NT; ++nt) {
-                float o[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+                // NT is 1/2/4 by split; a fixed [2][4] sizes only s8 and reads out
+                // of bounds at s4 (NT=4).
+                float o[NT][4] = {{0.0f, 0.0f, 0.0f, 0.0f}};
                 #pragma unroll
                 for (int ks = 0; ks < P1_C / 16; ++ks) {
                     // ks*16 is the chunk-row offset of the 16-wide k-step: without it

@@ -49,7 +49,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const SCHEMA_MANIFEST: &str = "gdn-p1-frozen-inputs/1";
-const SCHEMA_BASIS: &str = "gdn-p1-gate-basis/2";
+const SCHEMA_BASIS: &str = "gdn-p1-gate-basis/3";
 const SCHEMA_GATE: &str = "gdn-p1-gate-report/1";
 const SCHEMA_TIMING: &str = "gdn-p1-timing-report/1";
 
