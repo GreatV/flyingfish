@@ -3,16 +3,25 @@ use crate::{
     backend::cuda::{
         Device,
         blas::Blas,
+        copy,
         decode::Attention,
         flash::{Flash, Shape},
         ops::{Ops, flat, grid},
     },
     backend::{Event, Head, Logits, Settings, SpecBudget, Target, TreeBuilder},
     config::Config,
+    prefix_state::{
+        PrefixBoundary, PrefixBuilder, PrefixGeometry, PrefixIdentity, PrefixRecordKind,
+        PrefixRestoreReceipt, PrefixSaveReceipt, PrefixSnapshot, sha256, token_ids_sha256,
+    },
     trace::Trace,
+    vision_input::PositionPlan,
 };
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaGraph, CudaSlice, CudaStream, DevicePtrMut, PushKernelArg, sys};
+use cudarc::driver::{
+    CudaContext, CudaGraph, CudaSlice, CudaStream, DevicePtrMut, PinnedHostSlice, PushKernelArg,
+    sys,
+};
 use half::bf16;
 use std::{
     path::{Path, PathBuf},
@@ -425,6 +434,143 @@ pub struct Engine {
     workspace_rows: usize,
     trace_layer: usize,
     position: usize,
+}
+
+pub struct TextPrefixSaveRequest<'a> {
+    pub identity: PrefixIdentity,
+    pub prefix_ids: &'a [u32],
+    pub block_tokens: usize,
+    pub transfer_bytes: usize,
+}
+
+pub struct TextPrefixRestoreIntent<'a> {
+    pub prefix_ids: &'a [u32],
+    pub pending_next_token: u32,
+    pub transfer_bytes: usize,
+}
+
+pub struct TextPrefixSaveOutput {
+    pub snapshot: PrefixSnapshot,
+    pub receipt: PrefixSaveReceipt,
+}
+
+fn pinned_transfer_ring(
+    ctx: &Arc<CudaContext>,
+    transfer_bytes: usize,
+) -> Result<PinnedHostSlice<u8>> {
+    ensure!(transfer_bytes > 0, "prefix transfer bytes must be nonzero");
+    Ok(unsafe { ctx.alloc_pinned_with_flags::<u8>(transfer_bytes, 0)? })
+}
+
+fn dtoh_pinned_chunks<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    source: &CudaSlice<T>,
+    source_element_offset: usize,
+    bytes: usize,
+    ring: &mut PinnedHostSlice<u8>,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes);
+    let mut source_byte_offset = source_element_offset
+        .checked_mul(std::mem::size_of::<T>())
+        .context("prefix D2H source offset overflow")?;
+    let mut left = bytes;
+    while left > 0 {
+        let chunk = left.min(ring.len());
+        let source_elements = source_byte_offset / std::mem::size_of::<T>();
+        copy::dtoh_bytes(stream, source, source_elements, ring, 0, chunk)?;
+        stream.synchronize()?;
+        out.extend_from_slice(&ring.as_slice()?[..chunk]);
+        source_byte_offset += chunk;
+        left -= chunk;
+    }
+    ensure!(out.len() == bytes, "prefix D2H byte count mismatch");
+    Ok(out)
+}
+
+fn htod_pinned_chunks<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    destination: &mut CudaSlice<T>,
+    destination_element_offset: usize,
+    bytes: &[u8],
+    ring: &mut PinnedHostSlice<u8>,
+) -> Result<()> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let chunk = (bytes.len() - offset).min(ring.len());
+        {
+            let destination = ring.as_mut_slice()?;
+            destination[..chunk].copy_from_slice(&bytes[offset..offset + chunk]);
+        }
+        copy::htod_bytes(
+            stream,
+            destination,
+            destination_element_offset + offset / std::mem::size_of::<T>(),
+            ring,
+            0,
+            chunk,
+        )?;
+        stream.synchronize()?;
+        offset += chunk;
+    }
+    Ok(())
+}
+
+fn text_rope_context_sha256(capacity: usize) -> Result<String> {
+    let axes = PositionPlan::text(1, capacity)?.packed_axes()?;
+    let mut bytes = Vec::with_capacity(axes.len() * 4);
+    for axis in axes {
+        bytes.extend_from_slice(&axis.to_le_bytes());
+    }
+    Ok(sha256(&bytes))
+}
+
+type PrefixAttentionTensors = Vec<(usize, Vec<Vec<u8>>, Vec<Vec<u8>>)>;
+
+fn prefix_attention_host_tensors(
+    snapshot: &PrefixSnapshot,
+    head_dim: usize,
+) -> Result<PrefixAttentionTensors> {
+    let prefix_tokens = snapshot.manifest.boundary.prefix_tokens;
+    let block_tokens = snapshot.manifest.block_tokens;
+    let prefix_bytes = prefix_tokens * head_dim * 2;
+    let mut by_layer = std::collections::BTreeMap::new();
+    for (receipt, payload) in snapshot.records() {
+        if receipt.key.kind != PrefixRecordKind::AttentionKvBlock {
+            continue;
+        }
+        let segment_bytes = receipt.key.valid_tokens * head_dim * 2;
+        ensure!(
+            !payload.is_empty() && payload.len() % (2 * segment_bytes) == 0,
+            "malformed attention payload extent"
+        );
+        let kv_heads = payload.len() / (2 * segment_bytes);
+        let entry = by_layer
+            .entry(receipt.key.layer)
+            .or_insert_with(|| (vec![Vec::new(); kv_heads], vec![Vec::new(); kv_heads]));
+        ensure!(
+            entry.0.len() == kv_heads && entry.1.len() == kv_heads,
+            "attention head count changes inside a prefix snapshot"
+        );
+        for tensor in [&mut entry.0, &mut entry.1] {
+            if tensor.iter().any(|x| x.is_empty()) {
+                tensor.iter_mut().for_each(|x| x.resize(prefix_bytes, 0));
+            }
+        }
+        let block = receipt.key.token_start / block_tokens;
+        let destination_offset = block * block_tokens * head_dim * 2;
+        let tensors: [&mut Vec<Vec<u8>>; 2] = [entry.0.as_mut(), entry.1.as_mut()];
+        for (tensor_index, tensor) in tensors.into_iter().enumerate() {
+            for (head, destination) in tensor.iter_mut().enumerate() {
+                let payload_offset = tensor_index * kv_heads * segment_bytes + head * segment_bytes;
+                destination[destination_offset..destination_offset + segment_bytes]
+                    .copy_from_slice(&payload[payload_offset..payload_offset + segment_bytes]);
+            }
+        }
+    }
+    Ok(by_layer
+        .into_iter()
+        .map(|(layer, (k, v))| (layer, k, v))
+        .collect())
 }
 
 impl Engine {
@@ -1559,6 +1705,361 @@ impl Engine {
             .stream
             .memcpy_htod(&[1i32], &mut self.work.length)?;
         self.poisoned = false;
+        Ok(())
+    }
+
+    /// Explicitly destroy resident state for the E1 restore experiment.
+    ///
+    /// This deliberately has no silent fallback and is not a production cache
+    /// eviction API.  It makes the subsequent restore prove that every prefix
+    /// byte came from the host package rather than remaining resident.
+    #[doc(hidden)]
+    pub fn poison_state_for_prefix_e1(&mut self) -> Result<()> {
+        self.device.stream.synchronize()?;
+        for kv in &mut self.state.kv {
+            self.device.stream.memset_zeros(&mut kv.k)?;
+            self.device.stream.memset_zeros(&mut kv.v)?;
+        }
+        self.state.reset(&self.device.stream)?;
+        self.reset_qwen_positions()?;
+        self.device
+            .stream
+            .memcpy_htod(&[0i32], &mut self.work.position)?;
+        self.device
+            .stream
+            .memcpy_htod(&[1i32], &mut self.work.length)?;
+        self.set_token(0)?;
+        self.position = 0;
+        self.device.stream.synchronize()?;
+        Ok(())
+    }
+
+    pub fn save_text_prefix(
+        &mut self,
+        request: TextPrefixSaveRequest<'_>,
+    ) -> Result<TextPrefixSaveOutput> {
+        let started = Instant::now();
+        self.closure.assert_ready()?;
+        ensure!(!self.poisoned, "cannot save a poisoned engine prefix");
+        ensure!(self.qwen.is_some(), "text prefix save requires Qwen3.8");
+        ensure!(
+            self.images.is_none(),
+            "multimodal prefix save is unsupported"
+        );
+        ensure!(
+            self.spec.as_ref().is_none_or(|spec| spec.active_rows == 0),
+            "cannot save during a speculative transaction"
+        );
+        let prefix = request.prefix_ids.len();
+        ensure!(
+            prefix > 0 && prefix == self.position,
+            "prefix boundary mismatch"
+        );
+        ensure!(
+            request
+                .prefix_ids
+                .iter()
+                .all(|token| (*token as usize) < self.config.vocab_size),
+            "prefix token outside vocabulary"
+        );
+        self.device.stream.synchronize()?;
+        let sequence = self
+            .state
+            .sequence
+            .as_ref()
+            .context("Qwen sequence metadata missing")?;
+        let sequence = self.device.stream.clone_dtoh(sequence)?;
+        ensure!(
+            sequence
+                == [
+                    prefix as i32,
+                    1,
+                    prefix as i32 + 1,
+                    self.capacity as i32,
+                    1,
+                    0,
+                    0,
+                    0
+                ],
+            "device sequence metadata differs from committed text prefix"
+        );
+        let last_token = request
+            .prefix_ids
+            .last()
+            .copied()
+            .context("prefix token ids are empty")?;
+        let pending_next_token = self.token()?;
+        ensure!(
+            (pending_next_token as usize) < self.config.vocab_size,
+            "pending prefix token outside vocabulary"
+        );
+        let resident_ids = self.device.stream.clone_dtoh(&self.work.ids)?;
+        let last_input_index = (prefix - 1) % self.chunk;
+        ensure!(
+            resident_ids.get(last_input_index).copied() == Some(last_token),
+            "last prefix input differs from the resident last prefill chunk"
+        );
+        ensure!(
+            request
+                .prefix_ids
+                .iter()
+                .all(|token| (*token as usize) < self.config.vocab_size),
+            "prefix token outside vocabulary"
+        );
+        let geometry = PrefixGeometry::new(
+            &self.model_spec,
+            self.capacity,
+            prefix,
+            request.block_tokens,
+            &request.identity,
+        )?;
+        let boundary = PrefixBoundary {
+            prefix_tokens: prefix,
+            last_token,
+            pending_next_token,
+            token_ids_sha256: token_ids_sha256(request.prefix_ids)?,
+            rope_context_sha256: text_rope_context_sha256(self.capacity)?,
+        };
+        let builder = PrefixBuilder::new(geometry, boundary)?;
+        let mut ring = pinned_transfer_ring(&self.device.ctx, request.transfer_bytes)?;
+        let result = self.save_text_prefix_into(builder, &mut ring);
+        if result.is_err() {
+            self.device.stream.synchronize()?;
+            self.poisoned = true;
+        }
+        let snapshot = result?;
+        let receipt = PrefixSaveReceipt {
+            prefix_tokens: prefix,
+            state_root: snapshot.manifest.state_root.clone(),
+            total_state_bytes: snapshot.manifest.total_state_bytes,
+            transfer_bytes: request.transfer_bytes,
+            wall_ms: started.elapsed().as_secs_f64() * 1000.0,
+        };
+        Ok(TextPrefixSaveOutput { snapshot, receipt })
+    }
+
+    fn save_text_prefix_into(
+        &mut self,
+        mut builder: PrefixBuilder,
+        ring: &mut PinnedHostSlice<u8>,
+    ) -> Result<PrefixSnapshot> {
+        let stream = self.device.stream.clone();
+        let capacity = self.capacity;
+        let dim = self.model_spec.head_dim as usize;
+        let block_tokens = builder.geometry.block_tokens;
+        let prefix_tokens = builder.geometry.prefix_tokens;
+        for (physical, layer) in self.model_spec.layers.iter().enumerate() {
+            match layer.mixer {
+                crate::model_spec::Mixer::FullAttention => {
+                    let state_index = layer.state_index as usize;
+                    let kv = &self.state.kv[state_index];
+                    let prefix_bytes = prefix_tokens * dim * 2;
+                    let mut resident = [
+                        Vec::with_capacity(builder.geometry.kv_heads * prefix_bytes),
+                        Vec::with_capacity(builder.geometry.kv_heads * prefix_bytes),
+                    ];
+                    for tensor in [&kv.k, &kv.v] {
+                        let tensor_index = usize::from(std::ptr::eq(tensor, &kv.v));
+                        for head in 0..builder.geometry.kv_heads {
+                            let source_element_offset = head * capacity * dim;
+                            let bytes = dtoh_pinned_chunks(
+                                &stream,
+                                tensor,
+                                source_element_offset,
+                                prefix_bytes,
+                                ring,
+                            )?;
+                            resident[tensor_index].extend_from_slice(&bytes);
+                        }
+                    }
+                    for block in 0..prefix_tokens.div_ceil(block_tokens) {
+                        let token_start = block * block_tokens;
+                        let valid = (prefix_tokens - token_start).min(block_tokens);
+                        let segment_bytes = valid * dim * 2;
+                        let mut payload =
+                            Vec::with_capacity(builder.geometry.attention_block_bytes(valid)?);
+                        for tensor in &resident {
+                            for head in 0..builder.geometry.kv_heads {
+                                let source_offset = head * prefix_bytes + token_start * dim * 2;
+                                payload.extend_from_slice(
+                                    &tensor[source_offset..source_offset + segment_bytes],
+                                );
+                            }
+                        }
+                        builder.add(
+                            PrefixRecordKind::AttentionKvBlock,
+                            physical,
+                            block,
+                            payload,
+                        )?;
+                    }
+                    drop(resident);
+                }
+                crate::model_spec::Mixer::Gdn => {
+                    let state_index = layer.state_index as usize;
+                    let state = &self.state.gdn[state_index];
+                    let s = dtoh_pinned_chunks(
+                        &stream,
+                        &state.s,
+                        0,
+                        builder.geometry.gdn_s_bytes,
+                        ring,
+                    )?;
+                    builder.add(PrefixRecordKind::GdnS, physical, 0, s)?;
+                    let history = dtoh_pinned_chunks(
+                        &stream,
+                        &state.history,
+                        0,
+                        builder.geometry.gdn_history_bytes,
+                        ring,
+                    )?;
+                    builder.add(PrefixRecordKind::GdnHistory, physical, 0, history)?;
+                }
+            }
+        }
+        builder.finish()
+    }
+
+    pub fn restore_text_prefix(
+        &mut self,
+        snapshot: &PrefixSnapshot,
+        intent: TextPrefixRestoreIntent<'_>,
+    ) -> Result<PrefixRestoreReceipt> {
+        let started = Instant::now();
+        snapshot.verify_prefix_and_pending(intent.prefix_ids, intent.pending_next_token)?;
+        let geometry = PrefixGeometry::new(
+            &self.model_spec,
+            self.capacity,
+            snapshot.manifest.boundary.prefix_tokens,
+            snapshot.manifest.block_tokens,
+            &snapshot.manifest.identity,
+        )?;
+        geometry.verify_manifest(&snapshot.manifest)?;
+        ensure!(
+            snapshot.manifest.boundary.rope_context_sha256
+                == text_rope_context_sha256(self.capacity)?,
+            "prefix rope context differs from this engine"
+        );
+        ensure!(!self.poisoned, "cannot restore into a poisoned engine");
+        ensure!(self.qwen.is_some(), "text prefix restore requires Qwen3.8");
+        ensure!(
+            self.images.is_none(),
+            "multimodal prefix restore is unsupported"
+        );
+        ensure!(
+            self.spec.as_ref().is_none_or(|spec| spec.active_rows == 0),
+            "cannot restore during a speculative transaction"
+        );
+        self.device.stream.synchronize()?;
+        self.poisoned = true;
+        let result = self.restore_text_prefix_from(snapshot, intent.transfer_bytes);
+        if let Err(error) = result {
+            self.device.stream.synchronize()?;
+            return Err(error);
+        }
+        self.mtp_epoch = self
+            .mtp_epoch
+            .checked_add(1)
+            .context("MTP state epoch exhausted")?;
+        if let Some(spec) = self.spec.as_mut() {
+            spec.active_rows = 0;
+        }
+        self.poisoned = false;
+        Ok(PrefixRestoreReceipt {
+            prefix_tokens: snapshot.manifest.boundary.prefix_tokens,
+            state_root: snapshot.manifest.state_root.clone(),
+            total_state_bytes: snapshot.manifest.total_state_bytes,
+            transfer_bytes: intent.transfer_bytes,
+            wall_ms: started.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+
+    fn restore_text_prefix_from(
+        &mut self,
+        snapshot: &PrefixSnapshot,
+        transfer_bytes: usize,
+    ) -> Result<()> {
+        let mut ring = pinned_transfer_ring(&self.device.ctx, transfer_bytes)?;
+        let stream = self.device.stream.clone();
+        let capacity = self.capacity;
+        let dim = self.model_spec.head_dim as usize;
+        let attention_tensors = prefix_attention_host_tensors(snapshot, dim)?;
+        for (physical, k_heads, v_heads) in attention_tensors {
+            let layer = self
+                .model_spec
+                .layers
+                .get(physical)
+                .with_context(|| format!("prefix layer {physical} outside model"))?;
+            ensure!(
+                matches!(layer.mixer, crate::model_spec::Mixer::FullAttention),
+                "prefix K/V record maps to a non-attention layer"
+            );
+            let kv = &mut self.state.kv[layer.state_index as usize];
+            for (head, bytes) in k_heads.iter().enumerate() {
+                htod_pinned_chunks(&stream, &mut kv.k, head * capacity * dim, bytes, &mut ring)?;
+            }
+            for (head, bytes) in v_heads.iter().enumerate() {
+                htod_pinned_chunks(&stream, &mut kv.v, head * capacity * dim, bytes, &mut ring)?;
+            }
+        }
+        for (receipt, payload) in snapshot.records() {
+            if receipt.key.kind == PrefixRecordKind::AttentionKvBlock {
+                continue;
+            }
+            let physical = receipt.key.layer;
+            let layer = self
+                .model_spec
+                .layers
+                .get(physical)
+                .with_context(|| format!("prefix layer {physical} outside model"))?;
+            let state_index = layer.state_index as usize;
+            match receipt.key.kind {
+                PrefixRecordKind::AttentionKvBlock => continue,
+                PrefixRecordKind::GdnS => {
+                    ensure!(
+                        matches!(layer.mixer, crate::model_spec::Mixer::Gdn),
+                        "prefix S record maps to a non-GDN layer"
+                    );
+                    htod_pinned_chunks(
+                        &stream,
+                        &mut self.state.gdn[state_index].s,
+                        0,
+                        payload,
+                        &mut ring,
+                    )?;
+                }
+                PrefixRecordKind::GdnHistory => {
+                    ensure!(
+                        matches!(layer.mixer, crate::model_spec::Mixer::Gdn),
+                        "prefix history record maps to a non-GDN layer"
+                    );
+                    htod_pinned_chunks(
+                        &stream,
+                        &mut self.state.gdn[state_index].history,
+                        0,
+                        payload,
+                        &mut ring,
+                    )?;
+                }
+            }
+        }
+        let prefix = snapshot.manifest.boundary.prefix_tokens;
+        stream.synchronize()?;
+        self.state
+            .set_sequence(&stream, prefix as u32, 1, self.workspace_rows as u32)?;
+        self.reset_qwen_positions()?;
+        stream.memcpy_htod(&[prefix as i32], &mut self.work.position)?;
+        stream.memcpy_htod(&[prefix as i32 + 1], &mut self.work.length)?;
+        stream.memcpy_htod(
+            &[snapshot.manifest.boundary.last_token],
+            &mut self
+                .work
+                .ids
+                .slice_mut((prefix - 1) % self.chunk..(prefix - 1) % self.chunk + 1),
+        )?;
+        self.set_token(snapshot.manifest.boundary.pending_next_token)?;
+        self.position = prefix;
+        stream.synchronize()?;
         Ok(())
     }
 

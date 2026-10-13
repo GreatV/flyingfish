@@ -11,6 +11,7 @@ pub mod model_spec;
 pub mod mtp;
 pub mod op_contract;
 pub mod prefill;
+pub mod prefix_state;
 pub mod serve;
 pub mod spec;
 pub mod tensors;

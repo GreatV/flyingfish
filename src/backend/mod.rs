@@ -6,6 +6,10 @@ pub mod setup;
 pub(crate) mod cuda;
 #[cfg(feature = "cuda")]
 pub use cuda::engine::Engine as Backend;
+#[cfg(feature = "cuda")]
+pub use cuda::engine::TextPrefixSaveOutput;
+#[cfg(feature = "cuda")]
+pub use cuda::engine::{TextPrefixRestoreIntent, TextPrefixSaveRequest};
 #[cfg(not(feature = "cuda"))]
 mod missing;
 #[cfg(not(feature = "cuda"))]
