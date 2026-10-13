@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use crate::{
@@ -22,6 +23,23 @@ pub fn sha256(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     encode_hex(&h.finalize())
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open identity file {}", path.display()))?;
+    let mut h = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("read identity file {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        h.update(&buffer[..count]);
+    }
+    Ok(encode_hex(&h.finalize()))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -76,6 +94,63 @@ impl PrefixIdentity {
             rope: rope.into(),
             tensor_semantics: PrefixTensorSemantics::default(),
         })
+    }
+
+    /// Derive checkpoint identity from local metadata rather than caller labels.
+    ///
+    /// The hashes intentionally cover the model index/checksum metadata and the
+    /// tokenizer files.  This is not a proof of every weight byte, but it is
+    /// independent of the prefix IDs supplied to save/restore.
+    pub fn for_checkpoint(dir: &Path, rope: &str, spec: &ModelSpec) -> Result<Self> {
+        let config = dir.join("config.json");
+        let index = dir.join("model.safetensors.index.json");
+        let checksums = dir.join("safetensors-md5sum.txt");
+        let tokenizer_json = dir.join("tokenizer.json");
+        let tokenizer_config = dir.join("tokenizer_config.json");
+
+        let config_sha = file_sha256(&config)?;
+        let index_sha = file_sha256(&index)?;
+        let checksum_sha = if checksums.exists() {
+            Some(file_sha256(&checksums)?)
+        } else {
+            None
+        };
+        let model_id = format!("config-sha256:{config_sha}");
+        let revision_seed = [
+            ("config.json", config_sha),
+            ("model.safetensors.index.json", index_sha),
+            (
+                "safetensors-md5sum.txt",
+                checksum_sha.unwrap_or_else(|| "absent".into()),
+            ),
+        ];
+        let mut revision = Sha256::new();
+        for (name, digest) in revision_seed {
+            revision.update(name.as_bytes());
+            revision.update([0]);
+            revision.update(digest.as_bytes());
+            revision.update([0]);
+        }
+        let model_revision = format!(
+            "checkpoint-metadata-sha256:{}",
+            encode_hex(&revision.finalize())
+        );
+
+        let mut tokenizer = Sha256::new();
+        for path in [tokenizer_json, tokenizer_config] {
+            let name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("")
+                .to_owned();
+            let digest = file_sha256(&path)?;
+            tokenizer.update(name.as_bytes());
+            tokenizer.update([0]);
+            tokenizer.update(digest.as_bytes());
+            tokenizer.update([0]);
+        }
+        let tokenizer_identity = format!("tokenizer-sha256:{}", encode_hex(&tokenizer.finalize()));
+        Self::new(model_id, model_revision, tokenizer_identity, rope, spec)
     }
 
     fn validate(&self) -> Result<()> {
@@ -239,8 +314,8 @@ impl PrefixGeometry {
             "invalid prefix capacity"
         );
         ensure!(
-            prefix_tokens > 0 && prefix_tokens <= capacity,
-            "prefix exceeds capacity"
+            prefix_tokens > 0 && prefix_tokens < capacity,
+            "prefix must leave a slot for the pending decode token"
         );
         ensure!(block_tokens > 0, "prefix block must be nonempty");
         let gdn = GdnSpec::q38();
@@ -416,6 +491,16 @@ impl PrefixGeometry {
             got == expected.keys().cloned().collect::<BTreeSet<_>>(),
             "prefix manifest coverage mismatch"
         );
+        for receipt in &manifest.records {
+            let expected_bytes = expected
+                .get(&receipt.key_sha256)
+                .context("prefix manifest contains an unknown record")?;
+            ensure!(
+                receipt.bytes == *expected_bytes,
+                "prefix receipt byte extent mismatch for {}",
+                receipt.key_sha256
+            );
+        }
         ensure!(
             manifest.total_state_bytes == self.total_state_bytes()?,
             "prefix manifest byte total mismatch"
@@ -612,6 +697,15 @@ impl PrefixSnapshot {
         ensure!(
             self.manifest.records.len() == self.payloads.len(),
             "prefix receipt/payload count mismatch"
+        );
+        ensure!(
+            self.manifest.block_tokens > 0,
+            "prefix snapshot block must be nonempty"
+        );
+        ensure!(
+            self.manifest.boundary.prefix_tokens > 0
+                && self.manifest.boundary.prefix_tokens < self.manifest.capacity,
+            "prefix snapshot must leave a slot for the pending decode token"
         );
         let mut attention = Vec::new();
         let mut gdn = Vec::new();
@@ -931,6 +1025,38 @@ mod tests {
     }
 
     #[test]
+    fn geometry_rejects_empty_block_and_full_capacity() {
+        let spec = spec();
+        assert!(PrefixGeometry::new(&spec, 128, 4, 0, &identity(&spec)).is_err());
+        assert!(PrefixGeometry::new(&spec, 128, 128, 2, &identity(&spec)).is_err());
+        let mut zero_block = full_package();
+        zero_block.manifest.block_tokens = 0;
+        assert!(zero_block.validate().is_err());
+    }
+
+    #[test]
+    fn checkpoint_identity_is_derived_from_local_metadata() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "flyingfish-prefix-identity-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("config.json"), b"config-a")?;
+        std::fs::write(root.join("model.safetensors.index.json"), b"index-a")?;
+        std::fs::write(root.join("tokenizer.json"), b"tokenizer-a")?;
+        std::fs::write(root.join("tokenizer_config.json"), b"tokenizer-config-a")?;
+        let spec = spec();
+        let first = PrefixIdentity::for_checkpoint(&root, "rope-a", &spec)?;
+        first.validate()?;
+        std::fs::write(root.join("tokenizer_config.json"), b"tokenizer-config-b")?;
+        let second = PrefixIdentity::for_checkpoint(&root, "rope-a", &spec)?;
+        assert_ne!(first, second);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn complete_package_and_prefix_identity_pass() {
         let package = full_package();
         package.validate().unwrap();
@@ -944,6 +1070,7 @@ mod tests {
                 .is_err()
         );
         assert!(package.verify_prefix(&[7, 8, 9, 11]).is_err());
+        assert!(package.verify_prefix(&[7, 8, 10, 10]).is_err());
         let root = std::env::temp_dir().join(format!(
             "flyingfish-prefix-state-{}-{}",
             std::process::id(),
@@ -954,6 +1081,41 @@ mod tests {
         assert_eq!(loaded.manifest, package.manifest);
         loaded.verify_prefix(&[7, 8, 9, 10]).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_shape_foreign_identity_and_wrong_extent_fail_before_restore() -> Result<()> {
+        let spec = spec();
+        let package = full_package();
+        let mut foreign_spec = spec.clone();
+        foreign_spec.hidden += 1;
+        let foreign = identity(&foreign_spec);
+        assert_ne!(package.manifest.identity, foreign);
+        assert!(
+            PrefixGeometry::new(
+                &spec,
+                package.manifest.capacity,
+                package.manifest.boundary.prefix_tokens,
+                package.manifest.block_tokens,
+                &foreign,
+            )?
+            .verify_manifest(&package.manifest)
+            .is_err()
+        );
+
+        let mut wrong_extent = package.clone();
+        wrong_extent.manifest.records[0].bytes += 1;
+        let geometry = geometry(
+            &spec,
+            wrong_extent.manifest.boundary.prefix_tokens,
+            wrong_extent.manifest.block_tokens,
+        );
+        let err = geometry
+            .verify_manifest(&wrong_extent.manifest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("byte extent"), "{err}");
+        Ok(())
     }
 
     #[test]

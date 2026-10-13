@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, PinnedHostSlice, sys};
 use half::bf16;
 use std::sync::Arc;
@@ -66,32 +66,29 @@ pub fn columns(
 
 fn checked_byte_span<T>(
     elements: usize,
-    element_offset: usize,
+    byte_offset: usize,
     byte_count: usize,
 ) -> Result<(usize, usize)> {
     let size = std::mem::size_of::<T>();
-    let offset = element_offset
-        .checked_mul(size)
-        .context("CUDA byte-span offset overflow")?;
     ensure!(byte_count > 0, "CUDA byte-span copy requires bytes");
     ensure!(
-        offset
+        byte_offset
             .checked_add(byte_count)
             .is_some_and(|end| end <= elements * size),
         "CUDA byte-span copy exceeds source"
     );
-    Ok((offset, byte_count))
+    Ok((byte_offset, byte_count))
 }
 
 pub fn dtoh_bytes<T: cudarc::driver::DeviceRepr>(
     s: &Arc<CudaStream>,
     src: &impl DevicePtr<T>,
-    src_element_offset: usize,
+    src_byte_offset: usize,
     dst: &mut PinnedHostSlice<u8>,
     dst_offset: usize,
     bytes: usize,
 ) -> Result<()> {
-    let (src_offset, bytes) = checked_byte_span::<T>(src.len(), src_element_offset, bytes)?;
+    let (src_offset, bytes) = checked_byte_span::<T>(src.len(), src_byte_offset, bytes)?;
     ensure!(
         dst_offset
             .checked_add(bytes)
@@ -116,12 +113,12 @@ pub fn dtoh_bytes<T: cudarc::driver::DeviceRepr>(
 pub fn htod_bytes<T: cudarc::driver::DeviceRepr>(
     s: &Arc<CudaStream>,
     dst: &mut impl DevicePtrMut<T>,
-    dst_element_offset: usize,
+    dst_byte_offset: usize,
     src: &PinnedHostSlice<u8>,
     src_offset: usize,
     bytes: usize,
 ) -> Result<()> {
-    let (dst_offset, bytes) = checked_byte_span::<T>(dst.len(), dst_element_offset, bytes)?;
+    let (dst_offset, bytes) = checked_byte_span::<T>(dst.len(), dst_byte_offset, bytes)?;
     ensure!(
         src_offset
             .checked_add(bytes)

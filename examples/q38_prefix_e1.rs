@@ -18,7 +18,7 @@ use flyingfish::{
     backend::{
         Backend, Settings, SpecBudget, TextPrefixRestoreIntent, TextPrefixSaveRequest, TreeBuilder,
     },
-    model_spec::ModelSpec,
+    model_spec::{Architecture, ModelSpec},
     prefix_state::{PrefixIdentity, PrefixSnapshot},
 };
 #[cfg(feature = "cuda")]
@@ -49,14 +49,8 @@ struct Args {
     transfer_bytes: usize,
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
-    #[arg(long, default_value = "Qwen3.8-27B-FP8")]
-    model_id: String,
-    #[arg(long, default_value = "1f7800145ce7ae0f59a6306d33c90cf80bb0f170")]
-    model_revision: String,
-    #[arg(long, default_value = "qwen3.8-official")]
-    tokenizer: String,
-    #[arg(long, default_value = "mrope_interleaved/theta1e7/context-v1")]
-    rope: String,
+    #[arg(long)]
+    expected_identity: Option<PathBuf>,
 }
 
 #[cfg(feature = "cuda")]
@@ -100,13 +94,10 @@ fn main() -> Result<()> {
         let suffix = read_ids(&args.suffix_ids)?;
         ensure_counts(&prefix, &suffix, args.capacity)?;
         let spec = ModelSpec::read(&args.model)?;
-        let identity = PrefixIdentity::new(
-            args.model_id.clone(),
-            args.model_revision.clone(),
-            args.tokenizer.clone(),
-            args.rope.clone(),
-            &spec,
-        )?;
+        ensure!(
+            spec.architecture == Architecture::Qwen35Text,
+            "q38_prefix_e1 requires the Qwen3.8 text architecture"
+        );
         let settings = Settings {
             tree_builder: TreeBuilder::Waves,
             spec_budget: SpecBudget::Chain,
@@ -117,11 +108,17 @@ fn main() -> Result<()> {
         let mut engine = Backend::load(&args.model, args.device, args.capacity, None, settings)?;
         engine.prefill(&prefix, None)?;
         let saved = engine.save_text_prefix(TextPrefixSaveRequest {
-            identity: identity.clone(),
             prefix_ids: &prefix,
             block_tokens: args.block_tokens,
             transfer_bytes: args.transfer_bytes,
         })?;
+        if let Some(path) = &args.expected_identity {
+            let expected: PrefixIdentity = serde_json::from_slice(&std::fs::read(path)?)?;
+            ensure!(
+                saved.snapshot.manifest.identity == expected,
+                "engine-derived prefix identity differs from expected identity file"
+            );
+        }
         engine.step(false)?;
         let baseline_pending_token = engine.token()?;
         let baseline_pending_logits = engine.decode_logits()?;
@@ -137,7 +134,6 @@ fn main() -> Result<()> {
             },
         )?;
         let readback = engine.save_text_prefix(TextPrefixSaveRequest {
-            identity,
             prefix_ids: &prefix,
             block_tokens: args.block_tokens,
             transfer_bytes: args.transfer_bytes,

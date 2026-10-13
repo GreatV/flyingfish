@@ -434,10 +434,13 @@ pub struct Engine {
     workspace_rows: usize,
     trace_layer: usize,
     position: usize,
+    prefix_identity: Option<PrefixIdentity>,
+    committed_prefix_ids: Vec<u32>,
+    pending_token: Option<u32>,
+    resident_ids_len: usize,
 }
 
 pub struct TextPrefixSaveRequest<'a> {
-    pub identity: PrefixIdentity,
     pub prefix_ids: &'a [u32],
     pub block_tokens: usize,
     pub transfer_bytes: usize,
@@ -476,8 +479,7 @@ fn dtoh_pinned_chunks<T: cudarc::driver::DeviceRepr>(
     let mut left = bytes;
     while left > 0 {
         let chunk = left.min(ring.len());
-        let source_elements = source_byte_offset / std::mem::size_of::<T>();
-        copy::dtoh_bytes(stream, source, source_elements, ring, 0, chunk)?;
+        copy::dtoh_bytes(stream, source, source_byte_offset, ring, 0, chunk)?;
         stream.synchronize()?;
         out.extend_from_slice(&ring.as_slice()?[..chunk]);
         source_byte_offset += chunk;
@@ -504,7 +506,7 @@ fn htod_pinned_chunks<T: cudarc::driver::DeviceRepr>(
         copy::htod_bytes(
             stream,
             destination,
-            destination_element_offset + offset / std::mem::size_of::<T>(),
+            destination_element_offset * std::mem::size_of::<T>() + offset,
             ring,
             0,
             chunk,
@@ -743,6 +745,10 @@ impl Engine {
             workspace_rows,
             trace_layer: 0,
             position: 0,
+            prefix_identity: None,
+            committed_prefix_ids: Vec::new(),
+            pending_token: None,
+            resident_ids_len: 0,
         };
         if let Some(path) = settings.draft_model {
             let path = path.canonicalize()?;
@@ -1698,6 +1704,9 @@ impl Engine {
             spec.active_rows = 0;
         }
         self.position = 0;
+        self.committed_prefix_ids.clear();
+        self.pending_token = None;
+        self.resident_ids_len = 0;
         self.device
             .stream
             .memcpy_htod(&[0i32], &mut self.work.position)?;
@@ -1730,6 +1739,9 @@ impl Engine {
             .memcpy_htod(&[1i32], &mut self.work.length)?;
         self.set_token(0)?;
         self.position = 0;
+        self.committed_prefix_ids.clear();
+        self.pending_token = Some(0);
+        self.resident_ids_len = 0;
         self.device.stream.synchronize()?;
         Ok(())
     }
@@ -1739,6 +1751,10 @@ impl Engine {
         request: TextPrefixSaveRequest<'_>,
     ) -> Result<TextPrefixSaveOutput> {
         let started = Instant::now();
+        let prefix_identity = self
+            .prefix_identity
+            .clone()
+            .context("text prefix identity missing")?;
         self.closure.assert_ready()?;
         ensure!(!self.poisoned, "cannot save a poisoned engine prefix");
         ensure!(self.qwen.is_some(), "text prefix save requires Qwen3.8");
@@ -1754,6 +1770,14 @@ impl Engine {
         ensure!(
             prefix > 0 && prefix == self.position,
             "prefix boundary mismatch"
+        );
+        ensure!(
+            self.committed_prefix_ids.len() == prefix,
+            "engine committed token count differs from requested prefix"
+        );
+        ensure!(
+            self.committed_prefix_ids.as_slice() == request.prefix_ids,
+            "prefix token ids differ from the engine-committed sequence"
         );
         ensure!(
             request
@@ -1789,29 +1813,27 @@ impl Engine {
             .copied()
             .context("prefix token ids are empty")?;
         let pending_next_token = self.token()?;
+        self.pending_token = Some(pending_next_token);
         ensure!(
             (pending_next_token as usize) < self.config.vocab_size,
             "pending prefix token outside vocabulary"
         );
         let resident_ids = self.device.stream.clone_dtoh(&self.work.ids)?;
-        let last_input_index = (prefix - 1) % self.chunk;
+        ensure!(
+            self.resident_ids_len > 0,
+            "engine has no resident prefill ids to audit"
+        );
+        let last_input_index = self.resident_ids_len - 1;
         ensure!(
             resident_ids.get(last_input_index).copied() == Some(last_token),
-            "last prefix input differs from the resident last prefill chunk"
-        );
-        ensure!(
-            request
-                .prefix_ids
-                .iter()
-                .all(|token| (*token as usize) < self.config.vocab_size),
-            "prefix token outside vocabulary"
+            "last prefix input differs from the resident last submitted chunk"
         );
         let geometry = PrefixGeometry::new(
             &self.model_spec,
             self.capacity,
             prefix,
             request.block_tokens,
-            &request.identity,
+            &prefix_identity,
         )?;
         let boundary = PrefixBoundary {
             prefix_tokens: prefix,
@@ -1824,8 +1846,8 @@ impl Engine {
         let mut ring = pinned_transfer_ring(&self.device.ctx, request.transfer_bytes)?;
         let result = self.save_text_prefix_into(builder, &mut ring);
         if result.is_err() {
-            self.device.stream.synchronize()?;
             self.poisoned = true;
+            self.device.stream.synchronize()?;
         }
         let snapshot = result?;
         let receipt = PrefixSaveReceipt {
@@ -1926,13 +1948,21 @@ impl Engine {
         intent: TextPrefixRestoreIntent<'_>,
     ) -> Result<PrefixRestoreReceipt> {
         let started = Instant::now();
+        let prefix_identity = self
+            .prefix_identity
+            .clone()
+            .context("text prefix identity missing")?;
         snapshot.verify_prefix_and_pending(intent.prefix_ids, intent.pending_next_token)?;
+        ensure!(
+            snapshot.manifest.identity == prefix_identity,
+            "prefix snapshot identity differs from the loaded engine"
+        );
         let geometry = PrefixGeometry::new(
             &self.model_spec,
             self.capacity,
             snapshot.manifest.boundary.prefix_tokens,
             snapshot.manifest.block_tokens,
-            &snapshot.manifest.identity,
+            &prefix_identity,
         )?;
         geometry.verify_manifest(&snapshot.manifest)?;
         ensure!(
@@ -1952,7 +1982,8 @@ impl Engine {
         );
         self.device.stream.synchronize()?;
         self.poisoned = true;
-        let result = self.restore_text_prefix_from(snapshot, intent.transfer_bytes);
+        let result =
+            self.restore_text_prefix_from(snapshot, intent.prefix_ids, intent.transfer_bytes);
         if let Err(error) = result {
             self.device.stream.synchronize()?;
             return Err(error);
@@ -1977,6 +2008,7 @@ impl Engine {
     fn restore_text_prefix_from(
         &mut self,
         snapshot: &PrefixSnapshot,
+        prefix_ids: &[u32],
         transfer_bytes: usize,
     ) -> Result<()> {
         let mut ring = pinned_transfer_ring(&self.device.ctx, transfer_bytes)?;
@@ -2044,6 +2076,8 @@ impl Engine {
             }
         }
         let prefix = snapshot.manifest.boundary.prefix_tokens;
+        let resident_len = prefix.min(self.chunk);
+        let resident_ids_start = prefix - resident_len;
         stream.synchronize()?;
         self.state
             .set_sequence(&stream, prefix as u32, 1, self.workspace_rows as u32)?;
@@ -2051,14 +2085,13 @@ impl Engine {
         stream.memcpy_htod(&[prefix as i32], &mut self.work.position)?;
         stream.memcpy_htod(&[prefix as i32 + 1], &mut self.work.length)?;
         stream.memcpy_htod(
-            &[snapshot.manifest.boundary.last_token],
-            &mut self
-                .work
-                .ids
-                .slice_mut((prefix - 1) % self.chunk..(prefix - 1) % self.chunk + 1),
+            &prefix_ids[resident_ids_start..],
+            &mut self.work.ids.slice_mut(..resident_len),
         )?;
         self.set_token(snapshot.manifest.boundary.pending_next_token)?;
         self.position = prefix;
+        self.committed_prefix_ids = prefix_ids.to_vec();
+        self.resident_ids_len = resident_len;
         stream.synchronize()?;
         Ok(())
     }
@@ -2132,6 +2165,7 @@ impl Engine {
             self.device
                 .stream
                 .memcpy_htod(chunk, &mut self.work.ids.slice_mut(..chunk.len()))?;
+            self.resident_ids_len = chunk.len();
             self.device
                 .stream
                 .memcpy_htod(&[self.position as i32], &mut self.work.position)?;
@@ -2161,6 +2195,7 @@ impl Engine {
             if self.spec.is_some() {
                 self.inject_capture(chunk.len(), self.position, None)?;
             }
+            self.committed_prefix_ids.extend_from_slice(chunk);
             self.position += chunk.len();
         }
         self.device
@@ -2177,7 +2212,9 @@ impl Engine {
                 self.workspace_rows as u32,
             )?;
         }
-        self.token()
+        let pending_next_token = self.token()?;
+        self.pending_token = Some(pending_next_token);
+        Ok(pending_next_token)
     }
 
     fn advance(&mut self, graph: bool, trace: Option<(&mut Trace, &str)>) -> Result<()> {
@@ -2195,6 +2232,10 @@ impl Engine {
             !graph || trace.is_none(),
             "graph tracing is unsupported; use eager tracing"
         );
+        let committed_token = match self.pending_token {
+            Some(token) => token,
+            None => self.token()?,
+        };
         if graph {
             let result = self
                 .graph
@@ -2212,13 +2253,17 @@ impl Engine {
                 skip: 0,
             }))?;
         }
+        self.committed_prefix_ids.push(committed_token);
+        self.pending_token = None;
         self.position += 1;
         Ok(())
     }
 
     pub fn decode(&mut self, graph: bool, trace: Option<(&mut Trace, &str)>) -> Result<u32> {
         self.advance(graph, trace)?;
-        self.token()
+        let pending_next_token = self.token()?;
+        self.pending_token = Some(pending_next_token);
+        Ok(pending_next_token)
     }
 
     pub fn step(&mut self, graph: bool) -> Result<()> {
@@ -2241,6 +2286,7 @@ impl Engine {
         self.device
             .stream
             .memcpy_htod(&[(position + 1) as i32], &mut self.work.length)?;
+        self.committed_prefix_ids.truncate(position);
         self.set_token(token)?;
         self.position = position;
         self.device.stream.synchronize()?;
@@ -2354,6 +2400,7 @@ impl Engine {
         self.device
             .stream
             .memcpy_htod(&[token], &mut self.work.token)?;
+        self.pending_token = Some(token);
         Ok(())
     }
 

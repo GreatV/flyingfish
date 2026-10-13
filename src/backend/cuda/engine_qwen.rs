@@ -810,6 +810,8 @@ impl Engine {
         let work = Work::new(s, &model_spec, rows)?;
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
         let config = model_spec.config();
+        let prefix_identity =
+            PrefixIdentity::for_checkpoint(dir, &text_rope_context_sha256(capacity)?, &model_spec)?;
         let mut engine = Self {
             #[cfg(test)]
             capture_fail_after_layer: None,
@@ -844,6 +846,10 @@ impl Engine {
             workspace_rows: rows,
             trace_layer: 0,
             position: 0,
+            prefix_identity: Some(prefix_identity),
+            committed_prefix_ids: Vec::new(),
+            pending_token: None,
+            resident_ids_len: 0,
             qwen: None,
             mtp: None,
             mtp_state: None,
