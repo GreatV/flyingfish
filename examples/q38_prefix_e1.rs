@@ -19,7 +19,10 @@ use flyingfish::{
         Backend, Settings, SpecBudget, TextPrefixRestoreIntent, TextPrefixSaveRequest, TreeBuilder,
     },
     model_spec::{Architecture, ModelSpec},
-    prefix_state::{PrefixIdentity, PrefixSnapshot},
+    prefix_state::{
+        PrefixBoundary, PrefixBuilder, PrefixGeometry, PrefixIdentity, PrefixRecordKind,
+        PrefixSnapshot, token_ids_sha256,
+    },
 };
 #[cfg(feature = "cuda")]
 use serde_json::json;
@@ -81,6 +84,34 @@ fn read_ids(path: &Path) -> Result<Vec<u32>> {
         .collect()
 }
 
+#[cfg(feature = "cuda")]
+fn internally_consistent_foreign_snapshot(
+    source: &PrefixSnapshot,
+    identity: PrefixIdentity,
+    spec: &ModelSpec,
+    capacity: usize,
+) -> Result<PrefixSnapshot> {
+    let boundary: PrefixBoundary = source.manifest.boundary.clone();
+    let block_tokens = source.manifest.block_tokens;
+    let geometry = PrefixGeometry::new(
+        spec,
+        capacity,
+        boundary.prefix_tokens,
+        block_tokens,
+        &identity,
+    )?;
+    let mut builder = PrefixBuilder::new(geometry, boundary)?;
+    for (receipt, payload) in source.records() {
+        let block = if receipt.key.kind == PrefixRecordKind::AttentionKvBlock {
+            receipt.key.token_start / block_tokens
+        } else {
+            0
+        };
+        builder.add(receipt.key.kind, receipt.key.layer, block, payload.to_vec())?;
+    }
+    builder.finish()
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     #[cfg(not(feature = "cuda"))]
@@ -119,15 +150,15 @@ fn main() -> Result<()> {
                 "engine-derived prefix identity differs from expected identity file"
             );
         }
-        let mut foreign = saved.snapshot.clone();
-        foreign
+        let mut manifest_only_foreign = saved.snapshot.clone();
+        manifest_only_foreign
             .manifest
             .identity
             .model_id
             .push_str("-foreign-negative-control");
-        let foreign_error = engine
+        let manifest_only_error = engine
             .restore_text_prefix(
-                &foreign,
+                &manifest_only_foreign,
                 TextPrefixRestoreIntent {
                     prefix_ids: &prefix,
                     pending_next_token: saved.snapshot.manifest.boundary.pending_next_token,
@@ -136,10 +167,37 @@ fn main() -> Result<()> {
             )
             .expect_err("foreign identity snapshot must be rejected");
         ensure!(
+            manifest_only_error
+                .to_string()
+                .contains("prefix record identity differs from manifest"),
+            "manifest-only foreign snapshot was not rejected by internal consistency: {manifest_only_error}"
+        );
+
+        let mut foreign_identity = saved.snapshot.manifest.identity.clone();
+        foreign_identity
+            .model_id
+            .push_str("-foreign-negative-control");
+        let consistent_foreign = internally_consistent_foreign_snapshot(
+            &saved.snapshot,
+            foreign_identity,
+            &spec,
+            args.capacity,
+        )?;
+        let foreign_error = engine
+            .restore_text_prefix(
+                &consistent_foreign,
+                TextPrefixRestoreIntent {
+                    prefix_ids: &prefix,
+                    pending_next_token: saved.snapshot.manifest.boundary.pending_next_token,
+                    transfer_bytes: args.transfer_bytes,
+                },
+            )
+            .expect_err("internally consistent foreign snapshot must be rejected");
+        ensure!(
             foreign_error
                 .to_string()
                 .contains("prefix snapshot identity differs"),
-            "unexpected foreign-identity rejection: {foreign_error}"
+            "foreign snapshot was not rejected by engine identity: {foreign_error}"
         );
         engine.check_ready()?;
         let negative_readback = engine.save_text_prefix(TextPrefixSaveRequest {
@@ -157,12 +215,20 @@ fn main() -> Result<()> {
         engine.step(false)?;
         let mut decoded_prefix = prefix.clone();
         decoded_prefix.push(committed_decode_token);
-        let baseline_pending_token = engine.token()?;
         let decoded_saved = engine.save_text_prefix(TextPrefixSaveRequest {
             prefix_ids: &decoded_prefix,
             block_tokens: args.block_tokens,
             transfer_bytes: args.transfer_bytes,
         })?;
+        let decoded_boundary_pending_token = engine.token()?;
+        ensure!(
+            decoded_boundary_pending_token
+                == decoded_saved.snapshot.manifest.boundary.pending_next_token,
+            "decoded boundary pending token changed before save completed"
+        );
+        let decoded_boundary_logits = engine.decode_logits()?;
+        engine.step(false)?;
+        let baseline_pending_token = engine.token()?;
         let baseline_pending_logits = engine.decode_logits()?;
         let baseline_token = engine.prefill(&suffix, None)?;
         let baseline_logits = engine.decode_logits()?;
@@ -189,6 +255,11 @@ fn main() -> Result<()> {
             "post-restore readback receipts differ"
         );
         drop(readback);
+        let restored_boundary_pending_token = engine.token()?;
+        ensure!(
+            restored_boundary_pending_token == decoded_boundary_pending_token,
+            "restored boundary pending token differs before the compared decode step"
+        );
         engine.step(false)?;
         let restored_pending_token = engine.token()?;
         let restored_pending_logits = engine.decode_logits()?;
@@ -220,6 +291,31 @@ fn main() -> Result<()> {
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
             "restored suffix logits are not bitwise identical"
         );
+        let mut baseline_after_step = decoded_prefix.clone();
+        baseline_after_step.push(decoded_boundary_pending_token);
+        let mut restored_after_step = decoded_prefix.clone();
+        restored_after_step.push(restored_boundary_pending_token);
+        let baseline_after_step_sha256 = token_ids_sha256(&baseline_after_step)?;
+        let restored_after_step_sha256 = token_ids_sha256(&restored_after_step)?;
+        let decoded_boundary_logits_sha256 = sha256_bytemuck(&decoded_boundary_logits);
+        let token_trace = json!({
+            "prefill_return_pending_t1": committed_decode_token,
+            "decode_boundary_committed_prefix_ids": decoded_prefix.clone(),
+            "decode_boundary_committed_prefix_sha256": token_ids_sha256(&decoded_prefix)?,
+            "decode_boundary_pending_t2": decoded_boundary_pending_token,
+            "decode_boundary_logits_sha256": decoded_boundary_logits_sha256,
+            "baseline_step_committed_t2": decoded_boundary_pending_token,
+            "baseline_post_step_pending_t3": baseline_pending_token,
+            "baseline_committed_after_step_sha256": baseline_after_step_sha256,
+            "baseline_suffix_ids": suffix.clone(),
+            "baseline_suffix_first_pending": baseline_token,
+            "restored_boundary_pending_t2": restored_boundary_pending_token,
+            "restored_step_committed_t2": restored_boundary_pending_token,
+            "restored_post_step_pending_t3": restored_pending_token,
+            "restored_committed_after_step_sha256": restored_after_step_sha256,
+            "restored_suffix_ids": suffix.clone(),
+            "restored_suffix_first_pending": restored_token,
+        });
         let document = json!({
             "schema": "q38-prefix-e1-v1",
             "status": "PASS",
@@ -232,6 +328,8 @@ fn main() -> Result<()> {
             "save": saved.receipt,
             "decode_boundary_save": decoded_saved.receipt,
             "foreign_identity_negative_control": true,
+            "manifest_only_foreign_rejected_by_internal_consistency": true,
+            "internally_consistent_foreign_rejected_by_engine_identity": true,
             "foreign_identity_rejected_before_mutation": true,
             "post_foreign_identity_readback_state_root":
                 saved.snapshot.manifest.state_root.clone(),
@@ -258,6 +356,7 @@ fn main() -> Result<()> {
         let document = {
             let mut value = document;
             value["manifest_sha256"] = json!(manifest_sha256);
+            value["token_trace"] = token_trace;
             value
         };
         std::fs::write(&args.output, serde_json::to_vec_pretty(&document)?)?;
@@ -266,7 +365,7 @@ fn main() -> Result<()> {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn ensure_counts(prefix: &[u32], suffix: &[u32], capacity: usize) -> Result<()> {
     anyhow::ensure!(!prefix.is_empty(), "prefix is empty");
     anyhow::ensure!(!suffix.is_empty(), "suffix is empty");
@@ -281,7 +380,7 @@ fn ensure_counts(prefix: &[u32], suffix: &[u32], capacity: usize) -> Result<()> 
     Ok(())
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::ensure_counts;
 
@@ -295,6 +394,65 @@ mod tests {
         let prefix_128k = vec![1; 131_072];
         ensure_counts(&prefix_128k, &suffix, 132_097).unwrap();
         assert!(ensure_counts(&prefix_128k, &suffix, 132_096).is_err());
+    }
+
+    #[test]
+    fn cpu_mock_dry_run_aligns_decode_boundary_sequences() {
+        struct Mock {
+            committed: Vec<u32>,
+            pending: u32,
+            next: u32,
+        }
+        impl Mock {
+            fn token(&self) -> u32 {
+                self.pending
+            }
+            fn step(&mut self) {
+                self.committed.push(self.pending);
+                self.next += 1;
+                self.pending = self.next;
+            }
+            fn prefill_suffix(&mut self, suffix: &[u32]) -> u32 {
+                self.committed.extend_from_slice(suffix);
+                self.next += 1;
+                self.pending = self.next;
+                self.pending
+            }
+        }
+
+        let prefix = [10u32, 11, 12];
+        let suffix = [80u32, 81, 82];
+        let mut baseline = Mock {
+            committed: prefix.to_vec(),
+            pending: 20,
+            next: 20,
+        };
+
+        // Prefill returned T1=20; one step commits T1 and yields T2=21.
+        baseline.step();
+        let saved_committed = baseline.committed.clone();
+        let saved_pending = baseline.token();
+        assert_eq!(saved_committed, [10, 11, 12, 20]);
+        assert_eq!(saved_pending, 21);
+
+        // Baseline and restore both consume T2 at the saved boundary, then suffix.
+        baseline.step();
+        let baseline_post_step = baseline.token();
+        let baseline_suffix = baseline.prefill_suffix(&suffix);
+        let mut restored = Mock {
+            committed: saved_committed,
+            pending: saved_pending,
+            next: 21,
+        };
+        assert_eq!(restored.token(), 21);
+        restored.step();
+        let restored_post_step = restored.token();
+        let restored_suffix = restored.prefill_suffix(&suffix);
+
+        assert_eq!(baseline_post_step, restored_post_step);
+        assert_eq!(baseline_suffix, restored_suffix);
+        assert_eq!(baseline.committed, restored.committed);
+        assert_eq!(baseline.committed, [10, 11, 12, 20, 21, 80, 81, 82]);
     }
 }
 
