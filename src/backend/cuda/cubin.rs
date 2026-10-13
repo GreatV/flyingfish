@@ -9,6 +9,14 @@ mod binaries {
     include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
 }
 
+/// The native cubin bytes for one kernel module, or None when this build has no
+/// cubin for that architecture. The gate runner loads its own modules from these
+/// rather than through [`module`], so it can launch a kernel directly with its own
+/// buffers instead of through the Engine's binder.
+pub fn bytes(name: &str, sm: u32) -> Option<&'static [u8]> {
+    binaries::cubin(name, sm)
+}
+
 pub fn check(sm: u32) -> Result<()> {
     ensure!(
         binaries::ARCHES.contains(&sm),

@@ -1,0 +1,2105 @@
+//! GDN chunkwise P1 primitive gate runner — numerics and timing phases.
+//!
+//! Frozen inputs: the P1 package given by `--package` (MANIFEST.json with a per-file
+//! SHA-256, `inputs/*.f32`, `truth/<case>.{out,state}.f64` and `gate_basis.json`).
+//! Every array is read from those bytes and verified against the manifest BEFORE it is
+//! used; nothing is regenerated from a seed, because the 1.25x comparison only isolates
+//! implementation error when both sides consume the same bytes (Codex-D, 07:28).
+//!
+//! The candidate is measured against `truth/`, the FP64 oracle's own out/state: the
+//! basis in gate_basis.json is the CPU P1 model's error against that same array, so the
+//! two sides of the ratio share one reference. `reference/` in the package holds the CPU
+//! model's OUTPUTS; measuring against those would add the model's error to the candidate's
+//! and compare the sum with 1.25x of one of its terms. It is not in the manifest's file
+//! list, is not verified here and is not read.
+//!
+//! Gate (4d, 2026-10-13T07:06:44Z, item 2), per fixture x chunk C x split s, against
+//! the FP64 reference and pre-registered from the CPU P1 model:
+//!   out_max_abs <= 1.25x model, out_rel_rms <= 1.25x model,
+//!   state_rel_rms <= 1.25x model, frac_le_1ulp >= model - 0.02,
+//!   every value finite, every length and head present. A quantity whose basis is
+//!   zero keeps ZERO tolerance; the band is never widened by a candidate result.
+//! Multi-chunk condition: every C must have at least one fixture with more than one
+//! chunk passing.
+//!
+//! `frac_le_1ulp` and the residual norms use the CPU model's own definitions
+//! (gdn_phase2_model_w.bf16_ulp / metrics_p2, gdn_phase2_sensitivity.residual_record):
+//! the local BF16 ULP of each REFERENCE element, 2^(floor(log2|x|) - 7) and 2^-133 on
+//! the subnormal grid below 2^-126.
+//!
+//! Timing phase (§F): the NULL band (main core vs itself, same ABBA block structure)
+//! is computed and WRITTEN BEFORE any P1 timing is compared against it. 12 paired
+//! ABBA blocks per configuration; the per-block statistic is the mean of the two legs
+//! of log(t_B) - log(t_A); the acceptance band is
+//!   max(0.03, exp(3 * SD(null log ratios)) - 1, event quantisation / batch time),
+//! and the P1 leg reports a geometric-mean ratio with a t-based simultaneous CI at
+//! Bonferroni alpha = 0.05/9 over the nine (C, s) configurations.
+//!
+//! `--stub` replaces the kernel launch and the CUDA-event clock with documented
+//! deterministic values so the whole pipeline — manifest load, SHA verification,
+//! gate-basis load, metric computation, verdict emission and the ABBA statistics —
+//! runs with no CUDA device at all. Stub numerics are EXPECTED to fail the 1.25x
+//! comparison: that is the honest outcome of a stub, and the pipeline proving it is
+//! the point of the mode.
+use anyhow::{Context, Result, ensure};
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+const SCHEMA_MANIFEST: &str = "gdn-p1-frozen-inputs/1";
+const SCHEMA_BASIS: &str = "gdn-p1-gate-basis/2";
+const SCHEMA_GATE: &str = "gdn-p1-gate-report/1";
+const SCHEMA_TIMING: &str = "gdn-p1-timing-report/1";
+
+/// Chunk size the P1 core is compiled with (kernels/gdn/gdn_chunkwise_p1.cu, P1_C).
+/// The protocol fixes C64 for every candidate (§A); the gate basis carries C16/C32
+/// rows because the CPU model swept C, and the runner refuses them by name rather
+/// than running a kernel that does not exist at that chunk size.
+const KERNEL_C: u32 = 64;
+
+#[cfg(feature = "cuda")]
+const P1_MODULE: &str = "gdn/gdn_chunkwise_p1";
+
+#[derive(Parser)]
+#[command(about = "GDN chunkwise P1 primitive gate runner", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    phase: Phase,
+}
+
+#[derive(Subcommand)]
+enum Phase {
+    /// Run the kernel per fixture and emit the primitive numerics gate report.
+    Numerics(NumericsArgs),
+    /// Freeze the NULL band, then measure P1 against the main core.
+    Timing(TimingArgs),
+    /// Dump every pipeline stage of one chunk for one fixture (debug only).
+    Debug(DebugArgs),
+}
+
+#[derive(Parser)]
+struct DebugArgs {
+    /// Frozen P1 package directory.
+    #[arg(long)]
+    package: PathBuf,
+    /// Run directory for the per-stage dumps.
+    #[arg(long)]
+    run_dir: PathBuf,
+    /// The fixture to dump.
+    #[arg(long, default_value = "decode_m1")]
+    case: String,
+    /// Chunk size; the built P1 core is C64 only.
+    #[arg(long, default_value_t = KERNEL_C)]
+    c: u32,
+    /// Value split; only the s8 debug entry point exists.
+    #[arg(long, default_value_t = 8)]
+    s: u32,
+    /// Head whose stages are dumped (the CTA writes only its own).
+    #[arg(long, default_value_t = 0)]
+    dbg_head: u32,
+    /// Value strip whose stages are dumped.
+    #[arg(long, default_value_t = 0)]
+    dbg_strip: u32,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum Clock {
+    /// CUDA events around the launch.
+    Cuda,
+    /// Documented deterministic per-launch durations; no CUDA device is touched.
+    Stub,
+}
+
+#[derive(Parser)]
+struct NumericsArgs {
+    /// Frozen P1 package directory (MANIFEST.json, inputs/, truth/, gate_basis.json).
+    #[arg(long)]
+    package: PathBuf,
+    /// Run directory for the raw outputs and the gate report.
+    #[arg(long)]
+    run_dir: PathBuf,
+    /// Chunk size; the built core is C64 only.
+    #[arg(long, default_value_t = KERNEL_C)]
+    c: u32,
+    /// Value splits, protocol §A order s8 first.
+    #[arg(long, value_delimiter = ',', default_value = "8,4,16")]
+    s: Vec<u32>,
+    /// Clock to substitute for the kernel launch.
+    #[arg(long, value_enum, default_value = "stub")]
+    clock: Clock,
+    /// Record the box3-shaped environment receipt instead of the local one.
+    #[arg(long)]
+    simulate_box3: bool,
+    /// Only these fixtures (default: every fixture in the manifest).
+    #[arg(long, value_delimiter = ',')]
+    case: Vec<String>,
+}
+
+#[derive(Parser)]
+struct TimingArgs {
+    #[arg(long)]
+    package: PathBuf,
+    #[arg(long)]
+    run_dir: PathBuf,
+    #[arg(long, default_value_t = KERNEL_C)]
+    c: u32,
+    #[arg(long, value_delimiter = ',', default_value = "8,4,16")]
+    s: Vec<u32>,
+    /// Paired ABBA blocks per configuration; the protocol fixes 12.
+    #[arg(long, default_value_t = 12)]
+    blocks: u32,
+    #[arg(long, value_enum, default_value = "stub")]
+    clock: Clock,
+    /// Fixture for the timing legs (one configuration's worth of work).
+    #[arg(long)]
+    case: Option<String>,
+    #[arg(long)]
+    simulate_box3: bool,
+}
+
+// ---------------------------------------------------------------------------
+// the frozen package
+// ---------------------------------------------------------------------------
+#[derive(Deserialize)]
+struct Manifest {
+    schema: String,
+    generated_utc: String,
+    purpose: String,
+    residual_record_spec: ResidualSpec,
+    files: Vec<ManifestFile>,
+    fixtures: Vec<Fixture>,
+    /// The FP64 oracle's per-fixture out/state; the reference the gate measures against.
+    #[serde(default)]
+    truth: Vec<TruthFile>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct ResidualSpec {
+    what: String,
+    norms: Vec<String>,
+    #[serde(rename = "NOT")]
+    not: String,
+}
+
+#[derive(Deserialize, Clone)]
+struct ManifestFile {
+    fixture: String,
+    array: String,
+    path: String,
+    sha256: String,
+    bytes: u64,
+    dtype: String,
+    shape: Vec<usize>,
+}
+
+#[derive(Deserialize)]
+struct Fixture {
+    name: String,
+    kind: String,
+    /// Live rows this fixture contributes to the core; the manifest calls it M.
+    #[serde(rename = "M")]
+    m: usize,
+    prefix: usize,
+    #[serde(rename = "seed")]
+    seed: Option<i64>,
+    arrays: BTreeMap<String, ArrayRec>,
+    note: String,
+}
+
+#[derive(Deserialize, Clone)]
+struct ArrayRec {
+    path: String,
+    sha256: String,
+    dtype: String,
+    shape: Vec<usize>,
+}
+
+#[derive(Deserialize, Clone)]
+struct TruthFile {
+    fixture: String,
+    /// "out" or "state".
+    which: String,
+    path: String,
+    sha256: String,
+    bytes: u64,
+    dtype: String,
+    shape: Vec<usize>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct Basis {
+    schema: String,
+    band: f64,
+    ulp_floor: f64,
+    rows: Vec<BasisRow>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct BasisRow {
+    case: String,
+    #[serde(rename = "C")]
+    c: u32,
+    s: u32,
+    out_max_abs: f64,
+    out_rel_rms: f64,
+    state_rel_rms: f64,
+    frac_le_1ulp: f64,
+    gate_out_max_abs: f64,
+    gate_out_rel_rms: f64,
+    gate_state_rel_rms: f64,
+    frac_floor: f64,
+    finite: bool,
+    input_sha256: String,
+}
+
+// ---------------------------------------------------------------------------
+// SHA-256 verification
+// ---------------------------------------------------------------------------
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    Ok(format!("{:x}", h.finalize()))
+}
+
+/// The order of the six arrays in the frozen package and in `input_sha256`.
+const ARRAYS: [&str; 6] = ["q", "k", "v", "beta", "g", "S0"];
+
+struct Package {
+    root: PathBuf,
+    manifest: Manifest,
+    basis: BTreeMap<(String, u32, u32), BasisRow>,
+    basis_doc: Basis,
+    truth: BTreeMap<(String, String), TruthFile>,
+    verified: usize,
+    truth_verified: usize,
+}
+
+impl Package {
+    fn truth_of(&self, fixture: &str, which: &str) -> Result<&TruthFile> {
+        self.truth
+            .get(&(fixture.to_string(), which.to_string()))
+            .with_context(|| format!("manifest has no {which} truth for fixture {fixture}"))
+    }
+}
+
+/// Verify EVERY file the manifest lists, before any array is read. A mismatch names
+/// the file and aborts: a package that has drifted is not a package.
+fn open_package(root: &Path) -> Result<Package> {
+    let manifest_path = root.join("MANIFEST.json");
+    let text = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("read {}", manifest_path.display()))?;
+    let manifest: Manifest = serde_json::from_str(&text)
+        .with_context(|| format!("parse {}", manifest_path.display()))?;
+    ensure!(
+        manifest.schema == SCHEMA_MANIFEST,
+        "manifest schema {} is not {SCHEMA_MANIFEST}",
+        manifest.schema
+    );
+    ensure!(!manifest.fixtures.is_empty(), "manifest lists no fixtures");
+
+    let mut verified = 0usize;
+    for f in &manifest.files {
+        ensure!(
+            f.dtype == "float32",
+            "{} is {}, not float32",
+            f.path,
+            f.dtype
+        );
+        let path = root.join(&f.path);
+        let got = sha256_file(&path)?;
+        ensure!(
+            got == f.sha256,
+            "SHA mismatch on {}: manifest {}, file {got}",
+            f.path,
+            f.sha256
+        );
+        let bytes = std::fs::metadata(&path)?.len();
+        ensure!(
+            bytes == f.bytes,
+            "{} is {bytes} B, manifest says {} B",
+            f.path,
+            f.bytes
+        );
+        let expect: u64 = f.shape.iter().map(|d| *d as u64).product();
+        ensure!(
+            expect * 4 == f.bytes,
+            "{} shape {:?} does not match {} B",
+            f.path,
+            f.shape,
+            f.bytes
+        );
+        verified += 1;
+    }
+    // The per-fixture records must agree with the file list; a manifest that
+    // disagrees with itself is not a package either.
+    for fx in &manifest.fixtures {
+        for a in ARRAYS {
+            let rec = fx
+                .arrays
+                .get(a)
+                .with_context(|| format!("fixture {} has no {a}", fx.name))?;
+            let listed = manifest
+                .files
+                .iter()
+                .find(|f| f.fixture == fx.name && f.array == a)
+                .with_context(|| format!("{} {a} is not in the file list", fx.name))?;
+            ensure!(
+                listed.sha256 == rec.sha256 && listed.path == rec.path,
+                "fixture {} {a} disagrees with the file list",
+                fx.name
+            );
+        }
+        ensure!(fx.m >= 1, "fixture {} has no live row", fx.name);
+    }
+
+    // The FP64 truth, verified on the same terms as the inputs and required for every
+    // fixture: a gate with no reference is not a gate.
+    let mut truth = BTreeMap::new();
+    let mut truth_verified = 0usize;
+    for t in &manifest.truth {
+        ensure!(
+            t.dtype == "float64",
+            "{} is {}, not float64",
+            t.path,
+            t.dtype
+        );
+        ensure!(
+            t.which == "out" || t.which == "state",
+            "{} names which={}, which is neither out nor state",
+            t.path,
+            t.which
+        );
+        let path = root.join(&t.path);
+        let got = sha256_file(&path)?;
+        ensure!(
+            got == t.sha256,
+            "SHA mismatch on {}: manifest {}, file {got}",
+            t.path,
+            t.sha256
+        );
+        let bytes = std::fs::metadata(&path)?.len();
+        ensure!(
+            bytes == t.bytes,
+            "{} is {bytes} B, manifest says {} B",
+            t.path,
+            t.bytes
+        );
+        let expect: u64 = t.shape.iter().map(|d| *d as u64).product();
+        ensure!(
+            expect * 8 == t.bytes,
+            "{} shape {:?} does not match {} B",
+            t.path,
+            t.shape,
+            t.bytes
+        );
+        truth.insert((t.fixture.clone(), t.which.clone()), t.clone());
+        truth_verified += 1;
+    }
+    for fx in &manifest.fixtures {
+        for w in ["out", "state"] {
+            ensure!(
+                truth.contains_key(&(fx.name.clone(), w.to_string())),
+                "manifest has no {w} truth for fixture {}",
+                fx.name
+            );
+        }
+    }
+
+    let basis_path = root.join("gate_basis.json");
+    let text = std::fs::read_to_string(&basis_path)
+        .with_context(|| format!("read {}", basis_path.display()))?;
+    let basis_doc: Basis =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", basis_path.display()))?;
+    ensure!(
+        basis_doc.schema == SCHEMA_BASIS,
+        "gate basis schema {} is not {SCHEMA_BASIS}",
+        basis_doc.schema
+    );
+    let mut basis = BTreeMap::new();
+    for r in &basis_doc.rows {
+        basis.insert((r.case.clone(), r.c, r.s), r.clone());
+    }
+    Ok(Package {
+        root: root.to_path_buf(),
+        manifest,
+        basis,
+        basis_doc,
+        truth,
+        verified,
+        truth_verified,
+    })
+}
+
+fn read_f32(root: &Path, rec: &ArrayRec) -> Result<Vec<f32>> {
+    ensure!(
+        rec.dtype == "float32",
+        "{} is {}, not float32",
+        rec.path,
+        rec.dtype
+    );
+    let path = root.join(&rec.path);
+    let got = sha256_file(&path)?;
+    ensure!(
+        got == rec.sha256,
+        "SHA mismatch on {}: manifest {}, file {got}",
+        rec.path,
+        rec.sha256
+    );
+    let bytes = std::fs::read(&path)?;
+    let n: usize = rec.shape.iter().product();
+    ensure!(
+        bytes.len() == n * 4,
+        "{} is {} B, shape {:?} needs {}",
+        rec.path,
+        bytes.len(),
+        rec.shape,
+        n * 4
+    );
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// The FP64 oracle's array for one fixture, read from the package bytes and verified
+/// against the manifest record on every call, exactly as `read_f32` does for the inputs.
+fn read_truth_f64(root: &Path, rec: &TruthFile) -> Result<Vec<f64>> {
+    ensure!(
+        rec.dtype == "float64",
+        "{} is {}, not float64",
+        rec.path,
+        rec.dtype
+    );
+    let path = root.join(&rec.path);
+    let got = sha256_file(&path)?;
+    ensure!(
+        got == rec.sha256,
+        "SHA mismatch on {}: manifest {}, file {got}",
+        rec.path,
+        rec.sha256
+    );
+    let bytes = std::fs::read(&path)?;
+    let n: usize = rec.shape.iter().product();
+    ensure!(
+        bytes.len() == n * 8,
+        "{} is {} B, shape {:?} needs {}",
+        rec.path,
+        bytes.len(),
+        rec.shape,
+        n * 8
+    );
+    Ok(bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// metrics — the CPU model's definitions, bit-for-bit in form
+// ---------------------------------------------------------------------------
+/// Local BF16 ULP at |x| (gdn_phase2_model_w.bf16_ulp): 2^(floor(log2|x|) - 7), and
+/// the 2^-133 subnormal grid below 2^-126.
+fn bf16_ulp(x: f64) -> f64 {
+    let a = x.abs();
+    if a == 0.0 {
+        return 2f64.powi(-133);
+    }
+    if a < 2f64.powi(-126) {
+        return 2f64.powi(-133);
+    }
+    2f64.powi(a.log2().floor() as i32 - 7)
+}
+
+struct Metrics {
+    max_abs: f64,
+    rel_rms: f64,
+    frac_le_1ulp: f64,
+    finite: bool,
+}
+
+fn metrics(got: &[f32], reference: &[f64]) -> Result<Metrics> {
+    ensure!(
+        got.len() == reference.len(),
+        "length {} against reference {}",
+        got.len(),
+        reference.len()
+    );
+    let mut max_abs = 0f64;
+    let mut sum = 0f64;
+    let mut sum_ref = 0f64;
+    let mut within = 0usize;
+    let mut finite = true;
+    for (g, r) in got.iter().zip(reference) {
+        let g = *g as f64;
+        let r = *r;
+        finite &= g.is_finite() && r.is_finite();
+        let d = (g - r).abs();
+        max_abs = max_abs.max(d);
+        sum += d * d;
+        sum_ref += r * r;
+        let u = bf16_ulp(r);
+        if d / u <= 1.0 {
+            within += 1;
+        }
+    }
+    let n = got.len() as f64;
+    let rms = (sum / n).sqrt();
+    let ref_rms = (sum_ref / n).sqrt();
+    Ok(Metrics {
+        max_abs,
+        rel_rms: if ref_rms > 0.0 {
+            rms / ref_rms
+        } else {
+            f64::NAN
+        },
+        frac_le_1ulp: within as f64 / n,
+        finite,
+    })
+}
+
+/// RNE to BF16 and back, so the stub's field is a real BF16-rounded one.
+fn bf16_round(x: f64) -> f64 {
+    let bits = (x as f32).to_bits();
+    // round-to-nearest-even on the truncated upper 16 bits
+    let lsb = (bits >> 16) & 1;
+    let rounding = 0x7fffu32 + lsb;
+    let up = (bits + rounding) & 0xffff0000;
+    f32::from_bits(up) as f64
+}
+
+/// The documented stub field: element n of an array gets
+///   sin(n * 0.7) and sin(n * 0.7 + 1.3) interleaved, scaled by 1/4, BF16-rounded.
+/// Deterministic, no RNG state, O(1) magnitude like a real GDN output, and non-constant
+/// so the ULP histogram and the rel_rms are exercised rather than short-circuited.
+fn stub_field(n: usize, phase: f64) -> f64 {
+    let x = n as f64;
+    bf16_round((x * 0.7 + phase).sin() * 0.25)
+}
+
+// ---------------------------------------------------------------------------
+// the numerics phase
+// ---------------------------------------------------------------------------
+#[derive(Serialize)]
+struct GateRow {
+    case: String,
+    c: u32,
+    s: u32,
+    chunks: u32,
+    multi_chunk: bool,
+    model_out_max_abs: f64,
+    model_out_rel_rms: f64,
+    model_state_rel_rms: f64,
+    model_frac_le_1ulp: f64,
+    got_out_max_abs: f64,
+    got_out_rel_rms: f64,
+    got_state_rel_rms: f64,
+    got_frac_le_1ulp: f64,
+    ratio_out_max_abs: f64,
+    ratio_out_rel_rms: f64,
+    ratio_state_rel_rms: f64,
+    frac_margin: f64,
+    out_finite: bool,
+    state_finite: bool,
+    lengths_match: bool,
+    heads_present: u32,
+    verdict: &'static str,
+    failures: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GateReport {
+    schema: &'static str,
+    generated_utc: String,
+    clock: String,
+    package: String,
+    manifest_generated_utc: String,
+    manifest_purpose: String,
+    files_sha256_verified: usize,
+    truth_files_sha256_verified: usize,
+    reference: &'static str,
+    band: f64,
+    ulp_floor: f64,
+    chunk_sizes_evaluated: Vec<u32>,
+    splits_evaluated: Vec<u32>,
+    rows: Vec<GateRow>,
+    fixtures: Vec<FixtureReceipt>,
+    multi_chunk_condition: MultiChunk,
+    residual: ResidualStatus,
+    environment: EnvReceipt,
+    inputs_reused_from_manifest: bool,
+}
+
+/// What each fixture in the package is, carried into the receipt so the run states
+/// which inputs it consumed rather than only that it consumed some.
+#[derive(Serialize)]
+struct FixtureReceipt {
+    name: String,
+    kind: String,
+    rows: usize,
+    prefix: usize,
+    live_rows: usize,
+    seed: Option<i64>,
+    /// Bytes of SHA-verified input this fixture contributed to the run. The arrays
+    /// are read and verified on every leg, including the stub leg, because reading
+    /// them from the manifest IS the input-ownership check (Codex-D 07:28).
+    verified_input_bytes: usize,
+    note: String,
+}
+
+#[derive(Serialize)]
+struct MultiChunk {
+    rule: &'static str,
+    satisfied: bool,
+    detail: Vec<MultiChunkRow>,
+}
+
+#[derive(Serialize)]
+struct MultiChunkRow {
+    c: u32,
+    multi_chunk_fixtures: Vec<String>,
+    passing: Vec<String>,
+    satisfied: bool,
+}
+
+#[derive(Serialize)]
+struct ResidualStatus {
+    required_by: &'static str,
+    what: String,
+    norms: Vec<String>,
+    not: String,
+    emitted: bool,
+    reason: String,
+}
+
+#[derive(Serialize)]
+struct EnvReceipt {
+    label: String,
+    simulated_box3: bool,
+    rust: &'static str,
+    /// What this run actually ran on: the live device when one was touched, otherwise
+    /// the no-device profile. Never a hardcoded box3 string on a measured run.
+    target_profile: String,
+    nvcc_observed: &'static str,
+    cuda_visible_devices: String,
+    device_touched: bool,
+    device: Option<DeviceInfo>,
+    /// Deviations of a STUB leg from a box3 CUDA leg; empty on a device-touching run,
+    /// which carries `device` instead.
+    differs_from_box3: Vec<String>,
+}
+
+/// What the CUDA driver reports about the device this run actually used. Present only
+/// when a device was opened; a stub leg carries None and says so.
+#[derive(Serialize, Clone)]
+struct DeviceInfo {
+    name: String,
+    compute_capability: u32,
+}
+
+fn now_utc() -> String {
+    // seconds since the epoch, formatted; no chrono dependency in this crate
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = t / 86_400;
+    let secs = t % 86_400;
+    let (y, m, d) = civil_from_days(days as i64);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// Howard Hinnant's civil_from_days, the standard days->(y,m,d) conversion.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn env_receipt(
+    simulate_box3: bool,
+    device: Option<DeviceInfo>,
+    device_touched: bool,
+) -> EnvReceipt {
+    let stub = !device_touched;
+    EnvReceipt {
+        label: match (&device, simulate_box3) {
+            (Some(_), _) => "measured on this host",
+            (None, true) => "box3-shaped stub, no CUDA device present",
+            (None, false) => "local stub, no CUDA device present",
+        }
+        .to_string(),
+        simulated_box3: simulate_box3,
+        rust: "see the build log (build.rs records nvcc; rustc is the pinned toolchain)",
+        target_profile: match &device {
+            Some(d) => format!("sm{} / {}", d.compute_capability, d.name),
+            None if simulate_box3 => "sm89 / CUDA 13.0 (asserted, not observed)".to_string(),
+            None => "no device; the stub profile of this host".to_string(),
+        },
+        nvcc_observed: "recorded by build.rs as a cargo warning; see the build log",
+        cuda_visible_devices: std::env::var("CUDA_VISIBLE_DEVICES")
+            .unwrap_or_else(|_| "<unset>".into()),
+        device_touched,
+        device: device.clone(),
+        differs_from_box3: if !stub {
+            vec![]
+        } else if simulate_box3 {
+            vec![
+                "no CUDA device is present here, so the kernel launch and the CUDA-event clock are the stub on both box3 and here".to_string(),
+            ]
+        } else {
+            vec![
+                "the kernel launch is the documented stub; on box3 it is the real gdn_chunkwise_p1_core_s* launch".to_string(),
+                "the clock is the documented stub; on box3 it is CUDA events around the launch".to_string(),
+            ]
+        },
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn split_function(s: u32) -> &'static str {
+    match s {
+        4 => "gdn_chunkwise_p1_core_s4",
+        8 => "gdn_chunkwise_p1_core_s8",
+        16 => "gdn_chunkwise_p1_core_s16",
+        _ => panic!("split {s} is not 4/8/16"),
+    }
+}
+
+/// The dynamic shared-memory bytes the P1 core asks for at this split, from the same
+/// header the kernel static_asserts its arena against.
+#[cfg(feature = "cuda")]
+fn split_smem(s: u32) -> Result<u32> {
+    Ok(match s {
+        4 => flyingfish::gdn_plan::cw_p1::S4_BYTES,
+        8 => flyingfish::gdn_plan::cw_p1::S8_BYTES,
+        16 => flyingfish::gdn_plan::cw_p1::S16_BYTES,
+        _ => anyhow::bail!("split {s} is not 4/8/16"),
+    })
+}
+
+fn head_count(fx: &Fixture, array: &str) -> usize {
+    fx.arrays.get(array).map(|a| a.shape[1]).unwrap_or_default()
+}
+
+fn run_numerics(args: &NumericsArgs) -> Result<()> {
+    ensure!(
+        args.c == KERNEL_C,
+        "the built P1 core is C{KERNEL_C} only; C{} is not built and is not run \
+         (protocol §A fixes C64 for every candidate)",
+        args.c
+    );
+    for s in &args.s {
+        ensure!(
+            [4u32, 8, 16].contains(s),
+            "split {s} is not one of 4/8/16 (protocol §A)"
+        );
+    }
+    let pkg = open_package(&args.package)?;
+    std::fs::create_dir_all(&args.run_dir)
+        .with_context(|| format!("create {}", args.run_dir.display()))?;
+    let fixtures: Vec<&Fixture> = pkg
+        .manifest
+        .fixtures
+        .iter()
+        .filter(|f| args.case.is_empty() || args.case.iter().any(|c| c == &f.name))
+        .collect();
+    ensure!(!fixtures.is_empty(), "no fixture selected");
+
+    // The reference arrays for the configurations actually run, and the basis rows.
+    let mut rows = Vec::new();
+    let mut bytes_by_fixture: BTreeMap<String, usize> = BTreeMap::new();
+    #[cfg(feature = "cuda")]
+    let mut gpu: Option<Gpu> = None;
+    // On the no-CUDA leg there is nothing to open; the stub clock is the only one
+    // and `--clock cuda` says so by name rather than running it silently.
+    #[cfg(not(feature = "cuda"))]
+    let gpu: Option<Gpu> = None;
+    if args.clock == Clock::Cuda {
+        #[cfg(feature = "cuda")]
+        {
+            gpu = Some(Gpu::open()?);
+        }
+        #[cfg(not(feature = "cuda"))]
+        anyhow::bail!("--clock cuda needs the crate's cuda feature");
+    }
+
+    for fx in &fixtures {
+        let m = fx.m;
+        let q = read_f32(&pkg.root, &fx.arrays["q"])?;
+        let k = read_f32(&pkg.root, &fx.arrays["k"])?;
+        let v = read_f32(&pkg.root, &fx.arrays["v"])?;
+        let beta = read_f32(&pkg.root, &fx.arrays["beta"])?;
+        let g = read_f32(&pkg.root, &fx.arrays["g"])?;
+        let s0 = read_f32(&pkg.root, &fx.arrays["S0"])?;
+        let heads = head_count(fx, "q");
+        let dk = fx.arrays["q"].shape[2];
+        let dv = fx.arrays["v"].shape[2];
+        let input_bytes = q.len() + k.len() + v.len() + beta.len() + g.len() + s0.len();
+        bytes_by_fixture.insert(fx.name.clone(), input_bytes);
+
+        // The FP64 truth does not depend on C or s, so it is read once per fixture.
+        let truth_out = read_truth_f64(&pkg.root, pkg.truth_of(&fx.name, "out")?)?;
+        let truth_state = read_truth_f64(&pkg.root, pkg.truth_of(&fx.name, "state")?)?;
+
+        for &s in &args.s {
+            let basis = pkg
+                .basis
+                .get(&(fx.name.clone(), args.c, s))
+                .with_context(|| {
+                    format!(
+                        "gate_basis.json has no row for {} C{} s{s}",
+                        fx.name, args.c
+                    )
+                })?
+                .clone();
+            let input_sha = ARRAYS
+                .iter()
+                .map(|a| fx.arrays[*a].sha256.clone())
+                .collect::<Vec<_>>()
+                .join(";");
+            ensure!(
+                input_sha == basis.input_sha256,
+                "gate basis row {} C{} s{s} names different input bytes; \
+                 the basis and the package are not the same run",
+                fx.name,
+                args.c
+            );
+
+            let (out, state) = match gpu.as_ref() {
+                #[cfg(feature = "cuda")]
+                Some(gpu) => gpu.run_p1(fx, &q, &k, &v, &beta, &g, &s0, s)?,
+                None => (
+                    stub_field_array(m * heads * dk, 0.0),
+                    stub_field_array(heads * dk * dv, 1.3),
+                ),
+                #[cfg(not(feature = "cuda"))]
+                Some(_) => anyhow::bail!("the CUDA clock needs the crate's cuda feature"),
+            };
+            ensure!(
+                out.len() == m * heads * dv,
+                "{} C{} s{s}: output is {} elements, expected {}",
+                fx.name,
+                args.c,
+                out.len(),
+                m * heads * dv
+            );
+            ensure!(
+                state.len() == heads * dk * dv,
+                "{} C{} s{s}: state is {} elements, expected {}",
+                fx.name,
+                args.c,
+                state.len(),
+                heads * dk * dv
+            );
+            write_f32(
+                &args
+                    .run_dir
+                    .join(format!("{}.C{}.s{}.out.f32", fx.name, args.c, s)),
+                &out,
+            )?;
+            write_f32(
+                &args
+                    .run_dir
+                    .join(format!("{}.C{}.s{}.state.f32", fx.name, args.c, s)),
+                &state,
+            )?;
+
+            let out_metrics = metrics(&out, &truth_out)?;
+            let state_metrics = metrics(&state, &truth_state)?;
+            rows.push(gate_row(
+                fx,
+                args.c,
+                s,
+                &basis,
+                &out_metrics,
+                &state_metrics,
+                heads as u32,
+            )?);
+            let verdict = rows.last().map(|r| r.verdict).unwrap_or("?");
+            eprintln!("  {:16} C{} s{s:<2} {verdict}", fx.name, args.c);
+        }
+    }
+
+    let device_touched = gpu.is_some();
+    let device = device_of(gpu.as_ref());
+    let multi = multi_chunk_condition(&rows, args.c);
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for r in &rows {
+        *counts.entry(r.case.as_str()).or_default() += 1;
+    }
+    let receipts: Vec<FixtureReceipt> = fixtures
+        .iter()
+        .map(|f| FixtureReceipt {
+            name: f.name.clone(),
+            kind: f.kind.clone(),
+            rows: counts.get(f.name.as_str()).copied().unwrap_or(0),
+            prefix: f.prefix,
+            live_rows: f.m,
+            seed: f.seed,
+            verified_input_bytes: bytes_by_fixture
+                .get(f.name.as_str())
+                .copied()
+                .unwrap_or_default(),
+            note: f.note.clone(),
+        })
+        .collect();
+    let report = GateReport {
+        schema: SCHEMA_GATE,
+        generated_utc: now_utc(),
+        clock: format!("{:?}", args.clock).to_lowercase(),
+        package: args.package.display().to_string(),
+        manifest_generated_utc: pkg.manifest.generated_utc.clone(),
+        manifest_purpose: pkg.manifest.purpose.clone(),
+        files_sha256_verified: pkg.verified,
+        truth_files_sha256_verified: pkg.truth_verified,
+        reference: "truth/<fixture>.{out,state}.f64 — the FP64 recurrent oracle, the same \
+                    array gate_basis.json measured the CPU P1 model against",
+        band: pkg.basis_doc.band,
+        ulp_floor: pkg.basis_doc.ulp_floor,
+        chunk_sizes_evaluated: vec![args.c],
+        splits_evaluated: args.s.clone(),
+        residual: residual_status(&pkg.manifest.residual_record_spec),
+        environment: env_receipt(args.simulate_box3, device.clone(), device_touched),
+        inputs_reused_from_manifest: true,
+        rows,
+        fixtures: receipts,
+        multi_chunk_condition: multi,
+    };
+    let path = args.run_dir.join("GATE.json");
+    let text = serde_json::to_string_pretty(&report)?;
+    std::fs::write(&path, text.as_bytes()).with_context(|| format!("write {}", path.display()))?;
+    eprintln!("[gate] {}", path.display());
+    let pass = report.rows.iter().filter(|r| r.verdict == "PASS").count();
+    eprintln!(
+        "[gate] {}/{} rows PASS, multi-chunk condition {}",
+        pass,
+        report.rows.len(),
+        if report.multi_chunk_condition.satisfied {
+            "satisfied"
+        } else {
+            "NOT satisfied"
+        }
+    );
+    // A gate report is emitted whatever the verdict; the runner exits non-zero only
+    // when the plumbing itself failed. The verdict is the caller's to read.
+    Ok(())
+}
+
+fn stub_field_array(n: usize, phase: f64) -> Vec<f32> {
+    (0..n).map(|i| stub_field(i, phase) as f32).collect()
+}
+
+fn write_f32(path: &Path, data: &[f32]) -> Result<()> {
+    let mut bytes = Vec::with_capacity(data.len() * 4);
+    for v in data {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, &bytes).with_context(|| format!("write {}", path.display()))
+}
+
+fn residual_status(spec: &ResidualSpec) -> ResidualStatus {
+    ResidualStatus {
+        required_by: "4d 2026-10-13T07:06:44Z item 1",
+        what: spec.what.clone(),
+        norms: spec.norms.clone(),
+        not: spec.not.clone(),
+        emitted: false,
+        reason: "the committed P1 core keeps A and T in shared memory and emits neither; \
+                 the residual needs the CANDIDATE's T, so it cannot be reconstructed on \
+                 the host from the reference. Emitting it needs a nullable per-(chunk,head) \
+                 output plus a 16x16 strip accumulator and a 16x16 diagonal stash in the \
+                 kernel (about 8 KiB more shared memory). Not present in this build."
+            .to_string(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gate_row(
+    fx: &Fixture,
+    c: u32,
+    s: u32,
+    basis: &BasisRow,
+    mo: &Metrics,
+    state_m: &Metrics,
+    heads: u32,
+) -> Result<GateRow> {
+    let mut failures = Vec::new();
+    let chunks = fx.m.div_ceil(c as usize) as u32;
+    let multi = chunks > 1;
+    // A quantity whose basis is zero keeps ZERO tolerance; no epsilon is added.
+    let ratio = |got: f64, model: f64| -> f64 {
+        if model == 0.0 {
+            if got == 0.0 { 0.0 } else { f64::INFINITY }
+        } else {
+            got / model
+        }
+    };
+    let r_max = ratio(mo.max_abs, basis.out_max_abs);
+    let r_rms = ratio(mo.rel_rms, basis.out_rel_rms);
+    let r_state = ratio(state_m.rel_rms, basis.state_rel_rms);
+    // The stored gate_* columns are the pre-registered 1.25x products; a band that
+    // disagrees with the model column is a package that is not self-consistent.
+    ensure!(
+        (basis.gate_out_max_abs - basis.out_max_abs * GATE_BAND).abs()
+            <= 1e-12 * basis.gate_out_max_abs.max(1e-300)
+            && (basis.gate_out_rel_rms - basis.out_rel_rms * GATE_BAND).abs()
+                <= 1e-12 * basis.gate_out_rel_rms.max(1e-300)
+            && (basis.gate_state_rel_rms - basis.state_rel_rms * GATE_BAND).abs()
+                <= 1e-12 * basis.gate_state_rel_rms.max(1e-300),
+        "gate basis row {} C{} s{}: the stored gate columns are not {GATE_BAND}x the model columns",
+        fx.name,
+        c,
+        s
+    );
+    if !mo.finite {
+        failures.push("non-finite output value".into());
+    }
+    if !state_m.finite {
+        failures.push("non-finite state value".into());
+    }
+    if heads == 0 {
+        failures.push("no head".into());
+    }
+    if basis.out_max_abs == 0.0 && mo.max_abs != 0.0 {
+        failures.push("zero-baseline out_max_abs exceeded with zero tolerance".into());
+    }
+    if basis.state_rel_rms == 0.0 && state_m.rel_rms != 0.0 {
+        failures.push("zero-baseline state_rel_rms exceeded with zero tolerance".into());
+    }
+    if r_max > GATE_BAND {
+        failures.push(format!("out_max_abs ratio {r_max:.4} over {GATE_BAND}"));
+    }
+    if r_rms > GATE_BAND {
+        failures.push(format!("out_rel_rms ratio {r_rms:.4} over {GATE_BAND}"));
+    }
+    if r_state > GATE_BAND {
+        failures.push(format!("state_rel_rms ratio {r_state:.4} over {GATE_BAND}"));
+    }
+    if mo.frac_le_1ulp < basis.frac_floor {
+        failures.push(format!(
+            "frac_le_1ulp {:.4} below floor {:.4}",
+            mo.frac_le_1ulp, basis.frac_floor
+        ));
+    }
+    Ok(GateRow {
+        case: fx.name.clone(),
+        c,
+        s,
+        chunks,
+        multi_chunk: multi,
+        model_out_max_abs: basis.out_max_abs,
+        model_out_rel_rms: basis.out_rel_rms,
+        model_state_rel_rms: basis.state_rel_rms,
+        model_frac_le_1ulp: basis.frac_le_1ulp,
+        got_out_max_abs: mo.max_abs,
+        got_out_rel_rms: mo.rel_rms,
+        got_state_rel_rms: state_m.rel_rms,
+        got_frac_le_1ulp: mo.frac_le_1ulp,
+        ratio_out_max_abs: r_max,
+        ratio_out_rel_rms: r_rms,
+        ratio_state_rel_rms: r_state,
+        frac_margin: mo.frac_le_1ulp - basis.frac_floor,
+        out_finite: mo.finite,
+        state_finite: state_m.finite,
+        lengths_match: true,
+        heads_present: heads,
+        verdict: if failures.is_empty() { "PASS" } else { "FAIL" },
+        failures,
+    })
+}
+
+/// 4d item 2's multi-chunk condition: every C evaluated must have at least one
+/// fixture of more than one chunk that passes.
+fn multi_chunk_condition(rows: &[GateRow], c: u32) -> MultiChunk {
+    let mut multi: Vec<String> = Vec::new();
+    let mut passing: Vec<String> = Vec::new();
+    for r in rows {
+        if r.c == c && r.multi_chunk {
+            if !multi.contains(&r.case) {
+                multi.push(r.case.clone());
+            }
+            if r.verdict == "PASS" && !passing.contains(&r.case) {
+                passing.push(r.case.clone());
+            }
+        }
+    }
+    let satisfied = !passing.is_empty();
+    MultiChunk {
+        rule: "every chunk size C must have at least one multi-chunk fixture (ceil(M/C) > 1) passing",
+        satisfied,
+        detail: vec![MultiChunkRow {
+            c,
+            multi_chunk_fixtures: multi,
+            passing,
+            satisfied,
+        }],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the timing phase
+// ---------------------------------------------------------------------------
+#[derive(Serialize, Clone)]
+struct BlockStat {
+    block: u32,
+    log_ratio: f64,
+    ratio: f64,
+    a_ms: f64,
+    b_ms: f64,
+}
+
+#[derive(Serialize)]
+struct LegSeries {
+    label: &'static str,
+    blocks: Vec<BlockStat>,
+    geometric_mean_ratio: f64,
+    ci_low: f64,
+    ci_high: f64,
+    mean_log_ratio: f64,
+    stderr_log_ratio: f64,
+    t_critical: f64,
+    max_direction_drift: f64,
+    n_legs: usize,
+}
+
+#[derive(Serialize)]
+struct NullBand {
+    label: &'static str,
+    computed_before_any_p1_comparison: bool,
+    blocks: u32,
+    sd_log_ratio: f64,
+    floor: f64,
+    quantisation_term: f64,
+    band: f64,
+    valid: bool,
+    invalid_reason: Option<String>,
+    band_written_to: String,
+}
+
+#[derive(Serialize)]
+struct TimingReport {
+    schema: &'static str,
+    generated_utc: String,
+    clock: String,
+    case: String,
+    c: u32,
+    splits: Vec<u32>,
+    blocks: u32,
+    configurations: Vec<TimingConfig>,
+    environment: EnvReceipt,
+    device_touched: bool,
+}
+
+#[derive(Serialize)]
+struct TimingConfig {
+    c: u32,
+    s: u32,
+    null_band: f64,
+    null_valid: bool,
+    comparisons: Vec<LegSeries>,
+    verdict: &'static str,
+    verdict_reason: String,
+}
+
+const GATE_BAND: f64 = 1.25;
+
+fn run_timing(args: &TimingArgs) -> Result<()> {
+    let pkg = open_package(&args.package)?;
+    ensure!(
+        !pkg.manifest.fixtures.is_empty(),
+        "manifest lists no fixtures"
+    );
+    let fx = match &args.case {
+        Some(name) => pkg
+            .manifest
+            .fixtures
+            .iter()
+            .find(|f| f.name == *name)
+            .with_context(|| format!("fixture {name} is not in the manifest"))?,
+        None => &pkg.manifest.fixtures[0],
+    };
+    std::fs::create_dir_all(&args.run_dir)
+        .with_context(|| format!("create {}", args.run_dir.display()))?;
+
+    #[cfg(feature = "cuda")]
+    let mut gpu: Option<Gpu> = None;
+    // On the no-CUDA leg there is nothing to open; the stub clock is the only one
+    // and `--clock cuda` says so by name rather than running it silently.
+    #[cfg(not(feature = "cuda"))]
+    let gpu: Option<Gpu> = None;
+    if args.clock == Clock::Cuda {
+        #[cfg(feature = "cuda")]
+        {
+            gpu = Some(Gpu::open()?);
+        }
+        #[cfg(not(feature = "cuda"))]
+        anyhow::bail!("--clock cuda needs the crate's cuda feature");
+    }
+
+    // Load the inputs once; every leg restores S from S0 so a leg's decay work is
+    // the same as the first call's.
+    let q = read_f32(&pkg.root, &fx.arrays["q"])?;
+    let k = read_f32(&pkg.root, &fx.arrays["k"])?;
+    let v = read_f32(&pkg.root, &fx.arrays["v"])?;
+    let beta = read_f32(&pkg.root, &fx.arrays["beta"])?;
+    let g = read_f32(&pkg.root, &fx.arrays["g"])?;
+    let s0 = read_f32(&pkg.root, &fx.arrays["S0"])?;
+
+    let device_touched = gpu.is_some();
+    let device = device_of(gpu.as_ref());
+    let mut configs = Vec::new();
+    for &s in &args.s {
+        // 1. NULL FIRST: the main core against ITSELF, so the band measures the
+        // measurement noise and nothing else.
+        let null_blocks = abba(
+            args.clock,
+            args.blocks,
+            Which::Main,
+            Which::Main,
+            |which, leg| {
+                let _ = leg;
+                time_leg(
+                    gpu.as_ref(),
+                    fx,
+                    &q,
+                    &k,
+                    &v,
+                    &beta,
+                    &g,
+                    &s0,
+                    which,
+                    s,
+                    args.c,
+                )
+            },
+        );
+        let null = freeze_null_band(&null_blocks, args, s)?;
+        let band_path = args
+            .run_dir
+            .join(format!("NULL_BAND.C{}.s{s}.json", args.c));
+        std::fs::write(&band_path, serde_json::to_string_pretty(&null)?.as_bytes())
+            .with_context(|| format!("write {}", band_path.display()))?;
+
+        // 2. Only now the P1 leg, compared against the band that is already on disk.
+        let p1_blocks = abba(
+            args.clock,
+            args.blocks,
+            Which::Main,
+            Which::P1,
+            |which, leg| {
+                let _ = leg;
+                time_leg(
+                    gpu.as_ref(),
+                    fx,
+                    &q,
+                    &k,
+                    &v,
+                    &beta,
+                    &g,
+                    &s0,
+                    which,
+                    s,
+                    args.c,
+                )
+            },
+        );
+        let series = summarise(&p1_blocks, args.blocks as usize * 4);
+        let (verdict, reason) = if !null.valid {
+            (
+                "INVALID",
+                format!(
+                    "the null band is not usable ({}) so the comparison is reported, not read",
+                    null.invalid_reason.clone().unwrap_or_default()
+                ),
+            )
+        } else if series.ci_low > 1.0 + null.band {
+            (
+                "PASS",
+                format!(
+                    "the CI lower bound {:.4} clears the band {:.4}",
+                    series.ci_low, null.band
+                ),
+            )
+        } else {
+            (
+                "NOT_CLEARED",
+                format!(
+                    "the CI [{:.4}, {:.4}] does not clear the band {:.4}",
+                    series.ci_low, series.ci_high, null.band
+                ),
+            )
+        };
+        configs.push(TimingConfig {
+            c: args.c,
+            s,
+            null_band: null.band,
+            null_valid: null.valid,
+            comparisons: vec![series],
+            verdict,
+            verdict_reason: reason,
+        });
+    }
+
+    let report = TimingReport {
+        schema: SCHEMA_TIMING,
+        generated_utc: now_utc(),
+        clock: format!("{:?}", args.clock).to_lowercase(),
+        case: fx.name.clone(),
+        c: args.c,
+        splits: args.s.clone(),
+        blocks: args.blocks,
+        configurations: configs,
+        environment: env_receipt(args.simulate_box3, device.clone(), device_touched),
+        device_touched,
+    };
+    let path = args.run_dir.join("TIMING.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&report)?.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
+    eprintln!("[timing] {}", path.display());
+    Ok(())
+}
+
+/// One A/B pair inside a block: A is always the main core, B is the candidate.
+#[derive(Copy, Clone, PartialEq)]
+enum Which {
+    Main,
+    P1,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn time_leg(
+    gpu: Option<&Gpu>,
+    _fx: &Fixture,
+    _q: &[f32],
+    _k: &[f32],
+    _v: &[f32],
+    _beta: &[f32],
+    _g: &[f32],
+    _s0: &[f32],
+    which: Which,
+    s: u32,
+    _c: u32,
+) -> Result<f64> {
+    match gpu {
+        None => Ok(stub_duration(which, s)),
+        #[cfg(feature = "cuda")]
+        Some(gpu) => gpu.time(which, _fx, _q, _k, _v, _beta, _g, _s0, s),
+        #[cfg(not(feature = "cuda"))]
+        Some(_) => anyhow::bail!("the CUDA clock needs the crate's cuda feature"),
+    }
+}
+
+/// Documented stub durations in milliseconds: the main core and the P1 core get
+/// distinct fixed bases so the ABBA arithmetic is exercised, and each leg carries a
+/// fixed 1% quantisation so the quantisation term of the band is non-zero. The
+/// NUMBERS are not a measurement and the report labels them as stub.
+fn stub_duration(which: Which, s: u32) -> f64 {
+    let base = match which {
+        Which::Main => 4.07,
+        Which::P1 => 4.07 / (s as f64).sqrt(),
+    };
+    base * (1.0 + 0.01 * ((s % 4) as f64 - 1.5) / 1.5)
+}
+
+/// Four legs per block in A B B A order; the per-block statistic is the mean of the
+/// two legs of log(t_B) - log(t_A). `a` and `b` name what each side runs, so the null
+/// band can run the SAME core on both sides and the P1 leg runs main against P1.
+fn abba<F>(clock: Clock, blocks: u32, a: Which, b: Which, mut leg: F) -> Vec<BlockStat>
+where
+    F: FnMut(Which, usize) -> Result<f64>,
+{
+    let mut out = Vec::new();
+    for blk in 0..blocks {
+        let n = blk * 4;
+        let order = [(a, n), (b, n + 1), (b, n + 2), (a, n + 3)];
+        // Assigned by POSITION, not by identity: when a == b (the null leg) both
+        // cores are the same one and identity cannot say which leg is which side.
+        let side = [true, false, false, true];
+        let mut ta = [f64::NAN; 2];
+        let mut tb = [f64::NAN; 2];
+        let mut filled = [0usize; 2];
+        for (i, (w, n)) in order.into_iter().enumerate() {
+            // A leg that failed is NaN, not a dropped sample: dropping it would
+            // silently shrink the block and the band would be computed from fewer.
+            let t = leg(w, n as usize).unwrap_or(f64::NAN);
+            if side[i] {
+                ta[filled[0]] = t;
+                filled[0] += 1;
+            } else {
+                tb[filled[1]] = t;
+                filled[1] += 1;
+            }
+        }
+        let a = (ta[0] + ta[1]) / 2.0;
+        let bmean = (tb[0] + tb[1]) / 2.0;
+        let lr = if a > 0.0 && bmean > 0.0 {
+            (bmean / a).ln()
+        } else {
+            f64::NAN
+        };
+        out.push(BlockStat {
+            block: blk,
+            log_ratio: lr,
+            ratio: if lr.is_nan() { f64::NAN } else { lr.exp() },
+            a_ms: a,
+            b_ms: bmean,
+        });
+    }
+    let _ = clock;
+    out
+}
+
+fn freeze_null_band(blocks: &[BlockStat], args: &TimingArgs, s: u32) -> Result<NullBand> {
+    let n = blocks.len() as f64;
+    let lr: Vec<f64> = blocks.iter().map(|b| b.log_ratio).collect();
+    let finite = lr.iter().all(|x| x.is_finite());
+    let mean = if finite {
+        lr.iter().sum::<f64>() / n
+    } else {
+        f64::NAN
+    };
+    let var = if finite {
+        lr.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)
+    } else {
+        f64::NAN
+    };
+    let sd = var.sqrt();
+    // event quantisation / batch time: the shortest leg in the block set
+    let min_t = blocks
+        .iter()
+        .flat_map(|b| [b.a_ms, b.b_ms])
+        .filter(|t| t.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let quant = if min_t.is_finite() && min_t > 0.0 {
+        0.5 / 1000.0 / min_t // 0.5 us of event quantisation over the shortest leg
+    } else {
+        f64::INFINITY
+    };
+    let floor: f64 = 0.03;
+    let spread = if sd.is_finite() {
+        (3.0 * sd).exp() - 1.0
+    } else {
+        f64::INFINITY
+    };
+    let band = floor.max(spread).max(quant);
+    let drift = blocks
+        .iter()
+        .map(|b| b.log_ratio.abs())
+        .fold(0.0f64, |m, x| if x > m { x } else { m });
+    let mut invalid = None;
+    if !finite {
+        invalid = Some("a null leg produced no finite duration".into());
+    } else if band > 0.05 {
+        invalid = Some(format!("null band {band:.4} exceeds 5%"));
+    } else if drift > 0.05 {
+        invalid = Some(format!("null direction drift {drift:.4} exceeds 5%"));
+    }
+    Ok(NullBand {
+        label: "main core vs main core, the same ABBA block structure",
+        computed_before_any_p1_comparison: true,
+        blocks: blocks.len() as u32,
+        sd_log_ratio: sd,
+        floor,
+        quantisation_term: quant,
+        band,
+        valid: invalid.is_none(),
+        invalid_reason: invalid,
+        band_written_to: format!("NULL_BAND.C{}.s{s}.json", args.c),
+    })
+}
+
+fn summarise(blocks: &[BlockStat], n_legs: usize) -> LegSeries {
+    let lr: Vec<f64> = blocks.iter().map(|b| b.log_ratio).collect();
+    let n = lr.len() as f64;
+    let mean = lr.iter().sum::<f64>() / n;
+    let var = lr.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let se = (var / n).sqrt();
+    // Bonferroni over the nine (C, s) configurations, two-sided.
+    let alpha = 0.05 / 9.0;
+    let t = t_critical(alpha / 2.0, n - 1.0);
+    let drift = lr.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    LegSeries {
+        label: "P1 core vs the main GDN core",
+        blocks: blocks.to_vec(),
+        geometric_mean_ratio: mean.exp(),
+        ci_low: (mean - t * se).exp(),
+        ci_high: (mean + t * se).exp(),
+        mean_log_ratio: mean,
+        stderr_log_ratio: se,
+        t_critical: t,
+        max_direction_drift: drift,
+        n_legs,
+    }
+}
+
+/// Two-sided t critical value: invert the Student t CDF through the regularised
+/// incomplete beta by bisection (Numerical Recipes' betai/betacf), so the CI is not
+/// a normal approximation wearing a t's name.
+fn t_critical(tail: f64, df: f64) -> f64 {
+    let mut lo = 0.0f64;
+    let mut hi = 200.0f64;
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if student_t_cdf(mid, df) < 1.0 - tail {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+fn student_t_cdf(t: f64, df: f64) -> f64 {
+    let x = df / (df + t * t);
+    let p = 0.5 * regularized_beta(x, df / 2.0, 0.5);
+    if t > 0.0 { 1.0 - p } else { p }
+}
+
+fn regularized_beta(x: f64, a: f64, b: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let lbeta = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b);
+    let front = (lbeta + a * x.ln() + b * (1.0 - x).ln()).exp();
+    if x < (a + 1.0) / (a + b + 2.0) {
+        front * betacf(x, a, b) / a
+    } else {
+        1.0 - (front * betacf(1.0 - x, b, a) / b)
+    }
+}
+
+/// Continued fraction for the incomplete beta (modified Lentz).
+fn betacf(x: f64, a: f64, b: f64) -> f64 {
+    let tiny = 1e-300;
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < tiny {
+        d = tiny;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..=300 {
+        let m = m as f64;
+        let m2 = 2.0 * m;
+        let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        let aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < 3e-16 {
+            break;
+        }
+    }
+    h
+}
+
+/// Lanczos approximation of ln Gamma (g = 7, n = 9 coefficients).
+fn ln_gamma(z: f64) -> f64 {
+    const COEF: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if z < 0.5 {
+        return std::f64::consts::PI.ln()
+            - (std::f64::consts::PI * z).sin().ln()
+            - ln_gamma(1.0 - z);
+    }
+    let z = z - 1.0;
+    let mut a = COEF[0];
+    for (i, c) in COEF.iter().enumerate().skip(1) {
+        a += c / (z + i as f64);
+    }
+    let t = z + 7.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + a.ln()
+}
+
+// ---------------------------------------------------------------------------
+// the CUDA leg
+// ---------------------------------------------------------------------------
+/// Load one kernel module from this build's own cubin bytes. The gate launches the
+/// core directly with its own buffers, so it does not go through the Engine binder.
+#[cfg(feature = "cuda")]
+fn load_module(
+    ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+    name: &str,
+) -> Result<std::sync::Arc<cudarc::driver::CudaModule>> {
+    use cudarc::nvrtc::Ptx;
+    let sm = compute_capability(ctx)?;
+    let bytes = flyingfish::backend::kernel_cubin(name, sm)
+        .with_context(|| format!("no cubin for {name} at sm{sm}; set CUDA_ARCH_LIST"))?;
+    Ok(ctx.load_module(Ptx::from_binary(bytes.to_vec()))?)
+}
+
+#[cfg(feature = "cuda")]
+fn compute_capability(ctx: &cudarc::driver::CudaContext) -> Result<u32> {
+    use cudarc::driver::sys::CUdevice_attribute as A;
+    let major = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+    let minor = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+    ensure!(
+        major > 0 && (0..=9).contains(&minor),
+        "invalid CUDA compute capability {major}.{minor}"
+    );
+    Ok((major * 10 + minor) as u32)
+}
+
+/// Placeholder on the no-CUDA leg: the stub clock is the only clock there, and
+/// `--clock cuda` says so by name rather than silently running the stub.
+#[cfg(not(feature = "cuda"))]
+struct Gpu;
+
+#[cfg(feature = "cuda")]
+fn device_of(gpu: Option<&Gpu>) -> Option<DeviceInfo> {
+    gpu.map(|g| g.device_info.clone())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_of(_gpu: Option<&Gpu>) -> Option<DeviceInfo> {
+    None
+}
+
+#[cfg(feature = "cuda")]
+struct Gpu {
+    ctx: std::sync::Arc<cudarc::driver::CudaContext>,
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    p1: [cudarc::driver::CudaFunction; 3],
+    main: cudarc::driver::CudaFunction,
+    device_info: DeviceInfo,
+}
+
+#[cfg(feature = "cuda")]
+impl Gpu {
+    /// Thread block of the P1 core (protocol §E), and of the shipped main core with
+    /// its measured 62,336 B dynamic shared-memory request.
+    const P1_THREADS: u32 = 256;
+    const MAIN_THREADS: u32 = 512;
+    const MAIN_SMEM: u32 = 62_336;
+    /// The shipped production prefill core, the timing baseline (gdn_chunked.cu).
+    const MAIN_NAME: &str = "gdn_chunked_core_v1";
+
+    fn open() -> Result<Self> {
+        use cudarc::driver::{CudaContext, LaunchConfig, sys};
+        let ctx = CudaContext::new(0).context("create CUDA context")?;
+        let arch = compute_capability(&ctx)?;
+        let stream = ctx.new_stream().context("create CUDA stream")?;
+        let p1_mod = load_module(&ctx, P1_MODULE)?;
+        let p1 = [
+            p1_mod.load_function(split_function(4))?,
+            p1_mod.load_function(split_function(8))?,
+            p1_mod.load_function(split_function(16))?,
+        ];
+        let main_mod = load_module(&ctx, "gdn/gdn_chunked")?;
+        let main = main_mod.load_function(Self::MAIN_NAME)?;
+        for (i, bytes) in [split_smem(4)?, split_smem(8)?, split_smem(16)?]
+            .iter()
+            .enumerate()
+        {
+            if *bytes > 48 * 1024 {
+                p1[i].set_attribute(
+                    sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    *bytes as i32,
+                )?;
+            }
+        }
+        if Self::MAIN_SMEM > 48 * 1024 {
+            main.set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                Self::MAIN_SMEM as i32,
+            )?;
+        }
+        // Touch LaunchConfig so the cfg type is used on this leg.
+        let _ = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        eprintln!("[cuda] sm{arch}, {P1_MODULE} and gdn/gdn_chunked loaded");
+        let name = ctx.name().unwrap_or_else(|_| "<unnamed>".to_string());
+        let device_info = DeviceInfo {
+            name,
+            compute_capability: arch,
+        };
+        eprintln!("[cuda] device {}", device_info.name);
+        Ok(Gpu {
+            ctx,
+            stream,
+            p1,
+            main,
+            device_info,
+        })
+    }
+
+    /// Allocate, upload, launch the P1 core, download. Every leg starts from S0 so
+    /// the state a previous leg decayed is not the next leg's input.
+    #[allow(clippy::too_many_arguments)]
+    fn run_p1(
+        &self,
+        fx: &Fixture,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        beta: &[f32],
+        g: &[f32],
+        s0: &[f32],
+        s: u32,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg as _};
+        let m = fx.m;
+        let heads = fx.arrays["q"].shape[1];
+        let dv = fx.arrays["v"].shape[2];
+        let dq = self.stream.clone_htod(q)?;
+        let dk = self.stream.clone_htod(k)?;
+        let dvv = self.stream.clone_htod(v)?;
+        let dbeta = self.stream.clone_htod(beta)?;
+        let dg = self.stream.clone_htod(g)?;
+        let mut ds = self.stream.clone_htod(s0)?;
+        let dout = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
+        let meta = self.meta(fx)?;
+        let idx = match s {
+            4 => 0,
+            8 => 1,
+            16 => 2,
+            _ => anyhow::bail!("split {s} is not 4/8/16"),
+        };
+        let cfg = LaunchConfig {
+            grid_dim: (s, heads as u32, 1),
+            block_dim: (Self::P1_THREADS, 1, 1),
+            shared_mem_bytes: split_smem(s)?,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.p1[idx])
+                .arg(&dq)
+                .arg(&dk)
+                .arg(&dvv)
+                .arg(&dbeta)
+                .arg(&dg)
+                .arg(&mut ds)
+                .arg(&dout)
+                .arg(&meta)
+                // 0 is the sentinel that makes the kernel read meta->valid_rows, so
+                // the live count stays device data and a captured graph replays it.
+                .arg(&0i32)
+                .launch(cfg)?;
+        }
+        let out: Vec<half::bf16> = self.stream.clone_dtoh(&dout)?;
+        let state: Vec<f32> = self.stream.clone_dtoh(&ds)?;
+        let widened: Vec<f32> = out.iter().map(|b| b.to_f32()).collect();
+        Ok((widened, state))
+    }
+
+    fn meta(&self, fx: &Fixture) -> Result<cudarc::driver::CudaSlice<i32>> {
+        // The kernel declares `struct GdnMeta { int prefix, valid_rows, key_count,
+        // capacity, causal, r20, r24, r28; }`; eight i32 in that order.
+        let key_count = fx.prefix as i32 + fx.m as i32;
+        Ok(self.stream.clone_htod(&[
+            fx.prefix as i32,
+            fx.m as i32,
+            key_count,
+            key_count,
+            1,
+            0,
+            0,
+            0,
+        ])?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn time(
+        &self,
+        which: Which,
+        fx: &Fixture,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        beta: &[f32],
+        g: &[f32],
+        s0: &[f32],
+        s: u32,
+    ) -> Result<f64> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg as _, sys};
+        let m = fx.m;
+        let heads = fx.arrays["q"].shape[1];
+        let dv = fx.arrays["v"].shape[2];
+        let dq = self.stream.clone_htod(q)?;
+        let dk = self.stream.clone_htod(k)?;
+        let dvv = self.stream.clone_htod(v)?;
+        let dbeta = self.stream.clone_htod(beta)?;
+        let dg = self.stream.clone_htod(g)?;
+        let mut ds = self.stream.clone_htod(s0)?;
+        let dout = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
+        let meta = self.meta(fx)?;
+        // The events bracket the launch on the stream; nothing else is enqueued
+        // between them, and the stream is synchronised before the pair is read.
+        let start = self
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        start.record(&self.stream)?;
+        #[allow(unused_unsafe)]
+        unsafe {
+            match which {
+                Which::Main => {
+                    self.stream
+                        .launch_builder(&self.main)
+                        .arg(&dq)
+                        .arg(&dk)
+                        .arg(&dvv)
+                        .arg(&dbeta)
+                        .arg(&dg)
+                        .arg(&mut ds)
+                        .arg(&dout)
+                        .arg(&meta)
+                        .arg(&0i32)
+                        .launch(LaunchConfig {
+                            grid_dim: (1, heads as u32, 1),
+                            block_dim: (Self::MAIN_THREADS, 1, 1),
+                            shared_mem_bytes: Self::MAIN_SMEM,
+                        })?;
+                }
+                Which::P1 => {
+                    let idx = match s {
+                        4 => 0,
+                        8 => 1,
+                        16 => 2,
+                        _ => anyhow::bail!("split {s} is not 4/8/16"),
+                    };
+                    self.stream
+                        .launch_builder(&self.p1[idx])
+                        .arg(&dq)
+                        .arg(&dk)
+                        .arg(&dvv)
+                        .arg(&dbeta)
+                        .arg(&dg)
+                        .arg(&mut ds)
+                        .arg(&dout)
+                        .arg(&meta)
+                        .arg(&0i32)
+                        .launch(LaunchConfig {
+                            grid_dim: (s, heads as u32, 1),
+                            block_dim: (Self::P1_THREADS, 1, 1),
+                            shared_mem_bytes: split_smem(s)?,
+                        })?;
+                }
+            }
+        }
+        let end = self
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        end.record(&self.stream)?;
+        self.stream.synchronize()?;
+        let ms = start.elapsed_ms(&end)? as f64;
+        ensure!(ms.is_finite() && ms > 0.0, "event pair gave {ms} ms");
+        Ok(ms)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the debug phase — one chunk, every stage, for the stage hunt
+// ---------------------------------------------------------------------------
+/// The dump layout, identical to the kernel's P1_DBG_* offsets: (name, first float,
+/// rows, cols). W is written out of order ([row tile][dk block][16][16]) so it carries
+/// the sentinel offset below and is re-laid-out on the way out.
+#[cfg(feature = "cuda")]
+const DBG_W_SENTINEL: usize = usize::MAX;
+#[cfg(feature = "cuda")]
+const DBG_STAGES: [(&str, usize, usize, usize); 20] = [
+    ("G", 0, 64, 1),
+    ("A", 64, 64, 64),
+    ("T", 4160, 64, 64),
+    ("U", 16448, 64, 16),
+    ("WS", 18496, 64, 16),
+    ("VNEW", 20544, 64, 16),
+    ("QK", 22592, 64, 64),
+    ("AD", 26688, 64, 16),
+    ("OUT", 28736, 64, 16),
+    ("SNEW", 30784, 128, 16),
+    ("BETA", 47168, 64, 1),
+    ("RAWA", 47232, 64, 64),
+    ("SV", 51328, 8 * 16, 16),
+    ("SR", 53376, 8 * 16, 16),
+    ("SR2", 55424, 8 * 16, 16),
+    ("MT11", 57472, 32, 32),
+    ("MT22", 58496, 32, 32),
+    ("MA21", 59520, 32, 32),
+    ("MX", 60544, 32, 32),
+    ("W", DBG_W_SENTINEL, 4 * 8 * 16, 16),
+];
+/// The kernel's P1_DBG_BYTES for any split: the [64][VW] and [128][VW] regions are
+/// reserved at the largest split (VW=32), so the offsets are split-independent.
+#[cfg(feature = "cuda")]
+const DBG_BYTES: usize = 61568;
+
+#[cfg(feature = "cuda")]
+fn run_debug(args: &DebugArgs) -> Result<()> {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg as _, sys};
+    ensure!(args.c == KERNEL_C, "the built P1 core is C{KERNEL_C} only");
+    ensure!(args.s == 8, "only the s8 debug entry point exists");
+    let pkg = open_package(&args.package)?;
+    let fx = pkg
+        .manifest
+        .fixtures
+        .iter()
+        .find(|f| f.name == args.case)
+        .with_context(|| format!("fixture {} is not in the manifest", args.case))?;
+    std::fs::create_dir_all(&args.run_dir)?;
+
+    let q = read_f32(&pkg.root, &fx.arrays["q"])?;
+    let k = read_f32(&pkg.root, &fx.arrays["k"])?;
+    let v = read_f32(&pkg.root, &fx.arrays["v"])?;
+    let beta = read_f32(&pkg.root, &fx.arrays["beta"])?;
+    let g = read_f32(&pkg.root, &fx.arrays["g"])?;
+    let s0 = read_f32(&pkg.root, &fx.arrays["S0"])?;
+
+    let ctx = CudaContext::new(0).context("create CUDA context")?;
+    let arch = compute_capability(&ctx)?;
+    let stream = ctx.new_stream().context("create CUDA stream")?;
+    let bytes = flyingfish::backend::kernel_cubin(P1_MODULE, arch)
+        .with_context(|| format!("no cubin for {P1_MODULE} at sm{arch}"))?;
+    let module = ctx.load_module(cudarc::nvrtc::Ptx::from_binary(bytes.to_vec()))?;
+    let fun = module.load_function("gdn_chunkwise_p1_dbg_s8")?;
+    fun.set_attribute(
+        sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        flyingfish::gdn_plan::cw_p1::S8_BYTES as i32,
+    )?;
+
+    let dq = stream.clone_htod(&q)?;
+    let dk = stream.clone_htod(&k)?;
+    let dv = stream.clone_htod(&v)?;
+    let dbeta = stream.clone_htod(&beta)?;
+    let dg = stream.clone_htod(&g)?;
+    let mut ds = stream.clone_htod(&s0)?;
+    let dout = stream.alloc_zeros::<half::bf16>(fx.m * fx.arrays["q"].shape[1] * 128)?;
+    let key_count = fx.prefix as i32 + fx.m as i32;
+    let meta = stream.clone_htod(&[
+        fx.prefix as i32,
+        fx.m as i32,
+        key_count,
+        key_count,
+        1,
+        args.dbg_head as i32,  // r20: debug dump selector
+        args.dbg_strip as i32, // r24
+        0,
+    ])?;
+    let total = DBG_BYTES;
+    let dbg = stream.alloc_zeros::<f32>(total)?;
+    unsafe {
+        stream
+            .launch_builder(&fun)
+            .arg(&dq)
+            .arg(&dk)
+            .arg(&dv)
+            .arg(&dbeta)
+            .arg(&dg)
+            .arg(&mut ds)
+            .arg(&dout)
+            .arg(&meta)
+            .arg(&0i32)
+            .arg(&dbg)
+            .launch(LaunchConfig {
+                grid_dim: (8, 48, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: flyingfish::gdn_plan::cw_p1::S8_BYTES,
+            })?;
+    }
+    stream.synchronize()?;
+    let host: Vec<f32> = stream.clone_dtoh(&dbg)?;
+    ensure!(
+        host.len() == total,
+        "dump is {} floats, expected {total}",
+        host.len()
+    );
+
+    for (name, off, rows, cols) in DBG_STAGES {
+        let slice: Vec<f32> = if off == DBG_W_SENTINEL {
+            // W is written by each warp into its own (row tile, dk block) block.
+            let mut w = vec![0f32; 4 * 8 * 16 * 16];
+            for wm in 0..4usize {
+                for kblk in 0..8usize {
+                    let src = 8256 + (wm * 8 + kblk) * 256;
+                    let dst = (wm * 8 + kblk) * 256;
+                    w[dst..dst + 256].copy_from_slice(&host[src..src + 256]);
+                }
+            }
+            w
+        } else {
+            host[off..off + rows * cols].to_vec()
+        };
+        write_f32(
+            &args
+                .run_dir
+                .join(format!("{}.C{}.s{}.{name}.f32", fx.name, args.c, args.s)),
+            &slice,
+        )?;
+    }
+    let state: Vec<f32> = stream.clone_dtoh(&ds)?;
+    write_f32(&args.run_dir.join(format!("{}.state.f32", fx.name)), &state)?;
+    eprintln!(
+        "[debug] {} stages -> {}",
+        DBG_STAGES.len(),
+        args.run_dir.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_debug(_args: &DebugArgs) -> Result<()> {
+    anyhow::bail!("the debug phase needs the crate's cuda feature")
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.phase {
+        Phase::Numerics(a) => run_numerics(&a),
+        Phase::Timing(a) => run_timing(&a),
+        Phase::Debug(a) => run_debug(&a),
+    }
+}

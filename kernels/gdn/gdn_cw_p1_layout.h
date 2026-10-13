@@ -5,6 +5,6 @@
 // kernel derive the size from ONE definition (the same pattern gdn_b_layout.h uses).
 // Protocol §E targets 18/14 KiB for the STATE pass alone; these are the FUSED
 // chunk-body arenas, which also carry A/T/qk and the operand staging.
-#define GDN_CW_P1_S4_BYTES  40704   // s=4,  VW=32
-#define GDN_CW_P1_S8_BYTES  34560   // s=8,  VW=16
-#define GDN_CW_P1_S16_BYTES 31488   // s=16, VW=8
+#define GDN_CW_P1_S4_BYTES  44800   // s=4,  VW=32
+#define GDN_CW_P1_S8_BYTES  40704   // s=8,  VW=16
+#define GDN_CW_P1_S16_BYTES 38656   // s=16, VW=8
