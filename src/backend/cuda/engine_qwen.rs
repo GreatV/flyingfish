@@ -9,6 +9,7 @@ use crate::backend::cuda::{
     weights::WeightCatalog,
 };
 use crate::gdn_plan::GdnPolicy;
+use crate::prefix_state::checkpoint_file_fingerprints;
 use crate::{
     linear_plan::LayerDequantPlan,
     model_spec::Mixer,
@@ -810,6 +811,7 @@ impl Engine {
         let work = Work::new(s, &model_spec, rows)?;
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
         let config = model_spec.config();
+        let prefix_file_fingerprints = Some(checkpoint_file_fingerprints(dir, &model_spec)?);
         let mut engine = Self {
             #[cfg(test)]
             capture_fail_after_layer: None,
@@ -846,6 +848,7 @@ impl Engine {
             position: 0,
             prefix_identity: None,
             prefix_identity_hash_ms: None,
+            prefix_file_fingerprints,
             committed_prefix_ids: Vec::new(),
             pending_token: None,
             resident_ids_len: 0,

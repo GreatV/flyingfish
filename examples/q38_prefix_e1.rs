@@ -153,10 +153,11 @@ fn main() -> Result<()> {
             "foreign identity rejection changed resident prefix state"
         );
         drop(negative_readback);
+        let committed_decode_token = saved.snapshot.manifest.boundary.pending_next_token;
         engine.step(false)?;
-        let baseline_pending_token = engine.token()?;
         let mut decoded_prefix = prefix.clone();
-        decoded_prefix.push(baseline_pending_token);
+        decoded_prefix.push(committed_decode_token);
+        let baseline_pending_token = engine.token()?;
         let decoded_saved = engine.save_text_prefix(TextPrefixSaveRequest {
             prefix_ids: &decoded_prefix,
             block_tokens: args.block_tokens,

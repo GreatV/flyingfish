@@ -11,9 +11,9 @@ use crate::{
     backend::{Event, Head, Logits, Settings, SpecBudget, Target, TreeBuilder},
     config::Config,
     prefix_state::{
-        PrefixBoundary, PrefixBuilder, PrefixGeometry, PrefixIdentity, PrefixLastInputKind,
-        PrefixRecordKind, PrefixRestoreReceipt, PrefixSaveReceipt, PrefixSnapshot, sha256,
-        token_ids_sha256,
+        PrefixBoundary, PrefixBuilder, PrefixFileFingerprint, PrefixGeometry, PrefixIdentity,
+        PrefixLastInputKind, PrefixRecordKind, PrefixRestoreReceipt, PrefixSaveReceipt,
+        PrefixSnapshot, sha256, token_ids_sha256, validate_transfer_bytes,
     },
     trace::Trace,
     vision_input::PositionPlan,
@@ -437,6 +437,7 @@ pub struct Engine {
     position: usize,
     prefix_identity: Option<PrefixIdentity>,
     prefix_identity_hash_ms: Option<f64>,
+    prefix_file_fingerprints: Option<Vec<PrefixFileFingerprint>>,
     committed_prefix_ids: Vec<u32>,
     pending_token: Option<u32>,
     resident_ids_len: usize,
@@ -464,7 +465,7 @@ fn pinned_transfer_ring(
     ctx: &Arc<CudaContext>,
     transfer_bytes: usize,
 ) -> Result<PinnedHostSlice<u8>> {
-    ensure!(transfer_bytes > 0, "prefix transfer bytes must be nonzero");
+    validate_transfer_bytes(transfer_bytes)?;
     Ok(unsafe { ctx.alloc_pinned_with_flags::<u8>(transfer_bytes, 0)? })
 }
 
@@ -750,6 +751,7 @@ impl Engine {
             position: 0,
             prefix_identity: None,
             prefix_identity_hash_ms: None,
+            prefix_file_fingerprints: None,
             committed_prefix_ids: Vec::new(),
             pending_token: None,
             resident_ids_len: 0,
@@ -1762,11 +1764,13 @@ impl Engine {
             .as_ref()
             .context("text prefix identity requires Qwen3.8")?;
         let checkpoint_dir = qwen.checkpoint_path().to_owned();
+        let fingerprints = self.prefix_file_fingerprints.clone();
         let started = Instant::now();
-        let identity = PrefixIdentity::for_checkpoint(
+        let identity = PrefixIdentity::for_checkpoint_with_fingerprints(
             &checkpoint_dir,
             &text_rope_context_sha256(self.capacity)?,
             &self.model_spec,
+            fingerprints.as_deref(),
         )?;
         let elapsed = started.elapsed().as_secs_f64() * 1000.0;
         self.prefix_identity = Some(identity.clone());
@@ -1989,6 +1993,7 @@ impl Engine {
         intent: TextPrefixRestoreIntent<'_>,
     ) -> Result<PrefixRestoreReceipt> {
         let started = Instant::now();
+        validate_transfer_bytes(intent.transfer_bytes)?;
         snapshot.verify_prefix_and_pending_within_vocab(
             intent.prefix_ids,
             intent.pending_next_token,
@@ -2023,10 +2028,10 @@ impl Engine {
                 == text_rope_context_sha256(self.capacity)?,
             "prefix rope context differs from this engine"
         );
+        let ring = pinned_transfer_ring(&self.device.ctx, intent.transfer_bytes)?;
         self.device.stream.synchronize()?;
         self.poisoned = true;
-        let result =
-            self.restore_text_prefix_from(snapshot, intent.prefix_ids, intent.transfer_bytes);
+        let result = self.restore_text_prefix_from(snapshot, intent.prefix_ids, ring);
         if let Err(error) = result {
             self.device.stream.synchronize()?;
             return Err(error);
@@ -2054,9 +2059,8 @@ impl Engine {
         &mut self,
         snapshot: &PrefixSnapshot,
         prefix_ids: &[u32],
-        transfer_bytes: usize,
+        mut ring: PinnedHostSlice<u8>,
     ) -> Result<()> {
-        let mut ring = pinned_transfer_ring(&self.device.ctx, transfer_bytes)?;
         let stream = self.device.stream.clone();
         let capacity = self.capacity;
         let dim = self.model_spec.head_dim as usize;

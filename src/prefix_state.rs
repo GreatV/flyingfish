@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::{
@@ -24,6 +25,55 @@ pub fn sha256(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     encode_hex(&h.finalize())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrefixFileFingerprint {
+    pub name: String,
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub mtime_seconds: i64,
+    pub mtime_nanoseconds: i64,
+}
+
+fn fingerprint(dir: &Path, name: &str) -> Result<PrefixFileFingerprint> {
+    let path = dir.join(name);
+    let metadata =
+        std::fs::metadata(&path).with_context(|| format!("stat prefix identity file {name}"))?;
+    Ok(PrefixFileFingerprint {
+        name: name.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        mtime_seconds: metadata.mtime(),
+        mtime_nanoseconds: metadata.mtime_nsec(),
+    })
+}
+
+pub fn checkpoint_file_fingerprints(
+    dir: &Path,
+    spec: &ModelSpec,
+) -> Result<Vec<PrefixFileFingerprint>> {
+    let (selected, _) = loaded_weight_shards(dir, spec)?;
+    let mut names = vec![
+        "config.json".to_owned(),
+        "model.safetensors.index.json".to_owned(),
+    ];
+    names.extend(selected.into_iter().map(|(name, _)| name));
+    names
+        .into_iter()
+        .map(|name| fingerprint(dir, &name))
+        .collect()
+}
+
+pub fn validate_transfer_bytes(bytes: usize) -> Result<()> {
+    ensure!(bytes > 0, "prefix transfer bytes must be nonzero");
+    ensure!(
+        bytes.is_multiple_of(16),
+        "prefix transfer bytes must be 16-byte aligned"
+    );
+    Ok(())
 }
 
 fn file_sha256(path: &Path) -> Result<String> {
@@ -166,6 +216,22 @@ impl PrefixIdentity {
     /// intentionally lazy at save/restore time because tokenizer files are not
     /// required merely to load and serve model weights.
     pub fn for_checkpoint(dir: &Path, rope: &str, spec: &ModelSpec) -> Result<Self> {
+        Self::for_checkpoint_with_fingerprints(dir, rope, spec, None)
+    }
+
+    pub fn for_checkpoint_with_fingerprints(
+        dir: &Path,
+        rope: &str,
+        spec: &ModelSpec,
+        expected: Option<&[PrefixFileFingerprint]>,
+    ) -> Result<Self> {
+        if let Some(expected) = expected {
+            let actual = checkpoint_file_fingerprints(dir, spec)?;
+            ensure!(
+                actual.as_slice() == expected,
+                "checkpoint identity files changed after engine load"
+            );
+        }
         let config = dir.join("config.json");
         let index = dir.join("model.safetensors.index.json");
         let tokenizer_json = dir.join("tokenizer.json");
@@ -840,14 +906,10 @@ pub struct PrefixSnapshot {
 }
 
 impl PrefixSnapshot {
-    pub fn validate(&self) -> Result<()> {
+    fn validate_manifest_only(&self) -> Result<()> {
         self.manifest.identity.validate()?;
         self.manifest.identity.tensor_semantics.validated()?;
         ensure!(!self.manifest.records.is_empty(), "empty prefix snapshot");
-        ensure!(
-            self.manifest.records.len() == self.payloads.len(),
-            "prefix receipt/payload count mismatch"
-        );
         ensure!(
             self.manifest.block_tokens > 0,
             "prefix snapshot block must be nonempty"
@@ -857,14 +919,16 @@ impl PrefixSnapshot {
                 && self.manifest.boundary.prefix_tokens < self.manifest.capacity,
             "prefix snapshot must leave a slot for the pending decode token"
         );
-        let mut attention = Vec::new();
-        let mut gdn = Vec::new();
-        let mut total = 0usize;
         let mut seen = BTreeSet::new();
-        for (receipt, payload) in self.manifest.records.iter().zip(&self.payloads) {
+        let mut total = 0usize;
+        for receipt in &self.manifest.records {
             ensure!(
                 seen.insert(receipt.key_sha256.clone()),
                 "duplicate prefix receipt"
+            );
+            ensure!(
+                receipt.key.identity == self.manifest.identity,
+                "prefix record identity differs from manifest"
             );
             let block = if receipt.key.kind == PrefixRecordKind::AttentionKvBlock {
                 receipt.key.token_start / self.manifest.block_tokens
@@ -879,6 +943,27 @@ impl PrefixSnapshot {
                 receipt.key_sha256 == sha256(&canonical(&receipt.key)?),
                 "prefix key SHA mismatch"
             );
+            total = total
+                .checked_add(receipt.bytes)
+                .context("prefix receipt byte total overflow")?;
+        }
+        ensure!(
+            total == self.manifest.total_state_bytes,
+            "prefix total byte mismatch"
+        );
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_manifest_only()?;
+        ensure!(
+            self.manifest.records.len() == self.payloads.len(),
+            "prefix receipt/payload count mismatch"
+        );
+        let mut attention = Vec::new();
+        let mut gdn = Vec::new();
+        let mut total = 0usize;
+        for (receipt, payload) in self.manifest.records.iter().zip(&self.payloads) {
             ensure!(
                 receipt.bytes == payload.len(),
                 "prefix payload size mismatch"
@@ -994,6 +1079,7 @@ impl PrefixSnapshot {
     }
 
     pub fn write_package(&self, root: &Path) -> Result<()> {
+        self.validate()?;
         ensure!(!root.exists(), "prefix package root already exists");
         std::fs::create_dir_all(root)?;
         let root = root.canonicalize()?;
@@ -1020,6 +1106,11 @@ impl PrefixSnapshot {
         let root = root.canonicalize().context("prefix package root missing")?;
         let manifest: PrefixManifest =
             serde_json::from_slice(&std::fs::read(root.join("MANIFEST.json"))?)?;
+        let manifest_only = Self {
+            manifest: manifest.clone(),
+            payloads: Vec::new(),
+        };
+        manifest_only.validate_manifest_only()?;
         let mut payloads = Vec::with_capacity(manifest.records.len());
         for receipt in &manifest.records {
             let relative = Path::new(&receipt.file);
@@ -1037,6 +1128,17 @@ impl PrefixSnapshot {
             ensure!(
                 canonical.starts_with(&root),
                 "prefix package path escapes root: {}",
+                receipt.file
+            );
+            ensure!(
+                std::fs::metadata(&canonical)
+                    .with_context(|| {
+                        format!("stat prefix package payload: {}", canonical.display())
+                    })?
+                    .len()
+                    == u64::try_from(receipt.bytes)
+                        .context("prefix receipt byte count overflow")?,
+                "prefix package payload length mismatch: {}",
                 receipt.file
             );
             payloads.push(std::fs::read(&canonical)?);
@@ -1288,6 +1390,30 @@ mod tests {
     }
 
     #[test]
+    fn transfer_bytes_must_be_nonzero_and_aligned() {
+        assert!(validate_transfer_bytes(16).is_ok());
+        assert!(validate_transfer_bytes(0).is_err());
+        assert!(validate_transfer_bytes(17).is_err());
+    }
+
+    #[test]
+    fn identity_fingerprint_detects_file_replacement() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "flyingfish-prefix-fingerprint-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("shard.bin"), b"first")?;
+        let first = fingerprint(&root, "shard.bin")?;
+        std::fs::write(root.join("shard.bin"), b"second")?;
+        let second = fingerprint(&root, "shard.bin")?;
+        assert_ne!(first, second);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn complete_package_and_prefix_identity_pass() {
         let package = full_package();
         package.validate().unwrap();
@@ -1388,6 +1514,46 @@ mod tests {
                 .verify_prefix_and_pending_within_vocab(&[7, 8, 9, 10], 100, 100)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn package_write_and_read_validate_before_io_effects() -> Result<()> {
+        let package = full_package();
+        let mut invalid = package.clone();
+        invalid.payloads[0][0] ^= 1;
+        let absent = std::env::temp_dir().join(format!(
+            "flyingfish-prefix-invalid-write-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        assert!(invalid.write_package(&absent).is_err());
+        assert!(!absent.exists());
+
+        let root = std::env::temp_dir().join(format!(
+            "flyingfish-prefix-length-read-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        package.write_package(&root)?;
+        let payload = root.join(&package.manifest.records[0].file);
+        let mut bytes = std::fs::read(&payload)?;
+        bytes.pop();
+        std::fs::write(&payload, bytes)?;
+        let err = PrefixSnapshot::read_package(&root).unwrap_err().to_string();
+        assert!(err.contains("length mismatch"), "{err}");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn record_identity_must_match_manifest_identity() {
+        let mut package = full_package();
+        package.manifest.records[0]
+            .key
+            .identity
+            .model_id
+            .push_str("-foreign");
+        assert!(package.validate().is_err());
     }
 
     #[test]
