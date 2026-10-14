@@ -149,6 +149,7 @@ fn run_e2e(a: &E2eArgs) -> Result<()> {
         "label": a.label, "tokens": ids.len(), "load_ms": load_ms,
         "prefill_gpu_ms": prefill_gpu_ms, "decode_step_gpu_ms": decode_gpu_ms,
         "decode_steps": a.decode_steps, "capacity": a.capacity, "chunk": a.chunk,
+        "admitted_chunk": model.chunk(),
     });
     std::fs::write(&a.output, serde_json::to_vec_pretty(&out)?)?;
     println!("{}", serde_json::to_string(&out)?);
@@ -1529,6 +1530,8 @@ struct BlockStat {
     ratio: f64,
     a_ms: f64,
     b_ms: f64,
+    /// Shortest individual leg duration in this block, in ms.
+    min_leg_ms: f64,
 }
 
 #[derive(Serialize)]
@@ -1863,12 +1866,17 @@ where
         let lr = (paired(ta[0], tb[0]) + paired(ta[1], tb[1])) / 2.0;
         let a = (ta[0] + ta[1]) / 2.0;
         let bmean = (tb[0] + tb[1]) / 2.0;
+        let min_leg_ms = [ta[0], ta[1], tb[0], tb[1]]
+            .into_iter()
+            .filter(|t| t.is_finite())
+            .fold(f64::INFINITY, f64::min);
         out.push(BlockStat {
             block: blk,
             log_ratio: lr,
             ratio: if lr.is_nan() { f64::NAN } else { lr.exp() },
             a_ms: a,
             b_ms: bmean,
+            min_leg_ms,
         });
     }
     let _ = clock;
@@ -1890,10 +1898,10 @@ fn freeze_null_band(blocks: &[BlockStat], band_path: &Path) -> Result<NullBand> 
         f64::NAN
     };
     let sd = var.sqrt();
-    // event quantisation / batch time: the shortest leg in the block set
+    // event quantisation / batch time: the shortest individual leg in the block set
     let min_t = blocks
         .iter()
-        .flat_map(|b| [b.a_ms, b.b_ms])
+        .map(|b| b.min_leg_ms)
         .filter(|t| t.is_finite())
         .fold(f64::INFINITY, f64::min);
     let quant = if min_t.is_finite() && min_t > 0.0 {
@@ -2688,6 +2696,35 @@ mod tests {
         invalidate_for_missing_residual(std::slice::from_mut(&mut row), &residual);
         assert_eq!(row.verdict, "INVALID");
         assert!(row.failures.iter().any(|f| f.contains("required by test")));
+    }
+
+    #[test]
+    fn the_quantisation_floor_uses_the_shortest_individual_leg() {
+        // One block whose per-arm MEANS are equal (2.5) but whose legs include a 1.0:
+        // the floor's min must be 1.0, not the mean 2.5.
+        let blocks = abba(Clock::Stub, 1, Which::Main, Which::P1, |w, leg| {
+            Ok(match (w, leg) {
+                (Which::Main, 0) => 1.0,
+                (Which::Main, _) => 4.0,
+                (Which::P1, 1) => 2.0,
+                (Which::P1, _) => 3.0,
+            })
+        });
+        assert_eq!(blocks[0].a_ms, 2.5);
+        assert_eq!(blocks[0].b_ms, 2.5);
+        assert!((blocks[0].min_leg_ms - 1.0).abs() < 1e-12);
+        // freeze_null_band's quantisation term must derive from that 1.0, not 2.5.
+        let dir = std::env::temp_dir().join(format!("qfloor-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let band = freeze_null_band(&blocks, &dir.join("NULL.json")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let want = 0.5 / 1000.0 / 1.0;
+        assert!(
+            (band.quantisation_term - want).abs() < 1e-15,
+            "quantisation {} is not over the shortest leg ({}), it used something else",
+            band.quantisation_term,
+            want
+        );
     }
 
     #[test]
