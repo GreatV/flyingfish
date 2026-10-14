@@ -1,6 +1,6 @@
 //! Single-Engine MTP component shared by generation and numerical probes.
 use super::{
-    Work,
+    Work, bucketed_prefill_rows,
     qwen::{heads, limits, matrix, scratch, vector, view},
 };
 #[cfg(test)]
@@ -210,9 +210,10 @@ impl MtpRuntime {
             return Ok(());
         }
         let s = &device.stream;
-        self.linear.prepare(blas, rows as u32)?;
+        let linear_rows = bucketed_prefill_rows(rows as u32, self.plan.max_rows as u32)? as usize;
+        self.linear.prepare(blas, linear_rows as u32)?;
         blas.prepare_fixed(1, HIDDEN as u32, (2 * HIDDEN) as u32)?;
-        blas.prepare_fixed(rows as u32, HIDDEN as u32, (2 * HIDDEN) as u32)?;
+        blas.prepare_fixed(linear_rows as u32, HIDDEN as u32, (2 * HIDDEN) as u32)?;
         if rows <= self.head_rows {
             blas.prepare_fixed(rows as u32, VOCAB as u32, HIDDEN as u32)?;
         }
@@ -228,8 +229,15 @@ impl MtpRuntime {
             limits(rows, self.plan.capacity)?,
             AttentionBindings {
                 q_gate: heads(&self.work.qkv, s, 0, rows, 24, 512)?,
-                k: heads(&self.work.qkv, s, rows * 12288, rows, 4, 256)?,
-                v: heads(&self.work.qkv, s, rows * (12288 + 1024), rows, 4, 256)?,
+                k: heads(&self.work.qkv, s, self.plan.max_rows * 12288, rows, 4, 256)?,
+                v: heads(
+                    &self.work.qkv,
+                    s,
+                    self.plan.max_rows * (12288 + 1024),
+                    rows,
+                    4,
+                    256,
+                )?,
                 q: TensorMut(heads(&mixer.q, s, 0, rows, 24, 256)?),
                 gate: TensorMut(heads(&mixer.gate, s, 0, rows, 24, 256)?),
                 k_cache: TensorMut(view(
@@ -396,6 +404,11 @@ impl MtpRuntime {
         } else {
             (ids.len(), None)
         };
+        let linear_rows = if phase == ExecutionPhase::Prefill {
+            bucketed_prefill_rows(rows as u32, self.plan.max_rows as u32)? as usize
+        } else {
+            rows
+        };
         self.plan
             .check_absolute_rows(prefix, rows, self.max_position)?;
         ensure!(
@@ -559,7 +572,7 @@ impl MtpRuntime {
             dump.bf16("concat", vec![rows, 2 * HIDDEN], cat)?;
         }
         let fc_weight = catalog.linear_ref("mtp.fc.weight", s)?;
-        output.for_each_fc(rows, |row, count| {
+        output.for_each_fc(linear_rows, |row, count| {
             blas.linear_typed(
                 phase,
                 fc_weight,
@@ -593,15 +606,19 @@ impl MtpRuntime {
         }
         for (role, width, offset) in [
             ("self_attn.q_proj.weight", 12288, 0),
-            ("self_attn.k_proj.weight", 1024, rows * 12288),
-            ("self_attn.v_proj.weight", 1024, rows * (12288 + 1024)),
+            ("self_attn.k_proj.weight", 1024, self.plan.max_rows * 12288),
+            (
+                "self_attn.v_proj.weight",
+                1024,
+                self.plan.max_rows * (12288 + 1024),
+            ),
         ] {
             self.linear.run(
                 blas,
                 role,
                 phase,
-                matrix(&self.work.n, s, 0, rows, HIDDEN)?,
-                &mut TensorMut(matrix(&self.work.qkv, s, offset, rows, width)?),
+                matrix(&self.work.n, s, 0, linear_rows, HIDDEN)?,
+                &mut TensorMut(matrix(&self.work.qkv, s, offset, linear_rows, width)?),
             )?;
             if detailed {
                 dump.device(role, s, &self.work.qkv, offset, rows, width)?;
@@ -630,7 +647,7 @@ impl MtpRuntime {
             self.common.norm.rms_with(
                 s,
                 domain,
-                heads(&self.work.qkv, s, rows * 12288, rows, 4, 256)?,
+                heads(&self.work.qkv, s, self.plan.max_rows * 12288, rows, 4, 256)?,
                 vector(catalog.bf16("mtp.layers.0.self_attn.k_norm.weight")?, s)?,
                 &mut TensorMut(heads(&self.work.n, s, 0, rows, 4, 256)?),
                 RmsOptions {
@@ -686,8 +703,8 @@ impl MtpRuntime {
             blas,
             "self_attn.o_proj.weight",
             phase,
-            matrix(&self.work.attn, s, 0, rows, 6144)?,
-            &mut TensorMut(matrix(&self.work.out, s, 0, rows, HIDDEN)?),
+            matrix(&self.work.attn, s, 0, linear_rows, 6144)?,
+            &mut TensorMut(matrix(&self.work.out, s, 0, linear_rows, HIDDEN)?),
         )?;
         if detailed {
             dump.device("o_proj", s, &self.work.out, 0, rows, HIDDEN)?;
@@ -721,26 +738,25 @@ impl MtpRuntime {
         }
         for (role, offset) in [
             ("mlp.gate_proj.weight", 0),
-            ("mlp.up_proj.weight", rows * 17408),
+            ("mlp.up_proj.weight", self.plan.max_rows * 17408),
         ] {
             self.linear.run(
                 blas,
                 role,
                 phase,
-                matrix(&self.work.n, s, 0, rows, HIDDEN)?,
-                &mut TensorMut(matrix(&self.work.gu, s, offset, rows, 17408)?),
+                matrix(&self.work.n, s, 0, linear_rows, HIDDEN)?,
+                &mut TensorMut(matrix(&self.work.gu, s, offset, linear_rows, 17408)?),
             )?;
             if detailed {
                 dump.device(role, s, &self.work.gu, offset, rows, 17408)?;
             }
         }
         let gate = heads(&self.work.gu, s, 0, rows, 1, 17408)?;
-        let up = heads(&self.work.gu, s, rows * 17408, rows, 1, 17408)?;
+        let up = heads(&self.work.gu, s, self.plan.max_rows * 17408, rows, 1, 17408)?;
         let mut activated = TensorMut(heads(&self.work.act, s, 0, rows, 1, 17408)?);
         self.common
             .gate
             .swiglu(s, domain, gate, up, &mut activated)?;
-        let a = matrix(&self.work.act, s, 0, rows, 17408)?;
         if detailed {
             dump.device("mlp_activation", s, &self.work.act, 0, rows, 17408)?;
         }
@@ -748,8 +764,8 @@ impl MtpRuntime {
             blas,
             "mlp.down_proj.weight",
             phase,
-            a,
-            &mut TensorMut(matrix(&self.work.out, s, 0, rows, HIDDEN)?),
+            matrix(&self.work.act, s, 0, linear_rows, 17408)?,
+            &mut TensorMut(matrix(&self.work.out, s, 0, linear_rows, HIDDEN)?),
         )?;
         if detailed {
             dump.device("mlp_down", s, &self.work.out, 0, rows, HIDDEN)?;

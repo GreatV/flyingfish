@@ -89,18 +89,6 @@ impl Engine {
         if graph {
             engine.capture()?;
         }
-        let rows: std::collections::BTreeSet<_> = if let Some(prompt) = prompt {
-            let mut rows = std::collections::BTreeSet::from([prompt.min(engine.chunk)]);
-            if prompt > engine.chunk && prompt % engine.chunk != 0 {
-                rows.insert(prompt % engine.chunk);
-            }
-            rows
-        } else {
-            (1..=engine.chunk).collect()
-        };
-        for rows in rows {
-            engine.prepare(rows)?;
-        }
         engine.closure.ready(load_start)?;
         let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
         Ok((engine, load_ms))

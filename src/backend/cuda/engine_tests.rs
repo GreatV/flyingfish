@@ -634,3 +634,49 @@ fn q38_engine_capture_gpu() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires a full-model GPU window, FF_Q38_MODEL and a calibrated FLYINGFISH_RUNTIME_DIR"]
+fn q38_tail_prefill_after_ready_uses_bound_linear_bucket() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_FULL_MODEL_WINDOW").as_deref() == Ok("granted"),
+        "full-model GPU window not acknowledged"
+    );
+    let dir = PathBuf::from(std::env::var_os("FF_Q38_MODEL").context("FF_Q38_MODEL missing")?);
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime directory missing")?,
+    );
+    let settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Tree16,
+        spec_graph: false,
+        draft_model: None,
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+    };
+    let mut engine = Engine::load_kind(&dir, 0, 128, Some(64), settings, false)?;
+    engine.check_ready()?;
+    let plans_before = engine.blas.fixed_plan_count();
+    ensure!(
+        engine.blas.has_fixed_plan(32) && !engine.blas.has_fixed_plan(31),
+        "chunk64 setup did not bind the intermediate 32-row bucket"
+    );
+    let ids = vec![1u32; 95];
+    let token = engine.prefill(&ids, None)?;
+    engine.check_logits()?;
+    let plans_after = engine.blas.fixed_plan_count();
+    ensure!(
+        plans_before == plans_after,
+        "tail prefill created Lt plans after Ready: {plans_before} -> {plans_after}"
+    );
+    ensure!(
+        token < engine.config.vocab_size as u32,
+        "invalid tail token"
+    );
+    ensure!(!engine.poisoned, "tail prefill poisoned Ready engine");
+    engine.check_ready()?;
+    eprintln!(
+        "Q38_TAIL_SINGLE_ARM tail31_bucket32 token={token} finite_logits=true plans_before={plans_before} plans_after={plans_after} PASS"
+    );
+    Ok(())
+}

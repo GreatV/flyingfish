@@ -64,6 +64,12 @@ impl Detok {
     /// multi-byte sequence (byte-fallback tokens split across rounds) and
     /// is held back until it completes or the stream finishes.
     pub fn push(&mut self, ids: &[u32]) -> Result<String> {
+        if let Some(&id) = ids
+            .iter()
+            .find(|&&id| self.tokenizer.id_to_token(id).is_none())
+        {
+            anyhow::bail!("token id {id} outside vocabulary");
+        }
         self.ids.extend_from_slice(ids);
         let full = self.decode()?;
         let stable = trim_trailing_replacements(&full).to_string();
