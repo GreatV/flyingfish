@@ -181,8 +181,10 @@ pub(crate) struct GdnPlan {
     chunked_cfg: LaunchConfig,
     recurrent_cfg: LaunchConfig,
     /// Protocol §A value split of the prepared chunkwise P1 core, 0 when the plan
-    /// keeps the shipped recursive core. Fixed in `prepare`, like every other grid
-    /// property, so a captured Graph replays an identical launch sequence.
+    /// keeps the shipped recursive core. Prepared only for a plan bound above
+    /// `gdn_plan::SCAN_MAX_ROWS` rows (`GdnPolicy::p1_split_for_step`), and fixed in
+    /// `prepare`, like every other grid property, so a captured Graph replays an
+    /// identical launch sequence.
     p1_split: u32,
 }
 
@@ -262,7 +264,14 @@ impl GdnPlan {
             hist_cfg: self.hist_cfg,
             chunked_cfg: self.chunked_cfg,
             recurrent_cfg: self.recurrent_cfg,
-            p1_split: self.p1_split,
+            // Narrowing can drop a plan into the small or scan-sized range, where the
+            // shipped core stays. 1..=4 is inside that range and also carries the MTP
+            // verify contract (`run_verify` rejects a P1 plan).
+            p1_split: if rows > crate::gdn_plan::SCAN_MAX_ROWS {
+                self.p1_split
+            } else {
+                0
+            },
         })
     }
 

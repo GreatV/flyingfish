@@ -96,36 +96,6 @@ struct GdnMeta {
     int prefix, valid_rows, key_count, capacity, causal, r20, r24, r28;
 };
 
-// -------------------------------------------------------------------------------------
-// DEBUG DUMP PATH (additive; production entry points instantiate DUMP=false and compile
-// every block below away). One CTA — head 0, value strip 0 — writes each pipeline stage
-// to global memory so it can be diffed against gdn_phase2_model_w.py's same-stage arrays.
-// Offsets are a single contiguous float array; P1_DBG_LAYOUT is the index it shares with
-// the host runner, so the two cannot drift.
-// -------------------------------------------------------------------------------------
-#define P1_DBG_G      0                       // [64]        within-chunk cumsum G
-#define P1_DBG_A      64                      // [64][64]    A, masked
-#define P1_DBG_T      (64 + 64 * 64)          // [64][64]    T, T-class bf16 as f32
-#define P1_DBG_W      (64 + 64 * 64 + 64 * 64)// [4][8][16][16] W per (row tile, dk block)
-#define P1_DBG_U      (64 + 128 * 64 + 4 * 8 * 256)          // [64][VW]
-#define P1_DBG_WS     (P1_DBG_U + 64 * 32)    // [64][VW]
-#define P1_DBG_VNEW   (P1_DBG_WS + 64 * 32)   // [64][VW]
-#define P1_DBG_QK     (P1_DBG_VNEW + 64 * 32) // [64][64]    qk, T-class bf16 as f32
-#define P1_DBG_AD     (P1_DBG_QK + 64 * 64)   // [64][VW]
-#define P1_DBG_OUT    (P1_DBG_AD + 64 * 32)   // [64][VW]    the BF16 output as f32
-#define P1_DBG_SNEW   (P1_DBG_OUT + 64 * 32)  // [128][VW]   the state strip after the update
-#define P1_DBG_BETA   (P1_DBG_SNEW + 128 * 32 * 4)  // [64]    the per-row beta scale
-#define P1_DBG_RAWA   (P1_DBG_BETA + 64)      // [64][64]    A before the tril/exp mask
-#define P1_DBG_SV     (P1_DBG_RAWA + 64 * 64) // [8][16][16] sV after the WS S staging
-#define P1_DBG_SR     (P1_DBG_SV + 8 * 16 * 16)  // [8][16][16] Sr right after the load
-#define P1_DBG_SR2    (P1_DBG_SR + 8 * 16 * 16)   // [8][16][16] Sr after the state update
-// 32->64 merge chain, dumped one 32x32 block each: T11 | T22 | A21 | X (=T22@A21)
-#define P1_DBG_MT11   (P1_DBG_SR2 + 8 * 16 * 16)
-#define P1_DBG_MT22   (P1_DBG_MT11 + 32 * 32)
-#define P1_DBG_MA21   (P1_DBG_MT22 + 32 * 32)
-#define P1_DBG_MX     (P1_DBG_MA21 + 32 * 32)
-#define P1_DBG_BYTES  (P1_DBG_MX + 32 * 32)
-
 struct AFrag { uint32_t r[4]; };
 struct BFrag { uint32_t r[2]; };
 
@@ -284,54 +254,10 @@ __device__ __forceinline__ void p1_store_bf16(__nv_bfloat16* base, int ld, int r
     b[1] = __float2bfloat16_rn(d[3]);
 }
 
-// ---- debug dump helpers (template parameter DUMP, so production compiles them away) ----
-
-__device__ __forceinline__ float p1_lo(uint32_t r) {
-    return __bfloat162float(__ushort_as_bfloat16((unsigned short)(r & 0xffffu)));
-}
-__device__ __forceinline__ float p1_hi(uint32_t r) {
-    return __bfloat162float(__ushort_as_bfloat16((unsigned short)(r >> 16)));
-}
-
-template <bool DUMP>
-__device__ __forceinline__ void p1_dump_sf32(float* dst, const float* src, int ld, int rows,
-                                             int cols) {
-    if (!DUMP) return;
-    for (int r = threadIdx.x; r < rows; r += P1_THREADS)
-        for (int c = 0; c < cols; ++c) dst[(size_t)r * cols + c] = src[(size_t)r * ld + c];
-}
-
-template <bool DUMP>
-__device__ __forceinline__ void p1_dump_sbf16(float* dst, const __nv_bfloat16* src, int ld,
-                                              int rows, int cols) {
-    if (!DUMP) return;
-    for (int r = threadIdx.x; r < rows; r += P1_THREADS)
-        for (int c = 0; c < cols; ++c)
-            dst[(size_t)r * cols + c] = __bfloat162float(src[(size_t)r * ld + c]);
-}
-
-// The W block lives in four packed registers, in the mma.m16n8k16 A order: r0 is row
-// gid at the low columns, r1 is row gid+8 at the low columns, r2 is row gid at +8 and
-// r3 is row gid+8 at +8. Each register's low/high halves are the pair 2*tig and 2*tig+1
-// (r0, r1) or 2*tig+8 and +9 (r2, r3) of the 16-wide dk step.
-template <bool DUMP>
-__device__ __forceinline__ void p1_dump_w(float* dst, const AFrag& wa, int gid, int t2) {
-    if (!DUMP) return;
-    float* lo_row = dst + (size_t)gid * 16 + t2;
-    float* hi_row = dst + (size_t)(gid + 8) * 16 + t2;
-    lo_row[0] = p1_lo(wa.r[0]);
-    lo_row[1] = p1_hi(wa.r[0]);
-    lo_row[8] = p1_lo(wa.r[2]);
-    lo_row[9] = p1_hi(wa.r[2]);
-    hi_row[0] = p1_lo(wa.r[1]);
-    hi_row[1] = p1_hi(wa.r[1]);
-    hi_row[8] = p1_lo(wa.r[3]);
-    hi_row[9] = p1_hi(wa.r[3]);
-}
 
 // ---- core ---------------------------------------------------------------------------
 
-template <int VW, bool DUMP = false>
+template <int VW>
 __device__ __forceinline__ void gdn_chunkwise_p1_t(
         const float* __restrict__ q,      // FP32 [M, HEADS, DK], pre-scaled by 1/sqrt(DK)
         const float* __restrict__ k,      // FP32 [M, HEADS, DK]
@@ -341,8 +267,7 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
         float* __restrict__ S,            // FP32 [HEADS, DK, DV]
         __nv_bfloat16* __restrict__ out,  // BF16 [M, HEADS, DV]
         const GdnMeta* __restrict__ meta,
-        int valid_rows_in,
-        float* __restrict__ dbg) {
+        int valid_rows_in) {
     static_assert(VW == 8 || VW == 16 || VW == 32,
                   "the value strip must be DV/4, DV/8 or DV/16 (protocol §A s = 4/8/16)");
     static_assert(P1_SMEM_BYTES(VW) == (VW == 32 ? GDN_CW_P1_S4_BYTES
@@ -372,9 +297,6 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
         __trap();
         return;
     }
-    // DEBUG: which head/strip this CTA dumps (meta->r20/r24; 0 in production).
-    const int dbg_head = meta->r20;
-    const int dbg_strip = meta->r24;
     const int prefix = meta->prefix;
     const int valid_rows = valid_rows_in > 0 ? valid_rows_in : meta->valid_rows;
     if (valid_rows <= 0 || prefix < 0 || meta->causal != 1
@@ -422,24 +344,9 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             }
     }
 
-    if (DUMP && dbg != nullptr && head == dbg_head && blockIdx.x == dbg_strip)
-        #pragma unroll
-        for (int nt = 0; nt < NT; ++nt)
-            #pragma unroll
-            for (int c = 0; c < 2; ++c) {
-                dbg[P1_DBG_SR + warp * 256 + gid * 16 + 8 * nt + t2 + c] = Sr[0][nt][c];
-                dbg[P1_DBG_SR + warp * 256 + (gid + 8) * 16 + 8 * nt + t2 + c] = Sr[1][nt][c];
-            }
     const int nchunk = (valid_rows + P1_C - 1) / P1_C;
-    // One CTA writes the dump: head 0, value strip 0. CTA-uniform, so no __syncthreads
-    // inside the dump helpers can be reached by only part of the block.
-    const bool dumping = DUMP && dbg != nullptr && head == dbg_head && blockIdx.x == dbg_strip;
     for (int c = 0; c < nchunk; ++c) {
         const int row0 = c * P1_C;
-        // Every dump below is of chunk 0 only: the stage hunt runs on the smallest
-        // fixture, which is a single chunk.
-        const bool dmp = dumping && c == 0;
-
         // ---- gates and the in-chunk cumsum. ONE thread scans, then a barrier:
         // interleaved in-place scans on shared memory apply G repeatedly and
         // without bound, which is what produced e^G overflow and NaNs.
@@ -474,21 +381,11 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             p1_store_f32(sA, P1_A_LD, mt * 16, nt * 8, gid, t2, d);
         }
         __syncthreads();
-        if (dmp) {
-            p1_dump_sf32<DUMP>(dbg + P1_DBG_BETA, sBeta, 1, P1_C, 1);
-            p1_dump_sf32<DUMP>(dbg + P1_DBG_RAWA, sA, P1_A_LD, P1_C, P1_C);
-            __syncthreads();
-        }
         // tril BEFORE the exp and AGAIN after it: exp of a masked entry is 1.0, and
         // without the second mask every token reads the future.
         for (int idx = tid; idx < P1_C * P1_C; idx += P1_THREADS) {
             const int j = idx / P1_C, i = idx - j * P1_C;
             sA[j * P1_A_LD + i] = j > i ? -sA[j * P1_A_LD + i] * __expf(sG[j] - sG[i]) : 0.0f;
-        }
-        if (dmp) {
-            p1_dump_sf32<DUMP>(dbg + P1_DBG_G, sG, 1, P1_C, 1);
-            __syncthreads();
-            p1_dump_sf32<DUMP>(dbg + P1_DBG_A, sA, P1_A_LD, P1_C, P1_C);
         }
         __syncthreads();
 
@@ -500,9 +397,13 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
         // already-final entries sA[m][j] of rows m < r, so the rows must be separated
         // by a barrier; and each row must be substituted once — repeating the pass over
         // all rows re-applies it to values that are already T and destroys them.
+        // ONE THREAD PER DIAGONAL BLOCK: the block index is the thread id, so each
+        // sA row has exactly one writer; the former `tid < P1_C` / `tid >> 4` form had
+        // sixteen threads computing the same row and writing the same addresses. The
+        // arithmetic per row is unchanged, so the stored bits are unchanged.
         for (int rr = 1; rr < P1_SUB; ++rr) {
-            if (tid < P1_C) {
-                const int blk = tid >> 4;
+            if (tid < P1_C / P1_SUB) {
+                const int blk = tid;
                 // Both the substituted row AND the rows it reads live in the diagonal
                 // block's COLUMN window [blk*P1_SUB, blk*P1_SUB+P1_SUB); without the
                 // column offset the pass substitutes the off-diagonal block at columns
@@ -593,14 +494,6 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
                 sV[al * 64 + bl] = __float2bfloat16_rn(sA[(size_t)(32 + bl) * P1_A_LD + al]);
             }
             __syncthreads();
-            if (DUMP && dbg != nullptr && head == dbg_head && blockIdx.x == dbg_strip)
-                for (int idx = tid; idx < 32 * 32; idx += P1_THREADS) {
-                    const int bl = idx / 32, al = idx - bl * 32;
-                    dbg[P1_DBG_MT11 + idx] = __bfloat162float(sT[(size_t)al * P1_T_LD + bl]);
-                    dbg[P1_DBG_MT22 + idx] =
-                        __bfloat162float(sT[(size_t)(32 + al) * P1_T_LD + 32 + bl]);
-                    dbg[P1_DBG_MA21 + idx] = __bfloat162float(sV[al * 64 + bl]);
-                }
             float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             // The reduction axis of BOTH products here is 32 wide (b over [32,64) in the
             // first, a over [0,32) in the second), i.e. TWO 16-wide k-steps. A bound of
@@ -617,11 +510,6 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             }
             p1_store_f32(sA, P1_A_LD, mt * 16, 32 + nt * 8, gid, t2, d);
             __syncthreads();
-            if (DUMP && dbg != nullptr && head == dbg_head && blockIdx.x == dbg_strip)
-                for (int idx = tid; idx < 32 * 32; idx += P1_THREADS)
-                    dbg[P1_DBG_MX + idx] = sA[(size_t)(idx / 32) * P1_A_LD + 32 + (idx % 32)];
-            // T[a,a] transposed into the tail of the same sV rows (offset 32), for the
-            // second product's B operand: memory[n=a][k=a'] must hold T[a'][a].
             for (int idx = tid; idx < 32 * 32; idx += P1_THREADS) {
                 const int bl = idx / 32, al = idx - bl * 32;
                 sV[al * 64 + 32 + bl] = __float2bfloat16_rn(
@@ -638,7 +526,6 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             p1_store_bf16(sT, P1_T_LD, 32 + mt * 16, nt * 8, gid, t2, e);
             __syncthreads();
         }
-        if (dmp) p1_dump_sbf16<DUMP>(dbg + P1_DBG_T, sT, P1_T_LD, P1_C, P1_C);
 
         // ---- U = T @ (beta . V) -> sVn. T is the T-class operand, beta.V the WU one.
         for (int idx = tid; idx < P1_C * VW; idx += P1_THREADS) {
@@ -660,22 +547,16 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             p1_store_f32(sVn, VW, mt * 16, nt * 8, gid, t2, d);
         }
         __syncthreads();
-        if (dmp) p1_dump_sf32<DUMP>(dbg + P1_DBG_U, sVn, VW, P1_C, VW);
 
         // ---- WS = W @ S with W MATERIALIZED. W is a GEMM output, so it is rounded
         // to BF16 (WU class) before it multiplies the BF16 S copy: the fused form
         // produces one [16 x 16] d_k block of W, rounds it, and feeds it straight
         // into the next mma, which is element-for-element the model's W then WS.
-        for (int idx = tid; idx < P1_C * VW; idx += P1_THREADS) {
-            const int r = idx / VW;
-            sA[r * P1_A_LD + (idx - r * VW)] = 0.0f;
-        }
         // The S copy, staged ONCE per warp into its OWN slice of the 128-row d_k axis.
-        // Warp w owns d_k rows 16w..16w+15 in registers (Sr) and the WS contraction is
-        // partitioned over exactly those rows, so sV holds all eight warps' rows at once,
-        // as [value][d_k]. All warps execute this staging, so they must not share the
-        // destination: one shared slice makes each warp contract W against whichever
-        // warp's rows landed last.
+        // Warp w owns d_k rows 16w..16w+15 in registers (Sr) and ALL EIGHT warps stage,
+        // so sV holds the whole 128-row axis at once, as [value][d_k]. All warps
+        // execute this staging, so they must not share the destination: one shared
+        // slice makes each warp contract W against whichever warp's rows landed last.
         const int kblk = warp;           // the dk window this warp's S rows belong to
         __syncthreads();
         #pragma unroll
@@ -688,59 +569,64 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
                     __float2bfloat16_rn(Sr[1][nt][cc]);
             }
         __syncthreads();
-        for (int wm = 0; wm < P1_MT; ++wm) {
-            float w0[4] = {0.0f, 0.0f, 0.0f, 0.0f}, w1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            #pragma unroll
-            for (int ks = 0; ks < P1_C / 16; ++ks) {
-                const AFrag a = p1_a_sbf(sT, P1_T_LD, wm * 16, ks * 16, gid, t2);
+        // The OWNING warp of a chunk-row tile contracts the WHOLE 128-row d_k axis
+        // itself, walking the eight staged windows in the loop order ks = 0..7, so the
+        // FP32 summation order is the loop order and every output element has exactly
+        // one writer. Warps with no chunk-row tile of their own wait at the barrier
+        // below. W is a function of (mt, ks) only: it is built once per window and
+        // used by every value tile.
+        if (warp < P1_MT) {
+            const int mt = warp;
+            float d[NT][4] = {{0.0f}};
+            // ks unrolled by 2, cs not at all: cs is a serial accumulation into w0/w1,
+            // so unrolling it buys no independent work and only lengthens the live
+            // ranges.
+            #pragma unroll 2
+            for (int ks = 0; ks < P1_DK / 16; ++ks) {
+                float w0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                float w1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                #pragma unroll 1
+                for (int cs = 0; cs < P1_C / 16; ++cs) {
+                    const AFrag a = p1_a_sbf(sT, P1_T_LD, mt * 16, cs * 16, gid, t2);
+                    // W is the one GEMM whose B fragment reads the input TRANSPOSED: its
+                    // fragment row is a d_k index and its columns are chunk rows. The B
+                    // fragment's k positions are the 16-wide window [cs*16, cs*16+16),
+                    // so the chunk row is cs*16 + the in-window position.
+                    const int c0 = cs * 16 + t2;
+                    const int dk0 = ks * 16 + gid;
+                    const BFrag b0{ {p1_pack(p1_kbg(kh, rstride, row0, valid_rows, c0, dk0, sSc),
+                                             p1_kbg(kh, rstride, row0, valid_rows, c0 + 1, dk0, sSc)),
+                                    p1_pack(p1_kbg(kh, rstride, row0, valid_rows, c0 + 8, dk0, sSc),
+                                            p1_kbg(kh, rstride, row0, valid_rows, c0 + 9, dk0, sSc))} };
+                    const BFrag b1{ {p1_pack(p1_kbg(kh, rstride, row0, valid_rows, c0, dk0 + 8, sSc),
+                                             p1_kbg(kh, rstride, row0, valid_rows, c0 + 1, dk0 + 8, sSc)),
+                                    p1_pack(p1_kbg(kh, rstride, row0, valid_rows, c0 + 8, dk0 + 8, sSc),
+                                            p1_kbg(kh, rstride, row0, valid_rows, c0 + 9, dk0 + 8, sSc))} };
+                    P1_MMA(w0, a, b0);
+                    P1_MMA(w1, a, b1);
+                }
+                // Same register order as p1_a_rows: register 1 is row gid+8 at the low
+                // columns, register 2 is row gid at the +8 columns. w0 is the first
+                // 8-wide dk group of the window, w1 the second.
+                const AFrag wa{ {p1_pack(w0[0], w0[1]), p1_pack(w0[2], w0[3]),
+                                 p1_pack(w1[0], w1[1]), p1_pack(w1[2], w1[3])} };
                 #pragma unroll
-                for (int nb = 0; nb < 2; ++nb) {
-                    const int dk = kblk * 16 + nb * 8 + gid;
-                    // The B fragment's k positions are the 16-wide window [ks*16,
-                    // ks*16+16), so the chunk row is ks*16 + the in-window position.
-                    const int c0 = ks * 16 + t2;
-                    const BFrag b{ {p1_pack(p1_kbg(kh, rstride, row0, valid_rows, c0, dk, sSc),
-                                            p1_kbg(kh, rstride, row0, valid_rows, c0 + 1, dk, sSc)),
-                                    p1_pack(p1_kbg(kh, rstride, row0, valid_rows, c0 + 8, dk, sSc),
-                                            p1_kbg(kh, rstride, row0, valid_rows, c0 + 9, dk, sSc))} };
-                    float* wa16 = nb ? w1 : w0;
-                    P1_MMA(wa16, a, b);
+                for (int nt = 0; nt < NT; ++nt) {
+                    const BFrag b = p1_b_sbf(sV, P1_VLDK, nt * 8 + gid, ks * 16, t2);
+                    P1_MMA(d[nt], wa, b);
                 }
             }
-            AFrag wa;
-            // Same register order as p1_a_rows: register 1 is row gid+8 at the low
-            // columns, register 2 is row gid at the +8 columns. w0 is the first 8-wide
-            // dk group of the block, w1 the second.
-            wa.r[0] = p1_pack(w0[0], w0[1]);
-            wa.r[1] = p1_pack(w0[2], w0[3]);
-            wa.r[2] = p1_pack(w1[0], w1[1]);
-            wa.r[3] = p1_pack(w1[2], w1[3]);
-            if (dmp)
-                p1_dump_w<DUMP>(dbg + P1_DBG_W + (size_t)(wm * 8 + kblk) * 256, wa, gid, t2);
-            float* acc = sA + (size_t)(wm * 16 + gid) * P1_A_LD + t2;
             #pragma unroll
-            for (int nt = 0; nt < NT; ++nt) {
-                float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                const BFrag b = p1_b_sbf(sV, P1_VLDK, nt * 8 + gid, kblk * 16, t2);
-                P1_MMA(o, wa, b);
-                atomicAdd(acc + 8 * nt, o[0]);
-                atomicAdd(acc + 8 * nt + 1, o[1]);
-                atomicAdd(acc + 8 * P1_A_LD + 8 * nt, o[2]);
-                atomicAdd(acc + 8 * P1_A_LD + 8 * nt + 1, o[3]);
-            }
+            for (int nt = 0; nt < NT; ++nt)
+                p1_store_f32(sA, P1_A_LD, mt * 16, nt * 8, gid, t2, d[nt]);
         }
 
         // ---- v_new = U - WS, in place in sVn
         __syncthreads();
-        if (dmp) p1_dump_sf32<DUMP>(dbg + P1_DBG_WS, sA, P1_A_LD, P1_C, VW);
         __syncthreads();
         for (int idx = tid; idx < P1_C * VW; idx += P1_THREADS) {
             const int r = idx / VW, cc = idx - r * VW;
             sVn[r * VW + cc] -= sA[r * P1_A_LD + cc];
-        }
-        if (dmp) {
-            __syncthreads();
-            p1_dump_sf32<DUMP>(dbg + P1_DBG_VNEW, sVn, VW, P1_C, VW);
         }
 
         // ---- qk = (bf16(q) @ bf16(K)^T) . exp(G_j - G_i), tril WITH the diagonal,
@@ -774,10 +660,6 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             const int r = idx / P1_C, cc = idx - r * P1_C;
             sT[r * P1_T_LD + cc] = __float2bfloat16_rn(sA[r * P1_A_LD + cc]);
         }
-        if (dmp) {
-            __syncthreads();
-            p1_dump_sbf16<DUMP>(dbg + P1_DBG_QK, sT, P1_T_LD, P1_C, P1_C);
-        }
 
         // ---- v_new as the WU-class operand (bf16), for AD and for the state update
         for (int idx = tid; idx < P1_C * VW; idx += P1_THREADS) {
@@ -799,7 +681,6 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             p1_store_f32(sA, P1_A_LD, mt * 16, nt * 8, gid, t2, d);
         }
         __syncthreads();
-        if (dmp) p1_dump_sf32<DUMP>(dbg + P1_DBG_AD, sA, P1_A_LD, P1_C, VW);
 
         // ---- QS = (q . e^G) @ S, accumulated onto AD's tile. S is re-staged because
         // sV now holds the encoded v_new, which the state update still needs from the
@@ -839,7 +720,6 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             o[8 * P1_A_LD + 1] = d[3];
         }
         __syncthreads();
-        if (dmp) p1_dump_sf32<DUMP>(dbg + P1_DBG_OUT, sA, P1_A_LD, P1_C, VW);
 
         // ---- out = BF16_RNE(QS + AD)
         for (int idx = tid; idx < P1_C * VW; idx += P1_THREADS) {
@@ -862,39 +742,32 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
         {
             const float decay = __expf(sG[P1_C - 1]);
             const float gl = sG[P1_C - 1];
+            // ONE pass: every o[nt] is contracted over ascending ks, then all the Sr
+            // rows are updated in one sweep. NT is 1/2/4 by split; a fixed [2][4] would
+            // read out of bounds at s4 (NT=4).
+            float o[NT][4] = {{0.0f}};
+            #pragma unroll
+            for (int ks = 0; ks < P1_C / 16; ++ks) {
+                // ks*16 is the chunk-row offset of the 16-wide k-step: without it
+                // every step contracts chunk rows 0..15 again, which is correct only
+                // while the chunk has <= 16 live rows.
+                const AFrag a = p1_a_kdec(kh, rstride, row0, valid_rows, sG, gl,
+                                          warp * 16 + gid, ks * 16 + t2);
+                #pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    const BFrag b = p1_b_sbf(sV, VLD, nt * 8 + gid, ks * 16, t2);
+                    P1_MMA(o[nt], a, b);
+                }
+            }
             #pragma unroll
             for (int nt = 0; nt < NT; ++nt) {
-                // NT is 1/2/4 by split; a fixed [2][4] sizes only s8 and reads out
-                // of bounds at s4 (NT=4).
-                float o[NT][4] = {{0.0f, 0.0f, 0.0f, 0.0f}};
                 #pragma unroll
-                for (int ks = 0; ks < P1_C / 16; ++ks) {
-                    // ks*16 is the chunk-row offset of the 16-wide k-step: without it
-                    // every step contracts chunk rows 0..15 again, which is correct only
-                    // while the chunk has <= 16 live rows.
-                    const AFrag a = p1_a_kdec(kh, rstride, row0, valid_rows, sG, gl,
-                                              warp * 16 + gid, ks * 16 + t2);
-                    #pragma unroll
-                    for (int nt2 = 0; nt2 < NT; ++nt2) {
-                        const BFrag b = p1_b_sbf(sV, VLD, nt2 * 8 + gid, ks * 16, t2);
-                        P1_MMA(o[nt2], a, b);
-                    }
-                }
                 for (int cc = 0; cc < 2; ++cc) {
                     Sr[0][nt][cc] = fmaf(decay, Sr[0][nt][cc], o[nt][cc]);
                     Sr[1][nt][cc] = fmaf(decay, Sr[1][nt][cc], o[nt][cc + 2]);
                 }
             }
         }
-        if (DUMP && dbg != nullptr && head == dbg_head && blockIdx.x == dbg_strip)
-            #pragma unroll
-            for (int nt = 0; nt < NT; ++nt)
-                #pragma unroll
-                for (int cc = 0; cc < 2; ++cc) {
-                    dbg[P1_DBG_SR2 + warp * 256 + gid * 16 + 8 * nt + t2 + cc] = Sr[0][nt][cc];
-                    dbg[P1_DBG_SR2 + warp * 256 + (gid + 8) * 16 + 8 * nt + t2 + cc] =
-                        Sr[1][nt][cc];
-                }
         __syncthreads();   // the next chunk rewrites sG/sBeta/sSc while slow threads read them
     }
 
@@ -910,13 +783,6 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
                 srow[8 * nt + c + 8 * P1_DV] = Sr[1][nt][c];
             }
     }
-    if (DUMP && dbg != nullptr && head == dbg_head && blockIdx.x == dbg_strip) {
-        // The store above is per thread; the dump reads the WHOLE 128-row strip, so it
-        // must wait for every warp's stores to land.
-        __syncthreads();
-        p1_dump_sf32<DUMP>(dbg + P1_DBG_SNEW,
-                           S + (size_t)head * P1_DK * P1_DV + j0, P1_DV, P1_DK, VW);
-    }
 }
 
 // ABI-shaped wrappers. The value strip width is a compile-time property: the register
@@ -926,30 +792,19 @@ extern "C" __global__ __launch_bounds__(P1_THREADS, 1)
 void gdn_chunkwise_p1_core_s4(const float* q, const float* k, const float* v,
                               const float* beta, const float* g, float* S,
                               __nv_bfloat16* out, const GdnMeta* meta, int valid_rows) {
-    gdn_chunkwise_p1_t<32>(q, k, v, beta, g, S, out, meta, valid_rows, nullptr);
+    gdn_chunkwise_p1_t<32>(q, k, v, beta, g, S, out, meta, valid_rows);
 }
 
 extern "C" __global__ __launch_bounds__(P1_THREADS, 1)
 void gdn_chunkwise_p1_core_s8(const float* q, const float* k, const float* v,
                               const float* beta, const float* g, float* S,
                               __nv_bfloat16* out, const GdnMeta* meta, int valid_rows) {
-    gdn_chunkwise_p1_t<16>(q, k, v, beta, g, S, out, meta, valid_rows, nullptr);
+    gdn_chunkwise_p1_t<16>(q, k, v, beta, g, S, out, meta, valid_rows);
 }
 
 extern "C" __global__ __launch_bounds__(P1_THREADS, 1)
 void gdn_chunkwise_p1_core_s16(const float* q, const float* k, const float* v,
                                const float* beta, const float* g, float* S,
                                __nv_bfloat16* out, const GdnMeta* meta, int valid_rows) {
-    gdn_chunkwise_p1_t<8>(q, k, v, beta, g, S, out, meta, valid_rows, nullptr);
-}
-
-// DEBUG entry points. Same computation, same grid, plus a P1_DBG_BYTES float buffer that
-// head 0 / strip 0 fills with every pipeline stage. Nothing above is reachable from
-// these, and nothing in them is reachable from the production entries above.
-extern "C" __global__ __launch_bounds__(P1_THREADS, 1)
-void gdn_chunkwise_p1_dbg_s8(const float* q, const float* k, const float* v,
-                             const float* beta, const float* g, float* S,
-                             __nv_bfloat16* out, const GdnMeta* meta, int valid_rows,
-                             float* dbg) {
-    gdn_chunkwise_p1_t<16, true>(q, k, v, beta, g, S, out, meta, valid_rows, dbg);
+    gdn_chunkwise_p1_t<8>(q, k, v, beta, g, S, out, meta, valid_rows);
 }

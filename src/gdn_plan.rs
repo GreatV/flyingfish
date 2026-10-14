@@ -7,6 +7,10 @@ const HK: u32 = 16;
 const DK: u32 = 128;
 const DV: u32 = 128;
 
+/// Top of the scan dispatch range, and the largest prepared scan bucket. A prefill
+/// step at or below it is the scan core's or the shipped recursive core's, never P1.
+pub const SCAN_MAX_ROWS: u32 = 2048;
+
 pub mod shared {
     include!(concat!(env!("OUT_DIR"), "/gdn_b_shared.rs"));
 }
@@ -22,13 +26,44 @@ pub mod cw_p1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct GdnPolicy {
     scan: bool,
+    /// Protocol §A value split of the production chunkwise-P1 prefill core, 0 = the
+    /// shipped recursive core. Derived once here from the same qualification the
+    /// scan path uses: the core's gate was run on sm89 with 128 SMs (box3), and
+    /// every other device keeps the shipped core until it has its own gate.
+    prefill_p1_split: u32,
 }
 impl GdnPolicy {
-    pub const LEGACY: Self = Self { scan: false };
+    pub const LEGACY: Self = Self {
+        scan: false,
+        prefill_p1_split: 0,
+    };
     pub const fn for_device(arch: u32, sms: usize) -> Self {
         Self {
             scan: arch == 89 && sms == 128,
+            prefill_p1_split: if arch == 89 && sms == 128 { 4 } else { 0 },
         }
+    }
+    /// The prepared chunkwise-P1 value split for a NON-scan prefill plan; scan bucket
+    /// plans always pass 0 (the scan core is their path). This is the device
+    /// qualification; `p1_split_for_step` is the per-step decision.
+    pub const fn prefill_p1_split(self) -> u32 {
+        self.prefill_p1_split
+    }
+    /// The split a prefill step of `step_rows` rows may carry. P1 s4 is prepared only
+    /// ABOVE the scan range: a step at or below `SCAN_MAX_ROWS` belongs to a scan
+    /// bucket or to the shipped recursive core and keeps 0.
+    pub const fn p1_split_for_step(self, step_rows: u32) -> u32 {
+        if step_rows > SCAN_MAX_ROWS {
+            self.prefill_p1_split
+        } else {
+            0
+        }
+    }
+    /// True when a non-scan prefill step of `step_rows` rows runs the NARROWED
+    /// sub-scan plan (the shipped recursive core, split 0) instead of the full P1
+    /// plan. 1..=4 keep the small plans, whose contract is MTP verify.
+    pub const fn sub_scan_prefill(self, step_rows: u32) -> bool {
+        step_rows > 4 && step_rows <= SCAN_MAX_ROWS
     }
     pub const fn identity(self) -> &'static str {
         if self.scan {
@@ -43,7 +78,7 @@ impl GdnPolicy {
             return Vec::new();
         }
         let mut result = Vec::new();
-        for bound in [512, 1024, 2048] {
+        for bound in [512, 1024, SCAN_MAX_ROWS] {
             let bound = bound.min(physical_rows);
             if result.last() != Some(&bound) {
                 result.push(bound);
@@ -62,7 +97,10 @@ impl GdnPolicy {
             step_rows > 0 && step_rows <= physical_rows,
             "GDN step exceeds physical rows"
         );
-        if !self.scan || phase == ExecutionPhase::Decode || !(512..=2048).contains(&step_rows) {
+        if !self.scan
+            || phase == ExecutionPhase::Decode
+            || !(512..=SCAN_MAX_ROWS).contains(&step_rows)
+        {
             return Ok(None);
         }
         Ok(Some(step_rows.next_power_of_two().min(physical_rows)))
@@ -249,7 +287,9 @@ mod tests {
             let legacy = GdnPolicy::for_device(arch, sms);
             assert_eq!(legacy, GdnPolicy::LEGACY);
             assert!(legacy.buckets(2048).is_empty());
+            assert_eq!(legacy.prefill_p1_split(), 0);
         }
+        assert_eq!(scan.prefill_p1_split(), 4);
         assert_eq!(scan.buckets(1021), vec![512, 1021]);
         assert_eq!(scan.buckets(4096), vec![512, 1024, 2048]);
         for (rows, want) in [
@@ -292,6 +332,48 @@ mod tests {
         assert!(scan.select(1024, 0, ExecutionPhase::Prefill).is_err());
         assert_ne!(scan.identity(), GdnPolicy::LEGACY.identity());
         Ok(())
+    }
+    #[test]
+    fn p1_split_is_prepared_only_above_the_scan_range() {
+        let scan = GdnPolicy::for_device(89, 128);
+        // The E1 suffix prefill step: 64 rows, far below the scan range.
+        assert_eq!(scan.p1_split_for_step(64), 0);
+        assert_eq!(scan.p1_split_for_step(2048), 0);
+        assert_eq!(scan.p1_split_for_step(2049), 4);
+        assert_eq!(scan.p1_split_for_step(16384), 4);
+        for (arch, sms) in [(86, 48), (89, 80), (90, 128)] {
+            let legacy = GdnPolicy::for_device(arch, sms);
+            assert_eq!(legacy.p1_split_for_step(64), 0);
+            assert_eq!(legacy.p1_split_for_step(16384), 0);
+        }
+    }
+    #[test]
+    fn prefill_routing_sends_every_sub_scan_step_to_the_shipped_core() {
+        let scan = GdnPolicy::for_device(89, 128);
+        // 1..=4 are the MTP verify plans, 5..=SCAN_MAX_ROWS the narrowed sub-scan
+        // plan: every step at or below the scan range leaves the shipped core on.
+        for rows in [1u32, 2, 3, 4] {
+            assert!(
+                !scan.sub_scan_prefill(rows),
+                "{rows} must keep the small plan"
+            );
+        }
+        for rows in [5u32, 6, 63, 64, 512, 1024, 2047, SCAN_MAX_ROWS] {
+            assert!(
+                scan.sub_scan_prefill(rows),
+                "{rows} must use the sub-scan plan"
+            );
+            assert_eq!(scan.p1_split_for_step(rows), 0, "{rows} split");
+        }
+        for rows in [SCAN_MAX_ROWS + 1, 4096, 16384] {
+            assert!(
+                !scan.sub_scan_prefill(rows),
+                "{rows} must use the full plan"
+            );
+            assert_eq!(scan.p1_split_for_step(rows), 4, "{rows} split");
+        }
+        assert_eq!(GdnPolicy::LEGACY.p1_split_for_step(64), 0);
+        assert_eq!(GdnPolicy::LEGACY.p1_split_for_step(16384), 0);
     }
     #[test]
     fn exact_shared_arena_and_monotone_admission() -> Result<()> {

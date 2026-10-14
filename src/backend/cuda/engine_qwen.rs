@@ -61,6 +61,10 @@ enum BoundMixer {
     Gdn {
         norm: Tensor<bf16, 1>,
         prefill: PrefillPlans<GdnPlan>,
+        /// Narrowed plan for steps 5..=SCAN_MAX_ROWS: the shipped recursive core.
+        /// Absent when the full plan is already that small, in which case the full
+        /// plan carries split 0 and serves those steps itself.
+        sub_scan: Option<Box<GdnPlan>>,
         scan: Vec<(u32, Box<GdnPlan>)>,
         decode: Box<GdnPlan>,
     },
@@ -391,10 +395,14 @@ impl Runtime {
                             },
                             common.clone(),
                             scan,
-                            // Phase-2 chunkwise P1 core: 0 keeps the shipped recursive
-                            // core. Landing it is the model gate's ruling, not a tuning
-                            // knob, so no plan here selects it.
-                            0,
+                            // The planner's derived chunkwise-P1 split, which applies only
+                            // ABOVE the scan range: a scan bucket plan and every sub-scan
+                            // plan keep 0 (the scan and shipped recursive cores are theirs).
+                            if scan {
+                                0
+                            } else {
+                                gdn_policy.p1_split_for_step(active_rows as u32)
+                            },
                         )
                     };
                     let scan = gdn_policy
@@ -410,9 +418,19 @@ impl Runtime {
                             Ok((bound, Box::new(plan)))
                         })
                         .collect::<Result<Vec<_>>>()?;
+                    let full = bind(rows, false)?;
+                    // A step at or below SCAN_MAX_ROWS runs the shipped recursive core:
+                    // the narrowed plan is that core, and when the full plan is itself
+                    // that small its split is already 0 and no narrowing is needed.
+                    let sub_scan = if rows as u32 > crate::gdn_plan::SCAN_MAX_ROWS {
+                        Some(Box::new(full.for_rows(crate::gdn_plan::SCAN_MAX_ROWS)?))
+                    } else {
+                        None
+                    };
                     BoundMixer::Gdn {
                         norm: weight("linear_attn.norm.weight")?,
-                        prefill: PrefillPlans::bind(bind(rows, false)?, rows, GdnPlan::for_rows)?,
+                        prefill: PrefillPlans::bind(full, rows, GdnPlan::for_rows)?,
+                        sub_scan,
                         decode: Box::new(bind(1, false)?),
                         scan,
                     }
@@ -1052,6 +1070,7 @@ impl Engine {
             BoundMixer::Gdn {
                 norm,
                 prefill,
+                sub_scan,
                 decode,
                 scan,
             } => {
@@ -1090,7 +1109,10 @@ impl Engine {
                             .1
                             .as_ref(),
                         None => match phase {
-                            ExecutionPhase::Prefill => prefill.select(rows)?,
+                            ExecutionPhase::Prefill => match sub_scan.as_deref() {
+                                Some(plan) if q.gdn_policy.sub_scan_prefill(rows as u32) => plan,
+                                _ => prefill.select(rows)?,
+                            },
                             ExecutionPhase::Decode => decode.as_ref(),
                         },
                     };

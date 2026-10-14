@@ -52,6 +52,8 @@ const SCHEMA_MANIFEST: &str = "gdn-p1-frozen-inputs/1";
 const SCHEMA_BASIS: &str = "gdn-p1-gate-basis/3";
 const SCHEMA_GATE: &str = "gdn-p1-gate-report/1";
 const SCHEMA_TIMING: &str = "gdn-p1-timing-report/1";
+#[cfg(feature = "cuda")]
+const SCHEMA_IDENTITY: &str = "gdn-p1-identity-report/1";
 
 /// Chunk size the P1 core is compiled with (kernels/gdn/gdn_chunkwise_p1.cu, P1_C).
 /// The protocol fixes C64 for every candidate (§A); the gate basis carries C16/C32
@@ -75,33 +77,31 @@ enum Phase {
     Numerics(NumericsArgs),
     /// Freeze the NULL band, then measure P1 against the main core.
     Timing(TimingArgs),
-    /// Dump every pipeline stage of one chunk for one fixture (debug only).
-    Debug(DebugArgs),
+    /// Launch one P1 entry >=N times from identical device inputs and byte-compare
+    /// out and state across the launches (the kernel gate's bit-identity leg).
+    Identity(IdentityArgs),
 }
 
 #[derive(Parser)]
-struct DebugArgs {
-    /// Frozen P1 package directory.
+struct IdentityArgs {
+    /// Frozen P1 package directory (MANIFEST.json, inputs/, truth/, gate_basis.json).
     #[arg(long)]
     package: PathBuf,
-    /// Run directory for the per-stage dumps.
+    /// Run directory for the identity report.
     #[arg(long)]
     run_dir: PathBuf,
-    /// The fixture to dump.
-    #[arg(long, default_value = "decode_m1")]
-    case: String,
     /// Chunk size; the built P1 core is C64 only.
     #[arg(long, default_value_t = KERNEL_C)]
     c: u32,
-    /// Value split; only the s8 debug entry point exists.
-    #[arg(long, default_value_t = 8)]
-    s: u32,
-    /// Head whose stages are dumped (the CTA writes only its own).
-    #[arg(long, default_value_t = 0)]
-    dbg_head: u32,
-    /// Value strip whose stages are dumped.
-    #[arg(long, default_value_t = 0)]
-    dbg_strip: u32,
+    /// Value splits, protocol §A order.
+    #[arg(long, value_delimiter = ',', default_value = "8,4,16")]
+    s: Vec<u32>,
+    /// Launches per (fixture, split), each from a fresh S0. The gate requires >= 20.
+    #[arg(long, default_value_t = 20)]
+    runs: u32,
+    /// Only these fixtures (default: every fixture in the manifest).
+    #[arg(long, value_delimiter = ',')]
+    case: Vec<String>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
@@ -613,6 +613,48 @@ struct GateRow {
     failures: Vec<String>,
 }
 
+/// One (fixture, split) row of the identity leg: what every launch produced.
+#[cfg(feature = "cuda")]
+#[derive(Serialize)]
+struct IdentityRow {
+    case: String,
+    #[serde(rename = "C")]
+    c: u32,
+    s: u32,
+    /// The entry point actually launched, named so the report cannot be read as the
+    /// other arm.
+    entry: String,
+    arm: &'static str,
+    runs: u32,
+    /// The digest every run must match, and how many distinct digests appeared.
+    out_sha256: String,
+    state_sha256: String,
+    distinct_out_sha256: usize,
+    distinct_state_sha256: usize,
+    /// The first launch whose out or state digest left the common value.
+    first_divergent_run: Option<u32>,
+    run_out_sha256: Vec<String>,
+    run_state_sha256: Vec<String>,
+    verdict: &'static str,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Serialize)]
+struct IdentityReport {
+    schema: &'static str,
+    generated_utc: String,
+    clock: &'static str,
+    package: String,
+    manifest_generated_utc: String,
+    files_sha256_verified: usize,
+    /// What runs between two measured launches, named so the leg cannot be read as
+    /// "launched 20 times into a quiet SM".
+    perturbation: &'static str,
+    environment: EnvReceipt,
+    rows: Vec<IdentityRow>,
+    verdict: &'static str,
+}
+
 #[derive(Serialize)]
 struct GateReport {
     schema: &'static str,
@@ -844,16 +886,16 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
 
     for fx in &fixtures {
         let m = fx.m;
-        let q = read_f32(&pkg.root, &fx.arrays["q"])?;
-        let k = read_f32(&pkg.root, &fx.arrays["k"])?;
-        let v = read_f32(&pkg.root, &fx.arrays["v"])?;
-        let beta = read_f32(&pkg.root, &fx.arrays["beta"])?;
-        let g = read_f32(&pkg.root, &fx.arrays["g"])?;
-        let s0 = read_f32(&pkg.root, &fx.arrays["S0"])?;
+        let arrays = CaseArrays::new(&pkg.root, fx)?;
         let heads = head_count(fx, "q");
         let dk = fx.arrays["q"].shape[2];
         let dv = fx.arrays["v"].shape[2];
-        let input_bytes = q.len() + k.len() + v.len() + beta.len() + g.len() + s0.len();
+        let input_bytes = arrays.q.len()
+            + arrays.k.len()
+            + arrays.v.len()
+            + arrays.beta.len()
+            + arrays.g.len()
+            + arrays.s0.len();
         bytes_by_fixture.insert(fx.name.clone(), input_bytes);
 
         // The FP64 truth does not depend on C or s, so it is read once per fixture.
@@ -886,7 +928,7 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
 
             let (out, state) = match gpu.as_ref() {
                 #[cfg(feature = "cuda")]
-                Some(gpu) => gpu.run_p1(fx, &q, &k, &v, &beta, &g, &s0, s)?,
+                Some(gpu) => gpu.run_p1(fx, &arrays, s)?,
                 None => (
                     stub_field_array(m * heads * dk, 0.0),
                     stub_field_array(heads * dk * dv, 1.3),
@@ -1032,7 +1074,6 @@ fn residual_status(spec: &ResidualSpec) -> ResidualStatus {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gate_row(
     fx: &Fixture,
     c: u32,
@@ -1257,72 +1298,44 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
 
     // Load the inputs once; every leg restores S from S0 so a leg's decay work is
     // the same as the first call's.
-    let q = read_f32(&pkg.root, &fx.arrays["q"])?;
-    let k = read_f32(&pkg.root, &fx.arrays["k"])?;
-    let v = read_f32(&pkg.root, &fx.arrays["v"])?;
-    let beta = read_f32(&pkg.root, &fx.arrays["beta"])?;
-    let g = read_f32(&pkg.root, &fx.arrays["g"])?;
-    let s0 = read_f32(&pkg.root, &fx.arrays["S0"])?;
+    let arrays = CaseArrays::new(&pkg.root, fx)?;
 
     let device_touched = gpu.is_some();
     let device = device_of(gpu.as_ref());
+    // Side A is the baseline the ratio is taken against and side B the candidate. The
+    // NULL leg runs side A's own core against itself, so the band measures the noise
+    // of the arms actually being compared.
+    let (baseline, candidate) = (Which::Main, Which::P1);
+    let comparison_label: &'static str = "P1 core vs the main GDN core";
     let mut configs = Vec::new();
     for &s in &args.s {
-        // 1. NULL FIRST: the main core against ITSELF, so the band measures the
+        // 1. NULL FIRST: side A's own core against ITSELF, so the band measures the
         // measurement noise and nothing else.
-        let null_blocks = abba(
-            args.clock,
-            args.blocks,
-            Which::Main,
-            Which::Main,
-            |which, leg| {
-                let _ = leg;
-                time_leg(
-                    gpu.as_ref(),
-                    fx,
-                    &q,
-                    &k,
-                    &v,
-                    &beta,
-                    &g,
-                    &s0,
-                    which,
-                    s,
-                    args.c,
-                )
-            },
-        );
+        let null_blocks = abba(args.clock, args.blocks, baseline, baseline, |which, leg| {
+            let _ = leg;
+            time_leg(gpu.as_ref(), fx, &arrays, which, s)
+        });
         let null = freeze_null_band(&null_blocks, args, s)?;
-        let band_path = args
-            .run_dir
-            .join(format!("NULL_BAND.C{}.s{s}.json", args.c));
+        let band_path = args.run_dir.join(format!(
+            "NULL_BAND.C{}.s{s}.{}.json",
+            args.c,
+            baseline.slug()
+        ));
         std::fs::write(&band_path, serde_json::to_string_pretty(&null)?.as_bytes())
             .with_context(|| format!("write {}", band_path.display()))?;
 
-        // 2. Only now the P1 leg, compared against the band that is already on disk.
+        // 2. Only now the candidate leg, compared against the band already on disk.
         let p1_blocks = abba(
             args.clock,
             args.blocks,
-            Which::Main,
-            Which::P1,
+            baseline,
+            candidate,
             |which, leg| {
                 let _ = leg;
-                time_leg(
-                    gpu.as_ref(),
-                    fx,
-                    &q,
-                    &k,
-                    &v,
-                    &beta,
-                    &g,
-                    &s0,
-                    which,
-                    s,
-                    args.c,
-                )
+                time_leg(gpu.as_ref(), fx, &arrays, which, s)
             },
         );
-        let series = summarise(&p1_blocks, args.blocks as usize * 4);
+        let series = summarise(&p1_blocks, args.blocks as usize * 4, comparison_label);
         let (verdict, reason) = if !null.valid {
             (
                 "INVALID",
@@ -1385,24 +1398,29 @@ enum Which {
     P1,
 }
 
-#[allow(clippy::too_many_arguments)]
+impl Which {
+    /// Short, filename-safe name of the arm, so a run directory holding two
+    /// comparisons does not overwrite one band with the other.
+    fn slug(self) -> &'static str {
+        match self {
+            Which::Main => "chunked",
+            Which::P1 => "p1",
+        }
+    }
+}
+
 fn time_leg(
     gpu: Option<&Gpu>,
-    _fx: &Fixture,
-    _q: &[f32],
-    _k: &[f32],
-    _v: &[f32],
-    _beta: &[f32],
-    _g: &[f32],
-    _s0: &[f32],
+    fx: &Fixture,
+    arrays: &CaseArrays,
     which: Which,
     s: u32,
-    _c: u32,
 ) -> Result<f64> {
+    let _ = (fx, arrays);
     match gpu {
         None => Ok(stub_duration(which, s)),
         #[cfg(feature = "cuda")]
-        Some(gpu) => gpu.time(which, _fx, _q, _k, _v, _beta, _g, _s0, s),
+        Some(gpu) => gpu.time(which, fx, arrays, s),
         #[cfg(not(feature = "cuda"))]
         Some(_) => anyhow::bail!("the CUDA clock needs the crate's cuda feature"),
     }
@@ -1527,7 +1545,7 @@ fn freeze_null_band(blocks: &[BlockStat], args: &TimingArgs, s: u32) -> Result<N
     })
 }
 
-fn summarise(blocks: &[BlockStat], n_legs: usize) -> LegSeries {
+fn summarise(blocks: &[BlockStat], n_legs: usize, label: &'static str) -> LegSeries {
     let lr: Vec<f64> = blocks.iter().map(|b| b.log_ratio).collect();
     let n = lr.len() as f64;
     let mean = lr.iter().sum::<f64>() / n;
@@ -1538,7 +1556,7 @@ fn summarise(blocks: &[BlockStat], n_legs: usize) -> LegSeries {
     let t = t_critical(alpha / 2.0, n - 1.0);
     let drift = lr.iter().fold(0.0f64, |m, x| m.max(x.abs()));
     LegSeries {
-        label: "P1 core vs the main GDN core",
+        label,
         blocks: blocks.to_vec(),
         geometric_mean_ratio: mean.exp(),
         ci_low: (mean - t * se).exp(),
@@ -1780,28 +1798,17 @@ impl Gpu {
 
     /// Allocate, upload, launch the P1 core, download. Every leg starts from S0 so
     /// the state a previous leg decayed is not the next leg's input.
-    #[allow(clippy::too_many_arguments)]
-    fn run_p1(
-        &self,
-        fx: &Fixture,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        beta: &[f32],
-        g: &[f32],
-        s0: &[f32],
-        s: u32,
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
+    fn run_p1(&self, fx: &Fixture, arrays: &CaseArrays, s: u32) -> Result<(Vec<f32>, Vec<f32>)> {
         use cudarc::driver::{LaunchConfig, PushKernelArg as _};
         let m = fx.m;
         let heads = fx.arrays["q"].shape[1];
         let dv = fx.arrays["v"].shape[2];
-        let dq = self.stream.clone_htod(q)?;
-        let dk = self.stream.clone_htod(k)?;
-        let dvv = self.stream.clone_htod(v)?;
-        let dbeta = self.stream.clone_htod(beta)?;
-        let dg = self.stream.clone_htod(g)?;
-        let mut ds = self.stream.clone_htod(s0)?;
+        let dq = self.stream.clone_htod(&arrays.q)?;
+        let dk = self.stream.clone_htod(&arrays.k)?;
+        let dvv = self.stream.clone_htod(&arrays.v)?;
+        let dbeta = self.stream.clone_htod(&arrays.beta)?;
+        let dg = self.stream.clone_htod(&arrays.g)?;
+        let mut ds = self.stream.clone_htod(&arrays.s0)?;
         let dout = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
         let meta = self.meta(fx)?;
         let idx = match s {
@@ -1837,6 +1844,94 @@ impl Gpu {
         Ok((widened, state))
     }
 
+    /// Launch the P1 core `runs` times from IDENTICAL device inputs and digest out
+    /// and state after every launch. Each run re-uploads S0 (the core advances S in
+    /// place, so a carried-over state would make run N+1 a different input) and takes
+    /// a freshly zeroed out buffer (so a row the kernel failed to write reads as zeros
+    /// rather than as the previous run's value). The input arrays, meta and the
+    /// perturbation's buffers are uploaded once and never rewritten.
+    ///
+    fn identity_p1(
+        &self,
+        fx: &Fixture,
+        arrays: &CaseArrays,
+        s: u32,
+        runs: u32,
+    ) -> Result<(&'static str, Vec<String>, Vec<String>)> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg as _};
+        let m = fx.m;
+        let heads = fx.arrays["q"].shape[1];
+        let dv = fx.arrays["v"].shape[2];
+        let index = match s {
+            4 => 0,
+            8 => 1,
+            16 => 2,
+            _ => anyhow::bail!("split {s} is not 4/8/16"),
+        };
+        let entry = split_function(s);
+        let fun = &self.p1[index];
+        let dq = self.stream.clone_htod(&arrays.q)?;
+        let dk = self.stream.clone_htod(&arrays.k)?;
+        let dvv = self.stream.clone_htod(&arrays.v)?;
+        let dbeta = self.stream.clone_htod(&arrays.beta)?;
+        let dg = self.stream.clone_htod(&arrays.g)?;
+        let meta = self.meta(fx)?;
+        let cfg = LaunchConfig {
+            grid_dim: (s, heads as u32, 1),
+            block_dim: (Self::P1_THREADS, 1, 1),
+            shared_mem_bytes: split_smem(s)?,
+        };
+        let launch = |stream: &cudarc::driver::CudaStream,
+                      ds: &mut cudarc::driver::CudaSlice<f32>,
+                      dout: &cudarc::driver::CudaSlice<half::bf16>|
+         -> Result<()> {
+            unsafe {
+                stream
+                    .launch_builder(fun)
+                    .arg(&dq)
+                    .arg(&dk)
+                    .arg(&dvv)
+                    .arg(&dbeta)
+                    .arg(&dg)
+                    .arg(ds)
+                    .arg(dout)
+                    .arg(&meta)
+                    .arg(&0i32)
+                    .launch(cfg)?;
+            }
+            Ok(())
+        };
+        // The perturbation's own state and output: the same entry, same inputs, a
+        // state and an output buffer no measured run reads.
+        let mut ds_filler = self.stream.clone_htod(&arrays.s0)?;
+        let dout_filler = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
+        let mut out_digests = Vec::with_capacity(runs as usize);
+        let mut state_digests = Vec::with_capacity(runs as usize);
+        for run in 1..=runs {
+            self.stream.synchronize()?;
+            launch(&self.stream, &mut ds_filler, &dout_filler)?;
+            launch(&self.stream, &mut ds_filler, &dout_filler)?;
+            self.stream.synchronize()?;
+            // Fresh inputs for this run: S0 re-uploaded, out zeroed.
+            let mut ds = self.stream.clone_htod(&arrays.s0)?;
+            let mut dout = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
+            launch(&self.stream, &mut ds, &mut dout)?;
+            self.stream.synchronize()?;
+            let out: Vec<half::bf16> = self.stream.clone_dtoh(&dout)?;
+            let state: Vec<f32> = self.stream.clone_dtoh(&ds)?;
+            let out_bytes: Vec<u8> = out.iter().flat_map(|b| b.to_ne_bytes()).collect();
+            let state_bytes: Vec<u8> = state.iter().flat_map(|f| f.to_ne_bytes()).collect();
+            out_digests.push(sha256_bytes(&out_bytes));
+            state_digests.push(sha256_bytes(&state_bytes));
+            eprintln!(
+                "    run {run}/{runs} out {} state {}",
+                &out_digests[out_digests.len() - 1][..16],
+                &state_digests[state_digests.len() - 1][..16]
+            );
+        }
+        Ok((entry, out_digests, state_digests))
+    }
+
     fn meta(&self, fx: &Fixture) -> Result<cudarc::driver::CudaSlice<i32>> {
         // The kernel declares `struct GdnMeta { int prefix, valid_rows, key_count,
         // capacity, causal, r20, r24, r28; }`; eight i32 in that order.
@@ -1853,29 +1948,17 @@ impl Gpu {
         ])?)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn time(
-        &self,
-        which: Which,
-        fx: &Fixture,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        beta: &[f32],
-        g: &[f32],
-        s0: &[f32],
-        s: u32,
-    ) -> Result<f64> {
+    fn time(&self, which: Which, fx: &Fixture, arrays: &CaseArrays, s: u32) -> Result<f64> {
         use cudarc::driver::{LaunchConfig, PushKernelArg as _, sys};
         let m = fx.m;
         let heads = fx.arrays["q"].shape[1];
         let dv = fx.arrays["v"].shape[2];
-        let dq = self.stream.clone_htod(q)?;
-        let dk = self.stream.clone_htod(k)?;
-        let dvv = self.stream.clone_htod(v)?;
-        let dbeta = self.stream.clone_htod(beta)?;
-        let dg = self.stream.clone_htod(g)?;
-        let mut ds = self.stream.clone_htod(s0)?;
+        let dq = self.stream.clone_htod(&arrays.q)?;
+        let dk = self.stream.clone_htod(&arrays.k)?;
+        let dvv = self.stream.clone_htod(&arrays.v)?;
+        let dbeta = self.stream.clone_htod(&arrays.beta)?;
+        let dg = self.stream.clone_htod(&arrays.g)?;
+        let mut ds = self.stream.clone_htod(&arrays.s0)?;
         let dout = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
         let meta = self.meta(fx)?;
         // The events bracket the launch on the stream; nothing else is enqueued
@@ -1884,7 +1967,6 @@ impl Gpu {
             .ctx
             .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
         start.record(&self.stream)?;
-        #[allow(unused_unsafe)]
         unsafe {
             match which {
                 Which::Main => {
@@ -1943,156 +2025,159 @@ impl Gpu {
 }
 
 // ---------------------------------------------------------------------------
-// the debug phase — one chunk, every stage, for the stage hunt
-// ---------------------------------------------------------------------------
-/// The dump layout, identical to the kernel's P1_DBG_* offsets: (name, first float,
-/// rows, cols). W is written out of order ([row tile][dk block][16][16]) so it carries
-/// the sentinel offset below and is re-laid-out on the way out.
-#[cfg(feature = "cuda")]
-const DBG_W_SENTINEL: usize = usize::MAX;
-#[cfg(feature = "cuda")]
-const DBG_STAGES: [(&str, usize, usize, usize); 20] = [
-    ("G", 0, 64, 1),
-    ("A", 64, 64, 64),
-    ("T", 4160, 64, 64),
-    ("U", 16448, 64, 16),
-    ("WS", 18496, 64, 16),
-    ("VNEW", 20544, 64, 16),
-    ("QK", 22592, 64, 64),
-    ("AD", 26688, 64, 16),
-    ("OUT", 28736, 64, 16),
-    ("SNEW", 30784, 128, 16),
-    ("BETA", 47168, 64, 1),
-    ("RAWA", 47232, 64, 64),
-    ("SV", 51328, 8 * 16, 16),
-    ("SR", 53376, 8 * 16, 16),
-    ("SR2", 55424, 8 * 16, 16),
-    ("MT11", 57472, 32, 32),
-    ("MT22", 58496, 32, 32),
-    ("MA21", 59520, 32, 32),
-    ("MX", 60544, 32, 32),
-    ("W", DBG_W_SENTINEL, 4 * 8 * 16, 16),
-];
-/// The kernel's P1_DBG_BYTES for any split: the [64][VW] and [128][VW] regions are
-/// reserved at the largest split (VW=32), so the offsets are split-independent.
-#[cfg(feature = "cuda")]
-const DBG_BYTES: usize = 61568;
 
 #[cfg(feature = "cuda")]
-fn run_debug(args: &DebugArgs) -> Result<()> {
-    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg as _, sys};
-    ensure!(args.c == KERNEL_C, "the built P1 core is C{KERNEL_C} only");
-    ensure!(args.s == 8, "only the s8 debug entry point exists");
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// The frozen per-fixture input arrays, as one argument, so the identity launch does
+/// not grow a ten-argument signature.
+struct CaseArrays {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    beta: Vec<f32>,
+    g: Vec<f32>,
+    s0: Vec<f32>,
+}
+
+impl CaseArrays {
+    fn new(root: &Path, fx: &Fixture) -> Result<Self> {
+        Ok(Self {
+            q: read_f32(root, &fx.arrays["q"])?,
+            k: read_f32(root, &fx.arrays["k"])?,
+            v: read_f32(root, &fx.arrays["v"])?,
+            beta: read_f32(root, &fx.arrays["beta"])?,
+            g: read_f32(root, &fx.arrays["g"])?,
+            s0: read_f32(root, &fx.arrays["S0"])?,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn run_identity(args: &IdentityArgs) -> Result<()> {
+    ensure!(
+        args.c == KERNEL_C,
+        "the built P1 core is C{KERNEL_C} only; C{} is not built and is not run \
+         (protocol §A fixes C64 for every candidate)",
+        args.c
+    );
+    ensure!(
+        args.runs >= 2,
+        "identity compares launches against each other and needs at least two"
+    );
+    for s in &args.s {
+        ensure!(
+            [4u32, 8, 16].contains(s),
+            "split {s} is not one of 4/8/16 (protocol §A)"
+        );
+    }
     let pkg = open_package(&args.package)?;
-    let fx = pkg
+    std::fs::create_dir_all(&args.run_dir)
+        .with_context(|| format!("create {}", args.run_dir.display()))?;
+    let fixtures: Vec<&Fixture> = pkg
         .manifest
         .fixtures
         .iter()
-        .find(|f| f.name == args.case)
-        .with_context(|| format!("fixture {} is not in the manifest", args.case))?;
-    std::fs::create_dir_all(&args.run_dir)?;
+        .filter(|f| args.case.is_empty() || args.case.iter().any(|c| c == &f.name))
+        .collect();
+    ensure!(!fixtures.is_empty(), "no fixture selected");
+    let gpu = Gpu::open()?;
+    let device = device_of(Some(&gpu));
 
-    let q = read_f32(&pkg.root, &fx.arrays["q"])?;
-    let k = read_f32(&pkg.root, &fx.arrays["k"])?;
-    let v = read_f32(&pkg.root, &fx.arrays["v"])?;
-    let beta = read_f32(&pkg.root, &fx.arrays["beta"])?;
-    let g = read_f32(&pkg.root, &fx.arrays["g"])?;
-    let s0 = read_f32(&pkg.root, &fx.arrays["S0"])?;
-
-    let ctx = CudaContext::new(0).context("create CUDA context")?;
-    let arch = compute_capability(&ctx)?;
-    let stream = ctx.new_stream().context("create CUDA stream")?;
-    let bytes = flyingfish::backend::kernel_cubin(P1_MODULE, arch)
-        .with_context(|| format!("no cubin for {P1_MODULE} at sm{arch}"))?;
-    let module = ctx.load_module(cudarc::nvrtc::Ptx::from_binary(bytes.to_vec()))?;
-    let fun = module.load_function("gdn_chunkwise_p1_dbg_s8")?;
-    fun.set_attribute(
-        sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        flyingfish::gdn_plan::cw_p1::S8_BYTES as i32,
-    )?;
-
-    let dq = stream.clone_htod(&q)?;
-    let dk = stream.clone_htod(&k)?;
-    let dv = stream.clone_htod(&v)?;
-    let dbeta = stream.clone_htod(&beta)?;
-    let dg = stream.clone_htod(&g)?;
-    let mut ds = stream.clone_htod(&s0)?;
-    let dout = stream.alloc_zeros::<half::bf16>(fx.m * fx.arrays["q"].shape[1] * 128)?;
-    let key_count = fx.prefix as i32 + fx.m as i32;
-    let meta = stream.clone_htod(&[
-        fx.prefix as i32,
-        fx.m as i32,
-        key_count,
-        key_count,
-        1,
-        args.dbg_head as i32,  // r20: debug dump selector
-        args.dbg_strip as i32, // r24
-        0,
-    ])?;
-    let total = DBG_BYTES;
-    let dbg = stream.alloc_zeros::<f32>(total)?;
-    unsafe {
-        stream
-            .launch_builder(&fun)
-            .arg(&dq)
-            .arg(&dk)
-            .arg(&dv)
-            .arg(&dbeta)
-            .arg(&dg)
-            .arg(&mut ds)
-            .arg(&dout)
-            .arg(&meta)
-            .arg(&0i32)
-            .arg(&dbg)
-            .launch(LaunchConfig {
-                grid_dim: (8, 48, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: flyingfish::gdn_plan::cw_p1::S8_BYTES,
-            })?;
+    let mut rows = Vec::new();
+    for fx in &fixtures {
+        let arrays = CaseArrays::new(&pkg.root, fx)?;
+        for &s in &args.s {
+            let (entry, out_digests, state_digests) = gpu.identity_p1(fx, &arrays, s, args.runs)?;
+            let distinct_out = out_digests
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let distinct_state = state_digests
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let first_divergent = out_digests
+                .iter()
+                .position(|d| d != &out_digests[0])
+                .or_else(|| state_digests.iter().position(|d| d != &state_digests[0]))
+                .map(|i| u32::try_from(i).unwrap_or(u32::MAX) + 1);
+            let pass = distinct_out == 1 && distinct_state == 1;
+            eprintln!(
+                "  {:16} C{} s{s:<2} {} out={} state={} {}",
+                fx.name,
+                args.c,
+                entry,
+                distinct_out,
+                distinct_state,
+                if pass { "IDENTICAL" } else { "DIVERGED" }
+            );
+            rows.push(IdentityRow {
+                case: fx.name.clone(),
+                c: args.c,
+                s,
+                entry: entry.to_string(),
+                arm: "production",
+                runs: args.runs,
+                out_sha256: out_digests[0].clone(),
+                state_sha256: state_digests[0].clone(),
+                distinct_out_sha256: distinct_out,
+                distinct_state_sha256: distinct_state,
+                first_divergent_run: first_divergent,
+                run_out_sha256: out_digests,
+                run_state_sha256: state_digests,
+                verdict: if pass { "PASS" } else { "FAIL" },
+            });
+        }
     }
-    stream.synchronize()?;
-    let host: Vec<f32> = stream.clone_dtoh(&dbg)?;
-    ensure!(
-        host.len() == total,
-        "dump is {} floats, expected {total}",
-        host.len()
-    );
-
-    for (name, off, rows, cols) in DBG_STAGES {
-        let slice: Vec<f32> = if off == DBG_W_SENTINEL {
-            // W is written by each warp into its own (row tile, dk block) block.
-            let mut w = vec![0f32; 4 * 8 * 16 * 16];
-            for wm in 0..4usize {
-                for kblk in 0..8usize {
-                    let src = 8256 + (wm * 8 + kblk) * 256;
-                    let dst = (wm * 8 + kblk) * 256;
-                    w[dst..dst + 256].copy_from_slice(&host[src..src + 256]);
-                }
-            }
-            w
-        } else {
-            host[off..off + rows * cols].to_vec()
-        };
-        write_f32(
-            &args
-                .run_dir
-                .join(format!("{}.C{}.s{}.{name}.f32", fx.name, args.c, args.s)),
-            &slice,
-        )?;
-    }
-    let state: Vec<f32> = stream.clone_dtoh(&ds)?;
-    write_f32(&args.run_dir.join(format!("{}.state.f32", fx.name)), &state)?;
+    let verdict = if rows.iter().all(|r| r.verdict == "PASS") {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    let report = IdentityReport {
+        schema: SCHEMA_IDENTITY,
+        generated_utc: now_utc(),
+        clock: "cuda",
+        package: args.package.display().to_string(),
+        manifest_generated_utc: pkg.manifest.generated_utc.clone(),
+        files_sha256_verified: pkg.verified,
+        perturbation: PERTURBATION,
+        environment: env_receipt(false, device, true),
+        rows,
+        verdict,
+    };
+    let path = args.run_dir.join("IDENTITY.json");
+    let text = serde_json::to_string_pretty(&report)?;
+    std::fs::write(&path, text.as_bytes()).with_context(|| format!("write {}", path.display()))?;
     eprintln!(
-        "[debug] {} stages -> {}",
-        DBG_STAGES.len(),
-        args.run_dir.display()
+        "[identity] {} — {} rows, verdict {verdict}",
+        path.display(),
+        report.rows.len()
     );
+    // As in the numerics phase: the report is written whatever the verdict and the
+    // runner exits 0 unless the plumbing failed. The verdict is the caller's to read.
     Ok(())
 }
 
+/// What runs between two measured launches. Named in the report so the leg cannot be
+/// read as "the same launch 20 times into a quiet SM": a full-length P1 launch of the
+/// same entry on a SECOND stream over throwaway state and output buffers, then a
+/// synchronize of both streams. The measured launch therefore starts while another
+/// CTA is resident, and the host round-trip changes what the driver has already
+/// resident. Nothing it touches can reach the measured buffers.
+#[cfg(feature = "cuda")]
+const PERTURBATION: &str = "a full-length launch of the same entry on a second stream over \
+     throwaway S and out buffers, then synchronize(stream) + synchronize(second stream), \
+     before every measured launch";
+
 #[cfg(not(feature = "cuda"))]
-fn run_debug(_args: &DebugArgs) -> Result<()> {
-    anyhow::bail!("the debug phase needs the crate's cuda feature")
+fn run_identity(_args: &IdentityArgs) -> Result<()> {
+    anyhow::bail!("the identity phase needs the crate's cuda feature")
 }
 
 fn main() -> Result<()> {
@@ -2100,6 +2185,6 @@ fn main() -> Result<()> {
     match cli.phase {
         Phase::Numerics(a) => run_numerics(&a),
         Phase::Timing(a) => run_timing(&a),
-        Phase::Debug(a) => run_debug(&a),
+        Phase::Identity(a) => run_identity(&a),
     }
 }
