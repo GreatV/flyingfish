@@ -1,20 +1,12 @@
-//! GDN chunkwise P1 primitive gate runner — numerics and timing phases.
+//! GDN chunkwise P1 primitive gate runner: numerics, kernel timing, bit-identity and
+//! end-to-end engine timing.
 //!
 //! Frozen inputs: the P1 package given by `--package` (MANIFEST.json with a per-file
 //! SHA-256, `inputs/*.f32`, `truth/<case>.{out,state}.f64` and `gate_basis.json`).
-//! Every array is read from those bytes and verified against the manifest BEFORE it is
-//! used; nothing is regenerated from a seed, because the 1.25x comparison only isolates
-//! implementation error when both sides consume the same bytes (Codex-D, 07:28).
+//! Every array is read from those bytes and verified against the manifest before use.
 //!
-//! The candidate is measured against `truth/`, the FP64 oracle's own out/state: the
-//! basis in gate_basis.json is the CPU P1 model's error against that same array, so the
-//! two sides of the ratio share one reference. `reference/` in the package holds the CPU
-//! model's OUTPUTS; measuring against those would add the model's error to the candidate's
-//! and compare the sum with 1.25x of one of its terms. It is not in the manifest's file
-//! list, is not verified here and is not read.
-//!
-//! Gate (4d, 2026-10-13T07:06:44Z, item 2), per fixture x chunk C x split s, against
-//! the FP64 reference and pre-registered from the CPU P1 model:
+//! Numerics (4d, 2026-10-13T07:06:44Z, item 2), per fixture x chunk C x split s,
+//! against the FP64 oracle and pre-registered from the CPU P1 model:
 //!   out_max_abs <= 1.25x model, out_rel_rms <= 1.25x model,
 //!   state_rel_rms <= 1.25x model, frac_le_1ulp >= model - 0.02,
 //!   every value finite, every length and head present. A quantity whose basis is
@@ -27,7 +19,7 @@
 //! the local BF16 ULP of each REFERENCE element, 2^(floor(log2|x|) - 7) and 2^-133 on
 //! the subnormal grid below 2^-126.
 //!
-//! Timing phase (§F): the NULL band (main core vs itself, same ABBA block structure)
+//! Kernel timing (§F): the NULL band (main core vs itself, same ABBA block structure)
 //! is computed and WRITTEN BEFORE any P1 timing is compared against it. 12 paired
 //! ABBA blocks per configuration; the per-block statistic is the mean of the two legs
 //! of log(t_B) - log(t_A); the acceptance band is
@@ -80,6 +72,10 @@ enum Phase {
     /// Launch one P1 entry >=N times from identical device inputs and byte-compare
     /// out and state across the launches (the kernel gate's bit-identity leg).
     Identity(IdentityArgs),
+    /// End-to-end engine timing: one model load per process, CUDA events around
+    /// prefill and decode only. Arms are separate processes (the planner derives the
+    /// core), so a driver interleaves process pairs.
+    E2e(E2eArgs),
 }
 
 #[derive(Parser)]
@@ -102,6 +98,102 @@ struct IdentityArgs {
     /// Only these fixtures (default: every fixture in the manifest).
     #[arg(long, value_delimiter = ',')]
     case: Vec<String>,
+}
+
+#[derive(Parser)]
+struct E2eArgs {
+    /// Model directory.
+    #[arg(long)]
+    model: PathBuf,
+    /// Runtime directory for this process.
+    #[arg(long)]
+    runtime_dir: PathBuf,
+    /// JSON array of token ids to prefill.
+    #[arg(long)]
+    tokens_file: PathBuf,
+    /// Output record path.
+    #[arg(long)]
+    output: PathBuf,
+    /// Arm label written into the record.
+    #[arg(long)]
+    label: String,
+    #[arg(long, default_value_t = 20000)]
+    capacity: usize,
+    /// Measured prefill repetitions, each from a reset.
+    #[arg(long, default_value_t = 4)]
+    prefill_reps: usize,
+    /// Decode steps measured after each prefill repetition.
+    #[arg(long, default_value_t = 16)]
+    decode_steps: usize,
+    /// Prefill chunk size in rows; None uses the planner's admitted chunk.
+    #[arg(long)]
+    chunk: Option<usize>,
+}
+
+#[cfg(feature = "cuda")]
+fn run_e2e(a: &E2eArgs) -> Result<()> {
+    use flyingfish::model::Model;
+    use std::time::Instant;
+    ensure!(a.prefill_reps > 0 && a.decode_steps > 0, "positive reps");
+    let ids: Vec<u32> =
+        serde_json::from_slice(&std::fs::read(&a.tokens_file)?).context("tokens file")?;
+    ensure!(
+        !ids.is_empty() && ids.len() + 64 <= a.capacity,
+        "tokens vs capacity"
+    );
+    let settings = flyingfish::backend::Settings {
+        tree_builder: flyingfish::backend::TreeBuilder::Waves,
+        spec_budget: flyingfish::backend::SpecBudget::Chain,
+        draft_model: None,
+        spec_graph: true,
+        runtime_dir: Some(a.runtime_dir.clone()),
+        prefix_cache: false,
+    };
+    let started = Instant::now();
+    let mut model = Model::load(&a.model, 0, a.capacity, a.chunk, settings)?;
+    let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // One discarded prefill+decode warms caches and graphs; reset is the Q38-native
+    // clean state for measurement.
+    model.reset()?;
+    let _ = model.prefill(&ids, None)?;
+    for _ in 0..4 {
+        model.step(false)?;
+    }
+    model.reset()?;
+    let mut prefill_gpu_ms = Vec::new();
+    let mut decode_gpu_ms = Vec::new();
+    for _ in 0..a.prefill_reps {
+        model.reset()?;
+        let begin = model.event()?;
+        let end = model.event()?;
+        model.record(&begin)?;
+        model.prefill(&ids, None)?;
+        model.record(&end)?;
+        end.synchronize()?;
+        prefill_gpu_ms.push(begin.elapsed_ms(&end)? as f64);
+        let dbegin = model.event()?;
+        let dend = model.event()?;
+        model.record(&dbegin)?;
+        for _ in 0..a.decode_steps {
+            model.step(false)?;
+        }
+        model.record(&dend)?;
+        dend.synchronize()?;
+        decode_gpu_ms.push(dbegin.elapsed_ms(&dend)? as f64 / a.decode_steps as f64);
+    }
+    let out = serde_json::json!({
+        "label": a.label, "tokens": ids.len(), "load_ms": load_ms,
+        "prefill_gpu_ms": prefill_gpu_ms, "decode_step_gpu_ms": decode_gpu_ms,
+        "decode_steps": a.decode_steps, "capacity": a.capacity, "chunk": a.chunk,
+    });
+    std::fs::write(&a.output, serde_json::to_vec_pretty(&out)?)?;
+    println!("{}", serde_json::to_string(&out)?);
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_e2e(_a: &E2eArgs) -> Result<()> {
+    anyhow::bail!("the e2e phase needs the crate's cuda feature")
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
@@ -2186,5 +2278,6 @@ fn main() -> Result<()> {
         Phase::Numerics(a) => run_numerics(&a),
         Phase::Timing(a) => run_timing(&a),
         Phase::Identity(a) => run_identity(&a),
+        Phase::E2e(a) => run_e2e(&a),
     }
 }

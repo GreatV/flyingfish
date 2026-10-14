@@ -149,16 +149,6 @@ impl WorkspaceBudget {
         request: WorkspaceRequest,
         workspace: impl Fn(usize) -> Result<usize>,
     ) -> Result<Self> {
-        Self::with_default_chunk(request, workspace, Ok)
-    }
-
-    /// Select only a smaller admitted default; explicit requests retain their
-    /// original validation. All workspace accounting uses the final selection.
-    pub(crate) fn with_default_chunk(
-        request: WorkspaceRequest,
-        workspace: impl Fn(usize) -> Result<usize>,
-        select: impl FnOnce(usize) -> Result<usize>,
-    ) -> Result<Self> {
         let WorkspaceRequest {
             capacity,
             requested,
@@ -207,14 +197,11 @@ impl WorkspaceBudget {
                 let tiles = row_limit / alignment;
                 alignment * (1usize << (usize::BITS - 1 - tiles.leading_zeros()))
             };
-            let selected = select(admitted)?;
             ensure!(
-                selected > 0
-                    && selected <= admitted
-                    && (selected == admitted || selected.is_multiple_of(alignment)),
+                admitted > 0 && (admitted == row_limit || admitted.is_multiple_of(alignment)),
                 "default chunk selection must preserve admission and alignment"
             );
-            selected
+            admitted
         };
         let scratch = workspace(chunk)?;
         Ok(Self {
@@ -235,9 +222,8 @@ impl WorkspaceBudget {
 }
 
 #[cfg(test)]
-mod default_chunk_tests {
+mod admission_tests {
     use super::*;
-    use crate::gdn_plan::GdnPolicy;
 
     fn request(capacity: usize, requested: Option<usize>, free: usize) -> WorkspaceRequest {
         WorkspaceRequest {
@@ -250,93 +236,43 @@ mod default_chunk_tests {
             fixed_transient_bytes: 512,
         }
     }
-    /// The landed default-chunk policy: the admitted chunk is used as admitted. The
-    /// former clamp to the last scan bucket is gone with the scan buckets, so the
-    /// policy argument is no longer consulted.
-    fn choose(_policy: GdnPolicy, admitted: usize) -> Result<usize> {
-        Ok(admitted)
-    }
+
+    /// The default chunk is the memory-admitted row limit rounded DOWN to the
+    /// alignment; an explicit request is honoured up to that same limit.
     #[test]
-    fn qualified_defaults_retain_capacity_and_exact_budget() -> Result<()> {
+    fn default_chunk_is_the_admitted_limit_rounded_down() -> Result<()> {
         for capacity in [
-            1, 17, 31, 32, 511, 512, 513, 1021, 1024, 2047, 2048, 2049, 4096, 8192, 33024,
+            1, 17, 31, 32, 511, 512, 513, 1021, 1024, 2047, 2048, 2049, 4096, 8192,
         ] {
             for free in [11_000, 14_000, 25_000, 160_000] {
-                let old = WorkspaceBudget::new(request(capacity, None, free), |r| Ok(8 * r))?;
-                let policy = GdnPolicy::for_device(89, 128);
-                let selected = WorkspaceBudget::with_default_chunk(
-                    request(capacity, None, free),
-                    |r| Ok(8 * r),
-                    |r| choose(policy, r),
-                )?;
-                assert_eq!(selected.plan.chunk, choose(policy, old.plan.chunk)?);
-                assert_eq!(selected.plan.row_limit, old.plan.row_limit);
-                assert_eq!(selected.plan.requested_chunk, None);
-                assert_eq!(selected.operator_workspace_bytes, 8 * selected.plan.chunk);
-                assert_eq!(
-                    selected.planned_transient_bytes,
-                    12 * selected.plan.chunk + 512
-                );
-                assert!(selected.planned_transient_bytes <= old.planned_transient_bytes);
+                let budget = WorkspaceBudget::new(request(capacity, None, free), |r| Ok(8 * r))?;
+                let chunk = budget.plan.chunk;
+                assert!(chunk > 0 && chunk <= budget.plan.row_limit);
+                assert!(chunk == budget.plan.row_limit || chunk.is_multiple_of(32));
+                assert_eq!(budget.plan.requested_chunk, None);
+                assert_eq!(budget.operator_workspace_bytes, 8 * chunk);
+                assert_eq!(budget.planned_transient_bytes, 4 * chunk + 512 + 8 * chunk);
             }
         }
         Ok(())
     }
+
     #[test]
-    fn no_b_devices_keep_every_budget_field() -> Result<()> {
-        for (arch, sms) in [(86, 48), (86, 128), (89, 127), (89, 132), (90, 128)] {
-            for capacity in [17, 511, 512, 2048, 8192, 33024] {
-                let old = WorkspaceBudget::new(request(capacity, None, 160_000), |r| Ok(8 * r))?;
-                let new = WorkspaceBudget::with_default_chunk(
-                    request(capacity, None, 160_000),
-                    |r| Ok(8 * r),
-                    |r| choose(GdnPolicy::for_device(arch, sms), r),
-                )?;
-                assert_eq!(serde_json::to_value(old)?, serde_json::to_value(new)?);
-            }
-        }
-        Ok(())
-    }
-    #[test]
-    fn explicit_requests_bypass_policy_and_keep_errors() -> Result<()> {
-        for rows in [6, 511, 2048, 8192] {
-            let old = WorkspaceBudget::new(request(33024, Some(rows), 160_000), |r| Ok(8 * r))?;
-            let new = WorkspaceBudget::with_default_chunk(
-                request(33024, Some(rows), 160_000),
-                |r| Ok(8 * r),
-                |_| panic!("explicit override reached default policy"),
-            )?;
-            assert_eq!(serde_json::to_value(old)?, serde_json::to_value(new)?);
-        }
+    fn every_budget_field_is_carried_and_requests_are_bounded() -> Result<()> {
+        let budget = WorkspaceBudget::new(request(8192, Some(2048), 160_000), |r| Ok(8 * r))?;
+        assert_eq!(budget.plan.chunk, 2048);
+        assert_eq!(budget.plan.requested_chunk, Some(2048));
+        assert_eq!(budget.plan.free_bytes, 160_000);
+        assert_eq!(budget.plan.reserve_bytes, 160_000 / 16);
+        assert_eq!(budget.plan.row_bytes, 4);
+        assert_eq!(budget.plan.alignment, 32);
+        assert_eq!(budget.accounting, "free_after_resident");
         assert!(
-            WorkspaceBudget::with_default_chunk(
-                request(8192, Some(8193), 160_000),
-                |r| Ok(8 * r),
-                Ok
-            )
-            .is_err()
+            WorkspaceBudget::new(request(8192, Some(1 << 20), 160_000), |r| Ok(8 * r)).is_err()
         );
-        assert!(
-            WorkspaceBudget::with_default_chunk(
-                request(33024, Some(8192), 11_000),
-                |r| Ok(8 * r),
-                Ok
-            )
-            .is_err()
-        );
+        assert!(WorkspaceBudget::new(request(8192, Some(0), 160_000), |r| Ok(8 * r)).is_err());
+        assert!(WorkspaceBudget::new(request(0, None, 160_000), |r| Ok(8 * r)).is_err());
+        assert!(WorkspaceBudget::new(request(8192, None, 1), |r| Ok(8 * r)).is_err());
         Ok(())
-    }
-    #[test]
-    fn invalid_policy_cannot_expand_or_unalign() {
-        for chosen in [0, 2049, 16384] {
-            assert!(
-                WorkspaceBudget::with_default_chunk(
-                    request(8192, None, 160_000),
-                    |r| Ok(8 * r),
-                    |_| Ok(chosen)
-                )
-                .is_err()
-            );
-        }
     }
 }

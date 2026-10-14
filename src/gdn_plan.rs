@@ -52,8 +52,7 @@ impl GdnPolicy {
             0
         }
     }
-    /// The plan identity this build reports: the P1 core is the prefill route above
-    /// the verify floor, and the plan id names it.
+    /// The plan id: the P1-named route where prefill_p1_split is prepared.
     pub const fn identity(self) -> &'static str {
         if self.prefill_p1_split != 0 {
             "gdn-plan-v3-c32-vs1-fp32-p1s4-w32"

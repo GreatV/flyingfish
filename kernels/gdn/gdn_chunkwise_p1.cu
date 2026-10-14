@@ -1,12 +1,9 @@
 // =====================================================================================
 // Q38 GDN chunkwise prefill, phase-2 precision protocol candidate P1. C = 64.
+// Separate entry points on module gdn/gdn_chunkwise_p1; the shipped recursive core
+// (gdn_chunked_core_v1) is a different module.
 //
-// ADDITIVE. The shipped recursive core (kernels/gdn/gdn_chunked.cu,
-// gdn_chunked_core_v1) and its dispatch are untouched; this is a separate entry
-// point on a separate module (gdn/gdn_chunkwise_p1).
-//
-// Structure, function for function against the CPU numerics reference
-// (gdn_phase2_model_w.py), which is what the GPU round will diff this against:
+// Pipeline, per the CPU numerics reference gdn_phase2_model_w.py:
 //
 //   per chunk, ONCE per head          _chunk_shared
 //     G_j   = within-chunk cumsum of g, FP32                     -> sG
@@ -398,8 +395,7 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
         // by a barrier; and each row must be substituted once — repeating the pass over
         // all rows re-applies it to values that are already T and destroys them.
         // ONE THREAD PER DIAGONAL BLOCK: the block index is the thread id, so each
-        // sA row has exactly one writer; the former `tid < P1_C` / `tid >> 4` form had
-        // sixteen threads computing the same row and writing the same addresses. The
+        // sA row has exactly one writer: the block index is the thread id. The
         // arithmetic per row is unchanged, so the stored bits are unchanged.
         for (int rr = 1; rr < P1_SUB; ++rr) {
             if (tid < P1_C / P1_SUB) {

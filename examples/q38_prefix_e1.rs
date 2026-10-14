@@ -52,11 +52,10 @@ struct Args {
     transfer_bytes: usize,
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
-    /// Prefill chunk size in rows; the engine's own default (None) keeps the
-    /// planner's admitted chunk. Above the scan range (2048) the non-scan prefill
-    /// plan carries the chunkwise-P1 core and the narrowed sub_scan plan covers
-    /// 5..2048-row steps; at or below it every prefill step is a scan-bucket or a
-    /// small plan and P1 never runs.
+    /// Prefill chunk size in rows. None (the default) uses the planner's admitted
+    /// chunk. On a qualified device every prefill step of more than 4 rows runs the
+    /// chunkwise-P1 core; steps of 1..=4 keep the shipped core that MTP verify
+    /// requires.
     #[arg(long)]
     chunk: Option<usize>,
     #[arg(long)]

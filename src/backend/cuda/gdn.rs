@@ -118,7 +118,6 @@ pub(crate) struct GdnBindings {
     pub history: TensorMut<f32, 2>,
 }
 
-
 struct Kernels {
     conv: CudaFunction,
     hist_update: CudaFunction,
@@ -172,10 +171,8 @@ pub(crate) struct GdnPlan {
     chunked_cfg: LaunchConfig,
     recurrent_cfg: LaunchConfig,
     /// Protocol §A value split of the prepared chunkwise P1 core, 0 when the plan
-    /// keeps the shipped recursive core. Prepared only for a plan bound above
-    /// `gdn_plan::SCAN_MAX_ROWS` rows (`GdnPolicy::p1_split_for_step`), and fixed in
-    /// `prepare`, like every other grid property, so a captured Graph replays an
-    /// identical launch sequence.
+    /// keeps the shipped recursive core. Fixed in `prepare`, like every other grid
+    /// property, so a captured Graph replays an identical launch sequence.
     p1_split: u32,
 }
 
@@ -1736,14 +1733,7 @@ mod gpu_probe {
     ) -> Result<()> {
         let s = &device.stream;
         let b = bindings(c, s, swap_gates)?;
-        let plan = GdnOps::prepare(
-            &device.ctx,
-            &GdnSpec::q38(),
-            c.man.plan_rows,
-            b,
-            common,
-            0,
-        )?;
+        let plan = GdnOps::prepare(&device.ctx, &GdnSpec::q38(), c.man.plan_rows, b, common, 0)?;
         let (meta_buf, meta) = meta_device(
             s,
             c.man.prefix,
