@@ -3,13 +3,17 @@ use super::*;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
-    gdn::{GdnBindings, GdnOps, GdnPlan},
+    gdn::{CUDA_GRID_YZ_MAX, GdnBindings, GdnOps, GdnPlan},
     linear::{LayerLinearPlan, LinearWeightRef},
     ops::{CommonOpsRef, GatedRmsInput, ResidualRmsInput, RmsMode, RmsOptions},
     weights::WeightCatalog,
 };
 /// Default prefill chunk ceiling in rows; an explicit `--chunk` is not clamped.
 const DEFAULT_CHUNK_ROWS: usize = 2048;
+/// The default chunk is bounded by the CUDA gridDim.y/z limit the GDN prep pair launches rows on.
+fn default_chunk(admitted: usize) -> usize {
+    admitted.min(CUDA_GRID_YZ_MAX as usize)
+}
 
 use crate::gdn_plan::GdnPolicy;
 use crate::{
@@ -831,7 +835,7 @@ impl Engine {
             },
             |admitted| {
                 admitted_default_chunk = Some(admitted);
-                Ok(admitted.min(DEFAULT_CHUNK_ROWS))
+                Ok(default_chunk(admitted).min(DEFAULT_CHUNK_ROWS))
             },
         )?;
         let rows = budget.plan.chunk;
@@ -1400,6 +1404,14 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    use super::{CUDA_GRID_YZ_MAX, default_chunk};
+
+    #[test]
+    fn the_default_chunk_is_bounded_by_the_cuda_grid_yz_limit() {
+        assert_eq!(default_chunk(100_000), CUDA_GRID_YZ_MAX as usize);
+        assert_eq!(default_chunk(500), 500);
+    }
+
     /// A stand-in plan recording the rows it was narrowed to, so selection is testable without a device.
     #[derive(Clone, Debug, PartialEq)]
     struct FakePlan {
