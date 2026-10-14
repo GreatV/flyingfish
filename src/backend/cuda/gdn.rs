@@ -440,8 +440,7 @@ impl GdnOps {
             recurrent: f_recurrent,
             p1,
         };
-        // Grids are functions of the rows the plan binds, never of the device
-        // valid_rows, so a captured Graph replays an identical launch sequence.
+        // Grids derive from the rows the plan binds, never from device valid_rows, so a captured Graph replays an identical launch sequence.
         let (prep_cfg, beta_cfg, conv_cfg) = prep_grids(
             LaunchConfig {
                 grid_dim: (DV.div_ceil(PREP_THREADS), HV, 1),

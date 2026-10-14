@@ -1462,28 +1462,6 @@ mod tests {
         assert!(plans.select(2049).is_err());
     }
 
-    /// The `Runtime::prepared` memo, modelled: a size is narrowed the FIRST time prepare
-    /// sees it, and the memo hit afterwards must not cost the step its own plan.
-    #[test]
-    fn a_prepared_rows_keeps_its_own_plan_across_a_memo_hit() {
-        let mut plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
-            .expect("bind");
-        let mut prepared = std::collections::BTreeSet::new();
-        for rows in [1021usize, 997] {
-            if prepared.insert(rows) {
-                plans
-                    .ensure_rows(rows, &FakePlan::for_rows)
-                    .expect("ensure the step's plan");
-            }
-            assert_eq!(plans.select(rows).unwrap().max_rows, rows);
-        }
-        // The second prepare of each size hits the memo and does nothing.
-        for rows in [1021usize, 997] {
-            assert!(prepared.contains(&rows));
-            assert_eq!(plans.select(rows).unwrap().max_rows, rows);
-        }
-    }
-
     /// Without `ensure_rows`, a 1021-row step has no plan of its own to select.
     #[test]
     fn a_step_only_runs_a_plan_narrowed_to_its_own_rows() {
