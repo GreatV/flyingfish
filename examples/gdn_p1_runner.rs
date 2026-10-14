@@ -510,6 +510,13 @@ fn open_package(root: &Path) -> Result<Package> {
         let bytes = std::fs::metadata(&path)?.len();
         ensure!(
             bytes == t.bytes,
+            "{} is {bytes} B, the manifest says {} B",
+            t.path,
+            t.bytes
+        );
+        let bytes = std::fs::metadata(&path)?.len();
+        ensure!(
+            bytes == t.bytes,
             "{} is {bytes} B, manifest says {} B",
             t.path,
             t.bytes
@@ -545,9 +552,23 @@ fn open_package(root: &Path) -> Result<Package> {
         "gate basis schema {} is not {SCHEMA_BASIS}",
         basis_doc.schema
     );
+    ensure!(
+        (basis_doc.band - GATE_BAND).abs() <= 1e-12
+            && (basis_doc.ulp_floor - FRAC_FLOOR_MARGIN).abs() <= 1e-12,
+        "gate basis declares band {} and ulp_floor {}, not the registered {GATE_BAND} and {FRAC_FLOOR_MARGIN}",
+        basis_doc.band,
+        basis_doc.ulp_floor
+    );
     let mut basis = BTreeMap::new();
     for r in &basis_doc.rows {
-        basis.insert((r.case.clone(), r.c, r.s), r.clone());
+        let key = (r.case.clone(), r.c, r.s);
+        ensure!(
+            basis.insert(key.clone(), r.clone()).is_none(),
+            "gate_basis.json has two rows for {} C{} s{}; the second would overwrite the first",
+            r.case,
+            r.c,
+            r.s
+        );
     }
     Ok(Package {
         root: root.to_path_buf(),
@@ -978,13 +999,7 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
     let pkg = open_package(&args.package)?;
     std::fs::create_dir_all(&args.run_dir)
         .with_context(|| format!("create {}", args.run_dir.display()))?;
-    let fixtures: Vec<&Fixture> = pkg
-        .manifest
-        .fixtures
-        .iter()
-        .filter(|f| args.case.is_empty() || args.case.iter().any(|c| c == &f.name))
-        .collect();
-    ensure!(!fixtures.is_empty(), "no fixture selected");
+    let fixtures = select_fixtures(&pkg, &args.case)?;
 
     // The reference arrays for the configurations actually run, and the basis rows.
     let mut rows = Vec::new();
@@ -1230,6 +1245,14 @@ fn gate_row(
         s
     );
     ensure!(
+        basis.finite,
+        "gate basis row {} C{} s{}: the registered baseline is not finite, so no candidate \
+         can be measured against it",
+        fx.name,
+        c,
+        s
+    );
+    ensure!(
         (basis.frac_floor - (basis.frac_le_1ulp - FRAC_FLOOR_MARGIN)).abs()
             <= 1e-12 * basis.frac_le_1ulp.abs().max(1e-300),
         "gate basis row {} C{} s{}: frac_floor {} is not frac_le_1ulp {} - {FRAC_FLOOR_MARGIN}",
@@ -1296,8 +1319,25 @@ fn gate_row(
     })
 }
 
-/// The multi-chunk condition: every C evaluated must have at least one fixture of more
-/// than one chunk that passes.
+/// The multi-chunk condition: every C evaluated must have at least one passing fixture of more than one chunk.
+/// The fixtures a `--case` selection names; every name must match, so a typo cannot quietly shrink the run.
+fn select_fixtures<'a>(pkg: &'a Package, case: &[String]) -> Result<Vec<&'a Fixture>> {
+    let chosen: Vec<&Fixture> = pkg
+        .manifest
+        .fixtures
+        .iter()
+        .filter(|f| case.is_empty() || case.iter().any(|c| c == &f.name))
+        .collect();
+    for name in case {
+        ensure!(
+            pkg.manifest.fixtures.iter().any(|f| &f.name == name),
+            "--case {name} is not a fixture in the manifest"
+        );
+    }
+    ensure!(!chosen.is_empty(), "no fixture selected");
+    Ok(chosen)
+}
+
 fn multi_chunk_condition(rows: &[GateRow], c: u32) -> MultiChunk {
     let mut multi: Vec<String> = Vec::new();
     let mut passing: Vec<String> = Vec::new();
@@ -1482,12 +1522,12 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
             let _ = leg;
             time_leg(gpu.as_ref(), fx, &arrays, which, s)
         });
-        let null = freeze_null_band(&null_blocks, args, s)?;
         let band_path = args.run_dir.join(format!(
             "NULL_BAND.C{}.s{s}.{}.json",
             args.c,
             baseline.slug()
         ));
+        let null = freeze_null_band(&null_blocks, &band_path)?;
         std::fs::write(&band_path, serde_json::to_string_pretty(&null)?.as_bytes())
             .with_context(|| format!("write {}", band_path.display()))?;
 
@@ -1503,12 +1543,25 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
             },
         );
         let series = summarise(&p1_blocks, args.blocks as usize * 4, comparison_label);
+        let unfinites = p1_blocks
+            .iter()
+            .filter(|b| !(b.log_ratio.is_finite() && b.a_ms.is_finite() && b.b_ms.is_finite()))
+            .count();
         let (verdict, reason) = if !null.valid {
             (
                 "INVALID",
                 format!(
                     "the null band is not usable ({}) so the comparison is reported, not read",
                     null.invalid_reason.clone().unwrap_or_default()
+                ),
+            )
+        } else if unfinites > 0 || !(series.ci_low.is_finite() && series.ci_high.is_finite()) {
+            (
+                "INVALID",
+                format!(
+                    "{unfinites} candidate block(s) produced no finite duration and the CI \
+                     bounds are {}/{}, so the comparison is invalid rather than negative",
+                    series.ci_low, series.ci_high
                 ),
             )
         } else {
@@ -1544,9 +1597,7 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
     Ok(())
 }
 
-/// The verdict in the ratio's own direction: `log_ratio` is log(t_P1/t_main), so a
-/// faster candidate is a ratio BELOW 1 and clears when the whole CI sits under
-/// 1 - band. A straddling CI does not clear.
+/// `log_ratio` is log(t_P1/t_main), so a faster candidate is a ratio below 1 and clears when the whole CI sits under 1 - band; a straddle does not clear.
 fn timing_verdict(series: &LegSeries, band: f64) -> (&'static str, String) {
     if series.ci_high < 1.0 - band {
         (
@@ -1612,9 +1663,7 @@ fn stub_duration(which: Which, s: u32) -> f64 {
     base * (1.0 + 0.01 * ((s % 4) as f64 - 1.5) / 1.5)
 }
 
-/// Four legs per block in A B B A order; the per-block statistic is the mean of the two
-/// paired log ratios, (leg0 A, leg1 B) and (leg2 B, leg3 A), as protocol §F registers it.
-/// `a_ms` and `b_ms` are the two legs' arithmetic means, reported as durations.
+/// Four legs per block in A B B A order; the per-block statistic is the mean of the two paired log ratios, (leg0 A, leg1 B) and (leg2 B, leg3 A), as protocol §F registers it, and `a_ms`/`b_ms` are the legs' arithmetic means.
 fn abba<F>(clock: Clock, blocks: u32, a: Which, b: Which, mut leg: F) -> Vec<BlockStat>
 where
     F: FnMut(Which, usize) -> Result<f64>,
@@ -1663,7 +1712,7 @@ where
     out
 }
 
-fn freeze_null_band(blocks: &[BlockStat], args: &TimingArgs, s: u32) -> Result<NullBand> {
+fn freeze_null_band(blocks: &[BlockStat], band_path: &Path) -> Result<NullBand> {
     let n = blocks.len() as f64;
     let lr: Vec<f64> = blocks.iter().map(|b| b.log_ratio).collect();
     let finite = lr.iter().all(|x| x.is_finite());
@@ -1718,7 +1767,7 @@ fn freeze_null_band(blocks: &[BlockStat], args: &TimingArgs, s: u32) -> Result<N
         band,
         valid: invalid.is_none(),
         invalid_reason: invalid,
-        band_written_to: format!("NULL_BAND.C{}.s{s}.json", args.c),
+        band_written_to: band_path.display().to_string(),
     })
 }
 
@@ -2069,24 +2118,22 @@ impl Gpu {
             }
             Ok(())
         };
-        // The perturbation's own state and output, which no measured run reads, on a
-        // SECOND stream so the measured launch starts with another CTA resident.
+        // The perturbation's own buffers on a second stream; the measured launch is enqueued while the filler is still running.
         let perturb_stream = self.ctx.new_stream()?;
         let mut ds_filler = self.stream.clone_htod(&arrays.s0)?;
         let dout_filler = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
         let mut out_digests = Vec::with_capacity(runs as usize);
         let mut state_digests = Vec::with_capacity(runs as usize);
         for run in 1..=runs {
-            self.stream.synchronize()?;
-            launch(&perturb_stream, &mut ds_filler, &dout_filler)?;
-            launch(&perturb_stream, &mut ds_filler, &dout_filler)?;
-            self.stream.synchronize()?;
-            perturb_stream.synchronize()?;
-            // Fresh inputs for this run: S0 re-uploaded, out zeroed.
+            // Fresh inputs for this run, uploaded and drained before anything is enqueued.
             let mut ds = self.stream.clone_htod(&arrays.s0)?;
             let mut dout = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
+            self.stream.synchronize()?;
+            launch(&perturb_stream, &mut ds_filler, &dout_filler)?;
+            launch(&perturb_stream, &mut ds_filler, &dout_filler)?;
             launch(&self.stream, &mut ds, &mut dout)?;
             self.stream.synchronize()?;
+            perturb_stream.synchronize()?;
             let out: Vec<half::bf16> = self.stream.clone_dtoh(&dout)?;
             let state: Vec<f32> = self.stream.clone_dtoh(&ds)?;
             let out_bytes: Vec<u8> = out.iter().flat_map(|b| b.to_ne_bytes()).collect();
@@ -2254,13 +2301,7 @@ fn run_identity(args: &IdentityArgs) -> Result<()> {
     let pkg = open_package(&args.package)?;
     std::fs::create_dir_all(&args.run_dir)
         .with_context(|| format!("create {}", args.run_dir.display()))?;
-    let fixtures: Vec<&Fixture> = pkg
-        .manifest
-        .fixtures
-        .iter()
-        .filter(|f| args.case.is_empty() || args.case.iter().any(|c| c == &f.name))
-        .collect();
-    ensure!(!fixtures.is_empty(), "no fixture selected");
+    let fixtures = select_fixtures(&pkg, &args.case)?;
     let gpu = Gpu::open()?;
     let device = device_of(Some(&gpu));
 
@@ -2343,9 +2384,7 @@ fn run_identity(args: &IdentityArgs) -> Result<()> {
 /// What runs between two measured launches; it touches only throwaway buffers, so the
 /// measured launch starts while another CTA is resident.
 #[cfg(feature = "cuda")]
-const PERTURBATION: &str = "a full-length launch of the same entry on a second stream over \
-     throwaway S and out buffers, then synchronize(stream) + synchronize(second stream), \
-     before every measured launch";
+const PERTURBATION: &str = "two full-length launches of the same entry on a second stream over throwaway S and out buffers, enqueued before the measured launch on the main stream and not joined until after it, then synchronize(stream) + synchronize(second stream), before every measured launch is read";
 
 #[cfg(not(feature = "cuda"))]
 fn run_identity(args: &IdentityArgs) -> Result<()> {
@@ -2367,8 +2406,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// `blocks` ABBA blocks of constant per-arm durations with a fixed +/-0.4% jitter,
-    /// so the CI has width and the direction of the test is the verdict's alone.
+    /// `blocks` ABBA blocks of constant per-arm durations with a fixed +/-0.4% jitter, so the CI has width.
     fn series_for(blocks: u32, a_ms: f64, b_ms: f64) -> LegSeries {
         let blocks = abba(
             Clock::Stub,
@@ -2399,8 +2437,7 @@ mod tests {
 
     #[test]
     fn the_block_statistic_is_the_mean_of_the_paired_log_ratios() {
-        // One block, A B B A: main 1.0 then 4.0, P1 2.0 then 1.0. The paired log
-        // ratios are log(2/1) and log(1/4); log(mean B / mean A) is a different number.
+        // One block, A B B A: main 1.0 then 4.0, P1 2.0 then 1.0; the paired log ratios are log(2/1) and log(1/4), and log(mean B / mean A) is a different number.
         let blocks = abba(Clock::Stub, 1, Which::Main, Which::P1, |w, leg| {
             Ok(match (w, leg) {
                 (Which::Main, 0) => 1.0,
