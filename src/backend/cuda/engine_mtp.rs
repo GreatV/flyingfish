@@ -425,7 +425,7 @@ impl MtpRuntime {
         );
         let attention = self
             .attention
-            .get(&rows)
+            .get(&linear_rows)
             .context("MTP rows were not bound before Ready")?;
         ensure!(
             device_hidden.is_some() || hidden.len() == rows * HIDDEN,

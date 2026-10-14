@@ -353,23 +353,6 @@ pub(crate) fn attachment_bytes(
     })
 }
 
-#[cfg(any(feature = "cuda", test))]
-pub(crate) fn bootstrap_rows(prompt: usize, chunk: usize) -> Result<Vec<usize>> {
-    ensure!(prompt > 0 && chunk > 0, "empty MTP bootstrap shape");
-    let mut rows = std::collections::BTreeSet::from([1]);
-    let first = prompt.min(chunk);
-    if first > 1 {
-        rows.insert(first - 1);
-    }
-    let mut remaining = prompt - first;
-    while remaining > 0 {
-        let count = remaining.min(chunk);
-        rows.insert(count);
-        remaining -= count;
-    }
-    Ok(rows.into_iter().collect())
-}
-
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct MtpMemory {
     pub weights: usize,
@@ -543,12 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_tails_and_attachment_share_the_workspace_budget() -> Result<()> {
-        assert_eq!(bootstrap_rows(1, 16)?, [1]);
-        assert_eq!(bootstrap_rows(16, 16)?, [1, 15]);
-        assert_eq!(bootstrap_rows(17, 16)?, [1, 15]);
-        assert_eq!(bootstrap_rows(33, 16)?, [1, 15, 16]);
-        assert_eq!(bootstrap_rows(53, 16)?, [1, 5, 15, 16]);
+    fn snapshot_and_attachment_bytes_share_the_workspace_budget() -> Result<()> {
         let s = spec();
         assert_eq!(snapshot_bytes(&s)?, 627572736);
         for capacity in [4096, 131072] {
@@ -625,19 +603,6 @@ mod tests {
 #[cfg(test)]
 mod resident_tests {
     use super::*;
-    #[test]
-    fn resident_shapes_cover_every_first_and_tail_partition() -> Result<()> {
-        for chunk in [4, 16, 32, 2048] {
-            for prompt in 1..=3 * chunk + 1 {
-                assert!(
-                    bootstrap_rows(prompt, chunk)?
-                        .iter()
-                        .all(|&r| (1..=chunk).contains(&r))
-                );
-            }
-        }
-        Ok(())
-    }
     #[test]
     fn request_reserves_next_slot_and_rejects_overflow() {
         assert!(check_request(31, 1, 32).is_ok());

@@ -337,19 +337,25 @@ impl Backend for Bound<'_> {
     }
 }
 
+/// The MTP row sizes bound before Ready: repair and head rows (1..=16) plus every bucketed tail-chunk size.
+fn mtp_bound_rows(chunk: usize) -> std::collections::BTreeSet<usize> {
+    let mut rows: std::collections::BTreeSet<usize> = (1..=chunk.min(16)).collect();
+    let mut bucket = 32usize;
+    while chunk > 16 && bucket < chunk {
+        rows.insert(bucket);
+        bucket *= 2;
+    }
+    rows.insert(chunk);
+    rows
+}
+
 impl Engine {
     #[cfg(test)]
     pub(in crate::backend::cuda::engine) fn mtp_enable(
         &mut self,
         options: MtpOptions,
     ) -> Result<()> {
-        self.mtp_enable_bound(options, &(1..=self.chunk).collect::<Vec<_>>())
-    }
-    pub(in crate::backend::cuda::engine) fn mtp_enable_resident(
-        &mut self,
-        options: MtpOptions,
-    ) -> Result<()> {
-        self.mtp_enable_bound(options, &(1..=self.chunk).collect::<Vec<_>>())
+        self.mtp_enable_bound(options)
     }
     pub(in crate::backend::cuda::engine) fn check_mtp_mode(&self, graph: bool) -> Result<()> {
         ensure!(
@@ -394,14 +400,13 @@ impl Engine {
         }
         result
     }
-    pub(in crate::backend::cuda::engine) fn mtp_enable_for_prompt(
+    pub(in crate::backend::cuda::engine) fn mtp_enable_resident(
         &mut self,
         options: MtpOptions,
-        prompt: usize,
     ) -> Result<()> {
-        self.mtp_enable_bound(options, &crate::mtp::bootstrap_rows(prompt, self.chunk)?)
+        self.mtp_enable_bound(options)
     }
-    fn mtp_enable_bound(&mut self, options: MtpOptions, rows: &[usize]) -> Result<()> {
+    fn mtp_enable_bound(&mut self, options: MtpOptions) -> Result<()> {
         options.validate()?;
         ensure!(
             self.qwen.is_some()
@@ -450,10 +455,7 @@ impl Engine {
             plan,
             1,
         )?;
-        for &rows in rows {
-            runtime.prepare_rows(&self.device, &catalog, &state, &self.blas, rows)?;
-        }
-        for rows in 1..=3.min(self.chunk) {
+        for rows in mtp_bound_rows(self.chunk) {
             runtime.prepare_rows(&self.device, &catalog, &state, &self.blas, rows)?;
         }
         let bootstrap = Bootstrap::new(&self.device.stream, self.chunk)?;
@@ -614,6 +616,57 @@ impl Engine {
 #[cfg(test)]
 #[path = "engine_mtp_chain_tests.rs"]
 pub(super) mod tests;
+
+#[cfg(test)]
+mod bound_rows_tests {
+    use super::super::bucketed_prefill_rows;
+    use super::mtp_bound_rows;
+    use anyhow::Result;
+
+    #[test]
+    fn the_bound_set_is_the_bucket_closure() {
+        let set = |rows: &[usize]| {
+            rows.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(mtp_bound_rows(4), set(&[1, 2, 3, 4]));
+        assert_eq!(mtp_bound_rows(16), set(&(1..=16).collect::<Vec<_>>()));
+        assert_eq!(
+            mtp_bound_rows(2048),
+            set(&[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128, 256, 512, 1024,
+                2048
+            ])
+        );
+        assert_eq!(
+            mtp_bound_rows(3000),
+            set(&[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128, 256, 512, 1024,
+                2048, 3000
+            ])
+        );
+    }
+
+    #[test]
+    fn every_request_row_maps_into_the_bound_set() -> Result<()> {
+        for chunk in [4usize, 16, 3000, 2048] {
+            let bound = mtp_bound_rows(chunk);
+            for rows in 1..=chunk {
+                let bucket = bucketed_prefill_rows(rows as u32, chunk as u32)? as usize;
+                assert!(
+                    bound.contains(&bucket),
+                    "chunk {chunk} rows {rows} map to unbound bucket {bucket}"
+                );
+            }
+            assert!(
+                bucketed_prefill_rows(chunk as u32 + 1, chunk as u32).is_err(),
+                "rows beyond the chunk must be rejected"
+            );
+        }
+        Ok(())
+    }
+}
 
 #[path = "engine_mtp_batched.rs"]
 mod batched;
