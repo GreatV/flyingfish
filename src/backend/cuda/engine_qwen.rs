@@ -18,7 +18,7 @@ use crate::{
     op_contract::{AttentionLimits, ExecutionPhase, FullAttentionSpec},
 };
 use cudarc::driver::{CudaFunction, DevicePtr};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 fn all_layers(trace: &Option<Target<'_>>) -> bool {
     trace.as_ref().is_some_and(|t| t.trace.all_layers)
@@ -73,9 +73,21 @@ enum BoundMixer {
 struct PrefillPlans<T> {
     full: Box<T>,
     small: Vec<T>,
-    /// One narrowed plan per distinct step size, bound in `prepare` before the step runs.
-    by_rows: BTreeMap<usize, T>,
     max_rows: usize,
+}
+/// Either a snapshot-bound plan borrowed as-is or a plan narrowed at dispatch.
+enum Narrowed<'a, T> {
+    Borrowed(&'a T),
+    Owned(T),
+}
+impl<T> std::ops::Deref for Narrowed<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        match self {
+            Narrowed::Borrowed(plan) => plan,
+            Narrowed::Owned(plan) => plan,
+        }
+    }
 }
 impl<T> PrefillPlans<T> {
     fn bind(full: T, max_rows: usize, narrow: impl Fn(&T, u32) -> Result<T>) -> Result<Self> {
@@ -86,33 +98,23 @@ impl<T> PrefillPlans<T> {
         Ok(Self {
             full: Box::new(full),
             small,
-            by_rows: BTreeMap::new(),
             max_rows,
         })
     }
-    /// Narrow the full plan to `rows` once; 1..=4 keep the snapshot-bound `small` plans.
-    fn ensure_rows(&mut self, rows: usize, narrow: &dyn Fn(&T, u32) -> Result<T>) -> Result<()> {
-        ensure!(
-            rows > 0 && rows <= self.max_rows,
-            "prefill rows outside binding"
-        );
-        if rows > 4 && !self.by_rows.contains_key(&rows) {
-            let plan = narrow(&self.full, rows as u32)?;
-            self.by_rows.insert(rows, plan);
-        }
-        Ok(())
-    }
-    fn select(&self, rows: usize) -> Result<&T> {
+    /// The plan narrowed to this step's live rows; 1..=4 keep the snapshot-bound small plans and larger sizes narrow host-side at dispatch.
+    fn select(
+        &self,
+        rows: usize,
+        narrow: &dyn Fn(&T, u32) -> Result<T>,
+    ) -> Result<Narrowed<'_, T>> {
         ensure!(
             rows > 0 && rows <= self.max_rows,
             "prefill rows outside binding"
         );
         if let Some(small) = self.small.get(rows - 1) {
-            return Ok(small);
+            return Ok(Narrowed::Borrowed(small));
         }
-        self.by_rows
-            .get(&rows)
-            .with_context(|| format!("no prefill plan was prepared for {rows} rows"))
+        Ok(Narrowed::Owned(narrow(&self.full, rows as u32)?))
     }
 }
 pub(super) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
@@ -462,8 +464,7 @@ impl Runtime {
         rows: u32,
         spec: &crate::model_spec::ModelSpec,
     ) -> Result<()> {
-        self.prepare_dimensions(blas, rows, spec.vocab, spec.hidden)?;
-        self.ensure_mixer_rows(rows)
+        self.prepare_dimensions(blas, rows, spec.vocab, spec.hidden)
     }
     fn prepare_dimensions(
         &mut self,
@@ -482,19 +483,6 @@ impl Runtime {
         self.prepared.insert(rows);
         Ok(())
     }
-    fn ensure_mixer_rows(&mut self, rows: u32) -> Result<()> {
-        for layer in &mut self.layers {
-            match &mut layer.mixer {
-                BoundMixer::Gdn { prefill, .. } => {
-                    prefill.ensure_rows(rows as usize, &GdnPlan::for_rows)?;
-                }
-                BoundMixer::Attention { text_prefill, .. } => {
-                    text_prefill.ensure_rows(rows as usize, &FullAttentionPlan::for_rows)?;
-                }
-            }
-        }
-        Ok(())
-    }
     pub(super) fn prepare_prefill_rows(
         &mut self,
         blas: &Blas,
@@ -503,8 +491,7 @@ impl Runtime {
         hidden: u32,
     ) -> Result<()> {
         let bound = bucketed_prefill_rows(rows, self.workspace_rows)?;
-        self.prepare_dimensions(blas, bound, vocab, hidden)?;
-        self.ensure_mixer_rows(rows)
+        self.prepare_dimensions(blas, bound, vocab, hidden)
     }
     fn linear_rows(&self, rows: u32, phase: ExecutionPhase) -> Result<u32> {
         if phase == ExecutionPhase::Decode {
@@ -1054,10 +1041,12 @@ impl Engine {
                 }
                 match phase {
                     ExecutionPhase::Prefill => {
-                        let prefill = if self.images.is_some() {
+                        let narrowed;
+                        let prefill: &FullAttentionPlan = if self.images.is_some() {
                             prefill
                         } else {
-                            text_prefill.select(rows)?
+                            narrowed = text_prefill.select(rows, &FullAttentionPlan::for_rows)?;
+                            &narrowed
                         };
                         FullAttentionOps::preprocess(prefill, s, meta, scratch(&q.scratch, s))?;
                         let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
@@ -1135,8 +1124,12 @@ impl Engine {
                         &mut TensorMut(matrix(output, s, offset, linear_rows, width)?),
                     )?;
                 }
+                let narrowed;
                 let plan = match phase {
-                    ExecutionPhase::Prefill => prefill.select(rows)?,
+                    ExecutionPhase::Prefill => {
+                        narrowed = prefill.select(rows, &GdnPlan::for_rows)?;
+                        &narrowed
+                    }
                     ExecutionPhase::Decode => decode.as_ref(),
                 };
                 if self.qwen_device_prefix {
@@ -1426,53 +1419,34 @@ mod tests {
 
     #[test]
     fn select_returns_the_plan_narrowed_to_the_steps_live_rows() {
-        let mut plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
             .expect("bind");
-        let unprepared = plans
-            .select(1021)
-            .expect_err("select before ensure_rows must fail")
-            .to_string();
-        assert!(
-            unprepared.contains("1021"),
-            "the error must name the unprepared size: {unprepared}"
+        // A step size never seen before narrows host-side at dispatch; no preparation step exists.
+        assert_eq!(
+            plans.select(1021, &FakePlan::for_rows).unwrap().max_rows,
+            1021
         );
-        plans
-            .ensure_rows(1021, &FakePlan::for_rows)
-            .expect("ensure 1021");
-        assert_eq!(plans.select(1021).unwrap().max_rows, 1021);
-        // A second call is idempotent and does not rebind.
-        plans
-            .ensure_rows(1021, &FakePlan::for_rows)
-            .expect("ensure 1021 again");
-        assert_eq!(plans.by_rows.len(), 1);
-        // An unprepared step size is an error naming the size, never a fallback.
-        let unprepared = plans
-            .select(700)
-            .expect_err("an unprepared size must not fall back")
-            .to_string();
-        assert!(
-            unprepared.contains("700"),
-            "the error must name the unprepared size: {unprepared}"
+        assert_eq!(
+            plans.select(700, &FakePlan::for_rows).unwrap().max_rows,
+            700
         );
         // 1..=4 keep the snapshot-bound small plans.
         for rows in 1..=4 {
-            assert_eq!(plans.select(rows).unwrap().max_rows, rows);
+            assert_eq!(
+                plans.select(rows, &FakePlan::for_rows).unwrap().max_rows,
+                rows
+            );
         }
-        assert!(plans.select(0).is_err());
-        assert!(plans.select(2049).is_err());
+        assert!(plans.select(0, &FakePlan::for_rows).is_err());
+        assert!(plans.select(2049, &FakePlan::for_rows).is_err());
     }
 
-    /// Without `ensure_rows`, a 1021-row step has no plan of its own to select.
     #[test]
     fn a_step_only_runs_a_plan_narrowed_to_its_own_rows() {
-        let mut plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
             .expect("bind");
-        // What `prepare(rows)` does before the step's forward pass.
-        plans
-            .ensure_rows(1021, &FakePlan::for_rows)
-            .expect("ensure the step's plan");
         assert_eq!(
-            plans.select(1021).unwrap().max_rows,
+            plans.select(1021, &FakePlan::for_rows).unwrap().max_rows,
             1021,
             "a 1021-row step must not run a plan sized for the admitted chunk"
         );
@@ -1481,16 +1455,14 @@ mod tests {
     #[test]
     fn every_step_size_of_a_chunked_prompt_gets_its_own_plan() {
         // 4093 tokens over a 2048 chunk: two 2048 steps and one 997 tail.
-        let mut plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
             .expect("bind");
         for step in [2048usize, 997] {
-            plans
-                .ensure_rows(step, &FakePlan::for_rows)
-                .expect("ensure step");
+            assert_eq!(
+                plans.select(step, &FakePlan::for_rows).unwrap().max_rows,
+                step
+            );
         }
-        assert_eq!(plans.select(2048).unwrap().max_rows, 2048);
-        assert_eq!(plans.select(997).unwrap().max_rows, 997);
-        assert_eq!(plans.by_rows.len(), 2);
     }
 
     use super::*;
@@ -1517,24 +1489,18 @@ mod tests {
     #[test]
     fn small_prefill_plans_select_structural_rows_without_rebinding() -> Result<()> {
         for capacity in [1, 2, 3, 4, 5, 16, 2048, 4096] {
-            let mut plans = PrefillPlans::bind(capacity, capacity, |&full, rows| {
+            let narrow = |&full: &usize, rows: u32| {
                 assert_eq!(full, capacity);
                 Ok(rows as usize)
-            })?;
+            };
+            let plans = PrefillPlans::bind(capacity, capacity, narrow)?;
             assert_eq!(plans.small, (1..=4.min(capacity)).collect::<Vec<_>>());
             for rows in 1..=capacity {
-                if rows > 4 {
-                    assert!(plans.select(rows).is_err(), "{rows} is not prepared");
-                    plans.ensure_rows(rows, &|&full, rows| {
-                        assert_eq!(full, capacity);
-                        Ok(rows as usize)
-                    })?;
-                }
-                assert_eq!(*plans.select(rows)?, rows);
+                assert_eq!(*plans.select(rows, &narrow)?, rows);
             }
-            assert!(plans.select(0).is_err());
-            assert!(plans.select(capacity + 1).is_err());
-            assert!(plans.select(usize::MAX).is_err());
+            assert!(plans.select(0, &narrow).is_err());
+            assert!(plans.select(capacity + 1, &narrow).is_err());
+            assert!(plans.select(usize::MAX, &narrow).is_err());
             let budget = Runtime::workspace(capacity, 4096, GdnPolicy::for_device(89, 128))? as u64;
             for rows in 1..=4.min(capacity) {
                 assert!(
