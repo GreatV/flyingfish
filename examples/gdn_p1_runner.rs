@@ -506,6 +506,20 @@ fn open_package(root: &Path) -> Result<Package> {
         check_fixture_shapes(fx)?;
     }
 
+    for fx in &manifest.fixtures {
+        ensure!(
+            !fx.name.is_empty()
+                && !fx.name.contains('/')
+                && !fx.name.contains('\\')
+                && fx.name != "."
+                && fx.name != ".."
+                && Path::new(&fx.name)
+                    .file_name()
+                    .is_some_and(|n| n == fx.name.as_str()),
+            "fixture name {:?} is not a plain basename",
+            fx.name
+        );
+    }
     let mut fixture_names = BTreeMap::new();
     for fx in &manifest.fixtures {
         ensure!(
@@ -1223,13 +1237,21 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
     let device = device_of(gpu.as_ref());
     if device_touched && !qualified_topology(device.as_ref()) {
         for r in rows.iter_mut() {
-            if r.verdict == "PASS" {
-                r.verdict = "INVALID";
-                r.failures.push(format!(
-                    "device {:?} is not the qualified topology (arch 89, 128 SMs), so no row \
-                     carries a verdict",
-                    device.as_ref().map(|d| (d.compute_capability, d.sm_count))
-                ));
+            r.verdict = "INVALID";
+            r.failures.push(format!(
+                "device {:?} is not the qualified topology (arch 89, 128 SMs), so no row \
+                 carries a verdict",
+                device.as_ref().map(|d| (d.compute_capability, d.sm_count))
+            ));
+        }
+    }
+    if args.clock == Clock::Stub {
+        for r in rows.iter_mut() {
+            r.verdict = "STUB";
+            if r.failures.is_empty() {
+                r.failures.push(
+                    "the stub clock substitutes documented fixed durations; no row carries a verdict".into(),
+                );
             }
         }
     }
@@ -1724,6 +1746,12 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
                      bounds are {}/{}, so the comparison is invalid rather than negative",
                     series.ci_low, series.ci_high
                 ),
+            )
+        } else if args.clock == Clock::Stub {
+            (
+                "STUB",
+                "the stub clock carries no measurement; this configuration is reported, not read"
+                    .to_string(),
             )
         } else if device_touched && !qualified_topology(device_of(gpu.as_ref()).as_ref()) {
             (
