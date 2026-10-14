@@ -1,4 +1,7 @@
-use super::super::tests::{configure, load, options, output, prompt, restore, save, state_bits};
+use super::super::tests::{
+    committed_bits, committed_difference, configure, load, options, output, prompt, restore, save,
+    state_bits,
+};
 use super::*;
 use std::path::PathBuf;
 
@@ -98,7 +101,11 @@ fn canonical(e: &mut Engine, inputs: &[u32], rows: usize) -> Result<Vec<u32>> {
         let hidden = b.chain.last_target.clone();
         let predictions = b.verify_batch(inputs)?;
         let batch = b.chain.batch.as_ref().context("batch missing")?;
-        let frame = batch.frame[..rows * HIDDEN].to_vec();
+        let frame = b
+            .engine
+            .device
+            .stream
+            .clone_dtoh(&batch.frame.slice(..rows * HIDDEN))?;
         let s = &b.engine.device.stream;
         for (state, snapshot) in b.engine.state.gdn.iter_mut().zip(&batch.snapshots) {
             for (target, source) in [
@@ -122,15 +129,35 @@ fn canonical(e: &mut Engine, inputs: &[u32], rows: usize) -> Result<Vec<u32>> {
             .state
             .set_sequence(s, position as u32, 1, b.engine.workspace_rows as u32)?;
         b.engine.position = position;
+        b.chain.cursor = b.chain.saved.cursor;
+        b.chain.mtp_checkpoint.restore(
+            b.engine.mtp_state.as_mut().context("MTP state missing")?,
+            &mut b.chain.runtime.work.token,
+            s,
+        )?;
         for (row, &token) in inputs[..rows].iter().enumerate() {
             let h = if row == 0 {
-                &hidden
+                matrix(&hidden, &b.engine.device.stream, 0, 1, HIDDEN)?
             } else {
-                &frame[(row - 1) * HIDDEN..row * HIDDEN]
+                let buffer = b
+                    .engine
+                    .device
+                    .stream
+                    .clone_htod(&frame[(row - 1) * HIDDEN..row * HIDDEN])?;
+                b.row(
+                    token,
+                    matrix(&buffer, &b.engine.device.stream, 0, 1, HIDDEN)?,
+                    OutputMode::Predict,
+                )?;
+                continue;
             };
             b.row(token, h, OutputMode::Predict)?;
         }
-        b.chain.last_target = frame[(rows - 1) * HIDDEN..rows * HIDDEN].to_vec();
+        b.engine.device.stream.memcpy_htod(
+            &frame[(rows - 1) * HIDDEN..rows * HIDDEN],
+            &mut b.chain.last_target,
+        )?;
+        b.chain.pending = predictions[rows - 1];
         b.chain.committed_position = b.engine.position;
         Ok(predictions[..rows].to_vec())
     })
@@ -168,7 +195,7 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
                     // Eager canonical is also the graph parity oracle.
                     e.mtp.as_mut().context("MTP missing")?.options.graph = false;
                     let expected = canonical(&mut e, &inputs, j + 1)?;
-                    let bits = state_bits(&e)?;
+                    let bits = committed_bits(&e)?;
                     restore(&mut e)?;
                     for graph in [false, true] {
                         let c = e.mtp.as_mut().context("MTP missing")?;
@@ -196,10 +223,14 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
                                 == (1, 0, 1),
                             "M2b full/partial path did extra target work"
                         );
-                        ensure!(
-                            state_bits(&e)? == bits,
-                            "M2b state bits mismatch K{k} j{j} {h2:?}/{h5:?} graph{graph}"
-                        );
+                        let actual = committed_bits(&e)?;
+                        if actual != bits {
+                            let difference = committed_difference(&e, &bits, &actual)?;
+                            receipt("m2b-transaction-difference", difference.clone())?;
+                            anyhow::bail!(
+                                "M2b state bits mismatch K{k} j{j} {h2:?}/{h5:?} graph{graph}: {difference}"
+                            );
+                        }
                         restore(&mut e)?;
                         cases += 1;
                     }

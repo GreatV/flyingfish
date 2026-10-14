@@ -1,11 +1,14 @@
 //! Engine-owned persistent mixer state; operators receive non-owning layer views.
-use super::{contracts::SeqRef, engine::Kv};
+use super::{
+    contracts::{SeqRef, Tensor},
+    engine::Kv,
+};
 use crate::{
     model_spec::{Architecture, Mixer, ModelSpec},
     op_contract::{GdnSpec, SequenceMeta},
 };
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -237,6 +240,7 @@ impl StateCheckpoint {
         token: &CudaSlice<u32>,
         prefix: usize,
         stream: &Arc<CudaStream>,
+        validation: Option<(&CudaFunction, Tensor<u32, 1>)>,
     ) -> Result<()> {
         self.valid = false;
         self.check(store)?;
@@ -246,20 +250,37 @@ impl StateCheckpoint {
         );
         let active_rows = self.rows.min(self.capacity - prefix);
         if let Some(seq) = &store.sequence {
-            let host = stream.clone_dtoh(seq)?;
-            ensure!(
-                host.len() == 8 && host[0] >= 0 && host[0] as usize == prefix,
-                "checkpoint prefix differs from device state"
-            );
-            SequenceMeta {
-                prefix: host[0],
-                valid_rows: host[1],
-                key_count: host[2],
-                capacity: host[3],
-                causal: host[4],
-                reserved: [host[5], host[6], host[7]],
+            ensure!(seq.len() == 8, "checkpoint sequence extent mismatch");
+            if let Some((check, flag)) = validation {
+                flag.validate()?;
+                ensure!(flag.stride == [1], "checkpoint status extent mismatch");
+                let flag_ptr = flag.element_ptr(flag.shape[0] as usize - 1)?;
+                unsafe {
+                    stream
+                        .launch_builder(check)
+                        .arg(seq)
+                        .arg(&(prefix as i32))
+                        .arg(&(self.capacity as i32))
+                        .arg(&(self.rows as i32))
+                        .arg(&flag_ptr)
+                        .launch(super::ops::grid(1, 1))?;
+                }
+            } else {
+                let host = stream.clone_dtoh(seq)?;
+                ensure!(
+                    host.len() == 8 && host[0] >= 0 && host[0] as usize == prefix,
+                    "checkpoint prefix differs from device state"
+                );
+                SequenceMeta {
+                    prefix: host[0],
+                    valid_rows: host[1],
+                    key_count: host[2],
+                    capacity: host[3],
+                    causal: host[4],
+                    reserved: [host[5], host[6], host[7]],
+                }
+                .validate(store.capacity, self.rows as u32)?;
             }
-            .validate(store.capacity, self.rows as u32)?;
         }
         for (src, dst) in store.gdn.iter().zip(&mut self.gdn) {
             stream.memcpy_dtod(&src.s, &mut dst.s)?;

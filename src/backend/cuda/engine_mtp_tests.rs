@@ -10,6 +10,61 @@ struct Fixture {
     logits_pre: Vec<bf16>,
     logits_post: Vec<bf16>,
 }
+
+#[test]
+fn canonical_repair_uses_single_row_fc() -> Result<()> {
+    for rows in 1..=3 {
+        let mut calls = Vec::new();
+        OutputMode::Repair.for_each_fc(rows, |row, count| {
+            calls.push((row, count));
+            Ok(())
+        })?;
+        assert_eq!(calls, (0..rows).map(|row| (row, 1)).collect::<Vec<_>>());
+    }
+    for rows in [1, 2, 3, 16, 53] {
+        for output in [
+            OutputMode::Predict,
+            OutputMode::PredictDevice,
+            OutputMode::StateOnly,
+            OutputMode::Queued,
+        ] {
+            let mut calls = Vec::new();
+            output.for_each_fc(rows, |row, count| {
+                calls.push((row, count));
+                Ok(())
+            })?;
+            assert_eq!(calls, [(0, rows)]);
+        }
+    }
+    let mut calls = 0;
+    assert!(
+        OutputMode::Repair
+            .for_each_fc(3, |_, _| {
+                calls += 1;
+                anyhow::bail!("injected FC error")
+            })
+            .is_err()
+    );
+    assert_eq!(calls, 1);
+    Ok(())
+}
+
+#[test]
+fn canonical_repair_preserves_decode_attention() {
+    for phase in [ExecutionPhase::Decode, ExecutionPhase::Prefill] {
+        assert_eq!(
+            OutputMode::Repair.attention_phase(phase),
+            ExecutionPhase::Decode
+        );
+        for output in [
+            OutputMode::Predict,
+            OutputMode::StateOnly,
+            OutputMode::Queued,
+        ] {
+            assert_eq!(output.attention_phase(phase), phase);
+        }
+    }
+}
 impl Fixture {
     fn load(root: &Path, case: &str) -> Result<Self> {
         let ids: serde_json::Value = serde_json::from_slice(&std::fs::read(
@@ -321,6 +376,7 @@ fn q38_mtp_single_step_gpu() -> Result<()> {
                 &mut runtime,
                 &mut state,
                 RunInput {
+                    device_ids: None,
                     prefix: 0,
                     ids: &f.sequence[1..],
                     hidden: &f.hidden(tap)[..rows * HIDDEN],
@@ -366,6 +422,7 @@ fn q38_mtp_cached_rows_gpu() -> Result<()> {
                     &mut runtime,
                     &mut state,
                     RunInput {
+                        device_ids: None,
                         prefix: r,
                         ids: &f.sequence[r + 1..r + 2],
                         hidden: &f.hidden(tap)[r * HIDDEN..(r + 1) * HIDDEN],
@@ -419,6 +476,7 @@ fn q38_mtp_state_only_decode_gpu() -> Result<()> {
             let mut hidden = fixture.hidden(h2)[..HIDDEN].to_vec();
             for prefix in 0..8 {
                 let input = || RunInput {
+                    device_ids: None,
                     prefix,
                     ids: &fixture.sequence[prefix + 1..prefix + 2],
                     hidden: &hidden,
@@ -512,6 +570,7 @@ fn q38_mtp_headless_prefill_gpu() -> Result<()> {
             &mut full,
             &mut full_state,
             RunInput {
+                device_ids: None,
                 prefix: 0,
                 ids,
                 hidden,
@@ -556,6 +615,254 @@ fn q38_mtp_headless_prefill_gpu() -> Result<()> {
             s.clone_dtoh(light_state.sequence.as_ref().unwrap())?
         );
     }
+    repair_prefill_matches_decode(&probe, &fixture)
+}
+
+fn repair_prefill_matches_decode(probe: &Probe, fixture: &Fixture) -> Result<()> {
+    let s = &probe.device.stream;
+    let execution = || -> Result<Execution<'_>> {
+        Ok(Execution {
+            device: &probe.device,
+            ops: &probe.ops,
+            blas: &probe.blas,
+            catalog: &probe.catalog,
+            embedding: probe
+                .catalog
+                .bf16("model.language_model.embed_tokens.weight")?,
+            head: probe.catalog.bf16("lm_head.weight")?,
+        })
+    };
+    let bits = |v: Vec<bf16>| v.into_iter().map(bf16::to_bits).collect::<Vec<_>>();
+    let mut receipts = Vec::new();
+    for tap in [MtpHiddenTap::PreFinalNorm, MtpHiddenTap::PostFinalNorm] {
+        let mut seed_state = probe.state(64)?;
+        let mut seed = probe.runtime(plan(tap, 53, 64, ExecutionPhase::Prefill), &seed_state)?;
+        seed.run_inner(
+            execution()?,
+            &mut seed_state,
+            RunInput {
+                prefix: 0,
+                ids: &fixture.sequence[1..54],
+                device_ids: None,
+                hidden: &fixture.hidden(tap)[..53 * HIDDEN],
+                control: Control::None,
+                detailed: false,
+            },
+            None,
+            ExecutionPhase::Prefill,
+            OutputMode::StateOnly,
+        )?;
+        for rows in 1..=3 {
+            let mut serial_state = probe.state(64)?;
+            let mut repair_state = probe.state(64)?;
+            let mut old_state = probe.state(64)?;
+            for state in [&mut serial_state, &mut repair_state, &mut old_state] {
+                s.memcpy_dtod(&seed_state.kv[0].k, &mut state.kv[0].k)?;
+                s.memcpy_dtod(&seed_state.kv[0].v, &mut state.kv[0].v)?;
+            }
+            let mut serial =
+                probe.runtime(plan(tap, 1, 64, ExecutionPhase::Decode), &serial_state)?;
+            let p = plan(tap, rows, 64, ExecutionPhase::Prefill);
+            let mut repair = probe.runtime(p, &repair_state)?;
+            let mut old = probe.runtime(p, &old_state)?;
+            let mut pre = Vec::new();
+            let mut post = Vec::new();
+            let mut serial_dump = Dump::default();
+            let mut serial_fc = Dump::default();
+            for row in 0..rows {
+                serial_dump = serial.run_inner(
+                    execution()?,
+                    &mut serial_state,
+                    RunInput {
+                        prefix: 53 + row,
+                        ids: &fixture.sequence[54 + row..55 + row],
+                        device_ids: None,
+                        hidden: &fixture.hidden(tap)[(53 + row) * HIDDEN..(54 + row) * HIDDEN],
+                        control: Control::None,
+                        detailed: true,
+                    },
+                    None,
+                    ExecutionPhase::Decode,
+                    OutputMode::StateOnly,
+                )?;
+                for name in [
+                    "pre_fc_norm_embedding",
+                    "pre_fc_norm_hidden",
+                    "concat",
+                    "fc",
+                    "norm1",
+                    "self_attn.q_proj.weight",
+                    "self_attn.k_proj.weight",
+                    "self_attn.v_proj.weight",
+                ] {
+                    let (dtype, shape, bytes) = serial_dump
+                        .tensors
+                        .get(name)
+                        .context("serial FC diagnostic missing")?;
+                    ensure!(
+                        *dtype == Dtype::BF16 && shape.len() == 2 && shape[0] == 1,
+                        "serial FC diagnostic shape mismatch"
+                    );
+                    let value = serial_fc
+                        .tensors
+                        .entry(name.into())
+                        .or_insert_with(|| (*dtype, vec![rows, shape[1]], Vec::new()));
+                    value.2.extend_from_slice(bytes);
+                }
+                pre.extend(bits(s.clone_dtoh(&serial.work.x.slice(..HIDDEN))?));
+                post.extend(bits(s.clone_dtoh(&serial.work.n.slice(..HIDDEN))?));
+            }
+            let mut dumps = Vec::new();
+            for (runtime, state, output) in [
+                (&mut repair, &mut repair_state, OutputMode::Repair),
+                (&mut old, &mut old_state, OutputMode::StateOnly),
+            ] {
+                dumps.push(runtime.run_inner(
+                    execution()?,
+                    state,
+                    RunInput {
+                        prefix: 53,
+                        ids: &fixture.sequence[54..54 + rows],
+                        device_ids: None,
+                        hidden: &fixture.hidden(tap)[53 * HIDDEN..(53 + rows) * HIDDEN],
+                        control: Control::None,
+                        detailed: true,
+                    },
+                    None,
+                    ExecutionPhase::Prefill,
+                    output,
+                )?);
+            }
+            let stem = format!("repair-{tap:?}-rows{rows}");
+            serial_fc.save(
+                &probe.output.join(format!("{stem}-serial-fc.safetensors")),
+                HashMap::new(),
+            )?;
+            for (name, dump) in [("repair", &dumps[0]), ("old_fa2", &dumps[1])] {
+                dump.save(
+                    &probe.output.join(format!("{stem}-{name}.safetensors")),
+                    HashMap::new(),
+                )?;
+            }
+            let expected = [
+                pre,
+                post,
+                bits(s.clone_dtoh(&serial_state.kv[0].k)?),
+                bits(s.clone_dtoh(&serial_state.kv[0].v)?),
+            ];
+            let mut checks = Vec::new();
+            for (name, runtime, state, dump) in [
+                ("repair", &repair, &repair_state, &dumps[0]),
+                ("old_fa2", &old, &old_state, &dumps[1]),
+            ] {
+                let actual = [
+                    bits(s.clone_dtoh(&runtime.work.x.slice(..rows * HIDDEN))?),
+                    bits(s.clone_dtoh(&runtime.work.n.slice(..rows * HIDDEN))?),
+                    bits(s.clone_dtoh(&state.kv[0].k)?),
+                    bits(s.clone_dtoh(&state.kv[0].v)?),
+                ];
+                let differences: Vec<_> = ["pre_mtp_norm", "post_mtp_norm", "k_cache", "v_cache"]
+                    .into_iter()
+                    .zip(expected.iter().zip(&actual))
+                    .filter_map(|(field, (a, b))| {
+                        a.iter().zip(b).position(|(a, b)| a != b).map(|index| {
+                            serde_json::json!({"field":field,"word":index,"expected":a[index],"actual":b[index]})
+                        })
+                    })
+                    .collect();
+                let mut fc_differences = Vec::new();
+                for (field, expected) in &serial_fc.tensors {
+                    let actual = dump
+                        .tensors
+                        .get(field)
+                        .context("batched FC diagnostic missing")?;
+                    if expected != actual {
+                        let word = expected
+                            .2
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .zip(actual.2.as_chunks::<2>().0)
+                            .position(|(a, b)| a != b);
+                        fc_differences.push(serde_json::json!({"field":field,"word":word,"expected_shape":expected.1,"actual_shape":actual.1}));
+                    }
+                }
+                checks.push(serde_json::json!({"arm":name,"differences":differences,"fc_differences":fc_differences}));
+            }
+            let first_old_op = if rows == 1 {
+                [
+                    "pre_fc_norm_embedding",
+                    "pre_fc_norm_hidden",
+                    "concat",
+                    "fc",
+                    "norm1",
+                    "self_attn.q_proj.weight",
+                    "self_attn.k_proj.weight",
+                    "self_attn.v_proj.weight",
+                    "k_norm",
+                    "q_norm",
+                    "q_rope",
+                    "k_cache",
+                    "v_cache",
+                    "attention_core",
+                    "attention_gated",
+                    "o_proj",
+                    "residual1",
+                    "norm2",
+                    "mlp.gate_proj.weight",
+                    "mlp.up_proj.weight",
+                    "mlp_activation",
+                    "mlp_down",
+                    "pre_mtp_norm",
+                    "post_mtp_norm",
+                ]
+                .into_iter()
+                .find(|name| serial_dump.tensors.get(*name) != dumps[1].tensors.get(*name))
+            } else {
+                [
+                    "pre_fc_norm_embedding",
+                    "pre_fc_norm_hidden",
+                    "concat",
+                    "fc",
+                    "norm1",
+                    "self_attn.q_proj.weight",
+                    "self_attn.k_proj.weight",
+                    "self_attn.v_proj.weight",
+                ]
+                .into_iter()
+                .find(|name| serial_fc.tensors.get(*name) != dumps[1].tensors.get(*name))
+            };
+            receipts.push(serde_json::json!({"hidden_tap":format!("{tap:?}"),"prefix":53,"rows":rows,"hidden_shape":[rows,HIDDEN],"old_first_different_op":first_old_op,"checks":checks}));
+            std::fs::write(
+                probe.output.join("repair-prefill.json"),
+                serde_json::to_vec_pretty(&receipts)?,
+            )?;
+            ensure!(
+                checks[0]["differences"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+                    && checks[0]["fc_differences"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty),
+                "MTP repair Prefill differs from serial Decode tap={tap:?} rows={rows}"
+            );
+        }
+    }
+    ensure!(
+        receipts
+            .iter()
+            .any(|r| r["rows"] == 2 && r["old_first_different_op"] == "fc"),
+        "old batched FC negative control did not discriminate"
+    );
+    ensure!(
+        receipts.iter().any(|r| r["checks"][1]["differences"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty())),
+        "old FA2 repair negative control did not discriminate"
+    );
+    println!(
+        "MTP_REPAIR_PREFILL_BITWISE_PASS cases=6 prefix=53 rows=1,2,3 fields=pre_mtp_norm,post_mtp_norm,k_cache,v_cache fc_intermediates=true old_fc_control=true old_fa2_control=true"
+    );
     Ok(())
 }
 
@@ -574,6 +881,7 @@ fn q38_mtp_negative_controls_gpu() -> Result<()> {
                 &mut runtime,
                 &mut state,
                 RunInput {
+                    device_ids: None,
                     prefix: r,
                     ids: &f.sequence[r + 1..r + 2],
                     hidden: &f.hidden(tap)[r * HIDDEN..(r + 1) * HIDDEN],
@@ -590,6 +898,7 @@ fn q38_mtp_negative_controls_gpu() -> Result<()> {
                 runtime,
                 state,
                 RunInput {
+                    device_ids: None,
                     prefix: 10,
                     ids: &f.sequence[11..12],
                     hidden: &f.hidden(hidden_tap)[10 * HIDDEN..11 * HIDDEN],
@@ -810,6 +1119,7 @@ fn q38_mtp_recursive_fixture_gpu() -> Result<()> {
                 &mut runtime,
                 &mut state,
                 RunInput {
+                    device_ids: None,
                     prefix: r,
                     ids: &fixture.sequence[r + 1..r + 2],
                     hidden: &hidden[r * HIDDEN..(r + 1) * HIDDEN],
@@ -834,6 +1144,7 @@ fn q38_mtp_recursive_fixture_gpu() -> Result<()> {
                 &mut runtime,
                 &mut state,
                 RunInput {
+                    device_ids: None,
                     prefix: j - 1 + depth,
                     ids: &[token],
                     hidden: &recurrent,

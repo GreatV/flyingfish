@@ -2395,7 +2395,7 @@ impl Engine {
             .take()
             .context("capture checkpoint missing")?;
         let result = (|| -> Result<CudaGraph> {
-            checkpoint.save(&self.state, &self.work.token, self.position, &s)?;
+            checkpoint.save(&self.state, &self.work.token, self.position, &s, None)?;
             self.run_decode_step(None)?;
             s.synchronize()?;
             checkpoint.restore(&mut self.state, &mut self.work.token, &s)?;

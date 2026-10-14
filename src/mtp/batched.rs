@@ -7,7 +7,12 @@ use anyhow::{Result, ensure};
 
 /// Verification retains each row's recurrent state and hidden rows for MTP repair.
 pub trait BatchedBackend: Backend {
-    fn verify_batch(&mut self, inputs: &[u32]) -> Result<Vec<u32>>;
+    fn draft_verify(
+        &mut self,
+        anchor: u32,
+        depth: usize,
+        #[cfg(test)] fault: Option<Fault>,
+    ) -> Result<(Vec<u32>, Vec<u32>)>;
     /// Select the committed target prefix and its pending prediction.
     fn select_prefix(&mut self, rows: usize) -> Result<()>;
     /// Preserve the verified target state and its hidden-row buffer.
@@ -35,7 +40,7 @@ pub struct BatchRound {
 }
 
 #[cfg(test)]
-fn inject(fault: Option<Fault>, point: Fault) -> Result<()> {
+pub(crate) fn inject(fault: Option<Fault>, point: Fault) -> Result<()> {
     ensure!(
         fault != Some(point),
         "injected batched MTP failure at {point:?}"
@@ -111,18 +116,16 @@ pub fn run<B: BatchedBackend>(
         return Err(e.context("M2b checkpoint save failed"));
     }
     let result = (|| -> Result<BatchRound> {
-        let mut proposals = Vec::with_capacity(k);
-        let mut token = anchor;
-        for depth in 0..k {
-            token = b.draft(token, depth)?;
-            proposals.push(token);
+        let (proposals, verify) = b.draft_verify(
+            anchor,
+            k,
             #[cfg(test)]
-            inject(fault, Fault::AfterDraft(depth))?;
-        }
+            fault,
+        )?;
+        ensure!(proposals.len() == k, "draft prediction count mismatch");
         let inputs: Vec<_> = std::iter::once(anchor)
             .chain(proposals.iter().copied())
             .collect();
-        let verify = b.verify_batch(&inputs)?;
         ensure!(
             verify.len() == inputs.len(),
             "batch verifier prediction count mismatch"

@@ -64,6 +64,7 @@ struct MtpRuntime {
     max_position: usize,
     head_rows: usize,
     copy_finite: CudaFunction,
+    stage_inputs: CudaFunction,
     #[cfg(test)]
     head_runs: usize,
     common: CommonOpsRef,
@@ -183,6 +184,8 @@ impl MtpRuntime {
             head_rows,
             copy_finite: cubin::module(&device.ctx, "q38_common")?
                 .load_function("q38_copy_finite_bf16")?,
+            stage_inputs: cubin::module(&device.ctx, "q38_common")?
+                .load_function("q38_stage_inputs")?,
             #[cfg(test)]
             head_runs: 0,
             common,
@@ -208,6 +211,7 @@ impl MtpRuntime {
         }
         let s = &device.stream;
         self.linear.prepare(blas, rows as u32)?;
+        blas.prepare_fixed(1, HIDDEN as u32, (2 * HIDDEN) as u32)?;
         blas.prepare_fixed(rows as u32, HIDDEN as u32, (2 * HIDDEN) as u32)?;
         if rows <= self.head_rows {
             blas.prepare_fixed(rows as u32, VOCAB as u32, HIDDEN as u32)?;
@@ -277,6 +281,7 @@ impl MtpRuntime {
             OutputMode::Predict,
         )
     }
+    #[cfg(test)]
     fn run_decode(
         &mut self,
         execution: Execution<'_>,
@@ -312,6 +317,7 @@ impl MtpRuntime {
             RunInput {
                 prefix,
                 ids,
+                device_ids: None,
                 hidden: &[],
                 detailed: false,
                 #[cfg(test)]
@@ -320,6 +326,33 @@ impl MtpRuntime {
             Some(hidden),
             ExecutionPhase::Prefill,
             OutputMode::StateOnly,
+        )?;
+        Ok(())
+    }
+    fn run_device(
+        &mut self,
+        execution: Execution<'_>,
+        state: &mut StateStore,
+        prefix: usize,
+        input: ((Tensor<u32, 1>, usize), Tensor<bf16, 2>, Tensor<u32, 1>),
+        phase: ExecutionPhase,
+        output: OutputMode,
+    ) -> Result<()> {
+        self.run_inner(
+            execution,
+            state,
+            RunInput {
+                prefix,
+                ids: &[],
+                device_ids: Some((input.0.0, input.0.1, input.2)),
+                hidden: &[],
+                detailed: false,
+                #[cfg(test)]
+                control: Control::None,
+            },
+            Some(input.1),
+            phase,
+            output,
         )?;
         Ok(())
     }
@@ -343,6 +376,7 @@ impl MtpRuntime {
         let RunInput {
             prefix,
             ids,
+            device_ids,
             hidden,
             #[cfg(test)]
             control,
@@ -356,7 +390,12 @@ impl MtpRuntime {
         );
         #[cfg(not(test))]
         let (shift_position, standard_norm, swap_concat) = (false, false, false);
-        let rows = ids.len();
+        let (rows, device_source) = if let Some((source, offset, _)) = device_ids {
+            let pointer = source.element_ptr(offset)?;
+            (source.shape[0] as usize - offset, Some(pointer))
+        } else {
+            (ids.len(), None)
+        };
         self.plan
             .check_absolute_rows(prefix, rows, self.max_position)?;
         ensure!(
@@ -364,7 +403,11 @@ impl MtpRuntime {
             "MTP decode requires one row"
         );
         ensure!(
-            output == OutputMode::StateOnly || rows <= self.head_rows,
+            output != OutputMode::Repair || rows <= 3,
+            "canonical MTP repair requires one to three rows"
+        );
+        ensure!(
+            matches!(output, OutputMode::StateOnly | OutputMode::Repair) || rows <= self.head_rows,
             "MTP head rows exceed binding"
         );
         let attention = self
@@ -380,8 +423,33 @@ impl MtpRuntime {
             "invalid MTP inputs"
         );
         let s = &device.stream;
-        state.set_sequence(s, prefix as u32, rows as u32, self.plan.max_rows as u32)?;
-        s.memcpy_htod(ids, &mut self.work.ids.slice_mut(..rows))?;
+        if let Some((source, _, flag)) = device_ids {
+            source.validate()?;
+            flag.validate()?;
+            ensure!(
+                source.stride == [1] && flag.stride == [1] && !detailed,
+                "invalid device MTP IDs"
+            );
+            let destination = view(&self.work.ids, s, 0, [rows as u32], [1])?;
+            let source_ptr = device_source.context("device MTP source missing")?;
+            let flag_ptr = flag.element_ptr(flag.shape[0] as usize - 1)?;
+            unsafe {
+                s.launch_builder(&self.stage_inputs)
+                    .arg(&source_ptr)
+                    .arg(&destination.ptr)
+                    .arg(&self.positions)
+                    .arg(state.sequence.as_mut().context("MTP sequence missing")?)
+                    .arg(&(rows as u32))
+                    .arg(&(prefix as i32))
+                    .arg(&(self.plan.capacity as i32))
+                    .arg(&(VOCAB as u32))
+                    .arg(&flag_ptr)
+                    .launch(flat(rows))?;
+            }
+        } else {
+            state.set_sequence(s, prefix as u32, rows as u32, self.plan.max_rows as u32)?;
+            s.memcpy_htod(ids, &mut self.work.ids.slice_mut(..rows))?;
+        }
         if let Some(source) = device_hidden {
             source.validate()?;
             ensure!(
@@ -392,22 +460,33 @@ impl MtpRuntime {
             );
             let destination = matrix(&self.hidden, s, 0, rows, HIDDEN)?;
             unsafe {
-                s.launch_builder(&self.copy_finite)
-                    .arg(&source.ptr)
-                    .arg(&destination.ptr)
-                    .arg(&((rows * HIDDEN) as u64))
-                    .launch(flat(rows * HIDDEN))?;
+                if matches!(output, OutputMode::Queued | OutputMode::Repair) {
+                    cudarc::driver::result::memcpy_dtod_async(
+                        destination.ptr,
+                        source.ptr,
+                        rows * HIDDEN * size_of::<bf16>(),
+                        s.cu_stream(),
+                    )?;
+                } else {
+                    s.launch_builder(&self.copy_finite)
+                        .arg(&source.ptr)
+                        .arg(&destination.ptr)
+                        .arg(&((rows * HIDDEN) as u64))
+                        .launch(flat(rows * HIDDEN))?;
+                }
             }
         } else {
             s.memcpy_htod(hidden, &mut self.hidden.slice_mut(..rows * HIDDEN))?;
         }
-        let axes: Vec<i32> = (0..rows)
+        let axes: Vec<i32> = (0..if device_ids.is_none() { rows } else { 0 })
             .flat_map(|r| {
                 let pos = (prefix + r + 1) as i32 + i32::from(shift_position);
                 [pos; 3]
             })
             .collect();
-        s.memcpy_htod(&axes, &mut self.positions.slice_mut(..rows * 3))?;
+        if device_ids.is_none() {
+            s.memcpy_htod(&axes, &mut self.positions.slice_mut(..rows * 3))?;
+        }
         let domain = RowDomain {
             meta: state.seq_ref(s)?,
             row_base: 0,
@@ -479,12 +558,15 @@ impl MtpRuntime {
             }
             dump.bf16("concat", vec![rows, 2 * HIDDEN], cat)?;
         }
-        blas.linear_typed(
-            phase,
-            catalog.linear_ref("mtp.fc.weight", s)?,
-            matrix(&self.concat, s, 0, rows, 2 * HIDDEN)?,
-            &mut TensorMut(matrix(&self.work.x, s, 0, rows, HIDDEN)?),
-        )?;
+        let fc_weight = catalog.linear_ref("mtp.fc.weight", s)?;
+        output.for_each_fc(rows, |row, count| {
+            blas.linear_typed(
+                phase,
+                fc_weight,
+                matrix(&self.concat, s, row * 2 * HIDDEN, count, 2 * HIDDEN)?,
+                &mut TensorMut(matrix(&self.work.x, s, row * HIDDEN, count, HIDDEN)?),
+            )
+        })?;
         if detailed {
             dump.device("fc", s, &self.work.x, 0, rows, HIDDEN)?;
         }
@@ -558,7 +640,7 @@ impl MtpRuntime {
             )?;
             dump.device("k_norm", s, &self.work.n, 0, rows, 1024)?;
         }
-        match phase {
+        match output.attention_phase(phase) {
             ExecutionPhase::Prefill => {
                 FullAttentionOps::preprocess(attention, s, domain.meta, scratch(&self.scratch, s))?;
                 self.flash.run(
@@ -682,6 +764,9 @@ impl MtpRuntime {
             dump.device("pre_mtp_norm", s, &self.work.x, 0, rows, HIDDEN)?;
             dump.device("post_mtp_norm", s, &self.work.n, 0, rows, HIDDEN)?;
         }
+        if output == OutputMode::Repair {
+            return Ok(dump);
+        }
         if output == OutputMode::StateOnly {
             if phase == ExecutionPhase::Decode {
                 // Repair failures must remain recoverable by the transaction's
@@ -715,25 +800,31 @@ impl MtpRuntime {
             matrix(&self.work.n, s, 0, rows, HIDDEN)?,
             &mut TensorMut(matrix(&self.logits, s, 0, rows, VOCAB)?),
         )?;
-        if output == OutputMode::PredictDevice {
+        if matches!(output, OutputMode::PredictDevice | OutputMode::Queued) {
             ensure!(rows == 1, "device draft head requires one row");
-            s.memset_zeros(&mut self.prediction)?;
+            if output == OutputMode::PredictDevice {
+                s.memset_zeros(&mut self.prediction)?;
+            }
             unsafe {
                 s.launch_builder(&ops.argmax)
                     .arg(&self.logits)
                     .arg(&mut self.prediction.slice_mut(..1))
                     .arg(&(VOCAB as i32))
                     .launch(crate::backend::cuda::ops::grid(1, 1024))?;
-                s.launch_builder(&ops.finite_bf16)
-                    .arg(&self.logits)
-                    .arg(&mut self.prediction.slice_mut(1..2))
-                    .arg(&(VOCAB as u64))
-                    .launch(flat(VOCAB))?;
             }
-            let result = s.clone_dtoh(&self.prediction)?;
-            ensure!(result[1] == 0, "nonfinite MTP dump logits");
-            ensure!((result[0] as usize) < VOCAB, "invalid MTP argmax ID");
-            dump.prediction = Some(result[0]);
+            if output == OutputMode::PredictDevice {
+                unsafe {
+                    s.launch_builder(&ops.finite_bf16)
+                        .arg(&self.logits)
+                        .arg(&mut self.prediction.slice_mut(1..2))
+                        .arg(&(VOCAB as u64))
+                        .launch(flat(VOCAB))?;
+                }
+                let result = s.clone_dtoh(&self.prediction)?;
+                ensure!(result[1] == 0, "nonfinite MTP dump logits");
+                ensure!((result[0] as usize) < VOCAB, "invalid MTP argmax ID");
+                dump.prediction = Some(result[0]);
+            }
         } else {
             dump.device("logits", s, &self.logits, 0, rows, VOCAB)?;
         }
@@ -746,11 +837,38 @@ enum OutputMode {
     Predict,
     PredictDevice,
     StateOnly,
+    Queued,
+    Repair,
+}
+
+impl OutputMode {
+    fn for_each_fc(
+        self,
+        rows: usize,
+        mut run: impl FnMut(usize, usize) -> Result<()>,
+    ) -> Result<()> {
+        if self == Self::Repair {
+            for row in 0..rows {
+                run(row, 1)?;
+            }
+            Ok(())
+        } else {
+            run(0, rows)
+        }
+    }
+    fn attention_phase(self, phase: ExecutionPhase) -> ExecutionPhase {
+        if self == Self::Repair {
+            ExecutionPhase::Decode
+        } else {
+            phase
+        }
+    }
 }
 
 struct RunInput<'a> {
     prefix: usize,
     ids: &'a [u32],
+    device_ids: Option<(Tensor<u32, 1>, usize, Tensor<u32, 1>)>,
     hidden: &'a [bf16],
     #[cfg(test)]
     control: Control,

@@ -44,6 +44,29 @@ extern "C" __global__ void q38_batch_meta(const int32_t* position,
         q38_meta_guard(meta);
     }
 }
+extern "C" __global__ void q38_sequence_check(const Q38SequenceMeta* meta,
+                                              int32_t prefix, int32_t capacity,
+                                              int32_t max_rows, uint32_t* status) {
+    if (blockIdx.x == 0 && threadIdx.x == 0 &&
+        (meta->prefix != prefix || meta->prefix < 0 || meta->valid_rows < 1 ||
+         meta->valid_rows > max_rows || meta->capacity != capacity || meta->causal != 1 ||
+         int64_t(meta->prefix) + meta->valid_rows != meta->key_count ||
+         meta->key_count > capacity || meta->reserved[0] || meta->reserved[1] || meta->reserved[2]))
+        atomicOr(status, 0x80000000u);
+}
+extern "C" __global__ void q38_stage_inputs(const uint32_t* source, uint32_t* ids,
+                                            int32_t* positions, Q38SequenceMeta* meta,
+                                            uint32_t rows, int32_t prefix,
+                                            int32_t capacity, uint32_t vocab,
+                                            uint32_t* status) {
+    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row == 0) *meta = {prefix, int32_t(rows), prefix + int32_t(rows), capacity, 1, {0, 0, 0}};
+    if (row >= rows) return;
+    uint32_t token = source[row];
+    if (token >= vocab) { atomicOr(status, 0x40000000u); token = 0; }
+    ids[row] = token;
+    positions[3 * row] = positions[3 * row + 1] = positions[3 * row + 2] = prefix + int32_t(row) + 1;
+}
 __device__ __forceinline__ float block_sum(float v,float* scratch) {
     for(int delta=16;delta;delta/=2) v+=__shfl_down_sync(0xffffffffu,v,delta);
     if(threadIdx.x%32==0) scratch[threadIdx.x/32]=v;

@@ -783,10 +783,10 @@ fn q38_state_checkpoint_gpu() -> Result<()> {
         "empty snapshot restored"
     );
     ensure!(
-        checkpoint.save(&state, &token, 4, s).is_err(),
+        checkpoint.save(&state, &token, 4, s, None).is_err(),
         "stale host prefix accepted"
     );
-    checkpoint.save(&state, &token, 5, s)?;
+    checkpoint.save(&state, &token, 5, s, None)?;
     state.reset(s)?;
     for kv in &mut state.kv {
         s.memset_zeros(&mut kv.k)?;
@@ -863,6 +863,186 @@ fn q38_state_checkpoint_gpu() -> Result<()> {
     ensure!(
         s.clone_dtoh(state.sequence.as_ref().unwrap())? == [5, 1, 6, 32, 1, 0, 0, 0],
         "checkpoint did not restore graph-mutated metadata"
+    );
+    let common = super::cubin::module(&d.ctx, "q38_common")?;
+    let check = common.load_function("q38_sequence_check")?;
+    let stage = common.load_function("q38_stage_inputs")?;
+    let mut flag = s.alloc_zeros::<u32>(8)?;
+    let flag_view = view(&flag, s, [8], [1])?;
+    let flag_ptr = flag_view.element_ptr(7)?;
+    checkpoint.save(&state, &token, 4, s, Some((&check, flag_view)))?;
+    ensure!(
+        s.clone_dtoh(&flag.slice(7..8))? == [0x8000_0000],
+        "device checkpoint accepted a stale prefix"
+    );
+    s.memset_zeros(&mut flag)?;
+    checkpoint.save(&state, &token, 5, s, Some((&check, flag_view)))?;
+    ensure!(
+        s.clone_dtoh(&flag.slice(7..8))? == [0],
+        "valid device checkpoint rejected"
+    );
+    let mut damaged_controls = 1;
+    for field in 0..8 {
+        let mut values = [5i32, 1, 6, 32, 1, 0, 0, 0];
+        values[field] = match field {
+            0 => 4,
+            1 => 0,
+            2 => 7,
+            3 => 31,
+            4 => 0,
+            _ => 1,
+        };
+        s.memcpy_htod(
+            &values,
+            state.sequence.as_mut().context("sequence missing")?,
+        )?;
+        s.memset_zeros(&mut flag)?;
+        unsafe {
+            s.launch_builder(&check)
+                .arg(&seq.ptr)
+                .arg(&5i32)
+                .arg(&32i32)
+                .arg(&1i32)
+                .arg(&flag_ptr)
+                .launch(super::ops::grid(1, 1))?;
+        }
+        ensure!(
+            s.clone_dtoh(&flag.slice(7..8))? == [0x8000_0000],
+            "device sequence field {field} escaped validation"
+        );
+        damaged_controls += 1;
+    }
+    let mut staged = s.clone_htod(&[u32::MAX; 8])?;
+    let mut axes = s.clone_htod(&[-9i32; 24])?;
+    for rows in 1..=4usize {
+        let values: Vec<_> = (0..rows).map(|i| (i * 97 + 13) as u32).collect();
+        let mut source_values = vec![u32::MAX];
+        source_values.extend_from_slice(&values);
+        let source = s.clone_htod(&source_values)?;
+        let source_ptr = view(&source, s, [(rows + 1) as u32], [1])?.element_ptr(1)?;
+        s.memcpy_htod(&[u32::MAX; 8], &mut staged)?;
+        s.memcpy_htod(&[-9i32; 24], &mut axes)?;
+        s.memset_zeros(&mut flag)?;
+        unsafe {
+            s.launch_builder(&stage)
+                .arg(&source_ptr)
+                .arg(&mut staged)
+                .arg(&mut axes)
+                .arg(&seq.ptr)
+                .arg(&(rows as u32))
+                .arg(&5i32)
+                .arg(&32i32)
+                .arg(&248320u32)
+                .arg(&flag_ptr)
+                .launch(super::ops::flat(rows))?;
+        }
+        let ids = s.clone_dtoh(&staged)?;
+        ensure!(
+            ids[..rows] == values && ids[rows..].iter().all(|&t| t == u32::MAX),
+            "staged ID extent/tail mismatch"
+        );
+        let got = s.clone_dtoh(&axes)?;
+        ensure!(
+            got[..3 * rows]
+                == (0..rows)
+                    .flat_map(|i| [6 + i as i32; 3])
+                    .collect::<Vec<_>>()
+                && got[3 * rows..].iter().all(|&v| v == -9),
+            "staged RoPE axes/tail mismatch"
+        );
+        ensure!(
+            s.clone_dtoh(state.sequence.as_ref().context("sequence missing")?)?
+                == [5, rows as i32, 5 + rows as i32, 32, 1, 0, 0, 0],
+            "staged sequence mismatch"
+        );
+        ensure!(
+            s.clone_dtoh(&flag.slice(7..8))? == [0],
+            "valid staged input rejected"
+        );
+        let bad = s.clone_htod(&[248320u32])?;
+        unsafe {
+            s.launch_builder(&stage)
+                .arg(&bad)
+                .arg(&mut staged)
+                .arg(&mut axes)
+                .arg(&seq.ptr)
+                .arg(&1u32)
+                .arg(&5i32)
+                .arg(&32i32)
+                .arg(&248320u32)
+                .arg(&flag_ptr)
+                .launch(super::ops::flat(1))?;
+        }
+        ensure!(
+            s.clone_dtoh(&flag.slice(7..8))? == [0x4000_0000] && s.clone_dtoh(&staged)?[0] == 0,
+            "invalid device ID was not quarantined"
+        );
+        unsafe {
+            s.launch_builder(&stage)
+                .arg(&source_ptr)
+                .arg(&mut staged)
+                .arg(&mut axes)
+                .arg(&seq.ptr)
+                .arg(&(rows as u32))
+                .arg(&5i32)
+                .arg(&32i32)
+                .arg(&248320u32)
+                .arg(&flag_ptr)
+                .launch(super::ops::flat(rows))?;
+        }
+        ensure!(
+            s.clone_dtoh(&flag.slice(7..8))? == [0x4000_0000],
+            "device input error flag was cleared"
+        );
+        damaged_controls += 1;
+    }
+    let count = 3 * spec.hidden as usize;
+    let mut values: Vec<_> = (0..count + 16)
+        .map(|i| {
+            if i < count {
+                bf16::from_f32((i % 131) as f32 * 0.03125)
+            } else {
+                bf16::NAN
+            }
+        })
+        .collect();
+    let mut hidden = s.clone_htod(&values)?;
+    let ops = Ops::new(&d.ctx)?;
+    let hidden_view = view(&hidden, s, [3, spec.hidden], [u64::from(spec.hidden), 1])?;
+    s.memset_zeros(&mut flag)?;
+    ops.finite(s, hidden_view, flag_view)?;
+    ensure!(
+        s.clone_dtoh(&flag.slice(7..8))? == [0],
+        "finite check read inactive hidden tail"
+    );
+    values[count - 1] = bf16::NAN;
+    s.memcpy_htod(&values, &mut hidden)?;
+    ops.finite(s, hidden_view, flag_view)?;
+    ensure!(
+        s.clone_dtoh(&flag.slice(7..8))? == [1],
+        "finite check missed the last active hidden element"
+    );
+    damaged_controls += 1;
+    let short_flag = s.clone_htod(&[0x1357u32, 0])?;
+    let short_view = view(&short_flag, s, [2], [1])?;
+    values[count - 1] = bf16::from_f32(0.5);
+    s.memcpy_htod(&values, &mut hidden)?;
+    ops.finite(s, hidden_view, short_view)?;
+    ensure!(
+        s.clone_dtoh(&short_flag)? == [0x1357, 0],
+        "finite check wrote outside bootstrap status word"
+    );
+    values[count - 1] = bf16::NAN;
+    s.memcpy_htod(&values, &mut hidden)?;
+    ops.finite(s, hidden_view, short_view)?;
+    ensure!(
+        s.clone_dtoh(&short_flag)? == [0x1357, 1],
+        "finite check missed bootstrap status word"
+    );
+    damaged_controls += 1;
+    eprintln!(
+        "Q38_MTP_DEVICE_BOUNDARY_PASS staged_shapes=4 hidden_shape=[3,{}] damaged_controls={damaged_controls} sticky_status=true source_word_offset=1 status_word_offsets=[1,7]",
+        spec.hidden
     );
     eprintln!(
         "Q38_STATE_PROBE mapping/byte_accounting/nonzero_prefix/S/history/KV_window/token/reset/repeated_metadata_graph PASS"

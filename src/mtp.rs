@@ -211,10 +211,15 @@ fn scratch_bytes(capacity: usize, rows: usize) -> Result<usize> {
         .and_then(|n| n.checked_add(255))
         .context("MTP scratch overflow")?
         & !255;
-    let decode = usize::try_from(
-        AttentionWorkspace::q38(1, capacity as u32, 256.min((capacity / 32 * 32) as u32))?.bytes,
+    let repair = usize::try_from(
+        AttentionWorkspace::q38(
+            rows.min(3) as u32,
+            capacity as u32,
+            256.min((capacity / 32 * 32) as u32),
+        )?
+        .bytes,
     )?;
-    Ok(prep.max(decode))
+    Ok(prep.max(repair))
 }
 #[cfg(any(feature = "cuda", test))]
 pub(crate) struct AttachmentBudget {
@@ -307,7 +312,7 @@ pub(crate) fn snapshot_bytes(spec: &ModelSpec) -> Result<usize> {
 pub(crate) fn batch_bytes(spec: &ModelSpec) -> Result<usize> {
     checkpoint_bytes(spec, 4)?
         .checked_add(snapshot_bytes(spec)?)
-        .and_then(|n| n.checked_add(4 * VOCAB * 2 + 36))
+        .and_then(|n| n.checked_add((4 * VOCAB + 5 * HIDDEN) * 2 + 48))
         .context("MTP batch buffer overflow")
 }
 
@@ -339,6 +344,7 @@ pub(crate) fn attachment_bytes(
         checkpoint_bytes(spec, 4)?,
         checkpoint_bytes(&component_spec(spec), 4)?,
         bootstrap,
+        (4 * HIDDEN + VOCAB) * 2 + 8,
         if batched { batch_bytes(spec)? } else { 0 },
     ]
     .into_iter()
@@ -487,6 +493,35 @@ mod tests {
         assert!(!L::MtpProbe.selects(S::Vision));
         assert!(!L::TextOnly.selects(S::Mtp));
         assert!(L::TextWithMtp.selects(S::Text));
+    }
+
+    #[test]
+    fn canonical_repair_scratch_covers_bound_rows() -> Result<()> {
+        for capacity in [32, 64, 128, 4096, 18432] {
+            for rows in [1, 2, 3, 16, 53, 116, 2048] {
+                if rows > capacity {
+                    continue;
+                }
+                let bytes = scratch_bytes(capacity, rows)?;
+                assert!(bytes.is_multiple_of(256));
+                for repair_rows in 1..=rows.min(3) {
+                    let required = AttentionWorkspace::q38(
+                        repair_rows as u32,
+                        capacity as u32,
+                        256.min((capacity / 32 * 32) as u32),
+                    )?
+                    .bytes as usize;
+                    assert!(
+                        bytes >= required,
+                        "capacity={capacity} bound_rows={rows} repair_rows={repair_rows}: allocated={bytes} required={required}"
+                    );
+                }
+            }
+        }
+        assert_eq!(scratch_bytes(64, 1)?, 27_136);
+        assert_eq!(scratch_bytes(64, 2)?, 53_760);
+        assert_eq!(scratch_bytes(64, 3)?, 80_896);
+        Ok(())
     }
 
     #[test]
