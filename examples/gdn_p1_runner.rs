@@ -22,6 +22,8 @@ const TIMING_BLOCKS: u32 = 12;
 const IDENTITY_MIN_RUNS: u32 = 20;
 /// ULP floor margin below the model's frac_le_1ulp.
 const FRAC_FLOOR_MARGIN: f64 = 0.02;
+/// Decode steps the e2e phase runs and discards before it resets.
+const E2E_WARMUP_STEPS: usize = 4;
 
 #[cfg(feature = "cuda")]
 const P1_MODULE: &str = "gdn/gdn_chunkwise_p1";
@@ -103,20 +105,7 @@ struct E2eArgs {
 fn run_e2e(a: &E2eArgs) -> Result<()> {
     use flyingfish::model::Model;
     use std::time::Instant;
-    ensure!(a.prefill_reps > 0 && a.decode_steps > 0, "positive reps");
-    let ids: Vec<u32> =
-        serde_json::from_slice(&std::fs::read(&a.tokens_file)?).context("tokens file")?;
-    let need = ids
-        .len()
-        .checked_add(a.decode_steps)
-        .context("token count + decode steps overflows usize")?;
-    ensure!(
-        !ids.is_empty() && need <= a.capacity,
-        "{need} positions ({} tokens + {} decode steps) against capacity {}",
-        ids.len(),
-        a.decode_steps,
-        a.capacity
-    );
+    let ids = read_e2e_ids(a)?;
     let settings = flyingfish::backend::Settings {
         tree_builder: flyingfish::backend::TreeBuilder::Waves,
         spec_budget: flyingfish::backend::SpecBudget::Chain,
@@ -131,7 +120,7 @@ fn run_e2e(a: &E2eArgs) -> Result<()> {
     // One discarded prefill+decode warms caches and graphs; reset is the clean state.
     model.reset()?;
     let _ = model.prefill(&ids, None)?;
-    for _ in 0..4 {
+    for _ in 0..E2E_WARMUP_STEPS {
         model.step(false)?;
     }
     model.reset()?;
@@ -166,8 +155,27 @@ fn run_e2e(a: &E2eArgs) -> Result<()> {
     Ok(())
 }
 
+/// The e2e phase's token file and the capacity it must fit, checked on both legs.
+fn read_e2e_ids(a: &E2eArgs) -> Result<Vec<u32>> {
+    ensure!(a.prefill_reps > 0 && a.decode_steps > 0, "positive reps");
+    let ids: Vec<u32> =
+        serde_json::from_slice(&std::fs::read(&a.tokens_file)?).context("tokens file")?;
+    let need = e2e_positions(ids.len(), a.decode_steps)?;
+    ensure!(
+        !ids.is_empty() && need <= a.capacity,
+        "{need} positions ({} tokens + {} steps, the warm-up's {} included) against \
+         capacity {}",
+        ids.len(),
+        a.decode_steps,
+        E2E_WARMUP_STEPS,
+        a.capacity
+    );
+    Ok(ids)
+}
+
 #[cfg(not(feature = "cuda"))]
-fn run_e2e(_a: &E2eArgs) -> Result<()> {
+fn run_e2e(a: &E2eArgs) -> Result<()> {
+    read_e2e_ids(a)?;
     anyhow::bail!("the e2e phase needs the crate's cuda feature")
 }
 
@@ -245,7 +253,15 @@ fn synth(rows: usize, array: u64, n: usize) -> Vec<f32> {
         z ^= z >> 31;
         // (0,1) scaled to about +/-1, the frozen fixtures' regime.
         let unit = ((z >> 40) as f32 / 8_388_608.0) - 1.0;
-        out.push(unit);
+        // q, k, v and S0 are signed values and stay unit; beta and g carry the
+        // production transforms of q38_gdn_gates (kernels/q38_common.cu:387-389), so
+        // beta = BF16(sigmoid(b)) >= 0 and g = -exp(a_log) * softplus(a + dt) <= 0.
+        let value = match array {
+            4 => 1.0 / (1.0 + (-unit).exp()),
+            5 => -(-unit).exp().ln_1p(),
+            _ => unit,
+        };
+        out.push(value);
     }
     out
 }
@@ -550,10 +566,24 @@ fn open_package(root: &Path) -> Result<Package> {
     }
     for fx in &manifest.fixtures {
         for w in ["out", "state"] {
+            let key = (fx.name.clone(), w.to_string());
+            let t = truth
+                .get(&key)
+                .with_context(|| format!("manifest has no {w} truth for fixture {}", fx.name))?;
+            // The truth record's own bytes are SHA-verified above; this binds it to the
+            // fixture it claims to describe, so a swapped record cannot be substituted.
+            let want: Vec<usize> = if w == "out" {
+                vec![fx.m, HEADS, DK]
+            } else {
+                vec![HEADS, DK, DV]
+            };
             ensure!(
-                truth.contains_key(&(fx.name.clone(), w.to_string())),
-                "manifest has no {w} truth for fixture {}",
-                fx.name
+                t.shape == want,
+                "truth {} for {} is {:?}, the fixture is {:?}",
+                t.path,
+                fx.name,
+                t.shape,
+                want
             );
         }
     }
@@ -1020,11 +1050,12 @@ fn split_smem(s: u32) -> Result<u32> {
     })
 }
 
+const HEADS: usize = 48;
+const DK: usize = 128;
+const DV: usize = 128;
+
 /// Checks every fixture against the kernel ABI shapes (q/k/v [M,48,D], beta/g [M,48], S0 [48,128,128]) before any array read.
 fn check_fixture_shapes(fx: &Fixture) -> Result<(usize, usize, usize)> {
-    const HEADS: usize = 48;
-    const DK: usize = 128;
-    const DV: usize = 128;
     ensure!(fx.m >= 1, "fixture {} has no live row", fx.name);
     let want = |array: &str, shape: &[usize]| -> Result<()> {
         let rec = fx
@@ -1180,6 +1211,8 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
             eprintln!("  {:16} C{} s{s:<2} {verdict}", fx.name, args.c);
         }
     }
+    let residual = residual_status(&pkg.manifest.residual_record_spec);
+    invalidate_for_missing_residual(&mut rows, &residual);
     let device_touched = gpu.is_some();
     let device = device_of(gpu.as_ref());
     if device_touched && !qualified_topology(device.as_ref()) {
@@ -1231,7 +1264,7 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
         ulp_floor: pkg.basis_doc.ulp_floor,
         chunk_sizes_evaluated: vec![args.c],
         splits_evaluated: args.s.clone(),
-        residual: residual_status(&pkg.manifest.residual_record_spec),
+        residual,
         environment: env_receipt(args.simulate_box3, device.clone(), device_touched),
         inputs_reused_from_manifest: true,
         rows,
@@ -1270,9 +1303,25 @@ fn write_f32(path: &Path, data: &[f32]) -> Result<()> {
     std::fs::write(path, &bytes).with_context(|| format!("write {}", path.display()))
 }
 
+/// A row cannot carry PASS while a record the manifest declares required is absent.
+fn invalidate_for_missing_residual(rows: &mut [GateRow], residual: &ResidualStatus) {
+    if residual.emitted {
+        return;
+    }
+    for r in rows.iter_mut() {
+        if r.verdict == "PASS" {
+            r.verdict = "INVALID";
+            r.failures.push(format!(
+                "the registered residual record is required by {} and is not emitted: {}",
+                residual.required_by, residual.reason
+            ));
+        }
+    }
+}
+
 fn residual_status(spec: &ResidualSpec) -> ResidualStatus {
     ResidualStatus {
-        required_by: "4d 2026-10-13T07:06:44Z item 1",
+        required_by: "4d 2026-10-13T07:06:44Z item 1", // item 1 of that ruling
         what: spec.what.clone(),
         norms: spec.norms.clone(),
         not: spec.not.clone(),
@@ -2524,6 +2573,14 @@ fn main() -> Result<()> {
     }
 }
 
+/// The positions the e2e phase must reserve: the tokens plus the measured decode steps,
+/// and the fixed warm-up when that is longer.
+fn e2e_positions(tokens: usize, decode_steps: usize) -> Result<usize> {
+    tokens
+        .checked_add(decode_steps.max(E2E_WARMUP_STEPS))
+        .context("token count + warm-up/decode steps overflows usize")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2555,6 +2612,78 @@ mod tests {
             slower.0, "NOT_CLEARED",
             "a 10% slower P1 must not clear: {slower:?}"
         );
+    }
+
+    #[test]
+    fn the_e2e_reservation_counts_the_fixed_warm_up() {
+        // 16 tokens with 2 measured steps: the 4 warm-up steps are the binding term.
+        assert_eq!(e2e_positions(16, 2).unwrap(), 20);
+        assert_eq!(e2e_positions(16, 8).unwrap(), 24);
+        assert!(e2e_positions(16, 2).unwrap() > 16 + 2);
+        assert!(e2e_positions(1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn the_synthesised_beta_and_g_sit_inside_their_production_domains() {
+        for rows in [1usize, 64, 1021] {
+            let (_, arrays) = synth_case(rows);
+            assert!(
+                arrays.beta.iter().all(|b| (0.0..=1.0).contains(b)),
+                "beta left (0,1) at {rows} rows"
+            );
+            assert!(
+                arrays.g.iter().all(|v| *v <= 0.0),
+                "g went positive at {rows} rows"
+            );
+            assert!(
+                arrays.g.iter().any(|v| *v < 0.0),
+                "g is all zero at {rows} rows"
+            );
+            assert!(
+                arrays.q.iter().any(|v| *v < 0.0) && arrays.q.iter().any(|v| *v > 0.0),
+                "q lost its signed range at {rows} rows"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_required_residual_makes_the_verdict_invalid() {
+        let residual = ResidualStatus {
+            required_by: "test",
+            what: String::new(),
+            norms: Vec::new(),
+            not: String::new(),
+            emitted: false,
+            reason: "the candidate T is not emitted".to_string(),
+        };
+        let mut row = GateRow {
+            case: "c63".into(),
+            c: 64,
+            s: 8,
+            chunks: 1,
+            multi_chunk: false,
+            model_out_max_abs: 1.0,
+            model_out_rel_rms: 1.0,
+            model_state_rel_rms: 1.0,
+            model_frac_le_1ulp: 1.0,
+            got_out_max_abs: 1.0,
+            got_out_rel_rms: 1.0,
+            got_state_rel_rms: 1.0,
+            got_frac_le_1ulp: 1.0,
+            ratio_out_max_abs: 1.0,
+            ratio_out_rel_rms: 1.0,
+            ratio_state_rel_rms: 1.0,
+            frac_margin: 0.1,
+            out_finite: true,
+            state_finite: true,
+            lengths_match: true,
+            heads_present: 48,
+            failures: Vec::new(),
+            verdict: "PASS",
+        };
+        invalidate_for_missing_residual(std::slice::from_mut(&mut row), &residual);
+        assert_eq!(row.verdict, "INVALID");
+        assert!(row.failures.iter().any(|f| f.contains("required by test")));
     }
 
     #[test]
