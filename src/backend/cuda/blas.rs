@@ -600,6 +600,47 @@ impl Blas {
         self.fp8 = Some(super::linear::Fp8Ops::new(ctx)?);
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn bound_plan_receipt(&self) -> Result<serde_json::Value> {
+        use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
+        let mut plans = Vec::new();
+        for (&(rows, output, input, index), p) in self.plans.borrow().iter() {
+            let attr16 = |attribute| -> Result<u16> {
+                let mut value = 0u16;
+                let mut written = 0usize;
+                unsafe {
+                    sys::cublasLtMatmulAlgoConfigGetAttribute(
+                        p.algo.as_ref().context("fixed Lt algorithm missing")?,
+                        attribute,
+                        (&mut value as *mut u16).cast(),
+                        size_of::<u16>(),
+                        &mut written,
+                    )
+                    .result()?;
+                }
+                ensure!(written == size_of::<u16>(), "Lt short attribute size");
+                Ok(value)
+            };
+            plans.push(serde_json::json!({
+                "rows":rows,"output":output,"input":input,"algo_index":index,
+                "id":p.attr(A::CUBLASLT_ALGO_CONFIG_ID)?,
+                "tile":p.attr(A::CUBLASLT_ALGO_CONFIG_TILE_ID)?,
+                "split_k":p.attr(A::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?,
+                "reduction_scheme":p.attr(A::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME)?,
+                "workspace_bytes":p.workspace,
+                "cta_swizzling":p.attr(A::CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING)?,
+                "custom_option":p.attr(A::CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION)?,
+                "stages_id":p.attr(A::CUBLASLT_ALGO_CONFIG_STAGES_ID)?,
+                "inner_shape_id":attr16(A::CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID)?,
+                "cluster_shape_id":attr16(A::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID)?,
+                "opaque_algorithm":p.algo.as_ref().context("fixed Lt algorithm missing")?.data
+            }));
+        }
+        ensure!(!plans.is_empty(), "fixed Lt plans missing");
+        Ok(
+            serde_json::json!({"lt":plans,"fp8_small_bound":self.fp8.is_some(),"biased_plans":self.biased_plans.borrow().len(),"measured_choices":self.choices.borrow().len()}),
+        )
+    }
     pub(crate) fn fp8_ops(&self) -> Result<&super::linear::Fp8Ops> {
         self.fp8.as_ref().context("FP8 operators not bound")
     }

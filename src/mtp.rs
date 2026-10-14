@@ -286,9 +286,28 @@ pub(crate) fn component_spec(spec: &ModelSpec) -> ModelSpec {
 }
 
 #[cfg(any(feature = "cuda", test))]
+pub(crate) fn snapshot_bytes(spec: &ModelSpec) -> Result<usize> {
+    let g = crate::op_contract::GdnSpec::q38();
+    let layers = spec
+        .layers
+        .iter()
+        .filter(|l| l.mixer == crate::model_spec::Mixer::Gdn)
+        .count();
+    usize::try_from(
+        g.state_bytes()?
+            .checked_add(g.history_bytes()?)
+            .and_then(|n| n.checked_mul(4))
+            .context("snapshot byte overflow")?,
+    )?
+    .checked_mul(layers)
+    .context("snapshot layer byte overflow")
+}
+
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn batch_bytes(spec: &ModelSpec) -> Result<usize> {
     checkpoint_bytes(spec, 4)?
-        .checked_add(4 * VOCAB * 2 + 36)
+        .checked_add(snapshot_bytes(spec)?)
+        .and_then(|n| n.checked_add(4 * VOCAB * 2 + 36))
         .context("MTP batch buffer overflow")
 }
 
@@ -496,6 +515,14 @@ mod tests {
         assert_eq!(bootstrap_rows(33, 16)?, [1, 15, 16]);
         assert_eq!(bootstrap_rows(53, 16)?, [1, 5, 15, 16]);
         let s = spec();
+        assert_eq!(snapshot_bytes(&s)?, 627572736);
+        for capacity in [4096, 131072] {
+            let budget = AttachmentBudget::new(&s, capacity)?;
+            assert_eq!(
+                budget.fixed_bytes + 4 * budget.row_bytes + budget.workspace(4)?,
+                attachment_bytes(&s, capacity, 4, true)?
+            );
+        }
         let p = MtpPlan {
             max_rows: 16,
             capacity: 128,

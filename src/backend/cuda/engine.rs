@@ -1703,6 +1703,9 @@ impl Engine {
 
     pub fn reset(&mut self) -> Result<()> {
         self.poisoned = true;
+        if let Some(chain) = self.mtp.as_mut() {
+            chain.invalidate_verify();
+        }
         {
             self.mtp_epoch = self
                 .mtp_epoch
@@ -2025,6 +2028,9 @@ impl Engine {
         self.device.stream.synchronize()?;
         self.logits_cache.invalidate();
         self.poisoned = true;
+        if let Some(chain) = self.mtp.as_mut() {
+            chain.invalidate_verify();
+        }
         let result = self.restore_text_prefix_from(snapshot, intent.prefix_ids, ring);
         if let Err(error) = result {
             self.device.stream.synchronize()?;
@@ -2372,6 +2378,9 @@ impl Engine {
             return Ok(());
         }
         self.closure.capture()?;
+        if let Some(chain) = self.mtp.as_mut() {
+            chain.invalidate_verify();
+        }
         self.ensure_decode()?;
         ensure!(
             self.position < self.capacity,

@@ -89,7 +89,7 @@ __device__ __forceinline__ bool aligned16(const void* p) {
 //   sVb  [C][VW]   beta.V,     FP32 -- reused as the w / v_new buffer once w is formed
 //   sKbS [C][VW]   kb @ S,     FP32 -- reused as the sOut buffer once consumed
 //   sT   [C][C]    L, then A, then T: one buffer, three uses
-template <int VSPLIT>
+template <int VSPLIT, bool SNAPSHOT = false>
 __device__
 void gdn_chunked_core_t(
         const float* __restrict__ q,      // FP32 [M, HEADS, DK], pre-scaled by 1/sqrt(DK)
@@ -100,7 +100,7 @@ void gdn_chunked_core_t(
         float* __restrict__ S,            // FP32 [HEADS, DK, DV]
         __nv_bfloat16* __restrict__ out,  // BF16 [M, HEADS, DV]
         const GdnMeta* __restrict__ meta,
-        int valid_rows_in
+        int valid_rows_in, float* snapshots
 // Negative-control build; never defined by build.rs.
 #ifdef GDN_DUMP_PARTS
         , float* __restrict__ dump_inter, float* __restrict__ dump_attn
@@ -123,6 +123,7 @@ void gdn_chunked_core_t(
         meta->key_count != prefix + valid_rows || meta->capacity < meta->key_count) {
         __trap(); return;
     }
+    if (SNAPSHOT && (!aligned16(snapshots) || valid_rows > 4)) { __trap(); return; }
     // ExecutionPhase selects this core even for a single prefill row. Partial
     // chunks mask inactive rows with neutral beta=0 and g=0 values (ABI §6).
 
@@ -370,6 +371,22 @@ void gdn_chunked_core_t(
             __syncthreads();
         }
 
+        if (SNAPSHOT) {
+            for (int r = 0; r < valid_rows; ++r) {
+                #pragma unroll
+                for (int a = 0; a < RT; ++a)
+                    #pragma unroll
+                    for (int b = 0; b < TC; ++b) {
+                        float acc = Sr[a][b] * __expf(sG[r]);
+                        for (int t = 0; t <= r; ++t)
+                            acc = fmaf(sKb[t * GDN_DK + i0 + a] * __expf(sG[r] - sG[t]),
+                                       sKbS[t * VW + jb + b], acc);
+                        snapshots[((size_t)r * GDN_HEADS + head) * GDN_DK * GDN_DV +
+                                  (i0 + a) * GDN_DV + j0 + jb + b] = acc;
+                    }
+            }
+        }
+
         // ---- S = S * e^{G_{C-1}} + (k .* e^{G_{C-1}-G})^T @ v_new
         {
             const float decay = __expf(sG[GDN_CHUNK - 1]);
@@ -420,7 +437,7 @@ extern "C" __global__ __launch_bounds__(GDN_THREADS, 1)
 void gdn_chunked_core_v1(const float* q, const float* k, const float* v,
                         const float* beta, const float* g, float* S,
                         __nv_bfloat16* out, const GdnMeta* meta, int valid_rows) {
-    gdn_chunked_core_t<1>(q, k, v, beta, g, S, out, meta, valid_rows GDN_DUMP_ARGS);
+    gdn_chunked_core_t<1>(q, k, v, beta, g, S, out, meta, valid_rows, nullptr GDN_DUMP_ARGS);
 }
 
 // Negative-control build; never defined by build.rs.
@@ -431,6 +448,14 @@ void gdn_chunked_core_v1(const float* q, const float* k, const float* v,
 extern "C" __global__ void gdn_chunked_core_v1_dump(const float* q, const float* k, const float* v,
     const float* beta, const float* g, float* S, __nv_bfloat16* out,
     const GdnMeta* meta, int valid_rows, float* dump_inter, float* dump_attn) {
-    gdn_chunked_core_t<1>(q, k, v, beta, g, S, out, meta, valid_rows, dump_inter, dump_attn);
+    gdn_chunked_core_t<1>(q, k, v, beta, g, S, out, meta, valid_rows, nullptr, dump_inter, dump_attn);
 }
 #endif
+
+extern "C" __global__ __launch_bounds__(GDN_THREADS, 1)
+void gdn_chunked_core_snapshot(const float* q, const float* k, const float* v,
+                              const float* beta, const float* g, float* S,
+                              __nv_bfloat16* out, const GdnMeta* meta, int valid_rows,
+                              float* snapshots) {
+    gdn_chunked_core_t<1, true>(q, k, v, beta, g, S, out, meta, valid_rows, snapshots GDN_DUMP_ARGS);
+}

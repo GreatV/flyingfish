@@ -1,14 +1,15 @@
-//! M2b policy: retain full verification state, replay partial prefixes once.
+//! Batched verification commits a retained recurrent prefix without target replay.
 use super::{
     MtpOptions,
     transaction::{self, Backend, Round},
 };
 use anyhow::{Result, ensure};
 
-/// Batch calls use an explicitly selected prefill phase, including one-row
-/// partial replays. The backend retains their hidden rows for MTP repair.
+/// Verification retains each row's recurrent state and hidden rows for MTP repair.
 pub trait BatchedBackend: Backend {
     fn verify_batch(&mut self, inputs: &[u32]) -> Result<Vec<u32>>;
+    /// Select the committed target prefix and its pending prediction.
+    fn select_prefix(&mut self, rows: usize) -> Result<()>;
     /// Preserve the verified target state and its hidden-row buffer.
     fn restore_mtp(&mut self) -> Result<()>;
     /// Rebuild canonical MTP rows from the saved boundary and latest target batch.
@@ -21,8 +22,7 @@ pub enum Fault {
     AfterDraft(usize),
     AfterVerify,
     AfterMtpRestore,
-    AfterTargetRestore,
-    AfterReplay,
+    AfterPrefixSelect,
     AfterRepair,
     BeforePublish,
 }
@@ -32,7 +32,6 @@ pub struct BatchRound {
     pub round: Round,
     pub kept_verify_state: bool,
     pub verify_predictions: Vec<u32>,
-    pub replay_predictions: Option<Vec<u32>>,
 }
 
 #[cfg(test)]
@@ -42,6 +41,26 @@ fn inject(fault: Option<Fault>, point: Fault) -> Result<()> {
         "injected batched MTP failure at {point:?}"
     );
     Ok(())
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn snapshot_row(
+    rows: usize,
+    live: usize,
+    base: usize,
+    position: usize,
+    epoch: Option<u64>,
+    expected_epoch: u64,
+) -> Result<usize> {
+    ensure!(
+        (1..=4).contains(&live)
+            && rows > 0
+            && rows < live
+            && base.checked_add(live) == Some(position)
+            && epoch == Some(expected_epoch),
+        "stale or invalid verify snapshot extent/epoch"
+    );
+    Ok(rows - 1)
 }
 
 pub fn run<B: BatchedBackend>(
@@ -60,7 +79,6 @@ pub fn run<B: BatchedBackend>(
             round: Round::default(),
             kept_verify_state: false,
             verify_predictions: vec![],
-            replay_predictions: None,
         });
     }
     let k = options
@@ -72,7 +90,6 @@ pub fn run<B: BatchedBackend>(
         let fault = match fault {
             Some(Fault::BeforePublish) => Some(transaction::Fault::BeforePublish),
             Some(Fault::AfterRepair) => Some(transaction::Fault::AfterCanonical(0)),
-            Some(Fault::AfterReplay) => Some(transaction::Fault::AfterReplay(0)),
             _ => None,
         };
         let round = transaction::run(
@@ -87,7 +104,6 @@ pub fn run<B: BatchedBackend>(
             round,
             kept_verify_state: false,
             verify_predictions: vec![],
-            replay_predictions: None,
         });
     }
     if let Err(e) = b.save(k + 1) {
@@ -124,27 +140,18 @@ pub fn run<B: BatchedBackend>(
             .unwrap_or(matched);
         let keep = accepted == k;
         let committed = &inputs[..accepted + 1];
-        let replay;
-        let pending;
+        let pending = verify[accepted];
         if keep {
             b.restore_mtp()?;
             #[cfg(test)]
             inject(fault, Fault::AfterMtpRestore)?;
-            replay = None;
-            pending = verify[k];
         } else {
-            b.restore()?;
+            b.select_prefix(committed.len())?;
             #[cfg(test)]
-            inject(fault, Fault::AfterTargetRestore)?;
-            let predictions = b.verify_batch(committed)?;
-            ensure!(
-                predictions.len() == committed.len(),
-                "batch replay prediction count mismatch"
-            );
-            pending = predictions[accepted];
-            replay = Some(predictions);
+            inject(fault, Fault::AfterPrefixSelect)?;
+            b.restore_mtp()?;
             #[cfg(test)]
-            inject(fault, Fault::AfterReplay)?;
+            inject(fault, Fault::AfterMtpRestore)?;
         }
         b.repair_mtp(committed)?;
         #[cfg(test)]
@@ -168,7 +175,6 @@ pub fn run<B: BatchedBackend>(
             },
             kept_verify_state: keep,
             verify_predictions: verify,
-            replay_predictions: replay,
         })
     })();
     match result {
@@ -178,6 +184,7 @@ pub fn run<B: BatchedBackend>(
                 b.poison();
                 return Err(restore.context(format!("M2b rollback failed after: {e:#}")));
             }
+            b.poison();
             Err(e)
         }
     }

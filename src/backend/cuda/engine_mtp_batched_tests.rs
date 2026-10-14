@@ -1,5 +1,6 @@
 use super::super::tests::{configure, load, options, output, prompt, restore, save, state_bits};
 use super::*;
+use std::path::PathBuf;
 
 #[test]
 fn eager_setup_creates_no_verify_graphs_or_capture_work() -> Result<()> {
@@ -85,41 +86,54 @@ fn proposals(e: &mut Engine, k: usize) -> Result<Vec<u32>> {
     );
     Ok(inputs[1..].to_vec())
 }
-// Independent same-partition rebuild: one target batch, then canonical MTP
-// rows directly from C(P)'s H2 and that batch's H2 rows. It never invokes the
-// transaction controller, restore_mtp or repair_mtp. Keep the prepared R-row
-// core: a full C32 binding has a different floating-point evaluation order.
-fn canonical(e: &mut Engine, inputs: &[u32]) -> Result<Vec<u32>> {
+// This oracle materializes the chosen GPU slot without the production selector.
+// Primitive gates independently check the slot contents against row recurrence.
+fn canonical(e: &mut Engine, inputs: &[u32], rows: usize) -> Result<Vec<u32>> {
     ensure!(
         !e.mtp.as_ref().context("MTP missing")?.options.graph,
-        "same-partition oracle must run eagerly"
+        "oracle must run eagerly"
     );
-    e.qwen_full_prefill_for_test(true)?;
-    let result = call(e, |b| {
+    call(e, |b| {
+        let start = b.engine.position;
         let hidden = b.chain.last_target.clone();
         let predictions = b.verify_batch(inputs)?;
-        let frame = b
-            .chain
-            .batch
-            .as_ref()
-            .context("batch missing")?
-            .frame
-            .clone();
-        for (row, &token) in inputs.iter().enumerate() {
+        let batch = b.chain.batch.as_ref().context("batch missing")?;
+        let frame = batch.frame[..rows * HIDDEN].to_vec();
+        let s = &b.engine.device.stream;
+        for (state, snapshot) in b.engine.state.gdn.iter_mut().zip(&batch.snapshots) {
+            for (target, source) in [
+                (&mut state.s, &snapshot.s),
+                (&mut state.history, &snapshot.history),
+            ] {
+                let n = target.len();
+                let values = s.clone_dtoh(&source.slice((rows - 1) * n..rows * n))?;
+                s.memcpy_htod(&values, target)?;
+            }
+        }
+        s.memcpy_dtod(
+            &batch.logits.slice((rows - 1) * VOCAB..rows * VOCAB),
+            &mut b.engine.work.logits,
+        )?;
+        s.memcpy_htod(&[predictions[rows - 1]], &mut b.engine.work.token)?;
+        let position = start + rows;
+        s.memcpy_htod(&[position as i32], &mut b.engine.work.position)?;
+        s.memcpy_htod(&[(position + 1) as i32], &mut b.engine.work.length)?;
+        b.engine
+            .state
+            .set_sequence(s, position as u32, 1, b.engine.workspace_rows as u32)?;
+        b.engine.position = position;
+        for (row, &token) in inputs[..rows].iter().enumerate() {
             let h = if row == 0 {
                 &hidden
             } else {
                 &frame[(row - 1) * HIDDEN..row * HIDDEN]
             };
-            // Retain the old head-producing row as the canonical state oracle.
             b.row(token, h, OutputMode::Predict)?;
         }
-        b.chain.last_target = frame[(inputs.len() - 1) * HIDDEN..].to_vec();
+        b.chain.last_target = frame[(rows - 1) * HIDDEN..rows * HIDDEN].to_vec();
         b.chain.committed_position = b.engine.position;
-        Ok(predictions)
-    });
-    e.qwen_full_prefill_for_test(false)?;
-    result
+        Ok(predictions[..rows].to_vec())
+    })
 }
 fn receipt(name: &str, value: serde_json::Value) -> Result<()> {
     std::fs::write(
@@ -144,22 +158,22 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
                 let full = proposals(&mut e, k)?;
                 let anchor = e.token()?;
                 for j in 0..=k {
+                    let mut forced = full.clone();
+                    if j < k {
+                        forced[j] = (forced[j] + 1) % VOCAB as u32;
+                    }
                     let inputs: Vec<_> = std::iter::once(anchor)
-                        .chain(full[..j].iter().copied())
+                        .chain(forced.iter().copied())
                         .collect();
                     // Eager canonical is also the graph parity oracle.
                     e.mtp.as_mut().context("MTP missing")?.options.graph = false;
-                    let expected = canonical(&mut e, &inputs)?;
+                    let expected = canonical(&mut e, &inputs, j + 1)?;
                     let bits = state_bits(&e)?;
                     restore(&mut e)?;
                     for graph in [false, true] {
                         let c = e.mtp.as_mut().context("MTP missing")?;
                         c.options.graph = graph;
-                        let mut forced = full.clone();
-                        if j < k {
-                            forced[j] = (forced[j] + 1) % VOCAB as u32;
-                        }
-                        c.force_proposals = Some(forced);
+                        c.force_proposals = Some(forced.clone());
                         let head_runs = c.runtime.head_runs;
                         let before = counts(&e)?;
                         let r = e.mtp_batch_round(64, None)?;
@@ -179,7 +193,7 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
                         );
                         ensure!(
                             (after.0 - before.0, after.1 - before.1, after.2 - before.2)
-                                == if j == k { (1, 0, 1) } else { (2, 1, 0) },
+                                == (1, 0, 1),
                             "M2b full/partial path did extra target work"
                         );
                         ensure!(
@@ -252,7 +266,7 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
     );
     receipt(
         "m2b-transaction",
-        serde_json::json!({"result":"PASS","cases":cases,"state_oracle":"independent same-partition eager rebuild; all target/MTP states and invalid KV tail","paths":"full:1batch+0target_restore; partial:2batch+1target_restore","tail_eos_epoch":"PASS"}),
+        serde_json::json!({"result":"PASS","cases":cases,"state_oracle":"independent slot materialization; all target/MTP states and physical KV tail","paths":"all:1batch+0target_restore+1mtp_restore","tail_eos_epoch":"PASS"}),
     )
 }
 
@@ -340,8 +354,8 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
             points.extend((0..3).map(policy::Fault::AfterDraft));
             if partial {
                 points.extend([
-                    policy::Fault::AfterTargetRestore,
-                    policy::Fault::AfterReplay,
+                    policy::Fault::AfterPrefixSelect,
+                    policy::Fault::AfterMtpRestore,
                 ]);
             } else {
                 points.push(policy::Fault::AfterMtpRestore);
@@ -352,9 +366,10 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
                     "batch round fault ignored {fault:?}"
                 );
                 ensure!(
-                    !e.poisoned && state_bits(&e)? == before,
+                    e.poisoned && state_bits(&e)? == before,
                     "batch rollback mismatch {fault:?}"
                 );
+                e.poisoned = false;
                 faults += 1;
             }
             for row in 0..if partial { 2 } else { 4 } {
@@ -370,7 +385,7 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
                     "canonical row fault ignored"
                 );
                 ensure!(
-                    !e.poisoned && state_bits(&e)? == before,
+                    e.poisoned && state_bits(&e)? == before,
                     "canonical row rollback mismatch"
                 );
                 e.mtp
@@ -380,6 +395,7 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
                     .as_mut()
                     .unwrap()
                     .repair_fail_after = None;
+                e.poisoned = false;
                 faults += 1;
             }
             let r = e.mtp_batch_round(64, None)?;
@@ -395,7 +411,7 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
     }
     receipt(
         "m2b-failure-capture",
-        serde_json::json!({"result":"PASS","capture_boundaries":6,"round_faults":faults,"state_negative_controls":3,"retry":"identical tokens and state"}),
+        serde_json::json!({"result":"PASS","capture_boundaries":6,"round_faults":faults,"state_negative_controls":3,"poison":"required after every failed round; test-only manual clear for further injected faults"}),
     )
 }
 
@@ -430,7 +446,7 @@ fn q38_mtp_batch_chain_gpu() -> Result<()> {
                         {
                             let r = e.mtp_batch_round(64 - tokens.len(), None)?;
                             ensure!(!r.round.tokens.is_empty(), "batch stopped before budget");
-                            rounds.push(serde_json::json!({"matched":r.round.matched,"accepted":r.round.accepted,"consumed":r.round.consumed,"proposals":r.round.proposals,"tokens":r.round.tokens,"kept_verify_state":r.kept_verify_state,"verify_predictions":r.verify_predictions,"replay_predictions":r.replay_predictions}));
+                            rounds.push(serde_json::json!({"matched":r.round.matched,"accepted":r.round.accepted,"consumed":r.round.consumed,"proposals":r.round.proposals,"tokens":r.round.tokens,"kept_verify_state":r.kept_verify_state,"verify_predictions":r.verify_predictions}));
                             tokens.extend_from_slice(&r.round.tokens);
                         }
                         if let Some(expected) = &graph_tokens {
@@ -528,4 +544,244 @@ fn q38_mtp_bootstrap_acceptance_gpu() -> Result<()> {
         "K2 bootstrap acceptance {actual} is outside +/-3% of {reference}"
     );
     Ok(())
+}
+
+#[test]
+#[ignore = "authorized full-model GPU window required; score exported FP32 logits against frozen DRef"]
+fn q38_mtp_snapshot_teacher_forcing_gpu() -> Result<()> {
+    use std::io::Write;
+    let root =
+        PathBuf::from(std::env::var_os("FF_Q38_MTP_REF_ROOT").context("reference root missing")?);
+    let paths: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(root.join("PATHS.json"))?)?;
+    ensure!(paths.len() == 5, "five DREF16K paths required");
+    let model = PathBuf::from(std::env::var_os("FF_Q38_MODEL").context("model missing")?);
+    let runtime =
+        PathBuf::from(std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?);
+    ensure!(
+        std::env::var("FF_Q38_FULL_MODEL_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let options = crate::spec::Options {
+        device: 0,
+        capacity: 16640,
+        chunk: Some(2048),
+        count: 256,
+        ignore_eos: true,
+        backend: crate::backend::Settings {
+            runtime_dir: Some(runtime),
+            prefix_cache: false,
+            tree_builder: crate::backend::TreeBuilder::Waves,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+        },
+    };
+    let mut e = Engine::load_mtp(&model, &options, 3, true)?;
+    let out = output()?;
+    let job: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("MEASURE.json"))?)?;
+    let smoke = job["count"] == 16;
+    let length = if smoke { 12 } else { 64 };
+    let mut completed = Vec::new();
+    for path in paths.into_iter().take(if smoke { 1 } else { 5 }) {
+        let name = path["id"].as_str().context("path id missing")?;
+        let input: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            root.join(path["input_file"].as_str().context("input file missing")?),
+        )?)?;
+        let mut ids: Vec<u32> = serde_json::from_value(input["input_ids"].clone())?;
+        let history: Vec<u32> = serde_json::from_value(path["tokens"].clone())?;
+        ensure!(
+            ids.len() == 16320 && history.len() == 64,
+            "DREF16K extent mismatch"
+        );
+        if smoke {
+            ids.truncate(32);
+        }
+        e.mtp_prefill(&ids)?;
+        let mut predictions = vec![e.token()?];
+        let mut logits =
+            std::io::BufWriter::new(std::fs::File::create(out.join(format!("{name}.f32le")))?);
+        for value in e.decode_logits()? {
+            ensure!(value.is_finite(), "nonfinite prefill logits");
+            logits.write_all(&value.to_le_bytes())?;
+        }
+        let mut offset = 0;
+        let mut round = 0;
+        let mut branches = [0usize; 4];
+        while offset < length - 1 {
+            let rows = (round % 4 + 1).min(length - 1 - offset);
+            let inputs: Vec<_> = (0..4).map(|i| history[(offset + i).min(63)]).collect();
+            let (next, values) = call(&mut e, |b| {
+                b.save(4)?;
+                let mut draft = b.pending()?;
+                for depth in 0..3 {
+                    draft = b.draft(draft, depth)?;
+                }
+                let full = b.verify_batch(&inputs)?;
+                let batch = b.chain.batch.as_ref().context("batch missing")?;
+                let values = b
+                    .engine
+                    .device
+                    .stream
+                    .clone_dtoh(&batch.logits.slice(..rows * VOCAB))?;
+                if rows < 4 {
+                    b.select_prefix(rows)?;
+                }
+                b.restore_mtp()?;
+                b.repair_mtp(&inputs[..rows])?;
+                b.chain.committed_position = b.engine.position;
+                b.chain
+                    .batch
+                    .as_mut()
+                    .context("batch missing")?
+                    .invalidate_frame();
+                Ok((full[..rows].to_vec(), values))
+            })?;
+            ensure!(
+                values.len() == rows * VOCAB && values.iter().all(|v| v.is_finite()),
+                "nonfinite teacher-forced verify logits"
+            );
+            for value in values {
+                logits.write_all(&value.to_f32().to_le_bytes())?;
+            }
+            predictions.extend(next);
+            offset += rows;
+            branches[rows - 1] += 1;
+            round += 1;
+            ensure!(
+                e.position == ids.len() + offset
+                    && e.mtp.as_ref().context("MTP missing")?.cursor + 1 == e.position,
+                "teacher-forced commit metadata mismatch"
+            );
+        }
+        logits.flush()?;
+        e.synchronize()?;
+        ensure!(
+            predictions.len() == length && branches.iter().all(|n| *n > 0),
+            "branch coverage incomplete"
+        );
+        let receipt = serde_json::json!({"path":path,"predictions":predictions,"branches":branches,"logits_shape":[length,VOCAB],"stored_dtype":"FP32 little-endian, widened from native BF16","first_absolute_logit_row":ids.len()-1,"teacher_forcing":"prefill row then forced history, cyclic committed rows 1/2/3/4; full verify with raw snapshots and canonical MTP repair","candidate_DEFECT":"score only"});
+        std::fs::write(
+            out.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&receipt)?,
+        )?;
+        completed.push(receipt);
+    }
+    receipt(
+        "snapshot-teacher-forcing",
+        serde_json::json!({"validity":"PASS","paths":completed,"positions":if smoke {12} else {320},"smoke":smoke}),
+    )
+}
+
+#[test]
+#[ignore = "authorized full-model GPU window required; frozen MEASURE.json"]
+fn q38_mtp_snapshot_measure_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_FULL_MODEL_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let root = PathBuf::from(std::env::var_os("FF_Q38_MTP_REF_ROOT").context("root missing")?);
+    let job: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("MEASURE.json"))?)?;
+    let capacity = usize::try_from(job["capacity"].as_u64().context("capacity missing")?)?;
+    let count = usize::try_from(job["count"].as_u64().context("count missing")?)?;
+    let samples = usize::try_from(job["samples"].as_u64().context("samples missing")?)?;
+    ensure!(
+        [4096, 131072].contains(&capacity)
+            && [16, 256].contains(&count)
+            && (1..=4).contains(&samples),
+        "measurement job outside protocol"
+    );
+    let model = PathBuf::from(std::env::var_os("FF_Q38_MODEL").context("model missing")?);
+    let runtime =
+        PathBuf::from(std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?);
+    let chunk = if job["auto_chunk"].as_bool() == Some(true) {
+        None
+    } else {
+        Some(2048)
+    };
+    let options = crate::spec::Options {
+        device: 0,
+        capacity,
+        chunk,
+        count,
+        ignore_eos: true,
+        backend: crate::backend::Settings {
+            runtime_dir: Some(runtime),
+            prefix_cache: false,
+            tree_builder: crate::backend::TreeBuilder::Waves,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+        },
+    };
+    let mut e = Engine::load_mtp(&model, &options, 3, true)?;
+    let (free, total) = e.device.ctx.mem_get_info()?;
+    ensure!(
+        free >= total / 16,
+        "Ready allocations consumed the unchanged reserve"
+    );
+    receipt(
+        "snapshot-admission",
+        serde_json::json!({"validity":"PASS","capacity":capacity,"requested_chunk":chunk,"chunk":e.chunk,"reserve_divisor":16,"total_bytes":total,"free_bytes":free}),
+    )?;
+    let ids = prompt("math1")?;
+    let mut records = Vec::new();
+    for sample in 0..=samples {
+        let mut rounds = 0;
+        let mut accepted = 0;
+        let mut publications = 0;
+        let result = e.generate_mtp_prepared(
+            &ids,
+            count,
+            true,
+            crate::mtp::VerifyPolicy::Batched,
+            true,
+            &mut |_, a| {
+                if publications > 0 {
+                    rounds += 1;
+                    accepted += a;
+                }
+                publications += 1;
+                true
+            },
+        )?;
+        ensure!(
+            result.ids.len() == count && result.ids.iter().all(|t| (*t as usize) < VOCAB),
+            "incomplete or invalid MTP3 generation"
+        );
+        ensure!(
+            result.decode_ms.is_finite() && result.prefill_ms.is_finite() && result.decode_ms > 0.0,
+            "nonfinite generation timing"
+        );
+        ensure!(
+            e.decode_logits()?.iter().all(|v| v.is_finite()),
+            "nonfinite final MTP3 head"
+        );
+        if sample > 0 {
+            records.push(serde_json::json!({"decode_ms":result.decode_ms,"prefill_ms":result.prefill_ms,"ids":result.ids,"rounds":rounds,"accepted":accepted}));
+        }
+    }
+    receipt(
+        "snapshot-measure",
+        serde_json::json!({"validity":"PASS","capacity":capacity,"chunk":e.chunk,"samples":records,"reserve_divisor":16}),
+    )
+}
+
+#[test]
+#[ignore = "authorized GPU window required; pins main calibration for candidate"]
+fn q38_mtp_snapshot_calibrate_gpu() -> Result<()> {
+    let mut e = super::super::tests::load_capacity(true, 131072)?;
+    e.mtp_enable(options(
+        3,
+        MtpHiddenTap::PostFinalNorm,
+        MtpRecurrentTap::PostMtpNorm,
+        true,
+    ))?;
+    e.mtp_batch_enable()?;
+    receipt(
+        "snapshot-calibration",
+        serde_json::json!({"validity":"PASS","capacity":131072,"linear_rows":"1..16; larger prefill index0","reserve_divisor":16,"plans":e.blas.bound_plan_receipt()?}),
+    )
 }
