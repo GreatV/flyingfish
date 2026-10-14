@@ -97,7 +97,11 @@ pub(super) fn ordinary(e: &mut Engine, count: usize) -> Result<Vec<u32>> {
             let token = b.pending()?;
             // Keep the old head-producing canonical row as the state oracle.
             let hidden = b.chain.last_target.clone();
-            b.row(token, &hidden, OutputMode::Predict)?;
+            b.row(
+                token,
+                matrix(&hidden, &b.engine.device.stream, 0, 1, HIDDEN)?,
+                OutputMode::Predict,
+            )?;
             out.push(b.target_decode(token)?);
         }
         b.chain.committed_position = b.engine.position;
@@ -107,9 +111,94 @@ pub(super) fn ordinary(e: &mut Engine, count: usize) -> Result<Vec<u32>> {
     result
 }
 pub(super) fn state_bits(e: &Engine) -> Result<Vec<u8>> {
+    state_bits_with_visibility(e, false)
+}
+pub(super) fn committed_bits(e: &Engine) -> Result<Vec<u8>> {
+    state_bits_with_visibility(e, true)
+}
+pub(super) fn committed_difference(
+    e: &Engine,
+    expected: &[u8],
+    actual: &[u8],
+) -> Result<serde_json::Value> {
+    if expected.len() != actual.len() {
+        return Ok(
+            serde_json::json!([{"field":"packed_extent","expected":expected.len(),"actual":actual.len()}]),
+        );
+    }
+    let c = e.mtp.as_ref().context("MTP missing")?;
+    let mut fields = Vec::new();
+    for (name, store, prefix) in [
+        ("target", &e.state, e.position),
+        (
+            "mtp",
+            e.mtp_state.as_ref().context("MTP state missing")?,
+            c.cursor,
+        ),
+    ] {
+        for (layer, g) in store.gdn.iter().enumerate() {
+            fields.push((format!("{name}.gdn{layer}.s"), g.s.len() * 4));
+            fields.push((format!("{name}.gdn{layer}.history"), g.history.len() * 4));
+        }
+        for layer in 0..store.kv.len() {
+            for part in ["k", "v"] {
+                for head in 0..4 {
+                    fields.push((
+                        format!("{name}.kv{layer}.{part}.head{head}"),
+                        prefix * 256 * 2,
+                    ));
+                }
+            }
+        }
+        fields.push((
+            format!("{name}.sequence"),
+            store.sequence.as_ref().context("metadata missing")?.len() * 4,
+        ));
+    }
+    fields.extend([
+        ("target.position".into(), e.work.position.len() * 4),
+        ("target.length".into(), e.work.length.len() * 4),
+        ("target.token".into(), e.work.token.len() * 4),
+    ]);
+    if e.position > 0 {
+        fields.push(("target.logits".into(), e.work.logits.len() * 2));
+    }
+    fields.extend([
+        ("mtp.pending".into(), 4),
+        ("mtp.last_target".into(), c.last_target.len() * 2),
+        ("mtp.recurrent".into(), c.recurrent.len() * 2),
+        ("target.host_position".into(), size_of::<usize>()),
+        ("mtp.cursor".into(), size_of::<usize>()),
+        ("mtp.committed_position".into(), size_of::<usize>()),
+        ("target.epoch".into(), 8),
+        ("mtp.epoch".into(), 8),
+    ]);
+    let used = fields.iter().map(|(_, bytes)| bytes).sum::<usize>();
+    ensure!(
+        used <= expected.len(),
+        "committed state partition exceeds receipt"
+    );
+    fields.push(("target.qwen_positions".into(), expected.len() - used));
+    let mut offset = 0;
+    let mut differences = Vec::new();
+    for (field, bytes) in fields {
+        let a = &expected[offset..offset + bytes];
+        let b = &actual[offset..offset + bytes];
+        if let Some(index) = a.iter().zip(b).position(|(a, b)| a != b) {
+            let end = (index + 8).min(bytes);
+            differences.push(serde_json::json!({"field":field,"byte":index,"expected":a[index..end],"actual":b[index..end]}));
+        }
+        offset += bytes;
+    }
+    Ok(serde_json::json!(differences))
+}
+fn state_bits_with_visibility(e: &Engine, visible_only: bool) -> Result<Vec<u8>> {
     let s = &e.device.stream;
     let mut bits = Vec::new();
-    for store in [&e.state, e.mtp_state.as_ref().context("MTP state missing")?] {
+    for (index, store) in [&e.state, e.mtp_state.as_ref().context("MTP state missing")?]
+        .into_iter()
+        .enumerate()
+    {
         for g in &store.gdn {
             for buf in [&g.s, &g.history] {
                 for v in s.clone_dtoh(buf)? {
@@ -119,6 +208,21 @@ pub(super) fn state_bits(e: &Engine) -> Result<Vec<u8>> {
         }
         for kv in &store.kv {
             for buf in [&kv.k, &kv.v] {
+                if visible_only {
+                    let prefix = if index == 0 {
+                        e.position
+                    } else {
+                        e.mtp.as_ref().context("MTP missing")?.cursor
+                    };
+                    for head in 0..4 {
+                        for v in s.clone_dtoh(
+                            &buf.slice(head * e.capacity * 256..(head * e.capacity + prefix) * 256),
+                        )? {
+                            bits.extend_from_slice(&v.to_bits().to_le_bytes());
+                        }
+                    }
+                    continue;
+                }
                 for v in s.clone_dtoh(buf)? {
                     bits.extend_from_slice(&v.to_bits().to_le_bytes());
                 }
@@ -143,8 +247,9 @@ pub(super) fn state_bits(e: &Engine) -> Result<Vec<u8>> {
         }
     }
     let c = e.mtp.as_ref().context("MTP missing")?;
+    bits.extend_from_slice(&c.pending.to_le_bytes());
     for buf in [&c.last_target, &c.recurrent] {
-        for v in buf {
+        for v in s.clone_dtoh(buf)? {
             bits.extend_from_slice(&v.to_bits().to_le_bytes());
         }
     }

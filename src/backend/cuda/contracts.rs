@@ -89,6 +89,18 @@ impl<T: Copy, const R: usize> TensorMut<T, R> {
         self.0
     }
 }
+impl Tensor<u32, 1> {
+    pub fn element_ptr(self, index: usize) -> Result<u64> {
+        self.validate()?;
+        ensure!(
+            self.stride == [1] && index < self.shape[0] as usize,
+            "u32 element outside contiguous tensor"
+        );
+        self.ptr
+            .checked_add((index * size_of::<u32>()) as u64)
+            .context("u32 element address overflow")
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SeqRef {
     pub ptr: u64,
@@ -144,6 +156,20 @@ impl Scratch {
 mod tests {
     use super::*;
     use half::bf16;
+
+    #[test]
+    fn scalar_word_offsets_preserve_aligned_tensor_storage() -> Result<()> {
+        for (words, index) in [(2, 1), (4, 1), (8, 7)] {
+            let base =
+                unsafe { Tensor::<u32, 1>::new(0x1000, [words], [1], u64::from(words) * 4)? };
+            let ptr = base.element_ptr(index)?;
+            assert_eq!(ptr, 0x1000 + index as u64 * 4);
+            assert_eq!(ptr % 4, 0);
+            assert!(unsafe { Tensor::<u32, 1>::new(ptr, [1], [1], 4) }.is_err());
+            assert!(base.element_ptr(words as usize).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn prefix_rows_preserves_physical_projection_offsets() -> Result<()> {

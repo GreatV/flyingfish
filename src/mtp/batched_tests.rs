@@ -109,7 +109,8 @@ impl Backend for Mock {
         Ok(())
     }
 }
-impl BatchedBackend for Mock {
+
+impl Mock {
     fn verify_batch(&mut self, inputs: &[u32]) -> Result<Vec<u32>> {
         self.events.push("batch");
         self.state
@@ -125,6 +126,28 @@ impl BatchedBackend for Mock {
             self.snapshots.push(self.state.clone());
         }
         Ok(inputs.iter().map(|t| t + 1).collect())
+    }
+}
+
+impl BatchedBackend for Mock {
+    fn draft_verify(
+        &mut self,
+        anchor: u32,
+        depth: usize,
+        fault: Option<Fault>,
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        let mut proposals = Vec::new();
+        let mut token = anchor;
+        for i in 0..depth {
+            token = self.draft(token, i)?;
+            proposals.push(token);
+            inject(fault, Fault::AfterDraft(i))?;
+        }
+        let inputs: Vec<_> = std::iter::once(anchor)
+            .chain(proposals.iter().copied())
+            .collect();
+        let verify = self.verify_batch(&inputs)?;
+        Ok((proposals, verify))
     }
     fn select_prefix(&mut self, rows: usize) -> Result<()> {
         self.events.push("select_prefix");

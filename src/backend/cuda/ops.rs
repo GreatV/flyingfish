@@ -21,6 +21,30 @@ pub struct Ops {
 }
 
 impl Ops {
+    pub fn finite(
+        &self,
+        stream: &Arc<CudaStream>,
+        values: Tensor<bf16, 2>,
+        flag: Tensor<u32, 1>,
+    ) -> Result<()> {
+        values.validate()?;
+        flag.validate()?;
+        ensure!(
+            values.stride == [u64::from(values.shape[1]), 1] && flag.stride == [1],
+            "finite check requires contiguous values and one status word"
+        );
+        let count = u64::from(values.shape[0]) * u64::from(values.shape[1]);
+        let flag_ptr = flag.element_ptr(flag.shape[0] as usize - 1)?;
+        unsafe {
+            stream
+                .launch_builder(&self.finite_bf16)
+                .arg(&values.ptr)
+                .arg(&flag_ptr)
+                .arg(&count)
+                .launch(flat(usize::try_from(count)?))?;
+        }
+        Ok(())
+    }
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let embed = cubin::module(ctx, "embed")?;
         let embed_rmsnorm = cubin::module(ctx, "embed_rmsnorm")?;

@@ -562,7 +562,7 @@ fn q38_engine_capture_gpu() -> Result<()> {
         3,
         &s,
     )?;
-    seed.save(&engine.state, &engine.work.token, prefix, &s)?;
+    seed.save(&engine.state, &engine.work.token, prefix, &s, None)?;
     let mut replay_tokens = Vec::new();
     for _ in 0..3 {
         engine
