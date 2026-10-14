@@ -231,8 +231,10 @@ struct NumericsArgs {
 
 #[derive(Parser)]
 struct TimingArgs {
-    #[arg(long)]
-    package: PathBuf,
+    /// Frozen package directory. Optional only with `--rows`, which synthesises its
+    /// case and reads no package file.
+    #[arg(long, required_unless_present = "rows")]
+    package: Option<PathBuf>,
     #[arg(long)]
     run_dir: PathBuf,
     #[arg(long, default_value_t = KERNEL_C)]
@@ -1423,23 +1425,30 @@ struct TimingConfig {
 const GATE_BAND: f64 = 1.25;
 
 fn run_timing(args: &TimingArgs) -> Result<()> {
-    let pkg = open_package(&args.package)?;
-    ensure!(
-        !pkg.manifest.fixtures.is_empty(),
-        "manifest lists no fixtures"
-    );
     let synth_owned = args.rows.map(synth_case);
+    let pkg = match (&args.package, &synth_owned) {
+        (Some(root), _) => Some(open_package(root)?),
+        (None, None) => anyhow::bail!("timing needs --package unless --rows synthesises the case"),
+        (None, Some(_)) => None,
+    };
     let fx: &Fixture = match synth_owned.as_ref() {
         Some((fx, _)) => fx,
-        None => match &args.case {
-            Some(name) => pkg
-                .manifest
-                .fixtures
-                .iter()
-                .find(|f| f.name == *name)
-                .with_context(|| format!("fixture {name} is not in the manifest"))?,
-            None => &pkg.manifest.fixtures[0],
-        },
+        None => {
+            let pkg = pkg.as_ref().expect("package present without --rows");
+            ensure!(
+                !pkg.manifest.fixtures.is_empty(),
+                "manifest lists no fixtures"
+            );
+            match &args.case {
+                Some(name) => pkg
+                    .manifest
+                    .fixtures
+                    .iter()
+                    .find(|f| f.name == *name)
+                    .with_context(|| format!("fixture {name} is not in the manifest"))?,
+                None => &pkg.manifest.fixtures[0],
+            }
+        }
     };
     std::fs::create_dir_all(&args.run_dir)
         .with_context(|| format!("create {}", args.run_dir.display()))?;
@@ -1470,7 +1479,10 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
             g: a.g.clone(),
             s0: a.s0.clone(),
         },
-        None => CaseArrays::new(&pkg.root, fx)?,
+        None => CaseArrays::new(
+            &pkg.as_ref().expect("package present without --rows").root,
+            fx,
+        )?,
     };
 
     let device_touched = gpu.is_some();
