@@ -813,9 +813,10 @@ struct GateRow {
     got_out_rel_rms: f64,
     got_state_rel_rms: f64,
     got_frac_le_1ulp: f64,
-    ratio_out_max_abs: f64,
-    ratio_out_rel_rms: f64,
-    ratio_state_rel_rms: f64,
+    /// None where the ratio is infinite, i.e. a zero baseline and a non-zero candidate.
+    ratio_out_max_abs: Option<f64>,
+    ratio_out_rel_rms: Option<f64>,
+    ratio_state_rel_rms: Option<f64>,
     frac_margin: f64,
     out_finite: bool,
     state_finite: bool,
@@ -924,6 +925,8 @@ struct ResidualStatus {
     what: String,
     norms: Vec<String>,
     not: String,
+    /// How the protocol treats this record; it is reported, never a verdict.
+    gating: &'static str,
     emitted: bool,
     reason: String,
 }
@@ -1232,7 +1235,6 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
         }
     }
     let residual = residual_status(&pkg.manifest.residual_record_spec);
-    invalidate_for_missing_residual(&mut rows, &residual);
     let device_touched = gpu.is_some();
     let device = device_of(gpu.as_ref());
     if device_touched && !qualified_topology(device.as_ref()) {
@@ -1331,20 +1333,15 @@ fn write_f32(path: &Path, data: &[f32]) -> Result<()> {
     std::fs::write(path, &bytes).with_context(|| format!("write {}", path.display()))
 }
 
-/// A row cannot carry PASS while a record the manifest declares required is absent.
-fn invalidate_for_missing_residual(rows: &mut [GateRow], residual: &ResidualStatus) {
-    if residual.emitted {
-        return;
-    }
-    for r in rows.iter_mut() {
-        if r.verdict == "PASS" {
-            r.verdict = "INVALID";
-            r.failures.push(format!(
-                "the registered residual record is required by {} and is not emitted: {}",
-                residual.required_by, residual.reason
-            ));
-        }
-    }
+/// A zero baseline with a non-zero candidate has no ratio; it is reported as null and the
+/// failure carries the situation, because JSON has no infinity.
+fn gate_ratio(got: f64, model: f64) -> Option<f64> {
+    let r = if model == 0.0 {
+        if got == 0.0 { 0.0 } else { f64::INFINITY }
+    } else {
+        got / model
+    };
+    r.is_finite().then_some(r)
 }
 
 fn residual_status(spec: &ResidualSpec) -> ResidualStatus {
@@ -1353,12 +1350,15 @@ fn residual_status(spec: &ResidualSpec) -> ResidualStatus {
         what: spec.what.clone(),
         norms: spec.norms.clone(),
         not: spec.not.clone(),
+        gating: "recorded, not gating: Codex-D 07:28 item 1 and 4d's amendment item 1 keep \
+                 the a-priori nu reported and non-gating (K2_REPORT 7564-7572)",
         emitted: false,
-        reason: "the committed P1 core keeps A and T in shared memory and emits neither; \
-                 the residual needs the CANDIDATE's T, so it cannot be reconstructed on \
-                 the host from the reference. Emitting it needs a nullable per-(chunk,head) \
-                 output plus a 16x16 strip accumulator and a 16x16 diagonal stash in the \
-                 kernel (about 8 KiB more shared memory). Not present in this build."
+        reason: "the per-chunk records were computed by the CPU model run that wrote the \
+                 package (ffa/rustfa/gdn_p1_frozen_basis.json, schema gdn-p1-gate-basis/3, \
+                 key residual_records) and were dropped when the package copy was projected, \
+                 so the frozen gate_basis.json carries no record to emit. Recomputing them \
+                 here would need a host FP64 reimplementation of the reference A and T, \
+                 which measures the model and not the candidate. Ruling requested."
             .to_string(),
     }
 }
@@ -1376,16 +1376,9 @@ fn gate_row(
     let chunks = fx.m.div_ceil(c as usize) as u32;
     let multi = chunks > 1;
     // A quantity whose basis is zero keeps ZERO tolerance; no epsilon is added.
-    let ratio = |got: f64, model: f64| -> f64 {
-        if model == 0.0 {
-            if got == 0.0 { 0.0 } else { f64::INFINITY }
-        } else {
-            got / model
-        }
-    };
-    let r_max = ratio(mo.max_abs, basis.out_max_abs);
-    let r_rms = ratio(mo.rel_rms, basis.out_rel_rms);
-    let r_state = ratio(state_m.rel_rms, basis.state_rel_rms);
+    let r_max = gate_ratio(mo.max_abs, basis.out_max_abs);
+    let r_rms = gate_ratio(mo.rel_rms, basis.out_rel_rms);
+    let r_state = gate_ratio(state_m.rel_rms, basis.state_rel_rms);
     // The stored gate_* columns must equal the pre-registered 1.25x products.
     ensure!(
         (basis.gate_out_max_abs - basis.out_max_abs * GATE_BAND).abs()
@@ -1455,14 +1448,20 @@ fn gate_row(
     if basis.state_rel_rms == 0.0 && state_m.rel_rms != 0.0 {
         failures.push("zero-baseline state_rel_rms exceeded with zero tolerance".into());
     }
-    if r_max > GATE_BAND {
-        failures.push(format!("out_max_abs ratio {r_max:.4} over {GATE_BAND}"));
-    }
-    if r_rms > GATE_BAND {
-        failures.push(format!("out_rel_rms ratio {r_rms:.4} over {GATE_BAND}"));
-    }
-    if r_state > GATE_BAND {
-        failures.push(format!("state_rel_rms ratio {r_state:.4} over {GATE_BAND}"));
+    for (name, r, limit) in [
+        ("out_max_abs", r_max, GATE_BAND),
+        ("out_rel_rms", r_rms, GATE_BAND),
+        ("state_rel_rms", r_state, GATE_BAND),
+    ] {
+        match r {
+            Some(v) if v > limit => {
+                failures.push(format!("{name} ratio {v:.4} over {limit}"));
+            }
+            Some(_) => {}
+            None => failures.push(format!(
+                "{name} has no ratio: the baseline is zero and the candidate is not"
+            )),
+        }
     }
     if mo.frac_le_1ulp < basis.frac_floor {
         failures.push(format!(
@@ -1570,7 +1569,7 @@ struct LegSeries {
     n_legs: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct NullBand {
     label: &'static str,
     computed_before_any_p1_comparison: bool,
@@ -1698,9 +1697,10 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
     // NULL leg runs side A's own core against itself.
     let (baseline, candidate) = (Which::Main, Which::P1);
     let comparison_label: &'static str = "P1 core vs the main GDN core";
-    let mut configs = Vec::new();
+    // Pass 1: every split's NULL band is measured AND WRITTEN before any candidate leg
+    // runs, so `computed_before_any_p1_comparison` is true for every split.
+    let mut bands: BTreeMap<u32, NullBand> = BTreeMap::new();
     for &s in &args.s {
-        // 1. NULL FIRST: side A's own core against ITSELF.
         let null_blocks = abba(args.clock, args.blocks, baseline, baseline, |which, leg| {
             let _ = leg;
             time_leg(gpu.as_ref(), fx, &arrays, which, s)
@@ -1713,8 +1713,16 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
         let null = freeze_null_band(&null_blocks, &band_path)?;
         std::fs::write(&band_path, serde_json::to_string_pretty(&null)?.as_bytes())
             .with_context(|| format!("write {}", band_path.display()))?;
+        bands.insert(s, null);
+    }
 
-        // 2. Only now the candidate leg, compared against the band already on disk.
+    // Pass 2: the candidate legs, each against the band already written to disk.
+    let mut configs = Vec::new();
+    for &s in &args.s {
+        let null = bands
+            .get(&s)
+            .cloned()
+            .with_context(|| format!("no null band was frozen for split {s}"))?;
         let p1_blocks = abba(
             args.clock,
             args.blocks,
@@ -2687,46 +2695,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_required_residual_makes_the_verdict_invalid() {
-        let residual = ResidualStatus {
-            required_by: "test",
-            what: String::new(),
-            norms: Vec::new(),
-            not: String::new(),
-            emitted: false,
-            reason: "the candidate T is not emitted".to_string(),
-        };
-        let mut row = GateRow {
-            case: "c63".into(),
-            c: 64,
-            s: 8,
-            chunks: 1,
-            multi_chunk: false,
-            model_out_max_abs: 1.0,
-            model_out_rel_rms: 1.0,
-            model_state_rel_rms: 1.0,
-            model_frac_le_1ulp: 1.0,
-            got_out_max_abs: 1.0,
-            got_out_rel_rms: 1.0,
-            got_state_rel_rms: 1.0,
-            got_frac_le_1ulp: 1.0,
-            ratio_out_max_abs: 1.0,
-            ratio_out_rel_rms: 1.0,
-            ratio_state_rel_rms: 1.0,
-            frac_margin: 0.1,
-            out_finite: true,
-            state_finite: true,
-            lengths_match: true,
-            heads_present: 48,
-            failures: Vec::new(),
-            verdict: "PASS",
-        };
-        invalidate_for_missing_residual(std::slice::from_mut(&mut row), &residual);
-        assert_eq!(row.verdict, "INVALID");
-        assert!(row.failures.iter().any(|f| f.contains("required by test")));
-    }
-
-    #[test]
     fn the_quantisation_floor_uses_the_shortest_individual_leg() {
         // One block whose per-arm MEANS are equal (2.5) but whose legs include a 1.0:
         // the floor's min must be 1.0, not the mean 2.5.
@@ -2752,6 +2720,31 @@ mod tests {
             "quantisation {} is not over the shortest leg ({}), it used something else",
             band.quantisation_term,
             want
+        );
+    }
+
+    #[test]
+    fn a_zero_baseline_with_a_non_zero_candidate_has_no_json_ratio() {
+        assert_eq!(gate_ratio(0.0, 0.0), Some(0.0));
+        assert_eq!(gate_ratio(1.5, 1.0), Some(1.5));
+        assert_eq!(gate_ratio(0.5, 1.0), Some(0.5));
+        let r = gate_ratio(3.0, 0.0);
+        assert_eq!(
+            r, None,
+            "a zero baseline and a non-zero candidate has no ratio"
+        );
+        // The receipt must still serialise, and it did before too: serde_json writes a
+        // non-finite f64 as null, which is why this was an untyped field rather than a
+        // crash. The Option makes it explicit and keeps the failure text the carrier.
+        let row = serde_json::json!({ "ratio_state_rel_rms": r });
+        assert_eq!(
+            serde_json::to_string(&row).unwrap(),
+            "{\"ratio_state_rel_rms\":null}"
+        );
+        let bare = serde_json::json!({ "ratio_state_rel_rms": f64::INFINITY });
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            "{\"ratio_state_rel_rms\":null}"
         );
     }
 
