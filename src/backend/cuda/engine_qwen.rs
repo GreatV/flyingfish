@@ -8,8 +8,6 @@ use crate::backend::cuda::{
     ops::{CommonOpsRef, GatedRmsInput, ResidualRmsInput, RmsMode, RmsOptions},
     weights::WeightCatalog,
 };
-/// Default prefill chunk ceiling in rows; an explicit `--chunk` is not clamped.
-const DEFAULT_CHUNK_ROWS: usize = 2048;
 /// The default chunk is bounded by the CUDA gridDim.y/z limit the GDN prep pair launches rows on.
 fn default_chunk(admitted: usize) -> usize {
     admitted.min(CUDA_GRID_YZ_MAX as usize)
@@ -810,7 +808,6 @@ impl Engine {
         let mtp_budget = reserve_mtp
             .then(|| crate::mtp::AttachmentBudget::new(&model_spec, capacity))
             .transpose()?;
-        let mut admitted_default_chunk = None;
         let budget = crate::prefill::WorkspaceBudget::new(
             crate::prefill::WorkspaceRequest {
                 capacity,
@@ -837,24 +834,9 @@ impl Engine {
                     )
                     .context("Q38 combined workspace overflow")
             },
-            |admitted| {
-                admitted_default_chunk = Some(admitted);
-                Ok(default_chunk(admitted).min(DEFAULT_CHUNK_ROWS))
-            },
+            |admitted| Ok(default_chunk(admitted)),
         )?;
         let rows = budget.plan.chunk;
-        if let Some(admitted) = admitted_default_chunk
-            && admitted != rows
-        {
-            eprintln!(
-                "{}",
-                serde_json::json!({"q38_default_chunk_policy": {
-                    "admitted_chunk": admitted, "selected_chunk": rows,
-                    "arch": device.info.arch, "sms": device.info.sms,
-                    "requested_chunk": requested_chunk,
-                }})
-            );
-        }
         ensure!(
             !reserve_mtp || rows >= 4,
             "MTP workspace cannot fit four verification rows"
