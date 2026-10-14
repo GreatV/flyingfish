@@ -18,7 +18,7 @@ use crate::{
     op_contract::{AttentionLimits, ExecutionPhase, FullAttentionSpec},
 };
 use cudarc::driver::{CudaFunction, DevicePtr};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn all_layers(trace: &Option<Target<'_>>) -> bool {
     trace.as_ref().is_some_and(|t| t.trace.all_layers)
@@ -73,6 +73,9 @@ enum BoundMixer {
 struct PrefillPlans<T> {
     full: Box<T>,
     small: Vec<T>,
+    /// One narrowed plan per distinct step size this run dispatches, so every launch
+    /// is sized by the LIVE rows of its step. Bound in `prepare` before the step runs.
+    by_rows: BTreeMap<usize, T>,
     max_rows: usize,
 }
 impl<T> PrefillPlans<T> {
@@ -84,15 +87,36 @@ impl<T> PrefillPlans<T> {
         Ok(Self {
             full: Box::new(full),
             small,
+            by_rows: BTreeMap::new(),
             max_rows,
         })
+    }
+    /// Narrow the full plan to `rows` once, so `select` returns a plan whose grids are
+    /// functions of the live rows alone. 1..=4 keep the snapshot-bound `small` plans.
+    fn ensure_rows(&mut self, rows: usize, narrow: &dyn Fn(&T, u32) -> Result<T>) -> Result<()> {
+        ensure!(
+            rows > 0 && rows <= self.max_rows,
+            "prefill rows outside binding"
+        );
+        if rows > 4 && !self.by_rows.contains_key(&rows) {
+            let plan = narrow(&self.full, rows as u32)?;
+            self.by_rows.insert(rows, plan);
+        }
+        Ok(())
     }
     fn select(&self, rows: usize) -> Result<&T> {
         ensure!(
             rows > 0 && rows <= self.max_rows,
             "prefill rows outside binding"
         );
-        Ok(self.small.get(rows - 1).unwrap_or(&self.full))
+        if let Some(small) = self.small.get(rows - 1) {
+            return Ok(small);
+        }
+        Ok(self
+            .by_rows
+            .get(&rows)
+            .or(self.by_rows.get(&self.max_rows))
+            .unwrap_or(&self.full))
     }
 }
 pub(super) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
@@ -441,8 +465,13 @@ impl Runtime {
         blas: &Blas,
         rows: u32,
         spec: &crate::model_spec::ModelSpec,
+        prefill: bool,
     ) -> Result<()> {
-        self.prepare_dimensions(blas, rows, spec.vocab, spec.hidden)
+        self.prepare_dimensions(blas, rows, spec.vocab, spec.hidden)?;
+        if prefill {
+            self.ensure_mixer_rows(rows)?;
+        }
+        Ok(())
     }
     fn prepare_dimensions(
         &mut self,
@@ -454,11 +483,24 @@ impl Runtime {
         if self.prepared.contains(&rows) {
             return Ok(());
         }
-        for layer in &self.layers {
+        for layer in &mut self.layers {
             layer.linear.prepare(blas, rows)?;
         }
         blas.prepare_fixed(1, vocab, hidden)?;
         self.prepared.insert(rows);
+        Ok(())
+    }
+    fn ensure_mixer_rows(&mut self, rows: u32) -> Result<()> {
+        for layer in &mut self.layers {
+            match &mut layer.mixer {
+                BoundMixer::Gdn { prefill, .. } => {
+                    prefill.ensure_rows(rows as usize, &GdnPlan::for_rows)?;
+                }
+                BoundMixer::Attention { text_prefill, .. } => {
+                    text_prefill.ensure_rows(rows as usize, &FullAttentionPlan::for_rows)?;
+                }
+            }
+        }
         Ok(())
     }
     pub(super) fn prepare_prefill_rows(
@@ -469,7 +511,8 @@ impl Runtime {
         hidden: u32,
     ) -> Result<()> {
         let bound = bucketed_prefill_rows(rows, self.workspace_rows)?;
-        self.prepare_dimensions(blas, bound, vocab, hidden)
+        self.prepare_dimensions(blas, bound, vocab, hidden)?;
+        self.ensure_mixer_rows(rows)
     }
     fn linear_rows(&self, rows: u32, phase: ExecutionPhase) -> Result<u32> {
         if phase == ExecutionPhase::Decode {
@@ -910,7 +953,7 @@ impl Engine {
             images: None,
         };
         engine.qwen = Some(Runtime::new(&engine, dir, catalog, arena, scratch_buffer)?);
-        engine.prepare(1)?;
+        engine.prepare(1, false)?;
         engine.prepare_prefill_plans()?;
         engine
             .qwen
@@ -928,11 +971,12 @@ impl Engine {
         }
         Ok(engine)
     }
-    pub(super) fn prepare_qwen(&mut self, rows: usize) -> Result<()> {
+    pub(super) fn prepare_qwen(&mut self, rows: usize, prefill: bool) -> Result<()> {
         self.qwen.as_mut().context("Q38 runtime missing")?.prepare(
             &self.blas,
             u32::try_from(rows)?,
             &self.model_spec,
+            prefill,
         )
     }
     pub(super) fn prepare_prefill_rows(&mut self, rows: usize) -> Result<()> {
@@ -942,7 +986,7 @@ impl Engine {
             let q = self.qwen.as_mut().context("Q38 runtime missing")?;
             return q.prepare_prefill_rows(&self.blas, u32::try_from(rows)?, vocab, hidden);
         }
-        self.prepare(rows)
+        self.prepare(rows, true)
     }
     pub(super) fn qwen_advance(&mut self) -> Result<()> {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
@@ -1372,6 +1416,84 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    /// A stand-in plan that records the rows it was narrowed to, so the selection
+    /// mapping is testable without a device.
+    #[derive(Clone, Debug, PartialEq)]
+    struct FakePlan {
+        max_rows: usize,
+    }
+    impl FakePlan {
+        fn for_rows(plan: &FakePlan, rows: u32) -> Result<FakePlan> {
+            ensure!(
+                rows > 0 && rows as usize <= plan.max_rows,
+                "rows outside binding"
+            );
+            Ok(FakePlan {
+                max_rows: rows as usize,
+            })
+        }
+    }
+
+    #[test]
+    fn select_returns_the_plan_narrowed_to_the_steps_live_rows() {
+        let mut plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+            .expect("bind");
+        assert_eq!(
+            plans.select(1021).unwrap().max_rows,
+            2048,
+            "before ensure_rows"
+        );
+        plans
+            .ensure_rows(1021, &FakePlan::for_rows)
+            .expect("ensure 1021");
+        assert_eq!(plans.select(1021).unwrap().max_rows, 1021);
+        // A second call is idempotent and does not rebind.
+        plans
+            .ensure_rows(1021, &FakePlan::for_rows)
+            .expect("ensure 1021 again");
+        assert_eq!(plans.by_rows.len(), 1);
+        // An un-prepared step size still returns a plan, never an error.
+        assert_eq!(plans.select(700).unwrap().max_rows, 2048);
+        // 1..=4 keep the snapshot-bound small plans.
+        for rows in 1..=4 {
+            assert_eq!(plans.select(rows).unwrap().max_rows, rows);
+        }
+        assert!(plans.select(0).is_err());
+        assert!(plans.select(2049).is_err());
+    }
+
+    /// The 1617a86 behaviour, pinned: without `ensure_rows` a 1021-row step runs the
+    /// plan bound at the whole 2048-row chunk.
+    #[test]
+    fn a_step_only_runs_a_plan_narrowed_to_its_own_rows() {
+        let mut plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+            .expect("bind");
+        // What `prepare(rows, prefill = true)` does before the step's forward pass.
+        plans
+            .ensure_rows(1021, &FakePlan::for_rows)
+            .expect("ensure the step's plan");
+        assert_eq!(
+            plans.select(1021).unwrap().max_rows,
+            1021,
+            "a 1021-row step must not run a plan sized for the admitted chunk"
+        );
+    }
+
+    #[test]
+    fn every_step_size_of_a_chunked_prompt_gets_its_own_plan() {
+        // 4093 tokens over a 2048 chunk: two 2048 steps and one 997 tail.
+        let mut plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+            .expect("bind");
+        for step in [2048usize, 997] {
+            plans
+                .ensure_rows(step, &FakePlan::for_rows)
+                .expect("ensure step");
+        }
+        assert_eq!(plans.select(2048).unwrap().max_rows, 2048);
+        assert_eq!(plans.select(997).unwrap().max_rows, 997);
+        assert_eq!(plans.by_rows.len(), 2);
+    }
+
     use super::*;
     use crate::prefill::{WorkspaceBudget, WorkspaceRequest};
 

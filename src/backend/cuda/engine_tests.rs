@@ -468,7 +468,7 @@ fn q38_engine_capture_gpu() -> Result<()> {
         vec![1, 2, 3, 4, 5]
     };
     for part in ids.chunks(chunk) {
-        engine.prepare(part.len())?;
+        engine.prepare(part.len(), true)?;
         engine
             .state
             .set_sequence(&s, engine.position as u32, part.len() as u32, chunk as u32)?;

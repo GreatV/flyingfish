@@ -151,6 +151,24 @@ impl ChunkwiseP1 {
     }
 }
 
+/// Every prep-phase grid for `rows` live rows. `prepare` calls it with the plan's row
+/// count and `for_rows` with a narrower step's, so a launch grid is a function of the
+/// rows it processes and of nothing else.
+fn prep_grids(
+    prep_cfg: LaunchConfig,
+    beta_cfg: LaunchConfig,
+    conv_cfg: LaunchConfig,
+    rows: u32,
+) -> (LaunchConfig, LaunchConfig, LaunchConfig) {
+    let mut prep_cfg = prep_cfg;
+    prep_cfg.grid_dim.2 = rows;
+    let mut beta_cfg = beta_cfg;
+    beta_cfg.grid_dim.1 = rows;
+    let mut conv_cfg = conv_cfg;
+    conv_cfg.grid_dim.1 = rows.div_ceil(CONV_ROWS);
+    (prep_cfg, beta_cfg, conv_cfg)
+}
+
 pub(crate) struct GdnPlan {
     snapshots: Option<(Tensor<f32, 4>, Tensor<f32, 3>)>,
     kernels: Arc<Kernels>,
@@ -224,12 +242,8 @@ impl GdnPlan {
             history: TensorMut(b.history.read()),
         };
         check_bindings(&bindings, rows, self.conv_dim)?;
-        let mut prep_cfg = self.prep_cfg;
-        prep_cfg.grid_dim.2 = rows;
-        let mut beta_cfg = self.beta_cfg;
-        beta_cfg.grid_dim.1 = rows;
-        let mut conv_cfg = self.conv_cfg;
-        conv_cfg.grid_dim.1 = rows.div_ceil(CONV_ROWS);
+        let (prep_cfg, beta_cfg, conv_cfg) =
+            prep_grids(self.prep_cfg, self.beta_cfg, self.conv_cfg, rows);
         Ok(Self {
             snapshots: None,
             kernels: self.kernels.clone(),
@@ -910,6 +924,47 @@ fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::prep_grids;
+    use cudarc::driver::LaunchConfig;
+
+    fn cfg(d: (u32, u32, u32)) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: d,
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn every_prep_grid_is_a_function_of_the_live_rows_alone() {
+        let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
+        for rows in [5u32, 7, 1021, 2047, 2048] {
+            let (prep, beta, conv) = prep_grids(full.0, full.1, full.2, rows);
+            assert_eq!(prep.grid_dim.2, rows, "gdn_prep_fp32 grid z");
+            assert_eq!(beta.grid_dim.1, rows, "gdn_beta_widen grid y");
+            assert_eq!(
+                conv.grid_dim.1,
+                rows.div_ceil(super::CONV_ROWS),
+                "gdn_conv grid y"
+            );
+            // The non-row dimensions are the plan's own and never move with the step.
+            assert_eq!(prep.grid_dim.0, full.0.grid_dim.0);
+            assert_eq!(prep.grid_dim.1, full.0.grid_dim.1);
+            assert_eq!(beta.grid_dim.0, full.1.grid_dim.0);
+            assert_eq!(beta.grid_dim.2, full.1.grid_dim.2);
+            assert_eq!(conv.grid_dim.0, full.2.grid_dim.0);
+            assert_eq!(conv.grid_dim.2, full.2.grid_dim.2);
+        }
+    }
+
+    #[test]
+    fn a_narrower_step_never_widens_a_grid() {
+        let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
+        let (wide, _, _) = prep_grids(full.0, full.1, full.2, 2048);
+        let (narrow, _, _) = prep_grids(full.0, full.1, full.2, 1021);
+        assert!(narrow.grid_dim.2 < wide.grid_dim.2);
+    }
+
     use super::*;
 
     #[test]
