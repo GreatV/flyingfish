@@ -1333,6 +1333,29 @@ fn gate_row(
         c,
         s
     );
+    for (name, value) in [
+        ("out_max_abs", basis.out_max_abs),
+        ("out_rel_rms", basis.out_rel_rms),
+        ("state_rel_rms", basis.state_rel_rms),
+    ] {
+        ensure!(
+            value.is_finite() && value >= 0.0,
+            "gate basis row {} C{} s{}: {name} {value} is negative or non-finite; a \
+             negative baseline makes every candidate ratio negative and the > band \
+             checks vacuous",
+            fx.name,
+            c,
+            s
+        );
+    }
+    ensure!(
+        (0.0..=1.0).contains(&basis.frac_le_1ulp),
+        "gate basis row {} C{} s{}: frac_le_1ulp {} is outside [0, 1]",
+        fx.name,
+        c,
+        s,
+        basis.frac_le_1ulp
+    );
     ensure!(
         (basis.frac_floor - (basis.frac_le_1ulp - FRAC_FLOOR_MARGIN)).abs()
             <= 1e-12 * basis.frac_le_1ulp.abs().max(1e-300),
@@ -2547,6 +2570,93 @@ mod tests {
         assert!(
             (mean_of_ratios - paired / 2.0).abs() > 1e-3,
             "the test case does not separate the two statistics"
+        );
+    }
+
+    fn test_fixture() -> Fixture {
+        Fixture {
+            name: "c1".into(),
+            kind: "margin".into(),
+            note: String::new(),
+            m: 1,
+            prefix: 0,
+            seed: None,
+            arrays: BTreeMap::new(),
+        }
+    }
+
+    fn basis_row() -> BasisRow {
+        BasisRow {
+            case: "c1".into(),
+            c: 64,
+            s: 8,
+            out_max_abs: 1e-4,
+            out_rel_rms: 1e-3,
+            state_rel_rms: 1e-4,
+            frac_le_1ulp: 0.65,
+            gate_out_max_abs: 1.25e-4,
+            gate_out_rel_rms: 1.25e-3,
+            gate_state_rel_rms: 1.25e-4,
+            frac_floor: 0.63,
+            finite: true,
+            input_sha256: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_negative_or_out_of_range_basis_metric_is_rejected() {
+        let fx = test_fixture();
+        let m0 = Metrics {
+            max_abs: 0.0,
+            rel_rms: 0.0,
+            frac_le_1ulp: 1.0,
+            finite: true,
+        };
+        for (field, bad) in [
+            ("out_max_abs", -1e-4),
+            ("out_rel_rms", -1e-3),
+            ("state_rel_rms", -1e-4),
+        ] {
+            let mut b = basis_row();
+            match field {
+                "out_max_abs" => {
+                    b.out_max_abs = bad;
+                    b.gate_out_max_abs = bad * GATE_BAND;
+                }
+                "out_rel_rms" => {
+                    b.out_rel_rms = bad;
+                    b.gate_out_rel_rms = bad * GATE_BAND;
+                }
+                _ => {
+                    b.state_rel_rms = bad;
+                    b.gate_state_rel_rms = bad * GATE_BAND;
+                }
+            }
+            let m0 = Metrics {
+                max_abs: 0.0,
+                rel_rms: 0.0,
+                frac_le_1ulp: 1.0,
+                finite: true,
+            };
+            let err = gate_row(&fx, 64, 8, &b, &m0, &m0, 48)
+                .map(|_| ())
+                .expect_err("a negative basis metric must be rejected");
+            assert!(
+                err.to_string().contains(field),
+                "the error for {field} must name the field: {err}"
+            );
+        }
+        for bad in [-0.01f64, 1.4, f64::NAN] {
+            let mut b = basis_row();
+            b.frac_le_1ulp = bad;
+            assert!(
+                gate_row(&fx, 64, 8, &b, &m0, &m0, 48).is_err(),
+                "frac_le_1ulp {bad} must be rejected"
+            );
+        }
+        assert!(
+            gate_row(&fx, 64, 8, &basis_row(), &m0, &m0, 48).is_ok(),
+            "the well-formed row must still pass"
         );
     }
 }
