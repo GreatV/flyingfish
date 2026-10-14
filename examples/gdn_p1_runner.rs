@@ -106,9 +106,16 @@ fn run_e2e(a: &E2eArgs) -> Result<()> {
     ensure!(a.prefill_reps > 0 && a.decode_steps > 0, "positive reps");
     let ids: Vec<u32> =
         serde_json::from_slice(&std::fs::read(&a.tokens_file)?).context("tokens file")?;
+    let need = ids
+        .len()
+        .checked_add(a.decode_steps)
+        .context("token count + decode steps overflows usize")?;
     ensure!(
-        !ids.is_empty() && ids.len() + 64 <= a.capacity,
-        "tokens vs capacity"
+        !ids.is_empty() && need <= a.capacity,
+        "{need} positions ({} tokens + {} decode steps) against capacity {}",
+        ids.len(),
+        a.decode_steps,
+        a.capacity
     );
     let settings = flyingfish::backend::Settings {
         tree_builder: flyingfish::backend::TreeBuilder::Waves,
@@ -483,6 +490,15 @@ fn open_package(root: &Path) -> Result<Package> {
         ensure!(fx.m >= 1, "fixture {} has no live row", fx.name);
     }
 
+    let mut fixture_names = BTreeMap::new();
+    for fx in &manifest.fixtures {
+        ensure!(
+            fixture_names.insert(fx.name.clone(), ()).is_none(),
+            "manifest lists fixture {} twice; the second would overwrite the first",
+            fx.name
+        );
+    }
+
     // The FP64 truth, verified on the same terms as the inputs, for every fixture.
     let mut truth = BTreeMap::new();
     let mut truth_verified = 0usize;
@@ -514,13 +530,6 @@ fn open_package(root: &Path) -> Result<Package> {
             t.path,
             t.bytes
         );
-        let bytes = std::fs::metadata(&path)?.len();
-        ensure!(
-            bytes == t.bytes,
-            "{} is {bytes} B, manifest says {} B",
-            t.path,
-            t.bytes
-        );
         let expect: u64 = t.shape.iter().map(|d| *d as u64).product();
         ensure!(
             expect * 8 == t.bytes,
@@ -529,7 +538,13 @@ fn open_package(root: &Path) -> Result<Package> {
             t.shape,
             t.bytes
         );
-        truth.insert((t.fixture.clone(), t.which.clone()), t.clone());
+        let key = (t.fixture.clone(), t.which.clone());
+        ensure!(
+            truth.insert(key.clone(), t.clone()).is_none(),
+            "manifest has two {} truth records for fixture {}; the second would overwrite the first",
+            t.which,
+            t.fixture
+        );
         truth_verified += 1;
     }
     for fx in &manifest.fixtures {
@@ -832,8 +847,8 @@ struct FixtureReceipt {
     prefix: usize,
     live_rows: usize,
     seed: Option<i64>,
-    /// Bytes of SHA-verified input this fixture contributed to the run; the arrays are
-    /// read and verified on every leg, including the stub leg.
+    /// Bytes of SHA-verified input this fixture contributed to the run (f32 arrays are
+    /// four bytes per element); the arrays are read and verified on every leg.
     verified_input_bytes: usize,
     note: String,
 }
@@ -884,6 +899,17 @@ struct EnvReceipt {
 struct DeviceInfo {
     name: String,
     compute_capability: u32,
+    sm_count: u32,
+}
+
+/// Whether this device is the one the P1 core is qualified for, by the engine's own
+/// policy; a gate verdict measured elsewhere is INVALID, not PASS.
+fn qualified_topology(device: Option<&DeviceInfo>) -> bool {
+    device.is_some_and(|d| {
+        flyingfish::gdn_plan::GdnPolicy::for_device(d.compute_capability, d.sm_count as usize)
+            .prefill_p1_split()
+            != 0
+    })
 }
 
 fn now_utc() -> String {
@@ -943,7 +969,23 @@ fn env_receipt(
         device_touched,
         device: device.clone(),
         differs_from_box3: if !stub {
-            vec![]
+            match device.as_ref() {
+                Some(d)
+                    if flyingfish::gdn_plan::GdnPolicy::for_device(
+                        d.compute_capability,
+                        d.sm_count as usize,
+                    )
+                    .prefill_p1_split()
+                        == 0 =>
+                {
+                    vec![format!(
+                        "the launch ran on sm{} with {} SMs, not the qualified topology \
+                         (arch 89, 128 SMs), so a gate verdict here is INVALID",
+                        d.compute_capability, d.sm_count
+                    )]
+                }
+                _ => vec![],
+            }
         } else if simulate_box3 {
             vec![
                 "no CUDA device is present here, so the kernel launch and the CUDA-event clock are the stub on both box3 and here".to_string(),
@@ -979,8 +1021,36 @@ fn split_smem(s: u32) -> Result<u32> {
     })
 }
 
-fn head_count(fx: &Fixture, array: &str) -> usize {
-    fx.arrays.get(array).map(|a| a.shape[1]).unwrap_or_default()
+/// The kernel's ABI shapes: q/k/v are [M, HEADS, D], beta/g are [M, HEADS] and the
+/// state is [HEADS, DK, DV]. Every fixture is checked against them before any array is
+/// read, so a short shape vector is an error rather than an index panic.
+fn check_fixture_shapes(fx: &Fixture) -> Result<(usize, usize, usize)> {
+    const HEADS: usize = 48;
+    const DK: usize = 128;
+    const DV: usize = 128;
+    ensure!(fx.m >= 1, "fixture {} has no live row", fx.name);
+    let want = |array: &str, shape: &[usize]| -> Result<()> {
+        let rec = fx
+            .arrays
+            .get(array)
+            .with_context(|| format!("fixture {} has no {array} array", fx.name))?;
+        ensure!(
+            rec.shape == shape,
+            "fixture {} {array} is {:?}, the kernel ABI wants {:?}",
+            fx.name,
+            rec.shape,
+            shape
+        );
+        Ok(())
+    };
+    for array in ["q", "k", "v"] {
+        want(array, &[fx.m, HEADS, DK])?;
+    }
+    for array in ["beta", "g"] {
+        want(array, &[fx.m, HEADS])?;
+    }
+    want("S0", &[HEADS, DK, DV])?;
+    Ok((HEADS, DK, DV))
 }
 
 fn run_numerics(args: &NumericsArgs) -> Result<()> {
@@ -1020,16 +1090,15 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
 
     for fx in &fixtures {
         let m = fx.m;
+        let (heads, dk, dv) = check_fixture_shapes(fx)?;
         let arrays = CaseArrays::new(&pkg.root, fx)?;
-        let heads = head_count(fx, "q");
-        let dk = fx.arrays["q"].shape[2];
-        let dv = fx.arrays["v"].shape[2];
-        let input_bytes = arrays.q.len()
-            + arrays.k.len()
-            + arrays.v.len()
-            + arrays.beta.len()
-            + arrays.g.len()
-            + arrays.s0.len();
+        let input_bytes = 4
+            * (arrays.q.len()
+                + arrays.k.len()
+                + arrays.v.len()
+                + arrays.beta.len()
+                + arrays.g.len()
+                + arrays.s0.len());
         bytes_by_fixture.insert(fx.name.clone(), input_bytes);
 
         // The FP64 truth does not depend on C or s, so it is read once per fixture.
@@ -1114,9 +1183,21 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
             eprintln!("  {:16} C{} s{s:<2} {verdict}", fx.name, args.c);
         }
     }
-
     let device_touched = gpu.is_some();
     let device = device_of(gpu.as_ref());
+    if device_touched && !qualified_topology(device.as_ref()) {
+        for r in rows.iter_mut() {
+            if r.verdict == "PASS" {
+                r.verdict = "INVALID";
+                r.failures.push(format!(
+                    "device {:?} is not the qualified topology (arch 89, 128 SMs), so no row \
+                     carries a verdict",
+                    device.as_ref().map(|d| (d.compute_capability, d.sm_count))
+                ));
+            }
+        }
+    }
+
     let multi = multi_chunk_condition(&rows, args.c);
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for r in &rows {
@@ -1319,7 +1400,6 @@ fn gate_row(
     })
 }
 
-/// The multi-chunk condition: every C evaluated must have at least one passing fixture of more than one chunk.
 /// The fixtures a `--case` selection names; every name must match, so a typo cannot quietly shrink the run.
 fn select_fixtures<'a>(pkg: &'a Package, case: &[String]) -> Result<Vec<&'a Fixture>> {
     let chosen: Vec<&Fixture> = pkg
@@ -1338,6 +1418,7 @@ fn select_fixtures<'a>(pkg: &'a Package, case: &[String]) -> Result<Vec<&'a Fixt
     Ok(chosen)
 }
 
+/// The multi-chunk condition: every C evaluated must have at least one passing fixture of more than one chunk.
 fn multi_chunk_condition(rows: &[GateRow], c: u32) -> MultiChunk {
     let mut multi: Vec<String> = Vec::new();
     let mut passing: Vec<String> = Vec::new();
@@ -1432,6 +1513,9 @@ struct TimingConfig {
 const GATE_BAND: f64 = 1.25;
 
 fn run_timing(args: &TimingArgs) -> Result<()> {
+    if let Some(rows) = args.rows {
+        ensure!(rows >= 1, "--rows must be at least 1, not {rows}");
+    }
     ensure!(
         args.c == KERNEL_C,
         "the built P1 core is C{KERNEL_C} only; C{} is not built and is not run \
@@ -1969,6 +2053,7 @@ impl Gpu {
     const MAIN_NAME: &str = "gdn_chunked_core_v1";
 
     fn open() -> Result<Self> {
+        use cudarc::driver::sys::CUdevice_attribute as A;
         use cudarc::driver::{CudaContext, LaunchConfig, sys};
         let ctx = CudaContext::new(0).context("create CUDA context")?;
         let arch = compute_capability(&ctx)?;
@@ -2005,10 +2090,12 @@ impl Gpu {
             shared_mem_bytes: 0,
         };
         eprintln!("[cuda] sm{arch}, {P1_MODULE} and gdn/gdn_chunked loaded");
+        let sm_count = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
         let name = ctx.name().unwrap_or_else(|_| "<unnamed>".to_string());
         let device_info = DeviceInfo {
             name,
             compute_capability: arch,
+            sm_count,
         };
         eprintln!("[cuda] device {}", device_info.name);
         Ok(Gpu {
@@ -2307,6 +2394,7 @@ fn run_identity(args: &IdentityArgs) -> Result<()> {
 
     let mut rows = Vec::new();
     for fx in &fixtures {
+        check_fixture_shapes(fx)?;
         let arrays = CaseArrays::new(&pkg.root, fx)?;
         for &s in &args.s {
             let (entry, out_digests, state_digests) = gpu.identity_p1(fx, &arrays, s, args.runs)?;
@@ -2351,7 +2439,9 @@ fn run_identity(args: &IdentityArgs) -> Result<()> {
             });
         }
     }
-    let verdict = if rows.iter().all(|r| r.verdict == "PASS") {
+    let verdict = if !qualified_topology(device.as_ref()) {
+        "INVALID"
+    } else if rows.iter().all(|r| r.verdict == "PASS") {
         "PASS"
     } else {
         "FAIL"
