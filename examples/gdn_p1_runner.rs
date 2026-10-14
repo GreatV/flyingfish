@@ -1668,7 +1668,7 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
                     series.ci_low, series.ci_high
                 ),
             )
-        } else if !qualified_topology(device_of(gpu.as_ref()).as_ref()) {
+        } else if device_touched && !qualified_topology(device_of(gpu.as_ref()).as_ref()) {
             (
                 "INVALID",
 "the device is not the qualified topology (arch 89, 128 SMs), so this comparison is reported, not read".to_string(),
