@@ -553,7 +553,7 @@ mod tests {
             row_bytes: 64,
             fixed_transient_bytes: 0,
         };
-        let plain = crate::prefill::WorkspaceBudget::new(request, |_| Ok(1024))?;
+        let plain = crate::prefill::WorkspaceBudget::new(request, |_| Ok(1024), Ok)?;
         let combined = crate::prefill::WorkspaceBudget::new(
             crate::prefill::WorkspaceRequest {
                 row_bytes: request.row_bytes + b.row_bytes,
@@ -561,6 +561,7 @@ mod tests {
                 ..request
             },
             |rows| Ok(1024 + b.workspace(rows)?),
+            Ok,
         )?;
         assert!(combined.plan.chunk < plain.plan.chunk);
         assert_eq!(combined.plan.chunk, 16);
@@ -577,7 +578,8 @@ mod tests {
                     fixed_transient_bytes: b.fixed_bytes,
                     ..request
                 },
-                |rows| Ok(1024 + b.workspace(rows)?)
+                |rows| Ok(1024 + b.workspace(rows)?),
+                Ok,
             )
             .is_err()
         );

@@ -145,9 +145,12 @@ pub struct WorkspaceRequest {
 impl WorkspaceBudget {
     /// `workspace(rows)` must be monotone and include every simultaneously live
     /// operator temporary, with alignment. Sequential operators contribute their max.
+    /// `select` bounds the DEFAULT chunk only; an explicit `requested` chunk is
+    /// admitted as given, up to the same row limit.
     pub fn new(
         request: WorkspaceRequest,
         workspace: impl Fn(usize) -> Result<usize>,
+        select: impl FnOnce(usize) -> Result<usize>,
     ) -> Result<Self> {
         let WorkspaceRequest {
             capacity,
@@ -197,11 +200,14 @@ impl WorkspaceBudget {
                 let tiles = row_limit / alignment;
                 alignment * (1usize << (usize::BITS - 1 - tiles.leading_zeros()))
             };
+            let selected = select(admitted)?;
             ensure!(
-                admitted > 0 && (admitted == row_limit || admitted.is_multiple_of(alignment)),
+                selected > 0
+                    && selected <= admitted
+                    && (selected == admitted || selected.is_multiple_of(alignment)),
                 "default chunk selection must preserve admission and alignment"
             );
-            admitted
+            selected
         };
         let scratch = workspace(chunk)?;
         Ok(Self {
@@ -238,14 +244,39 @@ mod admission_tests {
     }
 
     /// The default chunk is the memory-admitted row limit rounded DOWN to the
-    /// alignment; an explicit request is honoured up to that same limit.
+    /// alignment and then bounded by `select`; an explicit request is honoured up to
+    /// the row limit WITHOUT `select`.
+    #[test]
+    fn default_chunk_is_bounded_by_select_and_requests_are_not() -> Result<()> {
+        let cap = |admitted: usize| Ok(admitted.min(2048));
+        let wide = WorkspaceBudget::new(request(262_144, None, 160_000), |r| Ok(8 * r), cap)?;
+        assert_eq!(wide.plan.chunk, 2048, "the default is clamped");
+        assert!(wide.plan.chunk <= wide.plan.row_limit);
+        let exact = WorkspaceBudget::new(request(262_144, None, 160_000), |r| Ok(8 * r), Ok)?;
+        assert!(
+            exact.plan.chunk > 2048,
+            "select may pass the admitted chunk through"
+        );
+        let explicit =
+            WorkspaceBudget::new(request(262_144, Some(8192), 160_000), |r| Ok(8 * r), cap)?;
+        assert_eq!(
+            explicit.plan.chunk, 8192,
+            "an explicit chunk is never clamped"
+        );
+        let over =
+            WorkspaceBudget::new(request(262_144, Some(1 << 20), 160_000), |r| Ok(8 * r), cap);
+        assert!(over.is_err(), "an explicit chunk still faces the row limit");
+        Ok(())
+    }
+
     #[test]
     fn default_chunk_is_the_admitted_limit_rounded_down() -> Result<()> {
         for capacity in [
             1, 17, 31, 32, 511, 512, 513, 1021, 1024, 2047, 2048, 2049, 4096, 8192,
         ] {
             for free in [11_000, 14_000, 25_000, 160_000] {
-                let budget = WorkspaceBudget::new(request(capacity, None, free), |r| Ok(8 * r))?;
+                let budget =
+                    WorkspaceBudget::new(request(capacity, None, free), |r| Ok(8 * r), Ok)?;
                 let chunk = budget.plan.chunk;
                 assert!(chunk > 0 && chunk <= budget.plan.row_limit);
                 assert!(chunk == budget.plan.row_limit || chunk.is_multiple_of(32));
@@ -259,7 +290,7 @@ mod admission_tests {
 
     #[test]
     fn every_budget_field_is_carried_and_requests_are_bounded() -> Result<()> {
-        let budget = WorkspaceBudget::new(request(8192, Some(2048), 160_000), |r| Ok(8 * r))?;
+        let budget = WorkspaceBudget::new(request(8192, Some(2048), 160_000), |r| Ok(8 * r), Ok)?;
         assert_eq!(budget.plan.chunk, 2048);
         assert_eq!(budget.plan.requested_chunk, Some(2048));
         assert_eq!(budget.plan.free_bytes, 160_000);
@@ -268,11 +299,11 @@ mod admission_tests {
         assert_eq!(budget.plan.alignment, 32);
         assert_eq!(budget.accounting, "free_after_resident");
         assert!(
-            WorkspaceBudget::new(request(8192, Some(1 << 20), 160_000), |r| Ok(8 * r)).is_err()
+            WorkspaceBudget::new(request(8192, Some(1 << 20), 160_000), |r| Ok(8 * r), Ok).is_err()
         );
-        assert!(WorkspaceBudget::new(request(8192, Some(0), 160_000), |r| Ok(8 * r)).is_err());
-        assert!(WorkspaceBudget::new(request(0, None, 160_000), |r| Ok(8 * r)).is_err());
-        assert!(WorkspaceBudget::new(request(8192, None, 1), |r| Ok(8 * r)).is_err());
+        assert!(WorkspaceBudget::new(request(8192, Some(0), 160_000), |r| Ok(8 * r), Ok).is_err());
+        assert!(WorkspaceBudget::new(request(0, None, 160_000), |r| Ok(8 * r), Ok).is_err());
+        assert!(WorkspaceBudget::new(request(8192, None, 1), |r| Ok(8 * r), Ok).is_err());
         Ok(())
     }
 }

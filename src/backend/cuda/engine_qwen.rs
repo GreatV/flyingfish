@@ -8,6 +8,15 @@ use crate::backend::cuda::{
     ops::{CommonOpsRef, GatedRmsInput, ResidualRmsInput, RmsMode, RmsOptions},
     weights::WeightCatalog,
 };
+/// Default prefill chunk ceiling, in rows. The prep and elementwise launches are sized
+/// by the admitted chunk, not by the live rows, so the per-step cost grows with it:
+/// measured on box3 at 1021 live rows, chunk 32768 against 2048 added about +117 ms per
+/// prefill (q38_norm l2_heads +54.3, gdn_prep_fp32 +34.3, q38_gate silu +17.9, tcmqa
+/// qg_split +5.7, others +4.7), and the 1021-token end-to-end leg ran 653.5 ms against
+/// main's 612.2 ms while the P1 core itself was 23.7 ms FASTER per prefill. An explicit
+/// `--chunk` is not clamped. Sizing those launches by live rows is a separate change.
+const DEFAULT_CHUNK_ROWS: usize = 2048;
+
 use crate::gdn_plan::GdnPolicy;
 use crate::{
     linear_plan::LayerDequantPlan,
@@ -745,6 +754,7 @@ impl Engine {
         let mtp_budget = reserve_mtp
             .then(|| crate::mtp::AttachmentBudget::new(&model_spec, capacity))
             .transpose()?;
+        let mut admitted_default_chunk = None;
         let budget = crate::prefill::WorkspaceBudget::new(
             crate::prefill::WorkspaceRequest {
                 capacity,
@@ -771,8 +781,24 @@ impl Engine {
                     )
                     .context("Q38 combined workspace overflow")
             },
+            |admitted| {
+                admitted_default_chunk = Some(admitted);
+                Ok(admitted.min(DEFAULT_CHUNK_ROWS))
+            },
         )?;
         let rows = budget.plan.chunk;
+        if let Some(admitted) = admitted_default_chunk
+            && admitted != rows
+        {
+            eprintln!(
+                "{}",
+                serde_json::json!({"q38_default_chunk_policy": {
+                    "admitted_chunk": admitted, "selected_chunk": rows,
+                    "arch": device.info.arch, "sms": device.info.sms,
+                    "requested_chunk": requested_chunk,
+                }})
+            );
+        }
         ensure!(
             !reserve_mtp || rows >= 4,
             "MTP workspace cannot fit four verification rows"
@@ -1388,9 +1414,11 @@ mod tests {
                 row_bytes: Runtime::row_bytes(&spec)?,
                 fixed_transient_bytes: fixed,
             };
-            let budget = WorkspaceBudget::new(request, |r| {
-                Runtime::workspace(r, capacity, GdnPolicy::LEGACY)
-            })?;
+            let budget = WorkspaceBudget::new(
+                request,
+                |r| Runtime::workspace(r, capacity, GdnPolicy::LEGACY),
+                Ok,
+            )?;
             assert_eq!(budget.planned_transient_bytes, allocated);
             assert_eq!(budget.plan.row_limit, rows);
             // The same request must fail if even one byte of the allocation is missing.
@@ -1401,6 +1429,7 @@ mod tests {
                         ..request
                     },
                     |r| Runtime::workspace(r, capacity, GdnPolicy::LEGACY),
+                    Ok,
                 )
                 .is_err()
             );
@@ -1436,7 +1465,7 @@ mod tests {
                 fixed_transient_bytes: fixed,
             };
             let budget =
-                WorkspaceBudget::new(request, |r| Runtime::workspace(r, capacity, policy))?;
+                WorkspaceBudget::new(request, |r| Runtime::workspace(r, capacity, policy), Ok)?;
             assert_eq!(budget.plan.chunk, rows);
             assert_eq!(budget.operator_workspace_bytes, scratch);
             assert_eq!(budget.planned_transient_bytes, required);
@@ -1446,7 +1475,8 @@ mod tests {
                         free_after_resident: request.free_after_resident - 1,
                         ..request
                     },
-                    |r| Runtime::workspace(r, capacity, policy)
+                    |r| Runtime::workspace(r, capacity, policy),
+                    Ok,
                 )
                 .is_err()
             );
