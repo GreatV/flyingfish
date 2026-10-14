@@ -5,7 +5,7 @@ use crate::backend::cuda::{
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
     gdn::{GdnBindings, GdnOps, GdnPlan},
     linear::{LayerLinearPlan, LinearWeightRef},
-    ops::{CommonOpsRef, GatedRmsInput, RmsMode, RmsOptions},
+    ops::{CommonOpsRef, GatedRmsInput, ResidualRmsInput, RmsMode, RmsOptions},
     weights::WeightCatalog,
 };
 use crate::gdn_plan::GdnPolicy;
@@ -42,7 +42,6 @@ pub(super) struct Runtime {
     mask: CudaSlice<u64>,
     layers: Vec<Layer>,
     common: CommonOpsRef,
-    multiply: CudaFunction,
     advance: CudaFunction,
     prepared: BTreeSet<u32>,
     gdn_policy: GdnPolicy,
@@ -442,7 +441,6 @@ impl Runtime {
             mask,
             layers,
             common,
-            multiply: module.load_function("q38_multiply")?,
             advance: module.load_function("q38_advance")?,
             prepared: BTreeSet::new(),
             gdn_policy,
@@ -1236,19 +1234,15 @@ impl Engine {
                 }
             }
             O::PostNorm | O::NextNorm => {
-                unsafe {
-                    s.launch_builder(&self.ops.residual)
-                        .arg(&mut w.x)
-                        .arg(&w.out)
-                        .arg(&((rows * h) as i32))
-                        .launch(flat(rows * h))?;
-                }
                 if matches!(op, O::PostNorm) {
-                    q.common.norm.rms_with(
+                    q.common.norm.rms_add_with(
                         s,
                         domain,
-                        heads(&w.x, s, 0, rows, 1, h as u32)?,
-                        layer.post_norm,
+                        ResidualRmsInput {
+                            x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                            residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                            weight: layer.post_norm,
+                        },
                         &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
                         RmsOptions {
                             mode: RmsMode::ZeroCentered,
@@ -1261,15 +1255,24 @@ impl Engine {
                         let name = debug_name(trace, i, "norm2");
                         trace_value(trace, s, &name, &w.n, rows, h)?;
                     }
-                } else if trace.is_some()
-                    && (!all_layers(trace) || [0, 3, 7, 31, 32, 47, 63].contains(&i))
-                {
-                    let name = if all_layers(trace) {
-                        i.to_string()
-                    } else {
-                        format!("layer.{i}")
-                    };
-                    trace_value(trace, s, &name, &w.x, rows, h)?;
+                } else {
+                    unsafe {
+                        s.launch_builder(&self.ops.residual)
+                            .arg(&mut w.x)
+                            .arg(&w.out)
+                            .arg(&((rows * h) as i32))
+                            .launch(flat(rows * h))?;
+                    }
+                    if trace.is_some()
+                        && (!all_layers(trace) || [0, 3, 7, 31, 32, 47, 63].contains(&i))
+                    {
+                        let name = if all_layers(trace) {
+                            i.to_string()
+                        } else {
+                            format!("layer.{i}")
+                        };
+                        trace_value(trace, s, &name, &w.x, rows, h)?;
+                    }
                 }
             }
             O::GateUp => {
@@ -1287,22 +1290,10 @@ impl Engine {
                 }
             }
             O::Activate => {
-                q.common.gate.silu(
-                    s,
-                    domain,
-                    heads(&w.gu, s, 0, rows, 1, f as u32)?,
-                    &mut TensorMut(heads(&w.act, s, 0, rows, 1, f as u32)?),
-                )?;
-                let a = matrix(&w.act, s, 0, rows, f)?;
-                let up = matrix(&w.gu, s, self.workspace_rows * f, rows, f)?;
-                unsafe {
-                    s.launch_builder(&q.multiply)
-                        .arg(&a.ptr)
-                        .arg(&up.ptr)
-                        .arg(&a.ptr)
-                        .arg(&((rows * f) as u64))
-                        .launch(flat(rows * f))?;
-                }
+                let gate = heads(&w.gu, s, 0, rows, 1, f as u32)?;
+                let up = heads(&w.gu, s, self.workspace_rows * f, rows, 1, f as u32)?;
+                let mut activated = TensorMut(heads(&w.act, s, 0, rows, 1, f as u32)?);
+                q.common.gate.swiglu(s, domain, gate, up, &mut activated)?;
             }
             O::Down => layer.linear.run(
                 &self.blas,

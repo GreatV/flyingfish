@@ -18,7 +18,7 @@ use crate::{
         cubin,
         flash::{Flash, Shape},
         linear::LayerLinearPlan,
-        ops::{CommonOpsRef, Ops, RmsMode, RmsOptions, flat},
+        ops::{CommonOpsRef, Ops, ResidualRmsInput, RmsMode, RmsOptions, flat},
         state::StateStore,
         weights::WeightCatalog,
     },
@@ -67,7 +67,6 @@ struct MtpRuntime {
     #[cfg(test)]
     head_runs: usize,
     common: CommonOpsRef,
-    multiply: CudaFunction,
     flash: Flash,
 }
 
@@ -166,7 +165,6 @@ impl MtpRuntime {
         let mut linear = LayerLinearPlan::bind(&dequant, catalog, &scratch(&arena, s), s)?;
         linear.materialize(blas.fp8_ops()?, s)?;
         let common = CommonOpsRef::new(&device.ctx)?;
-        let multiply = cubin::module(&device.ctx, "q38_common")?.load_function("q38_multiply")?;
         let mut runtime = Self {
             plan,
             work,
@@ -188,7 +186,6 @@ impl MtpRuntime {
             #[cfg(test)]
             head_runs: 0,
             common,
-            multiply,
             flash: Flash::new(s.clone(), rows, 24)?,
         };
         runtime.prepare_rows(device, catalog, state, blas, rows)?;
@@ -613,22 +610,31 @@ impl MtpRuntime {
         if detailed {
             dump.device("o_proj", s, &self.work.out, 0, rows, HIDDEN)?;
         }
-        unsafe {
-            s.launch_builder(&ops.residual)
-                .arg(&mut self.work.x)
-                .arg(&self.work.out)
-                .arg(&((rows * HIDDEN) as i32))
-                .launch(flat(rows * HIDDEN))?;
-        }
-        if detailed {
-            dump.device("residual1", s, &self.work.x, 0, rows, HIDDEN)?;
-        }
-        norm(
+        let add_norm =
+            |x: &CudaSlice<bf16>, r: &CudaSlice<bf16>, y: &CudaSlice<bf16>, name: &str| {
+                self.common.norm.rms_add_with(
+                    s,
+                    domain,
+                    ResidualRmsInput {
+                        x: &mut TensorMut(heads(x, s, 0, rows, 1, HIDDEN as u32)?),
+                        residual: heads(r, s, 0, rows, 1, HIDDEN as u32)?,
+                        weight: vector(catalog.bf16(name)?, s)?,
+                    },
+                    &mut TensorMut(heads(y, s, 0, rows, 1, HIDDEN as u32)?),
+                    RmsOptions {
+                        mode: RmsMode::ZeroCentered,
+                        eps: 1e-6,
+                    },
+                )
+            };
+        add_norm(
             &self.work.x,
+            &self.work.out,
             &self.work.n,
             "mtp.layers.0.post_attention_layernorm.weight",
         )?;
         if detailed {
+            dump.device("residual1", s, &self.work.x, 0, rows, HIDDEN)?;
             dump.device("norm2", s, &self.work.n, 0, rows, HIDDEN)?;
         }
         for (role, offset) in [
@@ -646,25 +652,13 @@ impl MtpRuntime {
                 dump.device(role, s, &self.work.gu, offset, rows, 17408)?;
             }
         }
-        self.common.gate.silu(
-            s,
-            domain,
-            heads(&self.work.gu, s, 0, rows, 1, 17408)?,
-            &mut TensorMut(heads(&self.work.act, s, 0, rows, 1, 17408)?),
-        )?;
-        if detailed {
-            dump.device("mlp_silu", s, &self.work.act, 0, rows, 17408)?;
-        }
+        let gate = heads(&self.work.gu, s, 0, rows, 1, 17408)?;
+        let up = heads(&self.work.gu, s, rows * 17408, rows, 1, 17408)?;
+        let mut activated = TensorMut(heads(&self.work.act, s, 0, rows, 1, 17408)?);
+        self.common
+            .gate
+            .swiglu(s, domain, gate, up, &mut activated)?;
         let a = matrix(&self.work.act, s, 0, rows, 17408)?;
-        let up = matrix(&self.work.gu, s, rows * 17408, rows, 17408)?;
-        unsafe {
-            s.launch_builder(&self.multiply)
-                .arg(&a.ptr)
-                .arg(&up.ptr)
-                .arg(&a.ptr)
-                .arg(&((rows * 17408) as u64))
-                .launch(flat(rows * 17408))?;
-        }
         if detailed {
             dump.device("mlp_activation", s, &self.work.act, 0, rows, 17408)?;
         }
@@ -678,18 +672,14 @@ impl MtpRuntime {
         if detailed {
             dump.device("mlp_down", s, &self.work.out, 0, rows, HIDDEN)?;
         }
-        unsafe {
-            s.launch_builder(&ops.residual)
-                .arg(&mut self.work.x)
-                .arg(&self.work.out)
-                .arg(&((rows * HIDDEN) as i32))
-                .launch(flat(rows * HIDDEN))?;
-        }
+        add_norm(
+            &self.work.x,
+            &self.work.out,
+            &self.work.n,
+            "mtp.norm.weight",
+        )?;
         if detailed {
             dump.device("pre_mtp_norm", s, &self.work.x, 0, rows, HIDDEN)?;
-        }
-        norm(&self.work.x, &self.work.n, "mtp.norm.weight")?;
-        if detailed {
             dump.device("post_mtp_norm", s, &self.work.n, 0, rows, HIDDEN)?;
         }
         if output == OutputMode::StateOnly {
