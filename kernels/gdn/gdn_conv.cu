@@ -153,3 +153,27 @@ extern "C" __global__ void gdn_conv_hist_update(
 #endif
     }
 }
+
+extern "C" __global__ void gdn_conv_hist_snapshot(
+        const __nv_bfloat16* __restrict__ qkv, float* __restrict__ history,
+        const GdnMeta* __restrict__ meta, int conv_dim, float* __restrict__ snapshots) {
+    const int ch = blockIdx.x * GDN_CONV_CHAN + threadIdx.x;
+    const int rows = meta->valid_rows;
+    if (conv_dim != GDN_CONV_DIM || blockDim.x != GDN_CONV_CHAN || blockDim.y != 1 ||
+        blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1 || ch >= conv_dim ||
+        !aligned16(qkv) || !aligned16(history) || !aligned16(snapshots) ||
+        rows < 1 || rows > 4 || meta->prefix < 0 || meta->causal != 1 ||
+        meta->key_count != meta->prefix + rows || meta->capacity < meta->key_count) {
+        __trap(); return;
+    }
+    const float old[3] = { history[ch * 3], history[ch * 3 + 1], history[ch * 3 + 2] };
+    for (int r = 0; r < rows; ++r) {
+        #pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            const int idx = r + 1 + j;
+            const float x = idx < 3 ? old[idx] : __bfloat162float(qkv[(size_t)(idx - 3) * conv_dim + ch]);
+            snapshots[((size_t)r * conv_dim + ch) * 3 + j] = x;
+            if (r == rows - 1) history[ch * 3 + j] = x;
+        }
+    }
+}

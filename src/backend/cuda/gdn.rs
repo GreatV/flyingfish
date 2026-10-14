@@ -133,9 +133,12 @@ struct Kernels {
     chunked: CudaFunction,
     recurrent: CudaFunction,
     rstep: Option<CudaFunction>,
+    hist_snapshot: CudaFunction,
+    core_snapshot: CudaFunction,
 }
 
 pub(crate) struct GdnPlan {
+    snapshots: Option<(Tensor<f32, 4>, Tensor<f32, 3>)>,
     kernels: Arc<Kernels>,
     bindings: GdnBindings,
     common: CommonOpsRef,
@@ -154,6 +157,37 @@ pub(crate) struct GdnPlan {
 }
 
 impl GdnPlan {
+    pub(crate) fn bind_snapshots(
+        &mut self,
+        state: Tensor<f32, 4>,
+        history: Tensor<f32, 3>,
+    ) -> Result<()> {
+        ensure!(
+            (1..=4).contains(&self.max_rows),
+            "snapshot plan bound must be 1..4"
+        );
+        state.validate()?;
+        ensure!(
+            state.shape == [4, HV, DK, DV]
+                && state.stride
+                    == [
+                        u64::from(HV * DK * DV),
+                        u64::from(DK * DV),
+                        u64::from(DV),
+                        1
+                    ],
+            "invalid state snapshot layout"
+        );
+        history.validate()?;
+        ensure!(
+            history.shape == [4, self.conv_dim, 3]
+                && history.stride == [u64::from(self.conv_dim * 3), 3, 1],
+            "invalid history snapshot layout"
+        );
+        self.snapshots = Some((state, history));
+        Ok(())
+    }
+
     /// Setup-only prefix view. Reuse loaded modules and physical addresses.
     pub(crate) fn for_rows(&self, rows: u32) -> Result<Self> {
         ensure!(
@@ -184,6 +218,7 @@ impl GdnPlan {
         let mut conv_cfg = self.conv_cfg;
         conv_cfg.grid_dim.1 = rows.div_ceil(CONV_ROWS);
         Ok(Self {
+            snapshots: None,
             kernels: self.kernels.clone(),
             bindings,
             common: self.common.clone(),
@@ -323,7 +358,19 @@ impl GdnOps {
         } else {
             None
         };
+        let hist_snapshot =
+            cubin::module(ctx, "gdn/gdn_conv")?.load_function("gdn_conv_hist_snapshot")?;
+        let core_snapshot = if rstep.is_some() {
+            cubin::module(ctx, "gdn/gdn_rstep")?.load_function("gdn_rstep_core_snapshot")?
+        } else {
+            let f = cubin::module(ctx, "gdn/gdn_chunked")?
+                .load_function("gdn_chunked_core_snapshot")?;
+            f.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, CHUNKED_SMEM as i32)?;
+            f
+        };
         let kernels = Kernels {
+            hist_snapshot,
+            core_snapshot,
             rstep,
             scan: scan_kernels,
             conv: f_conv,
@@ -337,6 +384,7 @@ impl GdnOps {
         // valid_rows, so a captured Graph replays an identical launch sequence.
         let conv_rows = max_rows.div_ceil(CONV_ROWS);
         Ok(GdnPlan {
+            snapshots: None,
             kernels: Arc::new(kernels),
             bindings,
             common,
@@ -404,6 +452,7 @@ impl GdnOps {
             plan.kernels.scan.is_none(),
             "verify GDN cannot use scan plan"
         );
+        ensure!(plan.snapshots.is_some(), "verify snapshots not bound");
         Self::run_core(plan, stream, meta, ExecutionPhase::Prefill, scratch, true)
     }
 
@@ -415,6 +464,11 @@ impl GdnOps {
         scratch: Scratch,
         verify: bool,
     ) -> Result<()> {
+        let snapshots = if verify {
+            plan.snapshots.as_ref()
+        } else {
+            None
+        };
         let rstep = if verify {
             plan.kernels.rstep.as_ref()
         } else {
@@ -487,13 +541,24 @@ impl GdnOps {
             // ---- 2. hist_update: INSIDE the binder, after conv, same stream.
             // Fusing these was a cross-block race: the block owning the last row overwrote
             // history[] while blocks with blockIdx.y == 0 were still reading it.
-            stream
-                .launch_builder(&plan.kernels.hist_update)
-                .arg(&b.qkv.ptr)
-                .arg(&b.history.0.ptr)
-                .arg(&meta.ptr)
-                .arg(&(cd as i32))
-                .launch(plan.hist_cfg)?;
+            if let Some((_, history)) = snapshots {
+                stream
+                    .launch_builder(&plan.kernels.hist_snapshot)
+                    .arg(&b.qkv.ptr)
+                    .arg(&b.history.0.ptr)
+                    .arg(&meta.ptr)
+                    .arg(&(cd as i32))
+                    .arg(&history.ptr)
+                    .launch(plan.hist_cfg)?;
+            } else {
+                stream
+                    .launch_builder(&plan.kernels.hist_update)
+                    .arg(&b.qkv.ptr)
+                    .arg(&b.history.0.ptr)
+                    .arg(&meta.ptr)
+                    .arg(&(cd as i32))
+                    .launch(plan.hist_cfg)?;
+            }
         }
         // ---- 3. common SiLU, IN PLACE: conv_out -> conv_out. There is no `act` region.
         // The kernel is elementwise and GateOps::silu imposes no x/y disjointness, so the
@@ -590,6 +655,27 @@ impl GdnOps {
                             g.0.ptr,
                         ],
                     )?;
+                }
+                ExecutionPhase::Prefill if snapshots.is_some() => {
+                    let (state, _) = snapshots.context("missing snapshot bindings")?;
+                    let (bound, config) = if rstep.is_some() {
+                        (rows as i32, plan.recurrent_cfg)
+                    } else {
+                        (0, plan.chunked_cfg)
+                    };
+                    stream
+                        .launch_builder(&plan.kernels.core_snapshot)
+                        .arg(&q_fp32.0.ptr)
+                        .arg(&k_fp32.0.ptr)
+                        .arg(&v_fp32.0.ptr)
+                        .arg(&beta_fp32.0.ptr)
+                        .arg(&g.0.ptr)
+                        .arg(&b.s.0.ptr)
+                        .arg(&b.core_out.0.ptr)
+                        .arg(&meta.ptr)
+                        .arg(&bound)
+                        .arg(&state.ptr)
+                        .launch(config)?;
                 }
                 ExecutionPhase::Prefill if rstep.is_some() => {
                     let core = rstep.context("missing prepared rstep core")?;
@@ -900,6 +986,181 @@ fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "authorized sm89 GPU window required"]
+    fn gdn_verify_snapshot_rows_gpu() -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let device = crate::backend::cuda::Device::new(0)?;
+        ensure!(
+            device.info.arch == 89,
+            "bitwise R-step primitive gate requires sm89"
+        );
+        let stream = &device.stream;
+        let state_elements = (HV * DK * DV) as usize;
+        let row_elements = (HV * DK) as usize;
+        let signal =
+            |i: usize, prime: usize| ((i * 17 % prime) as f32 - (prime / 2) as f32) / 1024.0;
+        let initial: Vec<_> = (0..state_elements).map(|i| signal(i, 127)).collect();
+        let q: Vec<_> = (0..4 * row_elements).map(|i| signal(i, 131)).collect();
+        let k: Vec<_> = (0..4 * row_elements).map(|i| signal(i, 137)).collect();
+        let v: Vec<_> = (0..4 * row_elements).map(|i| signal(i, 139)).collect();
+        let beta = vec![0.5f32; 4 * HV as usize];
+        let g: Vec<_> = (0..4 * HV as usize)
+            .map(|i| -((i * 17 % 157 + 1) as f32) / 256.0)
+            .collect();
+        let q = stream.clone_htod(&q)?;
+        let k = stream.clone_htod(&k)?;
+        let v = stream.clone_htod(&v)?;
+        let beta = stream.clone_htod(&beta)?;
+        let g = stream.clone_htod(&g)?;
+        let module = cubin::module(&device.ctx, "gdn/gdn_rstep")?;
+        let snapshot_kernel = module.load_function("gdn_rstep_core_snapshot")?;
+        let plain_kernel = module.load_function("gdn_rstep_core_v1")?;
+        let config = LaunchConfig {
+            grid_dim: (2, HV, 1),
+            block_dim: (512, 1, 1),
+            shared_mem_bytes: RECURRENT_SMEM,
+        };
+        for rows in 1..=4usize {
+            let mut state = stream.clone_htod(&initial)?;
+            let mut snapshots = stream.alloc_zeros::<f32>(4 * state_elements)?;
+            let mut out = stream.alloc_zeros::<bf16>(4 * row_elements)?;
+            let meta =
+                stream.clone_htod(&[17i32, rows as i32, 17 + rows as i32, 128, 1, 0, 0, 0])?;
+            unsafe {
+                stream
+                    .launch_builder(&snapshot_kernel)
+                    .arg(&q)
+                    .arg(&k)
+                    .arg(&v)
+                    .arg(&beta)
+                    .arg(&g)
+                    .arg(&mut state)
+                    .arg(&mut out)
+                    .arg(&meta)
+                    .arg(&(rows as i32))
+                    .arg(&mut snapshots)
+                    .launch(config)?;
+            }
+            let slots = stream.clone_dtoh(&snapshots)?;
+            let final_state = stream.clone_dtoh(&state)?;
+            let actual = stream.clone_dtoh(&out)?;
+            let mut reference = stream.clone_htod(&initial)?;
+            for row in 0..rows {
+                let meta =
+                    stream.clone_htod(&[17 + row as i32, 1, 18 + row as i32, 128, 1, 0, 0, 0])?;
+                let offset = row * row_elements;
+                let qp = q.device_ptr(stream).0 + (offset * 4) as u64;
+                let kp = k.device_ptr(stream).0 + (offset * 4) as u64;
+                let vp = v.device_ptr(stream).0 + (offset * 4) as u64;
+                let bp = beta.device_ptr(stream).0 + (row * HV as usize * 4) as u64;
+                let gp = g.device_ptr(stream).0 + (row * HV as usize * 4) as u64;
+                let mut output = stream.alloc_zeros::<bf16>(row_elements)?;
+                unsafe {
+                    stream
+                        .launch_builder(&plain_kernel)
+                        .arg(&qp)
+                        .arg(&kp)
+                        .arg(&vp)
+                        .arg(&bp)
+                        .arg(&gp)
+                        .arg(&mut reference)
+                        .arg(&mut output)
+                        .arg(&meta)
+                        .arg(&1i32)
+                        .launch(config)?;
+                }
+                let expected = stream.clone_dtoh(&reference)?;
+                ensure!(
+                    expected
+                        .iter()
+                        .zip(&slots[row * state_elements..(row + 1) * state_elements])
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "snapshot state differs from independent R1 chain, rows={rows} row={row}"
+                );
+                ensure!(
+                    stream.clone_dtoh(&output)? == actual[offset..offset + row_elements],
+                    "snapshot output changed"
+                );
+                if row + 1 == rows {
+                    ensure!(expected == final_state, "final state changed");
+                }
+            }
+            ensure!(
+                slots[rows * state_elements..]
+                    .iter()
+                    .all(|v| v.to_bits() == 0),
+                "dead snapshot slots written"
+            );
+        }
+        let conv_dim = GDN_CONV_DIM as usize;
+        let initial: Vec<_> = (0..conv_dim * 3).map(|i| signal(i, 149)).collect();
+        let raw: Vec<_> = (0..4 * conv_dim)
+            .map(|i| bf16::from_f32(signal(i, 151)))
+            .collect();
+        let qkv = stream.clone_htod(&raw)?;
+        let kernel =
+            cubin::module(&device.ctx, "gdn/gdn_conv")?.load_function("gdn_conv_hist_snapshot")?;
+        for rows in 1..=4usize {
+            let mut history = stream.clone_htod(&initial)?;
+            let mut slots = stream.alloc_zeros::<f32>(4 * conv_dim * 3)?;
+            let meta =
+                stream.clone_htod(&[17i32, rows as i32, 17 + rows as i32, 128, 1, 0, 0, 0])?;
+            unsafe {
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&qkv)
+                    .arg(&mut history)
+                    .arg(&meta)
+                    .arg(&(conv_dim as i32))
+                    .arg(&mut slots)
+                    .launch(LaunchConfig {
+                        grid_dim: (GDN_CONV_DIM / 256, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            let slots = stream.clone_dtoh(&slots)?;
+            let final_history = stream.clone_dtoh(&history)?;
+            for row in 0..rows {
+                for ch in 0..conv_dim {
+                    for tap in 0..3 {
+                        let index = row + 1 + tap;
+                        let expected = if index < 3 {
+                            initial[ch * 3 + index]
+                        } else {
+                            raw[(index - 3) * conv_dim + ch].to_f32()
+                        };
+                        ensure!(
+                            slots[(row * conv_dim + ch) * 3 + tap].to_bits() == expected.to_bits(),
+                            "raw history snapshot index mismatch"
+                        );
+                        if row + 1 == rows {
+                            ensure!(
+                                final_history[ch * 3 + tap].to_bits() == expected.to_bits(),
+                                "final history mismatch"
+                            );
+                        }
+                    }
+                }
+            }
+            ensure!(
+                slots[rows * conv_dim * 3..]
+                    .iter()
+                    .all(|v| v.to_bits() == 0),
+                "dead history slots written"
+            );
+        }
+        println!(
+            "GDN_VERIFY_SNAPSHOT_PRIMITIVE_PASS rows1..4 state_bitwise_R1 raw_history_CPU dead_slots"
+        );
+        Ok(())
+    }
 
     fn align256(n: u64) -> u64 {
         (n + 255) & !255

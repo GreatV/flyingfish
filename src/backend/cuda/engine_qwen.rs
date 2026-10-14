@@ -73,8 +73,6 @@ struct PrefillPlans<T> {
     full: Box<T>,
     small: Vec<T>,
     max_rows: usize,
-    #[cfg(test)]
-    force_full: bool,
 }
 impl<T> PrefillPlans<T> {
     fn bind(full: T, max_rows: usize, narrow: impl Fn(&T, u32) -> Result<T>) -> Result<Self> {
@@ -86,8 +84,6 @@ impl<T> PrefillPlans<T> {
             full: Box::new(full),
             small,
             max_rows,
-            #[cfg(test)]
-            force_full: false,
         })
     }
     fn select(&self, rows: usize) -> Result<&T> {
@@ -95,10 +91,6 @@ impl<T> PrefillPlans<T> {
             rows > 0 && rows <= self.max_rows,
             "prefill rows outside binding"
         );
-        #[cfg(test)]
-        if self.force_full {
-            return Ok(&self.full);
-        }
         Ok(self.small.get(rows - 1).unwrap_or(&self.full))
     }
 }
@@ -482,18 +474,30 @@ impl Runtime {
     }
 }
 impl Engine {
-    #[cfg(test)]
-    pub(super) fn qwen_full_prefill_for_test(&mut self, full: bool) -> Result<()> {
-        // The state oracle may widen FA, but sm89 MTP must retain the same
-        // R-step core/partition. C32 is a numerical oracle, not a bitwise one.
-        let full_gdn = full && self.device.info.arch != 89;
+    pub(super) fn bind_mtp_snapshots(
+        &mut self,
+        snapshots: &[super::super::state::GdnState],
+    ) -> Result<()> {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
+        let stream = &self.device.stream;
+        let mut states = snapshots.iter();
         for layer in &mut q.layers {
-            match &mut layer.mixer {
-                BoundMixer::Attention { text_prefill, .. } => text_prefill.force_full = full,
-                BoundMixer::Gdn { prefill, .. } => prefill.force_full = full_gdn,
+            if let BoundMixer::Gdn { prefill, .. } = &mut layer.mixer {
+                let state = states.next().context("missing GDN snapshot allocation")?;
+                let s = view(
+                    &state.s,
+                    stream,
+                    0,
+                    [4, 48, 128, 128],
+                    [48 * 128 * 128, 128 * 128, 128, 1],
+                )?;
+                let h = view(&state.history, stream, 0, [4, 10240, 3], [10240 * 3, 3, 1])?;
+                for plan in &mut prefill.small {
+                    plan.bind_snapshots(s, h)?;
+                }
             }
         }
+        ensure!(states.next().is_none(), "extra GDN snapshot allocation");
         Ok(())
     }
 

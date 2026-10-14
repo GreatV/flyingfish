@@ -16,6 +16,8 @@ fn optional_verify_graphs<G>(
 }
 
 pub(super) struct Batch {
+    snapshots: Vec<crate::backend::cuda::state::GdnState>,
+    frame_epoch: Option<u64>,
     logits: CudaSlice<bf16>,
     predictions: CudaSlice<u32>,
     nonfinite: CudaSlice<u32>,
@@ -36,6 +38,7 @@ pub(super) struct Batch {
 
 impl Batch {
     pub(super) fn invalidate_frame(&mut self) {
+        self.frame_epoch = None;
         self.frame.clear();
         self.frame_position = 0;
         self.frame_rows = 0;
@@ -43,8 +46,7 @@ impl Batch {
 }
 
 impl Engine {
-    /// Setup before Ready; four fixed query shapes cover K1..3 and every partial
-    /// replay (including R1 with Prefill phase). No new measured choices.
+    /// Four fixed query shapes cover K1..3 with per-row recurrent snapshots.
     pub(in crate::backend::cuda::engine) fn mtp_batch_enable(&mut self) -> Result<()> {
         ensure!(
             self.position == 0 && self.mtp.as_ref().is_some_and(|c| c.batch.is_none()),
@@ -62,9 +64,10 @@ impl Engine {
             .target_checkpoint
             .bytes();
         let buffers = 4 * VOCAB * size_of::<bf16>() + size_of::<[i32; 9]>();
+        let snapshot_bytes = crate::mtp::snapshot_bytes(&self.model_spec)?;
         let needed = crate::mtp::batch_bytes(&self.model_spec)?;
         ensure!(
-            needed == journal + buffers,
+            needed == journal + buffers + snapshot_bytes,
             "M2b budget/attachment mismatch"
         );
         let (free, total) = self.device.ctx.mem_get_info()?;
@@ -77,7 +80,29 @@ impl Engine {
             self.blas
                 .prepare_fixed(rows as u32, VOCAB as u32, HIDDEN as u32)?;
         }
+        let snapshots = self
+            .state
+            .gdn
+            .iter()
+            .map(|state| {
+                Ok(crate::backend::cuda::state::GdnState {
+                    s: s.alloc_zeros(4 * state.s.len())?,
+                    history: s.alloc_zeros(4 * state.history.len())?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            snapshots
+                .iter()
+                .map(|g| (g.s.len() + g.history.len()) * size_of::<f32>())
+                .sum::<usize>()
+                == snapshot_bytes,
+            "snapshot allocation ledger mismatch"
+        );
+        self.bind_mtp_snapshots(&snapshots)?;
         let mut batch = Batch {
+            snapshots,
+            frame_epoch: None,
             logits: s.alloc_zeros(4 * VOCAB)?,
             predictions: s.alloc_zeros(4)?,
             nonfinite: s.alloc_zeros(1)?,
@@ -107,12 +132,13 @@ impl Engine {
         };
         self.mtp.as_mut().context("MTP missing")?.batch = Some(batch);
         eprintln!(
-            "MTP_M2B_MEMORY additional_device_bytes={needed} capture_checkpoint_bytes={journal} graph_shapes={graph_shapes}"
+            "MTP_M2B_MEMORY additional_device_bytes={needed} capture_checkpoint_bytes={journal} snapshot_bytes={snapshot_bytes} graph_shapes={graph_shapes}"
         );
         Ok(())
     }
 
     fn mtp_batch_capture(&mut self, batch: &mut Batch) -> Result<Vec<CudaGraph>> {
+        batch.invalidate_frame();
         self.closure.capture()?;
         let s = self.device.stream.clone();
         batch
@@ -297,6 +323,11 @@ impl Engine {
                 fault,
             )?;
             chain.committed_position = self.position;
+            chain
+                .batch
+                .as_mut()
+                .context("M2b not bound")?
+                .invalidate_frame();
             Ok(r)
         })();
         self.mtp = Some(chain);
@@ -317,6 +348,7 @@ impl BatchedBackend for Bound<'_> {
         );
         let s = e.device.stream.clone();
         let batch = c.batch.as_mut().context("M2b not bound")?;
+        batch.invalidate_frame();
         s.memcpy_htod(inputs, &mut e.work.ids.slice_mut(..rows))?;
         s.memcpy_htod(&[e.position as i32], &mut e.work.position)?;
         if c.options.graph {
@@ -338,6 +370,7 @@ impl BatchedBackend for Bound<'_> {
         batch.frame = s.clone_dtoh(&hidden.slice(..rows * HIDDEN))?;
         batch.frame_position = e.position;
         batch.frame_rows = rows;
+        batch.frame_epoch = Some(e.mtp_epoch);
         batch.calls += 1;
         e.position += rows;
         s.memcpy_htod(&[e.position as i32], &mut e.work.position)?;
@@ -345,6 +378,55 @@ impl BatchedBackend for Bound<'_> {
         e.state
             .set_sequence(&s, e.position as u32, 1, e.workspace_rows as u32)?;
         Ok(predictions)
+    }
+    fn select_prefix(&mut self, rows: usize) -> Result<()> {
+        let e = &mut self.engine;
+        let c = &mut self.chain;
+        let saved = c.saved.as_ref().context("MTP checkpoint invalid")?;
+        let batch = c.batch.as_mut().context("M2b not bound")?;
+        let row = policy::snapshot_row(
+            rows,
+            batch.frame_rows,
+            batch.frame_position,
+            e.position,
+            batch.frame_epoch,
+            e.mtp_epoch,
+        )?;
+        ensure!(
+            c.epoch == e.mtp_epoch
+                && batch.frame_position == saved.position
+                && batch.frame.len() == batch.frame_rows * HIDDEN,
+            "verify frame/checkpoint mismatch"
+        );
+        let s = &e.device.stream;
+        ensure!(
+            batch.snapshots.len() == e.state.gdn.len(),
+            "snapshot layer count mismatch"
+        );
+        for (state, snapshot) in e.state.gdn.iter_mut().zip(&batch.snapshots) {
+            let n = state.s.len();
+            s.memcpy_dtod(&snapshot.s.slice(row * n..(row + 1) * n), &mut state.s)?;
+            let n = state.history.len();
+            s.memcpy_dtod(
+                &snapshot.history.slice(row * n..(row + 1) * n),
+                &mut state.history,
+            )?;
+        }
+        s.memcpy_dtod(
+            &batch.logits.slice(row * VOCAB..(row + 1) * VOCAB),
+            &mut e.work.logits,
+        )?;
+        s.memcpy_dtod(&batch.predictions.slice(row..row + 1), &mut e.work.token)?;
+        let position = saved.position + rows;
+        s.memcpy_htod(&[position as i32], &mut e.work.position)?;
+        s.memcpy_htod(&[(position + 1) as i32], &mut e.work.length)?;
+        e.state
+            .set_sequence(s, position as u32, 1, e.workspace_rows as u32)?;
+        batch.frame.truncate(rows * HIDDEN);
+        batch.frame_rows = rows;
+        e.position = position;
+        e.logits_cache.mark_valid();
+        Ok(())
     }
     fn restore_mtp(&mut self) -> Result<()> {
         let e = &mut self.engine;
@@ -369,7 +451,8 @@ impl BatchedBackend for Bound<'_> {
             .clone();
         let batch = self.chain.batch.as_ref().context("M2b not bound")?;
         ensure!(
-            batch.frame_position == saved.position
+            batch.frame_epoch == Some(self.engine.mtp_epoch)
+                && batch.frame_position == saved.position
                 && batch.frame_rows == inputs.len()
                 && self.engine.position == saved.position + inputs.len()
                 && self.chain.cursor == saved.cursor,
@@ -396,7 +479,7 @@ impl BatchedBackend for Bound<'_> {
                 "injected M2b canonical row failure {row}"
             );
         }
-        self.chain.last_target = frame[(inputs.len() - 1) * HIDDEN..].to_vec();
+        self.chain.last_target = frame[(inputs.len() - 1) * HIDDEN..inputs.len() * HIDDEN].to_vec();
         ensure!(
             self.chain.cursor + 1 == self.engine.position,
             "M2b repair cursor mismatch"

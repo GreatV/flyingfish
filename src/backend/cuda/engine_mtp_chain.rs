@@ -48,6 +48,11 @@ impl Bootstrap {
     }
 }
 impl Chain {
+    pub(in crate::backend::cuda::engine) fn invalidate_verify(&mut self) {
+        if let Some(batch) = self.batch.as_mut() {
+            batch.invalidate_frame();
+        }
+    }
     fn bootstrap_chunk(&mut self, e: &mut Engine, ids: &[u32]) -> Result<()> {
         let rows = ids.len();
         let s = &e.device.stream;
@@ -249,6 +254,7 @@ impl Backend for Bound<'_> {
         c.committed_position = saved.position;
         if let Some(batch) = c.batch.as_mut() {
             batch.target_restores += 1;
+            batch.invalidate_frame();
         }
         Ok(())
     }

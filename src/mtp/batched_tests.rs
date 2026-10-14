@@ -6,6 +6,9 @@ struct State {
     position: usize,
     pending: u32,
     accumulator: u64,
+    history: [u32; 3],
+    visible: usize,
+    epoch: u64,
     target_kv: Vec<u32>,
     mtp_kv: Vec<u32>,
     hidden: u32,
@@ -17,7 +20,9 @@ struct Mock {
     proposals: Vec<u32>,
     hidden_rows: Vec<u32>,
     events: Vec<&'static str>,
-    replay_bias: u32,
+    snapshots: Vec<State>,
+    snapshot_epoch: Option<u64>,
+    mutant: Option<usize>,
     poisoned: bool,
     restore_fails: bool,
 }
@@ -28,6 +33,9 @@ impl Mock {
                 position: 1,
                 pending: 10,
                 accumulator: 17,
+                history: [91, 92, 93],
+                visible: 1,
+                epoch: 7,
                 target_kv: vec![77; 32],
                 mtp_kv: vec![88; 32],
                 hidden: 5,
@@ -37,7 +45,9 @@ impl Mock {
             proposals,
             hidden_rows: vec![],
             events: vec![],
-            replay_bias: 0,
+            snapshots: vec![],
+            snapshot_epoch: None,
+            mutant: None,
             poisoned: false,
             restore_fails: false,
         }
@@ -51,6 +61,9 @@ impl Mock {
         self.state.hidden = token ^ self.state.position as u32;
         self.state.target_kv[self.state.position] = token;
         self.state.position += 1;
+        self.state.visible = self.state.position;
+        self.state.history.rotate_left(1);
+        self.state.history[2] = token;
     }
 }
 impl Backend for Mock {
@@ -72,6 +85,7 @@ impl Backend for Mock {
         self.events.push("restore_all");
         ensure!(!self.restore_fails, "restore failure");
         self.state = self.saved.clone().unwrap();
+        self.snapshot_epoch = None;
         Ok(())
     }
     fn poison(&mut self) {
@@ -102,16 +116,46 @@ impl BatchedBackend for Mock {
             .partitions
             .push((self.state.position, inputs.len()));
         self.hidden_rows.clear();
+        self.snapshots.clear();
+        self.snapshot_epoch = Some(self.state.epoch);
         for &token in inputs {
             self.append(token, inputs.len());
             self.hidden_rows.push(self.state.hidden);
+            self.state.pending = token + 1;
+            self.snapshots.push(self.state.clone());
         }
-        let mut predictions: Vec<_> = inputs.iter().map(|t| t + 1).collect();
-        if inputs.len() < 4 {
-            *predictions.last_mut().unwrap() += self.replay_bias;
+        Ok(inputs.iter().map(|t| t + 1).collect())
+    }
+    fn select_prefix(&mut self, rows: usize) -> Result<()> {
+        self.events.push("select_prefix");
+        let mut row = snapshot_row(
+            rows,
+            self.snapshots.len(),
+            self.saved.as_ref().map_or(1, |s| s.position),
+            self.state.position,
+            self.snapshot_epoch,
+            self.state.epoch,
+        )?;
+        if self.mutant == Some(0) {
+            row += 1;
         }
-        self.state.pending = *predictions.last().unwrap();
-        Ok(predictions)
+        if self.mutant == Some(1) {
+            row = row.saturating_sub(1);
+        }
+        let tail = self.state.target_kv.clone();
+        let visible = self.state.visible;
+        self.state = self.snapshots[row].clone();
+        self.state.target_kv = tail;
+        if self.mutant == Some(2) {
+            self.state.history = [self.state.hidden; 3];
+        }
+        if self.mutant == Some(3) {
+            self.state.visible = visible;
+        }
+        if self.mutant != Some(4) {
+            self.hidden_rows.truncate(rows);
+        }
+        Ok(())
     }
     fn restore_mtp(&mut self) -> Result<()> {
         self.events.push("restore_mtp");
@@ -120,6 +164,10 @@ impl BatchedBackend for Mock {
     }
     fn repair_mtp(&mut self, inputs: &[u32]) -> Result<()> {
         self.events.push("repair");
+        ensure!(
+            self.hidden_rows.len() == inputs.len(),
+            "untruncated hidden frame"
+        );
         let before = self.saved.as_ref().unwrap();
         for (row, &token) in inputs.iter().enumerate() {
             let hidden = if row == 0 {
@@ -141,54 +189,83 @@ fn options(k: usize) -> MtpOptions {
     }
 }
 
+// The oracle consumes the full verify shape but commits only the causal prefix.
+fn oracle(proposals: &[u32], accepted: usize) -> State {
+    let mut expected = Mock::new(vec![]);
+    expected.save(proposals.len() + 1).unwrap();
+    expected.state.partitions.push((1, proposals.len() + 1));
+    let inputs: Vec<_> = std::iter::once(10)
+        .chain(proposals.iter().copied())
+        .collect();
+    for (row, &token) in inputs.iter().enumerate() {
+        if row <= accepted {
+            expected.append(token, inputs.len());
+            expected.hidden_rows.push(expected.state.hidden);
+        } else {
+            expected.state.target_kv[1 + row] = token;
+        }
+    }
+    expected.state.pending = inputs[accepted] + 1;
+    expected.repair_mtp(&inputs[..accepted + 1]).unwrap();
+    expected.state
+}
+
 #[test]
-fn all_accept_keeps_one_batch_and_partial_accept_replays_one_batch() {
+fn every_acceptance_branch_selects_the_full_verify_prefix_without_replay() {
     for k in 1..=3 {
-        for j in 0..=k {
+        for accepted in 0..=k {
             let mut proposals: Vec<_> = (11..11 + k as u32).collect();
-            if j < k {
-                proposals[j] = 999;
+            if accepted < k {
+                proposals[accepted] = 999;
             }
+            let expected = oracle(&proposals, accepted);
             let mut b = Mock::new(proposals);
             let r = run(&mut b, options(k), 64, &[], None).unwrap();
-            assert_eq!((r.round.accepted, r.kept_verify_state), (j, j == k));
             assert_eq!(
-                b.events.iter().filter(|&&e| e == "batch").count(),
-                if j == k { 1 } else { 2 }
+                (r.round.accepted, r.kept_verify_state),
+                (accepted, accepted == k)
             );
-            assert_eq!(
-                b.events.iter().filter(|&&e| e == "restore_all").count(),
-                usize::from(j != k)
-            );
+            assert_eq!(b.events.iter().filter(|&&e| e == "batch").count(), 1);
+            assert!(!b.events.contains(&"restore_all"));
             assert!(!b.events.contains(&"decode"));
-            let mut canonical = Mock::new(vec![]);
-            canonical.save(j + 1).unwrap();
-            let inputs: Vec<_> = (10..11 + j as u32).collect();
-            let expected = canonical.verify_batch(&inputs).unwrap();
-            canonical.repair_mtp(&inputs).unwrap();
-            assert_eq!(b.state, canonical.state);
-            assert_eq!(r.round.tokens.last(), expected.last());
+            assert_eq!(b.state, expected);
+            assert_eq!(r.round.tokens.last(), r.verify_predictions.get(accepted));
         }
     }
 }
 
 #[test]
-fn partial_replay_uses_its_own_correction_and_same_phase_state() {
-    let mut b = Mock::new(vec![11, 999, 13]);
-    b.replay_bias = 7;
-    let r = run(&mut b, options(3), 64, &[], None).unwrap();
-    assert_eq!(r.round.tokens, [11, 19]);
-    assert_ne!(r.round.tokens.last(), r.verify_predictions.get(1));
-    let mut canonical = Mock::new(vec![]);
-    canonical.replay_bias = 7;
-    canonical.save(2).unwrap();
-    canonical.verify_batch(&[10, 11]).unwrap();
-    canonical.repair_mtp(&[10, 11]).unwrap();
-    assert_eq!(b.state, canonical.state);
-    let mut decode = Mock::new(vec![]);
-    decode.target_decode(10).unwrap();
-    decode.target_decode(11).unwrap();
-    assert_ne!(b.state.accumulator, decode.state.accumulator);
+fn state_oracle_detects_wrong_row_history_visibility_frame_and_stale_epoch() {
+    for (rows, live, base, position) in [
+        (0, 4, 1, 5),
+        (4, 4, 1, 5),
+        (1, 0, 1, 1),
+        (1, 5, 1, 6),
+        (1, 4, usize::MAX, 3),
+        (1, 4, 1, 6),
+    ] {
+        assert!(snapshot_row(rows, live, base, position, Some(7), 7).is_err());
+    }
+    for mutant in 0..5 {
+        let proposals = vec![11, 12, 999];
+        let expected = oracle(&proposals, 2);
+        let mut b = Mock::new(proposals);
+        b.mutant = Some(mutant);
+        let result = run(&mut b, options(3), 64, &[], None);
+        assert!(
+            result.is_err() || b.state != expected,
+            "mutant {mutant} escaped"
+        );
+    }
+    let mut b = Mock::new(vec![]);
+    b.verify_batch(&[10, 11, 12, 13]).unwrap();
+    b.state.epoch += 1;
+    assert!(b.select_prefix(2).is_err());
+    b.state.epoch -= 1;
+    b.restore_fails = false;
+    b.save(4).unwrap();
+    b.restore().unwrap();
+    assert!(b.select_prefix(2).is_err());
 }
 
 #[test]
@@ -202,7 +279,7 @@ fn both_commit_paths_roll_back_on_failure_and_never_publish_early() {
             Fault::BeforePublish,
         ];
         if partial {
-            points.extend([Fault::AfterTargetRestore, Fault::AfterReplay]);
+            points.extend([Fault::AfterPrefixSelect, Fault::AfterMtpRestore]);
         } else {
             points.push(Fault::AfterMtpRestore);
         }
@@ -215,7 +292,7 @@ fn both_commit_paths_roll_back_on_failure_and_never_publish_early() {
             let before = b.state.clone();
             assert!(run(&mut b, options(3), 64, &[], Some(fault)).is_err());
             assert_eq!(b.state, before);
-            assert!(!b.poisoned);
+            assert!(b.poisoned);
         }
     }
     let mut b = Mock::new(vec![11, 12, 13]);

@@ -195,8 +195,12 @@ fn q38_primitives_gpu() -> Result<()> {
         let materialized = s.alloc_zeros::<bf16>((n * k) as usize)?;
         let mut mat = TensorMut(view(&materialized, s, [n, k], [u64::from(k), 1])?);
         fp8.materialize(s, w, sc, &mut mat)?;
-        for m in [1u32, 2, 63, 64, 65] {
-            let xb = s.clone_htod(&vec![bf16::ONE; (m * k) as usize])?;
+        for m in [1u32, 2, 3, 4, 5, 63, 64, 65] {
+            let row_values = [1.0f32, -1.0, 2.0, -2.0, 4.0];
+            let inputs: Vec<_> = (0..m * k)
+                .map(|i| bf16::from_f32(row_values[(i / k) as usize % 5]))
+                .collect();
+            let xb = s.clone_htod(&inputs)?;
             let yb = s.alloc_zeros::<bf16>((m * n) as usize)?;
             let x = view(&xb, s, [m, k], [u64::from(k), 1])?;
             let mut y = TensorMut(view(&yb, s, [m, n], [u64::from(n), 1])?);
@@ -208,20 +212,28 @@ fn q38_primitives_gpu() -> Result<()> {
                 &mut y,
             )?;
             let got = s.clone_dtoh(&yb)?;
+            ensure!(
+                got.iter().all(|v| v.is_finite()),
+                "Lt reference non-finite M={m}"
+            );
             for (i, value) in got.iter().enumerate() {
                 let want = bf16::from_f32(if (i % n as usize).is_multiple_of(2) {
-                    k as f32
+                    k as f32 * row_values[(i / n as usize) % 5]
                 } else {
-                    -(k as f32)
+                    -(k as f32) * row_values[(i / n as usize) % 5]
                 });
                 ensure!(
                     value.to_bits() == want.to_bits(),
                     "Lt exact-sum mismatch {m}x{n}x{k} at {i}"
                 );
             }
-            if m == 1 {
+            if m <= 5 {
                 blas.linear_typed(
-                    ExecutionPhase::Decode,
+                    if m == 1 {
+                        ExecutionPhase::Decode
+                    } else {
+                        ExecutionPhase::Prefill
+                    },
                     LinearWeightRef::BlockFp8 {
                         codes: w,
                         scale: sc,
@@ -231,60 +243,142 @@ fn q38_primitives_gpu() -> Result<()> {
                 )?;
                 let decoded = s.clone_dtoh(&yb)?;
                 ensure!(
+                    decoded.iter().all(|v| v.is_finite()),
+                    "direct FP8 non-finite M={m}"
+                );
+                ensure!(
                     got.iter()
                         .zip(decoded)
                         .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "direct GEMV exact-sum mismatch {n}x{k}"
+                    "direct FP8 exact-sum mismatch {m}x{n}x{k}"
                 );
             }
         }
     }
     // Sparse inputs across scale blocks expose skipped effective-BF16 rounding.
-    {
-        let (n, k) = (129u32, 257u32);
+    for (n, k) in [(129u32, 257u32), (6144, 5120)] {
+        let columns: &[usize] = if k == 257 {
+            &[127, 128, 256]
+        } else {
+            &[0, 127, 128, 511, 512, 1023, 1024, 5119]
+        };
+        let scale_cols = k.div_ceil(128);
         let codes: Vec<u8> = (0..n * k)
-            .map(|i| [0x2d, 0x35, 0x41][i as usize % 3])
+            .map(|i| [0x2d, 0x35, 0x41][i as usize % 131 % 3])
             .collect();
-        let scales: Vec<bf16> = (0..6)
-            .map(|i| bf16::from_f32([1.0078125, 0.03125, 3.140625][i % 3]))
+        let scales: Vec<bf16> = (0..n.div_ceil(128) * scale_cols)
+            .map(|i| bf16::from_f32([1.0078125, 0.03125, 3.140625][i as usize % 137 % 3]))
             .collect();
-        let mut inputs = vec![bf16::ZERO; k as usize];
-        inputs[127] = bf16::ONE;
-        inputs[128] = bf16::ONE;
-        inputs[256] = bf16::from_f32(-1.0);
         let wb = s.clone_htod(&codes)?;
         let sb = s.clone_htod(&scales)?;
-        let xb = s.clone_htod(&inputs)?;
-        let yb = s.alloc_zeros::<bf16>(n as usize)?;
         let codes_view = view(&wb, s, [n, k], [u64::from(k), 1])?;
-        let scales_view = view(&sb, s, [2, 3], [3, 1])?;
-        let x = view(&xb, s, [1, k], [u64::from(k), 1])?;
-        let mut y = TensorMut(view(&yb, s, [1, n], [u64::from(n), 1])?);
-        blas.linear_typed(
-            ExecutionPhase::Decode,
-            LinearWeightRef::BlockFp8 {
-                codes: codes_view,
-                scale: scales_view,
-            },
-            x,
-            &mut y,
+        let scales_view = view(
+            &sb,
+            s,
+            [n.div_ceil(128), scale_cols],
+            [u64::from(scale_cols), 1],
         )?;
-        let got = s.clone_dtoh(&yb)?;
-        for row in 0..n as usize {
-            let sum = [127usize, 128, 256]
-                .iter()
-                .map(|&col| {
-                    effective_weight(
-                        codes[row * k as usize + col],
-                        scales[(row / 128) * 3 + col / 128],
-                    )
-                    .to_f32()
-                        * inputs[col].to_f32()
-                })
-                .sum::<f32>();
+        for m in 1u32..=5 {
+            let mut inputs = vec![bf16::ZERO; (m * k) as usize];
+            for row in 0..m as usize {
+                for (i, &col) in columns.iter().enumerate() {
+                    let coefficients = [1.0f32, 1.0, -1.0, 2.0, -2.0, 1.0, 1.0, -1.0];
+                    let row_values = [1.0f32, -1.0, 2.0, -2.0, 4.0];
+                    inputs[row * k as usize + col] =
+                        bf16::from_f32(coefficients[i] * row_values[row]);
+                }
+            }
+            let mut xb = s.clone_htod(&inputs)?;
+            let yb = s.alloc_zeros::<bf16>((m * n) as usize)?;
+            let x = view(&xb, s, [m, k], [u64::from(k), 1])?;
+            let mut y = TensorMut(view(&yb, s, [m, n], [u64::from(n), 1])?);
+            blas.linear_typed(
+                if m == 1 {
+                    ExecutionPhase::Decode
+                } else {
+                    ExecutionPhase::Prefill
+                },
+                LinearWeightRef::BlockFp8 {
+                    codes: codes_view,
+                    scale: scales_view,
+                },
+                x,
+                &mut y,
+            )?;
+            let got = s.clone_dtoh(&yb)?;
             ensure!(
-                got[row].to_bits() == bf16::from_f32(sum).to_bits(),
-                "GEMV effective-weight rounding mismatch at row {row}"
+                got.iter().all(|v| v.is_finite()),
+                "direct FP8 sparse non-finite M={m}"
+            );
+            let expected: Vec<_> = (0..(m * n) as usize)
+                .map(|index| {
+                    let row = index / n as usize;
+                    let out = index % n as usize;
+                    bf16::from_f32(
+                        columns
+                            .iter()
+                            .map(|&col| {
+                                effective_weight(
+                                    codes[out * k as usize + col],
+                                    scales[(out / 128) * scale_cols as usize + col / 128],
+                                )
+                                .to_f32()
+                                    * inputs[row * k as usize + col].to_f32()
+                            })
+                            .sum::<f32>(),
+                    )
+                })
+                .collect();
+            ensure!(
+                got.iter()
+                    .zip(&expected)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "direct FP8 effective-weight rounding mismatch M={m}"
+            );
+            if m > 1 {
+                let rotated: Vec<_> = inputs[k as usize..]
+                    .iter()
+                    .chain(&inputs[..k as usize])
+                    .copied()
+                    .collect();
+                s.memcpy_htod(&rotated, &mut xb)?;
+                blas.linear_typed(
+                    ExecutionPhase::Prefill,
+                    LinearWeightRef::BlockFp8 {
+                        codes: codes_view,
+                        scale: scales_view,
+                    },
+                    x,
+                    &mut y,
+                )?;
+                let mutant = s.clone_dtoh(&yb)?;
+                ensure!(
+                    mutant.iter().all(|v| v.is_finite()),
+                    "direct FP8 mutant non-finite M={m}"
+                );
+                ensure!(
+                    mutant.iter().enumerate().all(|(i, v)| v.is_finite()
+                        && v.to_bits()
+                            == expected[((i / n as usize + 1) % m as usize) * n as usize
+                                + i % n as usize]
+                                .to_bits()),
+                    "FP8 rotated-input reference mismatch M={m}"
+                );
+                let mutant_mismatches = mutant
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                ensure!(
+                    mutant_mismatches > 0,
+                    "FP8 wrong-row mutant undetected M={m}"
+                );
+                eprintln!("Q38_FP8_ROW_MUTANT M={m} mismatches={mutant_mismatches} PASS");
+            }
+            eprintln!(
+                "Q38_FP8_DIRECT M={m} stored_weight=[{n},{k}] scale=[{},{}] exact=PASS",
+                n.div_ceil(128),
+                scale_cols
             );
         }
     }

@@ -19,7 +19,7 @@ __device__ __forceinline__ bool aligned16(const void* p) {
     return p && (reinterpret_cast<uintptr_t>(p) & 15) == 0;
 }
 
-template <int VSPLIT>
+template <int VSPLIT, bool SNAPSHOT = false>
 __device__
 void gdn_rstep_core_t(
         const float* __restrict__ q,      // FP32 [bound, HEADS, DK]
@@ -29,7 +29,7 @@ void gdn_rstep_core_t(
         const float* __restrict__ g,
         float* __restrict__ S,            // FP32 [HEADS, DK, DV]
         __nv_bfloat16* __restrict__ out,  // BF16 [bound, HEADS, DV]
-        const GdnMeta* __restrict__ meta, int bound) {
+        const GdnMeta* __restrict__ meta, int bound, float* snapshots = nullptr) {
     constexpr int VW = GDN_DV / VSPLIT;
     const int head = blockIdx.y;
     const int j0 = blockIdx.x * VW;
@@ -42,6 +42,7 @@ void gdn_rstep_core_t(
         !aligned16(S) || !aligned16(out)) {
         __trap(); return;
     }
+    if (SNAPSHOT && !aligned16(snapshots)) { __trap(); return; }
     const int prefix = meta->prefix;
     const int valid_rows = meta->valid_rows;
     if (bound < 1 || bound > 4 || valid_rows < 1 || valid_rows > bound || prefix < 0 || meta->causal != 1 ||
@@ -146,6 +147,14 @@ void gdn_rstep_core_t(
     }
     __syncthreads();
 
+    if (SNAPSHOT) {
+        #pragma unroll
+        for (int a = 0; a < RT; ++a)
+            #pragma unroll
+            for (int b = 0; b < TC; ++b)
+                snapshots[((size_t)r * GDN_HEADS + head) * GDN_DK * GDN_DV +
+                          (i0 + a) * GDN_DV + j0 + jb + b] = Sr[a][b];
+    }
     // ---- 4. o = q^T S, from the UPDATED S
     #pragma unroll
     for (int b = 0; b < TC; ++b) {
@@ -178,4 +187,12 @@ void gdn_rstep_core_v1(const float* q, const float* k, const float* v,
                        const float* beta, const float* g, float* S,
                        __nv_bfloat16* out, const GdnMeta* meta, int bound) {
     gdn_rstep_core_t<2>(q, k, v, beta, g, S, out, meta, bound);
+}
+
+extern "C" __global__ __launch_bounds__(GDN_THREADS, 1)
+void gdn_rstep_core_snapshot(const float* q, const float* k, const float* v,
+                            const float* beta, const float* g, float* S,
+                            __nv_bfloat16* out, const GdnMeta* meta, int bound,
+                            float* snapshots) {
+    gdn_rstep_core_t<2, true>(q, k, v, beta, g, S, out, meta, bound, snapshots);
 }
