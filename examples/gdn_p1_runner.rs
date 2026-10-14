@@ -488,6 +488,7 @@ fn open_package(root: &Path) -> Result<Package> {
             );
         }
         ensure!(fx.m >= 1, "fixture {} has no live row", fx.name);
+        check_fixture_shapes(fx)?;
     }
 
     let mut fixture_names = BTreeMap::new();
@@ -847,8 +848,7 @@ struct FixtureReceipt {
     prefix: usize,
     live_rows: usize,
     seed: Option<i64>,
-    /// Bytes of SHA-verified input this fixture contributed to the run (f32 arrays are
-    /// four bytes per element); the arrays are read and verified on every leg.
+    /// SHA-verified input bytes this fixture contributed (f32 = 4 B per element).
     verified_input_bytes: usize,
     note: String,
 }
@@ -902,8 +902,7 @@ struct DeviceInfo {
     sm_count: u32,
 }
 
-/// Whether this device is the one the P1 core is qualified for, by the engine's own
-/// policy; a gate verdict measured elsewhere is INVALID, not PASS.
+/// True when the engine's own policy qualifies this device for the P1 core; a gate verdict elsewhere is INVALID.
 fn qualified_topology(device: Option<&DeviceInfo>) -> bool {
     device.is_some_and(|d| {
         flyingfish::gdn_plan::GdnPolicy::for_device(d.compute_capability, d.sm_count as usize)
@@ -1021,9 +1020,7 @@ fn split_smem(s: u32) -> Result<u32> {
     })
 }
 
-/// The kernel's ABI shapes: q/k/v are [M, HEADS, D], beta/g are [M, HEADS] and the
-/// state is [HEADS, DK, DV]. Every fixture is checked against them before any array is
-/// read, so a short shape vector is an error rather than an index panic.
+/// Checks every fixture against the kernel ABI shapes (q/k/v [M,48,D], beta/g [M,48], S0 [48,128,128]) before any array read.
 fn check_fixture_shapes(fx: &Fixture) -> Result<(usize, usize, usize)> {
     const HEADS: usize = 48;
     const DK: usize = 128;
@@ -1670,6 +1667,11 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
                      bounds are {}/{}, so the comparison is invalid rather than negative",
                     series.ci_low, series.ci_high
                 ),
+            )
+        } else if !qualified_topology(device_of(gpu.as_ref()).as_ref()) {
+            (
+                "INVALID",
+"the device is not the qualified topology (arch 89, 128 SMs), so this comparison is reported, not read".to_string(),
             )
         } else {
             timing_verdict(&series, null.band)
@@ -2434,7 +2436,8 @@ fn run_identity(args: &IdentityArgs) -> Result<()> {
                 .position(|d| d != &out_digests[0])
                 .or_else(|| state_digests.iter().position(|d| d != &state_digests[0]))
                 .map(|i| u32::try_from(i).unwrap_or(u32::MAX) + 1);
-            let pass = distinct_out == 1 && distinct_state == 1;
+            let identical = distinct_out == 1 && distinct_state == 1;
+            let qualified = qualified_topology(device.as_ref());
             eprintln!(
                 "  {:16} C{} s{s:<2} {} out={} state={} {}",
                 fx.name,
@@ -2442,7 +2445,7 @@ fn run_identity(args: &IdentityArgs) -> Result<()> {
                 entry,
                 distinct_out,
                 distinct_state,
-                if pass { "IDENTICAL" } else { "DIVERGED" }
+                if identical { "IDENTICAL" } else { "DIVERGED" }
             );
             rows.push(IdentityRow {
                 case: fx.name.clone(),
@@ -2458,7 +2461,13 @@ fn run_identity(args: &IdentityArgs) -> Result<()> {
                 first_divergent_run: first_divergent,
                 run_out_sha256: out_digests,
                 run_state_sha256: state_digests,
-                verdict: if pass { "PASS" } else { "FAIL" },
+                verdict: if !qualified {
+                    "INVALID"
+                } else if identical {
+                    "PASS"
+                } else {
+                    "FAIL"
+                },
             });
         }
     }
