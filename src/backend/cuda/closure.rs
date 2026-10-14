@@ -251,7 +251,14 @@ impl Closure {
         Ok(())
     }
     pub fn bind_fixed(&self) -> Result<()> {
-        self.before_ready("fixed operator binding")
+        if self.stage.get() == Stage::Ready {
+            self.late_attempts.set(self.late_attempts.get() + 1);
+        }
+        ensure!(
+            self.stage.get() == Stage::Setup || self.stage.get() == Stage::Frozen,
+            "fixed operator binding must precede Ready"
+        );
+        Ok(())
     }
     pub fn capture(&self) -> Result<()> {
         self.before_ready("production Graph capture")?;
@@ -765,9 +772,9 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn fixed_binding_requires_frozen_setup_without_counting_captures() -> Result<()> {
+    fn fixed_binding_covers_setup_and_frozen_without_counting_captures() -> Result<()> {
         let closure = Closure::new(false, "fixed setup".into());
-        assert!(closure.bind_fixed().is_err());
+        closure.bind_fixed()?;
         closure.freeze_fixed()?;
         closure.bind_fixed()?;
         closure.expect_captures(0)?;

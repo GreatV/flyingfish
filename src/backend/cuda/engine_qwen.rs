@@ -47,6 +47,7 @@ pub(super) struct Runtime {
     common: CommonOpsRef,
     advance: CudaFunction,
     prepared: BTreeSet<u32>,
+    workspace_rows: u32,
 }
 struct Layer {
     linear: LayerLinearPlan,
@@ -432,6 +433,7 @@ impl Runtime {
             common,
             advance: module.load_function("q38_advance")?,
             prepared: BTreeSet::new(),
+            workspace_rows: u32::try_from(rows)?,
         })
     }
     fn prepare(
@@ -440,15 +442,45 @@ impl Runtime {
         rows: u32,
         spec: &crate::model_spec::ModelSpec,
     ) -> Result<()> {
+        self.prepare_dimensions(blas, rows, spec.vocab, spec.hidden)
+    }
+    fn prepare_dimensions(
+        &mut self,
+        blas: &Blas,
+        rows: u32,
+        vocab: u32,
+        hidden: u32,
+    ) -> Result<()> {
         if self.prepared.contains(&rows) {
             return Ok(());
         }
         for layer in &self.layers {
             layer.linear.prepare(blas, rows)?;
         }
-        blas.prepare_fixed(1, spec.vocab, spec.hidden)?;
+        blas.prepare_fixed(1, vocab, hidden)?;
         self.prepared.insert(rows);
         Ok(())
+    }
+    pub(super) fn prepare_prefill_rows(
+        &mut self,
+        blas: &Blas,
+        rows: u32,
+        vocab: u32,
+        hidden: u32,
+    ) -> Result<()> {
+        let bound = bucketed_prefill_rows(rows, self.workspace_rows)?;
+        self.prepare_dimensions(blas, bound, vocab, hidden)
+    }
+    fn linear_rows(&self, rows: u32, phase: ExecutionPhase) -> Result<u32> {
+        if phase == ExecutionPhase::Decode {
+            return Ok(rows);
+        }
+        let bound = bucketed_prefill_rows(rows, self.workspace_rows)?;
+        ensure!(
+            self.prepared.contains(&bound),
+            "Q38 prefill Lt bucket {bound} was not bound before Ready"
+        );
+        Ok(bound)
     }
     fn ensure_complete(&self) -> Result<()> {
         // These allocations own every address retained by the operator plans.
@@ -879,7 +911,7 @@ impl Engine {
         };
         engine.qwen = Some(Runtime::new(&engine, dir, catalog, arena, scratch_buffer)?);
         engine.prepare(1)?;
-        engine.prepare(rows)?;
+        engine.prepare_prefill_plans()?;
         engine
             .qwen
             .as_ref()
@@ -902,6 +934,15 @@ impl Engine {
             u32::try_from(rows)?,
             &self.model_spec,
         )
+    }
+    pub(super) fn prepare_prefill_rows(&mut self, rows: usize) -> Result<()> {
+        if self.qwen.is_some() {
+            let vocab = self.model_spec.vocab;
+            let hidden = self.model_spec.hidden;
+            let q = self.qwen.as_mut().context("Q38 runtime missing")?;
+            return q.prepare_prefill_rows(&self.blas, u32::try_from(rows)?, vocab, hidden);
+        }
+        self.prepare(rows)
     }
     pub(super) fn qwen_advance(&mut self) -> Result<()> {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
@@ -944,6 +985,7 @@ impl Engine {
         } else {
             ExecutionPhase::Prefill
         };
+        let linear_rows = q.linear_rows(rows as u32, phase)? as usize;
         let w = &mut self.work;
         let mw = w.mixer.as_ref().context("Q38 mixer work missing")?;
         let meta = self.state.seq_ref(s)?;
@@ -971,8 +1013,8 @@ impl Engine {
                         &self.blas,
                         role,
                         phase,
-                        matrix(&w.n, s, 0, rows, 5120)?,
-                        &mut TensorMut(matrix(&w.qkv, s, offset, rows, width)?),
+                        matrix(&w.n, s, 0, linear_rows, 5120)?,
+                        &mut TensorMut(matrix(&w.qkv, s, offset, linear_rows, width)?),
                     )?;
                 }
                 match phase {
@@ -1026,8 +1068,8 @@ impl Engine {
                     &self.blas,
                     "self_attn.o_proj.weight",
                     phase,
-                    matrix(&w.attn, s, 0, rows, 6144)?,
-                    &mut TensorMut(matrix(&w.out, s, 0, rows, 5120)?),
+                    matrix(&w.attn, s, 0, linear_rows, 6144)?,
+                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, 5120)?),
                 )?;
             }
             BoundMixer::Gdn {
@@ -1054,8 +1096,8 @@ impl Engine {
                         &self.blas,
                         role,
                         phase,
-                        matrix(&w.n, s, 0, rows, 5120)?,
-                        &mut TensorMut(matrix(output, s, offset, rows, width)?),
+                        matrix(&w.n, s, 0, linear_rows, 5120)?,
+                        &mut TensorMut(matrix(output, s, offset, linear_rows, width)?),
                     )?;
                 }
                 let plan = match phase {
@@ -1086,8 +1128,8 @@ impl Engine {
                     &self.blas,
                     "linear_attn.out_proj.weight",
                     phase,
-                    matrix(&w.attn, s, 0, rows, value)?,
-                    &mut TensorMut(matrix(&w.out, s, 0, rows, 5120)?),
+                    matrix(&w.attn, s, 0, linear_rows, value)?,
+                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, 5120)?),
                 )?;
             }
         }
@@ -1142,6 +1184,7 @@ impl Engine {
         } else {
             ExecutionPhase::Prefill
         };
+        let linear_rows = q.linear_rows(rows as u32, phase)? as usize;
         let domain = RowDomain {
             meta: self.state.seq_ref(s)?,
             row_base: 0,
@@ -1256,8 +1299,8 @@ impl Engine {
                         &self.blas,
                         role,
                         phase,
-                        matrix(&w.n, s, 0, rows, h)?,
-                        &mut TensorMut(matrix(&w.gu, s, offset, rows, f)?),
+                        matrix(&w.n, s, 0, linear_rows, h)?,
+                        &mut TensorMut(matrix(&w.gu, s, offset, linear_rows, f)?),
                     )?;
                 }
             }
@@ -1271,8 +1314,8 @@ impl Engine {
                 &self.blas,
                 "mlp.down_proj.weight",
                 phase,
-                matrix(&w.act, s, 0, rows, f)?,
-                &mut TensorMut(matrix(&w.out, s, 0, rows, h)?),
+                matrix(&w.act, s, 0, linear_rows, f)?,
+                &mut TensorMut(matrix(&w.out, s, 0, linear_rows, h)?),
             )?,
             O::Head => {
                 if step.head == Head::None {
@@ -1331,6 +1374,24 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::prefill::{WorkspaceBudget, WorkspaceRequest};
+
+    #[test]
+    fn prefill_linear_rows_use_setup_bound_buckets() -> Result<()> {
+        for (rows, workspace, bound) in [
+            (1u32, 2048u32, 1u32),
+            (7, 2048, 7),
+            (16, 2048, 16),
+            (17, 2048, 32),
+            (31, 2048, 32),
+            (2037, 2048, 2048),
+            (17, 20, 20),
+        ] {
+            assert_eq!(bucketed_prefill_rows(rows, workspace)?, bound);
+        }
+        assert!(bucketed_prefill_rows(0, 2048).is_err());
+        assert!(bucketed_prefill_rows(2049, 2048).is_err());
+        Ok(())
+    }
 
     #[test]
     fn small_prefill_plans_select_structural_rows_without_rebinding() -> Result<()> {

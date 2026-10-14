@@ -63,6 +63,20 @@ fn trace_value(
     Ok(())
 }
 
+pub(in crate::backend::cuda::engine) fn bucketed_prefill_rows(
+    rows: u32,
+    workspace_rows: u32,
+) -> Result<u32> {
+    ensure!(
+        rows > 0 && rows <= workspace_rows,
+        "prefill rows {rows} outside workspace {workspace_rows}"
+    );
+    if rows <= 16 {
+        return Ok(rows);
+    }
+    Ok(rows.next_power_of_two().min(workspace_rows))
+}
+
 pub(crate) struct Kv {
     pub(crate) k: CudaSlice<bf16>,
     pub(crate) v: CudaSlice<bf16>,
@@ -903,8 +917,27 @@ impl Engine {
         self.grow_rows(rows, plan.chunk).with_context(|| {
             format!("allocate prefill workspace: required={required} available={available}")
         })?;
-        self.prepare(plan.chunk)?;
+        self.prepare_prefill_plans()?;
         self.poisoned = false;
+        Ok(())
+    }
+
+    fn prepare_prefill_plans(&mut self) -> Result<()> {
+        if self.qwen.is_none() {
+            self.prepare(self.chunk)?;
+            return Ok(());
+        }
+        let workspace = self.workspace_rows;
+        let mut rows: std::collections::BTreeSet<usize> = (1..=workspace.min(16)).collect();
+        let mut bucket = 32usize;
+        while workspace > 16 && bucket < workspace {
+            rows.insert(bucket);
+            bucket *= 2;
+        }
+        rows.insert(workspace);
+        for row in rows {
+            self.prepare(row)?;
+        }
         Ok(())
     }
 
@@ -1124,7 +1157,11 @@ impl Engine {
         } else {
             step.rows
         };
-        self.prepare(rows)?;
+        if step.input == crate::backend::Input::Ids {
+            self.prepare_prefill_rows(rows)?;
+        } else {
+            self.prepare(rows)?;
+        }
         if step.head == Head::All {
             self.blas
                 .prepare(rows, self.config.vocab_size, self.config.hidden_size)?;
@@ -2213,7 +2250,7 @@ impl Engine {
         for chunk in ids.chunks(self.chunk) {
             let skip = trace_start.saturating_sub(self.position).min(chunk.len());
             let selected = trace.is_some() && skip < chunk.len();
-            self.prepare(chunk.len())?;
+            self.prepare_prefill_rows(chunk.len())?;
             if self.qwen.is_some() {
                 self.state.set_sequence(
                     &self.device.stream,

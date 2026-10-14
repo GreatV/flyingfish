@@ -273,6 +273,7 @@ pub struct Blas {
     decode: CudaBlas,
     workspace: CudaSlice<u8>,
     stream: Arc<CudaStream>,
+    closure: Rc<super::closure::Closure>,
 }
 
 /// Only the paths that cast dimensions to i32 are bounded here: the M1 legacy
@@ -299,7 +300,8 @@ impl Blas {
         closure: Rc<super::closure::Closure>,
     ) -> Result<Self> {
         let stream = device.stream.clone();
-        let calibration = linear_calibrate::Environment::new(device, ops, runtime, closure)?;
+        let calibration =
+            linear_calibrate::Environment::new(device, ops, runtime, closure.clone())?;
         let decode = CudaBlas::new(stream.clone())?;
         unsafe {
             bs::cublasSetMathMode(
@@ -323,6 +325,7 @@ impl Blas {
             decode,
             workspace,
             stream,
+            closure,
         })
     }
 
@@ -654,10 +657,19 @@ impl Blas {
         );
         let key = (rows as usize, output as usize, input as usize, 0);
         if !self.plans.borrow().contains_key(&key) {
+            self.closure.bind_fixed()?;
             let p = Plan::new(self.handle, key.0, key.1, key.2, self.workspace.len(), 0)?;
             self.plans.borrow_mut().insert(key, p);
         }
         Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn fixed_plan_count(&self) -> usize {
+        self.plans.borrow().len()
+    }
+    #[cfg(test)]
+    pub(super) fn has_fixed_plan(&self, rows: u32) -> bool {
+        self.plans.borrow().keys().any(|key| key.0 == rows as usize)
     }
     pub(crate) fn linear_typed(
         &self,

@@ -688,23 +688,27 @@ async fn respond(
                     )),
                     StreamState::Running(mut events, mut detok) => match events.recv().await {
                         Some(event) => {
-                            let item = sse_event(&event, &model, &id, is_chat, &mut detok);
-                            let next = match event {
-                                EngineEvent::Tokens { .. } => StreamState::Running(events, detok),
-                                EngineEvent::Done { .. } | EngineEvent::Aborted { .. } => {
-                                    StreamState::Sentinel
+                            let (item, detok_failed) =
+                                match sse_event(&event, &model, &id, is_chat, &mut detok) {
+                                    Ok(item) => (item, false),
+                                    Err(message) => (sse_error(&message), true),
+                                };
+                            let next = if detok_failed || matches!(event, EngineEvent::Failed(_)) {
+                                StreamState::End
+                            } else {
+                                match event {
+                                    EngineEvent::Tokens { .. } => {
+                                        StreamState::Running(events, detok)
+                                    }
+                                    EngineEvent::Done { .. } | EngineEvent::Aborted { .. } => {
+                                        StreamState::Sentinel
+                                    }
+                                    EngineEvent::Failed(_) => StreamState::End,
                                 }
-                                EngineEvent::Failed(_) => StreamState::End,
                             };
-                            Some((item, next))
+                            Some((Ok(item), next))
                         }
-                        None => Some((
-                            sse_json(&json!({"error": {
-                                "message": ENGINE_EOF,
-                                "type": "server_error"
-                            }})),
-                            StreamState::End,
-                        )),
+                        None => Some((Ok(sse_error(ENGINE_EOF)), StreamState::End)),
                     },
                     StreamState::Sentinel => {
                         Some((Ok(Event::default().data("[DONE]")), StreamState::End))
@@ -775,24 +779,41 @@ fn sse_event(
     id: &str,
     is_chat: bool,
     detok: &mut super::detok::Detok,
-) -> Result<Event, axum::Error> {
+) -> Result<Event, String> {
     match event {
         EngineEvent::Tokens { ids, .. } => {
-            let text = detok.push(ids).unwrap_or_default();
+            let text = detok
+                .push(ids)
+                .map_err(|error| format!("detokenize failed: {error}"))?;
             sse_json(&chunk_payload(model, id, is_chat, &text, None))
+                .map_err(|error| error.to_string())
         }
         EngineEvent::Done { length_reached, .. } => {
-            let text = detok.finish().unwrap_or_default();
+            let text = detok
+                .finish()
+                .map_err(|error| format!("detokenize failed: {error}"))?;
             let finish = if *length_reached { "length" } else { "stop" };
             sse_json(&chunk_payload(model, id, is_chat, &text, Some(finish)))
+                .map_err(|error| error.to_string())
         }
         EngineEvent::Aborted { .. } => {
             sse_json(&chunk_payload(model, id, is_chat, "", Some("aborted")))
+                .map_err(|error| error.to_string())
         }
         EngineEvent::Failed(message) => sse_json(&json!({
             "error": {"message": message, "type": "server_error"}
-        })),
+        }))
+        .map_err(|error| error.to_string()),
     }
+}
+
+fn sse_error(message: &str) -> Event {
+    Event::default().data(
+        json!({
+            "error": {"message": message, "type": "server_error"}
+        })
+        .to_string(),
+    )
 }
 
 fn sse_json(payload: &serde_json::Value) -> Result<Event, axum::Error> {
@@ -955,6 +976,44 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn stream_detokenizer_error_emits_error_and_stops() -> Result<()> {
+        let (state, _commands) = test_state(16, Slot::Idle);
+        let bad_id = 299_999u32;
+        ensure!(
+            state
+                .shared
+                .detok()
+                .push(std::slice::from_ref(&bad_id))
+                .is_err(),
+            "out-of-vocabulary fixture must fail detokenization"
+        );
+        let (events, receiver) = tokio_mpsc::channel(1);
+        events
+            .send(EngineEvent::Tokens {
+                ids: vec![bad_id],
+                accepted: 0,
+            })
+            .await?;
+        let response = respond(receiver, state, "test".into(), false, true, 1).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await?;
+        let text = std::str::from_utf8(&bytes)?;
+        assert!(!text.contains("data: [DONE]"), "{text}");
+        let payload = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        ensure!(payload.len() == 1, "{payload:?}");
+        ensure!(
+            payload[0]["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("detokenize failed")),
+            "{payload:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
