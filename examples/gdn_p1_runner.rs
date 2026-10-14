@@ -253,9 +253,7 @@ fn synth(rows: usize, array: u64, n: usize) -> Vec<f32> {
         z ^= z >> 31;
         // (0,1) scaled to about +/-1, the frozen fixtures' regime.
         let unit = ((z >> 40) as f32 / 8_388_608.0) - 1.0;
-        // q, k, v and S0 are signed values and stay unit; beta and g carry the
-        // production transforms of q38_gdn_gates (kernels/q38_common.cu:387-389), so
-        // beta = BF16(sigmoid(b)) >= 0 and g = -exp(a_log) * softplus(a + dt) <= 0.
+        // beta/g carry the q38_gdn_gates production transforms (kernels/q38_common.cu:387-389): beta = sigmoid >= 0, g = -exp(a_log)*softplus <= 0; q/k/v/S0 stay signed unit.
         let value = match array {
             4 => 1.0 / (1.0 + (-unit).exp()),
             5 => -(-unit).exp().ln_1p(),
@@ -570,8 +568,15 @@ fn open_package(root: &Path) -> Result<Package> {
             let t = truth
                 .get(&key)
                 .with_context(|| format!("manifest has no {w} truth for fixture {}", fx.name))?;
-            // The truth record's own bytes are SHA-verified above; this binds it to the
-            // fixture it claims to describe, so a swapped record cannot be substituted.
+            // A truth record's path must be its fixture's own out/state file.
+            ensure!(
+                t.path == format!("truth/{}.{}.f64", fx.name, w),
+                "truth record for {} claims path {}, not truth/{}.{}.f64",
+                fx.name,
+                t.path,
+                fx.name,
+                w
+            );
             let want: Vec<usize> = if w == "out" {
                 vec![fx.m, HEADS, DK]
             } else {
@@ -1321,7 +1326,7 @@ fn invalidate_for_missing_residual(rows: &mut [GateRow], residual: &ResidualStat
 
 fn residual_status(spec: &ResidualSpec) -> ResidualStatus {
     ResidualStatus {
-        required_by: "4d 2026-10-13T07:06:44Z item 1", // item 1 of that ruling
+        required_by: "4d 2026-10-13T07:06:44Z item 1",
         what: spec.what.clone(),
         norms: spec.norms.clone(),
         not: spec.not.clone(),
@@ -2573,8 +2578,7 @@ fn main() -> Result<()> {
     }
 }
 
-/// The positions the e2e phase must reserve: the tokens plus the measured decode steps,
-/// and the fixed warm-up when that is longer.
+/// Positions the e2e phase reserves: tokens + max(decode steps, the fixed warm-up).
 fn e2e_positions(tokens: usize, decode_steps: usize) -> Result<usize> {
     tokens
         .checked_add(decode_steps.max(E2E_WARMUP_STEPS))
