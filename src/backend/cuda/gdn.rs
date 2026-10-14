@@ -56,7 +56,7 @@ pub(crate) fn take_phase_log() -> Vec<&'static str> {
 use super::contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut};
 use super::cubin;
 use super::ops::{CommonOpsRef, GdnGateBindings};
-use crate::gdn_plan::{GdnPolicy, GdnWorkspace, Region, ScanWorkspace, add, mul, shared};
+use crate::gdn_plan::{GdnPolicy, GdnWorkspace, Region, add, cw_p1, mul};
 use crate::op_contract::{ExecutionPhase, GdnSpec, WorkspaceReq};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
@@ -84,6 +84,9 @@ const PREP_THREADS: u32 = 128;
 /// `GDN_RS_INTERFACE.md` §7. Static shared memory in all three is 0.
 const RECURRENT_SMEM: u32 = 4096;
 const CHUNKED_SMEM: u32 = 62_336;
+/// Chunkwise P1 core thread block (protocol §E: 256 threads for the state pass).
+/// Its dynamic shared-memory size is per split and comes from `gdn_cw_p1_layout.h`.
+const P1_THREADS: u32 = 256;
 
 /// The ABI §6 views. Every field carries an explicit stride and span; `prepare`
 /// validates them against the registered layout rather than assuming widths.
@@ -115,17 +118,7 @@ pub(crate) struct GdnBindings {
     pub history: TensorMut<f32, 2>,
 }
 
-struct ScanKernels {
-    guard: CudaFunction,
-    p1: CudaFunction,
-    leaf: CudaFunction,
-    up: CudaFunction,
-    down: CudaFunction,
-    p3: CudaFunction,
-}
-
 struct Kernels {
-    scan: Option<ScanKernels>,
     conv: CudaFunction,
     hist_update: CudaFunction,
     prep: CudaFunction,
@@ -135,6 +128,27 @@ struct Kernels {
     rstep: Option<CudaFunction>,
     hist_snapshot: CudaFunction,
     core_snapshot: CudaFunction,
+    /// Bound only when the plan was prepared with a non-zero chunkwise P1 split.
+    p1: Option<ChunkwiseP1>,
+}
+
+/// Phase-2 chunkwise P1 cores (precision protocol §D/§E), one entry point per value
+// split; the split is a compile-time property of the kernel's register state tile.
+struct ChunkwiseP1 {
+    s4: CudaFunction,
+    s8: CudaFunction,
+    s16: CudaFunction,
+}
+
+impl ChunkwiseP1 {
+    fn select(&self, split: u32) -> Result<(&CudaFunction, u32)> {
+        Ok(match split {
+            4 => (&self.s4, cw_p1::S4_BYTES),
+            8 => (&self.s8, cw_p1::S8_BYTES),
+            16 => (&self.s16, cw_p1::S16_BYTES),
+            _ => anyhow::bail!("chunkwise P1 value split {split} is not one of 4/8/16"),
+        })
+    }
 }
 
 pub(crate) struct GdnPlan {
@@ -154,6 +168,9 @@ pub(crate) struct GdnPlan {
     hist_cfg: LaunchConfig,
     chunked_cfg: LaunchConfig,
     recurrent_cfg: LaunchConfig,
+    /// Protocol §A value split of the prepared chunkwise P1 core, 0 when the plan
+    /// keeps the shipped recursive core; fixed in `prepare`.
+    p1_split: u32,
 }
 
 impl GdnPlan {
@@ -190,10 +207,6 @@ impl GdnPlan {
 
     /// Setup-only prefix view. Reuse loaded modules and physical addresses.
     pub(crate) fn for_rows(&self, rows: u32) -> Result<Self> {
-        ensure!(
-            self.kernels.scan.is_none(),
-            "scan plan cannot narrow to legacy rows"
-        );
         ensure!(
             rows > 0 && rows <= self.max_rows,
             "GDN rows outside binding"
@@ -232,7 +245,60 @@ impl GdnPlan {
             hist_cfg: self.hist_cfg,
             chunked_cfg: self.chunked_cfg,
             recurrent_cfg: self.recurrent_cfg,
+            // 1..=MIN_VERIFY_ROWS keeps the shipped core: `run_verify` rejects a P1 plan.
+            p1_split: if rows > crate::gdn_plan::MIN_VERIFY_ROWS {
+                self.p1_split
+            } else {
+                0
+            },
         })
+    }
+
+    /// Phase-2 chunkwise P1 core (precision protocol §D/§E); `split` selects the entry point and grid.x.
+    pub(crate) fn run_chunkwise_p1(
+        &self,
+        stream: &Arc<CudaStream>,
+        meta: SeqRef,
+        scratch: Scratch,
+        split: u32,
+    ) -> Result<()> {
+        meta.validate()?;
+        scratch.validate(self.ws.bytes)?;
+        let p1 = self
+            .kernels
+            .p1
+            .as_ref()
+            .context("chunkwise P1 core was not bound by prepare")?;
+        let (core, smem) = p1.select(split)?;
+        let rows = self.max_rows;
+        let ws = scratch.ptr;
+        let q = ws_f32_3(self.ws.q_fp32, ws, rows, HV, DK)?;
+        let k = ws_f32_3(self.ws.k_fp32, ws, rows, HV, DK)?;
+        let v = ws_f32_3(self.ws.v_fp32, ws, rows, HV, DV)?;
+        let beta = ws_f32(self.ws.beta_fp32, ws, rows, HV)?;
+        let g = ws_f32(self.ws.g, ws, rows, HV)?;
+        let cfg = LaunchConfig {
+            grid_dim: (split, HV, 1),
+            block_dim: (P1_THREADS, 1, 1),
+            shared_mem_bytes: smem,
+        };
+        unsafe {
+            stream
+                .launch_builder(core)
+                .arg(&q.0.ptr)
+                .arg(&k.0.ptr)
+                .arg(&v.0.ptr)
+                .arg(&beta.0.ptr)
+                .arg(&g.0.ptr)
+                .arg(&self.bindings.s.0.ptr)
+                .arg(&self.bindings.core_out.0.ptr)
+                .arg(&meta.ptr)
+                // 0 is the sentinel that makes the kernel read `meta->valid_rows`,
+                // as the chunked core does, so a captured Graph replays it.
+                .arg(&0i32)
+                .launch(cfg)?;
+        }
+        Ok(())
     }
 }
 
@@ -260,25 +326,19 @@ impl GdnOps {
         max_rows: u32,
         bindings: GdnBindings,
         common: CommonOpsRef,
-        scan: bool,
+        p1_split: u32,
     ) -> Result<GdnPlan> {
         spec.validate()?;
+        // 4/8/16 or not bound: an unknown split must name itself, not fall back.
+        ensure!(
+            matches!(p1_split, 0 | 4 | 8 | 16),
+            "GDN chunkwise P1 split {p1_split} is not 0 (off) or 4/8/16"
+        );
         ensure!(
             HK * GQA == HV,
             "GDN GQA {GQA} does not expand {HK} key heads to {HV} value heads"
         );
-        let ws = if scan {
-            use cudarc::driver::sys::CUdevice_attribute as A;
-            let arch = cubin::capability(ctx)?;
-            let sms = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
-            ensure!(
-                GdnPolicy::for_device(arch, sms) != GdnPolicy::LEGACY,
-                "GDN scan requires qualified sm89/128SM"
-            );
-            GdnWorkspace::with_scan(spec, max_rows)?
-        } else {
-            GdnWorkspace::q38(spec, max_rows)?
-        };
+        let ws = GdnWorkspace::q38(spec, max_rows)?;
         // conv_dim is derived in exactly ONE place, then asserted against the
         // constant compiled into the kernel. The formula is not restated here.
         let conv_dim = spec.conv_dim()?;
@@ -294,6 +354,9 @@ impl GdnOps {
         for (name, bytes) in [
             ("recurrent", u64::from(RECURRENT_SMEM)),
             ("chunked", u64::from(CHUNKED_SMEM)),
+            ("chunkwise P1 s4", u64::from(cw_p1::S4_BYTES)),
+            ("chunkwise P1 s8", u64::from(cw_p1::S8_BYTES)),
+            ("chunkwise P1 s16", u64::from(cw_p1::S16_BYTES)),
         ] {
             ensure!(
                 bytes <= optin,
@@ -325,35 +388,8 @@ impl GdnOps {
             }
         }
 
-        let scan_kernels = if scan {
-            let module = cubin::module(ctx, "gdn/gdn_b")?;
-            let p3 = module.load_function("gdn_b_p3")?;
-            p3.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared::P3_BYTES as i32)?;
-            for bytes in [
-                shared::P1_BYTES,
-                shared::LEAF_BYTES,
-                shared::UP_BYTES,
-                shared::DOWN_BYTES,
-                shared::P3_BYTES,
-            ] {
-                ensure!(
-                    u64::from(bytes) <= optin,
-                    "GDN scan shared memory exceeds opt-in limit"
-                );
-            }
-            Some(ScanKernels {
-                guard: module.load_function("gdn_b_guard")?,
-                p1: module.load_function("gdn_b_p1")?,
-                leaf: module.load_function("gdn_b_leaf")?,
-                up: module.load_function("gdn_b_up")?,
-                down: module.load_function("gdn_b_down")?,
-                p3,
-            })
-        } else {
-            None
-        };
         // Bind before Ready. Unsupported architectures retain their exact core route.
-        let rstep = if cubin::capability(ctx)? == 89 && !scan {
+        let rstep = if cubin::capability(ctx)? == 89 {
             Some(cubin::module(ctx, "gdn/gdn_rstep")?.load_function("gdn_rstep_core_v1")?)
         } else {
             None
@@ -368,17 +404,29 @@ impl GdnOps {
             f.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, CHUNKED_SMEM as i32)?;
             f
         };
+        // All three arenas are under the 48 KiB no-opt-in cap, so they need no
+        // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES.
+        let p1 = if p1_split == 0 {
+            None
+        } else {
+            let p1_mod = cubin::module(ctx, "gdn/gdn_chunkwise_p1")?;
+            Some(ChunkwiseP1 {
+                s4: p1_mod.load_function("gdn_chunkwise_p1_core_s4")?,
+                s8: p1_mod.load_function("gdn_chunkwise_p1_core_s8")?,
+                s16: p1_mod.load_function("gdn_chunkwise_p1_core_s16")?,
+            })
+        };
         let kernels = Kernels {
             hist_snapshot,
             core_snapshot,
             rstep,
-            scan: scan_kernels,
             conv: f_conv,
             hist_update: f_hist,
             prep: f_prep,
             beta_widen: f_beta,
             chunked: f_chunked,
             recurrent: f_recurrent,
+            p1,
         };
         // Grids are functions of the PLAN (max_rows), never of the device
         // valid_rows, so a captured Graph replays an identical launch sequence.
@@ -422,6 +470,7 @@ impl GdnOps {
                 block_dim: (CORE_THREADS, 1, 1),
                 shared_mem_bytes: RECURRENT_SMEM,
             },
+            p1_split,
         })
     }
 
@@ -448,10 +497,6 @@ impl GdnOps {
             plan.kernels.rstep.is_none() || (1..=4).contains(&plan.max_rows),
             "verify GDN bound must be 1..4"
         );
-        ensure!(
-            plan.kernels.scan.is_none(),
-            "verify GDN cannot use scan plan"
-        );
         ensure!(plan.snapshots.is_some(), "verify snapshots not bound");
         Self::run_core(plan, stream, meta, ExecutionPhase::Prefill, scratch, true)
     }
@@ -476,8 +521,8 @@ impl GdnOps {
         };
         meta.validate()?;
         ensure!(
-            phase == ExecutionPhase::Prefill || plan.kernels.scan.is_none(),
-            "scan plan cannot decode"
+            !verify || plan.p1_split == 0,
+            "chunkwise P1 plan cannot verify; verify keeps the recurrent core"
         );
         scratch.validate(plan.ws.bytes)?;
         let b = &plan.bindings;
@@ -514,19 +559,6 @@ impl GdnOps {
         let l2_eps = plan.l2_eps;
         let conv_ptr = conv_out.0.ptr;
 
-        // Validate the selected bucket before any persistent history update. The
-        // live count remains device data; this launch is fixed in each scan plan.
-        if let Some(scan) = &plan.kernels.scan {
-            let geometry = plan.ws.scan.context("missing scan geometry")?;
-            unsafe {
-                stream
-                    .launch_builder(&scan.guard)
-                    .arg(&meta.ptr)
-                    .arg(&(plan.max_rows as i32))
-                    .arg(&(geometry.leaves as i32))
-                    .launch(scan_cfg(1, 1, 0))?;
-            }
-        }
         // ---- 1. conv: qkv -> conv_out. ABI §5: this BF16 cast may not be elided.
         unsafe {
             stream
@@ -634,27 +666,15 @@ impl GdnOps {
         // precisely the trap this assertion was meant to avoid. Test-only; compiles out.
         #[cfg(test)]
         record_phase(match phase {
-            ExecutionPhase::Prefill if plan.kernels.scan.is_some() => "bscan",
+            ExecutionPhase::Prefill if plan.p1_split != 0 => "chunkwise_p1",
             ExecutionPhase::Prefill if rstep.is_some() => "rstep",
             ExecutionPhase::Prefill => "chunked",
             ExecutionPhase::Decode => "recurrent",
         });
         unsafe {
             match phase {
-                ExecutionPhase::Prefill if plan.kernels.scan.is_some() => {
-                    launch_scan(
-                        plan,
-                        stream,
-                        meta,
-                        ws_ptr,
-                        [
-                            q_fp32.0.ptr,
-                            k_fp32.0.ptr,
-                            v_fp32.0.ptr,
-                            beta_fp32.0.ptr,
-                            g.0.ptr,
-                        ],
-                    )?;
+                ExecutionPhase::Prefill if plan.p1_split != 0 => {
+                    plan.run_chunkwise_p1(stream, meta, scratch, plan.p1_split)?;
                 }
                 ExecutionPhase::Prefill if snapshots.is_some() => {
                     let (state, _) = snapshots.context("missing snapshot bindings")?;
@@ -769,101 +789,6 @@ fn as3(
             cap,
         )
     }
-}
-
-fn scan_cfg(x: u32, threads: u32, smem: u32) -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: (x, if threads == 1 { 1 } else { HV }, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: smem,
-    }
-}
-
-fn launch_scan(
-    plan: &GdnPlan,
-    stream: &Arc<CudaStream>,
-    meta: SeqRef,
-    scratch: u64,
-    inputs: [u64; 5],
-) -> Result<()> {
-    let k = plan.kernels.scan.as_ref().context("missing scan kernels")?;
-    let ScanWorkspace {
-        t,
-        maps,
-        entries,
-        leaves,
-    } = plan.ws.scan.context("missing scan workspace")?;
-    let t = add(scratch, t.offset)?;
-    let maps = add(scratch, maps.offset)?;
-    let entries = add(scratch, entries.offset)?;
-    let [q, key, v, beta, g] = inputs;
-    let bound = plan.max_rows as i32;
-    let leaf_count = leaves as i32;
-    let levels = leaves.ilog2();
-    let b = &plan.bindings;
-    unsafe {
-        stream
-            .launch_builder(&k.p1)
-            .arg(&key)
-            .arg(&beta)
-            .arg(&g)
-            .arg(&t)
-            .arg(&meta.ptr)
-            .arg(&bound)
-            .arg(&leaf_count)
-            .launch(scan_cfg(leaves * 4, 128, shared::P1_BYTES))?;
-        stream
-            .launch_builder(&k.leaf)
-            .arg(&key)
-            .arg(&v)
-            .arg(&beta)
-            .arg(&g)
-            .arg(&t)
-            .arg(&b.s.0.ptr)
-            .arg(&maps)
-            .arg(&entries)
-            .arg(&meta.ptr)
-            .arg(&bound)
-            .arg(&leaf_count)
-            .launch(scan_cfg(leaves * 4, 256, shared::LEAF_BYTES))?;
-        for depth in (1..levels).rev() {
-            stream
-                .launch_builder(&k.up)
-                .arg(&maps)
-                .arg(&meta.ptr)
-                .arg(&bound)
-                .arg(&leaf_count)
-                .arg(&(depth as i32))
-                .launch(scan_cfg((1 << depth) * 16, 256, shared::UP_BYTES))?;
-        }
-        for depth in 0..levels {
-            stream
-                .launch_builder(&k.down)
-                .arg(&maps)
-                .arg(&entries)
-                .arg(&meta.ptr)
-                .arg(&bound)
-                .arg(&leaf_count)
-                .arg(&(depth as i32))
-                .launch(scan_cfg((1 << depth) * 16, 256, shared::DOWN_BYTES))?;
-        }
-        stream
-            .launch_builder(&k.p3)
-            .arg(&q)
-            .arg(&key)
-            .arg(&v)
-            .arg(&beta)
-            .arg(&g)
-            .arg(&b.s.0.ptr)
-            .arg(&b.core_out.0.ptr)
-            .arg(&t)
-            .arg(&entries)
-            .arg(&meta.ptr)
-            .arg(&bound)
-            .arg(&leaf_count)
-            .launch(scan_cfg(leaves, 512, shared::P3_BYTES))?;
-    }
-    Ok(())
 }
 
 fn ws_region(r: Region, rows: u32, cols: u32, elem: u64) -> Result<()> {
@@ -1794,14 +1719,7 @@ mod gpu_probe {
     ) -> Result<()> {
         let s = &device.stream;
         let b = bindings(c, s, swap_gates)?;
-        let plan = GdnOps::prepare(
-            &device.ctx,
-            &GdnSpec::q38(),
-            c.man.plan_rows,
-            b,
-            common,
-            false,
-        )?;
+        let plan = GdnOps::prepare(&device.ctx, &GdnSpec::q38(), c.man.plan_rows, b, common, 0)?;
         let (meta_buf, meta) = meta_device(
             s,
             c.man.prefix,

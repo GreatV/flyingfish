@@ -182,7 +182,7 @@ fn g6_workspace_budget_counts_resident_once_and_checks_tail() {
         row_bytes: 100,
         fixed_transient_bytes: 128,
     };
-    let p = WorkspaceBudget::new(request, |rows| Ok(rows.div_ceil(32) * 256)).unwrap();
+    let p = WorkspaceBudget::new(request, |rows| Ok(rows.div_ceil(32) * 256), Ok).unwrap();
     assert_eq!(p.planned_transient_bytes, 65 * 100 + 128 + 3 * 256);
     assert_eq!(p.plan.reserve_bytes, 1000);
     assert!(p.planned_transient_bytes + p.plan.reserve_bytes <= p.plan.free_bytes);
@@ -192,7 +192,8 @@ fn g6_workspace_budget_counts_resident_once_and_checks_tail() {
                 free_after_resident: 8395,
                 ..request
             },
-            |rows| Ok(rows.div_ceil(32) * 256)
+            |rows| Ok(rows.div_ceil(32) * 256),
+            Ok,
         )
         .is_err()
     );
@@ -202,7 +203,8 @@ fn g6_workspace_budget_counts_resident_once_and_checks_tail() {
                 requested: None,
                 ..request
             },
-            |_| anyhow::bail!("GDN workspace pending")
+            |_| anyhow::bail!("GDN workspace pending"),
+            Ok,
         )
         .is_err()
     );

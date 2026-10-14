@@ -5,6 +5,8 @@ pub mod setup;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda;
 #[cfg(feature = "cuda")]
+pub use cuda::cubin::bytes as kernel_cubin;
+#[cfg(feature = "cuda")]
 pub use cuda::engine::Engine as Backend;
 #[cfg(feature = "cuda")]
 pub use cuda::engine::TextPrefixSaveOutput;

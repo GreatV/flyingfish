@@ -9,6 +9,12 @@ mod binaries {
     include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
 }
 
+/// The native cubin bytes for one kernel module, or None when this build has no
+/// cubin for that architecture.
+pub fn bytes(name: &str, sm: u32) -> Option<&'static [u8]> {
+    binaries::cubin(name, sm)
+}
+
 pub fn check(sm: u32) -> Result<()> {
     ensure!(
         binaries::ARCHES.contains(&sm),

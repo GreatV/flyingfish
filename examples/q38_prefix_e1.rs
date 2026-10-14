@@ -52,6 +52,9 @@ struct Args {
     transfer_bytes: usize,
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
+    /// Prefill chunk size in rows; None uses the planner's admitted chunk.
+    #[arg(long)]
+    chunk: Option<usize>,
     #[arg(long)]
     prefix_cache: bool,
     #[arg(long)]
@@ -139,7 +142,13 @@ fn main() -> Result<()> {
             runtime_dir: args.runtime_dir.clone(),
             prefix_cache: args.prefix_cache,
         };
-        let mut engine = Backend::load(&args.model, args.device, args.capacity, None, settings)?;
+        let mut engine = Backend::load(
+            &args.model,
+            args.device,
+            args.capacity,
+            args.chunk,
+            settings,
+        )?;
         engine.prefill(&prefix, None)?;
         let saved = engine.save_text_prefix(TextPrefixSaveRequest {
             prefix_ids: &prefix,
