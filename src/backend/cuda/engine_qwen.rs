@@ -61,7 +61,7 @@ struct Layer {
 }
 enum BoundMixer {
     Attention {
-        prefill: Box<FullAttentionPlan>,
+        image_prefill: PrefillPlans<FullAttentionPlan>,
         text_prefill: PrefillPlans<FullAttentionPlan>,
         decode: Box<FullAttentionPlan>,
     },
@@ -343,16 +343,20 @@ impl Runtime {
                         );
                     }
                     BoundMixer::Attention {
-                        prefill: Box::new(bind(
+                        image_prefill: PrefillPlans::bind(
+                            bind(
+                                rows,
+                                PositionBindings::Axes(view(
+                                    &active_positions,
+                                    s,
+                                    0,
+                                    [rows as u32, 3],
+                                    [3, 1],
+                                )?),
+                            )?,
                             rows,
-                            PositionBindings::Axes(view(
-                                &active_positions,
-                                s,
-                                0,
-                                [rows as u32, 3],
-                                [3, 1],
-                            )?),
-                        )?),
+                            FullAttentionPlan::for_rows,
+                        )?,
                         text_prefill: PrefillPlans::bind(
                             bind(rows, PositionBindings::Linear)?,
                             rows,
@@ -1022,7 +1026,7 @@ impl Engine {
         };
         match &layer.mixer {
             BoundMixer::Attention {
-                prefill,
+                image_prefill,
                 text_prefill,
                 decode,
             } => {
@@ -1045,13 +1049,13 @@ impl Engine {
                 }
                 match phase {
                     ExecutionPhase::Prefill => {
-                        let narrowed;
-                        let prefill: &FullAttentionPlan = if self.images.is_some() {
-                            prefill
+                        let plans = if self.images.is_some() {
+                            image_prefill
                         } else {
-                            narrowed = text_prefill.select(rows, &FullAttentionPlan::for_rows)?;
-                            &narrowed
+                            text_prefill
                         };
+                        let narrowed = plans.select(rows, &FullAttentionPlan::for_rows)?;
+                        let prefill: &FullAttentionPlan = &narrowed;
                         FullAttentionOps::preprocess(prefill, s, meta, scratch(&q.scratch, s))?;
                         let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
                         let shape = Shape {
