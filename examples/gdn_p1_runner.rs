@@ -16,6 +16,12 @@ const SCHEMA_IDENTITY: &str = "gdn-p1-identity-report/1";
 /// Chunk size the P1 core is compiled with (kernels/gdn/gdn_chunkwise_p1.cu, P1_C);
 /// the protocol fixes C64 and the runner refuses the basis's C16/C32 rows by name.
 const KERNEL_C: u32 = 64;
+/// Paired ABBA blocks per timing configuration; protocol §F fixes this.
+const TIMING_BLOCKS: u32 = 12;
+/// Identity launches per row; the gate contract's minimum.
+const IDENTITY_MIN_RUNS: u32 = 20;
+/// ULP floor margin below the model's frac_le_1ulp.
+const FRAC_FLOOR_MARGIN: f64 = 0.02;
 
 #[cfg(feature = "cuda")]
 const P1_MODULE: &str = "gdn/gdn_chunkwise_p1";
@@ -204,7 +210,7 @@ struct TimingArgs {
     #[arg(long, value_delimiter = ',', default_value = "8,4,16")]
     s: Vec<u32>,
     /// Paired ABBA blocks per configuration; the protocol fixes 12.
-    #[arg(long, default_value_t = 12)]
+    #[arg(long, default_value_t = TIMING_BLOCKS)]
     blocks: u32,
     #[arg(long, value_enum, default_value = "stub")]
     clock: Clock,
@@ -466,8 +472,11 @@ fn open_package(root: &Path) -> Result<Package> {
                 .find(|f| f.fixture == fx.name && f.array == a)
                 .with_context(|| format!("{} {a} is not in the file list", fx.name))?;
             ensure!(
-                listed.sha256 == rec.sha256 && listed.path == rec.path,
-                "fixture {} {a} disagrees with the file list",
+                listed.sha256 == rec.sha256
+                    && listed.path == rec.path
+                    && listed.dtype == rec.dtype
+                    && listed.shape == rec.shape,
+                "fixture {} {a} disagrees with the file list on path, sha256, dtype or shape",
                 fx.name
             );
         }
@@ -1220,6 +1229,16 @@ fn gate_row(
         c,
         s
     );
+    ensure!(
+        (basis.frac_floor - (basis.frac_le_1ulp - FRAC_FLOOR_MARGIN)).abs()
+            <= 1e-12 * basis.frac_le_1ulp.abs().max(1e-300),
+        "gate basis row {} C{} s{}: frac_floor {} is not frac_le_1ulp {} - {FRAC_FLOOR_MARGIN}",
+        fx.name,
+        c,
+        s,
+        basis.frac_floor,
+        basis.frac_le_1ulp
+    );
     if !mo.finite {
         failures.push("non-finite output value".into());
     }
@@ -1373,6 +1392,24 @@ struct TimingConfig {
 const GATE_BAND: f64 = 1.25;
 
 fn run_timing(args: &TimingArgs) -> Result<()> {
+    ensure!(
+        args.c == KERNEL_C,
+        "the built P1 core is C{KERNEL_C} only; C{} is not built and is not run \
+         (protocol §A fixes C64 for every candidate)",
+        args.c
+    );
+    ensure!(
+        args.blocks == TIMING_BLOCKS,
+        "the timing protocol fixes {TIMING_BLOCKS} paired ABBA blocks per configuration \
+         (protocol §F); {} blocks are not a gate report",
+        args.blocks
+    );
+    for s in &args.s {
+        ensure!(
+            [4u32, 8, 16].contains(s),
+            "split {s} is not one of 4/8/16 (protocol §A)"
+        );
+    }
     let synth_owned = args.rows.map(synth_case);
     let pkg = match (&args.package, &synth_owned) {
         (Some(root), _) => Some(open_package(root)?),
@@ -1474,22 +1511,8 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
                     null.invalid_reason.clone().unwrap_or_default()
                 ),
             )
-        } else if series.ci_low > 1.0 + null.band {
-            (
-                "PASS",
-                format!(
-                    "the CI lower bound {:.4} clears the band {:.4}",
-                    series.ci_low, null.band
-                ),
-            )
         } else {
-            (
-                "NOT_CLEARED",
-                format!(
-                    "the CI [{:.4}, {:.4}] does not clear the band {:.4}",
-                    series.ci_low, series.ci_high, null.band
-                ),
-            )
+            timing_verdict(&series, null.band)
         };
         configs.push(TimingConfig {
             c: args.c,
@@ -1519,6 +1542,29 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))?;
     eprintln!("[timing] {}", path.display());
     Ok(())
+}
+
+/// The verdict in the ratio's own direction: `log_ratio` is log(t_P1/t_main), so a
+/// faster candidate is a ratio BELOW 1 and clears when the whole CI sits under
+/// 1 - band. A straddling CI does not clear.
+fn timing_verdict(series: &LegSeries, band: f64) -> (&'static str, String) {
+    if series.ci_high < 1.0 - band {
+        (
+            "PASS",
+            format!(
+                "the CI upper bound {:.4} clears the band {:.4} below 1",
+                series.ci_high, band
+            ),
+        )
+    } else {
+        (
+            "NOT_CLEARED",
+            format!(
+                "the CI [{:.4}, {:.4}] does not clear the band {:.4} below 1",
+                series.ci_low, series.ci_high, band
+            ),
+        )
+    }
 }
 
 /// One A/B pair inside a block: A is always the main core, B is the candidate.
@@ -1567,7 +1613,8 @@ fn stub_duration(which: Which, s: u32) -> f64 {
 }
 
 /// Four legs per block in A B B A order; the per-block statistic is the mean of the two
-/// legs of log(t_B) - log(t_A).
+/// paired log ratios, (leg0 A, leg1 B) and (leg2 B, leg3 A), as protocol §F registers it.
+/// `a_ms` and `b_ms` are the two legs' arithmetic means, reported as durations.
 fn abba<F>(clock: Clock, blocks: u32, a: Which, b: Which, mut leg: F) -> Vec<BlockStat>
 where
     F: FnMut(Which, usize) -> Result<f64>,
@@ -1594,13 +1641,16 @@ where
                 filled[1] += 1;
             }
         }
+        let paired = |a: f64, b: f64| {
+            if a > 0.0 && b > 0.0 {
+                (b / a).ln()
+            } else {
+                f64::NAN
+            }
+        };
+        let lr = (paired(ta[0], tb[0]) + paired(ta[1], tb[1])) / 2.0;
         let a = (ta[0] + ta[1]) / 2.0;
         let bmean = (tb[0] + tb[1]) / 2.0;
-        let lr = if a > 0.0 && bmean > 0.0 {
-            (bmean / a).ln()
-        } else {
-            f64::NAN
-        };
         out.push(BlockStat {
             block: blk,
             log_ratio: lr,
@@ -2019,16 +2069,19 @@ impl Gpu {
             }
             Ok(())
         };
-        // The perturbation's own state and output, which no measured run reads.
+        // The perturbation's own state and output, which no measured run reads, on a
+        // SECOND stream so the measured launch starts with another CTA resident.
+        let perturb_stream = self.ctx.new_stream()?;
         let mut ds_filler = self.stream.clone_htod(&arrays.s0)?;
         let dout_filler = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
         let mut out_digests = Vec::with_capacity(runs as usize);
         let mut state_digests = Vec::with_capacity(runs as usize);
         for run in 1..=runs {
             self.stream.synchronize()?;
-            launch(&self.stream, &mut ds_filler, &dout_filler)?;
-            launch(&self.stream, &mut ds_filler, &dout_filler)?;
+            launch(&perturb_stream, &mut ds_filler, &dout_filler)?;
+            launch(&perturb_stream, &mut ds_filler, &dout_filler)?;
             self.stream.synchronize()?;
+            perturb_stream.synchronize()?;
             // Fresh inputs for this run: S0 re-uploaded, out zeroed.
             let mut ds = self.stream.clone_htod(&arrays.s0)?;
             let mut dout = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
@@ -2173,8 +2226,7 @@ impl CaseArrays {
     }
 }
 
-#[cfg(feature = "cuda")]
-fn run_identity(args: &IdentityArgs) -> Result<()> {
+fn check_identity_args(args: &IdentityArgs) -> Result<()> {
     ensure!(
         args.c == KERNEL_C,
         "the built P1 core is C{KERNEL_C} only; C{} is not built and is not run \
@@ -2182,8 +2234,10 @@ fn run_identity(args: &IdentityArgs) -> Result<()> {
         args.c
     );
     ensure!(
-        args.runs >= 2,
-        "identity compares launches against each other and needs at least two"
+        args.runs >= IDENTITY_MIN_RUNS,
+        "the identity gate contract requires at least {IDENTITY_MIN_RUNS} launches per \
+         row; {} is a rehearsal and cannot carry a verdict",
+        args.runs
     );
     for s in &args.s {
         ensure!(
@@ -2191,6 +2245,12 @@ fn run_identity(args: &IdentityArgs) -> Result<()> {
             "split {s} is not one of 4/8/16 (protocol §A)"
         );
     }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_identity(args: &IdentityArgs) -> Result<()> {
+    check_identity_args(args)?;
     let pkg = open_package(&args.package)?;
     std::fs::create_dir_all(&args.run_dir)
         .with_context(|| format!("create {}", args.run_dir.display()))?;
@@ -2288,7 +2348,8 @@ const PERTURBATION: &str = "a full-length launch of the same entry on a second s
      before every measured launch";
 
 #[cfg(not(feature = "cuda"))]
-fn run_identity(_args: &IdentityArgs) -> Result<()> {
+fn run_identity(args: &IdentityArgs) -> Result<()> {
+    check_identity_args(args)?;
     anyhow::bail!("the identity phase needs the crate's cuda feature")
 }
 
@@ -2299,5 +2360,66 @@ fn main() -> Result<()> {
         Phase::Timing(a) => run_timing(&a),
         Phase::Identity(a) => run_identity(&a),
         Phase::E2e(a) => run_e2e(&a),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `blocks` ABBA blocks of constant per-arm durations with a fixed +/-0.4% jitter,
+    /// so the CI has width and the direction of the test is the verdict's alone.
+    fn series_for(blocks: u32, a_ms: f64, b_ms: f64) -> LegSeries {
+        let blocks = abba(
+            Clock::Stub,
+            blocks,
+            Which::Main,
+            Which::P1,
+            move |w, leg| {
+                let base = match w {
+                    Which::Main => a_ms,
+                    Which::P1 => b_ms,
+                };
+                Ok(base * (1.0 + if leg % 2 == 0 { -0.004 } else { 0.004 }))
+            },
+        );
+        summarise(&blocks, blocks.len() * 4, "P1 core vs the main GDN core")
+    }
+
+    #[test]
+    fn a_p1_ten_percent_faster_clears_and_a_p1_ten_percent_slower_does_not() {
+        let faster = timing_verdict(&series_for(TIMING_BLOCKS, 1.0, 0.9), 0.03);
+        assert_eq!(faster.0, "PASS", "a 10% faster P1 must clear: {faster:?}");
+        let slower = timing_verdict(&series_for(TIMING_BLOCKS, 1.0, 1.1), 0.03);
+        assert_eq!(
+            slower.0, "NOT_CLEARED",
+            "a 10% slower P1 must not clear: {slower:?}"
+        );
+    }
+
+    #[test]
+    fn the_block_statistic_is_the_mean_of_the_paired_log_ratios() {
+        // One block, A B B A: main 1.0 then 4.0, P1 2.0 then 1.0. The paired log
+        // ratios are log(2/1) and log(1/4); log(mean B / mean A) is a different number.
+        let blocks = abba(Clock::Stub, 1, Which::Main, Which::P1, |w, leg| {
+            Ok(match (w, leg) {
+                (Which::Main, 0) => 1.0,
+                (Which::Main, _) => 4.0,
+                (Which::P1, 1) => 2.0,
+                (Which::P1, _) => 1.0,
+            })
+        });
+        let paired = (2.0f64 / 1.0).ln() + (1.0f64 / 4.0).ln();
+        let mean_of_ratios = (1.5f64 / 2.5).ln();
+        assert!(
+            (blocks[0].log_ratio - paired / 2.0).abs() < 1e-12,
+            "block statistic {} is not the mean of the paired log ratios {}",
+            blocks[0].log_ratio,
+            paired / 2.0
+        );
+        assert!(
+            (mean_of_ratios - paired / 2.0).abs() > 1e-3,
+            "the test case does not separate the two statistics"
+        );
     }
 }
