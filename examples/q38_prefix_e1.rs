@@ -52,10 +52,7 @@ struct Args {
     transfer_bytes: usize,
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
-    /// Prefill chunk size in rows. None (the default) uses the planner's admitted
-    /// chunk. On a qualified device every prefill step of more than 4 rows runs the
-    /// chunkwise-P1 core; steps of 1..=4 keep the shipped core that MTP verify
-    /// requires.
+    /// Prefill chunk size in rows; None uses the planner's admitted chunk.
     #[arg(long)]
     chunk: Option<usize>,
     #[arg(long)]

@@ -10,9 +10,7 @@ mod binaries {
 }
 
 /// The native cubin bytes for one kernel module, or None when this build has no
-/// cubin for that architecture. The gate runner loads its own modules from these
-/// rather than through [`module`], so it can launch a kernel directly with its own
-/// buffers instead of through the Engine's binder.
+/// cubin for that architecture.
 pub fn bytes(name: &str, sm: u32) -> Option<&'static [u8]> {
     binaries::cubin(name, sm)
 }

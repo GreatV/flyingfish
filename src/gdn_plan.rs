@@ -11,9 +11,7 @@ const DV: u32 = 128;
 /// chunkwise-P1 core on a qualified device.
 pub const MIN_VERIFY_ROWS: u32 = 4;
 
-/// Chunkwise P1 core shared-memory bytes per value split, from
-/// `kernels/gdn/gdn_cw_p1_layout.h`. The kernel static_asserts its arena against the
-/// same constants, so the launcher and the kernel derive the size from one definition.
+/// Chunkwise P1 core shared-memory bytes per split, from `kernels/gdn/gdn_cw_p1_layout.h`.
 pub mod cw_p1 {
     include!(concat!(env!("OUT_DIR"), "/gdn_cw_p1_shared.rs"));
 }
@@ -22,9 +20,7 @@ pub mod cw_p1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct GdnPolicy {
     /// Protocol §A value split of the production chunkwise-P1 prefill core, 0 = the
-    /// shipped recursive core. Derived once here from the device qualification: the
-    /// core's gate was run on sm89 with 128 SMs (box3), and every other device keeps
-    /// the shipped core until it has its own gate.
+    /// shipped recursive core; qualified for arch 89 with 128 SMs, 0 elsewhere.
     prefill_p1_split: u32,
 }
 impl GdnPolicy {
@@ -41,10 +37,8 @@ impl GdnPolicy {
     pub const fn prefill_p1_split(self) -> u32 {
         self.prefill_p1_split
     }
-    /// The split a prefill step of `step_rows` rows carries. Every prefill step of
-    /// more than MIN_VERIFY_ROWS rows takes the chunkwise-P1 core on a qualified
-    /// device; 1..=MIN_VERIFY_ROWS keep split 0 because MTP verify's contract is the
-    /// shipped recursive core.
+    /// The split a prefill step of `step_rows` rows carries: steps above
+    /// MIN_VERIFY_ROWS take the chunkwise-P1 core, 1..=MIN_VERIFY_ROWS keep split 0.
     pub const fn p1_split_for_step(self, step_rows: u32) -> u32 {
         if step_rows > MIN_VERIFY_ROWS {
             self.prefill_p1_split
@@ -60,8 +54,7 @@ impl GdnPolicy {
             GdnSpec::PLAN_ID
         }
     }
-    /// All prebound operators reuse the same arena: the maximum of complete plan
-    /// layouts is enough, and with the scan buckets gone it is the plain arena.
+    /// All prebound operators reuse the arena sized by the maximum complete plan layout.
     pub fn workspace(self, spec: &GdnSpec, physical_rows: u32) -> Result<WorkspaceReq> {
         Ok(WorkspaceReq {
             bytes: GdnWorkspace::q38(spec, physical_rows)?.bytes,

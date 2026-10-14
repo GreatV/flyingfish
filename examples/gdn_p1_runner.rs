@@ -1,38 +1,4 @@
-//! GDN chunkwise P1 primitive gate runner: numerics, kernel timing, bit-identity and
-//! end-to-end engine timing.
-//!
-//! Frozen inputs: the P1 package given by `--package` (MANIFEST.json with a per-file
-//! SHA-256, `inputs/*.f32`, `truth/<case>.{out,state}.f64` and `gate_basis.json`).
-//! Every array is read from those bytes and verified against the manifest before use.
-//!
-//! Numerics (4d, 2026-10-13T07:06:44Z, item 2), per fixture x chunk C x split s,
-//! against the FP64 oracle and pre-registered from the CPU P1 model:
-//!   out_max_abs <= 1.25x model, out_rel_rms <= 1.25x model,
-//!   state_rel_rms <= 1.25x model, frac_le_1ulp >= model - 0.02,
-//!   every value finite, every length and head present. A quantity whose basis is
-//!   zero keeps ZERO tolerance; the band is never widened by a candidate result.
-//! Multi-chunk condition: every C must have at least one fixture with more than one
-//! chunk passing.
-//!
-//! `frac_le_1ulp` and the residual norms use the CPU model's own definitions
-//! (gdn_phase2_model_w.bf16_ulp / metrics_p2, gdn_phase2_sensitivity.residual_record):
-//! the local BF16 ULP of each REFERENCE element, 2^(floor(log2|x|) - 7) and 2^-133 on
-//! the subnormal grid below 2^-126.
-//!
-//! Kernel timing (§F): the NULL band (main core vs itself, same ABBA block structure)
-//! is computed and WRITTEN BEFORE any P1 timing is compared against it. 12 paired
-//! ABBA blocks per configuration; the per-block statistic is the mean of the two legs
-//! of log(t_B) - log(t_A); the acceptance band is
-//!   max(0.03, exp(3 * SD(null log ratios)) - 1, event quantisation / batch time),
-//! and the P1 leg reports a geometric-mean ratio with a t-based simultaneous CI at
-//! Bonferroni alpha = 0.05/9 over the nine (C, s) configurations.
-//!
-//! `--stub` replaces the kernel launch and the CUDA-event clock with documented
-//! deterministic values so the whole pipeline — manifest load, SHA verification,
-//! gate-basis load, metric computation, verdict emission and the ABBA statistics —
-//! runs with no CUDA device at all. Stub numerics are EXPECTED to fail the 1.25x
-//! comparison: that is the honest outcome of a stub, and the pipeline proving it is
-//! the point of the mode.
+//! GDN chunkwise P1 gate runner over the frozen `--package` bytes (MANIFEST.json, inputs/*.f32, truth/*.f64, gate_basis.json), every array SHA-verified before use: numerics against the FP64 oracle at the pre-registered 1.25x band on out_max_abs, out_rel_rms and state_rel_rms with a frac_le_1ulp floor at model - 0.02 and one passing multi-chunk fixture per C, kernel timing against a NULL band computed and WRITTEN before any P1 comparison (max(0.03, exp(3*SD(null log ratios)) - 1, quantisation/batch), 12 paired ABBA blocks, t CI at Bonferroni alpha = 0.05/9), bit-identity, and end-to-end engine timing; `--stub` runs the whole pipeline with no CUDA device and its numerics are EXPECTED to fail the 1.25x comparison.
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -47,10 +13,8 @@ const SCHEMA_TIMING: &str = "gdn-p1-timing-report/1";
 #[cfg(feature = "cuda")]
 const SCHEMA_IDENTITY: &str = "gdn-p1-identity-report/1";
 
-/// Chunk size the P1 core is compiled with (kernels/gdn/gdn_chunkwise_p1.cu, P1_C).
-/// The protocol fixes C64 for every candidate (§A); the gate basis carries C16/C32
-/// rows because the CPU model swept C, and the runner refuses them by name rather
-/// than running a kernel that does not exist at that chunk size.
+/// Chunk size the P1 core is compiled with (kernels/gdn/gdn_chunkwise_p1.cu, P1_C);
+/// the protocol fixes C64 and the runner refuses the basis's C16/C32 rows by name.
 const KERNEL_C: u32 = 64;
 
 #[cfg(feature = "cuda")]
@@ -73,8 +37,7 @@ enum Phase {
     /// out and state across the launches (the kernel gate's bit-identity leg).
     Identity(IdentityArgs),
     /// End-to-end engine timing: one model load per process, CUDA events around
-    /// prefill and decode only. Arms are separate processes (the planner derives the
-    /// core), so a driver interleaves process pairs.
+    /// prefill and decode only.
     E2e(E2eArgs),
 }
 
@@ -152,8 +115,7 @@ fn run_e2e(a: &E2eArgs) -> Result<()> {
     let started = Instant::now();
     let mut model = Model::load(&a.model, 0, a.capacity, a.chunk, settings)?;
     let load_ms = started.elapsed().as_secs_f64() * 1000.0;
-    // One discarded prefill+decode warms caches and graphs; reset is the Q38-native
-    // clean state for measurement.
+    // One discarded prefill+decode warms caches and graphs; reset is the clean state.
     model.reset()?;
     let _ = model.prefill(&ids, None)?;
     for _ in 0..4 {
@@ -257,10 +219,7 @@ struct TimingArgs {
     simulate_box3: bool,
 }
 
-/// splitmix64 over a per-(array, index) key: the same N yields the same bytes on every
-/// run and on every build, so a curve measured with synthesised rows is comparable
-/// across arms. Values are centred and scaled to keep the core's arithmetic in the same
-/// regime as the frozen fixtures.
+/// splitmix64 over a per-(array, index) key: the same N yields the same bytes on every run and build, centred and scaled into the frozen fixtures' regime.
 fn synth(rows: usize, array: u64, n: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
     let mut key =
@@ -446,8 +405,8 @@ impl Package {
     }
 }
 
-/// Verify EVERY file the manifest lists, before any array is read. A mismatch names
-/// the file and aborts: a package that has drifted is not a package.
+/// Verify EVERY file the manifest lists, before any array is read; a mismatch names the
+/// file and aborts.
 fn open_package(root: &Path) -> Result<Package> {
     let manifest_path = root.join("MANIFEST.json");
     let text = std::fs::read_to_string(&manifest_path)
@@ -494,8 +453,7 @@ fn open_package(root: &Path) -> Result<Package> {
         );
         verified += 1;
     }
-    // The per-fixture records must agree with the file list; a manifest that
-    // disagrees with itself is not a package either.
+    // The per-fixture records must agree with the file list.
     for fx in &manifest.fixtures {
         for a in ARRAYS {
             let rec = fx
@@ -516,8 +474,7 @@ fn open_package(root: &Path) -> Result<Package> {
         ensure!(fx.m >= 1, "fixture {} has no live row", fx.name);
     }
 
-    // The FP64 truth, verified on the same terms as the inputs and required for every
-    // fixture: a gate with no reference is not a gate.
+    // The FP64 truth, verified on the same terms as the inputs, for every fixture.
     let mut truth = BTreeMap::new();
     let mut truth_verified = 0usize;
     for t in &manifest.truth {
@@ -627,8 +584,8 @@ fn read_f32(root: &Path, rec: &ArrayRec) -> Result<Vec<f32>> {
         .collect())
 }
 
-/// The FP64 oracle's array for one fixture, read from the package bytes and verified
-/// against the manifest record on every call, exactly as `read_f32` does for the inputs.
+/// The FP64 oracle's array for one fixture, verified against the manifest record on every
+/// call, exactly as `read_f32` does for the inputs.
 fn read_truth_f64(root: &Path, rec: &TruthFile) -> Result<Vec<f64>> {
     ensure!(
         rec.dtype == "float64",
@@ -665,8 +622,8 @@ fn read_truth_f64(root: &Path, rec: &TruthFile) -> Result<Vec<f64>> {
 // ---------------------------------------------------------------------------
 // metrics — the CPU model's definitions, bit-for-bit in form
 // ---------------------------------------------------------------------------
-/// Local BF16 ULP at |x| (gdn_phase2_model_w.bf16_ulp): 2^(floor(log2|x|) - 7), and
-/// the 2^-133 subnormal grid below 2^-126.
+
+/// Local BF16 ULP at |x| (gdn_phase2_model_w.bf16_ulp): 2^(floor(log2|x|) - 7), and the 2^-133 subnormal grid below 2^-126.
 fn bf16_ulp(x: f64) -> f64 {
     let a = x.abs();
     if a == 0.0 {
@@ -735,10 +692,8 @@ fn bf16_round(x: f64) -> f64 {
     f32::from_bits(up) as f64
 }
 
-/// The documented stub field: element n of an array gets
-///   sin(n * 0.7) and sin(n * 0.7 + 1.3) interleaved, scaled by 1/4, BF16-rounded.
-/// Deterministic, no RNG state, O(1) magnitude like a real GDN output, and non-constant
-/// so the ULP histogram and the rel_rms are exercised rather than short-circuited.
+/// The documented stub field: sin(n * 0.7) and sin(n * 0.7 + 1.3) interleaved, scaled
+/// by 1/4, BF16-rounded; O(1) magnitude and non-constant.
 fn stub_field(n: usize, phase: f64) -> f64 {
     let x = n as f64;
     bf16_round((x * 0.7 + phase).sin() * 0.25)
@@ -808,8 +763,7 @@ struct IdentityReport {
     package: String,
     manifest_generated_utc: String,
     files_sha256_verified: usize,
-    /// What runs between two measured launches, named so the leg cannot be read as
-    /// "launched 20 times into a quiet SM".
+    /// What runs between two measured launches (see PERTURBATION).
     perturbation: &'static str,
     environment: EnvReceipt,
     rows: Vec<IdentityRow>,
@@ -839,8 +793,7 @@ struct GateReport {
     inputs_reused_from_manifest: bool,
 }
 
-/// What each fixture in the package is, carried into the receipt so the run states
-/// which inputs it consumed rather than only that it consumed some.
+/// What each fixture in the package is, carried into the receipt.
 #[derive(Serialize)]
 struct FixtureReceipt {
     name: String,
@@ -849,9 +802,8 @@ struct FixtureReceipt {
     prefix: usize,
     live_rows: usize,
     seed: Option<i64>,
-    /// Bytes of SHA-verified input this fixture contributed to the run. The arrays
-    /// are read and verified on every leg, including the stub leg, because reading
-    /// them from the manifest IS the input-ownership check (Codex-D 07:28).
+    /// Bytes of SHA-verified input this fixture contributed to the run; the arrays are
+    /// read and verified on every leg, including the stub leg.
     verified_input_bytes: usize,
     note: String,
 }
@@ -887,19 +839,17 @@ struct EnvReceipt {
     simulated_box3: bool,
     rust: &'static str,
     /// What this run actually ran on: the live device when one was touched, otherwise
-    /// the no-device profile. Never a hardcoded box3 string on a measured run.
+    /// the no-device profile.
     target_profile: String,
     nvcc_observed: &'static str,
     cuda_visible_devices: String,
     device_touched: bool,
     device: Option<DeviceInfo>,
-    /// Deviations of a STUB leg from a box3 CUDA leg; empty on a device-touching run,
-    /// which carries `device` instead.
+    /// Deviations of a STUB leg from a device-touching run, which carries `device`.
     differs_from_box3: Vec<String>,
 }
 
-/// What the CUDA driver reports about the device this run actually used. Present only
-/// when a device was opened; a stub leg carries None and says so.
+/// What the CUDA driver reports about the device this run used; a stub leg carries None.
 #[derive(Serialize, Clone)]
 struct DeviceInfo {
     name: String,
@@ -987,8 +937,8 @@ fn split_function(s: u32) -> &'static str {
     }
 }
 
-/// The dynamic shared-memory bytes the P1 core asks for at this split, from the same
-/// header the kernel static_asserts its arena against.
+/// The P1 core's dynamic shared-memory bytes at this split, from the header the kernel
+/// static_asserts its arena against.
 #[cfg(feature = "cuda")]
 fn split_smem(s: u32) -> Result<u32> {
     Ok(match s {
@@ -1032,8 +982,7 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
     let mut bytes_by_fixture: BTreeMap<String, usize> = BTreeMap::new();
     #[cfg(feature = "cuda")]
     let mut gpu: Option<Gpu> = None;
-    // On the no-CUDA leg there is nothing to open; the stub clock is the only one
-    // and `--clock cuda` says so by name rather than running it silently.
+    // On the no-CUDA leg there is nothing to open; the stub clock is the only one.
     #[cfg(not(feature = "cuda"))]
     let gpu: Option<Gpu> = None;
     if args.clock == Clock::Cuda {
@@ -1203,7 +1152,7 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
         }
     );
     // A gate report is emitted whatever the verdict; the runner exits non-zero only
-    // when the plumbing itself failed. The verdict is the caller's to read.
+    // when the plumbing itself failed.
     Ok(())
 }
 
@@ -1258,8 +1207,7 @@ fn gate_row(
     let r_max = ratio(mo.max_abs, basis.out_max_abs);
     let r_rms = ratio(mo.rel_rms, basis.out_rel_rms);
     let r_state = ratio(state_m.rel_rms, basis.state_rel_rms);
-    // The stored gate_* columns are the pre-registered 1.25x products; a band that
-    // disagrees with the model column is a package that is not self-consistent.
+    // The stored gate_* columns must equal the pre-registered 1.25x products.
     ensure!(
         (basis.gate_out_max_abs - basis.out_max_abs * GATE_BAND).abs()
             <= 1e-12 * basis.gate_out_max_abs.max(1e-300)
@@ -1329,8 +1277,8 @@ fn gate_row(
     })
 }
 
-/// 4d item 2's multi-chunk condition: every C evaluated must have at least one
-/// fixture of more than one chunk that passes.
+/// The multi-chunk condition: every C evaluated must have at least one fixture of more
+/// than one chunk that passes.
 fn multi_chunk_condition(rows: &[GateRow], c: u32) -> MultiChunk {
     let mut multi: Vec<String> = Vec::new();
     let mut passing: Vec<String> = Vec::new();
@@ -1455,8 +1403,7 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
 
     #[cfg(feature = "cuda")]
     let mut gpu: Option<Gpu> = None;
-    // On the no-CUDA leg there is nothing to open; the stub clock is the only one
-    // and `--clock cuda` says so by name rather than running it silently.
+    // On the no-CUDA leg there is nothing to open; the stub clock is the only one.
     #[cfg(not(feature = "cuda"))]
     let gpu: Option<Gpu> = None;
     if args.clock == Clock::Cuda {
@@ -1487,15 +1434,13 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
 
     let device_touched = gpu.is_some();
     let device = device_of(gpu.as_ref());
-    // Side A is the baseline the ratio is taken against and side B the candidate. The
-    // NULL leg runs side A's own core against itself, so the band measures the noise
-    // of the arms actually being compared.
+    // Side A is the baseline the ratio is taken against and side B the candidate; the
+    // NULL leg runs side A's own core against itself.
     let (baseline, candidate) = (Which::Main, Which::P1);
     let comparison_label: &'static str = "P1 core vs the main GDN core";
     let mut configs = Vec::new();
     for &s in &args.s {
-        // 1. NULL FIRST: side A's own core against ITSELF, so the band measures the
-        // measurement noise and nothing else.
+        // 1. NULL FIRST: side A's own core against ITSELF.
         let null_blocks = abba(args.clock, args.blocks, baseline, baseline, |which, leg| {
             let _ = leg;
             time_leg(gpu.as_ref(), fx, &arrays, which, s)
@@ -1611,10 +1556,8 @@ fn time_leg(
     }
 }
 
-/// Documented stub durations in milliseconds: the main core and the P1 core get
-/// distinct fixed bases so the ABBA arithmetic is exercised, and each leg carries a
-/// fixed 1% quantisation so the quantisation term of the band is non-zero. The
-/// NUMBERS are not a measurement and the report labels them as stub.
+/// Documented stub durations in milliseconds: distinct fixed bases per core and a fixed
+/// 1% quantisation per leg. The NUMBERS are not a measurement.
 fn stub_duration(which: Which, s: u32) -> f64 {
     let base = match which {
         Which::Main => 4.07,
@@ -1623,9 +1566,8 @@ fn stub_duration(which: Which, s: u32) -> f64 {
     base * (1.0 + 0.01 * ((s % 4) as f64 - 1.5) / 1.5)
 }
 
-/// Four legs per block in A B B A order; the per-block statistic is the mean of the
-/// two legs of log(t_B) - log(t_A). `a` and `b` name what each side runs, so the null
-/// band can run the SAME core on both sides and the P1 leg runs main against P1.
+/// Four legs per block in A B B A order; the per-block statistic is the mean of the two
+/// legs of log(t_B) - log(t_A).
 fn abba<F>(clock: Clock, blocks: u32, a: Which, b: Which, mut leg: F) -> Vec<BlockStat>
 where
     F: FnMut(Which, usize) -> Result<f64>,
@@ -1634,15 +1576,15 @@ where
     for blk in 0..blocks {
         let n = blk * 4;
         let order = [(a, n), (b, n + 1), (b, n + 2), (a, n + 3)];
-        // Assigned by POSITION, not by identity: when a == b (the null leg) both
-        // cores are the same one and identity cannot say which leg is which side.
+        // Assigned by POSITION: when a == b both cores are the same one, so identity
+        // cannot say which leg is which side.
         let side = [true, false, false, true];
         let mut ta = [f64::NAN; 2];
         let mut tb = [f64::NAN; 2];
         let mut filled = [0usize; 2];
         for (i, (w, n)) in order.into_iter().enumerate() {
-            // A leg that failed is NaN, not a dropped sample: dropping it would
-            // silently shrink the block and the band would be computed from fewer.
+            // A leg that failed is NaN, not a dropped sample: dropping it would shrink
+            // the block and the band would be computed from fewer.
             let t = leg(w, n as usize).unwrap_or(f64::NAN);
             if side[i] {
                 ta[filled[0]] = t;
@@ -1754,9 +1696,8 @@ fn summarise(blocks: &[BlockStat], n_legs: usize, label: &'static str) -> LegSer
     }
 }
 
-/// Two-sided t critical value: invert the Student t CDF through the regularised
-/// incomplete beta by bisection (Numerical Recipes' betai/betacf), so the CI is not
-/// a normal approximation wearing a t's name.
+/// Two-sided t critical value: the Student t CDF inverted through the regularised
+/// incomplete beta by bisection (Numerical Recipes' betai/betacf).
 fn t_critical(tail: f64, df: f64) -> f64 {
     let mut lo = 0.0f64;
     let mut hi = 200.0f64;
@@ -1869,8 +1810,8 @@ fn ln_gamma(z: f64) -> f64 {
 // ---------------------------------------------------------------------------
 // the CUDA leg
 // ---------------------------------------------------------------------------
-/// Load one kernel module from this build's own cubin bytes. The gate launches the
-/// core directly with its own buffers, so it does not go through the Engine binder.
+
+/// Load one kernel module from this build's own cubin bytes; the gate launches the core directly, not through the Engine binder.
 #[cfg(feature = "cuda")]
 fn load_module(
     ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
@@ -1895,8 +1836,7 @@ fn compute_capability(ctx: &cudarc::driver::CudaContext) -> Result<u32> {
     Ok((major * 10 + minor) as u32)
 }
 
-/// Placeholder on the no-CUDA leg: the stub clock is the only clock there, and
-/// `--clock cuda` says so by name rather than silently running the stub.
+/// Placeholder on the no-CUDA leg, where the stub clock is the only clock.
 #[cfg(not(feature = "cuda"))]
 struct Gpu;
 
@@ -1921,8 +1861,8 @@ struct Gpu {
 
 #[cfg(feature = "cuda")]
 impl Gpu {
-    /// Thread block of the P1 core (protocol §E), and of the shipped main core with
-    /// its measured 62,336 B dynamic shared-memory request.
+    /// Thread block of the P1 core (protocol §E), and of the shipped main core with its
+    /// measured 62,336 B dynamic shared-memory request.
     const P1_THREADS: u32 = 256;
     const MAIN_THREADS: u32 = 512;
     const MAIN_SMEM: u32 = 62_336;
@@ -1981,8 +1921,7 @@ impl Gpu {
         })
     }
 
-    /// Allocate, upload, launch the P1 core, download. Every leg starts from S0 so
-    /// the state a previous leg decayed is not the next leg's input.
+    /// Allocate, upload, launch the P1 core, download; every leg starts from S0.
     fn run_p1(&self, fx: &Fixture, arrays: &CaseArrays, s: u32) -> Result<(Vec<f32>, Vec<f32>)> {
         use cudarc::driver::{LaunchConfig, PushKernelArg as _};
         let m = fx.m;
@@ -2018,8 +1957,8 @@ impl Gpu {
                 .arg(&mut ds)
                 .arg(&dout)
                 .arg(&meta)
-                // 0 is the sentinel that makes the kernel read meta->valid_rows, so
-                // the live count stays device data and a captured graph replays it.
+                // 0 is the sentinel that makes the kernel read meta->valid_rows, so a
+                // captured graph replays the live count.
                 .arg(&0i32)
                 .launch(cfg)?;
         }
@@ -2029,13 +1968,7 @@ impl Gpu {
         Ok((widened, state))
     }
 
-    /// Launch the P1 core `runs` times from IDENTICAL device inputs and digest out
-    /// and state after every launch. Each run re-uploads S0 (the core advances S in
-    /// place, so a carried-over state would make run N+1 a different input) and takes
-    /// a freshly zeroed out buffer (so a row the kernel failed to write reads as zeros
-    /// rather than as the previous run's value). The input arrays, meta and the
-    /// perturbation's buffers are uploaded once and never rewritten.
-    ///
+    /// Launch the P1 core `runs` times from IDENTICAL device inputs, digesting out and state after every launch; each run re-uploads S0 and zeroes the out buffer.
     fn identity_p1(
         &self,
         fx: &Fixture,
@@ -2086,8 +2019,7 @@ impl Gpu {
             }
             Ok(())
         };
-        // The perturbation's own state and output: the same entry, same inputs, a
-        // state and an output buffer no measured run reads.
+        // The perturbation's own state and output, which no measured run reads.
         let mut ds_filler = self.stream.clone_htod(&arrays.s0)?;
         let dout_filler = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
         let mut out_digests = Vec::with_capacity(runs as usize);
@@ -2146,8 +2078,8 @@ impl Gpu {
         let mut ds = self.stream.clone_htod(&arrays.s0)?;
         let dout = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
         let meta = self.meta(fx)?;
-        // The events bracket the launch on the stream; nothing else is enqueued
-        // between them, and the stream is synchronised before the pair is read.
+        // The events bracket the launch; nothing else is enqueued between them and the
+        // stream is synchronised before the pair is read.
         let start = self
             .ctx
             .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
@@ -2218,8 +2150,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// The frozen per-fixture input arrays, as one argument, so the identity launch does
-/// not grow a ten-argument signature.
+/// The frozen per-fixture input arrays as one argument.
 struct CaseArrays {
     q: Vec<f32>,
     k: Vec<f32>,
@@ -2344,17 +2275,13 @@ fn run_identity(args: &IdentityArgs) -> Result<()> {
         path.display(),
         report.rows.len()
     );
-    // As in the numerics phase: the report is written whatever the verdict and the
-    // runner exits 0 unless the plumbing failed. The verdict is the caller's to read.
+    // The report is written whatever the verdict; the runner exits 0 unless the
+    // plumbing failed.
     Ok(())
 }
 
-/// What runs between two measured launches. Named in the report so the leg cannot be
-/// read as "the same launch 20 times into a quiet SM": a full-length P1 launch of the
-/// same entry on a SECOND stream over throwaway state and output buffers, then a
-/// synchronize of both streams. The measured launch therefore starts while another
-/// CTA is resident, and the host round-trip changes what the driver has already
-/// resident. Nothing it touches can reach the measured buffers.
+/// What runs between two measured launches; it touches only throwaway buffers, so the
+/// measured launch starts while another CTA is resident.
 #[cfg(feature = "cuda")]
 const PERTURBATION: &str = "a full-length launch of the same entry on a second stream over \
      throwaway S and out buffers, then synchronize(stream) + synchronize(second stream), \

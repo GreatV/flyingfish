@@ -133,9 +133,7 @@ struct Kernels {
 }
 
 /// Phase-2 chunkwise P1 cores (precision protocol §D/§E), one entry point per value
-// split. The split is a compile-time property of the kernel's register state tile,
-// so it selects the entry point rather than a runtime argument, and it selects the
-// shared-memory opt-in from the same constants the kernel static_asserts against.
+// split; the split is a compile-time property of the kernel's register state tile.
 struct ChunkwiseP1 {
     s4: CudaFunction,
     s8: CudaFunction,
@@ -171,8 +169,7 @@ pub(crate) struct GdnPlan {
     chunked_cfg: LaunchConfig,
     recurrent_cfg: LaunchConfig,
     /// Protocol §A value split of the prepared chunkwise P1 core, 0 when the plan
-    /// keeps the shipped recursive core. Fixed in `prepare`, like every other grid
-    /// property, so a captured Graph replays an identical launch sequence.
+    /// keeps the shipped recursive core; fixed in `prepare`.
     p1_split: u32,
 }
 
@@ -248,9 +245,7 @@ impl GdnPlan {
             hist_cfg: self.hist_cfg,
             chunked_cfg: self.chunked_cfg,
             recurrent_cfg: self.recurrent_cfg,
-            // Narrowing can drop a plan into the small range, where the shipped core
-            // stays; 1..=4 carries the MTP verify contract (`run_verify` rejects a P1
-            // plan).
+            // 1..=MIN_VERIFY_ROWS keeps the shipped core: `run_verify` rejects a P1 plan.
             p1_split: if rows > crate::gdn_plan::MIN_VERIFY_ROWS {
                 self.p1_split
             } else {
@@ -259,13 +254,7 @@ impl GdnPlan {
         })
     }
 
-    /// Phase-2 chunkwise P1 core (precision protocol §D/§E).
-    ///
-    /// It launches the core only. The ABI §6 prep chain (conv, SiLU, l2_heads,
-    /// gates, widen) runs first, as it does for every core; this is the core
-    /// launch that `run` makes when the plan was prepared with a non-zero split.
-    /// `split` is protocol §A's value-axis strip count and selects both the entry
-    /// point and the grid's x dimension.
+    /// Phase-2 chunkwise P1 core (precision protocol §D/§E); `split` selects the entry point and grid.x.
     pub(crate) fn run_chunkwise_p1(
         &self,
         stream: &Arc<CudaStream>,
@@ -304,9 +293,8 @@ impl GdnPlan {
                 .arg(&self.bindings.s.0.ptr)
                 .arg(&self.bindings.core_out.0.ptr)
                 .arg(&meta.ptr)
-                // The row count stays device data: 0 is the sentinel that makes the
-                // kernel read `meta->valid_rows`, exactly as the chunked core does.
-                // A captured Graph therefore replays it instead of a host constant.
+                // 0 is the sentinel that makes the kernel read `meta->valid_rows`,
+                // as the chunked core does, so a captured Graph replays it.
                 .arg(&0i32)
                 .launch(cfg)?;
         }
@@ -416,10 +404,8 @@ impl GdnOps {
             f.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, CHUNKED_SMEM as i32)?;
             f
         };
-        // Chunkwise P1, bound only when the plan asks for it. All three arenas are
-        // under the 48 KiB no-opt-in cap, so they need no
-        // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES; the device limit was
-        // asserted above.
+        // All three arenas are under the 48 KiB no-opt-in cap, so they need no
+        // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES.
         let p1 = if p1_split == 0 {
             None
         } else {

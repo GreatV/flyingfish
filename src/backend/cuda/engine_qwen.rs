@@ -8,13 +8,7 @@ use crate::backend::cuda::{
     ops::{CommonOpsRef, GatedRmsInput, ResidualRmsInput, RmsMode, RmsOptions},
     weights::WeightCatalog,
 };
-/// Default prefill chunk ceiling, in rows. The prep and elementwise launches are sized
-/// by the admitted chunk, not by the live rows, so the per-step cost grows with it:
-/// measured on box3 at 1021 live rows, chunk 32768 against 2048 added about +117 ms per
-/// prefill (q38_norm l2_heads +54.3, gdn_prep_fp32 +34.3, q38_gate silu +17.9, tcmqa
-/// qg_split +5.7, others +4.7), and the 1021-token end-to-end leg ran 653.5 ms against
-/// main's 612.2 ms while the P1 core itself was 23.7 ms FASTER per prefill. An explicit
-/// `--chunk` is not clamped. Sizing those launches by live rows is a separate change.
+/// Default prefill chunk ceiling in rows; an explicit `--chunk` is not clamped.
 const DEFAULT_CHUNK_ROWS: usize = 2048;
 
 use crate::gdn_plan::GdnPolicy;
