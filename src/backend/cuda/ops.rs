@@ -165,6 +165,49 @@ pub(crate) struct GatedRmsInput {
     pub gate: Tensor<bf16, 3>,
 }
 
+pub(crate) struct ResidualRmsInput<'a> {
+    pub x: &'a mut TensorMut<bf16, 3>,
+    pub residual: Tensor<bf16, 3>,
+    pub weight: Tensor<bf16, 1>,
+}
+
+fn norm_slices_per_block(
+    row_capacity: u32,
+    x: &Tensor<bf16, 3>,
+    wp: u64,
+    zp: u64,
+    zs: [u64; 3],
+    y: &Tensor<bf16, 3>,
+    mode: i32,
+) -> u32 {
+    let heads = x.shape[1];
+    let width = x.shape[2];
+    if x.stride[2] != 1 || y.stride[2] != 1 || (mode >= 3 && zs[2] != 1) {
+        return 1;
+    }
+    let ptrs = x.ptr | y.ptr | wp | if mode >= 3 { zp } else { 0 };
+    let strides = x.stride[0]
+        | x.stride[1]
+        | y.stride[0]
+        | y.stride[1]
+        | if mode >= 3 { zs[0] | zs[1] } else { 0 };
+    if width == 128 && (ptrs & 7) == 0 && (strides & 3) == 0 {
+        return 8;
+    }
+    if width == 256 && (ptrs & 15) == 0 && (strides & 7) == 0 {
+        return 8;
+    }
+    if width == 5120
+        && heads == 1
+        && row_capacity > 16
+        && (ptrs & 7) == 0
+        && ((x.stride[0] | y.stride[0] | if mode >= 3 { zs[0] } else { 0 }) & 3) == 0
+    {
+        return 4;
+    }
+    1
+}
+
 impl NormOps {
     pub fn rms_with(
         &self,
@@ -183,6 +226,40 @@ impl NormOps {
                 x,
                 weight: Some(weight),
                 z: None,
+                y,
+                mode: Some(mode),
+                eps,
+            },
+        )
+    }
+    pub fn rms_add_with(
+        &self,
+        stream: &Arc<CudaStream>,
+        rows: RowDomain,
+        input: ResidualRmsInput<'_>,
+        y: &mut TensorMut<bf16, 3>,
+        options: RmsOptions,
+    ) -> Result<()> {
+        let ResidualRmsInput {
+            x,
+            residual: z,
+            weight,
+        } = input;
+        let RmsOptions { mode, eps } = options;
+        ensure!(
+            matches!(mode, RmsMode::ZeroCentered),
+            "residual norm requires zero-centered RMS semantics"
+        );
+        no_overlap(&x.0, &y.0)?;
+        no_overlap(&z, &x.0)?;
+        no_overlap(&weight, &x.0)?;
+        self.launch(
+            stream,
+            NormLaunch {
+                rows,
+                x: x.0,
+                weight: Some(weight),
+                z: Some(z),
                 y,
                 mode: Some(mode),
                 eps,
@@ -244,6 +321,7 @@ impl NormOps {
         } = call;
         let mode = match (mode, z.is_some()) {
             (Some(RmsMode::Standard), true) => 3,
+            (Some(RmsMode::ZeroCentered), true) => 4,
             (Some(mode), false) => mode as i32,
             (None, false) => 2,
             _ => anyhow::bail!("gated norm requires standard RMS semantics"),
@@ -263,16 +341,24 @@ impl NormOps {
         let (zp, zs) = if let Some(z) = z {
             z.validate()?;
             ensure!(z.shape == x.shape, "norm gate shape mismatch");
+            ensure!(
+                z.stride[2] == 1
+                    && z.stride[1] >= u64::from(z.shape[2])
+                    && z.stride[0] >= u64::from(z.shape[1]) * z.stride[1],
+                "overlapping/unsupported tensor strides"
+            );
             no_overlap(&z, &y.0)?;
             (z.ptr, z.stride)
         } else {
             (0, [0; 3])
         };
-        let blocks = rows
+        let slices = rows
             .row_capacity
             .checked_mul(x.shape[1])
             .filter(|&n| n <= i32::MAX as u32)
             .ok_or_else(|| anyhow::anyhow!("norm grid overflow"))?;
+        let spb = norm_slices_per_block(rows.row_capacity, &x, wp, zp, zs, &y.0, mode);
+        let blocks = slices.div_ceil(spb);
         unsafe {
             stream
                 .launch_builder(&self.norm)
@@ -320,6 +406,67 @@ impl GateOps {
         y: &mut TensorMut<bf16, 3>,
     ) -> Result<()> {
         self.launch(stream, rows, x, Some(gate), y)
+    }
+    pub fn swiglu(
+        &self,
+        stream: &Arc<CudaStream>,
+        rows: RowDomain,
+        x: Tensor<bf16, 3>,
+        up: Tensor<bf16, 3>,
+        y: &mut TensorMut<bf16, 3>,
+    ) -> Result<()> {
+        validate_io(&x, &y.0, rows)?;
+        up.validate()?;
+        ensure!(up.shape == x.shape, "SwiGLU shape mismatch");
+        no_overlap(&x, &up)?;
+        no_overlap(&up, &y.0)?;
+        let width = x.shape[2];
+        ensure!(
+            x.shape[1] == 1
+                && width.is_multiple_of(8)
+                && x.stride == [u64::from(width), u64::from(width), 1]
+                && up.stride == x.stride
+                && y.0.stride == x.stride,
+            "SwiGLU requires aligned contiguous rows"
+        );
+        ensure!(
+            x.ptr.is_multiple_of(16) && up.ptr.is_multiple_of(16) && y.0.ptr.is_multiple_of(16),
+            "SwiGLU tensors must be 16-byte aligned"
+        );
+        let vectors = width / 8;
+        let blocks = vectors.div_ceil(256);
+        ensure!(
+            blocks <= i32::MAX as u32 && rows.row_capacity <= u16::MAX as u32,
+            "SwiGLU grid outside CUDA limits"
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.gate)
+                .arg(&x.ptr)
+                .arg(&up.ptr)
+                .arg(&y.0.ptr)
+                .arg(&rows.meta.ptr)
+                .arg(&rows.row_base)
+                .arg(&rows.row_capacity)
+                .arg(&x.shape[1])
+                .arg(&width)
+                .arg(&x.stride[0])
+                .arg(&x.stride[1])
+                .arg(&x.stride[2])
+                .arg(&up.stride[0])
+                .arg(&up.stride[1])
+                .arg(&up.stride[2])
+                .arg(&y.0.stride[0])
+                .arg(&y.0.stride[1])
+                .arg(&y.0.stride[2])
+                .arg(&2i32)
+                .launch(LaunchConfig {
+                    grid_dim: (blocks, rows.row_capacity, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
     }
     fn launch(
         &self,

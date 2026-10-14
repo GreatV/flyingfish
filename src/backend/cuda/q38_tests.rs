@@ -4,15 +4,19 @@ use super::{
     blas::Blas,
     closure::Closure,
     contracts::{RowDomain, SeqRef, Tensor, TensorMut},
+    cubin,
     linear::{Fp8Ops, LinearWeightRef},
-    ops::{CommonOpsRef, GatedRmsInput, GdnGateBindings, Ops, RmsMode, RmsOptions},
+    ops::{
+        CommonOpsRef, GatedRmsInput, GdnGateBindings, Ops, ResidualRmsInput, RmsMode, RmsOptions,
+        grid,
+    },
 };
 use crate::{
     fp8::effective_weight,
     op_contract::{ExecutionPhase, SequenceMeta},
 };
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg};
 use half::bf16;
 use std::{rc::Rc, sync::Arc};
 
@@ -615,6 +619,64 @@ fn q38_primitives_gpu() -> Result<()> {
         s.clone_dtoh(&y)?.iter().all(|v| v.to_f32() == 0.0),
         "SiLU zero mismatch"
     );
+    for width in [128u32, 17_408] {
+        let count = 3 * width as usize;
+        let swiglu_gate = (0..count)
+            .map(|i| bf16::from_f32(((i % 17) as f32) * 0.125 - 1.0))
+            .collect::<Vec<_>>();
+        let swiglu_up = (0..count)
+            .map(|i| bf16::from_f32(1.0 + ((i % 5) as f32) * 0.25))
+            .collect::<Vec<_>>();
+        let gate_x = s.clone_htod(&swiglu_gate)?;
+        let up_x = s.clone_htod(&swiglu_up)?;
+        let baseline = s.alloc_zeros::<bf16>(count)?;
+        let fused = s.clone_htod(&vec![bf16::from_f32(-17.0); count])?;
+        let gate_view = view(
+            &gate_x,
+            s,
+            [3, 1, width],
+            [u64::from(width), u64::from(width), 1],
+        )?;
+        let up_view = view(&up_x, s, gate_view.shape, gate_view.stride)?;
+        let mut baseline_view = TensorMut(view(&baseline, s, gate_view.shape, gate_view.stride)?);
+        let mut fused_view = TensorMut(view(&fused, s, gate_view.shape, gate_view.stride)?);
+        common.gate.silu(s, rows, gate_view, &mut baseline_view)?;
+        common
+            .gate
+            .swiglu(s, rows, gate_view, up_view, &mut fused_view)?;
+        let activated = s.clone_dtoh(&baseline)?;
+        let multiplied = s.clone_dtoh(&fused)?;
+        ensure!(
+            activated.iter().chain(&multiplied).all(|v| v.is_finite()),
+            "nonfinite SwiGLU component output"
+        );
+        let mismatches = (0..2 * width as usize)
+            .filter(|&i| {
+                multiplied[i].to_bits()
+                    != bf16::from_f32(activated[i].to_f32() * swiglu_up[i].to_f32()).to_bits()
+            })
+            .count();
+        let inactive = multiplied[2 * width as usize..]
+            .iter()
+            .filter(|v| v.to_bits() != bf16::from_f32(-17.0).to_bits())
+            .count();
+        eprintln!(
+            "Q38_SWIGLU width={width} finite=true active_mismatches={mismatches} inactive_mismatches={inactive}"
+        );
+        for i in 0..2 * width as usize {
+            let want = bf16::from_f32(activated[i].to_f32() * swiglu_up[i].to_f32());
+            ensure!(
+                multiplied[i].to_bits() == want.to_bits(),
+                "fused SwiGLU bit mismatch at {i}"
+            );
+        }
+        ensure!(
+            multiplied[2 * width as usize..]
+                .iter()
+                .all(|v| v.to_bits() == bf16::from_f32(-17.0).to_bits()),
+            "inactive fused SwiGLU row was written"
+        );
+    }
     let a = s.alloc_zeros::<bf16>(3 * 48)?;
     let log = s.alloc_zeros::<bf16>(48)?;
     let beta = s.alloc_zeros::<bf16>(3 * 48)?;
@@ -1241,5 +1303,803 @@ fn vision_opref_diagnostics(
             );
         }
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NormCase {
+    valid_rows: u32,
+    row_capacity: u32,
+    heads: u32,
+    width: u32,
+    mode: i32,
+    row_pad: u32,
+    head_pad: u32,
+}
+
+fn next_u64(state: &mut u64) -> u64 {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    state.wrapping_mul(0x2545f4914f6cdd1d)
+}
+
+fn next_f32_unit(state: &mut u64) -> f32 {
+    ((next_u64(state) >> 40) as f32) * (1.0 / 16777216.0)
+}
+
+fn build_norm_fixture(case: NormCase, order_sensitive: bool) -> (Vec<bf16>, Vec<bf16>, Vec<bf16>) {
+    let hs = (case.width + case.head_pad) as usize;
+    let rs = (case.heads as usize) * hs + (case.row_pad as usize);
+    let total = (case.row_capacity as usize) * rs;
+    let w_len = case.width as usize;
+    if !order_sensitive {
+        let x = (0..total)
+            .map(|i| {
+                bf16::from_f32(
+                    (((i % 131) as f32) - 65.0) * 0.03125
+                        + (((i % 257) as f32) - 128.0) * 0.0078125,
+                )
+            })
+            .collect();
+        let z = (0..total)
+            .map(|i| bf16::from_f32((((i % 137) as f32) - 68.0) * 0.0234375))
+            .collect();
+        let w = (0..w_len)
+            .map(|d| bf16::from_f32((((d % 139) as f32) - 69.0) * 0.015625))
+            .collect();
+        return (x, w, z);
+    }
+    let mut seed = u64::from(case.width).wrapping_mul(0x9e3779b97f4a7c15) ^ 0xd1b54a32d192ed03;
+    let sample_spread = |s: &mut u64, idx: usize| -> bf16 {
+        let col = idx % w_len;
+        if (idx / w_len).is_multiple_of(2) {
+            if col == 0 || col == 64 {
+                return bf16::from_f32(64.0);
+            }
+            let jitter = 0.9375f32 + 0.125f32 * next_f32_unit(s);
+            return bf16::from_f32(0.022097087f32 * jitter);
+        }
+        let mut g = -3.0f32;
+        for _ in 0..6 {
+            g += next_f32_unit(s);
+        }
+        let exp_u = -8.0f32 + 16.0f32 * next_f32_unit(s);
+        bf16::from_f32(g * exp_u.exp2())
+    };
+    let x = (0..total).map(|i| sample_spread(&mut seed, i)).collect();
+    let z = (0..total)
+        .map(|i| bf16::from_f32(0.5 + 0.5 * next_f32_unit(&mut seed) + ((i % 7) as f32) * 0.03125))
+        .collect();
+    let w = (0..w_len)
+        .map(|d| bf16::from_f32(0.75 + 0.5 * next_f32_unit(&mut seed) + ((d % 5) as f32) * 0.0625))
+        .collect();
+    (x, w, z)
+}
+
+struct BaselineNormArgs<'a> {
+    rows: RowDomain,
+    x: Tensor<bf16, 3>,
+    wp: u64,
+    zp: u64,
+    zs: [u64; 3],
+    y: &'a mut TensorMut<bf16, 3>,
+    mode: i32,
+    eps: f32,
+}
+
+fn launch_baseline_norm(
+    func: &CudaFunction,
+    s: &Arc<CudaStream>,
+    args: BaselineNormArgs<'_>,
+) -> Result<()> {
+    let blocks = args.rows.row_capacity * args.x.shape[1];
+    unsafe {
+        s.launch_builder(func)
+            .arg(&args.x.ptr)
+            .arg(&args.wp)
+            .arg(&args.zp)
+            .arg(&args.y.0.ptr)
+            .arg(&args.rows.meta.ptr)
+            .arg(&args.rows.row_base)
+            .arg(&args.rows.row_capacity)
+            .arg(&args.x.shape[1])
+            .arg(&args.x.shape[2])
+            .arg(&args.x.stride[0])
+            .arg(&args.x.stride[1])
+            .arg(&args.x.stride[2])
+            .arg(&args.y.0.stride[0])
+            .arg(&args.y.0.stride[1])
+            .arg(&args.y.0.stride[2])
+            .arg(&args.zs[0])
+            .arg(&args.zs[1])
+            .arg(&args.zs[2])
+            .arg(&args.mode)
+            .arg(&args.eps)
+            .launch(grid(blocks as usize, 256))?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted and FF_Q38_NORM_ORACLE_DIR"]
+fn q38_norm_stage_ab_gpu() -> Result<()> {
+    let oracle_dir = std::path::PathBuf::from(
+        std::env::var_os("FF_Q38_NORM_ORACLE_DIR").context("FF_Q38_NORM_ORACLE_DIR is required")?,
+    );
+    ensure!(oracle_dir.is_dir(), "norm oracle directory is missing");
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let d = Device::new(0)?;
+    let ops = Ops::new(&d.ctx)?;
+    let common = CommonOpsRef::new(&d.ctx)?;
+    let s = &d.stream;
+    let sm = cubin::capability(&d.ctx)?;
+    let baseline = oracle_dir.join(format!("norm-baseline-sm{sm}.cubin"));
+    let base_mod = d.ctx.load_module(cudarc::nvrtc::Ptx::from_binary(
+        std::fs::read(&baseline)
+            .with_context(|| format!("norm baseline missing: {}", baseline.display()))?,
+    ))?;
+    let base_norm = base_mod.load_function("q38_norm_baseline_4bf2cfc")?;
+    let mutant_norm = base_mod.load_function("q38_norm_mutant_tree128")?;
+    let eps = 1e-6f32;
+    let sentinel = bf16::from_f32(-17.0);
+    let cases = [
+        NormCase {
+            valid_rows: 1,
+            row_capacity: 1,
+            heads: 1,
+            width: 5120,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 3,
+            row_capacity: 4,
+            heads: 1,
+            width: 5120,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 16,
+            row_capacity: 16,
+            heads: 1,
+            width: 5120,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 17,
+            row_capacity: 19,
+            heads: 1,
+            width: 5120,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 2038,
+            row_capacity: 2048,
+            heads: 1,
+            width: 5120,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 1,
+            row_capacity: 1,
+            heads: 1,
+            width: 5120,
+            mode: 4,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 3,
+            row_capacity: 4,
+            heads: 1,
+            width: 5120,
+            mode: 4,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 16,
+            row_capacity: 16,
+            heads: 1,
+            width: 5120,
+            mode: 4,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 17,
+            row_capacity: 19,
+            heads: 1,
+            width: 5120,
+            mode: 4,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 2038,
+            row_capacity: 2048,
+            heads: 1,
+            width: 5120,
+            mode: 4,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 1,
+            row_capacity: 1,
+            heads: 16,
+            width: 256,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 3,
+            row_capacity: 4,
+            heads: 16,
+            width: 256,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 17,
+            row_capacity: 19,
+            heads: 16,
+            width: 256,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 2038,
+            row_capacity: 2048,
+            heads: 16,
+            width: 256,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 1,
+            row_capacity: 1,
+            heads: 24,
+            width: 256,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 3,
+            row_capacity: 4,
+            heads: 24,
+            width: 256,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 2038,
+            row_capacity: 2048,
+            heads: 24,
+            width: 256,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 1,
+            row_capacity: 1,
+            heads: 4,
+            width: 256,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 3,
+            row_capacity: 4,
+            heads: 4,
+            width: 256,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 17,
+            row_capacity: 19,
+            heads: 4,
+            width: 256,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 1,
+            row_capacity: 1,
+            heads: 48,
+            width: 128,
+            mode: 3,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 3,
+            row_capacity: 4,
+            heads: 48,
+            width: 128,
+            mode: 3,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 17,
+            row_capacity: 19,
+            heads: 48,
+            width: 128,
+            mode: 3,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 2038,
+            row_capacity: 2048,
+            heads: 48,
+            width: 128,
+            mode: 3,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 1,
+            row_capacity: 1,
+            heads: 16,
+            width: 128,
+            mode: 2,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 3,
+            row_capacity: 4,
+            heads: 16,
+            width: 128,
+            mode: 2,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 17,
+            row_capacity: 19,
+            heads: 16,
+            width: 128,
+            mode: 2,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 2038,
+            row_capacity: 2048,
+            heads: 16,
+            width: 128,
+            mode: 2,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 2,
+            row_capacity: 3,
+            heads: 3,
+            width: 128,
+            mode: 0,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 2,
+            row_capacity: 3,
+            heads: 2,
+            width: 130,
+            mode: 1,
+            row_pad: 0,
+            head_pad: 0,
+        },
+        NormCase {
+            valid_rows: 2,
+            row_capacity: 3,
+            heads: 2,
+            width: 128,
+            mode: 1,
+            row_pad: 2,
+            head_pad: 2,
+        },
+    ];
+    let mut cases = cases.to_vec();
+    for (heads, width, mode) in [
+        (1, 5120, 1),
+        (1, 5120, 4),
+        (16, 256, 1),
+        (24, 256, 1),
+        (4, 256, 1),
+        (48, 128, 3),
+        (16, 128, 2),
+    ] {
+        for rows in [4, 2048] {
+            cases.push(NormCase {
+                valid_rows: rows,
+                row_capacity: rows,
+                heads,
+                width,
+                mode,
+                row_pad: 0,
+                head_pad: 0,
+            });
+        }
+    }
+    let mut executed_cases = 0;
+    let mut defects = 0;
+    for order_sensitive in [false, true] {
+        for mut case in cases.iter().copied() {
+            if case.mode == 2 {
+                case.row_pad = 8192;
+            }
+            let variants: &[(usize, bool)] = if case.mode == 2 {
+                &[(0, false), (2048, false)]
+            } else if case.mode == 3 || (case.mode == 1 && case.heads == 24) {
+                &[(0, false), (0, true)]
+            } else {
+                &[(0, false)]
+            };
+            for &(input_offset, in_place) in variants {
+                for graph in [false, true] {
+                    let (mut x_host, w_host, mut z_host) =
+                        build_norm_fixture(case, order_sensitive);
+                    let head_stride = (case.width + case.head_pad) as usize;
+                    let row_stride = case.heads as usize * head_stride + case.row_pad as usize;
+                    for index in 0..x_host.len() {
+                        let row = index / row_stride;
+                        let offset = (index % row_stride).checked_sub(input_offset);
+                        let active = row < case.valid_rows as usize
+                            && offset.is_some_and(|v| {
+                                v < case.heads as usize * head_stride
+                                    && v % head_stride < case.width as usize
+                            });
+                        if !active {
+                            x_host[index] = bf16::NAN;
+                            z_host[index] = bf16::NAN;
+                        }
+                    }
+                    let hs = u64::from(case.width + case.head_pad);
+                    let rs = u64::from(case.heads) * hs + u64::from(case.row_pad);
+                    let shape = [case.row_capacity, case.heads, case.width];
+                    let stride = [rs, hs, 1];
+                    let output_stride = if case.mode == 2 {
+                        [u64::from(case.heads * case.width), u64::from(case.width), 1]
+                    } else {
+                        stride
+                    };
+                    let output_len = (u64::from(case.row_capacity) * output_stride[0]) as usize;
+                    let (_meta_buf, mref) =
+                        meta(s, 0, case.valid_rows as i32, case.row_capacity as i32)?;
+                    let rows = RowDomain {
+                        meta: mref,
+                        row_base: 0,
+                        row_capacity: case.row_capacity,
+                    };
+                    let mut xb_base = s.clone_htod(&x_host)?;
+                    let xb_cand = s.clone_htod(&x_host)?;
+                    let wb = s.clone_htod(&w_host)?;
+                    let zb = s.clone_htod(&z_host)?;
+                    let yb_base = s.clone_htod(&vec![sentinel; output_len])?;
+                    let yb_cand = s.clone_htod(&vec![sentinel; output_len])?;
+                    let wv = view(&wb, s, [case.width], [1])?;
+                    let mut zv = view(&zb, s, shape, stride)?;
+                    zv.ptr += (input_offset * 2) as u64;
+                    zv.span_bytes -= (input_offset * 2) as u64;
+                    zv.validate()?;
+                    if case.mode == 4 {
+                        let active_elems = (case.valid_rows * case.heads * case.width) as i32;
+                        unsafe {
+                            s.launch_builder(&ops.residual)
+                                .arg(&mut xb_base)
+                                .arg(&zb)
+                                .arg(&active_elems)
+                                .launch(super::ops::flat(active_elems as usize))?;
+                        }
+                    }
+                    let mut xv_base = view(&xb_base, s, shape, stride)?;
+                    let mut xv_cand = view(&xb_cand, s, shape, stride)?;
+                    for x in [&mut xv_base, &mut xv_cand] {
+                        x.ptr += (input_offset * 2) as u64;
+                        x.span_bytes -= (input_offset * 2) as u64;
+                        x.validate()?;
+                    }
+                    let mut yv_base = TensorMut(if in_place {
+                        xv_base
+                    } else {
+                        view(&yb_base, s, shape, output_stride)?
+                    });
+                    launch_baseline_norm(
+                        &base_norm,
+                        s,
+                        BaselineNormArgs {
+                            rows,
+                            x: xv_base,
+                            wp: if case.mode == 2 { 0 } else { wv.ptr },
+                            zp: if case.mode == 3 { zv.ptr } else { 0 },
+                            zs: if case.mode == 3 { zv.stride } else { [0; 3] },
+                            y: &mut yv_base,
+                            mode: if case.mode == 4 { 1 } else { case.mode },
+                            eps,
+                        },
+                    )?;
+                    let mut yv_cand = TensorMut(if in_place {
+                        xv_cand
+                    } else {
+                        view(&yb_cand, s, shape, output_stride)?
+                    });
+                    if graph {
+                        s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    }
+                    match case.mode {
+                        0 => common.norm.rms_with(
+                            s,
+                            rows,
+                            xv_cand,
+                            wv,
+                            &mut yv_cand,
+                            RmsOptions {
+                                mode: RmsMode::Standard,
+                                eps,
+                            },
+                        )?,
+                        1 => common.norm.rms_with(
+                            s,
+                            rows,
+                            xv_cand,
+                            wv,
+                            &mut yv_cand,
+                            RmsOptions {
+                                mode: RmsMode::ZeroCentered,
+                                eps,
+                            },
+                        )?,
+                        2 => common.norm.l2_heads(s, rows, xv_cand, &mut yv_cand, eps)?,
+                        3 => common.norm.rms_gated(
+                            s,
+                            rows,
+                            GatedRmsInput {
+                                x: xv_cand,
+                                weight: wv,
+                                gate: zv,
+                            },
+                            &mut yv_cand,
+                            eps,
+                        )?,
+                        4 => {
+                            let mut xv_cand = TensorMut(xv_cand);
+                            common.norm.rms_add_with(
+                                s,
+                                rows,
+                                ResidualRmsInput {
+                                    x: &mut xv_cand,
+                                    residual: zv,
+                                    weight: wv,
+                                },
+                                &mut yv_cand,
+                                RmsOptions {
+                                    mode: RmsMode::ZeroCentered,
+                                    eps,
+                                },
+                            )?;
+                        }
+                        _ => unreachable!(),
+                    }
+                    if graph {
+                        s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                            .context("norm capture returned no graph")?
+                            .launch()?;
+                    }
+                    let got_y_base = s.clone_dtoh(if in_place { &xb_base } else { &yb_base })?;
+                    let got_y_cand = s.clone_dtoh(if in_place { &xb_cand } else { &yb_cand })?;
+                    for row in 0..case.valid_rows {
+                        for head in 0..case.heads {
+                            for col in 0..case.width {
+                                let index = (u64::from(row) * output_stride[0]
+                                    + u64::from(head) * output_stride[1]
+                                    + u64::from(col))
+                                    as usize;
+                                ensure!(
+                                    got_y_base[index].is_finite() && got_y_cand[index].is_finite(),
+                                    "non-finite norm output on {case:?} index={index}"
+                                );
+                            }
+                        }
+                    }
+                    if !got_y_base
+                        .iter()
+                        .zip(&got_y_cand)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                    {
+                        defects += 1;
+                        eprintln!(
+                            "Q38_NORM_DEFECT y {case:?} order_sensitive={order_sensitive} graph={graph} input_offset={input_offset} in_place={in_place}"
+                        );
+                    }
+                    executed_cases += 1;
+                    if case.mode == 4 {
+                        let got_x_base = s.clone_dtoh(&xb_base)?;
+                        let got_x_cand = s.clone_dtoh(&xb_cand)?;
+                        if !got_x_base
+                            .iter()
+                            .zip(&got_x_cand)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                        {
+                            defects += 1;
+                            eprintln!(
+                                "Q38_NORM_DEFECT x {case:?} order_sensitive={order_sensitive} graph={graph} input_offset={input_offset} in_place={in_place}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let witness_raw = std::fs::read(oracle_dir.join("norm-order-sensitive.bf16"))?;
+    ensure!(
+        witness_raw.len() == 3 * 64 * 128 * 2,
+        "norm witness extent mismatch"
+    );
+    let witnesses: Vec<_> = witness_raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|v| bf16::from_bits(u16::from_le_bytes(*v)))
+        .collect();
+    ensure!(
+        witnesses.iter().all(|v| v.is_finite() && *v != bf16::ZERO),
+        "norm witness values invalid"
+    );
+    for (group, (heads, width, mode)) in [(48u32, 128u32, 3i32), (16, 256, 1), (1, 5120, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        let case = NormCase {
+            valid_rows: 64,
+            row_capacity: 64,
+            heads,
+            width,
+            mode,
+            row_pad: 0,
+            head_pad: 0,
+        };
+        let mut x_host = vec![bf16::ZERO; (case.row_capacity * heads * width) as usize];
+        for slice in 0..(case.row_capacity * heads) as usize {
+            let source = (group * 64 + slice % 64) * 128;
+            let target = slice * width as usize;
+            x_host[target..target + 128].copy_from_slice(&witnesses[source..source + 128]);
+        }
+        let w_host = vec![bf16::ONE; width as usize];
+        let z_host = vec![bf16::from_f32(32.0); x_host.len()];
+        let shape = [case.row_capacity, case.heads, case.width];
+        let stride = [u64::from(case.heads * case.width), u64::from(case.width), 1];
+        let (_meta_buf, mref) = meta(s, 0, case.valid_rows as i32, case.row_capacity as i32)?;
+        let rows = RowDomain {
+            meta: mref,
+            row_base: 0,
+            row_capacity: case.row_capacity,
+        };
+        let xb = s.clone_htod(&x_host)?;
+        let wb = s.clone_htod(&w_host)?;
+        let zb = s.clone_htod(&z_host)?;
+        let yb_base = s.clone_htod(&vec![sentinel; x_host.len()])?;
+        let yb_mut = s.clone_htod(&vec![sentinel; x_host.len()])?;
+        let yb_cand = s.clone_htod(&vec![sentinel; x_host.len()])?;
+        let xv = view(&xb, s, shape, stride)?;
+        let wv = view(&wb, s, [case.width], [1])?;
+        let zv = view(&zb, s, shape, stride)?;
+        let mut yv_base = TensorMut(view(&yb_base, s, shape, stride)?);
+        let mut yv_mut = TensorMut(view(&yb_mut, s, shape, stride)?);
+        let mut yv_cand = TensorMut(view(&yb_cand, s, shape, stride)?);
+        launch_baseline_norm(
+            &base_norm,
+            s,
+            BaselineNormArgs {
+                rows,
+                x: xv,
+                wp: wv.ptr,
+                zp: if mode == 3 { zv.ptr } else { 0 },
+                zs: if mode == 3 { zv.stride } else { [0; 3] },
+                y: &mut yv_base,
+                mode,
+                eps,
+            },
+        )?;
+        launch_baseline_norm(
+            &mutant_norm,
+            s,
+            BaselineNormArgs {
+                rows,
+                x: xv,
+                wp: wv.ptr,
+                zp: if mode == 3 { zv.ptr } else { 0 },
+                zs: if mode == 3 { zv.stride } else { [0; 3] },
+                y: &mut yv_mut,
+                mode,
+                eps,
+            },
+        )?;
+        if mode == 3 {
+            common.norm.rms_gated(
+                s,
+                rows,
+                GatedRmsInput {
+                    x: xv,
+                    weight: wv,
+                    gate: zv,
+                },
+                &mut yv_cand,
+                eps,
+            )?;
+        } else {
+            common.norm.rms_with(
+                s,
+                rows,
+                xv,
+                wv,
+                &mut yv_cand,
+                RmsOptions {
+                    mode: RmsMode::ZeroCentered,
+                    eps,
+                },
+            )?;
+        }
+        let got_base = s.clone_dtoh(&yb_base)?;
+        let got_cand = s.clone_dtoh(&yb_cand)?;
+        ensure!(
+            got_base.iter().chain(&got_cand).all(|v| v.is_finite()),
+            "non-finite norm witness output width={width}"
+        );
+        if !got_base
+            .iter()
+            .zip(&got_cand)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+        {
+            defects += 1;
+            eprintln!("Q38_NORM_DEFECT witness width={width}");
+        }
+        let got_mut = s.clone_dtoh(&yb_mut)?;
+        let mismatches = got_base
+            .iter()
+            .zip(&got_mut)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        ensure!(
+            mismatches > 0,
+            "planted tree128 mutant was not detected for width={width}"
+        );
+        eprintln!(
+            "Q38_NORM_MUTANT_CHECK width={width} heads={heads} mode={mode} mismatches={mismatches} PASS"
+        );
+    }
+    eprintln!(
+        "Q38_NORM_STAGE_AB cases={} gpu_vs_gpu={} graph_eager=EXECUTED inactive_NaN=CHECKED mutant_detected=PASS defects={defects}",
+        executed_cases,
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "norm candidate has {defects} defects");
     Ok(())
 }

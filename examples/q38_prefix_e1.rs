@@ -230,11 +230,23 @@ fn main() -> Result<()> {
             "decoded boundary pending token changed before save completed"
         );
         let decoded_boundary_logits = engine.decode_logits()?;
+        ensure!(
+            decoded_boundary_logits.iter().all(|v| v.is_finite()),
+            "E1 nonfinite logits at decoded_boundary_logits"
+        );
         engine.step(true)?;
         let baseline_pending_token = engine.token()?;
         let baseline_pending_logits = engine.decode_logits()?;
+        ensure!(
+            baseline_pending_logits.iter().all(|v| v.is_finite()),
+            "E1 nonfinite logits at baseline_pending_logits"
+        );
         let baseline_token = engine.prefill(&suffix, None)?;
         let baseline_logits = engine.decode_logits()?;
+        ensure!(
+            baseline_logits.iter().all(|v| v.is_finite()),
+            "E1 nonfinite logits at baseline_logits"
+        );
         engine.poison_state_for_prefix_e1()?;
         let restore = engine.restore_text_prefix(
             &decoded_saved.snapshot,
@@ -276,6 +288,10 @@ fn main() -> Result<()> {
         let restored_pending_token = engine.token()?;
         let restored_pending_logits = engine.decode_logits()?;
         ensure!(
+            restored_pending_logits.iter().all(|v| v.is_finite()),
+            "E1 nonfinite logits at restored_pending_logits"
+        );
+        ensure!(
             baseline_pending_token == restored_pending_token,
             "restored pending next token differs"
         );
@@ -288,6 +304,10 @@ fn main() -> Result<()> {
         );
         let restored_token = engine.prefill(&suffix, None)?;
         let restored_logits = engine.decode_logits()?;
+        ensure!(
+            restored_logits.iter().all(|v| v.is_finite()),
+            "E1 nonfinite logits at restored_logits"
+        );
         ensure!(
             baseline_token == restored_token,
             "restored suffix token differs: {baseline_token} != {restored_token}"
@@ -358,6 +378,7 @@ fn main() -> Result<()> {
             "baseline_logits_sha256": sha256_bytemuck(&baseline_logits),
             "restored_logits_sha256": sha256_bytemuck(&restored_logits),
             "logits_bit_equal": true,
+            "finite_logits": true,
             "package_dir": args.package_dir,
         });
         let manifest_sha256 = if let Some(package) = &args.package_dir {
