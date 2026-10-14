@@ -245,10 +245,77 @@ struct TimingArgs {
     #[arg(long, value_enum, default_value = "stub")]
     clock: Clock,
     /// Fixture for the timing legs (one configuration's worth of work).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "rows")]
     case: Option<String>,
+    /// Synthesise a single-step case of N live rows instead of reading a fixture.
+    /// Deterministic from N alone, so two builds synthesise the same bytes.
+    #[arg(long, conflicts_with = "case")]
+    rows: Option<usize>,
     #[arg(long)]
     simulate_box3: bool,
+}
+
+/// splitmix64 over a per-(array, index) key: the same N yields the same bytes on every
+/// run and on every build, so a curve measured with synthesised rows is comparable
+/// across arms. Values are centred and scaled to keep the core's arithmetic in the same
+/// regime as the frozen fixtures.
+fn synth(rows: usize, array: u64, n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    let mut key =
+        0x9E37_79B9_7F4A_7C15u64 ^ (array.wrapping_mul(0xD1B5_4A32_D192_ED03) ^ rows as u64);
+    for _ in 0..n {
+        key = key.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = key;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // (0,1) scaled to about +/-1, the frozen fixtures' regime.
+        let unit = ((z >> 40) as f32 / 8_388_608.0) - 1.0;
+        out.push(unit);
+    }
+    out
+}
+
+/// A single-step case of `rows` live rows, shaped like a manifest fixture so the
+/// existing launch path serves it unchanged.
+fn synth_case(rows: usize) -> (Fixture, CaseArrays) {
+    const HEADS: usize = 48;
+    const DK: usize = 128;
+    const DV: usize = 128;
+    let name = format!("synth{rows}");
+    let rec = |shape: Vec<usize>| ArrayRec {
+        path: String::new(),
+        sha256: String::new(),
+        dtype: "f32".into(),
+        shape,
+    };
+    let arrays = CaseArrays {
+        q: synth(rows, 1, rows * HEADS * DK),
+        k: synth(rows, 2, rows * HEADS * DK),
+        v: synth(rows, 3, rows * HEADS * DV),
+        beta: synth(rows, 4, rows * HEADS),
+        g: synth(rows, 5, rows * HEADS),
+        s0: synth(rows, 6, HEADS * DK * DV),
+    };
+    let mut map = BTreeMap::new();
+    map.insert("q".to_string(), rec(vec![rows, HEADS, DK]));
+    map.insert("k".to_string(), rec(vec![rows, HEADS, DK]));
+    map.insert("v".to_string(), rec(vec![rows, HEADS, DV]));
+    map.insert("beta".to_string(), rec(vec![rows, HEADS]));
+    map.insert("g".to_string(), rec(vec![rows, HEADS]));
+    map.insert("S0".to_string(), rec(vec![HEADS, DK, DV]));
+    (
+        Fixture {
+            name,
+            kind: "synthesised single step".into(),
+            m: rows,
+            prefix: 0,
+            seed: Some(rows as i64),
+            arrays: map,
+            note: format!("{rows} synthesised rows; splitmix64 keyed by rows and array"),
+        },
+        arrays,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,14 +1428,18 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
         !pkg.manifest.fixtures.is_empty(),
         "manifest lists no fixtures"
     );
-    let fx = match &args.case {
-        Some(name) => pkg
-            .manifest
-            .fixtures
-            .iter()
-            .find(|f| f.name == *name)
-            .with_context(|| format!("fixture {name} is not in the manifest"))?,
-        None => &pkg.manifest.fixtures[0],
+    let synth_owned = args.rows.map(synth_case);
+    let fx: &Fixture = match synth_owned.as_ref() {
+        Some((fx, _)) => fx,
+        None => match &args.case {
+            Some(name) => pkg
+                .manifest
+                .fixtures
+                .iter()
+                .find(|f| f.name == *name)
+                .with_context(|| format!("fixture {name} is not in the manifest"))?,
+            None => &pkg.manifest.fixtures[0],
+        },
     };
     std::fs::create_dir_all(&args.run_dir)
         .with_context(|| format!("create {}", args.run_dir.display()))?;
@@ -1390,7 +1461,17 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
 
     // Load the inputs once; every leg restores S from S0 so a leg's decay work is
     // the same as the first call's.
-    let arrays = CaseArrays::new(&pkg.root, fx)?;
+    let arrays = match synth_owned.as_ref() {
+        Some((_, a)) => CaseArrays {
+            q: a.q.clone(),
+            k: a.k.clone(),
+            v: a.v.clone(),
+            beta: a.beta.clone(),
+            g: a.g.clone(),
+            s0: a.s0.clone(),
+        },
+        None => CaseArrays::new(&pkg.root, fx)?,
+    };
 
     let device_touched = gpu.is_some();
     let device = device_of(gpu.as_ref());
