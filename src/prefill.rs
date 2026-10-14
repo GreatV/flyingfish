@@ -250,11 +250,11 @@ mod default_chunk_tests {
             fixed_transient_bytes: 512,
         }
     }
-    fn choose(policy: GdnPolicy, admitted: usize) -> Result<usize> {
-        Ok(policy
-            .buckets(u32::try_from(admitted)?)
-            .last()
-            .map_or(admitted, |&r| r as usize))
+    /// The landed default-chunk policy: the admitted chunk is used as admitted. The
+    /// former clamp to the last scan bucket is gone with the scan buckets, so the
+    /// policy argument is no longer consulted.
+    fn choose(_policy: GdnPolicy, admitted: usize) -> Result<usize> {
+        Ok(admitted)
     }
     #[test]
     fn qualified_defaults_retain_capacity_and_exact_budget() -> Result<()> {

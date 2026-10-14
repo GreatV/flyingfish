@@ -56,7 +56,7 @@ pub(crate) fn take_phase_log() -> Vec<&'static str> {
 use super::contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut};
 use super::cubin;
 use super::ops::{CommonOpsRef, GdnGateBindings};
-use crate::gdn_plan::{GdnPolicy, GdnWorkspace, Region, ScanWorkspace, add, cw_p1, mul, shared};
+use crate::gdn_plan::{GdnPolicy, GdnWorkspace, Region, add, cw_p1, mul};
 use crate::op_contract::{ExecutionPhase, GdnSpec, WorkspaceReq};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
@@ -118,17 +118,8 @@ pub(crate) struct GdnBindings {
     pub history: TensorMut<f32, 2>,
 }
 
-struct ScanKernels {
-    guard: CudaFunction,
-    p1: CudaFunction,
-    leaf: CudaFunction,
-    up: CudaFunction,
-    down: CudaFunction,
-    p3: CudaFunction,
-}
 
 struct Kernels {
-    scan: Option<ScanKernels>,
     conv: CudaFunction,
     hist_update: CudaFunction,
     prep: CudaFunction,
@@ -223,10 +214,6 @@ impl GdnPlan {
     /// Setup-only prefix view. Reuse loaded modules and physical addresses.
     pub(crate) fn for_rows(&self, rows: u32) -> Result<Self> {
         ensure!(
-            self.kernels.scan.is_none(),
-            "scan plan cannot narrow to legacy rows"
-        );
-        ensure!(
             rows > 0 && rows <= self.max_rows,
             "GDN rows outside binding"
         );
@@ -264,10 +251,10 @@ impl GdnPlan {
             hist_cfg: self.hist_cfg,
             chunked_cfg: self.chunked_cfg,
             recurrent_cfg: self.recurrent_cfg,
-            // Narrowing can drop a plan into the small or scan-sized range, where the
-            // shipped core stays. 1..=4 is inside that range and also carries the MTP
-            // verify contract (`run_verify` rejects a P1 plan).
-            p1_split: if rows > crate::gdn_plan::SCAN_MAX_ROWS {
+            // Narrowing can drop a plan into the small range, where the shipped core
+            // stays; 1..=4 carries the MTP verify contract (`run_verify` rejects a P1
+            // plan).
+            p1_split: if rows > crate::gdn_plan::MIN_VERIFY_ROWS {
                 self.p1_split
             } else {
                 0
@@ -354,7 +341,6 @@ impl GdnOps {
         max_rows: u32,
         bindings: GdnBindings,
         common: CommonOpsRef,
-        scan: bool,
         p1_split: u32,
     ) -> Result<GdnPlan> {
         spec.validate()?;
@@ -367,18 +353,7 @@ impl GdnOps {
             HK * GQA == HV,
             "GDN GQA {GQA} does not expand {HK} key heads to {HV} value heads"
         );
-        let ws = if scan {
-            use cudarc::driver::sys::CUdevice_attribute as A;
-            let arch = cubin::capability(ctx)?;
-            let sms = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
-            ensure!(
-                GdnPolicy::for_device(arch, sms) != GdnPolicy::LEGACY,
-                "GDN scan requires qualified sm89/128SM"
-            );
-            GdnWorkspace::with_scan(spec, max_rows)?
-        } else {
-            GdnWorkspace::q38(spec, max_rows)?
-        };
+        let ws = GdnWorkspace::q38(spec, max_rows)?;
         // conv_dim is derived in exactly ONE place, then asserted against the
         // constant compiled into the kernel. The formula is not restated here.
         let conv_dim = spec.conv_dim()?;
@@ -428,35 +403,8 @@ impl GdnOps {
             }
         }
 
-        let scan_kernels = if scan {
-            let module = cubin::module(ctx, "gdn/gdn_b")?;
-            let p3 = module.load_function("gdn_b_p3")?;
-            p3.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared::P3_BYTES as i32)?;
-            for bytes in [
-                shared::P1_BYTES,
-                shared::LEAF_BYTES,
-                shared::UP_BYTES,
-                shared::DOWN_BYTES,
-                shared::P3_BYTES,
-            ] {
-                ensure!(
-                    u64::from(bytes) <= optin,
-                    "GDN scan shared memory exceeds opt-in limit"
-                );
-            }
-            Some(ScanKernels {
-                guard: module.load_function("gdn_b_guard")?,
-                p1: module.load_function("gdn_b_p1")?,
-                leaf: module.load_function("gdn_b_leaf")?,
-                up: module.load_function("gdn_b_up")?,
-                down: module.load_function("gdn_b_down")?,
-                p3,
-            })
-        } else {
-            None
-        };
         // Bind before Ready. Unsupported architectures retain their exact core route.
-        let rstep = if cubin::capability(ctx)? == 89 && !scan {
+        let rstep = if cubin::capability(ctx)? == 89 {
             Some(cubin::module(ctx, "gdn/gdn_rstep")?.load_function("gdn_rstep_core_v1")?)
         } else {
             None
@@ -485,12 +433,10 @@ impl GdnOps {
                 s16: p1_mod.load_function("gdn_chunkwise_p1_core_s16")?,
             })
         };
-        };
         let kernels = Kernels {
             hist_snapshot,
             core_snapshot,
             rstep,
-            scan: scan_kernels,
             conv: f_conv,
             hist_update: f_hist,
             prep: f_prep,
@@ -568,10 +514,6 @@ impl GdnOps {
             plan.kernels.rstep.is_none() || (1..=4).contains(&plan.max_rows),
             "verify GDN bound must be 1..4"
         );
-        ensure!(
-            plan.kernels.scan.is_none(),
-            "verify GDN cannot use scan plan"
-        );
         ensure!(plan.snapshots.is_some(), "verify snapshots not bound");
         Self::run_core(plan, stream, meta, ExecutionPhase::Prefill, scratch, true)
     }
@@ -595,10 +537,6 @@ impl GdnOps {
             None
         };
         meta.validate()?;
-        ensure!(
-            phase == ExecutionPhase::Prefill || plan.kernels.scan.is_none(),
-            "scan plan cannot decode"
-        );
         ensure!(
             !verify || plan.p1_split == 0,
             "chunkwise P1 plan cannot verify; verify keeps the recurrent core"
@@ -638,19 +576,6 @@ impl GdnOps {
         let l2_eps = plan.l2_eps;
         let conv_ptr = conv_out.0.ptr;
 
-        // Validate the selected bucket before any persistent history update. The
-        // live count remains device data; this launch is fixed in each scan plan.
-        if let Some(scan) = &plan.kernels.scan {
-            let geometry = plan.ws.scan.context("missing scan geometry")?;
-            unsafe {
-                stream
-                    .launch_builder(&scan.guard)
-                    .arg(&meta.ptr)
-                    .arg(&(plan.max_rows as i32))
-                    .arg(&(geometry.leaves as i32))
-                    .launch(scan_cfg(1, 1, 0))?;
-            }
-        }
         // ---- 1. conv: qkv -> conv_out. ABI §5: this BF16 cast may not be elided.
         unsafe {
             stream
@@ -759,7 +684,6 @@ impl GdnOps {
         #[cfg(test)]
         record_phase(match phase {
             ExecutionPhase::Prefill if plan.p1_split != 0 => "chunkwise_p1",
-            ExecutionPhase::Prefill if plan.kernels.scan.is_some() => "bscan",
             ExecutionPhase::Prefill if rstep.is_some() => "rstep",
             ExecutionPhase::Prefill => "chunked",
             ExecutionPhase::Decode => "recurrent",
@@ -768,21 +692,6 @@ impl GdnOps {
             match phase {
                 ExecutionPhase::Prefill if plan.p1_split != 0 => {
                     plan.run_chunkwise_p1(stream, meta, scratch, plan.p1_split)?;
-                }
-                ExecutionPhase::Prefill if plan.kernels.scan.is_some() => {
-                    launch_scan(
-                        plan,
-                        stream,
-                        meta,
-                        ws_ptr,
-                        [
-                            q_fp32.0.ptr,
-                            k_fp32.0.ptr,
-                            v_fp32.0.ptr,
-                            beta_fp32.0.ptr,
-                            g.0.ptr,
-                        ],
-                    )?;
                 }
                 ExecutionPhase::Prefill if snapshots.is_some() => {
                     let (state, _) = snapshots.context("missing snapshot bindings")?;
@@ -897,101 +806,6 @@ fn as3(
             cap,
         )
     }
-}
-
-fn scan_cfg(x: u32, threads: u32, smem: u32) -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: (x, if threads == 1 { 1 } else { HV }, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: smem,
-    }
-}
-
-fn launch_scan(
-    plan: &GdnPlan,
-    stream: &Arc<CudaStream>,
-    meta: SeqRef,
-    scratch: u64,
-    inputs: [u64; 5],
-) -> Result<()> {
-    let k = plan.kernels.scan.as_ref().context("missing scan kernels")?;
-    let ScanWorkspace {
-        t,
-        maps,
-        entries,
-        leaves,
-    } = plan.ws.scan.context("missing scan workspace")?;
-    let t = add(scratch, t.offset)?;
-    let maps = add(scratch, maps.offset)?;
-    let entries = add(scratch, entries.offset)?;
-    let [q, key, v, beta, g] = inputs;
-    let bound = plan.max_rows as i32;
-    let leaf_count = leaves as i32;
-    let levels = leaves.ilog2();
-    let b = &plan.bindings;
-    unsafe {
-        stream
-            .launch_builder(&k.p1)
-            .arg(&key)
-            .arg(&beta)
-            .arg(&g)
-            .arg(&t)
-            .arg(&meta.ptr)
-            .arg(&bound)
-            .arg(&leaf_count)
-            .launch(scan_cfg(leaves * 4, 128, shared::P1_BYTES))?;
-        stream
-            .launch_builder(&k.leaf)
-            .arg(&key)
-            .arg(&v)
-            .arg(&beta)
-            .arg(&g)
-            .arg(&t)
-            .arg(&b.s.0.ptr)
-            .arg(&maps)
-            .arg(&entries)
-            .arg(&meta.ptr)
-            .arg(&bound)
-            .arg(&leaf_count)
-            .launch(scan_cfg(leaves * 4, 256, shared::LEAF_BYTES))?;
-        for depth in (1..levels).rev() {
-            stream
-                .launch_builder(&k.up)
-                .arg(&maps)
-                .arg(&meta.ptr)
-                .arg(&bound)
-                .arg(&leaf_count)
-                .arg(&(depth as i32))
-                .launch(scan_cfg((1 << depth) * 16, 256, shared::UP_BYTES))?;
-        }
-        for depth in 0..levels {
-            stream
-                .launch_builder(&k.down)
-                .arg(&maps)
-                .arg(&entries)
-                .arg(&meta.ptr)
-                .arg(&bound)
-                .arg(&leaf_count)
-                .arg(&(depth as i32))
-                .launch(scan_cfg((1 << depth) * 16, 256, shared::DOWN_BYTES))?;
-        }
-        stream
-            .launch_builder(&k.p3)
-            .arg(&q)
-            .arg(&key)
-            .arg(&v)
-            .arg(&beta)
-            .arg(&g)
-            .arg(&b.s.0.ptr)
-            .arg(&b.core_out.0.ptr)
-            .arg(&t)
-            .arg(&entries)
-            .arg(&meta.ptr)
-            .arg(&bound)
-            .arg(&leaf_count)
-            .launch(scan_cfg(leaves, 512, shared::P3_BYTES))?;
-    }
-    Ok(())
 }
 
 fn ws_region(r: Region, rows: u32, cols: u32, elem: u64) -> Result<()> {
@@ -1928,7 +1742,6 @@ mod gpu_probe {
             c.man.plan_rows,
             b,
             common,
-            false,
             0,
         )?;
         let (meta_buf, meta) = meta_device(

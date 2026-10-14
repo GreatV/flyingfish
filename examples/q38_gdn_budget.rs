@@ -20,20 +20,14 @@ fn main() -> Result<()> {
     let spec = GdnSpec::q38();
     let legacy = GdnWorkspace::q38(&spec, rows)?;
     let workspace = policy.workspace(&spec, rows)?;
-    let buckets = policy
-        .buckets(rows)
-        .into_iter()
-        .map(|bound| {
-            let req = policy.workspace(&spec, bound)?;
-            Ok(serde_json::json!({"bound_rows":bound,"workspace_bytes":req.bytes}))
-        })
-        .collect::<Result<Vec<_>>>()?;
     println!(
         "{}",
         serde_json::json!({
             "gdn_plan":policy.identity(),"cuda_sm":arch,"sms":sms,"physical_rows":rows,
             "legacy_workspace_bytes":legacy.bytes,"workspace_bytes":workspace.bytes,
-            "workspace_alignment":workspace.alignment,"scan_buckets":buckets,
+            "workspace_alignment":workspace.alignment,
+            "p1_split_for_2048":policy.p1_split_for_step(2048),
+            "p1_split_for_64":policy.p1_split_for_step(64),
             "accounting":"maximum complete plan; one arena reused across layers",
         })
     );

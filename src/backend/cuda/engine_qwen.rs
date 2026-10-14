@@ -44,7 +44,6 @@ pub(super) struct Runtime {
     common: CommonOpsRef,
     advance: CudaFunction,
     prepared: BTreeSet<u32>,
-    gdn_policy: GdnPolicy,
 }
 struct Layer {
     linear: LayerLinearPlan,
@@ -61,11 +60,6 @@ enum BoundMixer {
     Gdn {
         norm: Tensor<bf16, 1>,
         prefill: PrefillPlans<GdnPlan>,
-        /// Narrowed plan for steps 5..=SCAN_MAX_ROWS: the shipped recursive core.
-        /// Absent when the full plan is already that small, in which case the full
-        /// plan carries split 0 and serves those steps itself.
-        sub_scan: Option<Box<GdnPlan>>,
-        scan: Vec<(u32, Box<GdnPlan>)>,
         decode: Box<GdnPlan>,
     },
 }
@@ -342,7 +336,7 @@ impl Runtime {
                     let cd = spec.conv_dim()?;
                     let state = &engine.state.gdn[layout.state_index as usize];
                     let conv = catalog.bf16(&format!("{prefix}linear_attn.conv1d.weight"))?;
-                    let bind = |active_rows, scan| {
+                    let bind = |active_rows| {
                         GdnOps::prepare(
                             &engine.device.ctx,
                             &spec,
@@ -394,45 +388,15 @@ impl Runtime {
                                 )?),
                             },
                             common.clone(),
-                            scan,
-                            // The planner's derived chunkwise-P1 split, which applies only
-                            // ABOVE the scan range: a scan bucket plan and every sub-scan
-                            // plan keep 0 (the scan and shipped recursive cores are theirs).
-                            if scan {
-                                0
-                            } else {
-                                gdn_policy.p1_split_for_step(active_rows as u32)
-                            },
+                            // The planner's derived chunkwise-P1 split for a plan bound
+                            // at `active_rows`; steps of at most MIN_VERIFY_ROWS keep 0.
+                            gdn_policy.p1_split_for_step(active_rows as u32),
                         )
-                    };
-                    let scan = gdn_policy
-                        .buckets(rows as u32)
-                        .into_iter()
-                        .map(|bound| {
-                            let plan = bind(bound as usize, true)?;
-                            ensure!(
-                                gdn_policy.workspace(&spec, bound)?.bytes
-                                    <= scratch_buffer.len() as u64,
-                                "GDN scan exceeds shared scratch budget"
-                            );
-                            Ok((bound, Box::new(plan)))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let full = bind(rows, false)?;
-                    // A step at or below SCAN_MAX_ROWS runs the shipped recursive core:
-                    // the narrowed plan is that core, and when the full plan is itself
-                    // that small its split is already 0 and no narrowing is needed.
-                    let sub_scan = if rows as u32 > crate::gdn_plan::SCAN_MAX_ROWS {
-                        Some(Box::new(full.for_rows(crate::gdn_plan::SCAN_MAX_ROWS)?))
-                    } else {
-                        None
                     };
                     BoundMixer::Gdn {
                         norm: weight("linear_attn.norm.weight")?,
-                        prefill: PrefillPlans::bind(full, rows, GdnPlan::for_rows)?,
-                        sub_scan,
-                        decode: Box::new(bind(1, false)?),
-                        scan,
+                        prefill: PrefillPlans::bind(bind(rows)?, rows, GdnPlan::for_rows)?,
+                        decode: Box::new(bind(1)?),
                     }
                 }
             };
@@ -465,7 +429,6 @@ impl Runtime {
             common,
             advance: module.load_function("q38_advance")?,
             prepared: BTreeSet::new(),
-            gdn_policy,
         })
     }
     fn prepare(
@@ -811,8 +774,7 @@ impl Engine {
             },
             |admitted| {
                 admitted_default_chunk = Some(admitted);
-                let bounds = gdn_policy.buckets(u32::try_from(admitted)?);
-                Ok(bounds.last().map_or(admitted, |&rows| rows as usize))
+                Ok(admitted)
             },
         )?;
         let rows = budget.plan.chunk;
@@ -823,7 +785,6 @@ impl Engine {
                 "{}",
                 serde_json::json!({"q38_default_chunk_policy": {
                     "admitted_chunk": admitted, "selected_chunk": rows,
-                    "qualified_bounds": gdn_policy.buckets(u32::try_from(admitted)?),
                     "arch": device.info.arch, "sms": device.info.sms,
                     "requested_chunk": requested_chunk,
                 }})
@@ -858,7 +819,6 @@ impl Engine {
                 "bound_prefill_max_rows": rows,
                 "bound_decode_max_rows": 1,
                 "gdn_plan": gdn_policy.identity(),
-                "gdn_scan_buckets": gdn_policy.buckets(rows as u32),
                 "gdn_workspace_policy": "max_complete_prebound_plan_not_sum",
                 "selection_source": "fixed"
             })
@@ -1070,9 +1030,7 @@ impl Engine {
             BoundMixer::Gdn {
                 norm,
                 prefill,
-                sub_scan,
                 decode,
-                scan,
             } => {
                 let spec = crate::op_contract::GdnSpec::q38();
                 let conv = spec.conv_dim()? as usize;
@@ -1097,25 +1055,10 @@ impl Engine {
                         &mut TensorMut(matrix(output, s, offset, rows, width)?),
                     )?;
                 }
-                let plan =
-                    match q
-                        .gdn_policy
-                        .select(self.workspace_rows as u32, rows as u32, phase)?
-                    {
-                        Some(bound) => scan
-                            .iter()
-                            .find(|(rows, _)| *rows == bound)
-                            .context("GDN structural bound has no prepared bucket")?
-                            .1
-                            .as_ref(),
-                        None => match phase {
-                            ExecutionPhase::Prefill => match sub_scan.as_deref() {
-                                Some(plan) if q.gdn_policy.sub_scan_prefill(rows as u32) => plan,
-                                _ => prefill.select(rows)?,
-                            },
-                            ExecutionPhase::Decode => decode.as_ref(),
-                        },
-                    };
+                let plan = match phase {
+                    ExecutionPhase::Prefill => prefill.select(rows)?,
+                    ExecutionPhase::Decode => decode.as_ref(),
+                };
                 if self.qwen_device_prefix {
                     ensure!(
                         phase == ExecutionPhase::Prefill,

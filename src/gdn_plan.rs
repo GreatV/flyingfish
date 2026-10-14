@@ -1,5 +1,5 @@
 //! Pure GDN plan geometry, dispatch and shared-scratch admission accounting.
-use crate::op_contract::{ExecutionPhase, GdnSpec, WorkspaceReq};
+use crate::op_contract::{GdnSpec, WorkspaceReq};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 const HV: u32 = 48;
@@ -7,13 +7,9 @@ const HK: u32 = 16;
 const DK: u32 = 128;
 const DV: u32 = 128;
 
-/// Top of the scan dispatch range, and the largest prepared scan bucket. A prefill
-/// step at or below it is the scan core's or the shipped recursive core's, never P1.
-pub const SCAN_MAX_ROWS: u32 = 2048;
-
-pub mod shared {
-    include!(concat!(env!("OUT_DIR"), "/gdn_b_shared.rs"));
-}
+/// Largest prefill step the MTP-verify small plans cover. Steps of more rows take the
+/// chunkwise-P1 core on a qualified device.
+pub const MIN_VERIFY_ROWS: u32 = 4;
 
 /// Chunkwise P1 core shared-memory bytes per value split, from
 /// `kernels/gdn/gdn_cw_p1_layout.h`. The kernel static_asserts its arena against the
@@ -25,109 +21,58 @@ pub mod cw_p1 {
 /// Immutable device qualification; no runtime GPU query or tuning in a forward.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct GdnPolicy {
-    scan: bool,
     /// Protocol §A value split of the production chunkwise-P1 prefill core, 0 = the
-    /// shipped recursive core. Derived once here from the same qualification the
-    /// scan path uses: the core's gate was run on sm89 with 128 SMs (box3), and
-    /// every other device keeps the shipped core until it has its own gate.
+    /// shipped recursive core. Derived once here from the device qualification: the
+    /// core's gate was run on sm89 with 128 SMs (box3), and every other device keeps
+    /// the shipped core until it has its own gate.
     prefill_p1_split: u32,
 }
 impl GdnPolicy {
     pub const LEGACY: Self = Self {
-        scan: false,
         prefill_p1_split: 0,
     };
     pub const fn for_device(arch: u32, sms: usize) -> Self {
         Self {
-            scan: arch == 89 && sms == 128,
             prefill_p1_split: if arch == 89 && sms == 128 { 4 } else { 0 },
         }
     }
-    /// The prepared chunkwise-P1 value split for a NON-scan prefill plan; scan bucket
-    /// plans always pass 0 (the scan core is their path). This is the device
-    /// qualification; `p1_split_for_step` is the per-step decision.
+    /// The device's prepared chunkwise-P1 value split; `p1_split_for_step` is the
+    /// per-step decision.
     pub const fn prefill_p1_split(self) -> u32 {
         self.prefill_p1_split
     }
-    /// The split a prefill step of `step_rows` rows may carry. P1 s4 is prepared only
-    /// ABOVE the scan range: a step at or below `SCAN_MAX_ROWS` belongs to a scan
-    /// bucket or to the shipped recursive core and keeps 0.
+    /// The split a prefill step of `step_rows` rows carries. Every prefill step of
+    /// more than MIN_VERIFY_ROWS rows takes the chunkwise-P1 core on a qualified
+    /// device; 1..=MIN_VERIFY_ROWS keep split 0 because MTP verify's contract is the
+    /// shipped recursive core.
     pub const fn p1_split_for_step(self, step_rows: u32) -> u32 {
-        if step_rows > SCAN_MAX_ROWS {
+        if step_rows > MIN_VERIFY_ROWS {
             self.prefill_p1_split
         } else {
             0
         }
     }
-    /// True when a non-scan prefill step of `step_rows` rows runs the NARROWED
-    /// sub-scan plan (the shipped recursive core, split 0) instead of the full P1
-    /// plan. 1..=4 keep the small plans, whose contract is MTP verify.
-    pub const fn sub_scan_prefill(self, step_rows: u32) -> bool {
-        step_rows > 4 && step_rows <= SCAN_MAX_ROWS
-    }
+    /// The plan identity this build reports: the P1 core is the prefill route above
+    /// the verify floor, and the plan id names it.
     pub const fn identity(self) -> &'static str {
-        if self.scan {
-            "gdn-plan-v3-c32-vs1-fp32-bscan-g4-w32"
+        if self.prefill_p1_split != 0 {
+            "gdn-plan-v3-c32-vs1-fp32-p1s4-w32"
         } else {
             GdnSpec::PLAN_ID
         }
     }
-    /// Prepared upper bounds, capped at the physical projection/output extent.
-    pub fn buckets(self, physical_rows: u32) -> Vec<u32> {
-        if !self.scan || physical_rows < 512 {
-            return Vec::new();
-        }
-        let mut result = Vec::new();
-        for bound in [512, 1024, SCAN_MAX_ROWS] {
-            let bound = bound.min(physical_rows);
-            if result.last() != Some(&bound) {
-                result.push(bound);
-            }
-        }
-        result
-    }
-    /// Structural Step bound only. The device live count is never read here.
-    pub fn select(
-        self,
-        physical_rows: u32,
-        step_rows: u32,
-        phase: ExecutionPhase,
-    ) -> Result<Option<u32>> {
-        ensure!(
-            step_rows > 0 && step_rows <= physical_rows,
-            "GDN step exceeds physical rows"
-        );
-        if !self.scan
-            || phase == ExecutionPhase::Decode
-            || !(512..=SCAN_MAX_ROWS).contains(&step_rows)
-        {
-            return Ok(None);
-        }
-        Ok(Some(step_rows.next_power_of_two().min(physical_rows)))
-    }
-    /// All prebound operators reuse the same arena. Large legacy plans do not
-    /// pay scan scratch on top: the maximum of complete plan layouts is enough.
+    /// All prebound operators reuse the same arena: the maximum of complete plan
+    /// layouts is enough, and with the scan buckets gone it is the plain arena.
     pub fn workspace(self, spec: &GdnSpec, physical_rows: u32) -> Result<WorkspaceReq> {
-        let mut bytes = GdnWorkspace::q38(spec, physical_rows)?.bytes;
-        for bound in self.buckets(physical_rows) {
-            bytes = bytes.max(GdnWorkspace::with_scan(spec, bound)?.bytes);
-        }
         Ok(WorkspaceReq {
-            bytes,
+            bytes: GdnWorkspace::q38(spec, physical_rows)?.bytes,
             alignment: 256,
         })
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ScanWorkspace {
-    pub t: Region,
-    pub maps: Region,
-    pub entries: Region,
-    pub leaves: u32,
-}
 /// One named region of the single Engine slice. The binder defines its layout
-/// and allocates no workspace of its own (ABI §6).
+/// and allocates no workspace of its own.
 #[derive(Clone, Copy, Debug)]
 pub struct Region {
     pub offset: u64,
@@ -138,8 +83,8 @@ pub struct Region {
 /// its own offset, so the Engine never has to guess and never hard-codes a total.
 ///
 /// `workspace()` is the ONLY source of the Engine's byte accounting. The Engine
-/// binds legacy prefill/decode and qualified scan buckets, and shares ONE scratch
-/// sized to the largest complete layout, as it does for HD256. Nothing here depends on `prepare` having run.
+/// binds prefill and decode plans, and shares ONE scratch sized to the largest complete
+/// layout, as it does for HD256. Nothing here depends on `prepare` having run.
 #[derive(Clone, Copy, Debug)]
 pub struct GdnWorkspace {
     /// `[R, conv_dim]` BF16 — the conv result, then SiLU'd IN PLACE. ABI §5: the
@@ -170,7 +115,6 @@ pub struct GdnWorkspace {
     pub v_fp32: Region,
     pub bytes: u64,
     pub alignment: u64,
-    pub scan: Option<ScanWorkspace>,
 }
 
 pub(crate) fn mul(a: u64, b: u64) -> Result<u64> {
@@ -240,40 +184,9 @@ impl GdnWorkspace {
             q_fp32: r[6],
             k_fp32: r[7],
             v_fp32: r[8],
-            scan: None,
             bytes: off,
             alignment: 256,
         })
-    }
-}
-
-impl GdnWorkspace {
-    pub(crate) fn with_scan(spec: &GdnSpec, bound: u32) -> Result<Self> {
-        ensure!(
-            (512..=2048).contains(&bound),
-            "GDN scan bound must be 512..2048"
-        );
-        let mut ws = Self::q38(spec, bound)?;
-        let leaves = bound.div_ceil(128).next_power_of_two();
-        let mut region = |floats: u64| -> Result<Region> {
-            let bytes = align(mul(floats, 4)?)?;
-            let r = Region {
-                offset: ws.bytes,
-                bytes,
-            };
-            ws.bytes = add(ws.bytes, bytes)?;
-            Ok(r)
-        };
-        let t = region(mul(mul(48, u64::from(leaves) * 4)?, 32 * 32)?)?;
-        let maps = region(mul(mul(48, u64::from(leaves) * 2 - 2)?, 2 * 128 * 128)?)?;
-        let entries = region(mul(mul(48, u64::from(leaves))?, 128 * 128)?)?;
-        ws.scan = Some(ScanWorkspace {
-            t,
-            maps,
-            entries,
-            leaves,
-        });
-        Ok(ws)
     }
 }
 
@@ -281,120 +194,34 @@ impl GdnWorkspace {
 mod tests {
     use super::*;
     #[test]
-    fn qualified_buckets_and_structural_dispatch() -> Result<()> {
-        let scan = GdnPolicy::for_device(89, 128);
+    fn every_prefill_step_above_the_verify_floor_takes_p1() {
+        let qualified = GdnPolicy::for_device(89, 128);
+        for rows in [1u32, 2, 3, 4] {
+            assert_eq!(
+                qualified.p1_split_for_step(rows),
+                0,
+                "{rows} keeps the verify core"
+            );
+        }
+        for rows in [5u32, 63, 64, 512, 1024, 2048, 2049, 4096, 16384] {
+            assert_eq!(qualified.p1_split_for_step(rows), 4, "{rows} must take P1");
+        }
         for (arch, sms) in [(86, 48), (89, 80), (90, 128)] {
             let legacy = GdnPolicy::for_device(arch, sms);
             assert_eq!(legacy, GdnPolicy::LEGACY);
-            assert!(legacy.buckets(2048).is_empty());
             assert_eq!(legacy.prefill_p1_split(), 0);
-        }
-        assert_eq!(scan.prefill_p1_split(), 4);
-        assert_eq!(scan.buckets(1021), vec![512, 1021]);
-        assert_eq!(scan.buckets(4096), vec![512, 1024, 2048]);
-        for (rows, want) in [
-            (1, None),
-            (2, None),
-            (3, None),
-            (4, None),
-            (5, None),
-            (511, None),
-            (512, Some(512)),
-            (513, Some(1024)),
-            (1021, Some(1024)),
-            (1024, Some(1024)),
-            (1025, Some(2048)),
-            (2048, Some(2048)),
-            (2049, None),
-        ] {
-            assert_eq!(scan.select(4096, rows, ExecutionPhase::Prefill)?, want);
-            assert_eq!(scan.select(4096, rows, ExecutionPhase::Decode)?, None);
-            assert_eq!(
-                GdnPolicy::LEGACY.select(4096, rows, ExecutionPhase::Prefill)?,
-                None
-            );
-            let legacy = GdnWorkspace::q38(&GdnSpec::q38(), rows)?;
-            assert!(legacy.scan.is_none());
-            if let Some(bucket) = want {
-                assert!(
-                    GdnWorkspace::with_scan(&GdnSpec::q38(), bucket)?
-                        .scan
-                        .is_some()
-                );
-            }
-            if rows <= 4 {
-                assert!(GdnWorkspace::with_scan(&GdnSpec::q38(), rows).is_err());
-            }
-        }
-        assert_eq!(scan.select(1021, 513, ExecutionPhase::Prefill)?, Some(1021));
-        assert_eq!(scan.select(2048, 1, ExecutionPhase::Decode)?, None);
-        assert!(scan.select(1024, 1025, ExecutionPhase::Prefill).is_err());
-        assert!(scan.select(1024, 0, ExecutionPhase::Prefill).is_err());
-        assert_ne!(scan.identity(), GdnPolicy::LEGACY.identity());
-        Ok(())
-    }
-    #[test]
-    fn p1_split_is_prepared_only_above_the_scan_range() {
-        let scan = GdnPolicy::for_device(89, 128);
-        // The E1 suffix prefill step: 64 rows, far below the scan range.
-        assert_eq!(scan.p1_split_for_step(64), 0);
-        assert_eq!(scan.p1_split_for_step(2048), 0);
-        assert_eq!(scan.p1_split_for_step(2049), 4);
-        assert_eq!(scan.p1_split_for_step(16384), 4);
-        for (arch, sms) in [(86, 48), (89, 80), (90, 128)] {
-            let legacy = GdnPolicy::for_device(arch, sms);
             assert_eq!(legacy.p1_split_for_step(64), 0);
             assert_eq!(legacy.p1_split_for_step(16384), 0);
         }
     }
     #[test]
-    fn prefill_routing_sends_every_sub_scan_step_to_the_shipped_core() {
-        let scan = GdnPolicy::for_device(89, 128);
-        // 1..=4 are the MTP verify plans, 5..=SCAN_MAX_ROWS the narrowed sub-scan
-        // plan: every step at or below the scan range leaves the shipped core on.
-        for rows in [1u32, 2, 3, 4] {
-            assert!(
-                !scan.sub_scan_prefill(rows),
-                "{rows} must keep the small plan"
-            );
-        }
-        for rows in [5u32, 6, 63, 64, 512, 1024, 2047, SCAN_MAX_ROWS] {
-            assert!(
-                scan.sub_scan_prefill(rows),
-                "{rows} must use the sub-scan plan"
-            );
-            assert_eq!(scan.p1_split_for_step(rows), 0, "{rows} split");
-        }
-        for rows in [SCAN_MAX_ROWS + 1, 4096, 16384] {
-            assert!(
-                !scan.sub_scan_prefill(rows),
-                "{rows} must use the full plan"
-            );
-            assert_eq!(scan.p1_split_for_step(rows), 4, "{rows} split");
-        }
-        assert_eq!(GdnPolicy::LEGACY.p1_split_for_step(64), 0);
-        assert_eq!(GdnPolicy::LEGACY.p1_split_for_step(16384), 0);
-    }
-    #[test]
     fn exact_shared_arena_and_monotone_admission() -> Result<()> {
         let spec = GdnSpec::q38();
         let policy = GdnPolicy::for_device(89, 128);
-        for (rows, extra) in [(512, 51), (1024, 114), (2048, 240)] {
-            let old = GdnWorkspace::q38(&spec, rows)?;
-            let new = GdnWorkspace::with_scan(&spec, rows)?;
-            assert_eq!(new.bytes - old.bytes, extra * 1024 * 1024);
-            let scan = new.scan.unwrap();
-            let regions = [scan.t, scan.maps, scan.entries];
-            assert_eq!(regions[0].offset, old.bytes);
-            for r in regions {
-                assert_eq!(r.offset % 256, 0);
-                assert_eq!(r.bytes % 256, 0);
-                assert!(r.offset + r.bytes <= new.bytes);
-            }
-            assert_eq!(scan.t.offset + scan.t.bytes, scan.maps.offset);
-            assert_eq!(scan.maps.offset + scan.maps.bytes, scan.entries.offset);
-            assert_eq!(policy.workspace(&spec, rows)?.bytes, new.bytes);
-            assert_eq!(GdnPolicy::LEGACY.workspace(&spec, rows)?.bytes, old.bytes);
+        for rows in [512u32, 1024, 2048] {
+            let ws = GdnWorkspace::q38(&spec, rows)?;
+            assert_eq!(policy.workspace(&spec, rows)?.bytes, ws.bytes);
+            assert_eq!(GdnPolicy::LEGACY.workspace(&spec, rows)?.bytes, ws.bytes);
         }
         let large = GdnWorkspace::q38(&spec, 8192)?.bytes;
         assert_eq!(policy.workspace(&spec, 8192)?.bytes, large);
@@ -406,14 +233,8 @@ mod tests {
         }
         assert!(policy.workspace(&spec, 0).is_err());
         assert_eq!(
-            [
-                shared::P1_BYTES,
-                shared::LEAF_BYTES,
-                shared::UP_BYTES,
-                shared::DOWN_BYTES,
-                shared::P3_BYTES
-            ],
-            [21248, 43264, 12288, 8192, 62336]
+            [cw_p1::S4_BYTES, cw_p1::S8_BYTES, cw_p1::S16_BYTES],
+            [44800, 40704, 38656]
         );
         Ok(())
     }
