@@ -73,8 +73,7 @@ enum BoundMixer {
 struct PrefillPlans<T> {
     full: Box<T>,
     small: Vec<T>,
-    /// One narrowed plan per distinct step size this run dispatches, so every launch
-    /// is sized by the LIVE rows of its step. Bound in `prepare` before the step runs.
+    /// One narrowed plan per distinct step size, bound in `prepare` before the step runs.
     by_rows: BTreeMap<usize, T>,
     max_rows: usize,
 }
@@ -91,8 +90,7 @@ impl<T> PrefillPlans<T> {
             max_rows,
         })
     }
-    /// Narrow the full plan to `rows` once, so `select` returns a plan whose grids are
-    /// functions of the live rows alone. 1..=4 keep the snapshot-bound `small` plans.
+    /// Narrow the full plan to `rows` once; 1..=4 keep the snapshot-bound `small` plans.
     fn ensure_rows(&mut self, rows: usize, narrow: &dyn Fn(&T, u32) -> Result<T>) -> Result<()> {
         ensure!(
             rows > 0 && rows <= self.max_rows,
@@ -112,11 +110,9 @@ impl<T> PrefillPlans<T> {
         if let Some(small) = self.small.get(rows - 1) {
             return Ok(small);
         }
-        Ok(self
-            .by_rows
+        self.by_rows
             .get(&rows)
-            .or(self.by_rows.get(&self.max_rows))
-            .unwrap_or(&self.full))
+            .with_context(|| format!("no prefill plan was prepared for {rows} rows"))
     }
 }
 pub(super) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
@@ -465,13 +461,9 @@ impl Runtime {
         blas: &Blas,
         rows: u32,
         spec: &crate::model_spec::ModelSpec,
-        prefill: bool,
     ) -> Result<()> {
         self.prepare_dimensions(blas, rows, spec.vocab, spec.hidden)?;
-        if prefill {
-            self.ensure_mixer_rows(rows)?;
-        }
-        Ok(())
+        self.ensure_mixer_rows(rows)
     }
     fn prepare_dimensions(
         &mut self,
@@ -953,7 +945,7 @@ impl Engine {
             images: None,
         };
         engine.qwen = Some(Runtime::new(&engine, dir, catalog, arena, scratch_buffer)?);
-        engine.prepare(1, false)?;
+        engine.prepare(1)?;
         engine.prepare_prefill_plans()?;
         engine
             .qwen
@@ -971,12 +963,11 @@ impl Engine {
         }
         Ok(engine)
     }
-    pub(super) fn prepare_qwen(&mut self, rows: usize, prefill: bool) -> Result<()> {
+    pub(super) fn prepare_qwen(&mut self, rows: usize) -> Result<()> {
         self.qwen.as_mut().context("Q38 runtime missing")?.prepare(
             &self.blas,
             u32::try_from(rows)?,
             &self.model_spec,
-            prefill,
         )
     }
     pub(super) fn prepare_prefill_rows(&mut self, rows: usize) -> Result<()> {
@@ -986,7 +977,7 @@ impl Engine {
             let q = self.qwen.as_mut().context("Q38 runtime missing")?;
             return q.prepare_prefill_rows(&self.blas, u32::try_from(rows)?, vocab, hidden);
         }
-        self.prepare(rows, true)
+        self.prepare(rows)
     }
     pub(super) fn qwen_advance(&mut self) -> Result<()> {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
@@ -1416,8 +1407,7 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    /// A stand-in plan that records the rows it was narrowed to, so the selection
-    /// mapping is testable without a device.
+    /// A stand-in plan recording the rows it was narrowed to, so selection is testable without a device.
     #[derive(Clone, Debug, PartialEq)]
     struct FakePlan {
         max_rows: usize,
@@ -1438,10 +1428,13 @@ mod tests {
     fn select_returns_the_plan_narrowed_to_the_steps_live_rows() {
         let mut plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
             .expect("bind");
-        assert_eq!(
-            plans.select(1021).unwrap().max_rows,
-            2048,
-            "before ensure_rows"
+        let unprepared = plans
+            .select(1021)
+            .expect_err("select before ensure_rows must fail")
+            .to_string();
+        assert!(
+            unprepared.contains("1021"),
+            "the error must name the unprepared size: {unprepared}"
         );
         plans
             .ensure_rows(1021, &FakePlan::for_rows)
@@ -1452,8 +1445,15 @@ mod tests {
             .ensure_rows(1021, &FakePlan::for_rows)
             .expect("ensure 1021 again");
         assert_eq!(plans.by_rows.len(), 1);
-        // An un-prepared step size still returns a plan, never an error.
-        assert_eq!(plans.select(700).unwrap().max_rows, 2048);
+        // An unprepared step size is an error naming the size, never a fallback.
+        let unprepared = plans
+            .select(700)
+            .expect_err("an unprepared size must not fall back")
+            .to_string();
+        assert!(
+            unprepared.contains("700"),
+            "the error must name the unprepared size: {unprepared}"
+        );
         // 1..=4 keep the snapshot-bound small plans.
         for rows in 1..=4 {
             assert_eq!(plans.select(rows).unwrap().max_rows, rows);
@@ -1462,13 +1462,34 @@ mod tests {
         assert!(plans.select(2049).is_err());
     }
 
-    /// The 1617a86 behaviour, pinned: without `ensure_rows` a 1021-row step runs the
-    /// plan bound at the whole 2048-row chunk.
+    /// The `Runtime::prepared` memo, modelled: a size is narrowed the FIRST time prepare
+    /// sees it, and the memo hit afterwards must not cost the step its own plan.
+    #[test]
+    fn a_prepared_rows_keeps_its_own_plan_across_a_memo_hit() {
+        let mut plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+            .expect("bind");
+        let mut prepared = std::collections::BTreeSet::new();
+        for rows in [1021usize, 997] {
+            if prepared.insert(rows) {
+                plans
+                    .ensure_rows(rows, &FakePlan::for_rows)
+                    .expect("ensure the step's plan");
+            }
+            assert_eq!(plans.select(rows).unwrap().max_rows, rows);
+        }
+        // The second prepare of each size hits the memo and does nothing.
+        for rows in [1021usize, 997] {
+            assert!(prepared.contains(&rows));
+            assert_eq!(plans.select(rows).unwrap().max_rows, rows);
+        }
+    }
+
+    /// Without `ensure_rows`, a 1021-row step has no plan of its own to select.
     #[test]
     fn a_step_only_runs_a_plan_narrowed_to_its_own_rows() {
         let mut plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
             .expect("bind");
-        // What `prepare(rows, prefill = true)` does before the step's forward pass.
+        // What `prepare(rows)` does before the step's forward pass.
         plans
             .ensure_rows(1021, &FakePlan::for_rows)
             .expect("ensure the step's plan");
@@ -1518,16 +1539,20 @@ mod tests {
     #[test]
     fn small_prefill_plans_select_structural_rows_without_rebinding() -> Result<()> {
         for capacity in [1, 2, 3, 4, 5, 16, 2048, 4096] {
-            let plans = PrefillPlans::bind(capacity, capacity, |&full, rows| {
+            let mut plans = PrefillPlans::bind(capacity, capacity, |&full, rows| {
                 assert_eq!(full, capacity);
                 Ok(rows as usize)
             })?;
             assert_eq!(plans.small, (1..=4.min(capacity)).collect::<Vec<_>>());
             for rows in 1..=capacity {
-                assert_eq!(
-                    *plans.select(rows)?,
-                    if rows <= 4 { rows } else { capacity }
-                );
+                if rows > 4 {
+                    assert!(plans.select(rows).is_err(), "{rows} is not prepared");
+                    plans.ensure_rows(rows, &|&full, rows| {
+                        assert_eq!(full, capacity);
+                        Ok(rows as usize)
+                    })?;
+                }
+                assert_eq!(*plans.select(rows)?, rows);
             }
             assert!(plans.select(0).is_err());
             assert!(plans.select(capacity + 1).is_err());

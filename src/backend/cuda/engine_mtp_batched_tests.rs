@@ -525,7 +525,7 @@ fn q38_mtp_bootstrap_acceptance_gpu() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     for (_, ids) in &inputs {
         for chunk in ids.chunks(e.chunk) {
-            e.prepare(chunk.len(), true)?;
+            e.prepare(chunk.len())?;
         }
     }
     e.closure.ready(std::time::Instant::now())?;

@@ -151,9 +151,7 @@ impl ChunkwiseP1 {
     }
 }
 
-/// Every prep-phase grid for `rows` live rows. `prepare` calls it with the plan's row
-/// count and `for_rows` with a narrower step's, so a launch grid is a function of the
-/// rows it processes and of nothing else.
+/// The single derivation of the three prep grids: `prepare` and `for_rows` both call it with the rows they bind.
 fn prep_grids(
     prep_cfg: LaunchConfig,
     beta_cfg: LaunchConfig,
@@ -442,9 +440,26 @@ impl GdnOps {
             recurrent: f_recurrent,
             p1,
         };
-        // Grids are functions of the PLAN (max_rows), never of the device
+        // Grids are functions of the rows the plan binds, never of the device
         // valid_rows, so a captured Graph replays an identical launch sequence.
-        let conv_rows = max_rows.div_ceil(CONV_ROWS);
+        let (prep_cfg, beta_cfg, conv_cfg) = prep_grids(
+            LaunchConfig {
+                grid_dim: (DV.div_ceil(PREP_THREADS), HV, 1),
+                block_dim: (PREP_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            LaunchConfig {
+                grid_dim: (HV.div_ceil(PREP_THREADS), 1, 1),
+                block_dim: (PREP_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            LaunchConfig {
+                grid_dim: (conv_dim / CONV_CHAN, 1, 1),
+                block_dim: (CONV_CHAN, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            max_rows,
+        );
         Ok(GdnPlan {
             snapshots: None,
             kernels: Arc::new(kernels),
@@ -454,26 +469,14 @@ impl GdnOps {
             conv_dim,
             l2_eps: spec.l2_eps,
             max_rows,
-            prep_cfg: LaunchConfig {
-                grid_dim: (DV.div_ceil(PREP_THREADS), HV, max_rows),
-                block_dim: (PREP_THREADS, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            conv_cfg: LaunchConfig {
-                grid_dim: (conv_dim / CONV_CHAN, conv_rows, 1),
-                block_dim: (CONV_CHAN, 1, 1),
-                shared_mem_bytes: 0,
-            },
+            prep_cfg,
+            conv_cfg,
             hist_cfg: LaunchConfig {
                 grid_dim: (conv_dim / CONV_CHAN, 1, 1),
                 block_dim: (CONV_CHAN, 1, 1),
                 shared_mem_bytes: 0,
             },
-            beta_cfg: LaunchConfig {
-                grid_dim: (HV.div_ceil(PREP_THREADS), max_rows, 1),
-                block_dim: (PREP_THREADS, 1, 1),
-                shared_mem_bytes: 0,
-            },
+            beta_cfg,
             chunked_cfg: LaunchConfig {
                 grid_dim: (1, HV, 1),
                 block_dim: (CORE_THREADS, 1, 1),

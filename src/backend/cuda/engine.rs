@@ -787,14 +787,13 @@ impl Engine {
                 engine.workspace_rows,
                 &mut engine.blas,
             )?;
-            engine.prepare(8, false)?;
+            engine.prepare(8)?;
             engine
                 .blas
                 .prepare(8, engine.config.vocab_size, engine.config.hidden_size)?;
             let rows = engine.spec_budget.rows();
             if engine.spec_budget.is_tree() {
-                // MTP tree drafting dispatches its own row count, not a prefill step.
-                engine.prepare(rows, false)?;
+                engine.prepare(rows)?;
                 engine
                     .blas
                     .prepare(rows, engine.config.vocab_size, engine.config.hidden_size)?;
@@ -925,7 +924,7 @@ impl Engine {
 
     fn prepare_prefill_plans(&mut self) -> Result<()> {
         if self.qwen.is_none() {
-            self.prepare(self.chunk, true)?;
+            self.prepare(self.chunk)?;
             return Ok(());
         }
         let workspace = self.workspace_rows;
@@ -937,7 +936,7 @@ impl Engine {
         }
         rows.insert(workspace);
         for row in rows {
-            self.prepare(row, true)?;
+            self.prepare(row)?;
         }
         Ok(())
     }
@@ -1057,9 +1056,9 @@ impl Engine {
         &self.config
     }
 
-    fn prepare(&mut self, rows: usize, prefill: bool) -> Result<()> {
+    fn prepare(&mut self, rows: usize) -> Result<()> {
         if self.qwen.is_some() {
-            return self.prepare_qwen(rows, prefill);
+            return self.prepare_qwen(rows);
         }
         let c = &self.config;
         for (o, i) in [
@@ -1161,7 +1160,7 @@ impl Engine {
         if step.input == crate::backend::Input::Ids {
             self.prepare_prefill_rows(rows)?;
         } else {
-            self.prepare(rows, false)?;
+            self.prepare(rows)?;
         }
         if step.head == Head::All {
             self.blas

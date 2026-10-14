@@ -78,9 +78,7 @@ impl Engine {
             "M2b attachment exceeds memory budget: required={needed} free={free}"
         );
         for rows in 1..=4 {
-            // MTP verify/replay dispatches 1..=4 rows; their plans are the snapshot-bound
-            // small ones, so no prefill narrowing is wanted here.
-            self.prepare(rows, false)?;
+            self.prepare(rows)?;
             self.blas
                 .prepare_fixed(rows as u32, VOCAB as u32, HIDDEN as u32)?;
         }
