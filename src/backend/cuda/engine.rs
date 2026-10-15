@@ -2602,6 +2602,12 @@ impl Engine {
         self.chunk
     }
 
+    /// Device bytes in use right now; the runner reads it while the prefill allocation is live.
+    pub fn live_device_bytes(&self) -> Result<u64> {
+        let (free, total) = self.device.ctx.mem_get_info()?;
+        Ok(u64::try_from(total - free)?)
+    }
+
     pub fn attention_chunk(&self) -> Option<usize> {
         self.decode.as_ref().map(Attention::chunk)
     }

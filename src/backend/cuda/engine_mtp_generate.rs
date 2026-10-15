@@ -80,11 +80,8 @@ impl Engine {
             settings,
             SetupMode::Mtp,
         )?;
-        if let Some(prompt) = prompt {
-            engine.mtp_enable_for_prompt(mtp, prompt)?;
-        } else {
-            engine.mtp_enable_resident(mtp)?;
-        }
+        ensure!(prompt.is_none_or(|p| p > 0), "empty MTP prompt");
+        engine.mtp_enable_resident(mtp)?;
         engine.mtp_batch_enable()?;
         if graph {
             engine.capture()?;

@@ -3,13 +3,17 @@ use super::*;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
-    gdn::{GdnBindings, GdnOps, GdnPlan},
+    gdn::{CUDA_GRID_YZ_MAX, GdnBindings, GdnOps, GdnPlan},
     linear::{LayerLinearPlan, LinearWeightRef},
     ops::{CommonOpsRef, GatedRmsInput, ResidualRmsInput, RmsMode, RmsOptions},
     weights::WeightCatalog,
 };
-/// Default prefill chunk ceiling in rows; an explicit `--chunk` is not clamped.
-const DEFAULT_CHUNK_ROWS: usize = 2048;
+/// The workspace alignment the default-chunk cap must preserve; the same value the budget call passes.
+const CHUNK_ALIGNMENT: usize = 32;
+/// The default chunk is bounded by the largest alignment multiple at or under the CUDA gridDim.y/z limit the GDN prep pair launches rows on.
+fn default_chunk(admitted: usize) -> usize {
+    admitted.min(CUDA_GRID_YZ_MAX as usize / CHUNK_ALIGNMENT * CHUNK_ALIGNMENT)
+}
 
 use crate::gdn_plan::GdnPolicy;
 use crate::{
@@ -57,7 +61,7 @@ struct Layer {
 }
 enum BoundMixer {
     Attention {
-        prefill: Box<FullAttentionPlan>,
+        image_prefill: PrefillPlans<FullAttentionPlan>,
         text_prefill: PrefillPlans<FullAttentionPlan>,
         decode: Box<FullAttentionPlan>,
     },
@@ -339,16 +343,20 @@ impl Runtime {
                         );
                     }
                     BoundMixer::Attention {
-                        prefill: Box::new(bind(
+                        image_prefill: PrefillPlans::bind(
+                            bind(
+                                rows,
+                                PositionBindings::Axes(view(
+                                    &active_positions,
+                                    s,
+                                    0,
+                                    [rows as u32, 3],
+                                    [3, 1],
+                                )?),
+                            )?,
                             rows,
-                            PositionBindings::Axes(view(
-                                &active_positions,
-                                s,
-                                0,
-                                [rows as u32, 3],
-                                [3, 1],
-                            )?),
-                        )?),
+                            FullAttentionPlan::for_rows,
+                        )?,
                         text_prefill: PrefillPlans::bind(
                             bind(rows, PositionBindings::Linear)?,
                             rows,
@@ -802,14 +810,13 @@ impl Engine {
         let mtp_budget = reserve_mtp
             .then(|| crate::mtp::AttachmentBudget::new(&model_spec, capacity))
             .transpose()?;
-        let mut admitted_default_chunk = None;
         let budget = crate::prefill::WorkspaceBudget::new(
             crate::prefill::WorkspaceRequest {
                 capacity,
                 requested: requested_chunk,
                 free_after_resident: free,
                 total,
-                alignment: 32,
+                alignment: CHUNK_ALIGNMENT,
                 row_bytes: Runtime::row_bytes(&model_spec)?
                     .checked_add(mtp_budget.as_ref().map_or(0, |b| b.row_bytes))
                     .context("combined row bytes overflow")?,
@@ -829,24 +836,9 @@ impl Engine {
                     )
                     .context("Q38 combined workspace overflow")
             },
-            |admitted| {
-                admitted_default_chunk = Some(admitted);
-                Ok(admitted.min(DEFAULT_CHUNK_ROWS))
-            },
+            |admitted| Ok(default_chunk(admitted)),
         )?;
         let rows = budget.plan.chunk;
-        if let Some(admitted) = admitted_default_chunk
-            && admitted != rows
-        {
-            eprintln!(
-                "{}",
-                serde_json::json!({"q38_default_chunk_policy": {
-                    "admitted_chunk": admitted, "selected_chunk": rows,
-                    "arch": device.info.arch, "sms": device.info.sms,
-                    "requested_chunk": requested_chunk,
-                }})
-            );
-        }
         ensure!(
             !reserve_mtp || rows >= 4,
             "MTP workspace cannot fit four verification rows"
@@ -1018,7 +1010,7 @@ impl Engine {
         };
         match &layer.mixer {
             BoundMixer::Attention {
-                prefill,
+                image_prefill,
                 text_prefill,
                 decode,
             } => {
@@ -1041,13 +1033,13 @@ impl Engine {
                 }
                 match phase {
                     ExecutionPhase::Prefill => {
-                        let narrowed;
-                        let prefill: &FullAttentionPlan = if self.images.is_some() {
-                            prefill
+                        let plans = if self.images.is_some() {
+                            image_prefill
                         } else {
-                            narrowed = text_prefill.select(rows, &FullAttentionPlan::for_rows)?;
-                            &narrowed
+                            text_prefill
                         };
+                        let narrowed = plans.select(rows, &FullAttentionPlan::for_rows)?;
+                        let prefill: &FullAttentionPlan = &narrowed;
                         FullAttentionOps::preprocess(prefill, s, meta, scratch(&q.scratch, s))?;
                         let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
                         let shape = Shape {
@@ -1400,6 +1392,36 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    use super::default_chunk;
+
+    #[test]
+    fn the_default_chunk_is_bounded_by_the_cuda_grid_yz_limit() {
+        assert_eq!(default_chunk(100_000), 65_504);
+        assert_eq!(default_chunk(100_000) % 32, 0);
+        assert_eq!(default_chunk(500), 500);
+    }
+
+    /// An admission of 65536 rows selects 65504, a multiple of the budget alignment.
+    #[test]
+    fn the_default_chunk_cap_preserves_the_budget_alignment() -> Result<()> {
+        let budget = WorkspaceBudget::new(
+            WorkspaceRequest {
+                capacity: 70000,
+                requested: None,
+                free_after_resident: 1 << 40,
+                total: 1 << 40,
+                alignment: super::CHUNK_ALIGNMENT,
+                row_bytes: 1,
+                fixed_transient_bytes: 0,
+            },
+            |rows| Ok(rows * 4),
+            |admitted| Ok(default_chunk(admitted)),
+        )?;
+        assert_eq!(budget.plan.chunk, 65_504);
+        assert_eq!(budget.plan.chunk % super::CHUNK_ALIGNMENT, 0);
+        Ok(())
+    }
+
     /// A stand-in plan recording the rows it was narrowed to, so selection is testable without a device.
     #[derive(Clone, Debug, PartialEq)]
     struct FakePlan {

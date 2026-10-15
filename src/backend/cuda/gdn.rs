@@ -151,20 +151,27 @@ impl ChunkwiseP1 {
     }
 }
 
+/// CUDA caps gridDim.y and gridDim.z at 65535; prep puts rows on gridDim.z and beta on gridDim.y.
+pub(crate) const CUDA_GRID_YZ_MAX: u32 = 65_535;
+
 /// The single derivation of the three prep grids: `prepare` and `for_rows` both call it with the rows they bind.
 fn prep_grids(
     prep_cfg: LaunchConfig,
     beta_cfg: LaunchConfig,
     conv_cfg: LaunchConfig,
     rows: u32,
-) -> (LaunchConfig, LaunchConfig, LaunchConfig) {
+) -> Result<(LaunchConfig, LaunchConfig, LaunchConfig)> {
+    ensure!(
+        rows <= CUDA_GRID_YZ_MAX,
+        "GDN prep rows {rows} exceed the CUDA gridDim.y/z limit {CUDA_GRID_YZ_MAX}"
+    );
     let mut prep_cfg = prep_cfg;
     prep_cfg.grid_dim.2 = rows;
     let mut beta_cfg = beta_cfg;
     beta_cfg.grid_dim.1 = rows;
     let mut conv_cfg = conv_cfg;
     conv_cfg.grid_dim.1 = rows.div_ceil(CONV_ROWS);
-    (prep_cfg, beta_cfg, conv_cfg)
+    Ok((prep_cfg, beta_cfg, conv_cfg))
 }
 
 pub(crate) struct GdnPlan {
@@ -241,7 +248,7 @@ impl GdnPlan {
         };
         check_bindings(&bindings, rows, self.conv_dim)?;
         let (prep_cfg, beta_cfg, conv_cfg) =
-            prep_grids(self.prep_cfg, self.beta_cfg, self.conv_cfg, rows);
+            prep_grids(self.prep_cfg, self.beta_cfg, self.conv_cfg, rows)?;
         Ok(Self {
             snapshots: None,
             kernels: self.kernels.clone(),
@@ -458,7 +465,7 @@ impl GdnOps {
                 shared_mem_bytes: 0,
             },
             max_rows,
-        );
+        )?;
         Ok(GdnPlan {
             snapshots: None,
             kernels: Arc::new(kernels),
@@ -938,10 +945,10 @@ mod tests {
     }
 
     #[test]
-    fn every_prep_grid_is_a_function_of_the_live_rows_alone() {
+    fn every_prep_grid_is_a_function_of_the_live_rows_alone() -> Result<()> {
         let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
         for rows in [5u32, 7, 1021, 2047, 2048] {
-            let (prep, beta, conv) = prep_grids(full.0, full.1, full.2, rows);
+            let (prep, beta, conv) = prep_grids(full.0, full.1, full.2, rows)?;
             assert_eq!(prep.grid_dim.2, rows, "gdn_prep_fp32 grid z");
             assert_eq!(beta.grid_dim.1, rows, "gdn_beta_widen grid y");
             assert_eq!(
@@ -957,14 +964,26 @@ mod tests {
             assert_eq!(conv.grid_dim.0, full.2.grid_dim.0);
             assert_eq!(conv.grid_dim.2, full.2.grid_dim.2);
         }
+        Ok(())
     }
 
     #[test]
-    fn a_narrower_step_never_widens_a_grid() {
+    fn a_narrower_step_never_widens_a_grid() -> Result<()> {
         let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
-        let (wide, _, _) = prep_grids(full.0, full.1, full.2, 2048);
-        let (narrow, _, _) = prep_grids(full.0, full.1, full.2, 1021);
+        let (wide, _, _) = prep_grids(full.0, full.1, full.2, 2048)?;
+        let (narrow, _, _) = prep_grids(full.0, full.1, full.2, 1021)?;
         assert!(narrow.grid_dim.2 < wide.grid_dim.2);
+        Ok(())
+    }
+
+    #[test]
+    fn rows_beyond_the_cuda_grid_yz_limit_are_rejected() -> Result<()> {
+        let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
+        prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX)?;
+        let rejected = prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX + 1)
+            .expect_err("rows above the CUDA gridDim.y/z limit must not form a launch");
+        assert!(rejected.to_string().contains("gridDim"), "{rejected}");
+        Ok(())
     }
 
     use super::*;

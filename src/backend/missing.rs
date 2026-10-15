@@ -183,6 +183,10 @@ impl Backend {
     pub fn chunk(&self) -> usize {
         match *self {}
     }
+
+    pub fn live_device_bytes(&self) -> Result<u64> {
+        match *self {}
+    }
     pub fn attention_chunk(&self) -> Option<usize> {
         match *self {}
     }

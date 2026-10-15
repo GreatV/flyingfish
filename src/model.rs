@@ -283,6 +283,10 @@ impl Model {
     pub fn chunk(&self) -> usize {
         self.backend.chunk()
     }
+
+    pub fn live_device_bytes(&self) -> Result<u64> {
+        self.backend.live_device_bytes()
+    }
     pub fn attention_chunk(&self) -> Option<usize> {
         self.backend.attention_chunk()
     }

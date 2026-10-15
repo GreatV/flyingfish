@@ -126,6 +126,7 @@ fn run_e2e(a: &E2eArgs) -> Result<()> {
     model.reset()?;
     let mut prefill_gpu_ms = Vec::new();
     let mut decode_gpu_ms = Vec::new();
+    let mut peak_vram_bytes = 0u64;
     for _ in 0..a.prefill_reps {
         model.reset()?;
         let begin = model.event()?;
@@ -135,6 +136,7 @@ fn run_e2e(a: &E2eArgs) -> Result<()> {
         model.record(&end)?;
         end.synchronize()?;
         prefill_gpu_ms.push(begin.elapsed_ms(&end)? as f64);
+        peak_vram_bytes = model.live_device_bytes()?;
         let dbegin = model.event()?;
         let dend = model.event()?;
         model.record(&dbegin)?;
@@ -149,7 +151,7 @@ fn run_e2e(a: &E2eArgs) -> Result<()> {
         "label": a.label, "tokens": ids.len(), "load_ms": load_ms,
         "prefill_gpu_ms": prefill_gpu_ms, "decode_step_gpu_ms": decode_gpu_ms,
         "decode_steps": a.decode_steps, "capacity": a.capacity, "chunk": a.chunk,
-        "admitted_chunk": model.chunk(),
+        "admitted_chunk": model.chunk(), "peak_vram_bytes": peak_vram_bytes,
     });
     std::fs::write(&a.output, serde_json::to_vec_pretty(&out)?)?;
     println!("{}", serde_json::to_string(&out)?);
