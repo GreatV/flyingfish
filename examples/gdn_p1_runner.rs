@@ -3098,6 +3098,19 @@ impl Gpu {
         } else {
             None
         };
+        // The P2 arm's BF16 sources are constant across measurements; derived and
+        // uploaded before the event pair.
+        let p2_sources = if which == Which::P2 {
+            let (q_bf16, k_bf16, v_bf16) = derive_bf16_sources(&arrays.q, &arrays.k, &arrays.v)?;
+            Some((
+                self.stream.clone_htod(&q_bf16)?,
+                self.stream.clone_htod(&k_bf16)?,
+                self.stream.clone_htod(&v_bf16)?,
+            ))
+        } else {
+            None
+        };
+        self.stream.synchronize()?;
         // The events bracket the launch; nothing else is enqueued between them and the
         // stream is synchronised before the pair is read.
         let start = self
@@ -3126,17 +3139,13 @@ impl Gpu {
                 }
                 Which::P2 => {
                     let ws = ws.as_ref().context("the P2 arm allocates its workspace")?;
-                    // The stages read BF16 sources; the FP32 uploads above are the other
-                    // arms' operands and are not read here.
-                    let (q_bf16, k_bf16, v_bf16) =
-                        derive_bf16_sources(&arrays.q, &arrays.k, &arrays.v)?;
-                    let dq = self.stream.clone_htod(&q_bf16)?;
-                    let dk = self.stream.clone_htod(&k_bf16)?;
-                    let dvv = self.stream.clone_htod(&v_bf16)?;
+                    let (dq, dk, dvv) = p2_sources
+                        .as_ref()
+                        .context("P2 timing without its derived sources")?;
                     let mut case = P2Case {
-                        dq: &dq,
-                        dk: &dk,
-                        dvv: &dvv,
+                        dq,
+                        dk,
+                        dvv,
                         dbeta: &dbeta,
                         dg: &dg,
                         ds: &mut ds,

@@ -385,27 +385,49 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
     }
     __syncthreads();
 
-    // ---- T = (I - A)^-1, blocked: 16x16 FP32 leaves by forward substitution then 16->32 and 32->64 merges, ONE row per iteration with the barrier between rows (row r reads the already-final entries of rows m < r) and ONE thread per diagonal block, so each sA row has exactly one writer and is substituted once.
-    for (int rr = 1; rr < P2_SUB; ++rr) {
-        if (tid < P2_C / P2_SUB) {
-            const int blk = tid;
+    // ---- T = (I - A)^-1, blocked: 16x16 FP32 leaves by forward substitution then 16->32 and 32->64 merges. ONE WARP per diagonal block, lane j = row j: row r still reads the
+    // already-final entries of rows m < r, but through __shfl_sync(lw, t[j], m) — lane
+    // m's current t[j], final by the row-synchronous step order — so each element keeps
+    // the thread form's seed and ascending-m fma chain and the leaves are bit-identical.
+    // All lanes named in lw execute every shuffle (the non-owning lanes discard); the
+    // guard keeps lanes 16..31 of a leaf warp from touching the next block's rows.
+    {
+        const unsigned lw = (1u << P2_SUB) - 1u;   // the 16 leaf lanes
+        if (warp < P2_C / P2_SUB && lane < P2_SUB) {
             // The substituted row and the rows it reads both live in the diagonal block's COLUMN window; without c0 the pass substitutes the off-diagonal block at columns 0..15 and destroys the A[b,a] the merges consume.
-            const int c0 = blk * P2_SUB;
-            float* row = sA + (size_t)(blk * P2_SUB + rr) * P2_A_LD + c0;
-            for (int j = 0; j < rr; ++j) {
-                float acc = row[j];
+            const int c0 = warp * P2_SUB;
+            float t[P2_SUB];
+            #pragma unroll
+            for (int j = 0; j < P2_SUB; ++j)
+                t[j] = sA[(size_t)(warp * P2_SUB + lane) * P2_A_LD + c0 + j];
+            __syncwarp(lw);
+            for (int step = 1; step < P2_SUB; ++step) {
+                float acc[P2_SUB];
+                if (lane == step)
+                    #pragma unroll
+                    for (int j = 0; j < step; ++j) acc[j] = t[j];
                 #pragma unroll
-                for (int m = j + 1; m < P2_SUB; ++m) {
-                    if (m < rr)
-                        acc = fmaf(row[m],
-                                   sA[(size_t)(blk * P2_SUB + m) * P2_A_LD + c0 + j],
-                                   acc);
+                for (int j = 0; j < P2_SUB; ++j) {
+                    if (j < step)
+                        #pragma unroll
+                        for (int m = j + 1; m < P2_SUB; ++m) {
+                            if (m < step) {
+                                const float tmj = __shfl_sync(lw, t[j], m);
+                                if (lane == step) acc[j] = fmaf(t[m], tmj, acc[j]);
+                            }
+                        }
                 }
-                row[j] = acc;
+                if (lane == step)
+                    #pragma unroll
+                    for (int j = 0; j < step; ++j) t[j] = acc[j];
+                __syncwarp(lw);
             }
+            #pragma unroll
+            for (int j = 0; j < P2_SUB; ++j)
+                sA[(size_t)(warp * P2_SUB + lane) * P2_A_LD + c0 + j] = t[j];
         }
-        __syncthreads();
     }
+    __syncthreads();
     for (int r = tid; r < P2_C; r += P2_THREADS) sA[r * P2_A_LD + r] += 1.0f;
     __syncthreads();   // the encode reads ALL of sA, including diagonals other
                        // threads just incremented
