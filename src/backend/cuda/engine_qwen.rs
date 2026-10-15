@@ -8,9 +8,11 @@ use crate::backend::cuda::{
     ops::{CommonOpsRef, GatedRmsInput, ResidualRmsInput, RmsMode, RmsOptions},
     weights::WeightCatalog,
 };
-/// The default chunk is bounded by the CUDA gridDim.y/z limit the GDN prep pair launches rows on.
+/// The workspace alignment the default-chunk cap must preserve; the same value the budget call passes.
+const CHUNK_ALIGNMENT: usize = 32;
+/// The default chunk is bounded by the largest alignment multiple at or under the CUDA gridDim.y/z limit the GDN prep pair launches rows on.
 fn default_chunk(admitted: usize) -> usize {
-    admitted.min(CUDA_GRID_YZ_MAX as usize)
+    admitted.min(CUDA_GRID_YZ_MAX as usize / CHUNK_ALIGNMENT * CHUNK_ALIGNMENT)
 }
 
 use crate::gdn_plan::GdnPolicy;
@@ -814,7 +816,7 @@ impl Engine {
                 requested: requested_chunk,
                 free_after_resident: free,
                 total,
-                alignment: 32,
+                alignment: CHUNK_ALIGNMENT,
                 row_bytes: Runtime::row_bytes(&model_spec)?
                     .checked_add(mtp_budget.as_ref().map_or(0, |b| b.row_bytes))
                     .context("combined row bytes overflow")?,
@@ -1390,12 +1392,34 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::{CUDA_GRID_YZ_MAX, default_chunk};
+    use super::default_chunk;
 
     #[test]
     fn the_default_chunk_is_bounded_by_the_cuda_grid_yz_limit() {
-        assert_eq!(default_chunk(100_000), CUDA_GRID_YZ_MAX as usize);
+        assert_eq!(default_chunk(100_000), 65_504);
+        assert_eq!(default_chunk(100_000) % 32, 0);
         assert_eq!(default_chunk(500), 500);
+    }
+
+    /// An admission of 65536 rows selects 65504, a multiple of the budget alignment.
+    #[test]
+    fn the_default_chunk_cap_preserves_the_budget_alignment() -> Result<()> {
+        let budget = WorkspaceBudget::new(
+            WorkspaceRequest {
+                capacity: 70000,
+                requested: None,
+                free_after_resident: 1 << 40,
+                total: 1 << 40,
+                alignment: super::CHUNK_ALIGNMENT,
+                row_bytes: 1,
+                fixed_transient_bytes: 0,
+            },
+            |rows| Ok(rows * 4),
+            |admitted| Ok(default_chunk(admitted)),
+        )?;
+        assert_eq!(budget.plan.chunk, 65_504);
+        assert_eq!(budget.plan.chunk % super::CHUNK_ALIGNMENT, 0);
+        Ok(())
     }
 
     /// A stand-in plan recording the rows it was narrowed to, so selection is testable without a device.
