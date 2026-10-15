@@ -129,18 +129,6 @@ int dispatch(void* q, void* k, void* v, void* out, void* lse, int rows, int star
 
 }  // namespace
 
-// Fixed query shape, device-resident key count. The caller writes start+rows
-// before this launch and guarantees rows <= *seqused_k <= capacity. Host sizes
-// describe the allocation; the causal alignment and CTA bounds use seqused_k.
-extern "C" int ff_fa2_run_device(void* q, void* k, void* v, void* out, void* lse,
-                                int rows, int* seqused_k, int q_heads, int kv_heads,
-                                int capacity, int head_dim, int64_t q_row_stride,
-                                int causal, cudaStream_t stream) {
-    if (!seqused_k) { error = "missing FA2 device key count"; return -1; }
-    return dispatch(q, k, v, out, lse, rows, 0, q_heads, kv_heads, capacity,
-                    head_dim, q_row_stride, causal, stream, seqused_k);
-}
-
 // kBlockM FA2 uses for this head dim on the current device: 64 for d128, 128 or
 // 64 for d256 per the query above. 0 = unsupported head dim.
 extern "C" int ff_fa2_tile(int head_dim) {

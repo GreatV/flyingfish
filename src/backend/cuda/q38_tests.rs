@@ -1,9 +1,10 @@
 //! Explicit-window GPU probes. Default cargo test never initializes a GPU here.
 use super::{
     Device,
+    attention_d256::{AttentionBindings, D, FullAttentionOps, GQA, HKV, HQ, PositionBindings},
     blas::Blas,
     closure::Closure,
-    contracts::{RowDomain, SeqRef, Tensor, TensorMut},
+    contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut},
     cubin,
     linear::{Fp8Ops, LinearWeightRef},
     ops::{
@@ -13,7 +14,9 @@ use super::{
 };
 use crate::{
     fp8::effective_weight,
-    op_contract::{ExecutionPhase, SequenceMeta},
+    op_contract::{
+        AttentionLimits, AttentionWorkspace, ExecutionPhase, FullAttentionSpec, SequenceMeta,
+    },
 };
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg};
@@ -739,6 +742,834 @@ fn q38_primitives_gpu() -> Result<()> {
         "Q38_PRIMITIVE_PROBE exact_dequant=true exact_linear_shapes=true visible_norm_boundaries=true g_zero_max_abs={max_err:e}; full G2/G3 acceptance requires reference fixtures"
     );
     Ok(())
+}
+
+const VERIFY_M4_ROWS: usize = 4;
+const VERIFY_CAUSAL_MASK_LEN: usize = 64;
+
+fn verify_bf16(
+    stage: &str,
+    case: u32,
+    row: usize,
+    a: &[bf16],
+    b: &[bf16],
+    coordinate: impl Fn(usize) -> String,
+) -> Result<Option<String>> {
+    ensure!(
+        a.len() == b.len(),
+        "VERIFY_M4 extent mismatch stage={stage} case={case}"
+    );
+    ensure!(
+        a.iter().chain(b).all(|v| v.is_finite()),
+        "VERIFY_M4 non-finite stage={stage} case={case} row={row}"
+    );
+    let mut first = None;
+    for (index, (x, y)) in a.iter().zip(b).enumerate() {
+        if x.to_bits() != y.to_bits() {
+            first = Some(format!(
+                "VERIFY_M4 first_diff stage={stage} case={case} row={row} at={} batch={:#04x} serial={:#04x}",
+                coordinate(index),
+                x.to_bits(),
+                y.to_bits()
+            ));
+            break;
+        }
+    }
+    Ok(first)
+}
+
+fn verify_f32(
+    stage: &str,
+    case: u32,
+    row: usize,
+    a: &[f32],
+    b: &[f32],
+    coordinate: impl Fn(usize) -> String,
+) -> Result<Option<String>> {
+    ensure!(
+        a.len() == b.len(),
+        "VERIFY_M4 extent mismatch stage={stage} case={case}"
+    );
+    ensure!(
+        a.iter().chain(b).all(|v| v.is_finite()),
+        "VERIFY_M4 non-finite stage={stage} case={case} row={row}"
+    );
+    let mut first = None;
+    for (index, (x, y)) in a.iter().zip(b).enumerate() {
+        if x.to_bits() != y.to_bits() {
+            first = Some(format!(
+                "VERIFY_M4 first_diff stage={stage} case={case} row={row} at={} batch={:#010x} serial={:#010x}",
+                coordinate(index),
+                x.to_bits(),
+                y.to_bits()
+            ));
+            break;
+        }
+    }
+    Ok(first)
+}
+
+fn verify_record(
+    first: &mut Option<String>,
+    defects: &mut usize,
+    words: &mut usize,
+    count: usize,
+    diff: Option<String>,
+) {
+    *words += count;
+    if diff.is_some() {
+        *defects += 1;
+        if first.is_none() {
+            *first = diff;
+        }
+    }
+}
+
+fn verify_projection_m4(
+    device: &Device,
+    blas: &Blas,
+    output: u32,
+    input: u32,
+    state: &mut u64,
+) -> Result<(usize, Option<String>)> {
+    let code_set = [0x20u8, 0x35, 0x48, 0x59, 0x68, 0x80, 0x99, 0xb0, 0xc0, 0xd8];
+    let codes = (0..u64::from(output) * u64::from(input))
+        .map(|i| code_set[(i % 17) as usize % code_set.len()])
+        .collect::<Vec<_>>();
+    let scales = (0..output.div_ceil(128) * input.div_ceil(128))
+        .map(|i| {
+            [
+                bf16::from_f32(0.25),
+                bf16::ONE,
+                bf16::from_f32(1.0078125),
+                bf16::from_f32(2.0),
+                bf16::from_f32(0.03125),
+            ][(i % 13) as usize % 5]
+        })
+        .collect::<Vec<_>>();
+    let rows = (0..VERIFY_M4_ROWS * input as usize)
+        .map(|_| bf16::from_f32(next_f32_unit(state) * 3.0 - 1.5))
+        .collect::<Vec<_>>();
+
+    let s = &device.stream;
+    let code_buffer = s.clone_htod(&codes)?;
+    let scale_buffer = s.clone_htod(&scales)?;
+    let row_buffer = s.clone_htod(&rows)?;
+    let batch_out = s.clone_htod(&vec![bf16::ZERO; VERIFY_M4_ROWS * output as usize])?;
+    let scale_cols = input.div_ceil(128);
+    let codes_view = view(&code_buffer, s, [output, input], [u64::from(input), 1])?;
+    let scales_view = view(
+        &scale_buffer,
+        s,
+        [output.div_ceil(128), scale_cols],
+        [u64::from(scale_cols), 1],
+    )?;
+    let weight = LinearWeightRef::BlockFp8 {
+        codes: codes_view,
+        scale: scales_view,
+    };
+    let batch_x = view(
+        &row_buffer,
+        s,
+        [VERIFY_M4_ROWS as u32, input],
+        [u64::from(input), 1],
+    )?;
+    let mut batch_y = TensorMut(view(
+        &batch_out,
+        s,
+        [VERIFY_M4_ROWS as u32, output],
+        [u64::from(output), 1],
+    )?);
+    blas.linear_typed(ExecutionPhase::Prefill, weight, batch_x, &mut batch_y)?;
+
+    let mut serial = Vec::with_capacity(VERIFY_M4_ROWS * output as usize);
+    for row in 0..VERIFY_M4_ROWS {
+        let values = rows[row * input as usize..(row + 1) * input as usize].to_vec();
+        let x_buffer = s.clone_htod(&values)?;
+        let y_buffer = s.clone_htod(&vec![bf16::ZERO; output as usize])?;
+        let x = view(&x_buffer, s, [1, input], [u64::from(input), 1])?;
+        let mut y = TensorMut(view(&y_buffer, s, [1, output], [u64::from(output), 1])?);
+        blas.linear_typed(ExecutionPhase::Decode, weight, x, &mut y)?;
+        serial.extend(s.clone_dtoh(&y_buffer)?);
+    }
+    let batch = s.clone_dtoh(&batch_out)?;
+    let diff = verify_bf16("projection", output, usize::MAX, &batch, &serial, |index| {
+        format!(
+            "row={} col={}",
+            index / output as usize,
+            index % (output as usize)
+        )
+    })?;
+    Ok((batch.len(), diff))
+}
+
+struct VerifyAttentionFixture {
+    prefix: u32,
+    capacity: u32,
+    q_gate: Vec<bf16>,
+    k: Vec<bf16>,
+    v: Vec<bf16>,
+    q_norm: Vec<bf16>,
+    k_norm: Vec<bf16>,
+    prefix_k: Vec<bf16>,
+    prefix_v: Vec<bf16>,
+}
+
+impl VerifyAttentionFixture {
+    fn new(prefix: u32, capacity: u32, state: &mut u64) -> Self {
+        let value = |state: &mut u64| bf16::from_f32(next_f32_unit(state) * 3.0 - 1.5);
+        let q_gate = (0..VERIFY_M4_ROWS * HQ as usize * 2 * D as usize)
+            .map(|_| value(state))
+            .collect::<Vec<_>>();
+        let k = (0..VERIFY_M4_ROWS * HKV as usize * D as usize)
+            .map(|_| value(state))
+            .collect::<Vec<_>>();
+        let v = (0..VERIFY_M4_ROWS * HKV as usize * D as usize)
+            .map(|_| value(state))
+            .collect::<Vec<_>>();
+        let q_norm = (0..D as usize)
+            .map(|_| bf16::from_f32(next_f32_unit(state) * 0.25))
+            .collect::<Vec<_>>();
+        let k_norm = (0..D as usize)
+            .map(|_| bf16::from_f32(next_f32_unit(state) * 0.25))
+            .collect::<Vec<_>>();
+        let prefix_k = (0..prefix as usize * HKV as usize * D as usize)
+            .map(|_| value(state))
+            .collect::<Vec<_>>();
+        let prefix_v = (0..prefix as usize * HKV as usize * D as usize)
+            .map(|_| value(state))
+            .collect::<Vec<_>>();
+        Self {
+            prefix,
+            capacity,
+            q_gate,
+            k,
+            v,
+            q_norm,
+            k_norm,
+            prefix_k,
+            prefix_v,
+        }
+    }
+
+    fn caches(&self) -> (Vec<bf16>, Vec<bf16>) {
+        let span = self.capacity as usize * D as usize;
+        let nan = bf16::from_bits(0x7fc0);
+        let mut k = vec![nan; HKV as usize * span];
+        let mut v = vec![nan; HKV as usize * span];
+        for head in 0..HKV as usize {
+            for position in 0..self.prefix as usize {
+                let source = (head * self.prefix as usize + position) * D as usize;
+                let target = head * span + position * D as usize;
+                k[target..target + D as usize]
+                    .copy_from_slice(&self.prefix_k[source..source + D as usize]);
+                v[target..target + D as usize]
+                    .copy_from_slice(&self.prefix_v[source..source + D as usize]);
+            }
+        }
+        (k, v)
+    }
+}
+
+struct VerifyRunDump {
+    gate: Vec<bf16>,
+    q: Vec<bf16>,
+    core: Vec<bf16>,
+    k_cache: Vec<bf16>,
+    v_cache: Vec<bf16>,
+    scratch: Vec<u8>,
+    workspace: AttentionWorkspace,
+    max_parts: u32,
+}
+
+fn verify_f32_at(bytes: &[u8], offset: u64) -> Result<f32> {
+    let start = usize::try_from(offset).context("scratch offset overflow")?;
+    ensure!(
+        start.checked_add(4).is_some_and(|end| end <= bytes.len()),
+        "scratch read outside workspace"
+    );
+    Ok(f32::from_le_bytes(bytes[start..start + 4].try_into()?))
+}
+
+struct VerifyPartials {
+    max: Vec<f32>,
+    sum: Vec<f32>,
+    out: Vec<f32>,
+}
+
+fn verify_run_batch(
+    device: &Device,
+    common: &CommonOpsRef,
+    fixture: &VerifyAttentionFixture,
+    rows: u32,
+) -> Result<VerifyRunDump> {
+    let s = &device.stream;
+    let limits = AttentionLimits {
+        max_rows: rows,
+        capacity: fixture.capacity,
+        key_chunk: 256,
+        causal: 1,
+    };
+    let request = FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits)?;
+    let q_gate = s.clone_htod(&fixture.q_gate)?;
+    let k = s.clone_htod(&fixture.k)?;
+    let v = s.clone_htod(&fixture.v)?;
+    let q = s.alloc_zeros::<bf16>(rows as usize * HQ as usize * D as usize)?;
+    let gate = s.alloc_zeros::<bf16>(rows as usize * HQ as usize * D as usize)?;
+    let core = s.clone_htod(&vec![
+        bf16::from_bits(0x7fc0);
+        rows as usize * HQ as usize * D as usize
+    ])?;
+    let (host_k, host_v) = fixture.caches();
+    let k_cache = s.clone_htod(&host_k)?;
+    let v_cache = s.clone_htod(&host_v)?;
+    let q_norm = s.clone_htod(&fixture.q_norm)?;
+    let k_norm = s.clone_htod(&fixture.k_norm)?;
+    let mask = s.clone_htod(&verify_causal_mask())?;
+    let (metadata, meta_ref) = meta(
+        s,
+        fixture.prefix as i32,
+        rows as i32,
+        fixture.capacity as i32,
+    )?;
+    let scratch = s.alloc_zeros::<u8>(usize::try_from(request.bytes)?)?;
+    let (scratch_ptr, _scratch_hold) = scratch.device_ptr(s);
+    let bindings = AttentionBindings {
+        compact: None,
+        q_gate: view(
+            &q_gate,
+            s,
+            [rows, HQ, 2 * D],
+            [(HQ * 2 * D).into(), (2 * D).into(), 1],
+        )?,
+        k: view(&k, s, [rows, HKV, D], [(HKV * D).into(), D.into(), 1])?,
+        v: view(&v, s, [rows, HKV, D], [(HKV * D).into(), D.into(), 1])?,
+        q: TensorMut(view(&q, s, [rows, HQ, D], [(HQ * D).into(), D.into(), 1])?),
+        gate: TensorMut(view(
+            &gate,
+            s,
+            [rows, HQ, D],
+            [(HQ * D).into(), D.into(), 1],
+        )?),
+        k_cache: TensorMut(view(
+            &k_cache,
+            s,
+            [HKV, fixture.capacity, D],
+            [u64::from(fixture.capacity) * u64::from(D), D.into(), 1],
+        )?),
+        v_cache: TensorMut(view(
+            &v_cache,
+            s,
+            [HKV, fixture.capacity, D],
+            [u64::from(fixture.capacity) * u64::from(D), D.into(), 1],
+        )?),
+        core_out: TensorMut(view(
+            &core,
+            s,
+            [rows, HQ, D],
+            [(HQ * D).into(), D.into(), 1],
+        )?),
+        q_norm: view(&q_norm, s, [D], [1])?,
+        k_norm: view(&k_norm, s, [D], [1])?,
+        causal_mask: view(&mask, s, [VERIFY_CAUSAL_MASK_LEN as u32], [1])?,
+        positions: PositionBindings::Linear,
+    };
+    let plan = FullAttentionOps::prepare(
+        &device.ctx,
+        &FullAttentionSpec::q38(),
+        limits,
+        bindings,
+        common.clone(),
+    )?;
+    let max_parts = plan.max_parts();
+    FullAttentionOps::run(
+        &plan,
+        s,
+        meta_ref,
+        Scratch {
+            ptr: scratch_ptr,
+            bytes: request.bytes,
+        },
+    )?;
+    s.synchronize()?;
+    drop(metadata);
+    Ok(VerifyRunDump {
+        gate: s.clone_dtoh(&gate)?,
+        q: s.clone_dtoh(&q)?,
+        core: s.clone_dtoh(&core)?,
+        k_cache: s.clone_dtoh(&k_cache)?,
+        v_cache: s.clone_dtoh(&v_cache)?,
+        scratch: s.clone_dtoh(&scratch)?,
+        workspace: plan.workspace(),
+        max_parts,
+    })
+}
+
+fn verify_causal_mask() -> Vec<u64> {
+    (0..VERIFY_CAUSAL_MASK_LEN)
+        .map(|row| {
+            if row + 1 == VERIFY_CAUSAL_MASK_LEN {
+                u64::MAX
+            } else {
+                (1u64 << (row + 1)) - 1
+            }
+        })
+        .collect()
+}
+
+struct VerifySerialDump {
+    gate: Vec<bf16>,
+    q: Vec<bf16>,
+    core: Vec<bf16>,
+    k_cache: Vec<bf16>,
+    v_cache: Vec<bf16>,
+    partials: Vec<VerifyPartials>,
+}
+
+fn verify_run_serial(
+    device: &Device,
+    common: &CommonOpsRef,
+    fixture: &VerifyAttentionFixture,
+    rows: u32,
+) -> Result<VerifySerialDump> {
+    let s = &device.stream;
+    let limits = AttentionLimits {
+        max_rows: 1,
+        capacity: fixture.capacity,
+        key_chunk: 256,
+        causal: 1,
+    };
+    let request = FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits)?;
+    let (host_k, host_v) = fixture.caches();
+    let k_cache = s.clone_htod(&host_k)?;
+    let v_cache = s.clone_htod(&host_v)?;
+    let q_norm = s.clone_htod(&fixture.q_norm)?;
+    let k_norm = s.clone_htod(&fixture.k_norm)?;
+    let mask = s.clone_htod(&verify_causal_mask())?;
+    let mut q_gate = s.alloc_zeros::<bf16>(HQ as usize * 2 * D as usize)?;
+    let mut k = s.alloc_zeros::<bf16>(HKV as usize * D as usize)?;
+    let mut v = s.alloc_zeros::<bf16>(HKV as usize * D as usize)?;
+    let q = s.alloc_zeros::<bf16>(HQ as usize * D as usize)?;
+    let gate = s.alloc_zeros::<bf16>(HQ as usize * D as usize)?;
+    let mut core = s.clone_htod(&vec![bf16::from_bits(0x7fc0); HQ as usize * D as usize])?;
+    let scratch = s.alloc_zeros::<u8>(usize::try_from(request.bytes)?)?;
+    let (scratch_ptr, _scratch_hold) = scratch.device_ptr(s);
+    let mut gates = Vec::new();
+    let mut queries = Vec::new();
+    let mut outputs = Vec::new();
+    let mut partials = Vec::new();
+
+    for row in 0..rows as usize {
+        let q_gate_row = fixture.q_gate
+            [row * HQ as usize * 2 * D as usize..(row + 1) * HQ as usize * 2 * D as usize]
+            .to_vec();
+        let k_row = fixture.k
+            [row * HKV as usize * D as usize..(row + 1) * HKV as usize * D as usize]
+            .to_vec();
+        let v_row = fixture.v
+            [row * HKV as usize * D as usize..(row + 1) * HKV as usize * D as usize]
+            .to_vec();
+        s.memcpy_htod(&q_gate_row, &mut q_gate.slice_mut(..))?;
+        s.memcpy_htod(&k_row, &mut k.slice_mut(..))?;
+        s.memcpy_htod(&v_row, &mut v.slice_mut(..))?;
+        s.memcpy_htod(
+            &vec![bf16::from_bits(0x7fc0); HQ as usize * D as usize],
+            &mut core.slice_mut(..),
+        )?;
+        let prefix = fixture.prefix + row as u32;
+        let (metadata, meta_ref) = meta(s, prefix as i32, 1, fixture.capacity as i32)?;
+        let bindings = AttentionBindings {
+            compact: None,
+            q_gate: view(
+                &q_gate,
+                s,
+                [1, HQ, 2 * D],
+                [(HQ * 2 * D).into(), (2 * D).into(), 1],
+            )?,
+            k: view(&k, s, [1, HKV, D], [(HKV * D).into(), D.into(), 1])?,
+            v: view(&v, s, [1, HKV, D], [(HKV * D).into(), D.into(), 1])?,
+            q: TensorMut(view(&q, s, [1, HQ, D], [(HQ * D).into(), D.into(), 1])?),
+            gate: TensorMut(view(&gate, s, [1, HQ, D], [(HQ * D).into(), D.into(), 1])?),
+            k_cache: TensorMut(view(
+                &k_cache,
+                s,
+                [HKV, fixture.capacity, D],
+                [u64::from(fixture.capacity) * u64::from(D), D.into(), 1],
+            )?),
+            v_cache: TensorMut(view(
+                &v_cache,
+                s,
+                [HKV, fixture.capacity, D],
+                [u64::from(fixture.capacity) * u64::from(D), D.into(), 1],
+            )?),
+            core_out: TensorMut(view(&core, s, [1, HQ, D], [(HQ * D).into(), D.into(), 1])?),
+            q_norm: view(&q_norm, s, [D], [1])?,
+            k_norm: view(&k_norm, s, [D], [1])?,
+            causal_mask: view(&mask, s, [VERIFY_CAUSAL_MASK_LEN as u32], [1])?,
+            positions: PositionBindings::Linear,
+        };
+        let plan = FullAttentionOps::prepare(
+            &device.ctx,
+            &FullAttentionSpec::q38(),
+            limits,
+            bindings,
+            common.clone(),
+        )?;
+        FullAttentionOps::run(
+            &plan,
+            s,
+            meta_ref,
+            Scratch {
+                ptr: scratch_ptr,
+                bytes: request.bytes,
+            },
+        )?;
+        s.synchronize()?;
+        drop(metadata);
+        let run = VerifyRunDump {
+            gate: s.clone_dtoh(&gate)?,
+            q: s.clone_dtoh(&q)?,
+            core: s.clone_dtoh(&core)?,
+            k_cache: Vec::new(),
+            v_cache: Vec::new(),
+            scratch: s.clone_dtoh(&scratch)?,
+            workspace: plan.workspace(),
+            max_parts: plan.max_parts(),
+        };
+        let row_partials = verify_row_partials(&run, 0, prefix + 1, limits.key_chunk)?;
+        gates.extend(run.gate);
+        queries.extend(run.q);
+        outputs.extend(run.core);
+        partials.push(row_partials);
+    }
+
+    Ok(VerifySerialDump {
+        gate: gates,
+        q: queries,
+        core: outputs,
+        k_cache: s.clone_dtoh(&k_cache)?,
+        v_cache: s.clone_dtoh(&v_cache)?,
+        partials,
+    })
+}
+
+fn verify_row_partials(
+    run: &VerifyRunDump,
+    row: usize,
+    key_count: u32,
+    key_chunk: u32,
+) -> Result<VerifyPartials> {
+    let active = key_count.div_ceil(key_chunk).max(1);
+    let segment_rows = run.workspace.segment_rows as usize;
+    let mut max = Vec::with_capacity(active as usize * HQ as usize);
+    let mut sum = Vec::with_capacity(active as usize * HQ as usize);
+    let mut out = Vec::with_capacity(active as usize * HQ as usize * D as usize);
+    for head in 0..HQ as usize {
+        let kv = head / GQA as usize;
+        let group = head % GQA as usize;
+        for part in 0..active as usize {
+            let index = (kv * run.max_parts as usize + part) * (GQA as usize * segment_rows)
+                + group * segment_rows
+                + row;
+            max.push(verify_f32_at(
+                &run.scratch,
+                run.workspace.p_max + u64::try_from(index)? * 4,
+            )?);
+            sum.push(verify_f32_at(
+                &run.scratch,
+                run.workspace.p_sum + u64::try_from(index)? * 4,
+            )?);
+            for dimension in 0..D as usize {
+                out.push(verify_f32_at(
+                    &run.scratch,
+                    run.workspace.p_out
+                        + u64::try_from(index)? * u64::from(D) * 4
+                        + u64::try_from(dimension)? * 4,
+                )?);
+            }
+        }
+    }
+    ensure!(
+        max.iter().chain(&sum).chain(&out).all(|v| v.is_finite()),
+        "VERIFY_M4 non-finite partials row={row}"
+    );
+    Ok(VerifyPartials { max, sum, out })
+}
+
+fn verify_partial_sum(
+    batch: &VerifyPartials,
+    serial: &VerifyPartials,
+    case: u32,
+    row: usize,
+    active: usize,
+) -> Result<Option<String>> {
+    verify_f32("partial_sum", case, row, &batch.sum, &serial.sum, |index| {
+        format!("head={} part={}", index / active, index % active)
+    })
+}
+
+#[test]
+fn verify_partial_sum_rejects_max_substitution() -> Result<()> {
+    let batch = VerifyPartials {
+        max: vec![2.0],
+        sum: vec![1.0],
+        out: vec![3.0],
+    };
+    let serial = VerifyPartials {
+        max: vec![1.0],
+        sum: vec![2.0],
+        out: vec![3.0],
+    };
+    ensure!(
+        verify_partial_sum(&batch, &serial, 256, 0, 1)?.is_some(),
+        "distinct partial sums compared equal"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires coordinator-granted local 4090 window; FF_Q38_GPU_WINDOW=granted"]
+fn verify_attention_m4_serial_bits_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let device = Device::new(0)?;
+    ensure!(
+        device.info.arch == 89,
+        "VERIFY_M4 requires the authorized sm_89 device"
+    );
+    let ops = Ops::new(&device.ctx)?;
+    let common = CommonOpsRef::new(&device.ctx)?;
+    let runtime = std::env::temp_dir().join(format!("ff-verify-attn-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime)?;
+    let mut first_diff = None;
+    let mut defects = 0;
+    let projection = (|| -> Result<(usize, usize)> {
+        let closure = Rc::new(Closure::new(false, "VERIFY_M4 projections".into()));
+        let mut blas = Blas::new(&device, &ops, &runtime, closure)?;
+        blas.enable_fp8(&device.ctx)?;
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut words = 0;
+        let mut projection_defects = 0;
+        for (output, input) in [(12288u32, 5120u32), (1024, 5120), (5120, 6144)] {
+            let (count, diff) = verify_projection_m4(&device, &blas, output, input, &mut state)?;
+            let status = if diff.is_none() { "PASS" } else { "DEFECT" };
+            verify_record(
+                &mut first_diff,
+                &mut projection_defects,
+                &mut words,
+                count,
+                diff,
+            );
+            println!("VERIFY_M4_PROJECTION output={output} rows=4 serial=BITWISE {status}");
+        }
+        Ok((words, projection_defects))
+    })();
+    std::fs::remove_dir_all(&runtime)?;
+    let (projection_words, projection_defects) = projection?;
+    defects += projection_defects;
+
+    let cases = [
+        (251u32, 1024u32),
+        (252, 1024),
+        (253, 1024),
+        (283, 1024),
+        (284, 1024),
+        (285, 1024),
+        (507, 1024),
+        (508, 1024),
+        (509, 1024),
+        (16379, 16832),
+        (16380, 16832),
+        (16381, 16832),
+    ];
+    let mut attention_words = 0;
+    let mut partial_words = 0;
+    let mut rng = 0xf00d_face_1234_5678u64;
+    for rows in [1_u32, 2, 3, 4] {
+        for (case_index, &(prefix, capacity)) in cases.iter().enumerate() {
+            let defects_before = defects;
+            let fixture = VerifyAttentionFixture::new(prefix, capacity, &mut rng);
+            let batch = verify_run_batch(&device, &common, &fixture, rows)?;
+            let serial = verify_run_serial(&device, &common, &fixture, rows)?;
+            let row_span = HQ as usize * D as usize;
+            let cache_span = capacity as usize * D as usize;
+            for row in 0..rows as usize {
+                let base = row * row_span;
+                verify_record(
+                    &mut first_diff,
+                    &mut defects,
+                    &mut attention_words,
+                    row_span,
+                    verify_bf16(
+                        "gate",
+                        prefix,
+                        row,
+                        &batch.gate[base..base + row_span],
+                        &serial.gate[base..base + row_span],
+                        |index| format!("head={} dim={}", index / D as usize, index % D as usize),
+                    )?,
+                );
+                verify_record(
+                    &mut first_diff,
+                    &mut defects,
+                    &mut attention_words,
+                    row_span,
+                    verify_bf16(
+                        "q_rope",
+                        prefix,
+                        row,
+                        &batch.q[base..base + row_span],
+                        &serial.q[base..base + row_span],
+                        |index| format!("head={} dim={}", index / D as usize, index % D as usize),
+                    )?,
+                );
+                verify_record(
+                    &mut first_diff,
+                    &mut defects,
+                    &mut attention_words,
+                    row_span,
+                    verify_bf16(
+                        "core_out",
+                        prefix,
+                        row,
+                        &batch.core[base..base + row_span],
+                        &serial.core[base..base + row_span],
+                        |index| format!("head={} dim={}", index / D as usize, index % D as usize),
+                    )?,
+                );
+
+                for head in 0..HKV as usize {
+                    let cache_base = head * cache_span + (prefix as usize + row) * D as usize;
+                    let batch_k = batch.k_cache[cache_base..cache_base + D as usize].to_vec();
+                    let serial_k = serial.k_cache[cache_base..cache_base + D as usize].to_vec();
+                    verify_record(
+                        &mut first_diff,
+                        &mut defects,
+                        &mut attention_words,
+                        D as usize,
+                        verify_bf16("k_cache", prefix, row, &batch_k, &serial_k, |index| {
+                            format!("head={head} dim={index}")
+                        })?,
+                    );
+                    let batch_v = batch.v_cache[cache_base..cache_base + D as usize].to_vec();
+                    let serial_v = serial.v_cache[cache_base..cache_base + D as usize].to_vec();
+                    verify_record(
+                        &mut first_diff,
+                        &mut defects,
+                        &mut attention_words,
+                        D as usize,
+                        verify_bf16("v_cache", prefix, row, &batch_v, &serial_v, |index| {
+                            format!("head={head} dim={index}")
+                        })?,
+                    );
+                }
+
+                let key_count = prefix + row as u32 + 1;
+                let batch_partials = verify_row_partials(&batch, row, key_count, 256)?;
+                let serial_partials = &serial.partials[row];
+                let active = key_count.div_ceil(256) as usize;
+                verify_record(
+                    &mut first_diff,
+                    &mut defects,
+                    &mut partial_words,
+                    batch_partials.max.len(),
+                    verify_f32(
+                        "partial_max",
+                        prefix,
+                        row,
+                        &batch_partials.max,
+                        &serial_partials.max,
+                        |index| format!("head={} part={}", index / active, index % active),
+                    )?,
+                );
+                verify_record(
+                    &mut first_diff,
+                    &mut defects,
+                    &mut partial_words,
+                    batch_partials.sum.len(),
+                    verify_partial_sum(&batch_partials, serial_partials, prefix, row, active)?,
+                );
+                let out_stride = active * D as usize;
+                verify_record(
+                    &mut first_diff,
+                    &mut defects,
+                    &mut partial_words,
+                    batch_partials.out.len(),
+                    verify_f32(
+                        "partial_out",
+                        prefix,
+                        row,
+                        &batch_partials.out,
+                        &serial_partials.out,
+                        |index| {
+                            format!(
+                                "head={} part={} dim={}",
+                                index / out_stride,
+                                index % out_stride / D as usize,
+                                index % D as usize
+                            )
+                        },
+                    )?,
+                );
+            }
+
+            for (stage, batch_cache, serial_cache) in [
+                ("k_cache", &batch.k_cache, &serial.k_cache),
+                ("v_cache", &batch.v_cache, &serial.v_cache),
+            ] {
+                let diff = batch_cache
+                .iter()
+                .zip(serial_cache)
+                .enumerate()
+                .find_map(|(index, (x, y))| {
+                    (x.to_bits() != y.to_bits()).then(|| {
+                        format!(
+                            "VERIFY_M4 first_diff stage=full_{stage} case={prefix} at={index} batch={:#04x} serial={:#04x}",
+                            x.to_bits(),
+                            y.to_bits()
+                        )
+                    })
+                });
+                verify_record(
+                    &mut first_diff,
+                    &mut defects,
+                    &mut attention_words,
+                    batch_cache.len(),
+                    diff,
+                );
+            }
+            let status = if defects == defects_before {
+                "PASS"
+            } else {
+                "DEFECT"
+            };
+            println!(
+                "VERIFY_M4_CASE index={case_index} rows={rows} prefix={prefix} key_counts={}..{} capacity={capacity} projection_through_cache=BITWISE {status}",
+                prefix + 1,
+                prefix + rows
+            );
+        }
+    }
+
+    if defects == 0 {
+        println!(
+            "VERIFY_M4_KERNEL_PASS cases={} rows=4 projections=3 projection_words={projection_words} attention_words={attention_words} partial_words={partial_words} arch={}",
+            cases.len(),
+            device.info.arch
+        );
+        return Ok(());
+    }
+    println!(
+        "VERIFY_M4_KERNEL_DEFECT cases={} rows=4 defects={defects} projections=3 projection_words={projection_words} attention_words={attention_words} partial_words={partial_words} arch={}",
+        cases.len(),
+        device.info.arch
+    );
+    anyhow::bail!(
+        "{}",
+        first_diff.context("VERIFY_M4 defect without a location")?
+    )
 }
 
 #[test]
