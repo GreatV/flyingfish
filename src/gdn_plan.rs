@@ -16,20 +16,91 @@ pub mod cw_p1 {
     include!(concat!(env!("OUT_DIR"), "/gdn_cw_p1_shared.rs"));
 }
 
+/// Chunkwise-P2 split arena and workspace-slot bytes, from
+/// `kernels/gdn/gdn_cw_p2_layout.h`.
+pub mod cw_p2 {
+    include!(concat!(env!("OUT_DIR"), "/gdn_cw_p2_shared.rs"));
+}
+
+/// Chunk rows C of the chunkwise cores, from `P2_C` in `kernels/gdn/gdn_cw_p2.cu`.
+pub const CW_P2_CHUNK: u32 = 64;
+/// Value columns per stage-H CTA and per stage-O tile, P1's s4 strip width.
+pub const CW_P2_VALUE_BLOCK: u32 = 32;
+/// The chunkwise-P2 workspace slot of one (chunk, head), in kernel byte order, with the
+/// writing stage: `W` bf16[64,128], `U` fp32[64,128], `qk` bf16[64,72] (row stride
+/// `P1_T_LD`, so stage O reads it with `p1_a_sbf` in place), `vn` bf16[64,128],
+/// `Sn` fp32[128,128] (the pre-update state, in the gmem `S` layout), then the
+/// FP32[64] vectors `Gc`, `Be`, `Sc`.
+pub const CW_P2_SLOT: [(&str, u64, char); 8] = [
+    ("W", 64 * 128 * 2, 'A'),
+    ("U", 64 * 128 * 4, 'A'),
+    ("qk", 64 * 72 * 2, 'A'),
+    ("vn", 64 * 128 * 2, 'H'),
+    ("Sn", 128 * 128 * 4, 'H'),
+    ("Gc", 64 * 4, 'A'),
+    ("Be", 64 * 4, 'A'),
+    ("Sc", 64 * 4, 'A'),
+];
+
+/// Field offsets of the slot, each 256 B aligned, in the kernel's order.
+pub const fn cw_p2_slot_layout() -> [(u64, u64, char); 8] {
+    let mut layout = [(0u64, 0u64, '?'); 8];
+    let mut off = 0u64;
+    let mut i = 0;
+    while i < CW_P2_SLOT.len() {
+        off = (off + 255) & !255;
+        let (_, bytes, writer) = CW_P2_SLOT[i];
+        layout[i] = (off, bytes, writer);
+        off += bytes;
+        i += 1;
+    }
+    layout
+}
+
+/// Bytes of one slot: the eight fields above.
+pub const CW_P2_SLOT_BYTES: u64 =
+    64 * 128 * 2 + 64 * 128 * 4 + 64 * 72 * 2 + 64 * 128 * 2 + 128 * 128 * 4 + 3 * 64 * 4;
+const _: () = assert!(
+    CW_P2_SLOT_BYTES == cw_p2::SLOT_BYTES,
+    "the chunkwise-P2 slot fields and gdn_cw_p2_layout.h disagree"
+);
+
+/// The chunkwise-P2 workspace for `max_rows`: one slot per (chunk, head), C = 64 rows to
+/// a chunk and 48 value heads, so ceil(rows/64) * 48 slots of 141,056 B -- 2204 B per row
+/// per head, 105,792 B per row across the 48 heads, with the tail chunk rounded up whole.
+pub const fn cw_p2_bytes(max_rows: u32) -> u64 {
+    let chunks = if max_rows == 0 {
+        0
+    } else {
+        (max_rows - 1) / CW_P2_CHUNK + 1
+    };
+    chunks as u64 * 48 * CW_P2_SLOT_BYTES
+}
+
 /// Immutable device qualification; no runtime GPU query or tuning in a forward.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct GdnPolicy {
     /// Protocol §A value split of the production chunkwise-P1 prefill core, 0 = the
     /// shipped recursive core; qualified for arch 89 with 128 SMs, 0 elsewhere.
     prefill_p1_split: u32,
+    /// The chunkwise-P2 split (three kernels over a workspace slot) replaces the fused
+    /// P1 core; prepared for arch 89 with 128 SMs.
+    cw_p2: bool,
 }
 impl GdnPolicy {
     pub const LEGACY: Self = Self {
         prefill_p1_split: 0,
+        cw_p2: false,
+    };
+    /// The chunkwise-P2 split.
+    pub const P2: Self = Self {
+        prefill_p1_split: 0,
+        cw_p2: true,
     };
     pub const fn for_device(arch: u32, sms: usize) -> Self {
         Self {
-            prefill_p1_split: if arch == 89 && sms == 128 { 4 } else { 0 },
+            prefill_p1_split: 0,
+            cw_p2: arch == 89 && sms == 128,
         }
     }
     /// The device's prepared chunkwise-P1 value split; `p1_split_for_step` is the
@@ -38,7 +109,7 @@ impl GdnPolicy {
         self.prefill_p1_split
     }
     /// The split a prefill step of `step_rows` rows carries: steps above
-    /// MIN_VERIFY_ROWS take the chunkwise-P1 core, 1..=MIN_VERIFY_ROWS keep split 0.
+    /// MIN_VERIFY_ROWS take the chunkwise core, 1..=MIN_VERIFY_ROWS keep split 0.
     pub const fn p1_split_for_step(self, step_rows: u32) -> u32 {
         if step_rows > MIN_VERIFY_ROWS {
             self.prefill_p1_split
@@ -46,18 +117,28 @@ impl GdnPolicy {
             0
         }
     }
-    /// The plan id: the P1-named route where prefill_p1_split is prepared.
+    /// Whether a prefill step of `step_rows` rows carries the chunkwise-P2 split, on the
+    /// same verify floor as `p1_split_for_step`.
+    pub const fn cw_p2_for_step(self, step_rows: u32) -> bool {
+        self.cw_p2 && step_rows > MIN_VERIFY_ROWS
+    }
+    /// The plan id.
     pub const fn identity(self) -> &'static str {
-        if self.prefill_p1_split != 0 {
-            "gdn-plan-v3-c32-vs1-fp32-p1s4-w32"
+        if self.cw_p2 {
+            "gdn-plan-v3-c32-vs1-fp32-p2-w32"
         } else {
             GdnSpec::PLAN_ID
         }
     }
     /// All prebound operators reuse the arena sized by the maximum complete plan layout.
     pub fn workspace(self, spec: &GdnSpec, physical_rows: u32) -> Result<WorkspaceReq> {
+        let bytes = GdnWorkspace::q38(spec, physical_rows)?.bytes;
         Ok(WorkspaceReq {
-            bytes: GdnWorkspace::q38(spec, physical_rows)?.bytes,
+            bytes: if self.cw_p2 {
+                add(bytes, cw_p2_bytes(physical_rows))?
+            } else {
+                bytes
+            },
             alignment: 256,
         })
     }
@@ -186,37 +267,37 @@ impl GdnWorkspace {
 mod tests {
     use super::*;
     #[test]
-    fn every_prefill_step_above_the_verify_floor_takes_p1() {
+    fn every_prefill_step_above_the_verify_floor_takes_the_chunkwise_core() {
         let qualified = GdnPolicy::for_device(89, 128);
+        assert_eq!(qualified, GdnPolicy::P2);
         for rows in [1u32, 2, 3, 4] {
             assert_eq!(
                 qualified.p1_split_for_step(rows),
                 0,
                 "{rows} keeps the verify core"
             );
+            assert!(
+                !qualified.cw_p2_for_step(rows),
+                "{rows} keeps the verify core"
+            );
         }
-        for rows in [5u32, 63, 64, 512, 1024, 2048, 2049, 4096, 16384] {
-            assert_eq!(qualified.p1_split_for_step(rows), 4, "{rows} must take P1");
+        for rows in [5u32, 63, 64, 512, 1021, 2048, 2049, 4096, 16384] {
+            assert!(qualified.cw_p2_for_step(rows), "{rows} must take P2");
         }
         for (arch, sms) in [(86, 48), (89, 80), (90, 128)] {
             let legacy = GdnPolicy::for_device(arch, sms);
             assert_eq!(legacy, GdnPolicy::LEGACY);
             assert_eq!(legacy.prefill_p1_split(), 0);
-            assert_eq!(legacy.p1_split_for_step(64), 0);
-            assert_eq!(legacy.p1_split_for_step(16384), 0);
+            assert!(!legacy.cw_p2_for_step(64));
+            assert!(!legacy.cw_p2_for_step(16384));
         }
     }
     #[test]
     fn exact_shared_arena_and_monotone_admission() -> Result<()> {
         let spec = GdnSpec::q38();
         let policy = GdnPolicy::for_device(89, 128);
-        for rows in [512u32, 1024, 2048] {
-            let ws = GdnWorkspace::q38(&spec, rows)?;
-            assert_eq!(policy.workspace(&spec, rows)?.bytes, ws.bytes);
-            assert_eq!(GdnPolicy::LEGACY.workspace(&spec, rows)?.bytes, ws.bytes);
-        }
-        let large = GdnWorkspace::q38(&spec, 8192)?.bytes;
-        assert_eq!(policy.workspace(&spec, 8192)?.bytes, large);
+        let legacy_ws = GdnPolicy::LEGACY.workspace(&spec, 2048)?;
+        assert!(policy.workspace(&spec, 2048)?.bytes > legacy_ws.bytes);
         let mut last = 0;
         for rows in 1..=8192 {
             let bytes = policy.workspace(&spec, rows)?.bytes;

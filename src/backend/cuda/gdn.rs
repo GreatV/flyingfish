@@ -56,7 +56,9 @@ pub(crate) fn take_phase_log() -> Vec<&'static str> {
 use super::contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut};
 use super::cubin;
 use super::ops::{CommonOpsRef, GdnGateBindings};
-use crate::gdn_plan::{GdnPolicy, GdnWorkspace, Region, add, cw_p1, mul};
+use crate::gdn_plan::{
+    CW_P2_CHUNK, CW_P2_VALUE_BLOCK, GdnPolicy, GdnWorkspace, Region, add, cw_p2, cw_p2_bytes, mul,
+};
 use crate::op_contract::{ExecutionPhase, GdnSpec, WorkspaceReq};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
@@ -84,9 +86,9 @@ const PREP_THREADS: u32 = 128;
 /// `GDN_RS_INTERFACE.md` §7. Static shared memory in all three is 0.
 const RECURRENT_SMEM: u32 = 4096;
 const CHUNKED_SMEM: u32 = 62_336;
-/// Chunkwise P1 core thread block (protocol §E: 256 threads for the state pass).
-/// Its dynamic shared-memory size is per split and comes from `gdn_cw_p1_layout.h`.
-const P1_THREADS: u32 = 256;
+/// Chunkwise-P2 core thread block, the same 256 threads; all three stages use the one
+/// arena whose size comes from `gdn_cw_p2_layout.h`.
+const P2_THREADS: u32 = 256;
 
 /// The ABI §6 views. Every field carries an explicit stride and span; `prepare`
 /// validates them against the registered layout rather than assuming widths.
@@ -128,27 +130,34 @@ struct Kernels {
     rstep: Option<CudaFunction>,
     hist_snapshot: CudaFunction,
     core_snapshot: CudaFunction,
-    /// Bound only when the plan was prepared with a non-zero chunkwise P1 split.
-    p1: Option<ChunkwiseP1>,
+    /// Bound only when the plan was prepared for the chunkwise-P2 split.
+    p2: Option<ChunkwiseP2>,
 }
 
-/// Phase-2 chunkwise P1 cores (precision protocol §D/§E), one entry point per value
-// split; the split is a compile-time property of the kernel's register state tile.
-struct ChunkwiseP1 {
-    s4: CudaFunction,
-    s8: CudaFunction,
-    s16: CudaFunction,
+/// The three chunkwise-P2 stages. They are launched in the order A, H, O on one stream
+/// with nothing between them: A fills the workspace slot, H walks the chunks in order
+/// and O reads the slot that launch sequence produced.
+struct ChunkwiseP2 {
+    a: CudaFunction,
+    h: CudaFunction,
+    o: CudaFunction,
 }
 
-impl ChunkwiseP1 {
-    fn select(&self, split: u32) -> Result<(&CudaFunction, u32)> {
-        Ok(match split {
-            4 => (&self.s4, cw_p1::S4_BYTES),
-            8 => (&self.s8, cw_p1::S8_BYTES),
-            16 => (&self.s16, cw_p1::S16_BYTES),
-            _ => anyhow::bail!("chunkwise P1 value split {split} is not one of 4/8/16"),
-        })
-    }
+/// The three chunkwise-P2 launch configs for a plan bound at `rows`: stage A and stage O
+/// run one CTA per (chunk, head) with grid.x = ceil(rows/64), stage H one CTA per
+/// 32-wide value block with grid.x = DV/32, so its grid never moves with the step.
+fn cw_p2_grids(rows: u32) -> (LaunchConfig, LaunchConfig, LaunchConfig) {
+    let per_chunk = LaunchConfig {
+        grid_dim: (rows.div_ceil(CW_P2_CHUNK), HV, 1),
+        block_dim: (P2_THREADS, 1, 1),
+        shared_mem_bytes: cw_p2::SMEM_BYTES as u32,
+    };
+    let per_value_block = LaunchConfig {
+        grid_dim: (DV / CW_P2_VALUE_BLOCK, HV, 1),
+        block_dim: (P2_THREADS, 1, 1),
+        shared_mem_bytes: cw_p2::SMEM_BYTES as u32,
+    };
+    (per_chunk, per_value_block, per_chunk)
 }
 
 /// CUDA caps gridDim.y and gridDim.z at 65535; prep puts rows on gridDim.z and beta on gridDim.y.
@@ -191,9 +200,11 @@ pub(crate) struct GdnPlan {
     hist_cfg: LaunchConfig,
     chunked_cfg: LaunchConfig,
     recurrent_cfg: LaunchConfig,
-    /// Protocol §A value split of the prepared chunkwise P1 core, 0 when the plan
-    /// keeps the shipped recursive core; fixed in `prepare`.
-    p1_split: u32,
+    /// Whether this plan carries the chunkwise-P2 split instead of the shipped core.
+    cw_p2: bool,
+    /// Chunkwise-P2 workspace bytes this plan needs past `ws.bytes`, 0 when it does not
+    /// carry the split. The slot region starts at `ws.bytes`.
+    ws_p2: u64,
 }
 
 impl GdnPlan {
@@ -249,6 +260,8 @@ impl GdnPlan {
         check_bindings(&bindings, rows, self.conv_dim)?;
         let (prep_cfg, beta_cfg, conv_cfg) =
             prep_grids(self.prep_cfg, self.beta_cfg, self.conv_cfg, rows)?;
+        // 1..=MIN_VERIFY_ROWS keeps the shipped core.
+        let cw_p2 = self.cw_p2 && rows > crate::gdn_plan::MIN_VERIFY_ROWS;
         Ok(Self {
             snapshots: None,
             kernels: self.kernels.clone(),
@@ -264,31 +277,29 @@ impl GdnPlan {
             hist_cfg: self.hist_cfg,
             chunked_cfg: self.chunked_cfg,
             recurrent_cfg: self.recurrent_cfg,
-            // 1..=MIN_VERIFY_ROWS keeps the shipped core: `run_verify` rejects a P1 plan.
-            p1_split: if rows > crate::gdn_plan::MIN_VERIFY_ROWS {
-                self.p1_split
-            } else {
-                0
-            },
+            ws_p2: if cw_p2 { cw_p2_bytes(rows) } else { 0 },
+            cw_p2,
         })
     }
 
-    /// Phase-2 chunkwise P1 core (precision protocol §D/§E); `split` selects the entry point and grid.x.
-    pub(crate) fn run_chunkwise_p1(
+    /// The chunkwise-P2 prefill core: stage A, then stage H, then stage O, three launches
+    /// back to back on the caller's stream with no synchronisation between them. Stage A
+    /// and stage O size their grid from the rows the plan binds, stage H from the value
+    /// strip; all three resolve the row count on the device, so a captured Graph replays
+    /// the identical sequence.
+    pub(crate) fn gdn_cw_p2_step(
         &self,
         stream: &Arc<CudaStream>,
         meta: SeqRef,
         scratch: Scratch,
-        split: u32,
     ) -> Result<()> {
         meta.validate()?;
-        scratch.validate(self.ws.bytes)?;
-        let p1 = self
+        scratch.validate(add(self.ws.bytes, self.ws_p2)?)?;
+        let p2 = self
             .kernels
-            .p1
+            .p2
             .as_ref()
-            .context("chunkwise P1 core was not bound by prepare")?;
-        let (core, smem) = p1.select(split)?;
+            .context("chunkwise P2 stages were not bound by prepare")?;
         let rows = self.max_rows;
         let ws = scratch.ptr;
         let q = ws_f32_3(self.ws.q_fp32, ws, rows, HV, DK)?;
@@ -296,26 +307,47 @@ impl GdnPlan {
         let v = ws_f32_3(self.ws.v_fp32, ws, rows, HV, DV)?;
         let beta = ws_f32(self.ws.beta_fp32, ws, rows, HV)?;
         let g = ws_f32(self.ws.g, ws, rows, HV)?;
-        let cfg = LaunchConfig {
-            grid_dim: (split, HV, 1),
-            block_dim: (P1_THREADS, 1, 1),
-            shared_mem_bytes: smem,
-        };
+        // The slot region starts where the fused layout ends; that end is 256 B aligned
+        // and the host scratch pointer is 256 B aligned, which the stages require.
+        let slot = add(ws, self.ws.bytes)?;
+        let (a_cfg, h_cfg, o_cfg) = cw_p2_grids(rows);
         unsafe {
             stream
-                .launch_builder(core)
+                .launch_builder(&p2.a)
+                .arg(&q.0.ptr)
+                .arg(&k.0.ptr)
+                .arg(&v.0.ptr)
+                .arg(&beta.0.ptr)
+                .arg(&g.0.ptr)
+                .arg(&slot)
+                .arg(&meta.ptr)
+                // 0 is the sentinel that makes the kernel read `meta->valid_rows`.
+                .arg(&0i32)
+                .launch(a_cfg)?;
+            stream
+                .launch_builder(&p2.h)
                 .arg(&q.0.ptr)
                 .arg(&k.0.ptr)
                 .arg(&v.0.ptr)
                 .arg(&beta.0.ptr)
                 .arg(&g.0.ptr)
                 .arg(&self.bindings.s.0.ptr)
+                .arg(&slot)
+                .arg(&meta.ptr)
+                .arg(&0i32)
+                .launch(h_cfg)?;
+            stream
+                .launch_builder(&p2.o)
+                .arg(&q.0.ptr)
+                .arg(&k.0.ptr)
+                .arg(&v.0.ptr)
+                .arg(&beta.0.ptr)
+                .arg(&g.0.ptr)
+                .arg(&slot)
                 .arg(&self.bindings.core_out.0.ptr)
                 .arg(&meta.ptr)
-                // 0 is the sentinel that makes the kernel read `meta->valid_rows`,
-                // as the chunked core does, so a captured Graph replays it.
                 .arg(&0i32)
-                .launch(cfg)?;
+                .launch(o_cfg)?;
         }
         Ok(())
     }
@@ -345,14 +377,9 @@ impl GdnOps {
         max_rows: u32,
         bindings: GdnBindings,
         common: CommonOpsRef,
-        p1_split: u32,
+        cw_p2: bool,
     ) -> Result<GdnPlan> {
         spec.validate()?;
-        // 4/8/16 or not bound: an unknown split must name itself, not fall back.
-        ensure!(
-            matches!(p1_split, 0 | 4 | 8 | 16),
-            "GDN chunkwise P1 split {p1_split} is not 0 (off) or 4/8/16"
-        );
         ensure!(
             HK * GQA == HV,
             "GDN GQA {GQA} does not expand {HK} key heads to {HV} value heads"
@@ -373,9 +400,7 @@ impl GdnOps {
         for (name, bytes) in [
             ("recurrent", u64::from(RECURRENT_SMEM)),
             ("chunked", u64::from(CHUNKED_SMEM)),
-            ("chunkwise P1 s4", u64::from(cw_p1::S4_BYTES)),
-            ("chunkwise P1 s8", u64::from(cw_p1::S8_BYTES)),
-            ("chunkwise P1 s16", u64::from(cw_p1::S16_BYTES)),
+            ("chunkwise P2 stages", cw_p2::SMEM_BYTES),
         ] {
             ensure!(
                 bytes <= optin,
@@ -425,14 +450,14 @@ impl GdnOps {
         };
         // All three arenas are under the 48 KiB no-opt-in cap, so they need no
         // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES.
-        let p1 = if p1_split == 0 {
+        let p2 = if !cw_p2 {
             None
         } else {
-            let p1_mod = cubin::module(ctx, "gdn/gdn_chunkwise_p1")?;
-            Some(ChunkwiseP1 {
-                s4: p1_mod.load_function("gdn_chunkwise_p1_core_s4")?,
-                s8: p1_mod.load_function("gdn_chunkwise_p1_core_s8")?,
-                s16: p1_mod.load_function("gdn_chunkwise_p1_core_s16")?,
+            let p2_mod = cubin::module(ctx, "gdn/gdn_cw_p2")?;
+            Some(ChunkwiseP2 {
+                a: p2_mod.load_function("gdn_cw_p2_stage_a")?,
+                h: p2_mod.load_function("gdn_cw_p2_stage_h")?,
+                o: p2_mod.load_function("gdn_cw_p2_stage_o")?,
             })
         };
         let kernels = Kernels {
@@ -445,7 +470,7 @@ impl GdnOps {
             beta_widen: f_beta,
             chunked: f_chunked,
             recurrent: f_recurrent,
-            p1,
+            p2,
         };
         // Grids derive from the rows the plan binds, never from device valid_rows, so a captured Graph replays an identical launch sequence.
         let (prep_cfg, beta_cfg, conv_cfg) = prep_grids(
@@ -493,7 +518,8 @@ impl GdnOps {
                 block_dim: (CORE_THREADS, 1, 1),
                 shared_mem_bytes: RECURRENT_SMEM,
             },
-            p1_split,
+            ws_p2: if cw_p2 { cw_p2_bytes(max_rows) } else { 0 },
+            cw_p2,
         })
     }
 
@@ -544,10 +570,10 @@ impl GdnOps {
         };
         meta.validate()?;
         ensure!(
-            !verify || plan.p1_split == 0,
-            "chunkwise P1 plan cannot verify; verify keeps the recurrent core"
+            !verify || !plan.cw_p2,
+            "chunkwise plan cannot verify; verify keeps the recurrent core"
         );
-        scratch.validate(plan.ws.bytes)?;
+        scratch.validate(add(plan.ws.bytes, plan.ws_p2)?)?;
         let b = &plan.bindings;
         let cd = plan.conv_dim;
         let rows = plan.max_rows;
@@ -689,15 +715,15 @@ impl GdnOps {
         // precisely the trap this assertion was meant to avoid. Test-only; compiles out.
         #[cfg(test)]
         record_phase(match phase {
-            ExecutionPhase::Prefill if plan.p1_split != 0 => "chunkwise_p1",
+            ExecutionPhase::Prefill if plan.cw_p2 => "chunkwise_p2",
             ExecutionPhase::Prefill if rstep.is_some() => "rstep",
             ExecutionPhase::Prefill => "chunked",
             ExecutionPhase::Decode => "recurrent",
         });
         unsafe {
             match phase {
-                ExecutionPhase::Prefill if plan.p1_split != 0 => {
-                    plan.run_chunkwise_p1(stream, meta, scratch, plan.p1_split)?;
+                ExecutionPhase::Prefill if plan.cw_p2 => {
+                    plan.gdn_cw_p2_step(stream, meta, scratch)?;
                 }
                 ExecutionPhase::Prefill if snapshots.is_some() => {
                     let (state, _) = snapshots.context("missing snapshot bindings")?;
@@ -1321,6 +1347,155 @@ mod tests {
         assert_eq!(GDN_CONV_DIM, 2 * HK * DK + HV * DV);
     }
 
+    /// The chunkwise-P2 slot offsets are the kernels' `P2_OFF_*` values: each 256 B
+    /// aligned, pairwise disjoint, filling a slot of exactly `GDN_CW_P2_SLOT_BYTES`, and
+    /// the planner's byte count is that many slots per (chunk, head).
+    #[test]
+    fn cw_p2_slot_is_aligned_and_the_planner_sizes_it_exactly() -> Result<()> {
+        let layout = crate::gdn_plan::cw_p2_slot_layout();
+        assert_eq!(layout.len(), crate::gdn_plan::CW_P2_SLOT.len());
+        let mut spans: Vec<(u64, u64, &str)> = Vec::new();
+        for ((name, bytes, _), (offset, laid_out, _)) in
+            crate::gdn_plan::CW_P2_SLOT.iter().zip(&layout)
+        {
+            assert_eq!(bytes, laid_out, "{name} size disagrees with the layout");
+            assert!(
+                offset.is_multiple_of(256),
+                "{name} at {offset} is not 256 B aligned"
+            );
+            spans.push((*offset, *offset + *bytes, name));
+        }
+        spans.sort();
+        for w in spans.windows(2) {
+            assert!(w[0].1 <= w[1].0, "{} overlaps {}", w[0].2, w[1].2);
+        }
+        assert_eq!(
+            spans.last().expect("fields").1,
+            cw_p2::SLOT_BYTES,
+            "the slot does not close over its fields"
+        );
+        assert_eq!(cw_p2::SLOT_BYTES, 141_056, "the kernel slot size moved");
+
+        let spec = GdnSpec::q38();
+        for rows in [1u32, 64, 2048, 16384] {
+            let slots = u64::from(rows.div_ceil(CW_P2_CHUNK)) * u64::from(HV);
+            assert_eq!(cw_p2_bytes(rows), slots * cw_p2::SLOT_BYTES, "rows={rows}");
+            // The planner's number, with the split armed, is the fused layout plus the
+            // slots; unarmed it is the fused layout alone.
+            let fused = GdnWorkspace::q38(&spec, rows)?.bytes;
+            assert_eq!(
+                GdnPolicy::P2.workspace(&spec, rows)?.bytes,
+                fused + cw_p2_bytes(rows),
+                "rows={rows}"
+            );
+            assert_eq!(
+                GdnPolicy::LEGACY.workspace(&spec, rows)?.bytes,
+                fused,
+                "the split must not tax a plan that does not carry it, rows={rows}"
+            );
+            // Every slot sits inside the region the plan accounts for.
+            assert!(cw_p2_bytes(rows).is_multiple_of(256), "rows={rows}");
+        }
+        Ok(())
+    }
+
+    /// The three chunkwise-P2 grids derive from the rows the plan binds: stage A and O get
+    /// one CTA per (chunk, head), stage H one per 32-wide value block, so its grid does not
+    /// move with the step at all.
+    #[test]
+    fn cw_p2_grids_are_a_function_of_the_bound_rows() {
+        for (rows, want_chunks) in [(2048u32, 32u32), (16384, 256)] {
+            let (a, h, o) = cw_p2_grids(rows);
+            assert_eq!(
+                a.grid_dim,
+                (want_chunks, HV, 1),
+                "stage A grid, rows={rows}"
+            );
+            assert_eq!(
+                o.grid_dim,
+                (want_chunks, HV, 1),
+                "stage O grid, rows={rows}"
+            );
+            assert_eq!(
+                h.grid_dim,
+                (4, HV, 1),
+                "stage H covers DV in 32-wide blocks, rows={rows}"
+            );
+            for cfg in [a, h, o] {
+                assert_eq!(cfg.block_dim, (P2_THREADS, 1, 1));
+                assert_eq!(cfg.shared_mem_bytes, cw_p2::SMEM_BYTES as u32);
+            }
+        }
+        // The H grid is the same whatever the step is; the per-chunk grid is monotone.
+        assert_eq!(cw_p2_grids(5).0.grid_dim, cw_p2_grids(64).0.grid_dim);
+        assert!(cw_p2_grids(16384).0.grid_dim.0 > cw_p2_grids(2048).0.grid_dim.0);
+        for rows in [5u32, 64, 2048, 16384] {
+            assert_eq!(cw_p2_grids(rows).1.grid_dim, cw_p2_grids(2048).1.grid_dim);
+        }
+    }
+
+    /// The chunkwise-P2 stage dependency contract as a CPU model: within one (chunk, head)
+    /// slot, stage A writes W, U, qk, Gc, Be and Sc and stage H writes vn and Sn, no field
+    /// has a second writer, no field is written twice for the same pair, and stage O writes
+    /// nothing into the slot at all.
+    #[test]
+    fn every_cw_p2_slot_field_has_exactly_one_writing_stage() {
+        let rows = 2048u32;
+        let slots = usize::try_from(rows.div_ceil(CW_P2_CHUNK)).expect("nchunk") * HV as usize;
+        let fields = crate::gdn_plan::CW_P2_SLOT.len();
+        // writers[field][slot]: how many stages write that field of that slot.
+        let mut writers = vec![vec![0u8; slots]; fields];
+        for (index, (_, _, writer)) in crate::gdn_plan::CW_P2_SLOT.iter().enumerate() {
+            for count in &mut writers[index] {
+                *count += 1;
+            }
+            assert_ne!(*writer, 'O', "stage O must not write into the slot");
+            let stage = *writer;
+            assert!(
+                stage == 'A' || stage == 'H',
+                "field written by an unknown stage {stage}"
+            );
+        }
+        for (index, count) in writers.iter().enumerate() {
+            let name = crate::gdn_plan::CW_P2_SLOT[index].0;
+            assert!(
+                count.iter().all(|c| *c == 1),
+                "{name} is not written exactly once for every (chunk, head)"
+            );
+        }
+        let by_a: Vec<&str> = crate::gdn_plan::CW_P2_SLOT
+            .iter()
+            .filter(|(_, _, w)| *w == 'A')
+            .map(|(n, _, _)| *n)
+            .collect();
+        let by_h: Vec<&str> = crate::gdn_plan::CW_P2_SLOT
+            .iter()
+            .filter(|(_, _, w)| *w == 'H')
+            .map(|(n, _, _)| *n)
+            .collect();
+        assert_eq!(by_a, ["W", "U", "qk", "Gc", "Be", "Sc"], "stage A outputs");
+        assert_eq!(by_h, ["vn", "Sn"], "stage H outputs");
+        // Stage A's outputs are what stage H and stage O read, so both of those slots must
+        // be full for every chunk and head the plan covers.
+        let layout = crate::gdn_plan::cw_p2_slot_layout();
+        for chunk in 0..slots / HV as usize {
+            for head in 0..HV as usize {
+                let base = chunk * HV as usize + head;
+                for (index, (offset, bytes, _)) in layout.iter().enumerate() {
+                    let name = crate::gdn_plan::CW_P2_SLOT[index].0;
+                    assert!(
+                        offset + bytes <= cw_p2::SLOT_BYTES,
+                        "{name} runs past its slot"
+                    );
+                    assert_eq!(
+                        writers[index][base], 1,
+                        "{name} at chunk {chunk} head {head}"
+                    );
+                }
+            }
+        }
+    }
+
     fn valid_bindings(rows: u32) -> GdnBindings {
         let cd = GDN_CONV_DIM;
         let bf = size_of::<bf16>() as u64;
@@ -1795,7 +1970,14 @@ mod gpu_probe {
     ) -> Result<()> {
         let s = &device.stream;
         let b = bindings(c, s, swap_gates)?;
-        let plan = GdnOps::prepare(&device.ctx, &GdnSpec::q38(), c.man.plan_rows, b, common, 0)?;
+        let plan = GdnOps::prepare(
+            &device.ctx,
+            &GdnSpec::q38(),
+            c.man.plan_rows,
+            b,
+            common,
+            false,
+        )?;
         let (meta_buf, meta) = meta_device(
             s,
             c.man.prefix,

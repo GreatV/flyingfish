@@ -482,9 +482,9 @@ impl Runtime {
                                 )?),
                             },
                             common.clone(),
-                            // The planner's derived chunkwise-P1 split for a plan bound
+                            // The planner's derived chunkwise-P2 split for a plan bound
                             // at `active_rows`; steps of at most MIN_VERIFY_ROWS keep 0.
-                            gdn_policy.p1_split_for_step(active_rows as u32),
+                            gdn_policy.cw_p2_for_step(active_rows as u32),
                         )
                     };
                     BoundMixer::Gdn {
