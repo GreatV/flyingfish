@@ -52,6 +52,7 @@ fn main() -> Result<()> {
         draft_model: None,
         runtime_dir: Some(paths[3].clone()),
         prefix_cache: false,
+        kv_format: flyingfish::kv::KvFormat::Bf16,
     };
     let mut model = Model::load(&paths[0], 0, 128, Some(128), settings)?;
     model.check_ready()?;

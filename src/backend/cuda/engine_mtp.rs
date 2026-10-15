@@ -228,6 +228,7 @@ impl MtpRuntime {
             &crate::op_contract::FullAttentionSpec::q38(),
             limits(rows, self.plan.capacity)?,
             AttentionBindings {
+                compact: None,
                 q_gate: heads(&self.work.qkv, s, 0, rows, 24, 512)?,
                 k: heads(&self.work.qkv, s, self.plan.max_rows * 12288, rows, 4, 256)?,
                 v: heads(

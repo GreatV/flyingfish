@@ -5,6 +5,7 @@ pub mod config;
 pub mod dspark;
 pub mod fp8;
 pub mod gdn_plan;
+pub mod kv;
 pub mod linear_plan;
 pub mod model;
 pub mod model_spec;

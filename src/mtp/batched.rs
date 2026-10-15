@@ -183,7 +183,7 @@ pub fn run<B: BatchedBackend>(
     match result {
         Ok(r) => Ok(r),
         Err(e) => {
-            if let Err(restore) = b.restore() {
+            if let Err(restore) = b.restore(false) {
                 b.poison();
                 return Err(restore.context(format!("M2b rollback failed after: {e:#}")));
             }

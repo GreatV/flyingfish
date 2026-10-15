@@ -46,6 +46,7 @@ pub(super) struct Runtime {
     catalog: WeightCatalog,
     arena: CudaSlice<u8>,
     scratch: CudaSlice<u8>,
+    kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
     mask: CudaSlice<u64>,
     layers: Vec<Layer>,
     common: CommonOpsRef,
@@ -64,6 +65,7 @@ enum BoundMixer {
         image_prefill: PrefillPlans<FullAttentionPlan>,
         text_prefill: PrefillPlans<FullAttentionPlan>,
         decode: Box<FullAttentionPlan>,
+        compact_small: Option<PrefillPlans<FullAttentionPlan>>,
     },
     Gdn {
         norm: Tensor<bf16, 1>,
@@ -258,6 +260,7 @@ impl Runtime {
         catalog: WeightCatalog,
         arena: CudaSlice<u8>,
         scratch_buffer: CudaSlice<u8>,
+        kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
     ) -> Result<Self> {
         let s = &engine.device.stream;
         let rows = engine.workspace_rows;
@@ -289,30 +292,54 @@ impl Runtime {
             let mixer = match layout.mixer {
                 Mixer::FullAttention => {
                     let kv = &engine.state.kv[layout.state_index as usize];
-                    let bind = |active_rows, positions| {
+                    ensure!(
+                        kv.compact.is_some() == kv_scratch.is_some(),
+                        "KV format/prefill scratch mismatch at setup"
+                    );
+                    let bind = |active_rows, positions, compact: bool| {
+                        let (k, v, cap) = if compact {
+                            (
+                                &kv.k,
+                                &kv.v,
+                                kv.compact
+                                    .as_ref()
+                                    .context("compact cache missing")?
+                                    .layout
+                                    .ring,
+                            )
+                        } else if let Some((k, v)) = &kv_scratch {
+                            (k, v, engine.capacity)
+                        } else {
+                            (&kv.k, &kv.v, engine.capacity)
+                        };
                         FullAttentionOps::prepare(
                             &engine.device.ctx,
                             &FullAttentionSpec::q38(),
                             limits(active_rows, engine.capacity)?,
                             AttentionBindings {
+                                compact: if compact {
+                                    kv.compact.as_ref().map(|c| c.view(&kv.k, &kv.v, s))
+                                } else {
+                                    None
+                                },
                                 q_gate: heads(&w.qkv, s, 0, active_rows, 24, 512)?,
                                 k: heads(&w.qkv, s, rows * 12288, active_rows, 4, 256)?,
                                 v: heads(&w.qkv, s, rows * (12288 + 1024), active_rows, 4, 256)?,
                                 q: TensorMut(heads(&mw.q, s, 0, active_rows, 24, 256)?),
                                 gate: TensorMut(heads(&mw.gate, s, 0, active_rows, 24, 256)?),
                                 k_cache: TensorMut(view(
-                                    &kv.k,
+                                    k,
                                     s,
                                     0,
-                                    [4, engine.capacity as u32, 256],
-                                    [(engine.capacity * 256) as u64, 256, 1],
+                                    [4, cap as u32, 256],
+                                    [(cap * 256) as u64, 256, 1],
                                 )?),
                                 v_cache: TensorMut(view(
-                                    &kv.v,
+                                    v,
                                     s,
                                     0,
-                                    [4, engine.capacity as u32, 256],
-                                    [(engine.capacity * 256) as u64, 256, 1],
+                                    [4, cap as u32, 256],
+                                    [(cap * 256) as u64, 256, 1],
                                 )?),
                                 core_out: TensorMut(heads(&w.attn, s, 0, active_rows, 24, 256)?),
                                 q_norm: weight("self_attn.q_norm.weight")?,
@@ -326,6 +353,7 @@ impl Runtime {
                     let decode = bind(
                         1,
                         PositionBindings::Axes(view(&active_positions, s, 0, [1, 3], [3, 1])?),
+                        kv.compact.is_some(),
                     )?;
                     ensure!(
                         decode.workspace().bytes <= scratch_buffer.len() as u64,
@@ -353,15 +381,25 @@ impl Runtime {
                                     [rows as u32, 3],
                                     [3, 1],
                                 )?),
+                                false,
                             )?,
                             rows,
                             FullAttentionPlan::for_rows,
                         )?,
                         text_prefill: PrefillPlans::bind(
-                            bind(rows, PositionBindings::Linear)?,
+                            bind(rows, PositionBindings::Linear, false)?,
                             rows,
                             FullAttentionPlan::for_rows,
                         )?,
+                        compact_small: if kv.compact.is_some() {
+                            Some(PrefillPlans::bind(
+                                bind(4.min(rows), PositionBindings::Linear, true)?,
+                                4.min(rows),
+                                FullAttentionPlan::for_rows,
+                            )?)
+                        } else {
+                            None
+                        },
                         decode: Box::new(decode),
                     }
                 }
@@ -458,6 +496,7 @@ impl Runtime {
             catalog,
             arena,
             scratch: scratch_buffer,
+            kv_scratch,
             mask,
             layers,
             common,
@@ -584,6 +623,10 @@ impl Engine {
         trace: Option<&mut Trace>,
     ) -> Result<()> {
         ensure!(self.qwen.is_some(), "packed images require Qwen");
+        ensure!(
+            self.state.kv.iter().all(|kv| kv.compact.is_none()),
+            "8-bit KV is qualified for text only"
+        );
         ensure!(
             !self.poisoned && self.position == 0 && self.images.is_none(),
             "multimodal prefill requires a healthy, reset sequence"
@@ -764,7 +807,7 @@ impl Engine {
             WeightCatalog::load(dir, &model_spec, &device)?
         };
         let prefix_identity_load_ms = catalog.load_wall_ms;
-        let prefix_identity = if prefix_cache {
+        let mut prefix_identity = if prefix_cache {
             let upload_sha = catalog
                 .upload_content_sha256
                 .clone()
@@ -786,9 +829,25 @@ impl Engine {
         } else {
             None
         };
+        if let Some(identity) = prefix_identity.as_mut() {
+            identity.attention_kv_dtype = settings.kv_format.tag().into();
+        }
         let weights = catalog.take_globals()?;
         let s = &device.stream;
-        let state = super::super::state::StateStore::new(&model_spec, capacity, s)?;
+        let state = super::super::state::StateStore::new_with_format(
+            &model_spec,
+            capacity,
+            settings.kv_format,
+            s,
+        )?;
+        let kv_scratch = if settings.kv_format == crate::kv::KvFormat::Bf16 {
+            None
+        } else {
+            Some((
+                s.alloc_zeros::<bf16>(capacity * 4 * 256)?,
+                s.alloc_zeros::<bf16>(capacity * 4 * 256)?,
+            ))
+        };
         let capture_checkpoint = Some(super::super::state::StateCheckpoint::new(
             &state,
             &model_spec,
@@ -825,7 +884,17 @@ impl Engine {
                     .context("combined fixed bytes overflow")?,
             },
             |rows| {
-                let target = Runtime::workspace(rows, capacity, gdn_policy)?;
+                let mut target = Runtime::workspace(rows, capacity, gdn_policy)?;
+                if settings.kv_format != crate::kv::KvFormat::Bf16 {
+                    target = target.max(
+                        crate::op_contract::AttentionWorkspace::q38(
+                            4,
+                            capacity as u32,
+                            limits(4, capacity)?.key_chunk,
+                        )?
+                        .bytes as usize,
+                    );
+                }
                 target
                     .checked_add(
                         mtp_budget
@@ -843,7 +912,18 @@ impl Engine {
             !reserve_mtp || rows >= 4,
             "MTP workspace cannot fit four verification rows"
         );
-        let target_workspace = Runtime::workspace(rows, capacity, gdn_policy)?;
+        let target_workspace = Runtime::workspace(rows, capacity, gdn_policy)?.max(
+            if settings.kv_format == crate::kv::KvFormat::Bf16 {
+                0
+            } else {
+                crate::op_contract::AttentionWorkspace::q38(
+                    4,
+                    capacity as u32,
+                    limits(4, capacity)?.key_chunk,
+                )?
+                .bytes as usize
+            },
+        );
         eprintln!(
             "{}",
             serde_json::json!({
@@ -856,6 +936,8 @@ impl Engine {
                     "hashed_bytes": catalog.upload_hashed_bytes.unwrap_or(0)
                 },
                 "persistent_state_bytes": state.bytes(),
+                "kv_format": settings.kv_format.tag(),
+                "kv_prefill_scratch_bytes": kv_scratch.as_ref().map_or(0,|(k,v)|(k.len()+v.len())*size_of::<bf16>()),
                 "capture_checkpoint_bytes": capture_checkpoint.as_ref().context("capture checkpoint missing")?.bytes(),
                 "layer_arena_bytes": arena_bytes,
                 "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(limits(rows, capacity)?)?.bytes,
@@ -923,7 +1005,14 @@ impl Engine {
             mtp_epoch: 0,
             images: None,
         };
-        engine.qwen = Some(Runtime::new(&engine, dir, catalog, arena, scratch_buffer)?);
+        engine.qwen = Some(Runtime::new(
+            &engine,
+            dir,
+            catalog,
+            arena,
+            scratch_buffer,
+            kv_scratch,
+        )?);
         engine.prepare(1)?;
         engine.prepare_prefill_plans()?;
         engine
@@ -968,7 +1057,8 @@ impl Engine {
                 .arg(&meta.ptr)
                 .launch(grid(1, 1))?;
         }
-        self.work.advance(&self.ops, &self.device.stream)
+        self.work.advance(&self.ops, &self.device.stream)?;
+        self.state.compact_commit(&self.device.stream, false)
     }
     pub(super) fn qwen_layer_begin(
         &mut self,
@@ -1013,6 +1103,7 @@ impl Engine {
                 image_prefill,
                 text_prefill,
                 decode,
+                compact_small,
             } => {
                 for (role, width, offset) in [
                     ("self_attn.q_proj.weight", 12288, 0),
@@ -1033,41 +1124,90 @@ impl Engine {
                 }
                 match phase {
                     ExecutionPhase::Prefill => {
-                        let plans = if self.images.is_some() {
-                            image_prefill
+                        if self.qwen_device_prefix && compact_small.is_some() {
+                            let narrowed = compact_small
+                                .as_ref()
+                                .context("compact verify plan missing")?
+                                .select(rows, &FullAttentionPlan::for_rows)?;
+                            FullAttentionOps::run(&narrowed, s, meta, scratch(&q.scratch, s))?;
                         } else {
-                            text_prefill
-                        };
-                        let narrowed = plans.select(rows, &FullAttentionPlan::for_rows)?;
-                        let prefill: &FullAttentionPlan = &narrowed;
-                        FullAttentionOps::preprocess(prefill, s, meta, scratch(&q.scratch, s))?;
-                        let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
-                        let shape = Shape {
-                            rows,
-                            start: self.position,
-                            q_heads: 24,
-                            kv_heads: 4,
-                            capacity: self.capacity,
-                            head_dim: 256,
-                            causal: true,
-                        };
-                        let launch = if self.qwen_device_prefix {
-                            super::super::flash::Launch::Device {
-                                shape,
-                                key_count: self
-                                    .state
-                                    .sequence
+                            let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
+                            if let Some(c) = &kv.compact {
+                                let (k, v) = q
+                                    .kv_scratch
                                     .as_ref()
-                                    .context("Q38 sequence missing")?
-                                    .slice(2..3),
+                                    .context("compact KV prefill scratch missing")?;
+                                ensure!(
+                                    self.images.is_none(),
+                                    "8-bit KV is qualified for text only"
+                                );
+                                c.dequant_prefix(
+                                    c.view(&kv.k, &kv.v, s),
+                                    meta,
+                                    k,
+                                    v,
+                                    self.position,
+                                    s,
+                                )?;
                             }
-                        } else {
-                            shape.into()
-                        };
-                        self.flash
-                            .as_mut()
-                            .context("Q38 prefill attention is not bound")?
-                            .run(&mw.q, 24 * 256, &kv.k, &kv.v, &mut w.attn, launch)?;
+                            let plans = if self.images.is_some() {
+                                image_prefill
+                            } else {
+                                text_prefill
+                            };
+                            let narrowed = plans.select(rows, &FullAttentionPlan::for_rows)?;
+                            let prefill: &FullAttentionPlan = &narrowed;
+                            FullAttentionOps::preprocess(prefill, s, meta, scratch(&q.scratch, s))?;
+                            let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
+                            let (k_cache, v_cache) = if kv.compact.is_some() {
+                                let (k, v) = q
+                                    .kv_scratch
+                                    .as_ref()
+                                    .context("compact KV prefill scratch missing")?;
+                                (k, v)
+                            } else {
+                                (&kv.k, &kv.v)
+                            };
+                            let shape = Shape {
+                                rows,
+                                start: self.position,
+                                q_heads: 24,
+                                kv_heads: 4,
+                                capacity: self.capacity,
+                                head_dim: 256,
+                                causal: true,
+                            };
+                            let launch = if self.qwen_device_prefix {
+                                super::super::flash::Launch::Device {
+                                    shape,
+                                    key_count: self
+                                        .state
+                                        .sequence
+                                        .as_ref()
+                                        .context("Q38 sequence missing")?
+                                        .slice(2..3),
+                                }
+                            } else {
+                                shape.into()
+                            };
+                            self.flash
+                                .as_mut()
+                                .context("Q38 prefill attention is not bound")?
+                                .run(&mw.q, 24 * 256, k_cache, v_cache, &mut w.attn, launch)?;
+                            if let Some(c) = &kv.compact {
+                                let (k, v) = q
+                                    .kv_scratch
+                                    .as_ref()
+                                    .context("compact KV prefill scratch missing")?;
+                                c.finish(
+                                    c.view(&kv.k, &kv.v, s),
+                                    meta,
+                                    Some((k, v, rows)),
+                                    true,
+                                    s,
+                                )?;
+                            }
+                        }
                     }
                     ExecutionPhase::Decode => {
                         FullAttentionOps::run(decode, s, meta, scratch(&q.scratch, s))?;

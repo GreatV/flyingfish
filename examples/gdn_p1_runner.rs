@@ -113,6 +113,7 @@ fn run_e2e(a: &E2eArgs) -> Result<()> {
         spec_graph: true,
         runtime_dir: Some(a.runtime_dir.clone()),
         prefix_cache: false,
+        kv_format: flyingfish::kv::KvFormat::Bf16,
     };
     let started = Instant::now();
     let mut model = Model::load(&a.model, 0, a.capacity, a.chunk, settings)?;

@@ -21,7 +21,7 @@ pub trait Backend {
     fn capacity(&self) -> usize;
     fn pending(&self) -> Result<u32>;
     fn save(&mut self, rows: usize) -> Result<()>;
-    fn restore(&mut self) -> Result<()>;
+    fn restore(&mut self, replay: bool) -> Result<()>;
     fn poison(&mut self);
     fn draft(&mut self, input: u32, depth: usize) -> Result<u32>;
     fn target_decode(&mut self, input: u32) -> Result<u32>;
@@ -107,7 +107,7 @@ pub fn run<B: Backend>(
             .iter()
             .position(|t| eos.contains(t))
             .unwrap_or(matched);
-        backend.restore()?;
+        backend.restore(true)?;
         #[cfg(test)]
         inject(fault, Fault::AfterRestore)?;
         let mut pending = anchor;
@@ -145,7 +145,7 @@ pub fn run<B: Backend>(
     match result {
         Ok(round) => Ok(round),
         Err(error) => {
-            if let Err(restore) = backend.restore() {
+            if let Err(restore) = backend.restore(false) {
                 backend.poison();
                 return Err(restore.context(format!("MTP rollback failed after: {error:#}")));
             }
@@ -175,6 +175,7 @@ mod tests {
         capacity: usize,
         poisoned: bool,
         restore_fails: bool,
+        seal_locked: bool,
     }
     impl Mock {
         fn new(draft: Vec<u32>) -> Self {
@@ -193,6 +194,7 @@ mod tests {
                 capacity: 16,
                 poisoned: false,
                 restore_fails: false,
+                seal_locked: false,
             }
         }
         fn ordinary(&mut self, count: usize) {
@@ -216,11 +218,13 @@ mod tests {
         fn save(&mut self, rows: usize) -> Result<()> {
             ensure!(self.state.p + rows <= self.capacity, "capacity");
             self.snapshot = Some(self.state.clone());
+            self.seal_locked = true;
             Ok(())
         }
-        fn restore(&mut self) -> Result<()> {
+        fn restore(&mut self, replay: bool) -> Result<()> {
             ensure!(!self.restore_fails, "restore failure");
             self.state = self.snapshot.clone().unwrap();
+            self.seal_locked = replay;
             Ok(())
         }
         fn poison(&mut self) {
@@ -289,6 +293,10 @@ mod tests {
             let before = b.state.clone();
             assert!(run(&mut b, opt, 64, &[], Some(point)).is_err(), "{point:?}");
             assert_eq!(b.state, before, "{point:?}");
+            assert!(
+                !b.seal_locked,
+                "rollback must leave sealing enabled: {point:?}"
+            );
             assert!(!b.poisoned);
             let retry = run(&mut b, opt, 64, &[], None).unwrap();
             assert_eq!(retry.tokens, [11, 12, 13, 14]);
@@ -297,6 +305,23 @@ mod tests {
         b.restore_fails = true;
         assert!(run(&mut b, opt, 64, &[], Some(Fault::AfterDraft(0))).is_err());
         assert!(b.poisoned);
+    }
+    #[test]
+    fn failed_single_row_round_unlocks_before_plain_decode() {
+        let opt = options(3, H2::PreFinalNorm, H5::PostMtpNorm);
+        for point in [
+            Fault::AfterCanonical(0),
+            Fault::AfterReplay(0),
+            Fault::BeforePublish,
+        ] {
+            let mut b = Mock::new(vec![]);
+            let mut plain = Mock::new(vec![]);
+            assert!(run(&mut b, opt, 1, &[], Some(point)).is_err());
+            assert!(!b.seal_locked);
+            b.ordinary(8);
+            plain.ordinary(8);
+            assert_eq!(b.state, plain.state);
+        }
     }
     #[test]
     fn eos_output_budget_and_capacity_do_not_consume_pending_eos() {

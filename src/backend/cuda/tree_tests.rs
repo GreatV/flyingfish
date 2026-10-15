@@ -24,6 +24,7 @@ fn tree_prepare_embed_norm_replay_serves_wider_tree() -> Result<()> {
     let mut kv: Vec<Kv> = Vec::with_capacity(config.num_hidden_layers);
     for _ in 0..config.num_hidden_layers {
         kv.push(Kv {
+            compact: None,
             k: s.alloc_zeros(capacity * kv_dim)?,
             v: s.alloc_zeros(capacity * kv_dim)?,
         });

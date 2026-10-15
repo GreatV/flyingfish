@@ -57,6 +57,8 @@ struct Args {
     chunk: Option<usize>,
     #[arg(long)]
     prefix_cache: bool,
+    #[arg(long, value_enum, default_value_t = flyingfish::kv::KvFormat::Bf16)]
+    kv_format: flyingfish::kv::KvFormat,
     #[arg(long)]
     expected_identity: Option<PathBuf>,
 }
@@ -112,7 +114,40 @@ fn internally_consistent_foreign_snapshot(
         } else {
             0
         };
-        builder.add(receipt.key.kind, receipt.key.layer, block, payload.to_vec())?;
+        let payload = if receipt.key.kind == PrefixRecordKind::AttentionKvBlock
+            && identity.attention_kv_dtype != source.manifest.identity.attention_kv_dtype
+        {
+            let valid = receipt.key.valid_tokens;
+            let mut bytes = vec![
+                0;
+                builder
+                    .geometry
+                    .attention_block_bytes_at(receipt.key.token_start, valid)?
+            ];
+            let format = builder.geometry.kv_format;
+            if format != flyingfish::kv::KvFormat::Bf16 {
+                let encoded = receipt
+                    .key
+                    .token_end
+                    .min(flyingfish::kv::sealed_until(
+                        source.manifest.boundary.prefix_tokens,
+                    ))
+                    .saturating_sub(receipt.key.token_start);
+                let codes = 2 * spec.kv_heads as usize * encoded * spec.head_dim as usize;
+                let statistics = spec.kv_heads as usize
+                    * (encoded / 128 * spec.head_dim as usize * 2 + encoded * 2);
+                for i in 0..statistics {
+                    if i % 2 == 1 {
+                        bytes[codes + i * 4..codes + (i + 1) * 4]
+                            .copy_from_slice(&1.0f32.to_le_bytes());
+                    }
+                }
+            }
+            bytes
+        } else {
+            payload.to_vec()
+        };
+        builder.add(receipt.key.kind, receipt.key.layer, block, payload)?;
     }
     builder.finish()
 }
@@ -126,6 +161,10 @@ fn main() -> Result<()> {
     }
     #[cfg(feature = "cuda")]
     {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "coordinator GPU window required"
+        );
         let prefix = read_ids(&args.prefix_ids)?;
         let suffix = read_ids(&args.suffix_ids)?;
         ensure_counts(&prefix, &suffix, args.capacity)?;
@@ -141,20 +180,84 @@ fn main() -> Result<()> {
             draft_model: None,
             runtime_dir: args.runtime_dir.clone(),
             prefix_cache: args.prefix_cache,
+            kv_format: args.kv_format,
         };
         let mut engine = Backend::load(
             &args.model,
             args.device,
             args.capacity,
             args.chunk,
-            settings,
+            settings.clone(),
         )?;
+        if args.kv_format != flyingfish::kv::KvFormat::Bf16 {
+            let old = prefix
+                .iter()
+                .rev()
+                .copied()
+                .cycle()
+                .take(args.capacity - 1)
+                .collect::<Vec<_>>();
+            engine.prefill(&old, None)?;
+            ensure!(
+                engine.decode_logits()?.iter().all(|v| v.is_finite()),
+                "E1 nonfinite logits before history/reset/save"
+            );
+            engine.reset()?;
+        }
         engine.prefill(&prefix, None)?;
+        ensure!(
+            engine.decode_logits()?.iter().all(|v| v.is_finite()),
+            "E1 nonfinite logits before history/reset/save"
+        );
         let saved = engine.save_text_prefix(TextPrefixSaveRequest {
             prefix_ids: &prefix,
             block_tokens: args.block_tokens,
             transfer_bytes: args.transfer_bytes,
         })?;
+        if args.kv_format != flyingfish::kv::KvFormat::Bf16 {
+            let first = saved.snapshot.clone();
+            drop(engine);
+            engine = Backend::load(
+                &args.model,
+                args.device,
+                args.capacity,
+                args.chunk,
+                settings,
+            )?;
+            let old = prefix
+                .iter()
+                .copied()
+                .cycle()
+                .take(args.capacity - 2)
+                .collect::<Vec<_>>();
+            engine.prefill(&old, None)?;
+            ensure!(
+                engine.decode_logits()?.iter().all(|v| v.is_finite()),
+                "E1 nonfinite logits before history/reset/save"
+            );
+            engine.reset()?;
+            engine.prefill(&prefix, None)?;
+            ensure!(
+                engine.decode_logits()?.iter().all(|v| v.is_finite()),
+                "E1 nonfinite logits before history/reset/save"
+            );
+            let second = engine.save_text_prefix(TextPrefixSaveRequest {
+                prefix_ids: &prefix,
+                block_tokens: args.block_tokens,
+                transfer_bytes: args.transfer_bytes,
+            })?;
+            ensure!(
+                first.manifest.state_root == second.snapshot.manifest.state_root,
+                "E1 state root depends on previous request"
+            );
+            ensure!(
+                first
+                    .records()
+                    .zip(second.snapshot.records())
+                    .all(|((a, x), (b, y))| a == b && x == y),
+                "E1 payload bytes differ between engines with different histories"
+            );
+        }
         if let Some(path) = &args.expected_identity {
             let expected: PrefixIdentity = serde_json::from_slice(&std::fs::read(path)?)?;
             ensure!(
@@ -212,6 +315,37 @@ fn main() -> Result<()> {
             "foreign snapshot was not rejected by engine identity: {foreign_error}"
         );
         engine.check_ready()?;
+        let mut format_identity = saved.snapshot.manifest.identity.clone();
+        format_identity.attention_kv_dtype = if args.kv_format == flyingfish::kv::KvFormat::Bf16 {
+            flyingfish::kv::KvFormat::Affine8
+        } else {
+            flyingfish::kv::KvFormat::Bf16
+        }
+        .tag()
+        .into();
+        let foreign_format = internally_consistent_foreign_snapshot(
+            &saved.snapshot,
+            format_identity,
+            &spec,
+            args.capacity,
+        )?;
+        foreign_format.verify_prefix(&prefix)?;
+        let format_error = engine
+            .restore_text_prefix(
+                &foreign_format,
+                TextPrefixRestoreIntent {
+                    prefix_ids: &prefix,
+                    pending_next_token: saved.snapshot.manifest.boundary.pending_next_token,
+                    transfer_bytes: args.transfer_bytes,
+                },
+            )
+            .expect_err("foreign KV format must be rejected");
+        ensure!(
+            format_error
+                .to_string()
+                .contains("prefix snapshot identity differs"),
+            "foreign format was not rejected before restore: {format_error}"
+        );
         let negative_readback = engine.save_text_prefix(TextPrefixSaveRequest {
             prefix_ids: &prefix,
             block_tokens: args.block_tokens,
@@ -369,6 +503,8 @@ fn main() -> Result<()> {
             "save": saved.receipt,
             "decode_boundary_save": decoded_saved.receipt,
             "foreign_identity_negative_control": true,
+            "foreign_kv_format_rejected_before_mutation":true,
+            "kv_format":args.kv_format,
             "manifest_only_foreign_rejected_by_internal_consistency": true,
             "internally_consistent_foreign_rejected_by_engine_identity": true,
             "foreign_identity_rejected_before_mutation": true,

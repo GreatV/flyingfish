@@ -64,6 +64,7 @@ pub(crate) enum PositionBindings {
 /// row width from `hidden`.
 #[derive(Debug)]
 pub(crate) struct AttentionBindings {
+    pub compact: Option<super::state::CacheView>,
     /// Projection `[max_rows, 24, 512]`: Q at head offset 0, gate at +256.
     pub q_gate: Tensor<bf16, 3>,
     /// Projection K and V, `[max_rows, 4, 256]`, read-only.
@@ -87,6 +88,7 @@ pub(crate) struct AttentionBindings {
 }
 
 struct Kernels {
+    write_ring: Option<CudaFunction>,
     qg_split: CudaFunction,
     rope_q: CudaFunction,
     rope_k_scatter: CudaFunction,
@@ -123,6 +125,7 @@ impl FullAttentionPlan {
             PositionBindings::Axes(axes) => PositionBindings::Axes(axes.prefix_rows(rows)?),
         };
         let bindings = AttentionBindings {
+            compact: b.compact,
             q_gate: b.q_gate.prefix_rows(rows)?,
             k: b.k.prefix_rows(rows)?,
             v: b.v.prefix_rows(rows)?,
@@ -215,8 +218,15 @@ fn want<T: Copy, const R: usize>(view: &Tensor<T, R>, shape: [u32; R], name: &st
 }
 
 fn check_bindings(b: &AttentionBindings, limits: AttentionLimits) -> Result<()> {
+    if let Some(cache) = b.compact {
+        cache.validate(limits.capacity, limits.max_rows)?;
+        ensure!(
+            cache.k_ring == b.k_cache.0.ptr && cache.v_ring == b.v_cache.0.ptr,
+            "compact KV ring pointers differ from bindings"
+        );
+    }
     let rows = limits.max_rows;
-    let cap = limits.capacity;
+    let cap = b.compact.map_or(limits.capacity, |v| v.ring as u32);
     want(&b.q_gate, [rows, HQ, 2 * D], "q_gate")?;
     ensure!(
         b.q_gate.stride == [u64::from(HQ) * 2 * u64::from(D), u64::from(2 * D), 1],
@@ -332,6 +342,7 @@ impl FullAttentionOps {
         let kernels = if let Some(template) = template {
             ensure!(
                 template.limits.capacity == limits.capacity
+                    && template.bindings.compact.is_some() == bindings.compact.is_some()
                     && template.max_parts == max_parts
                     && template.phase2_cfg.shared_mem_bytes >= phase2_smem
                     && std::mem::discriminant(&template.bindings.positions)
@@ -341,7 +352,11 @@ impl FullAttentionOps {
             template.kernels.clone()
         } else {
             let module = cubin::module(ctx, "tcmqa_d256")?;
-            let phase1 = module.load_function("tcmqa_d256_phase1")?;
+            let phase1 = module.load_function(if bindings.compact.is_some() {
+                "tcmqa_d256_phase1_compact"
+            } else {
+                "tcmqa_d256_phase1"
+            })?;
             let phase2 = module.load_function("tcmqa_d256_phase2")?;
             for (function, bytes) in [(&phase1, PHASE1_SMEM), (&phase2, phase2_smem)] {
                 if bytes > 48 * 1024 {
@@ -360,6 +375,10 @@ impl FullAttentionOps {
                 }
             };
             Arc::new(Kernels {
+                write_ring: bindings
+                    .compact
+                    .map(|_| module.load_function("tcmqa_d256_write_ring"))
+                    .transpose()?,
                 qg_split: module.load_function("tcmqa_d256_qg_split")?,
                 rope_q: module.load_function(rope_q_entry)?,
                 rope_k_scatter: module.load_function(rope_k_entry)?,
@@ -504,6 +523,39 @@ impl FullAttentionOps {
             },
         )?;
 
+        if let Some(cache) = b.compact {
+            let axes = match b.positions {
+                PositionBindings::Linear => 0,
+                PositionBindings::Axes(t) => t.ptr,
+            };
+            let mut launch = stream.launch_builder(&plan.kernels.rope_q);
+            launch.arg(&b.q.0.ptr).arg(&meta.ptr);
+            if axes != 0 {
+                launch.arg(&axes);
+            }
+            unsafe {
+                launch.arg(&q_tok).launch(plan.scatter_cfg)?;
+            }
+            unsafe {
+                stream
+                    .launch_builder(
+                        plan.kernels
+                            .write_ring
+                            .as_ref()
+                            .context("compact writer missing")?,
+                    )
+                    .arg(&k_tmp)
+                    .arg(&b.v.ptr)
+                    .arg(&meta.ptr)
+                    .arg(&axes)
+                    .arg(&k_tok)
+                    .arg(&v_tok)
+                    .arg(&cache)
+                    .launch(plan.scatter_cfg)?;
+            }
+            return Ok(());
+        }
+
         // 3. partial RoPE on Q; RoPE + scatter on the normalised K; scatter V.
         //    The linear branch rotates by the physical position; the axes branch
         //    reads (T, H, W) per row. Both keep the cache slot at `prefix + r`.
@@ -607,8 +659,8 @@ impl FullAttentionOps {
             let q_ptr = b.q.0.ptr + u64::from(row_base) * q_row_bytes;
             let out_ptr = b.core_out.0.ptr + u64::from(row_base) * out_row_bytes;
             unsafe {
-                stream
-                    .launch_builder(&plan.kernels.phase1)
+                let mut launch = stream.launch_builder(&plan.kernels.phase1);
+                launch
                     .arg(&q_ptr)
                     .arg(&b.k_cache.0.ptr)
                     .arg(&b.v_cache.0.ptr)
@@ -625,8 +677,11 @@ impl FullAttentionOps {
                     .arg(&key_chunk)
                     .arg(&pmax)
                     .arg(&seg_rows)
-                    .arg(&base)
-                    .launch(plan.phase1_cfg)?;
+                    .arg(&base);
+                if let Some(cache) = b.compact.as_ref() {
+                    launch.arg(cache);
+                }
+                launch.launch(plan.phase1_cfg)?;
                 stream
                     .launch_builder(&plan.kernels.phase2)
                     .arg(&p_max)
@@ -1006,6 +1061,7 @@ mod tests {
         let (scratch_ptr, _hold) = scratch.device_ptr(stream);
 
         let bindings = AttentionBindings {
+            compact: None,
             q_gate: view(
                 &dev_q_gate,
                 stream,

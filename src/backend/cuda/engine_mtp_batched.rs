@@ -327,6 +327,7 @@ impl Engine {
                 #[cfg(test)]
                 fault,
             )?;
+            self.state.compact_commit(&self.device.stream, true)?;
             chain.committed_position = self.position;
             chain
                 .batch

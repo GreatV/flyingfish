@@ -53,24 +53,45 @@ fn architectures() -> Vec<u32> {
 }
 
 fn main() {
-    let cw_header = "kernels/gdn/gdn_cw_p1_layout.h";
-    println!("cargo:rerun-if-changed={cw_header}");
-    let text = fs::read_to_string(cw_header).expect("read chunkwise P1 layout header");
-    let mut cw = String::new();
-    for name in ["S4", "S8", "S16"] {
-        let prefix = format!("#define GDN_CW_P1_{name}_BYTES ");
-        let value = text
-            .lines()
-            .find_map(|line| line.strip_prefix(&prefix))
-            .and_then(|rest| rest.split_whitespace().next())
-            .expect("missing chunkwise P1 shared-memory constant")
-            .parse::<u32>()
-            .expect("numeric shared-memory size");
-        assert!(value <= 101_376);
-        cw.push_str(&format!("pub const {name}_BYTES: u32 = {value};\n"));
-    }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR missing"));
-    fs::write(out.join("gdn_cw_p1_shared.rs"), cw).expect("write chunkwise P1 constants");
+    for (header, prefix, names, ty, output) in [
+        (
+            "kernels/gdn/gdn_cw_p1_layout.h",
+            "GDN_CW_P1_",
+            &["S4_BYTES", "S8_BYTES", "S16_BYTES"][..],
+            "u32",
+            "gdn_cw_p1_shared.rs",
+        ),
+        (
+            "kernels/kv_cache.cuh",
+            "KV_",
+            &[
+                "SINK_TOKENS",
+                "RECENT_TOKENS",
+                "GROUP_TOKENS",
+                "TENTATIVE_TOKENS",
+            ][..],
+            "usize",
+            "kv_geometry.rs",
+        ),
+    ] {
+        println!("cargo:rerun-if-changed={header}");
+        let text = fs::read_to_string(header).expect("read kernel constants header");
+        let mut constants = String::new();
+        for name in names {
+            let prefix = format!("#define {prefix}{name} ");
+            let value = text
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .and_then(|rest| rest.split_whitespace().next())
+                .expect("missing kernel constant")
+                .parse::<u32>()
+                .expect("numeric kernel constant");
+            assert!(value <= 101_376);
+            constants.push_str(&format!("pub const {name}: {ty} = {value};\n"));
+        }
+        fs::write(out.join(output), constants).expect("write kernel constants");
+    }
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;

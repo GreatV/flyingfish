@@ -126,6 +126,8 @@ pub struct Settings {
     pub draft_model: Option<std::path::PathBuf>,
     #[arg(long, global = true, default_value_t = false, action = clap::ArgAction::Set)]
     pub prefix_cache: bool,
+    #[arg(long, global = true, value_enum, default_value_t = crate::kv::KvFormat::Bf16)]
+    pub kv_format: crate::kv::KvFormat,
     #[arg(long, global = true, env = "FLYINGFISH_RUNTIME_DIR")]
     pub runtime_dir: Option<std::path::PathBuf>,
 }

@@ -40,6 +40,7 @@
 // ============================================================================
 #include <cuda_bf16.h>
 #include <cstdint>
+#include "kv_cache.cuh"
 
 namespace tcmqa_d256 {
 
@@ -346,13 +347,14 @@ extern "C" __global__ void tcmqa_d256_v_scatter(const __nv_bfloat16* __restrict_
 //
 // Launch: grid(Pmax, HKV, ceil(GQA*seg_rows/MT)), block NT,
 //         dynamic smem SMEM_NARROW = 68096 B (> 48 KiB: host opts in).
+template<bool COMPACT = false>
 __device__ __forceinline__ void phase1_body(
     const bf16* __restrict__ q, const bf16* __restrict__ kc, const bf16* __restrict__ vc,
     float* __restrict__ p_max, float* __restrict__ p_sum, float* __restrict__ p_out,
     const unsigned long long* __restrict__ causal_mask, const int4* __restrict__ meta,
     int q_tok_stride, int k_head_stride, int k_pos_stride,
     int v_head_stride, int v_pos_stride,
-    int key_chunk, int Pmax, int seg_rows, int row_base) {
+    int key_chunk, int Pmax, int seg_rows, int row_base, KvCacheView cache = {}) {
   const int part = blockIdx.x;
   const int kv   = blockIdx.y;
   const int rt   = blockIdx.z;
@@ -429,7 +431,7 @@ __device__ __forceinline__ void phase1_body(
   // overwrites the tile consumed before the preceding barrier.
   const int ntiles = (pos_end - pos_beg + KT - 1) / KT;
 
-  auto stage_kv = [&](const bf16* src, int head_stride, int pos_stride, int t, bf16* dst) {
+  auto stage_kv = [&](const bf16* src, int head_stride, int pos_stride, int t, bf16* dst, bool is_k) {
     const int tt0 = pos_beg + t * KT;
 #pragma unroll
     for (int rep = 0; rep < KT * NSLICE / NT; ++rep) {
@@ -437,15 +439,19 @@ __device__ __forceinline__ void phase1_body(
       const int r = idx / NSLICE, seg = idx % NSLICE;
       const int pos = tt0 + r;
       const bool live = pos < pos_end;
-      const bf16* g = live
-          ? src + (size_t)kv * head_stride + (size_t)pos * pos_stride + seg * 8
-          : src;
-      cp16(dst + r * LDS + seg * 8, g, live ? 16 : 0);
+      if constexpr (COMPACT) {
+        for(int j=0;j<8;++j) dst[r*LDS+seg*8+j]=live ? kv_load(cache,is_k,kv,pos,seg*8+j) : __float2bfloat16_rn(0.0f);
+      } else {
+        const bf16* g = live
+            ? src + (size_t)kv * head_stride + (size_t)pos * pos_stride + seg * 8
+            : src;
+        cp16(dst + r * LDS + seg * 8, g, live ? 16 : 0);
+      }
     }
   };
 
   if (ntiles > 0) {
-    stage_kv(kc, k_head_stride, k_pos_stride, 0, ksm);
+    stage_kv(kc, k_head_stride, k_pos_stride, 0, ksm, true);
     cp_commit();
   }
 
@@ -453,7 +459,7 @@ __device__ __forceinline__ void phase1_body(
     const int t0 = pos_beg + t * KT;
     cp_wait0();                                       // K(t) landed
     __syncthreads();                                  // K(t) visible; V(t-1) consumed
-    stage_kv(vc, v_head_stride, v_pos_stride, t, vsm);
+    stage_kv(vc, v_head_stride, v_pos_stride, t, vsm, false);
     cp_commit();                                      // V(t) flies during S + softmax
 
     // ---- S = Q_w * K_tile^T : KSLICE k16 x 4 n8 mma, per-warp row slab ----
@@ -548,7 +554,7 @@ __device__ __forceinline__ void phase1_body(
     cp_wait0();                                       // V(t) landed
     __syncthreads();                                  // V(t) visible; K(t) consumed
     if (t + 1 < ntiles) {
-      stage_kv(kc, k_head_stride, k_pos_stride, t + 1, ksm);
+      stage_kv(kc, k_head_stride, k_pos_stride, t + 1, ksm, true);
       cp_commit();                                    // K(t+1) flies during PV
     }
 
@@ -610,9 +616,38 @@ extern "C" __global__ void __launch_bounds__(NT) tcmqa_d256_phase1(
   guard_pmax(meta, key_chunk, Pmax);
   guard_geometry(seg_rows, key_chunk, blockDim.x, 1);
   if (causal_mask == nullptr) __trap();
-  phase1_body(q, k_cache, v_cache, p_max, p_sum, p_out, causal_mask, meta,
+  phase1_body<>(q, k_cache, v_cache, p_max, p_sum, p_out, causal_mask, meta,
               q_tok_stride, k_head_stride, k_pos_stride, v_head_stride, v_pos_stride,
               key_chunk, Pmax, seg_rows, row_base);
+}
+
+extern "C" __global__ void __launch_bounds__(NT) tcmqa_d256_phase1_compact(
+    const bf16* q, const bf16* kc, const bf16* vc, float* p_max, float* p_sum,
+    float* p_out, const unsigned long long* mask, const int4* meta,
+    int q_stride,int kh,int kp,int vh,int vp,int chunk,int pmax,int rows,int base,
+    KvCacheView cache) {
+  guard_meta(meta);guard_pmax(meta,chunk,pmax);guard_geometry(rows,chunk,blockDim.x,1);
+  if(!mask || !cache.cursor || cache.capacity!=meta[0].w) __trap();
+  phase1_body<true>(q,kc,vc,p_max,p_sum,p_out,mask,meta,q_stride,kh,kp,vh,vp,chunk,pmax,rows,base,cache);
+}
+
+extern "C" __global__ void tcmqa_d256_write_ring(
+    const bf16* k,const bf16* v,const int4* meta,const int* axes,
+    int k_stride,int v_stride,KvCacheView cache) {
+  guard_meta(meta);
+  const int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=meta[0].y*HKV*DH) return;
+  const int d=i%DH,h=(i/DH)%HKV,r=i/(HKV*DH),pos=meta[0].x+r;
+  const size_t dst=((size_t)h*cache.ring+kv_slot(pos,cache.ring))*DH;
+  const bf16* src=k+(size_t)r*k_stride+h*DH;
+  if(!isfinite(__bfloat162float(src[d])) || !isfinite(__bfloat162float(v[(size_t)r*v_stride+h*DH+d]))) __trap();
+  if(d<RHALF) {
+    bf16 a=src[d],b=src[d+RHALF];
+    const int coordinate=axes ? axes[(size_t)r*3+rope_axis(d)] : pos;
+    rope_apply(a,b,rope_angle(coordinate,d));
+    cache.k_ring[dst+d]=a;cache.k_ring[dst+d+RHALF]=b;
+  } else if(d>=ROTARY) cache.k_ring[dst+d]=src[d];
+  cache.v_ring[dst+d]=v[(size_t)r*v_stride+h*DH+d];
 }
 
 // ====================================================== attention phase 2 ====
