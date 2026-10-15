@@ -31,8 +31,6 @@ const IDENTITY_MIN_RUNS: u32 = 20;
 const FRAC_FLOOR_MARGIN: f64 = 0.02;
 /// Decode steps the e2e phase runs and discards before it resets.
 const E2E_WARMUP_STEPS: usize = 4;
-/// Value heads, the head count every core indexes Q/K/V by (kernels/gdn: 48).
-const VALUE_HEADS: u32 = 48;
 
 #[cfg(feature = "cuda")]
 const P1_MODULE: &str = "gdn/gdn_chunkwise_p1";
@@ -53,7 +51,7 @@ impl Cli {
             Phase::Numerics(a) => a.route,
             Phase::Timing(a) => a.route,
             Phase::Identity(a) => a.route,
-            Phase::E2e(_) | Phase::StageDump(_) => Route::P1,
+            Phase::E2e(_) => Route::P1,
         }
     }
 
@@ -107,18 +105,6 @@ impl Cli {
                 ensure!(a.decode_steps > 0, "--decode-steps must be positive");
                 Ok(())
             }
-            Phase::StageDump(a) => {
-                ensure!(
-                    !a.heads.is_empty(),
-                    "--heads is required and must name at least one value head"
-                );
-                ensure!(
-                    a.heads.iter().all(|h| *h < VALUE_HEADS),
-                    "--heads {:?} names a head outside 0..{VALUE_HEADS}",
-                    a.heads
-                );
-                Ok(())
-            }
         }
     }
 }
@@ -148,27 +134,6 @@ enum Phase {
     /// End-to-end engine timing: one model load per process, CUDA events around
     /// prefill and decode only.
     E2e(E2eArgs),
-    /// TEST-ONLY: run stages A and H and dump the slots stage O reads. Not one of the
-    /// three production entries; it writes no `out` and advances no further.
-    StageDump(StageDumpArgs),
-}
-
-/// The chunkwise-P2 stage-O inputs, for the gate's diagnostic leg.
-#[derive(Parser)]
-struct StageDumpArgs {
-    /// Frozen P1 package directory (MANIFEST.json, inputs/, truth/, gate_basis.json).
-    #[arg(long)]
-    package: PathBuf,
-    /// Run directory for the dumps and their index.
-    #[arg(long)]
-    run_dir: PathBuf,
-    /// Only this fixture (default: every fixture in the manifest).
-    #[arg(long, value_delimiter = ',')]
-    case: Vec<String>,
-    /// The value heads to dump. REQUIRED: a diagnostic leg must say which heads it
-    /// covered rather than silently defaulting to all of them.
-    #[arg(long, value_delimiter = ',', required = true)]
-    heads: Vec<u32>,
 }
 
 #[derive(Parser)]
@@ -1240,9 +1205,10 @@ struct DeviceInfo {
 /// True when the engine's own policy qualifies this device for the P1 core; a gate verdict elsewhere is INVALID.
 fn qualified_topology(device: Option<&DeviceInfo>) -> bool {
     device.is_some_and(|d| {
+        // The split's own qualification, one step above the verify floor. Not the P1
+        // split's: the P2 split replaced it, and the policy selects the P2 split here.
         flyingfish::gdn_plan::GdnPolicy::for_device(d.compute_capability, d.sm_count as usize)
-            .prefill_p1_split()
-            != 0
+            .cw_p2_for_step(flyingfish::gdn_plan::MIN_VERIFY_ROWS + 1)
     })
 }
 
@@ -2700,97 +2666,6 @@ impl Gpu {
         Ok(())
     }
 
-    /// Stages A and H ONLY: the workspace they leave is what stage O would read. The
-    /// diagnostic leg's entry point; `run_p2` is the production one.
-    #[cfg(feature = "cuda")]
-    fn run_p2_ab(
-        &self,
-        arrays: &CaseArrays,
-        m: usize,
-        nchunk: u32,
-        fx: &Fixture,
-    ) -> Result<(
-        cudarc::driver::CudaSlice<u8>,
-        cudarc::driver::CudaSlice<f32>,
-    )> {
-        let heads = arrays.q[1].round() as u32; // q is [M, 48, 128]; unused, but bounds the head count
-        ensure!(heads > 0, "no value heads");
-        let heads = 48u32;
-        let dv = 128usize;
-        let dq = self.stream.clone_htod(&arrays.q)?;
-        let dk = self.stream.clone_htod(&arrays.k)?;
-        let dvv = self.stream.clone_htod(&arrays.v)?;
-        let dbeta = self.stream.clone_htod(&arrays.beta)?;
-        let dg = self.stream.clone_htod(&arrays.g)?;
-        let ds = self.stream.clone_htod(&arrays.s0)?;
-        let meta = self.meta(fx)?;
-        let ws = self.p2_workspace(m)?;
-        use cudarc::driver::{DevicePtr as _, LaunchConfig, PushKernelArg as _};
-        let slot = ws.device_ptr(&self.stream).0;
-        let smem = flyingfish::gdn_plan::cw_p2::SMEM_BYTES as u32;
-        let per_chunk = LaunchConfig {
-            grid_dim: (nchunk, heads, 1),
-            block_dim: (Self::P1_THREADS, 1, 1),
-            shared_mem_bytes: smem,
-        };
-        let per_value_block = LaunchConfig {
-            grid_dim: (
-                dv as u32 / flyingfish::gdn_plan::CW_P2_VALUE_BLOCK,
-                heads,
-                1,
-            ),
-            block_dim: (Self::P1_THREADS, 1, 1),
-            shared_mem_bytes: smem,
-        };
-        let stages = self
-            .p2
-            .as_ref()
-            .context("stage-dump needs the three gdn_cw_p2 stage entry points")?;
-        unsafe {
-            self.stream
-                .launch_builder(&stages[0])
-                .arg(&dq)
-                .arg(&dk)
-                .arg(&dvv)
-                .arg(&dbeta)
-                .arg(&dg)
-                .arg(&slot)
-                .arg(&meta)
-                .arg(&0i32)
-                .launch(per_chunk)?;
-            self.stream
-                .launch_builder(&stages[1])
-                .arg(&dq)
-                .arg(&dk)
-                .arg(&dvv)
-                .arg(&dbeta)
-                .arg(&dg)
-                .arg(&ds)
-                .arg(&slot)
-                .arg(&meta)
-                .arg(&0i32)
-                .launch(per_value_block)?;
-        }
-        self.stream.synchronize()?;
-        Ok((ws, ds))
-    }
-
-    /// `len` bytes at a raw device address, as they are stored.
-    #[cfg(feature = "cuda")]
-    fn read_bytes(&self, ptr: u64, len: usize) -> Result<Vec<u8>> {
-        let mut out = vec![0u8; len];
-        self.ctx.bind_to_thread()?;
-        unsafe {
-            cudarc::driver::result::memcpy_dtoh_async(
-                out.as_mut_slice(),
-                ptr,
-                self.stream.cu_stream(),
-            )?;
-        }
-        self.stream.synchronize()?;
-        Ok(out)
-    }
-
     /// The slot a case's three stages run in, sized by the binder's planner.
     #[cfg(feature = "cuda")]
     fn p2_workspace(&self, m: usize) -> Result<cudarc::driver::CudaSlice<u8>> {
@@ -3278,141 +3153,6 @@ fn run_identity(args: &IdentityArgs) -> Result<()> {
     anyhow::bail!("the identity phase needs the crate's cuda feature")
 }
 
-/// One dumped slot field: its name, element count and SHA-256, for the index.
-#[cfg(feature = "cuda")]
-#[derive(Serialize)]
-struct DumpField {
-    fixture: String,
-    chunk: u32,
-    head: u32,
-    field: &'static str,
-    offset: u64,
-    rows: usize,
-    cols: usize,
-    dtype: &'static str,
-    bytes: u64,
-    sha256: String,
-    non_finite: usize,
-    abs_max: f64,
-    path: String,
-}
-
-/// The stage-O input dumps for one fixture/head: exactly the three slots stage O
-/// contracts plus the FP32[64] cumsum it scales q by.
-#[cfg(feature = "cuda")]
-fn run_stage_dump(args: &StageDumpArgs) -> Result<()> {
-    let pkg = open_package(&args.package)?;
-    std::fs::create_dir_all(&args.run_dir)
-        .with_context(|| format!("create {}", args.run_dir.display()))?;
-    let fixtures = select_fixtures(&pkg, &args.case)?;
-    let heads: Vec<u32> = args.heads.clone();
-    use cudarc::driver::DevicePtr as _;
-    let gpu = Gpu::open(Route::P2)?;
-    route_policy(Route::P2, &gpu.ctx)?;
-    let mut index = Vec::new();
-    for fx in &fixtures {
-        check_fixture_shapes(fx)?;
-        let arrays = CaseArrays::new(&pkg.root, fx)?;
-        let m = fx.m;
-        let nchunk = u32::try_from(m.div_ceil(flyingfish::gdn_plan::CW_P2_CHUNK as usize))
-            .context("chunks")?;
-        // stages A and H only: stage O is not launched, so this is what it WOULD read.
-        let (ws, _state) = gpu.run_p2_ab(&arrays, m, nchunk, fx)?;
-        let slot = ws.device_ptr(&gpu.stream).0;
-        for &head in &heads {
-            let base = u64::from(head) * flyingfish::gdn_plan::cw_p2::SLOT_BYTES;
-            for (name, rows, cols, dtype) in [
-                ("qk", 64usize, 64usize, "bf16"),
-                ("vn", 64, 128, "bf16"),
-                ("Sn", 128, 128, "f32"),
-                ("Gc", 64, 1, "f32"),
-            ] {
-                // the offsets come from the binder's own slot table, not a second copy
-                let offset = flyingfish::gdn_plan::cw_p2_slot_layout()
-                    .iter()
-                    .zip(flyingfish::gdn_plan::CW_P2_SLOT.iter())
-                    .find(|(_, (n, _, _))| *n == name)
-                    .map(|((off, _, _), _)| *off)
-                    .with_context(|| format!("the slot table has no {name} field"))?;
-                let count = rows * cols;
-                let path = args
-                    .run_dir
-                    .join(format!("{}.head{head}.{name}.{}", fx.name, dtype));
-                let (values, raw) = match dtype {
-                    "f32" => {
-                        let raw = gpu.read_bytes(slot + base + offset, count * 4)?;
-                        let v = raw
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect::<Vec<f32>>();
-                        (v, raw)
-                    }
-                    _ => {
-                        let raw = gpu.read_bytes(slot + base + offset, count * 2)?;
-                        let mut wide = Vec::with_capacity(count);
-                        for c in raw.as_chunks::<2>().0 {
-                            let bits = u16::from_le_bytes([c[0], c[1]]);
-                            wide.push(half::bf16::from_bits(bits).to_f32());
-                        }
-                        (wide, raw)
-                    }
-                };
-                let non_finite = values.iter().filter(|v| !v.is_finite()).count();
-                let abs_max = values
-                    .iter()
-                    .filter(|v| v.is_finite())
-                    .fold(0.0f64, |m, v| m.max(f64::from(v.abs())));
-                std::fs::write(&path, &raw).with_context(|| format!("write {}", path.display()))?;
-                index.push(DumpField {
-                    fixture: fx.name.clone(),
-                    chunk: nchunk - 1,
-                    head,
-                    field: name,
-                    offset,
-                    rows,
-                    cols,
-                    dtype,
-                    bytes: raw.len() as u64,
-                    sha256: sha256_bytes(&raw),
-                    non_finite,
-                    abs_max,
-                    path: path.display().to_string(),
-                });
-            }
-        }
-    }
-    let path = args.run_dir.join("STAGE_DUMP.json");
-    std::fs::write(&path, serde_json::to_string_pretty(&index)?.as_bytes())
-        .with_context(|| format!("write {}", path.display()))?;
-    let bad: Vec<&DumpField> = index.iter().filter(|d| d.non_finite > 0).collect();
-    eprintln!(
-        "[stage-dump] {} — {} fields, {} with non-finite values, index {}",
-        path.display(),
-        index.len(),
-        bad.len(),
-        path.display()
-    );
-    for d in &bad {
-        eprintln!(
-            "  {} {} head{} non-finite {}/{} abs_max {:.4e}",
-            d.fixture,
-            d.field,
-            d.head,
-            d.non_finite,
-            d.rows * d.cols,
-            d.abs_max
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "cuda"))]
-fn run_stage_dump(_args: &StageDumpArgs) -> Result<()> {
-    anyhow::bail!("the stage-dump phase needs the crate's cuda feature")
-}
-
 fn main() -> Result<()> {
     // Parse and validate every argument BEFORE any device or topology query, so a bad
     // command line is reported as itself and never as a CUDA error.
@@ -3425,7 +3165,6 @@ fn main() -> Result<()> {
         Phase::Timing(a) => run_timing(&a),
         Phase::Identity(a) => run_identity(&a),
         Phase::E2e(a) => run_e2e(&a),
-        Phase::StageDump(a) => run_stage_dump(&a),
     }
 }
 
@@ -3553,11 +3292,12 @@ mod tests {
             compute_capability: 86,
             sm_count: 48,
         };
-        assert_eq!(
+        // The P2 route runs under the P2 policy, and the device policy says the same
+        // thing on this topology: the split replaced the fused P1 core.
+        assert!(
             require_qualified_topology(Route::P2, Ok(qualified.clone()))
                 .unwrap()
-                .prefill_p1_split(),
-            0
+                .cw_p2_for_step(flyingfish::gdn_plan::MIN_VERIFY_ROWS + 1)
         );
         let err = require_qualified_topology(Route::P2, Ok(other.clone()))
             .expect_err("an unqualified device must not run the split");
@@ -3565,12 +3305,13 @@ mod tests {
             err.to_string().contains("qualified topology"),
             "the error must name the condition: {err}"
         );
-        // p1 carries on as the device policy says.
+        // The p1 route is the gate's reference arm: it is accepted on the same topology
+        // and still carries the device's own policy, but it selects no P1 split.
         assert_eq!(
             require_qualified_topology(Route::P1, Ok(qualified.clone()))
                 .unwrap()
                 .prefill_p1_split(),
-            4
+            0
         );
         assert_eq!(
             require_qualified_topology(Route::P1, Ok(other.clone()))
@@ -3617,40 +3358,6 @@ mod tests {
     #[test]
     fn a_missing_required_argument_fails_in_parsing_not_on_a_device() {
         let run = |argv: &[&str]| parse_and_validate(argv.to_vec()).map(|_| ());
-        // stage-dump without --heads
-        let err = run(&[
-            "gdn_p1_runner",
-            "stage-dump",
-            "--package",
-            "p",
-            "--run-dir",
-            "d",
-        ])
-        .map(|_| ())
-        .expect_err("stage-dump without --heads must fail");
-        assert!(
-            err.to_string().contains("heads"),
-            "the error must name the missing argument: {err}"
-        );
-        assert!(
-            !err.to_string().contains("CUDA") && !err.to_string().contains("no CUDA"),
-            "argument validation must not reach the device: {err}"
-        );
-        // and the same phase WITH --heads parses
-        assert!(
-            run(&[
-                "gdn_p1_runner",
-                "stage-dump",
-                "--package",
-                "p",
-                "--run-dir",
-                "d",
-                "--heads",
-                "0,1"
-            ])
-            .is_ok(),
-            "stage-dump with --heads must parse"
-        );
         // numerics without --package, identity without --run-dir, e2e without --model
         for (phase, drop_arg, name) in [
             (
@@ -3729,19 +3436,6 @@ mod tests {
         .map(|_| ())
         .expect_err("the built core is C64 only");
         assert!(err.to_string().contains("C64"), "{err}");
-        let err = parse_and_validate(vec![
-            "gdn_p1_runner",
-            "stage-dump",
-            "--package",
-            "p",
-            "--run-dir",
-            "d",
-            "--heads",
-            "48",
-        ])
-        .map(|_| ())
-        .expect_err("there is no head 48");
-        assert!(err.to_string().contains("outside 0..48"), "{err}");
     }
 
     /// The P2 slot the three stages run in is the planner's number, and it is one

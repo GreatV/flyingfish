@@ -57,8 +57,7 @@ use super::contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut};
 use super::cubin;
 use super::ops::{CommonOpsRef, GdnGateBindings};
 use crate::gdn_plan::{
-    CW_P2_CHUNK, CW_P2_VALUE_BLOCK, GdnPolicy, GdnWorkspace, Region, add, cw_p1, cw_p2,
-    cw_p2_bytes, mul,
+    CW_P2_CHUNK, CW_P2_VALUE_BLOCK, GdnPolicy, GdnWorkspace, Region, add, cw_p2, cw_p2_bytes, mul,
 };
 use crate::op_contract::{ExecutionPhase, GdnSpec, WorkspaceReq};
 use anyhow::{Context, Result, ensure};
@@ -87,9 +86,6 @@ const PREP_THREADS: u32 = 128;
 /// `GDN_RS_INTERFACE.md` §7. Static shared memory in all three is 0.
 const RECURRENT_SMEM: u32 = 4096;
 const CHUNKED_SMEM: u32 = 62_336;
-/// Chunkwise P1 core thread block (protocol §E: 256 threads for the state pass).
-/// Its dynamic shared-memory size is per split and comes from `gdn_cw_p1_layout.h`.
-const P1_THREADS: u32 = 256;
 /// Chunkwise-P2 core thread block, the same 256 threads; all three stages use the one
 /// arena whose size comes from `gdn_cw_p2_layout.h`.
 const P2_THREADS: u32 = 256;
@@ -134,29 +130,8 @@ struct Kernels {
     rstep: Option<CudaFunction>,
     hist_snapshot: CudaFunction,
     core_snapshot: CudaFunction,
-    /// Bound only when the plan was prepared with a non-zero chunkwise P1 split.
-    p1: Option<ChunkwiseP1>,
     /// Bound only when the plan was prepared for the chunkwise-P2 split.
     p2: Option<ChunkwiseP2>,
-}
-
-/// Phase-2 chunkwise P1 cores (precision protocol §D/§E), one entry point per value
-// split; the split is a compile-time property of the kernel's register state tile.
-struct ChunkwiseP1 {
-    s4: CudaFunction,
-    s8: CudaFunction,
-    s16: CudaFunction,
-}
-
-impl ChunkwiseP1 {
-    fn select(&self, split: u32) -> Result<(&CudaFunction, u32)> {
-        Ok(match split {
-            4 => (&self.s4, cw_p1::S4_BYTES),
-            8 => (&self.s8, cw_p1::S8_BYTES),
-            16 => (&self.s16, cw_p1::S16_BYTES),
-            _ => anyhow::bail!("chunkwise P1 value split {split} is not one of 4/8/16"),
-        })
-    }
 }
 
 /// The three chunkwise-P2 stages. They are launched in the order A, H, O on one stream
@@ -225,10 +200,7 @@ pub(crate) struct GdnPlan {
     hist_cfg: LaunchConfig,
     chunked_cfg: LaunchConfig,
     recurrent_cfg: LaunchConfig,
-    /// Protocol §A value split of the prepared chunkwise P1 core, 0 when the plan
-    /// keeps the shipped recursive core; fixed in `prepare`.
-    p1_split: u32,
-    /// Whether this plan carries the chunkwise-P2 split instead of the fused P1 core.
+    /// Whether this plan carries the chunkwise-P2 split instead of the shipped core.
     cw_p2: bool,
     /// Chunkwise-P2 workspace bytes this plan needs past `ws.bytes`, 0 when it does not
     /// carry the split. The slot region starts at `ws.bytes`.
@@ -288,8 +260,7 @@ impl GdnPlan {
         check_bindings(&bindings, rows, self.conv_dim)?;
         let (prep_cfg, beta_cfg, conv_cfg) =
             prep_grids(self.prep_cfg, self.beta_cfg, self.conv_cfg, rows)?;
-        // 1..=MIN_VERIFY_ROWS keeps the shipped core for both chunkwise routes, exactly
-        // as `p1_split` does.
+        // 1..=MIN_VERIFY_ROWS keeps the shipped core.
         let cw_p2 = self.cw_p2 && rows > crate::gdn_plan::MIN_VERIFY_ROWS;
         Ok(Self {
             snapshots: None,
@@ -306,62 +277,9 @@ impl GdnPlan {
             hist_cfg: self.hist_cfg,
             chunked_cfg: self.chunked_cfg,
             recurrent_cfg: self.recurrent_cfg,
-            // 1..=MIN_VERIFY_ROWS keeps the shipped core: `run_verify` rejects a P1 plan.
-            p1_split: if rows > crate::gdn_plan::MIN_VERIFY_ROWS {
-                self.p1_split
-            } else {
-                0
-            },
             ws_p2: if cw_p2 { cw_p2_bytes(rows) } else { 0 },
             cw_p2,
         })
-    }
-
-    /// Phase-2 chunkwise P1 core (precision protocol §D/§E); `split` selects the entry point and grid.x.
-    pub(crate) fn run_chunkwise_p1(
-        &self,
-        stream: &Arc<CudaStream>,
-        meta: SeqRef,
-        scratch: Scratch,
-        split: u32,
-    ) -> Result<()> {
-        meta.validate()?;
-        scratch.validate(self.ws.bytes)?;
-        let p1 = self
-            .kernels
-            .p1
-            .as_ref()
-            .context("chunkwise P1 core was not bound by prepare")?;
-        let (core, smem) = p1.select(split)?;
-        let rows = self.max_rows;
-        let ws = scratch.ptr;
-        let q = ws_f32_3(self.ws.q_fp32, ws, rows, HV, DK)?;
-        let k = ws_f32_3(self.ws.k_fp32, ws, rows, HV, DK)?;
-        let v = ws_f32_3(self.ws.v_fp32, ws, rows, HV, DV)?;
-        let beta = ws_f32(self.ws.beta_fp32, ws, rows, HV)?;
-        let g = ws_f32(self.ws.g, ws, rows, HV)?;
-        let cfg = LaunchConfig {
-            grid_dim: (split, HV, 1),
-            block_dim: (P1_THREADS, 1, 1),
-            shared_mem_bytes: smem,
-        };
-        unsafe {
-            stream
-                .launch_builder(core)
-                .arg(&q.0.ptr)
-                .arg(&k.0.ptr)
-                .arg(&v.0.ptr)
-                .arg(&beta.0.ptr)
-                .arg(&g.0.ptr)
-                .arg(&self.bindings.s.0.ptr)
-                .arg(&self.bindings.core_out.0.ptr)
-                .arg(&meta.ptr)
-                // 0 is the sentinel that makes the kernel read `meta->valid_rows`,
-                // as the chunked core does, so a captured Graph replays it.
-                .arg(&0i32)
-                .launch(cfg)?;
-        }
-        Ok(())
     }
 
     /// The chunkwise-P2 prefill core: stage A, then stage H, then stage O, three launches
@@ -459,21 +377,9 @@ impl GdnOps {
         max_rows: u32,
         bindings: GdnBindings,
         common: CommonOpsRef,
-        p1_split: u32,
         cw_p2: bool,
     ) -> Result<GdnPlan> {
         spec.validate()?;
-        // 4/8/16 or not bound: an unknown split must name itself, not fall back.
-        ensure!(
-            matches!(p1_split, 0 | 4 | 8 | 16),
-            "GDN chunkwise P1 split {p1_split} is not 0 (off) or 4/8/16"
-        );
-        // The two chunkwise routes are alternatives over the same core: preparing both
-        // would leave the dispatch order, not the split, deciding the numerics.
-        ensure!(
-            !(p1_split != 0 && cw_p2),
-            "GDN cannot prepare both the chunkwise P1 core and the chunkwise P2 split"
-        );
         ensure!(
             HK * GQA == HV,
             "GDN GQA {GQA} does not expand {HK} key heads to {HV} value heads"
@@ -494,9 +400,6 @@ impl GdnOps {
         for (name, bytes) in [
             ("recurrent", u64::from(RECURRENT_SMEM)),
             ("chunked", u64::from(CHUNKED_SMEM)),
-            ("chunkwise P1 s4", u64::from(cw_p1::S4_BYTES)),
-            ("chunkwise P1 s8", u64::from(cw_p1::S8_BYTES)),
-            ("chunkwise P1 s16", u64::from(cw_p1::S16_BYTES)),
             ("chunkwise P2 stages", cw_p2::SMEM_BYTES),
         ] {
             ensure!(
@@ -547,16 +450,6 @@ impl GdnOps {
         };
         // All three arenas are under the 48 KiB no-opt-in cap, so they need no
         // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES.
-        let p1 = if p1_split == 0 {
-            None
-        } else {
-            let p1_mod = cubin::module(ctx, "gdn/gdn_chunkwise_p1")?;
-            Some(ChunkwiseP1 {
-                s4: p1_mod.load_function("gdn_chunkwise_p1_core_s4")?,
-                s8: p1_mod.load_function("gdn_chunkwise_p1_core_s8")?,
-                s16: p1_mod.load_function("gdn_chunkwise_p1_core_s16")?,
-            })
-        };
         let p2 = if !cw_p2 {
             None
         } else {
@@ -577,7 +470,6 @@ impl GdnOps {
             beta_widen: f_beta,
             chunked: f_chunked,
             recurrent: f_recurrent,
-            p1,
             p2,
         };
         // Grids derive from the rows the plan binds, never from device valid_rows, so a captured Graph replays an identical launch sequence.
@@ -626,7 +518,6 @@ impl GdnOps {
                 block_dim: (CORE_THREADS, 1, 1),
                 shared_mem_bytes: RECURRENT_SMEM,
             },
-            p1_split,
             ws_p2: if cw_p2 { cw_p2_bytes(max_rows) } else { 0 },
             cw_p2,
         })
@@ -679,7 +570,7 @@ impl GdnOps {
         };
         meta.validate()?;
         ensure!(
-            !verify || (plan.p1_split == 0 && !plan.cw_p2),
+            !verify || !plan.cw_p2,
             "chunkwise plan cannot verify; verify keeps the recurrent core"
         );
         scratch.validate(add(plan.ws.bytes, plan.ws_p2)?)?;
@@ -825,7 +716,6 @@ impl GdnOps {
         #[cfg(test)]
         record_phase(match phase {
             ExecutionPhase::Prefill if plan.cw_p2 => "chunkwise_p2",
-            ExecutionPhase::Prefill if plan.p1_split != 0 => "chunkwise_p1",
             ExecutionPhase::Prefill if rstep.is_some() => "rstep",
             ExecutionPhase::Prefill => "chunked",
             ExecutionPhase::Decode => "recurrent",
@@ -834,9 +724,6 @@ impl GdnOps {
             match phase {
                 ExecutionPhase::Prefill if plan.cw_p2 => {
                     plan.gdn_cw_p2_step(stream, meta, scratch)?;
-                }
-                ExecutionPhase::Prefill if plan.p1_split != 0 => {
-                    plan.run_chunkwise_p1(stream, meta, scratch, plan.p1_split)?;
                 }
                 ExecutionPhase::Prefill if snapshots.is_some() => {
                     let (state, _) = snapshots.context("missing snapshot bindings")?;
@@ -2089,7 +1976,6 @@ mod gpu_probe {
             c.man.plan_rows,
             b,
             common,
-            0,
             false,
         )?;
         let (meta_buf, meta) = meta_device(

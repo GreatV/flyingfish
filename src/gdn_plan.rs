@@ -83,9 +83,8 @@ pub struct GdnPolicy {
     /// Protocol §A value split of the production chunkwise-P1 prefill core, 0 = the
     /// shipped recursive core; qualified for arch 89 with 128 SMs, 0 elsewhere.
     prefill_p1_split: u32,
-    /// Whether the chunkwise-P2 split (three kernels over a workspace slot) is prepared
-    /// instead of the fused P1 core. No device qualification sets it: the bit-identity
-    /// gate does, and until it does the fused P1 core stays the prefill route.
+    /// The chunkwise-P2 split (three kernels over a workspace slot) replaces the fused
+    /// P1 core; prepared for arch 89 with 128 SMs.
     cw_p2: bool,
 }
 impl GdnPolicy {
@@ -93,16 +92,15 @@ impl GdnPolicy {
         prefill_p1_split: 0,
         cw_p2: false,
     };
-    /// The chunkwise-P2 split, replacing the fused P1 core. The bit-identity gate selects
-    /// it; no device qualification does, so the shipped route is unchanged.
+    /// The chunkwise-P2 split.
     pub const P2: Self = Self {
         prefill_p1_split: 0,
         cw_p2: true,
     };
     pub const fn for_device(arch: u32, sms: usize) -> Self {
         Self {
-            prefill_p1_split: if arch == 89 && sms == 128 { 4 } else { 0 },
-            cw_p2: false,
+            prefill_p1_split: 0,
+            cw_p2: arch == 89 && sms == 128,
         }
     }
     /// The device's prepared chunkwise-P1 value split; `p1_split_for_step` is the
@@ -111,10 +109,9 @@ impl GdnPolicy {
         self.prefill_p1_split
     }
     /// The split a prefill step of `step_rows` rows carries: steps above
-    /// MIN_VERIFY_ROWS take the chunkwise-P1 core, 1..=MIN_VERIFY_ROWS keep split 0,
-    /// and the chunkwise-P2 split carries neither P1 entry.
+    /// MIN_VERIFY_ROWS take the chunkwise core, 1..=MIN_VERIFY_ROWS keep split 0.
     pub const fn p1_split_for_step(self, step_rows: u32) -> u32 {
-        if step_rows > MIN_VERIFY_ROWS && !self.cw_p2 {
+        if step_rows > MIN_VERIFY_ROWS {
             self.prefill_p1_split
         } else {
             0
@@ -125,12 +122,10 @@ impl GdnPolicy {
     pub const fn cw_p2_for_step(self, step_rows: u32) -> bool {
         self.cw_p2 && step_rows > MIN_VERIFY_ROWS
     }
-    /// The plan id: the P1-named route where prefill_p1_split is prepared.
+    /// The plan id.
     pub const fn identity(self) -> &'static str {
         if self.cw_p2 {
             "gdn-plan-v3-c32-vs1-fp32-p2-w32"
-        } else if self.prefill_p1_split != 0 {
-            "gdn-plan-v3-c32-vs1-fp32-p1s4-w32"
         } else {
             GdnSpec::PLAN_ID
         }
@@ -272,37 +267,37 @@ impl GdnWorkspace {
 mod tests {
     use super::*;
     #[test]
-    fn every_prefill_step_above_the_verify_floor_takes_p1() {
+    fn every_prefill_step_above_the_verify_floor_takes_the_chunkwise_core() {
         let qualified = GdnPolicy::for_device(89, 128);
+        assert_eq!(qualified, GdnPolicy::P2);
         for rows in [1u32, 2, 3, 4] {
             assert_eq!(
                 qualified.p1_split_for_step(rows),
                 0,
                 "{rows} keeps the verify core"
             );
+            assert!(
+                !qualified.cw_p2_for_step(rows),
+                "{rows} keeps the verify core"
+            );
         }
-        for rows in [5u32, 63, 64, 512, 1024, 2048, 2049, 4096, 16384] {
-            assert_eq!(qualified.p1_split_for_step(rows), 4, "{rows} must take P1");
+        for rows in [5u32, 63, 64, 512, 1021, 2048, 2049, 4096, 16384] {
+            assert!(qualified.cw_p2_for_step(rows), "{rows} must take P2");
         }
         for (arch, sms) in [(86, 48), (89, 80), (90, 128)] {
             let legacy = GdnPolicy::for_device(arch, sms);
             assert_eq!(legacy, GdnPolicy::LEGACY);
             assert_eq!(legacy.prefill_p1_split(), 0);
-            assert_eq!(legacy.p1_split_for_step(64), 0);
-            assert_eq!(legacy.p1_split_for_step(16384), 0);
+            assert!(!legacy.cw_p2_for_step(64));
+            assert!(!legacy.cw_p2_for_step(16384));
         }
     }
     #[test]
     fn exact_shared_arena_and_monotone_admission() -> Result<()> {
         let spec = GdnSpec::q38();
         let policy = GdnPolicy::for_device(89, 128);
-        for rows in [512u32, 1024, 2048] {
-            let ws = GdnWorkspace::q38(&spec, rows)?;
-            assert_eq!(policy.workspace(&spec, rows)?.bytes, ws.bytes);
-            assert_eq!(GdnPolicy::LEGACY.workspace(&spec, rows)?.bytes, ws.bytes);
-        }
-        let large = GdnWorkspace::q38(&spec, 8192)?.bytes;
-        assert_eq!(policy.workspace(&spec, 8192)?.bytes, large);
+        let legacy_ws = GdnPolicy::LEGACY.workspace(&spec, 2048)?;
+        assert!(policy.workspace(&spec, 2048)?.bytes > legacy_ws.bytes);
         let mut last = 0;
         for rows in 1..=8192 {
             let bytes = policy.workspace(&spec, rows)?.bytes;
