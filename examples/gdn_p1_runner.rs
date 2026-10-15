@@ -334,13 +334,6 @@ fn route_workspace_bytes(route: Route, rows: u32) -> Result<u64> {
     Ok(slot)
 }
 
-/// The context the numerics and timing phases launch on, so the topology guard can read
-/// the driver's attributes rather than a host-side device list.
-#[cfg(feature = "cuda")]
-fn gpu_ctx(gpu: Option<&Gpu>) -> &std::sync::Arc<cudarc::driver::CudaContext> {
-    &gpu.expect("the CUDA clock opened a context").ctx
-}
-
 /// The policy a route runs under, and the device it needs. P2 is not a device
 /// qualification: it is the explicit selection the bit-identity gate makes, and it errors
 /// rather than falling back when the device is not the qualified topology.
@@ -377,6 +370,7 @@ fn query_topology(ctx: &std::sync::Arc<cudarc::driver::CudaContext>) -> Result<D
 /// device is whatever the attribute query returned, and a FAILED query is a refusal, not
 /// a silent "unknown" that lets the run continue. The message shape on a mismatch is
 /// unchanged from the pre-sanitizer form.
+#[cfg(any(feature = "cuda", test))]
 fn require_qualified_topology(
     route: Route,
     topology: Result<DeviceInfo>,
@@ -419,13 +413,6 @@ fn route_policy(
     ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
 ) -> Result<flyingfish::gdn_plan::GdnPolicy> {
     require_qualified_topology(route, query_topology(ctx))
-}
-
-/// Without the CUDA feature there is no attribute query, so the guard refuses with the
-/// same shape a failed query produces.
-#[cfg(not(feature = "cuda"))]
-fn route_policy_no_cuda(route: Route) -> Result<flyingfish::gdn_plan::GdnPolicy> {
-    require_qualified_topology(route, Err(anyhow::anyhow!("the cuda feature is off")))
 }
 
 #[derive(Parser)]
@@ -1382,16 +1369,12 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
     if args.clock == Clock::Cuda {
         #[cfg(feature = "cuda")]
         {
-            gpu = Some(Gpu::open(args.route)?);
+            let opened = Gpu::open(args.route)?;
+            route_policy(args.route, &opened.ctx)?;
+            gpu = Some(opened);
         }
         #[cfg(not(feature = "cuda"))]
         anyhow::bail!("--clock cuda needs the crate's cuda feature");
-    }
-    {
-        #[cfg(feature = "cuda")]
-        route_policy(args.route, gpu_ctx(gpu.as_ref()))?;
-        #[cfg(not(feature = "cuda"))]
-        route_policy_no_cuda(args.route)?;
     }
 
     for fx in &fixtures {
@@ -1924,16 +1907,12 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
     if args.clock == Clock::Cuda {
         #[cfg(feature = "cuda")]
         {
-            gpu = Some(Gpu::open(args.route)?);
+            let opened = Gpu::open(args.route)?;
+            route_policy(args.route, &opened.ctx)?;
+            gpu = Some(opened);
         }
         #[cfg(not(feature = "cuda"))]
         anyhow::bail!("--clock cuda needs the crate's cuda feature");
-    }
-    {
-        #[cfg(feature = "cuda")]
-        route_policy(args.route, gpu_ctx(gpu.as_ref()))?;
-        #[cfg(not(feature = "cuda"))]
-        route_policy_no_cuda(args.route)?;
     }
 
     // Load the inputs once; every leg restores S from S0 so a leg's decay work is
@@ -2907,6 +2886,11 @@ impl Gpu {
         let mut ds = self.stream.clone_htod(&arrays.s0)?;
         let mut dout = self.stream.alloc_zeros::<half::bf16>(m * heads * dv)?;
         let meta = self.meta(fx)?;
+        let ws = if which == Which::P2 {
+            Some(self.p2_workspace(m)?)
+        } else {
+            None
+        };
         // The events bracket the launch; nothing else is enqueued between them and the
         // stream is synchronised before the pair is read.
         let start = self
@@ -2934,7 +2918,7 @@ impl Gpu {
                         })?;
                 }
                 Which::P2 => {
-                    let ws = self.p2_workspace(m)?;
+                    let ws = ws.as_ref().context("the P2 arm allocates its workspace")?;
                     let mut case = P2Case {
                         dq: &dq,
                         dk: &dk,
@@ -2944,7 +2928,7 @@ impl Gpu {
                         ds: &mut ds,
                         dout: &mut dout,
                         meta: &meta,
-                        ws: &ws,
+                        ws,
                         m,
                         heads: heads as u32,
                     };
