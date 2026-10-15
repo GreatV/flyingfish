@@ -204,6 +204,16 @@ pub(super) fn limits(rows: usize, capacity: usize) -> Result<AttentionLimits> {
         causal: 1,
     })
 }
+fn nested_verify_tcmqa(device_prefix: bool, rows: usize) -> Result<bool> {
+    if !device_prefix {
+        return Ok(false);
+    }
+    ensure!(
+        rows > 0 && rows <= 4,
+        "nested device-prefix attention supports rows 1..=4"
+    );
+    Ok(true)
+}
 impl Runtime {
     pub(super) fn checkpoint_path(&self) -> &Path {
         &self.checkpoint_dir
@@ -232,6 +242,8 @@ impl Runtime {
         let attention_prefill = FullAttentionOps::preprocess_workspace(limits(rows, capacity)?)?;
         let attention_decode =
             FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(1, capacity)?)?;
+        let attention_nested_verify =
+            FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(rows.min(4), capacity)?)?;
         let spec = crate::op_contract::GdnSpec::q38();
         let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?, policy)?;
         let decode = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY)?;
@@ -239,6 +251,7 @@ impl Runtime {
             [
                 attention_prefill.alignment,
                 attention_decode.alignment,
+                attention_nested_verify.alignment,
                 prefill.alignment,
                 decode.alignment,
             ]
@@ -250,6 +263,7 @@ impl Runtime {
             attention_prefill
                 .bytes
                 .max(attention_decode.bytes)
+                .max(attention_nested_verify.bytes)
                 .max(prefill.bytes)
                 .max(decode.bytes),
         )?)
@@ -370,6 +384,18 @@ impl Runtime {
                             }})
                         );
                     }
+                    let text_prefill = PrefillPlans::bind(
+                        bind(rows, PositionBindings::Linear, false)?,
+                        rows,
+                        FullAttentionPlan::for_rows,
+                    )?;
+                    ensure!(
+                        text_prefill
+                            .small
+                            .iter()
+                            .all(|plan| plan.workspace().bytes <= scratch_buffer.len() as u64),
+                        "nested verify attention exceeds Engine scratch budget"
+                    );
                     BoundMixer::Attention {
                         image_prefill: PrefillPlans::bind(
                             bind(
@@ -386,11 +412,7 @@ impl Runtime {
                             rows,
                             FullAttentionPlan::for_rows,
                         )?,
-                        text_prefill: PrefillPlans::bind(
-                            bind(rows, PositionBindings::Linear, false)?,
-                            rows,
-                            FullAttentionPlan::for_rows,
-                        )?,
+                        text_prefill,
                         compact_small: if kv.compact.is_some() {
                             Some(PrefillPlans::bind(
                                 bind(4.min(rows), PositionBindings::Linear, true)?,
@@ -943,6 +965,7 @@ impl Engine {
                 "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(limits(rows, capacity)?)?.bytes,
                 "attention_prefill_lse_bytes": rows * model_spec.q_heads as usize * size_of::<f32>(),
                 "attention_decode_workspace_bytes": FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(1, capacity)?)?.bytes,
+                "attention_nested_verify_workspace_bytes": FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(rows.min(4), capacity)?)?.bytes,
                 "attention_prefill_backend": "FA2 d256",
                 "attention_decode_backend": "TCMQA d256",
                 "gdn_prefill_workspace_bytes": GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), u32::try_from(rows)?, gdn_policy)?.bytes,
@@ -1124,11 +1147,16 @@ impl Engine {
                 }
                 match phase {
                     ExecutionPhase::Prefill => {
-                        if self.qwen_device_prefix && compact_small.is_some() {
-                            let narrowed = compact_small
-                                .as_ref()
-                                .context("compact verify plan missing")?
-                                .select(rows, &FullAttentionPlan::for_rows)?;
+                        if nested_verify_tcmqa(self.qwen_device_prefix, rows)? {
+                            let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
+                            let plans = if kv.compact.is_some() {
+                                compact_small
+                                    .as_ref()
+                                    .context("compact verify plan missing")?
+                            } else {
+                                text_prefill
+                            };
+                            let narrowed = plans.select(rows, &FullAttentionPlan::for_rows)?;
                             FullAttentionOps::run(&narrowed, s, meta, scratch(&q.scratch, s))?;
                         } else {
                             let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
@@ -1177,23 +1205,10 @@ impl Engine {
                                 head_dim: 256,
                                 causal: true,
                             };
-                            let launch = if self.qwen_device_prefix {
-                                super::super::flash::Launch::Device {
-                                    shape,
-                                    key_count: self
-                                        .state
-                                        .sequence
-                                        .as_ref()
-                                        .context("Q38 sequence missing")?
-                                        .slice(2..3),
-                                }
-                            } else {
-                                shape.into()
-                            };
                             self.flash
                                 .as_mut()
                                 .context("Q38 prefill attention is not bound")?
-                                .run(&mw.q, 24 * 256, k_cache, v_cache, &mut w.attn, launch)?;
+                                .run(&mw.q, 24 * 256, k_cache, v_cache, &mut w.attn, shape)?;
                             if let Some(c) = &kv.compact {
                                 let (k, v) = q
                                     .kv_scratch
@@ -1660,6 +1675,12 @@ mod tests {
             for rows in 1..=capacity {
                 assert_eq!(*plans.select(rows, &narrow)?, rows);
             }
+            for rows in 1..=4.min(capacity) {
+                ensure!(
+                    matches!(plans.select(rows, &narrow)?, Narrowed::Borrowed(_)),
+                    "nested verify rows {rows} did not select a snapshot-bound plan"
+                );
+            }
             assert!(plans.select(0, &narrow).is_err());
             assert!(plans.select(capacity + 1, &narrow).is_err());
             assert!(plans.select(usize::MAX, &narrow).is_err());
@@ -1680,6 +1701,33 @@ mod tests {
             }
         }
         assert!(PrefillPlans::bind(0, 0, |_, rows| Ok(rows as usize)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn nested_verify_routes_only_small_rows_to_tcmqa() -> Result<()> {
+        for rows in [1, 4, 65, 2048] {
+            assert!(!nested_verify_tcmqa(false, rows)?);
+        }
+        for rows in 1..=4 {
+            assert!(nested_verify_tcmqa(true, rows)?);
+        }
+        assert!(nested_verify_tcmqa(true, 0).is_err());
+        assert!(nested_verify_tcmqa(true, 5).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_binds_nested_verify_tcmqa_rows() -> Result<()> {
+        for capacity in [256, 16_832] {
+            let required =
+                FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(4, capacity)?)?;
+            let allocated = Runtime::workspace(4, capacity, GdnPolicy::for_device(89, 128))?;
+            ensure!(
+                required.bytes <= allocated as u64,
+                "nested verify workspace {required:?} exceeds allocation {allocated}"
+            );
+        }
         Ok(())
     }
 
