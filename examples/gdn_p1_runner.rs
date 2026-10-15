@@ -36,6 +36,10 @@ const E2E_WARMUP_STEPS: usize = 4;
 const P1_MODULE: &str = "gdn/gdn_chunkwise_p1";
 #[cfg(feature = "cuda")]
 const P2_MODULE: &str = "gdn/gdn_cw_p2";
+/// The P1 reference arm's widen: the SAME kernel production launches, loaded so the
+/// reference arm runs bf16 -> prep -> core exactly as the engine does.
+#[cfg(feature = "cuda")]
+const PREP_MODULE: &str = "gdn/gdn_prep";
 
 #[derive(Parser)]
 #[command(about = "GDN chunkwise P1 primitive gate runner", long_about = None)]
@@ -1122,6 +1126,9 @@ struct GateReport {
     residual: ResidualStatus,
     environment: EnvReceipt,
     inputs_reused_from_manifest: bool,
+    /// The derived BF16 sources BOTH arms read, as (file name, sha256) written into the
+    /// run directory at load time. The frozen package is never written to.
+    derived_bf16_sources: Vec<(String, String)>,
 }
 
 /// What each fixture in the package is, carried into the receipt.
@@ -1360,6 +1367,11 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
 
     // The reference arrays for the configurations actually run, and the basis rows.
     let mut rows = Vec::new();
+    // The receipts are only produced on the CUDA leg, where the sources are derived.
+    #[cfg(feature = "cuda")]
+    let mut source_receipts: Vec<(String, String)> = Vec::new();
+    #[cfg(not(feature = "cuda"))]
+    let source_receipts: Vec<(String, String)> = Vec::new();
     let mut bytes_by_fixture: BTreeMap<String, usize> = BTreeMap::new();
     #[cfg(feature = "cuda")]
     let mut gpu: Option<Gpu> = None;
@@ -1381,6 +1393,21 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
         let m = fx.m;
         let (heads, dk, dv) = check_fixture_shapes(fx)?;
         let arrays = CaseArrays::new(&pkg.root, fx)?;
+        // The derived BF16 sources, written here so "both arms read the same inputs" is a
+        // checkable fact about the run directory rather than a claim.
+        #[cfg(feature = "cuda")]
+        {
+            let (q_src, k_src, v_src) = derive_bf16_sources(&arrays.q, &arrays.k, &arrays.v)?;
+            for receipt in write_sources(
+                &args.run_dir.join("sources"),
+                &fx.name,
+                &q_src,
+                &k_src,
+                &v_src,
+            )? {
+                source_receipts.push(receipt);
+            }
+        }
         let input_bytes = 4
             * (arrays.q.len()
                 + arrays.k.len()
@@ -1535,6 +1562,7 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
         residual,
         environment: env_receipt(args.simulate_box3, device.clone(), device_touched),
         inputs_reused_from_manifest: true,
+        derived_bf16_sources: source_receipts,
         rows,
         fixtures: receipts,
         multi_chunk_condition: multi,
@@ -1544,6 +1572,12 @@ fn run_numerics(args: &NumericsArgs) -> Result<()> {
     std::fs::write(&path, text.as_bytes()).with_context(|| format!("write {}", path.display()))?;
     eprintln!("[gate] {}", path.display());
     let pass = report.rows.iter().filter(|r| r.verdict == "PASS").count();
+    eprintln!(
+        "[gate] route {:?}: both arms read the derived BF16 sources in sources/ \
+         (p1 = sources -> gdn_prep_fp32 -> gdn_chunkwise_p1_core_s*, p2 = sources -> the \
+         folded stages); the 1.25x band is read for each arm on those same inputs",
+        args.route
+    );
     eprintln!(
         "[gate] {}/{} rows PASS, multi-chunk condition {}",
         pass,
@@ -2411,10 +2445,109 @@ fn device_of(_gpu: Option<&Gpu>) -> Option<DeviceInfo> {
 
 /// The device-side arguments of one case's chunkwise-P2 launches.
 #[cfg(feature = "cuda")]
+/// The 1/sqrt(DK) factor `gdn_prep_fp32` and the folded stage apply to Q, computed the
+/// way both kernels compute it. The fixture's Q is the BF16 activation times this factor
+/// in FP32, so the conversion divides it back out first.
+#[cfg(feature = "cuda")]
+fn p2_qscale() -> f32 {
+    1.0f32 / 128.0f32.sqrt()
+}
+
+/// The one set of BF16 sources BOTH arms read, derived at run start from the fixture's
+/// FP32 arrays and written into the run directory (never into the frozen package). The
+/// fixture's q and k are POST-PREP arrays -- GQA-expanded to 48 value heads, q already
+/// carrying the FP32 Q scale -- while `gdn_prep_fp32` and the folded stages read the
+/// PRE-EXPANSION 16 key heads, so the derivation folds the expansion back:
+///
+///   q_src[m][kh][t] = bf16_rn(q_fixture[m][3*kh][t] / 1/sqrt(128))
+///   k_src[m][kh][t] = bf16_rn(k_fixture[m][3*kh][t])   -- exact: the fixture's k is BF16
+///   v_src[m][h][t]  = bf16_rn(v_fixture[m][h][t])      -- exact: the fixture's v is BF16
+///
+/// The three GQA replicas are checked bit-equal first: a fixture whose triples disagree
+/// is a format finding to surface, not something to average over. The derivation is
+/// deterministic and its SHAs go into GATE.json. The P1 arm runs the REAL gdn_prep_fp32
+/// over these sources and then the P1 core; the P2 arm runs the folded stages over the
+/// same sources directly. Leg C's byte identity is therefore a statement about the FOLD
+/// alone, and the derived q is intentionally up to one ulp from the fixture's own q --
+/// which is why the numerics band is read for each arm on the SAME derived inputs rather
+/// than against the fixture's values.
+#[cfg(feature = "cuda")]
+fn derive_bf16_sources(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+) -> anyhow::Result<(Vec<half::bf16>, Vec<half::bf16>, Vec<half::bf16>)> {
+    const VH: usize = 48;
+    const KH: usize = 16;
+    const DK: usize = 128;
+    anyhow::ensure!(
+        q.len() == k.len() && k.len() == v.len() && q.len().is_multiple_of(VH * DK),
+        "fixture q/k/v lengths disagree or are not [rows, {VH}, {DK}]: {} / {} / {}",
+        q.len(),
+        k.len(),
+        v.len()
+    );
+    let rows = q.len() / (VH * DK);
+    let mut q_src = Vec::with_capacity(rows * KH * DK);
+    let mut k_src = Vec::with_capacity(rows * KH * DK);
+    let mut v_src = Vec::with_capacity(q.len());
+    let qscale = p2_qscale();
+    for m in 0..rows {
+        for kh in 0..KH {
+            for t in 0..DK {
+                let base = (m * VH + 3 * kh) * DK + t;
+                let (r1, r2) = (base + DK, base + 2 * DK);
+                anyhow::ensure!(
+                    q[base].to_bits() == q[r1].to_bits() && q[base].to_bits() == q[r2].to_bits(),
+                    "fixture q GQA replicas disagree at row {m} key head {kh} col {t}"
+                );
+                anyhow::ensure!(
+                    k[base].to_bits() == k[r1].to_bits() && k[base].to_bits() == k[r2].to_bits(),
+                    "fixture k GQA replicas disagree at row {m} key head {kh} col {t}"
+                );
+                q_src.push(half::bf16::from_f32(q[base] / qscale));
+                k_src.push(half::bf16::from_f32(k[base]));
+            }
+        }
+        for x in &v[m * VH * DK..(m + 1) * VH * DK] {
+            v_src.push(half::bf16::from_f32(*x));
+        }
+    }
+    Ok((q_src, k_src, v_src))
+}
+
+/// The derived sources as the raw bf16 bytes both arms were fed, plus their SHA-256: the
+/// receipts that make "the same inputs" checkable from the run directory alone.
+#[cfg(feature = "cuda")]
+fn write_sources(
+    dir: &Path,
+    name: &str,
+    q_src: &[half::bf16],
+    k_src: &[half::bf16],
+    v_src: &[half::bf16],
+) -> Result<Vec<(String, String)>> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let mut out = Vec::new();
+    for (tag, values) in [("q", q_src), ("k", k_src), ("v", v_src)] {
+        let raw: Vec<u8> = values
+            .iter()
+            .flat_map(|x| x.to_bits().to_le_bytes())
+            .collect();
+        let path = dir.join(format!("{name}.{tag}_src.bf16"));
+        std::fs::write(&path, &raw).with_context(|| format!("write {}", path.display()))?;
+        out.push((format!("{name}.{tag}_src.bf16"), sha256_bytes(&raw)));
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
 struct P2Case<'a> {
-    dq: &'a cudarc::driver::CudaSlice<f32>,
-    dk: &'a cudarc::driver::CudaSlice<f32>,
-    dvv: &'a cudarc::driver::CudaSlice<f32>,
+    // The stages read the BF16 sources directly (the prep fold): q and k as 16 KEY
+    // heads, v as a [M, 48, 128] contiguous block. See `bf16_sources` for the
+    // f32 -> bf16 conversion and the Q scale it undoes.
+    dq: &'a cudarc::driver::CudaSlice<half::bf16>,
+    dk: &'a cudarc::driver::CudaSlice<half::bf16>,
+    dvv: &'a cudarc::driver::CudaSlice<half::bf16>,
     dbeta: &'a cudarc::driver::CudaSlice<f32>,
     dg: &'a cudarc::driver::CudaSlice<f32>,
     ds: &'a mut cudarc::driver::CudaSlice<f32>,
@@ -2430,6 +2563,8 @@ struct Gpu {
     ctx: std::sync::Arc<cudarc::driver::CudaContext>,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
     p1: [cudarc::driver::CudaFunction; 3],
+    /// gdn_prep_fp32, the widen the P1 reference arm runs over the derived BF16 sources.
+    prep: cudarc::driver::CudaFunction,
     /// The three chunkwise-P2 stages, loaded only under `--route p2`.
     p2: Option<[cudarc::driver::CudaFunction; 3]>,
     main: cudarc::driver::CudaFunction,
@@ -2460,6 +2595,7 @@ impl Gpu {
         ];
         let main_mod = load_module(&ctx, "gdn/gdn_chunked")?;
         let main = main_mod.load_function(Self::MAIN_NAME)?;
+        let prep = load_module(&ctx, PREP_MODULE)?.load_function("gdn_prep_fp32")?;
         for (i, bytes) in [split_smem(4)?, split_smem(8)?, split_smem(16)?]
             .iter()
             .enumerate()
@@ -2515,6 +2651,7 @@ impl Gpu {
             ctx,
             stream,
             p1,
+            prep,
             p2,
             main,
             device_info,
@@ -2522,14 +2659,62 @@ impl Gpu {
     }
 
     /// Allocate, upload, launch the P1 core, download; every leg starts from S0.
+    /// gdn_prep_fp32 over the derived BF16 sources, returning the three widened FP32
+    /// buffers. Launched exactly as src/backend/cuda/gdn.rs issues it: one thread per
+    /// (row, value head, element), grid (DV/128, HEADS, rows), V's row stride a scalar.
+    fn widen_p1(
+        &self,
+        fx: &Fixture,
+        dq_src: &cudarc::driver::CudaSlice<half::bf16>,
+        dk_src: &cudarc::driver::CudaSlice<half::bf16>,
+        dv_src: &cudarc::driver::CudaSlice<half::bf16>,
+        heads: usize,
+        dv: usize,
+    ) -> Result<(
+        cudarc::driver::CudaSlice<f32>,
+        cudarc::driver::CudaSlice<f32>,
+        cudarc::driver::CudaSlice<f32>,
+    )> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg as _};
+        let m = fx.m;
+        let meta = self.meta(fx)?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, heads as u32, u32::try_from(m).context("live rows")?),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut dq = self.stream.alloc_zeros::<f32>(m * heads * dv)?;
+        let mut dk = self.stream.alloc_zeros::<f32>(m * heads * dv)?;
+        let mut dvv = self.stream.alloc_zeros::<f32>(m * heads * dv)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.prep)
+                .arg(dq_src)
+                .arg(dk_src)
+                .arg(dv_src)
+                .arg(&mut dq)
+                .arg(&mut dk)
+                .arg(&mut dvv)
+                .arg(&(heads as u32 * dv as u32))
+                .arg(&meta)
+                .launch(cfg)?;
+        }
+        Ok((dq, dk, dvv))
+    }
+
+    /// The P1 REFERENCE ARM: the derived BF16 sources -> the real gdn_prep_fp32 -> the
+    /// fused P1 core. This is the arm leg C compares the fold against, and it is the same
+    /// sequence production runs, so a difference is the fold's and nothing else's.
     fn run_p1(&self, fx: &Fixture, arrays: &CaseArrays, s: u32) -> Result<(Vec<f32>, Vec<f32>)> {
         use cudarc::driver::{LaunchConfig, PushKernelArg as _};
         let m = fx.m;
         let heads = fx.arrays["q"].shape[1];
         let dv = fx.arrays["v"].shape[2];
-        let dq = self.stream.clone_htod(&arrays.q)?;
-        let dk = self.stream.clone_htod(&arrays.k)?;
-        let dvv = self.stream.clone_htod(&arrays.v)?;
+        let (q_src, k_src, v_src) = derive_bf16_sources(&arrays.q, &arrays.k, &arrays.v)?;
+        let dq_src = self.stream.clone_htod(&q_src)?;
+        let dk_src = self.stream.clone_htod(&k_src)?;
+        let dv_src = self.stream.clone_htod(&v_src)?;
+        let (dq, dk, dvv) = self.widen_p1(fx, &dq_src, &dk_src, &dv_src, heads, dv)?;
         let dbeta = self.stream.clone_htod(&arrays.beta)?;
         let dg = self.stream.clone_htod(&arrays.g)?;
         let mut ds = self.stream.clone_htod(&arrays.s0)?;
@@ -2603,43 +2788,57 @@ impl Gpu {
             shared_mem_bytes: smem,
         };
         let (slot, _hold) = case.ws.device_ptr(&self.stream);
+        let stage = flyingfish::gdn_plan::P2StageArgs {
+            q: case.dq.device_ptr(&self.stream).0,
+            k: case.dk.device_ptr(&self.stream).0,
+            v: case.dvv.device_ptr(&self.stream).0,
+            beta: case.dbeta.device_ptr(&self.stream).0,
+            g: case.dg.device_ptr(&self.stream).0,
+            ws: slot,
+            meta: case.meta.device_ptr(&self.stream).0,
+            valid_rows: 0,
+            // v is a contiguous [M, 48, 128] block here; in production it is a conv_out
+            // column window whose rows are conv_dim apart.
+            v_row_stride: DV as u32 * 48,
+        };
         unsafe {
             stream
                 .launch_builder(&stages[0])
-                .arg(case.dq)
-                .arg(case.dk)
-                .arg(case.dvv)
-                .arg(case.dbeta)
-                .arg(case.dg)
-                .arg(&slot)
-                .arg(case.meta)
+                .arg(&stage.q)
+                .arg(&stage.k)
+                .arg(&stage.v)
+                .arg(&stage.beta)
+                .arg(&stage.g)
+                .arg(&stage.ws)
+                .arg(&stage.meta)
                 // 0 is the sentinel that makes the kernel read meta->valid_rows, so a
                 // captured graph replays the live count.
-                .arg(&0i32)
+                .arg(&stage.valid_rows)
+                .arg(&stage.v_row_stride)
                 .launch(per_chunk)?;
             stream
                 .launch_builder(&stages[1])
-                .arg(case.dq)
-                .arg(case.dk)
-                .arg(case.dvv)
-                .arg(case.dbeta)
-                .arg(case.dg)
+                .arg(&stage.q)
+                .arg(&stage.k)
+                .arg(&stage.v)
+                .arg(&stage.beta)
+                .arg(&stage.g)
                 .arg(&*case.ds)
-                .arg(&slot)
-                .arg(case.meta)
-                .arg(&0i32)
+                .arg(&stage.ws)
+                .arg(&stage.meta)
+                .arg(&stage.valid_rows)
                 .launch(per_value_block)?;
             stream
                 .launch_builder(&stages[2])
-                .arg(case.dq)
-                .arg(case.dk)
-                .arg(case.dvv)
-                .arg(case.dbeta)
-                .arg(case.dg)
-                .arg(&slot)
+                .arg(&stage.q)
+                .arg(&stage.k)
+                .arg(&stage.v)
+                .arg(&stage.beta)
+                .arg(&stage.g)
+                .arg(&stage.ws)
                 .arg(&*case.dout)
-                .arg(case.meta)
-                .arg(&0i32)
+                .arg(&stage.meta)
+                .arg(&stage.valid_rows)
                 .launch(per_chunk)?;
         }
         Ok(())
@@ -2659,9 +2858,10 @@ impl Gpu {
         let m = fx.m;
         let heads = fx.arrays["q"].shape[1] as u32;
         let dv = fx.arrays["v"].shape[2];
-        let dq = self.stream.clone_htod(&arrays.q)?;
-        let dk = self.stream.clone_htod(&arrays.k)?;
-        let dvv = self.stream.clone_htod(&arrays.v)?;
+        let (q_bf16, k_bf16, v_bf16) = derive_bf16_sources(&arrays.q, &arrays.k, &arrays.v)?;
+        let dq = self.stream.clone_htod(&q_bf16)?;
+        let dk = self.stream.clone_htod(&k_bf16)?;
+        let dvv = self.stream.clone_htod(&v_bf16)?;
         let dbeta = self.stream.clone_htod(&arrays.beta)?;
         let dg = self.stream.clone_htod(&arrays.g)?;
         let mut ds = self.stream.clone_htod(&arrays.s0)?;
@@ -2703,9 +2903,10 @@ impl Gpu {
         let m = fx.m;
         let heads = fx.arrays["q"].shape[1] as u32;
         let dv = fx.arrays["v"].shape[2];
-        let dq = self.stream.clone_htod(&arrays.q)?;
-        let dk = self.stream.clone_htod(&arrays.k)?;
-        let dvv = self.stream.clone_htod(&arrays.v)?;
+        let (q_bf16, k_bf16, v_bf16) = derive_bf16_sources(&arrays.q, &arrays.k, &arrays.v)?;
+        let dq = self.stream.clone_htod(&q_bf16)?;
+        let dk = self.stream.clone_htod(&k_bf16)?;
+        let dvv = self.stream.clone_htod(&v_bf16)?;
         let dbeta = self.stream.clone_htod(&arrays.beta)?;
         let dg = self.stream.clone_htod(&arrays.g)?;
         let meta = self.meta(fx)?;
@@ -2795,9 +2996,13 @@ impl Gpu {
         };
         let entry = split_function(s);
         let fun = &self.p1[index];
-        let dq = self.stream.clone_htod(&arrays.q)?;
-        let dk = self.stream.clone_htod(&arrays.k)?;
-        let dvv = self.stream.clone_htod(&arrays.v)?;
+        // The same derived sources and the same prep as run_p1, hoisted out of the measured
+        // launch: the identity leg compares launches, not the widen.
+        let (q_src, k_src, v_src) = derive_bf16_sources(&arrays.q, &arrays.k, &arrays.v)?;
+        let dq_src = self.stream.clone_htod(&q_src)?;
+        let dk_src = self.stream.clone_htod(&k_src)?;
+        let dv_src = self.stream.clone_htod(&v_src)?;
+        let (dq, dk, dvv) = self.widen_p1(fx, &dq_src, &dk_src, &dv_src, heads, dv)?;
         let dbeta = self.stream.clone_htod(&arrays.beta)?;
         let dg = self.stream.clone_htod(&arrays.g)?;
         let meta = self.meta(fx)?;
@@ -2878,6 +3083,8 @@ impl Gpu {
         let m = fx.m;
         let heads = fx.arrays["q"].shape[1];
         let dv = fx.arrays["v"].shape[2];
+        // The shared locals stay FP32: the P1 and main arms read exactly what the fixture
+        // holds. The P2 arm builds its own BF16 sources inside its match arm.
         let dq = self.stream.clone_htod(&arrays.q)?;
         let dk = self.stream.clone_htod(&arrays.k)?;
         let dvv = self.stream.clone_htod(&arrays.v)?;
@@ -2919,6 +3126,13 @@ impl Gpu {
                 }
                 Which::P2 => {
                     let ws = ws.as_ref().context("the P2 arm allocates its workspace")?;
+                    // The stages read BF16 sources; the FP32 uploads above are the other
+                    // arms' operands and are not read here.
+                    let (q_bf16, k_bf16, v_bf16) =
+                        derive_bf16_sources(&arrays.q, &arrays.k, &arrays.v)?;
+                    let dq = self.stream.clone_htod(&q_bf16)?;
+                    let dk = self.stream.clone_htod(&k_bf16)?;
+                    let dvv = self.stream.clone_htod(&v_bf16)?;
                     let mut case = P2Case {
                         dq: &dq,
                         dk: &dk,
