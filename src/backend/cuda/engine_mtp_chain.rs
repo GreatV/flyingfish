@@ -241,7 +241,7 @@ impl Backend for Bound<'_> {
         saved.position = Some(e.position);
         Ok(())
     }
-    fn restore(&mut self) -> Result<()> {
+    fn restore(&mut self, replay: bool) -> Result<()> {
         let e = &mut self.engine;
         let c = &mut self.chain;
         let s = &e.device.stream;
@@ -259,6 +259,9 @@ impl Backend for Bound<'_> {
         s.memcpy_dtod(&saved.logits, &mut e.work.logits)?;
         s.synchronize()?;
         e.position = position;
+        if replay {
+            e.state.compact_defer(s)?;
+        }
         e.logits_cache.mark_valid();
         e.poisoned = false;
         s.memcpy_dtod(&saved.last_target, &mut c.last_target)?;
@@ -605,6 +608,7 @@ impl Engine {
                 #[cfg(test)]
                 fault,
             )?;
+            self.state.compact_commit(&self.device.stream, true)?;
             chain.committed_position = self.position;
             Ok(round)
         })();

@@ -602,6 +602,7 @@ fn q38_mtp_snapshot_teacher_forcing_gpu() -> Result<()> {
         backend: crate::backend::Settings {
             runtime_dir: Some(runtime),
             prefix_cache: false,
+            kv_format: crate::kv::KvFormat::Bf16,
             tree_builder: crate::backend::TreeBuilder::Waves,
             spec_budget: crate::backend::SpecBudget::Chain,
             spec_graph: false,
@@ -741,6 +742,7 @@ fn q38_mtp_snapshot_measure_gpu() -> Result<()> {
         backend: crate::backend::Settings {
             runtime_dir: Some(runtime),
             prefix_cache: false,
+            kv_format: crate::kv::KvFormat::Bf16,
             tree_builder: crate::backend::TreeBuilder::Waves,
             spec_budget: crate::backend::SpecBudget::Chain,
             spec_graph: false,
@@ -815,4 +817,104 @@ fn q38_mtp_snapshot_calibrate_gpu() -> Result<()> {
         "snapshot-calibration",
         serde_json::json!({"validity":"PASS","capacity":131072,"linear_rows":"1..16; larger prefill index0","reserve_divisor":16,"plans":e.blas.bound_plan_receipt()?}),
     )
+}
+
+#[test]
+#[ignore = "authorized full-model GPU window required"]
+fn q38_compact_failed_round_then_plain_decode_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_FULL_MODEL_WINDOW").as_deref() == Ok("granted"),
+        "compact rollback regression requires full-model window"
+    );
+    let mut ids = prompt("math1")?;
+    ids.resize(2242, 1);
+    {
+        let mut e = super::super::tests::load_format(true, 2304, crate::kv::KvFormat::Affine8)?;
+        let o = options(
+            3,
+            MtpHiddenTap::PreFinalNorm,
+            MtpRecurrentTap::PostMtpNorm,
+            false,
+        );
+        configure(&mut e, o)?;
+        e.mtp_batch_enable()?;
+        e.closure.ready(std::time::Instant::now())?;
+        e.mtp_prefill(&ids)?;
+        e.model_spec.eos.clear();
+        e.check_logits()?;
+        let before = e.decode_logits()?;
+        let failure = e
+            .mtp_batch_round(1, Some(policy::Fault::BeforePublish))
+            .err()
+            .context("single-row fault was not injected")?;
+        ensure!(
+            failure.to_string() == "injected MTP failure at BeforePublish",
+            "fault transaction failed before injection: {failure:#}"
+        );
+        ensure!(
+            !e.poisoned && e.position == ids.len(),
+            "failed single-row rollback left unhealthy engine"
+        );
+        e.check_logits()?;
+        ensure!(
+            e.decode_logits()? == before,
+            "failed round changed boundary logits"
+        );
+        for kv in &e.state.kv {
+            let c = kv.compact.as_ref().context("compact cache missing")?;
+            ensure!(
+                e.device.stream.clone_dtoh(&c.cursor)?[2] == 0,
+                "failed round retained seal lock"
+            );
+        }
+        let mut compact_logits = Vec::new();
+        let mut inputs = Vec::new();
+        for _ in 0..16 {
+            inputs.push(e.device.stream.clone_dtoh(&e.work.token)?[0]);
+            e.decode(false, None)?;
+            e.check_logits()?;
+            compact_logits.push(e.decode_logits()?);
+        }
+        configure(&mut e, o)?;
+        e.mtp_prefill(&ids)?;
+        for (row, (&input, candidate)) in inputs.iter().zip(&compact_logits).enumerate() {
+            e.device.stream.memcpy_htod(&[input], &mut e.work.token)?;
+            e.decode(false, None)?;
+            e.check_logits()?;
+            let healthy = e.decode_logits()?;
+            ensure!(
+                candidate
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .eq(healthy.iter().map(|x| x.to_bits())),
+                "post-fault/healthy compact bits differ at row {row}"
+            );
+        }
+        drop(e);
+        let mut bf16 = super::super::tests::load_format(false, 2304, crate::kv::KvFormat::Bf16)?;
+        bf16.prefill(&ids, None)?;
+        for (row, (&input, candidate)) in inputs.iter().zip(&compact_logits).enumerate() {
+            bf16.device
+                .stream
+                .memcpy_htod(&[input], &mut bf16.work.token)?;
+            bf16.decode(false, None)?;
+            let reference = bf16.decode_logits()?;
+            ensure!(
+                candidate.iter().chain(&reference).all(|x| x.is_finite()),
+                "nonfinite post-fault logits row {row}"
+            );
+            let max_error = candidate
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "COMPACT_FAILED_ROUND_BF16_COMPARISON affine8 row={row} max_logit_error={max_error}"
+            );
+        }
+    }
+    println!(
+        "COMPACT_FAILED_ROUND_PLAIN_PASS: affine8; injected k0 failure; 16 rows beyond wrap; healthy compact exact bits; BF16 per-row finite logit differences reported"
+    );
+    Ok(())
 }

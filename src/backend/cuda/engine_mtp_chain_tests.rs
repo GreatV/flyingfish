@@ -6,6 +6,13 @@ pub(super) fn load(write: bool) -> Result<Engine> {
     load_capacity(write, 128)
 }
 pub(super) fn load_capacity(write: bool, capacity: usize) -> Result<Engine> {
+    load_format(write, capacity, crate::kv::KvFormat::Bf16)
+}
+pub(super) fn load_format(
+    write: bool,
+    capacity: usize,
+    format: crate::kv::KvFormat,
+) -> Result<Engine> {
     ensure!(
         std::env::var("FF_Q38_FULL_MODEL_WINDOW").as_deref() == Ok("granted"),
         "M2a requires a separate full-model cloud window"
@@ -26,6 +33,7 @@ pub(super) fn load_capacity(write: bool, capacity: usize) -> Result<Engine> {
             draft_model: None,
             runtime_dir: Some(runtime),
             prefix_cache: false,
+            kv_format: format,
         },
         write,
     )
@@ -81,7 +89,7 @@ pub(super) fn restore(e: &mut Engine) -> Result<()> {
         engine: e,
         chain: &mut c,
     }
-    .restore();
+    .restore(false);
     e.mtp = Some(c);
     r
 }

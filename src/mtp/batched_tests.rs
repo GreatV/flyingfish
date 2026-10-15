@@ -81,7 +81,7 @@ impl Backend for Mock {
         self.saved = Some(self.state.clone());
         Ok(())
     }
-    fn restore(&mut self) -> Result<()> {
+    fn restore(&mut self, _replay: bool) -> Result<()> {
         self.events.push("restore_all");
         ensure!(!self.restore_fails, "restore failure");
         self.state = self.saved.clone().unwrap();
@@ -287,7 +287,7 @@ fn state_oracle_detects_wrong_row_history_visibility_frame_and_stale_epoch() {
     b.state.epoch -= 1;
     b.restore_fails = false;
     b.save(4).unwrap();
-    b.restore().unwrap();
+    b.restore(false).unwrap();
     assert!(b.select_prefix(2).is_err());
 }
 

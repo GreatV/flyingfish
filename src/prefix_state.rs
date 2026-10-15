@@ -206,7 +206,8 @@ impl PrefixIdentity {
         ensure!(!self.rope.is_empty(), "prefix rope context is empty");
         ensure!(self.schema == SCHEMA, "prefix schema mismatch");
         ensure!(
-            self.attention_kv_dtype == "BF16" && self.gdn_dtype == "F32",
+            crate::kv::KvFormat::from_tag(&self.attention_kv_dtype).is_ok()
+                && self.gdn_dtype == "F32",
             "prefix dtype identity mismatch"
         );
         Ok(())
@@ -338,6 +339,7 @@ pub struct PrefixRestoreReceipt {
 
 #[derive(Clone, Debug)]
 pub struct PrefixGeometry {
+    pub kv_format: crate::kv::KvFormat,
     pub capacity: usize,
     pub prefix_tokens: usize,
     pub block_tokens: usize,
@@ -380,6 +382,11 @@ impl PrefixGeometry {
             "prefix must leave a slot for the pending decode token"
         );
         ensure!(block_tokens > 0, "prefix block must be nonempty");
+        let kv_format = crate::kv::KvFormat::from_tag(&identity.attention_kv_dtype)?;
+        ensure!(
+            kv_format == crate::kv::KvFormat::Bf16 || block_tokens.is_multiple_of(128),
+            "compact KV prefix block must be a multiple of128"
+        );
         let gdn = GdnSpec::q38();
         let s_bytes = gdn.state_bytes()?;
         let history_bytes = gdn.history_bytes()?;
@@ -430,7 +437,20 @@ impl PrefixGeometry {
                     token_end: end,
                     valid_tokens: end - start,
                     axes: vec!["kv_head".into(), "token_in_block".into(), "channel".into()],
-                    payload_axes: vec!["K".into(), "V".into()],
+                    payload_axes: if kv_format == crate::kv::KvFormat::Bf16 {
+                        vec!["K".into(), "V".into()]
+                    } else {
+                        [
+                            "K_u8",
+                            "V_u8",
+                            "K_stats_f32",
+                            "V_stats_f32",
+                            "K_live_bf16",
+                            "V_live_bf16",
+                        ]
+                        .map(str::to_owned)
+                        .to_vec()
+                    },
                 };
                 expected.insert(
                     PrefixDescriptor {
@@ -481,6 +501,7 @@ impl PrefixGeometry {
             );
         }
         Ok(Self {
+            kv_format,
             capacity,
             prefix_tokens,
             block_tokens,
@@ -495,9 +516,17 @@ impl PrefixGeometry {
     }
 
     pub fn attention_block_bytes(&self, valid_tokens: usize) -> Result<usize> {
+        self.attention_block_bytes_at(0, valid_tokens)
+    }
+    pub fn attention_block_bytes_at(&self, start: usize, valid_tokens: usize) -> Result<usize> {
         ensure!(valid_tokens > 0 && valid_tokens <= self.block_tokens);
-        let one = self.kv_heads * valid_tokens * self.head_dim * 2;
-        2usize.checked_mul(one).context("attention block overflow")
+        self.kv_format.block_bytes(
+            start,
+            valid_tokens,
+            self.prefix_tokens,
+            self.kv_heads,
+            self.head_dim,
+        )
     }
 
     fn descriptor_bytes(&self, descriptor: PrefixDescriptor) -> Result<usize> {
@@ -508,7 +537,7 @@ impl PrefixGeometry {
                     .checked_sub(descriptor.block * self.block_tokens)
                     .context("bad attention block")?
                     .min(self.block_tokens);
-                self.attention_block_bytes(valid)
+                self.attention_block_bytes_at(descriptor.block * self.block_tokens, valid)
             }
             PrefixRecordKind::GdnS => Ok(self.gdn_s_bytes),
             PrefixRecordKind::GdnHistory => Ok(self.gdn_history_bytes),
@@ -1074,6 +1103,56 @@ mod tests {
             PrefixIdentity::new("test-model", "rev1", "test-tokenizer", "rope-v1", spec).unwrap();
         identity.hashed_weight_bytes = 1;
         identity
+    }
+
+    #[test]
+    fn compact_prefix_covers_typed_statistics_and_live_bf16() -> Result<()> {
+        let mut spec = spec();
+        spec.max_position = 4096;
+        let format = crate::kv::KvFormat::Affine8;
+        let mut identity = identity(&spec);
+        identity.attention_kv_dtype = format.tag().into();
+        let g = PrefixGeometry::new(&spec, 4096, 2305, 256, &identity)?;
+        let mut builder = PrefixBuilder::new(g, boundary(&vec![7; 2305]))?;
+        for layer in [1usize, 3] {
+            for block in 0..2305usize.div_ceil(256) {
+                let start = block * 256;
+                let valid = (2305 - start).min(256);
+                let n = builder.geometry.attention_block_bytes_at(start, valid)?;
+                builder.add(
+                    PrefixRecordKind::AttentionKvBlock,
+                    layer,
+                    block,
+                    vec![19; n],
+                )?;
+            }
+            builder.add(
+                PrefixRecordKind::GdnS,
+                layer - 1,
+                0,
+                vec![7; builder.geometry.gdn_s_bytes],
+            )?;
+            builder.add(
+                PrefixRecordKind::GdnHistory,
+                layer - 1,
+                0,
+                vec![11; builder.geometry.gdn_history_bytes],
+            )?;
+        }
+        let snapshot = builder.finish()?;
+        snapshot.verify_prefix(&vec![7; 2305])?;
+        let g = PrefixGeometry::new(&spec, 4096, 2305, 256, &identity)?;
+        g.verify_manifest(&snapshot.manifest)?;
+        assert_eq!(g.attention_block_bytes_at(0, 256)?, 811008);
+        assert!(PrefixGeometry::new(&spec, 4096, 2305, 127, &identity).is_err());
+        let mut foreign = identity.clone();
+        foreign.attention_kv_dtype = crate::kv::KvFormat::Bf16.tag().into();
+        assert!(
+            PrefixGeometry::new(&spec, 4096, 2305, 256, &foreign)?
+                .verify_manifest(&snapshot.manifest)
+                .is_err()
+        );
+        Ok(())
     }
 
     fn boundary(ids: &[u32]) -> PrefixBoundary {

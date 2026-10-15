@@ -80,6 +80,16 @@ pub(in crate::backend::cuda::engine) fn bucketed_prefill_rows(
 pub(crate) struct Kv {
     pub(crate) k: CudaSlice<bf16>,
     pub(crate) v: CudaSlice<bf16>,
+    pub(crate) compact: Option<super::state::CompactKv>,
+}
+impl Kv {
+    pub(crate) fn bytes(&self) -> usize {
+        (self.k.len() + self.v.len()) * 2
+            + self
+                .compact
+                .as_ref()
+                .map_or(0, super::state::CompactKv::bytes)
+    }
 }
 
 pub(crate) struct Work {
@@ -483,7 +493,7 @@ fn pinned_transfer_ring(
     Ok(unsafe { ctx.alloc_pinned_with_flags::<u8>(transfer_bytes, 0)? })
 }
 
-fn dtoh_pinned_chunks<T: cudarc::driver::DeviceRepr>(
+pub(super) fn dtoh_pinned_chunks<T: cudarc::driver::DeviceRepr>(
     stream: &Arc<CudaStream>,
     source: &CudaSlice<T>,
     source_element_offset: usize,
@@ -507,7 +517,7 @@ fn dtoh_pinned_chunks<T: cudarc::driver::DeviceRepr>(
     Ok(out)
 }
 
-fn htod_pinned_chunks<T: cudarc::driver::DeviceRepr>(
+pub(super) fn htod_pinned_chunks<T: cudarc::driver::DeviceRepr>(
     stream: &Arc<CudaStream>,
     destination: &mut CudaSlice<T>,
     destination_element_offset: usize,
@@ -656,6 +666,10 @@ impl Engine {
                 model_spec,
             );
         }
+        ensure!(
+            settings.kv_format == crate::kv::KvFormat::Bf16,
+            "8-bit KV requires the Qwen3.8 text runtime"
+        );
         let draft_path = settings.draft_model.clone();
         let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\"'\"'"));
         let runtime_arg = settings
@@ -1783,6 +1797,13 @@ impl Engine {
         for kv in &mut self.state.kv {
             self.device.stream.memset_zeros(&mut kv.k)?;
             self.device.stream.memset_zeros(&mut kv.v)?;
+            if let Some(c) = &mut kv.compact {
+                self.device.stream.memset_zeros(&mut c.k_code)?;
+                self.device.stream.memset_zeros(&mut c.v_code)?;
+                self.device.stream.memset_zeros(&mut c.k_stats)?;
+                self.device.stream.memset_zeros(&mut c.v_stats)?;
+                self.device.stream.memset_zeros(&mut c.cursor)?;
+            }
         }
         self.state.reset(&self.device.stream)?;
         self.reset_qwen_positions()?;
@@ -1948,7 +1969,38 @@ impl Engine {
             match layer.mixer {
                 crate::model_spec::Mixer::FullAttention => {
                     let state_index = layer.state_index as usize;
-                    let kv = &self.state.kv[state_index];
+                    let kv = &mut self.state.kv[state_index];
+                    if kv.compact.is_some() {
+                        let c = kv.compact.as_ref().context("compact cache missing")?;
+                        ensure!(
+                            stream.clone_dtoh(&c.cursor)?
+                                == [
+                                    prefix_tokens as i32,
+                                    crate::kv::sealed_until(prefix_tokens) as i32,
+                                    0,
+                                    0
+                                ],
+                            "prefix cache has an uncommitted compact cursor"
+                        );
+                        for block in 0..prefix_tokens.div_ceil(block_tokens) {
+                            let start = block * block_tokens;
+                            let end = prefix_tokens.min(start + block_tokens);
+                            let payload = kv.compact_prefix_block(
+                                start..end,
+                                prefix_tokens,
+                                &stream,
+                                ring,
+                                None,
+                            )?;
+                            builder.add(
+                                PrefixRecordKind::AttentionKvBlock,
+                                physical,
+                                block,
+                                payload,
+                            )?;
+                        }
+                        continue;
+                    }
                     let prefix_bytes = prefix_tokens * dim * 2;
                     let mut resident = [
                         Vec::with_capacity(builder.geometry.kv_heads * prefix_bytes),
@@ -2102,7 +2154,30 @@ impl Engine {
         let stream = self.device.stream.clone();
         let capacity = self.capacity;
         let dim = self.model_spec.head_dim as usize;
-        let attention_tensors = prefix_attention_host_tensors(snapshot, dim)?;
+        let compact =
+            crate::kv::KvFormat::from_tag(&snapshot.manifest.identity.attention_kv_dtype)?
+                != crate::kv::KvFormat::Bf16;
+        let attention_tensors = if compact {
+            Vec::new()
+        } else {
+            prefix_attention_host_tensors(snapshot, dim)?
+        };
+        if compact {
+            let prefix = snapshot.manifest.boundary.prefix_tokens;
+            for (receipt, payload) in snapshot.records() {
+                if receipt.key.kind != PrefixRecordKind::AttentionKvBlock {
+                    continue;
+                }
+                let layer = &self.model_spec.layers[receipt.key.layer];
+                self.state.kv[layer.state_index as usize].compact_prefix_block(
+                    receipt.key.token_start..receipt.key.token_end,
+                    prefix,
+                    &stream,
+                    &mut ring,
+                    Some(payload),
+                )?;
+            }
+        }
         for (physical, k_heads, v_heads) in attention_tensors {
             let layer = self
                 .model_spec
@@ -2186,6 +2261,16 @@ impl Engine {
         };
         self.set_token(snapshot.manifest.boundary.pending_next_token)?;
         self.position = prefix;
+        for kv in &self.state.kv {
+            if let Some(c) = &kv.compact {
+                c.cursor_mode(
+                    c.view(&kv.k, &kv.v, &stream),
+                    self.state.seq_ref(&stream)?,
+                    2,
+                    &stream,
+                )?;
+            }
+        }
         self.committed_prefix_ids = prefix_ids.to_vec();
         self.resident_ids_len = resident_len;
         self.last_input_kind = Some(last_input_kind);
@@ -2403,7 +2488,19 @@ impl Engine {
     }
 
     pub fn kv_read_bytes(&self, tokens: usize) -> usize {
-        2 * self.state.kv.len() * tokens * self.config.kv_dim() * size_of::<bf16>()
+        self.state
+            .kv
+            .iter()
+            .map(|kv| {
+                let Some(_) = &kv.compact else {
+                    return tokens * self.config.kv_dim() * 4;
+                };
+                let sealed = crate::kv::sealed_until(tokens);
+                let coded = sealed.saturating_sub(crate::kv::SINK_TOKENS);
+                let stats = sealed / crate::kv::GROUP_TOKENS * 4 * 256 * 2 * 4 + coded * 4 * 2 * 4;
+                coded * 4 * 256 * 2 + (tokens - coded) * 4 * 256 * 4 + stats + 16
+            })
+            .sum()
     }
 
     pub fn capture(&mut self) -> Result<()> {
@@ -3804,6 +3901,59 @@ impl Engine {
         let c = &self.config;
         let mut output = Vec::new();
         for layer in &self.state.kv {
+            if let Some(compact) = &layer.compact {
+                let s = &self.device.stream;
+                let cursor = s.clone_dtoh(&compact.cursor)?;
+                ensure!(
+                    cursor
+                        == [
+                            self.position as i32,
+                            crate::kv::sealed_until(self.position) as i32,
+                            0,
+                            0
+                        ],
+                    "KV snapshot requires a committed compact cache"
+                );
+                for (buffer, codes, stats, is_k) in [
+                    (&layer.k, &compact.k_code, &compact.k_stats, true),
+                    (&layer.v, &compact.v_code, &compact.v_stats, false),
+                ] {
+                    for head in 0..c.num_key_value_heads {
+                        for pos in start..start + rows {
+                            if pos < crate::kv::SINK_TOKENS || pos >= cursor[1] as usize {
+                                let lo = (head * compact.layout.ring
+                                    + crate::kv::ring_slot(pos, compact.layout.ring)?)
+                                    * c.head_dim;
+                                output.extend(
+                                    s.clone_dtoh(&buffer.slice(lo..lo + c.head_dim))?
+                                        .into_iter()
+                                        .map(bf16::to_f32),
+                                );
+                            } else {
+                                let lo = (head * self.capacity + pos) * c.head_dim;
+                                let code = s.clone_dtoh(&codes.slice(lo..lo + c.head_dim))?;
+                                let lo = if is_k {
+                                    (head * self.capacity.div_ceil(crate::kv::GROUP_TOKENS)
+                                        + pos / crate::kv::GROUP_TOKENS)
+                                        * c.head_dim
+                                        * 2
+                                } else {
+                                    (head * self.capacity + pos) * 2
+                                };
+                                let statistic = s.clone_dtoh(
+                                    &stats.slice(lo..lo + if is_k { c.head_dim * 2 } else { 2 }),
+                                )?;
+                                for (d, &word) in code.iter().enumerate() {
+                                    let i = if is_k { 2 * d } else { 0 };
+                                    let scaled = f32::from(word) * statistic[i + 1];
+                                    output.push(bf16::from_f32(scaled + statistic[i]).to_f32());
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             for buffer in [&layer.k, &layer.v] {
                 for head in 0..c.num_key_value_heads {
                     let values = self.device.stream.clone_dtoh(&buffer.slice(

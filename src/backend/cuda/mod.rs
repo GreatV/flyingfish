@@ -10,6 +10,8 @@ pub mod draft;
 pub mod engine;
 pub mod flash;
 pub(crate) mod gdn;
+#[cfg(test)]
+mod kv_cache_tests;
 pub(crate) mod linear;
 mod linear_calibrate;
 mod markov;

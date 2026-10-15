@@ -5,7 +5,7 @@ use flyingfish::{
     model::Model,
 };
 use serde_json::{Value, json};
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write, path::PathBuf};
 
 fn main() -> Result<()> {
     ensure!(
@@ -14,8 +14,8 @@ fn main() -> Result<()> {
     );
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     ensure!(
-        args.len() == 7,
-        "usage: q38_trace MODEL INPUTS_DIR REFERENCE_JSON RUNTIME_DIR OUTPUT_JSON eager|graph CHUNK"
+        args.len() == 8,
+        "usage: q38_trace MODEL INPUTS_DIR REFERENCE_JSON RUNTIME_DIR OUTPUT_JSON eager|graph CHUNK|default bf16|affine8"
     );
     let paths: Vec<_> = args[..5].iter().map(PathBuf::from).collect();
     let graph = match args[5].to_str() {
@@ -23,8 +23,19 @@ fn main() -> Result<()> {
         Some("graph") => true,
         _ => anyhow::bail!("expected eager or graph"),
     };
-    let chunk: usize = args[6].to_str().context("invalid chunk")?.parse()?;
-    ensure!(chunk > 0, "chunk must be positive");
+    let chunk = match args[6].to_str().context("invalid chunk")? {
+        "default" => None,
+        text => {
+            let rows: usize = text.parse()?;
+            ensure!(rows > 0, "chunk must be positive");
+            Some(rows)
+        }
+    };
+    let kv_format = <flyingfish::kv::KvFormat as clap::ValueEnum>::from_str(
+        args[7].to_str().context("invalid KV format")?,
+        false,
+    )
+    .map_err(anyhow::Error::msg)?;
     let reference: Value = serde_json::from_slice(&fs::read(&paths[2])?)?;
     let prompts = reference["prompts"]
         .as_object()
@@ -34,7 +45,7 @@ fn main() -> Result<()> {
         "G8 requires exactly five reference prompts"
     );
     let mut cases = Vec::new();
-    let mut capacity = 32.max(chunk);
+    let mut capacity = 32.max(chunk.unwrap_or(0));
     for (name, entry) in prompts {
         let input: Value =
             serde_json::from_slice(&fs::read(paths[1].join(format!("{name}.input_ids.json")))?)?;
@@ -59,12 +70,12 @@ fn main() -> Result<()> {
                 )?)
             })
             .collect::<Result<Vec<_>>>()?;
-        capacity = capacity.max(ids.len() + 64);
+        capacity = capacity.max(ids.len() + 320);
         cases.push((name, entry, ids, tokens));
     }
     ensure!(
-        chunk <= capacity,
-        "requested chunk {chunk} exceeds sequence capacity {capacity}"
+        chunk.is_none_or(|rows| rows <= capacity),
+        "requested chunk {chunk:?} exceeds sequence capacity {capacity}"
     );
     eprintln!(
         "{}",
@@ -77,17 +88,27 @@ fn main() -> Result<()> {
         draft_model: None,
         runtime_dir: Some(paths[3].clone()),
         prefix_cache: false,
+        kv_format,
     };
-    let mut model = Model::load(&paths[0], 0, capacity, Some(chunk), settings)?;
+    let mut model = Model::load(&paths[0], 0, capacity, chunk, settings)?;
     model.check_ready()?;
-    let mut report = json!({"schema":1,"mode":"teacher_forced","graph":graph,"chunk":chunk,"reference":paths[2],"prompts":{}});
+    let mut report = json!({"schema":1,"mode":"teacher_forced","graph":graph,"chunk":model.chunk(),"requested_chunk":chunk,"reference":paths[2],"prompts":{}});
     for (name, entry, ids, forced) in cases {
+        let raw_path = paths[4].with_file_name(format!("{name}.f32le"));
+        let mut raw = std::io::BufWriter::new(fs::File::create(&raw_path)?);
         model.reset()?;
         let mut predicted = model.prefill(&ids, None)?;
         let mut positions = Vec::new();
         for (i, &token) in forced.iter().enumerate() {
             model.check_logits()?;
             let logits = model.decode_logits()?;
+            ensure!(
+                logits.len() == 248320 && logits.iter().all(|x| x.is_finite()),
+                "invalid full-vocabulary logits"
+            );
+            for value in &logits {
+                raw.write_all(&value.to_le_bytes())?;
+            }
             ensure!(
                 (predicted as usize) < logits.len(),
                 "engine token outside logits"
@@ -105,7 +126,8 @@ fn main() -> Result<()> {
                 predicted = model.decode(graph, None)?;
             }
         }
-        report["prompts"][name] = json!({"prompt_len":ids.len(),"input_ids":ids,"cand_sha16":entry["cand_sha16"],"forced_tokens":forced,"positions":positions});
+        raw.flush()?;
+        report["prompts"][name] = json!({"prompt_len":ids.len(),"input_ids":ids,"cand_sha16":entry["cand_sha16"],"forced_tokens":forced,"positions":positions,"logits_file":raw_path.file_name().and_then(|name| name.to_str()).context("invalid logit filename")?,"logits_shape":[64,248320],"stored_dtype":"FP32 little-endian widened native BF16","kv_format":args[7].to_str().context("invalid KV format")?});
         fs::write(
             &paths[4],
             format!("{}\n", serde_json::to_string_pretty(&report)?),
