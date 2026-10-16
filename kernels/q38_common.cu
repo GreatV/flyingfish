@@ -324,6 +324,24 @@ extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
             sum=__fadd_rn(sum,norm_term(a,mode));
         }
         float inv=block_inv(sum,tmp,5120u,mode,eps);
+        if(mode==1 || mode==4) {
+            #pragma unroll
+            for(int group=0;group<5;++group) {
+                __nv_bfloat16 weights[4];
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    uint32_t d=uint32_t(4*group+j)*256u+threadIdx.x;
+                    weights[j]=w[d];
+                }
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    int c=4*group+j;
+                    uint32_t d=uint32_t(c)*256u+threadIdx.x;
+                    y[d]=norm_scale(xv[c],inv,weights[j],__float2bfloat16_rn(0.0f),1);
+                }
+            }
+            return;
+        }
         #pragma unroll
         for(int c=0;c<20;++c) {
             uint32_t d=uint32_t(c)*256u+threadIdx.x;
