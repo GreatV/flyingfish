@@ -259,7 +259,7 @@ mod tests {
     }
     #[test]
     fn every_acceptance_length_commits_the_plain_decode_state() {
-        for k in 1..=3 {
+        for k in 1..=4 {
             for accepted in 0..=k {
                 for h2 in [H2::PreFinalNorm, H2::PostFinalNorm] {
                     for h5 in [H5::PreMtpNorm, H5::PostMtpNorm] {
@@ -343,7 +343,7 @@ mod tests {
             assert_eq!(b.state, plain.state);
         }
         let mut b = Mock::new(vec![]);
-        assert!(run(&mut b, MtpOptions { depth: 4, ..opt }, 1, &[], None).is_err());
+        assert!(run(&mut b, MtpOptions { depth: 5, ..opt }, 1, &[], None).is_err());
         assert!(b.snapshot.is_none());
     }
 }

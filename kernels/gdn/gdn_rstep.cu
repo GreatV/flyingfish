@@ -1,5 +1,5 @@
 // MTP verify/replay only: one CTA per (head, value split) holds FP32 state
-// across 1..4 ordered rows. Prepared BF16 boundaries and row-local tensors are
+// across 1..5 ordered rows. Prepared BF16 boundaries and row-local tensors are
 // unchanged. Live row count stays on device; bound is the prepared allocation.
 // No metadata mutation, padding updates, or cross-CTA state dependency.
 #include <cuda_runtime.h>
@@ -45,7 +45,7 @@ void gdn_rstep_core_t(
     if (SNAPSHOT && !aligned16(snapshots)) { __trap(); return; }
     const int prefix = meta->prefix;
     const int valid_rows = meta->valid_rows;
-    if (bound < 1 || bound > 4 || valid_rows < 1 || valid_rows > bound || prefix < 0 || meta->causal != 1 ||
+    if (bound < 1 || bound > 5 || valid_rows < 1 || valid_rows > bound || prefix < 0 || meta->causal != 1 ||
         meta->key_count != prefix + valid_rows || meta->capacity < meta->key_count) {
         __trap(); return;   // Reject invalid live rows before reading state.
     }

@@ -70,6 +70,7 @@ enum BoundMixer {
     Gdn {
         norm: Tensor<bf16, 1>,
         prefill: PrefillPlans<GdnPlan>,
+        verify: Vec<GdnPlan>,
         decode: Box<GdnPlan>,
     },
 }
@@ -81,7 +82,7 @@ struct PrefillPlans<T> {
     small: Vec<T>,
     max_rows: usize,
 }
-/// Either a snapshot-bound plan borrowed as-is or a plan narrowed at dispatch.
+/// Either a prebound plan borrowed as-is or a plan narrowed at dispatch.
 enum Narrowed<'a, T> {
     Borrowed(&'a T),
     Owned(T),
@@ -98,7 +99,7 @@ impl<T> std::ops::Deref for Narrowed<'_, T> {
 impl<T> PrefillPlans<T> {
     fn bind(full: T, max_rows: usize, narrow: impl Fn(&T, u32) -> Result<T>) -> Result<Self> {
         ensure!(max_rows > 0, "prefill plan requires rows");
-        let small = (1..=4.min(max_rows))
+        let small = (1..=5.min(max_rows))
             .map(|rows| narrow(&full, rows as u32))
             .collect::<Result<_>>()?;
         Ok(Self {
@@ -107,7 +108,7 @@ impl<T> PrefillPlans<T> {
             max_rows,
         })
     }
-    /// The plan narrowed to this step's live rows; 1..=4 keep the snapshot-bound small plans and larger sizes narrow host-side at dispatch.
+    /// Rows 1..=5 borrow prebound small plans; larger sizes narrow at dispatch.
     fn select(
         &self,
         rows: usize,
@@ -209,8 +210,8 @@ fn nested_verify_tcmqa(device_prefix: bool, rows: usize) -> Result<bool> {
         return Ok(false);
     }
     ensure!(
-        rows > 0 && rows <= 4,
-        "nested device-prefix attention supports rows 1..=4"
+        rows > 0 && rows <= 5,
+        "nested device-prefix attention supports rows 1..=5"
     );
     Ok(true)
 }
@@ -243,7 +244,7 @@ impl Runtime {
         let attention_decode =
             FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(1, capacity)?)?;
         let attention_nested_verify =
-            FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(rows.min(4), capacity)?)?;
+            FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(rows.min(5), capacity)?)?;
         let spec = crate::op_contract::GdnSpec::q38();
         let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?, policy)?;
         let decode = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY)?;
@@ -489,7 +490,10 @@ impl Runtime {
                     };
                     BoundMixer::Gdn {
                         norm: weight("linear_attn.norm.weight")?,
-                        prefill: PrefillPlans::bind(bind(rows)?, rows, GdnPlan::for_rows)?,
+                        prefill: PrefillPlans::bind(bind(rows)?, rows, |plan, rows| {
+                            plan.for_rows(rows, None)
+                        })?,
+                        verify: Vec::new(),
                         decode: Box::new(bind(1)?),
                     }
                 }
@@ -591,7 +595,10 @@ impl Engine {
         let stream = &self.device.stream;
         let mut states = snapshots.iter();
         for layer in &mut q.layers {
-            if let BoundMixer::Gdn { prefill, .. } = &mut layer.mixer {
+            if let BoundMixer::Gdn {
+                prefill, verify, ..
+            } = &mut layer.mixer
+            {
                 let state = states.next().context("missing GDN snapshot allocation")?;
                 let s = view(
                     &state.s,
@@ -601,9 +608,9 @@ impl Engine {
                     [48 * 128 * 128, 128 * 128, 128, 1],
                 )?;
                 let h = view(&state.history, stream, 0, [4, 10240, 3], [10240 * 3, 3, 1])?;
-                for plan in &mut prefill.small {
-                    plan.bind_snapshots(s, h)?;
-                }
+                *verify = (1..=5.min(prefill.max_rows))
+                    .map(|rows| prefill.full.for_rows(rows as u32, Some((s, h))))
+                    .collect::<Result<_>>()?;
             }
         }
         ensure!(states.next().is_none(), "extra GDN snapshot allocation");
@@ -931,8 +938,8 @@ impl Engine {
         )?;
         let rows = budget.plan.chunk;
         ensure!(
-            !reserve_mtp || rows >= 4,
-            "MTP workspace cannot fit four verification rows"
+            !reserve_mtp || rows >= 5,
+            "MTP workspace cannot fit five verification rows"
         );
         let target_workspace = Runtime::workspace(rows, capacity, gdn_policy)?.max(
             if settings.kv_format == crate::kv::KvFormat::Bf16 {
@@ -965,7 +972,7 @@ impl Engine {
                 "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(limits(rows, capacity)?)?.bytes,
                 "attention_prefill_lse_bytes": rows * model_spec.q_heads as usize * size_of::<f32>(),
                 "attention_decode_workspace_bytes": FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(1, capacity)?)?.bytes,
-                "attention_nested_verify_workspace_bytes": FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(rows.min(4), capacity)?)?.bytes,
+                "attention_nested_verify_workspace_bytes": FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(rows.min(5), capacity)?)?.bytes,
                 "attention_prefill_backend": "FA2 d256",
                 "attention_decode_backend": "TCMQA d256",
                 "gdn_prefill_workspace_bytes": GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), u32::try_from(rows)?, gdn_policy)?.bytes,
@@ -1246,6 +1253,7 @@ impl Engine {
             BoundMixer::Gdn {
                 norm,
                 prefill,
+                verify,
                 decode,
             } => {
                 let spec = crate::op_contract::GdnSpec::q38();
@@ -1272,18 +1280,25 @@ impl Engine {
                     )?;
                 }
                 let narrowed;
-                let plan = match phase {
-                    ExecutionPhase::Prefill => {
-                        narrowed = prefill.select(rows, &GdnPlan::for_rows)?;
-                        &narrowed
-                    }
-                    ExecutionPhase::Decode => decode.as_ref(),
-                };
-                if self.qwen_device_prefix {
+                let plan: &GdnPlan = if self.qwen_device_prefix {
                     ensure!(
                         phase == ExecutionPhase::Prefill,
                         "MTP verify must remain Prefill"
                     );
+                    verify
+                        .get(rows.checked_sub(1).context("MTP verify requires rows")?)
+                        .context("MTP verify GDN plan missing")?
+                } else {
+                    match phase {
+                        ExecutionPhase::Prefill => {
+                            narrowed =
+                                prefill.select(rows, &|plan, rows| plan.for_rows(rows, None))?;
+                            &narrowed
+                        }
+                        ExecutionPhase::Decode => decode.as_ref(),
+                    }
+                };
+                if self.qwen_device_prefix {
                     GdnOps::run_verify(plan, s, meta, scratch(&q.scratch, s))?;
                 } else {
                     GdnOps::run(plan, s, meta, phase, scratch(&q.scratch, s))?;
@@ -1607,8 +1622,8 @@ mod tests {
             plans.select(700, &FakePlan::for_rows).unwrap().max_rows,
             700
         );
-        // 1..=4 keep the snapshot-bound small plans.
-        for rows in 1..=4 {
+        // Rows 1..=5 borrow prebound small plans.
+        for rows in 1..=5 {
             assert_eq!(
                 plans.select(rows, &FakePlan::for_rows).unwrap().max_rows,
                 rows
@@ -1671,21 +1686,21 @@ mod tests {
                 Ok(rows as usize)
             };
             let plans = PrefillPlans::bind(capacity, capacity, narrow)?;
-            assert_eq!(plans.small, (1..=4.min(capacity)).collect::<Vec<_>>());
+            assert_eq!(plans.small, (1..=5.min(capacity)).collect::<Vec<_>>());
             for rows in 1..=capacity {
                 assert_eq!(*plans.select(rows, &narrow)?, rows);
             }
-            for rows in 1..=4.min(capacity) {
+            for rows in 1..=5.min(capacity) {
                 ensure!(
                     matches!(plans.select(rows, &narrow)?, Narrowed::Borrowed(_)),
-                    "nested verify rows {rows} did not select a snapshot-bound plan"
+                    "small extent {rows} did not select a prebound plan"
                 );
             }
             assert!(plans.select(0, &narrow).is_err());
             assert!(plans.select(capacity + 1, &narrow).is_err());
             assert!(plans.select(usize::MAX, &narrow).is_err());
             let budget = Runtime::workspace(capacity, 4096, GdnPolicy::for_device(89, 128))? as u64;
-            for rows in 1..=4.min(capacity) {
+            for rows in 1..=5.min(capacity) {
                 assert!(
                     GdnOps::workspace(
                         &crate::op_contract::GdnSpec::q38(),
@@ -1709,23 +1724,87 @@ mod tests {
         for rows in [1, 4, 65, 2048] {
             assert!(!nested_verify_tcmqa(false, rows)?);
         }
-        for rows in 1..=4 {
+        for rows in 1..=5 {
             assert!(nested_verify_tcmqa(true, rows)?);
         }
         assert!(nested_verify_tcmqa(true, 0).is_err());
-        assert!(nested_verify_tcmqa(true, 5).is_err());
+        assert!(nested_verify_tcmqa(true, 6).is_err());
         Ok(())
     }
 
     #[test]
     fn workspace_binds_nested_verify_tcmqa_rows() -> Result<()> {
+        let spec = crate::model_spec::ModelSpec::qwen(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/q38-config.json"
+            )))?,
+            &serde_json::json!({}),
+        )?;
         for capacity in [256, 16_832] {
             let required =
-                FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(4, capacity)?)?;
-            let allocated = Runtime::workspace(4, capacity, GdnPolicy::for_device(89, 128))?;
+                FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(5, capacity)?)?;
+            let allocated = Runtime::workspace(5, capacity, GdnPolicy::for_device(89, 128))?;
             ensure!(
                 required.bytes <= allocated as u64,
                 "nested verify workspace {required:?} exceeds allocation {allocated}"
+            );
+            let mtp = crate::mtp::AttachmentBudget::new(&spec, capacity)?;
+            let row_bytes = Runtime::row_bytes(&spec)? + mtp.row_bytes;
+            let fixed = Runtime::fixed_bytes(&spec, capacity)? + mtp.fixed_bytes;
+            let workspace = |rows| {
+                Ok(
+                    Runtime::workspace(rows, capacity, GdnPolicy::for_device(89, 128))?
+                        + mtp.workspace(rows)?,
+                )
+            };
+            let total = 24usize << 30;
+            let request = WorkspaceRequest {
+                capacity,
+                requested: Some(5),
+                free_after_resident: total / 16 + fixed + 5 * row_bytes + workspace(5)?,
+                total,
+                alignment: 32,
+                row_bytes,
+                fixed_transient_bytes: fixed,
+            };
+            let budget = WorkspaceBudget::new(request, workspace, Ok)?;
+            assert_eq!(budget.plan.chunk, 5);
+            assert_eq!(budget.plan.row_limit, 5);
+            assert_eq!(
+                budget.planned_transient_bytes + budget.plan.reserve_bytes,
+                request.free_after_resident
+            );
+            assert!(
+                WorkspaceBudget::new(
+                    WorkspaceRequest {
+                        free_after_resident: request.free_after_resident - 1,
+                        ..request
+                    },
+                    workspace,
+                    Ok,
+                )
+                .is_err()
+            );
+            let admitted = WorkspaceBudget::new(
+                WorkspaceRequest {
+                    requested: None,
+                    free_after_resident: total / 4,
+                    ..request
+                },
+                workspace,
+                |rows| Ok(default_chunk(rows)),
+            )?;
+            assert!(admitted.plan.chunk >= 5);
+            assert!(admitted.planned_transient_bytes + admitted.plan.reserve_bytes <= total / 4);
+            println!(
+                "MTP_M5_ADMISSION_PASS capacity={capacity} total={total} free_after_resident={} minimum_free={} chunk={} row_limit={} planned_transient={} reserve={}",
+                total / 4,
+                request.free_after_resident,
+                admitted.plan.chunk,
+                admitted.plan.row_limit,
+                admitted.planned_transient_bytes,
+                admitted.plan.reserve_bytes,
             );
         }
         Ok(())

@@ -31,7 +31,7 @@ extern "C" __global__ void q38_batch_meta(const int32_t* position,
     }
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         int32_t p = *position;
-        if (p < 0 || rows < 1 || rows > 4 || int64_t(p) + rows >= capacity) {
+        if (p < 0 || rows < 1 || rows > 5 || int64_t(p) + rows >= capacity) {
             __trap(); return;
         }
         *meta = {p, rows, p + rows, capacity, 1, {0, 0, 0}};

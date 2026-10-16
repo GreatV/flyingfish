@@ -61,7 +61,7 @@ fn q38_batch_meta_launch_contract_gpu() -> Result<()> {
         "valid" => {}
         _ => unreachable!(),
     }
-    for rows in 1..=4i32 {
+    for rows in 1..=5i32 {
         unsafe {
             stream
                 .launch_builder(&function)
@@ -93,6 +93,6 @@ fn q38_batch_meta_launch_contract_gpu() -> Result<()> {
             "valid batch metadata mismatch"
         );
     }
-    println!("BATCH_META_GATE valid PASS rows=1,2,3,4");
+    println!("BATCH_META_GATE valid PASS rows=1,2,3,4,5");
     Ok(())
 }

@@ -79,7 +79,7 @@ pub(super) fn save(e: &mut Engine) -> Result<()> {
         engine: e,
         chain: &mut c,
     }
-    .save(4);
+    .save(5);
     e.mtp = Some(c);
     r
 }
