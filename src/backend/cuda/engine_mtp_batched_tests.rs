@@ -109,9 +109,7 @@ fn canonical(e: &mut Engine, inputs: &[u32], rows: usize) -> Result<Vec<u32>> {
             .clone_dtoh(&batch.frame.slice(..rows * HIDDEN))?;
         let s = &b.engine.device.stream;
         if rows < inputs.len() {
-            // Partial prefix: rewind to the snapshot row. On keep (rows == inputs.len())
-            // the verify's live state already is the last row's state: the last snapshot
-            // row is its duplicate and is no longer written.
+            // On keep (rows == inputs.len()) the live verify state is the last row's state.
             for (state, snapshot) in b.engine.state.gdn.iter_mut().zip(&batch.snapshots) {
                 for (target, source) in [
                     (&mut state.s, &snapshot.s),
