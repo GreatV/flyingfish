@@ -1122,13 +1122,16 @@ mod tests {
                         .launch(config)?;
                 }
                 let expected = stream.clone_dtoh(&reference)?;
-                ensure!(
-                    expected
-                        .iter()
-                        .zip(&slots[row * state_elements..(row + 1) * state_elements])
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "snapshot state differs from independent R1 chain, rows={rows} row={row}"
-                );
+                // The last live row is not snapshotted (it is the final S write-back).
+                if row + 1 < rows {
+                    ensure!(
+                        expected
+                            .iter()
+                            .zip(&slots[row * state_elements..(row + 1) * state_elements])
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "snapshot state differs from independent R1 chain, rows={rows} row={row}"
+                    );
+                }
                 ensure!(
                     stream.clone_dtoh(&output)? == actual[offset..offset + row_elements],
                     "snapshot output changed"
@@ -1138,7 +1141,7 @@ mod tests {
                 }
             }
             ensure!(
-                slots[rows * state_elements..]
+                slots[(rows - 1) * state_elements..]
                     .iter()
                     .all(|v| v.to_bits() == 0),
                 "dead snapshot slots written"
@@ -1182,10 +1185,13 @@ mod tests {
                         } else {
                             raw[(index - 3) * conv_dim + ch].to_f32()
                         };
-                        ensure!(
-                            slots[(row * conv_dim + ch) * 3 + tap].to_bits() == expected.to_bits(),
-                            "raw history snapshot index mismatch"
-                        );
+                        if row + 1 < rows {
+                            ensure!(
+                                slots[(row * conv_dim + ch) * 3 + tap].to_bits()
+                                    == expected.to_bits(),
+                                "raw history snapshot index mismatch"
+                            );
+                        }
                         if row + 1 == rows {
                             ensure!(
                                 final_history[ch * 3 + tap].to_bits() == expected.to_bits(),
@@ -1196,7 +1202,7 @@ mod tests {
                 }
             }
             ensure!(
-                slots[rows * conv_dim * 3..]
+                slots[(rows - 1) * conv_dim * 3..]
                     .iter()
                     .all(|v| v.to_bits() == 0),
                 "dead history slots written"

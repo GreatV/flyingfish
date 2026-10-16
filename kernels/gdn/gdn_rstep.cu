@@ -147,13 +147,21 @@ void gdn_rstep_core_t(
     }
     __syncthreads();
 
-    if (SNAPSHOT) {
+    // The last verify row's snapshot duplicates the final S write-back; select_prefix
+    // never reads it (snapshot_row requires rows < live). float2 stores: TC is even and
+    // every (j0 + jb) is even, so each store covers a full aligned pair -- a warp's
+    // 32 x 8 B stores cover a contiguous 256 B, one access per 32 B sector.
+    if (SNAPSHOT && r + 1 < valid_rows) {
+        static_assert(TC % 2 == 0, "float2 snapshot stores need even TC");
         #pragma unroll
-        for (int a = 0; a < RT; ++a)
+        for (int a = 0; a < RT; ++a) {
+            float2* dst = reinterpret_cast<float2*>(
+                snapshots + ((size_t)r * GDN_HEADS + head) * GDN_DK * GDN_DV +
+                (i0 + a) * GDN_DV + j0 + jb);
             #pragma unroll
-            for (int b = 0; b < TC; ++b)
-                snapshots[((size_t)r * GDN_HEADS + head) * GDN_DK * GDN_DV +
-                          (i0 + a) * GDN_DV + j0 + jb + b] = Sr[a][b];
+            for (int b2 = 0; b2 < TC / 2; ++b2)
+                dst[b2] = make_float2(Sr[a][2 * b2], Sr[a][2 * b2 + 1]);
+        }
     }
     // ---- 4. o = q^T S, from the UPDATED S
     #pragma unroll

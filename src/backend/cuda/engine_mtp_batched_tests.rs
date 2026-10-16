@@ -3,6 +3,7 @@ use super::super::tests::{
     state_bits,
 };
 use super::*;
+use crate::mtp::batched::BatchedBackend;
 use std::path::PathBuf;
 
 #[test]
@@ -444,6 +445,104 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
         "m2b-failure-capture",
         serde_json::json!({"result":"PASS","capture_boundaries":6,"round_faults":faults,"state_negative_controls":3,"poison":"required after every failed round; test-only manual clear for further injected faults"}),
     )
+}
+
+#[test]
+#[ignore = "requires a full-model GPU window, FF_Q38_MODEL and FLYINGFISH_RUNTIME_DIR"]
+fn q38_snapshot_poison_rows_gpu() -> Result<()> {
+    // Read contract for the verify GDN snapshot rows: select_prefix reads exactly one row
+    // per layer (snapshot_row(committed) = committed - 1). Every other row is poisoned
+    // between verify and restore; the restored GDN state must match the canonical oracle.
+    let mut e = ready()?;
+    let ids = prompt("math1")?;
+    let garbage_s = vec![1.0e30f32; 48 * 128 * 128];
+    let garbage_h = vec![1.0e30f32; 10240 * 3];
+    for k in 1..=3 {
+        configure(
+            &mut e,
+            options(
+                k,
+                MtpHiddenTap::PreFinalNorm,
+                MtpRecurrentTap::PreMtpNorm,
+                false,
+            ),
+        )?;
+        e.mtp_prefill(&ids)?;
+        save(&mut e)?;
+        let full = proposals(&mut e, k)?;
+        let anchor = e.token()?;
+        for j in 0..=k {
+            let mut forced = full.clone();
+            if j < k {
+                forced[j] = (forced[j] + 1) % VOCAB as u32;
+            }
+            let inputs: Vec<_> = std::iter::once(anchor)
+                .chain(forced.iter().copied())
+                .collect();
+            let _ = canonical(&mut e, &inputs, j + 1)?;
+            let expected = gdn_bits(&e)?;
+            restore(&mut e)?;
+            let _ = call(&mut e, |b| b.verify_batch(&inputs))?;
+            // j == k keeps the verify state and never selects; poison every row.
+            let keep_row = (j < k).then_some(j);
+            poison_snapshot_rows(&mut e, keep_row, &garbage_s, &garbage_h)?;
+            if j < k {
+                call(&mut e, |b| b.select_prefix(j + 1))?;
+            }
+            let actual = gdn_bits(&e)?;
+            ensure!(
+                actual == expected,
+                "poisoned snapshot rows changed the GDN state K{k} j{j}"
+            );
+            restore(&mut e)?;
+        }
+        restore(&mut e)?;
+    }
+    Ok(())
+}
+
+fn gdn_bits(e: &Engine) -> Result<Vec<u8>> {
+    let s = &e.device.stream;
+    let mut bits = Vec::new();
+    for g in &e.state.gdn {
+        for buf in [&g.s, &g.history] {
+            for v in s.clone_dtoh(buf)? {
+                bits.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+        }
+    }
+    Ok(bits)
+}
+
+fn poison_snapshot_rows(
+    e: &mut Engine,
+    keep_row: Option<usize>,
+    garbage_s: &[f32],
+    garbage_h: &[f32],
+) -> Result<()> {
+    let s = e.device.stream.clone();
+    let c = e.mtp.as_mut().context("MTP missing")?;
+    let batch = c.batch.as_mut().context("M2b not bound")?;
+    for snap in &mut batch.snapshots {
+        for r in 0..4 {
+            if Some(r) == keep_row {
+                continue;
+            }
+            s.memcpy_htod(
+                garbage_s,
+                &mut snap
+                    .s
+                    .slice_mut(r * garbage_s.len()..(r + 1) * garbage_s.len()),
+            )?;
+            s.memcpy_htod(
+                garbage_h,
+                &mut snap
+                    .history
+                    .slice_mut(r * garbage_h.len()..(r + 1) * garbage_h.len()),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[test]

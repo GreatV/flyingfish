@@ -175,7 +175,9 @@ extern "C" __global__ void gdn_conv_hist_snapshot(
         for (int j = 0; j < 3; ++j) {
             const int idx = r + 1 + j;
             const float x = idx < 3 ? old[idx] : __bfloat162float(qkv[(size_t)(idx - 3) * conv_dim + ch]);
-            snapshots[((size_t)r * conv_dim + ch) * 3 + j] = x;
+            // The last row's snapshot duplicates the live history write; unread
+            // (snapshot_row requires rows < live).
+            if (r + 1 < rows) snapshots[((size_t)r * conv_dim + ch) * 3 + j] = x;
             if (r == rows - 1) history[ch * 3 + j] = x;
         }
     }
