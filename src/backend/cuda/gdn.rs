@@ -638,7 +638,9 @@ impl GdnOps {
         let l2_eps = plan.l2_eps;
         let conv_ptr = conv_out.0.ptr;
 
-        // ---- 1. conv: qkv -> conv_out. ABI §5: this BF16 cast may not be elided.
+        // ---- 1. conv: qkv -> conv_out, with the exact SiLU applied in the same kernel.
+        // ABI §5: the conv output cast may not be elided; the kernel casts to BF16 and
+        // back before silu().
         unsafe {
             stream
                 .launch_builder(&plan.kernels.conv)
@@ -671,15 +673,7 @@ impl GdnOps {
                     .launch(plan.hist_cfg)?;
             }
         }
-        // ---- 3. common SiLU, IN PLACE: conv_out -> conv_out. There is no `act` region.
-        // The kernel is elementwise and GateOps::silu imposes no x/y disjointness, so the
-        // BF16 -> FP32 -> BF16 chain of ABI §5 lands over the same bytes.
-        {
-            let x = as3(conv_ptr, rows, cd / DV, cd, span, 0)?;
-            let mut y = ws_bf16_3_mut(plan.ws.conv_out, ws_ptr, rows, cd)?;
-            plan.common.gate.silu(stream, dom, x, &mut y)?;
-        }
-        // ---- 4. common l2_heads on Q and K only. V is NOT normed (ABI §5).
+        // ---- 3. common l2_heads on Q and K only. V is NOT normed (ABI §5).
         // Both are read as column windows of conv_out: 16 KEY heads each.
         plan.common.norm.l2_heads(
             stream,
@@ -905,17 +899,6 @@ fn ws_region(r: Region, rows: u32, cols: u32, elem: u64) -> Result<()> {
 fn ws_bf16(r: Region, ptr: u64, rows: u32, cols: u32) -> Result<TensorMut<bf16, 2>> {
     ws_region(r, rows, cols, size_of::<bf16>() as u64)?;
     unsafe { TensorMut::new(ptr + r.offset, [rows, cols], [u64::from(cols), 1], r.bytes) }
-}
-fn ws_bf16_3_mut(r: Region, ptr: u64, rows: u32, cd: u32) -> Result<TensorMut<bf16, 3>> {
-    ws_region(r, rows, cd, size_of::<bf16>() as u64)?;
-    unsafe {
-        TensorMut::new(
-            ptr + r.offset,
-            [rows, cd / DV, DV],
-            [u64::from(cd), u64::from(DV), 1],
-            r.bytes,
-        )
-    }
 }
 fn ws_bf16_3(r: Region, ptr: u64, rows: u32, h: u32, d: u32) -> Result<TensorMut<bf16, 3>> {
     ws_region(r, rows, h * d, size_of::<bf16>() as u64)?;

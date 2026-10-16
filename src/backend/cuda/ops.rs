@@ -412,6 +412,7 @@ impl NormOps {
     }
 }
 impl GateOps {
+    #[cfg(test)]
     pub fn silu(
         &self,
         stream: &Arc<CudaStream>,
