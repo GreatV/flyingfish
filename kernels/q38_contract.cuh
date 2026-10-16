@@ -1,10 +1,19 @@
 #pragma once
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <math.h>
 #include <stdint.h>
 struct alignas(16) Q38SequenceMeta {
     int32_t prefix, valid_rows, key_count, capacity, causal, reserved[3];
 };
 static_assert(sizeof(Q38SequenceMeta)==32,"Q38 ABI sequence size");
+__device__ __forceinline__ float bround(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+__device__ __forceinline__ float sigmoid(float x) {
+    if (x>=0.0f) return 1.0f/(1.0f+expf(-x));
+    float e=expf(x); return e/(1.0f+e);
+}
+__device__ __forceinline__ float silu(float x) {return x*sigmoid(x);}
+
 __device__ __forceinline__ void q38_meta_guard(const Q38SequenceMeta* s) {
     if (!s || (reinterpret_cast<uintptr_t>(s)&15)) { __trap(); return; }
     if (s->prefix<0 || s->valid_rows<=0 || s->capacity<=0 || s->causal!=1 ||
