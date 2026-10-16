@@ -34,7 +34,10 @@ impl CacheView {
                 && self.ring > 0,
             "compact KV binding geometry"
         );
-        ensure!((1..=4).contains(&rows), "compact KV binding row extent");
+        ensure!(
+            (1..=crate::mtp::MAX_VERIFY_ROWS as u32).contains(&rows),
+            "compact KV binding row extent"
+        );
         for ptr in [self.k_code, self.v_code, self.k_ring, self.v_ring] {
             ensure!(
                 ptr != 0 && ptr.is_multiple_of(16),

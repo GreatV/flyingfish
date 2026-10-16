@@ -88,7 +88,7 @@ enum Command {
         max_new_tokens: usize,
         #[arg(long)]
         graph: bool,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=3), help = "MTP depth; defaults to 3 when the checkpoint contains MTP weights; 0 selects plain generation")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 4 when the checkpoint contains MTP weights; 0 selects plain generation")]
         mtp: Option<u8>,
         #[arg(long)]
         dump: Option<PathBuf>,
@@ -107,7 +107,7 @@ enum Command {
     Serve {
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=3), help = "MTP depth; defaults to 3 when the checkpoint contains MTP weights; 0 selects plain serving")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 4 when the checkpoint contains MTP weights; 0 selects plain serving")]
         mtp: Option<u8>,
     },
     Bench {
@@ -500,7 +500,7 @@ fn resolve_mtp(requested: Option<u8>, component: bool, plain_selected: bool) -> 
     match requested {
         Some(0) => Ok(None),
         Some(depth) => {
-            ensure!(depth <= 3, "MTP depth must be 0..=3");
+            ensure!(depth <= 4, "MTP depth must be 0..=4");
             ensure!(
                 !plain_selected,
                 "MTP cannot combine --draft-model, --dump, --trace-layer or --image-tensors"
@@ -508,7 +508,7 @@ fn resolve_mtp(requested: Option<u8>, component: bool, plain_selected: bool) -> 
             ensure!(component, "checkpoint has no MTP component");
             Ok(Some(depth))
         }
-        None => Ok((component && !plain_selected).then_some(3)),
+        None => Ok((component && !plain_selected).then_some(4)),
     }
 }
 
@@ -992,21 +992,21 @@ mod tests {
             Cli::try_parse_from(args)?.command,
             Command::Generate { mtp: None, .. }
         ));
-        for depth in ["0", "1", "2", "3"] {
+        for depth in ["0", "1", "2", "3", "4"] {
             let cli = Cli::try_parse_from(args.into_iter().chain(["--mtp", depth]))?;
             assert!(
                 matches!(cli.command, Command::Generate { mtp: Some(k), .. } if k.to_string() == depth)
             );
         }
-        assert!(Cli::try_parse_from(args.into_iter().chain(["--mtp", "4"])).is_err());
-        assert_eq!(resolve_mtp(None, true, false)?, Some(3));
+        assert!(Cli::try_parse_from(args.into_iter().chain(["--mtp", "5"])).is_err());
+        assert_eq!(resolve_mtp(None, true, false)?, Some(4));
         assert_eq!(resolve_mtp(None, false, false)?, None);
         for component in [false, true] {
             assert_eq!(resolve_mtp(Some(0), component, false)?, None);
             assert_eq!(resolve_mtp(Some(0), component, true)?, None);
             assert_eq!(resolve_mtp(None, component, true)?, None);
         }
-        for depth in 1..=3 {
+        for depth in 1..=4 {
             assert_eq!(resolve_mtp(Some(depth), true, false)?, Some(depth));
             assert!(resolve_mtp(Some(depth), false, false).is_err());
             assert!(resolve_mtp(Some(depth), true, true).is_err());

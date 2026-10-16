@@ -211,13 +211,18 @@ impl Backend for Bound<'_> {
         let c = &mut self.chain;
         let s = &e.device.stream;
         ensure!(
-            rows <= 4 && e.position > 0 && c.cursor == e.position - 1,
+            (1..=crate::mtp::MAX_VERIFY_ROWS).contains(&rows),
+            "MTP checkpoint rows {rows} exceed journal capacity {}",
+            crate::mtp::MAX_VERIFY_ROWS
+        );
+        ensure!(
+            e.position > 0 && c.cursor == e.position - 1,
             "MTP checkpoint cursor mismatch"
         );
         c.saved.position = None;
         let validation = if let Some(batch) = c.batch.as_mut().filter(|_| rows > 1) {
             s.memset_zeros(&mut batch.status)?;
-            Some((&batch.sequence_check, view(&batch.status, s, 0, [8], [1])?))
+            Some((&batch.sequence_check, view(&batch.status, s, 0, [10], [1])?))
         } else {
             None
         };
@@ -463,8 +468,8 @@ impl Engine {
         }
         let bootstrap = Bootstrap::new(&self.device.stream, self.chunk)?;
         let target_checkpoint =
-            StateCheckpoint::new(&self.state, &self.model_spec, 4, &self.device.stream)?;
-        let mtp_checkpoint = StateCheckpoint::new(&state, &spec, 4, &self.device.stream)?;
+            StateCheckpoint::new(&self.state, &self.model_spec, 5, &self.device.stream)?;
+        let mtp_checkpoint = StateCheckpoint::new(&state, &spec, 5, &self.device.stream)?;
         let journal = target_checkpoint.bytes() + mtp_checkpoint.bytes();
         ensure!(
             runtime.allocation_bytes()

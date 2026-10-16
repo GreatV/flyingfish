@@ -13,7 +13,7 @@ struct Fixture {
 
 #[test]
 fn canonical_repair_uses_single_row_fc() -> Result<()> {
-    for rows in 1..=3 {
+    for rows in 1..=4 {
         let mut calls = Vec::new();
         OutputMode::Repair.for_each_fc(rows, |row, count| {
             calls.push((row, count));
@@ -652,7 +652,7 @@ fn repair_prefill_matches_decode(probe: &Probe, fixture: &Fixture) -> Result<()>
             ExecutionPhase::Prefill,
             OutputMode::StateOnly,
         )?;
-        for rows in 1..=3 {
+        for rows in 1..=4 {
             let mut serial_state = probe.state(64)?;
             let mut repair_state = probe.state(64)?;
             let mut old_state = probe.state(64)?;
@@ -861,7 +861,7 @@ fn repair_prefill_matches_decode(probe: &Probe, fixture: &Fixture) -> Result<()>
         "old FA2 repair negative control did not discriminate"
     );
     println!(
-        "MTP_REPAIR_PREFILL_BITWISE_PASS cases=6 prefix=53 rows=1,2,3 fields=pre_mtp_norm,post_mtp_norm,k_cache,v_cache fc_intermediates=true old_fc_control=true old_fa2_control=true"
+        "MTP_REPAIR_PREFILL_BITWISE_PASS cases=8 prefix=53 rows=1,2,3,4 fields=pre_mtp_norm,post_mtp_norm,k_cache,v_cache fc_intermediates=true old_fc_control=true old_fa2_control=true"
     );
     Ok(())
 }

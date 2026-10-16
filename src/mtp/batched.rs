@@ -58,7 +58,7 @@ pub(crate) fn snapshot_row(
     expected_epoch: u64,
 ) -> Result<usize> {
     ensure!(
-        (1..=4).contains(&live)
+        (1..=5).contains(&live)
             && rows > 0
             && rows < live
             && base.checked_add(live) == Some(position)

@@ -417,8 +417,8 @@ impl MtpRuntime {
             "MTP decode requires one row"
         );
         ensure!(
-            output != OutputMode::Repair || rows <= 3,
-            "canonical MTP repair requires one to three rows"
+            output != OutputMode::Repair || rows <= 4,
+            "canonical MTP repair requires one to four rows"
         );
         ensure!(
             matches!(output, OutputMode::StateOnly | OutputMode::Repair) || rows <= self.head_rows,

@@ -20,9 +20,9 @@ fn graph_setup_preserves_capture_results_and_errors() -> Result<()> {
     let mut calls = 0;
     let graphs = optional_verify_graphs(true, || {
         calls += 1;
-        Ok(vec![1, 2, 3, 4])
+        Ok(vec![1, 2, 3, 4, 5])
     })?;
-    assert_eq!(graphs, [1, 2, 3, 4]);
+    assert_eq!(graphs, [1, 2, 3, 4, 5]);
     assert_eq!(calls, 1);
     let error = optional_verify_graphs::<()>(true, || anyhow::bail!("capture failed"))
         .expect_err("graph setup must propagate capture failure");
@@ -33,7 +33,7 @@ fn graph_setup_preserves_capture_results_and_errors() -> Result<()> {
 pub(super) fn staged() -> Result<Engine> {
     let mut e = load(true)?;
     e.mtp_enable(options(
-        3,
+        4,
         MtpHiddenTap::PreFinalNorm,
         MtpRecurrentTap::PostMtpNorm,
         true,
@@ -180,12 +180,16 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
     let mut e = ready()?;
     let ids = prompt("math1")?;
     let mut cases = 0;
-    for k in 1..=3 {
+    for k in 1..=4 {
         for h2 in [MtpHiddenTap::PreFinalNorm, MtpHiddenTap::PostFinalNorm] {
             for h5 in [MtpRecurrentTap::PreMtpNorm, MtpRecurrentTap::PostMtpNorm] {
                 configure(&mut e, options(k, h2, h5, false))?;
                 e.mtp_prefill(&ids)?;
-                save(&mut e)?;
+                save(&mut e)
+                    .with_context(|| format!("BF16 K{k} {h2:?}/{h5:?} five-row checkpoint save"))?;
+                if k == 1 && h2 == MtpHiddenTap::PreFinalNorm && h5 == MtpRecurrentTap::PreMtpNorm {
+                    println!("MTP_CHECKPOINT_CAPACITY_PASS selected_depth=1 saved_rows=5");
+                }
                 let full = proposals(&mut e, k)?;
                 let anchor = e.token()?;
                 for j in 0..=k {
@@ -299,9 +303,57 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
         e.mtp_batch_round(1, None).is_err() && state_bits(&e)? == before,
         "stale epoch accepted or mutated"
     );
+    drop(e);
+    let mut affine = super::super::tests::load_format(true, 128, crate::kv::KvFormat::Affine8)?;
+    affine.mtp_enable(options(
+        4,
+        MtpHiddenTap::PreFinalNorm,
+        MtpRecurrentTap::PostMtpNorm,
+        true,
+    ))?;
+    affine.mtp_batch_enable()?;
+    affine.capture()?;
+    affine.closure.ready(std::time::Instant::now())?;
+    affine.mtp_prefill(&ids)?;
+    save(&mut affine)?;
+    let full = proposals(&mut affine, 4)?;
+    let anchor = affine.token()?;
+    let mut affine_cases = 0;
+    for accepted in 0..=4 {
+        let mut forced = full.clone();
+        if accepted < 4 {
+            forced[accepted] = (forced[accepted] + 1) % VOCAB as u32;
+        }
+        let inputs: Vec<_> = std::iter::once(anchor)
+            .chain(forced.iter().copied())
+            .collect();
+        affine.mtp.as_mut().context("MTP missing")?.options.graph = false;
+        let expected = canonical(&mut affine, &inputs, accepted + 1)?;
+        let expected_bits = committed_bits(&affine)?;
+        restore(&mut affine)?;
+        for graph in [false, true] {
+            let chain = affine.mtp.as_mut().context("MTP missing")?;
+            chain.options.graph = graph;
+            chain.force_proposals = Some(forced.clone());
+            let round = affine.mtp_batch_round(64, None)?;
+            let mut tokens = full[..accepted].to_vec();
+            tokens.push(*expected.last().context("empty affine8 canonical head")?);
+            ensure!(
+                round.round.accepted == accepted && round.round.tokens == tokens,
+                "affine8 K4 commit/pending mismatch"
+            );
+            ensure!(
+                committed_bits(&affine)? == expected_bits,
+                "affine8 K4 canonical state mismatch accepted={accepted} graph={graph}"
+            );
+            restore(&mut affine)?;
+            affine_cases += 1;
+        }
+    }
+    println!("MTP_AFFINE8_K4_TRANSACTIONS_PASS cases={affine_cases} graph_and_eager");
     receipt(
         "m2b-transaction",
-        serde_json::json!({"result":"PASS","cases":cases,"state_oracle":"independent slot materialization; all target/MTP states and physical KV tail","paths":"all:1batch+0target_restore+1mtp_restore","tail_eos_epoch":"PASS"}),
+        serde_json::json!({"result":"PASS","cases":cases,"affine8_k4_cases":affine_cases,"state_oracle":"independent slot materialization; all target/MTP states and physical KV tail","paths":"all:1batch+0target_restore+1mtp_restore","tail_eos_epoch":"PASS"}),
     )
 }
 
@@ -310,7 +362,7 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
 fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
     let mut e = staged()?;
     let before = state_bits(&e)?;
-    for occurrence in [1, 2, 3] {
+    for occurrence in 1..=5 {
         e.capture_fail_after_layer = Some((0, occurrence));
         ensure!(e.mtp_batch_enable().is_err(), "batch capture fault ignored");
         ensure!(
@@ -344,7 +396,7 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
     e.closure.ready(std::time::Instant::now())?;
     e.mtp_prefill(&prompt("math1")?)?;
     save(&mut e)?;
-    let full = proposals(&mut e, 3)?;
+    let full = proposals(&mut e, 4)?;
     // Prove the state oracle detects a missed GDN S/history restore and a
     // stale MTP cursor, even when the target token has not changed.
     let oracle = state_bits(&e)?;
@@ -372,10 +424,10 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
     restore(&mut e)?;
     let mut faults = 0;
     for graph in [false, true] {
-        for partial in [false, true] {
+        for accepted in 0..=4 {
             let mut forced = full.clone();
-            if partial {
-                forced[1] = (forced[1] + 1) % VOCAB as u32;
+            if accepted < 4 {
+                forced[accepted] = (forced[accepted] + 1) % VOCAB as u32;
             }
             let c = e.mtp.as_mut().context("MTP missing")?;
             c.options.graph = graph;
@@ -386,8 +438,8 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
                 policy::Fault::AfterRepair,
                 policy::Fault::BeforePublish,
             ];
-            points.extend((0..3).map(policy::Fault::AfterDraft));
-            if partial {
+            points.extend((0..4).map(policy::Fault::AfterDraft));
+            if accepted < 4 {
                 points.extend([
                     policy::Fault::AfterPrefixSelect,
                     policy::Fault::AfterMtpRestore,
@@ -407,7 +459,7 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
                 e.poisoned = false;
                 faults += 1;
             }
-            for row in 0..if partial { 2 } else { 4 } {
+            for row in 0..accepted + 1 {
                 e.mtp
                     .as_mut()
                     .unwrap()
@@ -446,7 +498,7 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
     }
     receipt(
         "m2b-failure-capture",
-        serde_json::json!({"result":"PASS","capture_boundaries":6,"round_faults":faults,"state_negative_controls":3,"poison":"required after every failed round; test-only manual clear for further injected faults"}),
+        serde_json::json!({"result":"PASS","capture_boundaries":8,"round_faults":faults,"state_negative_controls":3,"poison":"required after every failed round; test-only manual clear for further injected faults"}),
     )
 }
 
@@ -460,7 +512,8 @@ fn q38_snapshot_poison_rows_gpu() -> Result<()> {
     let ids = prompt("math1")?;
     let garbage_s = vec![1.0e30f32; 48 * 128 * 128];
     let garbage_h = vec![1.0e30f32; 10240 * 3];
-    for k in 1..=3 {
+    let mut cases = 0;
+    for k in 1..=4 {
         configure(
             &mut e,
             options(
@@ -498,10 +551,17 @@ fn q38_snapshot_poison_rows_gpu() -> Result<()> {
                 "poisoned snapshot rows changed the GDN state K{k} j{j}"
             );
             restore(&mut e)?;
+            cases += 1;
         }
         restore(&mut e)?;
     }
-    Ok(())
+    println!(
+        "MTP_SNAPSHOT_POISON_PASS K1..4 cases={cases} allocated_rows=4 full_accept_keeps_live_state=true"
+    );
+    receipt(
+        "snapshot-poison",
+        serde_json::json!({"result":"PASS","cases":cases,"allocated_rows":4,"max_depth":4,"keep":"live final state"}),
+    )
 }
 
 fn gdn_bits(e: &Engine) -> Result<Vec<u8>> {
@@ -554,7 +614,7 @@ fn q38_mtp_batch_chain_gpu() -> Result<()> {
     let mut e = ready()?;
     let out = output()?;
     let mut cases = Vec::new();
-    for k in 1..=3 {
+    for k in 1..=4 {
         for h2 in [MtpHiddenTap::PreFinalNorm, MtpHiddenTap::PostFinalNorm] {
             for h5 in [MtpRecurrentTap::PreMtpNorm, MtpRecurrentTap::PostMtpNorm] {
                 for case in ["math1", "code1", "gen1", "gen2", "math2"] {
@@ -909,7 +969,7 @@ fn q38_mtp_snapshot_measure_gpu() -> Result<()> {
 fn q38_mtp_snapshot_calibrate_gpu() -> Result<()> {
     let mut e = super::super::tests::load_capacity(true, 131072)?;
     e.mtp_enable(options(
-        3,
+        4,
         MtpHiddenTap::PostFinalNorm,
         MtpRecurrentTap::PostMtpNorm,
         true,

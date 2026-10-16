@@ -47,14 +47,10 @@ impl Engine {
             recurrent_tap: MtpRecurrentTap::PostMtpNorm,
             graph,
         };
-        mtp.validate()?;
+        let verify_rows = mtp.verify_rows(options.chunk)?;
         ensure!(
             options.backend.draft_model.is_none(),
             "MTP cannot use a separate draft model"
-        );
-        ensure!(
-            options.chunk.is_none_or(|n| n >= 4),
-            "MTP prefill chunk must be at least four"
         );
         let spec = crate::model_spec::ModelSpec::read(dir)?;
         ensure!(
@@ -78,7 +74,7 @@ impl Engine {
             options.capacity,
             options.chunk,
             settings,
-            SetupMode::Mtp,
+            SetupMode::Mtp { verify_rows },
         )?;
         ensure!(prompt.is_none_or(|p| p > 0), "empty MTP prompt");
         engine.mtp_enable_resident(mtp)?;

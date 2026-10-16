@@ -20,7 +20,7 @@ pub(super) struct Batch {
     frame_epoch: Option<u64>,
     logits: CudaSlice<bf16>,
     pub(super) status: CudaSlice<u32>,
-    host_predictions: [u32; 4],
+    host_predictions: [u32; 5],
     row_counts: CudaSlice<i32>,
     meta: CudaFunction,
     pub(super) sequence_check: CudaFunction,
@@ -48,13 +48,18 @@ impl Batch {
 }
 
 impl Engine {
-    /// Four fixed query shapes cover K1..3 with per-row recurrent snapshots.
+    /// Depth+1 fixed query shapes retain recurrent prefixes.
     pub(in crate::backend::cuda::engine) fn mtp_batch_enable(&mut self) -> Result<()> {
         ensure!(
             self.position == 0 && self.mtp.as_ref().is_some_and(|c| c.batch.is_none()),
             "M2b setup requires empty MTP Engine"
         );
-        ensure!(self.workspace_rows >= 4, "M2b requires four workspace rows");
+        let verify_rows = self
+            .mtp
+            .as_ref()
+            .context("MTP missing")?
+            .options
+            .verify_rows(Some(self.workspace_rows))?;
         // This guard rejects late setup before allocating or binding anything.
         self.closure.bind_fixed()?;
         let graph = self.mtp.as_ref().context("MTP missing")?.options.graph;
@@ -65,7 +70,7 @@ impl Engine {
             .context("MTP missing")?
             .target_checkpoint
             .bytes();
-        let buffers = (4 * VOCAB + 5 * HIDDEN) * size_of::<bf16>() + size_of::<[i32; 12]>();
+        let buffers = (5 * VOCAB + 6 * HIDDEN) * size_of::<bf16>() + size_of::<[i32; 15]>();
         let snapshot_bytes = crate::mtp::snapshot_bytes(&self.model_spec)?;
         let needed = crate::mtp::batch_bytes(&self.model_spec)?;
         ensure!(
@@ -77,7 +82,7 @@ impl Engine {
             free.checked_sub(total / 16).is_some_and(|n| needed <= n),
             "M2b attachment exceeds memory budget: required={needed} free={free}"
         );
-        for rows in 1..=4 {
+        for rows in 1..=verify_rows {
             self.prepare(rows)?;
             self.blas
                 .prepare_fixed(rows as u32, VOCAB as u32, HIDDEN as u32)?;
@@ -101,21 +106,21 @@ impl Engine {
                 == snapshot_bytes,
             "snapshot allocation ledger mismatch"
         );
-        self.bind_mtp_snapshots(&snapshots)?;
+        self.bind_mtp_snapshots(&snapshots, verify_rows)?;
         let mut batch = Batch {
             snapshots,
             frame_epoch: None,
-            logits: s.alloc_zeros(4 * VOCAB)?,
-            status: s.alloc_zeros(8)?,
-            host_predictions: [0; 4],
-            row_counts: s.clone_htod(&[1, 2, 3, 4])?,
+            logits: s.alloc_zeros(5 * VOCAB)?,
+            status: s.alloc_zeros(10)?,
+            host_predictions: [0; 5],
+            row_counts: s.clone_htod(&[1, 2, 3, 4, 5])?,
             meta: cubin::module(&self.device.ctx, "q38_common")?.load_function("q38_batch_meta")?,
             sequence_check: cubin::module(&self.device.ctx, "q38_common")?
                 .load_function("q38_sequence_check")?,
             common: CommonOpsRef::new(&self.device.ctx)?,
-            capture_checkpoint: StateCheckpoint::new(&self.state, &self.model_spec, 4, &s)?,
+            capture_checkpoint: StateCheckpoint::new(&self.state, &self.model_spec, 5, &s)?,
             graphs: Vec::new(),
-            frame: s.alloc_zeros(4 * HIDDEN)?,
+            frame: s.alloc_zeros(5 * HIDDEN)?,
             anchor: s.alloc_zeros(HIDDEN)?,
             anchor_token: 0,
             frame_position: 0,
@@ -132,9 +137,12 @@ impl Engine {
         );
         batch.graphs = optional_verify_graphs(graph, || self.mtp_batch_capture(&mut batch))?;
         let graph_shapes = if batch.graphs.is_empty() {
-            "none"
+            "none".to_owned()
         } else {
-            "1,2,3,4"
+            (1..=batch.graphs.len())
+                .map(|rows| rows.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         };
         self.mtp.as_mut().context("MTP missing")?.batch = Some(batch);
         eprintln!(
@@ -153,7 +161,13 @@ impl Engine {
         let logits = s.clone_dtoh(&self.work.logits)?;
         let result = (|| -> Result<Vec<CudaGraph>> {
             let mut graphs = Vec::new();
-            for rows in 1..=4 {
+            let verify_rows = self
+                .mtp
+                .as_ref()
+                .context("MTP missing")?
+                .options
+                .verify_rows(Some(self.workspace_rows))?;
+            for rows in 1..=verify_rows {
                 if rows > 1 {
                     self.closure.capture()?;
                 }
@@ -222,7 +236,10 @@ impl Engine {
     /// Capture-safe: no host transfers/allocations, all plans prebound. Metadata
     /// is generated from the device position before Q/K scatter, GDN and FA2.
     fn mtp_batch_launch(&mut self, batch: &mut Batch, rows: usize) -> Result<()> {
-        ensure!((1..=4).contains(&rows), "invalid M2b query rows");
+        ensure!(
+            (1..=crate::mtp::MAX_VERIFY_ROWS).contains(&rows),
+            "invalid M2b query rows"
+        );
         let s = self.device.stream.clone();
         unsafe {
             s.launch_builder(&batch.meta)
@@ -274,7 +291,7 @@ impl Engine {
         unsafe {
             s.launch_builder(&self.ops.argmax_rows)
                 .arg(&batch.logits)
-                .arg(&mut batch.status.slice_mut(3..7))
+                .arg(&mut batch.status.slice_mut(4..9))
                 .arg(&(VOCAB as i32))
                 .arg(&batch.row_counts.slice(rows - 1..rows))
                 .launch(grid(rows, 1024))?;
@@ -282,7 +299,7 @@ impl Engine {
         unsafe {
             s.launch_builder(&self.ops.finite_bf16)
                 .arg(&batch.logits)
-                .arg(&mut batch.status.slice_mut(7..8))
+                .arg(&mut batch.status.slice_mut(9..10))
                 .arg(&((rows * VOCAB) as u64))
                 .launch(crate::backend::cuda::ops::flat(rows * VOCAB))?;
         }
@@ -291,7 +308,7 @@ impl Engine {
             &mut self.work.logits,
         )?;
         s.memcpy_dtod(
-            &batch.status.slice(rows + 2..rows + 3),
+            &batch.status.slice(rows + 3..rows + 4),
             &mut self.work.token,
         )?;
         self.logits_cache.mark_valid();
@@ -370,7 +387,7 @@ impl Bound<'_> {
             &c.batch.as_ref().context("M2b not bound")?.status,
             s,
             0,
-            [8],
+            [10],
             [1],
         )?;
         c.runtime.run_device(
@@ -393,7 +410,7 @@ impl Bound<'_> {
             MtpRecurrentTap::PostMtpNorm => &c.runtime.work.n,
         };
         let batch = c.batch.as_mut().context("M2b not bound")?;
-        let flag = view(&batch.status, s, 0, [8], [1])?;
+        let flag = view(&batch.status, s, 0, [10], [1])?;
         e.ops
             .finite(s, matrix(&c.runtime.logits, s, 0, 1, VOCAB)?, flag)?;
         e.ops
@@ -428,7 +445,7 @@ impl Bound<'_> {
         let e = &mut self.engine;
         let c = &mut self.chain;
         ensure!(
-            (2..=4).contains(&rows)
+            (2..=5).contains(&rows)
                 && e.position + rows < e.capacity
                 && c.saved.position == Some(e.position),
             "invalid M2b batch extent"
@@ -440,8 +457,8 @@ impl Bound<'_> {
             c.runtime.positions.len() >= 3 * rows,
             "M2b input-staging workspace too small"
         );
-        let flag = view(&batch.status, &s, 0, [8], [1])?;
-        let flag_ptr = flag.element_ptr(7)?;
+        let flag = view(&batch.status, &s, 0, [10], [1])?;
+        let flag_ptr = flag.element_ptr(9)?;
         unsafe {
             s.launch_builder(&c.runtime.stage_inputs)
                 .arg(&e.work.ids)
@@ -481,7 +498,7 @@ impl Bound<'_> {
         batch.frame_rows = rows;
         batch.frame_epoch = Some(e.mtp_epoch);
         batch.calls += 1;
-        let flag = view(&batch.status, &s, 0, [8], [1])?;
+        let flag = view(&batch.status, &s, 0, [10], [1])?;
         e.ops
             .finite(&s, matrix(&batch.frame, &s, 0, rows, HIDDEN)?, flag)?;
         c.runtime.run_device(
@@ -517,38 +534,38 @@ impl Bound<'_> {
         }
         let status = s.clone_dtoh(&batch.status)?;
         ensure!(
-            status[7] & 0x8000_0000 == 0,
+            status[9] & 0x8000_0000 == 0,
             "M2b checkpoint sequence validation failed"
         );
         ensure!(
-            status[7] & 0x4000_0000 == 0,
+            status[9] & 0x4000_0000 == 0,
             "invalid M2b device input token"
         );
         ensure!(
-            status[7] == 0,
+            status[9] == 0,
             "nonfinite M2b draft, target or repair values"
         );
         ensure!(
             status[..rows - 1]
                 .iter()
-                .chain(&status[3..rows + 3])
+                .chain(&status[4..rows + 4])
                 .all(|&t| (t as usize) < VOCAB),
             "invalid M2b prediction ID"
         );
-        batch.host_predictions.copy_from_slice(&status[3..7]);
-        c.pending = status[rows + 2];
+        batch.host_predictions.copy_from_slice(&status[4..9]);
+        c.pending = status[rows + 3];
         e.position += rows;
         s.memcpy_htod(&[e.position as i32], &mut e.work.position)?;
         s.memcpy_htod(&[(e.position + 1) as i32], &mut e.work.length)?;
         e.state
             .set_sequence(&s, e.position as u32, 1, e.workspace_rows as u32)?;
-        Ok((status[..rows - 1].to_vec(), status[3..rows + 3].to_vec()))
+        Ok((status[..rows - 1].to_vec(), status[4..rows + 4].to_vec()))
     }
 
     #[cfg(test)]
     fn verify_batch(&mut self, inputs: &[u32]) -> Result<Vec<u32>> {
         ensure!(
-            (2..=4).contains(&inputs.len()) && inputs.iter().all(|&t| (t as usize) < VOCAB),
+            (2..=5).contains(&inputs.len()) && inputs.iter().all(|&t| (t as usize) < VOCAB),
             "invalid forced verify inputs"
         );
         let e = &mut self.engine;
@@ -561,7 +578,7 @@ impl Bound<'_> {
             &inputs[1..],
             &mut batch.status.slice_mut(..inputs.len() - 1),
         )?;
-        let flag = view(&batch.status, s, 0, [8], [1])?;
+        let flag = view(&batch.status, s, 0, [10], [1])?;
         c.runtime.run_device(
             Execution {
                 device: &e.device,
@@ -588,7 +605,7 @@ impl Bound<'_> {
         };
         s.memcpy_dtod(&source.slice(..HIDDEN), &mut batch.anchor)?;
         batch.anchor_token = inputs[0];
-        let flag = view(&batch.status, s, 0, [8], [1])?;
+        let flag = view(&batch.status, s, 0, [10], [1])?;
         e.ops
             .finite(s, matrix(&c.runtime.work.n, s, 0, 1, HIDDEN)?, flag)?;
         e.ops.finite(s, matrix(source, s, 0, 1, HIDDEN)?, flag)?;
@@ -604,7 +621,7 @@ impl BatchedBackend for Bound<'_> {
         #[cfg(test)] fault: Option<policy::Fault>,
     ) -> Result<(Vec<u32>, Vec<u32>)> {
         ensure!(
-            (1..=3).contains(&depth) && anchor == self.chain.pending,
+            (1..=4).contains(&depth) && anchor == self.chain.pending,
             "invalid M2b draft anchor/depth"
         );
         for i in 0..depth {
@@ -662,7 +679,7 @@ impl BatchedBackend for Bound<'_> {
             &batch.logits.slice(row * VOCAB..(row + 1) * VOCAB),
             &mut e.work.logits,
         )?;
-        s.memcpy_dtod(&batch.status.slice(row + 3..row + 4), &mut e.work.token)?;
+        s.memcpy_dtod(&batch.status.slice(row + 4..row + 5), &mut e.work.token)?;
         let position = saved_position + rows;
         s.memcpy_htod(&[position as i32], &mut e.work.position)?;
         s.memcpy_htod(&[(position + 1) as i32], &mut e.work.length)?;

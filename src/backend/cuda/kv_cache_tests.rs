@@ -39,7 +39,9 @@ fn compact_binding_rejects_wrong_geometry_and_alignment() -> Result<()> {
         capacity: 16640,
         ring: 2243,
     };
-    view.validate(16640, 4)?;
+    for rows in 1..=5 {
+        view.validate(16640, rows)?;
+    }
     assert!(CacheView { ring: 2242, ..view }.validate(16640, 4).is_err());
     assert!(
         CacheView {
@@ -49,7 +51,8 @@ fn compact_binding_rejects_wrong_geometry_and_alignment() -> Result<()> {
         .validate(16640, 4)
         .is_err()
     );
-    assert!(view.validate(16640, 5).is_err());
+    assert!(view.validate(16640, 0).is_err());
+    assert!(view.validate(16640, 6).is_err());
     Ok(())
 }
 fn bf16_file(path: PathBuf, elements: usize) -> Result<Vec<bf16>> {

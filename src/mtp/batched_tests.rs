@@ -235,7 +235,7 @@ fn oracle(proposals: &[u32], accepted: usize) -> State {
 
 #[test]
 fn every_acceptance_branch_selects_the_full_verify_prefix_without_replay() {
-    for k in 1..=3 {
+    for k in 1..=4 {
         for accepted in 0..=k {
             let mut proposals: Vec<_> = (11..11 + k as u32).collect();
             if accepted < k {
@@ -263,7 +263,7 @@ fn state_oracle_detects_wrong_row_history_visibility_frame_and_stale_epoch() {
         (0, 4, 1, 5),
         (4, 4, 1, 5),
         (1, 0, 1, 1),
-        (1, 5, 1, 6),
+        (1, 6, 1, 7),
         (1, 4, usize::MAX, 3),
         (1, 4, 1, 6),
     ] {
@@ -293,34 +293,34 @@ fn state_oracle_detects_wrong_row_history_visibility_frame_and_stale_epoch() {
 
 #[test]
 fn both_commit_paths_roll_back_on_failure_and_never_publish_early() {
-    for partial in [false, true] {
+    for accepted in 0..=4 {
         let mut points = vec![
             Fault::AfterDraft(0),
-            Fault::AfterDraft(2),
+            Fault::AfterDraft(3),
             Fault::AfterVerify,
             Fault::AfterRepair,
             Fault::BeforePublish,
         ];
-        if partial {
+        if accepted < 4 {
             points.extend([Fault::AfterPrefixSelect, Fault::AfterMtpRestore]);
         } else {
             points.push(Fault::AfterMtpRestore);
         }
         for fault in points {
-            let mut b = Mock::new(if partial {
-                vec![11, 999, 13]
-            } else {
-                vec![11, 12, 13]
-            });
+            let mut proposals = vec![11, 12, 13, 14];
+            if accepted < 4 {
+                proposals[accepted] = 999;
+            }
+            let mut b = Mock::new(proposals);
             let before = b.state.clone();
-            assert!(run(&mut b, options(3), 64, &[], Some(fault)).is_err());
+            assert!(run(&mut b, options(4), 64, &[], Some(fault)).is_err());
             assert_eq!(b.state, before);
             assert!(b.poisoned);
         }
     }
-    let mut b = Mock::new(vec![11, 12, 13]);
+    let mut b = Mock::new(vec![11, 12, 13, 14]);
     b.restore_fails = true;
-    assert!(run(&mut b, options(3), 64, &[], Some(Fault::AfterRepair)).is_err());
+    assert!(run(&mut b, options(4), 64, &[], Some(Fault::AfterRepair)).is_err());
     assert!(b.poisoned);
 }
 
@@ -341,10 +341,10 @@ fn eos_and_tail_budget_do_not_consume_the_published_pending_token() {
 
 #[test]
 fn effective_depth_clips_to_both_capacity_and_publication_budget() {
-    for depth in 1..=3 {
+    for depth in 1..=4 {
         for remaining in 0..=5 {
-            for room in 0..=4 {
-                let mut b = Mock::new(vec![11, 12, 13]);
+            for room in 0..=5 {
+                let mut b = Mock::new(vec![11, 12, 13, 14]);
                 b.state.position = 31 - room;
                 let before = b.state.clone();
                 let r = run(&mut b, options(depth), remaining, &[], None).unwrap();

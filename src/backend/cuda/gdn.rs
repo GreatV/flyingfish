@@ -27,7 +27,7 @@
 //!
 //! Ordinary `run` selects by phase: even M1 Prefill uses chunked. The Engine's
 //! MTP device-prefix transaction calls `run_verify`, which retains Prefill and
-//! all batched preparation but uses the R1..4 recurrent core on sm89. Modules
+//! all batched preparation but uses the R1..5 recurrent core on sm89. Modules
 //! and launch bounds are prepared before Ready; live rows remain device data.
 //!
 //! Rows are LOCAL. `qkv` and `core_out` are this call's `[M, ...]`; `prefix` rows
@@ -219,43 +219,37 @@ pub(crate) struct P2Sources {
 }
 
 impl GdnPlan {
-    pub(crate) fn bind_snapshots(
-        &mut self,
-        state: Tensor<f32, 4>,
-        history: Tensor<f32, 3>,
-    ) -> Result<()> {
-        ensure!(
-            (1..=4).contains(&self.max_rows),
-            "snapshot plan bound must be 1..4"
-        );
-        state.validate()?;
-        ensure!(
-            state.shape == [4, HV, DK, DV]
-                && state.stride
-                    == [
-                        u64::from(HV * DK * DV),
-                        u64::from(DK * DV),
-                        u64::from(DV),
-                        1
-                    ],
-            "invalid state snapshot layout"
-        );
-        history.validate()?;
-        ensure!(
-            history.shape == [4, self.conv_dim, 3]
-                && history.stride == [u64::from(self.conv_dim * 3), 3, 1],
-            "invalid history snapshot layout"
-        );
-        self.snapshots = Some((state, history));
-        Ok(())
-    }
-
     /// Setup-only prefix view. Reuse loaded modules and physical addresses.
-    pub(crate) fn for_rows(&self, rows: u32) -> Result<Self> {
+    pub(crate) fn for_rows(
+        &self,
+        rows: u32,
+        snapshots: Option<(Tensor<f32, 4>, Tensor<f32, 3>)>,
+    ) -> Result<Self> {
         ensure!(
             rows > 0 && rows <= self.max_rows,
             "GDN rows outside binding"
         );
+        if let Some((state, history)) = snapshots {
+            ensure!((1..=5).contains(&rows), "snapshot plan bound must be 1..5");
+            state.validate()?;
+            ensure!(
+                state.shape == [4, HV, DK, DV]
+                    && state.stride
+                        == [
+                            u64::from(HV * DK * DV),
+                            u64::from(DK * DV),
+                            u64::from(DV),
+                            1
+                        ],
+                "invalid state snapshot layout"
+            );
+            history.validate()?;
+            ensure!(
+                history.shape == [4, self.conv_dim, 3]
+                    && history.stride == [u64::from(self.conv_dim * 3), 3, 1],
+                "invalid history snapshot layout"
+            );
+        }
         let b = &self.bindings;
         let bindings = GdnBindings {
             qkv: b.qkv.prefix_rows(rows)?,
@@ -271,10 +265,9 @@ impl GdnPlan {
         check_bindings(&bindings, rows, self.conv_dim)?;
         let (prep_cfg, beta_cfg, conv_cfg) =
             prep_grids(self.prep_cfg, self.beta_cfg, self.conv_cfg, rows)?;
-        // 1..=MIN_VERIFY_ROWS keeps the shipped core.
-        let cw_p2 = self.cw_p2 && rows > crate::gdn_plan::MIN_VERIFY_ROWS;
+        let cw_p2 = snapshots.is_none() && self.cw_p2 && rows > crate::gdn_plan::MIN_VERIFY_ROWS;
         Ok(Self {
-            snapshots: None,
+            snapshots,
             kernels: self.kernels.clone(),
             bindings,
             common: self.common.clone(),
@@ -553,8 +546,8 @@ impl GdnOps {
         scratch: Scratch,
     ) -> Result<()> {
         ensure!(
-            plan.kernels.rstep.is_none() || (1..=4).contains(&plan.max_rows),
-            "verify GDN bound must be 1..4"
+            plan.kernels.rstep.is_none() || (1..=5).contains(&plan.max_rows),
+            "verify GDN bound must be 1..5"
         );
         ensure!(plan.snapshots.is_some(), "verify snapshots not bound");
         Self::run_core(plan, stream, meta, ExecutionPhase::Prefill, scratch, true)
@@ -1036,7 +1029,7 @@ mod tests {
     #[test]
     #[ignore = "authorized sm89 GPU window required"]
     fn gdn_verify_snapshot_rows_gpu() -> Result<()> {
-        use cudarc::driver::DevicePtr;
+        use cudarc::driver::{CudaSlice, DevicePtr};
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window required"
@@ -1052,11 +1045,11 @@ mod tests {
         let signal =
             |i: usize, prime: usize| ((i * 17 % prime) as f32 - (prime / 2) as f32) / 1024.0;
         let initial: Vec<_> = (0..state_elements).map(|i| signal(i, 127)).collect();
-        let q: Vec<_> = (0..4 * row_elements).map(|i| signal(i, 131)).collect();
-        let k: Vec<_> = (0..4 * row_elements).map(|i| signal(i, 137)).collect();
-        let v: Vec<_> = (0..4 * row_elements).map(|i| signal(i, 139)).collect();
-        let beta = vec![0.5f32; 4 * HV as usize];
-        let g: Vec<_> = (0..4 * HV as usize)
+        let q: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 131)).collect();
+        let k: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 137)).collect();
+        let v: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 139)).collect();
+        let beta = vec![0.5f32; 5 * HV as usize];
+        let g: Vec<_> = (0..5 * HV as usize)
             .map(|i| -((i * 17 % 157 + 1) as f32) / 256.0)
             .collect();
         let q = stream.clone_htod(&q)?;
@@ -1072,10 +1065,10 @@ mod tests {
             block_dim: (512, 1, 1),
             shared_mem_bytes: RECURRENT_SMEM,
         };
-        for rows in 1..=4usize {
+        for rows in 1..=5usize {
             let mut state = stream.clone_htod(&initial)?;
-            let mut snapshots = stream.alloc_zeros::<f32>(4 * state_elements)?;
-            let mut out = stream.alloc_zeros::<bf16>(4 * row_elements)?;
+            let mut snapshots = stream.alloc_zeros::<f32>(5 * state_elements)?;
+            let mut out = stream.alloc_zeros::<bf16>(5 * row_elements)?;
             let meta =
                 stream.clone_htod(&[17i32, rows as i32, 17 + rows as i32, 128, 1, 0, 0, 0])?;
             unsafe {
@@ -1149,15 +1142,15 @@ mod tests {
         }
         let conv_dim = GDN_CONV_DIM as usize;
         let initial: Vec<_> = (0..conv_dim * 3).map(|i| signal(i, 149)).collect();
-        let raw: Vec<_> = (0..4 * conv_dim)
+        let raw: Vec<_> = (0..5 * conv_dim)
             .map(|i| bf16::from_f32(signal(i, 151)))
             .collect();
         let qkv = stream.clone_htod(&raw)?;
         let kernel =
             cubin::module(&device.ctx, "gdn/gdn_conv")?.load_function("gdn_conv_hist_snapshot")?;
-        for rows in 1..=4usize {
+        for rows in 1..=5usize {
             let mut history = stream.clone_htod(&initial)?;
-            let mut slots = stream.alloc_zeros::<f32>(4 * conv_dim * 3)?;
+            let mut slots = stream.alloc_zeros::<f32>(5 * conv_dim * 3)?;
             let meta =
                 stream.clone_htod(&[17i32, rows as i32, 17 + rows as i32, 128, 1, 0, 0, 0])?;
             unsafe {
@@ -1208,8 +1201,293 @@ mod tests {
                 "dead history slots written"
             );
         }
+        let a = stream.clone_htod(&vec![bf16::from_f32(0.25); 5 * HV as usize])?;
+        let b = stream.clone_htod(&vec![bf16::from_f32(0.5); 5 * HV as usize])?;
+        let conv_weight = stream.clone_htod(&vec![bf16::from_f32(0.25); conv_dim * 4])?;
+        let a_log = stream.alloc_zeros::<bf16>(HV as usize)?;
+        let dt_bias = stream.alloc_zeros::<bf16>(HV as usize)?;
+        let core_out = stream.alloc_zeros::<bf16>(5 * row_elements)?;
+        let state = stream.alloc_zeros::<f32>(state_elements)?;
+        let history = stream.alloc_zeros::<f32>(conv_dim * 3)?;
+        let snapshots = stream.alloc_zeros::<f32>(4 * state_elements)?;
+        let history_snapshots = stream.alloc_zeros::<f32>(4 * conv_dim * 3)?;
+        let matrix = |buffer: &CudaSlice<bf16>, columns: u32| unsafe {
+            Tensor::new(
+                buffer.device_ptr(stream).0,
+                [buffer.len() as u32 / columns, columns],
+                [u64::from(columns), 1],
+                (buffer.len() * 2) as u64,
+            )
+        };
+        let bindings = unsafe {
+            GdnBindings {
+                qkv: matrix(&qkv, GDN_CONV_DIM)?,
+                a: matrix(&a, HV)?,
+                b: matrix(&b, HV)?,
+                conv_weight: matrix(&conv_weight, 4)?,
+                a_log: Tensor::new(a_log.device_ptr(stream).0, [HV], [1], u64::from(HV) * 2)?,
+                dt_bias: Tensor::new(dt_bias.device_ptr(stream).0, [HV], [1], u64::from(HV) * 2)?,
+                core_out: TensorMut(Tensor::new(
+                    core_out.device_ptr(stream).0,
+                    [5, HV, DV],
+                    [u64::from(HV * DV), u64::from(DV), 1],
+                    (5 * row_elements * 2) as u64,
+                )?),
+                s: TensorMut(Tensor::new(
+                    state.device_ptr(stream).0,
+                    [HV, DK, DV],
+                    [u64::from(DK * DV), u64::from(DV), 1],
+                    (state_elements * 4) as u64,
+                )?),
+                history: TensorMut(Tensor::new(
+                    history.device_ptr(stream).0,
+                    [GDN_CONV_DIM, 3],
+                    [3, 1],
+                    (conv_dim * 3 * 4) as u64,
+                )?),
+            }
+        };
+        let full = GdnOps::prepare(
+            &device.ctx,
+            &GdnSpec::q38(),
+            5,
+            bindings,
+            CommonOpsRef::new(&device.ctx)?,
+            true,
+        )?;
+        let ordinary = full.for_rows(5, None)?;
+        ensure!(
+            ordinary.cw_p2 && ordinary.ws_p2 > 0,
+            "M5 negative control did not carry P2"
+        );
+        let snapshot_views = unsafe {
+            (
+                Tensor::new(
+                    snapshots.device_ptr(stream).0,
+                    [4, HV, DK, DV],
+                    [
+                        u64::from(HV * DK * DV),
+                        u64::from(DK * DV),
+                        u64::from(DV),
+                        1,
+                    ],
+                    (4 * state_elements * 4) as u64,
+                )?,
+                Tensor::new(
+                    history_snapshots.device_ptr(stream).0,
+                    [4, GDN_CONV_DIM, 3],
+                    [u64::from(GDN_CONV_DIM * 3), 3, 1],
+                    (4 * conv_dim * 3 * 4) as u64,
+                )?,
+            )
+        };
+        let plan = full.for_rows(5, Some(snapshot_views))?;
+        ensure!(
+            !plan.cw_p2 && plan.ws_p2 == 0,
+            "snapshot-bound M5 plan retained chunkwise dispatch"
+        );
+        ensure!(
+            full.cw_p2 && full.ws_p2 > 0,
+            "M5 verify binding changed ordinary prefill plan"
+        );
+        let scratch = stream.alloc_zeros::<u8>(plan.ws.bytes as usize)?;
+        let meta = stream.clone_htod(&[17i32, 5, 22, 128, 1, 0, 0, 0])?;
+        GdnOps::run_verify(
+            &plan,
+            stream,
+            SeqRef {
+                ptr: meta.device_ptr(stream).0,
+            },
+            Scratch {
+                ptr: scratch.device_ptr(stream).0,
+                bytes: plan.ws.bytes,
+            },
+        )?;
+        stream.synchronize()?;
+        ensure!(
+            stream.clone_dtoh(&core_out)?.iter().all(|v| v.is_finite())
+                && stream.clone_dtoh(&state)?.iter().all(|v| v.is_finite())
+                && stream.clone_dtoh(&snapshots)?.iter().all(|v| v.is_finite()),
+            "M5 verify produced nonfinite values"
+        );
+        let bound_snapshots = stream.clone_dtoh(&snapshots)?;
+        for row in 0..4 {
+            ensure!(
+                bound_snapshots[row * state_elements..(row + 1) * state_elements]
+                    .iter()
+                    .any(|v| v.to_bits() != 0),
+                "snapshot state differs: M5 verify omitted a retained state prefix"
+            );
+        }
+        let saved_history = stream.clone_dtoh(&history_snapshots)?;
+        for row in 0..4 {
+            for ch in 0..conv_dim {
+                for tap in 0..3 {
+                    let index = row + 1 + tap;
+                    let expected = if index < 3 {
+                        0.0
+                    } else {
+                        raw[(index - 3) * conv_dim + ch].to_f32()
+                    };
+                    ensure!(
+                        saved_history[(row * conv_dim + ch) * 3 + tap].to_bits()
+                            == expected.to_bits(),
+                        "raw history snapshot index mismatch in M5 bound plan"
+                    );
+                }
+            }
+        }
+        let reference_state = stream.alloc_zeros::<f32>(state_elements)?;
+        let reference_history = stream.alloc_zeros::<f32>(conv_dim * 3)?;
+        let reference_out = stream.alloc_zeros::<bf16>(5 * row_elements)?;
+        let final_state = stream.clone_dtoh(&state)?;
+        let final_history = stream.clone_dtoh(&history)?;
+        let input_row = |source: Tensor<bf16, 2>, row: usize| {
+            let offset = row as u64 * source.stride[0] * 2;
+            unsafe {
+                Tensor::new(
+                    source.ptr + offset,
+                    [1, source.shape[1]],
+                    source.stride,
+                    source.span_bytes - offset,
+                )
+            }
+        };
+        for row in 0..5 {
+            let b = &full.bindings;
+            let bindings = unsafe {
+                GdnBindings {
+                    qkv: input_row(b.qkv, row)?,
+                    a: input_row(b.a, row)?,
+                    b: input_row(b.b, row)?,
+                    conv_weight: b.conv_weight,
+                    a_log: b.a_log,
+                    dt_bias: b.dt_bias,
+                    core_out: TensorMut(Tensor::new(
+                        reference_out.device_ptr(stream).0 + (row * row_elements * 2) as u64,
+                        [1, HV, DV],
+                        [u64::from(HV * DV), u64::from(DV), 1],
+                        ((5 - row) * row_elements * 2) as u64,
+                    )?),
+                    s: TensorMut(Tensor::new(
+                        reference_state.device_ptr(stream).0,
+                        b.s.0.shape,
+                        b.s.0.stride,
+                        b.s.0.span_bytes,
+                    )?),
+                    history: TensorMut(Tensor::new(
+                        reference_history.device_ptr(stream).0,
+                        b.history.0.shape,
+                        b.history.0.stride,
+                        b.history.0.span_bytes,
+                    )?),
+                }
+            };
+            let reference = GdnOps::prepare(
+                &device.ctx,
+                &GdnSpec::q38(),
+                1,
+                bindings,
+                full.common.clone(),
+                false,
+            )?;
+            let meta =
+                stream.clone_htod(&[17 + row as i32, 1, 18 + row as i32, 128, 1, 0, 0, 0])?;
+            GdnOps::run_core(
+                &reference,
+                stream,
+                SeqRef {
+                    ptr: meta.device_ptr(stream).0,
+                },
+                ExecutionPhase::Prefill,
+                Scratch {
+                    ptr: scratch.device_ptr(stream).0,
+                    bytes: plan.ws.bytes,
+                },
+                true,
+            )?;
+            let expected = stream.clone_dtoh(&reference_state)?;
+            let actual = if row < 4 {
+                &bound_snapshots[row * state_elements..(row + 1) * state_elements]
+            } else {
+                &final_state
+            };
+            ensure!(
+                expected
+                    .iter()
+                    .zip(actual)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "snapshot state differs from prepared R1 chain, row={row}"
+            );
+            let expected = stream.clone_dtoh(&reference_history)?;
+            let actual = if row < 4 {
+                &saved_history[row * conv_dim * 3..(row + 1) * conv_dim * 3]
+            } else {
+                &final_history
+            };
+            ensure!(
+                expected
+                    .iter()
+                    .zip(actual)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "raw history snapshot index mismatch against prepared R1 chain, row={row}"
+            );
+        }
+        ensure!(
+            stream
+                .clone_dtoh(&reference_out)?
+                .iter()
+                .zip(stream.clone_dtoh(&core_out)?)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "snapshot output changed against prepared R1 chain"
+        );
+        take_phase_log();
+        GdnOps::run(
+            &plan,
+            stream,
+            SeqRef {
+                ptr: meta.device_ptr(stream).0,
+            },
+            ExecutionPhase::Prefill,
+            Scratch {
+                ptr: scratch.device_ptr(stream).0,
+                bytes: plan.ws.bytes,
+            },
+        )?;
+        stream.synchronize()?;
+        ensure!(
+            take_phase_log() == ["chunked"],
+            "M5 shared-plan mutant was not exercised"
+        );
+        let ordinary_scratch =
+            stream.alloc_zeros::<u8>((ordinary.ws.bytes + ordinary.ws_p2) as usize)?;
+        GdnOps::run(
+            &ordinary,
+            stream,
+            SeqRef {
+                ptr: meta.device_ptr(stream).0,
+            },
+            ExecutionPhase::Prefill,
+            Scratch {
+                ptr: ordinary_scratch.device_ptr(stream).0,
+                bytes: ordinary.ws.bytes + ordinary.ws_p2,
+            },
+        )?;
+        stream.synchronize()?;
+        ensure!(
+            take_phase_log() == ["chunkwise_p2"],
+            "ordinary M5 prefill route changed"
+        );
+        ensure!(
+            stream.clone_dtoh(&state)?.iter().all(|v| v.is_finite())
+                && stream.clone_dtoh(&core_out)?.iter().all(|v| v.is_finite()),
+            "ordinary M5 prefill nonfinite values"
+        );
         println!(
-            "GDN_VERIFY_SNAPSHOT_PRIMITIVE_PASS rows1..4 state_bitwise_R1 raw_history_CPU dead_slots"
+            "GDN_VERIFY_M5_BINDING_PASS recurrent_snapshot_rows=4 retained_state_prefixes=4 raw_history_CPU ordinary_prefill_P2_unchanged prepared_R1_state_output_history_bitwise shared_plan_mutant_chunked ordinary_M5_P2_launched"
+        );
+        println!(
+            "GDN_VERIFY_SNAPSHOT_PRIMITIVE_PASS rows1..5 state_bitwise_R1 raw_history_CPU dead_slots M5_bound_plan"
         );
         Ok(())
     }

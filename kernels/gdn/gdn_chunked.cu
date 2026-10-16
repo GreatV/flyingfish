@@ -123,7 +123,7 @@ void gdn_chunked_core_t(
         meta->key_count != prefix + valid_rows || meta->capacity < meta->key_count) {
         __trap(); return;
     }
-    if (SNAPSHOT && (!aligned16(snapshots) || valid_rows > 4)) { __trap(); return; }
+    if (SNAPSHOT && (!aligned16(snapshots) || valid_rows > 5)) { __trap(); return; }
     // ExecutionPhase selects this core even for a single prefill row. Partial
     // chunks mask inactive rows with neutral beta=0 and g=0 values (ABI §6).
 

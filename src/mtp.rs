@@ -9,6 +9,8 @@ use anyhow::{Context, Result, ensure};
 pub mod batched;
 pub mod transaction;
 
+pub(crate) const MAX_VERIFY_ROWS: usize = 5;
+
 /// Target verification used for a complete MTP request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub enum VerifyPolicy {
@@ -43,11 +45,23 @@ pub struct MtpOptions {
 }
 impl MtpOptions {
     pub fn validate(self) -> Result<()> {
+        self.verify_rows(None).map(|_| ())
+    }
+
+    pub(crate) fn verify_rows(self, chunk: Option<usize>) -> Result<usize> {
         ensure!(
-            (1..=3).contains(&self.depth),
-            "MTP chain depth must be 1..=3"
+            (1..MAX_VERIFY_ROWS).contains(&self.depth),
+            "MTP chain depth must be 1..=4"
         );
-        Ok(())
+        let rows = self.depth + 1;
+        if let Some(chunk) = chunk {
+            ensure!(
+                chunk >= rows,
+                "MTP chunk {chunk} cannot fit {rows} verification rows for depth {}",
+                self.depth
+            );
+        }
+        Ok(rows)
     }
 }
 
@@ -213,7 +227,7 @@ fn scratch_bytes(capacity: usize, rows: usize) -> Result<usize> {
         & !255;
     let repair = usize::try_from(
         AttentionWorkspace::q38(
-            rows.min(3) as u32,
+            rows.min(4) as u32,
             capacity as u32,
             256.min((capacity / 32 * 32) as u32),
         )?
@@ -310,9 +324,9 @@ pub(crate) fn snapshot_bytes(spec: &ModelSpec) -> Result<usize> {
 
 #[cfg(any(feature = "cuda", test))]
 pub(crate) fn batch_bytes(spec: &ModelSpec) -> Result<usize> {
-    checkpoint_bytes(spec, 4)?
+    checkpoint_bytes(spec, 5)?
         .checked_add(snapshot_bytes(spec)?)
-        .and_then(|n| n.checked_add((4 * VOCAB + 5 * HIDDEN) * 2 + 48))
+        .and_then(|n| n.checked_add((5 * VOCAB + 6 * HIDDEN) * 2 + 60))
         .context("MTP batch buffer overflow")
 }
 
@@ -341,8 +355,8 @@ pub(crate) fn attachment_bytes(
     [
         memory.total - memory.weights - memory.blas,
         WEIGHT_BYTES,
-        checkpoint_bytes(spec, 4)?,
-        checkpoint_bytes(&component_spec(spec), 4)?,
+        checkpoint_bytes(spec, 5)?,
+        checkpoint_bytes(&component_spec(spec), 5)?,
         bootstrap,
         (4 * HIDDEN + VOCAB) * 2 + 8,
         if batched { batch_bytes(spec)? } else { 0 },
@@ -399,6 +413,23 @@ pub fn teacher_forced_rows(sequence: &[u32]) -> Result<Vec<MtpRow>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn verify_rows_fit_the_selected_depth_and_chunk() -> Result<()> {
+        for depth in 1..MAX_VERIFY_ROWS {
+            let options = MtpOptions {
+                depth,
+                hidden_tap: MtpHiddenTap::PostFinalNorm,
+                recurrent_tap: MtpRecurrentTap::PostMtpNorm,
+                graph: false,
+            };
+            assert_eq!(options.verify_rows(None)?, depth + 1);
+            assert_eq!(options.verify_rows(Some(depth + 1))?, depth + 1);
+            assert!(options.verify_rows(Some(depth)).is_err());
+            assert_eq!(options.verify_rows(Some(4)).is_ok(), depth <= 3);
+        }
+        Ok(())
+    }
+
     fn spec() -> ModelSpec {
         ModelSpec::qwen(
             &serde_json::from_str(include_str!("../tests/data/q38-config.json")).unwrap(),
@@ -481,13 +512,13 @@ mod tests {
     #[test]
     fn canonical_repair_scratch_covers_bound_rows() -> Result<()> {
         for capacity in [32, 64, 128, 4096, 18432] {
-            for rows in [1, 2, 3, 16, 53, 116, 2048] {
+            for rows in [1, 2, 3, 4, 16, 53, 116, 2048] {
                 if rows > capacity {
                     continue;
                 }
                 let bytes = scratch_bytes(capacity, rows)?;
                 assert!(bytes.is_multiple_of(256));
-                for repair_rows in 1..=rows.min(3) {
+                for repair_rows in 1..=rows.min(4) {
                     let required = AttentionWorkspace::q38(
                         repair_rows as u32,
                         capacity as u32,
@@ -531,10 +562,12 @@ mod tests {
         assert_eq!(snapshot_bytes(&s)?, 627572736);
         for capacity in [4096, 131072] {
             let budget = AttachmentBudget::new(&s, capacity)?;
-            assert_eq!(
-                budget.fixed_bytes + 4 * budget.row_bytes + budget.workspace(4)?,
-                attachment_bytes(&s, capacity, 4, true)?
-            );
+            for rows in [4, 5] {
+                assert_eq!(
+                    budget.fixed_bytes + rows * budget.row_bytes + budget.workspace(rows)?,
+                    attachment_bytes(&s, capacity, rows, true)?
+                );
+            }
         }
         let p = MtpPlan {
             max_rows: 16,
@@ -546,7 +579,7 @@ mod tests {
             15 * VOCAB * 2
         );
         let b = AttachmentBudget::new(&s, 128)?;
-        for rows in [1, 2, 15, 16, 32, 128] {
+        for rows in [1, 2, 5, 15, 16, 32, 128] {
             assert_eq!(
                 b.fixed_bytes + rows * b.row_bytes + b.workspace(rows)?,
                 attachment_bytes(&s, 128, rows, true)?
