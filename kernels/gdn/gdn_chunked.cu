@@ -371,8 +371,9 @@ void gdn_chunked_core_t(
             __syncthreads();
         }
 
+        // The last row is not snapshotted; snapshot_row reads rows < live only.
         if (SNAPSHOT) {
-            for (int r = 0; r < valid_rows; ++r) {
+            for (int r = 0; r + 1 < valid_rows; ++r) {
                 #pragma unroll
                 for (int a = 0; a < RT; ++a)
                     #pragma unroll
