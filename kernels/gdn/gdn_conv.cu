@@ -1,7 +1,7 @@
 // Q38 ABI v1 section 6, GDN conv: depthwise causal conv1d, k=4, groups == channels, no
-// bias, over CONV_DIM = 10240 channels. Emits the BF16 conv result; the shared
-// GateOps::silu applies SiLU. ABI section 5 requires that split -- the conv output cast
-// may not be elided -- so the cast below is load-bearing.
+// bias, over CONV_DIM = 10240 channels, with the exact shared SiLU applied in the same
+// thread. ABI section 5's BF16 rounding points are kept: the conv result is cast to BF16
+// and back before silu(), and the silu result is cast to BF16 for conv_out.
 //
 // HISTORY is written by a SEPARATE kernel, gdn_conv_hist_update, not by this one. They used
 // to be fused and that was a cross-block race: the block owning the last row overwrote
@@ -19,6 +19,7 @@
 //
 // CPU emulation of exactly this indexing lives in the P1-C gate
 // (p1c/gdn_gate_cpu.cpp, section (f)); it caught all of the above without a GPU.
+#include "../q38_contract.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
@@ -102,9 +103,11 @@ extern "C" __global__ void gdn_conv(
         }
 // Negative-control build; never defined by build.rs.
 #ifdef GDN_ABS_ROWS
-        out[(size_t)(prefix + lr) * conv_dim + ch] = __float2bfloat16_rn(acc);
+        const __nv_bfloat16 vis = __float2bfloat16_rn(acc);
+        out[(size_t)(prefix + lr) * conv_dim + ch] = __float2bfloat16_rn(silu(__bfloat162float(vis)));
 #else
-        out[(size_t)lr * conv_dim + ch] = __float2bfloat16_rn(acc);   // the visible cast
+        const __nv_bfloat16 vis = __float2bfloat16_rn(acc);   // the visible cast (ABI §5)
+        out[(size_t)lr * conv_dim + ch] = __float2bfloat16_rn(silu(__bfloat162float(vis)));
 #endif
     }
 }
