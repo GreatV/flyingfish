@@ -2,12 +2,6 @@
 #include "q38_contract.cuh"
 #include <cuda_bf16.h>
 #include <math.h>
-__device__ __forceinline__ float bround(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
-__device__ __forceinline__ float sigmoid(float x) {
-    if (x>=0.0f) return 1.0f/(1.0f+expf(-x));
-    float e=expf(x); return e/(1.0f+e);
-}
-__device__ __forceinline__ float silu(float x) {return x*sigmoid(x);}
 extern "C" __global__ void q38_copy_finite_bf16(const __nv_bfloat16* source,
                                                __nv_bfloat16* destination,
                                                uint64_t count) {
