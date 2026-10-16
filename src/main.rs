@@ -88,7 +88,7 @@ enum Command {
         max_new_tokens: usize,
         #[arg(long)]
         graph: bool,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 3 when the checkpoint contains MTP weights; 0 selects plain generation")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 4 when the checkpoint contains MTP weights; 0 selects plain generation")]
         mtp: Option<u8>,
         #[arg(long)]
         dump: Option<PathBuf>,
@@ -107,7 +107,7 @@ enum Command {
     Serve {
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 3 when the checkpoint contains MTP weights; 0 selects plain serving")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 4 when the checkpoint contains MTP weights; 0 selects plain serving")]
         mtp: Option<u8>,
     },
     Bench {
@@ -508,7 +508,7 @@ fn resolve_mtp(requested: Option<u8>, component: bool, plain_selected: bool) -> 
             ensure!(component, "checkpoint has no MTP component");
             Ok(Some(depth))
         }
-        None => Ok((component && !plain_selected).then_some(3)),
+        None => Ok((component && !plain_selected).then_some(4)),
     }
 }
 
@@ -999,7 +999,7 @@ mod tests {
             );
         }
         assert!(Cli::try_parse_from(args.into_iter().chain(["--mtp", "5"])).is_err());
-        assert_eq!(resolve_mtp(None, true, false)?, Some(3));
+        assert_eq!(resolve_mtp(None, true, false)?, Some(4));
         assert_eq!(resolve_mtp(None, false, false)?, None);
         for component in [false, true] {
             assert_eq!(resolve_mtp(Some(0), component, false)?, None);
