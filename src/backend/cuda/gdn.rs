@@ -86,7 +86,7 @@ const PREP_THREADS: u32 = 128;
 /// `GDN_RS_INTERFACE.md` §7. Static shared memory in all three is 0.
 const RECURRENT_SMEM: u32 = 4096;
 const CHUNKED_SMEM: u32 = 62_336;
-/// Chunkwise-P2 core thread block, the same 256 threads; all three stages use the one
+/// Chunkwise-P2 core thread block, the same 256 threads; both stages use the one
 /// arena whose size comes from `gdn_cw_p2_layout.h`.
 const P2_THREADS: u32 = 256;
 
@@ -134,19 +134,18 @@ struct Kernels {
     p2: Option<ChunkwiseP2>,
 }
 
-/// The three chunkwise-P2 stages. They are launched in the order A, H, O on one stream
-/// with nothing between them: A fills the workspace slot, H walks the chunks in order
-/// and O reads the slot that launch sequence produced.
+/// The two chunkwise-P2 stages. They are launched in the order A, H on one stream
+/// with nothing between them: A fills the workspace slot, H walks the chunks in order,
+/// contracting the out rows against its register state as it goes.
 struct ChunkwiseP2 {
     a: CudaFunction,
     h: CudaFunction,
-    o: CudaFunction,
 }
 
-/// The three chunkwise-P2 launch configs for a plan bound at `rows`: stage A and stage O
-/// run one CTA per (chunk, head) with grid.x = ceil(rows/64), stage H one CTA per
-/// 32-wide value block with grid.x = DV/32, so its grid never moves with the step.
-fn cw_p2_grids(rows: u32) -> (LaunchConfig, LaunchConfig, LaunchConfig) {
+/// The two chunkwise-P2 launch configs for a plan bound at `rows`: stage A runs one CTA
+/// per (chunk, head) with grid.x = ceil(rows/64), stage H one CTA per 32-wide value
+/// block with grid.x = DV/32, so its grid never moves with the step.
+fn cw_p2_grids(rows: u32) -> (LaunchConfig, LaunchConfig) {
     let per_chunk = LaunchConfig {
         grid_dim: (rows.div_ceil(CW_P2_CHUNK), HV, 1),
         block_dim: (P2_THREADS, 1, 1),
@@ -157,7 +156,7 @@ fn cw_p2_grids(rows: u32) -> (LaunchConfig, LaunchConfig, LaunchConfig) {
         block_dim: (P2_THREADS, 1, 1),
         shared_mem_bytes: cw_p2::SMEM_BYTES as u32,
     };
-    (per_chunk, per_value_block, per_chunk)
+    (per_chunk, per_value_block)
 }
 
 /// CUDA caps gridDim.y and gridDim.z at 65535; prep puts rows on gridDim.z and beta on gridDim.y.
@@ -294,10 +293,10 @@ impl GdnPlan {
         })
     }
 
-    /// The chunkwise-P2 prefill core: stage A, then stage H, then stage O, three launches
+    /// The chunkwise-P2 prefill core: stage A, then stage H, two launches
     /// back to back on the caller's stream with no synchronisation between them. Stage A
-    /// and stage O size their grid from the rows the plan binds, stage H from the value
-    /// strip; all three resolve the row count on the device, so a captured Graph replays
+    /// stage A sizes its grid from the rows the plan binds, stage H from the value
+    /// strip; both resolve the row count on the device, so a captured Graph replays
     /// the identical sequence.
     pub(crate) fn gdn_cw_p2_step(
         &self,
@@ -320,7 +319,7 @@ impl GdnPlan {
         let g = ws_f32(self.ws.g, ws, rows, HV)?.0.ptr;
         // The slot region starts where the fused layout ends; that end is 256 B aligned
         // and the host scratch pointer is 256 B aligned, which the stages require. All
-        // three stages take THIS base as their ws argument.
+        // stages take THIS base as their ws argument.
         let slot = add(ws, self.ws.bytes)?;
         let stage = crate::gdn_plan::P2StageArgs {
             q,
@@ -333,7 +332,7 @@ impl GdnPlan {
             valid_rows: 0,
             v_row_stride: src.v_row_stride,
         };
-        let (a_cfg, h_cfg, o_cfg) = cw_p2_grids(rows);
+        let (a_cfg, h_cfg) = cw_p2_grids(rows);
         unsafe {
             stream
                 .launch_builder(&p2.a)
@@ -355,22 +354,11 @@ impl GdnPlan {
                 .arg(&stage.beta)
                 .arg(&stage.g)
                 .arg(&self.bindings.s.0.ptr)
+                .arg(&self.bindings.core_out.0.ptr)
                 .arg(&slot)
                 .arg(&stage.meta)
                 .arg(&stage.valid_rows)
                 .launch(h_cfg)?;
-            stream
-                .launch_builder(&p2.o)
-                .arg(&stage.q)
-                .arg(&stage.k)
-                .arg(&stage.v)
-                .arg(&stage.beta)
-                .arg(&stage.g)
-                .arg(&slot)
-                .arg(&self.bindings.core_out.0.ptr)
-                .arg(&stage.meta)
-                .arg(&stage.valid_rows)
-                .launch(o_cfg)?;
         }
         Ok(())
     }
@@ -480,7 +468,6 @@ impl GdnOps {
             Some(ChunkwiseP2 {
                 a: p2_mod.load_function("gdn_cw_p2_stage_a")?,
                 h: p2_mod.load_function("gdn_cw_p2_stage_h")?,
-                o: p2_mod.load_function("gdn_cw_p2_stage_o")?,
             })
         };
         let kernels = Kernels {
@@ -1406,7 +1393,7 @@ mod tests {
             cw_p2::SLOT_BYTES,
             "the slot does not close over its fields"
         );
-        assert_eq!(cw_p2::SLOT_BYTES, 141_056, "the kernel slot size moved");
+        assert_eq!(cw_p2::SLOT_BYTES, 59_136, "the kernel slot size moved");
 
         let spec = GdnSpec::q38();
         for rows in [1u32, 64, 2048, 16384] {
@@ -1431,29 +1418,24 @@ mod tests {
         Ok(())
     }
 
-    /// The three chunkwise-P2 grids derive from the rows the plan binds: stage A and O get
+    /// The two chunkwise-P2 grids derive from the rows the plan binds: stage A gets
     /// one CTA per (chunk, head), stage H one per 32-wide value block, so its grid does not
     /// move with the step at all.
     #[test]
     fn cw_p2_grids_are_a_function_of_the_bound_rows() {
         for (rows, want_chunks) in [(2048u32, 32u32), (16384, 256)] {
-            let (a, h, o) = cw_p2_grids(rows);
+            let (a, h) = cw_p2_grids(rows);
             assert_eq!(
                 a.grid_dim,
                 (want_chunks, HV, 1),
                 "stage A grid, rows={rows}"
             );
             assert_eq!(
-                o.grid_dim,
-                (want_chunks, HV, 1),
-                "stage O grid, rows={rows}"
-            );
-            assert_eq!(
                 h.grid_dim,
                 (4, HV, 1),
                 "stage H covers DV in 32-wide blocks, rows={rows}"
             );
-            for cfg in [a, h, o] {
+            for cfg in [a, h] {
                 assert_eq!(cfg.block_dim, (P2_THREADS, 1, 1));
                 assert_eq!(cfg.shared_mem_bytes, cw_p2::SMEM_BYTES as u32);
             }
@@ -1468,8 +1450,7 @@ mod tests {
 
     /// The chunkwise-P2 stage dependency contract as a CPU model: within one (chunk, head)
     /// slot, stage A writes W, U, qk, Gc, Be and Sc and stage H writes vn and Sn, no field
-    /// has a second writer, no field is written twice for the same pair, and stage O writes
-    /// nothing into the slot at all.
+    /// has a second writer and no field is written twice for the same pair.
     #[test]
     fn every_cw_p2_slot_field_has_exactly_one_writing_stage() {
         let rows = 2048u32;
@@ -1481,12 +1462,7 @@ mod tests {
             for count in &mut writers[index] {
                 *count += 1;
             }
-            assert_ne!(*writer, 'O', "stage O must not write into the slot");
-            let stage = *writer;
-            assert!(
-                stage == 'A' || stage == 'H',
-                "field written by an unknown stage {stage}"
-            );
+            assert_eq!(*writer, 'A', "only stage A writes slot fields");
         }
         for (index, count) in writers.iter().enumerate() {
             let name = crate::gdn_plan::CW_P2_SLOT[index].0;
@@ -1506,8 +1482,8 @@ mod tests {
             .map(|(n, _, _)| *n)
             .collect();
         assert_eq!(by_a, ["W", "U", "qk", "Gc", "Be", "Sc"], "stage A outputs");
-        assert_eq!(by_h, ["vn", "Sn"], "stage H outputs");
-        // Stage A's outputs are what stage H and stage O read, so both of those slots must
+        assert!(by_h.is_empty(), "stage H writes no slot field");
+        // Stage A's outputs are what stage H reads, so both of those slots must
         // be full for every chunk and head the plan covers.
         let layout = crate::gdn_plan::cw_p2_slot_layout();
         for chunk in 0..slots / HV as usize {

@@ -28,23 +28,20 @@ pub const CW_P2_CHUNK: u32 = 64;
 pub const CW_P2_VALUE_BLOCK: u32 = 32;
 /// The chunkwise-P2 workspace slot of one (chunk, head), in kernel byte order, with the
 /// writing stage: `W` bf16[64,128], `U` fp32[64,128], `qk` bf16[64,72] (row stride
-/// `P1_T_LD`, so stage O reads it with `p1_a_sbf` in place), `vn` bf16[64,128],
-/// `Sn` fp32[128,128] (the pre-update state, in the gmem `S` layout), then the
-/// FP32[64] vectors `Gc`, `Be`, `Sc`.
-pub const CW_P2_SLOT: [(&str, u64, char); 8] = [
+/// `P1_T_LD`, so stage H reads it with `p1_a_sbf` in place), then the FP32[64] vectors
+/// `Gc`, `Be`, `Sc`.
+pub const CW_P2_SLOT: [(&str, u64, char); 6] = [
     ("W", 64 * 128 * 2, 'A'),
     ("U", 64 * 128 * 4, 'A'),
     ("qk", 64 * 72 * 2, 'A'),
-    ("vn", 64 * 128 * 2, 'H'),
-    ("Sn", 128 * 128 * 4, 'H'),
     ("Gc", 64 * 4, 'A'),
     ("Be", 64 * 4, 'A'),
     ("Sc", 64 * 4, 'A'),
 ];
 
 /// Field offsets of the slot, each 256 B aligned, in the kernel's order.
-pub const fn cw_p2_slot_layout() -> [(u64, u64, char); 8] {
-    let mut layout = [(0u64, 0u64, '?'); 8];
+pub const fn cw_p2_slot_layout() -> [(u64, u64, char); 6] {
+    let mut layout = [(0u64, 0u64, '?'); 6];
     let mut off = 0u64;
     let mut i = 0;
     while i < CW_P2_SLOT.len() {
@@ -57,9 +54,8 @@ pub const fn cw_p2_slot_layout() -> [(u64, u64, char); 8] {
     layout
 }
 
-/// Bytes of one slot: the eight fields above.
-pub const CW_P2_SLOT_BYTES: u64 =
-    64 * 128 * 2 + 64 * 128 * 4 + 64 * 72 * 2 + 64 * 128 * 2 + 128 * 128 * 4 + 3 * 64 * 4;
+/// Bytes of one slot: the six fields above.
+pub const CW_P2_SLOT_BYTES: u64 = 64 * 128 * 2 + 64 * 128 * 4 + 64 * 72 * 2 + 3 * 64 * 4;
 const _: () = assert!(
     CW_P2_SLOT_BYTES == cw_p2::SLOT_BYTES,
     "the chunkwise-P2 slot fields and gdn_cw_p2_layout.h disagree"
@@ -77,7 +73,7 @@ pub const fn cw_p2_bytes(max_rows: u32) -> u64 {
     chunks as u64 * 48 * CW_P2_SLOT_BYTES
 }
 
-/// The chunkwise-P2 stage ABI: field order IS the argument order of all three
+/// The chunkwise-P2 stage ABI: field order IS the argument order of both
 /// entries, as declared in `kernels/gdn/gdn_cw_p2.cu`.
 #[derive(Copy, Clone)]
 pub struct P2StageArgs {
@@ -107,7 +103,7 @@ pub struct GdnPolicy {
     /// Protocol §A value split of the production chunkwise-P1 prefill core, 0 = the
     /// shipped recursive core; qualified for arch 89 with 128 SMs, 0 elsewhere.
     prefill_p1_split: u32,
-    /// The chunkwise-P2 split (three kernels over a workspace slot) replaces the fused
+    /// The chunkwise-P2 split (two kernels over a workspace slot) replaces the fused
     /// P1 core; prepared for arch 89 with 128 SMs.
     cw_p2: bool,
 }
