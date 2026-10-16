@@ -417,7 +417,7 @@ enum CaptureFault {
 enum SetupMode {
     Ready,
     Prepare,
-    Mtp,
+    Mtp { verify_rows: usize },
 }
 
 pub struct Engine {

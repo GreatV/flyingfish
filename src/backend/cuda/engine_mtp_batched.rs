@@ -48,13 +48,18 @@ impl Batch {
 }
 
 impl Engine {
-    /// Five fixed query shapes cover K1..4 with retained recurrent prefixes.
+    /// Depth+1 fixed query shapes retain recurrent prefixes.
     pub(in crate::backend::cuda::engine) fn mtp_batch_enable(&mut self) -> Result<()> {
         ensure!(
             self.position == 0 && self.mtp.as_ref().is_some_and(|c| c.batch.is_none()),
             "M2b setup requires empty MTP Engine"
         );
-        ensure!(self.workspace_rows >= 5, "M2b requires five workspace rows");
+        let verify_rows = self
+            .mtp
+            .as_ref()
+            .context("MTP missing")?
+            .options
+            .verify_rows(Some(self.workspace_rows))?;
         // This guard rejects late setup before allocating or binding anything.
         self.closure.bind_fixed()?;
         let graph = self.mtp.as_ref().context("MTP missing")?.options.graph;
@@ -77,7 +82,7 @@ impl Engine {
             free.checked_sub(total / 16).is_some_and(|n| needed <= n),
             "M2b attachment exceeds memory budget: required={needed} free={free}"
         );
-        for rows in 1..=5 {
+        for rows in 1..=verify_rows {
             self.prepare(rows)?;
             self.blas
                 .prepare_fixed(rows as u32, VOCAB as u32, HIDDEN as u32)?;
@@ -101,7 +106,7 @@ impl Engine {
                 == snapshot_bytes,
             "snapshot allocation ledger mismatch"
         );
-        self.bind_mtp_snapshots(&snapshots)?;
+        self.bind_mtp_snapshots(&snapshots, verify_rows)?;
         let mut batch = Batch {
             snapshots,
             frame_epoch: None,
@@ -132,9 +137,12 @@ impl Engine {
         );
         batch.graphs = optional_verify_graphs(graph, || self.mtp_batch_capture(&mut batch))?;
         let graph_shapes = if batch.graphs.is_empty() {
-            "none"
+            "none".to_owned()
         } else {
-            "1,2,3,4,5"
+            (1..=batch.graphs.len())
+                .map(|rows| rows.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         };
         self.mtp.as_mut().context("MTP missing")?.batch = Some(batch);
         eprintln!(
@@ -153,7 +161,13 @@ impl Engine {
         let logits = s.clone_dtoh(&self.work.logits)?;
         let result = (|| -> Result<Vec<CudaGraph>> {
             let mut graphs = Vec::new();
-            for rows in 1..=5 {
+            let verify_rows = self
+                .mtp
+                .as_ref()
+                .context("MTP missing")?
+                .options
+                .verify_rows(Some(self.workspace_rows))?;
+            for rows in 1..=verify_rows {
                 if rows > 1 {
                     self.closure.capture()?;
                 }
@@ -222,7 +236,10 @@ impl Engine {
     /// Capture-safe: no host transfers/allocations, all plans prebound. Metadata
     /// is generated from the device position before Q/K scatter, GDN and FA2.
     fn mtp_batch_launch(&mut self, batch: &mut Batch, rows: usize) -> Result<()> {
-        ensure!((1..=5).contains(&rows), "invalid M2b query rows");
+        ensure!(
+            (1..=crate::mtp::MAX_VERIFY_ROWS).contains(&rows),
+            "invalid M2b query rows"
+        );
         let s = self.device.stream.clone();
         unsafe {
             s.launch_builder(&batch.meta)

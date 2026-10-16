@@ -57,6 +57,8 @@ struct Args {
     chunk: Option<usize>,
     #[arg(long)]
     prefix_cache: bool,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    graph: bool,
     #[arg(long, value_enum, default_value_t = flyingfish::kv::KvFormat::Bf16)]
     kv_format: flyingfish::kv::KvFormat,
     #[arg(long)]
@@ -176,7 +178,7 @@ fn main() -> Result<()> {
         let settings = Settings {
             tree_builder: TreeBuilder::Waves,
             spec_budget: SpecBudget::Chain,
-            spec_graph: true,
+            spec_graph: args.graph,
             draft_model: None,
             runtime_dir: args.runtime_dir.clone(),
             prefix_cache: args.prefix_cache,
@@ -358,7 +360,7 @@ fn main() -> Result<()> {
         );
         drop(negative_readback);
         let committed_decode_token = saved.snapshot.manifest.boundary.pending_next_token;
-        engine.step(true)?;
+        engine.step(args.graph)?;
         let mut decoded_prefix = prefix.clone();
         decoded_prefix.push(committed_decode_token);
         let decoded_saved = engine.save_text_prefix(TextPrefixSaveRequest {
@@ -377,7 +379,7 @@ fn main() -> Result<()> {
             decoded_boundary_logits.iter().all(|v| v.is_finite()),
             "E1 nonfinite logits at decoded_boundary_logits"
         );
-        engine.step(true)?;
+        engine.step(args.graph)?;
         let baseline_pending_token = engine.token()?;
         let baseline_pending_logits = engine.decode_logits()?;
         ensure!(
@@ -427,7 +429,7 @@ fn main() -> Result<()> {
                 .contains("decode logits are invalid after prefix restore"),
             "unexpected stale-logits rejection: {stale_logits_error}"
         );
-        engine.step(true)?;
+        engine.step(args.graph)?;
         let restored_pending_token = engine.token()?;
         let restored_pending_logits = engine.decode_logits()?;
         ensure!(
@@ -509,7 +511,7 @@ fn main() -> Result<()> {
             "internally_consistent_foreign_rejected_by_engine_identity": true,
             "foreign_identity_rejected_before_mutation": true,
             "restored_logits_invalid_until_step": true,
-            "post_restore_step_used_graph": true,
+            "post_restore_step_used_graph": args.graph,
             "post_foreign_identity_readback_state_root":
                 saved.snapshot.manifest.state_root.clone(),
             "restore": restore,

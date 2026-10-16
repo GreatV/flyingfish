@@ -299,9 +299,57 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
         e.mtp_batch_round(1, None).is_err() && state_bits(&e)? == before,
         "stale epoch accepted or mutated"
     );
+    drop(e);
+    let mut affine = super::super::tests::load_format(true, 128, crate::kv::KvFormat::Affine8)?;
+    affine.mtp_enable(options(
+        4,
+        MtpHiddenTap::PreFinalNorm,
+        MtpRecurrentTap::PostMtpNorm,
+        true,
+    ))?;
+    affine.mtp_batch_enable()?;
+    affine.capture()?;
+    affine.closure.ready(std::time::Instant::now())?;
+    affine.mtp_prefill(&ids)?;
+    save(&mut affine)?;
+    let full = proposals(&mut affine, 4)?;
+    let anchor = affine.token()?;
+    let mut affine_cases = 0;
+    for accepted in 0..=4 {
+        let mut forced = full.clone();
+        if accepted < 4 {
+            forced[accepted] = (forced[accepted] + 1) % VOCAB as u32;
+        }
+        let inputs: Vec<_> = std::iter::once(anchor)
+            .chain(forced.iter().copied())
+            .collect();
+        affine.mtp.as_mut().context("MTP missing")?.options.graph = false;
+        let expected = canonical(&mut affine, &inputs, accepted + 1)?;
+        let expected_bits = committed_bits(&affine)?;
+        restore(&mut affine)?;
+        for graph in [false, true] {
+            let chain = affine.mtp.as_mut().context("MTP missing")?;
+            chain.options.graph = graph;
+            chain.force_proposals = Some(forced.clone());
+            let round = affine.mtp_batch_round(64, None)?;
+            let mut tokens = full[..accepted].to_vec();
+            tokens.push(*expected.last().context("empty affine8 canonical head")?);
+            ensure!(
+                round.round.accepted == accepted && round.round.tokens == tokens,
+                "affine8 K4 commit/pending mismatch"
+            );
+            ensure!(
+                committed_bits(&affine)? == expected_bits,
+                "affine8 K4 canonical state mismatch accepted={accepted} graph={graph}"
+            );
+            restore(&mut affine)?;
+            affine_cases += 1;
+        }
+    }
+    println!("MTP_AFFINE8_K4_TRANSACTIONS_PASS cases={affine_cases} graph_and_eager");
     receipt(
         "m2b-transaction",
-        serde_json::json!({"result":"PASS","cases":cases,"state_oracle":"independent slot materialization; all target/MTP states and physical KV tail","paths":"all:1batch+0target_restore+1mtp_restore","tail_eos_epoch":"PASS"}),
+        serde_json::json!({"result":"PASS","cases":cases,"affine8_k4_cases":affine_cases,"state_oracle":"independent slot materialization; all target/MTP states and physical KV tail","paths":"all:1batch+0target_restore+1mtp_restore","tail_eos_epoch":"PASS"}),
     )
 }
 

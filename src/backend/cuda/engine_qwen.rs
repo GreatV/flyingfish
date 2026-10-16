@@ -99,7 +99,7 @@ impl<T> std::ops::Deref for Narrowed<'_, T> {
 impl<T> PrefillPlans<T> {
     fn bind(full: T, max_rows: usize, narrow: impl Fn(&T, u32) -> Result<T>) -> Result<Self> {
         ensure!(max_rows > 0, "prefill plan requires rows");
-        let small = (1..=5.min(max_rows))
+        let small = (1..=crate::mtp::MAX_VERIFY_ROWS.min(max_rows))
             .map(|rows| narrow(&full, rows as u32))
             .collect::<Result<_>>()?;
         Ok(Self {
@@ -243,8 +243,10 @@ impl Runtime {
         let attention_prefill = FullAttentionOps::preprocess_workspace(limits(rows, capacity)?)?;
         let attention_decode =
             FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(1, capacity)?)?;
-        let attention_nested_verify =
-            FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(rows.min(5), capacity)?)?;
+        let attention_nested_verify = FullAttentionOps::workspace(
+            &FullAttentionSpec::q38(),
+            limits(rows.min(crate::mtp::MAX_VERIFY_ROWS), capacity)?,
+        )?;
         let spec = crate::op_contract::GdnSpec::q38();
         let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?, policy)?;
         let decode = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY)?;
@@ -276,6 +278,7 @@ impl Runtime {
         arena: CudaSlice<u8>,
         scratch_buffer: CudaSlice<u8>,
         kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
+        verify_rows: usize,
     ) -> Result<Self> {
         let s = &engine.device.stream;
         let rows = engine.workspace_rows;
@@ -416,8 +419,8 @@ impl Runtime {
                         text_prefill,
                         compact_small: if kv.compact.is_some() {
                             Some(PrefillPlans::bind(
-                                bind(4.min(rows), PositionBindings::Linear, true)?,
-                                4.min(rows),
+                                bind(verify_rows.min(rows), PositionBindings::Linear, true)?,
+                                verify_rows.min(rows),
                                 FullAttentionPlan::for_rows,
                             )?)
                         } else {
@@ -590,6 +593,7 @@ impl Engine {
     pub(super) fn bind_mtp_snapshots(
         &mut self,
         snapshots: &[super::super::state::GdnState],
+        verify_rows: usize,
     ) -> Result<()> {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let stream = &self.device.stream;
@@ -608,7 +612,7 @@ impl Engine {
                     [48 * 128 * 128, 128 * 128, 128, 1],
                 )?;
                 let h = view(&state.history, stream, 0, [4, 10240, 3], [10240 * 3, 3, 1])?;
-                *verify = (1..=5.min(prefill.max_rows))
+                *verify = (1..=verify_rows)
                     .map(|rows| prefill.full.for_rows(rows as u32, Some((s, h))))
                     .collect::<Result<_>>()?;
             }
@@ -805,7 +809,11 @@ impl Engine {
         model_spec: crate::model_spec::ModelSpec,
     ) -> Result<Self> {
         let write = !matches!(mode, super::SetupMode::Ready);
-        let reserve_mtp = matches!(mode, super::SetupMode::Mtp);
+        let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
+        let verify_rows = match mode {
+            super::SetupMode::Mtp { verify_rows } => verify_rows,
+            _ => crate::mtp::MAX_VERIFY_ROWS,
+        };
         let started = Instant::now();
         ensure!(
             settings.draft_model.is_none(),
@@ -917,9 +925,9 @@ impl Engine {
                 if settings.kv_format != crate::kv::KvFormat::Bf16 {
                     target = target.max(
                         crate::op_contract::AttentionWorkspace::q38(
-                            4,
+                            verify_rows as u32,
                             capacity as u32,
-                            limits(4, capacity)?.key_chunk,
+                            limits(verify_rows, capacity)?.key_chunk,
                         )?
                         .bytes as usize,
                     );
@@ -938,17 +946,17 @@ impl Engine {
         )?;
         let rows = budget.plan.chunk;
         ensure!(
-            !reserve_mtp || rows >= 5,
-            "MTP workspace cannot fit five verification rows"
+            !reserve_mtp || rows >= verify_rows,
+            "MTP chunk {rows} cannot fit {verify_rows} verification rows"
         );
         let target_workspace = Runtime::workspace(rows, capacity, gdn_policy)?.max(
             if settings.kv_format == crate::kv::KvFormat::Bf16 {
                 0
             } else {
                 crate::op_contract::AttentionWorkspace::q38(
-                    4,
+                    verify_rows as u32,
                     capacity as u32,
-                    limits(4, capacity)?.key_chunk,
+                    limits(verify_rows, capacity)?.key_chunk,
                 )?
                 .bytes as usize
             },
@@ -1042,6 +1050,7 @@ impl Engine {
             arena,
             scratch_buffer,
             kv_scratch,
+            verify_rows,
         )?);
         engine.prepare(1)?;
         engine.prepare_prefill_plans()?;

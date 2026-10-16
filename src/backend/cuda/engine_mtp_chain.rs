@@ -211,7 +211,7 @@ impl Backend for Bound<'_> {
         let c = &mut self.chain;
         let s = &e.device.stream;
         ensure!(
-            rows <= 5 && e.position > 0 && c.cursor == e.position - 1,
+            rows <= c.options.depth + 1 && e.position > 0 && c.cursor == e.position - 1,
             "MTP checkpoint cursor mismatch"
         );
         c.saved.position = None;

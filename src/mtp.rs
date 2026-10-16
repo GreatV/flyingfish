@@ -9,6 +9,8 @@ use anyhow::{Context, Result, ensure};
 pub mod batched;
 pub mod transaction;
 
+pub(crate) const MAX_VERIFY_ROWS: usize = 5;
+
 /// Target verification used for a complete MTP request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub enum VerifyPolicy {
@@ -43,11 +45,23 @@ pub struct MtpOptions {
 }
 impl MtpOptions {
     pub fn validate(self) -> Result<()> {
+        self.verify_rows(None).map(|_| ())
+    }
+
+    pub(crate) fn verify_rows(self, chunk: Option<usize>) -> Result<usize> {
         ensure!(
-            (1..=4).contains(&self.depth),
+            (1..MAX_VERIFY_ROWS).contains(&self.depth),
             "MTP chain depth must be 1..=4"
         );
-        Ok(())
+        let rows = self.depth + 1;
+        if let Some(chunk) = chunk {
+            ensure!(
+                chunk >= rows,
+                "MTP chunk {chunk} cannot fit {rows} verification rows for depth {}",
+                self.depth
+            );
+        }
+        Ok(rows)
     }
 }
 
@@ -399,6 +413,23 @@ pub fn teacher_forced_rows(sequence: &[u32]) -> Result<Vec<MtpRow>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn verify_rows_fit_the_selected_depth_and_chunk() -> Result<()> {
+        for depth in 1..MAX_VERIFY_ROWS {
+            let options = MtpOptions {
+                depth,
+                hidden_tap: MtpHiddenTap::PostFinalNorm,
+                recurrent_tap: MtpRecurrentTap::PostMtpNorm,
+                graph: false,
+            };
+            assert_eq!(options.verify_rows(None)?, depth + 1);
+            assert_eq!(options.verify_rows(Some(depth + 1))?, depth + 1);
+            assert!(options.verify_rows(Some(depth)).is_err());
+            assert_eq!(options.verify_rows(Some(4)).is_ok(), depth <= 3);
+        }
+        Ok(())
+    }
+
     fn spec() -> ModelSpec {
         ModelSpec::qwen(
             &serde_json::from_str(include_str!("../tests/data/q38-config.json")).unwrap(),
