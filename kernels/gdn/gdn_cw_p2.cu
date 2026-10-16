@@ -1,6 +1,6 @@
 // Q38 GDN chunkwise prefill, the P2 SPLIT of the precision protocol P1 core, C = 64,
 // module gdn/gdn_cw_p2. gdn/gdn_chunkwise_p1 runs one kernel per step; this file runs
-// three, with the same fp32 accumulators, the same bf16 RNE rounding points, the same
+// two, with the same fp32 accumulators, the same bf16 RNE rounding points, the same
 // mma fragment staging and the same loop and accumulation orders, so the two agree bit
 // for bit. Only the kernel boundaries and the placement of the materialized products
 // change.
@@ -52,7 +52,7 @@
 #define P2_A_LD    68                    // sA row stride, floats (+4 off 64)
 #define P2_T_LD    72                    // sT row stride, bf16 (+8 off 64)
 
-// One arena for all three stages, in order: sA | sT | sV | sVn | sG | sBeta | sSc; it is
+// One arena for both stages, in order: sA | sT | sV | sVn | sG | sBeta | sSc; it is
 // P1's s4 arena (gdn_cw_p1.cu :24-26), the largest of the split set.
 #define P2_SMEM_BYTES GDN_CW_P2_SMEM_BYTES
 
@@ -282,7 +282,7 @@ __device__ __forceinline__ int p2_valid_rows(const GdnMeta* meta, int valid_rows
 
 // ---- stage A ------------------------------------------------------------------------
 
-// One CTA per (chunk, head). No S dependency: everything stage H and stage O read is
+// One CTA per (chunk, head). No S dependency: everything stage H reads is
 // written here. The host grid is ceil(max_rows / P2_C) wide, so a tail step leaves spare
 // CTAs, and they exit before the first barrier.
 extern "C" __global__ __launch_bounds__(P2_THREADS, 1)
@@ -619,7 +619,7 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
             __float2bfloat16_rn(sA[r * P2_A_LD + cc]);
     }
 
-    // ---- the FP32[64] vectors stage H and stage O read.
+    // ---- the FP32[64] vectors stage H reads.
     float* const wGc = reinterpret_cast<float*>(slot + P2_OFF_GC);
     float* const wBe = reinterpret_cast<float*>(slot + P2_OFF_BE);
     float* const wSc = reinterpret_cast<float*>(slot + P2_OFF_SC);
@@ -634,8 +634,9 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
 // ---- stage H ------------------------------------------------------------------------
 
 // One CTA per (32-wide value block, head), the chunk loop in order, S[:, j0:j0+32] in
-// registers. q, k, beta and g are part of the common stage signature: this stage reads
-// K for the decay, q for the out contraction, and the ws slot; v and beta are not read.
+// registers. This stage reads q for the out contraction, k for the decay, the state S,
+// the out buffer and the ws slot; v, beta and g are part of the common stage signature
+// and are not read.
 extern "C" __global__ __launch_bounds__(P2_THREADS, 1)
 void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
                        const __nv_bfloat16* __restrict__ k,

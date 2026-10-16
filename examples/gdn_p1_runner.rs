@@ -1,8 +1,8 @@
 //! GDN chunkwise gate runner over the frozen `--package` bytes (MANIFEST.json, inputs/*.f32, truth/*.f64, gate_basis.json), every array SHA-verified before use: numerics against the FP64 oracle at the pre-registered 1.25x band on out_max_abs, out_rel_rms and state_rel_rms with a frac_le_1ulp floor at model - 0.02 and one passing multi-chunk fixture per C, kernel timing against a NULL band computed and WRITTEN before any P1 comparison (max(0.03, exp(3*SD(null log ratios)) - 1, quantisation/batch), 12 paired ABBA blocks, t CI at Bonferroni alpha = 0.05/9), bit-identity, and end-to-end engine timing; `--stub` runs the whole pipeline with no CUDA device and its numerics are EXPECTED to fail the 1.25x comparison.
 //!
 //! `--route` selects the core: `p1` (default) launches the fused `gdn_chunkwise_p1_core_s*`
-//! entry points once per value split; `p2` launches the chunkwise-P2 split's three stages
-//! (A, H, O) over one workspace slot. The P2 split has a single configuration -- its
+//! entry point once per value split; `p2` launches the chunkwise-P2 split's two stages
+//! (A, H) over one workspace slot. The P2 split has a single configuration -- its
 //! stage-H value strip is 32 columns, P1's s4 -- so `--s` is accepted and IGNORED under
 //! `--route p2`, and both routes write their dumps under the same file names, so the two
 //! run directories can be byte-compared pair by pair.
@@ -286,7 +286,7 @@ enum Clock {
 }
 
 /// Which core the phase launches: the fused P1 core, one launch per value split, or the
-/// chunkwise-P2 split, three launches (stage A, stage H, stage O) over a workspace slot.
+/// chunkwise-P2 split, two launches (stage A, stage H) over a workspace slot.
 ///
 /// The P2 split has ONE configuration: its stage-H value strip is 32 columns wide, which
 /// is P1's s4. `--s` is therefore accepted and IGNORED under `--route p2`, and every
@@ -1976,7 +1976,7 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
     };
     let comparison_label: &'static str = match args.route {
         Route::P1 => "P1 core vs the main GDN core",
-        Route::P2 => "chunkwise-P2 split (stages A, H, O) vs the main GDN core",
+        Route::P2 => "chunkwise-P2 split (stages A, H) vs the main GDN core",
     };
     // Pass 1: every split's NULL band is measured AND WRITTEN before any candidate leg
     // runs, so `computed_before_any_p1_comparison` is true for every split.
@@ -2015,26 +2015,6 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
             },
         );
         let series = summarise(&p1_blocks, args.blocks as usize * 4, comparison_label);
-        // The per-stage sidecar: one (A, H) ms pair per timed P2 candidate leg, in leg
-        // order; descriptive, not part of the band or the CI.
-        #[cfg(feature = "cuda")]
-        if args.route == Route::P2 {
-            let records = P2_STAGE_MS.with(|acc| std::mem::take(&mut *acc.borrow_mut()));
-            if !records.is_empty() {
-                let sidecar = serde_json::json!({
-                    "schema": "gdn-p2-stage-timing/1",
-                    "case": fx.name,
-                    "c": args.c,
-                    "s": s,
-                    "legs": records,
-                });
-                let path = args
-                    .run_dir
-                    .join(format!("STAGE_TIMING.C{}.s{s}.json", args.c));
-                std::fs::write(&path, serde_json::to_string_pretty(&sidecar)?.as_bytes())
-                    .with_context(|| format!("write {}", path.display()))?;
-            }
-        }
         let unfinites = p1_blocks
             .iter()
             .filter(|b| !(b.log_ratio.is_finite() && b.a_ms.is_finite() && b.b_ms.is_finite()))
@@ -2152,19 +2132,10 @@ fn time_leg(
     match gpu {
         None => Ok(stub_duration(which, s)),
         #[cfg(feature = "cuda")]
-        Some(gpu) => gpu.time(which, fx, arrays, s).map(|(ms, _)| ms),
+        Some(gpu) => gpu.time(which, fx, arrays, s),
         #[cfg(not(feature = "cuda"))]
         Some(_) => anyhow::bail!("the CUDA clock needs the crate's cuda feature"),
     }
-}
-
-// Per-stage (A, H) milliseconds of every timed P2 candidate leg, in leg order — the
-// sidecar the E curve reports per stage. Only the candidate legs run P2, so the
-// accumulator is empty across the null pass.
-#[cfg(feature = "cuda")]
-thread_local! {
-    static P2_STAGE_MS: std::cell::RefCell<Vec<[f64; 2]>> =
-        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Documented stub durations in milliseconds: distinct fixed bases per core and a fixed
@@ -2173,7 +2144,7 @@ fn stub_duration(which: Which, s: u32) -> f64 {
     let base = match which {
         Which::Main => 4.07,
         Which::P1 => 4.07 / (s as f64).sqrt(),
-        // The split runs three launches per chunk-row tile, so its stub carries the
+        // The split runs two launches per chunk-row tile, so its stub carries the
         // same 32-column strip cost as the fused s4 core; the NUMBERS are not a
         // measurement either way.
         Which::P2 => 4.07 / (P2_SPLIT_TAG as f64).sqrt(),
@@ -2594,7 +2565,7 @@ struct Gpu {
     p1: [cudarc::driver::CudaFunction; 3],
     /// gdn_prep_fp32, the widen the P1 reference arm runs over the derived BF16 sources.
     prep: cudarc::driver::CudaFunction,
-    /// The three chunkwise-P2 stages, loaded only under `--route p2`.
+    /// The two chunkwise-P2 stages, loaded only under `--route p2`.
     p2: Option<[cudarc::driver::CudaFunction; 2]>,
     main: cudarc::driver::CudaFunction,
     device_info: DeviceInfo,
@@ -2648,7 +2619,7 @@ impl Gpu {
             block_dim: (1, 1, 1),
             shared_mem_bytes: 0,
         };
-        // The split's three entry points, loaded for its route only: a p1 run must not
+        // The split's two entry points, loaded for its route only: a p1 run must not
         // need the P2 cubin to be present.
         let p2 = if route == Route::P2 {
             let p2_mod = load_module(&ctx, P2_MODULE)?;
@@ -2781,25 +2752,20 @@ impl Gpu {
         Ok((widened, state))
     }
 
-    /// The three chunkwise-P2 launches for one case, in the order the binder issues them
+    /// The two chunkwise-P2 launches for one case, in the order the binder issues them
     /// (`GdnPlan::gdn_cw_p2_step`, src/backend/cuda/gdn.rs): stage A fills the workspace
-    /// slot, stage H walks the chunks over one 32-column value strip, stage O contracts
+    /// slot, stage H walks the chunks over one 32-column value strip and contracts
     /// the slot and writes `out`. The grids are the binder's derivation -- one CTA per
     /// (chunk, head) for A and O, DV/32 for H -- and the slot size is the planner's. The
     /// launches go on `stream`, so the identity leg can enqueue the perturbation on a
     /// second one exactly as it does for P1.
     #[cfg(feature = "cuda")]
-    fn launch_p2(
-        &self,
-        stream: &cudarc::driver::CudaStream,
-        case: &mut P2Case<'_>,
-        marks: Option<(&cudarc::driver::CudaEvent, &cudarc::driver::CudaEvent)>,
-    ) -> Result<()> {
+    fn launch_p2(&self, stream: &cudarc::driver::CudaStream, case: &mut P2Case<'_>) -> Result<()> {
         use cudarc::driver::{DevicePtr, LaunchConfig, PushKernelArg as _};
         let stages = self
             .p2
             .as_ref()
-            .context("--route p2 needs the three gdn_cw_p2 stage entry points")?;
+            .context("--route p2 needs the two gdn_cw_p2 stage entry points")?;
         let heads = case.heads;
         let nchunk = u32::try_from(case.m)
             .context("live rows")?
@@ -2849,9 +2815,6 @@ impl Gpu {
                 .arg(&stage.valid_rows)
                 .arg(&stage.v_row_stride)
                 .launch(per_chunk)?;
-            if let Some((m_a, _)) = marks {
-                m_a.record(stream)?;
-            }
             stream
                 .launch_builder(&stages[1])
                 .arg(&stage.q)
@@ -2865,14 +2828,11 @@ impl Gpu {
                 .arg(&stage.meta)
                 .arg(&stage.valid_rows)
                 .launch(per_value_block)?;
-            if let Some((_, m_h)) = marks {
-                m_h.record(stream)?;
-            }
         }
         Ok(())
     }
 
-    /// The slot a case's three stages run in, sized by the binder's planner.
+    /// The slot a case's stages run in, sized by the binder's planner.
     #[cfg(feature = "cuda")]
     fn p2_workspace(&self, m: usize) -> Result<cudarc::driver::CudaSlice<u8>> {
         let bytes = route_workspace_bytes(Route::P2, u32::try_from(m).context("live rows")?)?;
@@ -2880,7 +2840,7 @@ impl Gpu {
         Ok(self.stream.alloc_zeros::<u8>(bytes as usize)?)
     }
 
-    /// Allocate, upload, launch the three P2 stages, download; every leg starts from S0.
+    /// Allocate, upload, launch the P2 stages, download; every leg starts from S0.
     #[cfg(feature = "cuda")]
     fn run_p2(&self, fx: &Fixture, arrays: &CaseArrays) -> Result<(Vec<f32>, Vec<f32>)> {
         let m = fx.m;
@@ -2911,14 +2871,14 @@ impl Gpu {
             m,
             heads,
         };
-        self.launch_p2(&self.stream, &mut case, None)?;
+        self.launch_p2(&self.stream, &mut case)?;
         let out: Vec<half::bf16> = self.stream.clone_dtoh(&dout)?;
         let state: Vec<f32> = self.stream.clone_dtoh(&ds)?;
         let widened: Vec<f32> = out.iter().map(|b| b.to_f32()).collect();
         Ok((widened, state))
     }
 
-    /// Launch the three P2 stages `runs` times from IDENTICAL device inputs, digesting out
+    /// Launch the P2 stages `runs` times from IDENTICAL device inputs, digesting out
     /// and state after every launch; each run re-uploads S0, zeroes the out buffer and
     /// takes a freshly zeroed slot, so no stage reads what the previous run left.
     #[cfg(feature = "cuda")]
@@ -2971,7 +2931,7 @@ impl Gpu {
                     m,
                     heads,
                 };
-                self.launch_p2(&perturb_stream, &mut filler, None)?;
+                self.launch_p2(&perturb_stream, &mut filler)?;
             }
             let mut case = P2Case {
                 dq: &dq,
@@ -2986,7 +2946,7 @@ impl Gpu {
                 m,
                 heads,
             };
-            self.launch_p2(&self.stream, &mut case, None)?;
+            self.launch_p2(&self.stream, &mut case)?;
             self.stream.synchronize()?;
             perturb_stream.synchronize()?;
             let out: Vec<half::bf16> = self.stream.clone_dtoh(&dout)?;
@@ -3106,7 +3066,7 @@ impl Gpu {
         ])?)
     }
 
-    fn time(&self, which: Which, fx: &Fixture, arrays: &CaseArrays, s: u32) -> Result<(f64, bool)> {
+    fn time(&self, which: Which, fx: &Fixture, arrays: &CaseArrays, s: u32) -> Result<f64> {
         use cudarc::driver::{LaunchConfig, PushKernelArg as _, sys};
         let m = fx.m;
         let heads = fx.arrays["q"].shape[1];
@@ -3145,16 +3105,6 @@ impl Gpu {
             .ctx
             .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
         start.record(&self.stream)?;
-        let marks = if which == Which::P2 {
-            Some((
-                self.ctx
-                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?,
-                self.ctx
-                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?,
-            ))
-        } else {
-            None
-        };
         unsafe {
             match which {
                 Which::Main => {
@@ -3193,7 +3143,7 @@ impl Gpu {
                         m,
                         heads: heads as u32,
                     };
-                    self.launch_p2(&self.stream, &mut case, marks.as_ref().map(|(a, h)| (a, h)))?;
+                    self.launch_p2(&self.stream, &mut case)?;
                 }
                 Which::P1 => {
                     let idx = match s {
@@ -3228,12 +3178,7 @@ impl Gpu {
         self.stream.synchronize()?;
         let ms = start.elapsed_ms(&end)? as f64;
         ensure!(ms.is_finite() && ms > 0.0, "event pair gave {ms} ms");
-        if let Some((m_a, m_h)) = marks.as_ref() {
-            let a = start.elapsed_ms(m_a)? as f64;
-            let h = m_a.elapsed_ms(m_h)? as f64;
-            P2_STAGE_MS.with(|acc| acc.borrow_mut().push([a, h]));
-        }
-        Ok((ms, marks.is_some()))
+        Ok(ms)
     }
 }
 
@@ -3688,7 +3633,7 @@ mod tests {
         assert!(err.to_string().contains("C64"), "{err}");
     }
 
-    /// The P2 slot the three stages run in is the planner's number, and it is one
+    /// The P2 slot the stages run in is the planner's number, and it is one
     /// (chunk, head) slot per 64 rows. Only the CUDA leg allocates it.
     #[cfg(feature = "cuda")]
     #[test]

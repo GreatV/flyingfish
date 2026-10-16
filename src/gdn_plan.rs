@@ -73,7 +73,7 @@ pub const fn cw_p2_bytes(max_rows: u32) -> u64 {
     chunks as u64 * 48 * CW_P2_SLOT_BYTES
 }
 
-/// The chunkwise-P2 stage ABI: field order IS the argument order of all three
+/// The chunkwise-P2 stage ABI: field order IS the argument order of both
 /// entries, as declared in `kernels/gdn/gdn_cw_p2.cu`.
 #[derive(Copy, Clone)]
 pub struct P2StageArgs {
@@ -103,7 +103,7 @@ pub struct GdnPolicy {
     /// Protocol §A value split of the production chunkwise-P1 prefill core, 0 = the
     /// shipped recursive core; qualified for arch 89 with 128 SMs, 0 elsewhere.
     prefill_p1_split: u32,
-    /// The chunkwise-P2 split (three kernels over a workspace slot) replaces the fused
+    /// The chunkwise-P2 split (two kernels over a workspace slot) replaces the fused
     /// P1 core; prepared for arch 89 with 128 SMs.
     cw_p2: bool,
 }
