@@ -77,6 +77,30 @@ pub const fn cw_p2_bytes(max_rows: u32) -> u64 {
     chunks as u64 * 48 * CW_P2_SLOT_BYTES
 }
 
+/// The chunkwise-P2 stage ABI: field order IS the argument order of all three
+/// entries, as declared in `kernels/gdn/gdn_cw_p2.cu`.
+#[derive(Copy, Clone)]
+pub struct P2StageArgs {
+    /// BF16 [M, 16, DK] key heads; the stages expand to the 48 value heads.
+    pub q: u64,
+    /// BF16 [M, 16, DK] key heads.
+    pub k: u64,
+    /// BF16 [M, 48, 128] rows, `v_row_stride` elements apart.
+    pub v: u64,
+    /// FP32 [M, 48]: gdn_beta_widen's output.
+    pub beta: u64,
+    /// FP32 [M, 48]: gdn_gates' output.
+    pub g: u64,
+    /// The workspace slot base, or the state for stage H.
+    pub ws: u64,
+    /// The sequence metadata (eight i32).
+    pub meta: u64,
+    /// 0, the sentinel that makes the kernel read `meta->valid_rows`.
+    pub valid_rows: i32,
+    /// Stage A only: the element stride between V's rows.
+    pub v_row_stride: u32,
+}
+
 /// Immutable device qualification; no runtime GPU query or tuning in a forward.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct GdnPolicy {
@@ -266,6 +290,9 @@ impl GdnWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stage ABI declaration and the argument counts must agree with each other: the
+    /// struct carries ten fields, A pushes all ten, and H and O push nine (no V stride).
     #[test]
     fn every_prefill_step_above_the_verify_floor_takes_the_chunkwise_core() {
         let qualified = GdnPolicy::for_device(89, 128);

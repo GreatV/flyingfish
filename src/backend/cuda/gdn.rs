@@ -207,6 +207,18 @@ pub(crate) struct GdnPlan {
     ws_p2: u64,
 }
 
+/// The BF16 sources the P2 stages read: Q and K as 16 KEY heads each (the stages do
+/// the GQA expansion), and V as the conv_out column window whose rows are
+/// `v_row_stride` elements apart rather than HEADS*DV. They are arguments, not plan
+/// state.
+#[derive(Copy, Clone)]
+pub(crate) struct P2Sources {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub v_row_stride: u32,
+}
+
 impl GdnPlan {
     pub(crate) fn bind_snapshots(
         &mut self,
@@ -292,6 +304,7 @@ impl GdnPlan {
         stream: &Arc<CudaStream>,
         meta: SeqRef,
         scratch: Scratch,
+        src: P2Sources,
     ) -> Result<()> {
         meta.validate()?;
         scratch.validate(add(self.ws.bytes, self.ws_p2)?)?;
@@ -302,51 +315,61 @@ impl GdnPlan {
             .context("chunkwise P2 stages were not bound by prepare")?;
         let rows = self.max_rows;
         let ws = scratch.ptr;
-        let q = ws_f32_3(self.ws.q_fp32, ws, rows, HV, DK)?;
-        let k = ws_f32_3(self.ws.k_fp32, ws, rows, HV, DK)?;
-        let v = ws_f32_3(self.ws.v_fp32, ws, rows, HV, DV)?;
-        let beta = ws_f32(self.ws.beta_fp32, ws, rows, HV)?;
-        let g = ws_f32(self.ws.g, ws, rows, HV)?;
+        let (q, k, v) = (src.q, src.k, src.v);
+        let beta = ws_f32(self.ws.beta_fp32, ws, rows, HV)?.0.ptr;
+        let g = ws_f32(self.ws.g, ws, rows, HV)?.0.ptr;
         // The slot region starts where the fused layout ends; that end is 256 B aligned
-        // and the host scratch pointer is 256 B aligned, which the stages require.
+        // and the host scratch pointer is 256 B aligned, which the stages require. All
+        // three stages take THIS base as their ws argument.
         let slot = add(ws, self.ws.bytes)?;
+        let stage = crate::gdn_plan::P2StageArgs {
+            q,
+            k,
+            v,
+            beta,
+            g,
+            ws: slot,
+            meta: meta.ptr,
+            valid_rows: 0,
+            v_row_stride: src.v_row_stride,
+        };
         let (a_cfg, h_cfg, o_cfg) = cw_p2_grids(rows);
         unsafe {
             stream
                 .launch_builder(&p2.a)
-                .arg(&q.0.ptr)
-                .arg(&k.0.ptr)
-                .arg(&v.0.ptr)
-                .arg(&beta.0.ptr)
-                .arg(&g.0.ptr)
-                .arg(&slot)
-                .arg(&meta.ptr)
-                // 0 is the sentinel that makes the kernel read `meta->valid_rows`.
-                .arg(&0i32)
+                .arg(&stage.q)
+                .arg(&stage.k)
+                .arg(&stage.v)
+                .arg(&stage.beta)
+                .arg(&stage.g)
+                .arg(&stage.ws)
+                .arg(&stage.meta)
+                .arg(&stage.valid_rows)
+                .arg(&stage.v_row_stride)
                 .launch(a_cfg)?;
             stream
                 .launch_builder(&p2.h)
-                .arg(&q.0.ptr)
-                .arg(&k.0.ptr)
-                .arg(&v.0.ptr)
-                .arg(&beta.0.ptr)
-                .arg(&g.0.ptr)
+                .arg(&stage.q)
+                .arg(&stage.k)
+                .arg(&stage.v)
+                .arg(&stage.beta)
+                .arg(&stage.g)
                 .arg(&self.bindings.s.0.ptr)
                 .arg(&slot)
-                .arg(&meta.ptr)
-                .arg(&0i32)
+                .arg(&stage.meta)
+                .arg(&stage.valid_rows)
                 .launch(h_cfg)?;
             stream
                 .launch_builder(&p2.o)
-                .arg(&q.0.ptr)
-                .arg(&k.0.ptr)
-                .arg(&v.0.ptr)
-                .arg(&beta.0.ptr)
-                .arg(&g.0.ptr)
+                .arg(&stage.q)
+                .arg(&stage.k)
+                .arg(&stage.v)
+                .arg(&stage.beta)
+                .arg(&stage.g)
                 .arg(&slot)
                 .arg(&self.bindings.core_out.0.ptr)
-                .arg(&meta.ptr)
-                .arg(&0i32)
+                .arg(&stage.meta)
+                .arg(&stage.valid_rows)
                 .launch(o_cfg)?;
         }
         Ok(())
@@ -569,6 +592,13 @@ impl GdnOps {
             None
         };
         meta.validate()?;
+        // The P2 plan skips the prep launch, so NOTHING may read the FP32 regions on it.
+        // Prefill is already routed to the P2 arm above; decode must therefore be running
+        // on the separate decode plan, which is bound at one row and carries no split.
+        ensure!(
+            !plan.cw_p2 || phase != ExecutionPhase::Decode,
+            "the chunkwise-P2 plan has no FP32 sources: decode must use the decode plan"
+        );
         ensure!(
             !verify || !plan.cw_p2,
             "chunkwise plan cannot verify; verify keeps the recurrent core"
@@ -693,17 +723,26 @@ impl GdnOps {
             // q/k widened and BOTH GQA-expanded to value heads; Q scaled by 1/sqrt(DK)
             // after the widen. V stays a conv_out column window: the kernel still takes
             // the row stride (conv_dim) as its scalar.
-            stream
-                .launch_builder(&plan.kernels.prep)
-                .arg(&q_bf16.0.ptr)
-                .arg(&k_bf16.0.ptr)
-                .arg(&v_bf16.ptr)
-                .arg(&q_fp32.0.ptr)
-                .arg(&k_fp32.0.ptr)
-                .arg(&v_fp32.0.ptr)
-                .arg(&cd)
-                .arg(&meta.ptr)
-                .launch(plan.prep_cfg)?;
+            //
+            // P2 SKIPS THIS LAUNCH: its stages read the BF16 sources and do the widen, the
+            // GQA expansion and the Q scale at the load sites, so the whole pass is folded
+            // into the stages that consume it. Every OTHER route on this plan -- the
+            // shipped core, the recurrent step and the decode rstep, all of which read
+            // these FP32 buffers -- still gets them, and the decode plan is a separate
+            // plan whose cw_p2 is false.
+            if !plan.cw_p2 {
+                stream
+                    .launch_builder(&plan.kernels.prep)
+                    .arg(&q_bf16.0.ptr)
+                    .arg(&k_bf16.0.ptr)
+                    .arg(&v_bf16.ptr)
+                    .arg(&q_fp32.0.ptr)
+                    .arg(&k_fp32.0.ptr)
+                    .arg(&v_fp32.0.ptr)
+                    .arg(&cd)
+                    .arg(&meta.ptr)
+                    .launch(plan.prep_cfg)?;
+            }
         }
         // ---- 7. the core. PHASE selects it; never a host valid_rows.
         // The builder must be one expression: `launch_builder` returns a value that
@@ -723,7 +762,17 @@ impl GdnOps {
         unsafe {
             match phase {
                 ExecutionPhase::Prefill if plan.cw_p2 => {
-                    plan.gdn_cw_p2_step(stream, meta, scratch)?;
+                    plan.gdn_cw_p2_step(
+                        stream,
+                        meta,
+                        scratch,
+                        P2Sources {
+                            q: q_bf16.0.ptr,
+                            k: k_bf16.0.ptr,
+                            v: v_bf16.ptr,
+                            v_row_stride: cd,
+                        },
+                    )?;
                 }
                 ExecutionPhase::Prefill if snapshots.is_some() => {
                     let (state, _) = snapshots.context("missing snapshot bindings")?;
