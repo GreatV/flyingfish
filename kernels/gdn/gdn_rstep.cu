@@ -147,10 +147,8 @@ void gdn_rstep_core_t(
     }
     __syncthreads();
 
-    // The last verify row's snapshot duplicates the final S write-back; select_prefix
-    // never reads it (snapshot_row requires rows < live). float2 stores: TC is even and
-    // every (j0 + jb) is even, so each store covers a full aligned pair -- a warp's
-    // 32 x 8 B stores cover a contiguous 256 B, one access per 32 B sector.
+    // The last verify row is not snapshotted; snapshot_row reads rows < live only.
+    // float2 stores: TC and every (j0 + jb) are even.
     if (SNAPSHOT && r + 1 < valid_rows) {
         static_assert(TC % 2 == 0, "float2 snapshot stores need even TC");
         #pragma unroll
