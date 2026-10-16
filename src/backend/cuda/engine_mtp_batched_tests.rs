@@ -185,7 +185,11 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
             for h5 in [MtpRecurrentTap::PreMtpNorm, MtpRecurrentTap::PostMtpNorm] {
                 configure(&mut e, options(k, h2, h5, false))?;
                 e.mtp_prefill(&ids)?;
-                save(&mut e)?;
+                save(&mut e)
+                    .with_context(|| format!("BF16 K{k} {h2:?}/{h5:?} five-row checkpoint save"))?;
+                if k == 1 && h2 == MtpHiddenTap::PreFinalNorm && h5 == MtpRecurrentTap::PreMtpNorm {
+                    println!("MTP_CHECKPOINT_CAPACITY_PASS selected_depth=1 saved_rows=5");
+                }
                 let full = proposals(&mut e, k)?;
                 let anchor = e.token()?;
                 for j in 0..=k {

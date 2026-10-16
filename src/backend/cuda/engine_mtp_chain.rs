@@ -211,7 +211,12 @@ impl Backend for Bound<'_> {
         let c = &mut self.chain;
         let s = &e.device.stream;
         ensure!(
-            rows <= c.options.depth + 1 && e.position > 0 && c.cursor == e.position - 1,
+            (1..=crate::mtp::MAX_VERIFY_ROWS).contains(&rows),
+            "MTP checkpoint rows {rows} exceed journal capacity {}",
+            crate::mtp::MAX_VERIFY_ROWS
+        );
+        ensure!(
+            e.position > 0 && c.cursor == e.position - 1,
             "MTP checkpoint cursor mismatch"
         );
         c.saved.position = None;
