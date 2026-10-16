@@ -2015,6 +2015,26 @@ fn run_timing(args: &TimingArgs) -> Result<()> {
             },
         );
         let series = summarise(&p1_blocks, args.blocks as usize * 4, comparison_label);
+        // The per-stage sidecar: one (A, H) ms pair per timed P2 candidate leg, in leg
+        // order; descriptive, not part of the band or the CI.
+        #[cfg(feature = "cuda")]
+        if args.route == Route::P2 {
+            let records = P2_STAGE_MS.with(|acc| std::mem::take(&mut *acc.borrow_mut()));
+            if !records.is_empty() {
+                let sidecar = serde_json::json!({
+                    "schema": "gdn-p2-stage-timing/1",
+                    "case": fx.name,
+                    "c": args.c,
+                    "s": s,
+                    "legs": records,
+                });
+                let path = args
+                    .run_dir
+                    .join(format!("STAGE_TIMING.C{}.s{s}.json", args.c));
+                std::fs::write(&path, serde_json::to_string_pretty(&sidecar)?.as_bytes())
+                    .with_context(|| format!("write {}", path.display()))?;
+            }
+        }
         let unfinites = p1_blocks
             .iter()
             .filter(|b| !(b.log_ratio.is_finite() && b.a_ms.is_finite() && b.b_ms.is_finite()))
@@ -2132,10 +2152,19 @@ fn time_leg(
     match gpu {
         None => Ok(stub_duration(which, s)),
         #[cfg(feature = "cuda")]
-        Some(gpu) => gpu.time(which, fx, arrays, s),
+        Some(gpu) => gpu.time(which, fx, arrays, s).map(|(ms, _)| ms),
         #[cfg(not(feature = "cuda"))]
         Some(_) => anyhow::bail!("the CUDA clock needs the crate's cuda feature"),
     }
+}
+
+// Per-stage (A, H) milliseconds of every timed P2 candidate leg, in leg order — the
+// sidecar the E curve reports per stage. Only the candidate legs run P2, so the
+// accumulator is empty across the null pass.
+#[cfg(feature = "cuda")]
+thread_local! {
+    static P2_STAGE_MS: std::cell::RefCell<Vec<[f64; 2]>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Documented stub durations in milliseconds: distinct fixed bases per core and a fixed
@@ -2566,7 +2595,7 @@ struct Gpu {
     /// gdn_prep_fp32, the widen the P1 reference arm runs over the derived BF16 sources.
     prep: cudarc::driver::CudaFunction,
     /// The three chunkwise-P2 stages, loaded only under `--route p2`.
-    p2: Option<[cudarc::driver::CudaFunction; 3]>,
+    p2: Option<[cudarc::driver::CudaFunction; 2]>,
     main: cudarc::driver::CudaFunction,
     device_info: DeviceInfo,
 }
@@ -2626,7 +2655,6 @@ impl Gpu {
             Some([
                 p2_mod.load_function("gdn_cw_p2_stage_a")?,
                 p2_mod.load_function("gdn_cw_p2_stage_h")?,
-                p2_mod.load_function("gdn_cw_p2_stage_o")?,
             ])
         } else {
             None
@@ -2761,7 +2789,12 @@ impl Gpu {
     /// launches go on `stream`, so the identity leg can enqueue the perturbation on a
     /// second one exactly as it does for P1.
     #[cfg(feature = "cuda")]
-    fn launch_p2(&self, stream: &cudarc::driver::CudaStream, case: &mut P2Case<'_>) -> Result<()> {
+    fn launch_p2(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        case: &mut P2Case<'_>,
+        marks: Option<(&cudarc::driver::CudaEvent, &cudarc::driver::CudaEvent)>,
+    ) -> Result<()> {
         use cudarc::driver::{DevicePtr, LaunchConfig, PushKernelArg as _};
         let stages = self
             .p2
@@ -2816,6 +2849,9 @@ impl Gpu {
                 .arg(&stage.valid_rows)
                 .arg(&stage.v_row_stride)
                 .launch(per_chunk)?;
+            if let Some((m_a, _)) = marks {
+                m_a.record(stream)?;
+            }
             stream
                 .launch_builder(&stages[1])
                 .arg(&stage.q)
@@ -2824,22 +2860,14 @@ impl Gpu {
                 .arg(&stage.beta)
                 .arg(&stage.g)
                 .arg(&*case.ds)
+                .arg(&*case.dout)
                 .arg(&stage.ws)
                 .arg(&stage.meta)
                 .arg(&stage.valid_rows)
                 .launch(per_value_block)?;
-            stream
-                .launch_builder(&stages[2])
-                .arg(&stage.q)
-                .arg(&stage.k)
-                .arg(&stage.v)
-                .arg(&stage.beta)
-                .arg(&stage.g)
-                .arg(&stage.ws)
-                .arg(&*case.dout)
-                .arg(&stage.meta)
-                .arg(&stage.valid_rows)
-                .launch(per_chunk)?;
+            if let Some((_, m_h)) = marks {
+                m_h.record(stream)?;
+            }
         }
         Ok(())
     }
@@ -2883,7 +2911,7 @@ impl Gpu {
             m,
             heads,
         };
-        self.launch_p2(&self.stream, &mut case)?;
+        self.launch_p2(&self.stream, &mut case, None)?;
         let out: Vec<half::bf16> = self.stream.clone_dtoh(&dout)?;
         let state: Vec<f32> = self.stream.clone_dtoh(&ds)?;
         let widened: Vec<f32> = out.iter().map(|b| b.to_f32()).collect();
@@ -2910,7 +2938,7 @@ impl Gpu {
         let dbeta = self.stream.clone_htod(&arrays.beta)?;
         let dg = self.stream.clone_htod(&arrays.g)?;
         let meta = self.meta(fx)?;
-        let entry = "gdn_cw_p2_stage_a+h+o";
+        let entry = "gdn_cw_p2_stage_a+h";
         // The perturbation's own buffers on a second stream; the measured launch is
         // enqueued while the filler is still running.
         let perturb_stream = self.ctx.new_stream()?;
@@ -2943,7 +2971,7 @@ impl Gpu {
                     m,
                     heads,
                 };
-                self.launch_p2(&perturb_stream, &mut filler)?;
+                self.launch_p2(&perturb_stream, &mut filler, None)?;
             }
             let mut case = P2Case {
                 dq: &dq,
@@ -2958,7 +2986,7 @@ impl Gpu {
                 m,
                 heads,
             };
-            self.launch_p2(&self.stream, &mut case)?;
+            self.launch_p2(&self.stream, &mut case, None)?;
             self.stream.synchronize()?;
             perturb_stream.synchronize()?;
             let out: Vec<half::bf16> = self.stream.clone_dtoh(&dout)?;
@@ -3078,7 +3106,7 @@ impl Gpu {
         ])?)
     }
 
-    fn time(&self, which: Which, fx: &Fixture, arrays: &CaseArrays, s: u32) -> Result<f64> {
+    fn time(&self, which: Which, fx: &Fixture, arrays: &CaseArrays, s: u32) -> Result<(f64, bool)> {
         use cudarc::driver::{LaunchConfig, PushKernelArg as _, sys};
         let m = fx.m;
         let heads = fx.arrays["q"].shape[1];
@@ -3117,6 +3145,16 @@ impl Gpu {
             .ctx
             .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
         start.record(&self.stream)?;
+        let marks = if which == Which::P2 {
+            Some((
+                self.ctx
+                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?,
+                self.ctx
+                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?,
+            ))
+        } else {
+            None
+        };
         unsafe {
             match which {
                 Which::Main => {
@@ -3155,7 +3193,7 @@ impl Gpu {
                         m,
                         heads: heads as u32,
                     };
-                    self.launch_p2(&self.stream, &mut case)?;
+                    self.launch_p2(&self.stream, &mut case, marks.as_ref().map(|(a, h)| (a, h)))?;
                 }
                 Which::P1 => {
                     let idx = match s {
@@ -3190,7 +3228,12 @@ impl Gpu {
         self.stream.synchronize()?;
         let ms = start.elapsed_ms(&end)? as f64;
         ensure!(ms.is_finite() && ms > 0.0, "event pair gave {ms} ms");
-        Ok(ms)
+        if let Some((m_a, m_h)) = marks.as_ref() {
+            let a = start.elapsed_ms(m_a)? as f64;
+            let h = m_a.elapsed_ms(m_h)? as f64;
+            P2_STAGE_MS.with(|acc| acc.borrow_mut().push([a, h]));
+        }
+        Ok((ms, marks.is_some()))
     }
 }
 

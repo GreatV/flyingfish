@@ -18,21 +18,16 @@
 //             with S[:, j0:j0+32] in registers (:246-258), WS = W@S (:435-487), v_new =
 //             U - WS (:492-495), the pre-update S snapshot, and the state update
 //             (:596-630). S is written back at :634-645.
-//   stage O  grid (nchunk, 48): AD = qk@v_new and QS = (q.e^G)@S_{t-1} in 32-wide tiles
-//             (:536-547 and :550-584), out = BF16_RNE(QS+AD) (:587-594).
 //
 // The workspace slot of one (chunk, head) is GDN_CW_P2_SLOT_BYTES at
 // ws + (chunk * 48 + head) * GDN_CW_P2_SLOT_BYTES, in this byte order:
 //   P2_OFF_W   0      W  bf16[64][128]  row stride 128   A writes, H reads
 //   P2_OFF_U   16384  U  fp32[64][128]  row stride 128   A writes, H reads
-//   P2_OFF_QK  49152  qk bf16[64][72]   row stride 72    A writes, O reads
-//   P2_OFF_VN  58368  vn bf16[64][128]  row stride 128   H writes, O reads
-//   P2_OFF_SN  74752  Sn fp32[128][128] row stride 128   H writes, O reads
-//   P2_OFF_GC  140288 Gc fp32[64]                        A writes, H and O read
-//   P2_OFF_BE  140544 Be fp32[64]                        A writes
-//   P2_OFF_SC  140800 Sc fp32[64]                        A writes
-// The qk row stride is P1_T_LD so p1_a_sbf reads it in place, and Sn carries the full
-// [DK][DV] width with stage H writing only its own 32 columns.
+//   P2_OFF_QK  49152  qk bf16[64][72]   row stride 72    A writes, H reads
+//   P2_OFF_GC  58368  Gc fp32[64]                        A writes, H reads
+//   P2_OFF_BE  58624  Be fp32[64]                        A writes
+//   P2_OFF_SC  58880  Sc fp32[64]                        A writes
+// The qk row stride is P1_T_LD so p1_a_sbf reads it in place.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
@@ -64,20 +59,18 @@
 static_assert(P2_SMEM_BYTES == P2_C * P2_A_LD * 4 + P2_C * P2_T_LD * 2 + P2_C * P2_VL * 2
                   + P2_C * 32 * 4 + 3 * P2_C * 4,
               "kernel arena and gdn_cw_p2_layout.h disagree on the shared-memory size");
-static_assert(GDN_CW_P2_SLOT_BYTES == 16384 + 32768 + 9216 + 16384 + 65536 + 3 * 256,
+static_assert(GDN_CW_P2_SLOT_BYTES == 16384 + 32768 + 9216 + 3 * 256,
               "workspace slot size disagrees with the field offsets below");
 
 #define P2_SLOT_BYTES GDN_CW_P2_SLOT_BYTES
 #define P2_OFF_W      0
 #define P2_OFF_U      16384
 #define P2_OFF_QK     49152
-#define P2_OFF_VN     58368
-#define P2_OFF_SN     74752
-#define P2_OFF_GC     140288
-#define P2_OFF_BE     140544
-#define P2_OFF_SC     140800
+#define P2_OFF_GC     58368
+#define P2_OFF_BE     58624
+#define P2_OFF_SC     58880
 
-// The value strip stage H and stage O walk, and the U column tile stage A walks: 32-wide
+// The value strip stage H walks, and the U column tile stage A walks: 32-wide
 // strips are P1's s4, the 8-wide tile is P1's s16 accumulator width.
 #define P2_VW        32
 #define P2_VT        8
@@ -641,8 +634,8 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
 // ---- stage H ------------------------------------------------------------------------
 
 // One CTA per (32-wide value block, head), the chunk loop in order, S[:, j0:j0+32] in
-// registers. q, v, beta and g are part of the common stage signature and are not read:
-// this stage's inputs are K, the state and the ws slot.
+// registers. q, k, beta and g are part of the common stage signature: this stage reads
+// K for the decay, q for the out contraction, and the ws slot; v and beta are not read.
 extern "C" __global__ __launch_bounds__(P2_THREADS, 1)
 void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
                        const __nv_bfloat16* __restrict__ k,
@@ -650,6 +643,7 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
                        const float* __restrict__ beta,
                        const float* __restrict__ g,
                        float* __restrict__ S,            // FP32 [HEADS, DK, DV]
+                       __nv_bfloat16* __restrict__ out,  // BF16 [rows, HEADS, DV]
                        char* __restrict__ ws,
                        const GdnMeta* __restrict__ meta,
                        int valid_rows_in) {
@@ -664,6 +658,7 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
 
     const bool aligned = (reinterpret_cast<uintptr_t>(k)
                           | reinterpret_cast<uintptr_t>(S)
+                          | reinterpret_cast<uintptr_t>(out)
                           | reinterpret_cast<uintptr_t>(ws)) % 256 == 0;
     if (blockDim.x != P2_THREADS || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1
         || gridDim.y != P2_HEADS || gridDim.x * P2_VW != P2_DV || !aligned) {
@@ -682,6 +677,8 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
 
     constexpr size_t rstride = P2_KROW;
     const __nv_bfloat16* const kh = k + (size_t)(head / P2_GQA) * P2_DK;
+    const __nv_bfloat16* const qh = q + (size_t)(head / P2_GQA) * P2_DK;
+    const float qscale = 1.0f / sqrtf((float)P2_DK);
 
     // S[:, j0:j0+VW] stays in REGISTERS for the whole call; every index into Sr is
     // compile-time, which is what keeps the tile out of local memory.
@@ -707,8 +704,8 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
         const __nv_bfloat16* const wW =
             reinterpret_cast<const __nv_bfloat16*>(slot + P2_OFF_W);
         const float* const wU = reinterpret_cast<const float*>(slot + P2_OFF_U);
-        float* const wSn = reinterpret_cast<float*>(slot + P2_OFF_SN);
-        __nv_bfloat16* const wVn = reinterpret_cast<__nv_bfloat16*>(slot + P2_OFF_VN);
+        const __nv_bfloat16* const wqk =
+            reinterpret_cast<const __nv_bfloat16*>(slot + P2_OFF_QK);
         const float* const wGc = reinterpret_cast<const float*>(slot + P2_OFF_GC);
         const float* const wSc = reinterpret_cast<const float*>(slot + P2_OFF_SC);
         for (int r = tid; r < P2_C; r += P2_THREADS) {
@@ -758,28 +755,81 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
             sVn[r * P2_VW + cc] = wU[r * P2_DV + j0 + cc] - sA[r * P2_A_LD + cc];
         }
 
-        // ---- the PRE-update state, in the layout S occupies in gmem ([DK][DV]), which is
-        // what stage O contracts for QS. This CTA writes its own 32 value columns.
-        {
-            float* srow = wSn + (size_t)(warp * 16 + gid) * P2_DV + j0 + t2;
-            #pragma unroll
-            for (int nt = 0; nt < NT; ++nt)
-                #pragma unroll
-                for (int cc = 0; cc < 2; ++cc) {
-                    srow[8 * nt + cc] = Sr[0][nt][cc];
-                    srow[8 * nt + cc + 8 * P2_DV] = Sr[1][nt][cc];
-                }
-        }
-
-        // ---- v_new as the WU-class operand (bf16), for the state update and for the ws
-        // copy stage O contracts.
+        // ---- v_new as the WU-class operand (bf16), staged for the out contraction and
+        // the state update.
         for (int idx = tid; idx < P2_C * P2_VW; idx += P2_THREADS) {
             const int r = idx / P2_VW, cc = idx - r * P2_VW;
             const __nv_bfloat16 e = __float2bfloat16_rn(sVn[r * P2_VW + cc]);
             sV[cc * P2_VL + r] = e;
-            wVn[r * P2_DV + j0 + cc] = e;
         }
         __syncthreads();
+
+        // ---- AD = qk @ v_new, accumulating into sA (the output tile). qk is read from
+        // the ws slot in place (it keeps P2_T_LD). v_new is staged in sV in
+        // [value][chunk] layout — p1_b_sbf packs two consecutive CHUNK values per
+        // register.
+        for (int tile = warp; tile < P2_MT * NT; tile += P2_WARPS) {
+            const int mt = tile / NT, nt = tile - (tile / NT) * NT;
+            float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma unroll
+            for (int ks = 0; ks < P2_C / 16; ++ks) {
+                const AFrag a = p1_a_sbf(wqk, P2_T_LD, mt * 16, ks * 16, gid, t2);
+                const BFrag b = p1_b_sbf(sV, P2_VL, nt * 8 + gid, ks * 16, t2);
+                P2_MMA(d, a, b);
+            }
+            p1_store_f32(sA, P2_A_LD, mt * 16, nt * 8, gid, t2, d);
+        }
+        __syncthreads();
+
+        // ---- QS = (q . e^G) @ S_{t-1} onto AD's tile; the PRE-update state is this
+        // CTA's Sr registers, staged here in bf16 per warp dk-slice exactly as P1
+        // :553-561 does.
+        __syncthreads();
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+            #pragma unroll
+            for (int cc = 0; cc < 2; ++cc) {
+                sV[(8 * nt + t2 + cc) * P2_VLDK + kblk * 16 + gid] =
+                    __float2bfloat16_rn(Sr[0][nt][cc]);
+                sV[(8 * nt + t2 + cc) * P2_VLDK + kblk * 16 + gid + 8] =
+                    __float2bfloat16_rn(Sr[1][nt][cc]);
+            }
+        __syncthreads();
+        // The whole 128-row d_k axis of S is in sV, so the owning warp does the FULL
+        // d_k contraction over the eight 16-wide windows onto AD's tile.
+        for (int tile = warp; tile < P2_MT * NT; tile += P2_WARPS) {
+            const int mt = tile / NT, nt = tile - (tile / NT) * NT;
+            const int cl = mt * 16 + gid, ch = cl + 8;
+            const __nv_bfloat16* al =
+                qh + (size_t)((row0 + cl) < valid_rows ? row0 + cl : row0) * rstride;
+            const __nv_bfloat16* ah =
+                qh + (size_t)((row0 + ch) < valid_rows ? row0 + ch : row0) * rstride;
+            const float sl = (row0 + cl) < valid_rows ? __expf(sG[cl]) : 0.0f;
+            const float sh = (row0 + ch) < valid_rows ? __expf(sG[ch]) : 0.0f;
+            float* o = sA + (size_t)(mt * 16 + gid) * P2_A_LD + nt * 8 + t2;
+            float d[4] = {o[0], o[1], o[8 * P2_A_LD], o[8 * P2_A_LD + 1]};
+            #pragma unroll
+            for (int ks = 0; ks < P2_DK / 16; ++ks) {
+                const AFrag a = p1_a_rows(al, ah, ks * 16, t2, qscale, sl, sh);
+                const BFrag b = p1_b_sbf(sV, P2_VLDK, nt * 8 + gid, ks * 16, t2);
+                P2_MMA(d, a, b);
+            }
+            o[0] = d[0];
+            o[1] = d[1];
+            o[8 * P2_A_LD] = d[2];
+            o[8 * P2_A_LD + 1] = d[3];
+        }
+        __syncthreads();
+
+        // ---- out = BF16_RNE(QS + AD)
+        for (int idx = tid; idx < P2_C * P2_VW; idx += P2_THREADS) {
+            const int r = idx / P2_VW, cc = idx - r * P2_VW;
+            const int gr = row0 + r;
+            if (gr < valid_rows)
+                out[((size_t)gr * P2_HEADS + head) * P2_DV + j0 + cc] =
+                    __float2bfloat16_rn(sA[r * P2_A_LD + cc]);
+        }
+        __syncthreads();   // the QS staging overwrote sV; the decay restages it below
 
         // ---- S = S . exp(G_last) + (k . e^{G_last-G})^T @ v_new; the A operand is the
         // TRANSPOSE (fragment rows are d_k indices), so the scale is per column here.
@@ -833,136 +883,3 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
     }
 }
 
-
-// ---- stage O ------------------------------------------------------------------------
-
-// One CTA per (chunk, head), four 32-wide value blocks in sequence, so the whole DV is
-// written. The ws slot's qk, vn, Sn and Gc are the only inputs besides Q.
-extern "C" __global__ __launch_bounds__(P2_THREADS, 1)
-void gdn_cw_p2_stage_o(const __nv_bfloat16* __restrict__ q,
-                       const __nv_bfloat16* __restrict__ k,
-                       const __nv_bfloat16* __restrict__ v,
-                       const float* __restrict__ beta,
-                       const float* __restrict__ g,
-                       char* __restrict__ ws,
-                       __nv_bfloat16* __restrict__ out,   // BF16 [M, HEADS, DV]
-                       const GdnMeta* __restrict__ meta,
-                       int valid_rows_in) {
-    const int head = blockIdx.y;
-    const int chunk = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    const int gid = P2_GID(lane);
-    const int t2 = P2_T2(lane);
-    constexpr int NT = P2_VW / 8;
-
-    const bool aligned = (reinterpret_cast<uintptr_t>(q)
-                          | reinterpret_cast<uintptr_t>(out)
-                          | reinterpret_cast<uintptr_t>(ws)) % 256 == 0;
-    if (blockDim.x != P2_THREADS || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1
-        || gridDim.y != P2_HEADS || !aligned) {
-        __trap();
-        return;
-    }
-    const int valid_rows = p2_valid_rows(meta, valid_rows_in);
-    const int nchunk = (valid_rows + P2_C - 1) / P2_C;
-    if (chunk >= nchunk) return;
-    const int row0 = chunk * P2_C;
-
-    extern __shared__ __align__(16) char p2_smem[];
-    const P2Arena ar = p2_arena(p2_smem);
-    float* const sA = ar.sA;
-    __nv_bfloat16* const sV = ar.sV;
-    float* const sG = ar.sG;
-
-    constexpr size_t rstride = P2_KROW;
-    const __nv_bfloat16* const qh = q + (size_t)(head / P2_GQA) * P2_DK;
-    const float qscale = 1.0f / sqrtf((float)P2_DK);
-
-    const char* const slot = p2_slot(ws, chunk, head);
-    const __nv_bfloat16* const wqk =
-        reinterpret_cast<const __nv_bfloat16*>(slot + P2_OFF_QK);
-    const __nv_bfloat16* const wvn =
-        reinterpret_cast<const __nv_bfloat16*>(slot + P2_OFF_VN);
-    const float* const wSn = reinterpret_cast<const float*>(slot + P2_OFF_SN);
-    const float* const wGc = reinterpret_cast<const float*>(slot + P2_OFF_GC);
-    for (int r = tid; r < P2_C; r += P2_THREADS) sG[r] = wGc[r];
-
-    const int kblk = warp;           // the dk window this warp's S rows belong to
-    for (int blk = 0; blk < P2_DV / P2_VW; ++blk) {
-        const int j0 = blk * P2_VW;
-        // ---- AD = qk @ v_new, accumulating into sA (the output tile). qk is read from
-        // the ws slot in place (it keeps P2_T_LD). v_new is STAGED into sV in
-        // [value][chunk] layout — p1_b_sbf packs two consecutive CHUNK values per
-        // register — because the ws vn slot is [chunk][dv] row-major and cannot be
-        // read by the B fragment in place.
-        for (int idx = tid; idx < P2_C * P2_VW; idx += P2_THREADS) {
-            const int r = idx / P2_VW, cc = idx - r * P2_VW;
-            sV[cc * P2_VL + r] = wvn[r * P2_DV + j0 + cc];
-        }
-        __syncthreads();
-        for (int tile = warp; tile < P2_MT * NT; tile += P2_WARPS) {
-            const int mt = tile / NT, nt = tile - (tile / NT) * NT;
-            float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            #pragma unroll
-            for (int ks = 0; ks < P2_C / 16; ++ks) {
-                const AFrag a = p1_a_sbf(wqk, P2_T_LD, mt * 16, ks * 16, gid, t2);
-                const BFrag b = p1_b_sbf(sV, P2_VL, nt * 8 + gid, ks * 16, t2);
-                P2_MMA(d, a, b);
-            }
-            p1_store_f32(sA, P2_A_LD, mt * 16, nt * 8, gid, t2, d);
-        }
-        __syncthreads();
-
-        // ---- QS = (q . e^G) @ S_{t-1} onto AD's tile; S is the fp32 snapshot stage H wrote,
-        // staged here in bf16 per warp dk-slice exactly as P1 :553-561 does with Sr.
-        __syncthreads();
-        #pragma unroll
-        for (int nt = 0; nt < NT; ++nt)
-            #pragma unroll
-            for (int cc = 0; cc < 2; ++cc) {
-                const int col = j0 + 8 * nt + t2 + cc;
-                sV[(8 * nt + t2 + cc) * P2_VLDK + kblk * 16 + gid] =
-                    __float2bfloat16_rn(wSn[(size_t)(kblk * 16 + gid) * P2_DV + col]);
-                sV[(8 * nt + t2 + cc) * P2_VLDK + kblk * 16 + gid + 8] =
-                    __float2bfloat16_rn(wSn[(size_t)(kblk * 16 + gid + 8) * P2_DV + col]);
-            }
-        __syncthreads();
-        // The whole 128-row d_k axis of S is in sV, so the owning warp does the FULL
-        // d_k contraction over the eight 16-wide windows onto AD's tile.
-        for (int tile = warp; tile < P2_MT * NT; tile += P2_WARPS) {
-            const int mt = tile / NT, nt = tile - (tile / NT) * NT;
-            const int cl = mt * 16 + gid, ch = cl + 8;
-            const __nv_bfloat16* al =
-                qh + (size_t)((row0 + cl) < valid_rows ? row0 + cl : row0) * rstride;
-            const __nv_bfloat16* ah =
-                qh + (size_t)((row0 + ch) < valid_rows ? row0 + ch : row0) * rstride;
-            const float sl = (row0 + cl) < valid_rows ? __expf(sG[cl]) : 0.0f;
-            const float sh = (row0 + ch) < valid_rows ? __expf(sG[ch]) : 0.0f;
-            float* o = sA + (size_t)(mt * 16 + gid) * P2_A_LD + nt * 8 + t2;
-            float d[4] = {o[0], o[1], o[8 * P2_A_LD], o[8 * P2_A_LD + 1]};
-            #pragma unroll
-            for (int ks = 0; ks < P2_DK / 16; ++ks) {
-                const AFrag a = p1_a_rows(al, ah, ks * 16, t2, qscale, sl, sh);
-                const BFrag b = p1_b_sbf(sV, P2_VLDK, nt * 8 + gid, ks * 16, t2);
-                P2_MMA(d, a, b);
-            }
-            o[0] = d[0];
-            o[1] = d[1];
-            o[8 * P2_A_LD] = d[2];
-            o[8 * P2_A_LD + 1] = d[3];
-        }
-        __syncthreads();
-
-        // ---- out = BF16_RNE(QS + AD)
-        for (int idx = tid; idx < P2_C * P2_VW; idx += P2_THREADS) {
-            const int r = idx / P2_VW, cc = idx - r * P2_VW;
-            const int gr = row0 + r;
-            if (gr < valid_rows)
-                out[((size_t)gr * P2_HEADS + head) * P2_DV + j0 + cc] =
-                    __float2bfloat16_rn(sA[r * P2_A_LD + cc]);
-        }
-        __syncthreads();   // the next block's AD rewrites sA
-    }
-}
