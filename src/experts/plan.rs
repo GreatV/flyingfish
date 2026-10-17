@@ -1,14 +1,16 @@
 //! Setup-derived expert residency capacity and per-request placement policy.
+//! Per-layer slot split is equal with the remainder to low layer ids; the F8 simulation used
+//! marginal allocation, which is a PR7 item.
 use crate::experts::catalogue::ExpertGeometry;
 use anyhow::{Context, Result, ensure};
 
-/// Decayed-frequency decay of the admission score.
+/// Decay of the admission score (addendum §3.1).
 pub const F_DECAY: f64 = 0.98;
-/// Minimum decayed frequency of an admitted candidate.
+/// Candidates below this decayed frequency are not admitted (addendum §3.1).
 pub const THETA_MIN: f64 = 1.05;
-/// F seed multiplier over the request's normalized prefill frequency.
+/// F seed = 12 copies of the request's normalized prefill frequency (F8 erratum 2026-10-17T18:07:51Z).
 pub const F_SEED_SCALE: f64 = 12.0;
-/// Normalized prefill frequency sums to the top-k count per layer.
+/// Normalized prefill frequency sums to the top-k count per layer (addendum §3.1).
 pub const FREQUENCY_SUM: f64 = 8.0;
 
 /// One measured CPU expert-service cell.
@@ -318,16 +320,16 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
     let slot_bytes = geometry.slot_bytes()?;
     let device_expert_bytes = inputs.device_free_bytes - device_reserved;
     let host_expert_bytes = inputs.host_available_bytes - host_reserved;
-    let total_slots = device_expert_bytes / slot_bytes;
+    let routed_slots = u64::from(geometry.layers)
+        .checked_mul(u64::from(geometry.experts))
+        .context("routed expert count overflow")?;
+    let total_slots = (device_expert_bytes / slot_bytes).min(routed_slots);
     ensure!(
         total_slots >= u64::from(geometry.layers),
         "device expert bytes {device_expert_bytes} hold {total_slots} slots, below one per layer ({})",
         geometry.layers
     );
     let slots_per_layer = equal_slots(total_slots, geometry.layers)?;
-    let routed_slots = u64::from(geometry.layers)
-        .checked_mul(u64::from(geometry.experts))
-        .context("routed expert count overflow")?;
     let host_block_slots = host_expert_bytes / slot_bytes;
     ensure!(
         host_block_slots >= u64::from(admission_cap),
@@ -605,69 +607,6 @@ impl Admission {
     }
 }
 
-/// Predicted decode latency of one admission budget.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Prediction {
-    pub hit: f64,
-    pub cpu_seconds: f64,
-    pub h2d_seconds: f64,
-    pub d2h_seconds: f64,
-    pub overlap_seconds: f64,
-    pub serial_seconds: f64,
-    pub admitted_per_token: f64,
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn unit(&mut self) -> f64 {
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64
-    }
-}
-
-fn sample_row(frequency: &[f64], top_k: u32, rng: &mut Rng, chosen: &mut Vec<u32>) {
-    chosen.clear();
-    let mut weights = frequency.to_vec();
-    for _ in 0..top_k {
-        let total: f64 = weights.iter().sum();
-        let pick = if total > 0.0 {
-            let point = rng.unit() * total;
-            let mut cumulative = 0.0;
-            let mut picked = None;
-            for (expert, weight) in weights.iter().enumerate() {
-                if *weight <= 0.0 {
-                    continue;
-                }
-                cumulative += weight;
-                if point <= cumulative {
-                    picked = Some(expert as u32);
-                    break;
-                }
-            }
-            picked.unwrap_or_else(|| {
-                (0..weights.len() as u32)
-                    .rev()
-                    .find(|&expert| weights[expert as usize] > 0.0)
-                    .expect("a positive weight exists")
-            })
-        } else {
-            (0..weights.len() as u32)
-                .find(|&expert| !chosen.contains(&expert))
-                .expect("an unchosen expert exists")
-        };
-        chosen.push(pick);
-        weights[pick as usize] = 0.0;
-    }
-}
-
 /// F seed: 12 copies of the request's normalized prefill frequency.
 pub fn seed_scores(frequency: &[Vec<f64>], geometry: &ExpertGeometry) -> Result<Vec<Vec<f64>>> {
     validate_frequency(frequency, geometry)?;
@@ -684,55 +623,15 @@ pub fn seed_scores(frequency: &[Vec<f64>], geometry: &ExpertGeometry) -> Result<
     Ok(scores)
 }
 
-/// One decode simulation request.
-pub struct Simulation<'a> {
-    pub geometry: ExpertGeometry,
-    pub slots_per_layer: &'a [u32],
-    pub host_blocks: u32,
-    pub spare_blocks: u32,
-    pub initial: &'a [Vec<u32>],
-    pub frequency: &'a [Vec<f64>],
-    pub admission: Admission,
-    pub service: &'a ServiceTable,
-    pub h2d_bytes_per_second: f64,
-    pub d2h_bytes_per_second: f64,
-    pub copy_engines: u32,
-    pub steps: u32,
-    pub warmup: u32,
-    pub seed: u64,
-}
-
-/// Decode-latency prediction over a deterministic synthetic stream drawn from `frequency`.
-pub fn simulate(input: Simulation<'_>) -> Result<Prediction> {
-    let Simulation {
-        geometry,
-        slots_per_layer,
-        host_blocks,
-        spare_blocks,
-        initial,
-        frequency,
-        admission,
-        service,
-        h2d_bytes_per_second,
-        d2h_bytes_per_second,
-        copy_engines,
-        steps,
-        warmup,
-        seed,
-    } = input;
-    validate_frequency(frequency, &geometry)?;
-    ensure!(
-        slots_per_layer.len() == geometry.layers as usize
-            && initial.len() == geometry.layers as usize,
-        "slot/initial layer count mismatch"
-    );
-    ensure!(steps > warmup && warmup > 0, "invalid simulation window");
-    ensure!(
-        geometry.top_k <= geometry.experts,
-        "top_k {} exceeds {} experts",
-        geometry.top_k,
-        geometry.experts
-    );
+/// Closed-form admission budget: the per-token copy time may not exceed the CPU time of one
+/// missed expert in every layer, priced by the measured copy rates and async engine count.
+pub fn admission_budget(
+    geometry: &ExpertGeometry,
+    service: &ServiceTable,
+    h2d_bytes_per_second: f64,
+    d2h_bytes_per_second: f64,
+    copy_engines: u32,
+) -> Result<u64> {
     ensure!(
         h2d_bytes_per_second.is_finite() && h2d_bytes_per_second > 0.0,
         "invalid H2D rate {h2d_bytes_per_second}"
@@ -745,222 +644,19 @@ pub fn simulate(input: Simulation<'_>) -> Result<Prediction> {
         copy_engines > 0 && copy_engines <= 16,
         "invalid copy engine count {copy_engines}"
     );
-    let layers = geometry.layers as usize;
-    let experts = geometry.experts as usize;
     let workers = service.worker_count()?;
-    let slot_bytes = geometry.slot_bytes()?;
-    let hard_cap = admission.hard_cap(slot_bytes);
-    let mut resident: Vec<Vec<bool>> = Vec::with_capacity(layers);
-    let mut host: Vec<Vec<bool>> = Vec::with_capacity(layers);
-    let mut score = seed_scores(frequency, &geometry)?;
-    let mut host_used = 0u32;
-    for (layer, set) in initial.iter().enumerate() {
-        ensure!(
-            set.len() as u32 == slots_per_layer[layer],
-            "layer {layer} initial set has {} experts for {} slots",
-            set.len(),
-            slots_per_layer[layer]
-        );
-        let mut flags = vec![false; experts];
-        for &expert in set {
-            ensure!(
-                expert < geometry.experts,
-                "initial expert {expert} out of range"
-            );
-            flags[expert as usize] = true;
-        }
-        resident.push(flags);
-        host.push(vec![false; experts]);
-    }
-    let mut spares = spare_blocks;
-    let mut rng = Rng(seed);
-    let mut sampled: Vec<u32> = Vec::with_capacity(geometry.top_k as usize);
-    let mut pairs: Vec<(f64, u32, u32, u32, bool)> = Vec::new();
-    let mut measured = 0u32;
-    let mut hit_sum = 0.0f64;
-    let mut cpu_sum = 0.0f64;
-    let mut h2d_sum = 0.0f64;
-    let mut d2h_sum = 0.0f64;
-    let mut overlap_sum = 0.0f64;
-    let mut serial_sum = 0.0f64;
-    let mut admitted_sum = 0.0f64;
-    for step in 0..steps {
-        let mut sampled_rows: Vec<Vec<u32>> = Vec::with_capacity(layers);
-        for row in frequency {
-            sample_row(row, geometry.top_k, &mut rng, &mut sampled);
-            sampled_rows.push(sampled.clone());
-        }
-        let mut hits_per_layer = vec![0u32; layers];
-        for layer in 0..layers {
-            for value in score[layer].iter_mut() {
-                *value *= F_DECAY;
-            }
-            for &expert in &sampled_rows[layer] {
-                score[layer][expert as usize] += 1.0;
-                if resident[layer][expert as usize] {
-                    hits_per_layer[layer] += 1;
-                }
-            }
-        }
-        pairs.clear();
-        for layer in 0..layers {
-            let row = &sampled_rows[layer];
-            let active = |expert: u32| row.contains(&expert);
-            let victim = (0..geometry.experts)
-                .filter(|&expert| resident[layer][expert as usize] && !active(expert))
-                .min_by(|&a, &b| {
-                    score[layer][a as usize]
-                        .total_cmp(&score[layer][b as usize])
-                        .then(a.cmp(&b))
-                });
-            let Some(victim) = victim else { continue };
-            for &candidate in row {
-                if resident[layer][candidate as usize] {
-                    continue;
-                }
-                let candidate_score = score[layer][candidate as usize];
-                let delta = candidate_score - score[layer][victim as usize];
-                if candidate_score >= THETA_MIN && delta > 0.0 {
-                    pairs.push((
-                        delta,
-                        layer as u32,
-                        candidate,
-                        victim,
-                        host[layer][candidate as usize],
-                    ));
-                }
-            }
-        }
-        pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-        let mut admitted = 0u32;
-        let mut h2d_bytes = 0u64;
-        let mut d2h_bytes = 0u64;
-        for &(_, layer, candidate, victim, from_host) in &pairs {
-            if admitted >= hard_cap {
-                break;
-            }
-            let (l, e, v) = (layer as usize, candidate as usize, victim as usize);
-            if !resident[l][v] || resident[l][e] {
-                continue;
-            }
-            let host_block_free = spares > 0 && host_used < host_blocks;
-            resident[l][e] = true;
-            resident[l][v] = false;
-            host[l][e] = false;
-            if from_host {
-                host[l][v] = true;
-            } else if host_block_free {
-                host[l][v] = true;
-                host_used += 1;
-                spares -= 1;
-            }
-            h2d_bytes += slot_bytes;
-            if from_host || host_block_free {
-                d2h_bytes += slot_bytes;
-            }
-            admitted += 1;
-        }
-        let mut cpu = 0.0f64;
-        for hits in &hits_per_layer {
-            let misses = geometry.top_k - hits;
-            if misses > 0 {
-                cpu += service.seconds(1, misses, workers)?;
-            }
-        }
-        let h2d = h2d_bytes as f64 / h2d_bytes_per_second;
-        let d2h = d2h_bytes as f64 / d2h_bytes_per_second;
-        let copy = if copy_engines >= 2 {
-            h2d.max(d2h)
-        } else {
-            h2d + d2h
-        };
-        if step >= warmup {
-            measured += 1;
-            hit_sum += f64::from(hits_per_layer.iter().sum::<u32>());
-            cpu_sum += cpu;
-            h2d_sum += h2d;
-            d2h_sum += d2h;
-            overlap_sum += cpu.max(copy);
-            serial_sum += cpu + copy;
-            admitted_sum += f64::from(admitted);
-        }
-    }
-    let measured = f64::from(measured);
-    let rows_total = f64::from(geometry.layers * geometry.top_k);
-    Ok(Prediction {
-        hit: hit_sum / measured / rows_total,
-        cpu_seconds: cpu_sum / measured,
-        h2d_seconds: h2d_sum / measured,
-        d2h_seconds: d2h_sum / measured,
-        overlap_seconds: overlap_sum / measured,
-        serial_seconds: serial_sum / measured,
-        admitted_per_token: admitted_sum / measured,
-    })
-}
-
-/// Admission ladder: whole expert slots per token, zero first.
-pub fn budget_ladder(slot_bytes: u64, max_experts_per_token: u32) -> Result<Vec<u64>> {
+    let cpu_seconds = service.seconds(1, 1, workers)? * f64::from(geometry.layers);
+    let bytes_per_second = if copy_engines >= 2 {
+        h2d_bytes_per_second.min(d2h_bytes_per_second)
+    } else {
+        1.0 / (1.0 / h2d_bytes_per_second + 1.0 / d2h_bytes_per_second)
+    };
+    let bytes = cpu_seconds * bytes_per_second;
     ensure!(
-        max_experts_per_token > 0 && max_experts_per_token <= 1024,
-        "invalid admission ladder extent {max_experts_per_token}"
+        bytes.is_finite() && bytes >= 0.0 && bytes <= u64::MAX as f64,
+        "admission budget {bytes} outside the byte range"
     );
-    let mut ladder = Vec::with_capacity(max_experts_per_token as usize + 1);
-    ladder.push(0);
-    for experts in 1..=max_experts_per_token {
-        ladder.push(
-            u64::from(experts)
-                .checked_mul(slot_bytes)
-                .context("admission budget overflow")?,
-        );
-    }
-    Ok(ladder)
-}
-
-/// One budget search over a fixed setup.
-pub struct BudgetSearch<'a> {
-    pub inputs: &'a PlanInputs<'a>,
-    pub initial: &'a [Vec<u32>],
-    pub frequency: &'a [Vec<f64>],
-    pub ladder: &'a [u64],
-    pub steps: u32,
-    pub warmup: u32,
-    pub seed: u64,
-}
-
-/// Capacity and budget with the smallest predicted overlap-aware decode time.
-pub fn choose_budget(search: BudgetSearch<'_>) -> Result<(Capacity, u64, Prediction)> {
-    ensure!(!search.ladder.is_empty(), "empty admission ladder");
-    let slot_bytes = search.inputs.geometry.slot_bytes()?;
-    let mut best: Option<(Capacity, u64, Prediction)> = None;
-    for &budget in search.ladder {
-        let cap = (budget / slot_bytes) as u32;
-        let capacity = capacity(search.inputs, cap)?;
-        let prediction = simulate(Simulation {
-            geometry: search.inputs.geometry,
-            slots_per_layer: &capacity.slots_per_layer,
-            host_blocks: capacity.host_blocks,
-            spare_blocks: capacity.spare_blocks,
-            initial: search.initial,
-            frequency: search.frequency,
-            admission: Admission {
-                budget_bytes_per_token: budget,
-            },
-            service: search.inputs.service,
-            h2d_bytes_per_second: search.inputs.h2d_bytes_per_second,
-            d2h_bytes_per_second: search.inputs.d2h_bytes_per_second,
-            copy_engines: search.inputs.copy_engines,
-            steps: search.steps,
-            warmup: search.warmup,
-            seed: search.seed,
-        })?;
-        if best
-            .as_ref()
-            .is_none_or(|(_, _, seen)| prediction.overlap_seconds < seen.overlap_seconds)
-        {
-            best = Some((capacity, budget, prediction));
-        }
-    }
-    Ok(best.expect("ladder is not empty"))
+    Ok(bytes.floor() as u64)
 }
 
 #[cfg(test)]
@@ -1032,48 +728,6 @@ mod tests {
         }
     }
 
-    fn simulation<'a>(
-        slots: &'a [u32],
-        initial: &'a [Vec<u32>],
-        frequency: &'a [Vec<f64>],
-        service: &'a ServiceTable,
-        admission: Admission,
-    ) -> Simulation<'a> {
-        Simulation {
-            geometry: geometry(),
-            slots_per_layer: slots,
-            host_blocks: 5,
-            spare_blocks: 2,
-            initial,
-            frequency,
-            admission,
-            service,
-            h2d_bytes_per_second: 1e9,
-            d2h_bytes_per_second: 1e9,
-            copy_engines: 2,
-            steps: 64,
-            warmup: 8,
-            seed: 7,
-        }
-    }
-
-    fn search<'a>(
-        inputs: &'a PlanInputs<'a>,
-        initial: &'a [Vec<u32>],
-        frequency: &'a [Vec<f64>],
-        ladder: &'a [u64],
-    ) -> BudgetSearch<'a> {
-        BudgetSearch {
-            inputs,
-            initial,
-            frequency,
-            ladder,
-            steps: 32,
-            warmup: 4,
-            seed: 3,
-        }
-    }
-
     fn inputs<'a>(service: &'a ServiceTable, reserves: &'a Reserves) -> PlanInputs<'a> {
         let geometry = geometry();
         let slot = geometry.slot_bytes().unwrap();
@@ -1116,7 +770,7 @@ mod tests {
             device_free_bytes: reserves.device_bytes(&geometry(), 4).unwrap()
                 + 2 * geometry().slot_bytes().unwrap()
                 - 1,
-            ..inputs
+            ..capacity_ref(&inputs)
         };
         let error = capacity(&tight, 0).unwrap_err().to_string();
         assert!(error.contains("device expert bytes"), "{error}");
@@ -1128,6 +782,22 @@ mod tests {
         assert!(error.contains("span/staging reserves"), "{error}");
         let spares = capacity(&inputs, 28).unwrap_err().to_string();
         assert!(spares.contains("spare blocks"), "{spares}");
+    }
+
+    #[test]
+    fn fully_resident_capacity_is_clamped_to_the_routed_count() {
+        let service = service();
+        let reserves = reserves();
+        let geometry = geometry();
+        let slot = geometry.slot_bytes().unwrap();
+        let mut inputs = inputs(&service, &reserves);
+        inputs.device_free_bytes = reserves.device_bytes(&geometry, 4).unwrap() + 16 * slot + 4_096;
+        inputs.host_available_bytes = reserves.host_bytes(&geometry).unwrap() + 2 * slot;
+        let derived = capacity(&inputs, 0).unwrap();
+        assert_eq!(derived.slots_per_layer, vec![8, 8]);
+        assert_eq!(derived.host_blocks, 0);
+        assert_eq!(derived.disk_bytes, 0);
+        assert_eq!(derived.disk_workers, 0);
     }
 
     #[test]
@@ -1164,126 +834,88 @@ mod tests {
     }
 
     #[test]
-    fn f_seed_is_twelve_normalized_prefill_copies() -> Result<()> {
-        let scores = seed_scores(&frequency(), &geometry())?;
+    fn f_seed_is_twelve_normalized_prefill_copies() {
+        let scores = seed_scores(&frequency(), &geometry()).unwrap();
         for layer in &scores {
             let sum: f64 = layer.iter().sum();
             assert!((sum - F_SEED_SCALE * FREQUENCY_SUM).abs() < 1e-9);
         }
         let zero = vec![vec![0.0; 8], vec![0.0; 8]];
         assert!(seed_scores(&zero, &geometry()).is_err());
-        Ok(())
     }
 
     #[test]
-    fn ledger_keeps_tiers_disjoint_and_bytes_exact() -> Result<()> {
+    fn admission_budget_is_one_miss_per_layer_priced_by_the_copy_rates() {
         let geometry = geometry();
-        let slot = geometry.slot_bytes()?;
-        let initial = initial_residency(&frequency(), &[2, 2], &geometry)?;
-        let mut ledger = TierLedger::new(geometry, vec![2, 2], 5, &initial)?;
+        let table = ServiceTable::new(
+            "test",
+            vec![
+                ServiceCell {
+                    workers: 1,
+                    rows: 1,
+                    experts: 1,
+                    seconds: 0.0002,
+                },
+                ServiceCell {
+                    workers: 1,
+                    rows: 1,
+                    experts: 2,
+                    seconds: 0.0004,
+                },
+            ],
+        )
+        .unwrap();
+        let budget = admission_budget(&geometry, &table, 1e9, 1e9, 2).unwrap();
+        assert_eq!(budget, 400_000);
+        assert_eq!(
+            Admission {
+                budget_bytes_per_token: budget
+            }
+            .hard_cap(geometry.slot_bytes().unwrap()),
+            400_000 / geometry.slot_bytes().unwrap() as u32
+        );
+        let serial = admission_budget(&geometry, &table, 1e9, 1e9, 1).unwrap();
+        assert_eq!(serial, 200_000);
+        assert!(admission_budget(&geometry, &table, 0.0, 1e9, 2).is_err());
+        assert!(admission_budget(&geometry, &table, 1e9, 1e9, 0).is_err());
+    }
+
+    #[test]
+    fn ledger_keeps_tiers_disjoint_and_bytes_exact() {
+        let geometry = geometry();
+        let slot = geometry.slot_bytes().unwrap();
+        let initial = initial_residency(&frequency(), &[2, 2], &geometry).unwrap();
+        let mut ledger = TierLedger::new(geometry, vec![2, 2], 5, &initial).unwrap();
         let routed = 16 * slot;
-        assert_eq!(ledger.unique_bytes()? + ledger.disk_bytes()?, routed);
-        assert_eq!(ledger.tier(0, initial[0][0])?, Tier::Gpu);
-        assert_eq!(ledger.tier(0, 7)?, Tier::Disk);
-        ledger.admit_disk(0, 7, initial[0][0], true)?;
-        assert_eq!(ledger.tier(0, 7)?, Tier::Gpu);
-        assert_eq!(ledger.tier(0, initial[0][0])?, Tier::Host);
-        ledger.admit_host(0, initial[0][0], initial[0][1])?;
-        assert_eq!(ledger.tier(0, initial[0][0])?, Tier::Gpu);
-        assert_eq!(ledger.tier(0, initial[0][1])?, Tier::Host);
-        ledger.admit_disk(1, 7, initial[1][0], true)?;
-        assert_eq!(ledger.tier(1, 7)?, Tier::Gpu);
-        assert_eq!(ledger.tier(1, initial[1][0])?, Tier::Host);
-        ledger.evict_gpu(0, 7)?;
-        assert_eq!(ledger.tier(0, 7)?, Tier::Disk);
+        assert_eq!(
+            ledger.unique_bytes().unwrap() + ledger.disk_bytes().unwrap(),
+            routed
+        );
+        assert_eq!(ledger.tier(0, initial[0][0]).unwrap(), Tier::Gpu);
+        assert_eq!(ledger.tier(0, 7).unwrap(), Tier::Disk);
+        ledger.admit_disk(0, 7, initial[0][0], true).unwrap();
+        assert_eq!(ledger.tier(0, 7).unwrap(), Tier::Gpu);
+        assert_eq!(ledger.tier(0, initial[0][0]).unwrap(), Tier::Host);
+        ledger.admit_host(0, initial[0][0], initial[0][1]).unwrap();
+        assert_eq!(ledger.tier(0, initial[0][0]).unwrap(), Tier::Gpu);
+        assert_eq!(ledger.tier(0, initial[0][1]).unwrap(), Tier::Host);
+        ledger.admit_disk(1, 7, initial[1][0], true).unwrap();
+        assert_eq!(ledger.tier(1, 7).unwrap(), Tier::Gpu);
+        assert_eq!(ledger.tier(1, initial[1][0]).unwrap(), Tier::Host);
+        ledger.evict_gpu(0, 7).unwrap();
+        assert_eq!(ledger.tier(0, 7).unwrap(), Tier::Disk);
         assert_eq!(ledger.duplicate_bytes(), 0);
-        assert_eq!(ledger.unique_bytes()? + ledger.disk_bytes()?, routed);
+        assert_eq!(
+            ledger.unique_bytes().unwrap() + ledger.disk_bytes().unwrap(),
+            routed
+        );
         for layer in 0..2u32 {
             for expert in 0..8u32 {
-                let tier = ledger.tier(layer, expert)?;
+                let tier = ledger.tier(layer, expert).unwrap();
                 assert!(matches!(tier, Tier::Gpu | Tier::Host | Tier::Disk));
             }
         }
         assert!(ledger.check().is_ok());
         assert!(ledger.admit_host(1, initial[1][1], initial[1][1]).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn admission_hard_cap_only_and_deterministic() -> Result<()> {
-        let geometry = geometry();
-        let frequency = frequency();
-        let slots = vec![2u32, 2u32];
-        let initial = initial_residency(&frequency, &slots, &geometry)?;
-        let slot_bytes = geometry.slot_bytes()?;
-        let service = service();
-        let zero = simulate(simulation(
-            &slots,
-            &initial,
-            &frequency,
-            &service,
-            Admission {
-                budget_bytes_per_token: 0,
-            },
-        ))?;
-        assert_eq!(zero.admitted_per_token, 0.0);
-        assert_eq!(zero.h2d_seconds, 0.0);
-        assert_eq!(zero.d2h_seconds, 0.0);
-        let budget = Admission {
-            budget_bytes_per_token: slot_bytes * 2,
-        };
-        assert_eq!(budget.hard_cap(slot_bytes), 2);
-        let two = simulate(simulation(&slots, &initial, &frequency, &service, budget))?;
-        assert!(two.admitted_per_token > 0.0 && two.admitted_per_token <= 2.0);
-        assert_eq!(
-            two,
-            simulate(simulation(&slots, &initial, &frequency, &service, budget))?
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn d2h_pricing_matches_the_engine_count() -> Result<()> {
-        let geometry = geometry();
-        let frequency = frequency();
-        let slots = vec![2u32, 2u32];
-        let initial = initial_residency(&frequency, &slots, &geometry)?;
-        let slot_bytes = geometry.slot_bytes()?;
-        let reserves = reserves();
-        let service = service();
-        let base = inputs(&service, &reserves);
-        let single_inputs = PlanInputs {
-            copy_engines: 1,
-            ..capacity_ref(&base)
-        };
-        let dual_inputs = PlanInputs {
-            copy_engines: 2,
-            ..capacity_ref(&base)
-        };
-        let ladder = [0, slot_bytes];
-        let (_, _, single) = choose_budget(search(&single_inputs, &initial, &frequency, &ladder))?;
-        let (_, _, dual) = choose_budget(search(&dual_inputs, &initial, &frequency, &ladder))?;
-        assert!(single.serial_seconds >= single.overlap_seconds);
-        assert!(dual.serial_seconds >= dual.overlap_seconds);
-        Ok(())
-    }
-
-    #[test]
-    fn budget_choice_is_deterministic_and_respects_the_ladder() -> Result<()> {
-        let geometry = geometry();
-        let frequency = frequency();
-        let slots = vec![2u32, 2u32];
-        let initial = initial_residency(&frequency, &slots, &geometry)?;
-        let slot_bytes = geometry.slot_bytes()?;
-        let ladder = budget_ladder(slot_bytes, 2)?;
-        assert_eq!(ladder, vec![0, slot_bytes, slot_bytes * 2]);
-        let reserves = reserves();
-        let service = service();
-        let inputs = inputs(&service, &reserves);
-        let (_, budget, _) = choose_budget(search(&inputs, &initial, &frequency, &ladder))?;
-        assert!(ladder.contains(&budget));
-        let (_, again, _) = choose_budget(search(&inputs, &initial, &frequency, &ladder))?;
-        assert_eq!(budget, again);
-        Ok(())
     }
 }
