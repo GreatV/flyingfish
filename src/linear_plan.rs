@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 pub const fn direct_fp8_rows(rows: usize) -> bool {
     rows >= 1 && rows <= 5
 }
+
 #[derive(Debug)]
 pub struct DequantSlot {
     pub offset_bytes: u64,
@@ -75,7 +76,16 @@ impl LayerDequantPlan {
                 },
             );
         }
-        ensure!(!slots.is_empty(), "missing FP8 layer {layer}");
+        ensure!(
+            manifest.entries.iter().any(|(name, entry)| {
+                entry.load
+                    && name.starts_with(&prefix)
+                    && name.ends_with(".weight")
+                    && entry.shape.len() == 2
+                    && matches!(entry.dtype, Dtype::BF16 | Dtype::F8_E4M3)
+            }),
+            "missing linear layer {layer}"
+        );
         bytes = bytes.checked_add(255).context("arena size overflow")? & !255;
         Ok(Self {
             layer,
@@ -83,5 +93,41 @@ impl LayerDequantPlan {
             bytes,
             slots,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoint::{TensorEntry, TensorScope};
+
+    #[test]
+    fn native_bf16_layer_requires_no_materialization_storage() -> Result<()> {
+        let entry = TensorEntry {
+            dtype: Dtype::BF16,
+            shape: vec![8192, 2048],
+            shard: "native.safetensors".into(),
+            bytes: 8192 * 2048 * 2,
+            load: true,
+            data_start: 0,
+            data_offsets: [0, 8192 * 2048 * 2],
+            scope: TensorScope::Text,
+            layer: Some(0),
+            role: "linear_attn.in_proj_qkv.weight".into(),
+            scale_name: None,
+        };
+        let manifest = TensorManifest {
+            entries: [(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight".into(),
+                entry,
+            )]
+            .into(),
+            resident_bytes: 8192 * 2048 * 2,
+        };
+        let plan = LayerDequantPlan::from_manifest(&manifest, 0)?;
+        assert_eq!(plan.bytes, 0);
+        assert!(plan.slots.is_empty());
+        assert!(LayerDequantPlan::from_manifest(&manifest, 1).is_err());
+        Ok(())
     }
 }

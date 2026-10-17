@@ -407,23 +407,27 @@ extern "C" __global__ void q38_gate(
         y[row*ys0+h*ys1+d*ys2]=__float2bfloat16_rn(out);
     }
 }
-extern "C" __global__ void q38_gdn_gates(
-    const __nv_bfloat16* a,const __nv_bfloat16* b,const __nv_bfloat16* a_log,const __nv_bfloat16* dt,
-    __nv_bfloat16* beta,float* g,const Q38SequenceMeta* meta,uint32_t row_base,uint32_t row_capacity,
-    uint64_t as0,uint64_t bs0,uint64_t betas0,uint64_t gs0) {
-    q38_meta_guard(meta);
-    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
-       !a || !b || !a_log || !dt || !beta || !g || !row_capacity) {__trap();return;}
-    uint64_t count=uint64_t(row_capacity)*48;
-    for(uint64_t i=uint64_t(blockIdx.x)*256+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*256) {
-        uint64_t row=uint64_t(row_base)+i/48; if(row>=uint64_t(meta->valid_rows))continue;
-        uint32_t h=i%48;
-        float t=__fadd_rn(__bfloat162float(a[row*as0+h]),__bfloat162float(dt[h]));
-        float soft=t>20.0f?t:log1pf(expf(t));
-        beta[row*betas0+h]=__float2bfloat16_rn(sigmoid(__bfloat162float(b[row*bs0+h])));
-        g[row*gs0+h]=-expf(__bfloat162float(a_log[h]))*soft;
-    }
+#define GDN_GATES(HEADS, NAME) \
+extern "C" __global__ void NAME( \
+    const __nv_bfloat16* a,const __nv_bfloat16* b,const __nv_bfloat16* a_log,const __nv_bfloat16* dt, \
+    __nv_bfloat16* beta,float* g,const Q38SequenceMeta* meta,uint32_t row_base,uint32_t row_capacity, \
+    uint64_t as0,uint64_t bs0,uint64_t betas0,uint64_t gs0) { \
+    q38_meta_guard(meta); \
+    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 || \
+       !a || !b || !a_log || !dt || !beta || !g || !row_capacity) {__trap();return;} \
+    uint64_t count=uint64_t(row_capacity)*HEADS; \
+    for(uint64_t i=uint64_t(blockIdx.x)*256+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*256) { \
+        uint64_t row=uint64_t(row_base)+i/HEADS; if(row>=uint64_t(meta->valid_rows))continue; \
+        uint32_t h=i%HEADS; \
+        float t=__fadd_rn(__bfloat162float(a[row*as0+h]),__bfloat162float(dt[h])); \
+        float soft=t>20.0f?t:log1pf(expf(t)); \
+        beta[row*betas0+h]=__float2bfloat16_rn(sigmoid(__bfloat162float(b[row*bs0+h]))); \
+        g[row*gs0+h]=-expf(__bfloat162float(a_log[h]))*soft; \
+    } \
 }
+GDN_GATES(48, q38_gdn_gates)
+GDN_GATES(32, gdn_gates_h32)
+#undef GDN_GATES
 
 // Stateless LayerNorm: every declared row is valid. No text sequence/causal metadata.
 // One CTA per [row,head]; FP32 centered variance and affine, BF16 input/output.

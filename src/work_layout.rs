@@ -1,7 +1,7 @@
 //! Shared row-work geometry; excludes weights, persistent state and operator scratch.
 use crate::{
     model_spec::{Architecture, ModelSpec},
-    op_contract::GdnSpec,
+    op_contract::MixerSpec,
 };
 use anyhow::{Context, Result};
 #[derive(Clone, Copy, Debug)]
@@ -29,10 +29,10 @@ impl RowWorkSpec {
                 false,
                 0,
             ),
-            Architecture::Qwen35Text => {
-                let g = GdnSpec::q38();
-                g.validate()?;
-                let gqkv = g.conv_dim()? as usize;
+            Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
+                let geometry = MixerSpec::from_model(spec)?;
+                let g = geometry.gdn;
+                let gqkv = geometry.conv_width as usize;
                 let full = q
                     .checked_mul(2)
                     .and_then(|n| n.checked_add(2 * kv))
@@ -44,7 +44,6 @@ impl RowWorkSpec {
                     (2 * g.hv) as usize,
                 )
             }
-            Architecture::MiniCpmV47 => anyhow::bail!("MiniCPM row work is not implemented"),
         };
         Ok(Self {
             hidden,

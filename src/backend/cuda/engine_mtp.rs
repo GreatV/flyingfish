@@ -163,8 +163,8 @@ impl MtpRuntime {
                 })
                 .collect::<Vec<_>>(),
         )?;
-        let mut linear = LayerLinearPlan::bind(&dequant, catalog, &scratch(&arena, s), s)?;
-        linear.materialize(blas.fp8_ops()?, s)?;
+        let mut linear = LayerLinearPlan::bind(&dequant, catalog, Some(&scratch(&arena, s)), s)?;
+        linear.materialize(blas, s)?;
         let common = CommonOpsRef::new(&device.ctx)?;
         let mut runtime = Self {
             plan,

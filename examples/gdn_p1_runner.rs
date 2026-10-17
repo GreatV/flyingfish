@@ -300,15 +300,15 @@ fn route_workspace_bytes(route: Route, rows: u32) -> Result<u64> {
     }
     let spec = flyingfish::op_contract::GdnSpec::q38();
     let armed = flyingfish::gdn_plan::GdnPolicy::P2.workspace(&spec, rows)?;
-    let fused = flyingfish::gdn_plan::GdnWorkspace::q38(&spec, rows)?;
+    let fused = flyingfish::gdn_plan::GdnWorkspace::new(&spec, rows)?;
     let slot = armed
         .bytes
         .checked_sub(fused.bytes)
         .context("the P2 policy's workspace is smaller than the fused layout it extends")?;
     ensure!(
-        slot == flyingfish::gdn_plan::cw_p2_bytes(rows),
+        slot == flyingfish::gdn_plan::cw_p2_bytes(48, rows),
         "the P2 slot region is {slot} B for {rows} rows; the planner derives {}",
-        flyingfish::gdn_plan::cw_p2_bytes(rows)
+        flyingfish::gdn_plan::cw_p2_bytes(48, rows)
     );
     Ok(slot)
 }
@@ -3503,7 +3503,11 @@ mod tests {
         assert_eq!(route_workspace_bytes(Route::P1, 2048).unwrap(), 0);
         for rows in [1u32, 64, 2048, 8192] {
             let slot = route_workspace_bytes(Route::P2, rows).unwrap();
-            assert_eq!(slot, flyingfish::gdn_plan::cw_p2_bytes(rows), "rows={rows}");
+            assert_eq!(
+                slot,
+                flyingfish::gdn_plan::cw_p2_bytes(48, rows),
+                "rows={rows}"
+            );
             assert_eq!(
                 slot,
                 u64::from(rows.div_ceil(64)) * 48 * flyingfish::gdn_plan::cw_p2::SLOT_BYTES,

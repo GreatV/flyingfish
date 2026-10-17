@@ -20,7 +20,10 @@
 #define P1_WARPS   (P1_THREADS / 32)
 #define P1_DK      128
 #define P1_DV      128
-#define P1_HEADS   48
+#ifndef GDN_HEADS
+#define GDN_HEADS 48
+#endif
+#define P1_HEADS GDN_HEADS
 #define P1_MT      (P1_C / 16)          // row tiles of 16
 #define P1_NT_C    (P1_C / 8)           // column tiles of 8 in the [C][C] products
 #define P1_VL      72                    // sV row stride for the CHUNK axis, bf16 (+8 off 64)

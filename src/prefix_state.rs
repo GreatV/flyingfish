@@ -382,7 +382,7 @@ impl PrefixGeometry {
             kv_format == crate::kv::KvFormat::Bf16 || block_tokens.is_multiple_of(128),
             "compact KV prefix block must be a multiple of128"
         );
-        let gdn = GdnSpec::q38();
+        let gdn = GdnSpec::from_model(spec)?;
         let s_bytes = gdn.state_bytes()?;
         let history_bytes = gdn.history_bytes()?;
         let mut attention = Vec::new();
@@ -1084,7 +1084,7 @@ mod tests {
             head_dim: 256,
             q_width: 6144,
             max_position: 1024,
-            rms_eps: 1e-5,
+            rms_eps: 1e-6,
             rope_theta: 10_000_000.0,
             rotary_dim: 128,
             linear_format: crate::model_spec::LinearFormat::Fp8E4m3Block128,

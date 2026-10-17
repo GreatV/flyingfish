@@ -226,7 +226,8 @@ fn scratch_bytes(capacity: usize, rows: usize) -> Result<usize> {
         .context("MTP scratch overflow")?
         & !255;
     let repair = usize::try_from(
-        AttentionWorkspace::q38(
+        AttentionWorkspace::new(
+            &crate::op_contract::FullAttentionSpec::q38(),
             rows.min(4) as u32,
             capacity as u32,
             256.min((capacity / 32 * 32) as u32),
@@ -272,17 +273,17 @@ pub(crate) fn checkpoint_bytes(spec: &ModelSpec, rows: usize) -> Result<usize> {
         .and_then(|n| n.checked_mul(spec.head_dim as usize))
         .and_then(|n| n.checked_mul(4))
         .context("checkpoint KV overflow")?;
-    let g = GdnSpec::q38();
-    let gdn = usize::try_from(
-        g.state_bytes()?
-            .checked_add(g.history_bytes()?)
-            .context("GDN checkpoint overflow")?,
-    )?;
-    let mut bytes: usize = if spec.architecture == Architecture::Qwen35Text {
-        36
+    let gdn = if spec.layers.iter().any(|l| l.mixer == Mixer::Gdn) {
+        let g = GdnSpec::from_model(spec)?;
+        usize::try_from(
+            g.state_bytes()?
+                .checked_add(g.history_bytes()?)
+                .context("GDN checkpoint overflow")?,
+        )?
     } else {
-        4
+        0
     };
+    let mut bytes: usize = if spec.gdn.is_some() { 36 } else { 4 };
     for layer in &spec.layers {
         bytes = bytes
             .checked_add(match layer.mixer {
@@ -306,12 +307,15 @@ pub(crate) fn component_spec(spec: &ModelSpec) -> ModelSpec {
 
 #[cfg(any(feature = "cuda", test))]
 pub(crate) fn snapshot_bytes(spec: &ModelSpec) -> Result<usize> {
-    let g = crate::op_contract::GdnSpec::q38();
     let layers = spec
         .layers
         .iter()
         .filter(|l| l.mixer == crate::model_spec::Mixer::Gdn)
         .count();
+    if layers == 0 {
+        return Ok(0);
+    }
+    let g = crate::op_contract::GdnSpec::from_model(spec)?;
     usize::try_from(
         g.state_bytes()?
             .checked_add(g.history_bytes()?)
@@ -519,7 +523,8 @@ mod tests {
                 let bytes = scratch_bytes(capacity, rows)?;
                 assert!(bytes.is_multiple_of(256));
                 for repair_rows in 1..=rows.min(4) {
-                    let required = AttentionWorkspace::q38(
+                    let required = AttentionWorkspace::new(
+                        &crate::op_contract::FullAttentionSpec::q38(),
                         repair_rows as u32,
                         capacity as u32,
                         256.min((capacity / 32 * 32) as u32),

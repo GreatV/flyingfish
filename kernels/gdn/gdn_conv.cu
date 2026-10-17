@@ -1,5 +1,5 @@
 // GDN conv: depthwise causal conv1d, k=4, groups == channels, no bias, over
-// CONV_DIM = 10240 channels, with the exact shared SiLU applied in the same thread. The
+// GDN_CONV_DIM = 8192 or 10240 channels, with the exact shared SiLU applied in the same thread. The
 // conv result is cast to BF16 and back before silu(), and the silu result is cast to
 // BF16 for conv_out.
 //
@@ -10,7 +10,9 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-#define GDN_CONV_DIM  10240
+#ifndef GDN_CONV_DIM
+#define GDN_CONV_DIM 10240
+#endif
 #define GDN_CONV_CHAN 256
 #define GDN_CONV_ROWS 32
 

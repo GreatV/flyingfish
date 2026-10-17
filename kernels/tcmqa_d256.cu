@@ -1,5 +1,5 @@
 // HD256 full attention.
-// Shape: q_heads=24, kv_heads=4, GQA=6, head_dim=256, scale=1/16.
+// Shape: (q_heads, kv_heads) = (24, 4) or (16, 2), head_dim=256, scale=1/16.
 // Tile: MT=64 pair rows, KT=32 KV positions, 4 warps / 128 threads, dynamic smem SMEM_NARROW.
 // Array extents and unrolled loop bounds are written in DH/HQ/HKV through
 // NSLICE = DH/8 and KSLICE = DH/16; no dimension is a literal.
@@ -25,8 +25,14 @@ namespace tcmqa_d256 {
 
 using bf16 = __nv_bfloat16;
 
-constexpr int HQ      = 24;      // q heads
-constexpr int HKV     = 4;       // kv heads
+#ifndef ATTENTION_Q_HEADS
+#define ATTENTION_Q_HEADS 24
+#endif
+#ifndef ATTENTION_KV_HEADS
+#define ATTENTION_KV_HEADS 4
+#endif
+constexpr int HQ      = ATTENTION_Q_HEADS;
+constexpr int HKV     = ATTENTION_KV_HEADS;
 constexpr int GQA     = HQ / HKV;
 constexpr int DH      = 256;     // head_dim
 constexpr int MT      = 64;      // pair rows per block (narrow tile)
@@ -125,7 +131,7 @@ __device__ __forceinline__ void guard_geometry(int seg_rows, int key_chunk,
     __trap();
 }
 
-// Split the [M,24,512] q_gate projection into Q and gate views: per head, Q at offset 0
+// Split the [M,HQ,512] q_gate projection into Q and gate views: per head, Q at offset 0
 // and gate at offset 256 within the head's 512-wide span.
 // One thread per (row, head, dim) writes every element of both views; rows at or beyond
 // the device valid_rows return.
@@ -177,7 +183,7 @@ static_assert(RHALF != 32 ||
                    rope_axis_count(2) == 10),
               "mrope_section (11, 11, 10) over RHALF = 32");
 
-// In-place partial RoPE on Q ([M,24,256] BF16 view) at absolute position prefix + row.
+// In-place partial RoPE on Q ([M,HQ,256] BF16 view) at absolute position prefix + row.
 // Writes only dims [0, ROTARY); qg_split writes the full view first.
 extern "C" __global__ void tcmqa_d256_rope_q(__nv_bfloat16* __restrict__ q,
                                              const int4* __restrict__ meta,

@@ -6,16 +6,16 @@
 //   expansion (value head h reads key head h / P2_GQA, row stride P2_KROW = 16*128),
 //   and Q scaled by 1/sqrt(DK) as a separate first multiply. beta and g are FP32.
 //
-//   stage A  grid (nchunk, 48): gates and the cumsum, A = -tril(...), the blocked
+//   stage A  grid (nchunk, P2_HEADS): gates and the cumsum, A = -tril(...), the blocked
 //             (I-A)^-1 with both merge levels, U = T@(beta.V) for all DV columns,
 //             W = T@(beta.K.e^G) materialized bf16, qk, and the FP32[64] vectors
 //             Gc, Be, Sc.
-//   stage H  grid (4, 48), 32-wide value strips: the chunk loop in order with
+//   stage H  grid (4, P2_HEADS), 32-wide value strips: the chunk loop in order with
 //             S[:, j0:j0+32] in registers; WS = W@S, v_new = U - WS, out, and the
 //             state update. S is written back at the end.
 //
 // The workspace slot of one (chunk, head) is GDN_CW_P2_SLOT_BYTES at
-// ws + (chunk * 48 + head) * GDN_CW_P2_SLOT_BYTES, in this byte order:
+// ws + (chunk * P2_HEADS + head) * GDN_CW_P2_SLOT_BYTES, in this byte order:
 //   P2_OFF_W   0      W  bf16[64][128]  row stride 128   A writes, H reads
 //   P2_OFF_U   16384  U  fp32[64][128]  row stride 128   A writes, H reads
 //   P2_OFF_QK  49152  qk bf16[64][72]   row stride 72    A writes, H reads
@@ -36,7 +36,10 @@
 #define P2_WARPS   (P2_THREADS / 32)
 #define P2_DK      128
 #define P2_DV      128
-#define P2_HEADS   48
+#ifndef GDN_HEADS
+#define GDN_HEADS 48
+#endif
+#define P2_HEADS GDN_HEADS
 #define P2_MT      (P2_C / 16)          // row tiles of 16
 #define P2_KHEADS  16                   // KEY heads in the projection's Q and K
 #define P2_GQA     (P2_HEADS / P2_KHEADS)   // value head -> key head, h / GQA

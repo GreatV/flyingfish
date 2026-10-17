@@ -116,6 +116,7 @@ pub(crate) struct NormOps {
 pub(crate) struct GateOps {
     gate: CudaFunction,
     gdn: CudaFunction,
+    gdn_heads: u32,
     gelu: CudaFunction,
 }
 #[derive(Clone)]
@@ -134,9 +135,28 @@ impl CommonOpsRef {
             gate: Arc::new(GateOps {
                 gate: module.load_function("q38_gate")?,
                 gdn: module.load_function("q38_gdn_gates")?,
+                gdn_heads: 48,
                 gelu: module.load_function("q38_gelu")?,
             }),
         })
+    }
+
+    pub fn with_gdn(
+        mut self,
+        ctx: &Arc<CudaContext>,
+        spec: &crate::op_contract::GdnSpec,
+    ) -> Result<Self> {
+        spec.validate()?;
+        if self.gate.gdn_heads != spec.hv {
+            let module = cubin::module(ctx, "q38_common")?;
+            self.gate = Arc::new(GateOps {
+                gate: self.gate.gate.clone(),
+                gdn: module.load_function(spec.gate_kernel())?,
+                gdn_heads: spec.hv,
+                gelu: self.gate.gelu.clone(),
+            });
+        }
+        Ok(self)
     }
 }
 fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
@@ -551,18 +571,22 @@ impl GateOps {
             beta,
             g,
         } = bindings;
+        let heads = self.gdn_heads;
         rows.validate(a.shape[0])?;
         for t in [&a, &b, &beta.0] {
             t.validate()?;
             ensure!(
-                t.shape == a.shape && t.shape[1] == 48 && t.stride[1] == 1 && t.stride[0] >= 48,
+                t.shape == a.shape
+                    && t.shape[1] == heads
+                    && t.stride[1] == 1
+                    && t.stride[0] >= u64::from(heads),
                 "GDN gate layout mismatch"
             );
         }
         for t in [&a_log, &dt_bias] {
             t.validate()?;
             ensure!(
-                t.shape == [48] && t.stride == [1],
+                t.shape == [heads] && t.stride == [1],
                 "GDN gate weight mismatch"
             );
             no_overlap(t, &beta.0)?;
@@ -570,7 +594,7 @@ impl GateOps {
         }
         g.0.validate()?;
         ensure!(
-            g.0.shape == a.shape && g.0.stride[1] == 1 && g.0.stride[0] >= 48,
+            g.0.shape == a.shape && g.0.stride[1] == 1 && g.0.stride[0] >= u64::from(heads),
             "GDN g layout mismatch"
         );
         for t in [&a, &b] {
@@ -578,7 +602,9 @@ impl GateOps {
             no_overlap(t, &g.0)?;
         }
         no_overlap(&beta.0, &g.0)?;
-        let blocks = (u64::from(rows.row_capacity) * 48).div_ceil(256).min(65535);
+        let blocks = (u64::from(rows.row_capacity) * u64::from(heads))
+            .div_ceil(256)
+            .min(65535);
         unsafe {
             stream
                 .launch_builder(&self.gdn)

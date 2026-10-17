@@ -24,7 +24,9 @@
 #endif
 #define GDN_SUB   16          // UT sub-block
 #define GDN_THREADS 512
+#ifndef GDN_HEADS
 #define GDN_HEADS 48
+#endif
 #define GDN_DK    128
 #define GDN_DV    128
 

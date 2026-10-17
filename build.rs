@@ -188,28 +188,48 @@ fn main() {
             .to_str()
             .expect("invalid kernel filename")
             .replace('\\', "/");
-        for sm in &archs {
-            let filename = format!("{name}_sm{sm}.cubin");
-            let cubin = out.join(&filename);
-            fs::create_dir_all(cubin.parent().expect("cubin has no parent"))
-                .expect("cannot create cubin directory");
-            let result = Command::new(&nvcc)
-                .env("TMPDIR", &temp)
-                .args(["--cubin", "--threads=1", "-O3", "--std=c++17"])
-                .arg(format!("-arch=sm_{sm}"))
-                .arg(&file)
-                .arg("-o")
-                .arg(&cubin)
-                .output()
-                .expect("cannot compile CUDA kernel");
-            assert!(
-                result.status.success(),
-                "nvcc failed for {} sm_{sm}:\n{}\n{}",
-                file.display(),
-                String::from_utf8_lossy(&result.stdout),
-                String::from_utf8_lossy(&result.stderr)
-            );
-            index.push_str(&format!("({name:?}, {sm}) => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/\", {filename:?}))),\n"));
+        let variants: &[(&str, &[&str])] = if name.starts_with("gdn/") {
+            &[
+                ("", &[]),
+                ("_h32", &["-DGDN_HEADS=32", "-DGDN_CONV_DIM=8192"]),
+            ]
+        } else if name == "tcmqa_d256" {
+            &[
+                ("", &[]),
+                (
+                    "_q16_kv2",
+                    &["-DATTENTION_Q_HEADS=16", "-DATTENTION_KV_HEADS=2"],
+                ),
+            ]
+        } else {
+            &[("", &[])]
+        };
+        for (suffix, defines) in variants {
+            let name = format!("{name}{suffix}");
+            for sm in &archs {
+                let filename = format!("{name}_sm{sm}.cubin");
+                let cubin = out.join(&filename);
+                fs::create_dir_all(cubin.parent().expect("cubin has no parent"))
+                    .expect("cannot create cubin directory");
+                let result = Command::new(&nvcc)
+                    .env("TMPDIR", &temp)
+                    .args(["--cubin", "--threads=1", "-O3", "--std=c++17"])
+                    .args(*defines)
+                    .arg(format!("-arch=sm_{sm}"))
+                    .arg(&file)
+                    .arg("-o")
+                    .arg(&cubin)
+                    .output()
+                    .expect("cannot compile CUDA kernel");
+                assert!(
+                    result.status.success(),
+                    "nvcc failed for {} sm_{sm}:\n{}\n{}",
+                    file.display(),
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                index.push_str(&format!("({name:?}, {sm}) => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/\", {filename:?}))),\n"));
+            }
         }
     }
     index.push_str("_ => None,\n}\n}\n");

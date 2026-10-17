@@ -99,3 +99,23 @@ impl Device {
 
 #[cfg(test)]
 mod q38_tests;
+
+#[cfg(test)]
+pub(crate) fn mixer_reference_only() -> Result<bool> {
+    match std::env::var("FF_MIXER_GATE_PHASE").as_deref() {
+        Ok("reference") => Ok(true),
+        Ok("candidate") => Ok(false),
+        _ => anyhow::bail!("FF_MIXER_GATE_PHASE must be reference or candidate"),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn mixer_reference_dump(name: &str, bytes: &[u8]) -> Result<()> {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("FF_Q38_PROBE_DIR").context("FF_Q38_PROBE_DIR is required")?,
+    )
+    .join("reference");
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(root.join(name), bytes)?;
+    Ok(())
+}
