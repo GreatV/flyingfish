@@ -15,6 +15,97 @@ pub struct RgbImage {
     pub pixels: Vec<u8>,
 }
 
+/// Decoded-video metadata: decode order, average fps and duration in seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VideoMetadata {
+    pub total_num_frames: usize,
+    pub fps: f64,
+    pub duration: f64,
+}
+
+impl VideoMetadata {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.total_num_frames > 0,
+            "video metadata: zero total frames"
+        );
+        ensure!(
+            self.fps.is_finite() && self.fps > 0.0,
+            "video metadata: invalid fps {}",
+            self.fps
+        );
+        ensure!(
+            self.duration.is_finite() && self.duration > 0.0,
+            "video metadata: invalid duration {}",
+            self.duration
+        );
+        Ok(())
+    }
+}
+
+/// Python `round(value, 1)`: the nearest double to the one-decimal value.
+fn round_to_one_decimal(value: f64) -> f64 {
+    (value * 10.0).round_ties_even() / 10.0
+}
+
+/// `numpy.linspace(0, len - 1, count, dtype=int)` positions.
+fn linspace_positions(len: usize, count: usize) -> Vec<usize> {
+    if count == 1 {
+        return vec![0];
+    }
+    let delta = (len - 1) as f64 / (count - 1) as f64;
+    (0..count).map(|k| (delta * k as f64) as usize).collect()
+}
+
+/// Frames sampled from decode order, stack_frames = 1 (model definition `sample_frames`).
+pub fn sample_frame_indices(
+    meta: &VideoMetadata,
+    max_num_frames: usize,
+    stack_frames: u32,
+) -> Result<Vec<usize>> {
+    ensure!(
+        stack_frames == 1,
+        "stack_frames {stack_frames} is not claimed; first support samples stack_frames = 1"
+    );
+    ensure!(max_num_frames > 0, "zero max_num_frames");
+    meta.validate()?;
+    let mut indices = if meta.duration > max_num_frames as f64 {
+        let count = (meta.duration / 0.1) as usize;
+        let mut timestamps = Vec::with_capacity(count);
+        for i in 0..count {
+            timestamps.push(round_to_one_decimal(i as f64 * 0.1));
+        }
+        let mut main: Vec<usize> = timestamps
+            .iter()
+            .map(|&timestamp| {
+                let index = (timestamp * meta.fps) as usize;
+                index.min(meta.total_num_frames - 1)
+            })
+            .collect();
+        if main.len() > max_num_frames {
+            let positions = linspace_positions(main.len(), max_num_frames);
+            main = positions.iter().map(|&position| main[position]).collect();
+        }
+        main
+    } else {
+        let seconds = meta.duration.ceil() as usize;
+        let mut main = Vec::with_capacity(seconds);
+        for i in 0..seconds {
+            let index = (i as f64 * meta.fps) as usize;
+            ensure!(
+                index < meta.total_num_frames,
+                "video metadata: sampled frame {index} outside {} frames",
+                meta.total_num_frames
+            );
+            main.push(index);
+        }
+        main
+    };
+    ensure!(!indices.is_empty(), "video sampling produced no frames");
+    indices.shrink_to_fit();
+    Ok(indices)
+}
+
 pub struct PackedImage {
     pub grids: Vec<ImageGrid>,
     pub rows: u32,
@@ -1409,5 +1500,109 @@ mod tests {
             assert_eq!(prepared.grids.len(), 1);
         }
         Ok(())
+    }
+
+    #[test]
+    fn video_sampling_matches_the_model_definition() -> Result<()> {
+        let short = VideoMetadata {
+            total_num_frames: 60,
+            fps: 30.0,
+            duration: 2.0,
+        };
+        assert_eq!(sample_frame_indices(&short, 8, 1)?, vec![0, 30]);
+        assert_eq!(sample_frame_indices(&short, 128, 1)?, vec![0, 30]);
+        let long = VideoMetadata {
+            total_num_frames: 600,
+            fps: 30.0,
+            duration: 20.0,
+        };
+        assert_eq!(
+            sample_frame_indices(&long, 8, 1)?,
+            vec![0, 84, 168, 255, 339, 426, 510, 597]
+        );
+        let one = VideoMetadata {
+            total_num_frames: 30,
+            fps: 30.0,
+            duration: 1.0,
+        };
+        assert_eq!(sample_frame_indices(&one, 8, 1)?, vec![0]);
+        let fraction = VideoMetadata {
+            total_num_frames: 12,
+            fps: 30.0,
+            duration: 0.4,
+        };
+        assert_eq!(sample_frame_indices(&fraction, 8, 1)?, vec![0]);
+        let capped = VideoMetadata {
+            total_num_frames: 3_900,
+            fps: 30.0,
+            duration: 130.0,
+        };
+        let indices = sample_frame_indices(&capped, 128, 1)?;
+        assert_eq!(indices.len(), 128);
+        assert_eq!(&indices[..3], &[0, 30, 60]);
+        assert_eq!(&indices[125..], &[3_834, 3_864, 3_897]);
+        let nine = VideoMetadata {
+            total_num_frames: 216,
+            fps: 24.0,
+            duration: 9.0,
+        };
+        assert_eq!(
+            sample_frame_indices(&nine, 8, 1)?,
+            vec![0, 28, 60, 91, 120, 151, 182, 213]
+        );
+        let ten = VideoMetadata {
+            total_num_frames: 240,
+            fps: 24.0,
+            duration: 10.0,
+        };
+        assert_eq!(
+            sample_frame_indices(&ten, 8, 1)?,
+            vec![0, 33, 67, 100, 134, 168, 201, 237]
+        );
+        let exactly = VideoMetadata {
+            total_num_frames: 3_840,
+            fps: 30.0,
+            duration: 128.0,
+        };
+        let indices = sample_frame_indices(&exactly, 128, 1)?;
+        assert_eq!(indices.len(), 128);
+        assert_eq!(&indices[..2], &[0, 30]);
+        assert_eq!(&indices[126..], &[3_780, 3_810]);
+        Ok(())
+    }
+
+    #[test]
+    fn video_sampling_validates_metadata_and_scope() {
+        let meta = VideoMetadata {
+            total_num_frames: 60,
+            fps: 30.0,
+            duration: 2.0,
+        };
+        let error = sample_frame_indices(&meta, 8, 3).unwrap_err().to_string();
+        assert!(error.contains("stack_frames 3 is not claimed"), "{error}");
+        assert!(sample_frame_indices(&meta, 0, 1).is_err());
+        let zero = VideoMetadata {
+            total_num_frames: 0,
+            ..meta
+        };
+        assert!(sample_frame_indices(&zero, 8, 1).is_err());
+        let bad_fps = VideoMetadata {
+            fps: f64::NAN,
+            ..meta
+        };
+        assert!(sample_frame_indices(&bad_fps, 8, 1).is_err());
+        let bad_duration = VideoMetadata {
+            duration: 0.0,
+            ..meta
+        };
+        assert!(sample_frame_indices(&bad_duration, 8, 1).is_err());
+        let inconsistent = VideoMetadata {
+            total_num_frames: 10,
+            ..meta
+        };
+        let error = sample_frame_indices(&inconsistent, 8, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside 10 frames"), "{error}");
     }
 }
