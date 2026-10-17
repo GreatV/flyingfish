@@ -94,6 +94,23 @@ impl ServiceTable {
         Ok(best.map(|(_, workers)| workers).expect("best is set"))
     }
 
+    /// Largest measured row count.
+    pub fn max_rows(&self) -> u32 {
+        self.cells.iter().map(|cell| cell.rows).max().unwrap_or(0)
+    }
+
+    /// Measured or interpolated cell, extended linearly in rows above the largest measured row.
+    pub fn rows_time(&self, rows: u32, experts: u32, workers: u32) -> Result<f64> {
+        ensure!(rows > 0, "zero service rows");
+        let max = self.max_rows();
+        ensure!(max > 0, "empty service table");
+        if rows <= max {
+            self.seconds(rows, experts, workers)
+        } else {
+            Ok(self.seconds(max, experts, workers)? * f64::from(rows) / f64::from(max))
+        }
+    }
+
     /// Measured or linearly interpolated service time over the experts axis.
     pub fn seconds(&self, rows: u32, experts: u32, workers: u32) -> Result<f64> {
         ensure!(
