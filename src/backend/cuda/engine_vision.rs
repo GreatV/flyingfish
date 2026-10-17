@@ -226,13 +226,15 @@ fn splice_bounds(
     u32::try_from(range.feature_rows.len()).context("image splice exceeds device range")
 }
 
-/// One image segment of the split-QKV pack: three token-major projections into head-major Q/K/V.
+/// One image segment of the split-QKV pack: three token-major projections into head-major Q,
+/// padded head-major K and V.
 struct SegmentPack<'a> {
     q_in: &'a Tensor<bf16, 2>,
     k_in: &'a Tensor<bf16, 2>,
     v_in: &'a Tensor<bf16, 2>,
     q: &'a Tensor<bf16, 3>,
-    k: &'a Tensor<bf16, 3>,
+    /// Destination of the padded K rows.
+    k: u64,
     v: &'a Tensor<bf16, 3>,
     rows: u32,
     padded: u32,
@@ -436,7 +438,7 @@ impl VisionIo {
         Ok(())
     }
 
-    /// Three token-major projections -> head-major Q/K/V over one image segment.
+    /// Three token-major projections -> head-major Q, padded K and V over one image segment.
     fn pack_split(
         &self,
         stream: &Arc<CudaStream>,
@@ -457,7 +459,7 @@ impl VisionIo {
                 .arg(&pack.k_in.ptr)
                 .arg(&pack.v_in.ptr)
                 .arg(&pack.q.ptr)
-                .arg(&pack.k.ptr)
+                .arg(&pack.k)
                 .arg(&pack.v.ptr)
                 .arg(&pack.rows)
                 .arg(&pack.padded)
@@ -1708,7 +1710,7 @@ impl VisionRuntime {
                                 k_in: &dense_at(buffers.qkv, stream, [rows, width], plane)?,
                                 v_in: &dense_at(buffers.qkv, stream, [rows, width], 2 * plane)?,
                                 q: &q,
-                                k: &k,
+                                k: stage.attention.padded_key_ptr(&run.scratch),
                                 v: &v,
                                 rows,
                                 padded: stage.padded,
@@ -1834,7 +1836,6 @@ impl VisionRuntime {
         let v_out = dense_at(&request.qkv, stream, [rows, width], 2 * plane)?;
         window.v.run(stream, blas, normed, &mut TensorMut(v_out))?;
         let q = dense(&request.q, stream, [spec.hq, rows, spec.d])?;
-        let k = dense(&request.k, stream, [spec.hq, rows, spec.d])?;
         let v = stage_view(
             &request.v,
             stream,
@@ -1851,7 +1852,7 @@ impl VisionRuntime {
                     k_in: &dense_at(&request.qkv, stream, [rows, width], plane)?,
                     v_in: &dense_at(&request.qkv, stream, [rows, width], 2 * plane)?,
                     q: &q,
-                    k: &k,
+                    k: tower.window.padded_key_ptr(&scratch),
                     v: &v,
                     rows,
                     padded: tower.window_packing.padded_rows(),

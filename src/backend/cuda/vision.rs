@@ -263,10 +263,15 @@ fn align(n: u64) -> Result<u64> {
         & !(WS_ALIGN - 1))
 }
 
-/// Scratch layout of the attention stage: `(q_rot, k_rot, k_pad, bytes)`.
-fn attn_layout(rows: u32, krows: u32) -> Result<(u64, u64, u64, u64)> {
+/// Scratch layout of the attention stage: `(q_rot, k_rot, k_pad, bytes)`; the two rotation
+/// buffers exist only when the spec applies RoPE.
+fn attn_layout(rows: u32, krows: u32, rope: bool) -> Result<(u64, u64, u64, u64)> {
     let row_bytes = u64::from(HQ) * u64::from(D) * 2;
-    let rot_bytes = align(u64::from(rows) * row_bytes)?;
+    let rot_bytes = if rope {
+        align(u64::from(rows) * row_bytes)?
+    } else {
+        0
+    };
     let off_q_rot = 0u64;
     let off_k_rot = rot_bytes;
     let off_k_pad = off_k_rot
@@ -303,11 +308,18 @@ fn dense<T: Copy, const R: usize>(view: &Tensor<T, R>, name: &str) -> Result<()>
     Ok(())
 }
 
+impl VisionAttnPlan {
+    /// Destination of the padded key rows when the spec skips RoPE.
+    pub(crate) fn padded_key_ptr(&self, scratch: &Scratch) -> u64 {
+        scratch.ptr + self.off_k_pad
+    }
+}
+
 impl VisionAttnOps {
     /// CPU-only checked sizing of the RoPE outputs and the padded K staging.
     pub(crate) fn workspace(spec: &VisionSpec, packing: &PatchPacking) -> Result<WorkspaceReq> {
         spec.validate()?;
-        let (_, _, _, bytes) = attn_layout(packing.real_rows(), packing.padded_rows())?;
+        let (_, _, _, bytes) = attn_layout(packing.real_rows(), packing.padded_rows(), spec.rope)?;
         Ok(WorkspaceReq {
             bytes,
             alignment: WS_ALIGN,
@@ -361,16 +373,19 @@ impl VisionAttnOps {
             "query tiles exceed the grid x limit"
         );
 
-        let (off_q_rot, off_k_rot, off_k_pad, scratch_bytes) = attn_layout(rows, krows)?;
+        let (off_q_rot, off_k_rot, off_k_pad, scratch_bytes) = attn_layout(rows, krows, spec.rope)?;
 
         // Per-image copies of rotated K real rows to their padded offsets, fixed by the plan.
-        let mut copies = Vec::with_capacity(grids.len() * HQ as usize);
-        for h in 0..u64::from(HQ) {
-            for (b, g) in grids.iter().enumerate() {
-                let n = u64::from(g.h) * u64::from(g.w);
-                let src = (h * u64::from(rows) + cu[b] as u64) * u64::from(D) * 2;
-                let dst = (h * u64::from(krows) + kb[b] as u64) * u64::from(D) * 2;
-                copies.push((src, dst, n * u64::from(D) * 2));
+        let mut copies = Vec::new();
+        if spec.rope {
+            copies.reserve(grids.len() * HQ as usize);
+            for h in 0..u64::from(HQ) {
+                for (b, g) in grids.iter().enumerate() {
+                    let n = u64::from(g.h) * u64::from(g.w);
+                    let src = (h * u64::from(rows) + cu[b] as u64) * u64::from(D) * 2;
+                    let dst = (h * u64::from(krows) + kb[b] as u64) * u64::from(D) * 2;
+                    copies.push((src, dst, n * u64::from(D) * 2));
+                }
             }
         }
 
@@ -465,7 +480,7 @@ impl VisionAttnOps {
             }
         }
         let q_source = if plan.rope_enabled { q_rot } else { b.q_in.ptr };
-        let k_source = if plan.rope_enabled { k_rot } else { b.k_in.ptr };
+        let k_source = if plan.rope_enabled { k_rot } else { k_pad };
 
         for &(src, dst, bytes) in &plan.copies {
             unsafe {

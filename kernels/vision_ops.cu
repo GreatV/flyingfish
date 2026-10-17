@@ -27,7 +27,8 @@ extern "C" __global__ void vision_patch_rows(
     }
 }
 
-// Three token-major `[rows, hq*d]` projections -> head-major Q/K/V for the attention core.
+// Three token-major `[rows, hq*d]` projections -> head-major Q, padded head-major K and V.
+// K and V both land at the image's padded key offsets; Q stays at the real-row offsets.
 extern "C" __global__ void vision_pack_split(
     const __nv_bfloat16* q_in, const __nv_bfloat16* k_in, const __nv_bfloat16* v_in,
     __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v,
@@ -40,9 +41,8 @@ extern "C" __global__ void vision_pack_split(
          i += uint64_t(gridDim.x) * 256) {
         uint32_t r = i / hidden, head = (i % hidden) / d, j = i % d;
         uint64_t src = uint64_t(first + r) * hidden + head * d + j;
-        uint64_t dst = (uint64_t(head) * rows + first + r) * d + j;
-        q[dst] = q_in[src];
-        k[dst] = k_in[src];
+        q[(uint64_t(head) * rows + first + r) * d + j] = q_in[src];
+        k[(uint64_t(head) * padded + key_first + r) * d + j] = k_in[src];
         v[(uint64_t(head) * padded + key_first + r) * d + j] = v_in[src];
     }
 }
