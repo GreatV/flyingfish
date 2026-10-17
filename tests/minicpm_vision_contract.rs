@@ -27,27 +27,20 @@ const CASES: [&str; 10] = [
 /// f32 accumulation, not candidate measurements.
 const PIXEL_TOLERANCE: f32 = 4.0 / 255.0 + 4.0 * f32::EPSILON;
 
-fn integers(tensors: &SafeTensors<'_>, name: &str) -> Result<Vec<i64>> {
+fn tensor_values<T, const N: usize>(
+    tensors: &SafeTensors<'_>,
+    name: &str,
+    dtype: Dtype,
+    convert: impl Fn([u8; N]) -> T,
+) -> Result<Vec<T>> {
     let tensor = tensors.tensor(name)?;
-    ensure!(tensor.dtype() == Dtype::I64, "{name} must be I64");
+    ensure!(tensor.dtype() == dtype, "{name} must be {dtype:?}");
     Ok(tensor
         .data()
-        .as_chunks::<8>()
+        .as_chunks::<N>()
         .0
         .iter()
-        .map(|v| i64::from_le_bytes(*v))
-        .collect())
-}
-
-fn floats(tensors: &SafeTensors<'_>, name: &str) -> Result<Vec<f32>> {
-    let tensor = tensors.tensor(name)?;
-    ensure!(tensor.dtype() == Dtype::F32, "{name} must be F32");
-    Ok(tensor
-        .data()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|v| f32::from_le_bytes(*v))
+        .map(|v| convert(*v))
         .collect())
 }
 
@@ -70,9 +63,11 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
     for case in CASES {
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
         let tensors = SafeTensors::deserialize(&bytes)?;
-        let count = usize::try_from(integers(&tensors, "image_count")?[0])?;
-        let widths = integers(&tensors, "image_widths")?;
-        let heights = integers(&tensors, "image_heights")?;
+        let count = usize::try_from(
+            tensor_values(&tensors, "image_count", Dtype::I64, i64::from_le_bytes)?[0],
+        )?;
+        let widths = tensor_values(&tensors, "image_widths", Dtype::I64, i64::from_le_bytes)?;
+        let heights = tensor_values(&tensors, "image_heights", Dtype::I64, i64::from_le_bytes)?;
         let mut images = Vec::with_capacity(count);
         for index in 0..count {
             let tensor = tensors.tensor(&format!("rgb_{index}"))?;
@@ -89,25 +84,32 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
                 pixels: tensor.data().to_vec(),
             })?);
         }
-        let prompt: Vec<u32> = integers(&tensors, "prompt_ids")?
-            .into_iter()
-            .map(u32::try_from)
-            .collect::<std::result::Result<_, _>>()?;
-        let expected_ids: Vec<u32> = integers(&tensors, "input_ids")?
-            .into_iter()
-            .map(u32::try_from)
-            .collect::<std::result::Result<_, _>>()?;
+        let prompt: Vec<u32> =
+            tensor_values(&tensors, "prompt_ids", Dtype::I64, i64::from_le_bytes)?
+                .into_iter()
+                .map(u32::try_from)
+                .collect::<std::result::Result<_, _>>()?;
+        let expected_ids: Vec<u32> =
+            tensor_values(&tensors, "input_ids", Dtype::I64, i64::from_le_bytes)?
+                .into_iter()
+                .map(u32::try_from)
+                .collect::<std::result::Result<_, _>>()?;
         let capacity = expected_ids.len() + 64;
         let (expanded, prepared) = processor.expand(&prompt, images, capacity)?;
         assert_eq!(expanded, expected_ids, "{case} ids");
 
-        let expected_modality: Vec<u8> = integers(&tensors, "mm_token_type_ids")?
-            .into_iter()
-            .map(u8::try_from)
-            .collect::<std::result::Result<_, _>>()?;
+        let expected_modality: Vec<u8> = tensor_values(
+            &tensors,
+            "mm_token_type_ids",
+            Dtype::I64,
+            i64::from_le_bytes,
+        )?
+        .into_iter()
+        .map(u8::try_from)
+        .collect::<std::result::Result<_, _>>()?;
         assert_eq!(prepared.modality_ids, expected_modality, "{case} modality");
 
-        let target_sizes = integers(&tensors, "target_sizes")?;
+        let target_sizes = tensor_values(&tensors, "target_sizes", Dtype::I64, i64::from_le_bytes)?;
         let expected_grids: Vec<ImageGrid> = target_sizes
             .as_chunks::<2>()
             .0
@@ -122,7 +124,12 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
             .collect::<Result<_>>()?;
         assert_eq!(prepared.grids, expected_grids, "{case} grids");
 
-        let reference = floats(&tensors, "pixel_values_fp32")?;
+        let reference = tensor_values(
+            &tensors,
+            "pixel_values_fp32",
+            Dtype::F32,
+            f32::from_le_bytes,
+        )?;
         assert_eq!(
             prepared.pixel_values.len(),
             reference.len(),
@@ -152,7 +159,7 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
         );
 
         let plan = prepared.input(&expanded).validate(&spec, capacity)?;
-        let positions = integers(&tensors, "positions")?;
+        let positions = tensor_values(&tensors, "positions", Dtype::I64, i64::from_le_bytes)?;
         let len = expanded.len();
         ensure!(
             positions.len() == 3 * len,
@@ -169,7 +176,7 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
         }
         assert_eq!(
             plan.rope_delta(),
-            integers(&tensors, "rope_delta")?[0],
+            tensor_values(&tensors, "rope_delta", Dtype::I64, i64::from_le_bytes)?[0],
             "{case} rope delta"
         );
         if case == CASES[0] {
@@ -376,46 +383,21 @@ fn patch_embedding(
     out
 }
 
-fn checkpoint_tensor(model_dir: &std::path::Path, name: &str) -> Result<(Vec<usize>, Vec<u8>)> {
-    use std::io::{Read, Seek, SeekFrom};
+fn checkpoint_bf16(model_dir: &std::path::Path, name: &str) -> Result<(Vec<usize>, Vec<f32>)> {
     let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
         model_dir.join("model.safetensors.index.json"),
     )?)?;
     let shard = index["weight_map"][name]
         .as_str()
         .with_context(|| format!("shard for {name}"))?;
-    let mut file = std::fs::File::open(model_dir.join(shard))?;
-    let mut len = [0u8; 8];
-    file.read_exact(&mut len)?;
-    let header_len = u64::from_le_bytes(len) as usize;
-    let mut header = vec![0u8; header_len];
-    file.read_exact(&mut header)?;
-    let header: serde_json::Value = serde_json::from_slice(&header)?;
-    let entry = &header[name];
-    let shape: Vec<usize> = entry["shape"]
-        .as_array()
-        .with_context(|| format!("shape of {name}"))?
-        .iter()
-        .map(|v| Ok(v.as_u64().context("dim")? as usize))
-        .collect::<Result<_>>()?;
-    let start = entry["data_offsets"][0].as_u64().context("data start")?;
-    let end = entry["data_offsets"][1].as_u64().context("data end")?;
-    file.seek(SeekFrom::Start(8 + header_len as u64 + start))?;
-    let mut data = vec![0u8; (end - start) as usize];
-    file.read_exact(&mut data)?;
-    Ok((shape, data))
-}
-
-fn checkpoint_bf16(model_dir: &std::path::Path, name: &str) -> Result<(Vec<usize>, Vec<f32>)> {
-    let (shape, data) = checkpoint_tensor(model_dir, name)?;
-    Ok((
-        shape,
-        data.as_chunks::<2>()
-            .0
-            .iter()
-            .map(|v| half::bf16::from_bits(u16::from_le_bytes(*v)).to_f32())
-            .collect(),
-    ))
+    let file = std::fs::File::open(model_dir.join(shard))?;
+    let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+    let tensors = SafeTensors::deserialize(&map)?;
+    let shape = tensors.tensor(name)?.shape().to_vec();
+    let values = tensor_values(&tensors, name, Dtype::BF16, |v| {
+        half::bf16::from_bits(u16::from_le_bytes(v)).to_f32()
+    })?;
+    Ok((shape, values))
 }
 
 /// Pins the NaViT pack order at the patch embedding: the correct (c, ky, patch, kx) gather plus the
@@ -441,15 +423,7 @@ fn patch_rows_reorder_matches_the_reference() -> Result<()> {
     let file = std::fs::File::open(fixtures.join("image_hockey_16x.safetensors"))?;
     let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
     let source = SafeTensors::deserialize(&map)?;
-    let sizes = source.tensor("target_sizes")?;
-    ensure!(sizes.dtype() == Dtype::I32, "target_sizes must be I32");
-    let sizes: Vec<i32> = sizes
-        .data()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|v| i32::from_le_bytes(*v))
-        .collect();
+    let sizes = tensor_values(&source, "target_sizes", Dtype::I32, i32::from_le_bytes)?;
     ensure!(sizes.len() == 2, "single-image fixture expected");
     let grids = [ImageGrid {
         t: 1,
@@ -457,24 +431,10 @@ fn patch_rows_reorder_matches_the_reference() -> Result<()> {
         w: u32::try_from(sizes[1])?,
     }];
     let patches = (grids[0].h * grids[0].w) as usize;
-    let pixels_tensor = source.tensor("pixel_values")?;
-    ensure!(pixels_tensor.dtype() == Dtype::F32, "pixel dtype");
-    let pixels: Vec<f32> = pixels_tensor
-        .data()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|v| f32::from_le_bytes(*v))
-        .collect();
-    let reference_tensor = source.tensor("vision_patch_embeddings")?;
-    ensure!(reference_tensor.dtype() == Dtype::BF16, "reference dtype");
-    let reference: Vec<f32> = reference_tensor
-        .data()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|v| half::bf16::from_bits(u16::from_le_bytes(*v)).to_f32())
-        .collect();
+    let pixels = tensor_values(&source, "pixel_values", Dtype::F32, f32::from_le_bytes)?;
+    let reference = tensor_values(&source, "vision_patch_embeddings", Dtype::BF16, |v| {
+        half::bf16::from_bits(u16::from_le_bytes(v)).to_f32()
+    })?;
     let (weight_shape, weight) = checkpoint_bf16(
         &model_dir,
         "model.vision_tower.embeddings.patch_embedding.weight",
@@ -606,29 +566,21 @@ fn final_merger_groups_match_the_reference() -> Result<()> {
     let file = std::fs::File::open(fixtures.join("image_hockey_16x.safetensors"))?;
     let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
     let source = SafeTensors::deserialize(&map)?;
-    let sizes = source.tensor("target_sizes")?;
-    ensure!(sizes.dtype() == Dtype::I32, "target_sizes must be I32");
-    let sizes: Vec<i32> = sizes
-        .data()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|v| i32::from_le_bytes(*v))
-        .collect();
+    let sizes = tensor_values(&source, "target_sizes", Dtype::I32, i32::from_le_bytes)?;
     let (h, w) = (sizes[0] as u32, sizes[1] as u32);
-    let tower_tensor = source.tensor("vision_tower_out")?;
-    ensure!(tower_tensor.dtype() == Dtype::BF16, "tower dtype");
-    let tower_shape = tower_tensor.shape().to_vec();
-    let tower = bf16_values(tower_tensor.data());
+    let tower = tensor_values(&source, "vision_tower_out", Dtype::BF16, |v| {
+        half::bf16::from_bits(u16::from_le_bytes(v)).to_f32()
+    })?;
+    let tower_shape = source.tensor("vision_tower_out")?.shape().to_vec();
     ensure!(
         tower_shape == [1, ((h / 2) * (w / 2)) as usize, vision.hidden as usize],
         "tower shape {:?}",
         tower_shape
     );
-    let merger_tensor = source.tensor("merger_out")?;
-    ensure!(merger_tensor.dtype() == Dtype::BF16, "merger dtype");
-    let merger_shape = merger_tensor.shape().to_vec();
-    let reference = bf16_values(merger_tensor.data());
+    let merger_shape = source.tensor("merger_out")?.shape().to_vec();
+    let reference = tensor_values(&source, "merger_out", Dtype::BF16, |v| {
+        half::bf16::from_bits(u16::from_le_bytes(v)).to_f32()
+    })?;
     ensure!(
         merger_shape == [((h / 4) * (w / 4)) as usize, vision.output as usize],
         "merger shape {:?}",
@@ -709,12 +661,4 @@ fn final_merger_groups_match_the_reference() -> Result<()> {
         worst[1]
     );
     Ok(())
-}
-
-fn bf16_values(data: &[u8]) -> Vec<f32> {
-    data.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|v| half::bf16::from_bits(u16::from_le_bytes(*v)).to_f32())
-        .collect()
 }

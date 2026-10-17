@@ -2569,42 +2569,20 @@ mod tests {
         worst
     }
 
-    fn bf16_tensor(source: &safetensors::SafeTensors<'_>, name: &str) -> Result<Vec<f32>> {
-        use safetensors::Dtype;
+    fn tensor_values<T, const N: usize>(
+        source: &safetensors::SafeTensors<'_>,
+        name: &str,
+        dtype: safetensors::Dtype,
+        convert: impl Fn([u8; N]) -> T,
+    ) -> Result<Vec<T>> {
         let tensor = source.tensor(name)?;
-        ensure!(tensor.dtype() == Dtype::BF16, "{name} must be BF16");
+        ensure!(tensor.dtype() == dtype, "{name} must be {dtype:?}");
         Ok(tensor
             .data()
-            .as_chunks::<2>()
+            .as_chunks::<N>()
             .0
             .iter()
-            .map(|v| bf16::from_bits(u16::from_le_bytes(*v)).to_f32())
-            .collect())
-    }
-
-    fn i64_tensor(source: &safetensors::SafeTensors<'_>, name: &str) -> Result<Vec<i64>> {
-        use safetensors::Dtype;
-        let tensor = source.tensor(name)?;
-        ensure!(tensor.dtype() == Dtype::I64, "{name} must be I64");
-        Ok(tensor
-            .data()
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|v| i64::from_le_bytes(*v))
-            .collect())
-    }
-
-    fn i32_tensor(source: &safetensors::SafeTensors<'_>, name: &str) -> Result<Vec<i32>> {
-        use safetensors::Dtype;
-        let tensor = source.tensor(name)?;
-        ensure!(tensor.dtype() == Dtype::I32, "{name} must be I32");
-        Ok(tensor
-            .data()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|v| i32::from_le_bytes(*v))
+            .map(|v| convert(*v))
             .collect())
     }
 
@@ -2716,7 +2694,12 @@ mod tests {
             let file = std::fs::File::open(fixtures.join(format!("{case}.safetensors")))?;
             let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
             let source = safetensors::SafeTensors::deserialize(&map)?;
-            let sizes = i32_tensor(&source, "target_sizes")?;
+            let sizes = tensor_values(
+                &source,
+                "target_sizes",
+                safetensors::Dtype::I32,
+                i32::from_le_bytes,
+            )?;
             ensure!(sizes.len().is_multiple_of(2), "target_sizes extent");
             let grids: Vec<ImageGrid> = sizes
                 .chunks(2)
@@ -2728,14 +2711,24 @@ mod tests {
                     })
                 })
                 .collect::<Result<_>>()?;
-            let ids: Vec<u32> = i64_tensor(&source, "input_ids")?
-                .into_iter()
-                .map(|id| Ok(u32::try_from(id)?))
-                .collect::<Result<_>>()?;
-            let modalities: Vec<u8> = i64_tensor(&source, "mm_token_type_ids")?
-                .into_iter()
-                .map(|m| Ok(u8::try_from(m)?))
-                .collect::<Result<_>>()?;
+            let ids: Vec<u32> = tensor_values(
+                &source,
+                "input_ids",
+                safetensors::Dtype::I64,
+                i64::from_le_bytes,
+            )?
+            .into_iter()
+            .map(|id| Ok(u32::try_from(id)?))
+            .collect::<Result<_>>()?;
+            let modalities: Vec<u8> = tensor_values(
+                &source,
+                "mm_token_type_ids",
+                safetensors::Dtype::I64,
+                i64::from_le_bytes,
+            )?
+            .into_iter()
+            .map(|m| Ok(u8::try_from(m)?))
+            .collect::<Result<_>>()?;
             let pixel_tensor = source.tensor("pixel_values")?;
             ensure!(
                 pixel_tensor.dtype() == safetensors::Dtype::F32,
@@ -2771,7 +2764,10 @@ mod tests {
             let reference = safetensors::SafeTensors::deserialize(&ref_map)?;
             for tap in MINICPM_TAPS {
                 let candidate = trace.values(tap)?;
-                let reference_values = bf16_tensor(&reference, tap)?;
+                let reference_values =
+                    tensor_values(&reference, tap, safetensors::Dtype::BF16, |v| {
+                        bf16::from_bits(u16::from_le_bytes(v)).to_f32()
+                    })?;
                 let metrics = tap_metrics(&candidate, &reference_values)?;
                 let k = tolerances[case][tap]["k"]
                     .as_f64()
@@ -2780,7 +2776,9 @@ mod tests {
                     .as_f64()
                     .with_context(|| format!("missing rms {case}/{tap}"))?;
                 let ratio = ulp_ratio(&candidate, &reference_values, rms as f32);
-                let fixture_values = bf16_tensor(&source, tap)?;
+                let fixture_values = tensor_values(&source, tap, safetensors::Dtype::BF16, |v| {
+                    bf16::from_bits(u16::from_le_bytes(v)).to_f32()
+                })?;
                 let fixture_metrics = tap_metrics(&candidate, &fixture_values)?;
                 let pass = ratio <= k;
                 eprintln!(
