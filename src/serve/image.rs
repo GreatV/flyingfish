@@ -53,18 +53,15 @@ pub struct DecodedVideo {
     pub timestamps: Vec<f64>,
 }
 
-/// Python `round(value, 1)`: the nearest double to the one-decimal value.
-fn round_to_one_decimal(value: f64) -> f64 {
-    (value * 10.0).round_ties_even() / 10.0
-}
-
-/// `numpy.linspace(0, len - 1, count, dtype=int)` positions.
+/// `numpy.linspace(0, len - 1, count, dtype=int)` positions; the endpoint is exactly `len - 1`.
 fn linspace_positions(len: usize, count: usize) -> Vec<usize> {
     if count == 1 {
         return vec![0];
     }
     let delta = (len - 1) as f64 / (count - 1) as f64;
-    (0..count).map(|k| (delta * k as f64) as usize).collect()
+    let mut positions: Vec<usize> = (0..count).map(|k| (delta * k as f64) as usize).collect();
+    positions[count - 1] = len - 1;
+    positions
 }
 
 /// Frames sampled from decode order, stack_frames = 1 (model definition `sample_frames`).
@@ -79,11 +76,11 @@ pub fn sample_frame_indices(
     );
     ensure!(max_num_frames > 0, "zero max_num_frames");
     meta.validate()?;
-    let mut indices = if meta.duration > max_num_frames as f64 {
+    let indices = if meta.duration > max_num_frames as f64 {
         let count = (meta.duration / 0.1) as usize;
         let mut timestamps = Vec::with_capacity(count);
         for i in 0..count {
-            timestamps.push(round_to_one_decimal(i as f64 * 0.1));
+            timestamps.push(i as f64 / 10.0);
         }
         let mut main: Vec<usize> = timestamps
             .iter()
@@ -112,10 +109,10 @@ pub fn sample_frame_indices(
         main
     };
     ensure!(!indices.is_empty(), "video sampling produced no frames");
-    indices.shrink_to_fit();
     Ok(indices)
 }
 
+#[derive(Debug)]
 pub struct PackedImage {
     pub grids: Vec<ImageGrid>,
     pub rows: u32,
@@ -132,26 +129,10 @@ pub struct VideoOptions {
     pub max_slice_nums: Option<usize>,
 }
 
-/// One prepared video frame: its slice grid and per-crop patch grids (thumbnail, then slices).
-#[derive(Debug)]
-pub struct VideoFrame {
-    pub rows: u32,
-    pub cols: u32,
-    pub grids: Vec<ImageGrid>,
-}
-
-/// Prepared video: packed crops in frame order.
+/// Prepared video: one packed entry per sampled frame, in sample order.
 #[derive(Debug)]
 pub struct PackedVideo {
-    pub frames: Vec<VideoFrame>,
-    pub pixel_values: Vec<f32>,
-}
-
-impl PackedVideo {
-    /// Per-crop patch grids in frame order, matching the prompt's crop runs.
-    pub fn crops(&self) -> impl Iterator<Item = &ImageGrid> {
-        self.frames.iter().flat_map(|frame| frame.grids.iter())
-    }
+    pub frames: Vec<PackedImage>,
 }
 
 pub struct PlannedImage {
@@ -465,13 +446,32 @@ impl Processor {
         meta: &VideoMetadata,
         options: &VideoOptions,
     ) -> Result<PackedVideo> {
-        let indices = sample_frame_indices(meta, options.max_num_frames, options.stack_frames)?;
         ensure!(
             frames.len() == meta.total_num_frames,
             "decoded video holds {} frames, metadata reports {}",
             frames.len(),
             meta.total_num_frames
         );
+        let mut size = None;
+        for (index, frame) in frames.iter().enumerate() {
+            let pixels = checked_pixels(frame.width, frame.height)?;
+            ensure!(
+                frame.pixels.len() == pixels * 3,
+                "video frame {index} RGB byte count does not match its dimensions"
+            );
+            match size {
+                None => size = Some((frame.width, frame.height)),
+                Some(expected) => ensure!(
+                    expected == (frame.width, frame.height),
+                    "video frame {index} is {}x{}; frame 0 is {}x{}",
+                    frame.width,
+                    frame.height,
+                    expected.0,
+                    expected.1
+                ),
+            }
+        }
+        let indices = sample_frame_indices(meta, options.max_num_frames, options.stack_frames)?;
         let ImageConfig::MiniCpm(base) = &self.config else {
             bail!("video input requires the MiniCPM image configuration")
         };
@@ -482,16 +482,11 @@ impl Processor {
         }
         let mut packed = PackedVideo {
             frames: Vec::with_capacity(indices.len()),
-            pixel_values: Vec::new(),
         };
         for &index in &indices {
-            let image = mini_cpm_prepare_rgb(&self.spec, &frames[index], &config)?;
-            packed.frames.push(VideoFrame {
-                rows: image.rows,
-                cols: image.cols,
-                grids: image.grids,
-            });
-            packed.pixel_values.extend_from_slice(&image.pixel_values);
+            packed
+                .frames
+                .push(mini_cpm_prepare_rgb(&self.spec, &frames[index], &config)?);
         }
         Ok(packed)
     }
@@ -616,20 +611,6 @@ impl Processor {
                     .checked_add(self.image_tokens(image, index)?)
                     .context("image token count overflow")
             })
-    }
-
-    /// Total video_token count of one prepared video.
-    pub fn video_tokens(&self, video: &PackedVideo) -> Result<usize> {
-        let vision = self
-            .spec
-            .vision
-            .as_ref()
-            .context("vision configuration missing")?;
-        video.frames.iter().try_fold(0usize, |total, frame| {
-            total
-                .checked_add(video_frame_tokens(vision, frame)?)
-                .context("video token count overflow")
-        })
     }
 
     pub fn expand(
@@ -941,33 +922,85 @@ fn get_sliced_grid(
     Some(best)
 }
 
-fn video_frame_tokens(
+struct VisualUnit<'a> {
+    tag: &'a [u32],
+    token: u32,
+    modality: u8,
+    unit: &'a PackedImage,
+}
+
+/// Emits one visual unit's placeholder block: tag, thumbnail run, then slice rows.
+fn push_visual_unit(
     vision: &crate::model_spec::VisionConfig,
-    frame: &VideoFrame,
+    markers: &crate::model_spec::MiniCpmVision,
+    expanded: &mut Vec<u32>,
+    modality_ids: &mut Vec<u8>,
+    visual: VisualUnit<'_>,
+    capacity: usize,
 ) -> Result<usize> {
-    let thumb = *frame.grids.first().context("video frame has no crops")?;
-    let mut tokens = thumb.feature_rows(vision.merge)?;
-    if frame.rows > 0 && frame.cols > 0 {
+    let unit = visual.unit;
+    let thumb = *unit.grids.first().context("visual unit has no crops")?;
+    let thumb_tokens = thumb.feature_rows(vision.merge)?;
+    let slices = if unit.rows > 0 && unit.cols > 0 {
+        let rows = unit.rows as usize;
+        let cols = unit.cols as usize;
         ensure!(
-            frame.grids.len() == 1 + frame.rows as usize * frame.cols as usize,
-            "crop count does not match the video slice grid"
+            unit.grids.len() == 1 + rows * cols,
+            "crop count does not match the slice grid"
         );
-        let slice = *frame
+        let slice = *unit
             .grids
             .get(1)
-            .context("sliced video frame lacks a slice crop")?;
-        tokens = tokens
-            .checked_add(
-                frame.rows as usize * frame.cols as usize * slice.feature_rows(vision.merge)?,
-            )
-            .context("video token count overflow")?;
+            .context("sliced unit lacks a slice crop")?;
+        Some((rows, cols, slice.feature_rows(vision.merge)?))
     } else {
-        ensure!(
-            frame.grids.len() == 1,
-            "unsliced video frame carries slice crops"
-        );
+        ensure!(unit.grids.len() == 1, "unsliced unit carries slice crops");
+        None
+    };
+    let mut len = visual
+        .tag
+        .len()
+        .checked_add(2)
+        .and_then(|n| n.checked_add(thumb_tokens))
+        .context("visual token count overflow")?;
+    if let Some((rows, cols, per_slice)) = slices {
+        len = len
+            .checked_add(rows - 1)
+            .and_then(|n| n.checked_add(rows * cols * (2 + per_slice)))
+            .context("visual token count overflow")?;
     }
-    Ok(tokens)
+    ensure!(
+        expanded
+            .len()
+            .checked_add(len)
+            .is_some_and(|n| n <= capacity),
+        "visual tokens exceed request capacity"
+    );
+    expanded.extend_from_slice(visual.tag);
+    modality_ids.extend(std::iter::repeat_n(0, visual.tag.len()));
+    expanded.push(vision.start_token);
+    modality_ids.push(0);
+    expanded.extend(std::iter::repeat_n(visual.token, thumb_tokens));
+    modality_ids.extend(std::iter::repeat_n(visual.modality, thumb_tokens));
+    expanded.push(vision.end_token);
+    modality_ids.push(0);
+    if let Some((rows, cols, per_slice)) = slices {
+        for row in 0..rows {
+            if row > 0 {
+                expanded.push(markers.newline_token);
+                modality_ids.push(0);
+            }
+            for _ in 0..cols {
+                expanded.push(markers.slice_start_token);
+                modality_ids.push(0);
+                expanded.extend(std::iter::repeat_n(visual.token, per_slice));
+                modality_ids.extend(std::iter::repeat_n(visual.modality, per_slice));
+                expanded.push(markers.slice_end_token);
+                modality_ids.push(0);
+            }
+        }
+    }
+    Ok(len)
 }
 
 fn expand_qwen(
@@ -1052,142 +1085,57 @@ fn expand_mini_cpm(
             let video = videos
                 .next()
                 .context("more video placeholders than supplied videos")?;
-            let tokens = video.frames.iter().try_fold(0usize, |total, frame| {
-                total
-                    .checked_add(video_frame_tokens(vision, frame)?)
-                    .context("video token count overflow")
-            })?;
-            let block = video
-                .frames
-                .len()
-                .checked_mul(2)
-                .and_then(|markers| markers.checked_add(tokens))
-                .context("video token count overflow")?;
-            ensure!(
-                expanded
-                    .len()
-                    .checked_add(block)
-                    .is_some_and(|n| n <= capacity),
-                "video tokens exceed request capacity"
-            );
+            ensure!(!video.frames.is_empty(), "video has no frames");
             for frame in &video.frames {
-                let thumb = *frame.grids.first().context("video frame has no crops")?;
-                let thumb_tokens = thumb.feature_rows(vision.merge)?;
-                expanded.push(vision.start_token);
-                prepared.modality_ids.push(0);
-                expanded.extend(std::iter::repeat_n(id, thumb_tokens));
-                prepared
-                    .modality_ids
-                    .extend(std::iter::repeat_n(2, thumb_tokens));
-                expanded.push(vision.end_token);
-                prepared.modality_ids.push(0);
-                if frame.rows > 0 && frame.cols > 0 {
-                    let slice = *frame
-                        .grids
-                        .get(1)
-                        .context("sliced video frame lacks a slice crop")?;
-                    let per_slice = slice.feature_rows(vision.merge)?;
-                    for row in 0..frame.rows {
-                        if row > 0 {
-                            expanded.push(markers.newline_token);
-                            prepared.modality_ids.push(0);
-                        }
-                        for _ in 0..frame.cols {
-                            expanded.push(markers.slice_start_token);
-                            prepared.modality_ids.push(0);
-                            expanded.extend(std::iter::repeat_n(id, per_slice));
-                            prepared
-                                .modality_ids
-                                .extend(std::iter::repeat_n(2, per_slice));
-                            expanded.push(markers.slice_end_token);
-                            prepared.modality_ids.push(0);
-                        }
-                    }
-                }
+                push_visual_unit(
+                    vision,
+                    markers,
+                    &mut expanded,
+                    &mut prepared.modality_ids,
+                    VisualUnit {
+                        tag: &[],
+                        token: id,
+                        modality: 2,
+                        unit: frame,
+                    },
+                    capacity,
+                )?;
             }
-            packed_patches.push(video.frames.iter().try_fold(
-                0usize,
-                |total, frame| -> Result<usize> {
-                    frame.grids.iter().try_fold(total, |acc, grid| {
-                        acc.checked_add(grid.patch_rows()?)
-                            .context("patch count overflow")
-                    })
-                },
-            )?);
+            for frame in &video.frames {
+                packed_patches.push(frame.grids.iter().try_fold(0usize, |total, grid| {
+                    total
+                        .checked_add(grid.patch_rows()?)
+                        .context("patch count overflow")
+                })?);
+            }
             prepared.grids.extend(
                 video
                     .frames
                     .iter()
                     .flat_map(|frame| frame.grids.iter().copied()),
             );
-            packed.push(video.pixel_values);
+            for frame in video.frames {
+                packed.push(frame.pixel_values);
+            }
         } else if id == vision.image_token {
             let image = images
                 .next()
                 .context("more image placeholders than supplied images")?;
             let tag = image_id.tag(index);
             index += 1;
-            let thumb = *image.grids.first().context("image has no crops")?;
-            let thumb_tokens = thumb.feature_rows(vision.merge)?;
-            let mut block = tag.len() + 2 + thumb_tokens;
-            if image.rows > 0 && image.cols > 0 {
-                ensure!(
-                    image.grids.len() == 1 + image.rows as usize * image.cols as usize,
-                    "crop count does not match the slice grid"
-                );
-                let slice = *image
-                    .grids
-                    .get(1)
-                    .context("sliced image lacks a slice crop")?;
-                let per_slice = slice.feature_rows(vision.merge)?;
-                block += image.rows as usize - 1;
-                block += image.rows as usize * image.cols as usize * (2 + per_slice);
-            } else {
-                ensure!(image.grids.len() == 1, "unsliced image carries slice crops");
-            }
-            ensure!(
-                expanded
-                    .len()
-                    .checked_add(block)
-                    .is_some_and(|n| n <= capacity),
-                "image tokens exceed request capacity"
-            );
-            let tag_len = tag.len();
-            expanded.extend(tag);
-            prepared
-                .modality_ids
-                .extend(std::iter::repeat_n(0, tag_len));
-            expanded.push(vision.start_token);
-            prepared.modality_ids.push(0);
-            expanded.extend(std::iter::repeat_n(id, thumb_tokens));
-            prepared
-                .modality_ids
-                .extend(std::iter::repeat_n(1, thumb_tokens));
-            expanded.push(vision.end_token);
-            prepared.modality_ids.push(0);
-            if image.rows > 0 && image.cols > 0 {
-                let slice = *image
-                    .grids
-                    .get(1)
-                    .context("sliced image lacks a slice crop")?;
-                let per_slice = slice.feature_rows(vision.merge)?;
-                for row in 0..image.rows {
-                    if row > 0 {
-                        expanded.push(markers.newline_token);
-                        prepared.modality_ids.push(0);
-                    }
-                    for _ in 0..image.cols {
-                        expanded.push(markers.slice_start_token);
-                        prepared.modality_ids.push(0);
-                        expanded.extend(std::iter::repeat_n(id, per_slice));
-                        prepared
-                            .modality_ids
-                            .extend(std::iter::repeat_n(1, per_slice));
-                        expanded.push(markers.slice_end_token);
-                        prepared.modality_ids.push(0);
-                    }
-                }
-            }
+            push_visual_unit(
+                vision,
+                markers,
+                &mut expanded,
+                &mut prepared.modality_ids,
+                VisualUnit {
+                    tag: &tag,
+                    token: id,
+                    modality: 1,
+                    unit: &image,
+                },
+                capacity,
+            )?;
             packed_patches.push(image.grids.iter().try_fold(0usize, |total, grid| {
                 total
                     .checked_add(grid.patch_rows()?)
@@ -2072,6 +2020,16 @@ mod tests {
         assert_eq!(indices.len(), 128);
         assert_eq!(&indices[..2], &[0, 30]);
         assert_eq!(&indices[126..], &[3_780, 3_810]);
+        // The last linspace position is exactly len - 1: 407 s at 30 fps ends at frame 12207.
+        let endpoint = VideoMetadata {
+            total_num_frames: 12_210,
+            fps: 30.0,
+            duration: 407.0,
+        };
+        let indices = sample_frame_indices(&endpoint, 128, 1)?;
+        assert_eq!(indices.len(), 128);
+        assert_eq!(&indices[..4], &[0, 96, 192, 288]);
+        assert_eq!(&indices[124..], &[11_916, 12_012, 12_108, 12_207]);
         Ok(())
     }
 
@@ -2171,16 +2129,19 @@ mod tests {
             assert_eq!(frame.grids.len(), 1);
             rows += frame.grids[0].patch_rows()?;
         }
-        assert_eq!(packed.pixel_values.len(), rows * patch);
-        // Distinct frame content must produce distinct packed pixels in frame order.
-        let per = rows / 2 * patch;
-        assert_ne!(packed.pixel_values[..per], packed.pixel_values[per..]);
+        let total: usize = packed
+            .frames
+            .iter()
+            .map(|frame| frame.pixel_values.len())
+            .sum();
+        assert_eq!(total, rows * patch);
+        assert_ne!(packed.frames[0].pixel_values, packed.frames[1].pixel_values);
         let sliced = VideoOptions {
             max_num_frames: 1,
             stack_frames: 1,
             max_slice_nums: Some(9),
         };
-        let large = vec![constant_frame(640, 480, 77), constant_frame(320, 240, 12)];
+        let large = vec![constant_frame(640, 480, 77), constant_frame(640, 480, 12)];
         let meta = VideoMetadata {
             total_num_frames: 2,
             fps: 1.0,
@@ -2190,6 +2151,42 @@ mod tests {
         assert_eq!(packed.frames.len(), 1);
         assert_eq!(packed.frames[0].grids.len(), 3);
         assert_eq!(packed.frames[0].rows * packed.frames[0].cols, 2);
+        let single = VideoMetadata {
+            total_num_frames: 1,
+            fps: 1.0,
+            duration: 1.0,
+        };
+        let only = processor.prepare_video(&[constant_frame(640, 480, 77)], &single, &sliced)?;
+        assert_eq!(packed.frames[0].pixel_values, only.frames[0].pixel_values);
+        assert_eq!(packed.frames[0].grids, only.frames[0].grids);
+        Ok(())
+    }
+
+    #[test]
+    fn video_pixels_interleave_like_the_same_frames_as_images() -> Result<()> {
+        let processor = video_processor()?;
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let frames = video_frames(2, 64, 48);
+        let options = VideoOptions {
+            max_num_frames: 2,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let video = processor.prepare_video(&frames, &video_meta(2), &options)?;
+        let images = frames
+            .iter()
+            .map(|frame| processor.prepare_rgb(frame))
+            .collect::<Result<Vec<_>>>()?;
+        let (_, video_prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 4096)?;
+        let (_, image_prepared) = processor.expand(
+            &[vision.image_token, vision.image_token],
+            images,
+            Vec::new(),
+            4096,
+        )?;
+        assert_eq!(video_prepared.pixel_values, image_prepared.pixel_values);
+        assert_eq!(video_prepared.grids, image_prepared.grids);
         Ok(())
     }
 
@@ -2236,6 +2233,20 @@ mod tests {
                 .prepare_video(&frames, &meta, &zero_slices)
                 .is_err()
         );
+        let mut bytes = video_frames(1, 64, 48);
+        bytes[0].pixels.pop();
+        let error = processor
+            .prepare_video(&bytes, &meta, &options)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RGB byte count"), "{error}");
+        let mut mixed = video_frames(2, 64, 48);
+        mixed[1] = constant_frame(64, 32, 5);
+        let error = processor
+            .prepare_video(&mixed, &video_meta(2), &options)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("video frame 1 is 64x32"), "{error}");
         Ok(())
     }
 
@@ -2409,7 +2420,16 @@ mod tests {
         };
         let packed = processor.prepare_video(&video.frames, &video.metadata, &options)?;
         assert_eq!(packed.frames.len(), 2);
-        assert_eq!(processor.video_tokens(&packed)?, 126);
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let (expanded, _) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![packed], 4096)?;
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|&&id| id == vision.video_token)
+                .count(),
+            126
+        );
         Ok(())
     }
 
@@ -2435,10 +2455,16 @@ mod tests {
         };
         let frames = video_frames(2, 64, 48);
         let video = processor.prepare_video(&frames, &video_meta(2), &options)?;
-        assert_eq!(processor.video_tokens(&video)?, 126);
         let (expanded, prepared) =
             processor.expand(&[vision.video_token], Vec::new(), vec![video], 4096)?;
         assert_eq!(expanded.len(), 130);
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|&&id| id == vision.video_token)
+                .count(),
+            126
+        );
         let expected = [(0u8, 1usize), (2, 63), (0, 1), (0, 1), (2, 63), (0, 1)];
         let mut cursor = 0usize;
         for (modality, len) in expected {
@@ -2454,18 +2480,30 @@ mod tests {
         options.max_slice_nums = Some(9);
         let video = processor.prepare_video(&sliced, &video_meta(2), &options)?;
         assert_eq!((video.frames[0].rows, video.frames[0].cols), (1, 2));
-        assert_eq!(processor.video_tokens(&video)?, 406);
         let (expanded, prepared) =
             processor.expand(&[vision.video_token], Vec::new(), vec![video], 8192)?;
         assert_eq!(expanded.len(), 418);
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|&&id| id == vision.video_token)
+                .count(),
+            406
+        );
         assert_eq!(prepared.grids.len(), 6);
         let square = video_frames(2, 1024, 1024);
         let video = processor.prepare_video(&square, &video_meta(2), &options)?;
         assert_eq!((video.frames[0].rows, video.frames[0].cols), (2, 3));
-        assert_eq!(processor.video_tokens(&video)?, 848);
         let (expanded, _prepared) =
             processor.expand(&[vision.video_token], Vec::new(), vec![video], 16384)?;
         assert_eq!(expanded.len(), 878);
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|&&id| id == vision.video_token)
+                .count(),
+            848
+        );
         Ok(())
     }
 
@@ -2543,6 +2581,25 @@ mod tests {
         assert!(
             error.contains("video has no placeholder in rendered prompt"),
             "{error}"
+        );
+        let video = processor.prepare_video(&video_frames(1, 64, 48), &video_meta(1), &options)?;
+        let (expanded, prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 4096)?;
+        let mut modality = prepared.modality_ids.clone();
+        let visual = modality
+            .iter()
+            .position(|&m| m == 2)
+            .context("no video modality")?;
+        modality[visual] = 3;
+        let bad = PreparedInput {
+            modality_ids: modality,
+            pixel_values: prepared.pixel_values,
+            grids: prepared.grids,
+        };
+        assert!(
+            bad.input(&expanded)
+                .validate(&processor.spec, 4096)
+                .is_err()
         );
         Ok(())
     }
