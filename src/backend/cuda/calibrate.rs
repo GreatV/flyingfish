@@ -963,17 +963,27 @@ fn check_expert_transfer(bytes: &[u8]) -> Result<()> {
 }
 
 fn measure_expert_transfer(d: &Device, bytes: usize) -> Result<ExpertTransfer> {
-    let mut host = unsafe { d.ctx.alloc_pinned_with_flags::<u8>(bytes, 0)? };
+    let mut host = unsafe { d.ctx.alloc_pinned_with_flags::<u8>(bytes, 0) }
+        .with_context(|| format!("allocate expert transfer pinned bytes={bytes}"))?;
     unsafe {
         std::ptr::write_bytes(host.as_mut_ptr()?, 0, bytes);
     }
     for (index, value) in host.as_mut_slice()?.iter_mut().enumerate() {
         *value = (index % 251) as u8;
     }
-    let mut device = d.upload.alloc_zeros::<u8>(bytes)?;
-    d.upload.memcpy_htod(&host, &mut device)?;
-    d.upload.memcpy_dtoh(&device, &mut host)?;
-    d.upload.synchronize()?;
+    let mut device = d
+        .upload
+        .alloc_zeros::<u8>(bytes)
+        .with_context(|| format!("allocate expert transfer device bytes={bytes}"))?;
+    d.upload
+        .memcpy_htod(&host, &mut device)
+        .with_context(|| format!("expert transfer roundtrip H2D bytes={bytes}"))?;
+    d.upload
+        .memcpy_dtoh(&device, &mut host)
+        .with_context(|| format!("expert transfer roundtrip D2H bytes={bytes}"))?;
+    d.upload
+        .synchronize()
+        .with_context(|| format!("synchronize expert transfer roundtrip bytes={bytes}"))?;
     check_expert_transfer(host.as_slice()?)?;
     let mut cell = ExpertTransfer {
         bytes: bytes as u64,
@@ -982,17 +992,39 @@ fn measure_expert_transfer(d: &Device, bytes: usize) -> Result<ExpertTransfer> {
     };
     for download in [false, true] {
         for trial in 0..6 {
-            let begin = d.upload.record_event(None)?;
+            let begin = d
+                .upload
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .with_context(|| {
+                    format!(
+                        "record expert transfer begin bytes={bytes} d2h={download} trial={trial}"
+                    )
+                })?;
             for _ in 0..16 {
                 if download {
-                    d.upload.memcpy_dtoh(&device, &mut host)?;
+                    d.upload.memcpy_dtoh(&device, &mut host).with_context(|| {
+                        format!("expert transfer timed D2H bytes={bytes} trial={trial}")
+                    })?;
                 } else {
-                    d.upload.memcpy_htod(&host, &mut device)?;
+                    d.upload.memcpy_htod(&host, &mut device).with_context(|| {
+                        format!("expert transfer timed H2D bytes={bytes} trial={trial}")
+                    })?;
                 }
             }
-            let end = d.upload.record_event(None)?;
-            end.synchronize()?;
-            let seconds = f64::from(begin.elapsed_ms(&end)?) / 16000.0;
+            let end = d
+                .upload
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .with_context(|| {
+                    format!("record expert transfer end bytes={bytes} d2h={download} trial={trial}")
+                })?;
+            end.synchronize().with_context(|| {
+                format!(
+                    "synchronize expert transfer end bytes={bytes} d2h={download} trial={trial}"
+                )
+            })?;
+            let seconds = f64::from(begin.elapsed_ms(&end).with_context(|| {
+                format!("time expert transfer events bytes={bytes} d2h={download} trial={trial}")
+            })?) / 16000.0;
             ensure!(
                 seconds.is_finite() && seconds > 0.0,
                 "invalid expert transfer sample seconds={seconds} bytes={bytes} d2h={download}"
@@ -1214,6 +1246,20 @@ mod long_tests {
     #[ignore = "requires exclusive CUDA calibration"]
     fn expert_setup_smoke_gpu() -> Result<()> {
         let device = Device::new(0)?;
+        let untimed_begin = device
+            .upload
+            .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+        let untimed_end = device
+            .upload
+            .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+        let untimed_error = untimed_begin
+            .elapsed_ms(&untimed_end)
+            .expect_err("untimed events produced elapsed time");
+        ensure!(
+            untimed_error.0 == sys::cudaError_enum::CUDA_ERROR_INVALID_HANDLE,
+            "untimed expert transfer events returned {untimed_error:?}, expected CUDA_ERROR_INVALID_HANDLE"
+        );
+        println!("PASS expert_setup_event_control untimed=CUDA_ERROR_INVALID_HANDLE");
         measure_expert_transfer(&device, 4096)?;
         let host = ExpertHost::read()?;
         let cells = crate::cpu::expert_ffn::measure_service_table(
