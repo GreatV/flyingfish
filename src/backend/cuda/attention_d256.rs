@@ -994,7 +994,7 @@ mod tests {
         } = case;
         ensure!(
             !oracle || spec == FullAttentionSpec::q38(),
-            "FP32 oracle requires the qualified24/4 geometry"
+            "FP32 oracle requires the qualified 24/4 geometry"
         );
         let stream = &device.stream;
         let limits = AttentionLimits {
@@ -1523,39 +1523,17 @@ mod tests {
             .parse()?;
         let device = Device::new(ordinal)?;
         // Two segments: partials and merge.
-        run_shape(
-            &device,
-            Case {
-                spec: FullAttentionSpec::q38(),
-                remap: false,
-                graph: false,
-                mutant: false,
-                flash: false,
-                prefix: 33,
-                valid_rows: 65,
-                max_rows: 65,
-                capacity: 256,
-                key_chunk: 32,
-                axes: None,
-                oracle: true,
-            },
-        )?;
+        run_shape(&device, case(None, true))?;
         // 17 live rows of max_rows 64: the graph-replay shape.
         run_shape(
             &device,
             Case {
-                spec: FullAttentionSpec::q38(),
-                remap: false,
-                graph: false,
-                mutant: false,
-                flash: false,
                 prefix: 0,
                 valid_rows: 17,
                 max_rows: 64,
                 capacity: 1024,
                 key_chunk: 64,
-                axes: None,
-                oracle: true,
+                ..case(None, true)
             },
         )?;
 

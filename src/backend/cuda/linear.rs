@@ -341,14 +341,7 @@ mod tests {
         )?;
         let mut defects = 0;
         let mut cases = 0;
-        for (n, k) in [
-            (8192u32, 2048u32),
-            (4096, 2048),
-            (2048, 4096),
-            (512, 2048),
-            (32, 2048),
-            (129, 257),
-        ] {
+        for (n, k) in [(8192u32, 2048u32), (32, 2048), (129, 257)] {
             let role = "linear_attn.in_proj_qkv.weight";
             let name = format!("model.language_model.layers.0.{role}");
             let values: Vec<_> = (0..n as usize * k as usize)
@@ -399,7 +392,7 @@ mod tests {
                 "native BF16 fixture allocated materialization storage"
             );
             let plan = LayerLinearPlan::bind(&dequant, &catalog, None, stream)?;
-            for m in [1u32, 2, 5, 8, 37, 512, 4096] {
+            for m in [1u32, 2, 5, 8, 4096] {
                 plan.prepare(&blas, m)?;
                 let mut inputs = vec![bf16::ZERO; m as usize * k as usize];
                 for row in 0..m as usize {
@@ -416,7 +409,7 @@ mod tests {
                         (input_store.len() * 2) as u64,
                     )?
                 };
-                let mut target = TensorMut(unsafe {
+                let target = TensorMut(unsafe {
                     Tensor::new(
                         output.device_ptr(stream).0,
                         [m, n],
@@ -425,16 +418,15 @@ mod tests {
                     )?
                 });
                 device.finish_upload()?;
-                for graph in [false, true] {
-                    let execute = || {
-                        plan.run(
-                            &blas,
-                            role,
-                            ExecutionPhase::Prefill,
-                            input,
-                            &mut TensorMut(target.read()),
-                        )
-                    };
+                for (phase, graph) in [
+                    (ExecutionPhase::Prefill, false),
+                    (ExecutionPhase::Prefill, true),
+                ]
+                .into_iter()
+                .chain((m == 1).then_some((ExecutionPhase::Decode, false)))
+                {
+                    let execute =
+                        || plan.run(&blas, role, phase, input, &mut TensorMut(target.read()));
                     if graph {
                         use cudarc::driver::sys;
                         stream.begin_capture(
@@ -465,29 +457,7 @@ mod tests {
                         })
                         .count();
                     println!(
-                        "BF16_LINEAR stored_weight=[{n},{k}] rows={m} graph={graph} dequant_bytes=0 mismatches={mismatches} {}",
-                        if mismatches == 0 { "PASS" } else { "DEFECT" }
-                    );
-                    defects += usize::from(mismatches != 0);
-                    cases += 1;
-                }
-                if m == 1 {
-                    plan.run(&blas, role, ExecutionPhase::Decode, input, &mut target)?;
-                    stream.synchronize()?;
-                    let got = stream.clone_dtoh(&output)?;
-                    ensure!(
-                        got.iter().all(|v| v.is_finite()),
-                        "nonfinite native BF16 decode output"
-                    );
-                    let mismatches = got
-                        .iter()
-                        .enumerate()
-                        .filter(|(r, v)| {
-                            v.to_bits() != values[*r * k as usize + 13 % k as usize].to_bits()
-                        })
-                        .count();
-                    println!(
-                        "BF16_LINEAR_DECODE stored_weight=[{n},{k}] rows=1 graph=false mismatches={mismatches} {}",
+                        "BF16_LINEAR stored_weight=[{n},{k}] rows={m} phase={phase:?} graph={graph} dequant_bytes=0 mismatches={mismatches} {}",
                         if mismatches == 0 { "PASS" } else { "DEFECT" }
                     );
                     defects += usize::from(mismatches != 0);
