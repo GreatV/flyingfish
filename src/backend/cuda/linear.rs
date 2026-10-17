@@ -220,7 +220,7 @@ pub(crate) struct LayerLinearPlan {
     materialize: Vec<(Tensor<u8, 2>, Tensor<bf16, 2>, TensorMut<bf16, 2>)>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum BoundFfn {
     Dense,
     Moe {

@@ -690,6 +690,46 @@ impl Runtime {
     }
 }
 impl Engine {
+    #[cfg(test)]
+    pub(super) fn inject_moe_test_positions(&mut self, axes: [&[i32]; 3]) -> Result<()> {
+        let rows = axes[0].len();
+        let first = *axes[0]
+            .first()
+            .context("layer injection positions are empty")?;
+        ensure!(
+            first >= 0
+                && axes.iter().all(|a| a.len() == rows
+                    && a.iter()
+                        .all(|&v| v >= 0 && (v as u32) < self.model_spec.max_position)),
+            "invalid layer injection position axes"
+        );
+        if let Some(runtime) = self.qwen.as_mut() {
+            let packed = (0..rows)
+                .flat_map(|row| axes.map(|a| a[row]))
+                .collect::<Vec<_>>();
+            self.device
+                .stream
+                .memcpy_htod(&packed, &mut runtime.active_positions.slice_mut(..rows * 3))?;
+            self.state.set_sequence(
+                &self.device.stream,
+                first as u32,
+                rows as u32,
+                self.workspace_rows as u32,
+            )?;
+        } else {
+            ensure!(
+                axes.iter()
+                    .all(|axis| axis.iter().enumerate().all(|(r, &v)| v == first + r as i32)),
+                "legacy layer injection requires contiguous equal position axes"
+            );
+        }
+        self.position = first as usize;
+        self.device
+            .stream
+            .memcpy_htod(&[first], &mut self.work.position)?;
+        Ok(())
+    }
+
     pub(super) fn bind_mtp_snapshots(
         &mut self,
         snapshots: &[super::super::state::GdnState],
@@ -1201,6 +1241,10 @@ impl Engine {
             resident_ids_len: 0,
             last_input_kind: None,
             qwen: None,
+            moe: None,
+            moe_slots: None,
+            #[cfg(test)]
+            moe_test_ffn: None,
             mtp: None,
             mtp_state: None,
             mtp_epoch: 0,
@@ -1215,6 +1259,22 @@ impl Engine {
             kv_scratch,
             verify_rows,
         )?);
+        if engine.model_spec.moe.is_some() {
+            let geometry =
+                crate::experts::catalogue::ExpertGeometry::from_model(&engine.model_spec)?;
+            let measured = super::super::calibrate::load_experts(
+                &engine.device,
+                &engine.runtime,
+                geometry,
+                &engine.closure,
+            )?;
+            engine.moe = Some(super::moe::Decode::new(
+                &engine.device,
+                geometry,
+                rows.min(8),
+                measured.service.worker_count()?,
+            )?);
+        }
         engine.prepare(1)?;
         engine.prepare_prefill_plans()?;
         engine
@@ -1554,15 +1614,11 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
-        if let Some(runtime) = &self.qwen {
-            match &runtime.layers[layer].ffn {
-                BoundFfn::Dense => {}
-                BoundFfn::Moe { router, .. } => anyhow::bail!(
-                    "MoE expert residency is not bound: layer={layer} experts={} hidden={}",
-                    router.shape[0],
-                    router.shape[1]
-                ),
-            }
+        let ffn = self.qwen.as_ref().map(|runtime| runtime.layers[layer].ffn);
+        #[cfg(test)]
+        let ffn = ffn.or(self.moe_test_ffn);
+        if let Some(ffn @ BoundFfn::Moe { .. }) = ffn {
+            return self.run_moe_ffn(layer, step.rows, ffn, trace);
         }
         for op in [
             crate::backend::Operator::GateUp,

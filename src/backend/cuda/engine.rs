@@ -31,6 +31,8 @@ use std::{
     time::Instant,
 };
 
+#[path = "engine_moe.rs"]
+mod moe;
 #[path = "engine_mtp.rs"]
 mod mtp;
 #[path = "engine_mtp_generate.rs"]
@@ -454,6 +456,10 @@ pub struct Engine {
     spec: Option<Spec>,
     hidden_capture: Option<HiddenCapture>,
     qwen: Option<qwen::Runtime>,
+    moe: Option<moe::Decode>,
+    moe_slots: Option<moe::Slots>,
+    #[cfg(test)]
+    moe_test_ffn: Option<super::linear::BoundFfn>,
     mtp: Option<mtp::Chain>,
     mtp_state: Option<super::state::StateStore>,
     mtp_epoch: u64,
@@ -803,6 +809,10 @@ impl Engine {
             #[cfg(test)]
             capture_fail_stage: None,
             qwen: None,
+            moe: None,
+            moe_slots: None,
+            #[cfg(test)]
+            moe_test_ffn: None,
             mtp: None,
             mtp_state: None,
             mtp_epoch: 0,

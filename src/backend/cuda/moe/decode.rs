@@ -4,6 +4,7 @@
 //! bits consumed by the shared combine op.
 use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut};
 use crate::backend::cuda::cubin;
+#[cfg(test)]
 use crate::backend::cuda::moe::combine::{CombineOps, MoeCombine};
 use anyhow::{Result, ensure};
 use cudarc::driver::{
@@ -15,6 +16,7 @@ use std::sync::Arc;
 pub(crate) struct DecodeOps {
     gate_up: CudaFunction,
     down: CudaFunction,
+    #[cfg(test)]
     combine: CombineOps,
 }
 
@@ -249,6 +251,7 @@ impl DecodeOps {
         Ok(Self {
             gate_up: module.load_function("moe_ffn_gate_up")?,
             down: module.load_function("moe_ffn_down")?,
+            #[cfg(test)]
             combine: CombineOps::new(ctx)?,
         })
     }
@@ -328,6 +331,7 @@ impl DecodeOps {
 
     /// One full decode MoE row block: contribute, shared sigmoid scale and
     /// the single deterministic combine, with final_active = active.
+    #[cfg(test)]
     pub fn decode(
         &self,
         stream: &Arc<CudaStream>,
