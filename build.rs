@@ -189,10 +189,7 @@ fn main() {
             .expect("invalid kernel filename")
             .replace('\\', "/");
         let variants: &[(&str, &[&str])] = if name.starts_with("gdn/") {
-            &[
-                ("", &[]),
-                ("_h32", &["-DGDN_HEADS=32", "-DGDN_CONV_DIM=8192"]),
-            ]
+            &[("", &[]), ("_h32", &["-DGDN_HEADS=32"])]
         } else if name == "tcmqa_d256" {
             &[
                 ("", &[]),

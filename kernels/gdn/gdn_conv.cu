@@ -10,9 +10,10 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-#ifndef GDN_CONV_DIM
-#define GDN_CONV_DIM 10240
+#ifndef GDN_HEADS
+#define GDN_HEADS 48
 #endif
+#define GDN_CONV_DIM ((2 * 16 + GDN_HEADS) * 128)
 #define GDN_CONV_CHAN 256
 #define GDN_CONV_ROWS 32
 
