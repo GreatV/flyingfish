@@ -38,10 +38,19 @@ const MERGE: u32 = 2;
 const HIDDEN: u32 = 1152;
 const MERGER_FC1: u32 = HIDDEN * MERGE * MERGE;
 const MERGER_FC2: u32 = 5120;
-const LN_EPS: f32 = 1e-6;
+pub(crate) const LN_EPS: f32 = 1e-6;
 /// Biased linears accumulate in FP32, add bias, then round once to BF16.
 const BIAS_MODE: LinearBiasMode = LinearBiasMode::BeforeOutputRound;
 const WS_ALIGN: u64 = 256;
+
+/// LayerNorm placement relative to the merge grouping of a vision merger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MergerNorm {
+    /// Normalize each patch row before grouping.
+    PerPatch,
+    /// Group rows, then normalize the grouped row.
+    Grouped,
+}
 
 /// The declared vision-tower shape; `validate` rejects any shape the compiled kernels do not implement.
 #[derive(Clone, Copy, Debug)]
@@ -49,8 +58,11 @@ pub(crate) struct VisionSpec {
     pub hq: u32,
     pub d: u32,
     pub hidden: u32,
-    pub fc1: u32,
-    pub fc2: u32,
+    pub merger_fc1: u32,
+    pub merger_fc2: u32,
+    pub merge: u32,
+    pub merger_norm: MergerNorm,
+    pub rope: bool,
     pub ln_eps: f32,
 }
 
@@ -60,21 +72,31 @@ impl VisionSpec {
             hq: 16,
             d: 72,
             hidden: HIDDEN,
-            fc1: MERGER_FC1,
-            fc2: MERGER_FC2,
+            merger_fc1: MERGER_FC1,
+            merger_fc2: MERGER_FC2,
+            merge: MERGE,
+            merger_norm: MergerNorm::PerPatch,
+            rope: true,
             ln_eps: LN_EPS,
         }
     }
 
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.hq == HQ
-                && self.d == D
-                && self.hidden == HIDDEN
-                && self.fc1 == MERGER_FC1
-                && self.fc2 == MERGER_FC2
+            self.hq == HQ && self.d == D,
+            "unsupported vision attention geometry"
+        );
+        ensure!(
+            self.hidden > 0
+                && self.merger_fc1 > 0
+                && self.merger_fc2 > 0
+                && self.merge > 0
                 && self.ln_eps == LN_EPS,
-            "unsupported vision specification"
+            "unsupported vision merger geometry"
+        );
+        ensure!(
+            self.merger_fc1 == self.hidden * self.merge * self.merge,
+            "vision merger width does not cover one merge block"
         );
         Ok(())
     }
@@ -213,6 +235,7 @@ pub(crate) struct VisionAttnPlan {
     off_k_rot: u64,
     off_k_pad: u64,
     scratch_bytes: u64,
+    rope_enabled: bool,
     rope_cfg: LaunchConfig,
     attn_cfg: LaunchConfig,
 }
@@ -222,6 +245,9 @@ pub(crate) struct VisionMergerPlan {
     common: CommonOpsRef,
     rows: u32,
     tokens: u32,
+    hidden: u32,
+    fc1: u32,
+    norm: MergerNorm,
     off_ln: u64,
     off_fc1: u64,
     scratch_bytes: u64,
@@ -252,9 +278,9 @@ fn attn_layout(rows: u32, krows: u32) -> Result<(u64, u64, u64, u64)> {
     Ok((off_q_rot, off_k_rot, off_k_pad, bytes))
 }
 
-/// Scratch layout of the merger: `(ln, fc1, bytes)`; both buffers are `rows * 1152 * 2` bytes.
-fn merger_layout(rows: u32) -> Result<(u64, u64, u64)> {
-    let buf = align(u64::from(rows) * u64::from(HIDDEN) * 2)?;
+/// Scratch layout of the merger: `(ln, fc1, bytes)`; both buffers are `rows * hidden * 2` bytes.
+fn merger_layout(rows: u32, hidden: u32) -> Result<(u64, u64, u64)> {
+    let buf = align(u64::from(rows) * u64::from(hidden) * 2)?;
     Ok((0, buf, buf.checked_mul(2).context("workspace overflow")?))
 }
 
@@ -394,6 +420,7 @@ impl VisionAttnOps {
             off_k_rot,
             off_k_pad,
             scratch_bytes,
+            rope_enabled: spec.rope,
             rope_cfg,
             attn_cfg,
         })
@@ -417,26 +444,30 @@ impl VisionAttnOps {
         let rows = plan.rows as i32;
         let nblocks = plan.nblocks as i32;
 
-        unsafe {
-            stream
-                .launch_builder(&plan.rope)
-                .arg(&b.q_in.ptr)
-                .arg(&b.k_in.ptr)
-                .arg(&q_rot)
-                .arg(&k_rot)
-                .arg(&cu_ptr)
-                .arg(&gh_ptr)
-                .arg(&gw_ptr)
-                .arg(&nblocks)
-                .arg(&rows)
-                .launch(plan.rope_cfg)?;
+        if plan.rope_enabled {
+            unsafe {
+                stream
+                    .launch_builder(&plan.rope)
+                    .arg(&b.q_in.ptr)
+                    .arg(&b.k_in.ptr)
+                    .arg(&q_rot)
+                    .arg(&k_rot)
+                    .arg(&cu_ptr)
+                    .arg(&gh_ptr)
+                    .arg(&gw_ptr)
+                    .arg(&nblocks)
+                    .arg(&rows)
+                    .launch(plan.rope_cfg)?;
+            }
         }
+        let q_source = if plan.rope_enabled { q_rot } else { b.q_in.ptr };
+        let k_source = if plan.rope_enabled { k_rot } else { b.k_in.ptr };
 
         for &(src, dst, bytes) in &plan.copies {
             unsafe {
                 cudarc::driver::result::memcpy_dtod_async(
                     (k_pad + dst) as _,
-                    (k_rot + src) as _,
+                    (k_source + src) as _,
                     bytes as usize,
                     stream.cu_stream() as _,
                 )?;
@@ -446,7 +477,7 @@ impl VisionAttnOps {
         unsafe {
             stream
                 .launch_builder(&plan.attn)
-                .arg(&q_rot)
+                .arg(&q_source)
                 .arg(&k_pad)
                 .arg(&b.v.ptr)
                 .arg(&b.o.0.ptr)
@@ -465,10 +496,10 @@ impl VisionMergerOps {
         spec.validate()?;
         ensure!(rows > 0, "merger needs at least one patch row");
         ensure!(
-            rows.is_multiple_of(MERGE * MERGE),
-            "merger rows must be whole 2x2 blocks"
+            rows.is_multiple_of(spec.merge * spec.merge),
+            "merger rows must be whole merge blocks"
         );
-        let (_, _, bytes) = merger_layout(rows)?;
+        let (_, _, bytes) = merger_layout(rows, spec.hidden)?;
         Ok(WorkspaceReq {
             bytes,
             alignment: WS_ALIGN,
@@ -484,33 +515,52 @@ impl VisionMergerOps {
     ) -> Result<VisionMergerPlan> {
         spec.validate()?;
         let rows = bindings.x.shape[0];
-        let tokens = rows / (MERGE * MERGE);
+        let tokens = rows / (spec.merge * spec.merge);
         ensure!(
-            rows > 0 && rows.is_multiple_of(MERGE * MERGE) && tokens > 0,
-            "merger rows must be whole 2x2 blocks"
+            rows > 0 && rows.is_multiple_of(spec.merge * spec.merge) && tokens > 0,
+            "merger rows must be whole merge blocks"
         );
-        want(&bindings.x, [rows, HIDDEN], "x")?;
+        want(&bindings.x, [rows, spec.hidden], "x")?;
         dense(&bindings.x, "x")?;
+        let norm_width = match spec.merger_norm {
+            MergerNorm::PerPatch => spec.hidden,
+            MergerNorm::Grouped => spec.merger_fc1,
+        };
         for (view, name) in [(&bindings.norm_w, "norm_w"), (&bindings.norm_b, "norm_b")] {
-            want(view, [HIDDEN], name)?;
+            want(view, [norm_width], name)?;
         }
-        want(&bindings.fc1_w, [MERGER_FC1, MERGER_FC1], "fc1_w")?;
-        want(&bindings.fc1_b, [MERGER_FC1], "fc1_b")?;
-        want(&bindings.fc2_w, [MERGER_FC2, MERGER_FC1], "fc2_w")?;
-        want(&bindings.fc2_b, [MERGER_FC2], "fc2_b")?;
-        want(&bindings.out.read(), [tokens, MERGER_FC2], "out")?;
+        want(&bindings.fc1_w, [spec.merger_fc1, spec.merger_fc1], "fc1_w")?;
+        want(&bindings.fc1_b, [spec.merger_fc1], "fc1_b")?;
+        want(&bindings.fc2_w, [spec.merger_fc2, spec.merger_fc1], "fc2_w")?;
+        want(&bindings.fc2_b, [spec.merger_fc2], "fc2_b")?;
+        want(&bindings.out.read(), [tokens, spec.merger_fc2], "out")?;
         dense(&bindings.fc1_w, "fc1_w")?;
         dense(&bindings.fc2_w, "fc2_w")?;
 
-        let (off_ln, off_fc1, scratch_bytes) = merger_layout(rows)?;
+        let (off_ln, off_fc1, scratch_bytes) = merger_layout(rows, spec.hidden)?;
 
-        blas.prepare_biased(tokens, MERGER_FC1, MERGER_FC1, bindings.fc1_b, BIAS_MODE)?;
-        blas.prepare_biased(tokens, MERGER_FC2, MERGER_FC1, bindings.fc2_b, BIAS_MODE)?;
+        blas.prepare_biased(
+            tokens,
+            spec.merger_fc1,
+            spec.merger_fc1,
+            bindings.fc1_b,
+            BIAS_MODE,
+        )?;
+        blas.prepare_biased(
+            tokens,
+            spec.merger_fc2,
+            spec.merger_fc1,
+            bindings.fc2_b,
+            BIAS_MODE,
+        )?;
         Ok(VisionMergerPlan {
             bindings,
             common,
             rows,
             tokens,
+            hidden: spec.hidden,
+            fc1: spec.merger_fc1,
+            norm: spec.merger_norm,
             off_ln,
             off_fc1,
             scratch_bytes,
@@ -527,23 +577,27 @@ impl VisionMergerOps {
         scratch.validate(plan.scratch_bytes)?;
         let b = &plan.bindings;
         let elem = std::mem::size_of::<bf16>() as u64;
-        let ln_row = u64::from(HIDDEN);
-        let fc1_row = u64::from(MERGER_FC1);
-        let ln_span = u64::from(plan.rows) * ln_row * elem;
+        let ln_span = u64::from(plan.rows) * u64::from(plan.hidden) * elem;
 
-        // The [rows, 1, 1152] LayerNorm output is the [tokens, 4608] fc1 input in place.
+        // The LayerNorm output is the [tokens, fc1] linear input in place; the norm covers either
+        // each patch row (before grouping) or the grouped row (after grouping).
+        let (ln_rows, ln_width) = match plan.norm {
+            MergerNorm::PerPatch => (plan.rows, plan.hidden),
+            MergerNorm::Grouped => (plan.tokens, plan.fc1),
+        };
+        let ln_row = u64::from(ln_width);
         let x3 = unsafe {
             Tensor::new(
                 b.x.ptr,
-                [plan.rows, 1, HIDDEN],
+                [ln_rows, 1, ln_width],
                 [ln_row, ln_row, 1],
-                b.x.span_bytes,
+                ln_span,
             )?
         };
         let mut ln3 = unsafe {
             TensorMut::new(
                 scratch.ptr + plan.off_ln,
-                [plan.rows, 1, HIDDEN],
+                [ln_rows, 1, ln_width],
                 [ln_row, ln_row, 1],
                 ln_span,
             )?
@@ -552,10 +606,11 @@ impl VisionMergerOps {
             .norm
             .layer_norm(stream, x3, b.norm_w, b.norm_b, &mut ln3, LN_EPS)?;
 
+        let fc1_row = u64::from(plan.fc1);
         let ln2 = unsafe {
             Tensor::new(
                 scratch.ptr + plan.off_ln,
-                [plan.tokens, MERGER_FC1],
+                [plan.tokens, plan.fc1],
                 [fc1_row, 1],
                 ln_span,
             )?
@@ -563,7 +618,7 @@ impl VisionMergerOps {
         let mut fc1 = unsafe {
             TensorMut::new(
                 scratch.ptr + plan.off_fc1,
-                [plan.tokens, MERGER_FC1],
+                [plan.tokens, plan.fc1],
                 [fc1_row, 1],
                 ln_span,
             )?
@@ -572,7 +627,7 @@ impl VisionMergerOps {
         let mut fc1_3 = unsafe {
             TensorMut::new(
                 scratch.ptr + plan.off_fc1,
-                [plan.tokens, 1, MERGER_FC1],
+                [plan.tokens, 1, plan.fc1],
                 [fc1_row, fc1_row, 1],
                 ln_span,
             )?

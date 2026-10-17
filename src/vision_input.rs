@@ -35,6 +35,113 @@ impl ImageGrid {
     }
 }
 
+/// Patch rows reordered into square `window` blocks: window row-major, then row-major inside the window.
+pub struct WindowGather {
+    /// Source patch row of each gathered row, images concatenated in grid order.
+    pub indices: Vec<u32>,
+    /// One window-end entry per window, preceded by zero; every window is `window * window` rows.
+    pub cu_seqlens: Vec<i32>,
+}
+
+/// Nearest-bucket ids into a `side × side` learned table: `bucketize(right=True)` of `i / extent`
+/// against `(j + 1) / side`, flattened as `bucket_h * side + bucket_w`, image after image.
+pub fn nearest_position_ids(grids: &[ImageGrid], side: u32) -> Result<Vec<i32>> {
+    ensure!(side > 0, "zero position table side");
+    ensure!(
+        side <= 46340,
+        "position table side exceeds the i32 id range"
+    );
+    let bucket = |value: f32| -> i32 {
+        let mut count = 0i32;
+        while count < side as i32 {
+            let boundary = ((count + 1) as f64 / f64::from(side)) as f32;
+            if boundary > value {
+                break;
+            }
+            count += 1;
+        }
+        count
+    };
+    let mut ids = Vec::new();
+    for grid in grids {
+        ids.reserve(grid.patch_rows()?);
+        for row in 0..grid.h {
+            let base = bucket(row as f32 / grid.h as f32) * side as i32;
+            for column in 0..grid.w {
+                ids.push(base + bucket(column as f32 / grid.w as f32));
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Gathers every patch row into its `window × window` block, images concatenated in grid order.
+pub fn window_gather(grids: &[ImageGrid], window: u32) -> Result<WindowGather> {
+    ensure!(window > 0, "zero window size");
+    let mut indices = Vec::new();
+    let mut cu_seqlens = vec![0i32];
+    let mut base = 0u32;
+    for grid in grids {
+        grid.patch_rows()?;
+        ensure!(
+            grid.h.is_multiple_of(window) && grid.w.is_multiple_of(window),
+            "patch grid is not window aligned"
+        );
+        for window_row in 0..grid.h / window {
+            for window_column in 0..grid.w / window {
+                for row in 0..window {
+                    for column in 0..window {
+                        let patch =
+                            (window_row * window + row) * grid.w + window_column * window + column;
+                        indices.push(base + patch);
+                    }
+                }
+                cu_seqlens.push(i32::try_from(indices.len())?);
+            }
+        }
+        base = base
+            .checked_add(grid.h * grid.w)
+            .context("window gather row overflow")?;
+    }
+    Ok(WindowGather {
+        indices,
+        cu_seqlens,
+    })
+}
+
+/// `merge × merge` row grouping over current row grids: `groups[merge²·r + j]` is the source row of
+/// output row `r`, block `j = dh · merge + dw`, images concatenated in grid order.
+pub fn merge_groups(grids: &[(u32, u32)], merge: u32) -> Result<Vec<u32>> {
+    ensure!(merge > 0, "zero merge size");
+    let merge = merge as usize;
+    let mut groups = Vec::new();
+    let mut base = 0u32;
+    for &(rows, columns) in grids {
+        ensure!(
+            rows > 0
+                && columns > 0
+                && (rows as usize).is_multiple_of(merge)
+                && (columns as usize).is_multiple_of(merge),
+            "row grid is not merge aligned"
+        );
+        let (rows, columns) = (rows as usize, columns as usize);
+        for group_row in 0..rows / merge {
+            for group_column in 0..columns / merge {
+                for dh in 0..merge {
+                    for dw in 0..merge {
+                        let row = (group_row * merge + dh) * columns + group_column * merge + dw;
+                        groups.push(base + row as u32);
+                    }
+                }
+            }
+        }
+        base = base
+            .checked_add(u32::try_from(rows * columns)?)
+            .context("merge group row overflow")?;
+    }
+    Ok(groups)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageSlot {
     pub tokens: Range<usize>,
