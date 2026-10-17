@@ -337,7 +337,7 @@ impl FullAttentionOps {
             );
             template.kernels.clone()
         } else {
-            let module = cubin::module(ctx, spec.kernel_module())?;
+            let module = cubin::module(ctx, spec.kernel_module()?)?;
             let phase1 = module.load_function(if bindings.compact.is_some() {
                 "tcmqa_d256_phase1_compact"
             } else {

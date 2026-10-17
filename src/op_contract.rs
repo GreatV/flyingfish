@@ -125,11 +125,11 @@ impl FullAttentionSpec {
         Ok(bound)
     }
 
-    pub const fn kernel_module(&self) -> &'static str {
-        if self.hq == 16 {
-            "tcmqa_d256_q16_kv2"
-        } else {
-            "tcmqa_d256"
+    pub fn kernel_module(&self) -> Result<&'static str> {
+        match (self.hq, self.hkv) {
+            (24, 4) => Ok("tcmqa_d256"),
+            (16, 2) => Ok("tcmqa_d256_q16_kv2"),
+            _ => anyhow::bail!("unsupported attention hq={} hkv={}", self.hq, self.hkv),
         }
     }
 
@@ -268,15 +268,19 @@ impl GdnSpec {
             l2_eps: 1e-6,
         }
     }
-    pub const fn kernel_suffix(&self) -> &'static str {
-        if self.hv == 32 { "_h32" } else { "" }
+    pub fn kernel_suffix(&self) -> Result<&'static str> {
+        match self.hv {
+            48 => Ok(""),
+            32 => Ok("_h32"),
+            _ => anyhow::bail!("unsupported GDN hv={}", self.hv),
+        }
     }
 
-    pub const fn gate_kernel(&self) -> &'static str {
-        if self.hv == 32 {
-            "gdn_gates_h32"
-        } else {
-            "q38_gdn_gates"
+    pub fn gate_kernel(&self) -> Result<&'static str> {
+        match self.hv {
+            48 => Ok("q38_gdn_gates"),
+            32 => Ok("gdn_gates_h32"),
+            _ => anyhow::bail!("unsupported GDN hv={}", self.hv),
         }
     }
     /// Projection/history channel width derived from the normalized GDN geometry.

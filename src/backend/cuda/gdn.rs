@@ -352,6 +352,17 @@ impl GdnOps {
         spec.validate()?;
         let ws = GdnWorkspace::new(spec, max_rows)?;
         let conv_dim = spec.conv_dim()?;
+        let suffix = spec.kernel_suffix()?;
+        let compiled_width = match suffix {
+            "" => 10240,
+            "_h32" => 8192,
+            _ => anyhow::bail!("unsupported GDN kernel suffix={suffix}"),
+        };
+        ensure!(
+            conv_dim == compiled_width,
+            "GDN conv_dim={conv_dim} differs from compiled width={compiled_width} for hv={}",
+            spec.hv
+        );
         check_bindings(&bindings, max_rows, conv_dim, spec.hv)?;
 
         use cudarc::driver::sys::CUdevice_attribute as Attribute;
@@ -368,7 +379,7 @@ impl GdnOps {
             );
         }
 
-        let module = |name| cubin::module(ctx, &format!("gdn/{name}{}", spec.kernel_suffix()));
+        let module = |name| cubin::module(ctx, &format!("gdn/{name}{suffix}"));
         let conv = module("gdn_conv")?;
         let chunked_mod = module("gdn_chunked")?;
         let prep_mod = module("gdn_prep")?;
@@ -1198,7 +1209,7 @@ mod tests {
             stream.memcpy_htod(&geometry_state(spec.hv as usize), &mut buffers.state)?;
             let module = cubin::module(
                 &device.ctx,
-                &format!("gdn/gdn_chunkwise_p1{}", spec.kernel_suffix()),
+                &format!("gdn/gdn_chunkwise_p1{}", spec.kernel_suffix()?),
             )?;
             let function = module.load_function(&format!("gdn_chunkwise_p1_core_s{split}"))?;
             let shared_mem_bytes = match split {

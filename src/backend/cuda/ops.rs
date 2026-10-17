@@ -151,7 +151,7 @@ impl CommonOpsRef {
             let module = cubin::module(ctx, "q38_common")?;
             self.gate = Arc::new(GateOps {
                 gate: self.gate.gate.clone(),
-                gdn: module.load_function(spec.gate_kernel())?,
+                gdn: module.load_function(spec.gate_kernel()?)?,
                 gdn_heads: spec.hv,
                 gelu: self.gate.gelu.clone(),
             });
