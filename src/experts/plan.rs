@@ -802,12 +802,47 @@ impl TierLedger {
         self.free_host_blocks() > 0
     }
 
+    /// Marks a non-GPU expert host-resident within the host block capacity.
+    pub fn place_host(&mut self, layer: u32, expert: u32) -> Result<()> {
+        self.check_index(layer, expert)?;
+        let (l, e) = (layer as usize, expert as usize);
+        ensure!(
+            !self.gpu[l][e],
+            "expert {expert} of layer {layer} is GPU resident"
+        );
+        ensure!(
+            !self.host[l][e],
+            "expert {expert} of layer {layer} is already host resident"
+        );
+        ensure!(
+            self.free_host_blocks() > 0,
+            "host tier holds {} experts for {} blocks",
+            self.host_blocks - self.free_host_blocks(),
+            self.host_blocks
+        );
+        self.host[l][e] = true;
+        debug_assert!(self.check().is_ok());
+        Ok(())
+    }
+
+    /// Physical positions of the layer's empty, non-borrowed slots.
+    pub fn empty_slots(&self, layer: u32) -> Result<u32> {
+        let mut empty = 0u32;
+        for rank in 0..self.slot_count(layer)? {
+            let position = self.position(layer, rank)?;
+            if self.slots[position] == EMPTY_SLOT && !self.borrowed[position] {
+                empty += 1;
+            }
+        }
+        Ok(empty)
+    }
+
     /// Borrows the last `slots` existing physical positions of the resident prefix
     /// (SlotLayout `borrowed_tail`, staging excluded, every layer's first slot retained).
-    /// Occupied positions are evicted into a free host block when one exists, otherwise to the
-    /// disk tier; empty positions are only marked borrowed. The position list is validated before
-    /// mutating.
-    pub fn borrow(&mut self, slots: u32) -> Result<Borrow> {
+    /// At most `to_host_limit` victims are evicted into host blocks; the rest drop to the disk
+    /// tier; empty positions are only marked borrowed. The position list is validated before
+    /// mutating. Reached only through `Residency::borrow`.
+    pub(crate) fn borrow_tail(&mut self, slots: u32, to_host_limit: u32) -> Result<Borrow> {
         ensure!(slots > 0, "zero borrowed slots");
         let range = self.layout.borrowed_tail(slots)?;
         let slot_bytes = self.layout.geometry().slot_bytes()?;
@@ -848,7 +883,7 @@ impl TierLedger {
             let layer = self.layer_of[position];
             let (l, e) = (layer as usize, expert as usize);
             self.gpu[l][e] = false;
-            if self.free_host_blocks() > 0 {
+            if to_host < to_host_limit {
                 self.host[l][e] = true;
                 to_host += 1;
             } else {
@@ -868,12 +903,13 @@ impl TierLedger {
     }
 
     /// Returns every borrowed position to admission; the decode target repopulates them.
-    pub fn refill(&mut self) -> Result<u32> {
-        let mut returned = 0u32;
-        for borrowed in self.borrowed.iter_mut() {
+    /// Reached only through `Residency::refill`.
+    pub(crate) fn refill_tail(&mut self) -> Result<Vec<u32>> {
+        let mut returned = Vec::new();
+        for (position, borrowed) in self.borrowed.iter_mut().enumerate() {
             if *borrowed {
                 *borrowed = false;
-                returned += 1;
+                returned.push(u32::try_from(position).context("slot position exceeds u32")?);
             }
         }
         self.check()?;
@@ -1423,16 +1459,16 @@ mod tests {
         let mut ledger = ledger_for(geometry, vec![2, 2], 5, &initial);
         let tail = initial[1][1];
         ledger.evict_gpu(1, tail).unwrap();
-        let borrow = ledger.borrow(1).unwrap();
+        let borrow = ledger.borrow_tail(1, 5).unwrap();
         assert!(borrow.experts.is_empty());
         assert_eq!((borrow.to_host, borrow.to_disk), (0, 0));
         assert_eq!(ledger.tier(0, initial[0][0]).unwrap(), Tier::Gpu);
         assert_eq!(ledger.tier(0, initial[0][1]).unwrap(), Tier::Gpu);
         assert_eq!(ledger.tier(1, initial[1][0]).unwrap(), Tier::Gpu);
         assert!(ledger.check().is_ok());
-        assert_eq!(ledger.refill().unwrap(), 1);
+        assert_eq!(ledger.refill_tail().unwrap().len(), 1);
         assert!(ledger.check().is_ok());
-        let again = ledger.borrow(1).unwrap();
+        let again = ledger.borrow_tail(1, 5).unwrap();
         assert!(again.experts.is_empty());
     }
 
@@ -1441,12 +1477,12 @@ mod tests {
         let geometry = geometry();
         let initial = initial_residency(&frequency(), &[2, 1], &geometry).unwrap();
         let mut ledger = ledger_for(geometry, vec![2, 1], 5, &initial);
-        let borrow = ledger.borrow(1).unwrap();
+        let borrow = ledger.borrow_tail(1, 5).unwrap();
         assert_eq!(borrow.experts, vec![(0, initial[0][1])]);
         assert_eq!(ledger.tier(0, initial[0][0]).unwrap(), Tier::Gpu);
         assert_eq!(ledger.tier(1, initial[1][0]).unwrap(), Tier::Gpu);
         let before = ledger.unique_bytes().unwrap();
-        assert!(ledger.borrow(2).is_err());
+        assert!(ledger.borrow_tail(2, 5).is_err());
         assert_eq!(ledger.unique_bytes().unwrap(), before);
         assert!(ledger.check().is_ok());
     }
@@ -1457,23 +1493,23 @@ mod tests {
         let slot = geometry.slot_bytes().unwrap();
         let initial = initial_residency(&frequency(), &[2, 2], &geometry).unwrap();
         let mut ledger = ledger_for(geometry, vec![2, 2], 2, &initial);
-        let borrow = ledger.borrow(2).unwrap();
+        let borrow = ledger.borrow_tail(2, 2).unwrap();
         let mut evicted = borrow.experts.clone();
         evicted.sort_unstable();
         assert_eq!(evicted, vec![(0, initial[0][1]), (1, initial[1][1])]);
         assert_eq!((borrow.to_host, borrow.to_disk), (2, 0));
         assert_eq!(borrow.d2h_bytes, 2 * slot);
         let before = ledger.unique_bytes().unwrap();
-        let error = ledger.borrow(1).unwrap_err().to_string();
+        let error = ledger.borrow_tail(1, 2).unwrap_err().to_string();
         assert!(error.contains("already borrowed"), "{error}");
         assert_eq!(ledger.unique_bytes().unwrap(), before);
-        assert_eq!(ledger.refill().unwrap(), 2);
+        assert_eq!(ledger.refill_tail().unwrap().len(), 2);
         assert!(ledger.check().is_ok());
-        let again = ledger.borrow(2).unwrap();
+        let again = ledger.borrow_tail(2, 2).unwrap();
         assert!(again.experts.is_empty());
-        assert_eq!(ledger.refill().unwrap(), 2);
+        assert_eq!(ledger.refill_tail().unwrap().len(), 2);
         let mut starved = ledger_for(geometry, vec![2, 2], 0, &initial);
-        let borrow = starved.borrow(2).unwrap();
+        let borrow = starved.borrow_tail(2, 0).unwrap();
         assert_eq!((borrow.to_host, borrow.to_disk), (0, 2));
         assert_eq!(borrow.disk_bytes, 2 * slot);
         assert!(starved.check().is_ok());

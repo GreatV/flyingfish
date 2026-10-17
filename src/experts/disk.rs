@@ -3,6 +3,7 @@ use crate::experts::catalogue::{ExpertCatalogue, ExpertRange};
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -15,7 +16,7 @@ const RING_ALIGN: usize = 4096;
 struct AlignedSlot {
     ptr: NonNull<u8>,
     layout: Layout,
-    leased: bool,
+    leased: Cell<bool>,
 }
 
 impl AlignedSlot {
@@ -28,7 +29,7 @@ impl AlignedSlot {
         Ok(Self {
             ptr,
             layout,
-            leased: false,
+            leased: Cell::new(false),
         })
     }
 }
@@ -46,7 +47,7 @@ pub struct DiskReader {
     per_expert: usize,
     gate_up_bytes: u64,
     ring: Vec<AlignedSlot>,
-    next: usize,
+    next: Cell<usize>,
 }
 
 // SAFETY: the ring holds a private allocation owned by this reader; moving the reader to one
@@ -106,30 +107,25 @@ impl DiskReader {
             per_expert,
             gate_up_bytes,
             ring,
-            next: 0,
+            next: Cell::new(0),
         })
     }
 
     /// Reads one expert's native ranges into a free ring slot and leases it; release with
     /// `release` after the consumer is done.
-    pub fn read_expert(
-        &mut self,
-        layer: u32,
-        expert: u32,
-        catalogue: &ExpertCatalogue,
-    ) -> Result<u32> {
+    pub fn read_expert(&self, layer: u32, expert: u32, catalogue: &ExpertCatalogue) -> Result<u32> {
         let range: &ExpertRange = catalogue.range(layer, expert)?;
         let slots = self.ring.len();
         let mut chosen = None;
         for step in 0..slots {
-            let index = (self.next + step) % slots;
-            if !self.ring[index].leased {
+            let index = (self.next.get() + step) % slots;
+            if !self.ring[index].leased.get() {
                 chosen = Some(index);
                 break;
             }
         }
         let slot = chosen.with_context(|| format!("all {slots} disk ring slots are leased"))?;
-        self.next = (slot + 1) % slots;
+        self.next.set((slot + 1) % slots);
         let bytes = self.ring[slot].layout.size();
         let ptr = self.ring[slot].ptr.as_ptr();
         // SAFETY: the slot owns `bytes` writable bytes with the ring alignment.
@@ -167,7 +163,7 @@ impl DiskReader {
                 range.down.shard
             )
         })?;
-        self.ring[slot].leased = true;
+        self.ring[slot].leased.set(true);
         u32::try_from(slot).context("disk ring slot exceeds u32")
     }
 
@@ -175,7 +171,7 @@ impl DiskReader {
     pub fn values(&self, slot: u32) -> Result<&[bf16]> {
         let index = usize::try_from(slot).context("disk ring slot exceeds usize")?;
         ensure!(
-            index < self.ring.len() && self.ring[index].leased,
+            index < self.ring.len() && self.ring[index].leased.get(),
             "disk ring slot {slot} is not leased"
         );
         let ptr = self.ring[index].ptr.as_ptr();
@@ -184,13 +180,13 @@ impl DiskReader {
     }
 
     /// Releases a leased slot for reuse.
-    pub fn release(&mut self, slot: u32) -> Result<()> {
+    pub fn release(&self, slot: u32) -> Result<()> {
         let index = usize::try_from(slot).context("disk ring slot exceeds usize")?;
         ensure!(
-            index < self.ring.len() && self.ring[index].leased,
+            index < self.ring.len() && self.ring[index].leased.get(),
             "disk ring slot {slot} is not leased"
         );
-        self.ring[index].leased = false;
+        self.ring[index].leased.set(false);
         Ok(())
     }
 }
@@ -314,7 +310,7 @@ mod tests {
     fn reads_native_ranges_at_the_catalogue_offsets() -> Result<()> {
         let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
         let pattern = pattern(1536, 0);
-        let mut reader = DiskReader::open(&catalogue, dir.path(), 2)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 2)?;
         for (layer, expert) in [(0u32, 0u32), (0, 3), (1, 0), (1, 3)] {
             let slot = reader.read_expert(layer, expert, &catalogue)?;
             let values = reader.values(slot)?;
@@ -344,7 +340,7 @@ mod tests {
         let (dir, catalogue) = staged("gate.safetensors", "down.safetensors")?;
         let gate_pattern = pattern(1536, 0);
         let down_pattern = pattern(1536, 91);
-        let mut reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
         let slot = reader.read_expert(0, 2, &catalogue)?;
         let values = reader.values(slot)?;
         for (index, value) in values.iter().enumerate() {
@@ -382,7 +378,7 @@ mod tests {
     #[test]
     fn ring_slots_are_leased_until_released() -> Result<()> {
         let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
-        let mut reader = DiskReader::open(&catalogue, dir.path(), 2)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 2)?;
         let first = reader.read_expert(0, 0, &catalogue)?;
         let second = reader.read_expert(0, 1, &catalogue)?;
         assert_ne!(first, second);
@@ -404,6 +400,35 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_can_be_filled_while_another_is_read() -> Result<()> {
+        let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 2)?;
+        let first = reader.read_expert(0, 0, &catalogue)?;
+        let values = reader.values(first)?;
+        let second = reader.read_expert(0, 1, &catalogue)?;
+        assert_ne!(first, second);
+        let second_values = reader.values(second)?;
+        assert_eq!(values.len(), 96);
+        assert_eq!(second_values.len(), 96);
+        assert_ne!(values[0].to_bits(), second_values[0].to_bits());
+        reader.release(first)?;
+        reader.release(second)?;
+        assert!(reader.values(first).is_err());
+        let single = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let held = single.read_expert(0, 0, &catalogue)?;
+        let error = single
+            .read_expert(0, 1, &catalogue)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("all 1 disk ring slots are leased"),
+            "{error}"
+        );
+        single.release(held)?;
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "CPU-only real checkpoint; set FF_MODEL"]
     fn reads_the_published_checkpoint_ranges() -> Result<()> {
         let dir =
@@ -413,7 +438,7 @@ mod tests {
         let mapped = crate::checkpoint::MappedCheckpoint::open(&dir)?;
         let manifest = mapped.manifest(&model, crate::checkpoint::LoadPolicy::TextOnly)?;
         let catalogue = ExpertCatalogue::from_manifest(&manifest, geometry)?;
-        let mut reader = DiskReader::open(&catalogue, &dir, 2)?;
+        let reader = DiskReader::open(&catalogue, &dir, 2)?;
         let gate_up_elements = 2 * geometry.intermediate as usize * geometry.hidden as usize;
         let down_elements = geometry.hidden as usize * geometry.intermediate as usize;
         for (layer, expert) in [(0u32, 0u32), (39, 255)] {
