@@ -1,5 +1,8 @@
-//! Host expert block arena with per-block read leases and writer claims.
+//! Native device-slot layout and host expert blocks with read leases and writer claims.
+use crate::experts::{catalogue::ExpertGeometry, plan::Capacity};
 use anyhow::{Context, Result, ensure};
+#[cfg(feature = "cuda")]
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, sys};
 use half::bf16;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -101,7 +104,16 @@ impl HostBlocks {
         let elements = usize::try_from(blocks)?
             .checked_mul(block_elements)
             .context("host arena extent overflow")?;
-        let data: Box<[bf16]> = vec![bf16::ZERO; elements].into_boxed_slice();
+        let bytes = elements
+            .checked_mul(std::mem::size_of::<bf16>())
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .context("host arena byte extent overflow")?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(elements).with_context(|| {
+            format!("allocate host expert arena: blocks={blocks} bytes={bytes}")
+        })?;
+        data.resize(elements, bf16::ZERO);
+        let data: Box<[bf16]> = data.into_boxed_slice();
         let base = Box::into_raw(data) as *mut bf16;
         Ok(Arc::new(Self {
             base,
@@ -195,9 +207,572 @@ impl HostBlocks {
     }
 }
 
+/// Native expert slots in rank-major, layer-minor order, followed by persistent staging.
+pub struct SlotLayout {
+    geometry: ExpertGeometry,
+    slots: Vec<Vec<Range<usize>>>,
+    resident_bytes: usize,
+    staging_slots: u32,
+    host_blocks: u32,
+}
+
+impl SlotLayout {
+    pub fn new(geometry: ExpertGeometry, capacity: &Capacity) -> Result<Self> {
+        ensure!(
+            geometry.layers > 0
+                && geometry.experts > 0
+                && geometry.hidden > 0
+                && geometry.intermediate > 0
+                && geometry.top_k > 0
+                && geometry.top_k <= geometry.experts,
+            "invalid slot geometry {geometry:?}"
+        );
+        let slot_bytes = usize::try_from(geometry.slot_bytes()?)?;
+        ensure!(
+            slot_bytes.is_multiple_of(16) && geometry.gate_up_bytes()?.is_multiple_of(16),
+            "native slot alignment: slot_bytes={slot_bytes} gate_up_bytes={}",
+            geometry.gate_up_bytes()?
+        );
+        ensure!(
+            capacity.slots_per_layer.len() == geometry.layers as usize,
+            "slot layout layer count {} differs from {}",
+            capacity.slots_per_layer.len(),
+            geometry.layers
+        );
+        let resident_count = capacity
+            .slots_per_layer
+            .iter()
+            .try_fold(0u64, |n, &count| {
+                n.checked_add(u64::from(count))
+                    .context("resident slot count overflow")
+            })?;
+        let resident_extent = resident_count
+            .checked_mul(slot_bytes as u64)
+            .filter(|&n| n <= isize::MAX as u64)
+            .context("resident expert arena overflow")?;
+        ensure!(
+            resident_extent <= capacity.device_expert_bytes,
+            "resident expert arena bytes={resident_extent} exceed budget={}",
+            capacity.device_expert_bytes
+        );
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(geometry.layers as usize)?;
+        for (layer, &count) in capacity.slots_per_layer.iter().enumerate() {
+            ensure!(
+                count > 0 && count <= geometry.experts,
+                "slot layout layer={layer} slots={count} experts={}",
+                geometry.experts
+            );
+            let mut layer_slots = Vec::new();
+            layer_slots.try_reserve_exact(count as usize)?;
+            slots.push(layer_slots);
+        }
+        let mut resident_bytes = 0usize;
+        for rank in 0..capacity.slots_per_layer.iter().copied().max().unwrap_or(0) {
+            for (layer, &count) in capacity.slots_per_layer.iter().enumerate() {
+                if rank < count {
+                    let end = resident_bytes
+                        .checked_add(slot_bytes)
+                        .context("resident expert arena overflow")?;
+                    slots[layer].push(resident_bytes..end);
+                    resident_bytes = end;
+                }
+            }
+        }
+        let host_blocks = capacity
+            .host_blocks
+            .checked_add(capacity.spare_blocks)
+            .context("host data plus spare block count overflow")?;
+        let host_bytes = u64::from(host_blocks)
+            .checked_mul(slot_bytes as u64)
+            .context("host expert arena overflow")?;
+        ensure!(
+            host_bytes <= capacity.host_expert_bytes,
+            "host expert arena bytes={host_bytes} exceed budget={}",
+            capacity.host_expert_bytes
+        );
+        let layout = Self {
+            geometry,
+            slots,
+            resident_bytes,
+            staging_slots: capacity.prefill_staging_slots,
+            host_blocks,
+        };
+        layout.allocation_bytes()?;
+        Ok(layout)
+    }
+
+    pub fn allocation_bytes(&self) -> Result<usize> {
+        usize::try_from(self.geometry.slot_bytes()?)?
+            .checked_mul(self.staging_slots as usize)
+            .and_then(|n| n.checked_add(self.resident_bytes))
+            .filter(|&n| n <= isize::MAX as usize)
+            .context("device expert plus staging arena extent overflow")
+    }
+
+    pub fn geometry(&self) -> ExpertGeometry {
+        self.geometry
+    }
+
+    pub fn host_blocks(&self) -> u32 {
+        self.host_blocks
+    }
+
+    pub fn resident_slot(&self, layer: u32, rank: u32) -> Result<Range<usize>> {
+        self.slots
+            .get(layer as usize)
+            .and_then(|slots| slots.get(rank as usize))
+            .cloned()
+            .with_context(|| format!("native slot outside layout: layer={layer} rank={rank}"))
+    }
+
+    pub fn staging_slot(&self, slot: u32) -> Result<Range<usize>> {
+        ensure!(
+            slot < self.staging_slots,
+            "staging slot={slot} outside count={}",
+            self.staging_slots
+        );
+        let bytes = usize::try_from(self.geometry.slot_bytes()?)?;
+        let start = self.resident_bytes + slot as usize * bytes;
+        Ok(start..start + bytes)
+    }
+
+    /// Borrowed storage excludes persistent staging and retains the first slot of every layer.
+    pub fn borrowed_tail(&self, slots: u32) -> Result<Range<usize>> {
+        let bytes = usize::try_from(self.geometry.slot_bytes()?)?;
+        let count = self.resident_bytes / bytes;
+        ensure!(
+            slots as usize <= count - self.geometry.layers as usize,
+            "borrowed slots={slots} exceed resident count={count} minus layers={}",
+            self.geometry.layers
+        );
+        Ok(self.resident_bytes - slots as usize * bytes..self.resident_bytes)
+    }
+}
+
+/// Stable native expert slots, persistent staging and host data plus spare blocks.
+#[cfg(feature = "cuda")]
+pub struct ExpertStorage {
+    layout: SlotLayout,
+    device: CudaSlice<bf16>,
+    host: Option<Arc<HostBlocks>>,
+    context: Arc<CudaContext>,
+    registered: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl ExpertStorage {
+    pub fn new(
+        stream: &Arc<CudaStream>,
+        upload: &Arc<CudaStream>,
+        geometry: ExpertGeometry,
+        capacity: &Capacity,
+    ) -> Result<Self> {
+        ensure!(
+            Arc::ptr_eq(stream.context(), upload.context()),
+            "expert allocation streams have different contexts"
+        );
+        let layout = SlotLayout::new(geometry, capacity)?;
+        let bytes = layout.allocation_bytes()?;
+        let host = (layout.host_blocks() > 0)
+            .then(|| {
+                HostBlocks::new(
+                    layout.host_blocks(),
+                    usize::try_from(geometry.slot_bytes()? / 2)?,
+                )
+            })
+            .transpose()?;
+        let allocation = stream
+            .alloc_zeros(bytes / size_of::<bf16>())
+            .with_context(|| format!("allocate native expert slots and staging: bytes={bytes}"))?;
+        upload.wait(&stream.record_event(None)?)?;
+        Ok(Self {
+            layout,
+            device: allocation,
+            host,
+            context: stream.context().clone(),
+            registered: false,
+        })
+    }
+
+    pub fn layout(&self) -> &SlotLayout {
+        &self.layout
+    }
+
+    pub fn host(&self) -> Option<&Arc<HostBlocks>> {
+        self.host.as_ref()
+    }
+
+    fn native_pointers(&self, range: std::ops::Range<usize>) -> Result<(u64, u64)> {
+        ensure!(
+            range.end <= self.device.len() * size_of::<bf16>(),
+            "native expert range {range:?} exceeds allocation bytes={}",
+            self.device.len() * size_of::<bf16>()
+        );
+        let (base, _read) = self.device.device_ptr(self.device.stream());
+        let gate_up = base
+            .checked_add(range.start as u64)
+            .context("native expert address overflow")?;
+        let down = gate_up
+            .checked_add(self.layout.geometry().gate_up_bytes()?)
+            .context("native down address overflow")?;
+        Ok((gate_up, down))
+    }
+
+    /// Native `[2I,H]` gate-up and `[H,I]` down device addresses of one resident slot.
+    pub fn slot(&self, layer: u32, rank: u32) -> Result<(u64, u64)> {
+        self.native_pointers(self.layout.resident_slot(layer, rank)?)
+    }
+
+    /// Native gate-up and down device addresses of one persistent staging slot.
+    pub fn staging(&self, slot: u32) -> Result<(u64, u64)> {
+        self.native_pointers(self.layout.staging_slot(slot)?)
+    }
+
+    /// The ledger must evict and claim every slot in this range before writes begin.
+    pub fn borrowed_tail(&self, slots: u32) -> Result<(u64, usize)> {
+        let range = self.layout.borrowed_tail(slots)?;
+        let (base, _read) = self.device.device_ptr(self.device.stream());
+        Ok((
+            base.checked_add(range.start as u64)
+                .context("borrowed span address overflow")?,
+            range.len(),
+        ))
+    }
+
+    /// Setup calls this only for a resource-profiled pinned host plan.
+    pub fn register_host(&mut self) -> Result<()> {
+        ensure!(!self.registered, "expert host arena is already registered");
+        let host = self
+            .host
+            .as_ref()
+            .context("cannot register an empty host expert arena")?;
+        let (address, bytes) = host.host_span();
+        self.context
+            .bind_to_thread()
+            .context("bind expert host registration context")?;
+        // SAFETY: the exact owned allocation remains alive until unregister after all device uses.
+        unsafe { sys::cuMemHostRegister_v2(address as *mut std::ffi::c_void, bytes, 0).result() }
+            .with_context(|| format!("register expert host arena: bytes={bytes}"))?;
+        self.registered = true;
+        Ok(())
+    }
+
+    /// Completes all context readers and copies before releasing page-lock registration.
+    pub fn finish(&mut self) -> Result<()> {
+        self.context
+            .synchronize()
+            .context("finish expert storage readers and copies")?;
+        if self.registered {
+            let (address, bytes) = self
+                .host
+                .as_ref()
+                .context("registered expert host arena missing")?
+                .host_span();
+            // SAFETY: context synchronization completed every device use of the live allocation.
+            unsafe { sys::cuMemHostUnregister(address as *mut std::ffi::c_void).result() }
+                .with_context(|| format!("unregister expert host arena: bytes={bytes}"))?;
+            self.registered = false;
+        }
+        self.context
+            .check_err()
+            .context("expert storage deferred CUDA error")?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for ExpertStorage {
+    fn drop(&mut self) {
+        self.context.record_err(self.context.synchronize());
+        if self.registered {
+            self.context.record_err(self.context.bind_to_thread());
+            if let Some(host) = &self.host {
+                let (address, _) = host.host_span();
+                // SAFETY: the host allocation remains owned and context uses have been synchronized.
+                self.context.record_err(unsafe {
+                    sys::cuMemHostUnregister(address as *mut std::ffi::c_void).result()
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cuda")]
+    fn expert_storage_case(geometry: crate::experts::catalogue::ExpertGeometry) -> Result<()> {
+        use crate::experts::plan::Capacity;
+        use cudarc::driver::result;
+        let slot_bytes = geometry.slot_bytes()?;
+        let mut counts = vec![1; geometry.layers as usize];
+        counts[0] += 1;
+        let capacity = Capacity {
+            span_rows: 8,
+            wave_rows: 2,
+            device_expert_bytes: u64::from(geometry.layers + 1) * slot_bytes,
+            host_expert_bytes: 3 * slot_bytes,
+            slots_per_layer: counts.clone(),
+            host_blocks: 2,
+            spare_blocks: 1,
+            disk_bytes: 0,
+            worker_count: 1,
+            disk_workers: 0,
+            prefill_staging_slots: 2,
+        };
+        let device = crate::backend::cuda::Device::new(0)?;
+        let mut storage = ExpertStorage::new(&device.stream, &device.upload, geometry, &capacity)?;
+        let host = storage.host().context("host expert arena missing")?.clone();
+        let elements = slot_bytes as usize / size_of::<bf16>();
+        let pattern = |i: usize, block: u32| {
+            bf16::from_bits(0x3c00 | ((i * 17 + block as usize * 59) % 251) as u16)
+        };
+        for block in 0..host.blocks() {
+            let mut claim = host.claim(block)?;
+            for (index, value) in claim.slice()?.iter_mut().enumerate() {
+                *value = pattern(index, block);
+            }
+        }
+        storage.register_host()?;
+        let (registered, registered_bytes) = host.host_span();
+        assert_eq!(registered_bytes, 3 * slot_bytes as usize);
+        let mut flags = u32::MAX;
+        unsafe { sys::cuMemHostGetFlags(&mut flags, registered as *mut std::ffi::c_void).result() }
+            .context("read expert host registration flags")?;
+        assert_eq!(flags, 0);
+        let upload = &device.upload;
+        let stream = &device.stream;
+        let (first, first_down) = storage.slot(0, 0)?;
+        assert_eq!(first_down - first, geometry.gate_up_bytes()?);
+        let lease = host.lease(&[0])?;
+        // SAFETY: the registered block is leased through completion and the destination owns a full slot.
+        unsafe { result::memcpy_htod_async(first, lease.read(0)?, upload.cu_stream())? };
+        let ready = upload.record_event(None)?;
+        assert!(host.claim(0).is_err());
+        stream.wait(&ready)?;
+        let first_range = storage.layout().resident_slot(0, 0)?;
+        let observed = stream.clone_dtoh(
+            &storage
+                .device
+                .slice(first_range.start / 2..first_range.end / 2),
+        )?;
+        assert!(
+            observed
+                .iter()
+                .enumerate()
+                .all(|(i, &value)| value == pattern(i, 0))
+        );
+        ready.synchronize()?;
+        drop(lease);
+        let claim = host.claim(2)?;
+        // SAFETY: this exact registered destination block is writer-claimed through the copy event.
+        unsafe {
+            sys::cuMemcpyDtoHAsync_v2(
+                claim.pointer()? as *mut std::ffi::c_void,
+                first,
+                slot_bytes as usize,
+                upload.cu_stream(),
+            )
+            .result()?
+        };
+        let written = upload.record_event(None)?;
+        assert!(host.lease(&[2]).is_err());
+        written.synchronize()?;
+        drop(claim);
+        let lease = host.lease(&[2])?;
+        assert!(
+            lease
+                .read(2)?
+                .iter()
+                .enumerate()
+                .all(|(i, &value)| value == pattern(i, 0))
+        );
+        drop(lease);
+        let staged = storage.staging(1)?;
+        let lease = host.lease(&[1])?;
+        // SAFETY: the source lease and both full-slot destination ranges remain live through completion.
+        unsafe {
+            result::memcpy_htod_async(staged.0, lease.read(1)?, upload.cu_stream())?;
+            result::memcpy_htod_async(storage.slot(0, 1)?.0, lease.read(1)?, upload.cu_stream())?;
+        }
+        let ready = upload.record_event(None)?;
+        stream.wait(&ready)?;
+        let mut ledger = crate::experts::plan::TierLedger::new(
+            geometry,
+            counts,
+            0,
+            &(0..geometry.layers)
+                .map(|layer| if layer == 0 { vec![0, 1] } else { vec![0] })
+                .collect::<Vec<_>>(),
+        )?;
+        assert_eq!(ledger.borrow(1)?.experts, vec![(0, 1)]);
+        let (borrowed, borrowed_bytes) = storage.borrowed_tail(1)?;
+        assert_eq!(borrowed, storage.slot(0, 1)?.0);
+        assert_eq!(borrowed_bytes, slot_bytes as usize);
+        // SAFETY: the ledger evicted the tail, the stream waits for its last writer, and the storage is live.
+        unsafe { result::memset_d8_async(borrowed, 0x5a, borrowed_bytes, stream.cu_stream())? };
+        let staged_range = storage.layout().staging_slot(1)?;
+        let staged_values = stream.clone_dtoh(
+            &storage
+                .device
+                .slice(staged_range.start / 2..staged_range.end / 2),
+        )?;
+        assert!(
+            staged_values
+                .iter()
+                .enumerate()
+                .all(|(i, &value)| value == pattern(i, 1))
+        );
+        let first_values = stream.clone_dtoh(
+            &storage
+                .device
+                .slice(first_range.start / 2..first_range.end / 2),
+        )?;
+        assert_eq!(first_values, observed);
+        let tail = storage.layout().borrowed_tail(1)?;
+        let tail_values = stream.clone_dtoh(&storage.device.slice(tail.start / 2..tail.end / 2))?;
+        assert!(tail_values.iter().all(|value| value.to_bits() == 0x5a5a));
+        ready.synchronize()?;
+        drop(lease);
+        storage.finish()?;
+        storage.register_host()?;
+        storage.finish()?;
+        let lease = host.lease(&[0])?;
+        let mut ring = unsafe { device.ctx.alloc_pinned::<bf16>(elements)? };
+        ring.as_mut_slice()?.copy_from_slice(lease.read(0)?);
+        drop(lease);
+        let mut destination = storage
+            .device
+            .slice_mut(first_range.start / 2..first_range.end / 2);
+        upload.memcpy_htod(&ring, &mut destination)?;
+        stream.wait(&upload.record_event(None)?)?;
+        let pageable_values = stream.clone_dtoh(&destination)?;
+        assert_eq!(pageable_values, observed);
+        storage.finish()?;
+        device.ctx.check_err()?;
+        println!(
+            "PASS expert_storage_case layers={} hidden={} intermediate={} native_slot_bytes={slot_bytes} pinned=true pageable_staging=true tail_staging_disjoint=true leases=true re_register=true",
+            geometry.layers, geometry.hidden, geometry.intermediate
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    #[cfg(feature = "cuda")]
+    fn expert_storage_smoke_gpu() -> Result<()> {
+        expert_storage_case(crate::experts::catalogue::ExpertGeometry {
+            layers: 3,
+            experts: 8,
+            hidden: 128,
+            intermediate: 64,
+            top_k: 2,
+        })
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    #[cfg(feature = "cuda")]
+    fn expert_storage_native_gpu() -> Result<()> {
+        let path = std::env::var_os("FF_MODEL")
+            .context("FF_MODEL is required for native expert geometry")?;
+        let spec = crate::model_spec::ModelSpec::read(std::path::Path::new(&path))?;
+        expert_storage_case(crate::experts::catalogue::ExpertGeometry::from_model(
+            &spec,
+        )?)
+    }
+
+    fn slot_capacity(geometry: ExpertGeometry, slots_per_layer: Vec<u32>) -> Result<Capacity> {
+        let bytes = geometry.slot_bytes()?;
+        Ok(Capacity {
+            span_rows: 8,
+            wave_rows: 2,
+            device_expert_bytes: slots_per_layer.iter().map(|&n| u64::from(n)).sum::<u64>() * bytes,
+            host_expert_bytes: 3 * bytes,
+            slots_per_layer,
+            host_blocks: 2,
+            spare_blocks: 1,
+            disk_bytes: 0,
+            worker_count: 1,
+            disk_workers: 0,
+            prefill_staging_slots: 2,
+        })
+    }
+
+    #[test]
+    fn slot_layout_matches_ledger_tail_with_uneven_layers() -> Result<()> {
+        let geometry = ExpertGeometry {
+            layers: 3,
+            experts: 8,
+            hidden: 8,
+            intermediate: 4,
+            top_k: 2,
+        };
+        let capacity = slot_capacity(geometry, vec![3, 2, 2])?;
+        let layout = SlotLayout::new(geometry, &capacity)?;
+        let bytes = geometry.slot_bytes()? as usize;
+        let order = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1), (0, 2)];
+        for (physical, &(layer, rank)) in order.iter().enumerate() {
+            assert_eq!(
+                layout.resident_slot(layer, rank)?,
+                physical * bytes..(physical + 1) * bytes
+            );
+        }
+        assert!(layout.resident_slot(1, 2).is_err());
+        assert_eq!(layout.staging_slot(0)?, 7 * bytes..8 * bytes);
+        assert_eq!(layout.staging_slot(1)?, 8 * bytes..9 * bytes);
+        assert!(layout.staging_slot(2).is_err());
+        assert_eq!(layout.allocation_bytes()?, 9 * bytes);
+        assert_eq!(layout.borrowed_tail(0)?, 7 * bytes..7 * bytes);
+        assert_eq!(layout.borrowed_tail(2)?, 5 * bytes..7 * bytes);
+        assert_eq!(layout.borrowed_tail(4)?, 3 * bytes..7 * bytes);
+        assert!(layout.borrowed_tail(5).is_err());
+        let initial = vec![vec![4, 1, 7], vec![2, 6], vec![5, 0]];
+        let mut ledger = crate::experts::plan::TierLedger::new(
+            geometry,
+            capacity.slots_per_layer.clone(),
+            0,
+            &initial,
+        )?;
+        let borrowed = ledger.borrow(2)?;
+        assert_eq!(borrowed.experts, vec![(0, 7), (2, 0)]);
+        assert_eq!(borrowed.disk_bytes, 2 * bytes as u64);
+        ledger.check()?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_slot_layout_prices_spares_and_rejects_out_of_bounds_extents() -> Result<()> {
+        let geometry = ExpertGeometry {
+            layers: 40,
+            experts: 256,
+            hidden: 2048,
+            intermediate: 512,
+            top_k: 8,
+        };
+        let mut capacity = slot_capacity(geometry, crate::experts::plan::equal_slots(2701, 40)?)?;
+        let bytes = geometry.slot_bytes()? as usize;
+        assert_eq!(bytes, 6_291_456);
+        assert_eq!(geometry.gate_up_bytes()?, 4_194_304);
+        assert_eq!(geometry.down_bytes()?, 2_097_152);
+        let layout = SlotLayout::new(geometry, &capacity)?;
+        assert_eq!(layout.resident_slot(20, 67)?, 2700 * bytes..2701 * bytes);
+        assert!(layout.resident_slot(21, 67).is_err());
+        assert_eq!(layout.borrowed_tail(429)?, 2272 * bytes..2701 * bytes);
+        assert_eq!(layout.staging_slot(0)?.start, 2701 * bytes);
+        assert_eq!(layout.allocation_bytes()?, 2703 * bytes);
+        capacity.device_expert_bytes -= 1;
+        assert!(SlotLayout::new(geometry, &capacity).is_err());
+        capacity.device_expert_bytes += 1;
+        capacity.host_expert_bytes -= 1;
+        assert!(SlotLayout::new(geometry, &capacity).is_err());
+        capacity.host_expert_bytes += 1;
+        capacity.spare_blocks = u32::MAX;
+        assert!(SlotLayout::new(geometry, &capacity).is_err());
+        assert!(HostBlocks::new(2, usize::MAX / 2).is_err());
+        Ok(())
+    }
 
     /// A read after the lease drops does not compile: `BlockLease::read` borrows the guard.
     #[test]
