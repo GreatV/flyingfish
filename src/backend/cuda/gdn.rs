@@ -1353,7 +1353,6 @@ mod tests {
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
         let spec = GdnSpec::from_model(&model)?;
-        let reference_only = crate::backend::cuda::mixer_reference_only()?;
         for core in [
             GeometryCore::Recurrent,
             GeometryCore::Chunked,
@@ -1361,20 +1360,14 @@ mod tests {
         ] {
             for graph in [false, true] {
                 let reference = geometry_run(&device, GdnSpec::q38(), 2, 2, core, graph, false)?;
-                if !reference_only {
-                    let candidate = geometry_run(&device, spec, 2, 2, core, graph, false)?;
-                    ensure!(
-                        geometry_mismatches(&candidate, &reference, 2) == 0,
-                        "mixer SMOKE geometry differs"
-                    );
-                } else {
-                    ensure!(!reference.out.is_empty(), "empty reference SMOKE");
-                }
+                let candidate = geometry_run(&device, spec, 2, 2, core, graph, false)?;
+                ensure!(
+                    geometry_mismatches(&candidate, &reference, 2) == 0,
+                    "mixer SMOKE geometry differs"
+                );
             }
         }
-        println!(
-            "PR2_MIXER_SMOKE PASS reference_only={reference_only} prefix=23 rows=2 cores=3 graph_modes=2"
-        );
+        println!("PR2_MIXER_SMOKE PASS prefix=23 rows=2 cores=3 graph_modes=2");
         Ok(())
     }
 
@@ -1395,7 +1388,6 @@ mod tests {
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
         let spec = GdnSpec::from_model(&model)?;
-        let reference_only = crate::backend::cuda::mixer_reference_only()?;
         let mut defects = 0;
         let mut cases = 0;
         for (rows, valid) in [
@@ -1423,32 +1415,6 @@ mod tests {
                 for graph in [false, true] {
                     let reference =
                         geometry_run(&device, GdnSpec::q38(), rows, valid, core, graph, false)?;
-                    if reference_only {
-                        let name = format!("gdn_{core:?}_m{rows}_v{valid}_graph{graph}");
-                        crate::backend::cuda::mixer_reference_dump(
-                            &format!("{name}.out.bf16"),
-                            &reference.out[..valid as usize * 48 * 128]
-                                .iter()
-                                .flat_map(|v| v.to_bits().to_le_bytes())
-                                .collect::<Vec<_>>(),
-                        )?;
-                        for (field, values) in
-                            [("state", &reference.state), ("history", &reference.history)]
-                        {
-                            crate::backend::cuda::mixer_reference_dump(
-                                &format!("{name}.{field}.f32"),
-                                &values
-                                    .iter()
-                                    .flat_map(|v| v.to_bits().to_le_bytes())
-                                    .collect::<Vec<_>>(),
-                            )?;
-                        }
-                        println!(
-                            "PR2_GDN_REFERENCE PASS core={core:?} rows={rows} valid={valid} prefix=23 graph={graph}"
-                        );
-                        cases += 1;
-                        continue;
-                    }
                     let candidate = geometry_run(&device, spec, rows, valid, core, graph, false)?;
                     let mismatches = geometry_mismatches(&candidate, &reference, valid);
                     println!(
@@ -1459,10 +1425,6 @@ mod tests {
                     cases += 1;
                 }
             }
-        }
-        if reference_only {
-            println!("PR2_GDN_REFERENCE_SUMMARY PASS cases={cases} candidate_cases=0");
-            return Ok(());
         }
         let reference = geometry_run(
             &device,

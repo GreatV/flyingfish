@@ -339,7 +339,6 @@ mod tests {
             &root,
             Rc::new(Closure::new(false, "native BF16 mixer gate".into())),
         )?;
-        let reference_only = crate::backend::cuda::mixer_reference_only()?;
         let mut defects = 0;
         let mut cases = 0;
         for (n, k) in [
@@ -465,20 +464,8 @@ mod tests {
                             v.to_bits() != values[(*i % n as usize) * k as usize + column].to_bits()
                         })
                         .count();
-                    if reference_only {
-                        ensure!(
-                            mismatches == 0,
-                            "BF16 one-hot reference mismatches={mismatches}"
-                        );
-                        crate::backend::cuda::mixer_reference_dump(
-                            &format!("linear_n{n}_k{k}_m{m}_graph{graph}.out.bf16"),
-                            &got.iter()
-                                .flat_map(|v| v.to_bits().to_le_bytes())
-                                .collect::<Vec<_>>(),
-                        )?;
-                    }
                     println!(
-                        "PR2_BF16_LINEAR stored_weight=[{n},{k}] rows={m} graph={graph} reference_only={reference_only} dequant_bytes=0 mismatches={mismatches} {}",
+                        "PR2_BF16_LINEAR stored_weight=[{n},{k}] rows={m} graph={graph} dequant_bytes=0 mismatches={mismatches} {}",
                         if mismatches == 0 { "PASS" } else { "DEFECT" }
                     );
                     defects += usize::from(mismatches != 0);
@@ -499,20 +486,8 @@ mod tests {
                             v.to_bits() != values[*r * k as usize + 13 % k as usize].to_bits()
                         })
                         .count();
-                    if reference_only {
-                        ensure!(
-                            mismatches == 0,
-                            "BF16 decode one-hot reference mismatches={mismatches}"
-                        );
-                        crate::backend::cuda::mixer_reference_dump(
-                            &format!("linear_n{n}_k{k}_decode.out.bf16"),
-                            &got.iter()
-                                .flat_map(|v| v.to_bits().to_le_bytes())
-                                .collect::<Vec<_>>(),
-                        )?;
-                    }
                     println!(
-                        "PR2_BF16_LINEAR_DECODE stored_weight=[{n},{k}] rows=1 graph=false reference_only={reference_only} mismatches={mismatches} {}",
+                        "PR2_BF16_LINEAR_DECODE stored_weight=[{n},{k}] rows=1 graph=false mismatches={mismatches} {}",
                         if mismatches == 0 { "PASS" } else { "DEFECT" }
                     );
                     defects += usize::from(mismatches != 0);
@@ -520,9 +495,7 @@ mod tests {
                 }
             }
         }
-        println!(
-            "PR2_BF16_LINEAR_SUMMARY reference_only={reference_only} cases={cases} defects={defects}"
-        );
+        println!("PR2_BF16_LINEAR_SUMMARY cases={cases} defects={defects}");
         ensure!(defects == 0, "PR2_BF16_LINEAR DEFECT cases={defects}");
         Ok(())
     }

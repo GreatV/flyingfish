@@ -1415,7 +1415,6 @@ mod tests {
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
         let spec = FullAttentionSpec::from_model(&model)?;
-        let reference_only = crate::backend::cuda::mixer_reference_only()?;
         let mut defects = 0;
         let mut cases = 0;
         for (rows, valid) in [
@@ -1462,58 +1461,6 @@ mod tests {
                             "attention reference oracle mismatches={}",
                             reference.oracle_mismatches
                         );
-                        if reference_only {
-                            let name = format!(
-                                "attention_m{rows}_v{valid}_axes{}_graph{graph}_flash{flash}",
-                                positions.is_some()
-                            );
-                            for (field, values) in [
-                                ("q", &reference.q),
-                                ("gate", &reference.gate),
-                                ("core", &reference.core_out),
-                            ] {
-                                let live = &values[..valid as usize * 24 * 256];
-                                ensure!(
-                                    live.iter().all(|v| v.is_finite()),
-                                    "nonfinite attention reference {field}"
-                                );
-                                crate::backend::cuda::mixer_reference_dump(
-                                    &format!("{name}.{field}.bf16"),
-                                    &live
-                                        .iter()
-                                        .flat_map(|v| v.to_bits().to_le_bytes())
-                                        .collect::<Vec<_>>(),
-                                )?;
-                            }
-                            for (field, values) in [
-                                ("k_cache", &reference.k_cache),
-                                ("v_cache", &reference.v_cache),
-                            ] {
-                                let live: Vec<_> = (0..4)
-                                    .flat_map(|head| {
-                                        let start = head * 8192 * 256;
-                                        values[start..start + (23 + valid as usize) * 256].iter()
-                                    })
-                                    .collect();
-                                ensure!(
-                                    live.iter().all(|v| v.is_finite()),
-                                    "nonfinite attention reference {field}"
-                                );
-                                crate::backend::cuda::mixer_reference_dump(
-                                    &format!("{name}.{field}.bf16"),
-                                    &live
-                                        .iter()
-                                        .flat_map(|v| v.to_bits().to_le_bytes())
-                                        .collect::<Vec<_>>(),
-                                )?;
-                            }
-                            println!(
-                                "PR2_ATTENTION_REFERENCE PASS rows={rows} valid={valid} prefix=23 axes={} graph={graph} flash={flash}",
-                                positions.is_some()
-                            );
-                            cases += 1;
-                            continue;
-                        }
                         let candidate = run_shape(&device, base)?;
                         let mismatches = geometry_mismatches(&candidate, &reference, valid, 8192)?
                             + candidate.oracle_mismatches;
@@ -1527,10 +1474,6 @@ mod tests {
                     }
                 }
             }
-        }
-        if reference_only {
-            println!("PR2_ATTENTION_REFERENCE_SUMMARY PASS cases={cases} candidate_cases=0");
-            return Ok(());
         }
         let base = Case {
             spec,
