@@ -22,10 +22,11 @@ pub struct LoadInputs<'a> {
     pub capacity: Capacity,
     pub admission: Admission,
     pub max_rows: u32,
+    /// Initial GPU set from the planner's static prefill residency.
+    pub initial: &'a [Vec<u32>],
     pub host: &'a Arc<HostBlocks>,
     pub catalogue: &'a ExpertCatalogue,
     pub reader: &'a DiskReader,
-    pub prefill_frequency: &'a [Vec<f64>],
 }
 
 /// Host-tier load cost at setup.
@@ -79,6 +80,10 @@ pub struct PromptMove {
     pub source: MoveSource,
     /// D2H destination of the victim, written before the candidate copy; `None` drops it to disk.
     pub dest_block: Option<u32>,
+    /// Event the D2H into `dest_block` waits on; `None` for a chained destination.
+    pub dest_wait: Option<u64>,
+    /// Slot of the preceding host swap whose H2D event a chained destination waits on.
+    pub chain_slot: Option<u32>,
     /// Physical slot the candidate takes (SlotLayout id).
     pub slot: u32,
     pub generation: u64,
@@ -95,16 +100,25 @@ pub struct Published {
     pub source_block: Option<u32>,
     /// D2H destination of the victim, written before the candidate copy; `None` drops it to disk.
     pub dest_block: Option<u32>,
+    /// Event the D2H into `dest_block` waits on.
+    pub dest_wait: Option<u64>,
     /// Physical slot the candidate takes (SlotLayout id).
     pub slot: u32,
     pub generation: u64,
 }
 
+/// Free host block and the event its next D2H destination waits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreeBlock {
+    id: u32,
+    wait: Option<u64>,
+}
+
 /// Destination kind of a planned move before block ids are popped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dest {
-    Spare,
-    Data,
+    Pool,
+    Chain,
     Disk,
     None,
 }
@@ -128,11 +142,10 @@ pub struct Residency {
     ledger: TierLedger,
     events: SlotEvents,
     host_block: Vec<Vec<u32>>,
-    /// Data block count: ids `0..host_blocks`; spares follow.
-    host_blocks: u32,
-    data_blocks: Vec<u32>,
-    spares: Vec<u32>,
-    released: Vec<u32>,
+    cap: u32,
+    free_blocks: Vec<FreeBlock>,
+    /// Vacated candidate blocks and the slots whose copy events gate their reuse.
+    released: Vec<(u32, u32)>,
     generation: Vec<Vec<u64>>,
     next_generation: u64,
     scores: Vec<Vec<f64>>,
@@ -144,6 +157,7 @@ pub struct Residency {
     victims: Vec<u32>,
     candidates: Vec<u32>,
     pending: Vec<(f64, u32, u32, u32)>,
+    block_needs: Vec<bool>,
     plan: Vec<PlannedMove>,
     published: Vec<Published>,
     moves: Vec<PromptMove>,
@@ -173,31 +187,36 @@ fn fresh_dispatch(max_routes: usize, experts: usize, max_rows: usize) -> Dispatc
 }
 
 fn host_fill_order(
-    frequency: &[Vec<f64>],
     initial: &[Vec<u32>],
     geometry: &ExpertGeometry,
     host_blocks: u32,
 ) -> Result<Vec<(u32, u32)>> {
+    let mut per_layer: Vec<Vec<u32>> = Vec::with_capacity(geometry.layers as usize);
+    for set in initial {
+        per_layer.push(
+            (0..geometry.experts)
+                .filter(|expert| !set.contains(expert))
+                .collect(),
+        );
+    }
     let mut order = Vec::with_capacity(host_blocks as usize);
-    for layer in 0..geometry.layers {
-        let l = layer as usize;
-        let mut ranked: Vec<u32> = (0..geometry.experts)
-            .filter(|expert| !initial[l].contains(expert))
-            .collect();
-        ranked.sort_unstable_by(|&a, &b| {
-            frequency[l][b as usize]
-                .total_cmp(&frequency[l][a as usize])
-                .then(a.cmp(&b))
-        });
-        for expert in ranked {
+    let mut rank = 0usize;
+    'ranks: loop {
+        let mut placed = false;
+        for (layer, experts) in per_layer.iter().enumerate() {
+            let Some(&expert) = experts.get(rank) else {
+                continue;
+            };
             if order.len() == host_blocks as usize {
-                break;
+                break 'ranks;
             }
-            order.push((layer, expert));
+            order.push((layer as u32, expert));
+            placed = true;
         }
-        if order.len() == host_blocks as usize {
+        if !placed {
             break;
         }
+        rank += 1;
     }
     ensure!(
         order.len() == host_blocks as usize,
@@ -217,16 +236,20 @@ impl Residency {
             capacity,
             admission,
             max_rows,
+            initial,
             host,
             catalogue,
             reader,
-            prefill_frequency,
         } = inputs;
         let started = Instant::now();
         ensure!(max_rows > 0, "zero dispatch row bound");
         ensure!(
             capacity.slots_per_layer.len() == geometry.layers as usize,
             "slot plan layer count mismatch"
+        );
+        ensure!(
+            initial.len() == geometry.layers as usize,
+            "initial set layer count mismatch"
         );
         let slot_bytes = geometry.slot_bytes()?;
         let cap = admission.hard_cap(slot_bytes)?;
@@ -257,9 +280,8 @@ impl Residency {
                 .checked_add(count)
                 .context("slot position count overflow")?;
         }
-        let initial = initial_residency(prefill_frequency, &capacity.slots_per_layer, &geometry)?;
         let layout = SlotLayout::new(geometry, &capacity)?;
-        let mut ledger = TierLedger::new(layout, host_blocks, &initial)?;
+        let mut ledger = TierLedger::new(layout, host_blocks, initial)?;
         let experts = geometry.experts as usize;
         let layers = geometry.layers as usize;
         let mut generation = vec![vec![0u64; experts]; layers];
@@ -271,25 +293,26 @@ impl Residency {
             }
         }
         let mut host_block = vec![vec![NO_BLOCK; experts]; layers];
-        let order = host_fill_order(prefill_frequency, &initial, &geometry, capacity.host_blocks)?;
+        let order = host_fill_order(initial, &geometry, capacity.host_blocks)?;
         let mut host_bytes = 0u64;
         for (index, &(layer, expert)) in order.iter().enumerate() {
             let block = u32::try_from(index).context("host block id exceeds u32")?;
             let slot = reader.read_expert(layer, expert, catalogue)?;
             let values = reader.values(slot)?;
             let mut claim = host.claim(block)?;
-            claim.slice()?.copy_from_slice(values);
+            claim.slice()?.copy_from_slice(&values);
             drop(claim);
-            reader.release(slot)?;
+            drop(values);
             ledger.place_host(layer, expert)?;
             host_block[layer as usize][expert as usize] = block;
             host_bytes = host_bytes
                 .checked_add(slot_bytes)
                 .context("host load bytes overflow")?;
         }
-        let data_blocks: Vec<u32> = (order.len() as u32..capacity.host_blocks).rev().collect();
-        let spares: Vec<u32> = (capacity.host_blocks..host_blocks).rev().collect();
-        let data_blocks_count = capacity.host_blocks;
+        let free_blocks: Vec<FreeBlock> = (order.len() as u32..host_blocks)
+            .rev()
+            .map(|id| FreeBlock { id, wait: None })
+            .collect();
         let max_routes = max_rows as usize * geometry.top_k as usize;
         let select_capacity = (positions as usize).max(cap as usize);
         let dispatches = (0..layers)
@@ -303,10 +326,9 @@ impl Residency {
             ledger,
             events: SlotEvents::new(positions as usize),
             host_block,
-            host_blocks: data_blocks_count,
-            data_blocks,
-            spares,
-            released: Vec::new(),
+            cap,
+            free_blocks,
+            released: Vec::with_capacity(host_blocks as usize),
             generation,
             next_generation,
             scores: vec![vec![0.0; experts]; layers],
@@ -318,6 +340,7 @@ impl Residency {
             victims: Vec::with_capacity(experts),
             candidates: Vec::with_capacity(experts),
             pending: Vec::with_capacity(select_capacity),
+            block_needs: Vec::with_capacity(select_capacity),
             plan: Vec::with_capacity(positions as usize),
             published: Vec::with_capacity(select_capacity),
             moves: Vec::with_capacity(positions as usize),
@@ -333,18 +356,17 @@ impl Residency {
     }
 
     /// Starts a request: installs the initial GPU set from the prefill frequency and emits the
-    /// prompt-boundary moves. The host tier and generations persist across requests; every block
-    /// need is validated before the plan is applied.
+    /// prompt-boundary moves. Host swaps chain through their vacated blocks; every block need is
+    /// validated before the plan is applied.
     pub fn begin_request(&mut self, frequency: &[Vec<f64>]) -> Result<&[PromptMove]> {
         ensure!(!self.token_open, "request boundary inside an open token");
-        self.drain_released();
+        self.drain_released()?;
         let initial = initial_residency(frequency, &self.capacity.slots_per_layer, &self.geometry)?;
         let scores = seed_scores(frequency, &self.geometry)?;
-        self.moves.clear();
         self.plan.clear();
-        let mut spare_need = 0u32;
-        let mut data_free =
-            u32::try_from(self.data_blocks.len()).context("free data blocks exceed u32")?;
+        let mut pool =
+            u32::try_from(self.free_blocks.len()).context("free host blocks exceed u32")?;
+        let mut first_host = true;
         for layer in 0..self.geometry.layers {
             let l = layer as usize;
             let target = &initial[l];
@@ -381,13 +403,19 @@ impl Residency {
                 let dest = match (victim, tier) {
                     (Some(_), Tier::Gpu) => unreachable!("incoming experts are not GPU resident"),
                     (Some(_), Tier::Host) => {
-                        spare_need += 1;
-                        Dest::Spare
+                        if first_host {
+                            ensure!(pool >= 1, "request needs a free host block, none");
+                            pool -= 1;
+                            first_host = false;
+                            Dest::Pool
+                        } else {
+                            Dest::Chain
+                        }
                     }
                     (Some(_), Tier::Disk) => {
-                        if data_free > 0 {
-                            data_free -= 1;
-                            Dest::Data
+                        if pool > self.cap {
+                            pool -= 1;
+                            Dest::Pool
                         } else {
                             Dest::Disk
                         }
@@ -422,50 +450,56 @@ impl Residency {
                 "layer {layer} needs {installs} install slots for {empty} empty slots"
             );
         }
-        ensure!(
-            spare_need <= u32::try_from(self.spares.len()).context("free spares exceed u32")?,
-            "request needs {spare_need} spare host blocks, {} free",
-            self.spares.len()
-        );
+        self.moves.clear();
+        let mut chain: Option<(u32, u32)> = None;
         for index in 0..self.plan.len() {
             let planned = self.plan[index];
             let layer = planned.layer;
             let l = layer as usize;
             let expert = planned.expert;
-            let (dest_block, slot) = match planned.victim {
+            let mut chain_slot = None;
+            let (dest_block, dest_wait, slot) = match planned.victim {
                 Some(victim) => {
                     let slot = self.ledger.slot(layer, victim)?;
-                    let dest = match planned.dest {
-                        Dest::Spare => Some(self.spare_block()?),
-                        Dest::Data => Some(self.data_block()?),
-                        Dest::Disk | Dest::None => None,
+                    let (dest_block, dest_wait) = match planned.dest {
+                        Dest::Pool => {
+                            let free = self.pool_block()?;
+                            (Some(free.id), free.wait)
+                        }
+                        Dest::Chain => {
+                            let (block, previous_slot) =
+                                chain.context("chained swap without a predecessor")?;
+                            chain_slot = Some(previous_slot);
+                            (Some(block), None)
+                        }
+                        Dest::Disk | Dest::None => (None, None),
                     };
                     match planned.tier {
                         Tier::Host => {
                             self.ledger.admit_host(layer, expert, victim)?;
                             self.host_block[l][expert as usize] = NO_BLOCK;
                             self.host_block[l][victim as usize] =
-                                dest.context("host swap without a destination block")?;
-                            self.released.push(planned.source_block);
+                                dest_block.context("host swap without a destination block")?;
+                            chain = Some((planned.source_block, slot));
                         }
                         Tier::Disk => {
                             self.ledger
-                                .admit_disk(layer, expert, victim, dest.is_some())?;
-                            if let Some(block) = dest {
+                                .admit_disk(layer, expert, victim, dest_block.is_some())?;
+                            if let Some(block) = dest_block {
                                 self.host_block[l][victim as usize] = block;
                             }
                         }
                         Tier::Gpu => unreachable!("incoming experts are not GPU resident"),
                     }
-                    (dest, slot)
+                    (dest_block, dest_wait, slot)
                 }
                 None => {
                     let slot = self.ledger.install(layer, expert)?;
                     if planned.tier == Tier::Host {
                         self.host_block[l][expert as usize] = NO_BLOCK;
-                        self.released.push(planned.source_block);
+                        self.released.push((planned.source_block, slot));
                     }
-                    (None, slot)
+                    (None, None, slot)
                 }
             };
             self.next_generation += 1;
@@ -481,9 +515,14 @@ impl Residency {
                 victim: planned.victim,
                 source,
                 dest_block,
+                dest_wait,
+                chain_slot,
                 slot,
                 generation: self.next_generation,
             });
+        }
+        if let Some((block, slot)) = chain {
+            self.released.push((block, slot));
         }
         self.scores = scores;
         self.ledger.check()?;
@@ -494,7 +533,13 @@ impl Residency {
     pub fn begin_token(&mut self) -> Result<()> {
         ensure!(self.request_open, "token outside a request");
         ensure!(!self.token_open, "token already open");
-        self.drain_released();
+        self.drain_released()?;
+        ensure!(
+            self.free_host_blocks() >= self.cap,
+            "free host blocks {} below the {}-block reserve",
+            self.free_host_blocks(),
+            self.cap
+        );
         self.token_open = true;
         for layer in 0..self.geometry.layers as usize {
             self.routed[layer].fill(false);
@@ -674,9 +719,9 @@ impl Residency {
         self.pending
             .sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
         self.pending.truncate(cap as usize);
-        let mut spare_need = 0u32;
-        let mut data_free =
-            u32::try_from(self.data_blocks.len()).context("free data blocks exceed u32")?;
+        let mut pool =
+            u32::try_from(self.free_blocks.len()).context("free host blocks exceed u32")?;
+        self.block_needs.clear();
         for index in 0..self.pending.len() {
             let (_, layer, candidate, _) = self.pending[index];
             if self.ledger.tier(layer, candidate)? == Tier::Host {
@@ -684,42 +729,44 @@ impl Residency {
                     self.host_block[layer as usize][candidate as usize] != NO_BLOCK,
                     "host expert {candidate} of layer {layer} has no block"
                 );
-                spare_need += 1;
+                ensure!(pool >= 1, "host write-back needs a free block, none");
+                pool -= 1;
+                self.block_needs.push(true);
+            } else if pool > self.cap {
+                pool -= 1;
+                self.block_needs.push(true);
             } else {
-                data_free = data_free.saturating_sub(1);
+                self.block_needs.push(false);
             }
         }
-        ensure!(
-            spare_need <= u32::try_from(self.spares.len()).context("free spares exceed u32")?,
-            "host write-backs need {spare_need} spare blocks, {} free",
-            self.spares.len()
-        );
         self.published.clear();
         for index in 0..self.pending.len() {
             let (_, layer, candidate, victim) = self.pending[index];
             let l = layer as usize;
             let slot = self.ledger.slot(layer, victim)?;
             let from_host = self.ledger.tier(layer, candidate)? == Tier::Host;
-            let (source_block, dest_block) = if from_host {
+            let (source_block, dest_block, dest_wait) = if from_host {
                 let block = self.host_block[l][candidate as usize];
-                let spare = self.spare_block()?;
+                let free = self.pool_block()?;
                 self.ledger.admit_host(layer, candidate, victim)?;
                 self.host_block[l][candidate as usize] = NO_BLOCK;
-                self.host_block[l][victim as usize] = spare;
-                self.released.push(block);
-                (Some(block), Some(spare))
+                self.host_block[l][victim as usize] = free.id;
+                self.released.push((block, slot));
+                (Some(block), Some(free.id), free.wait)
             } else {
-                let dest = if self.data_blocks.is_empty() {
-                    None
+                let dest = if self.block_needs[index] {
+                    Some(self.pool_block()?)
                 } else {
-                    Some(self.data_block()?)
+                    None
                 };
+                let dest_block = dest.map(|free| free.id);
+                let dest_wait = dest.and_then(|free| free.wait);
                 self.ledger
-                    .admit_disk(layer, candidate, victim, dest.is_some())?;
-                if let Some(block) = dest {
+                    .admit_disk(layer, candidate, victim, dest_block.is_some())?;
+                if let Some(block) = dest_block {
                     self.host_block[l][victim as usize] = block;
                 }
-                (None, dest)
+                (None, dest_block, dest_wait)
             };
             self.next_generation += 1;
             self.generation[l][candidate as usize] = self.next_generation;
@@ -730,6 +777,7 @@ impl Residency {
                 from_host,
                 source_block,
                 dest_block,
+                dest_wait,
                 slot,
                 generation: self.next_generation,
             });
@@ -754,25 +802,30 @@ impl Residency {
         self.events.copy_event(slot)
     }
 
-    /// Reader events the copy stream waits on before overwriting the slot; clears its lifetime.
-    pub fn reclaim(&mut self, slot: u32) -> Result<Vec<u64>> {
+    /// `[last copy event, last reader event]` of a slot; the copy stream waits on the reader
+    /// event before overwriting. Clears the slot's lifetime.
+    pub fn reclaim(&mut self, slot: u32) -> Result<[Option<u64>; 2]> {
         self.events.reclaim(slot)
     }
 
-    /// Borrows the resident tail for a prefill span; victims take a free data block or drop to
-    /// disk.
+    /// Borrows the resident tail for a prefill span; victims take a free block above the cap
+    /// reserve or drop to disk.
     pub fn borrow(&mut self, slots: u32) -> Result<Borrow> {
-        let limit = u32::try_from(self.data_blocks.len()).context("free data blocks exceed u32")?;
-        let borrow = self.ledger.borrow_tail(slots, limit)?;
+        let available = u32::try_from(self.free_blocks.len())
+            .context("free host blocks exceed u32")?
+            .saturating_sub(self.cap);
+        let mut borrow = self.ledger.borrow_tail(slots, available)?;
         let to_host = borrow.to_host as usize;
         ensure!(
-            to_host <= self.data_blocks.len(),
-            "borrow assigned {to_host} host victims for {} free data blocks",
-            self.data_blocks.len()
+            to_host <= self.free_blocks.len(),
+            "borrow assigned {to_host} host victims for {} free blocks",
+            self.free_blocks.len()
         );
+        borrow.host_waits.reserve(to_host);
         for &(layer, expert) in borrow.experts.iter().take(to_host) {
-            let block = self.data_block()?;
-            self.host_block[layer as usize][expert as usize] = block;
+            let free = self.pool_block()?;
+            self.host_block[layer as usize][expert as usize] = free.id;
+            borrow.host_waits.push(free.wait);
         }
         Ok(borrow)
     }
@@ -782,26 +835,29 @@ impl Residency {
         self.ledger.refill_tail()
     }
 
-    fn drain_released(&mut self) {
-        for block in self.released.drain(..) {
-            if block < self.host_blocks {
-                self.data_blocks.push(block);
-            } else {
-                self.spares.push(block);
-            }
+    fn drain_released(&mut self) -> Result<()> {
+        for index in 0..self.released.len() {
+            let (block, slot) = self.released[index];
+            ensure!(
+                self.events.copy_event(slot)?.is_some(),
+                "released block {block} has no copy event on slot {slot}"
+            );
         }
+        for index in 0..self.released.len() {
+            let (block, slot) = self.released[index];
+            self.free_blocks.push(FreeBlock {
+                id: block,
+                wait: self.events.copy_event(slot)?,
+            });
+        }
+        self.released.clear();
+        Ok(())
     }
 
-    fn spare_block(&mut self) -> Result<u32> {
-        self.spares
+    fn pool_block(&mut self) -> Result<FreeBlock> {
+        self.free_blocks
             .pop()
-            .context("spare host block missing from the pool")
-    }
-
-    fn data_block(&mut self) -> Result<u32> {
-        self.data_blocks
-            .pop()
-            .context("data host block missing from the pool")
+            .context("free host block missing from the pool")
     }
 
     pub fn ledger(&self) -> &TierLedger {
@@ -825,12 +881,8 @@ impl Residency {
         Ok(self.host_block[layer as usize][expert as usize])
     }
 
-    pub fn free_data_blocks(&self) -> u32 {
-        u32::try_from(self.data_blocks.len()).expect("free data block count fits u32")
-    }
-
-    pub fn free_spare_blocks(&self) -> u32 {
-        u32::try_from(self.spares.len()).expect("free spare block count fits u32")
+    pub fn free_host_blocks(&self) -> u32 {
+        u32::try_from(self.free_blocks.len()).expect("free host block count fits u32")
     }
 }
 
@@ -838,13 +890,22 @@ impl Residency {
 mod tests {
     use super::*;
     use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
-    use crate::experts::catalogue::ExpertCatalogue;
     use crate::experts::plan::{PlanInputs, Reserves, ServiceCell, ServiceTable, capacity};
     use std::path::{Path, PathBuf};
 
     fn geometry() -> ExpertGeometry {
         ExpertGeometry {
             layers: 2,
+            experts: 8,
+            hidden: 8,
+            intermediate: 4,
+            top_k: 2,
+        }
+    }
+
+    fn three_layers() -> ExpertGeometry {
+        ExpertGeometry {
+            layers: 3,
             experts: 8,
             hidden: 8,
             intermediate: 4,
@@ -985,17 +1046,25 @@ mod tests {
         Ok((dir, catalogue))
     }
 
+    fn slots(geometry: ExpertGeometry) -> Result<u32> {
+        geometry
+            .layers
+            .checked_mul(2)
+            .context("slot count overflow")
+    }
+
     fn build_full(
+        geometry: ExpertGeometry,
         host_blocks: u32,
         cap: u32,
     ) -> Result<(Residency, LoadReport, Arc<HostBlocks>, TempDir)> {
-        let geometry = geometry();
         let reserves = reserves();
         let service = service();
         let slot = geometry.slot_bytes()?;
         let inputs = PlanInputs {
             geometry,
-            device_free_bytes: reserves.persistent_bytes(&geometry)? + 4 * slot,
+            device_free_bytes: reserves.persistent_bytes(&geometry)?
+                + u64::from(slots(geometry)?) * slot,
             host_available_bytes: reserves.host_bytes(&geometry)?
                 + u64::from(host_blocks + cap) * slot,
             h2d_bytes_per_second: 1e9,
@@ -1009,7 +1078,6 @@ mod tests {
             wave_rows: 2,
         };
         let capacity = capacity(&inputs, cap)?;
-        assert_eq!(capacity.slots_per_layer, vec![2, 2]);
         assert_eq!(capacity.host_blocks, host_blocks);
         let admission = Admission {
             budget_bytes_per_token: slot * u64::from(cap),
@@ -1017,21 +1085,23 @@ mod tests {
         let host = HostBlocks::new(host_blocks + cap, usize::try_from(slot / 2)?)?;
         let (dir, catalogue) = staged(geometry)?;
         let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let frequency = vec![vec![1.0; 8]; geometry.layers as usize];
+        let initial = initial_residency(&frequency, &capacity.slots_per_layer, &geometry)?;
         let (residency, report) = Residency::load(LoadInputs {
             geometry,
             capacity,
             admission,
             max_rows: 8,
+            initial: &initial,
             host: &host,
             catalogue: &catalogue,
             reader: &reader,
-            prefill_frequency: &frequency(),
         })?;
         Ok((residency, report, host, dir))
     }
 
     fn build(host_blocks: u32, cap: u32) -> Result<Residency> {
-        let (mut residency, _, _, _) = build_full(host_blocks, cap)?;
+        let (mut residency, _, _, _) = build_full(geometry(), host_blocks, cap)?;
         residency.begin_request(&frequency())?;
         Ok(residency)
     }
@@ -1049,9 +1119,32 @@ mod tests {
         residency.scores[layer] = scores.to_vec();
     }
 
+    fn host_swap(
+        residency: &mut Residency,
+        layer: usize,
+        active: u32,
+        candidate: u32,
+        victim: u32,
+        event: u64,
+    ) -> Result<Published> {
+        let mut scores = [0.0; 8];
+        scores[active as usize] = 5.0;
+        scores[candidate as usize] = 30.0;
+        scores[victim as usize] = 1.0;
+        set_scores(residency, layer, scores);
+        residency.begin_token()?;
+        residency.dispatch(layer as u32, &[route(0, 0, active), route(0, 1, candidate)])?;
+        let published = residency.finish_token()?.to_vec();
+        let entry = published[0];
+        assert!(entry.from_host);
+        assert_eq!((entry.expert, entry.victim), (candidate, victim));
+        residency.record_copy(&[entry.slot], event)?;
+        Ok(entry)
+    }
+
     #[test]
-    fn load_fills_the_host_tier_from_the_native_ranges() -> Result<()> {
-        let (residency, report, host, _dir) = build_full(3, 2)?;
+    fn load_fills_the_host_tier_interleaved_from_the_native_ranges() -> Result<()> {
+        let (residency, report, host, _dir) = build_full(geometry(), 3, 2)?;
         let slot = geometry().slot_bytes()?;
         assert_eq!(report.host_bytes, 3 * slot);
         assert!(report.seconds.is_finite() && report.seconds >= 0.0);
@@ -1061,7 +1154,7 @@ mod tests {
             }
         }
         let bytes = pattern(3_072);
-        for (layer, expert, block) in [(0u32, 2u32, 0u32), (0, 3, 1), (0, 4, 2)] {
+        for (layer, expert, block) in [(0u32, 2u32, 0u32), (1, 2, 1), (0, 3, 2)] {
             assert_eq!(residency.ledger().tier(layer, expert)?, Tier::Host);
             assert_eq!(residency.host_block(layer, expert)?, block);
             let lease = host.lease(&[block])?;
@@ -1083,9 +1176,8 @@ mod tests {
             }
             drop(lease);
         }
-        assert_eq!(residency.ledger().tier(0, 5)?, Tier::Disk);
-        assert_eq!(residency.free_data_blocks(), 0);
-        assert_eq!(residency.free_spare_blocks(), 2);
+        assert_eq!(residency.ledger().tier(1, 3)?, Tier::Disk);
+        assert_eq!(residency.free_host_blocks(), 2, "the cap reserve is free");
         assert!(residency.ledger().check().is_ok());
         Ok(())
     }
@@ -1103,12 +1195,15 @@ mod tests {
         assert_eq!(movement.victim, Some(1));
         assert_eq!(movement.source, MoveSource::Host(0));
         assert_eq!(movement.dest_block, Some(3));
+        assert_eq!(movement.dest_wait, None);
+        assert_eq!(movement.chain_slot, None);
         assert_eq!(residency.ledger().tier(0, 2)?, Tier::Gpu);
         assert_eq!(residency.ledger().tier(0, 1)?, Tier::Host);
         assert_eq!(residency.host_block(0, 1)?, 3);
         assert_eq!(residency.host_block(0, 2)?, NO_BLOCK);
+        residency.record_copy(&[movement.slot], 50)?;
         residency.begin_token()?;
-        assert_eq!(residency.free_data_blocks(), 1);
+        assert_eq!(residency.free_host_blocks(), 2);
         residency.finish_token()?.to_vec();
         let moves = residency.begin_request(&frequency())?.to_vec();
         assert_eq!(moves.len(), 1);
@@ -1116,10 +1211,80 @@ mod tests {
         assert_eq!((movement.layer, movement.expert), (0, 1));
         assert_eq!(movement.victim, Some(2));
         assert_eq!(movement.source, MoveSource::Host(3));
-        assert_eq!(movement.dest_block, Some(4));
+        assert_eq!(movement.dest_block, Some(0), "the returned block is reused");
+        assert_eq!(
+            movement.dest_wait,
+            Some(50),
+            "its reuse waits on the swap's copy"
+        );
         assert_eq!(residency.ledger().tier(0, 1)?, Tier::Gpu);
-        assert_eq!(residency.host_block(0, 2)?, 4);
+        assert_eq!(residency.host_block(0, 2)?, 0);
         assert!(residency.generation(0, 1)? > residency.generation(0, 0)?);
+        Ok(())
+    }
+
+    #[test]
+    fn request_boundary_chains_host_swaps_through_vacated_blocks() -> Result<()> {
+        let (mut residency, _, _, _) = build_full(three_layers(), 4, 1)?;
+        let mut hot = vec![vec![1.0; 8]; 3];
+        for layer in &mut hot {
+            layer[2] = 5.0;
+            layer[3] = 4.0;
+        }
+        residency.begin_request(&frequency_for(3))?;
+        let moves = residency.begin_request(&hot)?.to_vec();
+        assert_eq!(moves.len(), 6);
+        assert_eq!(
+            residency.free_host_blocks(),
+            0,
+            "one block serves the whole chain"
+        );
+        let mut chained = 0;
+        for movement in &moves {
+            if let MoveSource::Host(_) = movement.source {
+                chained += 1;
+            }
+        }
+        assert_eq!(chained, 4);
+        assert_eq!(moves[0].dest_block, Some(4));
+        assert_eq!(moves[0].chain_slot, None);
+        assert_eq!(moves[1].dest_block, Some(0));
+        assert_eq!(moves[1].chain_slot, Some(moves[0].slot));
+        assert_eq!(moves[2].dest_block, Some(3));
+        assert_eq!(moves[2].chain_slot, Some(moves[1].slot));
+        assert_eq!(moves[4].dest_block, Some(1));
+        assert_eq!(moves[4].chain_slot, Some(moves[2].slot));
+        for movement in &moves {
+            residency.record_copy(&[movement.slot], 60 + u64::from(movement.slot))?;
+        }
+        residency.begin_token()?;
+        assert_eq!(residency.free_host_blocks(), 1);
+        assert!(residency.ledger().check().is_ok());
+        Ok(())
+    }
+
+    fn frequency_for(layers: usize) -> Vec<Vec<f64>> {
+        vec![vec![1.0; 8]; layers]
+    }
+
+    #[test]
+    fn host_swaps_keep_the_pool_at_the_cap_reserve() -> Result<()> {
+        let mut residency = build(3, 2)?;
+        let cap = 2;
+        let mut event = 100u64;
+        for _ in 0..2 * cap {
+            let _ = host_swap(&mut residency, 0, 0, 2, 1, event)?;
+            event += 1;
+            residency.begin_token()?;
+            assert!(residency.free_host_blocks() >= cap);
+            residency.finish_token()?.to_vec();
+            let _ = host_swap(&mut residency, 0, 0, 1, 2, event)?;
+            event += 1;
+            residency.begin_token()?;
+            assert!(residency.free_host_blocks() >= cap);
+            residency.finish_token()?.to_vec();
+        }
+        assert!(residency.ledger().check().is_ok());
         Ok(())
     }
 
@@ -1151,7 +1316,10 @@ mod tests {
             assert_eq!(dispatch.disk[1].expert, 7);
         }
         assert!(residency.dispatch(0, &[route(0, 0, 0)]).is_err());
-        residency.finish_token()?.to_vec();
+        let published = residency.finish_token()?.to_vec();
+        for entry in &published {
+            residency.record_copy(&[entry.slot], 80)?;
+        }
         residency.begin_token()?;
         assert!(residency.dispatch(0, &[route(0, 2, 0)]).is_err());
         assert!(residency.dispatch(0, &[route(8, 16, 0)]).is_err());
@@ -1187,7 +1355,10 @@ mod tests {
             );
             assert!(!entry.from_host);
             assert!(entry.source_block.is_none());
-            assert!(entry.dest_block.is_none(), "no free data block at load");
+            assert!(
+                entry.dest_block.is_none(),
+                "the cap reserve blocks the write-back"
+            );
         }
         residency.begin_token()?;
         let expert = published[0].expert;
@@ -1213,7 +1384,7 @@ mod tests {
         assert!(published[0].from_host && published[1].from_host);
         assert_eq!(residency.host_block(0, 0)?, 3);
         assert_eq!(residency.host_block(0, 1)?, 4);
-        assert_eq!(residency.free_spare_blocks(), 0);
+        assert_eq!(residency.free_host_blocks(), 0);
         assert!(residency.ledger().check().is_ok());
         Ok(())
     }
@@ -1275,11 +1446,10 @@ mod tests {
     }
 
     #[test]
-    fn a_host_candidate_swaps_through_a_spare_block() -> Result<()> {
+    fn a_host_candidate_swaps_through_the_pool() -> Result<()> {
         let mut residency = build(3, 2)?;
         let source = residency.host_block(0, 2)?;
-        assert_eq!(source, 0);
-        let spare = *residency.spares.last().expect("free spare");
+        let spare = *residency.free_blocks.last().expect("free block");
         residency.begin_token()?;
         set_scores(&mut residency, 0, [5.0, 7.0, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         residency.dispatch(0, &[route(0, 0, 0), route(0, 1, 2)])?;
@@ -1291,186 +1461,56 @@ mod tests {
         assert!(entry.from_host);
         assert_eq!((entry.expert, entry.victim), (2, 1));
         assert_eq!(entry.source_block, Some(source));
-        assert_eq!(entry.dest_block, Some(spare));
+        assert_eq!(entry.dest_block, Some(spare.id));
+        assert_eq!(entry.dest_wait, spare.wait);
         assert_eq!(residency.ledger().tier(0, 1)?, Tier::Host);
-        assert_eq!(residency.host_block(0, 1)?, spare);
+        assert_eq!(residency.host_block(0, 1)?, spare.id);
         assert_eq!(residency.host_block(0, 2)?, NO_BLOCK);
-        assert_eq!(residency.free_spare_blocks(), 1);
+        assert_eq!(residency.free_host_blocks(), 1);
+        residency.record_copy(&[entry.slot], 70)?;
         residency.begin_token()?;
-        assert_eq!(
-            residency.free_data_blocks(),
-            1,
-            "the candidate block returns"
-        );
+        assert_eq!(residency.free_host_blocks(), 2);
         assert!(residency.ledger().check().is_ok());
         Ok(())
     }
 
     #[test]
-    fn disk_admission_uses_a_data_block_and_never_a_spare() -> Result<()> {
-        let mut residency = build(3, 2)?;
-        residency.begin_token()?;
-        set_scores(&mut residency, 0, [5.0, 7.0, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        residency.dispatch(0, &[route(0, 0, 0), route(0, 1, 2)])?;
-        residency.finish_token()?.to_vec();
-        residency.begin_token()?;
-        assert_eq!(
-            (residency.free_data_blocks(), residency.free_spare_blocks()),
-            (1, 1)
-        );
-        set_scores(
-            &mut residency,
-            0,
-            [1.0, 30.0, 2.0, 20.0, 1.0, 30.0, 0.0, 0.0],
-        );
-        residency.dispatch(0, &[route(0, 0, 5), route(0, 1, 3)])?;
-        let published = residency.finish_token()?.to_vec();
-        assert_eq!(published.len(), 2);
-        assert_eq!((published[0].expert, published[0].victim), (5, 0));
-        assert!(!published[0].from_host);
-        let data = published[0].dest_block.expect("data block");
-        assert!(data < 3, "disk write-back must use a data block");
-        assert_eq!(residency.host_block(0, 0)?, data);
-        assert_eq!((published[1].expert, published[1].victim), (3, 2));
-        assert!(published[1].from_host);
-        assert!(published[1].dest_block.expect("spare") >= 3);
-        assert_eq!(residency.free_data_blocks(), 0);
-        assert_eq!(residency.free_spare_blocks(), 0);
-        assert!(residency.ledger().check().is_ok());
-        Ok(())
-    }
-
-    #[test]
-    fn host_write_backs_without_a_spare_fail_without_side_effects() -> Result<()> {
-        let mut residency = build(3, 2)?;
-        residency.begin_token()?;
-        set_scores(&mut residency, 0, [5.0, 7.0, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        residency.dispatch(0, &[route(0, 0, 0), route(0, 1, 2)])?;
-        residency.finish_token()?.to_vec();
-        residency.begin_token()?;
-        set_scores(&mut residency, 0, [5.0, 0.0, 7.0, 30.0, 0.0, 0.0, 0.0, 0.0]);
-        residency.dispatch(0, &[route(0, 0, 0), route(0, 1, 3)])?;
-        residency.finish_token()?.to_vec();
-        residency.begin_token()?;
-        assert_eq!(
-            (residency.free_data_blocks(), residency.free_spare_blocks()),
-            (2, 0)
-        );
-        set_scores(
-            &mut residency,
-            0,
-            [1.0, 0.0, 10.0, 1.0, 0.0, 30.0, 0.0, 0.0],
-        );
-        residency.dispatch(0, &[route(0, 0, 5)])?;
-        residency.finish_token()?.to_vec();
-        residency.begin_token()?;
-        assert_eq!(
-            (residency.free_data_blocks(), residency.free_spare_blocks()),
-            (1, 0)
-        );
-        let before = (
-            residency.ledger().tier(0, 3)?,
-            residency.ledger().tier(0, 6)?,
-            residency.host_block(0, 4)?,
-            residency.free_data_blocks(),
-            residency.free_spare_blocks(),
-            residency.published.len(),
-        );
-        set_scores(
-            &mut residency,
-            0,
-            [0.0, 0.0, 1.0, 0.0, 20.0, 2.0, 30.0, 0.0],
-        );
-        residency.dispatch(0, &[route(0, 0, 6), route(0, 1, 4)])?;
-        let error = residency.finish_token().unwrap_err().to_string();
-        assert!(error.contains("spare blocks, 0 free"), "{error}");
-        let after = (
-            residency.ledger().tier(0, 3)?,
-            residency.ledger().tier(0, 6)?,
-            residency.host_block(0, 4)?,
-            residency.free_data_blocks(),
-            residency.free_spare_blocks(),
-            residency.published.len(),
-        );
-        assert_eq!(
-            before, after,
-            "a failed selection leaves the state unchanged"
-        );
-        assert!(residency.begin_token().is_err(), "the token stays open");
-        Ok(())
-    }
-
-    #[test]
-    fn request_boundary_spare_validation_leaves_the_state_unchanged() -> Result<()> {
-        let mut residency = build(3, 1)?;
-        assert_eq!(residency.free_spare_blocks(), 1);
-        let mut hot = frequency();
-        hot[0] = vec![0.0, 0.0, 5.0, 4.0, 1.0, 1.0, 1.0, 1.0];
-        let before = (
-            residency.ledger().tier(0, 0)?,
-            residency.ledger().tier(0, 2)?,
-            residency.host_block(0, 2)?,
-            residency.free_spare_blocks(),
-            residency.moves.len(),
-        );
-        let error = residency.begin_request(&hot).unwrap_err().to_string();
-        assert!(error.contains("spare host blocks"), "{error}");
-        let after = (
-            residency.ledger().tier(0, 0)?,
-            residency.ledger().tier(0, 2)?,
-            residency.host_block(0, 2)?,
-            residency.free_spare_blocks(),
-            residency.moves.len(),
-        );
-        assert_eq!(before, after);
-        assert!(residency.begin_request(&frequency()).is_ok());
-        assert!(residency.ledger().check().is_ok());
-        Ok(())
-    }
-
-    #[test]
-    fn slot_events_move_to_device_side_waiting() -> Result<()> {
+    fn slot_events_are_bounded_and_reclaim_both_events() -> Result<()> {
         let mut residency = build(3, 2)?;
         let slot0 = residency.ledger().slot(0, 0)?;
         let slot1 = residency.ledger().slot(0, 1)?;
-        let slot2 = residency.ledger().slot(1, 0)?;
-        residency.record_copy(&[slot0, slot1, slot2], 7)?;
-        for slot in [slot0, slot1, slot2] {
-            assert_eq!(residency.first_read(slot)?, Some(7));
+        residency.record_copy(&[slot0, slot1], 7)?;
+        for event in 8..1_008u64 {
+            residency.record_readers(&[slot0, slot1], event)?;
         }
-        residency.record_readers(&[slot0, slot1], 9)?;
-        residency.record_readers(&[slot0], 10)?;
-        assert_eq!(residency.reclaim(slot0)?, vec![9, 10]);
-        assert_eq!(residency.reclaim(slot1)?, vec![9]);
-        assert_eq!(residency.reclaim(slot2)?, Vec::<u64>::new());
+        assert_eq!(residency.reclaim(slot0)?, [Some(7), Some(1_007)]);
         assert_eq!(residency.first_read(slot0)?, None);
         let error = residency
-            .record_readers(&[slot0], 11)
+            .record_readers(&[slot0], 1_009)
             .unwrap_err()
             .to_string();
         assert!(error.contains("has no recorded copy to read"), "{error}");
-        residency.record_copy(&[slot0, slot1, slot2], 12)?;
-        assert_eq!(residency.first_read(slot2)?, Some(12));
-        assert!(residency.reclaim(99).is_err());
+        assert_eq!(
+            residency.reclaim(slot1)?,
+            [Some(7), Some(1_007)],
+            "a rejected batch leaves its valid slots unchanged"
+        );
+        residency.record_copy(&[slot0, slot1], 11)?;
+        residency.record_readers(&[slot0, slot1], 12)?;
+        assert_eq!(residency.reclaim(slot1)?, [Some(11), Some(12)]);
         Ok(())
     }
 
     #[test]
-    fn borrow_assigns_data_blocks_and_refill_returns_positions() -> Result<()> {
+    fn borrow_returns_positions_and_respects_the_cap_reserve() -> Result<()> {
         let mut residency = build(3, 2)?;
-        residency.begin_token()?;
-        set_scores(&mut residency, 0, [5.0, 7.0, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        residency.dispatch(0, &[route(0, 0, 0), route(0, 1, 2)])?;
-        residency.finish_token()?.to_vec();
-        residency.begin_token()?;
-        assert_eq!(residency.free_data_blocks(), 1);
+        assert_eq!(residency.free_host_blocks(), 2);
         let borrow = residency.borrow(2)?;
-        assert_eq!(borrow.experts, vec![(1, 1), (0, 2)]);
-        assert_eq!((borrow.to_host, borrow.to_disk), (1, 1));
-        assert_eq!(residency.host_block(1, 1)?, 0);
-        assert_eq!(residency.ledger().tier(1, 1)?, Tier::Host);
-        assert_eq!(residency.ledger().tier(0, 2)?, Tier::Disk);
-        assert_eq!(residency.free_data_blocks(), 0);
+        assert_eq!(borrow.positions, vec![3, 2]);
+        assert_eq!(borrow.experts, vec![(1, 1), (0, 1)]);
+        assert_eq!((borrow.to_host, borrow.to_disk), (0, 2));
+        assert!(borrow.host_waits.is_empty());
+        assert_eq!(residency.free_host_blocks(), 2);
         assert_eq!(residency.refill()?, vec![2, 3]);
         assert!(residency.ledger().check().is_ok());
         Ok(())

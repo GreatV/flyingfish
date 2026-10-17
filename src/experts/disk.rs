@@ -16,7 +16,64 @@ const RING_ALIGN: usize = 4096;
 struct AlignedSlot {
     ptr: NonNull<u8>,
     layout: Layout,
-    leased: Cell<bool>,
+    state: Cell<RingState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RingState {
+    Free,
+    Filled,
+    Guarded,
+    Copied { event: u64 },
+}
+
+/// Lease over one filled ring slot; dropping it returns the slot to the ring unless `copied`
+/// recorded a device copy event.
+pub struct SlotLease<'a> {
+    reader: &'a DiskReader,
+    slot: usize,
+    release: bool,
+}
+
+impl SlotLease<'_> {
+    pub fn values(&self) -> &[bf16] {
+        let ring = &self.reader.ring[self.slot];
+        // SAFETY: the slot holds `per_expert` initialized bf16 values for the guard's lifetime.
+        unsafe {
+            std::slice::from_raw_parts(ring.ptr.as_ptr() as *const bf16, self.reader.per_expert)
+        }
+    }
+
+    /// Marks the slot's data copied to the device; the slot is reusable only through `reclaim`
+    /// with this event.
+    pub fn copied(mut self, event: u64) -> Result<()> {
+        ensure!(
+            self.reader.ring[self.slot].state.get() == RingState::Guarded,
+            "disk ring slot {} is not guarded",
+            self.slot
+        );
+        self.reader.ring[self.slot]
+            .state
+            .set(RingState::Copied { event });
+        self.release = false;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for SlotLease<'_> {
+    type Target = [bf16];
+
+    fn deref(&self) -> &[bf16] {
+        self.values()
+    }
+}
+
+impl Drop for SlotLease<'_> {
+    fn drop(&mut self) {
+        if self.release {
+            self.reader.ring[self.slot].state.set(RingState::Free);
+        }
+    }
 }
 
 impl AlignedSlot {
@@ -29,7 +86,7 @@ impl AlignedSlot {
         Ok(Self {
             ptr,
             layout,
-            leased: Cell::new(false),
+            state: Cell::new(RingState::Free),
         })
     }
 }
@@ -111,20 +168,19 @@ impl DiskReader {
         })
     }
 
-    /// Reads one expert's native ranges into a free ring slot and leases it; release with
-    /// `release` after the consumer is done.
+    /// Reads one expert's native ranges into a free ring slot.
     pub fn read_expert(&self, layer: u32, expert: u32, catalogue: &ExpertCatalogue) -> Result<u32> {
         let range: &ExpertRange = catalogue.range(layer, expert)?;
         let slots = self.ring.len();
         let mut chosen = None;
         for step in 0..slots {
             let index = (self.next.get() + step) % slots;
-            if !self.ring[index].leased.get() {
+            if self.ring[index].state.get() == RingState::Free {
                 chosen = Some(index);
                 break;
             }
         }
-        let slot = chosen.with_context(|| format!("all {slots} disk ring slots are leased"))?;
+        let slot = chosen.with_context(|| format!("all {slots} disk ring slots are in use"))?;
         self.next.set((slot + 1) % slots);
         let bytes = self.ring[slot].layout.size();
         let ptr = self.ring[slot].ptr.as_ptr();
@@ -163,120 +219,56 @@ impl DiskReader {
                 range.down.shard
             )
         })?;
-        self.ring[slot].leased.set(true);
+        self.ring[slot].state.set(RingState::Filled);
         u32::try_from(slot).context("disk ring slot exceeds u32")
     }
 
-    /// Values of a leased ring slot.
-    pub fn values(&self, slot: u32) -> Result<&[bf16]> {
+    /// Lease over a filled ring slot; the guard holds the values until it drops or records the
+    /// device copy event.
+    pub fn values(&self, slot: u32) -> Result<SlotLease<'_>> {
         let index = usize::try_from(slot).context("disk ring slot exceeds usize")?;
         ensure!(
-            index < self.ring.len() && self.ring[index].leased.get(),
-            "disk ring slot {slot} is not leased"
+            index < self.ring.len(),
+            "disk ring slot {slot} outside {}",
+            self.ring.len()
         );
-        let ptr = self.ring[index].ptr.as_ptr();
-        // SAFETY: the slot is leased and holds `per_expert` initialized bf16 values.
-        Ok(unsafe { std::slice::from_raw_parts(ptr as *const bf16, self.per_expert) })
-    }
-
-    /// Releases a leased slot for reuse.
-    pub fn release(&self, slot: u32) -> Result<()> {
-        let index = usize::try_from(slot).context("disk ring slot exceeds usize")?;
         ensure!(
-            index < self.ring.len() && self.ring[index].leased.get(),
-            "disk ring slot {slot} is not leased"
+            self.ring[index].state.get() == RingState::Filled,
+            "disk ring slot {slot} is not filled"
         );
-        self.ring[index].leased.set(false);
-        Ok(())
-    }
-}
-
-/// Bounded layer-ahead disk prefetch; demand entries jump ahead of prefetches.
-pub struct Prefetch {
-    depth: u32,
-    queue: Vec<(u32, u32)>,
-    loaded: Vec<(u32, u32, u32)>,
-}
-
-impl Prefetch {
-    pub fn new(depth: u32) -> Result<Self> {
-        ensure!(depth > 0, "zero prefetch depth");
-        Ok(Self {
-            depth,
-            queue: Vec::with_capacity(depth as usize),
-            loaded: Vec::with_capacity(depth as usize),
+        self.ring[index].state.set(RingState::Guarded);
+        Ok(SlotLease {
+            reader: self,
+            slot: index,
+            release: true,
         })
     }
 
-    /// Entries holding a ring slot's worth of capacity: queued and loaded.
-    pub fn entries(&self) -> u32 {
-        u32::try_from(self.queue.len() + self.loaded.len()).expect("prefetch entry count fits u32")
-    }
-
-    /// Queues one read; a demand entry moves to the front and repeats are no-ops.
-    pub fn request(&mut self, layer: u32, expert: u32, demand: bool) -> Result<()> {
-        if self
-            .loaded
-            .iter()
-            .any(|&(l, e, _)| l == layer && e == expert)
-        {
-            return Ok(());
-        }
-        if let Some(index) = self
-            .queue
-            .iter()
-            .position(|&(l, e)| l == layer && e == expert)
-        {
-            if demand && index > 0 {
-                let entry = self.queue.remove(index);
-                self.queue.insert(0, entry);
-            }
-            return Ok(());
-        }
+    /// Discards unconsumed prefetched bytes.
+    pub fn discard(&self, slot: u32) -> Result<()> {
+        let index = usize::try_from(slot).context("disk ring slot exceeds usize")?;
         ensure!(
-            self.entries() < self.depth,
-            "prefetch queue full at depth {}",
-            self.depth
+            index < self.ring.len() && self.ring[index].state.get() == RingState::Filled,
+            "disk ring slot {slot} is not filled"
         );
-        if demand {
-            self.queue.insert(0, (layer, expert));
-        } else {
-            self.queue.push((layer, expert));
-        }
+        self.ring[index].state.set(RingState::Free);
         Ok(())
     }
 
-    /// Front request for the reader; it stays queued until `complete`.
-    pub fn front(&self) -> Option<(u32, u32)> {
-        self.queue.first().copied()
-    }
-
-    /// Records the ring slot of the front request.
-    pub fn complete(&mut self, layer: u32, expert: u32, slot: u32) -> Result<()> {
+    /// Returns a copied slot to the ring after its device copy event completed.
+    pub fn reclaim(&self, slot: u32, event: u64) -> Result<()> {
+        let index = usize::try_from(slot).context("disk ring slot exceeds usize")?;
         ensure!(
-            self.front() == Some((layer, expert)),
-            "completed request ({layer}, {expert}) is not the front"
+            index < self.ring.len()
+                && self.ring[index].state.get() == (RingState::Copied { event }),
+            "disk ring slot {slot} has no copy with event {event}"
         );
-        self.queue.remove(0);
-        self.loaded.push((layer, expert, slot));
+        self.ring[index].state.set(RingState::Free);
         Ok(())
     }
 
-    /// Drops a queued request that became resident elsewhere.
-    pub fn cancel(&mut self, layer: u32, expert: u32) -> bool {
-        self.queue
-            .iter()
-            .position(|&(l, e)| l == layer && e == expert)
-            .map(|index| self.queue.remove(index))
-            .is_some()
-    }
-
-    /// Takes a loaded request's ring slot.
-    pub fn take(&mut self, layer: u32, expert: u32) -> Option<u32> {
-        self.loaded
-            .iter()
-            .position(|&(l, e, _)| l == layer && e == expert)
-            .map(|index| self.loaded.remove(index).2)
+    pub fn ring_slots(&self) -> u32 {
+        u32::try_from(self.ring.len()).expect("ring slot count fits u32")
     }
 }
 
@@ -402,24 +394,25 @@ mod tests {
         let reader = DiskReader::open(&catalogue, dir.path(), 2)?;
         for (layer, expert) in [(0u32, 0u32), (0, 3), (1, 0), (1, 3)] {
             let slot = reader.read_expert(layer, expert, &catalogue)?;
-            let values = reader.values(slot)?;
-            assert_eq!(values.len(), 96);
-            let layer_base = layer as usize * 768;
-            let gate = layer_base + expert as usize * 128;
-            let down = layer_base + 512 + expert as usize * 64;
-            for (index, value) in values.iter().enumerate() {
-                let byte = if index < 64 {
-                    gate + index * 2
-                } else {
-                    down + (index - 64) * 2
-                };
-                assert_eq!(
-                    value.to_bits(),
-                    u16::from_le_bytes([pattern[byte], pattern[byte + 1]]),
-                    "layer {layer} expert {expert} element {index}"
-                );
+            {
+                let values = reader.values(slot)?;
+                assert_eq!(values.len(), 96);
+                let layer_base = layer as usize * 768;
+                let gate = layer_base + expert as usize * 128;
+                let down = layer_base + 512 + expert as usize * 64;
+                for (index, value) in values.iter().enumerate() {
+                    let byte = if index < 64 {
+                        gate + index * 2
+                    } else {
+                        down + (index - 64) * 2
+                    };
+                    assert_eq!(
+                        value.to_bits(),
+                        u16::from_le_bytes([pattern[byte], pattern[byte + 1]]),
+                        "layer {layer} expert {expert} element {index}"
+                    );
+                }
             }
-            reader.release(slot)?;
         }
         Ok(())
     }
@@ -444,7 +437,6 @@ mod tests {
                 "element {index}"
             );
         }
-        reader.release(slot)?;
         Ok(())
     }
 
@@ -465,26 +457,24 @@ mod tests {
     }
 
     #[test]
-    fn ring_slots_are_leased_until_released() -> Result<()> {
+    fn ring_slots_are_guarded_until_their_lease_drops() -> Result<()> {
         let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
         let reader = DiskReader::open(&catalogue, dir.path(), 2)?;
         let first = reader.read_expert(0, 0, &catalogue)?;
         let second = reader.read_expert(0, 1, &catalogue)?;
         assert_ne!(first, second);
-        let Err(error) = reader.read_expert(0, 2, &catalogue) else {
-            panic!("a third read succeeded with every slot leased");
-        };
-        let error = error.to_string();
+        let error = reader
+            .read_expert(0, 2, &catalogue)
+            .unwrap_err()
+            .to_string();
         assert!(
-            error.contains("all 2 disk ring slots are leased"),
+            error.contains("all 2 disk ring slots are in use"),
             "{error}"
         );
-        reader.release(first)?;
+        drop(reader.values(first)?);
         assert!(reader.values(first).is_err());
         let third = reader.read_expert(0, 2, &catalogue)?;
         assert_eq!(third, first);
-        assert!(reader.release(third).is_ok());
-        assert!(reader.release(third).is_err());
         Ok(())
     }
 
@@ -500,8 +490,8 @@ mod tests {
         assert_eq!(values.len(), 96);
         assert_eq!(second_values.len(), 96);
         assert_ne!(values[0].to_bits(), second_values[0].to_bits());
-        reader.release(first)?;
-        reader.release(second)?;
+        drop(values);
+        drop(second_values);
         assert!(reader.values(first).is_err());
         let single = DiskReader::open(&catalogue, dir.path(), 1)?;
         let held = single.read_expert(0, 0, &catalogue)?;
@@ -510,10 +500,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("all 1 disk ring slots are leased"),
+            error.contains("all 1 disk ring slots are in use"),
             "{error}"
         );
-        single.release(held)?;
+        drop(single.values(held)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_copied_slot_returns_only_through_its_copy_event() -> Result<()> {
+        let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let slot = reader.read_expert(0, 0, &catalogue)?;
+        reader.values(slot)?.copied(5)?;
+        let error = reader
+            .read_expert(0, 1, &catalogue)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("all 1 disk ring slots are in use"),
+            "{error}"
+        );
+        let error = reader.reclaim(slot, 4).unwrap_err().to_string();
+        assert!(error.contains("has no copy with event 4"), "{error}");
+        reader.reclaim(slot, 5)?;
+        let again = reader.read_expert(0, 1, &catalogue)?;
+        assert_eq!(again, slot);
         Ok(())
     }
 
@@ -559,39 +571,7 @@ mod tests {
                     assert_eq!(value, expected, "{name} element {index}");
                 }
             }
-            reader.release(slot)?;
         }
-        Ok(())
-    }
-
-    #[test]
-    fn prefetch_serves_demand_first_within_its_depth() -> Result<()> {
-        let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
-        let reader = DiskReader::open(&catalogue, dir.path(), 4)?;
-        let mut prefetch = Prefetch::new(2)?;
-        prefetch.request(0, 0, false)?;
-        prefetch.request(0, 1, false)?;
-        let error = prefetch.request(0, 2, false).unwrap_err().to_string();
-        assert!(error.contains("prefetch queue full at depth 2"), "{error}");
-        prefetch.request(0, 1, true)?;
-        assert_eq!(prefetch.front(), Some((0, 1)));
-        prefetch.request(0, 1, true)?;
-        assert_eq!(prefetch.entries(), 2);
-        let error = prefetch.complete(0, 0, 0).unwrap_err().to_string();
-        assert!(error.contains("is not the front"), "{error}");
-        let (layer, expert) = prefetch.front().expect("front request");
-        let slot = reader.read_expert(layer, expert, &catalogue)?;
-        prefetch.complete(layer, expert, slot)?;
-        assert_eq!(prefetch.front(), Some((0, 0)));
-        assert_eq!(prefetch.take(0, 1), Some(slot));
-        assert_eq!(prefetch.take(0, 1), None);
-        reader.release(slot)?;
-        assert_eq!(prefetch.entries(), 1);
-        assert!(prefetch.cancel(0, 0));
-        assert!(!prefetch.cancel(0, 0));
-        assert_eq!(prefetch.entries(), 0);
-        assert!(prefetch.take(0, 0).is_none());
-        assert!(Prefetch::new(0).is_err());
         Ok(())
     }
 }

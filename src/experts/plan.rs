@@ -510,11 +510,15 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
 /// Evicted tail slots of a prefill borrow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Borrow {
+    /// Borrowed physical positions, descending.
+    pub positions: Vec<u32>,
     pub experts: Vec<(u32, u32)>,
     pub to_host: u32,
     pub to_disk: u32,
     pub d2h_bytes: u64,
     pub disk_bytes: u64,
+    /// Device events each host victim's D2H waits on; filled by the residency.
+    pub host_waits: Vec<Option<u64>>,
 }
 
 /// Tier of one expert in the provenance ledger.
@@ -871,11 +875,13 @@ impl TierLedger {
                 );
             }
         }
+        let mut positions: Vec<u32> = Vec::with_capacity(slots as usize);
         let mut victims: Vec<(u32, u32)> = Vec::with_capacity(slots as usize);
         let mut to_host = 0u32;
         let mut to_disk = 0u32;
         for position in (first..end).rev() {
             self.borrowed[position] = true;
+            positions.push(u32::try_from(position).context("slot position exceeds u32")?);
             let expert = self.slots[position];
             if expert == EMPTY_SLOT {
                 continue;
@@ -896,9 +902,11 @@ impl TierLedger {
         Ok(Borrow {
             d2h_bytes: u64::from(to_host) * slot_bytes,
             disk_bytes: u64::from(to_disk) * slot_bytes,
+            positions,
             experts: victims,
             to_host,
             to_disk,
+            host_waits: Vec::new(),
         })
     }
 
