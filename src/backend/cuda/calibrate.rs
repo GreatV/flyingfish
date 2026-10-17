@@ -813,6 +813,8 @@ struct ExpertTransfer {
     d2h_seconds: [f64; 5],
 }
 
+const EXPERT_SERVICE_ROWS: [u32; 7] = [1, 2, 5, 8, 16, 32, 64];
+
 #[derive(Serialize, Deserialize)]
 struct ExpertCache {
     schema: u32,
@@ -905,14 +907,14 @@ impl ExpertCache {
             .into_iter()
             .collect();
         let workers = host.workers();
-        let expected = workers.len() * 4 * missed.len();
+        let expected = workers.len() * EXPERT_SERVICE_ROWS.len() * missed.len();
         ensure!(
             self.service.len() == expected,
             "expert CPU service cells {} expected {expected}",
             self.service.len()
         );
         for &workers in &workers {
-            for rows in [1, 2, 5, 8] {
+            for rows in EXPERT_SERVICE_ROWS {
                 for &experts in &missed {
                     ensure!(
                         self.service
@@ -1114,7 +1116,7 @@ pub(super) fn load_experts(
             )?,
             ring_experts,
             &host.workers(),
-            &[1, 2, 5, 8],
+            &EXPERT_SERVICE_ROWS,
             &missed,
         )?;
         let cache = ExpertCache {
@@ -1201,7 +1203,7 @@ mod long_tests {
             service: [1, 2]
                 .into_iter()
                 .flat_map(|workers| {
-                    [1, 2, 5, 8].into_iter().flat_map(move |rows| {
+                    EXPERT_SERVICE_ROWS.into_iter().flat_map(move |rows| {
                         [1, 2].into_iter().map(move |experts| ServiceCell {
                             workers,
                             rows,
@@ -1217,6 +1219,11 @@ mod long_tests {
         assert_eq!(measured.d2h_bytes_per_second, 384000.0);
         assert_eq!(measured.copy_engines, 2);
         assert_eq!(measured.service.seconds(1, 1, 1)?, 0.001);
+        assert_eq!(measured.service.seconds(64, 1, 1)?, 0.001);
+        let large = cache.service.iter().position(|c| c.rows == 64).unwrap();
+        let cell = cache.service.remove(large);
+        assert!(cache.check(&key, &host, &geometry).is_err());
+        cache.service.insert(large, cell);
         cache.transfers[0].d2h_seconds[0] = f64::NAN;
         assert!(cache.check(&key, &host, &geometry).is_err());
         cache.transfers[0].d2h_seconds[0] = 0.0;

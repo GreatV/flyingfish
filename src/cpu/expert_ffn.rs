@@ -1035,6 +1035,7 @@ pub fn measure_service_table(
     for &workers in workers {
         let pool = ExpertPool::new(workers as usize, shape, rows_max, max_assignments)?;
         for &rows in rows {
+            let row_started = std::time::Instant::now();
             for &missed in missed {
                 let assignments: Vec<Assignment> = (0..rows * missed)
                     .map(|slot| Assignment {
@@ -1086,6 +1087,10 @@ pub fn measure_service_table(
                     seconds: samples[2],
                 });
             }
+            eprintln!(
+                "{}",
+                serde_json::json!({"expert_service_setup":{"workers":workers,"rows":rows,"cells":missed.len(),"wall_seconds":row_started.elapsed().as_secs_f64()}})
+            );
         }
     }
     Ok(cells)
