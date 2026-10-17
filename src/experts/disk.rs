@@ -191,6 +191,95 @@ impl DiskReader {
     }
 }
 
+/// Bounded layer-ahead disk prefetch; demand entries jump ahead of prefetches.
+pub struct Prefetch {
+    depth: u32,
+    queue: Vec<(u32, u32)>,
+    loaded: Vec<(u32, u32, u32)>,
+}
+
+impl Prefetch {
+    pub fn new(depth: u32) -> Result<Self> {
+        ensure!(depth > 0, "zero prefetch depth");
+        Ok(Self {
+            depth,
+            queue: Vec::with_capacity(depth as usize),
+            loaded: Vec::with_capacity(depth as usize),
+        })
+    }
+
+    /// Entries holding a ring slot's worth of capacity: queued and loaded.
+    pub fn entries(&self) -> u32 {
+        u32::try_from(self.queue.len() + self.loaded.len()).expect("prefetch entry count fits u32")
+    }
+
+    /// Queues one read; a demand entry moves to the front and repeats are no-ops.
+    pub fn request(&mut self, layer: u32, expert: u32, demand: bool) -> Result<()> {
+        if self
+            .loaded
+            .iter()
+            .any(|&(l, e, _)| l == layer && e == expert)
+        {
+            return Ok(());
+        }
+        if let Some(index) = self
+            .queue
+            .iter()
+            .position(|&(l, e)| l == layer && e == expert)
+        {
+            if demand && index > 0 {
+                let entry = self.queue.remove(index);
+                self.queue.insert(0, entry);
+            }
+            return Ok(());
+        }
+        ensure!(
+            self.entries() < self.depth,
+            "prefetch queue full at depth {}",
+            self.depth
+        );
+        if demand {
+            self.queue.insert(0, (layer, expert));
+        } else {
+            self.queue.push((layer, expert));
+        }
+        Ok(())
+    }
+
+    /// Front request for the reader; it stays queued until `complete`.
+    pub fn front(&self) -> Option<(u32, u32)> {
+        self.queue.first().copied()
+    }
+
+    /// Records the ring slot of the front request.
+    pub fn complete(&mut self, layer: u32, expert: u32, slot: u32) -> Result<()> {
+        ensure!(
+            self.front() == Some((layer, expert)),
+            "completed request ({layer}, {expert}) is not the front"
+        );
+        self.queue.remove(0);
+        self.loaded.push((layer, expert, slot));
+        Ok(())
+    }
+
+    /// Drops a queued request that became resident elsewhere.
+    pub fn cancel(&mut self, layer: u32, expert: u32) -> bool {
+        self.queue
+            .iter()
+            .position(|&(l, e)| l == layer && e == expert)
+            .map(|index| self.queue.remove(index))
+            .is_some()
+    }
+
+    /// Takes a loaded request's ring slot.
+    pub fn take(&mut self, layer: u32, expert: u32) -> Option<u32> {
+        self.loaded
+            .iter()
+            .position(|&(l, e, _)| l == layer && e == expert)
+            .map(|index| self.loaded.remove(index).2)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +561,37 @@ mod tests {
             }
             reader.release(slot)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn prefetch_serves_demand_first_within_its_depth() -> Result<()> {
+        let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 4)?;
+        let mut prefetch = Prefetch::new(2)?;
+        prefetch.request(0, 0, false)?;
+        prefetch.request(0, 1, false)?;
+        let error = prefetch.request(0, 2, false).unwrap_err().to_string();
+        assert!(error.contains("prefetch queue full at depth 2"), "{error}");
+        prefetch.request(0, 1, true)?;
+        assert_eq!(prefetch.front(), Some((0, 1)));
+        prefetch.request(0, 1, true)?;
+        assert_eq!(prefetch.entries(), 2);
+        let error = prefetch.complete(0, 0, 0).unwrap_err().to_string();
+        assert!(error.contains("is not the front"), "{error}");
+        let (layer, expert) = prefetch.front().expect("front request");
+        let slot = reader.read_expert(layer, expert, &catalogue)?;
+        prefetch.complete(layer, expert, slot)?;
+        assert_eq!(prefetch.front(), Some((0, 0)));
+        assert_eq!(prefetch.take(0, 1), Some(slot));
+        assert_eq!(prefetch.take(0, 1), None);
+        reader.release(slot)?;
+        assert_eq!(prefetch.entries(), 1);
+        assert!(prefetch.cancel(0, 0));
+        assert!(!prefetch.cancel(0, 0));
+        assert_eq!(prefetch.entries(), 0);
+        assert!(prefetch.take(0, 0).is_none());
+        assert!(Prefetch::new(0).is_err());
         Ok(())
     }
 }

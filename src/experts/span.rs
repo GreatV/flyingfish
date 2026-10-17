@@ -1,4 +1,5 @@
 //! Prefill span service: cohort classes and the wave plan for one layer's whole-span routing.
+use crate::experts::arena::SlotEvents;
 use crate::experts::catalogue::ExpertGeometry;
 use crate::experts::plan::ServiceTable;
 use anyhow::{Context, Result, ensure};
@@ -111,6 +112,85 @@ pub fn plan_span(
     })
 }
 
+/// Prefill staging leases: one cohort copy per round, pinned through every row wave.
+pub struct StagingLeases {
+    slots: u32,
+    waves: u32,
+    events: SlotEvents,
+    ids: Vec<u32>,
+    recorded: Vec<u32>,
+    loaded: u32,
+}
+
+impl StagingLeases {
+    pub fn new(slots: u32, waves: u32) -> Result<Self> {
+        ensure!(slots > 0, "zero prefill staging slots");
+        ensure!(waves > 0, "zero span row waves");
+        Ok(Self {
+            slots,
+            waves,
+            events: SlotEvents::new(slots as usize),
+            ids: Vec::with_capacity(slots as usize),
+            recorded: vec![0; slots as usize],
+            loaded: 0,
+        })
+    }
+
+    /// Records the cohort copy into staging slots `0..cohort.len()` under one event.
+    pub fn load(&mut self, cohort: &[u32], event: u64) -> Result<()> {
+        ensure!(
+            self.loaded == 0,
+            "staging cohort {} is still loaded",
+            self.loaded
+        );
+        ensure!(!cohort.is_empty(), "empty staging cohort");
+        ensure!(
+            cohort.len() as u32 <= self.slots,
+            "cohort {} exceeds {} staging slots",
+            cohort.len(),
+            self.slots
+        );
+        self.ids.clear();
+        self.ids.extend(0..cohort.len() as u32);
+        self.events.record_copy(&self.ids, event)?;
+        self.recorded[..cohort.len()].fill(0);
+        self.loaded = cohort.len() as u32;
+        Ok(())
+    }
+
+    /// Records one wave's reader event on one staging slot.
+    pub fn record_wave(&mut self, slot: u32, event: u64) -> Result<()> {
+        ensure!(
+            slot < self.loaded,
+            "staging slot {slot} outside the loaded cohort {}",
+            self.loaded
+        );
+        self.events.record_readers(&[slot], event)?;
+        self.recorded[slot as usize] += 1;
+        Ok(())
+    }
+
+    /// Releases a cohort that recorded every row wave and returns the reader events the next copy
+    /// stream waits on.
+    pub fn release(&mut self) -> Result<Vec<u64>> {
+        ensure!(self.loaded > 0, "no staging cohort to release");
+        for slot in 0..self.loaded {
+            ensure!(
+                self.recorded[slot as usize] == self.waves,
+                "staging slot {slot} recorded {} of {} waves",
+                self.recorded[slot as usize],
+                self.waves
+            );
+        }
+        let mut waits = Vec::new();
+        for slot in 0..self.loaded {
+            waits.append(&mut self.events.reclaim(slot)?);
+        }
+        self.loaded = 0;
+        Ok(waits)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +300,44 @@ mod tests {
         let plan = plan_span(&geometry, &counts, &resident, 4, 2, 2, &rates).unwrap();
         assert!(plan.resident.is_empty() && plan.staged.is_empty() && plan.cpu.is_empty());
         assert_eq!(plan.waves, 2);
+    }
+
+    #[test]
+    fn staging_leases_pin_a_cohort_through_every_wave() -> Result<()> {
+        let mut leases = StagingLeases::new(3, 2)?;
+        let error = leases.record_wave(0, 10).unwrap_err().to_string();
+        assert!(error.contains("outside the loaded cohort"), "{error}");
+        leases.load(&[7, 8, 9], 1)?;
+        let error = leases.load(&[4], 2).unwrap_err().to_string();
+        assert!(error.contains("is still loaded"), "{error}");
+        for slot in 0..3u32 {
+            leases.record_wave(slot, 10 + u64::from(slot))?;
+        }
+        let error = leases.release().unwrap_err().to_string();
+        assert!(error.contains("recorded 1 of 2 waves"), "{error}");
+        for slot in 0..3u32 {
+            leases.record_wave(slot, 20 + u64::from(slot))?;
+        }
+        let waits = leases.release()?;
+        assert_eq!(waits, vec![10, 20, 11, 21, 12, 22]);
+        leases.load(&[1, 2], 30)?;
+        let error = leases.record_wave(2, 31).unwrap_err().to_string();
+        assert!(error.contains("outside the loaded cohort 2"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn staging_leases_validate_cohorts_events_and_waves() {
+        assert!(StagingLeases::new(0, 1).is_err());
+        assert!(StagingLeases::new(1, 0).is_err());
+        let mut leases = StagingLeases::new(2, 1).unwrap();
+        assert!(leases.load(&[1, 2, 3], 1).is_err());
+        assert!(leases.load(&[], 1).is_err());
+        leases.load(&[1], 4).unwrap();
+        leases.record_wave(0, 6).unwrap();
+        assert!(leases.record_wave(1, 7).is_err());
+        let waits = leases.release().unwrap();
+        assert_eq!(waits, vec![6]);
+        assert!(leases.release().is_err());
     }
 }
