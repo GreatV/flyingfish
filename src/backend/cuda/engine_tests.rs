@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn load_dispatch_selects_qwen_llama_and_rejects_minicpm() -> Result<()> {
+    assert_eq!(
+        super::load_dispatch(crate::model_spec::Architecture::Qwen35Text)?,
+        super::LoadDispatch::Qwen
+    );
+    assert_eq!(
+        super::load_dispatch(crate::model_spec::Architecture::Llama)?,
+        super::LoadDispatch::Llama
+    );
+    let error = super::load_dispatch(crate::model_spec::Architecture::MiniCpmV47)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("MiniCpmV47") && error.contains("not implemented"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires a reserved GPU window and FF_ARGMAX_MODEL/FF_ARGMAX_DRAFT/FLYINGFISH_RUNTIME_DIR"]
 fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
     let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);

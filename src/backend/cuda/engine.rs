@@ -419,6 +419,23 @@ enum SetupMode {
     Mtp { verify_rows: usize },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadDispatch {
+    Qwen,
+    Llama,
+}
+
+fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDispatch> {
+    use crate::model_spec::Architecture;
+    Ok(match architecture {
+        Architecture::Qwen35Text => LoadDispatch::Qwen,
+        Architecture::Llama => LoadDispatch::Llama,
+        Architecture::MiniCpmV47 => anyhow::bail!(
+            "MiniCPM-V-4.7 CUDA runtime is not implemented (architecture {architecture:?})"
+        ),
+    })
+}
+
 pub struct Engine {
     qwen_device_prefix: bool,
     #[cfg(test)]
@@ -654,16 +671,19 @@ impl Engine {
         let write = !matches!(mode, SetupMode::Ready);
         let started = Instant::now();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
-        if model_spec.architecture == crate::model_spec::Architecture::Qwen35Text {
-            return Self::load_qwen(
-                dir,
-                ordinal,
-                capacity,
-                requested_chunk,
-                settings,
-                mode,
-                model_spec,
-            );
+        match load_dispatch(model_spec.architecture)? {
+            LoadDispatch::Qwen => {
+                return Self::load_qwen(
+                    dir,
+                    ordinal,
+                    capacity,
+                    requested_chunk,
+                    settings,
+                    mode,
+                    model_spec,
+                );
+            }
+            LoadDispatch::Llama => {}
         }
         ensure!(
             settings.kv_format == crate::kv::KvFormat::Bf16,
