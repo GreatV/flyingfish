@@ -1,8 +1,6 @@
-// ============================================================================
-// markov.cu -- DSpark Markov-head distribution kernel (tree verification).
-// One launch pair serves a batch of P requests; the markov_w2 table is read
-// exactly once per launch and shared by all P acts. All phase-1 instances
-// use tensor cores (mma.m16n8k16 bf16 -> fp32).
+// DSpark Markov-head distribution kernel (tree verification). One launch pair
+// serves a batch of P requests; markov_w2 is read once per launch and shared
+// by all P acts. Phase 1 uses mma.m16n8k16 bf16 -> fp32.
 //
 // Semantics (two bf16 rounding points):
 //   bias[p][v] = bf16( fp32 dot( w2[v][0:256], w1[req_tok[p]][0:256] ) )
@@ -10,19 +8,16 @@
 //   score      = __bfloat162float(s)
 //   top-4[p]   = the 4 largest scores; strictly greater wins, tie -> smaller
 //                token id
-//   lse[p]     = fp32 logsumexp over the full vocab of s[p]
 //   logp[p][j] = (s[p][top4[p][j]] - m) - logsum, where m = max_v s[p][v]
-//                and logsum = log(Σ_v exp(s[p][v] - m))  (stable form)
+//                and logsum = log(Σ_v exp(s[p][v] - m))
 //   lse[p]     = m + logsum
 //
-// BATCH INVARIANCE: one request's top4/logp/lse are bitwise identical for
+// Batch invariance: one request's top4/logp/lse are bitwise identical for
 // every batch size P and every batch position. All instances compute bias
-// with the same mma instruction, the same fragment values and the same k
-// order per (act, v); the lse (m, l) partials are merged in a canonical
-// order in every instance (per 32-v group butterfly offs 4/8/16, groups
-// folded ascending); top-4 is a deterministic function of the score set
-// (insertion order does not matter); phase 2's merge order does not depend
-// on PT.
+// with the same mma instruction, fragment values and k order per (act, v);
+// (m, l) partials merge in a canonical order (per 32-v group butterfly offs
+// 4/8/16, groups folded ascending); top-4 is a deterministic function of the
+// score set; phase 2's merge order does not depend on PT.
 //
 // Inputs / outputs:
 //   B       bf16 [7][V] base logits rows; row per request from req_row
@@ -34,60 +29,30 @@
 //   logp    fp32 [P][4] out
 //   lse     fp32 [P] out
 //
-// ABI CHANGE relative to the pre-v2 revision of this file: symbols renamed
-// markov_top4_phase1_p{1,8,64} -> markov2_top4_phase1_p{1,8,64} and
-// markov_top4_phase2 -> markov2_top4_phase2; phase-1 launch is now
-// grid = dim3(510), block = 256 with all shared memory static (dynamic
-// smem = 0, no cudaFuncSetAttribute opt-in) instead of grid = dim3(16320)
-// with dynamic smem; phase-2 launch is now grid = dim3(P), block = 256,
-// static smem (dynamic smem = 0) instead of block = 1024 with 40960 B
-// dynamic; caller scratch shrinks to NB*PT*40 bytes with NB = 510 (was
-// 16320). Argument lists and math semantics are unchanged.
-//
-// Two-phase structure:
-//   phase 1 (markov2_top4_phase1_p{1,8,64}): grid = dim3(NB), block = 256.
+// Two-phase structure (all smem static; dynamic smem = 0):
+//   phase 1 (markov2_top4_phase1_*p{1,8,64}): grid = dim3(NB), block = 256.
 //     Block blk owns vocab rows [blk*VT, +VT) (VT = 256, NB = V/VT = 510)
 //     and writes, per act p < P, its local top-4 (4 (score, id) pairs) and
 //     its lse partial (m, l) to caller scratch. Slots p >= P are not written.
-//   phase 2 (markov2_top4_phase2): grid = dim3(P), block = 256. Each thread
-//     folds two of the NB block partials per act (vectorized reads,
-//     score-desc/id-asc merge; lse rescale), 5-round in-warp shfl
-//     butterflies, one __syncthreads, then warp 0 merges the 8 warp lists
-//     and writes top4/logp/lse. Reads exactly NB partials per act. The
-//     lse/logp merge association differs from the previous (smem halving
-//     tree) revision: top-4 ids are unchanged (deterministic total order),
-//     lse/logp can differ in the last fp32 ulp.
+//   phase 2 (markov2_top4_phase2): grid = dim3(P), block = 256. Reads exactly
+//     NB partials per act and writes top4/logp/lse.
 //
 // Scratch (caller-allocated; PT = compiled max acts of the phase-1 instance):
 //   scratch_top4: [NB][PT][4] of (float score, u32 id) -- 8 B each
 //     element (blk, p, j) at float offset ((size_t)blk * PT + p) * 8 + j * 2
 //   scratch_lse:  [NB][PT][2] fp32 (m, l)
 //     element (blk, p) at float offset ((size_t)blk * PT + p) * 2
-//   bytes = NB * PT * 40  (510*64*40 = 1305600 B at PT = 64)
+//   bytes = NB * PT * 40
 // Every needed scratch element is written by exactly one phase-1 block.
 //
-// FD_GUARD: every entry point calls __trap() on a wrong-shape launch:
+// Every entry point __trap()s on a wrong-shape launch:
 //   phase 1: V != 130560 || in != 256 || P < 1 || P > PT ||
 //            blockDim.x != 256 || gridDim.x != 510
 //   phase 2: V != 130560 || P < 1 || P > 64 || blockDim.x != 256
 //
-// CUDA Graph: P and PT are ordinary kernel arguments, fixed per capture; the
-// request arrays and output buffers are pointers fixed per capture whose
-// CONTENTS the engine updates between replays. No device scalars are read;
-// no global state.
-//
-// SIGNATURE TABLE (extern "C" __global__; all pointer args __restrict__):
-//   markov2_top4_phase1_p{1,8,64}   -- PT = compiled max acts
-//     void(const __nv_bfloat16* B, const __nv_bfloat16* w1,
-//          const __nv_bfloat16* w2, const unsigned* req_tok,
-//          const int* req_row, float* scratch_top4, float* scratch_lse,
-//          int V, int in, int P)
-//     launch: grid = dim3(510), block = 256, dynamic smem = 0
-//   markov2_top4_phase2
-//     void(const float* scratch_top4, const float* scratch_lse,
-//          unsigned* top4, float* logp, float* lse, int V, int P, int PT)
-//     launch: grid = dim3(P), block = 256, dynamic smem = 0
-// ============================================================================
+// CUDA Graph: P and PT are fixed per capture; the request arrays and output
+// buffers are pointers fixed per capture whose contents change between
+// replays. No device scalars are read; no global state.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -108,8 +73,7 @@ using bf16 = __nv_bfloat16;
 // computed s is also stored at [act*V + v]. Compiles to nothing otherwise.
 #ifdef MK2_DUMP_S
 __device__ float* g_mk2_dump;
-// g_mk2_dump lives in this TU; the host installs the pointer by launching
-// this kernel (cudaMemcpyToSymbol across TUs fails without -rdc).
+// The host installs g_mk2_dump by launching this kernel.
 extern "C" __global__ void mk2_set_dump(float* p) { g_mk2_dump = p; }
 #define MK2_DUMP_S_WRITE(act, v, s)                                          \
   do { if (g_mk2_dump) g_mk2_dump[(size_t)(act) * MK2_VOCAB + (v)] = (s); } while (0)
@@ -153,11 +117,8 @@ __device__ __forceinline__ void cp_wait() {
 __device__ __forceinline__ void cp_wait0() { cp_wait<0>(); }
 
 // Sorted top-4 as a register-resident list, score-desc / id-asc (strictly
-// greater wins, tie -> smaller id); same comparator as v1's top4_insert.
-// The list is only ever accessed with literal indices and never address-
-// taken (passing float* to an insert helper demotes it to local memory);
-// insertion bubbles the candidate through the four slots, which is
-// equivalent to v1's shift-insert.
+// greater wins, tie -> smaller id). Accessed only with literal indices, never
+// address-taken; insertion bubbles the candidate through the four slots.
 __device__ __forceinline__ void t4_bubble(float& S, unsigned& I, float& s, unsigned& i) {
   const bool better = (s > S) || (s == S && i < I);
   const float ts = S; const unsigned ti = I;
@@ -222,9 +183,8 @@ struct ActState {
       merge_q<1>(off);
     }
   }
-  // (m, l) only, same off sequence and formula as merge_lanes. Used for the
-  // canonical 32-v-group merge: identical inputs produce identical bits in
-  // every instance.
+  // (m, l) only, same off sequence and formula as merge_lanes; the canonical
+  // 32-v-group merge.
   __device__ __forceinline__ void merge_lanes_ml() {
 #pragma unroll
     for (int off = 4; off <= 16; off <<= 1) {
@@ -244,24 +204,10 @@ struct ActState {
 
 using namespace mk2p1;
 
-// =========================================================== PT = 64 =======
-// Warp w owns acts [w*8, w*8+8) and sweeps all 256 block rows in 16-row
-// chunks. w2 is cp.async-staged through a 4-buffer swizzled smem pipeline
-// ([4][16][256] = 32768 B static smem). DEVIATION from "e rows staged once
-// in smem": the e B-fragments are loaded straight from gmem into registers
-// once per launch (32 x LDG.32 per lane; the 64 e rows are a 32 KB
-// L2-resident working set, so w1 DRAM traffic is still each row once per
-// launch, and the sector pairs are fully consumed through L1). Reason:
-// the 48 KB static-smem budget cannot hold both e[64][256] (32 KB) and a
-// useful w2 pipeline; with e in smem the block is capped at 2 blocks/SM
-// (33% occupancy) and measures ~57% of DRAM peak on A4000 (latency-bound,
-// phase-synchronized staging bursts). At 32768 B/block three blocks are
-// resident per SM (24 warps), which restores DRAM saturation. Dynamic smem
-// with an opt-in is not an option: the fixed ABI launch contract does not
-// document one.
-// Body shared by the fixed-P export and the device-P dispatcher (devp below).
-// The w2 pipeline buffer is caller-provided (16384 bf16 = 32768 B) so the
-// devp kernel can share one allocation across the three body branches.
+// PT = 64. Warp w owns acts [w*8, w*8+8) and sweeps all 256 block rows in
+// 16-row chunks. w2 is cp.async-staged through a 4-buffer swizzled pipeline
+// in the caller-provided w2sm ([4][16][256] bf16 = 32768 B); the e
+// B-fragments are loaded once from gmem into registers.
 __device__ __forceinline__ void markov2_p1_body64(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
@@ -315,10 +261,8 @@ __device__ __forceinline__ void markov2_p1_body64(
   ActState st;
   st.init();
   // Canonical (m, l): after every 32-v group (two 16-row chunks) the group
-  // partial is merged in-warp (merge_lanes_ml, offs 4/8/16) and folded into
-  // the block accumulators in ascending-group order by the lanes with
-  // r0 == 0. A lane holds the same four v of a group in every instance, so
-  // the block (m, l) partial is bitwise identical across instances.
+  // partial is merged in-warp (merge_lanes_ml) and folded into the block
+  // accumulators in ascending-group order by the lanes with r0 == 0.
   float mb[2] = {-3.0e38f, -3.0e38f}, lb[2] = {0.0f, 0.0f};
 
   for (int c = 0; c < MK2_VT / CH; ++c) {
@@ -408,25 +352,10 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 3) markov2_top4_phase1_p64(
                     P, w2sm);
 }
 
-// ==================================================== PT = 8 / PT = 1 ======
-// Shared tensor-core body for the small-PT instances. PT = 1 runs the same
-// mma code as PT = 8 (e rows p >= P are zero-filled, padding acts are never
-// written), so one request's bias and s bits are identical whether it runs
-// alone or inside a batch. Warp w owns v rows [blk*256 + w*32, +32) (2 m16
-// tiles), all acts. The w2 A-operands are cp.async-staged PER WARP: warp w
-// streams its own 32-row slice in [32 rows][32 k] chunks through its own
-// double buffer inside the caller-provided 32768 B pool (8 warps x 2 x
-// [32][32] x 2 B), wait_group + __syncwarp per chunk (the gemm_skinny
-// per-warp staging idiom) -- there is no block-wide barrier in the sweep,
-// so warps free-run. 16B-segment swizzle seg ^ ((row >> 1) & 3) keeps the
-// ldmatrix reads bank-conflict-free; A operands via ldmatrix.x4 on the
-// warp's own two m16 tiles. Per-acc k order stays kk = 0..15 ascending with
-// the same fragment values as the former gmem-direct loads, so outputs are
-// bitwise identical. w2 DRAM traffic is exactly V*256*2 B once per launch.
-// e rows are staged in smem (4096 B swizzled) via ldmatrix.x2, one ldsm per
-// k16 slice shared by both tiles. Each warp covers exactly one 32-v group:
-// its (m, l) partial after the in-warp butterfly is the canonical group
-// partial; the 8 v-split warp partials merge through smem in ascending-warp
+// Small-PT body (PT = 8 / PT = 1): both run the same mma code; e rows p >= P
+// are zero-filled and padding acts are never written. Warp w owns v rows
+// [blk*256 + w*32, +32) (2 m16 tiles), all acts, and is exactly one 32-v
+// group. The 8 v-split warp partials merge through smem in ascending-warp
 // order before one warp per act writes scratch.
 // Static smem: pool 32768 (caller's) + e 4096 + merge 2560 B.
 template <int PTB>
@@ -470,13 +399,10 @@ __device__ __forceinline__ void markov2_p1_small_body(
   const bf16* erow = esm + (lane & 7) * MK2_DIM;
   const int eseg = lane & 7;
 
-  // Per-warp w2 pipeline: warp w stages its own 32 rows x 32 k chunks into
-  // its own double buffer inside the pool (2 x [32][32] bf16 = 4096 B per
-  // warp, 32768 B total); cp.async per lane + wait_group + __syncwarp (the
-  // gemm_skinny per-warp idiom) -- no block-wide barrier in the sweep, so
-  // warps free-run. 16B-segment swizzle seg ^ ((row >> 1) & 3) keeps the
-  // ldmatrix reads bank-conflict-free. Same fragment values and ascending
-  // per-acc k order as the former gmem-direct loads -> bitwise-identical.
+  // Per-warp w2 pipeline: warp w stages its own [32 rows][32 k] chunks into
+  // its own double buffer in the pool (2 x [32][32] bf16 = 4096 B per warp);
+  // wait_group + __syncwarp per chunk, no block-wide barrier in the sweep.
+  // 16B-segment swizzle: seg ^ ((row >> 1) & 3).
   bf16* const myw2 = w2sm + warp * (2 * 32 * 32);
 
   // Stage chunk c of this warp's slice (rows [w*32, +32), k [c*32, +32)):
@@ -496,8 +422,7 @@ __device__ __forceinline__ void markov2_p1_small_body(
   cp_commit();
 
   // Both m-tile accumulators persist across the k-chunk sweep; per acc the
-  // k16 slices arrive ascending kk = 0..15 with the same fragment values as
-  // the former gmem-direct A loads.
+  // k16 slices arrive ascending kk = 0..15.
   float acc[2][4];
 #pragma unroll
   for (int t = 0; t < 2; ++t)
@@ -518,7 +443,7 @@ __device__ __forceinline__ void markov2_p1_small_body(
     for (int kq = 0; kq < 2; ++kq) {      // k16 slices 2c, 2c+1 of the chunk
       const int kk = c * 2 + kq;
       unsigned eb[2], wa[4];
-      // B k16 x n8(acts): plain ldmatrix on the e rows (unchanged path).
+      // B k16 x n8(acts): plain ldmatrix on the e rows.
       ldsm_x2(eb, erow + swz((kk * 2 + (lane >> 3)) & 31, eseg) * 8);
       // A 16x16 tiles at rows [warp*32 + t*16, +16) x k [kk*16, +16):
       // lane -> row lane%16 of the m-tile, k-offset kq*16 + (lane/16)*8.
@@ -530,8 +455,8 @@ __device__ __forceinline__ void markov2_p1_small_body(
     }
   }
 
-  // Epilogue (t = 0 then t = 1, same per-lane add order as before): the two
-  // bf16 rounding points, then running top-4 / lse per act column.
+  // Epilogue (t = 0 then t = 1): the two bf16 rounding points, then running
+  // top-4 / lse per act column.
 #pragma unroll
   for (int t = 0; t < 2; ++t) {
     const int vg = vBlk0 + warp * 32 + t * 16 + r0;
@@ -559,9 +484,8 @@ __device__ __forceinline__ void markov2_p1_small_body(
 
   st.merge_lanes();
 
-  // v is split across the 8 warps (nvs = 8): stage each warp's 32-row
-  // partials (lanes 0..3 hold all 8 acts after the in-warp merge) and merge
-  // across warps through smem. Warp w then owns act w's block merge.
+  // Lanes 0..3 hold all 8 acts after the in-warp merge; warp w owns act w's
+  // cross-warp merge.
   if (lane < 4) {
 #pragma unroll
     for (int q = 0; q < 2; ++q) {
@@ -691,9 +615,8 @@ __device__ __forceinline__ void markov2_p1_small_body_preF1(
 
   st.merge_lanes();
 
-  // v is split across the 8 warps (nvs = 8): stage each warp's 32-row
-  // partials (lanes 0..3 hold all 8 acts after the in-warp merge) and merge
-  // across warps through smem. Warp w then owns act w's block merge.
+  // Lanes 0..3 hold all 8 acts after the in-warp merge; warp w owns act w's
+  // cross-warp merge.
   if (lane < 4) {
 #pragma unroll
     for (int q = 0; q < 2; ++q) {
@@ -741,32 +664,26 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_p8(
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
     float* __restrict__ scratch_lse, int V, int in, int P) {
   MK2_GUARD_P1(8);
-  // 32768 B pool for the small body's w2 pipeline (sized to share one
-  // allocation with body64 inside the devp dispatcher).
   __shared__ __align__(16) bf16 w2sm[4 * 16 * MK2_DIM];
   markov2_p1_small_body<8>(B, w1c, w2c, req_tok, req_row, scratch_top4,
                            scratch_lse, P, w2sm);
 }
 
-// ============================================================ PT = 1 =======
-// The same tensor-core body instantiated with scratch stride 1: a request
-// produces bitwise-identical top4/logp/lse whether it runs alone or inside
-// a batch.
+// PT = 1: the small body with scratch stride 1.
 extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_p1(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
     float* __restrict__ scratch_lse, int V, int in, int P) {
   MK2_GUARD_P1(1);
-  __shared__ __align__(16) bf16 w2sm[4 * 16 * MK2_DIM];   // shared pool (as p8)
+  __shared__ __align__(16) bf16 w2sm[4 * 16 * MK2_DIM];
   markov2_p1_small_body<1>(B, w1c, w2c, req_tok, req_row, scratch_top4,
                            scratch_lse, P, w2sm);
 }
 
-// ---------------------------------------------------------------------------
-// preF1 variants: the small body with direct 32-bit global loads of w2 in
-// place of the cp.async stages. Same template instances, guards and launch
-// contract as the F1 entries; outputs are bitwise identical to them.
+// The small body with direct 32-bit global loads of w2 in place of the
+// cp.async stages. Same guards and launch contract as markov2_top4_phase1_p{8,1};
+// outputs are bitwise identical to them.
 extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_preF1_p8(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
@@ -789,18 +706,11 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_preF
 
 #undef MK2_GUARD_P1
 
-// ======================================================== phase 2 ==========
-// Per act p = blockIdx.x: thread t folds the MK2_NB2 = 510 phase-1 partials
-// b in {t, t+256} & [0,510) (vectorized: 2 x float4 + 1 x float2 per
-// partial) into a private register-resident top-4 (T4; score desc, tie ->
-// smaller id) and an online (m, l) with __expf rescaling; a 5-round shfl
-// butterfly merges each warp's lanes; warp partials cross smem (one
-// __syncthreads) and warp 0 merges the 8 lists with a 3-round butterfly.
-// Lane 0 of warp 0 writes lse[p] = m + logsum, top4[p][*] and the stable
-// logp form logp[j] = (score_j - m) - logsum.
-// The lse/logp merge association differs from the pre-warp-tree revision:
-// top-4 ids are unchanged (deterministic total order), lse/logp can differ
-// in the last fp32 ulp.
+// Per act p = blockIdx.x: thread t folds phase-1 partials b in {t, t+256} &
+// [0,510) into a register-resident T4 and an online (m, l); a 5-round shfl
+// butterfly merges each warp's lanes; warp partials cross smem and warp 0
+// merges the 8 lists with a 3-round butterfly. Lane 0 of warp 0 writes
+// lse[p], top4[p][*] and logp[p][*].
 __device__ __forceinline__ void markov2_p2_body(
     const float* __restrict__ scratch_top4, const float* __restrict__ scratch_lse,
     unsigned* __restrict__ top4, float* __restrict__ logp, float* __restrict__ lse,
@@ -813,8 +723,6 @@ __device__ __forceinline__ void markov2_p2_body(
   const int tid = threadIdx.x;
   const int warp = tid >> 5, lane = tid & 31;
 
-  // T4 is register-resident (an address-taken float* list would be demoted
-  // to local memory); comparator: strictly greater wins, tie -> smaller id.
   T4 t4; t4.init();
   float m = -3.0e38f, l = 0.0f;
 #pragma unroll
@@ -882,9 +790,7 @@ __device__ __forceinline__ void markov2_p2_body(
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         top4[(size_t)p * 4 + j] = w4.i[j];
-        // stable form: (score - m) - log(sum); score <= m, so the first
-        // subtraction loses no bits to cancellation and logsum is never
-        // rounded into the fp32 lse before it is subtracted.
+        // (score - m) - logsum; logsum is not rounded into lse first.
         logp[(size_t)p * 4 + j] = (w4.s[j] - wm) - logsum;
       }
     }

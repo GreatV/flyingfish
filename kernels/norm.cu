@@ -1,65 +1,39 @@
-// norm.cu — RMSNorm, fused residual-add + RMSNorm, and residual add for
-// MiniCPM5-2B (hidden = 2048), BF16 in / BF16 out with FP32 internal math.
-// Drop-in replacement for the repo norm.cu entry points using the v8 vectorized
-// implementations extracted from src/fused.cu: 16-byte vector I/O (8 bf16 per
-// load/store), warp-shuffle block reduction, register-cached single pass
-// (re-reads the row from L2 only when it does not fit in registers).
+// RMSNorm, fused residual-add + RMSNorm, and residual add. BF16 in / BF16 out with
+// FP32 internal math; 16-byte vector I/O (8 bf16 per load/store), warp-shuffle block
+// reduction, register-cached single pass (re-reads the row only when it does not fit
+// in registers).
 //
 // Semantics
 //   rms_norm:    y[r][d] = x[r][d] * rsqrt(mean_d(x[r][.]^2) + eps) * w[d]
-//   add_rmsnorm: res_out[r][d] = bf16(res[r][d] + x[r][d])            (add in fp32,
-//                single round at store, matching transformer-block residual math)
+//   add_rmsnorm: res_out[r][d] = bf16(res[r][d] + x[r][d])   (add in fp32, one round)
 //                y[r][d] = bf16(res_out[r][d]) * rsqrt(mean_d(res_out[r][.]^2) + eps) * w[d]
-//                (the norm consumes the rounded residual exactly as stored)
-//   residual:    x[i] = bf16(x[i] + y[i])   (__hadd2 per pair; same round-to-nearest
-//                result as the repo's scalar __hadd loop)
-//   rms_norm/add_rmsnorm compute x*rstd*w in fp32 and round once at the store;
-//   the repo rms_norm instead rounds x*scale to bf16 before a bf16 multiply by w.
+//                (the norm consumes the rounded residual as stored)
+//   residual:    x[i] = bf16(x[i] + y[i])   (__hadd2 per pair)
+//   rms_norm/add_rmsnorm compute x*rstd*w in fp32 and round once at the store.
 //   All reductions accumulate in fp32.
 //
 // Layout / contract
 //   * All tensors contiguous BF16 device buffers, element stride 1. x, y, res,
 //     res_out are row-major [rows][dim]; w is one shared row of length dim.
 //   * The 8-wide vector path is taken when dim % 8 == 0 (rms_norm, add_rmsnorm)
-//     or n % 8 == 0 (residual) and requires 16-byte base alignment
-//     (cudaMalloc guarantees 256 B); any other extent takes the scalar path.
-//   * rms_norm / add_rmsnorm: the sum of squares is a per-block reduction, so
-//     exactly one block per row: gridDim.x == rows. blockDim.x must be a
-//     multiple of 32 and <= 1024 (warp shuffles assume full warps).
-//   * add_rmsnorm: res_out may equal res (in-place residual stream, the decode
-//     case); res/res_out are deliberately not __restrict__ for that reason.
-//     x, w, y must not alias any output.
+//     or n % 8 == 0 (residual) and requires 16-byte base alignment; any other
+//     extent takes the scalar path.
+//   * rms_norm / add_rmsnorm: one block per row, gridDim.x == rows. blockDim.x
+//     must be a multiple of 32 and <= 1024.
+//   * add_rmsnorm: res_out may equal res (in place); res/res_out are not
+//     __restrict__. x, w, y must not alias any output.
 //   * residual: grid-stride over ceil(n/8) chunks (vector) or n elements
-//     (scalar); any grid >= 1 block is correct. The repo launches
-//     ceil(n/256) x 256, which this kernel handles unchanged.
-//   * No global state, no host interaction, no dynamic allocation; 128 B static
-//     __shared__ scratch per block. CUDA-Graph capturable.
-//
-// Measured (RTX 4090, sm_89, hidden = 2048, rows = 1, block = 256, hot /
-// launch-bound batched launches; per-kernel ~2-3 us regime)
-//   rms_norm     v8 1.84 us  vs repo rms_norm 3.7 us             (~2.0x)
-//   add_rmsnorm  v8 1.93 us  vs repo residual + rms_norm 5.1 us  (~2.6x)
-//   accuracy vs fp32 reference: max_rel err <= 0.0039
-//
-// Exported symbols (extern "C" __global__) and launch configs
-//   void rms_norm(const __nv_bfloat16* x, const __nv_bfloat16* w,
-//                 __nv_bfloat16* y, int rows, int dim, float eps)
-//       launch: <<<rows, 256>>>                     (repo-identical signature)
-//   void add_rmsnorm(const __nv_bfloat16* x, const __nv_bfloat16* res,
-//                    const __nv_bfloat16* w, __nv_bfloat16* y,
-//                    __nv_bfloat16* res_out, int rows, int dim, float eps)
-//       launch: <<<rows, 256>>>                     (res_out == res allowed)
-//   void residual(__nv_bfloat16* x, const __nv_bfloat16* y, int n)
-//       launch: <<<ceil(n/2048), 256>>>             (grid-stride; any grid ok,
-//               repo's <<<ceil(n/256), 256>>> included)
+//     (scalar); any grid >= 1 block is correct.
+//   * No global state; 128 B static __shared__ scratch per block. CUDA-Graph
+//     capturable.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
 namespace {
 
-// Max elements cached per thread in registers. If the row does not fit, the
-// norm kernels fall back to a strided loop that re-reads the row from L2.
+// Max elements cached per thread in registers. Rows that do not fit take a
+// strided loop that re-reads the row.
 constexpr int kMaxPerThread = 8;
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
@@ -68,7 +42,7 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
   return v;
 }
 
-// blockDim.x must be a multiple of 32 (host enforces) so every lane is active.
+// blockDim.x must be a multiple of 32.
 __device__ __forceinline__ float block_reduce_sum(float v, float* smem) {
   const int tid = threadIdx.x;
   const int nw = blockDim.x >> 5;
@@ -85,7 +59,7 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* smem) {
 }
 
 // Load VEC contiguous bf16 -> float[VEC]. Requires n % VEC == 0 and
-// VEC*2-byte pointer alignment (guaranteed by the entry-point dispatch).
+// VEC*2-byte pointer alignment.
 template <int VEC>
 __device__ __forceinline__ void ld_vec(const __nv_bfloat16* __restrict__ p,
                                        float* __restrict__ f) {
@@ -226,7 +200,7 @@ __device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict_
         ld_vec<VEC>(res + idx, b);
 #pragma unroll
         for (int j = 0; j < VEC; ++j) {
-          const __nv_bfloat16 s = __float2bfloat16(b[j] + a[j]);  // store, then normalize what was stored
+          const __nv_bfloat16 s = __float2bfloat16(b[j] + a[j]);  // the norm reads the stored value
           res_out[idx + j] = s;
           b[j] = __bfloat162float(s);
           rr[i * VEC + j] = b[j];

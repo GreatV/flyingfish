@@ -1,4 +1,13 @@
-// Q38 GDN chunkwise prefill, precision protocol candidate P1, C = 64, module gdn/gdn_chunkwise_p1: per head and chunk sG = cumsum(g), sA = -tril(beta.K.K^T.exp(G_j-G_i),-1), sT = blocked inverse of (I-A) in 16x16 FP32 leaves with 16->32->64 TC merges, W = bf16(T)@bf16(beta.K.e^G), qk = bf16(q)@bf16(K)^T.exp(G_j-G_i) tril inclusive, then per value strip U = bf16(T)@bf16(beta.V), v_new = U - bf16(W)@bf16(S), QS = bf16(q.e^G)@bf16(S), AD = bf16(qk)@bf16(v_new), out = BF16_RNE(QS+AD) and S = S.exp(G_last) + bf16(k.e^{G_last-G})^T@bf16(v_new), with one BF16 RNE copy per GEMM operand, FP32 accumulators and FP32 T leaves, __expf on differences of non-positive log-cumulatives so gamma is never formed (G reaches -87.7), BM = C = 64, BN = VW = 128/s, BK = 16, 256 threads = 8 warps, S[:,j0:j0+VW] in registers at 8/4/2 floats per thread for s=8/4/16, 1032 mma.m16n8k16 per CTA per chunk at s=8 (8256 per head per chunk against protocol §D's 2856) and ptxas -v (nvcc 13.2.86, sm_86 == sm_89) s4 228 registers / 40,704 B smem, s8 168 / 34,560, s16 168 / 31,488, 0 spill, one CTA per SM.
+// GDN chunkwise prefill, C = 64. Per head and chunk: sG = cumsum(g),
+// sA = -tril(beta.K.K^T.exp(G_j-G_i),-1), sT = blocked inverse of (I-A) in 16x16 FP32
+// leaves with 16->32->64 TC merges, W = bf16(T)@bf16(beta.K.e^G),
+// qk = bf16(q)@bf16(K)^T.exp(G_j-G_i) tril inclusive; then per value strip
+// U = bf16(T)@bf16(beta.V), v_new = U - bf16(W)@bf16(S), QS = bf16(q.e^G)@bf16(S),
+// AD = bf16(qk)@bf16(v_new), out = BF16_RNE(QS+AD) and
+// S = S.exp(G_last) + bf16(k.e^{G_last-G})^T@bf16(v_new).
+// One BF16 RNE copy per GEMM operand, FP32 accumulators and FP32 T leaves; __expf only
+// on differences of non-positive log-cumulatives. BM = C = 64, BN = VW = 128/s, BK = 16,
+// 256 threads = 8 warps, S[:,j0:j0+VW] in registers, one CTA per SM.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
@@ -6,8 +15,8 @@
 #include "gdn_cw_p1_layout.h"
 
 #define P1_C       64     // chunk rows
-#define P1_SUB     16     // UT inverse diagonal block (protocol §A)
-#define P1_THREADS 256    // protocol §E: 256 threads for the state pass
+#define P1_SUB     16     // UT inverse diagonal block
+#define P1_THREADS 256
 #define P1_WARPS   (P1_THREADS / 32)
 #define P1_DK      128
 #define P1_DV      128
@@ -51,9 +60,8 @@ __device__ __forceinline__ uint32_t p1_pack(float lo, float hi) {
 
 
 
-// ---- fragment loads ----------------------------------------------------------------
-
-// A from FP32 rows, one scale per ROW (beta, and the q liveness mask): register 1 is the +8 row at the LOW columns and register 2 the base row at the +8 columns, and the two are not interchangeable.
+// A from FP32 rows, one scale per row (beta, and the q liveness mask): register 1 is the
+// +8 row at the low columns and register 2 the base row at the +8 columns.
 __device__ __forceinline__ AFrag p1_a_rows(const float* lo, const float* hi, int col0,
                                            int t2, float s_lo, float s_hi) {
     AFrag f;
@@ -97,7 +105,7 @@ __device__ __forceinline__ BFrag p1_b_rows(const float* p, int ld, int n, int co
     return f;
 }
 
-// A from a BF16 shared buffer (T class, encoded qk). Same register order as p1_a_rows.
+// A from a BF16 shared buffer (T, encoded qk). Same register order as p1_a_rows.
 __device__ __forceinline__ AFrag p1_a_sbf(const __nv_bfloat16* base, int ld, int row0,
                                           int col0, int gid, int t2) {
     const uint32_t* lo = reinterpret_cast<const uint32_t*>(base + (size_t)(row0 + gid) * ld);
@@ -174,8 +182,6 @@ __device__ __forceinline__ void p1_store_bf16(__nv_bfloat16* base, int ld, int r
 }
 
 
-// ---- core ---------------------------------------------------------------------------
-
 template <int VW>
 __device__ __forceinline__ void gdn_chunkwise_p1_t(
         const float* __restrict__ q,      // FP32 [M, HEADS, DK], pre-scaled by 1/sqrt(DK)
@@ -194,9 +200,7 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
                                                   : GDN_CW_P1_S16_BYTES),
                   "kernel arena and gdn_cw_p1_layout.h disagree on the shared-memory size");
     constexpr int NT = VW / 8;      // 8-column value tiles
-    constexpr int VLD = P1_VL;      // sV row stride in bf16; every sV staging below writes
-                                   // [value][reduction] because p1_b_sbf packs two
-                                   // consecutive reduction values into one 32-bit register.
+    constexpr int VLD = P1_VL;      // sV row stride in bf16; sV is staged [value][reduction]
 
     const int head = blockIdx.y;
     const int j0 = blockIdx.x * VW;
@@ -240,12 +244,11 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
     const float* const qh = q + (size_t)head * P1_DK;
     const float* const vh = v + (size_t)head * P1_DV + j0;
 
-    // S[:, j0:j0+VW] stays in REGISTERS for the whole call; every index into Sr is
-    // compile-time, which is what keeps the tile out of local memory.
+    // S[:, j0:j0+VW] stays in registers for the whole call; every index into Sr is
+    // compile-time.
     float Sr[2][NT][2];
     {
-        // Warp w owns d_k rows 16w..16w+15, so the 8 warps cover all P1_DK = 128; the
-        // warp*16 term is what keeps 112 state rows from being skipped entirely.
+        // Warp w owns d_k rows 16w..16w+15.
         float* srow = S + (size_t)head * P1_DK * P1_DV
                     + (size_t)warp * 16 * P1_DV + j0 + gid * P1_DV + t2;
         #pragma unroll
@@ -260,7 +263,7 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
     const int nchunk = (valid_rows + P1_C - 1) / P1_C;
     for (int c = 0; c < nchunk; ++c) {
         const int row0 = c * P1_C;
-        // ---- gates and the in-chunk cumsum: ONE thread per scan then a barrier, since interleaved in-place scans apply G without bound (e^G overflow and NaNs).
+        // ---- gates and the in-chunk cumsum; the in-place scan runs on one thread.
         for (int r = tid; r < P1_C; r += P1_THREADS) {
             const int gr = row0 + r;
             sBeta[r] = gr < valid_rows ? beta[(size_t)gr * P1_HEADS + head] : 0.0f;
@@ -292,19 +295,20 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             p1_store_f32(sA, P1_A_LD, mt * 16, nt * 8, gid, t2, d);
         }
         __syncthreads();
-        // tril BEFORE the exp and AGAIN after it: exp of a masked entry is 1.0, so
-        // without the second mask every token reads the future.
+        // tril is applied again after the exp: exp of a masked entry is 1.0.
         for (int idx = tid; idx < P1_C * P1_C; idx += P1_THREADS) {
             const int j = idx / P1_C, i = idx - j * P1_C;
             sA[j * P1_A_LD + i] = j > i ? -sA[j * P1_A_LD + i] * __expf(sG[j] - sG[i]) : 0.0f;
         }
         __syncthreads();
 
-        // ---- T = (I - A)^-1, blocked: 16x16 FP32 leaves by forward substitution then 16->32 and 32->64 merges, ONE row per iteration with the barrier between rows (row r reads the already-final entries of rows m < r) and ONE thread per diagonal block, so each sA row has exactly one writer and is substituted once.
+        // ---- T = (I - A)^-1, blocked: 16x16 FP32 leaves by forward substitution, then
+        // 16->32 and 32->64 merges. One row per iteration with a barrier between rows, one
+        // thread per diagonal block; each sA row has one writer.
         for (int rr = 1; rr < P1_SUB; ++rr) {
             if (tid < P1_C / P1_SUB) {
                 const int blk = tid;
-                // The substituted row and the rows it reads both live in the diagonal block's COLUMN window; without c0 the pass substitutes the off-diagonal block at columns 0..15 and destroys the A[b,a] the merges consume.
+                // Columns are within the diagonal block's column window c0.
                 const int c0 = blk * P1_SUB;
                 float* row = sA + (size_t)(blk * P1_SUB + rr) * P1_A_LD + c0;
                 for (int j = 0; j < rr; ++j) {
@@ -322,9 +326,7 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             __syncthreads();
         }
         for (int r = tid; r < P1_C; r += P1_THREADS) sA[r * P1_A_LD + r] += 1.0f;
-        __syncthreads();   // the encode reads ALL of sA, including diagonals other
-                           // threads just incremented
-        // The fp32 T is dead from here, so sA is free for the WS accumulator and qk.
+        __syncthreads();   // the encode reads all of sA, including the incremented diagonal
         for (int idx = tid; idx < P1_C * P1_C; idx += P1_THREADS) {
             const int r = idx / P1_C, cc = idx - r * P1_C;
             sT[r * P1_T_LD + cc] = __float2bfloat16_rn(sA[r * P1_A_LD + cc]);
@@ -336,7 +338,8 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
         for (int p = 0; p < P1_C / (2 * P1_SUB); ++p) {
             const int a0 = p * 2 * P1_SUB, b0 = a0 + P1_SUB;
             __syncthreads();
-            // Both merge operands are staged TRANSPOSED, because a B fragment reads [output column][reduction]: A[b,a] as [a][b] and T[a,a] as [a'][a]; the block here is still the ORIGINAL A, the leaf substitution writing only the diagonal 16x16 blocks.
+            // Merge operands are staged as [output column][reduction]: A[b,a] as [a][b] and
+            // T[a,a] as [a'][a]. The off-diagonal block of sA still holds the original A.
             for (int idx = tid; idx < P1_SUB * P1_SUB; idx += P1_THREADS) {
                 const int bl = idx / P1_SUB, al = idx - bl * P1_SUB;
                 sV[al * 32 + bl] = __float2bfloat16_rn(
@@ -373,20 +376,18 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
         {   // 32 -> 64. The (x@y) intermediate goes to sA[0:32][32:64], strictly ABOVE
             // A's lower triangle and so disjoint from A[32:64][0:32].
             const int mt = warp / 4, nt = warp - (warp / 4) * 4;
-            // A[32:64][0:32] transposed into sV as [a][b], for the same reason as above.
+            // A[32:64][0:32] transposed into sV as [a][b].
             for (int idx = tid; idx < 32 * 32; idx += P1_THREADS) {
                 const int bl = idx / 32, al = idx - bl * 32;
                 sV[al * 64 + bl] = __float2bfloat16_rn(sA[(size_t)(32 + bl) * P1_A_LD + al]);
             }
             __syncthreads();
             float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            // BOTH products reduce over a 32-wide axis, i.e. TWO 16-wide k-steps; a
-            // bound of P1_SUB/16 = 1 contracts half of it and is wrong on the mt=1 half.
+            // Both products reduce over a 32-wide axis: two 16-wide k-steps.
             #pragma unroll
             for (int ks = 0; ks < P1_C / (2 * P1_SUB); ++ks) {
                 const AFrag a = p1_a_sbf(sT, P1_T_LD, 32 + mt * 16, 32 + ks * 16, gid, t2);
-                // col0 = ks*16: the staged tile is indexed by the LOCAL b, so without
-                // ks*16 both steps read local b 0..15.
+                // The staged tile is indexed by the local b.
                 const BFrag b = p1_b_sbf(sV, 64, nt * 8 + gid, ks * 16, t2);
                 P1_MMA(d, a, b);
             }
@@ -409,7 +410,7 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             __syncthreads();
         }
 
-        // ---- U = T @ (beta . V) -> sVn. T is the T-class operand, beta.V the WU one.
+        // ---- U = T @ (beta . V) -> sVn.
         for (int idx = tid; idx < P1_C * VW; idx += P1_THREADS) {
             const int r = idx / VW, cc = idx - r * VW;
             const int gr = row0 + r;
@@ -430,7 +431,8 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
         }
         __syncthreads();
 
-        // ---- WS = W @ S with W MATERIALIZED: W is a GEMM output, so it is rounded to BF16 (WU class) before it multiplies the BF16 S copy; each warp stages S into its OWN slice of the 128-row d_k axis, so sV holds the whole axis as [value][d_k] and no warp contracts W against another warp's rows.
+        // ---- WS = W @ S: W is rounded to bf16 and multiplies a bf16 copy of S. Each warp
+        // stages its own 16-row d_k slice; sV holds the whole d_k axis as [value][d_k].
         const int kblk = warp;           // the dk window this warp's S rows belong to
         __syncthreads();
         #pragma unroll
@@ -443,12 +445,11 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
                     __float2bfloat16_rn(Sr[1][nt][cc]);
             }
         __syncthreads();
-        // The OWNING warp of a chunk-row tile contracts the WHOLE 128-row d_k axis itself over ks = 0..7, so every output element has exactly one writer; warps with no tile of their own wait at the barrier below, and W depends on (mt, ks) only.
+        // The owning warp of a chunk-row tile contracts the whole d_k axis over ks = 0..7;
+        // every output element has one writer.
         if (warp < P1_MT) {
             const int mt = warp;
             float d[NT][4] = {{0.0f}};
-            // ks unrolled by 2, cs not at all: cs accumulates serially into w0/w1, so
-            // unrolling it buys no independent work.
             #pragma unroll 2
             for (int ks = 0; ks < P1_DK / 16; ++ks) {
                 float w0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -494,8 +495,7 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             sVn[r * VW + cc] -= sA[r * P1_A_LD + cc];
         }
 
-        // ---- qk = (bf16(q) @ bf16(K)^T) . exp(G_j - G_i), tril WITH the diagonal,
-        // into sA (free since WS).
+        // ---- qk = (bf16(q) @ bf16(K)^T) . exp(G_j - G_i), tril with the diagonal, into sA.
         __syncthreads();
         for (int tile = warp; tile < P1_MT * P1_NT_C; tile += P1_WARPS) {
             const int mt = tile / P1_NT_C, nt = tile - mt * P1_NT_C;
@@ -526,7 +526,7 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
             sT[r * P1_T_LD + cc] = __float2bfloat16_rn(sA[r * P1_A_LD + cc]);
         }
 
-        // ---- v_new as the WU-class operand (bf16), for AD and for the state update
+        // ---- v_new as bf16, for AD and for the state update
         for (int idx = tid; idx < P1_C * VW; idx += P1_THREADS) {
             const int r = idx / VW, cc = idx - r * VW;
             sV[cc * VLD + r] = __float2bfloat16_rn(sVn[r * VW + cc]);
@@ -547,8 +547,7 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
         }
         __syncthreads();
 
-        // ---- QS = (q . e^G) @ S onto AD's tile; S is re-staged because sV now holds
-        // the encoded v_new.
+        // ---- QS = (q . e^G) @ S onto AD's tile; S is re-staged into sV.
         __syncthreads();
         #pragma unroll
         for (int nt = 0; nt < NT; ++nt)
@@ -560,8 +559,7 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
                     __float2bfloat16_rn(Sr[1][nt][cc]);
             }
         __syncthreads();
-        // The whole 128-row d_k axis of S is in sV, so the owning warp does the FULL
-        // d_k contraction over the eight 16-wide windows onto AD's tile.
+        // The owning warp contracts the full d_k axis onto AD's tile.
         for (int tile = warp; tile < P1_MT * NT; tile += P1_WARPS) {
             const int mt = tile / NT, nt = tile - (tile / NT) * NT;
             const int cl = mt * 16 + gid, ch = cl + 8;
@@ -604,13 +602,12 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
         {
             const float decay = __expf(sG[P1_C - 1]);
             const float gl = sG[P1_C - 1];
-            // ONE pass: every o[nt] contracts over ascending ks, then all Sr rows are
-            // updated in one sweep. NT is 1/2/4 by split.
+            // Every o[nt] contracts over ascending ks, then all Sr rows update in one
+            // sweep. NT is 1/2/4 for s = 16/8/4.
             float o[NT][4] = {{0.0f}};
             #pragma unroll
             for (int ks = 0; ks < P1_C / 16; ++ks) {
-                // ks*16 is the chunk-row offset of the 16-wide k-step; without it every
-                // step contracts chunk rows 0..15 again.
+                // ks*16 is the chunk-row offset of the 16-wide k-step.
                 const AFrag a = p1_a_kdec(kh, rstride, row0, valid_rows, sG, gl,
                                           warp * 16 + gid, ks * 16 + t2);
                 #pragma unroll
@@ -645,8 +642,7 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
     }
 }
 
-// ABI-shaped wrappers; the value strip width is compile-time because the register state
-// tile is indexed by it, and protocol §A fixes the split set at 4/8/16.
+// Value strip splits s = 4/8/16 (VW = 32/16/8).
 extern "C" __global__ __launch_bounds__(P1_THREADS, 1)
 void gdn_chunkwise_p1_core_s4(const float* q, const float* k, const float* v,
                               const float* beta, const float* g, float* S,
