@@ -1,4 +1,5 @@
 //! Host-side routed-expert FFN for decode misses; model-independent.
+use crate::experts::arena::HostBlocks;
 use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
 use std::ops::Range;
@@ -434,7 +435,7 @@ pub struct ExpertPool {
 }
 
 pub struct Job<'a> {
-    pub arena: Arc<[bf16]>,
+    pub arena: Arc<HostBlocks>,
     pub hidden: &'a [bf16],
     pub rows: usize,
     pub experts: &'a [ExpertWeights],
@@ -459,7 +460,7 @@ struct PoolShared {
 
 struct JobSlot {
     rows: usize,
-    arena: Arc<[bf16]>,
+    arena: Option<Arc<HostBlocks>>,
     hidden: Vec<bf16>,
     experts: Vec<ExpertWeights>,
     assignments: Vec<Assignment>,
@@ -469,7 +470,7 @@ impl JobSlot {
     fn new(shape: &Shape, max_rows: usize, max_assignments: usize) -> Self {
         Self {
             rows: 0,
-            arena: Arc::<[bf16]>::from(Vec::<bf16>::new().into_boxed_slice()),
+            arena: None,
             hidden: vec![bf16::ZERO; max_rows * shape.hidden],
             experts: Vec::with_capacity(max_assignments),
             assignments: Vec::with_capacity(max_assignments),
@@ -502,6 +503,32 @@ impl Local {
             block: vec![bf16::ZERO; block],
         }
     }
+}
+
+/// Host block of every assignment expert; each expert's slices must stay inside one block.
+fn assignment_blocks(
+    arena: &HostBlocks,
+    experts: &[ExpertWeights],
+    assignments: &[Assignment],
+) -> Result<Vec<u32>> {
+    let per_block = arena.block_elements();
+    let mut blocks = Vec::with_capacity(assignments.len());
+    for (index, assignment) in assignments.iter().enumerate() {
+        let weights = experts
+            .get(assignment.expert as usize)
+            .with_context(|| format!("assignment {index} expert {}", assignment.expert))?;
+        let block = weights.gate_up.start / per_block;
+        let end = (block + 1) * per_block;
+        ensure!(
+            weights.gate_up.end <= end
+                && weights.down.start >= block * per_block
+                && weights.down.end <= end,
+            "expert {} weights span host blocks",
+            assignment.expert
+        );
+        blocks.push(u32::try_from(block).context("host block index exceeds u32")?);
+    }
+    Ok(blocks)
 }
 
 fn block(index: usize, workers: usize, total: usize) -> std::ops::Range<usize> {
@@ -602,17 +629,19 @@ impl ExpertPool {
             out,
         } = job;
         self.validate(
-            arena.len(),
+            arena.elements(),
             hidden.len(),
             rows,
             experts,
             assignments,
             out.len(),
         )?;
+        let blocks = assignment_blocks(&arena, experts, assignments)?;
+        let lease = arena.lease(&blocks)?;
         {
             let mut slot = self.shared.job.write().unwrap_or_else(|e| e.into_inner());
             slot.rows = rows;
-            slot.arena = arena;
+            slot.arena = Some(arena.clone());
             slot.hidden[..hidden.len()].copy_from_slice(hidden);
             slot.experts.clear();
             slot.experts.extend_from_slice(experts);
@@ -661,6 +690,7 @@ impl ExpertPool {
         for (target, source) in out.iter_mut().zip(&self.shared.out[..len]) {
             *target = bf16::from_bits(source.load(Ordering::Acquire));
         }
+        drop(lease);
         Ok(())
     }
 
@@ -838,7 +868,8 @@ fn phases(
                 }
             }
         }
-        (slot.arena.clone(), items_len, range1, slot.rows)
+        let arena = slot.arena.clone().context("job arena missing")?;
+        (arena, items_len, range1, slot.rows)
     };
     for row in 0..rows {
         if local.hidden_rows[row] {
@@ -854,7 +885,7 @@ fn phases(
         let item = &local.items[unit / intermediate];
         let j = unit % intermediate;
         let expert = &local.experts[item.expert as usize];
-        let gate_up = &arena[expert.gate_up.clone()];
+        let gate_up = arena.read(expert.gate_up.clone())?;
         let x = &local.hidden_f[item.row as usize * hidden..][..hidden];
         let gate = unsafe { (arm.dot)(x, &gate_up[j * expert.gate_up_stride..][..hidden]) };
         let up = unsafe {
@@ -918,7 +949,7 @@ fn phases(
             }
             let item = &local.items[item_index];
             let expert = &local.experts[item.expert as usize];
-            let down = &arena[expert.down.clone()];
+            let down = arena.read(expert.down.clone())?;
             let k = unit % hidden;
             let value = unsafe {
                 (arm.dot)(
@@ -962,26 +993,33 @@ mod tests {
         2 * shape.intermediate * shape.hidden + shape.hidden * shape.intermediate
     }
 
-    fn build_arena(shape: &Shape, experts: usize) -> Arc<[bf16]> {
+    fn build_arena(shape: &Shape, experts: usize) -> Arc<HostBlocks> {
         let per = per_expert(shape);
-        let mut values = vec![bf16::ZERO; per * experts];
+        let arena = HostBlocks::new(u32::try_from(experts).unwrap(), per).unwrap();
+        let mut values = vec![bf16::ZERO; per];
         for expert in 0..experts {
-            let base = expert * per;
             for j in 0..2 * shape.intermediate {
                 for k in 0..shape.hidden {
-                    values[base + j * shape.hidden + k] =
+                    values[j * shape.hidden + k] =
                         pattern(expert * 7919 + j * shape.hidden + k, 0.11);
                 }
             }
-            let down = base + 2 * shape.intermediate * shape.hidden;
+            let down = 2 * shape.intermediate * shape.hidden;
             for j in 0..shape.hidden {
                 for k in 0..shape.intermediate {
                     values[down + j * shape.intermediate + k] =
                         pattern(expert * 104729 + j * shape.intermediate + k, 1.7);
                 }
             }
+            arena
+                .write(u32::try_from(expert).unwrap(), &values)
+                .unwrap();
         }
-        Arc::from(values.into_boxed_slice())
+        arena
+    }
+
+    fn arena_slice(arena: &HostBlocks) -> &[bf16] {
+        arena.read(0..arena.elements()).unwrap()
     }
 
     fn weights(shape: &Shape, expert: usize) -> ExpertWeights {
@@ -1067,7 +1105,7 @@ mod tests {
                 Isa::Scalar,
                 Contribution {
                     shape: &shape,
-                    arena: &arena,
+                    arena: arena_slice(&arena),
                     weights: &weights(&shape, expert),
                     hidden: &hidden,
                     routing,
@@ -1075,7 +1113,13 @@ mod tests {
                 &mut out,
                 &mut scratch,
             )?;
-            let expected = reference(&shape, &arena, &weights(&shape, expert), &hidden, routing);
+            let expected = reference(
+                &shape,
+                arena_slice(&arena),
+                &weights(&shape, expert),
+                &hidden,
+                routing,
+            );
             for (actual, expected) in out.iter().zip(&expected) {
                 let distance = order_key(*actual).abs_diff(order_key(*expected));
                 elements += 1;
@@ -1114,7 +1158,7 @@ mod tests {
                 Isa::Scalar,
                 Contribution {
                     shape: &shape,
-                    arena: &arena,
+                    arena: arena_slice(&arena),
                     weights: &weights0,
                     hidden: &hidden,
                     routing,
@@ -1132,7 +1176,7 @@ mod tests {
                     isa,
                     Contribution {
                         shape: &shape,
-                        arena: &arena,
+                        arena: arena_slice(&arena),
                         weights: &weights0,
                         hidden: &hidden,
                         routing,
@@ -1164,7 +1208,7 @@ mod tests {
             Isa::Scalar,
             Contribution {
                 shape: &shape,
-                arena: &arena,
+                arena: arena_slice(&arena),
                 weights: &weights(&shape, 0),
                 hidden: &hidden,
                 routing,
@@ -1177,7 +1221,7 @@ mod tests {
             Isa::Scalar,
             Contribution {
                 shape: &shape,
-                arena: &arena,
+                arena: arena_slice(&arena),
                 weights: &weights(&shape, 1),
                 hidden: &hidden,
                 routing,
@@ -1190,8 +1234,9 @@ mod tests {
             "wrong expert pointer produced identical output"
         );
         let (h, i) = (shape.hidden, shape.intermediate);
-        let mut shifted: Vec<bf16> = arena.iter().copied().collect();
-        let source = &arena[..2 * i * h];
+        let flat = arena_slice(&arena);
+        let mut shifted: Vec<bf16> = flat.to_vec();
+        let source = &flat[..2 * i * h];
         for j in 0..i - 1 {
             shifted[(i + j) * h..][..h].copy_from_slice(&source[(i + j + 1) * h..][..h]);
         }
@@ -1251,7 +1296,7 @@ mod tests {
                     Isa::Scalar,
                     Contribution {
                         shape: &shape,
-                        arena: &arena,
+                        arena: arena_slice(&arena),
                         weights: &experts[assignment.expert as usize],
                         hidden: row,
                         routing: assignment.weight,
@@ -1315,7 +1360,7 @@ mod tests {
                 Isa::Scalar,
                 Contribution {
                     shape: &shape,
-                    arena: &arena,
+                    arena: arena_slice(&arena),
                     weights: &experts[assignment.expert as usize],
                     hidden: &hidden,
                     routing: assignment.weight,
@@ -1526,13 +1571,19 @@ mod tests {
     /// 12.5x the 64 MiB LLC of the Ryzen 7950X; 128 x 6,291,456 B = 805 MB.
     const RING_EXPERTS: usize = 128;
 
-    fn build_timing_arena(shape: &Shape, experts: usize) -> Arc<[bf16]> {
+    fn build_timing_arena(shape: &Shape, experts: usize) -> Arc<HostBlocks> {
         let per = per_expert(shape);
-        let mut values = vec![bf16::ZERO; per * experts];
+        let arena = HostBlocks::new(u32::try_from(experts).unwrap(), per).unwrap();
+        let mut values = vec![bf16::ZERO; per];
         for (index, slot) in values.iter_mut().enumerate() {
             *slot = bf16::from_f32((((index % 251) as f32) - 125.0) / 128.0);
         }
-        Arc::from(values.into_boxed_slice())
+        for expert in 0..experts {
+            arena
+                .write(u32::try_from(expert).unwrap(), &values)
+                .unwrap();
+        }
+        arena
     }
 
     #[test]
