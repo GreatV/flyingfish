@@ -521,7 +521,6 @@ mod tests {
         Ok(())
     }
 
-    /// A read after the lease drops does not compile: `BlockLease::read` borrows the guard.
     #[test]
     fn slot_events_keep_one_copy_and_one_reader_event() -> Result<()> {
         let mut events = SlotEvents::new(3);

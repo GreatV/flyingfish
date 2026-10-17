@@ -107,6 +107,14 @@ pub struct Published {
     pub generation: u64,
 }
 
+/// A vacated host block and the copy event captured for its reuse.
+#[derive(Clone, Copy, Debug)]
+struct ReleasedBlock {
+    block: u32,
+    slot: u32,
+    event: Option<u64>,
+}
+
 /// Free host block and the event its next D2H destination waits on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FreeBlock {
@@ -142,10 +150,10 @@ pub struct Residency {
     ledger: TierLedger,
     events: SlotEvents,
     host_block: Vec<Vec<u32>>,
-    cap: u32,
+    reserve: u32,
     free_blocks: Vec<FreeBlock>,
-    /// Vacated candidate blocks and the slots whose copy events gate their reuse.
-    released: Vec<(u32, u32)>,
+    /// Vacated candidate blocks; `record_copy` captures the event that gates their reuse.
+    released: Vec<ReleasedBlock>,
     generation: Vec<Vec<u64>>,
     next_generation: u64,
     scores: Vec<Vec<f64>>,
@@ -253,9 +261,14 @@ impl Residency {
         );
         let slot_bytes = geometry.slot_bytes()?;
         let cap = admission.hard_cap(slot_bytes)?;
+        let reserve = if capacity.host_blocks > 0 {
+            cap.max(1)
+        } else {
+            cap
+        };
         ensure!(
-            capacity.spare_blocks == cap,
-            "plan reserves {} spare blocks for an admission cap of {cap}",
+            capacity.spare_blocks == reserve,
+            "plan reserves {} blocks for a reserve of {reserve}",
             capacity.spare_blocks
         );
         let host_blocks = capacity
@@ -326,7 +339,7 @@ impl Residency {
             ledger,
             events: SlotEvents::new(positions as usize),
             host_block,
-            cap,
+            reserve,
             free_blocks,
             released: Vec::with_capacity(host_blocks as usize),
             generation,
@@ -360,12 +373,16 @@ impl Residency {
     /// validated before the plan is applied.
     pub fn begin_request(&mut self, frequency: &[Vec<f64>]) -> Result<&[PromptMove]> {
         ensure!(!self.token_open, "request boundary inside an open token");
-        self.drain_released()?;
+        ensure!(
+            !self.request_open,
+            "request boundary inside an open request"
+        );
+        self.validate_released()?;
         let initial = initial_residency(frequency, &self.capacity.slots_per_layer, &self.geometry)?;
         let scores = seed_scores(frequency, &self.geometry)?;
         self.plan.clear();
-        let mut pool =
-            u32::try_from(self.free_blocks.len()).context("free host blocks exceed u32")?;
+        let mut pool = u32::try_from(self.free_blocks.len() + self.released.len())
+            .context("free host blocks exceed u32")?;
         let mut first_host = true;
         for layer in 0..self.geometry.layers {
             let l = layer as usize;
@@ -413,7 +430,7 @@ impl Residency {
                         }
                     }
                     (Some(_), Tier::Disk) => {
-                        if pool > self.cap {
+                        if pool > self.reserve {
                             pool -= 1;
                             Dest::Pool
                         } else {
@@ -450,6 +467,7 @@ impl Residency {
                 "layer {layer} needs {installs} install slots for {empty} empty slots"
             );
         }
+        self.drain_released()?;
         self.moves.clear();
         let mut chain: Option<(u32, u32)> = None;
         for index in 0..self.plan.len() {
@@ -497,7 +515,11 @@ impl Residency {
                     let slot = self.ledger.install(layer, expert)?;
                     if planned.tier == Tier::Host {
                         self.host_block[l][expert as usize] = NO_BLOCK;
-                        self.released.push((planned.source_block, slot));
+                        self.released.push(ReleasedBlock {
+                            block: planned.source_block,
+                            slot,
+                            event: None,
+                        });
                     }
                     (None, None, slot)
                 }
@@ -522,7 +544,11 @@ impl Residency {
             });
         }
         if let Some((block, slot)) = chain {
-            self.released.push((block, slot));
+            self.released.push(ReleasedBlock {
+                block,
+                slot,
+                event: None,
+            });
         }
         self.scores = scores;
         self.ledger.check()?;
@@ -533,13 +559,15 @@ impl Residency {
     pub fn begin_token(&mut self) -> Result<()> {
         ensure!(self.request_open, "token outside a request");
         ensure!(!self.token_open, "token already open");
-        self.drain_released()?;
+        self.validate_released()?;
+        let free_after = self.free_host_blocks()
+            + u32::try_from(self.released.len()).context("released block count exceeds u32")?;
         ensure!(
-            self.free_host_blocks() >= self.cap,
-            "free host blocks {} below the {}-block reserve",
-            self.free_host_blocks(),
-            self.cap
+            free_after >= self.reserve,
+            "free host blocks {free_after} below the {}-block reserve",
+            self.reserve
         );
+        self.drain_released()?;
         self.token_open = true;
         for layer in 0..self.geometry.layers as usize {
             self.routed[layer].fill(false);
@@ -732,7 +760,7 @@ impl Residency {
                 ensure!(pool >= 1, "host write-back needs a free block, none");
                 pool -= 1;
                 self.block_needs.push(true);
-            } else if pool > self.cap {
+            } else if pool > self.reserve {
                 pool -= 1;
                 self.block_needs.push(true);
             } else {
@@ -751,7 +779,11 @@ impl Residency {
                 self.ledger.admit_host(layer, candidate, victim)?;
                 self.host_block[l][candidate as usize] = NO_BLOCK;
                 self.host_block[l][victim as usize] = free.id;
-                self.released.push((block, slot));
+                self.released.push(ReleasedBlock {
+                    block,
+                    slot,
+                    event: None,
+                });
                 (Some(block), Some(free.id), free.wait)
             } else {
                 let dest = if self.block_needs[index] {
@@ -787,9 +819,16 @@ impl Residency {
         Ok(&self.published)
     }
 
-    /// Records one copy event covering every listed slot.
+    /// Records one copy event covering every listed slot and captures it for any released block
+    /// waiting on that slot.
     pub fn record_copy(&mut self, slots: &[u32], event: u64) -> Result<()> {
-        self.events.record_copy(slots, event)
+        self.events.record_copy(slots, event)?;
+        for released in &mut self.released {
+            if slots.contains(&released.slot) {
+                released.event = Some(event);
+            }
+        }
+        Ok(())
     }
 
     /// Records one reader event covering every listed slot.
@@ -811,9 +850,13 @@ impl Residency {
     /// Borrows the resident tail for a prefill span; victims take a free block above the cap
     /// reserve or drop to disk.
     pub fn borrow(&mut self, slots: u32) -> Result<Borrow> {
+        ensure!(
+            !self.token_open && !self.request_open,
+            "borrow runs only between requests"
+        );
         let available = u32::try_from(self.free_blocks.len())
             .context("free host blocks exceed u32")?
-            .saturating_sub(self.cap);
+            .saturating_sub(self.reserve);
         let mut borrow = self.ledger.borrow_tail(slots, available)?;
         let to_host = borrow.to_host as usize;
         ensure!(
@@ -832,22 +875,39 @@ impl Residency {
 
     /// Returns every borrowed position to admission.
     pub fn refill(&mut self) -> Result<Vec<u32>> {
+        ensure!(
+            !self.token_open && !self.request_open,
+            "refill runs only between requests"
+        );
         self.ledger.refill_tail()
     }
 
-    fn drain_released(&mut self) -> Result<()> {
-        for index in 0..self.released.len() {
-            let (block, slot) = self.released[index];
+    /// Closes a request; borrowing and refilling run before the next boundary opens one.
+    pub fn end_request(&mut self) -> Result<()> {
+        ensure!(!self.token_open, "request ends inside an open token");
+        ensure!(self.request_open, "no open request");
+        self.request_open = false;
+        Ok(())
+    }
+
+    fn validate_released(&self) -> Result<()> {
+        for released in &self.released {
             ensure!(
-                self.events.copy_event(slot)?.is_some(),
-                "released block {block} has no copy event on slot {slot}"
+                released.event.is_some(),
+                "released block {} has no copy event on slot {}",
+                released.block,
+                released.slot
             );
         }
-        for index in 0..self.released.len() {
-            let (block, slot) = self.released[index];
+        Ok(())
+    }
+
+    fn drain_released(&mut self) -> Result<()> {
+        self.validate_released()?;
+        for released in &self.released {
             self.free_blocks.push(FreeBlock {
-                id: block,
-                wait: self.events.copy_event(slot)?,
+                id: released.block,
+                wait: released.event,
             });
         }
         self.released.clear();
@@ -1185,7 +1245,9 @@ mod tests {
     #[test]
     fn request_boundary_swaps_only_the_gpu_set() -> Result<()> {
         let mut residency = build(3, 2)?;
+        residency.end_request()?;
         assert!(residency.begin_request(&frequency())?.is_empty());
+        residency.end_request()?;
         let mut hot = frequency();
         hot[0][2] = 5.0;
         let moves = residency.begin_request(&hot)?.to_vec();
@@ -1205,6 +1267,7 @@ mod tests {
         residency.begin_token()?;
         assert_eq!(residency.free_host_blocks(), 2);
         residency.finish_token()?.to_vec();
+        residency.end_request()?;
         let moves = residency.begin_request(&frequency())?.to_vec();
         assert_eq!(moves.len(), 1);
         let movement = moves[0];
@@ -1232,6 +1295,7 @@ mod tests {
             layer[3] = 4.0;
         }
         residency.begin_request(&frequency_for(3))?;
+        residency.end_request()?;
         let moves = residency.begin_request(&hot)?.to_vec();
         assert_eq!(moves.len(), 6);
         assert_eq!(
@@ -1268,22 +1332,63 @@ mod tests {
     }
 
     #[test]
-    fn host_swaps_keep_the_pool_at_the_cap_reserve() -> Result<()> {
-        let mut residency = build(3, 2)?;
-        let cap = 2;
+    fn mixed_admissions_keep_the_pool_at_the_cap_reserve() -> Result<()> {
+        let mut residency = build(6, 2)?;
+        let reserve = 2;
         let mut event = 100u64;
-        for _ in 0..2 * cap {
-            let _ = host_swap(&mut residency, 0, 0, 2, 1, event)?;
+        let _ = host_swap(&mut residency, 0, 0, 2, 1, event)?;
+        event += 1;
+        residency.begin_token()?;
+        assert_eq!(residency.free_host_blocks(), reserve);
+        residency.finish_token()?.to_vec();
+        residency.begin_token()?;
+        set_scores(
+            &mut residency,
+            0,
+            [1.0, 0.0, 2.0, 20.0, 0.0, 0.0, 30.0, 0.0],
+        );
+        residency.dispatch(0, &[route(0, 0, 6), route(0, 1, 3)])?;
+        let published = residency.finish_token()?.to_vec();
+        assert_eq!(published.len(), 2, "mixed token");
+        assert_eq!((published[0].expert, published[0].from_host), (6, false));
+        assert!(
+            published[0].dest_block.is_none(),
+            "the reserve blocks the disk write-back"
+        );
+        assert_eq!((published[1].expert, published[1].from_host), (3, true));
+        assert!(published[1].dest_block.is_some());
+        for admitted in &published {
+            residency.record_copy(&[admitted.slot], event)?;
             event += 1;
-            residency.begin_token()?;
-            assert!(residency.free_host_blocks() >= cap);
-            residency.finish_token()?.to_vec();
-            let _ = host_swap(&mut residency, 0, 0, 1, 2, event)?;
-            event += 1;
-            residency.begin_token()?;
-            assert!(residency.free_host_blocks() >= cap);
-            residency.finish_token()?.to_vec();
         }
+        residency.begin_token()?;
+        assert_eq!(residency.free_host_blocks(), reserve);
+        residency.finish_token()?.to_vec();
+        let _ = host_swap(&mut residency, 0, 3, 4, 6, event)?;
+        event += 1;
+        residency.begin_token()?;
+        assert_eq!(residency.free_host_blocks(), reserve);
+        residency.finish_token()?.to_vec();
+        residency.begin_token()?;
+        set_scores(
+            &mut residency,
+            0,
+            [0.0, 0.0, 0.5, 1.0, 2.0, 0.0, 20.0, 30.0],
+        );
+        residency.dispatch(0, &[route(0, 0, 7), route(0, 1, 6)])?;
+        let published = residency.finish_token()?.to_vec();
+        assert_eq!(published.len(), 2, "second mixed token");
+        assert_eq!((published[0].expert, published[0].from_host), (7, false));
+        assert!(published[0].dest_block.is_none());
+        assert_eq!((published[1].expert, published[1].from_host), (6, true));
+        assert!(published[1].dest_block.is_some());
+        for admitted in &published {
+            residency.record_copy(&[admitted.slot], event)?;
+            event += 1;
+        }
+        residency.begin_token()?;
+        assert_eq!(residency.free_host_blocks(), reserve);
+        residency.finish_token()?.to_vec();
         assert!(residency.ledger().check().is_ok());
         Ok(())
     }
@@ -1475,6 +1580,117 @@ mod tests {
     }
 
     #[test]
+    fn drain_uses_the_event_captured_at_record_copy() -> Result<()> {
+        let mut residency = build(3, 2)?;
+        residency.end_request()?;
+        residency.begin_request(&frequency())?;
+        let entry = host_swap(&mut residency, 0, 0, 2, 1, 90)?;
+        residency.end_request()?;
+        let borrow = residency.borrow(2)?;
+        assert!(borrow.positions.contains(&entry.slot));
+        residency.reclaim(entry.slot)?;
+        assert_eq!(residency.refill()?.len(), 2);
+        let moves = residency.begin_request(&frequency())?.to_vec();
+        assert_eq!(moves.len(), 2, "the evicted rank-1 experts are installed");
+        assert_eq!(residency.free_host_blocks(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn borrow_and_refill_run_only_between_requests() -> Result<()> {
+        let mut residency = build(3, 2)?;
+        let error = residency.borrow(2).unwrap_err().to_string();
+        assert!(error.contains("between requests"), "{error}");
+        let error = residency.refill().unwrap_err().to_string();
+        assert!(error.contains("between requests"), "{error}");
+        assert_eq!(residency.free_host_blocks(), 2);
+        residency.begin_token()?;
+        assert!(residency.end_request().is_err());
+        residency.finish_token()?.to_vec();
+        residency.end_request()?;
+        residency.borrow(2)?;
+        residency.refill()?;
+        Ok(())
+    }
+
+    #[test]
+    fn request_validation_leaves_the_pool_unchanged() -> Result<()> {
+        let mut residency = build(3, 2)?;
+        residency.end_request()?;
+        residency.begin_request(&frequency())?;
+        let _ = host_swap(&mut residency, 0, 0, 2, 1, 91)?;
+        residency.end_request()?;
+        let borrow = residency.borrow(2)?;
+        assert_eq!(borrow.positions.len(), 2);
+        let free_before = residency.free_host_blocks();
+        let error = residency
+            .begin_request(&frequency())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("install slots"), "{error}");
+        assert_eq!(
+            residency.free_host_blocks(),
+            free_before,
+            "a failed boundary drained the pool"
+        );
+        residency.refill()?;
+        Ok(())
+    }
+
+    #[test]
+    fn reserve_floor_covers_zero_cap_host_swaps() -> Result<()> {
+        let geometry = geometry();
+        let reserves = reserves();
+        let service = service();
+        let slot = geometry.slot_bytes()?;
+        let inputs = PlanInputs {
+            geometry,
+            device_free_bytes: reserves.persistent_bytes(&geometry)? + 4 * slot,
+            host_available_bytes: reserves.host_bytes(&geometry)? + 3 * slot,
+            h2d_bytes_per_second: 1e9,
+            d2h_bytes_per_second: 1e9,
+            copy_engines: 2,
+            disk_readers: 1,
+            host_registration_bytes: u64::MAX,
+            service: &service,
+            reserves: &reserves,
+            span_rows: 4,
+            wave_rows: 2,
+        };
+        let capacity = capacity(&inputs, 0)?;
+        assert_eq!(capacity.spare_blocks, 1, "the reserve floor");
+        assert_eq!(capacity.host_blocks, 2);
+        let admission = Admission {
+            budget_bytes_per_token: 0,
+        };
+        let host = HostBlocks::new(3, usize::try_from(slot / 2)?)?;
+        let (dir, catalogue) = staged(geometry)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let initial = initial_residency(&frequency(), &capacity.slots_per_layer, &geometry)?;
+        let (mut residency, _report) = Residency::load(LoadInputs {
+            geometry,
+            capacity,
+            admission,
+            max_rows: 8,
+            initial: &initial,
+            host: &host,
+            catalogue: &catalogue,
+            reader: &reader,
+        })?;
+        assert_eq!(residency.free_host_blocks(), 1);
+        residency.begin_request(&frequency())?;
+        residency.end_request()?;
+        let mut hot = frequency();
+        hot[0][2] = 5.0;
+        let moves = residency.begin_request(&hot)?.to_vec();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].expert, 2);
+        assert_eq!(moves[0].dest_block, Some(2));
+        assert_eq!(residency.free_host_blocks(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn slot_events_are_bounded_and_reclaim_both_events() -> Result<()> {
         let mut residency = build(3, 2)?;
         let slot0 = residency.ledger().slot(0, 0)?;
@@ -1504,6 +1720,7 @@ mod tests {
     #[test]
     fn borrow_returns_positions_and_respects_the_cap_reserve() -> Result<()> {
         let mut residency = build(3, 2)?;
+        residency.end_request()?;
         assert_eq!(residency.free_host_blocks(), 2);
         let borrow = residency.borrow(2)?;
         assert_eq!(borrow.positions, vec![3, 2]);

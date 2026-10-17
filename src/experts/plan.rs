@@ -252,7 +252,8 @@ pub struct Capacity {
     pub slots_per_layer: Vec<u32>,
     /// Usable host blocks after reserving the per-token spare blocks.
     pub host_blocks: u32,
-    /// Spare host blocks used by admission write-backs.
+    /// Reserve host blocks for swap write-backs: the admission cap, at least one when the host
+    /// tier is non-empty.
     pub spare_blocks: u32,
     pub disk_bytes: u64,
     pub worker_count: u32,
@@ -463,11 +464,15 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
     );
     let slots_per_layer = equal_slots(total_slots, geometry.layers)?;
     let host_block_slots = host_expert_bytes / slot_bytes;
+    let mut reserve = admission_cap;
+    if host_block_slots > u64::from(reserve) {
+        reserve = reserve.max(1);
+    }
     ensure!(
-        host_block_slots >= u64::from(admission_cap),
-        "host blocks {host_block_slots} cannot hold {admission_cap} spare blocks"
+        host_block_slots >= u64::from(reserve),
+        "host blocks {host_block_slots} cannot hold {reserve} reserve blocks"
     );
-    let host_blocks = (host_block_slots - u64::from(admission_cap)).min(routed_slots - total_slots);
+    let host_blocks = (host_block_slots - u64::from(reserve)).min(routed_slots - total_slots);
     let host_blocks = u32::try_from(host_blocks).context("host block count exceeds u32")?;
     let unique_slots = total_slots
         .checked_add(u64::from(host_blocks))
@@ -480,7 +485,7 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         .checked_mul(slot_bytes)
         .context("disk tier bytes overflow")?;
     let arena_bytes = u64::from(host_blocks)
-        .checked_add(u64::from(admission_cap))
+        .checked_add(u64::from(reserve))
         .and_then(|blocks| blocks.checked_mul(slot_bytes))
         .context("host arena bytes overflow")?;
     let pinned = arena_bytes > 0 && arena_bytes <= inputs.host_registration_bytes;
@@ -498,7 +503,7 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         host_expert_bytes,
         slots_per_layer,
         host_blocks,
-        spare_blocks: admission_cap,
+        spare_blocks: reserve,
         disk_bytes,
         worker_count,
         disk_workers,
@@ -1206,10 +1211,13 @@ mod tests {
             ..capacity_ref(&inputs)
         };
         let small = capacity(&small_host, 0).unwrap();
-        assert_eq!(small.host_blocks, 8);
+        assert_eq!(
+            small.host_blocks, 7,
+            "one block is reserved for swap write-backs"
+        );
         assert_eq!(
             small.disk_bytes,
-            (16 - 4 - 8) * geometry().slot_bytes().unwrap()
+            (16 - 4 - 7) * geometry().slot_bytes().unwrap()
         );
         let tight = PlanInputs {
             device_free_bytes: reserves.persistent_bytes(&geometry()).unwrap()
@@ -1226,7 +1234,7 @@ mod tests {
         let error = capacity(&over, 0).unwrap_err().to_string();
         assert!(error.contains("persistent reserves"), "{error}");
         let spares = capacity(&inputs, 28).unwrap_err().to_string();
-        assert!(spares.contains("spare blocks"), "{spares}");
+        assert!(spares.contains("reserve blocks"), "{spares}");
     }
 
     #[test]
@@ -1234,7 +1242,7 @@ mod tests {
         let service = service();
         let reserves = reserves();
         let inputs = inputs(&service, &reserves);
-        let arena_bytes = 12 * geometry().slot_bytes().unwrap();
+        let arena_bytes = 13 * geometry().slot_bytes().unwrap();
         let eligible = PlanInputs {
             host_registration_bytes: arena_bytes,
             ..capacity_ref(&inputs)

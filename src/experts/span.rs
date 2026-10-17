@@ -204,8 +204,10 @@ struct PrefetchEntry {
 /// Bounded layer-ahead disk prefetch over the ring; demand entries take priority.
 pub struct Prefetch {
     depth: u32,
-    queue: Vec<PrefetchEntry>,
+    queued: Vec<PrefetchEntry>,
+    in_flight: Option<PrefetchEntry>,
     loaded: Vec<(PrefetchEntry, u32)>,
+    taken: Vec<(PrefetchEntry, u32)>,
 }
 
 impl Prefetch {
@@ -217,19 +219,38 @@ impl Prefetch {
         );
         Ok(Self {
             depth,
-            queue: Vec::with_capacity(depth as usize + 1),
+            queued: Vec::with_capacity(depth as usize),
+            in_flight: None,
             loaded: Vec::with_capacity(depth as usize),
+            taken: Vec::with_capacity(depth as usize),
         })
     }
 
-    /// Entries holding a ring slot's worth of capacity: queued and loaded.
+    /// Queued, in-flight, loaded and taken entries: every entry holds or waits for a ring slot.
     pub fn entries(&self) -> u32 {
-        u32::try_from(self.queue.len() + self.loaded.len()).expect("prefetch entry count fits u32")
+        let in_flight = usize::from(self.in_flight.is_some());
+        u32::try_from(self.queued.len() + in_flight + self.loaded.len() + self.taken.len())
+            .expect("prefetch entry count fits u32")
+    }
+
+    fn contains(&self, layer: u32, expert: u32) -> bool {
+        self.queued
+            .iter()
+            .chain(self.in_flight.iter())
+            .chain(self.loaded.iter().map(|(entry, _)| entry))
+            .chain(self.taken.iter().map(|(entry, _)| entry))
+            .any(|entry| entry.layer == layer && entry.expert == expert)
     }
 
     /// Queues layer L+1's streamed experts from its complete span plan; only whole cohorts are
-    /// queued.
-    pub fn plan_layer(&mut self, current_layer: u32, layer: u32, plan: &SpanPlan) -> Result<u32> {
+    /// queued and host-tier experts are skipped.
+    pub fn plan_layer(
+        &mut self,
+        current_layer: u32,
+        layer: u32,
+        plan: &SpanPlan,
+        host: &[bool],
+    ) -> Result<u32> {
         ensure!(
             layer
                 == current_layer
@@ -239,54 +260,48 @@ impl Prefetch {
         );
         let mut queued = 0u32;
         for cohort in &plan.staged {
-            if self.entries() + cohort.len() as u32 > self.depth {
+            let mut needed = 0u32;
+            for &expert in cohort {
+                ensure!(
+                    (expert as usize) < host.len(),
+                    "host mask holds {} experts, not expert {expert}",
+                    host.len()
+                );
+                if !host[expert as usize] && !self.contains(layer, expert) {
+                    needed += 1;
+                }
+            }
+            if self.entries() + needed > self.depth {
                 break;
             }
             for &expert in cohort {
-                self.push(layer, expert, false)?;
+                if !host[expert as usize] {
+                    self.push(layer, expert, false)?;
+                }
             }
             queued += 1;
         }
         Ok(queued)
     }
 
-    /// Queues one read; a demand request moves to the front and never fails queue-full. Returns
-    /// the ring slot of an evicted loaded prefetch, which the caller discards.
+    /// Queues one read. A demand request never fails queue-full: it evicts the oldest waiting
+    /// entry, never the entry being read, and waits for the oldest completion when only in-flight
+    /// or taken slots remain. Returns the ring slot of an evicted loaded entry for `discard`.
     pub fn request(&mut self, layer: u32, expert: u32, demand: bool) -> Result<Option<u32>> {
         self.push(layer, expert, demand)
     }
 
     fn push(&mut self, layer: u32, expert: u32, demand: bool) -> Result<Option<u32>> {
-        if self
-            .loaded
-            .iter()
-            .any(|(entry, _)| entry.layer == layer && entry.expert == expert)
-        {
-            return Ok(None);
-        }
-        if let Some(index) = self
-            .queue
-            .iter()
-            .position(|entry| entry.layer == layer && entry.expert == expert)
-        {
-            if demand && index > 0 {
-                let entry = self.queue.remove(index);
-                self.queue.insert(0, entry);
-            }
+        if self.contains(layer, expert) {
             return Ok(None);
         }
         let mut evicted_slot = None;
         if self.entries() >= self.depth {
             ensure!(demand, "prefetch queue full at depth {}", self.depth);
-            if let Some(index) = self.queue.iter().position(|entry| !entry.demand) {
-                self.queue.remove(index);
-            } else if let Some(index) = self.loaded.iter().position(|(entry, _)| !entry.demand) {
-                evicted_slot = Some(self.loaded.remove(index).1);
-            } else {
-                anyhow::bail!(
-                    "demand read has no prefetch to evict at depth {}",
-                    self.depth
-                );
+            if !self.queued.is_empty() {
+                self.queued.remove(0);
+            } else if !self.loaded.is_empty() {
+                evicted_slot = Some(self.loaded.remove(0).1);
             }
         }
         let entry = PrefetchEntry {
@@ -295,44 +310,64 @@ impl Prefetch {
             demand,
         };
         if demand {
-            self.queue.insert(0, entry);
+            self.queued.insert(0, entry);
         } else {
-            self.queue.push(entry);
+            self.queued.push(entry);
         }
         Ok(evicted_slot)
     }
 
-    /// Front request for the reader; it stays queued until `complete`.
-    pub fn front(&self) -> Option<(u32, u32)> {
-        self.queue.first().map(|entry| (entry.layer, entry.expert))
+    /// Starts the oldest request; it stays in flight until `complete` and is never evicted.
+    pub fn begin_read(&mut self) -> Option<(u32, u32)> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let entry = self.queued.first().copied()?;
+        self.queued.remove(0);
+        self.in_flight = Some(entry);
+        Some((entry.layer, entry.expert))
     }
 
-    /// Records the ring slot of the front request.
+    /// Records the ring slot of the read in flight.
     pub fn complete(&mut self, layer: u32, expert: u32, slot: u32) -> Result<()> {
+        let entry = self.in_flight.context("no prefetch read in flight")?;
         ensure!(
-            self.front() == Some((layer, expert)),
-            "completed request ({layer}, {expert}) is not the front"
+            (entry.layer, entry.expert) == (layer, expert),
+            "completed request ({layer}, {expert}) is not the read in flight"
         );
-        let entry = self.queue.remove(0);
+        self.in_flight = None;
         self.loaded.push((entry, slot));
         Ok(())
     }
 
     /// Drops a queued request that became resident elsewhere.
     pub fn cancel(&mut self, layer: u32, expert: u32) -> bool {
-        self.queue
+        self.queued
             .iter()
             .position(|entry| entry.layer == layer && entry.expert == expert)
-            .map(|index| self.queue.remove(index))
+            .map(|index| self.queued.remove(index))
             .is_some()
     }
 
-    /// Takes a loaded request's ring slot.
+    /// Takes a loaded request's ring slot; the slot keeps counting toward the depth until
+    /// `release`.
     pub fn take(&mut self, layer: u32, expert: u32) -> Option<u32> {
-        self.loaded
+        let index = self
+            .loaded
             .iter()
-            .position(|(entry, _)| entry.layer == layer && entry.expert == expert)
-            .map(|index| self.loaded.remove(index).1)
+            .position(|(entry, _)| entry.layer == layer && entry.expert == expert)?;
+        let (entry, slot) = self.loaded.remove(index);
+        self.taken.push((entry, slot));
+        Some(slot)
+    }
+
+    /// Frees a taken ring slot after the consumer released it.
+    pub fn release(&mut self, slot: u32) -> bool {
+        self.taken
+            .iter()
+            .position(|(_, taken)| *taken == slot)
+            .map(|index| self.taken.remove(index))
+            .is_some()
     }
 }
 
@@ -503,48 +538,66 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_is_bounded_by_the_ring_and_serves_demand_first() -> Result<()> {
+    fn prefetch_demands_wait_and_never_evict_the_read() -> Result<()> {
         assert!(Prefetch::new(0, 2).is_err());
         assert!(Prefetch::new(3, 2).is_err());
-        let mut prefetch = Prefetch::new(2, 4)?;
+        let mut prefetch = Prefetch::new(2, 2)?;
         prefetch.request(0, 0, false)?;
-        prefetch.request(0, 1, false)?;
-        let error = prefetch.request(0, 2, false).unwrap_err().to_string();
-        assert!(error.contains("prefetch queue full at depth 2"), "{error}");
-        assert_eq!(
-            prefetch.request(0, 2, true)?,
-            None,
-            "a demand never fails queue-full"
-        );
-        assert_eq!(prefetch.front(), Some((0, 2)));
-        assert_eq!(prefetch.entries(), 2);
         prefetch.request(0, 1, true)?;
-        assert_eq!(prefetch.front(), Some((0, 1)));
-        let (layer, expert) = prefetch.front().expect("front request");
-        prefetch.complete(layer, expert, 7)?;
-        assert_eq!(prefetch.take(0, 1), Some(7));
-        assert_eq!(prefetch.take(0, 1), None);
-        assert!(prefetch.cancel(0, 2));
-        assert_eq!(prefetch.entries(), 0);
-        let mut evict = Prefetch::new(1, 2)?;
-        evict.request(0, 0, false)?;
-        let (layer, expert) = evict.front().expect("front request");
-        evict.complete(layer, expert, 3)?;
-        assert_eq!(evict.request(0, 1, true)?, Some(3));
-        assert_eq!(evict.front(), Some((0, 1)));
-        assert_eq!(evict.entries(), 1);
+        assert_eq!(
+            prefetch.begin_read(),
+            Some((0, 1)),
+            "the demand reads first"
+        );
+        assert_eq!(prefetch.begin_read(), None, "one read at a time");
+        prefetch.request(0, 2, true)?;
+        prefetch.complete(0, 1, 5)?;
+        assert_eq!(prefetch.begin_read(), Some((0, 2)));
+        prefetch.complete(0, 2, 7)?;
+        assert_eq!(prefetch.entries(), 2);
+        let mut all_demand = Prefetch::new(1, 2)?;
+        all_demand.request(0, 1, true)?;
+        all_demand.request(0, 2, true)?;
+        assert_eq!(all_demand.begin_read(), Some((0, 2)));
+        Ok(())
+    }
+
+    #[test]
+    fn prefetch_taken_slots_count_toward_the_depth() -> Result<()> {
+        let mut prefetch = Prefetch::new(1, 2)?;
+        prefetch.request(0, 0, false)?;
+        assert_eq!(prefetch.begin_read(), Some((0, 0)));
+        prefetch.complete(0, 0, 5)?;
+        assert_eq!(prefetch.take(0, 0), Some(5));
+        assert_eq!(prefetch.take(0, 0), None);
+        assert_eq!(prefetch.entries(), 1);
+        let error = prefetch.request(0, 1, false).unwrap_err().to_string();
+        assert!(error.contains("prefetch queue full at depth 1"), "{error}");
+        assert!(prefetch.release(5));
+        assert!(!prefetch.release(5));
+        prefetch.request(0, 1, false)?;
+        assert_eq!(prefetch.entries(), 1);
         Ok(())
     }
 
     #[test]
     fn prefetch_plans_only_the_next_layers_complete_cohorts() -> Result<()> {
         let plan = plan(vec![vec![1, 2], vec![3, 4]]);
+        let mut host = vec![false; 8];
+        host[2] = true;
         let mut prefetch = Prefetch::new(3, 4)?;
-        let error = prefetch.plan_layer(5, 7, &plan).unwrap_err().to_string();
+        let error = prefetch
+            .plan_layer(5, 7, &plan, &host)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("is not next after 5"), "{error}");
-        assert_eq!(prefetch.plan_layer(5, 6, &plan)?, 1);
-        assert_eq!(prefetch.entries(), 2);
-        assert_eq!(prefetch.plan_layer(6, 7, &plan)?, 0, "no whole cohort fits");
+        assert_eq!(prefetch.plan_layer(5, 6, &plan, &host)?, 2);
+        assert_eq!(prefetch.entries(), 3, "host-tier expert 2 is not queued");
+        assert_eq!(
+            prefetch.plan_layer(6, 7, &plan, &host)?,
+            0,
+            "no whole cohort fits"
+        );
         Ok(())
     }
 }
