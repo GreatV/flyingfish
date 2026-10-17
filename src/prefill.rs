@@ -644,7 +644,8 @@ mod admission_tests {
             let (_, capacity, admission) =
                 ExpertWorkspaceBudget::select(&changed, 65_536, &candidates)?;
             assert_eq!(admission.budget_bytes_per_token, 5 << 20);
-            assert_eq!(capacity.spare_blocks, 0);
+            assert!(capacity.host_blocks > 0);
+            assert_eq!(capacity.spare_blocks, 1);
         }
         assert!(
             ExpertWorkspaceBudget::select(
