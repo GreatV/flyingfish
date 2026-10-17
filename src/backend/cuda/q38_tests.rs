@@ -1,7 +1,7 @@
 //! GPU probes. Default cargo test never initializes a GPU here.
 use super::{
     Device,
-    attention_d256::{AttentionBindings, D, FullAttentionOps, GQA, HKV, HQ, PositionBindings},
+    attention_d256::{AttentionBindings, D, FullAttentionOps, PositionBindings},
     blas::Blas,
     closure::Closure,
     contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut},
@@ -920,13 +920,13 @@ struct VerifyAttentionFixture {
 impl VerifyAttentionFixture {
     fn new(prefix: u32, capacity: u32, state: &mut u64) -> Self {
         let value = |state: &mut u64| bf16::from_f32(next_f32_unit(state) * 3.0 - 1.5);
-        let q_gate = (0..VERIFY_M4_ROWS * HQ as usize * 2 * D as usize)
+        let q_gate = (0..VERIFY_M4_ROWS * FullAttentionSpec::q38().hq as usize * 2 * D as usize)
             .map(|_| value(state))
             .collect::<Vec<_>>();
-        let k = (0..VERIFY_M4_ROWS * HKV as usize * D as usize)
+        let k = (0..VERIFY_M4_ROWS * FullAttentionSpec::q38().hkv as usize * D as usize)
             .map(|_| value(state))
             .collect::<Vec<_>>();
-        let v = (0..VERIFY_M4_ROWS * HKV as usize * D as usize)
+        let v = (0..VERIFY_M4_ROWS * FullAttentionSpec::q38().hkv as usize * D as usize)
             .map(|_| value(state))
             .collect::<Vec<_>>();
         let q_norm = (0..D as usize)
@@ -935,10 +935,10 @@ impl VerifyAttentionFixture {
         let k_norm = (0..D as usize)
             .map(|_| bf16::from_f32(next_f32_unit(state) * 0.25))
             .collect::<Vec<_>>();
-        let prefix_k = (0..prefix as usize * HKV as usize * D as usize)
+        let prefix_k = (0..prefix as usize * FullAttentionSpec::q38().hkv as usize * D as usize)
             .map(|_| value(state))
             .collect::<Vec<_>>();
-        let prefix_v = (0..prefix as usize * HKV as usize * D as usize)
+        let prefix_v = (0..prefix as usize * FullAttentionSpec::q38().hkv as usize * D as usize)
             .map(|_| value(state))
             .collect::<Vec<_>>();
         Self {
@@ -957,9 +957,9 @@ impl VerifyAttentionFixture {
     fn caches(&self) -> (Vec<bf16>, Vec<bf16>) {
         let span = self.capacity as usize * D as usize;
         let nan = bf16::from_bits(0x7fc0);
-        let mut k = vec![nan; HKV as usize * span];
-        let mut v = vec![nan; HKV as usize * span];
-        for head in 0..HKV as usize {
+        let mut k = vec![nan; FullAttentionSpec::q38().hkv as usize * span];
+        let mut v = vec![nan; FullAttentionSpec::q38().hkv as usize * span];
+        for head in 0..FullAttentionSpec::q38().hkv as usize {
             for position in 0..self.prefix as usize {
                 let source = (head * self.prefix as usize + position) * D as usize;
                 let target = head * span + position * D as usize;
@@ -1016,11 +1016,15 @@ fn verify_run_batch(
     let q_gate = s.clone_htod(&fixture.q_gate)?;
     let k = s.clone_htod(&fixture.k)?;
     let v = s.clone_htod(&fixture.v)?;
-    let q = s.alloc_zeros::<bf16>(rows as usize * HQ as usize * D as usize)?;
-    let gate = s.alloc_zeros::<bf16>(rows as usize * HQ as usize * D as usize)?;
+    let q =
+        s.alloc_zeros::<bf16>(rows as usize * FullAttentionSpec::q38().hq as usize * D as usize)?;
+    let gate =
+        s.alloc_zeros::<bf16>(rows as usize * FullAttentionSpec::q38().hq as usize * D as usize)?;
     let core = s.clone_htod(&vec![
         bf16::from_bits(0x7fc0);
-        rows as usize * HQ as usize * D as usize
+        rows as usize
+            * FullAttentionSpec::q38().hq as usize
+            * D as usize
     ])?;
     let (host_k, host_v) = fixture.caches();
     let k_cache = s.clone_htod(&host_k)?;
@@ -1041,35 +1045,54 @@ fn verify_run_batch(
         q_gate: view(
             &q_gate,
             s,
-            [rows, HQ, 2 * D],
-            [(HQ * 2 * D).into(), (2 * D).into(), 1],
+            [rows, FullAttentionSpec::q38().hq, 2 * D],
+            [
+                (FullAttentionSpec::q38().hq * 2 * D).into(),
+                (2 * D).into(),
+                1,
+            ],
         )?,
-        k: view(&k, s, [rows, HKV, D], [(HKV * D).into(), D.into(), 1])?,
-        v: view(&v, s, [rows, HKV, D], [(HKV * D).into(), D.into(), 1])?,
-        q: TensorMut(view(&q, s, [rows, HQ, D], [(HQ * D).into(), D.into(), 1])?),
+        k: view(
+            &k,
+            s,
+            [rows, FullAttentionSpec::q38().hkv, D],
+            [(FullAttentionSpec::q38().hkv * D).into(), D.into(), 1],
+        )?,
+        v: view(
+            &v,
+            s,
+            [rows, FullAttentionSpec::q38().hkv, D],
+            [(FullAttentionSpec::q38().hkv * D).into(), D.into(), 1],
+        )?,
+        q: TensorMut(view(
+            &q,
+            s,
+            [rows, FullAttentionSpec::q38().hq, D],
+            [(FullAttentionSpec::q38().hq * D).into(), D.into(), 1],
+        )?),
         gate: TensorMut(view(
             &gate,
             s,
-            [rows, HQ, D],
-            [(HQ * D).into(), D.into(), 1],
+            [rows, FullAttentionSpec::q38().hq, D],
+            [(FullAttentionSpec::q38().hq * D).into(), D.into(), 1],
         )?),
         k_cache: TensorMut(view(
             &k_cache,
             s,
-            [HKV, fixture.capacity, D],
+            [FullAttentionSpec::q38().hkv, fixture.capacity, D],
             [u64::from(fixture.capacity) * u64::from(D), D.into(), 1],
         )?),
         v_cache: TensorMut(view(
             &v_cache,
             s,
-            [HKV, fixture.capacity, D],
+            [FullAttentionSpec::q38().hkv, fixture.capacity, D],
             [u64::from(fixture.capacity) * u64::from(D), D.into(), 1],
         )?),
         core_out: TensorMut(view(
             &core,
             s,
-            [rows, HQ, D],
-            [(HQ * D).into(), D.into(), 1],
+            [rows, FullAttentionSpec::q38().hq, D],
+            [(FullAttentionSpec::q38().hq * D).into(), D.into(), 1],
         )?),
         q_norm: view(&q_norm, s, [D], [1])?,
         k_norm: view(&k_norm, s, [D], [1])?,
@@ -1148,12 +1171,16 @@ fn verify_run_serial(
     let q_norm = s.clone_htod(&fixture.q_norm)?;
     let k_norm = s.clone_htod(&fixture.k_norm)?;
     let mask = s.clone_htod(&verify_causal_mask())?;
-    let mut q_gate = s.alloc_zeros::<bf16>(HQ as usize * 2 * D as usize)?;
-    let mut k = s.alloc_zeros::<bf16>(HKV as usize * D as usize)?;
-    let mut v = s.alloc_zeros::<bf16>(HKV as usize * D as usize)?;
-    let q = s.alloc_zeros::<bf16>(HQ as usize * D as usize)?;
-    let gate = s.alloc_zeros::<bf16>(HQ as usize * D as usize)?;
-    let mut core = s.clone_htod(&vec![bf16::from_bits(0x7fc0); HQ as usize * D as usize])?;
+    let mut q_gate =
+        s.alloc_zeros::<bf16>(FullAttentionSpec::q38().hq as usize * 2 * D as usize)?;
+    let mut k = s.alloc_zeros::<bf16>(FullAttentionSpec::q38().hkv as usize * D as usize)?;
+    let mut v = s.alloc_zeros::<bf16>(FullAttentionSpec::q38().hkv as usize * D as usize)?;
+    let q = s.alloc_zeros::<bf16>(FullAttentionSpec::q38().hq as usize * D as usize)?;
+    let gate = s.alloc_zeros::<bf16>(FullAttentionSpec::q38().hq as usize * D as usize)?;
+    let mut core = s.clone_htod(&vec![
+        bf16::from_bits(0x7fc0);
+        FullAttentionSpec::q38().hq as usize * D as usize
+    ])?;
     let scratch = s.alloc_zeros::<u8>(usize::try_from(request.bytes)?)?;
     let (scratch_ptr, _scratch_hold) = scratch.device_ptr(s);
     let mut gates = Vec::new();
@@ -1162,20 +1189,20 @@ fn verify_run_serial(
     let mut partials = Vec::new();
 
     for row in 0..rows as usize {
-        let q_gate_row = fixture.q_gate
-            [row * HQ as usize * 2 * D as usize..(row + 1) * HQ as usize * 2 * D as usize]
+        let q_gate_row = fixture.q_gate[row * FullAttentionSpec::q38().hq as usize * 2 * D as usize
+            ..(row + 1) * FullAttentionSpec::q38().hq as usize * 2 * D as usize]
             .to_vec();
-        let k_row = fixture.k
-            [row * HKV as usize * D as usize..(row + 1) * HKV as usize * D as usize]
+        let k_row = fixture.k[row * FullAttentionSpec::q38().hkv as usize * D as usize
+            ..(row + 1) * FullAttentionSpec::q38().hkv as usize * D as usize]
             .to_vec();
-        let v_row = fixture.v
-            [row * HKV as usize * D as usize..(row + 1) * HKV as usize * D as usize]
+        let v_row = fixture.v[row * FullAttentionSpec::q38().hkv as usize * D as usize
+            ..(row + 1) * FullAttentionSpec::q38().hkv as usize * D as usize]
             .to_vec();
         s.memcpy_htod(&q_gate_row, &mut q_gate.slice_mut(..))?;
         s.memcpy_htod(&k_row, &mut k.slice_mut(..))?;
         s.memcpy_htod(&v_row, &mut v.slice_mut(..))?;
         s.memcpy_htod(
-            &vec![bf16::from_bits(0x7fc0); HQ as usize * D as usize],
+            &vec![bf16::from_bits(0x7fc0); FullAttentionSpec::q38().hq as usize * D as usize],
             &mut core.slice_mut(..),
         )?;
         let prefix = fixture.prefix + row as u32;
@@ -1185,26 +1212,55 @@ fn verify_run_serial(
             q_gate: view(
                 &q_gate,
                 s,
-                [1, HQ, 2 * D],
-                [(HQ * 2 * D).into(), (2 * D).into(), 1],
+                [1, FullAttentionSpec::q38().hq, 2 * D],
+                [
+                    (FullAttentionSpec::q38().hq * 2 * D).into(),
+                    (2 * D).into(),
+                    1,
+                ],
             )?,
-            k: view(&k, s, [1, HKV, D], [(HKV * D).into(), D.into(), 1])?,
-            v: view(&v, s, [1, HKV, D], [(HKV * D).into(), D.into(), 1])?,
-            q: TensorMut(view(&q, s, [1, HQ, D], [(HQ * D).into(), D.into(), 1])?),
-            gate: TensorMut(view(&gate, s, [1, HQ, D], [(HQ * D).into(), D.into(), 1])?),
+            k: view(
+                &k,
+                s,
+                [1, FullAttentionSpec::q38().hkv, D],
+                [(FullAttentionSpec::q38().hkv * D).into(), D.into(), 1],
+            )?,
+            v: view(
+                &v,
+                s,
+                [1, FullAttentionSpec::q38().hkv, D],
+                [(FullAttentionSpec::q38().hkv * D).into(), D.into(), 1],
+            )?,
+            q: TensorMut(view(
+                &q,
+                s,
+                [1, FullAttentionSpec::q38().hq, D],
+                [(FullAttentionSpec::q38().hq * D).into(), D.into(), 1],
+            )?),
+            gate: TensorMut(view(
+                &gate,
+                s,
+                [1, FullAttentionSpec::q38().hq, D],
+                [(FullAttentionSpec::q38().hq * D).into(), D.into(), 1],
+            )?),
             k_cache: TensorMut(view(
                 &k_cache,
                 s,
-                [HKV, fixture.capacity, D],
+                [FullAttentionSpec::q38().hkv, fixture.capacity, D],
                 [u64::from(fixture.capacity) * u64::from(D), D.into(), 1],
             )?),
             v_cache: TensorMut(view(
                 &v_cache,
                 s,
-                [HKV, fixture.capacity, D],
+                [FullAttentionSpec::q38().hkv, fixture.capacity, D],
                 [u64::from(fixture.capacity) * u64::from(D), D.into(), 1],
             )?),
-            core_out: TensorMut(view(&core, s, [1, HQ, D], [(HQ * D).into(), D.into(), 1])?),
+            core_out: TensorMut(view(
+                &core,
+                s,
+                [1, FullAttentionSpec::q38().hq, D],
+                [(FullAttentionSpec::q38().hq * D).into(), D.into(), 1],
+            )?),
             q_norm: view(&q_norm, s, [D], [1])?,
             k_norm: view(&k_norm, s, [D], [1])?,
             causal_mask: view(&mask, s, [VERIFY_CAUSAL_MASK_LEN as u32], [1])?,
@@ -1263,14 +1319,17 @@ fn verify_row_partials(
 ) -> Result<VerifyPartials> {
     let active = key_count.div_ceil(key_chunk).max(1);
     let segment_rows = run.workspace.segment_rows as usize;
-    let mut max = Vec::with_capacity(active as usize * HQ as usize);
-    let mut sum = Vec::with_capacity(active as usize * HQ as usize);
-    let mut out = Vec::with_capacity(active as usize * HQ as usize * D as usize);
-    for head in 0..HQ as usize {
-        let kv = head / GQA as usize;
-        let group = head % GQA as usize;
+    let mut max = Vec::with_capacity(active as usize * FullAttentionSpec::q38().hq as usize);
+    let mut sum = Vec::with_capacity(active as usize * FullAttentionSpec::q38().hq as usize);
+    let mut out =
+        Vec::with_capacity(active as usize * FullAttentionSpec::q38().hq as usize * D as usize);
+    for head in 0..FullAttentionSpec::q38().hq as usize {
+        let kv = head / (FullAttentionSpec::q38().hq / FullAttentionSpec::q38().hkv) as usize;
+        let group = head % (FullAttentionSpec::q38().hq / FullAttentionSpec::q38().hkv) as usize;
         for part in 0..active as usize {
-            let index = (kv * run.max_parts as usize + part) * (GQA as usize * segment_rows)
+            let index = (kv * run.max_parts as usize + part)
+                * ((FullAttentionSpec::q38().hq / FullAttentionSpec::q38().hkv) as usize
+                    * segment_rows)
                 + group * segment_rows
                 + row;
             max.push(verify_f32_at(
@@ -1395,7 +1454,7 @@ fn verify_attention_m4_serial_bits_gpu() -> Result<()> {
             let fixture = VerifyAttentionFixture::new(prefix, capacity, &mut rng);
             let batch = verify_run_batch(&device, &common, &fixture, rows)?;
             let serial = verify_run_serial(&device, &common, &fixture, rows)?;
-            let row_span = HQ as usize * D as usize;
+            let row_span = FullAttentionSpec::q38().hq as usize * D as usize;
             let cache_span = capacity as usize * D as usize;
             for row in 0..rows as usize {
                 let base = row * row_span;
@@ -1442,7 +1501,7 @@ fn verify_attention_m4_serial_bits_gpu() -> Result<()> {
                     )?,
                 );
 
-                for head in 0..HKV as usize {
+                for head in 0..FullAttentionSpec::q38().hkv as usize {
                     let cache_base = head * cache_span + (prefix as usize + row) * D as usize;
                     let batch_k = batch.k_cache[cache_base..cache_base + D as usize].to_vec();
                     let serial_k = serial.k_cache[cache_base..cache_base + D as usize].to_vec();

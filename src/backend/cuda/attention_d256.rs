@@ -13,12 +13,6 @@ use half::bf16;
 use std::mem::size_of;
 use std::sync::Arc;
 
-#[cfg(test)]
-pub(crate) const HQ: u32 = 24;
-#[cfg(test)]
-pub(crate) const HKV: u32 = 4;
-#[cfg(test)]
-pub(crate) const GQA: u32 = HQ / HKV;
 pub(crate) const D: u32 = 256;
 
 /// Narrow KT of the phase-1 kernel; `key_chunk` must be a positive multiple.
@@ -31,8 +25,6 @@ const PREP_THREADS: u32 = 256;
 /// `(MT + 2*KT) * (D + 8) * 2 + 64*8` from `kernels/tcmqa_d256.cu`.
 const PHASE1_SMEM: u32 = 68096;
 const MASK_LEN: u32 = 64;
-#[cfg(test)]
-const RMS_EPS: f32 = 1e-6;
 
 /// RoPE coordinate source: `Linear` = physical `prefix + row`; `Axes` = per-row (T, H, W) from a
 /// `[max_rows, 3]` i32 table. KV slot and causal key count stay physical; T = H = W matches `Linear` bitwise.
@@ -851,7 +843,7 @@ mod tests {
     fn norm(x: &[bf16], w: &[bf16]) -> Vec<f32> {
         let values: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
         let mean = values.iter().map(|v| v * v).sum::<f32>() / values.len() as f32;
-        let inv = 1.0 / (mean + RMS_EPS).sqrt();
+        let inv = 1.0 / (mean + FullAttentionSpec::q38().rms_eps).sqrt();
         values
             .iter()
             .zip(w)
@@ -873,7 +865,11 @@ mod tests {
 
     impl Reference {
         fn new(i: &Inputs<'_>) -> Self {
-            let (d, hq, hkv) = (D as usize, HQ as usize, HKV as usize);
+            let (d, hq, hkv) = (
+                D as usize,
+                FullAttentionSpec::q38().hq as usize,
+                FullAttentionSpec::q38().hkv as usize,
+            );
             let mut q = vec![0f32; i.valid_rows as usize * hq * d];
             for row in 0..i.valid_rows as usize {
                 for head in 0..hq {
@@ -918,13 +914,14 @@ mod tests {
         }
 
         fn core_out(&self) -> Vec<f32> {
-            let (d, hq) = (D as usize, HQ as usize);
+            let (d, hq) = (D as usize, FullAttentionSpec::q38().hq as usize);
             let span = self.capacity * d;
             let mut out = vec![0f32; self.valid_rows * hq * d];
             for row in 0..self.valid_rows {
                 let limit = self.prefix + row + 1;
                 for head in 0..hq {
-                    let kv = head / GQA as usize;
+                    let kv = head
+                        / (FullAttentionSpec::q38().hq / FullAttentionSpec::q38().hkv) as usize;
                     let q = &self.q[(row * hq + head) * d..][..d];
                     let mut scores = vec![0f32; limit];
                     for (pos, score) in scores.iter_mut().enumerate() {
@@ -1510,10 +1507,7 @@ mod tests {
         );
         println!("ATTENTION_GLOBAL_SPLIT_MUTANT PASS mismatches={mismatches}");
         println!("ATTENTION_GEOMETRY_SUMMARY cases={cases} defects={defects}");
-        ensure!(
-            defects == 0,
-            "ATTENTION_GEOMETRY DEFECT cases={defects}"
-        );
+        ensure!(defects == 0, "ATTENTION_GEOMETRY DEFECT cases={defects}");
         Ok(())
     }
 

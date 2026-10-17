@@ -209,11 +209,8 @@ impl GdnSpec {
                 .conv_kernel
                 .checked_sub(1)
                 .context("GDN history width underflow")?,
-            chunk: 32,
-            prefill_value_split: 1,
-            decode_value_split: 2,
             rms_eps: spec.rms_eps,
-            l2_eps: 1e-6,
+            ..Self::q38()
         };
         bound.validate()?;
         Ok(bound)
