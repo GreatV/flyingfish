@@ -1627,25 +1627,39 @@ impl Engine {
                     trace_value(trace, s, "debug.qkv", &w.qkv, trace_rows, c.qkv_dim())?;
                 }
             }
-            crate::backend::Operator::RopeKv => unsafe {
-                // Fused rotation + KV write over rows x heads x (head_dim/2) element pairs.
-                let kv = &mut self.state.kv[i];
-                s.launch_builder(&self.ops.rope_kv)
-                    .arg(&mut w.qkv)
-                    .arg(&mut kv.k)
-                    .arg(&mut kv.v)
-                    .arg(&w.position)
-                    .arg(&nr)
-                    .arg(&qh)
-                    .arg(&kh)
-                    .arg(&dim)
-                    .arg(&c.rope_theta)
-                    .arg(&cap)
-                    .launch(flat(
-                        rows * (c.num_attention_heads + 2 * c.num_key_value_heads)
-                            * (c.head_dim / 2),
-                    ))?;
-            },
+            crate::backend::Operator::RopeKv => {
+                super::ops::check_rope_kv(
+                    Shape {
+                        rows,
+                        start: self.position,
+                        q_heads: c.num_attention_heads,
+                        kv_heads: c.num_key_value_heads,
+                        capacity: self.capacity,
+                        head_dim: c.head_dim,
+                        causal: true,
+                    },
+                    c.rope_theta,
+                )?;
+                unsafe {
+                    // Fused rotation + KV write over rows x heads x (head_dim/2) element pairs.
+                    let kv = &mut self.state.kv[i];
+                    s.launch_builder(&self.ops.rope_kv)
+                        .arg(&mut w.qkv)
+                        .arg(&mut kv.k)
+                        .arg(&mut kv.v)
+                        .arg(&w.position)
+                        .arg(&nr)
+                        .arg(&qh)
+                        .arg(&kh)
+                        .arg(&dim)
+                        .arg(&c.rope_theta)
+                        .arg(&cap)
+                        .launch(flat(
+                            rows * (c.num_attention_heads + 2 * c.num_key_value_heads)
+                                * (c.head_dim / 2),
+                        ))?;
+                }
+            }
             crate::backend::Operator::Attention => {
                 self.run_attention(i, step)?;
             }

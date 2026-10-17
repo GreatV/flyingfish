@@ -4,16 +4,17 @@ use crate::backend::cuda::weights::{ExpertStorage, Layer};
 use crate::experts::plan::Capacity;
 use std::collections::BTreeSet;
 
-fn layer_coverage(hidden: usize) -> (usize, BTreeSet<(usize, usize)>) {
-    (8, BTreeSet::from([(3 * hidden, hidden), (hidden, hidden)]))
+fn layer_coverage(hidden: usize, qkv: usize) -> (usize, BTreeSet<(usize, usize)>) {
+    (8, BTreeSet::from([(qkv, hidden), (hidden, hidden)]))
 }
 
 fn check_layer_coverage(
     coverage: Option<&(usize, BTreeSet<(usize, usize)>)>,
     hidden: usize,
+    qkv: usize,
 ) -> Result<()> {
     for rows in 1..=8 {
-        for output in [3 * hidden, hidden] {
+        for output in [qkv, hidden] {
             super::super::super::blas::check_coverage(
                 crate::backend::setup::LinearShape {
                     rows,
@@ -31,16 +32,16 @@ impl Engine {
     pub(crate) fn load_moe_test(fixture: &MoeFixture, runtime: &Path) -> Result<Self> {
         let d = fixture.dims;
         ensure!(
-            d.hidden == 128 && d.inter == 64 && d.experts == 16 && d.top_k == 4,
-            "small MoE hook expects H128/I64/E16/K4, received {d:?}"
+            [128, 2048].contains(&d.hidden) && d.inter == 64 && d.experts == 16 && d.top_k == 4,
+            "MoE hook expects H128 or H2048 / I64/E16/K4, received {d:?}"
         );
         let config = Config {
             model_type: "llama".into(),
             hidden_size: d.hidden,
             intermediate_size: d.inter,
             num_hidden_layers: 1,
-            num_attention_heads: 1,
-            num_key_value_heads: 1,
+            num_attention_heads: d.hidden / 128,
+            num_key_value_heads: if d.hidden == 2048 { 2 } else { 1 },
             head_dim: 128,
             vocab_size: 32,
             max_position_embeddings: 32,
@@ -62,8 +63,8 @@ impl Engine {
             shared_intermediate: 64,
         });
         let geometry = ExpertGeometry::from_model(&model_spec)?;
-        let coverage = layer_coverage(config.hidden_size);
-        check_layer_coverage(Some(&coverage), config.hidden_size)?;
+        let coverage = layer_coverage(config.hidden_size, config.qkv_dim());
+        check_layer_coverage(Some(&coverage), config.hidden_size, config.qkv_dim())?;
         let device = Device::new(0)?;
         let stream = &device.stream;
         let bytes = geometry.slot_bytes()?;
@@ -81,6 +82,7 @@ impl Engine {
             prefill_staging_slots: 0,
         };
         let storage = ExpertStorage::new(stream, &device.upload, geometry, &capacity)?;
+        stream.synchronize()?;
         let mut gu = Vec::new();
         let mut dn = Vec::new();
         let gu_len = 2 * d.inter * d.hidden;
@@ -144,7 +146,7 @@ impl Engine {
             bytes: 0,
             layers: vec![Layer {
                 input_norm: stream.clone_htod(&vec![bf16::ONE; d.hidden])?,
-                qkv: stream.alloc_zeros(3 * d.hidden * d.hidden)?,
+                qkv: stream.alloc_zeros(config.qkv_dim() * d.hidden)?,
                 o: stream.alloc_zeros(d.hidden * d.hidden)?,
                 post_norm: stream.clone_htod(&vec![bf16::ONE; d.hidden])?,
                 gu: stream.alloc_zeros(2 * d.inter * d.hidden)?,
@@ -161,7 +163,26 @@ impl Engine {
         let state = super::super::super::state::StateStore::new(&model_spec, 32, stream)?;
         let mut work = Work::new(stream, &model_spec, 8)?;
         stream.memcpy_htod(&[1i32], &mut work.length)?;
-        let flash = Some(Flash::new(stream.clone(), 8, 1)?);
+        let flash = Some(Flash::new(stream.clone(), 8, config.num_attention_heads)?);
+        if d.hidden == 2048 {
+            for rows in 1..=8 {
+                let x = work.n.slice(..rows * d.hidden);
+                for (weight, output) in [
+                    (&weights.layers[0].qkv, config.qkv_dim()),
+                    (&weights.layers[0].o, d.hidden),
+                ] {
+                    blas.calibrate_shape(
+                        weight,
+                        &x,
+                        crate::backend::setup::LinearShape {
+                            rows,
+                            output,
+                            input: d.hidden,
+                        },
+                    )?;
+                }
+            }
+        }
         let moe = Some(Decode::new(&device, geometry, 8, 2)?);
         Ok(Self {
             capture_fail_after_layer: None,
@@ -649,6 +670,20 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
     for &variant in variants {
         let fixture = fixture(MoeDims::new(8, 16, 4, 128, 64), variant);
         let mut engine = Engine::load_moe_test(&fixture, runtime)?;
+        let axes = [0, 1];
+        let rejected = engine
+            .run_layer_from_reference(0, &fixture.x[..256], [&axes; 3], &mut Trace::default())
+            .expect_err("unsupported RoPE geometry reached a launch");
+        ensure!(
+            rejected
+                .to_string()
+                .contains("q_heads=1 kv_heads=1 head_dim=128"),
+            "Runner FAIL unsupported RoPE guard returned another error: {rejected:#}"
+        );
+        engine.device.stream.synchronize()?;
+        println!(
+            "PASS eager_moe_rope_rejection q_heads=1 kv_heads=1 head_dim=128 rejected_before_launch=true context_usable=true"
+        );
         for &rows in row_cases {
             let input = &fixture.x[..rows * 128];
             let reference = direct(&engine, input, rows)?;
@@ -707,9 +742,15 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
         }
         let axes = [0, 1];
         let mut trace = Trace::default();
-        engine.run_layer_from_reference(0, &fixture.x[..256], [&axes; 3], &mut trace)?;
+        drop(engine);
+        let layer_fixture = crate::backend::cuda::moe::reference::fixture(
+            MoeDims::new(2, 16, 4, 2048, 64),
+            variant,
+        );
+        let mut layer_engine = Engine::load_moe_test(&layer_fixture, runtime)?;
+        layer_engine.run_layer_from_reference(0, &layer_fixture.x, [&axes; 3], &mut trace)?;
         ensure!(
-            trace.values("layer.ffn")?.len() == 256,
+            trace.values("layer.ffn")?.len() == 4096,
             "layer injection did not execute FFN"
         );
     }
@@ -803,17 +844,60 @@ fn dispatch_covers_original_choices_once_after_row_compaction() -> Result<()> {
 
 #[test]
 fn injected_layer_uses_declared_linear_coverage() -> Result<()> {
-    let coverage = layer_coverage(128);
-    check_layer_coverage(Some(&coverage), 128)?;
-    assert!(check_layer_coverage(None, 128).is_err());
+    let coverage = layer_coverage(128, 384);
+    check_layer_coverage(Some(&coverage), 128, 384)?;
+    check_layer_coverage(Some(&layer_coverage(2048, 2560)), 2048, 2560)?;
+    assert!(check_layer_coverage(None, 128, 384).is_err());
     let mut without_qkv = coverage.clone();
     without_qkv.1.remove(&(384, 128));
-    assert!(check_layer_coverage(Some(&without_qkv), 128).is_err());
+    assert!(check_layer_coverage(Some(&without_qkv), 128, 384).is_err());
     let mut too_few_rows = coverage;
     too_few_rows.0 = 1;
-    assert!(check_layer_coverage(Some(&too_few_rows), 128).is_err());
+    assert!(check_layer_coverage(Some(&too_few_rows), 128, 384).is_err());
     println!(
         "PASS eager_moe_layer_coverage rows=1..8 qkv=[384,128] output=[128,128] undeclared_rejected=true missing_qkv_rejected=true row_bound_rejected=true"
+    );
+    Ok(())
+}
+
+#[test]
+fn injected_layer_checks_rope_preconditions_before_launch() -> Result<()> {
+    use crate::backend::cuda::flash::Shape;
+
+    let shape = Shape {
+        rows: 2,
+        start: 0,
+        q_heads: 16,
+        kv_heads: 2,
+        capacity: 32,
+        head_dim: 128,
+        causal: true,
+    };
+    super::super::super::ops::check_rope_kv(shape, 10000.0)?;
+    for invalid in [
+        Shape {
+            q_heads: 1,
+            kv_heads: 1,
+            ..shape
+        },
+        Shape {
+            head_dim: 256,
+            ..shape
+        },
+        Shape { rows: 0, ..shape },
+        Shape { start: 31, ..shape },
+        Shape {
+            capacity: 0,
+            ..shape
+        },
+    ] {
+        assert!(super::super::super::ops::check_rope_kv(invalid, 10000.0).is_err());
+    }
+    for theta in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        assert!(super::super::super::ops::check_rope_kv(shape, theta).is_err());
+    }
+    println!(
+        "PASS eager_moe_rope_preflight q_heads=16 kv_heads=2 head_dim=128 unsupported_heads_rejected=true dimension_rejected=true theta_rejected=true extent_rejected=true"
     );
     Ok(())
 }
