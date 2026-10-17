@@ -201,6 +201,14 @@ struct PrefetchEntry {
     demand: bool,
 }
 
+/// A retired prefetch; a loaded entry's ring slot is returned for the caller to release after its
+/// copy event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retired {
+    Queued,
+    Loaded(u32),
+}
+
 /// Bounded layer-ahead disk prefetch over the ring; demand entries take priority.
 pub struct Prefetch {
     depth: u32,
@@ -284,10 +292,19 @@ impl Prefetch {
         Ok(queued)
     }
 
-    /// Queues one read. A demand request never fails queue-full: it evicts the oldest waiting
-    /// entry, never the entry being read, and waits for the oldest completion when only in-flight
-    /// or taken slots remain. Returns the ring slot of an evicted loaded entry for `discard`.
-    pub fn request(&mut self, layer: u32, expert: u32, demand: bool) -> Result<Option<u32>> {
+    /// Queues one disk read. A demand request waits when no non-demand entry can be retired and
+    /// never evicts a demand; a prefetch of a host-tier expert is rejected.
+    pub fn request(
+        &mut self,
+        layer: u32,
+        expert: u32,
+        demand: bool,
+        host: bool,
+    ) -> Result<Option<u32>> {
+        ensure!(
+            !(host && !demand),
+            "host-tier expert {expert} of layer {layer} is not a disk prefetch"
+        );
         self.push(layer, expert, demand)
     }
 
@@ -298,10 +315,12 @@ impl Prefetch {
         let mut evicted_slot = None;
         if self.entries() >= self.depth {
             ensure!(demand, "prefetch queue full at depth {}", self.depth);
-            if !self.queued.is_empty() {
-                self.queued.remove(0);
-            } else if !self.loaded.is_empty() {
-                evicted_slot = Some(self.loaded.remove(0).1);
+            if let Some(index) = self.queued.iter().position(|entry| !entry.demand) {
+                self.queued.remove(index);
+            } else if let Some(index) = self.loaded.iter().position(|(entry, _)| !entry.demand) {
+                evicted_slot = Some(self.loaded.remove(index).1);
+            } else {
+                return Ok(None);
             }
         }
         let entry = PrefetchEntry {
@@ -317,9 +336,14 @@ impl Prefetch {
         Ok(evicted_slot)
     }
 
-    /// Starts the oldest request; it stays in flight until `complete` and is never evicted.
+    /// Starts the oldest request when a ring slot is free; it stays in flight until `complete`
+    /// and is never evicted.
     pub fn begin_read(&mut self) -> Option<(u32, u32)> {
         if self.in_flight.is_some() {
+            return None;
+        }
+        let in_use = self.loaded.len() + self.taken.len();
+        if in_use >= self.depth as usize {
             return None;
         }
         let entry = self.queued.first().copied()?;
@@ -340,13 +364,22 @@ impl Prefetch {
         Ok(())
     }
 
-    /// Drops a queued request that became resident elsewhere.
-    pub fn cancel(&mut self, layer: u32, expert: u32) -> bool {
-        self.queued
+    /// Retires a queued or loaded request; a loaded entry's ring slot is returned so the caller
+    /// can release it after its copy event. A read in flight completes first.
+    pub fn cancel(&mut self, layer: u32, expert: u32) -> Option<Retired> {
+        if let Some(index) = self
+            .queued
             .iter()
             .position(|entry| entry.layer == layer && entry.expert == expert)
-            .map(|index| self.queued.remove(index))
-            .is_some()
+        {
+            self.queued.remove(index);
+            return Some(Retired::Queued);
+        }
+        let index = self
+            .loaded
+            .iter()
+            .position(|(entry, _)| entry.layer == layer && entry.expert == expert)?;
+        Some(Retired::Loaded(self.loaded.remove(index).1))
     }
 
     /// Takes a loaded request's ring slot; the slot keeps counting toward the depth until
@@ -538,44 +571,82 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_demands_wait_and_never_evict_the_read() -> Result<()> {
+    fn prefetch_demands_never_evict_a_demand() -> Result<()> {
         assert!(Prefetch::new(0, 2).is_err());
         assert!(Prefetch::new(3, 2).is_err());
-        let mut prefetch = Prefetch::new(2, 2)?;
-        prefetch.request(0, 0, false)?;
-        prefetch.request(0, 1, true)?;
+        let mut prefetch = Prefetch::new(1, 2)?;
+        prefetch.request(0, 1, true, false)?;
         assert_eq!(
-            prefetch.begin_read(),
-            Some((0, 1)),
-            "the demand reads first"
+            prefetch.request(0, 2, true, false)?,
+            None,
+            "a demand waits instead of evicting a demand"
         );
-        assert_eq!(prefetch.begin_read(), None, "one read at a time");
-        prefetch.request(0, 2, true)?;
+        assert_eq!(prefetch.entries(), 1);
+        assert_eq!(prefetch.begin_read(), Some((0, 1)));
         prefetch.complete(0, 1, 5)?;
-        assert_eq!(prefetch.begin_read(), Some((0, 2)));
-        prefetch.complete(0, 2, 7)?;
+        let error = prefetch.request(0, 3, false, true).unwrap_err().to_string();
+        assert!(error.contains("not a disk prefetch"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn prefetch_read_waits_for_a_free_ring_slot() -> Result<()> {
+        let mut prefetch = Prefetch::new(2, 2)?;
+        prefetch.request(0, 0, false, false)?;
+        prefetch.request(0, 1, false, false)?;
+        assert_eq!(prefetch.begin_read(), Some((0, 0)));
+        prefetch.complete(0, 0, 5)?;
+        assert_eq!(prefetch.begin_read(), Some((0, 1)));
+        prefetch.complete(0, 1, 7)?;
+        assert_eq!(prefetch.take(0, 0), Some(5));
+        assert_eq!(prefetch.take(0, 1), Some(7));
+        assert_eq!(
+            prefetch.request(0, 2, true, false)?,
+            None,
+            "the demand waits while both ring slots are taken"
+        );
+        assert_eq!(prefetch.begin_read(), None, "no ring slot is free");
+        assert!(prefetch.release(5));
+        prefetch.request(0, 2, true, false)?;
         assert_eq!(prefetch.entries(), 2);
-        let mut all_demand = Prefetch::new(1, 2)?;
-        all_demand.request(0, 1, true)?;
-        all_demand.request(0, 2, true)?;
-        assert_eq!(all_demand.begin_read(), Some((0, 2)));
+        assert_eq!(prefetch.begin_read(), Some((0, 2)));
+        prefetch.complete(0, 2, 5)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prefetch_cancel_retires_loaded_entries() -> Result<()> {
+        let mut prefetch = Prefetch::new(1, 2)?;
+        prefetch.request(0, 0, false, false)?;
+        assert_eq!(prefetch.begin_read(), Some((0, 0)));
+        prefetch.complete(0, 0, 5)?;
+        assert_eq!(prefetch.entries(), 1);
+        assert_eq!(prefetch.cancel(0, 0), Some(Retired::Loaded(5)));
+        assert_eq!(prefetch.entries(), 0);
+        assert_eq!(prefetch.cancel(0, 0), None);
+        prefetch.request(0, 1, false, false)?;
+        assert_eq!(prefetch.cancel(0, 1), Some(Retired::Queued));
+        assert_eq!(prefetch.entries(), 0);
         Ok(())
     }
 
     #[test]
     fn prefetch_taken_slots_count_toward_the_depth() -> Result<()> {
         let mut prefetch = Prefetch::new(1, 2)?;
-        prefetch.request(0, 0, false)?;
+        prefetch.request(0, 0, false, false)?;
         assert_eq!(prefetch.begin_read(), Some((0, 0)));
         prefetch.complete(0, 0, 5)?;
         assert_eq!(prefetch.take(0, 0), Some(5));
         assert_eq!(prefetch.take(0, 0), None);
         assert_eq!(prefetch.entries(), 1);
-        let error = prefetch.request(0, 1, false).unwrap_err().to_string();
+        let error = prefetch
+            .request(0, 1, false, false)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("prefetch queue full at depth 1"), "{error}");
         assert!(prefetch.release(5));
         assert!(!prefetch.release(5));
-        prefetch.request(0, 1, false)?;
+        prefetch.request(0, 1, false, false)?;
         assert_eq!(prefetch.entries(), 1);
         Ok(())
     }

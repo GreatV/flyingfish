@@ -24,7 +24,8 @@ pub struct LoadInputs<'a> {
     pub max_rows: u32,
     /// Initial GPU set from the planner's static prefill residency.
     pub initial: &'a [Vec<u32>],
-    pub host: &'a Arc<HostBlocks>,
+    /// Host block arena; required exactly when the plan allocates host blocks.
+    pub host: Option<&'a Arc<HostBlocks>>,
     pub catalogue: &'a ExpertCatalogue,
     pub reader: &'a DiskReader,
 }
@@ -275,18 +276,23 @@ impl Residency {
             .host_blocks
             .checked_add(capacity.spare_blocks)
             .context("host block count overflow")?;
-        ensure!(host_blocks > 0, "zero host blocks");
         ensure!(
-            host.blocks() == host_blocks,
-            "host arena holds {} blocks, plan allocates {host_blocks}",
-            host.blocks()
+            (host_blocks > 0) == host.is_some(),
+            "host arena presence differs from the plan's {host_blocks} blocks"
         );
-        ensure!(
-            host.block_elements() == usize::try_from(slot_bytes / 2)?,
-            "host block holds {} elements, a slot holds {}",
-            host.block_elements(),
-            slot_bytes / 2
-        );
+        if let Some(arena) = host {
+            ensure!(
+                arena.blocks() == host_blocks,
+                "host arena holds {} blocks, plan allocates {host_blocks}",
+                arena.blocks()
+            );
+            ensure!(
+                arena.block_elements() == usize::try_from(slot_bytes / 2)?,
+                "host block holds {} elements, a slot holds {}",
+                arena.block_elements(),
+                slot_bytes / 2
+            );
+        }
         let mut positions = 0u32;
         for &count in &capacity.slots_per_layer {
             positions = positions
@@ -310,9 +316,10 @@ impl Residency {
         let mut host_bytes = 0u64;
         for (index, &(layer, expert)) in order.iter().enumerate() {
             let block = u32::try_from(index).context("host block id exceeds u32")?;
+            let arena = host.context("host arena missing for the host fill")?;
             let slot = reader.read_expert(layer, expert, catalogue)?;
             let values = reader.values(slot)?;
-            let mut claim = host.claim(block)?;
+            let mut claim = arena.claim(block)?;
             claim.slice()?.copy_from_slice(&values);
             drop(claim);
             drop(values);
@@ -1153,7 +1160,7 @@ mod tests {
             admission,
             max_rows: 8,
             initial: &initial,
-            host: &host,
+            host: Some(&host),
             catalogue: &catalogue,
             reader: &reader,
         })?;
@@ -1638,6 +1645,61 @@ mod tests {
     }
 
     #[test]
+    fn zero_cap_all_resident_loads_without_a_host_tier() -> Result<()> {
+        let geometry = geometry();
+        let reserves = reserves();
+        let service = service();
+        let slot = geometry.slot_bytes()?;
+        let routed = u64::from(geometry.layers)
+            .checked_mul(u64::from(geometry.experts))
+            .context("routed count overflow")?;
+        let inputs = PlanInputs {
+            geometry,
+            device_free_bytes: reserves.persistent_bytes(&geometry)?
+                + routed.checked_mul(slot).context("device extent overflow")?,
+            host_available_bytes: reserves.host_bytes(&geometry)? + 2 * slot,
+            h2d_bytes_per_second: 1e9,
+            d2h_bytes_per_second: 1e9,
+            copy_engines: 2,
+            disk_readers: 1,
+            host_registration_bytes: u64::MAX,
+            service: &service,
+            reserves: &reserves,
+            span_rows: 4,
+            wave_rows: 2,
+        };
+        let capacity = capacity(&inputs, 0)?;
+        assert_eq!(capacity.slots_per_layer, vec![8, 8]);
+        assert_eq!(capacity.host_blocks, 0);
+        assert_eq!(capacity.spare_blocks, 0, "no host tier, no reserve");
+        let admission = Admission {
+            budget_bytes_per_token: 0,
+        };
+        let (dir, catalogue) = staged(geometry)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let frequency = vec![vec![1.0; 8]; 2];
+        let initial = initial_residency(&frequency, &capacity.slots_per_layer, &geometry)?;
+        let (mut residency, _report) = Residency::load(LoadInputs {
+            geometry,
+            capacity,
+            admission,
+            max_rows: 8,
+            initial: &initial,
+            host: None,
+            catalogue: &catalogue,
+            reader: &reader,
+        })?;
+        for layer in 0..2u32 {
+            for expert in 0..8u32 {
+                assert_eq!(residency.ledger().tier(layer, expert)?, Tier::Gpu);
+            }
+        }
+        assert_eq!(residency.free_host_blocks(), 0);
+        assert!(residency.begin_request(&frequency)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn reserve_floor_covers_zero_cap_host_swaps() -> Result<()> {
         let geometry = geometry();
         let reserves = reserves();
@@ -1673,7 +1735,7 @@ mod tests {
             admission,
             max_rows: 8,
             initial: &initial,
-            host: &host,
+            host: Some(&host),
             catalogue: &catalogue,
             reader: &reader,
         })?;

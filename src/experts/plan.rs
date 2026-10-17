@@ -464,15 +464,21 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
     );
     let slots_per_layer = equal_slots(total_slots, geometry.layers)?;
     let host_block_slots = host_expert_bytes / slot_bytes;
-    let mut reserve = admission_cap;
-    if host_block_slots > u64::from(reserve) {
-        reserve = reserve.max(1);
-    }
     ensure!(
-        host_block_slots >= u64::from(reserve),
-        "host blocks {host_block_slots} cannot hold {reserve} reserve blocks"
+        host_block_slots >= u64::from(admission_cap),
+        "host blocks {host_block_slots} cannot hold {admission_cap} reserve blocks"
     );
-    let host_blocks = (host_block_slots - u64::from(reserve)).min(routed_slots - total_slots);
+    let non_gpu = routed_slots - total_slots;
+    let mut reserve = admission_cap;
+    let mut host_blocks = (host_block_slots - u64::from(reserve)).min(non_gpu);
+    if host_blocks > 0 && reserve == 0 {
+        if host_block_slots > 1 {
+            reserve = 1;
+            host_blocks = (host_block_slots - 1).min(non_gpu);
+        } else {
+            host_blocks = 0;
+        }
+    }
     let host_blocks = u32::try_from(host_blocks).context("host block count exceeds u32")?;
     let unique_slots = total_slots
         .checked_add(u64::from(host_blocks))
