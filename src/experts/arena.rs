@@ -9,10 +9,9 @@ use std::sync::{Arc, Mutex};
 const WRITER: u32 = u32::MAX;
 
 /// Fixed-size host expert blocks. A block is written only under an exclusive writer claim, after
-/// the caller has ordered the write behind that block's device copy event. References are formed
-/// per block from the raw base pointer; the backing box is never viewed as a whole after `new`.
+/// the caller has ordered the write behind that block's device copy event. The allocation is owned
+/// as a raw pointer; references are formed per block only.
 pub struct HostBlocks {
-    _data: Box<[bf16]>,
     base: *mut bf16,
     elements: usize,
     block_elements: usize,
@@ -24,6 +23,15 @@ pub struct HostBlocks {
 // the base pointer is allocated once for the arena lifetime.
 unsafe impl Send for HostBlocks {}
 unsafe impl Sync for HostBlocks {}
+
+impl Drop for HostBlocks {
+    fn drop(&mut self) {
+        // SAFETY: the allocation came from Box::into_raw in `new` and is freed exactly once.
+        drop(unsafe {
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.base, self.elements))
+        });
+    }
+}
 
 /// Read lease over a set of host blocks; releasing it lets the owner claim those blocks.
 pub struct BlockLease {
@@ -93,10 +101,9 @@ impl HostBlocks {
         let elements = usize::try_from(blocks)?
             .checked_mul(block_elements)
             .context("host arena extent overflow")?;
-        let mut data = vec![bf16::ZERO; elements].into_boxed_slice();
-        let base = data.as_mut_ptr();
+        let data: Box<[bf16]> = vec![bf16::ZERO; elements].into_boxed_slice();
+        let base = Box::into_raw(data) as *mut bf16;
         Ok(Arc::new(Self {
-            _data: data,
             base,
             elements,
             block_elements,
@@ -115,6 +122,14 @@ impl HostBlocks {
 
     pub fn elements(&self) -> usize {
         self.elements
+    }
+
+    /// Base host address and byte length for the setup-time page-lock registration.
+    pub fn host_span(&self) -> (u64, usize) {
+        (
+            self.base as u64,
+            self.elements * std::mem::size_of::<bf16>(),
+        )
     }
 
     pub fn block_range(&self, block: u32) -> Result<Range<usize>> {
