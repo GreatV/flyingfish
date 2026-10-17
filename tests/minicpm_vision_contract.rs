@@ -61,7 +61,8 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
         Processor::load(&model, Some(&tokenizer))?.context("MiniCPM image processor")?;
     let mut worst_pixels = 0.0_f32;
     for case in CASES {
-        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let path = fixtures.join(format!("{case}.safetensors"));
+        let bytes = std::fs::read(&path).with_context(|| format!("open {}", path.display()))?;
         let tensors = SafeTensors::deserialize(&bytes)?;
         let count = usize::try_from(
             tensor_values(&tensors, "image_count", Dtype::I64, i64::from_le_bytes)?[0],
@@ -404,12 +405,12 @@ fn checkpoint_bf16(model_dir: &std::path::Path, name: &str) -> Result<(Vec<usize
 /// position add reproduces the T0 hockey tap, while a ky/kx-transposed gather must fail.
 /// Measured on CPU (torch): correct 0.0625, transposed 6.4375 max_abs; the tolerance sits between.
 #[test]
-#[ignore = "CPU-only external fixtures; set FF_MODEL and FF_MINICPM_FIXTURE_DIR; run with --release"]
+#[ignore = "CPU-only external fixtures; set FF_MODEL and FF_MINICPM_REFERENCE_DIR; run with --release"]
 fn patch_rows_reorder_matches_the_reference() -> Result<()> {
     use flyingfish::vision_input::{ImageGrid, nearest_position_ids};
     let model_dir = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
-    let fixtures = PathBuf::from(
-        std::env::var_os("FF_MINICPM_FIXTURE_DIR").context("FF_MINICPM_FIXTURE_DIR missing")?,
+    let reference_dir = PathBuf::from(
+        std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("FF_MINICPM_REFERENCE_DIR missing")?,
     );
     let spec = ModelSpec::read(&model_dir)?;
     let vision = spec
@@ -420,7 +421,8 @@ fn patch_rows_reorder_matches_the_reference() -> Result<()> {
     let side = vision.patch as usize;
     let width = channels * side * side;
     let hidden = vision.hidden as usize;
-    let file = std::fs::File::open(fixtures.join("image_hockey_16x.safetensors"))?;
+    let path = reference_dir.join("image_hockey_16x.safetensors");
+    let file = std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
     let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
     let source = SafeTensors::deserialize(&map)?;
     let sizes = tensor_values(&source, "target_sizes", Dtype::I32, i32::from_le_bytes)?;
@@ -551,19 +553,20 @@ fn matmul_f32(
 /// `merge_groups` map must reproduce the T0 merger output from the fixture tower output, while
 /// contiguous four-row chunks must fail.
 #[test]
-#[ignore = "CPU-only external fixtures; set FF_MODEL and FF_MINICPM_FIXTURE_DIR; run with --release"]
+#[ignore = "CPU-only external fixtures; set FF_MODEL and FF_MINICPM_REFERENCE_DIR; run with --release"]
 fn final_merger_groups_match_the_reference() -> Result<()> {
     use flyingfish::vision_input::merge_groups;
     let model_dir = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
-    let fixtures = PathBuf::from(
-        std::env::var_os("FF_MINICPM_FIXTURE_DIR").context("FF_MINICPM_FIXTURE_DIR missing")?,
+    let reference_dir = PathBuf::from(
+        std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("FF_MINICPM_REFERENCE_DIR missing")?,
     );
     let spec = ModelSpec::read(&model_dir)?;
     let vision = spec
         .vision
         .as_ref()
         .context("vision configuration missing")?;
-    let file = std::fs::File::open(fixtures.join("image_hockey_16x.safetensors"))?;
+    let path = reference_dir.join("image_hockey_16x.safetensors");
+    let file = std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
     let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
     let source = SafeTensors::deserialize(&map)?;
     let sizes = tensor_values(&source, "target_sizes", Dtype::I32, i32::from_le_bytes)?;

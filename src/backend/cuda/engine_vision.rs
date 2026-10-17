@@ -2671,7 +2671,7 @@ mod tests {
 
     /// Gate of the MiniCPM tower against the T0 fixtures.
     #[test]
-    #[ignore = "requires FF_MINICPM_VISION_WINDOW=granted, FF_MODEL, FF_MINICPM_FIXTURE_DIR, \
+    #[ignore = "requires FF_MINICPM_VISION_WINDOW=granted, FF_MODEL, FF_MINICPM_REFERENCE_DIR, \
                 FF_MINICPM_VISION_OUTPUT_DIR, FF_MINICPM_TOLERANCES and FF_MINICPM_VISION_REFERENCE"]
     fn minicpm_vision_tower_gpu() -> Result<()> {
         use crate::backend::cuda::{closure::Closure, ops::Ops};
@@ -2682,8 +2682,9 @@ mod tests {
         );
         let model_dir =
             PathBuf::from(std::env::var_os("FF_MODEL").context("model directory missing")?);
-        let fixtures = PathBuf::from(
-            std::env::var_os("FF_MINICPM_FIXTURE_DIR").context("fixture directory missing")?,
+        let fixture_reference = PathBuf::from(
+            std::env::var_os("FF_MINICPM_REFERENCE_DIR")
+                .context("reference fixture directory missing")?,
         );
         let output = PathBuf::from(
             std::env::var_os("FF_MINICPM_VISION_OUTPUT_DIR")
@@ -2738,7 +2739,9 @@ mod tests {
             .as_ref()
             .context("vision configuration missing")?;
         for case in ["image_hockey_16x", "image_boat_16x"] {
-            let file = std::fs::File::open(fixtures.join(format!("{case}.safetensors")))?;
+            let path = fixture_reference.join(format!("{case}.safetensors"));
+            let file =
+                std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
             let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
             let source = safetensors::SafeTensors::deserialize(&map)?;
             let sizes = tensor_values(
@@ -2805,8 +2808,9 @@ mod tests {
                 "merger output extent"
             );
             trace.save(&output.join(format!("{case}-tower.safetensors")))?;
-            let ref_file =
-                std::fs::File::open(reference_dir.join(format!("ref-{case}.safetensors")))?;
+            let ref_path = reference_dir.join(format!("ref-{case}.safetensors"));
+            let ref_file = std::fs::File::open(&ref_path)
+                .with_context(|| format!("open {}", ref_path.display()))?;
             let ref_map = unsafe { memmap2::MmapOptions::new().map(&ref_file)? };
             let reference = safetensors::SafeTensors::deserialize(&ref_map)?;
             let insert_tap = format!(
