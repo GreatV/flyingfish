@@ -635,6 +635,39 @@ impl Engine {
         chunk: Option<usize>,
         settings: Settings,
     ) -> Result<()> {
+        let spec = crate::model_spec::ModelSpec::read(dir)?;
+        if spec.moe.is_some() {
+            let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&spec)?;
+            let runtime = super::calibrate::runtime_dir(
+                settings
+                    .runtime_dir
+                    .as_deref()
+                    .context("expert calibration requires a runtime directory")?,
+                dir,
+                true,
+            )?;
+            let closure = super::closure::Closure::new(
+                true,
+                format!(
+                    "{:?} --model {dir:?} --device {ordinal} --runtime-dir {runtime:?} calibrate",
+                    std::env::current_exe()?,
+                ),
+            );
+            let device = Device::new(ordinal)?;
+            let measured = super::calibrate::load_experts(&device, &runtime, geometry, &closure)?;
+            let budget = crate::experts::plan::admission_budget(
+                &geometry,
+                &measured.service,
+                measured.h2d_bytes_per_second,
+                measured.d2h_bytes_per_second,
+                measured.copy_engines,
+            )?;
+            eprintln!(
+                "{}",
+                serde_json::json!({"expert_setup_calibrated":{"budget_bytes_per_token":budget,"hard_step_cap":crate::experts::plan::Admission { budget_bytes_per_token: budget }.hard_cap(geometry.slot_bytes()?)}})
+            );
+            return Ok(());
+        }
         Self::load_kind(dir, ordinal, capacity, chunk, settings, true)?;
         Ok(())
     }

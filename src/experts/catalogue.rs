@@ -20,7 +20,7 @@ pub struct ExpertRange {
 }
 
 /// Routed-expert geometry of the text tower.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExpertGeometry {
     pub layers: u32,
     pub experts: u32,

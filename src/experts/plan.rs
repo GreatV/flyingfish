@@ -14,7 +14,7 @@ pub const F_SEED_SCALE: f64 = 12.0;
 pub const FREQUENCY_SUM: f64 = 8.0;
 
 /// One measured CPU expert-service cell.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ServiceCell {
     pub workers: u32,
     pub rows: u32,

@@ -423,7 +423,7 @@ mod x86 {
 #[cfg(target_arch = "x86_64")]
 use x86::{AVX2 as AVX2_ARM, AVX512 as AVX512_ARM};
 
-/// A fixed worker pool over an immutable arena of native expert slices.
+/// A fixed worker pool over native expert slices with per-job block read leases.
 pub struct ExpertPool {
     shape: Shape,
     workers: usize,
@@ -983,6 +983,112 @@ fn phases(
             .store(local.block[offset].to_bits(), Ordering::Relaxed);
     }
     Ok(())
+}
+
+pub fn measure_service_table(
+    shape: Shape,
+    ring_experts: u32,
+    workers: &[u32],
+    rows: &[u32],
+    missed: &[u32],
+) -> Result<Vec<crate::experts::plan::ServiceCell>> {
+    Shape::new(shape.hidden, shape.intermediate)?;
+    let rows_max = *rows.iter().max().context("empty service row lattice")? as usize;
+    let missed_max = *missed.iter().max().context("empty service miss lattice")? as usize;
+    ensure!(
+        !workers.is_empty()
+            && workers.iter().all(|&n| n > 0 && n <= 256)
+            && rows.iter().all(|&n| n > 0)
+            && missed.iter().all(|&n| n > 0),
+        "invalid expert service lattice: workers={workers:?} rows={rows:?} missed={missed:?}"
+    );
+    ensure!(
+        ring_experts as usize >= missed_max,
+        "expert service ring {ring_experts} cannot hold {missed_max} misses"
+    );
+    let per = shape
+        .hidden
+        .checked_mul(shape.intermediate)
+        .and_then(|n| n.checked_mul(3))
+        .context("service expert extent overflow")?;
+    let max_assignments = rows_max
+        .checked_mul(missed_max)
+        .context("service assignment extent overflow")?;
+    ensure!(
+        max_assignments <= 1 << 16,
+        "service assignments {max_assignments} exceed pool capacity {}",
+        1 << 16
+    );
+    let arena = HostBlocks::new(ring_experts, per)?;
+    let mut values = vec![bf16::ZERO; per];
+    for (index, slot) in values.iter_mut().enumerate() {
+        *slot = bf16::from_f32((((index % 251) as f32) - 125.0) / 128.0);
+    }
+    for expert in 0..ring_experts {
+        arena.claim(expert)?.slice()?.copy_from_slice(&values);
+    }
+    let hidden: Vec<bf16> = (0..rows_max * shape.hidden)
+        .map(|k| bf16::from_f32(((k as f64 * 0.6180339887498949 + 0.9).sin() * 0.75) as f32))
+        .collect();
+    let mut cells = Vec::new();
+    let mut cursor = 0usize;
+    for &workers in workers {
+        let pool = ExpertPool::new(workers as usize, shape, rows_max, max_assignments)?;
+        for &rows in rows {
+            for &missed in missed {
+                let assignments: Vec<Assignment> = (0..rows * missed)
+                    .map(|slot| Assignment {
+                        row: slot / missed,
+                        choice: slot,
+                        expert: slot % missed,
+                        weight: bf16::from_f32(0.125 * ((slot % missed) as f32 + 1.0)),
+                    })
+                    .collect();
+                let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
+                let mut samples = [0.0; 5];
+                for trial in 0..6 {
+                    cursor = (cursor + missed as usize) % ring_experts as usize;
+                    let selected: Vec<ExpertWeights> = (0..missed as usize)
+                        .map(|choice| {
+                            let start = ((cursor + choice) % ring_experts as usize) * per;
+                            let down = start + 2 * shape.intermediate * shape.hidden;
+                            ExpertWeights {
+                                gate_up: start..down,
+                                gate_up_stride: shape.hidden,
+                                down: down..start + per,
+                                down_stride: shape.intermediate,
+                            }
+                        })
+                        .collect();
+                    let started = std::time::Instant::now();
+                    pool.run(Job {
+                        arena: arena.clone(),
+                        hidden: &hidden[..rows as usize * shape.hidden],
+                        rows: rows as usize,
+                        experts: &selected,
+                        assignments: &assignments,
+                        out: &mut out,
+                    })?;
+                    let seconds = started.elapsed().as_secs_f64();
+                    ensure!(
+                        out.iter().all(|x| x.to_f32().is_finite()),
+                        "non-finite CPU service output: workers={workers} rows={rows} missed={missed}"
+                    );
+                    if trial > 0 {
+                        samples[trial - 1] = seconds;
+                    }
+                }
+                samples.sort_by(f64::total_cmp);
+                cells.push(crate::experts::plan::ServiceCell {
+                    workers,
+                    rows,
+                    experts: missed,
+                    seconds: samples[2],
+                });
+            }
+        }
+    }
+    Ok(cells)
 }
 
 #[cfg(test)]
@@ -1591,98 +1697,45 @@ mod tests {
     /// 12.5x the 64 MiB LLC of the Ryzen 7950X; 128 x 6,291,456 B = 805 MB.
     const RING_EXPERTS: usize = 128;
 
-    fn build_timing_arena(shape: &Shape, experts: usize) -> Arc<HostBlocks> {
-        let per = per_expert(shape);
-        let arena = HostBlocks::new(u32::try_from(experts).unwrap(), per).unwrap();
-        let mut values = vec![bf16::ZERO; per];
-        for (index, slot) in values.iter_mut().enumerate() {
-            *slot = bf16::from_f32((((index % 251) as f32) - 125.0) / 128.0);
-        }
-        for expert in 0..experts {
-            write_block(&arena, u32::try_from(expert).unwrap(), &values);
-        }
-        arena
-    }
-
     #[test]
     #[ignore = "descriptive CPU timing table"]
     fn service_time_table() -> Result<()> {
         let shape = production_shape();
-        let arena = build_timing_arena(&shape, RING_EXPERTS);
-        let rows_max = 8usize;
-        let hidden: Vec<bf16> = (0..rows_max * shape.hidden)
-            .map(|k| pattern(k, 0.9))
-            .collect();
-        let isa = Isa::detect();
+        let per = per_expert(&shape);
         println!(
             "{}",
             serde_json::json!({
                 "table": "service_time",
-                "isa": isa.name(),
+                "isa": Isa::detect().name(),
                 "ring_experts": RING_EXPERTS,
-                "ring_bytes": RING_EXPERTS * per_expert(&shape) * 2,
-                "expert_bytes": per_expert(&shape) * 2,
+                "ring_bytes": RING_EXPERTS * per * 2,
+                "expert_bytes": per * 2,
             })
         );
-        let mut cursor = 0usize;
-        for workers in [1usize, 2, 4, 8, 16, 24] {
-            let max_assignments = rows_max * 8;
-            let pool = ExpertPool::new(workers, shape, rows_max, max_assignments)?;
-            for rows in [1usize, 2, 5, 8] {
-                for missed in [1usize, 2, 4, 8] {
-                    let mut assignments: Vec<Assignment> = (0..rows * missed)
-                        .map(|slot| Assignment {
-                            row: (slot / missed) as u32,
-                            choice: slot as u32,
-                            expert: 0,
-                            weight: bf16::from_f32(0.125 * ((slot % missed) as f32 + 1.0)),
-                        })
-                        .collect();
-                    let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
-                    let mut samples = Vec::new();
-                    for trial in 0..6 {
-                        // Consecutive samples take disjoint sets of ring experts.
-                        cursor = (cursor + missed) % RING_EXPERTS;
-                        let selected: Vec<ExpertWeights> = (0..missed)
-                            .map(|choice| weights(&shape, (cursor + choice) % RING_EXPERTS))
-                            .collect();
-                        for assignment in &mut assignments {
-                            assignment.expert = (assignment.choice as usize % missed) as u32;
-                        }
-                        let started = std::time::Instant::now();
-                        pool.run(Job {
-                            arena: arena.clone(),
-                            hidden: &hidden[..rows * shape.hidden],
-                            rows,
-                            experts: &selected,
-                            assignments: &assignments,
-                            out: &mut out,
-                        })?;
-                        let elapsed = started.elapsed().as_secs_f64();
-                        if trial > 0 {
-                            samples.push(elapsed);
-                        }
-                    }
-                    samples.sort_by(f64::total_cmp);
-                    let median = samples[samples.len() / 2];
-                    let cold_bytes = missed as f64 * per_expert(&shape) as f64 * 2.0;
-                    let flops = assignments.len() as f64
-                        * 6.0
-                        * shape.hidden as f64
-                        * shape.intermediate as f64;
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "workers": workers,
-                            "rows": rows,
-                            "missed": missed,
-                            "seconds": median,
-                            "GFLOPs": flops / median / 1e9,
-                            "cold_GB_s": cold_bytes / median / 1e9,
-                        })
-                    );
-                }
-            }
+        let cells = measure_service_table(
+            shape,
+            RING_EXPERTS as u32,
+            &[1, 2, 4, 8, 16, 24],
+            &[1, 2, 5, 8],
+            &[1, 2, 4, 8],
+        )?;
+        for cell in cells {
+            let cold_bytes = f64::from(cell.experts) * per as f64 * 2.0;
+            let flops = f64::from(cell.rows * cell.experts)
+                * 6.0
+                * shape.hidden as f64
+                * shape.intermediate as f64;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "workers": cell.workers,
+                    "rows": cell.rows,
+                    "missed": cell.experts,
+                    "seconds": cell.seconds,
+                    "GFLOPs": flops / cell.seconds / 1e9,
+                    "cold_GB_s": cold_bytes / cell.seconds / 1e9,
+                })
+            );
         }
         Ok(())
     }
