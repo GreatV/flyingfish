@@ -278,7 +278,18 @@ fn state_bits_with_visibility(e: &Engine, visible_only: bool) -> Result<Vec<u8>>
 }
 
 pub(crate) fn q38_mtp_chain_gpu() -> Result<()> {
-    let mut e = load(false)?;
+    let mut e = load(true)?;
+    configure(
+        &mut e,
+        options(
+            3,
+            MtpHiddenTap::PreFinalNorm,
+            MtpRecurrentTap::PostMtpNorm,
+            true,
+        ),
+    )?;
+    e.capture()?;
+    e.closure.ready(std::time::Instant::now())?;
     let out = output()?;
     for k in 1..=3 {
         for h2 in [MtpHiddenTap::PreFinalNorm, MtpHiddenTap::PostFinalNorm] {
@@ -336,7 +347,18 @@ pub(crate) fn q38_mtp_chain_gpu() -> Result<()> {
 }
 
 pub(crate) fn q38_mtp_transaction_gpu() -> Result<()> {
-    let mut e = load(false)?;
+    let mut e = load(true)?;
+    configure(
+        &mut e,
+        options(
+            3,
+            MtpHiddenTap::PreFinalNorm,
+            MtpRecurrentTap::PostMtpNorm,
+            true,
+        ),
+    )?;
+    e.capture()?;
+    e.closure.ready(std::time::Instant::now())?;
     let ids = prompt("math1")?;
     for graph in [false, true] {
         for k in 1..=3 {
