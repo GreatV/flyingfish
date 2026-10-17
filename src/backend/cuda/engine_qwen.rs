@@ -287,7 +287,7 @@ impl Runtime {
             .and_then(|n| n.checked_add(spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>()))
             .context("Q38 fixed workspace overflow")
     }
-    fn workspace(
+    pub(super) fn workspace(
         model: &crate::model_spec::ModelSpec,
         rows: usize,
         capacity: usize,
@@ -326,7 +326,7 @@ impl Runtime {
                 .max(decode.bytes),
         )?)
     }
-    fn new(
+    pub(super) fn new(
         engine: &Engine,
         checkpoint_dir: &Path,
         catalog: WeightCatalog,

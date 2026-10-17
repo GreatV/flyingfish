@@ -40,8 +40,6 @@ pub(super) struct Slots {
     valid: CudaSlice<u32>,
     generation: CudaSlice<u64>,
     published: Vec<u64>,
-    #[cfg(test)]
-    _weights: Vec<CudaSlice<bf16>>,
 }
 
 impl Slots {

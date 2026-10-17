@@ -1,80 +1,164 @@
 use super::*;
 use crate::backend::cuda::moe::reference::{MoeDims, MoeFixture, fixture};
-use crate::backend::cuda::weights::{ExpertStorage, Layer};
+use crate::backend::cuda::weights::ExpertStorage;
 use crate::experts::plan::Capacity;
-use std::collections::BTreeSet;
 
-fn layer_coverage(hidden: usize, qkv: usize) -> (usize, BTreeSet<(usize, usize)>) {
-    (8, BTreeSet::from([(qkv, hidden), (hidden, hidden)]))
+fn hybrid_spec() -> Result<crate::model_spec::ModelSpec> {
+    use crate::model_spec::{LayerPlan, Mixer};
+    let mut spec = crate::model_spec::ModelSpec::minicpm(
+        &serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/minicpm-config.json"
+        )))?,
+        &serde_json::json!({"eos_token_id": [248044, 248046]}),
+    )?;
+    spec.hidden = 128;
+    spec.intermediate = 64;
+    spec.vocab = 32;
+    spec.max_position = 32;
+    spec.eos = vec![31];
+    spec.vision = None;
+    spec.moe = Some(crate::model_spec::MoeConfig {
+        experts: 16,
+        experts_per_tok: 4,
+        expert_intermediate: 64,
+        shared_intermediate: 64,
+    });
+    spec.layers = vec![
+        LayerPlan {
+            mixer: Mixer::Gdn,
+            state_index: 0,
+        },
+        LayerPlan {
+            mixer: Mixer::FullAttention,
+            state_index: 0,
+        },
+    ];
+    Ok(spec)
 }
 
-fn check_layer_coverage(
-    coverage: Option<&(usize, BTreeSet<(usize, usize)>)>,
-    hidden: usize,
-    qkv: usize,
-) -> Result<()> {
-    for rows in 1..=8 {
-        for output in [qkv, hidden] {
-            super::super::super::blas::check_coverage(
-                crate::backend::setup::LinearShape {
-                    rows,
-                    output,
-                    input: hidden,
+fn hybrid_manifest(
+    spec: &crate::model_spec::ModelSpec,
+) -> Result<crate::checkpoint::TensorManifest> {
+    use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
+    use crate::model_spec::Mixer;
+    ensure!(
+        spec.architecture == crate::model_spec::Architecture::MiniCpmV47,
+        "hybrid fixture requires MiniCpmV47 architecture, received {:?}",
+        spec.architecture
+    );
+    ensure!(
+        spec.layers
+            .iter()
+            .map(|layer| layer.mixer)
+            .eq([Mixer::Gdn, Mixer::FullAttention]),
+        "hybrid fixture requires one GDN and one full-attention layer"
+    );
+    let g = crate::op_contract::GdnSpec::from_model(spec)?;
+    let a = crate::op_contract::FullAttentionSpec::from_model(spec)?;
+    let h = spec.hidden as usize;
+    let m = spec.moe.context("hybrid fixture MoE missing")?;
+    let i = m.shared_intermediate as usize;
+    let mut manifest = TensorManifest {
+        entries: Default::default(),
+        resident_bytes: 0,
+    };
+    for (layer, plan) in spec.layers.iter().enumerate() {
+        let mut shapes = vec![
+            ("input_layernorm.weight", vec![h]),
+            ("post_attention_layernorm.weight", vec![h]),
+            ("mlp.gate.weight", vec![m.experts as usize, h]),
+            ("mlp.shared_expert.gate_proj.weight", vec![i, h]),
+            ("mlp.shared_expert.up_proj.weight", vec![i, h]),
+            ("mlp.shared_expert.down_proj.weight", vec![h, i]),
+            ("mlp.shared_expert_gate.weight", vec![1, h]),
+        ];
+        shapes.extend(match plan.mixer {
+            Mixer::Gdn => vec![
+                (
+                    "linear_attn.in_proj_qkv.weight",
+                    vec![g.conv_dim()? as usize, h],
+                ),
+                (
+                    "linear_attn.in_proj_z.weight",
+                    vec![(g.hv * g.dv) as usize, h],
+                ),
+                ("linear_attn.in_proj_a.weight", vec![g.hv as usize, h]),
+                ("linear_attn.in_proj_b.weight", vec![g.hv as usize, h]),
+                (
+                    "linear_attn.out_proj.weight",
+                    vec![h, (g.hv * g.dv) as usize],
+                ),
+                (
+                    "linear_attn.conv1d.weight",
+                    vec![g.conv_dim()? as usize, 1, g.conv_width as usize],
+                ),
+                ("linear_attn.A_log", vec![g.hv as usize]),
+                ("linear_attn.dt_bias", vec![g.hv as usize]),
+                ("linear_attn.norm.weight", vec![g.dv as usize]),
+            ],
+            Mixer::FullAttention => vec![
+                (
+                    "self_attn.q_proj.weight",
+                    vec![(2 * a.hq * a.d) as usize, h],
+                ),
+                ("self_attn.k_proj.weight", vec![(a.hkv * a.d) as usize, h]),
+                ("self_attn.v_proj.weight", vec![(a.hkv * a.d) as usize, h]),
+                ("self_attn.o_proj.weight", vec![h, (a.hq * a.d) as usize]),
+                ("self_attn.q_norm.weight", vec![a.d as usize]),
+                ("self_attn.k_norm.weight", vec![a.d as usize]),
+            ],
+        });
+        for (role, shape) in shapes {
+            let bytes = shape.iter().product::<usize>() * size_of::<bf16>();
+            manifest.resident_bytes += bytes;
+            manifest.entries.insert(
+                format!("model.language_model.layers.{layer}.{role}"),
+                TensorEntry {
+                    dtype: safetensors::Dtype::BF16,
+                    shape,
+                    shard: "synthetic.safetensors".into(),
+                    bytes,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [0, bytes as u64],
+                    scope: TensorScope::Text,
+                    layer: Some(layer as u32),
+                    role: role.into(),
+                    scale_name: None,
                 },
-                coverage,
-            )?;
+            );
         }
     }
-    Ok(())
+    Ok(manifest)
 }
 
 impl Engine {
     pub(crate) fn load_moe_test(fixture: &MoeFixture, runtime: &Path) -> Result<Self> {
+        use crate::backend::cuda::{
+            linear::LayerLinearPlan,
+            weights::{StoredTensor, WeightCatalog},
+        };
         let d = fixture.dims;
         ensure!(
-            [128, 2048].contains(&d.hidden) && d.inter == 64 && d.experts == 16 && d.top_k == 4,
-            "MoE hook expects H128 or H2048 / I64/E16/K4, received {d:?}"
+            d.hidden == 128 && d.inter == 64 && d.experts == 16 && d.top_k == 4,
+            "MoE hook expects H128/I64/E16/K4, received {d:?}"
         );
-        let config = Config {
-            model_type: "llama".into(),
-            hidden_size: d.hidden,
-            intermediate_size: d.inter,
-            num_hidden_layers: 1,
-            num_attention_heads: d.hidden / 128,
-            num_key_value_heads: if d.hidden == 2048 { 2 } else { 1 },
-            head_dim: 128,
-            vocab_size: 32,
-            max_position_embeddings: 32,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10000.0,
-            rope_scaling: None,
-            hidden_act: "silu".into(),
-            tie_word_embeddings: false,
-            torch_dtype: "bfloat16".into(),
-            eos_token_id: vec![31],
-            attention_bias: false,
-            mlp_bias: false,
-        };
-        let mut model_spec = crate::model_spec::ModelSpec::from_llama(&config)?;
-        model_spec.moe = Some(crate::model_spec::MoeConfig {
-            experts: 16,
-            experts_per_tok: 4,
-            expert_intermediate: 64,
-            shared_intermediate: 64,
-        });
+        let model_spec = hybrid_spec()?;
+        let config = model_spec.config();
+        let manifest = hybrid_manifest(&model_spec)?;
         let geometry = ExpertGeometry::from_model(&model_spec)?;
-        let coverage = layer_coverage(config.hidden_size, config.qkv_dim());
-        check_layer_coverage(Some(&coverage), config.hidden_size, config.qkv_dim())?;
         let device = Device::new(0)?;
         let stream = &device.stream;
+        let count = (geometry.layers * geometry.experts) as usize;
         let bytes = geometry.slot_bytes()?;
         let capacity = Capacity {
             span_rows: 8,
             wave_rows: 8,
-            device_expert_bytes: bytes * 16,
-            host_expert_bytes: bytes * 16,
-            slots_per_layer: vec![16],
-            host_blocks: 16,
+            device_expert_bytes: bytes * count as u64,
+            host_expert_bytes: bytes * count as u64,
+            slots_per_layer: vec![16; geometry.layers as usize],
+            host_blocks: count as u32,
             spare_blocks: 0,
             disk_bytes: 0,
             worker_count: 2,
@@ -83,108 +167,108 @@ impl Engine {
         };
         let storage = ExpertStorage::new(stream, &device.upload, geometry, &capacity)?;
         stream.synchronize()?;
-        let mut gu = Vec::new();
-        let mut dn = Vec::new();
+        let mut gu = Vec::with_capacity(count);
+        let mut dn = Vec::with_capacity(count);
         let gu_len = 2 * d.inter * d.hidden;
         let dn_len = d.hidden * d.inter;
-        for expert in 0..d.experts {
-            let (gate_up, down) = storage.slot(0, expert as u32)?;
-            // SAFETY: SlotLayout owns the exact native slices through every launch and copy.
-            unsafe {
-                result::memcpy_htod_sync(
-                    gate_up,
-                    &fixture.gate_up[expert * gu_len..(expert + 1) * gu_len],
-                )?;
-                result::memcpy_htod_sync(
-                    down,
-                    &fixture.down[expert * dn_len..(expert + 1) * dn_len],
-                )?;
+        for layer in 0..geometry.layers {
+            for expert in 0..d.experts {
+                let (gate_up, down) = storage.slot(layer, expert as u32)?;
+                // SAFETY: setup synchronization completed the owned stream-ordered allocation.
+                unsafe {
+                    result::memcpy_htod_sync(
+                        gate_up,
+                        &fixture.gate_up[expert * gu_len..(expert + 1) * gu_len],
+                    )?;
+                    result::memcpy_htod_sync(
+                        down,
+                        &fixture.down[expert * dn_len..(expert + 1) * dn_len],
+                    )?;
+                }
+                let mut claim = storage
+                    .host()
+                    .context("test host arena missing")?
+                    .claim(layer * geometry.experts + expert as u32)?;
+                claim.slice()?[..gu_len]
+                    .copy_from_slice(&fixture.gate_up[expert * gu_len..(expert + 1) * gu_len]);
+                claim.slice()?[gu_len..]
+                    .copy_from_slice(&fixture.down[expert * dn_len..(expert + 1) * dn_len]);
+                gu.push(gate_up);
+                dn.push(down);
             }
-            let mut claim = storage
-                .host()
-                .context("test host arena missing")?
-                .claim(expert as u32)?;
-            claim.slice()?[..gu_len]
-                .copy_from_slice(&fixture.gate_up[expert * gu_len..(expert + 1) * gu_len]);
-            claim.slice()?[gu_len..]
-                .copy_from_slice(&fixture.down[expert * dn_len..(expert + 1) * dn_len]);
-            gu.push(gate_up);
-            dn.push(down);
         }
-        let weights = [
-            &fixture.router_w,
-            &fixture.shared_gate,
-            &fixture.shared_up,
-            &fixture.shared_down,
-            &fixture.shared_expert_gate,
-        ]
-        .into_iter()
-        .map(|w| stream.clone_htod(w))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-        let ffn = BoundFfn::Moe {
-            router: qwen::matrix(&weights[0], stream, 0, d.experts, d.hidden)?,
-            shared: [
-                qwen::matrix(&weights[1], stream, 0, d.inter, d.hidden)?,
-                qwen::matrix(&weights[2], stream, 0, d.inter, d.hidden)?,
-                qwen::matrix(&weights[3], stream, 0, d.hidden, d.inter)?,
-            ],
-            shared_gate: qwen::view(&weights[4], stream, 0, [d.hidden as u32], [1])?,
+        let mut tensors = std::collections::BTreeMap::new();
+        for (name, entry) in &manifest.entries {
+            let values = match entry.role.as_str() {
+                "mlp.gate.weight" => fixture.router_w.clone(),
+                "mlp.shared_expert.gate_proj.weight" => fixture.shared_gate.clone(),
+                "mlp.shared_expert.up_proj.weight" => fixture.shared_up.clone(),
+                "mlp.shared_expert.down_proj.weight" => fixture.shared_down.clone(),
+                "mlp.shared_expert_gate.weight" => fixture.shared_expert_gate.clone(),
+                role if role.ends_with("norm.weight") => vec![bf16::ONE; entry.bytes / 2],
+                "linear_attn.A_log" | "linear_attn.dt_bias" => vec![bf16::ZERO; entry.bytes / 2],
+                _ => (0..entry.bytes / 2)
+                    .map(|index| {
+                        let width = *entry.shape.last().unwrap();
+                        bf16::from_f32(
+                            (((index / width * 37 + index % width * 11 + 7) % 53) as f32 - 26.0)
+                                / 4096.0,
+                        )
+                    })
+                    .collect(),
+            };
+            ensure!(
+                values.len() * 2 == entry.bytes,
+                "hybrid fixture tensor extent: {name}"
+            );
+            tensors.insert(
+                name.clone(),
+                StoredTensor::Bf16(stream.clone_htod(&values)?),
+            );
+        }
+        let bytes = manifest.resident_bytes;
+        let catalog = WeightCatalog {
+            tensors,
+            manifest,
+            bytes,
+            upload_content_sha256: None,
+            upload_hashed_bytes: None,
+            load_wall_ms: 0.0,
         };
+        let plan = crate::linear_plan::LayerDequantPlan::from_manifest(
+            &catalog.manifest,
+            0,
+            model_spec.linear_format,
+        )?;
+        let mut linear = LayerLinearPlan::bind(&plan, &catalog, None, stream)?;
+        let ffn = BoundFfn::bind(&model_spec, &mut linear)?;
         let slots = Slots {
             storage,
             gate_up: stream.clone_htod(&gu)?,
             down: stream.clone_htod(&dn)?,
-            valid: stream.clone_htod(&[1u32; 16])?,
-            generation: stream.clone_htod(&[1u64; 16])?,
-            published: vec![1; 16],
-            _weights: weights,
+            valid: stream.clone_htod(&vec![1u32; count])?,
+            generation: stream.clone_htod(&vec![1u64; count])?,
+            published: vec![1; count],
         };
         let weights = Weights {
             embed: stream.alloc_zeros(32 * d.hidden)?,
             norm: stream.clone_htod(&vec![bf16::ONE; d.hidden])?,
             head: stream.alloc_zeros(32 * d.hidden)?,
             bytes: 0,
-            layers: vec![Layer {
-                input_norm: stream.clone_htod(&vec![bf16::ONE; d.hidden])?,
-                qkv: stream.alloc_zeros(config.qkv_dim() * d.hidden)?,
-                o: stream.alloc_zeros(d.hidden * d.hidden)?,
-                post_norm: stream.clone_htod(&vec![bf16::ONE; d.hidden])?,
-                gu: stream.alloc_zeros(2 * d.inter * d.hidden)?,
-                down: stream.alloc_zeros(d.hidden * d.inter)?,
-            }],
+            layers: Vec::new(),
         };
         let ops = Ops::new(&device.ctx)?;
         let closure = Rc::new(super::super::super::closure::Closure::new(
             true,
             "MoE layer gate".into(),
         ));
-        let mut blas = Blas::new(&device, &ops, runtime, closure.clone())?;
-        blas.declare(coverage.0, &coverage.1);
+        let blas = Blas::new(&device, &ops, runtime, closure.clone())?;
         let state = super::super::super::state::StateStore::new(&model_spec, 32, stream)?;
         let mut work = Work::new(stream, &model_spec, 8)?;
         stream.memcpy_htod(&[1i32], &mut work.length)?;
-        let flash = Some(Flash::new(stream.clone(), 8, config.num_attention_heads)?);
-        if d.hidden == 2048 {
-            for rows in 1..=8 {
-                let x = work.n.slice(..rows * d.hidden);
-                for (weight, output) in [
-                    (&weights.layers[0].qkv, config.qkv_dim()),
-                    (&weights.layers[0].o, d.hidden),
-                ] {
-                    blas.calibrate_shape(
-                        weight,
-                        &x,
-                        crate::backend::setup::LinearShape {
-                            rows,
-                            output,
-                            input: d.hidden,
-                        },
-                    )?;
-                }
-            }
-        }
+        let flash = Some(Flash::new(stream.clone(), 8, model_spec.q_heads as usize)?);
         let moe = Some(Decode::new(&device, geometry, 8, 2)?);
-        Ok(Self {
+        let mut engine = Self {
             capture_fail_after_layer: None,
             capture_fail_stage: None,
             qwen: None,
@@ -231,7 +315,21 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
-        })
+        };
+        let scratch = engine.device.stream.alloc_zeros(qwen::Runtime::workspace(
+            &engine.model_spec,
+            8,
+            32,
+            crate::gdn_plan::GdnPolicy::for_device(engine.device.info.arch, engine.device.info.sms),
+        )?)?;
+        engine.qwen = Some(qwen::Runtime::new(
+            &engine, runtime, catalog, None, scratch, None, 8,
+        )?);
+        for rows in 1..=8 {
+            engine.prepare_qwen(rows)?;
+            engine.prepare_prefill_rows(rows)?;
+        }
+        Ok(engine)
     }
 
     pub(crate) fn run_layer_from_reference(
@@ -670,20 +768,6 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
     for &variant in variants {
         let fixture = fixture(MoeDims::new(8, 16, 4, 128, 64), variant);
         let mut engine = Engine::load_moe_test(&fixture, runtime)?;
-        let axes = [0, 1];
-        let rejected = engine
-            .run_layer_from_reference(0, &fixture.x[..256], [&axes; 3], &mut Trace::default())
-            .expect_err("unsupported RoPE geometry reached a launch");
-        ensure!(
-            rejected
-                .to_string()
-                .contains("q_heads=1 kv_heads=1 head_dim=128"),
-            "Runner FAIL unsupported RoPE guard returned another error: {rejected:#}"
-        );
-        engine.device.stream.synchronize()?;
-        println!(
-            "PASS eager_moe_rope_rejection q_heads=1 kv_heads=1 head_dim=128 rejected_before_launch=true context_usable=true"
-        );
         for &rows in row_cases {
             let input = &fixture.x[..rows * 128];
             let reference = direct(&engine, input, rows)?;
@@ -741,18 +825,27 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
             );
         }
         let axes = [0, 1];
-        let mut trace = Trace::default();
-        drop(engine);
-        let layer_fixture = crate::backend::cuda::moe::reference::fixture(
-            MoeDims::new(2, 16, 4, 2048, 64),
-            variant,
-        );
-        let mut layer_engine = Engine::load_moe_test(&layer_fixture, runtime)?;
-        layer_engine.run_layer_from_reference(0, &layer_fixture.x, [&axes; 3], &mut trace)?;
-        ensure!(
-            trace.values("layer.ffn")?.len() == 4096,
-            "layer injection did not execute FFN"
-        );
+        let _range = super::super::super::profile::Range::new(true, c"engine_moe_hybrid");
+        for layer in 0..2 {
+            let mut trace = Trace::default();
+            engine.trace_layer = layer;
+            engine.run_layer_from_reference(layer, &fixture.x[..256], [&axes; 3], &mut trace)?;
+            ensure!(
+                trace.values("layer.ffn")?.len() == 256,
+                "hybrid layer injection did not execute FFN layer={layer}"
+            );
+            ensure!(
+                trace
+                    .values("layer.debug.mixer_out")?
+                    .iter()
+                    .all(|value| value.is_finite()),
+                "Runner FAIL hybrid layer mixer output nonfinite layer={layer}"
+            );
+            println!(
+                "PASS eager_moe_hybrid_injection layer={layer} mixer={:?} rows=2 q_heads=16 kv_heads=2 head_dim=256 rotary_dim=64 hybrid_bound=true",
+                engine.model_spec.layers[layer].mixer
+            );
+        }
     }
     ensure!(defects == 0, "eager MoE candidate defects={defects}");
     println!(
@@ -843,19 +936,55 @@ fn dispatch_covers_original_choices_once_after_row_compaction() -> Result<()> {
 }
 
 #[test]
-fn injected_layer_uses_declared_linear_coverage() -> Result<()> {
-    let coverage = layer_coverage(128, 384);
-    check_layer_coverage(Some(&coverage), 128, 384)?;
-    check_layer_coverage(Some(&layer_coverage(2048, 2560)), 2048, 2560)?;
-    assert!(check_layer_coverage(None, 128, 384).is_err());
-    let mut without_qkv = coverage.clone();
-    without_qkv.1.remove(&(384, 128));
-    assert!(check_layer_coverage(Some(&without_qkv), 128, 384).is_err());
-    let mut too_few_rows = coverage;
-    too_few_rows.0 = 1;
-    assert!(check_layer_coverage(Some(&too_few_rows), 128, 384).is_err());
+fn injected_layers_bind_hybrid_mixer_geometry() -> Result<()> {
+    use crate::model_spec::{Architecture, Mixer};
+    let spec = hybrid_spec()?;
+    let manifest = hybrid_manifest(&spec)?;
+    assert_eq!(spec.architecture, Architecture::MiniCpmV47);
+    assert_eq!(
+        (spec.q_heads, spec.kv_heads, spec.head_dim, spec.rotary_dim),
+        (16, 2, 256, 64)
+    );
+    let g = crate::op_contract::GdnSpec::from_model(&spec)?;
+    assert_eq!(
+        (g.hk, g.hv, g.dk, g.dv, g.conv_width),
+        (16, 32, 128, 128, 4)
+    );
+    for (layer, mixer) in [Mixer::Gdn, Mixer::FullAttention].into_iter().enumerate() {
+        assert!(matches!(
+            crate::model::layer_program(&spec, layer)?[1],
+            crate::model::LayerStage::Mixer(bound) if bound == mixer
+        ));
+        let plan = crate::linear_plan::LayerDequantPlan::from_manifest(
+            &manifest,
+            layer as u32,
+            spec.linear_format,
+        )?;
+        assert_eq!(plan.bytes, 0);
+        assert!(plan.slots.is_empty());
+    }
+    for (name, shape) in [
+        ("0.linear_attn.in_proj_qkv.weight", [8192, 128]),
+        ("0.linear_attn.out_proj.weight", [128, 4096]),
+        ("1.self_attn.q_proj.weight", [8192, 128]),
+        ("1.self_attn.k_proj.weight", [512, 128]),
+        ("1.self_attn.o_proj.weight", [128, 4096]),
+    ] {
+        assert_eq!(
+            manifest.entries[&format!("model.language_model.layers.{name}")].shape,
+            shape
+        );
+    }
+    assert!(qwen::Runtime::workspace(&spec, 8, 32, crate::gdn_plan::GdnPolicy::LEGACY)? > 0);
+    let mut old = spec.clone();
+    old.architecture = Architecture::Llama;
+    assert!(hybrid_manifest(&old).is_err());
+    old = spec.clone();
+    old.head_dim = 128;
+    old.q_width = old.q_heads * old.head_dim;
+    assert!(hybrid_manifest(&old).is_err());
     println!(
-        "PASS eager_moe_layer_coverage rows=1..8 qkv=[384,128] output=[128,128] undeclared_rejected=true missing_qkv_rejected=true row_bound_rejected=true"
+        "PASS eager_moe_hybrid_preflight architecture=MiniCpmV47 layers=Gdn,FullAttention q16_kv2_d256_rotary64=true gdn_hk16_hv32=true legacy_rejected=true d128_rejected=true GPU_executed=false"
     );
     Ok(())
 }
