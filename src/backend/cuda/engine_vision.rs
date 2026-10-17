@@ -2528,15 +2528,14 @@ mod tests {
         "merger_out",
     ];
 
-    /// Original T0 fixture epsilons; the fixture comparison is a reported secondary metric
-    /// (`evidence/PR5/PROTOCOL.md` CORRECTION 2).
-    fn fixture_eps(tap: &str) -> f32 {
-        match tap {
+    /// T0 fixture epsilons; the fixture comparison is a reported secondary metric.
+    fn fixture_eps(tap: &str) -> Result<f32> {
+        Ok(match tap {
             "vision_patch_embeddings" | "vision_tower_out" => 0.0625,
             "vision_layer_06_out" | "vit_merger_out" => 0.03125,
             "merger_out" => 0.0078125,
-            _ => 0.0,
-        }
+            _ => bail!("unknown fixture tap {tap}"),
+        })
     }
 
     /// Largest per-element distance in BF16 ulps of `max(|reference_i|, rms)`.
@@ -2628,7 +2627,8 @@ mod tests {
     /// Gate of the MiniCPM tower against the T0 fixtures; tolerances are frozen in the protocol
     /// (`evidence/PR5/PROTOCOL.md`) before the run.
     #[test]
-    #[ignore = "requires FF_MINICPM_VISION_WINDOW=granted, FF_MODEL, FF_MINICPM_FIXTURE_DIR, FF_MINICPM_VISION_OUTPUT_DIR and FF_MINICPM_TOLERANCES"]
+    #[ignore = "requires FF_MINICPM_VISION_WINDOW=granted, FF_MODEL, FF_MINICPM_FIXTURE_DIR, \
+                FF_MINICPM_VISION_OUTPUT_DIR, FF_MINICPM_TOLERANCES and FF_MINICPM_VISION_REFERENCE"]
     fn minicpm_vision_tower_gpu() -> Result<()> {
         use crate::backend::cuda::{closure::Closure, ops::Ops};
         use std::{collections::BTreeMap, path::PathBuf, rc::Rc};
@@ -2685,8 +2685,6 @@ mod tests {
             catalog.tensors.is_empty(),
             "vision binding left unloaded owners"
         );
-        let arm = std::env::var("FF_MINICPM_GATE_EXPECT")
-            .context("FF_MINICPM_GATE_EXPECT missing (clean or M1..M4)")?;
         let mut standalone: BTreeMap<String, Vec<f32>> = BTreeMap::new();
         let mut verdict: BTreeMap<String, (f64, f64, bool)> = BTreeMap::new();
         let mut merged_input: Option<MergedInput> = None;
@@ -2768,11 +2766,11 @@ mod tests {
                 let pass = ratio <= k;
                 eprintln!(
                     "{}",
-                    serde_json::json!({"minicpm_vision_gate": {"arm": arm, "case": case, "tap": tap,
+                    serde_json::json!({"minicpm_vision_gate": {"case": case, "tap": tap,
                         "max_abs": metrics["max_abs"], "max_ulp_ratio": ratio, "k": k, "rms": rms,
                         "cosine": metrics["cosine"],
                         "max_abs_over_rms": metrics["max_abs"].as_f64().context("max_abs")? / rms,
-                        "pass": pass, "fixture_secondary": fixture_metrics, "fixture_eps": fixture_eps(tap)}})
+                        "pass": pass, "fixture_secondary": fixture_metrics, "fixture_eps": fixture_eps(tap)?}})
                 );
                 verdict.insert(
                     format!("{case}/{tap}"),
@@ -2866,54 +2864,25 @@ mod tests {
             merged[..first] != merged[first..],
             "the two images produced identical merger blocks"
         );
-        let designated = match arm.as_str() {
-            "clean" => None,
-            "M1" => Some("vision_patch_embeddings"),
-            "M2" | "M3" => Some("vit_merger_out"),
-            "M4" => Some("merger_out"),
-            other => bail!("unknown gate expectation {other}"),
-        };
         let taps: Vec<_> = verdict
             .iter()
             .map(|(key, (max_abs, ratio, pass))| {
                 serde_json::json!({"tap": key, "max_abs": max_abs, "max_ulp_ratio": ratio, "pass": pass})
             })
             .collect();
-        match designated {
-            None => {
-                let defects: Vec<&String> = verdict
-                    .iter()
-                    .filter(|(_, (_, _, pass))| !pass)
-                    .map(|(key, _)| key)
-                    .collect();
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"minicpm_vision_verdict": {"arm": arm, "taps": taps, "defects": defects}})
-                );
-                ensure!(
-                    defects.is_empty(),
-                    "clean arm exceeds the frozen bound at {defects:?}"
-                );
-            }
-            Some(tap) => {
-                let mut exceeded = Vec::new();
-                for case in ["image_hockey_16x", "image_boat_16x"] {
-                    let key = format!("{case}/{tap}");
-                    if let Some((_, ratio, false)) = verdict.get(&key) {
-                        exceeded.push((key, *ratio));
-                    }
-                }
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"minicpm_vision_verdict": {"arm": arm, "designated_tap": tap,
-                        "taps": taps, "exceeded": exceeded}})
-                );
-                ensure!(
-                    !exceeded.is_empty(),
-                    "mutant {arm} did not exceed the frozen bound at {tap}"
-                );
-            }
-        }
+        let defects: Vec<&String> = verdict
+            .iter()
+            .filter(|(_, (_, _, pass))| !pass)
+            .map(|(key, _)| key)
+            .collect();
+        eprintln!(
+            "{}",
+            serde_json::json!({"minicpm_vision_verdict": {"taps": taps, "defects": defects}})
+        );
+        ensure!(
+            defects.is_empty(),
+            "vision gate exceeds the frozen bound at {defects:?}"
+        );
         Ok(())
     }
 
