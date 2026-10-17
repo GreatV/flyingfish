@@ -36,6 +36,72 @@ fn debug_name(trace: &Option<Target<'_>>, layer: usize, point: &str) -> String {
     }
 }
 
+/// The Q38 runtime implements exactly this text geometry; other Qwen3.5 specs error here.
+fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
+    use crate::model_spec::Architecture;
+    ensure!(
+        spec.architecture == Architecture::Qwen35Text,
+        "Q38 engine requires the Qwen3.5 text architecture"
+    );
+    for (name, value, expected) in [
+        ("hidden_size", spec.hidden, 5120u32),
+        ("intermediate_size", spec.intermediate, 17408),
+        ("vocab_size", spec.vocab, 248320),
+        ("num_attention_heads", spec.q_heads, 24),
+        ("num_key_value_heads", spec.kv_heads, 4),
+        ("head_dim", spec.head_dim, 256),
+        ("q_width", spec.q_width, 6144),
+        ("max_position_embeddings", spec.max_position, 262144),
+        ("rotary_dim", spec.rotary_dim, 64),
+    ] {
+        ensure!(
+            value == expected,
+            "Q38 engine does not implement {name}={value}"
+        );
+    }
+    ensure!(
+        spec.layers.len() == 64,
+        "Q38 engine does not implement num_hidden_layers={}",
+        spec.layers.len()
+    );
+    ensure!(
+        spec.rms_eps == 1e-6,
+        "Q38 engine does not implement rms_norm_eps={}",
+        spec.rms_eps
+    );
+    ensure!(
+        spec.rope_theta == 1e7,
+        "Q38 engine does not implement rope_theta={}",
+        spec.rope_theta
+    );
+    ensure!(
+        spec.moe.is_none(),
+        "Q38 engine does not implement a MoE text tower"
+    );
+    ensure!(
+        spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Block128,
+        "Q38 engine does not implement linear_format={:?}",
+        spec.linear_format
+    );
+    let gdn = spec
+        .gdn
+        .as_ref()
+        .context("Q38 engine requires GDN geometry")?;
+    for (name, value, expected) in [
+        ("linear_num_key_heads", gdn.key_heads, 16u32),
+        ("linear_num_value_heads", gdn.value_heads, 48),
+        ("linear_key_head_dim", gdn.key_head_dim, 128),
+        ("linear_value_head_dim", gdn.value_head_dim, 128),
+        ("linear_conv_kernel_dim", gdn.conv_kernel, 4),
+    ] {
+        ensure!(
+            value == expected,
+            "Q38 engine does not implement {name}={value}"
+        );
+    }
+    Ok(())
+}
+
 pub(super) struct Runtime {
     checkpoint_dir: PathBuf,
     vision: Option<super::vision_runtime::VisionRuntime>,
@@ -709,9 +775,11 @@ impl Engine {
             return Ok(());
         }
         let checkpoint = crate::checkpoint::MappedCheckpoint::open(dir)?;
-        let main_bytes = checkpoint.q38_manifest(&spec)?.resident_bytes;
+        let main_bytes = checkpoint
+            .manifest(&spec, crate::checkpoint::LoadPolicy::TextOnly)?
+            .resident_bytes;
         let vision_bytes = checkpoint
-            .q38_manifest_with_policy(&spec, crate::checkpoint::LoadPolicy::VisionOnly)?
+            .manifest(&spec, crate::checkpoint::LoadPolicy::VisionOnly)?
             .resident_bytes;
         let kv_bytes = spec
             .layers
@@ -754,10 +822,7 @@ impl Engine {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         if q.vision.is_none() {
             let manifest = crate::checkpoint::MappedCheckpoint::open(&q.checkpoint_dir)?
-                .q38_manifest_with_policy(
-                    &self.model_spec,
-                    crate::checkpoint::LoadPolicy::VisionOnly,
-                )?;
+                .manifest(&self.model_spec, crate::checkpoint::LoadPolicy::VisionOnly)?;
             let needed = manifest
                 .resident_bytes
                 .checked_add(request_bytes)
@@ -808,6 +873,7 @@ impl Engine {
         mode: super::SetupMode,
         model_spec: crate::model_spec::ModelSpec,
     ) -> Result<Self> {
+        require_qwen35_geometry(&model_spec)?;
         let write = !matches!(mode, super::SetupMode::Ready);
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
         let verify_rows = match mode {
@@ -1572,6 +1638,66 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::default_chunk;
+
+    #[test]
+    fn capability_check_rejects_geometry_the_q38_engine_does_not_implement() -> Result<()> {
+        let root: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?;
+        let spec = crate::model_spec::ModelSpec::qwen(&root, &serde_json::Value::Null)?;
+        super::require_qwen35_geometry(&spec)?;
+        let check = |bad: &crate::model_spec::ModelSpec, field: &str| {
+            let err = super::require_qwen35_geometry(bad).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        };
+        let mut bad = spec.clone();
+        bad.architecture = crate::model_spec::Architecture::MiniCpmV47;
+        check(&bad, "architecture");
+        let mut bad = spec.clone();
+        bad.hidden = 2048;
+        check(&bad, "hidden_size=2048");
+        let mut bad = spec.clone();
+        bad.layers.pop();
+        check(&bad, "num_hidden_layers=63");
+        let mut bad = spec.clone();
+        bad.head_dim = 128;
+        check(&bad, "head_dim=128");
+        let mut bad = spec.clone();
+        bad.rotary_dim = 128;
+        check(&bad, "rotary_dim=128");
+        let mut bad = spec.clone();
+        bad.rope_theta = 5e6;
+        check(&bad, "rope_theta");
+        let mut bad = spec.clone();
+        bad.gdn.as_mut().unwrap().value_heads = 32;
+        check(&bad, "linear_num_value_heads=32");
+        let mut bad = spec.clone();
+        bad.linear_format = crate::model_spec::LinearFormat::Bf16;
+        check(&bad, "linear_format");
+        let mut unquantized = root.clone();
+        unquantized
+            .as_object_mut()
+            .unwrap()
+            .remove("quantization_config");
+        let unquantized =
+            crate::model_spec::ModelSpec::qwen(&unquantized, &serde_json::Value::Null)?;
+        assert_eq!(
+            unquantized.linear_format,
+            crate::model_spec::LinearFormat::Bf16
+        );
+        let err = super::require_qwen35_geometry(&unquantized)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("linear_format"), "{err}");
+        let mut bad = spec.clone();
+        bad.moe = Some(crate::model_spec::MoeConfig {
+            experts: 256,
+            experts_per_tok: 8,
+            expert_intermediate: 512,
+            shared_intermediate: 512,
+        });
+        check(&bad, "MoE");
+        Ok(())
+    }
 
     #[test]
     fn the_default_chunk_is_bounded_by_the_cuda_grid_yz_limit() {

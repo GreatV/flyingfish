@@ -466,7 +466,7 @@ impl WeightCatalog {
     ) -> Result<Self> {
         let started = std::time::Instant::now();
         let mapped = MappedCheckpoint::open(dir)?;
-        let manifest = mapped.q38_manifest_with_policy(spec, policy)?;
+        let manifest = mapped.manifest(spec, policy)?;
         let ((tensors, bytes), upload_digest) =
             checkpoint_mapped(&mapped, d, Some(&manifest), hash_uploads, |loader| {
                 let mut tensors = BTreeMap::new();

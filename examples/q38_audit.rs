@@ -6,7 +6,7 @@ fn main() -> Result<()> {
     let dir = std::path::Path::new(&arg);
     let spec = flyingfish::model_spec::ModelSpec::read(dir)?;
     let mapped = flyingfish::checkpoint::MappedCheckpoint::open(dir)?;
-    let manifest = mapped.q38_manifest(&spec)?;
+    let manifest = mapped.manifest(&spec, flyingfish::checkpoint::LoadPolicy::TextOnly)?;
     let plans = (0..64)
         .map(|i| flyingfish::linear_plan::LayerDequantPlan::from_manifest(&manifest, i))
         .collect::<Result<Vec<_>>>()?;
