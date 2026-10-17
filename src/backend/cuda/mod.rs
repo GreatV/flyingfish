@@ -16,6 +16,8 @@ pub(crate) mod linear;
 mod linear_calibrate;
 mod markov;
 mod markov_calibrate;
+#[cfg(test)]
+pub(crate) mod moe;
 pub mod multi_calibrate;
 pub mod ops;
 pub mod profile;
