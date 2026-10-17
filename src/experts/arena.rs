@@ -1,26 +1,30 @@
-//! Host expert block arena with per-block read leases.
+//! Host expert block arena with per-block read leases and writer claims.
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::cell::UnsafeCell;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
-/// Fixed-size host expert blocks. A block is written only while its lease count is zero, after
+/// Lease word value of an exclusive writer claim; any other value is a reader count.
+const WRITER: u32 = u32::MAX;
+
+/// Fixed-size host expert blocks. A block is written only under an exclusive writer claim, after
 /// the caller has ordered the write behind that block's device copy event.
 pub struct HostBlocks {
     data: UnsafeCell<Box<[bf16]>>,
     elements: usize,
     block_elements: usize,
-    leases: Box<[AtomicU32]>,
+    words: Box<[AtomicU32]>,
+    claim: Mutex<()>,
 }
 
-// SAFETY: reads go through `read` under a lease and writes through `write` with no lease on the
-// block; the data pointer is allocated once for the arena lifetime.
+// SAFETY: reads go through a lease on the block and writes through a writer claim on the block;
+// the data pointer is allocated once for the arena lifetime.
 unsafe impl Send for HostBlocks {}
 unsafe impl Sync for HostBlocks {}
 
-/// Read lease over a set of host blocks; releasing it lets the owner rewrite those blocks.
+/// Read lease over a set of host blocks; releasing it lets the owner claim those blocks.
 pub struct BlockLease {
     arena: Arc<HostBlocks>,
     blocks: Vec<u32>,
@@ -29,8 +33,52 @@ pub struct BlockLease {
 impl Drop for BlockLease {
     fn drop(&mut self) {
         for &block in &self.blocks {
-            self.arena.leases[block as usize].fetch_sub(1, Ordering::AcqRel);
+            self.arena.words[block as usize].fetch_sub(1, Ordering::AcqRel);
         }
+    }
+}
+
+impl BlockLease {
+    pub fn block_elements(&self) -> usize {
+        self.arena.block_elements
+    }
+
+    /// Whole leased block; the slice is tied to this guard.
+    pub fn read(&self, block: u32) -> Result<&[bf16]> {
+        ensure!(
+            self.blocks.binary_search(&block).is_ok(),
+            "host block {block} is not leased"
+        );
+        self.arena.block_slice(block)
+    }
+}
+
+/// Exclusive writer claim over one host block; exposes only that block.
+pub struct WriteClaim {
+    arena: Arc<HostBlocks>,
+    block: u32,
+}
+
+impl Drop for WriteClaim {
+    fn drop(&mut self) {
+        self.arena.words[self.block as usize].store(0, Ordering::Release);
+    }
+}
+
+impl WriteClaim {
+    /// Host slice of the claimed block.
+    pub fn slice(&mut self) -> Result<&mut [bf16]> {
+        let range = self.arena.block_range(self.block)?;
+        // SAFETY: this guard holds the block's exclusive writer claim.
+        let data: &mut [bf16] = unsafe { &mut *self.arena.data.get() };
+        Ok(&mut data[range])
+    }
+
+    /// Host address of the claimed block for a D2H copy.
+    pub fn pointer(&self) -> Result<u64> {
+        let range = self.arena.block_range(self.block)?;
+        let data: &[bf16] = unsafe { &*self.arena.data.get() };
+        Ok(data[range].as_ptr() as u64)
     }
 }
 
@@ -45,12 +93,13 @@ impl HostBlocks {
             data: UnsafeCell::new(vec![bf16::ZERO; elements].into_boxed_slice()),
             elements,
             block_elements,
-            leases: (0..blocks).map(|_| AtomicU32::new(0)).collect(),
+            words: (0..blocks).map(|_| AtomicU32::new(0)).collect(),
+            claim: Mutex::new(()),
         }))
     }
 
     pub fn blocks(&self) -> u32 {
-        u32::try_from(self.leases.len()).expect("block count fits u32")
+        u32::try_from(self.words.len()).expect("block count fits u32")
     }
 
     pub fn block_elements(&self) -> usize {
@@ -63,9 +112,9 @@ impl HostBlocks {
 
     pub fn block_range(&self, block: u32) -> Result<Range<usize>> {
         ensure!(
-            (block as usize) < self.leases.len(),
+            (block as usize) < self.words.len(),
             "host block {block} outside {}",
-            self.leases.len()
+            self.words.len()
         );
         let start = block as usize * self.block_elements;
         Ok(start..start + self.block_elements)
@@ -73,16 +122,23 @@ impl HostBlocks {
 
     /// Leases every listed block until the guard is dropped; duplicates are counted once.
     pub fn lease(self: &Arc<Self>, blocks: &[u32]) -> Result<BlockLease> {
+        for &block in blocks {
+            self.block_range(block)?;
+        }
         let mut unique = blocks.to_vec();
         unique.sort_unstable();
         unique.dedup();
-        for &block in &unique {
-            ensure!(
-                (block as usize) < self.leases.len(),
-                "host block {block} outside {}",
-                self.leases.len()
-            );
-            self.leases[block as usize].fetch_add(1, Ordering::AcqRel);
+        let _guard = self.claim.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, &block) in unique.iter().enumerate() {
+            let word = &self.words[block as usize];
+            let current = word.load(Ordering::Acquire);
+            if current == WRITER {
+                for &held in &unique[..index] {
+                    self.words[held as usize].fetch_sub(1, Ordering::AcqRel);
+                }
+                anyhow::bail!("host block {block} is writer-claimed");
+            }
+            word.store(current + 1, Ordering::Release);
         }
         Ok(BlockLease {
             arena: self.clone(),
@@ -90,41 +146,30 @@ impl HostBlocks {
         })
     }
 
-    /// Reads a range of the arena; the caller must hold a lease covering every touched block.
-    pub fn read(&self, range: Range<usize>) -> Result<&[bf16]> {
-        ensure!(
-            range.start <= range.end && range.end <= self.elements,
-            "host read {range:?} outside {} elements",
-            self.elements
-        );
-        // SAFETY: the lease excludes writers on every block the caller reads; see the type contract.
-        let data: &[bf16] = unsafe { &*self.data.get() };
-        Ok(&data[range])
-    }
-
-    /// Writes one whole block; requires zero outstanding leases on that block.
-    pub fn write(&self, block: u32, values: &[bf16]) -> Result<()> {
-        let range = self.block_range(block)?;
-        ensure!(
-            values.len() == range.len(),
-            "host block {block} write has {} elements, expected {}",
-            values.len(),
-            range.len()
-        );
-        ensure!(
-            self.leases[block as usize].load(Ordering::Acquire) == 0,
-            "host block {block} is leased"
-        );
-        // SAFETY: no lease on this block; the caller has ordered the write behind the block's
-        // device copy event.
-        let data: &mut [bf16] = unsafe { &mut *self.data.get() };
-        data[range].copy_from_slice(values);
-        Ok(())
+    /// Claims one block exclusively; fails while it is leased or claimed.
+    pub fn claim(self: &Arc<Self>, block: u32) -> Result<WriteClaim> {
+        self.block_range(block)?;
+        let _guard = self.claim.lock().unwrap_or_else(|e| e.into_inner());
+        self.words[block as usize]
+            .compare_exchange(0, WRITER, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|current| {
+                anyhow::anyhow!("host block {block} is busy (word {current}, writer {WRITER})")
+            })?;
+        Ok(WriteClaim {
+            arena: self.clone(),
+            block,
+        })
     }
 
     pub fn lease_count(&self, block: u32) -> Result<u32> {
         self.block_range(block)?;
-        Ok(self.leases[block as usize].load(Ordering::Acquire))
+        Ok(self.words[block as usize].load(Ordering::Acquire))
+    }
+
+    fn block_slice(&self, block: u32) -> Result<&[bf16]> {
+        let range = self.block_range(block)?;
+        let data: &[bf16] = unsafe { &*self.data.get() };
+        Ok(&data[range])
     }
 }
 
@@ -132,37 +177,74 @@ impl HostBlocks {
 mod tests {
     use super::*;
 
+    /// A read after the lease drops does not compile: `BlockLease::read` borrows the guard.
     #[test]
-    fn a_leased_block_rejects_writes_until_the_lease_drops() -> Result<()> {
+    fn a_claim_fails_while_the_block_is_leased() -> Result<()> {
         let arena = HostBlocks::new(2, 4)?;
-        let values: Vec<bf16> = (0..4).map(|i| bf16::from_f32(i as f32)).collect();
-        arena.write(0, &values)?;
-        assert_eq!(arena.read(0..4)?, values.as_slice());
         let lease = arena.lease(&[0])?;
+        let Err(error) = arena.claim(0) else {
+            panic!("claim succeeded while leased");
+        };
+        let error = error.to_string();
+        assert!(error.contains("host block 0 is busy"), "{error}");
         assert_eq!(arena.lease_count(0)?, 1);
-        let error = arena.write(0, &values).unwrap_err().to_string();
-        assert!(error.contains("block 0 is leased"), "{error}");
         drop(lease);
-        assert_eq!(arena.lease_count(0)?, 0);
-        arena.write(0, &values)?;
-        assert!(arena.write(3, &values).is_err());
-        assert!(arena.write(1, &values[..3]).is_err());
+        let mut claim = arena.claim(0)?;
+        let values: Vec<bf16> = (0..4).map(|i| bf16::from_f32(i as f32)).collect();
+        claim.slice()?.copy_from_slice(&values);
+        drop(claim);
+        let lease = arena.lease(&[0])?;
+        assert_eq!(lease.read(0)?, values.as_slice());
         Ok(())
     }
 
     #[test]
-    fn overlapping_leases_count_once_and_release_together() -> Result<()> {
+    fn a_lease_fails_while_the_block_is_claimed() -> Result<()> {
         let arena = HostBlocks::new(2, 4)?;
-        let a = arena.lease(&[1, 0, 1])?;
+        let claim = arena.claim(1)?;
+        let Err(error) = arena.lease(&[0, 1]) else {
+            panic!("lease succeeded while claimed");
+        };
+        let error = error.to_string();
+        assert!(error.contains("block 1 is writer-claimed"), "{error}");
+        assert_eq!(arena.lease_count(0)?, 0);
+        drop(claim);
+        let lease = arena.lease(&[0, 1])?;
+        assert_eq!(lease.read(1)?.len(), 4);
+        assert!(lease.read(0).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_indices_leave_every_count_unchanged() -> Result<()> {
+        let arena = HostBlocks::new(2, 4)?;
+        assert!(arena.lease(&[0, 5]).is_err());
+        assert_eq!(arena.lease_count(0)?, 0);
+        assert_eq!(arena.lease_count(1)?, 0);
+        assert!(arena.claim(9).is_err());
+        let lease = arena.lease(&[1, 0, 1])?;
         assert_eq!(arena.lease_count(0)?, 1);
         assert_eq!(arena.lease_count(1)?, 1);
-        let b = arena.lease(&[1])?;
-        assert_eq!(arena.lease_count(1)?, 2);
-        drop(a);
-        assert_eq!(arena.lease_count(1)?, 1);
-        drop(b);
+        assert!(lease.read(0).is_ok());
+        assert!(lease.read(1).is_ok());
+        drop(lease);
+        assert_eq!(arena.lease_count(0)?, 0);
         assert_eq!(arena.lease_count(1)?, 0);
-        assert!(arena.read(0..9).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_claim_exposes_only_its_block() -> Result<()> {
+        let arena = HostBlocks::new(2, 4)?;
+        let mut claim = arena.claim(0)?;
+        assert_eq!(claim.slice()?.len(), 4);
+        assert!(claim.pointer()? > 0);
+        let second = arena.claim(1)?;
+        assert!(arena.claim(0).is_err());
+        drop(second);
+        drop(claim);
+        let other = arena.claim(1)?;
+        drop(other);
         Ok(())
     }
 }
