@@ -1100,9 +1100,10 @@ fn tower_bytes(geometry: &VisionGeometry, packings: &VisionPackings) -> Result<(
     } else {
         0
     };
+    let gathered = usize::from(packings.down.is_some());
     let payload = [
         prefix_bytes(rows, geometry)?,
-        rows.checked_mul((6 * hidden + 3 * hidden + geometry.mlp as usize) * 2)
+        rows.checked_mul(((5 + gathered) * hidden + 3 * hidden + geometry.mlp as usize) * 2)
             .context("tower work overflow")?,
         (packings.v_rows() as usize)
             .checked_mul(hidden * 2)
@@ -2189,7 +2190,7 @@ mod tests {
         };
         let (bytes, scratch) = tower_bytes(&q38_geometry(), &packings)?;
         let expected = 12 * 18464
-            + 12 * (1152 * 6 + 3456 + 4304) * 2
+            + 12 * (1152 * 5 + 3456 + 4304) * 2
             + 128 * 1152 * 2
             + 3 * 5120 * 2
             + 40
