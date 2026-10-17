@@ -1,12 +1,19 @@
 //! CPU gates for the MoE prefill op (scratch sizing, problem grouping) and
 //! the frozen GPU gate. The GPU test is ignored by default and runs only
 //! under an acknowledged window with --include-ignored --test-threads=1.
-use super::prefill::{MoePrefill, PrefillOps, group_runs, prefill_scratch_bytes, problem_order};
+use super::combine::{CombineOps, MoeCombine};
+use super::prefill::{
+    GEMM1_PTR_WORDS, GEMM2_PTR_WORDS, MAX_EXPERTS, MoePrefill, MoePrefillContribute, PrefillOps,
+    d2h_active_total_word, d2h_window_words, group_runs, prefill_layout, prefill_scratch_bytes,
+    problem_order,
+};
 use super::reference::{self, Combine, MoeDims, MoeFixture};
 use super::testing;
 use crate::backend::cuda::contracts::{Scratch, TensorMut};
+use crate::backend::cuda::cubin;
+use crate::backend::cuda::ops::grid;
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -22,28 +29,22 @@ fn scratch_sizing_matches_region_math() {
         (4096, 8, 256, 2048, 512),
     ] {
         let assignments = rows * top_k;
-        let regions: [(usize, u64); 21] = [
+        let regions: [(usize, u64); 15] = [
             (experts, 4),
             (1, 4),
             (experts + 1, 4),
             (experts, 4),
             (assignments, 4),
             (assignments, 4),
-            (assignments, 4),
             (assignments * hidden, 2),
             (assignments * 2 * inter, 2),
             (assignments * inter, 2),
+            (assignments * hidden, 2),
             (assignments * hidden, 2),
             (rows * 2 * inter, 2),
             (rows * inter, 2),
             (rows * hidden, 2),
             (rows, 2),
-            (experts + 2, 8),
-            (experts + 2, 8),
-            (experts + 2, 8),
-            (assignments + 1, 8),
-            (assignments + 1, 8),
-            (assignments + 1, 8),
         ];
         let expected: u64 = regions
             .iter()
@@ -57,11 +58,12 @@ fn scratch_sizing_matches_region_math() {
             "scratch must pad at least one region"
         );
     }
-    // Production prefill chunk: raw regions 399_656_016 B plus the region
-    // paddings.
+    // Production prefill chunk: raw regions 532,950,024 B plus the region
+    // paddings; y_perm duplicates the contributions extent for the
+    // per-expert grouped GEMM2.
     assert_eq!(
         prefill_scratch_bytes(4096, 8, 256, 2048, 512).unwrap(),
-        399_657_984
+        532_950_528
     );
     assert!(
         prefill_scratch_bytes(4096, 8, 256, 2048, 512).unwrap()
@@ -69,19 +71,50 @@ fn scratch_sizing_matches_region_math() {
     );
 }
 
+/// Stage capacities: the D2H window holds counts[E], the 256-byte-aligned
+/// active total and offsets[E+1] for every experts count up to MAX_EXPERTS,
+/// and the pointer blocks hold one A/B/C pointer per active expert plus the
+/// shared entries.
+#[test]
+fn stage_capacity_math() {
+    for experts in [1usize, 2, 8, 255, 256, 257, 1023, MAX_EXPERTS] {
+        let padded_counts = up256(experts as u64 * 4) as usize;
+        assert_eq!(d2h_active_total_word(experts), padded_counts / 4);
+        assert_eq!(
+            d2h_window_words(experts),
+            padded_counts / 4 + up256(4) as usize / 4 + experts + 1,
+            "experts={experts}"
+        );
+    }
+    for experts in 1..=MAX_EXPERTS {
+        assert!(
+            d2h_window_words(experts) <= d2h_window_words(MAX_EXPERTS),
+            "D2H window exceeds the stage capacity at experts={experts}"
+        );
+    }
+    assert_eq!(d2h_window_words(MAX_EXPERTS), 2113);
+    assert_eq!(GEMM1_PTR_WORDS, 3 * (MAX_EXPERTS + 2));
+    assert_eq!(GEMM2_PTR_WORDS, 3 * (MAX_EXPERTS + 1));
+}
+
 #[test]
 fn grouping_orders_and_runs() {
+    let mut order = Vec::new();
+    let mut runs = Vec::new();
     let counts = [0i32, 3, 0, 1, 3, 2];
-    assert_eq!(problem_order(&counts), vec![3, 5, 1, 4]);
-    assert_eq!(
-        group_runs(&problem_order(&counts), &counts),
-        vec![(1, 1), (2, 1), (3, 2)]
-    );
-    assert!(problem_order(&[0, 0, 0]).is_empty());
-    assert!(group_runs(&[], &[]).is_empty());
+    problem_order(&counts, &mut order);
+    assert_eq!(order, vec![3, 5, 1, 4]);
+    group_runs(&order, &counts, &mut runs);
+    assert_eq!(runs, vec![(1, 1), (2, 1), (3, 2)]);
+    problem_order(&[0, 0, 0], &mut order);
+    assert!(order.is_empty());
+    group_runs(&order, &[0, 0, 0], &mut runs);
+    assert!(runs.is_empty());
     let flat = [2, 2, 2, 2];
-    assert_eq!(problem_order(&flat), vec![0, 1, 2, 3]);
-    assert_eq!(group_runs(&problem_order(&flat), &flat), vec![(2, 4)]);
+    problem_order(&flat, &mut order);
+    assert_eq!(order, vec![0, 1, 2, 3]);
+    group_runs(&order, &flat, &mut runs);
+    assert_eq!(runs, vec![(2, 4)]);
 }
 
 /// The eviction-arm fixture: hot-expert weights scaled by 1.25 (bf16 round);
@@ -270,11 +303,13 @@ struct SharedBufs {
     seg: CudaSlice<bf16>,
 }
 
-/// Host slot tables plus the device valid/generation arrays they were
-/// published with.
+/// Host slot tables plus the device tables (pointer arrays, valid mask,
+/// generation) they were published with.
 struct DeviceSlots {
     gu_host: Vec<u64>,
     dn_host: Vec<u64>,
+    gu_dev: CudaSlice<u64>,
+    dn_dev: CudaSlice<u64>,
     valid: CudaSlice<u32>,
     generation: CudaSlice<u64>,
 }
@@ -287,10 +322,12 @@ fn device_slots(
     generation: Vec<u64>,
 ) -> Result<DeviceSlots> {
     Ok(DeviceSlots {
-        gu_host,
-        dn_host,
+        gu_dev: s.clone_htod(&gu_host)?,
+        dn_dev: s.clone_htod(&dn_host)?,
         valid: s.clone_htod(&valid)?,
         generation: s.clone_htod(&generation)?,
+        gu_host,
+        dn_host,
     })
 }
 
@@ -314,6 +351,8 @@ fn moe_input<'a>(
         ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
         active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
         weights: testing::dense(&bufs.weights, s, rows as u32, top_k as u32)?,
+        slots_gate_up: testing::view(&slots.gu_dev, s, [experts as u32], [1])?,
+        slots_down: testing::view(&slots.dn_dev, s, [experts as u32], [1])?,
         slot_valid: testing::view(&slots.valid, s, [experts as u32], [1])?,
         slot_generation: testing::view(&slots.generation, s, [experts as u32], [1])?,
         assignment_gen: testing::dense(&bufs.gens, s, rows as u32, top_k as u32)?,
@@ -325,6 +364,91 @@ fn moe_input<'a>(
         shared_expert_gate: testing::view(&shared.seg, s, [hidden as u32], [1])?,
         y,
     })
+}
+
+/// Caller-owned contribute targets: the contributions/done pair a cohort
+/// writes into.
+struct CohortBufs {
+    contributions: CudaSlice<bf16>,
+    done: CudaSlice<u32>,
+}
+
+/// A contribute input over caller-owned contributions/done buffers.
+fn contribute_input<'a>(
+    s: &Arc<CudaStream>,
+    fx: &MoeFixture,
+    rows: usize,
+    bufs: &CaseBufs,
+    slots: &'a DeviceSlots,
+    shared: &SharedBufs,
+    cohort: &CohortBufs,
+) -> Result<MoePrefillContribute<'a>> {
+    let (experts, top_k, hidden, inter) = (
+        fx.dims.experts,
+        fx.dims.top_k,
+        fx.dims.hidden,
+        fx.dims.inter,
+    );
+    Ok(MoePrefillContribute {
+        x: testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
+        ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
+        active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
+        weights: testing::dense(&bufs.weights, s, rows as u32, top_k as u32)?,
+        slots_gate_up: testing::view(&slots.gu_dev, s, [experts as u32], [1])?,
+        slots_down: testing::view(&slots.dn_dev, s, [experts as u32], [1])?,
+        slot_valid: testing::view(&slots.valid, s, [experts as u32], [1])?,
+        slot_generation: testing::view(&slots.generation, s, [experts as u32], [1])?,
+        assignment_gen: testing::dense(&bufs.gens, s, rows as u32, top_k as u32)?,
+        slots_gate_up_host: &slots.gu_host,
+        slots_down_host: &slots.dn_host,
+        shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
+        shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
+        shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
+        shared_expert_gate: testing::view(&shared.seg, s, [hidden as u32], [1])?,
+        contributions: testing::view(
+            &cohort.contributions,
+            s,
+            [rows as u32, top_k as u32, hidden as u32],
+            [(top_k * hidden) as u64, hidden as u64, 1],
+        )?,
+        done: testing::mut_view(
+            &cohort.done,
+            s,
+            [rows as u32, top_k as u32],
+            [top_k as u64, 1],
+        )?,
+    })
+}
+
+/// Raw device-address copies for the mutant/join cells.
+fn raw_dtoh<T>(s: &Arc<CudaStream>, src: u64, dst: &mut [T]) -> Result<()> {
+    s.context().bind_to_thread()?;
+    unsafe {
+        cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+            dst.as_mut_ptr().cast(),
+            src,
+            std::mem::size_of_val(dst),
+            s.cu_stream(),
+        )
+        .result()?;
+    }
+    s.synchronize()?;
+    Ok(())
+}
+
+fn raw_htod<T>(s: &Arc<CudaStream>, dst: u64, src: &[T]) -> Result<()> {
+    s.context().bind_to_thread()?;
+    unsafe {
+        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+            dst,
+            src.as_ptr().cast(),
+            std::mem::size_of_val(src),
+            s.cu_stream(),
+        )
+        .result()?;
+    }
+    s.synchronize()?;
+    Ok(())
 }
 
 struct Arm<'a> {
@@ -442,6 +566,123 @@ impl GpuCase<'_> {
     }
 }
 
+/// Shared context of the K2/K4 join cells.
+struct GateCtx<'a> {
+    s: &'a Arc<CudaStream>,
+    ops: &'a PrefillOps,
+    combine: &'a CombineOps,
+    fx: &'a MoeFixture,
+    slots: &'a DeviceSlots,
+    shared: &'a SharedBufs,
+    scratch: &'a Scratch,
+}
+
+/// Real shared-FFN bits for the join cells: one wrapper run on this input,
+/// then the shared_out region read back from scratch.
+fn capture_shared_out(
+    ctx: &GateCtx<'_>,
+    rows: usize,
+    ids: &[i32],
+    active: &[u32],
+    weights: &[bf16],
+    gens: &[u64],
+) -> Result<CudaSlice<bf16>> {
+    let fx = ctx.fx;
+    let (top_k, hidden, experts, inter) = (
+        fx.dims.top_k,
+        fx.dims.hidden,
+        fx.dims.experts,
+        fx.dims.inter,
+    );
+    let case_bufs = case_bufs(ctx.s, fx, rows, ids, active, weights, gens)?;
+    let y: CudaSlice<bf16> = ctx.s.alloc_zeros(rows * hidden)?;
+    let y_view = testing::dense_mut(&y, ctx.s, rows as u32, hidden as u32)?;
+    let input = moe_input(ctx.s, fx, rows, &case_bufs, ctx.slots, ctx.shared, y_view)?;
+    ctx.ops.prefill(ctx.s, input, ctx.scratch)?;
+    ctx.s.synchronize()?;
+    let layout = prefill_layout(rows, top_k, experts, hidden, inter)?;
+    let mut host = vec![bf16::ZERO; rows * hidden];
+    raw_dtoh(ctx.s, ctx.scratch.ptr + layout.shared_out, &mut host)?;
+    Ok(ctx.s.clone_htod(&host)?)
+}
+
+/// One wrapper-style join over caller-owned buffers: sigmoid gate once per
+/// row, then the combine with `bufs.active` as the final union mask;
+/// returns the y bits.
+fn join_combine(
+    ctx: &GateCtx<'_>,
+    rows: usize,
+    bufs: &CaseBufs,
+    shared_out: &CudaSlice<bf16>,
+    contributions: &CudaSlice<bf16>,
+    done: &CudaSlice<u32>,
+) -> Result<Vec<u16>> {
+    let (s, fx, shared) = (ctx.s, ctx.fx, ctx.shared);
+    let (top_k, hidden) = (fx.dims.top_k, fx.dims.hidden);
+    let scale: CudaSlice<bf16> = s.alloc_zeros(rows)?;
+    let y: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
+    let mut scale_view = testing::dense_mut(&scale, s, rows as u32, 1)?;
+    ctx.combine.shared_scale(
+        s,
+        testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
+        testing::view(&shared.seg, s, [hidden as u32], [1])?,
+        &mut scale_view,
+    )?;
+    let input = MoeCombine {
+        ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
+        final_active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
+        done: testing::view(done, s, [rows as u32, top_k as u32], [top_k as u64, 1])?,
+        contributions: testing::view(
+            contributions,
+            s,
+            [rows as u32, top_k as u32, hidden as u32],
+            [(top_k * hidden) as u64, hidden as u64, 1],
+        )?,
+        shared_out: testing::dense(shared_out, s, rows as u32, hidden as u32)?,
+        x: testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
+        shared_expert_gate: testing::view(&shared.seg, s, [hidden as u32], [1])?,
+        scale: scale_view,
+        y: testing::dense_mut(&y, s, rows as u32, hidden as u32)?,
+    };
+    ctx.combine.combine(s, &input)?;
+    s.synchronize()?;
+    Ok(s.clone_dtoh(&y)?.iter().map(|v| v.to_bits()).collect())
+}
+
+/// Contribute `cohorts` sequentially into one caller-owned
+/// contributions/done pair, then one join; returns the y bits.
+fn join_bits(
+    ctx: &GateCtx<'_>,
+    rows: usize,
+    ids: &[i32],
+    weights: &[bf16],
+    gens: &[u64],
+    shared_out: &CudaSlice<bf16>,
+    cohorts: &[Vec<u32>],
+) -> Result<Vec<u16>> {
+    let (s, fx) = (ctx.s, ctx.fx);
+    let (top_k, hidden) = (fx.dims.top_k, fx.dims.hidden);
+    let cohort = CohortBufs {
+        contributions: s.alloc_zeros(rows * top_k * hidden)?,
+        done: s.alloc_zeros(rows * top_k)?,
+    };
+    for active in cohorts {
+        let bufs = case_bufs(s, fx, rows, ids, active, weights, gens)?;
+        let input = contribute_input(s, fx, rows, &bufs, ctx.slots, ctx.shared, &cohort)?;
+        ctx.ops.prefill_contribute(s, input, ctx.scratch)?;
+        s.synchronize()?;
+    }
+    let union = case_bufs(s, fx, rows, ids, &all_active(rows, top_k), weights, gens)?;
+    join_combine(
+        ctx,
+        rows,
+        &union,
+        shared_out,
+        &cohort.contributions,
+        &cohort.done,
+    )
+}
+
 /// Runs one control input and returns its max diff against the reference on
 /// the original ids/weights.
 fn control_diff(
@@ -489,13 +730,16 @@ fn moe_prefill_gpu() -> Result<()> {
     match std::env::var("FF_MOE_CHILD").as_deref() {
         Ok("stale") => return stale_generation_child(),
         Ok("dup") => return duplicate_ids_child(),
+        Ok("oobpos") => return pos_of_oob_child(),
         _ => {}
     }
     let d = crate::backend::cuda::Device::new(0)?;
     let s = &d.stream;
     let mut defects: Vec<String> = Vec::new();
     let ops = PrefillOps::new(&d.ctx, s)?;
-    let fx = reference::fixture(MoeDims::minicpm47(4096), 0);
+    // The 16384-row arm slices the same fixture, so its weights are the ones
+    // every smaller-rows arm already scores against.
+    let fx = reference::fixture(MoeDims::minicpm47(16384), 0);
     let (experts, top_k, hidden, inter) = (
         fx.dims.experts,
         fx.dims.top_k,
@@ -521,7 +765,7 @@ fn moe_prefill_gpu() -> Result<()> {
         vec![1u32; experts],
         vec![1u64; experts],
     )?;
-    let scratch_bytes = prefill_scratch_bytes(4096, top_k, experts, hidden, inter)?;
+    let scratch_bytes = prefill_scratch_bytes(16384, top_k, experts, hidden, inter)?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
     let scratch = Scratch {
@@ -544,6 +788,10 @@ fn moe_prefill_gpu() -> Result<()> {
         tol,
     };
 
+    // The per-expert GEMM2 shape (n = m_e per expert, restored from the
+    // per-assignment n=1 problems) is confirmed on device by every arm
+    // below: they score the full path against the unchanged oracle under
+    // the frozen tolerance.
     for rows in [1usize, 37, 512, 4096] {
         // Full-row reference compares run only at rows <= 37; above that the
         // debug-build host reference (about 0.1 GFLOP per row) exceeds the
@@ -622,6 +870,45 @@ fn moe_prefill_gpu() -> Result<()> {
         case.run(
             Arm {
                 label: "routed",
+                rows,
+                ids: &ids,
+                active: &active,
+                weights: &weights,
+                check: &check,
+                gens: &gens,
+                slots: &main_slots,
+            },
+            &mut defects,
+        )?;
+    }
+
+    // rows=16384: 131072 assignments drive the permute/scatter grids, the
+    // count loop and the largest per-expert GEMM2 segments; 16-row coprime
+    // sample checks like the 512/4096 arms.
+    {
+        let rows = 16384usize;
+        let check = sample_rows(rows);
+        let active = all_active(rows, top_k);
+        let (ids, weights) = planted_uniform(rows, experts, top_k);
+        let gens = vec![1u64; rows * top_k];
+        case.run(
+            Arm {
+                label: "uniform",
+                rows,
+                ids: &ids,
+                active: &active,
+                weights: &weights,
+                check: &check,
+                gens: &gens,
+                slots: &main_slots,
+            },
+            &mut defects,
+        )?;
+        let (ids, weights) = planted_skewed(rows, top_k);
+        let gens = vec![1u64; rows * top_k];
+        case.run(
+            Arm {
+                label: "skewed",
                 rows,
                 ids: &ids,
                 active: &active,
@@ -844,6 +1131,154 @@ fn moe_prefill_gpu() -> Result<()> {
         );
     }
 
+    // K2 duplicate-pos_of mutant: after a clean all-active contribute, the
+    // real moe_scatter is re-launched over a planted pos_of where choice 1
+    // of row 0 points at choice 0's Y_perm row; the joined output must move
+    // beyond the frozen tolerance (two active assignments reading one
+    // Y_perm row).
+    {
+        let rows = 37usize;
+        let (ids, weights) = planted_uniform(rows, experts, top_k);
+        let active = all_active(rows, top_k);
+        let gens = vec![1u64; rows * top_k];
+        let combine_ops = CombineOps::new(&d.ctx)?;
+        let ctx = GateCtx {
+            s,
+            ops: &ops,
+            combine: &combine_ops,
+            fx: &fx,
+            slots: &main_slots,
+            shared: &shared,
+            scratch: &scratch,
+        };
+        let shared_out = capture_shared_out(&ctx, rows, &ids, &active, &weights, &gens)?;
+        let cohort = CohortBufs {
+            contributions: s.alloc_zeros(rows * top_k * hidden)?,
+            done: s.alloc_zeros(rows * top_k)?,
+        };
+        let bufs = case_bufs(s, &fx, rows, &ids, &active, &weights, &gens)?;
+        let input = contribute_input(s, &fx, rows, &bufs, &main_slots, &shared, &cohort)?;
+        ops.prefill_contribute(s, input, &scratch)?;
+        s.synchronize()?;
+        let layout = prefill_layout(rows, top_k, experts, hidden, inter)?;
+        let mut pos_of = vec![0i32; rows * top_k];
+        raw_dtoh(s, scratch.ptr + layout.pos_of, &mut pos_of)?;
+        let planted = (pos_of[0], pos_of[1]);
+        pos_of[1] = pos_of[0];
+        raw_htod(s, scratch.ptr + layout.pos_of + 4, &pos_of[1..2])?;
+        let module = cubin::module(&d.ctx, "moe_prefill")?;
+        let scatter = module.load_function("moe_scatter")?;
+        let (contributions_ptr, _gc) = cohort.contributions.device_ptr(s);
+        let (weights_ptr, _gw) = bufs.weights.device_ptr(s);
+        let (active_ptr, _ga) = bufs.active.device_ptr(s);
+        unsafe {
+            s.launch_builder(&scatter)
+                .arg(&(scratch.ptr + layout.y_perm))
+                .arg(&weights_ptr)
+                .arg(&(scratch.ptr + layout.pos_of))
+                .arg(&active_ptr)
+                .arg(&contributions_ptr)
+                .arg(&((rows * top_k) as i64))
+                .arg(&(hidden as i64))
+                .launch(grid(rows * top_k, 256))?;
+        }
+        s.synchronize()?;
+        let bits = join_combine(
+            &ctx,
+            rows,
+            &bufs,
+            &shared_out,
+            &cohort.contributions,
+            &cohort.done,
+        )?;
+        let mut row0_diff = 0.0f32;
+        let mut max_diff = 0.0f32;
+        for row in 0..rows {
+            let expected = reference::moe_row_ids(
+                &fx,
+                row,
+                &ids[row * top_k..(row + 1) * top_k],
+                &weights[row * top_k..(row + 1) * top_k],
+                &(0..top_k).collect::<Vec<_>>(),
+                Combine::Fp32,
+            );
+            for c in 0..hidden {
+                let got = bf16::from_bits(bits[row * hidden + c]).to_f32();
+                let diff = (got - expected[c].to_f32()).abs();
+                if row == 0 {
+                    row0_diff = row0_diff.max(diff);
+                }
+                max_diff = max_diff.max(diff);
+            }
+        }
+        eprintln!(
+            "moe_prefill K2 duplicate-pos_of rows={rows} planted pos_of[1]={} (was {}) row0 max_diff={row0_diff:.6} max_diff={max_diff:.6} tol={:.6}",
+            planted.0, planted.1, tol
+        );
+        anyhow::ensure!(
+            row0_diff > tol && max_diff > tol,
+            "duplicate pos_of was not detected: row0 {row0_diff:.6} max {max_diff:.6} <= tol {tol:.6}"
+        );
+    }
+
+    // K4 two-cohort join: the routed rows=37 input split into choice-parity
+    // cohorts contributed into ONE caller-owned contributions/done pair,
+    // then one wrapper-style join with the union mask; bitwise equal to the
+    // single all-active cohort run.
+    {
+        let rows = 37usize;
+        let mut ids = vec![0i32; rows * top_k];
+        let mut weights = vec![bf16::ZERO; rows * top_k];
+        for r in 0..rows {
+            let routed = reference::route_row(&fx, r);
+            ids[r * top_k..(r + 1) * top_k].copy_from_slice(&routed.ids);
+            weights[r * top_k..(r + 1) * top_k].copy_from_slice(&routed.weights);
+        }
+        let gens = vec![1u64; rows * top_k];
+        let combine_ops = CombineOps::new(&d.ctx)?;
+        let ctx = GateCtx {
+            s,
+            ops: &ops,
+            combine: &combine_ops,
+            fx: &fx,
+            slots: &main_slots,
+            shared: &shared,
+            scratch: &scratch,
+        };
+        let shared_out =
+            capture_shared_out(&ctx, rows, &ids, &all_active(rows, top_k), &weights, &gens)?;
+        let single = join_bits(
+            &ctx,
+            rows,
+            &ids,
+            &weights,
+            &gens,
+            &shared_out,
+            &[all_active(rows, top_k)],
+        )?;
+        let mut even = vec![0u32; rows * top_k];
+        let mut odd = vec![0u32; rows * top_k];
+        for a in 0..rows * top_k {
+            if a % 2 == 0 {
+                even[a] = 1;
+            } else {
+                odd[a] = 1;
+            }
+        }
+        let split = join_bits(&ctx, rows, &ids, &weights, &gens, &shared_out, &[even, odd])?;
+        let first_bad = single.iter().zip(&split).position(|(a, b)| a != b);
+        eprintln!(
+            "moe_prefill K4 two-cohort join rows={rows} cohorts=choice-parity words={} first_differing_word={:?}",
+            single.len(),
+            first_bad
+        );
+        anyhow::ensure!(
+            first_bad.is_none(),
+            "two-cohort join is not bitwise equal to the single cohort: first differing word {first_bad:?} of {}",
+            single.len()
+        );
+    }
+
     anyhow::ensure!(defects.is_empty(), "recorded defects: {defects:?}");
     Ok(())
 }
@@ -1006,6 +1441,68 @@ fn duplicate_ids_child() -> Result<()> {
     }
 }
 
+/// pos_of[0] planted to `assignments` (out of range) before a direct
+/// moe_scatter relaunch over the cohort's scratch; the scatter's position
+/// guard must trap. Exits 3 only on the trap's launch failure; every other
+/// outcome fails the test (harness exit 101).
+fn pos_of_oob_child() -> Result<()> {
+    let d = crate::backend::cuda::Device::new(0)?;
+    let s = &d.stream;
+    let ops = PrefillOps::new(&d.ctx, s)?;
+    let fx = reference::fixture(MoeDims::new(8, 16, 4, 32, 16), 0);
+    let (experts, top_k, hidden, inter) = (
+        fx.dims.experts,
+        fx.dims.top_k,
+        fx.dims.hidden,
+        fx.dims.inter,
+    );
+    let rows = fx.dims.rows;
+    let (ids, weights) = planted_uniform(rows, experts, top_k);
+    let active = all_active(rows, top_k);
+    let gens = vec![1u64; rows * top_k];
+    let setup = child_setup(s, &fx, vec![1u64; experts])?;
+    let cohort = CohortBufs {
+        contributions: s.alloc_zeros(rows * top_k * hidden)?,
+        done: s.alloc_zeros(rows * top_k)?,
+    };
+    let bufs = case_bufs(s, &fx, rows, &ids, &active, &weights, &gens)?;
+    let input = contribute_input(s, &fx, rows, &bufs, &setup.slots, &setup.shared, &cohort)?;
+    ops.prefill_contribute(s, input, &setup.scratch)?;
+    s.synchronize()?;
+    let layout = prefill_layout(rows, top_k, experts, hidden, inter)?;
+    let planted = [(rows * top_k) as i32];
+    raw_htod(s, setup.scratch.ptr + layout.pos_of, &planted)?;
+    let module = cubin::module(&d.ctx, "moe_prefill")?;
+    let scatter = module.load_function("moe_scatter")?;
+    let (contributions_ptr, _gc) = cohort.contributions.device_ptr(s);
+    let (weights_ptr, _gw) = bufs.weights.device_ptr(s);
+    let (active_ptr, _ga) = bufs.active.device_ptr(s);
+    let launched = unsafe {
+        s.launch_builder(&scatter)
+            .arg(&(setup.scratch.ptr + layout.y_perm))
+            .arg(&weights_ptr)
+            .arg(&(setup.scratch.ptr + layout.pos_of))
+            .arg(&active_ptr)
+            .arg(&contributions_ptr)
+            .arg(&((rows * top_k) as i64))
+            .arg(&(hidden as i64))
+            .launch(grid(rows * top_k, 256))
+    };
+    let outcome = launched
+        .and_then(|_| s.synchronize())
+        .map_err(anyhow::Error::from);
+    eprintln!(
+        "moe_prefill K2 out-of-range pos_of rows={rows} planted pos_of[0]={} assignments={}",
+        planted[0],
+        rows * top_k
+    );
+    match outcome {
+        Ok(()) => anyhow::bail!("out-of-range pos_of did not trap"),
+        Err(err) if trap_launched(&err) => std::process::exit(3),
+        Err(err) => anyhow::bail!("scatter relaunch failed without the trap: {err:#}"),
+    }
+}
+
 // Same isolation as the gate children: the parent makes no CUDA call.
 #[test]
 #[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
@@ -1053,6 +1550,32 @@ fn prefill_duplicate_ids_gpu() -> Result<()> {
     anyhow::ensure!(
         status.code() == Some(3),
         "duplicate-ids child exit {:?} != 3 (the permute trap was not proven)",
+        status.code()
+    );
+    Ok(())
+}
+
+// Parent for the out-of-range pos_of child; no CUDA call in the parent.
+#[test]
+#[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
+fn prefill_pos_of_bounds_gpu() -> Result<()> {
+    anyhow::ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "moe_prefill_gpu",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("FF_Q38_GPU_WINDOW", "granted")
+        .env("FF_MOE_CHILD", "oobpos")
+        .status()?;
+    anyhow::ensure!(
+        status.code() == Some(3),
+        "out-of-range pos_of child exit {:?} != 3 (the scatter trap was not proven)",
         status.code()
     );
     Ok(())

@@ -84,6 +84,7 @@ fn compare_case(
     let k = out.dims.top_k;
     let mut strict = 0;
     let mut gated = 0;
+    let mut max_weight_dev = 0.0f32;
     for &row in rows {
         let want = &refs[&row];
         let ids = &out.ids[row * k..(row + 1) * k];
@@ -112,14 +113,16 @@ fn compare_case(
         );
         for (j, (got, &expected)) in weights.iter().zip(&want.weights).enumerate() {
             let (got, expected) = (got.to_f32(), expected.to_f32());
+            let dev = (got - expected).abs();
+            max_weight_dev = max_weight_dev.max(dev);
             ensure!(
-                (got - expected).abs() <= tol,
+                dev <= tol,
                 "route case {case} row {row} weight {j} {got:e} vs {expected:e} (tol {tol:e})"
             );
         }
     }
     eprintln!(
-        "MOE_ROUTE_CASE rows={case} checked={} strict_ids={strict} gated_ids={gated} PASS",
+        "MOE_ROUTE_CASE rows={case} checked={} strict_ids={strict} gated_ids={gated} max_weight_dev={max_weight_dev:e} PASS",
         rows.len()
     );
     Ok(())
@@ -134,7 +137,7 @@ fn moe_route_gpu() -> Result<()> {
     );
     let d = Device::new(0)?;
     let s = &d.stream;
-    let ops = RouteOps::new(&d.ctx)?;
+    let ops = RouteOps::new(&d.ctx, s)?;
     let dims = MoeDims::minicpm47(4096);
     let (e, k, h) = (dims.experts, dims.top_k, dims.hidden);
     let fx = reference::fixture(dims, 0);
@@ -221,6 +224,162 @@ fn moe_route_gpu() -> Result<()> {
     eprintln!(
         "MOE_ROUTE_CONTROL perturbed_ids={:?} changed={changed} PASS",
         &ids[..k]
+    );
+    Ok(())
+}
+
+/// Prefill route arms: rows 37/512/4096 as prefix views of the 4096-row
+/// fixture, ids compared against reference::route_row on rows whose cut
+/// margin exceeds CUT_MARGIN_THRESHOLD, weights within the frozen tolerance.
+const PREFILL_ROW_CASES: [u32; 3] = [37, 512, 4096];
+
+#[test]
+#[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
+fn moe_route_prefill_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let d = Device::new(0)?;
+    let s = &d.stream;
+    let ops = RouteOps::new(&d.ctx, s)?;
+    let dims = MoeDims::minicpm47(4096);
+    let (e, k, h) = (dims.experts, dims.top_k, dims.hidden);
+    let fx = reference::fixture(dims, 0);
+    let refs: HashMap<usize, RouteRow> = checked_rows(4096)
+        .into_iter()
+        .map(|row| (row, reference::route_row(&fx, row)))
+        .collect();
+    let tol = reference::tolerance(&fx, &[0, 1, 37]);
+
+    let xb = testing::upload(&d.upload, fx.x.clone())?;
+    let rb = testing::upload(&d.upload, fx.router_w.clone())?;
+    d.finish_upload()?;
+    let mut idsb = testing::zeros::<i32>(s, dims.rows * k)?;
+    let mut wb = testing::zeros::<bf16>(s, dims.rows * k)?;
+    let mut fused_idsb = testing::zeros::<i32>(s, dims.rows * k)?;
+    let mut fused_wb = testing::zeros::<bf16>(s, dims.rows * k)?;
+    let lb = testing::zeros::<bf16>(s, dims.rows * e)?;
+
+    let run = |rows: u32,
+               xb: &CudaSlice<bf16>,
+               rb: &CudaSlice<bf16>,
+               idsb: &mut CudaSlice<i32>,
+               wb: &mut CudaSlice<bf16>|
+     -> Result<()> {
+        let x = testing::dense(xb, s, dims.rows as u32, h as u32)?.prefix_rows(rows)?;
+        let router = testing::dense(rb, s, e as u32, h as u32)?;
+        let mut ids = TensorMut(
+            testing::dense_mut(idsb, s, dims.rows as u32, k as u32)?
+                .0
+                .prefix_rows(rows)?,
+        );
+        let mut weights = TensorMut(
+            testing::dense_mut(wb, s, dims.rows as u32, k as u32)?
+                .0
+                .prefix_rows(rows)?,
+        );
+        let mut logits = TensorMut(
+            testing::dense_mut(&lb, s, dims.rows as u32, e as u32)?
+                .0
+                .prefix_rows(rows)?,
+        );
+        ops.route_prefill(s, x, router, &mut ids, &mut weights, &mut logits)
+    };
+
+    for &case in &PREFILL_ROW_CASES {
+        s.memcpy_htod(&vec![-1i32; dims.rows * k], &mut idsb)?;
+        s.memcpy_htod(&vec![bf16::from_f32(-17.0); dims.rows * k], &mut wb)?;
+        run(case, &xb, &rb, &mut idsb, &mut wb)?;
+        s.synchronize()?;
+        let rows = checked_rows(case);
+        let ids = s.clone_dtoh(&idsb)?;
+        let weights = s.clone_dtoh(&wb)?;
+        let (a, b) = fx.exact_tie_experts;
+        let first = &ids[0..k];
+        ensure!(
+            first[0] as usize == a && first[1] as usize == b,
+            "prefill exact-tie row must return both tie experts with the lower id first: {first:?} vs ({a},{b})"
+        );
+        compare_case(
+            case,
+            &refs,
+            &rows,
+            &CaseOutputs {
+                dims,
+                ids: &ids,
+                weights: &weights,
+            },
+            tol,
+        )?;
+    }
+
+    // Cross-check at rows 8: the GEMM path and the fused kernel must agree on
+    // ids wherever the reference cut margin exceeds the frozen threshold.
+    let rows = checked_rows(8);
+    ensure!(
+        rows.iter()
+            .any(|&row| refs[&row].margin > CUT_MARGIN_THRESHOLD),
+        "cross-check needs at least one margin-gated row"
+    );
+    s.memcpy_htod(&vec![-1i32; dims.rows * k], &mut idsb)?;
+    s.memcpy_htod(&vec![bf16::from_f32(-17.0); dims.rows * k], &mut wb)?;
+    run(8, &xb, &rb, &mut idsb, &mut wb)?;
+    s.memcpy_htod(&vec![-1i32; dims.rows * k], &mut fused_idsb)?;
+    s.memcpy_htod(&vec![bf16::from_f32(-17.0); dims.rows * k], &mut fused_wb)?;
+    {
+        let x = testing::dense(&xb, s, dims.rows as u32, h as u32)?.prefix_rows(8)?;
+        let router = testing::dense(&rb, s, e as u32, h as u32)?;
+        let mut ids = TensorMut(
+            testing::dense_mut(&fused_idsb, s, dims.rows as u32, k as u32)?
+                .0
+                .prefix_rows(8)?,
+        );
+        let mut weights = TensorMut(
+            testing::dense_mut(&fused_wb, s, dims.rows as u32, k as u32)?
+                .0
+                .prefix_rows(8)?,
+        );
+        ops.route(s, x, router, &mut ids, &mut weights)?;
+    }
+    s.synchronize()?;
+    let ids = s.clone_dtoh(&idsb)?;
+    let weights = s.clone_dtoh(&wb)?;
+    let fused_ids = s.clone_dtoh(&fused_idsb)?;
+    let fused_weights = s.clone_dtoh(&fused_wb)?;
+    let (a, b) = fx.exact_tie_experts;
+    ensure!(
+        ids[0] as usize == a
+            && ids[1] as usize == b
+            && fused_ids[0] as usize == a
+            && fused_ids[1] as usize == b,
+        "both paths must order the exact-tie pair with the lower id first: prefill {:?} fused {:?}",
+        &ids[..2],
+        &fused_ids[..2]
+    );
+    let mut strict = 0;
+    let mut max_weight_dev = 0.0f32;
+    for &row in &rows {
+        let want = &refs[&row];
+        if want.margin <= CUT_MARGIN_THRESHOLD {
+            continue;
+        }
+        strict += 1;
+        ensure!(
+            ids[row * k..(row + 1) * k] == fused_ids[row * k..(row + 1) * k],
+            "route cross-check row {row} margin {:e}: prefill ids {:?} != fused {:?}",
+            want.margin,
+            &ids[row * k..(row + 1) * k],
+            &fused_ids[row * k..(row + 1) * k]
+        );
+        for j in 0..k {
+            let dev = (weights[row * k + j].to_f32() - fused_weights[row * k + j].to_f32()).abs();
+            max_weight_dev = max_weight_dev.max(dev);
+        }
+    }
+    ensure!(strict > 0, "route cross-check compared no strict rows");
+    eprintln!(
+        "MOE_ROUTE_CROSSCHECK rows=8 strict_ids={strict} max_weight_dev_vs_fused={max_weight_dev:e} PASS"
     );
     Ok(())
 }
