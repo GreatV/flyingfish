@@ -209,6 +209,8 @@ pub struct PlanInputs<'a> {
     /// Device async copy engines available to expert transfers.
     pub copy_engines: u32,
     pub disk_readers: u32,
+    /// Largest host span the setup registration measurement can page-lock; 0 when unsupported.
+    pub host_registration_bytes: u64,
     pub service: &'a ServiceTable,
     pub reserves: &'a Reserves,
     pub span_rows: u32,
@@ -231,6 +233,8 @@ pub struct Capacity {
     pub worker_count: u32,
     pub disk_workers: u32,
     pub prefill_staging_slots: u32,
+    /// Host arena span fits the measured page-lock registration; the engine never infers it.
+    pub pinned: bool,
 }
 
 impl Capacity {
@@ -450,6 +454,10 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
     let disk_bytes = (routed_slots - unique_slots)
         .checked_mul(slot_bytes)
         .context("disk tier bytes overflow")?;
+    let arena_bytes = host_block_slots
+        .checked_mul(slot_bytes)
+        .context("host arena bytes overflow")?;
+    let pinned = arena_bytes > 0 && arena_bytes <= inputs.host_registration_bytes;
     let worker_count = inputs.service.worker_count()?;
     let disk_workers = if disk_bytes > 0 {
         ensure!(inputs.disk_readers > 0, "no measured disk readers");
@@ -469,6 +477,7 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         worker_count,
         disk_workers,
         prefill_staging_slots: inputs.reserves.prefill_staging_slots,
+        pinned,
     })
 }
 
@@ -988,6 +997,7 @@ mod tests {
             d2h_bytes_per_second: inputs.d2h_bytes_per_second,
             copy_engines: inputs.copy_engines,
             disk_readers: inputs.disk_readers,
+            host_registration_bytes: inputs.host_registration_bytes,
             service: inputs.service,
             reserves: inputs.reserves,
             span_rows: inputs.span_rows,
@@ -1006,6 +1016,7 @@ mod tests {
             d2h_bytes_per_second: 5e8,
             copy_engines: 2,
             disk_readers: 2,
+            host_registration_bytes: u64::MAX,
             service,
             reserves,
             span_rows: 4,
@@ -1049,6 +1060,29 @@ mod tests {
         assert!(error.contains("persistent reserves"), "{error}");
         let spares = capacity(&inputs, 28).unwrap_err().to_string();
         assert!(spares.contains("spare blocks"), "{spares}");
+    }
+
+    #[test]
+    fn pinned_is_decided_from_the_measured_registration() {
+        let service = service();
+        let reserves = reserves();
+        let inputs = inputs(&service, &reserves);
+        let arena_bytes = 26 * geometry().slot_bytes().unwrap();
+        let eligible = PlanInputs {
+            host_registration_bytes: arena_bytes,
+            ..capacity_ref(&inputs)
+        };
+        assert!(capacity(&eligible, 0).unwrap().pinned);
+        let short = PlanInputs {
+            host_registration_bytes: arena_bytes - 1,
+            ..capacity_ref(&inputs)
+        };
+        assert!(!capacity(&short, 0).unwrap().pinned);
+        let none = PlanInputs {
+            host_registration_bytes: 0,
+            ..capacity_ref(&inputs)
+        };
+        assert!(!capacity(&none, 0).unwrap().pinned);
     }
 
     #[test]

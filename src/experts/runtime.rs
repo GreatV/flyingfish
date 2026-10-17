@@ -478,6 +478,7 @@ mod tests {
             d2h_bytes_per_second: 1e9,
             copy_engines: 2,
             disk_readers: 1,
+            host_registration_bytes: u64::MAX,
             service: &service,
             reserves: &reserves,
             span_rows: 4,
