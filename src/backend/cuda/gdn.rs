@@ -2058,11 +2058,13 @@ mod tests {
     /// `conv_dim` comes from one derivation.
     #[test]
     fn conv_dim_has_a_single_derivation() {
-        let qwen = GdnSpec::q38();
-        let qwen_conv_dim = qwen.conv_dim().expect("Qwen GDN geometry");
-        let spec = GdnSpec::q38();
-        assert_eq!(spec.conv_dim().expect("conv_dim"), qwen_conv_dim);
-        assert_eq!(qwen_conv_dim, 2 * qwen.hk * DK + qwen.hv * DV);
+        for (hv, stored_channels) in [(32, 8192), (48, 10240)] {
+            let spec = GdnSpec {
+                hv,
+                ..GdnSpec::q38()
+            };
+            assert_eq!(spec.conv_dim().expect("conv_dim"), stored_channels);
+        }
     }
 
     /// The chunkwise-P2 slot offsets are the kernels' `P2_OFF_*` values: each 256 B
