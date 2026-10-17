@@ -231,7 +231,6 @@ struct SegmentPack<'a> {
 }
 
 pub(super) struct VisionIo {
-    architecture: Architecture,
     cast: CudaFunction,
     position_add: CudaFunction,
     splice: CudaFunction,
@@ -242,9 +241,7 @@ pub(super) struct VisionIo {
 
 /// Model-independent versions of the vision IO ops (`kernels/vision_ops.cu`).
 struct WideVisionOps {
-    cast: CudaFunction,
     pack_split: CudaFunction,
-    splice: CudaFunction,
     bucket_add: CudaFunction,
     gather: CudaFunction,
     mean: CudaFunction,
@@ -259,20 +256,17 @@ pub(super) struct PositionInputs {
 }
 
 impl VisionIo {
-    fn new(device: &Device, architecture: Architecture) -> Result<Self> {
+    fn new(device: &Device) -> Result<Self> {
         let module = cubin::module(&device.ctx, "q38_vision_io")?;
         let wide = cubin::module(&device.ctx, "vision_ops")?;
         Ok(Self {
-            architecture,
             cast: module.load_function("q38_vision_cast_patches")?,
             position_add: module.load_function("q38_vision_position_add")?,
             splice: module.load_function("q38_vision_splice")?,
             pack: module.load_function("q38_vision_pack")?,
             residual: module.load_function("q38_vision_residual")?,
             wide: WideVisionOps {
-                cast: wide.load_function("vision_cast_patches")?,
                 pack_split: wide.load_function("vision_pack_split")?,
-                splice: wide.load_function("vision_splice_rows")?,
                 bucket_add: wide.load_function("vision_bucket_position_add")?,
                 gather: wide.load_function("vision_row_gather")?,
                 mean: wide.load_function("vision_mean_rows")?,
@@ -292,29 +286,15 @@ impl VisionIo {
         matrix(&output.0, patch)?;
         ensure!(input.shape == output.0.shape, "patch cast shape mismatch");
         disjoint(&input, &output.0)?;
+        ensure!(patch == 1536, "Q38 patch cast width mismatch");
         let count = u64::from(input.shape[0]) * u64::from(patch);
         unsafe {
-            match self.architecture {
-                Architecture::Qwen35Text => {
-                    ensure!(patch == 1536, "Q38 patch cast width mismatch");
-                    stream
-                        .launch_builder(&self.cast)
-                        .arg(&input.ptr)
-                        .arg(&output.0.ptr)
-                        .arg(&count)
-                        .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
-                }
-                Architecture::MiniCpmV47 => {
-                    stream
-                        .launch_builder(&self.wide.cast)
-                        .arg(&input.ptr)
-                        .arg(&output.0.ptr)
-                        .arg(&count)
-                        .arg(&patch)
-                        .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
-                }
-                Architecture::Llama => bail!("vision IO requires a multimodal architecture"),
-            }
+            stream
+                .launch_builder(&self.cast)
+                .arg(&input.ptr)
+                .arg(&output.0.ptr)
+                .arg(&count)
+                .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
         }
         Ok(())
     }
@@ -327,10 +307,6 @@ impl VisionIo {
         interpolated: &mut TensorMut<f32, 2>,
         hidden: u32,
     ) -> Result<()> {
-        ensure!(
-            self.architecture == Architecture::Qwen35Text,
-            "bilinear position tables belong to the Q38 tower"
-        );
         let PositionInputs {
             table,
             indices,
@@ -392,37 +368,19 @@ impl VisionIo {
         let rows = splice_bounds(&features, &output.0, range, width)?;
         let source = u32::try_from(range.feature_rows.start)?;
         let destination = u32::try_from(range.chunk_rows.start)?;
+        ensure!(width == 5120, "Q38 splice width mismatch");
         let count = u64::from(rows) * u64::from(width);
         unsafe {
-            match self.architecture {
-                Architecture::Qwen35Text => {
-                    ensure!(width == 5120, "Q38 splice width mismatch");
-                    stream
-                        .launch_builder(&self.splice)
-                        .arg(&features.ptr)
-                        .arg(&output.0.ptr)
-                        .arg(&features.shape[0])
-                        .arg(&output.0.shape[0])
-                        .arg(&source)
-                        .arg(&destination)
-                        .arg(&rows)
-                        .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
-                }
-                Architecture::MiniCpmV47 => {
-                    stream
-                        .launch_builder(&self.wide.splice)
-                        .arg(&features.ptr)
-                        .arg(&output.0.ptr)
-                        .arg(&features.shape[0])
-                        .arg(&output.0.shape[0])
-                        .arg(&source)
-                        .arg(&destination)
-                        .arg(&rows)
-                        .arg(&width)
-                        .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
-                }
-                Architecture::Llama => bail!("vision IO requires a multimodal architecture"),
-            }
+            stream
+                .launch_builder(&self.splice)
+                .arg(&features.ptr)
+                .arg(&output.0.ptr)
+                .arg(&features.shape[0])
+                .arg(&output.0.shape[0])
+                .arg(&source)
+                .arg(&destination)
+                .arg(&rows)
+                .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
         }
         Ok(())
     }
@@ -437,10 +395,6 @@ impl VisionIo {
         output: &mut TensorMut<bf16, 2>,
         hidden: u32,
     ) -> Result<()> {
-        ensure!(
-            self.architecture == Architecture::MiniCpmV47,
-            "bucket position tables belong to the MiniCPM tower"
-        );
         matrix(&table, hidden)?;
         matrix(&patches, hidden)?;
         matrix(&output.0, hidden)?;
@@ -478,10 +432,6 @@ impl VisionIo {
         pack: SegmentPack<'_>,
         spec: &VisionSpec,
     ) -> Result<()> {
-        ensure!(
-            self.architecture == Architecture::MiniCpmV47,
-            "split QKV packing belongs to the MiniCPM tower"
-        );
         ensure!(
             pack.q_in.shape[0] == pack.k_in.shape[0]
                 && pack.q_in.shape[0] == pack.v_in.shape[0]
@@ -1960,7 +1910,7 @@ impl VisionRuntime {
             .vision
             .as_ref()
             .context("vision configuration missing")?;
-        let io = Arc::new(VisionIo::new(device, model.architecture)?);
+        let io = Arc::new(VisionIo::new(device)?);
         let weights = VisionWeights::take(catalog, geometry, vision, model.architecture)?;
         Ok(Self {
             model: model.clone(),
@@ -2226,7 +2176,7 @@ mod tests {
         );
         let device = Device::new(0)?;
         let s = &device.stream;
-        let io = VisionIo::new(&device, Architecture::Qwen35Text)?;
+        let io = VisionIo::new(&device)?;
         let packing = PatchPacking::build(&[PatchGrid { h: 2, w: 2 }, PatchGrid { h: 2, w: 4 }])?;
         let rows = packing.real_rows();
         let padded = packing.padded_rows();
@@ -2402,7 +2352,7 @@ mod tests {
         );
         let device = Device::new(0)?;
         let s = &device.stream;
-        let io = Arc::new(VisionIo::new(&device, Architecture::Qwen35Text)?);
+        let io = Arc::new(VisionIo::new(&device)?);
         let model = ModelSpec::qwen(
             &serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?,
             &serde_json::Value::Null,
