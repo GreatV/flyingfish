@@ -2070,4 +2070,49 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn video_canvas_positions_match_the_model_definition() -> Result<()> {
+        let processor = video_processor()?;
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let mut options = VideoOptions {
+            max_num_frames: 2,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let video = processor.prepare_video(&video_frames(2, 64, 48), &video_meta(2), &options)?;
+        let (expanded, prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 4096)?;
+        let plan = prepared.input(&expanded).validate(&processor.spec, 4096)?;
+        let axes = plan.axes();
+        assert_eq!([axes[0][1], axes[1][1], axes[2][1]], [0, 0, 0]);
+        assert_eq!([axes[0][66], axes[1][66], axes[2][66]], [10, 10, 10]);
+        assert_eq!(plan.rope_delta(), -110);
+        options.max_slice_nums = Some(9);
+        let video =
+            processor.prepare_video(&video_frames(2, 640, 480), &video_meta(2), &options)?;
+        let (expanded, prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 8192)?;
+        assert_eq!(expanded.len(), 418);
+        let plan = prepared.input(&expanded).validate(&processor.spec, 8192)?;
+        let axes = plan.axes();
+        assert_eq!([axes[0][1], axes[1][1], axes[2][1]], [0, 0, 0]);
+        assert_eq!([axes[0][66], axes[1][66], axes[2][66]], [0, 0, 0]);
+        assert_eq!([axes[0][138], axes[1][138], axes[2][138]], [0, 0, 7]);
+        assert_eq!([axes[0][210], axes[1][210], axes[2][210]], [15, 15, 15]);
+        options.max_slice_nums = Some(1);
+        let image = processor.prepare_rgb(&constant_frame(64, 48, 5))?;
+        let video = processor.prepare_video(&video_frames(2, 64, 48), &video_meta(2), &options)?;
+        let (expanded, prepared) = processor.expand(
+            &[vision.image_token, vision.video_token],
+            vec![image],
+            vec![video],
+            4096,
+        )?;
+        let plan = prepared.input(&expanded).validate(&processor.spec, 4096)?;
+        let axes = plan.axes();
+        assert_eq!([axes[0][69], axes[1][69], axes[2][69]], [13, 13, 13]);
+        assert_eq!([axes[0][134], axes[1][134], axes[2][134]], [23, 23, 23]);
+        Ok(())
+    }
 }
