@@ -1,55 +1,19 @@
-// ============================================================================
-// gemm_skinny.cu -- skinny GEMM (M activation rows share one streaming weight
-// read) on bf16 tensor cores, for the speculative-decoding verification path.
-//
+// Skinny GEMM on bf16 tensor cores: M activation rows share one streaming weight read.
 //   Y[m, out] = X[m, in] @ W[out, in]^T
 //   W: bf16 row-major [out,in], row stride ldw elements (packed: ldw == in).
 //   X: bf16 row-major [m,in] packed.  Y: bf16 row-major [m,out].
 //   fp32 accumulation (MMA D fragments), one bf16 rounding at the store.
-//
-// FD_GUARD: every entry point calls __trap() when invoked with m outside
-// [1,16], in % 64 != 0, ldw % 8 != 0, or blockDim.x != 128 -- a wrong-shape
-// launch fails loudly (the trap surfaces as a CUDA error at the next
-// synchronization) instead of silently computing garbage.
-//
-// Kernel organization: block = 128 threads = 4 warps; each block covers 16
-// consecutive W rows (the m16 tile of mma.m16n8k16). Warps split the IN
-// dimension into quarters (warp w sweeps k in [w*in/4, (w+1)*in/4)) so a
-// block streams 16 rows x in once; cross-warp fp32 merge through smem at the
-// end. Per warp per 64-wide in-chunk: 4 k16-slices of mma.m16n8k16; A =
-// ldmatrix.x4 on the W smem tile (row-major [16 rows][64 in]); B =
-// ldmatrix.x2 (plain) on the X smem chunk (row-major [act][in-slice] -- a
-// col-major k16 x n8 B fragment equals a row-major [n][k] tile). Activation
-// columns beyond m are zero-filled at staging and never stored. W/X chunk
-// staging uses cp.async 16B copies, double-buffered (buffer for chunk c+1 is
-// committed before chunk c is consumed).
-//
-// Launch contract:
-//   gridDim.x = ceil(out / 16), blockDim.x = 128 (fixed; guarded).
-//   smem = W tile 4 warps x 16 rows x (64+8) x 2 B (double-buffered x2)
-//        + X chunk 4 warps x 16 acts x (64+8) x 2 B (double-buffered x2)
-//        + merge [4][16][16] fp32
-//        = 18432 + 18432 + 4096 = 40960 B (<= 48 KB, no opt-in needed).
-// Alignment: W and X 16B-aligned; in % 256 == 0 (NW*CK); ldw % 8 == 0. No device-side
-// scalar is read and all arguments are fixed per call, so the launch is
-// CUDA-Graph capturable; no global state. Every Y element is written by
-// exactly one block.
-//
-// SIGNATURE TABLE (extern "C" __global__; all pointer args __restrict__):
-//   gemm_skinny_bf16
-//     void(const __nv_bfloat16* W, const __nv_bfloat16* X,
-//          __nv_bfloat16* Y, int out_features, int in_features,
-//          long ldw, int m)
-//     launch: grid = dim3(ceil(out/16)), block = 128, smem = 40960
-//
-// Host integration:
-//   - Selection between this kernel and the cuBLAS path is a setup-time
-//     calibration per (device, shape, M bucket): measure both, persist the
-//     winner. (4090 measured: skinny wins for M >= 7 in-graph; A4000 picks
-//     cuBLAS.) Do not hardcode an M threshold.
-//   - Weight buffers are the existing [out][in] row-major bf16 blocks; X/Y
-//     are the engine's packed [rows][dim] activation buffers.
-// ============================================================================
+// FD_GUARD_SKINNY calls __trap() on m outside [1,16], in % 256 != 0, ldw % 8 != 0, or
+// blockDim.x != 128.
+// Block = 4 warps over 16 consecutive W rows (the m16 tile of mma.m16n8k16); warp w sweeps
+// k in [w*in/4, (w+1)*in/4); the warps merge fp32 partials through smem at the end.
+// Per warp per 64-wide in-chunk: 4 k16 slices; A = ldmatrix.x4 on the W tile (row-major
+// [16 rows][64 in]); B = ldmatrix.x2 on the X chunk (row-major [act][in-slice]).
+// Activation rows >= m are zero-filled at staging and never stored. W/X staging is
+// cp.async 16B copies, double-buffered.
+// Launch: grid = ceil(out / 16), block = 128,
+//   dynamic smem = 2 x 9216 (W) + 2 x 9216 (X) + 4096 (merge) = 40960 B.
+// W and X are 16B-aligned. Every Y element is written by exactly one block.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -57,7 +21,7 @@ using bf16 = __nv_bfloat16;
 
 constexpr int RT  = 16;                 // W rows per block (MMA m16 tile)
 constexpr int NW  = 4;                  // warps per block (in-dim quarters)
-constexpr int NT_ = NW * 32;            // 128 threads
+constexpr int NT_ = NW * 32;
 constexpr int CK  = 64;                 // in-chunk width (k elements)
 constexpr int PAD = 8;                  // smem row padding vs ldmatrix banks
 constexpr int LDS = CK + PAD;           // padded smem row stride = 72

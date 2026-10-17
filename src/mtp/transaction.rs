@@ -1,4 +1,4 @@
-//! M2a: verify with ordinary decode, restore, then replay before publication.
+//! Verify with ordinary decode, restore, then replay before publication.
 use super::MtpOptions;
 use anyhow::{Result, ensure};
 

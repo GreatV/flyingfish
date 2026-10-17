@@ -1,28 +1,21 @@
-// Q38 ABI v1 section 6, GDN recurrent core. M = 1, decode, value_split = 2 (P1 plan).
+// GDN recurrent core. M = 1, decode, value_split = 2.
 //
 // One token, per v-head:
-//     S     = S * exp(g)                       <- decay FIRST, this is the contract
-//     kv    = k^T S                            <- read from the DECAYED S
+//     S     = S * exp(g)                       <- decay first
+//     kv    = k^T S                            <- read from the decayed S
 //     delta = (v - kv) * beta
 //     S     = S + k (x) delta                  <- rank-one, thread-local
-//     o     = q^T S                            <- read from the UPDATED S
+//     o     = q^T S                            <- read from the updated S
 // In matrix form from the model definition:
 //     S_t = exp(g_t)(I - beta_t k_t k_t^T) S_{t-1} + beta_t k_t v_t^T
 //     o_t = q_t^T S_t
-// The order is load-bearing: applying the decay after computing kv is a DIFFERENT recurrence
-// and differs by core 7.05e-02 / state 9.58e-03 (see gdn_kernel_design.md 6b) -- enough that
-// a generic state tolerance would NOT catch it, so it is a dedicated negative control in G5.
 //
-// S[:, j] is independent across the value axis, so the value split is free here: no
-// cross-split reduction anywhere in this kernel.
+// S[:, j] is independent across the value axis; no cross-split reduction.
 //
-// All state math is FP32 (ABI section 6). q arrives pre-scaled by 1/sqrt(HEAD_K); the caller
-// applied the shared l2_heads and widened. There is no neutral-padding question at M=1, but
-// valid_rows is still checked: the recurrent path is only for valid_rows == 1, and anything
-// else belongs to gdn_chunked (ABI section 6).
+// All state math is FP32. q arrives pre-scaled by 1/sqrt(HEAD_K); the caller applies
+// l2_heads and the widen. valid_rows must be 1.
 //
-// launch: grid (DV/VSPLIT, NUM_V_HEADS). The only parallelism is across heads and the value
-// split; the state pass is inherently serial in time.
+// launch: grid (VSPLIT, NUM_V_HEADS), block GDN_THREADS.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
@@ -70,9 +63,8 @@ void gdn_recurrent_core_t(
         __trap(); return;   // M>1 is the chunked path
     }
 
-    // 512 threads tile the [DK][VW] state as 16 row groups x 32 column groups, RT x TC each,
-    // i.e. 16 floats per thread. Every loop indexing Sr MUST be unrolled or the tile lands
-    // in local memory -- see gdn_chunked.cu for the same trap and its cost.
+    // 512 threads tile the [DK][VW] state as 16 row groups x 32 column groups, RT x TC each.
+    // Every loop indexing Sr is unrolled.
     constexpr int RT = GDN_DK / 16, TC = VW / 32, TG = GDN_DK / RT;
     const int ti = tid / 32, tj = tid % 32;
     const int i0 = ti * RT, jb = tj * TC;
@@ -91,13 +83,11 @@ void gdn_recurrent_core_t(
     const float bv = beta[head];
     const size_t kv0 = (size_t)head * GDN_DK;    // row 0 of this head's [DK] slice
 
-    float dl[TC];   // declared before the control-build fork: both branches produce it
-    // ---- 1. decay FIRST
+    float dl[TC];
+    // ---- 1. decay first
 // Negative-control build; never defined by build.rs.
 #ifdef GDN_WRONG_DECAY
-    // NEGATIVE CONTROL BUILD (never shipped): decay applied AFTER kv instead of before.
-    // The whole point of the G5 order control is that this is a real kernel build, so it is
-    // the same source with the order swapped, not a perturbation of the outputs.
+    // Decay applied after kv.
     float kvp[TC];
     #pragma unroll
     for (int b = 0; b < TC; ++b) {
@@ -128,7 +118,7 @@ void gdn_recurrent_core_t(
         for (int b = 0; b < TC; ++b) Sr[a][b] *= alpha;
     __syncthreads();
 
-    // ---- 2. kv = k^T S, from the DECAYED S. Stage one partial per row group.
+    // ---- 2. kv = k^T S, from the decayed S. Stage one partial per row group.
     #pragma unroll
     for (int b = 0; b < TC; ++b) {
         float p = 0.0f;
@@ -154,7 +144,7 @@ void gdn_recurrent_core_t(
     }
     __syncthreads();
 
-    // ---- 4. o = q^T S, from the UPDATED S
+    // ---- 4. o = q^T S, from the updated S
     #pragma unroll
     for (int b = 0; b < TC; ++b) {
         float p = 0.0f;
@@ -178,8 +168,7 @@ void gdn_recurrent_core_t(
             S[(size_t)head * GDN_DK * GDN_DV + (i0 + a) * GDN_DV + j0 + jb + b] = Sr[a][b];
 }
 
-// Decode entry point. value_split is a property of the prepared plan (P1: 2), fixed in
-// setup, not chosen per call.
+// Decode entry point, value_split = 2.
 extern "C" __global__ __launch_bounds__(GDN_THREADS, 1)
 void gdn_recurrent_core_v2(const float* q, const float* k, const float* v,
                            const float* beta, const float* g, float* S,

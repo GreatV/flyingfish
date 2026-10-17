@@ -1,23 +1,18 @@
-// Q38 GDN chunkwise prefill, the P2 SPLIT of the precision protocol P1 core, C = 64,
-// module gdn/gdn_cw_p2. gdn/gdn_chunkwise_p1 runs one kernel per step; this file runs
-// two, with the same fp32 accumulators, the same bf16 RNE rounding points, the same
-// mma fragment staging and the same loop and accumulation orders, so the two agree bit
-// for bit. Only the kernel boundaries and the placement of the materialized products
-// change.
+// GDN chunkwise prefill as two kernels, C = 64. Same fp32 accumulators, bf16 RNE
+// rounding points, mma fragment staging and loop/accumulation orders as
+// gdn/gdn_chunkwise_p1; the two agree bit for bit.
 //
-//   P2 reads the BF16 sources directly: the widen (__bfloat162float at each load), the
-//   GQA expansion (value head h reads key head h / P2_GQA, row stride P2_KROW = 16*128)
-//   and the Q scale by 1/sqrt(DK) as a separate FIRST multiply happen at the load sites;
-//   no gdn_prep_fp32 launch. beta stays FP32 (gdn_beta_widen) and g is FP32.
+//   Sources are read as BF16 at the load sites: widened with __bfloat162float, GQA
+//   expansion (value head h reads key head h / P2_GQA, row stride P2_KROW = 16*128),
+//   and Q scaled by 1/sqrt(DK) as a separate first multiply. beta and g are FP32.
 //
-//   stage A  grid (nchunk, 48): P1 :263-274 gates and the cumsum, :276-301 A = -tril(...),
-//             :303-410 the blocked (I-A)^-1 with both merge levels, then U = T@(beta.V) for
-//             all DV columns (:412-431 tiled), W = T@(beta.K.e^G) materialized bf16 (:447-487
-//             inner), qk (:497-527) and the FP32[64] vectors Gc, Be, Sc.
-//   stage H  grid (4, 48), 32-wide value strips (P1's s4 slice): the chunk loop in order,
-//             with S[:, j0:j0+32] in registers (:246-258), WS = W@S (:435-487), v_new =
-//             U - WS (:492-495), the pre-update S snapshot, and the state update
-//             (:596-630). S is written back at :634-645.
+//   stage A  grid (nchunk, 48): gates and the cumsum, A = -tril(...), the blocked
+//             (I-A)^-1 with both merge levels, U = T@(beta.V) for all DV columns,
+//             W = T@(beta.K.e^G) materialized bf16, qk, and the FP32[64] vectors
+//             Gc, Be, Sc.
+//   stage H  grid (4, 48), 32-wide value strips: the chunk loop in order with
+//             S[:, j0:j0+32] in registers; WS = W@S, v_new = U - WS, out, and the
+//             state update. S is written back at the end.
 //
 // The workspace slot of one (chunk, head) is GDN_CW_P2_SLOT_BYTES at
 // ws + (chunk * 48 + head) * GDN_CW_P2_SLOT_BYTES, in this byte order:
@@ -36,8 +31,8 @@
 #include "gdn_cw_p2_layout.h"
 
 #define P2_C       64     // chunk rows
-#define P2_SUB     16     // UT inverse diagonal block (protocol section A)
-#define P2_THREADS 256    // protocol section E: 256 threads for the state pass
+#define P2_SUB     16     // UT inverse diagonal block
+#define P2_THREADS 256
 #define P2_WARPS   (P2_THREADS / 32)
 #define P2_DK      128
 #define P2_DV      128
@@ -52,8 +47,7 @@
 #define P2_A_LD    68                    // sA row stride, floats (+4 off 64)
 #define P2_T_LD    72                    // sT row stride, bf16 (+8 off 64)
 
-// One arena for both stages, in order: sA | sT | sV | sVn | sG | sBeta | sSc; it is
-// P1's s4 arena (gdn_cw_p1.cu :24-26), the largest of the split set.
+// One arena for both stages, in order: sA | sT | sV | sVn | sG | sBeta | sSc.
 #define P2_SMEM_BYTES GDN_CW_P2_SMEM_BYTES
 
 static_assert(P2_SMEM_BYTES == P2_C * P2_A_LD * 4 + P2_C * P2_T_LD * 2 + P2_C * P2_VL * 2
@@ -70,8 +64,7 @@ static_assert(GDN_CW_P2_SLOT_BYTES == 16384 + 32768 + 9216 + 3 * 256,
 #define P2_OFF_BE     58624
 #define P2_OFF_SC     58880
 
-// The value strip stage H walks, and the U column tile stage A walks: 32-wide
-// strips are P1's s4, the 8-wide tile is P1's s16 accumulator width.
+// Stage H value strip width and stage A U column tile width.
 #define P2_VW        32
 #define P2_VT        8
 
@@ -101,12 +94,9 @@ __device__ __forceinline__ uint32_t p1_pack(float lo, float hi) {
 
 
 
-// ---- fragment loads ----------------------------------------------------------------
-
-// A from BF16 rows, one scale per ROW (beta, and the q liveness mask): register 1 is the
-// +8 row at the LOW columns and register 2 the base row at the +8 columns, and the two
-// are not interchangeable. `qscale` is 1/sqrt(DK) for Q and 1.0f for K, applied before
-// the row scale. x * 1.0f is exact, so the same helper serves K unchanged.
+// A from BF16 rows, one scale per row (beta, and the q liveness mask): register 1 is the
+// +8 row at the low columns and register 2 the base row at the +8 columns. `qscale` is
+// 1/sqrt(DK) for Q and 1.0f for K, applied before the row scale.
 __device__ __forceinline__ AFrag p1_a_rows(const __nv_bfloat16* lo, const __nv_bfloat16* hi,
                                            int col0, int t2, float qscale,
                                            float s_lo, float s_hi) {
@@ -156,8 +146,8 @@ __device__ __forceinline__ BFrag p1_b_rows(const __nv_bfloat16* p, int ld, int n
     return f;
 }
 
-// A from a BF16 buffer (T class, encoded qk, materialized W): shared or global, the
-// register order is p1_a_rows'. Same register order as p1_a_rows.
+// A from a BF16 buffer (T, encoded qk, materialized W), shared or global; same register
+// order as p1_a_rows.
 __device__ __forceinline__ AFrag p1_a_sbf(const __nv_bfloat16* base, int ld, int row0,
                                           int col0, int gid, int t2) {
     const uint32_t* lo = reinterpret_cast<const uint32_t*>(base + (size_t)(row0 + gid) * ld);
@@ -234,8 +224,6 @@ __device__ __forceinline__ void p1_store_bf16(__nv_bfloat16* base, int ld, int r
 }
 
 
-// ---- shared arena and the workspace slot --------------------------------------------
-
 // The arena is sA | sT | sV | sVn | sG | sBeta | sSc; sV is [output column] x
 // [reduction] (P2_VL, p1_b_sbf).
 struct P2Arena {
@@ -267,8 +255,8 @@ __device__ __forceinline__ char* p2_slot(char* ws, int chunk, int head) {
     return ws + ((size_t)chunk * P2_HEADS + (size_t)head) * P2_SLOT_BYTES;
 }
 
-// P1's meta guard (gdn_chunkwise_p1.cu :218-224): valid_rows resolves the host sentinel
-// 0, and key_count == prefix + valid_rows bounds the rows a kernel may read.
+// valid_rows_in == 0 selects meta->valid_rows; key_count == prefix + valid_rows bounds
+// the rows a kernel may read.
 __device__ __forceinline__ int p2_valid_rows(const GdnMeta* meta, int valid_rows_in) {
     const int prefix = meta->prefix;
     const int valid_rows = valid_rows_in > 0 ? valid_rows_in : meta->valid_rows;
@@ -280,11 +268,8 @@ __device__ __forceinline__ int p2_valid_rows(const GdnMeta* meta, int valid_rows
 }
 
 
-// ---- stage A ------------------------------------------------------------------------
-
-// One CTA per (chunk, head). No S dependency: everything stage H reads is
-// written here. The host grid is ceil(max_rows / P2_C) wide, so a tail step leaves spare
-// CTAs, and they exit before the first barrier.
+// Stage A: one CTA per (chunk, head); no S dependency. Grid x is ceil(max_rows / P2_C);
+// CTAs past the valid chunks exit before the first barrier.
 extern "C" __global__ __launch_bounds__(P2_THREADS, 1)
 void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK] KEY heads
                        const __nv_bfloat16* __restrict__ k,  // BF16 [M, 16, DK] KEY heads
@@ -338,7 +323,7 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
 
     char* const slot = p2_slot(ws, chunk, head);
 
-    // ---- gates and the in-chunk cumsum: ONE thread per scan then a barrier, since interleaved in-place scans apply G without bound (e^G overflow and NaNs).
+    // ---- gates and the in-chunk cumsum; the in-place scan runs on one thread.
     for (int r = tid; r < P2_C; r += P2_THREADS) {
         const int gr = row0 + r;
         sBeta[r] = gr < valid_rows ? beta[(size_t)gr * P2_HEADS + head] : 0.0f;
@@ -370,24 +355,21 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
         p1_store_f32(sA, P2_A_LD, mt * 16, nt * 8, gid, t2, d);
     }
     __syncthreads();
-    // tril BEFORE the exp and AGAIN after it: exp of a masked entry is 1.0, so
-    // without the second mask every token reads the future.
+    // tril is applied again after the exp: exp of a masked entry is 1.0.
     for (int idx = tid; idx < P2_C * P2_C; idx += P2_THREADS) {
         const int j = idx / P2_C, i = idx - j * P2_C;
         sA[j * P2_A_LD + i] = j > i ? -sA[j * P2_A_LD + i] * __expf(sG[j] - sG[i]) : 0.0f;
     }
     __syncthreads();
 
-    // ---- T = (I - A)^-1, blocked: 16x16 FP32 leaves by forward substitution then 16->32 and 32->64 merges. ONE WARP per diagonal block, lane j = row j: row r still reads the
-    // already-final entries of rows m < r, but through __shfl_sync(lw, t[j], m) — lane
-    // m's current t[j], final by the row-synchronous step order — so each element keeps
-    // the thread form's seed and ascending-m fma chain and the leaves are bit-identical.
-    // All lanes named in lw execute every shuffle (the non-owning lanes discard); the
-    // guard keeps lanes 16..31 of a leaf warp from touching the next block's rows.
+    // ---- T = (I - A)^-1, blocked: 16x16 FP32 leaves by forward substitution, then
+    // 16->32 and 32->64 merges. One warp per diagonal block, lane j = row j; row r reads
+    // the final rows m < r through __shfl_sync(lw, t[j], m) in an ascending-m fma chain.
+    // All lanes in lw execute every shuffle; lanes 16..31 do not participate.
     {
         const unsigned lw = (1u << P2_SUB) - 1u;   // the 16 leaf lanes
         if (warp < P2_C / P2_SUB && lane < P2_SUB) {
-            // The substituted row and the rows it reads both live in the diagonal block's COLUMN window; without c0 the pass substitutes the off-diagonal block at columns 0..15 and destroys the A[b,a] the merges consume.
+            // Columns are within the diagonal block's column window c0.
             const int c0 = warp * P2_SUB;
             float t[P2_SUB];
             #pragma unroll
@@ -422,9 +404,7 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
     }
     __syncthreads();
     for (int r = tid; r < P2_C; r += P2_THREADS) sA[r * P2_A_LD + r] += 1.0f;
-    __syncthreads();   // the encode reads ALL of sA, including diagonals other
-                       // threads just incremented
-    // The fp32 T is dead from here, so sA is free for the qk accumulator.
+    __syncthreads();   // the encode reads all of sA, including the incremented diagonal
     for (int idx = tid; idx < P2_C * P2_C; idx += P2_THREADS) {
         const int r = idx / P2_C, cc = idx - r * P2_C;
         sT[r * P2_T_LD + cc] = __float2bfloat16_rn(sA[r * P2_A_LD + cc]);
@@ -436,7 +416,8 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
     for (int p = 0; p < P2_C / (2 * P2_SUB); ++p) {
         const int a0 = p * 2 * P2_SUB, b0 = a0 + P2_SUB;
         __syncthreads();
-        // Both merge operands are staged TRANSPOSED, because a B fragment reads [output column][reduction]: A[b,a] as [a][b] and T[a,a] as [a'][a]; the block here is still the ORIGINAL A, the leaf substitution writing only the diagonal 16x16 blocks.
+        // Merge operands are staged as [output column][reduction]: A[b,a] as [a][b] and
+        // T[a,a] as [a'][a]. The off-diagonal block of sA still holds the original A.
         for (int idx = tid; idx < P2_SUB * P2_SUB; idx += P2_THREADS) {
             const int bl = idx / P2_SUB, al = idx - bl * P2_SUB;
             sV[al * 32 + bl] = __float2bfloat16_rn(
@@ -473,20 +454,18 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
     {   // 32 -> 64. The (x@y) intermediate goes to sA[0:32][32:64], strictly ABOVE
         // A's lower triangle and so disjoint from A[32:64][0:32].
         const int mt = warp / 4, nt = warp - (warp / 4) * 4;
-        // A[32:64][0:32] transposed into sV as [a][b], for the same reason as above.
+        // A[32:64][0:32] transposed into sV as [a][b].
         for (int idx = tid; idx < 32 * 32; idx += P2_THREADS) {
             const int bl = idx / 32, al = idx - bl * 32;
             sV[al * 64 + bl] = __float2bfloat16_rn(sA[(size_t)(32 + bl) * P2_A_LD + al]);
         }
         __syncthreads();
         float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        // BOTH products reduce over a 32-wide axis, i.e. TWO 16-wide k-steps; a
-        // bound of P2_SUB/16 = 1 contracts half of it and is wrong on the mt=1 half.
+        // Both products reduce over a 32-wide axis: two 16-wide k-steps.
         #pragma unroll
         for (int ks = 0; ks < P2_C / (2 * P2_SUB); ++ks) {
             const AFrag a = p1_a_sbf(sT, P2_T_LD, 32 + mt * 16, 32 + ks * 16, gid, t2);
-            // col0 = ks*16: the staged tile is indexed by the LOCAL b, so without
-            // ks*16 both steps read local b 0..15.
+            // The staged tile is indexed by the local b.
             const BFrag b = p1_b_sbf(sV, 64, nt * 8 + gid, ks * 16, t2);
             P2_MMA(d, a, b);
         }
@@ -509,9 +488,8 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
         __syncthreads();
     }
 
-    // ---- U = T @ (beta . V), all DV columns in 16 tiles of P2_VT: sVn is one tile wide,
-    // so each tile's fp32 accumulator goes to the ws U slot at once. Every element is one
-    // mma over the same ascending ks, and the tile boundary splits columns, not k.
+    // ---- U = T @ (beta . V), all DV columns in 16 tiles of P2_VT; each tile's fp32
+    // accumulator goes through sVn to the ws U slot. Tiles split columns, not k.
     float* const wU = reinterpret_cast<float*>(slot + P2_OFF_U);
     for (int cb = 0; cb < P2_DV / P2_VT; ++cb) {
         for (int idx = tid; idx < P2_C * P2_VT; idx += P2_THREADS) {
@@ -544,14 +522,11 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
         __syncthreads();
     }
 
-    // ---- W = T @ (beta . K . e^G) MATERIALIZED: the same w0/w1 accumulators over cs and
-    // the same p1_pack as P1 :476-477, written out so stage H can read them back as the A
-    // fragment. Each warp mt owns all eight 16-wide d_k windows of its rows.
+    // ---- W = T @ (beta . K . e^G), materialized bf16 for stage H's A fragment. Warp mt
+    // owns all eight 16-wide d_k windows of its rows.
     __nv_bfloat16* const wW = reinterpret_cast<__nv_bfloat16*>(slot + P2_OFF_W);
     if (warp < P2_MT) {
         const int mt = warp;
-        // ks unrolled by 2, cs not at all: cs accumulates serially into w0/w1, so
-        // unrolling it buys no independent work.
         #pragma unroll 2
         for (int ks = 0; ks < P2_DK / 16; ++ks) {
             float w0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -574,10 +549,7 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
                 P2_MMA(w0, a, b0);
                 P2_MMA(w1, a, b1);
             }
-            // Same register order as p1_a_rows; w0 is the first 8-wide d_k group of
-            // the window, w1 the second. p1_store_bf16 writes d[0],d[1] on the base row
-            // and d[2],d[3] on its +8 row, so these two stores are r[0],r[1] from w0
-            // at the window base and r[2],r[3] from w1 at the window's +8 d_k columns.
+            // w0 holds d_k columns [ks*16, +8) and w1 [ks*16+8, +8) of the window.
             const float g0[4] = {w0[0], w0[1], w0[2], w0[3]};
             const float g1[4] = {w1[0], w1[1], w1[2], w1[3]};
             p1_store_bf16(wW, P2_DK, mt * 16, ks * 16, gid, t2, g0);
@@ -586,8 +558,8 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
     }
     __syncthreads();
 
-    // ---- qk = (bf16(q) @ bf16(K)^T) . exp(G_j - G_i), tril WITH the diagonal,
-    // into sA (free since the fp32 T is encoded), then to the ws slot.
+    // ---- qk = (bf16(q) @ bf16(K)^T) . exp(G_j - G_i), tril with the diagonal,
+    // into sA, then to the ws slot.
     __syncthreads();
     for (int tile = warp; tile < P2_MT * P2_NT_C; tile += P2_WARPS) {
         const int mt = tile / P2_NT_C, nt = tile - mt * P2_NT_C;
@@ -631,12 +603,8 @@ void gdn_cw_p2_stage_a(const __nv_bfloat16* __restrict__ q,  // BF16 [M, 16, DK]
 }
 
 
-// ---- stage H ------------------------------------------------------------------------
-
-// One CTA per (32-wide value block, head), the chunk loop in order, S[:, j0:j0+32] in
-// registers. This stage reads q for the out contraction, k for the decay, the state S,
-// the out buffer and the ws slot; v, beta and g are part of the common stage signature
-// and are not read.
+// Stage H: one CTA per (32-wide value strip, head), the chunk loop in order,
+// S[:, j0:j0+32] in registers. v, beta and g are not read.
 extern "C" __global__ __launch_bounds__(P2_THREADS, 1)
 void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
                        const __nv_bfloat16* __restrict__ k,
@@ -681,12 +649,11 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* const qh = q + (size_t)(head / P2_GQA) * P2_DK;
     const float qscale = 1.0f / sqrtf((float)P2_DK);
 
-    // S[:, j0:j0+VW] stays in REGISTERS for the whole call; every index into Sr is
-    // compile-time, which is what keeps the tile out of local memory.
+    // S[:, j0:j0+VW] stays in registers for the whole call; every index into Sr is
+    // compile-time.
     float Sr[2][NT][2];
     {
-        // Warp w owns d_k rows 16w..16w+15, so the 8 warps cover all P2_DK = 128; the
-        // warp*16 term is what keeps 112 state rows from being skipped entirely.
+        // Warp w owns d_k rows 16w..16w+15.
         float* srow = S + (size_t)head * P2_DK * P2_DV
                     + (size_t)warp * 16 * P2_DV + j0 + gid * P2_DV + t2;
         #pragma unroll
@@ -714,7 +681,8 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
             sSc[r] = wSc[r];
         }
 
-        // ---- WS = W @ S with W MATERIALIZED: W is a GEMM output, so it is rounded to BF16 (WU class) before it multiplies the BF16 S copy; each warp stages S into its OWN slice of the 128-row d_k axis, so sV holds the whole axis as [value][d_k] and no warp contracts W against another warp's rows.
+        // ---- WS = W @ S: bf16 W times a bf16 copy of S. Each warp stages its own 16-row
+        // d_k slice; sV holds the whole d_k axis as [value][d_k].
         const int kblk = warp;           // the dk window this warp's S rows belong to
         __syncthreads();
         #pragma unroll
@@ -727,14 +695,13 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
                     __float2bfloat16_rn(Sr[1][nt][cc]);
             }
         __syncthreads();
-        // The OWNING warp of a chunk-row tile contracts the WHOLE 128-row d_k axis itself over ks = 0..7, so every output element has exactly one writer; warps with no tile of their own wait at the barrier below, and W depends on (mt, ks) only.
+        // The owning warp of a chunk-row tile contracts the whole d_k axis over ks = 0..7;
+        // every output element has one writer.
         if (warp < P2_MT) {
             const int mt = warp;
             float d[NT][4] = {{0.0f}};
             #pragma unroll 2
             for (int ks = 0; ks < P2_DK / 16; ++ks) {
-                // The A fragment is the materialized W, the same 16 bits P1 packed into
-                // registers at :476-477, in the same register order.
                 const AFrag a = p1_a_sbf(wW, P2_DK, mt * 16, ks * 16, gid, t2);
                 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
@@ -747,8 +714,7 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
                 p1_store_f32(sA, P2_A_LD, mt * 16, nt * 8, gid, t2, d[nt]);
         }
 
-        // ---- v_new = U - WS into sVn; U comes from the ws slot in the same subtraction
-        // order (U - WS) as P1 :494.
+        // ---- v_new = U - WS into sVn; U comes from the ws slot.
         __syncthreads();
         __syncthreads();
         for (int idx = tid; idx < P2_C * P2_VW; idx += P2_THREADS) {
@@ -756,8 +722,7 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
             sVn[r * P2_VW + cc] = wU[r * P2_DV + j0 + cc] - sA[r * P2_A_LD + cc];
         }
 
-        // ---- v_new as the WU-class operand (bf16), staged for the out contraction and
-        // the state update.
+        // ---- v_new as bf16, staged for the out contraction and the state update.
         for (int idx = tid; idx < P2_C * P2_VW; idx += P2_THREADS) {
             const int r = idx / P2_VW, cc = idx - r * P2_VW;
             const __nv_bfloat16 e = __float2bfloat16_rn(sVn[r * P2_VW + cc]);
@@ -765,10 +730,8 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
         }
         __syncthreads();
 
-        // ---- AD = qk @ v_new, accumulating into sA (the output tile). qk is read from
-        // the ws slot in place (it keeps P2_T_LD). v_new is staged in sV in
-        // [value][chunk] layout — p1_b_sbf packs two consecutive CHUNK values per
-        // register.
+        // ---- AD = qk @ v_new into sA. qk is read from the ws slot in place (stride
+        // P2_T_LD); v_new is in sV as [value][chunk].
         for (int tile = warp; tile < P2_MT * NT; tile += P2_WARPS) {
             const int mt = tile / NT, nt = tile - (tile / NT) * NT;
             float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -782,9 +745,8 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
         }
         __syncthreads();
 
-        // ---- QS = (q . e^G) @ S_{t-1} onto AD's tile; the PRE-update state is this
-        // CTA's Sr registers, staged here in bf16 per warp dk-slice exactly as P1
-        // :553-561 does.
+        // ---- QS = (q . e^G) @ S_{t-1} onto AD's tile; the pre-update Sr is staged in
+        // bf16 per warp d_k slice.
         __syncthreads();
         #pragma unroll
         for (int nt = 0; nt < NT; ++nt)
@@ -796,8 +758,7 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
                     __float2bfloat16_rn(Sr[1][nt][cc]);
             }
         __syncthreads();
-        // The whole 128-row d_k axis of S is in sV, so the owning warp does the FULL
-        // d_k contraction over the eight 16-wide windows onto AD's tile.
+        // The owning warp contracts the full d_k axis onto AD's tile.
         for (int tile = warp; tile < P2_MT * NT; tile += P2_WARPS) {
             const int mt = tile / NT, nt = tile - (tile / NT) * NT;
             const int cl = mt * 16 + gid, ch = cl + 8;
@@ -843,13 +804,11 @@ void gdn_cw_p2_stage_h(const __nv_bfloat16* __restrict__ q,
         {
             const float decay = __expf(sG[P2_C - 1]);
             const float gl = sG[P2_C - 1];
-            // ONE pass: every o[nt] contracts over ascending ks, then all Sr rows are
-            // updated in one sweep. NT is 1/2/4 by split.
+            // Every o[nt] contracts over ascending ks, then all Sr rows update in one sweep.
             float o[NT][4] = {{0.0f}};
             #pragma unroll
             for (int ks = 0; ks < P2_C / 16; ++ks) {
-                // ks*16 is the chunk-row offset of the 16-wide k-step; without it every
-                // step contracts chunk rows 0..15 again.
+                // ks*16 is the chunk-row offset of the 16-wide k-step.
                 const AFrag a = p1_a_kdec(kh, rstride, row0, valid_rows, sG, gl,
                                           warp * 16 + gid, ks * 16 + t2);
                 #pragma unroll

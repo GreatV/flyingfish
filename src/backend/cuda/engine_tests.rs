@@ -386,7 +386,6 @@ fn chain_argmax_matches_single_on_real_logits() -> Result<()> {
     Ok(())
 }
 
-/// Full-model G7; local primitive grants do not authorize this test.
 #[test]
 #[ignore = "requires a full-model GPU window and FF_Q38_MODEL/FLYINGFISH_RUNTIME_DIR"]
 fn q38_engine_capture_gpu() -> Result<()> {

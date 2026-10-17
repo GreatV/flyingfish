@@ -786,8 +786,7 @@ impl MtpRuntime {
         }
         if output == OutputMode::StateOnly {
             if phase == ExecutionPhase::Decode {
-                // Repair failures must remain recoverable by the transaction's
-                // restore path. Check on the host instead of trapping the GPU.
+                // Host check, not a GPU trap: repair failures stay recoverable by the transaction restore.
                 ensure!(
                     s.clone_dtoh(&self.work.n.slice(..rows * HIDDEN))?
                         .iter()

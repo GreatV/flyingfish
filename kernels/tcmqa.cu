@@ -1,209 +1,83 @@
-// ============================================================================
-// tcmqa.cu -- TENSOR-CORE multi-query GQA flash-decoding attention (TCMQA)
-// for MiniCPM5-2B speculative-decoding verification: M query tokens share one
-// KV cache; tree-structured visibility via a per-row ancestor bitset.
-// Scores and the P*V product run on bf16 tensor cores (mma.sync.m16n8k16);
-// the online softmax is fp32 in registers (FA2-style, per MMA fragment row).
+// TCMQA: tensor-core multi-query GQA flash-decoding attention. M query tokens
+// share one KV cache; tree visibility via a per-row ancestor bitset. S and P*V
+// run on bf16 mma.sync.m16n8k16 with fp32 accumulation; the online softmax is
+// fp32 in registers per MMA fragment row.
 //
-// Model shape (MiniCPM5-2B): GQA 16 q-heads / 2 kv-heads (group size 8),
-// head_dim 128, bf16 data with fp32 accumulation, scale = 1/sqrt(128).
-// FD_GUARD: every entry point calls __trap() when invoked with
-// n_q_heads != 16, n_kv_heads != 2, gqa != 8, head_dim != 128, M outside
-// [1, MQ_MAX=64], chunk not a positive multiple of 64, blockDim.x != 128,
-// gridDim.y != 2, gridDim.z != ceil(8M/64), or anc == nullptr -- a
-// wrong-shape launch fails loudly (the trap surfaces as a CUDA error at the
-// next synchronization) instead of silently leaving outputs unwritten.
+// Shape: 16 q-heads / 2 kv-heads (GQA 8), head_dim 128, scale = 1/sqrt(128).
+// Every entry point __trap()s when n_q_heads != 16, n_kv_heads != 2, gqa != 8,
+// head_dim != 128, M outside [1, MQ_MAX=64], chunk not a positive multiple of
+// 64, or (phase 1) blockDim.x/gridDim.y/gridDim.z mismatch or anc == nullptr.
 //
 // Semantics:
-//   The KV caches hold prefix positions [0, L) PLUS the M new tokens'
-//   positions [L, L+M); total extent L+M. Query token i attends all prefix
-//   positions plus draft position L+j iff bit j of anc[i] is set. The
-//   block-causal case is anc[i] = bits 0..i set (built host-side; anc is a
-//   plain kernel argument, fixed per graph capture). Positions >= L+M are
-//   never visible (covered by the bit-count guard). Mask logic runs only in
-//   the tiles overlapping [L, L+M): tiles fully below L take the no-mask fast
-//   path.
+//   The KV caches hold prefix positions [0, L) plus the M new tokens'
+//   positions [L, L+M). Query token i attends all prefix positions plus draft
+//   position L+j iff bit j of anc[i] is set; positions >= L+M are never
+//   visible. Tiles fully below L skip the mask.
 //
-//   q  : bf16 [M][16][128]; row of (query i, head qh) at
-//        q + i*q_tok_stride + qh*q_head_stride  (strides in bf16 elements)
+//   q  : bf16 [M][16][128]; row (i, qh) at q + i*q_tok_stride + qh*q_head_stride
 //   K,V: bf16, separate tensors, head_dim-contiguous rows
-//   o  : bf16 [M][16][128]; row of (i, qh) at o + i*o_tok_stride + qh*o_head_stride
+//   o  : bf16 [M][16][128]; row (i, qh) at o + i*o_tok_stride + qh*o_head_stride
+//   anc: M u64 (device); bit j of row i = draft position L+j visible.
 //
-// Pairs: global pair index p = qh_local*M + i in [0, 8M) per kv head
-// (qh_local in [0,8), i in [0,M)). Pair p occupies MMA row (p - rt*64) of
-// row-tile rt. Blocks with row-tile rt cover pairs [rt*64, rt*64+64); rows
-// with p >= 8M are dead (computed but never written).
+// Pairs: pair index p = qh_local*M + i in [0, 8M) per kv head. Pair p occupies
+// MMA row (p - rt*MT) of row-tile rt; rows with p >= 8M are computed but never
+// written.
 //
-// Two-phase split-KV (flash decoding):
-//   phase 1: grid (nchunks, 2, ceil(8M/64)); block = 128 threads = 4 warps.
-//            Block (ch, kv, rt) sweeps chunk ch of kv-head kv in KT=32-pos
-//            tiles; warp w owns MMA rows [w*16, w*16+16) of the tile (all 128
-//            dims of those rows), runs the online softmax per row, and writes
-//            one partial (m, l, acc[128]) per pair to caller scratch. No
-//            cross-warp reductions: warps own disjoint rows.
-//   phase 1 wide (tcmqa_phase1_w): grid (nchunks, 2, ceil(8M/128)); block =
-//            256 threads = 8 warps sharing one 128-row pair tile; warp w owns
-//            MMA rows [w*16, w*16+16) of it. At M = 16 grid.z = 1, so the
-//            chunk's K/V is read once per launch (the 64-row variant reads it
-//            once per row-tile, i.e. twice at M = 16). Every pair's per-value
-//            arithmetic is closed inside its owning warp and identical to the
-//            64-row variant, so outputs are bitwise identical.
+// Two-phase split-KV:
+//   phase 1: grid (nchunks, 2, ceil(8M/64)), block 128 = 4 warps. Block
+//            (ch, kv, rt) sweeps chunk ch of kv-head kv in KT=32-position
+//            tiles; warp w owns MMA rows [w*16, w*16+16) and writes one
+//            partial (m, l, acc[128]) per pair.
+//   phase 1 wide (_w, _ws): grid (nchunks, 2, ceil(8M/128)), block 256 = 8
+//            warps sharing one 128-row pair tile; outputs are bitwise
+//            identical to the 64-row variant.
 //   phase 2: grid (16*M); one block merges the nchunks partials of one
 //            (query, head) pair by LSE rescaling and writes o.
 //
-// Per-warp per-K-tile flow (KT=32 positions, KTR = 32):
-//   S[16][32]  = Q_w[16][128] * K_tile^T[128][32]: 8 k16-slices x 4 n8-slices
-//                of mma.m16n8k16; A = ldmatrix.x4 on the Q smem tile, B =
-//                ldmatrix.x2 (plain) on K smem rows [pos][d] (the col-major
-//                k16 x n8 B fragment equals the row-major [n][k] tile).
-//   softmax    : per row, max/sum over the row's S elements: each m16n8 fp32
-//                fragment row is held by a 4-lane quad (2 elements per lane
-//                per n8 slice), so row reductions are 2 quad shuffles.
-//                m' = max(m, rowmax); cf = expf(m - m'); l = l*cf + rowsum;
-//                acc *= cf. Masked elements are set to -INF before the update
-//                (exact no-op: expf(-INF - m') = 0 with the finite -3e38
-//                sentinel keeping m - m' NaN-free).
-//   P bf16     : S fragments' D registers repack in-register to A fragments
-//                (a k16 A fragment is two adjacent n8 D fragments, lane-wise).
-//   O += P*V   : 2 k16-slices (32 pos) x 16 n8-slices (128 dims); B =
-//                ldmatrix.x2.trans on V smem rows [pos][dim] (the col-major
-//                k16 x n8 B fragment needs the transpose of the [k][n] tile).
+// Per-warp per-K-tile flow:
+//   S[16][32] = Q_w[16][128] * K_tile^T[128][32]: 8 k16 x 4 n8 mma; A =
+//               ldmatrix.x4 on Q smem, B = ldmatrix.x2 on K smem rows [pos][d].
+//   softmax   : each fragment row is held by a 4-lane quad; row reductions are
+//               2 quad shuffles. Masked elements are -INF; the finite -3e38
+//               running-max sentinel keeps m - m' NaN-free.
+//   P bf16    : S D fragments repack in-register to A fragments.
+//   O += P*V  : 2 k16 x 16 n8 mma; B = ldmatrix.x2.trans on V smem rows [pos][dim].
 //
-// Thread map (phase 1): 128 threads = 4 warps x 32 lanes. Warp w owns rows
-// [w*16, w*16+16); within a warp, lane l holds D-fragment elements
-// (row l/4, cols (l%4)*2+{0,1}) and (row l/4+8, same cols) per n8 slice.
-// m/l are replicated across each row's quad.
+// Thread map: lane l holds D-fragment elements (row l/4, cols (l%4)*2+{0,1})
+// and (row l/4+8, same cols) per n8 slice; m/l are replicated across each
+// row's quad.
 //
-// Smem (dynamic, <= 48 KB, no cudaFuncSetAttribute needed):
-//   Q tile  [64][136] bf16 (row stride padded +8 against ldmatrix bank
-//   conflicts) | K tile [32][136] | V tile [32][136] | anc[64] u64.
-//   Total = (64+32+32)*136*2 + 512 = 35328 B.
-//   The wide variant's 128-row Q tile makes it (128+32+32)*136*2 + 512 =
-//   52736 B > 48 KB: the host must opt in with cudaFuncSetAttribute(
-//   cudaFuncAttributeMaxDynamicSharedMemorySize) before launching
-//   tcmqa_phase1_w.
-// Out-of-extent tile rows are zero-filled on load (NaN-safe: P is 0 there and
-// 0*0 = 0 in the PV MMA).
+// Smem (dynamic): Q [MT][LDSQ] bf16 | K [32][LDSK] | V [32][136] | anc[64] u64.
+//   phase 1: (64+32+32)*136*2 + 512 = 35328 B.
+//   _w:      (128+32+32)*136*2 + 512 = 52736 B.
+//   _ws:     50176 B (Q/K unpadded and XOR-swizzled).
+//   _w and _ws require cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize).
+//   phase 2: block = threads2 (multiple of 128, <= 1024),
+//            smem = (2*nchunks + threads2) * 4 B <= 48 KB.
+// Out-of-extent tile rows are zero-filled on load.
 //
-// KV layouts (strides in bf16 ELEMENTS, multiples of 8 for 16B alignment):
+// KV layouts (strides in bf16 elements, multiples of 8):
 //   position-major [pos][kv][d]:  head_stride = 128,     pos_stride = 256
 //   head-major     [kv][pos][d]:  head_stride = Lh*128,  pos_stride = 128
-//   Address: kv*head_stride + pos*pos_stride + d.  K and V strides are
-//   independent arguments. q/o strides must likewise be multiples of 8
-//   (contiguous defaults: tok_stride = 16*128 = 2048, head_stride = 128).
+//   Address: kv*head_stride + pos*pos_stride + d. K and V strides are
+//   independent. q/o strides are multiples of 8.
 //
-// Scratch (caller-allocated fp32, one buffer; NC = nchunks = ceil((L+M)/
-// chunk); NP = 2*NC*8*M = 16*NC*M total partials):
-//   scratch[0        .. NP)         = m   [NP]
-//   scratch[NP       .. 2*NP)       = l   [NP]
-//   scratch[2*NP     .. NP*(2+128)) = acc [NP][128]
-//   partial index part = ((kv*NC + ch)*8 + qh_local)*M + i
-//                      = (kv*NC + ch)*8*M + p   (p = qh_local*M + i)
-//   Required size: 16 * nchunks * M * 130 floats.
-//   Every (kv, ch, p) partial is written by exactly one block (the row-tile
-//   owning p), so phase 2 reads exactly nchunks defined partials per
-//   (query, head).
+// Scratch (caller-allocated fp32; NC = ceil((L+M)/chunk); NP = 16*NC*M):
+//   scratch[0    .. NP)         = m   [NP]
+//   scratch[NP   .. 2*NP)       = l   [NP]
+//   scratch[2*NP .. NP*(2+128)) = acc [NP][128]
+//   partial index = (kv*NC + ch)*8*M + p
+//   Size: 16 * NC * M * 130 floats. Each partial is written by exactly one block.
 //
-// CUDA Graph: the graph-safe entry points (non-_host) read L from a device
-// scalar (const int* len_dev); the engine updates that scalar to change L
-// between graph replays. M, chunk and the anc pointer are ordinary kernel
-// arguments: fixed per capture, and M/chunk MUST be identical in both phases
-// (both derive nchunks = ceil((L+M)/chunk) from L, M, chunk). The _host
-// variants take L by value. No global state; every buffer is caller-allocated
-// and passed per launch. Capacity-sized graphs: phase 1 may be launched with
-// grid.x = nchunks_max while the replayed L needs fewer chunks; blocks with
-// blockIdx.x >= ceil((L+M)/chunk) return before writing anything.
-//
-// Phase-1 launch:
-//   grid  = dim3(nchunks, 2, ceil(8M/64))
-//   block = 128 (fixed; guarded)
-//   smem  = 35328 bytes
-// Phase-1 wide launch (tcmqa_phase1_w):
-//   grid  = dim3(nchunks, 2, ceil(8M/128))
-//   block = 256 (fixed; guarded)
-//   smem  = 52736 bytes (> 48 KB: cudaFuncSetAttribute opt-in required)
-// Phase-2 launch:
-//   grid  = (16*M)
-//   block = threads2, a multiple of 128 (<= 1024)
-//   smem  = (2*nchunks + threads2) * 4 bytes, <= 48 KB
-// nchunks must be identical in both phases for the same (L, M, chunk).
-//
-// Host integration:
-//   - phase-1: grid = dim3(nchunks, 2, ceil(8M/64)), block = 128,
-//     smem = 35328 B (< 48 KB: no cudaFuncSetAttribute opt-in needed).
-//   - phase-1 wide (tcmqa_phase1_w): grid = dim3(nchunks, 2, ceil(8M/128)),
-//     block = 256, smem = 52736 B; call cudaFuncSetAttribute(
-//     cudaFuncAttributeMaxDynamicSharedMemorySize, 52736) once at setup.
-//     Outputs are bitwise identical to the 64-row variant; scratch layout and
-//     phase 2 are unchanged.
-//   - phase-2: grid = dim3(16*M), block = threads2 (multiple of 128, <= 1024),
-//     smem = (2*nchunks + threads2)*4 B <= 49152.
-//   - scratch bytes = 16 * nchunks * M * 130 * 4 (fp32), one slab; e.g.
-//     32k/M64/c2048: 16*17*64*130*4 = 9.0 MB.
-//   - chunk must be a positive multiple of 64 and identical in both phases.
-//   - anc: M uint64 (device), bit j of row i = draft position L+j visible.
-//     Chain/causal: anc[i] = (1ull << (i+1)) - 1; DSpark draft (full block):
-//     anc[i] = (1ull << M) - 1. Built once per (M, topology); the pointer is
-//     fixed per graph capture (update the contents, not the pointer).
-//   - chunk candidates per (ctx, M) for setup calibration (4090 measured,
-//     best first; A4000 calibrates separately -- its L2 is 4 MiB):
-//       1k : M7/8 {64,128}   M16 {64,128}   M32 {64,128}   M64 {128,64}
-//       8k : M7/8 {128,256}  M16 {256,128}  M32 {256,128}  M64 {512,256}
-//       32k: M7/8 {256,512}  M16 {512,1024} M32 {1024,512} M64 {2048,1024}
-//     v1 flash_decode_mq (kernels/attention.cu) stays a calibration candidate
-//     for M <= 16 (it wins e.g. 1k m7F: 13.2 vs 14.2 us on 4090); choose per
-//     (capacity bucket, M) by measurement, not by assumption.
-//
-// SIGNATURE TABLE (all symbols are extern "C" __global__; all pointer args
-// are __restrict__; NC = nchunks = ceil((L+M)/chunk)).
-// Failure semantics: wrong-shape calls or anc == nullptr __trap(); phase-1
-// grid.x may exceed nchunks (capacity-sized graphs) -- excess blocks exit
-// before any write.
-//
-//   tcmqa_phase1
-//     void(const __nv_bfloat16* q, const __nv_bfloat16* k,
-//          const __nv_bfloat16* v, float* scratch, const int* len_dev, int M,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int q_tok_stride, int q_head_stride,
-//          int k_head_stride, int k_pos_stride,
-//          int v_head_stride, int v_pos_stride, int chunk,
-//          const unsigned long long* anc)
-//     launch: grid = dim3(nchunks, 2, ceil(8M/64)), block = 128, smem = 35328
-//   tcmqa_phase1_host
-//     void(... same, with int L in place of const int* len_dev ...)
-//     launch: same as tcmqa_phase1
-//   tcmqa_phase1_w
-//     void(... same argument list as tcmqa_phase1 ...)
-//     launch: grid = dim3(nchunks, 2, ceil(8M/128)), block = 256,
-//             smem = 52736 (cudaFuncSetAttribute opt-in required)
-//   tcmqa_phase1_w_host
-//     void(... same, with int L in place of const int* len_dev ...)
-//     launch: same as tcmqa_phase1_w
-//   tcmqa_phase1_ws
-//     void(... same argument list as tcmqa_phase1 ...)
-//     launch: grid = dim3(nchunks, 2, ceil(8M/128)), block = 256,
-//             smem = 50176 (cudaFuncSetAttribute opt-in required)
-//   tcmqa_phase1_ws_host
-//     void(... same, with int L in place of const int* len_dev ...)
-//     launch: same as tcmqa_phase1_ws
-//   tcmqa_phase2
-//     void(float* scratch, __nv_bfloat16* o, const int* len_dev, int M,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int o_tok_stride, int o_head_stride, int chunk)
-//     launch: grid = dim3(16*M), block = threads2 (multiple of 128, <= 1024),
-//             smem = (2*nchunks + threads2)*4 bytes, <= 49152
-//   tcmqa_phase2_host
-//     void(float* scratch, __nv_bfloat16* o, int L, int M,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int o_tok_stride, int o_head_stride, int chunk)
-//     launch: same as tcmqa_phase2
-// ============================================================================
+// CUDA Graph: non-_host entry points read L from len_dev; _host variants take
+// L by value. M, chunk and the anc pointer are fixed per capture; M and chunk
+// are identical in both phases. Phase 1 may launch with grid.x = nchunks_max;
+// blocks with blockIdx.x >= ceil((L+M)/chunk) return before writing.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
 using bf16 = __nv_bfloat16;
 
-// ------------------------------------------------------- model / shape ----
 constexpr int HQ  = 16;                 // q heads
 constexpr int HKV = 2;                  // kv heads
 constexpr int GQA = HQ / HKV;           // 8 q heads per kv head
@@ -215,9 +89,8 @@ constexpr int NT  = NW * 32;            // 128 threads
 constexpr int MQ_MAX = 64;              // guard range for query tokens: 1..MQ_MAX
 constexpr int PAD = 8;                  // smem row padding (elements) vs ldmatrix banks
 constexpr int LDS = DH + PAD;           // padded smem row stride = 136
-constexpr float SCALE = 0.08838834764831845f;   // 1/sqrt(128); sqrtf() is not constexpr
+constexpr float SCALE = 0.08838834764831845f;   // 1/sqrt(128)
 
-// ------------------------------------------------------------- helpers ----
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
   return (unsigned)__cvta_generic_to_shared(p);
 }
@@ -259,13 +132,11 @@ __device__ __forceinline__ void cp_wait0() {
   asm volatile("cp.async.wait_group 0;\n");
 }
 
-// -------------------------------------------------------- phase 1 body ----
 // Block (ch, kv, rt): sweeps chunk ch of kv-head kv in KT-pos tiles; warp w
 // owns MMA rows [w*16, w*16+16) of the MT_-row pair tile (MT_ = 64 with
 // NT_ = 128 threads, or MT_ = 128 with NT_ = 256).
-// Layout parameters: row strides for the Q, K and V tiles (the padded stride
-// LDS = DH + 8 avoids ldmatrix bank conflicts) plus a flag selecting the XOR
-// swizzle that keeps an unpadded (DH-stride) Q/K tile conflict free.
+// LDSQ/LDSK/LDSV: Q/K/V tile row strides in elements. SWZ: Q/K 16B segment
+// index is XORed with (row & 7).
 template <int MT_, int NT_, int LDSQ, int LDSK, int LDSV, bool SWZ>
 __device__ __forceinline__ void tcmqa_phase1_body(
     const bf16* __restrict__ q, const bf16* __restrict__ Kc, const bf16* __restrict__ Vc,
@@ -328,11 +199,9 @@ __device__ __forceinline__ void tcmqa_phase1_body(
 #pragma unroll
     for (int j = 0; j < 4; ++j) acc[n][j] = 0.0f;
 
-  // ---- sweep the chunk in KT-position tiles ----
-  // K/V tiles are staged with cp.async. The prologue stages K(0); per tile,
-  // CP1 waits for K(t), barriers, and stages V(t) during the S mma and
-  // softmax; CP2 waits for V(t), barriers, and stages K(t+1) during the PV
-  // mma. Each stage overwrites the tile consumed before the preceding
+  // cp.async pipeline: the prologue stages K(0); per tile, CP1 waits for K(t)
+  // and stages V(t) over S + softmax; CP2 waits for V(t) and stages K(t+1)
+  // over PV. Each stage overwrites the tile consumed before the preceding
   // barrier.
   const int ntiles = (pos_end > pos_beg) ? ((pos_end - pos_beg + KT - 1) / KT) : 0;
 
@@ -447,7 +316,6 @@ __device__ __forceinline__ void tcmqa_phase1_body(
       rsum += __shfl_xor_sync(0xffffffffu, rsum, 1);
       rsum += __shfl_xor_sync(0xffffffffu, rsum, 2);
       ls[half] = ls[half] * cf + rsum;
-      // rescale the accumulators of this row half
 #pragma unroll
       for (int n = 0; n < 16; ++n) {
         acc[n][half * 2 + 0] *= cf;
@@ -504,7 +372,6 @@ __device__ __forceinline__ void tcmqa_phase1_body(
   }
 }
 
-// -------------------------------------------------------- phase 2 body ----
 // One block per (query, head) pair; blockIdx.x = eh = qi*n_q_heads + qh.
 // Partial index: part(ch) = (kv*nchunks + ch)*8*M + qh_local*M + qi,
 // stride 8*M per chunk.
@@ -647,7 +514,6 @@ __device__ __forceinline__ void tcmqa_phase2_short_body(
   }
 }
 
-// ======================================================== exported ABI =====
 #define FD_GUARD_P1 do {                                                                    \
   if (head_dim != DH || n_q_heads != HQ || n_kv_heads != HKV || gqa != GQA ||               \
       M < 1 || M > MQ_MAX || chunk < 64 || (chunk % 64) != 0 ||                             \
@@ -674,9 +540,7 @@ __device__ __forceinline__ void tcmqa_phase1_entry(
     int q_tok_stride, int q_head_stride,
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride) {
   const int nchunks = (L + M + chunk - 1) / chunk;
-  // Capacity-sized graph launches may carry more CTAs than this L needs.
-  // Block-uniform, before any __syncthreads: excess blocks must not write
-  // partials (part = (kv*nchunks + ch)*8*M + p would index into the next tile).
+  // Block-uniform, before any __syncthreads: blocks beyond nchunks write nothing.
   if (blockIdx.x >= nchunks) return;
   float* p_m = scratch;
   float* p_l = scratch + (size_t)HKV * nchunks * GQA * M;
@@ -713,8 +577,8 @@ extern "C" __global__ void __launch_bounds__(NT) tcmqa_phase1_host(
                              k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
 }
 
-// Wide pair-tile variant: one 128-row tile per block (8 warps share one K/V
-// smem tile set), so at M = 16 the KV chunk is read once per launch.
+// Wide pair-tile variant: one 128-row tile per block; 8 warps share one K/V
+// smem tile set.
 extern "C" __global__ void __launch_bounds__(256) tcmqa_phase1_w(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
     float* __restrict__ scratch, const int* __restrict__ len_dev, int M,
@@ -806,12 +670,8 @@ extern "C" __global__ void tcmqa_phase2_short_host(
                           o_tok_stride, o_head_stride);
 }
 
-// ---------------------------------------------- reduced-smem wide entry ----
-// Reduced-shared-memory wide variant: Q and K tiles lose the +8 element row
-// padding (both stay 16-byte aligned, since DH = 128 elements = 256 B), the V
-// tile keeps it, so the tile request is (128 + 32) * 128 * 2 + 32 * 136 * 2 +
-// 512 = 32768 + 8192 + 8704 + 512 = 50176 B. 50176 + 1024 driver = 51200 B,
-// which fits two CTAs in the 100 KiB per-SM shared memory.
+// Reduced-smem wide variant: Q/K tiles unpadded (stride DH, swizzled), V tile
+// stride LDS; smem = (128 + 32) * 128 * 2 + 32 * 136 * 2 + 512 = 50176 B.
 __device__ __forceinline__ void tcmqa_phase1_entry_ws(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
     float* __restrict__ scratch, const unsigned long long* __restrict__ anc,

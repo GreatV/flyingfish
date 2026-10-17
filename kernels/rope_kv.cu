@@ -1,6 +1,6 @@
-// rope_kv.cu -- fused RoPE rotation + KV-cache write (chain/decode); one
-// launch, bitwise-identical to the (rope, kv_write) pair it replaces.
-// FD_GUARD: __trap() unless q_heads == 16, kv_heads == 2, dim == 128, theta
+// Fused RoPE rotation + KV-cache write (chain/decode); bitwise-identical to
+// rope followed by kv_write.
+// __trap() unless q_heads == 16, kv_heads == 2, dim == 128, theta
 // finite and > 0, rows >= 1, and 0 <= *start <= capacity - rows.
 #include <cuda_bf16.h>
 

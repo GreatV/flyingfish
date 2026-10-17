@@ -1,4 +1,4 @@
-// Q38 ABI v1 common norm/gates. BF16-visible operations round explicitly.
+// Common norm/gate kernels. BF16-visible operations round explicitly.
 #include "q38_contract.cuh"
 #include <cuda_bf16.h>
 #include <math.h>
@@ -20,8 +20,8 @@ extern "C" __global__ void q38_advance(Q38SequenceMeta* meta) {
     q38_meta_guard(meta);
     if(threadIdx.x==0 && blockIdx.x==0) { ++meta->prefix; ++meta->key_count; }
 }
-// Fixed-row MTP verification graphs read a changing device position. Keep the
-// final physical slot available for the next-row decode metadata.
+// Reads the device position; requires p + rows < capacity, leaving the final
+// physical slot for the next-row decode metadata.
 extern "C" __global__ void q38_batch_meta(const int32_t* position,
                                          Q38SequenceMeta* meta, int32_t rows,
                                          int32_t capacity) {

@@ -302,8 +302,7 @@ pub(crate) fn q38_mtp_chain_gpu() -> Result<()> {
                             break;
                         }
                     }
-                    // Rebuild the prompt; a four-row transaction journal cannot
-                    // rewind a complete 64-token baseline trajectory.
+                    // The four-row transaction journal cannot rewind 64 tokens; re-prefill.
                     ensure!(
                         e.mtp_prefill(&ids)? == first,
                         "MTP bootstrap changed target prefill"

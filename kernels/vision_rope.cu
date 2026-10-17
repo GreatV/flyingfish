@@ -1,30 +1,17 @@
-// Qwen3.8 vision 2D RoPE: 18 frequencies per axis over the full 72-dim head.
-//
-// Reference (transformers 5.10.2):
-//   Qwen3_5VisionRotaryEmbedding, modeling_qwen3_5.py:81-92, built with
-//   dim = head_dim // 2 = 36 and theta = 1e4 (not the text model's 1e7):
+// Vision 2D RoPE: 18 frequencies per axis over the full 72-dim head, theta = 1e4.
+// Model definition (vision rotary embedding, dim = head_dim // 2 = 36):
 //       inv_freq[k] = 1 / theta**(k/18),  k = 0..17
 //       rope[p] = concat(row_pos[p] * inv_freq, col_pos[p] * inv_freq)   -> [36]
-//   the model then does emb = cat((rope, rope), -1), cos/sin, and
-//   apply_rotary_pos_emb_vision (:891-902) casts q,k up to fp32, rotates and casts
-//   back to bf16. rotate_half (:562-566) splits the head in half, so the rotation
-//   pairs dim i with dim i+36 and the two halves carry the same angle:
+// emb = cat((rope, rope), -1); q,k rotate in fp32 and round back to bf16. rotate_half pairs
+// dim i with dim i+36, both carrying the same angle:
 //
 //       out[i]    = x[i]   *c[i] - x[i+36]*s[i]
 //       out[i+36] = x[i+36]*c[i] + x[i]   *s[i]        i = 0..35
 //
 // with c[i] = cos(pos_axis(i) * inv_freq[i mod 18]) and pos_axis(i) = row for
 // i < 18, col for i >= 18.
-//
-// Positions come from the packing order, not from (row, col) of a row-major grid:
-// vision_utils.py:74-81 enumerates blocks row-major and, inside a block, the
-// m x m patch row-major. That is the silent failure this kernel is most likely to
-// have, so it is one line and it has a negative control.
-//
-// Not in-place, deliberately: reads x[i] and x[i+36] for each output element, so
-// the output buffer must not alias the input. An aliasing bug here is silent --
-// every element is written, the values are merely wrong. q/k are read, q_out/k_out
-// written.
+// Positions follow the merge-block packing order, not a row-major grid.
+// Not in-place: q_out/k_out must not alias q/k.
 //
 // Launch: grid(ceil(rows*HQ / 256)), block 256. One thread per (row, head).
 #include <cuda_bf16.h>
@@ -39,8 +26,6 @@ constexpr int D      = 72;      // head_dim
 constexpr int HALF   = D / 2;   // 36: rotate_half's split
 constexpr int NFREQ  = 18;      // frequencies per axis
 constexpr int MERGE  = 2;       // spatial_merge_size
-// Vision attention uses 1e4; the text path uses 1e7. A named constant so the
-// value is one line, and so substituting the text value is a one-line control.
 constexpr float THETA = 1.0e4f;
 
 static_assert(D == 2 * HALF, "rotate_half splits the head in half");
@@ -88,15 +73,12 @@ __device__ __forceinline__ void rope_body(const bf16* __restrict__ q, const bf16
   const int p = row - block_rows[b];
   const int nblk_w = grid_w[b] / MERGE;
 
-  // Merge-block packing order: blocks row-major, then the m x m patch inside a
-  // block row-major (vision_utils.py:74-81). Plain row-major would be a valid
-  // permutation of the right angles: nothing crashes and the logits drift.
+  // Merge-block packing order: blocks row-major, then the m x m patch inside a block row-major.
   const int blk = p / (MERGE * MERGE);
   const int inb = p % (MERGE * MERGE);
   const int pos_row = (blk / nblk_w) * MERGE + inb / MERGE;
   const int pos_col = (blk % nblk_w) * MERGE + inb % MERGE;
-  // Which grid axis feeds which half of the head. Named, because swapping them is
-  // a plausible build and this is where it has to be visible.
+  // Row position feeds dims [0, 18), column position dims [18, 36).
   const float axis_lo = (float)pos_row, axis_hi = (float)pos_col;
 
   float c[HALF], s[HALF];

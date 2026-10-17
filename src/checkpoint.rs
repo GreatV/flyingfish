@@ -138,9 +138,7 @@ impl MappedCheckpoint {
             files,
         })
     }
-    /// Read a validated mapped range through its original file descriptor. This does
-    /// not fault payload pages into the mapping, so verified large-model uploads
-    /// can keep process RSS bounded without changing borrowed mmap contents.
+    /// Reads a validated mapped range through its file descriptor without faulting mapping pages.
     #[cfg(feature = "cuda")]
     pub(crate) fn read_mapped_range(
         &self,

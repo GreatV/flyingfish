@@ -14,11 +14,8 @@ use cudarc::driver::{PushKernelArg, sys};
 use half::bf16;
 use serde::{Deserialize, Serialize};
 
-// Markov phase-1 small-body selection: F1 (cp.async pipeline) vs preF1
-// (LDG.32 direct read), measured per P bucket {1, 8}, independent of
-// context length. Selection metric: per-launch mean of a 7-launch burst
-// after one L2 flush; the burst's first launch is stored as cold-launch
-// evidence.
+// Markov phase-1 small body per P bucket {1, 8}: F1 (cp.async pipeline) or preF1 (LDG.32 direct read).
+// Metric: per-launch mean of a 7-launch burst after one L2 flush; the first launch is stored as cold time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum Body {

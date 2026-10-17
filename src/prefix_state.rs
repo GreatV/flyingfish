@@ -1,8 +1,4 @@
-//! Pure identity, coverage, and receipts for exact Qwen3.8 prefix snapshots.
-//!
-//! CUDA save/restore is intentionally not part of this module.  Keeping the
-//! package contract CPU-only makes the critical "did we snapshot every hybrid
-//! state?" question testable without a device or official checkpoint.
+//! Pure identity, coverage, and receipts for exact Qwen3.8 prefix snapshots; CPU-only.
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -130,8 +126,7 @@ impl PrefixIdentity {
         })
     }
 
-    /// Build identity from the SHA-256 computed while the exact upload bytes
-    /// were read.  This is deliberately not lazy and never re-reads weight files.
+    /// Builds identity from the SHA-256 computed while the upload bytes were read; never re-reads weight files.
     pub fn from_prefix_cache(
         dir: &Path,
         rope: &str,

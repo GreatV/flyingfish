@@ -1,11 +1,9 @@
-// embed_rmsnorm.cu -- embedding gather + RMSNorm as a single launch.
+// Embedding gather + RMSNorm as a single launch.
 //   embed_rmsnorm            decode/chain paths
 //   tree_prepare_embed_norm  tree path: tree_prepare's metadata writes plus
 //                            the same gather+norm body
-// Each replaces a back-to-back (embed, rms_norm [, tree_prepare]) sequence
-// with identical per-element math, reduction order and rounding points, so
-// the result is bit-identical. x receives the exact table bits (it is the
-// residual stream add_rmsnorm consumes and updates).
+// Bit-identical to (embed, rms_norm [, tree_prepare]): same per-element math,
+// reduction order and rounding points. x receives the exact table bits.
 //
 // Semantics as embed.cu + norm.cu rms_norm: fp32 ssq per row (butterfly warp
 // reduction, one value per warp in smem), y = bf16(x * rsqrt(mean+eps) * w),
@@ -16,7 +14,7 @@
 //     ids uint32[rows] (tree: tokens).
 //   * grid = (rows,1,1), block = (256,1,1), smem 128 B static; blocks past
 //     the valid rows return before any write.
-//   * FD_GUARD (__trap__): hidden != 2048, rows < 1, eps negative or not
+//   * __trap() when: hidden != 2048, rows < 1, eps negative or not
 //     finite, any null buffer, blockDim.x not a multiple of 32 or outside
 //     [32,1024]. The tree entry additionally keeps tree_prepare's checks:
 //     valid_rows in [1,64], budget in [1,64], valid_rows <= budget,
@@ -62,8 +60,7 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* smem) {
     return smem[0];
 }
 
-// Load 8 contiguous bf16 -> float[8] with one 16 B access; the raw vector is
-// returned so the caller can store it to x without a rounding step.
+// Load 8 contiguous bf16 -> float[8] with one 16 B access; returns the raw vector.
 __device__ __forceinline__ float4 ld_vec8(const bf16* __restrict__ p, float* __restrict__ f) {
     union U { float4 v; __nv_bfloat162 h[4]; } u;
     u.v = *reinterpret_cast<const float4*>(p);

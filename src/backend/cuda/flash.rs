@@ -59,8 +59,7 @@ impl Flash {
         Ok(tile as usize)
     }
 
-    /// Holds FA2's LSE, `rows * heads` f32 (FA2 writes `(b, h, seqlen_q)`),
-    /// allocated once at setup so `run` never allocates.
+    /// Holds FA2's LSE, `rows * heads` f32 (FA2 writes `(b, h, seqlen_q)`); allocated once at setup.
     pub fn new(stream: Arc<CudaStream>, rows: usize, heads: usize) -> Result<Self> {
         let lse = stream.alloc_zeros(rows * heads)?;
         Ok(Self { stream, lse })

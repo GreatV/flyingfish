@@ -1,25 +1,11 @@
-// sample.cu - token sampling kernels for MiniCPM5-2B decode (vocab = 130560, BF16 logits).
+// Token sampling kernels over BF16 logits.
 //
-// argmax: single-block reduction. Comparator: strictly greater value wins; ties
-// resolve to the lower index - the selected token is bit-identical for every
-// input, including all-equal and -inf logits. Vectorized 16B loads (8 bf16 per
-// uint4) when vocab % 8 == 0 and the pointer is 16B-aligned (both hold for the
-// engine's logits buffer); otherwise a scalar fallback with identical semantics.
-// Works for any blockDim.x <= 1024.
+// argmax: launch <<<1, T>>>, T <= 1024. Comparator: strictly greater value wins;
+// ties resolve to the lower index, including all-equal and -inf logits. 16B loads
+// (8 bf16 per uint4) when vocab % 8 == 0 and the pointer is 16B-aligned; scalar
+// loads otherwise, same semantics.
 //
-// advance: single-thread increment of the device position scalar.
-//
-// Signature table:
-//   argmax(const __nv_bfloat16* logits, uint32_t* token, int vocab)
-//     launch <<<1, T>>>, T <= 1024
-//   argmax_rows_bf16(const __nv_bfloat16* logits, uint32_t* tokens, int vocab,
-//                    const int* valid_rows_dev)
-//     launch <<<budget, 1024>>>; block b argmaxes logits row b ([budget][vocab]
-//     contiguous bf16) into tokens[b]; rows with b >= *valid_rows_dev return
-//     before any write (capacity-sized graphs: grid fixed at budget, the device
-//     scalar drives the live rows per replay). Same comparator as argmax.
-//   advance(int* position)
-//     launch <<<1, 1>>> (any block size; only thread 0 acts)
+// advance: thread 0 increments the device position scalar.
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -78,10 +64,9 @@ extern "C" __global__ void argmax(const __nv_bfloat16* logits, uint32_t* token, 
     }
 }
 
-// Per-row argmax for the fixed-budget verify graph: block b reduces row b of
-// a [budget][vocab] bf16 logits slab. Same comparator as argmax (strictly
-// greater wins; ties take the lower index). Dead rows (b >= *valid_rows_dev)
-// return before any write.
+// Per-row argmax, launch <<<budget, 1024>>>: block b reduces row b of a
+// [budget][vocab] bf16 logits slab into tokens[b]. Same comparator as argmax.
+// Rows b >= *valid_rows_dev return before any write.
 extern "C" __global__ void __launch_bounds__(1024) argmax_rows_bf16(
     const __nv_bfloat16* __restrict__ logits, uint32_t* __restrict__ tokens,
     int vocab, const int* __restrict__ valid_rows_dev) {

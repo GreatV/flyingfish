@@ -113,10 +113,8 @@ fn calibration_capacity(length: usize, rows: usize) -> usize {
     length + 256 + rows
 }
 
-/// Chunks whose phase-1 grid fills one and two whole waves of resident CTAs:
-/// rounding the chunk up to a 64-position step keeps the grid at or under the
-/// wave, so no tail block is launched. The grid is
-/// ceil(calibration_capacity / chunk) chunks per KV head times the row tiles.
+/// 64-position-step chunks whose phase-1 grid fills at most one and two whole waves of resident CTAs.
+/// The grid is ceil(calibration_capacity / chunk) chunks per KV head times the row tiles.
 fn wave_chunks(
     length: usize,
     rows: usize,
@@ -212,12 +210,7 @@ fn candidates(
             },
         });
     }
-    // 128-row tile variant. It reads each K/V tile once per launch; the 64-row
-    // variant reads it once per row tile, so it is offered only when the query
-    // rows span two or more 64-row tiles.
-    // One layer's K/V prefix at the bucket's measured length is
-    // LENGTHS[bucket] * kv_bytes_per_token bytes; the extra 64-row tile re-reads
-    // that prefix, so the variant is offered only where it exceeds the device L2.
+    // 128-row tile variant: offered when rows span two or more 64-row tiles and one layer's K/V prefix exceeds L2.
     if 8 * rows > 64 && LENGTHS[bucket] * budget.kv_bytes_per_token > budget.l2_bytes {
         for &chunk in &chunks {
             plans.push(MultiPlan {

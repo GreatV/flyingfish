@@ -143,8 +143,7 @@ impl Verification {
             plan.qpack * (plan.threads as usize / 32) * 130 * 4
         };
         let second_smem = (2 * chunks + plan.merge_threads as usize) * 4;
-        // TcmqaW's 52,736 B phase-1 tile needs the per-function opt-in set
-        // below; phase 2 has no opt-in anywhere, so it stays under 48 KiB.
+        // TcmqaW/TcmqaWs phase 1 uses the per-function smem opt-in; phase 2 stays under 48 KiB.
         let first_smem_limit = if matches!(phase1, MultiImpl::TcmqaW | MultiImpl::TcmqaWs) {
             101 * 1024
         } else {
