@@ -807,14 +807,13 @@ mod tests {
         let ready = upload.record_event(None)?;
         stream.wait(&ready)?;
         let mut ledger = crate::experts::plan::TierLedger::new(
-            geometry,
-            counts,
+            SlotLayout::new(geometry, &capacity)?,
             0,
             &(0..geometry.layers)
                 .map(|layer| if layer == 0 { vec![0, 1] } else { vec![0] })
                 .collect::<Vec<_>>(),
         )?;
-        assert_eq!(ledger.borrow(1)?.experts, vec![(0, 1)]);
+        assert_eq!(ledger.borrow_tail(1, 0)?.experts, vec![(0, 1)]);
         let (borrowed, borrowed_bytes) = storage.borrowed_tail(1)?;
         assert_eq!(borrowed, storage.slot(0, 1)?.0);
         assert_eq!(borrowed_bytes, slot_bytes as usize);

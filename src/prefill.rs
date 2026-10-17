@@ -599,6 +599,7 @@ mod admission_tests {
             d2h_bytes_per_second: (16u64 << 30) as f64,
             copy_engines: 2,
             disk_readers: 1,
+            host_registration_bytes: 0,
             service: &service,
             reserves,
             span_rows: request.span_rows,
