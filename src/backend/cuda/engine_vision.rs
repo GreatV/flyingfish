@@ -829,26 +829,28 @@ impl VisionWeights {
                     "model.vision_tower.post_layernorm",
                     hidden,
                 )?);
+                let projection = |catalog: &mut WeightCatalog,
+                                  prefix: &str,
+                                  name: &str|
+                 -> Result<BiasedWeight> {
+                    BiasedWeight::take(
+                        catalog,
+                        &format!("{prefix}.self_attn.{name}_proj"),
+                        [hidden, hidden],
+                        &[hidden_usize, hidden_usize],
+                    )
+                };
                 let mut blocks = Vec::with_capacity(depth as usize);
                 for i in 0..depth {
                     let p = format!("model.vision_tower.encoder.layers.{i}");
-                    let projection =
-                        |catalog: &mut WeightCatalog, name: &str| -> Result<BiasedWeight> {
-                            BiasedWeight::take(
-                                catalog,
-                                &format!("{p}.self_attn.{name}_proj"),
-                                [hidden, hidden],
-                                &[hidden_usize, hidden_usize],
-                            )
-                        };
                     blocks.push(BlockWeights {
                         norm1: AffineWeights::take(catalog, &format!("{p}.layer_norm1"), hidden)?,
                         qkv: QkvWeights::Split(Box::new(QkvSplit {
-                            q: projection(catalog, "q")?,
-                            k: projection(catalog, "k")?,
-                            v: projection(catalog, "v")?,
+                            q: projection(catalog, &p, "q")?,
+                            k: projection(catalog, &p, "k")?,
+                            v: projection(catalog, &p, "v")?,
                         })),
-                        projection: projection(catalog, "out")?,
+                        projection: projection(catalog, &p, "out")?,
                         norm2: AffineWeights::take(catalog, &format!("{p}.layer_norm2"), hidden)?,
                         fc1: BiasedWeight::take(
                             catalog,
@@ -865,20 +867,11 @@ impl VisionWeights {
                     });
                 }
                 let p = "model.vision_tower.vit_merger";
-                let projection =
-                    |catalog: &mut WeightCatalog, name: &str| -> Result<BiasedWeight> {
-                        BiasedWeight::take(
-                            catalog,
-                            &format!("{p}.self_attn.{name}_proj"),
-                            [hidden, hidden],
-                            &[hidden_usize, hidden_usize],
-                        )
-                    };
                 let window = WindowMergerWeights {
-                    q: projection(catalog, "q")?,
-                    k: projection(catalog, "k")?,
-                    v: projection(catalog, "v")?,
-                    projection: projection(catalog, "out")?,
+                    q: projection(catalog, p, "q")?,
+                    k: projection(catalog, p, "k")?,
+                    v: projection(catalog, p, "v")?,
+                    projection: projection(catalog, p, "out")?,
                     norm1: AffineWeights::take(catalog, &format!("{p}.layer_norm1"), hidden)?,
                     pre_norm: AffineWeights::take(
                         catalog,
@@ -1183,6 +1176,17 @@ fn prefix_bytes(rows: usize, geometry: &VisionGeometry) -> Result<usize> {
     ensure!(rows > 0, "empty vision prefix");
     rows.checked_mul(geometry.patch as usize * 6 + geometry.hidden() as usize * 8 + 4 * 8)
         .context("vision prefix byte overflow")
+}
+
+/// One stage's split-QKV pack: the projection planes, the head-major destinations and the packing.
+struct SplitStage<'a> {
+    qkv: &'a CudaSlice<bf16>,
+    packing: &'a PatchPacking,
+    rows: u32,
+    padded: u32,
+    q: &'a Tensor<bf16, 3>,
+    k_out: u64,
+    v: &'a Tensor<bf16, 3>,
 }
 
 /// One tower pass over a fixed row extent: the patch rows before an insert merger, the merged rows after.
@@ -1681,28 +1685,19 @@ impl VisionRuntime {
                     split.k.run(stream, blas, normed, &mut TensorMut(k_out))?;
                     let v_out = dense_at(buffers.qkv, stream, [rows, width], 2 * plane)?;
                     split.v.run(stream, blas, normed, &mut TensorMut(v_out))?;
-                    for image in 0..stage.packing.images() {
-                        let first = stage.packing.cu_seqlens()[image] as u32;
-                        let n = stage.packing.cu_seqlens()[image + 1] as u32 - first;
-                        let key_first = stage.packing.k_bases()[image] as u32;
-                        self.io.pack_split(
-                            stream,
-                            SegmentPack {
-                                q_in: &dense_at(buffers.qkv, stream, [rows, width], 0)?,
-                                k_in: &dense_at(buffers.qkv, stream, [rows, width], plane)?,
-                                v_in: &dense_at(buffers.qkv, stream, [rows, width], 2 * plane)?,
-                                q: &q,
-                                k: stage.attention.padded_key_ptr(&run.scratch),
-                                v: &v,
-                                rows,
-                                padded: stage.padded,
-                                first,
-                                key_first,
-                                n,
-                            },
-                            &spec,
-                        )?;
-                    }
+                    self.pack_split_stage(
+                        stream,
+                        SplitStage {
+                            qkv: buffers.qkv,
+                            packing: stage.packing,
+                            rows,
+                            padded: stage.padded,
+                            q: &q,
+                            k_out: stage.attention.padded_key_ptr(&run.scratch),
+                            v: &v,
+                        },
+                        &spec,
+                    )?;
                 }
             }
         }
@@ -1772,6 +1767,41 @@ impl VisionRuntime {
         Ok(())
     }
 
+    /// Packs every image segment of one stage: three token-major planes into head-major Q,
+    /// padded K and V.
+    fn pack_split_stage(
+        &self,
+        stream: &Arc<CudaStream>,
+        stage: SplitStage<'_>,
+        spec: &VisionSpec,
+    ) -> Result<()> {
+        let width = spec.hidden;
+        let plane = stage.rows as usize * width as usize;
+        for segment in 0..stage.packing.images() {
+            let first = stage.packing.cu_seqlens()[segment] as u32;
+            let n = stage.packing.cu_seqlens()[segment + 1] as u32 - first;
+            let key_first = stage.packing.k_bases()[segment] as u32;
+            self.io.pack_split(
+                stream,
+                SegmentPack {
+                    q_in: &dense_at(stage.qkv, stream, [stage.rows, width], 0)?,
+                    k_in: &dense_at(stage.qkv, stream, [stage.rows, width], plane)?,
+                    v_in: &dense_at(stage.qkv, stream, [stage.rows, width], 2 * plane)?,
+                    q: stage.q,
+                    k: stage.k_out,
+                    v: stage.v,
+                    rows: stage.rows,
+                    padded: stage.padded,
+                    first,
+                    key_first,
+                    n,
+                },
+                spec,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Window-attention merger: gather patch rows into 2×2 windows, attend inside each window,
     /// flatten each window to one `4 · hidden` row, and add the window mean back.
     fn run_insert(
@@ -1823,28 +1853,19 @@ impl VisionRuntime {
             stream,
             [spec.hq, tower.window_packing.padded_rows(), spec.d],
         )?;
-        for segment in 0..tower.window_packing.images() {
-            let first = tower.window_packing.cu_seqlens()[segment] as u32;
-            let n = tower.window_packing.cu_seqlens()[segment + 1] as u32 - first;
-            let key_first = tower.window_packing.k_bases()[segment] as u32;
-            self.io.pack_split(
-                stream,
-                SegmentPack {
-                    q_in: &dense_at(&request.qkv, stream, [rows, width], 0)?,
-                    k_in: &dense_at(&request.qkv, stream, [rows, width], plane)?,
-                    v_in: &dense_at(&request.qkv, stream, [rows, width], 2 * plane)?,
-                    q: &q,
-                    k: tower.window.padded_key_ptr(&scratch),
-                    v: &v,
-                    rows,
-                    padded: tower.window_packing.padded_rows(),
-                    first,
-                    key_first,
-                    n,
-                },
-                &spec,
-            )?;
-        }
+        self.pack_split_stage(
+            stream,
+            SplitStage {
+                qkv: &request.qkv,
+                packing: &tower.window_packing,
+                rows,
+                padded: tower.window_packing.padded_rows(),
+                q: &q,
+                k_out: tower.window.padded_key_ptr(&scratch),
+                v: &v,
+            },
+            &spec,
+        )?;
         VisionAttnOps::run(&tower.window, stream, scratch)?;
         window.projection.run(
             stream,
