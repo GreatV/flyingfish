@@ -40,6 +40,13 @@ impl PlannedImage {
     }
 }
 
+fn patch_width(spec: &ModelSpec) -> Result<usize> {
+    spec.vision
+        .as_ref()
+        .context("image input requires a vision configuration")?
+        .patch_elements(spec.architecture)
+}
+
 pub struct PreparedImages {
     pub modality_ids: Vec<u8>,
     pub pixel_values: Vec<f32>,
@@ -47,7 +54,13 @@ pub struct PreparedImages {
 }
 
 impl PreparedImages {
-    pub fn save(&self, ids: &[u32], path: &Path) -> Result<()> {
+    pub fn save(&self, spec: &ModelSpec, ids: &[u32], path: &Path) -> Result<()> {
+        let width = patch_width(spec)?;
+        ensure!(
+            self.pixel_values.len().is_multiple_of(width),
+            "pixel_values length {} is not a multiple of the model's {width}-element patch",
+            self.pixel_values.len()
+        );
         let mut tensors = crate::tensors::Tensors::default();
         tensors.i64(
             "input_ids".into(),
@@ -71,7 +84,7 @@ impl PreparedImages {
         tensors.i64("image_grid_thw".into(), vec![self.grids.len(), 3], &grids)?;
         tensors.f32(
             "pixel_values_fp32".into(),
-            vec![self.pixel_values.len() / 1536, 1536],
+            vec![self.pixel_values.len() / width, width],
             &self.pixel_values,
         )?;
         tensors.save_new(
@@ -80,7 +93,8 @@ impl PreparedImages {
         )
     }
 
-    pub fn read(path: &Path, ids: &[u32]) -> Result<Self> {
+    pub fn read(spec: &ModelSpec, path: &Path, ids: &[u32]) -> Result<Self> {
+        let width = patch_width(spec)?;
         let bytes = std::fs::read(path)?;
         let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
         let integers = |name: &str| -> Result<Vec<i64>> {
@@ -136,10 +150,13 @@ impl PreparedImages {
             .collect::<Result<Vec<_>>>()?;
         let pixels = tensors.tensor("pixel_values_fp32")?;
         ensure!(
-            pixels.dtype() == safetensors::Dtype::F32
-                && pixels.shape().len() == 2
-                && pixels.shape()[1] == 1536,
-            "pixel_values_fp32 must be F32 [patches,1536]"
+            pixels.dtype() == safetensors::Dtype::F32 && pixels.shape().len() == 2,
+            "pixel_values_fp32 must be F32 [patches,{width}]"
+        );
+        ensure!(
+            pixels.shape()[1] == width,
+            "pixel_values_fp32 row width {} does not match the model's {width}-element patch",
+            pixels.shape()[1]
         );
         let pixel_values = pixels
             .data()
@@ -1206,6 +1223,48 @@ fn decode_jpeg(bytes: &[u8]) -> Result<RgbImage> {
 mod tests {
     use super::*;
     use crate::serve::detok::Shared;
+
+    #[test]
+    fn image_input_files_use_the_model_patch_width() -> Result<()> {
+        let root: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/data/minicpm-config.json"))?;
+        let spec = ModelSpec::minicpm(
+            &root,
+            &serde_json::json!({"eos_token_id": [248044, 248046]}),
+        )?;
+        let width = spec
+            .vision
+            .as_ref()
+            .unwrap()
+            .patch_elements(spec.architecture)?;
+        assert_eq!(width, 588);
+        let prepared = PreparedImages {
+            modality_ids: vec![0, 1, 1, 0],
+            pixel_values: (0..16 * width).map(|i| i as f32 / 1024.0).collect(),
+            grids: vec![ImageGrid { t: 1, h: 4, w: 4 }],
+        };
+        let ids = [1u32, 2, 3, 4];
+        let path =
+            std::env::temp_dir().join(format!("ff-image-roundtrip-minicpm-{}", std::process::id()));
+        prepared.save(&spec, &ids, &path)?;
+        let replay = PreparedImages::read(&spec, &path, &ids)?;
+        assert_eq!(replay.grids, prepared.grids);
+        assert_eq!(replay.modality_ids, prepared.modality_ids);
+        assert_eq!(replay.pixel_values, prepared.pixel_values);
+        let qwen: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/data/q38-config.json"))?;
+        let qwen = ModelSpec::qwen(&qwen, &serde_json::Value::Null)?;
+        let error = match PreparedImages::read(&qwen, &path, &ids) {
+            Ok(_) => anyhow::bail!("Qwen-width read must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("588") && error.contains("1536"), "{error}");
+        let mut mismatched = prepared;
+        mismatched.pixel_values.pop();
+        assert!(mismatched.save(&spec, &ids, &path).is_err());
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
 
     #[test]
     fn smart_resize_matches_qwen_grid_and_rejects_invalid_dimensions() -> Result<()> {

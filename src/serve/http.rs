@@ -1373,9 +1373,10 @@ mod tests {
                 "flyingfish-image-roundtrip-{}-{index}.safetensors",
                 std::process::id()
             ));
-            prepared.save(&request.ids, &path)?;
-            let replay = super::super::image::PreparedImages::read(&path, &request.ids)?;
-            assert!(super::super::image::PreparedImages::read(&path, &[0]).is_err());
+            let spec = crate::model_spec::ModelSpec::read(model)?;
+            prepared.save(&spec, &request.ids, &path)?;
+            let replay = super::super::image::PreparedImages::read(&spec, &path, &request.ids)?;
+            assert!(super::super::image::PreparedImages::read(&spec, &path, &[0]).is_err());
             std::fs::remove_file(&path)?;
             assert_eq!(replay.grids, prepared.grids);
             assert_eq!(replay.modality_ids, prepared.modality_ids);
