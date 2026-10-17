@@ -174,7 +174,7 @@ pub struct SpliceRange {
 
 pub struct MultimodalInput<'a> {
     pub input_ids: &'a [u32],
-    /// 0 = text, 1 = image. Video and other modalities are rejected.
+    /// 0 = text, 1 = image, 2 = video.
     pub modality_ids: &'a [u8],
     /// Merge-grouped rows, each [channel, temporal, patch_y, patch_x] flattened.
     pub pixel_values: &'a [f32],
@@ -483,14 +483,12 @@ impl MultimodalInput<'_> {
             "token/modality extent mismatch"
         );
         ensure!(
-            self.input_ids
-                .iter()
-                .all(|&id| id < spec.vocab && id != vision.video_token),
-            "invalid token or unsupported video token"
+            self.input_ids.iter().all(|&id| id < spec.vocab),
+            "invalid token id"
         );
         ensure!(
-            self.modality_ids.iter().all(|&m| m <= 1),
-            "unsupported modality (only text/image)"
+            self.modality_ids.iter().all(|&m| m <= 2),
+            "unsupported modality (only text/image/video)"
         );
         let mut patch_rows = 0usize;
         let mut feature_rows = 0usize;
@@ -529,22 +527,29 @@ impl MultimodalInput<'_> {
                 continue;
             }
             let start = cursor;
-            while cursor < len && self.modality_ids[cursor] == 1 {
+            let run = self.modality_ids[start];
+            let token = if run == 1 {
+                vision.image_token
+            } else {
+                ensure!(run == 2, "unsupported modality {run}");
+                vision.video_token
+            };
+            while cursor < len && self.modality_ids[cursor] == run {
                 ensure!(
-                    self.input_ids[cursor] == vision.image_token,
-                    "image modality contains non-placeholder token"
+                    self.input_ids[cursor] == token,
+                    "visual modality contains non-placeholder token"
                 );
                 cursor += 1;
             }
             let grid = *self
                 .grids
                 .get(slots.len())
-                .context("image run has no corresponding grid")?;
+                .context("visual run has no corresponding grid")?;
             let patches = grid.patch_rows()?;
             let features = grid.feature_rows(merge)?;
             ensure!(
                 cursor - start == features,
-                "image placeholder count does not match grid"
+                "visual placeholder count does not match grid"
             );
             let before = start
                 .checked_sub(1)

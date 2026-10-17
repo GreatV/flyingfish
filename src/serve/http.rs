@@ -413,7 +413,7 @@ fn add_request(
     state: &AppState,
     ids: Vec<u32>,
     max_tokens: usize,
-    images: Option<super::image::PreparedImages>,
+    images: Option<super::image::PreparedInput>,
     admission: Option<super::Admission<'_>>,
 ) -> Result<tokio_mpsc::Receiver<EngineEvent>, Box<Response>> {
     let (event_tx, event_rx) = tokio_mpsc::channel::<EngineEvent>(64);
@@ -564,7 +564,7 @@ async fn chat_completions(
             Ok(images) => images,
             Err(error) => return bad_request(&format!("image input: {error}")),
         };
-        match processor.expand(&ids, images, state.backend.options().capacity) {
+        match processor.expand(&ids, images, Vec::new(), state.backend.options().capacity) {
             Ok((expanded, prepared)) => {
                 ids = expanded;
                 Some(prepared)
@@ -1375,8 +1375,8 @@ mod tests {
             ));
             let spec = crate::model_spec::ModelSpec::read(model)?;
             prepared.save(&spec, &request.ids, &path)?;
-            let replay = super::super::image::PreparedImages::read(&spec, &path, &request.ids)?;
-            assert!(super::super::image::PreparedImages::read(&spec, &path, &[0]).is_err());
+            let replay = super::super::image::PreparedInput::read(&spec, &path, &request.ids)?;
+            assert!(super::super::image::PreparedInput::read(&spec, &path, &[0]).is_err());
             std::fs::remove_file(&path)?;
             assert_eq!(replay.grids, prepared.grids);
             assert_eq!(replay.modality_ids, prepared.modality_ids);

@@ -169,13 +169,14 @@ fn patch_width(spec: &ModelSpec) -> Result<usize> {
         .patch_elements(spec.architecture)
 }
 
-pub struct PreparedImages {
+#[derive(Debug)]
+pub struct PreparedInput {
     pub modality_ids: Vec<u8>,
     pub pixel_values: Vec<f32>,
     pub grids: Vec<ImageGrid>,
 }
 
-impl PreparedImages {
+impl PreparedInput {
     pub fn save(&self, spec: &ModelSpec, ids: &[u32], path: &Path) -> Result<()> {
         let width = patch_width(spec)?;
         ensure!(
@@ -607,25 +608,41 @@ impl Processor {
             })
     }
 
+    /// Total video_token count of one prepared video.
+    pub fn video_tokens(&self, video: &PackedVideo) -> Result<usize> {
+        let vision = self
+            .spec
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        video.frames.iter().try_fold(0usize, |total, frame| {
+            total
+                .checked_add(video_frame_tokens(vision, frame)?)
+                .context("video token count overflow")
+        })
+    }
+
     pub fn expand(
         &self,
         ids: &[u32],
         images: Vec<PackedImage>,
+        videos: Vec<PackedVideo>,
         capacity: usize,
-    ) -> Result<(Vec<u32>, PreparedImages)> {
+    ) -> Result<(Vec<u32>, PreparedInput)> {
         let vision = self
             .spec
             .vision
             .as_ref()
             .context("vision configuration missing")?;
         match &self.config {
-            ImageConfig::Qwen(_) => expand_qwen(&self.spec, vision, ids, images, capacity),
+            ImageConfig::Qwen(_) => expand_qwen(&self.spec, vision, ids, images, videos, capacity),
             ImageConfig::MiniCpm(_) => expand_mini_cpm(
                 &self.spec,
                 vision,
                 self.image_id.as_ref().context("image-id tokens missing")?,
                 ids,
                 images,
+                videos,
                 capacity,
             ),
         }
@@ -914,15 +931,49 @@ fn get_sliced_grid(
     Some(best)
 }
 
+fn video_frame_tokens(
+    vision: &crate::model_spec::VisionConfig,
+    frame: &VideoFrame,
+) -> Result<usize> {
+    let thumb = *frame.grids.first().context("video frame has no crops")?;
+    let mut tokens = thumb.feature_rows(vision.merge)?;
+    if frame.rows > 0 && frame.cols > 0 {
+        ensure!(
+            frame.grids.len() == 1 + frame.rows as usize * frame.cols as usize,
+            "crop count does not match the video slice grid"
+        );
+        let slice = *frame
+            .grids
+            .get(1)
+            .context("sliced video frame lacks a slice crop")?;
+        tokens = tokens
+            .checked_add(
+                frame.rows as usize * frame.cols as usize * slice.feature_rows(vision.merge)?,
+            )
+            .context("video token count overflow")?;
+    } else {
+        ensure!(
+            frame.grids.len() == 1,
+            "unsliced video frame carries slice crops"
+        );
+    }
+    Ok(tokens)
+}
+
 fn expand_qwen(
     spec: &ModelSpec,
     vision: &crate::model_spec::VisionConfig,
     ids: &[u32],
     images: Vec<PackedImage>,
+    videos: Vec<PackedVideo>,
     capacity: usize,
-) -> Result<(Vec<u32>, PreparedImages)> {
+) -> Result<(Vec<u32>, PreparedInput)> {
+    ensure!(
+        videos.is_empty(),
+        "video input requires the MiniCPM image configuration"
+    );
     let mut expanded = Vec::new();
-    let mut prepared = PreparedImages {
+    let mut prepared = PreparedInput {
         modality_ids: Vec::new(),
         pixel_values: Vec::new(),
         grids: Vec::new(),
@@ -968,14 +1019,15 @@ fn expand_mini_cpm(
     image_id: &ImageId,
     ids: &[u32],
     images: Vec<PackedImage>,
+    videos: Vec<PackedVideo>,
     capacity: usize,
-) -> Result<(Vec<u32>, PreparedImages)> {
+) -> Result<(Vec<u32>, PreparedInput)> {
     let markers = vision
         .minicpm
         .as_ref()
         .context("MiniCPM vision configuration missing")?;
     let mut expanded = Vec::new();
-    let mut prepared = PreparedImages {
+    let mut prepared = PreparedInput {
         modality_ids: Vec::new(),
         pixel_values: Vec::new(),
         grids: Vec::new(),
@@ -983,9 +1035,83 @@ fn expand_mini_cpm(
     let mut packed: Vec<Vec<f32>> = Vec::new();
     let mut packed_patches: Vec<usize> = Vec::new();
     let mut images = images.into_iter();
+    let mut videos = videos.into_iter();
     let mut index = 0usize;
     for &id in ids {
-        if id == vision.image_token {
+        if id == vision.video_token {
+            let video = videos
+                .next()
+                .context("more video placeholders than supplied videos")?;
+            let tokens = video.frames.iter().try_fold(0usize, |total, frame| {
+                total
+                    .checked_add(video_frame_tokens(vision, frame)?)
+                    .context("video token count overflow")
+            })?;
+            let block = video
+                .frames
+                .len()
+                .checked_mul(2)
+                .and_then(|markers| markers.checked_add(tokens))
+                .context("video token count overflow")?;
+            ensure!(
+                expanded
+                    .len()
+                    .checked_add(block)
+                    .is_some_and(|n| n <= capacity),
+                "video tokens exceed request capacity"
+            );
+            for frame in &video.frames {
+                let thumb = *frame.grids.first().context("video frame has no crops")?;
+                let thumb_tokens = thumb.feature_rows(vision.merge)?;
+                expanded.push(vision.start_token);
+                prepared.modality_ids.push(0);
+                expanded.extend(std::iter::repeat_n(id, thumb_tokens));
+                prepared
+                    .modality_ids
+                    .extend(std::iter::repeat_n(2, thumb_tokens));
+                expanded.push(vision.end_token);
+                prepared.modality_ids.push(0);
+                if frame.rows > 0 && frame.cols > 0 {
+                    let slice = *frame
+                        .grids
+                        .get(1)
+                        .context("sliced video frame lacks a slice crop")?;
+                    let per_slice = slice.feature_rows(vision.merge)?;
+                    for row in 0..frame.rows {
+                        if row > 0 {
+                            expanded.push(markers.newline_token);
+                            prepared.modality_ids.push(0);
+                        }
+                        for _ in 0..frame.cols {
+                            expanded.push(markers.slice_start_token);
+                            prepared.modality_ids.push(0);
+                            expanded.extend(std::iter::repeat_n(id, per_slice));
+                            prepared
+                                .modality_ids
+                                .extend(std::iter::repeat_n(2, per_slice));
+                            expanded.push(markers.slice_end_token);
+                            prepared.modality_ids.push(0);
+                        }
+                    }
+                }
+            }
+            packed_patches.push(video.frames.iter().try_fold(
+                0usize,
+                |total, frame| -> Result<usize> {
+                    frame.grids.iter().try_fold(total, |acc, grid| {
+                        acc.checked_add(grid.patch_rows()?)
+                            .context("patch count overflow")
+                    })
+                },
+            )?);
+            prepared.grids.extend(
+                video
+                    .frames
+                    .iter()
+                    .flat_map(|frame| frame.grids.iter().copied()),
+            );
+            packed.push(video.pixel_values);
+        } else if id == vision.image_token {
             let image = images
                 .next()
                 .context("more image placeholders than supplied images")?;
@@ -1068,6 +1194,10 @@ fn expand_mini_cpm(
     ensure!(
         images.next().is_none(),
         "image has no placeholder in rendered prompt"
+    );
+    ensure!(
+        videos.next().is_none(),
+        "video has no placeholder in rendered prompt"
     );
     prepared.pixel_values = interleave_mini_cpm(&packed, &packed_patches, vision.patch as usize)?;
     prepared.input(&expanded).validate(spec, capacity)?;
@@ -1398,7 +1528,7 @@ mod tests {
             .unwrap()
             .patch_elements(spec.architecture)?;
         assert_eq!(width, 588);
-        let prepared = PreparedImages {
+        let prepared = PreparedInput {
             modality_ids: vec![0, 1, 1, 0],
             pixel_values: (0..16 * width).map(|i| i as f32 / 1024.0).collect(),
             grids: vec![ImageGrid { t: 1, h: 4, w: 4 }],
@@ -1407,14 +1537,14 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("ff-image-roundtrip-minicpm-{}", std::process::id()));
         prepared.save(&spec, &ids, &path)?;
-        let replay = PreparedImages::read(&spec, &path, &ids)?;
+        let replay = PreparedInput::read(&spec, &path, &ids)?;
         assert_eq!(replay.grids, prepared.grids);
         assert_eq!(replay.modality_ids, prepared.modality_ids);
         assert_eq!(replay.pixel_values, prepared.pixel_values);
         let qwen: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/data/q38-config.json"))?;
         let qwen = ModelSpec::qwen(&qwen, &serde_json::Value::Null)?;
-        let error = match PreparedImages::read(&qwen, &path, &ids) {
+        let error = match PreparedInput::read(&qwen, &path, &ids) {
             Ok(_) => anyhow::bail!("Qwen-width read must fail"),
             Err(error) => error.to_string(),
         };
@@ -1560,7 +1690,7 @@ mod tests {
                 assert_eq!(bf16_different, 0, "{name} bf16 identity");
             }
             let ids = tokenizer.encode_chat(prompt)?;
-            let (expanded, prepared) = processor.expand(&ids, vec![packed], 4096)?;
+            let (expanded, prepared) = processor.expand(&ids, vec![packed], Vec::new(), 4096)?;
             let expected_ids: Vec<_> = integers("input_ids")?
                 .into_iter()
                 .map(|i| i as u32)
@@ -1690,7 +1820,11 @@ mod tests {
                 image_std: [0.5, 0.5, 0.5],
                 mrope_mode: "canvas".into(),
             }),
-            image_id: None,
+            image_id: Some(ImageId {
+                start: 100,
+                end: 101,
+                digits: [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+            }),
         })
     }
 
@@ -1796,6 +1930,143 @@ mod tests {
             processor
                 .prepare_video(&frames, &meta, &zero_slices)
                 .is_err()
+        );
+        Ok(())
+    }
+
+    fn video_frames(count: usize, width: usize, height: usize) -> Vec<RgbImage> {
+        (0..count)
+            .map(|i| constant_frame(width, height, (i * 37) as u8))
+            .collect()
+    }
+
+    fn video_meta(count: usize) -> VideoMetadata {
+        VideoMetadata {
+            total_num_frames: count,
+            fps: 1.0,
+            duration: count as f64,
+        }
+    }
+
+    #[test]
+    fn video_placeholders_match_the_model_definition() -> Result<()> {
+        let processor = video_processor()?;
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let mut options = VideoOptions {
+            max_num_frames: 2,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let frames = video_frames(2, 64, 48);
+        let video = processor.prepare_video(&frames, &video_meta(2), &options)?;
+        assert_eq!(processor.video_tokens(&video)?, 126);
+        let (expanded, prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 4096)?;
+        assert_eq!(expanded.len(), 130);
+        let expected = [(0u8, 1usize), (2, 63), (0, 1), (0, 1), (2, 63), (0, 1)];
+        let mut cursor = 0usize;
+        for (modality, len) in expected {
+            for &value in &prepared.modality_ids[cursor..cursor + len] {
+                assert_eq!(value, modality);
+            }
+            cursor += len;
+        }
+        assert_eq!(cursor, 130);
+        assert_eq!(prepared.grids.len(), 2);
+        assert_eq!(prepared.pixel_values.len(), 2 * 28 * 36 * 588);
+        let sliced = video_frames(2, 640, 480);
+        options.max_slice_nums = Some(9);
+        let video = processor.prepare_video(&sliced, &video_meta(2), &options)?;
+        assert_eq!((video.frames[0].rows, video.frames[0].cols), (1, 2));
+        assert_eq!(processor.video_tokens(&video)?, 406);
+        let (expanded, prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 8192)?;
+        assert_eq!(expanded.len(), 418);
+        assert_eq!(prepared.grids.len(), 6);
+        let square = video_frames(2, 1024, 1024);
+        let video = processor.prepare_video(&square, &video_meta(2), &options)?;
+        assert_eq!((video.frames[0].rows, video.frames[0].cols), (2, 3));
+        assert_eq!(processor.video_tokens(&video)?, 848);
+        let (expanded, _prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 16384)?;
+        assert_eq!(expanded.len(), 878);
+        Ok(())
+    }
+
+    #[test]
+    fn image_and_video_placeholders_expand_in_prompt_order() -> Result<()> {
+        let processor = video_processor()?;
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let image = processor.prepare_rgb(&constant_frame(64, 48, 9))?;
+        let options = VideoOptions {
+            max_num_frames: 2,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let video = processor.prepare_video(&video_frames(2, 64, 48), &video_meta(2), &options)?;
+        let (expanded, prepared) = processor.expand(
+            &[vision.image_token, vision.video_token],
+            vec![image],
+            vec![video],
+            4096,
+        )?;
+        assert_eq!(expanded.len(), 198);
+        let video_first = expanded
+            .iter()
+            .position(|&id| id == vision.video_token)
+            .unwrap();
+        assert!(expanded[..video_first].contains(&vision.image_token));
+        assert_eq!(
+            prepared.modality_ids.iter().filter(|&&m| m == 1).count(),
+            63
+        );
+        assert_eq!(
+            prepared.modality_ids.iter().filter(|&&m| m == 2).count(),
+            126
+        );
+        assert_eq!(prepared.grids.len(), 3);
+        let (_, prepared) = processor.expand(
+            &[vision.video_token, vision.image_token],
+            vec![processor.prepare_rgb(&constant_frame(64, 48, 9))?],
+            vec![processor.prepare_video(&video_frames(2, 64, 48), &video_meta(2), &options)?],
+            4096,
+        )?;
+        assert_eq!(prepared.grids.len(), 3);
+        assert_eq!(prepared.modality_ids[1], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn video_expansion_validates_placeholder_counts() -> Result<()> {
+        let processor = video_processor()?;
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let options = VideoOptions {
+            max_num_frames: 1,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let video = processor.prepare_video(&video_frames(1, 64, 48), &video_meta(1), &options)?;
+        let error = processor
+            .expand(
+                &[vision.video_token, vision.video_token],
+                Vec::new(),
+                vec![video],
+                4096,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("more video placeholders than supplied videos"),
+            "{error}"
+        );
+        let video = processor.prepare_video(&video_frames(1, 64, 48), &video_meta(1), &options)?;
+        let error = processor
+            .expand(&[5], Vec::new(), vec![video], 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("video has no placeholder in rendered prompt"),
+            "{error}"
         );
         Ok(())
     }

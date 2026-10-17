@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use flyingfish::{
     model_spec::{Architecture, ModelSpec},
     serve::detok::Shared,
-    serve::image::{PreparedImages, Processor, RgbImage},
+    serve::image::{PreparedInput, Processor, RgbImage},
     vision_input::{ImageGrid, merge_groups, nearest_position_ids, window_gather},
 };
 use safetensors::{Dtype, SafeTensors};
@@ -96,7 +96,7 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
                 .map(u32::try_from)
                 .collect::<std::result::Result<_, _>>()?;
         let capacity = expected_ids.len() + 64;
-        let (expanded, prepared) = processor.expand(&prompt, images, capacity)?;
+        let (expanded, prepared) = processor.expand(&prompt, images, Vec::new(), capacity)?;
         assert_eq!(expanded, expected_ids, "{case} ids");
 
         let expected_modality: Vec<u8> = tensor_values(
@@ -190,7 +190,7 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
             let mut bad_modality = prepared.modality_ids.clone();
             bad_ids.remove(run);
             bad_modality.remove(run);
-            let bad = PreparedImages {
+            let bad = PreparedInput {
                 modality_ids: bad_modality,
                 pixel_values: prepared.pixel_values.clone(),
                 grids: prepared.grids.clone(),
@@ -201,7 +201,7 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
             );
             let mut bad_ids = expanded.clone();
             bad_ids[run - 1] = 0;
-            let bad = PreparedImages {
+            let bad = PreparedInput {
                 modality_ids: prepared.modality_ids.clone(),
                 pixel_values: prepared.pixel_values.clone(),
                 grids: prepared.grids.clone(),

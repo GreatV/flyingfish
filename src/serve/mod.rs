@@ -14,7 +14,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 pub struct Request {
     pub ids: Vec<u32>,
     pub max_new_tokens: usize,
-    pub images: Option<image::PreparedImages>,
+    pub images: Option<image::PreparedInput>,
 }
 
 pub enum EngineCommand {
@@ -456,7 +456,7 @@ fn check_request(ids: &[u32], options: &SpecOptions) -> Result<()> {
 fn produce_plain_events(
     model: &mut Model,
     ids: &[u32],
-    images: Option<&image::PreparedImages>,
+    images: Option<&image::PreparedInput>,
     options: &SpecOptions,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<spec::Output> {
