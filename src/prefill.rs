@@ -259,7 +259,9 @@ pub struct ExpertWorkspaceRequest {
 pub struct ExpertWorkspaceBudget {
     pub mixer: WorkspaceBudget,
     pub workspace_rows: usize,
-    pub reserves: crate::experts::plan::Reserves,
+    /// Whole tail slots borrowed at the candidate's span bound.
+    pub borrowed_slots: u32,
+    pub candidate: crate::experts::plan::SpanCandidate,
 }
 
 impl ExpertWorkspaceBudget {
@@ -269,7 +271,7 @@ impl ExpertWorkspaceBudget {
         mixer_workspace: impl Fn(usize) -> Result<usize>,
         select: impl FnOnce(usize) -> Result<usize>,
     ) -> Result<Self> {
-        use crate::experts::plan::Reserves;
+        use crate::experts::plan::{Reserves, SpanCandidate, span_borrow_slots};
         let ExpertWorkspaceRequest {
             mut mixer,
             span_rows,
@@ -322,16 +324,39 @@ impl ExpertWorkspaceBudget {
             prefill_staging_slots,
             disk_ring_slots,
         };
-        let span_and_staging = usize::try_from(reserves.device_bytes(&geometry, span_rows)?)?;
+        let staging_bytes = reserves.persistent_bytes(&geometry)?;
+        let span_bytes = reserves.span_bytes(span_rows)?;
+        let slot_bytes = geometry.slot_bytes()?;
+        let borrowed_slots = span_borrow_slots(&reserves, &geometry, span_rows, span_rows)?;
+        let routed_slots = u64::from(geometry.layers) * u64::from(geometry.experts);
+        ensure!(
+            u64::from(borrowed_slots) + u64::from(geometry.layers) <= routed_slots,
+            "span bytes {span_bytes} borrow {borrowed_slots} slots, leaving fewer than one per layer: routed_slots={routed_slots} layers={}",
+            geometry.layers
+        );
+        let borrowed_bytes = u64::from(borrowed_slots)
+            .checked_mul(slot_bytes)
+            .context("borrowed expert slot extent overflow")?;
+        // Decode retains one contribution/done row and two route snapshots.
+        let decode_mailbox_bytes = reserves
+            .route_row_bytes
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(reserves.contribution_row_bytes))
+            .and_then(|n| n.checked_add(reserves.done_row_bytes))
+            .context("decode mailbox extent overflow")?;
         let minimum_experts = u64::from(geometry.layers)
-            .checked_mul(geometry.slot_bytes()?)
+            .checked_mul(slot_bytes)
             .context("minimum expert capacity overflow")?;
-        let withheld = span_and_staging
-            .checked_add(usize::try_from(minimum_experts)?)
-            .context("expert workspace reservation overflow")?;
+        let withheld = usize::try_from(
+            borrowed_bytes
+                .checked_add(staging_bytes)
+                .and_then(|n| n.checked_add(minimum_experts))
+                .and_then(|n| n.checked_add(decode_mailbox_bytes))
+                .context("expert workspace reservation overflow")?,
+        )?;
         mixer.free_after_resident = mixer.free_after_resident.checked_sub(withheld).with_context(|| {
             format!(
-                "expert span/staging {span_and_staging} plus minimum slots {minimum_experts} exceed free bytes {}",
+                "borrowed span slots {borrowed_bytes} plus staging {staging_bytes}, minimum slots {minimum_experts} and decode mailboxes {decode_mailbox_bytes} exceed free bytes {}",
                 mixer.free_after_resident
             )
         })?;
@@ -345,7 +370,7 @@ impl ExpertWorkspaceBudget {
         )
         .with_context(|| {
             format!(
-                "expert mixer/wave admission failed: span_rows={span_rows} wave_rows={wave_rows} span_staging_bytes={span_and_staging} minimum_expert_bytes={minimum_experts} headroom_bytes={device_headroom_bytes}"
+                "expert mixer/wave admission failed: span_rows={span_rows} wave_rows={wave_rows} borrowed_slots={borrowed_slots} minimum_expert_bytes={minimum_experts} headroom_bytes={device_headroom_bytes}"
             )
         })?;
         let workspace_rows = mixer.plan.chunk.max(wave_rows as usize);
@@ -354,12 +379,52 @@ impl ExpertWorkspaceBudget {
                 .planned_transient_bytes
                 .checked_add(device_headroom_bytes)
                 .context("expert fixed reserve overflow")?,
-        )?;
+        )?
+        .checked_add(decode_mailbox_bytes)
+        .context("expert fixed decode reserve overflow")?;
         Ok(Self {
             mixer,
             workspace_rows,
-            reserves,
+            borrowed_slots,
+            candidate: SpanCandidate {
+                span_rows,
+                wave_rows,
+                reserves,
+            },
         })
+    }
+
+    pub fn select(
+        inputs: &crate::experts::plan::PlanInputs<'_>,
+        prefill_rows: u32,
+        candidates: &[Self],
+    ) -> Result<(
+        usize,
+        crate::experts::plan::Capacity,
+        crate::experts::plan::Admission,
+    )> {
+        use crate::experts::plan::{Admission, admission_budget, select_span};
+        let budget_bytes_per_token = admission_budget(
+            &inputs.geometry,
+            inputs.service,
+            inputs.h2d_bytes_per_second,
+            inputs.d2h_bytes_per_second,
+            inputs.copy_engines,
+        )?;
+        let admission = Admission {
+            budget_bytes_per_token,
+        };
+        let span_candidates = candidates
+            .iter()
+            .map(|budget| budget.candidate.clone())
+            .collect::<Vec<_>>();
+        let (index, capacity) = select_span(
+            inputs,
+            admission.hard_cap(inputs.geometry.slot_bytes()?),
+            prefill_rows,
+            &span_candidates,
+        )?;
+        Ok((index, capacity, admission))
     }
 }
 
@@ -447,7 +512,7 @@ mod admission_tests {
     fn expert_span_destinations_and_wave_floor_precede_cache_capacity() -> Result<()> {
         use crate::experts::{
             catalogue::ExpertGeometry,
-            plan::{PlanInputs, ServiceCell, ServiceTable, capacity},
+            plan::{PlanInputs, ServiceCell, ServiceTable},
         };
         let model = crate::model_spec::ModelSpec::minicpm(
             &serde_json::from_str(include_str!(concat!(
@@ -476,56 +541,121 @@ mod admission_tests {
             prefill_staging_slots: 2,
             disk_ring_slots: 3,
         };
-        let budget = ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 257), Ok)?;
+        let candidates = [97, 65_536]
+            .map(|span_rows| {
+                ExpertWorkspaceBudget::new(
+                    ExpertWorkspaceRequest {
+                        span_rows,
+                        ..request
+                    },
+                    geometry,
+                    |r| Ok(r * 257),
+                    Ok,
+                )
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let budget = &candidates[1];
+        let reserves = &budget.candidate.reserves;
         assert_eq!(budget.mixer.plan.chunk, 37);
         assert_eq!(budget.workspace_rows, 71);
         assert_eq!(budget.mixer.operator_workspace_bytes, 71 * 937);
-        assert_eq!(budget.reserves.residual_row_bytes, 4096);
-        assert_eq!(budget.reserves.normalized_row_bytes, 4096);
-        assert_eq!(budget.reserves.contribution_row_bytes, 32768);
-        assert_eq!(budget.reserves.done_row_bytes, 32);
-        assert_eq!(budget.reserves.route_row_bytes, 144);
-        let fixed = 8192 + 71 * row_bytes + 71 * 937 + 4096;
-        assert_eq!(budget.reserves.device_fixed_bytes, fixed as u64);
+        assert_eq!(reserves.residual_row_bytes, 4096);
+        assert_eq!(reserves.normalized_row_bytes, 4096);
+        assert_eq!(reserves.contribution_row_bytes, 32768);
+        assert_eq!(reserves.done_row_bytes, 32);
+        assert_eq!(reserves.route_row_bytes, 144);
+        assert_eq!(budget.borrowed_slots, 429);
+        let fixed = 8192 + 71 * row_bytes + 71 * 937 + 4096 + 33088;
+        assert_eq!(reserves.device_fixed_bytes, fixed as u64);
+        assert_eq!(reserves.span_bytes(request.span_rows)?, 65_536 * 41136);
         assert_eq!(
-            budget.reserves.device_bytes(&geometry, request.span_rows)?,
-            fixed as u64 + 65_536 * 41136 + 2 * 6_291_456
+            reserves.persistent_bytes(&geometry)?,
+            fixed as u64 + 2 * 6_291_456
         );
-        assert_eq!(
-            budget.reserves.host_bytes(&geometry)?,
-            16384 + 3 * 6_291_456
-        );
+        assert_eq!(reserves.host_bytes(&geometry)?, 16384 + 3 * 6_291_456);
         let service = ServiceTable::new(
             "fixture",
-            vec![ServiceCell {
-                workers: 1,
-                rows: 1,
-                experts: 8,
-                seconds: 0.001,
-            }],
+            vec![
+                ServiceCell {
+                    workers: 1,
+                    rows: 1,
+                    experts: 1,
+                    seconds: 1.0 / 65536.0,
+                },
+                ServiceCell {
+                    workers: 1,
+                    rows: 1,
+                    experts: 8,
+                    seconds: 0.001,
+                },
+            ],
         )?;
         let inputs = PlanInputs {
             geometry,
             device_free_bytes: request.mixer.free_after_resident as u64,
             host_available_bytes: 48 << 30,
-            h2d_bytes_per_second: 19e9,
-            d2h_bytes_per_second: 20e9,
+            h2d_bytes_per_second: (16u64 << 30) as f64,
+            d2h_bytes_per_second: (16u64 << 30) as f64,
             copy_engines: 2,
             disk_readers: 1,
             service: &service,
-            reserves: &budget.reserves,
+            reserves,
             span_rows: request.span_rows,
             wave_rows: request.wave_rows,
         };
-        let capacity = capacity(&inputs, 5)?;
-        let slots: u64 = capacity.slots_per_layer.iter().map(|&n| u64::from(n)).sum();
-        assert_eq!(capacity.spare_blocks, 5);
+        let (index, capacity, admission) =
+            ExpertWorkspaceBudget::select(&inputs, 65_536, &candidates)?;
+        assert_eq!(index, 1);
+        assert_eq!(admission.budget_bytes_per_token, 10 << 20);
+        assert_eq!(capacity.spare_blocks, 1);
         assert_eq!(capacity.span_rows, 65_536);
         assert_eq!(capacity.wave_rows, 71);
-        let remaining = inputs.device_free_bytes
-            - budget.reserves.device_bytes(&geometry, request.span_rows)?;
+        let slots: u64 = capacity.slots_per_layer.iter().map(|&n| u64::from(n)).sum();
+        let remaining = inputs.device_free_bytes - reserves.persistent_bytes(&geometry)?;
         assert_eq!(slots, remaining / geometry.slot_bytes()?);
-        assert!(slots * geometry.slot_bytes()? + (fixed as u64) < inputs.device_free_bytes);
+        assert!(slots - u64::from(budget.borrowed_slots) >= u64::from(geometry.layers));
+        let short = &candidates[0];
+        assert_eq!(short.borrowed_slots, 1);
+        assert_eq!(
+            short.candidate.reserves.device_fixed_bytes,
+            reserves.device_fixed_bytes
+        );
+        let short_capacity = crate::experts::plan::capacity(
+            &PlanInputs {
+                span_rows: 97,
+                reserves: &short.candidate.reserves,
+                ..inputs.clone()
+            },
+            1,
+        )?;
+        assert_eq!(short_capacity.slots_per_layer, capacity.slots_per_layer);
+        for changed in [
+            PlanInputs {
+                copy_engines: 1,
+                ..inputs.clone()
+            },
+            PlanInputs {
+                d2h_bytes_per_second: (8u64 << 30) as f64,
+                ..inputs.clone()
+            },
+        ] {
+            let (_, capacity, admission) =
+                ExpertWorkspaceBudget::select(&changed, 65_536, &candidates)?;
+            assert_eq!(admission.budget_bytes_per_token, 5 << 20);
+            assert_eq!(capacity.spare_blocks, 0);
+        }
+        assert!(
+            ExpertWorkspaceBudget::select(
+                &PlanInputs {
+                    d2h_bytes_per_second: f64::NAN,
+                    ..inputs
+                },
+                65_536,
+                &candidates,
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -558,17 +688,17 @@ mod admission_tests {
             disk_ring_slots: 1,
         };
         let budget = ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok)?;
-        let exact = budget.reserves.device_bytes(&geometry, request.span_rows)?
-            + u64::from(geometry.layers) * geometry.slot_bytes()?;
+        let exact = budget.candidate.reserves.persistent_bytes(&geometry)?
+            + (u64::from(budget.borrowed_slots) + u64::from(geometry.layers))
+                * geometry.slot_bytes()?;
         request.mixer.free_after_resident = usize::try_from(exact)?;
         let admitted = ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok)?;
         assert_eq!(admitted.workspace_rows, 5);
         assert_eq!(admitted.mixer.operator_workspace_bytes, 2048);
         assert_eq!(
-            admitted
-                .reserves
-                .device_bytes(&geometry, request.span_rows)?
-                + u64::from(geometry.layers) * geometry.slot_bytes()?,
+            admitted.candidate.reserves.persistent_bytes(&geometry)?
+                + (u64::from(admitted.borrowed_slots) + u64::from(geometry.layers))
+                    * geometry.slot_bytes()?,
             exact
         );
         request.mixer.free_after_resident -= 1;
