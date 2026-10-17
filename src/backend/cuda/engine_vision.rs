@@ -1472,16 +1472,6 @@ impl VisionRuntime {
                     stream.clone_dtoh(&bilinear.values)?,
                 )?;
             }
-            if geometry.insert_layer.is_some() {
-                record(
-                    &mut trace,
-                    stream,
-                    "vision_patch_embeddings",
-                    &request.prefix.hidden,
-                    width,
-                    rows,
-                )?;
-            }
             let (scratch_ptr, _hold) = request.scratch.device_ptr(stream);
             let scratch = || Scratch {
                 ptr: scratch_ptr,
@@ -1534,14 +1524,6 @@ impl VisionRuntime {
                         &mut trace,
                         stream,
                         &format!("vision_layer_{insert:02}_out"),
-                        stage.hidden,
-                        width,
-                        rows,
-                    )?;
-                    record(
-                        &mut trace,
-                        stream,
-                        "vit_merger_in",
                         stage.hidden,
                         width,
                         rows,
@@ -2814,7 +2796,12 @@ mod tests {
                 "merger_out",
             ];
             for tap in taps {
-                let candidate = trace.values(tap)?;
+                let trace_tap = if tap == "vision_patch_embeddings" {
+                    "after_pos_add"
+                } else {
+                    tap
+                };
+                let candidate = trace.values(trace_tap)?;
                 let reference_values =
                     tensor_values(&reference, tap, safetensors::Dtype::BF16, |v| {
                         bf16::from_bits(u16::from_le_bytes(v)).to_f32()
