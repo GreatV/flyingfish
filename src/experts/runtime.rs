@@ -1401,6 +1401,34 @@ mod tests {
     }
 
     #[test]
+    fn request_boundary_spare_validation_leaves_the_state_unchanged() -> Result<()> {
+        let mut residency = build(3, 1)?;
+        assert_eq!(residency.free_spare_blocks(), 1);
+        let mut hot = frequency();
+        hot[0] = vec![0.0, 0.0, 5.0, 4.0, 1.0, 1.0, 1.0, 1.0];
+        let before = (
+            residency.ledger().tier(0, 0)?,
+            residency.ledger().tier(0, 2)?,
+            residency.host_block(0, 2)?,
+            residency.free_spare_blocks(),
+            residency.moves.len(),
+        );
+        let error = residency.begin_request(&hot).unwrap_err().to_string();
+        assert!(error.contains("spare host blocks"), "{error}");
+        let after = (
+            residency.ledger().tier(0, 0)?,
+            residency.ledger().tier(0, 2)?,
+            residency.host_block(0, 2)?,
+            residency.free_spare_blocks(),
+            residency.moves.len(),
+        );
+        assert_eq!(before, after);
+        assert!(residency.begin_request(&frequency()).is_ok());
+        assert!(residency.ledger().check().is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn slot_events_move_to_device_side_waiting() -> Result<()> {
         let mut residency = build(3, 2)?;
         let slot0 = residency.ledger().slot(0, 0)?;
