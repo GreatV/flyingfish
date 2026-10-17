@@ -2730,7 +2730,7 @@ mod tests {
                 .map(|v| Ok(u8::try_from(v)?))
                 .collect::<Result<_>>()?;
             let grid = integers("image_grid_thw")?;
-            let grids = [ImageGrid {
+            let grids = [crate::vision_input::ImageGrid {
                 t: u32::try_from(grid[0])?,
                 h: u32::try_from(grid[1])?,
                 w: u32::try_from(grid[2])?,
