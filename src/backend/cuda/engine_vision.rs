@@ -28,9 +28,6 @@ const PATCH: u32 = 1536;
 #[cfg(test)]
 const OUTPUT: u32 = 5120;
 
-/// Side of the 2x2 window of the insert attention merger.
-const WINDOW: u32 = 2;
-
 /// Tower geometry resolved from the validated model spec.
 #[derive(Clone, Copy)]
 struct VisionGeometry {
@@ -57,13 +54,23 @@ impl VisionGeometry {
                     vision.heads > 0 && vision.hidden.is_multiple_of(vision.heads),
                     "vision heads do not divide the hidden width"
                 );
+                let merge = vision.merge.isqrt();
+                ensure!(
+                    merge * merge == vision.merge,
+                    "vision merge {} is not a square",
+                    vision.merge
+                );
                 VisionSpec {
                     hq: vision.heads,
                     d: vision.hidden / vision.heads,
                     hidden: vision.hidden,
-                    merger_fc1: vision.hidden * 4,
+                    merger_fc1: vision
+                        .hidden
+                        .checked_mul(merge)
+                        .and_then(|width| width.checked_mul(merge))
+                        .context("vision merger width overflow")?,
                     merger_fc2: vision.output,
-                    merge: 2,
+                    merge,
                     merger_norm: crate::backend::cuda::vision::MergerNorm::Grouped,
                     rope: false,
                     ln_eps: crate::backend::cuda::vision::LN_EPS,
@@ -717,15 +724,35 @@ impl VisionWeights {
         let hidden = geometry.hidden();
         let mlp = geometry.mlp;
         let depth = vision.depth;
+        let merge = geometry.spec.merge;
+        let hidden_usize = hidden as usize;
+        let mlp_usize = mlp as usize;
+        let fc1_usize = geometry.spec.merger_fc1 as usize;
+        let output_usize = geometry.output() as usize;
+        let position_rows = (vision.position_side as usize)
+            .checked_mul(vision.position_side as usize)
+            .context("vision position table rows overflow")?;
+        let patch_shape = [
+            hidden_usize,
+            vision.channels as usize,
+            vision.temporal_patch as usize,
+            vision.patch as usize,
+            vision.patch as usize,
+        ];
+        let window_width = (merge * merge) as usize * mlp_usize;
         let (patch, position, post_norm, blocks, window, merger, expected) = match architecture {
             Architecture::Qwen35Text => {
                 let patch = BiasedWeight::take(
                     catalog,
                     "model.visual.patch_embed.proj",
                     [hidden, geometry.patch],
-                    &[1152, 3, 2, 16, 16],
+                    &patch_shape,
                 )?;
-                let position = take(catalog, "model.visual.pos_embed.weight", &[2304, 1152])?;
+                let position = take(
+                    catalog,
+                    "model.visual.pos_embed.weight",
+                    &[position_rows, hidden_usize],
+                )?;
                 let mut blocks = Vec::with_capacity(depth as usize);
                 for i in 0..depth {
                     let p = format!("model.visual.blocks.{i}");
@@ -735,26 +762,26 @@ impl VisionWeights {
                             catalog,
                             &format!("{p}.attn.qkv"),
                             [3 * hidden, hidden],
-                            &[3456, 1152],
+                            &[3 * hidden_usize, hidden_usize],
                         )?),
                         projection: BiasedWeight::take(
                             catalog,
                             &format!("{p}.attn.proj"),
                             [hidden, hidden],
-                            &[1152, 1152],
+                            &[hidden_usize, hidden_usize],
                         )?,
                         norm2: AffineWeights::take(catalog, &format!("{p}.norm2"), hidden)?,
                         fc1: BiasedWeight::take(
                             catalog,
                             &format!("{p}.mlp.linear_fc1"),
                             [mlp, hidden],
-                            &[4304, 1152],
+                            &[mlp_usize, hidden_usize],
                         )?,
                         fc2: BiasedWeight::take(
                             catalog,
                             &format!("{p}.mlp.linear_fc2"),
                             [hidden, mlp],
-                            &[1152, 4304],
+                            &[hidden_usize, mlp_usize],
                         )?,
                     });
                 }
@@ -764,28 +791,36 @@ impl VisionWeights {
                         catalog,
                         "model.visual.merger.linear_fc1",
                         [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
-                        &[4608, 4608],
+                        &[fc1_usize, fc1_usize],
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         "model.visual.merger.linear_fc2",
                         [geometry.output(), geometry.spec.merger_fc1],
-                        &[5120, 4608],
+                        &[output_usize, fc1_usize],
                     )?,
                 };
-                (patch, position, None, blocks, None, merger, 333usize)
+                (
+                    patch,
+                    position,
+                    None,
+                    blocks,
+                    None,
+                    merger,
+                    2 + 1 + 6 + depth as usize * 12,
+                )
             }
             Architecture::MiniCpmV47 => {
                 let patch = BiasedWeight::take(
                     catalog,
                     "model.vision_tower.embeddings.patch_embedding",
                     [hidden, geometry.patch],
-                    &[1152, 3, 14, 14],
+                    &patch_shape,
                 )?;
                 let position = take(
                     catalog,
                     "model.vision_tower.embeddings.position_embedding.weight",
-                    &[4900, 1152],
+                    &[position_rows, hidden_usize],
                 )?;
                 let post_norm = Some(AffineWeights::take(
                     catalog,
@@ -801,7 +836,7 @@ impl VisionWeights {
                                 catalog,
                                 &format!("{p}.self_attn.{name}_proj"),
                                 [hidden, hidden],
-                                &[1152, 1152],
+                                &[hidden_usize, hidden_usize],
                             )
                         };
                     blocks.push(BlockWeights {
@@ -817,13 +852,13 @@ impl VisionWeights {
                             catalog,
                             &format!("{p}.mlp.fc1"),
                             [mlp, hidden],
-                            &[4304, 1152],
+                            &[mlp_usize, hidden_usize],
                         )?,
                         fc2: BiasedWeight::take(
                             catalog,
                             &format!("{p}.mlp.fc2"),
                             [hidden, mlp],
-                            &[1152, 4304],
+                            &[hidden_usize, mlp_usize],
                         )?,
                     });
                 }
@@ -834,7 +869,7 @@ impl VisionWeights {
                             catalog,
                             &format!("{p}.self_attn.{name}_proj"),
                             [hidden, hidden],
-                            &[1152, 1152],
+                            &[hidden_usize, hidden_usize],
                         )
                     };
                 let window = WindowMergerWeights {
@@ -851,14 +886,14 @@ impl VisionWeights {
                     fc1: BiasedWeight::take(
                         catalog,
                         &format!("{p}.linear_1"),
-                        [WINDOW * WINDOW * mlp, geometry.spec.merger_fc1],
-                        &[17216, 4608],
+                        [merge * merge * mlp, geometry.spec.merger_fc1],
+                        &[window_width, fc1_usize],
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         &format!("{p}.linear_2"),
-                        [hidden, WINDOW * WINDOW * mlp],
-                        &[1152, 17216],
+                        [hidden, merge * merge * mlp],
+                        &[hidden_usize, window_width],
                     )?,
                 };
                 let m = "model.merger.mlp.0";
@@ -872,13 +907,13 @@ impl VisionWeights {
                         catalog,
                         &format!("{m}.linear_1"),
                         [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
-                        &[4608, 4608],
+                        &[fc1_usize, fc1_usize],
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         &format!("{m}.linear_2"),
                         [geometry.output(), geometry.spec.merger_fc1],
-                        &[2048, 4608],
+                        &[output_usize, fc1_usize],
                     )?,
                 };
                 let expected = 2 + 1 + 2 + depth as usize * 16 + 16 + 6;
@@ -997,8 +1032,9 @@ impl VisionPackings {
                 window: None,
             });
         }
+        let merge = geometry.spec.merge;
         ensure!(
-            geometry.insert_scale == 4,
+            geometry.insert_scale == merge * merge,
             "unsupported insert downsample: {}",
             geometry.insert_scale
         );
@@ -1006,26 +1042,26 @@ impl VisionPackings {
             &grids
                 .iter()
                 .map(|g| PatchGrid {
-                    h: g.h / 2,
-                    w: g.w / 2,
+                    h: g.h / merge,
+                    w: g.w / merge,
                 })
                 .collect::<Vec<_>>(),
         )?;
         ensure!(
-            down.real_rows() * 4 == tower.real_rows(),
+            down.real_rows() * merge * merge == tower.real_rows(),
             "insert merger row count mismatch"
         );
         let mut windows = Vec::new();
         for g in grids {
             ensure!(
-                g.h.is_multiple_of(4) && g.w.is_multiple_of(4),
-                "16x vision requires patch grids divisible by four"
+                g.h.is_multiple_of(merge * merge) && g.w.is_multiple_of(merge * merge),
+                "vision patch grid {}x{} is not divisible by {}",
+                g.h,
+                g.w,
+                merge * merge
             );
-            for _ in 0..(g.h / 2) * (g.w / 2) {
-                windows.push(PatchGrid {
-                    h: WINDOW,
-                    w: WINDOW,
-                });
+            for _ in 0..(g.h / merge) * (g.w / merge) {
+                windows.push(PatchGrid { h: merge, w: merge });
             }
         }
         let window = PatchPacking::build(&windows)?;
@@ -1299,7 +1335,7 @@ impl VisionRuntime {
                 for weight in [&window_weights.fc1, &window_weights.fc2] {
                     weight.prepare(s, blas, tower_rows)?;
                 }
-                let gather = crate::vision_input::window_gather(input.grids, 2)?;
+                let gather = crate::vision_input::window_gather(input.grids, merge)?;
                 ensure!(
                     gather.indices.len() == rows as usize
                         && gather.cu_seqlens == window_packing.cu_seqlens().to_vec(),
@@ -1311,9 +1347,12 @@ impl VisionRuntime {
                     .map(|&row| i32::try_from(row).context("window index exceeds i32"))
                     .collect::<Result<_>>()?;
                 let window_indices = s.clone_htod(&window_indices)?;
-                let row_grids: Vec<(u32, u32)> =
-                    input.grids.iter().map(|g| (g.h / 2, g.w / 2)).collect();
-                let groups = crate::vision_input::merge_groups(&row_grids, 2)?;
+                let row_grids: Vec<(u32, u32)> = input
+                    .grids
+                    .iter()
+                    .map(|g| (g.h / merge, g.w / merge))
+                    .collect();
+                let groups = crate::vision_input::merge_groups(&row_grids, merge)?;
                 ensure!(
                     groups.len() == tower_rows as usize,
                     "merger group map extent mismatch"
@@ -1488,10 +1527,11 @@ impl VisionRuntime {
                     &mut trace,
                 )?;
                 if Some(index as u32) == geometry.insert_layer {
+                    let insert = u32::try_from(index)?;
                     record(
                         &mut trace,
                         stream,
-                        "vision_layer_06_out",
+                        &format!("vision_layer_{insert:02}_out"),
                         stage.hidden,
                         width,
                         rows,
@@ -1765,6 +1805,7 @@ impl VisionRuntime {
             .context("insert weights missing")?;
         let geometry = self.geometry;
         let spec = geometry.spec;
+        let merge = spec.merge;
         let width = geometry.hidden();
         let rows = request.packing.real_rows();
         let tower_rows = rows / geometry.insert_scale;
@@ -1840,38 +1881,38 @@ impl VisionRuntime {
             &mut TensorMut(dense(&tower.mean, stream, [tower_rows, width])?),
             rows,
             width,
-            WINDOW * WINDOW,
+            merge * merge,
         )?;
         self.common.norm.layer_norm(
             stream,
             dense(
                 &tower.gathered,
                 stream,
-                [tower_rows, 1, WINDOW * WINDOW * width],
+                [tower_rows, 1, merge * merge * width],
             )?,
-            dense(&window.pre_norm.weight, stream, [WINDOW * WINDOW * width])?,
-            dense(&window.pre_norm.bias, stream, [WINDOW * WINDOW * width])?,
+            dense(&window.pre_norm.weight, stream, [merge * merge * width])?,
+            dense(&window.pre_norm.bias, stream, [merge * merge * width])?,
             &mut TensorMut(dense(
                 &request.norm,
                 stream,
-                [tower_rows, 1, WINDOW * WINDOW * width],
+                [tower_rows, 1, merge * merge * width],
             )?),
             spec.ln_eps,
         )?;
         window.fc1.run(
             stream,
             blas,
-            dense(&request.norm, stream, [tower_rows, WINDOW * WINDOW * width])?,
+            dense(&request.norm, stream, [tower_rows, merge * merge * width])?,
             &mut TensorMut(dense(
                 &request.mlp,
                 stream,
-                [tower_rows, geometry.mlp * WINDOW * WINDOW],
+                [tower_rows, geometry.mlp * merge * merge],
             )?),
         )?;
         let mlp = dense(
             &request.mlp,
             stream,
-            [tower_rows, 1, geometry.mlp * WINDOW * WINDOW],
+            [tower_rows, 1, geometry.mlp * merge * merge],
         )?;
         self.common
             .gate
@@ -1882,7 +1923,7 @@ impl VisionRuntime {
             dense(
                 &request.mlp,
                 stream,
-                [tower_rows, geometry.mlp * WINDOW * WINDOW],
+                [tower_rows, geometry.mlp * merge * merge],
             )?,
             &mut TensorMut(dense(&tower.hidden, stream, [tower_rows, width])?),
         )?;
@@ -2540,20 +2581,13 @@ mod tests {
         merged
     }
 
-    const MINICPM_TAPS: [&str; 5] = [
-        "vision_patch_embeddings",
-        "vision_layer_06_out",
-        "vit_merger_out",
-        "vision_tower_out",
-        "merger_out",
-    ];
-
     /// T0 fixture epsilons; the fixture comparison is a reported secondary metric.
     fn fixture_eps(tap: &str) -> Result<f32> {
         Ok(match tap {
             "vision_patch_embeddings" | "vision_tower_out" => 0.0625,
-            "vision_layer_06_out" | "vit_merger_out" => 0.03125,
+            "vit_merger_out" => 0.03125,
             "merger_out" => 0.0078125,
+            _ if tap.starts_with("vision_layer_") => 0.03125,
             _ => bail!("unknown fixture tap {tap}"),
         })
     }
@@ -2762,7 +2796,23 @@ mod tests {
                 std::fs::File::open(reference_dir.join(format!("ref-{case}.safetensors")))?;
             let ref_map = unsafe { memmap2::MmapOptions::new().map(&ref_file)? };
             let reference = safetensors::SafeTensors::deserialize(&ref_map)?;
-            for tap in MINICPM_TAPS {
+            let insert_tap = format!(
+                "vision_layer_{:02}_out",
+                model
+                    .vision
+                    .as_ref()
+                    .and_then(|v| v.minicpm.as_ref())
+                    .context("MiniCPM vision configuration missing")?
+                    .insert_layer
+            );
+            let taps = [
+                "vision_patch_embeddings",
+                insert_tap.as_str(),
+                "vit_merger_out",
+                "vision_tower_out",
+                "merger_out",
+            ];
+            for tap in taps {
                 let candidate = trace.values(tap)?;
                 let reference_values =
                     tensor_values(&reference, tap, safetensors::Dtype::BF16, |v| {
@@ -2881,7 +2931,7 @@ mod tests {
             merged[..first] != merged[first..],
             "the two images produced identical merger blocks"
         );
-        let taps: Vec<_> = verdict
+        let tap_reports: Vec<_> = verdict
             .iter()
             .map(|(key, (max_abs, ratio, pass))| {
                 serde_json::json!({"tap": key, "max_abs": max_abs, "max_ulp_ratio": ratio, "pass": pass})
@@ -2894,7 +2944,7 @@ mod tests {
             .collect();
         eprintln!(
             "{}",
-            serde_json::json!({"minicpm_vision_verdict": {"taps": taps, "defects": defects}})
+            serde_json::json!({"minicpm_vision_verdict": {"taps": tap_reports, "defects": defects}})
         );
         ensure!(
             defects.is_empty(),
