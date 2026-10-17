@@ -115,8 +115,6 @@ pub(crate) struct NormOps {
 }
 pub(crate) struct GateOps {
     gate: CudaFunction,
-    gdn: CudaFunction,
-    gdn_heads: u32,
     gelu: CudaFunction,
 }
 #[derive(Clone)]
@@ -134,29 +132,9 @@ impl CommonOpsRef {
             }),
             gate: Arc::new(GateOps {
                 gate: module.load_function("q38_gate")?,
-                gdn: module.load_function("q38_gdn_gates")?,
-                gdn_heads: 48,
                 gelu: module.load_function("q38_gelu")?,
             }),
         })
-    }
-
-    pub fn with_gdn(
-        mut self,
-        ctx: &Arc<CudaContext>,
-        spec: &crate::op_contract::GdnSpec,
-    ) -> Result<Self> {
-        spec.validate()?;
-        if self.gate.gdn_heads != spec.hv {
-            let module = cubin::module(ctx, "q38_common")?;
-            self.gate = Arc::new(GateOps {
-                gate: self.gate.gate.clone(),
-                gdn: module.load_function(spec.gate_kernel()?)?,
-                gdn_heads: spec.hv,
-                gelu: self.gate.gelu.clone(),
-            });
-        }
-        Ok(self)
     }
 }
 fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
@@ -558,7 +536,7 @@ impl GateOps {
         Ok(())
     }
     pub fn gdn_gates_with(
-        &self,
+        function: &CudaFunction,
         stream: &Arc<CudaStream>,
         rows: RowDomain,
         bindings: GdnGateBindings<'_>,
@@ -571,7 +549,7 @@ impl GateOps {
             beta,
             g,
         } = bindings;
-        let heads = self.gdn_heads;
+        let heads = a.shape[1];
         rows.validate(a.shape[0])?;
         for t in [&a, &b, &beta.0] {
             t.validate()?;
@@ -607,7 +585,7 @@ impl GateOps {
             .min(65535);
         unsafe {
             stream
-                .launch_builder(&self.gdn)
+                .launch_builder(function)
                 .arg(&a.ptr)
                 .arg(&b.ptr)
                 .arg(&a_log.ptr)

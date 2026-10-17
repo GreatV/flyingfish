@@ -688,7 +688,9 @@ fn q38_primitives_gpu() -> Result<()> {
     let lv = view(&log, s, [48], [1])?;
     let mut bv = TensorMut(view(&beta, s, [3, 48], [48, 1])?);
     let mut gv = TensorMut(view(&g, s, [3, 48], [48, 1])?);
-    common.gate.gdn_gates_with(
+    super::ops::GateOps::gdn_gates_with(
+        &cubin::module(&d.ctx, "q38_common")?
+            .load_function(crate::op_contract::GdnSpec::q38().gate_kernel()?)?,
         s,
         rows,
         GdnGateBindings {

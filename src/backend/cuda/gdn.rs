@@ -91,6 +91,7 @@ pub(crate) struct GdnBindings {
 }
 
 struct Kernels {
+    gate: CudaFunction,
     conv: CudaFunction,
     hist_update: CudaFunction,
     prep: CudaFunction,
@@ -427,6 +428,7 @@ impl GdnOps {
             })
         };
         let kernels = Kernels {
+            gate: cubin::module(ctx, "q38_common")?.load_function(spec.gate_kernel()?)?,
             hist_snapshot,
             core_snapshot,
             rstep,
@@ -462,7 +464,7 @@ impl GdnOps {
             snapshots: None,
             kernels: Arc::new(kernels),
             bindings,
-            common: common.with_gdn(ctx, spec)?,
+            common,
             ws,
             conv_dim,
             l2_eps: spec.l2_eps,
@@ -631,7 +633,8 @@ impl GdnOps {
             l2_eps,
         )?;
         // common gdn_gates: beta BF16, g FP32.
-        plan.common.gate.gdn_gates_with(
+        super::ops::GateOps::gdn_gates_with(
+            &plan.kernels.gate,
             stream,
             dom,
             GdnGateBindings {
