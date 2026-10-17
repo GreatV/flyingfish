@@ -2662,6 +2662,115 @@ mod tests {
 
     /// Gate of the MiniCPM tower against the T0 fixtures; tolerances are frozen in the protocol
     /// (`evidence/PR5/PROTOCOL.md`) before the run.
+    /// Vision-encoder timing for the PR5 no-regression A/B (identical text in both binaries).
+    #[test]
+    #[ignore = "requires FF_Q38_VISION_WINDOW=granted, FF_Q38_MODEL, FF_Q38_FIXTURE_DIR, FF_Q38_VISION_OUTPUT_DIR"]
+    fn q38_vision_encode_timing() -> Result<()> {
+        use crate::backend::cuda::{closure::Closure, ops::Ops};
+        use std::{path::PathBuf, rc::Rc};
+        ensure!(
+            std::env::var("FF_Q38_VISION_WINDOW").as_deref() == Ok("granted"),
+            "vision GPU window missing"
+        );
+        let model_dir =
+            PathBuf::from(std::env::var_os("FF_Q38_MODEL").context("model directory missing")?);
+        let fixtures = PathBuf::from(
+            std::env::var_os("FF_Q38_FIXTURE_DIR").context("fixture directory missing")?,
+        );
+        let output = PathBuf::from(
+            std::env::var_os("FF_Q38_VISION_OUTPUT_DIR")
+                .context("vision output directory missing")?,
+        );
+        let iterations: usize = std::env::var("FF_Q38_TIMING_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32);
+        std::fs::create_dir_all(&output)?;
+        let model = ModelSpec::read(&model_dir)?;
+        let device = Device::new(0)?;
+        let common = CommonOpsRef::new(&device.ctx)?;
+        let ops = Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &output,
+            Rc::new(Closure::new(false, "vision timing".into())),
+        )?;
+        let mut catalog = WeightCatalog::load_with_policy(
+            &model_dir,
+            &model,
+            &device,
+            crate::checkpoint::LoadPolicy::VisionOnly,
+        )?;
+        let runtime = VisionRuntime::from_catalog(&model, &mut catalog, &device, common)?;
+        for case in ["img-report", "img-nonsquare", "img-marker", "img-tiny"] {
+            let file = std::fs::File::open(fixtures.join(format!("{case}.safetensors")))?;
+            let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+            let source = safetensors::SafeTensors::deserialize(&map)?;
+            let integers = |key: &str| -> Result<Vec<i64>> {
+                let tensor = source.tensor(key)?;
+                ensure!(
+                    tensor.dtype() == safetensors::Dtype::I64,
+                    "fixture integer dtype"
+                );
+                Ok(tensor
+                    .data()
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|v| i64::from_le_bytes(*v))
+                    .collect())
+            };
+            let ids: Vec<u32> = integers("input_ids")?
+                .into_iter()
+                .map(|v| Ok(u32::try_from(v)?))
+                .collect::<Result<_>>()?;
+            let modalities: Vec<u8> = integers("mm_token_type_ids")?
+                .into_iter()
+                .map(|v| Ok(u8::try_from(v)?))
+                .collect::<Result<_>>()?;
+            let grid = integers("image_grid_thw")?;
+            let grids = [ImageGrid {
+                t: u32::try_from(grid[0])?,
+                h: u32::try_from(grid[1])?,
+                w: u32::try_from(grid[2])?,
+            }];
+            let pixels = source.tensor("pixel_values_fp32")?;
+            ensure!(
+                pixels.dtype() == safetensors::Dtype::F32,
+                "fixture pixel dtype"
+            );
+            let pixels: Vec<f32> = pixels
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect();
+            let input = crate::vision_input::MultimodalInput {
+                input_ids: &ids,
+                modality_ids: &modalities,
+                pixel_values: &pixels,
+                grids: &grids,
+            };
+            for iteration in 0..iterations {
+                let started = std::time::Instant::now();
+                let request = runtime.prepare(&device, &mut blas, &input, ids.len())?;
+                let images = runtime.encode(&device.stream, &blas, request, None)?;
+                let seconds = started.elapsed().as_secs_f64();
+                std::hint::black_box(&images);
+                if iteration >= 2 {
+                    println!(
+                        "{}",
+                        serde_json::json!({"vision_timing": {"case": case,
+                            "iteration": iteration, "seconds": seconds}})
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires FF_MINICPM_VISION_WINDOW=granted, FF_MODEL, FF_MINICPM_FIXTURE_DIR, FF_MINICPM_VISION_OUTPUT_DIR and FF_MINICPM_TOLERANCES"]
     fn minicpm_vision_tower_gpu() -> Result<()> {
