@@ -1611,3 +1611,83 @@ fn stage_accounting_is_pinned() {
     assert_eq!(super::prefill::stage_host_pinned_bytes(), 57_676);
     assert_eq!(super::prefill::stage_device_bytes(), 49_224);
 }
+
+/// Small frozen case for the prefill racecheck: rows=64, E=16, K=4, H=128,
+/// I=64 exercises count/scan/permute/GEMMs/silu/scatter/shared_scale/
+/// combine once each within a sanitizer budget.
+#[test]
+#[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
+fn prefill_racecheck_small_gpu() -> Result<()> {
+    let d = crate::backend::cuda::Device::new(0)?;
+    let s = &d.stream;
+    let fx = reference::fixture(MoeDims::new(64, 16, 4, 128, 64), 0);
+    let (experts, top_k, hidden, inter) = (
+        fx.dims.experts,
+        fx.dims.top_k,
+        fx.dims.hidden,
+        fx.dims.inter,
+    );
+    let ops = PrefillOps::new(&d.ctx, s)?;
+    let gu: CudaSlice<bf16> = s.clone_htod(fx.gate_up.as_slice())?;
+    let dn: CudaSlice<bf16> = s.clone_htod(fx.down.as_slice())?;
+    let (gu_ptr, _a) = gu.device_ptr(s);
+    let (dn_ptr, _b) = dn.device_ptr(s);
+    let table = testing::slots(
+        s,
+        experts,
+        gu_ptr,
+        (2 * inter * hidden * 2) as u64,
+        dn_ptr,
+        (hidden * inter * 2) as u64,
+    )?;
+    let sg: CudaSlice<bf16> = s.clone_htod(fx.shared_gate.as_slice())?;
+    let su: CudaSlice<bf16> = s.clone_htod(fx.shared_up.as_slice())?;
+    let sd: CudaSlice<bf16> = s.clone_htod(fx.shared_down.as_slice())?;
+    let seg: CudaSlice<bf16> = s.clone_htod(fx.shared_expert_gate.as_slice())?;
+    let scratch_bytes = prefill_scratch_bytes(64, top_k, experts, hidden, inter)?;
+    let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
+    let (scratch_ptr, _c) = scratch_buf.device_ptr(s);
+    let scratch = Scratch {
+        ptr: scratch_ptr,
+        bytes: scratch_bytes,
+    };
+    let rows = fx.dims.rows;
+    let (ids, weights) = planted_uniform(rows, experts, top_k);
+    let active = all_active(rows, top_k);
+    let gens = vec![1u64; rows * top_k];
+    let x: CudaSlice<bf16> = s.clone_htod(fx.x.as_slice())?;
+    let ids_buf: CudaSlice<i32> = s.clone_htod(&ids)?;
+    let active_buf: CudaSlice<u32> = s.clone_htod(&active)?;
+    let weights_buf: CudaSlice<bf16> = s.clone_htod(&weights)?;
+    let gens_buf: CudaSlice<u64> = s.clone_htod(&gens)?;
+    let y: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
+    let y_view = testing::dense_mut(&y, s, rows as u32, hidden as u32)?;
+    let input = MoePrefill {
+        x: testing::dense(&x, s, rows as u32, hidden as u32)?,
+        ids: testing::dense(&ids_buf, s, rows as u32, top_k as u32)?,
+        active: testing::dense(&active_buf, s, rows as u32, top_k as u32)?,
+        weights: testing::dense(&weights_buf, s, rows as u32, top_k as u32)?,
+        assignment_gen: testing::dense(&gens_buf, s, rows as u32, top_k as u32)?,
+        slots_gate_up: testing::view(&table.gate_up, s, [experts as u32], [1])?,
+        slots_down: testing::view(&table.down, s, [experts as u32], [1])?,
+        slot_valid: testing::view(&table.valid, s, [experts as u32], [1])?,
+        slot_generation: testing::view(&table.generation, s, [experts as u32], [1])?,
+        slots_gate_up_host: &gu_host_vecs(gu_ptr, experts, 2 * inter * hidden * 2).0,
+        slots_down_host: &gu_host_vecs(dn_ptr, experts, hidden * inter * 2).1,
+        shared_gate: testing::dense(&sg, s, inter as u32, hidden as u32)?,
+        shared_up: testing::dense(&su, s, inter as u32, hidden as u32)?,
+        shared_down: testing::dense(&sd, s, hidden as u32, inter as u32)?,
+        shared_expert_gate: testing::view(&seg, s, [hidden as u32], [1])?,
+        y: y_view,
+    };
+    ops.prefill(s, input, &scratch)?;
+    s.synchronize()?;
+    Ok(())
+}
+
+fn gu_host_vecs(base: u64, experts: usize, stride: usize) -> (Vec<u64>, Vec<u64>) {
+    let v: Vec<u64> = (0..experts as u64)
+        .map(|e| base + e * stride as u64)
+        .collect();
+    (v.clone(), v)
+}
