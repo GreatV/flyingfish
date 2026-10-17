@@ -209,10 +209,19 @@ pub enum Retired {
     Loaded(u32),
 }
 
+/// Outcome of a prefetch request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Requested {
+    Queued,
+    Present,
+    Deferred,
+}
+
 /// Bounded layer-ahead disk prefetch over the ring; demand entries take priority.
 pub struct Prefetch {
     depth: u32,
     queued: Vec<PrefetchEntry>,
+    deferred: Vec<PrefetchEntry>,
     in_flight: Option<PrefetchEntry>,
     loaded: Vec<(PrefetchEntry, u32)>,
     taken: Vec<(PrefetchEntry, u32)>,
@@ -228,6 +237,7 @@ impl Prefetch {
         Ok(Self {
             depth,
             queued: Vec::with_capacity(depth as usize),
+            deferred: Vec::with_capacity(depth as usize),
             in_flight: None,
             loaded: Vec::with_capacity(depth as usize),
             taken: Vec::with_capacity(depth as usize),
@@ -235,6 +245,7 @@ impl Prefetch {
     }
 
     /// Queued, in-flight, loaded and taken entries: every entry holds or waits for a ring slot.
+    /// Deferred demands hold no entry until they are admitted.
     pub fn entries(&self) -> u32 {
         let in_flight = usize::from(self.in_flight.is_some());
         u32::try_from(self.queued.len() + in_flight + self.loaded.len() + self.taken.len())
@@ -244,10 +255,21 @@ impl Prefetch {
     fn contains(&self, layer: u32, expert: u32) -> bool {
         self.queued
             .iter()
+            .chain(self.deferred.iter())
             .chain(self.in_flight.iter())
             .chain(self.loaded.iter().map(|(entry, _)| entry))
             .chain(self.taken.iter().map(|(entry, _)| entry))
             .any(|entry| entry.layer == layer && entry.expert == expert)
+    }
+
+    /// Admits deferred demands first whenever an entry frees.
+    fn admit_deferred(&mut self) {
+        while self.entries() < self.depth && !self.deferred.is_empty() {
+            let entry = self.deferred.remove(0);
+            if !self.contains(entry.layer, entry.expert) {
+                self.queued.insert(0, entry);
+            }
+        }
     }
 
     /// Queues layer L+1's streamed experts from its complete span plan; only whole cohorts are
@@ -292,15 +314,16 @@ impl Prefetch {
         Ok(queued)
     }
 
-    /// Queues one disk read. A demand request waits when no non-demand entry can be retired and
-    /// never evicts a demand; a prefetch of a host-tier expert is rejected.
+    /// Queues one disk read. A demand that cannot be queued is deferred and admitted first when an
+    /// entry frees; a prefetch of a host-tier expert is rejected. The second value is an evicted
+    /// loaded entry's ring slot for `discard`.
     pub fn request(
         &mut self,
         layer: u32,
         expert: u32,
         demand: bool,
         host: bool,
-    ) -> Result<Option<u32>> {
+    ) -> Result<(Requested, Option<u32>)> {
         ensure!(
             !(host && !demand),
             "host-tier expert {expert} of layer {layer} is not a disk prefetch"
@@ -308,9 +331,9 @@ impl Prefetch {
         self.push(layer, expert, demand)
     }
 
-    fn push(&mut self, layer: u32, expert: u32, demand: bool) -> Result<Option<u32>> {
+    fn push(&mut self, layer: u32, expert: u32, demand: bool) -> Result<(Requested, Option<u32>)> {
         if self.contains(layer, expert) {
-            return Ok(None);
+            return Ok((Requested::Present, None));
         }
         let mut evicted_slot = None;
         if self.entries() >= self.depth {
@@ -320,7 +343,17 @@ impl Prefetch {
             } else if let Some(index) = self.loaded.iter().position(|(entry, _)| !entry.demand) {
                 evicted_slot = Some(self.loaded.remove(index).1);
             } else {
-                return Ok(None);
+                ensure!(
+                    self.deferred.len() < self.depth as usize,
+                    "pending demand list full at depth {}",
+                    self.depth
+                );
+                self.deferred.push(PrefetchEntry {
+                    layer,
+                    expert,
+                    demand,
+                });
+                return Ok((Requested::Deferred, None));
             }
         }
         let entry = PrefetchEntry {
@@ -333,12 +366,13 @@ impl Prefetch {
         } else {
             self.queued.push(entry);
         }
-        Ok(evicted_slot)
+        Ok((Requested::Queued, evicted_slot))
     }
 
     /// Starts the oldest request when a ring slot is free; it stays in flight until `complete`
     /// and is never evicted.
     pub fn begin_read(&mut self) -> Option<(u32, u32)> {
+        self.admit_deferred();
         if self.in_flight.is_some() {
             return None;
         }
@@ -364,22 +398,34 @@ impl Prefetch {
         Ok(())
     }
 
-    /// Retires a queued or loaded request; a loaded entry's ring slot is returned so the caller
-    /// can release it after its copy event. A read in flight completes first.
-    pub fn cancel(&mut self, layer: u32, expert: u32) -> Option<Retired> {
+    /// Retires a non-demand queued or loaded request; a loaded entry's ring slot is returned so
+    /// the caller can release it after its copy event. Cancelling a demand names it.
+    pub fn cancel(&mut self, layer: u32, expert: u32) -> Result<Retired> {
         if let Some(index) = self
             .queued
             .iter()
             .position(|entry| entry.layer == layer && entry.expert == expert)
         {
+            ensure!(
+                !self.queued[index].demand,
+                "demand {expert} of layer {layer} cannot be cancelled"
+            );
             self.queued.remove(index);
-            return Some(Retired::Queued);
+            self.admit_deferred();
+            return Ok(Retired::Queued);
         }
         let index = self
             .loaded
             .iter()
-            .position(|(entry, _)| entry.layer == layer && entry.expert == expert)?;
-        Some(Retired::Loaded(self.loaded.remove(index).1))
+            .position(|(entry, _)| entry.layer == layer && entry.expert == expert)
+            .with_context(|| format!("no queued or loaded prefetch for ({layer}, {expert})"))?;
+        ensure!(
+            !self.loaded[index].0.demand,
+            "demand {expert} of layer {layer} cannot be cancelled"
+        );
+        let retired = Retired::Loaded(self.loaded.remove(index).1);
+        self.admit_deferred();
+        Ok(retired)
     }
 
     /// Takes a loaded request's ring slot; the slot keeps counting toward the depth until
@@ -394,13 +440,18 @@ impl Prefetch {
         Some(slot)
     }
 
-    /// Frees a taken ring slot after the consumer released it.
+    /// Frees a taken ring slot after the consumer released it and admits deferred demands.
     pub fn release(&mut self, slot: u32) -> bool {
-        self.taken
+        let released = self
+            .taken
             .iter()
             .position(|(_, taken)| *taken == slot)
             .map(|index| self.taken.remove(index))
-            .is_some()
+            .is_some();
+        if released {
+            self.admit_deferred();
+        }
+        released
     }
 }
 
@@ -571,19 +622,28 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_demands_never_evict_a_demand() -> Result<()> {
+    fn prefetch_defers_a_demand_and_admits_it_first() -> Result<()> {
         assert!(Prefetch::new(0, 2).is_err());
         assert!(Prefetch::new(3, 2).is_err());
         let mut prefetch = Prefetch::new(1, 2)?;
-        prefetch.request(0, 1, true, false)?;
+        assert_eq!(prefetch.request(0, 1, true, false)?.0, Requested::Queued);
         assert_eq!(
             prefetch.request(0, 2, true, false)?,
-            None,
-            "a demand waits instead of evicting a demand"
+            (Requested::Deferred, None),
+            "a demand that cannot be queued is held"
         );
+        assert_eq!(prefetch.request(0, 1, true, false)?.0, Requested::Present);
         assert_eq!(prefetch.entries(), 1);
         assert_eq!(prefetch.begin_read(), Some((0, 1)));
         prefetch.complete(0, 1, 5)?;
+        assert_eq!(prefetch.take(0, 1), Some(5));
+        assert!(prefetch.release(5));
+        assert_eq!(
+            prefetch.begin_read(),
+            Some((0, 2)),
+            "the deferred demand is issued once D1 completes"
+        );
+        prefetch.complete(0, 2, 5)?;
         let error = prefetch.request(0, 3, false, true).unwrap_err().to_string();
         assert!(error.contains("not a disk prefetch"), "{error}");
         Ok(())
@@ -602,31 +662,35 @@ mod tests {
         assert_eq!(prefetch.take(0, 1), Some(7));
         assert_eq!(
             prefetch.request(0, 2, true, false)?,
-            None,
+            (Requested::Deferred, None),
             "the demand waits while both ring slots are taken"
         );
         assert_eq!(prefetch.begin_read(), None, "no ring slot is free");
         assert!(prefetch.release(5));
-        prefetch.request(0, 2, true, false)?;
-        assert_eq!(prefetch.entries(), 2);
         assert_eq!(prefetch.begin_read(), Some((0, 2)));
         prefetch.complete(0, 2, 5)?;
         Ok(())
     }
 
     #[test]
-    fn prefetch_cancel_retires_loaded_entries() -> Result<()> {
+    fn prefetch_cancel_retires_only_non_demand_entries() -> Result<()> {
         let mut prefetch = Prefetch::new(1, 2)?;
         prefetch.request(0, 0, false, false)?;
         assert_eq!(prefetch.begin_read(), Some((0, 0)));
         prefetch.complete(0, 0, 5)?;
         assert_eq!(prefetch.entries(), 1);
-        assert_eq!(prefetch.cancel(0, 0), Some(Retired::Loaded(5)));
+        assert_eq!(prefetch.cancel(0, 0)?, Retired::Loaded(5));
         assert_eq!(prefetch.entries(), 0);
-        assert_eq!(prefetch.cancel(0, 0), None);
+        assert!(prefetch.cancel(0, 0).is_err());
         prefetch.request(0, 1, false, false)?;
-        assert_eq!(prefetch.cancel(0, 1), Some(Retired::Queued));
+        assert_eq!(prefetch.cancel(0, 1)?, Retired::Queued);
         assert_eq!(prefetch.entries(), 0);
+        prefetch.request(0, 2, true, false)?;
+        let error = prefetch.cancel(0, 2).unwrap_err().to_string();
+        assert!(
+            error.contains("demand 2 of layer 0 cannot be cancelled"),
+            "{error}"
+        );
         Ok(())
     }
 
