@@ -60,6 +60,8 @@ __device__ void moe_route_select(
   }
   __syncthreads();
   const float max_logit = s_red[0];
+  // max_logit reads s_red[0]; the sum stage scatters into s_red[warp].
+  __syncthreads();
 
   const float ev = live ? expf(logit - max_logit) : 0.0f;
   v = ev;
