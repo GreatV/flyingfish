@@ -1,10 +1,8 @@
-// tree_rope_kv.cu -- fused tree RoPE + KV-cache write; one launch,
-// bitwise-identical to the (tree_rope, tree_kv_write) pair it replaces,
-// including the padding zeroing of qkv rows and cache slots.
-// FD_GUARD: __trap() unless valid_rows in [1,64], budget in [1,64],
-// valid_rows <= budget, q_heads == 16, kv_heads == 2, dim == 128, theta
-// finite and > 0, 0 <= *prefix <= capacity - budget, and positions[row] >= 0
-// for every valid row.
+// Fused tree RoPE + KV-cache write in one launch, bitwise-identical to tree_rope followed
+// by tree_kv_write, including the padding zeroing of qkv rows and cache slots.
+// __trap() unless valid_rows in [1,64], budget in [1,64], valid_rows <= budget,
+// q_heads == 16, kv_heads == 2, dim == 128, theta finite and > 0,
+// 0 <= *prefix <= capacity - budget, and positions[row] >= 0 for every valid row.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 

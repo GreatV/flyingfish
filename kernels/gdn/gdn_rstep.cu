@@ -1,7 +1,6 @@
-// MTP verify/replay only: one CTA per (head, value split) holds FP32 state
-// across 1..5 ordered rows. Prepared BF16 boundaries and row-local tensors are
-// unchanged. Live row count stays on device; bound is the prepared allocation.
-// No metadata mutation, padding updates, or cross-CTA state dependency.
+// Recurrent GDN step over 1..5 ordered rows: one CTA per (head, value split) holds FP32
+// state in registers. The live row count is read from the device meta; bound is the
+// prepared allocation. No metadata mutation and no cross-CTA state dependency.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
@@ -47,12 +46,11 @@ void gdn_rstep_core_t(
     const int valid_rows = meta->valid_rows;
     if (bound < 1 || bound > 5 || valid_rows < 1 || valid_rows > bound || prefix < 0 || meta->causal != 1 ||
         meta->key_count != prefix + valid_rows || meta->capacity < meta->key_count) {
-        __trap(); return;   // Reject invalid live rows before reading state.
+        __trap(); return;
     }
 
-    // 512 threads tile the [DK][VW] state as 16 row groups x 32 column groups, RT x TC each,
-    // i.e. 16 floats per thread. Every loop indexing Sr MUST be unrolled or the tile lands
-    // in local memory -- see gdn_chunked.cu for the same trap and its cost.
+    // 512 threads tile the [DK][VW] state as 16 row groups x 32 column groups, RT x TC each.
+    // Loops indexing Sr are fully unrolled.
     constexpr int RT = GDN_DK / 16, TC = VW / 32, TG = GDN_DK / RT;
     const int ti = tid / 32, tj = tid % 32;
     const int i0 = ti * RT, jb = tj * TC;
@@ -85,13 +83,11 @@ void gdn_rstep_core_t(
     const float bv = beta[row * GDN_HEADS + head];
     const size_t kv0 = ((size_t)row * GDN_HEADS + head) * GDN_DK;    // local row; prefix never indexes input
 
-    float dl[TC];   // declared before the control-build fork: both branches produce it
-    // ---- 1. decay FIRST
+    float dl[TC];
+    // 1. Decay before kv.
 // Negative-control build; never defined by build.rs.
 #ifdef GDN_RSTEP_WRONG_DECAY
-    // NEGATIVE CONTROL BUILD (never shipped): decay applied AFTER kv instead of before.
-    // The whole point of the G5 order control is that this is a real kernel build, so it is
-    // the same source with the order swapped, not a perturbation of the outputs.
+    // Decay applied after kv instead of before.
     #pragma unroll
     for (int b = 0; b < TC; ++b) {
         float p = 0.0f;
@@ -121,7 +117,7 @@ void gdn_rstep_core_t(
         for (int b = 0; b < TC; ++b) Sr[a][b] *= alpha;
     __syncthreads();
 
-    // ---- 2. kv = k^T S, from the DECAYED S. Stage one partial per row group.
+    // 2. kv = k^T S from the decayed S; one staged partial per row group.
     #pragma unroll
     for (int b = 0; b < TC; ++b) {
         float p = 0.0f;
@@ -138,7 +134,7 @@ void gdn_rstep_core_t(
     }
 #endif
 
-    // ---- 3. rank-one update, entirely thread-local
+    // 3. Rank-one update, thread-local.
     #pragma unroll
     for (int a = 0; a < RT; ++a) {
         const float ka = k[kv0 + i0 + a];
@@ -161,7 +157,7 @@ void gdn_rstep_core_t(
                 dst[b2] = make_float2(Sr[a][2 * b2], Sr[a][2 * b2 + 1]);
         }
     }
-    // ---- 4. o = q^T S, from the UPDATED S
+    // 4. o = q^T S from the updated S.
     #pragma unroll
     for (int b = 0; b < TC; ++b) {
         float p = 0.0f;
@@ -180,7 +176,7 @@ void gdn_rstep_core_t(
         __syncthreads();
     }
 
-    // ---- 5. write the state back
+    // 5. Write the state back.
     #pragma unroll
     for (int a = 0; a < RT; ++a)
         #pragma unroll

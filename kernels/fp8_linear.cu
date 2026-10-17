@@ -1,7 +1,7 @@
-// Q38 ABI v1: row-major E4M3 codes, BF16 [ceil(N/128),ceil(K/128)] scales.
+// Row-major E4M3 codes, BF16 [ceil(N/128),ceil(K/128)] scales.
 // M>5 prefill materializes effective BF16 weights. M1..5 forms the same rounded
 // weight in registers, accumulates FP32, and writes BF16; no matrix scratch.
-// Format source: NVIDIA CUDA 13.0 Math API, __nv_fp8_e4m3.
+// Format: __nv_fp8_e4m3 (CUDA Math API).
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
@@ -81,7 +81,7 @@ __device__ __forceinline__ void gemv_accumulate_tiles(
     for (int j=0; j<4; ++j) {
         #pragma unroll
         for (int byte=0; byte<4; ++byte) {
-            // Pairing one code from each vector makes conversion depend on both loads.
+            // pair = (byte of code0[j], same byte of code1[j])
             const uint16_t pair = uint16_t(__byte_perm(code0[j], code1[j], byte | ((byte+4)<<4)));
             const float2 values = gemv_decode_pair(pair);
             const float w0 = __bfloat162float(__float2bfloat16_rn(values.x * scale0));
@@ -95,7 +95,7 @@ __device__ __forceinline__ void gemv_accumulate_tiles(
     a0=accum[0]; a1=accum[1]; a2=accum[2]; a3=accum[3];
 }
 
-// launch: grid ceil(N/4), block128. Q38 shapes have K divisible by1024.
+// launch: grid ceil(N/4), block 128. K % 1024 == 0 takes the vectorized path.
 extern "C" __global__ void fp8_gemv_bf16(
         const uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
         const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y,

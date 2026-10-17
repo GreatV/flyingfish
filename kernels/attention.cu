@@ -1,170 +1,41 @@
-// ============================================================================
-// attention.cu -- GQA flash-decoding attention for ONE decode token.
-// Multi-query (M-token verification) kernels are in the second half of this
-// file (symbols flash_decode_mq_*).
-//
-// Model shape (MiniCPM5-2B): GQA 16 q-heads / 2 kv-heads (group size 8),
-// head_dim 128, bf16 data with fp32 accumulation, scale = 1/sqrt(128).
-// Causal decode: the single token attends to all L cached KV positions.
-// FD_GUARD: every entry point calls __trap() when invoked with
-// n_q_heads != 16, n_kv_heads != 2, gqa != 8, or head_dim != 128 --
-// a wrong-shape launch fails loudly (the trap surfaces as a CUDA error at
-// the next synchronization) instead of silently leaving outputs unwritten.
-//
-//   q  : bf16 [16][128] (one token, contiguous rows)
+// GQA flash-decoding attention: single-token decode (flash_decode_*) and M-token
+// block-causal verification (flash_decode_mq_*).
+// Shape: 16 q-heads / 2 kv-heads (gqa 8), head_dim 128, bf16 data, fp32 accumulation,
+// scale = 1/sqrt(128). FD_GUARD calls __trap() on any other shape.
+//   q  : bf16 [16][128]
 //   K,V: bf16, separate tensors, head_dim-contiguous rows
 //   o  : bf16 [16][128]
-//
-// Two-phase split-KV (flash decoding):
-//   phase 1: grid (nchunks, n_q_heads/QP); one block runs an online softmax
-//            (running max m, running sum l, fp32 acc[128]) over one chunk of
-//            `chunk` KV positions for QP q-heads that share one kv head, and
-//            writes the partial (m, l, acc[128]) to caller scratch. The
-//            per-group partials inside a block are merged with an
-//            online-softmax merge (M = max, rescale by exp(m - M)) in two
-//            levels: intra-warp butterfly shuffle, then cross-warp through
-//            dynamic shared memory.
-//   phase 2: grid (n_q_heads); one block merges the nchunks partials of one
-//            q head by LSE rescaling and writes o[16][128] bf16.
-//
-// Thread map (phase 1): TP=16 lanes cooperate on one key position; lane l
-// owns dims [l*8, l*8+8), so K and V each load as one 16B vector per lane at
-// head_dim=128. The q.k dot is a butterfly reduction over the 16 lanes; m/l
-// are replicated per group while the 128-dim accumulator is sharded 8 dims
-// per lane. QP=8 packs all 8 q-heads of a kv head into one block so each K/V
-// row is read once instead of 8 times.
-//
-// KV layouts (same kernel, only the strides differ; strides are in bf16
-// ELEMENTS and must be multiples of 8 so the 16B vector loads stay aligned):
-//   position-major [pos][kv][d]:  head_stride = 128,     pos_stride = 256
-//   head-major     [kv][pos][d]:  head_stride = Lh*128,  pos_stride = 128
-//     (Lh = L for a compact cache, or Lmax for a fixed max-len cache slab)
-//   Address: kv*head_stride + pos*pos_stride + d.  K and V strides are
-//   independent arguments.
-//
-// Scratch (caller-allocated fp32, one buffer; NQ = n_q_heads, NC = nchunks =
-// ceil(L/chunk)):
-//   scratch[0         .. NQ*NC)          = m           [NQ][NC]
-//   scratch[NQ*NC     .. 2*NQ*NC)        = l           [NQ][NC]
-//   scratch[2*NQ*NC   .. NQ*NC*(2+128))  = acc         [NQ][NC][128]
-//   Required size: n_q_heads * nchunks * (2 + 128) floats.
-//
-// CUDA Graph: the graph-safe entry points (non-_host) read L from a device
-// scalar (const int* len_dev); the engine updates that scalar to change L
-// between graph replays. The _host variants take L by value. No global
-// state; every buffer is caller-allocated and passed per launch.
-// Capacity-sized graphs: phase 1 may be launched with grid.x = nchunks_max
-// (for the longest captured L) while the replayed L needs fewer chunks;
-// blocks with blockIdx.x >= ceil(L/chunk) return before writing anything,
-// so other heads' partials in scratch are never touched.
-//
-// Phase-1 launch REQUIRES dynamic shared memory for the cross-warp merge:
-//   smem  = qpack * (threads/32) * (128+2) * 4 bytes,  smem <= 48 KB
-//   block = threads, a multiple of 32
-//   grid  = (nchunks, n_q_heads/qpack)
-// Phase-2 launch:
-//   grid  = n_q_heads (= 16)
-//   block = threads2, a multiple of 128 (<= 1024)
-//   smem  = (2*nchunks + threads2) * 4 bytes,  smem <= 48 KB
-// nchunks must be identical in both phases for the same (L, chunk).
-//
-// Measured (RTX 4090, sm_89, CUDA 13.2; cold L2 via rotating KV replicas,
-// 288 MiB footprint; per-iteration CUDA events, median; full two-phase
-// pipeline; threads=256):
-//   ctx1k  qp2/chunk128: 10.2 us, 103 GB/s
-//   ctx8k  qp2/chunk256: 18.4 us, 456 GB/s
-//   ctx32k qp2/chunk512: 46.1 us, 728 GB/s  (76% of the 958 GB/s plateau)
-//   max_abs err vs fp64 CPU reference <= 6.1e-5 across the sweep shapes.
-//
-// SIGNATURE TABLE (all symbols are extern "C" __global__; all pointer args
-// are __restrict__; QP = q-heads per block; nchunks = ceil(L/chunk)).
-// Failure semantics: wrong-shape calls __trap(); phase-1 grid.x may exceed
-// nchunks (capacity-sized graphs) -- excess blocks exit before any write.
-//
-//   flash_decode_phase1_q1  -- QP=1
-//     void(const __nv_bfloat16* q, const __nv_bfloat16* k,
-//          const __nv_bfloat16* v, float* scratch, const int* len_dev,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int k_head_stride, int k_pos_stride,
-//          int v_head_stride, int v_pos_stride, int chunk)
-//     launch: grid = dim3(nchunks, 16), block = threads (multiple of 32),
-//             smem = 1*(threads/32)*130*4 bytes, <= 49152
-//   flash_decode_phase1_q1_host -- QP=1
-//     void(const __nv_bfloat16* q, const __nv_bfloat16* k,
-//          const __nv_bfloat16* v, float* scratch, int L,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int k_head_stride, int k_pos_stride,
-//          int v_head_stride, int v_pos_stride, int chunk)
-//     launch: same as flash_decode_phase1_q1
-//   flash_decode_phase1_q2  -- QP=2
-//     void(const __nv_bfloat16* q, const __nv_bfloat16* k,
-//          const __nv_bfloat16* v, float* scratch, const int* len_dev,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int k_head_stride, int k_pos_stride,
-//          int v_head_stride, int v_pos_stride, int chunk)
-//     launch: grid = dim3(nchunks, 8), block = threads (multiple of 32),
-//             smem = 2*(threads/32)*130*4 bytes, <= 49152
-//   flash_decode_phase1_q2_host -- QP=2
-//     void(const __nv_bfloat16* q, const __nv_bfloat16* k,
-//          const __nv_bfloat16* v, float* scratch, int L,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int k_head_stride, int k_pos_stride,
-//          int v_head_stride, int v_pos_stride, int chunk)
-//     launch: same as flash_decode_phase1_q2
-//   flash_decode_phase1_q4  -- QP=4
-//     void(const __nv_bfloat16* q, const __nv_bfloat16* k,
-//          const __nv_bfloat16* v, float* scratch, const int* len_dev,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int k_head_stride, int k_pos_stride,
-//          int v_head_stride, int v_pos_stride, int chunk)
-//     launch: grid = dim3(nchunks, 4), block = threads (multiple of 32),
-//             smem = 4*(threads/32)*130*4 bytes, <= 49152
-//   flash_decode_phase1_q4_host -- QP=4
-//     void(const __nv_bfloat16* q, const __nv_bfloat16* k,
-//          const __nv_bfloat16* v, float* scratch, int L,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int k_head_stride, int k_pos_stride,
-//          int v_head_stride, int v_pos_stride, int chunk)
-//     launch: same as flash_decode_phase1_q4
-//   flash_decode_phase1_q8  -- QP=8
-//     void(const __nv_bfloat16* q, const __nv_bfloat16* k,
-//          const __nv_bfloat16* v, float* scratch, const int* len_dev,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int k_head_stride, int k_pos_stride,
-//          int v_head_stride, int v_pos_stride, int chunk)
-//     launch: grid = dim3(nchunks, 2), block = threads (multiple of 32),
-//             smem = 8*(threads/32)*130*4 bytes, <= 49152
-//   flash_decode_phase1_q8_host -- QP=8
-//     void(const __nv_bfloat16* q, const __nv_bfloat16* k,
-//          const __nv_bfloat16* v, float* scratch, int L,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int k_head_stride, int k_pos_stride,
-//          int v_head_stride, int v_pos_stride, int chunk)
-//     launch: same as flash_decode_phase1_q8
-//   flash_decode_phase2
-//     void(float* scratch, __nv_bfloat16* o, const int* len_dev,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim, int chunk)
-//     launch: grid = dim3(16), block = threads2 (multiple of 128, <= 1024),
-//             smem = (2*nchunks + threads2)*4 bytes, <= 49152
-//   flash_decode_phase2_host
-//     void(float* scratch, __nv_bfloat16* o, int L,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim, int chunk)
-//     launch: same as flash_decode_phase2
-// ============================================================================
+// Phase 1: grid (nchunks, n_q_heads/QP); one block runs an online softmax over `chunk`
+//   KV positions for QP q-heads sharing one kv head and writes the partial
+//   (m, l, acc[128]) to scratch; per-group partials merge by intra-warp shuffle, then
+//   cross-warp through dynamic smem.
+// Phase 2: grid (n_q_heads); one block merges the nchunks partials of one q head by
+//   LSE rescaling and writes o.
+// Phase-1 thread map: TP=16 lanes per key position; lane l owns dims [l*8, l*8+8).
+// KV address: kv*head_stride + pos*pos_stride + d; strides in bf16 elements, multiples of 8.
+//   position-major [pos][kv][d]: head_stride = 128,    pos_stride = 256
+//   head-major     [kv][pos][d]: head_stride = Lh*128, pos_stride = 128
+// Scratch (fp32; NQ = n_q_heads, NC = nchunks = ceil(L/chunk)):
+//   m [NQ][NC] | l [NQ][NC] | acc [NQ][NC][128]; size NQ*NC*(2+128) floats.
+// Non-_host entry points read L from the device scalar len_dev; _host variants take L by value.
+// Phase-1 grid.x may exceed nchunks; blocks with blockIdx.x >= nchunks return before any write.
+// Phase-1 launch: block = threads (multiple of 32), grid = (nchunks, n_q_heads/qpack),
+//   smem = qpack*(threads/32)*(128+2)*4 bytes <= 48 KB.
+// Phase-2 launch: grid = n_q_heads, block = threads2 (multiple of 128, <= 1024),
+//   smem = (2*nchunks + threads2)*4 bytes <= 48 KB.
+// nchunks is identical in both phases for the same (L, chunk).
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
 using bf16 = __nv_bfloat16;
 
-// ------------------------------------------------------- model / shape ----
 constexpr int HQ  = 16;                 // q heads
 constexpr int HKV = 2;                  // kv heads
-constexpr int GQA = HQ / HKV;           // 8 q heads per kv head
+constexpr int GQA = HQ / HKV;
 constexpr int DH  = 128;                // head_dim
 constexpr int TP  = 16;                 // lanes cooperating on one key position
-constexpr float SCALE = 0.08838834764831845f;   // 1/sqrt(128); sqrtf() is not constexpr
+constexpr float SCALE = 0.08838834764831845f;   // 1/sqrt(128)
 
-// ------------------------------------------------------------- helpers ----
 // Load 8 bf16 (one 16B vector) and widen to 8 floats.
 __device__ __forceinline__ void ld_bf8(const bf16* __restrict__ p, float* out) {
   const uint4 r = *reinterpret_cast<const uint4*>(p);
@@ -190,8 +61,7 @@ __device__ __forceinline__ void st_f8(float* __restrict__ p, const float* v) {
 __device__ __forceinline__ void st_f4(float* __restrict__ p, const float* v) {
   *reinterpret_cast<float4*>(p) = make_float4(v[0], v[1], v[2], v[3]);
 }
-// VPR bf16 in / VPR fp32 out. Uses 16B loads whenever VPR is a multiple of 8
-// (head_dim=128 -> VPR=8 -> exactly one 16B load per lane per tensor).
+// VPR bf16 in, VPR fp32 out; 16B loads when VPR % 8 == 0, else 8B loads.
 template <int VPR>
 __device__ __forceinline__ void ld_vec(const bf16* __restrict__ p, float* out) {
   static_assert(VPR % 4 == 0, "VPR must be a multiple of 4 for vectorized loads");
@@ -214,9 +84,7 @@ __device__ __forceinline__ void st_vec(float* __restrict__ p, const float* v) {
   }
 }
 
-// -------------------------------------------------------- phase 1 body ----
-// QP = q heads per block (all sharing one kv head), U = key positions per block
-// iteration per lane group (software pipeline depth).
+// QP = q heads per block sharing one kv head; U = key positions per lane group per iteration.
 template <int DH, int QP, int U>
 __device__ __forceinline__ void fd_phase1_body(
     const bf16* __restrict__ q, const bf16* __restrict__ Kc, const bf16* __restrict__ Vc,
@@ -251,14 +119,14 @@ __device__ __forceinline__ void fd_phase1_body(
     for (int j = 0; j < VPR; ++j) acc[h][j] = 0.0f;
   }
 
-  // Block-uniform trip count so every lane stays converged for the shuffles.
+  // Trip count is block-uniform; all lanes are converged at the shuffles.
   const int step  = ngrp * U;
   const int niter = (pos_end > pos_beg) ? ((pos_end - pos_beg + step - 1) / step) : 0;
 
   for (int it = 0; it < niter; ++it) {
     const int base = pos_beg + grp + it * step;
 
-    // Issue all U K loads before touching any of them (memory parallelism).
+    // All U K loads issue before the first use.
     float kf[U][VPR];
     bool  ok[U];
 #pragma unroll
@@ -278,8 +146,7 @@ __device__ __forceinline__ void fd_phase1_body(
 #pragma unroll
         for (int h = 0; h < QP; ++h) s[h] = fmaf(qr[h][j], kf[u][j], s[h]);
 
-      // Butterfly reduce the dot product across the TP lanes of this group.
-      // off < TP <= 16, so a warp's two groups reduce independently.
+      // Butterfly over the TP lanes of one group; off < TP keeps a warp's two groups independent.
 #pragma unroll
       for (int h = 0; h < QP; ++h)
 #pragma unroll
@@ -308,11 +175,8 @@ __device__ __forceinline__ void fd_phase1_body(
     }
   }
 
-  // ---- Merge the per-group partials into one block-level partial. ----
-  // Groups processed disjoint position sets, so this is an online-softmax
-  // merge, not a plain sum: M=max, rescale by exp(m-M), then accumulate.
-  // Level 1: the two TP-lane groups inside each warp exchange via shuffles
-  // (butterfly: both halves end up holding the merged value).
+  // Online-softmax merge of the per-group partials (disjoint position sets).
+  // Level 1: the two TP-lane groups of a warp exchange via shuffles; both halves hold the result.
 #pragma unroll
   for (int h = 0; h < QP; ++h) {
     const float pm = __shfl_xor_sync(0xffffffffu, mx[h], TP);
@@ -329,7 +193,6 @@ __device__ __forceinline__ void fd_phase1_body(
     mx[h] = M;
   }
   // Level 2: cross-warp merge through dynamic shared memory.
-  // smem layout: acc [QP][nw][DH] | m [QP][nw] | l [QP][nw].
   const int warp   = tid / 32;
   const int lane32 = tid % 32;
   const int nw     = blockDim.x / 32;
@@ -337,7 +200,7 @@ __device__ __forceinline__ void fd_phase1_body(
   float* sa  = fd_sm;                              // [QP][nw][DH]
   float* smm = sa + QP * nw * DH;                  // [QP][nw]
   float* sll = smm + QP * nw;                      // [QP][nw]
-  if (lane32 < TP) {   // one group per warp writes (both halves hold the same merged shard)
+  if (lane32 < TP) {   // one group per warp writes; both halves hold the same merged shard
 #pragma unroll
     for (int h = 0; h < QP; ++h) {
       if (lane32 == 0) { smm[h * nw + warp] = mx[h]; sll[h * nw + warp] = ls[h]; }
@@ -362,8 +225,7 @@ __device__ __forceinline__ void fd_phase1_body(
     }
   }
 
-  // Partials: m,l are [n_q_heads][nchunks] (phase 2 reads them coalesced),
-  // acc is [n_q_heads][nchunks][head_dim].
+  // Partials: m, l [n_q_heads][nchunks]; acc [n_q_heads][nchunks][head_dim].
 #pragma unroll
   for (int h = 0; h < QP; ++h) {
     const size_t part = (size_t)(qh0 + h) * nchunks + ch;
@@ -372,9 +234,8 @@ __device__ __forceinline__ void fd_phase1_body(
   }
 }
 
-// -------------------------------------------------------- phase 2 body ----
-// One block per q head; blockDim.x = DH * G2 where G2 groups split the chunk
-// range (G2 = blockDim.x / DH).  Dynamic shared: 2*nchunks (m,l) + blockDim.
+// One block per q head; blockDim.x = DH*G2, G2 groups split the chunk range.
+// Dynamic smem: 2*nchunks (m, l) + blockDim.x floats.
 template <int DH>
 __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
                                                const float* __restrict__ p_l,
@@ -410,7 +271,7 @@ __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
 
   float pv = 0.0f;
   for (int h = tid; h < nchunks; h += nt) pv += sl_[h] * __expf(sm_[h] - M);
-  __syncthreads();      // every thread has consumed red[0] before red[] is reused
+  __syncthreads();      // all threads have read red[0] before red[] is reused
   red[tid] = pv;
   __syncthreads();
   for (int s = nt / 2; s > 0; s >>= 1) {
@@ -418,7 +279,7 @@ __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
     __syncthreads();
   }
   const float lse = red[0];                        // sum_h l_h * exp(m_h - M)
-  __syncthreads();      // same barrier before red[] is reused by the G2 reduction
+  __syncthreads();      // all threads have read red[0] before the G2 reduction reuses red[]
 
   float acc = 0.0f;
   for (int h = g; h < nchunks; h += G2) {
@@ -436,11 +297,7 @@ __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
   if (g == 0) o[qh * DH + d] = __float2bfloat16(acc * inv);   // only group 0 holds the reduced acc
 }
 
-// ======================================================== exported ABI =====
-// Concrete extern "C" __global__ entry points. q_pack is baked into the symbol
-// name; every other dimension and every stride is an explicit argument; the
-// scratch buffer is caller-allocated; L comes from a device scalar so these are
-// CUDA-Graph-capturable.
+// QP is baked into the symbol name; every other dimension and stride is an argument.
 #define FD_GUARD do { if (head_dim != DH || n_q_heads != HQ || n_kv_heads != HKV || gqa != GQA) __trap(); } while (0)
 
 template <int DH, int QP>
@@ -450,9 +307,7 @@ __device__ __forceinline__ void fd_phase1_entry(
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride) {
   constexpr int U = (QP == 1) ? 2 : 1;            // pipeline depth baked per variant
   const int nchunks = (L + chunk - 1) / chunk;
-  // Capacity-sized graph launches may carry more CTAs than this L needs.
-  // Block-uniform, before any __syncthreads: excess blocks must not write
-  // partials (part = qh*nchunks + ch would index into the next head).
+  // Block-uniform, before any __syncthreads: blocks past nchunks write no partials.
   if (blockIdx.x >= nchunks) return;
   float* p_m = scratch;
   float* p_l = scratch + (size_t)n_q_heads * nchunks;
@@ -517,126 +372,29 @@ extern "C" __global__ void flash_decode_phase2_host(float* __restrict__ scratch,
 #undef FD_P1_EXPORTS
 #undef FD_GUARD
 
-// ============================================================================
-// Multi-query flash decode for speculative-decoding verification: M query
-// tokens share one KV cache, block-causal among the M new positions. The
-// per-position online-softmax machinery is identical to the single-token
-// kernels above.
-//
-// Semantics:
-//   The KV caches hold prefix positions [0, L) PLUS the M new tokens'
-//   positions [L, L+M) (written by the qkv path before attention); total
-//   extent L+M. Query token i (0-based, 0 <= i < M) attends exactly the
-//   positions [0, L+i] inclusive: all prefix plus new positions 0..i.
-//
-//   q  : bf16 [M][16][128]; row of (query qi, head qh) at
-//        q + qi*q_tok_stride + qh*q_head_stride  (strides in bf16 elements)
+// Multi-query flash decode: M query tokens share one KV cache, block-causal among the
+// M new positions. KV holds positions [0, L+M); query qi (0 <= qi < M) attends
+// [0, L+qi] inclusive.
+//   q  : bf16 [M][16][128]; row (qi, qh) at q + qi*q_tok_stride + qh*q_head_stride (bf16 elements)
 //   K,V: same layouts and stride rules as the single-token kernels
-//   o  : bf16 [M][16][128]; row of (qi, qh) at
-//        o + qi*o_tok_stride + qh*o_head_stride
-//
-// Two-phase split-KV (flash decoding), same structure as the single-token
-// kernels:
-//   phase 1: grid (nchunks, n_q_heads/QP, M); block (ch, y, qi) runs an online
-//            softmax over chunk ch for QP q-heads that share one kv head of
-//            query token qi and writes the partial (m, l, acc[128]) to caller
-//            scratch. The causal mask is folded into the trip count:
-//            pos_end = min(pos_beg + chunk, L + qi + 1); positions p > L+qi
-//            get score -INFINITY, an exact no-op in the online softmax
-//            (pf = expf(-inf - mn) = 0, cf = expf(mx - mn) = 1 with the finite
-//            -3e38 sentinel keeping m - m' NaN-free). Chunks fully above a
-//            query's range run zero iterations and still write their partial
-//            as the sentinel, so phase 2 always reads exactly nchunks defined
-//            partials per (query, head) and merges dead chunks as no-ops.
-//   phase 2: grid (n_q_heads*M); block eh = qi*n_q_heads + qh merges the
-//            nchunks partials of one (query, head) pair by LSE rescaling and
-//            writes o. Same merge math as the single-token kernel.
-//
-// Scratch (caller-allocated fp32, one buffer; NQ = n_q_heads = 16,
-// NC = nchunks = ceil((L+M)/chunk), row index eh = qi*NQ + qh):
-//   scratch[0         .. M*NQ*NC)          = m   [M*NQ][NC]
-//   scratch[M*NQ*NC   .. 2*M*NQ*NC)        = l   [M*NQ][NC]
-//   scratch[2*M*NQ*NC .. M*NQ*NC*(2+128))  = acc [M*NQ][NC][128]
-//   Required size: M * n_q_heads * nchunks * (2 + 128) floats.
-//   Every partial is written by exactly one block; every o row is written by
-//   exactly one phase-2 block.
-//
-// CUDA Graph: the graph-safe entry points (non-_host) read L from a device
-// scalar (const int* len_dev); the engine updates that scalar to change L
-// between graph replays. M is an ordinary kernel argument: fixed per capture,
-// and MUST be identical in both phases (both derive nchunks = ceil((L+M)/
-// chunk) from L, M, chunk). The _host variants take L by value. No global
-// state; every buffer is caller-allocated and passed per launch.
-// Capacity-sized graphs: phase 1 may be launched with grid.x = nchunks_max
-// while the replayed L needs fewer chunks; blocks with blockIdx.x >=
-// ceil((L+M)/chunk) return before writing anything.
-//
-// Phase-1 launch REQUIRES dynamic shared memory for the cross-warp merge:
-//   smem  = qpack * (threads/32) * 130 * 4 bytes,  smem <= 48 KB
-//   block = threads, a multiple of 32
-//   grid  = (nchunks, n_q_heads/qpack, M)
-// Phase-2 launch:
-//   grid  = (n_q_heads * M)
-//   block = threads2, a multiple of 128 (<= 1024)
-//   smem  = (2*nchunks + threads2) * 4 bytes,  smem <= 48 KB
-// nchunks must be identical in both phases for the same (L, M, chunk).
-//
-// SIGNATURE TABLE (all symbols are extern "C" __global__; all pointer args
-// are __restrict__; QP = q-heads per block; nchunks = ceil((L+M)/chunk);
-// grid.y = 16/QP, grid.z = M for phase 1).
-// Failure semantics: wrong-shape calls or M outside [1,16] __trap(); phase-1
-// grid.x may exceed nchunks (capacity-sized graphs) -- excess blocks exit
-// before any write.
-//
-//   flash_decode_mq_phase1_q1  -- QP=1
-//     void(const __nv_bfloat16* q, const __nv_bfloat16* k,
-//          const __nv_bfloat16* v, float* scratch, const int* len_dev, int M,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int q_tok_stride, int q_head_stride,
-//          int k_head_stride, int k_pos_stride,
-//          int v_head_stride, int v_pos_stride, int chunk)
-//     launch: grid = dim3(nchunks, 16, M), block = threads (multiple of 32),
-//             smem = 1*(threads/32)*130*4 bytes, <= 49152
-//   flash_decode_mq_phase1_q1_host -- QP=1
-//     void(const __nv_bfloat16* q, const __nv_bfloat16* k,
-//          const __nv_bfloat16* v, float* scratch, int L, int M,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int q_tok_stride, int q_head_stride,
-//          int k_head_stride, int k_pos_stride,
-//          int v_head_stride, int v_pos_stride, int chunk)
-//     launch: same as flash_decode_mq_phase1_q1
-//   flash_decode_mq_phase1_q2  -- QP=2
-//     void(... same argument list as flash_decode_mq_phase1_q1 ...)
-//     launch: grid = dim3(nchunks, 8, M), block = threads,
-//             smem = 2*(threads/32)*130*4 bytes, <= 49152
-//   flash_decode_mq_phase1_q2_host -- QP=2, L by value
-//   flash_decode_mq_phase1_q4  -- QP=4
-//     launch: grid = dim3(nchunks, 4, M), block = threads,
-//             smem = 4*(threads/32)*130*4 bytes, <= 49152
-//   flash_decode_mq_phase1_q4_host -- QP=4, L by value
-//   flash_decode_mq_phase1_q8  -- QP=8
-//     launch: grid = dim3(nchunks, 2, M), block = threads,
-//             smem = 8*(threads/32)*130*4 bytes, <= 49152
-//   flash_decode_mq_phase1_q8_host -- QP=8, L by value
-//   flash_decode_mq_phase2
-//     void(float* scratch, __nv_bfloat16* o, const int* len_dev, int M,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int o_tok_stride, int o_head_stride, int chunk)
-//     launch: grid = dim3(16*M), block = threads2 (multiple of 128, <= 1024),
-//             smem = (2*nchunks + threads2)*4 bytes, <= 49152
-//   flash_decode_mq_phase2_host
-//     void(float* scratch, __nv_bfloat16* o, int L, int M,
-//          int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-//          int o_tok_stride, int o_head_stride, int chunk)
-//     launch: same as flash_decode_mq_phase2
-// ============================================================================
+//   o  : bf16 [M][16][128]; row (qi, qh) at o + qi*o_tok_stride + qh*o_head_stride
+// Phase 1: grid (nchunks, n_q_heads/QP, M); pos_end = min(pos_beg + chunk, L + qi + 1).
+//   Chunks fully above a query's range run zero iterations and write the sentinel partial,
+//   so phase 2 reads nchunks defined partials per (query, head).
+// Phase 2: grid (n_q_heads*M); block eh = qi*n_q_heads + qh merges one (query, head) row.
+// Scratch (fp32; NQ = 16, NC = nchunks = ceil((L+M)/chunk), row eh = qi*NQ + qh):
+//   m [M*NQ][NC] | l [M*NQ][NC] | acc [M*NQ][NC][128]; size M*NQ*NC*(2+128) floats.
+// M is identical in both phases; FD_GUARD_MQ calls __trap() on M outside [1, 16].
+// Phase-1 grid.x may exceed nchunks; blocks with blockIdx.x >= nchunks return before any write.
+// Phase-1 launch: block = threads (multiple of 32), grid = (nchunks, n_q_heads/qpack, M),
+//   smem = qpack*(threads/32)*130*4 bytes <= 48 KB.
+// Phase-2 launch: grid = n_q_heads*M, block = threads2 (multiple of 128, <= 1024),
+//   smem = (2*nchunks + threads2)*4 bytes <= 48 KB.
 
 constexpr int MQ_MAX = 16;              // guard range for query tokens: 1..MQ_MAX
 
-// ------------------------------------------------- multi-query phase 1 ----
-// QP = q heads per block (all sharing one kv head), U = key positions per block
-// iteration per lane group (software pipeline depth). blockIdx.z = qi selects
-// the query token; the causal mask is folded into pos_end.
+// QP = q heads per block sharing one kv head; U = key positions per lane group per
+// iteration; blockIdx.z = query token.
 template <int DH, int QP, int U>
 __device__ __forceinline__ void fdmq_phase1_body(
     const bf16* __restrict__ q, const bf16* __restrict__ Kc, const bf16* __restrict__ Vc,
@@ -675,16 +433,15 @@ __device__ __forceinline__ void fdmq_phase1_body(
     for (int j = 0; j < VPR; ++j) acc[h][j] = 0.0f;
   }
 
-  // Block-uniform trip count so every lane stays converged for the shuffles.
-  // niter = 0 for chunks fully above this query's range: the block then writes
-  // the sentinel partial (m = -3e38, l = 0, acc = 0), a no-op for phase 2.
+  // Trip count is block-uniform; niter = 0 above this query's range writes the sentinel
+  // partial (m = -3e38, l = 0, acc = 0).
   const int step  = ngrp * U;
   const int niter = (pos_end > pos_beg) ? ((pos_end - pos_beg + step - 1) / step) : 0;
 
   for (int it = 0; it < niter; ++it) {
     const int base = pos_beg + grp + it * step;
 
-    // Issue all U K loads before touching any of them (memory parallelism).
+    // All U K loads issue before the first use.
     float kf[U][VPR];
     bool  ok[U];
 #pragma unroll
@@ -704,8 +461,7 @@ __device__ __forceinline__ void fdmq_phase1_body(
 #pragma unroll
         for (int h = 0; h < QP; ++h) s[h] = fmaf(qr[h][j], kf[u][j], s[h]);
 
-      // Butterfly reduce the dot product across the TP lanes of this group.
-      // off < TP <= 16, so a warp's two groups reduce independently.
+      // Butterfly over the TP lanes of one group; off < TP keeps a warp's two groups independent.
 #pragma unroll
       for (int h = 0; h < QP; ++h)
 #pragma unroll
@@ -734,11 +490,8 @@ __device__ __forceinline__ void fdmq_phase1_body(
     }
   }
 
-  // ---- Merge the per-group partials into one block-level partial. ----
-  // Groups processed disjoint position sets, so this is an online-softmax
-  // merge, not a plain sum: M=max, rescale by exp(m-M), then accumulate.
-  // Level 1: the two TP-lane groups inside each warp exchange via shuffles
-  // (butterfly: both halves end up holding the merged value).
+  // Online-softmax merge of the per-group partials (disjoint position sets).
+  // Level 1: the two TP-lane groups of a warp exchange via shuffles; both halves hold the result.
 #pragma unroll
   for (int h = 0; h < QP; ++h) {
     const float pm = __shfl_xor_sync(0xffffffffu, mx[h], TP);
@@ -755,7 +508,6 @@ __device__ __forceinline__ void fdmq_phase1_body(
     mx[h] = M;
   }
   // Level 2: cross-warp merge through dynamic shared memory.
-  // smem layout: acc [QP][nw][DH] | m [QP][nw] | l [QP][nw].
   const int warp   = tid / 32;
   const int lane32 = tid % 32;
   const int nw     = blockDim.x / 32;
@@ -763,7 +515,7 @@ __device__ __forceinline__ void fdmq_phase1_body(
   float* sa  = fdmq_sm;                            // [QP][nw][DH]
   float* smm = sa + QP * nw * DH;                  // [QP][nw]
   float* sll = smm + QP * nw;                      // [QP][nw]
-  if (lane32 < TP) {   // one group per warp writes (both halves hold the same merged shard)
+  if (lane32 < TP) {   // one group per warp writes; both halves hold the same merged shard
 #pragma unroll
     for (int h = 0; h < QP; ++h) {
       if (lane32 == 0) { smm[h * nw + warp] = mx[h]; sll[h * nw + warp] = ls[h]; }
@@ -788,8 +540,8 @@ __device__ __forceinline__ void fdmq_phase1_body(
     }
   }
 
-  // Partials: m,l are [M*n_q_heads][nchunks] (phase 2 reads them coalesced),
-  // acc is [M*n_q_heads][nchunks][head_dim]; row eh = qi*n_q_heads + qh.
+  // Partials: m, l [M*n_q_heads][nchunks]; acc [M*n_q_heads][nchunks][head_dim];
+  // row eh = qi*n_q_heads + qh.
 #pragma unroll
   for (int h = 0; h < QP; ++h) {
     const size_t part = ((size_t)qi * n_q_heads + (qh0 + h)) * nchunks + ch;
@@ -798,10 +550,8 @@ __device__ __forceinline__ void fdmq_phase1_body(
   }
 }
 
-// ------------------------------------------------- multi-query phase 2 ----
-// One block per (query, head) pair; blockIdx.x = eh = qi*n_q_heads + qh.
-// blockDim.x = DH * G2 where G2 groups split the chunk range
-// (G2 = blockDim.x / DH).  Dynamic shared: 2*nchunks (m,l) + blockDim.
+// One block per (query, head); blockIdx.x = eh = qi*n_q_heads + qh; blockDim.x = DH*G2,
+// G2 groups split the chunk range. Dynamic smem: 2*nchunks (m, l) + blockDim.x floats.
 template <int DH>
 __device__ __forceinline__ void fdmq_phase2_body(const float* __restrict__ p_m,
                                                  const float* __restrict__ p_l,
@@ -841,7 +591,7 @@ __device__ __forceinline__ void fdmq_phase2_body(const float* __restrict__ p_m,
 
   float pv = 0.0f;
   for (int h = tid; h < nchunks; h += nt) pv += sl_[h] * __expf(sm_[h] - M);
-  __syncthreads();      // every thread has consumed red[0] before red[] is reused
+  __syncthreads();      // all threads have read red[0] before red[] is reused
   red[tid] = pv;
   __syncthreads();
   for (int s = nt / 2; s > 0; s >>= 1) {
@@ -849,7 +599,7 @@ __device__ __forceinline__ void fdmq_phase2_body(const float* __restrict__ p_m,
     __syncthreads();
   }
   const float lse = red[0];                        // sum_h l_h * exp(m_h - M)
-  __syncthreads();      // same barrier before red[] is reused by the G2 reduction
+  __syncthreads();      // all threads have read red[0] before the G2 reduction reuses red[]
 
   float acc = 0.0f;
   for (int h = g; h < nchunks; h += G2) {
@@ -869,7 +619,6 @@ __device__ __forceinline__ void fdmq_phase2_body(const float* __restrict__ p_m,
       __float2bfloat16(acc * inv);
 }
 
-// ============================================ exported multi-query ABI =====
 #define FD_GUARD_MQ do { if (head_dim != DH || n_q_heads != HQ || n_kv_heads != HKV || gqa != GQA || M < 1 || M > MQ_MAX) __trap(); } while (0)
 
 template <int DH, int QP>
@@ -880,9 +629,7 @@ __device__ __forceinline__ void fdmq_phase1_entry(
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride) {
   constexpr int U = (QP == 1) ? 2 : 1;            // pipeline depth baked per variant
   const int nchunks = (L + M + chunk - 1) / chunk;
-  // Capacity-sized graph launches may carry more CTAs than this L needs.
-  // Block-uniform, before any __syncthreads: excess blocks must not write
-  // partials (part = (qi*NQ+qh)*nchunks + ch would index into the next row).
+  // Block-uniform, before any __syncthreads: blocks past nchunks write no partials.
   if (blockIdx.x >= nchunks) return;
   float* p_m = scratch;
   float* p_l = scratch + (size_t)M * n_q_heads * nchunks;

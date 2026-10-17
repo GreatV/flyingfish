@@ -1,12 +1,9 @@
-// add_rmsnorm_capture.cu -- residual add + RMSNorm with the DSpark capture
-// copy folded into the same launch: add_rmsnorm's x/res/y/res_out writes are
-// bit-identical, and the capture destination receives the same bytes the 2D
-// device-to-device copy would have moved. Only the capture layers (5 per
-// round) use this entry point; the rest keep add_rmsnorm, decode keeps both.
+// Residual add + RMSNorm with a capture copy in the same launch: the x/res/y/res_out
+// writes are bit-identical to add_rmsnorm, and capture receives the rounded res_out values.
 //
-// Math as norm.cu add_rmsnorm: res_out = bf16(res + x) (one rounding), then
-// y = bf16(res_out * rsqrt(mean(res_out^2) + eps) * w) in fp32 with one round
-// at the store; the same rounded res_out values are mirrored into
+// res_out = bf16(res + x) (one rounding), then
+// y = bf16(res_out * rsqrt(mean(res_out^2) + eps) * w) in fp32 with one rounding at the
+// store; the same rounded res_out values are mirrored into
 // capture[r * dst_pitch + dst_col + d].
 //
 // Layout / contract:
@@ -14,10 +11,9 @@
 //     capture bf16 with row stride dst_pitch and slot offset dst_col.
 //   * grid = (rows,1,1), block = (256,1,1), smem 128 B static; blocks past
 //     rows return before any write.
-//   * FD_GUARD (__trap__): hidden != 2048, rows < 1, eps negative or not
-//     finite, any null buffer, blockDim.x not a multiple of 32 or outside
-//     [32,1024], dst_col + hidden > dst_pitch, dst_pitch/dst_col not a
-//     multiple of 8 elements (the capture store is a 16 B vector store).
+//   * __trap() on: hidden != 2048, rows < 1, eps negative or not finite, any null
+//     buffer, blockDim.x not a multiple of 32 or outside [32,1024],
+//     dst_col + hidden > dst_pitch, dst_pitch/dst_col not a multiple of 8 elements.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -236,8 +232,7 @@ __global__ __launch_bounds__(1024) void add_rmsnorm_capture(const __nv_bfloat16*
     const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t off = (size_t)row * hidden;
-    // hidden is pinned to 2048 by the guard, so the 8-wide register-cached
-    // path is the one the unfused add_rmsnorm takes for this shape.
+    // hidden == 2048 (guarded); VEC = 8 takes the register-cached path.
     add_rmsnorm_capture_row<8>(x + off, res + off, w, y + off, res_out + off, capture, hidden,
                                eps, dst_pitch, dst_col);
 }

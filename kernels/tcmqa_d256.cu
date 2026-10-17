@@ -1,43 +1,22 @@
-// ============================================================================
-// tcmqa_d256.cu -- HD256 full attention for Qwen3.8-27B.
-//
-// ABI v1 §4. Self-contained; kernels/tcmqa.cu (HD128) is untouched so the
-// existing regression is unaffected.
-//
+// HD256 full attention.
 // Shape: q_heads=24, kv_heads=4, GQA=6, head_dim=256, scale=1/16.
-// Narrow tile only: MT=64 pair rows, KT=32 KV positions, 4 warps / 128 threads,
-// smem = (64+32+32)*264*2 + 64*8 = 68096 B. The wide 128-row variant would need
-// 101888 B > the 101376 B opt-in ceiling and is deliberately NOT registered.
-//
-// EVERY dimension-derived array extent and unrolled loop bound is symbolic in
-// DH/HQ/HKV. The HD128 kernel wrote these as literals; a constants-only "D=256"
-// build compiles, runs, and silently computes only the first half of the output
-// dims (see p1d/P1D_STATUS.md §1.1). Do not reintroduce a literal here.
-// NSLICE = DH/8 and KSLICE = DH/16 are the two hoisted bounds; every array
-// extent, QK reduction, PV loop, rescale, partial store and partial read is
-// written in terms of them.
-//
-// Partials use the fixed-Pmax SoA layout of ABI §4.3, NOT the old packed layout:
+// Tile: MT=64 pair rows, KT=32 KV positions, 4 warps / 128 threads, dynamic smem SMEM_NARROW.
+// Array extents and unrolled loop bounds are written in DH/HQ/HKV through
+// NSLICE = DH/8 and KSLICE = DH/16; no dimension is a literal.
+// Partials (fixed-Pmax SoA):
 //   Pmax = ceil(capacity/key_chunk)   m_cap = min(max_rows, 64) = seg_rows
 //   E = seg_rows * HQ * Pmax
 //   e = ((kv_head*Pmax + part)*(GQA*seg_rows) + q_in_group*seg_rows + local_row)
 //   p_max:  f32[E]      offset 0
 //   p_sum:  f32[E]      offset align256(E*4)
 //   p_out:  f32[E*DH]   offset p_sum + align256(E*4)
-// Phase 1 writes only rows/parts that are valid; phase 2 reads only those.
-//
-// Query segmentation (ABI §4.2): prefill rows are processed in segments of at
-// most 64 rows. Segment s has local row 0 at global row `row_base = s`, absolute
-// position L = prefix + row_base, and m = min(seg_rows, valid_rows - row_base)
-// live rows. Row r sees every key below L unconditionally, and key L+jj iff bit
-// jj of causal_mask[r] is set. causal_mask is the caller's u64[64]; mask[63] is
-// UINT64_MAX and `1 << 64` is never computed here.
-//
-// Every kernel reads prefix/valid_rows from the device SequenceMeta instead of
-// from launch arguments, so a captured Graph cannot replay a stale host
-// position. Grids are sized from the plan's max_rows; launches whose segment
-// has no live rows exit without writing.
-// ============================================================================
+// Phase 1 writes only valid rows/parts; phase 2 reads only those.
+// Query segmentation: segments of at most 64 rows. Segment local row 0 is global row
+// row_base, absolute position L = prefix + row_base, m = min(seg_rows, valid_rows - row_base)
+// live rows. Row r sees every key below L, and key L+jj iff bit jj of causal_mask[r] is
+// set. causal_mask is u64[64]; mask[63] is UINT64_MAX.
+// Kernels read prefix/valid_rows from the device SequenceMeta. Grids are sized from
+// max_rows; segments with no live rows exit without writing.
 #include <cuda_bf16.h>
 #include <cstdint>
 #include "kv_cache.cuh"
@@ -46,22 +25,20 @@ namespace tcmqa_d256 {
 
 using bf16 = __nv_bfloat16;
 
-// ---------------------------------------------------------------- shape ----
 constexpr int HQ      = 24;      // q heads
 constexpr int HKV     = 4;       // kv heads
-constexpr int GQA     = HQ / HKV;// 6 q heads per kv head
+constexpr int GQA     = HQ / HKV;
 constexpr int DH      = 256;     // head_dim
 constexpr int MT      = 64;      // pair rows per block (narrow tile)
 constexpr int KT      = 32;      // KV positions per smem tile
 constexpr int NW      = 4;       // warps per block
-constexpr int NT      = NW * 32; // 128 threads
+constexpr int NT      = NW * 32;
 constexpr int M_CAP   = 64;      // max query rows per segment
 constexpr int PAD     = 8;       // smem row padding vs ldmatrix banks
-constexpr int LDS     = DH + PAD;// 264
-constexpr float SCALE = 0.0625f; // 1/sqrt(256); sqrtf() is not constexpr
+constexpr int LDS     = DH + PAD;
+constexpr float SCALE = 0.0625f; // 1/sqrt(256)
 
-// n8 slices over DH, and k16 slices over DH -- the two that the HD128 kernel
-// hardcoded as 16 and 8.
+// n8 slices and k16 slices over DH.
 constexpr int NSLICE = DH / 8;    // 32
 constexpr int KSLICE = DH / 16;   // 16
 
@@ -81,7 +58,6 @@ constexpr int ROTARY = 64;
 constexpr int RHALF  = ROTARY / 2;
 constexpr float THETA = 1.0e7f;
 
-// --------------------------------------------------------------- helpers ----
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
   return (unsigned)__cvta_generic_to_shared(p);
 }
@@ -122,7 +98,6 @@ __device__ __forceinline__ void cp_wait0() {
   asm volatile("cp.async.wait_group 0;\n");
 }
 
-// ----------------------------------------------------------------- guards ---
 // Device-side invariants only. prepare() does the host-side shape/stride work.
 __device__ __forceinline__ void guard_meta(const int4* meta) {
   const int prefix     = meta[0].x;
@@ -140,8 +115,7 @@ __device__ __forceinline__ void guard_pmax(const int4* meta, int key_chunk, int 
   const int want = (int)(((long)capacity + key_chunk - 1) / key_chunk);
   if (Pmax != want) __trap();
 }
-// A wrong-shape launch traps (it surfaces as a CUDA error at the next
-// synchronisation) instead of silently leaving outputs unwritten.
+// A wrong-shape launch traps.
 __device__ __forceinline__ void guard_geometry(int seg_rows, int key_chunk,
                                                int block_threads, int p1) {
   if (seg_rows < 1 || seg_rows > M_CAP) __trap();
@@ -151,16 +125,10 @@ __device__ __forceinline__ void guard_geometry(int seg_rows, int key_chunk,
     __trap();
 }
 
-// ============================================================ host-side prep
-// Split the [M,24,512] q_gate projection into independent Q and gate views.
-// ABI §4.1: per head Q is at offset 0 and gate at offset 256 within the head's
-// 512-wide span; the pair must NOT be produced by bisecting the whole row.
-// Grid is sized for max_rows; rows at or beyond the device valid_rows return.
-//
-// Coverage: one thread per (row, head, dim) over rows*HQ*DH, so every element of
-// both output views is written. rope_q rotates in place and therefore owns only
-// its own rotation; the dims it does not touch are already correct because of
-// this complete copy.
+// Split the [M,24,512] q_gate projection into Q and gate views: per head, Q at offset 0
+// and gate at offset 256 within the head's 512-wide span.
+// One thread per (row, head, dim) writes every element of both views; rows at or beyond
+// the device valid_rows return.
 extern "C" __global__ void tcmqa_d256_qg_split(const __nv_bfloat16* __restrict__ q_gate,
                                                __nv_bfloat16* __restrict__ q,
                                                __nv_bfloat16* __restrict__ gate,
@@ -179,9 +147,8 @@ extern "C" __global__ void tcmqa_d256_qg_split(const __nv_bfloat16* __restrict__
   gate[(size_t)row * g_tok_stride + (size_t)h * DH + d] = src[DH];
 }
 
-// Rotation of one (j, j+RHALF) pair at the given fp32 angle. Both halves are
-// read before either is written; an in-place update through aliasing views is
-// what made the fp32 oracle's first version silently wrong.
+// Rotation of one (j, j+RHALF) pair at the given fp32 angle; both halves are read before
+// either is written.
 __device__ __forceinline__ void rope_apply(bf16& a, bf16& b, float ang) {
   const float c = cosf(ang), s = sinf(ang);
   const float af = __bfloat162float(a), bf = __bfloat162float(b);
@@ -189,19 +156,14 @@ __device__ __forceinline__ void rope_apply(bf16& a, bf16& b, float ang) {
   b = __float2bfloat16(bf * c + af * s);
 }
 
-// Angle of pair `half_idx` at coordinate `pos`: theta^(-2*half_idx/ROTARY) times
-// the position, all fp32. The single place the rotation frequency is formed;
-// both the physical-position path and the three-axis path call it.
+// Angle of pair half_idx at coordinate pos: pos * theta^(-2*half_idx/ROTARY), fp32.
 __device__ __forceinline__ float rope_angle(int pos, int half_idx) {
   const float inv = 1.0f / powf(THETA, float(2 * half_idx) / float(ROTARY));
   return float(pos) * inv;
 }
 
-// Qwen3.5's interleaved mRoPE (`apply_interleaved_mrope`, mrope_section
-// (11, 11, 10)): of the RHALF = 32 pairs, H owns slice(1, 33, 3), W owns
-// slice(2, 30, 3), T keeps the rest -- 11/11/10. The sections are interleaved,
-// not three contiguous runs. Counts are checked below for RHALF = 32; the
-// RHALF != 32 builds (the harness's rotary-width control) never use it.
+// Interleaved mRoPE (model definition apply_interleaved_mrope, mrope_section (11, 11, 10)):
+// of the RHALF = 32 pairs, H owns slice(1, 33, 3), W owns slice(2, 30, 3), T the rest.
 __host__ __device__ constexpr int rope_axis(int j) {
   return (j % 3 == 1 && j < 33) ? 1 : ((j % 3 == 2 && j < 30) ? 2 : 0);
 }
@@ -215,11 +177,8 @@ static_assert(RHALF != 32 ||
                    rope_axis_count(2) == 10),
               "mrope_section (11, 11, 10) over RHALF = 32");
 
-// In-place partial RoPE on Q. Q is an independent [M,24,256] BF16 view; positions
-// are absolute (device prefix + row). Dims >= ROTARY pass through untouched, and
-// that is correct only because qg_split wrote the whole view first: this kernel
-// owns dims [0, ROTARY) of every (row, head) it covers and nothing else. It does
-// not read or write the gate view, so no gate dim depends on it.
+// In-place partial RoPE on Q ([M,24,256] BF16 view) at absolute position prefix + row.
+// Writes only dims [0, ROTARY); qg_split writes the full view first.
 extern "C" __global__ void tcmqa_d256_rope_q(__nv_bfloat16* __restrict__ q,
                                              const int4* __restrict__ meta,
                                              int q_tok_stride) {
@@ -235,16 +194,9 @@ extern "C" __global__ void tcmqa_d256_rope_q(__nv_bfloat16* __restrict__ q,
   rope_apply(row[j], row[j + RHALF], rope_angle(prefix + r, j));
 }
 
-// Partial RoPE on K, then scatter the whole head row into the head-major K
-// cache. K arrives already normalised -- the common NormOps::rms caller runs
-// before this kernel (ABI §4.2 step order); the projection K itself is never
-// modified.
-//
-// One thread owns one cache dim. Dims below ROTARY are rotated as
-// (j, j + ROTARY/2) pairs, written by the lower half of each pair; dims from
-// ROTARY up are copied through unchanged. Rotating without copying the tail
-// leaves the last DH - ROTARY dims of every cache row holding whatever the
-// buffer previously held -- a silent wrong answer, not a trap.
+// Partial RoPE on normalised K, then scatter the head row into the head-major K cache.
+// One thread per cache dim: dims < RHALF write the rotated (j, j+RHALF) pair; dims >= ROTARY
+// copy through.
 extern "C" __global__ void tcmqa_d256_rope_k_scatter(const __nv_bfloat16* __restrict__ k,
                                                      __nv_bfloat16* __restrict__ k_cache,
                                                      const int4* __restrict__ meta,
@@ -271,10 +223,8 @@ extern "C" __global__ void tcmqa_d256_rope_k_scatter(const __nv_bfloat16* __rest
   }
 }
 
-// Three-axis variant of tcmqa_d256_rope_q: each pair's angle uses the row's
-// (T, H, W) coordinate from `axes` ([rows, 3] i32, row-major) instead of the
-// physical position. The physical position still bounds the work (rows,
-// prefix/valid_rows from the meta); only the rotation coordinate changes.
+// Three-axis tcmqa_d256_rope_q: each pair's angle uses the row's (T, H, W) coordinate from
+// axes ([rows, 3] i32, row-major); rows still come from the meta.
 extern "C" __global__ void tcmqa_d256_rope_q_axes(__nv_bfloat16* __restrict__ q,
                                                   const int4* __restrict__ meta,
                                                   const int* __restrict__ axes,
@@ -291,9 +241,8 @@ extern "C" __global__ void tcmqa_d256_rope_q_axes(__nv_bfloat16* __restrict__ q,
              rope_angle(axes[(size_t)r * 3 + rope_axis(j)], j));
 }
 
-// Three-axis variant of tcmqa_d256_rope_k_scatter: the rotation coordinate per
-// (row, pair) comes from `axes`; the scatter destination is still the physical
-// slot `prefix + r`, so the KV cache layout does not change.
+// Three-axis tcmqa_d256_rope_k_scatter: the rotation coordinate comes from axes; the
+// destination slot is still prefix + r.
 extern "C" __global__ void tcmqa_d256_rope_k_scatter_axes(
     const __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ k_cache,
     const int4* __restrict__ meta, const int* __restrict__ axes, int k_tok_stride,
@@ -338,15 +287,12 @@ extern "C" __global__ void tcmqa_d256_v_scatter(const __nv_bfloat16* __restrict_
       v[(size_t)r * v_tok_stride + (size_t)h * DH + d];
 }
 
-// ====================================================== attention phase 1 ====
-// Block (part, kv, rt) sweeps key chunk `part` of kv-head kv in KT-position
-// tiles and reduces each of its MT pair rows to one (max, sum, acc[DH]) partial.
-// Pair p = q_in_group*seg_rows + local_row; the tile covers pairs
-// [rt*MT, rt*MT+MT). Warp w owns MMA rows [w*16, w*16+16), so warps own
-// disjoint rows and no cross-warp reduction is needed.
-//
+// Phase 1: block (part, kv, rt) sweeps key chunk part of kv-head kv in KT-position tiles and
+// reduces each of its MT pair rows to one (max, sum, acc[DH]) partial.
+// Pair p = q_in_group*seg_rows + local_row; the tile covers pairs [rt*MT, rt*MT+MT).
+// Warp w owns MMA rows [w*16, w*16+16).
 // Launch: grid(Pmax, HKV, ceil(GQA*seg_rows/MT)), block NT,
-//         dynamic smem SMEM_NARROW = 68096 B (> 48 KiB: host opts in).
+//         dynamic smem SMEM_NARROW (> 48 KiB, host opts in).
 template<bool COMPACT = false>
 __device__ __forceinline__ void phase1_body(
     const bf16* __restrict__ q, const bf16* __restrict__ kc, const bf16* __restrict__ vc,
@@ -367,8 +313,7 @@ __device__ __forceinline__ void phase1_body(
   const int m = min(seg_rows, rows - row_base);
   const int L = prefix + row_base;
   const int Pactive = (L + m + key_chunk - 1) / key_chunk;
-  // Both exits are block-uniform: m and Pactive depend only on the device meta
-  // and on launch constants, so no barrier is crossed before them.
+  // Both exits are block-uniform and precede every barrier.
   if (m <= 0) return;
   if (part >= Pactive) return;
 
@@ -378,7 +323,7 @@ __device__ __forceinline__ void phase1_body(
   const int tid  = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
-  const int nrows = GQA * seg_rows;   // live pair rows in this segment
+  const int nrows = GQA * seg_rows;   // pair rows in this segment
   const int row0  = rt * MT;
 
   extern __shared__ __align__(16) bf16 tcm_sm[];
@@ -387,7 +332,7 @@ __device__ __forceinline__ void phase1_body(
   bf16* vsm = ksm + KT * LDS;
   unsigned long long* msm = reinterpret_cast<unsigned long long*>(vsm + KT * LDS);
 
-  // ---- stage the causal mask and the Q row tile (cooperative 16B copies) ----
+  // Stage the causal mask and the Q row tile (16B copies).
   for (int i = tid; i < M_CAP; i += NT) msm[i] = causal_mask[i];
   for (int idx = tid; idx < MT * NSLICE; idx += NT) {
     const int r = idx / NSLICE, seg = idx % NSLICE;
@@ -404,11 +349,7 @@ __device__ __forceinline__ void phase1_body(
   }
   __syncthreads();
 
-  // Per-lane rows (D-fragment layout): rows lane/4 and lane/4+8 of the warp's
-  // 16-row slab, as pairs of this segment. Only these four values stay live
-  // across the whole tile sweep -- they are re-derived at the write-out so that
-  // the head group and the liveness predicates do not occupy registers through
-  // 32 unrolled PV slices.
+  // Per-lane rows (D-fragment layout): rows lane/4 and lane/4+8 of the warp's 16-row slab.
   const int rl = warp * 16 + (lane >> 2);
   const int rh = rl + 8;
   const int pl = row0 + rl;
@@ -424,7 +365,6 @@ __device__ __forceinline__ void phase1_body(
 #pragma unroll
     for (int j = 0; j < 4; ++j) acc[n][j] = 0.0f;
 
-  // ---- sweep the chunk in KT-position tiles ----
   // K/V tiles are staged with cp.async. The prologue stages K(0); per tile, CP1
   // waits for K(t), barriers, and stages V(t) during the S mma and softmax; CP2
   // waits for V(t), barriers, and stages K(t+1) during the PV mma. Each stage
@@ -462,7 +402,7 @@ __device__ __forceinline__ void phase1_body(
     stage_kv(vc, v_head_stride, v_pos_stride, t, vsm, false);
     cp_commit();                                      // V(t) flies during S + softmax
 
-    // ---- S = Q_w * K_tile^T : KSLICE k16 x 4 n8 mma, per-warp row slab ----
+    // S = Q_w * K_tile^T: KSLICE k16 x 4 n8 mma, per-warp row slab.
     float sf[4][4];
 #pragma unroll
     for (int n = 0; n < 4; ++n)
@@ -495,8 +435,7 @@ __device__ __forceinline__ void phase1_body(
 #pragma unroll
       for (int j = 0; j < 4; ++j) sf[n][j] *= SCALE;
 
-    // ---- visibility: pos < L is unconditional; above L the selector bit comes
-    // from the caller's triangle mask, and mask[r] has r < m <= 64 bits set.
+    // Visibility: pos < L is unconditional; above L the bit comes from causal_mask[row].
     if (t0 + KT > L) {
       const unsigned long long al = msm[lrl];
       const unsigned long long ah = msm[lrh];
@@ -512,7 +451,7 @@ __device__ __forceinline__ void phase1_body(
       }
     }
 
-    // ---- online softmax (per row; quad reductions) ----
+    // Online softmax per row; quad reductions.
     float pn[4][4];                                   // P fp32 before bf16 pack
     float rmax[2] = {-3.0e38f, -3.0e38f};
 #pragma unroll
@@ -550,7 +489,7 @@ __device__ __forceinline__ void phase1_body(
       }
     }
 
-    // ---- CP2: V(t) landed; stage K(t+1) into the just-consumed K tile ----
+    // CP2: V(t) landed; stage K(t+1) into the consumed K tile.
     cp_wait0();                                       // V(t) landed
     __syncthreads();                                  // V(t) visible; K(t) consumed
     if (t + 1 < ntiles) {
@@ -558,7 +497,7 @@ __device__ __forceinline__ void phase1_body(
       cp_commit();                                    // K(t+1) flies during PV
     }
 
-    // ---- O += P * V : P bf16 repack, then 2 k16 x NSLICE n8 mma ----
+    // O += P * V: P bf16 repack, then 2 k16 x NSLICE n8 mma.
     unsigned pa[2][4];
 #pragma unroll
     for (int kk = 0; kk < 2; ++kk) {                  // k16 = pos [kk*16, +16)
@@ -581,7 +520,7 @@ __device__ __forceinline__ void phase1_body(
     }
   }
 
-  // ---- one partial per owned pair; dead rows never write ----
+  // One partial per owned pair; dead rows never write.
   const size_t part0 = (size_t)(kv * Pmax + part) * (size_t)nrows;
   const bool live_l = pl < nrows && lrl < m;
   const bool live_h = ph < nrows && lrh < m;
@@ -650,11 +589,8 @@ extern "C" __global__ void tcmqa_d256_write_ring(
   cache.v_ring[dst+d]=v[(size_t)r*v_stride+h*DH+d];
 }
 
-// ====================================================== attention phase 2 ====
-// LSE-rescale the Pactive partials of one (local row, q head) into the ungated
-// BF16 core output. ABI §4.1: the sigmoid gate runs outside this module, in the
-// caller's common GateOps.
-//
+// Phase 2: LSE-rescale the Pactive partials of one (local row, q head) into the ungated
+// BF16 core output; the sigmoid gate is applied by the caller.
 // Launch: grid(HQ*seg_rows), block DH (one thread per output dim),
 //         dynamic smem 2*Pactive floats + DH reduction slots.
 __device__ __forceinline__ void phase2_body(
@@ -671,8 +607,7 @@ __device__ __forceinline__ void phase2_body(
   const int prefix = meta[0].x;
   const int rows   = meta[0].y;
   const int m = min(seg_rows, rows - row_base);
-  // Block-uniform (lrow and m are the same for every thread), so the barriers
-  // below are reached by all threads or by none.
+  // Block-uniform; precedes every barrier.
   if (m <= 0 || lrow >= m) return;
   const int L = prefix + row_base;
   const int Pactive = (L + m + key_chunk - 1) / key_chunk;
@@ -702,7 +637,7 @@ __device__ __forceinline__ void phase2_body(
     __syncthreads();
   }
   const float Mx = red[0];
-  __syncthreads();   // every thread has consumed red[0] before red[] is reused
+  __syncthreads();   // all threads have read red[0] before red[] is reused
 
   float pv = 0.0f;
   for (int h = tid; h < Pactive; h += DH) pv += sl_[h] * __expf(sm_[h] - Mx);
@@ -713,7 +648,7 @@ __device__ __forceinline__ void phase2_body(
     __syncthreads();
   }
   const float lse = red[0];   // sum_h l_h * exp(m_h - Mx)
-  __syncthreads();            // same barrier before red[] is reused
+  __syncthreads();            // all threads have read red[0] before red[] is reused
 
   const int d = tid;          // blockDim.x == DH
   float acc = 0.0f;

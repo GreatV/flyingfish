@@ -1,21 +1,15 @@
-// Qwen3.8 vision attention: MHA 16 x 72, non-causal, per-image blocks, BF16.
-//
-// Reference geometry (transformers 5.10.2, modeling_qwen3_5.py:905-985):
-// 16 Q heads = 16 KV heads, head_dim 72, scaling head_dim**-0.5, is_causal = False,
-// no mask, no dropout, no softcap, no Q/K norm. Sequences are per image, taken
+// Vision attention: MHA 16 x 72, non-causal, per-image blocks, BF16.
+// Model definition geometry: 16 Q heads = 16 KV heads, head_dim 72, scaling head_dim**-0.5,
+// non-causal, no mask, no dropout, no softcap, no Q/K norm. Sequences are per image, taken
 // from cu_seqlens; a key outside its own image block carries no weight.
-//
-// D = 72 = 9 x 8: QK^T runs 9 k8 steps (mma.m16n8k8) and P*V runs 9 n8 slices,
-// so neither operand needs padding lanes. The smem row stride is 144 B = 36
-// words, which puts the 8 rows of an ldmatrix on 8 distinct bank groups
-// (36r mod 32 = 4r), i.e. conflict-free without padding.
-//
-// Layouts (both owned by the producers, not by this kernel):
-//   q, k, v  head-major   [head][row][72]   -- K/V tiles are contiguous copies
-//   o        token-major  [row][head][72]   -- what the following projection needs
-//
-// Launch: grid(ceil(max_block_rows / MT), HQ, nblocks), block 128 (4 warps),
-//         static smem 28160 B. One CTA owns MT query rows of one head.
+// D = 72 = 9 x 8: QK^T runs 9 k8 steps (mma.m16n8k8) and P*V runs 9 n8 slices. The smem row
+// stride is 144 B = 36 words; the 8 rows of an ldmatrix fall on 8 distinct bank groups
+// (36r mod 32 = 4r).
+// Layouts:
+//   q, k, v  head-major   [head][row][72]
+//   o        token-major  [row][head][72]
+// Launch: grid(ceil(max_block_rows / MT), HQ, nblocks), block NW*32,
+//         static smem (MT + 2*KT)*LDS*2 B. One CTA owns MT query rows of one head.
 #include <cuda_bf16.h>
 #include <math_constants.h>
 #include <stdint.h>
@@ -30,23 +24,12 @@ constexpr int D   = 72;            // head_dim
 constexpr int LDS = D;             // smem row stride in elements (144 B)
 constexpr int KS  = D / 8;         // 9 QK k8 steps
 constexpr int NS  = D / 8;         // 9 P*V n8 dim slices
-// fp32 nearest to 72**-0.5 (the double is 0.11785113019775792). A named constant
-// so the value is one line, not an expression re-derived per build.
+// fp32 nearest to 72**-0.5.
 constexpr float SCALE = 0.11785113066434860f;
 
 static_assert(D % 8 == 0, "D must be a multiple of 8 (k8 QK steps, n8 PV slices)");
 static_assert(LDS % 8 == 0, "row stride must stay 16B-aligned for ldmatrix/cp.async");
 
-// The tile is a compile-time parameter of the body, not a runtime value: one
-// instantiation per (query rows, key tile, warps). Q tile, K tile and V tile
-// only -- the row statistics stay in registers.
-//
-// The three instantiations below are the ones Q38_VISION_DESIGN.md §11.3 argues
-// about; its arithmetic intensity (AI = MT) is a prediction and the A4000 timing
-// is what decides. The tall tiles get a launch-bounds minimum of 1: at 256 or 512
-// threads, asking for 2 CTAs would cap registers at 65536/(NT*2) and spill.
-
-// --------------------------------------------------------------- helpers ----
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
   return (unsigned)__cvta_generic_to_shared(p);
 }
@@ -91,15 +74,12 @@ __device__ __forceinline__ void cp16(void* dst, const void* src, int sz) {
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
 __device__ __forceinline__ void cp_wait0() { asm volatile("cp.async.wait_group 0;\n"); }
 
-// The only visibility bound on this path: a key past its image block has no
-// weight. There is no causal structure and no caller-supplied mask.
+// A key is visible iff it lies inside its image block.
 __device__ __forceinline__ bool vision_key_visible(int q_local, int k_local, int n) {
   return k_local < n;
 }
 
-// ----------------------------------------------------------------- guards ---
-// Device-side geometry checks. The host plan owns the shape arithmetic; these
-// trap on a launch that would otherwise write outside the block's rows.
+// Device-side geometry checks; trap on a launch that would write outside the block's rows.
 template <int KT>
 __device__ __forceinline__ void guard_geometry(const int* cu, const int* kb, int nblocks) {
   if (nblocks <= 0) __trap();
@@ -107,7 +87,7 @@ __device__ __forceinline__ void guard_geometry(const int* cu, const int* kb, int
   for (int b = 0; b < nblocks; ++b) {
     const int n = cu[b + 1] - cu[b];
     const int klen = kb[b + 1] - kb[b];
-    if (n <= 0) __trap();                       // an empty block has no l to divide by
+    if (n <= 0) __trap();                       // blocks are non-empty
     if (klen < n) __trap();                     // K/V must cover the block
     if (klen > n + KT - 1) __trap();            // and be padded by less than one tile
     if (klen % KT != 0) __trap();               // tiles are whole
@@ -115,7 +95,6 @@ __device__ __forceinline__ void guard_geometry(const int* cu, const int* kb, int
   }
 }
 
-// -------------------------------------------------------------- the kernel ---
 template <int MT, int KT, int NW>
 __device__ __forceinline__ void vision_attn_body(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
@@ -149,7 +128,7 @@ __device__ __forceinline__ void vision_attn_body(
   bf16* ksm = qsm + MT * LDS;
   bf16* vtm = ksm + KT * LDS;
 
-  // ---- Q tile: rows [qr0, qr0 + MT) of this head, zero-filled past the block ----
+  // Q tile: rows [qr0, qr0 + MT) of this head, zero-filled past the block.
   for (int idx = tid; idx < MT * (LDS / 8); idx += NT) {
     const int r = idx / (LDS / 8), c = idx % (LDS / 8);
     uint4 val = make_uint4(0u, 0u, 0u, 0u);
@@ -167,8 +146,8 @@ __device__ __forceinline__ void vision_attn_body(
     ldsm_x2(qa[kk], qsm + rq * LDS + kk * 8);
   }
 
-  // Per-lane rows: the m16n8 C fragment puts row (lane>>2) in / lane>>2 + 8 in
-  // elements 0,1 / 2,3. Both halves carry their own row max and row sum.
+  // Per-lane rows: the m16n8 C fragment holds row lane>>2 in elements 0,1 and row
+  // (lane>>2) + 8 in elements 2,3; each half carries its own row max and row sum.
   const int rl = warp * 16 + (lane >> 2);
   const int rh = rl + 8;
   const int ql = qt * MT + rl;                 // block-local query rows
@@ -182,9 +161,8 @@ __device__ __forceinline__ void vision_attn_body(
   float mx[2] = {-3.0e38f, -3.0e38f};          // finite sentinel: never NaN
   float ls[2] = {0.0f, 0.0f};
 
-  // ---- sweep the block's keys in KT tiles ----
-  // K(t) is staged, then V(t) during the S mma and softmax, then K(t+1) during
-  // the P*V mma: one buffer each, refilled only after its consumer is done.
+  // Sweep the block's keys in KT tiles: K(t), then V(t) during the S mma and softmax, then
+  // K(t+1) during the P*V mma; one buffer each.
   const int ntiles = (n + KT - 1) / KT;
   auto stage = [&](const bf16* src, int t, bf16* dst) {
     const int t0 = t * KT;
@@ -210,7 +188,7 @@ __device__ __forceinline__ void vision_attn_body(
     stage(v, t, vtm);
     cp_commit();                                   // V(t) flies during S + softmax
 
-    // ---- S = Q @ K^T: 8 key n8 tiles x 9 k8 steps ----
+    // S = Q @ K^T: SN key n8 tiles x KS k8 steps.
     float sf[SN][4];
 #pragma unroll
     for (int n8 = 0; n8 < SN; ++n8)
@@ -232,7 +210,7 @@ __device__ __forceinline__ void vision_attn_body(
 #pragma unroll
       for (int j = 0; j < 4; ++j) sf[n8][j] *= SCALE;
 
-    // ---- visibility: no key past the block's extent ----
+    // Visibility: no key past the block's extent.
 #pragma unroll
     for (int n8 = 0; n8 < SN; ++n8) {
 #pragma unroll
@@ -243,7 +221,7 @@ __device__ __forceinline__ void vision_attn_body(
       }
     }
 
-    // ---- online softmax, one row half per reduction ----
+    // Online softmax, one row half per reduction.
     float pn[SN][4];
     float rmax[2] = {-3.0e38f, -3.0e38f};
 #pragma unroll
@@ -284,7 +262,7 @@ __device__ __forceinline__ void vision_attn_body(
     __syncthreads();                               // V(t) visible; K(t) consumed
     if (t + 1 < ntiles) { stage(k, t + 1, ksm); cp_commit(); }
 
-    // ---- O += P @ V: 4 k16 steps x 9 dim slices; P is rounded to bf16 here ----
+    // O += P @ V: VN k16 steps x NS dim slices; P is rounded to bf16.
     for (int s = 0; s < VN; ++s) {
       unsigned pa[4];
       pa[0] = pack_bf16x2(pn[s * 2 + 0][0], pn[s * 2 + 0][1]);
@@ -294,8 +272,7 @@ __device__ __forceinline__ void vision_attn_body(
 #pragma unroll
       for (int nd = 0; nd < NS; ++nd) {
         unsigned vb[2];
-        // B is k16(key) x n8(dim) on V[key][dim]: rows are keys, so the operand
-        // needs the transposed load. mat0 lanes 0-7: key s*16 + lane&7;
+        // B is k16(key) x n8(dim) on V[key][dim], transposed load. mat0 lanes 0-7: key s*16 + lane&7;
         // mat1 lanes 8-15: key s*16 + 8 + lane&7.
         ldsm_x2_t(vb, vtm + (s * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * LDS + nd * 8);
         mma_16816(acc[nd], pa, vb);
@@ -303,7 +280,7 @@ __device__ __forceinline__ void vision_attn_body(
     }
   }
 
-  // ---- write out: one bf16 row per (row, head), token-major ----
+  // Write out: one bf16 row per (row, head), token-major.
   const bool live_l = rl < m_rows;
   const bool live_h = rh < m_rows;
   const float inv_l = live_l ? 1.0f / ls[0] : 0.0f;
@@ -322,8 +299,6 @@ __device__ __forceinline__ void vision_attn_body(
 
 }  // namespace vision_attn
 
-// Three instantiations of the same source. `vision_attn_kernel` keeps its name
-// because it is the one already landed in kernels/; the tall tiles are new.
 #define VISION_ATTN_ENTRY(NAME, MT, KT, NW, MINB)                          \
   extern "C" __global__ void __launch_bounds__((NW) * 32, MINB) NAME(       \
       const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, \
@@ -336,20 +311,10 @@ __device__ __forceinline__ void vision_attn_body(
     vision_attn::vision_attn_body<MT, KT, NW>(q, k, v, o, cu_seqlens, k_bases, nblocks); \
   }
 
-// The tile constants, named once. The instantiations below and the host-visible
-// table are both built from them, so the driver's K/V padding and the manifest's
-// k_t come from the same source as the kernel that consumes them. A copy on the
-// host side once said 64 where m256's template said 32; the device guard trapped
-// it, and this removes the possibility rather than relying on the guard.
+// Tile constants shared by the instantiation and the host-visible tile table.
 constexpr int TILE_M64_ROWS = 64, TILE_M64_KEYS = 64, TILE_M64_WARPS = 4, TILE_M64_MINB = 2;
 
-// Row order is the tile order the driver's selector and the harness use.
-//
-// ONE tile. The 128- and 256-row instantiations were built, verified and measured
-// (P1V_STATUS §9.1): the tall tiles were never faster, and at small n they were up
-// to 60% slower, because their better arithmetic intensity did not pay for dropping
-// from 3 CTAs/SM to 1. The template parameterisation stays, so a tall tile can come
-// back the moment a held-clock measurement shows a large-n win worth having.
+// Row order is the tile order of the driver's selector.
 extern "C" const char* const kVisionTileNames[1] = {"m64"};
 extern "C" const int kVisionTileSpec[1][3] = {
     {TILE_M64_ROWS, TILE_M64_KEYS, TILE_M64_WARPS},
