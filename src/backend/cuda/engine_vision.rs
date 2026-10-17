@@ -2529,8 +2529,30 @@ mod tests {
     struct MergedInput {
         ids: Vec<u32>,
         modalities: Vec<u8>,
-        pixels: Vec<f32>,
+        /// Per-image packs `[channels, side, patches*side]`, merged per (c, ky) stripe before use.
+        pixel_packs: Vec<(usize, Vec<f32>)>,
         grids: Vec<ImageGrid>,
+    }
+
+    /// Interleaves NaViT packs along the patch axis: for every (channel, ky) row, each pack's columns
+    /// follow in order, matching the official processor's multi-image layout.
+    fn merge_pixel_packs(packs: &[(usize, Vec<f32>)], channels: usize, side: usize) -> Vec<f32> {
+        let total: usize = packs.iter().map(|(patches, _)| *patches).sum();
+        let mut merged = vec![0f32; channels * side * total * side];
+        for c in 0..channels {
+            for ky in 0..side {
+                let row = c * side + ky;
+                let mut column = 0usize;
+                for (patches, pixels) in packs {
+                    let source = row * patches * side;
+                    let span = patches * side;
+                    merged[row * total * side + column..][..span]
+                        .copy_from_slice(&pixels[source..source + span]);
+                    column += span;
+                }
+            }
+        }
+        merged
     }
 
     const MINICPM_TAPS: [&str; 5] = [
@@ -2704,6 +2726,10 @@ mod tests {
         let mut verdict: BTreeMap<String, (f64, f64, bool)> = BTreeMap::new();
         let mut merged_input: Option<MergedInput> = None;
         let mut merged_expected: Vec<(&str, usize)> = Vec::new();
+        let vision = model
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
         for case in ["image_hockey_16x", "image_boat_16x"] {
             let file = std::fs::File::open(fixtures.join(format!("{case}.safetensors")))?;
             let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
@@ -2789,18 +2815,27 @@ mod tests {
                 );
                 standalone.insert(format!("{case}/{tap}"), candidate);
             }
+            let patches: usize = grids.iter().map(|g| (g.h * g.w) as usize).sum();
+            ensure!(
+                pixels.len()
+                    == vision.channels as usize
+                        * vision.patch as usize
+                        * patches
+                        * vision.patch as usize,
+                "fixture pixel extent"
+            );
             match merged_input.as_mut() {
                 Some(merged) => {
                     merged.ids.extend_from_slice(&ids);
                     merged.modalities.extend_from_slice(&modalities);
-                    merged.pixels.extend_from_slice(&pixels);
+                    merged.pixel_packs.push((patches, pixels));
                     merged.grids.extend_from_slice(&grids);
                 }
                 None => {
                     merged_input = Some(MergedInput {
                         ids,
                         modalities,
-                        pixels,
+                        pixel_packs: vec![(patches, pixels)],
                         grids,
                     });
                 }
@@ -2810,10 +2845,19 @@ mod tests {
         // Two-image reach control: independent per-crop segments must reproduce each standalone
         // merger block and the two blocks must not be byte-identical.
         let merged = merged_input.context("merged input missing")?;
+        let vision_config = model
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        let merged_pixels = merge_pixel_packs(
+            &merged.pixel_packs,
+            vision_config.channels as usize,
+            vision_config.patch as usize,
+        );
         let input = MultimodalInput {
             input_ids: &merged.ids,
             modality_ids: &merged.modalities,
-            pixel_values: &merged.pixels,
+            pixel_values: &merged_pixels,
             grids: &merged.grids,
         };
         let request = runtime.prepare(&device, &mut blas, &input, merged.ids.len())?;
