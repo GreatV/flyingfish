@@ -4,10 +4,13 @@ use crate::vision_input::{ImageGrid, MultimodalInput};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DECODED_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_SOURCE_PIXELS: usize = 4 * 16_777_216;
+static VIDEO_SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct RgbImage {
     pub width: usize,
@@ -41,6 +44,13 @@ impl VideoMetadata {
         );
         Ok(())
     }
+}
+
+/// Decoded video container: RGB frames in decode order, their presentation timestamps and metadata.
+pub struct DecodedVideo {
+    pub frames: Vec<RgbImage>,
+    pub metadata: VideoMetadata,
+    pub timestamps: Vec<f64>,
 }
 
 /// Python `round(value, 1)`: the nearest double to the one-decimal value.
@@ -1382,6 +1392,301 @@ fn load_encoded(url: &str) -> Result<(Vec<u8>, String)> {
     Ok((bytes, mime))
 }
 
+/// Decodes one MP4 data URL through the system ffprobe and ffmpeg.
+pub fn load_video(url: &str) -> Result<DecodedVideo> {
+    decode_video(&load_encoded_video(url)?)
+}
+
+fn load_encoded_video(url: &str) -> Result<Vec<u8>> {
+    ensure!(
+        url.starts_with("data:"),
+        "video URL must be a base64 data URL"
+    );
+    let (header, data) = url.split_once(',').context("invalid video data URL")?;
+    let mime = header
+        .strip_prefix("data:")
+        .and_then(|h| h.strip_suffix(";base64"))
+        .context("video data URL must use base64")?;
+    ensure!(mime == "video/mp4", "only MP4 video URLs are supported");
+    ensure!(
+        data.len() <= MAX_ENCODED_BYTES * 4 / 3 + 4,
+        "encoded video exceeds byte limit"
+    );
+    base64::decode(data).context("video data URL is not valid base64")
+}
+
+/// Decodes one MP4 container: ffprobe metadata and timestamps, ffmpeg rgb24 frames over a pipe.
+pub fn decode_video(bytes: &[u8]) -> Result<DecodedVideo> {
+    ensure!(!bytes.is_empty(), "empty video container");
+    ensure!(
+        bytes.len() <= MAX_ENCODED_BYTES,
+        "encoded video exceeds byte limit"
+    );
+    let source = ScratchVideo::write(bytes)?;
+    let path = source
+        .path()
+        .to_str()
+        .context("video scratch path is not UTF-8")?;
+    let probe = tool_stdout(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate,nb_frames,duration",
+            "-show_entries",
+            "frame=pts_time",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            path,
+        ],
+    )?;
+    let probed = parse_probe(&probe)?;
+    let frame_bytes = (probed.width as usize)
+        .checked_mul(probed.height as usize)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .context("video frame byte count overflow")?;
+    let expected = probed
+        .frames
+        .checked_mul(frame_bytes)
+        .context("decoded video byte count overflow")?;
+    ensure!(
+        expected <= MAX_DECODED_VIDEO_BYTES,
+        "decoded video is {expected} bytes over the {MAX_DECODED_VIDEO_BYTES}-byte limit"
+    );
+    let raw = tool_stdout(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-noautorotate",
+            "-i",
+            path,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ],
+    )?;
+    ensure!(
+        raw.len() == expected,
+        "ffmpeg decoded {} bytes; ffprobe metadata expects {expected} for {} frames of {}x{}",
+        raw.len(),
+        probed.frames,
+        probed.width,
+        probed.height
+    );
+    let frames = raw
+        .chunks_exact(frame_bytes)
+        .map(|pixels| RgbImage {
+            width: probed.width as usize,
+            height: probed.height as usize,
+            pixels: pixels.to_vec(),
+        })
+        .collect();
+    Ok(DecodedVideo {
+        frames,
+        metadata: VideoMetadata {
+            total_num_frames: probed.frames,
+            fps: probed.fps,
+            duration: probed.duration,
+        },
+        timestamps: probed.timestamps,
+    })
+}
+
+fn tool_stdout(tool: &str, args: &[&str]) -> Result<Vec<u8>> {
+    let output = std::process::Command::new(tool)
+        .args(args)
+        .output()
+        .with_context(|| format!("run {tool}"))?;
+    ensure!(
+        output.status.success(),
+        "{tool} failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+
+struct ScratchVideo {
+    path: PathBuf,
+}
+
+impl ScratchVideo {
+    fn write(bytes: &[u8]) -> Result<Self> {
+        use std::io::Write;
+        let directory = std::env::temp_dir();
+        for _ in 0..8 {
+            let counter = VIDEO_SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!(
+                "flyingfish-video-{}-{counter}.mp4",
+                std::process::id()
+            ));
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("create video scratch file {}", path.display()));
+                }
+            };
+            if let Err(error) = file.write_all(bytes) {
+                let _ = std::fs::remove_file(&path);
+                return Err(error)
+                    .with_context(|| format!("write video scratch file {}", path.display()));
+            }
+            return Ok(Self { path });
+        }
+        bail!(
+            "could not create a video scratch file in {}",
+            directory.display()
+        )
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchVideo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Deserialize)]
+struct ProbeReport {
+    #[serde(default)]
+    streams: Vec<ProbeStream>,
+    #[serde(default)]
+    frames: Vec<ProbeFrame>,
+    #[serde(default)]
+    format: Option<ProbeFormat>,
+}
+
+#[derive(Deserialize)]
+struct ProbeStream {
+    width: Option<u32>,
+    height: Option<u32>,
+    avg_frame_rate: Option<String>,
+    nb_frames: Option<String>,
+    duration: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProbeFrame {
+    pts_time: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProbeFormat {
+    duration: Option<String>,
+}
+
+#[derive(Debug)]
+struct ProbedVideo {
+    width: u32,
+    height: u32,
+    fps: f64,
+    duration: f64,
+    frames: usize,
+    timestamps: Vec<f64>,
+}
+
+fn parse_probe(bytes: &[u8]) -> Result<ProbedVideo> {
+    let report: ProbeReport = serde_json::from_slice(bytes).context("parse ffprobe JSON")?;
+    let stream = report
+        .streams
+        .first()
+        .context("ffprobe reported no video stream")?;
+    let width = stream.width.context("ffprobe reported no video width")?;
+    let height = stream.height.context("ffprobe reported no video height")?;
+    ensure!(
+        width > 0 && height > 0,
+        "ffprobe reported a zero frame dimension"
+    );
+    let rate = stream
+        .avg_frame_rate
+        .as_deref()
+        .context("ffprobe reported no average frame rate")?;
+    let (numerator, denominator) = rate
+        .split_once('/')
+        .with_context(|| format!("ffprobe average frame rate {rate} is not a fraction"))?;
+    let numerator: f64 = numerator
+        .parse()
+        .with_context(|| format!("ffprobe average frame rate {rate} numerator"))?;
+    let denominator: f64 = denominator
+        .parse()
+        .with_context(|| format!("ffprobe average frame rate {rate} denominator"))?;
+    let fps = numerator / denominator;
+    ensure!(
+        fps.is_finite() && fps > 0.0,
+        "ffprobe average frame rate {rate} is not positive"
+    );
+    let duration = match stream.duration.as_deref().or(report
+        .format
+        .as_ref()
+        .and_then(|format| format.duration.as_deref()))
+    {
+        Some(duration) => duration
+            .parse::<f64>()
+            .context("parse ffprobe video duration")?,
+        None => bail!("ffprobe reported no video duration"),
+    };
+    ensure!(
+        duration.is_finite() && duration > 0.0,
+        "ffprobe video duration {duration} is not positive"
+    );
+    let mut timestamps = Vec::with_capacity(report.frames.len());
+    for (index, frame) in report.frames.iter().enumerate() {
+        let text = frame
+            .pts_time
+            .as_deref()
+            .with_context(|| format!("ffprobe reported no timestamp for frame {index}"))?;
+        let timestamp: f64 = text
+            .parse()
+            .with_context(|| format!("parse ffprobe timestamp {text} of frame {index}"))?;
+        ensure!(
+            timestamp.is_finite(),
+            "ffprobe timestamp of frame {index} is not finite"
+        );
+        if let Some(previous) = timestamps.last() {
+            ensure!(
+                timestamp >= *previous,
+                "ffprobe timestamp of frame {index} decreases"
+            );
+        }
+        timestamps.push(timestamp);
+    }
+    ensure!(!timestamps.is_empty(), "ffprobe reported no video frames");
+    if let Some(count) = stream.nb_frames.as_deref() {
+        let count: usize = count.parse().context("parse ffprobe frame count")?;
+        ensure!(
+            count == timestamps.len(),
+            "ffprobe reports {count} frames but {} frame timestamps",
+            timestamps.len()
+        );
+    }
+    Ok(ProbedVideo {
+        width,
+        height,
+        fps,
+        duration,
+        frames: timestamps.len(),
+        timestamps,
+    })
+}
+
 enum ImageFormat {
     Png,
     Jpeg,
@@ -1946,6 +2251,177 @@ mod tests {
             fps: 1.0,
             duration: count as f64,
         }
+    }
+
+    #[test]
+    fn ffprobe_metadata_parses_rate_duration_and_timestamps() -> Result<()> {
+        let report = serde_json::json!({
+            "streams": [{"width": 64, "height": 48, "avg_frame_rate": "30000/1001",
+                         "nb_frames": "3", "duration": "0.100100"}],
+            "frames": [{"pts_time": "0.000000"}, {"pts_time": "0.033367"},
+                       {"pts_time": "0.066733"}],
+            "format": {"duration": "0.100100"},
+        });
+        let probed = parse_probe(&serde_json::to_vec(&report)?)?;
+        assert_eq!((probed.width, probed.height), (64, 48));
+        assert!((probed.fps - 30000.0 / 1001.0).abs() < 1e-12);
+        assert!((probed.duration - 0.1001).abs() < 1e-12);
+        assert_eq!(probed.frames, 3);
+        assert_eq!(probed.timestamps, [0.0, 0.033367, 0.066733]);
+        let mut container = report.clone();
+        assert!(
+            container["streams"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("duration")
+                .is_some()
+        );
+        let probed = parse_probe(&serde_json::to_vec(&container)?)?;
+        assert!((probed.duration - 0.1001).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn ffprobe_metadata_rejects_missing_or_inconsistent_fields() -> Result<()> {
+        let valid = serde_json::json!({
+            "streams": [{"width": 64, "height": 48, "avg_frame_rate": "10/1",
+                         "nb_frames": "3", "duration": "0.300000"}],
+            "frames": [{"pts_time": "0.000000"}, {"pts_time": "0.100000"},
+                       {"pts_time": "0.200000"}],
+            "format": {"duration": "0.300000"},
+        });
+        let error = |value: serde_json::Value| -> Result<String> {
+            match parse_probe(&serde_json::to_vec(&value)?) {
+                Ok(_) => bail!("probe report must fail"),
+                Err(error) => Ok(error.to_string()),
+            }
+        };
+        let mut value = valid.clone();
+        value["streams"] = serde_json::json!([]);
+        assert!(error(value)?.contains("no video stream"));
+        let mut value = valid.clone();
+        assert!(
+            value["streams"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("width")
+                .is_some()
+        );
+        assert!(error(value)?.contains("no video width"));
+        let mut value = valid.clone();
+        value["streams"][0]["height"] = serde_json::json!(0);
+        assert!(error(value)?.contains("zero frame dimension"));
+        let mut value = valid.clone();
+        assert!(
+            value["streams"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("avg_frame_rate")
+                .is_some()
+        );
+        assert!(error(value)?.contains("no average frame rate"));
+        let mut value = valid.clone();
+        value["streams"][0]["avg_frame_rate"] = serde_json::json!("0/0");
+        assert!(error(value)?.contains("not positive"));
+        let mut value = valid.clone();
+        value["streams"][0]["avg_frame_rate"] = serde_json::json!("10");
+        assert!(error(value)?.contains("not a fraction"));
+        let mut value = valid.clone();
+        assert!(
+            value["streams"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("duration")
+                .is_some()
+        );
+        value["format"] = serde_json::json!({});
+        assert!(error(value)?.contains("no video duration"));
+        let mut value = valid.clone();
+        value["streams"][0]["duration"] = serde_json::json!("-1.0");
+        assert!(error(value)?.contains("not positive"));
+        let mut value = valid.clone();
+        value["streams"][0]["nb_frames"] = serde_json::json!("4");
+        assert!(error(value)?.contains("reports 4 frames but 3"));
+        let mut value = valid.clone();
+        value["frames"][2]["pts_time"] = serde_json::json!("0.050000");
+        assert!(error(value)?.contains("decreases"));
+        let mut value = valid.clone();
+        value["frames"][1] = serde_json::json!({});
+        assert!(error(value)?.contains("no timestamp for frame 1"));
+        let mut value = valid.clone();
+        value["frames"] = serde_json::json!([]);
+        assert!(error(value)?.contains("no video frames"));
+        Ok(())
+    }
+
+    #[test]
+    fn video_data_urls_require_mp4_base64() {
+        for url in [
+            "https://example.com/video.mp4",
+            "file:///etc/passwd",
+            "data:video/webm;base64,AAAA",
+            "data:video/mp4,AAAA",
+            "data:video/mp4;base64,!!!!",
+        ] {
+            assert!(load_video(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_decoding_uses_ffprobe_metadata_and_ffmpeg_frames() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("ff-video-clip-{}.mp4", std::process::id()));
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=10:duration=1.5",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&path)
+            .status()
+            .context("run ffmpeg to build the test clip")?;
+        assert!(status.success());
+        let bytes = std::fs::read(&path)?;
+        std::fs::remove_file(&path)?;
+        let video = decode_video(&bytes)?;
+        assert_eq!(video.frames.len(), 15);
+        assert_eq!(video.metadata.total_num_frames, 15);
+        assert!((video.metadata.fps - 10.0).abs() < 1e-6);
+        assert!((video.metadata.duration - 1.5).abs() < 1e-3);
+        assert_eq!(video.timestamps.len(), 15);
+        assert!(video.timestamps[0].abs() < 1e-6);
+        assert!((video.timestamps[14] - 1.4).abs() < 1e-6);
+        assert_eq!((video.frames[0].width, video.frames[0].height), (64, 48));
+        assert_eq!(video.frames[0].pixels.len(), 64 * 48 * 3);
+        let processor = video_processor()?;
+        let options = VideoOptions {
+            max_num_frames: 4,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let packed = processor.prepare_video(&video.frames, &video.metadata, &options)?;
+        assert_eq!(packed.frames.len(), 2);
+        assert_eq!(processor.video_tokens(&packed)?, 126);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_decoding_errors_name_the_failing_tool() -> Result<()> {
+        let error = match decode_video(b"not a video container") {
+            Ok(_) => bail!("invalid container must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("ffprobe"), "{error}");
+        Ok(())
     }
 
     #[test]
