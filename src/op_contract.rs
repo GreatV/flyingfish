@@ -179,44 +179,6 @@ pub enum ExecutionPhase {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct MixerSpec {
-    pub attention: FullAttentionSpec,
-    pub gdn: GdnSpec,
-    pub hidden: u32,
-    pub q_width: u32,
-    pub kv_width: u32,
-    pub conv_width: u32,
-    pub value_width: u32,
-}
-
-impl MixerSpec {
-    pub fn from_model(spec: &crate::model_spec::ModelSpec) -> Result<Self> {
-        ensure!(
-            spec.hidden > 0 && spec.hidden <= i32::MAX as u32,
-            "unsupported mixer hidden width {}",
-            spec.hidden
-        );
-        let attention = FullAttentionSpec::from_model(spec)?;
-        let gdn = GdnSpec::from_model(spec)?;
-        Ok(Self {
-            attention,
-            gdn,
-            hidden: spec.hidden,
-            q_width: spec.q_width,
-            kv_width: attention
-                .hkv
-                .checked_mul(attention.d)
-                .context("KV width overflow")?,
-            conv_width: gdn.conv_dim()?,
-            value_width: gdn
-                .hv
-                .checked_mul(gdn.dv)
-                .context("GDN value width overflow")?,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct GdnSpec {
     pub hk: u32,
     pub hv: u32,
@@ -343,29 +305,24 @@ mod tests {
             "/tests/data/q38-config.json"
         )))?;
         let mut model = crate::model_spec::ModelSpec::qwen(&root, &serde_json::Value::Null)?;
-        let original = MixerSpec::from_model(&model)?;
+        let original = GdnSpec::from_model(&model)?;
         let work = crate::work_layout::RowWorkSpec::new(&model)?;
         assert_eq!((work.projection, work.mixer, work.ab), (14336, 6144, 96));
-        assert_eq!(original.gdn.state_bytes()?, 48 * 128 * 128 * 4);
+        assert_eq!(original.state_bytes()?, 48 * 128 * 128 * 4);
         model.hidden = 2048;
         model.q_heads = 16;
         model.kv_heads = 2;
         model.q_width = 4096;
         model.gdn.as_mut().unwrap().value_heads = 32;
-        let changed = MixerSpec::from_model(&model)?;
+        let changed = GdnSpec::from_model(&model)?;
+        let attention = FullAttentionSpec::from_model(&model)?;
         let work = crate::work_layout::RowWorkSpec::new(&model)?;
         assert_eq!((work.projection, work.mixer, work.ab), (9216, 4096, 64));
-        assert_eq!(changed.gdn.state_bytes()?, 32 * 128 * 128 * 4);
-        assert_eq!(changed.gdn.history_bytes()?, 8192 * 3 * 4);
+        assert_eq!(changed.state_bytes()?, 32 * 128 * 128 * 4);
+        assert_eq!(changed.history_bytes()?, 8192 * 3 * 4);
         assert_eq!(
-            (
-                changed.hidden,
-                changed.q_width,
-                changed.kv_width,
-                changed.conv_width,
-                changed.value_width
-            ),
-            (2048, 4096, 512, 8192, 4096)
+            (attention.hq, attention.hkv, changed.conv_dim()?),
+            (16, 2, 8192)
         );
         assert_eq!(
             model.architecture,

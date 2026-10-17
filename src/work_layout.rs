@@ -1,7 +1,7 @@
 //! Shared row-work geometry; excludes weights, persistent state and operator scratch.
 use crate::{
     model_spec::{Architecture, ModelSpec},
-    op_contract::MixerSpec,
+    op_contract::{FullAttentionSpec, GdnSpec},
 };
 use anyhow::{Context, Result};
 #[derive(Clone, Copy, Debug)]
@@ -30,9 +30,9 @@ impl RowWorkSpec {
                 0,
             ),
             Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
-                let geometry = MixerSpec::from_model(spec)?;
-                let g = geometry.gdn;
-                let gqkv = geometry.conv_width as usize;
+                FullAttentionSpec::from_model(spec)?;
+                let g = GdnSpec::from_model(spec)?;
+                let gqkv = g.conv_dim()? as usize;
                 let full = q
                     .checked_mul(2)
                     .and_then(|n| n.checked_add(2 * kv))
