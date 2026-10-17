@@ -148,6 +148,16 @@ impl WorkspaceBudget {
         workspace: impl Fn(usize) -> Result<usize>,
         select: impl FnOnce(usize) -> Result<usize>,
     ) -> Result<Self> {
+        Self::with_reserve(request, request.total / 16, 1, workspace, select)
+    }
+
+    fn with_reserve(
+        request: WorkspaceRequest,
+        reserve: usize,
+        minimum_rows: usize,
+        workspace: impl Fn(usize) -> Result<usize>,
+        select: impl FnOnce(usize) -> Result<usize>,
+    ) -> Result<Self> {
         let WorkspaceRequest {
             capacity,
             requested,
@@ -161,18 +171,26 @@ impl WorkspaceBudget {
             capacity > 0 && alignment > 0 && row_bytes > 0 && free_after_resident <= total,
             "invalid workspace budget"
         );
-        let reserve = total / 16;
-        let available = free_after_resident
-            .checked_sub(reserve)
-            .context("VRAM reserve exceeds free memory")?;
+        ensure!(
+            minimum_rows > 0 && minimum_rows <= capacity,
+            "workspace row floor {minimum_rows} outside capacity {capacity}"
+        );
+        let available = free_after_resident.checked_sub(reserve).with_context(|| {
+            format!("VRAM reserve {reserve} exceeds free memory {free_after_resident}")
+        })?;
         let bytes = |rows: usize| -> Result<usize> {
             let operator_bytes = workspace(rows)?;
-            rows.checked_mul(row_bytes)
+            rows.max(minimum_rows)
+                .checked_mul(row_bytes)
                 .and_then(|v| v.checked_add(fixed_transient_bytes))
                 .and_then(|v| v.checked_add(operator_bytes))
                 .context("workspace byte count overflow")
         };
-        ensure!(bytes(1)? <= available, "workspace cannot fit one row");
+        let one_row = bytes(1)?;
+        ensure!(
+            one_row <= available,
+            "workspace cannot fit one row: required={one_row} available={available} row_bytes={row_bytes} fixed_bytes={fixed_transient_bytes}"
+        );
         let (mut low, mut high) = (1usize, capacity);
         while low < high {
             let mid = low + (high - low).div_ceil(2);
@@ -219,6 +237,128 @@ impl WorkspaceBudget {
             operator_workspace_bytes: scratch,
             planned_transient_bytes: bytes(chunk)?,
             accounting: "free_after_resident",
+        })
+    }
+}
+
+/// Candidate row domains and measured resources before expert-slot allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct ExpertWorkspaceRequest {
+    pub mixer: WorkspaceRequest,
+    pub span_rows: u32,
+    pub wave_rows: u32,
+    pub wave_workspace_bytes: usize,
+    pub device_headroom_bytes: usize,
+    /// CPU/disk scratch, pinned staging, runtime state and measured host headroom.
+    pub host_fixed_bytes: u64,
+    pub prefill_staging_slots: u32,
+    pub disk_ring_slots: u32,
+}
+
+#[derive(Debug)]
+pub struct ExpertWorkspaceBudget {
+    pub mixer: WorkspaceBudget,
+    pub workspace_rows: usize,
+    pub reserves: crate::experts::plan::Reserves,
+}
+
+impl ExpertWorkspaceBudget {
+    pub fn new(
+        request: ExpertWorkspaceRequest,
+        geometry: crate::experts::catalogue::ExpertGeometry,
+        mixer_workspace: impl Fn(usize) -> Result<usize>,
+        select: impl FnOnce(usize) -> Result<usize>,
+    ) -> Result<Self> {
+        use crate::experts::plan::Reserves;
+        let ExpertWorkspaceRequest {
+            mut mixer,
+            span_rows,
+            wave_rows,
+            wave_workspace_bytes,
+            device_headroom_bytes,
+            host_fixed_bytes,
+            prefill_staging_slots,
+            disk_ring_slots,
+        } = request;
+        ensure!(
+            mixer.free_after_resident <= mixer.total,
+            "expert free-after-resident bytes {} exceed total bytes {}",
+            mixer.free_after_resident,
+            mixer.total
+        );
+        ensure!(
+            geometry.layers > 0
+                && geometry.experts > 0
+                && geometry.hidden > 0
+                && geometry.intermediate > 0
+                && geometry.top_k > 0
+                && geometry.top_k <= geometry.experts,
+            "invalid expert workspace geometry: {geometry:?}"
+        );
+        ensure!(
+            span_rows > 0 && span_rows as usize <= mixer.capacity,
+            "expert span rows {span_rows} outside capacity {}",
+            mixer.capacity
+        );
+        ensure!(
+            wave_rows > 0 && wave_rows <= span_rows,
+            "expert wave rows {wave_rows} outside span {span_rows}"
+        );
+        let hidden_bytes = u64::from(geometry.hidden) * 2;
+        let choices = u64::from(geometry.top_k);
+        let mut reserves = Reserves {
+            device_fixed_bytes: 0,
+            host_fixed_bytes,
+            residual_row_bytes: hidden_bytes,
+            normalized_row_bytes: hidden_bytes,
+            contribution_row_bytes: hidden_bytes
+                .checked_mul(choices)
+                .context("expert contribution row overflow")?,
+            done_row_bytes: choices * size_of::<u32>() as u64,
+            // ids i32, weights BF16, active u32, assignment generation u64.
+            route_row_bytes: choices
+                * (size_of::<i32>() + size_of::<half::bf16>() + size_of::<u32>() + size_of::<u64>())
+                    as u64,
+            prefill_staging_slots,
+            disk_ring_slots,
+        };
+        let span_and_staging = usize::try_from(reserves.device_bytes(&geometry, span_rows)?)?;
+        let minimum_experts = u64::from(geometry.layers)
+            .checked_mul(geometry.slot_bytes()?)
+            .context("minimum expert capacity overflow")?;
+        let withheld = span_and_staging
+            .checked_add(usize::try_from(minimum_experts)?)
+            .context("expert workspace reservation overflow")?;
+        mixer.free_after_resident = mixer.free_after_resident.checked_sub(withheld).with_context(|| {
+            format!(
+                "expert span/staging {span_and_staging} plus minimum slots {minimum_experts} exceed free bytes {}",
+                mixer.free_after_resident
+            )
+        })?;
+        mixer.capacity = span_rows as usize;
+        let mixer = WorkspaceBudget::with_reserve(
+            mixer,
+            device_headroom_bytes,
+            wave_rows as usize,
+            |rows| Ok(mixer_workspace(rows)?.max(wave_workspace_bytes)),
+            select,
+        )
+        .with_context(|| {
+            format!(
+                "expert mixer/wave admission failed: span_rows={span_rows} wave_rows={wave_rows} span_staging_bytes={span_and_staging} minimum_expert_bytes={minimum_experts} headroom_bytes={device_headroom_bytes}"
+            )
+        })?;
+        let workspace_rows = mixer.plan.chunk.max(wave_rows as usize);
+        reserves.device_fixed_bytes = u64::try_from(
+            mixer
+                .planned_transient_bytes
+                .checked_add(device_headroom_bytes)
+                .context("expert fixed reserve overflow")?,
+        )?;
+        Ok(Self {
+            mixer,
+            workspace_rows,
+            reserves,
         })
     }
 }
@@ -300,6 +440,156 @@ mod admission_tests {
         assert!(WorkspaceBudget::new(request(8192, Some(0), 160_000), |r| Ok(8 * r), Ok).is_err());
         assert!(WorkspaceBudget::new(request(0, None, 160_000), |r| Ok(8 * r), Ok).is_err());
         assert!(WorkspaceBudget::new(request(8192, None, 1), |r| Ok(8 * r), Ok).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn expert_span_destinations_and_wave_floor_precede_cache_capacity() -> Result<()> {
+        use crate::experts::{
+            catalogue::ExpertGeometry,
+            plan::{PlanInputs, ServiceCell, ServiceTable, capacity},
+        };
+        let model = crate::model_spec::ModelSpec::minicpm(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/minicpm-config.json"
+            )))?,
+            &serde_json::json!({"eos_token_id": [248044, 248046]}),
+        )?;
+        let geometry = ExpertGeometry::from_model(&model)?;
+        let row_bytes = crate::work_layout::RowWorkSpec::new(&model)?.row_bytes()?;
+        let request = ExpertWorkspaceRequest {
+            mixer: WorkspaceRequest {
+                capacity: 65_536,
+                requested: Some(37),
+                free_after_resident: 24 << 30,
+                total: 24 << 30,
+                alignment: 32,
+                row_bytes,
+                fixed_transient_bytes: 8192,
+            },
+            span_rows: 65_536,
+            wave_rows: 71,
+            wave_workspace_bytes: 71 * 937,
+            device_headroom_bytes: 4096,
+            host_fixed_bytes: 16384,
+            prefill_staging_slots: 2,
+            disk_ring_slots: 3,
+        };
+        let budget = ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 257), Ok)?;
+        assert_eq!(budget.mixer.plan.chunk, 37);
+        assert_eq!(budget.workspace_rows, 71);
+        assert_eq!(budget.mixer.operator_workspace_bytes, 71 * 937);
+        assert_eq!(budget.reserves.residual_row_bytes, 4096);
+        assert_eq!(budget.reserves.normalized_row_bytes, 4096);
+        assert_eq!(budget.reserves.contribution_row_bytes, 32768);
+        assert_eq!(budget.reserves.done_row_bytes, 32);
+        assert_eq!(budget.reserves.route_row_bytes, 144);
+        let fixed = 8192 + 71 * row_bytes + 71 * 937 + 4096;
+        assert_eq!(budget.reserves.device_fixed_bytes, fixed as u64);
+        assert_eq!(
+            budget.reserves.device_bytes(&geometry, request.span_rows)?,
+            fixed as u64 + 65_536 * 41136 + 2 * 6_291_456
+        );
+        assert_eq!(
+            budget.reserves.host_bytes(&geometry)?,
+            16384 + 3 * 6_291_456
+        );
+        let service = ServiceTable::new(
+            "fixture",
+            vec![ServiceCell {
+                workers: 1,
+                rows: 1,
+                experts: 8,
+                seconds: 0.001,
+            }],
+        )?;
+        let inputs = PlanInputs {
+            geometry,
+            device_free_bytes: request.mixer.free_after_resident as u64,
+            host_available_bytes: 48 << 30,
+            h2d_bytes_per_second: 19e9,
+            d2h_bytes_per_second: 20e9,
+            copy_engines: 2,
+            disk_readers: 1,
+            service: &service,
+            reserves: &budget.reserves,
+            span_rows: request.span_rows,
+            wave_rows: request.wave_rows,
+        };
+        let capacity = capacity(&inputs, 5)?;
+        let slots: u64 = capacity.slots_per_layer.iter().map(|&n| u64::from(n)).sum();
+        assert_eq!(capacity.spare_blocks, 5);
+        assert_eq!(capacity.span_rows, 65_536);
+        assert_eq!(capacity.wave_rows, 71);
+        let remaining = inputs.device_free_bytes
+            - budget.reserves.device_bytes(&geometry, request.span_rows)?;
+        assert_eq!(slots, remaining / geometry.slot_bytes()?);
+        assert!(slots * geometry.slot_bytes()? + (fixed as u64) < inputs.device_free_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn expert_workspace_exact_boundary_preserves_minimum_slots_and_headroom() -> Result<()> {
+        use crate::experts::catalogue::ExpertGeometry;
+        let geometry = ExpertGeometry {
+            layers: 2,
+            experts: 8,
+            hidden: 16,
+            intermediate: 8,
+            top_k: 2,
+        };
+        let mut request = ExpertWorkspaceRequest {
+            mixer: WorkspaceRequest {
+                capacity: 16,
+                requested: Some(3),
+                free_after_resident: 1 << 20,
+                total: 1 << 20,
+                alignment: 1,
+                row_bytes: 128,
+                fixed_transient_bytes: 1024,
+            },
+            span_rows: 16,
+            wave_rows: 5,
+            wave_workspace_bytes: 2048,
+            device_headroom_bytes: 4096,
+            host_fixed_bytes: 512,
+            prefill_staging_slots: 2,
+            disk_ring_slots: 1,
+        };
+        let budget = ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok)?;
+        let exact = budget.reserves.device_bytes(&geometry, request.span_rows)?
+            + u64::from(geometry.layers) * geometry.slot_bytes()?;
+        request.mixer.free_after_resident = usize::try_from(exact)?;
+        let admitted = ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok)?;
+        assert_eq!(admitted.workspace_rows, 5);
+        assert_eq!(admitted.mixer.operator_workspace_bytes, 2048);
+        assert_eq!(
+            admitted
+                .reserves
+                .device_bytes(&geometry, request.span_rows)?
+                + u64::from(geometry.layers) * geometry.slot_bytes()?,
+            exact
+        );
+        request.mixer.free_after_resident -= 1;
+        assert!(ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok).is_err());
+        request.mixer.free_after_resident = 1 << 20;
+        request.wave_rows = 17;
+        assert!(ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok).is_err());
+        request.wave_rows = 5;
+        request.mixer.requested = Some(17);
+        assert!(ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok).is_err());
+        request.mixer.requested = Some(3);
+        request.mixer.free_after_resident = request.mixer.total + 1;
+        assert!(ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok).is_err());
+        request.mixer.free_after_resident = request.mixer.total;
+        let oversized = ExpertGeometry {
+            hidden: u32::MAX,
+            experts: u32::MAX,
+            top_k: u32::MAX,
+            ..geometry
+        };
+        assert!(ExpertWorkspaceBudget::new(request, oversized, |r| Ok(r * 13), Ok).is_err());
         Ok(())
     }
 }
