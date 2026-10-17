@@ -278,6 +278,15 @@ fn g9_shared_layer_program_preserves_llama_order_and_types_qwen() {
             LayerStage::Mixer(Mixer::FullAttention) => {
                 flattened.extend(LLAMA_MIXER.iter().map(std::mem::discriminant))
             }
+            LayerStage::Ffn => flattened.extend(
+                [
+                    flyingfish::backend::Operator::GateUp,
+                    flyingfish::backend::Operator::Activate,
+                    flyingfish::backend::Operator::Down,
+                ]
+                .iter()
+                .map(std::mem::discriminant),
+            ),
             _ => panic!("unexpected GDN mixer on full layer"),
         }
     }

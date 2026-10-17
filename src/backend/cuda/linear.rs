@@ -219,7 +219,82 @@ pub(crate) struct LayerLinearPlan {
     projections: std::collections::BTreeMap<String, BoundProjection>,
     materialize: Vec<(Tensor<u8, 2>, Tensor<bf16, 2>, TensorMut<bf16, 2>)>,
 }
+
+#[derive(Debug)]
+pub(crate) enum BoundFfn {
+    Dense,
+    Moe {
+        router: Tensor<bf16, 2>,
+        shared: [Tensor<bf16, 2>; 3],
+        shared_gate: Tensor<bf16, 1>,
+    },
+}
+
+impl BoundFfn {
+    pub fn bind(spec: &crate::model_spec::ModelSpec, linear: &mut LayerLinearPlan) -> Result<Self> {
+        let Some(moe) = spec.moe else {
+            return Ok(Self::Dense);
+        };
+        ensure!(
+            spec.linear_format == crate::model_spec::LinearFormat::Bf16,
+            "MoE FFN requires BF16 weights: linear_format={:?}",
+            spec.linear_format
+        );
+        let h = spec.hidden;
+        let i = moe.shared_intermediate;
+        let router = linear.take_bf16("mlp.gate.weight", [moe.experts, h])?;
+        let shared = [
+            linear.take_bf16("mlp.shared_expert.gate_proj.weight", [i, h])?,
+            linear.take_bf16("mlp.shared_expert.up_proj.weight", [i, h])?,
+            linear.take_bf16("mlp.shared_expert.down_proj.weight", [h, i])?,
+        ];
+        let gate = linear.take_bf16("mlp.shared_expert_gate.weight", [1, h])?;
+        let shared_gate = unsafe { Tensor::new(gate.ptr, [h], [1], gate.span_bytes)? };
+        Ok(Self::Moe {
+            router,
+            shared,
+            shared_gate,
+        })
+    }
+
+    pub fn prepare(&self, blas: &super::blas::Blas, rows: u32) -> Result<()> {
+        match self {
+            Self::Dense => Ok(()),
+            Self::Moe {
+                shared,
+                shared_gate,
+                ..
+            } => {
+                shared_gate.validate()?;
+                for weight in shared {
+                    blas.prepare_fixed(rows, weight.shape[0], weight.shape[1])?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl LayerLinearPlan {
+    fn take_bf16(&mut self, role: &str, expected: [u32; 2]) -> Result<Tensor<bf16, 2>> {
+        let projection = self
+            .projections
+            .remove(role)
+            .with_context(|| format!("FFN projection not bound: role={role}"))?;
+        let LinearWeightRef::Bf16(weight) = projection.resident else {
+            anyhow::bail!(
+                "FFN projection format mismatch: role={role} format=Fp8E4m3Block128 expected=Bf16"
+            );
+        };
+        ensure!(
+            weight.shape == expected && weight.stride == [u64::from(expected[1]), 1],
+            "FFN projection layout mismatch: role={role} shape={:?} stride={:?} expected={expected:?}",
+            weight.shape,
+            weight.stride
+        );
+        Ok(weight)
+    }
+
     pub fn bind(
         plan: &crate::linear_plan::LayerDequantPlan,
         catalog: &WeightCatalog,
@@ -319,6 +394,75 @@ mod tests {
     use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
     use crate::op_contract::ExecutionPhase;
     use std::{path::PathBuf, rc::Rc};
+
+    #[test]
+    fn moe_ffn_binding_uses_native_router_and_shared_layouts() -> Result<()> {
+        let spec = crate::model_spec::ModelSpec::minicpm(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/minicpm-config.json"
+            )))?,
+            &serde_json::json!({"eos_token_id": [248044, 248046]}),
+        )?;
+        let shapes = [
+            ("mlp.gate.weight", [256, 2048]),
+            ("mlp.shared_expert.gate_proj.weight", [512, 2048]),
+            ("mlp.shared_expert.up_proj.weight", [512, 2048]),
+            ("mlp.shared_expert.down_proj.weight", [2048, 512]),
+            ("mlp.shared_expert_gate.weight", [1, 2048]),
+        ];
+        for wrong in std::iter::once(None).chain((0..shapes.len()).map(Some)) {
+            let mut linear = LayerLinearPlan {
+                projections: std::collections::BTreeMap::new(),
+                materialize: Vec::new(),
+            };
+            let mut ptr = 0x1000u64;
+            for (index, (role, mut shape)) in shapes.iter().copied().enumerate() {
+                if wrong == Some(index) {
+                    shape[1] /= 2;
+                }
+                let bytes = u64::from(shape[0]) * u64::from(shape[1]) * 2;
+                let weight = unsafe { Tensor::new(ptr, shape, [u64::from(shape[1]), 1], bytes)? };
+                linear.projections.insert(
+                    role.into(),
+                    BoundProjection {
+                        resident: LinearWeightRef::Bf16(weight),
+                        prefill: weight,
+                    },
+                );
+                ptr += bytes;
+            }
+            let bound = BoundFfn::bind(&spec, &mut linear);
+            if let Some(index) = wrong {
+                ensure!(
+                    bound.is_err(),
+                    "accepted wrong FFN layout: projection={index}"
+                );
+            } else {
+                let BoundFfn::Moe {
+                    router,
+                    shared,
+                    shared_gate,
+                } = bound?
+                else {
+                    anyhow::bail!("MoE layer selected the dense FFN plan");
+                };
+                assert_eq!(router.shape, [256, 2048]);
+                assert_eq!(
+                    shared.map(|weight| weight.shape),
+                    [[512, 2048], [512, 2048], [2048, 512]]
+                );
+                assert_eq!(shared_gate.shape, [2048]);
+                assert_eq!(shared[0].ptr, router.ptr + router.span_bytes);
+                assert_eq!(shared[1].ptr, shared[0].ptr + shared[0].span_bytes);
+                assert_eq!(shared[2].ptr, shared[1].ptr + shared[1].span_bytes);
+                assert_eq!(shared_gate.ptr, shared[2].ptr + shared[2].span_bytes);
+                assert!(linear.projections.is_empty());
+                assert!(linear.materialize.is_empty());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "coordinator-granted GPU window and FF_Q38_PROBE_DIR required"]

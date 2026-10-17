@@ -29,7 +29,15 @@ pub struct Weights {
     pub bytes: usize,
 }
 
-use crate::checkpoint::{Index, MappedCheckpoint, TensorManifest};
+use crate::checkpoint::{Index, MappedCheckpoint, TensorEntry, TensorManifest};
+
+fn upload_entry(entry: &TensorEntry) -> bool {
+    entry.load
+        && !matches!(
+            entry.role.as_str(),
+            "mlp.experts.gate_up_proj" | "mlp.experts.down_proj"
+        )
+}
 
 pub(crate) struct Loader<'a> {
     source: &'a MappedCheckpoint,
@@ -467,11 +475,31 @@ impl WeightCatalog {
         let started = std::time::Instant::now();
         let mapped = MappedCheckpoint::open(dir)?;
         let manifest = mapped.manifest(spec, policy)?;
+        let upload_bytes = manifest
+            .entries
+            .values()
+            .filter(|entry| upload_entry(entry))
+            .try_fold(0usize, |sum, entry| {
+                sum.checked_add(entry.bytes)
+                    .context("resident upload byte count overflow")
+            })?;
+        ensure!(
+            !hash_uploads || upload_bytes == manifest.resident_bytes,
+            "prefix-cache identity does not cover deferred expert bytes: uploaded={upload_bytes} selected={}",
+            manifest.resident_bytes
+        );
         let ((tensors, bytes), upload_digest) =
             checkpoint_mapped(&mapped, d, Some(&manifest), hash_uploads, |loader| {
                 let mut tensors = BTreeMap::new();
                 for (name, entry) in &manifest.entries {
                     if !entry.load {
+                        continue;
+                    }
+                    if !upload_entry(entry) {
+                        ensure!(
+                            loader.seen.insert(name.clone()),
+                            "expert tensor delegated twice: name={name}"
+                        );
                         continue;
                     }
                     let value = match entry.dtype {
@@ -486,8 +514,9 @@ impl WeightCatalog {
                 Ok((tensors, loader.bytes))
             })?;
         ensure!(
-            bytes == manifest.resident_bytes,
-            "resident/upload byte count mismatch"
+            bytes == upload_bytes,
+            "resident/upload byte count mismatch: uploaded={bytes} planned={upload_bytes} selected={}",
+            manifest.resident_bytes
         );
         Ok(Self {
             tensors,
@@ -512,6 +541,49 @@ mod tests {
     use half::bf16;
     use sha2::{Digest, Sha256};
 
+    #[test]
+    fn expert_upload_partition_preserves_other_three_dimensional_weights() {
+        let entries = [
+            ("mlp.experts.gate_up_proj", vec![2, 4, 4], true),
+            ("mlp.experts.down_proj", vec![2, 4, 2], true),
+            ("linear_attn.conv1d.weight", vec![4, 1, 4], true),
+            ("mlp.gate.weight", vec![2, 4], true),
+            ("vision.projection.weight", vec![4, 4], false),
+        ]
+        .map(|(role, shape, load)| TensorEntry {
+            dtype: Dtype::BF16,
+            bytes: shape.iter().product::<usize>() * 2,
+            shape,
+            shard: "native.safetensors".into(),
+            load,
+            data_start: 0,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: Some(0),
+            role: role.into(),
+            scale_name: None,
+        });
+        let uploaded = entries
+            .iter()
+            .filter(|entry| upload_entry(entry))
+            .collect::<Vec<_>>();
+        assert_eq!(uploaded.iter().map(|entry| entry.bytes).sum::<usize>(), 48);
+        assert_eq!(
+            uploaded
+                .iter()
+                .map(|entry| entry.role.as_str())
+                .collect::<Vec<_>>(),
+            ["linear_attn.conv1d.weight", "mlp.gate.weight"]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.load && !upload_entry(entry))
+                .map(|entry| entry.bytes)
+                .sum::<usize>(),
+            96
+        );
+    }
     #[test]
     fn checkpoint_bytes_preserve_bf16_bits() {
         let bits = [0u16, 0x8000, 0x0001, 0x3f80, 0xbf80, 0x7f80, 0xff80, 0x7fc1];

@@ -5,7 +5,7 @@ use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
     gdn::{CUDA_GRID_YZ_MAX, GdnBindings, GdnOps, GdnPlan},
-    linear::{LayerLinearPlan, LinearWeightRef},
+    linear::{BoundFfn, LayerLinearPlan, LinearWeightRef},
     ops::{CommonOpsRef, GatedRmsInput, ResidualRmsCapture, ResidualRmsInput, RmsMode, RmsOptions},
     weights::WeightCatalog,
 };
@@ -134,6 +134,7 @@ pub(super) struct Runtime {
 }
 struct Layer {
     linear: LayerLinearPlan,
+    ffn: BoundFfn,
     input_norm: Tensor<bf16, 1>,
     post_norm: Tensor<bf16, 1>,
     mixer: BoundMixer,
@@ -369,7 +370,8 @@ impl Runtime {
                 engine.model_spec.linear_format,
             )?;
             let arena_view = arena.as_ref().map(|b| scratch(b, s));
-            let linear = LayerLinearPlan::bind(&plan, &catalog, arena_view.as_ref(), s)?;
+            let mut linear = LayerLinearPlan::bind(&plan, &catalog, arena_view.as_ref(), s)?;
+            let ffn = BoundFfn::bind(&engine.model_spec, &mut linear)?;
             let mixer = match layout.mixer {
                 Mixer::FullAttention => {
                     let kv = &engine.state.kv[layout.state_index as usize];
@@ -595,6 +597,7 @@ impl Runtime {
             };
             layers.push(Layer {
                 linear,
+                ffn,
                 input_norm: weight("input_layernorm.weight")?,
                 post_norm: weight("post_attention_layernorm.weight")?,
                 mixer,
@@ -648,6 +651,7 @@ impl Runtime {
         }
         for layer in &mut self.layers {
             layer.linear.prepare(blas, rows)?;
+            layer.ffn.prepare(blas, rows)?;
         }
         blas.prepare_fixed(1, vocab, hidden)?;
         self.prepared.insert(rows);
@@ -921,7 +925,12 @@ impl Engine {
         model_spec: crate::model_spec::ModelSpec,
     ) -> Result<Self> {
         require_qwen35_geometry(&model_spec)?;
-        ensure!(model_spec.moe.is_none(), "MoE FFN execution is not bound");
+        ensure!(
+            model_spec.moe.is_none(),
+            "MoE FFN execution is not bound: missing=expert residency architecture={:?} moe={:?}",
+            model_spec.architecture,
+            model_spec.moe
+        );
         let write = !matches!(mode, super::SetupMode::Ready);
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
         let verify_rows = match mode {
@@ -1539,6 +1548,32 @@ impl Engine {
         }
         Ok(())
     }
+    pub(super) fn run_ffn(
+        &mut self,
+        layer: usize,
+        step: crate::backend::Step<'_>,
+        trace: &mut Option<Target<'_>>,
+    ) -> Result<()> {
+        if let Some(runtime) = &self.qwen {
+            match &runtime.layers[layer].ffn {
+                BoundFfn::Dense => {}
+                BoundFfn::Moe { router, .. } => anyhow::bail!(
+                    "MoE expert residency is not bound: layer={layer} experts={} hidden={}",
+                    router.shape[0],
+                    router.shape[1]
+                ),
+            }
+        }
+        for op in [
+            crate::backend::Operator::GateUp,
+            crate::backend::Operator::Activate,
+            crate::backend::Operator::Down,
+        ] {
+            self.run_operator(op, layer, step, trace)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn qwen_operator(
         &mut self,
         op: crate::backend::Operator,

@@ -1427,6 +1427,7 @@ impl Engine {
                 crate::model::LayerStage::Mixer(mixer) => {
                     self.run_mixer(mixer, layer, step, trace)?
                 }
+                crate::model::LayerStage::Ffn => self.run_ffn(layer, step, trace)?,
             }
         }
         #[cfg(test)]
