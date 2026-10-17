@@ -1,4 +1,5 @@
-//! Host expert block arena with per-block read leases and writer claims.
+//! Native device-slot layout and host expert blocks with read leases and writer claims.
+use crate::experts::{catalogue::ExpertGeometry, plan::Capacity};
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::ops::Range;
@@ -101,7 +102,16 @@ impl HostBlocks {
         let elements = usize::try_from(blocks)?
             .checked_mul(block_elements)
             .context("host arena extent overflow")?;
-        let data: Box<[bf16]> = vec![bf16::ZERO; elements].into_boxed_slice();
+        let bytes = elements
+            .checked_mul(std::mem::size_of::<bf16>())
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .context("host arena byte extent overflow")?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(elements).with_context(|| {
+            format!("allocate host expert arena: blocks={blocks} bytes={bytes}")
+        })?;
+        data.resize(elements, bf16::ZERO);
+        let data: Box<[bf16]> = data.into_boxed_slice();
         let base = Box::into_raw(data) as *mut bf16;
         Ok(Arc::new(Self {
             base,
@@ -195,9 +205,246 @@ impl HostBlocks {
     }
 }
 
+/// Native expert slots in rank-major, layer-minor order, followed by persistent staging.
+pub struct SlotLayout {
+    geometry: ExpertGeometry,
+    slots: Vec<Vec<Range<usize>>>,
+    resident_bytes: usize,
+    staging_slots: u32,
+    host_blocks: u32,
+}
+
+impl SlotLayout {
+    pub fn new(geometry: ExpertGeometry, capacity: &Capacity) -> Result<Self> {
+        ensure!(
+            geometry.layers > 0
+                && geometry.experts > 0
+                && geometry.hidden > 0
+                && geometry.intermediate > 0
+                && geometry.top_k > 0
+                && geometry.top_k <= geometry.experts,
+            "invalid slot geometry {geometry:?}"
+        );
+        let slot_bytes = usize::try_from(geometry.slot_bytes()?)?;
+        ensure!(
+            slot_bytes.is_multiple_of(16) && geometry.gate_up_bytes()?.is_multiple_of(16),
+            "native slot alignment: slot_bytes={slot_bytes} gate_up_bytes={}",
+            geometry.gate_up_bytes()?
+        );
+        ensure!(
+            capacity.slots_per_layer.len() == geometry.layers as usize,
+            "slot layout layer count {} differs from {}",
+            capacity.slots_per_layer.len(),
+            geometry.layers
+        );
+        let resident_count = capacity
+            .slots_per_layer
+            .iter()
+            .try_fold(0u64, |n, &count| {
+                n.checked_add(u64::from(count))
+                    .context("resident slot count overflow")
+            })?;
+        let resident_extent = resident_count
+            .checked_mul(slot_bytes as u64)
+            .filter(|&n| n <= isize::MAX as u64)
+            .context("resident expert arena overflow")?;
+        ensure!(
+            resident_extent <= capacity.device_expert_bytes,
+            "resident expert arena bytes={resident_extent} exceed budget={}",
+            capacity.device_expert_bytes
+        );
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(geometry.layers as usize)?;
+        for (layer, &count) in capacity.slots_per_layer.iter().enumerate() {
+            ensure!(
+                count > 0 && count <= geometry.experts,
+                "slot layout layer={layer} slots={count} experts={}",
+                geometry.experts
+            );
+            let mut layer_slots = Vec::new();
+            layer_slots.try_reserve_exact(count as usize)?;
+            slots.push(layer_slots);
+        }
+        let mut resident_bytes = 0usize;
+        for rank in 0..capacity.slots_per_layer.iter().copied().max().unwrap_or(0) {
+            for (layer, &count) in capacity.slots_per_layer.iter().enumerate() {
+                if rank < count {
+                    let end = resident_bytes
+                        .checked_add(slot_bytes)
+                        .context("resident expert arena overflow")?;
+                    slots[layer].push(resident_bytes..end);
+                    resident_bytes = end;
+                }
+            }
+        }
+        let host_blocks = capacity
+            .host_blocks
+            .checked_add(capacity.spare_blocks)
+            .context("host data plus spare block count overflow")?;
+        let host_bytes = u64::from(host_blocks)
+            .checked_mul(slot_bytes as u64)
+            .context("host expert arena overflow")?;
+        ensure!(
+            host_bytes <= capacity.host_expert_bytes,
+            "host expert arena bytes={host_bytes} exceed budget={}",
+            capacity.host_expert_bytes
+        );
+        let layout = Self {
+            geometry,
+            slots,
+            resident_bytes,
+            staging_slots: capacity.prefill_staging_slots,
+            host_blocks,
+        };
+        layout.allocation_bytes()?;
+        Ok(layout)
+    }
+
+    pub fn allocation_bytes(&self) -> Result<usize> {
+        usize::try_from(self.geometry.slot_bytes()?)?
+            .checked_mul(self.staging_slots as usize)
+            .and_then(|n| n.checked_add(self.resident_bytes))
+            .filter(|&n| n <= isize::MAX as usize)
+            .context("device expert plus staging arena extent overflow")
+    }
+
+    pub fn geometry(&self) -> ExpertGeometry {
+        self.geometry
+    }
+
+    pub fn host_blocks(&self) -> u32 {
+        self.host_blocks
+    }
+
+    pub fn resident_slot(&self, layer: u32, rank: u32) -> Result<Range<usize>> {
+        self.slots
+            .get(layer as usize)
+            .and_then(|slots| slots.get(rank as usize))
+            .cloned()
+            .with_context(|| format!("native slot outside layout: layer={layer} rank={rank}"))
+    }
+
+    /// Existing ranks of one layer.
+    pub fn slot_count(&self, layer: u32) -> Result<u32> {
+        self.slots
+            .get(layer as usize)
+            .map(|slots| slots.len() as u32)
+            .with_context(|| format!("slot layout layer {layer} outside {}", self.slots.len()))
+    }
+
+    pub fn staging_slot(&self, slot: u32) -> Result<Range<usize>> {
+        ensure!(
+            slot < self.staging_slots,
+            "staging slot={slot} outside count={}",
+            self.staging_slots
+        );
+        let bytes = usize::try_from(self.geometry.slot_bytes()?)?;
+        let start = self.resident_bytes + slot as usize * bytes;
+        Ok(start..start + bytes)
+    }
+
+    /// Borrowed storage excludes persistent staging and retains the first slot of every layer.
+    pub fn borrowed_tail(&self, slots: u32) -> Result<Range<usize>> {
+        let bytes = usize::try_from(self.geometry.slot_bytes()?)?;
+        let count = self.resident_bytes / bytes;
+        ensure!(
+            slots as usize <= count - self.geometry.layers as usize,
+            "borrowed slots={slots} exceed resident count={count} minus layers={}",
+            self.geometry.layers
+        );
+        Ok(self.resident_bytes - slots as usize * bytes..self.resident_bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn slot_capacity(geometry: ExpertGeometry, slots_per_layer: Vec<u32>) -> Result<Capacity> {
+        let bytes = geometry.slot_bytes()?;
+        Ok(Capacity {
+            span_rows: 8,
+            wave_rows: 2,
+            device_expert_bytes: slots_per_layer.iter().map(|&n| u64::from(n)).sum::<u64>() * bytes,
+            host_expert_bytes: 3 * bytes,
+            slots_per_layer,
+            host_blocks: 2,
+            spare_blocks: 1,
+            disk_bytes: 0,
+            worker_count: 1,
+            disk_workers: 0,
+            prefill_staging_slots: 2,
+            pinned: false,
+        })
+    }
+
+    #[test]
+    fn slot_layout_matches_ledger_tail_with_uneven_layers() -> Result<()> {
+        let geometry = ExpertGeometry {
+            layers: 3,
+            experts: 8,
+            hidden: 8,
+            intermediate: 4,
+            top_k: 2,
+        };
+        let capacity = slot_capacity(geometry, vec![3, 2, 2])?;
+        let layout = SlotLayout::new(geometry, &capacity)?;
+        let bytes = geometry.slot_bytes()? as usize;
+        let order = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1), (0, 2)];
+        for (physical, &(layer, rank)) in order.iter().enumerate() {
+            assert_eq!(
+                layout.resident_slot(layer, rank)?,
+                physical * bytes..(physical + 1) * bytes
+            );
+        }
+        assert!(layout.resident_slot(1, 2).is_err());
+        assert_eq!(layout.staging_slot(0)?, 7 * bytes..8 * bytes);
+        assert_eq!(layout.staging_slot(1)?, 8 * bytes..9 * bytes);
+        assert!(layout.staging_slot(2).is_err());
+        assert_eq!(layout.allocation_bytes()?, 9 * bytes);
+        assert_eq!(layout.borrowed_tail(0)?, 7 * bytes..7 * bytes);
+        assert_eq!(layout.borrowed_tail(2)?, 5 * bytes..7 * bytes);
+        assert_eq!(layout.borrowed_tail(4)?, 3 * bytes..7 * bytes);
+        assert!(layout.borrowed_tail(5).is_err());
+        let initial = vec![vec![4, 1, 7], vec![2, 6], vec![5, 0]];
+        let mut ledger = crate::experts::plan::TierLedger::new(layout, 0, &initial)?;
+        let borrowed = ledger.borrow(2)?;
+        assert_eq!(borrowed.experts, vec![(0, 7), (2, 0)]);
+        assert_eq!(borrowed.disk_bytes, 2 * bytes as u64);
+        ledger.check()?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_slot_layout_prices_spares_and_rejects_out_of_bounds_extents() -> Result<()> {
+        let geometry = ExpertGeometry {
+            layers: 40,
+            experts: 256,
+            hidden: 2048,
+            intermediate: 512,
+            top_k: 8,
+        };
+        let mut capacity = slot_capacity(geometry, crate::experts::plan::equal_slots(2701, 40)?)?;
+        let bytes = geometry.slot_bytes()? as usize;
+        assert_eq!(bytes, 6_291_456);
+        assert_eq!(geometry.gate_up_bytes()?, 4_194_304);
+        assert_eq!(geometry.down_bytes()?, 2_097_152);
+        let layout = SlotLayout::new(geometry, &capacity)?;
+        assert_eq!(layout.resident_slot(20, 67)?, 2700 * bytes..2701 * bytes);
+        assert!(layout.resident_slot(21, 67).is_err());
+        assert_eq!(layout.borrowed_tail(429)?, 2272 * bytes..2701 * bytes);
+        assert_eq!(layout.staging_slot(0)?.start, 2701 * bytes);
+        assert_eq!(layout.allocation_bytes()?, 2703 * bytes);
+        capacity.device_expert_bytes -= 1;
+        assert!(SlotLayout::new(geometry, &capacity).is_err());
+        capacity.device_expert_bytes += 1;
+        capacity.host_expert_bytes -= 1;
+        assert!(SlotLayout::new(geometry, &capacity).is_err());
+        capacity.host_expert_bytes += 1;
+        capacity.spare_blocks = u32::MAX;
+        assert!(SlotLayout::new(geometry, &capacity).is_err());
+        assert!(HostBlocks::new(2, usize::MAX / 2).is_err());
+        Ok(())
+    }
 
     /// A read after the lease drops does not compile: `BlockLease::read` borrows the guard.
     #[test]

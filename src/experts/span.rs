@@ -65,6 +65,7 @@ pub fn plan_span(
     let slot_bytes = geometry.slot_bytes()?;
     let copy_seconds = slot_bytes as f64 / rates.h2d_bytes_per_second;
     let workers = rates.service.worker_count()?;
+    let max_rows = rates.service.max_rows();
     let mut resident_experts = Vec::new();
     let mut streamed = Vec::new();
     let mut cpu = Vec::new();
@@ -74,6 +75,15 @@ pub fn plan_span(
         }
         if resident[expert] {
             resident_experts.push(expert as u32);
+            continue;
+        }
+        if rows > max_rows {
+            let at_max = rates.service.rows_time(max_rows, 1, workers)?;
+            ensure!(
+                copy_seconds < at_max,
+                "expert {expert} rows={rows} exceed the measured rows extent ..={max_rows} and the CPU route wins at {max_rows}"
+            );
+            streamed.push(expert as u32);
             continue;
         }
         let cpu_seconds = rates.service.rows_time(rows, 1, workers)?;
@@ -117,24 +127,20 @@ mod tests {
     }
 
     fn table() -> ServiceTable {
-        ServiceTable::new(
-            "test",
-            vec![
-                ServiceCell {
-                    workers: 1,
-                    rows: 1,
-                    experts: 1,
-                    seconds: 0.01,
-                },
-                ServiceCell {
-                    workers: 1,
-                    rows: 2,
-                    experts: 1,
-                    seconds: 0.02,
-                },
-            ],
-        )
-        .unwrap()
+        let mut cells = Vec::new();
+        for workers in [1u32, 2] {
+            for rows in [1u32, 2, 4, 8] {
+                for experts in [1u32, 2] {
+                    cells.push(ServiceCell {
+                        workers,
+                        rows,
+                        experts,
+                        seconds: f64::from(rows) * 0.01 * f64::from(experts) / f64::from(workers),
+                    });
+                }
+            }
+        }
+        ServiceTable::new("test", cells).unwrap()
     }
 
     #[test]
@@ -146,14 +152,14 @@ mod tests {
             service: &table(),
             h2d_bytes_per_second: 1e9,
         };
-        // 192 B at 1 GB/s is 0.192 us; rows=4 costs 40 ms from the 2-row cell scaled linearly.
+        // 192 B at 1 GB/s is 0.192 us, below every measured CPU cell here.
         let plan = plan_span(&geometry, &counts, &resident, 4, 2, 2, &rates).unwrap();
         assert_eq!(plan.resident, vec![0]);
         assert_eq!(plan.staged, vec![vec![1, 2], vec![4, 5]]);
         assert!(plan.cpu.is_empty());
         assert_eq!(plan.streamed_bytes, 4 * 192);
         assert_eq!(plan.waves, 2);
-        // 192 B at 100 B/s is 1.92 s, above every CPU cell here.
+        // 192 B at 100 B/s is 1.92 s, above every measured CPU cell here.
         rates.h2d_bytes_per_second = 100.0;
         let plan = plan_span(&geometry, &counts, &resident, 4, 2, 2, &rates).unwrap();
         assert!(plan.staged.is_empty());
@@ -162,12 +168,40 @@ mod tests {
     }
 
     #[test]
-    fn expert_rows_scale_linearly_above_the_measured_window() {
+    fn expert_rows_interpolate_between_measured_cells() {
         let table = table();
         assert_eq!(table.rows_time(2, 1, 1).unwrap(), 0.02);
-        assert_eq!(table.rows_time(10, 1, 1).unwrap(), 0.1);
+        assert_eq!(table.rows_time(3, 1, 1).unwrap(), 0.03);
+        assert_eq!(table.rows_time(6, 1, 1).unwrap(), 0.06);
+        let error = table.rows_time(16, 1, 1).unwrap_err().to_string();
+        assert!(
+            error.contains("outside the measured rows extent"),
+            "{error}"
+        );
         assert!(table.rows_time(0, 1, 1).is_err());
         assert!(table.rows_time(10, 3, 1).is_err());
+    }
+
+    #[test]
+    fn rows_above_the_measured_window_need_the_gpu_class_to_win_at_the_maximum() {
+        let geometry = geometry();
+        let counts = [0u32, 16, 0, 0, 0, 0, 0, 0];
+        let resident = [false; 8];
+        let fast = SpanRates {
+            service: &table(),
+            h2d_bytes_per_second: 1e9,
+        };
+        let plan = plan_span(&geometry, &counts, &resident, 16, 2, 2, &fast).unwrap();
+        assert_eq!(plan.staged, vec![vec![1]]);
+        assert!(plan.cpu.is_empty());
+        let slow = SpanRates {
+            service: &table(),
+            h2d_bytes_per_second: 100.0,
+        };
+        let error = plan_span(&geometry, &counts, &resident, 16, 2, 2, &slow)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceed the measured rows extent"), "{error}");
     }
 
     #[test]

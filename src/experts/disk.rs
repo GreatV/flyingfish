@@ -1,9 +1,9 @@
-//! Disk tier: bounded aligned native-range reads for disk-owned experts.
-use crate::experts::catalogue::{ExpertCatalogue, ExpertGeometry, ExpertRange};
+//! Disk tier: bounded aligned native-range reads with per-slot completion leases.
+use crate::experts::catalogue::{ExpertCatalogue, ExpertRange};
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -15,6 +15,7 @@ const RING_ALIGN: usize = 4096;
 struct AlignedSlot {
     ptr: NonNull<u8>,
     layout: Layout,
+    leased: bool,
 }
 
 impl AlignedSlot {
@@ -24,7 +25,11 @@ impl AlignedSlot {
         // SAFETY: the layout has a nonzero size and a power-of-two alignment.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })
             .with_context(|| format!("allocate {bytes} B ring slot"))?;
-        Ok(Self { ptr, layout })
+        Ok(Self {
+            ptr,
+            layout,
+            leased: false,
+        })
     }
 }
 
@@ -38,12 +43,15 @@ impl Drop for AlignedSlot {
 /// Read-only disk tier over the native checkpoint shards with a bounded aligned ring.
 pub struct DiskReader {
     shards: BTreeMap<String, File>,
-    geometry: ExpertGeometry,
     per_expert: usize,
     gate_up_bytes: u64,
     ring: Vec<AlignedSlot>,
     next: usize,
 }
+
+// SAFETY: the ring holds a private allocation owned by this reader; moving the reader to one
+// worker thread transfers that ownership.
+unsafe impl Send for DiskReader {}
 
 impl DiskReader {
     pub fn open(catalogue: &ExpertCatalogue, model_dir: &Path, ring_slots: u32) -> Result<Self> {
@@ -52,22 +60,32 @@ impl DiskReader {
         let slot_bytes = usize::try_from(geometry.slot_bytes()?)?;
         let gate_up_bytes = geometry.gate_up_bytes()?;
         let per_expert = slot_bytes / std::mem::size_of::<bf16>();
+        let mut names = BTreeSet::new();
+        for layer in 0..geometry.layers {
+            for expert in 0..geometry.experts {
+                let range = catalogue.range(layer, expert)?;
+                names.insert(range.gate_up.shard.clone());
+                names.insert(range.down.shard.clone());
+            }
+        }
         let mut shards = BTreeMap::new();
+        let mut lengths = BTreeMap::new();
+        for name in names {
+            let file = File::open(model_dir.join(name.as_ref()))
+                .with_context(|| format!("open disk shard {name}"))?;
+            let length = file
+                .metadata()
+                .with_context(|| format!("stat disk shard {name}"))?
+                .len();
+            shards.insert(name.to_string(), file);
+            lengths.insert(name.to_string(), length);
+        }
         for layer in 0..geometry.layers {
             for expert in 0..geometry.experts {
                 let range = catalogue.range(layer, expert)?;
                 for native in [&range.gate_up, &range.down] {
                     let name = native.shard.as_ref();
-                    if !shards.contains_key(name) {
-                        let file = File::open(model_dir.join(name))
-                            .with_context(|| format!("open disk shard {name}"))?;
-                        shards.insert(name.to_owned(), file);
-                    }
-                    let file = &shards[name];
-                    let length = file
-                        .metadata()
-                        .with_context(|| format!("stat disk shard {name}"))?
-                        .len();
+                    let length = lengths[name];
                     let end = native
                         .offset
                         .checked_add(native.len)
@@ -85,7 +103,6 @@ impl DiskReader {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             shards,
-            geometry,
             per_expert,
             gate_up_bytes,
             ring,
@@ -93,19 +110,29 @@ impl DiskReader {
         })
     }
 
-    /// Reads one expert's native gate-up and down ranges into the next ring slot.
+    /// Reads one expert's native ranges into a free ring slot and leases it; release with
+    /// `release` after the consumer is done.
     pub fn read_expert(
         &mut self,
         layer: u32,
         expert: u32,
         catalogue: &ExpertCatalogue,
-    ) -> Result<&[bf16]> {
+    ) -> Result<u32> {
         let range: &ExpertRange = catalogue.range(layer, expert)?;
-        let slot = (self.next + 1) % self.ring.len();
-        self.next = slot;
+        let slots = self.ring.len();
+        let mut chosen = None;
+        for step in 0..slots {
+            let index = (self.next + step) % slots;
+            if !self.ring[index].leased {
+                chosen = Some(index);
+                break;
+            }
+        }
+        let slot = chosen.with_context(|| format!("all {slots} disk ring slots are leased"))?;
+        self.next = (slot + 1) % slots;
         let bytes = self.ring[slot].layout.size();
         let ptr = self.ring[slot].ptr.as_ptr();
-        // SAFETY: the slot owns `bytes` readable and writable bytes with the ring alignment.
+        // SAFETY: the slot owns `bytes` writable bytes with the ring alignment.
         let buffer = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
         let gate = self
             .shards
@@ -123,7 +150,7 @@ impl DiskReader {
                 range.gate_up.shard
             )
         })?;
-        let start = self.gate_up_bytes as usize;
+        let start = usize::try_from(self.gate_up_bytes)?;
         let down = self
             .shards
             .get(range.down.shard.as_ref())
@@ -140,26 +167,31 @@ impl DiskReader {
                 range.down.shard
             )
         })?;
+        self.ring[slot].leased = true;
+        u32::try_from(slot).context("disk ring slot exceeds u32")
+    }
+
+    /// Values of a leased ring slot.
+    pub fn values(&self, slot: u32) -> Result<&[bf16]> {
+        let index = usize::try_from(slot).context("disk ring slot exceeds usize")?;
         ensure!(
-            range.gate_up.len + range.down.len == bytes as u64,
-            "expert {expert} of layer {layer} does not fill one ring slot"
+            index < self.ring.len() && self.ring[index].leased,
+            "disk ring slot {slot} is not leased"
         );
-        // SAFETY: the slot is aligned and holds `per_expert` initialized bf16 values.
+        let ptr = self.ring[index].ptr.as_ptr();
+        // SAFETY: the slot is leased and holds `per_expert` initialized bf16 values.
         Ok(unsafe { std::slice::from_raw_parts(ptr as *const bf16, self.per_expert) })
     }
 
-    /// Ring slot count.
-    pub fn ring_slots(&self) -> u32 {
-        u32::try_from(self.ring.len()).expect("ring count fits u32")
-    }
-
-    /// Next ring cursor, for diagnostics and tests.
-    pub fn cursor(&self) -> usize {
-        self.next
-    }
-
-    pub fn geometry(&self) -> ExpertGeometry {
-        self.geometry
+    /// Releases a leased slot for reuse.
+    pub fn release(&mut self, slot: u32) -> Result<()> {
+        let index = usize::try_from(slot).context("disk ring slot exceeds usize")?;
+        ensure!(
+            index < self.ring.len() && self.ring[index].leased,
+            "disk ring slot {slot} is not leased"
+        );
+        self.ring[index].leased = false;
+        Ok(())
     }
 }
 
@@ -180,11 +212,11 @@ mod tests {
         }
     }
 
-    fn entry(role: &str, shape: Vec<usize>, start: u64, len: u64) -> TensorEntry {
+    fn entry(role: &str, shape: Vec<usize>, shard: &str, start: u64, len: u64) -> TensorEntry {
         TensorEntry {
             dtype: safetensors::Dtype::BF16,
             shape,
-            shard: "shard-0.safetensors".into(),
+            shard: shard.into(),
             bytes: len as usize,
             load: true,
             data_start: 0,
@@ -196,7 +228,7 @@ mod tests {
         }
     }
 
-    fn manifest() -> TensorManifest {
+    fn manifest(gate_shard: &str, down_shard: &str) -> TensorManifest {
         let gate = 4 * 8 * 8 * 2u64;
         let down = 4 * 8 * 4 * 2u64;
         let mut entries = BTreeMap::new();
@@ -204,11 +236,28 @@ mod tests {
             let base = u64::from(layer) * (gate + down);
             entries.insert(
                 format!("model.language_model.layers.{layer}.mlp.experts.gate_up_proj"),
-                entry("mlp.experts.gate_up_proj", vec![4, 8, 8], base, gate),
+                entry(
+                    "mlp.experts.gate_up_proj",
+                    vec![4, 8, 8],
+                    gate_shard,
+                    base,
+                    gate,
+                ),
             );
+            let down_start = if gate_shard == down_shard {
+                base + gate
+            } else {
+                base
+            };
             entries.insert(
                 format!("model.language_model.layers.{layer}.mlp.experts.down_proj"),
-                entry("mlp.experts.down_proj", vec![4, 8, 4], base + gate, down),
+                entry(
+                    "mlp.experts.down_proj",
+                    vec![4, 8, 4],
+                    down_shard,
+                    down_start,
+                    down,
+                ),
             );
         }
         TensorManifest {
@@ -217,9 +266,9 @@ mod tests {
         }
     }
 
-    fn pattern(bytes: usize) -> Vec<u8> {
+    fn pattern(bytes: usize, salt: usize) -> Vec<u8> {
         (0..bytes)
-            .map(|i| ((i * 37 + i / 251) % 256) as u8)
+            .map(|i| ((i * 37 + i / 251 + salt) % 256) as u8)
             .collect()
     }
 
@@ -250,21 +299,25 @@ mod tests {
         Ok(TempDir(dir))
     }
 
-    fn staged() -> Result<(TempDir, ExpertCatalogue, u64)> {
+    fn staged(gate_shard: &str, down_shard: &str) -> Result<(TempDir, ExpertCatalogue)> {
         let dir = temp_dir("ranges")?;
-        let bytes = pattern(1536);
-        std::fs::write(dir.path().join("shard-0.safetensors"), &bytes)?;
-        let catalogue = ExpertCatalogue::from_manifest(&manifest(), geometry())?;
-        Ok((dir, catalogue, 1536))
+        std::fs::write(dir.path().join(gate_shard), pattern(1536, 0))?;
+        if down_shard != gate_shard {
+            std::fs::write(dir.path().join(down_shard), pattern(1536, 91))?;
+        }
+        let catalogue =
+            ExpertCatalogue::from_manifest(&manifest(gate_shard, down_shard), geometry())?;
+        Ok((dir, catalogue))
     }
 
     #[test]
     fn reads_native_ranges_at_the_catalogue_offsets() -> Result<()> {
-        let (dir, catalogue, bytes) = staged()?;
+        let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
+        let pattern = pattern(1536, 0);
         let mut reader = DiskReader::open(&catalogue, dir.path(), 2)?;
-        let pattern = pattern(bytes as usize);
         for (layer, expert) in [(0u32, 0u32), (0, 3), (1, 0), (1, 3)] {
-            let values = reader.read_expert(layer, expert, &catalogue)?;
+            let slot = reader.read_expert(layer, expert, &catalogue)?;
+            let values = reader.values(slot)?;
             assert_eq!(values.len(), 96);
             let layer_base = layer as usize * 768;
             let gate = layer_base + expert as usize * 128;
@@ -281,8 +334,32 @@ mod tests {
                     "layer {layer} expert {expert} element {index}"
                 );
             }
+            reader.release(slot)?;
         }
-        assert_eq!(reader.ring_slots(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn gate_up_and_down_may_live_in_different_shards() -> Result<()> {
+        let (dir, catalogue) = staged("gate.safetensors", "down.safetensors")?;
+        let gate_pattern = pattern(1536, 0);
+        let down_pattern = pattern(1536, 91);
+        let mut reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let slot = reader.read_expert(0, 2, &catalogue)?;
+        let values = reader.values(slot)?;
+        for (index, value) in values.iter().enumerate() {
+            let (pattern, byte) = if index < 64 {
+                (&gate_pattern, 2 * 128 + index * 2)
+            } else {
+                (&down_pattern, 2 * 64 + (index - 64) * 2)
+            };
+            assert_eq!(
+                value.to_bits(),
+                u16::from_le_bytes([pattern[byte], pattern[byte + 1]]),
+                "element {index}"
+            );
+        }
+        reader.release(slot)?;
         Ok(())
     }
 
@@ -290,7 +367,10 @@ mod tests {
     fn a_truncated_shard_names_the_range() -> Result<()> {
         let dir = temp_dir("truncated")?;
         std::fs::write(dir.path().join("shard-0.safetensors"), vec![0u8; 1000])?;
-        let catalogue = ExpertCatalogue::from_manifest(&manifest(), geometry())?;
+        let catalogue = ExpertCatalogue::from_manifest(
+            &manifest("shard-0.safetensors", "shard-0.safetensors"),
+            geometry(),
+        )?;
         let Err(error) = DiskReader::open(&catalogue, dir.path(), 1) else {
             panic!("open succeeded on a truncated shard");
         };
@@ -300,17 +380,26 @@ mod tests {
     }
 
     #[test]
-    fn the_ring_rotates_over_bounded_slots() -> Result<()> {
-        let (dir, catalogue, _) = staged()?;
+    fn ring_slots_are_leased_until_released() -> Result<()> {
+        let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
         let mut reader = DiskReader::open(&catalogue, dir.path(), 2)?;
-        assert_eq!(reader.cursor(), 0);
-        reader.read_expert(0, 0, &catalogue)?;
-        assert_eq!(reader.cursor(), 1);
-        reader.read_expert(0, 1, &catalogue)?;
-        assert_eq!(reader.cursor(), 0);
-        reader.read_expert(1, 2, &catalogue)?;
-        assert_eq!(reader.cursor(), 1);
-        assert_eq!(reader.ring_slots(), 2);
+        let first = reader.read_expert(0, 0, &catalogue)?;
+        let second = reader.read_expert(0, 1, &catalogue)?;
+        assert_ne!(first, second);
+        let Err(error) = reader.read_expert(0, 2, &catalogue) else {
+            panic!("a third read succeeded with every slot leased");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("all 2 disk ring slots are leased"),
+            "{error}"
+        );
+        reader.release(first)?;
+        assert!(reader.values(first).is_err());
+        let third = reader.read_expert(0, 2, &catalogue)?;
+        assert_eq!(third, first);
+        assert!(reader.release(third).is_ok());
+        assert!(reader.release(third).is_err());
         Ok(())
     }
 
@@ -328,27 +417,26 @@ mod tests {
         let gate_up_elements = 2 * geometry.intermediate as usize * geometry.hidden as usize;
         let down_elements = geometry.hidden as usize * geometry.intermediate as usize;
         for (layer, expert) in [(0u32, 0u32), (39, 255)] {
-            let values = reader.read_expert(layer, expert, &catalogue)?;
-            for (name, offset) in [
+            let slot = reader.read_expert(layer, expert, &catalogue)?;
+            let values = reader.values(slot)?.to_vec();
+            for (name, range, offset, elements) in [
                 (
                     format!("model.language_model.layers.{layer}.mlp.experts.gate_up_proj"),
+                    catalogue.range(layer, expert)?.gate_up.clone(),
                     0usize,
+                    gate_up_elements,
                 ),
                 (
                     format!("model.language_model.layers.{layer}.mlp.experts.down_proj"),
+                    catalogue.range(layer, expert)?.down.clone(),
                     gate_up_elements,
+                    down_elements,
                 ),
             ] {
-                let shard = catalogue.range(layer, expert)?.gate_up.shard.clone();
-                let file = std::fs::File::open(dir.join(shard.as_ref()))?;
+                let file = std::fs::File::open(dir.join(range.shard.as_ref()))?;
                 let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
                 let tensors = safetensors::SafeTensors::deserialize(&map)?;
                 let data = tensors.tensor(&name)?.data();
-                let elements = if offset == 0 {
-                    gate_up_elements
-                } else {
-                    down_elements
-                };
                 let start = expert as usize * elements * 2;
                 for index in 0..elements {
                     let value = values[offset + index].to_bits();
@@ -357,6 +445,7 @@ mod tests {
                     assert_eq!(value, expected, "{name} element {index}");
                 }
             }
+            reader.release(slot)?;
         }
         Ok(())
     }
