@@ -147,7 +147,18 @@ pub struct Reserves {
 }
 
 impl Reserves {
-    pub fn device_bytes(&self, geometry: &ExpertGeometry, span_rows: u32) -> Result<u64> {
+    /// Device bytes reserved outside the expert slots: fixed profile plus staging slots.
+    pub fn persistent_bytes(&self, geometry: &ExpertGeometry) -> Result<u64> {
+        let staging = u64::from(self.prefill_staging_slots)
+            .checked_mul(geometry.slot_bytes()?)
+            .context("prefill staging overflow")?;
+        self.device_fixed_bytes
+            .checked_add(staging)
+            .context("device reserve overflow")
+    }
+
+    /// Whole-span buffer bytes for `span_rows`; time-shared with the expert slot arena.
+    pub fn span_bytes(&self, span_rows: u32) -> Result<u64> {
         let per_row = self
             .residual_row_bytes
             .checked_add(self.normalized_row_bytes)
@@ -155,16 +166,9 @@ impl Reserves {
             .and_then(|n| n.checked_add(self.done_row_bytes))
             .and_then(|n| n.checked_add(self.route_row_bytes))
             .context("span reserve overflow")?;
-        let span = u64::from(span_rows)
+        u64::from(span_rows)
             .checked_mul(per_row)
-            .context("span buffer overflow")?;
-        let staging = u64::from(self.prefill_staging_slots)
-            .checked_mul(geometry.slot_bytes()?)
-            .context("prefill staging overflow")?;
-        self.device_fixed_bytes
-            .checked_add(span)
-            .and_then(|n| n.checked_add(staging))
-            .context("device reserve overflow")
+            .context("span buffer overflow")
     }
 
     pub fn host_bytes(&self, geometry: &ExpertGeometry) -> Result<u64> {
@@ -210,6 +214,88 @@ pub struct Capacity {
     pub worker_count: u32,
     pub disk_workers: u32,
     pub prefill_staging_slots: u32,
+}
+
+impl Capacity {
+    pub fn slots_total(&self) -> u32 {
+        self.slots_per_layer.iter().sum()
+    }
+}
+
+/// One span/wave candidate with the caller's exact reserves.
+#[derive(Clone, Debug)]
+pub struct SpanCandidate {
+    pub span_rows: u32,
+    pub wave_rows: u32,
+    pub reserves: Reserves,
+}
+
+/// Tail slots borrowed by a prefill of `prefill_rows` at `span_rows`.
+pub fn span_borrow_slots(
+    reserves: &Reserves,
+    geometry: &ExpertGeometry,
+    prefill_rows: u32,
+    span_rows: u32,
+) -> Result<u32> {
+    ensure!(span_rows > 0, "zero span rows");
+    let rows = prefill_rows.min(span_rows);
+    ensure!(rows > 0, "zero prefill rows");
+    let bytes = reserves.span_bytes(rows)?;
+    let slot = geometry.slot_bytes()?;
+    u32::try_from(bytes.div_ceil(slot)).context("span borrow exceeds u32 slots")
+}
+
+/// Largest span whose borrowed tail slots leave one slot per layer; ties keep fewer borrowed slots.
+pub fn select_span(
+    inputs: &PlanInputs<'_>,
+    admission_cap: u32,
+    prefill_rows: u32,
+    candidates: &[SpanCandidate],
+) -> Result<(usize, Capacity)> {
+    ensure!(!candidates.is_empty(), "empty span candidate list");
+    let mut best: Option<(usize, u32, u32, Capacity)> = None;
+    let mut failures: Vec<String> = Vec::with_capacity(candidates.len());
+    for (index, candidate) in candidates.iter().enumerate() {
+        let candidate_inputs = PlanInputs {
+            span_rows: candidate.span_rows,
+            wave_rows: candidate.wave_rows,
+            reserves: &candidate.reserves,
+            ..inputs.clone()
+        };
+        let capacity = match capacity(&candidate_inputs, admission_cap) {
+            Ok(capacity) => capacity,
+            Err(error) => {
+                failures.push(format!("candidate {index}: {error}"));
+                continue;
+            }
+        };
+        let borrow = span_borrow_slots(
+            &candidate.reserves,
+            &inputs.geometry,
+            prefill_rows,
+            candidate.span_rows,
+        )?;
+        if borrow > capacity.slots_total() - inputs.geometry.layers {
+            failures.push(format!(
+                "candidate {index}: borrow {borrow} leaves fewer than {} slots",
+                inputs.geometry.layers
+            ));
+            continue;
+        }
+        let better = best.as_ref().is_none_or(|(_, span, seen, _)| {
+            candidate.span_rows > *span || (candidate.span_rows == *span && borrow < *seen)
+        });
+        if better {
+            best = Some((index, candidate.span_rows, borrow, capacity));
+        }
+    }
+    match best {
+        Some((index, _, _, capacity)) => Ok((index, capacity)),
+        None => anyhow::bail!(
+            "no feasible span candidate; {}",
+            failures.first().map(String::as_str).unwrap_or("empty")
+        ),
+    }
 }
 
 /// Per-request initial residency, ranked by the request's prefill frequency.
@@ -305,11 +391,11 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         "invalid copy engine count {}",
         inputs.copy_engines
     );
-    let device_reserved = inputs.reserves.device_bytes(&geometry, inputs.span_rows)?;
+    let device_reserved = inputs.reserves.persistent_bytes(&geometry)?;
     let host_reserved = inputs.reserves.host_bytes(&geometry)?;
     ensure!(
         inputs.device_free_bytes >= device_reserved,
-        "span/staging reserves {device_reserved} B exceed device free bytes {}",
+        "persistent reserves {device_reserved} B exceed device free bytes {}",
         inputs.device_free_bytes
     );
     ensure!(
@@ -367,6 +453,16 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         disk_workers,
         prefill_staging_slots: inputs.reserves.prefill_staging_slots,
     })
+}
+
+/// Evicted tail slots of a prefill borrow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Borrow {
+    pub experts: Vec<(u32, u32)>,
+    pub to_host: u32,
+    pub to_disk: u32,
+    pub d2h_bytes: u64,
+    pub disk_bytes: u64,
 }
 
 /// Tier of one expert in the provenance ledger.
@@ -534,6 +630,48 @@ impl TierLedger {
 
     pub fn free_host_block(&self) -> bool {
         self.free_host_blocks() > 0
+    }
+
+    /// Evicts `slots` GPU-resident experts from the arena tail (layer desc, expert desc) into a
+    /// free host block when one exists, otherwise to the disk tier.
+    pub fn borrow(&mut self, slots: u32) -> Result<Borrow> {
+        ensure!(slots > 0, "zero borrowed slots");
+        let slot_bytes = self.geometry.slot_bytes()?;
+        let mut experts = Vec::with_capacity(slots as usize);
+        let mut to_host = 0u32;
+        let mut to_disk = 0u32;
+        'layers: for layer in (0..self.geometry.layers).rev() {
+            for expert in (0..self.geometry.experts).rev() {
+                if experts.len() as u32 == slots {
+                    break 'layers;
+                }
+                let (l, e) = (layer as usize, expert as usize);
+                if !self.gpu[l][e] {
+                    continue;
+                }
+                self.gpu[l][e] = false;
+                if self.free_host_blocks() > 0 {
+                    self.host[l][e] = true;
+                    to_host += 1;
+                } else {
+                    to_disk += 1;
+                }
+                experts.push((layer, expert));
+            }
+        }
+        ensure!(
+            experts.len() as u32 == slots,
+            "GPU tier holds {} experts, cannot borrow {slots}",
+            experts.len()
+        );
+        self.check()?;
+        Ok(Borrow {
+            d2h_bytes: u64::from(to_host) * slot_bytes,
+            disk_bytes: u64::from(to_disk) * slot_bytes,
+            experts,
+            to_host,
+            to_disk,
+        })
     }
 
     pub fn unique_bytes(&self) -> Result<u64> {
@@ -733,7 +871,7 @@ mod tests {
         let slot = geometry.slot_bytes().unwrap();
         PlanInputs {
             geometry,
-            device_free_bytes: reserves.device_bytes(&geometry, 4).unwrap() + 4 * slot,
+            device_free_bytes: reserves.persistent_bytes(&geometry).unwrap() + 4 * slot,
             host_available_bytes: reserves.host_bytes(&geometry).unwrap() + 26 * slot,
             h2d_bytes_per_second: 1e9,
             d2h_bytes_per_second: 5e8,
@@ -767,7 +905,7 @@ mod tests {
             (16 - 4 - 8) * geometry().slot_bytes().unwrap()
         );
         let tight = PlanInputs {
-            device_free_bytes: reserves.device_bytes(&geometry(), 4).unwrap()
+            device_free_bytes: reserves.persistent_bytes(&geometry()).unwrap()
                 + 2 * geometry().slot_bytes().unwrap()
                 - 1,
             ..capacity_ref(&inputs)
@@ -775,11 +913,11 @@ mod tests {
         let error = capacity(&tight, 0).unwrap_err().to_string();
         assert!(error.contains("device expert bytes"), "{error}");
         let over = PlanInputs {
-            device_free_bytes: reserves.device_bytes(&geometry(), 4).unwrap() - 1,
+            device_free_bytes: reserves.persistent_bytes(&geometry()).unwrap() - 1,
             ..tight
         };
         let error = capacity(&over, 0).unwrap_err().to_string();
-        assert!(error.contains("span/staging reserves"), "{error}");
+        assert!(error.contains("persistent reserves"), "{error}");
         let spares = capacity(&inputs, 28).unwrap_err().to_string();
         assert!(spares.contains("spare blocks"), "{spares}");
     }
@@ -791,7 +929,8 @@ mod tests {
         let geometry = geometry();
         let slot = geometry.slot_bytes().unwrap();
         let mut inputs = inputs(&service, &reserves);
-        inputs.device_free_bytes = reserves.device_bytes(&geometry, 4).unwrap() + 16 * slot + 4_096;
+        inputs.device_free_bytes =
+            reserves.persistent_bytes(&geometry).unwrap() + 16 * slot + 4_096;
         inputs.host_available_bytes = reserves.host_bytes(&geometry).unwrap() + 2 * slot;
         let derived = capacity(&inputs, 0).unwrap();
         assert_eq!(derived.slots_per_layer, vec![8, 8]);
@@ -878,6 +1017,79 @@ mod tests {
         assert_eq!(serial, 200_000);
         assert!(admission_budget(&geometry, &table, 0.0, 1e9, 2).is_err());
         assert!(admission_budget(&geometry, &table, 1e9, 1e9, 0).is_err());
+    }
+
+    #[test]
+    fn span_borrow_uses_the_prompt_and_span_minimum() {
+        let geometry = geometry();
+        let reserves = reserves();
+        assert_eq!(span_borrow_slots(&reserves, &geometry, 4, 4).unwrap(), 3);
+        assert_eq!(span_borrow_slots(&reserves, &geometry, 2, 4).unwrap(), 2);
+        assert_eq!(span_borrow_slots(&reserves, &geometry, 8, 4).unwrap(), 3);
+        assert!(span_borrow_slots(&reserves, &geometry, 0, 4).is_err());
+        assert!(span_borrow_slots(&reserves, &geometry, 4, 0).is_err());
+    }
+
+    #[test]
+    fn select_span_picks_the_largest_feasible_and_breaks_ties_by_borrow() {
+        let service = service();
+        let reserves = reserves();
+        let mut inputs = inputs(&service, &reserves);
+        inputs.device_free_bytes =
+            reserves.persistent_bytes(&geometry()).unwrap() + 4 * geometry().slot_bytes().unwrap();
+        let mut tight = reserves;
+        tight.residual_row_bytes = 128;
+        let candidates = vec![
+            SpanCandidate {
+                span_rows: 4,
+                wave_rows: 2,
+                reserves,
+            },
+            SpanCandidate {
+                span_rows: 2,
+                wave_rows: 2,
+                reserves: tight,
+            },
+            SpanCandidate {
+                span_rows: 2,
+                wave_rows: 2,
+                reserves,
+            },
+        ];
+        let (index, capacity) = select_span(&inputs, 0, 4, &candidates).unwrap();
+        assert_eq!(index, 2);
+        assert_eq!(capacity.slots_total(), 4);
+        let error = select_span(&inputs, 0, 4, &candidates[..1])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no feasible span candidate"), "{error}");
+    }
+
+    #[test]
+    fn ledger_borrow_evicts_the_tail_into_host_or_disk() {
+        let geometry = geometry();
+        let slot = geometry.slot_bytes().unwrap();
+        let initial = initial_residency(&frequency(), &[2, 2], &geometry).unwrap();
+        let mut ledger = TierLedger::new(geometry, vec![2, 2], 3, &initial).unwrap();
+        let borrow = ledger.borrow(3).unwrap();
+        assert_eq!(borrow.experts.len(), 3);
+        assert_eq!(borrow.to_host, 3);
+        assert_eq!(borrow.to_disk, 0);
+        assert_eq!(borrow.d2h_bytes, 3 * slot);
+        assert_eq!(borrow.disk_bytes, 0);
+        assert!(ledger.check().is_ok());
+        let more = ledger.borrow(1).unwrap();
+        assert_eq!((more.to_host, more.to_disk), (0, 1));
+        assert_eq!(more.disk_bytes, slot);
+        assert_eq!(
+            ledger.tier(more.experts[0].0, more.experts[0].1).unwrap(),
+            Tier::Disk
+        );
+        assert_eq!(
+            ledger.unique_bytes().unwrap() + ledger.disk_bytes().unwrap(),
+            16 * slot
+        );
+        assert!(ledger.borrow(9).is_err());
     }
 
     #[test]
