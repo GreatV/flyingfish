@@ -734,13 +734,22 @@ impl VisionWeights {
         let position_rows = (vision.position_side as usize)
             .checked_mul(vision.position_side as usize)
             .context("vision position table rows overflow")?;
-        let patch_shape = [
-            hidden_usize,
-            vision.channels as usize,
-            vision.temporal_patch as usize,
-            vision.patch as usize,
-            vision.patch as usize,
-        ];
+        let patch_shape: Vec<usize> = if vision.temporal_patch > 1 {
+            vec![
+                hidden_usize,
+                vision.channels as usize,
+                vision.temporal_patch as usize,
+                vision.patch as usize,
+                vision.patch as usize,
+            ]
+        } else {
+            vec![
+                hidden_usize,
+                vision.channels as usize,
+                vision.patch as usize,
+                vision.patch as usize,
+            ]
+        };
         let window_width = (merge * merge) as usize * mlp_usize;
         let (patch, position, post_norm, blocks, window, merger, expected) = match architecture {
             Architecture::Qwen35Text => {
