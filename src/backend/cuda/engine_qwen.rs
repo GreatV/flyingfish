@@ -1757,7 +1757,7 @@ mod tests {
     use super::default_chunk;
 
     fn geometry() -> crate::model_spec::ModelSpec {
-        let model = crate::model_spec::ModelSpec::qwen(
+        crate::model_spec::ModelSpec::qwen(
             &serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/data/q38-config.json"
@@ -1765,8 +1765,7 @@ mod tests {
             .unwrap(),
             &serde_json::json!({}),
         )
-        .unwrap();
-        model
+        .unwrap()
     }
 
     #[test]

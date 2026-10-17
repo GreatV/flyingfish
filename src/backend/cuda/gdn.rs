@@ -1438,6 +1438,8 @@ mod tests {
     #[test]
     #[ignore = "authorized sm89 GPU window required"]
     fn gdn_verify_snapshot_rows_gpu() -> Result<()> {
+        let qwen = GdnSpec::q38();
+        let qwen_conv_dim = qwen.conv_dim().expect("Qwen GDN geometry");
         use cudarc::driver::{CudaSlice, DevicePtr};
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -1449,16 +1451,16 @@ mod tests {
             "bitwise R-step primitive gate requires sm89"
         );
         let stream = &device.stream;
-        let state_elements = (GdnSpec::q38().hv * DK * DV) as usize;
-        let row_elements = (GdnSpec::q38().hv * DK) as usize;
+        let state_elements = (qwen.hv * DK * DV) as usize;
+        let row_elements = (qwen.hv * DK) as usize;
         let signal =
             |i: usize, prime: usize| ((i * 17 % prime) as f32 - (prime / 2) as f32) / 1024.0;
         let initial: Vec<_> = (0..state_elements).map(|i| signal(i, 127)).collect();
         let q: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 131)).collect();
         let k: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 137)).collect();
         let v: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 139)).collect();
-        let beta = vec![0.5f32; 5 * GdnSpec::q38().hv as usize];
-        let g: Vec<_> = (0..5 * GdnSpec::q38().hv as usize)
+        let beta = vec![0.5f32; 5 * qwen.hv as usize];
+        let g: Vec<_> = (0..5 * qwen.hv as usize)
             .map(|i| -((i * 17 % 157 + 1) as f32) / 256.0)
             .collect();
         let q = stream.clone_htod(&q)?;
@@ -1470,7 +1472,7 @@ mod tests {
         let snapshot_kernel = module.load_function("gdn_rstep_core_snapshot")?;
         let plain_kernel = module.load_function("gdn_rstep_core_v1")?;
         let config = LaunchConfig {
-            grid_dim: (2, GdnSpec::q38().hv, 1),
+            grid_dim: (2, qwen.hv, 1),
             block_dim: (512, 1, 1),
             shared_mem_bytes: RECURRENT_SMEM,
         };
@@ -1506,8 +1508,8 @@ mod tests {
                 let qp = q.device_ptr(stream).0 + (offset * 4) as u64;
                 let kp = k.device_ptr(stream).0 + (offset * 4) as u64;
                 let vp = v.device_ptr(stream).0 + (offset * 4) as u64;
-                let bp = beta.device_ptr(stream).0 + (row * GdnSpec::q38().hv as usize * 4) as u64;
-                let gp = g.device_ptr(stream).0 + (row * GdnSpec::q38().hv as usize * 4) as u64;
+                let bp = beta.device_ptr(stream).0 + (row * qwen.hv as usize * 4) as u64;
+                let gp = g.device_ptr(stream).0 + (row * qwen.hv as usize * 4) as u64;
                 let mut output = stream.alloc_zeros::<bf16>(row_elements)?;
                 unsafe {
                     stream
@@ -1549,7 +1551,7 @@ mod tests {
                 "dead snapshot slots written"
             );
         }
-        let conv_dim = GdnSpec::q38().conv_dim().expect("Qwen GDN geometry") as usize;
+        let conv_dim = qwen_conv_dim as usize;
         let initial: Vec<_> = (0..conv_dim * 3).map(|i| signal(i, 149)).collect();
         let raw: Vec<_> = (0..5 * conv_dim)
             .map(|i| bf16::from_f32(signal(i, 151)))
@@ -1571,11 +1573,7 @@ mod tests {
                     .arg(&(conv_dim as i32))
                     .arg(&mut slots)
                     .launch(LaunchConfig {
-                        grid_dim: (
-                            GdnSpec::q38().conv_dim().expect("Qwen GDN geometry") / 256,
-                            1,
-                            1,
-                        ),
+                        grid_dim: (qwen_conv_dim / 256, 1, 1),
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
                     })?;
@@ -1614,11 +1612,11 @@ mod tests {
                 "dead history slots written"
             );
         }
-        let a = stream.clone_htod(&vec![bf16::from_f32(0.25); 5 * GdnSpec::q38().hv as usize])?;
-        let b = stream.clone_htod(&vec![bf16::from_f32(0.5); 5 * GdnSpec::q38().hv as usize])?;
+        let a = stream.clone_htod(&vec![bf16::from_f32(0.25); 5 * qwen.hv as usize])?;
+        let b = stream.clone_htod(&vec![bf16::from_f32(0.5); 5 * qwen.hv as usize])?;
         let conv_weight = stream.clone_htod(&vec![bf16::from_f32(0.25); conv_dim * 4])?;
-        let a_log = stream.alloc_zeros::<bf16>(GdnSpec::q38().hv as usize)?;
-        let dt_bias = stream.alloc_zeros::<bf16>(GdnSpec::q38().hv as usize)?;
+        let a_log = stream.alloc_zeros::<bf16>(qwen.hv as usize)?;
+        let dt_bias = stream.alloc_zeros::<bf16>(qwen.hv as usize)?;
         let core_out = stream.alloc_zeros::<bf16>(5 * row_elements)?;
         let state = stream.alloc_zeros::<f32>(state_elements)?;
         let history = stream.alloc_zeros::<f32>(conv_dim * 3)?;
@@ -1634,37 +1632,37 @@ mod tests {
         };
         let bindings = unsafe {
             GdnBindings {
-                qkv: matrix(&qkv, GdnSpec::q38().conv_dim().expect("Qwen GDN geometry"))?,
-                a: matrix(&a, GdnSpec::q38().hv)?,
-                b: matrix(&b, GdnSpec::q38().hv)?,
+                qkv: matrix(&qkv, qwen_conv_dim)?,
+                a: matrix(&a, qwen.hv)?,
+                b: matrix(&b, qwen.hv)?,
                 conv_weight: matrix(&conv_weight, 4)?,
                 a_log: Tensor::new(
                     a_log.device_ptr(stream).0,
-                    [GdnSpec::q38().hv],
+                    [qwen.hv],
                     [1],
-                    u64::from(GdnSpec::q38().hv) * 2,
+                    u64::from(qwen.hv) * 2,
                 )?,
                 dt_bias: Tensor::new(
                     dt_bias.device_ptr(stream).0,
-                    [GdnSpec::q38().hv],
+                    [qwen.hv],
                     [1],
-                    u64::from(GdnSpec::q38().hv) * 2,
+                    u64::from(qwen.hv) * 2,
                 )?,
                 core_out: TensorMut(Tensor::new(
                     core_out.device_ptr(stream).0,
-                    [5, GdnSpec::q38().hv, DV],
-                    [u64::from(GdnSpec::q38().hv * DV), u64::from(DV), 1],
+                    [5, qwen.hv, DV],
+                    [u64::from(qwen.hv * DV), u64::from(DV), 1],
                     (5 * row_elements * 2) as u64,
                 )?),
                 s: TensorMut(Tensor::new(
                     state.device_ptr(stream).0,
-                    [GdnSpec::q38().hv, DK, DV],
+                    [qwen.hv, DK, DV],
                     [u64::from(DK * DV), u64::from(DV), 1],
                     (state_elements * 4) as u64,
                 )?),
                 history: TensorMut(Tensor::new(
                     history.device_ptr(stream).0,
-                    [GdnSpec::q38().conv_dim().expect("Qwen GDN geometry"), 3],
+                    [qwen_conv_dim, 3],
                     [3, 1],
                     (conv_dim * 3 * 4) as u64,
                 )?),
@@ -1687,9 +1685,9 @@ mod tests {
             (
                 Tensor::new(
                     snapshots.device_ptr(stream).0,
-                    [4, GdnSpec::q38().hv, DK, DV],
+                    [4, qwen.hv, DK, DV],
                     [
-                        u64::from(GdnSpec::q38().hv * DK * DV),
+                        u64::from(qwen.hv * DK * DV),
                         u64::from(DK * DV),
                         u64::from(DV),
                         1,
@@ -1698,12 +1696,8 @@ mod tests {
                 )?,
                 Tensor::new(
                     history_snapshots.device_ptr(stream).0,
-                    [4, GdnSpec::q38().conv_dim().expect("Qwen GDN geometry"), 3],
-                    [
-                        u64::from(GdnSpec::q38().conv_dim().expect("Qwen GDN geometry") * 3),
-                        3,
-                        1,
-                    ],
+                    [4, qwen_conv_dim, 3],
+                    [u64::from(qwen_conv_dim * 3), 3, 1],
                     (4 * conv_dim * 3 * 4) as u64,
                 )?,
             )
@@ -1792,8 +1786,8 @@ mod tests {
                     dt_bias: b.dt_bias,
                     core_out: TensorMut(Tensor::new(
                         reference_out.device_ptr(stream).0 + (row * row_elements * 2) as u64,
-                        [1, GdnSpec::q38().hv, DV],
-                        [u64::from(GdnSpec::q38().hv * DV), u64::from(DV), 1],
+                        [1, qwen.hv, DV],
+                        [u64::from(qwen.hv * DV), u64::from(DV), 1],
                         ((5 - row) * row_elements * 2) as u64,
                     )?),
                     s: TensorMut(Tensor::new(
@@ -1925,13 +1919,14 @@ mod tests {
 
     #[test]
     fn workspace_regions_match_the_interface_table() {
+        let qwen = GdnSpec::q38();
         let spec = GdnSpec::q38();
         let conv_dim = u64::from(spec.conv_dim().expect("conv_dim"));
         for rows in [1u32, 64, 2048] {
             let ws = GdnWorkspace::new(&spec, rows).expect("workspace");
             let r = u64::from(rows);
-            let head = u64::from(GdnSpec::q38().hv);
-            let khead = u64::from(GdnSpec::q38().hk);
+            let head = u64::from(qwen.hv);
+            let khead = u64::from(qwen.hk);
             let d = u64::from(DV);
             let dk = u64::from(DK);
 
@@ -2021,28 +2016,25 @@ mod tests {
     /// that overruns the final row.
     #[test]
     fn column_window_capacity_is_measured_from_the_window() {
-        let cd = u64::from(GdnSpec::q38().conv_dim().expect("Qwen GDN geometry"));
+        let qwen = GdnSpec::q38();
+        let qwen_conv_dim = qwen.conv_dim().expect("Qwen GDN geometry");
+        let cd = u64::from(qwen_conv_dim);
         let el = size_of::<bf16>() as u64;
         // ABI §6: Q at 0 width HK*DK, K next, V next width HV*DV, in bytes.
         let q_off = 0u64;
-        let k_off = u64::from(GdnSpec::q38().hk * DK) * el;
-        let v_off = 2 * u64::from(GdnSpec::q38().hk * DK) * el;
+        let k_off = u64::from(qwen.hk * DK) * el;
+        let v_off = 2 * u64::from(qwen.hk * DK) * el;
         assert_eq!(v_off, 8192, "V starts two key-head blocks in");
         // Wrong offset: V's own width added where K's belongs.
-        let v_off_bug = q_off + u64::from(GdnSpec::q38().hv * DV) * el + k_off;
+        let v_off_bug = q_off + u64::from(qwen.hv * DV) * el + k_off;
         assert_eq!(v_off_bug, 16384, "the historical bug sat 8192 B too far in");
 
         let builds = |rows: u32, off: u64, span: u64| -> bool {
             match span.checked_sub(off) {
                 None => false,
                 Some(cap) => unsafe {
-                    Tensor::<bf16, 3>::new(
-                        0x1000,
-                        [rows, GdnSpec::q38().hv, DV],
-                        [cd, u64::from(DV), 1],
-                        cap,
-                    )
-                    .is_ok()
+                    Tensor::<bf16, 3>::new(0x1000, [rows, qwen.hv, DV], [cd, u64::from(DV), 1], cap)
+                        .is_ok()
                 },
             }
         };
@@ -2066,15 +2058,11 @@ mod tests {
     /// `conv_dim` comes from one derivation.
     #[test]
     fn conv_dim_has_a_single_derivation() {
+        let qwen = GdnSpec::q38();
+        let qwen_conv_dim = qwen.conv_dim().expect("Qwen GDN geometry");
         let spec = GdnSpec::q38();
-        assert_eq!(
-            spec.conv_dim().expect("conv_dim"),
-            GdnSpec::q38().conv_dim().expect("Qwen GDN geometry")
-        );
-        assert_eq!(
-            GdnSpec::q38().conv_dim().expect("Qwen GDN geometry"),
-            2 * GdnSpec::q38().hk * DK + GdnSpec::q38().hv * DV
-        );
+        assert_eq!(spec.conv_dim().expect("conv_dim"), qwen_conv_dim);
+        assert_eq!(qwen_conv_dim, 2 * qwen.hk * DK + qwen.hv * DV);
     }
 
     /// The chunkwise-P2 slot offsets are the kernels' `P2_OFF_*` values: each 256 B
@@ -2082,6 +2070,7 @@ mod tests {
     /// the planner's byte count is that many slots per (chunk, head).
     #[test]
     fn cw_p2_slot_is_aligned_and_the_planner_sizes_it_exactly() -> Result<()> {
+        let qwen = GdnSpec::q38();
         let layout = crate::gdn_plan::cw_p2_slot_layout();
         assert_eq!(layout.len(), crate::gdn_plan::CW_P2_SLOT.len());
         let mut spans: Vec<(u64, u64, &str)> = Vec::new();
@@ -2108,9 +2097,9 @@ mod tests {
 
         let spec = GdnSpec::q38();
         for rows in [1u32, 64, 2048, 16384] {
-            let slots = u64::from(rows.div_ceil(CW_P2_CHUNK)) * u64::from(GdnSpec::q38().hv);
+            let slots = u64::from(rows.div_ceil(CW_P2_CHUNK)) * u64::from(qwen.hv);
             assert_eq!(
-                cw_p2_bytes(GdnSpec::q38().hv, rows),
+                cw_p2_bytes(qwen.hv, rows),
                 slots * cw_p2::SLOT_BYTES,
                 "rows={rows}"
             );
@@ -2119,7 +2108,7 @@ mod tests {
             let fused = GdnWorkspace::new(&spec, rows)?.bytes;
             assert_eq!(
                 GdnPolicy::P2.workspace(&spec, rows)?.bytes,
-                fused + cw_p2_bytes(GdnSpec::q38().hv, rows),
+                fused + cw_p2_bytes(qwen.hv, rows),
                 "rows={rows}"
             );
             assert_eq!(
@@ -2129,7 +2118,7 @@ mod tests {
             );
             // Every slot sits inside the region the plan accounts for.
             assert!(
-                cw_p2_bytes(GdnSpec::q38().hv, rows).is_multiple_of(256),
+                cw_p2_bytes(qwen.hv, rows).is_multiple_of(256),
                 "rows={rows}"
             );
         }
@@ -2140,16 +2129,17 @@ mod tests {
     /// stage H one per 32-wide value block independent of the step.
     #[test]
     fn cw_p2_grids_are_a_function_of_the_bound_rows() {
+        let qwen = GdnSpec::q38();
         for (rows, want_chunks) in [(2048u32, 32u32), (16384, 256)] {
-            let (a, h) = cw_p2_grids(rows, GdnSpec::q38().hv);
+            let (a, h) = cw_p2_grids(rows, qwen.hv);
             assert_eq!(
                 a.grid_dim,
-                (want_chunks, GdnSpec::q38().hv, 1),
+                (want_chunks, qwen.hv, 1),
                 "stage A grid, rows={rows}"
             );
             assert_eq!(
                 h.grid_dim,
-                (4, GdnSpec::q38().hv, 1),
+                (4, qwen.hv, 1),
                 "stage H covers DV in 32-wide blocks, rows={rows}"
             );
             for cfg in [a, h] {
@@ -2159,17 +2149,14 @@ mod tests {
         }
         // The H grid is the same whatever the step is; the per-chunk grid is monotone.
         assert_eq!(
-            cw_p2_grids(5, GdnSpec::q38().hv).0.grid_dim,
-            cw_p2_grids(64, GdnSpec::q38().hv).0.grid_dim
+            cw_p2_grids(5, qwen.hv).0.grid_dim,
+            cw_p2_grids(64, qwen.hv).0.grid_dim
         );
-        assert!(
-            cw_p2_grids(16384, GdnSpec::q38().hv).0.grid_dim.0
-                > cw_p2_grids(2048, GdnSpec::q38().hv).0.grid_dim.0
-        );
+        assert!(cw_p2_grids(16384, qwen.hv).0.grid_dim.0 > cw_p2_grids(2048, qwen.hv).0.grid_dim.0);
         for rows in [5u32, 64, 2048, 16384] {
             assert_eq!(
-                cw_p2_grids(rows, GdnSpec::q38().hv).1.grid_dim,
-                cw_p2_grids(2048, GdnSpec::q38().hv).1.grid_dim
+                cw_p2_grids(rows, qwen.hv).1.grid_dim,
+                cw_p2_grids(2048, qwen.hv).1.grid_dim
             );
         }
     }
@@ -2179,9 +2166,9 @@ mod tests {
     /// has a second writer and no field is written twice for the same pair.
     #[test]
     fn every_cw_p2_slot_field_has_exactly_one_writing_stage() {
+        let qwen = GdnSpec::q38();
         let rows = 2048u32;
-        let slots = usize::try_from(rows.div_ceil(CW_P2_CHUNK)).expect("nchunk")
-            * GdnSpec::q38().hv as usize;
+        let slots = usize::try_from(rows.div_ceil(CW_P2_CHUNK)).expect("nchunk") * qwen.hv as usize;
         let fields = crate::gdn_plan::CW_P2_SLOT.len();
         // writers[field][slot]: how many stages write that field of that slot.
         let mut writers = vec![vec![0u8; slots]; fields];
@@ -2213,9 +2200,9 @@ mod tests {
         // Stage A's outputs are what stage H reads, so both of those slots must
         // be full for every chunk and head the plan covers.
         let layout = crate::gdn_plan::cw_p2_slot_layout();
-        for chunk in 0..slots / GdnSpec::q38().hv as usize {
-            for head in 0..GdnSpec::q38().hv as usize {
-                let base = chunk * GdnSpec::q38().hv as usize + head;
+        for chunk in 0..slots / qwen.hv as usize {
+            for head in 0..qwen.hv as usize {
+                let base = chunk * qwen.hv as usize + head;
                 for (index, (offset, bytes, _)) in layout.iter().enumerate() {
                     let name = crate::gdn_plan::CW_P2_SLOT[index].0;
                     assert!(
@@ -2232,11 +2219,13 @@ mod tests {
     }
 
     fn valid_bindings(rows: u32) -> GdnBindings {
-        let cd = GdnSpec::q38().conv_dim().expect("Qwen GDN geometry");
+        let qwen = GdnSpec::q38();
+        let qwen_conv_dim = qwen.conv_dim().expect("Qwen GDN geometry");
+        let cd = qwen_conv_dim;
         let bf = size_of::<bf16>() as u64;
         let f32b = size_of::<f32>() as u64;
         let r = u64::from(rows);
-        let head = u64::from(GdnSpec::q38().hv);
+        let head = u64::from(qwen.hv);
         let d = u64::from(DV);
         let dk = u64::from(DK);
         // Span headroom so a widened stride fails the stride check, not extent validation.
@@ -2250,36 +2239,24 @@ mod tests {
                     padded(r * u64::from(cd) * bf),
                 )
                 .expect("qkv"),
-                a: Tensor::new(
-                    0x1000,
-                    [rows, GdnSpec::q38().hv],
-                    [head, 1],
-                    padded(r * head * bf),
-                )
-                .expect("a"),
-                b: Tensor::new(
-                    0x1000,
-                    [rows, GdnSpec::q38().hv],
-                    [head, 1],
-                    padded(r * head * bf),
-                )
-                .expect("b"),
+                a: Tensor::new(0x1000, [rows, qwen.hv], [head, 1], padded(r * head * bf))
+                    .expect("a"),
+                b: Tensor::new(0x1000, [rows, qwen.hv], [head, 1], padded(r * head * bf))
+                    .expect("b"),
                 conv_weight: Tensor::new(0x1000, [cd, 4], [4, 1], padded(u64::from(cd) * 4 * bf))
                     .expect("conv_weight"),
-                a_log: Tensor::new(0x1000, [GdnSpec::q38().hv], [1], padded(head * bf))
-                    .expect("a_log"),
-                dt_bias: Tensor::new(0x1000, [GdnSpec::q38().hv], [1], padded(head * bf))
-                    .expect("dt_bias"),
+                a_log: Tensor::new(0x1000, [qwen.hv], [1], padded(head * bf)).expect("a_log"),
+                dt_bias: Tensor::new(0x1000, [qwen.hv], [1], padded(head * bf)).expect("dt_bias"),
                 core_out: TensorMut::new(
                     0x1000,
-                    [rows, GdnSpec::q38().hv, DV],
+                    [rows, qwen.hv, DV],
                     [head * d, d, 1],
                     padded(r * head * d * bf),
                 )
                 .expect("core_out"),
                 s: TensorMut::new(
                     0x1000,
-                    [GdnSpec::q38().hv, DK, DV],
+                    [qwen.hv, DK, DV],
                     [dk * d, d, 1],
                     padded(head * dk * d * f32b),
                 )
@@ -2294,24 +2271,16 @@ mod tests {
     /// guard, not by extent validation.
     #[test]
     fn bindings_must_carry_the_kernel_strides() {
+        let qwen = GdnSpec::q38();
+        let qwen_conv_dim = qwen.conv_dim().expect("Qwen GDN geometry");
         let rows = 4u32;
-        check_bindings(
-            &valid_bindings(rows),
-            rows,
-            GdnSpec::q38().conv_dim().expect("Qwen GDN geometry"),
-            GdnSpec::q38().hv,
-        )
-        .expect("dense bindings must pass");
+        check_bindings(&valid_bindings(rows), rows, qwen_conv_dim, qwen.hv)
+            .expect("dense bindings must pass");
         let reject = |name: &str, mangle: &dyn Fn(&mut GdnBindings)| {
             let mut b = valid_bindings(rows);
             mangle(&mut b);
-            let error = check_bindings(
-                &b,
-                rows,
-                GdnSpec::q38().conv_dim().expect("Qwen GDN geometry"),
-                GdnSpec::q38().hv,
-            )
-            .expect_err("{name} binding must be rejected");
+            let error = check_bindings(&b, rows, qwen_conv_dim, qwen.hv)
+                .expect_err("{name} binding must be rejected");
             assert!(
                 error.to_string().contains("GDN"),
                 "{name}: expected the binding stride guard, got {error:?}"
@@ -2337,38 +2306,23 @@ mod tests {
     /// wrong column offset is rejected in run() instead of reading past conv_out.
     #[test]
     fn v_window_offsets_are_validated_before_launch() {
-        let cd = u64::from(GdnSpec::q38().conv_dim().expect("Qwen GDN geometry"));
+        let qwen = GdnSpec::q38();
+        let qwen_conv_dim = qwen.conv_dim().expect("Qwen GDN geometry");
+        let cd = u64::from(qwen_conv_dim);
         let el = size_of::<bf16>() as u64;
         // ABI §6: Q at 0 width HK*DK, K next, V next width HV*DV, in bytes.
-        let v_off = 2 * u64::from(GdnSpec::q38().hk * DK) * el;
+        let v_off = 2 * u64::from(qwen.hk * DK) * el;
         assert_eq!(v_off, 8192, "V starts two key-head blocks in");
         // Wrong offset: V's own width added where K's belongs.
-        let v_off_bug =
-            u64::from(GdnSpec::q38().hv * DV) * el + u64::from(GdnSpec::q38().hk * DK) * el;
+        let v_off_bug = u64::from(qwen.hv * DV) * el + u64::from(qwen.hk * DK) * el;
         assert_eq!(v_off_bug, 16384, "the historical bug sat 8192 B too far in");
         for rows in [1u32, 64] {
             let span = cd * el * u64::from(rows);
-            let window = as3(
-                0x1000,
-                rows,
-                GdnSpec::q38().hv,
-                GdnSpec::q38().conv_dim().expect("Qwen GDN geometry"),
-                span,
-                v_off,
-            )
-            .expect("V window");
-            assert_eq!(window.shape, [rows, GdnSpec::q38().hv, DV]);
+            let window = as3(0x1000, rows, qwen.hv, qwen_conv_dim, span, v_off).expect("V window");
+            assert_eq!(window.shape, [rows, qwen.hv, DV]);
             assert_eq!(window.stride, [cd, u64::from(DV), 1]);
             assert!(
-                as3(
-                    0x1000,
-                    rows,
-                    GdnSpec::q38().hv,
-                    GdnSpec::q38().conv_dim().expect("Qwen GDN geometry"),
-                    span,
-                    v_off_bug
-                )
-                .is_err(),
+                as3(0x1000, rows, qwen.hv, qwen_conv_dim, span, v_off_bug).is_err(),
                 "v_off {v_off_bug} must be rejected before any launch (rows={rows})"
             );
         }
@@ -2412,7 +2366,8 @@ mod gpu_probe {
 
     /// The gate's comparator, on BF16-rounded values.
     fn terms(got: &[bf16], reference: &[bf16], valid: usize) -> Terms {
-        let heads = GdnSpec::q38().hv as usize;
+        let qwen = GdnSpec::q38();
+        let heads = qwen.hv as usize;
         let dv = DV as usize;
         let rows = valid;
         let f = |x: &bf16| f64::from(x.to_f32());
@@ -2483,6 +2438,7 @@ mod gpu_probe {
 
     impl Man {
         fn load(name: &str) -> Man {
+            let qwen = GdnSpec::q38();
             let dir = PathBuf::from(
                 std::env::var_os("FF_Q38_GDN_FIXTURE_DIR")
                     .expect("FF_Q38_GDN_FIXTURE_DIR is required"),
@@ -2492,7 +2448,7 @@ mod gpu_probe {
                 .unwrap_or_else(|e| panic!("read {}/manifest.json: {e}", dir.display()));
             let m: serde_json::Value = serde_json::from_str(&text).expect("manifest json");
             let bounds = &m["bounds"];
-            let elems = m["valid_rows"].as_u64().unwrap() * GdnSpec::q38().hv as u64 * DV as u64;
+            let elems = m["valid_rows"].as_u64().unwrap() * qwen.hv as u64 * DV as u64;
             Man {
                 mode: m["mode"].as_str().unwrap().to_string(),
                 valid: m["valid_rows"].as_u64().unwrap() as usize,
@@ -2589,42 +2545,39 @@ mod gpu_probe {
     /// Build one case's device state: row-dimensioned inputs at or past `valid` carry bf16 NaN,
     /// core_out carries the marker.
     fn build_case(device: &Device, man: Man) -> Result<Case> {
+        let qwen = GdnSpec::q38();
         let s = &device.stream;
         let cd = 10_240usize;
         let plan = man.plan_rows as usize;
         let valid = man.valid;
         let mut qkv = vec![bf16::NAN; plan * cd];
-        let mut a = vec![bf16::NAN; plan * GdnSpec::q38().hv as usize];
-        let mut b = vec![bf16::NAN; plan * GdnSpec::q38().hv as usize];
+        let mut a = vec![bf16::NAN; plan * qwen.hv as usize];
+        let mut b = vec![bf16::NAN; plan * qwen.hv as usize];
         {
             let vqkv = man.bf16("qkv.bf16", valid * cd);
-            let va = man.bf16("a.bf16", valid * GdnSpec::q38().hv as usize);
-            let vb = man.bf16("b.bf16", valid * GdnSpec::q38().hv as usize);
+            let va = man.bf16("a.bf16", valid * qwen.hv as usize);
+            let vb = man.bf16("b.bf16", valid * qwen.hv as usize);
             qkv[..valid * cd].copy_from_slice(&vqkv);
-            a[..valid * GdnSpec::q38().hv as usize].copy_from_slice(&va);
-            b[..valid * GdnSpec::q38().hv as usize].copy_from_slice(&vb);
+            a[..valid * qwen.hv as usize].copy_from_slice(&va);
+            b[..valid * qwen.hv as usize].copy_from_slice(&vb);
             // The row poison must be the exact bit pattern the marker check anticipates.
             for x in qkv[valid * cd..].iter_mut() {
                 *x = bf16::from_bits(NAN_BITS);
             }
-            for x in a[valid * GdnSpec::q38().hv as usize..].iter_mut() {
+            for x in a[valid * qwen.hv as usize..].iter_mut() {
                 *x = bf16::from_bits(NAN_BITS);
             }
-            for x in b[valid * GdnSpec::q38().hv as usize..].iter_mut() {
+            for x in b[valid * qwen.hv as usize..].iter_mut() {
                 *x = bf16::from_bits(NAN_BITS);
             }
         }
         let conv_w = man.bf16("conv_w.bf16", cd * 4);
-        let a_log = man.bf16("a_log.bf16", GdnSpec::q38().hv as usize);
-        let dt_bias = man.bf16("dt_bias.bf16", GdnSpec::q38().hv as usize);
-        let s_init = man.f32s(
-            "s_init.f32",
-            GdnSpec::q38().hv as usize * DK as usize * DV as usize,
-        );
+        let a_log = man.bf16("a_log.bf16", qwen.hv as usize);
+        let dt_bias = man.bf16("dt_bias.bf16", qwen.hv as usize);
+        let s_init = man.f32s("s_init.f32", qwen.hv as usize * DK as usize * DV as usize);
         let hist_init = man.f32s("hist_init.f32", cd * 3);
-        let mut core =
-            vec![bf16::from_f32(TAIL_MARKER); plan * GdnSpec::q38().hv as usize * DV as usize];
-        core[..valid * GdnSpec::q38().hv as usize * DV as usize].fill(bf16::ZERO);
+        let mut core = vec![bf16::from_f32(TAIL_MARKER); plan * qwen.hv as usize * DV as usize];
+        core[..valid * qwen.hv as usize * DV as usize].fill(bf16::ZERO);
         let dev_qkv = s.clone_htod(&qkv)?;
         let dev_a = s.clone_htod(&a)?;
         let dev_b = s.clone_htod(&b)?;
@@ -2653,9 +2606,10 @@ mod gpu_probe {
     }
 
     fn bindings(c: &Case, s: &Arc<CudaStream>, swap_gates: bool) -> Result<GdnBindings> {
+        let qwen = GdnSpec::q38();
         let plan = c.man.plan_rows;
         let cd = 10_240u32;
-        let hv = GdnSpec::q38().hv;
+        let hv = qwen.hv;
         let (a, b) = if swap_gates {
             (&c.dev_b, &c.dev_a)
         } else {
@@ -2762,7 +2716,8 @@ mod gpu_probe {
     ///
     /// The scaled comparison is `measured <= basis` in f64 with `RMS_ULP_TOL` relative slack.
     fn check_core(case: &str, man: &Man, got: &[bf16], reference: &[bf16]) -> Terms {
-        let elems = man.valid * GdnSpec::q38().hv as usize * DV as usize;
+        let qwen = GdnSpec::q38();
+        let elems = man.valid * qwen.hv as usize * DV as usize;
         let t = terms(got, reference, man.valid);
         let frac = t.ndiff as f64 / elems as f64;
         let degenerate = man.degenerate;
@@ -2858,11 +2813,12 @@ mod gpu_probe {
     /// Stage dumps: reads the plan's own workspace offsets after a run and writes the valid rows
     /// of conv_out / q / k / v / beta_fp32 / g, plus the final state S.
     fn dump_workspace(case: &Case, name: &str, s: &Arc<CudaStream>) -> Result<()> {
+        let qwen = GdnSpec::q38();
         let ws = GdnWorkspace::new(&GdnSpec::q38(), case.man.plan_rows)?;
         let host = s.clone_dtoh(&case.scratch_buf)?;
         let valid = case.man.valid as u64;
         let cd = 10_240u64;
-        let hv = u64::from(GdnSpec::q38().hv);
+        let hv = u64::from(qwen.hv);
         let dv = u64::from(DV);
         let dir = dump_dir();
         let wr = |region: Region, bytes: u64, path: PathBuf| -> Result<()> {
@@ -2914,6 +2870,7 @@ mod gpu_probe {
     #[test]
     #[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted, FF_Q38_GDN_FIXTURE_DIR and FF_Q38_PROBE_DUMP"]
     fn gdn_binder_probe() -> Result<()> {
+        let qwen = GdnSpec::q38();
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window not acknowledged"
@@ -2955,7 +2912,7 @@ mod gpu_probe {
                 phase_of(&case.man.mode),
                 false,
             )?;
-            let elems = case.man.valid * GdnSpec::q38().hv as usize * DV as usize;
+            let elems = case.man.valid * qwen.hv as usize * DV as usize;
             dump_workspace(case, name, s)?;
             let got = s.clone_dtoh(&case.dev_core)?;
             let got_valid = &got[..elems];
@@ -3034,7 +2991,7 @@ mod gpu_probe {
         {
             let man = Man::load("prefill_m1");
             let case = build_case(&device, man)?;
-            let elems = case.man.valid * GdnSpec::q38().hv as usize * DV as usize;
+            let elems = case.man.valid * qwen.hv as usize * DV as usize;
             run_case(
                 &device,
                 &case,
@@ -3113,7 +3070,7 @@ mod gpu_probe {
         {
             let man = Man::load("prefill_m64");
             let case = build_case(&device, man)?;
-            let elems = case.man.valid * GdnSpec::q38().hv as usize * DV as usize;
+            let elems = case.man.valid * qwen.hv as usize * DV as usize;
             run_case(&device, &case, common, ExecutionPhase::Prefill, true)?;
             let got = s.clone_dtoh(&case.dev_core)?;
             let reference = case.man.bf16("ref_core.bf16", elems);

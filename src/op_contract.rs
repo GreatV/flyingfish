@@ -306,6 +306,12 @@ mod tests {
         let work = crate::work_layout::RowWorkSpec::new(&model)?;
         assert_eq!((work.projection, work.mixer, work.ab), (14336, 6144, 96));
         assert_eq!(original.state_bytes()?, 48 * 128 * 128 * 4);
+        assert_eq!(
+            FullAttentionSpec::from_model(&model)?.kernel_module()?,
+            "tcmqa_d256"
+        );
+        assert_eq!(original.kernel_suffix()?, "");
+        assert_eq!(original.gate_kernel()?, "q38_gdn_gates");
         model.hidden = 2048;
         model.q_heads = 16;
         model.kv_heads = 2;
@@ -317,6 +323,36 @@ mod tests {
         assert_eq!((work.projection, work.mixer, work.ab), (9216, 4096, 64));
         assert_eq!(changed.state_bytes()?, 32 * 128 * 128 * 4);
         assert_eq!(changed.history_bytes()?, 8192 * 3 * 4);
+        assert_eq!(attention.kernel_module()?, "tcmqa_d256_q16_kv2");
+        assert_eq!(changed.kernel_suffix()?, "_h32");
+        assert_eq!(changed.gate_kernel()?, "gdn_gates_h32");
+        let unsupported = GdnSpec { hv: 64, ..changed };
+        assert!(
+            unsupported
+                .kernel_suffix()
+                .unwrap_err()
+                .to_string()
+                .contains("hv=64")
+        );
+        assert!(
+            unsupported
+                .gate_kernel()
+                .unwrap_err()
+                .to_string()
+                .contains("hv=64")
+        );
+        let unsupported = FullAttentionSpec {
+            hq: 16,
+            hkv: 4,
+            ..attention
+        };
+        assert!(
+            unsupported
+                .kernel_module()
+                .unwrap_err()
+                .to_string()
+                .contains("hq=16 hkv=4")
+        );
         assert_eq!(
             (attention.hq, attention.hkv, changed.conv_dim()?),
             (16, 2, 8192)
