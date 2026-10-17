@@ -465,7 +465,7 @@ mod tests {
                         })
                         .count();
                     println!(
-                        "PR2_BF16_LINEAR stored_weight=[{n},{k}] rows={m} graph={graph} dequant_bytes=0 mismatches={mismatches} {}",
+                        "BF16_LINEAR stored_weight=[{n},{k}] rows={m} graph={graph} dequant_bytes=0 mismatches={mismatches} {}",
                         if mismatches == 0 { "PASS" } else { "DEFECT" }
                     );
                     defects += usize::from(mismatches != 0);
@@ -487,7 +487,7 @@ mod tests {
                         })
                         .count();
                     println!(
-                        "PR2_BF16_LINEAR_DECODE stored_weight=[{n},{k}] rows=1 graph=false mismatches={mismatches} {}",
+                        "BF16_LINEAR_DECODE stored_weight=[{n},{k}] rows=1 graph=false mismatches={mismatches} {}",
                         if mismatches == 0 { "PASS" } else { "DEFECT" }
                     );
                     defects += usize::from(mismatches != 0);
@@ -495,8 +495,8 @@ mod tests {
                 }
             }
         }
-        println!("PR2_BF16_LINEAR_SUMMARY cases={cases} defects={defects}");
-        ensure!(defects == 0, "PR2_BF16_LINEAR DEFECT cases={defects}");
+        println!("BF16_LINEAR_SUMMARY cases={cases} defects={defects}");
+        ensure!(defects == 0, "BF16_LINEAR DEFECT cases={defects}");
         Ok(())
     }
 }

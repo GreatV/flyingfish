@@ -1465,7 +1465,7 @@ mod tests {
                         let mismatches = geometry_mismatches(&candidate, &reference, valid, 8192)?
                             + candidate.oracle_mismatches;
                         println!(
-                            "PR2_ATTENTION_GEOMETRY rows={rows} valid={valid} prefix=23 axes={} graph={graph} flash={flash} mismatches={mismatches} {}",
+                            "ATTENTION_GEOMETRY rows={rows} valid={valid} prefix=23 axes={} graph={graph} flash={flash} mismatches={mismatches} {}",
                             positions.is_some(),
                             if mismatches == 0 { "PASS" } else { "DEFECT" }
                         );
@@ -1508,11 +1508,11 @@ mod tests {
             mismatches > 0,
             "global Q/gate split mutant was not detected"
         );
-        println!("PR2_ATTENTION_GLOBAL_SPLIT_MUTANT PASS mismatches={mismatches}");
-        println!("PR2_ATTENTION_GEOMETRY_SUMMARY cases={cases} defects={defects}");
+        println!("ATTENTION_GLOBAL_SPLIT_MUTANT PASS mismatches={mismatches}");
+        println!("ATTENTION_GEOMETRY_SUMMARY cases={cases} defects={defects}");
         ensure!(
             defects == 0,
-            "PR2_ATTENTION_GEOMETRY DEFECT cases={defects}"
+            "ATTENTION_GEOMETRY DEFECT cases={defects}"
         );
         Ok(())
     }

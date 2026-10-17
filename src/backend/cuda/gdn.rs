@@ -1367,7 +1367,7 @@ mod tests {
                 );
             }
         }
-        println!("PR2_MIXER_SMOKE PASS prefix=23 rows=2 cores=3 graph_modes=2");
+        println!("MIXER_SMOKE PASS prefix=23 rows=2 cores=3 graph_modes=2");
         Ok(())
     }
 
@@ -1418,7 +1418,7 @@ mod tests {
                     let candidate = geometry_run(&device, spec, rows, valid, core, graph, false)?;
                     let mismatches = geometry_mismatches(&candidate, &reference, valid);
                     println!(
-                        "PR2_GDN_GEOMETRY core={core:?} rows={rows} valid={valid} prefix=23 graph={graph} mismatches={mismatches} {}",
+                        "GDN_GEOMETRY core={core:?} rows={rows} valid={valid} prefix=23 graph={graph} mismatches={mismatches} {}",
                         if mismatches == 0 { "PASS" } else { "DEFECT" }
                     );
                     defects += usize::from(mismatches != 0);
@@ -1438,9 +1438,9 @@ mod tests {
         let mutant = geometry_run(&device, spec, 8, 8, GeometryCore::Chunked, false, true)?;
         let mismatches = geometry_mismatches(&mutant, &reference, 8);
         ensure!(mismatches > 0, "h/3 mutant was not detected");
-        println!("PR2_GDN_WRONG_GQA_MUTANT PASS mismatches={mismatches}");
-        println!("PR2_GDN_GEOMETRY_SUMMARY cases={cases} defects={defects}");
-        ensure!(defects == 0, "PR2_GDN_GEOMETRY DEFECT cases={defects}");
+        println!("GDN_WRONG_GQA_MUTANT PASS mismatches={mismatches}");
+        println!("GDN_GEOMETRY_SUMMARY cases={cases} defects={defects}");
+        ensure!(defects == 0, "GDN_GEOMETRY DEFECT cases={defects}");
         Ok(())
     }
 
