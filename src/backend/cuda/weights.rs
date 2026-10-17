@@ -731,7 +731,24 @@ mod tests {
         let mut flags = u32::MAX;
         unsafe { sys::cuMemHostGetFlags(&mut flags, registered as *mut std::ffi::c_void).result() }
             .context("read expert host registration flags")?;
-        assert_eq!(flags, 0);
+        let unified_addressing = device
+            .ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING)?
+            != 0;
+        let allowed_host_flags = if unified_addressing {
+            sys::CU_MEMHOSTALLOC_DEVICEMAP
+        } else {
+            0
+        };
+        ensure!(
+            flags & !allowed_host_flags == 0,
+            "expert host registration flags={flags} allowed={allowed_host_flags} unified_addressing={unified_addressing} portable_bit={} writecombined_bit={}",
+            flags & sys::CU_MEMHOSTALLOC_PORTABLE,
+            flags & sys::CU_MEMHOSTALLOC_WRITECOMBINED
+        );
+        println!(
+            "PASS expert_storage_registration flags={flags} unified_addressing={unified_addressing} portable=false writecombined=false"
+        );
         let upload = &device.upload;
         let stream = &device.stream;
         let (first, first_down) = storage.slot(0, 0)?;
