@@ -1,4 +1,5 @@
-//! Native device-slot layout and host expert blocks with read leases and writer claims.
+//! Native device-slot layout, slot event lifetimes and host expert blocks with read leases
+//! and writer claims.
 use crate::experts::{catalogue::ExpertGeometry, plan::Capacity};
 use anyhow::{Context, Result, ensure};
 use half::bf16;
@@ -324,6 +325,14 @@ impl SlotLayout {
             .with_context(|| format!("native slot outside layout: layer={layer} rank={rank}"))
     }
 
+    /// Existing ranks of one layer.
+    pub fn slot_count(&self, layer: u32) -> Result<u32> {
+        self.slots
+            .get(layer as usize)
+            .map(|slots| slots.len() as u32)
+            .with_context(|| format!("slot layout layer {layer} outside {}", self.slots.len()))
+    }
+
     pub fn staging_slot(&self, slot: u32) -> Result<Range<usize>> {
         ensure!(
             slot < self.staging_slots,
@@ -348,6 +357,80 @@ impl SlotLayout {
     }
 }
 
+/// Copy and reader events of one slot; the streams wait on them, placement never does.
+pub struct SlotEvents {
+    slots: Vec<SlotLifetime>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SlotLifetime {
+    copy: Option<u64>,
+    reader: Option<u64>,
+}
+
+impl SlotEvents {
+    pub fn new(slots: usize) -> Self {
+        Self {
+            slots: vec![SlotLifetime::default(); slots],
+        }
+    }
+
+    fn index(&self, slot: u32) -> Result<usize> {
+        let index = usize::try_from(slot).context("slot id exceeds usize")?;
+        ensure!(
+            index < self.slots.len(),
+            "slot {slot} outside {} positions",
+            self.slots.len()
+        );
+        Ok(index)
+    }
+
+    /// Records one copy event covering every listed slot; it starts their lifetimes.
+    pub fn record_copy(&mut self, slots: &[u32], event: u64) -> Result<()> {
+        for &slot in slots {
+            self.index(slot)?;
+        }
+        for &slot in slots {
+            let index = self.index(slot)?;
+            let lifetime = &mut self.slots[index];
+            lifetime.copy = Some(event);
+            lifetime.reader = None;
+        }
+        Ok(())
+    }
+
+    /// Records one reader event covering every listed slot; the last event on the reader stream
+    /// wins.
+    pub fn record_readers(&mut self, slots: &[u32], event: u64) -> Result<()> {
+        for &slot in slots {
+            let index = self.index(slot)?;
+            ensure!(
+                self.slots[index].copy.is_some(),
+                "slot {slot} has no recorded copy to read"
+            );
+        }
+        for &slot in slots {
+            let index = self.index(slot)?;
+            self.slots[index].reader = Some(event);
+        }
+        Ok(())
+    }
+
+    /// Copy event the reader stream waits on for the first read of a slot.
+    pub fn copy_event(&self, slot: u32) -> Result<Option<u64>> {
+        Ok(self.slots[self.index(slot)?].copy)
+    }
+
+    /// Returns `[last copy event, last reader event]` and clears the slot's lifetime.
+    pub fn reclaim(&mut self, slot: u32) -> Result<[Option<u64>; 2]> {
+        let index = self.index(slot)?;
+        let lifetime = &mut self.slots[index];
+        let events = [lifetime.copy, lifetime.reader];
+        *lifetime = SlotLifetime::default();
+        Ok(events)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +448,7 @@ mod tests {
             worker_count: 1,
             disk_workers: 0,
             prefill_staging_slots: 2,
+            pinned: false,
         })
     }
 
@@ -397,13 +481,8 @@ mod tests {
         assert_eq!(layout.borrowed_tail(4)?, 3 * bytes..7 * bytes);
         assert!(layout.borrowed_tail(5).is_err());
         let initial = vec![vec![4, 1, 7], vec![2, 6], vec![5, 0]];
-        let mut ledger = crate::experts::plan::TierLedger::new(
-            geometry,
-            capacity.slots_per_layer.clone(),
-            0,
-            &initial,
-        )?;
-        let borrowed = ledger.borrow(2)?;
+        let mut ledger = crate::experts::plan::TierLedger::new(layout, 0, &initial)?;
+        let borrowed = ledger.borrow_tail(2, 0)?;
         assert_eq!(borrowed.experts, vec![(0, 7), (2, 0)]);
         assert_eq!(borrowed.disk_bytes, 2 * bytes as u64);
         ledger.check()?;
@@ -442,7 +521,36 @@ mod tests {
         Ok(())
     }
 
-    /// A read after the lease drops does not compile: `BlockLease::read` borrows the guard.
+    #[test]
+    fn slot_events_keep_one_copy_and_one_reader_event() -> Result<()> {
+        let mut events = SlotEvents::new(3);
+        events.record_copy(&[0, 1, 2], 7)?;
+        for slot in 0..3u32 {
+            assert_eq!(events.copy_event(slot)?, Some(7));
+        }
+        for event in 8..1_008u64 {
+            events.record_readers(&[0, 1, 2], event)?;
+        }
+        assert_eq!(events.reclaim(1)?, [Some(7), Some(1_007)]);
+        assert_eq!(events.copy_event(1)?, None);
+        assert_eq!(
+            std::mem::size_of::<SlotLifetime>(),
+            2 * std::mem::size_of::<Option<u64>>()
+        );
+        events.record_copy(&[0], 11)?;
+        let error = events.record_readers(&[0, 9], 12).unwrap_err().to_string();
+        assert!(error.contains("slot 9 outside"), "{error}");
+        assert_eq!(
+            events.reclaim(0)?,
+            [Some(11), None],
+            "a rejected batch leaves its valid slots unchanged"
+        );
+        let error = events.record_readers(&[1], 13).unwrap_err().to_string();
+        assert!(error.contains("has no recorded copy to read"), "{error}");
+        assert_eq!(events.reclaim(2)?, [Some(7), Some(1_007)]);
+        Ok(())
+    }
+
     #[test]
     fn a_claim_fails_while_the_block_is_leased() -> Result<()> {
         let arena = HostBlocks::new(2, 4)?;
