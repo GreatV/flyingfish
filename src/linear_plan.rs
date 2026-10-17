@@ -1,5 +1,5 @@
 //! Checked single-layer materialization layout, shared by planner and Linear.
-use crate::checkpoint::TensorManifest;
+use crate::{checkpoint::TensorManifest, model_spec::LinearFormat};
 use anyhow::{Context, Result, ensure};
 use safetensors::Dtype;
 use std::collections::BTreeMap;
@@ -23,16 +23,30 @@ pub struct LayerDequantPlan {
     pub slots: BTreeMap<String, DequantSlot>,
 }
 impl LayerDequantPlan {
-    pub fn from_manifest(manifest: &TensorManifest, layer: u32) -> Result<Self> {
+    pub fn from_manifest(
+        manifest: &TensorManifest,
+        layer: u32,
+        format: LinearFormat,
+    ) -> Result<Self> {
         let prefix = format!("model.language_model.layers.{layer}.");
-        Self::build(manifest, layer, prefix)
+        Self::build(manifest, layer, prefix, format)
     }
 
     pub fn mtp(manifest: &TensorManifest) -> Result<Self> {
-        Self::build(manifest, 0, "mtp.layers.0.".into())
+        Self::build(
+            manifest,
+            0,
+            "mtp.layers.0.".into(),
+            LinearFormat::Fp8E4m3Block128,
+        )
     }
 
-    fn build(manifest: &TensorManifest, layer: u32, prefix: String) -> Result<Self> {
+    fn build(
+        manifest: &TensorManifest,
+        layer: u32,
+        prefix: String,
+        format: LinearFormat,
+    ) -> Result<Self> {
         let mut bytes = 0u64;
         let mut slots = BTreeMap::new();
         for (name, e) in &manifest.entries {
@@ -86,6 +100,14 @@ impl LayerDequantPlan {
             }),
             "missing linear layer {layer}"
         );
+        ensure!(
+            match format {
+                LinearFormat::Fp8E4m3Block128 => !slots.is_empty(),
+                LinearFormat::Bf16 => slots.is_empty(),
+            },
+            "linear layer={layer} has {} FP8 slots for linear_format={format:?}",
+            slots.len()
+        );
         bytes = bytes.checked_add(255).context("arena size overflow")? & !255;
         Ok(Self {
             layer,
@@ -124,10 +146,13 @@ mod tests {
             .into(),
             resident_bytes: 8192 * 2048 * 2,
         };
-        let plan = LayerDequantPlan::from_manifest(&manifest, 0)?;
+        let plan = LayerDequantPlan::from_manifest(&manifest, 0, LinearFormat::Bf16)?;
+        let error = LayerDequantPlan::from_manifest(&manifest, 0, LinearFormat::Fp8E4m3Block128)
+            .unwrap_err();
+        assert!(error.to_string().contains("0 FP8 slots"), "{error}");
         assert_eq!(plan.bytes, 0);
         assert!(plan.slots.is_empty());
-        assert!(LayerDequantPlan::from_manifest(&manifest, 1).is_err());
+        assert!(LayerDequantPlan::from_manifest(&manifest, 1, LinearFormat::Bf16).is_err());
         Ok(())
     }
 }

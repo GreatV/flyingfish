@@ -390,8 +390,11 @@ mod tests {
                 upload_hashed_bytes: None,
                 load_wall_ms: 0.0,
             };
-            let dequant =
-                crate::linear_plan::LayerDequantPlan::from_manifest(&catalog.manifest, 0)?;
+            let dequant = crate::linear_plan::LayerDequantPlan::from_manifest(
+                &catalog.manifest,
+                0,
+                crate::model_spec::LinearFormat::Bf16,
+            )?;
             ensure!(
                 dequant.bytes == 0 && dequant.slots.is_empty(),
                 "native BF16 fixture allocated materialization storage"

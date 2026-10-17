@@ -389,7 +389,11 @@ impl Runtime {
         for (i, layout) in engine.model_spec.layers.iter().enumerate() {
             let prefix = format!("model.language_model.layers.{i}.");
             let weight = |name: &str| vector(catalog.bf16(&format!("{prefix}{name}"))?, s);
-            let plan = LayerDequantPlan::from_manifest(&catalog.manifest, i as u32)?;
+            let plan = LayerDequantPlan::from_manifest(
+                &catalog.manifest,
+                i as u32,
+                engine.model_spec.linear_format,
+            )?;
             let arena_view = arena.as_ref().map(|b| scratch(b, s));
             let linear = LayerLinearPlan::bind(&plan, &catalog, arena_view.as_ref(), s)?;
             let mixer = match layout.mixer {
@@ -1028,7 +1032,14 @@ impl Engine {
             s,
         )?);
         let arena_bytes = (0..model_spec.layers.len())
-            .map(|i| LayerDequantPlan::from_manifest(&catalog.manifest, i as u32).map(|p| p.bytes))
+            .map(|i| {
+                LayerDequantPlan::from_manifest(
+                    &catalog.manifest,
+                    i as u32,
+                    model_spec.linear_format,
+                )
+                .map(|p| p.bytes)
+            })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .max()
@@ -1040,7 +1051,7 @@ impl Engine {
         };
         let ops = Ops::new(&device.ctx)?;
         let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
-        if arena.is_some() {
+        if model_spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Block128 {
             blas.enable_fp8(&device.ctx)?;
         }
         device.finish_upload()?;
@@ -1868,7 +1879,11 @@ mod tests {
             let values = mixer_fixture_values(tensors, &name, &[rows, geometry.hidden as usize])?;
             let mut work = Work::new(&self.device.stream, self.spec, rows)?;
             self.device.stream.memcpy_htod(&values, &mut work.n)?;
-            let plan = LayerDequantPlan::from_manifest(&self.catalog.manifest, layer as u32)?;
+            let plan = LayerDequantPlan::from_manifest(
+                &self.catalog.manifest,
+                layer as u32,
+                model.linear_format,
+            )?;
             ensure!(
                 plan.bytes == 0 && plan.slots.is_empty(),
                 "native mixer has a dequant arena"
