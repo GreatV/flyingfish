@@ -2294,23 +2294,87 @@ mod tests {
         )?;
         require_qwen35_geometry(&minicpm)?;
         for original in [&spec, &minicpm] {
-            let mut bad = original.clone();
-            bad.q_heads += 1;
-            assert!(require_qwen35_geometry(&bad).is_err());
-            let mut bad = original.clone();
-            bad.gdn.as_mut().unwrap().value_heads = 64;
-            assert!(require_qwen35_geometry(&bad).is_err());
-            let mut bad = original.clone();
-            bad.head_dim = 128;
-            bad.q_width = bad.q_heads * bad.head_dim;
-            assert!(require_qwen35_geometry(&bad).is_err());
-            let mut bad = original.clone();
-            bad.gdn = None;
-            assert!(require_qwen35_geometry(&bad).is_err());
+            for field in [
+                "hidden_size",
+                "intermediate_size",
+                "vocab_size",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "head_dim",
+                "q_width",
+                "max_position_embeddings",
+                "rotary_dim",
+                "num_hidden_layers",
+                "rms_norm_eps",
+                "rope_theta",
+                "linear_num_key_heads",
+                "linear_num_value_heads",
+                "linear_key_head_dim",
+                "linear_value_head_dim",
+                "linear_conv_kernel_dim",
+                "gdn",
+                "linear_format",
+                "architecture",
+            ] {
+                let mut bad = original.clone();
+                match field {
+                    "hidden_size" => bad.hidden += 1,
+                    "intermediate_size" => bad.intermediate += 1,
+                    "vocab_size" => bad.vocab += 1,
+                    "num_attention_heads" => bad.q_heads += 1,
+                    "num_key_value_heads" => bad.kv_heads += 1,
+                    "head_dim" => bad.head_dim += 1,
+                    "q_width" => bad.q_width += 1,
+                    "max_position_embeddings" => bad.max_position += 1,
+                    "rotary_dim" => bad.rotary_dim += 1,
+                    "num_hidden_layers" => {
+                        bad.layers.pop();
+                    }
+                    "rms_norm_eps" => bad.rms_eps *= 2.0,
+                    "rope_theta" => bad.rope_theta *= 2.0,
+                    "linear_num_key_heads" => bad.gdn.as_mut().unwrap().key_heads += 1,
+                    "linear_num_value_heads" => bad.gdn.as_mut().unwrap().value_heads += 1,
+                    "linear_key_head_dim" => bad.gdn.as_mut().unwrap().key_head_dim += 1,
+                    "linear_value_head_dim" => bad.gdn.as_mut().unwrap().value_head_dim += 1,
+                    "linear_conv_kernel_dim" => bad.gdn.as_mut().unwrap().conv_kernel += 1,
+                    "gdn" => bad.gdn = None,
+                    "linear_format" => {
+                        bad.linear_format = match original.linear_format {
+                            crate::model_spec::LinearFormat::Bf16 => {
+                                crate::model_spec::LinearFormat::Fp8E4m3Block128
+                            }
+                            crate::model_spec::LinearFormat::Fp8E4m3Block128 => {
+                                crate::model_spec::LinearFormat::Bf16
+                            }
+                        }
+                    }
+                    "architecture" => bad.architecture = crate::model_spec::Architecture::Llama,
+                    _ => unreachable!(),
+                }
+                let error = require_qwen35_geometry(&bad).unwrap_err().to_string();
+                assert!(error.contains(&format!("{field}=")), "{field}: {error}");
+            }
         }
-        let mut unquantized = spec;
-        unquantized.linear_format = crate::model_spec::LinearFormat::Bf16;
-        assert!(require_qwen35_geometry(&unquantized).is_err());
+        let error = Engine::load_qwen(
+            Path::new("unused-model"),
+            0,
+            32,
+            Some(1),
+            Settings {
+                tree_builder: crate::backend::TreeBuilder::Waves,
+                spec_budget: crate::backend::SpecBudget::Chain,
+                spec_graph: false,
+                draft_model: None,
+                prefix_cache: false,
+                kv_format: crate::kv::KvFormat::Bf16,
+                runtime_dir: None,
+            },
+            super::super::SetupMode::Prepare,
+            minicpm,
+        )
+        .err()
+        .context("MoE model reached device setup")?;
+        assert!(error.to_string().contains("MoE FFN execution"), "{error}");
         Ok(())
     }
 
