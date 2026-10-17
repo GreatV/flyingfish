@@ -1,7 +1,6 @@
 //! Host expert block arena with per-block read leases and writer claims.
 use anyhow::{Context, Result, ensure};
 use half::bf16;
-use std::cell::UnsafeCell;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,9 +9,11 @@ use std::sync::{Arc, Mutex};
 const WRITER: u32 = u32::MAX;
 
 /// Fixed-size host expert blocks. A block is written only under an exclusive writer claim, after
-/// the caller has ordered the write behind that block's device copy event.
+/// the caller has ordered the write behind that block's device copy event. References are formed
+/// per block from the raw base pointer; the backing box is never viewed as a whole after `new`.
 pub struct HostBlocks {
-    data: UnsafeCell<Box<[bf16]>>,
+    _data: Box<[bf16]>,
+    base: *mut bf16,
     elements: usize,
     block_elements: usize,
     words: Box<[AtomicU32]>,
@@ -20,7 +21,7 @@ pub struct HostBlocks {
 }
 
 // SAFETY: reads go through a lease on the block and writes through a writer claim on the block;
-// the data pointer is allocated once for the arena lifetime.
+// the base pointer is allocated once for the arena lifetime.
 unsafe impl Send for HostBlocks {}
 unsafe impl Sync for HostBlocks {}
 
@@ -69,16 +70,19 @@ impl WriteClaim {
     /// Host slice of the claimed block.
     pub fn slice(&mut self) -> Result<&mut [bf16]> {
         let range = self.arena.block_range(self.block)?;
-        // SAFETY: this guard holds the block's exclusive writer claim.
-        let data: &mut [bf16] = unsafe { &mut *self.arena.data.get() };
-        Ok(&mut data[range])
+        // SAFETY: this guard holds the block's exclusive writer claim and the reference covers
+        // only the claimed block.
+        Ok(
+            unsafe {
+                std::slice::from_raw_parts_mut(self.arena.base.add(range.start), range.len())
+            },
+        )
     }
 
     /// Host address of the claimed block for a D2H copy.
     pub fn pointer(&self) -> Result<u64> {
         let range = self.arena.block_range(self.block)?;
-        let data: &[bf16] = unsafe { &*self.arena.data.get() };
-        Ok(data[range].as_ptr() as u64)
+        Ok(unsafe { self.arena.base.add(range.start) } as u64)
     }
 }
 
@@ -89,8 +93,11 @@ impl HostBlocks {
         let elements = usize::try_from(blocks)?
             .checked_mul(block_elements)
             .context("host arena extent overflow")?;
+        let mut data = vec![bf16::ZERO; elements].into_boxed_slice();
+        let base = data.as_mut_ptr();
         Ok(Arc::new(Self {
-            data: UnsafeCell::new(vec![bf16::ZERO; elements].into_boxed_slice()),
+            _data: data,
+            base,
             elements,
             block_elements,
             words: (0..blocks).map(|_| AtomicU32::new(0)).collect(),
@@ -168,8 +175,8 @@ impl HostBlocks {
 
     fn block_slice(&self, block: u32) -> Result<&[bf16]> {
         let range = self.block_range(block)?;
-        let data: &[bf16] = unsafe { &*self.data.get() };
-        Ok(&data[range])
+        // SAFETY: the caller holds a lease on this block; the reference covers only this block.
+        Ok(unsafe { std::slice::from_raw_parts(self.base.add(range.start), range.len()) })
     }
 }
 
