@@ -2,6 +2,7 @@ pub mod backend;
 pub mod bench;
 pub mod checkpoint;
 pub mod config;
+pub mod cpu;
 pub mod dspark;
 pub mod fp8;
 pub mod gdn_plan;
