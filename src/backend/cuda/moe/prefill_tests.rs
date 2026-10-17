@@ -1221,10 +1221,12 @@ fn moe_prefill_gpu() -> Result<()> {
         );
     }
 
-    // K4 two-cohort join: the routed rows=37 input split into choice-parity
-    // cohorts contributed into ONE caller-owned contributions/done pair,
-    // then one wrapper-style join with the union mask; bitwise equal to the
-    // single all-active cohort run.
+    // K4 two-cohort join, two partitions of the routed rows=37 input into
+    // ONE caller-owned contributions/done pair plus one wrapper-style join
+    // with the union mask. The FAIL predicate is the production cohort
+    // form: split by expert id parity (every expert's rows wholly in one
+    // cohort). The choice-parity split is reported only (first differing
+    // word if any).
     {
         let rows = 37usize;
         let mut ids = vec![0i32; rows * top_k];
@@ -1256,6 +1258,34 @@ fn moe_prefill_gpu() -> Result<()> {
             &shared_out,
             &[all_active(rows, top_k)],
         )?;
+        let mut by_expert = (vec![0u32; rows * top_k], vec![0u32; rows * top_k]);
+        for (a, &id) in ids.iter().enumerate() {
+            if id % 2 == 0 {
+                by_expert.0[a] = 1;
+            } else {
+                by_expert.1[a] = 1;
+            }
+        }
+        let expert_split = join_bits(
+            &ctx,
+            rows,
+            &ids,
+            &weights,
+            &gens,
+            &shared_out,
+            &[by_expert.0, by_expert.1],
+        )?;
+        let expert_bad = single.iter().zip(&expert_split).position(|(a, b)| a != b);
+        eprintln!(
+            "moe_prefill K4 two-cohort join rows={rows} cohorts=expert-parity words={} first_differing_word={:?} (FAIL predicate)",
+            single.len(),
+            expert_bad
+        );
+        anyhow::ensure!(
+            expert_bad.is_none(),
+            "expert-parity two-cohort join is not bitwise equal to the single cohort: first differing word {expert_bad:?} of {}",
+            single.len()
+        );
         let mut even = vec![0u32; rows * top_k];
         let mut odd = vec![0u32; rows * top_k];
         for a in 0..rows * top_k {
@@ -1268,14 +1298,9 @@ fn moe_prefill_gpu() -> Result<()> {
         let split = join_bits(&ctx, rows, &ids, &weights, &gens, &shared_out, &[even, odd])?;
         let first_bad = single.iter().zip(&split).position(|(a, b)| a != b);
         eprintln!(
-            "moe_prefill K4 two-cohort join rows={rows} cohorts=choice-parity words={} first_differing_word={:?}",
+            "moe_prefill K4 two-cohort join rows={rows} cohorts=choice-parity words={} first_differing_word={:?} (reported result, not a FAIL predicate)",
             single.len(),
             first_bad
-        );
-        anyhow::ensure!(
-            first_bad.is_none(),
-            "two-cohort join is not bitwise equal to the single cohort: first differing word {first_bad:?} of {}",
-            single.len()
         );
     }
 
@@ -1579,4 +1604,10 @@ fn prefill_pos_of_bounds_gpu() -> Result<()> {
         status.code()
     );
     Ok(())
+}
+
+#[test]
+fn stage_accounting_is_pinned() {
+    assert_eq!(super::prefill::stage_host_pinned_bytes(), 57_676);
+    assert_eq!(super::prefill::stage_device_bytes(), 49_224);
 }

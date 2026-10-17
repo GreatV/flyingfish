@@ -398,6 +398,18 @@ pub(crate) struct PrefillLayout {
     bytes: u64,
 }
 
+/// Persistent pinned host bytes reserved by PrefillOps::new: one D2H
+/// window plus the two GEMM pointer mirrors.
+pub fn stage_host_pinned_bytes() -> u64 {
+    (D2H_WINDOW_WORDS * 4 + (GEMM1_PTR_WORDS + GEMM2_PTR_WORDS) * 8) as u64
+}
+
+/// Persistent device bytes reserved by PrefillOps::new: the two GEMM
+/// pointer blocks.
+pub fn stage_device_bytes() -> u64 {
+    ((GEMM1_PTR_WORDS + GEMM2_PTR_WORDS) * 8) as u64
+}
+
 pub(crate) fn prefill_scratch_bytes(
     rows: usize,
     top_k: usize,
