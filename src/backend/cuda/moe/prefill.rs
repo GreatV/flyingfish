@@ -1,6 +1,7 @@
-//! MoE prefill op: per-expert count/scan/permute, two cuBLAS grouped GEMMs
-//! (cublasGemmGroupedBatchedEx), SwiGLU and the weighted combine with the
-//! shared expert (kernels/moe_prefill.cu).
+//! MoE prefill op: per-expert count/scan/permute, two cuBLAS grouped GEMM
+//! stages (cublasGemmGroupedBatchedEx), silu_mul activation
+//! (kernels/act.cu), per-assignment contribution scaling and the shared
+//! combine (kernels/moe_combine.cu).
 //!
 //! Grouped-GEMM column-major mapping of the row-major buffers:
 //!   GEMM1 per expert e with m_e routed rows:
@@ -9,52 +10,50 @@
 //!     B = X_perm_e row-major [m_e,H] = column-major [H,m_e].
 //!     C = H1_e row-major [m_e,2I] = column-major [2I,m_e];
 //!     C = op(A)·B = H1_e^T, i.e. H1_e = X_perm_e·gate_up_e^T.
-//!   GEMM2 per expert e:
-//!     gemm(opA=T, opB=N, m=H, n=m_e, k=I, lda=I, ldb=I, ldc=H)
-//!     A = down_e row-major [H,I]; B = act_e [m_e,I]; C = Y_e [m_e,H] =
-//!     act_e·down_e^T.
+//!   GEMM2 per assignment (one n=1 problem each):
+//!     gemm(opA=T, opB=N, m=H, n=1, k=I, lda=I, ldb=I, ldc=H)
+//!     A = down_e row-major [H,I]; B = act row [I]; C = contributions row
+//!     [H] at slot row*top_k + choice, so the down projection lands each
+//!     assignment's output at its (row, choice) slot and moe_scale applies
+//!     the router weight at the BF16 boundary.
 //!   Shared expert runs as extra problems over all rows: gate and up as one
 //!   m=I, n=rows, k=H group of size 2 writing the two halves of H1s
 //!   [rows,2I] (ldc=2I), down as one m=H, n=rows, k=I problem (FP32
-//!   accumulate, BF16 out, alpha=1, beta=0). It shares the grouped call
-//!   instead of the Blas cuBLASLt path: the Lt path requires setup-time
-//!   plans, calibration state and a runtime directory, and the numerics
-//!   (CUBLAS_COMPUTE_32F in, BF16 out) are identical here.
+//!   accumulate, BF16 out, alpha=1, beta=0) writing shared_out [rows,H].
 //!
 //! Count sync: the m/n/k/ld arrays of this cuBLAS API are host-side, so
 //! after the permute launch the op copies counts[E], the active-assignment
-//! total, the scan total and the two slot tables to the host and
+//! total, the scan total and the provenance pairs to the host and
 //! synchronizes the stream once per call; per-expert problem sizes and the
-//! A/B/C device pointer arrays are built from those host values and uploaded
-//! back. The A pointers of routed experts come from the device slot table
-//! values, so weights may live in non-contiguous staging buffers.
+//! A/B/C device pointer arrays are built from those host values and
+//! uploaded back. The per-expert weight pointers come from the caller's
+//! host slot tables; the tables and every input tensor are immutable until
+//! the returned event.
 //!
-//! Active cohort and slot generation (T3 revision 2026-10-17): `active
-//! [rows,top_k]` selects the assignments this launch computes; inactive
-//! assignments are never dereferenced and trip no guard. An active
-//! assignment on a slot with slot_valid == 0 or slot_generation !=
-//! assignment_gen (the per-assignment snapshot at routing time) traps. Permute stores the (row, choice) provenance
-//! pair per slot (src_row/src_choice) plus the inverse map inv_pos[a] = pos;
-//! the combine applies exactly the active (row, choice) pairs once and
-//! checks each join against the stored pair. The scan total is asserted
-//! equal to the count kernel's active-assignment total.
+//! Active cohort and slot generation: `active [rows,top_k]` selects the
+//! assignments this launch computes; inactive assignments are never
+//! dereferenced and trip no guard. An active assignment on a slot with
+//! slot_valid == 0 or slot_generation != assignment_gen (the per-assignment
+//! snapshot at routing time) traps. Permute stores the (row, choice)
+//! provenance pair per slot and sets done[a] = 1 exactly once (a pre-set
+//! done traps); the scan total is asserted equal to the count kernel's
+//! active-assignment total. When that total is zero the routed problems
+//! (grouped GEMMs, silu, gemm2, scale) are skipped and the combine writes
+//! the shared-only output.
 //!
-//! Zero-count experts are excluded from the problem list on the host; the
-//! cuBLAS 13.4 documentation of cublasGemmGroupedBatchedEx only rejects
-//! negative m/n/k/group_size (CUBLAS_STATUS_INVALID_VALUE) and states no
-//! semantics for zero-sized problems, so none are passed.
+//! Zero-count experts are excluded from the problem list.
 use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
 use anyhow::{Context, Result, ensure};
 use cudarc::{
     cublas::{CudaBlas, sys as bs},
-    driver::{
-        CudaContext, CudaEvent, CudaFunction, CudaStream, LaunchConfig, PushKernelArg, sys as ds,
-    },
+    driver::{CudaContext, CudaEvent, CudaFunction, CudaStream, PushKernelArg, sys as ds},
 };
 use half::bf16;
 use std::sync::Arc;
+
+use super::combine::{CombineOps, MoeCombine};
 
 const SCAN_THREADS: u32 = 1024;
 const BLOCK_THREADS: u32 = 256;
@@ -65,20 +64,22 @@ const REGION: u64 = 256;
 /// cuBLAS BF16 pointer rule: (k*2)%16==0 needs 16B, (k*2)%4==0 needs 4B.
 const ALIGN_BYTES: u64 = 16;
 const ALIGN_MIN_BYTES: u64 = 4;
-/// grid.y limit of the SwiGLU launch.
-const MAX_GRID_Y: u64 = 65535;
 
 #[derive(Debug)]
-pub(crate) struct MoePrefill {
+pub(crate) struct MoePrefill<'a> {
     pub x: Tensor<bf16, 2>,
     pub ids: Tensor<i32, 2>,
     pub active: Tensor<u32, 2>,
     pub weights: Tensor<bf16, 2>,
-    pub slots_gate_up: Tensor<u64, 1>,
+    pub slot_valid: Tensor<u32, 1>,
     pub slot_generation: Tensor<u64, 1>,
     pub assignment_gen: Tensor<u64, 2>,
-    pub slots_down: Tensor<u64, 1>,
-    pub slot_valid: Tensor<u32, 1>,
+    /// `[experts]` device addresses of each expert's fused gate/up blocks.
+    /// Immutable until the event returned by `PrefillOps::prefill`.
+    pub slots_gate_up_host: &'a [u64],
+    /// `[experts]` device addresses of each expert's down blocks.
+    /// Immutable until the event returned by `PrefillOps::prefill`.
+    pub slots_down_host: &'a [u64],
     pub shared_gate: Tensor<bf16, 2>,
     pub shared_up: Tensor<bf16, 2>,
     pub shared_down: Tensor<bf16, 2>,
@@ -93,23 +94,24 @@ pub(crate) struct PrefillPlan {
     experts: u32,
     hidden: u32,
     inter: u32,
-    x_stride: u64,
     assignments: u64,
     layout: PrefillLayout,
 }
 
-impl MoePrefill {
+impl MoePrefill<'_> {
     pub(crate) fn validate(&self) -> Result<PrefillPlan> {
         self.x.validate()?;
         self.y.read().validate()?;
         let (rows, hidden) = (self.x.shape[0], self.x.shape[1]);
         ensure!(
-            self.x.stride[1] == 1 && self.x.stride[0] >= u64::from(hidden),
-            "moe prefill requires unit inner stride on x"
+            self.x.stride == [u64::from(hidden), 1],
+            "moe prefill x must be dense [rows, hidden] (stride {:?}, hidden {hidden})",
+            self.x.stride
         );
         ensure!(
             self.y.read().shape == [rows, hidden] && self.y.read().stride == [u64::from(hidden), 1],
-            "moe prefill y must be a dense [rows, hidden] view"
+            "moe prefill y must be a dense [rows, hidden] view (shape {:?}, hidden {hidden})",
+            self.y.read().shape
         );
         self.ids.validate()?;
         self.active.validate()?;
@@ -125,23 +127,24 @@ impl MoePrefill {
                 && self.weights.stride == [u64::from(top_k), 1]
                 && self.assignment_gen.shape == [rows, top_k]
                 && self.assignment_gen.stride == [u64::from(top_k), 1],
-            "moe prefill ids/active/weights/assignment_gen must be dense [rows, top_k] views"
+            "moe prefill ids/active/weights/assignment_gen must be dense [rows, top_k] views (top_k {top_k})"
         );
-        let experts = self.slots_gate_up.shape[0];
-        self.slots_gate_up.validate()?;
-        self.slots_down.validate()?;
+        let experts = self.slot_valid.shape[0];
         self.slot_valid.validate()?;
         self.slot_generation.validate()?;
         ensure!(
-            self.slots_gate_up.shape == [experts]
-                && self.slots_gate_up.stride == [1]
-                && self.slots_down.shape == [experts]
-                && self.slots_down.stride == [1]
-                && self.slot_valid.shape == [experts]
+            self.slot_valid.shape == [experts]
                 && self.slot_valid.stride == [1]
                 && self.slot_generation.shape == [experts]
                 && self.slot_generation.stride == [1],
-            "moe prefill slot tables must be dense [experts] views"
+            "moe prefill slot tables must be dense [experts] views (experts {experts})"
+        );
+        ensure!(
+            self.slots_gate_up_host.len() == experts as usize
+                && self.slots_down_host.len() == experts as usize,
+            "moe prefill host slot tables must hold one pointer per expert (gate_up {}, down {}, experts {experts})",
+            self.slots_gate_up_host.len(),
+            self.slots_down_host.len()
         );
         let inter = self.shared_gate.shape[0];
         self.shared_gate.validate()?;
@@ -157,34 +160,34 @@ impl MoePrefill {
                 && self.shared_down.stride == [u64::from(inter), 1]
                 && self.shared_expert_gate.shape == [hidden]
                 && self.shared_expert_gate.stride == [1],
-            "moe prefill shared expert layout mismatch"
+            "moe prefill shared expert layout mismatch (inter {inter}, hidden {hidden})"
         );
         ensure!(
             experts as usize <= MAX_EXPERTS,
-            "moe prefill expert count above 1024"
+            "moe prefill expert count {experts} above 1024"
         );
         ensure!(
             top_k >= 1 && top_k as usize <= MAX_TOP_K,
-            "moe prefill top_k outside [1,32]"
+            "moe prefill top_k {top_k} outside [1,32]"
         );
         ensure!(
             hidden.is_multiple_of(2) && inter.is_multiple_of(2),
-            "moe prefill hidden/inter must be even for cuBLAS BF16 alignment"
+            "moe prefill hidden {hidden} and inter {inter} must be even for cuBLAS BF16 alignment"
         );
         ensure!(
-            u64::from(hidden) <= i32::MAX as u64
-                && u64::from(inter) <= i32::MAX as u64
-                && self.x.stride[0] <= i32::MAX as u64,
-            "moe prefill dimensions exceed the cuBLAS grouped i32 leading dims"
+            u64::from(hidden) <= i32::MAX as u64 && u64::from(inter) <= i32::MAX as u64,
+            "moe prefill hidden {hidden} and inter {inter} exceed the cuBLAS grouped i32 leading dims"
         );
         let assignments = u64::from(rows) * u64::from(top_k);
         ensure!(
             assignments <= i32::MAX as u64,
-            "moe prefill assignment count exceeds i32"
+            "moe prefill assignment count {assignments} exceeds i32"
         );
+        let silu_routed = assignments * u64::from(inter);
+        let silu_shared = u64::from(rows) * u64::from(inter);
         ensure!(
-            assignments <= MAX_GRID_Y && u64::from(rows) <= MAX_GRID_Y,
-            "moe prefill rows exceed the SwiGLU grid"
+            silu_routed <= i32::MAX as u64 && silu_shared <= i32::MAX as u64,
+            "moe prefill activation elements assignments*inter {silu_routed} and rows*inter {silu_shared} exceed the silu_mul flat-grid index"
         );
         no_overlap(&self.x, &self.y.read(), "x", "y")?;
         no_overlap(&self.ids, &self.y.read(), "ids", "y")?;
@@ -211,7 +214,6 @@ impl MoePrefill {
             experts,
             hidden,
             inter,
-            x_stride: self.x.stride[0],
             assignments,
             layout,
         })
@@ -240,15 +242,15 @@ pub(crate) struct PrefillLayout {
     cursor: u64,
     src_row: u64,
     src_choice: u64,
-    inv_pos: u64,
-    w_row: u64,
+    done: u64,
     x_perm: u64,
     h1: u64,
     act: u64,
-    y_perm: u64,
+    contributions: u64,
     h1s: u64,
     act_s: u64,
-    y_s: u64,
+    shared_out: u64,
+    scale: u64,
     ptra1: u64,
     ptrb1: u64,
     ptrc1: u64,
@@ -264,10 +266,8 @@ pub(crate) fn prefill_scratch_bytes(
     experts: usize,
     hidden: usize,
     inter: usize,
-) -> u64 {
-    prefill_layout(rows, top_k, experts, hidden, inter)
-        .expect("moe prefill scratch size overflow")
-        .bytes
+) -> Result<u64> {
+    prefill_layout(rows, top_k, experts, hidden, inter).map(|layout| layout.bytes)
 }
 
 fn region(at: &mut u64, elements: usize, element_bytes: u64) -> Result<u64> {
@@ -300,21 +300,21 @@ fn prefill_layout(
     let cursor = region(&mut at, experts, 4)?;
     let src_row = region(&mut at, assignments, 4)?;
     let src_choice = region(&mut at, assignments, 4)?;
-    let inv_pos = region(&mut at, assignments, 4)?;
-    let w_row = region(&mut at, assignments, 2)?;
+    let done = region(&mut at, assignments, 4)?;
     let x_perm = region(&mut at, assignments * hidden, 2)?;
     let h1 = region(&mut at, assignments * 2 * inter, 2)?;
     let act = region(&mut at, assignments * inter, 2)?;
-    let y_perm = region(&mut at, assignments * hidden, 2)?;
+    let contributions = region(&mut at, assignments * hidden, 2)?;
     let h1s = region(&mut at, rows * 2 * inter, 2)?;
     let act_s = region(&mut at, rows * inter, 2)?;
-    let y_s = region(&mut at, rows * hidden, 2)?;
+    let shared_out = region(&mut at, rows * hidden, 2)?;
+    let scale = region(&mut at, rows, 2)?;
     let ptra1 = region(&mut at, experts + 2, 8)?;
     let ptrb1 = region(&mut at, experts + 2, 8)?;
     let ptrc1 = region(&mut at, experts + 2, 8)?;
-    let ptra2 = region(&mut at, experts + 2, 8)?;
-    let ptrb2 = region(&mut at, experts + 2, 8)?;
-    let ptrc2 = region(&mut at, experts + 2, 8)?;
+    let ptra2 = region(&mut at, assignments + 1, 8)?;
+    let ptrb2 = region(&mut at, assignments + 1, 8)?;
+    let ptrc2 = region(&mut at, assignments + 1, 8)?;
     Ok(PrefillLayout {
         counts,
         active_total,
@@ -322,15 +322,15 @@ fn prefill_layout(
         cursor,
         src_row,
         src_choice,
-        inv_pos,
-        w_row,
+        done,
         x_perm,
         h1,
         act,
-        y_perm,
+        contributions,
         h1s,
         act_s,
-        y_s,
+        shared_out,
+        scale,
         ptra1,
         ptrb1,
         ptrc1,
@@ -373,55 +373,21 @@ struct GemmGroup {
     size: i32,
 }
 
-/// Pipeline stages; marks[i] is recorded before stage i starts, marks[i+1]
-/// after it. The count-sync host gap lands inside the gemm1 stage, so
-/// StageTiming::sync_us reports it separately.
-pub(crate) const STAGES: [&str; 7] = [
-    "count", "scan", "permute", "gemm1", "swiglu", "gemm2", "combine",
-];
-
-pub(crate) struct StageTiming {
-    marks: Vec<CudaEvent>,
-    /// Host wall time of the counts D2H copies plus the stream synchronize.
-    pub(crate) sync_us: f64,
-}
-
-impl StageTiming {
-    pub(crate) fn new(stream: &Arc<CudaStream>) -> Result<Self> {
-        let ctx = stream.context();
-        let marks = (0..=STAGES.len())
-            .map(|_| ctx.new_event(Some(ds::CUevent_flags::CU_EVENT_DEFAULT)))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(Self {
-            marks,
-            sync_us: 0.0,
-        })
-    }
-    fn mark(&mut self, stream: &Arc<CudaStream>, stage: usize) -> Result<()> {
-        self.marks[stage].record(stream)?;
-        Ok(())
-    }
-    /// Stream time of one stage in microseconds.
-    pub(crate) fn stage_us(&self, stage: usize) -> Result<f32> {
-        Ok(self.marks[stage].elapsed_ms(&self.marks[stage + 1])? * 1000.0)
-    }
-    pub(crate) fn total_us(&self) -> Result<f32> {
-        Ok(self.marks[0].elapsed_ms(&self.marks[STAGES.len()])? * 1000.0)
-    }
-}
-
 pub(crate) struct PrefillOps {
     count: CudaFunction,
     scan: CudaFunction,
     permute: CudaFunction,
-    swiglu: CudaFunction,
-    combine: CudaFunction,
+    scale: CudaFunction,
+    silu: CudaFunction,
+    combine: CombineOps,
     blas: CudaBlas,
+    stream: Arc<CudaStream>,
 }
 
 impl PrefillOps {
     pub fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<Self> {
         let module = cubin::module(ctx, "moe_prefill")?;
+        let act = cubin::module(ctx, "act")?;
         let blas = CudaBlas::new(stream.clone())?;
         unsafe {
             bs::cublasSetMathMode(
@@ -434,33 +400,32 @@ impl PrefillOps {
             count: module.load_function("moe_count")?,
             scan: module.load_function("moe_scan")?,
             permute: module.load_function("moe_permute")?,
-            swiglu: module.load_function("moe_swiglu")?,
-            combine: module.load_function("moe_combine")?,
+            scale: module.load_function("moe_scale")?,
+            silu: act.load_function("silu_mul")?,
+            combine: CombineOps::new(ctx)?,
             blas,
+            stream: stream.clone(),
         })
     }
 
+    /// Contribute + combine over the active assignments and the shared expert.
+    /// Records and returns the completion event of the final combine launch;
+    /// the host slot tables and every input tensor are immutable until that
+    /// event completes.
     pub fn prefill(
         &self,
         stream: &Arc<CudaStream>,
-        input: MoePrefill,
+        input: MoePrefill<'_>,
         scratch: &Scratch,
-    ) -> Result<()> {
-        self.run(stream, input, scratch, None)
-    }
-
-    pub(crate) fn run(
-        &self,
-        stream: &Arc<CudaStream>,
-        input: MoePrefill,
-        scratch: &Scratch,
-        mut timing: Option<&mut StageTiming>,
-    ) -> Result<()> {
+    ) -> Result<CudaEvent> {
+        ensure!(
+            Arc::ptr_eq(stream, &self.stream),
+            "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
+        );
         let plan = input.validate()?;
         scratch.validate(plan.layout.bytes)?;
         let experts = plan.experts as usize;
         let (rows, top_k, hidden, inter) = (plan.rows, plan.top_k, plan.hidden, plan.inter);
-        let x_stride = plan.x_stride as i64;
         let layout = &plan.layout;
         let counts_at = scratch.ptr + layout.counts;
         let active_total_at = scratch.ptr + layout.active_total;
@@ -468,18 +433,18 @@ impl PrefillOps {
         let cursor_at = scratch.ptr + layout.cursor;
         let src_row_at = scratch.ptr + layout.src_row;
         let src_choice_at = scratch.ptr + layout.src_choice;
-        let inv_pos_at = scratch.ptr + layout.inv_pos;
-        let w_row_at = scratch.ptr + layout.w_row;
+        let done_at = scratch.ptr + layout.done;
         let x_perm_at = scratch.ptr + layout.x_perm;
         let h1_at = scratch.ptr + layout.h1;
         let act_at = scratch.ptr + layout.act;
-        let y_perm_at = scratch.ptr + layout.y_perm;
+        let contributions_at = scratch.ptr + layout.contributions;
         let h1s_at = scratch.ptr + layout.h1s;
         let act_s_at = scratch.ptr + layout.act_s;
-        let y_s_at = scratch.ptr + layout.y_s;
+        let shared_out_at = scratch.ptr + layout.shared_out;
+        let scale_at = scratch.ptr + layout.scale;
 
-        if let Some(t) = timing.as_mut() {
-            t.mark(stream, 0)?;
+        unsafe {
+            zero_words(stream, done_at, plan.assignments as usize)?;
         }
         unsafe {
             stream
@@ -493,9 +458,6 @@ impl PrefillOps {
                 .arg(&(top_k as i32))
                 .launch(grid(1, SCAN_THREADS))?;
         }
-        if let Some(t) = timing.as_mut() {
-            t.mark(stream, 1)?;
-        }
         unsafe {
             stream
                 .launch_builder(&self.scan)
@@ -505,14 +467,10 @@ impl PrefillOps {
                 .arg(&(experts as i32))
                 .launch(grid(1, SCAN_THREADS))?;
         }
-        if let Some(t) = timing.as_mut() {
-            t.mark(stream, 2)?;
-        }
         unsafe {
             stream
                 .launch_builder(&self.permute)
                 .arg(&input.ids.ptr)
-                .arg(&input.weights.ptr)
                 .arg(&input.x.ptr)
                 .arg(&offsets_at)
                 .arg(&cursor_at)
@@ -520,37 +478,31 @@ impl PrefillOps {
                 .arg(&input.slot_generation.ptr)
                 .arg(&input.assignment_gen.ptr)
                 .arg(&input.active.ptr)
+                .arg(&done_at)
                 .arg(&src_row_at)
                 .arg(&src_choice_at)
-                .arg(&w_row_at)
-                .arg(&inv_pos_at)
                 .arg(&x_perm_at)
                 .arg(&(rows as i32))
                 .arg(&(top_k as i32))
                 .arg(&(experts as i32))
                 .arg(&(hidden as i64))
-                .arg(&x_stride)
                 .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
-        }
-        if let Some(t) = timing.as_mut() {
-            t.mark(stream, 3)?;
         }
 
         // Count sync: the grouped-GEMM m/n/k/ld arrays are host-side in
-        // cuBLAS, so counts, the scan total and the slot tables come to the
-        // host here and the stream synchronizes once per prefill call.
-        let sync_start = std::time::Instant::now();
+        // cuBLAS, so counts, the scan total and the provenance pairs come to
+        // the host here and the stream synchronizes once per prefill call.
         let mut counts = vec![0i32; experts];
-        let mut slots_gu = vec![0u64; experts];
-        let mut slots_dn = vec![0u64; experts];
+        let mut src_row = vec![0i32; plan.assignments as usize];
+        let mut src_choice = vec![0i32; plan.assignments as usize];
         let mut total = [0i32; 1];
         let mut active_total = [0i32; 1];
         unsafe {
             dtoh(stream, counts_at, &mut counts)?;
             dtoh(stream, active_total_at, &mut active_total)?;
-            dtoh(stream, input.slots_gate_up.ptr, &mut slots_gu)?;
-            dtoh(stream, input.slots_down.ptr, &mut slots_dn)?;
             dtoh(stream, offsets_at + (experts as u64) * 4, &mut total)?;
+            dtoh(stream, src_row_at, &mut src_row)?;
+            dtoh(stream, src_choice_at, &mut src_choice)?;
         }
         stream.synchronize()?;
         ensure!(
@@ -559,9 +511,7 @@ impl PrefillOps {
             total[0],
             active_total[0]
         );
-        if let Some(t) = timing.as_mut() {
-            t.sync_us = sync_start.elapsed().as_secs_f64() * 1e6;
-        }
+        let active_total = active_total[0] as u64;
 
         let order = problem_order(&counts);
         let runs = group_runs(&order, &counts);
@@ -578,27 +528,29 @@ impl PrefillOps {
         };
         for &e in &order {
             let e = e as usize;
+            let gu = input.slots_gate_up_host[e];
+            let dn = input.slots_down_host[e];
             ensure!(
-                slots_gu[e] != 0 && slots_dn[e] != 0,
-                "null expert slot pointer"
+                gu != 0,
+                "moe prefill gate_up slot pointer of expert {e} is null"
             );
             ensure!(
-                slots_gu[e].is_multiple_of(gu_align),
-                "gate_up slot pointer of expert {e} below cuBLAS alignment"
+                dn != 0,
+                "moe prefill down slot pointer of expert {e} is null"
             );
             ensure!(
-                slots_dn[e].is_multiple_of(dn_align),
-                "down slot pointer of expert {e} below cuBLAS alignment"
+                gu.is_multiple_of(gu_align),
+                "moe prefill gate_up slot pointer of expert {e} (0x{gu:x}) below cuBLAS alignment {gu_align}"
+            );
+            ensure!(
+                dn.is_multiple_of(dn_align),
+                "moe prefill down slot pointer of expert {e} (0x{dn:x}) below cuBLAS alignment {dn_align}"
             );
         }
         let mut a1 = Vec::with_capacity(order.len() + 2);
         let mut b1 = Vec::with_capacity(order.len() + 2);
         let mut c1 = Vec::with_capacity(order.len() + 2);
-        let mut a2 = Vec::with_capacity(order.len() + 1);
-        let mut b2 = Vec::with_capacity(order.len() + 1);
-        let mut c2 = Vec::with_capacity(order.len() + 1);
         let mut groups1 = Vec::with_capacity(runs.len() + 1);
-        let mut groups2 = Vec::with_capacity(runs.len() + 1);
         for &(count, size) in &runs {
             groups1.push(GemmGroup {
                 m: (2 * inter) as i32,
@@ -609,24 +561,12 @@ impl PrefillOps {
                 ldc: (2 * inter) as i32,
                 size: size as i32,
             });
-            groups2.push(GemmGroup {
-                m: hidden as i32,
-                n: count as i32,
-                k: inter as i32,
-                lda: inter as i32,
-                ldb: inter as i32,
-                ldc: hidden as i32,
-                size: size as i32,
-            });
         }
         for &e in &order {
             let off = offsets[e as usize] as u64;
-            a1.push(slots_gu[e as usize]);
+            a1.push(input.slots_gate_up_host[e as usize]);
             b1.push(x_perm_at + elem(off * u64::from(hidden)));
             c1.push(h1_at + elem(off * u64::from(2 * inter)));
-            a2.push(slots_dn[e as usize]);
-            b2.push(act_at + elem(off * u64::from(inter)));
-            c2.push(y_perm_at + elem(off * u64::from(hidden)));
         }
         a1.push(input.shared_gate.ptr);
         b1.push(input.x.ptr);
@@ -639,13 +579,48 @@ impl PrefillOps {
             n: rows as i32,
             k: hidden as i32,
             lda: hidden as i32,
-            ldb: plan.x_stride as i32,
+            ldb: hidden as i32,
             ldc: (2 * inter) as i32,
             size: 2,
         });
+
+        let mut a2 = Vec::with_capacity(active_total as usize + 1);
+        let mut b2 = Vec::with_capacity(active_total as usize + 1);
+        let mut c2 = Vec::with_capacity(active_total as usize + 1);
+        let mut groups2 = Vec::new();
+        if active_total > 0 {
+            for e in 0..experts {
+                let count = counts[e] as u64;
+                if count == 0 {
+                    continue;
+                }
+                let off = offsets[e] as u64;
+                for pos in off..off + count {
+                    let row = src_row[pos as usize];
+                    let choice = src_choice[pos as usize];
+                    let slot = row as i64 * i64::from(top_k) + choice as i64;
+                    ensure!(
+                        row >= 0 && choice >= 0 && slot >= 0 && slot < plan.assignments as i64,
+                        "moe prefill provenance slot {slot} out of range at position {pos} (row {row}, choice {choice})"
+                    );
+                    a2.push(input.slots_down_host[e]);
+                    b2.push(act_at + elem(pos * u64::from(inter)));
+                    c2.push(contributions_at + elem(slot as u64 * u64::from(hidden)));
+                }
+            }
+            groups2.push(GemmGroup {
+                m: hidden as i32,
+                n: 1,
+                k: inter as i32,
+                lda: inter as i32,
+                ldb: inter as i32,
+                ldc: hidden as i32,
+                size: active_total as i32,
+            });
+        }
         a2.push(input.shared_down.ptr);
         b2.push(act_s_at);
-        c2.push(y_s_at);
+        c2.push(shared_out_at);
         groups2.push(GemmGroup {
             m: hidden as i32,
             n: rows as i32,
@@ -668,33 +643,27 @@ impl PrefillOps {
             )
             .context("moe prefill grouped GEMM 1")?;
         }
-        if let Some(t) = timing.as_mut() {
-            t.mark(stream, 4)?;
-        }
 
-        let swiglu_grid = |n: u32, rows_y: u32| LaunchConfig {
-            grid_dim: (n.div_ceil(BLOCK_THREADS), rows_y, 1),
-            block_dim: (BLOCK_THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let silu_grid = |elems: usize| grid(elems.div_ceil(BLOCK_THREADS as usize), BLOCK_THREADS);
+        if active_total > 0 {
+            unsafe {
+                stream
+                    .launch_builder(&self.silu)
+                    .arg(&h1_at)
+                    .arg(&act_at)
+                    .arg(&(active_total as i32))
+                    .arg(&(inter as i32))
+                    .launch(silu_grid(active_total as usize * inter as usize))?;
+            }
+        }
         unsafe {
             stream
-                .launch_builder(&self.swiglu)
-                .arg(&h1_at)
-                .arg(&act_at)
-                .arg(&(active_total[0] as i64))
-                .arg(&(inter as i32))
-                .launch(swiglu_grid(inter, active_total[0] as u32))?;
-            stream
-                .launch_builder(&self.swiglu)
+                .launch_builder(&self.silu)
                 .arg(&h1s_at)
                 .arg(&act_s_at)
-                .arg(&(u64::from(rows) as i64))
+                .arg(&(rows as i32))
                 .arg(&(inter as i32))
-                .launch(swiglu_grid(inter, rows))?;
-        }
-        if let Some(t) = timing.as_mut() {
-            t.mark(stream, 5)?;
+                .launch(silu_grid(rows as usize * inter as usize))?;
         }
 
         unsafe {
@@ -709,33 +678,58 @@ impl PrefillOps {
             )
             .context("moe prefill grouped GEMM 2")?;
         }
-        if let Some(t) = timing.as_mut() {
-            t.mark(stream, 6)?;
+        if active_total > 0 {
+            unsafe {
+                stream
+                    .launch_builder(&self.scale)
+                    .arg(&contributions_at)
+                    .arg(&input.weights.ptr)
+                    .arg(&input.active.ptr)
+                    .arg(&(plan.assignments as i64))
+                    .arg(&(hidden as i64))
+                    .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
+            }
         }
 
-        unsafe {
-            stream
-                .launch_builder(&self.combine)
-                .arg(&y_perm_at)
-                .arg(&w_row_at)
-                .arg(&inv_pos_at)
-                .arg(&src_row_at)
-                .arg(&src_choice_at)
-                .arg(&input.active.ptr)
-                .arg(&input.x.ptr)
-                .arg(&input.shared_expert_gate.ptr)
-                .arg(&y_s_at)
-                .arg(&input.y.0.ptr)
-                .arg(&(rows as i32))
-                .arg(&(top_k as i32))
-                .arg(&(hidden as i64))
-                .arg(&x_stride)
-                .launch(grid(rows as usize, BLOCK_THREADS))?;
-        }
-        if let Some(t) = timing.as_mut() {
-            t.mark(stream, STAGES.len())?;
-        }
-        Ok(())
+        // moe_combine's scale column over the same [rows] words; the nonzero
+        // stride keeps Tensor::validate satisfied.
+        let mut scale =
+            unsafe { TensorMut::<bf16, 2>::new(scale_at, [rows, 1], [1, 1], u64::from(rows) * 2)? };
+        self.combine
+            .shared_scale(stream, input.x, input.shared_expert_gate, &mut scale)?;
+        let combine_input = MoeCombine {
+            ids: input.ids,
+            final_active: input.active,
+            done: unsafe {
+                Tensor::<u32, 2>::new(
+                    done_at,
+                    [rows, top_k],
+                    [u64::from(top_k), 1],
+                    plan.assignments * 4,
+                )?
+            },
+            contributions: unsafe {
+                Tensor::<bf16, 3>::new(
+                    contributions_at,
+                    [rows, top_k, hidden],
+                    [u64::from(top_k) * u64::from(hidden), u64::from(hidden), 1],
+                    plan.assignments * u64::from(hidden) * 2,
+                )?
+            },
+            shared_out: unsafe {
+                Tensor::<bf16, 2>::new(
+                    shared_out_at,
+                    [rows, hidden],
+                    [u64::from(hidden), 1],
+                    u64::from(rows) * u64::from(hidden) * 2,
+                )?
+            },
+            x: input.x,
+            shared_expert_gate: input.shared_expert_gate,
+            scale,
+            y: input.y,
+        };
+        self.combine.combine(stream, &combine_input)
     }
 
     /// cublasGemmGroupedBatchedEx with BF16 A/B/C, CUBLAS_COMPUTE_32F,
@@ -789,6 +783,17 @@ impl PrefillOps {
 
 fn elem(count: u64) -> u64 {
     count * 2
+}
+
+/// # Safety
+/// `dst` must address `words` writable device words that no in-flight work
+/// on the stream touches.
+unsafe fn zero_words(stream: &Arc<CudaStream>, dst: u64, words: usize) -> Result<()> {
+    stream.context().bind_to_thread()?;
+    unsafe {
+        ds::cuMemsetD32Async(dst, 0, words, stream.cu_stream()).result()?;
+    }
+    Ok(())
 }
 
 /// # Safety

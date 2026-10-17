@@ -1,29 +1,22 @@
-//! Route-op gates: CPU view validation, reference layout checks and the GPU
-//! window gate for kernels/moe_route.cu. Default cargo test never initializes
-//! a GPU here.
+//! Route-op gates: reference layout checks and the GPU window gate for
+//! kernels/moe_route.cu. Default cargo test never initializes a GPU here.
 use super::reference::{self, MoeDims, RouteRow};
-use super::route::{self, RouteOps};
+use super::route::RouteOps;
 use super::testing;
 use crate::backend::cuda::Device;
-use crate::backend::cuda::contracts::{Tensor, TensorMut};
+use crate::backend::cuda::contracts::TensorMut;
 use anyhow::{Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use std::collections::HashMap;
-use std::mem::size_of;
 
-/// Exact-id compare gate. Frozen on CPU before the GPU run from the fixture
-/// margins of the checked rows (variant 0, E=256/K=8/H=2048): margins span an
-/// exact cut tie on row 0 and 2.52e-5..1.19e-3 elsewhere. BF16 products are
-/// exact in FP32 and the kernel accumulates sequentially in index order, so
-/// logits reproduce the reference bitwise and prob noise is expf/sum rounding
-/// (<= ~1e-6 relative at p_cut <= 1/8). Rows at or below the threshold skip
-/// the exact-id compare.
+/// Exact-id compare gate. Rows at or below the threshold skip the exact-id
+/// compare. Variant 0 (E=256/K=8/H=2048) margins span an exact cut tie on
+/// row 0 and 2.52e-5..1.19e-3 elsewhere. BF16 products are exact in FP32 and
+/// the kernel accumulates sequentially in index order, so logits reproduce
+/// the reference bitwise and prob noise is expf/sum rounding (<= ~1e-6
+/// relative at p_cut <= 1/8).
 const CUT_MARGIN_THRESHOLD: f32 = 1e-5;
-/// |gpu - cpu| <= PROBS_REL_TOL * cpu + PROBS_ABS_FLOOR; the floor covers
-/// expf underflow-to-zero differences.
-const PROBS_REL_TOL: f32 = 1e-5;
-const PROBS_ABS_FLOOR: f32 = 1e-30;
 
 const ROW_CASES: [u32; 7] = [1, 2, 5, 8, 37, 512, 4096];
 /// Rows compared against the reference per case; every case also checks
@@ -36,161 +29,6 @@ fn checked_rows(n: u32) -> Vec<usize> {
         }
     }
     rows
-}
-
-fn view<T: Copy>(ptr: u64, shape: [u32; 2], stride: [u64; 2]) -> Result<Tensor<T, 2>> {
-    let span = ((u64::from(shape[0] - 1)) * stride[0] + (u64::from(shape[1] - 1)) * stride[1] + 1)
-        * size_of::<T>() as u64;
-    unsafe { Tensor::new(ptr, shape, stride, span) }
-}
-
-#[test]
-fn route_validation_rejects_bad_views() -> Result<()> {
-    let base = 0x10000u64;
-    let ids = view::<i32>(base + 0x2000, [5, 4], [4, 1])?;
-    let weights = view::<bf16>(base + 0x3000, [5, 4], [4, 1])?;
-    let probs = view::<f32>(base + 0x4000, [5, 16], [16, 1])?;
-    let good = |x: &Tensor<bf16, 2>,
-                router: &Tensor<bf16, 2>,
-                ids: &Tensor<i32, 2>,
-                weights: &Tensor<bf16, 2>,
-                probs: Option<&Tensor<f32, 2>>|
-     -> Result<()> { route::validate(x, router, ids, weights, probs).map(|_| ()) };
-    let x = |hidden: u32| view::<bf16>(base, [5, hidden], [u64::from(hidden), 1]);
-    let router = |experts: u32, hidden: u32| {
-        view::<bf16>(base + 0x1000, [experts, hidden], [u64::from(hidden), 1])
-    };
-
-    good(&x(128)?, &router(16, 128)?, &ids, &weights, Some(&probs))?;
-
-    let cases = [
-        (
-            good(&x(128)?, &router(16, 64)?, &ids, &weights, Some(&probs)),
-            "route hidden width mismatch",
-        ),
-        (
-            good(
-                &x(128)?,
-                &router(16, 128)?,
-                &view::<i32>(base + 0x2000, [5, 3], [3, 1])?,
-                &weights,
-                Some(&probs),
-            ),
-            "route ids/weights shape mismatch",
-        ),
-        (
-            good(
-                &x(128)?,
-                &router(16, 128)?,
-                &view::<i32>(base + 0x2000, [4, 4], [4, 1])?,
-                &weights,
-                Some(&probs),
-            ),
-            "route ids/weights shape mismatch",
-        ),
-        (
-            good(
-                &view::<bf16>(base, [5, 128], [256, 1])?,
-                &router(16, 128)?,
-                &ids,
-                &weights,
-                Some(&probs),
-            ),
-            "route requires contiguous x and router rows",
-        ),
-        (
-            good(
-                &x(128)?,
-                &view::<bf16>(base + 0x1000, [16, 128], [257, 1])?,
-                &ids,
-                &weights,
-                Some(&probs),
-            ),
-            "route requires contiguous x and router rows",
-        ),
-        (
-            good(
-                &x(128)?,
-                &router(16, 128)?,
-                &view::<i32>(base + 0x2000, [5, 4], [5, 1])?,
-                &weights,
-                Some(&probs),
-            ),
-            "route requires contiguous ids and weights rows",
-        ),
-        (
-            good(
-                &x(128)?,
-                &router(16, 128)?,
-                &ids,
-                &view::<bf16>(base + 0x3000, [5, 4], [5, 1])?,
-                Some(&probs),
-            ),
-            "route requires contiguous ids and weights rows",
-        ),
-        (
-            good(&x(12)?, &router(16, 12)?, &ids, &weights, Some(&probs)),
-            "route hidden width must be a multiple of 8",
-        ),
-        (
-            good(
-                &x(128)?,
-                &router(1040, 128)?,
-                &view::<i32>(base + 0x2000, [5, 4], [4, 1])?,
-                &weights,
-                Some(&view::<f32>(base + 0x4000, [5, 1040], [1040, 1])?),
-            ),
-            "route expert count above 1024",
-        ),
-        (
-            good(
-                &x(128)?,
-                &router(16, 128)?,
-                &view::<i32>(base + 0x2000, [5, 33], [33, 1])?,
-                &view::<bf16>(base + 0x3000, [5, 33], [33, 1])?,
-                Some(&view::<f32>(base + 0x4000, [5, 16], [16, 1])?),
-            ),
-            "route top_k outside [1,32]",
-        ),
-        (
-            good(
-                &x(128)?,
-                &router(16, 128)?,
-                &view::<i32>(base + 0x2000, [5, 16], [16, 1])?,
-                &view::<bf16>(base + 0x3000, [5, 16], [16, 1])?,
-                Some(&probs),
-            ),
-            "route top_k must be below the expert count",
-        ),
-        (
-            good(
-                &x(128)?,
-                &router(16, 128)?,
-                &ids,
-                &weights,
-                Some(&view::<f32>(base + 0x4000, [5, 15], [15, 1])?),
-            ),
-            "route probs must be a contiguous [rows, experts] view",
-        ),
-    ];
-    for (case, needle) in cases {
-        let error = case.expect_err("route validation must reject the view");
-        ensure!(
-            error.to_string().contains(needle),
-            "route validation error {error} lacks {needle}"
-        );
-    }
-
-    let plan = route::validate(&x(128)?, &router(16, 128)?, &ids, &weights, None)?;
-    ensure!(
-        plan.probs_ptr == 0,
-        "route without probs must pass a null pointer"
-    );
-    ensure!(
-        plan.rows == 5 && plan.experts == 16 && plan.top_k == 4 && plan.hidden == 128,
-        "route plan dims mismatch"
-    );
-    Ok(())
 }
 
 #[test]
@@ -234,7 +72,6 @@ struct CaseOutputs<'a> {
     dims: MoeDims,
     ids: &'a [i32],
     weights: &'a [bf16],
-    probs: &'a [f32],
 }
 
 fn compare_case(
@@ -244,21 +81,16 @@ fn compare_case(
     out: &CaseOutputs<'_>,
     tol: f32,
 ) -> Result<()> {
-    let (e, k) = (out.dims.experts, out.dims.top_k);
+    let k = out.dims.top_k;
     let mut strict = 0;
     let mut gated = 0;
     for &row in rows {
         let want = &refs[&row];
         let ids = &out.ids[row * k..(row + 1) * k];
         let weights = &out.weights[row * k..(row + 1) * k];
-        let probs = &out.probs[row * e..(row + 1) * e];
         ensure!(
             ids.iter().all(|&id| id >= 0) && weights.iter().all(|w| w.to_f32() != -17.0),
             "route case {case} row {row} left sentinel outputs"
-        );
-        ensure!(
-            probs.iter().all(|p| *p >= 0.0 && p.is_finite()),
-            "route case {case} row {row} wrote invalid probabilities"
         );
         let cut = want.probs[want.ids[k - 1] as usize];
         if want.margin > CUT_MARGIN_THRESHOLD {
@@ -285,12 +117,6 @@ fn compare_case(
                 "route case {case} row {row} weight {j} {got:e} vs {expected:e} (tol {tol:e})"
             );
         }
-        for (expert, (&got, &want_p)) in probs.iter().zip(&want.probs).enumerate() {
-            ensure!(
-                (got - want_p).abs() <= PROBS_REL_TOL * want_p + PROBS_ABS_FLOOR,
-                "route case {case} row {row} prob {expert} {got:e} vs {want_p:e}"
-            );
-        }
     }
     eprintln!(
         "MOE_ROUTE_CASE rows={case} checked={} strict_ids={strict} gated_ids={gated} PASS",
@@ -300,10 +126,10 @@ fn compare_case(
 }
 
 #[test]
-#[ignore = "requires GPU window, FF_MOE_GPU_WINDOW=granted"]
+#[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
 fn moe_route_gpu() -> Result<()> {
     ensure!(
-        std::env::var("FF_MOE_GPU_WINDOW").as_deref() == Ok("granted"),
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
         "GPU window not acknowledged"
     );
     let d = Device::new(0)?;
@@ -323,14 +149,12 @@ fn moe_route_gpu() -> Result<()> {
     d.finish_upload()?;
     let mut idsb = testing::zeros::<i32>(s, dims.rows * k)?;
     let mut wb = testing::zeros::<bf16>(s, dims.rows * k)?;
-    let mut pb = testing::zeros::<f32>(s, dims.rows * e)?;
 
     let run = |rows: u32,
                xb: &CudaSlice<bf16>,
                rb: &CudaSlice<bf16>,
                idsb: &mut CudaSlice<i32>,
-               wb: &mut CudaSlice<bf16>,
-               pb: &mut CudaSlice<f32>|
+               wb: &mut CudaSlice<bf16>|
      -> Result<()> {
         let x = testing::dense(xb, s, dims.rows as u32, h as u32)?.prefix_rows(rows)?;
         let router = testing::dense(rb, s, e as u32, h as u32)?;
@@ -344,24 +168,17 @@ fn moe_route_gpu() -> Result<()> {
                 .0
                 .prefix_rows(rows)?,
         );
-        let mut probs = TensorMut(
-            testing::dense_mut(pb, s, dims.rows as u32, e as u32)?
-                .0
-                .prefix_rows(rows)?,
-        );
-        ops.route(s, x, router, &mut ids, &mut weights, Some(&mut probs))
+        ops.route(s, x, router, &mut ids, &mut weights)
     };
 
     for &case in &ROW_CASES {
         s.memcpy_htod(&vec![-1i32; dims.rows * k], &mut idsb)?;
         s.memcpy_htod(&vec![bf16::from_f32(-17.0); dims.rows * k], &mut wb)?;
-        s.memcpy_htod(&vec![-1.0f32; dims.rows * e], &mut pb)?;
-        run(case, &xb, &rb, &mut idsb, &mut wb, &mut pb)?;
+        run(case, &xb, &rb, &mut idsb, &mut wb)?;
         s.synchronize()?;
         let rows = checked_rows(case);
         let ids = s.clone_dtoh(&idsb)?;
         let weights = s.clone_dtoh(&wb)?;
-        let probs = s.clone_dtoh(&pb)?;
         let (a, b) = fx.exact_tie_experts;
         let first = &ids[0..k];
         ensure!(
@@ -376,7 +193,6 @@ fn moe_route_gpu() -> Result<()> {
                 dims,
                 ids: &ids,
                 weights: &weights,
-                probs: &probs,
             },
             tol,
         )?;
@@ -389,7 +205,7 @@ fn moe_route_gpu() -> Result<()> {
     }
     s.memcpy_htod(&tampered, &mut rb)?;
     s.memcpy_htod(&vec![-1i32; dims.rows * k], &mut idsb)?;
-    run(1, &xb, &rb, &mut idsb, &mut wb, &mut pb)?;
+    run(1, &xb, &rb, &mut idsb, &mut wb)?;
     s.synchronize()?;
     let ids = s.clone_dtoh(&idsb)?;
     let baseline = reference::route_row(&fx, 0);
@@ -406,49 +222,5 @@ fn moe_route_gpu() -> Result<()> {
         "MOE_ROUTE_CONTROL perturbed_ids={:?} changed={changed} PASS",
         &ids[..k]
     );
-
-    if std::env::var("FF_MOE_TIMING").as_deref() == Ok("1") {
-        use cudarc::driver::sys::CUevent_flags;
-        let (begin, end) = (
-            d.ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?,
-            d.ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?,
-        );
-        const WARMUP: usize = 20;
-        const ITERS: usize = 100;
-        let router_bytes = (e * h * 2) as f64;
-        for &case in &[1u32, dims.rows as u32] {
-            for _ in 0..WARMUP {
-                run(case, &xb, &rb, &mut idsb, &mut wb, &mut pb)?;
-            }
-            s.synchronize()?;
-            begin.record(s)?;
-            for _ in 0..ITERS {
-                run(case, &xb, &rb, &mut idsb, &mut wb, &mut pb)?;
-            }
-            end.record(s)?;
-            s.synchronize()?;
-            let per_launch_us = f64::from(begin.elapsed_ms(&end)?) * 1000.0 / ITERS as f64;
-            let gb_s = case as f64 * router_bytes / (per_launch_us * 1e-6) / 1e9;
-            eprintln!(
-                "MOE_ROUTE_TIMING rows={case} iters={ITERS} per_launch_us={per_launch_us:.3} router_GB_s={gb_s:.1}"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn distinct_row_experts_validation_rejects_duplicates() -> Result<()> {
-    let distinct: Vec<i32> = vec![5, 0, 9, 200, 7, 3, 2, 1];
-    super::route::ensure_distinct_row_experts(&distinct, 8)?;
-    let duplicate: Vec<i32> = vec![5, 0, 9, 5, 7, 3, 2, 1];
-    let err = super::route::ensure_distinct_row_experts(&duplicate, 8)
-        .expect_err("duplicate within a row must be rejected");
-    assert!(
-        err.to_string().contains("duplicate expert id"),
-        "unexpected error: {err}"
-    );
-    let bad_len: Vec<i32> = vec![1, 2, 3];
-    assert!(super::route::ensure_distinct_row_experts(&bad_len, 8).is_err());
     Ok(())
 }

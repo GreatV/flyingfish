@@ -27,9 +27,8 @@ impl RouteOps {
         router: Tensor<bf16, 2>,
         ids: &mut TensorMut<i32, 2>,
         weights: &mut TensorMut<bf16, 2>,
-        probs: Option<&mut TensorMut<f32, 2>>,
     ) -> Result<()> {
-        let plan = validate(&x, &router, &ids.0, &weights.0, probs.map(|p| &p.0))?;
+        let plan = validate(&x, &router, &ids.0, &weights.0)?;
         unsafe {
             stream
                 .launch_builder(&self.route)
@@ -37,7 +36,6 @@ impl RouteOps {
                 .arg(&router.ptr)
                 .arg(&ids.0.ptr)
                 .arg(&weights.0.ptr)
-                .arg(&plan.probs_ptr)
                 .arg(&plan.rows)
                 .arg(&plan.experts)
                 .arg(&plan.top_k)
@@ -53,7 +51,6 @@ pub(crate) struct RoutePlan {
     pub experts: u32,
     pub top_k: u32,
     pub hidden: u32,
-    pub probs_ptr: u64,
 }
 
 pub(crate) fn validate(
@@ -61,7 +58,6 @@ pub(crate) fn validate(
     router: &Tensor<bf16, 2>,
     ids: &Tensor<i32, 2>,
     weights: &Tensor<bf16, 2>,
-    probs: Option<&Tensor<f32, 2>>,
 ) -> Result<RoutePlan> {
     x.validate()?;
     router.validate()?;
@@ -69,67 +65,47 @@ pub(crate) fn validate(
     weights.validate()?;
     let (rows, hidden) = (x.shape[0], x.shape[1]);
     let (experts, top_k) = (router.shape[0], ids.shape[1]);
-    ensure!(router.shape[1] == hidden, "route hidden width mismatch");
+    ensure!(
+        router.shape[1] == hidden,
+        "route hidden width mismatch: x {:?}, router {:?}",
+        x.shape,
+        router.shape
+    );
     ensure!(
         ids.shape == [rows, top_k] && weights.shape == [rows, top_k],
-        "route ids/weights shape mismatch"
+        "route ids/weights shape mismatch: ids {:?}, weights {:?}, expected [{rows}, {top_k}]",
+        ids.shape,
+        weights.shape
     );
     ensure!(
         x.stride == [u64::from(hidden), 1] && router.stride == [u64::from(hidden), 1],
-        "route requires contiguous x and router rows"
+        "route requires contiguous x and router rows: x stride {:?}, router stride {:?}, expected [{hidden}, 1]",
+        x.stride,
+        router.stride
     );
     ensure!(
         ids.stride == [u64::from(top_k), 1] && weights.stride == [u64::from(top_k), 1],
-        "route requires contiguous ids and weights rows"
+        "route requires contiguous ids and weights rows: ids stride {:?}, weights stride {:?}, expected [{top_k}, 1]",
+        ids.stride,
+        weights.stride
     );
     ensure!(
         hidden >= 8 && hidden.is_multiple_of(8),
-        "route hidden width must be a multiple of 8"
+        "route hidden width {hidden} must be a multiple of 8"
     );
-    ensure!(experts <= 1024, "route expert count above 1024");
-    ensure!((1..=32).contains(&top_k), "route top_k outside [1,32]");
+    ensure!(experts <= 1024, "route expert count {experts} above 1024");
+    ensure!(
+        (1..=32).contains(&top_k),
+        "route top_k {top_k} outside [1,32]"
+    );
     ensure!(
         top_k < experts,
-        "route top_k must be below the expert count"
+        "route top_k {top_k} must be below the expert count {experts}"
     );
-    let probs_ptr = match probs {
-        Some(p) => {
-            p.validate()?;
-            ensure!(
-                p.shape == [rows, experts] && p.stride == [u64::from(experts), 1],
-                "route probs must be a contiguous [rows, experts] view"
-            );
-            p.ptr
-        }
-        None => 0,
-    };
     Ok(RoutePlan {
         rows,
         experts,
         top_k,
         hidden,
-        probs_ptr,
     })
-}
-
-/// Router outputs feed decode/prefill: torch.topk returns K distinct
-/// experts per row, so a duplicate id within a row is an invalid input.
-pub(crate) fn ensure_distinct_row_experts(ids: &[i32], top_k: usize) -> Result<()> {
-    ensure!(
-        !ids.is_empty() && ids.len().is_multiple_of(top_k),
-        "ids length {} is not a multiple of top_k {top_k}",
-        ids.len()
-    );
-    for row in ids.chunks(top_k) {
-        for c0 in 0..row.len() {
-            for c1 in c0 + 1..row.len() {
-                ensure!(
-                    row[c0] != row[c1],
-                    "duplicate expert id {} within a row (top-k must be distinct)",
-                    row[c0]
-                );
-            }
-        }
-    }
-    Ok(())
 }

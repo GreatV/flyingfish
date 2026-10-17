@@ -1,7 +1,6 @@
 // MoE router for BF16 rows: logits, softmax, top-k, renormalised weights.
 //   x [rows, hidden] bf16 row-major, router W [experts, hidden] bf16 row-major,
-//   ids [rows, top_k] i32, weights [rows, top_k] bf16,
-//   probs [rows, experts] f32 or null (null = skip the probs store).
+//   ids [rows, top_k] i32, weights [rows, top_k] bf16.
 // One block per row; thread e < experts owns expert e. Each expert logit is an
 // FP32 accumulation of BF16 products over uint4 (8-element) loads, rounded to
 // BF16 (F.linear boundary). Softmax runs in FP32 over the BF16 logits.
@@ -24,7 +23,7 @@ using bf16 = __nv_bfloat16;
 extern "C" __global__ void moe_route_bf16(
     const bf16* __restrict__ x, const bf16* __restrict__ router,
     int* __restrict__ ids, bf16* __restrict__ weights,
-    float* __restrict__ probs, int rows, int experts, int top_k, int hidden) {
+    int rows, int experts, int top_k, int hidden) {
   if ((int)blockIdx.x >= rows || experts < 1 || experts > 1024 || top_k < 1 ||
       top_k > 32 || top_k >= experts || hidden < 8 || (hidden & 7) != 0 ||
       (blockDim.x & 31) != 0 || (int)blockDim.x < experts ||
@@ -139,5 +138,4 @@ extern "C" __global__ void moe_route_bf16(
     weights[(size_t)row * top_k + tid] =
         __float2bfloat16(s_sel_p[tid] / s_tsum);
   }
-  if (probs != nullptr && live) probs[(size_t)row * experts + e] = prob;
 }

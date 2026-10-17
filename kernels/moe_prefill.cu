@@ -1,12 +1,15 @@
-// MoE prefill kernels: per-expert count, exclusive scan, assignment permute,
-// SwiGLU and weighted combine. The two grouped GEMMs run through cuBLAS
-// (cublasGemmGroupedBatchedEx) between permute/swiglu/combine.
+// MoE prefill kernels: per-expert count, exclusive scan, assignment permute
+// and the router-weight scaling of the per-assignment contributions. The two
+// grouped GEMMs run through cuBLAS (cublasGemmGroupedBatchedEx), the
+// activation through silu_mul (kernels/act.cu) and the final combine through
+// moe_combine (kernels/moe_combine.cu).
 // Assignment space is rows*top_k; every kernel takes the dims as runtime
 // arguments and __trap()s on contract violations (experts > 1024, top_k > 32,
 // active id outside [0,experts), slot_valid == 0 or a slot_generation mismatch
-// on an active assignment, permute slot past the expert end, provenance join
-// mismatch in the combine). Inactive assignments (active[a] == 0) are skipped
-// without dereferencing ids, the slot tables or any guard.
+// on an active assignment, duplicate expert ids among a row's active choices,
+// a claimed slot outside the expert segment, done already set on an active
+// assignment). Inactive assignments (active[a] == 0) are skipped without
+// dereferencing ids, the slot tables or any guard.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -70,131 +73,76 @@ extern "C" __global__ void moe_scan(const int* __restrict__ counts,
   if (tid == 0) offsets[experts] = sh[experts - 1];
 }
 
-// One block per assignment: an inactive block returns before touching ids or
-// the slot tables. An active assignment claims slot pos = atomicAdd(cursor[e],
-// 1) inside [offsets[e], offsets[e+1]), stores the (row, choice) provenance
-// pair, the reverse map and the gathered x row. __trap() on invalid id,
+// One block per assignment. The choice-0 block of a row checks its ACTIVE
+// choices for duplicate expert ids once per row, then an inactive block
+// returns before touching ids or the slot tables. An active assignment with
+// done[a] != 0 traps; otherwise it claims slot pos = atomicAdd(cursor[e], 1)
+// inside [offsets[e], offsets[e+1]), stores the (row, choice) provenance
+// pair, gathers the x row and sets done[a] = 1. __trap() on invalid id,
 // slot_valid == 0, slot_generation != assignment_gen[a] (the per-assignment
-// snapshot of the slot generation at routing time) or a claimed slot
-// outside the expert segment.
+// snapshot of the slot generation at routing time) or a claimed slot outside
+// the expert segment.
 extern "C" __global__ void moe_permute(
-    const int* __restrict__ ids, const bf16* __restrict__ weights,
-    const bf16* __restrict__ x, const int* __restrict__ offsets,
+    const int* __restrict__ ids, const bf16* __restrict__ x,
+    const int* __restrict__ offsets,
     int* __restrict__ cursor, const unsigned* __restrict__ valid,
     const unsigned long long* __restrict__ generation,
     const unsigned long long* __restrict__ assignment_gen,
-    const unsigned* __restrict__ active,
+    const unsigned* __restrict__ active, unsigned* __restrict__ done,
     int* __restrict__ src_row, int* __restrict__ src_choice,
-    bf16* __restrict__ w_row, int* __restrict__ inv_pos,
     bf16* __restrict__ x_perm, int rows, int top_k, int experts,
-    long long hidden, long long x_stride) {
+    long long hidden) {
   if (blockDim.x != 256) __trap();
   const int a = blockIdx.x;
-  if (active[a] == 0u) return;
   const int row = a / top_k;
   const int choice = a % top_k;
+  if (choice == 0 && threadIdx.x == 0) {
+    for (int c0 = 0; c0 < top_k; ++c0) {
+      if (active[(size_t)row * top_k + c0] == 0u) continue;
+      for (int c1 = c0 + 1; c1 < top_k; ++c1) {
+        if (active[(size_t)row * top_k + c1] == 0u) continue;
+        if (ids[(size_t)row * top_k + c0] == ids[(size_t)row * top_k + c1]) __trap();
+      }
+    }
+  }
+  if (active[a] == 0u) return;
   const int e = ids[a];
   if (row < 0 || row >= rows || e < 0 || e >= experts) __trap();
   if (valid[e] == 0u || generation[e] != assignment_gen[a]) __trap();
-  // Router outputs carry K distinct experts per row (torch.topk).
-  if (threadIdx.x == 0) {
-    for (int c0 = 0; c0 < top_k; ++c0)
-      for (int c1 = c0 + 1; c1 < top_k; ++c1)
-        if (ids[(size_t)row * top_k + c0] == ids[(size_t)row * top_k + c1]) __trap();
-  }
   // One cursor claim per block: thread 0 atomics and broadcasts pos; a
   // per-thread atomicAdd would consume blockDim.x segment slots.
   __shared__ int spos;
   if (threadIdx.x == 0) {
+    if (done[a] != 0u) __trap();
     const int pos = atomicAdd(&cursor[e], 1);
     if (pos < offsets[e] || pos >= offsets[e + 1]) __trap();
     src_row[pos] = row;
     src_choice[pos] = choice;
-    w_row[pos] = weights[a];
-    inv_pos[a] = pos;
+    done[a] = 1u;
     spos = pos;
   }
   __syncthreads();
   const int pos = spos;
-  const bf16* __restrict__ xr = x + (long long)row * x_stride;
+  const bf16* __restrict__ xr = x + (long long)row * hidden;
   bf16* __restrict__ dst = x_perm + (long long)pos * hidden;
   for (long long c = threadIdx.x; c < hidden; c += blockDim.x) dst[c] = xr[c];
 }
 
-// act[r][j] = bf16(bf16(silu(g)) * u) with g = gu[r][j], u = gu[r][inter+j].
-// grid.y is the row index, grid.x covers the inter columns.
-extern "C" __global__ void moe_swiglu(const bf16* __restrict__ gu,
-                                      bf16* __restrict__ act, long long rows,
-                                      int inter) {
-  const int j = blockIdx.x * blockDim.x + threadIdx.x;
-  if (j >= inter) return;
-  const long long r = blockIdx.y;
-  const bf16* grow = gu + r * 2 * (long long)inter;
-  const float g = __bfloat162float(grow[j]);
-  const bf16 s = __float2bfloat16(g / (1.0f + expf(-g)));
-  act[r * inter + j] = __hmul(s, grow[inter + j]);
-}
-
-// One block per row. Combines the ACTIVE top_k weighted expert rows with the
-// shared expert (always computed): y[row][d] = bf16( sum over active k of
-// bf16(Y_perm[pos_k][d] * w_k) + bf16(scale * shared_y[row][d]) ) with FP32
-// accumulation, scale = bf16(sigmoid(bf16(dot(x_row, gate_vec)))). The bf16
-// boundaries match reference::moe_row_with Combine::Fp32. Each active term
-// checks the stored (row, choice) provenance pair against its join slot.
-extern "C" __global__ void moe_combine(
-    const bf16* __restrict__ y_perm, const bf16* __restrict__ w_row,
-    const int* __restrict__ inv_pos, const int* __restrict__ src_row,
-    const int* __restrict__ src_choice, const unsigned* __restrict__ active,
-    const bf16* __restrict__ x, const bf16* __restrict__ gate_vec,
-    const bf16* __restrict__ shared_y, bf16* __restrict__ y, int rows,
-    int top_k, long long hidden, long long x_stride) {
-  if (blockDim.x != 256 || top_k < 1 || top_k > 32) __trap();
-  const int row = blockIdx.x;
-  if (row < 0 || row >= rows) __trap();
-  const int tid = threadIdx.x;
-  const int a0 = row * top_k;
-  int pos[32];
-  float w[32];
-  int live = 0;
-  for (int kk = 0; kk < top_k; ++kk) {
-    if (active[a0 + kk] == 0u) continue;
-    const int p = inv_pos[a0 + kk];
-    if (src_row[p] != row || src_choice[p] != kk) __trap();
-    pos[live] = p;
-    w[live] = __bfloat162float(w_row[p]);
-    ++live;
-  }
-  const bf16* __restrict__ xr = x + (long long)row * x_stride;
-  float part = 0.0f;
-  for (long long c = tid; c < hidden; c += blockDim.x)
-    part += __bfloat162float(xr[c]) * __bfloat162float(gate_vec[c]);
-  for (int off = 16; off > 0; off >>= 1)
-    part += __shfl_down_sync(0xffffffffu, part, off);
-  __shared__ float red[8];
-  __shared__ float dot_sh;
-  if ((tid & 31) == 0) red[tid >> 5] = part;
-  __syncthreads();
-  if (tid < 32) {
-    float v = tid < (blockDim.x >> 5) ? red[tid] : 0.0f;
-    for (int off = 16; off > 0; off >>= 1)
-      v += __shfl_down_sync(0xffffffffu, v, off);
-    if (tid == 0) dot_sh = v;
-  }
-  __syncthreads();
-  const float dot = dot_sh;
-  const float sig = 1.0f / (1.0f + expf(-__bfloat162float(
-      __float2bfloat16(dot))));
-  const float scale = __bfloat162float(__float2bfloat16(sig));
-  const bf16* __restrict__ sh = shared_y + (long long)row * hidden;
-  bf16* __restrict__ yr = y + (long long)row * hidden;
-  for (long long d = tid; d < hidden; d += blockDim.x) {
-    float acc = __bfloat162float(__hmul(__float2bfloat16(scale), sh[d]));
-    for (int kk = 0; kk < live; ++kk) {
-      acc += __bfloat162float(__hmul(
-          y_perm[(long long)pos[kk] * hidden + d], __float2bfloat16(w[kk])));
-    }
-    yr[d] = __float2bfloat16(acc);
-  }
+// contributions[a] = bf16(contributions[a] * weights[a]) on the ACTIVE
+// assignments; the grouped down-projection wrote the unweighted rows into
+// contributions before this launch.
+extern "C" __global__ void moe_scale(bf16* __restrict__ contributions,
+                                     const bf16* __restrict__ weights,
+                                     const unsigned* __restrict__ active,
+                                     long long assignments, long long hidden) {
+  if (blockDim.x != 256) __trap();
+  const long long a = blockIdx.x;
+  if (a >= assignments) __trap();
+  if (active[a] == 0u) return;
+  const float w = __bfloat162float(weights[a]);
+  bf16* __restrict__ row = contributions + a * hidden;
+  for (long long d = threadIdx.x; d < hidden; d += blockDim.x)
+    row[d] = __float2bfloat16(__bfloat162float(row[d]) * w);
 }
 
 #undef FD_MOE_GUARDS

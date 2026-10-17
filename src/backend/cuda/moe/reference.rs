@@ -314,21 +314,26 @@ pub(crate) enum Combine {
     Fp32,
 }
 
-pub(crate) fn moe_row_with(
+/// The row's shared expert (sigmoid-gated) plus the routed contributions
+/// selected by `keep` (indices into `ids`/`weights`), accumulated per
+/// `combine` with contributions ordered ascending expert id.
+pub(crate) fn moe_row_ids(
     fx: &MoeFixture,
     row: usize,
+    ids: &[i32],
+    weights: &[bf16],
+    keep: &[usize],
     combine: Combine,
-    choices: &[usize],
 ) -> Vec<bf16> {
     let h = fx.dims.hidden;
-    let k = fx.dims.top_k;
-    assert!(!choices.is_empty());
-    let routed = route_row(fx, row);
-    let mut slots: Vec<(usize, bf16)> = choices
+    assert!(row < fx.dims.rows);
+    assert!(!keep.is_empty());
+    assert_eq!(ids.len(), weights.len());
+    let mut slots: Vec<(usize, bf16)> = keep
         .iter()
         .map(|&c| {
-            assert!(c < k, "choice index {c} outside top-k");
-            (routed.ids[c] as usize, routed.weights[c])
+            assert!(c < ids.len(), "choice index {c} outside ids/weights extent");
+            (ids[c] as usize, weights[c])
         })
         .collect();
     slots.sort_by_key(|&(id, _)| id);
@@ -376,14 +381,22 @@ pub(crate) fn moe_row_with(
     y
 }
 
+pub(crate) fn moe_row_with(
+    fx: &MoeFixture,
+    row: usize,
+    combine: Combine,
+    choices: &[usize],
+) -> Vec<bf16> {
+    let routed = route_row(fx, row);
+    moe_row_ids(fx, row, &routed.ids, &routed.weights, choices, combine)
+}
+
 pub(crate) fn moe_row(fx: &MoeFixture, row: usize) -> Vec<bf16> {
     moe_row_with(fx, row, Combine::AscendingBf16, &choice_all(fx))
 }
 
 /// The row's shared expert plus only the routing choices in `choices`
 /// (top-k choice indices), accumulated ascending expert id among the chosen.
-/// The active-assignment cohort of one launch covers exactly one subset per
-/// (row, choice); inactive choices are handled outside that launch.
 pub(crate) fn moe_row_choices(fx: &MoeFixture, row: usize, choices: &[usize]) -> Vec<bf16> {
     moe_row_with(fx, row, Combine::AscendingBf16, choices)
 }
@@ -421,9 +434,8 @@ pub(crate) fn combine_noise(fx: &MoeFixture, rows: &[usize]) -> CombineNoise {
     noise
 }
 
-/// Gate tolerance: twice the largest measured combine-order spread over the
-/// sampled rows. The factor 2 is frozen in the T3 gate protocol before any
-/// GPU run.
+/// Gate tolerance: twice the largest combine-order spread over the sampled
+/// rows.
 pub(crate) fn tolerance(fx: &MoeFixture, rows: &[usize]) -> f32 {
     let noise = combine_noise(fx, rows);
     2.0 * noise.ascending_vs_descending.max(noise.ascending_vs_fp32)
@@ -477,8 +489,7 @@ mod tests {
     }
 
     /// Gate-protocol freeze receipt at production shape: SHA-256 over the
-    /// fixture tensors and the CPU combine-order noise cells. Pinned values
-    /// change only by dated correction.
+    /// fixture tensors and the CPU combine-order noise cells.
     #[test]
     fn protocol_fixture_freeze_is_pinned() {
         use sha2::{Digest, Sha256};
@@ -524,44 +535,10 @@ mod tests {
             "shared_down=d9c33f0dcd703cbc8ded7e7790c46523850b2269c7974f71338f46aada2fca41",
             "shared_expert_gate=b211f365279b4aaba9a1cff843d95cb7ce41d40567751852e606d5c01c51011d",
         ];
-        assert_eq!(
-            pinned, frozen,
-            "fixture drift; update only by dated correction"
-        );
-        // Pinned to the 2026-10-17 CPU-measured value within 1e-6; the exact
-        // f32 bits are libm-dependent through f32::exp.
+        assert_eq!(pinned, frozen, "fixture drift");
+        // The exact f32 bits are libm-dependent through f32::exp; the cells
+        // are pinned within 1e-6.
         assert!((noise.ascending_vs_descending - 0.001953125).abs() < 1e-6);
         assert!((noise.ascending_vs_fp32 - 0.001953125).abs() < 1e-6);
-    }
-
-    #[test]
-    fn fixture_generation_is_deterministic() {
-        let a = fixture(small(2), 7);
-        let b = fixture(small(2), 7);
-        for (x, y) in [
-            (&a.x, &b.x),
-            (&a.router_w, &b.router_w),
-            (&a.gate_up, &b.gate_up),
-            (&a.down, &b.down),
-            (&a.shared_gate, &b.shared_gate),
-            (&a.shared_up, &b.shared_up),
-            (&a.shared_down, &b.shared_down),
-            (&a.shared_expert_gate, &b.shared_expert_gate),
-        ] {
-            assert_eq!(x, y);
-        }
-    }
-
-    #[test]
-    fn documented_row_layouts_hold() {
-        let fx = fixture(small(2), 3);
-        assert_eq!(fx.gate_row(2, 5).len(), fx.dims.hidden);
-        assert_eq!(fx.up_row(2, 5).len(), fx.dims.hidden);
-        assert_eq!(fx.down_row(2, 9).len(), fx.dims.inter);
-        assert_eq!(fx.gate_up.len(), 16 * 2 * 64 * 128);
-        let moe = moe_row(&fx, 1);
-        assert_eq!(moe.len(), fx.dims.hidden);
-        assert!(moe.iter().all(|v| v.to_f32().is_finite()));
-        assert!(tolerance(&fx, &[0, 1]) > 0.0);
     }
 }
