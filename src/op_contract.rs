@@ -56,7 +56,13 @@ fn align(n: u64) -> Result<u64> {
     Ok(add(n, 255)? & !255)
 }
 impl AttentionWorkspace {
-    pub fn q38(max_rows: u32, capacity: u32, key_chunk: u32) -> Result<Self> {
+    pub fn new(
+        spec: &FullAttentionSpec,
+        max_rows: u32,
+        capacity: u32,
+        key_chunk: u32,
+    ) -> Result<Self> {
+        spec.validate()?;
         ensure!(
             max_rows > 0 && max_rows <= capacity && capacity <= i32::MAX as u32,
             "invalid attention limits"
@@ -67,11 +73,14 @@ impl AttentionWorkspace {
         );
         let max_parts = u64::from(capacity).div_ceil(u64::from(key_chunk));
         let segment_rows = u64::from(max_rows.min(64));
-        let e = mul(mul(segment_rows, 24)?, max_parts)?;
+        let e = mul(mul(segment_rows, u64::from(spec.hq))?, max_parts)?;
         let scalar = align(mul(e, 4)?)?;
         let p_out = mul(scalar, 2)?;
         let k_norm = add(p_out, align(mul(mul(e, 256)?, 4)?)?)?;
-        let bytes = add(k_norm, align(mul(u64::from(max_rows), 2048)?)?)?;
+        let bytes = add(
+            k_norm,
+            align(mul(mul(u64::from(max_rows), u64::from(spec.hkv))?, 512)?)?,
+        )?;
         Ok(Self {
             max_parts,
             segment_rows,
@@ -87,7 +96,7 @@ impl AttentionWorkspace {
 const _: () = assert!(std::mem::size_of::<SequenceMeta>() == 32);
 const _: () = assert!(std::mem::offset_of!(SequenceMeta, causal) == 16);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FullAttentionSpec {
     pub hq: u32,
     pub hkv: u32,
@@ -98,6 +107,35 @@ pub struct FullAttentionSpec {
     pub rotary_dim: u32,
 }
 impl FullAttentionSpec {
+    pub fn from_model(spec: &crate::model_spec::ModelSpec) -> Result<Self> {
+        ensure!(
+            spec.q_heads.checked_mul(spec.head_dim) == Some(spec.q_width),
+            "attention q_width={} differs from q_heads={} * head_dim={}",
+            spec.q_width,
+            spec.q_heads,
+            spec.head_dim
+        );
+        let bound = Self {
+            hq: spec.q_heads,
+            hkv: spec.kv_heads,
+            d: spec.head_dim,
+            scale: 1.0 / (spec.head_dim as f32).sqrt(),
+            rms_eps: spec.rms_eps,
+            rope_theta: spec.rope_theta,
+            rotary_dim: spec.rotary_dim,
+        };
+        bound.validate()?;
+        Ok(bound)
+    }
+
+    pub fn kernel_module(&self) -> Result<&'static str> {
+        match (self.hq, self.hkv) {
+            (24, 4) => Ok("tcmqa_d256"),
+            (16, 2) => Ok("tcmqa_d256_q16_kv2"),
+            _ => anyhow::bail!("unsupported attention hq={} hkv={}", self.hq, self.hkv),
+        }
+    }
+
     pub const fn q38() -> Self {
         Self {
             hq: 24,
@@ -111,14 +149,13 @@ impl FullAttentionSpec {
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.hq == 24
-                && self.hkv == 4
+            matches!((self.hq, self.hkv), (24, 4) | (16, 2))
                 && self.d == 256
                 && self.scale == 0.0625
                 && self.rms_eps == 1e-6
                 && self.rope_theta == 1e7
                 && self.rotary_dim == 64,
-            "unsupported full-attention specification"
+            "unsupported full-attention specification: {self:?}"
         );
         Ok(())
     }
@@ -157,6 +194,27 @@ pub struct GdnSpec {
 }
 impl GdnSpec {
     pub const PLAN_ID: &'static str = "gdn-plan-v2-c32-vs1-fp32";
+    pub fn from_model(spec: &crate::model_spec::ModelSpec) -> Result<Self> {
+        let g = spec
+            .gdn
+            .as_ref()
+            .context("GDN geometry missing from model spec")?;
+        let bound = Self {
+            hk: g.key_heads,
+            hv: g.value_heads,
+            dk: g.key_head_dim,
+            dv: g.value_head_dim,
+            conv_width: g.conv_kernel,
+            history_width: g
+                .conv_kernel
+                .checked_sub(1)
+                .context("GDN history width underflow")?,
+            rms_eps: spec.rms_eps,
+            ..Self::q38()
+        };
+        bound.validate()?;
+        Ok(bound)
+    }
     pub const fn q38() -> Self {
         Self {
             hk: 16,
@@ -172,6 +230,21 @@ impl GdnSpec {
             l2_eps: 1e-6,
         }
     }
+    pub fn kernel_suffix(&self) -> Result<&'static str> {
+        match self.hv {
+            48 => Ok(""),
+            32 => Ok("_h32"),
+            _ => anyhow::bail!("unsupported GDN hv={}", self.hv),
+        }
+    }
+
+    pub fn gate_kernel(&self) -> Result<&'static str> {
+        match self.hv {
+            48 => Ok("q38_gdn_gates"),
+            32 => Ok("gdn_gates_h32"),
+            _ => anyhow::bail!("unsupported GDN hv={}", self.hv),
+        }
+    }
     /// Projection/history channel width derived from the normalized GDN geometry.
     pub fn conv_dim(&self) -> Result<u32> {
         self.validate()?;
@@ -184,7 +257,7 @@ impl GdnSpec {
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.hk == 16
-                && self.hv == 48
+                && matches!(self.hv, 32 | 48)
                 && self.dk == 128
                 && self.dv == 128
                 && self.conv_width == 4
@@ -194,7 +267,7 @@ impl GdnSpec {
                 && self.decode_value_split == 2
                 && self.rms_eps == 1e-6
                 && self.l2_eps == 1e-6,
-            "unsupported GDN plan; expected {}",
+            "unsupported GDN plan {self:?}; expected {}",
             Self::PLAN_ID
         );
         Ok(())
@@ -215,5 +288,109 @@ impl GdnSpec {
             mul(u64::from(self.conv_dim()?), u64::from(self.history_width))?,
             4,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_fields_determine_mixer_work_and_state_capacity() -> Result<()> {
+        let root = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/q38-config.json"
+        )))?;
+        let mut model = crate::model_spec::ModelSpec::qwen(&root, &serde_json::Value::Null)?;
+        let original = GdnSpec::from_model(&model)?;
+        let work = crate::work_layout::RowWorkSpec::new(&model)?;
+        assert_eq!((work.projection, work.mixer, work.ab), (14336, 6144, 96));
+        assert_eq!(original.state_bytes()?, 48 * 128 * 128 * 4);
+        assert_eq!(
+            FullAttentionSpec::from_model(&model)?.kernel_module()?,
+            "tcmqa_d256"
+        );
+        assert_eq!(original.kernel_suffix()?, "");
+        assert_eq!(original.gate_kernel()?, "q38_gdn_gates");
+        model.hidden = 2048;
+        model.q_heads = 16;
+        model.kv_heads = 2;
+        model.q_width = 4096;
+        model.gdn.as_mut().unwrap().value_heads = 32;
+        let changed = GdnSpec::from_model(&model)?;
+        let attention = FullAttentionSpec::from_model(&model)?;
+        let work = crate::work_layout::RowWorkSpec::new(&model)?;
+        assert_eq!((work.projection, work.mixer, work.ab), (9216, 4096, 64));
+        assert_eq!(changed.state_bytes()?, 32 * 128 * 128 * 4);
+        assert_eq!(changed.history_bytes()?, 8192 * 3 * 4);
+        assert_eq!(attention.kernel_module()?, "tcmqa_d256_q16_kv2");
+        assert_eq!(changed.kernel_suffix()?, "_h32");
+        assert_eq!(changed.gate_kernel()?, "gdn_gates_h32");
+        let unsupported = GdnSpec { hv: 64, ..changed };
+        assert!(
+            unsupported
+                .kernel_suffix()
+                .unwrap_err()
+                .to_string()
+                .contains("hv=64")
+        );
+        assert!(
+            unsupported
+                .gate_kernel()
+                .unwrap_err()
+                .to_string()
+                .contains("hv=64")
+        );
+        let unsupported = FullAttentionSpec {
+            hq: 16,
+            hkv: 4,
+            ..attention
+        };
+        assert!(
+            unsupported
+                .kernel_module()
+                .unwrap_err()
+                .to_string()
+                .contains("hq=16 hkv=4")
+        );
+        assert_eq!(
+            (attention.hq, attention.hkv, changed.conv_dim()?),
+            (16, 2, 8192)
+        );
+        assert_eq!(
+            model.architecture,
+            crate::model_spec::Architecture::Qwen35Text
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attention_workspace_covers_each_bound_head_geometry() -> Result<()> {
+        for (hq, hkv) in [(24, 4), (16, 2)] {
+            let spec = FullAttentionSpec {
+                hq,
+                hkv,
+                ..FullAttentionSpec::q38()
+            };
+            for rows in [1, 2, 5, 8, 37, 512, 4096] {
+                let w = AttentionWorkspace::new(&spec, rows, 8192, 128)?;
+                let aligned = |n: u64| (n + 255) & !255;
+                let elements = u64::from(rows.min(64)) * u64::from(hq) * 64;
+                assert_eq!(w.p_sum, aligned(elements * 4));
+                assert_eq!(w.p_out, 2 * aligned(elements * 4));
+                assert_eq!(w.k_norm, w.p_out + aligned(elements * 256 * 4));
+                assert_eq!(
+                    w.bytes - w.k_norm,
+                    aligned(u64::from(rows) * u64::from(hkv) * 256 * 2)
+                );
+            }
+        }
+        let unsupported = FullAttentionSpec {
+            hkv: 4,
+            hq: 16,
+            ..FullAttentionSpec::q38()
+        };
+        assert!(AttentionWorkspace::new(&unsupported, 1, 8192, 128).is_err());
+        Ok(())
     }
 }

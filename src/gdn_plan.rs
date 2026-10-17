@@ -2,10 +2,6 @@
 use crate::op_contract::{GdnSpec, WorkspaceReq};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-const HV: u32 = 48;
-const HK: u32 = 16;
-const DK: u32 = 128;
-const DV: u32 = 128;
 
 /// Largest prefill step the MTP-verify small plans cover.
 pub const MIN_VERIFY_ROWS: u32 = 4;
@@ -56,28 +52,28 @@ const _: () = assert!(
     "the chunkwise-P2 slot fields and gdn_cw_p2_layout.h disagree"
 );
 
-/// The chunkwise-P2 workspace for `max_rows`: one slot per (chunk, value head), ceil(rows/64) * 48 slots.
-pub const fn cw_p2_bytes(max_rows: u32) -> u64 {
+/// The chunkwise-P2 workspace for `max_rows`: one slot per (chunk, value head), ceil(rows/64) * value_heads slots.
+pub const fn cw_p2_bytes(value_heads: u32, max_rows: u32) -> u64 {
     let chunks = if max_rows == 0 {
         0
     } else {
         (max_rows - 1) / CW_P2_CHUNK + 1
     };
-    chunks as u64 * 48 * CW_P2_SLOT_BYTES
+    chunks as u64 * value_heads as u64 * CW_P2_SLOT_BYTES
 }
 
 /// The chunkwise-P2 stage ABI: field order is the argument order in `kernels/gdn/gdn_cw_p2.cu`.
 #[derive(Copy, Clone)]
 pub struct P2StageArgs {
-    /// BF16 [M, 16, DK] key heads; the stages expand to the 48 value heads.
+    /// BF16 [M, 16, DK] key heads; the stages expand to the bound value heads.
     pub q: u64,
     /// BF16 [M, 16, DK] key heads.
     pub k: u64,
-    /// BF16 [M, 48, 128] rows, `v_row_stride` elements apart.
+    /// BF16 [M, hv, 128] rows, `v_row_stride` elements apart.
     pub v: u64,
-    /// FP32 [M, 48]: gdn_beta_widen's output.
+    /// FP32 [M, hv]: gdn_beta_widen's output.
     pub beta: u64,
-    /// FP32 [M, 48]: gdn_gates' output.
+    /// FP32 [M, hv]: gdn_gates' output.
     pub g: u64,
     /// The workspace slot base, or the state for stage H.
     pub ws: u64,
@@ -137,10 +133,10 @@ impl GdnPolicy {
     }
     /// All prebound operators reuse the arena sized by the maximum complete plan layout.
     pub fn workspace(self, spec: &GdnSpec, physical_rows: u32) -> Result<WorkspaceReq> {
-        let bytes = GdnWorkspace::q38(spec, physical_rows)?.bytes;
+        let bytes = GdnWorkspace::new(spec, physical_rows)?.bytes;
         Ok(WorkspaceReq {
             bytes: if self.cw_p2 {
-                add(bytes, cw_p2_bytes(physical_rows))?
+                add(bytes, cw_p2_bytes(spec.hv, physical_rows))?
             } else {
                 bytes
             },
@@ -166,17 +162,17 @@ pub struct GdnWorkspace {
     /// `[R, 16, 128]` BF16 — K after `l2_heads`, KEY heads.
     pub k_bf16: Region,
     // No `v_bf16` region: `gdn_prep_fp32` reads V in place from `conv_out` at row stride conv_dim.
-    /// `[R, 48]` BF16 — `beta = BF16(sigmoid(b))`, as emitted by `gdn_gates`.
+    /// `[R, hv]` BF16 — `beta = BF16(sigmoid(b))`, as emitted by `gdn_gates`.
     pub beta: Region,
-    /// `[R, 48]` FP32 — the exact widen of `beta`; both cores read `const float* beta`.
+    /// `[R, hv]` FP32 — the exact widen of `beta`; both cores read `const float* beta`.
     pub beta_fp32: Region,
-    /// `[R, 48]` FP32 — `g = -exp(A_log) * softplus(a + dt_bias)`.
+    /// `[R, hv]` FP32 — `g = -exp(A_log) * softplus(a + dt_bias)`.
     pub g: Region,
-    /// `[R, 48, 128]` FP32 — Q widened, GQA-expanded and scaled by `1/sqrt(DK)`.
+    /// `[R, hv, 128]` FP32 — Q widened, GQA-expanded and scaled by `1/sqrt(DK)`.
     pub q_fp32: Region,
-    /// `[R, 48, 128]` FP32 — K widened and expanded to VALUE heads.
+    /// `[R, hv, 128]` FP32 — K widened and expanded to VALUE heads.
     pub k_fp32: Region,
-    /// `[R, 48, 128]` FP32 — V widened.
+    /// `[R, hv, 128]` FP32 — V widened.
     pub v_fp32: Region,
     pub bytes: u64,
     pub alignment: u64,
@@ -195,15 +191,15 @@ fn align(n: u64) -> Result<u64> {
 
 impl GdnWorkspace {
     /// CPU-only checked sizing; `max_rows` is a workspace capacity, not a device row count.
-    pub fn q38(spec: &GdnSpec, max_rows: u32) -> Result<Self> {
+    pub fn new(spec: &GdnSpec, max_rows: u32) -> Result<Self> {
         spec.validate()?;
         ensure!(max_rows > 0, "GDN max_rows must be positive");
         let conv_dim = u64::from(spec.conv_dim()?);
         let rows = u64::from(max_rows);
-        let hd = u64::from(HV);
-        let dv = u64::from(DV);
-        let hk = u64::from(HK);
-        let dk = u64::from(DK);
+        let hd = u64::from(spec.hv);
+        let dv = u64::from(spec.dv);
+        let hk = u64::from(spec.hk);
+        let dk = u64::from(spec.dk);
 
         let hd_dv = mul(hd, dv)?;
         let hk_dk = mul(hk, dk)?;
@@ -211,12 +207,12 @@ impl GdnWorkspace {
             mul(rows, mul(conv_dim, 2)?)?, // conv_out  BF16 [R, conv_dim]
             mul(rows, mul(hk_dk, 2)?)?,    // q_bf16     BF16 [R, 16, 128] KEY heads
             mul(rows, mul(hk_dk, 2)?)?,    // k_bf16     BF16 [R, 16, 128] KEY heads
-            mul(rows, mul(hd, 2)?)?,       // beta       BF16 [R, 48]
-            mul(rows, mul(hd, 4)?)?,       // beta_fp32  FP32 [R, 48]
-            mul(rows, mul(hd, 4)?)?,       // g          FP32 [R, 48]
-            mul(rows, mul(hd_dv, 4)?)?,    // q_fp32     FP32 [R, 48, 128]
-            mul(rows, mul(hd_dv, 4)?)?,    // k_fp32     FP32 [R, 48, 128]
-            mul(rows, mul(hd_dv, 4)?)?,    // v_fp32     FP32 [R, 48, 128]
+            mul(rows, mul(hd, 2)?)?,       // beta       BF16 [R, hv]
+            mul(rows, mul(hd, 4)?)?,       // beta_fp32  FP32 [R, hv]
+            mul(rows, mul(hd, 4)?)?,       // g          FP32 [R, hv]
+            mul(rows, mul(hd_dv, 4)?)?,    // q_fp32     FP32 [R, hv, 128]
+            mul(rows, mul(hd_dv, 4)?)?,    // k_fp32     FP32 [R, hv, 128]
+            mul(rows, mul(hd_dv, 4)?)?,    // v_fp32     FP32 [R, hv, 128]
         ];
         let mut off = 0u64;
         let mut r = [Region {
@@ -294,6 +290,34 @@ mod tests {
             [cw_p1::S4_BYTES, cw_p1::S8_BYTES, cw_p1::S16_BYTES],
             [44800, 40704, 38656]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn value_head_geometry_bounds_every_workspace_region() -> Result<()> {
+        for hv in [32, 48] {
+            let spec = GdnSpec {
+                hv,
+                ..GdnSpec::q38()
+            };
+            let cd = (2 * spec.hk + hv) * 128;
+            assert_eq!(spec.conv_dim()?, cd);
+            assert_eq!(spec.state_bytes()?, u64::from(hv) * 128 * 128 * 4);
+            assert_eq!(spec.history_bytes()?, u64::from(cd) * 3 * 4);
+            for rows in [1, 2, 5, 8, 37, 512, 4096] {
+                let ws = GdnWorkspace::new(&spec, rows)?;
+                let padded = |n: u64| (n + 255) & !255;
+                let rows = u64::from(rows);
+                assert_eq!(ws.conv_out.bytes, padded(rows * u64::from(cd) * 2));
+                assert_eq!(ws.beta.bytes, padded(rows * u64::from(hv) * 2));
+                assert_eq!(ws.g.bytes, padded(rows * u64::from(hv) * 4));
+                for region in [ws.q_fp32, ws.k_fp32, ws.v_fp32] {
+                    assert_eq!(region.bytes, padded(rows * u64::from(hv) * 128 * 4));
+                    assert!(region.offset + region.bytes <= ws.bytes);
+                }
+                assert_eq!(ws.v_fp32.offset + ws.v_fp32.bytes, ws.bytes);
+            }
+        }
         Ok(())
     }
 }

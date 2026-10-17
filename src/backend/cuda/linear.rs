@@ -223,10 +223,14 @@ impl LayerLinearPlan {
     pub fn bind(
         plan: &crate::linear_plan::LayerDequantPlan,
         catalog: &WeightCatalog,
-        arena: &Scratch,
+        arena: Option<&Scratch>,
         stream: &Arc<CudaStream>,
     ) -> Result<Self> {
-        arena.validate(plan.bytes)?;
+        if plan.bytes > 0 {
+            arena
+                .context("FP8 layer has no materialization arena")?
+                .validate(plan.bytes)?;
+        }
         let prefix = &plan.prefix;
         let mut projections = std::collections::BTreeMap::new();
         let mut materialize = Vec::new();
@@ -242,7 +246,11 @@ impl LayerLinearPlan {
             let prefill = match &resident {
                 LinearWeightRef::Bf16(w) => *w,
                 LinearWeightRef::BlockFp8 { codes, scale } => {
-                    let LinearWeightRef::Bf16(w) = plan.weight(name, arena)? else {
+                    let LinearWeightRef::Bf16(w) = plan.weight(
+                        name,
+                        arena.context("FP8 layer has no materialization arena")?,
+                    )?
+                    else {
                         unreachable!()
                     };
                     materialize.push((*codes, *scale, TensorMut(w)));
@@ -269,9 +277,13 @@ impl LayerLinearPlan {
         }
         Ok(())
     }
-    pub fn materialize(&mut self, ops: &Fp8Ops, stream: &Arc<CudaStream>) -> Result<()> {
+    pub fn materialize(
+        &mut self,
+        blas: &super::blas::Blas,
+        stream: &Arc<CudaStream>,
+    ) -> Result<()> {
         for (codes, scale, dst) in &mut self.materialize {
-            ops.materialize(stream, *codes, *scale, dst)?;
+            blas.fp8_ops()?.materialize(stream, *codes, *scale, dst)?;
         }
         Ok(())
     }
@@ -295,5 +307,166 @@ impl LayerLinearPlan {
             p.resident
         };
         blas.linear_typed(phase, weight, x, y)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::cuda::{
+        Device, blas::Blas, closure::Closure, ops::Ops, weights::StoredTensor,
+    };
+    use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
+    use crate::op_contract::ExecutionPhase;
+    use std::{path::PathBuf, rc::Rc};
+
+    #[test]
+    #[ignore = "coordinator-granted GPU window and FF_Q38_PROBE_DIR required"]
+    fn mixer_geometry_linear_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let root = PathBuf::from(
+            std::env::var_os("FF_Q38_PROBE_DIR").context("FF_Q38_PROBE_DIR is required")?,
+        );
+        let ops = Ops::new(&device.ctx)?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &root,
+            Rc::new(Closure::new(false, "native BF16 mixer gate".into())),
+        )?;
+        let mut defects = 0;
+        let mut cases = 0;
+        for (n, k) in [(8192u32, 2048u32), (32, 2048), (129, 257)] {
+            let role = "linear_attn.in_proj_qkv.weight";
+            let name = format!("model.language_model.layers.0.{role}");
+            let values: Vec<_> = (0..n as usize * k as usize)
+                .map(|i| {
+                    bf16::from_f32(
+                        (((i / k as usize) * 37 + i % k as usize * 11) % 53) as f32 / 32.0
+                            - 26.0 / 32.0,
+                    )
+                })
+                .collect();
+            let weight = stream.clone_htod(&values)?;
+            let bytes = values.len() * 2;
+            let manifest = TensorManifest {
+                entries: [(
+                    name.clone(),
+                    TensorEntry {
+                        dtype: safetensors::Dtype::BF16,
+                        shape: vec![n as usize, k as usize],
+                        shard: "synthetic.safetensors".into(),
+                        bytes,
+                        load: true,
+                        data_start: 0,
+                        data_offsets: [0, bytes as u64],
+                        scope: TensorScope::Text,
+                        layer: Some(0),
+                        role: role.into(),
+                        scale_name: None,
+                    },
+                )]
+                .into(),
+                resident_bytes: bytes,
+            };
+            let catalog = WeightCatalog {
+                tensors: [(name.clone(), StoredTensor::Bf16(weight))].into(),
+                manifest,
+                bytes,
+                upload_content_sha256: None,
+                upload_hashed_bytes: None,
+                load_wall_ms: 0.0,
+            };
+            let dequant = crate::linear_plan::LayerDequantPlan::from_manifest(
+                &catalog.manifest,
+                0,
+                crate::model_spec::LinearFormat::Bf16,
+            )?;
+            ensure!(
+                dequant.bytes == 0 && dequant.slots.is_empty(),
+                "native BF16 fixture allocated materialization storage"
+            );
+            let plan = LayerLinearPlan::bind(&dequant, &catalog, None, stream)?;
+            for m in [1u32, 2, 5, 8, 4096] {
+                plan.prepare(&blas, m)?;
+                let mut inputs = vec![bf16::ZERO; m as usize * k as usize];
+                for row in 0..m as usize {
+                    inputs[row * k as usize + (row * 17 + 13) % k as usize] = bf16::ONE;
+                }
+                let input_store = stream.clone_htod(&inputs)?;
+                let output = stream.alloc_zeros::<bf16>(m as usize * n as usize)?;
+                use cudarc::driver::DevicePtr;
+                let input = unsafe {
+                    Tensor::new(
+                        input_store.device_ptr(stream).0,
+                        [m, k],
+                        [u64::from(k), 1],
+                        (input_store.len() * 2) as u64,
+                    )?
+                };
+                let target = TensorMut(unsafe {
+                    Tensor::new(
+                        output.device_ptr(stream).0,
+                        [m, n],
+                        [u64::from(n), 1],
+                        (output.len() * 2) as u64,
+                    )?
+                });
+                device.finish_upload()?;
+                for (phase, graph) in [
+                    (ExecutionPhase::Prefill, false),
+                    (ExecutionPhase::Prefill, true),
+                ]
+                .into_iter()
+                .chain((m == 1).then_some((ExecutionPhase::Decode, false)))
+                {
+                    let execute =
+                        || plan.run(&blas, role, phase, input, &mut TensorMut(target.read()));
+                    if graph {
+                        use cudarc::driver::sys;
+                        stream.begin_capture(
+                            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                        )?;
+                        let run = execute();
+                        let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                        run?;
+                        captured?
+                            .context("empty native BF16 geometry graph")?
+                            .launch()?;
+                    } else {
+                        execute()?;
+                    }
+                    stream.synchronize()?;
+                    let got = stream.clone_dtoh(&output)?;
+                    ensure!(
+                        got.iter().all(|v| v.is_finite()),
+                        "nonfinite native BF16 linear output"
+                    );
+                    let mismatches = got
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, v)| {
+                            let row = *i / n as usize;
+                            let column = (row * 17 + 13) % k as usize;
+                            v.to_bits() != values[(*i % n as usize) * k as usize + column].to_bits()
+                        })
+                        .count();
+                    println!(
+                        "BF16_LINEAR stored_weight=[{n},{k}] rows={m} phase={phase:?} graph={graph} dequant_bytes=0 mismatches={mismatches} {}",
+                        if mismatches == 0 { "PASS" } else { "DEFECT" }
+                    );
+                    defects += usize::from(mismatches != 0);
+                    cases += 1;
+                }
+            }
+        }
+        println!("BF16_LINEAR_SUMMARY cases={cases} defects={defects}");
+        ensure!(defects == 0, "BF16_LINEAR DEFECT cases={defects}");
+        Ok(())
     }
 }

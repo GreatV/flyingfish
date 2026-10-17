@@ -1,4 +1,4 @@
-//! HD256 full attention (24 Q heads, 4 KV heads, head_dim 256); the output sigmoid gate is the caller's.
+//! HD256 full attention with bound 24/4 or 16/2 heads; the output gate is the caller's.
 //!
 //! `run` order: split Q/gate -> common Q/K norm -> partial RoPE and KV scatter -> segmented attention.
 //! The segment count `ceil(max_rows / segment_rows)` is fixed by the plan, independent of device `valid_rows`.
@@ -13,9 +13,6 @@ use half::bf16;
 use std::mem::size_of;
 use std::sync::Arc;
 
-pub(crate) const HQ: u32 = 24;
-pub(crate) const HKV: u32 = 4;
-pub(crate) const GQA: u32 = HQ / HKV;
 pub(crate) const D: u32 = 256;
 
 /// Narrow KT of the phase-1 kernel; `key_chunk` must be a positive multiple.
@@ -28,7 +25,6 @@ const PREP_THREADS: u32 = 256;
 /// `(MT + 2*KT) * (D + 8) * 2 + 64*8` from `kernels/tcmqa_d256.cu`.
 const PHASE1_SMEM: u32 = 68096;
 const MASK_LEN: u32 = 64;
-const RMS_EPS: f32 = 1e-6;
 
 /// RoPE coordinate source: `Linear` = physical `prefix + row`; `Axes` = per-row (T, H, W) from a
 /// `[max_rows, 3]` i32 table. KV slot and causal key count stay physical; T = H = W matches `Linear` bitwise.
@@ -42,18 +38,18 @@ pub(crate) enum PositionBindings {
 #[derive(Debug)]
 pub(crate) struct AttentionBindings {
     pub compact: Option<super::state::CacheView>,
-    /// Projection `[max_rows, 24, 512]`: Q at head offset 0, gate at +256.
+    /// Projection `[max_rows, hq, 512]`: Q at head offset 0, gate at +256.
     pub q_gate: Tensor<bf16, 3>,
-    /// Projection K and V, `[max_rows, 4, 256]`, read-only.
+    /// Projection K and V, `[max_rows, hkv, 256]`, read-only.
     pub k: Tensor<bf16, 3>,
     pub v: Tensor<bf16, 3>,
-    /// Independent Q and gate `[max_rows, 24, 256]`.
+    /// Independent Q and gate `[max_rows, hq, 256]`.
     pub q: TensorMut<bf16, 3>,
     pub gate: TensorMut<bf16, 3>,
-    /// Head-major caches `[4, capacity, 256]`, two separate buffers.
+    /// Head-major caches `[hkv, capacity, 256]`, two separate buffers.
     pub k_cache: TensorMut<bf16, 3>,
     pub v_cache: TensorMut<bf16, 3>,
-    /// Ungated attention output `[max_rows, 24, 256]`.
+    /// Ungated attention output `[max_rows, hq, 256]`.
     pub core_out: TensorMut<bf16, 3>,
     /// Zero-centred Q/K norm weights, `[256]`.
     pub q_norm: Tensor<bf16, 1>,
@@ -75,6 +71,7 @@ struct Kernels {
 }
 
 pub(crate) struct FullAttentionPlan {
+    spec: FullAttentionSpec,
     kernels: Arc<Kernels>,
     bindings: AttentionBindings,
     common: CommonOpsRef,
@@ -121,24 +118,25 @@ impl FullAttentionPlan {
             ..self.limits
         };
         check_limits(limits)?;
-        check_bindings(&bindings, limits)?;
-        let ws = AttentionWorkspace::q38(rows, limits.capacity, limits.key_chunk)?;
+        check_bindings(&bindings, limits, &self.spec)?;
+        let ws = AttentionWorkspace::new(&self.spec, rows, limits.capacity, limits.key_chunk)?;
         let segment_rows = u32::try_from(ws.segment_rows)?;
         let mut split_cfg = self.split_cfg;
         split_cfg.grid_dim.0 = rows
-            .checked_mul(HQ * D)
+            .checked_mul(self.spec.hq * D)
             .context("split grid overflow")?
             .div_ceil(PREP_THREADS);
         let mut scatter_cfg = self.scatter_cfg;
         scatter_cfg.grid_dim.0 = rows
-            .checked_mul(HKV * D)
+            .checked_mul(self.spec.hkv * D)
             .context("scatter grid overflow")?
             .div_ceil(PREP_THREADS);
         let mut phase1_cfg = self.phase1_cfg;
-        phase1_cfg.grid_dim.2 = (GQA * segment_rows).div_ceil(SEG_MAX);
+        phase1_cfg.grid_dim.2 = ((self.spec.hq / self.spec.hkv) * segment_rows).div_ceil(SEG_MAX);
         let mut phase2_cfg = self.phase2_cfg;
-        phase2_cfg.grid_dim.0 = HQ * segment_rows;
+        phase2_cfg.grid_dim.0 = self.spec.hq * segment_rows;
         Ok(Self {
+            spec: self.spec,
             kernels: self.kernels.clone(),
             bindings,
             common: self.common.clone(),
@@ -193,8 +191,17 @@ fn want<T: Copy, const R: usize>(view: &Tensor<T, R>, shape: [u32; R], name: &st
     Ok(())
 }
 
-fn check_bindings(b: &AttentionBindings, limits: AttentionLimits) -> Result<()> {
+fn check_bindings(
+    b: &AttentionBindings,
+    limits: AttentionLimits,
+    spec: &FullAttentionSpec,
+) -> Result<()> {
     if let Some(cache) = b.compact {
+        ensure!(
+            spec.hkv == 4,
+            "compact attention requires hkv=4, got hkv={}",
+            spec.hkv
+        );
         cache.validate(limits.capacity, limits.max_rows)?;
         ensure!(
             cache.k_ring == b.k_cache.0.ptr && cache.v_ring == b.v_cache.0.ptr,
@@ -203,32 +210,32 @@ fn check_bindings(b: &AttentionBindings, limits: AttentionLimits) -> Result<()> 
     }
     let rows = limits.max_rows;
     let cap = b.compact.map_or(limits.capacity, |v| v.ring as u32);
-    want(&b.q_gate, [rows, HQ, 2 * D], "q_gate")?;
+    want(&b.q_gate, [rows, spec.hq, 2 * D], "q_gate")?;
     ensure!(
-        b.q_gate.stride == [u64::from(HQ) * 2 * u64::from(D), u64::from(2 * D), 1],
-        "q_gate must be the packed [M,24,512] projection"
+        b.q_gate.stride == [u64::from(spec.hq) * 2 * u64::from(D), u64::from(2 * D), 1],
+        "q_gate must be the packed [M,hq,512] projection"
     );
     for (view, name) in [(&b.q, "q"), (&b.gate, "gate"), (&b.core_out, "core_out")] {
         let t = view.read();
-        want(&t, [rows, HQ, D], name)?;
+        want(&t, [rows, spec.hq, D], name)?;
         ensure!(
-            t.stride == [u64::from(HQ) * u64::from(D), u64::from(D), 1],
-            "{name} must be a contiguous [M,24,256] view"
+            t.stride == [u64::from(spec.hq) * u64::from(D), u64::from(D), 1],
+            "{name} must be a contiguous [M,hq,256] view"
         );
     }
     for (view, name) in [(&b.k, "k"), (&b.v, "v")] {
-        want(view, [rows, HKV, D], name)?;
+        want(view, [rows, spec.hkv, D], name)?;
         ensure!(
-            view.stride == [u64::from(HKV) * u64::from(D), u64::from(D), 1],
-            "{name} must be a contiguous [M,4,256] projection"
+            view.stride == [u64::from(spec.hkv) * u64::from(D), u64::from(D), 1],
+            "{name} must be a contiguous [M,hkv,256] projection"
         );
     }
     for (view, name) in [(&b.k_cache, "k_cache"), (&b.v_cache, "v_cache")] {
         let t = view.read();
-        want(&t, [HKV, cap, D], name)?;
+        want(&t, [spec.hkv, cap, D], name)?;
         ensure!(
             t.stride == [u64::from(cap) * u64::from(D), u64::from(D), 1],
-            "{name} must be head-major [4,capacity,256]"
+            "{name} must be head-major [hkv,capacity,256]"
         );
     }
     for (view, name) in [(&b.q_norm, "q_norm"), (&b.k_norm, "k_norm")] {
@@ -258,7 +265,7 @@ impl FullAttentionOps {
     ) -> Result<WorkspaceReq> {
         spec.validate()?;
         check_limits(limits)?;
-        let ws = AttentionWorkspace::q38(limits.max_rows, limits.capacity, limits.key_chunk)?;
+        let ws = AttentionWorkspace::new(spec, limits.max_rows, limits.capacity, limits.key_chunk)?;
         Ok(WorkspaceReq {
             bytes: ws.bytes,
             alignment: ws.alignment,
@@ -287,8 +294,8 @@ impl FullAttentionOps {
     ) -> Result<FullAttentionPlan> {
         spec.validate()?;
         check_limits(limits)?;
-        check_bindings(&bindings, limits)?;
-        let ws = AttentionWorkspace::q38(limits.max_rows, limits.capacity, limits.key_chunk)?;
+        check_bindings(&bindings, limits, spec)?;
+        let ws = AttentionWorkspace::new(spec, limits.max_rows, limits.capacity, limits.key_chunk)?;
         let segment_rows = u32::try_from(ws.segment_rows)?;
         let max_parts = u32::try_from(ws.max_parts)?;
         ensure!(segment_rows <= SEG_MAX, "segment rows exceed the pair tile");
@@ -315,7 +322,8 @@ impl FullAttentionOps {
 
         let kernels = if let Some(template) = template {
             ensure!(
-                template.limits.capacity == limits.capacity
+                template.spec == *spec
+                    && template.limits.capacity == limits.capacity
                     && template.bindings.compact.is_some() == bindings.compact.is_some()
                     && template.max_parts == max_parts
                     && template.phase2_cfg.shared_mem_bytes >= phase2_smem
@@ -325,7 +333,7 @@ impl FullAttentionOps {
             );
             template.kernels.clone()
         } else {
-            let module = cubin::module(ctx, "tcmqa_d256")?;
+            let module = cubin::module(ctx, spec.kernel_module()?)?;
             let phase1 = module.load_function(if bindings.compact.is_some() {
                 "tcmqa_d256_phase1_compact"
             } else {
@@ -370,24 +378,29 @@ impl FullAttentionOps {
         };
         // Grids are sized for max_rows; the device valid_rows bounds the work.
         let split_cfg = flat(
-            rows.checked_mul(HQ * D)
+            rows.checked_mul(spec.hq * D)
                 .context("Q/gate split grid overflow")?,
         )?;
         let scatter_cfg = flat(
-            rows.checked_mul(HKV * D)
+            rows.checked_mul(spec.hkv * D)
                 .context("KV scatter grid overflow")?,
         )?;
         let phase1_cfg = LaunchConfig {
-            grid_dim: (max_parts, HKV, (GQA * segment_rows).div_ceil(SEG_MAX)),
+            grid_dim: (
+                max_parts,
+                spec.hkv,
+                ((spec.hq / spec.hkv) * segment_rows).div_ceil(SEG_MAX),
+            ),
             block_dim: (PHASE1_THREADS, 1, 1),
             shared_mem_bytes: PHASE1_SMEM,
         };
         let phase2_cfg = LaunchConfig {
-            grid_dim: (HQ * segment_rows, 1, 1),
+            grid_dim: (spec.hq * segment_rows, 1, 1),
             block_dim: (PHASE2_THREADS, 1, 1),
             shared_mem_bytes: phase2_smem,
         };
         Ok(FullAttentionPlan {
+            spec: *spec,
             kernels,
             bindings,
             common,
@@ -404,9 +417,12 @@ impl FullAttentionOps {
     }
 
     /// Scratch bytes of the preprocess chain alone: the K-norm temp at the end of the full workspace.
-    pub(crate) fn preprocess_workspace(limits: AttentionLimits) -> Result<WorkspaceReq> {
+    pub(crate) fn preprocess_workspace(
+        spec: &FullAttentionSpec,
+        limits: AttentionLimits,
+    ) -> Result<WorkspaceReq> {
         check_limits(limits)?;
-        let ws = AttentionWorkspace::q38(limits.max_rows, limits.capacity, limits.key_chunk)?;
+        let ws = AttentionWorkspace::new(spec, limits.max_rows, limits.capacity, limits.key_chunk)?;
         Ok(WorkspaceReq {
             bytes: ws.bytes - ws.k_norm,
             alignment: ws.alignment,
@@ -432,7 +448,7 @@ impl FullAttentionOps {
         let pos_stride = D as i32;
         let elem = size_of::<bf16>() as u64;
         let k_tmp = scratch.ptr;
-        let k_tmp_span = u64::from(rows) * u64::from(HKV) * u64::from(D) * elem;
+        let k_tmp_span = u64::from(rows) * u64::from(plan.spec.hkv) * u64::from(D) * elem;
 
         unsafe {
             stream
@@ -462,14 +478,14 @@ impl FullAttentionOps {
             &mut q_out,
             RmsOptions {
                 mode: RmsMode::ZeroCentered,
-                eps: RMS_EPS,
+                eps: plan.spec.rms_eps,
             },
         )?;
         let mut k_out = unsafe {
             TensorMut::new(
                 k_tmp,
-                [rows, HKV, D],
-                [u64::from(HKV) * u64::from(D), u64::from(D), 1],
+                [rows, plan.spec.hkv, D],
+                [u64::from(plan.spec.hkv) * u64::from(D), u64::from(D), 1],
                 k_tmp_span,
             )?
         };
@@ -481,7 +497,7 @@ impl FullAttentionOps {
             &mut k_out,
             RmsOptions {
                 mode: RmsMode::ZeroCentered,
-                eps: RMS_EPS,
+                eps: plan.spec.rms_eps,
             },
         )?;
 
@@ -695,6 +711,48 @@ mod tests {
     use crate::op_contract::SequenceMeta;
     use cudarc::driver::{CudaSlice, DevicePtr};
 
+    #[test]
+    fn new_head_geometry_rejects_old_kv_projection_and_cache_strides() -> Result<()> {
+        let spec = FullAttentionSpec {
+            hq: 16,
+            hkv: 2,
+            ..FullAttentionSpec::q38()
+        };
+        let limits = AttentionLimits {
+            max_rows: 37,
+            capacity: 8192,
+            key_chunk: 256,
+            causal: 1,
+        };
+        let view =
+            |shape, stride| unsafe { Tensor::<bf16, 3>::new(0x1000, shape, stride, 1 << 30) };
+        let mut bindings = AttentionBindings {
+            compact: None,
+            q_gate: view([37, 16, 512], [8192, 512, 1])?,
+            k: view([37, 2, 256], [512, 256, 1])?,
+            v: view([37, 2, 256], [512, 256, 1])?,
+            q: TensorMut(view([37, 16, 256], [4096, 256, 1])?),
+            gate: TensorMut(view([37, 16, 256], [4096, 256, 1])?),
+            core_out: TensorMut(view([37, 16, 256], [4096, 256, 1])?),
+            k_cache: TensorMut(view([2, 8192, 256], [8192 * 256, 256, 1])?),
+            v_cache: TensorMut(view([2, 8192, 256], [8192 * 256, 256, 1])?),
+            q_norm: unsafe { Tensor::new(0x1000, [256], [1], 512)? },
+            k_norm: unsafe { Tensor::new(0x1000, [256], [1], 512)? },
+            causal_mask: unsafe { Tensor::new(0x1000, [64], [1], 512)? },
+            positions: PositionBindings::Linear,
+        };
+        check_bindings(&bindings, limits, &spec)?;
+        bindings.k.stride[0] = 4 * 256;
+        assert!(check_bindings(&bindings, limits, &spec).is_err());
+        bindings.k.stride[0] = 512;
+        bindings.k_cache.0.shape[0] = 4;
+        assert!(check_bindings(&bindings, limits, &spec).is_err());
+        bindings.k_cache.0.shape[0] = 2;
+        bindings.q_gate.stride[0] = 24 * 512;
+        assert!(check_bindings(&bindings, limits, &spec).is_err());
+        Ok(())
+    }
+
     /// The kernel's RoPE constants.
     const ROTARY: usize = 64;
     const THETA: f32 = 1.0e7;
@@ -783,9 +841,10 @@ mod tests {
     }
 
     fn norm(x: &[bf16], w: &[bf16]) -> Vec<f32> {
+        let qwen = FullAttentionSpec::q38();
         let values: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
         let mean = values.iter().map(|v| v * v).sum::<f32>() / values.len() as f32;
-        let inv = 1.0 / (mean + RMS_EPS).sqrt();
+        let inv = 1.0 / (mean + qwen.rms_eps).sqrt();
         values
             .iter()
             .zip(w)
@@ -807,7 +866,8 @@ mod tests {
 
     impl Reference {
         fn new(i: &Inputs<'_>) -> Self {
-            let (d, hq, hkv) = (D as usize, HQ as usize, HKV as usize);
+            let qwen = FullAttentionSpec::q38();
+            let (d, hq, hkv) = (D as usize, qwen.hq as usize, qwen.hkv as usize);
             let mut q = vec![0f32; i.valid_rows as usize * hq * d];
             for row in 0..i.valid_rows as usize {
                 for head in 0..hq {
@@ -852,13 +912,14 @@ mod tests {
         }
 
         fn core_out(&self) -> Vec<f32> {
-            let (d, hq) = (D as usize, HQ as usize);
+            let qwen = FullAttentionSpec::q38();
+            let (d, hq) = (D as usize, qwen.hq as usize);
             let span = self.capacity * d;
             let mut out = vec![0f32; self.valid_rows * hq * d];
             for row in 0..self.valid_rows {
                 let limit = self.prefix + row + 1;
                 for head in 0..hq {
-                    let kv = head / GQA as usize;
+                    let kv = head / (qwen.hq / qwen.hkv) as usize;
                     let q = &self.q[(row * hq + head) * d..][..d];
                     let mut scores = vec![0f32; limit];
                     for (pos, score) in scores.iter_mut().enumerate() {
@@ -887,7 +948,13 @@ mod tests {
     }
 
     /// One `run_shape` case; `axes: None` is the linear path; `oracle` marks the fp32 reference valid.
+    #[derive(Clone, Copy)]
     struct Case<'a> {
+        spec: FullAttentionSpec,
+        remap: bool,
+        graph: bool,
+        mutant: bool,
+        flash: bool,
         prefix: u32,
         valid_rows: u32,
         max_rows: u32,
@@ -904,11 +971,17 @@ mod tests {
         core_out: Vec<bf16>,
         k_cache: Vec<bf16>,
         v_cache: Vec<bf16>,
+        oracle_mismatches: usize,
     }
 
     /// One `workspace` -> `prepare` -> `run` cycle, checked against the reference at `BINDER_BOUND`.
     fn run_shape(device: &Device, case: Case<'_>) -> Result<RunDump> {
         let Case {
+            spec,
+            remap,
+            graph,
+            mutant,
+            flash,
             prefix,
             valid_rows,
             max_rows,
@@ -917,8 +990,11 @@ mod tests {
             axes,
             oracle,
         } = case;
+        ensure!(
+            !oracle || spec == FullAttentionSpec::q38(),
+            "FP32 oracle requires the qualified 24/4 geometry"
+        );
         let stream = &device.stream;
-        let spec = FullAttentionSpec::q38();
         let limits = AttentionLimits {
             max_rows,
             capacity,
@@ -931,16 +1007,80 @@ mod tests {
 
         // Both halves of Q, K and V carry nonzero signal.
         let mut rng = Rng(0x243F_6A88_5A30_8D3D ^ (u64::from(prefix) << 8) ^ u64::from(valid_rows));
-        let (d, hq, hkv) = (D as usize, HQ as usize, HKV as usize);
-        let q_gate: Vec<bf16> = (0..max_rows as usize * hq * 2 * d)
+        let (d, hq, hkv) = (spec.d as usize, spec.hq as usize, spec.hkv as usize);
+        let mut q_gate: Vec<bf16> = (0..max_rows as usize * hq * 2 * d)
             .map(|_| rng.bf())
             .collect();
-        let k_proj: Vec<bf16> = (0..max_rows as usize * hkv * d).map(|_| rng.bf()).collect();
-        let v_proj: Vec<bf16> = (0..max_rows as usize * hkv * d).map(|_| rng.bf()).collect();
-        let q_norm_w: Vec<bf16> = (0..d).map(|_| bf16::from_f32(rng.next() * 0.25)).collect();
-        let k_norm_w: Vec<bf16> = (0..d).map(|_| bf16::from_f32(rng.next() * 0.25)).collect();
-        let prefix_k: Vec<bf16> = (0..hkv * prefix as usize * d).map(|_| rng.bf()).collect();
-        let prefix_v: Vec<bf16> = (0..hkv * prefix as usize * d).map(|_| rng.bf()).collect();
+        let mut k_proj: Vec<bf16> = (0..max_rows as usize * hkv * d).map(|_| rng.bf()).collect();
+        let mut v_proj: Vec<bf16> = (0..max_rows as usize * hkv * d).map(|_| rng.bf()).collect();
+        let mut q_norm_w: Vec<bf16> = (0..d).map(|_| bf16::from_f32(rng.next() * 0.25)).collect();
+        let mut k_norm_w: Vec<bf16> = (0..d).map(|_| bf16::from_f32(rng.next() * 0.25)).collect();
+        let mut prefix_k: Vec<bf16> = (0..hkv * prefix as usize * d).map(|_| rng.bf()).collect();
+        let mut prefix_v: Vec<bf16> = (0..hkv * prefix as usize * d).map(|_| rng.bf()).collect();
+
+        if remap {
+            let pattern = |i: usize| bf16::from_f32(((i % 53) as f32 - 26.0) / 64.0);
+            let qhead = |h: usize| {
+                if hq == 24 {
+                    (h / 6 / 2) * 8 + ((h / 6) % 2) * 4 + (h % 6).min(3)
+                } else {
+                    h
+                }
+            };
+            let kvhead = |h: usize| if hkv == 4 { h / 2 } else { h };
+            for (i, v) in q_gate.iter_mut().enumerate() {
+                *v = pattern(
+                    i / (hq * 2 * d) * 19 + qhead(i / (2 * d) % hq) * 37 + i % (2 * d) * 13,
+                );
+            }
+            for (i, v) in k_proj.iter_mut().enumerate() {
+                *v = pattern(i / (hkv * d) * 17 + kvhead(i / d % hkv) * 23 + i % d * 7);
+            }
+            for (i, v) in v_proj.iter_mut().enumerate() {
+                *v = pattern(i / (hkv * d) * 29 + kvhead(i / d % hkv) * 31 + i % d * 11);
+            }
+            for (i, v) in q_norm_w.iter_mut().enumerate() {
+                *v = pattern(i * 3);
+            }
+            for (i, v) in k_norm_w.iter_mut().enumerate() {
+                *v = pattern(i * 5);
+            }
+            for (i, v) in prefix_k.iter_mut().enumerate() {
+                *v = pattern(
+                    (i / d % prefix as usize) * 17
+                        + kvhead(i / (prefix as usize * d)) * 23
+                        + i % d * 7,
+                );
+            }
+            for (i, v) in prefix_v.iter_mut().enumerate() {
+                *v = pattern(
+                    (i / d % prefix as usize) * 29
+                        + kvhead(i / (prefix as usize * d)) * 31
+                        + i % d * 11,
+                );
+            }
+        }
+
+        if flash {
+            k_proj.fill(bf16::ZERO);
+            prefix_k.fill(bf16::ZERO);
+            let value = |head: usize, dim: usize| {
+                let h = if hkv == 4 { head / 2 } else { head };
+                bf16::from_f32(
+                    if (h + dim).is_multiple_of(2) {
+                        1.0
+                    } else {
+                        -1.0
+                    } * 2.0f32.powi(((dim * 3 + h * 5) % 7) as i32 - 3),
+                )
+            };
+            for (i, v) in v_proj.iter_mut().enumerate() {
+                *v = value(i / d % hkv, i % d);
+            }
+            for (i, v) in prefix_v.iter_mut().enumerate() {
+                *v = value(i / (prefix as usize * d), i % d);
+            }
+        }
 
         // Caches and output are NaN past the visible extent.
         let nan = bf16::from_bits(0x7fc0);
@@ -969,7 +1109,7 @@ mod tests {
         let dev_v = stream.clone_htod(&v_proj)?;
         let dev_q = stream.alloc_zeros::<bf16>(max_rows as usize * hq * d)?;
         let dev_gate = stream.alloc_zeros::<bf16>(max_rows as usize * hq * d)?;
-        let dev_out = stream.clone_htod(&vec![nan; max_rows as usize * hq * d])?;
+        let mut dev_out = stream.clone_htod(&vec![nan; max_rows as usize * hq * d])?;
         let dev_k_cache = stream.clone_htod(&k_cache)?;
         let dev_v_cache = stream.clone_htod(&v_cache)?;
         let dev_q_norm = stream.clone_htod(&q_norm_w)?;
@@ -985,50 +1125,50 @@ mod tests {
             q_gate: view(
                 &dev_q_gate,
                 stream,
-                [max_rows, HQ, 2 * D],
-                [(HQ * 2 * D) as u64, (2 * D) as u64, 1],
+                [max_rows, spec.hq, 2 * D],
+                [(spec.hq * 2 * D) as u64, (2 * D) as u64, 1],
             )?,
             k: view(
                 &dev_k,
                 stream,
-                [max_rows, HKV, D],
-                [(HKV * D) as u64, D as u64, 1],
+                [max_rows, spec.hkv, D],
+                [(spec.hkv * D) as u64, D as u64, 1],
             )?,
             v: view(
                 &dev_v,
                 stream,
-                [max_rows, HKV, D],
-                [(HKV * D) as u64, D as u64, 1],
+                [max_rows, spec.hkv, D],
+                [(spec.hkv * D) as u64, D as u64, 1],
             )?,
             q: TensorMut(view(
                 &dev_q,
                 stream,
-                [max_rows, HQ, D],
-                [(HQ * D) as u64, D as u64, 1],
+                [max_rows, spec.hq, D],
+                [(spec.hq * D) as u64, D as u64, 1],
             )?),
             gate: TensorMut(view(
                 &dev_gate,
                 stream,
-                [max_rows, HQ, D],
-                [(HQ * D) as u64, D as u64, 1],
+                [max_rows, spec.hq, D],
+                [(spec.hq * D) as u64, D as u64, 1],
             )?),
             k_cache: TensorMut(view(
                 &dev_k_cache,
                 stream,
-                [HKV, capacity, D],
+                [spec.hkv, capacity, D],
                 [(capacity * D) as u64, D as u64, 1],
             )?),
             v_cache: TensorMut(view(
                 &dev_v_cache,
                 stream,
-                [HKV, capacity, D],
+                [spec.hkv, capacity, D],
                 [(capacity * D) as u64, D as u64, 1],
             )?),
             core_out: TensorMut(view(
                 &dev_out,
                 stream,
-                [max_rows, HQ, D],
-                [(HQ * D) as u64, D as u64, 1],
+                [max_rows, spec.hq, D],
+                [(spec.hq * D) as u64, D as u64, 1],
             )?),
             q_norm: view(&dev_q_norm, stream, [D], [1])?,
             k_norm: view(&dev_k_norm, stream, [D], [1])?,
@@ -1039,35 +1179,113 @@ mod tests {
             },
         };
         let common = CommonOpsRef::new(&device.ctx)?;
-        let plan = FullAttentionOps::prepare(&device.ctx, &spec, limits, bindings, common)?;
-        FullAttentionOps::run(
-            &plan,
-            stream,
-            meta_ref,
-            Scratch {
-                ptr: scratch_ptr,
-                bytes: request.bytes,
-            },
-        )?;
+        let mut plan = FullAttentionOps::prepare(&device.ctx, &spec, limits, bindings, common)?;
+        if mutant {
+            let root = std::path::PathBuf::from(
+                std::env::var_os("FF_Q38_PROBE_DIR").context("FF_Q38_PROBE_DIR is required")?,
+            );
+            let module = device
+                .ctx
+                .load_module(cudarc::nvrtc::Ptx::from_binary(std::fs::read(root.join(
+                    format!("tcmqa_d256_global_split_sm{}.cubin", device.info.arch),
+                ))?))?;
+            Arc::get_mut(&mut plan.kernels)
+                .context("geometry fixture unexpectedly shares kernels")?
+                .qg_split = module.load_function("tcmqa_d256_qg_split")?;
+        }
+        let mut flash_op = if flash {
+            Some(super::super::flash::Flash::new(
+                stream.clone(),
+                max_rows as usize,
+                hq,
+            )?)
+        } else {
+            None
+        };
+        device.finish_upload()?;
+        let mut execute = || -> Result<()> {
+            if let Some(op) = flash_op.as_mut() {
+                FullAttentionOps::preprocess(
+                    &plan,
+                    stream,
+                    meta_ref,
+                    Scratch {
+                        ptr: scratch_ptr,
+                        bytes: request.bytes,
+                    },
+                )?;
+                op.run(
+                    &dev_q,
+                    hq * d,
+                    &dev_k_cache,
+                    &dev_v_cache,
+                    &mut dev_out,
+                    super::super::flash::Shape {
+                        rows: valid_rows as usize,
+                        start: prefix as usize,
+                        q_heads: hq,
+                        kv_heads: hkv,
+                        capacity: capacity as usize,
+                        head_dim: d,
+                        causal: true,
+                    },
+                )
+            } else {
+                FullAttentionOps::run(
+                    &plan,
+                    stream,
+                    meta_ref,
+                    Scratch {
+                        ptr: scratch_ptr,
+                        bytes: request.bytes,
+                    },
+                )
+            }
+        };
+        if graph {
+            use cudarc::driver::sys;
+            stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            let run = execute();
+            let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+            run?;
+            captured?.context("empty geometry graph")?.launch()?;
+        } else {
+            execute()?;
+        }
         stream.synchronize()?;
 
         // The gate split is checked bitwise; the Q path under `BINDER_BOUND`.
         let gate = stream.clone_dtoh(&dev_gate)?;
         let q_roped = stream.clone_dtoh(&dev_q)?;
-        for row in 0..valid_rows as usize {
+        let mut oracle_mismatches = 0;
+        for row in 0..if mutant { 0 } else { valid_rows as usize } {
             for head in 0..hq {
                 let src = (row * hq + head) * 2 * d + d;
                 let dst = (row * hq + head) * d;
-                ensure!(
-                    gate[dst..dst + d]
-                        .iter()
-                        .zip(&q_gate[src..src + d])
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "gate view mismatch at row {row} head {head}"
-                );
+                oracle_mismatches += gate[dst..dst + d]
+                    .iter()
+                    .zip(&q_gate[src..src + d])
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
             }
         }
         let got = stream.clone_dtoh(&dev_out)?;
+        if flash {
+            for row in 0..valid_rows as usize {
+                for head in 0..hq {
+                    for dim in 0..d {
+                        let expected = v_proj[(head / (hq / hkv)) * d + dim];
+                        oracle_mismatches += usize::from(
+                            got[(row * hq + head) * d + dim].to_bits() != expected.to_bits(),
+                        );
+                    }
+                }
+            }
+        }
+        ensure!(
+            remap || oracle_mismatches == 0,
+            "attention gate split oracle mismatch count={oracle_mismatches}"
+        );
         let live = valid_rows as usize * hq * d;
         ensure!(
             got[live..].iter().all(|v| v.is_nan()),
@@ -1136,7 +1354,159 @@ mod tests {
             core_out: got,
             k_cache: stream.clone_dtoh(&dev_k_cache)?,
             v_cache: stream.clone_dtoh(&dev_v_cache)?,
+            oracle_mismatches,
         })
+    }
+
+    fn geometry_mismatches(a: &RunDump, b: &RunDump, valid: u32, capacity: u32) -> Result<usize> {
+        let mut mismatches = 0;
+        for (a, b) in [(&a.q, &b.q), (&a.gate, &b.gate), (&a.core_out, &b.core_out)] {
+            for row in 0..valid as usize {
+                for head in 0..16 {
+                    let reference = head / 8 * 12 + head % 8 / 4 * 6 + head % 4;
+                    for dim in 0..256 {
+                        let x = a[(row * 16 + head) * 256 + dim];
+                        let y = b[(row * 24 + reference) * 256 + dim];
+                        ensure!(
+                            x.is_finite() && y.is_finite(),
+                            "nonfinite attention geometry fixture"
+                        );
+                        mismatches += usize::from(x.to_bits() != y.to_bits());
+                    }
+                }
+            }
+        }
+        for (a, b) in [(&a.k_cache, &b.k_cache), (&a.v_cache, &b.v_cache)] {
+            for head in 0..2 {
+                for position in 0..23 + valid as usize {
+                    for dim in 0..256 {
+                        let x = a[(head * capacity as usize + position) * 256 + dim];
+                        let y = b[(head * 2 * capacity as usize + position) * 256 + dim];
+                        ensure!(
+                            x.is_finite() && y.is_finite(),
+                            "nonfinite attention cache fixture"
+                        );
+                        mismatches += usize::from(x.to_bits() != y.to_bits());
+                    }
+                }
+            }
+        }
+        Ok(mismatches)
+    }
+
+    #[test]
+    #[ignore = "GPU window and FF_Q38_PROBE_DIR/tcmqa_d256_global_split_sm{86,89}.cubin required"]
+    fn mixer_geometry_attention_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let device = Device::new(0)?;
+        let model = crate::model_spec::ModelSpec::minicpm(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/minicpm-config.json"
+            )))?,
+            &serde_json::json!({"eos_token_id": [248044, 248046]}),
+        )?;
+        let spec = FullAttentionSpec::from_model(&model)?;
+        let mut defects = 0;
+        let mut cases = 0;
+        for (rows, valid) in [
+            (1, 1),
+            (2, 2),
+            (5, 5),
+            (8, 8),
+            (37, 37),
+            (64, 37),
+            (512, 512),
+            (512, 509),
+            (4096, 4096),
+        ] {
+            let axes: Vec<i32> = (0..rows as i32)
+                .flat_map(|r| [23 + r, 23 + 2 * r, 30 + 3 * r])
+                .collect();
+            let axes = device.stream.clone_htod(&axes)?;
+            for positions in [None, Some(&axes)] {
+                for graph in [false, true] {
+                    for flash in [false, true] {
+                        let base = Case {
+                            spec,
+                            remap: true,
+                            graph,
+                            flash,
+                            mutant: false,
+                            prefix: 23,
+                            valid_rows: valid,
+                            max_rows: rows,
+                            capacity: 8192,
+                            key_chunk: 256,
+                            axes: positions,
+                            oracle: false,
+                        };
+                        let reference = run_shape(
+                            &device,
+                            Case {
+                                spec: FullAttentionSpec::q38(),
+                                ..base
+                            },
+                        )?;
+                        ensure!(
+                            reference.oracle_mismatches == 0,
+                            "attention reference oracle mismatches={}",
+                            reference.oracle_mismatches
+                        );
+                        let candidate = run_shape(&device, base)?;
+                        let mismatches = geometry_mismatches(&candidate, &reference, valid, 8192)?
+                            + candidate.oracle_mismatches;
+                        println!(
+                            "ATTENTION_GEOMETRY rows={rows} valid={valid} prefix=23 axes={} graph={graph} flash={flash} mismatches={mismatches} {}",
+                            positions.is_some(),
+                            if mismatches == 0 { "PASS" } else { "DEFECT" }
+                        );
+                        defects += usize::from(mismatches != 0);
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        let base = Case {
+            spec,
+            remap: true,
+            graph: false,
+            flash: false,
+            mutant: false,
+            prefix: 23,
+            valid_rows: 8,
+            max_rows: 8,
+            capacity: 8192,
+            key_chunk: 256,
+            axes: None,
+            oracle: false,
+        };
+        let reference = run_shape(
+            &device,
+            Case {
+                spec: FullAttentionSpec::q38(),
+                ..base
+            },
+        )?;
+        let mutant = run_shape(
+            &device,
+            Case {
+                mutant: true,
+                ..base
+            },
+        )?;
+        let mismatches = geometry_mismatches(&mutant, &reference, 8, 8192)?;
+        ensure!(
+            mismatches > 0,
+            "global Q/gate split mutant was not detected"
+        );
+        println!("ATTENTION_GLOBAL_SPLIT_MUTANT PASS mismatches={mismatches}");
+        println!("ATTENTION_GEOMETRY_SUMMARY cases={cases} defects={defects}");
+        ensure!(defects == 0, "ATTENTION_GEOMETRY DEFECT cases={defects}");
+        Ok(())
     }
 
     #[test]
@@ -1151,18 +1521,7 @@ mod tests {
             .parse()?;
         let device = Device::new(ordinal)?;
         // Two segments: partials and merge.
-        run_shape(
-            &device,
-            Case {
-                prefix: 33,
-                valid_rows: 65,
-                max_rows: 65,
-                capacity: 256,
-                key_chunk: 32,
-                axes: None,
-                oracle: true,
-            },
-        )?;
+        run_shape(&device, case(None, true))?;
         // 17 live rows of max_rows 64: the graph-replay shape.
         run_shape(
             &device,
@@ -1172,14 +1531,18 @@ mod tests {
                 max_rows: 64,
                 capacity: 1024,
                 key_chunk: 64,
-                axes: None,
-                oracle: true,
+                ..case(None, true)
             },
         )?;
 
         // T = H = W = physical Axes must be bit-identical to Linear; a shifted table must change the output.
         fn case<'a>(axes: Option<&'a CudaSlice<i32>>, oracle: bool) -> Case<'a> {
             Case {
+                spec: FullAttentionSpec::q38(),
+                remap: false,
+                graph: false,
+                mutant: false,
+                flash: false,
                 prefix: 33,
                 valid_rows: 65,
                 max_rows: 65,

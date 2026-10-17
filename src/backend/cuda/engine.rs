@@ -430,9 +430,7 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
     Ok(match architecture {
         Architecture::Qwen35Text => LoadDispatch::Qwen,
         Architecture::Llama => LoadDispatch::Llama,
-        Architecture::MiniCpmV47 => anyhow::bail!(
-            "MiniCPM-V-4.7 CUDA runtime is not implemented (architecture {architecture:?})"
-        ),
+        Architecture::MiniCpmV47 => LoadDispatch::Qwen,
     })
 }
 
@@ -1435,7 +1433,9 @@ impl Engine {
     ) -> Result<()> {
         use crate::model_spec::{Architecture, Mixer};
         match (self.model_spec.architecture, mixer) {
-            (Architecture::Qwen35Text, _) => self.qwen_mixer(layer, step, trace),
+            (Architecture::Qwen35Text | Architecture::MiniCpmV47, _) => {
+                self.qwen_mixer(layer, step, trace)
+            }
             (Architecture::Llama, Mixer::FullAttention) => {
                 for op in crate::model::LLAMA_MIXER {
                     self.run_operator(op, layer, step, trace)?;

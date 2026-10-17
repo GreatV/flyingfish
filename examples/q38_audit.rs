@@ -8,7 +8,13 @@ fn main() -> Result<()> {
     let mapped = flyingfish::checkpoint::MappedCheckpoint::open(dir)?;
     let manifest = mapped.manifest(&spec, flyingfish::checkpoint::LoadPolicy::TextOnly)?;
     let plans = (0..64)
-        .map(|i| flyingfish::linear_plan::LayerDequantPlan::from_manifest(&manifest, i))
+        .map(|i| {
+            flyingfish::linear_plan::LayerDequantPlan::from_manifest(
+                &manifest,
+                i,
+                spec.linear_format,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     println!(
         "{}",

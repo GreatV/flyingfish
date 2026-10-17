@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn load_dispatch_selects_qwen_llama_and_rejects_minicpm() -> Result<()> {
+fn load_dispatch_selects_shared_hybrid_and_llama() -> Result<()> {
     assert_eq!(
         super::load_dispatch(crate::model_spec::Architecture::Qwen35Text)?,
         super::LoadDispatch::Qwen
@@ -10,12 +10,9 @@ fn load_dispatch_selects_qwen_llama_and_rejects_minicpm() -> Result<()> {
         super::load_dispatch(crate::model_spec::Architecture::Llama)?,
         super::LoadDispatch::Llama
     );
-    let error = super::load_dispatch(crate::model_spec::Architecture::MiniCpmV47)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("MiniCpmV47") && error.contains("not implemented"),
-        "{error}"
+    assert_eq!(
+        super::load_dispatch(crate::model_spec::Architecture::MiniCpmV47)?,
+        super::LoadDispatch::Qwen
     );
     Ok(())
 }

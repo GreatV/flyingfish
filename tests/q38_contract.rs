@@ -83,7 +83,13 @@ fn g0_normalized_geometry_and_rejections() {
 }
 #[test]
 fn g4_workspace_segmentation_and_metadata() {
-    let w = AttentionWorkspace::q38(65, 16640, 128).unwrap();
+    let w = AttentionWorkspace::new(
+        &flyingfish::op_contract::FullAttentionSpec::q38(),
+        65,
+        16640,
+        128,
+    )
+    .unwrap();
     assert_eq!((w.segment_rows, w.max_parts), (64, 130));
     assert_eq!(w.k_norm, 64 * 24 * 130 * 258 * 4);
     assert_eq!(w.bytes, w.k_norm + 65 * 1024 * 2);
@@ -92,8 +98,24 @@ fn g4_workspace_segmentation_and_metadata() {
             .iter()
             .all(|x| x % 256 == 0)
     );
-    assert!(AttentionWorkspace::q38(1, 16640, 0).is_err());
-    assert!(AttentionWorkspace::q38(65, 64, 128).is_err());
+    assert!(
+        AttentionWorkspace::new(
+            &flyingfish::op_contract::FullAttentionSpec::q38(),
+            1,
+            16640,
+            0
+        )
+        .is_err()
+    );
+    assert!(
+        AttentionWorkspace::new(
+            &flyingfish::op_contract::FullAttentionSpec::q38(),
+            65,
+            64,
+            128
+        )
+        .is_err()
+    );
     let good = SequenceMeta {
         prefix: 63,
         valid_rows: 65,

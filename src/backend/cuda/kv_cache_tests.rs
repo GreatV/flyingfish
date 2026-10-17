@@ -104,7 +104,12 @@ struct Core<'a> {
 impl Core<'_> {
     fn run(&self, prefix: usize, rows: u32, qrow: usize, graph: bool) -> Result<Vec<bf16>> {
         let cap = 16640u32;
-        let ws = AttentionWorkspace::q38(rows, cap, 256)?;
+        let ws = AttentionWorkspace::new(
+            &crate::op_contract::FullAttentionSpec::q38(),
+            rows,
+            cap,
+            256,
+        )?;
         let s = &self.device.stream;
         let meta = s.clone_htod(&[
             prefix as i32,

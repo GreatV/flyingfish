@@ -19,7 +19,7 @@ use crate::gdn_plan::GdnPolicy;
 use crate::{
     linear_plan::LayerDequantPlan,
     model_spec::Mixer,
-    op_contract::{AttentionLimits, ExecutionPhase, FullAttentionSpec},
+    op_contract::{AttentionLimits, ExecutionPhase, FullAttentionSpec, GdnSpec},
 };
 use cudarc::driver::{CudaFunction, DevicePtr};
 use std::collections::BTreeSet;
@@ -36,73 +36,84 @@ fn debug_name(trace: &Option<Target<'_>>, layer: usize, point: &str) -> String {
     }
 }
 
-/// The Q38 runtime implements exactly this text geometry; other Qwen3.5 specs error here.
 fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
-    use crate::model_spec::Architecture;
-    ensure!(
-        spec.architecture == Architecture::Qwen35Text,
-        "Q38 engine requires the Qwen3.5 text architecture"
-    );
+    use crate::model_spec::{Architecture, LinearFormat};
+    let (hidden, intermediate, vocab, hq, hkv, layers, hv, format) = match spec.architecture {
+        Architecture::Qwen35Text => (
+            5120,
+            17408,
+            248320,
+            24,
+            4,
+            64,
+            48,
+            LinearFormat::Fp8E4m3Block128,
+        ),
+        Architecture::MiniCpmV47 => (2048, 512, 248144, 16, 2, 40, 32, LinearFormat::Bf16),
+        Architecture::Llama => anyhow::bail!(
+            "hybrid engine does not implement architecture={:?}",
+            spec.architecture
+        ),
+    };
     for (name, value, expected) in [
-        ("hidden_size", spec.hidden, 5120u32),
-        ("intermediate_size", spec.intermediate, 17408),
-        ("vocab_size", spec.vocab, 248320),
-        ("num_attention_heads", spec.q_heads, 24),
-        ("num_key_value_heads", spec.kv_heads, 4),
+        ("hidden_size", spec.hidden, hidden),
+        ("intermediate_size", spec.intermediate, intermediate),
+        ("vocab_size", spec.vocab, vocab),
+        ("num_attention_heads", spec.q_heads, hq),
+        ("num_key_value_heads", spec.kv_heads, hkv),
         ("head_dim", spec.head_dim, 256),
-        ("q_width", spec.q_width, 6144),
+        ("q_width", spec.q_width, hq * 256),
         ("max_position_embeddings", spec.max_position, 262144),
         ("rotary_dim", spec.rotary_dim, 64),
     ] {
         ensure!(
             value == expected,
-            "Q38 engine does not implement {name}={value}"
+            "hybrid engine does not implement {name}={value}"
         );
     }
     ensure!(
-        spec.layers.len() == 64,
-        "Q38 engine does not implement num_hidden_layers={}",
+        spec.layers.len() == layers,
+        "hybrid engine does not implement num_hidden_layers={}",
         spec.layers.len()
     );
     ensure!(
         spec.rms_eps == 1e-6,
-        "Q38 engine does not implement rms_norm_eps={}",
+        "hybrid engine does not implement rms_norm_eps={}",
         spec.rms_eps
     );
     ensure!(
         spec.rope_theta == 1e7,
-        "Q38 engine does not implement rope_theta={}",
+        "hybrid engine does not implement rope_theta={}",
         spec.rope_theta
     );
     ensure!(
-        spec.moe.is_none(),
-        "Q38 engine does not implement a MoE text tower"
-    );
-    ensure!(
-        spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Block128,
-        "Q38 engine does not implement linear_format={:?}",
-        spec.linear_format
+        spec.linear_format == format,
+        "hybrid engine does not implement linear_format={:?} for {:?}",
+        spec.linear_format,
+        spec.architecture
     );
     let gdn = spec
         .gdn
         .as_ref()
-        .context("Q38 engine requires GDN geometry")?;
+        .context("hybrid engine does not implement gdn=None")?;
     for (name, value, expected) in [
-        ("linear_num_key_heads", gdn.key_heads, 16u32),
-        ("linear_num_value_heads", gdn.value_heads, 48),
+        ("linear_num_key_heads", gdn.key_heads, 16),
+        ("linear_num_value_heads", gdn.value_heads, hv),
         ("linear_key_head_dim", gdn.key_head_dim, 128),
         ("linear_value_head_dim", gdn.value_head_dim, 128),
         ("linear_conv_kernel_dim", gdn.conv_kernel, 4),
     ] {
         ensure!(
             value == expected,
-            "Q38 engine does not implement {name}={value}"
+            "hybrid engine does not implement {name}={value}"
         );
     }
     Ok(())
 }
 
 pub(super) struct Runtime {
+    attention: FullAttentionSpec,
+    gdn: GdnSpec,
     checkpoint_dir: PathBuf,
     vision: Option<super::vision_runtime::VisionRuntime>,
     vision_bytes: usize,
@@ -110,7 +121,7 @@ pub(super) struct Runtime {
     active_positions: CudaSlice<i32>,
     gather_positions: CudaFunction,
     catalog: WeightCatalog,
-    arena: CudaSlice<u8>,
+    arena: Option<CudaSlice<u8>>,
     scratch: CudaSlice<u8>,
     kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
     mask: CudaSlice<u64>,
@@ -305,15 +316,22 @@ impl Runtime {
             .and_then(|n| n.checked_add(spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>()))
             .context("Q38 fixed workspace overflow")
     }
-    fn workspace(rows: usize, capacity: usize, policy: GdnPolicy) -> Result<usize> {
-        let attention_prefill = FullAttentionOps::preprocess_workspace(limits(rows, capacity)?)?;
-        let attention_decode =
-            FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(1, capacity)?)?;
+    fn workspace(
+        model: &crate::model_spec::ModelSpec,
+        rows: usize,
+        capacity: usize,
+        policy: GdnPolicy,
+    ) -> Result<usize> {
+        let attention = FullAttentionSpec::from_model(model)?;
+        let gdn = GdnSpec::from_model(model)?;
+        let attention_prefill =
+            FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?;
+        let attention_decode = FullAttentionOps::workspace(&attention, limits(1, capacity)?)?;
         let attention_nested_verify = FullAttentionOps::workspace(
-            &FullAttentionSpec::q38(),
+            &attention,
             limits(rows.min(crate::mtp::MAX_VERIFY_ROWS), capacity)?,
         )?;
-        let spec = crate::op_contract::GdnSpec::q38();
+        let spec = gdn;
         let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?, policy)?;
         let decode = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY)?;
         ensure!(
@@ -341,13 +359,17 @@ impl Runtime {
         engine: &Engine,
         checkpoint_dir: &Path,
         catalog: WeightCatalog,
-        arena: CudaSlice<u8>,
+        arena: Option<CudaSlice<u8>>,
         scratch_buffer: CudaSlice<u8>,
         kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
         verify_rows: usize,
     ) -> Result<Self> {
         let s = &engine.device.stream;
         let rows = engine.workspace_rows;
+        let attention = FullAttentionSpec::from_model(&engine.model_spec)?;
+        let gdn = GdnSpec::from_model(&engine.model_spec)?;
+        let q_width = engine.model_spec.q_width;
+        let kv_width = attention.hkv * attention.d;
         let gdn_policy = GdnPolicy::for_device(engine.device.info.arch, engine.device.info.sms);
         let common = CommonOpsRef::new(&engine.device.ctx)?;
         let positions = s.clone_htod(
@@ -371,8 +393,13 @@ impl Runtime {
         for (i, layout) in engine.model_spec.layers.iter().enumerate() {
             let prefix = format!("model.language_model.layers.{i}.");
             let weight = |name: &str| vector(catalog.bf16(&format!("{prefix}{name}"))?, s);
-            let plan = LayerDequantPlan::from_manifest(&catalog.manifest, i as u32)?;
-            let linear = LayerLinearPlan::bind(&plan, &catalog, &scratch(&arena, s), s)?;
+            let plan = LayerDequantPlan::from_manifest(
+                &catalog.manifest,
+                i as u32,
+                engine.model_spec.linear_format,
+            )?;
+            let arena_view = arena.as_ref().map(|b| scratch(b, s));
+            let linear = LayerLinearPlan::bind(&plan, &catalog, arena_view.as_ref(), s)?;
             let mixer = match layout.mixer {
                 Mixer::FullAttention => {
                     let kv = &engine.state.kv[layout.state_index as usize];
@@ -398,7 +425,7 @@ impl Runtime {
                         };
                         FullAttentionOps::prepare(
                             &engine.device.ctx,
-                            &FullAttentionSpec::q38(),
+                            &attention,
                             limits(active_rows, engine.capacity)?,
                             AttentionBindings {
                                 compact: if compact {
@@ -406,26 +433,54 @@ impl Runtime {
                                 } else {
                                     None
                                 },
-                                q_gate: heads(&w.qkv, s, 0, active_rows, 24, 512)?,
-                                k: heads(&w.qkv, s, rows * 12288, active_rows, 4, 256)?,
-                                v: heads(&w.qkv, s, rows * (12288 + 1024), active_rows, 4, 256)?,
-                                q: TensorMut(heads(&mw.q, s, 0, active_rows, 24, 256)?),
-                                gate: TensorMut(heads(&mw.gate, s, 0, active_rows, 24, 256)?),
+                                q_gate: heads(&w.qkv, s, 0, active_rows, attention.hq, 512)?,
+                                k: heads(
+                                    &w.qkv,
+                                    s,
+                                    rows * (2 * q_width as usize),
+                                    active_rows,
+                                    attention.hkv,
+                                    256,
+                                )?,
+                                v: heads(
+                                    &w.qkv,
+                                    s,
+                                    rows * (2 * q_width as usize + kv_width as usize),
+                                    active_rows,
+                                    attention.hkv,
+                                    256,
+                                )?,
+                                q: TensorMut(heads(&mw.q, s, 0, active_rows, attention.hq, 256)?),
+                                gate: TensorMut(heads(
+                                    &mw.gate,
+                                    s,
+                                    0,
+                                    active_rows,
+                                    attention.hq,
+                                    256,
+                                )?),
                                 k_cache: TensorMut(view(
                                     k,
                                     s,
                                     0,
-                                    [4, cap as u32, 256],
+                                    [attention.hkv, cap as u32, 256],
                                     [(cap * 256) as u64, 256, 1],
                                 )?),
                                 v_cache: TensorMut(view(
                                     v,
                                     s,
                                     0,
-                                    [4, cap as u32, 256],
+                                    [attention.hkv, cap as u32, 256],
                                     [(cap * 256) as u64, 256, 1],
                                 )?),
-                                core_out: TensorMut(heads(&w.attn, s, 0, active_rows, 24, 256)?),
+                                core_out: TensorMut(heads(
+                                    &w.attn,
+                                    s,
+                                    0,
+                                    active_rows,
+                                    attention.hq,
+                                    256,
+                                )?),
                                 q_norm: weight("self_attn.q_norm.weight")?,
                                 k_norm: weight("self_attn.k_norm.weight")?,
                                 causal_mask: view(&mask, s, 0, [64], [1])?,
@@ -496,7 +551,7 @@ impl Runtime {
                     }
                 }
                 Mixer::Gdn => {
-                    let spec = crate::op_contract::GdnSpec::q38();
+                    let spec = gdn;
                     let cd = spec.conv_dim()?;
                     let state = &engine.state.gdn[layout.state_index as usize];
                     let conv = catalog.bf16(&format!("{prefix}linear_attn.conv1d.weight"))?;
@@ -576,6 +631,8 @@ impl Runtime {
         }
         let module = crate::backend::cuda::cubin::module(&engine.device.ctx, "q38_common")?;
         Ok(Self {
+            attention,
+            gdn,
             checkpoint_dir: checkpoint_dir
                 .canonicalize()
                 .context("resolve Q38 checkpoint directory")?,
@@ -649,7 +706,9 @@ impl Runtime {
     fn ensure_complete(&self) -> Result<()> {
         // These allocations own every address retained by the operator plans.
         ensure!(
-            self.catalog.bytes > 0 && !self.arena.is_empty() && self.mask.len() == 64,
+            self.catalog.bytes > 0
+                && self.arena.as_ref().is_none_or(|a| !a.is_empty())
+                && self.mask.len() == 64,
             "Q38 owners missing"
         );
         Ok(())
@@ -663,6 +722,8 @@ impl Engine {
     ) -> Result<()> {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let stream = &self.device.stream;
+        let g = q.gdn;
+        let cd = g.conv_dim()?;
         let mut states = snapshots.iter();
         for layer in &mut q.layers {
             if let BoundMixer::Gdn {
@@ -674,10 +735,25 @@ impl Engine {
                     &state.s,
                     stream,
                     0,
-                    [4, 48, 128, 128],
-                    [48 * 128 * 128, 128 * 128, 128, 1],
+                    [4, g.hv, g.dk, g.dv],
+                    [
+                        u64::from(g.hv * g.dk * g.dv),
+                        u64::from(g.dk * g.dv),
+                        u64::from(g.dv),
+                        1,
+                    ],
                 )?;
-                let h = view(&state.history, stream, 0, [4, 10240, 3], [10240 * 3, 3, 1])?;
+                let h = view(
+                    &state.history,
+                    stream,
+                    0,
+                    [4, cd, g.history_width],
+                    [
+                        u64::from(cd * g.history_width),
+                        u64::from(g.history_width),
+                        1,
+                    ],
+                )?;
                 *verify = (1..=verify_rows)
                     .map(|rows| prefill.full.for_rows(rows as u32, Some((s, h))))
                     .collect::<Result<_>>()?;
@@ -874,6 +950,7 @@ impl Engine {
         model_spec: crate::model_spec::ModelSpec,
     ) -> Result<Self> {
         require_qwen35_geometry(&model_spec)?;
+        ensure!(model_spec.moe.is_none(), "MoE FFN execution is not bound");
         let write = !matches!(mode, super::SetupMode::Ready);
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
         let verify_rows = match mode {
@@ -881,6 +958,9 @@ impl Engine {
             _ => crate::mtp::MAX_VERIFY_ROWS,
         };
         let started = Instant::now();
+        let attention = FullAttentionSpec::from_model(&model_spec)?;
+        let gdn = GdnSpec::from_model(&model_spec)?;
+        let kv_width = attention.hkv * attention.d;
         ensure!(
             settings.draft_model.is_none(),
             "Q38 MTP/tree execution is not bound"
@@ -890,7 +970,7 @@ impl Engine {
             "invalid Q38 capacity"
         );
         // Reject an incomplete operator plan before allocating model weights.
-        Runtime::workspace(1, capacity, GdnPolicy::LEGACY)?;
+        Runtime::workspace(&model_spec, 1, capacity, GdnPolicy::LEGACY)?;
         let runtime = settings
             .runtime_dir
             .as_deref()
@@ -947,8 +1027,8 @@ impl Engine {
             None
         } else {
             Some((
-                s.alloc_zeros::<bf16>(capacity * 4 * 256)?,
-                s.alloc_zeros::<bf16>(capacity * 4 * 256)?,
+                s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
+                s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
             ))
         };
         let capture_checkpoint = Some(super::super::state::StateCheckpoint::new(
@@ -958,15 +1038,28 @@ impl Engine {
             s,
         )?);
         let arena_bytes = (0..model_spec.layers.len())
-            .map(|i| LayerDequantPlan::from_manifest(&catalog.manifest, i as u32).map(|p| p.bytes))
+            .map(|i| {
+                LayerDequantPlan::from_manifest(
+                    &catalog.manifest,
+                    i as u32,
+                    model_spec.linear_format,
+                )
+                .map(|p| p.bytes)
+            })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .max()
             .context("missing Q38 layers")?;
-        let arena = s.alloc_zeros::<u8>(usize::try_from(arena_bytes)?)?;
+        let arena = if arena_bytes == 0 {
+            None
+        } else {
+            Some(s.alloc_zeros::<u8>(usize::try_from(arena_bytes)?)?)
+        };
         let ops = Ops::new(&device.ctx)?;
         let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
-        blas.enable_fp8(&device.ctx)?;
+        if model_spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Block128 {
+            blas.enable_fp8(&device.ctx)?;
+        }
         device.finish_upload()?;
         let (free, total) = device.ctx.mem_get_info()?;
         let mtp_budget = reserve_mtp
@@ -987,10 +1080,11 @@ impl Engine {
                     .context("combined fixed bytes overflow")?,
             },
             |rows| {
-                let mut target = Runtime::workspace(rows, capacity, gdn_policy)?;
+                let mut target = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?;
                 if settings.kv_format != crate::kv::KvFormat::Bf16 {
                     target = target.max(
-                        crate::op_contract::AttentionWorkspace::q38(
+                        crate::op_contract::AttentionWorkspace::new(
+                            &attention,
                             verify_rows as u32,
                             capacity as u32,
                             limits(verify_rows, capacity)?.key_chunk,
@@ -1015,11 +1109,12 @@ impl Engine {
             !reserve_mtp || rows >= verify_rows,
             "MTP chunk {rows} cannot fit {verify_rows} verification rows"
         );
-        let target_workspace = Runtime::workspace(rows, capacity, gdn_policy)?.max(
+        let target_workspace = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?.max(
             if settings.kv_format == crate::kv::KvFormat::Bf16 {
                 0
             } else {
-                crate::op_contract::AttentionWorkspace::q38(
+                crate::op_contract::AttentionWorkspace::new(
+                    &attention,
                     verify_rows as u32,
                     capacity as u32,
                     limits(verify_rows, capacity)?.key_chunk,
@@ -1043,14 +1138,14 @@ impl Engine {
                 "kv_prefill_scratch_bytes": kv_scratch.as_ref().map_or(0,|(k,v)|(k.len()+v.len())*size_of::<bf16>()),
                 "capture_checkpoint_bytes": capture_checkpoint.as_ref().context("capture checkpoint missing")?.bytes(),
                 "layer_arena_bytes": arena_bytes,
-                "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(limits(rows, capacity)?)?.bytes,
+                "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?.bytes,
                 "attention_prefill_lse_bytes": rows * model_spec.q_heads as usize * size_of::<f32>(),
-                "attention_decode_workspace_bytes": FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(1, capacity)?)?.bytes,
-                "attention_nested_verify_workspace_bytes": FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(rows.min(5), capacity)?)?.bytes,
+                "attention_decode_workspace_bytes": FullAttentionOps::workspace(&attention, limits(1, capacity)?)?.bytes,
+                "attention_nested_verify_workspace_bytes": FullAttentionOps::workspace(&attention, limits(rows.min(5), capacity)?)?.bytes,
                 "attention_prefill_backend": "FA2 d256",
                 "attention_decode_backend": "TCMQA d256",
-                "gdn_prefill_workspace_bytes": GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), u32::try_from(rows)?, gdn_policy)?.bytes,
-                "gdn_decode_workspace_bytes": GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), 1, GdnPolicy::LEGACY)?.bytes,
+                "gdn_prefill_workspace_bytes": GdnOps::workspace(&gdn, u32::try_from(rows)?, gdn_policy)?.bytes,
+                "gdn_decode_workspace_bytes": GdnOps::workspace(&gdn, 1, GdnPolicy::LEGACY)?.bytes,
                 "bound_prefill_max_rows": rows,
                 "bound_decode_max_rows": 1,
                 "gdn_plan": gdn_policy.identity(),
@@ -1175,7 +1270,7 @@ impl Engine {
         {
             self.qwen.as_mut().context("Q38 runtime missing")?.layers[i]
                 .linear
-                .materialize(self.blas.fp8_ops()?, &self.device.stream)?;
+                .materialize(&self.blas, &self.device.stream)?;
         }
         Ok(())
     }
@@ -1187,6 +1282,13 @@ impl Engine {
     ) -> Result<()> {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
         let layer = &q.layers[i];
+        let attention = q.attention;
+        let gdn = q.gdn;
+        let q_width = self.model_spec.q_width;
+        let kv_width = attention.hkv * attention.d;
+        let conv_width = 2 * gdn.hk * gdn.dk + gdn.hv * gdn.dv;
+        let value_width = gdn.hv * gdn.dv;
+        let hidden = self.model_spec.hidden as usize;
         let s = &self.device.stream;
         let rows = step.rows;
         let phase = if step.input == crate::backend::Input::Token {
@@ -1211,19 +1313,23 @@ impl Engine {
                 compact_small,
             } => {
                 for (role, width, offset) in [
-                    ("self_attn.q_proj.weight", 12288, 0),
-                    ("self_attn.k_proj.weight", 1024, self.workspace_rows * 12288),
+                    ("self_attn.q_proj.weight", 2 * q_width as usize, 0),
+                    (
+                        "self_attn.k_proj.weight",
+                        kv_width as usize,
+                        self.workspace_rows * 2 * q_width as usize,
+                    ),
                     (
                         "self_attn.v_proj.weight",
-                        1024,
-                        self.workspace_rows * (12288 + 1024),
+                        kv_width as usize,
+                        self.workspace_rows * (2 * q_width as usize + kv_width as usize),
                     ),
                 ] {
                     layer.linear.run(
                         &self.blas,
                         role,
                         phase,
-                        matrix(&w.n, s, 0, linear_rows, 5120)?,
+                        matrix(&w.n, s, 0, linear_rows, hidden)?,
                         &mut TensorMut(matrix(&w.qkv, s, offset, linear_rows, width)?),
                     )?;
                 }
@@ -1281,8 +1387,8 @@ impl Engine {
                             let shape = Shape {
                                 rows,
                                 start: self.position,
-                                q_heads: 24,
-                                kv_heads: 4,
+                                q_heads: attention.hq as usize,
+                                kv_heads: attention.hkv as usize,
                                 capacity: self.capacity,
                                 head_dim: 256,
                                 causal: true,
@@ -1290,7 +1396,14 @@ impl Engine {
                             self.flash
                                 .as_mut()
                                 .context("Q38 prefill attention is not bound")?
-                                .run(&mw.q, 24 * 256, k_cache, v_cache, &mut w.attn, shape)?;
+                                .run(
+                                    &mw.q,
+                                    q_width as usize,
+                                    k_cache,
+                                    v_cache,
+                                    &mut w.attn,
+                                    shape,
+                                )?;
                             if let Some(c) = &kv.compact {
                                 let (k, v) = q
                                     .kv_scratch
@@ -1313,16 +1426,16 @@ impl Engine {
                 q.common.gate.sigmoid_mul(
                     s,
                     domain,
-                    heads(&w.attn, s, 0, rows, 24, 256)?,
-                    heads(&mw.gate, s, 0, rows, 24, 256)?,
-                    &mut TensorMut(heads(&w.attn, s, 0, rows, 24, 256)?),
+                    heads(&w.attn, s, 0, rows, attention.hq, 256)?,
+                    heads(&mw.gate, s, 0, rows, attention.hq, 256)?,
+                    &mut TensorMut(heads(&w.attn, s, 0, rows, attention.hq, 256)?),
                 )?;
                 layer.linear.run(
                     &self.blas,
                     "self_attn.o_proj.weight",
                     phase,
-                    matrix(&w.attn, s, 0, linear_rows, 6144)?,
-                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, 5120)?),
+                    matrix(&w.attn, s, 0, linear_rows, q_width as usize)?,
+                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
                 )?;
             }
             BoundMixer::Gdn {
@@ -1331,9 +1444,9 @@ impl Engine {
                 verify,
                 decode,
             } => {
-                let spec = crate::op_contract::GdnSpec::q38();
-                let conv = spec.conv_dim()? as usize;
-                let value = (spec.hv * spec.dv) as usize;
+                let spec = gdn;
+                let conv = conv_width as usize;
+                let value = value_width as usize;
                 let hv = spec.hv as usize;
                 for (role, output, offset, width) in [
                     ("linear_attn.in_proj_qkv.weight", &w.qkv, 0, conv),
@@ -1350,7 +1463,7 @@ impl Engine {
                         &self.blas,
                         role,
                         phase,
-                        matrix(&w.n, s, 0, linear_rows, 5120)?,
+                        matrix(&w.n, s, 0, linear_rows, hidden)?,
                         &mut TensorMut(matrix(output, s, offset, linear_rows, width)?),
                     )?;
                 }
@@ -1394,16 +1507,20 @@ impl Engine {
                     "linear_attn.out_proj.weight",
                     phase,
                     matrix(&w.attn, s, 0, linear_rows, value)?,
-                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, 5120)?),
+                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
                 )?;
             }
         }
         let all = all_layers(trace);
         if all || i == self.trace_layer {
             let name = debug_name(trace, i, "mixer_out");
-            trace_value(trace, s, &name, &w.attn, rows, 6144)?;
+            let mixer_width = match &layer.mixer {
+                BoundMixer::Attention { .. } => q_width,
+                BoundMixer::Gdn { .. } => value_width,
+            };
+            trace_value(trace, s, &name, &w.attn, rows, mixer_width as usize)?;
             let name = debug_name(trace, i, "o_proj");
-            trace_value(trace, s, &name, &w.out, rows, 5120)?;
+            trace_value(trace, s, &name, &w.out, rows, hidden)?;
             if matches!(self.model_spec.layers[i].mixer, Mixer::Gdn)
                 && (!all || i == 0)
                 && let Some(t) = trace.as_mut()
@@ -1417,12 +1534,12 @@ impl Engine {
                 let suffix = if all { ".e2e" } else { "" };
                 t.trace.add(
                     format!("{prefix}.debug.gdn_s{suffix}"),
-                    vec![48, 128, 128],
+                    vec![gdn.hv as usize, gdn.dk as usize, gdn.dv as usize],
                     s.clone_dtoh(&state.s)?,
                 )?;
                 t.trace.add(
                     format!("{prefix}.debug.gdn_history{suffix}"),
-                    vec![10240, 3],
+                    vec![conv_width as usize, gdn.history_width as usize],
                     s.clone_dtoh(&state.history)?,
                 )?;
             }
@@ -1639,63 +1756,116 @@ impl Engine {
 mod tests {
     use super::default_chunk;
 
+    fn geometry() -> crate::model_spec::ModelSpec {
+        crate::model_spec::ModelSpec::qwen(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/q38-config.json"
+            )))
+            .unwrap(),
+            &serde_json::json!({}),
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn capability_check_rejects_geometry_the_q38_engine_does_not_implement() -> Result<()> {
-        let root: serde_json::Value =
-            serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?;
-        let spec = crate::model_spec::ModelSpec::qwen(&root, &serde_json::Value::Null)?;
-        super::require_qwen35_geometry(&spec)?;
-        let check = |bad: &crate::model_spec::ModelSpec, field: &str| {
-            let err = super::require_qwen35_geometry(bad).unwrap_err().to_string();
-            assert!(err.contains(field), "{field}: {err}");
-        };
-        let mut bad = spec.clone();
-        bad.architecture = crate::model_spec::Architecture::MiniCpmV47;
-        check(&bad, "architecture");
-        let mut bad = spec.clone();
-        bad.hidden = 2048;
-        check(&bad, "hidden_size=2048");
-        let mut bad = spec.clone();
-        bad.layers.pop();
-        check(&bad, "num_hidden_layers=63");
-        let mut bad = spec.clone();
-        bad.head_dim = 128;
-        check(&bad, "head_dim=128");
-        let mut bad = spec.clone();
-        bad.rotary_dim = 128;
-        check(&bad, "rotary_dim=128");
-        let mut bad = spec.clone();
-        bad.rope_theta = 5e6;
-        check(&bad, "rope_theta");
-        let mut bad = spec.clone();
-        bad.gdn.as_mut().unwrap().value_heads = 32;
-        check(&bad, "linear_num_value_heads=32");
-        let mut bad = spec.clone();
-        bad.linear_format = crate::model_spec::LinearFormat::Bf16;
-        check(&bad, "linear_format");
-        let mut unquantized = root.clone();
-        unquantized
-            .as_object_mut()
-            .unwrap()
-            .remove("quantization_config");
-        let unquantized =
-            crate::model_spec::ModelSpec::qwen(&unquantized, &serde_json::Value::Null)?;
-        assert_eq!(
-            unquantized.linear_format,
-            crate::model_spec::LinearFormat::Bf16
-        );
-        let err = super::require_qwen35_geometry(&unquantized)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("linear_format"), "{err}");
-        let mut bad = spec.clone();
-        bad.moe = Some(crate::model_spec::MoeConfig {
-            experts: 256,
-            experts_per_tok: 8,
-            expert_intermediate: 512,
-            shared_intermediate: 512,
-        });
-        check(&bad, "MoE");
+    fn capability_check_matches_compiled_mixer_geometries() -> Result<()> {
+        let qwen: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/q38-config.json"
+        )))?;
+        let spec = crate::model_spec::ModelSpec::qwen(&qwen, &serde_json::json!({}))?;
+        require_qwen35_geometry(&spec)?;
+        let minicpm = crate::model_spec::ModelSpec::minicpm(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/minicpm-config.json"
+            )))?,
+            &serde_json::json!({"eos_token_id": [248044, 248046]}),
+        )?;
+        require_qwen35_geometry(&minicpm)?;
+        for original in [&spec, &minicpm] {
+            for field in [
+                "hidden_size",
+                "intermediate_size",
+                "vocab_size",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "head_dim",
+                "q_width",
+                "max_position_embeddings",
+                "rotary_dim",
+                "num_hidden_layers",
+                "rms_norm_eps",
+                "rope_theta",
+                "linear_num_key_heads",
+                "linear_num_value_heads",
+                "linear_key_head_dim",
+                "linear_value_head_dim",
+                "linear_conv_kernel_dim",
+                "gdn",
+                "linear_format",
+                "architecture",
+            ] {
+                let mut bad = original.clone();
+                match field {
+                    "hidden_size" => bad.hidden += 1,
+                    "intermediate_size" => bad.intermediate += 1,
+                    "vocab_size" => bad.vocab += 1,
+                    "num_attention_heads" => bad.q_heads += 1,
+                    "num_key_value_heads" => bad.kv_heads += 1,
+                    "head_dim" => bad.head_dim += 1,
+                    "q_width" => bad.q_width += 1,
+                    "max_position_embeddings" => bad.max_position += 1,
+                    "rotary_dim" => bad.rotary_dim += 1,
+                    "num_hidden_layers" => {
+                        bad.layers.pop();
+                    }
+                    "rms_norm_eps" => bad.rms_eps *= 2.0,
+                    "rope_theta" => bad.rope_theta *= 2.0,
+                    "linear_num_key_heads" => bad.gdn.as_mut().unwrap().key_heads += 1,
+                    "linear_num_value_heads" => bad.gdn.as_mut().unwrap().value_heads += 1,
+                    "linear_key_head_dim" => bad.gdn.as_mut().unwrap().key_head_dim += 1,
+                    "linear_value_head_dim" => bad.gdn.as_mut().unwrap().value_head_dim += 1,
+                    "linear_conv_kernel_dim" => bad.gdn.as_mut().unwrap().conv_kernel += 1,
+                    "gdn" => bad.gdn = None,
+                    "linear_format" => {
+                        bad.linear_format = match original.linear_format {
+                            crate::model_spec::LinearFormat::Bf16 => {
+                                crate::model_spec::LinearFormat::Fp8E4m3Block128
+                            }
+                            crate::model_spec::LinearFormat::Fp8E4m3Block128 => {
+                                crate::model_spec::LinearFormat::Bf16
+                            }
+                        }
+                    }
+                    "architecture" => bad.architecture = crate::model_spec::Architecture::Llama,
+                    _ => unreachable!(),
+                }
+                let error = require_qwen35_geometry(&bad).unwrap_err().to_string();
+                assert!(error.contains(&format!("{field}=")), "{field}: {error}");
+            }
+        }
+        let error = Engine::load_qwen(
+            Path::new("unused-model"),
+            0,
+            32,
+            Some(1),
+            Settings {
+                tree_builder: crate::backend::TreeBuilder::Waves,
+                spec_budget: crate::backend::SpecBudget::Chain,
+                spec_graph: false,
+                draft_model: None,
+                prefix_cache: false,
+                kv_format: crate::kv::KvFormat::Bf16,
+                runtime_dir: None,
+            },
+            super::super::SetupMode::Prepare,
+            minicpm,
+        )
+        .err()
+        .context("MoE model reached device setup")?;
+        assert!(error.to_string().contains("MoE FFN execution"), "{error}");
         Ok(())
     }
 
@@ -1834,7 +2004,9 @@ mod tests {
             assert!(plans.select(0, &narrow).is_err());
             assert!(plans.select(capacity + 1, &narrow).is_err());
             assert!(plans.select(usize::MAX, &narrow).is_err());
-            let budget = Runtime::workspace(capacity, 4096, GdnPolicy::for_device(89, 128))? as u64;
+            let budget =
+                Runtime::workspace(&geometry(), capacity, 4096, GdnPolicy::for_device(89, 128))?
+                    as u64;
             for rows in 1..=5.min(capacity) {
                 assert!(
                     GdnOps::workspace(
@@ -1846,7 +2018,12 @@ mod tests {
                         <= budget
                 );
                 assert!(
-                    FullAttentionOps::preprocess_workspace(limits(rows, 4096)?)?.bytes <= budget
+                    FullAttentionOps::preprocess_workspace(
+                        &FullAttentionSpec::q38(),
+                        limits(rows, 4096)?
+                    )?
+                    .bytes
+                        <= budget
                 );
             }
         }
@@ -1879,7 +2056,8 @@ mod tests {
         for capacity in [256, 16_832] {
             let required =
                 FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(5, capacity)?)?;
-            let allocated = Runtime::workspace(5, capacity, GdnPolicy::for_device(89, 128))?;
+            let allocated =
+                Runtime::workspace(&geometry(), 5, capacity, GdnPolicy::for_device(89, 128))?;
             ensure!(
                 required.bytes <= allocated as u64,
                 "nested verify workspace {required:?} exceeds allocation {allocated}"
@@ -1887,12 +2065,15 @@ mod tests {
             let mtp = crate::mtp::AttachmentBudget::new(&spec, capacity)?;
             let row_bytes = Runtime::row_bytes(&spec)? + mtp.row_bytes;
             let fixed = Runtime::fixed_bytes(&spec, capacity)? + mtp.fixed_bytes;
-            let workspace = |rows| {
-                Ok(
-                    Runtime::workspace(rows, capacity, GdnPolicy::for_device(89, 128))?
-                        + mtp.workspace(rows)?,
-                )
-            };
+            let workspace =
+                |rows| {
+                    Ok(Runtime::workspace(
+                        &geometry(),
+                        rows,
+                        capacity,
+                        GdnPolicy::for_device(89, 128),
+                    )? + mtp.workspace(rows)?)
+                };
             let total = 24usize << 30;
             let request = WorkspaceRequest {
                 capacity,
@@ -1957,9 +2138,12 @@ mod tests {
         let total = 1 << 30;
         let fixed = spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>() + capacity * 12;
         for rows in [1, 65, 128] {
-            let scratch = Runtime::workspace(rows, capacity, GdnPolicy::LEGACY)?;
+            let scratch = Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::LEGACY)?;
             for required in [
-                FullAttentionOps::preprocess_workspace(limits(rows, capacity)?)?,
+                FullAttentionOps::preprocess_workspace(
+                    &FullAttentionSpec::q38(),
+                    limits(rows, capacity)?,
+                )?,
                 FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(1, capacity)?)?,
                 GdnOps::workspace(
                     &crate::op_contract::GdnSpec::q38(),
@@ -1986,7 +2170,7 @@ mod tests {
             };
             let budget = WorkspaceBudget::new(
                 request,
-                |r| Runtime::workspace(r, capacity, GdnPolicy::LEGACY),
+                |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY),
                 Ok,
             )?;
             assert_eq!(budget.planned_transient_bytes, allocated);
@@ -1998,7 +2182,7 @@ mod tests {
                         free_after_resident: request.free_after_resident - 1,
                         ..request
                     },
-                    |r| Runtime::workspace(r, capacity, GdnPolicy::LEGACY),
+                    |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY),
                     Ok,
                 )
                 .is_err()
@@ -2021,7 +2205,7 @@ mod tests {
         let row_bytes = Runtime::row_bytes(&spec)?;
         let fixed = Runtime::fixed_bytes(&spec, capacity)?;
         for rows in [512, 513, 1021, 1024, 2048, 4096, 8192] {
-            let scratch = Runtime::workspace(rows, capacity, policy)?;
+            let scratch = Runtime::workspace(&geometry(), rows, capacity, policy)?;
             let gdn = policy.workspace(&crate::op_contract::GdnSpec::q38(), rows as u32)?;
             assert!(scratch as u64 >= gdn.bytes);
             let required = rows * row_bytes + fixed + scratch;
@@ -2034,8 +2218,11 @@ mod tests {
                 row_bytes,
                 fixed_transient_bytes: fixed,
             };
-            let budget =
-                WorkspaceBudget::new(request, |r| Runtime::workspace(r, capacity, policy), Ok)?;
+            let budget = WorkspaceBudget::new(
+                request,
+                |r| Runtime::workspace(&geometry(), r, capacity, policy),
+                Ok,
+            )?;
             assert_eq!(budget.plan.chunk, rows);
             assert_eq!(budget.operator_workspace_bytes, scratch);
             assert_eq!(budget.planned_transient_bytes, required);
@@ -2045,7 +2232,7 @@ mod tests {
                         free_after_resident: request.free_after_resident - 1,
                         ..request
                     },
-                    |r| Runtime::workspace(r, capacity, policy),
+                    |r| Runtime::workspace(&geometry(), r, capacity, policy),
                     Ok,
                 )
                 .is_err()

@@ -4,7 +4,7 @@ use super::{
     engine::Kv,
 };
 use crate::{
-    model_spec::{Architecture, Mixer, ModelSpec},
+    model_spec::{Mixer, ModelSpec},
     op_contract::{GdnSpec, SequenceMeta},
 };
 use anyhow::{Context, Result, ensure};
@@ -382,11 +382,10 @@ impl StateStore {
                 }
                 Mixer::Gdn => {
                     ensure!(
-                        spec.architecture == Architecture::Qwen35Text
-                            && layer.state_index as usize == gdn.len(),
+                        layer.state_index as usize == gdn.len(),
                         "invalid GDN state mapping"
                     );
-                    let g = GdnSpec::q38();
+                    let g = GdnSpec::from_model(spec)?;
                     gdn.push(GdnState {
                         s: stream.alloc_zeros::<f32>(usize::try_from(g.state_bytes()? / 4)?)?,
                         history: stream
@@ -395,7 +394,7 @@ impl StateStore {
                 }
             }
         }
-        let sequence = if spec.architecture == Architecture::Qwen35Text {
+        let sequence = if spec.gdn.is_some() {
             Some(stream.clone_htod(&[0i32, 1, 1, capacity as i32, 1, 0, 0, 0])?)
         } else {
             None
