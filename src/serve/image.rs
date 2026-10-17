@@ -113,6 +113,37 @@ pub struct PackedImage {
     pub pixel_values: Vec<f32>,
 }
 
+/// Video processing options for the first support (stack_frames = 1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VideoOptions {
+    pub max_num_frames: usize,
+    pub stack_frames: u32,
+    /// Slice cap per frame; `None` uses the processor configuration's value.
+    pub max_slice_nums: Option<usize>,
+}
+
+/// One prepared video frame: its slice grid and per-crop patch grids (thumbnail, then slices).
+#[derive(Debug)]
+pub struct VideoFrame {
+    pub rows: u32,
+    pub cols: u32,
+    pub grids: Vec<ImageGrid>,
+}
+
+/// Prepared video: packed crops in frame order.
+#[derive(Debug)]
+pub struct PackedVideo {
+    pub frames: Vec<VideoFrame>,
+    pub pixel_values: Vec<f32>,
+}
+
+impl PackedVideo {
+    /// Per-crop patch grids in frame order, matching the prompt's crop runs.
+    pub fn crops(&self) -> impl Iterator<Item = &ImageGrid> {
+        self.frames.iter().flat_map(|frame| frame.grids.iter())
+    }
+}
+
 pub struct PlannedImage {
     bytes: Vec<u8>,
     mime: String,
@@ -289,7 +320,7 @@ struct QwenConfig {
     image_std: [f32; 3],
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct MiniCpmConfig {
     max_slice_nums: usize,
     image_mean: [f32; 3],
@@ -414,6 +445,44 @@ impl Processor {
             .as_ref()
             .map(|vision| vision.merge)
             .unwrap_or(0)
+    }
+
+    /// Samples frames and packs their crops for one decoded video (stack_frames = 1).
+    pub fn prepare_video(
+        &self,
+        frames: &[RgbImage],
+        meta: &VideoMetadata,
+        options: &VideoOptions,
+    ) -> Result<PackedVideo> {
+        let indices = sample_frame_indices(meta, options.max_num_frames, options.stack_frames)?;
+        ensure!(
+            frames.len() == meta.total_num_frames,
+            "decoded video holds {} frames, metadata reports {}",
+            frames.len(),
+            meta.total_num_frames
+        );
+        let ImageConfig::MiniCpm(base) = &self.config else {
+            bail!("video input requires the MiniCPM image configuration")
+        };
+        let mut config = base.clone();
+        if let Some(max) = options.max_slice_nums {
+            ensure!(max > 0, "zero max_slice_nums");
+            config.max_slice_nums = max;
+        }
+        let mut packed = PackedVideo {
+            frames: Vec::with_capacity(indices.len()),
+            pixel_values: Vec::new(),
+        };
+        for &index in &indices {
+            let image = mini_cpm_prepare_rgb(&self.spec, &frames[index], &config)?;
+            packed.frames.push(VideoFrame {
+                rows: image.rows,
+                cols: image.cols,
+                grids: image.grids,
+            });
+            packed.pixel_values.extend_from_slice(&image.pixel_values);
+        }
+        Ok(packed)
     }
 
     pub fn prepare_rgb(&self, image: &RgbImage) -> Result<PackedImage> {
@@ -1604,5 +1673,130 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("outside 10 frames"), "{error}");
+    }
+
+    fn video_processor() -> Result<Processor> {
+        let root: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/data/minicpm-config.json"))?;
+        let spec = ModelSpec::minicpm(
+            &root,
+            &serde_json::json!({"eos_token_id": [248044, 248046]}),
+        )?;
+        Ok(Processor {
+            spec,
+            config: ImageConfig::MiniCpm(MiniCpmConfig {
+                max_slice_nums: 9,
+                image_mean: [0.5, 0.5, 0.5],
+                image_std: [0.5, 0.5, 0.5],
+                mrope_mode: "canvas".into(),
+            }),
+            image_id: None,
+        })
+    }
+
+    fn constant_frame(width: usize, height: usize, level: u8) -> RgbImage {
+        RgbImage {
+            width,
+            height,
+            pixels: vec![level; width * height * 3],
+        }
+    }
+
+    #[test]
+    fn video_frame_crops_pack_in_sample_order() -> Result<()> {
+        let processor = video_processor()?;
+        let patch = processor
+            .spec
+            .vision
+            .as_ref()
+            .unwrap()
+            .patch_elements(processor.spec.architecture)?;
+        let frames: Vec<RgbImage> = (0..4)
+            .map(|i| constant_frame(64, 48, (i * 40) as u8))
+            .collect();
+        let meta = VideoMetadata {
+            total_num_frames: 4,
+            fps: 2.0,
+            duration: 2.0,
+        };
+        let options = VideoOptions {
+            max_num_frames: 2,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let packed = processor.prepare_video(&frames, &meta, &options)?;
+        assert_eq!(packed.frames.len(), 2);
+        let mut rows = 0usize;
+        for frame in &packed.frames {
+            assert_eq!((frame.rows, frame.cols), (0, 0));
+            assert_eq!(frame.grids.len(), 1);
+            rows += frame.grids[0].patch_rows()?;
+        }
+        assert_eq!(packed.pixel_values.len(), rows * patch);
+        // Distinct frame content must produce distinct packed pixels in frame order.
+        let per = rows / 2 * patch;
+        assert_ne!(packed.pixel_values[..per], packed.pixel_values[per..]);
+        let sliced = VideoOptions {
+            max_num_frames: 1,
+            stack_frames: 1,
+            max_slice_nums: Some(9),
+        };
+        let large = vec![constant_frame(640, 480, 77), constant_frame(320, 240, 12)];
+        let meta = VideoMetadata {
+            total_num_frames: 2,
+            fps: 1.0,
+            duration: 2.0,
+        };
+        let packed = processor.prepare_video(&large, &meta, &sliced)?;
+        assert_eq!(packed.frames.len(), 1);
+        assert_eq!(packed.frames[0].grids.len(), 3);
+        assert_eq!(packed.frames[0].rows * packed.frames[0].cols, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn video_preparation_validates_frames_metadata_and_scope() -> Result<()> {
+        let processor = video_processor()?;
+        let frames = vec![constant_frame(64, 48, 3)];
+        let options = VideoOptions {
+            max_num_frames: 1,
+            stack_frames: 1,
+            max_slice_nums: None,
+        };
+        let meta = VideoMetadata {
+            total_num_frames: 2,
+            fps: 1.0,
+            duration: 2.0,
+        };
+        let error = processor
+            .prepare_video(&frames, &meta, &options)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("decoded video holds 1 frames, metadata reports 2"),
+            "{error}"
+        );
+        let meta = VideoMetadata {
+            total_num_frames: 1,
+            fps: 1.0,
+            duration: 1.0,
+        };
+        let stacked = VideoOptions {
+            max_num_frames: 1,
+            stack_frames: 3,
+            max_slice_nums: None,
+        };
+        assert!(processor.prepare_video(&frames, &meta, &stacked).is_err());
+        let zero_slices = VideoOptions {
+            max_num_frames: 1,
+            stack_frames: 1,
+            max_slice_nums: Some(0),
+        };
+        assert!(
+            processor
+                .prepare_video(&frames, &meta, &zero_slices)
+                .is_err()
+        );
+        Ok(())
     }
 }
