@@ -44,6 +44,7 @@ impl RowWorkSpec {
                     (2 * g.hv) as usize,
                 )
             }
+            Architecture::MiniCpmV47 => anyhow::bail!("MiniCPM row work is not implemented"),
         };
         Ok(Self {
             hidden,

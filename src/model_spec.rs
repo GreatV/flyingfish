@@ -8,11 +8,32 @@ use std::{fs, path::Path};
 pub enum Architecture {
     Llama,
     Qwen35Text,
+    MiniCpmV47,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Mixer {
     FullAttention,
     Gdn,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MoeConfig {
+    pub experts: u32,
+    pub experts_per_tok: u32,
+    pub expert_intermediate: u32,
+    pub shared_intermediate: u32,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LinearFormat {
+    Bf16,
+    Fp8E4m3Block128,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GdnConfig {
+    pub key_heads: u32,
+    pub value_heads: u32,
+    pub key_head_dim: u32,
+    pub value_head_dim: u32,
+    pub conv_kernel: u32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayerPlan {
@@ -34,10 +55,24 @@ pub struct ModelSpec {
     pub rms_eps: f32,
     pub rope_theta: f32,
     pub rotary_dim: u32,
+    pub linear_format: LinearFormat,
     pub eos: Vec<u32>,
     pub layers: Vec<LayerPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<MoeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gdn: Option<GdnConfig>,
     #[serde(default)]
     pub vision: Option<VisionConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MiniCpmVision {
+    pub image_size: u32,
+    pub insert_layer: u32,
+    pub slice_start_token: u32,
+    pub slice_end_token: u32,
+    pub newline_token: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,39 +91,102 @@ pub struct VisionConfig {
     pub video_token: u32,
     pub start_token: u32,
     pub end_token: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minicpm: Option<MiniCpmVision>,
 }
 
 impl VisionConfig {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            [
-                self.depth,
-                self.hidden,
-                self.heads,
-                self.intermediate,
-                self.channels,
-                self.patch,
-                self.temporal_patch,
-                self.merge,
-                self.output,
-                self.position_side
-            ] == [27, 1152, 16, 4304, 3, 16, 2, 2, 5120, 48],
-            "unsupported Q38 vision geometry"
-        );
-        ensure!(
-            [
-                self.image_token,
-                self.video_token,
-                self.start_token,
-                self.end_token
-            ] == [248056, 248057, 248053, 248054],
-            "unsupported Q38 image token IDs"
-        );
+    pub fn validate(&self, architecture: Architecture) -> Result<()> {
+        match architecture {
+            Architecture::Qwen35Text => {
+                ensure!(
+                    [
+                        self.depth,
+                        self.hidden,
+                        self.heads,
+                        self.intermediate,
+                        self.channels,
+                        self.patch,
+                        self.temporal_patch,
+                        self.merge,
+                        self.output,
+                        self.position_side
+                    ] == [27, 1152, 16, 4304, 3, 16, 2, 2, 5120, 48],
+                    "unsupported Q38 vision geometry"
+                );
+                ensure!(
+                    [
+                        self.image_token,
+                        self.video_token,
+                        self.start_token,
+                        self.end_token
+                    ] == [248056, 248057, 248053, 248054],
+                    "unsupported Q38 image token IDs"
+                );
+                ensure!(self.minicpm.is_none(), "unexpected MiniCPM vision fields");
+            }
+            Architecture::MiniCpmV47 => {
+                ensure!(
+                    [
+                        self.depth,
+                        self.hidden,
+                        self.heads,
+                        self.intermediate,
+                        self.channels,
+                        self.patch,
+                        self.temporal_patch,
+                        self.merge,
+                        self.output,
+                        self.position_side
+                    ] == [27, 1152, 16, 4304, 3, 14, 1, 4, 2048, 70],
+                    "unsupported MiniCPM vision geometry"
+                );
+                ensure!(
+                    [
+                        self.image_token,
+                        self.video_token,
+                        self.start_token,
+                        self.end_token
+                    ] == [248056, 248057, 248078, 248079],
+                    "unsupported MiniCPM image token IDs"
+                );
+                let v = self
+                    .minicpm
+                    .as_ref()
+                    .context("MiniCPM vision configuration missing")?;
+                ensure!(
+                    v.image_size == 980,
+                    "unsupported image_size: {}",
+                    v.image_size
+                );
+                ensure!(
+                    v.insert_layer == 6,
+                    "unsupported insert_layer_id: {}",
+                    v.insert_layer
+                );
+                ensure!(
+                    v.slice_start_token == 248088,
+                    "unsupported slice_start_id: {}",
+                    v.slice_start_token
+                );
+                ensure!(
+                    v.slice_end_token == 248089,
+                    "unsupported slice_end_id: {}",
+                    v.slice_end_token
+                );
+                ensure!(
+                    v.newline_token == 198,
+                    "unsupported newline_id: {}",
+                    v.newline_token
+                );
+            }
+            Architecture::Llama => bail!("vision configuration requires a multimodal architecture"),
+        }
         Ok(())
     }
 
-    pub fn patch_elements(&self) -> Result<usize> {
-        self.validate()?;
+    pub fn patch_elements(&self, architecture: Architecture) -> Result<usize> {
+        self.validate(architecture)?;
         Ok((self.channels * self.temporal_patch * self.patch * self.patch) as usize)
     }
 
@@ -96,7 +194,14 @@ impl VisionConfig {
         let Some(v) = root.get("vision_config") else {
             return Ok(None);
         };
-        equal(v, "model_type", "qwen3_5".into())?;
+        match v.get("model_type").and_then(Value::as_str) {
+            Some("qwen3_5") => Self::qwen_from_root(root, v).map(Some),
+            Some("minicpmv4_7_vision") => Self::minicpm_from_root(root, v).map(Some),
+            other => bail!("unsupported vision_config model_type: {other:?}"),
+        }
+    }
+
+    fn qwen_from_root(root: &Value, v: &Value) -> Result<Self> {
         equal(v, "hidden_act", "gelu_pytorch_tanh".into())?;
         equal(v, "deepstack_visual_indexes", serde_json::json!([]))?;
         ensure!(
@@ -118,9 +223,74 @@ impl VisionConfig {
             video_token: integer(root, "video_token_id")?,
             start_token: integer(root, "vision_start_token_id")?,
             end_token: integer(root, "vision_end_token_id")?,
+            minicpm: None,
         };
-        spec.validate()?;
-        Ok(Some(spec))
+        spec.validate(Architecture::Qwen35Text)?;
+        Ok(spec)
+    }
+
+    fn minicpm_from_root(root: &Value, v: &Value) -> Result<Self> {
+        equal(v, "hidden_act", "gelu_pytorch_tanh".into())?;
+        if let Some(kernel) = v.get("window_kernel_size") {
+            ensure!(
+                kernel == &serde_json::json!([2, 2]),
+                "unsupported window_kernel_size: {kernel:?}"
+            );
+        }
+        let image_size = integer(v, "image_size")?;
+        let patch = integer(v, "patch_size")?;
+        ensure!(
+            patch > 0 && image_size.is_multiple_of(patch),
+            "image_size is not a patch multiple"
+        );
+        // MiniCPMV4_7Config defaults: merge_kernel_size (2, 2), merger_times 1.
+        if let Some(kernel) = root.get("merge_kernel_size") {
+            ensure!(
+                kernel == &serde_json::json!([2, 2]),
+                "unsupported merge_kernel_size: {kernel:?}"
+            );
+        }
+        if let Some(times) = root.get("merger_times") {
+            ensure!(
+                integer(root, "merger_times")? == 1,
+                "unsupported merger_times: {times:?}"
+            );
+        }
+        let merge = match root.get("downsample_mode").and_then(Value::as_str) {
+            Some("16x") => 4,
+            other => bail!("unsupported downsample_mode: {other:?}"),
+        };
+        let spec = Self {
+            depth: integer(v, "num_hidden_layers")?,
+            hidden: integer(v, "hidden_size")?,
+            heads: integer(v, "num_attention_heads")?,
+            intermediate: integer(v, "intermediate_size")?,
+            channels: integer(v, "num_channels")?,
+            patch,
+            temporal_patch: 1,
+            merge,
+            output: u32::try_from(
+                root.get("text_config")
+                    .and_then(|t| t.get("hidden_size"))
+                    .and_then(Value::as_u64)
+                    .context("missing text_config.hidden_size")?,
+            )
+            .context("hidden_size overflows u32")?,
+            position_side: image_size / patch,
+            image_token: integer(root, "image_token_id")?,
+            video_token: integer(root, "video_token_id")?,
+            start_token: integer(root, "image_start_id")?,
+            end_token: integer(root, "image_end_id")?,
+            minicpm: Some(MiniCpmVision {
+                image_size,
+                insert_layer: integer(root, "insert_layer_id")?,
+                slice_start_token: integer(root, "slice_start_id")?,
+                slice_end_token: integer(root, "slice_end_id")?,
+                newline_token: integer(root, "newline_id")?,
+            }),
+        };
+        spec.validate(Architecture::MiniCpmV47)?;
+        Ok(spec)
     }
 }
 fn integer(v: &Value, key: &str) -> Result<u32> {
@@ -130,6 +300,11 @@ fn integer(v: &Value, key: &str) -> Result<u32> {
         .with_context(|| format!("missing/invalid {key}"))?;
     u32::try_from(n).with_context(|| format!("{key} overflows u32"))
 }
+fn positive(v: &Value, key: &str) -> Result<u32> {
+    let n = integer(v, key)?;
+    ensure!(n > 0, "unsupported {key}: 0");
+    Ok(n)
+}
 fn equal(v: &Value, key: &str, expected: Value) -> Result<()> {
     ensure!(
         v.get(key) == Some(&expected),
@@ -137,6 +312,22 @@ fn equal(v: &Value, key: &str, expected: Value) -> Result<()> {
         v.get(key)
     );
     Ok(())
+}
+impl LinearFormat {
+    fn read(root: &Value) -> Result<Self> {
+        let Some(quant) = root.get("quantization_config") else {
+            return Ok(Self::Bf16);
+        };
+        for (key, val) in [
+            ("quant_method", "fp8"),
+            ("fmt", "e4m3"),
+            ("activation_scheme", "dynamic"),
+        ] {
+            equal(quant, key, val.into())?;
+        }
+        equal(quant, "weight_block_size", serde_json::json!([128, 128]))?;
+        Ok(Self::Fp8E4m3Block128)
+    }
 }
 fn eos(v: &Value, vocab: u32) -> Result<Vec<u32>> {
     let values = match v {
@@ -155,6 +346,197 @@ fn eos(v: &Value, vocab: u32) -> Result<Vec<u32>> {
     ensure!(!out.is_empty(), "empty EOS set");
     Ok(out)
 }
+
+struct TextGeometry {
+    hidden: u32,
+    intermediate: u32,
+    vocab: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    q_width: u32,
+    max_position: u32,
+    rms_eps: f32,
+    rope_theta: f32,
+    rotary_dim: u32,
+    layers: Vec<LayerPlan>,
+    moe: Option<MoeConfig>,
+    gdn: GdnConfig,
+}
+
+impl TextGeometry {
+    fn read(t: &Value, model_type: &str) -> Result<Self> {
+        equal(t, "model_type", model_type.into())?;
+        if let Some(dtype) = t.get("dtype") {
+            ensure!(
+                dtype == &Value::String("bfloat16".into()),
+                "unsupported dtype: {dtype:?}"
+            );
+        }
+        for (key, val) in [("hidden_act", "silu"), ("mamba_ssm_dtype", "float32")] {
+            equal(t, key, val.into())?;
+        }
+        if let Some(gate) = t.get("output_gate_type") {
+            ensure!(
+                gate == &Value::String("swish".into()),
+                "unsupported output_gate_type: {gate:?}"
+            );
+        }
+        equal(t, "attention_bias", false.into())?;
+        equal(t, "attn_output_gate", true.into())?;
+        equal(t, "attention_dropout", 0.0.into())?;
+        equal(t, "tie_word_embeddings", false.into())?;
+        if let Some(bias) = t.get("mlp_bias") {
+            ensure!(
+                bias == &Value::Bool(false),
+                "unsupported mlp_bias: {bias:?}"
+            );
+        }
+        let hidden = positive(t, "hidden_size")?;
+        let vocab = positive(t, "vocab_size")?;
+        let depth = positive(t, "num_hidden_layers")?;
+        let q_heads = positive(t, "num_attention_heads")?;
+        let kv_heads = positive(t, "num_key_value_heads")?;
+        let head_dim = positive(t, "head_dim")?;
+        let max_position = positive(t, "max_position_embeddings")?;
+        ensure!(
+            q_heads.is_multiple_of(kv_heads),
+            "num_attention_heads is not a multiple of num_key_value_heads"
+        );
+        let interval = positive(t, "full_attention_interval")?;
+        let eps = t
+            .get("rms_norm_eps")
+            .and_then(Value::as_f64)
+            .context("missing/invalid rms_norm_eps")?;
+        ensure!(
+            eps.is_finite() && eps > 0.0,
+            "unsupported rms_norm_eps: {eps}"
+        );
+        let rope = t
+            .get("rope_parameters")
+            .context("missing rope_parameters")?;
+        equal(rope, "rope_type", "default".into())?;
+        equal(rope, "mrope_interleaved", true.into())?;
+        equal(rope, "mrope_section", serde_json::json!([11, 11, 10]))?;
+        let theta = positive(rope, "rope_theta")?;
+        let top_partial = t.get("partial_rotary_factor");
+        let rope_partial = rope.get("partial_rotary_factor");
+        if let (Some(a), Some(b)) = (top_partial, rope_partial) {
+            ensure!(
+                a == b,
+                "partial_rotary_factor differs between text_config and rope_parameters"
+            );
+        }
+        let partial = top_partial
+            .or(rope_partial)
+            .and_then(Value::as_f64)
+            .context("missing partial_rotary_factor")?;
+        ensure!(
+            partial > 0.0 && partial <= 1.0,
+            "unsupported partial_rotary_factor: {partial}"
+        );
+        let rotary = f64::from(head_dim) * partial;
+        ensure!(
+            rotary.fract() == 0.0 && rotary >= 1.0,
+            "partial_rotary_factor does not yield an integer rotary_dim: {partial}"
+        );
+        let types = t
+            .get("layer_types")
+            .and_then(Value::as_array)
+            .context("missing layer_types")?;
+        ensure!(
+            types.len() == depth as usize,
+            "layer_types length differs from num_hidden_layers"
+        );
+        let mut counts = [0u32, 0u32];
+        let mut layers = Vec::with_capacity(types.len());
+        for (i, kind) in types.iter().enumerate() {
+            let full = (i as u32 + 1).is_multiple_of(interval);
+            let (mixer, slot, expected) = if full {
+                (Mixer::FullAttention, 0, "full_attention")
+            } else {
+                (Mixer::Gdn, 1, "linear_attention")
+            };
+            ensure!(
+                kind.as_str() == Some(expected),
+                "unsupported mixer at layer {i}: {kind:?}"
+            );
+            layers.push(LayerPlan {
+                mixer,
+                state_index: counts[slot],
+            });
+            counts[slot] += 1;
+        }
+        let gdn = GdnConfig {
+            key_heads: positive(t, "linear_num_key_heads")?,
+            value_heads: positive(t, "linear_num_value_heads")?,
+            key_head_dim: positive(t, "linear_key_head_dim")?,
+            value_head_dim: positive(t, "linear_value_head_dim")?,
+            conv_kernel: positive(t, "linear_conv_kernel_dim")?,
+        };
+        ensure!(
+            gdn.value_heads.is_multiple_of(gdn.key_heads),
+            "linear_num_value_heads is not a multiple of linear_num_key_heads"
+        );
+        let moe = if model_type == "qwen3_5_moe_text" {
+            equal(t, "output_router_logits", false.into())?;
+            ensure!(
+                t.get("intermediate_size").is_none(),
+                "unexpected intermediate_size on a MoE text tower"
+            );
+            let experts = positive(t, "num_experts")?;
+            let experts_per_tok = positive(t, "num_experts_per_tok")?;
+            ensure!(
+                experts_per_tok <= experts,
+                "num_experts_per_tok exceeds num_experts"
+            );
+            Some(MoeConfig {
+                experts,
+                experts_per_tok,
+                expert_intermediate: positive(t, "moe_intermediate_size")?,
+                shared_intermediate: positive(t, "shared_expert_intermediate_size")?,
+            })
+        } else {
+            for key in [
+                "num_experts",
+                "num_experts_per_tok",
+                "moe_intermediate_size",
+                "shared_expert_intermediate_size",
+                "output_router_logits",
+            ] {
+                ensure!(
+                    t.get(key).is_none(),
+                    "unexpected {key} on a dense text tower"
+                );
+            }
+            None
+        };
+        let intermediate = match &moe {
+            Some(moe) => moe.expert_intermediate,
+            None => positive(t, "intermediate_size")?,
+        };
+        let q_width = q_heads
+            .checked_mul(head_dim)
+            .context("Q width overflows u32")?;
+        Ok(Self {
+            hidden,
+            intermediate,
+            vocab,
+            q_heads,
+            kv_heads,
+            head_dim,
+            q_width,
+            max_position,
+            rms_eps: eps as f32,
+            rope_theta: theta as f32,
+            rotary_dim: rotary as u32,
+            layers,
+            moe,
+            gdn,
+        })
+    }
+}
+
 impl ModelSpec {
     /// `Config` view for the model/CLI surface; does not relax Config::read's Llama validation.
     pub fn config(&self) -> crate::config::Config {
@@ -162,6 +544,7 @@ impl ModelSpec {
             model_type: match self.architecture {
                 Architecture::Llama => "llama",
                 Architecture::Qwen35Text => "qwen3_5_text",
+                Architecture::MiniCpmV47 => "qwen3_5_moe_text",
             }
             .into(),
             hidden_size: self.hidden as usize,
@@ -195,7 +578,11 @@ impl ModelSpec {
         } else {
             Value::Null
         };
-        Self::qwen(&root, &generation)
+        if root.get("model_type").and_then(Value::as_str) == Some("minicpmv4_7") {
+            Self::minicpm(&root, &generation)
+        } else {
+            Self::qwen(&root, &generation)
+        }
     }
     pub fn from_llama(c: &crate::config::Config) -> Result<Self> {
         let u = |n: usize| u32::try_from(n).context("Llama dimension overflows u32");
@@ -213,8 +600,11 @@ impl ModelSpec {
             rms_eps: c.rms_norm_eps,
             rope_theta: c.rope_theta,
             rotary_dim: u(c.head_dim)?,
+            linear_format: LinearFormat::Bf16,
             eos: c.eos_token_id.clone(),
             vision: None,
+            moe: None,
+            gdn: None,
             layers: (0..u(c.num_hidden_layers)?)
                 .map(|state_index| LayerPlan {
                     mixer: Mixer::FullAttention,
@@ -232,97 +622,48 @@ impl ModelSpec {
         )?;
         equal(root, "tie_word_embeddings", false.into())?;
         let t = root.get("text_config").context("missing text_config")?;
-        for (key, val) in [
-            ("model_type", "qwen3_5_text"),
-            ("dtype", "bfloat16"),
-            ("hidden_act", "silu"),
-            ("mamba_ssm_dtype", "float32"),
-            ("output_gate_type", "swish"),
-        ] {
-            equal(t, key, val.into())?;
-        }
-        for (key, val) in [
-            ("hidden_size", 5120),
-            ("intermediate_size", 17408),
-            ("vocab_size", 248320),
-            ("num_hidden_layers", 64),
-            ("num_attention_heads", 24),
-            ("num_key_value_heads", 4),
-            ("head_dim", 256),
-            ("full_attention_interval", 4),
-            ("linear_conv_kernel_dim", 4),
-            ("linear_key_head_dim", 128),
-            ("linear_value_head_dim", 128),
-            ("linear_num_key_heads", 16),
-            ("linear_num_value_heads", 48),
-            ("max_position_embeddings", 262144),
-        ] {
-            ensure!(integer(t, key)? == val, "unsupported {key}");
-        }
-        equal(t, "attention_bias", false.into())?;
-        equal(t, "tie_word_embeddings", false.into())?;
-        equal(t, "attn_output_gate", true.into())?;
-        if let Some(bias) = t.get("mlp_bias") {
-            ensure!(bias == &Value::Bool(false), "MLP bias unsupported");
-        }
-        let eps = t
-            .get("rms_norm_eps")
-            .and_then(Value::as_f64)
-            .context("missing rms_norm_eps")?;
-        ensure!(eps == 1e-6, "unsupported norm epsilon");
-        let rope = t
-            .get("rope_parameters")
-            .context("missing rope_parameters")?;
-        equal(rope, "rope_type", "default".into())?;
-        equal(rope, "mrope_interleaved", true.into())?;
-        equal(rope, "mrope_section", serde_json::json!([11, 11, 10]))?;
-        ensure!(
-            integer(rope, "rope_theta")? == 10_000_000,
-            "unsupported rope theta"
-        );
-        for value in [
-            t.get("partial_rotary_factor"),
-            rope.get("partial_rotary_factor"),
-        ] {
-            ensure!(
-                value.and_then(Value::as_f64) == Some(0.25),
-                "unsupported partial RoPE"
-            );
-        }
-        let quant = root
-            .get("quantization_config")
-            .context("missing quantization_config")?;
-        for (key, val) in [
-            ("quant_method", "fp8"),
-            ("fmt", "e4m3"),
-            ("activation_scheme", "dynamic"),
-        ] {
-            equal(quant, key, val.into())?;
-        }
-        equal(quant, "weight_block_size", serde_json::json!([128, 128]))?;
-        let types = t
-            .get("layer_types")
-            .and_then(Value::as_array)
-            .context("missing layer_types")?;
-        ensure!(types.len() == 64, "wrong layer count");
-        let mut counts = [0, 0];
-        let mut layers = Vec::with_capacity(64);
-        for (i, kind) in types.iter().enumerate() {
-            let (mixer, slot, expected) = if i % 4 == 3 {
-                (Mixer::FullAttention, 0, "full_attention")
-            } else {
-                (Mixer::Gdn, 1, "linear_attention")
-            };
-            ensure!(
-                kind.as_str() == Some(expected),
-                "unsupported mixer at layer {i}"
-            );
-            layers.push(LayerPlan {
-                mixer,
-                state_index: counts[slot],
-            });
-            counts[slot] += 1;
-        }
+        let text = TextGeometry::read(t, "qwen3_5_text")?;
+        Self::from_text(
+            Architecture::Qwen35Text,
+            text,
+            t,
+            generation,
+            VisionConfig::from_root(root)?,
+            LinearFormat::read(root)?,
+        )
+    }
+    pub fn minicpm(root: &Value, generation: &Value) -> Result<Self> {
+        equal(root, "model_type", "minicpmv4_7".into())?;
+        equal(
+            root,
+            "architectures",
+            serde_json::json!(["MiniCPMV4_7ForConditionalGeneration"]),
+        )?;
+        equal(root, "tie_word_embeddings", false.into())?;
+        equal(root, "dtype", "bfloat16".into())?;
+        equal(root, "mrope_mode", "canvas".into())?;
+        let t = root.get("text_config").context("missing text_config")?;
+        // Declared by text_config; the checkpoint contains no mtp.* tensors.
+        equal(t, "mtp_num_hidden_layers", 1.into())?;
+        equal(t, "mtp_use_dedicated_embeddings", false.into())?;
+        let text = TextGeometry::read(t, "qwen3_5_moe_text")?;
+        Self::from_text(
+            Architecture::MiniCpmV47,
+            text,
+            t,
+            generation,
+            VisionConfig::from_root(root)?,
+            LinearFormat::read(root)?,
+        )
+    }
+    fn from_text(
+        architecture: Architecture,
+        text: TextGeometry,
+        t: &Value,
+        generation: &Value,
+        vision: Option<VisionConfig>,
+        linear_format: LinearFormat,
+    ) -> Result<Self> {
         let eos_value = generation
             .get("eos_token_id")
             .filter(|x| !x.is_null())
@@ -330,21 +671,24 @@ impl ModelSpec {
             .context("missing EOS")?;
         Ok(Self {
             abi_version: 1,
-            architecture: Architecture::Qwen35Text,
-            hidden: 5120,
-            intermediate: 17408,
-            vocab: 248320,
-            q_heads: 24,
-            kv_heads: 4,
-            head_dim: 256,
-            q_width: 6144,
-            max_position: 262144,
-            rms_eps: eps as f32,
-            rope_theta: 1e7,
-            rotary_dim: 64,
-            eos: eos(eos_value, 248320)?,
-            layers,
-            vision: VisionConfig::from_root(root)?,
+            architecture,
+            hidden: text.hidden,
+            intermediate: text.intermediate,
+            vocab: text.vocab,
+            q_heads: text.q_heads,
+            kv_heads: text.kv_heads,
+            head_dim: text.head_dim,
+            q_width: text.q_width,
+            max_position: text.max_position,
+            rms_eps: text.rms_eps,
+            rope_theta: text.rope_theta,
+            rotary_dim: text.rotary_dim,
+            linear_format,
+            eos: eos(eos_value, text.vocab)?,
+            layers: text.layers,
+            moe: text.moe,
+            gdn: Some(text.gdn),
+            vision,
         })
     }
 }

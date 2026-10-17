@@ -1,5 +1,5 @@
 use flyingfish::{
-    model_spec::{Mixer, ModelSpec},
+    model_spec::{GdnConfig, LinearFormat, Mixer, ModelSpec},
     op_contract::{AttentionWorkspace, SequenceMeta},
 };
 use serde_json::{Value, json};
@@ -8,6 +8,24 @@ fn g0_normalized_geometry_and_rejections() {
     let root: Value = serde_json::from_str(include_str!("data/q38-config.json")).unwrap();
     let spec = ModelSpec::qwen(&root, &json!({"eos_token_id":[248046,248044,248046]})).unwrap();
     assert_eq!((spec.hidden, spec.q_width), (5120, 6144));
+    assert_eq!(
+        spec.gdn,
+        Some(GdnConfig {
+            key_heads: 16,
+            value_heads: 48,
+            key_head_dim: 128,
+            value_head_dim: 128,
+            conv_kernel: 4,
+        })
+    );
+    assert_eq!(spec.moe, None);
+    assert_eq!(spec.linear_format, LinearFormat::Fp8E4m3Block128);
+    let canonical = serde_json::to_string(&spec).unwrap();
+    assert_eq!(
+        flyingfish::prefix_state::sha256(canonical.as_bytes()),
+        "ba4a85072bea08b0113de8d0ae69aba447df73d62443d85af75385a97de43794",
+        "Q38 spec serialization changed"
+    );
     let public = spec.config();
     assert_eq!(
         (
@@ -38,19 +56,30 @@ fn g0_normalized_geometry_and_rejections() {
     );
     for (pointer, value) in [
         ("/text_config/layer_types/3", json!("linear_attention")),
-        ("/text_config/head_dim", json!(128)),
-        ("/quantization_config/weight_block_size", json!([64, 128])),
+        ("/text_config/rope_parameters/rope_type", json!("linear")),
         (
             "/text_config/rope_parameters/mrope_section",
             json!([10, 11, 11]),
         ),
         ("/text_config/attention_bias", json!(true)),
+        ("/text_config/attn_output_gate", json!(false)),
+        ("/text_config/partial_rotary_factor", json!(0.3)),
+        ("/quantization_config/quant_method", json!("awq")),
+        ("/quantization_config/weight_block_size", json!([64, 128])),
     ] {
         let mut bad = root.clone();
         *bad.pointer_mut(pointer).unwrap() = value;
         assert!(ModelSpec::qwen(&bad, &Value::Null).is_err(), "{pointer}");
     }
     assert!(ModelSpec::qwen(&root, &json!({"eos_token_id":248320})).is_err());
+    let mut unquantized = root.clone();
+    unquantized
+        .as_object_mut()
+        .unwrap()
+        .remove("quantization_config");
+    let unquantized =
+        ModelSpec::qwen(&unquantized, &Value::Null).expect("absent quantization_config is BF16");
+    assert_eq!(unquantized.linear_format, LinearFormat::Bf16);
 }
 #[test]
 fn g4_workspace_segmentation_and_metadata() {

@@ -1048,7 +1048,7 @@ impl PrefixGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_spec::LayerPlan;
+    use crate::model_spec::{GdnConfig, LayerPlan};
 
     fn spec() -> ModelSpec {
         let mut layers = Vec::new();
@@ -1087,8 +1087,17 @@ mod tests {
             rms_eps: 1e-5,
             rope_theta: 10_000_000.0,
             rotary_dim: 128,
+            linear_format: crate::model_spec::LinearFormat::Fp8E4m3Block128,
             eos: vec![1],
             layers,
+            moe: None,
+            gdn: Some(GdnConfig {
+                key_heads: 16,
+                value_heads: 48,
+                key_head_dim: 128,
+                value_head_dim: 128,
+                conv_kernel: 4,
+            }),
             vision: None,
         }
     }

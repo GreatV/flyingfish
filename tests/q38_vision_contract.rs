@@ -17,7 +17,14 @@ fn spec() -> ModelSpec {
 #[test]
 fn vision_config_and_scope_are_independent_of_load_selection() {
     let s = spec();
-    assert_eq!(s.vision.as_ref().unwrap().patch_elements().unwrap(), 1536);
+    assert_eq!(
+        s.vision
+            .as_ref()
+            .unwrap()
+            .patch_elements(s.architecture)
+            .unwrap(),
+        1536
+    );
     for policy in [
         LoadPolicy::TextOnly,
         LoadPolicy::TextWithVision,
@@ -240,7 +247,7 @@ fn text_axes_and_all_rotary_frequencies_are_exactly_linear() -> Result<()> {
 fn patch_coordinates_are_merge_grouped_and_identity_grid_is_exact() -> Result<()> {
     let s = spec();
     let v = s.vision.as_ref().unwrap();
-    let p = VisionPositions::new(v, &[ImageGrid { t: 1, h: 4, w: 6 }], 24)?;
+    let p = VisionPositions::new(v, s.architecture, &[ImageGrid { t: 1, h: 4, w: 6 }], 24)?;
     assert_eq!(
         &p.coordinates[..8],
         &[
@@ -254,8 +261,15 @@ fn patch_coordinates_are_merge_grouped_and_identity_grid_is_exact() -> Result<()
             [1, 3]
         ]
     );
-    assert!(VisionPositions::new(v, &[ImageGrid { t: 1, h: 4, w: 6 }], 23).is_err());
-    let p = VisionPositions::new(v, &[ImageGrid { t: 1, h: 48, w: 48 }], 48 * 48)?;
+    assert!(
+        VisionPositions::new(v, s.architecture, &[ImageGrid { t: 1, h: 4, w: 6 }], 23).is_err()
+    );
+    let p = VisionPositions::new(
+        v,
+        s.architecture,
+        &[ImageGrid { t: 1, h: 48, w: 48 }],
+        48 * 48,
+    )?;
     for (i, &[y, x]) in p.coordinates.iter().enumerate() {
         assert_eq!(p.bilinear_indices[0][i], y * 48 + x);
         assert_eq!(
@@ -328,7 +342,12 @@ fn image_fixture_positions_and_bilinear_tables_match_bitwise() -> Result<()> {
             reference,
             "{case}: text mRoPE"
         );
-        let tables = VisionPositions::new(s.vision.as_ref().unwrap(), &grid, plan.patch_rows())?;
+        let tables = VisionPositions::new(
+            s.vision.as_ref().unwrap(),
+            s.architecture,
+            &grid,
+            plan.patch_rows(),
+        )?;
         assert_eq!(
             tables
                 .coordinates
@@ -395,7 +414,7 @@ fn vision_load_policy_checks_all_headers_without_loading_payloads() -> Result<()
         (LoadPolicy::TextWithMtp, 29_945_203_072, 0, 1251, 22),
         (LoadPolicy::MtpOnly, 477_199_744, 0, 0, 22),
     ] {
-        let m = mapped.q38_manifest_with_policy(&s, policy)?;
+        let m = mapped.manifest(&s, policy)?;
         assert_eq!(m.resident_bytes, bytes);
         assert_eq!(
             m.entries

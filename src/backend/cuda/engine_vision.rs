@@ -768,7 +768,7 @@ impl VisionRuntime {
             .vision
             .as_ref()
             .context("vision configuration missing")?
-            .validate()?;
+            .validate(model.architecture)?;
         let io = Arc::new(VisionIo::new(device)?);
         let weights = VisionWeights::take(catalog)?;
         Ok(Self {
@@ -801,6 +801,7 @@ impl VisionRuntime {
                 .vision
                 .as_ref()
                 .context("vision configuration missing")?,
+            self.model.architecture,
             input.grids,
             rows,
         )?;
@@ -1168,8 +1169,12 @@ mod tests {
             "patch cast mismatch"
         );
 
-        let tables =
-            VisionPositions::new(model.vision.as_ref().unwrap(), &image_grids, rows as usize)?;
+        let tables = VisionPositions::new(
+            model.vision.as_ref().unwrap(),
+            model.architecture,
+            &image_grids,
+            rows as usize,
+        )?;
         let indices: Vec<_> = tables.bilinear_indices.iter().flatten().copied().collect();
         let coefficients: Vec<_> = tables.bilinear_weights.iter().flatten().copied().collect();
         let position_host: Vec<_> = (0..2304 * HIDDEN as usize)

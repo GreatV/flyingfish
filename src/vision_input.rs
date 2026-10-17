@@ -186,7 +186,7 @@ impl MultimodalInput<'_> {
             .vision
             .as_ref()
             .context("vision configuration missing")?;
-        vision.validate()?;
+        vision.validate(spec.architecture)?;
         ensure!(
             capacity > 0 && capacity <= spec.max_position as usize,
             "invalid multimodal capacity"
@@ -215,7 +215,7 @@ impl MultimodalInput<'_> {
             "more image features than prompt tokens"
         );
         let elements = patch_rows
-            .checked_mul(vision.patch_elements()?)
+            .checked_mul(vision.patch_elements(spec.architecture)?)
             .context("packed pixel size overflow")?;
         ensure!(
             self.pixel_values.len() == elements,
@@ -340,8 +340,17 @@ pub struct VisionPositions {
 }
 
 impl VisionPositions {
-    pub fn new(spec: &VisionConfig, grids: &[ImageGrid], row_limit: usize) -> Result<Self> {
-        spec.validate()?;
+    pub fn new(
+        spec: &VisionConfig,
+        architecture: Architecture,
+        grids: &[ImageGrid],
+        row_limit: usize,
+    ) -> Result<Self> {
+        ensure!(
+            architecture == Architecture::Qwen35Text,
+            "vision positions require the Qwen tower"
+        );
+        spec.validate(architecture)?;
         let total = grids.iter().try_fold(0usize, |n, g| {
             n.checked_add(g.patch_rows()?)
                 .context("vision position size overflow")

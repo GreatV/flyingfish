@@ -1,5 +1,5 @@
 //! Shared mmap/index audit, independent of device upload and model execution.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use memmap2::{Mmap, MmapOptions};
 use safetensors::{Dtype, SafeTensors};
 use serde::{
@@ -173,153 +173,490 @@ impl MappedCheckpoint {
             .map(|(n, m)| Ok((n.clone(), SafeTensors::deserialize(m)?)))
             .collect()
     }
-    pub fn q38_manifest(&self, spec: &crate::model_spec::ModelSpec) -> Result<TensorManifest> {
-        self.q38_manifest_with_policy(spec, LoadPolicy::TextOnly)
-    }
-
-    pub fn q38_manifest_with_policy(
+    pub fn manifest(
         &self,
         spec: &crate::model_spec::ModelSpec,
         policy: LoadPolicy,
     ) -> Result<TensorManifest> {
-        use crate::model_spec::{Architecture, Mixer};
-        ensure!(
-            spec.architecture == Architecture::Qwen35Text,
-            "Q38 manifest requires text spec"
-        );
-        if matches!(policy, LoadPolicy::TextWithVision | LoadPolicy::VisionOnly) {
-            spec.vision
-                .as_ref()
-                .context("vision load policy requires vision configuration")?
-                .validate()?;
-        }
-        let mut expected = BTreeMap::new();
-        let mut put = |name: String, dtype: Dtype, shape: Vec<usize>, load: bool| {
-            expected.insert(name, (dtype, shape, load));
+        use crate::model_spec::Architecture;
+        let label = match spec.architecture {
+            Architecture::Qwen35Text => "Q38",
+            Architecture::MiniCpmV47 => "MiniCPM",
+            Architecture::Llama => bail!("checkpoint manifest requires a Qwen3.5-family spec"),
         };
+        let mut expected = BTreeMap::new();
+        Self::text_entries(spec, &mut expected)?;
+        match spec.architecture {
+            Architecture::Qwen35Text => {
+                if policy.selects(TensorScope::Vision) {
+                    spec.vision
+                        .as_ref()
+                        .context("vision load policy requires vision configuration")?
+                        .validate(Architecture::Qwen35Text)?;
+                }
+                #[derive(Deserialize)]
+                struct Skipped {
+                    name: String,
+                    dtype: Dtype,
+                    shape: Vec<usize>,
+                }
+                // The closed-world skipped-tensor manifest is a required build input.
+                for item in serde_json::from_str::<Vec<Skipped>>(include_str!(
+                    "checkpoint/q38_skipped.json"
+                ))? {
+                    let scope = if item.name.starts_with("mtp.") {
+                        TensorScope::Mtp
+                    } else {
+                        ensure!(
+                            item.name.starts_with("model.visual."),
+                            "unknown non-text scope"
+                        );
+                        TensorScope::Vision
+                    };
+                    put(&mut expected, item.name, item.dtype, item.shape, scope);
+                }
+            }
+            Architecture::MiniCpmV47 => Self::minicpm_vision_entries(spec, &mut expected)?,
+            Architecture::Llama => unreachable!(),
+        }
+        if policy.selects(TensorScope::Mtp)
+            && !expected
+                .values()
+                .any(|(_, _, scope)| *scope == TensorScope::Mtp)
+        {
+            bail!("{label} checkpoint has no MTP component");
+        }
+        let planned = expected
+            .iter()
+            .try_fold(0usize, |sum, (name, (dtype, shape, scope))| {
+                if !policy.selects_tensor(*scope, name) {
+                    return Ok(sum);
+                }
+                sum.checked_add(tensor_bytes(*dtype, shape)?)
+                    .context("resident size overflow")
+            })?;
+        self.assemble_manifest(label, expected, policy, planned)
+    }
+
+    fn text_entries(
+        spec: &crate::model_spec::ModelSpec,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+    ) -> Result<()> {
+        use crate::model_spec::Mixer;
+        let hidden = spec.hidden as usize;
+        let vocab = spec.vocab as usize;
+        let head_dim = spec.head_dim as usize;
+        let q_width = spec.q_width as usize;
+        let kv_width = spec.kv_heads as usize * head_dim;
+        let fp8 = spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Block128;
         for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
-            put(name.into(), Dtype::BF16, vec![248320, 5120], true);
+            put(
+                expected,
+                name.into(),
+                Dtype::BF16,
+                vec![vocab, hidden],
+                TensorScope::Text,
+            );
         }
         put(
+            expected,
             "model.language_model.norm.weight".into(),
             Dtype::BF16,
-            vec![5120],
-            true,
+            vec![hidden],
+            TensorScope::Text,
         );
         for (i, layer) in spec.layers.iter().enumerate() {
             let p = format!("model.language_model.layers.{i}");
             for name in ["input_layernorm", "post_attention_layernorm"] {
-                put(format!("{p}.{name}.weight"), Dtype::BF16, vec![5120], true);
+                put(
+                    expected,
+                    format!("{p}.{name}.weight"),
+                    Dtype::BF16,
+                    vec![hidden],
+                    TensorScope::Text,
+                );
             }
-            let mut projections = vec![
-                ("mlp.gate_proj", 17408usize, 5120usize),
-                ("mlp.up_proj", 17408, 5120),
-                ("mlp.down_proj", 5120, 17408),
-            ];
+            match &spec.moe {
+                Some(moe) => {
+                    let experts = moe.experts as usize;
+                    let expert_i = moe.expert_intermediate as usize;
+                    let shared_i = moe.shared_intermediate as usize;
+                    put(
+                        expected,
+                        format!("{p}.mlp.gate.weight"),
+                        Dtype::BF16,
+                        vec![experts, hidden],
+                        TensorScope::Text,
+                    );
+                    put(
+                        expected,
+                        format!("{p}.mlp.experts.gate_up_proj"),
+                        Dtype::BF16,
+                        vec![experts, 2 * expert_i, hidden],
+                        TensorScope::Text,
+                    );
+                    put(
+                        expected,
+                        format!("{p}.mlp.experts.down_proj"),
+                        Dtype::BF16,
+                        vec![experts, hidden, expert_i],
+                        TensorScope::Text,
+                    );
+                    put(
+                        expected,
+                        format!("{p}.mlp.shared_expert.gate_proj.weight"),
+                        Dtype::BF16,
+                        vec![shared_i, hidden],
+                        TensorScope::Text,
+                    );
+                    put(
+                        expected,
+                        format!("{p}.mlp.shared_expert.up_proj.weight"),
+                        Dtype::BF16,
+                        vec![shared_i, hidden],
+                        TensorScope::Text,
+                    );
+                    put(
+                        expected,
+                        format!("{p}.mlp.shared_expert.down_proj.weight"),
+                        Dtype::BF16,
+                        vec![hidden, shared_i],
+                        TensorScope::Text,
+                    );
+                    put(
+                        expected,
+                        format!("{p}.mlp.shared_expert_gate.weight"),
+                        Dtype::BF16,
+                        vec![1, hidden],
+                        TensorScope::Text,
+                    );
+                }
+                None => {
+                    let intermediate = spec.intermediate as usize;
+                    projection(
+                        expected,
+                        format!("{p}.mlp.gate_proj"),
+                        intermediate,
+                        hidden,
+                        fp8,
+                    );
+                    projection(
+                        expected,
+                        format!("{p}.mlp.up_proj"),
+                        intermediate,
+                        hidden,
+                        fp8,
+                    );
+                    projection(
+                        expected,
+                        format!("{p}.mlp.down_proj"),
+                        hidden,
+                        intermediate,
+                        fp8,
+                    );
+                }
+            }
             match layer.mixer {
                 Mixer::FullAttention => {
-                    projections.extend([
-                        ("self_attn.q_proj", 12288, 5120),
-                        ("self_attn.k_proj", 1024, 5120),
-                        ("self_attn.v_proj", 1024, 5120),
-                        ("self_attn.o_proj", 5120, 6144),
-                    ]);
+                    projection(
+                        expected,
+                        format!("{p}.self_attn.q_proj"),
+                        2 * q_width,
+                        hidden,
+                        fp8,
+                    );
+                    projection(
+                        expected,
+                        format!("{p}.self_attn.k_proj"),
+                        kv_width,
+                        hidden,
+                        fp8,
+                    );
+                    projection(
+                        expected,
+                        format!("{p}.self_attn.v_proj"),
+                        kv_width,
+                        hidden,
+                        fp8,
+                    );
+                    projection(
+                        expected,
+                        format!("{p}.self_attn.o_proj"),
+                        hidden,
+                        q_width,
+                        fp8,
+                    );
                     for name in ["q_norm", "k_norm"] {
                         put(
+                            expected,
                             format!("{p}.self_attn.{name}.weight"),
                             Dtype::BF16,
-                            vec![256],
-                            true,
+                            vec![head_dim],
+                            TensorScope::Text,
                         );
                     }
                 }
                 Mixer::Gdn => {
-                    projections.extend([
-                        ("linear_attn.in_proj_qkv", 10240, 5120),
-                        ("linear_attn.in_proj_z", 6144, 5120),
-                        ("linear_attn.out_proj", 5120, 6144),
-                    ]);
+                    let g = spec.gdn.as_ref().context("GDN geometry missing")?;
+                    let key_dim = g.key_heads as usize * g.key_head_dim as usize;
+                    let value_heads = g.value_heads as usize;
+                    let value_dim = value_heads * g.value_head_dim as usize;
+                    let conv_dim = 2 * key_dim + value_dim;
+                    projection(
+                        expected,
+                        format!("{p}.linear_attn.in_proj_qkv"),
+                        conv_dim,
+                        hidden,
+                        fp8,
+                    );
+                    projection(
+                        expected,
+                        format!("{p}.linear_attn.in_proj_z"),
+                        value_dim,
+                        hidden,
+                        fp8,
+                    );
+                    projection(
+                        expected,
+                        format!("{p}.linear_attn.out_proj"),
+                        hidden,
+                        value_dim,
+                        fp8,
+                    );
                     for name in ["in_proj_a", "in_proj_b"] {
                         put(
+                            expected,
                             format!("{p}.linear_attn.{name}.weight"),
                             Dtype::BF16,
-                            vec![48, 5120],
-                            true,
+                            vec![value_heads, hidden],
+                            TensorScope::Text,
                         );
                     }
                     put(
+                        expected,
                         format!("{p}.linear_attn.conv1d.weight"),
                         Dtype::BF16,
-                        vec![10240, 1, 4],
-                        true,
+                        vec![conv_dim, 1, g.conv_kernel as usize],
+                        TensorScope::Text,
                     );
                     put(
+                        expected,
                         format!("{p}.linear_attn.norm.weight"),
                         Dtype::BF16,
-                        vec![128],
-                        true,
+                        vec![g.value_head_dim as usize],
+                        TensorScope::Text,
                     );
                     for name in ["A_log", "dt_bias"] {
                         put(
+                            expected,
                             format!("{p}.linear_attn.{name}"),
                             Dtype::BF16,
-                            vec![48],
-                            true,
+                            vec![value_heads],
+                            TensorScope::Text,
                         );
                     }
                 }
             }
-            for (name, n, k) in projections {
+        }
+        Ok(())
+    }
+
+    fn minicpm_vision_entries(
+        spec: &crate::model_spec::ModelSpec,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+    ) -> Result<()> {
+        let vision = spec
+            .vision
+            .as_ref()
+            .context("MiniCPM vision configuration missing")?;
+        vision.validate(crate::model_spec::Architecture::MiniCpmV47)?;
+        let vh = vision.hidden as usize;
+        let vi = vision.intermediate as usize;
+        let patch = vision.patch as usize;
+        // MiniCPMV4_7ViTWindowAttentionMerger windows are 2x2; the DownsampleMLP stacks two 2x2 merges.
+        let window_hidden = vh * 4;
+        let window_intermediate = vi * 4;
+        let merged = vh * 4;
+        put(
+            expected,
+            "model.vision_tower.embeddings.patch_embedding.weight".into(),
+            Dtype::BF16,
+            vec![vh, vision.channels as usize, patch, patch],
+            TensorScope::Vision,
+        );
+        put(
+            expected,
+            "model.vision_tower.embeddings.patch_embedding.bias".into(),
+            Dtype::BF16,
+            vec![vh],
+            TensorScope::Vision,
+        );
+        put(
+            expected,
+            "model.vision_tower.embeddings.position_embedding.weight".into(),
+            Dtype::BF16,
+            vec![(vision.position_side as usize).pow(2), vh],
+            TensorScope::Vision,
+        );
+        for name in ["post_layernorm.weight", "post_layernorm.bias"] {
+            put(
+                expected,
+                format!("model.vision_tower.{name}"),
+                Dtype::BF16,
+                vec![vh],
+                TensorScope::Vision,
+            );
+        }
+        for i in 0..vision.depth as usize {
+            let p = format!("model.vision_tower.encoder.layers.{i}");
+            for name in ["layer_norm1", "layer_norm2"] {
+                for suffix in ["weight", "bias"] {
+                    put(
+                        expected,
+                        format!("{p}.{name}.{suffix}"),
+                        Dtype::BF16,
+                        vec![vh],
+                        TensorScope::Vision,
+                    );
+                }
+            }
+            for (name, shape) in [
+                ("mlp.fc1.weight", vec![vi, vh]),
+                ("mlp.fc1.bias", vec![vi]),
+                ("mlp.fc2.weight", vec![vh, vi]),
+                ("mlp.fc2.bias", vec![vh]),
+            ] {
                 put(
-                    format!("{p}.{name}.weight"),
-                    Dtype::F8_E4M3,
-                    vec![n, k],
-                    true,
-                );
-                put(
-                    format!("{p}.{name}.weight_scale_inv"),
+                    expected,
+                    format!("{p}.{name}"),
                     Dtype::BF16,
-                    vec![n.div_ceil(128), k.div_ceil(128)],
-                    true,
+                    shape,
+                    TensorScope::Vision,
+                );
+            }
+            for name in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+                for (suffix, shape) in [("weight", vec![vh, vh]), ("bias", vec![vh])] {
+                    put(
+                        expected,
+                        format!("{p}.self_attn.{name}.{suffix}"),
+                        Dtype::BF16,
+                        shape,
+                        TensorScope::Vision,
+                    );
+                }
+            }
+        }
+        let p = "model.vision_tower.vit_merger";
+        for name in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+            for (suffix, shape) in [("weight", vec![vh, vh]), ("bias", vec![vh])] {
+                put(
+                    expected,
+                    format!("{p}.self_attn.{name}.{suffix}"),
+                    Dtype::BF16,
+                    shape,
+                    TensorScope::Vision,
                 );
             }
         }
-        #[derive(Deserialize)]
-        struct Skipped {
-            name: String,
-            dtype: Dtype,
-            shape: Vec<usize>,
+        for (name, width) in [("layer_norm1", vh), ("pre_norm", window_hidden)] {
+            for suffix in ["weight", "bias"] {
+                put(
+                    expected,
+                    format!("{p}.{name}.{suffix}"),
+                    Dtype::BF16,
+                    vec![width],
+                    TensorScope::Vision,
+                );
+            }
         }
-        // The closed-world skipped-tensor manifest is a required build input.
-        for item in
-            serde_json::from_str::<Vec<Skipped>>(include_str!("checkpoint/q38_skipped.json"))?
-        {
-            put(item.name, item.dtype, item.shape, false);
+        put(
+            expected,
+            format!("{p}.linear_1.weight"),
+            Dtype::BF16,
+            vec![window_intermediate, window_hidden],
+            TensorScope::Vision,
+        );
+        put(
+            expected,
+            format!("{p}.linear_1.bias"),
+            Dtype::BF16,
+            vec![window_intermediate],
+            TensorScope::Vision,
+        );
+        put(
+            expected,
+            format!("{p}.linear_2.weight"),
+            Dtype::BF16,
+            vec![vh, window_intermediate],
+            TensorScope::Vision,
+        );
+        put(
+            expected,
+            format!("{p}.linear_2.bias"),
+            Dtype::BF16,
+            vec![vh],
+            TensorScope::Vision,
+        );
+        let p = "model.merger.mlp.0";
+        for suffix in ["weight", "bias"] {
+            put(
+                expected,
+                format!("{p}.pre_norm.{suffix}"),
+                Dtype::BF16,
+                vec![merged],
+                TensorScope::Vision,
+            );
         }
+        for (name, n, k) in [
+            ("linear_1.weight", merged, merged),
+            ("linear_2.weight", vision.output as usize, merged),
+        ] {
+            put(
+                expected,
+                format!("{p}.{name}"),
+                Dtype::BF16,
+                vec![n, k],
+                TensorScope::Vision,
+            );
+        }
+        for (name, width) in [
+            ("linear_1.bias", merged),
+            ("linear_2.bias", vision.output as usize),
+        ] {
+            put(
+                expected,
+                format!("{p}.{name}"),
+                Dtype::BF16,
+                vec![width],
+                TensorScope::Vision,
+            );
+        }
+        Ok(())
+    }
+
+    fn assemble_manifest(
+        &self,
+        label: &str,
+        mut expected: BTreeMap<String, ExpectedTensor>,
+        policy: LoadPolicy,
+        expected_bytes: usize,
+    ) -> Result<TensorManifest> {
         ensure!(
             expected.len() == self.index.weight_map.len(),
-            "Q38 tensor count mismatch"
+            "{label} tensor count mismatch"
         );
         let views = self.views()?;
         let mut entries = BTreeMap::new();
         let mut resident_bytes = 0usize;
         for (name, shard) in &self.index.weight_map {
-            let (dtype, shape, text_tensor) = expected
+            let (dtype, shape, scope) = expected
                 .remove(name)
-                .with_context(|| format!("unknown Q38 tensor {name}"))?;
-            let scope = if text_tensor {
-                TensorScope::Text
-            } else if name.starts_with("mtp.") {
-                TensorScope::Mtp
-            } else {
-                ensure!(name.starts_with("model.visual."), "unknown non-text scope");
-                TensorScope::Vision
-            };
+                .with_context(|| format!("unknown {label} tensor {name}"))?;
             let load = policy.selects_tensor(scope, name);
             let t = views[shard].tensor(name)?;
             ensure!(
                 t.dtype() == dtype && t.shape() == shape,
-                "Q38 dtype/shape mismatch: {name}"
+                "{label} dtype/shape mismatch: {name}"
             );
             if load {
                 resident_bytes = resident_bytes
@@ -377,18 +714,9 @@ impl MappedCheckpoint {
                 },
             );
         }
-        let expected_bytes = match policy {
-            LoadPolicy::TextOnly => 29_468_003_328,
-            LoadPolicy::TextWithVision => 30_389_463_520,
-            LoadPolicy::VisionOnly => 921_460_192,
-            LoadPolicy::TextWithMtp => 29_945_203_072,
-            #[cfg(test)]
-            LoadPolicy::MtpProbe => 5_562_793_344,
-            LoadPolicy::MtpOnly => 477_199_744,
-        };
         ensure!(
             expected.is_empty() && resident_bytes == expected_bytes,
-            "Q38 manifest incomplete"
+            "{label} manifest incomplete"
         );
         Ok(TensorManifest {
             entries,
@@ -396,6 +724,53 @@ impl MappedCheckpoint {
         })
     }
 }
+
+type ExpectedTensor = (Dtype, Vec<usize>, TensorScope);
+
+fn put(
+    expected: &mut BTreeMap<String, ExpectedTensor>,
+    name: String,
+    dtype: Dtype,
+    shape: Vec<usize>,
+    scope: TensorScope,
+) {
+    expected.insert(name, (dtype, shape, scope));
+}
+
+fn projection(
+    expected: &mut BTreeMap<String, ExpectedTensor>,
+    base: String,
+    n: usize,
+    k: usize,
+    fp8: bool,
+) {
+    let dtype = if fp8 { Dtype::F8_E4M3 } else { Dtype::BF16 };
+    put(
+        expected,
+        format!("{base}.weight"),
+        dtype,
+        vec![n, k],
+        TensorScope::Text,
+    );
+    if fp8 {
+        put(
+            expected,
+            format!("{base}.weight_scale_inv"),
+            Dtype::BF16,
+            vec![n.div_ceil(128), k.div_ceil(128)],
+            TensorScope::Text,
+        );
+    }
+}
+
+fn tensor_bytes(dtype: Dtype, shape: &[usize]) -> Result<usize> {
+    let bits = shape.iter().try_fold(dtype.bitsize(), |n, &d| {
+        n.checked_mul(d).context("tensor size overflow")
+    })?;
+    ensure!(bits % 8 == 0, "tensor size is not a byte multiple");
+    Ok(bits / 8)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum TensorScope {
     Text,
