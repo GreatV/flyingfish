@@ -1,4 +1,4 @@
-//! CPU-side invariants shared by operator binders (Q38 ABI v1).
+//! CPU-side invariants shared by operator binders.
 use anyhow::{Context, Result, ensure};
 
 #[repr(C, align(16))]

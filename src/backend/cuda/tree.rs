@@ -295,10 +295,7 @@ impl State {
         Ok(())
     }
 
-    /// tree_prepare's metadata writes fused with the embedding gather and the
-    /// layer-0 RMSNorm. Replaces (tree_prepare, embed, rms_norm); the metadata
-    /// still lands before anything reads it, because this is the same point in
-    /// the step where tree_prepare used to run.
+    /// tree_prepare's metadata writes fused with the embedding gather and the layer-0 RMSNorm.
     pub(crate) fn prepare_embed_norm(
         &self,
         prefix: &CudaSlice<i32>,
@@ -344,8 +341,7 @@ impl State {
     }
 
     /// Fused tree RoPE and physical KV write: rotates the valid q/k rows in
-    /// place, stores K and V into the cache and zeroes the padding rows of both,
-    /// replacing (tree_rope, tree_kv_write) with one launch.
+    /// place, stores K and V into the cache and zeroes the padding rows of both.
     pub(crate) fn rope_kv(
         &self,
         qkv: &mut CudaSlice<bf16>,

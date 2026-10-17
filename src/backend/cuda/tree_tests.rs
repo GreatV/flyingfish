@@ -30,13 +30,10 @@ fn tree_prepare_embed_norm_replay_serves_wider_tree() -> Result<()> {
         });
     }
     let mut state = State::new(&d, &config, &kv, capacity, budget)?;
-    // Same prologue the engine runs before every step (engine.rs:501): drain
-    // the upload stream and stop event tracking, or the capture below sees
-    // uncaptured work from another stream.
+    // Same prologue the engine runs before every step: drain uploads and stop event tracking.
     d.finish_upload()?;
 
-    // Deterministic non-zero inputs, and a sentinel that the segment must
-    // overwrite so that "written" and "untouched" are both observable.
+    // Deterministic non-zero inputs and a sentinel the segment must overwrite.
     let pattern = |n: usize, seed: u16| -> Vec<bf16> {
         (0..n)
             .map(|i| bf16::from_bits(0x3f00 | (((i as u16).wrapping_mul(seed)) & 0x3f) ^ 0x15))
@@ -59,9 +56,7 @@ fn tree_prepare_embed_norm_replay_serves_wider_tree() -> Result<()> {
      -> Result<()> {
         s.memcpy_htod(&sentinel(budget * hidden), x)?;
         s.memcpy_htod(&sentinel(budget * hidden), y)?;
-        // qkv gets a pattern, not the sentinel: the V heads are copied through
-        // unchanged, so a sentinel there would be indistinguishable from "not
-        // written".
+        // qkv gets a pattern, not the sentinel: the V heads are copied through unchanged.
         s.memcpy_htod(&pattern(budget * qkv_dim, 5), qkv)?;
         s.memcpy_htod(&vec![u32::MAX; budget], ids)?;
         for layer in kv.iter_mut() {
@@ -94,15 +89,13 @@ fn tree_prepare_embed_norm_replay_serves_wider_tree() -> Result<()> {
     let big_tokens: Vec<u32> = (0..budget as u32).map(|i| 7 + i * 3).collect();
     let big_parents: Vec<i32> = vec![-1, 0, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
-    // Capture the segment with the narrow tree loaded: the launch geometry is
-    // frozen here and the replay has to live with it.
+    // Capture with the narrow tree loaded; the launch geometry is frozen here.
     let small = Tree::edges(&small_tokens, &small_parents, 100, capacity)?;
     state.load(&small)?;
     s.memcpy_htod(&[small.prefix() as i32], &mut prefix)?;
     s.synchronize()?;
     reset(&mut x, &mut y, &mut ids, &mut qkv, &mut kv)?;
-    // Warm the segment eagerly first, exactly as the engine does before it
-    // captures a verify graph: the capture must not carry first-launch work.
+    // Warm eagerly before capture, as the engine does before capturing a verify graph.
     prepare(
         &state,
         &mut prefix,
@@ -152,8 +145,7 @@ fn tree_prepare_embed_norm_replay_serves_wider_tree() -> Result<()> {
         "same-width graph replay diverges from eager"
     );
 
-    // The gate: widen the tree in the same buffers and replay the captured
-    // graph. A grid sized from the captured row count traps right here.
+    // Widen the tree in the same buffers and replay; a grid sized from the captured rows traps here.
     let big = Tree::edges(&big_tokens, &big_parents, 200, capacity)?;
     state.load(&big)?;
     s.memcpy_htod(&[big.prefix() as i32], &mut prefix)?;
@@ -196,10 +188,7 @@ fn tree_prepare_embed_norm_replay_serves_wider_tree() -> Result<()> {
         wide(&s.clone_dtoh(&kv[0].v)?),
     ];
 
-    // The wider tree must really have written its rows, otherwise the equality
-    // below could hold on untouched sentinel buffers. Cache slots are indexed
-    // (kv_head * capacity + position) * head_dim + d, so each kv head has its
-    // own written window.
+    // The wider tree must have written its rows; cache slot = (kv_head * capacity + position) * head_dim + d.
     let sentinel_word = u32::from(bf16::from_bits(0x3f80).to_bits());
     let rewritten = |got: &[u32], from: usize, len: usize| -> usize {
         got[from..from + len]

@@ -66,9 +66,7 @@ fn counts(e: &Engine) -> Result<(usize, usize, usize)> {
         .context("batch missing")?;
     Ok((b.calls, b.target_restores, b.mtp_restores))
 }
-// Causal teacher forcing at exactly K+1 rows constructs all-accept proposals.
-// Future placeholders cannot influence the row being chosen. Every trial is
-// rolled back; no recurrent-decode oracle is used for batch state equality.
+// Causal teacher forcing at exactly K+1 rows constructs all-accept proposals; every trial is rolled back.
 fn proposals(e: &mut Engine, k: usize) -> Result<Vec<u32>> {
     let anchor = e.token()?;
     let mut inputs = vec![1; k + 1];
@@ -90,8 +88,7 @@ fn proposals(e: &mut Engine, k: usize) -> Result<Vec<u32>> {
     );
     Ok(inputs[1..].to_vec())
 }
-// This oracle materializes the chosen GPU slot without the production selector.
-// Primitive gates independently check the slot contents against row recurrence.
+// Materializes the chosen GPU slot without the production selector.
 fn canonical(e: &mut Engine, inputs: &[u32], rows: usize) -> Result<Vec<u32>> {
     ensure!(
         !e.mtp.as_ref().context("MTP missing")?.options.graph,
@@ -505,9 +502,7 @@ fn q38_mtp_batch_failure_capture_gpu() -> Result<()> {
 #[test]
 #[ignore = "requires a full-model GPU window, FF_Q38_MODEL and FLYINGFISH_RUNTIME_DIR"]
 fn q38_snapshot_poison_rows_gpu() -> Result<()> {
-    // Read contract for the verify GDN snapshot rows: select_prefix reads exactly one row
-    // per layer (snapshot_row(committed) = committed - 1). Every other row is poisoned
-    // between verify and restore; the restored GDN state must match the canonical oracle.
+    // select_prefix reads one verify snapshot row per layer (committed - 1); every other row is poisoned.
     let mut e = ready()?;
     let ids = prompt("math1")?;
     let garbage_s = vec![1.0e30f32; 48 * 128 * 128];

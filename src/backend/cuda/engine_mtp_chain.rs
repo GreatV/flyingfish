@@ -1,5 +1,4 @@
-//! M2a correctness baseline. Both stores belong to the same Engine; the
-//! controller uses its ordinary target decode, including the existing graph.
+//! Both stores belong to the same Engine; the controller uses its ordinary target decode and graph.
 use super::super::Engine;
 use super::*;
 use crate::{

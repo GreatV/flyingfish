@@ -1,44 +1,20 @@
 //! Gated Delta Net for Qwen3.8-27B (ABI v1 §6).
 //!
 //! Shape is fixed by [`GdnSpec::q38`]: 48 value heads, 16 key heads, GQA 3,
-//! dk = dv = 128, conv width 4, history width 3, chunk 32, FP32 tiles. The CUDA
-//! side is `kernels/gdn/`: `gdn_conv`, `gdn_conv_hist_update`, `gdn_prep_fp32`,
-//! and the two core entry points `gdn_chunked_core_v1` (prefill) and
-//! `gdn_recurrent_core_v2` (decode).
+//! dk = dv = 128, conv width 4, history width 3, chunk 32, FP32 tiles. Kernels are in `kernels/gdn/`.
 //!
-//! `run` owns the WHOLE mixer between the `qkv`/`a`/`b` projections and
-//! `core_out`, because every intermediate depends on this call's `conv_out` and
-//! the caller has no slot between our launches. On one stream:
+//! `run` issues the whole mixer between the `qkv`/`a`/`b` projections and the ungated
+//! `core_out` on one stream; Q/K norms and gates use common ops ([`CommonOpsRef`]).
 //!
-//! ```text
-//! conv -> hist_update -> common silu -> common l2_heads (Q,K)
-//!      -> common gdn_gates -> widen+GQA+scale Q by 1/sqrt(dk)
-//!      -> recurrent | chunked -> core_out
-//! ```
+//! `hist_update` is a separate launch after conv; conv blocks read `history[]` to seed their window.
 //!
-//! The Q/K norms and the gates use common ops ([`CommonOpsRef`]); this
-//! module does not duplicate a norm or gate kernel, and it does not apply
-//! `rms_gated` — the caller consumes the ungated `core_out`.
+//! Ordinary `run` selects the core by phase. `run_verify` keeps Prefill preparation and uses the
+//! R1..5 recurrent core on sm_89. Modules and launch bounds are prepared before Ready.
 //!
-//! `hist_update` is launched by this binder, not the caller, because the two were
-//! once fused and that was a cross-block race: the block owning the last row
-//! overwrote `history[]` while blocks with `blockIdx.y == 0` were still reading
-//! it to seed their window, which made `valid_rows > 32` nondeterministic.
-//!
-//! Ordinary `run` selects by phase: even M1 Prefill uses chunked. The Engine's
-//! MTP device-prefix transaction calls `run_verify`, which retains Prefill and
-//! all batched preparation but uses the R1..5 recurrent core on sm89. Modules
-//! and launch bounds are prepared before Ready; live rows remain device data.
-//!
-//! Rows are LOCAL. `qkv` and `core_out` are this call's `[M, ...]`; `prefix` rows
-//! precede the call and are reachable only through `history[]`. `GdnMeta.prefix`
-//! is validation (`key_count == prefix + valid_rows`, `capacity >= key_count`),
-//! never an index.
+//! Rows are local: `qkv` and `core_out` are this call's `[M, ...]`; prefix rows are reachable only
+//! through `history[]`. `GdnMeta.prefix` is validated, never used as an index.
 
-/// Test-only record of which core each `run()` selected. The phase contract cannot be
-/// asserted by comparing outputs: at M=1 the chunked path (C=32, T=I, one live row)
-/// computes exactly the recurrent recurrence and the two agree bitwise, so identical
-/// output proves nothing about which kernel ran. Compiles out of production builds.
+/// Test-only record of which core each `run()` selected.
 #[cfg(test)]
 pub(crate) static PHASE_LOG: std::sync::Mutex<Vec<&'static str>> =
     std::sync::Mutex::new(Vec::new());
@@ -82,20 +58,14 @@ const CONV_ROWS: u32 = 32;
 const CORE_THREADS: u32 = 512;
 /// Prep thread block.
 const PREP_THREADS: u32 = 128;
-/// Dynamic shared memory the two cores request. Measured, not assumed: see
-/// `GDN_RS_INTERFACE.md` §7. Static shared memory in all three is 0.
+/// Dynamic shared memory the recurrent and chunked cores request; static shared memory is 0.
 const RECURRENT_SMEM: u32 = 4096;
 const CHUNKED_SMEM: u32 = 62_336;
-/// Chunkwise-P2 core thread block, the same 256 threads; both stages use the one
-/// arena whose size comes from `gdn_cw_p2_layout.h`.
+/// Chunkwise-P2 thread block; both stages use one arena sized by `gdn_cw_p2_layout.h`.
 const P2_THREADS: u32 = 256;
 
-/// The ABI §6 views. Every field carries an explicit stride and span; `prepare`
-/// validates them against the registered layout rather than assuming widths.
-///
-/// `conv_dim` is NOT a binding and is never taken from here: it comes from
-/// [`GdnSpec::conv_dim`], the single derivation, and `prepare` asserts it against
-/// the compiled kernel constant.
+/// The ABI §6 views; `prepare` validates every stride and span against the registered layout.
+/// `conv_dim` comes from [`GdnSpec::conv_dim`], not from these bindings.
 #[derive(Debug)]
 pub(crate) struct GdnBindings {
     /// Pre-conv projection `[M, conv_dim]`: Q at offset 0 width `HK*DK`, K next
@@ -134,17 +104,15 @@ struct Kernels {
     p2: Option<ChunkwiseP2>,
 }
 
-/// The two chunkwise-P2 stages. They are launched in the order A, H on one stream
-/// with nothing between them: A fills the workspace slot, H walks the chunks in order,
-/// contracting the out rows against its register state as it goes.
+/// The two chunkwise-P2 stages, launched A then H on one stream with nothing between:
+/// A fills the workspace slot, H walks the chunks in order.
 struct ChunkwiseP2 {
     a: CudaFunction,
     h: CudaFunction,
 }
 
-/// The two chunkwise-P2 launch configs for a plan bound at `rows`: stage A runs one CTA
-/// per (chunk, head) with grid.x = ceil(rows/64), stage H one CTA per 32-wide value
-/// block with grid.x = DV/32, so its grid never moves with the step.
+/// Chunkwise-P2 launch configs for a plan bound at `rows`: stage A one CTA per (chunk, head)
+/// with grid.x = ceil(rows/64), stage H one CTA per 32-wide value block with grid.x = DV/32.
 fn cw_p2_grids(rows: u32) -> (LaunchConfig, LaunchConfig) {
     let per_chunk = LaunchConfig {
         grid_dim: (rows.div_ceil(CW_P2_CHUNK), HV, 1),
@@ -162,7 +130,7 @@ fn cw_p2_grids(rows: u32) -> (LaunchConfig, LaunchConfig) {
 /// CUDA caps gridDim.y and gridDim.z at 65535; prep puts rows on gridDim.z and beta on gridDim.y.
 pub(crate) const CUDA_GRID_YZ_MAX: u32 = 65_535;
 
-/// The single derivation of the three prep grids: `prepare` and `for_rows` both call it with the rows they bind.
+/// Prep grids for `rows`; `prepare` and `for_rows` both derive them here.
 fn prep_grids(
     prep_cfg: LaunchConfig,
     beta_cfg: LaunchConfig,
@@ -199,17 +167,15 @@ pub(crate) struct GdnPlan {
     hist_cfg: LaunchConfig,
     chunked_cfg: LaunchConfig,
     recurrent_cfg: LaunchConfig,
-    /// Whether this plan carries the chunkwise-P2 split instead of the shipped core.
+    /// Whether this plan carries the chunkwise-P2 split.
     cw_p2: bool,
     /// Chunkwise-P2 workspace bytes this plan needs past `ws.bytes`, 0 when it does not
     /// carry the split. The slot region starts at `ws.bytes`.
     ws_p2: u64,
 }
 
-/// The BF16 sources the P2 stages read: Q and K as 16 KEY heads each (the stages do
-/// the GQA expansion), and V as the conv_out column window whose rows are
-/// `v_row_stride` elements apart rather than HEADS*DV. They are arguments, not plan
-/// state.
+/// BF16 sources the P2 stages read: Q and K as 16 key heads each, V as the conv_out
+/// column window with row stride `v_row_stride` elements.
 #[derive(Copy, Clone)]
 pub(crate) struct P2Sources {
     pub q: u64,
@@ -219,7 +185,7 @@ pub(crate) struct P2Sources {
 }
 
 impl GdnPlan {
-    /// Setup-only prefix view. Reuse loaded modules and physical addresses.
+    /// Setup-only prefix view; reuses loaded modules and physical addresses.
     pub(crate) fn for_rows(
         &self,
         rows: u32,
@@ -286,11 +252,8 @@ impl GdnPlan {
         })
     }
 
-    /// The chunkwise-P2 prefill core: stage A, then stage H, two launches
-    /// back to back on the caller's stream with no synchronisation between them. Stage A
-    /// stage A sizes its grid from the rows the plan binds, stage H from the value
-    /// strip; both resolve the row count on the device, so a captured Graph replays
-    /// the identical sequence.
+    /// Chunkwise-P2 prefill core: stage A then stage H on the caller's stream with no
+    /// synchronisation between them; row counts resolve on the device.
     pub(crate) fn gdn_cw_p2_step(
         &self,
         stream: &Arc<CudaStream>,
@@ -310,9 +273,7 @@ impl GdnPlan {
         let (q, k, v) = (src.q, src.k, src.v);
         let beta = ws_f32(self.ws.beta_fp32, ws, rows, HV)?.0.ptr;
         let g = ws_f32(self.ws.g, ws, rows, HV)?.0.ptr;
-        // The slot region starts where the fused layout ends; that end is 256 B aligned
-        // and the host scratch pointer is 256 B aligned, which the stages require. All
-        // stages take THIS base as their ws argument.
+        // The slot region starts at the 256 B aligned end of the fused layout; all stages take this base as `ws`.
         let slot = add(ws, self.ws.bytes)?;
         let stage = crate::gdn_plan::P2StageArgs {
             q,
@@ -362,9 +323,7 @@ pub(crate) struct GdnOps;
 pub(crate) const GDN_CONV_DIM: u32 = 10_240;
 
 impl GdnOps {
-    /// CPU-only checked sizing: reads no GPU state and allocates no GPU memory.
-    ///
-    /// This is the ONLY source of the Engine's byte accounting for GDN.
+    /// CPU-only checked sizing; the only source of the Engine's GDN byte accounting.
     pub(crate) fn workspace(
         spec: &GdnSpec,
         max_rows: u32,
@@ -389,8 +348,7 @@ impl GdnOps {
             "GDN GQA {GQA} does not expand {HK} key heads to {HV} value heads"
         );
         let ws = GdnWorkspace::q38(spec, max_rows)?;
-        // conv_dim is derived in exactly ONE place, then asserted against the
-        // constant compiled into the kernel. The formula is not restated here.
+        // `conv_dim` is derived once and asserted against the kernel constant.
         let conv_dim = spec.conv_dim()?;
         ensure!(
             conv_dim == GDN_CONV_DIM,
@@ -423,10 +381,8 @@ impl GdnOps {
         let f_chunked = chunked_mod.load_function("gdn_chunked_core_v1")?;
         let f_recurrent = recurrent_mod.load_function("gdn_recurrent_core_v2")?;
 
-        // The opt-in is applied UNCONDITIONALLY to every core, in setup, not on
-        // the path currently under test. A launch without it fails with
-        // `invalid argument` AT LAUNCH, not at the first shared write, so
-        // opting in lazily is how it hides.
+        // The dynamic shared memory opt-in is applied to every core at setup; a launch without it
+        // fails with `invalid argument`.
         for (function, bytes) in [(&f_recurrent, RECURRENT_SMEM), (&f_chunked, CHUNKED_SMEM)] {
             if bytes > 48 * 1024 {
                 function.set_attribute(
@@ -436,7 +392,7 @@ impl GdnOps {
             }
         }
 
-        // Bind before Ready. Unsupported architectures retain their exact core route.
+        // The rstep core binds only on sm_89.
         let rstep = if cubin::capability(ctx)? == 89 {
             Some(cubin::module(ctx, "gdn/gdn_rstep")?.load_function("gdn_rstep_core_v1")?)
         } else {
@@ -452,8 +408,7 @@ impl GdnOps {
             f.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, CHUNKED_SMEM as i32)?;
             f
         };
-        // All three arenas are under the 48 KiB no-opt-in cap, so they need no
-        // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES.
+        // All three arenas are under the 48 KiB no-opt-in cap.
         let p2 = if !cw_p2 {
             None
         } else {
@@ -475,7 +430,7 @@ impl GdnOps {
             recurrent: f_recurrent,
             p2,
         };
-        // Grids derive from the rows the plan binds, never from device valid_rows, so a captured Graph replays an identical launch sequence.
+        // Grids derive from the bound rows, never from device valid_rows.
         let (prep_cfg, beta_cfg, conv_cfg) = prep_grids(
             LaunchConfig {
                 grid_dim: (DV.div_ceil(PREP_THREADS), HV, 1),
@@ -572,9 +527,8 @@ impl GdnOps {
             None
         };
         meta.validate()?;
-        // The P2 plan skips the prep launch, so NOTHING may read the FP32 regions on it.
-        // Prefill is already routed to the P2 arm above; decode must therefore be running
-        // on the separate decode plan, which is bound at one row and carries no split.
+        // The P2 plan skips the prep launch, so its FP32 regions are unwritten; decode uses the
+        // separate one-row decode plan.
         ensure!(
             !plan.cw_p2 || phase != ExecutionPhase::Decode,
             "the chunkwise-P2 plan has no FP32 sources: decode must use the decode plan"
@@ -591,11 +545,8 @@ impl GdnOps {
         let ws_ptr = scratch.ptr;
 
         let span = mul(mul(u64::from(cd), el_bf)?, u64::from(rows))?;
-        // Column offsets into `qkv`, in BYTES. ABI section 6: Q at offset 0 width HK*DK,
-        // K next width HK*DK, V next width HV*DV. So the V start is TWO key-head blocks,
-        // not one plus a value-head block: the earlier `q_off + HV*DV*el_bf + k_off` added
-        // V's own width where K's belongs and put V at 16384 B instead of 8192 B, reading
-        // 8 KB past the buffer on the last row.
+        // Column offsets into `qkv` in bytes (ABI §6): Q at 0 width HK*DK, K next width HK*DK,
+        // V next width HV*DV.
         let q_off = 0u64;
         let k_off = u64::from(HK * DK) * el_bf;
         let v_off = add(k_off, u64::from(HK * DK) * el_bf)?;
@@ -618,9 +569,8 @@ impl GdnOps {
         let l2_eps = plan.l2_eps;
         let conv_ptr = conv_out.0.ptr;
 
-        // ---- 1. conv: qkv -> conv_out, with the exact SiLU applied in the same kernel.
-        // ABI §5: the conv output cast may not be elided; the kernel casts to BF16 and
-        // back before silu().
+        // conv: qkv -> conv_out with the exact SiLU; the conv output is cast to BF16 and back
+        // before silu() (ABI §5).
         unsafe {
             stream
                 .launch_builder(&plan.kernels.conv)
@@ -631,9 +581,7 @@ impl GdnOps {
                 .arg(&meta.ptr)
                 .arg(&(cd as i32))
                 .launch(plan.conv_cfg)?;
-            // ---- 2. hist_update: INSIDE the binder, after conv, same stream.
-            // Fusing these was a cross-block race: the block owning the last row overwrote
-            // history[] while blocks with blockIdx.y == 0 were still reading it.
+            // hist_update: after conv, same stream.
             if let Some((_, history)) = snapshots {
                 stream
                     .launch_builder(&plan.kernels.hist_snapshot)
@@ -653,8 +601,8 @@ impl GdnOps {
                     .launch(plan.hist_cfg)?;
             }
         }
-        // ---- 3. common l2_heads on Q and K only. V is NOT normed (ABI §5).
-        // Both are read as column windows of conv_out: 16 KEY heads each.
+        // common l2_heads on Q and K only (V is not normed, ABI §5), read as conv_out column
+        // windows of 16 key heads each.
         plan.common.norm.l2_heads(
             stream,
             dom,
@@ -669,7 +617,7 @@ impl GdnOps {
             &mut k_bf16,
             l2_eps,
         )?;
-        // ---- 5. common gdn_gates: beta BF16, g FP32.
+        // common gdn_gates: beta BF16, g FP32.
         plan.common.gate.gdn_gates_with(
             stream,
             dom,
@@ -682,11 +630,9 @@ impl GdnOps {
                 g: &mut g,
             },
         )?;
-        // V is read in place from its conv_out columns through the same validated
-        // window helper as Q and K: a drifted offset is rejected here, not read.
+        // V is read in place from its conv_out columns through the validated window helper.
         let v_bf16 = as3(conv_ptr, rows, HV, cd, span, v_off)?;
-        // ---- 6. exact widens. beta FIRST: both cores declare `const float* beta`, and
-        // handing them the BF16 buffer is a silent 2-byte/4-byte stride bug.
+        // Exact widens; the cores read `beta` as FP32.
         unsafe {
             stream
                 .launch_builder(&plan.kernels.beta_widen)
@@ -694,16 +640,8 @@ impl GdnOps {
                 .arg(&beta_fp32.0.ptr)
                 .arg(&meta.ptr)
                 .launch(plan.beta_cfg)?;
-            // q/k widened and BOTH GQA-expanded to value heads; Q scaled by 1/sqrt(DK)
-            // after the widen. V stays a conv_out column window: the kernel still takes
-            // the row stride (conv_dim) as its scalar.
-            //
-            // P2 SKIPS THIS LAUNCH: its stages read the BF16 sources and do the widen, the
-            // GQA expansion and the Q scale at the load sites, so the whole pass is folded
-            // into the stages that consume it. Every OTHER route on this plan -- the
-            // shipped core, the recurrent step and the decode rstep, all of which read
-            // these FP32 buffers -- still gets them, and the decode plan is a separate
-            // plan whose cw_p2 is false.
+            // Q/K widened and GQA-expanded to value heads, Q scaled by 1/sqrt(DK) after the widen;
+            // V stays a conv_out column window with row stride conv_dim. The P2 plan skips this launch.
             if !plan.cw_p2 {
                 stream
                     .launch_builder(&plan.kernels.prep)
@@ -718,14 +656,8 @@ impl GdnOps {
                     .launch(plan.prep_cfg)?;
             }
         }
-        // ---- 7. the core. PHASE selects it; never a host valid_rows.
-        // The builder must be one expression: `launch_builder` returns a value that
-        // borrows the stream, so holding it across statements drops the temporary.
-        // PHASE selects the core; a host valid_rows never does. Recording which arm was
-        // taken is the ONLY way to assert the phase contract at M=1: with one live row the
-        // chunked path (C=32, T=I) computes exactly the recurrent recurrence, and the two
-        // agree BITWISE -- so comparing outputs cannot distinguish the paths, which is
-        // precisely the trap this assertion was meant to avoid. Test-only; compiles out.
+        // The core is selected by phase, never by a host valid_rows. The launch builder must be one
+        // expression: it borrows the stream.
         #[cfg(test)]
         record_phase(match phase {
             ExecutionPhase::Prefill if plan.cw_p2 => "chunkwise_p2",
@@ -795,17 +727,8 @@ impl GdnOps {
                         .arg(&b.s.0.ptr)
                         .arg(&b.core_out.0.ptr)
                         .arg(&meta.ptr)
-                        // The trailing scalar is `valid_rows_in`, resolved as
-                        //     valid_rows = valid_rows_in > 0 ? valid_rows_in : meta->valid_rows
-                        // so 0 is the sentinel meaning "read it from the device". It MUST be 0.
-                        //
-                        // Passing the plan's max_rows is wrong twice over. On a tail chunk
-                        // (valid_rows < max_rows) it makes the kernel process max_rows rows,
-                        // tripping its own key_count guard and advancing state over rows that
-                        // do not exist. And it bakes a HOST value into the launch, so a captured
-                        // Graph replays a stale row count instead of re-reading valid_rows from
-                        // meta every replay. Grid SIZE may derive from max_rows; the row COUNT
-                        // may not.
+                        // The trailing `valid_rows_in` must be 0 so the kernel reads valid_rows from `meta` on
+                        // every replay.
                         .arg(&0i32)
                         .launch(plan.chunked_cfg)?;
                 }
@@ -827,17 +750,8 @@ impl GdnOps {
     }
 }
 
-/// A column window of conv_out: a `[rows, heads, DV]` view with the FULL row stride cd,
-/// starting at `base + offset` inside the buffer.
-///
-/// The capacity handed to Tensor::new is `span - offset`, measured from the WINDOW's
-/// own base -- NOT the whole buffer's span. That distinction is load-bearing. A
-/// column window's extent is (rows-1)*cd + heads*DV elements, far more than
-/// heads*DV*2 per row, so it needs a generous capacity; but granting it the buffer's
-/// FULL span over-grants by exactly `offset`, and Tensor's own extent validation then
-/// cannot reject a window that runs off the end. That is how a wrong column offset
-/// read 8 KB past the buffer without any check firing. With `span - offset` the same
-/// wrong offset is rejected in run(), before a single launch.
+/// A `[rows, heads, DV]` column window of conv_out with row stride cd at `base + offset`;
+/// its capacity is `span - offset` so extent validation rejects a window past the buffer end.
 fn as3(
     base: u64,
     rows: u32,
@@ -907,14 +821,7 @@ fn ws_f32_3(r: Region, ptr: u64, rows: u32, h: u32, d: u32) -> Result<TensorMut<
     }
 }
 
-/// Validate the registered layout against the ABI §6 binding table.
-///
-/// Every stride is checked explicitly. The recorded defect this guards: the conv driver
-/// once passed the ROW COUNT where the kernel's sixth scalar is `conv_dim`, so at
-/// `valid_rows == 1` conv_dim became 1, `ch >= conv_dim` discarded every block but the
-/// first, and 10239 of 10240 outputs stayed NaN. It looked like a kernel bug and cost a
-/// window. `prepare` derives `conv_dim` from `GdnSpec::conv_dim()` and asserts it against
-/// the compiled constant; this checks the strides that go with it.
+/// Validate the registered layout against the ABI §6 binding table; every stride is checked.
 fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32) -> Result<()> {
     b.qkv.validate()?;
     ensure!(
@@ -1496,12 +1403,6 @@ mod tests {
         (n + 255) & !255
     }
 
-    /// Every workspace region must be exactly the size `GDN_RS_INTERFACE.md` §3 tabulates.
-    ///
-    /// This is a capacity and indexing check on the critical path, and it exists because the
-    /// first draft sized `beta`, `beta_fp32` and `g` as `rows * 2` / `rows * 4` instead of
-    /// `rows * 48 * 2` / `rows * 48 * 4` — the missing x48. That is a silent UNDER-allocation:
-    /// the binder would have written past its own region while every type still checked out.
     #[test]
     fn workspace_regions_match_the_interface_table() {
         let spec = GdnSpec::q38();
@@ -1509,9 +1410,9 @@ mod tests {
         for rows in [1u32, 64, 2048] {
             let ws = GdnWorkspace::q38(&spec, rows).expect("workspace");
             let r = u64::from(rows);
-            let head = u64::from(HV); // 48
-            let khead = u64::from(HK); // 16
-            let d = u64::from(DV); // 128
+            let head = u64::from(HV);
+            let khead = u64::from(HK);
+            let d = u64::from(DV);
             let dk = u64::from(DK);
 
             let want = |cols: u64, elem: u64| align256(r * cols * elem);
@@ -1565,8 +1466,7 @@ mod tests {
             for w in spans.windows(2) {
                 assert!(w[0].1 <= w[1].0, "{} overlaps {}", w[0].2, w[1].2);
             }
-            // The declared total must be the slice the Engine is asked to allocate, and it
-            // must account for every region: nothing allocated here, nothing outside it.
+            // The declared total is the Engine slice and accounts for every region.
             let last = spans.last().expect("regions");
             assert_eq!(
                 ws.bytes,
@@ -1576,8 +1476,7 @@ mod tests {
         }
     }
 
-    /// `workspace()` is the Engine's ONLY source of byte accounting, so it must be pure:
-    /// same inputs, same bytes, and callable without a CUDA context.
+    /// `workspace()` is pure: same inputs, same bytes, no CUDA context.
     #[test]
     fn workspace_is_pure_and_matches_the_plan() {
         let spec = GdnSpec::q38();
@@ -1598,20 +1497,18 @@ mod tests {
         );
     }
 
-    /// A column window's capacity is `span - offset`, measured from the WINDOW's base.
-    ///
-    /// A V offset of 16384 B instead of 8192 B exceeds the final row by 8 KB.
-    /// The window must expose only its remaining capacity so extent validation rejects it.
+    /// A column window's capacity is `span - offset`, so extent validation rejects a V offset
+    /// that overruns the final row.
     #[test]
     fn column_window_capacity_is_measured_from_the_window() {
         let cd = u64::from(GDN_CONV_DIM);
         let el = size_of::<bf16>() as u64;
-        // ABI section 6: Q at 0 width HK*DK, K next, V next width HV*DV -- in BYTES.
+        // ABI §6: Q at 0 width HK*DK, K next, V next width HV*DV, in bytes.
         let q_off = 0u64;
         let k_off = u64::from(HK * DK) * el;
         let v_off = 2 * u64::from(HK * DK) * el;
         assert_eq!(v_off, 8192, "V starts two key-head blocks in");
-        // The defect, reconstructed: V's own width added where K's belongs.
+        // Wrong offset: V's own width added where K's belongs.
         let v_off_bug = q_off + u64::from(HV * DV) * el + k_off;
         assert_eq!(v_off_bug, 16384, "the historical bug sat 8192 B too far in");
 
@@ -1641,8 +1538,7 @@ mod tests {
         }
     }
 
-    /// `conv_dim` comes from ONE derivation. This guards against the formula being restated
-    /// in the binder, which is how the conv_dim/row-count mix-up happened.
+    /// `conv_dim` comes from one derivation.
     #[test]
     fn conv_dim_has_a_single_derivation() {
         let spec = GdnSpec::q38();
@@ -1702,9 +1598,8 @@ mod tests {
         Ok(())
     }
 
-    /// The two chunkwise-P2 grids derive from the rows the plan binds: stage A gets
-    /// one CTA per (chunk, head), stage H one per 32-wide value block, so its grid does not
-    /// move with the step at all.
+    /// The chunkwise-P2 grids derive from the bound rows: stage A one CTA per (chunk, head),
+    /// stage H one per 32-wide value block independent of the step.
     #[test]
     fn cw_p2_grids_are_a_function_of_the_bound_rows() {
         for (rows, want_chunks) in [(2048u32, 32u32), (16384, 256)] {
@@ -1796,8 +1691,7 @@ mod tests {
         let head = u64::from(HV);
         let d = u64::from(DV);
         let dk = u64::from(DK);
-        // Span headroom so a widened stride fails the stride check, not extent
-        // validation: a row-padded buffer with spare bytes is the dangerous case.
+        // Span headroom so a widened stride fails the stride check, not extent validation.
         let padded = |bytes: u64| bytes + 1024 * 1024;
         unsafe {
             GdnBindings {
@@ -1834,11 +1728,8 @@ mod tests {
         }
     }
 
-    /// The cores bake their strides in (`out[(gr * HEADS + head) * DV + ...]`,
-    /// `S[head * DK * DV + ...]`, `history[ch * 3 + ...]`, `qkv[row * conv_dim + ch]`),
-    /// so a binding with a wider stride passes extent validation and still lands every
-    /// row/head at the wrong address. Each padded binding must be rejected by the
-    /// binding guard, not by extent validation.
+    /// A binding wider than the strides the cores bake in must be rejected by the binding
+    /// guard, not by extent validation.
     #[test]
     fn bindings_must_carry_the_kernel_strides() {
         let rows = 4u32;
@@ -1876,10 +1767,10 @@ mod tests {
     fn v_window_offsets_are_validated_before_launch() {
         let cd = u64::from(GDN_CONV_DIM);
         let el = size_of::<bf16>() as u64;
-        // ABI section 6: Q at 0 width HK*DK, K next, V next width HV*DV -- in BYTES.
+        // ABI §6: Q at 0 width HK*DK, K next, V next width HV*DV, in bytes.
         let v_off = 2 * u64::from(HK * DK) * el;
         assert_eq!(v_off, 8192, "V starts two key-head blocks in");
-        // The defect, reconstructed: V's own width added where K's belongs.
+        // Wrong offset: V's own width added where K's belongs.
         let v_off_bug = u64::from(HV * DV) * el + u64::from(HK * DK) * el;
         assert_eq!(v_off_bug, 16384, "the historical bug sat 8192 B too far in");
         for rows in [1u32, 64] {
@@ -1895,35 +1786,19 @@ mod tests {
     }
 }
 
-/// GPU probe for the GDN binder: `workspace` -> `prepare` -> `run` through the
-/// real launch path and the real common ops, against fixtures produced by
-/// `p1c/gdn_oracle.py` (generator: `p1c/fixtures-binder/make_binder_fixtures.py`).
-///
-/// `#[ignore]`-gated because it initialises a device:
-///
-///   FF_Q38_GPU_WINDOW=granted [FF_Q38_GPU_ORDINAL=1] cargo test --features cuda \
-///     --lib gdn::gpu_probe -- --ignored --nocapture
+/// GPU probe for the GDN binder: `workspace` -> `prepare` -> `run` through the real
+/// launch path and common ops, against oracle fixtures.
 ///
 /// Checked contracts:
-///   1. phase contract: Prefill-M1 (chunked) and Decode-M1 (recurrent) on the SAME
-///      input produce outputs that DIFFER at the bit level (so the test cannot pass
-///      vacantly), and each matches its own oracle reference;
-///   2. tail chunk: with valid_rows < max_rows and the rows at or past valid_rows
-///      pre-poisoned, those rows are untouched in core_out, and running the same
-///      valid rows through a plan sized exactly to them changes nothing (normally
-///      -- the poisoned tail must not advance S or history);
-///   3. a silently-compiling negative control (a/b bindings swapped) that must FAIL
-///      on numbers;
-///   4. end-to-end against the oracle for both phases plus a nonzero-prefix
-///      continuation.
+///   1. phase contract: Prefill-M1 selects chunked and Decode-M1 selects recurrent, each
+///      matching its own oracle reference;
+///   2. tail chunk: rows at or past valid_rows stay untouched in core_out and do not advance
+///      S or history;
+///   3. a negative control (a/b bindings swapped) that must fail on numbers;
+///   4. end-to-end against the oracle for both phases plus a nonzero-prefix continuation.
 ///
-/// Bounds are per-case, from Q38Rules v1.1 §3: cases at >= 20k elements use the
-/// fraction term (5e-4) PLUS the case's own measured `scaled` basis; smaller cases
-/// use a COUNT bound (rec_m1: count <= 4). The terms are computed exactly as
-/// `wip/gdn_gate_cpu.cpp` does: BF16-rounded outputs, `scaled = max |d| / row-RMS`
-/// over (row, head) pairs whose REFERENCE row-RMS exceeds 1e-3 x the reference's
-/// median row-RMS; dead pairs are bounded by that floor; nothing falls back to the
-/// pooled maximum.
+/// Bounds are per-case: cases at >= 20k elements use the fraction term (5e-4) plus the case's
+/// own `scaled` basis; smaller cases use a count bound.
 #[cfg(test)]
 mod gpu_probe {
     use super::*;
@@ -1932,11 +1807,9 @@ mod gpu_probe {
     use cudarc::driver::{CudaSlice, DevicePtr};
     use std::path::PathBuf;
     const FLOOR_REL: f64 = 1e-3;
-    /// core_out marker for rows at or past valid_rows; a finite, exactly representable
-    /// value so a stray write is visible as inequality and not as a NaN comparison.
+    /// core_out marker for rows at or past valid_rows; finite.
     const TAIL_MARKER: f32 = 1234.0;
-    /// bf16 NaN (0x7FC0), written into input rows at or past valid_rows so a kernel that
-    /// processes them drags NaN into S/history and fails loudly.
+    /// bf16 NaN (0x7FC0), written into input rows at or past valid_rows.
     const NAN_BITS: u16 = 0x7FC0;
 
     #[derive(Clone)]
@@ -1948,7 +1821,7 @@ mod gpu_probe {
         nan: usize,
     }
 
-    /// The gate's comparator (wip/gdn_gate_cpu.cpp), on BF16-rounded values.
+    /// The gate's comparator, on BF16-rounded values.
     fn terms(got: &[bf16], reference: &[bf16], valid: usize) -> Terms {
         let heads = HV as usize;
         let dv = DV as usize;
@@ -2040,9 +1913,6 @@ mod gpu_probe {
                     .as_u64()
                     .unwrap_or(m["valid_rows"].as_u64().unwrap()) as u32,
                 scaled_bound: bounds["scaled_bound"].as_f64().unwrap(),
-                // The fixture declares degeneracy explicitly (v1.2 s3 requires it to be
-                // reported, not left as a 0 that reads like a tolerance). Fall back to
-                // `basis == 0` if an older manifest lacks the flag.
                 degenerate: bounds
                     .get("scaled_bound_degenerate")
                     .and_then(|v| v.as_bool())
@@ -2127,9 +1997,8 @@ mod gpu_probe {
         }))
     }
 
-    /// Build one case's device state. Rows at or past `valid` in the ROW-DIMENSIONED
-    /// inputs carry bf16 NaN and core_out carries the finite marker, so a kernel that
-    /// touches them is caught either way.
+    /// Build one case's device state: row-dimensioned inputs at or past `valid` carry bf16 NaN,
+    /// core_out carries the marker.
     fn build_case(device: &Device, man: Man) -> Result<Case> {
         let s = &device.stream;
         let cd = 10_240usize;
@@ -2293,23 +2162,12 @@ mod gpu_probe {
         Ok(())
     }
 
-    /// The per-case gate. Q38Rules v1.2 section 3, implemented exactly as written -- three
-    /// terms, and WHICH OF THEM BINDS is decided per case, not by this function:
+    /// The per-case gate, three terms:
+    ///   (a) COUNT: the per-case count bound below 20k elements; the fraction bound (<= 5e-4) at >= 20k.
+    ///   (b) SCALED against the case's own basis; informational when the basis is 0 and for rec_m1.
+    ///   (c) the dead-row absolute term against the floor; always binds.
     ///
-    ///   (a) COUNT. The per-case count bound from the self-spread, for cases below 20k
-    ///       elements; the pooled fraction bound (<= 5e-4) only at >= 20k.
-    ///   (b) SCALED, against EACH CASE's own basis. Informational, not a constraint, when the
-    ///       basis is 0 -- v1.2 is explicit that "a zero upper bound is a degenerate formula,
-    ///       not a constraint" and adds the generic rule that any case with basis 0 binds on
-    ///       COUNT alone -- and for the rec_m1 class, whose basis v1.2 records as
-    ///       "provisional/informational".
-    ///   (c) the dead-row absolute term against the floor. Always binds.
-    ///
-    /// The scaled comparison is `measured <= basis` in f64 with no tolerance, so equality at
-    /// %.17g is a PASS (v1.2 tie semantics). This function previously asserted `scaled <=
-    /// basis` unconditionally, which applied a STRICTER private rule than v1.2 for every
-    /// degenerate/count-bound case -- exactly the class of defect that made a correct kernel
-    /// read as defective.
+    /// The scaled comparison is `measured <= basis` in f64 with `RMS_ULP_TOL` relative slack.
     fn check_core(case: &str, man: &Man, got: &[bf16], reference: &[bf16]) -> Terms {
         let elems = man.valid * HV as usize * DV as usize;
         let t = terms(got, reference, man.valid);
@@ -2331,7 +2189,7 @@ mod gpu_probe {
         judge_with_rule(case, man, &t, frac, elems, &rule, scaled_informational)
     }
 
-    /// The three v1.2 terms, with the rule that judged them printed so a reader can audit it.
+    /// The three terms, with the rule that judged them printed.
     fn judge_with_rule(
         case: &str,
         man: &Man,
@@ -2379,16 +2237,10 @@ mod gpu_probe {
                 man.frac_bound.unwrap()
             );
         }
-        // (b) scaled -- only when v1.2 makes it a constraint
+        // (b) scaled, when it is a constraint
         if !scaled_informational {
-            // A few f64 ULPs of slack, and ONLY that. The basis is produced by torch and
-            // applied here in Rust; the row RMS is a 128-term f64 reduction on both sides, in
-            // different orders, so the two agree only to about one ULP of the result. Measured
-            // on prefill_m64: scaled 0.011376022967599604 against a basis of
-            // 0.011376022967599602 -- an excess of exactly 1.00 f64 ULP, 1.5e-16 relative,
-            // which is 2.6e13 x smaller than ONE BF16 ULP (2^-8). Any real numerical defect
-            // in this core is at least one BF16 ULP, so this admits arithmetic noise between
-            // two languages and nothing else. It does not relax the BF16-level bound.
+            // The basis and the measured row RMS are 128-term f64 reductions in different orders;
+            // the slack covers f64 rounding only.
             const RMS_ULP_TOL: f64 = 8.0 * f64::EPSILON;
             assert!(
                 t.scaled <= man.scaled_bound * (1.0 + RMS_ULP_TOL),
@@ -2410,10 +2262,8 @@ mod gpu_probe {
         dir
     }
 
-    /// Stage dumps for localisation: reads the plan's OWN workspace offsets (same
-    /// `GdnWorkspace::q38` the plan was built from) out of the scratch buffer after a
-    /// run and writes the valid rows of conv_out / q / k / v / beta_fp32 / g, plus the
-    /// final state S. Consumed by p1c/fixtures-binder/stage_and_core_check.py.
+    /// Stage dumps: reads the plan's own workspace offsets after a run and writes the valid rows
+    /// of conv_out / q / k / v / beta_fp32 / g, plus the final state S.
     fn dump_workspace(case: &Case, name: &str, s: &Arc<CudaStream>) -> Result<()> {
         let ws = GdnWorkspace::q38(&GdnSpec::q38(), case.man.plan_rows)?;
         let host = s.clone_dtoh(&case.scratch_buf)?;
@@ -2457,8 +2307,7 @@ mod gpu_probe {
             valid * hv * 4,
             dir.join(format!("gdn_ws_{name}_g.f32")),
         )?;
-        // S is a binding, not workspace, so it comes from the S buffer rather than the
-        // scratch region. The second core check needs it as the oracle's S0.
+        // S is read from its binding, not the scratch region.
         let svals = s.clone_dtoh(&case.dev_s)?;
         let mut sraw = Vec::with_capacity(svals.len() * 4);
         for x in &svals {
@@ -2491,7 +2340,7 @@ mod gpu_probe {
             }
         };
 
-        // ---- 4. end-to-end: every case against its own reference (and 2's tail differential)
+        // 4. end-to-end: every case against its own reference, plus case 2's tail differential
         for name in [
             "prefill_m64",
             "prefill_m1",
@@ -2499,8 +2348,6 @@ mod gpu_probe {
             "tail_m40of64",
             "prefix_cont",
         ] {
-            // Test-only selector so a single case can be isolated (e.g. under
-            // compute-sanitizer). When unset, every case runs.
             match std::env::var("FF_Q38_PROBE_ONLY") {
                 Ok(only) if only != name => continue,
                 _ => {}
@@ -2542,15 +2389,10 @@ mod gpu_probe {
             let reference = case.man.bf16("ref_core.bf16", elems);
             check_core(name, &case.man, got_valid, &reference);
 
-            // rows at or past valid_rows keep the marker exactly (tail case; for the
-            // other cases plan_rows == valid_rows so this is empty and skipped).
+            // Rows at or past valid_rows keep the marker exactly.
             let plan = case.man.plan_rows as usize;
             for (i, x) in got[elems..].iter().enumerate() {
-                // Compare BIT PATTERNS against the marker as it is stored. Comparing
-                // `|x - 1234.0| == 0` could never succeed: 1234.0 is not representable in
-                // BF16 (it rounds to 1232), so `bf16::from_f32(TAIL_MARKER)` -- the value
-                // build_case actually writes -- never compares equal to TAIL_MARKER. This
-                // assertion was latent: every earlier run failed before reaching it.
+                // Compare bit patterns against the stored BF16 marker; TAIL_MARKER is not representable in BF16.
                 assert_eq!(
                     x.to_bits(),
                     bf16::from_f32(TAIL_MARKER).to_bits(),
@@ -2595,7 +2437,7 @@ mod gpu_probe {
             }
         }
 
-        // ---- 1. phase contract on ONE input: Prefill-M1 vs Decode-M1
+        // 1. phase contract on one input: Prefill-M1 vs Decode-M1
         {
             let man = Man::load("prefill_m1");
             let case = build_case(&device, man)?;
@@ -2625,11 +2467,8 @@ mod gpu_probe {
                 &ref_chunked,
             );
 
-            // REBUILD the case for the Decode leg. `build_case` allocates dev_s and dev_hist
-            // ONCE and `GdnOps::run` advances them in place, so reusing `case` here made the
-            // Decode run start from the state the Prefill run left, while `ref_core_other` was
-            // computed from the fixture's own s_init/hist_init. That compared two different
-            // inputs: ndiff was 6138 of 6144. Both phases must start from the same state.
+            // Rebuild the case for the Decode leg: `run` advances dev_s and dev_hist in place, and both
+            // phases start from the fixture's initial state.
             let case2 = build_case(&device, Man::load("prefill_m1"))?;
             run_case(
                 &device,
@@ -2638,8 +2477,7 @@ mod gpu_probe {
                 ExecutionPhase::Decode,
                 false,
             )?;
-            // Distinct dump name: the second phase overwrites the scratch buffer, and the
-            // host-side second core check needs BOTH phases' stages.
+            // Distinct dump name: the second phase overwrites the scratch buffer.
             dump_workspace(&case2, "prefill_m1_decode", s)?;
             let got_rec = s.clone_dtoh(&case2.dev_core)?;
             let dir = dump_dir();
@@ -2656,14 +2494,8 @@ mod gpu_probe {
                 m
             };
             check_core("phase:decode_m1", &man_rec, &got_rec[..elems], &ref_rec);
-            // The phase contract, asserted on the PATH TAKEN rather than on the numbers.
-            // These two used to be compared for a difference, and that assertion can never
-            // pass: with one live row the chunked path has T=I and computes exactly the
-            // recurrent recurrence, so Prefill-M1 and Decode-M1 agree BITWISE (measured:
-            // 0 of 6144 elements differ). Identical output therefore proves nothing about
-            // which kernel ran, which is the very failure this check exists to catch -- if
-            // `run` branched on a host valid_rows, Prefill-M1 would quietly take the
-            // recurrent path and still match. The log records the arm actually selected.
+            // The phase contract is asserted on the path taken: at M=1 both cores compute the same
+            // recurrence, so outputs cannot distinguish them.
             let log = take_phase_log();
             let last_two: Vec<&str> = log.iter().rev().take(2).rev().copied().collect();
             println!("  phase contract: cores selected = {log:?}");
@@ -2684,7 +2516,7 @@ mod gpu_probe {
             );
         }
 
-        // ---- 3. silent negative control: a/b swapped must FAIL the same comparison
+        // 3. negative control: a/b swapped must fail the same comparison
         {
             let man = Man::load("prefill_m64");
             let case = build_case(&device, man)?;

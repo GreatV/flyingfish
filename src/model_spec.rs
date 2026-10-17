@@ -156,8 +156,7 @@ fn eos(v: &Value, vocab: u32) -> Result<Vec<u32>> {
     Ok(out)
 }
 impl ModelSpec {
-    /// Compatibility metadata for the public model/CLI surface. Qwen execution
-    /// uses ModelSpec; this does not relax Config::read's Llama validation.
+    /// `Config` view for the model/CLI surface; does not relax Config::read's Llama validation.
     pub fn config(&self) -> crate::config::Config {
         crate::config::Config {
             model_type: match self.architecture {

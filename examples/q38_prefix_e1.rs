@@ -1,7 +1,4 @@
-//! Exact Qwen3.8 hybrid-prefix save/poison/restore experiment.
-//!
-//! Build with the CUDA feature and run only under a 4d GPU grant.  The CPU
-//! legs still compile this example, but exit with an explicit backend error.
+//! Exact Qwen3.8 hybrid-prefix save/poison/restore; without `cuda` it exits with a backend error.
 
 #[cfg(feature = "cuda")]
 use anyhow::Context;

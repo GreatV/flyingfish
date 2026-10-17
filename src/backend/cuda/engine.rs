@@ -229,8 +229,7 @@ impl Work {
     }
 
     /// add_rmsnorm plus the DSpark capture mirror of the residual stream it
-    /// just wrote: capture[row][slot * hidden + d] = x[row][d]. Replaces the
-    /// separate 2D device-to-device column copy for capture layers.
+    /// just wrote: capture[row][slot * hidden + d] = x[row][d].
     fn add_norm_capture(
         &mut self,
         ops: &Ops,
@@ -1226,10 +1225,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Host-side validation for the tree step. The metadata kernel is no longer
-    /// launched here: prepare_embed_norm (the Embed operator, which this always
-    /// precedes) writes ids/positions/slots/snapshot in the same launch as the
-    /// embedding gather and the layer-0 norm.
+    /// Host-side validation for the tree step; the Embed operator writes the tree metadata.
     fn prepare_tree(&mut self, step: crate::backend::Step<'_>) -> Result<()> {
         self.spec_budget
             .check_tree(step, self.position, self.capacity)?;
@@ -1491,10 +1487,7 @@ impl Engine {
         let layer = &self.weights.layers[i];
         match op {
             crate::backend::Operator::Embed => {
-                // Fused gather + layer-0 RMSNorm: the Embed operator is always
-                // the step's first call and always immediately precedes layer 0,
-                // whose first operator is Norm, so the two launches belong in
-                // one. On the tree path prepare() joins the same launch.
+                // Fused gather + layer-0 RMSNorm; Embed immediately precedes layer 0's Norm.
                 if is_tree {
                     let tree = self
                         .spec
@@ -1532,8 +1525,7 @@ impl Engine {
                 trace_value(trace, s, "embed", &w.x, trace_rows, h)?;
             }
             crate::backend::Operator::Norm => {
-                // The layer-0 norm is folded into Embed above; for every other
-                // layer the Norm operator has no work.
+                // The layer-0 norm runs in Embed; Norm has no work on other layers.
             }
             crate::backend::Operator::Qkv => {
                 self.blas
@@ -1552,8 +1544,7 @@ impl Engine {
                 }
             }
             crate::backend::Operator::RopeKv => unsafe {
-                // Fused rotation + KV write: one launch over rows x 20 heads x
-                // (head_dim/2) element pairs, replacing (rope, kv_write).
+                // Fused rotation + KV write over rows x heads x (head_dim/2) element pairs.
                 let kv = &mut self.state.kv[i];
                 s.launch_builder(&self.ops.rope_kv)
                     .arg(&mut w.qkv)
@@ -1644,8 +1635,7 @@ impl Engine {
                     && let Some(slot) =
                         crate::dspark::capture_slot(&spec.draft.config.target_layer_ids, i)
                 {
-                    // Capture layer: the residual stream this writes is the
-                    // capture source, so the copy is folded into the norm.
+                    // Capture layer: the capture copy is folded into the norm.
                     w.add_norm_capture(
                         &self.ops,
                         s,
@@ -1786,11 +1776,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Explicitly destroy resident state for the E1 restore experiment.
-    ///
-    /// This deliberately has no silent fallback and is not a production cache
-    /// eviction API.  It makes the subsequent restore prove that every prefix
-    /// byte came from the host package rather than remaining resident.
+    /// Destroys resident state before a prefix restore; not a cache eviction API.
     #[doc(hidden)]
     pub fn poison_state_for_prefix_e1(&mut self) -> Result<()> {
         self.device.stream.synchronize()?;
@@ -2552,8 +2538,7 @@ impl Engine {
                 "injected capture end failure"
             );
             let graph = captured?.context("empty decode graph")?;
-            // end_capture also instantiates; injection here exercises disposal
-            // of that local graph and rollback before it can be published.
+            // end_capture also instantiates; the injection exercises disposal and rollback before publish.
             #[cfg(test)]
             ensure!(
                 self.capture_fail_stage != Some(CaptureFault::Instantiate),

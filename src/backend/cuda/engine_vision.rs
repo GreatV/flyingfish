@@ -1361,8 +1361,7 @@ mod tests {
             };
             let ln = decode(&raw[..bytes]);
             let gelu = decode(&raw[bytes..]);
-            // Replay fc1 because its output is overwritten by the in-place GELU.
-            // Its regenerated activation must equal the production scratch bits.
+            // GELU overwrites fc1 in place; the replayed fc1 must equal the production scratch bits.
             let ln_device = s.clone_htod(&ln)?;
             let fc1_device = s.alloc_zeros::<bf16>(host.len())?;
             m.fc1.run(

@@ -428,8 +428,7 @@ fn coefficients(input: usize, output: usize) -> Vec<(usize, Vec<f64>)> {
         .collect()
 }
 
-// V5 tensor-resize parity bounds: resized u8 <= 2, FP32 <= 4/255 + 4*EPS,
-// BF16 <= that bound + 1/256; non-resized inputs are bit-exact.
+// Tensor-resize parity bounds: resized u8 <= 2, FP32 <= 4/255 + 4*EPS, BF16 <= that + 1/256; else bit-exact.
 fn resize_bicubic(image: &RgbImage, width: usize, height: usize) -> Vec<u8> {
     let horizontal = if width == image.width {
         image.pixels.clone()

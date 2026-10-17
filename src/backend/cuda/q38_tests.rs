@@ -1,4 +1,4 @@
-//! Explicit-window GPU probes. Default cargo test never initializes a GPU here.
+//! GPU probes. Default cargo test never initializes a GPU here.
 use super::{
     Device,
     attention_d256::{AttentionBindings, D, FullAttentionOps, GQA, HKV, HQ, PositionBindings},

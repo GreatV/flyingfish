@@ -7,8 +7,7 @@ const HK: u32 = 16;
 const DK: u32 = 128;
 const DV: u32 = 128;
 
-/// Largest prefill step the MTP-verify small plans cover. Steps of more rows take the
-/// chunkwise-P1 core on a qualified device.
+/// Largest prefill step the MTP-verify small plans cover.
 pub const MIN_VERIFY_ROWS: u32 = 4;
 
 /// Chunkwise P1 core shared-memory bytes per split, from `kernels/gdn/gdn_cw_p1_layout.h`.
@@ -16,8 +15,7 @@ pub mod cw_p1 {
     include!(concat!(env!("OUT_DIR"), "/gdn_cw_p1_shared.rs"));
 }
 
-/// Chunkwise-P2 split arena and workspace-slot bytes, from
-/// `kernels/gdn/gdn_cw_p2_layout.h`.
+/// Chunkwise-P2 split arena and workspace-slot bytes, from `kernels/gdn/gdn_cw_p2_layout.h`.
 pub mod cw_p2 {
     include!(concat!(env!("OUT_DIR"), "/gdn_cw_p2_shared.rs"));
 }
@@ -26,10 +24,7 @@ pub mod cw_p2 {
 pub const CW_P2_CHUNK: u32 = 64;
 /// Value columns per stage-H CTA and per stage-O tile, P1's s4 strip width.
 pub const CW_P2_VALUE_BLOCK: u32 = 32;
-/// The chunkwise-P2 workspace slot of one (chunk, head), in kernel byte order, with the
-/// writing stage: `W` bf16[64,128], `U` fp32[64,128], `qk` bf16[64,72] (row stride
-/// `P1_T_LD`, so stage H reads it with `p1_a_sbf` in place), then the FP32[64] vectors
-/// `Gc`, `Be`, `Sc`.
+/// One (chunk, head) chunkwise-P2 slot in kernel byte order: (field, bytes, writing stage); `qk` row stride is `P1_T_LD`.
 pub const CW_P2_SLOT: [(&str, u64, char); 6] = [
     ("W", 64 * 128 * 2, 'A'),
     ("U", 64 * 128 * 4, 'A'),
@@ -61,9 +56,7 @@ const _: () = assert!(
     "the chunkwise-P2 slot fields and gdn_cw_p2_layout.h disagree"
 );
 
-/// The chunkwise-P2 workspace for `max_rows`: one slot per (chunk, head), C = 64 rows to
-/// a chunk and 48 value heads, so ceil(rows/64) * 48 slots of 141,056 B -- 2204 B per row
-/// per head, 105,792 B per row across the 48 heads, with the tail chunk rounded up whole.
+/// The chunkwise-P2 workspace for `max_rows`: one slot per (chunk, value head), ceil(rows/64) * 48 slots.
 pub const fn cw_p2_bytes(max_rows: u32) -> u64 {
     let chunks = if max_rows == 0 {
         0
@@ -73,8 +66,7 @@ pub const fn cw_p2_bytes(max_rows: u32) -> u64 {
     chunks as u64 * 48 * CW_P2_SLOT_BYTES
 }
 
-/// The chunkwise-P2 stage ABI: field order IS the argument order of both
-/// entries, as declared in `kernels/gdn/gdn_cw_p2.cu`.
+/// The chunkwise-P2 stage ABI: field order is the argument order in `kernels/gdn/gdn_cw_p2.cu`.
 #[derive(Copy, Clone)]
 pub struct P2StageArgs {
     /// BF16 [M, 16, DK] key heads; the stages expand to the 48 value heads.
@@ -100,11 +92,9 @@ pub struct P2StageArgs {
 /// Immutable device qualification; no runtime GPU query or tuning in a forward.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct GdnPolicy {
-    /// Protocol §A value split of the production chunkwise-P1 prefill core, 0 = the
-    /// shipped recursive core; qualified for arch 89 with 128 SMs, 0 elsewhere.
+    /// Value split of the chunkwise-P1 prefill core; 0 = the recursive core.
     prefill_p1_split: u32,
-    /// The chunkwise-P2 split (two kernels over a workspace slot) replaces the fused
-    /// P1 core; prepared for arch 89 with 128 SMs.
+    /// The chunkwise-P2 split (two kernels over a workspace slot) in place of the fused P1 core.
     cw_p2: bool,
 }
 impl GdnPolicy {
@@ -112,7 +102,6 @@ impl GdnPolicy {
         prefill_p1_split: 0,
         cw_p2: false,
     };
-    /// The chunkwise-P2 split.
     pub const P2: Self = Self {
         prefill_p1_split: 0,
         cw_p2: true,
@@ -123,13 +112,11 @@ impl GdnPolicy {
             cw_p2: arch == 89 && sms == 128,
         }
     }
-    /// The device's prepared chunkwise-P1 value split; `p1_split_for_step` is the
-    /// per-step decision.
+    /// The device's chunkwise-P1 value split; `p1_split_for_step` is the per-step decision.
     pub const fn prefill_p1_split(self) -> u32 {
         self.prefill_p1_split
     }
-    /// The split a prefill step of `step_rows` rows carries: steps above
-    /// MIN_VERIFY_ROWS take the chunkwise core, 1..=MIN_VERIFY_ROWS keep split 0.
+    /// Steps above MIN_VERIFY_ROWS take the chunkwise core; 1..=MIN_VERIFY_ROWS keep split 0.
     pub const fn p1_split_for_step(self, step_rows: u32) -> u32 {
         if step_rows > MIN_VERIFY_ROWS {
             self.prefill_p1_split
@@ -137,12 +124,10 @@ impl GdnPolicy {
             0
         }
     }
-    /// Whether a prefill step of `step_rows` rows carries the chunkwise-P2 split, on the
-    /// same verify floor as `p1_split_for_step`.
+    /// Whether a step of `step_rows` rows takes the chunkwise-P2 split; same floor as `p1_split_for_step`.
     pub const fn cw_p2_for_step(self, step_rows: u32) -> bool {
         self.cw_p2 && step_rows > MIN_VERIFY_ROWS
     }
-    /// The plan id.
     pub const fn identity(self) -> &'static str {
         if self.cw_p2 {
             "gdn-plan-v3-c32-vs1-fp32-p2-w32"
@@ -164,39 +149,26 @@ impl GdnPolicy {
     }
 }
 
-/// One named region of the single Engine slice. The binder defines its layout
-/// and allocates no workspace of its own.
+/// One named region of the single Engine slice; the binder allocates no workspace of its own.
 #[derive(Clone, Copy, Debug)]
 pub struct Region {
     pub offset: u64,
     pub bytes: u64,
 }
 
-/// The GDN workspace. Every intermediate the binder produces is listed here with
-/// its own offset, so the Engine never has to guess and never hard-codes a total.
-///
-/// `workspace()` is the ONLY source of the Engine's byte accounting. The Engine
-/// binds prefill and decode plans, and shares ONE scratch sized to the largest complete
-/// layout, as it does for HD256. Nothing here depends on `prepare` having run.
+/// Every GDN binder intermediate with its own offset; the only source of the GDN workspace bytes.
 #[derive(Clone, Copy, Debug)]
 pub struct GdnWorkspace {
-    /// `[R, conv_dim]` BF16 — the conv result, then SiLU'd IN PLACE. ABI §5: the
-    /// conv output cast may not be elided; the common `silu` reads and writes BF16
-    /// over the same bytes, so there is no separate `act` region.
+    /// `[R, conv_dim]` BF16 — the conv result, SiLU'd in place; there is no `act` region.
     pub conv_out: Region,
     /// `[R, 16, 128]` BF16 — Q after `l2_heads`, KEY heads, before the widen.
     pub q_bf16: Region,
     /// `[R, 16, 128]` BF16 — K after `l2_heads`, KEY heads.
     pub k_bf16: Region,
-    // There is deliberately no `v_bf16` region, and its absence is deliberate rather than an
-    // oversight: V is never transformed (ABI section 5 norms Q and K only), so it is not an
-    // intermediate. `gdn_prep_fp32` reads it in place from the V columns of `conv_out`,
-    // whose row stride is conv_dim, which is why that kernel takes an explicit
-    // `v_row_stride`. Declaring the region would have been a dead 20,480 B/row.
+    // No `v_bf16` region: `gdn_prep_fp32` reads V in place from `conv_out` at row stride conv_dim.
     /// `[R, 48]` BF16 — `beta = BF16(sigmoid(b))`, as emitted by `gdn_gates`.
     pub beta: Region,
-    /// `[R, 48]` FP32 — the exact, value-preserving widen of `beta`. Both cores
-    /// declare `const float* beta`, so this widen is required, not optional.
+    /// `[R, 48]` FP32 — the exact widen of `beta`; both cores read `const float* beta`.
     pub beta_fp32: Region,
     /// `[R, 48]` FP32 — `g = -exp(A_log) * softplus(a + dt_bias)`.
     pub g: Region,
@@ -222,13 +194,7 @@ fn align(n: u64) -> Result<u64> {
 }
 
 impl GdnWorkspace {
-    /// CPU-only checked sizing: reads no GPU state and allocates nothing.
-    ///
-    /// `max_rows` is a WORKSPACE capacity, not a device row count. `prefix` and
-    /// `capacity` are per-call and arrive in `GdnMeta`; there is deliberately no
-    /// `capacity >= prefix + max_rows` check here, because `prepare` has no
-    /// `meta` and the real device-side condition is
-    /// `capacity >= prefix + valid_rows` with `valid_rows <= max_rows`.
+    /// CPU-only checked sizing; `max_rows` is a workspace capacity, not a device row count.
     pub fn q38(spec: &GdnSpec, max_rows: u32) -> Result<Self> {
         spec.validate()?;
         ensure!(max_rows > 0, "GDN max_rows must be positive");
@@ -239,8 +205,6 @@ impl GdnWorkspace {
         let hk = u64::from(HK);
         let dk = u64::from(DK);
 
-        // Every region is [rows, heads, dim]; the per-row byte count is heads*dim*elem.
-        // `act` is absent: the common silu runs in place over `conv_out`.
         let hd_dv = mul(hd, dv)?;
         let hk_dk = mul(hk, dk)?;
         let sizes = [
@@ -287,8 +251,6 @@ impl GdnWorkspace {
 mod tests {
     use super::*;
 
-    /// The stage ABI declaration and the argument counts must agree with each other: the
-    /// struct carries ten fields, A pushes all ten, and H and O push nine (no V stride).
     #[test]
     fn every_prefill_step_above_the_verify_floor_takes_the_chunkwise_core() {
         let qualified = GdnPolicy::for_device(89, 128);

@@ -1,8 +1,6 @@
 use super::{Device, cubin, linear_calibrate, ops::Ops};
 
-/// Uniform number of cuBLASLt heuristic candidates per linear shape: every
-/// shape trials CublasLt(0..LT_CANDIDATES) plus Skinny; calibration picks
-/// per shape; calibration considers two Lt heuristic candidates.
+/// cuBLASLt heuristic candidates trialled per linear shape, alongside Skinny.
 pub const LT_CANDIDATES: u32 = 2;
 
 unsafe fn heuristic_algos(
@@ -185,8 +183,7 @@ impl Plan {
         p.c = lt::create_matrix_layout(dtype, output as u64, rows as u64, output as i64)?;
         p.pref = lt::create_matmul_pref()?;
         unsafe {
-            // Split-K bias epilogues can round the reduced output before bias.
-            // Keep biased plans single-pass to preserve BeforeOutputRound.
+            // Biased plans are single-pass; split-K bias epilogues round before bias.
             let reduction_mask = if bias.is_some() {
                 sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_NONE as u32
             } else {
@@ -276,9 +273,7 @@ pub struct Blas {
     closure: Rc<super::closure::Closure>,
 }
 
-/// Only the paths that cast dimensions to i32 are bounded here: the M1 legacy
-/// cuBLAS branch and the skinny kernel. The cuBLASLt path passes rows, output
-/// and input as u64/i64 layouts and is not bounded.
+/// Bounds the i32-cast paths (rows == 1 cuBLAS and skinny); the cuBLASLt path passes u64/i64 layouts.
 fn checked_dims(rows: usize, output: usize, input: usize) -> Result<()> {
     ensure!(
         rows > 0
@@ -522,8 +517,7 @@ impl Blas {
             input,
         } = shape;
         if rows == 1 {
-            // This branch casts the dimensions to i32; the Lt path below passes
-            // u64/i64 layouts and is unbounded.
+            // This branch casts the dimensions to i32.
             checked_dims(rows, output, input)?;
             let cfg = GemmConfig {
                 transa: bs::cublasOperation_t::CUBLAS_OP_T,
@@ -737,8 +731,7 @@ impl Blas {
 }
 
 impl Blas {
-    /// Bind a BF16 bias epilogue before run/capture. The stable bias pointer is
-    /// part of the plan key; descriptor mutation is never needed during run.
+    /// Binds a BF16 bias epilogue before run/capture; the bias pointer is part of the plan key.
     pub(crate) fn prepare_biased(
         &mut self,
         rows: u32,
@@ -868,10 +861,7 @@ impl Blas {
 mod tests {
     use super::*;
 
-    /// Only the paths that cast dimensions to i32 are guarded: the M1 legacy cuBLAS
-    /// branch and the skinny kernel. The cuBLASLt path passes rows, output and input
-    /// as u64/i64 and is deliberately unbounded, so a large multi-row shape never
-    /// reaches this check.
+    /// Only the i32-cast paths (rows == 1 cuBLAS and skinny) are bounded.
     #[test]
     fn linear_dimensions_must_fit_i32() {
         checked_dims(1, 5120, 17408).expect("Q38 M1 shape");

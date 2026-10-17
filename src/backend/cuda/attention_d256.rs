@@ -1,23 +1,7 @@
-//! HD256 full attention for Qwen3.8-27B (ABI v1 §4).
+//! HD256 full attention (24 Q heads, 4 KV heads, head_dim 256); the output sigmoid gate is the caller's.
 //!
-//! Shape is fixed by [`FullAttentionSpec::q38`]: 24 Q heads, 4 KV heads, GQA 6,
-//! head_dim 256, scale 1/16. The CUDA side is `kernels/tcmqa_d256.cu`: split
-//! Q/gate, partial RoPE on Q, RoPE+scatter on K, scatter on V, then the
-//! narrow-tile (64-row, KT=32, 128-thread) phase 1 and its phase-2 merge.
-//!
-//! `run` is allocation-free and same-stream, in the ABI §4.2 order: split
-//! Q/gate -> common Q/K norm -> partial RoPE and KV scatter -> segmented
-//! attention. The Q/K norms are the common [`NormOps`]; this module does not
-//! duplicate them, and it does not apply the output sigmoid gate (the caller's
-//! `GateOps::sigmoid_mul` produces `gated_out`, and the o_projection consumes
-//! the flattened 6144 width).
-//!
-//! Prefill rows are processed in segments of at most `SEG_MAX` rows. The segment
-//! count is `ceil(max_rows / segment_rows)` and depends only on the plan, never
-//! on the device `valid_rows`, so a captured Graph replays an identical launch
-//! sequence as the position advances. Every kernel reads `prefix` and
-//! `valid_rows` from the device `SequenceMeta`, and a segment with no live rows
-//! writes nothing.
+//! `run` order: split Q/gate -> common Q/K norm -> partial RoPE and KV scatter -> segmented attention.
+//! The segment count `ceil(max_rows / segment_rows)` is fixed by the plan, independent of device `valid_rows`.
 
 use super::contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut};
 use super::cubin;
@@ -46,22 +30,15 @@ const PHASE1_SMEM: u32 = 68096;
 const MASK_LEN: u32 = 64;
 const RMS_EPS: f32 = 1e-6;
 
-/// The ABI §4.1 views. Every field carries an explicit stride and span; the
-/// Where the RoPE coordinates come from. `Linear` uses the physical position
-/// `prefix + row` from the device SequenceMeta — the only source before the
-/// vision path existed. `Axes` reads each query row's (T, H, W) coordinate from
-/// `table` (`[max_rows, 3]` i32, row-major): a multimodal prompt rotates a row
-/// by its own axis coordinate while the KV cache slot and the causal key count
-/// stay the physical position. With T = H = W the two branches must agree
-/// bitwise; that degenerate case is the three-axis gate.
+/// RoPE coordinate source: `Linear` = physical `prefix + row`; `Axes` = per-row (T, H, W) from a
+/// `[max_rows, 3]` i32 table. KV slot and causal key count stay physical; T = H = W matches `Linear` bitwise.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PositionBindings {
     Linear,
     Axes(Tensor<i32, 2>),
 }
 
-/// binder validates them against the registered layout rather than assuming a
-/// row width from `hidden`.
+/// Attention views; each carries an explicit stride and span validated against the registered layout.
 #[derive(Debug)]
 pub(crate) struct AttentionBindings {
     pub compact: Option<super::state::CacheView>,
@@ -198,8 +175,7 @@ fn check_limits(limits: AttentionLimits) -> Result<()> {
         limits.key_chunk <= limits.capacity,
         "key_chunk exceeds capacity"
     );
-    // The KV cache head stride reaches the kernels as a 32-bit element count,
-    // and the key-partition start is computed in 32-bit.
+    // The kernels take the KV head stride and key-partition start as 32-bit.
     ensure!(
         u64::from(limits.capacity) * u64::from(D) <= i32::MAX as u64,
         "KV cache head stride exceeds the kernel's 32-bit stride"
@@ -317,9 +293,7 @@ impl FullAttentionOps {
         let max_parts = u32::try_from(ws.max_parts)?;
         ensure!(segment_rows <= SEG_MAX, "segment rows exceed the pair tile");
 
-        // Phase 2 indexes `sm[0 .. 2*Pactive + blockDim.x)`, and Pactive <= max_parts,
-        // so the launch is sized for max_parts. Launching it with no dynamic shared
-        // memory faults on the first write to the reduction slot.
+        // Phase 2 indexes `sm[0 .. 2*Pactive + blockDim.x)` with Pactive <= max_parts.
         let phase2_smem = u32::try_from(
             (2 * u64::from(max_parts) + u64::from(PHASE2_THREADS))
                 .checked_mul(4)
@@ -366,8 +340,6 @@ impl FullAttentionOps {
                 )?;
                 }
             }
-            // The coordinate source picks the RoPE entries; the plan stores which
-            // one it bound, so `run` never re-decides.
             let (rope_q_entry, rope_k_entry) = match &bindings.positions {
                 PositionBindings::Linear => ("tcmqa_d256_rope_q", "tcmqa_d256_rope_k_scatter"),
                 PositionBindings::Axes(_) => {
@@ -431,9 +403,7 @@ impl FullAttentionOps {
         })
     }
 
-    /// Scratch bytes the preprocess chain alone needs: the out-of-place K-norm
-    /// temp, which sits at the end of the full workspace at the same offset, so
-    /// a caller that runs no TCMQA phases can size an arena from this.
+    /// Scratch bytes of the preprocess chain alone: the K-norm temp at the end of the full workspace.
     pub(crate) fn preprocess_workspace(limits: AttentionLimits) -> Result<WorkspaceReq> {
         check_limits(limits)?;
         let ws = AttentionWorkspace::q38(limits.max_rows, limits.capacity, limits.key_chunk)?;
@@ -443,12 +413,7 @@ impl FullAttentionOps {
         })
     }
 
-    /// Allocation-free, same-stream preprocess over the device `valid_rows`
-    /// rows: Q/gate split, the common Q and K zero-centred norms, partial RoPE
-    /// on Q, and RoPE + scatter of K and V into the head-major caches. On return
-    /// `q`, `gate` and both caches hold this chunk, and `run` can continue with
-    /// the TCMQA phases or another attention. `scratch` holds only the K-norm
-    /// temp (see `preprocess_workspace`).
+    /// Allocation-free, same-stream preprocess over device `valid_rows`; `scratch` holds only the K-norm temp.
     pub(crate) fn preprocess(
         plan: &FullAttentionPlan,
         stream: &Arc<CudaStream>,
@@ -469,7 +434,6 @@ impl FullAttentionOps {
         let k_tmp = scratch.ptr;
         let k_tmp_span = u64::from(rows) * u64::from(HKV) * u64::from(D) * elem;
 
-        // 1. split the packed Q/gate projection into independent Q and gate views
         unsafe {
             stream
                 .launch_builder(&plan.kernels.qg_split)
@@ -483,9 +447,7 @@ impl FullAttentionOps {
                 .launch(plan.split_cfg)?;
         }
 
-        // 2. common Q norm in place, common K norm out of place into the
-        //    workspace temp. RowDomain carries the device meta, so the common
-        //    kernels bound their work by valid_rows rather than by max_rows.
+        // Q norm in place; K norm out of place into the workspace temp.
         let domain = RowDomain {
             meta,
             row_base: 0,
@@ -556,9 +518,7 @@ impl FullAttentionOps {
             return Ok(());
         }
 
-        // 3. partial RoPE on Q; RoPE + scatter on the normalised K; scatter V.
-        //    The linear branch rotates by the physical position; the axes branch
-        //    reads (T, H, W) per row. Both keep the cache slot at `prefix + r`.
+        // Both coordinate branches keep the cache slot at `prefix + r`.
         match &b.positions {
             PositionBindings::Linear => unsafe {
                 stream
@@ -612,8 +572,7 @@ impl FullAttentionOps {
         Ok(())
     }
 
-    /// Allocation-free, same-stream forward over the device `valid_rows` rows:
-    /// the preprocess chain, then the segmented TCMQA attention.
+    /// Allocation-free, same-stream forward over device `valid_rows`: preprocess, then segmented attention.
     pub(crate) fn run(
         plan: &FullAttentionPlan,
         stream: &Arc<CudaStream>,
@@ -636,8 +595,6 @@ impl FullAttentionOps {
         let p_max = scratch.ptr + plan.ws.p_max;
         let p_sum = scratch.ptr + plan.ws.p_sum;
         let p_out = scratch.ptr + plan.ws.p_out;
-        // The K-norm temp sits at the end of the op's workspace; preprocess gets
-        // a scratch whose base is that offset.
         Self::preprocess(
             plan,
             stream,
@@ -648,9 +605,7 @@ impl FullAttentionOps {
             },
         )?;
 
-        // 4. segmented attention. Segments run in order on one stream and reuse
-        //    the single partials region; the launch count is fixed by the plan,
-        //    and a segment past the device valid_rows exits without writing.
+        // Segments share one partials region; a segment past device valid_rows writes nothing.
         let q_row_bytes = b.q.0.stride[0] * elem;
         let out_row_bytes = b.core_out.0.stride[0] * elem;
         for segment in 0..plan.segments {
@@ -734,45 +689,23 @@ impl FullAttentionPlan {
 
 #[cfg(test)]
 mod tests {
-    //! GPU probe for the binder itself: `workspace` -> `prepare` -> `run` through
-    //! the real launch path, including the common `NormOps`.
-    //!
-    //! The kernel numerics are covered by the G4 harness. What this adds is the
-    //! plumbing: cudarc marshals launch arguments at run time from the kernel's
-    //! signature, so a wrong argument order or width yields a wrong answer or a
-    //! fault, and nothing else in the tree would notice. This is also the only
-    //! place the Q/K norm is exercised through this module.
-    //!
-    //! `#[ignore]`-gated because it initialises a device:
-    //!   FF_Q38_GPU_WINDOW=granted cargo test --features cuda --lib \
-    //!     attention_d256 -- --ignored --nocapture
+    //! GPU probe of `workspace` -> `prepare` -> `run` through the real launch path, including the common `NormOps`.
     use super::*;
     use crate::backend::cuda::Device;
     use crate::op_contract::SequenceMeta;
     use cudarc::driver::{CudaSlice, DevicePtr};
 
-    /// The model's RoPE constants live in the kernel, so the reference states
-    /// them again rather than importing them.
+    /// The kernel's RoPE constants.
     const ROTARY: usize = 64;
     const THETA: f32 = 1.0e7;
     /// 1/sqrt(256), the scale the kernel applies to the QK scores.
     const SCALE: f32 = 0.0625;
 
     /// One bf16 ulp, relative to a value's own magnitude.
-    ///
-    /// This is the floor for any comparison where *both* sides are
-    /// bf16-representable, which is the case here: the reference applies the
-    /// same visible casts the kernels do, so its residual against its own bf16
-    /// rounding is zero by construction and cannot serve as a floor. One ulp can
-    /// genuinely separate two correct results, because the common norm ends in
-    /// `rsqrtf` (~2 ulp) where the reference takes a `sqrt`, and a value sitting
-    /// near a rounding boundary then lands one step away. Measured, not assumed:
-    /// the Q path lands at 3.1e-3, i.e. 0.8 ulp, against the 3.125e-2 bound.
-    /// (The G4 harness's floor is half an ulp because its reference is pure fp32.)
     const BF16_ULP: f32 = 1.0 / 256.0;
     const BINDER_BOUND: f32 = 8.0 * BF16_ULP;
 
-    /// Deterministic xorshift, so both shapes and any rerun see the same bytes.
+    /// Deterministic xorshift.
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> f32 {
@@ -839,11 +772,7 @@ mod tests {
         prefix_v: &'a [bf16],
     }
 
-    /// The whole ABI §4.2 run order in fp32, with the model's visible bf16 casts
-    /// applied where the kernels apply them: after the zero-centred norm and
-    /// after RoPE. P is rounded to bf16 before it multiplies V, as the MMA does.
-    /// The QK reduction and the softmax stay fp32, so this is the same reference
-    /// the G4 harness uses, just on the test's own inputs.
+    /// FP32 reference of the `run` order with bf16 casts after the norm, after RoPE and on P before PV.
     struct Reference {
         prefix: usize,
         valid_rows: usize,
@@ -957,9 +886,7 @@ mod tests {
         }
     }
 
-    /// What one `run_shape` call runs: the geometry, the optional Axes table
-    /// (`None` is the linear physical-position path) and whether the fp32
-    /// reference — which models physical positions — is a valid oracle for it.
+    /// One `run_shape` case; `axes: None` is the linear path; `oracle` marks the fp32 reference valid.
     struct Case<'a> {
         prefix: u32,
         valid_rows: u32,
@@ -979,10 +906,7 @@ mod tests {
         v_cache: Vec<bf16>,
     }
 
-    /// One full `workspace` -> `prepare` -> `run` cycle on one shape, checked
-    /// against the reference under the same derived bound the G4 harness uses:
-    /// 8x the bf16 rounding floor of this reference, relative to its own scale.
-    /// Nothing is tuned here -- the floor is measured from the reference.
+    /// One `workspace` -> `prepare` -> `run` cycle, checked against the reference at `BINDER_BOUND`.
     fn run_shape(device: &Device, case: Case<'_>) -> Result<RunDump> {
         let Case {
             prefix,
@@ -1005,8 +929,7 @@ mod tests {
         ensure!(request.alignment == 256, "workspace alignment changed");
         let scratch_bytes = usize::try_from(request.bytes)?;
 
-        // ---- host inputs: both halves of Q, K and V carry signal, so a wrong
-        // head mapping or RoPE width cannot hide behind zeros.
+        // Both halves of Q, K and V carry nonzero signal.
         let mut rng = Rng(0x243F_6A88_5A30_8D3D ^ (u64::from(prefix) << 8) ^ u64::from(valid_rows));
         let (d, hq, hkv) = (D as usize, HQ as usize, HKV as usize);
         let q_gate: Vec<bf16> = (0..max_rows as usize * hq * 2 * d)
@@ -1019,9 +942,7 @@ mod tests {
         let prefix_k: Vec<bf16> = (0..hkv * prefix as usize * d).map(|_| rng.bf()).collect();
         let prefix_v: Vec<bf16> = (0..hkv * prefix as usize * d).map(|_| rng.bf()).collect();
 
-        // Caches are NaN past the visible extent: a read beyond it turns the
-        // output NaN rather than into a plausible small error, and rows at or
-        // past valid_rows must stay untouched.
+        // Caches and output are NaN past the visible extent.
         let nan = bf16::from_bits(0x7fc0);
         let mut k_cache = vec![nan; hkv * capacity as usize * d];
         let mut v_cache = vec![nan; hkv * capacity as usize * d];
@@ -1043,7 +964,6 @@ mod tests {
             })
             .collect();
 
-        // ---- device buffers ----------------------------------------------
         let dev_q_gate = stream.clone_htod(&q_gate)?;
         let dev_k = stream.clone_htod(&k_proj)?;
         let dev_v = stream.clone_htod(&v_proj)?;
@@ -1131,13 +1051,7 @@ mod tests {
         )?;
         stream.synchronize()?;
 
-        // ---- compare -----------------------------------------------------
-        // The split is pure data movement, so it is checked bitwise; the Q path
-        // is not, because the common norm ends in `rsqrtf` (~2 ulp) where the
-        // reference takes a `sqrt`, and a 2-ulp difference in the scale can flip
-        // a bf16 rounding on a value sitting on the boundary. Checking it under
-        // its own derived floor still isolates the stage without failing a
-        // kernel that is merely *differently* rounded.
+        // The gate split is checked bitwise; the Q path under `BINDER_BOUND`.
         let gate = stream.clone_dtoh(&dev_gate)?;
         let q_roped = stream.clone_dtoh(&dev_q)?;
         for row in 0..valid_rows as usize {
@@ -1232,12 +1146,11 @@ mod tests {
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window not acknowledged"
         );
-        // The environment selects the device ordinal for the GPU probe.
         let ordinal: usize = std::env::var("FF_Q38_GPU_ORDINAL")
             .unwrap_or_else(|_| "0".into())
             .parse()?;
         let device = Device::new(ordinal)?;
-        // m65: prefix 33, two segments -- both partials and the merge exercised.
+        // Two segments: partials and merge.
         run_shape(
             &device,
             Case {
@@ -1250,7 +1163,7 @@ mod tests {
                 oracle: true,
             },
         )?;
-        // replay17: max_rows 64 with only 17 live rows -- the graph-replay shape.
+        // 17 live rows of max_rows 64: the graph-replay shape.
         run_shape(
             &device,
             Case {
@@ -1264,12 +1177,7 @@ mod tests {
             },
         )?;
 
-        // ---- three-axis gate (VISION-WIRE item 2) -------------------------
-        // The degenerate Axes table (T = H = W = physical position) must be
-        // BIT-identical to the Linear path on the same shape: a wrong axis
-        // pointer, dispatch or launch would otherwise hide inside the reference
-        // bound. Then a non-degenerate table must move the output -- otherwise
-        // this would pass a build whose axes entries quietly ignore the table.
+        // T = H = W = physical Axes must be bit-identical to Linear; a shifted table must change the output.
         fn case<'a>(axes: Option<&'a CudaSlice<i32>>, oracle: bool) -> Case<'a> {
             Case {
                 prefix: 33,
@@ -1301,8 +1209,7 @@ mod tests {
             "P1D_BINDER_AXES degenerate=bitwise_identical over q/core_out/k_cache/v_cache/gate"
         );
 
-        // W = physical + 7 is not the pure-text coordinate, so the oracle does
-        // not apply; the claim is only that the table is really read.
+        // W = physical + 7 has no fp32 oracle.
         let shifted: Vec<i32> = (0..65).flat_map(|r| [33 + r, 33 + r, 40 + r]).collect();
         let shifted = device.stream.clone_htod(&shifted)?;
         let moved = run_shape(&device, case(Some(&shifted), false))?;

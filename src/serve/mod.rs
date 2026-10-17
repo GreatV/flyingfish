@@ -179,10 +179,7 @@ fn run_inner(
     let (ready_tx, ready_rx) = mpsc::channel::<Result<usize>>();
     let engine_slot = slot.clone();
     let engine_options = options.clone();
-    // Model is loaded inside the engine thread: it holds CUDA handles
-    // that are not Send, and the engine thread is their only user. The
-    // readiness channel carries the load result and the model vocabulary
-    // size to `serve` before it binds, so a failed load fails startup.
+    // The model holds non-Send CUDA handles; readiness carries the load result and vocab size before bind.
     let handle = thread::Builder::new()
         .name("engine".into())
         .spawn(move || {

@@ -1601,7 +1601,7 @@ mod tests {
         Ok(())
     }
 
-    /// A stand-in plan recording the rows it was narrowed to, so selection is testable without a device.
+    /// A stand-in plan recording the rows it was narrowed to.
     #[derive(Clone, Debug, PartialEq)]
     struct FakePlan {
         max_rows: usize,

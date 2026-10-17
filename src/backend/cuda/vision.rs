@@ -1,13 +1,4 @@
-//! Qwen3.8 vision path binder (P1-V): 2D RoPE + MHA attention (head_dim 72) and
-//! the merger (LayerNorm + two biased BF16 linears + exact GELU).
-//!
-//! Kernels: `kernels/vision_rope.cu` (one thread per (row, head)) and
-//! `kernels/vision_attn.cu` (the only instantiation is m64: 64 query rows,
-//! KT = 64, 4 warps). Both are standalone G4-verified; this module is their
-//! binder — it owns the geometry derivation and the launch sequence, not the
-//! numerics. The merger composes the common [`NormOps`] and [`GateOps`] entries
-//! and the shared [`Blas`] biased linear; no vision-private norm or activation
-//! kernel exists.
+//! Vision binder: 2D RoPE + MHA attention (head_dim 72) and the merger (LayerNorm + two biased BF16 linears + exact GELU).
 //!
 //! Layouts, all head-major over rows:
 //!
@@ -19,19 +10,10 @@
 //! | `v` | `[16, krows, 72]` | image-padded V (no RoPE); caller-owned |
 //! | `o` | `[rows, 16, 72]` | token-major — the following projection's `[rows, 1152]` |
 //!
-//! The attention kernel tiles K/V with per-image padding: image `b`'s keys
-//! occupy `[kb[b], kb[b] + n_b)` rounded up to a whole KT = 64 tile, and
-//! `kb[b] % 64 == 0` is a device guard. Tiles' rows past `n_b` are zero-filled
-//! in shared memory (`cp.async` with src-size 0) and their scores forced to
-//! −inf, so the padded rows of `k_pad` and `v` are never read from global
-//! memory; only real rows matter. `run` therefore performs the rope →
-//! attention handoff explicitly: RoPE writes K in the real-row layout, then the
-//! baked copy list moves each image's real rows to their padded offsets.
+//! Image `b`'s keys occupy `[kb[b], kb[b] + n_b)` rounded up to a KT = 64 tile with `kb[b] % 64 == 0`;
+//! padded rows of `k_pad` and `v` are never read from global memory.
 //!
-//! The merger's row contract is inherited, not established here: the packed
-//! patch order must already be merge-grouped (2×2 blocks contiguous), which is
-//! what makes the `view(-1, 4608)` correct. Row order is owned upstream by the
-//! patch-embed/position path.
+//! The merger requires merge-grouped packed patch order (2×2 blocks contiguous).
 
 use super::Device;
 use super::blas::Blas;
@@ -47,8 +29,7 @@ use std::sync::Arc;
 
 pub(crate) const HQ: u32 = 16;
 pub(crate) const D: u32 = 72;
-/// Query rows per attention CTA and the key tile, from `kVisionTileSpec` in
-/// `kernels/vision_attn.cu`. The kernel traps on any other block size.
+/// Query rows per attention CTA and the key tile, from `kVisionTileSpec` in `kernels/vision_attn.cu`.
 const MT: u32 = 64;
 const KT: u32 = 64;
 const ATTN_THREADS: u32 = 128;
@@ -62,9 +43,7 @@ const LN_EPS: f32 = 1e-6;
 const BIAS_MODE: LinearBiasMode = LinearBiasMode::BeforeOutputRound;
 const WS_ALIGN: u64 = 256;
 
-/// The declared vision-tower shape. Validated rather than assumed, the way
-/// [`super::attention_d256`]'s spec pins the text attention; a config that
-/// disagrees with the compiled kernels must fail here, not drift.
+/// The declared vision-tower shape; `validate` rejects any shape the compiled kernels do not implement.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VisionSpec {
     pub hq: u32,
@@ -108,16 +87,8 @@ pub(crate) struct PatchGrid {
     pub w: u32,
 }
 
-/// CPU packing description for the vision attention: real-row offsets
-/// (`cu_seqlens`), image-padded key offsets (`k_bases`) and the image order,
-/// derived once here so the attention plan, the workspace sizing and the
-/// caller's QKV/V packing cannot disagree.
-///
-/// Image `b`'s real rows are `[cu_seqlens[b], cu_seqlens[b + 1])` of the packed
-/// patch stream, in the order `grids` lists them, and its keys occupy
-/// `[k_bases[b], k_bases[b + 1])` after its row count is rounded up to a whole
-/// KT = 64 tile. Every `k_bases[b]` is a multiple of KT — the attention
-/// kernel's device guard (`guard_geometry`).
+/// Vision attention packing: image `b`'s real rows are `[cu_seqlens[b], cu_seqlens[b + 1])` in `grids` order;
+/// its keys occupy `[k_bases[b], k_bases[b + 1])`, rounded up to a KT tile; every `k_bases[b]` is a multiple of KT.
 #[derive(Clone, Debug)]
 pub(crate) struct PatchPacking {
     grids: Vec<PatchGrid>,
@@ -205,15 +176,13 @@ pub(crate) struct VisionAttnBindings {
     pub q_in: Tensor<bf16, 3>,
     /// The qkv projection's K slice, head-major real rows `[16, rows, 72]`.
     pub k_in: Tensor<bf16, 3>,
-    /// V, head-major and already image-padded `[16, krows, 72]` (no RoPE, so the
-    /// projection epilogue can write it at its padded offsets directly).
+    /// V, head-major and image-padded `[16, krows, 72]`, no RoPE.
     pub v: Tensor<bf16, 3>,
     /// `[rows, 16, 72]` token-major.
     pub o: TensorMut<bf16, 3>,
 }
 
-/// The merger's views: LayerNorm(1152, bias) per patch row, then
-/// Linear(4608→4608)+GELU(exact)+Linear(4608→5120) over 2×2 blocks.
+/// Merger views: per-row LayerNorm(1152, bias), then Linear(4608→4608)+GELU(exact)+Linear(4608→5120) over 2×2 blocks.
 #[derive(Debug)]
 pub(crate) struct VisionMergerBindings {
     /// The last block's output, `[rows, 1152]`, all rows real.
@@ -269,7 +238,6 @@ fn align(n: u64) -> Result<u64> {
 }
 
 /// Scratch layout of the attention stage: `(q_rot, k_rot, k_pad, bytes)`.
-/// One source, used by both `workspace` and `prepare`.
 fn attn_layout(rows: u32, krows: u32) -> Result<(u64, u64, u64, u64)> {
     let row_bytes = u64::from(HQ) * u64::from(D) * 2;
     let rot_bytes = align(u64::from(rows) * row_bytes)?;
@@ -284,8 +252,7 @@ fn attn_layout(rows: u32, krows: u32) -> Result<(u64, u64, u64, u64)> {
     Ok((off_q_rot, off_k_rot, off_k_pad, bytes))
 }
 
-/// Scratch layout of the merger: `(ln, fc1, bytes)`; both buffers are
-/// `rows * 1152 * 2` bytes.
+/// Scratch layout of the merger: `(ln, fc1, bytes)`; both buffers are `rows * 1152 * 2` bytes.
 fn merger_layout(rows: u32) -> Result<(u64, u64, u64)> {
     let buf = align(u64::from(rows) * u64::from(HIDDEN) * 2)?;
     Ok((0, buf, buf.checked_mul(2).context("workspace overflow")?))
@@ -311,8 +278,7 @@ fn dense<T: Copy, const R: usize>(view: &Tensor<T, R>, name: &str) -> Result<()>
 }
 
 impl VisionAttnOps {
-    /// CPU-only checked sizing: the RoPE outputs and the padded K staging, plus
-    /// the geometry tables.
+    /// CPU-only checked sizing of the RoPE outputs and the padded K staging.
     pub(crate) fn workspace(spec: &VisionSpec, packing: &PatchPacking) -> Result<WorkspaceReq> {
         spec.validate()?;
         let (_, _, _, bytes) = attn_layout(packing.real_rows(), packing.padded_rows())?;
@@ -322,10 +288,7 @@ impl VisionAttnOps {
         })
     }
 
-    /// Setup binder: loads the two kernels, validates the registered layout,
-    /// uploads `cu_seqlens`/`k_bases`/per-image grids from the packing, and bakes
-    /// the K scatter copy list. The plan is per request: the image grid is part
-    /// of its identity, so its launch sequence is stable for capture.
+    /// Per-request setup binder; the image grid is part of the plan identity.
     pub(crate) fn prepare(
         device: &Device,
         spec: &VisionSpec,
@@ -370,10 +333,7 @@ impl VisionAttnOps {
 
         let (off_q_rot, off_k_rot, off_k_pad, scratch_bytes) = attn_layout(rows, krows)?;
 
-        // Scatter each image's rotated K real rows to their padded offsets. The
-        // padded rows in between are never read (see the module docs); the copy
-        // list is fixed by the plan and replayed per run, so the launch sequence
-        // — including a possibly empty copy set — is capture-stable.
+        // Per-image copies of rotated K real rows to their padded offsets, fixed by the plan.
         let mut copies = Vec::with_capacity(grids.len() * HQ as usize);
         for h in 0..u64::from(HQ) {
             for (b, g) in grids.iter().enumerate() {
@@ -439,9 +399,7 @@ impl VisionAttnOps {
         })
     }
 
-    /// Allocation-free, same-stream forward: RoPE over Q and K, the K row
-    /// scatter into the padded layout, then one attention launch per
-    /// (image, query tile, head).
+    /// Allocation-free, same-stream forward: RoPE, K scatter into the padded layout, attention.
     pub(crate) fn run(
         plan: &VisionAttnPlan,
         stream: &Arc<CudaStream>,
@@ -459,7 +417,6 @@ impl VisionAttnOps {
         let rows = plan.rows as i32;
         let nblocks = plan.nblocks as i32;
 
-        // 1. 2D RoPE on Q and K, in the real-row layout.
         unsafe {
             stream
                 .launch_builder(&plan.rope)
@@ -475,7 +432,6 @@ impl VisionAttnOps {
                 .launch(plan.rope_cfg)?;
         }
 
-        // 2. Scatter rotated K real rows to their per-image padded offsets.
         for &(src, dst, bytes) in &plan.copies {
             unsafe {
                 cudarc::driver::result::memcpy_dtod_async(
@@ -487,8 +443,6 @@ impl VisionAttnOps {
             }
         }
 
-        // 3. Attention over the padded K/V; the kernel's device guards re-check
-        //    the tables this plan derived.
         unsafe {
             stream
                 .launch_builder(&plan.attn)
@@ -506,8 +460,7 @@ impl VisionAttnOps {
 }
 
 impl VisionMergerOps {
-    /// CPU-only checked sizing: the LayerNorm output and the fc1 activation,
-    /// both `rows * 1152 * 2` bytes.
+    /// CPU-only checked sizing of the LayerNorm output and the fc1 activation.
     pub(crate) fn workspace(spec: &VisionSpec, rows: u32) -> Result<WorkspaceReq> {
         spec.validate()?;
         ensure!(rows > 0, "merger needs at least one patch row");
@@ -522,11 +475,7 @@ impl VisionMergerOps {
         })
     }
 
-    /// Setup binder: validates the merger layout and binds the two biased
-    /// linear plans in the shared [`Blas`].
-    ///
-    /// The bias is added to the FP32 accumulator before the single BF16
-    /// output conversion ([`LinearBiasMode::BeforeOutputRound`]).
+    /// Setup binder: validates the merger layout and binds the two biased linear plans in the shared [`Blas`].
     pub(crate) fn prepare(
         spec: &VisionSpec,
         bindings: VisionMergerBindings,
@@ -568,8 +517,7 @@ impl VisionMergerOps {
         })
     }
 
-    /// Allocation-free, same-stream forward: per-patch LayerNorm, then the 2×2
-    /// block as one 4608-wide row through fc1 → exact GELU → fc2.
+    /// Allocation-free, same-stream forward: per-patch LayerNorm, then each 2×2 block as one 4608-wide row.
     pub(crate) fn run(
         plan: &VisionMergerPlan,
         stream: &Arc<CudaStream>,
@@ -579,13 +527,11 @@ impl VisionMergerOps {
         scratch.validate(plan.scratch_bytes)?;
         let b = &plan.bindings;
         let elem = std::mem::size_of::<bf16>() as u64;
-        // Views take element strides; the scratch offsets are bytes.
         let ln_row = u64::from(HIDDEN);
         let fc1_row = u64::from(MERGER_FC1);
         let ln_span = u64::from(plan.rows) * ln_row * elem;
 
-        // LayerNorm works on [rows, 1, 1152] views; the same storage is the
-        // [tokens, 4608] fc1 input, so no repack exists between them.
+        // The [rows, 1, 1152] LayerNorm output is the [tokens, 4608] fc1 input in place.
         let x3 = unsafe {
             Tensor::new(
                 b.x.ptr,
@@ -623,8 +569,6 @@ impl VisionMergerOps {
             )?
         };
         blas.linear_biased(b.fc1_w, b.fc1_b, ln2, &mut fc1, BIAS_MODE)?;
-        // The gate op works on [rows, heads, width]; the 4608-wide merger row is
-        // one segment, and the activation is exact in place.
         let mut fc1_3 = unsafe {
             TensorMut::new(
                 scratch.ptr + plan.off_fc1,
@@ -636,8 +580,6 @@ impl VisionMergerOps {
         plan.common
             .gate
             .gelu(stream, fc1_3.read(), &mut fc1_3, GeluMode::Exact)?;
-        // A fresh TensorMut over the same view: the plan is shared, the write
-        // goes to the same buffer through the same pointer.
         let mut out = TensorMut(b.out.read());
         blas.linear_biased(b.fc2_w, b.fc2_b, fc1.read(), &mut out, BIAS_MODE)?;
         Ok(())
@@ -686,20 +628,7 @@ mod tests {
 
 #[cfg(test)]
 mod probe {
-    //! GPU probe for the binder itself: `workspace` -> `prepare` -> `run` through
-    //! the real launch path, for the attention stage (RoPE + attention) and the
-    //! merger, plus silently-compiling negative controls that must fail on
-    //! numbers. `#[ignore]`-gated because it initialises a device:
-    //!
-    //!   FF_Q38_GPU_WINDOW=granted cargo test --features cuda --lib \
-    //!     vision::probe -- --ignored --nocapture
-    //!
-    //! Tolerance: both sides of each comparison are bf16-representable (the
-    //! reference applies the same visible casts), so the floor is one bf16 ulp
-    //! and the 8x factor covers the independent accumulation orders. OpRef
-    //! measured 99.8-99.9 % bitwise agreement for the biased linear on both
-    //! architectures with the remainder at ~1 ulp, and the kernel-side numerics
-    //! are the G4 harness's job, not this probe's.
+    //! GPU probe of `workspace` -> `prepare` -> `run` for the attention stage and the merger, with negative controls.
     use super::*;
     use crate::backend::cuda::Device;
     use crate::backend::cuda::closure::Closure;
@@ -767,9 +696,7 @@ mod probe {
         )
     }
 
-    /// The attention stage in fp32 with the kernels' visible bf16 casts: the
-    /// rotation rounds to bf16 (the model casts back), P rounds to bf16 before
-    /// P*V, and the output rounds once. Non-causal within each image.
+    /// FP32 attention reference with bf16 casts after rotation, on P before PV and on the output; non-causal per image.
     fn reference_attn(
         grids: &[PatchGrid],
         q_in: &[bf16],
@@ -827,7 +754,7 @@ mod probe {
         out
     }
 
-    /// Abramowitz & Stegun 7.1.26, |err| <= 1.5e-7 -- far below one bf16 ulp.
+    /// Abramowitz & Stegun 7.1.26, |err| <= 1.5e-7.
     fn erf(x: f32) -> f32 {
         let sign = if x < 0.0 { -1.0f32 } else { 1.0f32 };
         let x = x.abs();
@@ -848,10 +775,7 @@ mod probe {
         b2: &'a [bf16],
     }
 
-    /// The merger in fp32 with the OpRef's rounding points: LayerNorm with fp32
-    /// statistics and affine, one bf16 rounding; both linears bias into the fp32
-    /// accumulator with one bf16 rounding (BeforeOutputRound); exact GELU on
-    /// fp32, one bf16 rounding.
+    /// FP32 merger reference; LayerNorm, each biased linear (bias before rounding) and exact GELU round once to bf16.
     fn reference_merger(
         x: &[bf16],
         rows: usize,
@@ -862,9 +786,7 @@ mod probe {
         let tokens = rows / (MERGE * MERGE) as usize;
         let mut ln = vec![0f32; rows * hidden];
         if postshuffle {
-            // The model's `use_postshuffle_norm = True` variant: statistics over
-            // the whole 2x2 block (4608), not per patch row -- the silent error
-            // this control exists to be caught by.
+            // `use_postshuffle_norm = True`: statistics over the whole 2x2 block (4608).
             for t in 0..tokens {
                 let xr: Vec<f32> = x[t * fc1..(t + 1) * fc1]
                     .iter()
@@ -950,13 +872,12 @@ mod probe {
         let (hq, d) = (HQ as usize, D as usize);
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
 
-        // ---- attention stage: two images, grids 4x4 and 2x6, one tail tile
+        // Attention stage: two images, grids 4x4 and 2x6, one tail tile.
         let grids = [PatchGrid { h: 4, w: 4 }, PatchGrid { h: 2, w: 6 }];
         let packing = PatchPacking::build(&grids)?;
         let kb: Vec<i32> = vec![0, 64, 128];
         let rows = 28usize;
         let krows = 128usize;
-        // The packing the plan uses is the one this harness derives by hand.
         assert_eq!(packing.cu_seqlens(), [0, 16, 28]);
         assert_eq!(packing.k_bases(), kb.as_slice());
         assert_eq!(packing.real_rows(), rows as u32);
@@ -1030,9 +951,7 @@ mod probe {
             "attention binder output differs from the fp32 reference: rel={rel:.3e} bound={BOUND:.3e}"
         );
 
-        // Silently-compiling negative control: the same comparison must reject a
-        // run whose Q rows carry the other image's content (the plausible wrong
-        // grid table). Inputs swap, no code changes; only the numbers tell.
+        // Negative control: Q rows swapped between the two images must exceed the bound.
         let mut q_swapped = q_in.clone();
         for h in 0..hq {
             for r in 0..4 {
@@ -1048,8 +967,6 @@ mod probe {
             dev_q2.len() == dev_q.len(),
             "internal control buffer mismatch"
         );
-        // Re-bind the plan to the swapped buffer is not possible (bindings are
-        // fixed by prepare), so run the control through a second plan.
         let bindings2 = VisionAttnBindings {
             q_in: view(
                 &dev_q2,
@@ -1094,7 +1011,7 @@ mod probe {
             "negative control was not rejected: rel={ctl_rel:.3e} bound={BOUND:.3e}"
         );
 
-        // ---- merger stage: rows = 8 (two merged tokens)
+        // Merger stage: 8 rows, two merged tokens.
         let (mrows, hidden, fc1, fc2) = (
             8usize,
             HIDDEN as usize,
@@ -1102,10 +1019,7 @@ mod probe {
             MERGER_FC2 as usize,
         );
         let tokens = 2usize;
-        // Per-row scale steps: with i.i.d. rows the per-patch and block-wise
-        // LayerNorm statistics nearly coincide and the wrong-axis control hides
-        // under the bound (measured: 2.4e-2 against 3.1e-2). Distinct row scales
-        // are the input class where the axis error is actually observable.
+        // Distinct per-row scales separate per-patch from block-wise LayerNorm statistics.
         let x: Vec<bf16> = (0..mrows * hidden)
             .map(|i| bf16::from_f32((1.0 + 0.35 * (i / hidden) as f32) * rng.next()))
             .collect();
@@ -1182,13 +1096,7 @@ mod probe {
             "merger binder output differs from the fp32 reference: rel={mrel:.3e} bound={BOUND:.3e}"
         );
 
-        // Negative control: the same kernel output against a reference whose
-        // LayerNorm takes block-wise (post-shuffle) statistics instead of
-        // per-patch ones -- the model's other variant, a silently wrong contract
-        // that only the numbers can separate. (A bias-mode flip is NOT usable as
-        // a control here: the two modes differ by 1-2 bf16 ulp, which this
-        // probe's 8-ulp accumulation-order bound cannot and should not resolve;
-        // the mode question lives with the OpRef's per-element statistics.)
+        // Negative control: block-wise (post-shuffle) LayerNorm statistics must exceed the bound.
         let mctl = reference_merger(&x, mrows, &mw, true);
         let (_, mctl_rel) = max_rel(&mgot, &mctl);
         eprintln!("Q38_VISION_MERGER_CONTROL rel={mctl_rel:.3e} (must exceed {BOUND:.3e})");
