@@ -725,12 +725,10 @@ impl VisionWeights {
         vision: &crate::model_spec::VisionConfig,
         architecture: crate::model_spec::Architecture,
     ) -> Result<Self> {
-        use crate::model_spec::Architecture;
         let before = catalog.tensors.len();
         let hidden = geometry.hidden();
         let mlp = geometry.mlp;
         let depth = vision.depth;
-        let side = vision.position_side;
         let (patch, position, post_norm, blocks, window, merger, expected) = match architecture {
             Architecture::Qwen35Text => {
                 let patch = BiasedWeight::take(
@@ -910,7 +908,6 @@ impl VisionWeights {
                 bail!("vision configuration requires a multimodal architecture")
             }
         };
-        let _ = side;
         ensure!(
             before.checked_sub(catalog.tensors.len()) == Some(expected),
             "incomplete vision weight binding"
