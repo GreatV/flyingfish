@@ -82,25 +82,34 @@ pub fn window_gather(grids: &[ImageGrid], window: u32) -> Result<WindowGather> {
     let mut cu_seqlens = vec![0i32];
     let mut base = 0u32;
     for grid in grids {
-        grid.patch_rows()?;
+        let patches = grid.patch_rows()?;
         ensure!(
             grid.h.is_multiple_of(window) && grid.w.is_multiple_of(window),
-            "patch grid is not window aligned"
+            "patch grid {}x{} is not window aligned",
+            grid.h,
+            grid.w
         );
         for window_row in 0..grid.h / window {
             for window_column in 0..grid.w / window {
                 for row in 0..window {
                     for column in 0..window {
-                        let patch =
-                            (window_row * window + row) * grid.w + window_column * window + column;
-                        indices.push(base + patch);
+                        let patch = (window_row * window + row)
+                            .checked_mul(grid.w)
+                            .and_then(|column_index| {
+                                column_index.checked_add(window_column * window + column)
+                            })
+                            .context("window patch index overflow")?;
+                        indices.push(
+                            base.checked_add(patch)
+                                .context("window gather row overflow")?,
+                        );
                     }
                 }
                 cu_seqlens.push(i32::try_from(indices.len())?);
             }
         }
         base = base
-            .checked_add(grid.h * grid.w)
+            .checked_add(u32::try_from(patches)?)
             .context("window gather row overflow")?;
     }
     Ok(WindowGather {
@@ -129,14 +138,21 @@ pub fn merge_groups(grids: &[(u32, u32)], merge: u32) -> Result<Vec<u32>> {
             for group_column in 0..columns / merge {
                 for dh in 0..merge {
                     for dw in 0..merge {
-                        let row = (group_row * merge + dh) * columns + group_column * merge + dw;
-                        groups.push(base + row as u32);
+                        let row = (group_row * merge + dh)
+                            .checked_mul(columns)
+                            .and_then(|row| row.checked_add(group_column * merge + dw))
+                            .context("merge group row overflow")?;
+                        let row = u32::try_from(row).context("merge group row exceeds u32")?;
+                        groups.push(base.checked_add(row).context("merge group row overflow")?);
                     }
                 }
             }
         }
         base = base
-            .checked_add(u32::try_from(rows * columns)?)
+            .checked_add(u32::try_from(
+                rows.checked_mul(columns)
+                    .context("merge group extent overflow")?,
+            )?)
             .context("merge group row overflow")?;
     }
     Ok(groups)

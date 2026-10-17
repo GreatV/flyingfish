@@ -327,7 +327,11 @@ impl VisionAttnOps {
         let kb = packing.k_bases();
         let rows = packing.real_rows();
         let krows = packing.padded_rows();
-        let nblocks = packing.images() as u32;
+        let nblocks = u32::try_from(packing.images())?;
+        ensure!(
+            nblocks > 0 && nblocks <= u32::from(u16::MAX),
+            "image count {nblocks} exceeds the grid z limit"
+        );
 
         want(&bindings.q_in, [HQ, rows, D], "q_in")?;
         want(&bindings.k_in, [HQ, rows, D], "k_in")?;

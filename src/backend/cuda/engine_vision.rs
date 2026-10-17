@@ -116,7 +116,8 @@ fn dense<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     }
     ensure!(
         count == buffer.len() as u64,
-        "vision view/allocation size mismatch"
+        "vision view/allocation size mismatch: view={count} allocated={}",
+        buffer.len()
     );
     let (ptr, _read) = buffer.device_ptr(stream);
     unsafe {
@@ -150,7 +151,8 @@ fn dense_at<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
         .context("vision view offset overflow")?;
     ensure!(
         end <= buffer.len() as u64,
-        "vision view/allocation size mismatch"
+        "vision view/allocation size mismatch: end={end} allocated={}",
+        buffer.len()
     );
     let (ptr, _read) = buffer.device_ptr(stream);
     let bytes = count
@@ -184,7 +186,9 @@ fn matrix<T: Copy>(view: &Tensor<T, 2>, width: u32) -> Result<()> {
     view.validate()?;
     ensure!(
         view.shape[1] == width && view.stride == [u64::from(width), 1],
-        "vision IO requires dense rows of width {width}"
+        "vision IO requires dense rows of width {width}, got shape {:?} stride {:?}",
+        view.shape,
+        view.stride
     );
     Ok(())
 }
@@ -471,12 +475,21 @@ impl VisionIo {
         channels: u32,
         side: u32,
     ) -> Result<()> {
-        let width = channels * side * side;
+        ensure!(
+            channels > 0 && side > 0,
+            "patch row pack needs positive channels/side: channels={channels} side={side}"
+        );
+        let width = channels
+            .checked_mul(side)
+            .and_then(|n| n.checked_mul(side))
+            .context("patch row width overflow")?;
         matrix(&input, width)?;
         matrix(&output.0, width)?;
         ensure!(
             input.shape[0] == rows && output.0.shape[0] == rows && input.shape == output.0.shape,
-            "patch row pack shape mismatch"
+            "patch row pack shape mismatch: rows={rows} input={:?} output={:?}",
+            input.shape,
+            output.0.shape
         );
         disjoint(&input, &output.0)?;
         let count = u64::from(rows) * u64::from(width);
@@ -508,9 +521,13 @@ impl VisionIo {
         ensure!(
             input.shape[0] == rows
                 && gathered.0.shape[0] == rows
+                && input.shape[0] > 0
                 && indices.shape == [rows]
                 && indices.stride == [1],
-            "window gather shape mismatch"
+            "window gather shape mismatch: rows={rows} input={:?} gathered={:?} indices={:?}",
+            input.shape,
+            gathered.0.shape,
+            indices.shape
         );
         disjoint(&input, &gathered.0)?;
         disjoint(&indices, &gathered.0)?;
@@ -539,11 +556,14 @@ impl VisionIo {
         width: u32,
         k: u32,
     ) -> Result<()> {
+        ensure!(k > 0, "row mean needs a positive group size");
         matrix(&input, width)?;
         matrix(&out.0, width)?;
         ensure!(
-            input.shape[0] == rows && out.0.shape[0] == rows / k && rows.is_multiple_of(k) && k > 0,
-            "row mean shape mismatch"
+            input.shape[0] == rows && out.0.shape[0] == rows / k && rows.is_multiple_of(k),
+            "row mean shape mismatch: rows={rows} k={k} input={:?} output={:?}",
+            input.shape,
+            out.0.shape
         );
         disjoint(&input, &out.0)?;
         let count = u64::from(rows / k) * u64::from(width);
