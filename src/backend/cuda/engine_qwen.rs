@@ -38,25 +38,76 @@ fn debug_name(trace: &Option<Target<'_>>, layer: usize, point: &str) -> String {
 
 fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
     use crate::model_spec::{Architecture, LinearFormat};
-    ensure!(
-        matches!(
-            spec.architecture,
-            Architecture::Qwen35Text | Architecture::MiniCpmV47
+    let (hidden, intermediate, vocab, hq, hkv, layers, hv, format) = match spec.architecture {
+        Architecture::Qwen35Text => (
+            5120,
+            17408,
+            248320,
+            24,
+            4,
+            64,
+            48,
+            LinearFormat::Fp8E4m3Block128,
         ),
-        "hybrid engine requires a Qwen3.5-family text architecture"
-    );
-    MixerSpec::from_model(spec)?;
-    let expected = match spec.architecture {
-        Architecture::Qwen35Text => LinearFormat::Fp8E4m3Block128,
-        Architecture::MiniCpmV47 => LinearFormat::Bf16,
-        Architecture::Llama => unreachable!(),
+        Architecture::MiniCpmV47 => (2048, 512, 248144, 16, 2, 40, 32, LinearFormat::Bf16),
+        Architecture::Llama => anyhow::bail!(
+            "hybrid engine does not implement architecture={:?}",
+            spec.architecture
+        ),
     };
+    for (name, value, expected) in [
+        ("hidden_size", spec.hidden, hidden),
+        ("intermediate_size", spec.intermediate, intermediate),
+        ("vocab_size", spec.vocab, vocab),
+        ("num_attention_heads", spec.q_heads, hq),
+        ("num_key_value_heads", spec.kv_heads, hkv),
+        ("head_dim", spec.head_dim, 256),
+        ("q_width", spec.q_width, hq * 256),
+        ("max_position_embeddings", spec.max_position, 262144),
+        ("rotary_dim", spec.rotary_dim, 64),
+    ] {
+        ensure!(
+            value == expected,
+            "hybrid engine does not implement {name}={value}"
+        );
+    }
     ensure!(
-        spec.linear_format == expected,
+        spec.layers.len() == layers,
+        "hybrid engine does not implement num_hidden_layers={}",
+        spec.layers.len()
+    );
+    ensure!(
+        spec.rms_eps == 1e-6,
+        "hybrid engine does not implement rms_norm_eps={}",
+        spec.rms_eps
+    );
+    ensure!(
+        spec.rope_theta == 1e7,
+        "hybrid engine does not implement rope_theta={}",
+        spec.rope_theta
+    );
+    ensure!(
+        spec.linear_format == format,
         "hybrid engine does not implement linear_format={:?} for {:?}",
         spec.linear_format,
         spec.architecture
     );
+    let gdn = spec
+        .gdn
+        .as_ref()
+        .context("hybrid engine does not implement gdn=None")?;
+    for (name, value, expected) in [
+        ("linear_num_key_heads", gdn.key_heads, 16),
+        ("linear_num_value_heads", gdn.value_heads, hv),
+        ("linear_key_head_dim", gdn.key_head_dim, 128),
+        ("linear_value_head_dim", gdn.value_head_dim, 128),
+        ("linear_conv_kernel_dim", gdn.conv_kernel, 4),
+    ] {
+        ensure!(
+            value == expected,
+            "hybrid engine does not implement {name}={value}"
+        );
+    }
     Ok(())
 }
 
