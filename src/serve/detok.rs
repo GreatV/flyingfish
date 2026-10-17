@@ -48,6 +48,12 @@ impl Shared {
             .map_err(|e| anyhow::anyhow!("tokenizer encode: {e}"))
     }
 
+    pub fn token_id(&self, token: &str) -> Result<u32> {
+        self.tokenizer
+            .token_to_id(token)
+            .with_context(|| format!("tokenizer lacks token {token:?}"))
+    }
+
     pub fn detok(&self) -> Detok {
         Detok {
             tokenizer: self.tokenizer.clone(),

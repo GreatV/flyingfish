@@ -1,6 +1,6 @@
 //! CPU contracts for processor-packed static images and text mRoPE positions.
 use crate::model_spec::{Architecture, ModelSpec, VisionConfig};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,8 +25,13 @@ impl ImageGrid {
         usize::try_from(rows).context("patch count exceeds host index range")
     }
 
-    pub fn feature_rows(self) -> Result<usize> {
-        Ok(self.patch_rows()? / 4)
+    pub fn feature_rows(self, merge: u32) -> Result<usize> {
+        let patches = self.patch_rows()?;
+        ensure!(
+            self.h.is_multiple_of(merge) && self.w.is_multiple_of(merge),
+            "image grid is not merge aligned"
+        );
+        Ok(patches / (merge as usize * merge as usize))
     }
 }
 
@@ -178,10 +183,14 @@ impl PositionPlan {
 
 impl MultimodalInput<'_> {
     pub fn validate(&self, spec: &ModelSpec, capacity: usize) -> Result<PositionPlan> {
-        ensure!(
-            spec.architecture == Architecture::Qwen35Text,
-            "packed images require Q38"
-        );
+        match spec.architecture {
+            Architecture::Qwen35Text => self.validate_qwen(spec, capacity),
+            Architecture::MiniCpmV47 => self.validate_minicpm(spec, capacity),
+            Architecture::Llama => bail!("packed images require a multimodal architecture"),
+        }
+    }
+
+    fn validate_qwen(&self, spec: &ModelSpec, capacity: usize) -> Result<PositionPlan> {
         let vision = spec
             .vision
             .as_ref()
@@ -287,7 +296,7 @@ impl MultimodalInput<'_> {
                 .get(plan.slots.len())
                 .context("image run has no corresponding grid")?;
             let patches = grid.patch_rows()?;
-            let features = grid.feature_rows()?;
+            let features = grid.feature_rows(vision.merge)?;
             ensure!(
                 cursor - start == features,
                 "image placeholder count does not match grid"
@@ -329,6 +338,434 @@ impl MultimodalInput<'_> {
         plan.rope_delta = i64::from(*max) + 1 - i64::try_from(len)?;
         Ok(plan)
     }
+
+    fn validate_minicpm(&self, spec: &ModelSpec, capacity: usize) -> Result<PositionPlan> {
+        let vision = spec
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        vision.validate(spec.architecture)?;
+        let markers = vision
+            .minicpm
+            .as_ref()
+            .context("MiniCPM vision configuration missing")?;
+        let merge = vision.merge;
+        ensure!(
+            capacity > 0 && capacity <= spec.max_position as usize,
+            "invalid multimodal capacity"
+        );
+        let len = self.input_ids.len();
+        ensure!(
+            len > 0 && len <= capacity && self.modality_ids.len() == len,
+            "token/modality extent mismatch"
+        );
+        ensure!(
+            self.input_ids
+                .iter()
+                .all(|&id| id < spec.vocab && id != vision.video_token),
+            "invalid token or unsupported video token"
+        );
+        ensure!(
+            self.modality_ids.iter().all(|&m| m <= 1),
+            "unsupported modality (only text/image)"
+        );
+        let mut patch_rows = 0usize;
+        let mut feature_rows = 0usize;
+        for grid in self.grids {
+            patch_rows = patch_rows
+                .checked_add(grid.patch_rows()?)
+                .context("packed patch count overflow")?;
+            feature_rows = feature_rows
+                .checked_add(grid.feature_rows(merge)?)
+                .context("packed feature count overflow")?;
+        }
+        let elements = patch_rows
+            .checked_mul(vision.patch_elements(spec.architecture)?)
+            .context("packed pixel size overflow")?;
+        ensure!(
+            self.pixel_values.len() == elements,
+            "packed pixel element count mismatch: expected {elements}, got {}",
+            self.pixel_values.len()
+        );
+        ensure!(
+            self.pixel_values
+                .iter()
+                .all(|&v| v.is_finite() && half::bf16::from_f32(v).is_finite()),
+            "nonfinite packed pixel or BF16 overflow"
+        );
+
+        // One slot per image-token run; runs and crops are both in sequence order.
+        let mut slots = Vec::new();
+        let mut cursor = 0usize;
+        let mut patch = 0usize;
+        let mut feature = 0usize;
+        let mut opened = false;
+        while cursor < len {
+            if self.modality_ids[cursor] == 0 {
+                cursor += 1;
+                continue;
+            }
+            let start = cursor;
+            while cursor < len && self.modality_ids[cursor] == 1 {
+                ensure!(
+                    self.input_ids[cursor] == vision.image_token,
+                    "image modality contains non-placeholder token"
+                );
+                cursor += 1;
+            }
+            let grid = *self
+                .grids
+                .get(slots.len())
+                .context("image run has no corresponding grid")?;
+            let patches = grid.patch_rows()?;
+            let features = grid.feature_rows(merge)?;
+            ensure!(
+                cursor - start == features,
+                "image placeholder count does not match grid"
+            );
+            let before = start
+                .checked_sub(1)
+                .and_then(|i| self.input_ids.get(i))
+                .copied()
+                .context("image run lacks its opening marker")?;
+            let close = if before == vision.start_token {
+                opened = true;
+                vision.end_token
+            } else {
+                ensure!(
+                    before == markers.slice_start_token && opened,
+                    "image run lacks its opening marker"
+                );
+                markers.slice_end_token
+            };
+            ensure!(
+                self.input_ids.get(cursor) == Some(&close),
+                "image run lacks its closing marker"
+            );
+            slots.push(ImageSlot {
+                tokens: start..cursor,
+                patches: patch..patch + patches,
+                features: feature..feature + features,
+                grid,
+            });
+            patch += patches;
+            feature += features;
+        }
+        ensure!(
+            slots.len() == self.grids.len() && patch == patch_rows && feature == feature_rows,
+            "unused image grids/pixels"
+        );
+
+        let (axes, rope_delta) = mini_cpm_canvas(
+            self.input_ids,
+            self.modality_ids,
+            self.grids,
+            vision,
+            markers,
+        )?;
+        Ok(PositionPlan {
+            axes,
+            slots,
+            capacity,
+            rope_delta,
+            patch_rows,
+            feature_rows,
+        })
+    }
+}
+
+struct VisualFrame {
+    thumb: std::ops::Range<usize>,
+    slices: Vec<std::ops::Range<usize>>,
+    end: usize,
+}
+
+struct VisualGroup {
+    start: usize,
+    end: usize,
+    frames: Vec<VisualFrame>,
+}
+
+fn mini_cpm_canvas(
+    ids: &[u32],
+    modality: &[u8],
+    grids: &[ImageGrid],
+    vision: &VisionConfig,
+    markers: &crate::model_spec::MiniCpmVision,
+) -> Result<([Vec<i32>; 3], i64)> {
+    let marker_ids = [
+        markers.slice_start_token,
+        markers.slice_end_token,
+        vision.start_token,
+        vision.end_token,
+        markers.newline_token,
+    ];
+    let is_marker = |id: u32| marker_ids.contains(&id);
+    let merge = vision.merge;
+
+    let mut groups: Vec<VisualGroup> = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    let mut previous_end = 0usize;
+    let mut cursor = 0usize;
+    while cursor < ids.len() {
+        let current = modality[cursor];
+        let start = cursor;
+        while cursor < ids.len() && modality[cursor] == current {
+            cursor += 1;
+        }
+        if current == 0 {
+            continue;
+        }
+        if let Some((g, f)) = open
+            && start > 0
+            && ids[start - 1] == markers.slice_start_token
+        {
+            groups[g].frames[f].slices.push(start..cursor);
+            previous_end = cursor;
+            continue;
+        }
+        let frame = VisualFrame {
+            thumb: start..cursor,
+            slices: Vec::new(),
+            end: 0,
+        };
+        let adjacent =
+            !groups.is_empty() && ids[previous_end..start - 1].iter().all(|&id| is_marker(id));
+        if adjacent {
+            groups
+                .last_mut()
+                .context("visual group missing")?
+                .frames
+                .push(frame);
+        } else {
+            groups.push(VisualGroup {
+                start: start - 1,
+                end: 0,
+                frames: vec![frame],
+            });
+        }
+        let g = groups.len() - 1;
+        let f = groups[g].frames.len() - 1;
+        open = Some((g, f));
+        previous_end = cursor;
+    }
+    for group in &mut groups {
+        for frame in &mut group.frames {
+            let mut end = frame.slices.last().map_or(frame.thumb.end, |s| s.end);
+            while end < ids.len() && is_marker(ids[end]) {
+                end += 1;
+            }
+            frame.end = end;
+        }
+        group.end = group
+            .frames
+            .last()
+            .context("visual group without frames")?
+            .end;
+    }
+
+    let seq = ids.len();
+    let mut pos = [vec![0i64; seq], vec![0i64; seq], vec![0i64; seq]];
+    let fill_run = |pos: &mut [Vec<i64>; 3], range: std::ops::Range<usize>, base: i64| {
+        for (offset, index) in range.enumerate() {
+            let value = base + offset as i64;
+            pos[0][index] = value;
+            pos[1][index] = value;
+            pos[2][index] = value;
+        }
+    };
+    let mut grid_index = 0usize;
+    let mut current_pos = 0i64;
+    let mut current_idx = 0usize;
+    for group in &groups {
+        if group.start > current_idx {
+            fill_run(&mut pos, current_idx..group.start, current_pos);
+            current_pos += (group.start - current_idx) as i64;
+        }
+        let mut frame_cursor = group.start;
+        for frame in &group.frames {
+            let thumb = *grids.get(grid_index).context("missing thumbnail grid")?;
+            grid_index += 1;
+            let frame_start = frame.thumb.start - 1;
+            if frame_start > frame_cursor {
+                fill_run(&mut pos, frame_cursor..frame_start, current_pos);
+                current_pos += (frame_start - frame_cursor) as i64 + 1;
+            }
+            let frame_end = frame.end.min(group.end);
+            let canvas_origin = current_pos;
+            let halo = (canvas_origin - 1).max(0);
+            let (mut canvas_h, mut canvas_w) = (thumb.h / merge, thumb.w / merge);
+            let (num_rows, num_cols, slice_h, slice_w) = if frame.slices.is_empty() {
+                (0usize, 0usize, 0u32, 0u32)
+            } else {
+                let mut num_cols = frame.slices.len();
+                for k in 0..frame.slices.len() - 1 {
+                    if frame.slices[k + 1].start - frame.slices[k].end > 2 {
+                        num_cols = k + 1;
+                        break;
+                    }
+                }
+                let mut num_rows = frame.slices.len() / num_cols;
+                if num_rows * num_cols != frame.slices.len() {
+                    num_rows = 1;
+                    num_cols = frame.slices.len();
+                }
+                let first = *grids.get(grid_index).context("missing slice grid")?;
+                (num_rows, num_cols, first.h / merge, first.w / merge)
+            };
+            if num_rows > 0 {
+                canvas_h = num_rows as u32 * slice_h;
+                canvas_w = num_cols as u32 * slice_w;
+            }
+            for axis in &mut pos {
+                for value in &mut axis[frame_start..frame_end] {
+                    *value = canvas_origin;
+                }
+            }
+            pos[1][frame_start] = halo;
+            pos[2][frame_start] = halo;
+            if frame.thumb.end < frame_end {
+                pos[1][frame.thumb.end] = canvas_origin + i64::from(canvas_h);
+                pos[2][frame.thumb.end] = canvas_origin + i64::from(canvas_w);
+            }
+            vision_canvas_positions(
+                &mut pos,
+                CanvasPlacement {
+                    origin: canvas_origin,
+                    grid: thumb,
+                    canvas: (canvas_h, canvas_w),
+                    offset: (0, 0),
+                    merge,
+                    range: frame.thumb.clone(),
+                },
+            )?;
+            for (k, slice) in frame.slices.iter().enumerate() {
+                let h_off = (k / num_cols) as u32 * slice_h;
+                let w_off = (k % num_cols) as u32 * slice_w;
+                let grid = *grids.get(grid_index).context("missing slice grid")?;
+                grid_index += 1;
+                let slice_end_h = grid.h / merge;
+                let slice_end_w = grid.w / merge;
+                let marker = slice.start - 1;
+                if marker >= frame_start {
+                    pos[1][marker] = canvas_origin + i64::from(h_off);
+                    pos[2][marker] = canvas_origin + i64::from(w_off);
+                }
+                if slice.end < frame_end {
+                    pos[1][slice.end] = canvas_origin + i64::from(h_off + slice_end_h) - 1;
+                    pos[2][slice.end] = canvas_origin + i64::from(w_off + slice_end_w) - 1;
+                }
+                vision_canvas_positions(
+                    &mut pos,
+                    CanvasPlacement {
+                        origin: canvas_origin,
+                        grid,
+                        canvas: (0, 0),
+                        offset: (h_off, w_off),
+                        merge,
+                        range: slice.clone(),
+                    },
+                )?;
+            }
+            for k in 0..frame.slices.len().saturating_sub(1) {
+                let gap_start = frame.slices[k].end;
+                let gap_end = frame.slices[k + 1].start;
+                if gap_end - gap_start <= 2 {
+                    continue;
+                }
+                let boundary_h = i64::from((k / num_cols + 1) as u32 * slice_h) - 1;
+                let right_edge_w = i64::from(num_cols as u32 * slice_w);
+                let [_, rows, columns] = &mut pos;
+                for (h, w) in rows[gap_start + 1..gap_end - 1]
+                    .iter_mut()
+                    .zip(&mut columns[gap_start + 1..gap_end - 1])
+                {
+                    *h = canvas_origin + boundary_h;
+                    *w = canvas_origin + right_edge_w;
+                }
+            }
+            current_pos = canvas_origin + i64::from(canvas_h.max(canvas_w)) + 1;
+            frame_cursor = frame_end;
+        }
+        if frame_cursor < group.end {
+            fill_run(&mut pos, frame_cursor..group.end, current_pos);
+            current_pos += (group.end - frame_cursor) as i64;
+        }
+        current_idx = group.end;
+    }
+    if current_idx < seq {
+        fill_run(&mut pos, current_idx..seq, current_pos);
+    }
+    ensure!(
+        grid_index == grids.len(),
+        "unused image grids: {grid_index} of {}",
+        grids.len()
+    );
+    let max = pos
+        .iter()
+        .flatten()
+        .max()
+        .copied()
+        .context("empty positions")?;
+    let rope_delta = max + 1 - seq as i64;
+    let mut axes = [Vec::new(), Vec::new(), Vec::new()];
+    for (axis, values) in pos.into_iter().enumerate() {
+        axes[axis] = values
+            .into_iter()
+            .map(|value| i32::try_from(value).context("mRoPE coordinate exceeds device range"))
+            .collect::<Result<Vec<_>>>()?;
+    }
+    Ok((axes, rope_delta))
+}
+
+struct CanvasPlacement {
+    origin: i64,
+    grid: ImageGrid,
+    canvas: (u32, u32),
+    offset: (u32, u32),
+    merge: u32,
+    range: std::ops::Range<usize>,
+}
+
+fn vision_canvas_positions(pos: &mut [Vec<i64>; 3], placement: CanvasPlacement) -> Result<()> {
+    let llm_h = placement.grid.h / placement.merge;
+    let llm_w = placement.grid.w / placement.merge;
+    ensure!(
+        placement.range.len() == llm_h as usize * llm_w as usize,
+        "crop token count does not match its grid"
+    );
+    let canvas_h = if placement.canvas.0 == 0 {
+        llm_h
+    } else {
+        placement.canvas.0
+    };
+    let canvas_w = if placement.canvas.1 == 0 {
+        llm_w
+    } else {
+        placement.canvas.1
+    };
+    let hs = linspace_round(canvas_h - 1, llm_h as usize);
+    let ws = linspace_round(canvas_w - 1, llm_w as usize);
+    let mut index = placement.range.start;
+    for &h in &hs {
+        for &w in &ws {
+            pos[0][index] = placement.origin;
+            pos[1][index] = placement.origin + h + i64::from(placement.offset.0);
+            pos[2][index] = placement.origin + w + i64::from(placement.offset.1);
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn linspace_round(end: u32, len: usize) -> Vec<i64> {
+    if len <= 1 {
+        return vec![0];
+    }
+    let step = end as f32 / (len - 1) as f32;
+    (0..len)
+        .map(|i| (i as f32 * step).round_ties_even() as i64)
+        .collect()
 }
 
 #[derive(Clone, Debug)]

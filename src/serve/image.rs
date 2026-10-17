@@ -1,4 +1,5 @@
 use crate::model_spec::{Architecture, ModelSpec};
+use crate::serve::detok::Shared;
 use crate::vision_input::{ImageGrid, MultimodalInput};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -15,20 +16,35 @@ pub struct RgbImage {
 }
 
 pub struct PackedImage {
-    pub grid: ImageGrid,
+    pub grids: Vec<ImageGrid>,
+    pub rows: u32,
+    pub cols: u32,
     pub pixel_values: Vec<f32>,
 }
 
 pub struct PlannedImage {
     bytes: Vec<u8>,
     mime: String,
-    grid: ImageGrid,
+    grids: Vec<ImageGrid>,
+    rows: u32,
+    cols: u32,
 }
 
 impl PlannedImage {
-    pub fn feature_rows(&self) -> Result<usize> {
-        self.grid.feature_rows()
+    fn feature_rows(&self, merge: u32) -> Result<usize> {
+        self.grids.iter().try_fold(0usize, |total, grid| {
+            total
+                .checked_add(grid.feature_rows(merge)?)
+                .context("image token count overflow")
+        })
     }
+}
+
+fn patch_width(spec: &ModelSpec) -> Result<usize> {
+    spec.vision
+        .as_ref()
+        .context("image input requires a vision configuration")?
+        .patch_elements(spec.architecture)
 }
 
 pub struct PreparedImages {
@@ -38,7 +54,13 @@ pub struct PreparedImages {
 }
 
 impl PreparedImages {
-    pub fn save(&self, ids: &[u32], path: &Path) -> Result<()> {
+    pub fn save(&self, spec: &ModelSpec, ids: &[u32], path: &Path) -> Result<()> {
+        let width = patch_width(spec)?;
+        ensure!(
+            self.pixel_values.len().is_multiple_of(width),
+            "pixel_values length {} is not a multiple of the model's {width}-element patch",
+            self.pixel_values.len()
+        );
         let mut tensors = crate::tensors::Tensors::default();
         tensors.i64(
             "input_ids".into(),
@@ -62,7 +84,7 @@ impl PreparedImages {
         tensors.i64("image_grid_thw".into(), vec![self.grids.len(), 3], &grids)?;
         tensors.f32(
             "pixel_values_fp32".into(),
-            vec![self.pixel_values.len() / 1536, 1536],
+            vec![self.pixel_values.len() / width, width],
             &self.pixel_values,
         )?;
         tensors.save_new(
@@ -71,7 +93,8 @@ impl PreparedImages {
         )
     }
 
-    pub fn read(path: &Path, ids: &[u32]) -> Result<Self> {
+    pub fn read(spec: &ModelSpec, path: &Path, ids: &[u32]) -> Result<Self> {
+        let width = patch_width(spec)?;
         let bytes = std::fs::read(path)?;
         let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
         let integers = |name: &str| -> Result<Vec<i64>> {
@@ -127,10 +150,13 @@ impl PreparedImages {
             .collect::<Result<Vec<_>>>()?;
         let pixels = tensors.tensor("pixel_values_fp32")?;
         ensure!(
-            pixels.dtype() == safetensors::Dtype::F32
-                && pixels.shape().len() == 2
-                && pixels.shape()[1] == 1536,
-            "pixel_values_fp32 must be F32 [patches,1536]"
+            pixels.dtype() == safetensors::Dtype::F32 && pixels.shape().len() == 2,
+            "pixel_values_fp32 must be F32 [patches,{width}]"
+        );
+        ensure!(
+            pixels.shape()[1] == width,
+            "pixel_values_fp32 row width {} does not match the model's {width}-element patch",
+            pixels.shape()[1]
         );
         let pixel_values = pixels
             .data()
@@ -163,7 +189,7 @@ struct Size {
 }
 
 #[derive(Deserialize)]
-struct Config {
+struct QwenConfig {
     size: Size,
     patch_size: usize,
     temporal_patch_size: usize,
@@ -172,30 +198,131 @@ struct Config {
     image_std: [f32; 3],
 }
 
+#[derive(Deserialize)]
+struct MiniCpmConfig {
+    max_slice_nums: usize,
+    image_mean: [f32; 3],
+    image_std: [f32; 3],
+    mrope_mode: String,
+}
+
+enum ImageConfig {
+    Qwen(QwenConfig),
+    MiniCpm(MiniCpmConfig),
+}
+
+struct Crop {
+    pixels: Vec<u8>,
+    width: usize,
+    height: usize,
+}
+
+/// `MiniCPMV4_6ImageProcessor.scale_resolution` defaults to 448.
+const SCALE_RESOLUTION: usize = 448;
+
+struct ImageId {
+    start: u32,
+    end: u32,
+    digits: [u32; 10],
+}
+
+impl ImageId {
+    fn read(tokenizer: &Shared) -> Result<Self> {
+        let mut digits = [0u32; 10];
+        for (value, slot) in digits.iter_mut().enumerate() {
+            *slot = tokenizer.token_id(&value.to_string())?;
+        }
+        Ok(Self {
+            start: tokenizer.token_id("<image_id>")?,
+            end: tokenizer.token_id("</image_id>")?,
+            digits,
+        })
+    }
+
+    fn tag(&self, index: usize) -> Vec<u32> {
+        let mut ids = vec![self.start];
+        for digit in index.to_string().bytes() {
+            ids.push(self.digits[usize::from(digit - b'0')]);
+        }
+        ids.push(self.end);
+        ids
+    }
+}
+
 pub struct Processor {
     spec: ModelSpec,
-    config: Config,
+    config: ImageConfig,
+    image_id: Option<ImageId>,
 }
 
 impl Processor {
-    pub fn load(model: &Path) -> Result<Option<Self>> {
+    pub fn load(model: &Path, tokenizer: Option<&Shared>) -> Result<Option<Self>> {
         let spec = ModelSpec::read(model)?;
-        if spec.architecture != Architecture::Qwen35Text || spec.vision.is_none() {
+        let Some(vision) = spec.vision.as_ref() else {
             return Ok(None);
-        }
-        let config: Config =
-            serde_json::from_reader(std::fs::File::open(model.join("preprocessor_config.json"))?)?;
-        ensure!(
-            config.patch_size == 16
-                && config.temporal_patch_size == 2
-                && config.merge_size == 2
-                && config.image_mean == [0.5; 3]
-                && config.image_std == [0.5; 3]
-                && config.size.shortest_edge == 65536
-                && config.size.longest_edge == 16777216,
-            "unsupported image processor configuration"
-        );
-        Ok(Some(Self { spec, config }))
+        };
+        vision.validate(spec.architecture)?;
+        let path = model.join("preprocessor_config.json");
+        let config = match spec.architecture {
+            Architecture::Qwen35Text => {
+                let config: QwenConfig = serde_json::from_reader(std::fs::File::open(&path)?)?;
+                ensure!(
+                    config.patch_size == 16
+                        && config.temporal_patch_size == 2
+                        && config.merge_size == 2
+                        && config.image_mean == [0.5; 3]
+                        && config.image_std == [0.5; 3]
+                        && config.size.shortest_edge == 65536
+                        && config.size.longest_edge == 16777216,
+                    "unsupported image processor configuration"
+                );
+                ImageConfig::Qwen(config)
+            }
+            Architecture::MiniCpmV47 => {
+                let config: MiniCpmConfig = serde_json::from_reader(std::fs::File::open(&path)?)?;
+                ensure!(
+                    config.max_slice_nums == 9,
+                    "unsupported max_slice_nums: {}",
+                    config.max_slice_nums
+                );
+                ensure!(
+                    config.image_mean == [0.5; 3],
+                    "unsupported image_mean: {:?}",
+                    config.image_mean
+                );
+                ensure!(
+                    config.image_std == [0.5; 3],
+                    "unsupported image_std: {:?}",
+                    config.image_std
+                );
+                ensure!(
+                    config.mrope_mode == "canvas",
+                    "unsupported mrope_mode: {:?}",
+                    config.mrope_mode
+                );
+                ImageConfig::MiniCpm(config)
+            }
+            Architecture::Llama => return Ok(None),
+        };
+        let image_id = match spec.architecture {
+            Architecture::MiniCpmV47 => Some(ImageId::read(
+                tokenizer.context("MiniCPM image ids require the tokenizer")?,
+            )?),
+            _ => None,
+        };
+        Ok(Some(Self {
+            spec,
+            config,
+            image_id,
+        }))
+    }
+
+    pub fn merge(&self) -> u32 {
+        self.spec
+            .vision
+            .as_ref()
+            .map(|vision| vision.merge)
+            .unwrap_or(0)
     }
 
     pub fn prepare_rgb(&self, image: &RgbImage) -> Result<PackedImage> {
@@ -204,45 +331,10 @@ impl Processor {
             image.pixels.len() == count * 3,
             "RGB byte count does not match dimensions"
         );
-        let (height, width) = smart_resize(
-            image.height,
-            image.width,
-            self.config.size.shortest_edge,
-            self.config.size.longest_edge,
-        )?;
-        let resized = resize_bicubic(image, width, height);
-        let gh = height / 16;
-        let gw = width / 16;
-        let mut pixels = Vec::with_capacity(width * height * 3 * 2);
-        for group_y in 0..gh / 2 {
-            for group_x in 0..gw / 2 {
-                for merge_y in 0..2 {
-                    for merge_x in 0..2 {
-                        for channel in 0..3 {
-                            for _temporal in 0..2 {
-                                for y in 0..16 {
-                                    for x in 0..16 {
-                                        let row = (group_y * 2 + merge_y) * 16 + y;
-                                        let col = (group_x * 2 + merge_x) * 16 + x;
-                                        let value =
-                                            resized[(row * width + col) * 3 + channel] as f32;
-                                        pixels.push((value - 127.5) / 127.5);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        match &self.config {
+            ImageConfig::Qwen(config) => qwen_prepare_rgb(image, config),
+            ImageConfig::MiniCpm(config) => mini_cpm_prepare_rgb(&self.spec, image, config),
         }
-        Ok(PackedImage {
-            grid: ImageGrid {
-                t: 1,
-                h: gh as u32,
-                w: gw as u32,
-            },
-            pixel_values: pixels,
-        })
     }
 
     pub fn prepare_url(&self, url: &str) -> Result<PackedImage> {
@@ -252,30 +344,86 @@ impl Processor {
     pub fn plan_url(&self, url: &str) -> Result<PlannedImage> {
         let (bytes, mime) = load_encoded(url)?;
         let (width, height) = image_dimensions(&bytes, Some(&mime))?;
-        let (height, width) = smart_resize(
-            height,
-            width,
-            self.config.size.shortest_edge,
-            self.config.size.longest_edge,
-        )?;
-        Ok(PlannedImage {
-            bytes,
-            mime,
-            grid: ImageGrid {
-                t: 1,
-                h: (height / 16) as u32,
-                w: (width / 16) as u32,
-            },
-        })
+        match &self.config {
+            ImageConfig::Qwen(config) => {
+                let (height, width) = smart_resize(
+                    height,
+                    width,
+                    config.size.shortest_edge,
+                    config.size.longest_edge,
+                )?;
+                Ok(PlannedImage {
+                    bytes,
+                    mime,
+                    grids: vec![ImageGrid {
+                        t: 1,
+                        h: (height / 16) as u32,
+                        w: (width / 16) as u32,
+                    }],
+                    rows: 0,
+                    cols: 0,
+                })
+            }
+            ImageConfig::MiniCpm(config) => {
+                let vision = self
+                    .spec
+                    .vision
+                    .as_ref()
+                    .context("vision configuration missing")?;
+                let (grids, rows, cols) =
+                    mini_cpm_grids(height, width, vision.patch as usize, config.max_slice_nums)?;
+                Ok(PlannedImage {
+                    bytes,
+                    mime,
+                    grids,
+                    rows: rows as u32,
+                    cols: cols as u32,
+                })
+            }
+        }
     }
 
     pub fn prepare_planned(&self, image: PlannedImage) -> Result<PackedImage> {
         let packed = self.prepare_rgb(&decode_image(&image.bytes, Some(&image.mime))?)?;
         ensure!(
-            packed.grid == image.grid,
+            packed.grids == image.grids && packed.rows == image.rows && packed.cols == image.cols,
             "decoded image grid differs from header"
         );
         Ok(packed)
+    }
+
+    pub fn image_tokens(&self, image: &PlannedImage, index: usize) -> Result<usize> {
+        let vision = self
+            .spec
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        match &self.config {
+            ImageConfig::Qwen(_) => image.feature_rows(vision.merge),
+            ImageConfig::MiniCpm(_) => {
+                let thumb = *image.grids.first().context("image has no crops")?;
+                let tag = self
+                    .image_id
+                    .as_ref()
+                    .context("image-id tokens missing")?
+                    .tag(index);
+                let mut tokens = tag.len() + 2 + thumb.feature_rows(vision.merge)?;
+                if image.rows > 0 && image.cols > 0 {
+                    ensure!(
+                        image.grids.len() == 1 + image.rows as usize * image.cols as usize,
+                        "crop count does not match the slice grid"
+                    );
+                    let slice = *image
+                        .grids
+                        .get(1)
+                        .context("sliced image lacks a slice crop")?;
+                    let per_slice = slice.feature_rows(vision.merge)?;
+                    tokens += image.rows as usize - 1;
+                    tokens += image.rows as usize * image.cols as usize * (2 + per_slice);
+                }
+                Ok(tokens)
+            }
+        }
     }
 
     pub fn expanded_token_count(&self, ids: &[u32], images: &[PlannedImage]) -> Result<usize> {
@@ -291,9 +439,10 @@ impl Processor {
         );
         images
             .iter()
-            .try_fold(ids.len() - placeholders, |total, image| {
+            .enumerate()
+            .try_fold(ids.len() - placeholders, |total, (index, image)| {
                 total
-                    .checked_add(image.feature_rows()?)
+                    .checked_add(self.image_tokens(image, index)?)
                     .context("image token count overflow")
             })
     }
@@ -309,45 +458,488 @@ impl Processor {
             .vision
             .as_ref()
             .context("vision configuration missing")?;
-        let mut expanded = Vec::new();
-        let mut prepared = PreparedImages {
-            modality_ids: Vec::new(),
-            pixel_values: Vec::new(),
-            grids: Vec::new(),
-        };
-        let mut images = images.into_iter();
-        for &id in ids {
-            if id == vision.image_token {
-                let image = images
-                    .next()
-                    .context("more image placeholders than supplied images")?;
-                let features = image.grid.feature_rows()?;
-                ensure!(
-                    expanded
-                        .len()
-                        .checked_add(features)
-                        .is_some_and(|n| n <= capacity),
-                    "image tokens exceed request capacity"
-                );
-                expanded.extend(std::iter::repeat_n(id, features));
-                prepared
-                    .modality_ids
-                    .extend(std::iter::repeat_n(1, features));
-                prepared.grids.push(image.grid);
-                prepared.pixel_values.extend(image.pixel_values);
-            } else {
-                ensure!(expanded.len() < capacity, "prompt exceeds request capacity");
-                expanded.push(id);
-                prepared.modality_ids.push(0);
+        match &self.config {
+            ImageConfig::Qwen(_) => expand_qwen(&self.spec, vision, ids, images, capacity),
+            ImageConfig::MiniCpm(_) => expand_mini_cpm(
+                &self.spec,
+                vision,
+                self.image_id.as_ref().context("image-id tokens missing")?,
+                ids,
+                images,
+                capacity,
+            ),
+        }
+    }
+}
+
+fn qwen_prepare_rgb(image: &RgbImage, config: &QwenConfig) -> Result<PackedImage> {
+    let (height, width) = smart_resize(
+        image.height,
+        image.width,
+        config.size.shortest_edge,
+        config.size.longest_edge,
+    )?;
+    let resized = resize_bicubic(image, width, height);
+    let gh = height / 16;
+    let gw = width / 16;
+    let mut pixels = Vec::with_capacity(width * height * 3 * 2);
+    for group_y in 0..gh / 2 {
+        for group_x in 0..gw / 2 {
+            for merge_y in 0..2 {
+                for merge_x in 0..2 {
+                    for channel in 0..3 {
+                        for _temporal in 0..2 {
+                            for y in 0..16 {
+                                for x in 0..16 {
+                                    let row = (group_y * 2 + merge_y) * 16 + y;
+                                    let col = (group_x * 2 + merge_x) * 16 + x;
+                                    let value = resized[(row * width + col) * 3 + channel] as f32;
+                                    pixels.push((value - 127.5) / 127.5);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-        ensure!(
-            images.next().is_none(),
-            "image has no placeholder in rendered prompt"
-        );
-        prepared.input(&expanded).validate(&self.spec, capacity)?;
-        Ok((expanded, prepared))
     }
+    Ok(PackedImage {
+        grids: vec![ImageGrid {
+            t: 1,
+            h: gh as u32,
+            w: gw as u32,
+        }],
+        rows: 0,
+        cols: 0,
+        pixel_values: pixels,
+    })
+}
+
+fn mini_cpm_prepare_rgb(
+    spec: &ModelSpec,
+    image: &RgbImage,
+    config: &MiniCpmConfig,
+) -> Result<PackedImage> {
+    let vision = spec
+        .vision
+        .as_ref()
+        .context("vision configuration missing")?;
+    let patch = vision.patch as usize;
+    let (grids, rows, cols) =
+        mini_cpm_grids(image.height, image.width, patch, config.max_slice_nums)?;
+    let (source_h, source_w) = find_best_resize(
+        image.height as f64,
+        image.width as f64,
+        SCALE_RESOLUTION,
+        patch,
+        rows == 0,
+    );
+    let mut crops = vec![Crop {
+        pixels: resize_bicubic(image, source_w, source_h),
+        width: source_w,
+        height: source_h,
+    }];
+    if rows > 0 {
+        let (refine_h, refine_w) = get_refine_size(
+            image.height,
+            image.width,
+            rows,
+            cols,
+            SCALE_RESOLUTION,
+            patch,
+        )?;
+        let refine = resize_bicubic(image, refine_w, refine_h);
+        let patch_h = refine_h / rows;
+        let patch_w = refine_w / cols;
+        for row in 0..rows {
+            for col in 0..cols {
+                crops.push(crop_rect(
+                    &refine,
+                    refine_w,
+                    row * patch_h,
+                    col * patch_w,
+                    patch_h,
+                    patch_w,
+                ));
+            }
+        }
+    }
+    let patch_h = crops[0].height / patch;
+    let patch_w = crops[0].width / patch;
+    ensure!(
+        crops[0].height == patch_h * patch && crops[0].width == patch_w * patch,
+        "source resize is not patch aligned"
+    );
+    let pixel_values = pack_mini_cpm(&crops, patch, &config.image_mean, &config.image_std)?;
+    Ok(PackedImage {
+        grids,
+        rows: rows as u32,
+        cols: cols as u32,
+        pixel_values,
+    })
+}
+
+fn crop_rect(
+    image: &[u8],
+    width: usize,
+    top: usize,
+    left: usize,
+    height: usize,
+    columns: usize,
+) -> Crop {
+    let mut pixels = Vec::with_capacity(height * columns * 3);
+    for row in 0..height {
+        let start = ((top + row) * width + left) * 3;
+        pixels.extend_from_slice(&image[start..start + columns * 3]);
+    }
+    Crop {
+        pixels,
+        width: columns,
+        height,
+    }
+}
+
+fn pack_mini_cpm(
+    crops: &[Crop],
+    patch: usize,
+    mean: &[f32; 3],
+    std: &[f32; 3],
+) -> Result<Vec<f32>> {
+    let total_patches: usize = crops.iter().try_fold(0usize, |total, crop| {
+        let row = crop.height / patch;
+        let col = crop.width / patch;
+        total
+            .checked_add(row.checked_mul(col).context("crop patch count overflow")?)
+            .context("patch count overflow")
+    })?;
+    let mut pixels = Vec::with_capacity(
+        3usize
+            .saturating_mul(patch)
+            .saturating_mul(total_patches)
+            .saturating_mul(patch),
+    );
+    for channel in 0..3 {
+        for ky in 0..patch {
+            for crop in crops {
+                let cols = crop.width / patch;
+                let rows = crop.height / patch;
+                for patch_index in 0..rows * cols {
+                    let (py, px) = (patch_index / cols, patch_index % cols);
+                    for kx in 0..patch {
+                        let y = py * patch + ky;
+                        let x = px * patch + kx;
+                        let value = crop.pixels[(y * crop.width + x) * 3 + channel] as f32;
+                        let value = value * (1.0 / 255.0);
+                        pixels.push((value - mean[channel]) / std[channel]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(pixels)
+}
+
+fn mini_cpm_grids(
+    height: usize,
+    width: usize,
+    patch: usize,
+    max_slice_nums: usize,
+) -> Result<(Vec<ImageGrid>, usize, usize)> {
+    let sliced = get_sliced_grid(height, width, max_slice_nums, SCALE_RESOLUTION);
+    let (source_h, source_w) = find_best_resize(
+        height as f64,
+        width as f64,
+        SCALE_RESOLUTION,
+        patch,
+        sliced.is_none(),
+    );
+    let mut grids = vec![ImageGrid {
+        t: 1,
+        h: u32::try_from(source_h / patch).context("source grid overflows u32")?,
+        w: u32::try_from(source_w / patch).context("source grid overflows u32")?,
+    }];
+    let (rows, cols) = sliced.unwrap_or((0, 0));
+    if rows > 0 {
+        let (refine_h, refine_w) =
+            get_refine_size(height, width, rows, cols, SCALE_RESOLUTION, patch)?;
+        let patch_h = refine_h / rows;
+        let patch_w = refine_w / cols;
+        ensure!(
+            patch_h.is_multiple_of(patch) && patch_w.is_multiple_of(patch),
+            "slice resize is not patch aligned"
+        );
+        let grid = ImageGrid {
+            t: 1,
+            h: u32::try_from(patch_h / patch).context("slice grid overflows u32")?,
+            w: u32::try_from(patch_w / patch).context("slice grid overflows u32")?,
+        };
+        grids.extend(std::iter::repeat_n(grid, rows * cols));
+    }
+    Ok((grids, rows, cols))
+}
+
+fn ensure_divide(length: f64, divisor: usize) -> usize {
+    let rounded = (length / divisor as f64).round_ties_even() as i64 * divisor as i64;
+    rounded.max(divisor as i64) as usize
+}
+
+fn find_best_resize(
+    height: f64,
+    width: f64,
+    scale_resolution: usize,
+    patch_size: usize,
+    allow_upscale: bool,
+) -> (usize, usize) {
+    let (mut height, mut width) = (height, width);
+    if height * width > (scale_resolution * scale_resolution) as f64 || allow_upscale {
+        let aspect_ratio = width / height;
+        height = (scale_resolution as f64 / aspect_ratio.sqrt()).trunc();
+        width = (height * aspect_ratio).trunc();
+    }
+    let align = patch_size * 4;
+    (ensure_divide(height, align), ensure_divide(width, align))
+}
+
+fn get_refine_size(
+    height: usize,
+    width: usize,
+    rows: usize,
+    cols: usize,
+    scale_resolution: usize,
+    patch_size: usize,
+) -> Result<(usize, usize)> {
+    let refine_width = ensure_divide(width as f64, cols);
+    let refine_height = ensure_divide(height as f64, rows);
+    let (best_height, best_width) = find_best_resize(
+        refine_height as f64 / rows as f64,
+        refine_width as f64 / cols as f64,
+        scale_resolution,
+        patch_size,
+        true,
+    );
+    Ok((best_height * rows, best_width * cols))
+}
+
+fn get_sliced_grid(
+    height: usize,
+    width: usize,
+    max_slice_nums: usize,
+    scale_resolution: usize,
+) -> Option<(usize, usize)> {
+    let log_ratio = (width as f64 / height as f64).ln();
+    let ratio = (width * height) as f64 / (scale_resolution * scale_resolution) as f64;
+    let multiple = (ratio.ceil() as usize).min(max_slice_nums);
+    if multiple <= 1 {
+        return None;
+    }
+    let mut best = (1usize, 1usize);
+    let mut min_error = f64::INFINITY;
+    for num_slices in [multiple.saturating_sub(1), multiple, multiple + 1] {
+        if num_slices == 1 || num_slices > max_slice_nums {
+            continue;
+        }
+        for num_rows in 1..=num_slices {
+            if num_slices.is_multiple_of(num_rows) {
+                let num_cols = num_slices / num_rows;
+                let error = (log_ratio - (num_cols as f64 / num_rows as f64).ln()).abs();
+                if error < min_error {
+                    best = (num_rows, num_cols);
+                    min_error = error;
+                } else if error == min_error && num_rows > best.0 {
+                    best = (num_rows, num_cols);
+                }
+            }
+        }
+    }
+    Some(best)
+}
+
+fn expand_qwen(
+    spec: &ModelSpec,
+    vision: &crate::model_spec::VisionConfig,
+    ids: &[u32],
+    images: Vec<PackedImage>,
+    capacity: usize,
+) -> Result<(Vec<u32>, PreparedImages)> {
+    let mut expanded = Vec::new();
+    let mut prepared = PreparedImages {
+        modality_ids: Vec::new(),
+        pixel_values: Vec::new(),
+        grids: Vec::new(),
+    };
+    let mut images = images.into_iter();
+    for &id in ids {
+        if id == vision.image_token {
+            let image = images
+                .next()
+                .context("more image placeholders than supplied images")?;
+            let grid = *image.grids.first().context("image has no crops")?;
+            let features = grid.feature_rows(vision.merge)?;
+            ensure!(
+                expanded
+                    .len()
+                    .checked_add(features)
+                    .is_some_and(|n| n <= capacity),
+                "image tokens exceed request capacity"
+            );
+            expanded.extend(std::iter::repeat_n(id, features));
+            prepared
+                .modality_ids
+                .extend(std::iter::repeat_n(1, features));
+            prepared.grids.push(grid);
+            prepared.pixel_values.extend(image.pixel_values);
+        } else {
+            ensure!(expanded.len() < capacity, "prompt exceeds request capacity");
+            expanded.push(id);
+            prepared.modality_ids.push(0);
+        }
+    }
+    ensure!(
+        images.next().is_none(),
+        "image has no placeholder in rendered prompt"
+    );
+    prepared.input(&expanded).validate(spec, capacity)?;
+    Ok((expanded, prepared))
+}
+
+fn expand_mini_cpm(
+    spec: &ModelSpec,
+    vision: &crate::model_spec::VisionConfig,
+    image_id: &ImageId,
+    ids: &[u32],
+    images: Vec<PackedImage>,
+    capacity: usize,
+) -> Result<(Vec<u32>, PreparedImages)> {
+    let markers = vision
+        .minicpm
+        .as_ref()
+        .context("MiniCPM vision configuration missing")?;
+    let mut expanded = Vec::new();
+    let mut prepared = PreparedImages {
+        modality_ids: Vec::new(),
+        pixel_values: Vec::new(),
+        grids: Vec::new(),
+    };
+    let mut packed: Vec<Vec<f32>> = Vec::new();
+    let mut packed_patches: Vec<usize> = Vec::new();
+    let mut images = images.into_iter();
+    let mut index = 0usize;
+    for &id in ids {
+        if id == vision.image_token {
+            let image = images
+                .next()
+                .context("more image placeholders than supplied images")?;
+            let tag = image_id.tag(index);
+            index += 1;
+            let thumb = *image.grids.first().context("image has no crops")?;
+            let thumb_tokens = thumb.feature_rows(vision.merge)?;
+            let mut block = tag.len() + 2 + thumb_tokens;
+            if image.rows > 0 && image.cols > 0 {
+                ensure!(
+                    image.grids.len() == 1 + image.rows as usize * image.cols as usize,
+                    "crop count does not match the slice grid"
+                );
+                let slice = *image
+                    .grids
+                    .get(1)
+                    .context("sliced image lacks a slice crop")?;
+                let per_slice = slice.feature_rows(vision.merge)?;
+                block += image.rows as usize - 1;
+                block += image.rows as usize * image.cols as usize * (2 + per_slice);
+            } else {
+                ensure!(image.grids.len() == 1, "unsliced image carries slice crops");
+            }
+            ensure!(
+                expanded
+                    .len()
+                    .checked_add(block)
+                    .is_some_and(|n| n <= capacity),
+                "image tokens exceed request capacity"
+            );
+            let tag_len = tag.len();
+            expanded.extend(tag);
+            prepared
+                .modality_ids
+                .extend(std::iter::repeat_n(0, tag_len));
+            expanded.push(vision.start_token);
+            prepared.modality_ids.push(0);
+            expanded.extend(std::iter::repeat_n(id, thumb_tokens));
+            prepared
+                .modality_ids
+                .extend(std::iter::repeat_n(1, thumb_tokens));
+            expanded.push(vision.end_token);
+            prepared.modality_ids.push(0);
+            if image.rows > 0 && image.cols > 0 {
+                let slice = *image
+                    .grids
+                    .get(1)
+                    .context("sliced image lacks a slice crop")?;
+                let per_slice = slice.feature_rows(vision.merge)?;
+                for row in 0..image.rows {
+                    if row > 0 {
+                        expanded.push(markers.newline_token);
+                        prepared.modality_ids.push(0);
+                    }
+                    for _ in 0..image.cols {
+                        expanded.push(markers.slice_start_token);
+                        prepared.modality_ids.push(0);
+                        expanded.extend(std::iter::repeat_n(id, per_slice));
+                        prepared
+                            .modality_ids
+                            .extend(std::iter::repeat_n(1, per_slice));
+                        expanded.push(markers.slice_end_token);
+                        prepared.modality_ids.push(0);
+                    }
+                }
+            }
+            packed_patches.push(image.grids.iter().try_fold(0usize, |total, grid| {
+                total
+                    .checked_add(grid.patch_rows()?)
+                    .context("patch count overflow")
+            })?);
+            prepared.grids.extend(image.grids);
+            packed.push(image.pixel_values);
+        } else {
+            ensure!(expanded.len() < capacity, "prompt exceeds request capacity");
+            expanded.push(id);
+            prepared.modality_ids.push(0);
+        }
+    }
+    ensure!(
+        images.next().is_none(),
+        "image has no placeholder in rendered prompt"
+    );
+    prepared.pixel_values = interleave_mini_cpm(&packed, &packed_patches, vision.patch as usize)?;
+    prepared.input(&expanded).validate(spec, capacity)?;
+    Ok((expanded, prepared))
+}
+
+fn interleave_mini_cpm(vectors: &[Vec<f32>], patches: &[usize], patch: usize) -> Result<Vec<f32>> {
+    let total = patches.iter().try_fold(0usize, |total, &count| {
+        total.checked_add(count).context("patch count overflow")
+    })?;
+    let expected = 3usize
+        .checked_mul(patch)
+        .and_then(|n| n.checked_mul(total))
+        .and_then(|n| n.checked_mul(patch))
+        .context("pixel count overflow")?;
+    for (vector, &count) in vectors.iter().zip(patches) {
+        ensure!(
+            vector.len() == 3 * patch * count * patch,
+            "image pixel count does not match its crops"
+        );
+    }
+    let mut pixels = Vec::with_capacity(expected);
+    for channel in 0..3 {
+        for ky in 0..patch {
+            for (vector, &count) in vectors.iter().zip(patches) {
+                let row = count * patch;
+                let start = (channel * patch + ky) * row;
+                pixels.extend_from_slice(&vector[start..start + row]);
+            }
+        }
+    }
+    Ok(pixels)
 }
 
 fn checked_pixels(width: usize, height: usize) -> Result<usize> {
@@ -633,6 +1225,48 @@ mod tests {
     use crate::serve::detok::Shared;
 
     #[test]
+    fn image_input_files_use_the_model_patch_width() -> Result<()> {
+        let root: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/data/minicpm-config.json"))?;
+        let spec = ModelSpec::minicpm(
+            &root,
+            &serde_json::json!({"eos_token_id": [248044, 248046]}),
+        )?;
+        let width = spec
+            .vision
+            .as_ref()
+            .unwrap()
+            .patch_elements(spec.architecture)?;
+        assert_eq!(width, 588);
+        let prepared = PreparedImages {
+            modality_ids: vec![0, 1, 1, 0],
+            pixel_values: (0..16 * width).map(|i| i as f32 / 1024.0).collect(),
+            grids: vec![ImageGrid { t: 1, h: 4, w: 4 }],
+        };
+        let ids = [1u32, 2, 3, 4];
+        let path =
+            std::env::temp_dir().join(format!("ff-image-roundtrip-minicpm-{}", std::process::id()));
+        prepared.save(&spec, &ids, &path)?;
+        let replay = PreparedImages::read(&spec, &path, &ids)?;
+        assert_eq!(replay.grids, prepared.grids);
+        assert_eq!(replay.modality_ids, prepared.modality_ids);
+        assert_eq!(replay.pixel_values, prepared.pixel_values);
+        let qwen: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/data/q38-config.json"))?;
+        let qwen = ModelSpec::qwen(&qwen, &serde_json::Value::Null)?;
+        let error = match PreparedImages::read(&qwen, &path, &ids) {
+            Ok(_) => anyhow::bail!("Qwen-width read must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("588") && error.contains("1536"), "{error}");
+        let mut mismatched = prepared;
+        mismatched.pixel_values.pop();
+        assert!(mismatched.save(&spec, &ids, &path).is_err());
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[test]
     fn smart_resize_matches_qwen_grid_and_rejects_invalid_dimensions() -> Result<()> {
         assert_eq!(smart_resize(1024, 1024, 65536, 16777216)?, (1024, 1024));
         assert_eq!(smart_resize(1500, 900, 65536, 16777216)?, (1504, 896));
@@ -687,7 +1321,8 @@ mod tests {
         let model = std::env::var("FF_Q38_MODEL")?;
         let fixtures = std::env::var("FF_Q38_FIXTURE_DIR")?;
         let media = std::env::var("FF_Q38_IMAGE_DIR")?;
-        let processor = Processor::load(Path::new(&model))?.context("Qwen image processor")?;
+        let model = Path::new(&model);
+        let processor = Processor::load(model, None)?.context("Qwen image processor")?;
         let tokenizer = Shared::load(Path::new(&model))?;
         let prompt = "<|vision_start|><|image_pad|><|vision_end|>Describe every text block and figure in this document image, then summarize its purpose.";
         for (name, file) in [
@@ -713,9 +1348,9 @@ mod tests {
             let packed = processor.prepare_rgb(&image)?;
             assert_eq!(
                 [
-                    packed.grid.t as i64,
-                    packed.grid.h as i64,
-                    packed.grid.w as i64
+                    packed.grids[0].t as i64,
+                    packed.grids[0].h as i64,
+                    packed.grids[0].w as i64
                 ],
                 expected_grid.as_slice(),
                 "{name} grid"
@@ -723,7 +1358,7 @@ mod tests {
             let expected = tensors.tensor("pixel_values_fp32")?;
             let bf16 = tensors.tensor("pixel_values_bf16")?;
             let u8_values = tensors.tensor("pixel_values_uint8")?;
-            assert_eq!(expected.shape(), [packed.grid.patch_rows()?, 1536]);
+            assert_eq!(expected.shape(), [packed.grids[0].patch_rows()?, 1536]);
             let mut f32_max = 0.0_f32;
             let mut bf16_max = 0.0_f32;
             let mut bf16_different = 0;
@@ -744,8 +1379,8 @@ mod tests {
                 let actual_byte = ((actual + 1.0) * 127.5).round().clamp(0.0, 255.0) as u8;
                 u8_max = u8_max.max(actual_byte.abs_diff(byte));
             }
-            let resized = image.width != packed.grid.w as usize * 16
-                || image.height != packed.grid.h as usize * 16;
+            let resized = image.width != packed.grids[0].w as usize * 16
+                || image.height != packed.grids[0].h as usize * 16;
             let tolerance = if resized {
                 4.0 / 255.0 + 4.0 * f32::EPSILON
             } else {

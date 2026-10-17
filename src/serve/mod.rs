@@ -183,18 +183,21 @@ fn run_inner(
     let handle = thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
-            let loaded = if let Some(depth) = mtp {
-                Model::check_resident_vision_budget(&target, &engine_options)
-                    .and_then(|()| Model::load_mtp(&target, &engine_options, depth, true))
-                    .and_then(|mut model| {
-                        model.prepare_resident_vision()?;
-                        Ok(model)
-                    })
-            } else {
-                load_model(&target, &engine_options)
-            };
-            let model = match loaded {
-                Ok(model) => model,
+            let loaded = crate::model_spec::ModelSpec::read(&target).and_then(|spec| {
+                let model = if let Some(depth) = mtp {
+                    Model::check_resident_vision_budget(&target, &engine_options)
+                        .and_then(|()| Model::load_mtp(&target, &engine_options, depth, true))
+                        .and_then(|mut model| {
+                            model.prepare_resident_vision()?;
+                            Ok(model)
+                        })
+                } else {
+                    load_model(&target, &engine_options)
+                }?;
+                Ok((model, spec))
+            });
+            let (model, model_spec) = match loaded {
+                Ok(loaded) => loaded,
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
                     return;
@@ -204,6 +207,7 @@ fn run_inner(
             engine_loop(
                 model,
                 engine_options,
+                model_spec,
                 command_rx,
                 engine_slot,
                 mtp.is_some(),
@@ -226,6 +230,7 @@ fn run_inner(
 fn engine_loop(
     mut model: Model,
     options: SpecOptions,
+    model_spec: crate::model_spec::ModelSpec,
     commands: mpsc::Receiver<EngineCommand>,
     slot: Arc<Mutex<Slot>>,
     mtp: bool,
@@ -233,7 +238,15 @@ fn engine_loop(
     while let Ok(command) = commands.recv() {
         match command {
             EngineCommand::Generate { request, events } => {
-                generate_once(&mut model, &options, request, events, &commands, mtp);
+                generate_once(
+                    &mut model,
+                    &options,
+                    &model_spec,
+                    request,
+                    events,
+                    &commands,
+                    mtp,
+                );
                 let recovered = if mtp { model.reset_mtp() } else { Ok(()) };
                 let mut state = slot.lock().unwrap_or_else(|e| e.into_inner());
                 *state = if recovered.is_ok() {
@@ -254,6 +267,7 @@ fn engine_loop(
 fn generate_once(
     model: &mut Model,
     options: &SpecOptions,
+    model_spec: &crate::model_spec::ModelSpec,
     request: Request,
     events: tokio_mpsc::Sender<EngineEvent>,
     commands: &mpsc::Receiver<EngineCommand>,
@@ -286,7 +300,7 @@ fn generate_once(
         ));
         return;
     }
-    let input_dump = match trace_image_input(&request) {
+    let input_dump = match trace_image_input(model_spec, &request) {
         Ok(path) => path,
         Err(error) => {
             let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
@@ -405,7 +419,10 @@ fn generate_once(
     }
 }
 
-fn trace_image_input(request: &Request) -> Result<Option<std::path::PathBuf>> {
+fn trace_image_input(
+    spec: &crate::model_spec::ModelSpec,
+    request: &Request,
+) -> Result<Option<std::path::PathBuf>> {
     if !std::env::var("FLYINGFISH_SERVE_TRACE_IDS").is_ok_and(|v| v == "1") {
         return Ok(None);
     }
@@ -423,7 +440,7 @@ fn trace_image_input(request: &Request) -> Result<Option<std::path::PathBuf>> {
         "image-input-{}-{sequence}.safetensors",
         std::process::id()
     ));
-    images.save(&request.ids, &path)?;
+    images.save(spec, &request.ids, &path)?;
     Ok(Some(path))
 }
 

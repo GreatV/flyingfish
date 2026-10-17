@@ -45,7 +45,7 @@ pub fn serve(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "flyingfish".into());
     let bos_token = read_bos_token(&model_dir)?;
-    let image_processor = super::image::Processor::load(&model_dir)?;
+    let image_processor = super::image::Processor::load(&model_dir, Some(&shared))?;
     let state = Arc::new(AppState {
         backend,
         shared,
@@ -627,7 +627,7 @@ fn prepare_message_images(
                         .context("image_url needs a string url")?;
                     let image = processor.plan_url(url)?;
                     image_tokens = image_tokens
-                        .checked_add(image.feature_rows()?)
+                        .checked_add(processor.image_tokens(&image, images.len())?)
                         .context("image token count overflow")?;
                     anyhow::ensure!(
                         image_tokens <= state.backend.options().capacity,
@@ -1074,7 +1074,7 @@ mod tests {
                 "image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5]
             }))?,
         )?;
-        let processor = super::super::image::Processor::load(&dir)?.context("processor")?;
+        let processor = super::super::image::Processor::load(&dir, None)?.context("processor")?;
         std::fs::remove_dir_all(dir)?;
         Ok(processor)
     }
@@ -1166,7 +1166,8 @@ mod tests {
         let (state, commands) = image_request_state(Slot::Running, "busy")?;
         let url = pixel_fixture(false)?;
         let processor = state.image_processor.as_ref().unwrap();
-        assert_eq!(processor.plan_url(&url)?.feature_rows()?, 64);
+        let planned = processor.plan_url(&url)?;
+        assert_eq!(processor.image_tokens(&planned, 0)?, 64);
         assert!(processor.prepare_url(&url).is_err());
         let response = image_response(state.clone(), &url).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -1229,7 +1230,8 @@ mod tests {
             .context("IDAT")?;
         png.truncate(idat + 4);
         let url = format!("data:image/png;base64,{}", base64::encode(png));
-        assert_eq!(processor.plan_url(&url)?.feature_rows()?, 64);
+        let planned = processor.plan_url(&url)?;
+        assert_eq!(processor.image_tokens(&planned, 0)?, 64);
         assert!(
             processor.prepare_url(&url).is_err(),
             "fixture must reject pixel decoding"
@@ -1304,7 +1306,7 @@ mod tests {
                 Slot::Idle,
             );
             Arc::get_mut(&mut state).unwrap().image_processor =
-                super::super::image::Processor::load(model)?;
+                super::super::image::Processor::load(model, None)?;
             if index == 0 {
                 let rejected = serde_json::from_value(json!({
                     "messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///etc/passwd"}}]}],
@@ -1342,14 +1344,15 @@ mod tests {
             let features: usize = prepared
                 .grids
                 .iter()
-                .map(|g| g.feature_rows().unwrap())
+                .map(|g| g.feature_rows(2).unwrap())
                 .sum();
             assert_eq!(
                 prepared.modality_ids.iter().filter(|&&v| v == 1).count(),
                 features
             );
             assert_eq!(prepared.pixel_values.len(), features * 4 * 1536);
-            let processor = super::super::image::Processor::load(model)?.context("processor")?;
+            let processor =
+                super::super::image::Processor::load(model, None)?.context("processor")?;
             let mut direct_pixels = Vec::new();
             for file in case["files"].as_array().unwrap() {
                 let image = super::super::image::decode_image(
@@ -1370,9 +1373,10 @@ mod tests {
                 "flyingfish-image-roundtrip-{}-{index}.safetensors",
                 std::process::id()
             ));
-            prepared.save(&request.ids, &path)?;
-            let replay = super::super::image::PreparedImages::read(&path, &request.ids)?;
-            assert!(super::super::image::PreparedImages::read(&path, &[0]).is_err());
+            let spec = crate::model_spec::ModelSpec::read(model)?;
+            prepared.save(&spec, &request.ids, &path)?;
+            let replay = super::super::image::PreparedImages::read(&spec, &path, &request.ids)?;
+            assert!(super::super::image::PreparedImages::read(&spec, &path, &[0]).is_err());
             std::fs::remove_file(&path)?;
             assert_eq!(replay.grids, prepared.grids);
             assert_eq!(replay.modality_ids, prepared.modality_ids);

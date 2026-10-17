@@ -338,15 +338,18 @@ fn generate(
         image_tensors.is_none() || cli.draft_model.is_none(),
         "image input does not support a draft model"
     );
-    let images = image_tensors
-        .as_ref()
-        .map(|path| flyingfish::serve::image::PreparedImages::read(path, &ids))
-        .transpose()?;
-    if let Some(images) = &images {
-        images.input(&ids).validate(
-            &flyingfish::model_spec::ModelSpec::read(&cli.model)?,
-            cli.capacity,
-        )?;
+    let model_spec = match &image_tensors {
+        Some(_) => Some(flyingfish::model_spec::ModelSpec::read(&cli.model)?),
+        None => None,
+    };
+    let images = match (&image_tensors, &model_spec) {
+        (Some(path), Some(spec)) => Some(flyingfish::serve::image::PreparedImages::read(
+            spec, path, &ids,
+        )?),
+        _ => None,
+    };
+    if let (Some(images), Some(spec)) = (&images, &model_spec) {
+        images.input(&ids).validate(spec, cli.capacity)?;
     }
     if let Some(draft) = &cli.draft_model {
         ensure!(
