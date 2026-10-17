@@ -560,8 +560,7 @@ impl GdnOps {
         let ws_ptr = scratch.ptr;
 
         let span = mul(mul(u64::from(cd), el_bf)?, u64::from(rows))?;
-        // Column offsets into `qkv` in bytes (ABI §6): Q at 0 width plan.spec.hk*plan.spec.dk, K next width plan.spec.hk*plan.spec.dk,
-        // V next width plan.spec.hv*plan.spec.dv.
+        // Packed Q/K each have hk * dk channels; V has hv * dv channels.
         let q_off = 0u64;
         let k_off = u64::from(plan.spec.hk * plan.spec.dk) * el_bf;
         let v_off = add(k_off, u64::from(plan.spec.hk * plan.spec.dk) * el_bf)?;
@@ -656,8 +655,7 @@ impl GdnOps {
                 .arg(&beta_fp32.0.ptr)
                 .arg(&meta.ptr)
                 .launch(plan.beta_cfg)?;
-            // Q/K widened and GQA-expanded to value heads, Q scaled by 1/sqrt(plan.spec.dk) after the widen;
-            // V stays a conv_out column window with row stride conv_dim. The P2 plan skips this launch.
+            // Q/K expand to value heads; Q is scaled by 1/sqrt(dk).
             if !plan.cw_p2 {
                 stream
                     .launch_builder(&plan.kernels.prep)

@@ -205,7 +205,11 @@ fn check_bindings(
     spec: &FullAttentionSpec,
 ) -> Result<()> {
     if let Some(cache) = b.compact {
-        ensure!(spec.hkv == 4, "compact attention requires four KV heads");
+        ensure!(
+            spec.hkv == 4,
+            "compact attention requires hkv=4, got hkv={}",
+            spec.hkv
+        );
         cache.validate(limits.capacity, limits.max_rows)?;
         ensure!(
             cache.k_ring == b.k_cache.0.ptr && cache.v_ring == b.v_cache.0.ptr,

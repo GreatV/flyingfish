@@ -110,7 +110,10 @@ impl FullAttentionSpec {
     pub fn from_model(spec: &crate::model_spec::ModelSpec) -> Result<Self> {
         ensure!(
             spec.q_heads.checked_mul(spec.head_dim) == Some(spec.q_width),
-            "attention projection width differs from q_heads * head_dim"
+            "attention q_width={} differs from q_heads={} * head_dim={}",
+            spec.q_width,
+            spec.q_heads,
+            spec.head_dim
         );
         let bound = Self {
             hq: spec.q_heads,
@@ -152,7 +155,7 @@ impl FullAttentionSpec {
                 && self.rms_eps == 1e-6
                 && self.rope_theta == 1e7
                 && self.rotary_dim == 64,
-            "unsupported full-attention specification"
+            "unsupported full-attention specification: {self:?}"
         );
         Ok(())
     }
@@ -305,7 +308,7 @@ impl GdnSpec {
                 && self.decode_value_split == 2
                 && self.rms_eps == 1e-6
                 && self.l2_eps == 1e-6,
-            "unsupported GDN plan; expected {}",
+            "unsupported GDN plan {self:?}; expected {}",
             Self::PLAN_ID
         );
         Ok(())
