@@ -1,0 +1,1066 @@
+//! Native expert DMA ownership and the CPU residency runtime.
+use super::*;
+use crate::experts::{
+    arena::WriteClaim,
+    catalogue::ExpertCatalogue,
+    disk::{DiskExperts, DiskReader},
+    plan::Tier,
+    runtime::{MoveSource, PromptMove, Residency},
+};
+use cudarc::driver::CudaFunction;
+use std::cell::RefCell;
+
+#[derive(Clone)]
+struct Ticket {
+    id: u64,
+    event: Arc<CudaEvent>,
+}
+
+struct Events {
+    pool: Vec<Arc<CudaEvent>>,
+    ids: Vec<u64>,
+    epoch: u64,
+    cursor: usize,
+}
+
+fn event_index(id: u64, ids: &[u64]) -> Result<usize> {
+    ensure!(id > 0 && !ids.is_empty(), "invalid expert event id={id}");
+    let index = ((id - 1) % ids.len() as u64) as usize;
+    ensure!(
+        ids[index] == id,
+        "stale expert event id={id} current={} index={index}",
+        ids[index]
+    );
+    Ok(index)
+}
+
+impl Events {
+    #[cfg(test)]
+    fn new(context: &Arc<CudaContext>, count: usize) -> Result<Self> {
+        ensure!(count > 0, "empty expert event pool");
+        Ok(Self {
+            pool: (0..count)
+                .map(|_| Ok(Arc::new(context.new_event(None)?)))
+                .collect::<Result<_>>()?,
+            ids: vec![0; count],
+            epoch: 0,
+            cursor: 0,
+        })
+    }
+
+    fn record(&mut self, stream: &Arc<CudaStream>) -> Result<Ticket> {
+        let index = (0..self.pool.len())
+            .map(|offset| (self.cursor + offset) % self.pool.len())
+            .find(|&index| Arc::strong_count(&self.pool[index]) == 1)
+            .context("expert event pool has no unowned handle")?;
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .context("expert event epoch overflow")?;
+        let id = self
+            .epoch
+            .checked_mul(self.pool.len() as u64)
+            .and_then(|base| base.checked_add(index as u64 + 1))
+            .context("expert event id overflow")?;
+        self.pool[index].record(stream)?;
+        self.ids[index] = id;
+        self.cursor = (index + 1) % self.pool.len();
+        Ok(Ticket {
+            id,
+            event: self.pool[index].clone(),
+        })
+    }
+
+    fn wait(&self, stream: &Arc<CudaStream>, id: u64) -> Result<()> {
+        let index = event_index(id, &self.ids)?;
+        ensure!(
+            Arc::strong_count(&self.pool[index]) > 1,
+            "expert event id={id} has no lifetime owner"
+        );
+        stream.wait(&self.pool[index])?;
+        Ok(())
+    }
+}
+
+struct Reader {
+    disk: DiskReader,
+    context: Arc<CudaContext>,
+    registrations: Vec<u64>,
+    copied: Vec<Option<Ticket>>,
+}
+
+impl Reader {
+    #[cfg(test)]
+    fn new(device: &Device, disk: DiskReader, catalogue: &ExpertCatalogue) -> Result<Self> {
+        let slots = disk.ring_slots() as usize;
+        let mut reader = Self {
+            disk,
+            context: device.ctx.clone(),
+            registrations: Vec::with_capacity(slots),
+            copied: vec![None; slots],
+        };
+        device.ctx.bind_to_thread()?;
+        for _ in 0..slots {
+            let slot = reader.disk.read_expert(0, 0, catalogue)?;
+            let values = reader.disk.values(slot)?;
+            let address = values.as_ptr() as u64;
+            let bytes = std::mem::size_of_val(values.values());
+            ensure!(
+                !reader.registrations.contains(&address),
+                "disk ring registration repeated address={address:#x}"
+            );
+            // SAFETY: the reader owns every stable ring allocation through unregister.
+            unsafe {
+                cudarc::driver::sys::cuMemHostRegister_v2(
+                    address as *mut std::ffi::c_void,
+                    bytes,
+                    0,
+                )
+                .result()
+            }
+            .with_context(|| format!("register expert disk ring: slot={slot} bytes={bytes}"))?;
+            reader.registrations.push(address);
+        }
+        Ok(reader)
+    }
+
+    fn read(&mut self, layer: u32, expert: u32, catalogue: &ExpertCatalogue) -> Result<u32> {
+        for (slot, event) in self.copied.iter_mut().enumerate() {
+            let complete = if let Some(ticket) = event.as_ref() {
+                ticket.event.try_is_complete()?
+            } else {
+                false
+            };
+            if complete {
+                let completed = event.take().context("expert ring event disappeared")?;
+                self.disk.reclaim(slot as u32, completed.id)?;
+            }
+        }
+        if self.copied.iter().all(Option::is_some) {
+            let (slot, _) = self
+                .copied
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, event)| event.as_ref().map(|ticket| ticket.id))
+                .context("expert disk ring has no slots")?;
+            let event = self.copied[slot]
+                .take()
+                .context("expert disk ring event missing")?;
+            event.event.synchronize()?;
+            self.disk.reclaim(slot as u32, event.id)?;
+        }
+        self.disk.read_expert(layer, expert, catalogue)
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.context.record_err(self.context.synchronize());
+        self.context.record_err(self.context.bind_to_thread());
+        for &address in &self.registrations {
+            // SAFETY: all ring DMA is complete and the owned allocation is still live.
+            self.context.record_err(unsafe {
+                cudarc::driver::sys::cuMemHostUnregister(address as *mut std::ffi::c_void).result()
+            });
+        }
+    }
+}
+
+#[derive(Default)]
+struct HostUse {
+    claim: Option<WriteClaim>,
+    event: Option<Ticket>,
+    staged: Option<usize>,
+}
+
+struct Stage {
+    values: PinnedHostSlice<bf16>,
+    event: Option<Ticket>,
+    destination: Option<u32>,
+}
+
+pub(in crate::backend::cuda::engine) struct Transfers {
+    host: Option<Arc<HostBlocks>>,
+    host_use: Vec<RefCell<HostUse>>,
+    stages: Vec<RefCell<Stage>>,
+    h2d_cursor: usize,
+    d2h_cursor: usize,
+    per_direction: usize,
+    h2d: Arc<CudaStream>,
+    d2h: Arc<CudaStream>,
+    pinned: bool,
+}
+
+impl Transfers {
+    #[cfg(test)]
+    fn new(
+        device: &Device,
+        storage: &super::super::super::weights::ExpertStorage,
+        pinned: bool,
+        engines: u32,
+    ) -> Result<Self> {
+        ensure!(
+            engines > 0,
+            "expert copies require at least one measured copy engine"
+        );
+        let host = storage.host().cloned();
+        ensure!(
+            !pinned || host.is_some(),
+            "pinned expert plan has no host arena"
+        );
+        let host_use = (0..host.as_ref().map_or(0, |arena| arena.blocks()))
+            .map(|_| RefCell::new(HostUse::default()))
+            .collect();
+        let elements = usize::try_from(storage.layout().geometry().slot_bytes()? / 2)?;
+        let per_direction = engines.min(2) as usize;
+        let stages = if !pinned && host.is_some() {
+            2 * per_direction
+        } else {
+            0
+        };
+        Ok(Self {
+            host,
+            host_use,
+            stages: (0..stages)
+                .map(|_| {
+                    Ok(RefCell::new(Stage {
+                        values: pinned_zeros(&device.ctx, elements)?,
+                        event: None,
+                        destination: None,
+                    }))
+                })
+                .collect::<Result<_>>()?,
+            h2d_cursor: 0,
+            d2h_cursor: per_direction,
+            per_direction,
+            h2d: device.upload.clone(),
+            d2h: if engines >= 2 {
+                device.ctx.new_stream()?
+            } else {
+                device.upload.clone()
+            },
+            pinned,
+        })
+    }
+
+    fn flush_stage(&self, index: usize) -> Result<()> {
+        let mut stage = self
+            .stages
+            .get(index)
+            .context("expert staging index outside allocation")?
+            .borrow_mut();
+        if let Some(event) = stage.event.as_ref() {
+            event.event.synchronize()?;
+        }
+        if let Some(block) = stage.destination.take() {
+            let mut target = self.host_use[block as usize].borrow_mut();
+            target
+                .claim
+                .as_mut()
+                .context("staged expert write-back has no writer claim")?
+                .slice()?
+                .copy_from_slice(stage.values.as_slice()?);
+            target.staged = None;
+            target.claim.take();
+        }
+        stage.event = None;
+        Ok(())
+    }
+
+    fn ready_host(&self, block: u32) -> Result<()> {
+        let usage = self
+            .host_use
+            .get(block as usize)
+            .context("expert host block outside arena")?;
+        let staged = usage.borrow().staged;
+        if let Some(index) = staged {
+            return self.flush_stage(index);
+        }
+        let mut usage = usage.borrow_mut();
+        if usage.claim.is_some() {
+            usage
+                .event
+                .as_ref()
+                .context("expert host claim has no DMA completion")?
+                .event
+                .synchronize()?;
+            usage.claim.take();
+        }
+        Ok(())
+    }
+
+    fn claim(&self, block: u32) -> Result<u64> {
+        let arena = self.host.as_ref().context("expert DMA has no host arena")?;
+        let mut usage = self
+            .host_use
+            .get(block as usize)
+            .context("expert host block outside arena")?
+            .borrow_mut();
+        if usage.claim.is_none() {
+            usage.claim = Some(arena.claim(block)?);
+        }
+        usage
+            .claim
+            .as_ref()
+            .context("expert host writer claim missing")?
+            .pointer()
+    }
+
+    fn wait_host(&self, block: u32, stream: &Arc<CudaStream>) -> Result<()> {
+        let usage = self
+            .host_use
+            .get(block as usize)
+            .context("expert host block outside arena")?
+            .borrow();
+        if let Some(event) = &usage.event {
+            stream.wait(&event.event)?;
+        }
+        Ok(())
+    }
+
+    fn source_host(&mut self, block: u32) -> Result<(u64, Option<usize>)> {
+        if self.pinned {
+            let pointer = self.claim(block)?;
+            self.wait_host(block, &self.h2d)?;
+            return Ok((pointer, None));
+        }
+        self.ready_host(block)?;
+        let index = self.h2d_cursor;
+        self.h2d_cursor = (self.h2d_cursor + 1) % self.per_direction;
+        self.flush_stage(index)?;
+        let lease = self
+            .host
+            .as_ref()
+            .context("expert host source missing")?
+            .lease(&[block])?;
+        let mut stage = self.stages[index].borrow_mut();
+        stage
+            .values
+            .as_mut_slice()?
+            .copy_from_slice(lease.read(block)?);
+        Ok((stage.values.as_ptr()? as u64, Some(index)))
+    }
+
+    fn write_back(
+        &mut self,
+        pointer: u64,
+        block: u32,
+        bytes: usize,
+        events: &mut Events,
+    ) -> Result<Ticket> {
+        let stage = if self.pinned {
+            None
+        } else {
+            self.ready_host(block)?;
+            let index = self.d2h_cursor;
+            self.d2h_cursor = self.per_direction
+                + (self.d2h_cursor - self.per_direction + 1) % self.per_direction;
+            self.flush_stage(index)?;
+            Some(index)
+        };
+        let claimed = self.claim(block)?;
+        self.wait_host(block, &self.d2h)?;
+        let destination = if let Some(index) = stage {
+            self.stages[index].borrow_mut().values.as_mut_ptr()? as u64
+        } else {
+            claimed
+        };
+        self.d2h.context().bind_to_thread()?;
+        // SAFETY: the full native slot and its claimed host or pinned destination stay owned.
+        unsafe {
+            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                destination as *mut std::ffi::c_void,
+                pointer,
+                bytes,
+                self.d2h.cu_stream(),
+            )
+            .result()
+        }
+        .with_context(|| format!("expert write-back: block={block} bytes={bytes}"))?;
+        let completed = events.record(&self.d2h)?;
+        let mut usage = self.host_use[block as usize].borrow_mut();
+        usage.event = Some(completed.clone());
+        usage.staged = stage;
+        if let Some(index) = stage {
+            let mut stage = self.stages[index].borrow_mut();
+            stage.event = Some(completed.clone());
+            stage.destination = Some(block);
+        }
+        Ok(completed)
+    }
+
+    fn copied_host(&self, block: u32, staging: Option<usize>, event: &Ticket) {
+        self.host_use[block as usize].borrow_mut().event = Some(event.clone());
+        if let Some(index) = staging {
+            self.stages[index].borrow_mut().event = Some(event.clone());
+        }
+    }
+
+    fn finish(&self) -> Result<()> {
+        for index in 0..self.stages.len() {
+            self.flush_stage(index)?;
+        }
+        for block in 0..self.host_use.len() {
+            self.ready_host(block as u32)?;
+        }
+        Ok(())
+    }
+
+    pub fn ready_weights(&self, weights: &[ExpertWeights]) -> Result<()> {
+        let arena = self
+            .host
+            .as_ref()
+            .context("CPU host weights have no host arena")?;
+        for weights in weights {
+            self.ready_host(u32::try_from(
+                weights.gate_up.start / arena.block_elements(),
+            )?)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct Physical {
+    pointer: u64,
+    copy: Option<Ticket>,
+    reader: Option<Ticket>,
+    waited: bool,
+}
+
+#[cfg(test)]
+pub(super) struct Load<'a> {
+    pub capacity: &'a crate::experts::plan::Capacity,
+    pub admission: crate::experts::plan::Admission,
+    pub initial: &'a [Vec<u32>],
+    pub catalogue: Arc<ExpertCatalogue>,
+    pub directory: &'a Path,
+    pub engines: u32,
+    pub max_rows: u32,
+}
+
+pub(in crate::backend::cuda::engine) struct Slots {
+    pub storage: super::super::super::weights::ExpertStorage,
+    gate_up: CudaSlice<u64>,
+    down: CudaSlice<u64>,
+    valid: CudaSlice<u32>,
+    generation: CudaSlice<u64>,
+    pub published: Vec<u64>,
+    policy: Residency,
+    catalogue: Arc<ExpertCatalogue>,
+    disk: Reader,
+    transfers: Transfers,
+    events: Events,
+    physical: Vec<Physical>,
+    publish: CudaFunction,
+    routes: Vec<crate::experts::runtime::Route>,
+    host_experts: Vec<u32>,
+    host_weights: Vec<ExpertWeights>,
+    moves: Vec<PromptMove>,
+    readers: Vec<u32>,
+    disk_cpu: Option<DiskExperts>,
+    pub request_open: bool,
+    #[cfg(test)]
+    pending_reads: u64,
+}
+
+fn check_publish(
+    experts: u32,
+    incoming: u32,
+    victim: Option<u32>,
+    gu: u64,
+    down: u64,
+    generation: u64,
+) -> Result<()> {
+    ensure!(
+        experts > 0
+            && experts <= i32::MAX as u32
+            && incoming < experts
+            && victim.is_none_or(|victim| victim < experts && victim != incoming),
+        "expert publication bounds: experts={experts} incoming={incoming} victim={victim:?}"
+    );
+    ensure!(
+        gu > 0 && down > 0 && gu.is_multiple_of(16) && down.is_multiple_of(16) && generation > 0,
+        "expert publication pointer/generation: gu={gu:#x} down={down:#x} generation={generation}"
+    );
+    Ok(())
+}
+
+fn check_lifetime(expected: [Option<u64>; 2], owned: [Option<u64>; 2]) -> Result<()> {
+    ensure!(
+        expected == owned,
+        "expert slot lifetime differs: residency={expected:?} backend={owned:?}"
+    );
+    Ok(())
+}
+
+impl Slots {
+    #[cfg(test)]
+    pub(super) fn load(device: &Device, geometry: ExpertGeometry, input: Load<'_>) -> Result<Self> {
+        ensure!(
+            input.catalogue.geometry() == geometry,
+            "expert slot/catalogue geometry differs"
+        );
+        ensure!(
+            input.engines > 0,
+            "expert setup has no measured copy engines"
+        );
+        let mut storage = super::super::super::weights::ExpertStorage::new(
+            &device.stream,
+            &device.upload,
+            geometry,
+            input.capacity,
+        )?;
+        if input.capacity.pinned {
+            storage.register_host()?;
+        }
+        let disk = Reader::new(
+            device,
+            DiskReader::open(&input.catalogue, input.directory, input.engines.min(2))?,
+            &input.catalogue,
+        )?;
+        let (policy, _) = Residency::load(crate::experts::runtime::LoadInputs {
+            geometry,
+            capacity: input.capacity.clone(),
+            admission: input.admission,
+            max_rows: input.max_rows,
+            initial: input.initial,
+            host: storage.host(),
+            catalogue: &input.catalogue,
+            reader: &disk.disk,
+        })?;
+        let physical_count = input.capacity.slots_total() as usize;
+        let mut physical = (0..physical_count)
+            .map(|_| Physical::default())
+            .collect::<Vec<_>>();
+        let bytes = usize::try_from(geometry.slot_bytes()?)?;
+        for layer in 0..geometry.layers {
+            for rank in 0..storage.layout().slot_count(layer)? {
+                let index = storage.layout().resident_slot(layer, rank)?.start / bytes;
+                ensure!(
+                    index < physical.len(),
+                    "physical expert slot {index} outside allocation"
+                );
+                physical[index].pointer = storage.slot(layer, rank)?.0;
+            }
+        }
+        ensure!(
+            physical.iter().all(|slot| slot.pointer != 0),
+            "physical expert slot map has a hole"
+        );
+        let transfers = Transfers::new(device, &storage, input.capacity.pinned, input.engines)?;
+        let events = Events::new(
+            &device.ctx,
+            2 * physical_count
+                + transfers.host_use.len()
+                + transfers.stages.len()
+                + disk.copied.len()
+                + 4,
+        )?;
+        let logical = geometry.layers as usize * geometry.experts as usize;
+        let mut slots = Self {
+            storage,
+            gate_up: device.stream.alloc_zeros(logical)?,
+            down: device.stream.alloc_zeros(logical)?,
+            valid: device.stream.alloc_zeros(logical)?,
+            generation: device.stream.alloc_zeros(logical)?,
+            published: vec![0; logical],
+            policy,
+            catalogue: input.catalogue.clone(),
+            disk,
+            transfers,
+            events,
+            physical,
+            publish: super::super::super::cubin::module(&device.ctx, "moe_route")?
+                .load_function("moe_slot_publish")?,
+            routes: Vec::with_capacity(input.max_rows as usize * geometry.top_k as usize),
+            host_experts: Vec::with_capacity(geometry.experts as usize),
+            host_weights: Vec::with_capacity(geometry.experts as usize),
+            moves: Vec::with_capacity(physical_count),
+            readers: Vec::with_capacity(input.max_rows as usize * geometry.top_k as usize),
+            disk_cpu: if input.capacity.disk_bytes > 0 {
+                Some(DiskExperts::new(
+                    input.catalogue.clone(),
+                    input.directory,
+                    input.capacity.disk_workers,
+                    input.max_rows,
+                )?)
+            } else {
+                None
+            },
+            request_open: false,
+            pending_reads: 0,
+        };
+        device.upload.wait(&device.stream.record_event(None)?)?;
+        for layer in 0..geometry.layers {
+            for expert in 0..geometry.experts {
+                if slots.policy.ledger().tier(layer, expert)? == crate::experts::plan::Tier::Gpu {
+                    let slot = slots.policy.ledger().slot(layer, expert)?;
+                    let generation = slots.policy.generation(layer, expert)?;
+                    slots.install(layer, expert, None, slot, generation, MoveSource::Disk)?;
+                }
+            }
+        }
+        Ok(slots)
+    }
+
+    pub fn bindings(&self, layer: usize, stream: &Arc<CudaStream>) -> Result<SlotBindings> {
+        let geometry = self.storage.layout().geometry();
+        ensure!(
+            layer < geometry.layers as usize,
+            "expert layer={layer} outside layers={}",
+            geometry.layers
+        );
+        let offset = layer * geometry.experts as usize;
+        Ok(SlotBindings {
+            gate_up: qwen::view(&self.gate_up, stream, offset, [geometry.experts], [1])?,
+            down: qwen::view(&self.down, stream, offset, [geometry.experts], [1])?,
+            valid: qwen::view(&self.valid, stream, offset, [geometry.experts], [1])?,
+            generation: qwen::view(&self.generation, stream, offset, [geometry.experts], [1])?,
+        })
+    }
+
+    fn publish(
+        &mut self,
+        layer: u32,
+        expert: u32,
+        victim: Option<u32>,
+        slot: u32,
+        generation: u64,
+    ) -> Result<Ticket> {
+        let geometry = self.storage.layout().geometry();
+        let pointer = self
+            .physical
+            .get(slot as usize)
+            .context("publish physical slot outside allocation")?
+            .pointer;
+        let down = pointer
+            .checked_add(geometry.gate_up_bytes()?)
+            .context("expert down pointer overflow")?;
+        check_publish(geometry.experts, expert, victim, pointer, down, generation)?;
+        let tables = self.bindings(layer as usize, &self.transfers.h2d)?;
+        let stream = &self.transfers.h2d;
+        // SAFETY: checked layer/expert extents and owned tables cover both scalar updates.
+        unsafe {
+            stream
+                .launch_builder(&self.publish)
+                .arg(&tables.gate_up.ptr)
+                .arg(&tables.down.ptr)
+                .arg(&tables.valid.ptr)
+                .arg(&tables.generation.ptr)
+                .arg(&(geometry.experts as i32))
+                .arg(&(expert as i32))
+                .arg(&victim.map_or(-1, |value| value as i32))
+                .arg(&pointer)
+                .arg(&down)
+                .arg(&generation)
+                .launch(super::super::super::ops::grid(1, 1))?;
+        }
+        let event = self.events.record(stream)?;
+        self.physical[slot as usize].copy = Some(event.clone());
+        self.physical[slot as usize].reader = None;
+        self.physical[slot as usize].waited = false;
+        let offset = layer as usize * geometry.experts as usize;
+        if let Some(victim) = victim {
+            self.published[offset + victim as usize] = 0;
+        }
+        self.published[offset + expert as usize] = generation;
+        self.policy.record_copy(&[slot], event.id)?;
+        Ok(event)
+    }
+
+    fn install(
+        &mut self,
+        layer: u32,
+        expert: u32,
+        victim: Option<u32>,
+        slot: u32,
+        generation: u64,
+        source: MoveSource,
+    ) -> Result<()> {
+        let geometry = self.storage.layout().geometry();
+        self.transfers.h2d.context().bind_to_thread()?;
+        let (pointer, staging, ring) = match source {
+            MoveSource::Host(block) => {
+                let (pointer, staging) = self.transfers.source_host(block)?;
+                (pointer, staging, None)
+            }
+            MoveSource::Disk => {
+                let ring = self.disk.read(layer, expert, &self.catalogue)?;
+                let values = self.disk.disk.values(ring)?;
+                let pointer = values.as_ptr() as u64;
+                // SAFETY: the registered ring guard remains alive until the copy is submitted.
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        self.physical[slot as usize].pointer,
+                        pointer as *const std::ffi::c_void,
+                        usize::try_from(geometry.slot_bytes()?)?,
+                        self.transfers.h2d.cu_stream(),
+                    )
+                    .result()
+                }
+                .context("copy native disk expert into its physical slot")?;
+                let copy = self.events.record(&self.transfers.h2d)?;
+                values.copied(copy.id)?;
+                self.disk.copied[ring as usize] = Some(copy);
+                (pointer, None, Some(ring))
+            }
+        };
+        if ring.is_none() {
+            self.transfers.h2d.context().bind_to_thread()?;
+            // SAFETY: the pinned source remains claimed or staged through the recorded copy.
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    self.physical[slot as usize].pointer,
+                    pointer as *const std::ffi::c_void,
+                    usize::try_from(geometry.slot_bytes()?)?,
+                    self.transfers.h2d.cu_stream(),
+                )
+                .result()
+            }
+            .context("copy native host expert into its physical slot")?;
+        }
+        let event = self.publish(layer, expert, victim, slot, generation)?;
+        if let MoveSource::Host(block) = source {
+            self.transfers.copied_host(block, staging, &event);
+        }
+        Ok(())
+    }
+
+    fn apply_move(&mut self, movement: PromptMove) -> Result<()> {
+        let physical = self
+            .physical
+            .get(movement.slot as usize)
+            .context("move slot outside allocation")?;
+        let lifetime = self.policy.reclaim(movement.slot)?;
+        check_lifetime(
+            lifetime,
+            [
+                physical.copy.as_ref().map(|t| t.id),
+                physical.reader.as_ref().map(|t| t.id),
+            ],
+        )?;
+        for id in lifetime.into_iter().flatten() {
+            self.events.wait(&self.transfers.h2d, id)?;
+            self.events.wait(&self.transfers.d2h, id)?;
+        }
+        if let Some(id) = movement.dest_wait {
+            self.events.wait(&self.transfers.d2h, id)?;
+        }
+        if let Some(slot) = movement.chain_slot {
+            let ticket = self
+                .physical
+                .get(slot as usize)
+                .and_then(|slot| slot.copy.as_ref())
+                .context("chained swap has no preceding copy")?;
+            self.events.wait(&self.transfers.d2h, ticket.id)?;
+        }
+        let slot = self
+            .physical
+            .get_mut(movement.slot as usize)
+            .context("expert move targets an unallocated physical slot")?;
+        slot.copy = None;
+        slot.reader = None;
+        if let Some(block) = movement.dest_block {
+            ensure!(
+                movement.victim.is_some(),
+                "expert move writes back without a victim"
+            );
+            let event = self.transfers.write_back(
+                slot.pointer,
+                block,
+                usize::try_from(self.catalogue.geometry().slot_bytes()?)?,
+                &mut self.events,
+            )?;
+            self.transfers.h2d.wait(&event.event)?;
+        }
+        self.install(
+            movement.layer,
+            movement.expert,
+            movement.victim,
+            movement.slot,
+            movement.generation,
+            movement.source,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn begin_request(&mut self, frequency: &[Vec<f64>]) -> Result<()> {
+        self.moves.clear();
+        self.moves
+            .extend_from_slice(self.policy.begin_request(frequency)?);
+        for index in 0..self.moves.len() {
+            self.apply_move(self.moves[index])?;
+        }
+        self.request_open = true;
+        Ok(())
+    }
+
+    pub fn end_request(&mut self) -> Result<()> {
+        self.policy.end_request()?;
+        self.request_open = false;
+        self.transfers.finish()
+    }
+
+    pub fn begin_token(&mut self) -> Result<()> {
+        self.policy.begin_token()
+    }
+
+    pub fn finish_token(&mut self) -> Result<()> {
+        self.moves.clear();
+        for published in self.policy.finish_token()? {
+            let source = match (published.from_host, published.source_block) {
+                (true, Some(block)) => MoveSource::Host(block),
+                (false, None) => MoveSource::Disk,
+                other => anyhow::bail!("admission source contract differs: {other:?}"),
+            };
+            self.moves.push(PromptMove {
+                layer: published.layer,
+                expert: published.expert,
+                victim: Some(published.victim),
+                source,
+                dest_block: published.dest_block,
+                dest_wait: published.dest_wait,
+                chain_slot: None,
+                slot: published.slot,
+                generation: published.generation,
+            });
+        }
+        for index in 0..self.moves.len() {
+            self.apply_move(self.moves[index])?;
+        }
+        Ok(())
+    }
+
+    fn prepare_routes(&mut self, device: &Device, layer: u32, decode: &Decode) -> Result<()> {
+        let geometry = self.catalogue.geometry();
+        let (ids, weights) = decode.routed()?;
+        self.routes.clear();
+        self.readers.clear();
+        self.host_experts.clear();
+        self.host_weights.clear();
+        for (choice, (&id, &weight)) in ids.iter().zip(weights).enumerate() {
+            ensure!(
+                id >= 0 && (id as u32) < geometry.experts,
+                "route layer={layer} choice={choice} expert={id} outside {}",
+                geometry.experts
+            );
+            let expert = id as u32;
+            self.routes.push(crate::experts::runtime::Route {
+                row: choice as u32 / geometry.top_k,
+                choice: choice as u32,
+                expert,
+                weight,
+            });
+            if self.policy.ledger().tier(layer, expert)? == Tier::Gpu {
+                let slot = self.policy.ledger().slot(layer, expert)?;
+                let physical = &mut self.physical[slot as usize];
+                if !physical.waited {
+                    let id = self
+                        .policy
+                        .first_read(slot)?
+                        .context("resident expert has no copy event")?;
+                    ensure!(
+                        physical.copy.as_ref().is_some_and(|copy| copy.id == id),
+                        "slot={slot} copy event differs from residency id={id}"
+                    );
+                    #[cfg(test)]
+                    if !physical
+                        .copy
+                        .as_ref()
+                        .context("pending copy owner missing")?
+                        .event
+                        .try_is_complete()?
+                    {
+                        self.pending_reads += 1;
+                    }
+                    self.events.wait(&device.stream, id)?;
+                    physical.waited = true;
+                }
+                if !self.readers.contains(&slot) {
+                    self.readers.push(slot);
+                }
+            }
+        }
+        for expert in 0..geometry.experts {
+            if !self.routes.iter().any(|route| route.expert == expert)
+                || self.policy.ledger().tier(layer, expert)? != Tier::Host
+            {
+                continue;
+            }
+            let block = self.policy.host_block(layer, expert)?;
+            let range = self
+                .transfers
+                .host
+                .as_ref()
+                .context("host tier has no arena")?
+                .block_range(block)?;
+            let down = range.start + usize::try_from(geometry.gate_up_bytes()? / 2)?;
+            self.host_experts.push(expert);
+            self.host_weights.push(ExpertWeights {
+                gate_up: range.start..down,
+                gate_up_stride: geometry.hidden as usize,
+                down: down..range.end,
+                down_stride: geometry.intermediate as usize,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn run(
+        &mut self,
+        device: &Device,
+        decode: &mut Decode,
+        layer: u32,
+        ffn: BoundFfn,
+        x: Tensor<bf16, 2>,
+        y: &mut TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        decode.route(device, ffn, x)?;
+        self.prepare_routes(device, layer, decode)?;
+        let bindings = self.bindings(layer as usize, &device.stream)?;
+        let dispatch = self.policy.dispatch(layer, &self.routes)?;
+        ensure!(
+            dispatch.host_experts == self.host_experts,
+            "host expert compact order differs from residency at layer={layer}"
+        );
+        decode.finish(
+            device,
+            ffn,
+            bindings,
+            Dispatch {
+                active: &dispatch.active,
+                generation: &dispatch.generation,
+                host: self.transfers.host.clone(),
+                experts: &self.host_weights,
+                assignments: &dispatch.host,
+                miss_rows: &dispatch.miss_rows,
+                host_dma: Some(&self.transfers),
+                disk: &dispatch.disk,
+                disk_cpu: self.disk_cpu.as_mut(),
+                layer,
+            },
+            (x, y),
+        )?;
+        if !self.readers.is_empty() {
+            let event = self.events.record(&device.stream)?;
+            self.policy.record_readers(&self.readers, event.id)?;
+            for &slot in &self.readers {
+                self.physical[slot as usize].reader = Some(event.clone());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn trace(&self, trace: &mut Trace) -> Result<()> {
+        let geometry = self.catalogue.geometry();
+        self.policy.ledger().check()?;
+        let mut tiers = Vec::new();
+        for layer in 0..geometry.layers {
+            for expert in 0..geometry.experts {
+                tiers.push(match self.policy.ledger().tier(layer, expert)? {
+                    Tier::Gpu => 0.0,
+                    Tier::Host => 1.0,
+                    Tier::Disk => 2.0,
+                });
+            }
+        }
+        let shape = vec![geometry.layers as usize, geometry.experts as usize];
+        trace.add("residency.tier".into(), shape.clone(), tiers)?;
+        trace.add(
+            "residency.generation".into(),
+            shape,
+            self.published
+                .iter()
+                .map(|&generation| generation as f32)
+                .collect(),
+        )?;
+        trace.add(
+            "stats.copy_wait_pending".into(),
+            vec![1],
+            vec![self.pending_reads as f32],
+        )?;
+        for (name, values) in [
+            (
+                "residency.moves",
+                self.moves
+                    .iter()
+                    .flat_map(|movement| {
+                        [
+                            movement.layer as f32,
+                            movement.expert as f32,
+                            movement.victim.map_or(-1.0, |victim| victim as f32),
+                        ]
+                    })
+                    .collect(),
+            ),
+            (
+                "residency.source",
+                self.moves
+                    .iter()
+                    .map(|movement| u8::from(matches!(movement.source, MoveSource::Disk)) as f32)
+                    .collect(),
+            ),
+            (
+                "residency.writeback",
+                self.moves
+                    .iter()
+                    .map(|movement| movement.dest_block.map_or(-1.0, |block| block as f32))
+                    .collect(),
+            ),
+        ] {
+            let width = if name == "residency.moves" { 3 } else { 1 };
+            trace.add(name.into(), vec![self.moves.len(), width], values)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn delay_copies(&self) -> Result<()> {
+        unsafe extern "C" fn delay(_: *mut std::ffi::c_void) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        self.transfers.h2d.context().bind_to_thread()?;
+        // SAFETY: the callback uses no CUDA API, shared data, or outstanding device work.
+        unsafe {
+            cudarc::driver::sys::cuLaunchHostFunc(
+                self.transfers.h2d.cu_stream(),
+                Some(delay),
+                std::ptr::null_mut(),
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_ids_reject_reused_handle_generations() -> Result<()> {
+        let mut ids = vec![5, 6, 7, 8];
+        assert_eq!(event_index(6, &ids)?, 1);
+        ids[1] = 10;
+        assert!(event_index(6, &ids).is_err());
+        assert_eq!(event_index(10, &ids)?, 1);
+        assert!(event_index(0, &ids).is_err());
+        assert!(event_index(1, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn slot_publications_and_lifetimes_reject_stale_state() -> Result<()> {
+        check_publish(16, 3, Some(1), 0x1000, 0x2000, 7)?;
+        assert!(check_publish(16, 16, Some(1), 0x1000, 0x2000, 7).is_err());
+        assert!(check_publish(16, 3, Some(3), 0x1000, 0x2000, 7).is_err());
+        assert!(check_publish(16, 3, Some(1), 0x1002, 0x2000, 7).is_err());
+        assert!(check_publish(16, 3, Some(1), 0x1000, 0x2000, 0).is_err());
+        check_lifetime([Some(3), Some(7)], [Some(3), Some(7)])?;
+        assert!(check_lifetime([Some(3), Some(7)], [Some(3), None]).is_err());
+        assert!(check_lifetime([Some(3), Some(7)], [Some(3), Some(6)]).is_err());
+        Ok(())
+    }
+}

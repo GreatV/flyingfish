@@ -272,6 +272,271 @@ impl DiskReader {
     }
 }
 
+struct Work {
+    layer: u32,
+    hidden: Vec<bf16>,
+    routes: Vec<crate::experts::runtime::Route>,
+    output: Vec<bf16>,
+}
+
+struct Completed {
+    work: Work,
+    error: Option<String>,
+}
+
+struct Worker {
+    input: Option<std::sync::mpsc::SyncSender<Work>>,
+    output: std::sync::mpsc::Receiver<Completed>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    work: Option<Work>,
+}
+
+/// Bounded native disk reads and CPU contributions, with one persistent reader per worker.
+pub struct DiskExperts {
+    geometry: crate::experts::catalogue::ExpertGeometry,
+    max_rows: usize,
+    max_routes: usize,
+    running: bool,
+    workers: Vec<Worker>,
+}
+
+impl DiskExperts {
+    pub fn new(
+        catalogue: std::sync::Arc<ExpertCatalogue>,
+        directory: &Path,
+        workers: u32,
+        max_rows: u32,
+    ) -> Result<Self> {
+        let geometry = catalogue.geometry();
+        ensure!(
+            workers > 0 && workers <= 256 && max_rows > 0,
+            "disk expert bounds workers={workers} rows={max_rows}"
+        );
+        let shape = crate::cpu::expert_ffn::Shape::new(
+            geometry.hidden as usize,
+            geometry.intermediate as usize,
+        )?;
+        let max_routes = (max_rows as usize)
+            .checked_mul(geometry.top_k as usize)
+            .context("disk route capacity overflow")?;
+        let elements = max_routes
+            .checked_mul(shape.hidden)
+            .context("disk output capacity overflow")?;
+        let mut pool = Self {
+            geometry,
+            max_rows: max_rows as usize,
+            max_routes,
+            running: false,
+            workers: Vec::with_capacity(workers as usize),
+        };
+        for index in 0..workers {
+            let reader = DiskReader::open(&catalogue, directory, 1)?;
+            let mut scratch = crate::cpu::expert_ffn::Scratch::new(&shape);
+            let mut vector = vec![bf16::ZERO; shape.hidden];
+            let native = native_weights(shape);
+            let isa = crate::cpu::expert_ffn::Isa::detect();
+            let source = catalogue.clone();
+            let (input, requests) = std::sync::mpsc::sync_channel::<Work>(1);
+            let (results, output) = std::sync::mpsc::sync_channel(1);
+            let handle = std::thread::Builder::new()
+                .name(format!("expert-disk-{index}"))
+                .spawn(move || {
+                    while let Ok(mut work) = requests.recv() {
+                        let result = disk_contributions(
+                            &reader,
+                            &source,
+                            &mut work,
+                            &native,
+                            &mut scratch,
+                            &mut vector,
+                            isa,
+                        );
+                        let error = result.err().map(|error| format!("{error:#}"));
+                        if results.send(Completed { work, error }).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .context("spawn native disk expert worker")?;
+            pool.workers.push(Worker {
+                input: Some(input),
+                output,
+                handle: Some(handle),
+                work: Some(Work {
+                    layer: 0,
+                    hidden: Vec::with_capacity(max_rows as usize * shape.hidden),
+                    routes: Vec::with_capacity(max_routes),
+                    output: vec![bf16::ZERO; elements],
+                }),
+            });
+        }
+        Ok(pool)
+    }
+
+    pub fn start(
+        &mut self,
+        layer: u32,
+        hidden: &[bf16],
+        rows: usize,
+        routes: &[crate::experts::runtime::Route],
+    ) -> Result<()> {
+        ensure!(!self.running, "disk contribution job is already running");
+        ensure!(
+            layer < self.geometry.layers
+                && rows > 0
+                && rows <= self.max_rows
+                && hidden.len() == rows * self.geometry.hidden as usize
+                && routes.len() <= self.max_routes,
+            "disk contribution bounds layer={layer} rows={rows} hidden={} routes={}",
+            hidden.len(),
+            routes.len()
+        );
+        for (index, route) in routes.iter().enumerate() {
+            ensure!(
+                (route.row as usize) < rows
+                    && route.expert < self.geometry.experts
+                    && (route.choice as usize) < self.max_routes
+                    && route.weight.to_f32().is_finite(),
+                "disk route outside job bounds: {route:?}"
+            );
+            ensure!(
+                !routes[..index]
+                    .iter()
+                    .any(|previous| previous.choice == route.choice),
+                "disk choice={} has duplicate routes",
+                route.choice
+            );
+        }
+        let workers = self.workers.len();
+        for (index, worker) in self.workers.iter_mut().enumerate() {
+            let mut work = worker
+                .work
+                .take()
+                .context("disk worker has no reusable job")?;
+            work.layer = layer;
+            work.hidden.clear();
+            work.hidden.extend_from_slice(hidden);
+            work.routes.clear();
+            work.routes.extend(
+                routes
+                    .iter()
+                    .filter(|r| r.expert as usize % workers == index),
+            );
+            worker
+                .input
+                .as_ref()
+                .context("disk worker input closed")?
+                .send(work)
+                .map_err(|_| anyhow::anyhow!("disk expert worker {index} stopped"))?;
+        }
+        self.running = true;
+        Ok(())
+    }
+
+    pub fn finish(&mut self, output: &mut [bf16]) -> Result<()> {
+        ensure!(
+            self.running,
+            "disk contribution finish without a running job"
+        );
+        let width = self.geometry.hidden as usize;
+        let mut failure = None;
+        for (index, worker) in self.workers.iter_mut().enumerate() {
+            let completed = worker
+                .output
+                .recv()
+                .with_context(|| format!("receive disk worker {index}"))?;
+            for route in &completed.work.routes {
+                let first = route.choice as usize * width;
+                ensure!(
+                    first + width <= output.len(),
+                    "disk contribution choice={} outside output={}",
+                    route.choice,
+                    output.len()
+                );
+                output[first..first + width]
+                    .copy_from_slice(&completed.work.output[first..first + width]);
+            }
+            if completed.error.is_some() {
+                failure = completed.error;
+            }
+            worker.work = Some(completed.work);
+        }
+        self.running = false;
+        if let Some(error) = failure {
+            anyhow::bail!("disk expert contribution: {error}");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DiskExperts {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            worker.input.take();
+        }
+        for worker in &mut self.workers {
+            if let Some(handle) = worker.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+fn native_weights(shape: crate::cpu::expert_ffn::Shape) -> crate::cpu::expert_ffn::ExpertWeights {
+    let down = 2 * shape.intermediate * shape.hidden;
+    crate::cpu::expert_ffn::ExpertWeights {
+        gate_up: 0..down,
+        gate_up_stride: shape.hidden,
+        down: down..down + shape.hidden * shape.intermediate,
+        down_stride: shape.intermediate,
+    }
+}
+
+fn disk_contributions(
+    reader: &DiskReader,
+    catalogue: &ExpertCatalogue,
+    work: &mut Work,
+    weights: &crate::cpu::expert_ffn::ExpertWeights,
+    scratch: &mut crate::cpu::expert_ffn::Scratch,
+    vector: &mut [bf16],
+    isa: crate::cpu::expert_ffn::Isa,
+) -> Result<()> {
+    use crate::cpu::expert_ffn::{Contribution, Shape, contribution};
+    let geometry = catalogue.geometry();
+    let shape = Shape::new(geometry.hidden as usize, geometry.intermediate as usize)?;
+    for expert in 0..geometry.experts {
+        if !work.routes.iter().any(|route| route.expert == expert) {
+            continue;
+        }
+        let slot = reader.read_expert(work.layer, expert, catalogue)?;
+        let values = reader.values(slot)?;
+        for route in work.routes.iter().filter(|route| route.expert == expert) {
+            let first = route.row as usize * shape.hidden;
+            contribution(
+                isa,
+                Contribution {
+                    shape: &shape,
+                    arena: &values,
+                    weights,
+                    hidden: &work.hidden[first..first + shape.hidden],
+                    routing: route.weight,
+                },
+                vector,
+                scratch,
+            )?;
+            ensure!(
+                vector.iter().all(|value| value.to_f32().is_finite()),
+                "non-finite disk contribution layer={} expert={expert} row={}",
+                work.layer,
+                route.row
+            );
+            let first = route.choice as usize * shape.hidden;
+            work.output[first..first + shape.hidden].copy_from_slice(vector);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,6 +791,101 @@ mod tests {
         reader.reclaim(slot, 5)?;
         let again = reader.read_expert(0, 1, &catalogue)?;
         assert_eq!(again, slot);
+        Ok(())
+    }
+
+    #[test]
+    fn disk_workers_preserve_compacted_rows_choices_and_native_offsets() -> Result<()> {
+        use crate::cpu::expert_ffn::{Contribution, Isa, Scratch, Shape, contribution};
+        use crate::experts::runtime::Route;
+        use std::sync::Arc;
+        let dir = temp_dir("workers")?;
+        let geometry = ExpertGeometry {
+            intermediate: 8,
+            ..geometry()
+        };
+        let shape = Shape::new(8, 8)?;
+        let mut bytes = Vec::new();
+        let mut manifest = TensorManifest {
+            entries: BTreeMap::new(),
+            resident_bytes: 0,
+        };
+        for layer in 0..geometry.layers {
+            for (role, dims) in [
+                ("gate_up_proj", vec![4, 16, 8]),
+                ("down_proj", vec![4, 8, 8]),
+            ] {
+                let start = bytes.len() as u64;
+                for index in 0..dims.iter().product::<usize>() {
+                    let value = bf16::from_f32(
+                        ((index * 37 + layer as usize * 11) % 53) as f32 / 64.0 - 0.4,
+                    );
+                    bytes.extend(value.to_bits().to_le_bytes());
+                }
+                manifest.entries.insert(
+                    format!("model.language_model.layers.{layer}.mlp.experts.{role}"),
+                    entry(role, dims, "native.bin", start, bytes.len() as u64 - start),
+                );
+            }
+        }
+        std::fs::write(dir.path().join("native.bin"), bytes)?;
+        let catalogue = Arc::new(ExpertCatalogue::from_manifest(&manifest, geometry)?);
+        let mut pool = DiskExperts::new(catalogue.clone(), dir.path(), 2, 3)?;
+        let oracle = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let mut scratch = Scratch::new(&shape);
+        let hidden = (0..24)
+            .map(|index| bf16::from_f32(((index * 11) % 29) as f32 / 32.0))
+            .collect::<Vec<_>>();
+        for layer in [1, 0, 1] {
+            let routes = [
+                Route {
+                    row: 1,
+                    choice: 5,
+                    expert: 3,
+                    weight: bf16::from_f32(0.25),
+                },
+                Route {
+                    row: 0,
+                    choice: 1,
+                    expert: 0,
+                    weight: bf16::from_f32(0.5),
+                },
+                Route {
+                    row: 2,
+                    choice: 4,
+                    expert: 3,
+                    weight: bf16::from_f32(0.75),
+                },
+            ];
+            let mut output = vec![bf16::from_f32(-99.0); 6 * 8];
+            let mut expected = output.clone();
+            for route in routes {
+                let slot = oracle.read_expert(layer, route.expert, &catalogue)?;
+                let values = oracle.values(slot)?;
+                let first = route.row as usize * 8;
+                contribution(
+                    Isa::detect(),
+                    Contribution {
+                        shape: &shape,
+                        arena: &values,
+                        weights: &native_weights(shape),
+                        hidden: &hidden[first..first + 8],
+                        routing: route.weight,
+                    },
+                    &mut expected[route.choice as usize * 8..(route.choice as usize + 1) * 8],
+                    &mut scratch,
+                )?;
+            }
+            assert!(
+                pool.start(layer, &hidden, 3, &[routes[0], routes[0]])
+                    .is_err()
+            );
+            pool.start(layer, &hidden, 3, &routes)?;
+            assert!(pool.start(layer, &hidden, 3, &routes).is_err());
+            pool.finish(&mut output)?;
+            assert_eq!(output, expected);
+            assert!(pool.finish(&mut output).is_err());
+        }
         Ok(())
     }
 

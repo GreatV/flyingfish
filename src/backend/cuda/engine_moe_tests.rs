@@ -1,7 +1,71 @@
 use super::*;
 use crate::backend::cuda::moe::reference::{MoeDims, MoeFixture, fixture};
-use crate::backend::cuda::weights::ExpertStorage;
 use crate::experts::plan::Capacity;
+
+fn native_fixture(
+    fixture: &MoeFixture,
+    directory: &Path,
+) -> Result<Arc<crate::experts::catalogue::ExpertCatalogue>> {
+    use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
+    let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+    let d = fixture.dims;
+    let mut bytes = Vec::new();
+    let mut manifest = TensorManifest {
+        entries: Default::default(),
+        resident_bytes: 0,
+    };
+    for layer in 0..geometry.layers {
+        for (role, values, shape) in [
+            (
+                "gate_up_proj",
+                &fixture.gate_up,
+                vec![d.experts, 2 * d.inter, d.hidden],
+            ),
+            (
+                "down_proj",
+                &fixture.down,
+                vec![d.experts, d.hidden, d.inter],
+            ),
+        ] {
+            let start = bytes.len() as u64;
+            bytes.extend(values.iter().flat_map(|value| {
+                let value = if layer == 0 {
+                    *value
+                } else {
+                    bf16::from_f32(-0.75 * value.to_f32())
+                };
+                value.to_bits().to_le_bytes()
+            }));
+            let end = bytes.len() as u64;
+            manifest.entries.insert(
+                format!("model.language_model.layers.{layer}.mlp.experts.{role}"),
+                TensorEntry {
+                    dtype: safetensors::Dtype::BF16,
+                    shape,
+                    shard: "expert-fixture.bin".into(),
+                    bytes: (end - start) as usize,
+                    load: false,
+                    data_start: 0,
+                    data_offsets: [start, end],
+                    scope: TensorScope::Text,
+                    layer: Some(layer),
+                    role: format!("mlp.experts.{role}"),
+                    scale_name: None,
+                },
+            );
+        }
+    }
+    std::fs::create_dir_all(directory)?;
+    let path = directory.join("expert-fixture.bin");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    std::io::Write::write_all(&mut file, &bytes)?;
+    Ok(Arc::new(
+        crate::experts::catalogue::ExpertCatalogue::from_manifest(&manifest, geometry)?,
+    ))
+}
 
 fn hybrid_spec() -> Result<crate::model_spec::ModelSpec> {
     use crate::model_spec::{LayerPlan, Mixer};
@@ -135,6 +199,42 @@ fn hybrid_manifest(
 
 impl Engine {
     pub(crate) fn load_moe_test(fixture: &MoeFixture, runtime: &Path) -> Result<Self> {
+        let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+        let count = geometry.layers * geometry.experts;
+        let capacity = Capacity {
+            span_rows: 8,
+            wave_rows: 8,
+            device_expert_bytes: geometry.slot_bytes()? * u64::from(count),
+            host_expert_bytes: 0,
+            slots_per_layer: vec![geometry.experts; geometry.layers as usize],
+            host_blocks: 0,
+            spare_blocks: 0,
+            disk_bytes: 0,
+            worker_count: 2,
+            disk_workers: 0,
+            prefill_staging_slots: 0,
+            pinned: false,
+        };
+        Self::load_moe_placed(
+            fixture,
+            runtime,
+            &capacity,
+            &vec![(0..geometry.experts).collect::<Vec<_>>(); geometry.layers as usize],
+            crate::experts::plan::Admission {
+                budget_bytes_per_token: 0,
+            },
+            2,
+        )
+    }
+
+    fn load_moe_placed(
+        fixture: &MoeFixture,
+        runtime: &Path,
+        capacity: &Capacity,
+        initial: &[Vec<u32>],
+        admission: crate::experts::plan::Admission,
+        engines: u32,
+    ) -> Result<Self> {
         use crate::backend::cuda::{
             linear::LayerLinearPlan,
             weights::{StoredTensor, WeightCatalog},
@@ -150,53 +250,29 @@ impl Engine {
         let geometry = ExpertGeometry::from_model(&model_spec)?;
         let device = Device::new(0)?;
         let stream = &device.stream;
-        let count = (geometry.layers * geometry.experts) as usize;
-        let bytes = geometry.slot_bytes()?;
-        let capacity = Capacity {
-            span_rows: 8,
-            wave_rows: 8,
-            device_expert_bytes: bytes * count as u64,
-            host_expert_bytes: bytes * count as u64,
-            slots_per_layer: vec![16; geometry.layers as usize],
-            host_blocks: count as u32,
-            spare_blocks: 0,
-            disk_bytes: 0,
-            worker_count: 2,
-            disk_workers: 0,
-            prefill_staging_slots: 0,
-        };
-        let storage = ExpertStorage::new(stream, &device.upload, geometry, &capacity)?;
-        stream.synchronize()?;
-        let mut gu = Vec::with_capacity(count);
-        let mut dn = Vec::with_capacity(count);
-        let gu_len = 2 * d.inter * d.hidden;
-        let dn_len = d.hidden * d.inter;
-        for layer in 0..geometry.layers {
-            for expert in 0..d.experts {
-                let (gate_up, down) = storage.slot(layer, expert as u32)?;
-                // SAFETY: setup synchronization completed the owned stream-ordered allocation.
-                unsafe {
-                    result::memcpy_htod_sync(
-                        gate_up,
-                        &fixture.gate_up[expert * gu_len..(expert + 1) * gu_len],
-                    )?;
-                    result::memcpy_htod_sync(
-                        down,
-                        &fixture.down[expert * dn_len..(expert + 1) * dn_len],
-                    )?;
-                }
-                let mut claim = storage
-                    .host()
-                    .context("test host arena missing")?
-                    .claim(layer * geometry.experts + expert as u32)?;
-                claim.slice()?[..gu_len]
-                    .copy_from_slice(&fixture.gate_up[expert * gu_len..(expert + 1) * gu_len]);
-                claim.slice()?[gu_len..]
-                    .copy_from_slice(&fixture.down[expert * dn_len..(expert + 1) * dn_len]);
-                gu.push(gate_up);
-                dn.push(down);
+        let catalogue = native_fixture(fixture, runtime)?;
+        let mut slots = Slots::load(
+            &device,
+            geometry,
+            residency::Load {
+                capacity,
+                admission,
+                initial,
+                catalogue,
+                directory: runtime,
+                engines,
+                max_rows: 8,
+            },
+        )?;
+        std::fs::remove_file(runtime.join("expert-fixture.bin"))?;
+        let mut frequency = vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize];
+        for (layer, experts) in initial.iter().enumerate() {
+            for &expert in experts {
+                frequency[layer][expert as usize] = 1.0;
             }
         }
+        slots.begin_request(&frequency)?;
+        device.upload.synchronize()?;
         let mut tensors = std::collections::BTreeMap::new();
         for (name, entry) in &manifest.entries {
             let values = match entry.role.as_str() {
@@ -242,14 +318,6 @@ impl Engine {
         )?;
         let mut linear = LayerLinearPlan::bind(&plan, &catalog, None, stream)?;
         let ffn = BoundFfn::bind(&model_spec, &mut linear)?;
-        let slots = Slots {
-            storage,
-            gate_up: stream.clone_htod(&gu)?,
-            down: stream.clone_htod(&dn)?,
-            valid: stream.clone_htod(&vec![1u32; count])?,
-            generation: stream.clone_htod(&vec![1u64; count])?,
-            published: vec![1; count],
-        };
         let weights = Weights {
             embed: stream.alloc_zeros(32 * d.hidden)?,
             norm: stream.clone_htod(&vec![bf16::ONE; d.hidden])?,
@@ -267,7 +335,7 @@ impl Engine {
         let mut work = Work::new(stream, &model_spec, 8)?;
         stream.memcpy_htod(&[1i32], &mut work.length)?;
         let flash = Some(Flash::new(stream.clone(), 8, model_spec.q_heads as usize)?);
-        let moe = Some(Decode::new(&device, geometry, 8, 2)?);
+        let moe = Some(Decode::new(&device, geometry, 8, capacity.worker_count)?);
         let mut engine = Self {
             capture_fail_after_layer: None,
             capture_fail_stage: None,
@@ -373,6 +441,10 @@ impl Engine {
                     .launch(grid(rows, 256))?;
             }
         }
+        self.moe_slots
+            .as_mut()
+            .context("injected layer has no residency")?
+            .begin_token()?;
         self.run_layer(
             layer,
             crate::backend::Step {
@@ -386,7 +458,11 @@ impl Engine {
                 prefix: "layer",
                 skip: 0,
             }),
-        )
+        )?;
+        self.moe_slots
+            .as_mut()
+            .context("injected layer lost residency")?
+            .finish_token()
     }
 
     pub(crate) fn record_test_stats(&self, trace: &mut Trace) -> Result<()> {
@@ -407,6 +483,10 @@ impl Engine {
         {
             trace.add(format!("stats.{name}"), vec![1], vec![count as f32])?;
         }
+        self.moe_slots
+            .as_ref()
+            .context("MoE residency statistics missing")?
+            .trace(trace)?;
         Ok(())
     }
 }
@@ -420,7 +500,296 @@ fn step(rows: usize) -> crate::backend::Step<'static> {
     }
 }
 
-fn direct(engine: &Engine, input: &[bf16], rows: usize) -> Result<Trace> {
+fn tier_fixture(variant: u32) -> MoeFixture {
+    let mut values = fixture(MoeDims::new(8, 16, 4, 128, 64), variant);
+    values.router_w.fill(bf16::ZERO);
+    for row in 0..8 {
+        values.x[row * 128..row * 128 + 8].fill(bf16::ZERO);
+        values.x[row * 128 + row] = bf16::ONE;
+        let experts = routed_experts(row);
+        for expert in 0..16 {
+            let score = experts
+                .iter()
+                .position(|&id| id == expert)
+                .map_or(-1.0 - expert as f32 / 32.0, |rank| 3.0 - rank as f32 / 2.0);
+            values.router_w[expert as usize * 128 + row] = bf16::from_f32(score);
+        }
+    }
+    values
+}
+
+fn routed_experts(row: usize) -> [u32; 4] {
+    let offset = row as u32;
+    [
+        offset % 4,
+        4 + (offset + 2) % 4,
+        8 + (offset + 1) % 4,
+        12 + (offset + 3) % 4,
+    ]
+}
+
+fn tier_capacity(geometry: ExpertGeometry, pinned: bool) -> Result<Capacity> {
+    let slot = geometry.slot_bytes()?;
+    Ok(Capacity {
+        span_rows: 8,
+        wave_rows: 8,
+        device_expert_bytes: slot * 8,
+        host_expert_bytes: slot * 10,
+        slots_per_layer: vec![4, 4],
+        host_blocks: 8,
+        spare_blocks: 2,
+        disk_bytes: slot * 16,
+        worker_count: 2,
+        disk_workers: 2,
+        prefill_staging_slots: 0,
+        pinned,
+    })
+}
+
+fn tier_schedule() -> [(&'static [u32], &'static [usize]); 3] {
+    [
+        (&[0], &[1, 1, 1, 1, 1, 1, 2, 5, 8, 2]),
+        (&[0], &[8, 2, 1]),
+        (&[4, 5, 7, 8], &[8, 1]),
+    ]
+}
+
+struct TierOracle {
+    policy: crate::experts::runtime::Residency,
+    reader: crate::experts::disk::DiskReader,
+    catalogue: Arc<crate::experts::catalogue::ExpertCatalogue>,
+}
+
+impl TierOracle {
+    fn new(fixture: &MoeFixture, directory: &Path, capacity: &Capacity) -> Result<Self> {
+        use crate::experts::{
+            arena::SlotLayout,
+            disk::DiskReader,
+            runtime::{LoadInputs, Residency},
+        };
+        let catalogue = native_fixture(fixture, directory)?;
+        let geometry = catalogue.geometry();
+        let layout = SlotLayout::new(geometry, capacity)?;
+        let host = if layout.host_blocks() > 0 {
+            Some(HostBlocks::new(
+                layout.host_blocks(),
+                usize::try_from(geometry.slot_bytes()? / 2)?,
+            )?)
+        } else {
+            None
+        };
+        let reader = DiskReader::open(&catalogue, directory, 1)?;
+        let (policy, _) = Residency::load(LoadInputs {
+            geometry,
+            capacity: capacity.clone(),
+            admission: crate::experts::plan::Admission {
+                budget_bytes_per_token: 2 * geometry.slot_bytes()?,
+            },
+            max_rows: 8,
+            initial: &vec![vec![0, 1, 2, 3]; geometry.layers as usize],
+            host: host.as_ref(),
+            catalogue: &catalogue,
+            reader: &reader,
+        })?;
+        std::fs::remove_file(directory.join("expert-fixture.bin"))?;
+        Ok(Self {
+            policy,
+            reader,
+            catalogue,
+        })
+    }
+
+    fn routes(rows: usize) -> Vec<crate::experts::runtime::Route> {
+        (0..rows)
+            .flat_map(|row| {
+                routed_experts(row)
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(rank, expert)| crate::experts::runtime::Route {
+                        row: row as u32,
+                        choice: (row * 4 + rank) as u32,
+                        expert,
+                        weight: bf16::from_f32(0.25),
+                    })
+            })
+            .collect()
+    }
+
+    fn cpu_values(
+        &self,
+        layer: u32,
+        input: &[bf16],
+        reference: &Trace,
+        active: &[u32],
+    ) -> Result<Vec<bf16>> {
+        use crate::cpu::expert_ffn::{Contribution, Isa, Scratch, contribution};
+        let shape = Shape::new(128, 64)?;
+        let mut scratch = Scratch::new(&shape);
+        let native = ExpertWeights {
+            gate_up: 0..16384,
+            gate_up_stride: 128,
+            down: 16384..24576,
+            down_stride: 64,
+        };
+        let mut output = reference
+            .values("layer.moe.contributions")?
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect::<Vec<_>>();
+        let ids = reference.values("layer.moe.ids")?;
+        let weights = reference.values("layer.moe.weights")?;
+        for (choice, &active) in active.iter().enumerate() {
+            if active == 1 {
+                continue;
+            }
+            let slot = self
+                .reader
+                .read_expert(layer, ids[choice] as u32, &self.catalogue)?;
+            let values = self.reader.values(slot)?;
+            let row = choice / 4;
+            contribution(
+                Isa::detect(),
+                Contribution {
+                    shape: &shape,
+                    arena: &values,
+                    weights: &native,
+                    hidden: &input[row * 128..(row + 1) * 128],
+                    routing: bf16::from_f32(weights[choice]),
+                },
+                &mut output[choice * 128..(choice + 1) * 128],
+                &mut scratch,
+            )?;
+        }
+        Ok(output)
+    }
+
+    fn compare_state(&self, engine: &Engine) -> Result<usize> {
+        use crate::experts::plan::Tier;
+        let mut actual = Trace::default();
+        engine.record_test_stats(&mut actual)?;
+        let tiers = actual.values("residency.tier")?;
+        let generations = actual.values("residency.generation")?;
+        let mut mismatches = 0;
+        for layer in 0..2 {
+            for expert in 0..16 {
+                let tier = self.policy.ledger().tier(layer, expert)?;
+                let value = match tier {
+                    Tier::Gpu => 0.0,
+                    Tier::Host => 1.0,
+                    Tier::Disk => 2.0,
+                };
+                let generation = if tier == Tier::Gpu {
+                    self.policy.generation(layer, expert)?
+                } else {
+                    0
+                };
+                let index = layer as usize * 16 + expert as usize;
+                mismatches +=
+                    usize::from(tiers[index] != value || generations[index] != generation as f32);
+            }
+        }
+        Ok(mismatches)
+    }
+}
+
+#[test]
+fn decode_residency_fixture_covers_tiers_requests_and_cap() -> Result<()> {
+    use crate::experts::runtime::{MoveSource, Route};
+    let directory = std::env::temp_dir().join(format!(
+        "flyingfish-decode-residency-{}",
+        std::process::id()
+    ));
+    let fixture = tier_fixture(3);
+    let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+    let mut oracle = TierOracle::new(&fixture, &directory, &tier_capacity(geometry, false)?)?;
+    for layer in 0..2 {
+        for expert in 0..16 {
+            let slot = oracle
+                .reader
+                .read_expert(layer, expert, &oracle.catalogue)?;
+            let values = oracle.reader.values(slot)?;
+            let expert = expert as usize;
+            let expected = fixture.gate_up[expert * 16384..(expert + 1) * 16384]
+                .iter()
+                .chain(&fixture.down[expert * 8192..(expert + 1) * 8192])
+                .map(|&value| {
+                    if layer == 0 {
+                        value
+                    } else {
+                        bf16::from_f32(value.to_f32() * -0.75)
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(values.values(), expected);
+        }
+    }
+    let mut event = 1;
+    let (
+        mut host,
+        mut disk,
+        mut admissions,
+        mut host_moves,
+        mut disk_moves,
+        mut chains,
+        mut compact,
+    ) = (0, 0, 0, 0, 0, 0, false);
+    let mut writebacks = 0;
+    for (target, rows) in tier_schedule() {
+        let mut frequency = vec![vec![0.0; 16]; 2];
+        for layer in &mut frequency {
+            for &expert in target {
+                layer[expert as usize] = 1.0;
+            }
+        }
+        let moves = oracle.policy.begin_request(&frequency)?.to_vec();
+        for movement in moves {
+            writebacks += usize::from(movement.dest_block.is_some());
+            host_moves += usize::from(matches!(movement.source, MoveSource::Host(_)));
+            disk_moves += usize::from(matches!(movement.source, MoveSource::Disk));
+            chains += usize::from(movement.chain_slot.is_some());
+            oracle.policy.record_copy(&[movement.slot], event)?;
+            event += 1;
+        }
+        for &rows in rows {
+            oracle.policy.begin_token()?;
+            let routes: Vec<Route> = TierOracle::routes(rows);
+            for layer in 0..2 {
+                let dispatch = oracle.policy.dispatch(layer, &routes)?;
+                host += dispatch.host.len();
+                disk += dispatch.disk.len();
+                compact |= dispatch.miss_rows.first().is_some_and(|&row| row > 0);
+            }
+            let updates = oracle.policy.finish_token()?.to_vec();
+            assert!(updates.len() <= 2);
+            admissions += updates.len();
+            for update in updates {
+                writebacks += usize::from(update.dest_block.is_some());
+                host_moves += usize::from(update.from_host);
+                disk_moves += usize::from(!update.from_host);
+                oracle.policy.record_copy(&[update.slot], event)?;
+                event += 1;
+            }
+        }
+        oracle.policy.end_request()?;
+    }
+    assert!(
+        host > 0
+            && disk > 0
+            && admissions > 0
+            && host_moves > 0
+            && disk_moves > 0
+            && chains > 0
+            && compact
+    );
+    drop(oracle);
+    std::fs::remove_dir(directory)?;
+    println!(
+        "PASS decode_residency_cpu_preflight host_choices={host} disk_choices={disk} admissions={admissions} host_moves={host_moves} disk_moves={disk_moves} writebacks={writebacks} chains={chains} compact_nonzero_base={compact} requests=3 cap=2 GPU_executed=false"
+    );
+    Ok(())
+}
+
+fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<Trace> {
     let (h, k, i) = (128, 4, 64);
     let stream = &engine.device.stream;
     let ctx = &engine.device.ctx;
@@ -436,7 +805,7 @@ fn direct(engine: &Engine, input: &[bf16], rows: usize) -> Result<Trace> {
     let ids = stream.alloc_zeros::<i32>(rows * k)?;
     let weights = stream.alloc_zeros::<bf16>(rows * k)?;
     let active = stream.clone_htod(&vec![1u32; rows * k])?;
-    let generation = stream.clone_htod(&vec![1u64; rows * k])?;
+    let mut generation = stream.alloc_zeros::<u64>(rows * k)?;
     let contributions = stream.alloc_zeros::<bf16>(rows * k * h)?;
     let shared_out = stream.alloc_zeros::<bf16>(rows * h)?;
     let done = stream.alloc_zeros::<u32>(rows * k)?;
@@ -446,7 +815,7 @@ fn direct(engine: &Engine, input: &[bf16], rows: usize) -> Result<Trace> {
         .moe_slots
         .as_ref()
         .context("test slots absent")?
-        .bindings(0, stream)?;
+        .bindings(layer, stream)?;
     let xv = qwen::matrix(&x, stream, 0, rows, h)?;
     let idv = qwen::view(&ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
     let weightv = qwen::matrix(&weights, stream, 0, rows, k)?;
@@ -457,6 +826,17 @@ fn direct(engine: &Engine, input: &[bf16], rows: usize) -> Result<Trace> {
         &mut TensorMut(idv),
         &mut TensorMut(weightv),
     )?;
+    let routed = stream.clone_dtoh(&ids)?;
+    let published = &engine
+        .moe_slots
+        .as_ref()
+        .context("direct reference slots absent")?
+        .published;
+    let generations = routed
+        .iter()
+        .map(|&id| published[layer * 16 + id as usize])
+        .collect::<Vec<_>>();
+    stream.memcpy_htod(&generations, &mut generation)?;
     DecodeOps::new(ctx)?
         .decode(
             stream,
@@ -553,6 +933,10 @@ fn compare(a: &Trace, b: &Trace) -> Result<usize> {
             a.len() == b.len(),
             "reference/candidate trace extent differs for {name}"
         );
+        ensure!(
+            a.iter().chain(&b).all(|value| value.is_finite()),
+            "Runner FAIL reference/candidate trace nonfinite for {name}"
+        );
         mismatch += a
             .iter()
             .zip(&b)
@@ -562,8 +946,313 @@ fn compare(a: &Trace, b: &Trace) -> Result<usize> {
     Ok(mismatch)
 }
 
+fn combine_expected(engine: &Engine, contributions: &[bf16], rows: usize) -> Result<Vec<bf16>> {
+    let stream = &engine.device.stream;
+    let decode = engine.moe.as_ref().context("reference decode missing")?;
+    let x = qwen::matrix(&engine.work.n, stream, 0, rows, 128)?;
+    let ffn = engine.moe_test_ffn.context("reference FFN missing")?;
+    let expected_contributions = stream.clone_htod(contributions)?;
+    let expected_out = stream.alloc_zeros::<bf16>(rows * 128)?;
+    let expected_scale = stream.alloc_zeros::<bf16>(rows)?;
+    let BoundFfn::Moe { shared_gate, .. } = ffn else {
+        anyhow::bail!("dense CPU control FFN");
+    };
+    let scale = qwen::view(&expected_scale, stream, 0, [rows as u32, 1], [1, 1])?;
+    let combine = CombineOps::new(&engine.device.ctx)?;
+    combine.shared_scale(stream, x, shared_gate, &mut TensorMut(scale))?;
+    combine
+        .combine(
+            stream,
+            &MoeCombine {
+                ids: qwen::view(&decode.ids, stream, 0, [rows as u32, 4], [4, 1])?,
+                final_active: qwen::view(
+                    &decode.final_active,
+                    stream,
+                    0,
+                    [rows as u32, 4],
+                    [4, 1],
+                )?,
+                done: qwen::view(&decode.done, stream, 0, [rows as u32, 4], [4, 1])?,
+                contributions: qwen::view(
+                    &expected_contributions,
+                    stream,
+                    0,
+                    [rows as u32, 4, 128],
+                    [512, 128, 1],
+                )?,
+                shared_out: qwen::matrix(&decode.shared, stream, 0, rows, 128)?,
+                x,
+                shared_expert_gate: shared_gate,
+                scale: TensorMut(scale),
+                y: TensorMut(qwen::matrix(&expected_out, stream, 0, rows, 128)?),
+            },
+        )?
+        .synchronize()?;
+    Ok(stream.clone_dtoh(&expected_out)?)
+}
+
+fn tier_cell(
+    engine: &mut Engine,
+    oracle: &mut TierOracle,
+    reference: &Trace,
+    layer: u32,
+    input: &[bf16],
+    rows: usize,
+) -> Result<(usize, usize, usize)> {
+    let ids = reference.values("layer.moe.ids")?;
+    let weights = reference.values("layer.moe.weights")?;
+    let routes = ids
+        .iter()
+        .zip(&weights)
+        .enumerate()
+        .map(
+            |(choice, (&expert, &weight))| crate::experts::runtime::Route {
+                row: choice as u32 / 4,
+                choice: choice as u32,
+                expert: expert as u32,
+                weight: bf16::from_f32(weight),
+            },
+        )
+        .collect::<Vec<_>>();
+    ensure!(
+        routes
+            .iter()
+            .all(|route| route.expert
+                == routed_experts(route.row as usize)[route.choice as usize % 4]),
+        "Runner FAIL tier reference ids differ from the frozen 0.5-margin logits"
+    );
+    let dispatch = oracle.policy.dispatch(layer, &routes)?.clone();
+    let expected = oracle.cpu_values(layer, input, reference, &dispatch.active)?;
+    engine
+        .device
+        .stream
+        .memcpy_htod(input, &mut engine.work.n.slice_mut(..input.len()))?;
+    let mut trace = Trace::default();
+    engine.run_ffn(
+        layer as usize,
+        step(rows),
+        &mut Some(Target {
+            trace: &mut trace,
+            prefix: "layer",
+            skip: 0,
+        }),
+    )?;
+    for (name, length) in [
+        ("layer.moe.ids", rows * 4),
+        ("layer.moe.weights", rows * 4),
+        ("layer.moe.shared", rows * 128),
+        ("layer.moe.contributions", rows * 4 * 128),
+        ("layer.moe.done", rows * 4),
+        ("layer.ffn", rows * 128),
+    ] {
+        let values = trace.values(name)?;
+        let baseline = reference.values(name)?;
+        ensure!(
+            values.len() == length
+                && baseline.len() == length
+                && values
+                    .iter()
+                    .chain(&baseline)
+                    .all(|value| value.is_finite()),
+            "Runner FAIL tier trace {name} extent/nonfinite layer={layer} rows={rows} expected={length} actual={} reference={}",
+            values.len(),
+            baseline.len()
+        );
+    }
+    let mut mismatches = 0;
+    for name in ["layer.moe.ids", "layer.moe.weights", "layer.moe.shared"] {
+        mismatches += trace
+            .values(name)?
+            .iter()
+            .zip(reference.values(name)?)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+    }
+    mismatches += trace
+        .values("layer.moe.contributions")?
+        .iter()
+        .zip(&expected)
+        .filter(|(a, b)| a.to_bits() != b.to_f32().to_bits())
+        .count();
+    mismatches += trace
+        .values("layer.moe.done")?
+        .iter()
+        .filter(|&&done| done != 1.0)
+        .count();
+    let expected_out = combine_expected(engine, &expected, rows)?;
+    mismatches += trace
+        .values("layer.ffn")?
+        .iter()
+        .zip(expected_out)
+        .filter(|(a, b)| a.to_bits() != b.to_f32().to_bits())
+        .count();
+    println!(
+        "{} decode_residency_cell layer={layer} rows={rows} gpu_choices={} host_choices={} disk_choices={} compacted_rows={:?} bit_mismatches={mismatches}",
+        if mismatches == 0 { "PASS" } else { "DEFECT" },
+        dispatch.active.iter().sum::<u32>(),
+        dispatch.host.len(),
+        dispatch.disk.len(),
+        dispatch.miss_rows
+    );
+    Ok((
+        usize::from(mismatches != 0),
+        dispatch.host.len(),
+        dispatch.disk.len(),
+    ))
+}
+
+fn tier_gate(variants: &[u32], cases: &[(bool, u32)]) -> Result<()> {
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("tier gate runtime missing")?,
+    );
+    let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+    let mut defects = 0;
+    for &variant in variants {
+        let fixture = tier_fixture(variant);
+        let reference =
+            Engine::load_moe_test(&fixture, &runtime.join(format!("reference-{variant}")))?;
+        let mut references = std::collections::BTreeMap::new();
+        for layer in 0..2 {
+            for rows in [1, 2, 5, 8] {
+                let input = &fixture.x[..rows * 128];
+                let trace = direct(&reference, layer, input, rows)?;
+                ensure!(
+                    compare(&trace, &direct(&reference, layer, input, rows)?)? == 0,
+                    "Runner FAIL tier same-form reference repeat differs layer={layer} rows={rows}"
+                );
+                references.insert((layer, rows), trace);
+            }
+        }
+        for &(pinned, engines) in cases {
+            let directory = runtime.join(format!("tier-{variant}-{pinned}-{engines}"));
+            let capacity = tier_capacity(geometry, pinned)?;
+            let mut oracle = TierOracle::new(&fixture, &directory.join("oracle"), &capacity)?;
+            let mut engine = Engine::load_moe_placed(
+                &fixture,
+                &directory,
+                &capacity,
+                &[vec![0, 1, 2, 3], vec![0, 1, 2, 3]],
+                crate::experts::plan::Admission {
+                    budget_bytes_per_token: 2 * geometry.slot_bytes()?,
+                },
+                engines,
+            )?;
+            engine
+                .moe_slots
+                .as_mut()
+                .context("tier slots missing")?
+                .end_request()?;
+            let (mut host_choices, mut disk_choices, mut admissions) = (0, 0, 0);
+            let mut event = 1;
+            let _range = super::super::super::profile::Range::new(true, c"engine_moe_residency");
+            for (request, (target, rows)) in tier_schedule().into_iter().enumerate() {
+                let mut frequency = vec![vec![0.0; 16]; 2];
+                for layer in &mut frequency {
+                    for &expert in target {
+                        layer[expert as usize] = 1.0;
+                    }
+                }
+                let moves = oracle.policy.begin_request(&frequency)?.to_vec();
+                for movement in &moves {
+                    oracle.policy.record_copy(&[movement.slot], event)?;
+                    event += 1;
+                }
+                {
+                    let slots = engine
+                        .moe_slots
+                        .as_mut()
+                        .context("tier request slots missing")?;
+                    slots.delay_copies()?;
+                    slots.begin_request(&frequency)?;
+                }
+                defects += oracle.compare_state(&engine)?;
+                for &rows in rows {
+                    oracle.policy.begin_token()?;
+                    engine
+                        .moe_slots
+                        .as_mut()
+                        .context("tier token slots missing")?
+                        .begin_token()?;
+                    for layer in 0..2 {
+                        let (cell, host, disk) = tier_cell(
+                            &mut engine,
+                            &mut oracle,
+                            &references[&(layer, rows)],
+                            layer as u32,
+                            &fixture.x[..rows * 128],
+                            rows,
+                        )?;
+                        defects += cell;
+                        host_choices += host;
+                        disk_choices += disk;
+                    }
+                    let updates = oracle.policy.finish_token()?.to_vec();
+                    ensure!(
+                        updates.len() <= 2,
+                        "Runner FAIL CPU oracle exceeds frozen admission cap"
+                    );
+                    admissions += updates.len();
+                    for update in &updates {
+                        oracle.policy.record_copy(&[update.slot], event)?;
+                        event += 1;
+                    }
+                    let slots = engine
+                        .moe_slots
+                        .as_mut()
+                        .context("tier admission slots missing")?;
+                    slots.delay_copies()?;
+                    slots.finish_token()?;
+                    let mismatch = oracle.compare_state(&engine)?;
+                    defects += mismatch;
+                    println!(
+                        "{} decode_residency_admission variant={variant} pinned={pinned} engines={engines} request={request} rows={rows} moves={} cap=2 state_mismatches={mismatch}",
+                        if mismatch == 0 { "PASS" } else { "DEFECT" },
+                        updates.len()
+                    );
+                }
+                oracle.policy.end_request()?;
+                engine
+                    .moe_slots
+                    .as_mut()
+                    .context("tier request end slots missing")?
+                    .end_request()?;
+            }
+            let mut stats = Trace::default();
+            engine.record_test_stats(&mut stats)?;
+            let pending = stats.values("stats.copy_wait_pending")?[0];
+            ensure!(
+                pending > 0.0,
+                "Runner FAIL delayed copy control did not execute an outstanding first-read wait"
+            );
+            println!(
+                "PASS decode_residency_coverage variant={variant} pinned={pinned} engines={engines} host_choices={host_choices} disk_choices={disk_choices} admissions={admissions} pending_first_reads={pending} requests=3 end_request=true"
+            );
+        }
+    }
+    ensure!(defects == 0, "DEFECT decode residency cells={defects}");
+    println!(
+        "PASS decode_residency_gate variants={} cases={} host=true disk=true admissions=true writeback=true requests=3 graphs=false",
+        variants.len(),
+        cases.len()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "authorized GPU window"]
+fn decode_residency_smoke_gpu() -> Result<()> {
+    tier_gate(&[3], &[(false, 1)])
+}
+
+#[test]
+#[ignore = "authorized GPU window"]
+fn decode_residency_gpu() -> Result<()> {
+    tier_gate(&[3, 7], &[(false, 1), (false, 2), (true, 1), (true, 2)])
+}
+
 fn cpu_control(
     engine: &mut Engine,
+    fixture: &MoeFixture,
     input: &[bf16],
     rows: usize,
     reference: &Trace,
@@ -574,11 +1263,14 @@ fn cpu_control(
         .moe_slots
         .as_ref()
         .context("CPU control slots missing")?;
-    let host = slots
-        .storage
-        .host()
-        .context("CPU control host missing")?
-        .clone();
+    let host = HostBlocks::new(16, 24576)?;
+    for expert in 0..16 {
+        let mut claim = host.claim(expert)?;
+        let values = claim.slice()?;
+        let expert = expert as usize;
+        values[..16384].copy_from_slice(&fixture.gate_up[expert * 16384..(expert + 1) * 16384]);
+        values[16384..].copy_from_slice(&fixture.down[expert * 8192..(expert + 1) * 8192]);
+    }
     let shape = Shape::new(128, 64)?;
     let mut scratch = Scratch::new(&shape);
     let local = ExpertWeights {
@@ -600,6 +1292,10 @@ fn cpu_control(
         .collect::<Result<Vec<_>>>()?;
     let ids = reference.values("layer.moe.ids")?;
     let weights = reference.values("layer.moe.weights")?;
+    let generations = ids
+        .iter()
+        .map(|&expert| slots.published[expert as usize])
+        .collect::<Vec<_>>();
     let mut contributions = reference
         .values("layer.moe.contributions")?
         .into_iter()
@@ -642,11 +1338,15 @@ fn cpu_control(
     let mut probe_out = TensorMut(qwen::matrix(&engine.work.out, stream, 0, rows, 128)?);
     let dispatch = || Dispatch {
         active: &active,
-        generation: &[1u64; 32][..rows * 4],
+        generation: &generations,
         host: Some(host.clone()),
         experts: &experts,
         assignments: &assignments,
         miss_rows: &miss_rows,
+        host_dma: None,
+        disk: &[],
+        disk_cpu: None,
+        layer: 0,
     };
     let different_input = decode
         .finish(
@@ -667,11 +1367,15 @@ fn cpu_control(
             slots.bindings(0, stream)?,
             Dispatch {
                 active: &active,
-                generation: &vec![1; rows * 4],
+                generation: &generations,
                 host: Some(host.clone()),
                 experts: &experts,
                 assignments: &assignments,
                 miss_rows: &miss_rows,
+                host_dma: None,
+                disk: &[],
+                disk_cpu: None,
+                layer: 0,
             },
             (
                 x,
@@ -705,44 +1409,7 @@ fn cpu_control(
         .iter()
         .filter(|&&d| d != 1.0)
         .count();
-    let expected_contributions = stream.clone_htod(&contributions)?;
-    let expected_out = stream.alloc_zeros::<bf16>(rows * 128)?;
-    let expected_scale = stream.alloc_zeros::<bf16>(rows)?;
-    let BoundFfn::Moe { shared_gate, .. } = ffn else {
-        anyhow::bail!("dense CPU control FFN");
-    };
-    let scale = qwen::view(&expected_scale, stream, 0, [rows as u32, 1], [1, 1])?;
-    let combine = CombineOps::new(&engine.device.ctx)?;
-    combine.shared_scale(stream, x, shared_gate, &mut TensorMut(scale))?;
-    combine
-        .combine(
-            stream,
-            &MoeCombine {
-                ids: qwen::view(&decode.ids, stream, 0, [rows as u32, 4], [4, 1])?,
-                final_active: qwen::view(
-                    &decode.final_active,
-                    stream,
-                    0,
-                    [rows as u32, 4],
-                    [4, 1],
-                )?,
-                done: qwen::view(&decode.done, stream, 0, [rows as u32, 4], [4, 1])?,
-                contributions: qwen::view(
-                    &expected_contributions,
-                    stream,
-                    0,
-                    [rows as u32, 4, 128],
-                    [512, 128, 1],
-                )?,
-                shared_out: qwen::matrix(&decode.shared, stream, 0, rows, 128)?,
-                x,
-                shared_expert_gate: shared_gate,
-                scale: TensorMut(scale),
-                y: TensorMut(qwen::matrix(&expected_out, stream, 0, rows, 128)?),
-            },
-        )?
-        .synchronize()?;
-    let expected = stream.clone_dtoh(&expected_out)?;
+    let expected = combine_expected(engine, &contributions, rows)?;
     let observed = stream.clone_dtoh(&engine.work.out.slice(..rows * 128))?;
     let output_mismatches = expected
         .iter()
@@ -770,9 +1437,9 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
         let mut engine = Engine::load_moe_test(&fixture, runtime)?;
         for &rows in row_cases {
             let input = &fixture.x[..rows * 128];
-            let reference = direct(&engine, input, rows)?;
+            let reference = direct(&engine, 0, input, rows)?;
             ensure!(
-                compare(&reference, &direct(&engine, input, rows)?)? == 0,
+                compare(&reference, &direct(&engine, 0, input, rows)?)? == 0,
                 "Runner FAIL same-form reference repeat differs rows={rows} variant={variant}"
             );
             let mut trace = Trace::default();
@@ -781,6 +1448,11 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
                 .stream
                 .memcpy_htod(input, &mut engine.work.n.slice_mut(..input.len()))?;
             {
+                engine
+                    .moe_slots
+                    .as_mut()
+                    .context("gate slots absent")?
+                    .begin_token()?;
                 let _range = super::super::super::profile::Range::new(true, c"engine_moe_ffn");
                 engine.run_ffn(
                     0,
@@ -792,6 +1464,11 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
                     }),
                 )?;
             }
+            engine
+                .moe_slots
+                .as_mut()
+                .context("gate slots lost")?
+                .finish_token()?;
             let mismatches = compare(&reference, &trace)?;
             defects += usize::from(mismatches != 0);
             println!(
@@ -799,7 +1476,7 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
                 if mismatches == 0 { "PASS" } else { "DEFECT" }
             );
             if cpu {
-                defects += cpu_control(&mut engine, input, rows, &reference)?;
+                defects += cpu_control(&mut engine, &fixture, input, rows, &reference)?;
             }
         }
         let mut stats = Trace::default();
@@ -846,6 +1523,11 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
                 engine.model_spec.layers[layer].mixer
             );
         }
+        engine
+            .moe_slots
+            .as_mut()
+            .context("gate slots lost at request end")?
+            .end_request()?;
     }
     ensure!(defects == 0, "eager MoE candidate defects={defects}");
     println!(
@@ -910,6 +1592,10 @@ fn dispatch_covers_original_choices_once_after_row_compaction() -> Result<()> {
                 experts: &experts,
                 assignments,
                 miss_rows: rows,
+                host_dma: None,
+                disk: &[],
+                disk_cpu: None,
+                layer: 0,
             },
         )
     };

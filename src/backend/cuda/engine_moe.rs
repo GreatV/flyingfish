@@ -13,6 +13,10 @@ use crate::cpu::expert_ffn::{Assignment, ExpertPool, ExpertWeights, Job, Shape};
 use crate::experts::{arena::HostBlocks, catalogue::ExpertGeometry};
 use cudarc::driver::{CudaEvent, DevicePtr, DeviceRepr, HostSlice, ValidAsZeroBits, result};
 
+#[path = "engine_moe_residency.rs"]
+mod residency;
+pub(super) use residency::Slots;
+
 fn pinned_zeros<T: DeviceRepr + ValidAsZeroBits>(
     context: &Arc<CudaContext>,
     len: usize,
@@ -33,34 +37,6 @@ pub(super) struct SlotBindings {
     pub generation: Tensor<u64, 1>,
 }
 
-pub(super) struct Slots {
-    storage: super::super::weights::ExpertStorage,
-    gate_up: CudaSlice<u64>,
-    down: CudaSlice<u64>,
-    valid: CudaSlice<u32>,
-    generation: CudaSlice<u64>,
-    published: Vec<u64>,
-}
-
-impl Slots {
-    fn bindings(&self, layer: usize, stream: &Arc<CudaStream>) -> Result<SlotBindings> {
-        let geometry = self.storage.layout().geometry();
-        ensure!(
-            layer < geometry.layers as usize,
-            "MoE slot layer={layer} outside layers={}",
-            geometry.layers
-        );
-        let experts = geometry.experts;
-        let offset = layer * experts as usize;
-        Ok(SlotBindings {
-            gate_up: qwen::view(&self.gate_up, stream, offset, [experts], [1])?,
-            down: qwen::view(&self.down, stream, offset, [experts], [1])?,
-            valid: qwen::view(&self.valid, stream, offset, [experts], [1])?,
-            generation: qwen::view(&self.generation, stream, offset, [experts], [1])?,
-        })
-    }
-}
-
 impl Engine {
     pub(super) fn run_moe_ffn(
         &mut self,
@@ -75,44 +51,18 @@ impl Engine {
             .context("MoE decode executor is not bound")?;
         let slots = self
             .moe_slots
-            .as_ref()
+            .as_mut()
             .context("MoE physical slot tables are not bound")?;
         let stream = &self.device.stream;
         let hidden = self.model_spec.hidden as usize;
         let x = qwen::matrix(&self.work.n, stream, 0, rows, hidden)?;
-        let bindings = slots.bindings(layer, stream)?;
-        decode.route(&self.device, ffn, x)?;
-        let (ids, _) = decode.routed()?;
-        let mut generation = [0u64; 8 * 32];
-        let experts = slots.storage.layout().geometry().experts as usize;
-        for (choice, &expert) in ids.iter().enumerate() {
-            ensure!(
-                expert >= 0 && (expert as usize) < experts,
-                "MoE route choice={choice} expert={expert} outside experts={experts}"
-            );
-            generation[choice] = slots.published[layer * experts + expert as usize];
-            ensure!(
-                generation[choice] != 0,
-                "MoE all-resident binding lacks layer={layer} expert={expert}"
-            );
-        }
-        let count = ids.len();
-        decode.finish(
+        slots.run(
             &self.device,
+            decode,
+            u32::try_from(layer)?,
             ffn,
-            bindings,
-            Dispatch {
-                active: &[1u32; 8 * 32][..count],
-                generation: &generation[..count],
-                host: None,
-                experts: &[],
-                assignments: &[],
-                miss_rows: &[],
-            },
-            (
-                x,
-                &mut TensorMut(qwen::matrix(&self.work.out, stream, 0, rows, hidden)?),
-            ),
+            x,
+            &mut TensorMut(qwen::matrix(&self.work.out, stream, 0, rows, hidden)?),
         )?;
         if let Some(target) = trace.as_mut() {
             let prefix = if target.trace.all_layers {
@@ -134,6 +84,10 @@ pub(super) struct Dispatch<'a> {
     pub experts: &'a [ExpertWeights],
     pub assignments: &'a [Assignment],
     pub miss_rows: &'a [u32],
+    pub host_dma: Option<&'a residency::Transfers>,
+    pub disk: &'a [crate::experts::runtime::Route],
+    pub disk_cpu: Option<&'a mut crate::experts::disk::DiskExperts>,
+    pub layer: u32,
 }
 
 pub(super) struct Decode {
@@ -165,6 +119,7 @@ pub(super) struct Decode {
     cpu_out: PinnedHostSlice<bf16>,
     cpu_done: PinnedHostSlice<u32>,
     pool: ExpertPool,
+    mailbox: Arc<CudaStream>,
     pub stats: [u64; 5],
 }
 
@@ -228,6 +183,7 @@ impl Decode {
             cpu_x: vec![bf16::ZERO; hidden],
             cpu_out: pinned_zeros(context, elements)?,
             cpu_done: pinned_zeros(context, choices)?,
+            mailbox: context.new_stream()?,
             pool: ExpertPool::new(
                 workers as usize,
                 Shape::new(geometry.hidden as usize, geometry.intermediate as usize)?,
@@ -281,32 +237,32 @@ impl Decode {
                 [u64::from(k), 1],
             )?),
         )?;
-        device.upload.wait(&stream.record_event(None)?)?;
+        self.mailbox.wait(&stream.record_event(None)?)?;
         let count = rows * k as usize;
         {
-            let (ids, _ids) = self.ids.device_ptr(&device.upload);
-            let (weights, _weights) = self.weights.device_ptr(&device.upload);
+            let (ids, _ids) = self.ids.device_ptr(&self.mailbox);
+            let (weights, _weights) = self.weights.device_ptr(&self.mailbox);
             let (host_ids, _ids_write) =
-                unsafe { self.host_ids.stream_synced_mut_slice(&device.upload) };
+                unsafe { self.host_ids.stream_synced_mut_slice(&self.mailbox) };
             let (host_weights, _weights_write) =
-                unsafe { self.host_weights.stream_synced_mut_slice(&device.upload) };
-            let (host_x, _x_write) = unsafe { self.host_x.stream_synced_mut_slice(&device.upload) };
+                unsafe { self.host_weights.stream_synced_mut_slice(&self.mailbox) };
+            let (host_x, _x_write) = unsafe { self.host_x.stream_synced_mut_slice(&self.mailbox) };
             // SAFETY: each copied prefix has its exact logical extent inside the owned mailbox.
             unsafe {
-                result::memcpy_dtoh_async(&mut host_ids[..count], ids, device.upload.cu_stream())?;
+                result::memcpy_dtoh_async(&mut host_ids[..count], ids, self.mailbox.cu_stream())?;
                 result::memcpy_dtoh_async(
                     &mut host_weights[..count],
                     weights,
-                    device.upload.cu_stream(),
+                    self.mailbox.cu_stream(),
                 )?;
                 result::memcpy_dtoh_async(
                     &mut host_x[..rows * self.geometry.hidden as usize],
                     x.ptr,
-                    device.upload.cu_stream(),
+                    self.mailbox.cu_stream(),
                 )?;
             }
         }
-        device.upload.synchronize()?;
+        self.mailbox.synchronize()?;
         self.rows = rows;
         self.input_ptr = x.ptr;
         self.router_ptr = router.ptr;
@@ -328,7 +284,7 @@ impl Decode {
         device: &Device,
         ffn: BoundFfn,
         slots: SlotBindings,
-        dispatch: Dispatch<'_>,
+        mut dispatch: Dispatch<'_>,
         activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
     ) -> Result<CudaEvent> {
         let BoundFfn::Moe {
@@ -372,27 +328,26 @@ impl Decode {
         self.host_generation.as_mut_slice()?[..rows * k].copy_from_slice(dispatch.generation);
         {
             let (active, _active_read) =
-                unsafe { self.host_active.stream_synced_slice(&device.upload) };
+                unsafe { self.host_active.stream_synced_slice(&self.mailbox) };
             let (generation, _generation_read) =
-                unsafe { self.host_generation.stream_synced_slice(&device.upload) };
-            let (active_ptr, _active_write) = self.active.device_ptr_mut(&device.upload);
-            let (generation_ptr, _generation_write) =
-                self.generation.device_ptr_mut(&device.upload);
+                unsafe { self.host_generation.stream_synced_slice(&self.mailbox) };
+            let (active_ptr, _active_write) = self.active.device_ptr_mut(&self.mailbox);
+            let (generation_ptr, _generation_write) = self.generation.device_ptr_mut(&self.mailbox);
             // SAFETY: owned pinned prefixes and device destinations each contain rows*top_k elements.
             unsafe {
                 result::memcpy_htod_async(
                     active_ptr,
                     &active[..rows * k],
-                    device.upload.cu_stream(),
+                    self.mailbox.cu_stream(),
                 )?;
                 result::memcpy_htod_async(
                     generation_ptr,
                     &generation[..rows * k],
-                    device.upload.cu_stream(),
+                    self.mailbox.cu_stream(),
                 )?;
             }
         }
-        stream.wait(&device.upload.record_event(None)?)?;
+        stream.wait(&self.mailbox.record_event(None)?)?;
         {
             let (done_ptr, _write) = self.done.device_ptr_mut(stream);
             // SAFETY: done owns max_rows*top_k words and is ordered after the preceding layer's combine.
@@ -462,13 +417,18 @@ impl Decode {
             },
             &qwen::scratch(&self.scratch, stream),
         )?;
-        if !dispatch.assignments.is_empty() {
-            self.run_cpu(device, &dispatch)?;
-            device.upload.wait(&reader)?;
+        if !dispatch.assignments.is_empty() || !dispatch.disk.is_empty() {
+            self.run_cpu(device, &mut dispatch)?;
+            self.mailbox.wait(&reader)?;
             let values = self.cpu_out.as_slice()?;
             let done_values = self.cpu_done.as_mut_slice()?;
-            for assignment in dispatch.assignments {
-                let choice = assignment.choice as usize;
+            for choice in dispatch
+                .assignments
+                .iter()
+                .map(|a| a.choice)
+                .chain(dispatch.disk.iter().map(|a| a.choice))
+            {
+                let choice = choice as usize;
                 let first = choice * hidden;
                 done_values[choice] = 1;
                 // SAFETY: each validated CPU choice owns its contribution and done word; mailboxes live through publication.
@@ -476,19 +436,19 @@ impl Decode {
                     result::memcpy_htod_async(
                         contributions.ptr + (first * 2) as u64,
                         &values[first..first + hidden],
-                        device.upload.cu_stream(),
+                        self.mailbox.cu_stream(),
                     )?;
                     result::memcpy_htod_async(
                         done.read().ptr + (choice * 4) as u64,
                         &done_values[choice..choice + 1],
-                        device.upload.cu_stream(),
+                        self.mailbox.cu_stream(),
                     )?;
                 }
             }
-            let published = device.upload.record_event(None)?;
+            let published = self.mailbox.record_event(None)?;
             stream.wait(&published)?;
             published.synchronize()?;
-            self.stats[2] += dispatch.assignments.len() as u64;
+            self.stats[2] += (dispatch.assignments.len() + dispatch.disk.len()) as u64;
             self.stats[3] += 1;
         }
         let mut scale = TensorMut(qwen::view(
@@ -527,7 +487,7 @@ impl Decode {
         Ok(completed)
     }
 
-    fn run_cpu(&mut self, device: &Device, dispatch: &Dispatch<'_>) -> Result<()> {
+    fn run_cpu(&mut self, device: &Device, dispatch: &mut Dispatch<'_>) -> Result<()> {
         let hidden = self.geometry.hidden as usize;
         let source = self.host_x.as_slice()?;
         for (compacted, &row) in dispatch.miss_rows.iter().enumerate() {
@@ -539,19 +499,44 @@ impl Decode {
             self.cpu_x[compacted * hidden..(compacted + 1) * hidden]
                 .copy_from_slice(&source[row as usize * hidden..(row as usize + 1) * hidden]);
         }
-        self.pool.run(Job {
-            arena: dispatch
-                .host
-                .as_ref()
-                .context("MoE CPU assignments have no host arena")?
-                .clone(),
-            hidden: &self.cpu_x[..dispatch.miss_rows.len() * hidden],
-            rows: dispatch.miss_rows.len(),
-            experts: dispatch.experts,
-            assignments: dispatch.assignments,
-            out: &mut self.cpu_out.as_mut_slice()?
-                [..self.rows * self.geometry.top_k as usize * hidden],
-        })?;
+        let cpu_hidden = &self.cpu_x[..dispatch.miss_rows.len() * hidden];
+        if !dispatch.disk.is_empty() {
+            dispatch
+                .disk_cpu
+                .as_deref_mut()
+                .context("disk routes have no bound CPU workers")?
+                .start(
+                    dispatch.layer,
+                    cpu_hidden,
+                    dispatch.miss_rows.len(),
+                    dispatch.disk,
+                )?;
+        }
+        if !dispatch.assignments.is_empty() {
+            if let Some(dma) = dispatch.host_dma {
+                dma.ready_weights(dispatch.experts)?;
+            }
+            self.pool.run(Job {
+                arena: dispatch
+                    .host
+                    .as_ref()
+                    .context("MoE CPU assignments have no host arena")?
+                    .clone(),
+                hidden: cpu_hidden,
+                rows: dispatch.miss_rows.len(),
+                experts: dispatch.experts,
+                assignments: dispatch.assignments,
+                out: &mut self.cpu_out.as_mut_slice()?
+                    [..self.rows * self.geometry.top_k as usize * hidden],
+            })?;
+        }
+        if !dispatch.disk.is_empty() {
+            dispatch
+                .disk_cpu
+                .as_deref_mut()
+                .context("disk completion has no bound CPU workers")?
+                .finish(self.cpu_out.as_mut_slice()?)?;
+        }
         device.ctx.check_err()?;
         Ok(())
     }
@@ -632,6 +617,10 @@ fn validate_dispatch(
         dispatch.assignments.is_empty() || dispatch.host.is_some(),
         "MoE CPU assignments have no host arena"
     );
+    ensure!(
+        dispatch.disk.is_empty() || dispatch.disk_cpu.is_some(),
+        "disk CPU assignments have no bound worker service"
+    );
     let mut coverage = [0u8; 8 * 32];
     for assignment in dispatch.assignments {
         let choice = assignment.choice as usize;
@@ -658,6 +647,23 @@ fn validate_dispatch(
         ensure!(
             coverage[choice] == 0,
             "MoE CPU choice={choice} has duplicate assignments"
+        );
+        coverage[choice] = 1;
+    }
+    for route in dispatch.disk {
+        let choice = route.choice as usize;
+        ensure!(
+            choice < count && (route.row as usize) < dispatch.miss_rows.len(),
+            "disk route choice={} row={} outside count={count} rows={}",
+            route.choice,
+            route.row,
+            dispatch.miss_rows.len()
+        );
+        ensure!(
+            dispatch.miss_rows[route.row as usize] as usize == choice / top_k
+                && route.weight == weights[choice]
+                && coverage[choice] == 0,
+            "disk route choice={choice} compact row/weight/coverage differs"
         );
         coverage[choice] = 1;
     }

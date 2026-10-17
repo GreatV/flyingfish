@@ -175,3 +175,24 @@ extern "C" __global__ void moe_route_topk(
     logit = __bfloat162float(logits[(size_t)row * experts + tid]);
   moe_route_select(logit, ids, weights, experts, top_k);
 }
+
+// Stream-ordered publication of one native expert slot and its generation.
+extern "C" __global__ void moe_slot_publish(
+    uint64_t* gate_up, uint64_t* down, uint32_t* valid, uint64_t* generation,
+    int experts, int incoming, int victim, uint64_t gu, uint64_t dn,
+    uint64_t epoch) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  if (experts <= 0 || incoming < 0 || incoming >= experts || victim < -1 ||
+      victim >= experts || victim == incoming || gu == 0 || dn == 0 ||
+      (gu & 15) != 0 || (dn & 15) != 0 || epoch == 0) __trap();
+  if (victim >= 0) {
+    valid[victim] = 0;
+    generation[victim] = 0;
+    gate_up[victim] = 0;
+    down[victim] = 0;
+  }
+  gate_up[incoming] = gu;
+  down[incoming] = dn;
+  generation[incoming] = epoch;
+  valid[incoming] = 1;
+}

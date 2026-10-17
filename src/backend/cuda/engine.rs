@@ -1293,11 +1293,17 @@ impl Engine {
             );
             self.ensure_verification()?;
         }
+        if let Some(slots) = self.moe_slots.as_mut() {
+            slots.begin_token()?;
+        }
         self.run_operator(crate::backend::Operator::Embed, 0, step, &mut trace)?;
         for i in 0..self.config.num_hidden_layers {
             self.run_layer(i, step, &mut trace)?;
         }
         self.run_operator(crate::backend::Operator::Head, 0, step, &mut trace)?;
+        if let Some(slots) = self.moe_slots.as_mut() {
+            slots.finish_token()?;
+        }
         if step.head == Head::None {
             self.logits_cache.invalidate();
         } else {
@@ -1859,6 +1865,11 @@ impl Engine {
 
     pub fn reset(&mut self) -> Result<()> {
         self.poisoned = true;
+        if let Some(slots) = self.moe_slots.as_mut()
+            && slots.request_open
+        {
+            slots.end_request()?;
+        }
         if let Some(chain) = self.mtp.as_mut() {
             chain.invalidate_verify();
         }
