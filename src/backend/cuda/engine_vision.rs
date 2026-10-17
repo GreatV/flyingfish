@@ -2538,7 +2538,7 @@ mod tests {
         })
     }
 
-    /// Largest per-element distance in BF16 ulps of `max(|reference_i|, rms)`.
+    /// Largest per-element distance in half-BF16-ulp units of `max(|reference_i|, rms)`.
     fn ulp_ratio(candidate: &[f32], reference: &[f32], rms: f32) -> f64 {
         let mut worst = 0f64;
         for (&c, &r) in candidate.iter().zip(reference) {
@@ -2624,8 +2624,7 @@ mod tests {
         }))
     }
 
-    /// Gate of the MiniCPM tower against the T0 fixtures; tolerances are frozen in the protocol
-    /// (`evidence/PR5/PROTOCOL.md`) before the run.
+    /// Gate of the MiniCPM tower against the T0 fixtures.
     #[test]
     #[ignore = "requires FF_MINICPM_VISION_WINDOW=granted, FF_MODEL, FF_MINICPM_FIXTURE_DIR, \
                 FF_MINICPM_VISION_OUTPUT_DIR, FF_MINICPM_TOLERANCES and FF_MINICPM_VISION_REFERENCE"]

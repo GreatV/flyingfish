@@ -209,8 +209,7 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
 }
 
 /// Oracle: transformers 5.19 official modeling code (`get_vision_nearest_position_ids`,
-/// `get_vision_window_index`, `MiniCPMV4_7Merger.forward` ordering); generator and raw fixture in
-/// `evidence/PR5/`.
+/// `get_vision_window_index`, `MiniCPMV4_7Merger.forward` ordering).
 #[test]
 fn vision_bookkeeping_matches_the_model_definition() -> Result<()> {
     let fixture: serde_json::Value =
@@ -327,7 +326,8 @@ fn vision_bookkeeping_matches_the_model_definition() -> Result<()> {
 }
 
 /// NaViT patch pack `[C, side, patches*side]` in (c, ky, patch, kx) order -> `[patches, C*side*side]`
-/// patch rows in (c, ky, kx) order, rounded to BF16. `transposed` swaps ky/kx for the mutant arm.
+/// patch rows in (c, ky, kx) order, rounded to BF16. `transposed` swaps ky/kx for the negative
+/// control.
 fn patch_rows(
     pixels: &[f32],
     patches: usize,
@@ -589,7 +589,7 @@ fn matmul_f32(
 
 /// Pins the final-merger 2x2 grouping over the `(h/2, w/2)` tower grid: the production
 /// `merge_groups` map must reproduce the T0 merger output from the fixture tower output, while
-/// contiguous four-row chunks (the layout the engine used before the fix) must fail.
+/// contiguous four-row chunks must fail.
 #[test]
 #[ignore = "CPU-only external fixtures; set FF_MODEL and FF_MINICPM_FIXTURE_DIR; run with --release"]
 fn final_merger_groups_match_the_reference() -> Result<()> {
