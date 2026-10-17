@@ -162,6 +162,24 @@ fn dense_at<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     unsafe { Tensor::new(ptr + offset_bytes, shape, stride, bytes) }
 }
 
+/// Stage view: exact-length `dense` when the extent covers the whole allocation, otherwise the
+/// offset-0 prefix `dense_at`.
+fn stage_view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
+    buffer: &CudaSlice<T>,
+    stream: &Arc<CudaStream>,
+    shape: [u32; R],
+) -> Result<Tensor<T, R>> {
+    let count = shape
+        .iter()
+        .try_fold(1u64, |acc, &n| acc.checked_mul(u64::from(n)))
+        .context("vision view extent overflow")?;
+    if count == buffer.len() as u64 {
+        dense(buffer, stream, shape)
+    } else {
+        dense_at(buffer, stream, shape, 0)
+    }
+}
+
 fn matrix<T: Copy>(view: &Tensor<T, 2>, width: u32) -> Result<()> {
     view.validate()?;
     ensure!(
@@ -1265,7 +1283,7 @@ impl VisionRuntime {
             VisionAttnBindings {
                 q_in: dense(&q, s, [spec.hq, rows, spec.d])?,
                 k_in: dense(&k, s, [spec.hq, rows, spec.d])?,
-                v: dense_at(&v, s, [spec.hq, packing.padded_rows(), spec.d], 0)?,
+                v: stage_view(&v, s, [spec.hq, packing.padded_rows(), spec.d])?,
                 o: TensorMut(dense(&core, s, [rows, spec.hq, spec.d])?),
             },
         )?;
@@ -1283,10 +1301,10 @@ impl VisionRuntime {
                     &spec,
                     down_packing,
                     VisionAttnBindings {
-                        q_in: dense_at(&q, s, [spec.hq, tower_rows, spec.d], 0)?,
-                        k_in: dense_at(&k, s, [spec.hq, tower_rows, spec.d], 0)?,
-                        v: dense_at(&v, s, [spec.hq, down_packing.padded_rows(), spec.d], 0)?,
-                        o: TensorMut(dense_at(&core, s, [tower_rows, spec.hq, spec.d], 0)?),
+                        q_in: stage_view(&q, s, [spec.hq, tower_rows, spec.d])?,
+                        k_in: stage_view(&k, s, [spec.hq, tower_rows, spec.d])?,
+                        v: stage_view(&v, s, [spec.hq, down_packing.padded_rows(), spec.d])?,
+                        o: TensorMut(stage_view(&core, s, [tower_rows, spec.hq, spec.d])?),
                     },
                 )?;
                 let window_attention = VisionAttnOps::prepare(
@@ -1296,7 +1314,7 @@ impl VisionRuntime {
                     VisionAttnBindings {
                         q_in: dense(&q, s, [spec.hq, rows, spec.d])?,
                         k_in: dense(&k, s, [spec.hq, rows, spec.d])?,
-                        v: dense_at(&v, s, [spec.hq, window_packing.padded_rows(), spec.d], 0)?,
+                        v: stage_view(&v, s, [spec.hq, window_packing.padded_rows(), spec.d])?,
                         o: TensorMut(dense(&core, s, [rows, spec.hq, spec.d])?),
                     },
                 )?;
@@ -1364,7 +1382,7 @@ impl VisionRuntime {
         let merger = VisionMergerOps::prepare(
             &spec,
             VisionMergerBindings {
-                x: dense_at(merger_input, s, [tower_rows, hidden], 0)?,
+                x: stage_view(merger_input, s, [tower_rows, hidden])?,
                 norm_w: dense(&m.norm.weight, s, [norm_width])?,
                 norm_b: dense(&m.norm.bias, s, [norm_width])?,
                 fc1_w: dense(&m.fc1.weight, s, m.fc1.shape)?,
@@ -1610,7 +1628,7 @@ impl VisionRuntime {
             dense(stage.hidden, stream, [rows, 1, width])?,
             dense(&block.norm1.weight, stream, [width])?,
             dense(&block.norm1.bias, stream, [width])?,
-            &mut TensorMut(dense_at(buffers.norm, stream, [rows, 1, width], 0)?),
+            &mut TensorMut(stage_view(buffers.norm, stream, [rows, 1, width])?),
             spec.ln_eps,
         )?;
         if index == 0 || index == last {
@@ -1624,19 +1642,19 @@ impl VisionRuntime {
             )?;
         }
         {
-            let normed = dense_at(buffers.norm, stream, [rows, width], 0)?;
-            let q = dense_at(buffers.q, stream, [spec.hq, rows, spec.d], 0)?;
-            let k = dense_at(buffers.k, stream, [spec.hq, rows, spec.d], 0)?;
-            let v = dense_at(buffers.v, stream, [spec.hq, stage.padded, spec.d], 0)?;
+            let normed = stage_view(buffers.norm, stream, [rows, width])?;
+            let q = stage_view(buffers.q, stream, [spec.hq, rows, spec.d])?;
+            let k = stage_view(buffers.k, stream, [spec.hq, rows, spec.d])?;
+            let v = stage_view(buffers.v, stream, [spec.hq, stage.padded, spec.d])?;
             match &block.qkv {
                 QkvWeights::Fused(weight) => {
                     weight.run(
                         stream,
                         blas,
                         normed,
-                        &mut TensorMut(dense_at(buffers.qkv, stream, [rows, 3 * width], 0)?),
+                        &mut TensorMut(stage_view(buffers.qkv, stream, [rows, 3 * width])?),
                     )?;
-                    let input = dense_at(buffers.qkv, stream, [rows, 3 * width], 0)?;
+                    let input = stage_view(buffers.qkv, stream, [rows, 3 * width])?;
                     for image in 0..stage.packing.images() {
                         let first = stage.packing.cu_seqlens()[image] as u32;
                         let n = stage.packing.cu_seqlens()[image + 1] as u32 - first;
@@ -1698,8 +1716,8 @@ impl VisionRuntime {
         block.projection.run(
             stream,
             blas,
-            dense_at(buffers.core, stream, [rows, width], 0)?,
-            &mut TensorMut(dense_at(buffers.delta, stream, [rows, width], 0)?),
+            stage_view(buffers.core, stream, [rows, width])?,
+            &mut TensorMut(stage_view(buffers.delta, stream, [rows, width])?),
         )?;
         self.add_residual(
             stream,
@@ -1712,7 +1730,7 @@ impl VisionRuntime {
             dense(stage.hidden, stream, [rows, 1, width])?,
             dense(&block.norm2.weight, stream, [width])?,
             dense(&block.norm2.bias, stream, [width])?,
-            &mut TensorMut(dense_at(buffers.norm, stream, [rows, 1, width], 0)?),
+            &mut TensorMut(stage_view(buffers.norm, stream, [rows, 1, width])?),
             spec.ln_eps,
         )?;
         if index == 0 || index == last {
@@ -1728,18 +1746,18 @@ impl VisionRuntime {
         block.fc1.run(
             stream,
             blas,
-            dense_at(buffers.norm, stream, [rows, width], 0)?,
-            &mut TensorMut(dense_at(buffers.mlp, stream, [rows, geometry.mlp], 0)?),
+            stage_view(buffers.norm, stream, [rows, width])?,
+            &mut TensorMut(stage_view(buffers.mlp, stream, [rows, geometry.mlp])?),
         )?;
-        let mlp = dense_at(buffers.mlp, stream, [rows, 1, geometry.mlp], 0)?;
+        let mlp = stage_view(buffers.mlp, stream, [rows, 1, geometry.mlp])?;
         self.common
             .gate
             .gelu(stream, mlp, &mut TensorMut(mlp), GeluMode::Tanh)?;
         block.fc2.run(
             stream,
             blas,
-            dense_at(buffers.mlp, stream, [rows, geometry.mlp], 0)?,
-            &mut TensorMut(dense_at(buffers.delta, stream, [rows, width], 0)?),
+            stage_view(buffers.mlp, stream, [rows, geometry.mlp])?,
+            &mut TensorMut(stage_view(buffers.delta, stream, [rows, width])?),
         )?;
         self.add_residual(
             stream,
@@ -1806,11 +1824,10 @@ impl VisionRuntime {
         window.v.run(stream, blas, normed, &mut TensorMut(v_out))?;
         let q = dense(&request.q, stream, [spec.hq, rows, spec.d])?;
         let k = dense(&request.k, stream, [spec.hq, rows, spec.d])?;
-        let v = dense_at(
+        let v = stage_view(
             &request.v,
             stream,
             [spec.hq, tower.window_packing.padded_rows(), spec.d],
-            0,
         )?;
         for segment in 0..tower.window_packing.images() {
             let first = tower.window_packing.cu_seqlens()[segment] as u32;
