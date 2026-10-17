@@ -2,6 +2,30 @@ use super::*;
 use crate::backend::cuda::moe::reference::{MoeDims, MoeFixture, fixture};
 use crate::backend::cuda::weights::{ExpertStorage, Layer};
 use crate::experts::plan::Capacity;
+use std::collections::BTreeSet;
+
+fn layer_coverage(hidden: usize) -> (usize, BTreeSet<(usize, usize)>) {
+    (8, BTreeSet::from([(3 * hidden, hidden), (hidden, hidden)]))
+}
+
+fn check_layer_coverage(
+    coverage: Option<&(usize, BTreeSet<(usize, usize)>)>,
+    hidden: usize,
+) -> Result<()> {
+    for rows in 1..=8 {
+        for output in [3 * hidden, hidden] {
+            super::super::super::blas::check_coverage(
+                crate::backend::setup::LinearShape {
+                    rows,
+                    output,
+                    input: hidden,
+                },
+                coverage,
+            )?;
+        }
+    }
+    Ok(())
+}
 
 impl Engine {
     pub(crate) fn load_moe_test(fixture: &MoeFixture, runtime: &Path) -> Result<Self> {
@@ -38,6 +62,8 @@ impl Engine {
             shared_intermediate: 64,
         });
         let geometry = ExpertGeometry::from_model(&model_spec)?;
+        let coverage = layer_coverage(config.hidden_size);
+        check_layer_coverage(Some(&coverage), config.hidden_size)?;
         let device = Device::new(0)?;
         let stream = &device.stream;
         let bytes = geometry.slot_bytes()?;
@@ -130,7 +156,8 @@ impl Engine {
             true,
             "MoE layer gate".into(),
         ));
-        let blas = Blas::new(&device, &ops, runtime, closure.clone())?;
+        let mut blas = Blas::new(&device, &ops, runtime, closure.clone())?;
+        blas.declare(coverage.0, &coverage.1);
         let state = super::super::super::state::StateStore::new(&model_spec, 32, stream)?;
         let mut work = Work::new(stream, &model_spec, 8)?;
         stream.memcpy_htod(&[1i32], &mut work.length)?;
@@ -770,6 +797,23 @@ fn dispatch_covers_original_choices_once_after_row_compaction() -> Result<()> {
     assert!(check(&active, &valid, &[0, 2]).is_err());
     println!(
         "PASS eager_moe_dispatch_controls exact_cover=true compacted_rows=true original_choice=true bounds=true"
+    );
+    Ok(())
+}
+
+#[test]
+fn injected_layer_uses_declared_linear_coverage() -> Result<()> {
+    let coverage = layer_coverage(128);
+    check_layer_coverage(Some(&coverage), 128)?;
+    assert!(check_layer_coverage(None, 128).is_err());
+    let mut without_qkv = coverage.clone();
+    without_qkv.1.remove(&(384, 128));
+    assert!(check_layer_coverage(Some(&without_qkv), 128).is_err());
+    let mut too_few_rows = coverage;
+    too_few_rows.0 = 1;
+    assert!(check_layer_coverage(Some(&too_few_rows), 128).is_err());
+    println!(
+        "PASS eager_moe_layer_coverage rows=1..8 qkv=[384,128] output=[128,128] undeclared_rejected=true missing_qkv_rejected=true row_bound_rejected=true"
     );
     Ok(())
 }

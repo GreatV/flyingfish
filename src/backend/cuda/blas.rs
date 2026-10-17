@@ -56,7 +56,7 @@ use cudarc::{
 use half::bf16;
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     mem::size_of,
     path::{Path, PathBuf},
     rc::Rc,
@@ -74,6 +74,18 @@ struct Plan {
     algo_count: usize,
     waves: f32,
     workspace: usize,
+}
+
+pub(super) fn check_coverage(
+    shape: LinearShape,
+    coverage: Option<&(usize, BTreeSet<(usize, usize)>)>,
+) -> Result<()> {
+    let (limit, pairs) = coverage.context("linear coverage was not declared")?;
+    ensure!(
+        shape.rows > 0 && shape.rows <= *limit && pairs.contains(&(shape.output, shape.input)),
+        "linear shape outside cuBLAS-only coverage: {shape:?}"
+    );
+    Ok(())
 }
 
 impl Plan {
@@ -404,14 +416,7 @@ impl Blas {
             "missing frozen linear choice: {shape:?}; run calibrate for this deployment"
         );
         if !linear_calibrate::supports(shape) {
-            let (limit, pairs) = self
-                .coverage
-                .as_ref()
-                .context("linear coverage was not declared")?;
-            ensure!(
-                rows > 0 && rows <= *limit && pairs.contains(&(output, input)),
-                "linear shape outside cuBLAS-only coverage: {shape:?}"
-            );
+            check_coverage(shape, self.coverage.as_ref())?;
         }
         let mut algo = 0u32;
         if let Some(choice) = self.choices.borrow().get(&shape) {
