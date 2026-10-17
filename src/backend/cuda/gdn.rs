@@ -1328,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "coordinator-granted GPU window and FF_Q38_PROBE_DIR required"]
+    #[ignore = "coordinator-granted GPU window required"]
     fn mixer_smoke_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -1363,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "coordinator-granted GPU window and FF_Q38_PROBE_DIR required"]
+    #[ignore = "GPU window and FF_Q38_PROBE_DIR/gdn_prep_h32_wrong_gqa_sm{86,89}.cubin required"]
     fn mixer_geometry_gdn_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),

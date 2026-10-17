@@ -1397,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "coordinator-granted GPU window and FF_Q38_PROBE_DIR required"]
+    #[ignore = "GPU window and FF_Q38_PROBE_DIR/tcmqa_d256_global_split_sm{86,89}.cubin required"]
     fn mixer_geometry_attention_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
