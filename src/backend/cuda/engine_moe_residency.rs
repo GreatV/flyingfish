@@ -452,6 +452,7 @@ pub(in crate::backend::cuda::engine) struct Slots {
     disk: Option<Reader>,
     transfers: Transfers,
     events: Events,
+    pub(super) refill: CudaEvent,
     physical: Vec<Physical>,
     publish: CudaFunction,
     routes: Vec<crate::experts::runtime::Route>,
@@ -602,6 +603,7 @@ impl Slots {
             disk: Some(disk),
             transfers,
             events,
+            refill: device.ctx.new_event(None)?,
             physical,
             publish: super::super::super::cubin::module(&device.ctx, "moe_route")?
                 .load_function("moe_slot_publish")?,
@@ -638,6 +640,7 @@ impl Slots {
                 }
             }
         }
+        slots.refill.record(&slots.transfers.h2d)?;
         Ok(slots)
     }
 
@@ -852,6 +855,7 @@ impl Slots {
         for index in 0..self.moves.len() {
             self.apply_move(self.moves[index])?;
         }
+        self.refill.record(&self.transfers.h2d)?;
         self.request_open = true;
         Ok(())
     }

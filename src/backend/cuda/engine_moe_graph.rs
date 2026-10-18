@@ -195,6 +195,7 @@ impl Engine {
         decode.capture_events.reserve(self.model_spec.layers.len());
         decode.segments.reserve(self.model_spec.layers.len());
         let result = (|| -> Result<Option<CudaGraph>> {
+            stream.wait(&slots.refill)?;
             checkpoint.save(&self.state, &self.work.token, self.position, &stream, None)?;
             self.moe_device_decode(&mut decode, &slots, resident, false)?;
             stream.synchronize()?;
@@ -295,6 +296,7 @@ impl Engine {
         let result = (|| -> Result<()> {
             if slots.all_resident() {
                 ensure!(slots.request_open, "MoE resident graph has no request");
+                self.device.stream.wait(&slots.refill)?;
                 self.graph
                     .as_ref()
                     .context("MoE resident graph missing")?
