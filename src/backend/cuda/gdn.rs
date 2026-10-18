@@ -1207,7 +1207,18 @@ mod tests {
         let workspace_bytes = cw_p2_bytes(32, rows) as usize;
         let diag_bytes = rows as usize / 64 * 32 * 20480 * 4;
         let (a_cfg, h_cfg) = cw_p2_grids(rows, 32);
-        for arm in ["original", "baseline", "gram", "inverse", "uw", "qk"] {
+        for arm in [
+            "original",
+            "baseline",
+            "gram",
+            "inverse",
+            "uw",
+            "qk",
+            "w_storage",
+            "qk_storage",
+            "h_qk",
+            "h_state",
+        ] {
             let module = if arm == "original" {
                 cubin::module(&device.ctx, "gdn/gdn_cw_p2_h32")?
             } else {
@@ -1245,8 +1256,11 @@ mod tests {
                     .arg(&out)
                     .arg(&slot)
                     .arg(&metadata)
-                    .arg(&0_i32)
-                    .launch(h_cfg)?;
+                    .arg(&0_i32);
+                if arm != "original" {
+                    launch.arg(&capture);
+                }
+                launch.launch(h_cfg)?;
             }
             stream.synchronize()?;
             for (name, buffer) in [
@@ -1272,7 +1286,7 @@ mod tests {
             );
         }
         println!(
-            "PASS p2_boundary_capture original_baseline_bitwise=true stages=gram,inverse,uw,qk"
+            "PASS p2_boundary_capture original_baseline_bitwise=true arithmetic_storage_and_H_probes=true"
         );
         Ok(())
     }
