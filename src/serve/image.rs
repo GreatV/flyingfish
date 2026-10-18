@@ -3,11 +3,17 @@ use crate::serve::detok::Shared;
 use crate::vision_input::{ImageGrid, MultimodalInput};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
-use std::io::Cursor;
-use std::path::Path;
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DECODED_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_SOURCE_PIXELS: usize = 4 * 16_777_216;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const DECODE_TIMEOUT: Duration = Duration::from_secs(600);
+static VIDEO_SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct RgbImage {
     pub width: usize,
@@ -15,11 +21,126 @@ pub struct RgbImage {
     pub pixels: Vec<u8>,
 }
 
+/// Decoded-video metadata: decode order, average fps and duration in seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VideoMetadata {
+    pub total_num_frames: usize,
+    pub fps: f64,
+    pub duration: f64,
+}
+
+impl VideoMetadata {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.total_num_frames > 0,
+            "video metadata: zero total frames"
+        );
+        ensure!(
+            self.fps.is_finite() && self.fps > 0.0,
+            "video metadata: invalid fps {}",
+            self.fps
+        );
+        ensure!(
+            self.duration.is_finite() && self.duration > 0.0,
+            "video metadata: invalid duration {}",
+            self.duration
+        );
+        Ok(())
+    }
+}
+
+/// Decoded video container: RGB frames in decode order and their metadata.
+pub struct DecodedVideo {
+    pub frames: Vec<RgbImage>,
+    pub metadata: VideoMetadata,
+}
+
+/// `numpy.linspace(0, len - 1, count, dtype=int)` positions; the endpoint is exactly `len - 1`.
+/// Frames sampled from decode order, stack_frames = 1 (model definition `sample_frames`).
+pub fn sample_frame_indices(
+    meta: &VideoMetadata,
+    max_num_frames: usize,
+    stack_frames: u32,
+) -> Result<Vec<usize>> {
+    ensure!(
+        stack_frames == 1,
+        "stack_frames {stack_frames} is not claimed; first support samples stack_frames = 1"
+    );
+    ensure!(max_num_frames > 0, "zero max_num_frames");
+    meta.validate()?;
+    let indices = if meta.duration > max_num_frames as f64 {
+        // One sample per 0.1 s, then linspace-subsampled to max_num_frames; computed directly,
+        // never allocated in proportion to the container duration.
+        let count = (meta.duration / 0.1) as usize;
+        let out = count.min(max_num_frames);
+        let delta = if out > 1 {
+            (count - 1) as f64 / (out - 1) as f64
+        } else {
+            0.0
+        };
+        let mut main = Vec::with_capacity(out);
+        for k in 0..out {
+            let position = if out == 1 {
+                0
+            } else if out == count {
+                k
+            } else if k + 1 == out {
+                count - 1
+            } else {
+                (delta * k as f64) as usize
+            };
+            let index = ((position as f64 / 10.0) * meta.fps) as usize;
+            main.push(index.min(meta.total_num_frames - 1));
+        }
+        main
+    } else {
+        let seconds = meta.duration.ceil() as usize;
+        let mut main = Vec::with_capacity(seconds);
+        for i in 0..seconds {
+            let index = (i as f64 * meta.fps) as usize;
+            ensure!(
+                index < meta.total_num_frames,
+                "video metadata: sampled frame {index} outside {} frames",
+                meta.total_num_frames
+            );
+            main.push(index);
+        }
+        main
+    };
+    ensure!(!indices.is_empty(), "video sampling produced no frames");
+    Ok(indices)
+}
+
+#[derive(Debug)]
 pub struct PackedImage {
     pub grids: Vec<ImageGrid>,
     pub rows: u32,
     pub cols: u32,
     pub pixel_values: Vec<f32>,
+}
+
+/// Video processing options for the first support (stack_frames = 1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VideoOptions {
+    pub max_num_frames: usize,
+    pub stack_frames: u32,
+    /// Slice cap per frame; `None` uses the processor configuration's value.
+    pub max_slice_nums: Option<usize>,
+}
+
+/// Prepared video: one packed entry per sampled frame, in sample order.
+#[derive(Debug)]
+pub struct PackedVideo {
+    pub frames: Vec<PackedImage>,
+}
+
+/// A probed video, its sampled indices and options, before frame decoding.
+#[derive(Debug)]
+pub struct PlannedVideo {
+    source: ScratchVideo,
+    probed: ProbedVideo,
+    indices: Vec<usize>,
+    options: VideoOptions,
 }
 
 pub struct PlannedImage {
@@ -47,13 +168,14 @@ fn patch_width(spec: &ModelSpec) -> Result<usize> {
         .patch_elements(spec.architecture)
 }
 
-pub struct PreparedImages {
+#[derive(Debug)]
+pub struct PreparedInput {
     pub modality_ids: Vec<u8>,
     pub pixel_values: Vec<f32>,
     pub grids: Vec<ImageGrid>,
 }
 
-impl PreparedImages {
+impl PreparedInput {
     pub fn save(&self, spec: &ModelSpec, ids: &[u32], path: &Path) -> Result<()> {
         let width = patch_width(spec)?;
         ensure!(
@@ -182,13 +304,13 @@ impl PreparedImages {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Size {
     shortest_edge: usize,
     longest_edge: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct QwenConfig {
     size: Size,
     patch_size: usize,
@@ -198,7 +320,7 @@ struct QwenConfig {
     image_std: [f32; 3],
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct MiniCpmConfig {
     max_slice_nums: usize,
     image_mean: [f32; 3],
@@ -206,6 +328,7 @@ struct MiniCpmConfig {
     mrope_mode: String,
 }
 
+#[derive(Clone)]
 enum ImageConfig {
     Qwen(QwenConfig),
     MiniCpm(MiniCpmConfig),
@@ -220,6 +343,7 @@ struct Crop {
 /// `MiniCPMV4_6ImageProcessor.scale_resolution` defaults to 448.
 const SCALE_RESOLUTION: usize = 448;
 
+#[derive(Clone)]
 struct ImageId {
     start: u32,
     end: u32,
@@ -249,6 +373,7 @@ impl ImageId {
     }
 }
 
+#[derive(Clone)]
 pub struct Processor {
     spec: ModelSpec,
     config: ImageConfig,
@@ -325,6 +450,58 @@ impl Processor {
             .unwrap_or(0)
     }
 
+    /// Samples frames and packs their crops for one decoded video (stack_frames = 1).
+    pub fn prepare_video(
+        &self,
+        frames: &[RgbImage],
+        meta: &VideoMetadata,
+        options: &VideoOptions,
+    ) -> Result<PackedVideo> {
+        ensure!(
+            frames.len() == meta.total_num_frames,
+            "decoded video holds {} frames, metadata reports {}",
+            frames.len(),
+            meta.total_num_frames
+        );
+        let mut size = None;
+        for (index, frame) in frames.iter().enumerate() {
+            let pixels = checked_pixels(frame.width, frame.height)?;
+            ensure!(
+                frame.pixels.len() == pixels * 3,
+                "video frame {index} RGB byte count does not match its dimensions"
+            );
+            match size {
+                None => size = Some((frame.width, frame.height)),
+                Some(expected) => ensure!(
+                    expected == (frame.width, frame.height),
+                    "video frame {index} is {}x{}; frame 0 is {}x{}",
+                    frame.width,
+                    frame.height,
+                    expected.0,
+                    expected.1
+                ),
+            }
+        }
+        let indices = sample_frame_indices(meta, options.max_num_frames, options.stack_frames)?;
+        let ImageConfig::MiniCpm(base) = &self.config else {
+            bail!("video input requires the MiniCPM image configuration")
+        };
+        let mut config = base.clone();
+        if let Some(max) = options.max_slice_nums {
+            ensure!(max > 0, "zero max_slice_nums");
+            config.max_slice_nums = max;
+        }
+        let mut packed = PackedVideo {
+            frames: Vec::with_capacity(indices.len()),
+        };
+        for &index in &indices {
+            packed
+                .frames
+                .push(mini_cpm_prepare_rgb(&self.spec, &frames[index], &config)?);
+        }
+        Ok(packed)
+    }
+
     pub fn prepare_rgb(&self, image: &RgbImage) -> Result<PackedImage> {
         let count = checked_pixels(image.width, image.height)?;
         ensure!(
@@ -339,6 +516,122 @@ impl Processor {
 
     pub fn prepare_url(&self, url: &str) -> Result<PackedImage> {
         self.prepare_planned(self.plan_url(url)?)
+    }
+
+    /// Probes one MP4 data URL, samples its frames, and bounds them by the request token capacity.
+    pub fn plan_video(
+        &self,
+        url: &str,
+        options: VideoOptions,
+        token_limit: usize,
+    ) -> Result<PlannedVideo> {
+        ensure!(
+            options.stack_frames == 1,
+            "stack_frames {} is not supported; first support requires stack_frames = 1",
+            options.stack_frames
+        );
+        ensure!(options.max_num_frames > 0, "zero max_num_frames");
+        ensure!(token_limit > 0, "zero video token capacity");
+        let bytes = load_encoded_video(url)?;
+        let (source, probed) = probe_video(&bytes)?;
+        self.plan_probed_video(source, probed, options, token_limit)
+    }
+
+    fn plan_probed_video(
+        &self,
+        source: ScratchVideo,
+        probed: ProbedVideo,
+        options: VideoOptions,
+        token_limit: usize,
+    ) -> Result<PlannedVideo> {
+        let metadata = probed.metadata()?;
+        let per_frame =
+            self.frame_tokens(probed.width as usize, probed.height as usize, &options)?;
+        let count = if metadata.duration > options.max_num_frames as f64 {
+            ((metadata.duration / 0.1).floor() as usize).min(options.max_num_frames)
+        } else {
+            metadata.duration.ceil() as usize
+        };
+        let tokens = per_frame
+            .checked_mul(count)
+            .context("video token count overflow")?;
+        ensure!(
+            tokens <= token_limit,
+            "video needs {tokens} tokens for {count} sampled frames; request capacity is {token_limit}"
+        );
+        let indices =
+            sample_frame_indices(&metadata, options.max_num_frames, options.stack_frames)?;
+        ensure!(
+            indices.len() == count,
+            "video sample count mismatch: planned {count}, got {}",
+            indices.len()
+        );
+        Ok(PlannedVideo {
+            source,
+            probed,
+            indices,
+            options,
+        })
+    }
+
+    /// Decodes the sampled frames of a planned video and packs them; runs after admission.
+    pub fn prepare_planned_video(&self, planned: PlannedVideo) -> Result<PackedVideo> {
+        let frames = decode_video_indices(&planned.source, &planned.probed, &planned.indices)?;
+        self.pack_video_frames(&frames, &planned.options)
+    }
+
+    /// Expanded prompt tokens of one planned video: every sampled frame's visual unit.
+    pub fn video_tokens(&self, video: &PlannedVideo) -> Result<usize> {
+        let per = self.frame_tokens(
+            video.probed.width as usize,
+            video.probed.height as usize,
+            &video.options,
+        )?;
+        per.checked_mul(video.indices.len())
+            .context("video token count overflow")
+    }
+
+    fn frame_tokens(&self, width: usize, height: usize, options: &VideoOptions) -> Result<usize> {
+        let vision = self
+            .spec
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        let ImageConfig::MiniCpm(base) = &self.config else {
+            bail!("video input requires the MiniCPM image configuration")
+        };
+        let mut config = base.clone();
+        if let Some(max) = options.max_slice_nums {
+            ensure!(max > 0, "zero max_slice_nums");
+            config.max_slice_nums = max;
+        }
+        let (grids, rows, cols) =
+            mini_cpm_grids(height, width, vision.patch as usize, config.max_slice_nums)?;
+        visual_unit_tokens(vision, &grids, rows, cols, 0)
+    }
+
+    fn pack_video_frames(
+        &self,
+        frames: &[RgbImage],
+        options: &VideoOptions,
+    ) -> Result<PackedVideo> {
+        let ImageConfig::MiniCpm(base) = &self.config else {
+            bail!("video input requires the MiniCPM image configuration")
+        };
+        let mut config = base.clone();
+        if let Some(max) = options.max_slice_nums {
+            ensure!(max > 0, "zero max_slice_nums");
+            config.max_slice_nums = max;
+        }
+        let mut packed = PackedVideo {
+            frames: Vec::with_capacity(frames.len()),
+        };
+        for frame in frames {
+            packed
+                .frames
+                .push(mini_cpm_prepare_rgb(&self.spec, frame, &config)?);
+        }
+        Ok(packed)
     }
 
     pub fn plan_url(&self, url: &str) -> Result<PlannedImage> {
@@ -426,46 +719,62 @@ impl Processor {
         }
     }
 
-    pub fn expanded_token_count(&self, ids: &[u32], images: &[PlannedImage]) -> Result<usize> {
+    pub fn expanded_token_count(
+        &self,
+        ids: &[u32],
+        images: &[PlannedImage],
+        videos: &[PlannedVideo],
+    ) -> Result<usize> {
         let vision = self
             .spec
             .vision
             .as_ref()
             .context("vision configuration missing")?;
-        let placeholders = ids.iter().filter(|&&id| id == vision.image_token).count();
+        let image_placeholders = ids.iter().filter(|&&id| id == vision.image_token).count();
         ensure!(
-            placeholders == images.len(),
+            image_placeholders == images.len(),
             "image placeholder count differs from supplied images"
         );
-        images
-            .iter()
-            .enumerate()
-            .try_fold(ids.len() - placeholders, |total, (index, image)| {
-                total
-                    .checked_add(self.image_tokens(image, index)?)
-                    .context("image token count overflow")
-            })
+        let video_placeholders = ids.iter().filter(|&&id| id == vision.video_token).count();
+        ensure!(
+            video_placeholders == videos.len(),
+            "video placeholder count differs from supplied videos"
+        );
+        let mut total = ids.len() - image_placeholders - video_placeholders;
+        for (index, image) in images.iter().enumerate() {
+            total = total
+                .checked_add(self.image_tokens(image, index)?)
+                .context("image token count overflow")?;
+        }
+        for video in videos {
+            total = total
+                .checked_add(self.video_tokens(video)?)
+                .context("video token count overflow")?;
+        }
+        Ok(total)
     }
 
     pub fn expand(
         &self,
         ids: &[u32],
         images: Vec<PackedImage>,
+        videos: Vec<PackedVideo>,
         capacity: usize,
-    ) -> Result<(Vec<u32>, PreparedImages)> {
+    ) -> Result<(Vec<u32>, PreparedInput)> {
         let vision = self
             .spec
             .vision
             .as_ref()
             .context("vision configuration missing")?;
         match &self.config {
-            ImageConfig::Qwen(_) => expand_qwen(&self.spec, vision, ids, images, capacity),
+            ImageConfig::Qwen(_) => expand_qwen(&self.spec, vision, ids, images, videos, capacity),
             ImageConfig::MiniCpm(_) => expand_mini_cpm(
                 &self.spec,
                 vision,
                 self.image_id.as_ref().context("image-id tokens missing")?,
                 ids,
                 images,
+                videos,
                 capacity,
             ),
         }
@@ -754,15 +1063,127 @@ fn get_sliced_grid(
     Some(best)
 }
 
+struct VisualUnit<'a> {
+    tag: &'a [u32],
+    token: u32,
+    modality: u8,
+    unit: &'a PackedImage,
+}
+
+/// Expanded token count of one visual unit, start and end markers included.
+fn visual_unit_tokens(
+    vision: &crate::model_spec::VisionConfig,
+    grids: &[ImageGrid],
+    rows: usize,
+    cols: usize,
+    tag_len: usize,
+) -> Result<usize> {
+    let thumb = *grids.first().context("visual unit has no crops")?;
+    let thumb_tokens = thumb.feature_rows(vision.merge)?;
+    let mut len = tag_len
+        .checked_add(2)
+        .and_then(|n| n.checked_add(thumb_tokens))
+        .context("visual token count overflow")?;
+    if rows > 0 && cols > 0 {
+        ensure!(
+            grids.len() == 1 + rows * cols,
+            "crop count does not match the slice grid"
+        );
+        let slice = *grids.get(1).context("sliced unit lacks a slice crop")?;
+        let per_slice = slice.feature_rows(vision.merge)?;
+        len = len
+            .checked_add(rows - 1)
+            .and_then(|n| n.checked_add(rows * cols * (2 + per_slice)))
+            .context("visual token count overflow")?;
+    } else {
+        ensure!(grids.len() == 1, "unsliced unit carries slice crops");
+    }
+    Ok(len)
+}
+
+/// Emits one visual unit's placeholder block: tag, thumbnail run, then slice rows.
+fn push_visual_unit(
+    vision: &crate::model_spec::VisionConfig,
+    markers: &crate::model_spec::MiniCpmVision,
+    expanded: &mut Vec<u32>,
+    modality_ids: &mut Vec<u8>,
+    visual: VisualUnit<'_>,
+    capacity: usize,
+) -> Result<usize> {
+    let unit = visual.unit;
+    let thumb = *unit.grids.first().context("visual unit has no crops")?;
+    let thumb_tokens = thumb.feature_rows(vision.merge)?;
+    let slices = if unit.rows > 0 && unit.cols > 0 {
+        let rows = unit.rows as usize;
+        let cols = unit.cols as usize;
+        ensure!(
+            unit.grids.len() == 1 + rows * cols,
+            "crop count does not match the slice grid"
+        );
+        let slice = *unit
+            .grids
+            .get(1)
+            .context("sliced unit lacks a slice crop")?;
+        Some((rows, cols, slice.feature_rows(vision.merge)?))
+    } else {
+        ensure!(unit.grids.len() == 1, "unsliced unit carries slice crops");
+        None
+    };
+    let len = visual_unit_tokens(
+        vision,
+        &unit.grids,
+        unit.rows as usize,
+        unit.cols as usize,
+        visual.tag.len(),
+    )?;
+    ensure!(
+        expanded
+            .len()
+            .checked_add(len)
+            .is_some_and(|n| n <= capacity),
+        "visual tokens exceed request capacity"
+    );
+    expanded.extend_from_slice(visual.tag);
+    modality_ids.extend(std::iter::repeat_n(0, visual.tag.len()));
+    expanded.push(vision.start_token);
+    modality_ids.push(0);
+    expanded.extend(std::iter::repeat_n(visual.token, thumb_tokens));
+    modality_ids.extend(std::iter::repeat_n(visual.modality, thumb_tokens));
+    expanded.push(vision.end_token);
+    modality_ids.push(0);
+    if let Some((rows, cols, per_slice)) = slices {
+        for row in 0..rows {
+            if row > 0 {
+                expanded.push(markers.newline_token);
+                modality_ids.push(0);
+            }
+            for _ in 0..cols {
+                expanded.push(markers.slice_start_token);
+                modality_ids.push(0);
+                expanded.extend(std::iter::repeat_n(visual.token, per_slice));
+                modality_ids.extend(std::iter::repeat_n(visual.modality, per_slice));
+                expanded.push(markers.slice_end_token);
+                modality_ids.push(0);
+            }
+        }
+    }
+    Ok(len)
+}
+
 fn expand_qwen(
     spec: &ModelSpec,
     vision: &crate::model_spec::VisionConfig,
     ids: &[u32],
     images: Vec<PackedImage>,
+    videos: Vec<PackedVideo>,
     capacity: usize,
-) -> Result<(Vec<u32>, PreparedImages)> {
+) -> Result<(Vec<u32>, PreparedInput)> {
+    ensure!(
+        videos.is_empty(),
+        "video input requires the MiniCPM image configuration"
+    );
     let mut expanded = Vec::new();
-    let mut prepared = PreparedImages {
+    let mut prepared = PreparedInput {
         modality_ids: Vec::new(),
         pixel_values: Vec::new(),
         grids: Vec::new(),
@@ -808,14 +1229,15 @@ fn expand_mini_cpm(
     image_id: &ImageId,
     ids: &[u32],
     images: Vec<PackedImage>,
+    videos: Vec<PackedVideo>,
     capacity: usize,
-) -> Result<(Vec<u32>, PreparedImages)> {
+) -> Result<(Vec<u32>, PreparedInput)> {
     let markers = vision
         .minicpm
         .as_ref()
         .context("MiniCPM vision configuration missing")?;
     let mut expanded = Vec::new();
-    let mut prepared = PreparedImages {
+    let mut prepared = PreparedInput {
         modality_ids: Vec::new(),
         pixel_values: Vec::new(),
         grids: Vec::new(),
@@ -823,75 +1245,64 @@ fn expand_mini_cpm(
     let mut packed: Vec<Vec<f32>> = Vec::new();
     let mut packed_patches: Vec<usize> = Vec::new();
     let mut images = images.into_iter();
+    let mut videos = videos.into_iter();
     let mut index = 0usize;
     for &id in ids {
-        if id == vision.image_token {
+        if id == vision.video_token {
+            let video = videos
+                .next()
+                .context("more video placeholders than supplied videos")?;
+            ensure!(!video.frames.is_empty(), "video has no frames");
+            for frame in &video.frames {
+                push_visual_unit(
+                    vision,
+                    markers,
+                    &mut expanded,
+                    &mut prepared.modality_ids,
+                    VisualUnit {
+                        tag: &[],
+                        token: id,
+                        modality: 2,
+                        unit: frame,
+                    },
+                    capacity,
+                )?;
+            }
+            for frame in &video.frames {
+                packed_patches.push(frame.grids.iter().try_fold(0usize, |total, grid| {
+                    total
+                        .checked_add(grid.patch_rows()?)
+                        .context("patch count overflow")
+                })?);
+            }
+            prepared.grids.extend(
+                video
+                    .frames
+                    .iter()
+                    .flat_map(|frame| frame.grids.iter().copied()),
+            );
+            for frame in video.frames {
+                packed.push(frame.pixel_values);
+            }
+        } else if id == vision.image_token {
             let image = images
                 .next()
                 .context("more image placeholders than supplied images")?;
             let tag = image_id.tag(index);
             index += 1;
-            let thumb = *image.grids.first().context("image has no crops")?;
-            let thumb_tokens = thumb.feature_rows(vision.merge)?;
-            let mut block = tag.len() + 2 + thumb_tokens;
-            if image.rows > 0 && image.cols > 0 {
-                ensure!(
-                    image.grids.len() == 1 + image.rows as usize * image.cols as usize,
-                    "crop count does not match the slice grid"
-                );
-                let slice = *image
-                    .grids
-                    .get(1)
-                    .context("sliced image lacks a slice crop")?;
-                let per_slice = slice.feature_rows(vision.merge)?;
-                block += image.rows as usize - 1;
-                block += image.rows as usize * image.cols as usize * (2 + per_slice);
-            } else {
-                ensure!(image.grids.len() == 1, "unsliced image carries slice crops");
-            }
-            ensure!(
-                expanded
-                    .len()
-                    .checked_add(block)
-                    .is_some_and(|n| n <= capacity),
-                "image tokens exceed request capacity"
-            );
-            let tag_len = tag.len();
-            expanded.extend(tag);
-            prepared
-                .modality_ids
-                .extend(std::iter::repeat_n(0, tag_len));
-            expanded.push(vision.start_token);
-            prepared.modality_ids.push(0);
-            expanded.extend(std::iter::repeat_n(id, thumb_tokens));
-            prepared
-                .modality_ids
-                .extend(std::iter::repeat_n(1, thumb_tokens));
-            expanded.push(vision.end_token);
-            prepared.modality_ids.push(0);
-            if image.rows > 0 && image.cols > 0 {
-                let slice = *image
-                    .grids
-                    .get(1)
-                    .context("sliced image lacks a slice crop")?;
-                let per_slice = slice.feature_rows(vision.merge)?;
-                for row in 0..image.rows {
-                    if row > 0 {
-                        expanded.push(markers.newline_token);
-                        prepared.modality_ids.push(0);
-                    }
-                    for _ in 0..image.cols {
-                        expanded.push(markers.slice_start_token);
-                        prepared.modality_ids.push(0);
-                        expanded.extend(std::iter::repeat_n(id, per_slice));
-                        prepared
-                            .modality_ids
-                            .extend(std::iter::repeat_n(1, per_slice));
-                        expanded.push(markers.slice_end_token);
-                        prepared.modality_ids.push(0);
-                    }
-                }
-            }
+            push_visual_unit(
+                vision,
+                markers,
+                &mut expanded,
+                &mut prepared.modality_ids,
+                VisualUnit {
+                    tag: &tag,
+                    token: id,
+                    modality: 1,
+                    unit: &image,
+                },
+                capacity,
+            )?;
             packed_patches.push(image.grids.iter().try_fold(0usize, |total, grid| {
                 total
                     .checked_add(grid.patch_rows()?)
@@ -908,6 +1319,10 @@ fn expand_mini_cpm(
     ensure!(
         images.next().is_none(),
         "image has no placeholder in rendered prompt"
+    );
+    ensure!(
+        videos.next().is_none(),
+        "video has no placeholder in rendered prompt"
     );
     prepared.pixel_values = interleave_mini_cpm(&packed, &packed_patches, vision.patch as usize)?;
     prepared.input(&expanded).validate(spec, capacity)?;
@@ -1092,6 +1507,476 @@ fn load_encoded(url: &str) -> Result<(Vec<u8>, String)> {
     Ok((bytes, mime))
 }
 
+fn load_encoded_video(url: &str) -> Result<Vec<u8>> {
+    ensure!(
+        url.starts_with("data:"),
+        "video URL must be a base64 data URL"
+    );
+    let (header, data) = url.split_once(',').context("invalid video data URL")?;
+    let mime = header
+        .strip_prefix("data:")
+        .and_then(|h| h.strip_suffix(";base64"))
+        .context("video data URL must use base64")?;
+    ensure!(mime == "video/mp4", "only MP4 video URLs are supported");
+    ensure!(
+        data.len() <= MAX_ENCODED_BYTES * 4 / 3 + 4,
+        "encoded video exceeds byte limit"
+    );
+    base64::decode(data).context("video data URL is not valid base64")
+}
+
+/// Probes one MP4 container: frame geometry, rational rate and decoded frame count.
+fn probe_video(bytes: &[u8]) -> Result<(ScratchVideo, ProbedVideo)> {
+    ensure!(!bytes.is_empty(), "empty video container");
+    ensure!(
+        bytes.len() <= MAX_ENCODED_BYTES,
+        "encoded video exceeds byte limit"
+    );
+    let source = ScratchVideo::write(bytes)?;
+    let path = source
+        .path()
+        .to_str()
+        .context("video scratch path is not UTF-8")?;
+    let file = format!("file:{path}");
+    let probe = tool_stdout(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "file",
+            "-f",
+            "mp4",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate,nb_read_frames",
+            "-of",
+            "json",
+            &file,
+        ],
+        PROBE_TIMEOUT,
+        MAX_ENCODED_BYTES,
+    )
+    .map_err(|error| redact_scratch(error, path))?;
+    let probed = parse_probe(&probe)?;
+    Ok((source, probed))
+}
+
+/// Decodes every frame of one MP4 container through ffmpeg over a pipe.
+pub fn decode_video(bytes: &[u8]) -> Result<DecodedVideo> {
+    let (source, probed) = probe_video(bytes)?;
+    let frame_bytes = probed.frame_bytes()?;
+    let raw = decode_raw(&source, None, MAX_DECODED_VIDEO_BYTES)?;
+    ensure!(
+        raw.len() % frame_bytes == 0,
+        "ffmpeg produced {} bytes, not a multiple of the {frame_bytes}-byte {}x{} frame",
+        raw.len(),
+        probed.width,
+        probed.height
+    );
+    let count = raw.len() / frame_bytes;
+    ensure!(count > 0, "ffmpeg decoded no video frames");
+    let frames = frames_from_raw(&raw, &probed, frame_bytes);
+    Ok(DecodedVideo {
+        frames,
+        metadata: probed.metadata_with_count(count)?,
+    })
+}
+
+/// Decodes only the sampled frames of one probed container.
+fn decode_video_indices(
+    source: &ScratchVideo,
+    probed: &ProbedVideo,
+    indices: &[usize],
+) -> Result<Vec<RgbImage>> {
+    ensure!(!indices.is_empty(), "video has no sampled frames");
+    let frame_bytes = probed.frame_bytes()?;
+    let expected = indices
+        .len()
+        .checked_mul(frame_bytes)
+        .context("decoded video byte count overflow")?;
+    ensure!(
+        expected <= MAX_DECODED_VIDEO_BYTES,
+        "decoded video is expected to be {expected} bytes over the {MAX_DECODED_VIDEO_BYTES}-byte limit"
+    );
+    let mut unique = indices.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    let select = unique
+        .iter()
+        .map(|index| format!("eq(n\\,{index})"))
+        .collect::<Vec<_>>()
+        .join("+");
+    let filter = format!("select={select}");
+    let decoded_bytes = unique.len() * frame_bytes;
+    let raw = decode_raw(source, Some(&filter), decoded_bytes)?;
+    ensure!(
+        raw.len() == decoded_bytes,
+        "ffmpeg selected {} bytes, expected {decoded_bytes} for {} unique sampled frames",
+        raw.len(),
+        unique.len()
+    );
+    indices
+        .iter()
+        .map(|index| {
+            let position = unique.binary_search(index).map_err(|_| {
+                anyhow::anyhow!("sampled frame {index} missing from decoded indices")
+            })?;
+            let start = position * frame_bytes;
+            Ok(RgbImage {
+                width: probed.width as usize,
+                height: probed.height as usize,
+                pixels: raw[start..start + frame_bytes].to_vec(),
+            })
+        })
+        .collect()
+}
+
+fn decode_raw(source: &ScratchVideo, filter: Option<&str>, limit: usize) -> Result<Vec<u8>> {
+    let path = source
+        .path()
+        .to_str()
+        .context("video scratch path is not UTF-8")?;
+    let file = format!("file:{path}");
+    let mut args = vec![
+        "-v",
+        "error",
+        "-noautorotate",
+        "-protocol_whitelist",
+        "file",
+        "-f",
+        "mp4",
+        "-i",
+        &file,
+        "-map",
+        "0:v:0",
+    ];
+    if let Some(filter) = filter {
+        args.push("-vf");
+        args.push(filter);
+    }
+    args.extend([
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
+    ]);
+    tool_stdout("ffmpeg", &args, DECODE_TIMEOUT, limit).map_err(|error| redact_scratch(error, path))
+}
+
+fn frames_from_raw(raw: &[u8], probed: &ProbedVideo, frame_bytes: usize) -> Vec<RgbImage> {
+    raw.chunks_exact(frame_bytes)
+        .map(|pixels| RgbImage {
+            width: probed.width as usize,
+            height: probed.height as usize,
+            pixels: pixels.to_vec(),
+        })
+        .collect()
+}
+
+fn redact_scratch(error: anyhow::Error, path: &str) -> anyhow::Error {
+    anyhow::anyhow!("{}", error.to_string().replace(path, "<video>"))
+}
+
+/// Last lines of a bounded stderr tail, each line capped; never the whole stream.
+fn stderr_tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines: Vec<String> = text
+        .lines()
+        .rev()
+        .take(8)
+        .map(|line| line.chars().take(240).collect())
+        .collect();
+    lines.reverse();
+    lines.join(" | ")
+}
+
+enum ToolExit {
+    Status(std::process::ExitStatus),
+    TimedOut,
+    WaitFailed(String),
+}
+
+/// Runs one tool, keeps stdout under `limit` bytes and kills it after `timeout`.
+fn tool_stdout(tool: &str, args: &[&str], timeout: Duration, limit: usize) -> Result<Vec<u8>> {
+    let mut child = std::process::Command::new(tool)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!("video decoding requires {tool} on PATH")
+            } else {
+                anyhow::Error::new(error).context(format!("run {tool}"))
+            }
+        })?;
+    let mut stdout = child.stdout.take().context("tool stdout pipe missing")?;
+    let mut stderr = child.stderr.take().context("tool stderr pipe missing")?;
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let (exit_tx, exit_rx) = std::sync::mpsc::channel::<ToolExit>();
+    let waiter = std::thread::Builder::new()
+        .name(format!("{tool}-wait"))
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + timeout;
+            let exit = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break ToolExit::Status(status),
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break ToolExit::WaitFailed(error.to_string());
+                    }
+                }
+                if stop_rx.try_recv().is_ok() {
+                    let _ = child.kill();
+                    break child.wait().map_or_else(
+                        |error| ToolExit::WaitFailed(error.to_string()),
+                        ToolExit::Status,
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break ToolExit::TimedOut;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let _ = exit_tx.send(exit);
+        })
+        .context("spawn tool waiter")?;
+    let stderr_reader = std::thread::Builder::new()
+        .name(format!("{tool}-stderr"))
+        .spawn(move || {
+            const TAIL_BYTES: usize = 64 * 1024;
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        buffer.extend_from_slice(&chunk[..read]);
+                        if buffer.len() > TAIL_BYTES {
+                            let excess = buffer.len() - TAIL_BYTES;
+                            buffer.drain(..excess);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            buffer
+        })
+        .context("spawn tool stderr reader")?;
+    let mut output = Vec::new();
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut failure = None;
+    loop {
+        match stdout.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                if failure.is_none() && output.len().checked_add(read).is_none_or(|n| n > limit) {
+                    failure = Some(anyhow::anyhow!(
+                        "{tool} output exceeds the {limit}-byte limit"
+                    ));
+                    let _ = stop_tx.send(());
+                }
+                if failure.is_none() {
+                    output.extend_from_slice(&chunk[..read]);
+                }
+            }
+            Err(error) => {
+                if failure.is_none() {
+                    failure = Some(anyhow::anyhow!("read {tool} stdout: {error}"));
+                }
+                let _ = stop_tx.send(());
+                break;
+            }
+        }
+    }
+    drop(stdout);
+    let exit = exit_rx.recv().context("tool waiter stopped")?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("{tool} stderr reader panicked"))?;
+    waiter
+        .join()
+        .map_err(|_| anyhow::anyhow!("{tool} waiter panicked"))?;
+    if let Some(failure) = failure {
+        return Err(failure);
+    }
+    match exit {
+        ToolExit::TimedOut => bail!(
+            "{tool} timed out after {} s and was killed",
+            timeout.as_secs()
+        ),
+        ToolExit::WaitFailed(error) => bail!("wait for {tool}: {error}"),
+        ToolExit::Status(status) => {
+            if !status.success() {
+                bail!("{tool} failed ({}): {}", status, stderr_tail(&stderr));
+            }
+        }
+    }
+    Ok(output)
+}
+
+#[derive(Debug)]
+struct ScratchVideo {
+    path: PathBuf,
+}
+
+impl ScratchVideo {
+    fn write(bytes: &[u8]) -> Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = std::env::temp_dir();
+        for _ in 0..8 {
+            let counter = VIDEO_SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!(
+                "flyingfish-video-{}-{counter}.mp4",
+                std::process::id()
+            ));
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("create video scratch file {}", path.display()));
+                }
+            };
+            if let Err(error) = file.write_all(bytes) {
+                let _ = std::fs::remove_file(&path);
+                return Err(error)
+                    .with_context(|| format!("write video scratch file {}", path.display()));
+            }
+            return Ok(Self { path });
+        }
+        bail!(
+            "could not create a video scratch file in {}",
+            directory.display()
+        )
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchVideo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Deserialize)]
+struct ProbeReport {
+    #[serde(default)]
+    streams: Vec<ProbeStream>,
+}
+
+#[derive(Deserialize)]
+struct ProbeStream {
+    width: Option<u32>,
+    height: Option<u32>,
+    avg_frame_rate: Option<String>,
+    nb_read_frames: Option<String>,
+}
+
+#[derive(Debug)]
+struct ProbedVideo {
+    width: u32,
+    height: u32,
+    numerator: u64,
+    denominator: u64,
+    frames: usize,
+}
+
+impl ProbedVideo {
+    fn frame_bytes(&self) -> Result<usize> {
+        (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .context("video frame byte count overflow")
+    }
+
+    fn metadata(&self) -> Result<VideoMetadata> {
+        self.metadata_with_count(self.frames)
+    }
+
+    fn metadata_with_count(&self, frames: usize) -> Result<VideoMetadata> {
+        ensure!(frames > 0, "video holds no frames");
+        Ok(VideoMetadata {
+            total_num_frames: frames,
+            fps: self.numerator as f64 / self.denominator as f64,
+            duration: video_duration(frames, self.numerator, self.denominator),
+        })
+    }
+}
+
+fn parse_probe(bytes: &[u8]) -> Result<ProbedVideo> {
+    let report: ProbeReport = serde_json::from_slice(bytes).context("parse ffprobe JSON")?;
+    let stream = report
+        .streams
+        .first()
+        .context("ffprobe reported no video stream")?;
+    let width = stream.width.context("ffprobe reported no video width")?;
+    let height = stream.height.context("ffprobe reported no video height")?;
+    ensure!(
+        width > 0 && height > 0,
+        "ffprobe reported a zero frame dimension"
+    );
+    let rate = stream
+        .avg_frame_rate
+        .as_deref()
+        .context("ffprobe reported no average frame rate")?;
+    let (numerator, denominator) = rate
+        .split_once('/')
+        .with_context(|| format!("ffprobe average frame rate {rate} is not a fraction"))?;
+    let numerator: u64 = numerator
+        .parse()
+        .with_context(|| format!("ffprobe average frame rate {rate} numerator"))?;
+    let denominator: u64 = denominator
+        .parse()
+        .with_context(|| format!("ffprobe average frame rate {rate} denominator"))?;
+    let fps = numerator as f64 / denominator as f64;
+    ensure!(
+        numerator > 0 && denominator > 0 && fps.is_finite() && fps > 0.0,
+        "ffprobe average frame rate {rate} is not positive"
+    );
+    // Containers report an unknown frame count as "N/A".
+    let frames = match stream.nb_read_frames.as_deref() {
+        None | Some("N/A") => bail!("ffprobe reported no decoded frame count"),
+        Some(text) => text
+            .parse()
+            .with_context(|| format!("parse ffprobe frame count {text}"))?,
+    };
+    ensure!(frames > 0, "ffprobe reported zero frames");
+    Ok(ProbedVideo {
+        width,
+        height,
+        numerator,
+        denominator,
+        frames,
+    })
+}
+
+/// `float(Fraction(frames * denominator, numerator))`: the integer product converted to f64
+/// and divided once; exact while `frames * denominator <= 2^53`.
+fn video_duration(frames: usize, numerator: u64, denominator: u64) -> f64 {
+    (frames as u128 * denominator as u128) as f64 / numerator as f64
+}
+
 enum ImageFormat {
     Png,
     Jpeg,
@@ -1238,7 +2123,7 @@ mod tests {
             .unwrap()
             .patch_elements(spec.architecture)?;
         assert_eq!(width, 588);
-        let prepared = PreparedImages {
+        let prepared = PreparedInput {
             modality_ids: vec![0, 1, 1, 0],
             pixel_values: (0..16 * width).map(|i| i as f32 / 1024.0).collect(),
             grids: vec![ImageGrid { t: 1, h: 4, w: 4 }],
@@ -1247,14 +2132,14 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("ff-image-roundtrip-minicpm-{}", std::process::id()));
         prepared.save(&spec, &ids, &path)?;
-        let replay = PreparedImages::read(&spec, &path, &ids)?;
+        let replay = PreparedInput::read(&spec, &path, &ids)?;
         assert_eq!(replay.grids, prepared.grids);
         assert_eq!(replay.modality_ids, prepared.modality_ids);
         assert_eq!(replay.pixel_values, prepared.pixel_values);
         let qwen: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/data/q38-config.json"))?;
         let qwen = ModelSpec::qwen(&qwen, &serde_json::Value::Null)?;
-        let error = match PreparedImages::read(&qwen, &path, &ids) {
+        let error = match PreparedInput::read(&qwen, &path, &ids) {
             Ok(_) => anyhow::bail!("Qwen-width read must fail"),
             Err(error) => error.to_string(),
         };
@@ -1400,7 +2285,7 @@ mod tests {
                 assert_eq!(bf16_different, 0, "{name} bf16 identity");
             }
             let ids = tokenizer.encode_chat(prompt)?;
-            let (expanded, prepared) = processor.expand(&ids, vec![packed], 4096)?;
+            let (expanded, prepared) = processor.expand(&ids, vec![packed], Vec::new(), 4096)?;
             let expected_ids: Vec<_> = integers("input_ids")?
                 .into_iter()
                 .map(|i| i as u32)
@@ -1408,6 +2293,1153 @@ mod tests {
             assert_eq!(expanded, expected_ids, "{name} processor IDs");
             assert_eq!(prepared.grids.len(), 1);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn video_sampling_matches_the_model_definition() -> Result<()> {
+        let short = VideoMetadata {
+            total_num_frames: 60,
+            fps: 30.0,
+            duration: 2.0,
+        };
+        assert_eq!(sample_frame_indices(&short, 8, 1)?, vec![0, 30]);
+        assert_eq!(sample_frame_indices(&short, 128, 1)?, vec![0, 30]);
+        let long = VideoMetadata {
+            total_num_frames: 600,
+            fps: 30.0,
+            duration: 20.0,
+        };
+        assert_eq!(
+            sample_frame_indices(&long, 8, 1)?,
+            vec![0, 84, 168, 255, 339, 426, 510, 597]
+        );
+        let one = VideoMetadata {
+            total_num_frames: 30,
+            fps: 30.0,
+            duration: 1.0,
+        };
+        assert_eq!(sample_frame_indices(&one, 8, 1)?, vec![0]);
+        let fraction = VideoMetadata {
+            total_num_frames: 12,
+            fps: 30.0,
+            duration: 0.4,
+        };
+        assert_eq!(sample_frame_indices(&fraction, 8, 1)?, vec![0]);
+        let capped = VideoMetadata {
+            total_num_frames: 3_900,
+            fps: 30.0,
+            duration: 130.0,
+        };
+        let indices = sample_frame_indices(&capped, 128, 1)?;
+        assert_eq!(indices.len(), 128);
+        assert_eq!(&indices[..3], &[0, 30, 60]);
+        assert_eq!(&indices[125..], &[3_834, 3_864, 3_897]);
+        let nine = VideoMetadata {
+            total_num_frames: 216,
+            fps: 24.0,
+            duration: 9.0,
+        };
+        assert_eq!(
+            sample_frame_indices(&nine, 8, 1)?,
+            vec![0, 28, 60, 91, 120, 151, 182, 213]
+        );
+        let ten = VideoMetadata {
+            total_num_frames: 240,
+            fps: 24.0,
+            duration: 10.0,
+        };
+        assert_eq!(
+            sample_frame_indices(&ten, 8, 1)?,
+            vec![0, 33, 67, 100, 134, 168, 201, 237]
+        );
+        let exactly = VideoMetadata {
+            total_num_frames: 3_840,
+            fps: 30.0,
+            duration: 128.0,
+        };
+        let indices = sample_frame_indices(&exactly, 128, 1)?;
+        assert_eq!(indices.len(), 128);
+        assert_eq!(&indices[..2], &[0, 30]);
+        assert_eq!(&indices[126..], &[3_780, 3_810]);
+        // The last linspace position is exactly len - 1: 407 s at 30 fps ends at frame 12207.
+        let endpoint = VideoMetadata {
+            total_num_frames: 12_210,
+            fps: 30.0,
+            duration: 407.0,
+        };
+        let indices = sample_frame_indices(&endpoint, 128, 1)?;
+        assert_eq!(indices.len(), 128);
+        assert_eq!(&indices[..4], &[0, 96, 192, 288]);
+        assert_eq!(&indices[124..], &[11_916, 12_012, 12_108, 12_207]);
+        Ok(())
+    }
+
+    #[test]
+    fn video_duration_divides_the_frame_count_by_the_rate_once() -> Result<()> {
+        assert_eq!(video_duration(3_000, 30_000, 1_001), 100.1);
+        assert_eq!(video_duration(300, 30, 1), 10.0);
+        let meta = VideoMetadata {
+            total_num_frames: 3_000,
+            fps: 30_000.0 / 1_001.0,
+            duration: video_duration(3_000, 30_000, 1_001),
+        };
+        assert_eq!(
+            sample_frame_indices(&meta, 8, 1)?,
+            vec![0, 425, 854, 1_282, 1_708, 2_136, 2_565, 2_994]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sampling_bounds_a_huge_container_duration() -> Result<()> {
+        let meta = VideoMetadata {
+            total_num_frames: 30,
+            fps: 30.0,
+            duration: 1e12,
+        };
+        let indices = sample_frame_indices(&meta, 4, 1)?;
+        assert_eq!(indices.len(), 4);
+        assert!(indices.iter().all(|&index| index < 30), "{indices:?}");
+        assert_eq!(indices[0], 0);
+        let processor = video_processor()?;
+        let probed = ProbedVideo {
+            width: 1280,
+            height: 720,
+            numerator: 30,
+            denominator: 1_000_000_000_000,
+            frames: 30,
+        };
+        assert_eq!(probed.metadata()?.duration, 1e12);
+        let error = processor
+            .plan_probed_video(
+                ScratchVideo::write(&[])?,
+                probed,
+                VideoOptions {
+                    max_num_frames: u32::MAX as usize,
+                    stack_frames: 1,
+                    max_slice_nums: Some(1),
+                },
+                4096,
+            )
+            .unwrap_err();
+        eprintln!(
+            "PASS video_sample_capacity duration=1e12 max_num_frames={} error={error}",
+            u32::MAX
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires FF_VIDEO_DECODE_REFERENCE and FF_VIDEO_CLIPS"]
+    fn video_selected_frames_match_the_full_decode_and_fixture8() -> Result<()> {
+        let reference: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::env::var_os("FF_VIDEO_DECODE_REFERENCE")
+                .context("FF_VIDEO_DECODE_REFERENCE missing")?,
+        )?)?;
+        let clips = std::path::PathBuf::from(
+            std::env::var_os("FF_VIDEO_CLIPS").context("FF_VIDEO_CLIPS missing")?,
+        );
+        let cases = reference["clips"].as_object().context("clips map")?;
+        for (name, case) in cases {
+            let bytes = std::fs::read(clips.join(case["file"].as_str().context("clip file")?))?;
+            let (source, probed) = probe_video(&bytes)?;
+            let metadata = probed.metadata()?;
+            let pyav = &case["transformers_pyav"];
+            assert_eq!(
+                metadata.total_num_frames as u64,
+                pyav["total_num_frames"]
+                    .as_u64()
+                    .context("pyav frame count")?,
+                "{name} frames"
+            );
+            assert_eq!(
+                metadata.fps,
+                pyav["fps"].as_f64().context("pyav fps")?,
+                "{name} fps"
+            );
+            assert_eq!(
+                metadata.duration,
+                pyav["duration"].as_f64().context("pyav duration")?,
+                "{name} duration"
+            );
+            let expected: Vec<usize> = case["sampled_indices_max4_stack1"]
+                .as_array()
+                .context("sampled indices")?
+                .iter()
+                .map(|value| Ok(value.as_u64().context("index")? as usize))
+                .collect::<Result<_>>()?;
+            let sampled = sample_frame_indices(&metadata, 4, 1)?;
+            assert_eq!(sampled, expected, "{name} sampled indices");
+            let selected = decode_video_indices(&source, &probed, &sampled)?;
+            let full = decode_video(&bytes)?.frames;
+            assert_eq!(selected.len(), sampled.len(), "{name} selected count");
+            for (frame, &index) in selected.iter().zip(&sampled) {
+                let expected_frame = full
+                    .get(index)
+                    .with_context(|| format!("{name} frame {index}"))?;
+                assert_eq!(frame.width, expected_frame.width, "{name} frame {index}");
+                assert_eq!(frame.height, expected_frame.height, "{name} frame {index}");
+                assert_eq!(
+                    frame.pixels, expected_frame.pixels,
+                    "{name} frame {index} pixels"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_selected_frames_preserve_repeated_low_fps_samples() -> Result<()> {
+        let clip = ScratchVideo::write(&[])?;
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=1/2",
+                "-frames:v",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(clip.path())
+            .status()
+            .context("run ffmpeg to build the two-frame 0.5 fps clip")?;
+        ensure!(status.success(), "ffmpeg failed to build the low-fps clip");
+        let bytes = std::fs::read(clip.path())?;
+        let (source, probed) = probe_video(&bytes)?;
+        let metadata = probed.metadata()?;
+        assert_eq!(metadata.total_num_frames, 2);
+        assert_eq!(metadata.fps, 0.5);
+        assert_eq!(metadata.duration, 4.0);
+        let indices = sample_frame_indices(&metadata, 4, 1)?;
+        assert_eq!(indices, [0, 0, 1, 1]);
+        let selected = decode_video_indices(&source, &probed, &indices)?;
+        let full = decode_video(&bytes)?;
+        assert_eq!(selected.len(), 4);
+        assert_ne!(full.frames[0].pixels, full.frames[1].pixels);
+        for (frame, &index) in selected.iter().zip(&indices) {
+            assert_eq!((frame.width, frame.height), (64, 48));
+            assert_eq!(frame.pixels, full.frames[index].pixels);
+        }
+        assert_eq!(selected[0].pixels, selected[1].pixels);
+        assert_eq!(selected[2].pixels, selected[3].pixels);
+        let processor = video_processor()?;
+        let packed = processor.pack_video_frames(
+            &selected,
+            &VideoOptions {
+                max_num_frames: 4,
+                stack_frames: 1,
+                max_slice_nums: Some(1),
+            },
+        )?;
+        assert_eq!(packed.frames.len(), 4);
+        assert_eq!(packed.frames[0].pixel_values, packed.frames[1].pixel_values);
+        assert_eq!(packed.frames[2].pixel_values, packed.frames[3].pixel_values);
+        Ok(())
+    }
+
+    #[test]
+    fn video_sampling_validates_metadata_and_scope() {
+        let meta = VideoMetadata {
+            total_num_frames: 60,
+            fps: 30.0,
+            duration: 2.0,
+        };
+        let error = sample_frame_indices(&meta, 8, 3).unwrap_err().to_string();
+        assert!(error.contains("stack_frames 3 is not claimed"), "{error}");
+        assert!(sample_frame_indices(&meta, 0, 1).is_err());
+        let zero = VideoMetadata {
+            total_num_frames: 0,
+            ..meta
+        };
+        assert!(sample_frame_indices(&zero, 8, 1).is_err());
+        let bad_fps = VideoMetadata {
+            fps: f64::NAN,
+            ..meta
+        };
+        assert!(sample_frame_indices(&bad_fps, 8, 1).is_err());
+        let bad_duration = VideoMetadata {
+            duration: 0.0,
+            ..meta
+        };
+        assert!(sample_frame_indices(&bad_duration, 8, 1).is_err());
+        let inconsistent = VideoMetadata {
+            total_num_frames: 10,
+            ..meta
+        };
+        let error = sample_frame_indices(&inconsistent, 8, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside 10 frames"), "{error}");
+    }
+
+    fn video_processor() -> Result<Processor> {
+        let root: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/data/minicpm-config.json"))?;
+        let spec = ModelSpec::minicpm(
+            &root,
+            &serde_json::json!({"eos_token_id": [248044, 248046]}),
+        )?;
+        Ok(Processor {
+            spec,
+            config: ImageConfig::MiniCpm(MiniCpmConfig {
+                max_slice_nums: 9,
+                image_mean: [0.5, 0.5, 0.5],
+                image_std: [0.5, 0.5, 0.5],
+                mrope_mode: "canvas".into(),
+            }),
+            image_id: Some(ImageId {
+                start: 100,
+                end: 101,
+                digits: [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+            }),
+        })
+    }
+
+    fn constant_frame(width: usize, height: usize, level: u8) -> RgbImage {
+        RgbImage {
+            width,
+            height,
+            pixels: vec![level; width * height * 3],
+        }
+    }
+
+    #[test]
+    fn video_frame_crops_pack_in_sample_order() -> Result<()> {
+        let processor = video_processor()?;
+        let patch = processor
+            .spec
+            .vision
+            .as_ref()
+            .unwrap()
+            .patch_elements(processor.spec.architecture)?;
+        let frames: Vec<RgbImage> = (0..4)
+            .map(|i| constant_frame(64, 48, (i * 40) as u8))
+            .collect();
+        let meta = VideoMetadata {
+            total_num_frames: 4,
+            fps: 2.0,
+            duration: 2.0,
+        };
+        let options = VideoOptions {
+            max_num_frames: 2,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let packed = processor.prepare_video(&frames, &meta, &options)?;
+        assert_eq!(packed.frames.len(), 2);
+        let mut rows = 0usize;
+        for frame in &packed.frames {
+            assert_eq!((frame.rows, frame.cols), (0, 0));
+            assert_eq!(frame.grids.len(), 1);
+            rows += frame.grids[0].patch_rows()?;
+        }
+        let total: usize = packed
+            .frames
+            .iter()
+            .map(|frame| frame.pixel_values.len())
+            .sum();
+        assert_eq!(total, rows * patch);
+        assert_ne!(packed.frames[0].pixel_values, packed.frames[1].pixel_values);
+        let sliced = VideoOptions {
+            max_num_frames: 1,
+            stack_frames: 1,
+            max_slice_nums: Some(9),
+        };
+        let large = vec![constant_frame(640, 480, 77), constant_frame(640, 480, 12)];
+        let meta = VideoMetadata {
+            total_num_frames: 2,
+            fps: 1.0,
+            duration: 2.0,
+        };
+        let packed = processor.prepare_video(&large, &meta, &sliced)?;
+        assert_eq!(packed.frames.len(), 1);
+        assert_eq!(packed.frames[0].grids.len(), 3);
+        assert_eq!(packed.frames[0].rows * packed.frames[0].cols, 2);
+        let single = VideoMetadata {
+            total_num_frames: 1,
+            fps: 1.0,
+            duration: 1.0,
+        };
+        let only = processor.prepare_video(&[constant_frame(640, 480, 77)], &single, &sliced)?;
+        assert_eq!(packed.frames[0].pixel_values, only.frames[0].pixel_values);
+        assert_eq!(packed.frames[0].grids, only.frames[0].grids);
+        Ok(())
+    }
+
+    #[test]
+    fn video_pixels_interleave_like_the_same_frames_as_images() -> Result<()> {
+        let processor = video_processor()?;
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let frames = video_frames(2, 64, 48);
+        let options = VideoOptions {
+            max_num_frames: 2,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let video = processor.prepare_video(&frames, &video_meta(2), &options)?;
+        let images = frames
+            .iter()
+            .map(|frame| processor.prepare_rgb(frame))
+            .collect::<Result<Vec<_>>>()?;
+        let (_, video_prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 4096)?;
+        let (_, image_prepared) = processor.expand(
+            &[vision.image_token, vision.image_token],
+            images,
+            Vec::new(),
+            4096,
+        )?;
+        assert_eq!(video_prepared.pixel_values, image_prepared.pixel_values);
+        assert_eq!(video_prepared.grids, image_prepared.grids);
+        Ok(())
+    }
+
+    #[test]
+    fn video_preparation_validates_frames_metadata_and_scope() -> Result<()> {
+        let processor = video_processor()?;
+        let frames = vec![constant_frame(64, 48, 3)];
+        let options = VideoOptions {
+            max_num_frames: 1,
+            stack_frames: 1,
+            max_slice_nums: None,
+        };
+        let meta = VideoMetadata {
+            total_num_frames: 2,
+            fps: 1.0,
+            duration: 2.0,
+        };
+        let error = processor
+            .prepare_video(&frames, &meta, &options)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("decoded video holds 1 frames, metadata reports 2"),
+            "{error}"
+        );
+        let meta = VideoMetadata {
+            total_num_frames: 1,
+            fps: 1.0,
+            duration: 1.0,
+        };
+        let stacked = VideoOptions {
+            max_num_frames: 1,
+            stack_frames: 3,
+            max_slice_nums: None,
+        };
+        assert!(processor.prepare_video(&frames, &meta, &stacked).is_err());
+        let zero_slices = VideoOptions {
+            max_num_frames: 1,
+            stack_frames: 1,
+            max_slice_nums: Some(0),
+        };
+        assert!(
+            processor
+                .prepare_video(&frames, &meta, &zero_slices)
+                .is_err()
+        );
+        let mut bytes = video_frames(1, 64, 48);
+        bytes[0].pixels.pop();
+        let error = processor
+            .prepare_video(&bytes, &meta, &options)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RGB byte count"), "{error}");
+        let mut mixed = video_frames(2, 64, 48);
+        mixed[1] = constant_frame(64, 32, 5);
+        let error = processor
+            .prepare_video(&mixed, &video_meta(2), &options)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("video frame 1 is 64x32"), "{error}");
+        Ok(())
+    }
+
+    fn video_frames(count: usize, width: usize, height: usize) -> Vec<RgbImage> {
+        (0..count)
+            .map(|i| constant_frame(width, height, (i * 37) as u8))
+            .collect()
+    }
+
+    fn video_meta(count: usize) -> VideoMetadata {
+        VideoMetadata {
+            total_num_frames: count,
+            fps: 1.0,
+            duration: count as f64,
+        }
+    }
+
+    #[test]
+    fn ffprobe_metadata_parses_geometry_rate_and_frame_count() -> Result<()> {
+        let report = serde_json::json!({
+            "streams": [{"width": 64, "height": 48, "avg_frame_rate": "30000/1001",
+                         "nb_read_frames": "3"}],
+        });
+        let probed = parse_probe(&serde_json::to_vec(&report)?)?;
+        assert_eq!((probed.width, probed.height), (64, 48));
+        assert_eq!((probed.numerator, probed.denominator), (30000, 1001));
+        assert_eq!(probed.frames, 3);
+        for missing in [serde_json::json!("N/A"), serde_json::Value::Null] {
+            let mut unknown = report.clone();
+            if missing.is_null() {
+                unknown["streams"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("nb_read_frames");
+            } else {
+                unknown["streams"][0]["nb_read_frames"] = missing;
+            }
+            let error = parse_probe(&serde_json::to_vec(&unknown)?)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("no decoded frame count"), "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ffprobe_metadata_rejects_missing_or_inconsistent_fields() -> Result<()> {
+        let valid = serde_json::json!({
+            "streams": [{"width": 64, "height": 48, "avg_frame_rate": "10/1",
+                         "nb_read_frames": "3"}],
+        });
+        let error = |value: serde_json::Value| -> Result<String> {
+            match parse_probe(&serde_json::to_vec(&value)?) {
+                Ok(_) => bail!("probe report must fail"),
+                Err(error) => Ok(error.to_string()),
+            }
+        };
+        let mut value = valid.clone();
+        value["streams"] = serde_json::json!([]);
+        assert!(error(value)?.contains("no video stream"));
+        let mut value = valid.clone();
+        assert!(
+            value["streams"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("width")
+                .is_some()
+        );
+        assert!(error(value)?.contains("no video width"));
+        let mut value = valid.clone();
+        value["streams"][0]["height"] = serde_json::json!(0);
+        assert!(error(value)?.contains("zero frame dimension"));
+        let mut value = valid.clone();
+        assert!(
+            value["streams"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("avg_frame_rate")
+                .is_some()
+        );
+        assert!(error(value)?.contains("no average frame rate"));
+        let mut value = valid.clone();
+        value["streams"][0]["avg_frame_rate"] = serde_json::json!("0/0");
+        assert!(error(value)?.contains("not positive"));
+        let mut value = valid.clone();
+        value["streams"][0]["avg_frame_rate"] = serde_json::json!("10");
+        assert!(error(value)?.contains("not a fraction"));
+        let mut value = valid.clone();
+        value["streams"][0]["nb_read_frames"] = serde_json::json!("0");
+        assert!(error(value)?.contains("zero frames"));
+        let mut value = valid.clone();
+        value["streams"][0]["nb_read_frames"] = serde_json::json!("3x");
+        assert!(error(value)?.contains("frame count"));
+        Ok(())
+    }
+
+    #[test]
+    fn video_data_urls_require_mp4_base64() {
+        for url in [
+            "https://example.com/video.mp4",
+            "file:///etc/passwd",
+            "/etc/passwd",
+            "/dev/zero",
+            "data:video/webm;base64,AAAA",
+            "data:video/mp4,AAAA",
+            "data:video/mp4;base64,!!!!",
+        ] {
+            assert!(load_encoded_video(url).is_err(), "{url}");
+        }
+        let error = load_encoded_video("/etc/passwd").unwrap_err().to_string();
+        assert!(error.contains("base64 data URL"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_decoding_uses_ffprobe_metadata_and_ffmpeg_frames() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("ff-video-clip-{}.mp4", std::process::id()));
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=10:duration=1.5",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&path)
+            .status()
+            .context("run ffmpeg to build the test clip")?;
+        assert!(status.success());
+        let bytes = std::fs::read(&path)?;
+        std::fs::remove_file(&path)?;
+        let video = decode_video(&bytes)?;
+        assert_eq!(video.frames.len(), 15);
+        assert_eq!(video.metadata.total_num_frames, 15);
+        assert_eq!(video.metadata.fps, 10.0);
+        assert_eq!(video.metadata.duration, 1.5);
+        assert_eq!((video.frames[0].width, video.frames[0].height), (64, 48));
+        assert_eq!(video.frames[0].pixels.len(), 64 * 48 * 3);
+        let processor = video_processor()?;
+        let options = VideoOptions {
+            max_num_frames: 4,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let packed = processor.prepare_video(&video.frames, &video.metadata, &options)?;
+        assert_eq!(packed.frames.len(), 2);
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let (expanded, _) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![packed], 4096)?;
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|&&id| id == vision.video_token)
+                .count(),
+            126
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_request_matches_fixture4_token_counts() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-video-fixture4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("clip.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=1280x720:rate=30:duration=3.1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&path)
+            .status()
+            .context("run ffmpeg to build the fixture-4 clip")?;
+        assert!(status.success());
+        let bytes = std::fs::read(&path)?;
+        std::fs::remove_dir_all(&dir)?;
+        let url = format!("data:video/mp4;base64,{}", base64::encode(bytes));
+        let processor = video_processor()?;
+        let options = VideoOptions {
+            max_num_frames: 128,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let planned = processor.plan_video(&url, options, 4096)?;
+        assert_eq!(planned.indices, vec![0, 30, 60, 90]);
+        let metadata = planned.probed.metadata()?;
+        assert_eq!(metadata.total_num_frames, 93);
+        assert_eq!(metadata.fps, 30.0);
+        assert_eq!(metadata.duration, 3.1);
+        assert_eq!((planned.probed.height, planned.probed.width), (720, 1280));
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let (grids, rows, cols) = mini_cpm_grids(720, 1280, vision.patch as usize, 1)?;
+        assert_eq!((grids[0].h, grids[0].w), (24, 44));
+        assert_eq!((rows, cols), (0, 0));
+        assert_eq!(processor.video_tokens(&planned)?, 272);
+        let error = processor
+            .plan_video(&url, options, processor.video_tokens(&planned)? - 1)
+            .unwrap_err();
+        eprintln!("PASS video_sample_capacity below_required error={error}");
+        let packed = processor.prepare_planned_video(planned)?;
+        assert_eq!(packed.frames.len(), 4);
+        for frame in &packed.frames {
+            assert_eq!((frame.grids.len(), frame.rows, frame.cols), (1, 0, 0));
+            assert_eq!((frame.grids[0].h, frame.grids[0].w), (24, 44));
+        }
+        let ids = vec![5u32, 9, vision.video_token, 7];
+        let (expanded, prepared) = processor.expand(&ids, Vec::new(), vec![packed], 4096)?;
+        assert_eq!(expanded.len(), ids.len() - 1 + 272);
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|&&id| id == vision.video_token)
+                .count(),
+            264
+        );
+        assert_eq!(prepared.grids.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_video_tools_are_named() {
+        let error = tool_stdout(
+            "ffmpeg-not-on-path-ds",
+            &[],
+            std::time::Duration::from_millis(10),
+            16,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("video decoding requires ffmpeg-not-on-path-ds on PATH"),
+            "{error}"
+        );
+    }
+
+    fn ffprobe_report(path: &Path, entries: &str) -> Result<serde_json::Value> {
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_frames",
+                "-show_entries",
+                entries,
+                "-of",
+                "json",
+            ])
+            .arg(format!("file:{}", path.display()))
+            .output()
+            .context("run ffprobe")?;
+        assert!(probe.status.success());
+        serde_json::from_slice(&probe.stdout).context("parse ffprobe JSON")
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_decoding_keeps_variable_frame_timing() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!("ff-video-vfr-{}", std::process::id()));
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join("vfr.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=30:duration=1",
+                "-vf",
+                "select='eq(n,0)+eq(n,1)+eq(n,5)+eq(n,6)+eq(n,7)+eq(n,13)'",
+                "-fps_mode",
+                "vfr",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&path)
+            .status()
+            .context("run ffmpeg to build the VFR clip")?;
+        assert!(status.success());
+        let count = ffprobe_report(&path, "stream=nb_read_frames")?["streams"][0]["nb_read_frames"]
+            .as_str()
+            .context("nb_read_frames missing")?
+            .parse::<usize>()?;
+        assert_eq!(count, 6);
+        let bytes = std::fs::read(&path)?;
+        let reference = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-noautorotate", "-i"])
+            .arg(format!("file:{}", path.display()))
+            .args([
+                "-map",
+                "0:v:0",
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-",
+            ])
+            .output()
+            .context("run ffmpeg passthrough decode")?;
+        std::fs::remove_dir_all(&directory)?;
+        assert!(reference.status.success());
+        let video = decode_video(&bytes)?;
+        assert_eq!(video.frames.len(), count);
+        assert_eq!(video.metadata.fps, 15.0);
+        assert_eq!(video.metadata.duration, 0.4);
+        let decoded: Vec<u8> = video
+            .frames
+            .iter()
+            .flat_map(|frame| frame.pixels.iter().copied())
+            .collect();
+        assert_eq!(decoded, reference.stdout);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_metadata_uses_the_decoded_count_over_the_header_duration() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("ff-video-header-{}", std::process::id()));
+        std::fs::create_dir_all(&directory)?;
+        let clip = directory.join("video.mp4");
+        let audio = directory.join("audio.mkv");
+        let padded = directory.join("padded.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=30",
+                "-frames:v",
+                "300",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&clip)
+            .status()
+            .context("run ffmpeg to build the 300-frame clip")?;
+        assert!(status.success());
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=44100:cl=mono",
+                "-t",
+                "12",
+                "-c:a",
+                "aac",
+                "-y",
+            ])
+            .arg(&audio)
+            .status()
+            .context("run ffmpeg to build the 12 s audio track")?;
+        assert!(status.success());
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&clip)
+            .arg("-i")
+            .arg(&audio)
+            .args([
+                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-y",
+            ])
+            .arg(&padded)
+            .status()
+            .context("run ffmpeg to mux the padded container")?;
+        assert!(status.success());
+        let header = ffprobe_report(&padded, "format=duration")?["format"]["duration"]
+            .as_str()
+            .context("format duration missing")?
+            .parse::<f64>()?;
+        let bytes = std::fs::read(&padded)?;
+        std::fs::remove_dir_all(&directory)?;
+        let decoded = decode_video(&bytes)?;
+        assert_eq!(decoded.metadata.total_num_frames, 300);
+        assert_eq!(decoded.metadata.fps, 30.0);
+        assert_eq!(decoded.metadata.duration, 10.0);
+        assert!(
+            header > decoded.metadata.duration,
+            "header={header} decoded={}",
+            decoded.metadata.duration
+        );
+        let indices = sample_frame_indices(&decoded.metadata, 128, 1)?;
+        assert_eq!(indices, (0..10).map(|i| i * 30).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_metadata_divides_ntsc_rates_exactly() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("ff-video-ntsc-{}.mp4", std::process::id()));
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=30000/1001",
+                "-frames:v",
+                "3000",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&path)
+            .status()
+            .context("run ffmpeg to build the NTSC clip")?;
+        assert!(status.success());
+        let bytes = std::fs::read(&path)?;
+        std::fs::remove_file(&path)?;
+        let video = decode_video(&bytes)?;
+        assert_eq!(video.metadata.total_num_frames, 3000);
+        assert_eq!(video.metadata.fps, 30000.0 / 1001.0);
+        assert_eq!(video.metadata.duration, 100.1);
+        assert_eq!(
+            sample_frame_indices(&video.metadata, 8, 1)?,
+            vec![0, 425, 854, 1282, 1708, 2136, 2565, 2994]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_decoding_errors_name_the_failing_tool() -> Result<()> {
+        let error = match decode_video(b"not a video container") {
+            Ok(_) => bail!("invalid container must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("ffprobe"), "{error}");
+        assert!(!error.contains("flyingfish-video-"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn stderr_tail_keeps_only_the_last_lines() {
+        let text: String = (0..200).map(|index| format!("line {index}\n")).collect();
+        let tail = stderr_tail(text.as_bytes());
+        assert!(!tail.contains("line 0 |"), "{tail}");
+        assert!(tail.contains("line 199"), "{tail}");
+        let segments: Vec<&str> = tail.split(" | ").collect();
+        assert!(segments.len() <= 8, "{tail}");
+        assert!(segments.iter().all(|line| line.chars().count() <= 240));
+        let long_line = "x".repeat(1000);
+        let tail = stderr_tail(long_line.as_bytes());
+        assert!(tail.chars().count() <= 240);
+    }
+
+    #[test]
+    fn video_placeholders_match_the_model_definition() -> Result<()> {
+        let processor = video_processor()?;
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let mut options = VideoOptions {
+            max_num_frames: 2,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let frames = video_frames(2, 64, 48);
+        let video = processor.prepare_video(&frames, &video_meta(2), &options)?;
+        let (expanded, prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 4096)?;
+        assert_eq!(expanded.len(), 130);
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|&&id| id == vision.video_token)
+                .count(),
+            126
+        );
+        let expected = [(0u8, 1usize), (2, 63), (0, 1), (0, 1), (2, 63), (0, 1)];
+        let mut cursor = 0usize;
+        for (modality, len) in expected {
+            for &value in &prepared.modality_ids[cursor..cursor + len] {
+                assert_eq!(value, modality);
+            }
+            cursor += len;
+        }
+        assert_eq!(cursor, 130);
+        assert_eq!(prepared.grids.len(), 2);
+        assert_eq!(prepared.pixel_values.len(), 2 * 28 * 36 * 588);
+        let sliced = video_frames(2, 640, 480);
+        options.max_slice_nums = Some(9);
+        let video = processor.prepare_video(&sliced, &video_meta(2), &options)?;
+        assert_eq!((video.frames[0].rows, video.frames[0].cols), (1, 2));
+        let (expanded, prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 8192)?;
+        assert_eq!(expanded.len(), 418);
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|&&id| id == vision.video_token)
+                .count(),
+            406
+        );
+        assert_eq!(prepared.grids.len(), 6);
+        let square = video_frames(2, 1024, 1024);
+        let video = processor.prepare_video(&square, &video_meta(2), &options)?;
+        assert_eq!((video.frames[0].rows, video.frames[0].cols), (2, 3));
+        let (expanded, _prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 16384)?;
+        assert_eq!(expanded.len(), 878);
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|&&id| id == vision.video_token)
+                .count(),
+            848
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn image_and_video_placeholders_expand_in_prompt_order() -> Result<()> {
+        let processor = video_processor()?;
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let image = processor.prepare_rgb(&constant_frame(64, 48, 9))?;
+        let options = VideoOptions {
+            max_num_frames: 2,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let video = processor.prepare_video(&video_frames(2, 64, 48), &video_meta(2), &options)?;
+        let (expanded, prepared) = processor.expand(
+            &[vision.image_token, vision.video_token],
+            vec![image],
+            vec![video],
+            4096,
+        )?;
+        assert_eq!(expanded.len(), 198);
+        let video_first = expanded
+            .iter()
+            .position(|&id| id == vision.video_token)
+            .unwrap();
+        assert!(expanded[..video_first].contains(&vision.image_token));
+        assert_eq!(
+            prepared.modality_ids.iter().filter(|&&m| m == 1).count(),
+            63
+        );
+        assert_eq!(
+            prepared.modality_ids.iter().filter(|&&m| m == 2).count(),
+            126
+        );
+        assert_eq!(prepared.grids.len(), 3);
+        let (_, prepared) = processor.expand(
+            &[vision.video_token, vision.image_token],
+            vec![processor.prepare_rgb(&constant_frame(64, 48, 9))?],
+            vec![processor.prepare_video(&video_frames(2, 64, 48), &video_meta(2), &options)?],
+            4096,
+        )?;
+        assert_eq!(prepared.grids.len(), 3);
+        assert_eq!(prepared.modality_ids[1], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn video_expansion_validates_placeholder_counts() -> Result<()> {
+        let processor = video_processor()?;
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let options = VideoOptions {
+            max_num_frames: 1,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let video = processor.prepare_video(&video_frames(1, 64, 48), &video_meta(1), &options)?;
+        let error = processor
+            .expand(
+                &[vision.video_token, vision.video_token],
+                Vec::new(),
+                vec![video],
+                4096,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("more video placeholders than supplied videos"),
+            "{error}"
+        );
+        let video = processor.prepare_video(&video_frames(1, 64, 48), &video_meta(1), &options)?;
+        let error = processor
+            .expand(&[5], Vec::new(), vec![video], 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("video has no placeholder in rendered prompt"),
+            "{error}"
+        );
+        let video = processor.prepare_video(&video_frames(1, 64, 48), &video_meta(1), &options)?;
+        let (expanded, prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 4096)?;
+        let mut modality = prepared.modality_ids.clone();
+        let visual = modality
+            .iter()
+            .position(|&m| m == 2)
+            .context("no video modality")?;
+        modality[visual] = 3;
+        let bad = PreparedInput {
+            modality_ids: modality,
+            pixel_values: prepared.pixel_values,
+            grids: prepared.grids,
+        };
+        assert!(
+            bad.input(&expanded)
+                .validate(&processor.spec, 4096)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn video_canvas_positions_match_the_model_definition() -> Result<()> {
+        let processor = video_processor()?;
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let mut options = VideoOptions {
+            max_num_frames: 2,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let video = processor.prepare_video(&video_frames(2, 64, 48), &video_meta(2), &options)?;
+        let (expanded, prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 4096)?;
+        let plan = prepared.input(&expanded).validate(&processor.spec, 4096)?;
+        let axes = plan.axes();
+        assert_eq!([axes[0][1], axes[1][1], axes[2][1]], [0, 0, 0]);
+        assert_eq!([axes[0][66], axes[1][66], axes[2][66]], [10, 10, 10]);
+        assert_eq!(plan.rope_delta(), -110);
+        options.max_slice_nums = Some(9);
+        let video =
+            processor.prepare_video(&video_frames(2, 640, 480), &video_meta(2), &options)?;
+        let (expanded, prepared) =
+            processor.expand(&[vision.video_token], Vec::new(), vec![video], 8192)?;
+        assert_eq!(expanded.len(), 418);
+        let plan = prepared.input(&expanded).validate(&processor.spec, 8192)?;
+        let axes = plan.axes();
+        assert_eq!([axes[0][1], axes[1][1], axes[2][1]], [0, 0, 0]);
+        assert_eq!([axes[0][66], axes[1][66], axes[2][66]], [0, 0, 0]);
+        assert_eq!([axes[0][138], axes[1][138], axes[2][138]], [0, 0, 7]);
+        assert_eq!([axes[0][210], axes[1][210], axes[2][210]], [15, 15, 15]);
+        options.max_slice_nums = Some(1);
+        let image = processor.prepare_rgb(&constant_frame(64, 48, 5))?;
+        let video = processor.prepare_video(&video_frames(2, 64, 48), &video_meta(2), &options)?;
+        let (expanded, prepared) = processor.expand(
+            &[vision.image_token, vision.video_token],
+            vec![image],
+            vec![video],
+            4096,
+        )?;
+        let plan = prepared.input(&expanded).validate(&processor.spec, 4096)?;
+        let axes = plan.axes();
+        assert_eq!([axes[0][69], axes[1][69], axes[2][69]], [13, 13, 13]);
+        assert_eq!([axes[0][134], axes[1][134], axes[2][134]], [23, 23, 23]);
         Ok(())
     }
 }

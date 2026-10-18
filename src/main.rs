@@ -343,7 +343,7 @@ fn generate(
         None => None,
     };
     let images = match (&image_tensors, &model_spec) {
-        (Some(path), Some(spec)) => Some(flyingfish::serve::image::PreparedImages::read(
+        (Some(path), Some(spec)) => Some(flyingfish::serve::image::PreparedInput::read(
             spec, path, &ids,
         )?),
         _ => None,
