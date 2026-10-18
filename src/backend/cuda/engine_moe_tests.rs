@@ -482,13 +482,7 @@ impl Engine {
             crate::gdn_plan::GdnPolicy::for_device(engine.device.info.arch, engine.device.info.sms),
         )?)?;
         engine.qwen = Some(qwen::Runtime::new(
-            &engine,
-            runtime,
-            catalog,
-            None,
-            scratch,
-            None,
-            workspace_rows,
+            &engine, runtime, catalog, None, scratch, None, 8,
         )?);
         for rows in 1..=workspace_rows {
             engine.prepare_qwen(rows)?;
