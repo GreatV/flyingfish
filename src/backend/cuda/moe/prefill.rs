@@ -713,6 +713,8 @@ struct Stage {
     gemm1_dev: CudaSlice<u64>,
     gemm2_host: PinnedHostSlice<u64>,
     gemm2_dev: CudaSlice<u64>,
+    gemm1_copy_done: CudaEvent,
+    gemm2_copy_done: CudaEvent,
     order: Vec<u32>,
     runs: Vec<(u32, u32)>,
     offsets: Vec<i32>,
@@ -732,6 +734,8 @@ impl Stage {
                 gemm1_dev: stream.alloc_zeros::<u64>(GEMM1_PTR_WORDS)?,
                 gemm2_host: ctx.alloc_pinned_with_flags::<u64>(GEMM2_PTR_WORDS, 0)?,
                 gemm2_dev: stream.alloc_zeros::<u64>(GEMM2_PTR_WORDS)?,
+                gemm1_copy_done: ctx.new_event(Some(ds::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
+                gemm2_copy_done: ctx.new_event(Some(ds::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
                 order: Vec::new(),
                 runs: Vec::new(),
                 offsets: Vec::with_capacity(MAX_EXPERTS),
@@ -803,14 +807,15 @@ impl PrefillOps {
         stream: &Arc<CudaStream>,
         input: MoePrefillContribute<'_>,
         scratch: &Scratch,
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         ensure!(
             Arc::ptr_eq(stream, &self.stream),
             "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
         );
         let plan = input.validate()?;
         scratch.validate(plan.layout.bytes)?;
-        self.contribute(stream, &input, &plan, scratch)
+        self.contribute(stream, &input, &plan, scratch)?;
+        Ok(())
     }
 
     fn contribute(
@@ -819,7 +824,7 @@ impl PrefillOps {
         input: &MoePrefillContribute<'_>,
         plan: &PrefillPlan,
         scratch: &Scratch,
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         let experts = plan.experts as usize;
         let (rows, top_k, hidden, inter) = (plan.rows, plan.top_k, plan.hidden, plan.inter);
         let layout = &plan.layout;
@@ -896,7 +901,7 @@ impl PrefillOps {
             window[d2h_words - 1]
         );
         if active_total == 0 {
-            return Ok(stream.record_event(None)?);
+            return Ok(());
         }
         problem_order(counts, &mut stage.order);
         group_runs(&stage.order, counts, &mut stage.runs);
@@ -957,7 +962,13 @@ impl PrefillOps {
         }
         let (gemm1_base, _g1) = stage.gemm1_dev.device_ptr(stream);
         unsafe {
-            htod_ptrs(stream, gemm1_base, &stage.gemm1_host, 3 * len1)?;
+            htod_ptrs(
+                stream,
+                gemm1_base,
+                &stage.gemm1_host,
+                3 * len1,
+                &mut stage.gemm1_copy_done,
+            )?;
             self.grouped_gemm(stage, gemm1_base, len1)
                 .context("moe prefill grouped GEMM 1")?;
         }
@@ -1000,7 +1011,13 @@ impl PrefillOps {
         }
         let (gemm2_base, _g2) = stage.gemm2_dev.device_ptr(stream);
         unsafe {
-            htod_ptrs(stream, gemm2_base, &stage.gemm2_host, 3 * len2)?;
+            htod_ptrs(
+                stream,
+                gemm2_base,
+                &stage.gemm2_host,
+                3 * len2,
+                &mut stage.gemm2_copy_done,
+            )?;
             self.grouped_gemm(stage, gemm2_base, len2)
                 .context("moe prefill grouped GEMM 2")?;
         }
@@ -1016,7 +1033,7 @@ impl PrefillOps {
                 .arg(&(hidden as i64))
                 .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
         }
-        Ok(stream.record_event(None)?)
+        Ok(())
     }
 
     /// Contribute + combine over the active assignments and the shared
@@ -1030,7 +1047,7 @@ impl PrefillOps {
         stream: &Arc<CudaStream>,
         input: MoePrefill<'_>,
         scratch: &Scratch,
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         ensure!(
             Arc::ptr_eq(stream, &self.stream),
             "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
@@ -1102,7 +1119,8 @@ impl PrefillOps {
             shared_expert_gate: cohort.shared_expert_gate,
             y,
         };
-        self.finish_body(stream, fin, &plan, scratch)
+        self.finish_body(stream, fin, &plan, scratch)?;
+        Ok(())
     }
 
     /// The join over caller-owned contributions: shared FFN, sigmoid gate,
@@ -1114,14 +1132,15 @@ impl PrefillOps {
         stream: &Arc<CudaStream>,
         input: MoePrefillFinish,
         scratch: &Scratch,
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         ensure!(
             Arc::ptr_eq(stream, &self.stream),
             "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
         );
         let plan = input.validate()?;
         scratch.validate(plan.layout.bytes)?;
-        self.finish_body(stream, input, &plan, scratch)
+        self.finish_body(stream, input, &plan, scratch)?;
+        Ok(())
     }
 
     fn finish_body(
@@ -1130,7 +1149,7 @@ impl PrefillOps {
         input: MoePrefillFinish,
         plan: &PrefillPlan,
         scratch: &Scratch,
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         // Shared FFN: the gate/up group (2 problems) and the down group (1
         // problem) share one 9-pointer block [A|B|C] per group, uploaded
         // with a single H2D.
@@ -1168,7 +1187,13 @@ impl PrefillOps {
             });
             let (base, _gs) = stage.gemm1_dev.device_ptr(stream);
             unsafe {
-                htod_ptrs(stream, base, &stage.gemm1_host, 9)?;
+                htod_ptrs(
+                    stream,
+                    base,
+                    &stage.gemm1_host,
+                    9,
+                    &mut stage.gemm1_copy_done,
+                )?;
                 self.grouped_gemm(stage, base, 2)
                     .context("moe prefill shared gate/up GEMM")?;
             }
@@ -1225,7 +1250,8 @@ impl PrefillOps {
             scale,
             y: input.y,
         };
-        self.combine.combine(stream, &combine_input)
+        self.combine.combine(stream, &combine_input)?;
+        Ok(())
     }
 
     /// cublasGemmGroupedBatchedEx with BF16 A/B/C, CUBLAS_COMPUTE_32F,
@@ -1321,6 +1347,7 @@ unsafe fn htod_ptrs(
     dst: u64,
     src: &PinnedHostSlice<u64>,
     words: usize,
+    done: &mut CudaEvent,
 ) -> Result<()> {
     ensure!(
         words <= src.len(),
@@ -1328,6 +1355,9 @@ unsafe fn htod_ptrs(
         src.len()
     );
     stream.context().bind_to_thread()?;
+    // The pinned mirror is rewritten on the next call; the previous copy
+    // must have completed first.
+    stream.wait(done)?;
     let host = src.as_ptr()?;
     unsafe {
         ds::cuMemcpyHtoDAsync_v2(
@@ -1338,5 +1368,6 @@ unsafe fn htod_ptrs(
         )
         .result()?;
     }
+    done.record(stream)?;
     Ok(())
 }
