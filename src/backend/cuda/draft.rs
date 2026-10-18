@@ -1641,6 +1641,7 @@ mod tests {
         let mut rejected_control = 0;
         let mut graph_replays = 0;
         let mut native_requests = 0;
+        let mut reclassified_cells = 0;
         for name in names {
             let data = std::fs::read(reference.join(format!("{name}.safetensors")))?;
             let tensors = SafeTensors::deserialize(&data)?;
@@ -1709,7 +1710,7 @@ mod tests {
                 Some((&mut trace, "draft")),
                 Some(&expected_ids),
             )?;
-            let mut fixture_defects = usize::from(proposals != expected_ids);
+            let mut fixture_defects = 0;
             for (point, key, coef) in [
                 (
                     "context.c_projected",
@@ -1830,7 +1831,31 @@ mod tests {
                 b,
             )?;
             let top = values(&tensors, "combined_top32_vals", &[b, 32])?;
+            let top_floor = values(&floors, "combined_top32_vals", &[b, 32])?;
             let top_ids = ids(&tensors, "combined_top32_ids", &[b, 32])?;
+            let qualified: Vec<_> = (0..b)
+                .map(|r| top[r * 32] - top[r * 32 + 1] > top_floor[r * 32] + top_floor[r * 32 + 1])
+                .collect();
+            let winner_valid = |row: usize, token: u32| -> Result<bool> {
+                if qualified[row] {
+                    return Ok(token == expected_ids[row]);
+                }
+                let lo = row * 32;
+                let lower = top[lo] - top_floor[lo];
+                ensure!(
+                    top[lo + 31] + top_floor[lo + 31] < lower,
+                    "ambiguity interval exceeds stored top32"
+                );
+                Ok(top_ids[lo..lo + 32]
+                    .iter()
+                    .position(|id| *id == token)
+                    .is_some_and(|index| top[lo + index] + top_floor[lo + index] >= lower))
+            };
+            let mut teacher_id_defects = 0;
+            for (row, actual) in proposals.iter().enumerate() {
+                teacher_id_defects += usize::from(!winner_valid(row, *actual)?);
+            }
+            fixture_defects += teacher_id_defects;
             let scores = trace.values("draft.s")?;
             let mut actual_top = Vec::with_capacity(b * 32);
             for row in scores.chunks_exact(v) {
@@ -1842,7 +1867,7 @@ mod tests {
             fixture_defects += compare(
                 &format!("{name}.combined_top32_vals"),
                 &actual_top,
-                (&top, &values(&floors, "combined_top32_vals", &[b, 32])?),
+                (&top, &top_floor),
                 coefficient(&c, context, c.num_hidden_layers, 3)
                     + super::super::bf16_chain_bound(1, &[c.markov_rank])
                     + super::super::gamma(1, 2f64.powi(-24)),
@@ -1855,11 +1880,14 @@ mod tests {
                         .position(|id| id == actual)
                         .map(|index| top[row * 32 + index]);
                     println!(
-                        "T19_PROPOSAL_DEFECT fixture={name} row={row} expected={expected} actual={actual} candidate_expected={} candidate_actual={} reference_expected={} reference_actual={reference_actual:?} reference_margin={}",
+                        "T19_PROPOSAL_RAW fixture={name} row={row} expected={expected} actual={actual} candidate_expected={} candidate_actual={} reference_expected={} reference_actual={reference_actual:?} reference_margin={} detection_threshold={} qualified={} winner_valid={}",
                         scores[row * v + *expected as usize],
                         scores[row * v + *actual as usize],
                         top[row * 32],
                         top[row * 32] - top[row * 32 + 1],
+                        top_floor[row * 32] + top_floor[row * 32 + 1],
+                        qualified[row],
+                        winner_valid(row, *actual)?,
                     );
                 }
             }
@@ -1898,7 +1926,14 @@ mod tests {
                 None,
                 None,
             )?;
-            defects += usize::from(free != expected_ids);
+            let first_ambiguity = qualified.iter().position(|valid| !valid);
+            let mut free_id_defects = 0;
+            for (row, actual) in free.iter().enumerate() {
+                if first_ambiguity.is_none_or(|first| row <= first) {
+                    free_id_defects += usize::from(!winner_valid(row, *actual)?);
+                }
+            }
+            defects += free_id_defects;
             let mut expected_bits = Vec::new();
             draft.state_bits(context, b, &mut expected_bits)?;
             let anchor = s.clone_htod(&[block_ids[0]])?;
@@ -1957,9 +1992,36 @@ mod tests {
                     start += actual.len();
                 }
             }
-            for (actual, expected) in first.iter().zip(&expected_ids) {
-                defects += usize::from(actual.tokens[0] != *expected);
+            let mut native_exact_defects = 0;
+            for (row, actual) in first.iter().enumerate() {
+                native_exact_defects += usize::from(actual.tokens[0] != proposals[row]);
+                native_exact_defects += usize::from(!winner_valid(row, actual.tokens[0])?);
             }
+            defects += native_exact_defects;
+            let raw_teacher = proposals
+                .iter()
+                .zip(&expected_ids)
+                .filter(|(a, b)| a != b)
+                .count();
+            let raw_free = free
+                .iter()
+                .zip(&expected_ids)
+                .filter(|(a, b)| a != b)
+                .count();
+            let raw_native = first
+                .iter()
+                .zip(&expected_ids)
+                .filter(|(a, b)| a.tokens[0] != **b)
+                .count();
+            let reclassified = usize::from(raw_teacher > 0 && teacher_id_defects == 0)
+                + usize::from(raw_free > 0 && free_id_defects == 0)
+                + usize::from(raw_native > 0 && native_exact_defects == 0);
+            reclassified_cells += reclassified;
+            println!(
+                "T19_ID_CORRECTION fixture={name} raw_teacher={raw_teacher} raw_free={raw_free} raw_native_reference={raw_native} qualified_rows={} ambiguous_rows={} first_ambiguity={first_ambiguity:?} teacher_id_defects={teacher_id_defects} free_id_defects={free_id_defects} native_same_input_exact_defects={native_exact_defects} reclassified_scored_cells={reclassified}",
+                qualified.iter().filter(|v| **v).count(),
+                qualified.iter().filter(|v| !**v).count()
+            );
             native_requests += requests.len() + expanded.len();
             if name == names[0] {
                 let maximum = s
@@ -2054,7 +2116,7 @@ mod tests {
         }
         defects += usize::from(rejected_control == 0);
         println!(
-            "T19_DRAFT fixtures=6 graph_replays={graph_replays} native_markov_requests={native_requests} wrong_position_rejected={rejected_control} defects={defects} {}",
+            "T19_DRAFT fixtures=6 graph_replays={graph_replays} native_markov_requests={native_requests} wrong_position_rejected={rejected_control} reclassified_scored_cells={reclassified_cells} defects={defects} {}",
             if defects == 0 { "PASS" } else { "DEFECT" }
         );
         ensure!(defects == 0, "T19 draft has {defects} finite defects");

@@ -263,6 +263,7 @@ fn native_geometry_head_ops_gpu() -> Result<()> {
     let anchor = s.clone_htod(&[(vocab - 1) as u32])?;
     let mut output = s.clone_htod(&vec![f32::NAN; rows + 1])?;
     let (out_ptr, _out_hold) = output.device_ptr_mut(s);
+    drop(_out_hold);
     let kernel = module.load_function("concat_dot_sigmoid")?;
     let execute = || -> Result<()> {
         unsafe {

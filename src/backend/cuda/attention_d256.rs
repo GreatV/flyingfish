@@ -1176,7 +1176,7 @@ mod tests {
         let mask: Vec<u64> = (0..MASK_LEN)
             .map(|r| {
                 if full {
-                    if r >= valid_rows as usize {
+                    if r >= valid_rows {
                         0
                     } else if valid_rows == 64 {
                         u64::MAX
