@@ -171,7 +171,11 @@ pub(crate) fn fixture(dims: MoeDims, variant: u32) -> MoeFixture {
         router_w[exact.1 * h + c] = tied;
     }
     let near_row = 1usize;
-    let probs = softmax_probs(&router_w, &x[near_row * h..(near_row + 1) * h], experts);
+    let probs = softmax_probs(&router_logits(
+        &router_w,
+        &x[near_row * h..(near_row + 1) * h],
+        experts,
+    ));
     let order = ranking(&probs);
     let near = (order[top_k - 1], order[top_k]);
     let near_margin = (probs[near.0] - probs[near.1]).abs();
@@ -198,21 +202,26 @@ pub(crate) fn fixture(dims: MoeDims, variant: u32) -> MoeFixture {
     }
 }
 
-/// FP32 softmax over the BF16-rounded FP32 dot products of one row.
-fn softmax_probs(router: &[bf16], xr: &[bf16], experts: usize) -> Vec<f32> {
+fn router_logits(router: &[bf16], xr: &[bf16], experts: usize) -> Vec<bf16> {
     let h = xr.len();
-    let logits: Vec<f32> = (0..experts)
+    (0..experts)
         .map(|e| {
             let dot: f32 = xr
                 .iter()
                 .zip(&router[e * h..(e + 1) * h])
                 .map(|(&a, &b)| a.to_f32() * b.to_f32())
                 .sum();
-            bf16::from_f32(dot).to_f32()
+            bf16::from_f32(dot)
         })
-        .collect();
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
+        .collect()
+}
+
+fn softmax_probs(logits: &[bf16]) -> Vec<f32> {
+    let max = logits
+        .iter()
+        .map(|v| v.to_f32())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = logits.iter().map(|l| (l.to_f32() - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     exps.iter().map(|&v| v / sum).collect()
 }
@@ -243,7 +252,14 @@ pub(crate) struct RouteRow {
 pub(crate) fn route_row(fx: &MoeFixture, row: usize) -> RouteRow {
     let (e, k, h) = (fx.dims.experts, fx.dims.top_k, fx.dims.hidden);
     assert!(row < fx.dims.rows);
-    let probs = softmax_probs(&fx.router_w, &fx.x[row * h..(row + 1) * h], e);
+    route_logits(
+        &router_logits(&fx.router_w, &fx.x[row * h..(row + 1) * h], e),
+        k,
+    )
+}
+
+pub(crate) fn route_logits(logits: &[bf16], k: usize) -> RouteRow {
+    let probs = softmax_probs(logits);
     let order = ranking(&probs);
     let top = &order[..k];
     let ids = top.iter().map(|&id| id as i32).collect();

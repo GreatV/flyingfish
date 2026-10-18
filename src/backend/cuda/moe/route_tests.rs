@@ -224,10 +224,8 @@ fn moe_route_gpu() -> Result<()> {
     Ok(())
 }
 
-/// Prefill route arms: rows 37/512/4096 as prefix views of the 4096-row
-/// fixture, ids compared against reference::route_row on rows whose cut
-/// margin exceeds E * 2^-24 * p_cut, weights within BF16 and renormalisation rounding.
-const PREFILL_ROW_CASES: [u32; 3] = [37, 512, 4096];
+/// Prefill logits match the official BF16 GEMM bitwise; softmax/top-k consume those logits.
+const PREFILL_ROW_CASES: [u32; 4] = [8, 37, 512, 4096];
 
 fn official_router_logits(d: &Device, ops: &RouteOps) -> Result<()> {
     use safetensors::{Dtype, SafeTensors};
@@ -348,18 +346,37 @@ fn moe_route_prefill_gpu() -> Result<()> {
     let dims = MoeDims::minicpm47(4096);
     let (e, k, h) = (dims.experts, dims.top_k, dims.hidden);
     let fx = reference::fixture(dims, 0);
-    let refs: HashMap<usize, RouteRow> = checked_rows(4096)
-        .into_iter()
-        .map(|row| (row, reference::route_row(&fx, row)))
-        .collect();
+    let fixtures = std::path::PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+    let raw =
+        std::fs::read(fixtures.join(format!("router_synthetic_sm{}.safetensors", d.info.arch)))?;
+    let stored = safetensors::SafeTensors::deserialize(&raw)?;
+    for (name, values, shape) in [
+        ("x", &fx.x, [dims.rows, h]),
+        ("router", &fx.router_w, [e, h]),
+    ] {
+        let tensor = stored.tensor(name)?;
+        ensure!(
+            tensor.dtype() == safetensors::Dtype::BF16 && tensor.shape() == shape,
+            "synthetic router {name} fixture layout {:?}",
+            tensor.shape()
+        );
+        ensure!(
+            tensor
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(values)
+                .all(|(a, b)| u16::from_le_bytes(*a) == b.to_bits()),
+            "synthetic router {name} fixture input differs"
+        );
+    }
 
     let xb = testing::upload(&d.upload, fx.x.clone())?;
     let rb = testing::upload(&d.upload, fx.router_w.clone())?;
     d.finish_upload()?;
     let mut idsb = testing::zeros::<i32>(s, dims.rows * k)?;
     let mut wb = testing::zeros::<bf16>(s, dims.rows * k)?;
-    let mut fused_idsb = testing::zeros::<i32>(s, dims.rows * k)?;
-    let mut fused_wb = testing::zeros::<bf16>(s, dims.rows * k)?;
     let lb = testing::zeros::<bf16>(s, dims.rows * e)?;
 
     let run = |rows: u32,
@@ -396,6 +413,42 @@ fn moe_route_prefill_gpu() -> Result<()> {
         let rows = checked_rows(case);
         let ids = s.clone_dtoh(&idsb)?;
         let weights = s.clone_dtoh(&wb)?;
+        let actual = s.clone_dtoh(&lb)?;
+        let expected = stored.tensor(&format!("logits_{case}"))?;
+        ensure!(
+            expected.dtype() == safetensors::Dtype::BF16 && expected.shape() == [case as usize, e],
+            "synthetic logits rows={case} fixture layout {:?}",
+            expected.shape()
+        );
+        let logits = expected
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_bits(u16::from_le_bytes(*b)))
+            .collect::<Vec<_>>();
+        let mismatches = actual
+            .iter()
+            .zip(&logits)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        eprintln!(
+            "MOE_ROUTE_SYNTHETIC sm={} rows={case} bit_mismatches={mismatches}",
+            d.info.arch
+        );
+        ensure!(
+            mismatches == 0,
+            "synthetic official logits rows={case} bit_mismatches={mismatches}"
+        );
+        let refs = rows
+            .iter()
+            .map(|&row| {
+                (
+                    row,
+                    reference::route_logits(&logits[row * e..(row + 1) * e], k),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let (a, b) = fx.exact_tie_experts;
         let first = &ids[0..k];
         ensure!(
@@ -414,71 +467,5 @@ fn moe_route_prefill_gpu() -> Result<()> {
         )?;
     }
 
-    // Cross-check at rows 8: the GEMM path and the fused kernel must agree on
-    // ids wherever the reference cut margin exceeds the frozen threshold.
-    let rows = checked_rows(8);
-    ensure!(
-        rows.iter().any(|&row| strict_ids(&refs[&row])),
-        "cross-check needs at least one margin-gated row"
-    );
-    s.memcpy_htod(&vec![-1i32; dims.rows * k], &mut idsb)?;
-    s.memcpy_htod(&vec![bf16::from_f32(-17.0); dims.rows * k], &mut wb)?;
-    run(8, &xb, &rb, &mut idsb, &mut wb)?;
-    s.memcpy_htod(&vec![-1i32; dims.rows * k], &mut fused_idsb)?;
-    s.memcpy_htod(&vec![bf16::from_f32(-17.0); dims.rows * k], &mut fused_wb)?;
-    {
-        let x = testing::dense(&xb, s, dims.rows as u32, h as u32)?.prefix_rows(8)?;
-        let router = testing::dense(&rb, s, e as u32, h as u32)?;
-        let mut ids = TensorMut(
-            testing::dense_mut(&fused_idsb, s, dims.rows as u32, k as u32)?
-                .0
-                .prefix_rows(8)?,
-        );
-        let mut weights = TensorMut(
-            testing::dense_mut(&fused_wb, s, dims.rows as u32, k as u32)?
-                .0
-                .prefix_rows(8)?,
-        );
-        ops.route(s, x, router, &mut ids, &mut weights)?;
-    }
-    s.synchronize()?;
-    let ids = s.clone_dtoh(&idsb)?;
-    let weights = s.clone_dtoh(&wb)?;
-    let fused_ids = s.clone_dtoh(&fused_idsb)?;
-    let fused_weights = s.clone_dtoh(&fused_wb)?;
-    let (a, b) = fx.exact_tie_experts;
-    ensure!(
-        ids[0] as usize == a
-            && ids[1] as usize == b
-            && fused_ids[0] as usize == a
-            && fused_ids[1] as usize == b,
-        "both paths must order the exact-tie pair with the lower id first: prefill {:?} fused {:?}",
-        &ids[..2],
-        &fused_ids[..2]
-    );
-    let mut strict = 0;
-    let mut max_weight_dev = 0.0f32;
-    for &row in &rows {
-        let want = &refs[&row];
-        if !strict_ids(want) {
-            continue;
-        }
-        strict += 1;
-        ensure!(
-            ids[row * k..(row + 1) * k] == fused_ids[row * k..(row + 1) * k],
-            "route cross-check row {row} margin {:e}: prefill ids {:?} != fused {:?}",
-            want.margin,
-            &ids[row * k..(row + 1) * k],
-            &fused_ids[row * k..(row + 1) * k]
-        );
-        for j in 0..k {
-            let dev = (weights[row * k + j].to_f32() - fused_weights[row * k + j].to_f32()).abs();
-            max_weight_dev = max_weight_dev.max(dev);
-        }
-    }
-    ensure!(strict > 0, "route cross-check compared no strict rows");
-    eprintln!(
-        "MOE_ROUTE_CROSSCHECK rows=8 strict_ids={strict} max_weight_dev_vs_fused={max_weight_dev:e} PASS"
-    );
     Ok(())
 }
