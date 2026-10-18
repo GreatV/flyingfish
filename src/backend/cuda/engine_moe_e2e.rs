@@ -8,6 +8,7 @@ struct Bounds {
     layers: std::collections::BTreeMap<usize, [f64; 4]>,
     norm: [f64; 4],
     logits: [f64; 4],
+    decode: [f64; 4],
     media: [f64; 2],
     cross_media: [f64; 2],
 }
@@ -25,6 +26,7 @@ fn ceil_bf16(value: f64) -> Result<f64> {
 }
 
 fn measured_bounds(cells: &[&serde_json::Value]) -> Result<[f64; 4]> {
+    ensure!(!cells.is_empty(), "reference noise has no cells");
     let mut bound = [0.0f64; 4];
     for cell in cells {
         for (index, key) in ["max_abs", "p99_abs", "mean_abs", "cosine_sim"]
@@ -68,40 +70,40 @@ fn media_boundary(measured: &serde_json::Value) -> Result<[f64; 2]> {
 }
 
 impl Bounds {
-    fn read(fixtures: &Path) -> Result<Self> {
+    fn read(fixtures: &Path, case: &str) -> Result<Self> {
         let directory = fixtures.parent().context("reference parent missing")?;
         let noise: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join("noise_floor_r2.json"))?)?;
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join("fixtures_manifest.json"))?)?;
-        let same = &noise["same_precision_bf16_gpu_eager_vs_grouped_mm_experts"];
+        let comparisons = noise["per_case_reference_floor"]["cases"][case]["comparisons"]
+            .as_object()
+            .with_context(|| format!("missing per-case reference noise {case}"))?;
+        ensure!(
+            comparisons.len() == 4,
+            "reference noise {case} needs four comparisons"
+        );
         let mut layers = std::collections::BTreeMap::new();
         for layer in [0, 3, 6, 19, 39] {
             let key = format!("layer_{layer:02}_hidden_last8");
-            let mut cells = vec![
-                &same["tap_layers"][&key],
-                &noise["placement_control"]["layers"][&key],
-            ];
-            match layer {
-                0 => cells.push(&noise["fp32_cpu_single_layer_recompute_floor"]["text_layer_00_linear_attention"]["hidden_last8"]),
-                3 => cells.push(&noise["fp32_cpu_single_layer_recompute_floor"]["text_layer_03_full_attention"]["hidden_last8"]),
-                39 => cells.push(&noise["fp32_cpu_single_layer_recompute_floor"]["text_layer_39_full_attention"]["hidden_last8"]),
-                6 | 19 => {}
-                _ => unreachable!(),
-            }
+            let cells: Vec<_> = comparisons
+                .values()
+                .map(|cell| &cell["layers"][&key])
+                .collect();
             layers.insert(layer, measured_bounds(&cells)?);
         }
+        let cells = |key: &str| {
+            comparisons
+                .values()
+                .map(|cell| &cell[key])
+                .collect::<Vec<_>>()
+        };
         let media = &manifest["image"]["media_reach_controls"];
         Ok(Self {
             layers,
-            norm: measured_bounds(&[
-                &same["end_to_end_tensors"]["final_norm_last"],
-                &noise["placement_control"]["final_norm_last"],
-            ])?,
-            logits: measured_bounds(&[
-                &same["end_to_end_tensors"]["prefill_last_logits_bf16"],
-                &noise["placement_control"]["prefill_last_logits"],
-            ])?,
+            norm: measured_bounds(&cells("norm"))?,
+            logits: measured_bounds(&cells("logits"))?,
+            decode: measured_bounds(&cells("teacher_top2"))?,
             media: media_boundary(&media["same_grid_400x267_hockey_vs_boat_logits_diff"])?,
             cross_media: media_boundary(&media["hockey_16x_vs_boat_16x_logits_diff"])?,
         })
@@ -423,11 +425,11 @@ fn teacher_force(
             })
             .fold(0.0f32, f32::max);
         // Either of the two logits may move by the measured absolute-error bound.
-        let id_margin = bounds.logits[0] + bounds.logits[0];
+        let id_margin = bounds.decode[0] + bounds.decode[0];
         let above_margin = f64::from(margins[step]) > id_margin;
         let id_ok = !above_margin || prediction == ids[step];
         scored += usize::from(above_margin);
-        let pass = f64::from(error) <= bounds.logits[0] && id_ok;
+        let pass = f64::from(error) <= bounds.decode[0] && id_ok;
         defects += usize::from(!pass);
         println!(
             "{} minicpm_teacher {case} step={step} top2_max={error} reference_margin={} id_scored={} predicted={prediction} reference={}",
@@ -446,10 +448,10 @@ fn teacher_force(
     }
     errors.sort_unstable_by(f32::total_cmp);
     let median = errors[errors.len() / 2];
-    defects += usize::from(f64::from(median) > bounds.logits[1]);
+    defects += usize::from(f64::from(median) > bounds.decode[1]);
     println!(
         "{} minicpm_teacher_summary {case} steps={steps} ids_scored={scored} median_top2_error={median}",
-        if f64::from(median) <= bounds.logits[1] {
+        if f64::from(median) <= bounds.decode[1] {
             "PASS"
         } else {
             "DEFECT"
@@ -597,8 +599,22 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
         spec_graph: true,
         kv_format: crate::kv::KvFormat::Bf16,
     };
-    let bounds = Bounds::read(&fixtures)?;
-    println!("minicpm_reference_bounds {bounds:?}");
+    let cases = [
+        "text_32",
+        "text_1k",
+        "text_4k",
+        "image_hockey_16x",
+        "image_boat_16x",
+    ]
+    .into_iter()
+    .map(|case| Ok((case, Bounds::read(&fixtures, case)?)))
+    .collect::<Result<Vec<_>>>()?;
+    let cross_media = cases
+        .first()
+        .context("reference cases missing")?
+        .1
+        .cross_media;
+    println!("minicpm_reference_bounds {cases:?}");
     check_fixtures(&fixtures, &crate::model_spec::ModelSpec::read(&model)?)?;
     Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
     let mut engine = Engine::load(&model, 0, 4352, None, settings)?;
@@ -610,13 +626,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
     );
     let mut defects = 0;
     let mut media_logits = Vec::new();
-    for case in [
-        "text_32",
-        "text_1k",
-        "text_4k",
-        "image_hockey_16x",
-        "image_boat_16x",
-    ] {
+    for (case, bounds) in cases {
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
         let source = SafeTensors::deserialize(&bytes)?;
         let media = case.starts_with("image_");
@@ -691,7 +701,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
         }
     }
     let media = metrics(&media_logits[0], &media_logits[1])?;
-    defects += usize::from(media[0] < bounds.cross_media[0] || media[3] > bounds.cross_media[1]);
+    defects += usize::from(media[0] < cross_media[0] || media[3] > cross_media[1]);
     println!(
         "minicpm_two_media max={} cosine={} defects={defects}",
         media[0], media[3]
