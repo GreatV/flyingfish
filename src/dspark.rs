@@ -241,6 +241,77 @@ mod tests {
         );
         assert!(accept(&[3, 4, 5], &[3, 4, 5]).is_err());
     }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn target_capture_metadata_preserves_slots_and_rejects_bad_extents() -> Result<()> {
+        let target: Config = serde_json::from_value(serde_json::json!({
+            "model_type":"llama", "hidden_size":2048, "intermediate_size":6144,
+            "num_hidden_layers":42, "num_attention_heads":16, "num_key_value_heads":2,
+            "head_dim":128, "vocab_size":130560, "max_position_embeddings":32768,
+            "rms_norm_eps":1e-6, "rope_theta":5000000.0, "rope_scaling":null,
+            "hidden_act":"silu", "tie_word_embeddings":false,
+            "torch_dtype":"bfloat16", "eos_token_id":[2]
+        }))?;
+        let ids = [39usize, 1, 30, 10, 20];
+        let flat = serde_json::json!({
+            "architectures":["Qwen3DSparkModel"], "hidden_size":2048,
+            "vocab_size":130560, "num_target_layers":42, "target_layer_ids":ids
+        });
+        let mut nested = flat.clone();
+        nested
+            .as_object_mut()
+            .context("capture config object")?
+            .remove("target_layer_ids");
+        nested["dflash_config"] = serde_json::json!({"target_layer_ids":ids});
+        let root = std::env::temp_dir().join(format!(
+            "flyingfish-capture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let write = |value: &serde_json::Value| -> Result<()> {
+                Ok(std::fs::write(
+                    root.join("config.json"),
+                    serde_json::to_vec(value)?,
+                )?)
+            };
+            for value in [&flat, &nested] {
+                write(value)?;
+                ensure!(
+                    read_capture_layers(&root, &target)? == ids,
+                    "capture slot order changed"
+                );
+            }
+            ensure!(
+                serde_json::from_value::<Vec<usize>>(nested["target_layer_ids"].clone()).is_err(),
+                "flat-only capture control accepted nested metadata"
+            );
+            let mut invalid = vec![flat.clone(); 7];
+            invalid[0]["dflash_config"] = serde_json::json!({"target_layer_ids":ids});
+            invalid[1]["target_layer_ids"] = serde_json::json!([1, 10, 20, 30, 42]);
+            invalid[2]["target_layer_ids"] = serde_json::json!([1, 10, 20, 30, 30]);
+            invalid[3]["target_layer_ids"] = serde_json::json!([1, 10, 20, 30]);
+            invalid[4]["hidden_size"] = serde_json::json!(5120);
+            invalid[5]["vocab_size"] = serde_json::json!(248144);
+            invalid[6]["num_target_layers"] = serde_json::json!(40);
+            for value in invalid {
+                write(&value)?;
+                ensure!(
+                    read_capture_layers(&root, &target).is_err(),
+                    "invalid capture extent admitted"
+                );
+            }
+            Ok(())
+        })();
+        let cleanup = std::fs::remove_dir_all(root);
+        result?;
+        cleanup?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
