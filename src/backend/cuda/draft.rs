@@ -12,7 +12,7 @@ use super::{
     weights::{Layer, checkpoint},
 };
 use crate::{config::Config, dspark::DraftConfig, trace::Trace};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg};
 use half::bf16;
 use std::{path::Path, sync::Arc};
@@ -296,38 +296,30 @@ fn norm(
 }
 
 impl Draft {
-    pub(super) fn calibrate_injection(
+    pub(super) fn calibrate_shape(
         &self,
         blas: &mut Blas,
         input: &cudarc::driver::CudaView<'_, bf16>,
         shape: crate::backend::setup::LinearShape,
     ) -> Result<()> {
-        if shape.input == self.config.capture_width() && shape.output == self.config.hidden_size {
-            blas.calibrate_shape(&self.weights.fc, input, shape)
-        } else if shape.input == self.config.hidden_size
-            && shape.output == self.config.num_key_value_heads * self.config.head_dim
-        {
-            let h = self.config.hidden_size;
-            let kv = shape.output;
-            let weight = self.weights.layers[0].block.qkv.slice(h * h..(h + kv) * h);
-            blas.calibrate_shape(&weight, input, shape)
-        } else if shape.input == self.config.hidden_size
-            && shape.output == 2 * self.config.intermediate_size
-        {
-            blas.calibrate_shape(&self.weights.layers[0].block.gu, input, shape)
-        } else if shape.input == self.config.intermediate_size
-            && shape.output == self.config.hidden_size
-        {
-            blas.calibrate_shape(&self.weights.layers[0].block.down, input, shape)
-        } else {
-            ensure!(
-                shape.rows == 1
-                    && shape.input == self.config.markov_rank
-                    && shape.output == self.config.vocab_size,
-                "unknown draft calibration shape: {shape:?}"
-            );
-            blas.calibrate_shape(&self.weights.w2, input, shape)
-        }
+        let c = &self.config;
+        let h = c.hidden_size;
+        let kv = c.kv_dim();
+        let layer = &self.weights.layers[0].block;
+        let weights = [
+            (c.qkv_dim(), h, layer.qkv.slice(..)),
+            (h, h, layer.o.slice(..)),
+            (2 * c.intermediate_size, h, layer.gu.slice(..)),
+            (h, c.intermediate_size, layer.down.slice(..)),
+            (h, c.capture_width(), self.weights.fc.slice(..)),
+            (kv, h, layer.qkv.slice(h * h..(h + kv) * h)),
+            (c.vocab_size, c.markov_rank, self.weights.w2.slice(..)),
+        ];
+        let (_, _, weight) = weights
+            .into_iter()
+            .find(|(output, input, _)| *output == shape.output && *input == shape.input)
+            .with_context(|| format!("unknown draft calibration shape: {shape:?}"))?;
+        blas.calibrate_shape(&weight, input, shape)
     }
     pub(super) fn reset_setup(&mut self) -> Result<()> {
         let block_rows = self.config.block_size;

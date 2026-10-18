@@ -4126,7 +4126,7 @@ impl Engine {
                         .as_ref()
                         .context("draft shape without draft")?
                         .draft
-                        .calibrate_injection(&mut self.blas, &input.slice(..), shape)?;
+                        .calibrate_shape(&mut self.blas, &input.slice(..), shape)?;
                 }
             }
         } else {
