@@ -289,6 +289,53 @@ impl Views<'_> {
     }
 }
 
+struct HiddenCapture {
+    values: CudaSlice<bf16>,
+    layer_slots: Vec<Option<u32>>,
+    taps: usize,
+    width: usize,
+}
+
+impl HiddenCapture {
+    fn new(ids: &[usize], config: &Config, rows: usize, stream: &Arc<CudaStream>) -> Result<Self> {
+        let mut layer_slots = vec![None; config.num_hidden_layers];
+        for (slot, &layer) in ids.iter().enumerate() {
+            // Slots store decoder-layer outputs, hidden_states[layer + 1].
+            let entry = layer_slots
+                .get_mut(layer)
+                .context("capture layer outside target")?;
+            ensure!(entry.is_none(), "duplicate capture layer {layer}");
+            *entry = Some(u32::try_from(slot)?);
+        }
+        let width = ids
+            .len()
+            .checked_mul(config.hidden_size)
+            .filter(|&width| width > 0 && width <= i32::MAX as usize)
+            .context("capture row width overflow")?;
+        let elements = rows
+            .checked_mul(width)
+            .and_then(|n| n.checked_mul(size_of::<bf16>()))
+            .context("capture allocation size overflow")?
+            / size_of::<bf16>();
+        Ok(Self {
+            values: stream.alloc_zeros(elements)?,
+            layer_slots,
+            taps: ids.len(),
+            width,
+        })
+    }
+
+    fn grow(&mut self, rows: usize, stream: &Arc<CudaStream>) -> Result<()> {
+        let elements = rows
+            .checked_mul(self.width)
+            .and_then(|n| n.checked_mul(size_of::<bf16>()))
+            .context("capture allocation size overflow")?
+            / size_of::<bf16>();
+        self.values = stream.alloc_zeros(elements)?;
+        Ok(())
+    }
+}
+
 struct Spec {
     eos: Vec<u32>,
     tree_verify_graph: Option<CudaGraph>,
@@ -303,7 +350,6 @@ struct Spec {
     graph: bool,
     verification: Option<super::verification::Verification>,
     draft: super::draft::Draft,
-    capture: CudaSlice<bf16>,
     logits: CudaSlice<bf16>,
     predictions: CudaSlice<u32>,
     row_counts: CudaSlice<i32>,
@@ -406,6 +452,7 @@ pub struct Engine {
     profile_rounds: bool,
     runtime: PathBuf,
     spec: Option<Spec>,
+    hidden_capture: Option<HiddenCapture>,
     qwen: Option<qwen::Runtime>,
     mtp: Option<mtp::Chain>,
     mtp_state: Option<super::state::StateStore>,
@@ -731,6 +778,7 @@ impl Engine {
             profile_rounds: false,
             runtime,
             spec: None,
+            hidden_capture: None,
             graph: None,
             weights,
             state,
@@ -772,6 +820,12 @@ impl Engine {
                 engine.workspace_rows,
                 &mut engine.blas,
             )?;
+            engine.hidden_capture = Some(HiddenCapture::new(
+                &draft.config.target_layer_ids,
+                &engine.config,
+                engine.workspace_rows,
+                &engine.device.stream,
+            )?);
             engine.prepare(8)?;
             engine
                 .blas
@@ -811,7 +865,6 @@ impl Engine {
                 inject_graphs: (0..8).map(|_| None).collect(),
                 verification: None,
                 draft,
-                capture: s.alloc_zeros(engine.workspace_rows * 5 * engine.config.hidden_size)?,
                 logits: s.alloc_zeros(rows * engine.config.vocab_size)?,
                 predictions: s.alloc_zeros(rows)?,
                 row_counts,
@@ -853,10 +906,9 @@ impl Engine {
                 .grow(&self.device.stream, &self.model_spec, rows)?;
             if let Some(spec) = &mut self.spec {
                 spec.draft.grow(&self.config, rows)?;
-                spec.capture = self
-                    .device
-                    .stream
-                    .alloc_zeros(rows * 5 * self.config.hidden_size)?;
+            }
+            if let Some(capture) = &mut self.hidden_capture {
+                capture.grow(rows, &self.device.stream)?;
             }
         }
         if rows != old_rows || chunk != old_chunk {
@@ -882,7 +934,14 @@ impl Engine {
             free,
             total,
             Flash::tile(self.config.head_dim)?,
-            self.spec.is_some(),
+            self.hidden_capture
+                .as_ref()
+                .map_or(0, |capture| capture.width * 2)
+                + if self.spec.is_some() {
+                    (2 * self.config.hidden_size + 5 * self.config.kv_dim()) * 2
+                } else {
+                    0
+                },
         )?;
         let rows = self.spec_budget.workspace_rows(plan.chunk);
         let required = rows
@@ -1605,17 +1664,16 @@ impl Engine {
                 } else {
                     &self.weights.norm
                 };
-                if let Some(spec) = self.spec.as_mut()
-                    && let Some(slot) =
-                        crate::dspark::capture_slot(&spec.draft.config.target_layer_ids, i)
+                if let Some(binding) = self.hidden_capture.as_mut()
+                    && let Some(slot) = binding.layer_slots[i]
                 {
                     use super::contracts::TensorMut;
                     use super::ops::{ResidualRmsCapture, ResidualRmsInput, RmsMode, RmsOptions};
-                    let taps = spec.draft.config.target_layer_ids.len();
+                    let taps = binding.taps;
                     let mut x = TensorMut(qwen::heads(&w.x, s, 0, rows, 1, h as u32)?);
                     let mut y = TensorMut(qwen::heads(&w.n, s, 0, rows, 1, h as u32)?);
                     let mut capture = TensorMut(qwen::view(
-                        &spec.capture,
+                        &binding.values,
                         s,
                         0,
                         [rows as u32, taps as u32, h as u32],
@@ -1631,7 +1689,7 @@ impl Engine {
                                 weight: qwen::vector(weight, s)?,
                             },
                             capture: &mut capture,
-                            slot: slot as u32,
+                            slot,
                         },
                         &mut y,
                         RmsOptions {
@@ -2886,7 +2944,14 @@ impl Engine {
     fn tree_gather_scatter(&mut self) -> Result<()> {
         let spec = self.spec.as_mut().context("draft State is not enabled")?;
         let state = spec.tree.as_mut().context("tree State is not enabled")?;
-        state.gather_path(&self.state.kv, &spec.capture)?;
+        state.gather_path(
+            &self.state.kv,
+            &self
+                .hidden_capture
+                .as_ref()
+                .context("target capture missing")?
+                .values,
+        )?;
         state.scatter(&mut self.state.kv)
     }
 
@@ -2979,10 +3044,14 @@ impl Engine {
             .as_ref()
             .context("tree State is not enabled")?
             .rows();
+        let capture = self
+            .hidden_capture
+            .as_ref()
+            .context("target capture missing")?;
         Ok(self
             .device
             .stream
-            .clone_dtoh(&spec.capture.slice(..rows * 5 * self.config.hidden_size))?
+            .clone_dtoh(&capture.values.slice(..rows * capture.width))?
             .into_iter()
             .map(bf16::to_f32)
             .collect())
@@ -3199,7 +3268,11 @@ impl Engine {
     ) -> Result<()> {
         let spec = self.spec.as_mut().context("draft state is not enabled")?;
         spec.draft.inject(
-            &spec.capture,
+            &self
+                .hidden_capture
+                .as_ref()
+                .context("target capture missing")?
+                .values,
             rows,
             start,
             super::draft::Compute {
@@ -3251,7 +3324,11 @@ impl Engine {
             SpecPhase::Inject(rows) => {
                 let spec = self.spec.as_mut().context("draft is not enabled")?;
                 spec.draft.inject_device(
-                    &spec.capture,
+                    &self
+                        .hidden_capture
+                        .as_ref()
+                        .context("target capture missing")?
+                        .values,
                     rows,
                     start,
                     &self.work.position,
@@ -3375,6 +3452,10 @@ impl Engine {
         mut trace: Option<&mut Trace>,
         prefix: &str,
     ) -> Result<crate::dspark::Round> {
+        ensure!(
+            self.qwen.is_none(),
+            "Qwen DSpark proposal/verification execution is not bound"
+        );
         self.closure.assert_ready()?;
         if self.spec_budget.is_tree() {
             return self.tree_round(limit, trace, prefix);
@@ -3811,16 +3892,20 @@ impl Engine {
             rows > 0 && (rows > 16 || rows <= limit),
             "injection rows {rows} exceed declared small-row limit {limit}"
         );
+        ensure!(self.spec.is_some(), "draft is not enabled");
+        let capture = self
+            .hidden_capture
+            .as_mut()
+            .context("target capture missing")?;
         ensure!(
-            hidden.len() == rows * 5 * self.config.hidden_size,
+            rows.checked_mul(capture.width) == Some(hidden.len()),
             "injected hidden shape mismatch"
         );
-        let spec = self.spec.as_mut().context("draft is not enabled")?;
         ensure!(rows <= self.workspace_rows, "injection exceeds workspace");
         let values: Vec<bf16> = hidden.iter().copied().map(bf16::from_f32).collect();
         self.device
             .stream
-            .memcpy_htod(&values, &mut spec.capture.slice_mut(..values.len()))?;
+            .memcpy_htod(&values, &mut capture.values.slice_mut(..values.len()))?;
         self.inject_capture(rows, start, None)
     }
 
@@ -3832,6 +3917,10 @@ impl Engine {
         prefix: &str,
         forced: Option<&[u32]>,
     ) -> Result<Vec<u32>> {
+        ensure!(
+            self.qwen.is_none(),
+            "Qwen DSpark proposal execution is not bound"
+        );
         let spec = self.spec.as_mut().context("draft is not enabled")?;
         spec.draft.setup_attention(
             &self.device,
@@ -4230,11 +4319,12 @@ impl Engine {
         }
         s.memset_zeros(&mut self.work.ids)?;
         s.memset_zeros(&mut self.work.token)?;
+        if let Some(capture) = &mut self.hidden_capture {
+            s.memset_zeros(&mut capture.values)?;
+        }
         if let Some(spec) = &mut self.spec {
             spec.draft.reset_setup()?;
-            for value in [&mut spec.capture, &mut spec.logits] {
-                s.memset_zeros(value)?;
-            }
+            s.memset_zeros(&mut spec.logits)?;
             s.memset_zeros(&mut spec.predictions)?;
             spec.active_rows = 0;
             if let Some(tree) = &mut spec.tree {

@@ -34,6 +34,7 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
     Engine::calibrate(&target, 0, 33824, Some(16), settings.clone())?;
     let mut model = Engine::load(&target, 0, 33824, Some(1024), settings)?;
     model.check_ready()?;
+    model.profiler_start()?;
     for kv in &model.state.kv {
         for head in 0..model.config.num_key_value_heads {
             let lo = head * model.capacity * model.config.head_dim;
@@ -109,6 +110,7 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
     println!(
         "closure_target_graph rows1..17/1k/8k/32k token/logits/KV bitwise PASS; unwritten KV poisoned"
     );
+    model.profiler_stop()?;
     drop(model);
     let draft = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
     let settings = Settings {
@@ -400,6 +402,224 @@ fn chain_argmax_matches_single_on_real_logits() -> Result<()> {
         "{}",
         serde_json::json!({"chain_argmax_equivalence_summary":{"prompts":13,"rounds":rounds,"predictions_compared":compared,"pass":true}})
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU window and FF_ARGMAX_MODEL/FF_ARGMAX_DRAFT/FLYINGFISH_RUNTIME_DIR"]
+fn target_hidden_capture_gpu() -> Result<()> {
+    use cudarc::driver::DevicePtr;
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
+    let draft = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
+    let settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: false,
+        draft_model: None,
+        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut model = Engine::load_kind(&target, 0, 128, Some(17), settings, true)?;
+    ensure!(
+        model.qwen.is_none(),
+        "Llama operator capture fixture required"
+    );
+    let layers = crate::dspark::read_capture_layers(&draft, &model.config)?;
+    let mut capture = Some(HiddenCapture::new(
+        &layers,
+        &model.config,
+        model.workspace_rows,
+        &model.device.stream,
+    )?);
+    let s = model.device.stream.clone();
+    let h = model.config.hidden_size;
+    let width = capture.as_ref().context("capture missing")?.width;
+    let poison = bf16::from_f32(-17.0);
+    let prepare = |model: &mut Engine, start: usize, ids: &[u32]| -> Result<()> {
+        model.position = start;
+        model
+            .device
+            .stream
+            .memcpy_htod(ids, &mut model.work.ids.slice_mut(..ids.len()))?;
+        model
+            .device
+            .stream
+            .memcpy_htod(&[start as i32], &mut model.work.position)?;
+        model
+            .device
+            .stream
+            .memcpy_htod(&[(start + ids.len()) as i32], &mut model.work.length)?;
+        Ok(())
+    };
+    let run =
+        |model: &mut Engine, start: usize, ids: &[u32], trace: Option<&mut Trace>| -> Result<()> {
+            prepare(model, start, ids)?;
+            model.forward(
+                ids.len(),
+                false,
+                true,
+                trace.map(|trace| Target {
+                    trace,
+                    prefix: "tap",
+                    skip: 0,
+                }),
+            )
+        };
+    let state = |model: &Engine| -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for layer in &model.state.kv {
+            for value in [&layer.k, &layer.v] {
+                copy::bits(&s, value, &mut out)?;
+            }
+        }
+        for value in [&model.work.x, &model.work.n, &model.work.logits] {
+            copy::bits(&s, value, &mut out)?;
+        }
+        Ok(out)
+    };
+    let mut defects = 0;
+    let mut cells = 0;
+    let mut graph_replays = 0;
+    let mut wrong_mismatches = 0;
+    for prefix in [0usize, 7, 17] {
+        for rows in [1usize, 2, 5, 17] {
+            let ids: Vec<_> = (0..prefix + rows).map(|i| (i * 263 + 17) as u32).collect();
+            model.hidden_capture = None;
+            model.reset()?;
+            if prefix > 0 {
+                run(&mut model, 0, &ids[..prefix], None)?;
+            }
+            let mut baseline_trace = Trace::default();
+            run(
+                &mut model,
+                prefix,
+                &ids[prefix..],
+                Some(&mut baseline_trace),
+            )?;
+            model.check_logits()?;
+            let baseline = state(&model)?;
+            model.hidden_capture = capture.take();
+            model.reset()?;
+            if prefix > 0 {
+                run(&mut model, 0, &ids[..prefix], None)?;
+            }
+            let binding = model.hidden_capture.as_mut().context("capture missing")?;
+            let pointer = binding.values.device_ptr(&s).0;
+            s.memcpy_htod(&vec![poison; binding.values.len()], &mut binding.values)?;
+            let mut trace = Trace::default();
+            run(&mut model, prefix, &ids[prefix..], Some(&mut trace))?;
+            model.check_logits()?;
+            let binding = model.hidden_capture.as_ref().context("capture missing")?;
+            let actual = s.clone_dtoh(&binding.values)?;
+            ensure!(
+                actual.iter().all(|x| x.to_f32().is_finite()),
+                "non-finite target capture"
+            );
+            let mut expected = vec![poison; actual.len()];
+            let mut mismatches = 0;
+            for (slot, layer) in layers.iter().enumerate() {
+                let name = format!("tap.layer.{layer}");
+                let values = baseline_trace.values(&name)?;
+                ensure!(
+                    values.len() == rows * h && values.iter().all(|x| x.is_finite()),
+                    "target trace shape/finiteness"
+                );
+                let enabled = trace.values(&name)?;
+                mismatches += values
+                    .iter()
+                    .zip(enabled)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                for row in 0..rows {
+                    for d in 0..h {
+                        expected[row * width + slot * h + d] = bf16::from_f32(values[row * h + d]);
+                    }
+                }
+            }
+            mismatches += actual
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(mismatches != 0 || state(&model)? != baseline);
+            prepare(&mut model, prefix, &ids[prefix..])?;
+            s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            let launched = model.forward(rows, false, true, None);
+            let graph = s.end_capture(sys::CUgraphInstantiate_flags(0))?;
+            launched?;
+            let graph = graph.context("target capture graph missing")?;
+            for _ in 0..2 {
+                model.reset()?;
+                if prefix > 0 {
+                    run(&mut model, 0, &ids[..prefix], None)?;
+                }
+                prepare(&mut model, prefix, &ids[prefix..])?;
+                let binding = model.hidden_capture.as_mut().context("capture missing")?;
+                s.memcpy_htod(&vec![poison; binding.values.len()], &mut binding.values)?;
+                ensure!(
+                    binding.values.device_ptr(&s).0 == pointer,
+                    "capture graph pointer moved"
+                );
+                graph.launch()?;
+                s.synchronize()?;
+                let values = s.clone_dtoh(
+                    &model
+                        .hidden_capture
+                        .as_ref()
+                        .context("capture missing")?
+                        .values,
+                )?;
+                ensure!(
+                    values.iter().all(|x| x.to_f32().is_finite()),
+                    "non-finite graph target capture"
+                );
+                defects += usize::from(values != expected || state(&model)? != baseline);
+                graph_replays += 1;
+            }
+            if prefix == 7 && rows == 17 {
+                let mut wrong = layers.clone();
+                wrong[0] += 1;
+                let mut binding =
+                    HiddenCapture::new(&wrong, &model.config, model.workspace_rows, &s)?;
+                s.memcpy_htod(&vec![poison; binding.values.len()], &mut binding.values)?;
+                let healthy = model.hidden_capture.replace(binding);
+                model.reset()?;
+                run(&mut model, 0, &ids[..prefix], None)?;
+                run(&mut model, prefix, &ids[prefix..], None)?;
+                let values = s.clone_dtoh(
+                    &model
+                        .hidden_capture
+                        .as_ref()
+                        .context("capture missing")?
+                        .values,
+                )?;
+                for row in 0..rows {
+                    wrong_mismatches += values[row * width..row * width + h]
+                        .iter()
+                        .zip(&expected[row * width..row * width + h])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                }
+                defects += usize::from(wrong_mismatches == 0);
+                model.hidden_capture = healthy;
+            }
+            println!(
+                "TARGET_CAPTURE operator=Llama prefix={prefix} rows={rows} taps={layers:?} bit_mismatches={mismatches} defects={defects}"
+            );
+            capture = model.hidden_capture.take();
+            cells += 1;
+        }
+    }
+    println!(
+        "TARGET_HIDDEN_CAPTURE operator=Llama cells={cells} graph_replays={graph_replays} wrong_layer_bit_mismatches={wrong_mismatches} defects={defects} {}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "target capture has {defects} finite defects");
     Ok(())
 }
 

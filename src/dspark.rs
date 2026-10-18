@@ -147,6 +147,36 @@ impl DraftConfig {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub(crate) fn read_capture_layers(path: &Path, target: &Config) -> Result<Vec<usize>> {
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+    ensure!(
+        value["architectures"] == serde_json::json!(["Qwen3DSparkModel"]),
+        "unsupported capture draft architecture"
+    );
+    for (name, expected) in [
+        ("hidden_size", target.hidden_size),
+        ("vocab_size", target.vocab_size),
+        ("num_target_layers", target.num_hidden_layers),
+    ] {
+        ensure!(
+            value[name].as_u64() == Some(u64::try_from(expected)?),
+            "capture draft/target {name} mismatch"
+        );
+    }
+    let flat = value.get("target_layer_ids");
+    let nested = value
+        .get("dflash_config")
+        .and_then(|config| config.get("target_layer_ids"));
+    let ids: Vec<usize> = match (flat, nested) {
+        (Some(ids), None) | (None, Some(ids)) => serde_json::from_value(ids.clone())?,
+        _ => anyhow::bail!("capture config requires exactly one target_layer_ids field"),
+    };
+    check_capture_layers(&ids, target.num_hidden_layers)?;
+    Ok(ids)
+}
+
 fn check_capture_layers(ids: &[usize], target_layers: usize) -> Result<()> {
     ensure!(
         ids.len() == 5 && ids.iter().all(|&i| i < target_layers),
@@ -181,11 +211,6 @@ pub fn accept(proposals: &[u32], predictions: &[u32]) -> Result<Accept> {
         proposals: matched,
         bonus: predictions[matched],
     })
-}
-
-// target_layer_ids 中 i 指 decoder 层 i 的输出，即 hidden_states[i + 1]。
-pub fn capture_slot(ids: &[usize], decoder_layer: usize) -> Option<usize> {
-    ids.iter().position(|&i| i == decoder_layer)
 }
 
 #[cfg(test)]

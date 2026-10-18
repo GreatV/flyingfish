@@ -5,7 +5,7 @@ use crate::backend::cuda::{
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
     gdn::{CUDA_GRID_YZ_MAX, GdnBindings, GdnOps, GdnPlan},
     linear::{LayerLinearPlan, LinearWeightRef},
-    ops::{CommonOpsRef, GatedRmsInput, ResidualRmsInput, RmsMode, RmsOptions},
+    ops::{CommonOpsRef, GatedRmsInput, ResidualRmsCapture, ResidualRmsInput, RmsMode, RmsOptions},
     weights::WeightCatalog,
 };
 /// The workspace alignment the default-chunk cap must preserve; the same value the budget call passes.
@@ -961,10 +961,26 @@ impl Engine {
         let attention = FullAttentionSpec::from_model(&model_spec)?;
         let gdn = GdnSpec::from_model(&model_spec)?;
         let kv_width = attention.hkv * attention.d;
+        let config = model_spec.config();
+        let capture_layers = settings
+            .draft_model
+            .as_deref()
+            .map(|path| crate::dspark::read_capture_layers(path, &config))
+            .transpose()?;
         ensure!(
-            settings.draft_model.is_none(),
-            "Q38 MTP/tree execution is not bound"
+            !settings.spec_budget.is_tree(),
+            "Qwen DSpark proposal/tree execution is not bound"
         );
+        let capture_row_bytes = capture_layers
+            .as_ref()
+            .map(|ids| {
+                ids.len()
+                    .checked_mul(config.hidden_size)
+                    .and_then(|n| n.checked_mul(size_of::<bf16>()))
+                    .context("capture row byte count overflow")
+            })
+            .transpose()?
+            .unwrap_or(0);
         ensure!(
             capacity >= 32 && capacity <= model_spec.max_position as usize,
             "invalid Q38 capacity"
@@ -1074,6 +1090,7 @@ impl Engine {
                 alignment: CHUNK_ALIGNMENT,
                 row_bytes: Runtime::row_bytes(&model_spec)?
                     .checked_add(mtp_budget.as_ref().map_or(0, |b| b.row_bytes))
+                    .and_then(|bytes| bytes.checked_add(capture_row_bytes))
                     .context("combined row bytes overflow")?,
                 fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
                     .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
@@ -1137,6 +1154,7 @@ impl Engine {
                 "kv_format": settings.kv_format.tag(),
                 "kv_prefill_scratch_bytes": kv_scratch.as_ref().map_or(0,|(k,v)|(k.len()+v.len())*size_of::<bf16>()),
                 "capture_checkpoint_bytes": capture_checkpoint.as_ref().context("capture checkpoint missing")?.bytes(),
+                "target_hidden_capture_bytes": rows.checked_mul(capture_row_bytes).context("capture byte count overflow")?,
                 "layer_arena_bytes": arena_bytes,
                 "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?.bytes,
                 "attention_prefill_lse_bytes": rows * model_spec.q_heads as usize * size_of::<f32>(),
@@ -1156,7 +1174,10 @@ impl Engine {
         let scratch_buffer = s.alloc_zeros::<u8>(target_workspace)?;
         let work = Work::new(s, &model_spec, rows)?;
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
-        let config = model_spec.config();
+        let hidden_capture = capture_layers
+            .as_ref()
+            .map(|ids| HiddenCapture::new(ids, &config, rows, s))
+            .transpose()?;
         let mut engine = Self {
             #[cfg(test)]
             capture_fail_after_layer: None,
@@ -1175,6 +1196,7 @@ impl Engine {
             profile_rounds: false,
             runtime,
             spec: None,
+            hidden_capture,
             weights,
             state,
             capture_checkpoint,
@@ -1614,17 +1636,24 @@ impl Engine {
                 trace_value(trace, s, "embed", &w.x, rows, h)?;
             }
             O::Norm => {
-                q.common.norm.rms_with(
-                    s,
-                    domain,
-                    heads(&w.x, s, 0, rows, 1, h as u32)?,
-                    layer.input_norm,
-                    &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
-                    RmsOptions {
-                        mode: RmsMode::ZeroCentered,
-                        eps: self.model_spec.rms_eps,
-                    },
-                )?;
+                if i == 0
+                    || !self
+                        .hidden_capture
+                        .as_ref()
+                        .is_some_and(|capture| capture.layer_slots[i - 1].is_some())
+                {
+                    q.common.norm.rms_with(
+                        s,
+                        domain,
+                        heads(&w.x, s, 0, rows, 1, h as u32)?,
+                        layer.input_norm,
+                        &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                        RmsOptions {
+                            mode: RmsMode::ZeroCentered,
+                            eps: self.model_spec.rms_eps,
+                        },
+                    )?;
+                }
                 if all_layers(trace) || i == self.trace_layer {
                     let name = debug_name(trace, i, "norm1");
                     trace_value(trace, s, &name, &w.n, rows, h)?;
@@ -1653,15 +1682,54 @@ impl Engine {
                         trace_value(trace, s, &name, &w.n, rows, h)?;
                     }
                 } else {
-                    unsafe {
-                        s.launch_builder(&self.ops.residual)
-                            .arg(&mut w.x)
-                            .arg(&w.out)
-                            .arg(&((rows * h) as i32))
-                            .launch(flat(rows * h))?;
+                    if let Some(capture) = &mut self.hidden_capture
+                        && let Some(slot) = capture.layer_slots[i]
+                    {
+                        let weight = if let Some(next) = q.layers.get(i + 1) {
+                            next.input_norm
+                        } else {
+                            vector(&self.weights.norm, s)?
+                        };
+                        self.ops.add_rmsnorm_capture(
+                            s,
+                            Some(domain),
+                            ResidualRmsCapture {
+                                input: ResidualRmsInput {
+                                    x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                                    residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                    weight,
+                                },
+                                capture: &mut TensorMut(view(
+                                    &capture.values,
+                                    s,
+                                    0,
+                                    [rows as u32, capture.taps as u32, h as u32],
+                                    [capture.width as u64, h as u64, 1],
+                                )?),
+                                slot,
+                            },
+                            &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                            RmsOptions {
+                                mode: RmsMode::ZeroCentered,
+                                eps: self.model_spec.rms_eps,
+                            },
+                        )?;
+                    } else {
+                        unsafe {
+                            s.launch_builder(&self.ops.residual)
+                                .arg(&mut w.x)
+                                .arg(&w.out)
+                                .arg(&((rows * h) as i32))
+                                .launch(flat(rows * h))?;
+                        }
                     }
                     if trace.is_some()
-                        && (!all_layers(trace) || [0, 3, 7, 31, 32, 47, 63].contains(&i))
+                        && (!all_layers(trace)
+                            || [0, 3, 7, 31, 32, 47, 63].contains(&i)
+                            || self
+                                .hidden_capture
+                                .as_ref()
+                                .is_some_and(|capture| capture.layer_slots[i].is_some()))
                     {
                         let name = if all_layers(trace) {
                             i.to_string()
@@ -1707,17 +1775,21 @@ impl Engine {
                     step.head == Head::Last,
                     "Q38 all-row speculative head is not bound"
                 );
-                q.common.norm.rms_with(
-                    s,
-                    domain,
-                    heads(&w.x, s, 0, rows, 1, h as u32)?,
-                    vector(&self.weights.norm, s)?,
-                    &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
-                    RmsOptions {
-                        mode: RmsMode::ZeroCentered,
-                        eps: self.model_spec.rms_eps,
-                    },
-                )?;
+                if !self.hidden_capture.as_ref().is_some_and(|capture| {
+                    capture.layer_slots[self.model_spec.layers.len() - 1].is_some()
+                }) {
+                    q.common.norm.rms_with(
+                        s,
+                        domain,
+                        heads(&w.x, s, 0, rows, 1, h as u32)?,
+                        vector(&self.weights.norm, s)?,
+                        &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                        RmsOptions {
+                            mode: RmsMode::ZeroCentered,
+                            eps: self.model_spec.rms_eps,
+                        },
+                    )?;
+                }
                 self.blas.linear_typed(
                     phase,
                     LinearWeightRef::Bf16(matrix(
