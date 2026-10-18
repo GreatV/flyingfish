@@ -3226,7 +3226,7 @@ fn residual_rms_capture_gpu() -> Result<()> {
                     [total as u32, 5, hidden as u32],
                     [(5 * hidden) as u64, hidden as u64, 1],
                 )?);
-                let mut baseline_view = TensorMut(view(&baseline, stream, shape, strides)?);
+                let baseline_view = TensorMut(view(&baseline, stream, shape, strides)?);
                 let mut baseline_output =
                     TensorMut(view(&baseline_normalized, stream, shape, strides)?);
                 let options = RmsOptions { mode, eps: 1e-6 };
