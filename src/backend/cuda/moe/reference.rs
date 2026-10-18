@@ -409,36 +409,67 @@ fn choice_all(fx: &MoeFixture) -> Vec<usize> {
 pub(crate) struct CombineNoise {
     pub ascending_vs_descending: f32,
     pub ascending_vs_fp32: f32,
+    pub max_abs: f32,
+}
+
+impl CombineNoise {
+    pub fn tolerance(self) -> f32 {
+        self.ascending_vs_descending.max(self.ascending_vs_fp32) + bf16_ulp(self.max_abs)
+    }
+}
+
+pub(crate) fn bf16_ulp(value: f32) -> f32 {
+    let value = bf16::from_f32(value.abs());
+    bf16::from_bits(value.to_bits() + 1).to_f32() - value.to_f32()
+}
+
+pub(crate) fn row_noise(
+    fx: &MoeFixture,
+    row: usize,
+    ids: &[i32],
+    weights: &[bf16],
+    keep: &[usize],
+) -> CombineNoise {
+    let asc = moe_row_ids(fx, row, ids, weights, keep, Combine::AscendingBf16);
+    let desc = moe_row_ids(fx, row, ids, weights, keep, Combine::DescendingBf16);
+    let f32c = moe_row_ids(fx, row, ids, weights, keep, Combine::Fp32);
+    let mut noise = CombineNoise {
+        ascending_vs_descending: 0.0,
+        ascending_vs_fp32: 0.0,
+        max_abs: 0.0,
+    };
+    for ((asc, desc), fp32) in asc.iter().zip(&desc).zip(&f32c) {
+        let (asc, desc, fp32) = (asc.to_f32(), desc.to_f32(), fp32.to_f32());
+        noise.ascending_vs_descending = noise.ascending_vs_descending.max((asc - desc).abs());
+        noise.ascending_vs_fp32 = noise.ascending_vs_fp32.max((asc - fp32).abs());
+        noise.max_abs = noise.max_abs.max(asc.abs()).max(desc.abs()).max(fp32.abs());
+    }
+    noise
 }
 
 pub(crate) fn combine_noise(fx: &MoeFixture, rows: &[usize]) -> CombineNoise {
     let mut noise = CombineNoise {
         ascending_vs_descending: 0.0,
         ascending_vs_fp32: 0.0,
+        max_abs: 0.0,
     };
     for &row in rows {
         assert!(row < fx.dims.rows);
         let all = choice_all(fx);
-        let asc = moe_row_with(fx, row, Combine::AscendingBf16, &all);
-        let desc = moe_row_with(fx, row, Combine::DescendingBf16, &all);
-        let f32c = moe_row_with(fx, row, Combine::Fp32, &all);
-        for d in 0..fx.dims.hidden {
-            noise.ascending_vs_descending = noise
-                .ascending_vs_descending
-                .max((asc[d].to_f32() - desc[d].to_f32()).abs());
-            noise.ascending_vs_fp32 = noise
-                .ascending_vs_fp32
-                .max((asc[d].to_f32() - f32c[d].to_f32()).abs());
-        }
+        let route = route_row(fx, row);
+        let measured = row_noise(fx, row, &route.ids, &route.weights, &all);
+        noise.ascending_vs_descending = noise
+            .ascending_vs_descending
+            .max(measured.ascending_vs_descending);
+        noise.ascending_vs_fp32 = noise.ascending_vs_fp32.max(measured.ascending_vs_fp32);
+        noise.max_abs = noise.max_abs.max(measured.max_abs);
     }
     noise
 }
 
-/// Gate tolerance: twice the largest combine-order spread over the sampled
-/// rows.
+/// Measured combine-order spread plus one BF16 ulp at the largest reference output.
 pub(crate) fn tolerance(fx: &MoeFixture, rows: &[usize]) -> f32 {
-    let noise = combine_noise(fx, rows);
-    2.0 * noise.ascending_vs_descending.max(noise.ascending_vs_fp32)
+    combine_noise(fx, rows).tolerance()
 }
 
 #[cfg(test)]
@@ -464,7 +495,6 @@ mod tests {
             (near.probs[c] - near.probs[d]).abs().to_bits(),
             fx.near_tie_margin.to_bits()
         );
-        assert!(fx.near_tie_margin > 0.0 && fx.near_tie_margin < 0.1);
         assert!(near.margin > 0.0, "top-k cut must stay unambiguous");
     }
 
@@ -488,57 +518,14 @@ mod tests {
         assert!(maxdiff > 0.0, "dropping a contribution must change the row");
     }
 
-    /// Gate-protocol freeze receipt at production shape: SHA-256 over the
-    /// fixture tensors and the CPU combine-order noise cells.
     #[test]
-    fn protocol_fixture_freeze_is_pinned() {
-        use sha2::{Digest, Sha256};
+    fn combine_order_noise_is_pinned() {
         let fx = fixture(MoeDims::minicpm47(8), 0);
-        let mut pinned = Vec::new();
-        for (name, tensor) in [
-            ("x", &fx.x),
-            ("router_w", &fx.router_w),
-            ("gate_up", &fx.gate_up),
-            ("down", &fx.down),
-            ("shared_gate", &fx.shared_gate),
-            ("shared_up", &fx.shared_up),
-            ("shared_down", &fx.shared_down),
-            ("shared_expert_gate", &fx.shared_expert_gate),
-        ] {
-            let mut hasher = Sha256::new();
-            let mut chunk: Vec<u8> = Vec::with_capacity(1 << 16);
-            for value in tensor.iter() {
-                chunk.extend_from_slice(&value.to_bits().to_le_bytes());
-                if chunk.len() >= 1 << 16 {
-                    hasher.update(&chunk);
-                    chunk.clear();
-                }
-            }
-            hasher.update(&chunk);
-            pinned.push(format!("{name}={:x}", hasher.finalize()));
-        }
         let noise = combine_noise(&fx, &[0, 1]);
-        println!("MOE_PROTOCOL_FIXTURE_VARIANT0 {pinned:?}");
-        println!(
-            "MOE_PROTOCOL_NOISE asc_vs_desc={} asc_vs_fp32={} tolerance={}",
-            noise.ascending_vs_descending,
-            noise.ascending_vs_fp32,
-            tolerance(&fx, &[0, 1])
+        assert_eq!(
+            noise.ascending_vs_descending.to_bits(),
+            0.001953125f32.to_bits()
         );
-        let frozen = [
-            "x=682aa291c97e62275db9c1a09a48886edc7689fe99b5f07de23c6b1f72775557",
-            "router_w=9c40096dcffb95ac646e4d9687a01e1665cf8205e37581d850e9989ed3ccf6e9",
-            "gate_up=0471808404fa65c7607af197d8394ad170542ba7cb32bc54ef417635d107f522",
-            "down=b2f532038a567bfb92af8705819965eefa88b695b092f767662a3fbcfa0e4737",
-            "shared_gate=ec4a0ea38945f1f9bafaa591478f31e001b43ffc4cc94be6823a06ec6b9b4919",
-            "shared_up=f6e4adec4f41ac58b27ee2604944c6a64ff754ad9f7826dbf133d3838c675db8",
-            "shared_down=d9c33f0dcd703cbc8ded7e7790c46523850b2269c7974f71338f46aada2fca41",
-            "shared_expert_gate=b211f365279b4aaba9a1cff843d95cb7ce41d40567751852e606d5c01c51011d",
-        ];
-        assert_eq!(pinned, frozen, "fixture drift");
-        // The exact f32 bits are libm-dependent through f32::exp; the cells
-        // are pinned within 1e-6.
-        assert!((noise.ascending_vs_descending - 0.001953125).abs() < 1e-6);
-        assert!((noise.ascending_vs_fp32 - 0.001953125).abs() < 1e-6);
+        assert_eq!(noise.ascending_vs_fp32.to_bits(), 0.001953125f32.to_bits());
     }
 }

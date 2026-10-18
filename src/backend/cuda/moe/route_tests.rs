@@ -10,13 +10,10 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use std::collections::HashMap;
 
-/// Exact-id compare gate. Rows at or below the threshold skip the exact-id
-/// compare. Variant 0 (E=256/K=8/H=2048) margins span an exact cut tie on
-/// row 0 and 2.52e-5..1.19e-3 elsewhere. BF16 products are exact in FP32 and
-/// the kernel accumulates sequentially in index order, so logits reproduce
-/// the reference bitwise and prob noise is expf/sum rounding (<= ~1e-6
-/// relative at p_cut <= 1/8).
-const CUT_MARGIN_THRESHOLD: f32 = 1e-5;
+fn strict_ids(row: &RouteRow) -> bool {
+    let cut = row.probs[*row.ids.last().expect("nonempty top-k") as usize];
+    row.margin > row.probs.len() as f32 * (f32::EPSILON / 2.0) * cut
+}
 
 const ROW_CASES: [u32; 7] = [1, 2, 5, 8, 37, 512, 4096];
 /// Rows compared against the reference per case; every case also checks
@@ -79,7 +76,6 @@ fn compare_case(
     refs: &HashMap<usize, RouteRow>,
     rows: &[usize],
     out: &CaseOutputs<'_>,
-    tol: f32,
 ) -> Result<()> {
     let k = out.dims.top_k;
     let mut strict = 0;
@@ -94,7 +90,7 @@ fn compare_case(
             "route case {case} row {row} left sentinel outputs"
         );
         let cut = want.probs[want.ids[k - 1] as usize];
-        if want.margin > CUT_MARGIN_THRESHOLD {
+        if strict_ids(want) {
             strict += 1;
             ensure!(
                 ids == &want.ids[..],
@@ -109,11 +105,13 @@ fn compare_case(
             "MOE_ROUTE_MARGIN case={case} row={row} margin={:e} p_cut={:e} strict={}",
             want.margin,
             cut,
-            want.margin > CUT_MARGIN_THRESHOLD
+            strict_ids(want)
         );
         for (j, (got, &expected)) in weights.iter().zip(&want.weights).enumerate() {
             let (got, expected) = (got.to_f32(), expected.to_f32());
             let dev = (got - expected).abs();
+            let rounding = (k as f32 + 1.0) * (f32::EPSILON / 2.0);
+            let tol = reference::bf16_ulp(expected) + expected.abs() * rounding / (1.0 - rounding);
             max_weight_dev = max_weight_dev.max(dev);
             ensure!(
                 dev <= tol,
@@ -145,7 +143,6 @@ fn moe_route_gpu() -> Result<()> {
         .into_iter()
         .map(|row| (row, reference::route_row(&fx, row)))
         .collect();
-    let tol = reference::tolerance(&fx, &[0, 1, 37]);
 
     let xb = testing::upload(&d.upload, fx.x.clone())?;
     let mut rb = testing::upload(&d.upload, fx.router_w.clone())?;
@@ -197,7 +194,6 @@ fn moe_route_gpu() -> Result<()> {
                 ids: &ids,
                 weights: &weights,
             },
-            tol,
         )?;
     }
 
@@ -230,7 +226,7 @@ fn moe_route_gpu() -> Result<()> {
 
 /// Prefill route arms: rows 37/512/4096 as prefix views of the 4096-row
 /// fixture, ids compared against reference::route_row on rows whose cut
-/// margin exceeds CUT_MARGIN_THRESHOLD, weights within the frozen tolerance.
+/// margin exceeds E * 2^-24 * p_cut, weights within BF16 and renormalisation rounding.
 const PREFILL_ROW_CASES: [u32; 3] = [37, 512, 4096];
 
 #[test]
@@ -250,7 +246,6 @@ fn moe_route_prefill_gpu() -> Result<()> {
         .into_iter()
         .map(|row| (row, reference::route_row(&fx, row)))
         .collect();
-    let tol = reference::tolerance(&fx, &[0, 1, 37]);
 
     let xb = testing::upload(&d.upload, fx.x.clone())?;
     let rb = testing::upload(&d.upload, fx.router_w.clone())?;
@@ -310,7 +305,6 @@ fn moe_route_prefill_gpu() -> Result<()> {
                 ids: &ids,
                 weights: &weights,
             },
-            tol,
         )?;
     }
 
@@ -318,8 +312,7 @@ fn moe_route_prefill_gpu() -> Result<()> {
     // ids wherever the reference cut margin exceeds the frozen threshold.
     let rows = checked_rows(8);
     ensure!(
-        rows.iter()
-            .any(|&row| refs[&row].margin > CUT_MARGIN_THRESHOLD),
+        rows.iter().any(|&row| strict_ids(&refs[&row])),
         "cross-check needs at least one margin-gated row"
     );
     s.memcpy_htod(&vec![-1i32; dims.rows * k], &mut idsb)?;
@@ -361,7 +354,7 @@ fn moe_route_prefill_gpu() -> Result<()> {
     let mut max_weight_dev = 0.0f32;
     for &row in &rows {
         let want = &refs[&row];
-        if want.margin <= CUT_MARGIN_THRESHOLD {
+        if !strict_ids(want) {
             continue;
         }
         strict += 1;

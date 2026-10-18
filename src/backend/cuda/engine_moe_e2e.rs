@@ -3,6 +3,110 @@ use super::*;
 use crate::vision_input::{ImageGrid, MultimodalInput};
 use safetensors::{Dtype, SafeTensors};
 
+#[derive(Debug)]
+struct Bounds {
+    layers: std::collections::BTreeMap<usize, [f64; 4]>,
+    norm: [f64; 4],
+    logits: [f64; 4],
+    media: [f64; 2],
+    cross_media: [f64; 2],
+}
+
+fn ceil_bf16(value: f64) -> Result<f64> {
+    ensure!(
+        value.is_finite() && value >= 0.0,
+        "invalid noise value={value}"
+    );
+    let rounded = bf16::from_f32(value as f32);
+    let bits = rounded.to_bits() + u16::from(f64::from(rounded.to_f32()) < value);
+    let result = f64::from(bf16::from_bits(bits).to_f32());
+    ensure!(result.is_finite(), "noise exceeds BF16 range value={value}");
+    Ok(result)
+}
+
+fn measured_bounds(cells: &[&serde_json::Value]) -> Result<[f64; 4]> {
+    let mut bound = [0.0f64; 4];
+    for cell in cells {
+        for (index, key) in ["max_abs", "p99_abs", "mean_abs", "cosine_sim"]
+            .iter()
+            .enumerate()
+        {
+            let value = cell[key]
+                .as_f64()
+                .with_context(|| format!("missing noise {key}"))?;
+            ensure!(value.is_finite(), "nonfinite noise {key}={value}");
+            let error = if index == 3 {
+                (1.0 - value).max(0.0)
+            } else {
+                value
+            };
+            bound[index] = bound[index].max(error);
+        }
+    }
+    for value in &mut bound {
+        // Two-arm error budget: ceil_bf16(delta_ref + delta_ref).
+        *value = ceil_bf16(*value + *value)?;
+    }
+    bound[3] = 1.0 - bound[3];
+    Ok(bound)
+}
+
+fn media_boundary(measured: &serde_json::Value) -> Result<[f64; 2]> {
+    let separation = measured["max_abs"]
+        .as_f64()
+        .context("media max_abs missing")?;
+    let cosine = measured["cosine_sim"]
+        .as_f64()
+        .context("media cosine missing")?;
+    ensure!(
+        separation.is_finite() && separation > 0.0 && cosine.is_finite() && cosine < 1.0,
+        "invalid measured media separation={separation} cosine={cosine}"
+    );
+    // Midpoint between identical media and the measured reference contrast.
+    Ok([separation / 2.0, 1.0 - (1.0 - cosine) / 2.0])
+}
+
+impl Bounds {
+    fn read(fixtures: &Path) -> Result<Self> {
+        let directory = fixtures.parent().context("reference parent missing")?;
+        let noise: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("noise_floor_r2.json"))?)?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("fixtures_manifest.json"))?)?;
+        let same = &noise["same_precision_bf16_gpu_eager_vs_grouped_mm_experts"];
+        let mut layers = std::collections::BTreeMap::new();
+        for layer in [0, 3, 6, 19, 39] {
+            let key = format!("layer_{layer:02}_hidden_last8");
+            let mut cells = vec![
+                &same["tap_layers"][&key],
+                &noise["placement_control"]["layers"][&key],
+            ];
+            match layer {
+                0 => cells.push(&noise["fp32_cpu_single_layer_recompute_floor"]["text_layer_00_linear_attention"]["hidden_last8"]),
+                3 => cells.push(&noise["fp32_cpu_single_layer_recompute_floor"]["text_layer_03_full_attention"]["hidden_last8"]),
+                39 => cells.push(&noise["fp32_cpu_single_layer_recompute_floor"]["text_layer_39_full_attention"]["hidden_last8"]),
+                6 | 19 => {}
+                _ => unreachable!(),
+            }
+            layers.insert(layer, measured_bounds(&cells)?);
+        }
+        let media = &manifest["image"]["media_reach_controls"];
+        Ok(Self {
+            layers,
+            norm: measured_bounds(&[
+                &same["end_to_end_tensors"]["final_norm_last"],
+                &noise["placement_control"]["final_norm_last"],
+            ])?,
+            logits: measured_bounds(&[
+                &same["end_to_end_tensors"]["prefill_last_logits_bf16"],
+                &noise["placement_control"]["prefill_last_logits"],
+            ])?,
+            media: media_boundary(&media["same_grid_400x267_hockey_vs_boat_logits_diff"])?,
+            cross_media: media_boundary(&media["hockey_16x_vs_boat_16x_logits_diff"])?,
+        })
+    }
+}
+
 fn floats(source: &SafeTensors<'_>, name: &str) -> Result<Vec<f32>> {
     let tensor = source.tensor(name)?;
     let values = match tensor.dtype() {
@@ -61,6 +165,9 @@ fn metrics(a: &[f32], b: &[f32]) -> Result<[f64; 4]> {
         a.iter().chain(b).all(|v| v.is_finite()),
         "nonfinite comparison"
     );
+    if a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()) {
+        return Ok([0.0, 0.0, 0.0, 1.0]);
+    }
     let mut errors = Vec::with_capacity(a.len());
     let (mut dot, mut aa, mut bb) = (0.0, 0.0, 0.0);
     for (&a, &b) in a.iter().zip(b) {
@@ -86,7 +193,11 @@ fn metrics(a: &[f32], b: &[f32]) -> Result<[f64; 4]> {
 fn score(name: &str, a: &[f32], b: &[f32], bound: [f64; 4]) -> Result<usize> {
     let m = metrics(a, b)?;
     ensure!(m.iter().all(|v| v.is_finite()), "nonfinite metrics {name}");
-    let pass = m[0] <= bound[0] && m[1] <= bound[1] && m[2] <= bound[2] && m[3] >= bound[3];
+    let pass = m[0] <= bound[0]
+        && m[1] <= bound[1]
+        && m[2] <= bound[2]
+        && m[3] >= bound[3]
+        && (bound[0] != 0.0 || a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()));
     println!(
         "{} minicpm_e2e {name} max={} p99={} mean={} cosine={} bound={bound:?}",
         if pass { "PASS" } else { "DEFECT" },
@@ -187,6 +298,19 @@ fn check_fixtures(fixtures: &Path, model: &crate::model_spec::ModelSpec) -> Resu
         if !input.grids.is_empty() {
             input.packed().validate(model, 4352)?;
         }
+        if case == "image_hockey_16x" {
+            let bytes =
+                std::fs::read(fixtures.join("control_boat_at_hockey_size_16x.safetensors"))?;
+            let tensors = SafeTensors::deserialize(&bytes)?;
+            let control = Input::read(&tensors, true)?;
+            control.packed().validate(model, 4352)?;
+            ensure!(
+                control.ids == input.ids
+                    && control.grids == input.grids
+                    && control.modalities == input.modalities,
+                "reference media control differs outside pixels"
+            );
+        }
         for (name, tensor) in source.tensors() {
             if matches!(tensor.dtype(), Dtype::BF16 | Dtype::F32) {
                 floats(&source, &name)?;
@@ -212,6 +336,7 @@ fn prefill_scores(
     source: &SafeTensors<'_>,
     trace: &Trace,
     logits: &[f32],
+    bounds: &Bounds,
 ) -> Result<usize> {
     let image = case.starts_with("image_");
     let mut defects = 0;
@@ -220,16 +345,10 @@ fn prefill_scores(
             &format!("{case}/embed"),
             &tail(trace, "embed", 8 * 2048)?,
             &floats(source, "embed_last8")?,
-            [0.0, 0.0, 0.0, 1.0 - 1e-12],
+            [0.0, 0.0, 0.0, 1.0],
         )?;
     }
-    for (layer, bound) in [
-        (0, [0.015625, 0.002, 0.0003, 0.9999]),
-        (3, [0.0234375, 0.0035, 0.0006, 0.9998]),
-        (6, [0.03125, 0.004, 0.0008, 0.9998]),
-        (19, [0.09375, 0.045, 0.009, 0.996]),
-        (39, [0.4375, 0.1875, 0.045, 0.991]),
-    ] {
+    for (&layer, &bound) in &bounds.layers {
         let key = format!("layer_{layer:02}_hidden_last8");
         ensure!(
             source.tensor(&key)?.shape() == [8, 2048],
@@ -248,21 +367,13 @@ fn prefill_scores(
         &format!("{case}/norm"),
         &norm[norm.len() - 2048..],
         &floats(source, "final_norm_last")?,
-        if image {
-            [0.75, 0.5, 0.15, 0.998]
-        } else {
-            [0.625, 0.4375, 0.130, 0.9985]
-        },
+        bounds.norm,
     )?;
     defects += score(
         &format!("{case}/logits"),
         logits,
         &floats(source, "prefill_last_logits_bf16")?,
-        if image {
-            [1.5, 0.45, 0.125, 0.9985]
-        } else {
-            [1.25, 0.375, 0.105, 0.999]
-        },
+        bounds.logits,
     )?;
     Ok(defects)
 }
@@ -272,6 +383,7 @@ fn teacher_force(
     source: &SafeTensors<'_>,
     case: &str,
     model: &Path,
+    bounds: &Bounds,
 ) -> Result<(usize, Vec<Vec<f32>>)> {
     let ids = integers(source, "greedy_token_ids")?;
     let top = integers(source, "step_top2_ids")?;
@@ -309,21 +421,18 @@ fn teacher_force(
                 error
             })
             .fold(0.0f32, f32::max);
-        let id_ok = margins[step] <= 1.5 || prediction == ids[step];
-        scored += usize::from(margins[step] > 1.5);
-        let pass = error
-            <= if case.starts_with("image_") {
-                1.75
-            } else {
-                1.5
-            }
-            && id_ok;
+        // Either of the two logits may move by the measured absolute-error bound.
+        let id_margin = bounds.logits[0] + bounds.logits[0];
+        let above_margin = f64::from(margins[step]) > id_margin;
+        let id_ok = !above_margin || prediction == ids[step];
+        scored += usize::from(above_margin);
+        let pass = f64::from(error) <= bounds.logits[0] && id_ok;
         defects += usize::from(!pass);
         println!(
             "{} minicpm_teacher {case} step={step} top2_max={error} reference_margin={} id_scored={} predicted={prediction} reference={}",
             if pass { "PASS" } else { "DEFECT" },
             margins[step],
-            margins[step] > 1.5,
+            above_margin,
             ids[step]
         );
         outputs.push(values);
@@ -336,10 +445,14 @@ fn teacher_force(
     }
     errors.sort_unstable_by(f32::total_cmp);
     let median = errors[errors.len() / 2];
-    defects += usize::from(median > 0.375);
+    defects += usize::from(f64::from(median) > bounds.logits[1]);
     println!(
         "{} minicpm_teacher_summary {case} steps={steps} ids_scored={scored} median_top2_error={median}",
-        if median <= 0.375 { "PASS" } else { "DEFECT" }
+        if f64::from(median) <= bounds.logits[1] {
+            "PASS"
+        } else {
+            "DEFECT"
+        }
     );
     if case.starts_with("image_") {
         println!(
@@ -408,41 +521,20 @@ fn replay(
 fn media_control(
     engine: &mut Engine,
     input: &mut Input,
-    model: &Path,
     fixtures: &Path,
     baseline: &[f32],
+    bound: [f64; 2],
 ) -> Result<usize> {
-    use crate::serve::{
-        detok::Shared,
-        image::{Processor, RgbImage, load_image},
-    };
-    let bytes = std::fs::read(
-        fixtures
-            .parent()
-            .context("fixture parent missing")?
-            .join("inputs/boat.jpg"),
-    )?;
-    let boat = load_image(&format!("data:image/jpeg;base64,{}", base64::encode(bytes)))?;
-    let mut resized = RgbImage {
-        width: 400,
-        height: 267,
-        pixels: vec![0; 400 * 267 * 3],
-    };
-    for y in 0..267 {
-        for x in 0..400 {
-            let source = ((y * boat.height / 267) * boat.width + x * boat.width / 400) * 3;
-            resized.pixels[(y * 400 + x) * 3..][..3].copy_from_slice(&boat.pixels[source..][..3]);
-        }
-    }
-    let tokenizer = Shared::load(model)?;
-    let packed = Processor::load(model, Some(&tokenizer))?
-        .context("processor missing")?
-        .prepare_rgb(&resized)?;
+    let bytes = std::fs::read(fixtures.join("control_boat_at_hockey_size_16x.safetensors"))?;
+    let source = SafeTensors::deserialize(&bytes)?;
+    let control = Input::read(&source, true)?;
     ensure!(
-        packed.grids == input.grids && packed.pixel_values.len() == input.pixels.len(),
-        "media control grid differs"
+        control.ids == input.ids
+            && control.modalities == input.modalities
+            && control.grids == input.grids,
+        "media control ids/modalities/grid differ"
     );
-    input.pixels = packed.pixel_values;
+    input.pixels = control.pixels;
     engine.reset()?;
     engine.prefill_multimodal(&input.packed(), None)?;
     let changed = engine.decode_logits()?;
@@ -452,9 +544,9 @@ fn media_control(
         .as_ref()
         .context("runtime missing")?
         .vision_encode_calls;
-    let pass = calls == 1 && m[0] >= 5.0 && m[3] <= 0.93;
+    let pass = calls == 1 && m[0] >= bound[0] && m[3] <= bound[1];
     println!(
-        "{} minicpm_media_control same_ids=true same_grid=true changed_pixels=boat_nearest_resize encoder_calls={calls} max={} cosine={}",
+        "{} minicpm_media_control same_ids=true same_grid=true changed_pixels=boat_reference encoder_calls={calls} max={} cosine={} bound={bound:?}",
         if pass { "PASS" } else { "DEFECT" },
         m[0],
         m[3]
@@ -481,6 +573,8 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
         spec_graph: true,
         kv_format: crate::kv::KvFormat::Bf16,
     };
+    let bounds = Bounds::read(&fixtures)?;
+    println!("minicpm_reference_bounds {bounds:?}");
     check_fixtures(&fixtures, &crate::model_spec::ModelSpec::read(&model)?)?;
     Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
     let mut engine = Engine::load(&model, 0, 4352, None, settings)?;
@@ -510,7 +604,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
         }
         engine.prefill_tail(&input.ids, &mut trace, 8)?;
         let first_logits = engine.decode_logits()?;
-        defects += prefill_scores(case, &source, &trace, &first_logits)?;
+        defects += prefill_scores(case, &source, &trace, &first_logits, &bounds)?;
         let calls = engine
             .qwen
             .as_ref()
@@ -535,7 +629,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
             None,
         )?;
         let pending = engine.token()?;
-        let (errors, logits) = teacher_force(&mut engine, &source, case, &model)?;
+        let (errors, logits) = teacher_force(&mut engine, &source, case, &model, &bounds)?;
         defects += errors;
         defects += replay(
             &mut engine,
@@ -563,11 +657,17 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
             media_logits.push(first_logits.clone());
         }
         if case == "image_hockey_16x" {
-            defects += media_control(&mut engine, &mut input, &model, &fixtures, &first_logits)?;
+            defects += media_control(
+                &mut engine,
+                &mut input,
+                &fixtures,
+                &first_logits,
+                bounds.media,
+            )?;
         }
     }
     let media = metrics(&media_logits[0], &media_logits[1])?;
-    defects += usize::from(media[0] == 0.0);
+    defects += usize::from(media[0] < bounds.cross_media[0] || media[3] > bounds.cross_media[1]);
     println!(
         "minicpm_two_media max={} cosine={} defects={defects}",
         media[0], media[3]

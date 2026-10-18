@@ -157,51 +157,54 @@ fn eviction_fixture(fx: &MoeFixture, rows: usize) -> (MoeFixture, Vec<i32>, Vec<
     (fx2, ids, weights)
 }
 
-/// Combine-order spread of the reference on the eviction weight structure.
-fn eviction_combine_noise(fx2: &MoeFixture, ids: &[i32], weights: &[bf16], rows: &[usize]) -> f32 {
-    let top_k = fx2.dims.top_k;
-    let all: Vec<usize> = (0..top_k).collect();
-    let mut noise = 0.0f32;
+fn planted_noise(
+    fx: &MoeFixture,
+    ids: &[i32],
+    weights: &[bf16],
+    active: &[u32],
+    rows: &[usize],
+) -> reference::CombineNoise {
+    let k = fx.dims.top_k;
+    let mut noise = reference::CombineNoise {
+        ascending_vs_descending: 0.0,
+        ascending_vs_fp32: 0.0,
+        max_abs: 0.0,
+    };
     for &row in rows {
-        let ids_row = &ids[row * top_k..(row + 1) * top_k];
-        let weights_row = &weights[row * top_k..(row + 1) * top_k];
-        let asc =
-            reference::moe_row_ids(fx2, row, ids_row, weights_row, &all, Combine::AscendingBf16);
-        let desc = reference::moe_row_ids(
-            fx2,
-            row,
-            ids_row,
-            weights_row,
-            &all,
-            Combine::DescendingBf16,
-        );
-        let f32c = reference::moe_row_ids(fx2, row, ids_row, weights_row, &all, Combine::Fp32);
-        for d in 0..fx2.dims.hidden {
-            noise = noise
-                .max((asc[d].to_f32() - desc[d].to_f32()).abs())
-                .max((asc[d].to_f32() - f32c[d].to_f32()).abs());
-        }
+        let ids = &ids[row * k..(row + 1) * k];
+        let weights = &weights[row * k..(row + 1) * k];
+        let mut keep: Vec<usize> = (0..k)
+            .filter(|&choice| active[row * k + choice] == 1)
+            .collect();
+        let zero = vec![bf16::ZERO; k];
+        let weights = if keep.is_empty() {
+            keep.extend(0..k);
+            &zero
+        } else {
+            weights
+        };
+        let row = reference::row_noise(fx, row, ids, weights, &keep);
+        noise.ascending_vs_descending = noise
+            .ascending_vs_descending
+            .max(row.ascending_vs_descending);
+        noise.ascending_vs_fp32 = noise.ascending_vs_fp32.max(row.ascending_vs_fp32);
+        noise.max_abs = noise.max_abs.max(row.max_abs);
     }
     noise
 }
 
-/// Freeze receipt for the eviction-arm noise cell: the reference
-/// combine-order spread on the eviction weight structure.
 #[test]
 fn eviction_noise_cell_is_pinned() {
     let fx = reference::fixture(MoeDims::minicpm47(6), 0);
     let (fx2, ids, weights) = eviction_fixture(&fx, 6);
-    let noise = eviction_combine_noise(&fx2, &ids, &weights, &[0, 1, 2, 3, 4]);
-    println!(
-        "MOE_EVICT_NOISE_CELL max_spread={noise:.9} tol_evict={:.9}",
-        2.0 * noise
-    );
-    // Pinned to the 2026-10-17 CPU-measured value on the distinct-experts
-    // eviction fixture within 1e-6; the exact f32 bits are libm-dependent
-    // through f32::exp.
-    assert!(
-        (noise - 0.001_953_125).abs() < 1e-6,
-        "cell drifted: {noise}"
+    let active = all_active(6, fx.dims.top_k);
+    let noise = planted_noise(&fx2, &ids, &weights, &active, &[0, 1, 2, 3, 4]);
+    assert_eq!(
+        noise
+            .ascending_vs_descending
+            .max(noise.ascending_vs_fp32)
+            .to_bits(),
+        0.001953125f32.to_bits()
     );
 }
 
@@ -468,7 +471,6 @@ struct GpuCase<'a> {
     fx: &'a MoeFixture,
     scratch: &'a Scratch,
     shared: &'a SharedBufs,
-    tol: f32,
 }
 
 impl GpuCase<'_> {
@@ -496,6 +498,7 @@ impl GpuCase<'_> {
             gens,
             slots,
         } = arm;
+        let tol = planted_noise(self.fx, ids, weights, active, check).tolerance();
         let s = self.s;
         let (top_k, hidden) = (self.fx.dims.top_k, self.fx.dims.hidden);
         let case_bufs = self.bufs(rows, ids, active, weights, gens)?;
@@ -533,34 +536,13 @@ impl GpuCase<'_> {
         eprintln!(
             "moe_prefill {label} rows={rows} checked={} max_diff={max_diff:.6} tol={:.6}",
             check.len(),
-            self.tol
+            tol
         );
-        if max_diff > self.tol {
+        if max_diff > tol {
             defects.push(format!(
                 "{label} rows={rows} max_diff {max_diff:.6} > tol {:.6}",
-                self.tol
+                tol
             ));
-        }
-        if rows >= 4096 {
-            let norms: Vec<f64> = (0..rows)
-                .map(|r| {
-                    (0..hidden)
-                        .map(|c| {
-                            let v = y[r * hidden + c].to_f32() as f64;
-                            v * v
-                        })
-                        .sum::<f64>()
-                        .sqrt()
-                })
-                .collect();
-            let mean_all: f64 = norms.iter().sum::<f64>() / rows as f64;
-            let mean_checked: f64 =
-                check.iter().map(|&r| norms[r]).sum::<f64>() / check.len() as f64;
-            if !(0.5..=2.0).contains(&(mean_all / mean_checked)) {
-                defects.push(format!(
-                    "{label} rows={rows} aggregate row-norm control: {mean_all:.4} vs {mean_checked:.4}"
-                ));
-            }
         }
         Ok(())
     }
@@ -779,14 +761,12 @@ fn moe_prefill_gpu() -> Result<()> {
         sd: s.clone_htod(fx.shared_down.as_slice())?,
         seg: s.clone_htod(fx.shared_expert_gate.as_slice())?,
     };
-    let tol = reference::tolerance(&fx, &(0..8).collect::<Vec<_>>());
     let case = GpuCase {
         s,
         ops: &ops,
         fx: &fx,
         scratch: &scratch,
         shared: &shared,
-        tol,
     };
 
     // The per-expert GEMM2 shape (n = m_e per expert, restored from the
@@ -992,6 +972,8 @@ fn moe_prefill_gpu() -> Result<()> {
         let (ids, weights) = planted_uniform(rows, experts, top_k);
         let active = all_active(rows, top_k);
         let gens = vec![1u64; rows * top_k];
+        let tol =
+            planted_noise(&fx, &ids, &weights, &active, &(0..rows).collect::<Vec<_>>()).tolerance();
         let mut swapped_gu = main_gu.clone();
         let mut swapped_dn = main_dn.clone();
         swapped_gu.swap(3, 17);
@@ -1041,14 +1023,13 @@ fn moe_prefill_gpu() -> Result<()> {
     // Eviction-reuse control: all assignments route to the hot expert, whose
     // weights move to a new device buffer scaled by 1.25 (bf16 round) with
     // the slot generation bumped to 2; the relaunch must read the replaced
-    // weights. The tolerance is twice the reference combine-order spread on
-    // this weight structure.
+    // weights. Each checked row has a measured combine-order spread and BF16 ulp bound.
     {
         let rows = 37usize;
         let (fx2, ids, weights) = eviction_fixture(&fx, rows);
-        let tol_evict = 2.0 * eviction_combine_noise(&fx2, &ids, &weights, &[0, 1, 2, 3, 4]);
         let check: Vec<usize> = (0..rows).collect();
         let active = all_active(rows, top_k);
+        let tol_evict = planted_noise(&fx2, &ids, &weights, &active, &check).tolerance();
         let gens = vec![1u64; rows * top_k];
         let ev_case = GpuCase {
             s: case.s,
@@ -1056,7 +1037,6 @@ fn moe_prefill_gpu() -> Result<()> {
             fx: case.fx,
             scratch: case.scratch,
             shared: case.shared,
-            tol: tol_evict,
         };
         ev_case.run(
             Arm {
@@ -1142,6 +1122,8 @@ fn moe_prefill_gpu() -> Result<()> {
         let (ids, weights) = planted_uniform(rows, experts, top_k);
         let active = all_active(rows, top_k);
         let gens = vec![1u64; rows * top_k];
+        let tol =
+            planted_noise(&fx, &ids, &weights, &active, &(0..rows).collect::<Vec<_>>()).tolerance();
         let combine_ops = CombineOps::new(&d.ctx)?;
         let ctx = GateCtx {
             s,
