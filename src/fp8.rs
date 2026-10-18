@@ -105,6 +105,51 @@ pub(crate) fn fake_quant_reference(x: &[bf16]) -> anyhow::Result<(bf16, Vec<u8>,
     Ok((scale, codes, fake))
 }
 
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn linear_reference(weight: &[bf16], x: &[bf16], k: usize) -> anyhow::Result<Vec<bf16>> {
+    anyhow::ensure!(
+        k > 0 && weight.len().is_multiple_of(k) && x.len().is_multiple_of(k),
+        "invalid linear reference extents"
+    );
+    let mut output = Vec::with_capacity(x.len() / k * (weight.len() / k));
+    for input in x.chunks_exact(k) {
+        for row in weight.chunks_exact(k) {
+            let mut lanes = [0.0f32; 32];
+            for (lane, value) in lanes.iter_mut().enumerate() {
+                let mut sums = [0.0f32; 4];
+                if k.is_multiple_of(1024) {
+                    for base in (0..k).step_by(1024) {
+                        for word in 0..4 {
+                            for byte in 0..4 {
+                                let col = base + lane * 16 + word * 4 + byte;
+                                sums[byte] =
+                                    row[col].to_f32().mul_add(input[col].to_f32(), sums[byte]);
+                                let col = col + 512;
+                                let index = (byte + 2) & 3;
+                                sums[index] =
+                                    row[col].to_f32().mul_add(input[col].to_f32(), sums[index]);
+                            }
+                        }
+                    }
+                } else {
+                    for col in (lane..k).step_by(32) {
+                        sums[0] = row[col].to_f32().mul_add(input[col].to_f32(), sums[0]);
+                    }
+                }
+                *value = (sums[0] + sums[1]) + (sums[2] + sums[3]);
+            }
+            for shift in [16, 8, 4, 2, 1] {
+                let prior = lanes;
+                for lane in 0..32 - shift {
+                    lanes[lane] += prior[lane + shift];
+                }
+            }
+            output.push(bf16::from_f32(lanes[0]));
+        }
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

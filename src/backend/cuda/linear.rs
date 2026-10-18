@@ -477,6 +477,276 @@ mod tests {
     use std::{path::PathBuf, rc::Rc};
 
     #[test]
+    #[ignore = "GPU window, official FP8 model, T13 and projection reference required"]
+    fn channel_projection_gpu() -> Result<()> {
+        use super::super::q38_tests::view;
+        use crate::fp8::{effective_weight, linear_reference};
+        use cudarc::driver::sys;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let root = PathBuf::from(
+            std::env::var_os("FF_Q38_PROBE_DIR").context("FF_Q38_PROBE_DIR missing")?,
+        );
+        let reference_dir = PathBuf::from(
+            std::env::var_os("FF_MINICPM_REFERENCE_DIR")
+                .context("FF_MINICPM_REFERENCE_DIR missing")?,
+        );
+        let model =
+            PathBuf::from(std::env::var_os("FF_FP8_MODEL").context("FF_FP8_MODEL missing")?);
+        let spec = crate::model_spec::ModelSpec::read(&model)?;
+        ensure!(
+            spec.hidden == 2048
+                && spec.q_width == 4096
+                && spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Channel,
+            "invalid FP8 model geometry"
+        );
+        let checkpoint = crate::checkpoint::MappedCheckpoint::open(&model)?;
+        let manifest = checkpoint.manifest(&spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+        let views = checkpoint.views()?;
+        let tap_bytes = std::fs::read(reference_dir.join("fixtures/text_32_mixer.safetensors"))?;
+        let taps = safetensors::SafeTensors::deserialize(&tap_bytes)?;
+        let reference_bytes = std::fs::read(root.join("projection-reference.safetensors"))?;
+        let references = safetensors::SafeTensors::deserialize(&reference_bytes)?;
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &root,
+            Rc::new(Closure::new(false, "channel FP8 projection gate".into())),
+        )?;
+        blas.enable_fp8(&device.ctx)?;
+        let mut defects = 0;
+        let mut cases = 0;
+        // Twice the sm89 BF16 rows1..5,8,32 shape/FP32-path floors.
+        for (op, n, k, input_name, limit) in [
+            ("q", 8192u32, 2048u32, "layer_03_mixer_in_norm", 0.0625f32),
+            ("k", 512, 2048, "layer_03_mixer_in_norm", 0.0625),
+            ("v", 512, 2048, "layer_03_mixer_in_norm", 0.03125),
+            ("o", 2048, 4096, "layer_03_o_proj_in", 0.0078125),
+        ] {
+            let role = format!("self_attn.{op}_proj.weight");
+            let name = format!("model.language_model.layers.3.{role}");
+            let scale_name = format!("{name}_scale");
+            let entry = manifest
+                .entries
+                .get(&name)
+                .context("projection manifest entry missing")?;
+            let scale_entry = manifest
+                .entries
+                .get(&scale_name)
+                .context("projection scale missing")?;
+            let code = views[&entry.shard].tensor(&name)?;
+            let scale = views[&scale_entry.shard].tensor(&scale_name)?;
+            ensure!(
+                code.dtype() == safetensors::Dtype::F8_E4M3
+                    && code.shape() == [n as usize, k as usize]
+                    && scale.dtype() == safetensors::Dtype::BF16
+                    && scale.shape() == [n as usize, 1],
+                "invalid published {op} layout"
+            );
+            let scales = scale
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_le_bytes(*b))
+                .collect::<Vec<_>>();
+            let host_weight = code
+                .data()
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| effective_weight(c, scales[i / k as usize]))
+                .collect::<Vec<_>>();
+            ensure!(
+                host_weight.iter().all(|v| v.is_finite()),
+                "nonfinite published {op} weight"
+            );
+            let input = taps.tensor(input_name)?;
+            ensure!(
+                input.dtype() == safetensors::Dtype::BF16 && input.shape() == [32, k as usize],
+                "invalid T13 projection input"
+            );
+            let inputs = input
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_le_bytes(*b))
+                .collect::<Vec<_>>();
+            let host_fake = inputs
+                .chunks_exact(k as usize)
+                .map(crate::fp8::fake_quant_reference)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flat_map(|(_, _, f)| f)
+                .collect::<Vec<_>>();
+            let scalar = linear_reference(&host_weight, &host_fake[..5 * k as usize], k as usize)?;
+            let codes = stream.clone_htod(code.data())?;
+            let scales = stream.clone_htod(&scales)?;
+            let host_materialized = stream.clone_htod(&host_weight)?;
+            let dequant = stream.alloc_zeros::<u8>(host_weight.len() * 2)?;
+            let entries = [
+                (name.clone(), entry.clone()),
+                (scale_name.clone(), scale_entry.clone()),
+            ]
+            .into();
+            let small_manifest = TensorManifest {
+                entries,
+                resident_bytes: entry.bytes + scale_entry.bytes,
+            };
+            let dequant_plan = crate::linear_plan::LayerDequantPlan::from_manifest(
+                &small_manifest,
+                3,
+                spec.linear_format,
+            )?;
+            let catalog = WeightCatalog {
+                tensors: [
+                    (name.clone(), StoredTensor::Fp8(codes)),
+                    (scale_name.clone(), StoredTensor::Bf16(scales)),
+                ]
+                .into(),
+                manifest: small_manifest,
+                bytes: entry.bytes + scale_entry.bytes,
+                upload_content_sha256: None,
+                upload_hashed_bytes: None,
+                load_wall_ms: 0.0,
+            };
+            use cudarc::driver::DevicePtr;
+            let scratch = Scratch {
+                ptr: dequant.device_ptr(stream).0,
+                bytes: dequant.len() as u64,
+            };
+            let mut plan = LayerLinearPlan::bind(&dequant_plan, &catalog, Some(&scratch), stream)?;
+            plan.materialize(&blas, stream)?;
+            stream.synchronize()?;
+            let materialized = stream.clone_dtoh(&dequant)?;
+            let weight_bad = materialized
+                .iter()
+                .copied()
+                .ne(host_weight.iter().flat_map(|v| v.to_le_bytes()));
+            println!(
+                "FP8_MATERIALIZE op={op} stored_weight=[{n},{k}] mismatches_present={weight_bad} {}",
+                if weight_bad { "DEFECT" } else { "PASS" }
+            );
+            defects += usize::from(weight_bad);
+            for m in [1u32, 2, 3, 4, 5, 8, 32] {
+                plan.prepare(&blas, m)?;
+                let expected = if m <= 5 {
+                    scalar[..m as usize * n as usize].to_vec()
+                } else {
+                    let x = stream.clone_htod(&host_fake[..m as usize * k as usize])?;
+                    let y = stream.alloc_zeros::<bf16>(m as usize * n as usize)?;
+                    blas.linear_typed(
+                        ExecutionPhase::Prefill,
+                        LinearWeightRef::Bf16(view(
+                            &host_materialized,
+                            stream,
+                            [n, k],
+                            [u64::from(k), 1],
+                        )?),
+                        view(&x, stream, [m, k], [u64::from(k), 1])?,
+                        &mut TensorMut(view(&y, stream, [m, n], [u64::from(n), 1])?),
+                    )?;
+                    stream.clone_dtoh(&y)?
+                };
+                let torch = references.tensor(&format!("{op}_bf16_rows{m}"))?;
+                ensure!(
+                    torch.dtype() == safetensors::Dtype::BF16
+                        && torch.shape() == [m as usize, n as usize],
+                    "invalid torch projection reference"
+                );
+                let torch = torch
+                    .data()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| bf16::from_le_bytes(*b))
+                    .collect::<Vec<_>>();
+                for graph in [false, true] {
+                    let x = stream.clone_htod(&inputs[..m as usize * k as usize])?;
+                    let y = stream.alloc_zeros::<bf16>(m as usize * n as usize)?;
+                    let x_view = view(&x, stream, [m, k], [u64::from(k), 1])?;
+                    let y_view = view(&y, stream, [m, n], [u64::from(n), 1])?;
+                    device.finish_upload()?;
+                    let execute = || -> Result<()> {
+                        blas.fp8_ops()?
+                            .fake_quant(stream, &mut TensorMut(x_view), None, None)?;
+                        plan.run(
+                            &blas,
+                            &role,
+                            if m == 1 {
+                                ExecutionPhase::Decode
+                            } else {
+                                ExecutionPhase::Prefill
+                            },
+                            x_view,
+                            &mut TensorMut(y_view),
+                        )
+                    };
+                    if graph {
+                        stream.begin_capture(
+                            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                        )?;
+                        let run = execute();
+                        let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                        run?;
+                        captured?.context("empty FP8 projection graph")?.launch()?;
+                    } else {
+                        execute()?;
+                    }
+                    stream.synchronize()?;
+                    let got = stream.clone_dtoh(&y)?;
+                    ensure!(
+                        got.iter().all(|v| v.is_finite()),
+                        "nonfinite projection output"
+                    );
+                    let bit_bad = got
+                        .iter()
+                        .zip(&expected)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    let max_abs = got
+                        .iter()
+                        .zip(&torch)
+                        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+                        .fold(0.0f32, f32::max);
+                    let mut bad = bit_bad > 0 || max_abs > limit;
+                    if op == "o" {
+                        let tap = taps.tensor("layer_03_mixer_out")?;
+                        ensure!(
+                            tap.dtype() == safetensors::Dtype::BF16
+                                && tap.shape() == [32, n as usize],
+                            "invalid T13 o output tap"
+                        );
+                        let max_t13 = got
+                            .iter()
+                            .zip(tap.data().as_chunks::<2>().0.iter())
+                            .map(|(a, b)| (a.to_f32() - bf16::from_le_bytes(*b).to_f32()).abs())
+                            .fold(0.0f32, f32::max);
+                        bad |= max_t13 > limit;
+                        println!(
+                            "FP8_T13_O rows={m} graph={graph} max_abs={max_t13} limit={limit}"
+                        );
+                    }
+                    println!(
+                        "FP8_PROJECTION op={op} stored_weight=[{n},{k}] scale=[{n},1] rows={m} graph={graph} bit_mismatches={bit_bad} torch_max_abs={max_abs} limit={limit} {}",
+                        if bad { "DEFECT" } else { "PASS" }
+                    );
+                    defects += usize::from(bad);
+                    cases += 1;
+                }
+            }
+        }
+        println!("FP8_PROJECTION_SUMMARY cases={cases} defects={defects}");
+        ensure!(defects == 0, "FP8 projection DEFECT cases={defects}");
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "GPU window and FF_MINICPM_REFERENCE_DIR required"]
     fn token_quantization_gpu() -> Result<()> {
         use super::super::q38_tests::view;
