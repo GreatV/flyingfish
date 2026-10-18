@@ -46,10 +46,14 @@ impl BlockAttention {
         let c = &draft.config;
         let s = &device.stream;
         let rows = u32::try_from(c.block_size)?;
+        let groups = c.num_key_value_heads
+            * ((c.num_attention_heads / c.num_key_value_heads) * c.block_size).div_ceil(64);
+        let partitions = device.info.sms.div_ceil(groups).max(1);
+        let key_chunk = draft.capacity.div_ceil(partitions).next_multiple_of(32);
         let limits = AttentionLimits {
             max_rows: rows,
             capacity: u32::try_from(draft.capacity)?,
-            key_chunk: 32,
+            key_chunk: u32::try_from(key_chunk)?,
             causal: 1,
         };
         let spec = FullAttentionSpec {
@@ -1436,39 +1440,67 @@ mod tests {
     }
 
     fn confidence_bounds(
-        draft: &Draft,
+        c: &DraftConfig,
+        path: &Path,
         reference: (&[f32], &[f32]),
         parents: &[u32],
         propagated: f64,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let (hidden, floor) = reference;
-        let c = &draft.config;
         ensure!(
             hidden.len() == c.block_size * c.hidden_size
                 && floor.len() == c.block_size
                 && parents.len() == c.block_size,
             "confidence reference extent mismatch"
         );
-        let s = &draft.stream;
-        let weight = s.clone_dtoh(&draft.weights.confidence)?;
-        let bias = s.clone_dtoh(&draft.weights.confidence_bias)?[0]
-            .to_f32()
-            .abs();
+        ensure!(
+            parents.iter().all(|p| (*p as usize) < c.vocab_size),
+            "confidence parent outside vocabulary"
+        );
+        let mapped = crate::checkpoint::MappedCheckpoint::open(path)?;
+        let views = mapped.views()?;
+        let table = &views[mapped
+            .index
+            .weight_map
+            .get("confidence_head.proj.weight")
+            .context("confidence shard absent")?];
+        let weight = values(
+            table,
+            "confidence_head.proj.weight",
+            &[1, c.hidden_size + c.markov_rank],
+        )?;
+        let bias = values(table, "confidence_head.proj.bias", &[1])?[0].abs();
+        let embedding_table = &views[mapped
+            .index
+            .weight_map
+            .get("markov_head.markov_w1.weight")
+            .context("embedding shard absent")?];
+        let embedding_tensor = embedding_table.tensor("markov_head.markov_w1.weight")?;
+        ensure!(
+            embedding_tensor.dtype() == Dtype::BF16
+                && embedding_tensor.shape() == [c.vocab_size, c.markov_rank],
+            "confidence embedding layout mismatch"
+        );
         let local = super::super::bf16_chain_bound(1, &[c.hidden_size + c.markov_rank]);
         let mut complete = Vec::new();
         let mut isolated = Vec::new();
         for (row, &parent) in parents.iter().enumerate() {
             let begin = parent as usize * c.markov_rank;
-            let embedding = s.clone_dtoh(&draft.weights.w1.slice(begin..begin + c.markov_rank))?;
+            let embedding: Vec<_> = embedding_tensor.data()[begin * 2..(begin + c.markov_rank) * 2]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| bf16::from_bits(u16::from_le_bytes(*v)).to_f32())
+                .collect();
             let h_product: f64 = hidden[row * c.hidden_size..(row + 1) * c.hidden_size]
                 .iter()
                 .zip(&weight[..c.hidden_size])
-                .map(|(v, w)| f64::from(*v).abs() * f64::from(w.to_f32()).abs())
+                .map(|(v, w)| f64::from(*v).abs() * f64::from(*w).abs())
                 .sum();
             let m_product: f64 = embedding
                 .iter()
                 .zip(&weight[c.hidden_size..])
-                .map(|(v, w)| f64::from(v.to_f32()).abs() * f64::from(w.to_f32()).abs())
+                .map(|(v, w)| f64::from(*v).abs() * f64::from(*w).abs())
                 .sum();
             let budget =
                 0.25 * local * (h_product + m_product + f64::from(bias)) + f64::from(floor[row]);
@@ -1512,6 +1544,7 @@ mod tests {
             "general-block-1",
         ];
         let mut context_max = 0;
+        let mut confidence_limits = std::collections::BTreeMap::new();
         for name in names {
             let data = std::fs::read(reference.join(format!("{name}.safetensors")))?;
             let tensors = SafeTensors::deserialize(&data)?;
@@ -1532,6 +1565,31 @@ mod tests {
                     c.block_size
                 );
             }
+            let floor_data = std::fs::read(floor_root.join(format!("{name}-floor.safetensors")))?;
+            let floor = SafeTensors::deserialize(&floor_data)?;
+            let b = c.block_size;
+            let h = c.hidden_size;
+            let block_ids = ids(&tensors, "draft_input_ids", &[1, b])?;
+            let proposals = ids(&tensors, "proposals_tensor", &[b])?;
+            let parents: Vec<_> = std::iter::once(block_ids[0])
+                .chain(proposals.into_iter().take(b - 1))
+                .collect();
+            let limits = confidence_bounds(
+                &c,
+                &draft_path,
+                (
+                    &values(&tensors, "draft_norm_hidden", &[1, b, h])?,
+                    &values(&floor, "confidence_c_k", &[b])?,
+                ),
+                &parents,
+                coefficient(&c, shape[1], c.num_hidden_layers, 2),
+            )?;
+            println!(
+                "T19_CONFIDENCE_BOUND fixture={name} sigmoid_lipschitz=0.25 full_max={} isolated_max={}",
+                limits.0.iter().copied().fold(0.0f32, f32::max),
+                limits.1.iter().copied().fold(0.0f32, f32::max)
+            );
+            confidence_limits.insert(name, limits);
         }
         let capacity = context_max
             .checked_add(c.block_size)
@@ -1606,22 +1664,10 @@ mod tests {
             let expected_ids = ids(&tensors, "proposals_tensor", &[b])?;
             let expected_hidden = values(&tensors, "draft_norm_hidden", &[1, b, h])?;
             let expected_confidence = values(&tensors, "confidence_c_k", &[b])?;
-            let confidence_floor = values(&floors, "confidence_c_k", &[b])?;
-            let parents: Vec<_> = std::iter::once(block_ids[0])
-                .chain(expected_ids.iter().copied().take(b - 1))
-                .collect();
             let final_coefficient = coefficient(&c, context, c.num_hidden_layers, 2);
-            let (confidence_budget, isolated_budget) = confidence_bounds(
-                &draft,
-                (&expected_hidden, &confidence_floor),
-                &parents,
-                final_coefficient,
-            )?;
-            println!(
-                "T19_CONFIDENCE_BOUND fixture={name} sigmoid_lipschitz=0.25 full_max={} isolated_max={}",
-                confidence_budget.iter().copied().fold(0.0f32, f32::max),
-                isolated_budget.iter().copied().fold(0.0f32, f32::max)
-            );
+            let (confidence_budget, isolated_budget) = confidence_limits
+                .get(name)
+                .context("confidence budget absent")?;
             let taps: Vec<_> = values(&tensors, "target_taps", &[1, context, 5, h])?
                 .into_iter()
                 .map(bf16::from_f32)
@@ -1744,7 +1790,7 @@ mod tests {
             fixture_defects += compare(
                 &format!("{name}.confidence"),
                 &confidence,
-                (&expected_confidence, &confidence_budget),
+                (&expected_confidence, confidence_budget),
                 0.0,
                 b,
             )?;
@@ -1772,7 +1818,7 @@ mod tests {
             fixture_defects += compare(
                 &format!("{name}.confidence_isolated"),
                 &s.clone_dtoh(&draft.confidence_values)?,
-                (&expected_confidence, &isolated_budget),
+                (&expected_confidence, isolated_budget),
                 0.0,
                 b,
             )?;
@@ -1860,10 +1906,49 @@ mod tests {
             for (i, actual) in many.iter().enumerate() {
                 defects += usize::from(!actual.bits_equal(&first[i % b]));
             }
+            for chunk in [1, 8] {
+                let mut start = 0;
+                for requests in requests.chunks(chunk) {
+                    let actual = draft.distributions_batch(requests)?;
+                    for (index, value) in actual.iter().enumerate() {
+                        defects += usize::from(!value.bits_equal(&first[start + index]));
+                    }
+                    native_requests += actual.len();
+                    start += actual.len();
+                }
+            }
             for (actual, expected) in first.iter().zip(&expected_ids) {
                 defects += usize::from(actual.tokens[0] != *expected);
             }
             native_requests += requests.len() + expanded.len();
+            if name == names[0] {
+                let maximum = s
+                    .clone_dtoh(&draft.weights.w2)?
+                    .iter()
+                    .map(|v| v.to_f32().abs())
+                    .fold(0.0f32, f32::max);
+                let parent = block_ids[0] as usize;
+                let embedding = s.clone_dtoh(
+                    &draft
+                        .weights
+                        .w1
+                        .slice(parent * c.markov_rank..(parent + 1) * c.markov_rank),
+                )?;
+                let magnitude: f32 =
+                    embedding.iter().map(|v| v.to_f32().abs()).sum::<f32>() * maximum;
+                let mut base = vec![bf16::ZERO; v];
+                base[v - 1] = bf16::from_f32(2.0 * magnitude + 1.0);
+                s.memcpy_htod(&base, &mut draft.base.slice_mut((b - 1) * v..b * v))?;
+                let tail = draft.distributions_batch(&[((b - 1) as u8, block_ids[0])])?;
+                defects += usize::from(tail[0].tokens[0] as usize != v - 1);
+                native_requests += 1;
+                println!(
+                    "T19_VOCAB_TAIL vocab={v} row={} expected={} actual={} defects={defects}",
+                    b - 1,
+                    v - 1,
+                    tail[0].tokens[0]
+                );
+            }
 
             draft.position_shift = 257;
             draft.reset_setup()?;

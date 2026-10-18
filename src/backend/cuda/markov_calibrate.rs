@@ -250,7 +250,12 @@ fn measure(
         let reference = super::markov::phase1_bits(s, &functions[0].1, &state)?;
         let candidate = super::markov::phase1_bits(s, &functions[1].1, &state)?;
         ensure!(
-            reference == candidate,
+            reference
+                .0
+                .iter()
+                .chain(&reference.1)
+                .zip(candidate.0.iter().chain(&candidate.1))
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
             "markov phase-1 bodies diverge bitwise at P={p}"
         );
         let mut trials = Vec::new();

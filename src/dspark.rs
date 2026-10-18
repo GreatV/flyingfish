@@ -137,9 +137,10 @@ impl DraftConfig {
             c.num_hidden_layers == 5 && c.markov_rank == 256,
             "DSpark requires five layers and Markov rank256"
         );
+        let row_limit = if c.head_dim == 128 { 8 } else { 64 };
         ensure!(
-            (1..=64).contains(&c.block_size),
-            "DSpark block_size exceeds the 64-row attention mask"
+            (1..=row_limit).contains(&c.block_size),
+            "DSpark block_size exceeds its attention geometry row limit {row_limit}"
         );
         ensure!(
             c.block_size.checked_mul(c.vocab_size).is_some()
@@ -169,6 +170,19 @@ impl DraftConfig {
                 && c.rope_parameters.rope_dim.unwrap_or(c.head_dim) == c.head_dim,
             "DSpark requires default full-head rotary geometry"
         );
+        if c.head_dim == 256 {
+            crate::op_contract::FullAttentionSpec {
+                hq: c.num_attention_heads as u32,
+                hkv: c.num_key_value_heads as u32,
+                d: c.head_dim as u32,
+                scale: (c.head_dim as f32).sqrt().recip(),
+                rms_eps: c.rms_norm_eps,
+                rope_theta: c.rope_parameters.rope_theta,
+                rotary_dim: c.head_dim as u32,
+            }
+            .validate()
+            .context("unsupported DSpark full-attention parameters")?;
+        }
         Ok(c)
     }
 }
@@ -206,6 +220,9 @@ fn read_config(path: &Path) -> Result<serde_json::Value> {
         ] {
             if let Some(actual) = fields.get(name) {
                 ensure!(*actual == expected, "unsupported DSpark {name}");
+                if let Some(existing) = root.get(name) {
+                    ensure!(existing == actual, "ambiguous DSpark config field {name}");
+                }
             }
         }
     }
@@ -424,6 +441,7 @@ mod tests {
                 serde_json::json!([3, 11, 19, 27, 35]),
             );
             nested.insert("mask_token_id".into(), serde_json::json!(248076));
+            nested.insert("enable_confidence_head".into(), serde_json::json!(true));
             full["dflash_config"] = nested.into();
             write(&full)?;
             let draft = DraftConfig::read(&root, &hybrid_target)?;
@@ -435,6 +453,7 @@ mod tests {
                 ("draft_vocab_size", serde_json::json!(130560)),
                 ("block_size", serde_json::json!(65)),
                 ("num_attention_heads", serde_json::json!(16)),
+                ("enable_confidence_head", serde_json::json!(false)),
                 (
                     "rope_parameters",
                     serde_json::json!({"rope_theta":1e7,"rope_type":"default","rope_dim":64}),
