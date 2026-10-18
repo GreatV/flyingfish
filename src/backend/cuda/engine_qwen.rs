@@ -1,5 +1,6 @@
 //! Qwen bindings and operators of the shared Engine.
 use super::*;
+use crate::backend::cuda::contracts::view;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
@@ -200,37 +201,6 @@ impl<T> PrefillPlans<T> {
         }
         Ok(Narrowed::Owned(narrow(&self.full, rows as u32)?))
     }
-}
-pub(super) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
-    b: &CudaSlice<T>,
-    s: &Arc<CudaStream>,
-    offset: usize,
-    shape: [u32; R],
-    stride: [u64; R],
-) -> Result<Tensor<T, R>> {
-    ensure!(offset < b.len(), "view offset outside allocation");
-    let elements = shape
-        .iter()
-        .zip(&stride)
-        .try_fold(1u64, |extent, (&n, &step)| {
-            ensure!(n > 0, "zero view dimension");
-            extent
-                .checked_add(
-                    u64::from(n - 1)
-                        .checked_mul(step)
-                        .context("view stride overflow")?,
-                )
-                .context("view extent overflow")
-        })?;
-    ensure!(
-        elements <= (b.len() - offset) as u64,
-        "view exceeds allocation"
-    );
-    let bytes = elements
-        .checked_mul(size_of::<T>() as u64)
-        .context("view byte overflow")?;
-    let (ptr, _read) = b.device_ptr(s);
-    unsafe { Tensor::new(ptr + (offset * size_of::<T>()) as u64, shape, stride, bytes) }
 }
 pub(super) fn matrix(
     b: &CudaSlice<bf16>,
@@ -451,14 +421,15 @@ impl Runtime {
                                     256,
                                 )?,
                                 q: TensorMut(heads(&mw.q, s, 0, active_rows, attention.hq, 256)?),
-                                gate: TensorMut(heads(
+                                gate: Some(TensorMut(heads(
                                     &mw.gate,
                                     s,
                                     0,
                                     active_rows,
                                     attention.hq,
                                     256,
-                                )?),
+                                )?)),
+                                norm_mode: crate::backend::cuda::ops::RmsMode::ZeroCentered,
                                 k_cache: TensorMut(view(
                                     k,
                                     s,

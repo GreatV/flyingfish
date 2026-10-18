@@ -38,14 +38,15 @@ pub(crate) enum PositionBindings {
 #[derive(Debug)]
 pub(crate) struct AttentionBindings {
     pub compact: Option<super::state::CacheView>,
-    /// Projection `[max_rows, hq, 512]`: Q at head offset 0, gate at +256.
+    /// Q projection `[max_rows,hq,256]`, or Q/gate `[max_rows,hq,512]` with gate present.
     pub q_gate: Tensor<bf16, 3>,
     /// Projection K and V, `[max_rows, hkv, 256]`, read-only.
     pub k: Tensor<bf16, 3>,
     pub v: Tensor<bf16, 3>,
     /// Independent Q and gate `[max_rows, hq, 256]`.
     pub q: TensorMut<bf16, 3>,
-    pub gate: TensorMut<bf16, 3>,
+    pub gate: Option<TensorMut<bf16, 3>>,
+    pub norm_mode: RmsMode,
     /// Head-major caches `[hkv, capacity, 256]`, two separate buffers.
     pub k_cache: TensorMut<bf16, 3>,
     pub v_cache: TensorMut<bf16, 3>,
@@ -104,7 +105,12 @@ impl FullAttentionPlan {
             k: b.k.prefix_rows(rows)?,
             v: b.v.prefix_rows(rows)?,
             q: TensorMut(b.q.read().prefix_rows(rows)?),
-            gate: TensorMut(b.gate.read().prefix_rows(rows)?),
+            gate: b
+                .gate
+                .as_ref()
+                .map(|v| v.read().prefix_rows(rows).map(TensorMut))
+                .transpose()?,
+            norm_mode: b.norm_mode,
             k_cache: TensorMut(b.k_cache.read()),
             v_cache: TensorMut(b.v_cache.read()),
             core_out: TensorMut(b.core_out.read().prefix_rows(rows)?),
@@ -210,12 +216,25 @@ fn check_bindings(
     }
     let rows = limits.max_rows;
     let cap = b.compact.map_or(limits.capacity, |v| v.ring as u32);
-    want(&b.q_gate, [rows, spec.hq, 2 * D], "q_gate")?;
+    let input_width = if b.gate.is_some() { 2 * D } else { D };
+    want(&b.q_gate, [rows, spec.hq, input_width], "q_gate")?;
     ensure!(
-        b.q_gate.stride == [u64::from(spec.hq) * 2 * u64::from(D), u64::from(2 * D), 1],
-        "q_gate must be the packed [M,hq,512] projection"
+        (if b.gate.is_some() {
+            b.q_gate.stride[0] == u64::from(spec.hq) * u64::from(input_width)
+        } else {
+            b.q_gate.stride[0] >= u64::from(spec.hq) * u64::from(input_width)
+        }) && b.q_gate.stride[1..] == [u64::from(input_width), 1],
+        "Q input must have packed heads within each projection row"
     );
-    for (view, name) in [(&b.q, "q"), (&b.gate, "gate"), (&b.core_out, "core_out")] {
+    if let Some(gate) = &b.gate {
+        let t = gate.read();
+        want(&t, [rows, spec.hq, D], "gate")?;
+        ensure!(
+            t.stride == [u64::from(spec.hq) * u64::from(D), u64::from(D), 1],
+            "gate must be contiguous"
+        );
+    }
+    for (view, name) in [(&b.q, "q"), (&b.core_out, "core_out")] {
         let t = view.read();
         want(&t, [rows, spec.hq, D], name)?;
         ensure!(
@@ -225,9 +244,12 @@ fn check_bindings(
     }
     for (view, name) in [(&b.k, "k"), (&b.v, "v")] {
         want(view, [rows, spec.hkv, D], name)?;
+        let row_stride = u64::from(spec.hkv) * u64::from(D);
         ensure!(
-            view.stride == [u64::from(spec.hkv) * u64::from(D), u64::from(D), 1],
-            "{name} must be a contiguous [M,hkv,256] projection"
+            (view.stride[0] == row_stride
+                || (b.gate.is_none() && view.stride[0] == b.q_gate.stride[0]))
+                && view.stride[1..] == [u64::from(D), 1],
+            "{name} must use packed heads in the declared projection row"
         );
     }
     for (view, name) in [(&b.k_cache, "k_cache"), (&b.v_cache, "v_cache")] {
@@ -455,11 +477,11 @@ impl FullAttentionOps {
                 .launch_builder(&plan.kernels.qg_split)
                 .arg(&b.q_gate.ptr)
                 .arg(&b.q.0.ptr)
-                .arg(&b.gate.0.ptr)
+                .arg(&b.gate.as_ref().map_or(0, |v| v.0.ptr))
                 .arg(&meta.ptr)
                 .arg(&(b.q_gate.stride[0] as i32))
                 .arg(&q_tok)
-                .arg(&(b.gate.0.stride[0] as i32))
+                .arg(&b.gate.as_ref().map_or(0, |v| v.0.stride[0] as i32))
                 .launch(plan.split_cfg)?;
         }
 
@@ -477,7 +499,7 @@ impl FullAttentionOps {
             b.q_norm,
             &mut q_out,
             RmsOptions {
-                mode: RmsMode::ZeroCentered,
+                mode: b.norm_mode,
                 eps: plan.spec.rms_eps,
             },
         )?;
@@ -496,7 +518,7 @@ impl FullAttentionOps {
             b.k_norm,
             &mut k_out,
             RmsOptions {
-                mode: RmsMode::ZeroCentered,
+                mode: b.norm_mode,
                 eps: plan.spec.rms_eps,
             },
         )?;
@@ -732,7 +754,8 @@ mod tests {
             k: view([37, 2, 256], [512, 256, 1])?,
             v: view([37, 2, 256], [512, 256, 1])?,
             q: TensorMut(view([37, 16, 256], [4096, 256, 1])?),
-            gate: TensorMut(view([37, 16, 256], [4096, 256, 1])?),
+            gate: Some(TensorMut(view([37, 16, 256], [4096, 256, 1])?)),
+            norm_mode: RmsMode::ZeroCentered,
             core_out: TensorMut(view([37, 16, 256], [4096, 256, 1])?),
             k_cache: TensorMut(view([2, 8192, 256], [8192 * 256, 256, 1])?),
             v_cache: TensorMut(view([2, 8192, 256], [8192 * 256, 256, 1])?),
@@ -750,6 +773,21 @@ mod tests {
         bindings.k_cache.0.shape[0] = 2;
         bindings.q_gate.stride[0] = 24 * 512;
         assert!(check_bindings(&bindings, limits, &spec).is_err());
+        let draft_spec = FullAttentionSpec {
+            hq: 8,
+            hkv: 2,
+            rotary_dim: 256,
+            ..spec
+        };
+        bindings.q_gate = view([37, 8, 256], [3072, 256, 1])?;
+        bindings.q = TensorMut(view([37, 8, 256], [2048, 256, 1])?);
+        bindings.core_out = TensorMut(bindings.q.read());
+        bindings.gate = None;
+        bindings.norm_mode = RmsMode::Standard;
+        draft_spec.validate()?;
+        check_bindings(&bindings, limits, &draft_spec)?;
+        bindings.q_gate.stride[1] = 512;
+        assert!(check_bindings(&bindings, limits, &draft_spec).is_err());
         Ok(())
     }
 
@@ -1142,12 +1180,13 @@ mod tests {
                 [max_rows, spec.hq, D],
                 [(spec.hq * D) as u64, D as u64, 1],
             )?),
-            gate: TensorMut(view(
+            gate: Some(TensorMut(view(
                 &dev_gate,
                 stream,
                 [max_rows, spec.hq, D],
                 [(spec.hq * D) as u64, D as u64, 1],
-            )?),
+            )?)),
+            norm_mode: RmsMode::ZeroCentered,
             k_cache: TensorMut(view(
                 &dev_k_cache,
                 stream,

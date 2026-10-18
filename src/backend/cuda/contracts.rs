@@ -1,6 +1,40 @@
 //! Non-owning operator views. Engine owns storage through completion of all launches.
 use anyhow::{Context, Result, ensure};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use std::sync::Arc;
 use std::{marker::PhantomData, mem::size_of};
+
+pub(crate) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
+    b: &CudaSlice<T>,
+    s: &Arc<CudaStream>,
+    offset: usize,
+    shape: [u32; R],
+    stride: [u64; R],
+) -> Result<Tensor<T, R>> {
+    ensure!(offset < b.len(), "view offset outside allocation");
+    let elements = shape
+        .iter()
+        .zip(&stride)
+        .try_fold(1u64, |extent, (&n, &step)| {
+            ensure!(n > 0, "zero view dimension");
+            extent
+                .checked_add(
+                    u64::from(n - 1)
+                        .checked_mul(step)
+                        .context("view stride overflow")?,
+                )
+                .context("view extent overflow")
+        })?;
+    ensure!(
+        elements <= (b.len() - offset) as u64,
+        "view exceeds allocation"
+    );
+    let bytes = elements
+        .checked_mul(size_of::<T>() as u64)
+        .context("view byte overflow")?;
+    let (ptr, _read) = b.device_ptr(s);
+    unsafe { Tensor::new(ptr + (offset * size_of::<T>()) as u64, shape, stride, bytes) }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Tensor<T, const R: usize> {

@@ -808,3 +808,66 @@ extern "C" __global__ void __launch_bounds__(MK2_NT) markov2_top4_phase2(
   if (V < 4 || P < 1 || P > 64 || blockDim.x != MK2_NT) __trap();
   markov2_p2_body(scratch_top4, scratch_lse, top4, logp, lse, P, PT, V);
 }
+
+extern "C" __global__ void sum_argmax(const bf16* base, const bf16* bias,
+                                       void* scores, unsigned* token,
+                                       int vocab, int rounding) {
+  if (blockDim.x != 1024 || vocab < 4 || rounding < 0 || rounding > 1) __trap();
+  __shared__ float values[32];
+  __shared__ unsigned ids[32];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  float best = -__int_as_float(0x7f800000);
+  unsigned id = 0xffffffffu;
+  for (int v = tid; v < vocab; v += 1024) {
+    const float score = markov_score(__bfloat162float(bias[v]), base[v], rounding);
+    if (rounding == 0) static_cast<bf16*>(scores)[v] = __float2bfloat16(score);
+    else static_cast<float*>(scores)[v] = score;
+    if (score > best || (score == best && (unsigned)v < id)) { best = score; id = v; }
+  }
+  for (int offset = 16; offset; offset >>= 1) {
+    const float other = __shfl_down_sync(0xffffffffu,best,offset);
+    const unsigned other_id = __shfl_down_sync(0xffffffffu,id,offset);
+    if (lane + offset < 32 && (other > best || (other == best && other_id < id))) { best = other; id = other_id; }
+  }
+  if (lane == 0) { values[warp] = best; ids[warp] = id; }
+  __syncthreads();
+  if (warp == 0) {
+    best = values[lane]; id = ids[lane];
+    for (int offset = 16; offset; offset >>= 1) {
+      const float other = __shfl_down_sync(0xffffffffu,best,offset);
+      const unsigned other_id = __shfl_down_sync(0xffffffffu,id,offset);
+      if (lane + offset < 32 && (other > best || (other == best && other_id < id))) { best = other; id = other_id; }
+    }
+    if (lane == 0) *token = id;
+  }
+}
+
+extern "C" __global__ void concat_dot_sigmoid(const bf16* hidden, const bf16* embeddings,
+                                               const unsigned* anchor, const unsigned* previous,
+                                               const bf16* weight, const bf16* bias,
+                                               float* output, int rows, int width, int rank,
+                                               int vocab) {
+  if (blockDim.x != 256 || rows < 1 || rows > 64 || width < 1 || rank < 1) __trap();
+  const int row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  if (row >= rows) return;
+  const unsigned parent = row == 0 ? *anchor : previous[row - 1];
+  if (parent >= (unsigned)vocab) __trap();
+  float sum = 0.0f;
+  for (int i = tid; i < width + rank; i += 256) {
+    const bf16 value = i < width ? hidden[(size_t)row * width + i]
+                                 : embeddings[(size_t)parent * rank + i - width];
+    sum += __bfloat162float(value) * __bfloat162float(weight[i]);
+  }
+  for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffffu,sum,offset);
+  __shared__ float partials[8];
+  if (lane == 0) partials[warp] = sum;
+  __syncthreads();
+  if (warp == 0) {
+    sum = lane < 8 ? partials[lane] : 0.0f;
+    for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffffu,sum,offset);
+    if (lane == 0) {
+      const float logit = __bfloat162float(__float2bfloat16(sum + __bfloat162float(*bias)));
+      output[row] = 1.0f / (1.0f + expf(-logit));
+    }
+  }
+}

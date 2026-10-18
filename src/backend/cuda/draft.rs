@@ -1,28 +1,131 @@
 use super::{
     Device,
+    attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     blas::Blas,
+    contracts::{Scratch, SeqRef, TensorMut, view},
     copy::{Rect, columns},
     flash::Shape,
-    ops::{Ops, flat, grid},
+    ops::{CommonOpsRef, Ops, RmsMode, flat, grid},
     verification::Verification,
-    weights::{Layer, Weights, checkpoint},
+    weights::{Layer, checkpoint},
 };
 use crate::{config::Config, dspark::DraftConfig, trace::Trace};
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtrMut, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg};
 use half::bf16;
 use std::{path::Path, sync::Arc};
 
 pub struct Compute<'a> {
     pub ops: &'a Ops,
     pub blas: &'a mut Blas,
-    pub config: &'a Config,
 }
 
 enum Output {
     Tokens,
     Device,
     Base,
+}
+
+enum Attention {
+    Cached(Verification),
+    Block(BlockAttention),
+}
+
+struct BlockAttention {
+    layers: Vec<FullAttentionPlan>,
+    metadata: CudaSlice<i32>,
+    positions: CudaSlice<i32>,
+    mask: CudaSlice<u64>,
+    scratch: CudaSlice<u8>,
+    prepare: cudarc::driver::CudaFunction,
+}
+
+impl BlockAttention {
+    fn new(draft: &Draft, device: &Device) -> Result<Self> {
+        use crate::op_contract::{AttentionLimits, FullAttentionSpec};
+        let c = &draft.config;
+        let s = &device.stream;
+        let rows = u32::try_from(c.block_size)?;
+        let limits = AttentionLimits {
+            max_rows: rows,
+            capacity: u32::try_from(draft.capacity)?,
+            key_chunk: 32,
+            causal: 1,
+        };
+        let spec = FullAttentionSpec {
+            hq: u32::try_from(c.num_attention_heads)?,
+            hkv: u32::try_from(c.num_key_value_heads)?,
+            d: u32::try_from(c.head_dim)?,
+            rotary_dim: u32::try_from(c.head_dim)?,
+            scale: (c.head_dim as f32).sqrt().recip(),
+            rms_eps: c.rms_norm_eps,
+            rope_theta: c.rope_parameters.rope_theta,
+        };
+        let request = FullAttentionOps::workspace(&spec, limits)?;
+        let live = if rows == 64 {
+            u64::MAX
+        } else {
+            (1u64 << rows) - 1
+        };
+        let mask = s.clone_htod(&std::array::from_fn::<_, 64, _>(|row| {
+            if row < c.block_size { live } else { 0 }
+        }))?;
+        let positions = s.alloc_zeros::<i32>(c.block_size * 3)?;
+        let metadata = s.alloc_zeros::<i32>(8)?;
+        let scratch = s.alloc_zeros::<u8>(usize::try_from(request.bytes)?)?;
+        let common = CommonOpsRef::new(&device.ctx)?;
+        let width = c.num_attention_heads * c.head_dim;
+        let kv_width = c.kv_dim();
+        let head = c.head_dim as u32;
+        let q_shape = [rows, spec.hq, head];
+        let q_stride = [width as u64, u64::from(head), 1];
+        let kv_shape = [rows, spec.hkv, head];
+        let kv_stride = [c.qkv_dim() as u64, u64::from(head), 1];
+        let cache_shape = [spec.hkv, limits.capacity, head];
+        let cache_stride = [(draft.capacity * c.head_dim) as u64, u64::from(head), 1];
+        let mut layers = Vec::new();
+        for (layer, cache) in draft.weights.layers.iter().zip(&draft.kv) {
+            let bindings = AttentionBindings {
+                compact: None,
+                q_gate: view(
+                    &draft.qkv,
+                    s,
+                    0,
+                    q_shape,
+                    [c.qkv_dim() as u64, u64::from(head), 1],
+                )?,
+                k: view(&draft.qkv, s, width, kv_shape, kv_stride)?,
+                v: view(&draft.qkv, s, width + kv_width, kv_shape, kv_stride)?,
+                q: TensorMut(view(&draft.attn, s, 0, q_shape, q_stride)?),
+                gate: None,
+                norm_mode: RmsMode::Standard,
+                core_out: TensorMut(view(&draft.attn, s, 0, q_shape, q_stride)?),
+                k_cache: TensorMut(view(&cache.k, s, 0, cache_shape, cache_stride)?),
+                v_cache: TensorMut(view(&cache.v, s, 0, cache_shape, cache_stride)?),
+                q_norm: view(&layer.q_norm, s, 0, [head], [1])?,
+                k_norm: view(&layer.k_norm, s, 0, [head], [1])?,
+                causal_mask: view(&mask, s, 0, [64], [1])?,
+                positions: PositionBindings::Axes(view(&positions, s, 0, [rows, 3], [3, 1])?),
+            };
+            layers.push(FullAttentionOps::prepare_reusing(
+                &device.ctx,
+                &spec,
+                limits,
+                bindings,
+                common.clone(),
+                layers.first(),
+            )?);
+        }
+        Ok(Self {
+            layers,
+            metadata,
+            positions,
+            mask,
+            scratch,
+            prepare: super::cubin::module(&device.ctx, "rope")?
+                .load_function("sequence_positions")?,
+        })
+    }
 }
 
 struct LayerWeights {
@@ -38,8 +141,8 @@ struct DraftWeights {
     norm: CudaSlice<bf16>,
     w1: CudaSlice<bf16>,
     w2: CudaSlice<bf16>,
-    confidence: Vec<f32>,
-    confidence_bias: f32,
+    confidence: CudaSlice<bf16>,
+    confidence_bias: CudaSlice<bf16>,
     bytes: usize,
 }
 
@@ -99,13 +202,6 @@ impl DraftWeights {
                 vec![1, h + c.markov_rank],
             )])?;
             let confidence_bias = l.load(&[("confidence_head.proj.bias".into(), vec![1])])?;
-            let confidence = d
-                .upload
-                .clone_dtoh(&confidence)?
-                .into_iter()
-                .map(bf16::to_f32)
-                .collect();
-            let confidence_bias = d.upload.clone_dtoh(&confidence_bias)?[0].to_f32();
             Ok(Self {
                 layers,
                 fc,
@@ -135,9 +231,12 @@ pub struct Draft {
     capacity: usize,
     rows: usize,
     stream: Arc<CudaStream>,
-    attention: Option<Verification>,
+    attention: Option<Attention>,
+    #[cfg(test)]
+    position_shift: i32,
     qknorm_rope_kv: cudarc::driver::CudaFunction,
     ids: CudaSlice<u32>,
+    mask_ids: Vec<u32>,
     position: CudaSlice<i32>,
     x: CudaSlice<bf16>,
     n: CudaSlice<bf16>,
@@ -154,6 +253,11 @@ pub struct Draft {
     packed: CudaSlice<bf16>,
     base: CudaSlice<bf16>,
     scores: CudaSlice<bf16>,
+    combined: Option<CudaSlice<f32>>,
+    confidence_values: CudaSlice<f32>,
+    forced_tokens: CudaSlice<u32>,
+    sum_argmax: cudarc::driver::CudaFunction,
+    concat_dot_sigmoid: cudarc::driver::CudaFunction,
     prev: CudaSlice<bf16>,
     token: CudaSlice<u32>,
     tokens: CudaSlice<u32>,
@@ -209,13 +313,15 @@ impl Draft {
         }
     }
     pub(super) fn reset_setup(&mut self) -> Result<()> {
+        let block_rows = self.config.block_size;
+        self.mask_ids.fill(self.config.mask_token_id);
         let s = &self.stream;
         let dim = self.config.head_dim;
         for kv in &mut self.kv {
             for head in 0..self.config.num_key_value_heads {
                 let lo = head * self.capacity * dim;
-                s.memset_zeros(&mut kv.k.slice_mut(lo..lo + 8 * dim))?;
-                s.memset_zeros(&mut kv.v.slice_mut(lo..lo + 8 * dim))?;
+                s.memset_zeros(&mut kv.k.slice_mut(lo..lo + (block_rows + 1) * dim))?;
+                s.memset_zeros(&mut kv.v.slice_mut(lo..lo + (block_rows + 1) * dim))?;
             }
         }
         for value in [
@@ -242,7 +348,12 @@ impl Draft {
             s.memset_zeros(value)?;
         }
         s.memset_zeros(&mut self.position)?;
-        s.memcpy_htod(&[self.config.mask_token_id; 7], &mut self.ids)?;
+        if let Some(combined) = &mut self.combined {
+            s.memset_zeros(combined)?;
+        }
+        s.memset_zeros(&mut self.confidence_values)?;
+        s.memset_zeros(&mut self.forced_tokens)?;
+        s.memcpy_htod(&self.mask_ids, &mut self.ids)?;
         Ok(())
     }
     pub fn new(
@@ -255,12 +366,19 @@ impl Draft {
         score_rounding: super::markov::ScoreRounding,
     ) -> Result<Self> {
         let config = DraftConfig::read(path, c)?;
-        ensure!(rows >= 8, "DSpark workspace needs at least eight rows");
+        ensure!(
+            rows > config.block_size && capacity >= rows,
+            "DSpark workspace must fit block_size+1 rows within capacity"
+        );
         let weights = DraftWeights::load(path, &config, d)?;
         let s = &d.stream;
-        let h = c.hidden_size;
-        let f = c.intermediate_size;
-        let kv = c.kv_dim();
+        let h = config.hidden_size;
+        let f = config.intermediate_size;
+        let kv = config.kv_dim();
+        let qkv = config.qkv_dim();
+        let vocab = config.vocab_size;
+        let rank = config.markov_rank;
+        let block_rows = config.block_size;
         let mut caches = Vec::new();
         for _ in 0..config.num_hidden_layers {
             caches.push(Kv {
@@ -269,12 +387,12 @@ impl Draft {
             });
         }
         for (n, o, i) in [
-            (7, c.qkv_dim(), h),
-            (7, h, h),
-            (7, 2 * f, h),
-            (7, h, f),
-            (7, c.vocab_size, h),
-            (rows, h, 5 * h),
+            (block_rows, qkv, h),
+            (block_rows, h, h),
+            (block_rows, 2 * f, h),
+            (block_rows, h, f),
+            (block_rows, vocab, h),
+            (rows, h, config.capture_width()),
             (rows, kv, h),
         ] {
             blas.prepare(n, o, i)?;
@@ -284,7 +402,7 @@ impl Draft {
             weights.bytes,
             config.num_hidden_layers * capacity * kv * 4
         );
-        let mask = config.mask_token_id;
+        let mask_ids = vec![config.mask_token_id; block_rows];
         let qknorm_rope_kv =
             super::cubin::module(&d.ctx, "rope")?.load_function("draft_qknorm_rope_kv")?;
         Ok(Self {
@@ -297,32 +415,49 @@ impl Draft {
             rows,
             stream: s.clone(),
             attention: None,
+            #[cfg(test)]
+            position_shift: 0,
             qknorm_rope_kv,
-            ids: s.clone_htod(&[mask; 7])?,
+            ids: s.clone_htod(&mask_ids)?,
+            mask_ids,
             position: s.alloc_zeros(1)?,
-            x: s.alloc_zeros(7 * h)?,
-            n: s.alloc_zeros(7 * h)?,
-            qkv: s.alloc_zeros(7 * c.qkv_dim())?,
-            attn: s.alloc_zeros(7 * h)?,
-            out: s.alloc_zeros(7 * h)?,
-            gu: s.alloc_zeros(7 * 2 * f)?,
-            act: s.alloc_zeros(7 * f)?,
+            x: s.alloc_zeros(block_rows * h)?,
+            n: s.alloc_zeros(block_rows * h)?,
+            qkv: s.alloc_zeros(block_rows * qkv)?,
+            attn: s.alloc_zeros(block_rows * h)?,
+            out: s.alloc_zeros(block_rows * h)?,
+            gu: s.alloc_zeros(block_rows * 2 * f)?,
+            act: s.alloc_zeros(block_rows * f)?,
             k_raw: s.alloc_zeros(rows * kv)?,
             k_norm: s.alloc_zeros(rows * kv)?,
             v_raw: s.alloc_zeros(rows * kv)?,
             projected: s.alloc_zeros(rows * h)?,
             context: s.alloc_zeros(rows * h)?,
             packed: s.alloc_zeros(rows * 2 * kv)?,
-            base: s.alloc_zeros(7 * c.vocab_size)?,
-            scores: s.alloc_zeros(7 * c.vocab_size)?,
-            prev: s.alloc_zeros(config_rank(c))?,
+            base: s.alloc_zeros(block_rows * vocab)?,
+            scores: s.alloc_zeros(block_rows * vocab)?,
+            combined: if score_rounding == super::markov::ScoreRounding::F32 {
+                Some(s.alloc_zeros(block_rows * vocab)?)
+            } else {
+                None
+            },
+            confidence_values: s.alloc_zeros(block_rows)?,
+            forced_tokens: s.alloc_zeros(block_rows)?,
+            sum_argmax: super::cubin::module(&d.ctx, "markov")?.load_function("sum_argmax")?,
+            concat_dot_sigmoid: super::cubin::module(&d.ctx, "markov")?
+                .load_function("concat_dot_sigmoid")?,
+            prev: s.alloc_zeros(rank)?,
             token: s.alloc_zeros(1)?,
-            tokens: s.alloc_zeros(7)?,
+            tokens: s.alloc_zeros(block_rows)?,
         })
     }
 
-    pub(super) fn grow(&mut self, c: &Config, rows: usize) -> Result<()> {
-        ensure!(rows >= self.rows, "draft workspace rows cannot shrink");
+    pub(super) fn grow(&mut self, rows: usize) -> Result<()> {
+        ensure!(
+            rows >= self.rows && rows <= self.capacity,
+            "draft workspace rows outside cache bound"
+        );
+        let c = &self.config;
         let s = &self.stream;
         let k_raw = s.alloc_zeros(rows * c.kv_dim())?;
         let k_norm = s.alloc_zeros(rows * c.kv_dim())?;
@@ -373,11 +508,8 @@ impl Draft {
         compute: Compute<'_>,
         trace: Option<(&mut Trace, &str)>,
     ) -> Result<()> {
-        let Compute {
-            ops,
-            blas,
-            config: c,
-        } = compute;
+        let Compute { ops, blas } = compute;
+        let c = &self.config;
         ensure!(
             rows > 0 && rows <= self.rows && start + rows <= self.capacity,
             "draft injection exceeds workspace/cache"
@@ -385,15 +517,15 @@ impl Draft {
         let s = &self.stream;
         let h = c.hidden_size;
         let kv = c.kv_dim();
-        blas.prepare(rows, h, 5 * h)?;
+        blas.prepare(rows, h, c.capture_width())?;
         blas.prepare(rows, kv, h)?;
         blas.linear(
             &self.weights.fc,
-            &input.slice(..rows * 5 * h),
+            &input.slice(..rows * c.capture_width()),
             &mut self.projected.slice_mut(..rows * h),
             rows,
             h,
-            5 * h,
+            c.capture_width(),
         )?;
         norm(
             s,
@@ -440,7 +572,7 @@ impl Draft {
                     .arg(&(c.num_key_value_heads as i32))
                     .arg(&0i32)
                     .arg(&(c.head_dim as i32))
-                    .arg(&c.rope_theta)
+                    .arg(&c.rope_parameters.rope_theta)
                     .launch(flat(rows * kv / 2))?;
             }
             columns(
@@ -488,6 +620,14 @@ impl Draft {
             add_trace(
                 s,
                 trace,
+                format!("{prefix}.c_projected"),
+                &self.projected,
+                rows,
+                h,
+            )?;
+            add_trace(
+                s,
+                trace,
                 format!("{prefix}.c_committed"),
                 &self.context,
                 rows,
@@ -498,9 +638,6 @@ impl Draft {
     }
 }
 
-fn config_rank(_c: &Config) -> usize {
-    256
-}
 fn add_trace(
     s: &Arc<CudaStream>,
     trace: &mut Trace,
@@ -529,13 +666,25 @@ impl Draft {
         if self.attention.is_some() {
             return Ok(());
         }
+        if self.config.head_dim == 256 {
+            self.attention = Some(Attention::Block(BlockAttention::new(self, d)?));
+            return Ok(());
+        }
+        let block_rows = self.config.block_size;
+        let mut geometry = c.clone();
+        geometry.num_attention_heads = self.config.num_attention_heads;
+        geometry.num_key_value_heads = self.config.num_key_value_heads;
+        geometry.head_dim = self.config.head_dim;
+        geometry.rope_theta = self.config.rope_parameters.rope_theta;
+        geometry.rms_norm_eps = self.config.rms_norm_eps;
+        let c = &geometry;
         let measured = super::multi_calibrate::load(
             d,
             ops,
             c,
             dir,
             crate::backend::setup::MultiShape {
-                rows: 7,
+                rows: block_rows,
                 causal: false,
                 capacity: self.capacity,
             },
@@ -544,33 +693,32 @@ impl Draft {
         let (plan, selection) = measured.choose(self.capacity)?;
         eprintln!(
             "{}",
-            serde_json::json!({"backend_setup":{"role":"draft","rows":7,"causal":false,"attention":plan,"selection":selection,"calibration":measured}})
+            serde_json::json!({"backend_setup":{"role":"draft","rows":block_rows,"causal":false,"attention":plan,"selection":selection,"calibration":measured}})
         );
-        self.attention = Some(Verification::with_plan(
+        self.attention = Some(Attention::Cached(Verification::with_plan(
             &d.ctx,
             &d.stream,
             c,
             crate::backend::setup::MultiShape {
                 capacity: self.capacity,
-                rows: 7,
+                rows: block_rows,
                 causal: false,
             },
             plan,
-        )?);
+        )?));
         Ok(())
     }
     pub fn propose(
         &mut self,
         anchor: u32,
         start: usize,
-        target: &Weights,
+        target: (&CudaSlice<bf16>, &CudaSlice<bf16>),
         compute: Compute<'_>,
         trace: Option<(&mut Trace, &str)>,
         forced: Option<&[u32]>,
     ) -> Result<Vec<u32>> {
-        let mut ids = [self.config.mask_token_id; 7];
-        ids[0] = anchor;
-        self.stream.memcpy_htod(&ids, &mut self.ids)?;
+        self.mask_ids[0] = anchor;
+        self.stream.memcpy_htod(&self.mask_ids, &mut self.ids)?;
         self.stream
             .memcpy_htod(&[start as i32], &mut self.position)?;
         self.block(start, target, compute, trace, forced, Output::Tokens)
@@ -581,7 +729,7 @@ impl Draft {
         anchor: &CudaSlice<u32>,
         position: &CudaSlice<i32>,
         start: usize,
-        target: &Weights,
+        target: (&CudaSlice<bf16>, &CudaSlice<bf16>),
         compute: Compute<'_>,
     ) -> Result<()> {
         self.stream
@@ -595,12 +743,11 @@ impl Draft {
         &mut self,
         anchor: u32,
         start: usize,
-        target: &Weights,
+        target: (&CudaSlice<bf16>, &CudaSlice<bf16>),
         compute: Compute<'_>,
     ) -> Result<()> {
-        let mut ids = [self.config.mask_token_id; 7];
-        ids[0] = anchor;
-        self.stream.memcpy_htod(&ids, &mut self.ids)?;
+        self.mask_ids[0] = anchor;
+        self.stream.memcpy_htod(&self.mask_ids, &mut self.ids)?;
         self.stream
             .memcpy_htod(&[start as i32], &mut self.position)?;
         self.block(start, target, compute, None, None, Output::Base)?;
@@ -612,7 +759,7 @@ impl Draft {
         anchor: &CudaSlice<u32>,
         position: &CudaSlice<i32>,
         start: usize,
-        target: &Weights,
+        target: (&CudaSlice<bf16>, &CudaSlice<bf16>),
         compute: Compute<'_>,
     ) -> Result<()> {
         self.stream
@@ -675,9 +822,31 @@ impl Draft {
             "draft bit comparison range exceeds KV"
         );
         let s = &self.stream;
+        if let Some(Attention::Block(attention)) = &self.attention {
+            for values in [&attention.metadata, &attention.positions] {
+                out.extend(s.clone_dtoh(values)?.iter().flat_map(|v| v.to_le_bytes()));
+            }
+            out.extend(
+                s.clone_dtoh(&attention.mask)?
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes()),
+            );
+        }
         for values in [&self.n, &self.base, &self.scores] {
             super::copy::bits(s, values, out)?;
         }
+        if let Some(combined) = &self.combined {
+            out.extend(
+                s.clone_dtoh(combined)?
+                    .iter()
+                    .flat_map(|v| v.to_bits().to_le_bytes()),
+            );
+        }
+        out.extend(
+            s.clone_dtoh(&self.confidence_values)?
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes()),
+        );
         let d = self.config.head_dim;
         for kv in &self.kv {
             for head in 0..self.config.num_key_value_heads {
@@ -693,7 +862,7 @@ impl Draft {
     fn block(
         &mut self,
         start: usize,
-        target: &Weights,
+        target: (&CudaSlice<bf16>, &CudaSlice<bf16>),
         compute: Compute<'_>,
         mut trace: Option<(&mut Trace, &str)>,
         forced: Option<&[u32]>,
@@ -701,20 +870,18 @@ impl Draft {
     ) -> Result<Vec<u32>> {
         if let Some(tokens) = forced {
             ensure!(
-                tokens.len() == 7
+                tokens.len() == self.config.block_size
                     && tokens
                         .iter()
                         .all(|&v| (v as usize) < self.config.vocab_size),
                 "invalid teacher-forced Markov tokens"
             );
         }
-        let Compute {
-            ops,
-            blas,
-            config: c,
-        } = compute;
+        let Compute { ops, blas } = compute;
+        let c = &self.config;
+        let block_rows = c.block_size;
         ensure!(
-            start + 7 <= self.capacity,
+            start + block_rows <= self.capacity,
             "draft block exceeds KV capacity"
         );
         let s = &self.stream;
@@ -736,21 +903,43 @@ impl Draft {
                     .arg(weight)
                     .arg(output)
                     .arg(&xp)
-                    .arg(&7i32)
+                    .arg(&(block_rows as i32))
                     .arg(&(h as i32))
                     .arg(&eps)
-                    .launch(grid(7, 256))?;
+                    .launch(grid(block_rows, 256))?;
             }
             Ok(())
         };
         unsafe {
             s.launch_builder(&ops.embed)
-                .arg(&target.embed)
+                .arg(target.0)
                 .arg(&self.ids)
                 .arg(&mut self.x)
-                .arg(&7i32)
+                .arg(&(block_rows as i32))
                 .arg(&(h as i32))
-                .launch(flat(7 * h))?;
+                .launch(flat(block_rows * h))?;
+        }
+        if let Some(Attention::Block(attention)) = &mut self.attention {
+            let shift = {
+                #[cfg(test)]
+                {
+                    self.position_shift
+                }
+                #[cfg(not(test))]
+                {
+                    0i32
+                }
+            };
+            unsafe {
+                s.launch_builder(&attention.prepare)
+                    .arg(&self.position)
+                    .arg(&mut attention.metadata)
+                    .arg(&mut attention.positions)
+                    .arg(&(block_rows as i32))
+                    .arg(&(self.capacity as i32))
+                    .arg(&shift)
+                    .launch(grid(1, 256))?;
+            }
         }
         for (i, layer) in self.weights.layers.iter().enumerate() {
             if i == 0 {
@@ -760,63 +949,81 @@ impl Draft {
                     &self.x,
                     &layer.block.input_norm,
                     &mut self.n,
-                    (7, h),
+                    (block_rows, h),
                     self.config.rms_norm_eps,
                 )?;
             }
             blas.linear(
                 &layer.block.qkv,
-                &self.n.slice(..7 * h),
-                &mut self.qkv.slice_mut(..7 * qkv),
-                7,
+                &self.n.slice(..block_rows * h),
+                &mut self.qkv.slice_mut(..block_rows * qkv),
+                block_rows,
                 qkv,
                 h,
             )?;
-            let cache = &mut self.kv[i];
-            unsafe {
-                s.launch_builder(&self.qknorm_rope_kv)
-                    .arg(&mut self.qkv)
-                    .arg(&cache.k)
-                    .arg(&cache.v)
-                    .arg(&layer.q_norm)
-                    .arg(&layer.k_norm)
-                    .arg(&self.position)
-                    .arg(&7i32)
-                    .arg(&(c.num_attention_heads as i32))
-                    .arg(&(c.num_key_value_heads as i32))
-                    .arg(&(c.head_dim as i32))
-                    .arg(&(self.capacity as i32))
-                    .arg(&c.rope_theta)
-                    .arg(&self.config.rms_norm_eps)
-                    .launch(grid(
-                        7 * (c.num_attention_heads + 2 * c.num_key_value_heads),
-                        256,
-                    ))?;
-            }
-            self.attention
+            match self
+                .attention
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("draft attention has not been initialized"))?
-                .run(
-                    &self.qkv,
-                    &self.kv[i].k,
-                    &self.kv[i].v,
-                    &mut self.attn,
-                    &self.position,
-                    Shape {
-                        rows: 7,
-                        start,
-                        q_heads: c.num_attention_heads,
-                        kv_heads: c.num_key_value_heads,
-                        capacity: self.capacity,
-                        head_dim: c.head_dim,
-                        causal: false,
-                    },
-                )?;
+            {
+                Attention::Cached(attention) => {
+                    let cache = &mut self.kv[i];
+                    unsafe {
+                        s.launch_builder(&self.qknorm_rope_kv)
+                            .arg(&mut self.qkv)
+                            .arg(&cache.k)
+                            .arg(&cache.v)
+                            .arg(&layer.q_norm)
+                            .arg(&layer.k_norm)
+                            .arg(&self.position)
+                            .arg(&(block_rows as i32))
+                            .arg(&(c.num_attention_heads as i32))
+                            .arg(&(c.num_key_value_heads as i32))
+                            .arg(&(c.head_dim as i32))
+                            .arg(&(self.capacity as i32))
+                            .arg(&c.rope_parameters.rope_theta)
+                            .arg(&self.config.rms_norm_eps)
+                            .launch(grid(
+                                block_rows * (c.num_attention_heads + 2 * c.num_key_value_heads),
+                                256,
+                            ))?;
+                    }
+                    attention.run(
+                        &self.qkv,
+                        &self.kv[i].k,
+                        &self.kv[i].v,
+                        &mut self.attn,
+                        &self.position,
+                        Shape {
+                            rows: block_rows,
+                            start,
+                            q_heads: c.num_attention_heads,
+                            kv_heads: c.num_key_value_heads,
+                            capacity: self.capacity,
+                            head_dim: c.head_dim,
+                            causal: false,
+                        },
+                    )?;
+                }
+                Attention::Block(attention) => {
+                    let (metadata, _meta_hold) = attention.metadata.device_ptr(s);
+                    let (scratch, _scratch_hold) = attention.scratch.device_ptr(s);
+                    FullAttentionOps::run(
+                        &attention.layers[i],
+                        s,
+                        SeqRef { ptr: metadata },
+                        Scratch {
+                            ptr: scratch,
+                            bytes: attention.scratch.len() as u64,
+                        },
+                    )?;
+                }
+            }
             blas.linear(
                 &layer.block.o,
-                &self.attn.slice(..7 * h),
-                &mut self.out.slice_mut(..7 * h),
-                7,
+                &self.attn.slice(..block_rows * h),
+                &mut self.out.slice_mut(..block_rows * h),
+                block_rows,
                 h,
                 h,
             )?;
@@ -829,9 +1036,9 @@ impl Draft {
             )?;
             blas.linear(
                 &layer.block.gu,
-                &self.n.slice(..7 * h),
-                &mut self.gu.slice_mut(..7 * 2 * f),
-                7,
+                &self.n.slice(..block_rows * h),
+                &mut self.gu.slice_mut(..block_rows * 2 * f),
+                block_rows,
                 2 * f,
                 h,
             )?;
@@ -839,15 +1046,15 @@ impl Draft {
                 s.launch_builder(&ops.act)
                     .arg(&self.gu)
                     .arg(&mut self.act)
-                    .arg(&7i32)
+                    .arg(&(block_rows as i32))
                     .arg(&(f as i32))
-                    .launch(flat(7 * f))?;
+                    .launch(flat(block_rows * f))?;
             }
             blas.linear(
                 &layer.block.down,
-                &self.act.slice(..7 * f),
-                &mut self.out.slice_mut(..7 * h),
-                7,
+                &self.act.slice(..block_rows * f),
+                &mut self.out.slice_mut(..block_rows * h),
+                block_rows,
                 h,
                 f,
             )?;
@@ -857,12 +1064,22 @@ impl Draft {
                 &self.weights.norm
             };
             add_norm(ops, &self.out, &mut self.x, weight, &mut self.n)?;
+            if let Some((trace, prefix)) = trace.as_mut() {
+                add_trace(
+                    s,
+                    trace,
+                    format!("{prefix}.layer.{i}"),
+                    &self.x,
+                    block_rows,
+                    h,
+                )?;
+            }
         }
         blas.linear(
-            &target.head,
-            &self.n.slice(..7 * h),
-            &mut self.base.slice_mut(..7 * c.vocab_size),
-            7,
+            target.1,
+            &self.n.slice(..block_rows * h),
+            &mut self.base.slice_mut(..block_rows * c.vocab_size),
+            block_rows,
             c.vocab_size,
             h,
         )?;
@@ -870,8 +1087,10 @@ impl Draft {
             return Ok(Vec::new());
         }
         s.memcpy_dtod(&self.ids.slice(..1), &mut self.token)?;
-        let mut confidence = Vec::new();
-        for row in 0..7 {
+        if let Some(tokens) = forced {
+            s.memcpy_htod(tokens, &mut self.forced_tokens)?;
+        }
+        for row in 0..block_rows {
             unsafe {
                 s.launch_builder(&ops.embed)
                     .arg(&self.weights.w1)
@@ -880,19 +1099,6 @@ impl Draft {
                     .arg(&1i32)
                     .arg(&(self.config.markov_rank as i32))
                     .launch(flat(self.config.markov_rank))?;
-            }
-            if trace.is_some() {
-                let hrow = s.clone_dtoh(&self.n.slice(row * h..(row + 1) * h))?;
-                let prev = s.clone_dtoh(&self.prev)?;
-                let sum = hrow
-                    .into_iter()
-                    .chain(prev)
-                    .zip(&self.weights.confidence)
-                    .map(|(v, w)| v.to_f32() * w)
-                    .sum::<f32>()
-                    + self.weights.confidence_bias;
-                let value = bf16::from_f32(sum).to_f32();
-                confidence.push(bf16::from_f32(1.0 / (1.0 + (-value).exp())).to_f32());
             }
             blas.linear(
                 &self.weights.w2,
@@ -904,34 +1110,52 @@ impl Draft {
                 c.vocab_size,
                 self.config.markov_rank,
             )?;
+            let (bias, _bias_hold) = self.scores.device_ptr_mut(s);
+            let (combined, _combined_hold) = if let Some(values) = &mut self.combined {
+                let (ptr, hold) = values.device_ptr_mut(s);
+                (Some(ptr), Some(hold))
+            } else {
+                (None, None)
+            };
+            let bias_row = bias + (row * c.vocab_size * 2) as u64;
+            let score_row = combined.map_or(bias_row, |ptr| ptr + (row * c.vocab_size * 4) as u64);
             unsafe {
-                s.launch_builder(&ops.residual)
-                    .arg(
-                        &mut self
-                            .scores
-                            .slice_mut(row * c.vocab_size..(row + 1) * c.vocab_size),
-                    )
+                s.launch_builder(&self.sum_argmax)
                     .arg(
                         &self
                             .base
                             .slice(row * c.vocab_size..(row + 1) * c.vocab_size),
                     )
-                    .arg(&(c.vocab_size as i32))
-                    .launch(flat(c.vocab_size))?;
-                s.launch_builder(&ops.argmax)
-                    .arg(
-                        &self
-                            .scores
-                            .slice(row * c.vocab_size..(row + 1) * c.vocab_size),
-                    )
+                    .arg(&bias_row)
+                    .arg(&score_row)
                     .arg(&mut self.token)
                     .arg(&(c.vocab_size as i32))
+                    .arg(&(self.score_rounding as i32))
                     .launch(grid(1, 1024))?;
             }
             s.memcpy_dtod(&self.token, &mut self.tokens.slice_mut(row..row + 1))?;
-            if let Some(tokens) = forced {
-                s.memcpy_htod(&[tokens[row]], &mut self.token)?;
+            if forced.is_some() {
+                s.memcpy_dtod(&self.forced_tokens.slice(row..row + 1), &mut self.token)?;
             }
+        }
+        unsafe {
+            s.launch_builder(&self.concat_dot_sigmoid)
+                .arg(&self.n)
+                .arg(&self.weights.w1)
+                .arg(&self.ids)
+                .arg(if forced.is_some() {
+                    &self.forced_tokens
+                } else {
+                    &self.tokens
+                })
+                .arg(&self.weights.confidence)
+                .arg(&self.weights.confidence_bias)
+                .arg(&mut self.confidence_values)
+                .arg(&(block_rows as i32))
+                .arg(&(h as i32))
+                .arg(&(c.markov_rank as i32))
+                .arg(&(c.vocab_size as i32))
+                .launch(grid(block_rows, 256))?;
         }
         let proposals = if matches!(output, Output::Tokens) {
             s.clone_dtoh(&self.tokens)?
@@ -939,33 +1163,55 @@ impl Draft {
             Vec::new()
         };
         if let Some((trace, prefix)) = trace.as_mut() {
-            add_trace(s, trace, format!("{prefix}.H"), &self.n, 7, h)?;
-            add_trace(s, trace, format!("{prefix}.B"), &self.base, 7, c.vocab_size)?;
+            add_trace(s, trace, format!("{prefix}.H"), &self.n, block_rows, h)?;
             add_trace(
                 s,
                 trace,
-                format!("{prefix}.s"),
-                &self.scores,
-                7,
+                format!("{prefix}.B"),
+                &self.base,
+                block_rows,
                 c.vocab_size,
             )?;
-            trace.add(format!("{prefix}.conf"), vec![7], confidence)?;
+            if let Some(combined) = &self.combined {
+                add_trace(
+                    s,
+                    trace,
+                    format!("{prefix}.M"),
+                    &self.scores,
+                    block_rows,
+                    c.vocab_size,
+                )?;
+                trace.add(
+                    format!("{prefix}.s"),
+                    vec![block_rows, c.vocab_size],
+                    s.clone_dtoh(combined)?,
+                )?;
+            } else {
+                add_trace(
+                    s,
+                    trace,
+                    format!("{prefix}.s"),
+                    &self.scores,
+                    block_rows,
+                    c.vocab_size,
+                )?;
+            }
+            trace.add(
+                format!("{prefix}.conf"),
+                vec![block_rows],
+                s.clone_dtoh(&self.confidence_values)?,
+            )?;
             trace.add(
                 format!("{prefix}.proposed"),
-                vec![7],
+                vec![block_rows],
                 proposals.iter().map(|&v| v as f32).collect(),
             )?;
         }
         Ok(proposals)
     }
 
-    pub fn snapshot_kv(
-        &self,
-        trace: &mut Trace,
-        start: usize,
-        rows: usize,
-        c: &Config,
-    ) -> Result<()> {
+    pub fn snapshot_kv(&self, trace: &mut Trace, start: usize, rows: usize) -> Result<()> {
+        let c = &self.config;
         ensure!(
             start + rows <= self.capacity,
             "draft KV snapshot exceeds capacity"

@@ -906,7 +906,7 @@ impl Engine {
             self.work
                 .grow(&self.device.stream, &self.model_spec, rows)?;
             if let Some(spec) = &mut self.spec {
-                spec.draft.grow(&self.config, rows)?;
+                spec.draft.grow(rows)?;
             }
             if let Some(capture) = &mut self.hidden_capture {
                 capture.grow(rows, &self.device.stream)?;
@@ -1673,7 +1673,7 @@ impl Engine {
                     let taps = binding.taps;
                     let mut x = TensorMut(qwen::heads(&w.x, s, 0, rows, 1, h as u32)?);
                     let mut y = TensorMut(qwen::heads(&w.n, s, 0, rows, 1, h as u32)?);
-                    let mut capture = TensorMut(qwen::view(
+                    let mut capture = TensorMut(super::contracts::view(
                         &binding.values,
                         s,
                         0,
@@ -2985,7 +2985,6 @@ impl Engine {
             super::draft::Compute {
                 ops: &self.ops,
                 blas: &mut self.blas,
-                config: &self.config,
             },
         )
     }
@@ -3279,7 +3278,6 @@ impl Engine {
             super::draft::Compute {
                 ops: &self.ops,
                 blas: &mut self.blas,
-                config: &self.config,
             },
             trace,
         )
@@ -3296,11 +3294,10 @@ impl Engine {
                     &self.work.token,
                     &self.work.position,
                     start,
-                    &self.weights,
+                    (&self.weights.embed, &self.weights.head),
                     super::draft::Compute {
                         ops: &self.ops,
                         blas: &mut self.blas,
-                        config: &self.config,
                     },
                 ),
             SpecPhase::Verify => {
@@ -3336,7 +3333,6 @@ impl Engine {
                     super::draft::Compute {
                         ops: &self.ops,
                         blas: &mut self.blas,
-                        config: &self.config,
                     },
                 )
             }
@@ -3405,11 +3401,10 @@ impl Engine {
                 &self.work.token,
                 &self.work.position,
                 start,
-                &self.weights,
+                (&self.weights.embed, &self.weights.head),
                 super::draft::Compute {
                     ops: &self.ops,
                     blas: &mut self.blas,
-                    config: &self.config,
                 },
             )
     }
@@ -3505,11 +3500,10 @@ impl Engine {
             spec.draft.propose(
                 anchor,
                 start,
-                &self.weights,
+                (&self.weights.embed, &self.weights.head),
                 super::draft::Compute {
                     ops: &self.ops,
                     blas: &mut self.blas,
-                    config: &self.config,
                 },
                 trace.as_deref_mut().map(|t| (t, prefix)),
                 None,
@@ -3689,11 +3683,10 @@ impl Engine {
             spec.draft.forward_base(
                 anchor,
                 start,
-                &self.weights,
+                (&self.weights.embed, &self.weights.head),
                 super::draft::Compute {
                     ops: &self.ops,
                     blas: &mut self.blas,
-                    config: &self.config,
                 },
             )?;
         }
@@ -3933,11 +3926,10 @@ impl Engine {
         spec.draft.propose(
             anchor,
             position,
-            &self.weights,
+            (&self.weights.embed, &self.weights.head),
             super::draft::Compute {
                 ops: &self.ops,
                 blas: &mut self.blas,
-                config: &self.config,
             },
             Some((trace, prefix)),
             forced,
@@ -3949,7 +3941,7 @@ impl Engine {
             .as_ref()
             .context("draft is not enabled")?
             .draft
-            .snapshot_kv(trace, start, rows, &self.config)
+            .snapshot_kv(trace, start, rows)
     }
 
     pub fn position(&self) -> usize {

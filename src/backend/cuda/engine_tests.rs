@@ -207,7 +207,6 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
             super::super::draft::Compute {
                 ops: &model.ops,
                 blas: &mut model.blas,
-                config: &model.config,
             },
             None,
         )?;

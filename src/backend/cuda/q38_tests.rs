@@ -1065,12 +1065,13 @@ fn verify_run_batch(
             [rows, qwen.hq, D],
             [(qwen.hq * D).into(), D.into(), 1],
         )?),
-        gate: TensorMut(view(
+        gate: Some(TensorMut(view(
             &gate,
             s,
             [rows, qwen.hq, D],
             [(qwen.hq * D).into(), D.into(), 1],
-        )?),
+        )?)),
+        norm_mode: super::ops::RmsMode::ZeroCentered,
         k_cache: TensorMut(view(
             &k_cache,
             s,
@@ -1228,12 +1229,13 @@ fn verify_run_serial(
                 [1, qwen.hq, D],
                 [(qwen.hq * D).into(), D.into(), 1],
             )?),
-            gate: TensorMut(view(
+            gate: Some(TensorMut(view(
                 &gate,
                 s,
                 [1, qwen.hq, D],
                 [(qwen.hq * D).into(), D.into(), 1],
-            )?),
+            )?)),
+            norm_mode: super::ops::RmsMode::ZeroCentered,
             k_cache: TensorMut(view(
                 &k_cache,
                 s,

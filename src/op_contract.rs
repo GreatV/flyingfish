@@ -132,6 +132,7 @@ impl FullAttentionSpec {
         match (self.hq, self.hkv) {
             (24, 4) => Ok("tcmqa_d256"),
             (16, 2) => Ok("tcmqa_d256_q16_kv2"),
+            (8, 2) => Ok("tcmqa_d256_q8_kv2"),
             _ => anyhow::bail!("unsupported attention hq={} hkv={}", self.hq, self.hkv),
         }
     }
@@ -149,12 +150,13 @@ impl FullAttentionSpec {
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            matches!((self.hq, self.hkv), (24, 4) | (16, 2))
-                && self.d == 256
+            matches!(
+                (self.hq, self.hkv, self.rotary_dim),
+                (24, 4, 64) | (16, 2, 64) | (8, 2, 256)
+            ) && self.d == 256
                 && self.scale == 0.0625
                 && self.rms_eps == 1e-6
-                && self.rope_theta == 1e7
-                && self.rotary_dim == 64,
+                && self.rope_theta == 1e7,
             "unsupported full-attention specification: {self:?}"
         );
         Ok(())
@@ -366,10 +368,11 @@ mod tests {
 
     #[test]
     fn attention_workspace_covers_each_bound_head_geometry() -> Result<()> {
-        for (hq, hkv) in [(24, 4), (16, 2)] {
+        for (hq, hkv, rotary_dim) in [(24, 4, 64), (16, 2, 64), (8, 2, 256)] {
             let spec = FullAttentionSpec {
                 hq,
                 hkv,
+                rotary_dim,
                 ..FullAttentionSpec::q38()
             };
             for rows in [1, 2, 5, 8, 37, 512, 4096] {
