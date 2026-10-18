@@ -1587,20 +1587,37 @@ fn decode_video_indices(
         expected <= MAX_DECODED_VIDEO_BYTES,
         "decoded video is expected to be {expected} bytes over the {MAX_DECODED_VIDEO_BYTES}-byte limit"
     );
-    let select = indices
+    let mut unique = indices.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    let select = unique
         .iter()
         .map(|index| format!("eq(n\\,{index})"))
         .collect::<Vec<_>>()
         .join("+");
     let filter = format!("select={select}");
-    let raw = decode_raw(source, Some(&filter), expected)?;
+    let decoded_bytes = unique.len() * frame_bytes;
+    let raw = decode_raw(source, Some(&filter), decoded_bytes)?;
     ensure!(
-        raw.len() == expected,
-        "ffmpeg selected {} bytes, expected {expected} for {} sampled frames",
+        raw.len() == decoded_bytes,
+        "ffmpeg selected {} bytes, expected {decoded_bytes} for {} unique sampled frames",
         raw.len(),
-        indices.len()
+        unique.len()
     );
-    Ok(frames_from_raw(&raw, probed, frame_bytes))
+    indices
+        .iter()
+        .map(|index| {
+            let position = unique.binary_search(index).map_err(|_| {
+                anyhow::anyhow!("sampled frame {index} missing from decoded indices")
+            })?;
+            let start = position * frame_bytes;
+            Ok(RgbImage {
+                width: probed.width as usize,
+                height: probed.height as usize,
+                pixels: raw[start..start + frame_bytes].to_vec(),
+            })
+        })
+        .collect()
 }
 
 fn decode_raw(source: &ScratchVideo, filter: Option<&str>, limit: usize) -> Result<Vec<u8>> {
@@ -2430,6 +2447,64 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_selected_frames_preserve_repeated_low_fps_samples() -> Result<()> {
+        let clip = ScratchVideo::write(&[])?;
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=1/2",
+                "-frames:v",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(clip.path())
+            .status()
+            .context("run ffmpeg to build the two-frame 0.5 fps clip")?;
+        ensure!(status.success(), "ffmpeg failed to build the low-fps clip");
+        let bytes = std::fs::read(clip.path())?;
+        let (source, probed) = probe_video(&bytes)?;
+        let metadata = probed.metadata()?;
+        assert_eq!(metadata.total_num_frames, 2);
+        assert_eq!(metadata.fps, 0.5);
+        assert_eq!(metadata.duration, 4.0);
+        let indices = sample_frame_indices(&metadata, 4, 1)?;
+        assert_eq!(indices, [0, 0, 1, 1]);
+        let selected = decode_video_indices(&source, &probed, &indices)?;
+        let full = decode_video(&bytes)?;
+        assert_eq!(selected.len(), 4);
+        assert_ne!(full.frames[0].pixels, full.frames[1].pixels);
+        for (frame, &index) in selected.iter().zip(&indices) {
+            assert_eq!((frame.width, frame.height), (64, 48));
+            assert_eq!(frame.pixels, full.frames[index].pixels);
+        }
+        assert_eq!(selected[0].pixels, selected[1].pixels);
+        assert_eq!(selected[2].pixels, selected[3].pixels);
+        let processor = video_processor()?;
+        let packed = processor.pack_video_frames(
+            &selected,
+            &VideoOptions {
+                max_num_frames: 4,
+                stack_frames: 1,
+                max_slice_nums: Some(1),
+            },
+        )?;
+        assert_eq!(packed.frames.len(), 4);
+        assert_eq!(packed.frames[0].pixel_values, packed.frames[1].pixel_values);
+        assert_eq!(packed.frames[2].pixel_values, packed.frames[3].pixel_values);
         Ok(())
     }
 
