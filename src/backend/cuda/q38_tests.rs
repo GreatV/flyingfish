@@ -3241,7 +3241,7 @@ fn residual_rms_capture_gpu() -> Result<()> {
                                 .arg(&rp)
                                 .arg(&xp)
                                 .arg(&((rows * hidden) as i32))
-                                .launch(flat(rows * hidden))?;
+                                .launch(super::ops::flat(rows * hidden))?;
                         }
                         common.norm.rms_with(
                             stream,
