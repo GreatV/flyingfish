@@ -2599,6 +2599,7 @@ mod tests {
         Ok(match tap {
             "vision_patch_embeddings" | "vision_tower_out" => 0.0625,
             "vit_merger_out" => 0.03125,
+            "vit_merger_in" => 0.03125,
             "merger_out" => 0.0078125,
             _ if tap.starts_with("vision_layer_") => 0.03125,
             _ => bail!("unknown fixture tap {tap}"),
@@ -2738,7 +2739,42 @@ mod tests {
             .vision
             .as_ref()
             .context("vision configuration missing")?;
-        for case in ["image_hockey_16x", "image_boat_16x"] {
+        let requested: Option<Vec<String>> =
+            std::env::var("FF_MINICPM_VISION_CASES").ok().map(|value| {
+                value
+                    .split(',')
+                    .map(|case| case.trim().to_owned())
+                    .collect()
+            });
+        for (case, pixels_key, sizes_key, video) in [
+            ("image_hockey_16x", "pixel_values", "target_sizes", false),
+            ("image_boat_16x", "pixel_values", "target_sizes", false),
+            (
+                "video_football_16x",
+                "pixel_values_videos",
+                "target_sizes_videos",
+                true,
+            ),
+            (
+                "video_control_same_grid_16x",
+                "pixel_values_videos",
+                "target_sizes_videos",
+                true,
+            ),
+            (
+                "video_control_clip2_16x",
+                "pixel_values_videos",
+                "target_sizes_videos",
+                true,
+            ),
+        ] {
+            let selected = match &requested {
+                Some(list) => list.iter().any(|name| name == case),
+                None => !video,
+            };
+            if !selected {
+                continue;
+            }
             let path = fixture_reference.join(format!("{case}.safetensors"));
             let file =
                 std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
@@ -2746,7 +2782,7 @@ mod tests {
             let source = safetensors::SafeTensors::deserialize(&map)?;
             let sizes = tensor_values(
                 &source,
-                "target_sizes",
+                sizes_key,
                 safetensors::Dtype::I32,
                 i32::from_le_bytes,
             )?;
@@ -2779,7 +2815,7 @@ mod tests {
             .into_iter()
             .map(|m| Ok(u8::try_from(m)?))
             .collect::<Result<_>>()?;
-            let pixel_tensor = source.tensor("pixel_values")?;
+            let pixel_tensor = source.tensor(pixels_key)?;
             ensure!(
                 pixel_tensor.dtype() == safetensors::Dtype::F32,
                 "fixture pixel dtype"
@@ -2822,16 +2858,21 @@ mod tests {
                     .context("MiniCPM vision configuration missing")?
                     .insert_layer
             );
-            let taps = [
+            let mut taps = vec![
                 "vision_patch_embeddings",
                 insert_tap.as_str(),
                 "vit_merger_out",
                 "vision_tower_out",
                 "merger_out",
             ];
+            if video {
+                taps.push("vit_merger_in");
+            }
             for tap in taps {
                 let trace_tap = if tap == "vision_patch_embeddings" {
                     "after_pos_add"
+                } else if tap == "vit_merger_in" {
+                    insert_tap.as_str()
                 } else {
                     tap
                 };
@@ -2876,83 +2917,86 @@ mod tests {
                         * vision.patch as usize,
                 "fixture pixel extent"
             );
-            match merged_input.as_mut() {
-                Some(merged) => {
-                    merged.ids.extend_from_slice(&ids);
-                    merged.modalities.extend_from_slice(&modalities);
-                    merged.pixel_packs.push((patches, pixels));
-                    merged.grids.extend_from_slice(&grids);
+            if !video {
+                match merged_input.as_mut() {
+                    Some(merged) => {
+                        merged.ids.extend_from_slice(&ids);
+                        merged.modalities.extend_from_slice(&modalities);
+                        merged.pixel_packs.push((patches, pixels));
+                        merged.grids.extend_from_slice(&grids);
+                    }
+                    None => {
+                        merged_input = Some(MergedInput {
+                            ids,
+                            modalities,
+                            pixel_packs: vec![(patches, pixels)],
+                            grids,
+                        });
+                    }
                 }
-                None => {
-                    merged_input = Some(MergedInput {
-                        ids,
-                        modalities,
-                        pixel_packs: vec![(patches, pixels)],
-                        grids,
-                    });
-                }
+                merged_expected.push((case, feature_rows));
             }
-            merged_expected.push((case, feature_rows));
         }
         // Two-image reach control: independent per-crop segments must reproduce each standalone
         // merger block and the two blocks must not be byte-identical.
-        let merged = merged_input.context("merged input missing")?;
-        let vision_config = model
-            .vision
-            .as_ref()
-            .context("vision configuration missing")?;
-        let merged_pixels = merge_pixel_packs(
-            &merged.pixel_packs,
-            vision_config.channels as usize,
-            vision_config.patch as usize,
-        );
-        let input = MultimodalInput {
-            input_ids: &merged.ids,
-            modality_ids: &merged.modalities,
-            pixel_values: &merged_pixels,
-            grids: &merged.grids,
-        };
-        let request = runtime.prepare(&device, &mut blas, &input, merged.ids.len())?;
-        let mut trace = crate::trace::Trace::default();
-        trace.set_device(&device.info.name)?;
-        let _images = runtime.encode(s, &blas, request, Some(&mut trace))?;
-        trace.save(&output.join("merged-tower.safetensors"))?;
-        let merged = trace.values("merger_out")?;
-        let output_width = model.vision.as_ref().unwrap().output as usize;
-        let first = merged_expected[0].1 * output_width;
-        let second = merged_expected[1].1 * output_width;
-        ensure!(
-            merged.len() == first + second,
-            "merged merger output extent"
-        );
-        for (index, (case, rows)) in merged_expected.iter().enumerate() {
-            let start = if index == 0 { 0 } else { first };
-            let block = &merged[start..start + rows * output_width];
-            let reference = standalone
-                .get(&format!("{case}/merger_out"))
-                .with_context(|| format!("standalone merger missing for {case}"))?;
-            let metrics = tap_metrics(block, reference)?;
-            eprintln!(
-                "{}",
-                serde_json::json!({"minicpm_vision_control": {"case": case, "tap": "merger_out",
-                    "metrics": metrics}})
+        if let Some(merged) = merged_input {
+            let vision_config = model
+                .vision
+                .as_ref()
+                .context("vision configuration missing")?;
+            let merged_pixels = merge_pixel_packs(
+                &merged.pixel_packs,
+                vision_config.channels as usize,
+                vision_config.patch as usize,
             );
-            let k = tolerances[case]["merger_out"]["k"]
-                .as_f64()
-                .context("merger k")?;
-            let rms = tolerances[case]["merger_out"]["rms"]
-                .as_f64()
-                .context("merger rms")?;
-            let ratio = ulp_ratio(block, reference, rms as f32);
+            let input = MultimodalInput {
+                input_ids: &merged.ids,
+                modality_ids: &merged.modalities,
+                pixel_values: &merged_pixels,
+                grids: &merged.grids,
+            };
+            let request = runtime.prepare(&device, &mut blas, &input, merged.ids.len())?;
+            let mut trace = crate::trace::Trace::default();
+            trace.set_device(&device.info.name)?;
+            let _images = runtime.encode(s, &blas, request, Some(&mut trace))?;
+            trace.save(&output.join("merged-tower.safetensors"))?;
+            let merged = trace.values("merger_out")?;
+            let output_width = model.vision.as_ref().unwrap().output as usize;
+            let first = merged_expected[0].1 * output_width;
+            let second = merged_expected[1].1 * output_width;
             ensure!(
-                ratio <= k,
-                "{case} merged block differs from its standalone run: {ratio} ulps > {k}"
+                merged.len() == first + second,
+                "merged merger output extent"
+            );
+            for (index, (case, rows)) in merged_expected.iter().enumerate() {
+                let start = if index == 0 { 0 } else { first };
+                let block = &merged[start..start + rows * output_width];
+                let reference = standalone
+                    .get(&format!("{case}/merger_out"))
+                    .with_context(|| format!("standalone merger missing for {case}"))?;
+                let metrics = tap_metrics(block, reference)?;
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"minicpm_vision_control": {"case": case, "tap": "merger_out",
+                        "metrics": metrics}})
+                );
+                let k = tolerances[case]["merger_out"]["k"]
+                    .as_f64()
+                    .context("merger k")?;
+                let rms = tolerances[case]["merger_out"]["rms"]
+                    .as_f64()
+                    .context("merger rms")?;
+                let ratio = ulp_ratio(block, reference, rms as f32);
+                ensure!(
+                    ratio <= k,
+                    "{case} merged block differs from its standalone run: {ratio} ulps > {k}"
+                );
+            }
+            ensure!(
+                merged[..first] != merged[first..],
+                "the two images produced identical merger blocks"
             );
         }
-        ensure!(
-            merged[..first] != merged[first..],
-            "the two images produced identical merger blocks"
-        );
         let tap_reports: Vec<_> = verdict
             .iter()
             .map(|(key, (max_abs, ratio, pass))| {
