@@ -303,7 +303,7 @@ fn fp8_prefill_gpu() -> Result<()> {
             .count();
         let bad = output_bad + wave_bad + done_bad;
         println!(
-            "FP8_PREFILL rows={rows} expert_subset={experts} top_k={top_k} stored_gate_up=[{},{}] stored_down=[{hidden},{inter}] active_experts={} native_slot_bytes={} bf16_wave_slot_bytes={} wave_byte_mismatches={wave_bad} contribution_bit_mismatches={output_bad} done_mismatches={done_bad} {}",
+            "FP8_PREFILL rows={rows} expert_subset={experts} top_k={top_k} native_gate=[{inter},{hidden}] native_up=[{inter},{hidden}] native_down=[{hidden},{inter}] wave_gate_up=[{},{}] wave_down=[{hidden},{inter}] active_experts={} native_slot_bytes={} bf16_wave_slot_bytes={} wave_byte_mismatches={wave_bad} contribution_bit_mismatches={output_bad} done_mismatches={done_bad} {}",
             2 * inter,
             hidden,
             order.len(),

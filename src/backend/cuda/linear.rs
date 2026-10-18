@@ -1,6 +1,6 @@
 //! Typed Linear views; all BF16 plans execute through the shared Blas handle.
 use super::{
-    contracts::{Scratch, Tensor, TensorMut},
+    contracts::{RowDomain, Scratch, Tensor, TensorMut},
     weights::WeightCatalog,
 };
 use crate::fp8::Fp8ScaleLayout;
@@ -61,6 +61,7 @@ impl Fp8Ops {
         x: &mut TensorMut<bf16, 2>,
         codes: Option<&TensorMut<u8, 2>>,
         scales: Option<&TensorMut<bf16, 1>>,
+        rows: Option<RowDomain>,
     ) -> Result<()> {
         x.0.validate()?;
         ensure!(
@@ -89,6 +90,12 @@ impl Fp8Ops {
         }
         let codes_ptr = codes.map_or(0, |out| out.0.ptr);
         let scales_ptr = scales.map_or(0, |out| out.0.ptr);
+        if let Some(rows) = rows {
+            rows.validate(x.0.shape[0])?;
+        }
+        let (meta, row_base, row_capacity) = rows.map_or((0, 0, x.0.shape[0]), |rows| {
+            (rows.meta.ptr, rows.row_base, rows.row_capacity)
+        });
         unsafe {
             stream
                 .launch_builder(&self.fake_quant)
@@ -97,7 +104,10 @@ impl Fp8Ops {
                 .arg(&scales_ptr)
                 .arg(&(x.0.shape[0] as i32))
                 .arg(&(x.0.shape[1] as i32))
-                .launch(super::ops::grid(x.0.shape[0] as usize, 256))?;
+                .arg(&meta)
+                .arg(&row_base)
+                .arg(&row_capacity)
+                .launch(super::ops::grid(row_capacity as usize, 256))?;
         }
         Ok(())
     }
@@ -670,8 +680,13 @@ mod tests {
                     let y_view = view(&y, stream, [m, n], [u64::from(n), 1])?;
                     device.finish_upload()?;
                     let execute = || -> Result<()> {
-                        blas.fp8_ops()?
-                            .fake_quant(stream, &mut TensorMut(x_view), None, None)?;
+                        blas.fp8_ops()?.fake_quant(
+                            stream,
+                            &mut TensorMut(x_view),
+                            None,
+                            None,
+                            None,
+                        )?;
                         plan.run(
                             &blas,
                             &role,
@@ -863,6 +878,7 @@ mod tests {
                             &mut TensorMut(x_view),
                             capture_outputs.then_some(&code_view),
                             capture_outputs.then_some(&scale_view),
+                            None,
                         )
                     };
                     if graph {
@@ -922,6 +938,145 @@ mod tests {
             defects == 0,
             "E4M3 activation quantization DEFECT cases={defects}"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU window required"]
+    fn token_quantization_live_rows_gpu() -> Result<()> {
+        use super::super::{contracts::SeqRef, q38_tests::view};
+        use crate::fp8::fake_quant_reference;
+        use cudarc::driver::{DevicePtr, sys};
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let op = Fp8Ops::new(&device.ctx)?;
+        let (rows, width) = (32usize, 257usize);
+        let code_sentinel = 0xa5u8;
+        let scale_sentinel = bf16::from_bits(0x7fc5);
+        let mut defects = 0;
+        let mut cases = 0;
+        for (row_base, row_capacity) in [(0u32, 32u32), (3, 17)] {
+            let values = (0..rows * width)
+                .map(|i| {
+                    let row = i / width;
+                    if row < row_base as usize || row >= 20 {
+                        scale_sentinel
+                    } else {
+                        bf16::from_f32((((row * 37 + (i % width) * 11) % 103) as f32 - 51.0) / 32.0)
+                    }
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                values[20 * width..].iter().all(|v| v.is_nan()),
+                "live-row inactive-NaN fixture invalid"
+            );
+            for graph in [false, true] {
+                let mut x = stream.clone_htod(&values)?;
+                let mut codes = stream.clone_htod(&vec![code_sentinel; values.len()])?;
+                let mut scales = stream.clone_htod(&vec![scale_sentinel; rows])?;
+                let mut metadata = stream.clone_htod(&[3i32, 1, 4, 64, 1, 0, 0, 0])?;
+                let domain = RowDomain {
+                    meta: SeqRef {
+                        ptr: metadata.device_ptr(stream).0,
+                    },
+                    row_base,
+                    row_capacity,
+                };
+                let x_view = view(&x, stream, [rows as u32, width as u32], [width as u64, 1])?;
+                let code_view = TensorMut(view(
+                    &codes,
+                    stream,
+                    [rows as u32, width as u32],
+                    [width as u64, 1],
+                )?);
+                let scale_view = TensorMut(view(&scales, stream, [rows as u32], [1])?);
+                device.finish_upload()?;
+                let execute = || {
+                    op.fake_quant(
+                        stream,
+                        &mut TensorMut(x_view),
+                        Some(&code_view),
+                        Some(&scale_view),
+                        Some(domain),
+                    )
+                };
+                let captured = if graph {
+                    stream.begin_capture(
+                        sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                    )?;
+                    let run = execute();
+                    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                    run?;
+                    Some(captured?.context("empty live-row quantization graph")?)
+                } else {
+                    None
+                };
+                for valid in [1i32, 17, 20, 5] {
+                    stream.memcpy_htod(&values, &mut x)?;
+                    stream.memcpy_htod(&vec![code_sentinel; values.len()], &mut codes)?;
+                    stream.memcpy_htod(&vec![scale_sentinel; rows], &mut scales)?;
+                    stream.memcpy_htod(&[3, valid, 3 + valid, 64, 1, 0, 0, 0], &mut metadata)?;
+                    if let Some(captured) = &captured {
+                        captured.launch()?;
+                    } else {
+                        execute()?;
+                    }
+                    stream.synchronize()?;
+                    let got = stream.clone_dtoh(&x)?;
+                    let got_codes = stream.clone_dtoh(&codes)?;
+                    let got_scales = stream.clone_dtoh(&scales)?;
+                    let mut bad = 0;
+                    for row in 0..rows {
+                        let range = row * width..(row + 1) * width;
+                        let active = row >= row_base as usize
+                            && row < (row_base + row_capacity) as usize
+                            && row < valid as usize;
+                        if active {
+                            let (s, c, f) = fake_quant_reference(&values[range.clone()])?;
+                            ensure!(
+                                got[range.clone()].iter().all(|v| v.is_finite()),
+                                "nonfinite active quantization output"
+                            );
+                            bad += usize::from(got_scales[row].to_bits() != s.to_bits());
+                            bad += got_codes[range.clone()]
+                                .iter()
+                                .zip(&c)
+                                .filter(|(a, b)| a != b)
+                                .count();
+                            bad += got[range]
+                                .iter()
+                                .zip(&f)
+                                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                .count();
+                        } else {
+                            bad +=
+                                usize::from(got_scales[row].to_bits() != scale_sentinel.to_bits());
+                            bad += got_codes[range.clone()]
+                                .iter()
+                                .filter(|&&v| v != code_sentinel)
+                                .count();
+                            bad += got[range.clone()]
+                                .iter()
+                                .zip(&values[range])
+                                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                .count();
+                        }
+                    }
+                    println!(
+                        "E4M3_LIVE_ROWS stored_input=[{rows},{width}] row_base={row_base} row_capacity={row_capacity} valid={valid} graph={graph} bit_mismatches={bad} {}",
+                        if bad == 0 { "PASS" } else { "DEFECT" }
+                    );
+                    defects += usize::from(bad != 0);
+                    cases += 1;
+                }
+            }
+        }
+        println!("E4M3_LIVE_ROWS_SUMMARY cases={cases} defects={defects}");
+        ensure!(defects == 0, "live-row quantization DEFECT cases={defects}");
         Ok(())
     }
 

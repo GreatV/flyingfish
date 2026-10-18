@@ -6,6 +6,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include "q38_contract.cuh"
 
 __device__ __forceinline__ float e4m3_decode(uint8_t code) {
     const uint32_t sign = uint32_t(code & 0x80) << 24;
@@ -262,14 +263,22 @@ FP8_SKINNY_ENTRY(5)
 // scale and normalized quotient round to BF16 before E4M3 conversion.
 extern "C" __global__ void e4m3_fake_quant_bf16(
         __nv_bfloat16* x, uint8_t* codes, __nv_bfloat16* scales,
-        int rows, int cols) {
+        int rows, int cols, const Q38SequenceMeta* meta,
+        uint32_t row_base, uint32_t row_capacity) {
     if (rows <= 0 || cols <= 0 || blockDim.x != 256 || blockDim.y != 1 ||
-        blockDim.z != 1 || gridDim.x != uint32_t(rows) || gridDim.y != 1 ||
+        blockDim.z != 1 || !row_capacity ||
+        uint64_t(row_base) + row_capacity > uint64_t(rows) ||
+        gridDim.x != row_capacity || gridDim.y != 1 ||
         gridDim.z != 1 || !aligned16(x) || (codes && !aligned16(codes)) ||
         (scales && !aligned16(scales))) { __trap(); return; }
+    const uint64_t row = uint64_t(row_base) + blockIdx.x;
+    if (meta) {
+        q38_meta_guard(meta);
+        if (row >= uint64_t(meta->valid_rows)) return;
+    } else if (row_base || row_capacity != uint32_t(rows)) { __trap(); return; }
     __shared__ float maxima[8];
     __shared__ float scale;
-    const uint64_t base = uint64_t(blockIdx.x) * uint64_t(cols);
+    const uint64_t base = row * uint64_t(cols);
     const int lane = threadIdx.x & 31;
     float amax = 0.0f;
     for (uint64_t col = threadIdx.x; col < uint64_t(cols); col += 256) {
@@ -286,7 +295,7 @@ extern "C" __global__ void e4m3_fake_quant_bf16(
         for (int warp = 0; warp < 8; ++warp) amax = fmaxf(amax, maxima[warp]);
         scale = __bfloat162float(__float2bfloat16_rn(amax / 448.0f));
         if (scale == 0.0f) scale = 0.0078125f;
-        if (scales) scales[blockIdx.x] = __float2bfloat16_rn(scale);
+        if (scales) scales[row] = __float2bfloat16_rn(scale);
     }
     __syncthreads();
     for (uint64_t col = threadIdx.x; col < uint64_t(cols); col += 256) {

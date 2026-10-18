@@ -1450,6 +1450,7 @@ impl Engine {
                         &mut TensorMut(matrix(&w.n, s, 0, linear_rows, hidden)?),
                         None,
                         None,
+                        Some(domain),
                     )?;
                 }
                 for (role, width, offset) in [
@@ -1577,6 +1578,7 @@ impl Engine {
                         &mut TensorMut(matrix(&w.attn, s, 0, linear_rows, q_width as usize)?),
                         None,
                         None,
+                        Some(domain),
                     )?;
                 }
                 layer.linear.run(
