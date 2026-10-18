@@ -160,6 +160,13 @@ extern "C" __global__ void tcmqa_d256_qg_split(const __nv_bfloat16* __restrict__
 // Rotation of one (j, j+RHALF) pair at the given fp32 angle; both halves are read before
 // either is written.
 __device__ __forceinline__ void rope_apply(bf16& a, bf16& b, float ang) {
+  if constexpr (ROTARY == DH) {
+    const bf16 c = __float2bfloat16(cosf(ang)), s = __float2bfloat16(sinf(ang));
+    const bf16 old_a = a, old_b = b;
+    a = __hsub(__hmul(old_a, c), __hmul(old_b, s));
+    b = __hadd(__hmul(old_b, c), __hmul(old_a, s));
+    return;
+  }
   const float c = cosf(ang), s = sinf(ang);
   const float af = __bfloat162float(a), bf = __bfloat162float(b);
   a = __float2bfloat16(af * c - bf * s);

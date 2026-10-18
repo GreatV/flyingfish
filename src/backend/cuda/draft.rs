@@ -239,6 +239,9 @@ pub struct Draft {
     #[cfg(test)]
     position_shift: i32,
     qknorm_rope_kv: cudarc::driver::CudaFunction,
+    norm: cudarc::driver::CudaFunction,
+    add_norm: cudarc::driver::CudaFunction,
+    context_rope: cudarc::driver::CudaFunction,
     ids: CudaSlice<u32>,
     mask_ids: Vec<u32>,
     position: CudaSlice<i32>,
@@ -269,7 +272,7 @@ pub struct Draft {
 
 fn norm(
     s: &Arc<CudaStream>,
-    ops: &Ops,
+    kernel: &cudarc::driver::CudaFunction,
     input: &CudaSlice<bf16>,
     weight: &CudaSlice<bf16>,
     output: &mut CudaSlice<bf16>,
@@ -278,7 +281,7 @@ fn norm(
 ) -> Result<()> {
     let (rows, dim) = shape;
     unsafe {
-        s.launch_builder(&ops.norm)
+        s.launch_builder(kernel)
             .arg(input)
             .arg(weight)
             .arg(output)
@@ -409,6 +412,13 @@ impl Draft {
         let mask_ids = vec![config.mask_token_id; block_rows];
         let qknorm_rope_kv =
             super::cubin::module(&d.ctx, "rope")?.load_function("draft_qknorm_rope_kv")?;
+        let norm_module = super::cubin::module(&d.ctx, "norm")?;
+        let rope_module = super::cubin::module(&d.ctx, "rope")?;
+        let (norm_name, add_norm_name, rope_name) = if config.head_dim == 256 {
+            ("rms_norm_bf16", "add_rmsnorm_bf16", "rope")
+        } else {
+            ("rms_norm", "add_rmsnorm", "rope_float")
+        };
         Ok(Self {
             markov: None,
             score_rounding,
@@ -422,6 +432,9 @@ impl Draft {
             #[cfg(test)]
             position_shift: 0,
             qknorm_rope_kv,
+            norm: norm_module.load_function(norm_name)?,
+            add_norm: norm_module.load_function(add_norm_name)?,
+            context_rope: rope_module.load_function(rope_name)?,
             ids: s.clone_htod(&mask_ids)?,
             mask_ids,
             position: s.alloc_zeros(1)?,
@@ -533,7 +546,7 @@ impl Draft {
         )?;
         norm(
             s,
-            ops,
+            &self.norm,
             &self.projected,
             &self.weights.hidden_norm,
             &mut self.context,
@@ -561,7 +574,7 @@ impl Draft {
             )?;
             norm(
                 s,
-                ops,
+                &self.norm,
                 &self.k_raw,
                 &layer.k_norm,
                 &mut self.k_norm,
@@ -569,7 +582,7 @@ impl Draft {
                 self.config.rms_norm_eps,
             )?;
             unsafe {
-                s.launch_builder(&ops.rope_float)
+                s.launch_builder(&self.context_rope)
                     .arg(&mut self.k_norm)
                     .arg(&self.position)
                     .arg(&(rows as i32))
@@ -893,15 +906,15 @@ impl Draft {
         let f = c.intermediate_size;
         let qkv = c.qkv_dim();
         let eps = self.config.rms_norm_eps;
-        let add_norm = |ops: &Ops,
-                        res: &CudaSlice<bf16>,
+        let add_norm_kernel = &self.add_norm;
+        let add_norm = |res: &CudaSlice<bf16>,
                         x: &mut CudaSlice<bf16>,
                         weight: &CudaSlice<bf16>,
                         output: &mut CudaSlice<bf16>|
          -> Result<()> {
             let (xp, _x) = x.device_ptr_mut(s);
             unsafe {
-                s.launch_builder(&ops.add_norm)
+                s.launch_builder(add_norm_kernel)
                     .arg(res)
                     .arg(&xp)
                     .arg(weight)
@@ -949,7 +962,7 @@ impl Draft {
             if i == 0 {
                 norm(
                     s,
-                    ops,
+                    &self.norm,
                     &self.x,
                     &layer.block.input_norm,
                     &mut self.n,
@@ -1031,13 +1044,7 @@ impl Draft {
                 h,
                 h,
             )?;
-            add_norm(
-                ops,
-                &self.out,
-                &mut self.x,
-                &layer.block.post_norm,
-                &mut self.n,
-            )?;
+            add_norm(&self.out, &mut self.x, &layer.block.post_norm, &mut self.n)?;
             blas.linear(
                 &layer.block.gu,
                 &self.n.slice(..block_rows * h),
@@ -1067,7 +1074,7 @@ impl Draft {
             } else {
                 &self.weights.norm
             };
-            add_norm(ops, &self.out, &mut self.x, weight, &mut self.n)?;
+            add_norm(&self.out, &mut self.x, weight, &mut self.n)?;
             if let Some((trace, prefix)) = trace.as_mut() {
                 add_trace(
                     s,
@@ -1823,6 +1830,23 @@ mod tests {
                 b,
             )?;
             let top = values(&tensors, "combined_top32_vals", &[b, 32])?;
+            let top_ids = ids(&tensors, "combined_top32_ids", &[b, 32])?;
+            let scores = trace.values("draft.s")?;
+            for (row, (actual, expected)) in proposals.iter().zip(&expected_ids).enumerate() {
+                if actual != expected {
+                    let reference_actual = top_ids[row * 32..(row + 1) * 32]
+                        .iter()
+                        .position(|id| id == actual)
+                        .map(|index| top[row * 32 + index]);
+                    println!(
+                        "T19_PROPOSAL_DEFECT fixture={name} row={row} expected={expected} actual={actual} candidate_expected={} candidate_actual={} reference_expected={} reference_actual={reference_actual:?} reference_margin={}",
+                        scores[row * v + *expected as usize],
+                        scores[row * v + *actual as usize],
+                        top[row * 32],
+                        top[row * 32] - top[row * 32 + 1],
+                    );
+                }
+            }
             let margin = (0..b)
                 .map(|r| top[r * 32] - top[r * 32 + 1])
                 .fold(f32::INFINITY, f32::min);

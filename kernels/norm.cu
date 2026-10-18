@@ -113,8 +113,15 @@ __device__ __forceinline__ void st_vec(__nv_bfloat16* __restrict__ p,
   }
 }
 
+template <bool BF16_SCALE>
+__device__ __forceinline__ float norm_scale(float x, float inv, float weight) {
+  const float normalized = x * inv;
+  if constexpr (BF16_SCALE) return __bfloat162float(__float2bfloat16(normalized)) * weight;
+  return normalized * weight;
+}
+
 // One block normalizes one row of n elements (nthr = blockDim.x, gid = threadIdx.x).
-template <int VEC>
+template <int VEC, bool BF16_SCALE = false>
 __device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
                                             const __nv_bfloat16* __restrict__ w,
                                             __nv_bfloat16* __restrict__ y, int n,
@@ -155,7 +162,7 @@ __device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
         float ww[VEC], out[VEC];
         ld_vec<VEC>(w + idx, ww);
 #pragma unroll
-        for (int j = 0; j < VEC; ++j) out[j] = r[i * VEC + j] * rstd * ww[j];
+        for (int j = 0; j < VEC; ++j) out[j] = norm_scale<BF16_SCALE>(r[i * VEC + j], rstd, ww[j]);
         st_vec<VEC>(y + idx, out);
       }
     }
@@ -166,7 +173,7 @@ __device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
       ld_vec<VEC>(x + idx, r);
       ld_vec<VEC>(w + idx, ww);
 #pragma unroll
-      for (int j = 0; j < VEC; ++j) out[j] = r[j] * rstd * ww[j];
+      for (int j = 0; j < VEC; ++j) out[j] = norm_scale<BF16_SCALE>(r[j], rstd, ww[j]);
       st_vec<VEC>(y + idx, out);
     }
   }
@@ -174,7 +181,7 @@ __device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
 
 // Fused residual add + RMSNorm over one row per block. res/res_out are not
 // __restrict__: res_out == res (in-place residual stream) is supported.
-template <int VEC>
+template <int VEC, bool BF16_SCALE = false>
 __device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict__ x,
                                                 const __nv_bfloat16* res,
                                                 const __nv_bfloat16* __restrict__ w,
@@ -234,7 +241,7 @@ __device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict_
         float ww[VEC], out[VEC];
         ld_vec<VEC>(w + idx, ww);
 #pragma unroll
-        for (int j = 0; j < VEC; ++j) out[j] = rr[i * VEC + j] * rstd * ww[j];
+        for (int j = 0; j < VEC; ++j) out[j] = norm_scale<BF16_SCALE>(rr[i * VEC + j], rstd, ww[j]);
         st_vec<VEC>(y + idx, out);
       }
     }
@@ -245,7 +252,7 @@ __device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict_
       ld_vec<VEC>(res_out + idx, b);
       ld_vec<VEC>(w + idx, ww);
 #pragma unroll
-      for (int j = 0; j < VEC; ++j) out[j] = b[j] * rstd * ww[j];
+      for (int j = 0; j < VEC; ++j) out[j] = norm_scale<BF16_SCALE>(b[j], rstd, ww[j]);
       st_vec<VEC>(y + idx, out);
     }
   }
@@ -280,6 +287,31 @@ __global__ __launch_bounds__(1024) void add_rmsnorm(const __nv_bfloat16* x,
   const size_t off = (size_t)row * dim;
   if ((dim & 7) == 0) add_rmsnorm_row<8>(x + off, res + off, w, y + off, res_out + off, dim, eps);
   else                add_rmsnorm_row<1>(x + off, res + off, w, y + off, res_out + off, dim, eps);
+}
+
+// Normalized values round to BF16 before multiplication by the BF16 weight.
+__global__ __launch_bounds__(1024) void rms_norm_bf16(const __nv_bfloat16* x,
+                                                    const __nv_bfloat16* w,
+                                                    __nv_bfloat16* y, int rows, int dim,
+                                                    float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const size_t off = (size_t)row * dim;
+  if ((dim & 7) == 0) rmsnorm_row<8, true>(x + off, w, y + off, dim, eps);
+  else                rmsnorm_row<1, true>(x + off, w, y + off, dim, eps);
+}
+
+__global__ __launch_bounds__(1024) void add_rmsnorm_bf16(const __nv_bfloat16* x,
+                                                       const __nv_bfloat16* res,
+                                                       const __nv_bfloat16* w,
+                                                       __nv_bfloat16* y,
+                                                       __nv_bfloat16* res_out, int rows,
+                                                       int dim, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const size_t off = (size_t)row * dim;
+  if ((dim & 7) == 0) add_rmsnorm_row<8, true>(x + off, res + off, w, y + off, res_out + off, dim, eps);
+  else                add_rmsnorm_row<1, true>(x + off, res + off, w, y + off, res_out + off, dim, eps);
 }
 
 // x[i] += y[i] in bf16, flat grid-stride.
