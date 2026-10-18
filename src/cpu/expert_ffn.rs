@@ -2215,6 +2215,22 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_job_lock_rejects_work_without_publishing_output() -> Result<()> {
+        let fixture = pool_fixture()?;
+        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len())?;
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pool.shared.job.write().unwrap();
+            panic!("expert job poison control");
+        }));
+        assert!(poisoned.is_err());
+        let mut out = vec![bf16::ONE; fixture.assignments.len() * fixture.shape.hidden];
+        let before = out.clone();
+        assert!(pool.run(fixture_job(&fixture, &mut out)).is_err());
+        assert_eq!(out, before);
+        Ok(())
+    }
+
+    #[test]
     fn pending_guard_holds_the_lease_until_finish() -> Result<()> {
         let fixture = pool_fixture()?;
         let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len())?;
