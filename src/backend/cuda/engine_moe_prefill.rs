@@ -1857,6 +1857,268 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA, FF_MODEL and FF_MINICPM_REFERENCE_DIR"]
+    fn published_expert_contributions_match_across_tiers_gpu() -> Result<()> {
+        use crate::backend::cuda::moe::testing;
+        use crate::cpu::expert_ffn::Job;
+        let directory = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let fixtures = PathBuf::from(
+            std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("reference directory missing")?,
+        );
+        let model = crate::model_spec::ModelSpec::read(&directory)?;
+        let geometry = ExpertGeometry::from_model(&model)?;
+        ensure!(
+            model.expert_format == Some(crate::model_spec::ExpertFormat::Bf16)
+                && geometry.hidden == 2048
+                && geometry.intermediate == 512
+                && geometry.experts == 256,
+            "published BF16 expert identity geometry required: {geometry:?}"
+        );
+        let checkpoint = crate::checkpoint::Checkpoint::open(&directory)?;
+        let catalogue = Arc::new(ExpertCatalogue::from_manifest(
+            &checkpoint.manifest(&model, crate::checkpoint::LoadPolicy::TextOnly)?,
+            geometry,
+            crate::model_spec::ExpertFormat::Bf16,
+        )?);
+        drop(checkpoint);
+        let expert = 160u32;
+        let reader = DiskReader::open(&catalogue, &directory, 1)?;
+        let slot = reader.read_expert(0, expert, &catalogue)?;
+        let native = reader.values(slot)?.values().to_vec();
+        let hidden = geometry.hidden as usize;
+        let intermediate = geometry.intermediate as usize;
+        let cut = usize::try_from(
+            catalogue
+                .layout()
+                .gate_up_bytes()
+                .context("BF16 gate-up missing")?
+                / 2,
+        )?;
+        let host = HostBlocks::new(1, native.len())?;
+        host.claim(0)?.slice()?.copy_from_slice(&native);
+        let weights = [ExpertWeights {
+            gate_up: 0..cut,
+            gate_up_stride: hidden,
+            down: cut..native.len(),
+            down_stride: intermediate,
+        }];
+        let bytes = std::fs::read(fixtures.join("text_32_layer00_moe.safetensors"))?;
+        let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
+        let read = |name: &str, shape: &[usize]| -> Result<Vec<bf16>> {
+            let tensor = tensors.tensor(name)?;
+            ensure!(
+                tensor.dtype() == safetensors::Dtype::BF16 && tensor.shape() == shape,
+                "expert identity fixture {name} dtype={:?} shape={:?}",
+                tensor.dtype(),
+                tensor.shape()
+            );
+            Ok(tensor
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|value| bf16::from_bits(u16::from_le_bytes(*value)))
+                .collect())
+        };
+        let input = read("layer_00_moe_in_norm", &[32, hidden])?;
+        let routing = read(
+            "layer_00_router_topk_weights",
+            &[32, geometry.top_k as usize],
+        )?;
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let native_device = stream.clone_htod(&native)?;
+        let gate_up_pointer = native_device.device_ptr(stream).0;
+        let down_pointer = gate_up_pointer + (cut * 2) as u64;
+        let mut host_gate_up = vec![0u64; geometry.experts as usize];
+        let mut host_down = host_gate_up.clone();
+        let mut valid = vec![0u32; geometry.experts as usize];
+        host_gate_up[expert as usize] = gate_up_pointer;
+        host_down[expert as usize] = down_pointer;
+        valid[expert as usize] = 1;
+        let tables = testing::SlotTable {
+            gate_up: stream.clone_htod(&host_gate_up)?,
+            down: stream.clone_htod(&host_down)?,
+            valid: stream.clone_htod(&valid)?,
+            generation: stream
+                .clone_htod(&valid.iter().copied().map(u64::from).collect::<Vec<_>>())?,
+        };
+        let pool = ExpertPool::new(2, Shape::new(hidden, intermediate)?, 32, 32)?;
+        let mut disk = DiskExperts::new(catalogue, &directory, 1, 32)?;
+        let ops = PrefillOps::new(&device.ctx, stream)?;
+        let mut defects = 0;
+        for (rows, weighted) in [(1usize, false), (32, false), (32, true)] {
+            let x = &input[..rows * hidden];
+            let routing: Vec<_> = (0..rows)
+                .map(|row| {
+                    if weighted {
+                        routing[row * geometry.top_k as usize]
+                    } else {
+                        bf16::ONE
+                    }
+                })
+                .collect();
+            ensure!(
+                routing
+                    .iter()
+                    .all(|value| value.is_finite() && *value > bf16::ZERO)
+                    && (!weighted || routing.iter().all(|value| *value != bf16::ONE)),
+                "expert identity routing weights invalid"
+            );
+            let assignments: Vec<_> = routing
+                .iter()
+                .enumerate()
+                .map(|(row, &weight)| Assignment {
+                    row: row as u32,
+                    choice: row as u32,
+                    expert: 0,
+                    weight,
+                })
+                .collect();
+            let routes: Vec<_> = assignments
+                .iter()
+                .map(|item| crate::experts::runtime::Route {
+                    row: item.row,
+                    choice: item.choice,
+                    expert,
+                    weight: item.weight,
+                })
+                .collect();
+            let x_device = stream.clone_htod(x)?;
+            let ids = stream.clone_htod(&vec![expert as i32; rows])?;
+            let routing_device = stream.clone_htod(&routing)?;
+            let active = stream.clone_htod(&vec![1u32; rows])?;
+            let generation = stream.clone_htod(&vec![1u64; rows])?;
+            let contributions = stream.alloc_zeros::<bf16>(rows * hidden)?;
+            let done = stream.alloc_zeros::<u32>(rows)?;
+            let scratch = stream.alloc_zeros::<u8>(usize::try_from(prefill_scratch_bytes(
+                rows,
+                1,
+                geometry.experts as usize,
+                hidden,
+                intermediate,
+            )?)?)?;
+            {
+                let _range =
+                    crate::backend::cuda::profile::Range::new(true, c"expert_tier_grouped");
+                ops.prefill_contribute(
+                    stream,
+                    MoePrefillContribute {
+                        x: qwen::matrix(&x_device, stream, 0, rows, hidden)?,
+                        ids: testing::dense(&ids, stream, rows as u32, 1)?,
+                        weights: testing::dense(&routing_device, stream, rows as u32, 1)?,
+                        active: testing::dense(&active, stream, rows as u32, 1)?,
+                        assignment_gen: testing::dense(&generation, stream, rows as u32, 1)?,
+                        slots_gate_up: testing::view(
+                            &tables.gate_up,
+                            stream,
+                            [geometry.experts],
+                            [1],
+                        )?,
+                        slots_down: testing::view(&tables.down, stream, [geometry.experts], [1])?,
+                        slot_valid: testing::view(&tables.valid, stream, [geometry.experts], [1])?,
+                        slot_generation: testing::view(
+                            &tables.generation,
+                            stream,
+                            [geometry.experts],
+                            [1],
+                        )?,
+                        slots_gate_up_host: &host_gate_up,
+                        slots_down_host: &host_down,
+                        shared_gate: qwen::matrix(&native_device, stream, 0, intermediate, hidden)?,
+                        shared_up: qwen::matrix(
+                            &native_device,
+                            stream,
+                            intermediate * hidden,
+                            intermediate,
+                            hidden,
+                        )?,
+                        shared_down: qwen::matrix(
+                            &native_device,
+                            stream,
+                            cut,
+                            hidden,
+                            intermediate,
+                        )?,
+                        shared_expert_gate: testing::view(
+                            &x_device,
+                            stream,
+                            [geometry.hidden],
+                            [1],
+                        )?,
+                        contributions: testing::view(
+                            &contributions,
+                            stream,
+                            [rows as u32, 1, geometry.hidden],
+                            [geometry.hidden as u64, geometry.hidden as u64, 1],
+                        )?,
+                        done: testing::mut_view(&done, stream, [rows as u32, 1], [1, 1])?,
+                    },
+                    &qwen::scratch(&scratch, stream),
+                )?;
+                stream.synchronize()?;
+            }
+            let gpu = stream.clone_dtoh(&contributions)?;
+            ensure!(
+                stream.clone_dtoh(&done)?.iter().all(|&value| value == 1),
+                "grouped expert did not complete every assignment"
+            );
+            let mut cpu = vec![bf16::ZERO; rows * hidden];
+            let pending = pool.submit(Job {
+                arena: host.clone(),
+                hidden: x,
+                rows,
+                experts: &weights,
+                assignments: &assignments,
+                out: &mut cpu,
+            })?;
+            pool.finish(pending)?;
+            let mut from_disk = vec![bf16::ZERO; rows * hidden];
+            disk.start(0, x, rows, &routes)?;
+            disk.finish(&mut from_disk)?;
+            for (name, a, b) in [
+                ("gpu_vs_cpu_pool", &gpu, &cpu),
+                ("gpu_vs_disk", &gpu, &from_disk),
+                ("cpu_pool_vs_disk", &cpu, &from_disk),
+            ] {
+                ensure!(
+                    a.iter().chain(b).all(|value| value.is_finite()),
+                    "nonfinite expert tier contribution {name}"
+                );
+                let mismatches = a
+                    .iter()
+                    .zip(b)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let maximum = a
+                    .iter()
+                    .zip(b)
+                    .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+                    .fold(0.0f32, f32::max);
+                let first = a
+                    .iter()
+                    .zip(b)
+                    .enumerate()
+                    .find(|(_, (a, b))| a.to_bits() != b.to_bits())
+                    .map(|(index, (a, b))| {
+                        (index, a.to_bits(), b.to_bits(), a.to_f32(), b.to_f32())
+                    });
+                println!(
+                    "{} expert_tier_identity layer=0 expert={expert} rows={rows} weighted={weighted} comparison={name} stored=[rows,2048] bit_mismatches={mismatches} max_abs={maximum} first={first:?} cpu_isa={}",
+                    if mismatches == 0 { "PASS" } else { "DEFECT" },
+                    pool.isa().name()
+                );
+                defects += usize::from(mismatches != 0);
+            }
+        }
+        ensure!(
+            defects == 0,
+            "expert tier contribution identity DEFECT cells={defects}"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires CUDA and FLYINGFISH_RUNTIME_DIR"]
     fn resident_graph_waits_for_prefill_refill_gpu() -> Result<()> {
         let runtime = PathBuf::from(
