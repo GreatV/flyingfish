@@ -2652,6 +2652,7 @@ mod tests {
         fixture: &MoeFixture,
         layer: u32,
         wave: usize,
+        ceiling: u32,
         cohorts: impl FnOnce(&[i32]) -> Result<(Vec<u32>, Vec<Vec<u32>>)>,
     ) -> Result<Reference> {
         let stream = &engine.device.stream;
@@ -2684,11 +2685,6 @@ mod tests {
         )?;
         let host_ids = stream.clone_dtoh(&ids)?;
         let host_weights = stream.clone_dtoh(&weights)?;
-        let ceiling = engine
-            .moe_prefill
-            .as_ref()
-            .context("prefill reference planner missing")?
-            .cpu_ceiling;
         let mut arithmetic = [false; 16];
         for (expert, form) in arithmetic.iter_mut().enumerate() {
             *form = host_ids.iter().filter(|&&id| id == expert as i32).count() <= ceiling as usize;
@@ -2902,11 +2898,20 @@ mod tests {
                     8,
                 )?;
                 let mut expected = Vec::new();
+                let reference_capacity = tier_capacity(geometry, false)?;
+                let ceiling = cpu_bound(
+                    geometry,
+                    reference_capacity.slot_bytes(),
+                    rows,
+                    &tier_service(reference_capacity.worker_count)?,
+                    1_000_000_000.0,
+                )?
+                .2;
                 for layer in 0..2 {
-                    let first = reference(&oracle, &fixture, layer, 4, |_| {
+                    let first = reference(&oracle, &fixture, layer, 4, ceiling, |_| {
                         Ok((vec![], vec![(0..16).collect()]))
                     })?;
-                    let second = reference(&oracle, &fixture, layer, 4, |_| {
+                    let second = reference(&oracle, &fixture, layer, 4, ceiling, |_| {
                         Ok((vec![], vec![(0..16).collect()]))
                     })?;
                     ensure!(
@@ -2942,6 +2947,10 @@ mod tests {
                         .moe_prefill
                         .take()
                         .context("prefill gate executor missing")?;
+                    ensure!(
+                        prefill.cpu_ceiling == ceiling,
+                        "prefill oracle CPU ceiling mismatch"
+                    );
                     let mut slots = engine
                         .moe_slots
                         .take()
@@ -3103,9 +3112,14 @@ mod tests {
                             }
                             engine.device.stream.synchronize()?;
                         }
-                        let reference = reference(&oracle, &fixture, layer as u32, 4, |_| {
-                            Ok((expected_plan.cpu().to_vec(), vec![(0..16).collect()]))
-                        })?;
+                        let reference = reference(
+                            &oracle,
+                            &fixture,
+                            layer as u32,
+                            4,
+                            prefill.cpu_ceiling,
+                            |_| Ok((expected_plan.cpu().to_vec(), vec![(0..16).collect()])),
+                        )?;
                         let actual = engine.device.stream.clone_dtoh(&output)?;
                         let span = prefill.span.as_ref().context("prefill gate span missing")?;
                         let mut contributions = vec![bf16::ZERO; rows as usize * 4 * 128];
@@ -3306,7 +3320,7 @@ mod tests {
                 rows as u32,
                 engine.moe_ffn_binding(layer as usize)?,
             )?;
-            let expected = reference(&oracle, &fixture, layer, 4, |_| {
+            let expected = reference(&oracle, &fixture, layer, 4, prefill.cpu_ceiling, |_| {
                 Ok((prefill.plan.cpu().to_vec(), vec![(0..16).collect()]))
             })?;
             let span = prefill.span.as_ref().context("span missing")?;
@@ -3515,6 +3529,16 @@ mod tests {
         );
         engine.reset()?;
         let mut fixture = tier_fixture(3);
+        let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+        let reference_capacity = tier_capacity(geometry, false)?;
+        let ceiling = cpu_bound(
+            geometry,
+            reference_capacity.slot_bytes(),
+            span_rows as u32,
+            &tier_service(reference_capacity.worker_count)?,
+            1_000_000_000.0,
+        )?
+        .2;
         let mut hidden = Vec::new();
         for (span_index, admitted) in ids.chunks(span_rows).enumerate() {
             let start = span_index * span_rows;
@@ -3562,16 +3586,18 @@ mod tests {
                 }
                 fixture.x = normalized;
                 fixture.dims.rows = admitted.len();
-                let ffn = reference(
-                    engine,
-                    &fixture,
-                    layer as u32,
-                    wave,
-                    |ids| match placement {
-                        Some(capacity) => reference_cohorts(ids, layer as u32, capacity),
-                        None => Ok((vec![], vec![(0..16).collect()])),
-                    },
-                )?;
+                let ffn =
+                    reference(
+                        engine,
+                        &fixture,
+                        layer as u32,
+                        wave,
+                        ceiling,
+                        |ids| match placement {
+                            Some(capacity) => reference_cohorts(ids, layer as u32, capacity),
+                            None => Ok((vec![], vec![(0..16).collect()])),
+                        },
+                    )?;
                 for base in (0..admitted.len()).step_by(wave) {
                     let rows = wave.min(admitted.len() - base);
                     let step = engine.moe_wave(start + base, rows)?;
