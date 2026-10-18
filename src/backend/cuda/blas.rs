@@ -276,7 +276,7 @@ pub struct Blas {
     fp8: Option<super::linear::Fp8Ops>,
     skinny: CudaFunction,
     plans: RefCell<BTreeMap<(usize, usize, usize, u32), Plan>>,
-    biased_plans: RefCell<BTreeMap<(u32, u32, u32, u64, super::linear::LinearBiasMode), Plan>>,
+    biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
     bias_add: Option<CudaFunction>,
     handle: sys::cublasLtHandle_t,
     decode: CudaBlas,
@@ -756,19 +756,24 @@ impl Blas {
             bias.shape == [output] && bias.stride == [1],
             "linear bias shape mismatch"
         );
-        let key = (rows, output, input, bias.ptr, mode);
+        let shape = LinearShape {
+            rows: rows as usize,
+            output: output as usize,
+            input: input as usize,
+        };
+        let key = (shape, bias.ptr, mode);
         let mut plans = self.biased_plans.borrow_mut();
         if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry(key) {
             let plan = Plan::new_with_bias(
                 self.handle,
-                rows as usize,
-                output as usize,
-                input as usize,
+                shape.rows,
+                shape.output,
+                shape.input,
                 self.workspace.len(),
                 0,
                 (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
             )?;
-            plan.describe(rows as usize, output as usize, input as usize)?;
+            plan.describe(shape.rows, shape.output, shape.input)?;
             entry.insert(plan);
         }
         if mode == super::linear::LinearBiasMode::AfterOutputRound && self.bias_add.is_none() {
@@ -809,9 +814,14 @@ impl Blas {
                     .context("bias add kernel not prepared")?,
             ),
         };
+        let shape = LinearShape {
+            rows: x.shape[0] as usize,
+            output: weight.shape[0] as usize,
+            input: weight.shape[1] as usize,
+        };
         let plans = self.biased_plans.borrow();
         let p = plans
-            .get(&(x.shape[0], weight.shape[0], weight.shape[1], bias.ptr, mode))
+            .get(&(shape, bias.ptr, mode))
             .with_context(|| format!(
                 "biased Lt plan missing rows={} output={} input={} mode={mode:?}; bind before run/capture",
                 x.shape[0], weight.shape[0], weight.shape[1],
