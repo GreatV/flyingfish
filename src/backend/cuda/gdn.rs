@@ -1167,6 +1167,116 @@ mod tests {
         P2,
     }
 
+    #[test]
+    #[ignore = "requires a GPU window and precompiled P2 boundary fixtures"]
+    fn gdn_p2_boundary_probe() -> Result<()> {
+        use cudarc::{
+            driver::{DevicePtr, DevicePtrMut},
+            nvrtc::Ptx,
+        };
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let input = std::path::PathBuf::from(std::env::var("FF_Q38_GDN_FIXTURE_DIR")?);
+        let output = std::path::PathBuf::from(std::env::var("FF_Q38_PROBE_DUMP")?);
+        std::fs::create_dir_all(&output)?;
+        let device = crate::backend::cuda::Device::new(0)?;
+        let stream = &device.stream;
+        let mut sources = Vec::new();
+        for name in ["q", "k", "v", "beta", "g"] {
+            sources.push(stream.clone_htod(&std::fs::read(input.join(format!("{name}.bin")))?)?);
+        }
+        let rows = u32::try_from(sources[0].len() / (32 * 128 * 4))?;
+        ensure!(
+            rows > 0 && rows.is_multiple_of(64),
+            "P2 fixture rows={rows}"
+        );
+        for (source, elements) in sources
+            .iter()
+            .zip([4096 * 4, 4096 * 4, 4096 * 2, 32 * 4, 32 * 4])
+        {
+            ensure!(
+                source.len() == rows as usize * elements,
+                "P2 fixture byte count"
+            );
+        }
+        let meta = geometry_meta(stream, 0, rows)?;
+        let ptrs: Vec<_> = sources.iter().map(|x| x.device_ptr(stream).0).collect();
+        let metadata = meta.device_ptr(stream).0;
+        let workspace_bytes = cw_p2_bytes(32, rows) as usize;
+        let diag_bytes = rows as usize / 64 * 32 * 20480 * 4;
+        let (a_cfg, h_cfg) = cw_p2_grids(rows, 32);
+        for arm in ["original", "baseline", "gram", "inverse", "uw", "qk"] {
+            let module = if arm == "original" {
+                cubin::module(&device.ctx, "gdn/gdn_cw_p2_h32")?
+            } else {
+                device.ctx.load_module(Ptx::from_binary(std::fs::read(
+                    input.join(format!("{arm}.cubin")),
+                )?))?
+            };
+            let a = module.load_function("gdn_cw_p2_stage_a")?;
+            let h = module.load_function("gdn_cw_p2_stage_h")?;
+            let mut workspace = stream.alloc_zeros::<u8>(workspace_bytes)?;
+            let mut diag = stream.alloc_zeros::<u8>(diag_bytes)?;
+            let mut state = stream.alloc_zeros::<u8>(32 * 128 * 128 * 4)?;
+            let mut core = stream.alloc_zeros::<u8>(rows as usize * 32 * 128 * 2)?;
+            let slot = workspace.device_ptr_mut(stream).0;
+            let capture = diag.device_ptr_mut(stream).0;
+            let s = state.device_ptr_mut(stream).0;
+            let out = core.device_ptr_mut(stream).0;
+            // SAFETY: all row counts, source byte spans, slots and launch grids are checked above.
+            unsafe {
+                let mut launch = stream.launch_builder(&a);
+                for ptr in &ptrs {
+                    launch.arg(ptr);
+                }
+                launch.arg(&slot).arg(&metadata).arg(&0_i32).arg(&4096_u32);
+                if arm != "original" {
+                    launch.arg(&capture);
+                }
+                launch.launch(a_cfg)?;
+                let mut launch = stream.launch_builder(&h);
+                for ptr in &ptrs {
+                    launch.arg(ptr);
+                }
+                launch
+                    .arg(&s)
+                    .arg(&out)
+                    .arg(&slot)
+                    .arg(&metadata)
+                    .arg(&0_i32)
+                    .launch(h_cfg)?;
+            }
+            stream.synchronize()?;
+            for (name, buffer) in [
+                ("core", &core),
+                ("state", &state),
+                ("workspace", &workspace),
+                ("diag", &diag),
+            ] {
+                if arm != "original" || name != "diag" {
+                    std::fs::write(
+                        output.join(format!("{arm}-{name}.bin")),
+                        stream.clone_dtoh(buffer)?,
+                    )?;
+                }
+            }
+            println!("DIAGNOSTIC p2_boundary arm={arm} rows={rows} slot_bytes={workspace_bytes}");
+        }
+        for name in ["core", "state", "workspace"] {
+            ensure!(
+                std::fs::read(output.join(format!("original-{name}.bin")))?
+                    == std::fs::read(output.join(format!("baseline-{name}.bin")))?,
+                "P2 capture changed baseline {name}"
+            );
+        }
+        println!(
+            "PASS p2_boundary_capture original_baseline_bitwise=true stages=gram,inverse,uw,qk"
+        );
+        Ok(())
+    }
+
     fn geometry_run(
         device: &crate::backend::cuda::Device,
         spec: GdnSpec,
