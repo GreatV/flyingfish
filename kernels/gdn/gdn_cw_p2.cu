@@ -1,6 +1,5 @@
-// GDN chunkwise prefill as two kernels, C = 64. Same fp32 accumulators, bf16 RNE
-// rounding points, mma fragment staging and loop/accumulation orders as
-// gdn/gdn_chunkwise_p1; the two agree bit for bit.
+// GDN chunkwise prefill as two kernels, C = 64, with FP32 accumulators.
+// Stage H uses BF16 high/residual Q/K terms for 32 value heads.
 //
 //   h32 Q/K sources are expanded FP32 [M,32,128], with Q already scaled.
 //   h48 Q/K sources are BF16 [M,16,128], expanded at load and Q scaled by 1/sqrt(DK).
@@ -106,7 +105,12 @@ struct BFrag { uint32_t r[2]; };
 #define P2_GID(l) ((l) >> 2)
 #define P2_T2(l)  (((l) & 3) << 1)
 
+template<bool Residual = false>
 __device__ __forceinline__ uint32_t p1_pack(float lo, float hi) {
+    if constexpr (Residual) {
+        lo = __fsub_rn(lo, __bfloat162float(__float2bfloat16_rn(lo)));
+        hi = __fsub_rn(hi, __bfloat162float(__float2bfloat16_rn(hi)));
+    }
     return (uint32_t)__bfloat16_as_ushort(__float2bfloat16_rn(lo))
          | ((uint32_t)__bfloat16_as_ushort(__float2bfloat16_rn(hi)) << 16);
 }
@@ -116,17 +120,18 @@ __device__ __forceinline__ uint32_t p1_pack(float lo, float hi) {
 // A from Q/K source rows, one scale per row (beta, and the q liveness mask): register 1 is the
 // +8 row at the low columns and register 2 the base row at the +8 columns. `qscale` is
 // 1/sqrt(DK) for h48 Q and 1.0f otherwise, applied before the row scale.
+template<bool Residual = false>
 __device__ __forceinline__ AFrag p1_a_rows(const P2Qk* lo, const P2Qk* hi,
                                            int col0, int t2, float qscale,
                                            float s_lo, float s_hi) {
     AFrag f;
-    f.r[0] = p1_pack(p2_qk_float(lo[col0 + t2]) * qscale * s_lo,
+    f.r[0] = p1_pack<Residual>(p2_qk_float(lo[col0 + t2]) * qscale * s_lo,
                      p2_qk_float(lo[col0 + t2 + 1]) * qscale * s_lo);
-    f.r[1] = p1_pack(p2_qk_float(hi[col0 + t2]) * qscale * s_hi,
+    f.r[1] = p1_pack<Residual>(p2_qk_float(hi[col0 + t2]) * qscale * s_hi,
                      p2_qk_float(hi[col0 + t2 + 1]) * qscale * s_hi);
-    f.r[2] = p1_pack(p2_qk_float(lo[col0 + t2 + 8]) * qscale * s_lo,
+    f.r[2] = p1_pack<Residual>(p2_qk_float(lo[col0 + t2 + 8]) * qscale * s_lo,
                      p2_qk_float(lo[col0 + t2 + 9]) * qscale * s_lo);
-    f.r[3] = p1_pack(p2_qk_float(hi[col0 + t2 + 8]) * qscale * s_hi,
+    f.r[3] = p1_pack<Residual>(p2_qk_float(hi[col0 + t2 + 8]) * qscale * s_hi,
                      p2_qk_float(hi[col0 + t2 + 9]) * qscale * s_hi);
     return f;
 }
@@ -139,17 +144,18 @@ __device__ __forceinline__ float p1_kdec(const P2Qk* kh, size_t ld, int row0,
     return p2_qk_float(kh[(size_t)gr * ld + dk]) * __expf(gl - sG[ci]);
 }
 
+template<bool Residual = false>
 __device__ __forceinline__ AFrag p1_a_kdec(const P2Qk* kh, size_t ld, int row0,
                                            int valid, const float* sG, float gl, int dk, int t2) {
     const int c0 = t2;
     AFrag f;
-    f.r[0] = p1_pack(p1_kdec(kh, ld, row0, valid, c0, dk, sG, gl),
+    f.r[0] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0, dk, sG, gl),
                      p1_kdec(kh, ld, row0, valid, c0 + 1, dk, sG, gl));
-    f.r[1] = p1_pack(p1_kdec(kh, ld, row0, valid, c0, dk + 8, sG, gl),
+    f.r[1] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0, dk + 8, sG, gl),
                      p1_kdec(kh, ld, row0, valid, c0 + 1, dk + 8, sG, gl));
-    f.r[2] = p1_pack(p1_kdec(kh, ld, row0, valid, c0 + 8, dk, sG, gl),
+    f.r[2] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0 + 8, dk, sG, gl),
                      p1_kdec(kh, ld, row0, valid, c0 + 9, dk, sG, gl));
-    f.r[3] = p1_pack(p1_kdec(kh, ld, row0, valid, c0 + 8, dk + 8, sG, gl),
+    f.r[3] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0 + 8, dk + 8, sG, gl),
                      p1_kdec(kh, ld, row0, valid, c0 + 9, dk + 8, sG, gl));
     return f;
 }
@@ -793,6 +799,10 @@ void gdn_cw_p2_stage_h(const P2Qk* __restrict__ q,
                 const AFrag a = p1_a_rows(al, ah, ks * 16, t2, qscale, sl, sh);
                 const BFrag b = p1_b_sbf(sV, P2_VLDK, nt * 8 + gid, ks * 16, t2);
                 P2_MMA(d, a, b);
+#if GDN_HEADS == 32
+                const AFrag residual = p1_a_rows<true>(al, ah, ks * 16, t2, qscale, sl, sh);
+                P2_MMA(d, residual, b);
+#endif
             }
             o[0] = d[0];
             o[1] = d[1];
@@ -829,10 +839,17 @@ void gdn_cw_p2_stage_h(const P2Qk* __restrict__ q,
                 // ks*16 is the chunk-row offset of the 16-wide k-step.
                 const AFrag a = p1_a_kdec(kh, rstride, row0, valid_rows, sG, gl,
                                           warp * 16 + gid, ks * 16 + t2);
+#if GDN_HEADS == 32
+                const AFrag residual = p1_a_kdec<true>(kh, rstride, row0, valid_rows, sG, gl,
+                                                      warp * 16 + gid, ks * 16 + t2);
+#endif
                 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
                     const BFrag b = p1_b_sbf(sV, P2_VL, nt * 8 + gid, ks * 16, t2);
                     P2_MMA(o[nt], a, b);
+#if GDN_HEADS == 32
+                    P2_MMA(o[nt], residual, b);
+#endif
                 }
             }
             #pragma unroll
