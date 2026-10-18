@@ -509,7 +509,7 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         .context("host arena bytes overflow")?;
     let pinned = arena_bytes > 0 && arena_bytes <= inputs.host_registration_bytes;
     let worker_count = inputs.service.worker_count()?;
-    let disk_workers = if disk_bytes > 0 {
+    let disk_workers = if u64::from(host_blocks) < host_target {
         ensure!(inputs.disk_readers > 0, "no measured disk readers");
         inputs.disk_readers
     } else {
@@ -1364,7 +1364,7 @@ mod tests {
         );
         assert_eq!(derived.spare_blocks, 1);
         assert_eq!(derived.disk_bytes, 0);
-        assert_eq!(derived.disk_workers, 0);
+        assert_eq!(derived.disk_workers, inputs.disk_readers);
     }
 
     #[test]

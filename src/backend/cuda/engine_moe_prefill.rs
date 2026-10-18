@@ -3141,6 +3141,102 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA and FLYINGFISH_RUNTIME_DIR"]
+    fn prefill_borrow_uses_disk_cpu_workers_gpu() -> Result<()> {
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("prefill runtime missing")?,
+        );
+        let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+        let rows = 17;
+        let fixture = inputs(3, rows);
+        let mut capacity = capacity(geometry, rows as u32, false, 2, true)?;
+        capacity.host_blocks = geometry.layers * geometry.experts - capacity.slots_total();
+        capacity.host_expert_bytes =
+            u64::from(capacity.host_blocks + capacity.spare_blocks) * capacity.slot_bytes();
+        capacity.disk_workers = 1;
+        ensure!(capacity.disk_bytes == 0, "fixture has an initial disk tier");
+        let initial = vec![(0..capacity.slots_per_layer[0]).collect::<Vec<_>>(); 2];
+        let mut engine = Engine::load_moe_placed(
+            &fixture,
+            &runtime.join("borrow-disk"),
+            &capacity,
+            &initial,
+            crate::experts::plan::Admission {
+                budget_bytes_per_token: 2 * capacity.slot_bytes(),
+            },
+            2,
+            8,
+        )?;
+        let oracle = Engine::load_moe_test(&fixture, &runtime.join("borrow-oracle"), 8)?;
+        let mut prefill = engine.moe_prefill.take().context("prefill missing")?;
+        let mut slots = engine.moe_slots.take().context("slots missing")?;
+        let mut decode = engine.moe.take().context("decode missing")?;
+        ensure!(slots.disk_cpu.is_some(), "borrow has no disk CPU workers");
+        slots.end_request()?;
+        prefill.begin(&engine.device, &mut slots, rows as u32)?;
+        ensure!(prefill.stats[5] > 0, "borrow introduced no disk victims");
+        let input = engine.device.stream.clone_htod(&fixture.x)?;
+        let span = prefill.span.as_ref().context("span missing")?;
+        device_copy(
+            &engine.device.stream,
+            qwen::matrix(&input, &engine.device.stream, 0, rows, 128)?,
+            span.hidden(&span.layout.normalized, 0, rows as u32)?,
+        )?;
+        let mut disk_choices = 0;
+        for layer in 0..geometry.layers {
+            prefill.ffn(
+                &engine.device,
+                &mut slots,
+                &mut decode,
+                layer,
+                rows as u32,
+                engine.moe_ffn_binding(layer as usize)?,
+            )?;
+            let expected = reference(&oracle, &fixture, layer, 4, |_| {
+                Ok((prefill.plan.cpu().to_vec(), vec![(0..16).collect()]))
+            })?;
+            let span = prefill.span.as_ref().context("span missing")?;
+            let mut actual = vec![bf16::ZERO; rows * 4 * 128];
+            // SAFETY: the borrowed span owns all live contribution rows until refill.
+            unsafe {
+                result::memcpy_dtoh_async(
+                    &mut actual,
+                    span.contributions(0, rows as u32)?.ptr,
+                    engine.device.stream.cu_stream(),
+                )?;
+            }
+            engine.device.stream.synchronize()?;
+            for (choice, &expert) in expected.ids.iter().enumerate() {
+                if prefill.plan.cpu().contains(&(expert as u32))
+                    && slots.policy.ledger().tier(layer, expert as u32)? == Tier::Disk
+                {
+                    disk_choices += 1;
+                    ensure!(
+                        same_bits(
+                            &actual[choice * 128..(choice + 1) * 128],
+                            &expected.contributions[choice * 128..(choice + 1) * 128],
+                            |x| u32::from(x.to_bits())
+                        ),
+                        "DEFECT borrowed disk contribution layer={layer} choice={choice}"
+                    );
+                }
+            }
+        }
+        ensure!(
+            disk_choices > 0,
+            "fixture selected no borrowed disk CPU expert"
+        );
+        prefill.end(&engine.device, &mut slots)?;
+        engine.device.stream.synchronize()?;
+        slots.policy.ledger().check()?;
+        slots.end_request()?;
+        println!(
+            "PASS prefill_borrow_disk initial_disk_bytes=0 disk_choices={disk_choices} contribution_bit_mismatches=0 refill=true"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "authorized GPU window"]
     fn prefill_span_gpu() -> Result<()> {
         gate(

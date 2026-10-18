@@ -614,7 +614,7 @@ impl Slots {
             readers: Vec::with_capacity(
                 physical_count.max(input.max_rows as usize * geometry.top_k as usize),
             ),
-            disk_cpu: if input.capacity.disk_bytes > 0 {
+            disk_cpu: if input.capacity.disk_workers > 0 {
                 Some(DiskExperts::new(
                     input.catalogue.clone(),
                     input.directory,
