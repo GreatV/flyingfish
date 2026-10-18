@@ -503,7 +503,7 @@ mod tests {
             "invalid FP8 model geometry"
         );
         let checkpoint = crate::checkpoint::MappedCheckpoint::open(&model)?;
-        let manifest = checkpoint.manifest(&spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+        let mut manifest = checkpoint.manifest(&spec, crate::checkpoint::LoadPolicy::TextOnly)?;
         let views = checkpoint.views()?;
         let tap_bytes = std::fs::read(reference_dir.join("fixtures/text_32_mixer.safetensors"))?;
         let taps = safetensors::SafeTensors::deserialize(&tap_bytes)?;
@@ -533,11 +533,11 @@ mod tests {
             let scale_name = format!("{name}_scale");
             let entry = manifest
                 .entries
-                .get(&name)
+                .remove(&name)
                 .context("projection manifest entry missing")?;
             let scale_entry = manifest
                 .entries
-                .get(&scale_name)
+                .remove(&scale_name)
                 .context("projection scale missing")?;
             let code = views[&entry.shard].tensor(&name)?;
             let scale = views[&scale_entry.shard].tensor(&scale_name)?;
@@ -589,14 +589,11 @@ mod tests {
             let scales = stream.clone_htod(&scales)?;
             let host_materialized = stream.clone_htod(&host_weight)?;
             let dequant = stream.alloc_zeros::<u8>(host_weight.len() * 2)?;
-            let entries = [
-                (name.clone(), entry.clone()),
-                (scale_name.clone(), scale_entry.clone()),
-            ]
-            .into();
+            let bytes = entry.bytes + scale_entry.bytes;
+            let entries = [(name.clone(), entry), (scale_name.clone(), scale_entry)].into();
             let small_manifest = TensorManifest {
                 entries,
-                resident_bytes: entry.bytes + scale_entry.bytes,
+                resident_bytes: bytes,
             };
             let dequant_plan = crate::linear_plan::LayerDequantPlan::from_manifest(
                 &small_manifest,
@@ -610,7 +607,7 @@ mod tests {
                 ]
                 .into(),
                 manifest: small_manifest,
-                bytes: entry.bytes + scale_entry.bytes,
+                bytes,
                 upload_content_sha256: None,
                 upload_hashed_bytes: None,
                 load_wall_ms: 0.0,
