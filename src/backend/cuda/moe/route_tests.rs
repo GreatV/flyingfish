@@ -5,7 +5,7 @@ use super::route::RouteOps;
 use super::testing;
 use crate::backend::cuda::Device;
 use crate::backend::cuda::contracts::TensorMut;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use std::collections::HashMap;
@@ -229,6 +229,111 @@ fn moe_route_gpu() -> Result<()> {
 /// margin exceeds E * 2^-24 * p_cut, weights within BF16 and renormalisation rounding.
 const PREFILL_ROW_CASES: [u32; 3] = [37, 512, 4096];
 
+fn official_router_logits(d: &Device, ops: &RouteOps) -> Result<()> {
+    use safetensors::{Dtype, SafeTensors};
+    use std::path::PathBuf;
+
+    let reference = PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+    let raw =
+        std::fs::read(reference.join(format!("router_logits_sm{}.safetensors", d.info.arch)))?;
+    let fixture = SafeTensors::deserialize(&raw)?;
+    let layer = fixture.tensor("layer")?;
+    ensure!(
+        layer.dtype() == Dtype::I32 && layer.shape() == [1],
+        "router fixture layer layout"
+    );
+    let layer = u32::from_le_bytes(layer.data().try_into()?);
+    let model = PathBuf::from(std::env::var("FF_MODEL")?);
+    let spec = crate::model_spec::ModelSpec::minicpm(
+        &serde_json::from_slice(&std::fs::read(model.join("config.json"))?)?,
+        &serde_json::from_slice(&std::fs::read(model.join("generation_config.json"))?)?,
+    )?;
+    let moe = spec
+        .moe
+        .context("router fixture model has no MoE geometry")?;
+    ensure!(
+        (layer as usize) < spec.layers.len(),
+        "router fixture layer={layer} exceeds model layers={}",
+        spec.layers.len()
+    );
+    let bf16_values = |data: &[u8]| {
+        data.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_bits(u16::from_le_bytes(*b)))
+            .collect::<Vec<_>>()
+    };
+    let x = fixture.tensor("x")?;
+    ensure!(
+        x.dtype() == Dtype::BF16 && x.shape() == [4096, spec.hidden as usize],
+        "router fixture x layout {:?}, hidden={}",
+        x.shape(),
+        spec.hidden
+    );
+    let checkpoint = crate::checkpoint::MappedCheckpoint::open(&model)?;
+    let views = checkpoint.views()?;
+    let name = format!("model.language_model.layers.{layer}.mlp.gate.weight");
+    let shard = checkpoint
+        .index
+        .weight_map
+        .get(&name)
+        .context("router weight absent")?;
+    let w = views[shard].tensor(&name)?;
+    ensure!(
+        w.dtype() == Dtype::BF16 && w.shape() == [moe.experts as usize, spec.hidden as usize],
+        "router weight {name} layout {:?}",
+        w.shape()
+    );
+    let s = &d.stream;
+    let xb = s.clone_htod(&bf16_values(x.data()))?;
+    let wb = s.clone_htod(&bf16_values(w.data()))?;
+    let ids = s.alloc_zeros::<i32>(4096 * moe.experts_per_tok as usize)?;
+    let weights = s.alloc_zeros::<bf16>(ids.len())?;
+    let logits = s.alloc_zeros::<bf16>(4096 * moe.experts as usize)?;
+    let mut total = 0;
+    for rows in [1u32, 94, 481, 1024, 4096] {
+        ops.route_prefill(
+            s,
+            testing::dense(&xb, s, 4096, spec.hidden)?.prefix_rows(rows)?,
+            testing::dense(&wb, s, moe.experts, spec.hidden)?,
+            &mut TensorMut(testing::dense(&ids, s, 4096, moe.experts_per_tok)?.prefix_rows(rows)?),
+            &mut TensorMut(
+                testing::dense(&weights, s, 4096, moe.experts_per_tok)?.prefix_rows(rows)?,
+            ),
+            &mut TensorMut(testing::dense(&logits, s, 4096, moe.experts)?.prefix_rows(rows)?),
+        )?;
+        let actual = s.clone_dtoh(&logits)?;
+        let expected = fixture.tensor(&format!("logits_{rows}"))?;
+        ensure!(
+            expected.dtype() == Dtype::BF16
+                && expected.shape() == [rows as usize, moe.experts as usize],
+            "router fixture logits rows={rows} layout {:?}",
+            expected.shape()
+        );
+        let expected = bf16_values(expected.data());
+        ensure!(
+            actual[..expected.len()]
+                .iter()
+                .chain(&expected)
+                .all(|v| v.is_finite()),
+            "router logits rows={rows} are nonfinite"
+        );
+        let mismatches = actual
+            .iter()
+            .zip(&expected)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        total += mismatches;
+        eprintln!(
+            "MOE_ROUTE_OFFICIAL sm={} rows={rows} bit_mismatches={mismatches} {}",
+            d.info.arch,
+            if mismatches == 0 { "PASS" } else { "DEFECT" }
+        );
+    }
+    ensure!(total == 0, "official router logits bit_mismatches={total}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
 fn moe_route_prefill_gpu() -> Result<()> {
@@ -239,6 +344,7 @@ fn moe_route_prefill_gpu() -> Result<()> {
     let d = Device::new(0)?;
     let s = &d.stream;
     let ops = RouteOps::new(&d.ctx, s)?;
+    official_router_logits(&d, &ops)?;
     let dims = MoeDims::minicpm47(4096);
     let (e, k, h) = (dims.experts, dims.top_k, dims.hidden);
     let fx = reference::fixture(dims, 0);
