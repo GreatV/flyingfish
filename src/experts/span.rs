@@ -22,21 +22,26 @@ pub enum SpanClass {
 /// `staged` is one flat expert list whose `staging_slots`-expert chunks are the cohorts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpanPlan {
-    pub span_rows: u32,
-    pub wave_rows: u32,
-    pub waves: u32,
-    pub streamed_bytes: u64,
+    span_rows: u32,
+    wave_rows: u32,
+    waves: u32,
+    streamed_bytes: u64,
     geometry: ExpertGeometry,
     staging_slots: u32,
+    workers: u32,
     resident: Vec<u32>,
     staged: Vec<u32>,
     cpu: Vec<u32>,
+    classes: Vec<SpanClass>,
 }
 
 impl SpanPlan {
-    /// Setup-time allocation for one geometry's experts and `staging_slots`-expert cohorts.
-    pub fn new(geometry: &ExpertGeometry, staging_slots: u32) -> Result<Self> {
+    /// Setup-time allocation for one geometry's experts and `staging_slots`-expert cohorts;
+    /// `workers` is the service table's selected worker count.
+    pub fn new(geometry: &ExpertGeometry, staging_slots: u32, workers: u32) -> Result<Self> {
         ensure!(staging_slots > 0, "zero prefill staging slots");
+        ensure!(workers > 0, "zero service workers");
+        let experts = geometry.experts as usize;
         Ok(Self {
             span_rows: 0,
             wave_rows: 0,
@@ -44,13 +49,16 @@ impl SpanPlan {
             streamed_bytes: 0,
             geometry: *geometry,
             staging_slots,
-            resident: Vec::with_capacity(geometry.experts as usize),
-            staged: Vec::with_capacity(geometry.experts as usize),
-            cpu: Vec::with_capacity(geometry.experts as usize),
+            workers,
+            resident: Vec::with_capacity(experts),
+            staged: Vec::with_capacity(experts),
+            cpu: Vec::with_capacity(experts),
+            classes: vec![SpanClass::Cpu; experts],
         })
     }
 
-    /// Rewrites the plan from the routed row counts and the current residency.
+    /// Rewrites the plan from the routed row counts and the current residency. Every fallible step
+    /// runs before the plan buffers are touched, so a failed update leaves the previous plan intact.
     pub fn update(
         &mut self,
         counts: &[u32],
@@ -84,8 +92,37 @@ impl SpanPlan {
         );
         let slot_bytes = geometry.slot_bytes()?;
         let copy_seconds = slot_bytes as f64 / rates.h2d_bytes_per_second;
-        let workers = rates.service.worker_count()?;
+        let workers = self.workers;
         let max_rows = rates.service.max_rows();
+        let mut streamed = 0usize;
+        for (expert, &rows) in counts.iter().enumerate() {
+            let class = if rows == 0 {
+                continue;
+            } else if resident[expert] {
+                SpanClass::Resident
+            } else if rows > max_rows {
+                let at_max = rates.service.rows_time(max_rows, 1, workers)?;
+                ensure!(
+                    copy_seconds < at_max,
+                    "expert {expert} rows={rows} exceed the measured rows extent ..={max_rows} and the CPU route wins at {max_rows}"
+                );
+                SpanClass::Streamed
+            } else {
+                let cpu_seconds = rates.service.rows_time(rows, 1, workers)?;
+                if copy_seconds < cpu_seconds {
+                    SpanClass::Streamed
+                } else {
+                    SpanClass::Cpu
+                }
+            };
+            self.classes[expert] = class;
+            if class == SpanClass::Streamed {
+                streamed += 1;
+            }
+        }
+        let streamed_bytes = u64::try_from(streamed)?
+            .checked_mul(slot_bytes)
+            .context("streamed span bytes overflow")?;
         self.resident.clear();
         self.staged.clear();
         self.cpu.clear();
@@ -93,33 +130,33 @@ impl SpanPlan {
             if rows == 0 {
                 continue;
             }
-            if resident[expert] {
-                self.resident.push(expert as u32);
-                continue;
-            }
-            if rows > max_rows {
-                let at_max = rates.service.rows_time(max_rows, 1, workers)?;
-                ensure!(
-                    copy_seconds < at_max,
-                    "expert {expert} rows={rows} exceed the measured rows extent ..={max_rows} and the CPU route wins at {max_rows}"
-                );
-                self.staged.push(expert as u32);
-                continue;
-            }
-            let cpu_seconds = rates.service.rows_time(rows, 1, workers)?;
-            if copy_seconds < cpu_seconds {
-                self.staged.push(expert as u32);
-            } else {
-                self.cpu.push(expert as u32);
+            match self.classes[expert] {
+                SpanClass::Resident => self.resident.push(expert as u32),
+                SpanClass::Streamed => self.staged.push(expert as u32),
+                SpanClass::Cpu => self.cpu.push(expert as u32),
             }
         }
         self.span_rows = span_rows;
         self.wave_rows = wave_rows;
         self.waves = span_rows.div_ceil(wave_rows);
-        self.streamed_bytes = u64::try_from(self.staged.len())?
-            .checked_mul(slot_bytes)
-            .context("streamed span bytes overflow")?;
+        self.streamed_bytes = streamed_bytes;
         Ok(())
+    }
+
+    pub fn span_rows(&self) -> u32 {
+        self.span_rows
+    }
+
+    pub fn wave_rows(&self) -> u32 {
+        self.wave_rows
+    }
+
+    pub fn waves(&self) -> u32 {
+        self.waves
+    }
+
+    pub fn streamed_bytes(&self) -> u64 {
+        self.streamed_bytes
     }
 
     pub fn resident(&self) -> &[u32] {
@@ -143,21 +180,6 @@ impl SpanPlan {
     pub fn cpu(&self) -> &[u32] {
         &self.cpu
     }
-}
-
-/// Plans one layer into a fresh plan: setup-time and test use; the engine calls `SpanPlan::update`.
-pub fn plan_span(
-    geometry: &ExpertGeometry,
-    counts: &[u32],
-    resident: &[bool],
-    span_rows: u32,
-    wave_rows: u32,
-    staging_slots: u32,
-    rates: &SpanRates<'_>,
-) -> Result<SpanPlan> {
-    let mut plan = SpanPlan::new(geometry, staging_slots)?;
-    plan.update(counts, resident, span_rows, wave_rows, rates)?;
-    Ok(plan)
 }
 
 /// Prefill staging leases: one cohort copy per round, pinned through every row wave.
@@ -518,7 +540,8 @@ mod tests {
             h2d_bytes_per_second: 1e9,
         };
         // 192 B at 1 GB/s is 0.192 us, below every measured CPU cell here.
-        let plan = plan_span(&geometry, &counts, &resident, 4, 2, 2, &rates).unwrap();
+        let mut plan = planner(&geometry, 2, &rates).unwrap();
+        plan.update(&counts, &resident, 4, 2, &rates).unwrap();
         assert_eq!(plan.resident(), &[0]);
         assert_eq!(plan.staged(), &[1, 2, 4, 5]);
         assert_eq!(
@@ -527,15 +550,16 @@ mod tests {
         );
         assert_eq!(plan.cohort_count(), 2);
         assert!(plan.cpu().is_empty());
-        assert_eq!(plan.streamed_bytes, 4 * 192);
-        assert_eq!(plan.waves, 2);
+        assert_eq!(plan.streamed_bytes(), 4 * 192);
+        assert_eq!(plan.waves(), 2);
         // 192 B at 100 B/s is 1.92 s, above every measured CPU cell here.
         rates.h2d_bytes_per_second = 100.0;
-        let plan = plan_span(&geometry, &counts, &resident, 4, 2, 2, &rates).unwrap();
+        let mut plan = planner(&geometry, 2, &rates).unwrap();
+        plan.update(&counts, &resident, 4, 2, &rates).unwrap();
         assert!(plan.staged().is_empty());
         assert_eq!(plan.cohort_count(), 0);
         assert_eq!(plan.cpu(), &[1, 2, 4, 5]);
-        assert_eq!(plan.streamed_bytes, 0);
+        assert_eq!(plan.streamed_bytes(), 0);
     }
 
     #[test]
@@ -562,7 +586,8 @@ mod tests {
             service: &table(),
             h2d_bytes_per_second: 1e9,
         };
-        let plan = plan_span(&geometry, &counts, &resident, 16, 2, 2, &fast).unwrap();
+        let mut plan = planner(&geometry, 2, &fast).unwrap();
+        plan.update(&counts, &resident, 16, 2, &fast).unwrap();
         assert_eq!(plan.staged(), &[1]);
         assert_eq!(plan.cohorts().collect::<Vec<_>>(), vec![&[1][..]]);
         assert!(plan.cpu().is_empty());
@@ -570,7 +595,8 @@ mod tests {
             service: &table(),
             h2d_bytes_per_second: 100.0,
         };
-        let error = plan_span(&geometry, &counts, &resident, 16, 2, 2, &slow)
+        let error = plan
+            .update(&counts, &resident, 16, 2, &slow)
             .unwrap_err()
             .to_string();
         assert!(error.contains("exceed the measured rows extent"), "{error}");
@@ -585,13 +611,13 @@ mod tests {
             service: &table(),
             h2d_bytes_per_second: 1e9,
         };
-        assert!(plan_span(&geometry, &counts[..7], &resident, 4, 2, 2, &rates).is_err());
-        assert!(plan_span(&geometry, &counts, &resident[..7], 4, 2, 2, &rates).is_err());
-        assert!(plan_span(&geometry, &counts, &resident, 4, 8, 2, &rates).is_err());
-        assert!(plan_span(&geometry, &counts, &resident, 4, 2, 0, &rates).is_err());
-        let plan = plan_span(&geometry, &counts, &resident, 4, 2, 2, &rates).unwrap();
+        let mut plan = planner(&geometry, 2, &rates).unwrap();
+        assert!(plan.update(&counts[..7], &resident, 4, 2, &rates).is_err());
+        assert!(plan.update(&counts, &resident[..7], 4, 2, &rates).is_err());
+        assert!(plan.update(&counts, &resident, 4, 8, &rates).is_err());
+        plan.update(&counts, &resident, 4, 2, &rates).unwrap();
         assert!(plan.resident().is_empty() && plan.staged().is_empty() && plan.cpu().is_empty());
-        assert_eq!(plan.waves, 2);
+        assert_eq!(plan.waves(), 2);
     }
 
     #[test]
@@ -730,6 +756,44 @@ mod tests {
         Ok(())
     }
 
+    fn planner(
+        geometry: &ExpertGeometry,
+        staging_slots: u32,
+        rates: &SpanRates<'_>,
+    ) -> Result<SpanPlan> {
+        SpanPlan::new(geometry, staging_slots, rates.service.worker_count()?)
+    }
+
+    #[test]
+    fn failed_update_leaves_the_previous_plan_intact() -> Result<()> {
+        let geometry = geometry();
+        let fast = SpanRates {
+            service: &table(),
+            h2d_bytes_per_second: 1e9,
+        };
+        let slow = SpanRates {
+            service: &table(),
+            h2d_bytes_per_second: 100.0,
+        };
+        let counts = [4u32, 1, 1, 0, 2, 1, 0, 0];
+        let resident = [true, false, false, false, false, false, false, false];
+        let mut plan = planner(&geometry, 2, &fast)?;
+        plan.update(&counts, &resident, 4, 2, &fast)?;
+        let snapshot = plan.clone();
+        let mut wide = counts;
+        wide[1] = 16;
+        let error = plan
+            .update(&wide, &resident, 4, 2, &slow)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceed the measured rows extent"), "{error}");
+        assert_eq!(
+            plan, snapshot,
+            "a failed update must leave the previous plan intact"
+        );
+        Ok(())
+    }
+
     #[test]
     fn span_plan_update_reuses_its_buffers() -> Result<()> {
         let geometry = geometry();
@@ -741,7 +805,7 @@ mod tests {
         let resident_a = [true, false, false, false, false, false, false, false];
         let counts_b = [0u32, 1, 0, 0, 0, 0, 0, 0];
         let resident_b = [false; 8];
-        let mut plan = SpanPlan::new(&geometry, 2)?;
+        let mut plan = planner(&geometry, 2, &rates)?;
         plan.update(&counts_a, &resident_a, 4, 2, &rates)?;
         let (resident, staged, cpu) = (
             plan.resident().as_ptr(),
