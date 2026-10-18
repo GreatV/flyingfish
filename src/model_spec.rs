@@ -26,6 +26,8 @@ pub struct MoeConfig {
 pub enum LinearFormat {
     Bf16,
     Fp8E4m3Block128,
+    /// compressed-tensors FP8_DYNAMIC per-output-channel weights plus token activations.
+    Fp8E4m3Channel,
 }
 /// Routed-expert checkpoint layout: fused BF16 slices or per-expert E4M3 weights with BF16
 /// per-output-channel scales (compressed-tensors FP8_DYNAMIC).
@@ -64,7 +66,6 @@ pub struct ModelSpec {
     pub rope_theta: f32,
     pub rotary_dim: u32,
     pub linear_format: LinearFormat,
-    #[serde(default)]
     pub expert_format: ExpertFormat,
     pub eos: Vec<u32>,
     pub layers: Vec<LayerPlan>,
@@ -323,6 +324,18 @@ fn equal(v: &Value, key: &str, expected: Value) -> Result<()> {
     );
     Ok(())
 }
+fn exact_keys(v: &Value, keys: &[&str], label: &str) -> Result<()> {
+    let object = v
+        .as_object()
+        .with_context(|| format!("{label} is not an object"))?;
+    if let Some(key) = object.keys().find(|key| !keys.contains(&key.as_str())) {
+        bail!("unknown {label} key {key}");
+    }
+    for key in keys {
+        ensure!(object.contains_key(*key), "{label} missing key {key}");
+    }
+    Ok(())
+}
 impl LinearFormat {
     fn read(root: &Value) -> Result<Self> {
         let Some(quant) = root.get("quantization_config") else {
@@ -348,6 +361,22 @@ impl ExpertFormat {
         else {
             return Ok(Self::Bf16);
         };
+        exact_keys(
+            quant,
+            &[
+                "config_groups",
+                "format",
+                "global_compression_ratio",
+                "ignore",
+                "kv_cache_scheme",
+                "quant_method",
+                "quantization_status",
+                "sparsity_config",
+                "transform_config",
+                "version",
+            ],
+            "quantization_config",
+        )?;
         for (key, value) in [
             ("quant_method", "compressed-tensors"),
             ("format", "float-quantized"),
@@ -395,6 +424,17 @@ impl ExpertFormat {
             groups.len()
         );
         let group = groups.values().next().context("empty quantization group")?;
+        exact_keys(
+            group,
+            &[
+                "format",
+                "input_activations",
+                "output_activations",
+                "targets",
+                "weights",
+            ],
+            "quantization config group",
+        )?;
         equal(group, "format", "float-quantized".into())?;
         ensure!(
             group.get("output_activations").is_none_or(Value::is_null),
@@ -404,6 +444,24 @@ impl ExpertFormat {
         let weights = group
             .get("weights")
             .context("quantization weights missing")?;
+        exact_keys(
+            weights,
+            &[
+                "actorder",
+                "block_structure",
+                "dynamic",
+                "group_size",
+                "num_bits",
+                "observer",
+                "observer_kwargs",
+                "scale_dtype",
+                "strategy",
+                "symmetric",
+                "type",
+                "zp_dtype",
+            ],
+            "quantization weights",
+        )?;
         equal(weights, "num_bits", 8.into())?;
         equal(weights, "type", "float".into())?;
         equal(weights, "strategy", "channel".into())?;
@@ -431,6 +489,24 @@ impl ExpertFormat {
         let activations = group
             .get("input_activations")
             .context("quantization input_activations missing")?;
+        exact_keys(
+            activations,
+            &[
+                "actorder",
+                "block_structure",
+                "dynamic",
+                "group_size",
+                "num_bits",
+                "observer",
+                "observer_kwargs",
+                "scale_dtype",
+                "strategy",
+                "symmetric",
+                "type",
+                "zp_dtype",
+            ],
+            "quantization input_activations",
+        )?;
         equal(activations, "num_bits", 8.into())?;
         equal(activations, "type", "float".into())?;
         equal(activations, "strategy", "token".into())?;
@@ -456,6 +532,110 @@ impl ExpertFormat {
             "unsupported quantization input_activations observer_kwargs"
         );
         Ok(Self::Fp8W8a16)
+    }
+
+    /// The published ignore recipe: every tensor that stays in its stored dtype.
+    fn expected_ignore(spec: &ModelSpec) -> Result<Vec<String>> {
+        let vision = spec
+            .vision
+            .as_ref()
+            .context("quantized checkpoints need the vision tower")?;
+        let mut names = vec!["lm_head".to_owned()];
+        for (layer, plan) in spec.layers.iter().enumerate() {
+            let prefix = format!("model.language_model.layers.{layer}");
+            if plan.mixer == Mixer::Gdn {
+                names.push(format!("{prefix}.linear_attn"));
+                for child in [
+                    "in_proj_a",
+                    "in_proj_b",
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "norm",
+                    "out_proj",
+                ] {
+                    names.push(format!("{prefix}.linear_attn.{child}"));
+                }
+            }
+            for suffix in [
+                "mlp.gate",
+                "mlp.shared_expert.down_proj",
+                "mlp.shared_expert.up_proj",
+                "mlp.shared_expert.gate_proj",
+                "mlp.shared_expert_gate",
+            ] {
+                names.push(format!("{prefix}.{suffix}"));
+            }
+        }
+        names.push("model.merger.mlp.0.linear_1".to_owned());
+        names.push("model.merger.mlp.0.linear_2".to_owned());
+        for suffix in [
+            "linear_1",
+            "linear_2",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.q_proj",
+            "self_attn.out_proj",
+        ] {
+            names.push(format!("model.vision_tower.vit_merger.{suffix}"));
+        }
+        for layer in 0..vision.depth {
+            for suffix in [
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.q_proj",
+                "self_attn.out_proj",
+                "mlp.fc1",
+                "mlp.fc2",
+            ] {
+                names.push(format!(
+                    "model.vision_tower.encoder.layers.{layer}.{suffix}"
+                ));
+            }
+        }
+        names.sort_unstable();
+        Ok(names)
+    }
+
+    /// Requires the published ignore list exactly, so an unexpected quantized role errors.
+    fn check_ignore(&self, root: &Value, spec: &ModelSpec) -> Result<()> {
+        if *self == Self::Bf16 {
+            return Ok(());
+        }
+        let quant = root
+            .get("quantization_config")
+            .context("quantization_config missing")?;
+        let ignore = quant
+            .get("ignore")
+            .and_then(Value::as_array)
+            .context("quantization ignore missing")?;
+        let mut actual = Vec::with_capacity(ignore.len());
+        for entry in ignore {
+            actual.push(
+                entry
+                    .as_str()
+                    .context("quantization ignore entry is not a string")?
+                    .to_owned(),
+            );
+        }
+        actual.sort_unstable();
+        let expected = Self::expected_ignore(spec)?;
+        if let Some(entry) = expected
+            .iter()
+            .find(|entry| actual.binary_search(entry).is_err())
+        {
+            bail!("quantization ignore missing {entry}");
+        }
+        if let Some(entry) = actual
+            .iter()
+            .find(|entry| expected.binary_search(entry).is_err())
+        {
+            bail!("quantization ignore has unexpected entry {entry}");
+        }
+        ensure!(
+            actual.len() == expected.len(),
+            "quantization ignore repeats an entry"
+        );
+        Ok(())
     }
 }
 fn eos(v: &Value, vocab: u32) -> Result<Vec<u32>> {
@@ -778,15 +958,22 @@ impl ModelSpec {
         equal(t, "mtp_num_hidden_layers", 1.into())?;
         equal(t, "mtp_use_dedicated_embeddings", false.into())?;
         let text = TextGeometry::read(t, "qwen3_5_moe_text")?;
-        Self::from_text(
+        let expert_format = ExpertFormat::read(root)?;
+        let linear_format = match expert_format {
+            ExpertFormat::Bf16 => LinearFormat::Bf16,
+            ExpertFormat::Fp8W8a16 => LinearFormat::Fp8E4m3Channel,
+        };
+        let spec = Self::from_text(
             Architecture::MiniCpmV47,
             text,
             t,
             generation,
             VisionConfig::from_root(root)?,
-            LinearFormat::Bf16,
-            ExpertFormat::read(root)?,
-        )
+            linear_format,
+            expert_format,
+        )?;
+        expert_format.check_ignore(root, &spec)?;
+        Ok(spec)
     }
     fn from_text(
         architecture: Architecture,

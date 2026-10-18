@@ -1,6 +1,6 @@
 //! Checked single-layer materialization layout, shared by planner and Linear.
 use crate::{checkpoint::TensorManifest, model_spec::LinearFormat};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use safetensors::Dtype;
 use std::collections::BTreeMap;
 
@@ -100,11 +100,13 @@ impl LayerDequantPlan {
             }),
             "missing linear layer {layer}"
         );
+        let plan_shape = match format {
+            LinearFormat::Fp8E4m3Block128 => !slots.is_empty(),
+            LinearFormat::Bf16 => slots.is_empty(),
+            other => bail!("linear_format={other:?} has no dequant plan"),
+        };
         ensure!(
-            match format {
-                LinearFormat::Fp8E4m3Block128 => !slots.is_empty(),
-                LinearFormat::Bf16 => slots.is_empty(),
-            },
+            plan_shape,
             "linear layer={layer} has {} FP8 slots for linear_format={format:?}",
             slots.len()
         );

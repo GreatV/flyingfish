@@ -182,7 +182,7 @@ impl Scratch {
 }
 
 type DotFn = unsafe fn(&[f32], &[bf16]) -> f32;
-type Fp8DotFn = unsafe fn(&[f32], &[u8], f32) -> f32;
+type Fp8DotFn = unsafe fn(&[f32], &[u8], bf16) -> f32;
 type RoundFn = unsafe fn(&[f32], &mut [bf16]);
 
 struct Arm {
@@ -326,12 +326,9 @@ fn fp8_slice<'a>(slot: &'a [u8], range: &Range<u64>, bytes: usize, role: &str) -
     Ok(&slot[start..end])
 }
 
-fn row_scale(bytes: &[u8], row: usize) -> f32 {
+fn row_scale(bytes: &[u8], row: usize) -> bf16 {
     let at = 2 * row;
-    f32::from(bf16::from_bits(u16::from_le_bytes([
-        bytes[at],
-        bytes[at + 1],
-    ])))
+    bf16::from_bits(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
 }
 
 pub fn fp8_contribution(
@@ -449,20 +446,20 @@ fn scalar_dot(x: &[f32], weights: &[bf16]) -> f32 {
     pairwise(&lanes)
 }
 
-fn scalar_dot_e4m3(x: &[f32], codes: &[u8], scale: f32) -> f32 {
+fn scalar_dot_e4m3(x: &[f32], codes: &[u8], scale: bf16) -> f32 {
     assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
     let mut lanes = [0f32; LANES];
     let mut k = 0;
     while k + LANES <= x.len() {
         for lane in 0..LANES {
-            let weight = crate::fp8::decode_e4m3(codes[k + lane]) * scale;
+            let weight = f32::from(crate::fp8::effective_weight(codes[k + lane], scale));
             lanes[lane] = x[k + lane].mul_add(weight, lanes[lane]);
         }
         k += LANES;
     }
     while k < x.len() {
         let lane = k % LANES;
-        let weight = crate::fp8::decode_e4m3(codes[k]) * scale;
+        let weight = f32::from(crate::fp8::effective_weight(codes[k], scale));
         lanes[lane] = x[k].mul_add(weight, lanes[lane]);
         k += 1;
     }
@@ -552,10 +549,20 @@ mod x86 {
         }
     }
 
+    /// Rounds f32 lanes to BF16 (RNE) and widens back; matches `bf16::from_f32` for finite values.
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn dot_e4m3(x: &[f32], codes: &[u8], scale: f32) -> f32 {
+    unsafe fn round_bf16x8(values: __m256) -> __m256 {
+        let bits = _mm256_castps_si256(values);
+        let lsb = _mm256_and_si256(_mm256_srli_epi32(bits, 16), _mm256_set1_epi32(1));
+        let bias = _mm256_add_epi32(_mm256_set1_epi32(0x7fff), lsb);
+        let rounded = _mm256_add_epi32(bits, bias);
+        _mm256_castsi256_ps(_mm256_and_si256(rounded, _mm256_set1_epi32(-65536)))
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn dot_e4m3(x: &[f32], codes: &[u8], scale: bf16) -> f32 {
         assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
-        let factor = _mm256_set1_ps(scale);
+        let factor = _mm256_set1_ps(scale.to_f32());
         let mut low = _mm256_setzero_ps();
         let mut high = _mm256_setzero_ps();
         let mut k = 0;
@@ -563,8 +570,8 @@ mod x86 {
             unsafe {
                 let xl = _mm256_loadu_ps(x.as_ptr().add(k));
                 let xh = _mm256_loadu_ps(x.as_ptr().add(k + 8));
-                let wl = _mm256_mul_ps(decode8(codes.as_ptr().add(k)), factor);
-                let wh = _mm256_mul_ps(decode8(codes.as_ptr().add(k + 8)), factor);
+                let wl = round_bf16x8(_mm256_mul_ps(decode8(codes.as_ptr().add(k)), factor));
+                let wh = round_bf16x8(_mm256_mul_ps(decode8(codes.as_ptr().add(k + 8)), factor));
                 low = _mm256_fmadd_ps(xl, wl, low);
                 high = _mm256_fmadd_ps(xh, wh, high);
             }
@@ -577,7 +584,7 @@ mod x86 {
         }
         while k < x.len() {
             let lane = k % LANES;
-            let weight = crate::fp8::decode_e4m3(codes[k]) * scale;
+            let weight = f32::from(crate::fp8::effective_weight(codes[k], scale));
             lanes[lane] = x[k].mul_add(weight, lanes[lane]);
             k += 1;
         }
@@ -644,16 +651,26 @@ mod x86 {
         }
     }
 
+    /// Rounds f32 lanes to BF16 (RNE) and widens back; matches `bf16::from_f32` for finite values.
     #[target_feature(enable = "avx512f,avx512bf16")]
-    pub(super) unsafe fn dot_e4m3_512(x: &[f32], codes: &[u8], scale: f32) -> f32 {
+    unsafe fn round_bf16x16(values: __m512) -> __m512 {
+        let bits = _mm512_castps_si512(values);
+        let lsb = _mm512_and_si512(_mm512_srli_epi32(bits, 16), _mm512_set1_epi32(1));
+        let bias = _mm512_add_epi32(_mm512_set1_epi32(0x7fff), lsb);
+        let rounded = _mm512_add_epi32(bits, bias);
+        _mm512_castsi512_ps(_mm512_and_si512(rounded, _mm512_set1_epi32(-65536)))
+    }
+
+    #[target_feature(enable = "avx512f,avx512bf16")]
+    pub(super) unsafe fn dot_e4m3_512(x: &[f32], codes: &[u8], scale: bf16) -> f32 {
         assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
-        let factor = _mm512_set1_ps(scale);
+        let factor = _mm512_set1_ps(scale.to_f32());
         let mut acc = _mm512_setzero_ps();
         let mut k = 0;
         while k + LANES <= x.len() {
             unsafe {
                 let xv = _mm512_loadu_ps(x.as_ptr().add(k));
-                let weights = _mm512_mul_ps(decode16(codes.as_ptr().add(k)), factor);
+                let weights = round_bf16x16(_mm512_mul_ps(decode16(codes.as_ptr().add(k)), factor));
                 acc = _mm512_fmadd_ps(xv, weights, acc);
             }
             k += LANES;
@@ -662,7 +679,7 @@ mod x86 {
         unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), acc) };
         while k < x.len() {
             let lane = k % LANES;
-            let weight = crate::fp8::decode_e4m3(codes[k]) * scale;
+            let weight = f32::from(crate::fp8::effective_weight(codes[k], scale));
             lanes[lane] = x[k].mul_add(weight, lanes[lane]);
             k += 1;
         }
@@ -1547,6 +1564,28 @@ mod tests {
         (slot, slot_layout)
     }
 
+    #[test]
+    fn fp8_effective_weight_rounds_to_bf16_before_the_dot() -> Result<()> {
+        let scale = bf16::from_f32(1.0078125);
+        let product = crate::fp8::decode_e4m3(0x3f) * scale.to_f32();
+        let rounded = f32::from(crate::fp8::effective_weight(0x3f, scale));
+        assert_eq!(product, 1.889_648_4);
+        assert_eq!(rounded, 1.890_625);
+        assert_ne!(product, rounded);
+        let x = [1.0f32];
+        let codes = [0x3f];
+        for isa in [Isa::Scalar, Isa::Avx2, Isa::Avx512Bf16] {
+            if !isa.available() {
+                println!("arm {} unavailable", isa.name());
+                continue;
+            }
+            // SAFETY: the arm was selected by `Isa::detect` or checked by `Isa::available`.
+            let value = unsafe { (arm_for(isa)?.dot_e4m3)(&x, &codes, scale) };
+            assert_eq!(value, rounded, "{} feeds the unrounded weight", isa.name());
+        }
+        Ok(())
+    }
+
     /// FP64 accumulation over the dequantized weights with the model's BF16 rounding points.
     fn fp8_oracle(
         shape: &Shape,
@@ -1556,12 +1595,9 @@ mod tests {
         routing: bf16,
     ) -> Vec<bf16> {
         let (h, i) = (shape.hidden, shape.intermediate);
-        let scale = |range: &std::ops::Range<u64>, row: usize| -> f32 {
+        let scale = |range: &std::ops::Range<u64>, row: usize| -> bf16 {
             let at = range.start as usize + 2 * row;
-            f32::from(bf16::from_bits(u16::from_le_bytes([
-                slot[at],
-                slot[at + 1],
-            ])))
+            bf16::from_bits(u16::from_le_bytes([slot[at], slot[at + 1]]))
         };
         let mut gate_w = vec![0.0f32; i * h];
         let mut up_w = vec![0.0f32; i * h];
@@ -1569,20 +1605,24 @@ mod tests {
             let gate_scale = scale(&layout.gate_scale, j);
             let up_scale = scale(&layout.up_scale, j);
             for k in 0..h {
-                gate_w[j * h + k] =
-                    crate::fp8::decode_e4m3(slot[layout.gate.start as usize + j * h + k])
-                        * gate_scale;
-                up_w[j * h + k] =
-                    crate::fp8::decode_e4m3(slot[layout.up.start as usize + j * h + k]) * up_scale;
+                gate_w[j * h + k] = f32::from(crate::fp8::effective_weight(
+                    slot[layout.gate.start as usize + j * h + k],
+                    gate_scale,
+                ));
+                up_w[j * h + k] = f32::from(crate::fp8::effective_weight(
+                    slot[layout.up.start as usize + j * h + k],
+                    up_scale,
+                ));
             }
         }
         let mut down_w = vec![0.0f32; h * i];
         for k in 0..h {
             let down_scale = scale(&layout.down_scale, k);
             for j in 0..i {
-                down_w[k * i + j] =
-                    crate::fp8::decode_e4m3(slot[layout.down.start as usize + k * i + j])
-                        * down_scale;
+                down_w[k * i + j] = f32::from(crate::fp8::effective_weight(
+                    slot[layout.down.start as usize + k * i + j],
+                    down_scale,
+                ));
             }
         }
         let mut gate = vec![0.0f64; i];
