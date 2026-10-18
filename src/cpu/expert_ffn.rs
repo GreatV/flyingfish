@@ -267,8 +267,8 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
     unsafe { (arm.round)(&scratch.up, &mut scratch.up_bf) };
     for j in 0..intermediate {
         let gate = f32::from(scratch.gate_bf[j]);
-        let silu = gate * (1.0 / (1.0 + (-gate).exp()));
-        scratch.product[j] = silu * f32::from(scratch.up_bf[j]);
+        let silu = bf16::from_f32(gate * (1.0 / (1.0 + (-gate).exp())));
+        scratch.product[j] = f32::from(silu) * f32::from(scratch.up_bf[j]);
     }
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.product, &mut scratch.activated) };
@@ -396,8 +396,8 @@ fn compute_fp8(
     unsafe { (arm.round)(&scratch.up, &mut scratch.up_bf) };
     for j in 0..intermediate {
         let gate = f32::from(scratch.gate_bf[j]);
-        let silu = gate * (1.0 / (1.0 + (-gate).exp()));
-        scratch.product[j] = silu * f32::from(scratch.up_bf[j]);
+        let silu = bf16::from_f32(gate * (1.0 / (1.0 + (-gate).exp())));
+        scratch.product[j] = f32::from(silu) * f32::from(scratch.up_bf[j]);
     }
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.product, &mut scratch.activated) };
@@ -1270,8 +1270,8 @@ fn phases(
         let gate = bf16::from_f32(gate);
         let up = bf16::from_f32(up);
         let gate = f32::from(gate);
-        let silu = gate * (1.0 / (1.0 + (-gate).exp()));
-        local.block[unit - range1.start] = bf16::from_f32(silu * f32::from(up));
+        let silu = bf16::from_f32(gate * (1.0 / (1.0 + (-gate).exp())));
+        local.block[unit - range1.start] = bf16::from_f32(f32::from(silu) * f32::from(up));
     }
     if shared.failed.load(Ordering::Acquire) {
         return Ok(());
@@ -1560,7 +1560,9 @@ mod tests {
         for j in 0..i {
             let gate = f64::from(bf16::from_f32(gate[j] as f32));
             let up = f64::from(bf16::from_f32(up[j] as f32));
-            let silu = gate * (1.0 / (1.0 + (-gate).exp()));
+            let silu = f64::from(bf16::from_f32(
+                (gate * (1.0 / (1.0 + (-gate).exp()))) as f32,
+            ));
             activated[j] = f64::from(bf16::from_f32((silu * up) as f32));
         }
         let down = &arena[weights.down.clone()];
@@ -1583,6 +1585,81 @@ mod tests {
         } else {
             bits | 0x8000
         }
+    }
+
+    #[test]
+    fn native_expert_silu_rounds_before_up_multiply() -> Result<()> {
+        let shape = production_shape();
+        let (h, i) = (shape.hidden, shape.intermediate);
+        let mut flat = vec![bf16::ZERO; per_expert(&shape)];
+        let gate = -0.015625f32;
+        let up = 1.5;
+        flat[0] = bf16::from_f32(gate);
+        flat[i * h] = bf16::from_f32(up);
+        for row in 0..h {
+            flat[2 * i * h + row * i] = bf16::ONE;
+        }
+        let mut hidden = vec![bf16::ZERO; h];
+        hidden[0] = bf16::ONE;
+        let silu = gate / (1.0 + (-gate).exp());
+        let expected = bf16::from_f32(f32::from(bf16::from_f32(silu)) * up);
+        assert_ne!(expected.to_bits(), bf16::from_f32(silu * up).to_bits());
+        let expert = weights(&shape, 0);
+        let mut scratch = Scratch::new(&shape);
+        let mut output = vec![bf16::ZERO; h];
+        let mut mismatches = 0;
+        for isa in [Isa::Scalar, Isa::Avx2, Isa::Avx512Bf16] {
+            if !isa.available() {
+                continue;
+            }
+            contribution(
+                isa,
+                Contribution {
+                    shape: &shape,
+                    arena: &flat,
+                    weights: &expert,
+                    hidden: &hidden,
+                    routing: bf16::ONE,
+                },
+                &mut output,
+                &mut scratch,
+            )?;
+            let count = output
+                .iter()
+                .filter(|v| v.to_bits() != expected.to_bits())
+                .count();
+            println!(
+                "expert_silu_boundary arm={} bit_mismatches={count}",
+                isa.name()
+            );
+            mismatches += count;
+        }
+        let arena = HostBlocks::new(1, flat.len())?;
+        arena.claim(0)?.slice()?.copy_from_slice(&flat);
+        let pool = ExpertPool::new(2, shape, 1, 1)?;
+        let assignments = [Assignment {
+            row: 0,
+            choice: 0,
+            expert: 0,
+            weight: bf16::ONE,
+        }];
+        let experts = [expert];
+        let pending = pool.submit(Job {
+            arena,
+            hidden: &hidden,
+            rows: 1,
+            experts: &experts,
+            assignments: &assignments,
+            out: &mut output,
+        })?;
+        pool.finish(pending)?;
+        let count = output
+            .iter()
+            .filter(|v| v.to_bits() != expected.to_bits())
+            .count();
+        println!("expert_silu_boundary arm=pool bit_mismatches={count}");
+        assert_eq!(mismatches + count, 0);
+        Ok(())
     }
 
     #[test]
@@ -1748,7 +1825,9 @@ mod tests {
         for j in 0..i {
             let gate = f64::from(bf16::from_f32(gate[j] as f32));
             let up = f64::from(bf16::from_f32(up[j] as f32));
-            let silu = gate * (1.0 / (1.0 + (-gate).exp()));
+            let silu = f64::from(bf16::from_f32(
+                (gate * (1.0 / (1.0 + (-gate).exp()))) as f32,
+            ));
             activated[j] = f64::from(bf16::from_f32((silu * up) as f32));
         }
         let mut out = Vec::with_capacity(h);
