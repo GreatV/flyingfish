@@ -338,7 +338,7 @@ impl DecodeOps {
         input: &MoeDecode<'_>,
         y: &mut TensorMut<bf16, 2>,
         scratch: &Scratch,
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         self.contribute(stream, input, scratch)?;
         let rows = input.x.shape[0];
         let top_k = input.ids.shape[1];

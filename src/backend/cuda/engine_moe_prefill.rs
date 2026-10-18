@@ -4,7 +4,7 @@ use crate::backend::cuda::moe::prefill::prefill_scratch_bytes;
 use crate::backend::cuda::moe::prefill::{MoePrefillContribute, MoePrefillFinish, PrefillOps};
 use crate::experts::{
     plan::{Capacity, Reserves, ServiceTable},
-    span::{SpanPlan, SpanRates, StagingLeases, plan_span},
+    span::{SpanPlan, SpanRates, StagingLeases},
 };
 use crate::prefill::ExpertSpanLayout;
 use std::fmt::Write;
@@ -262,6 +262,9 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     resident: Vec<bool>,
     forecast_counts: Vec<u32>,
     forecast_resident: Vec<bool>,
+    plan: SpanPlan,
+    forecast_plan: SpanPlan,
+    leases: StagingLeases,
     pub stats: [u64; 8],
 }
 
@@ -283,22 +286,21 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
     );
     let mut counts = vec![0; geometry.experts as usize];
     let resident = vec![false; geometry.experts as usize];
+    let mut plan = SpanPlan::new(&geometry, 1, service.worker_count()?)?;
     let mut cpu_rows = 0;
     for row_count in 1..=service.max_rows().min(rows) {
         counts[0] = row_count;
-        let plan = plan_span(
-            &geometry,
+        plan.update(
             &counts,
             &resident,
             row_count,
-            1,
             1,
             &SpanRates {
                 service,
                 h2d_bytes_per_second,
             },
         )?;
-        if !plan.cpu.is_empty() {
+        if !plan.cpu().is_empty() {
             cpu_rows = row_count;
         }
     }
@@ -447,6 +449,9 @@ impl Prefill {
             resident: vec![false; geometry.experts as usize],
             forecast_counts: vec![0; geometry.experts as usize],
             forecast_resident: vec![false; geometry.experts as usize],
+            plan: SpanPlan::new(&geometry, capacity.prefill_staging_slots, workers)?,
+            forecast_plan: SpanPlan::new(&geometry, capacity.prefill_staging_slots, workers)?,
+            leases: StagingLeases::new(capacity.prefill_staging_slots)?,
             stats: [0; 8],
         })
     }
@@ -699,28 +704,27 @@ impl Prefill {
         for (expert, resident) in self.resident.iter_mut().enumerate() {
             *resident = slots.policy.ledger().tier(layer, expert as u32)? == Tier::Gpu;
         }
-        let plan = plan_span(
-            &self.geometry,
+        self.plan.update(
             &self.counts,
             &self.resident,
             rows,
             self.capacity.wave_rows.min(rows),
-            self.capacity.prefill_staging_slots,
             &SpanRates {
                 service: &self.service,
                 h2d_bytes_per_second: self.h2d_bytes_per_second,
             },
         )?;
+        let plan = &self.plan;
         for (total, &count) in self.frequency[layer as usize].iter_mut().zip(&self.counts) {
             *total += f64::from(count);
         }
         if layer == 0 {
             self.rows += u64::from(rows);
         }
-        self.gpu.read_ahead.begin_layer(slots, layer, &plan)?;
-        self.cpu.prepare(&self.gpu, span, slots, layer, &plan)?;
+        self.gpu.read_ahead.begin_layer(slots, layer, plan)?;
+        self.cpu.prepare(&self.gpu, span, slots, layer, plan)?;
         self.gpu
-            .prepare_tables(&device.stream, slots, layer, &plan)?;
+            .prepare_tables(&device.stream, slots, layer, plan)?;
         if !self.cpu.experts.is_empty() {
             slots.transfers.ready_weights(&self.cpu.experts)?;
         }
@@ -763,8 +767,8 @@ impl Prefill {
                     slots,
                     span,
                     &mut decode.prefill,
-                    (layer, &plan, ffn),
-                    next.as_ref().map(|plan| (layer + 1, plan)),
+                    (layer, plan, ffn, &mut self.leases),
+                    next.then_some((layer + 1, &self.forecast_plan)),
                 )
             });
             let host_result = match pending {
@@ -799,14 +803,14 @@ impl Prefill {
         }
         self.stats[0] += 1;
         self.stats[1] += u64::from(rows);
-        self.stats[2] += plan.streamed_bytes;
+        self.stats[2] += plan.streamed_bytes();
         self.stats[3] += cpu_choices as u64;
         Ok(())
     }
 
-    fn lookahead(&mut self, slots: &Slots, layer: u32, rows: u32) -> Result<Option<SpanPlan>> {
+    fn lookahead(&mut self, slots: &Slots, layer: u32, rows: u32) -> Result<bool> {
         if layer + 1 == self.geometry.layers {
-            return Ok(None);
+            return Ok(false);
         }
         let expected =
             u64::from(rows) * u64::from(self.geometry.top_k) / u64::from(self.geometry.experts);
@@ -817,25 +821,23 @@ impl Prefill {
                     .service
                     .rows_time(self.service.max_rows(), 1, self.workers)?
         {
-            return Ok(None);
+            return Ok(false);
         }
         for (expert, resident) in self.forecast_resident.iter_mut().enumerate() {
             *resident = slots.policy.ledger().tier(layer + 1, expert as u32)? == Tier::Gpu;
         }
         self.forecast_counts.fill(u32::try_from(expected)?);
-        plan_span(
-            &self.geometry,
+        self.forecast_plan.update(
             &self.forecast_counts,
             &self.forecast_resident,
             rows,
             rows.min(self.capacity.wave_rows),
-            self.capacity.prefill_staging_slots,
             &SpanRates {
                 service: &self.service,
                 h2d_bytes_per_second: self.h2d_bytes_per_second,
             },
-        )
-        .map(Some)
+        )?;
+        Ok(true)
     }
 
     fn finish_wave(
@@ -1343,10 +1345,10 @@ impl Cpu {
         self.assignments.clear();
         self.disk.clear();
         let geometry = span.geometry;
-        let choices = plan.span_rows as usize * geometry.top_k as usize;
+        let choices = plan.span_rows() as usize * geometry.top_k as usize;
         let ids = &gpu.host_ids.as_slice()?[..choices];
         let weights = &gpu.host_weights.as_slice()?[..choices];
-        for &expert in &plan.cpu {
+        for &expert in plan.cpu() {
             let compact = self.experts.len() as u32;
             let tier = slots.policy.ledger().tier(layer, expert)?;
             if tier == Tier::Host {
@@ -1474,7 +1476,7 @@ impl Gpu {
     ) -> Result<()> {
         let geometry = slots.catalogue.geometry();
         self.tables.clear()?;
-        for &expert in &plan.resident {
+        for &expert in plan.resident() {
             let position = slots.policy.ledger().slot(layer, expert)?;
             let physical = &mut slots.physical[position as usize];
             if !physical.waited {
@@ -1500,7 +1502,7 @@ impl Gpu {
                 slots.policy.generation(layer, expert)?,
             )?;
         }
-        for (cohort, experts) in plan.staged.iter().enumerate() {
+        for (cohort, experts) in plan.cohorts().enumerate() {
             self.epoch = self
                 .epoch
                 .checked_add(1)
@@ -1524,12 +1526,12 @@ impl Gpu {
         slots: &mut Slots,
         span: &Span,
         ops: &mut PrefillOps,
-        run: (u32, &SpanPlan, BoundFfn),
+        run: (u32, &SpanPlan, BoundFfn, &mut StagingLeases),
         next: Option<(u32, &SpanPlan)>,
     ) -> Result<()> {
-        let (layer, plan, ffn) = run;
+        let (layer, plan, ffn, leases) = run;
         let stream = &device.stream;
-        if plan.staged.is_empty()
+        if plan.staged().is_empty()
             && let Some((layer, next)) = next
         {
             self.read_ahead.predict(slots, layer, next)?;
@@ -1539,14 +1541,14 @@ impl Gpu {
             result::memset_d8_async(
                 span.base + span.layout.done.start as u64,
                 0,
-                plan.span_rows as usize * span.geometry.top_k as usize * 4,
+                plan.span_rows() as usize * span.geometry.top_k as usize * 4,
                 stream.cu_stream(),
             )?;
         }
-        if !plan.resident.is_empty() {
+        if !plan.resident().is_empty() {
             let ticket = self.cohort(device, slots, span, ops, plan, (layer, 0, ffn, None))?;
             self.resident_slots.clear();
-            for &expert in &plan.resident {
+            for &expert in plan.resident() {
                 self.resident_slots
                     .push(slots.policy.ledger().slot(layer, expert)?);
             }
@@ -1557,8 +1559,8 @@ impl Gpu {
                 slots.physical[position as usize].reader = Some(ticket.clone());
             }
         }
-        let mut leases = StagingLeases::new(self.staging_readers.len() as u32, plan.waves)?;
-        for (cohort, experts) in plan.staged.iter().enumerate() {
+        leases.reset(plan.waves())?;
+        for (cohort, experts) in plan.cohorts().enumerate() {
             for (position, &expert) in experts.iter().enumerate() {
                 if let Some(reader) = self.staging_readers[position].take() {
                     slots.transfers.h2d.wait(&reader.event)?;
@@ -1570,7 +1572,7 @@ impl Gpu {
             leases.load(experts, copied.id)?;
             self.staging_copy = Some(copied);
             self.read_ahead.prime(slots, layer, plan)?;
-            if cohort + 1 == plan.staged.len()
+            if cohort + 1 == plan.cohort_count() as usize
                 && let Some((layer, next)) = next
             {
                 self.read_ahead.predict(slots, layer, next)?;
@@ -1581,9 +1583,9 @@ impl Gpu {
                 span,
                 ops,
                 plan,
-                (layer, cohort + 1, ffn, Some(&mut leases)),
+                (layer, cohort + 1, ffn, Some(leases)),
             )?;
-            for id in leases.release()? {
+            for &id in leases.release()? {
                 ensure!(
                     self.staging_readers
                         .iter()
@@ -1665,6 +1667,15 @@ impl Gpu {
         cohort: (u32, usize, BoundFfn, Option<&mut StagingLeases>),
     ) -> Result<Ticket> {
         let (layer, cohort, ffn, mut leases) = cohort;
+        let staged_slots = if leases.is_some() {
+            ensure!(cohort > 0, "prefill resident cohort has staging leases");
+            plan.cohorts()
+                .nth(cohort - 1)
+                .context("prefill staging cohort exceeds the layer plan")?
+                .len()
+        } else {
+            0
+        };
         let BoundFfn::Moe {
             shared,
             shared_gate,
@@ -1676,11 +1687,11 @@ impl Gpu {
         let stream = &device.stream;
         let geometry = span.geometry;
         let tables = self.tables.upload(stream, cohort, geometry.experts)?;
-        let ids = span.choices::<i32>(&span.layout.ids, 0, plan.span_rows)?;
-        let active = span.choices::<u32>(&span.layout.active, 0, plan.span_rows)?;
-        let generation = span.choices::<u64>(&span.layout.generation, 0, plan.span_rows)?;
+        let ids = span.choices::<i32>(&span.layout.ids, 0, plan.span_rows())?;
+        let active = span.choices::<u32>(&span.layout.active, 0, plan.span_rows())?;
+        let generation = span.choices::<u64>(&span.layout.generation, 0, plan.span_rows())?;
         let assignments = plan
-            .span_rows
+            .span_rows()
             .checked_mul(geometry.top_k)
             .context("prefill mask assignment overflow")?;
         ensure!(
@@ -1705,9 +1716,9 @@ impl Gpu {
         }
         let range = cohort * geometry.experts as usize..(cohort + 1) * geometry.experts as usize;
         let mut last = None;
-        for base in (0..plan.span_rows).step_by(plan.wave_rows as usize) {
-            let rows = plan.wave_rows.min(plan.span_rows - base);
-            let reader = ops.prefill_contribute(
+        for base in (0..plan.span_rows()).step_by(plan.wave_rows() as usize) {
+            let rows = plan.wave_rows().min(plan.span_rows() - base);
+            ops.prefill_contribute(
                 stream,
                 MoePrefillContribute {
                     x: span.hidden(&span.layout.normalized, base, rows)?,
@@ -1730,10 +1741,9 @@ impl Gpu {
                 },
                 &qwen::scratch(&self.scratch, stream),
             )?;
-            drop(reader);
             let ticket = slots.events.record(stream)?;
             if let Some(leases) = leases.as_mut() {
-                for position in 0..plan.staged[cohort - 1].len() {
+                for position in 0..staged_slots {
                     leases.record_wave(position as u32, ticket.id)?;
                     self.staging_readers[position] = Some(ticket.clone());
                 }
@@ -1947,50 +1957,48 @@ mod tests {
             stream.alloc_zeros::<u8>(prefill_scratch_bytes(4, 4, 16, 128, 64)? as usize)?;
         for base in (0..rows).step_by(4) {
             let count = 4.min(rows - base);
-            decode
-                .prefill
-                .prefill_contribute(
-                    stream,
-                    MoePrefillContribute {
-                        x: qwen::matrix(&input, stream, base * 128, count, 128)?,
-                        ids: qwen::view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
-                        weights: qwen::view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,
-                        active: qwen::view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
-                        assignment_gen: qwen::view(
-                            &generation,
-                            stream,
-                            base * 4,
-                            [count as u32, 4],
-                            [4, 1],
-                        )?,
-                        slots_gate_up: table.gate_up,
-                        slots_down: table.down,
-                        slot_valid: table.valid,
-                        slot_generation: table.generation,
-                        slots_gate_up_host: &gate_up,
-                        slots_down_host: &down,
-                        shared_gate: shared[0],
-                        shared_up: shared[1],
-                        shared_down: shared[2],
-                        shared_expert_gate: shared_gate,
-                        contributions: qwen::view(
-                            &contributions,
-                            stream,
-                            base * 4 * 128,
-                            [count as u32, 4, 128],
-                            [512, 128, 1],
-                        )?,
-                        done: TensorMut(qwen::view(
-                            &done,
-                            stream,
-                            base * 4,
-                            [count as u32, 4],
-                            [4, 1],
-                        )?),
-                    },
-                    &qwen::scratch(&scratch, stream),
-                )?
-                .synchronize()?;
+            decode.prefill.prefill_contribute(
+                stream,
+                MoePrefillContribute {
+                    x: qwen::matrix(&input, stream, base * 128, count, 128)?,
+                    ids: qwen::view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
+                    weights: qwen::view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,
+                    active: qwen::view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
+                    assignment_gen: qwen::view(
+                        &generation,
+                        stream,
+                        base * 4,
+                        [count as u32, 4],
+                        [4, 1],
+                    )?,
+                    slots_gate_up: table.gate_up,
+                    slots_down: table.down,
+                    slot_valid: table.valid,
+                    slot_generation: table.generation,
+                    slots_gate_up_host: &gate_up,
+                    slots_down_host: &down,
+                    shared_gate: shared[0],
+                    shared_up: shared[1],
+                    shared_down: shared[2],
+                    shared_expert_gate: shared_gate,
+                    contributions: qwen::view(
+                        &contributions,
+                        stream,
+                        base * 4 * 128,
+                        [count as u32, 4, 128],
+                        [512, 128, 1],
+                    )?,
+                    done: TensorMut(qwen::view(
+                        &done,
+                        stream,
+                        base * 4,
+                        [count as u32, 4],
+                        [4, 1],
+                    )?),
+                },
+                &qwen::scratch(&scratch, stream),
+            )?;
+            stream.synchronize()?;
         }
         let mut expected = stream.clone_dtoh(&contributions)?;
         let shape = Shape::new(128, 64)?;
@@ -2036,38 +2044,30 @@ mod tests {
         stream.memcpy_htod(&expected, &mut contributions)?;
         for base in (0..rows).step_by(4) {
             let count = 4.min(rows - base);
-            decode
-                .prefill
-                .prefill_finish(
-                    stream,
-                    MoePrefillFinish {
-                        x: qwen::matrix(&input, stream, base * 128, count, 128)?,
-                        ids: qwen::view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
-                        final_active: qwen::view(
-                            &active,
-                            stream,
-                            base * 4,
-                            [count as u32, 4],
-                            [4, 1],
-                        )?,
-                        contributions: qwen::view(
-                            &contributions,
-                            stream,
-                            base * 512,
-                            [count as u32, 4, 128],
-                            [512, 128, 1],
-                        )?,
-                        done: qwen::view(&done, stream, base * 4, [count as u32, 4], [4, 1])?,
-                        experts: 16,
-                        shared_gate: shared[0],
-                        shared_up: shared[1],
-                        shared_down: shared[2],
-                        shared_expert_gate: shared_gate,
-                        y: TensorMut(qwen::matrix(&y, stream, base * 128, count, 128)?),
-                    },
-                    &qwen::scratch(&scratch, stream),
-                )?
-                .synchronize()?;
+            decode.prefill.prefill_finish(
+                stream,
+                MoePrefillFinish {
+                    x: qwen::matrix(&input, stream, base * 128, count, 128)?,
+                    ids: qwen::view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
+                    final_active: qwen::view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
+                    contributions: qwen::view(
+                        &contributions,
+                        stream,
+                        base * 512,
+                        [count as u32, 4, 128],
+                        [512, 128, 1],
+                    )?,
+                    done: qwen::view(&done, stream, base * 4, [count as u32, 4], [4, 1])?,
+                    experts: 16,
+                    shared_gate: shared[0],
+                    shared_up: shared[1],
+                    shared_down: shared[2],
+                    shared_expert_gate: shared_gate,
+                    y: TensorMut(qwen::matrix(&y, stream, base * 128, count, 128)?),
+                },
+                &qwen::scratch(&scratch, stream),
+            )?;
+            stream.synchronize()?;
         }
         Ok(Reference {
             ids: host_ids,
@@ -2221,13 +2221,12 @@ mod tests {
                                 Ok(slots.policy.ledger().tier(layer as u32, expert)? == Tier::Gpu)
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        let expected_plan = plan_span(
-                            &geometry,
+                        let mut expected_plan = SpanPlan::new(&geometry, 2, prefill.workers)?;
+                        expected_plan.update(
                             &counts,
                             &resident,
                             rows,
                             4,
-                            2,
                             &SpanRates {
                                 service: &prefill.service,
                                 h2d_bytes_per_second: prefill.h2d_bytes_per_second,
@@ -2237,8 +2236,7 @@ mod tests {
                             .iter()
                             .filter(|expert| {
                                 !expected_plan
-                                    .staged
-                                    .iter()
+                                    .cohorts()
                                     .any(|cohort| cohort.contains(expert))
                             })
                             .count() as u64;
@@ -2253,11 +2251,11 @@ mod tests {
                             }
                         }
                         coverage[0] += expected_plan
-                            .resident
+                            .resident()
                             .iter()
                             .map(|&expert| u64::from(counts[expert as usize]))
                             .sum::<u64>();
-                        for &expert in &expected_plan.cpu {
+                        for &expert in expected_plan.cpu() {
                             coverage[if slots.policy.ledger().tier(layer as u32, expert)?
                                 == Tier::Host
                             {
@@ -2266,7 +2264,7 @@ mod tests {
                                 2
                             }] += u64::from(counts[expert as usize]);
                         }
-                        for &expert in expected_plan.staged.iter().flatten() {
+                        for &expert in expected_plan.cohorts().flatten() {
                             coverage[if slots.policy.ledger().tier(layer as u32, expert)?
                                 == Tier::Host
                             {
@@ -2307,7 +2305,7 @@ mod tests {
                             engine.device.stream.synchronize()?;
                         }
                         let reference =
-                            reference(&oracle, &fixture, layer as u32, &expected_plan.cpu)?;
+                            reference(&oracle, &fixture, layer as u32, expected_plan.cpu())?;
                         let actual = engine.device.stream.clone_dtoh(&output)?;
                         let span = prefill.span.as_ref().context("prefill gate span missing")?;
                         let mut contributions = vec![bf16::ZERO; rows as usize * 4 * 128];
@@ -2347,7 +2345,7 @@ mod tests {
                             .zip(contributions.as_chunks::<128>().0)
                             .enumerate()
                         {
-                            let cpu = expected_plan.cpu.contains(&(expert as u32));
+                            let cpu = expected_plan.cpu().contains(&(expert as u32));
                             cohort_mismatches[usize::from(cpu)] += values
                                 .iter()
                                 .zip(&reference.contributions[choice * 128..(choice + 1) * 128])

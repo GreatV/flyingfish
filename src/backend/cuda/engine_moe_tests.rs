@@ -915,49 +915,48 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
         .map(|&id| published[layer * 16 + id as usize])
         .collect::<Vec<_>>();
     stream.memcpy_htod(&generations, &mut generation)?;
-    DecodeOps::new(ctx)?
-        .decode(
-            stream,
-            &MoeDecode {
-                x: xv,
-                ids: idv,
-                active: qwen::view(&active, stream, 0, [rows as u32, k as u32], [k as u64, 1])?,
-                weights: weightv,
-                slots_gate_up: slots.gate_up,
-                slots_down: slots.down,
-                slot_valid: slots.valid,
-                slot_generation: slots.generation,
-                assignment_gen: qwen::view(
-                    &generation,
-                    stream,
-                    0,
-                    [rows as u32, k as u32],
-                    [k as u64, 1],
-                )?,
-                shared_gate: shared[0],
-                shared_up: shared[1],
-                shared_down: shared[2],
-                shared_expert_gate: shared_gate,
-                contributions: qwen::view(
-                    &contributions,
-                    stream,
-                    0,
-                    [rows as u32, k as u32, h as u32],
-                    [(k * h) as u64, h as u64, 1],
-                )?,
-                shared_out: &mut TensorMut(qwen::matrix(&shared_out, stream, 0, rows, h)?),
-                done: &mut TensorMut(qwen::view(
-                    &done,
-                    stream,
-                    0,
-                    [rows as u32, k as u32],
-                    [k as u64, 1],
-                )?),
-            },
-            &mut TensorMut(qwen::matrix(&y, stream, 0, rows, h)?),
-            &qwen::scratch(&scratch, stream),
-        )?
-        .synchronize()?;
+    DecodeOps::new(ctx)?.decode(
+        stream,
+        &MoeDecode {
+            x: xv,
+            ids: idv,
+            active: qwen::view(&active, stream, 0, [rows as u32, k as u32], [k as u64, 1])?,
+            weights: weightv,
+            slots_gate_up: slots.gate_up,
+            slots_down: slots.down,
+            slot_valid: slots.valid,
+            slot_generation: slots.generation,
+            assignment_gen: qwen::view(
+                &generation,
+                stream,
+                0,
+                [rows as u32, k as u32],
+                [k as u64, 1],
+            )?,
+            shared_gate: shared[0],
+            shared_up: shared[1],
+            shared_down: shared[2],
+            shared_expert_gate: shared_gate,
+            contributions: qwen::view(
+                &contributions,
+                stream,
+                0,
+                [rows as u32, k as u32, h as u32],
+                [(k * h) as u64, h as u64, 1],
+            )?,
+            shared_out: &mut TensorMut(qwen::matrix(&shared_out, stream, 0, rows, h)?),
+            done: &mut TensorMut(qwen::view(
+                &done,
+                stream,
+                0,
+                [rows as u32, k as u32],
+                [k as u64, 1],
+            )?),
+        },
+        &mut TensorMut(qwen::matrix(&y, stream, 0, rows, h)?),
+        &qwen::scratch(&scratch, stream),
+    )?;
+    stream.synchronize()?;
     let mut trace = Trace::default();
     trace.add(
         "layer.moe.ids".into(),
@@ -1038,34 +1037,27 @@ fn combine_expected(engine: &Engine, contributions: &[bf16], rows: usize) -> Res
     let scale = qwen::view(&expected_scale, stream, 0, [rows as u32, 1], [1, 1])?;
     let combine = CombineOps::new(&engine.device.ctx)?;
     combine.shared_scale(stream, x, shared_gate, &mut TensorMut(scale))?;
-    combine
-        .combine(
-            stream,
-            &MoeCombine {
-                ids: qwen::view(&decode.ids, stream, 0, [rows as u32, 4], [4, 1])?,
-                final_active: qwen::view(
-                    &decode.final_active,
-                    stream,
-                    0,
-                    [rows as u32, 4],
-                    [4, 1],
-                )?,
-                done: qwen::view(&decode.done, stream, 0, [rows as u32, 4], [4, 1])?,
-                contributions: qwen::view(
-                    &expected_contributions,
-                    stream,
-                    0,
-                    [rows as u32, 4, 128],
-                    [512, 128, 1],
-                )?,
-                shared_out: qwen::matrix(&decode.shared, stream, 0, rows, 128)?,
-                x,
-                shared_expert_gate: shared_gate,
-                scale: TensorMut(scale),
-                y: TensorMut(qwen::matrix(&expected_out, stream, 0, rows, 128)?),
-            },
-        )?
-        .synchronize()?;
+    combine.combine(
+        stream,
+        &MoeCombine {
+            ids: qwen::view(&decode.ids, stream, 0, [rows as u32, 4], [4, 1])?,
+            final_active: qwen::view(&decode.final_active, stream, 0, [rows as u32, 4], [4, 1])?,
+            done: qwen::view(&decode.done, stream, 0, [rows as u32, 4], [4, 1])?,
+            contributions: qwen::view(
+                &expected_contributions,
+                stream,
+                0,
+                [rows as u32, 4, 128],
+                [512, 128, 1],
+            )?,
+            shared_out: qwen::matrix(&decode.shared, stream, 0, rows, 128)?,
+            x,
+            shared_expert_gate: shared_gate,
+            scale: TensorMut(scale),
+            y: TensorMut(qwen::matrix(&expected_out, stream, 0, rows, 128)?),
+        },
+    )?;
+    stream.synchronize()?;
     Ok(stream.clone_dtoh(&expected_out)?)
 }
 
@@ -1438,29 +1430,28 @@ fn cpu_control(
             ),
         )
         .is_err();
-    decode
-        .finish(
-            &engine.device,
-            ffn,
-            slots.bindings(0, stream)?,
-            Dispatch {
-                active: &active,
-                generation: &generations,
-                host: Some(host.clone()),
-                experts: &experts,
-                assignments: &assignments,
-                miss_rows: &miss_rows,
-                host_dma: None,
-                disk: &[],
-                disk_cpu: None,
-                layer: 0,
-            },
-            (
-                x,
-                &mut TensorMut(qwen::matrix(&engine.work.out, stream, 0, rows, 128)?),
-            ),
-        )?
-        .synchronize()?;
+    decode.finish(
+        &engine.device,
+        ffn,
+        slots.bindings(0, stream)?,
+        Dispatch {
+            active: &active,
+            generation: &generations,
+            host: Some(host.clone()),
+            experts: &experts,
+            assignments: &assignments,
+            miss_rows: &miss_rows,
+            host_dma: None,
+            disk: &[],
+            disk_cpu: None,
+            layer: 0,
+        },
+        (
+            x,
+            &mut TensorMut(qwen::matrix(&engine.work.out, stream, 0, rows, 128)?),
+        ),
+    )?;
+    stream.synchronize()?;
     let duplicate_finish = decode
         .finish(
             &engine.device,

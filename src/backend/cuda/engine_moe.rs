@@ -294,7 +294,7 @@ impl Decode {
         slots: SlotBindings,
         mut dispatch: Dispatch<'_>,
         activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         let BoundFfn::Moe {
             router,
             shared,
@@ -477,7 +477,7 @@ impl Decode {
         )?;
         self.stats[1] += dispatch.active.iter().map(|&n| u64::from(n)).sum::<u64>();
         self.stats[4] += 1;
-        let completed = self.combine.combine(
+        self.combine.combine(
             stream,
             &MoeCombine {
                 ids,
@@ -492,7 +492,7 @@ impl Decode {
             },
         )?;
         self.pending = false;
-        Ok(completed)
+        Ok(())
     }
 
     fn run_cpu(&mut self, device: &Device, dispatch: &mut Dispatch<'_>) -> Result<()> {

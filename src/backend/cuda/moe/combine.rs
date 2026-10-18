@@ -2,7 +2,7 @@
 use crate::backend::cuda::contracts::{Tensor, TensorMut};
 use crate::backend::cuda::cubin;
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaStream, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaFunction, CudaStream, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -109,7 +109,7 @@ impl CombineOps {
         x: Tensor<bf16, 2>,
         shared_expert_gate: Tensor<bf16, 1>,
         scale: &mut TensorMut<bf16, 2>,
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         let rows = x.shape[0];
         let hidden = x.shape[1];
         x.validate()?;
@@ -123,6 +123,7 @@ impl CombineOps {
                 && scale.read().stride == [1, 1],
             "moe combine shared_scale layout mismatch (rows {rows}, hidden {hidden})"
         );
+        // SAFETY: the validated row, gate and scale views cover every launched row and hidden value.
         unsafe {
             stream
                 .launch_builder(&self.shared_scale)
@@ -134,11 +135,12 @@ impl CombineOps {
                 .arg(&(x.stride[0] as i64))
                 .launch(grid(rows as usize, 256))?;
         }
-        Ok(stream.record_event(None)?)
+        Ok(())
     }
 
-    pub fn combine(&self, stream: &Arc<CudaStream>, input: &MoeCombine) -> Result<CudaEvent> {
+    pub fn combine(&self, stream: &Arc<CudaStream>, input: &MoeCombine) -> Result<()> {
         let (rows, top_k, hidden) = input.validate()?;
+        // SAFETY: all validated views cover rows*top_k choices and rows*hidden output values.
         unsafe {
             stream
                 .launch_builder(&self.combine)
@@ -154,6 +156,6 @@ impl CombineOps {
                 .arg(&(hidden as i64))
                 .launch(grid(rows as usize, 256))?;
         }
-        Ok(stream.record_event(None)?)
+        Ok(())
     }
 }

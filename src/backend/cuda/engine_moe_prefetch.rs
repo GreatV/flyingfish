@@ -306,8 +306,7 @@ impl ReadAhead {
         while index < self.predictions.len() {
             let (predicted_layer, expert) = self.predictions[index];
             if predicted_layer <= layer
-                && !(predicted_layer == layer
-                    && plan.staged.iter().any(|cohort| cohort.contains(&expert)))
+                && !(predicted_layer == layer && plan.staged().contains(&expert))
             {
                 if let Retired::Loaded(ring) = self
                     .queue
@@ -330,7 +329,7 @@ impl ReadAhead {
         if !self.pending {
             self.reclaim(slots, false)?;
         }
-        for &expert in plan.staged.iter().flatten() {
+        for &expert in plan.staged() {
             if slots.policy.ledger().tier(layer, expert)? != Tier::Disk
                 || self.predictions.contains(&(layer, expert))
                 || self.consumed.contains(&(layer, expert))
@@ -360,7 +359,7 @@ impl ReadAhead {
             self.forecast.is_empty(),
             "prefetch forecast for layer={layer} overlaps an earlier layer"
         );
-        for &expert in plan.staged.iter().flatten() {
+        for &expert in plan.staged() {
             if slots.policy.ledger().tier(layer, expert)? == Tier::Disk {
                 ensure!(
                     self.forecast.len() < self.forecast.capacity(),
@@ -383,9 +382,7 @@ impl ReadAhead {
         self.stats[4] += self
             .forecast
             .iter()
-            .filter(|&&(predicted, expert)| {
-                predicted == layer && !plan.staged.iter().any(|cohort| cohort.contains(&expert))
-            })
+            .filter(|&&(predicted, expert)| predicted == layer && !plan.staged().contains(&expert))
             .count() as u64;
         self.forecast.retain(|&(predicted, _)| predicted > layer);
         Ok(())
@@ -513,15 +510,46 @@ mod tests {
 
     #[test]
     fn forecast_cancellations_ignore_read_completion() -> Result<()> {
-        let plan = SpanPlan {
-            span_rows: 263,
-            wave_rows: 4,
-            waves: 66,
-            resident: vec![1],
-            staged: vec![vec![0, 2], vec![5]],
-            cpu: vec![7],
-            streamed_bytes: 0,
+        let geometry = ExpertGeometry {
+            layers: 2,
+            experts: 16,
+            hidden: 128,
+            intermediate: 64,
+            top_k: 4,
         };
+        let service = crate::experts::plan::ServiceTable::new(
+            "fixture",
+            [1, 64]
+                .into_iter()
+                .map(|rows| crate::experts::plan::ServiceCell {
+                    workers: 2,
+                    rows,
+                    experts: 1,
+                    seconds: f64::from(rows) * 0.00002,
+                })
+                .collect(),
+        )?;
+        let mut plan = SpanPlan::new(&geometry, 2, 2)?;
+        let mut counts = [0; 16];
+        for expert in [0, 2, 5] {
+            counts[expert] = 65;
+        }
+        counts[1] = 1;
+        counts[7] = 1;
+        let mut resident = [false; 16];
+        resident[1] = true;
+        plan.update(
+            &counts,
+            &resident,
+            263,
+            4,
+            &SpanRates {
+                service: &service,
+                h2d_bytes_per_second: 1_000_000_000.0,
+            },
+        )?;
+        assert_eq!(plan.staged(), [0, 2, 5]);
+        assert_eq!(plan.cpu(), [7]);
         for completed in [false, true] {
             let mut ahead = ReadAhead::new(2, 0, 16)?;
             assert!(ahead.worker.is_none() && ahead.queue.is_none() && ahead.depth == 0);

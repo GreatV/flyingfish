@@ -727,6 +727,7 @@ struct Stage {
 
 impl Stage {
     fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<Self> {
+        // SAFETY: the stage owns its pinned mirrors and initializes every transmitted word before upload.
         let stage = unsafe {
             Stage {
                 d2h: ctx.alloc_pinned_with_flags::<i32>(D2H_WINDOW_WORDS, 0)?,
@@ -736,8 +737,8 @@ impl Stage {
                 gemm2_dev: stream.alloc_zeros::<u64>(GEMM2_PTR_WORDS)?,
                 gemm1_copy_done: ctx.new_event(Some(ds::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
                 gemm2_copy_done: ctx.new_event(Some(ds::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
-                order: Vec::new(),
-                runs: Vec::new(),
+                order: Vec::with_capacity(MAX_EXPERTS),
+                runs: Vec::with_capacity(MAX_EXPERTS),
                 offsets: Vec::with_capacity(MAX_EXPERTS),
                 arrays: GemmArrays {
                     m: Vec::with_capacity(MAX_GROUPS),
@@ -799,9 +800,8 @@ impl PrefillOps {
     /// over THIS cohort's active assignments into the caller-owned
     /// contributions/done buffers. No zero/reset of either buffer, no shared
     /// FFN, no sigmoid gate, no combine; a cohort with no active assignments
-    /// runs no routed problem. Records and returns the completion event of
-    /// the cohort's last launch; every input tensor and both slot tables are
-    /// immutable until that event completes.
+    /// runs no routed problem. Every input tensor and both slot tables are
+    /// immutable until this stream completes.
     pub fn prefill_contribute(
         &self,
         stream: &Arc<CudaStream>,
@@ -1038,9 +1038,8 @@ impl PrefillOps {
 
     /// Contribute + combine over the active assignments and the shared
     /// expert: the all-active cohort into scratch-backed buffers, then the
-    /// shared FFN, the sigmoid gate and the combine. Records and returns the
-    /// completion event of the final combine launch; the host slot tables
-    /// and every input tensor are immutable until that event completes.
+    /// shared FFN, the sigmoid gate and the combine. The host slot tables
+    /// and every input tensor are immutable until this stream completes.
     #[cfg(test)]
     pub fn prefill(
         &self,
@@ -1125,8 +1124,8 @@ impl PrefillOps {
 
     /// The join over caller-owned contributions: shared FFN, sigmoid gate,
     /// one combine. `done` is read, never written; the combine traps unless
-    /// every final-active choice carries exactly one done bit. Records and
-    /// returns the completion event of the combine launch.
+    /// every final-active choice carries exactly one done bit. The caller
+    /// orders buffer reuse after this stream completes.
     pub fn prefill_finish(
         &self,
         stream: &Arc<CudaStream>,
