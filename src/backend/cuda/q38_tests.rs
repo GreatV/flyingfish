@@ -3182,6 +3182,7 @@ fn residual_rms_capture_gpu() -> Result<()> {
     let sentinel = bf16::from_f32(-17.0);
     let mut cells = 0;
     let mut controls = 0;
+    let mut defects = 0;
     for hidden in [2048usize, 5120] {
         for rows in [1usize, 5, 16, 17, 256, 4096] {
             for mode in [RmsMode::Standard, RmsMode::ZeroCentered] {
@@ -3289,24 +3290,36 @@ fn residual_rms_capture_gpu() -> Result<()> {
                         .filter(|(a, b)| a.to_bits() != b.to_bits())
                         .count()
                 };
-                ensure!(
-                    unequal(&actual_residual, &expected_residual) == 0,
-                    "capture residual differs hidden={hidden} rows={rows} mode={mode:?}"
-                );
-                ensure!(
-                    unequal(&actual_normalized, &expected_normalized) == 0,
-                    "capture normalization differs hidden={hidden} rows={rows} mode={mode:?}"
-                );
+                let check = |name: &str, actual: &[bf16], expected: &[bf16]| -> Result<usize> {
+                    ensure!(
+                        actual.len() == expected.len(),
+                        "capture comparison shape {name}"
+                    );
+                    ensure!(
+                        actual
+                            .iter()
+                            .chain(expected)
+                            .all(|x| x.to_f32().is_finite()),
+                        "non-finite capture comparison {name} hidden={hidden} rows={rows} mode={mode:?}"
+                    );
+                    let mismatch = unequal(actual, expected);
+                    if mismatch != 0 {
+                        println!(
+                            "DEFECT CAPTURE_OP hidden={hidden} rows={rows} mode={mode:?} value={name} bit_mismatches={mismatch} bound=0"
+                        );
+                    }
+                    Ok(usize::from(mismatch != 0))
+                };
+                let cell_before = defects;
+                defects += check("residual", &actual_residual, &expected_residual)?;
+                defects += check("normalization", &actual_normalized, &expected_normalized)?;
                 let mut expected_capture = vec![sentinel; total * 5 * hidden];
                 for row in 1..=active {
                     let offset = row * 5 * hidden + 2 * hidden;
                     expected_capture[offset..offset + hidden]
                         .copy_from_slice(&expected_residual[row * hidden..(row + 1) * hidden]);
                 }
-                ensure!(
-                    unequal(&actual_capture, &expected_capture) == 0,
-                    "capture layout or inactive rows differ hidden={hidden} rows={rows} mode={mode:?}"
-                );
+                defects += check("capture_layout", &actual_capture, &expected_capture)?;
                 stream.begin_capture(
                     cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
                 )?;
@@ -3320,12 +3333,21 @@ fn residual_rms_capture_gpu() -> Result<()> {
                     stream.memcpy_htod(&vec![sentinel; total * 5 * hidden], &mut capture)?;
                     graph.launch()?;
                     stream.synchronize()?;
-                    ensure!(
-                        unequal(&stream.clone_dtoh(&residual)?, &expected_residual) == 0
-                            && unequal(&stream.clone_dtoh(&normalized)?, &expected_normalized) == 0
-                            && unequal(&stream.clone_dtoh(&capture)?, &expected_capture) == 0,
-                        "capture graph differs hidden={hidden} rows={rows} mode={mode:?}"
-                    );
+                    defects += check(
+                        "graph_residual",
+                        &stream.clone_dtoh(&residual)?,
+                        &expected_residual,
+                    )?;
+                    defects += check(
+                        "graph_normalization",
+                        &stream.clone_dtoh(&normalized)?,
+                        &expected_normalized,
+                    )?;
+                    defects += check(
+                        "graph_capture",
+                        &stream.clone_dtoh(&capture)?,
+                        &expected_capture,
+                    )?;
                 }
                 if rows == 17 {
                     let wrong: Vec<_> = (0..total * hidden).map(|i| pattern(i, 4)).collect();
@@ -3348,26 +3370,36 @@ fn residual_rms_capture_gpu() -> Result<()> {
                         options,
                     )?;
                     stream.synchronize()?;
-                    let mismatch = unequal(&stream.clone_dtoh(&capture)?, &expected_capture);
+                    let wrong_capture = stream.clone_dtoh(&capture)?;
                     ensure!(
-                        mismatch > 0,
-                        "wrong-layer control escaped capture comparison"
+                        wrong_capture.iter().all(|x| x.to_f32().is_finite()),
+                        "non-finite wrong-layer capture control"
                     );
+                    let mismatch = unequal(&wrong_capture, &expected_capture);
+                    defects += usize::from(mismatch == 0);
                     println!(
-                        "CAPTURE_WRONG_LAYER hidden={hidden} rows={rows} mode={mode:?} bit_mismatches={mismatch} PASS"
+                        "CAPTURE_WRONG_LAYER hidden={hidden} rows={rows} mode={mode:?} bit_mismatches={mismatch} {}",
+                        if mismatch > 0 { "PASS" } else { "DEFECT" }
                     );
                     controls += 1;
                 }
                 println!(
-                    "CAPTURE_OP hidden={hidden} rows={rows} active={active} taps=5 mode={mode:?} residual/norm/capture/graph_bits PASS"
+                    "CAPTURE_OP hidden={hidden} rows={rows} active={active} taps=5 mode={mode:?} residual/norm/capture/graph_bits {}",
+                    if defects == cell_before {
+                        "PASS"
+                    } else {
+                        "DEFECT"
+                    }
                 );
                 cells += 1;
             }
         }
     }
     println!(
-        "RESIDUAL_RMS_CAPTURE cells={cells} wrong_layer_controls={controls} graph_replays={} PASS",
-        cells * 2
+        "RESIDUAL_RMS_CAPTURE cells={cells} wrong_layer_controls={controls} graph_replays={} defects={defects} {}",
+        cells * 2,
+        if defects == 0 { "PASS" } else { "DEFECT" }
     );
+    ensure!(defects == 0, "capture candidate has {defects} defects");
     Ok(())
 }
