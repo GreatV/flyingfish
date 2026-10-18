@@ -218,44 +218,90 @@ fn native_geometry_head_ops_gpu() -> Result<()> {
             actual[0].tokens[0]
         );
     }
-    let mut simple_base = vec![bf16::from_f32(-10.0); vocab];
-    let mut simple_bias = vec![bf16::ZERO; vocab];
-    simple_base[0] = bf16::ZERO;
-    simple_base[vocab - 1] = bf16::from_f32(1.0 / 512.0);
-    simple_bias[0] = bf16::ONE;
-    simple_bias[vocab - 1] = bf16::ONE;
-    let simple_base = s.clone_htod(&simple_base)?;
-    let simple_bias = s.clone_htod(&simple_bias)?;
-    let mut bf16_scores = s.alloc_zeros::<bf16>(vocab)?;
-    let mut f32_scores = s.alloc_zeros::<f32>(vocab)?;
+    let mut bf16_scores = s.alloc_zeros::<bf16>(vocab + 1)?;
+    let mut f32_scores = s.alloc_zeros::<f32>(vocab + 1)?;
     let mut token = s.alloc_zeros::<u32>(1)?;
     let sum = module.load_function("sum_argmax")?;
-    for rounding in [ScoreRounding::Bf16, ScoreRounding::F32] {
-        let (bf_ptr, _bf_hold) = bf16_scores.device_ptr_mut(s);
-        let (fp_ptr, _fp_hold) = f32_scores.device_ptr_mut(s);
-        let ptr = if rounding == ScoreRounding::Bf16 {
-            bf_ptr
-        } else {
-            fp_ptr
-        };
-        unsafe {
-            s.launch_builder(&sum)
-                .arg(&simple_base)
-                .arg(&simple_bias)
-                .arg(&ptr)
-                .arg(&mut token)
-                .arg(&(vocab as i32))
-                .arg(&(rounding as i32))
-                .launch(grid(1, 1024))?;
+    for (test_vocab, offset) in [(vocab, 0), (vocab - 3, 0), (vocab - 3, 1)] {
+        let live = offset..offset + test_vocab;
+        let mut simple_base = vec![bf16::from_f32(-10.0); vocab + 1];
+        let mut simple_bias = vec![bf16::ZERO; vocab + 1];
+        simple_base[offset] = bf16::ZERO;
+        simple_base[live.end - 1] = bf16::from_f32(1.0 / 512.0);
+        simple_bias[offset] = bf16::ONE;
+        simple_bias[live.end - 1] = bf16::ONE;
+        let mut guarded_bias = vec![bf16::NAN; vocab + 1];
+        guarded_bias[live.clone()].copy_from_slice(&simple_bias[live.clone()]);
+        let simple_base = s.clone_htod(&simple_base)?;
+        let simple_bias = s.clone_htod(&simple_bias)?;
+        for rounding in [ScoreRounding::Bf16, ScoreRounding::F32] {
+            s.memcpy_htod(&guarded_bias, &mut bf16_scores)?;
+            s.memcpy_htod(&vec![f32::NAN; vocab + 1], &mut f32_scores)?;
+            let (bf_ptr, bf_hold) = bf16_scores.device_ptr_mut(s);
+            let (fp_ptr, fp_hold) = f32_scores.device_ptr_mut(s);
+            drop(bf_hold);
+            drop(fp_hold);
+            let ptr = if rounding == ScoreRounding::Bf16 {
+                bf_ptr + (offset * 2) as u64
+            } else {
+                fp_ptr + (offset * 4) as u64
+            };
+            let bias = if rounding == ScoreRounding::Bf16 {
+                bf16_scores.slice(live.clone())
+            } else {
+                simple_bias.slice(live.clone())
+            };
+            unsafe {
+                s.launch_builder(&sum)
+                    .arg(&simple_base.slice(live.clone()))
+                    .arg(&bias)
+                    .arg(&ptr)
+                    .arg(&mut token)
+                    .arg(&(test_vocab as i32))
+                    .arg(&(rounding as i32))
+                    .launch(grid(1, 1024))?;
+            }
+            let actual = s.clone_dtoh(&token)?[0];
+            let expected = if rounding == ScoreRounding::Bf16 {
+                0
+            } else {
+                (test_vocab - 1) as u32
+            };
+            defects += usize::from(actual != expected);
+            let scores = if rounding == ScoreRounding::Bf16 {
+                s.clone_dtoh(&bf16_scores)?
+                    .into_iter()
+                    .map(bf16::to_f32)
+                    .collect::<Vec<_>>()
+            } else {
+                s.clone_dtoh(&f32_scores)?
+            };
+            let guard_mismatches = scores[..offset]
+                .iter()
+                .chain(&scores[live.end..])
+                .filter(|v| !v.is_nan())
+                .count();
+            defects += guard_mismatches;
+            let mut score_mismatches = 0;
+            for (index, value) in scores[live].iter().enumerate() {
+                let expected = if index == 0 {
+                    1.0f32
+                } else if index + 1 == test_vocab {
+                    if rounding == ScoreRounding::Bf16 {
+                        1.0
+                    } else {
+                        1.0 + 1.0 / 512.0
+                    }
+                } else {
+                    -10.0
+                };
+                score_mismatches += usize::from(value.to_bits() != expected.to_bits());
+            }
+            defects += score_mismatches;
+            println!(
+                "SUM_ARGMAX_ROUNDING vocab={test_vocab} offset={offset} rounding={rounding:?} expected={expected} actual={actual} guard_mismatches={guard_mismatches} score_mismatches={score_mismatches}"
+            );
         }
-        let actual = s.clone_dtoh(&token)?[0];
-        let expected = if rounding == ScoreRounding::Bf16 {
-            0
-        } else {
-            (vocab - 1) as u32
-        };
-        defects += usize::from(actual != expected);
-        println!("SUM_ARGMAX_ROUNDING rounding={rounding:?} expected={expected} actual={actual}");
     }
     let device_hidden = s.clone_htod(&hidden)?;
     let device_weight = s.clone_htod(&weight)?;

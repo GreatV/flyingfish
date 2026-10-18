@@ -818,11 +818,38 @@ extern "C" __global__ void sum_argmax(const bf16* base, const bf16* bias,
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   float best = -__int_as_float(0x7f800000);
   unsigned id = 0xffffffffu;
-  for (int v = tid; v < vocab; v += 1024) {
+  const bool aligned = ((reinterpret_cast<size_t>(base) | reinterpret_cast<size_t>(bias) |
+                         reinterpret_cast<size_t>(scores)) & 15u) == 0;
+  size_t scalar_begin = 0;
+  if (aligned) {
+    union Pack { uint4 words; bf16 values[8]; };
+    const int vectors = vocab / 8;
+    for (int i = tid; i < vectors; i += 1024) {
+      Pack a, b, rounded;
+      a.words = reinterpret_cast<const uint4*>(base)[i];
+      b.words = reinterpret_cast<const uint4*>(bias)[i];
+      float combined[8];
+      #pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const unsigned token_id = unsigned(i) * 8u + unsigned(j);
+        const float score = markov_score(__bfloat162float(b.values[j]), a.values[j], rounding);
+        combined[j] = score;
+        rounded.values[j] = __float2bfloat16(score);
+        if (score > best || (score == best && token_id < id)) { best = score; id = token_id; }
+      }
+      if (rounding == 0) reinterpret_cast<uint4*>(scores)[i] = rounded.words;
+      else {
+        reinterpret_cast<float4*>(scores)[2 * i] = make_float4(combined[0],combined[1],combined[2],combined[3]);
+        reinterpret_cast<float4*>(scores)[2 * i + 1] = make_float4(combined[4],combined[5],combined[6],combined[7]);
+      }
+    }
+    scalar_begin = size_t(vectors) * 8;
+  }
+  for (size_t v = scalar_begin + tid; v < size_t(vocab); v += 1024) {
     const float score = markov_score(__bfloat162float(bias[v]), base[v], rounding);
     if (rounding == 0) static_cast<bf16*>(scores)[v] = __float2bfloat16(score);
     else static_cast<float*>(scores)[v] = score;
-    if (score > best || (score == best && (unsigned)v < id)) { best = score; id = v; }
+    if (score > best || (score == best && (unsigned)v < id)) { best = score; id = unsigned(v); }
   }
   for (int offset = 16; offset; offset >>= 1) {
     const float other = __shfl_down_sync(0xffffffffu,best,offset);
