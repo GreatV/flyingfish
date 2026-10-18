@@ -1832,6 +1832,22 @@ mod tests {
             let top = values(&tensors, "combined_top32_vals", &[b, 32])?;
             let top_ids = ids(&tensors, "combined_top32_ids", &[b, 32])?;
             let scores = trace.values("draft.s")?;
+            let mut actual_top = Vec::with_capacity(b * 32);
+            for row in scores.chunks_exact(v) {
+                let mut sorted = row.to_vec();
+                sorted.select_nth_unstable_by(31, |a, b| b.total_cmp(a));
+                sorted[..32].sort_unstable_by(|a, b| b.total_cmp(a));
+                actual_top.extend_from_slice(&sorted[..32]);
+            }
+            fixture_defects += compare(
+                &format!("{name}.combined_top32_vals"),
+                &actual_top,
+                (&top, &values(&floors, "combined_top32_vals", &[b, 32])?),
+                coefficient(&c, context, c.num_hidden_layers, 3)
+                    + super::super::bf16_chain_bound(1, &[c.markov_rank])
+                    + super::super::gamma(1, 2f64.powi(-24)),
+                32,
+            )?;
             for (row, (actual, expected)) in proposals.iter().zip(&expected_ids).enumerate() {
                 if actual != expected {
                     let reference_actual = top_ids[row * 32..(row + 1) * 32]
