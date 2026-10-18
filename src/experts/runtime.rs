@@ -856,10 +856,12 @@ impl Residency {
             !self.token_open && !self.request_open,
             "borrow runs only between requests"
         );
-        let available = u32::try_from(self.free_blocks.len())
+        self.validate_released()?;
+        let available = u32::try_from(self.free_blocks.len() + self.released.len())
             .context("free host blocks exceed u32")?
             .saturating_sub(self.reserve);
         let mut borrow = self.ledger.borrow_tail(slots, available)?;
+        self.drain_released()?;
         let to_host = borrow.to_host as usize;
         ensure!(
             to_host <= self.free_blocks.len(),
