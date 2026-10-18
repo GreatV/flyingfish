@@ -1741,6 +1741,7 @@ mod tests {
                     &mut scratch,
                 )?;
                 assert_eq!(out, scalar, "{} differs from the scalar arm", isa.name());
+                println!("fp8 arm {} bitwise", isa.name());
             }
             let mut mutated = slot.clone();
             let down_scale = layout.down_scale.start as usize;

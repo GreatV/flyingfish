@@ -1665,7 +1665,7 @@ mod tests {
             layout: bf16_layout(&geometry)?,
             device_free_bytes: reserves.persistent_bytes(slot)?
                 + routed.checked_mul(slot).context("device extent overflow")?,
-            host_available_bytes: reserves.host_bytes(slot)? + 2 * slot,
+            host_available_bytes: reserves.host_bytes(slot)?,
             h2d_bytes_per_second: 1e9,
             d2h_bytes_per_second: 1e9,
             copy_engines: 2,
@@ -1734,12 +1734,11 @@ mod tests {
             span_rows: 4,
             wave_rows: 2,
         };
-        let mut capacity = capacity(&inputs, cap)?;
+        let capacity = capacity(&inputs, cap)?;
         assert_eq!(
-            capacity.host_blocks, 12,
-            "the planner clamps to the non-GPU count"
+            capacity.host_blocks, host_blocks,
+            "the planner sizes the non-GPU experts plus the borrow headroom"
         );
-        capacity.host_blocks = host_blocks;
         let admission = Admission {
             budget_bytes_per_token: slot * u64::from(cap),
         };

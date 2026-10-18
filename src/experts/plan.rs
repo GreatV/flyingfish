@@ -475,19 +475,29 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         "host blocks {host_block_slots} cannot hold {admission_cap} reserve blocks"
     );
     let non_gpu = routed_slots - total_slots;
+    let headroom = span_borrow_slots(
+        inputs.reserves,
+        slot_bytes,
+        inputs.span_rows,
+        inputs.span_rows,
+    )?;
+    let host_target = non_gpu
+        .checked_add(u64::from(headroom))
+        .context("host headroom overflow")?;
     let mut reserve = admission_cap;
-    let mut host_blocks = (host_block_slots - u64::from(reserve)).min(non_gpu);
+    let mut host_blocks = (host_block_slots - u64::from(reserve)).min(host_target);
     if host_blocks > 0 && reserve == 0 {
         if host_block_slots > 1 {
             reserve = 1;
-            host_blocks = (host_block_slots - 1).min(non_gpu);
+            host_blocks = (host_block_slots - 1).min(host_target);
         } else {
             host_blocks = 0;
         }
     }
     let host_blocks = u32::try_from(host_blocks).context("host block count exceeds u32")?;
+    let hosted = u64::from(host_blocks).min(non_gpu);
     let unique_slots = total_slots
-        .checked_add(u64::from(host_blocks))
+        .checked_add(hosted)
         .context("unique expert count overflow")?;
     ensure!(
         unique_slots <= routed_slots,
@@ -1231,7 +1241,7 @@ mod tests {
         let inputs = inputs(&service, &reserves);
         let derived = capacity(&inputs, 0).unwrap();
         assert_eq!(derived.slots_per_layer, vec![2, 2]);
-        assert_eq!(derived.host_blocks, 12);
+        assert_eq!(derived.host_blocks, 15);
         assert_eq!(derived.disk_bytes, 0);
         let small_host = PlanInputs {
             host_available_bytes: reserves.host_bytes(slot()).unwrap() + 8 * slot(),
@@ -1264,7 +1274,7 @@ mod tests {
         let service = service();
         let reserves = reserves();
         let inputs = inputs(&service, &reserves);
-        let arena_bytes = 13 * slot();
+        let arena_bytes = 16 * slot();
         let eligible = PlanInputs {
             host_registration_bytes: arena_bytes,
             ..capacity_ref(&inputs)
@@ -1317,6 +1327,25 @@ mod tests {
     }
 
     #[test]
+    fn host_blocks_cover_the_worst_case_span_borrow() {
+        let service = service();
+        let reserves = reserves();
+        let inputs = inputs(&service, &reserves);
+        assert_eq!(span_borrow_slots(&reserves, slot(), 4, 4).unwrap(), 3);
+        let derived = capacity(&inputs, 0).unwrap();
+        assert_eq!(derived.host_blocks, 15, "12 non-GPU plus 3 borrow slots");
+        assert_eq!(derived.spare_blocks, 1);
+        assert_eq!(derived.disk_bytes, 0);
+        let small_host = PlanInputs {
+            host_available_bytes: reserves.host_bytes(slot()).unwrap() + 8 * slot(),
+            ..capacity_ref(&inputs)
+        };
+        let small = capacity(&small_host, 0).unwrap();
+        assert_eq!(small.host_blocks, 7, "host bytes below the headroom target");
+        assert_eq!(small.disk_bytes, 5 * slot());
+    }
+
+    #[test]
     fn fully_resident_capacity_is_clamped_to_the_routed_count() {
         let service = service();
         let reserves = reserves();
@@ -1326,7 +1355,11 @@ mod tests {
         inputs.host_available_bytes = reserves.host_bytes(slot).unwrap() + 2 * slot;
         let derived = capacity(&inputs, 0).unwrap();
         assert_eq!(derived.slots_per_layer, vec![8, 8]);
-        assert_eq!(derived.host_blocks, 0);
+        assert_eq!(
+            derived.host_blocks, 1,
+            "the borrow headroom keeps one block above the reserve floor"
+        );
+        assert_eq!(derived.spare_blocks, 1);
         assert_eq!(derived.disk_bytes, 0);
         assert_eq!(derived.disk_workers, 0);
     }
