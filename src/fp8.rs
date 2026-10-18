@@ -24,21 +24,17 @@ pub fn effective_weight(code: u8, scale: bf16) -> bf16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     /// The anchor: effective_weight over the layer-0 expert-0 native FP8
     /// bytes equals agy's torch-dequantized BF16 dump bitwise.
+    #[ignore = "CPU-only external fixture; set FF_MINICPM_REFERENCE_DIR"]
     #[test]
     fn effective_weight_matches_real_expert_bitwise() -> anyhow::Result<()> {
-        let path = std::env::var("FF_T13_ANCHOR").unwrap_or_else(|_| {
-            format!(
-                "{}/../../ff-work/minicpm47/evidence/T13-fp8-ref/expert_l0e0_dequant.safetensors",
-                env!("CARGO_MANIFEST_DIR")
-            )
-        });
-        if !std::path::Path::new(&path).exists() {
-            anyhow::bail!("anchor dump missing: {path}");
-        }
-        let f = std::fs::read(path)?;
+        let dir = std::env::var_os("FF_MINICPM_REFERENCE_DIR")
+            .context("FF_MINICPM_REFERENCE_DIR missing")?;
+        let f = std::fs::read(std::path::Path::new(&dir).join("expert_l0e0_dequant.safetensors"))
+            .context("read expert_l0e0_dequant.safetensors")?;
         let tensors = safetensors::SafeTensors::deserialize(&f)?;
         let pairs = [
             ("gate", "gate_proj.weight_fp8", "gate_proj.weight_scale"),
