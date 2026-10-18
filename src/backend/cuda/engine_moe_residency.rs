@@ -463,6 +463,8 @@ pub(in crate::backend::cuda::engine) struct Slots {
     pub request_open: bool,
     #[cfg(test)]
     pending_reads: u64,
+    #[cfg(test)]
+    delay_request: bool,
 }
 
 fn check_publish(
@@ -623,6 +625,8 @@ impl Slots {
             request_open: false,
             #[cfg(test)]
             pending_reads: 0,
+            #[cfg(test)]
+            delay_request: false,
         };
         device.upload.wait(&device.stream.record_event(None)?)?;
         for layer in 0..geometry.layers {
@@ -838,6 +842,10 @@ impl Slots {
     }
 
     pub(super) fn begin_request(&mut self, frequency: &[Vec<f64>]) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.delay_request) {
+            delay_stream(&self.transfers.h2d)?;
+        }
         self.moves.clear();
         self.moves
             .extend_from_slice(self.policy.begin_request(frequency)?);

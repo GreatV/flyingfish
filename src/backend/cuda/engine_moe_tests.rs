@@ -621,7 +621,7 @@ impl Engine {
     }
 }
 
-fn graph_state(engine: &Engine) -> Result<Vec<u32>> {
+pub(super) fn graph_state(engine: &Engine) -> Result<Vec<u32>> {
     let stream = &engine.device.stream;
     let mut values = vec![engine.position as u32];
     for kv in &engine.state.kv {

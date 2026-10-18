@@ -1821,7 +1821,9 @@ impl Gpu {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::tests::{hybrid_spec, tier_capacity, tier_fixture, tier_service};
+    use super::super::super::tests::{
+        graph_state, hybrid_spec, tier_capacity, tier_fixture, tier_service,
+    };
     use super::*;
     use crate::backend::cuda::moe::reference::MoeFixture;
     use crate::cpu::expert_ffn::{Contribution, Isa, Scratch, contribution};
@@ -1838,6 +1840,95 @@ mod tests {
             prefill_staging_slots: 2,
             disk_ring_slots: 2,
         }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA and FLYINGFISH_RUNTIME_DIR"]
+    fn resident_graph_waits_for_prefill_refill_gpu() -> Result<()> {
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("graph refill runtime missing")?,
+        );
+        let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+        let mut capacity = capacity(geometry, 8, false, 2, true)?;
+        capacity.slots_per_layer.fill(geometry.experts);
+        capacity.device_expert_bytes = capacity.slot_bytes()
+            * (u64::from(geometry.layers) * u64::from(geometry.experts)
+                + u64::from(capacity.prefill_staging_slots));
+        let initial =
+            vec![(0..geometry.experts).rev().collect::<Vec<_>>(); geometry.layers as usize];
+        let mut fixture = tier_fixture(3);
+        fixture.router_w.fill(bf16::ZERO);
+        let mut engines = (0..2)
+            .map(|arm| {
+                Engine::load_moe_placed(
+                    &fixture,
+                    &runtime.join(format!("resident-refill-{arm}")),
+                    &capacity,
+                    &initial,
+                    crate::experts::plan::Admission {
+                        budget_bytes_per_token: 0,
+                    },
+                    2,
+                    8,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut candidate = engines.pop().context("graph refill candidate missing")?;
+        let mut reference = engines.pop().context("graph refill reference missing")?;
+        for engine in [&mut reference, &mut candidate] {
+            engine.closure.freeze_fixed()?;
+            engine.declare_graphs()?;
+            engine.capture()?;
+            engine.closure.expect_captures(1)?;
+            engine.closure.ready(Instant::now())?;
+            engine.reset()?;
+        }
+        reference.prefill_tail(&[1, 2, 3, 4, 5], &mut Trace::default(), 8)?;
+        candidate
+            .moe_slots
+            .as_mut()
+            .context("graph refill slots missing")?
+            .delay_request = true;
+        candidate.prefill_tail(&[1, 2, 3, 4, 5], &mut Trace::default(), 8)?;
+        let slots = candidate
+            .moe_slots
+            .as_ref()
+            .context("graph refill slots missing")?;
+        ensure!(
+            slots.all_resident() && !slots.moves.is_empty(),
+            "refill control issued no resident copies"
+        );
+        candidate.set_token(7)?;
+        candidate.decode(true, None)?;
+        reference.set_token(7)?;
+        reference.decode(false, None)?;
+        let a = reference.decode_logits()?;
+        let b = candidate.decode_logits()?;
+        ensure!(
+            a.iter().chain(&b).all(|value| value.is_finite()),
+            "graph refill nonfinite logits"
+        );
+        let logits = a
+            .iter()
+            .zip(&b)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let a = graph_state(&reference)?;
+        let b = graph_state(&candidate)?;
+        let state = a.iter().zip(&b).filter(|(a, b)| a != b).count() + a.len().abs_diff(b.len());
+        println!(
+            "{} resident_prefill_graph_refill logits_bit_mismatches={logits} state_bit_mismatches={state} delayed_upload=true",
+            if logits == 0 && state == 0 {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+        ensure!(
+            logits == 0 && state == 0,
+            "resident prefill graph refill DEFECT"
+        );
+        Ok(())
     }
 
     #[test]
