@@ -3,9 +3,9 @@
 //! under an acknowledged window with --include-ignored --test-threads=1.
 use super::combine::{CombineOps, MoeCombine};
 use super::prefill::{
-    GEMM1_PTR_WORDS, GEMM2_PTR_WORDS, MAX_EXPERTS, MoePrefill, MoePrefillContribute, PrefillOps,
-    d2h_active_total_word, d2h_window_words, group_runs, prefill_layout, prefill_scratch_bytes,
-    problem_order,
+    GEMM1_PTR_WORDS, GEMM2_PTR_WORDS, MAX_EXPERTS, MoePrefill, MoePrefillContribute,
+    MoePrefillFinish, PrefillOps, d2h_active_total_word, d2h_window_words, group_runs,
+    prefill_layout, prefill_scratch_bytes, problem_order,
 };
 use super::reference::{self, Combine, MoeDims, MoeFixture};
 use super::testing;
@@ -1304,6 +1304,128 @@ fn moe_prefill_gpu() -> Result<()> {
         );
     }
 
+    // K5c seam cell: two contribute cohorts plus a CPU-completed choice set
+    // written into the same caller-owned buffers, then prefill_finish ==
+    // the single wrapper run, bitwise. The CPU set round-trips a third
+    // cohort's exact bits through host memory.
+    {
+        let rows = 37usize;
+        let mut ids = vec![0i32; rows * top_k];
+        let mut weights = vec![bf16::ZERO; rows * top_k];
+        for r in 0..rows {
+            let routed = reference::route_row(&fx, r);
+            ids[r * top_k..(r + 1) * top_k].copy_from_slice(&routed.ids);
+            weights[r * top_k..(r + 1) * top_k].copy_from_slice(&routed.weights);
+        }
+        let gens = vec![1u64; rows * top_k];
+        let y_wrap: CudaSlice<bf16> = {
+            let bufs = case_bufs(
+                s,
+                &fx,
+                rows,
+                &ids,
+                &all_active(rows, top_k),
+                &weights,
+                &gens,
+            )?;
+            let y = s.alloc_zeros(rows * hidden)?;
+            let y_view = testing::dense_mut(&y, s, rows as u32, hidden as u32)?;
+            let input = moe_input(s, &fx, rows, &bufs, &main_slots, &shared, y_view)?;
+            ops.prefill(s, input, &scratch)?;
+            s.synchronize()?;
+            y
+        };
+        let mask = |pred: &dyn Fn(usize) -> bool| -> Vec<u32> {
+            (0..rows * top_k)
+                .map(|a| if pred(a) { 1 } else { 0 })
+                .collect()
+        };
+        let even = mask(&|a| ids[a] % 2 == 0);
+        let odd = mask(&|a| ids[a] % 2 == 1);
+        let cpu_set = mask(&|a| a % 3 == 0 && ids[a] % 2 == 0);
+        let cpu_source = mask(&|a| a % 3 == 0 && ids[a] % 2 == 0);
+        let _ = &cpu_source;
+        let mut cohort = CohortBufs {
+            contributions: s.alloc_zeros(rows * top_k * hidden)?,
+            done: s.alloc_zeros(rows * top_k)?,
+        };
+        for active in [&even, &odd] {
+            let bufs = case_bufs(s, &fx, rows, &ids, active, &weights, &gens)?;
+            let input = contribute_input(s, &fx, rows, &bufs, &main_slots, &shared, &cohort)?;
+            ops.prefill_contribute(s, input, &scratch)?;
+            s.synchronize()?;
+        }
+        // CPU completion stand-in: a third contribute restricted to the CPU
+        // set, its bits round-tripped through host memory into the caller
+        // buffers.
+        {
+            let tmp = CohortBufs {
+                contributions: s.alloc_zeros(rows * top_k * hidden)?,
+                done: s.alloc_zeros(rows * top_k)?,
+            };
+            let bufs = case_bufs(s, &fx, rows, &ids, &cpu_set, &weights, &gens)?;
+            let input = contribute_input(s, &fx, rows, &bufs, &main_slots, &shared, &tmp)?;
+            ops.prefill_contribute(s, input, &scratch)?;
+            s.synchronize()?;
+            let host_c: Vec<bf16> = s.clone_dtoh(&tmp.contributions)?;
+            let host_d: Vec<u32> = s.clone_dtoh(&tmp.done)?;
+            s.memcpy_htod(&host_c, &mut cohort.contributions)?;
+            s.memcpy_htod(&host_d, &mut cohort.done)?;
+            s.synchronize()?;
+        }
+        let y_fin: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
+        let fin = {
+            let union = case_bufs(
+                s,
+                &fx,
+                rows,
+                &ids,
+                &all_active(rows, top_k),
+                &weights,
+                &gens,
+            )?;
+            let y_view = testing::dense_mut(&y_fin, s, rows as u32, hidden as u32)?;
+            MoePrefillFinish {
+                x: testing::dense(&union.x, s, rows as u32, hidden as u32)?,
+                ids: testing::dense(&union.ids, s, rows as u32, top_k as u32)?,
+                final_active: testing::dense(&union.active, s, rows as u32, top_k as u32)?,
+                contributions: testing::view(
+                    &cohort.contributions,
+                    s,
+                    [rows as u32, top_k as u32, hidden as u32],
+                    [(top_k * hidden) as u64, hidden as u64, 1],
+                )?,
+                done: testing::view(
+                    &cohort.done,
+                    s,
+                    [rows as u32, top_k as u32],
+                    [top_k as u64, 1],
+                )?,
+                experts: fx.dims.experts as u32,
+                shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
+                shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
+                shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
+                shared_expert_gate: testing::view(&shared.seg, s, [hidden as u32], [1])?,
+                y: y_view,
+            }
+        };
+        ops.prefill_finish(s, fin, &scratch)?;
+        s.synchronize()?;
+        let wrap_bits: Vec<u16> = s.clone_dtoh(&y_wrap)?.iter().map(|v| v.to_bits()).collect();
+        let fin_bits: Vec<u16> = s.clone_dtoh(&y_fin)?.iter().map(|v| v.to_bits()).collect();
+        let first_bad = wrap_bits.iter().zip(&fin_bits).position(|(a, b)| a != b);
+        eprintln!(
+            "moe_prefill K5c seam rows={rows} cohorts=2+cpu words={} first_differing_word={:?}",
+            wrap_bits.len(),
+            first_bad
+        );
+        anyhow::ensure!(
+            first_bad.is_none(),
+            "K5c seam join is not bitwise equal to the wrapper: first differing word {first_bad:?} of {}",
+            wrap_bits.len()
+        );
+    }
+
     anyhow::ensure!(defects.is_empty(), "recorded defects: {defects:?}");
     Ok(())
 }
@@ -1690,4 +1812,150 @@ fn gu_host_vecs(base: u64, experts: usize, stride: usize) -> (Vec<u64>, Vec<u64>
         .map(|e| base + e * stride as u64)
         .collect();
     (v.clone(), v)
+}
+
+// K5c mutant: a finish whose done bits were reset must fail the
+// exactly-once combine check. Child runs contribute, zeroes one done bit,
+// then prefill_finish; parent requires exit 3.
+#[test]
+#[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
+fn prefill_reset_done_gpu() -> Result<()> {
+    anyhow::ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    if std::env::var("FF_MOE_CHILD").as_deref() == Ok("resetdone") {
+        let d = crate::backend::cuda::Device::new(0)?;
+        let s = &d.stream;
+        let fx = reference::fixture(MoeDims::minicpm47(8), 0);
+        let (experts, top_k, hidden, inter) = (
+            fx.dims.experts,
+            fx.dims.top_k,
+            fx.dims.hidden,
+            fx.dims.inter,
+        );
+        let ops = PrefillOps::new(&d.ctx, s)?;
+        let rows = fx.dims.rows;
+        let gu: CudaSlice<bf16> = s.clone_htod(fx.gate_up.as_slice())?;
+        let dn: CudaSlice<bf16> = s.clone_htod(fx.down.as_slice())?;
+        let (gu_ptr, _a) = gu.device_ptr(s);
+        let (dn_ptr, _b) = dn.device_ptr(s);
+        let gu_host: Vec<u64> = (0..experts as u64)
+            .map(|e| gu_ptr + e * (2 * inter * hidden * 2) as u64)
+            .collect();
+        let dn_host: Vec<u64> = (0..experts as u64)
+            .map(|e| dn_ptr + e * (hidden * inter * 2) as u64)
+            .collect();
+        let slots = device_slots(
+            s,
+            gu_host,
+            dn_host,
+            vec![1u32; experts],
+            vec![1u64; experts],
+        )?;
+        let scratch_bytes = prefill_scratch_bytes(rows, top_k, experts, hidden, inter)?;
+        let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
+        let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
+        let scratch = Scratch {
+            ptr: scratch_ptr,
+            bytes: scratch_bytes,
+        };
+        let shared = SharedBufs {
+            sg: s.clone_htod(fx.shared_gate.as_slice())?,
+            su: s.clone_htod(fx.shared_up.as_slice())?,
+            sd: s.clone_htod(fx.shared_down.as_slice())?,
+            seg: s.clone_htod(fx.shared_expert_gate.as_slice())?,
+        };
+        let (ids, weights) = planted_uniform(rows, experts, top_k);
+        let gens = vec![1u64; rows * top_k];
+        let mut cohort = CohortBufs {
+            contributions: s.alloc_zeros(rows * top_k * hidden)?,
+            done: s.alloc_zeros(rows * top_k)?,
+        };
+        let bufs = case_bufs(
+            s,
+            &fx,
+            rows,
+            &ids,
+            &all_active(rows, top_k),
+            &weights,
+            &gens,
+        )?;
+        let input = contribute_input(s, &fx, rows, &bufs, &slots, &shared, &cohort)?;
+        ops.prefill_contribute(s, input, &scratch)?;
+        s.synchronize()?;
+        let mut host_d: Vec<u32> = s.clone_dtoh(&cohort.done)?;
+        host_d[0] = 0;
+        s.memcpy_htod(&host_d, &mut cohort.done)?;
+        let y: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
+        let union = case_bufs(
+            s,
+            &fx,
+            rows,
+            &ids,
+            &all_active(rows, top_k),
+            &weights,
+            &gens,
+        )?;
+        let fin = MoePrefillFinish {
+            x: testing::dense(&union.x, s, rows as u32, hidden as u32)?,
+            ids: testing::dense(&union.ids, s, rows as u32, top_k as u32)?,
+            final_active: testing::dense(&union.active, s, rows as u32, top_k as u32)?,
+            contributions: testing::view(
+                &cohort.contributions,
+                s,
+                [rows as u32, top_k as u32, hidden as u32],
+                [(top_k * hidden) as u64, hidden as u64, 1],
+            )?,
+            done: testing::view(
+                &cohort.done,
+                s,
+                [rows as u32, top_k as u32],
+                [top_k as u64, 1],
+            )?,
+            experts: experts as u32,
+            shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
+            shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
+            shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
+            shared_expert_gate: testing::view(&shared.seg, s, [hidden as u32], [1])?,
+            y: testing::dense_mut(&y, s, rows as u32, hidden as u32)?,
+        };
+        let outcome = ops.prefill_finish(s, fin, &scratch);
+        eprintln!("moe_prefill reset-done child outcome: {outcome:?}");
+        let trapped = match &outcome {
+            Err(err) => {
+                let text = format!("{err:#}");
+                text.contains("illegal")
+                    || text.contains("assert")
+                    || text.contains("unspecified launch failure")
+                    || text.contains("launch failed")
+            }
+            Ok(_) => false,
+        };
+        if trapped {
+            std::process::exit(3);
+        }
+        anyhow::bail!("reset done did not fail the combine discriminantly: {outcome:?}")
+    }
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "moe_prefill_gpu",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("FF_Q38_GPU_WINDOW", "granted")
+        .env("FF_MOE_CHILD", "resetdone")
+        .env_remove("FF_MOE_TIMING")
+        .status()?;
+    anyhow::ensure!(!status.success(), "reset-done child exited successfully");
+    anyhow::ensure!(
+        status.code() == Some(3),
+        "reset-done child must discriminate (exit 3), got {status:?}"
+    );
+    eprintln!(
+        "moe_prefill reset-done child exit={:?} DETECTED",
+        status.code()
+    );
+    Ok(())
 }

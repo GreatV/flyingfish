@@ -156,6 +156,32 @@ pub(crate) struct MoePrefill<'a> {
     pub y: TensorMut<bf16, 2>,
 }
 
+/// The join input: caller-owned contributions and done bits accumulated by
+/// any mix of contribute cohorts (GPU, streamed, CPU) plus the final-active
+/// union; `prefill_finish` runs the shared FFN, the sigmoid gate and the
+/// single combine. No routed arithmetic runs here and `done` is never
+/// written.
+#[derive(Debug)]
+pub(crate) struct MoePrefillFinish {
+    pub x: Tensor<bf16, 2>,
+    pub ids: Tensor<i32, 2>,
+    /// `[rows, top_k]` the completed assignment union the combine checks
+    /// `done` against.
+    pub final_active: Tensor<u32, 2>,
+    /// CALLER-OWNED `[rows, top_k, hidden]` weighted BF16 contributions.
+    pub contributions: Tensor<bf16, 3>,
+    /// CALLER-OWNED `[rows, top_k]` done bits, one per completed choice.
+    pub done: Tensor<u32, 2>,
+    /// Slot-table length the caller's buffers were built against; sets the
+    /// scratch region offsets.
+    pub experts: u32,
+    pub shared_gate: Tensor<bf16, 2>,
+    pub shared_up: Tensor<bf16, 2>,
+    pub shared_down: Tensor<bf16, 2>,
+    pub shared_expert_gate: Tensor<bf16, 1>,
+    pub y: TensorMut<bf16, 2>,
+}
+
 #[derive(Debug)]
 pub(crate) struct PrefillPlan {
     rows: u32,
@@ -165,6 +191,106 @@ pub(crate) struct PrefillPlan {
     inter: u32,
     assignments: u64,
     layout: PrefillLayout,
+}
+
+impl MoePrefillFinish {
+    pub(crate) fn validate(&self) -> Result<PrefillPlan> {
+        self.x.validate()?;
+        let (rows, hidden) = (self.x.shape[0], self.x.shape[1]);
+        ensure!(
+            self.x.stride == [u64::from(hidden), 1],
+            "moe prefill finish x must be a dense [rows, hidden] view (shape {:?})",
+            self.x.shape
+        );
+        self.ids.validate()?;
+        let top_k = self.ids.shape[1];
+        ensure!(
+            self.ids.shape == [rows, top_k] && self.ids.stride == [u64::from(top_k), 1],
+            "moe prefill finish ids must be dense [rows, top_k] (shape {:?})",
+            self.ids.shape
+        );
+        for (t, name) in [(&self.final_active, "final_active"), (&self.done, "done")] {
+            t.validate()?;
+            ensure!(
+                t.shape == [rows, top_k] && t.stride == [u64::from(top_k), 1],
+                "moe prefill finish {name} must be dense [rows, top_k] (shape {:?})",
+                t.shape
+            );
+        }
+        self.contributions.validate()?;
+        ensure!(
+            self.contributions.shape == [rows, top_k, hidden]
+                && self.contributions.stride[2] == 1
+                && self.contributions.stride[1] == u64::from(hidden)
+                && self.contributions.stride[0] == u64::from(top_k) * u64::from(hidden),
+            "moe prefill finish contributions must be dense [rows, top_k, hidden] (shape {:?})",
+            self.contributions.shape
+        );
+        let inter = self.shared_gate.shape[0];
+        for (t, name) in [
+            (&self.shared_gate, "shared_gate"),
+            (&self.shared_up, "shared_up"),
+        ] {
+            t.validate()?;
+            ensure!(
+                t.shape == [inter, hidden] && t.stride == [u64::from(hidden), 1],
+                "moe prefill finish {name} must be dense [inter, hidden] (shape {:?})",
+                t.shape
+            );
+        }
+        self.shared_down.validate()?;
+        ensure!(
+            self.shared_down.shape == [hidden, inter]
+                && self.shared_down.stride == [u64::from(inter), 1],
+            "moe prefill finish shared_down must be dense [hidden, inter] (shape {:?})",
+            self.shared_down.shape
+        );
+        self.shared_expert_gate.validate()?;
+        ensure!(
+            self.shared_expert_gate.shape == [hidden] && self.shared_expert_gate.stride == [1],
+            "moe prefill finish shared gate must be dense [hidden]"
+        );
+        self.y.read().validate()?;
+        ensure!(
+            self.y.read().shape == [rows, hidden] && self.y.read().stride == [u64::from(hidden), 1],
+            "moe prefill finish y must be a dense [rows, hidden] view (shape {:?})",
+            self.y.read().shape
+        );
+        no_overlap(&self.x, &self.y.read(), "x", "y")?;
+        no_overlap(&self.ids, &self.y.read(), "ids", "y")?;
+        no_overlap(&self.contributions, &self.y.read(), "contributions", "y")?;
+        no_overlap(&self.shared_gate, &self.y.read(), "shared_gate", "y")?;
+        no_overlap(&self.shared_up, &self.y.read(), "shared_up", "y")?;
+        no_overlap(&self.shared_down, &self.y.read(), "shared_down", "y")?;
+        no_overlap(
+            &self.shared_expert_gate,
+            &self.y.read(),
+            "shared_expert_gate",
+            "y",
+        )?;
+        ensure!(
+            (1..=MAX_EXPERTS).contains(&(self.experts as usize)),
+            "moe prefill finish experts {} outside [1, {}]",
+            self.experts,
+            MAX_EXPERTS
+        );
+        let layout = prefill_layout(
+            rows as usize,
+            top_k as usize,
+            self.experts as usize,
+            hidden as usize,
+            inter as usize,
+        )?;
+        Ok(PrefillPlan {
+            rows,
+            top_k,
+            experts: self.experts,
+            hidden,
+            inter,
+            assignments: u64::from(rows) * u64::from(top_k),
+            layout,
+        })
+    }
 }
 
 impl MoePrefillContribute<'_> {
@@ -949,7 +1075,49 @@ impl PrefillOps {
             )?;
         }
         self.contribute(stream, &cohort, &plan, scratch)?;
+        let y = input.y;
+        let fin = MoePrefillFinish {
+            x: cohort.x,
+            ids: cohort.ids,
+            final_active: input.active,
+            contributions: cohort.contributions,
+            done: cohort.done.read(),
+            experts: plan.experts,
+            shared_gate: cohort.shared_gate,
+            shared_up: cohort.shared_up,
+            shared_down: cohort.shared_down,
+            shared_expert_gate: cohort.shared_expert_gate,
+            y,
+        };
+        self.finish_body(stream, fin, &plan, scratch)
+    }
 
+    /// The join over caller-owned contributions: shared FFN, sigmoid gate,
+    /// one combine. `done` is read, never written; the combine traps unless
+    /// every final-active choice carries exactly one done bit. Records and
+    /// returns the completion event of the combine launch.
+    pub fn prefill_finish(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: MoePrefillFinish,
+        scratch: &Scratch,
+    ) -> Result<CudaEvent> {
+        ensure!(
+            Arc::ptr_eq(stream, &self.stream),
+            "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
+        );
+        let plan = input.validate()?;
+        scratch.validate(plan.layout.bytes)?;
+        self.finish_body(stream, input, &plan, scratch)
+    }
+
+    fn finish_body(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: MoePrefillFinish,
+        plan: &PrefillPlan,
+        scratch: &Scratch,
+    ) -> Result<CudaEvent> {
         // Shared FFN: the gate/up group (2 problems) and the down group (1
         // problem) share one 9-pointer block [A|B|C] per group, uploaded
         // with a single H2D.
@@ -1028,9 +1196,9 @@ impl PrefillOps {
             .shared_scale(stream, input.x, input.shared_expert_gate, &mut scale)?;
         let combine_input = MoeCombine {
             ids: input.ids,
-            final_active: input.active,
-            done: cohort.done.read(),
-            contributions: cohort.contributions,
+            final_active: input.final_active,
+            done: input.done,
+            contributions: input.contributions,
             shared_out: unsafe {
                 Tensor::<bf16, 2>::new(
                     shared_out_at,
