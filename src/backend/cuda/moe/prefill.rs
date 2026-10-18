@@ -20,6 +20,8 @@ use super::combine::{CombineOps, MoeCombine};
 
 const SCAN_THREADS: u32 = 1024;
 const BLOCK_THREADS: u32 = 256;
+/// One 256-thread tile contains sixteen independent sixteen-lane dots.
+pub(crate) const LANE16_ROWS: u32 = BLOCK_THREADS / 16;
 pub(crate) const MAX_EXPERTS: usize = 1024;
 const MAX_TOP_K: usize = 32;
 /// Region alignment inside the scratch buffer.
@@ -40,7 +42,7 @@ const MAX_GROUPS: usize = MAX_EXPERTS + 2;
 /// Caller-owned contribution/done buffers survive cohorts; inputs stay immutable until stream completion.
 #[derive(Debug)]
 pub(crate) struct MoePrefillContribute<'a> {
-    /// Whole-span CPU-eligible arithmetic mask, independent of this cohort's row wave.
+    /// Whole-span counts at most LANE16_ROWS use the CPU arithmetic form in every wave.
     pub cpu_arithmetic: &'a [bool],
     pub x: Tensor<bf16, 2>,
     pub ids: Tensor<i32, 2>,
@@ -712,6 +714,19 @@ pub(crate) struct PrefillOps {
     stage: Mutex<Stage>,
 }
 
+pub(crate) fn arithmetic_mask(counts: &[u32], mask: &mut [bool]) -> Result<()> {
+    ensure!(
+        counts.len() == mask.len(),
+        "prefill arithmetic counts={} mask={}",
+        counts.len(),
+        mask.len()
+    );
+    for (&rows, form) in counts.iter().zip(mask) {
+        *form = rows <= LANE16_ROWS;
+    }
+    Ok(())
+}
+
 impl PrefillOps {
     pub fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<Self> {
         let module = cubin::module(ctx, "moe_prefill")?;
@@ -1237,7 +1252,11 @@ impl PrefillOps {
                 .arg(&(shape.0 as i32))
                 .arg(&(shape.1 as i32))
                 .launch(cudarc::driver::LaunchConfig {
-                    grid_dim: (shape.0.div_ceil(16), rows, (problems - first) as u32),
+                    grid_dim: (
+                        shape.0.div_ceil(LANE16_ROWS),
+                        rows,
+                        (problems - first) as u32,
+                    ),
                     block_dim: (BLOCK_THREADS, 1, 1),
                     shared_mem_bytes: 0,
                 })?;

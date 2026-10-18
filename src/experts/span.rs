@@ -4,10 +4,11 @@ use crate::experts::catalogue::ExpertGeometry;
 use crate::experts::plan::ServiceTable;
 use anyhow::{Context, Result, ensure};
 
-/// Measured rates the span classes are chosen from.
+/// Measured service rates and the setup-bound CPU row constraint.
 pub struct SpanRates<'a> {
     pub service: &'a ServiceTable,
     pub h2d_bytes_per_second: f64,
+    pub cpu_row_limit: u32,
 }
 
 /// Service class of one routed expert in a span.
@@ -107,6 +108,8 @@ impl SpanPlan {
                 continue;
             } else if resident[expert] {
                 SpanClass::Resident
+            } else if rows > rates.cpu_row_limit {
+                SpanClass::Streamed
             } else if rows > max_rows {
                 let at_max = rates.service.rows_time(max_rows, 1, workers)?;
                 ensure!(
@@ -543,6 +546,7 @@ mod tests {
         let counts = [4u32, 1, 1, 0, 2, 1, 0, 0];
         let resident = [true, false, false, false, false, false, false, false];
         let mut rates = SpanRates {
+            cpu_row_limit: u32::MAX,
             service: &table(),
             h2d_bytes_per_second: 1e9,
         };
@@ -590,6 +594,7 @@ mod tests {
         let counts = [0u32, 16, 0, 0, 0, 0, 0, 0];
         let resident = [false; 8];
         let fast = SpanRates {
+            cpu_row_limit: u32::MAX,
             service: &table(),
             h2d_bytes_per_second: 1e9,
         };
@@ -599,6 +604,7 @@ mod tests {
         assert_eq!(plan.cohorts().collect::<Vec<_>>(), vec![&[1][..]]);
         assert!(plan.cpu().is_empty());
         let slow = SpanRates {
+            cpu_row_limit: u32::MAX,
             service: &table(),
             h2d_bytes_per_second: 100.0,
         };
@@ -615,6 +621,7 @@ mod tests {
         let counts = [0u32; 8];
         let resident = [false; 8];
         let rates = SpanRates {
+            cpu_row_limit: u32::MAX,
             service: &table(),
             h2d_bytes_per_second: 1e9,
         };
@@ -785,10 +792,12 @@ mod tests {
     fn failed_update_leaves_the_previous_plan_intact() -> Result<()> {
         let geometry = geometry();
         let fast = SpanRates {
+            cpu_row_limit: u32::MAX,
             service: &table(),
             h2d_bytes_per_second: 1e9,
         };
         let slow = SpanRates {
+            cpu_row_limit: u32::MAX,
             service: &table(),
             h2d_bytes_per_second: 100.0,
         };
@@ -815,6 +824,7 @@ mod tests {
     fn span_plan_update_reuses_its_buffers() -> Result<()> {
         let geometry = geometry();
         let rates = SpanRates {
+            cpu_row_limit: u32::MAX,
             service: &table(),
             h2d_bytes_per_second: 1e9,
         };

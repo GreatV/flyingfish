@@ -296,6 +296,13 @@ impl Setup {
             &candidates,
         )?;
         let workspace = candidates.swap_remove(index);
+        let cpu = residency::cpu_bound(
+            geometry,
+            capacity.slot_bytes(),
+            capacity.span_rows,
+            &measured.service,
+            measured.h2d_bytes_per_second,
+        )?;
         eprintln!(
             "{}",
             serde_json::json!({"expert_memory_plan": {
@@ -307,7 +314,9 @@ impl Setup {
                 "host_available_bytes":available,"host_registration_bytes":registration,
                 "device_fixed_bytes":workspace.candidate.reserves.device_fixed_bytes,
                 "host_fixed_bytes":workspace.candidate.reserves.host_fixed_bytes,
-                "vision_reserved_bytes":vision,"budget_bytes_per_token":admission.budget_bytes_per_token
+                "vision_reserved_bytes":vision,"budget_bytes_per_token":admission.budget_bytes_per_token,
+                "cpu_rows_measured":cpu.3,"cpu_rows_limit":cpu.2,
+                "cpu_arithmetic_rows":super::super::moe::prefill::LANE16_ROWS
             }})
         );
         Ok(Self {

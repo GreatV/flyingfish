@@ -553,6 +553,7 @@ mod tests {
             &SpanRates {
                 service: &service,
                 h2d_bytes_per_second: 1_000_000_000.0,
+                cpu_row_limit: LANE16_ROWS,
             },
         )?;
         assert_eq!(plan.staged(), [0, 2, 5]);

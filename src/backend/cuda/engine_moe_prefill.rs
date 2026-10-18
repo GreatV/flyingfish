@@ -1,7 +1,9 @@
 //! Layer-major prefill over borrowed expert slots.
 use super::*;
 use crate::backend::cuda::moe::prefill::prefill_scratch_bytes;
-use crate::backend::cuda::moe::prefill::{MoePrefillContribute, MoePrefillFinish, PrefillOps};
+use crate::backend::cuda::moe::prefill::{
+    LANE16_ROWS, MoePrefillContribute, MoePrefillFinish, PrefillOps, arithmetic_mask,
+};
 use crate::experts::{
     plan::{Capacity, Reserves, ServiceTable},
     span::{SpanPlan, SpanRates, StagingLeases},
@@ -269,13 +271,14 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     pub stats: [u64; 8],
 }
 
+/// CPU workspace rows/choices, constrained expert rows, and measured expert rows.
 pub(in crate::backend::cuda::engine) fn cpu_bound(
     geometry: ExpertGeometry,
     slot_bytes: u64,
     rows: u32,
     service: &ServiceTable,
     h2d_bytes_per_second: f64,
-) -> Result<(usize, usize, u32)> {
+) -> Result<(usize, usize, u32, u32)> {
     ensure!(
         rows > 0
             && service.max_rows() > 0
@@ -299,12 +302,15 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
             &SpanRates {
                 service,
                 h2d_bytes_per_second,
+                cpu_row_limit: service.max_rows(),
             },
         )?;
         if !plan.cpu().is_empty() {
             cpu_rows = row_count;
         }
     }
+    let measured_cpu_rows = cpu_rows;
+    cpu_rows = cpu_rows.min(LANE16_ROWS);
     let choices = (u64::from(rows) * u64::from(geometry.top_k))
         .min(u64::from(geometry.experts) * u64::from(cpu_rows))
         .max(1);
@@ -316,6 +322,7 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
         usize::try_from(choices.min(u64::from(rows)))?,
         usize::try_from(choices)?,
         cpu_rows,
+        measured_cpu_rows,
     ))
 }
 
@@ -747,12 +754,11 @@ impl Prefill {
             &SpanRates {
                 service: &self.service,
                 h2d_bytes_per_second: self.h2d_bytes_per_second,
+                cpu_row_limit: self.cpu_ceiling,
             },
         )?;
         let plan = &self.plan;
-        for (expert, form) in self.gpu.cpu_arithmetic.iter_mut().enumerate() {
-            *form = self.counts[expert] <= self.cpu_ceiling;
-        }
+        arithmetic_mask(&self.counts, &mut self.gpu.cpu_arithmetic)?;
         for &expert in plan.cpu() {
             ensure!(
                 self.counts[expert as usize] <= self.cpu_ceiling,
@@ -881,6 +887,7 @@ impl Prefill {
             &SpanRates {
                 service: &self.service,
                 h2d_bytes_per_second: self.h2d_bytes_per_second,
+                cpu_row_limit: self.cpu_ceiling,
             },
         )?;
         Ok(true)
@@ -2018,7 +2025,13 @@ mod tests {
         let mut disk = DiskExperts::new(catalogue, &directory, 1, 32)?;
         let ops = PrefillOps::new(&device.ctx, stream)?;
         let mut defects = 0;
-        for (rows, weighted) in [(1usize, false), (32, false), (32, true)] {
+        for (rows, weighted) in [
+            (1usize, false),
+            (32, false),
+            (32, true),
+            (LANE16_ROWS as usize, true),
+            (LANE16_ROWS as usize + 1, true),
+        ] {
             let x = &input[..rows * hidden];
             let routing: Vec<_> = (0..rows)
                 .map(|row| {
@@ -2060,8 +2073,6 @@ mod tests {
             let routing_device = stream.clone_htod(&routing)?;
             let active = stream.clone_htod(&vec![1u32; rows])?;
             let generation = stream.clone_htod(&vec![1u64; rows])?;
-            let contributions = stream.alloc_zeros::<bf16>(rows * hidden)?;
-            let done = stream.alloc_zeros::<u32>(rows)?;
             let layout = crate::backend::cuda::moe::prefill::prefill_layout(
                 rows,
                 1,
@@ -2076,72 +2087,107 @@ mod tests {
                 hidden,
                 intermediate,
             )?)?)?;
-            {
-                let _range =
-                    crate::backend::cuda::profile::Range::new(true, c"expert_tier_grouped");
-                ops.prefill_contribute(
-                    stream,
-                    MoePrefillContribute {
-                        cpu_arithmetic: &[true; 256],
-                        x: qwen::matrix(&x_device, stream, 0, rows, hidden)?,
-                        ids: testing::dense(&ids, stream, rows as u32, 1)?,
-                        weights: testing::dense(&routing_device, stream, rows as u32, 1)?,
-                        active: testing::dense(&active, stream, rows as u32, 1)?,
-                        assignment_gen: testing::dense(&generation, stream, rows as u32, 1)?,
-                        slots_gate_up: testing::view(
-                            &tables.gate_up,
-                            stream,
-                            [geometry.experts],
-                            [1],
-                        )?,
-                        slots_down: testing::view(&tables.down, stream, [geometry.experts], [1])?,
-                        slot_valid: testing::view(&tables.valid, stream, [geometry.experts], [1])?,
-                        slot_generation: testing::view(
-                            &tables.generation,
-                            stream,
-                            [geometry.experts],
-                            [1],
-                        )?,
-                        slots_gate_up_host: &host_gate_up,
-                        slots_down_host: &host_down,
-                        shared_gate: qwen::matrix(&native_device, stream, 0, intermediate, hidden)?,
-                        shared_up: qwen::matrix(
-                            &native_device,
-                            stream,
-                            intermediate * hidden,
-                            intermediate,
-                            hidden,
-                        )?,
-                        shared_down: qwen::matrix(
-                            &native_device,
-                            stream,
-                            cut,
-                            hidden,
-                            intermediate,
-                        )?,
-                        shared_expert_gate: testing::view(
-                            &x_device,
-                            stream,
-                            [geometry.hidden],
-                            [1],
-                        )?,
-                        contributions: testing::view(
-                            &contributions,
-                            stream,
-                            [rows as u32, 1, geometry.hidden],
-                            [geometry.hidden as u64, geometry.hidden as u64, 1],
-                        )?,
-                        done: testing::mut_view(&done, stream, [rows as u32, 1], [1, 1])?,
-                    },
-                    &qwen::scratch(&scratch, stream),
-                )?;
-                stream.synchronize()?;
+            let boundary = rows == LANE16_ROWS as usize || rows == LANE16_ROWS as usize + 1;
+            let mut arithmetic = vec![true; geometry.experts as usize];
+            if boundary {
+                let mut counts = vec![0; geometry.experts as usize];
+                counts[expert as usize] = rows as u32;
+                arithmetic_mask(&counts, &mut arithmetic)?;
+                ensure!(
+                    arithmetic[expert as usize] == (rows <= LANE16_ROWS as usize),
+                    "expert arithmetic boundary rows={rows}"
+                );
             }
-            let gpu = stream.clone_dtoh(&contributions)?;
-            ensure!(
-                stream.clone_dtoh(&done)?.iter().all(|&value| value == 1),
-                "grouped expert did not complete every assignment"
-            );
+            let run_gpu = |tables: &testing::SlotTable,
+                           host_gate_up: &[u64],
+                           host_down: &[u64]|
+             -> Result<Vec<bf16>> {
+                let contributions = stream.alloc_zeros::<bf16>(rows * hidden)?;
+                let done = stream.alloc_zeros::<u32>(rows)?;
+                {
+                    let _range =
+                        crate::backend::cuda::profile::Range::new(true, c"expert_tier_grouped");
+                    ops.prefill_contribute(
+                        stream,
+                        MoePrefillContribute {
+                            cpu_arithmetic: &arithmetic,
+                            x: qwen::matrix(&x_device, stream, 0, rows, hidden)?,
+                            ids: testing::dense(&ids, stream, rows as u32, 1)?,
+                            weights: testing::dense(&routing_device, stream, rows as u32, 1)?,
+                            active: testing::dense(&active, stream, rows as u32, 1)?,
+                            assignment_gen: testing::dense(&generation, stream, rows as u32, 1)?,
+                            slots_gate_up: testing::view(
+                                &tables.gate_up,
+                                stream,
+                                [geometry.experts],
+                                [1],
+                            )?,
+                            slots_down: testing::view(
+                                &tables.down,
+                                stream,
+                                [geometry.experts],
+                                [1],
+                            )?,
+                            slot_valid: testing::view(
+                                &tables.valid,
+                                stream,
+                                [geometry.experts],
+                                [1],
+                            )?,
+                            slot_generation: testing::view(
+                                &tables.generation,
+                                stream,
+                                [geometry.experts],
+                                [1],
+                            )?,
+                            slots_gate_up_host: host_gate_up,
+                            slots_down_host: host_down,
+                            shared_gate: qwen::matrix(
+                                &native_device,
+                                stream,
+                                0,
+                                intermediate,
+                                hidden,
+                            )?,
+                            shared_up: qwen::matrix(
+                                &native_device,
+                                stream,
+                                intermediate * hidden,
+                                intermediate,
+                                hidden,
+                            )?,
+                            shared_down: qwen::matrix(
+                                &native_device,
+                                stream,
+                                cut,
+                                hidden,
+                                intermediate,
+                            )?,
+                            shared_expert_gate: testing::view(
+                                &x_device,
+                                stream,
+                                [geometry.hidden],
+                                [1],
+                            )?,
+                            contributions: testing::view(
+                                &contributions,
+                                stream,
+                                [rows as u32, 1, geometry.hidden],
+                                [geometry.hidden as u64, geometry.hidden as u64, 1],
+                            )?,
+                            done: testing::mut_view(&done, stream, [rows as u32, 1], [1, 1])?,
+                        },
+                        &qwen::scratch(&scratch, stream),
+                    )?;
+                    stream.synchronize()?;
+                }
+                ensure!(
+                    stream.clone_dtoh(&done)?.iter().all(|&value| value == 1),
+                    "grouped expert did not complete every assignment"
+                );
+                Ok(stream.clone_dtoh(&contributions)?)
+            };
+            let gpu = run_gpu(&tables, &host_gate_up, &host_down)?;
             let mut cpu = vec![bf16::ZERO; rows * hidden];
             let pending = pool.submit(Job {
                 arena: host.clone(),
@@ -2155,6 +2201,48 @@ mod tests {
             let mut from_disk = vec![bf16::ZERO; rows * hidden];
             disk.start(0, x, rows, &routes)?;
             disk.finish(&mut from_disk)?;
+            if boundary {
+                let staged = stream.clone_htod(&native)?;
+                let mut staged_gate_up = host_gate_up.clone();
+                let mut staged_down = host_down.clone();
+                staged_gate_up[expert as usize] = staged.device_ptr(stream).0;
+                staged_down[expert as usize] = staged.device_ptr(stream).0 + (cut * 2) as u64;
+                let staged_tables = testing::SlotTable {
+                    gate_up: stream.clone_htod(&staged_gate_up)?,
+                    down: stream.clone_htod(&staged_down)?,
+                    valid: stream.clone_htod(&valid)?,
+                    generation: stream
+                        .clone_htod(&valid.iter().copied().map(u64::from).collect::<Vec<_>>())?,
+                };
+                let streamed = run_gpu(&staged_tables, &staged_gate_up, &staged_down)?;
+                let mut comparisons = vec![
+                    ("gpu_resident_streamed", &gpu, &streamed),
+                    ("cpu_pool_disk", &cpu, &from_disk),
+                ];
+                if arithmetic[expert as usize] {
+                    comparisons
+                        .extend([("gpu_cpu_pool", &gpu, &cpu), ("gpu_disk", &gpu, &from_disk)]);
+                }
+                for (name, a, b) in comparisons {
+                    ensure!(
+                        a.iter().chain(b).all(|value| value.is_finite()),
+                        "nonfinite expert boundary contribution {name}"
+                    );
+                    let mismatches = a
+                        .iter()
+                        .zip(b)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    defects += usize::from(mismatches != 0);
+                    println!(
+                        "{} expert_arithmetic_boundary rows={rows} lane16={} comparison={name} weighted=true bit_mismatches={mismatches} cpu_reference_only={}",
+                        if mismatches == 0 { "PASS" } else { "DEFECT" },
+                        arithmetic[expert as usize],
+                        !arithmetic[expert as usize]
+                    );
+                }
+                continue;
+            }
             if !weighted {
                 let packed = stream.clone_dtoh(&scratch)?;
                 let mut cpu_stages: [Vec<bf16>; 4] = std::array::from_fn(|_| Vec::new());
@@ -2481,16 +2569,51 @@ mod tests {
         )?;
         assert_eq!(
             cpu_bound(geometry, slot_bytes, 263, &service, 1_000_000_000.0)?,
-            (32, 32, 2)
+            (32, 32, 2, 2)
         );
         assert_eq!(
             cpu_bound(geometry, slot_bytes, 263, &service, 1_000_000_000_000.0)?,
-            (1, 1, 0)
+            (1, 1, 0, 0)
         );
         assert_eq!(
             cpu_bound(geometry, slot_bytes, 263, &service, 1_000_000.0)?,
-            (263, 1024, 64)
+            (256, 256, 16, 64)
         );
+        let mut counts = vec![0; geometry.experts as usize];
+        counts[..5].copy_from_slice(&[0, 1, 15, 16, 17]);
+        for measured in [15, 16, 64] {
+            let copy_seconds = (f64::from(measured) + 0.5) * 0.00002;
+            let h2d = slot_bytes as f64 / copy_seconds;
+            let cpu = cpu_bound(geometry, slot_bytes, 263, &service, h2d)?;
+            assert_eq!(cpu.3, measured);
+            assert_eq!(cpu.2, measured.min(LANE16_ROWS));
+            let mut mask = vec![false; geometry.experts as usize];
+            arithmetic_mask(&counts, &mut mask)?;
+            assert_eq!(&mask[..5], &[true, true, true, true, false]);
+            let mut plan = SpanPlan::new(&geometry, slot_bytes, 1, 2)?;
+            plan.update(
+                &counts,
+                &vec![false; geometry.experts as usize],
+                263,
+                4,
+                &SpanRates {
+                    service: &service,
+                    h2d_bytes_per_second: h2d,
+                    cpu_row_limit: cpu.2,
+                },
+            )?;
+            assert!(
+                plan.cpu()
+                    .iter()
+                    .all(|&expert| counts[expert as usize] <= cpu.2)
+            );
+            assert!(plan.staged().contains(&4));
+            assert!(!plan.cpu().contains(&4));
+            println!(
+                "PASS deterministic_arithmetic_cpu measured={measured} effective={} boundary={LANE16_ROWS} counts=0,1,15,16,17",
+                cpu.2
+            );
+        }
         for span_rows in [8, 17, 37, 263] {
             let layout =
                 ExpertSpanLayout::new(&reserves(geometry), geometry, slot_bytes, span_rows)?;
@@ -2652,7 +2775,6 @@ mod tests {
         fixture: &MoeFixture,
         layer: u32,
         wave: usize,
-        ceiling: u32,
         cohorts: impl FnOnce(&[i32]) -> Result<(Vec<u32>, Vec<Vec<u32>>)>,
     ) -> Result<Reference> {
         let stream = &engine.device.stream;
@@ -2685,10 +2807,12 @@ mod tests {
         )?;
         let host_ids = stream.clone_dtoh(&ids)?;
         let host_weights = stream.clone_dtoh(&weights)?;
-        let mut arithmetic = [false; 16];
-        for (expert, form) in arithmetic.iter_mut().enumerate() {
-            *form = host_ids.iter().filter(|&&id| id == expert as i32).count() <= ceiling as usize;
+        let mut counts = [0; 16];
+        for &expert in &host_ids {
+            counts[expert as usize] += 1;
         }
+        let mut arithmetic = [false; 16];
+        arithmetic_mask(&counts, &mut arithmetic)?;
         let (cpu_experts, cohorts) = cohorts(&host_ids)?;
         let slots = engine
             .moe_slots
@@ -2908,10 +3032,10 @@ mod tests {
                 )?
                 .2;
                 for layer in 0..2 {
-                    let first = reference(&oracle, &fixture, layer, 4, ceiling, |_| {
+                    let first = reference(&oracle, &fixture, layer, 4, |_| {
                         Ok((vec![], vec![(0..16).collect()]))
                     })?;
-                    let second = reference(&oracle, &fixture, layer, 4, ceiling, |_| {
+                    let second = reference(&oracle, &fixture, layer, 4, |_| {
                         Ok((vec![], vec![(0..16).collect()]))
                     })?;
                     ensure!(
@@ -3037,6 +3161,7 @@ mod tests {
                             &SpanRates {
                                 service: &prefill.service,
                                 h2d_bytes_per_second: prefill.h2d_bytes_per_second,
+                                cpu_row_limit: prefill.cpu_ceiling,
                             },
                         )?;
                         expected_cancellations += forecast
@@ -3112,14 +3237,9 @@ mod tests {
                             }
                             engine.device.stream.synchronize()?;
                         }
-                        let reference = reference(
-                            &oracle,
-                            &fixture,
-                            layer as u32,
-                            4,
-                            prefill.cpu_ceiling,
-                            |_| Ok((expected_plan.cpu().to_vec(), vec![(0..16).collect()])),
-                        )?;
+                        let reference = reference(&oracle, &fixture, layer as u32, 4, |_| {
+                            Ok((expected_plan.cpu().to_vec(), vec![(0..16).collect()]))
+                        })?;
                         let actual = engine.device.stream.clone_dtoh(&output)?;
                         let span = prefill.span.as_ref().context("prefill gate span missing")?;
                         let mut contributions = vec![bf16::ZERO; rows as usize * 4 * 128];
@@ -3320,7 +3440,7 @@ mod tests {
                 rows as u32,
                 engine.moe_ffn_binding(layer as usize)?,
             )?;
-            let expected = reference(&oracle, &fixture, layer, 4, prefill.cpu_ceiling, |_| {
+            let expected = reference(&oracle, &fixture, layer, 4, |_| {
                 Ok((prefill.plan.cpu().to_vec(), vec![(0..16).collect()]))
             })?;
             let span = prefill.span.as_ref().context("span missing")?;
@@ -3496,6 +3616,7 @@ mod tests {
             &SpanRates {
                 service: &tier_service(capacity.worker_count)?,
                 h2d_bytes_per_second: 1_000_000_000.0,
+                cpu_row_limit: LANE16_ROWS,
             },
         )?;
         let mut cohorts = Vec::new();
@@ -3529,16 +3650,6 @@ mod tests {
         );
         engine.reset()?;
         let mut fixture = tier_fixture(3);
-        let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
-        let reference_capacity = tier_capacity(geometry, false)?;
-        let ceiling = cpu_bound(
-            geometry,
-            reference_capacity.slot_bytes(),
-            span_rows as u32,
-            &tier_service(reference_capacity.worker_count)?,
-            1_000_000_000.0,
-        )?
-        .2;
         let mut hidden = Vec::new();
         for (span_index, admitted) in ids.chunks(span_rows).enumerate() {
             let start = span_index * span_rows;
@@ -3586,18 +3697,16 @@ mod tests {
                 }
                 fixture.x = normalized;
                 fixture.dims.rows = admitted.len();
-                let ffn =
-                    reference(
-                        engine,
-                        &fixture,
-                        layer as u32,
-                        wave,
-                        ceiling,
-                        |ids| match placement {
-                            Some(capacity) => reference_cohorts(ids, layer as u32, capacity),
-                            None => Ok((vec![], vec![(0..16).collect()])),
-                        },
-                    )?;
+                let ffn = reference(
+                    engine,
+                    &fixture,
+                    layer as u32,
+                    wave,
+                    |ids| match placement {
+                        Some(capacity) => reference_cohorts(ids, layer as u32, capacity),
+                        None => Ok((vec![], vec![(0..16).collect()])),
+                    },
+                )?;
                 for base in (0..admitted.len()).step_by(wave) {
                     let rows = wave.min(admitted.len() - base);
                     let step = engine.moe_wave(start + base, rows)?;
