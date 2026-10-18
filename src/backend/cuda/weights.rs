@@ -724,6 +724,7 @@ mod tests {
             worker_count: 1,
             disk_workers: 0,
             prefill_staging_slots: 2,
+            pinned: true,
         };
         let device = crate::backend::cuda::Device::new(0)?;
         let mut storage = ExpertStorage::new(&device.stream, &device.upload, geometry, &capacity)?;
