@@ -56,7 +56,7 @@ use cudarc::{
 use half::bf16;
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     mem::size_of,
     path::{Path, PathBuf},
     rc::Rc,

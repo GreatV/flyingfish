@@ -6,7 +6,7 @@ use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut};
 use crate::backend::cuda::cubin;
 #[cfg(test)]
 use crate::backend::cuda::moe::combine::{CombineOps, MoeCombine};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaStream, LaunchConfig, PushKernelArg,
 };
@@ -147,8 +147,8 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
         input.slot_valid.shape[0],
         input.slot_generation.shape[0]
     );
-    input.shared_gate.validate()?;
-    input.shared_up.validate()?;
+    input.shared_gate.validate().context("decode shared_gate")?;
+    input.shared_up.validate().context("decode shared_up")?;
     let inter = input.shared_gate.shape[0];
     for t in [&input.shared_gate, &input.shared_up] {
         ensure!(
@@ -158,7 +158,7 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
             t.stride
         );
     }
-    input.shared_down.validate()?;
+    input.shared_down.validate().context("decode shared_down")?;
     ensure!(
         input.shared_down.shape == [hidden, inter]
             && input.shared_down.stride == [u64::from(inter), 1],
@@ -166,7 +166,7 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
         input.shared_down.shape,
         input.shared_down.stride
     );
-    input.shared_expert_gate.validate()?;
+    input.shared_expert_gate.validate().context("decode shared_expert_gate")?;
     ensure!(
         input.shared_expert_gate.shape == [hidden] && input.shared_expert_gate.stride == [1],
         "decode shared expert gate must be a contiguous [hidden] vector (shape {:?}, stride {:?}, hidden {hidden})",

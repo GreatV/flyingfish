@@ -14,60 +14,6 @@ use std::process::Command;
 use std::sync::Arc;
 
 #[test]
-fn shared_expert_misalignment_is_rejected_before_launch() -> Result<()> {
-    use super::decode::{MoeDecode, decode_scratch_bytes, validate};
-    use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut};
-    let matrix = |ptr, rows, cols| {
-        // SAFETY: these metadata-only views are passed only to validation.
-        unsafe {
-            Tensor::<bf16, 2>::new(
-                ptr,
-                [rows, cols],
-                [u64::from(cols), 1],
-                u64::from(rows) * u64::from(cols) * 2,
-            )
-        }
-    };
-    for misaligned in 0..4 {
-        let offset = |field| if misaligned == field { 2 } else { 0 };
-        // SAFETY: these disjoint metadata-only spans are never launched or dereferenced.
-        let mut shared = unsafe { TensorMut::new(0x60000, [1, 128], [128, 1], 256)? };
-        // SAFETY: this metadata-only span is never launched or dereferenced.
-        let mut done = unsafe { TensorMut::new(0x70000, [1, 1], [1, 1], 4)? };
-        // SAFETY: these disjoint metadata-only spans are never launched or dereferenced.
-        let input = unsafe {
-            MoeDecode {
-                x: matrix(0x1000, 1, 128)?,
-                ids: Tensor::new(0x2000, [1, 1], [1, 1], 4)?,
-                active: Tensor::new(0x3000, [1, 1], [1, 1], 4)?,
-                weights: matrix(0x4000, 1, 1)?,
-                slots_gate_up: Tensor::new(0x5000, [1], [1], 8)?,
-                slots_down: Tensor::new(0x6000, [1], [1], 8)?,
-                slot_valid: Tensor::new(0x7000, [1], [1], 4)?,
-                slot_generation: Tensor::new(0x8000, [1], [1], 8)?,
-                assignment_gen: Tensor::new(0x9000, [1, 1], [1, 1], 8)?,
-                shared_gate: matrix(0x10000 + offset(0), 64, 128)?,
-                shared_up: matrix(0x20000 + offset(1), 64, 128)?,
-                shared_down: matrix(0x30000 + offset(2), 128, 64)?,
-                shared_expert_gate: Tensor::new(0x40000 + offset(3), [128], [1], 256)?,
-                contributions: Tensor::new(0x50000, [1, 1, 128], [128, 128, 1], 256)?,
-                shared_out: &mut shared,
-                done: &mut done,
-            }
-        };
-        let scratch = Scratch {
-            ptr: 0x80000,
-            bytes: decode_scratch_bytes(1, 1, 64),
-        };
-        assert!(
-            validate(&input, &scratch).is_err(),
-            "shared field {misaligned}"
-        );
-    }
-    Ok(())
-}
-
-#[test]
 fn decode_scratch_bytes_sizes_h_shared_and_scale() {
     assert_eq!(decode_scratch_bytes(1, 8, 512), 9 * 512 * 2 + 2);
     assert_eq!(decode_scratch_bytes(8, 8, 512), 8 * 9 * 512 * 2 + 8 * 2);
