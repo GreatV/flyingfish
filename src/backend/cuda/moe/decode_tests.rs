@@ -203,6 +203,55 @@ fn decode_expert_ffn_gpu() -> Result<()> {
     let ops = DecodeOps::new(&device.ctx)?;
     let combine_ops = CombineOps::new(&device.ctx)?;
     let s = &device.stream;
+    {
+        let dims = MoeDims::minicpm47(2);
+        let (rows, k, h) = (dims.rows, dims.top_k, dims.hidden);
+        let mut io = decode_io(s, rows as u32, k as u32, h as u32)?;
+        let half_ulp = 2f32.powi(-8);
+        let mut contributions = vec![bf16::ZERO; rows * k * h];
+        let mut shared = vec![bf16::ZERO; rows * h];
+        for row in 0..rows {
+            let sign = if row == 0 { 1.0 } else { -1.0 };
+            contributions[row * k * h..][..h].fill(bf16::from_f32(sign));
+            contributions[(row * k + 1) * h..][..h].fill(bf16::from_f32(sign * half_ulp));
+            shared[row * h..][..h].fill(bf16::from_f32(sign * half_ulp));
+        }
+        s.memcpy_htod(&contributions, &mut io._contrib_dev)?;
+        s.memcpy_htod(&shared, &mut io._shared_out_dev)?;
+        let ids = testing::upload(s, (0..rows * k).map(|c| (c % k) as i32).collect())?;
+        let active = testing::upload(s, vec![1u32; rows * k])?;
+        let scale = testing::upload(s, vec![bf16::ONE; rows])?;
+        let active_view = testing::dense(&active, s, rows as u32, k as u32)?;
+        combine_ops.combine(
+            s,
+            &MoeCombine {
+                ids: testing::dense(&ids, s, rows as u32, k as u32)?,
+                final_active: active_view,
+                done: active_view,
+                contributions: io.contributions,
+                shared_out: io.shared_out.read(),
+                x: io.shared_out.read(),
+                shared_expert_gate: testing::view(&io._shared_out_dev, s, [h as u32], [1])?,
+                scale: testing::dense_mut(&scale, s, rows as u32, 1)?,
+                y: TensorMut(io.y.read()),
+            },
+        )?;
+        s.synchronize()?;
+        let output = s.clone_dtoh(&io.y_dev)?;
+        let mismatches = output
+            .iter()
+            .enumerate()
+            .filter(|(word, value)| {
+                let expected = bf16::from_f32(if *word < h { 1.0 } else { -1.0 });
+                value.to_bits() != expected.to_bits()
+            })
+            .count();
+        println!(
+            "{} moe_combine_bf16_boundary rows={rows} top_k={k} hidden={h} bit_mismatches={mismatches}",
+            if mismatches == 0 { "PASS" } else { "DEFECT" }
+        );
+        anyhow::ensure!(mismatches == 0, "DEFECT routed/shared BF16 boundary");
+    }
     let fx = reference::fixture(MoeDims::minicpm47(8), 0);
     let (e, k, h, i) = (
         fx.dims.experts,
