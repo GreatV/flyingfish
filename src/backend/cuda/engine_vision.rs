@@ -247,6 +247,7 @@ pub(super) struct VisionIo {
     cast: CudaFunction,
     position_add: CudaFunction,
     splice: CudaFunction,
+    width: u32,
     pack: CudaFunction,
     residual: CudaFunction,
     wide: WideVisionOps,
@@ -269,13 +270,19 @@ pub(super) struct PositionInputs {
 }
 
 impl VisionIo {
-    fn new(device: &Device) -> Result<Self> {
+    fn new(device: &Device, width: u32) -> Result<Self> {
+        let splice = match width {
+            2048 => "vision_splice_2048",
+            5120 => "q38_vision_splice",
+            _ => bail!("vision splice has no compiled output width={width}"),
+        };
         let module = cubin::module(&device.ctx, "q38_vision_io")?;
         let wide = cubin::module(&device.ctx, "vision_ops")?;
         Ok(Self {
             cast: module.load_function("q38_vision_cast_patches")?,
             position_add: module.load_function("q38_vision_position_add")?,
-            splice: module.load_function("q38_vision_splice")?,
+            splice: module.load_function(splice)?,
+            width,
             pack: module.load_function("q38_vision_pack")?,
             residual: module.load_function("q38_vision_residual")?,
             wide: WideVisionOps {
@@ -376,12 +383,11 @@ impl VisionIo {
         features: Tensor<bf16, 2>,
         output: &mut TensorMut<bf16, 2>,
         range: &SpliceRange,
-        width: u32,
     ) -> Result<()> {
+        let width = self.width;
         let rows = splice_bounds(&features, &output.0, range, width)?;
         let source = u32::try_from(range.feature_rows.start)?;
         let destination = u32::try_from(range.chunk_rows.start)?;
-        ensure!(width == 5120, "Q38 splice width mismatch");
         let count = u64::from(rows) * u64::from(width);
         unsafe {
             stream
@@ -1603,12 +1609,7 @@ impl VisionRuntime {
         let synchronized = stream.synchronize();
         launched?;
         synchronized?;
-        EncodedImages::new(
-            request.prefix.positions,
-            request.features,
-            self.io.clone(),
-            self.geometry.output(),
-        )
+        EncodedImages::new(request.prefix.positions, request.features, self.io.clone())
     }
 
     fn run_block(
@@ -1984,7 +1985,7 @@ impl VisionRuntime {
             .vision
             .as_ref()
             .context("vision configuration missing")?;
-        let io = Arc::new(VisionIo::new(device)?);
+        let io = Arc::new(VisionIo::new(device, geometry.output())?);
         let weights = VisionWeights::take(catalog, geometry, vision, model.architecture)?;
         Ok(Self {
             model: model.clone(),
@@ -2143,7 +2144,6 @@ pub(super) struct EncodedImages {
     positions: PositionPlan,
     features: CudaSlice<bf16>,
     io: Arc<VisionIo>,
-    width: u32,
 }
 impl EncodedImages {
     /// The caller must supply the completed merger output of this request.
@@ -2151,8 +2151,8 @@ impl EncodedImages {
         positions: PositionPlan,
         features: CudaSlice<bf16>,
         io: Arc<VisionIo>,
-        width: u32,
     ) -> Result<Self> {
+        let width = io.width;
         let elements = positions
             .feature_rows()
             .checked_mul(width as usize)
@@ -2165,7 +2165,6 @@ impl EncodedImages {
             positions,
             features,
             io,
-            width,
         })
     }
     pub(super) fn splice(
@@ -2174,7 +2173,7 @@ impl EncodedImages {
         first: usize,
         output: &mut TensorMut<bf16, 2>,
     ) -> Result<()> {
-        matrix(&output.0, self.width)?;
+        matrix(&output.0, self.io.width)?;
         let end = first
             .checked_add(output.0.shape[0] as usize)
             .context("splice prompt extent overflow")?
@@ -2185,12 +2184,11 @@ impl EncodedImages {
         let features = dense(
             &self.features,
             stream,
-            [u32::try_from(self.positions.feature_rows())?, self.width],
+            [u32::try_from(self.positions.feature_rows())?, self.io.width],
         )?;
         let splices = self.positions.splices(first..end)?;
         for range in &splices {
-            self.io
-                .splice(stream, features, output, range, self.width)?;
+            self.io.splice(stream, features, output, range)?;
         }
         if !splices.is_empty()
             && std::env::var("FLYINGFISH_SERVE_TRACE_IDS").is_ok_and(|value| value == "1")
@@ -2250,7 +2248,7 @@ mod tests {
         );
         let device = Device::new(0)?;
         let s = &device.stream;
-        let io = VisionIo::new(&device)?;
+        let io = VisionIo::new(&device, OUTPUT)?;
         let packing = PatchPacking::build(&[PatchGrid { h: 2, w: 2 }, PatchGrid { h: 2, w: 4 }])?;
         let rows = packing.real_rows();
         let padded = packing.padded_rows();
@@ -2426,7 +2424,7 @@ mod tests {
         );
         let device = Device::new(0)?;
         let s = &device.stream;
-        let io = Arc::new(VisionIo::new(&device)?);
+        let io = Arc::new(VisionIo::new(&device, OUTPUT)?);
         let model = ModelSpec::qwen(
             &serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?,
             &serde_json::Value::Null,
@@ -2528,36 +2526,56 @@ mod tests {
         ids.extend([248054, 200]);
         let mut modalities = vec![0; 10];
         modalities[2..8].fill(1);
-        let plan = MultimodalInput {
-            input_ids: &ids,
-            modality_ids: &modalities,
-            pixel_values: &pixels,
-            grids: &image_grids,
-        }
-        .validate(&model, 32)?;
-        let feature_host: Vec<_> = (0..6 * OUTPUT as usize)
-            .map(|i| bf16::from_f32((i / OUTPUT as usize + 1) as f32 * 0.25))
-            .collect();
-        let encoded = EncodedImages::new(plan, s.clone_htod(&feature_host)?, io.clone(), OUTPUT)?;
-        let sentinel = bf16::from_f32(-7.0);
-        for first in [0usize, 5, 10] {
-            let output = s.clone_htod(&vec![sentinel; 5 * OUTPUT as usize])?;
-            encoded.splice(s, first, &mut TensorMut(dense(&output, s, [5, OUTPUT])?))?;
-            let got = s.clone_dtoh(&output)?;
-            for r in 0..5 {
-                let absolute = first + r;
-                let expected = if (2..8).contains(&absolute) {
-                    bf16::from_f32((absolute - 1) as f32 * 0.25)
-                } else {
-                    sentinel
-                };
-                ensure!(
-                    got[r * OUTPUT as usize..(r + 1) * OUTPUT as usize]
-                        .iter()
-                        .all(|v| *v == expected),
-                    "splice corrupted image/text row {absolute}"
-                );
+        for width in [2048, OUTPUT] {
+            let io = Arc::new(VisionIo::new(&device, width)?);
+            let plan = MultimodalInput {
+                input_ids: &ids,
+                modality_ids: &modalities,
+                pixel_values: &pixels,
+                grids: &image_grids,
             }
+            .validate(&model, 32)?;
+            let feature_host: Vec<_> = (0..6 * width as usize)
+                .map(|i| bf16::from_bits(0x3e00 + ((i * 37) % 509) as u16))
+                .collect();
+            let mut encoded = EncodedImages::new(plan, s.clone_htod(&feature_host)?, io)?;
+            let sentinel = bf16::from_f32(-7.0);
+            for first in [0usize, 5, 10] {
+                let output = s.clone_htod(&vec![sentinel; 5 * width as usize])?;
+                encoded.splice(s, first, &mut TensorMut(dense(&output, s, [5, width])?))?;
+                let got = s.clone_dtoh(&output)?;
+                for row in 0..5 {
+                    let absolute = first + row;
+                    let begin = row * width as usize;
+                    let expected = if (2..8).contains(&absolute) {
+                        &feature_host[(absolute - 2) * width as usize..][..width as usize]
+                    } else {
+                        &vec![sentinel; width as usize]
+                    };
+                    ensure!(
+                        got[begin..begin + width as usize] == *expected,
+                        "splice width={width} corrupted image/text row={absolute}"
+                    );
+                }
+            }
+            let mut shifted = feature_host.clone();
+            shifted.rotate_left(width as usize);
+            s.memcpy_htod(&shifted, &mut encoded.features)?;
+            let output = s.clone_htod(&vec![sentinel; 10 * width as usize])?;
+            encoded.splice(s, 0, &mut TensorMut(dense(&output, s, [10, width])?))?;
+            let got = s.clone_dtoh(&output)?;
+            let mismatches = got[2 * width as usize..8 * width as usize]
+                .iter()
+                .zip(&feature_host)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            ensure!(
+                mismatches > 0,
+                "splice wrong-source-row control width={width} was not detected"
+            );
+            eprintln!(
+                "VISION_SPLICE width={width} chunks=3 bitwise=true wrong_source_row_mismatches={mismatches} PASS"
+            );
         }
         eprintln!(
             "VISION_IO cast/bilinear_fp32/cast_before_add/chunk_splice/text_preservation PASS"

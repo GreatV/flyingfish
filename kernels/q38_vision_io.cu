@@ -46,19 +46,36 @@ extern "C" __global__ void q38_vision_position_add(
     }
 }
 
-extern "C" __global__ void q38_vision_splice(
+template <uint32_t WIDTH>
+__device__ __forceinline__ void vision_splice(
     const __nv_bfloat16* features, __nv_bfloat16* output,
     uint32_t feature_rows, uint32_t output_rows,
     uint32_t source_first, uint32_t destination_first, uint32_t rows) {
     if (!flat_launch() || !features || !output || !rows ||
         uint64_t(source_first) + rows > feature_rows ||
         uint64_t(destination_first) + rows > output_rows) { __trap(); return; }
-    uint64_t count = uint64_t(rows) * 5120;
+    uint64_t count = uint64_t(rows) * WIDTH;
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x;
          i < count; i += uint64_t(gridDim.x) * 256) {
-        output[uint64_t(destination_first) * 5120 + i] =
-            features[uint64_t(source_first) * 5120 + i];
+        output[uint64_t(destination_first) * WIDTH + i] =
+            features[uint64_t(source_first) * WIDTH + i];
     }
+}
+
+extern "C" __global__ void q38_vision_splice(
+    const __nv_bfloat16* features, __nv_bfloat16* output,
+    uint32_t feature_rows, uint32_t output_rows,
+    uint32_t source_first, uint32_t destination_first, uint32_t rows) {
+    vision_splice<5120>(features, output, feature_rows, output_rows,
+                        source_first, destination_first, rows);
+}
+
+extern "C" __global__ void vision_splice_2048(
+    const __nv_bfloat16* features, __nv_bfloat16* output,
+    uint32_t feature_rows, uint32_t output_rows,
+    uint32_t source_first, uint32_t destination_first, uint32_t rows) {
+    vision_splice<2048>(features, output, feature_rows, output_rows,
+                        source_first, destination_first, rows);
 }
 
 // One image range from the shared PatchPacking; QKV is [rows,3,16,72].
