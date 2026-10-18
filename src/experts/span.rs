@@ -18,101 +18,172 @@ pub enum SpanClass {
     Cpu,
 }
 
-/// Per-layer span execution plan: classes, staged cohorts and the wave count.
+/// Per-layer span execution plan; `update` rewrites an instance in place without allocating.
+/// `staged` is one flat expert list whose `staging_slots`-expert chunks are the cohorts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpanPlan {
-    pub span_rows: u32,
-    pub wave_rows: u32,
-    pub waves: u32,
-    pub resident: Vec<u32>,
-    pub staged: Vec<Vec<u32>>,
-    pub cpu: Vec<u32>,
-    pub streamed_bytes: u64,
-}
-
-/// Plans one layer's span from the routed row counts and the current residency.
-pub fn plan_span(
-    geometry: &ExpertGeometry,
-    counts: &[u32],
-    resident: &[bool],
     span_rows: u32,
     wave_rows: u32,
+    waves: u32,
+    streamed_bytes: u64,
+    geometry: ExpertGeometry,
     staging_slots: u32,
-    rates: &SpanRates<'_>,
-) -> Result<SpanPlan> {
-    ensure!(
-        counts.len() == geometry.experts as usize,
-        "expert counts hold {} experts, expected {}",
-        counts.len(),
-        geometry.experts
-    );
-    ensure!(
-        resident.len() == geometry.experts as usize,
-        "residency holds {} experts, expected {}",
-        resident.len(),
-        geometry.experts
-    );
-    ensure!(span_rows > 0, "zero span rows");
-    ensure!(
-        wave_rows > 0 && wave_rows <= span_rows,
-        "wave rows {wave_rows} outside the span {span_rows}"
-    );
-    ensure!(staging_slots > 0, "zero prefill staging slots");
-    ensure!(
-        rates.h2d_bytes_per_second.is_finite() && rates.h2d_bytes_per_second > 0.0,
-        "invalid H2D rate {}",
-        rates.h2d_bytes_per_second
-    );
-    let slot_bytes = geometry.slot_bytes()?;
-    let copy_seconds = slot_bytes as f64 / rates.h2d_bytes_per_second;
-    let workers = rates.service.worker_count()?;
-    let max_rows = rates.service.max_rows();
-    let mut resident_experts = Vec::new();
-    let mut streamed = Vec::new();
-    let mut cpu = Vec::new();
-    for (expert, &rows) in counts.iter().enumerate() {
-        if rows == 0 {
-            continue;
-        }
-        if resident[expert] {
-            resident_experts.push(expert as u32);
-            continue;
-        }
-        if rows > max_rows {
-            let at_max = rates.service.rows_time(max_rows, 1, workers)?;
-            ensure!(
-                copy_seconds < at_max,
-                "expert {expert} rows={rows} exceed the measured rows extent ..={max_rows} and the CPU route wins at {max_rows}"
-            );
-            streamed.push(expert as u32);
-            continue;
-        }
-        let cpu_seconds = rates.service.rows_time(rows, 1, workers)?;
-        if copy_seconds < cpu_seconds {
-            streamed.push(expert as u32);
-        } else {
-            cpu.push(expert as u32);
-        }
+    workers: u32,
+    resident: Vec<u32>,
+    staged: Vec<u32>,
+    cpu: Vec<u32>,
+    classes: Vec<SpanClass>,
+}
+
+impl SpanPlan {
+    /// Setup-time allocation for one geometry's experts and `staging_slots`-expert cohorts;
+    /// `workers` is the service table's selected worker count.
+    pub fn new(geometry: &ExpertGeometry, staging_slots: u32, workers: u32) -> Result<Self> {
+        ensure!(staging_slots > 0, "zero prefill staging slots");
+        ensure!(workers > 0, "zero service workers");
+        let experts = geometry.experts as usize;
+        Ok(Self {
+            span_rows: 0,
+            wave_rows: 0,
+            waves: 0,
+            streamed_bytes: 0,
+            geometry: *geometry,
+            staging_slots,
+            workers,
+            resident: Vec::with_capacity(experts),
+            staged: Vec::with_capacity(experts),
+            cpu: Vec::with_capacity(experts),
+            classes: vec![SpanClass::Cpu; experts],
+        })
     }
-    let mut staged = Vec::new();
-    for cohort in streamed.chunks(staging_slots as usize) {
-        staged.push(cohort.to_vec());
+
+    /// Rewrites the plan from the routed row counts and the current residency. Every fallible step
+    /// runs before the plan buffers are touched, so a failed update leaves the previous plan intact.
+    pub fn update(
+        &mut self,
+        counts: &[u32],
+        resident: &[bool],
+        span_rows: u32,
+        wave_rows: u32,
+        rates: &SpanRates<'_>,
+    ) -> Result<()> {
+        let geometry = &self.geometry;
+        ensure!(
+            counts.len() == geometry.experts as usize,
+            "expert counts hold {} experts, expected {}",
+            counts.len(),
+            geometry.experts
+        );
+        ensure!(
+            resident.len() == geometry.experts as usize,
+            "residency holds {} experts, expected {}",
+            resident.len(),
+            geometry.experts
+        );
+        ensure!(span_rows > 0, "zero span rows");
+        ensure!(
+            wave_rows > 0 && wave_rows <= span_rows,
+            "wave rows {wave_rows} outside the span {span_rows}"
+        );
+        ensure!(
+            rates.h2d_bytes_per_second.is_finite() && rates.h2d_bytes_per_second > 0.0,
+            "invalid H2D rate {}",
+            rates.h2d_bytes_per_second
+        );
+        let slot_bytes = geometry.slot_bytes()?;
+        let copy_seconds = slot_bytes as f64 / rates.h2d_bytes_per_second;
+        let workers = self.workers;
+        let max_rows = rates.service.max_rows();
+        let mut streamed = 0usize;
+        for (expert, &rows) in counts.iter().enumerate() {
+            let class = if rows == 0 {
+                continue;
+            } else if resident[expert] {
+                SpanClass::Resident
+            } else if rows > max_rows {
+                let at_max = rates.service.rows_time(max_rows, 1, workers)?;
+                ensure!(
+                    copy_seconds < at_max,
+                    "expert {expert} rows={rows} exceed the measured rows extent ..={max_rows} and the CPU route wins at {max_rows}"
+                );
+                SpanClass::Streamed
+            } else {
+                let cpu_seconds = rates.service.rows_time(rows, 1, workers)?;
+                if copy_seconds < cpu_seconds {
+                    SpanClass::Streamed
+                } else {
+                    SpanClass::Cpu
+                }
+            };
+            self.classes[expert] = class;
+            if class == SpanClass::Streamed {
+                streamed += 1;
+            }
+        }
+        let streamed_bytes = u64::try_from(streamed)?
+            .checked_mul(slot_bytes)
+            .context("streamed span bytes overflow")?;
+        self.resident.clear();
+        self.staged.clear();
+        self.cpu.clear();
+        for (expert, &rows) in counts.iter().enumerate() {
+            if rows == 0 {
+                continue;
+            }
+            match self.classes[expert] {
+                SpanClass::Resident => self.resident.push(expert as u32),
+                SpanClass::Streamed => self.staged.push(expert as u32),
+                SpanClass::Cpu => self.cpu.push(expert as u32),
+            }
+        }
+        self.span_rows = span_rows;
+        self.wave_rows = wave_rows;
+        self.waves = span_rows.div_ceil(wave_rows);
+        self.streamed_bytes = streamed_bytes;
+        Ok(())
     }
-    let streamed_bytes = u64::try_from(streamed.len())?
-        .checked_mul(slot_bytes)
-        .context("streamed span bytes overflow")?;
-    Ok(SpanPlan {
-        span_rows,
-        wave_rows,
-        waves: span_rows.div_ceil(wave_rows),
-        resident: resident_experts,
-        staged,
-        cpu,
-        streamed_bytes,
-    })
+
+    pub fn span_rows(&self) -> u32 {
+        self.span_rows
+    }
+
+    pub fn wave_rows(&self) -> u32 {
+        self.wave_rows
+    }
+
+    pub fn waves(&self) -> u32 {
+        self.waves
+    }
+
+    pub fn streamed_bytes(&self) -> u64 {
+        self.streamed_bytes
+    }
+
+    pub fn resident(&self) -> &[u32] {
+        &self.resident
+    }
+
+    /// Flat staged expert list in routing order; `cohorts()` chunks it by staging slot count.
+    pub fn staged(&self) -> &[u32] {
+        &self.staged
+    }
+
+    pub fn cohorts(&self) -> impl Iterator<Item = &[u32]> {
+        self.staged.chunks(self.staging_slots as usize)
+    }
+
+    pub fn cohort_count(&self) -> u32 {
+        u32::try_from(self.staged.len().div_ceil(self.staging_slots as usize))
+            .expect("cohort count fits u32")
+    }
+
+    pub fn cpu(&self) -> &[u32] {
+        &self.cpu
+    }
 }
 
 /// Prefill staging leases: one cohort copy per round, pinned through every row wave.
+/// The event bookkeeping, the slot list and the released wait list are allocated once.
 pub struct StagingLeases {
     slots: u32,
     waves: u32,
@@ -120,20 +191,33 @@ pub struct StagingLeases {
     ids: Vec<u32>,
     recorded: Vec<u32>,
     loaded: u32,
+    waits: Vec<u64>,
 }
 
 impl StagingLeases {
-    pub fn new(slots: u32, waves: u32) -> Result<Self> {
+    pub fn new(slots: u32) -> Result<Self> {
         ensure!(slots > 0, "zero prefill staging slots");
-        ensure!(waves > 0, "zero span row waves");
         Ok(Self {
             slots,
-            waves,
+            waves: 0,
             events: SlotEvents::new(slots as usize),
             ids: Vec::with_capacity(slots as usize),
             recorded: vec![0; slots as usize],
             loaded: 0,
+            waits: Vec::with_capacity(slots as usize),
         })
+    }
+
+    /// Sets the row-wave count of the next cohort; legal only with no cohort loaded.
+    pub fn reset(&mut self, waves: u32) -> Result<()> {
+        ensure!(waves > 0, "zero span row waves");
+        ensure!(
+            self.loaded == 0,
+            "staging cohort {} is still loaded",
+            self.loaded
+        );
+        self.waves = waves;
+        Ok(())
     }
 
     /// Records the cohort copy into staging slots `0..cohort.len()` under one event.
@@ -143,6 +227,7 @@ impl StagingLeases {
             "staging cohort {} is still loaded",
             self.loaded
         );
+        ensure!(self.waves > 0, "staging waves are not set");
         ensure!(!cohort.is_empty(), "empty staging cohort");
         ensure!(
             cohort.len() as u32 <= self.slots,
@@ -170,9 +255,9 @@ impl StagingLeases {
         Ok(())
     }
 
-    /// Releases a cohort that recorded every row wave and returns the reader events the next copy
-    /// stream waits on.
-    pub fn release(&mut self) -> Result<Vec<u64>> {
+    /// Releases a cohort that recorded every row wave and returns the retained reader-event slice
+    /// that the next copy stream waits on.
+    pub fn release(&mut self) -> Result<&[u64]> {
         ensure!(self.loaded > 0, "no staging cohort to release");
         for slot in 0..self.loaded {
             ensure!(
@@ -182,14 +267,14 @@ impl StagingLeases {
                 self.waves
             );
         }
-        let mut waits = Vec::new();
+        self.waits.clear();
         for slot in 0..self.loaded {
             if let [_, Some(reader)] = self.events.reclaim(slot)? {
-                waits.push(reader);
+                self.waits.push(reader);
             }
         }
         self.loaded = 0;
-        Ok(waits)
+        Ok(&self.waits)
     }
 }
 
@@ -270,48 +355,6 @@ impl Prefetch {
                 self.queued.insert(0, entry);
             }
         }
-    }
-
-    /// Queues layer L+1's streamed experts from its complete span plan; only whole cohorts are
-    /// queued and host-tier experts are skipped.
-    pub fn plan_layer(
-        &mut self,
-        current_layer: u32,
-        layer: u32,
-        plan: &SpanPlan,
-        host: &[bool],
-    ) -> Result<u32> {
-        ensure!(
-            layer
-                == current_layer
-                    .checked_add(1)
-                    .context("prefetch layer overflow")?,
-            "prefetch layer {layer} is not next after {current_layer}"
-        );
-        let mut queued = 0u32;
-        for cohort in &plan.staged {
-            let mut needed = 0u32;
-            for &expert in cohort {
-                ensure!(
-                    (expert as usize) < host.len(),
-                    "host mask holds {} experts, not expert {expert}",
-                    host.len()
-                );
-                if !host[expert as usize] && !self.contains(layer, expert) {
-                    needed += 1;
-                }
-            }
-            if self.entries() + needed > self.depth {
-                break;
-            }
-            for &expert in cohort {
-                if !host[expert as usize] {
-                    self.push(layer, expert, false)?;
-                }
-            }
-            queued += 1;
-        }
-        Ok(queued)
     }
 
     /// Queues one disk read. A demand that cannot be queued is deferred and admitted first when an
@@ -497,18 +540,26 @@ mod tests {
             h2d_bytes_per_second: 1e9,
         };
         // 192 B at 1 GB/s is 0.192 us, below every measured CPU cell here.
-        let plan = plan_span(&geometry, &counts, &resident, 4, 2, 2, &rates).unwrap();
-        assert_eq!(plan.resident, vec![0]);
-        assert_eq!(plan.staged, vec![vec![1, 2], vec![4, 5]]);
-        assert!(plan.cpu.is_empty());
-        assert_eq!(plan.streamed_bytes, 4 * 192);
-        assert_eq!(plan.waves, 2);
+        let mut plan = planner(&geometry, 2, &rates).unwrap();
+        plan.update(&counts, &resident, 4, 2, &rates).unwrap();
+        assert_eq!(plan.resident(), &[0]);
+        assert_eq!(plan.staged(), &[1, 2, 4, 5]);
+        assert_eq!(
+            plan.cohorts().collect::<Vec<_>>(),
+            vec![&[1, 2][..], &[4, 5][..]]
+        );
+        assert_eq!(plan.cohort_count(), 2);
+        assert!(plan.cpu().is_empty());
+        assert_eq!(plan.streamed_bytes(), 4 * 192);
+        assert_eq!(plan.waves(), 2);
         // 192 B at 100 B/s is 1.92 s, above every measured CPU cell here.
         rates.h2d_bytes_per_second = 100.0;
-        let plan = plan_span(&geometry, &counts, &resident, 4, 2, 2, &rates).unwrap();
-        assert!(plan.staged.is_empty());
-        assert_eq!(plan.cpu, vec![1, 2, 4, 5]);
-        assert_eq!(plan.streamed_bytes, 0);
+        let mut plan = planner(&geometry, 2, &rates).unwrap();
+        plan.update(&counts, &resident, 4, 2, &rates).unwrap();
+        assert!(plan.staged().is_empty());
+        assert_eq!(plan.cohort_count(), 0);
+        assert_eq!(plan.cpu(), &[1, 2, 4, 5]);
+        assert_eq!(plan.streamed_bytes(), 0);
     }
 
     #[test]
@@ -535,14 +586,17 @@ mod tests {
             service: &table(),
             h2d_bytes_per_second: 1e9,
         };
-        let plan = plan_span(&geometry, &counts, &resident, 16, 2, 2, &fast).unwrap();
-        assert_eq!(plan.staged, vec![vec![1]]);
-        assert!(plan.cpu.is_empty());
+        let mut plan = planner(&geometry, 2, &fast).unwrap();
+        plan.update(&counts, &resident, 16, 2, &fast).unwrap();
+        assert_eq!(plan.staged(), &[1]);
+        assert_eq!(plan.cohorts().collect::<Vec<_>>(), vec![&[1][..]]);
+        assert!(plan.cpu().is_empty());
         let slow = SpanRates {
             service: &table(),
             h2d_bytes_per_second: 100.0,
         };
-        let error = plan_span(&geometry, &counts, &resident, 16, 2, 2, &slow)
+        let error = plan
+            .update(&counts, &resident, 16, 2, &slow)
             .unwrap_err()
             .to_string();
         assert!(error.contains("exceed the measured rows extent"), "{error}");
@@ -557,18 +611,19 @@ mod tests {
             service: &table(),
             h2d_bytes_per_second: 1e9,
         };
-        assert!(plan_span(&geometry, &counts[..7], &resident, 4, 2, 2, &rates).is_err());
-        assert!(plan_span(&geometry, &counts, &resident[..7], 4, 2, 2, &rates).is_err());
-        assert!(plan_span(&geometry, &counts, &resident, 4, 8, 2, &rates).is_err());
-        assert!(plan_span(&geometry, &counts, &resident, 4, 2, 0, &rates).is_err());
-        let plan = plan_span(&geometry, &counts, &resident, 4, 2, 2, &rates).unwrap();
-        assert!(plan.resident.is_empty() && plan.staged.is_empty() && plan.cpu.is_empty());
-        assert_eq!(plan.waves, 2);
+        let mut plan = planner(&geometry, 2, &rates).unwrap();
+        assert!(plan.update(&counts[..7], &resident, 4, 2, &rates).is_err());
+        assert!(plan.update(&counts, &resident[..7], 4, 2, &rates).is_err());
+        assert!(plan.update(&counts, &resident, 4, 8, &rates).is_err());
+        plan.update(&counts, &resident, 4, 2, &rates).unwrap();
+        assert!(plan.resident().is_empty() && plan.staged().is_empty() && plan.cpu().is_empty());
+        assert_eq!(plan.waves(), 2);
     }
 
     #[test]
     fn staging_leases_pin_a_cohort_through_every_wave() -> Result<()> {
-        let mut leases = StagingLeases::new(3, 2)?;
+        let mut leases = StagingLeases::new(3)?;
+        leases.reset(2)?;
         let error = leases.record_wave(0, 10).unwrap_err().to_string();
         assert!(error.contains("outside the loaded cohort"), "{error}");
         leases.load(&[7, 8, 9], 1)?;
@@ -583,11 +638,7 @@ mod tests {
             leases.record_wave(slot, 20 + u64::from(slot))?;
         }
         let waits = leases.release()?;
-        assert_eq!(
-            waits,
-            vec![20, 21, 22],
-            "the last reader event per slot wins"
-        );
+        assert_eq!(waits, &[20, 21, 22], "the last reader event per slot wins");
         leases.load(&[1, 2], 30)?;
         let error = leases.record_wave(2, 31).unwrap_err().to_string();
         assert!(error.contains("outside the loaded cohort 2"), "{error}");
@@ -596,29 +647,19 @@ mod tests {
 
     #[test]
     fn staging_leases_validate_cohorts_events_and_waves() {
-        assert!(StagingLeases::new(0, 1).is_err());
-        assert!(StagingLeases::new(1, 0).is_err());
-        let mut leases = StagingLeases::new(2, 1).unwrap();
+        assert!(StagingLeases::new(0).is_err());
+        let mut leases = StagingLeases::new(2).unwrap();
+        assert!(leases.reset(0).is_err());
+        assert!(leases.load(&[1], 1).is_err(), "waves are not set");
+        leases.reset(1).unwrap();
         assert!(leases.load(&[1, 2, 3], 1).is_err());
         assert!(leases.load(&[], 1).is_err());
         leases.load(&[1], 4).unwrap();
         leases.record_wave(0, 6).unwrap();
         assert!(leases.record_wave(1, 7).is_err());
         let waits = leases.release().unwrap();
-        assert_eq!(waits, vec![6]);
+        assert_eq!(waits, &[6]);
         assert!(leases.release().is_err());
-    }
-
-    fn plan(cohorts: Vec<Vec<u32>>) -> SpanPlan {
-        SpanPlan {
-            span_rows: 4,
-            wave_rows: 2,
-            waves: 2,
-            resident: Vec::new(),
-            staged: cohorts,
-            cpu: Vec::new(),
-            streamed_bytes: 0,
-        }
     }
 
     #[test]
@@ -715,24 +756,88 @@ mod tests {
         Ok(())
     }
 
+    fn planner(
+        geometry: &ExpertGeometry,
+        staging_slots: u32,
+        rates: &SpanRates<'_>,
+    ) -> Result<SpanPlan> {
+        SpanPlan::new(geometry, staging_slots, rates.service.worker_count()?)
+    }
+
     #[test]
-    fn prefetch_plans_only_the_next_layers_complete_cohorts() -> Result<()> {
-        let plan = plan(vec![vec![1, 2], vec![3, 4]]);
-        let mut host = vec![false; 8];
-        host[2] = true;
-        let mut prefetch = Prefetch::new(3, 4)?;
-        let error = prefetch
-            .plan_layer(5, 7, &plan, &host)
+    fn failed_update_leaves_the_previous_plan_intact() -> Result<()> {
+        let geometry = geometry();
+        let fast = SpanRates {
+            service: &table(),
+            h2d_bytes_per_second: 1e9,
+        };
+        let slow = SpanRates {
+            service: &table(),
+            h2d_bytes_per_second: 100.0,
+        };
+        let counts = [4u32, 1, 1, 0, 2, 1, 0, 0];
+        let resident = [true, false, false, false, false, false, false, false];
+        let mut plan = planner(&geometry, 2, &fast)?;
+        plan.update(&counts, &resident, 4, 2, &fast)?;
+        let snapshot = plan.clone();
+        let mut wide = counts;
+        wide[1] = 16;
+        let error = plan
+            .update(&wide, &resident, 4, 2, &slow)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("is not next after 5"), "{error}");
-        assert_eq!(prefetch.plan_layer(5, 6, &plan, &host)?, 2);
-        assert_eq!(prefetch.entries(), 3, "host-tier expert 2 is not queued");
+        assert!(error.contains("exceed the measured rows extent"), "{error}");
         assert_eq!(
-            prefetch.plan_layer(6, 7, &plan, &host)?,
-            0,
-            "no whole cohort fits"
+            plan, snapshot,
+            "a failed update must leave the previous plan intact"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn span_plan_update_reuses_its_buffers() -> Result<()> {
+        let geometry = geometry();
+        let rates = SpanRates {
+            service: &table(),
+            h2d_bytes_per_second: 1e9,
+        };
+        let counts_a = [4u32, 1, 1, 0, 2, 1, 0, 0];
+        let resident_a = [true, false, false, false, false, false, false, false];
+        let counts_b = [0u32, 1, 0, 0, 0, 0, 0, 0];
+        let resident_b = [false; 8];
+        let mut plan = planner(&geometry, 2, &rates)?;
+        plan.update(&counts_a, &resident_a, 4, 2, &rates)?;
+        let (resident, staged, cpu) = (
+            plan.resident().as_ptr(),
+            plan.staged().as_ptr(),
+            plan.cpu().as_ptr(),
+        );
+        assert_eq!(plan.resident(), &[0]);
+        assert_eq!(plan.staged(), &[1, 2, 4, 5]);
+        plan.update(&counts_b, &resident_b, 4, 2, &rates)?;
+        assert_eq!(plan.staged(), &[1]);
+        plan.update(&counts_a, &resident_a, 4, 2, &rates)?;
+        assert_eq!(plan.resident().as_ptr(), resident);
+        assert_eq!(plan.staged().as_ptr(), staged);
+        assert_eq!(plan.cpu().as_ptr(), cpu);
+        Ok(())
+    }
+
+    #[test]
+    fn staging_leases_release_reuses_its_wait_slice() -> Result<()> {
+        let mut leases = StagingLeases::new(2)?;
+        leases.reset(1)?;
+        leases.load(&[1, 2], 1)?;
+        leases.record_wave(0, 2)?;
+        leases.record_wave(1, 3)?;
+        let first = leases.release()?.as_ptr();
+        leases.reset(1)?;
+        leases.load(&[3, 4], 4)?;
+        leases.record_wave(0, 5)?;
+        leases.record_wave(1, 6)?;
+        let waits = leases.release()?;
+        assert_eq!(waits, &[5, 6]);
+        assert_eq!(waits.as_ptr(), first);
         Ok(())
     }
 }
