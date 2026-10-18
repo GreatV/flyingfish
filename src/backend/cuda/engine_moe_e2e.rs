@@ -84,6 +84,15 @@ impl Bounds {
             comparisons.len() == 4,
             "reference noise {case} needs four comparisons"
         );
+        let vision = case
+            .starts_with("image_")
+            .then(|| &noise["official_vision_implementation_propagation"]["cases"][case]);
+        if let Some(cell) = vision {
+            ensure!(
+                cell.is_object(),
+                "missing official vision propagation noise {case}"
+            );
+        }
         let mut layers = std::collections::BTreeMap::new();
         for layer in [0, 3, 6, 19, 39] {
             let key = format!("layer_{layer:02}_hidden_last8");
@@ -94,13 +103,20 @@ impl Bounds {
             if layer == 0 {
                 cells.push(&floor["fp32_layer0"]);
             }
+            if let Some(cell) = vision {
+                cells.push(&cell["layers"][&key]);
+            }
             layers.insert(layer, measured_bounds(&cells)?);
         }
         let cells = |key: &str| {
-            comparisons
+            let mut cells = comparisons
                 .values()
                 .map(|cell| &cell[key])
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            if let Some(cell) = vision {
+                cells.push(&cell[key]);
+            }
+            cells
         };
         let media = &manifest["image"]["media_reach_controls"];
         Ok(Self {
