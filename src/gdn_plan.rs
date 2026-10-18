@@ -65,9 +65,9 @@ pub const fn cw_p2_bytes(value_heads: u32, max_rows: u32) -> u64 {
 /// The chunkwise-P2 stage ABI: field order is the argument order in `kernels/gdn/gdn_cw_p2.cu`.
 #[derive(Copy, Clone)]
 pub struct P2StageArgs {
-    /// BF16 [M, 16, DK] key heads; the stages expand to the bound value heads.
+    /// h32: scaled FP32 [M,32,128]. h48: BF16 [M,16,128], expanded/scaled on load.
     pub q: u64,
-    /// BF16 [M, 16, DK] key heads.
+    /// h32: FP32 [M,32,128]. h48: BF16 [M,16,128], expanded on load.
     pub k: u64,
     /// BF16 [M, hv, 128] rows, `v_row_stride` elements apart.
     pub v: u64,

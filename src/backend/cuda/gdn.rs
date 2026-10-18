@@ -4,7 +4,7 @@
 //! dk = dv = 128, conv width 4, history width 3, chunk 32, FP32 tiles. Kernels are in `kernels/gdn/`.
 //!
 //! `run` issues the whole mixer between the `qkv`/`a`/`b` projections and the ungated
-//! `core_out` on one stream; Q/K norms and gates use common ops ([`CommonOpsRef`]).
+//! `core_out` on one stream; GdnSpec binds Q/K precision, and gates use [`CommonOpsRef`].
 //!
 //! `hist_update` is a separate launch after conv; conv blocks read `history[]` to seed their window.
 //!
@@ -170,8 +170,7 @@ pub(crate) struct GdnPlan {
     ws_p2: u64,
 }
 
-/// BF16 sources the P2 stages read: Q and K as 16 key heads each, V as the conv_out
-/// column window with row stride `v_row_stride` elements.
+/// Q/K precision follows GdnSpec; V is the BF16 conv_out column window at v_row_stride.
 #[derive(Copy, Clone)]
 pub(crate) struct P2Sources {
     pub q: u64,
@@ -378,7 +377,11 @@ impl GdnOps {
         let recurrent_mod = module("gdn_recurrent")?;
         let f_conv = conv.load_function("gdn_conv")?;
         let f_hist = conv.load_function("gdn_conv_hist_update")?;
-        let f_prep = prep_mod.load_function("gdn_prep_fp32")?;
+        let f_prep = prep_mod.load_function(if spec.qk_norm_fp32 {
+            "gdn_prep_l2_fp32"
+        } else {
+            "gdn_prep_fp32"
+        })?;
         let f_beta = prep_mod.load_function("gdn_beta_widen")?;
         let f_chunked = chunked_mod.load_function("gdn_chunked_core_v1")?;
         let f_recurrent = recurrent_mod.load_function("gdn_recurrent_core_v2")?;
@@ -434,7 +437,11 @@ impl GdnOps {
         // Grids derive from the bound rows, never from device valid_rows.
         let (prep_cfg, beta_cfg, conv_cfg) = prep_grids(
             LaunchConfig {
-                grid_dim: (DV.div_ceil(PREP_THREADS), spec.hv, 1),
+                grid_dim: (
+                    DV.div_ceil(PREP_THREADS),
+                    if spec.qk_norm_fp32 { spec.hk } else { spec.hv },
+                    1,
+                ),
                 block_dim: (PREP_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             },
@@ -606,22 +613,24 @@ impl GdnOps {
                     .launch(plan.hist_cfg)?;
             }
         }
-        // common l2_heads on Q and K only (V is not normed, ABI §5), read as conv_out column
-        // windows of 16 key heads each.
-        plan.common.norm.l2_heads(
-            stream,
-            dom,
-            as3(conv_ptr, rows, plan.spec.hk, cd, span, q_off)?,
-            &mut q_bf16,
-            l2_eps,
-        )?;
-        plan.common.norm.l2_heads(
-            stream,
-            dom,
-            as3(conv_ptr, rows, plan.spec.hk, cd, span, k_off)?,
-            &mut k_bf16,
-            l2_eps,
-        )?;
+        if !plan.spec.qk_norm_fp32 {
+            // common l2_heads on Q and K only (V is not normed, ABI §5), read as conv_out column
+            // windows of 16 key heads each.
+            plan.common.norm.l2_heads(
+                stream,
+                dom,
+                as3(conv_ptr, rows, plan.spec.hk, cd, span, q_off)?,
+                &mut q_bf16,
+                l2_eps,
+            )?;
+            plan.common.norm.l2_heads(
+                stream,
+                dom,
+                as3(conv_ptr, rows, plan.spec.hk, cd, span, k_off)?,
+                &mut k_bf16,
+                l2_eps,
+            )?;
+        }
         // common gdn_gates: beta BF16, g FP32.
         super::ops::GateOps::gdn_gates_with(
             &plan.kernels.gate,
@@ -647,11 +656,16 @@ impl GdnOps {
                 .arg(&meta.ptr)
                 .launch(plan.beta_cfg)?;
             // Q/K expand to value heads; Q is scaled by 1/sqrt(dk).
-            if !plan.cw_p2 {
+            if plan.spec.qk_norm_fp32 || !plan.cw_p2 {
+                let (q, k) = if plan.spec.qk_norm_fp32 {
+                    (conv_ptr + q_off, conv_ptr + k_off)
+                } else {
+                    (q_bf16.0.ptr, k_bf16.0.ptr)
+                };
                 stream
                     .launch_builder(&plan.kernels.prep)
-                    .arg(&q_bf16.0.ptr)
-                    .arg(&k_bf16.0.ptr)
+                    .arg(&q)
+                    .arg(&k)
                     .arg(&v_bf16.ptr)
                     .arg(&q_fp32.0.ptr)
                     .arg(&k_fp32.0.ptr)
@@ -678,8 +692,16 @@ impl GdnOps {
                         meta,
                         scratch,
                         P2Sources {
-                            q: q_bf16.0.ptr,
-                            k: k_bf16.0.ptr,
+                            q: if plan.spec.qk_norm_fp32 {
+                                q_fp32.0.ptr
+                            } else {
+                                q_bf16.0.ptr
+                            },
+                            k: if plan.spec.qk_norm_fp32 {
+                                k_fp32.0.ptr
+                            } else {
+                                k_bf16.0.ptr
+                            },
                             v: v_bf16.ptr,
                             v_row_stride: cd,
                         },
