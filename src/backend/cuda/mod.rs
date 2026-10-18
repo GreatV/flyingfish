@@ -97,5 +97,27 @@ impl Device {
     }
 }
 
+/// γ_n = n·u / (1 − n·u).
+pub(crate) fn gamma(n: usize, u: f64) -> f64 {
+    let nu = n as f64 * u;
+    nu / (1.0 - nu)
+}
+
+/// Half a BF16 ulp at magnitude `x`: 2^(⌊log2 x⌋ − 8); 0 at `x <= 0`.
+pub(crate) fn bf16_half_ulp(x: f64) -> f64 {
+    if x > 0.0 {
+        2f64.powi(x.log2().floor() as i32 - 8)
+    } else {
+        0.0
+    }
+}
+
+/// Max |a − b| relative to the compared magnitude, for two chains that each apply `roundings`
+/// BF16 roundings and FP32 reductions of the given lengths: 2·(roundings·2^-8 + Σ γ_K(2^-24)).
+pub(crate) fn bf16_chain_bound(roundings: u32, reductions: &[usize]) -> f64 {
+    let accumulation: f64 = reductions.iter().map(|&k| gamma(k, 2f64.powi(-24))).sum();
+    2.0 * (f64::from(roundings) * 2f64.powi(-8) + accumulation)
+}
+
 #[cfg(test)]
 mod q38_tests;

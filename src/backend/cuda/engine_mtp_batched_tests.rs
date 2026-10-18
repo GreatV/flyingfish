@@ -659,7 +659,7 @@ fn q38_mtp_batch_chain_gpu() -> Result<()> {
     }
     receipt(
         "m2b-chain-export",
-        serde_json::json!({"result":"EXPORTED_PENDING_DREF","cases":cases,"eager_graph_tokens":"BIT_EQUAL","rule":"DRef G7 ARGMAX/NEAR-TIE/DEFECT T=1.0; zero DEFECT required"}),
+        serde_json::json!({"result":"EXPORTED_PENDING_DREF","cases":cases,"eager_graph_tokens":"BIT_EQUAL"}),
     )
 }
 

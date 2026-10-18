@@ -707,7 +707,7 @@ impl FullAttentionPlan {
 mod tests {
     //! GPU probe of `workspace` -> `prepare` -> `run` through the real launch path, including the common `NormOps`.
     use super::*;
-    use crate::backend::cuda::Device;
+    use crate::backend::cuda::{Device, bf16_chain_bound};
     use crate::op_contract::SequenceMeta;
     use cudarc::driver::{CudaSlice, DevicePtr};
 
@@ -758,10 +758,6 @@ mod tests {
     const THETA: f32 = 1.0e7;
     /// 1/sqrt(256), the scale the kernel applies to the QK scores.
     const SCALE: f32 = 0.0625;
-
-    /// One bf16 ulp, relative to a value's own magnitude.
-    const BF16_ULP: f32 = 1.0 / 256.0;
-    const BINDER_BOUND: f32 = 8.0 * BF16_ULP;
 
     /// Deterministic xorshift.
     struct Rng(u64);
@@ -974,7 +970,7 @@ mod tests {
         oracle_mismatches: usize,
     }
 
-    /// One `workspace` -> `prepare` -> `run` cycle, checked against the reference at `BINDER_BOUND`.
+    /// One `workspace` -> `prepare` -> `run` cycle, checked against the reference at `bf16_chain_bound`.
     fn run_shape(device: &Device, case: Case<'_>) -> Result<RunDump> {
         let Case {
             spec,
@@ -1254,7 +1250,7 @@ mod tests {
         }
         stream.synchronize()?;
 
-        // The gate split is checked bitwise; the Q path under `BINDER_BOUND`.
+        // The gate split is checked bitwise; the Q path and core_out under `bf16_chain_bound`.
         let gate = stream.clone_dtoh(&dev_gate)?;
         let q_roped = stream.clone_dtoh(&dev_q)?;
         let mut oracle_mismatches = 0;
@@ -1317,13 +1313,18 @@ mod tests {
                 .map(|(a, b)| (a.to_f32() - b).abs())
                 .fold(0f32, f32::max)
                 / q_scale;
-            eprintln!("P1D_BINDER_Q rel={q_rel:e} bound={BINDER_BOUND:e}");
+            // BF16 roundings: RMS norm, RoPE. FP32 reduction: the RMS sum over D.
+            let q_bound = bf16_chain_bound(2, &[d]) as f32;
+            eprintln!("P1D_BINDER_Q rel={q_rel:e} bound={q_bound:e}");
             ensure!(
-                q_rel <= BINDER_BOUND,
-                "Q norm + partial RoPE differs: rel={q_rel:e} bound={BINDER_BOUND:e}"
+                q_rel <= q_bound,
+                "Q norm + partial RoPE differs: rel={q_rel:e} bound={q_bound:e}"
             );
             let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-12);
-            let bound = BINDER_BOUND;
+            let keys = (prefix + valid_rows) as usize;
+            // BF16 roundings: Q norm, Q RoPE, K norm, K RoPE, P, O. FP32 reductions: Q and K RMS
+            // sums and QK over D, softmax sum and PV over the visible keys.
+            let bound = bf16_chain_bound(6, &[d, d, d, keys, keys]) as f32;
             let worst = want
                 .iter()
                 .enumerate()

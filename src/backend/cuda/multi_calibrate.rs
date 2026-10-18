@@ -471,6 +471,10 @@ fn measure(
     let mut q = s.clone_htod(&q_values)?;
     let k = s.clone_htod(&random(capacities[selected] * c.kv_dim(), 1))?;
     let v_values = random(capacities[selected] * c.kv_dim(), 2);
+    let v_max = v_values
+        .iter()
+        .map(|v| v.to_f32().abs() as f64)
+        .fold(0f64, f64::max);
     let v = s.clone_htod(&v_values)?;
     let mut out = s.alloc_zeros::<bf16>(rows * c.hidden_size)?;
     let mut length = s.alloc_zeros::<i32>(1)?;
@@ -587,23 +591,17 @@ fn measure(
                 actual.iter().all(|x| x.is_finite()),
                 "nonfinite multi attention calibration output"
             );
-            let max_error = actual
-                .iter()
-                .enumerate()
-                .map(|(i, x)| {
-                    let row = i / c.hidden_size;
-                    let head = (i % c.hidden_size)
-                        / c.head_dim
-                        / (c.num_attention_heads / c.num_key_value_heads);
-                    (x.to_f32() as f64
-                        - expected
-                            [(row * c.num_key_value_heads + head) * c.head_dim + i % c.head_dim])
-                        .abs()
-                })
-                .fold(0f64, f64::max);
+            let (max_error, ratio) = calibrate::uniform_attention_error(
+                c,
+                &actual,
+                &expected,
+                plan.launch.chunk,
+                l + rows,
+                v_max,
+            );
             ensure!(
-                max_error <= 0.0001,
-                "multi attention uniform reference mismatch: {max_error}"
+                ratio <= 1.0,
+                "multi attention uniform reference mismatch: max_error={max_error} error/bound={ratio}"
             );
             s.memcpy_htod(&q_values, &mut q)?;
             s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;

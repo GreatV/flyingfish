@@ -1,5 +1,5 @@
 use super::{
-    Device, blas, calibrate,
+    Device, bf16_chain_bound, blas, calibrate,
     closure::Closure,
     ops::{Ops, grid},
 };
@@ -161,6 +161,8 @@ impl Environment {
         launch(&LinearImpl::CublasLt(0), &mut out)?;
         let reference = s.clone_dtoh(&out)?;
         let signal: f64 = reference.iter().map(|v| (v.to_f32() as f64).powi(2)).sum();
+        // One BF16 output rounding and one FP32 reduction over `input` per GEMM.
+        let bound = bf16_chain_bound(1, &[shape.input]);
         let mut rel_rmse = 0.0f64;
         for implementation in (1..blas::LT_CANDIDATES.min(algo_count))
             .map(LinearImpl::CublasLt)
@@ -179,8 +181,8 @@ impl Environment {
                 .sum();
             let candidate = (error / signal.max(1e-30)).sqrt();
             ensure!(
-                candidate <= 0.02,
-                "{implementation:?} calibration rel_rmse={candidate} exceeds 0.02 for {shape:?}"
+                candidate <= bound,
+                "{implementation:?} calibration rel_rmse={candidate} exceeds {bound} for {shape:?}"
             );
             rel_rmse = rel_rmse.max(candidate);
         }
@@ -295,7 +297,7 @@ fn check(cache: &Cache, key: &CacheKey, shape: LinearShape) -> Result<()> {
     );
     ensure!(
         cache.rel_rmse.is_finite()
-            && cache.rel_rmse <= 0.02
+            && cache.rel_rmse <= bf16_chain_bound(1, &[shape.input])
             && cache.rel_rmse >= 0.0
             && cache.trials.iter().all(|t| t.samples >= 12
                 && t.median_us.is_finite()

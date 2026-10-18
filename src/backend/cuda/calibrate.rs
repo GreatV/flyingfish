@@ -362,6 +362,35 @@ pub(super) fn percentile(values: &[f64], q: f64) -> f64 {
     v[lo] + (v[hi] - v[lo]) * (k - lo as f64)
 }
 
+/// Uniform-attention max |actual − expected| and max error / bound over elements.
+/// Bound: a + half_ulp_bf16(|expected| + a), a = γ_{chunk + ⌈keys/chunk⌉}(2^-23)·max|V| for the
+/// split-KV sums of at most `chunk` and ⌈keys/chunk⌉ FP32 terms, the reciprocal and the product.
+pub(super) fn uniform_attention_error(
+    c: &Config,
+    actual: &[bf16],
+    expected: &[f64],
+    chunk: usize,
+    keys: usize,
+    v_max: f64,
+) -> (f64, f64) {
+    let accumulation = super::gamma(chunk + keys.div_ceil(chunk), 2f64.powi(-23)) * v_max;
+    actual
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let row = i / c.hidden_size;
+            let head =
+                (i % c.hidden_size) / c.head_dim / (c.num_attention_heads / c.num_key_value_heads);
+            let e = expected[(row * c.num_key_value_heads + head) * c.head_dim + i % c.head_dim];
+            let error = (v.to_f32() as f64 - e).abs();
+            (
+                error,
+                error / (accumulation + super::bf16_half_ulp(e.abs() + accumulation)),
+            )
+        })
+        .fold((0f64, 0f64), |(a, r), (e, q)| (a.max(e), r.max(q)))
+}
+
 enum Candidate {
     Decode(Attention),
     Multi(Verification),
@@ -427,6 +456,10 @@ fn measure(
     let capacities = CAPACITIES.map(|n| n + query_rows.unwrap_or(0));
     let k = s.clone_htod(&random(capacities[selected] * c.kv_dim(), 1))?;
     let v_values = random(capacities[selected] * c.kv_dim(), 2);
+    let v_max = v_values
+        .iter()
+        .map(|v| v.to_f32().abs() as f64)
+        .fold(0f64, f64::max);
     let v = s.clone_htod(&v_values)?;
     let mut out = s.alloc_zeros::<bf16>(rows * c.hidden_size)?;
     let mut length = s.alloc_zeros::<i32>(1)?;
@@ -542,23 +575,17 @@ fn measure(
                 actual.iter().all(|v| v.is_finite()),
                 "nonfinite calibration output"
             );
-            let max_error = actual
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let qi = i / c.hidden_size;
-                    let head = (i % c.hidden_size)
-                        / c.head_dim
-                        / (c.num_attention_heads / c.num_key_value_heads);
-                    (v.to_f32() as f64
-                        - expected
-                            [(qi * c.num_key_value_heads + head) * c.head_dim + i % c.head_dim])
-                        .abs()
-                })
-                .fold(0f64, f64::max);
+            let (max_error, ratio) = uniform_attention_error(
+                c,
+                &actual,
+                &expected,
+                chunk,
+                l + query_rows.unwrap_or(0),
+                v_max,
+            );
             ensure!(
-                max_error <= 0.0001,
-                "calibration uniform-attention reference mismatch: {max_error}"
+                ratio <= 1.0,
+                "calibration uniform-attention reference mismatch: max_error={max_error} error/bound={ratio}"
             );
             s.memcpy_htod(&queries, &mut q)?;
             s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
