@@ -8,6 +8,7 @@ pub struct Ops {
     pub embed_rmsnorm: CudaFunction,
     pub add_norm: CudaFunction,
     pub add_norm_capture: CudaFunction,
+    norm_capture: CudaFunction,
     pub kv_write: CudaFunction,
     pub rope_kv: CudaFunction,
     pub act: CudaFunction,
@@ -57,6 +58,7 @@ impl Ops {
             embed_rmsnorm: embed_rmsnorm.load_function("embed_rmsnorm")?,
             add_norm: norm.load_function("add_rmsnorm")?,
             add_norm_capture: add_norm_capture.load_function("add_rmsnorm_capture")?,
+            norm_capture: cubin::module(ctx, "q38_common")?.load_function("q38_norm_capture")?,
             kv_write: rope.load_function("kv_write")?,
             rope_kv: rope_kv.load_function("rope_kv")?,
             act: act.load_function("silu_mul")?,
@@ -263,14 +265,48 @@ impl Ops {
         } else {
             (0, 0, x.0.shape[0])
         };
-        let slices = if matches!(options.mode, RmsMode::ZeroCentered) && hidden == 5120 && rows > 16
-        {
-            4
-        } else {
-            1
-        };
         let pitch = i32::try_from(u64::from(taps) * u64::from(hidden))?;
         let column = i32::try_from(u64::from(slot) * u64::from(hidden))?;
+        if matches!(options.mode, RmsMode::ZeroCentered) {
+            let slices = norm_slices_per_block(
+                rows,
+                &x.0,
+                weight.ptr,
+                residual.ptr,
+                residual.stride,
+                &y.0,
+                4,
+            );
+            unsafe {
+                stream
+                    .launch_builder(&self.norm_capture)
+                    .arg(&x.0.ptr)
+                    .arg(&weight.ptr)
+                    .arg(&residual.ptr)
+                    .arg(&y.0.ptr)
+                    .arg(&meta)
+                    .arg(&base)
+                    .arg(&rows)
+                    .arg(&1u32)
+                    .arg(&hidden)
+                    .arg(&x.0.stride[0])
+                    .arg(&x.0.stride[1])
+                    .arg(&x.0.stride[2])
+                    .arg(&y.0.stride[0])
+                    .arg(&y.0.stride[1])
+                    .arg(&y.0.stride[2])
+                    .arg(&residual.stride[0])
+                    .arg(&residual.stride[1])
+                    .arg(&residual.stride[2])
+                    .arg(&4i32)
+                    .arg(&options.eps)
+                    .arg(&capture.0.ptr)
+                    .arg(&u64::try_from(pitch)?)
+                    .arg(&u64::try_from(column)?)
+                    .launch(grid(rows.div_ceil(slices) as usize, 256))?;
+            }
+            return Ok(());
+        }
         unsafe {
             stream
                 .launch_builder(&self.add_norm_capture)
@@ -288,7 +324,7 @@ impl Ops {
                 .arg(&(options.mode as i32))
                 .arg(&meta)
                 .arg(&i32::try_from(base)?)
-                .launch(grid(rows.div_ceil(slices) as usize, 256))?;
+                .launch(grid(rows as usize, 256))?;
         }
         Ok(())
     }

@@ -1,6 +1,8 @@
 use super::{
     Device,
-    attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
+    attention_d256::{
+        AttentionBindings, FullAttentionOps, FullAttentionPlan, MASK_LEN, PositionBindings,
+    },
     blas::Blas,
     contracts::{Scratch, SeqRef, TensorMut, view},
     copy::{Rect, columns},
@@ -54,7 +56,7 @@ impl BlockAttention {
             max_rows: rows,
             capacity: u32::try_from(draft.capacity)?,
             key_chunk: u32::try_from(key_chunk)?,
-            causal: 1,
+            causal: 0,
         };
         let spec = FullAttentionSpec {
             hq: u32::try_from(c.num_attention_heads)?,
@@ -66,12 +68,12 @@ impl BlockAttention {
             rope_theta: c.rope_parameters.rope_theta,
         };
         let request = FullAttentionOps::workspace(&spec, limits)?;
-        let live = if rows == 64 {
+        let live = if rows == MASK_LEN {
             u64::MAX
         } else {
             (1u64 << rows) - 1
         };
-        let mask = s.clone_htod(&std::array::from_fn::<_, 64, _>(|row| {
+        let mask = s.clone_htod(&std::array::from_fn::<_, { MASK_LEN as usize }, _>(|row| {
             if row < c.block_size { live } else { 0 }
         }))?;
         let positions = s.alloc_zeros::<i32>(c.block_size * 3)?;
@@ -108,7 +110,7 @@ impl BlockAttention {
                 v_cache: TensorMut(view(&cache.v, s, 0, cache_shape, cache_stride)?),
                 q_norm: view(&layer.q_norm, s, 0, [head], [1])?,
                 k_norm: view(&layer.k_norm, s, 0, [head], [1])?,
-                causal_mask: view(&mask, s, 0, [64], [1])?,
+                causal_mask: view(&mask, s, 0, [MASK_LEN], [1])?,
                 positions: PositionBindings::Axes(view(&positions, s, 0, [rows, 3], [3, 1])?),
             };
             layers.push(FullAttentionOps::prepare_reusing(
@@ -414,11 +416,12 @@ impl Draft {
             super::cubin::module(&d.ctx, "rope")?.load_function("draft_qknorm_rope_kv")?;
         let norm_module = super::cubin::module(&d.ctx, "norm")?;
         let rope_module = super::cubin::module(&d.ctx, "rope")?;
-        let (norm_name, add_norm_name, rope_name) = if config.head_dim == 256 {
-            ("rms_norm_bf16", "add_rmsnorm_bf16", "rope")
-        } else {
-            ("rms_norm", "add_rmsnorm", "rope_float")
-        };
+        let (norm_name, add_norm_name, rope_name) =
+            if score_rounding == super::markov::ScoreRounding::F32 {
+                ("rms_norm_bf16", "add_rmsnorm_bf16", "rope")
+            } else {
+                ("rms_norm", "add_rmsnorm", "rope_float")
+            };
         Ok(Self {
             markov: None,
             score_rounding,
@@ -1129,7 +1132,10 @@ impl Draft {
                 (None, None)
             };
             let bias_row = bias + (row * c.vocab_size * 2) as u64;
-            let score_row = combined.map_or(bias_row, |ptr| ptr + (row * c.vocab_size * 4) as u64);
+            let score_row = combined.map_or_else(
+                || if trace.is_some() { bias_row } else { 0 },
+                |ptr| ptr + (row * c.vocab_size * 4) as u64,
+            );
             unsafe {
                 s.launch_builder(&self.sum_argmax)
                     .arg(
@@ -1149,24 +1155,26 @@ impl Draft {
                 s.memcpy_dtod(&self.forced_tokens.slice(row..row + 1), &mut self.token)?;
             }
         }
-        unsafe {
-            s.launch_builder(&self.concat_dot_sigmoid)
-                .arg(&self.n)
-                .arg(&self.weights.w1)
-                .arg(&self.ids)
-                .arg(if forced.is_some() {
-                    &self.forced_tokens
-                } else {
-                    &self.tokens
-                })
-                .arg(&self.weights.confidence)
-                .arg(&self.weights.confidence_bias)
-                .arg(&mut self.confidence_values)
-                .arg(&(block_rows as i32))
-                .arg(&(h as i32))
-                .arg(&(c.markov_rank as i32))
-                .arg(&(c.vocab_size as i32))
-                .launch(grid(block_rows, 256))?;
+        if trace.is_some() {
+            unsafe {
+                s.launch_builder(&self.concat_dot_sigmoid)
+                    .arg(&self.n)
+                    .arg(&self.weights.w1)
+                    .arg(&self.ids)
+                    .arg(if forced.is_some() {
+                        &self.forced_tokens
+                    } else {
+                        &self.tokens
+                    })
+                    .arg(&self.weights.confidence)
+                    .arg(&self.weights.confidence_bias)
+                    .arg(&mut self.confidence_values)
+                    .arg(&(block_rows as i32))
+                    .arg(&(h as i32))
+                    .arg(&(c.markov_rank as i32))
+                    .arg(&(c.vocab_size as i32))
+                    .launch(grid(block_rows, 256))?;
+            }
         }
         let proposals = if matches!(output, Output::Tokens) {
             s.clone_dtoh(&self.tokens)?
@@ -2106,6 +2114,7 @@ mod tests {
                 )?;
             }
             rejected_control += usize::from(rejected > 0);
+            defects += usize::from(rejected == 0);
             println!(
                 "T19_FIXTURE fixture={name} free_proposal_mismatches={} wrong_position_violations={rejected} defects={defects}",
                 free.iter()
@@ -2114,7 +2123,6 @@ mod tests {
                     .count()
             );
         }
-        defects += usize::from(rejected_control == 0);
         println!(
             "T19_DRAFT fixtures=6 graph_replays={graph_replays} native_markov_requests={native_requests} wrong_position_rejected={rejected_control} reclassified_scored_cells={reclassified_cells} defects={defects} {}",
             if defects == 0 { "PASS" } else { "DEFECT" }

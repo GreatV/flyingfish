@@ -24,7 +24,7 @@ const PHASE2_THREADS: u32 = D;
 const PREP_THREADS: u32 = 256;
 /// `(MT + 2*KT) * (D + 8) * 2 + 64*8` from `kernels/tcmqa_d256.cu`.
 const PHASE1_SMEM: u32 = 68096;
-const MASK_LEN: u32 = 64;
+pub(super) const MASK_LEN: u32 = 64;
 
 fn rotary_query_extent(spec: &FullAttentionSpec, rows: u32) -> Result<u32> {
     let queries = spec
@@ -69,7 +69,7 @@ pub(crate) struct AttentionBindings {
     /// Zero-centred Q/K norm weights, `[256]`.
     pub q_norm: Tensor<bf16, 1>,
     pub k_norm: Tensor<bf16, 1>,
-    /// Caller-prebuilt causal triangle, `u64[64]`, `mask[63] == u64::MAX`.
+    /// Caller-prebuilt key visibility bits for each query, `u64[64]`.
     pub causal_mask: Tensor<u64, 1>,
     /// Coordinate source for the RoPE stage.
     pub positions: PositionBindings,
@@ -180,7 +180,7 @@ impl FullAttentionPlan {
 pub(crate) struct FullAttentionOps;
 
 fn check_limits(limits: AttentionLimits) -> Result<()> {
-    ensure!(limits.causal == 1, "full attention requires causal=1");
+    ensure!(limits.causal <= 1, "invalid full attention causal mode");
     ensure!(
         limits.capacity > 0 && limits.capacity <= i32::MAX as u32,
         "invalid attention capacity"
@@ -220,6 +220,10 @@ fn check_bindings(
     limits: AttentionLimits,
     spec: &FullAttentionSpec,
 ) -> Result<()> {
+    ensure!(
+        limits.causal == 1 || spec.rotary_dim == D,
+        "bidirectional attention requires full rotary geometry"
+    );
     if let Some(cache) = b.compact {
         ensure!(
             spec.hkv == 4,
@@ -847,13 +851,14 @@ mod tests {
         prefix: i32,
         valid_rows: i32,
         capacity: i32,
+        causal: i32,
     ) -> Result<(CudaSlice<i32>, SeqRef)> {
         let m = SequenceMeta {
             prefix,
             valid_rows,
             key_count: prefix + valid_rows,
             capacity,
-            causal: 1,
+            causal,
             reserved: [0; 3],
         };
         m.validate(capacity as u32, valid_rows as u32)?;
@@ -1077,7 +1082,7 @@ mod tests {
             max_rows,
             capacity,
             key_chunk,
-            causal: 1,
+            causal: u32::from(!full),
         };
         let request = FullAttentionOps::workspace(&spec, limits)?;
         ensure!(request.alignment == 256, "workspace alignment changed");
@@ -1214,8 +1219,13 @@ mod tests {
             }
         }
         let dev_packed = stream.clone_htod(&packed)?;
-        let (_metadata, meta_ref) =
-            meta_device(stream, prefix as i32, valid_rows as i32, capacity as i32)?;
+        let (_metadata, meta_ref) = meta_device(
+            stream,
+            prefix as i32,
+            valid_rows as i32,
+            capacity as i32,
+            limits.causal as i32,
+        )?;
         let scratch = stream.alloc_zeros::<u8>(scratch_bytes)?;
         let (scratch_ptr, _hold) = scratch.device_ptr(stream);
 
@@ -1460,7 +1470,7 @@ mod tests {
                 .map(|(a, b)| (a.to_f32() - b).abs())
                 .fold(0f32, f32::max)
                 / q_scale;
-            // BF16 roundings: RMS norm, RoPE. FP32 reduction: the RMS sum over D.
+            // Full rotary: two RMS rounds, cos/sin, two products and the sum; partial rotary: RMS and RoPE.
             let q_bound = bf16_chain_bound(if full { 6 } else { 2 }, &[d]) as f32;
             eprintln!("P1D_BINDER_Q rel={q_rel:e} bound={q_bound:e}");
             if full {
@@ -1473,8 +1483,8 @@ mod tests {
             }
             let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-12);
             let keys = (prefix + valid_rows) as usize;
-            // BF16 roundings: Q norm, Q RoPE, K norm, K RoPE, P, O. FP32 reductions: Q and K RMS
-            // sums and QK over D, softmax sum and PV over the visible keys.
+            // Full rotary: six rounds on each of Q/K, P and O; partial rotary: two on Q/K, P and O.
+            // FP32 reductions: Q/K RMS and QK over D; softmax and PV over visible keys.
             let bound = bf16_chain_bound(if full { 14 } else { 6 }, &[d, d, d, keys, keys]) as f32;
             let worst = want
                 .iter()

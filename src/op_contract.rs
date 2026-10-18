@@ -18,7 +18,7 @@ impl SequenceMeta {
             "invalid capacity"
         );
         ensure!(
-            self.capacity == capacity as i32 && self.causal == 1,
+            self.capacity == capacity as i32 && [0, 1].contains(&self.causal),
             "sequence plan mismatch"
         );
         ensure!(

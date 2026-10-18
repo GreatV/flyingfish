@@ -127,7 +127,7 @@ fn native_geometry_head_ops_gpu() -> Result<()> {
             bf16::from_f32((products.iter().sum::<f64>() + f64::from(bias.to_f32())) as f32)
                 .to_f32();
         confidence.push((
-            1.0 / (1.0 + (-f64::from(logit)).exp()),
+            f64::from(bf16::from_f32((1.0 / (1.0 + (-f64::from(logit)).exp())) as f32).to_f32()),
             0.25 * bf16_chain_bound(1, &[width + rank])
                 * (products.iter().map(|v| v.abs()).sum::<f64>() + f64::from(bias.to_f32()).abs())
                 + gamma(5, 2f64.powi(-24)),
@@ -301,6 +301,35 @@ fn native_geometry_head_ops_gpu() -> Result<()> {
             println!(
                 "SUM_ARGMAX_ROUNDING vocab={test_vocab} offset={offset} rounding={rounding:?} expected={expected} actual={actual} guard_mismatches={guard_mismatches} score_mismatches={score_mismatches}"
             );
+            s.memcpy_htod(&guarded_bias, &mut bf16_scores)?;
+            s.memcpy_htod(&vec![f32::NAN; vocab + 1], &mut f32_scores)?;
+            let bias = bf16_scores.slice(live.clone());
+            unsafe {
+                s.launch_builder(&sum)
+                    .arg(&simple_base.slice(live.clone()))
+                    .arg(&bias)
+                    .arg(&0u64)
+                    .arg(&mut token)
+                    .arg(&(test_vocab as i32))
+                    .arg(&(rounding as i32))
+                    .launch(grid(1, 1024))?;
+            }
+            let actual = s.clone_dtoh(&token)?[0];
+            let bias_mismatches = s
+                .clone_dtoh(&bf16_scores)?
+                .iter()
+                .zip(&guarded_bias)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let output_mismatches = s
+                .clone_dtoh(&f32_scores)?
+                .iter()
+                .filter(|v| !v.is_nan())
+                .count();
+            defects += usize::from(actual != expected) + bias_mismatches + output_mismatches;
+            println!(
+                "SUM_ARGMAX_NO_WRITE vocab={test_vocab} offset={offset} rounding={rounding:?} expected={expected} actual={actual} bias_mismatches={bias_mismatches} output_mismatches={output_mismatches}"
+            );
         }
     }
     let device_hidden = s.clone_htod(&hidden)?;
@@ -344,6 +373,10 @@ fn native_geometry_head_ops_gpu() -> Result<()> {
         .filter(|(a, (b, bound))| (f64::from(**a) - b).abs() > *bound)
         .count();
     defects += usize::from(!eager[rows].is_nan());
+    defects += eager[..rows]
+        .iter()
+        .filter(|v| bf16::from_f32(**v).to_f32().to_bits() != v.to_bits())
+        .count();
     s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
     let run = execute();
     let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));

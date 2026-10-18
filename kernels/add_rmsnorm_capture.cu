@@ -194,125 +194,6 @@ __device__ __forceinline__ void add_rmsnorm_capture_row(const bf16* __restrict__
     }
 }
 
-__device__ __forceinline__ float zero_scale(float a, float inv, bf16 w) {
-    return __fmul_rn(__fmul_rn(a, inv), __fadd_rn(1.0f, __bfloat162float(w)));
-}
-
-__device__ __forceinline__ float zero_inv(float sum, int hidden, float eps) {
-    return rsqrtf(__fadd_rn(sum / float(hidden), eps));
-}
-
-__device__ __forceinline__ void zero_row(
-    const bf16* x, const bf16* res, const bf16* w, bf16* y,
-    bf16* res_out, bf16* cap, int hidden, float eps) {
-    __shared__ float sums[8];
-    float values[20];
-    float sum = 0.0f;
-    const int count = hidden / 256;
-    for (int c = 0; c < count; ++c) {
-        int d = c * 256 + threadIdx.x;
-        bf16 value = __hadd(res[d], x[d]);
-        res_out[d] = value;
-        cap[d] = value;
-        values[c] = __bfloat162float(value);
-        sum = __fadd_rn(sum, __fmul_rn(values[c], values[c]));
-    }
-    for (int delta = 16; delta; delta /= 2)
-        sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
-    if ((threadIdx.x & 31) == 0) sums[threadIdx.x >> 5] = sum;
-    __syncthreads();
-    sum = threadIdx.x < 8 ? sums[threadIdx.x] : 0.0f;
-    if (threadIdx.x < 32) {
-        for (int delta = 16; delta; delta /= 2)
-            sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
-        if (threadIdx.x == 0) sums[0] = zero_inv(sum, hidden, eps);
-    }
-    __syncthreads();
-    const float inv = sums[0];
-    for (int c = 0; c < count; ++c) {
-        int d = c * 256 + threadIdx.x;
-        y[d] = __float2bfloat16_rn(zero_scale(values[c], inv, w[d]));
-    }
-}
-
-union Vec4 {
-    uint2 u;
-    __nv_bfloat162 h[2];
-    bf16 e[4];
-};
-
-__device__ __forceinline__ void zero_four_rows(
-    const bf16* x, const bf16* res, const bf16* w, bf16* y,
-    bf16* res_out, bf16* capture, int rows, int valid, int base,
-    int pitch, int column, float eps) {
-    const int begin = base + int(blockIdx.x) * 4;
-    if (begin >= valid) return;
-    const int slot = threadIdx.x >> 6;
-    const int tid = threadIdx.x & 63;
-    const int hw = tid >> 5;
-    const int lane = tid & 31;
-    const int offset = int(blockIdx.x) * 4 + slot;
-    const int row = base + offset;
-    const bool active = offset < rows && row < valid;
-    uint2 values[20];
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    if (active) {
-        const bf16* xr = x + size_t(row) * 5120;
-        const bf16* rr = res + size_t(row) * 5120;
-        bf16* dst = res_out + size_t(row) * 5120;
-        bf16* cap = capture + size_t(row) * pitch + column;
-        #pragma unroll
-        for (int c = 0; c < 20; ++c) {
-            int d4 = c * 64 + tid;
-            Vec4 a, b;
-            a.u = reinterpret_cast<const uint2*>(xr)[d4];
-            b.u = reinterpret_cast<const uint2*>(rr)[d4];
-            a.h[0] = __hadd2(a.h[0], b.h[0]);
-            a.h[1] = __hadd2(a.h[1], b.h[1]);
-            reinterpret_cast<uint2*>(dst)[d4] = a.u;
-            reinterpret_cast<uint2*>(cap)[d4] = a.u;
-            values[c] = a.u;
-            float2 f0 = __bfloat1622float2(a.h[0]);
-            float2 f1 = __bfloat1622float2(a.h[1]);
-            acc[0] = __fadd_rn(acc[0], __fmul_rn(f0.x, f0.x));
-            acc[1] = __fadd_rn(acc[1], __fmul_rn(f0.y, f0.y));
-            acc[2] = __fadd_rn(acc[2], __fmul_rn(f1.x, f1.x));
-            acc[3] = __fadd_rn(acc[3], __fmul_rn(f1.y, f1.y));
-        }
-    }
-    #pragma unroll
-    for (int delta = 4; delta >= 1; delta >>= 1) {
-        #pragma unroll
-        for (int k = 0; k < 4; ++k)
-            acc[k] = __fadd_rn(acc[k], __shfl_down_sync(0xffffffffu, acc[k], delta));
-    }
-    float ww = __fadd_rn(__fadd_rn(acc[0], acc[2]), __fadd_rn(acc[1], acc[3]));
-    __shared__ float sums[4][4];
-    if (hw == 1 && (lane & 7) == 0) sums[slot][lane >> 3] = ww;
-    __syncthreads();
-    if (hw == 0) {
-        if ((lane & 7) == 0) ww = __fadd_rn(ww, sums[slot][lane >> 3]);
-        ww = __fadd_rn(ww, __shfl_down_sync(0xffffffffu, ww, 16));
-        ww = __fadd_rn(ww, __shfl_down_sync(0xffffffffu, ww, 8));
-        if (lane == 0) sums[slot][0] = zero_inv(ww, 5120, eps);
-    }
-    __syncthreads();
-    if (active) {
-        const float inv = sums[slot][0];
-        bf16* yr = y + size_t(row) * 5120;
-        #pragma unroll
-        for (int c = 0; c < 20; ++c) {
-            const int d4 = c * 64 + tid;
-            Vec4 a, weight, result;
-            a.u = values[c];
-            weight.u = reinterpret_cast<const uint2*>(w)[d4];
-            #pragma unroll
-            for (int k = 0; k < 4; ++k)
-                result.e[k] = __float2bfloat16_rn(zero_scale(__bfloat162float(a.e[k]), inv, weight.e[k]));
-            reinterpret_cast<uint2*>(yr)[d4] = result.u;
-        }
-    }
-}
 
 }
 
@@ -324,24 +205,14 @@ extern "C" __global__ __launch_bounds__(256) void add_rmsnorm_capture(
     using namespace add_norm_capture;
     shape(rows, hidden, eps, blockDim.x);
     rect(hidden, pitch, column);
-    if (!x || !res || !w || !y || !res_out || !capture || mode < 0 || mode > 1 ||
+    if (!x || !res || !w || !y || !res_out || !capture || mode != 0 ||
         blockDim.x != 256 || base < 0) __trap();
     if (meta) q38_meta_guard(meta);
     const int valid = meta ? meta->valid_rows : rows;
-    const bool four = mode == 1 && hidden == 5120 && rows > 16;
-    if (int(gridDim.x) != (four ? (rows + 3) / 4 : rows)) __trap();
-    if (four) {
-        zero_four_rows(x, res, w, y, res_out, capture, rows, valid, base, pitch, column, eps);
-        return;
-    }
+    if (int(gridDim.x) != rows) __trap();
     const int row = base + int(blockIdx.x);
     if (row >= valid) return;
     const size_t offset = size_t(row) * hidden;
-    if (mode == 1) {
-        zero_row(x + offset, res + offset, w, y + offset, res_out + offset,
-                 capture + size_t(row) * pitch + column, hidden, eps);
-    } else {
-        add_rmsnorm_capture_row<8>(x + offset, res + offset, w, y + offset,
-                                   res_out + offset, capture, hidden, eps, pitch, column, row);
-    }
+    add_rmsnorm_capture_row<8>(x + offset, res + offset, w, y + offset,
+                               res_out + offset, capture, hidden, eps, pitch, column, row);
 }

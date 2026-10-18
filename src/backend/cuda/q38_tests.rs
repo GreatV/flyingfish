@@ -3231,17 +3231,27 @@ fn residual_rms_capture_gpu() -> Result<()> {
                     TensorMut(view(&baseline_normalized, stream, shape, strides)?);
                 let options = RmsOptions { mode, eps: 1e-6 };
                 match mode {
-                    RmsMode::ZeroCentered => common.norm.rms_add_with(
-                        stream,
-                        domain,
-                        ResidualRmsInput {
-                            x: &mut baseline_view,
-                            residual: addend_view,
-                            weight: weight_view,
-                        },
-                        &mut baseline_output,
-                        options,
-                    )?,
+                    RmsMode::ZeroCentered => {
+                        let offset = (hidden * std::mem::size_of::<bf16>()) as u64;
+                        let rp = baseline_view.0.ptr + offset;
+                        let xp = addend_view.ptr + offset;
+                        unsafe {
+                            stream
+                                .launch_builder(&ops.residual)
+                                .arg(&rp)
+                                .arg(&xp)
+                                .arg(&((rows * hidden) as i32))
+                                .launch(flat(rows * hidden))?;
+                        }
+                        common.norm.rms_with(
+                            stream,
+                            domain,
+                            baseline_view.0,
+                            weight_view,
+                            &mut baseline_output,
+                            options,
+                        )?;
+                    }
                     RmsMode::Standard => {
                         let offset = (hidden * std::mem::size_of::<bf16>()) as u64;
                         let rp = baseline_view.0.ptr + offset;

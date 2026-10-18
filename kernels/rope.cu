@@ -12,7 +12,7 @@ extern "C" __global__ void sequence_positions(const int* prefix, int* metadata,
         metadata[1] = rows;
         metadata[2] = p + rows;
         metadata[3] = capacity;
-        metadata[4] = 1;
+        metadata[4] = 0;
         metadata[5] = metadata[6] = metadata[7] = 0;
     }
     if (row < rows) {

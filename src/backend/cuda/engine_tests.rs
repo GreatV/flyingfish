@@ -34,7 +34,6 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
     Engine::calibrate(&target, 0, 33824, Some(16), settings.clone())?;
     let mut model = Engine::load(&target, 0, 33824, Some(1024), settings)?;
     model.check_ready()?;
-    model.profiler_start()?;
     for kv in &model.state.kv {
         for head in 0..model.config.num_key_value_heads {
             let lo = head * model.capacity * model.config.head_dim;
@@ -110,7 +109,6 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
     println!(
         "closure_target_graph rows1..17/1k/8k/32k token/logits/KV bitwise PASS; unwritten KV poisoned"
     );
-    model.profiler_stop()?;
     drop(model);
     let draft = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
     let settings = Settings {

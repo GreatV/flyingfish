@@ -938,11 +938,9 @@ impl Engine {
             self.hidden_capture
                 .as_ref()
                 .map_or(0, |capture| capture.width * 2)
-                + if self.spec.is_some() {
-                    (2 * self.config.hidden_size + 5 * self.config.kv_dim()) * 2
-                } else {
-                    0
-                },
+                + self.spec.as_ref().map_or(0, |spec| {
+                    (2 * spec.draft.config.hidden_size + 5 * spec.draft.config.kv_dim()) * 2
+                }),
         )?;
         let rows = self.spec_budget.workspace_rows(plan.chunk);
         let required = rows

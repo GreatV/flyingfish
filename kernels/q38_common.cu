@@ -133,13 +133,21 @@ __device__ __forceinline__ float block_inv(float v,float* scratch,uint32_t width
     __syncthreads(); return scratch[0];
 }
 // mode: 0 Standard, 1 ZeroCentered, 2 BF16 L2 chain, 3 StandardGated, 4 ZeroCentered with in-place x += z.
-extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
+template <bool Capture>
+__device__ __forceinline__ void norm_body(
     __nv_bfloat16* x,const __nv_bfloat16* w,const __nv_bfloat16* z,__nv_bfloat16* y,
     const Q38SequenceMeta* meta,uint32_t row_base,uint32_t row_capacity,
     uint32_t heads,uint32_t width,
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,
-    uint64_t zs0,uint64_t zs1,uint64_t zs2,int mode,float eps) {
-    q38_meta_guard(meta);
+    uint64_t zs0,uint64_t zs1,uint64_t zs2,int mode,float eps,
+    __nv_bfloat16* capture,uint64_t capture_pitch,uint64_t capture_column) {
+    if constexpr(Capture) {
+        if(meta) q38_meta_guard(meta);
+        if(mode!=4 || heads!=1u || (width!=2048u && width!=5120u) || !capture) {__trap();return;}
+    } else q38_meta_guard(meta,false);
+    uint64_t valid_rows;
+    if constexpr(Capture) valid_rows=meta?uint64_t(meta->valid_rows):uint64_t(row_base)+row_capacity;
+    else valid_rows=uint64_t(meta->valid_rows);
     uint32_t spb=norm_slices_per_block(x,w,z,y,row_capacity,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,zs0,zs1,zs2,mode);
     uint64_t total_slices=uint64_t(row_capacity)*heads;
     uint64_t expected_blocks=(total_slices+spb-1u)/spb;
@@ -153,7 +161,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
         uint32_t row_off,head;
         divmod_heads(uint32_t(slice),heads,row_off,head);
         uint64_t row=uint64_t(row_base)+row_off;
-        if(row>=uint64_t(meta->valid_rows)) return;
+        if(row>=valid_rows) return;
         __nv_bfloat16* xs=x+row*xs0+head*xs1;
         __nv_bfloat16* ys=y+row*ys0+head*ys1;
         const __nv_bfloat16* zs=(mode>=3)?(z+row*zs0+head*zs1):nullptr;
@@ -194,7 +202,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
         uint32_t row_off,head;
         divmod_heads(uint32_t(slice),heads,row_off,head);
         uint64_t row=uint64_t(row_base)+row_off;
-        if(row>=uint64_t(meta->valid_rows)) return;
+        if(row>=valid_rows) return;
         __nv_bfloat16* xs=x+row*xs0+head*xs1;
         __nv_bfloat16* ys=y+row*ys0+head*ys1;
         const __nv_bfloat16* zs=(mode>=3)?(z+row*zs0+head*zs1):nullptr;
@@ -234,16 +242,32 @@ extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
     }
     if(spb==4u && width==5120u) {
         uint64_t block_row_base=uint64_t(row_base)+uint64_t(blockIdx.x)*4u;
-        if(block_row_base>=uint64_t(meta->valid_rows)) return;
+        if constexpr(!Capture) { if(block_row_base>=valid_rows) return; }
         uint32_t row_slot=threadIdx.x>>6,tid64=threadIdx.x&63u,hw=tid64>>5,lane=tid64&31u;
         uint32_t slice=blockIdx.x*4u+row_slot;
         uint64_t row=uint64_t(row_base)+slice;
-        bool active=(slice<row_capacity) && (row<uint64_t(meta->valid_rows));
+        bool launched=slice<row_capacity;
+        bool active=launched && row<valid_rows;
         __nv_bfloat16* xs=active?(x+row*xs0):nullptr;
         __nv_bfloat16* ys=active?(y+row*ys0):nullptr;
         const __nv_bfloat16* zs=(active && mode>=3)?(z+row*zs0):nullptr;
         uint2 xv[20];
         float acc[4]={0.0f,0.0f,0.0f,0.0f};
+        if constexpr(Capture) {
+            if(launched && !active) {
+                __nv_bfloat16* padded=x+row*xs0;
+                const __nv_bfloat16* addend=z+row*zs0;
+                #pragma unroll
+                for(int c=0;c<20;++c) {
+                    uint32_t d4=uint32_t(c)*64u+tid64;
+                    Bf16Vec4 vx,vz;
+                    vx.u=reinterpret_cast<const uint2*>(padded)[d4];
+                    vz.u=reinterpret_cast<const uint2*>(addend)[d4];
+                    vx.h[0]=__hadd2(vx.h[0],vz.h[0]); vx.h[1]=__hadd2(vx.h[1],vz.h[1]);
+                    reinterpret_cast<uint2*>(padded)[d4]=vx.u;
+                }
+            }
+        }
         if(active) {
             #pragma unroll
             for(int c=0;c<20;++c) {
@@ -253,6 +277,8 @@ extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
                     Bf16Vec4 vz; vz.u=reinterpret_cast<const uint2*>(zs)[d4];
                     vx.h[0]=__hadd2(vx.h[0],vz.h[0]); vx.h[1]=__hadd2(vx.h[1],vz.h[1]);
                     reinterpret_cast<uint2*>(xs)[d4]=vx.u;
+                    if constexpr(Capture)
+                        reinterpret_cast<uint2*>(capture+row*capture_pitch+capture_column)[d4]=vx.u;
                 }
                 xv[c]=vx.u;
                 float2 f0=__bfloat1622float2(vx.h[0]),f1=__bfloat1622float2(vx.h[1]);
@@ -302,7 +328,14 @@ extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
     uint32_t row_off,head;
     divmod_heads(blockIdx.x,heads,row_off,head);
     uint64_t row=uint64_t(row_base)+row_off;
-    if(row>=uint64_t(meta->valid_rows)) return;
+    if(row>=valid_rows) {
+        if constexpr(Capture) {
+            for(uint32_t d=threadIdx.x;d<width;d+=256u)
+                x[row*xs0+uint64_t(d)*xs2]=__hadd(x[row*xs0+uint64_t(d)*xs2],z[row*zs0+uint64_t(d)*zs2]);
+        }
+        return;
+    }
+    if constexpr(Capture) capture+=row*capture_pitch+capture_column;
     x+=row*xs0+head*xs1; y+=row*ys0+head*ys1;
     if(mode>=3) z+=row*zs0+head*zs1;
     __shared__ float tmp[8];
@@ -312,7 +345,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
         for(int c=0;c<20;++c) {
             uint32_t d=uint32_t(c)*256u+threadIdx.x;
             __nv_bfloat16 v=x[d];
-            if(mode==4) { v=__hadd(v,z[d]); x[d]=v; }
+            if(mode==4) { v=__hadd(v,z[d]); x[d]=v; if constexpr(Capture) capture[d]=v; }
             float a=__bfloat162float(v);
             xv[c]=a;
             sum=__fadd_rn(sum,norm_term(a,mode));
@@ -348,7 +381,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
     float sum=0.0f;
     for(uint32_t d=threadIdx.x;d<width;d+=256u) {
         __nv_bfloat16 v=x[uint64_t(d)*xs2];
-        if(mode==4) { v=__hadd(v,z[uint64_t(d)*zs2]); x[uint64_t(d)*xs2]=v; }
+        if(mode==4) { v=__hadd(v,z[uint64_t(d)*zs2]); x[uint64_t(d)*xs2]=v; if constexpr(Capture) capture[d]=v; }
         float a=__bfloat162float(v);
         sum=__fadd_rn(sum,norm_term(a,mode));
     }
@@ -359,6 +392,23 @@ extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
         __nv_bfloat16 zd=(mode==3)?z[uint64_t(d)*zs2]:__float2bfloat16_rn(0.0f);
         y[uint64_t(d)*ys2]=norm_scale(a,inv,wd,zd,mode);
     }
+}
+extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
+    __nv_bfloat16* x,const __nv_bfloat16* w,const __nv_bfloat16* z,__nv_bfloat16* y,
+    const Q38SequenceMeta* meta,uint32_t row_base,uint32_t row_capacity,
+    uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,
+    uint64_t zs0,uint64_t zs1,uint64_t zs2,int mode,float eps) {
+    norm_body<false>(x,w,z,y,meta,row_base,row_capacity,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,zs0,zs1,zs2,mode,eps,nullptr,0,0);
+}
+extern "C" __global__ __launch_bounds__(256, 4) void q38_norm_capture(
+    __nv_bfloat16* x,const __nv_bfloat16* w,const __nv_bfloat16* z,__nv_bfloat16* y,
+    const Q38SequenceMeta* meta,uint32_t row_base,uint32_t row_capacity,
+    uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,
+    uint64_t zs0,uint64_t zs1,uint64_t zs2,int mode,float eps,
+    __nv_bfloat16* capture,uint64_t capture_pitch,uint64_t capture_column) {
+    norm_body<true>(x,w,z,y,meta,row_base,row_capacity,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,zs0,zs1,zs2,mode,eps,capture,capture_pitch,capture_column);
 }
 // mode: 0 SiLU, 1 BF16 sigmoid(gate) followed by BF16 multiply,
 // 2 BF16 SiLU(x) followed by BF16 multiply by `gate`.

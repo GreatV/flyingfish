@@ -837,8 +837,8 @@ extern "C" __global__ void sum_argmax(const bf16* base, const bf16* bias,
         rounded.values[j] = __float2bfloat16(score);
         if (score > best || (score == best && token_id < id)) { best = score; id = token_id; }
       }
-      if (rounding == 0) reinterpret_cast<uint4*>(scores)[i] = rounded.words;
-      else {
+      if (scores && rounding == 0) reinterpret_cast<uint4*>(scores)[i] = rounded.words;
+      else if (scores) {
         reinterpret_cast<float4*>(scores)[2 * i] = make_float4(combined[0],combined[1],combined[2],combined[3]);
         reinterpret_cast<float4*>(scores)[2 * i + 1] = make_float4(combined[4],combined[5],combined[6],combined[7]);
       }
@@ -847,8 +847,8 @@ extern "C" __global__ void sum_argmax(const bf16* base, const bf16* bias,
   }
   for (size_t v = scalar_begin + tid; v < size_t(vocab); v += 1024) {
     const float score = markov_score(__bfloat162float(bias[v]), base[v], rounding);
-    if (rounding == 0) static_cast<bf16*>(scores)[v] = __float2bfloat16(score);
-    else static_cast<float*>(scores)[v] = score;
+    if (scores && rounding == 0) static_cast<bf16*>(scores)[v] = __float2bfloat16(score);
+    else if (scores) static_cast<float*>(scores)[v] = score;
     if (score > best || (score == best && (unsigned)v < id)) { best = score; id = unsigned(v); }
   }
   for (int offset = 16; offset; offset >>= 1) {
@@ -894,7 +894,7 @@ extern "C" __global__ void concat_dot_sigmoid(const bf16* hidden, const bf16* em
     for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffffu,sum,offset);
     if (lane == 0) {
       const float logit = __bfloat162float(__float2bfloat16(sum + __bfloat162float(*bias)));
-      output[row] = 1.0f / (1.0f + expf(-logit));
+      output[row] = __bfloat162float(__float2bfloat16(1.0f / (1.0f + expf(-logit))));
     }
   }
 }

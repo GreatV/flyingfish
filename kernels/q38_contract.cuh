@@ -14,9 +14,10 @@ __device__ __forceinline__ float sigmoid(float x) {
 }
 __device__ __forceinline__ float silu(float x) {return x*sigmoid(x);}
 
-__device__ __forceinline__ void q38_meta_guard(const Q38SequenceMeta* s) {
+__device__ __forceinline__ void q38_meta_guard(const Q38SequenceMeta* s, bool causal_required=true) {
     if (!s || (reinterpret_cast<uintptr_t>(s)&15)) { __trap(); return; }
-    if (s->prefix<0 || s->valid_rows<=0 || s->capacity<=0 || s->causal!=1 ||
+    if (s->prefix<0 || s->valid_rows<=0 || s->capacity<=0 ||
+        (s->causal!=1 && (causal_required || s->causal!=0)) ||
         int64_t(s->prefix)+s->valid_rows!=s->key_count || s->key_count>s->capacity ||
         s->reserved[0] || s->reserved[1] || s->reserved[2]) __trap();
 }
