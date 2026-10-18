@@ -406,14 +406,17 @@ impl Engine {
             x,
             &mut TensorMut(qwen::matrix(&self.work.out, stream, 0, rows, hidden)?),
         )?;
-        if let Some(target) = trace.as_mut() {
-            let prefix = if target.trace.all_layers {
-                format!("layer_{layer}")
+        if let Some(target) = trace
+            .as_mut()
+            .filter(|target| target.trace.all_layers || layer == self.trace_layer)
+        {
+            let (prefix, name) = if target.trace.all_layers {
+                (format!("{}.{layer}", target.prefix), format!("{layer}.ffn"))
             } else {
-                target.prefix.to_owned()
+                (target.prefix.to_owned(), "ffn".to_owned())
             };
             decode.trace(stream, target.trace, &prefix)?;
-            trace_value(trace, stream, "ffn", &self.work.out, rows, hidden)?;
+            trace_value(trace, stream, &name, &self.work.out, rows, hidden)?;
         }
         Ok(())
     }
