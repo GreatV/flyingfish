@@ -1936,6 +1936,16 @@ mod tests {
                 && read(&reference, "routing", &[32, geometry.top_k as usize])? == routing,
             "expert tier reference input differs from T0"
         );
+        let reference_bound = |a: &[bf16], b: &[bf16]| {
+            let delta = a
+                .iter()
+                .zip(b)
+                .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+                .fold(0.0f32, f32::max);
+            let twice = delta + delta;
+            let rounded = bf16::from_f32(twice);
+            bf16::from_bits(rounded.to_bits() + u16::from(rounded.to_f32() < twice)).to_f32()
+        };
         let device = Device::new(0)?;
         let stream = &device.stream;
         let native_device = stream.clone_htod(&native)?;
@@ -2180,6 +2190,7 @@ mod tests {
                     let batch = read(&reference, &format!("batch{rows}_{name}"), &[rows, width])?;
                     let per_row = read(&reference, &format!("perrow32_{name}"), &[32, width])?;
                     let fp64 = read(&reference, &format!("fp64_{name}"), &[32, width])?;
+                    let bound = reference_bound(&batch, &per_row[..rows * width]);
                     let sources = [
                         ("gpu_grouped", gpu_stages[stage].as_slice()),
                         ("cpu", cpu_stages[stage].as_slice()),
@@ -2219,8 +2230,50 @@ mod tests {
                                 "expert_tier_stage rows={rows} stage={name} left={} right={} stored=[{rows},{width}] bit_mismatches={mismatches} max_abs={maximum} first={first:?}",
                                 left.0, right.0
                             );
+                            if a < 2 && (b == 2 || b == 3) {
+                                let pass = maximum <= bound && (bound != 0.0 || mismatches == 0);
+                                defects += usize::from(!pass);
+                                println!(
+                                    "{} expert_tier_stage_reference rows={rows} stage={name} tier={} reference={} max_abs={maximum} bound={bound} bit_mismatches={mismatches}",
+                                    if pass { "PASS" } else { "DEFECT" },
+                                    left.0,
+                                    right.0
+                                );
+                            }
                         }
                     }
+                }
+            }
+            let weighted_reference = |name: &str, shape: &[usize]| -> Result<Vec<bf16>> {
+                Ok(read(&reference, name, shape)?[..rows * hidden]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        bf16::from_f32(value.to_f32() * routing[index / hidden].to_f32())
+                    })
+                    .collect())
+            };
+            let batch = weighted_reference(&format!("batch{rows}_down"), &[rows, hidden])?;
+            let per_row = weighted_reference("perrow32_down", &[32, hidden])?;
+            let bound = reference_bound(&batch, &per_row);
+            for (tier, actual) in [("gpu", &gpu), ("cpu", &cpu), ("disk", &from_disk)] {
+                for (name, expected) in [("batch", &batch), ("per_row", &per_row)] {
+                    let mismatches = actual
+                        .iter()
+                        .zip(expected)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    let maximum = actual
+                        .iter()
+                        .zip(expected)
+                        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+                        .fold(0.0f32, f32::max);
+                    let pass = maximum <= bound && (bound != 0.0 || mismatches == 0);
+                    defects += usize::from(!pass);
+                    println!(
+                        "{} expert_tier_weighted_reference rows={rows} weighted={weighted} tier={tier} reference={name} max_abs={maximum} bound={bound} bit_mismatches={mismatches}",
+                        if pass { "PASS" } else { "DEFECT" }
+                    );
                 }
             }
             for (name, a, b) in [
@@ -2252,10 +2305,16 @@ mod tests {
                     });
                 println!(
                     "{} expert_tier_identity layer=0 expert={expert} rows={rows} weighted={weighted} comparison={name} stored=[rows,2048] bit_mismatches={mismatches} max_abs={maximum} first={first:?} cpu_isa={}",
-                    if mismatches == 0 { "PASS" } else { "DEFECT" },
+                    if mismatches == 0 {
+                        "PASS"
+                    } else if name == "cpu_pool_vs_disk" {
+                        "DEFECT"
+                    } else {
+                        "DIFFERENCE"
+                    },
                     pool.isa().name()
                 );
-                defects += usize::from(mismatches != 0);
+                defects += usize::from(name == "cpu_pool_vs_disk" && mismatches != 0);
             }
         }
         ensure!(

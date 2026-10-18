@@ -94,6 +94,16 @@ impl Bounds {
             cross_gpu.is_object(),
             "missing official cross-GPU reference noise {case}"
         );
+        let batch_shape = &noise["official_expert_batch_shape"];
+        ensure!(
+            batch_shape["validated"].as_bool() == Some(true),
+            "official expert batch-shape arms did not pass validation"
+        );
+        let batch_shape = ["sm89", "sm86"].map(|arch| &batch_shape["cases"][case][arch]);
+        ensure!(
+            batch_shape.iter().all(|cell| cell.is_object()),
+            "missing official expert batch-shape noise {case}"
+        );
         let vision = case
             .starts_with("image_")
             .then(|| &noise["official_vision_implementation_propagation"]["cases"][case]);
@@ -111,6 +121,7 @@ impl Bounds {
                 .map(|cell| &cell["layers"][&key])
                 .collect();
             cells.push(&cross_gpu["layers"][&key]);
+            cells.extend(batch_shape.iter().map(|cell| &cell["layers"][&key]));
             if layer == 0 {
                 cells.push(&floor["fp32_layer0"]);
             }
@@ -125,6 +136,7 @@ impl Bounds {
                 .map(|cell| &cell[key])
                 .collect::<Vec<_>>();
             cells.push(&cross_gpu[key]);
+            cells.extend(batch_shape.iter().map(|cell| &cell[key]));
             if let Some(cell) = vision {
                 cells.push(&cell[key]);
             }
