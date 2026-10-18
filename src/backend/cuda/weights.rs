@@ -151,7 +151,8 @@ impl ExpertStorage {
     }
 
     /// Completes all context readers and copies before releasing page-lock registration.
-    pub fn finish(&mut self) -> Result<()> {
+    #[cfg(test)]
+    fn finish(&mut self) -> Result<()> {
         self.context
             .synchronize()
             .context("finish expert storage readers and copies")?;

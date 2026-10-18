@@ -1874,7 +1874,7 @@ mod tests {
                 && geometry.experts == 256,
             "published BF16 expert identity geometry required: {geometry:?}"
         );
-        let checkpoint = crate::checkpoint::Checkpoint::open(&directory)?;
+        let checkpoint = crate::checkpoint::MappedCheckpoint::open(&directory)?;
         let catalogue = Arc::new(ExpertCatalogue::from_manifest(
             &checkpoint.manifest(&model, crate::checkpoint::LoadPolicy::TextOnly)?,
             geometry,

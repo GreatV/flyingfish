@@ -1202,7 +1202,7 @@ mod tests {
                 p2,
             )?;
             if matches!(core, GeometryCore::WrongHeadStride) {
-                let directory = PathBuf::from(
+                let directory = std::path::PathBuf::from(
                     std::env::var_os("FF_Q38_PROBE_DIR")
                         .context("GDN control directory missing")?,
                 );
