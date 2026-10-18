@@ -632,6 +632,7 @@ struct BiasedWeight {
     weight: CudaSlice<bf16>,
     bias: CudaSlice<bf16>,
     shape: [u32; 2],
+    bias_mode: LinearBiasMode,
 }
 impl BiasedWeight {
     fn take(
@@ -639,11 +640,22 @@ impl BiasedWeight {
         name: &str,
         shape: [u32; 2],
         stored_shape: &[usize],
+        architecture: Architecture,
     ) -> Result<Self> {
+        let bias_mode = match (architecture, stored_shape.len()) {
+            (Architecture::MiniCpmV47, 4) => LinearBiasMode::AfterOutputRound,
+            (Architecture::MiniCpmV47, 2) | (Architecture::Qwen35Text, 2 | 5) => {
+                LinearBiasMode::BeforeOutputRound
+            }
+            _ => bail!(
+                "unsupported biased vision projection: architecture={architecture:?} stored_shape={stored_shape:?}"
+            ),
+        };
         Ok(Self {
             weight: take(catalog, &format!("{name}.weight"), stored_shape)?,
             bias: take(catalog, &format!("{name}.bias"), &[shape[0] as usize])?,
             shape,
+            bias_mode,
         })
     }
     fn prepare(&self, stream: &Arc<CudaStream>, blas: &mut Blas, rows: u32) -> Result<()> {
@@ -652,7 +664,7 @@ impl BiasedWeight {
             self.shape[0],
             self.shape[1],
             dense(&self.bias, stream, [self.shape[0]])?,
-            LinearBiasMode::BeforeOutputRound,
+            self.bias_mode,
         )
     }
     fn run(
@@ -667,7 +679,7 @@ impl BiasedWeight {
             dense(&self.bias, stream, [self.shape[0]])?,
             input,
             output,
-            LinearBiasMode::BeforeOutputRound,
+            self.bias_mode,
         )
     }
 }
@@ -764,6 +776,7 @@ impl VisionWeights {
                     "model.visual.patch_embed.proj",
                     [hidden, geometry.patch],
                     &patch_shape,
+                    architecture,
                 )?;
                 let position = take(
                     catalog,
@@ -780,12 +793,14 @@ impl VisionWeights {
                             &format!("{p}.attn.qkv"),
                             [3 * hidden, hidden],
                             &[3 * hidden_usize, hidden_usize],
+                            architecture,
                         )?),
                         projection: BiasedWeight::take(
                             catalog,
                             &format!("{p}.attn.proj"),
                             [hidden, hidden],
                             &[hidden_usize, hidden_usize],
+                            architecture,
                         )?,
                         norm2: AffineWeights::take(catalog, &format!("{p}.norm2"), hidden)?,
                         fc1: BiasedWeight::take(
@@ -793,12 +808,14 @@ impl VisionWeights {
                             &format!("{p}.mlp.linear_fc1"),
                             [mlp, hidden],
                             &[mlp_usize, hidden_usize],
+                            architecture,
                         )?,
                         fc2: BiasedWeight::take(
                             catalog,
                             &format!("{p}.mlp.linear_fc2"),
                             [hidden, mlp],
                             &[hidden_usize, mlp_usize],
+                            architecture,
                         )?,
                     });
                 }
@@ -809,12 +826,14 @@ impl VisionWeights {
                         "model.visual.merger.linear_fc1",
                         [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
                         &[fc1_usize, fc1_usize],
+                        architecture,
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         "model.visual.merger.linear_fc2",
                         [geometry.output(), geometry.spec.merger_fc1],
                         &[output_usize, fc1_usize],
+                        architecture,
                     )?,
                 };
                 (
@@ -833,6 +852,7 @@ impl VisionWeights {
                     "model.vision_tower.embeddings.patch_embedding",
                     [hidden, geometry.patch],
                     &patch_shape,
+                    architecture,
                 )?;
                 let position = take(
                     catalog,
@@ -853,6 +873,7 @@ impl VisionWeights {
                         &format!("{prefix}.self_attn.{name}_proj"),
                         [hidden, hidden],
                         &[hidden_usize, hidden_usize],
+                        architecture,
                     )
                 };
                 let mut blocks = Vec::with_capacity(depth as usize);
@@ -872,12 +893,14 @@ impl VisionWeights {
                             &format!("{p}.mlp.fc1"),
                             [mlp, hidden],
                             &[mlp_usize, hidden_usize],
+                            architecture,
                         )?,
                         fc2: BiasedWeight::take(
                             catalog,
                             &format!("{p}.mlp.fc2"),
                             [hidden, mlp],
                             &[hidden_usize, mlp_usize],
+                            architecture,
                         )?,
                     });
                 }
@@ -898,12 +921,14 @@ impl VisionWeights {
                         &format!("{p}.linear_1"),
                         [merge * merge * mlp, geometry.spec.merger_fc1],
                         &[window_width, fc1_usize],
+                        architecture,
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         &format!("{p}.linear_2"),
                         [hidden, merge * merge * mlp],
                         &[hidden_usize, window_width],
+                        architecture,
                     )?,
                 };
                 let m = "model.merger.mlp.0";
@@ -918,12 +943,14 @@ impl VisionWeights {
                         &format!("{m}.linear_1"),
                         [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
                         &[fc1_usize, fc1_usize],
+                        architecture,
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         &format!("{m}.linear_2"),
                         [geometry.output(), geometry.spec.merger_fc1],
                         &[output_usize, fc1_usize],
+                        architecture,
                     )?,
                 };
                 let expected = 2 + 1 + 2 + depth as usize * 16 + 16 + 6;
@@ -3281,7 +3308,13 @@ mod tests {
                 upload_hashed_bytes: None,
                 load_wall_ms: 0.0,
             };
-            let patch = BiasedWeight::take(&mut catalog, prefix, [width, input], &stored_shape)?;
+            let patch = BiasedWeight::take(
+                &mut catalog,
+                prefix,
+                [width, input],
+                &stored_shape,
+                Architecture::MiniCpmV47,
+            )?;
             for rows in [1u32, 37, 1120, 7104] {
                 let mut host = vec![bf16::ZERO; (rows * input) as usize];
                 for row in host.chunks_exact_mut(input as usize) {
