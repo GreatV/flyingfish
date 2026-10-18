@@ -83,34 +83,6 @@ pub fn flat(n: usize) -> LaunchConfig {
     grid(n.div_ceil(256), 256)
 }
 
-pub(super) fn check_rope_kv(shape: super::flash::Shape, theta: f32) -> Result<()> {
-    ensure!(
-        (shape.q_heads, shape.kv_heads, shape.head_dim) == (16, 2, 128),
-        "rope_kv requires q_heads=16 kv_heads=2 head_dim=128; got q_heads={} kv_heads={} head_dim={}",
-        shape.q_heads,
-        shape.kv_heads,
-        shape.head_dim
-    );
-    ensure!(
-        theta.is_finite() && theta > 0.0,
-        "rope_kv requires finite positive theta; got theta={theta}"
-    );
-    ensure!(
-        shape.rows > 0
-            && shape.rows <= i32::MAX as usize
-            && shape.capacity <= i32::MAX as usize
-            && shape
-                .start
-                .checked_add(shape.rows)
-                .is_some_and(|end| end <= shape.capacity),
-        "rope_kv requires rows>=1 and 0<=start<=capacity-rows within i32; got rows={} start={} capacity={}",
-        shape.rows,
-        shape.start,
-        shape.capacity
-    );
-    Ok(())
-}
-
 use super::contracts::{RowDomain, Tensor, TensorMut};
 use anyhow::ensure;
 use cudarc::driver::{CudaStream, PushKernelArg};

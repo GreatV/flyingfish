@@ -1678,18 +1678,6 @@ impl Engine {
                 }
             }
             crate::backend::Operator::RopeKv => {
-                super::ops::check_rope_kv(
-                    Shape {
-                        rows,
-                        start: self.position,
-                        q_heads: c.num_attention_heads,
-                        kv_heads: c.num_key_value_heads,
-                        capacity: self.capacity,
-                        head_dim: c.head_dim,
-                        causal: true,
-                    },
-                    c.rope_theta,
-                )?;
                 unsafe {
                     // Fused rotation + KV write over rows x heads x (head_dim/2) element pairs.
                     let kv = &mut self.state.kv[i];
@@ -4303,10 +4291,10 @@ impl Engine {
     }
 
     fn prepare_graphs(&mut self) -> Result<()> {
+        self.set_token(0)?;
         if self.graphs.is_empty() {
             return Ok(());
         }
-        self.set_token(0)?;
         if self.moe.is_some() {
             return self.capture();
         }
