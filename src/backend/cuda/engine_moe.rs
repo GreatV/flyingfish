@@ -1175,3 +1175,7 @@ fn validate_dispatch(
 #[cfg(test)]
 #[path = "engine_moe_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "engine_moe_e2e.rs"]
+mod e2e;

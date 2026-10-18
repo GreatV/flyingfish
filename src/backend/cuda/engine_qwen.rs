@@ -118,6 +118,8 @@ pub(super) struct Runtime {
     checkpoint_dir: PathBuf,
     vision: Option<super::vision_runtime::VisionRuntime>,
     vision_bytes: usize,
+    #[cfg(test)]
+    pub(super) vision_encode_calls: usize,
     positions: CudaSlice<i32>,
     active_positions: CudaSlice<i32>,
     gather_positions: CudaFunction,
@@ -632,6 +634,8 @@ impl Runtime {
                 .context("resolve Q38 checkpoint directory")?,
             vision: None,
             vision_bytes: 0,
+            #[cfg(test)]
+            vision_encode_calls: 0,
             positions,
             active_positions,
             gather_positions: crate::backend::cuda::cubin::module(
@@ -800,6 +804,10 @@ impl Engine {
 
     pub(super) fn reset_qwen_positions(&mut self) -> Result<()> {
         if let Some(q) = self.qwen.as_mut() {
+            #[cfg(test)]
+            {
+                q.vision_encode_calls = 0;
+            }
             let positions =
                 crate::vision_input::PositionPlan::text(1, self.capacity)?.packed_axes()?;
             self.device
@@ -861,6 +869,10 @@ impl Engine {
         self.poisoned = true;
         let request = vision.prepare(&self.device, &mut self.blas, input, self.capacity)?;
         let images = vision.encode(&self.device.stream, &self.blas, request, trace)?;
+        #[cfg(test)]
+        {
+            q.vision_encode_calls += 1;
+        }
         self.device
             .stream
             .memcpy_htod(&positions, &mut q.positions)?;
@@ -1905,6 +1917,8 @@ impl Engine {
                         },
                     )?;
                 }
+                #[cfg(test)]
+                trace_value(trace, s, "norm", &w.n, rows, h)?;
                 self.blas.linear_typed(
                     phase,
                     LinearWeightRef::Bf16(matrix(

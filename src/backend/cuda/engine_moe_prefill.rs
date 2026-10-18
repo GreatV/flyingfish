@@ -317,6 +317,12 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
 }
 
 impl Prefill {
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn reseed_request(&self, slots: &mut Slots) -> Result<()> {
+        slots.end_request()?;
+        slots.begin_request(&self.frequency)
+    }
+
     pub(in crate::backend::cuda::engine) fn new(
         device: &Device,
         slots: &mut Slots,
@@ -1264,14 +1270,16 @@ impl Engine {
                         prefix,
                         skip: *skip,
                     });
-                    trace_value(
-                        &mut target,
-                        &self.device.stream,
-                        "ffn",
-                        &self.work.out,
-                        *rows,
-                        self.model_spec.hidden as usize,
-                    )?;
+                    if layer == self.trace_layer {
+                        trace_value(
+                            &mut target,
+                            &self.device.stream,
+                            "ffn",
+                            &self.work.out,
+                            *rows,
+                            self.model_spec.hidden as usize,
+                        )?;
+                    }
                     if !all_layers || [0, 3, 7, 31, 32, 47, 63].contains(&layer) {
                         let name = if all_layers {
                             &prefill.layer_names[layer]["layer.".len()..]

@@ -564,6 +564,11 @@ impl Engine {
     }
 
     pub(crate) fn record_test_stats(&self, trace: &mut Trace) -> Result<()> {
+        trace.add(
+            "stats.vision_encode_calls".into(),
+            vec![1],
+            vec![self.qwen.as_ref().map_or(0, |q| q.vision_encode_calls) as f32],
+        )?;
         let stats = self
             .moe
             .as_ref()
