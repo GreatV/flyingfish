@@ -613,7 +613,10 @@ mod admission_tests {
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
         let geometry = ExpertGeometry::from_model(&model)?;
-        let layout = crate::experts::catalogue::ExpertLayout::new(model.expert_format, &geometry)?;
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            model.expert_format.context("MoE expert_format missing")?,
+            &geometry,
+        )?;
         let slot_bytes = layout.slot_bytes();
         let row_bytes = crate::work_layout::RowWorkSpec::new(&model)?.row_bytes()?;
         let request = ExpertWorkspaceRequest {

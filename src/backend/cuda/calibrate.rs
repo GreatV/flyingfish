@@ -1318,9 +1318,11 @@ mod long_tests {
         );
         let spec = crate::model_spec::ModelSpec::read(&model)?;
         let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&spec)?;
-        let slot_bytes =
-            crate::experts::catalogue::ExpertLayout::new(spec.expert_format, &geometry)?
-                .slot_bytes();
+        let slot_bytes = crate::experts::catalogue::ExpertLayout::new(
+            spec.expert_format.context("MoE expert_format missing")?,
+            &geometry,
+        )?
+        .slot_bytes();
         super::super::engine::Engine::calibrate(
             &model,
             0,
@@ -1350,7 +1352,13 @@ mod long_tests {
         let measured =
             measured.check(&key(&device)?, &ExpertHost::read()?, &geometry, slot_bytes)?;
         let reader = super::super::closure::Closure::new(false, "calibrate".into());
-        let reused = load_experts(&device, &runtime, geometry, spec.expert_format, &reader)?;
+        let reused = load_experts(
+            &device,
+            &runtime,
+            geometry,
+            spec.expert_format.context("MoE expert_format missing")?,
+            &reader,
+        )?;
         assert_eq!(measured.h2d_bytes_per_second, reused.h2d_bytes_per_second);
         assert_eq!(measured.d2h_bytes_per_second, reused.d2h_bytes_per_second);
         assert_eq!(measured.copy_engines, reused.copy_engines);
@@ -1360,7 +1368,13 @@ mod long_tests {
         let mut invalid: ExpertCache = serde_json::from_slice(&bytes)?;
         invalid.transfers[0].d2h_seconds[0] = 0.0;
         std::fs::write(&path, serde_json::to_vec(&invalid)?)?;
-        let rejected = load_experts(&device, &runtime, geometry, spec.expert_format, &reader);
+        let rejected = load_experts(
+            &device,
+            &runtime,
+            geometry,
+            spec.expert_format.context("MoE expert_format missing")?,
+            &reader,
+        );
         std::fs::write(&path, &bytes)?;
         assert!(rejected.is_err());
         device.upload.synchronize()?;

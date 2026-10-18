@@ -668,7 +668,7 @@ impl Engine {
                 &device,
                 &runtime,
                 geometry,
-                spec.expert_format,
+                spec.expert_format.context("MoE expert_format missing")?,
                 &closure,
             )?;
             let budget = crate::experts::plan::admission_budget(
@@ -680,7 +680,7 @@ impl Engine {
             )?;
             eprintln!(
                 "{}",
-                serde_json::json!({"expert_setup_calibrated":{"budget_bytes_per_token":budget,"hard_step_cap":crate::experts::plan::Admission { budget_bytes_per_token: budget }.hard_cap(crate::experts::catalogue::ExpertLayout::new(spec.expert_format, &geometry)?.slot_bytes())?}})
+                serde_json::json!({"expert_setup_calibrated":{"budget_bytes_per_token":budget,"hard_step_cap":crate::experts::plan::Admission { budget_bytes_per_token: budget }.hard_cap(crate::experts::catalogue::ExpertLayout::new(spec.expert_format.context("MoE expert_format missing")?, &geometry)?.slot_bytes())?}})
             );
             return Ok(());
         }

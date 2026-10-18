@@ -31,9 +31,8 @@ pub enum LinearFormat {
 }
 /// Routed-expert checkpoint layout: fused BF16 slices or per-expert E4M3 weights with BF16
 /// per-output-channel scales (compressed-tensors FP8_DYNAMIC).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ExpertFormat {
-    #[default]
     Bf16,
     Fp8W8a16,
 }
@@ -44,6 +43,7 @@ pub struct GdnConfig {
     pub key_head_dim: u32,
     pub value_head_dim: u32,
     pub conv_kernel: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub qk_norm_fp32: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,7 +67,8 @@ pub struct ModelSpec {
     pub rope_theta: f32,
     pub rotary_dim: u32,
     pub linear_format: LinearFormat,
-    pub expert_format: ExpertFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expert_format: Option<ExpertFormat>,
     pub eos: Vec<u32>,
     pub layers: Vec<LayerPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -912,7 +913,7 @@ impl ModelSpec {
             rope_theta: c.rope_theta,
             rotary_dim: u(c.head_dim)?,
             linear_format: LinearFormat::Bf16,
-            expert_format: ExpertFormat::Bf16,
+            expert_format: None,
             eos: c.eos_token_id.clone(),
             vision: None,
             moe: None,
@@ -942,7 +943,7 @@ impl ModelSpec {
             generation,
             VisionConfig::from_root(root)?,
             LinearFormat::read(root)?,
-            ExpertFormat::Bf16,
+            None,
         )
     }
     pub fn minicpm(root: &Value, generation: &Value) -> Result<Self> {
@@ -972,7 +973,7 @@ impl ModelSpec {
             generation,
             VisionConfig::from_root(root)?,
             linear_format,
-            expert_format,
+            Some(expert_format),
         )?;
         expert_format.check_ignore(root, &spec)?;
         Ok(spec)
@@ -984,7 +985,7 @@ impl ModelSpec {
         generation: &Value,
         vision: Option<VisionConfig>,
         linear_format: LinearFormat,
-        expert_format: ExpertFormat,
+        expert_format: Option<ExpertFormat>,
     ) -> Result<Self> {
         let eos_value = generation
             .get("eos_token_id")

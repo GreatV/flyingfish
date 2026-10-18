@@ -21,8 +21,14 @@ fn g0_normalized_geometry_and_rejections() {
     );
     assert_eq!(spec.moe, None);
     assert_eq!(spec.linear_format, LinearFormat::Fp8E4m3Block128);
-    let canonical = serde_json::to_value(&spec).unwrap();
-    assert_eq!(canonical["gdn"]["qk_norm_fp32"], false);
+    let canonical = serde_json::to_string(&spec).unwrap();
+    assert_eq!(
+        canonical,
+        include_str!("data/q38-spec.json").trim_end_matches('\n'),
+        "Q38 spec serialization changed"
+    );
+    let restored: ModelSpec = serde_json::from_str(&canonical).unwrap();
+    assert_eq!(serde_json::to_string(&restored).unwrap(), canonical);
     let public = spec.config();
     assert_eq!(
         (

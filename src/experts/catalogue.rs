@@ -699,7 +699,7 @@ mod tests {
             std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
         let model = ModelSpec::read(&dir)?;
         ensure!(
-            model.expert_format == ExpertFormat::Bf16,
+            model.expert_format == Some(ExpertFormat::Bf16),
             "FF_MODEL is not the BF16 checkpoint"
         );
         let geometry = ExpertGeometry::from_model(&model)?;
@@ -715,7 +715,11 @@ mod tests {
         );
         let mapped = crate::checkpoint::MappedCheckpoint::open(&dir)?;
         let manifest = mapped.manifest(&model, crate::checkpoint::LoadPolicy::TextOnly)?;
-        let catalogue = ExpertCatalogue::from_manifest(&manifest, geometry, model.expert_format)?;
+        let catalogue = ExpertCatalogue::from_manifest(
+            &manifest,
+            geometry,
+            model.expert_format.context("MoE expert_format missing")?,
+        )?;
         assert_eq!(catalogue.slot_bytes(), 6_291_456);
         for (layer, expert) in [(0u32, 0u32), (0, 255), (39, 0), (39, 255)] {
             let range = catalogue.range(layer, expert)?;
@@ -831,12 +835,16 @@ mod tests {
         );
         let model = ModelSpec::read(&dir)?;
         ensure!(
-            model.expert_format == ExpertFormat::Fp8W8a16,
+            model.expert_format == Some(ExpertFormat::Fp8W8a16),
             "FF_FP8_MODEL is not the FP8 checkpoint"
         );
         let geometry = ExpertGeometry::from_model(&model)?;
         let manifest = fp8_expert_manifest(&dir, &geometry)?;
-        let catalogue = ExpertCatalogue::from_manifest(&manifest, geometry, model.expert_format)?;
+        let catalogue = ExpertCatalogue::from_manifest(
+            &manifest,
+            geometry,
+            model.expert_format.context("MoE expert_format missing")?,
+        )?;
         assert_eq!(catalogue.slot_bytes(), 3_151_872);
         assert_eq!(
             catalogue.layout(),

@@ -176,7 +176,7 @@ fn fp8_spec_states_per_channel_linears_and_the_published_ignore_list() -> Result
     assert_eq!(spec.linear_format, LinearFormat::Fp8E4m3Channel);
     assert_eq!(
         spec.expert_format,
-        flyingfish::model_spec::ExpertFormat::Fp8W8a16
+        Some(flyingfish::model_spec::ExpertFormat::Fp8W8a16)
     );
 
     let mut unexpected = root.clone();

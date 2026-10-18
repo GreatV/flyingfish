@@ -138,7 +138,7 @@ impl Setup {
         let catalogue = Arc::new(crate::experts::catalogue::ExpertCatalogue::from_manifest(
             manifest,
             geometry,
-            model.expert_format,
+            model.expert_format.context("MoE expert_format missing")?,
         )?);
         let calibration = super::super::closure::Closure::new(
             write,
@@ -151,7 +151,7 @@ impl Setup {
             device,
             runtime,
             geometry,
-            model.expert_format,
+            model.expert_format.context("MoE expert_format missing")?,
             &calibration,
         )?;
         let (available, locked) = host_memory()?;
