@@ -23,7 +23,7 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelA
 use half::bf16;
 use std::{rc::Rc, sync::Arc};
 
-fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
+pub(super) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     b: &CudaSlice<T>,
     s: &Arc<CudaStream>,
     shape: [u32; R],

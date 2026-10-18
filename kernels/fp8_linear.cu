@@ -4,6 +4,7 @@
 // Format: __nv_fp8_e4m3 (CUDA Math API).
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
 
 __device__ __forceinline__ float e4m3_decode(uint8_t code) {
@@ -257,3 +258,43 @@ FP8_SKINNY_ENTRY(3)
 FP8_SKINNY_ENTRY(4)
 FP8_SKINNY_ENTRY(5)
 #undef FP8_SKINNY_ENTRY
+
+// scale and normalized quotient round to BF16 before E4M3 conversion.
+extern "C" __global__ void e4m3_fake_quant_bf16(
+        __nv_bfloat16* x, uint8_t* codes, __nv_bfloat16* scales,
+        int rows, int cols) {
+    if (rows <= 0 || cols <= 0 || blockDim.x != 256 || blockDim.y != 1 ||
+        blockDim.z != 1 || gridDim.x != uint32_t(rows) || gridDim.y != 1 ||
+        gridDim.z != 1 || !aligned16(x) || (codes && !aligned16(codes)) ||
+        (scales && !aligned16(scales))) { __trap(); return; }
+    __shared__ float maxima[8];
+    __shared__ float scale;
+    const uint64_t base = uint64_t(blockIdx.x) * uint64_t(cols);
+    const int lane = threadIdx.x & 31;
+    float amax = 0.0f;
+    for (int col = threadIdx.x; col < cols; col += 256) {
+        const float value = __bfloat162float(x[base + col]);
+        if (!isfinite(value)) { __trap(); return; }
+        amax = fmaxf(amax, fabsf(value));
+    }
+    for (int shift = 16; shift > 0; shift /= 2)
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, shift));
+    if (lane == 0) maxima[threadIdx.x / 32] = amax;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        amax = 0.0f;
+        for (int warp = 0; warp < 8; ++warp) amax = fmaxf(amax, maxima[warp]);
+        scale = __bfloat162float(__float2bfloat16_rn(amax / 448.0f));
+        if (scale == 0.0f) scale = 0.0078125f;
+        if (scales) scales[blockIdx.x] = __float2bfloat16_rn(scale);
+    }
+    __syncthreads();
+    for (int col = threadIdx.x; col < cols; col += 256) {
+        const float value = __bfloat162float(x[base + col]);
+        const float normalized = __bfloat162float(__float2bfloat16_rn(value / scale));
+        const uint8_t code = __nv_cvt_float_to_fp8(
+            fminf(448.0f, fmaxf(-448.0f, normalized)), __NV_SATFINITE, __NV_E4M3);
+        if (codes) codes[base + col] = code;
+        x[base + col] = __float2bfloat16_rn(e4m3_decode(code) * scale);
+    }
+}

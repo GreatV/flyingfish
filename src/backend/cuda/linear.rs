@@ -26,11 +26,13 @@ pub(crate) enum LinearWeightRef {
 pub(crate) struct Fp8Ops {
     dequant: [CudaFunction; 2],
     small: [[CudaFunction; 5]; 2],
+    fake_quant: CudaFunction,
 }
 impl Fp8Ops {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let m = super::cubin::module(ctx, "fp8_linear")?;
         Ok(Self {
+            fake_quant: m.load_function("e4m3_fake_quant_bf16")?,
             dequant: [
                 m.load_function("fp8_dequant_bf16")?,
                 m.load_function("fp8_dequant_bf16_per_channel")?,
@@ -52,6 +54,52 @@ impl Fp8Ops {
                 ],
             ],
         })
+    }
+    pub fn fake_quant(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &mut TensorMut<bf16, 2>,
+        codes: Option<&TensorMut<u8, 2>>,
+        scales: Option<&TensorMut<bf16, 1>>,
+    ) -> Result<()> {
+        x.0.validate()?;
+        ensure!(
+            x.0.shape.iter().all(|&n| n <= i32::MAX as u32)
+                && x.0.stride == [u64::from(x.0.shape[1]), 1],
+            "invalid E4M3 activation layout"
+        );
+        if let Some(out) = codes {
+            out.0.validate()?;
+            ensure!(
+                out.0.shape == x.0.shape && out.0.stride == x.0.stride,
+                "E4M3 code output mismatch"
+            );
+            disjoint(&x.0, &out.0)?;
+            if let Some(scale) = scales {
+                disjoint(&out.0, &scale.0)?;
+            }
+        }
+        if let Some(out) = scales {
+            out.0.validate()?;
+            ensure!(
+                out.0.shape == [x.0.shape[0]] && out.0.stride == [1],
+                "E4M3 scale output mismatch"
+            );
+            disjoint(&x.0, &out.0)?;
+        }
+        let codes_ptr = codes.map_or(0, |out| out.0.ptr);
+        let scales_ptr = scales.map_or(0, |out| out.0.ptr);
+        unsafe {
+            stream
+                .launch_builder(&self.fake_quant)
+                .arg(&x.0.ptr)
+                .arg(&codes_ptr)
+                .arg(&scales_ptr)
+                .arg(&(x.0.shape[0] as i32))
+                .arg(&(x.0.shape[1] as i32))
+                .launch(super::ops::grid(x.0.shape[0] as usize, 256))?;
+        }
+        Ok(())
     }
     fn check(codes: &Tensor<u8, 2>, scale: &Tensor<bf16, 2>, layout: Fp8ScaleLayout) -> Result<()> {
         codes.validate()?;
@@ -427,6 +475,186 @@ mod tests {
     use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
     use crate::op_contract::ExecutionPhase;
     use std::{path::PathBuf, rc::Rc};
+
+    #[test]
+    #[ignore = "GPU window and FF_MINICPM_REFERENCE_DIR required"]
+    fn token_quantization_gpu() -> Result<()> {
+        use super::super::q38_tests::view;
+        use crate::fp8::fake_quant_reference;
+        use cudarc::driver::sys;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let root = PathBuf::from(
+            std::env::var_os("FF_MINICPM_REFERENCE_DIR")
+                .context("FF_MINICPM_REFERENCE_DIR missing")?,
+        );
+        let bytes = std::fs::read(root.join("fixtures/text_32_mixer.safetensors"))?;
+        let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
+        let mut inputs = Vec::new();
+        for (name, prefix, width) in [
+            ("layer_03_mixer_in_norm", "layer_03_attn_in", 2048usize),
+            ("layer_03_o_proj_in", "layer_03_o_proj_in", 4096usize),
+        ] {
+            let input = tensors.tensor(name)?;
+            let scales = tensors.tensor(&format!("{prefix}_scale"))?;
+            let codes = tensors.tensor(&format!("{prefix}_fp8_q"))?;
+            let fake = tensors.tensor(&format!("{prefix}_fake_quant"))?;
+            ensure!(
+                input.dtype() == safetensors::Dtype::BF16
+                    && input.shape() == [32, width]
+                    && scales.dtype() == safetensors::Dtype::BF16
+                    && scales.shape() == [32, 1]
+                    && codes.dtype() == safetensors::Dtype::F8_E4M3
+                    && codes.shape() == input.shape()
+                    && fake.dtype() == safetensors::Dtype::BF16
+                    && fake.shape() == input.shape(),
+                "invalid T13 activation fixture {name}"
+            );
+            let values = input
+                .data()
+                .chunks_exact(2)
+                .map(|v| bf16::from_le_bytes([v[0], v[1]]))
+                .collect::<Vec<_>>();
+            for (row, x) in values.chunks_exact(width).enumerate() {
+                let (s, c, f) = fake_quant_reference(x)?;
+                ensure!(
+                    s.to_le_bytes() == scales.data()[row * 2..row * 2 + 2]
+                        && c == codes.data()[row * width..(row + 1) * width]
+                        && f.iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .eq(fake.data()[row * width * 2..(row + 1) * width * 2]
+                                .iter()
+                                .copied()),
+                    "T13 scalar oracle invalid source={name} row={row}"
+                );
+            }
+            for rows in [1, 2, 3, 4, 5, 8, 32] {
+                inputs.push((name, rows, width, values[..rows * width].to_vec()));
+            }
+        }
+        let width = 257usize;
+        let tiny = bf16::from_f32(bf16::EPSILON.to_f32() * 0.5);
+        let values = (0..9 * width)
+            .map(|i| match i / width {
+                0 => bf16::ZERO,
+                1 => bf16::NEG_ZERO,
+                2 => {
+                    if i % 2 == 0 {
+                        tiny
+                    } else {
+                        -tiny
+                    }
+                }
+                3 => bf16::from_bits((i % 127 + 1) as u16),
+                _ => bf16::from_f32(((i * 37 % 101) as f32 - 50.0) / 32.0),
+            })
+            .collect::<Vec<_>>();
+        let (right, _, _) = fake_quant_reference(&values[2 * width..3 * width])?;
+        let wrong = bf16::from_f32(tiny.to_f32().max(bf16::EPSILON.to_f32()) / 448.0);
+        ensure!(
+            right != wrong,
+            "max(amax,eps) control is not discriminating"
+        );
+        println!("PASS E4M3_EPS_CONTROL right={right:?} max_amax_eps={wrong:?}");
+        inputs.push(("zero_tiny_tail", 9, width, values));
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let op = Fp8Ops::new(&device.ctx)?;
+        let mut defects = 0;
+        let mut cases = 0;
+        for (name, rows, width, values) in inputs {
+            let mut want_codes = Vec::new();
+            let mut want_scales = Vec::new();
+            let mut want_fake = Vec::new();
+            for x in values.chunks_exact(width) {
+                let (s, c, f) = fake_quant_reference(x)?;
+                want_scales.push(s);
+                want_codes.extend(c);
+                want_fake.extend(f);
+            }
+            let codes = stream.alloc_zeros::<u8>(values.len())?;
+            let scales = stream.alloc_zeros::<bf16>(rows)?;
+            let code_view = TensorMut(view(
+                &codes,
+                stream,
+                [rows as u32, width as u32],
+                [width as u64, 1],
+            )?);
+            let scale_view = TensorMut(view(&scales, stream, [rows as u32], [1])?);
+            for graph in [false, true] {
+                for capture_outputs in [false, true] {
+                    let x = stream.clone_htod(&values)?;
+                    let x_view = view(&x, stream, [rows as u32, width as u32], [width as u64, 1])?;
+                    device.finish_upload()?;
+                    let execute = || {
+                        op.fake_quant(
+                            stream,
+                            &mut TensorMut(x_view),
+                            capture_outputs.then_some(&code_view),
+                            capture_outputs.then_some(&scale_view),
+                        )
+                    };
+                    if graph {
+                        stream.begin_capture(
+                            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                        )?;
+                        let run = execute();
+                        let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                        run?;
+                        captured?
+                            .context("empty activation quantization graph")?
+                            .launch()?;
+                    } else {
+                        execute()?;
+                    }
+                    stream.synchronize()?;
+                    let got = stream.clone_dtoh(&x)?;
+                    ensure!(
+                        got.iter().all(|v| v.is_finite()),
+                        "nonfinite fake-quant output"
+                    );
+                    let fake_bad = got
+                        .iter()
+                        .zip(&want_fake)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    let (code_bad, scale_bad) = if capture_outputs {
+                        (
+                            stream
+                                .clone_dtoh(&codes)?
+                                .iter()
+                                .zip(&want_codes)
+                                .filter(|(a, b)| a != b)
+                                .count(),
+                            stream
+                                .clone_dtoh(&scales)?
+                                .iter()
+                                .zip(&want_scales)
+                                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                .count(),
+                        )
+                    } else {
+                        (0, 0)
+                    };
+                    let bad = fake_bad + code_bad + scale_bad;
+                    println!(
+                        "E4M3_QUANT source={name} stored_input=[{rows},{width}] graph={graph} capture_outputs={capture_outputs} scale_bad={scale_bad} code_bad={code_bad} fake_bad={fake_bad} {}",
+                        if bad == 0 { "PASS" } else { "DEFECT" }
+                    );
+                    defects += usize::from(bad != 0);
+                    cases += 1;
+                }
+            }
+        }
+        println!("E4M3_QUANT_SUMMARY cases={cases} defects={defects}");
+        ensure!(
+            defects == 0,
+            "E4M3 activation quantization DEFECT cases={defects}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn moe_ffn_binding_uses_native_router_and_shared_layouts() -> Result<()> {
