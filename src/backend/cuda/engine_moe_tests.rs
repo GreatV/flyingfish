@@ -643,7 +643,11 @@ fn moe_graphs_match_eager_and_preserve_capture_state_gpu() -> Result<()> {
         (false, true, 2, 2),
         (false, false, 2, 0),
     ] {
-        let capacity = tier_capacity(geometry, pinned)?;
+        let mut capacity = tier_capacity(geometry, pinned)?;
+        if cap == 0 {
+            capacity.spare_blocks = 1;
+            capacity.host_expert_bytes = 9 * capacity.slot_bytes();
+        }
         let mut pair = (0..2)
             .map(|arm| {
                 let directory =
