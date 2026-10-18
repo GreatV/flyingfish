@@ -52,6 +52,15 @@ pub enum ExpertLayout {
 
 impl ExpertLayout {
     pub fn new(format: ExpertFormat, geometry: &ExpertGeometry) -> Result<Self> {
+        ensure!(
+            geometry.layers > 0
+                && geometry.experts > 0
+                && geometry.hidden > 0
+                && geometry.intermediate > 0
+                && geometry.top_k > 0
+                && geometry.top_k <= geometry.experts,
+            "invalid native expert geometry {geometry:?}"
+        );
         let intermediate = u64::from(geometry.intermediate);
         let hidden = u64::from(geometry.hidden);
         match format {
@@ -853,16 +862,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CPU-only real checkpoint; set FF_FP8_MODEL"]
+    #[ignore = "CPU-only real checkpoint; set FF_MODEL"]
     fn fp8_catalogue_matches_the_published_checkpoint() -> Result<()> {
         use std::os::unix::fs::FileExt;
-        let dir = std::path::PathBuf::from(
-            std::env::var_os("FF_FP8_MODEL").context("FF_FP8_MODEL missing")?,
-        );
+        let dir =
+            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
         let model = ModelSpec::read(&dir)?;
         ensure!(
             model.expert_format == Some(ExpertFormat::Fp8W8a16),
-            "FF_FP8_MODEL is not the FP8 checkpoint"
+            "FF_MODEL is not the FP8 checkpoint"
         );
         let geometry = ExpertGeometry::from_model(&model)?;
         let manifest = fp8_expert_manifest(&dir, &geometry)?;

@@ -1183,8 +1183,16 @@ impl Engine {
                             ))
                         })
                         .collect::<Result<Vec<_>>>()?;
+                    let cohort = |experts: &[u32]| {
+                        experts
+                            .iter()
+                            .map(|&expert| (expert, prefill.counts[expert as usize]))
+                            .collect::<Vec<_>>()
+                    };
+                    let resident = cohort(prefill.plan.resident());
+                    let streamed = cohort(prefill.plan.staged());
                     println!(
-                        "minicpm_prefill_cpu span_start={span_start} rows={} layer={layer} experts={experts:?}",
+                        "minicpm_prefill_cpu span_start={span_start} rows={} layer={layer} experts={experts:?} resident={resident:?} streamed={streamed:?}",
                         admitted.len()
                     );
                 }
@@ -1299,7 +1307,13 @@ impl Engine {
                             self.model_spec.hidden as usize,
                         )?;
                     }
-                    if !all_layers || [0, 3, 7, 31, 32, 47, 63].contains(&layer) {
+                    let layers = self.model_spec.layers.len();
+                    if !all_layers
+                        || layer == 0
+                        || layer == self.trace_layer
+                        || layer == layers / 2
+                        || layer + 1 == layers
+                    {
                         let name = if all_layers {
                             &prefill.layer_names[layer]["layer.".len()..]
                         } else {

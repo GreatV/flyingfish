@@ -808,7 +808,7 @@ struct Local {
 
 impl Local {
     fn new(shape: &Shape, workers: usize, max_rows: usize, max_assignments: usize) -> Self {
-        let block = (max_assignments * shape.hidden).div_ceil(workers);
+        let block = (max_assignments * shape.hidden.max(shape.intermediate)).div_ceil(workers);
         Self {
             hidden_bf: vec![bf16::ZERO; max_rows * shape.hidden],
             hidden_f: vec![0.0; max_rows * shape.hidden],
@@ -1710,10 +1710,7 @@ mod tests {
                 }
             })
         );
-        assert!(
-            worst <= 1,
-            "FP32 accumulation moved a result by more than one BF16 step"
-        );
+        assert_eq!(worst, 0, "FP32 and FP64 rounded contributions differ");
         Ok(())
     }
 
@@ -1884,10 +1881,7 @@ mod tests {
                 }
             })
         );
-        assert!(
-            worst <= 1,
-            "FP32 accumulation moved a result by more than one BF16 step"
-        );
+        assert_eq!(worst, 0, "FP32 and FP64 rounded contributions differ");
         Ok(())
     }
 
@@ -2448,9 +2442,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires FF_T4_FIXTURE with the torch-CPU model-definition contribution"]
+    #[ignore = "requires FF_MINICPM_REFERENCE_DIR/torch-expert.safetensors"]
     fn model_definition_matches_torch_cpu() -> Result<()> {
-        let path = std::env::var("FF_T4_FIXTURE").context("FF_T4_FIXTURE missing")?;
+        let path = std::path::PathBuf::from(
+            std::env::var_os("FF_MINICPM_REFERENCE_DIR")
+                .context("FF_MINICPM_REFERENCE_DIR missing")?,
+        )
+        .join("torch-expert.safetensors");
         let bytes = std::fs::read(path)?;
         let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
         let read = |name: &str| -> Result<Vec<bf16>> {
@@ -2490,6 +2488,13 @@ mod tests {
             down: 2 * shape.intermediate * shape.hidden..per_expert(&shape),
             down_stride: shape.intermediate,
         };
+        let reference64 = reference(&shape, &arena, &weights, &hidden, weight[0]);
+        let reference_noise = expected
+            .iter()
+            .zip(&reference64)
+            .map(|(&a, &b)| order_key(a).abs_diff(order_key(b)))
+            .max()
+            .context("empty torch contribution reference")?;
         let mut scratch = Scratch::new(&shape);
         for isa in [Isa::Scalar, Isa::Avx2, Isa::Avx512Bf16] {
             if !isa.available() {
@@ -2526,9 +2531,8 @@ mod tests {
                     }
                 })
             );
-            // Torch's own FP32 accumulation deviates from FP64 by up to 2 BF16 steps on this fixture.
             assert!(
-                worst <= 2,
+                worst <= reference_noise,
                 "{} differs from the torch contribution beyond the reference noise",
                 isa.name()
             );

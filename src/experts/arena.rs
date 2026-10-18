@@ -238,11 +238,33 @@ impl SlotLayout {
             "invalid slot geometry {geometry:?}"
         );
         let slot_bytes = usize::try_from(capacity.slot_bytes())?;
-        let gate_up_bytes = capacity.layout.gate_up_bytes().unwrap_or(0);
         ensure!(
-            slot_bytes.is_multiple_of(16) && gate_up_bytes.is_multiple_of(16),
-            "native slot alignment: slot_bytes={slot_bytes} gate_up_bytes={gate_up_bytes}"
+            slot_bytes > 0 && slot_bytes.is_multiple_of(16),
+            "native slot alignment: slot_bytes={slot_bytes}"
         );
+        match &capacity.layout {
+            crate::experts::catalogue::ExpertLayout::Bf16Fused { gate_up_bytes, .. } => {
+                ensure!(
+                    *gate_up_bytes > 0 && gate_up_bytes.is_multiple_of(16),
+                    "BF16 native gate-up alignment: bytes={gate_up_bytes}"
+                );
+            }
+            crate::experts::catalogue::ExpertLayout::Fp8W8a16(layout) => {
+                for (name, range) in [
+                    ("gate", &layout.gate),
+                    ("up", &layout.up),
+                    ("down", &layout.down),
+                    ("gate_scale", &layout.gate_scale),
+                    ("up_scale", &layout.up_scale),
+                    ("down_scale", &layout.down_scale),
+                ] {
+                    ensure!(
+                        range.start < range.end && range.start.is_multiple_of(16),
+                        "FP8 native {name} alignment: range={range:?}"
+                    );
+                }
+            }
+        }
         ensure!(
             capacity.slots_per_layer.len() == geometry.layers as usize,
             "slot layout layer count {} differs from {}",

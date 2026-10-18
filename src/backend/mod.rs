@@ -12,8 +12,6 @@ pub use cuda::engine::Engine as Backend;
 pub use cuda::engine::TextPrefixSaveOutput;
 #[cfg(feature = "cuda")]
 pub use cuda::engine::{TextPrefixRestoreIntent, TextPrefixSaveRequest};
-#[cfg(feature = "cuda")]
-pub use cuda::weights::ExpertStorage;
 #[cfg(not(feature = "cuda"))]
 mod missing;
 #[cfg(not(feature = "cuda"))]

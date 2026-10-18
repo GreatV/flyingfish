@@ -705,8 +705,7 @@ impl Residency {
         Ok(dispatch)
     }
 
-    /// Runs the global §3.1 selection for the token and publishes at most the hard step cap.
-    /// Every pair's block needs are validated before the plan is applied.
+    /// Publishes at most the hard per-token cap after validating block requirements.
     pub fn finish_token(&mut self) -> Result<&[Published]> {
         ensure!(self.token_open, "no token open");
         let cap = self.admission.hard_cap(self.capacity.slot_bytes())?;

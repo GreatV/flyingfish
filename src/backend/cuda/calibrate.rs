@@ -785,7 +785,7 @@ impl ExpertHost {
         let limit = self.threads.min(256);
         (0..=8)
             .map(|shift| 1 << shift)
-            .chain([24, limit])
+            .chain([limit - limit / 4, limit])
             .filter(|&n| n > 0 && n <= limit)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()

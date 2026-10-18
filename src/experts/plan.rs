@@ -1,18 +1,15 @@
 //! Setup-derived expert residency capacity and per-request placement policy.
-//! Per-layer slot split is equal with the remainder to low layer ids; the F8 simulation used
-//! marginal allocation, which is a PR7 item.
+//! Per-layer slots are equal, with the remainder assigned to low layer ids.
 use crate::experts::arena::SlotLayout;
 use crate::experts::catalogue::ExpertGeometry;
 use anyhow::{Context, Result, ensure};
 
-/// Decay of the admission score (addendum §3.1).
+/// Per-token admission-score decay.
 pub const F_DECAY: f64 = 0.98;
-/// Candidates below this decayed frequency are not admitted (addendum §3.1).
+/// Minimum decayed frequency for admission.
 pub const THETA_MIN: f64 = 1.05;
-/// F seed = 12 copies of the request's normalized prefill frequency (F8 erratum 2026-10-17T18:07:51Z).
+/// Copies of the request's normalized prefill frequency in the initial score.
 pub const F_SEED_SCALE: f64 = 12.0;
-/// Normalized prefill frequency sums to the top-k count per layer (addendum §3.1).
-pub const FREQUENCY_SUM: f64 = 8.0;
 
 /// One measured CPU expert-service cell.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -829,10 +826,6 @@ impl TierLedger {
         anyhow::bail!("expert {expert} of layer {layer} has no slot")
     }
 
-    pub fn free_host_block(&self) -> bool {
-        self.free_host_blocks() > 0
-    }
-
     /// Marks a non-GPU expert host-resident within the host block capacity.
     pub fn place_host(&mut self, layer: u32, expert: u32) -> Result<()> {
         self.check_index(layer, expert)?;
@@ -977,11 +970,6 @@ impl TierLedger {
             .context("disk bytes overflow")
     }
 
-    /// Duplicate residency is zero by construction.
-    pub fn duplicate_bytes(&self) -> u64 {
-        0
-    }
-
     pub fn check(&self) -> Result<()> {
         let geometry = self.layout.geometry();
         ensure!(
@@ -1086,7 +1074,7 @@ pub fn seed_scores(frequency: &[Vec<f64>], geometry: &ExpertGeometry) -> Result<
         ensure!(total > 0.0, "layer {layer} prefill frequency is all zero");
         scores.push(
             row.iter()
-                .map(|value| F_SEED_SCALE * value * FREQUENCY_SUM / total)
+                .map(|value| F_SEED_SCALE * value * f64::from(geometry.top_k) / total)
                 .collect(),
         );
     }
@@ -1645,7 +1633,6 @@ mod tests {
         assert_eq!(ledger.tier(1, initial[1][0]).unwrap(), Tier::Host);
         ledger.evict_gpu(0, 7).unwrap();
         assert_eq!(ledger.tier(0, 7).unwrap(), Tier::Disk);
-        assert_eq!(ledger.duplicate_bytes(), 0);
         assert_eq!(
             ledger.unique_bytes().unwrap() + ledger.disk_bytes().unwrap(),
             routed

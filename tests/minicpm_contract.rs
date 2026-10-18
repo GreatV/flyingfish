@@ -165,10 +165,9 @@ fn spec_rejects_every_unsupported_field() {
 }
 
 #[test]
-#[ignore = "official FP8 checkpoint; set FF_FP8_MODEL"]
+#[ignore = "official FP8 checkpoint; set FF_MODEL"]
 fn fp8_spec_states_per_channel_linears_and_the_published_ignore_list() -> Result<()> {
-    let dir =
-        std::path::PathBuf::from(std::env::var_os("FF_FP8_MODEL").context("FF_FP8_MODEL missing")?);
+    let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
     let root: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
     let generation: Value =
         serde_json::from_slice(&std::fs::read(dir.join("generation_config.json"))?)?;

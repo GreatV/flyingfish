@@ -78,6 +78,7 @@ impl Drop for SlotLease<'_> {
 
 impl AlignedSlot {
     fn new(bytes: usize) -> Result<Self> {
+        ensure!(bytes > 0, "zero disk ring slot bytes");
         let layout = Layout::from_size_align(bytes, RING_ALIGN)
             .with_context(|| format!("invalid ring slot layout: {bytes} B"))?;
         // SAFETY: the layout has a nonzero size and a power-of-two alignment.

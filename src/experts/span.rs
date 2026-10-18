@@ -65,8 +65,7 @@ impl SpanPlan {
         })
     }
 
-    /// Rewrites the plan from the routed row counts and the current residency. Every fallible step
-    /// runs before the plan buffers are touched, so a failed update leaves the previous plan intact.
+    /// Rewrites the reusable cohorts from routed row counts and current residency.
     pub fn update(
         &mut self,
         counts: &[u32],

@@ -76,18 +76,6 @@ struct Plan {
     workspace: usize,
 }
 
-pub(super) fn check_coverage(
-    shape: LinearShape,
-    coverage: Option<&(usize, BTreeSet<(usize, usize)>)>,
-) -> Result<()> {
-    let (limit, pairs) = coverage.context("linear coverage was not declared")?;
-    ensure!(
-        shape.rows > 0 && shape.rows <= *limit && pairs.contains(&(shape.output, shape.input)),
-        "linear shape outside cuBLAS-only coverage: {shape:?}"
-    );
-    Ok(())
-}
-
 impl Plan {
     fn attr(&self, attr: sys::cublasLtMatmulAlgoConfigAttributes_t) -> Result<i32> {
         let mut value = 0i32;
@@ -416,7 +404,16 @@ impl Blas {
             "missing frozen linear choice: {shape:?}; run calibrate for this deployment"
         );
         if !linear_calibrate::supports(shape) {
-            check_coverage(shape, self.coverage.as_ref())?;
+            let (limit, pairs) = self
+                .coverage
+                .as_ref()
+                .context("linear coverage was not declared")?;
+            ensure!(
+                shape.rows > 0
+                    && shape.rows <= *limit
+                    && pairs.contains(&(shape.output, shape.input)),
+                "linear shape outside cuBLAS-only coverage: {shape:?}"
+            );
         }
         let mut algo = 0u32;
         if let Some(choice) = self.choices.borrow().get(&shape) {
