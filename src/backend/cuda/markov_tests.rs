@@ -283,7 +283,7 @@ fn native_geometry_head_ops_gpu() -> Result<()> {
                 .count();
             defects += guard_mismatches;
             let mut score_mismatches = 0;
-            for (index, value) in scores[live].iter().enumerate() {
+            for (index, value) in scores[live.clone()].iter().enumerate() {
                 let expected = if index == 0 {
                     1.0f32
                 } else if index + 1 == test_vocab {
