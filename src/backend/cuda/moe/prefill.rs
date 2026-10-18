@@ -921,6 +921,7 @@ impl PrefillOps {
         // offsets.
         let len1 = stage.order.len();
         {
+            stage.gemm1_copy_done.synchronize()?;
             let mirror = stage.gemm1_host.as_mut_slice()?;
             for (j, &e) in stage.order.iter().enumerate() {
                 let e = e as usize;
@@ -988,6 +989,7 @@ impl PrefillOps {
         // segment, C rebuilt from the offsets into the contiguous Y_perm.
         let len2 = stage.order.len();
         {
+            stage.gemm2_copy_done.synchronize()?;
             let mirror = stage.gemm2_host.as_mut_slice()?;
             for (j, &e) in stage.order.iter().enumerate() {
                 let e = e as usize;
@@ -1163,6 +1165,7 @@ impl PrefillOps {
                 .map_err(|_| anyhow::anyhow!("moe prefill stage mutex is poisoned"))?;
             let stage: &mut Stage = &mut guard;
             {
+                stage.gemm1_copy_done.synchronize()?;
                 let mirror = stage.gemm1_host.as_mut_slice()?;
                 mirror[0] = input.shared_gate.ptr;
                 mirror[1] = input.shared_up.ptr;
@@ -1339,8 +1342,8 @@ unsafe fn dtoh_window(
 }
 
 /// # Safety
-/// `dst` must address `words` u64 words of writable device memory that no
-/// in-flight work on the stream touches.
+/// `dst` covers `words` u64 words ordered on `stream`. The host mirror stays
+/// immutable until the recorded `done` event completes.
 unsafe fn htod_ptrs(
     stream: &Arc<CudaStream>,
     dst: u64,
@@ -1354,9 +1357,6 @@ unsafe fn htod_ptrs(
         src.len()
     );
     stream.context().bind_to_thread()?;
-    // The pinned mirror is rewritten on the next call; the previous copy
-    // must have completed first.
-    stream.wait(done)?;
     let host = src.as_ptr()?;
     unsafe {
         ds::cuMemcpyHtoDAsync_v2(

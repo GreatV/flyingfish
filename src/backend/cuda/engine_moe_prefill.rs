@@ -2285,6 +2285,7 @@ mod tests {
                                 rows,
                                 ffn,
                             )?;
+                            super::super::delay_stream(&engine.device.stream)?;
                             for base in (0..rows).step_by(4) {
                                 let count = 4.min(rows - base);
                                 prefill.finish_wave(
@@ -2338,6 +2339,24 @@ mod tests {
                             .zip(&reference.output)
                             .filter(|(a, b)| a.to_bits() != b.to_bits())
                             .count();
+                        let wave_mismatches = actual
+                            .chunks(4 * 128)
+                            .zip(reference.output.chunks(4 * 128))
+                            .map(|(a, b)| {
+                                a.iter()
+                                    .zip(b)
+                                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                    .count()
+                            })
+                            .collect::<Vec<_>>();
+                        println!(
+                            "{} prefill_span_waves layer={layer} rows={rows} variant={variant} pinned={pinned} engines={engines} wave_mismatches={wave_mismatches:?} delay_ms=100 ref_outside_NVTX=true",
+                            if output_mismatches == 0 {
+                                "PASS"
+                            } else {
+                                "DEFECT"
+                            }
+                        );
                         let mut cohort_mismatches = [0usize; 2];
                         for (choice, (&expert, values)) in reference
                             .ids
