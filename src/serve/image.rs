@@ -1455,8 +1455,8 @@ pub fn decode_video(bytes: &[u8]) -> Result<DecodedVideo> {
         frames,
         metadata: VideoMetadata {
             total_num_frames: count,
-            fps: probed.fps,
-            duration: count as f64 / probed.fps,
+            fps: probed.numerator as f64 / probed.denominator as f64,
+            duration: video_duration(count, probed.numerator, probed.denominator),
         },
     })
 }
@@ -1642,7 +1642,8 @@ struct ProbeStream {
 struct ProbedVideo {
     width: u32,
     height: u32,
-    fps: f64,
+    numerator: u64,
+    denominator: u64,
     frames: Option<usize>,
 }
 
@@ -1665,15 +1666,15 @@ fn parse_probe(bytes: &[u8]) -> Result<ProbedVideo> {
     let (numerator, denominator) = rate
         .split_once('/')
         .with_context(|| format!("ffprobe average frame rate {rate} is not a fraction"))?;
-    let numerator: f64 = numerator
+    let numerator: u64 = numerator
         .parse()
         .with_context(|| format!("ffprobe average frame rate {rate} numerator"))?;
-    let denominator: f64 = denominator
+    let denominator: u64 = denominator
         .parse()
         .with_context(|| format!("ffprobe average frame rate {rate} denominator"))?;
-    let fps = numerator / denominator;
+    let fps = numerator as f64 / denominator as f64;
     ensure!(
-        fps.is_finite() && fps > 0.0,
+        numerator > 0 && denominator > 0 && fps.is_finite() && fps > 0.0,
         "ffprobe average frame rate {rate} is not positive"
     );
     // Containers report an unknown frame count as "N/A".
@@ -1691,9 +1692,15 @@ fn parse_probe(bytes: &[u8]) -> Result<ProbedVideo> {
     Ok(ProbedVideo {
         width,
         height,
-        fps,
+        numerator,
+        denominator,
         frames,
     })
+}
+
+/// `float(Fraction(frames * denominator, numerator))`: one rounded division.
+fn video_duration(frames: usize, numerator: u64, denominator: u64) -> f64 {
+    (frames as u128 * denominator as u128) as f64 / numerator as f64
 }
 
 enum ImageFormat {
@@ -2095,6 +2102,22 @@ mod tests {
     }
 
     #[test]
+    fn video_duration_divides_the_frame_count_by_the_rate_once() -> Result<()> {
+        assert_eq!(video_duration(3_000, 30_000, 1_001), 100.1);
+        assert_eq!(video_duration(300, 30, 1), 10.0);
+        let meta = VideoMetadata {
+            total_num_frames: 3_000,
+            fps: 30_000.0 / 1_001.0,
+            duration: video_duration(3_000, 30_000, 1_001),
+        };
+        assert_eq!(
+            sample_frame_indices(&meta, 8, 1)?,
+            vec![0, 425, 854, 1_282, 1_708, 2_136, 2_565, 2_994]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn video_sampling_validates_metadata_and_scope() {
         let meta = VideoMetadata {
             total_num_frames: 60,
@@ -2333,7 +2356,7 @@ mod tests {
         });
         let probed = parse_probe(&serde_json::to_vec(&report)?)?;
         assert_eq!((probed.width, probed.height), (64, 48));
-        assert!((probed.fps - 30000.0 / 1001.0).abs() < 1e-12);
+        assert_eq!((probed.numerator, probed.denominator), (30000, 1001));
         assert_eq!(probed.frames, Some(3));
         let mut unknown = report.clone();
         unknown["streams"][0]["nb_frames"] = serde_json::json!("N/A");
@@ -2623,6 +2646,43 @@ mod tests {
         assert_eq!(decoded.metadata.duration, 10.0);
         let indices = sample_frame_indices(&decoded.metadata, 128, 1)?;
         assert_eq!(indices, (0..10).map(|i| i * 30).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_metadata_divides_ntsc_rates_exactly() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("ff-video-ntsc-{}.mp4", std::process::id()));
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=30000/1001",
+                "-frames:v",
+                "3000",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&path)
+            .status()
+            .context("run ffmpeg to build the NTSC clip")?;
+        assert!(status.success());
+        let bytes = std::fs::read(&path)?;
+        std::fs::remove_file(&path)?;
+        let video = decode_video(&bytes)?;
+        assert_eq!(video.metadata.total_num_frames, 3000);
+        assert_eq!(video.metadata.fps, 30000.0 / 1001.0);
+        assert_eq!(video.metadata.duration, 100.1);
+        assert_eq!(
+            sample_frame_indices(&video.metadata, 8, 1)?,
+            vec![0, 425, 854, 1282, 1708, 2136, 2565, 2994]
+        );
         Ok(())
     }
 
