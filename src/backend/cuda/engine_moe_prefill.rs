@@ -2009,7 +2009,13 @@ mod tests {
                 hidden,
                 intermediate,
             )?;
-            let scratch = stream.alloc_zeros::<u8>(usize::try_from(layout.bytes)?)?;
+            let scratch = stream.alloc_zeros::<u8>(usize::try_from(prefill_scratch_bytes(
+                rows,
+                1,
+                geometry.experts as usize,
+                hidden,
+                intermediate,
+            )?)?)?;
             {
                 let _range =
                     crate::backend::cuda::profile::Range::new(true, c"expert_tier_grouped");

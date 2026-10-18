@@ -452,8 +452,8 @@ pub(crate) struct PrefillLayout {
     #[cfg(test)]
     done: u64,
     x_perm: u64,
-    h1: u64,
-    act: u64,
+    pub(crate) h1: u64,
+    pub(crate) act: u64,
     pub(crate) y_perm: u64,
     #[cfg(test)]
     contributions: u64,
