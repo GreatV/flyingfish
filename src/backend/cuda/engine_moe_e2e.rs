@@ -36,18 +36,19 @@ fn measured_bounds(cells: &[&serde_json::Value]) -> Result<[f64; 4]> {
                 .with_context(|| format!("missing noise {key}"))?;
             ensure!(value.is_finite(), "nonfinite noise {key}={value}");
             let error = if index == 3 {
-                (1.0 - value).max(0.0)
+                value.clamp(-1.0, 1.0).acos()
             } else {
                 value
             };
             bound[index] = bound[index].max(error);
         }
     }
-    for value in &mut bound {
+    for value in &mut bound[..3] {
         // Two-arm error budget: ceil_bf16(delta_ref + delta_ref).
         *value = ceil_bf16(*value + *value)?;
     }
-    bound[3] = 1.0 - bound[3];
+    // Angular triangle bound: cos(min(2 * max(acos(reference cosine)), pi)).
+    bound[3] = (2.0 * bound[3]).min(std::f64::consts::PI).cos();
     Ok(bound)
 }
 
@@ -552,6 +553,29 @@ fn media_control(
         m[3]
     );
     Ok(usize::from(!pass))
+}
+
+#[test]
+fn cosine_budget_covers_two_opposite_reference_errors() -> Result<()> {
+    let reference = [1.0, 0.0];
+    let a = [3.0, 4.0];
+    let b = [3.0, -4.0];
+    let floor = metrics(&reference, &a)?;
+    let cell = serde_json::json!({"max_abs":floor[0], "p99_abs":floor[1],
+        "mean_abs":floor[2], "cosine_sim":floor[3]});
+    let bound = measured_bounds(&[&cell])?;
+    let actual = metrics(&a, &b)?[3];
+    let linear = 1.0 - 2.0 * (1.0 - floor[3]);
+    ensure!(
+        actual < linear,
+        "counterexample did not reject linear cosine scaling"
+    );
+    ensure!(
+        actual >= bound[3],
+        "two-arm angular triangle bound rejected a valid pair: {actual} < {}",
+        bound[3]
+    );
+    Ok(())
 }
 
 #[test]
