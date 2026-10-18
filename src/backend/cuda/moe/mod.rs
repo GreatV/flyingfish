@@ -1,6 +1,5 @@
 pub mod combine;
 pub(crate) mod decode;
-#[cfg(test)]
 pub(crate) mod prefill;
 pub(crate) mod route;
 

@@ -133,6 +133,7 @@ pub(crate) struct MoePrefillContribute<'a> {
 /// The wrapper input: the cohort fields plus the output `y`; the wrapper
 /// owns `contributions`/`done` in scratch.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct MoePrefill<'a> {
     pub x: Tensor<bf16, 2>,
     pub ids: Tensor<i32, 2>,
@@ -460,6 +461,7 @@ impl MoePrefillContribute<'_> {
     }
 }
 
+#[cfg(test)]
 impl MoePrefill<'_> {
     /// The wrapper-only checks: `y` density and its separation from every
     /// input; every cohort-level check runs in
@@ -511,11 +513,13 @@ pub(crate) struct PrefillLayout {
     offsets: u64,
     cursor: u64,
     pub(crate) pos_of: u64,
+    #[cfg(test)]
     done: u64,
     x_perm: u64,
     h1: u64,
     act: u64,
     pub(crate) y_perm: u64,
+    #[cfg(test)]
     contributions: u64,
     h1s: u64,
     act_s: u64,
@@ -526,12 +530,14 @@ pub(crate) struct PrefillLayout {
 
 /// Persistent pinned host bytes reserved by PrefillOps::new: one D2H
 /// window plus the two GEMM pointer mirrors.
+#[cfg(test)]
 pub fn stage_host_pinned_bytes() -> u64 {
     (D2H_WINDOW_WORDS * 4 + (GEMM1_PTR_WORDS + GEMM2_PTR_WORDS) * 8) as u64
 }
 
 /// Persistent device bytes reserved by PrefillOps::new: the two GEMM
 /// pointer blocks.
+#[cfg(test)]
 pub fn stage_device_bytes() -> u64 {
     ((GEMM1_PTR_WORDS + GEMM2_PTR_WORDS) * 8) as u64
 }
@@ -575,12 +581,12 @@ pub(crate) fn prefill_layout(
     let offsets = region(&mut at, experts + 1, 4)?;
     let cursor = region(&mut at, experts, 4)?;
     let pos_of = region(&mut at, assignments, 4)?;
-    let done = region(&mut at, assignments, 4)?;
+    let _done = region(&mut at, assignments, 4)?;
     let x_perm = region(&mut at, assignments * hidden, 2)?;
     let h1 = region(&mut at, assignments * 2 * inter, 2)?;
     let act = region(&mut at, assignments * inter, 2)?;
     let y_perm = region(&mut at, assignments * hidden, 2)?;
-    let contributions = region(&mut at, assignments * hidden, 2)?;
+    let _contributions = region(&mut at, assignments * hidden, 2)?;
     let h1s = region(&mut at, rows * 2 * inter, 2)?;
     let act_s = region(&mut at, rows * inter, 2)?;
     let shared_out = region(&mut at, rows * hidden, 2)?;
@@ -591,12 +597,14 @@ pub(crate) fn prefill_layout(
         offsets,
         cursor,
         pos_of,
-        done,
+        #[cfg(test)]
+        done: _done,
         x_perm,
         h1,
         act,
         y_perm,
-        contributions,
+        #[cfg(test)]
+        contributions: _contributions,
         h1s,
         act_s,
         shared_out,
@@ -1012,6 +1020,7 @@ impl PrefillOps {
     /// shared FFN, the sigmoid gate and the combine. Records and returns the
     /// completion event of the final combine launch; the host slot tables
     /// and every input tensor are immutable until that event completes.
+    #[cfg(test)]
     pub fn prefill(
         &self,
         stream: &Arc<CudaStream>,
@@ -1263,6 +1272,7 @@ fn elem(count: u64) -> u64 {
 /// # Safety
 /// `dst` must address `words` writable device words that no in-flight work
 /// on the stream touches.
+#[cfg(test)]
 unsafe fn zero_words(stream: &Arc<CudaStream>, dst: u64, words: usize) -> Result<()> {
     stream.context().bind_to_thread()?;
     unsafe {

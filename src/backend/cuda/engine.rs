@@ -458,6 +458,7 @@ pub struct Engine {
     qwen: Option<qwen::Runtime>,
     moe: Option<moe::Decode>,
     moe_slots: Option<moe::Slots>,
+    moe_prefill: Option<moe::Prefill>,
     #[cfg(test)]
     moe_test_ffn: Option<super::linear::BoundFfn>,
     mtp: Option<mtp::Chain>,
@@ -811,6 +812,7 @@ impl Engine {
             qwen: None,
             moe: None,
             moe_slots: None,
+            moe_prefill: None,
             #[cfg(test)]
             moe_test_ffn: None,
             mtp: None,
@@ -1864,6 +1866,7 @@ impl Engine {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        self.check_moe_reset()?;
         self.poisoned = true;
         if let Some(slots) = self.moe_slots.as_mut()
             && slots.request_open
@@ -2441,6 +2444,9 @@ impl Engine {
             ids.iter().all(|&x| (x as usize) < self.config.vocab_size),
             "input token id outside vocabulary"
         );
+        if self.model_spec.moe.is_some() {
+            return self.prefill_moe_chunks(ids, trace, keep, &mut after_chunk);
+        }
         let trace_start = self.position + ids.len() - keep;
         let end = self.position + ids.len();
         let mut part = 0usize;

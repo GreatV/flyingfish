@@ -6,6 +6,7 @@ use crate::backend::cuda::{
     moe::{
         combine::{CombineOps, MoeCombine},
         decode::{DecodeOps, MoeDecode, decode_scratch_bytes},
+        prefill::PrefillOps,
         route::RouteOps,
     },
 };
@@ -15,7 +16,7 @@ use cudarc::driver::{CudaEvent, DevicePtr, DeviceRepr, HostSlice, ValidAsZeroBit
 
 #[path = "engine_moe_residency.rs"]
 mod residency;
-pub(super) use residency::Slots;
+pub(super) use residency::{Prefill, Slots};
 
 fn pinned_zeros<T: DeviceRepr + ValidAsZeroBits>(
     context: &Arc<CudaContext>,
@@ -99,6 +100,7 @@ pub(super) struct Decode {
     router_ptr: u64,
     route: RouteOps,
     contribute: DecodeOps,
+    prefill: PrefillOps,
     combine: CombineOps,
     ids: CudaSlice<i32>,
     weights: CudaSlice<bf16>,
@@ -129,6 +131,7 @@ impl Decode {
         geometry: ExpertGeometry,
         max_rows: usize,
         workers: u32,
+        cpu_bounds: (usize, usize),
     ) -> Result<Self> {
         ensure!(
             (1..=8).contains(&max_rows),
@@ -149,6 +152,10 @@ impl Decode {
         let hidden = max_rows
             .checked_mul(geometry.hidden as usize)
             .context("MoE hidden extent overflow")?;
+        ensure!(
+            cpu_bounds.0 >= max_rows && cpu_bounds.1 >= choices,
+            "MoE CPU bounds={cpu_bounds:?} below decode rows={max_rows} choices={choices}"
+        );
         let stream = &device.stream;
         let context = &device.ctx;
         Ok(Self {
@@ -160,6 +167,7 @@ impl Decode {
             router_ptr: 0,
             route: RouteOps::new(context, stream)?,
             contribute: DecodeOps::new(context)?,
+            prefill: PrefillOps::new(context, stream)?,
             combine: CombineOps::new(context)?,
             ids: stream.alloc_zeros(choices)?,
             weights: stream.alloc_zeros(choices)?,
@@ -187,8 +195,8 @@ impl Decode {
             pool: ExpertPool::new(
                 workers as usize,
                 Shape::new(geometry.hidden as usize, geometry.intermediate as usize)?,
-                max_rows,
-                choices,
+                cpu_bounds.0,
+                cpu_bounds.1,
             )?,
             stats: [0; 5],
         })

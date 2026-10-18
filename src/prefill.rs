@@ -264,6 +264,87 @@ pub struct ExpertWorkspaceBudget {
     pub candidate: crate::experts::plan::SpanCandidate,
 }
 
+#[derive(Debug)]
+#[cfg(any(feature = "cuda", test))]
+pub(crate) struct ExpertSpanLayout {
+    pub rows: u32,
+    pub residual: std::ops::Range<usize>,
+    pub normalized: std::ops::Range<usize>,
+    pub contributions: std::ops::Range<usize>,
+    pub done: std::ops::Range<usize>,
+    pub ids: std::ops::Range<usize>,
+    pub weights: std::ops::Range<usize>,
+    pub active: std::ops::Range<usize>,
+    pub generation: std::ops::Range<usize>,
+    pub bytes: usize,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl ExpertSpanLayout {
+    pub fn new(
+        reserves: &crate::experts::plan::Reserves,
+        geometry: crate::experts::catalogue::ExpertGeometry,
+        rows: u32,
+    ) -> Result<Self> {
+        ensure!(rows > 0, "zero expert span rows={rows}");
+        let hidden = u64::from(geometry.hidden) * 2;
+        let choices = u64::from(geometry.top_k);
+        ensure!(
+            hidden > 0
+                && choices > 0
+                && reserves.residual_row_bytes == hidden
+                && reserves.normalized_row_bytes == hidden
+                && reserves.contribution_row_bytes == hidden * choices
+                && reserves.done_row_bytes == choices * 4
+                && reserves.route_row_bytes == choices * (4 + 2 + 4 + 8),
+            "expert span reserves disagree with geometry={geometry:?} rows={rows}"
+        );
+        let mut bytes = 0usize;
+        let mut region = |row_bytes: u64| -> Result<std::ops::Range<usize>> {
+            let first = bytes
+                .checked_add(15)
+                .context("expert span alignment overflow")?
+                & !15;
+            let count = usize::try_from(
+                row_bytes
+                    .checked_mul(u64::from(rows))
+                    .context("expert span region overflow")?,
+            )?;
+            bytes = first
+                .checked_add(count)
+                .context("expert span extent overflow")?;
+            Ok(first..bytes)
+        };
+        let residual = region(reserves.residual_row_bytes)?;
+        let normalized = region(reserves.normalized_row_bytes)?;
+        let contributions = region(reserves.contribution_row_bytes)?;
+        let done = region(reserves.done_row_bytes)?;
+        let ids = region(choices * 4)?;
+        let weights = region(choices * 2)?;
+        let active = region(choices * 4)?;
+        let generation = region(choices * 8)?;
+        let raw = reserves.span_bytes(rows)?;
+        let slot = geometry.slot_bytes()?;
+        ensure!(
+            slot.is_multiple_of(16) && bytes as u64 <= raw.div_ceil(slot) * slot,
+            "aligned expert span bytes={bytes} exceed borrowed bytes={} raw={raw}",
+            raw.div_ceil(slot) * slot
+        );
+        Ok(Self {
+            rows,
+            residual,
+            normalized,
+            contributions,
+            done,
+            ids,
+            weights,
+            active,
+            generation,
+            bytes,
+        })
+    }
+}
+
 impl ExpertWorkspaceBudget {
     pub fn new(
         request: ExpertWorkspaceRequest,
@@ -569,6 +650,27 @@ mod admission_tests {
         let fixed = 8192 + 71 * row_bytes + 71 * 937 + 4096 + 33088;
         assert_eq!(reserves.device_fixed_bytes, fixed as u64);
         assert_eq!(reserves.span_bytes(request.span_rows)?, 65_536 * 41136);
+        for rows in [1, 97, request.span_rows] {
+            let layout = ExpertSpanLayout::new(reserves, geometry, rows)?;
+            assert_eq!(layout.bytes, rows as usize * 41136);
+            let regions = [
+                &layout.residual,
+                &layout.normalized,
+                &layout.contributions,
+                &layout.done,
+                &layout.ids,
+                &layout.weights,
+                &layout.active,
+                &layout.generation,
+            ];
+            assert!(regions.iter().all(|r| r.start % 16 == 0));
+            assert!(regions.windows(2).all(|r| r[0].end <= r[1].start));
+            assert_eq!(
+                layout.contributions.len(),
+                layout.rows as usize * 8 * 2048 * 2
+            );
+            assert_eq!(layout.generation.end, layout.bytes);
+        }
         assert_eq!(
             reserves.persistent_bytes(&geometry)?,
             fixed as u64 + 2 * 6_291_456

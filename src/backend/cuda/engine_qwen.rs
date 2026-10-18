@@ -264,6 +264,26 @@ fn nested_verify_tcmqa(device_prefix: bool, rows: usize) -> Result<bool> {
     Ok(true)
 }
 impl Runtime {
+    fn select_positions(
+        &self,
+        stream: &Arc<CudaStream>,
+        meta: crate::backend::cuda::contracts::SeqRef,
+        workspace_rows: usize,
+    ) -> Result<()> {
+        let (table, _table) = self.positions.device_ptr(stream);
+        let (active, _active) = self.active_positions.device_ptr(stream);
+        let max_rows = u32::try_from(workspace_rows)?;
+        unsafe {
+            stream
+                .launch_builder(&self.gather_positions)
+                .arg(&table)
+                .arg(&active)
+                .arg(&meta.ptr)
+                .arg(&max_rows)
+                .launch(grid((workspace_rows * 3).div_ceil(256).min(65535), 256))?;
+        }
+        Ok(())
+    }
     pub(super) fn checkpoint_path(&self) -> &Path {
         &self.checkpoint_dir
     }
@@ -1243,6 +1263,7 @@ impl Engine {
             qwen: None,
             moe: None,
             moe_slots: None,
+            moe_prefill: None,
             #[cfg(test)]
             moe_test_ffn: None,
             mtp: None,
@@ -1273,6 +1294,7 @@ impl Engine {
                 geometry,
                 rows.min(8),
                 measured.service.worker_count()?,
+                (rows.min(8), rows.min(8) * geometry.top_k as usize),
             )?);
         }
         engine.prepare(1)?;
@@ -1630,6 +1652,31 @@ impl Engine {
         Ok(())
     }
 
+    pub(super) fn moe_ffn_binding(&self, layer: usize) -> Result<BoundFfn> {
+        let ffn = self
+            .qwen
+            .as_ref()
+            .context("MoE hybrid runtime missing")?
+            .layers
+            .get(layer)
+            .with_context(|| format!("MoE hybrid layer={layer} is outside runtime"))?
+            .ffn;
+        ensure!(
+            matches!(ffn, BoundFfn::Moe { .. }),
+            "MoE hybrid layer={layer} has a dense FFN binding"
+        );
+        Ok(ffn)
+    }
+
+    pub(super) fn select_qwen_positions(&self) -> Result<()> {
+        let q = self.qwen.as_ref().context("Q38 position runtime missing")?;
+        q.select_positions(
+            &self.device.stream,
+            self.state.seq_ref(&self.device.stream)?,
+            self.workspace_rows,
+        )
+    }
+
     pub(super) fn qwen_operator(
         &mut self,
         op: crate::backend::Operator,
@@ -1658,20 +1705,7 @@ impl Engine {
         };
         match op {
             O::Embed => {
-                let (table, _table) = q.positions.device_ptr(s);
-                let (active, _active) = q.active_positions.device_ptr(s);
-                let max_rows = self.workspace_rows as u32;
-                unsafe {
-                    s.launch_builder(&q.gather_positions)
-                        .arg(&table)
-                        .arg(&active)
-                        .arg(&domain.meta.ptr)
-                        .arg(&max_rows)
-                        .launch(grid(
-                            (self.workspace_rows * 3).div_ceil(256).min(65535),
-                            256,
-                        ))?;
-                }
+                q.select_positions(s, domain.meta, self.workspace_rows)?;
                 let ids = if step.input == crate::backend::Input::Token {
                     &w.token
                 } else {

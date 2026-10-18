@@ -10,6 +10,12 @@ use crate::experts::{
 use cudarc::driver::CudaFunction;
 use std::cell::RefCell;
 
+#[path = "engine_moe_prefill.rs"]
+mod prefill;
+pub(in crate::backend::cuda::engine) use prefill::Prefill;
+#[cfg(test)]
+pub(super) use prefill::cpu_bound;
+
 #[derive(Clone)]
 struct Ticket {
     id: u64,
@@ -448,7 +454,7 @@ pub(in crate::backend::cuda::engine) struct Slots {
     pub published: Vec<u64>,
     policy: Residency,
     catalogue: Arc<ExpertCatalogue>,
-    disk: Reader,
+    disk: Option<Reader>,
     transfers: Transfers,
     events: Events,
     physical: Vec<Physical>,
@@ -496,6 +502,24 @@ fn check_lifetime(expected: [Option<u64>; 2], owned: [Option<u64>; 2]) -> Result
         expected == owned,
         "expert slot lifetime differs: residency={expected:?} backend={owned:?}"
     );
+    Ok(())
+}
+
+#[cfg(test)]
+fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
+    unsafe extern "C" fn delay(_: *mut std::ffi::c_void) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    stream.context().bind_to_thread()?;
+    // SAFETY: the callback uses no CUDA API, shared data, or outstanding device work.
+    unsafe {
+        cudarc::driver::sys::cuLaunchHostFunc(
+            stream.cu_stream(),
+            Some(delay),
+            std::ptr::null_mut(),
+        )
+        .result()?;
+    }
     Ok(())
 }
 
@@ -560,6 +584,7 @@ impl Slots {
                 + transfers.host_use.len()
                 + transfers.stages.len()
                 + disk.copied.len()
+                + 2 * input.capacity.prefill_staging_slots as usize
                 + 4,
         )?;
         let logical = geometry.layers as usize * geometry.experts as usize;
@@ -572,7 +597,7 @@ impl Slots {
             published: vec![0; logical],
             policy,
             catalogue: input.catalogue.clone(),
-            disk,
+            disk: Some(disk),
             transfers,
             events,
             physical,
@@ -703,8 +728,12 @@ impl Slots {
                 (pointer, staging, None)
             }
             MoveSource::Disk => {
-                let ring = self.disk.read(layer, expert, &self.catalogue)?;
-                let values = self.disk.disk.values(ring)?;
+                let disk = self
+                    .disk
+                    .as_mut()
+                    .context("decode disk reader is owned by prefill IO")?;
+                let ring = disk.read(layer, expert, &self.catalogue)?;
+                let values = disk.disk.values(ring)?;
                 let pointer = values.as_ptr() as u64;
                 // SAFETY: the registered ring guard remains alive until the copy is submitted.
                 unsafe {
@@ -719,7 +748,7 @@ impl Slots {
                 .context("copy native disk expert into its physical slot")?;
                 let copy = self.events.record(&self.transfers.h2d)?;
                 values.copied(copy.id)?;
-                self.disk.copied[ring as usize] = Some(copy);
+                disk.copied[ring as usize] = Some(copy);
                 (pointer, None, Some(ring))
             }
         };
@@ -801,7 +830,6 @@ impl Slots {
         )
     }
 
-    #[cfg(test)]
     pub(super) fn begin_request(&mut self, frequency: &[Vec<f64>]) -> Result<()> {
         self.moves.clear();
         self.moves
@@ -1035,20 +1063,7 @@ impl Slots {
 
     #[cfg(test)]
     pub(super) fn delay_copies(&self) -> Result<()> {
-        unsafe extern "C" fn delay(_: *mut std::ffi::c_void) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        self.transfers.h2d.context().bind_to_thread()?;
-        // SAFETY: the callback uses no CUDA API, shared data, or outstanding device work.
-        unsafe {
-            cudarc::driver::sys::cuLaunchHostFunc(
-                self.transfers.h2d.cu_stream(),
-                Some(delay),
-                std::ptr::null_mut(),
-            )
-            .result()?;
-        }
-        Ok(())
+        delay_stream(&self.transfers.h2d)
     }
 }
 
@@ -1096,6 +1111,8 @@ mod tests {
                 "publication_equal",
                 "publication_older",
                 "publication_victim",
+                "publication_mutant_equal",
+                "publication_mutant_older",
             ] {
                 let output = Command::new(std::env::current_exe()?)
                     .args([
@@ -1108,27 +1125,56 @@ mod tests {
                     .env("FF_MOE_CHILD", case)
                     .output()?;
                 let log = String::from_utf8_lossy(&output.stdout);
-                let expected = if case == "publication_valid" { 0 } else { 3 };
+                let error = String::from_utf8_lossy(&output.stderr);
+                let mutant = case.starts_with("publication_mutant_");
+                let expected = if mutant {
+                    101
+                } else if case == "publication_valid" {
+                    0
+                } else {
+                    3
+                };
                 ensure!(
                     output.status.code() == Some(expected)
                         && log.contains("running 1 test")
-                        && log.contains(&format!("PASS slot_publication_epoch case={case}")),
+                        && if mutant {
+                            error.contains("DEFECT stale publication did not trap")
+                        } else {
+                            log.contains(&format!("PASS slot_publication_epoch case={case}"))
+                        },
                     "publication child case={case} exit={:?} stdout={log} stderr={}",
                     output.status.code(),
                     String::from_utf8_lossy(&output.stderr)
                 );
                 print!("{log}");
+                if mutant {
+                    println!(
+                        "PASS slot_publication_guard_ablation case={case} missing_guard_detected=true"
+                    );
+                }
             }
             return Ok(());
         };
         let device = Device::new(0)?;
         let stream = &device.stream;
-        let function = super::super::super::super::cubin::module(&device.ctx, "moe_route")?
-            .load_function("moe_slot_publish")?;
+        let module = if case.starts_with("publication_mutant_") {
+            let sm = super::super::super::super::cubin::capability(&device.ctx)?;
+            let runtime = std::env::var_os("FLYINGFISH_RUNTIME_DIR")
+                .context("publication mutant runtime missing")?;
+            let bytes = std::fs::read(
+                Path::new(&runtime).join(format!("moe_route_without_epoch_sm{sm}.cubin")),
+            )?;
+            device
+                .ctx
+                .load_module(cudarc::nvrtc::Ptx::from_binary(bytes))?
+        } else {
+            super::super::super::super::cubin::module(&device.ctx, "moe_route")?
+        };
+        let function = module.load_function("moe_slot_publish")?;
         let cases = match case.as_str() {
             "publication_valid" => vec![(1, 7, 8, -1), (0, 99, 1, -1), (1, 7, u64::MAX, 1)],
-            "publication_equal" => vec![(1, 7, 7, -1)],
-            "publication_older" => vec![(1, 7, 6, -1)],
+            "publication_equal" | "publication_mutant_equal" => vec![(1, 7, 7, -1)],
+            "publication_older" | "publication_mutant_older" => vec![(1, 7, 6, -1)],
             "publication_victim" => vec![(1, 7, 8, 0)],
             _ => anyhow::bail!("unknown publication child case={case}"),
         };

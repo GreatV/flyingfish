@@ -67,7 +67,7 @@ fn native_fixture(
     ))
 }
 
-fn hybrid_spec() -> Result<crate::model_spec::ModelSpec> {
+pub(super) fn hybrid_spec() -> Result<crate::model_spec::ModelSpec> {
     use crate::model_spec::{LayerPlan, Mixer};
     let mut spec = crate::model_spec::ModelSpec::minicpm(
         &serde_json::from_str(include_str!(concat!(
@@ -227,7 +227,7 @@ impl Engine {
         )
     }
 
-    fn load_moe_placed(
+    pub(in crate::backend::cuda::engine) fn load_moe_placed(
         fixture: &MoeFixture,
         runtime: &Path,
         capacity: &Capacity,
@@ -248,6 +248,29 @@ impl Engine {
         let config = model_spec.config();
         let manifest = hybrid_manifest(&model_spec)?;
         let geometry = ExpertGeometry::from_model(&model_spec)?;
+        let service = crate::experts::plan::ServiceTable::new(
+            "fixture",
+            [1, 2, 5, 8, 16, 32, 64]
+                .into_iter()
+                .flat_map(|rows| {
+                    [1, 2, 4, 8]
+                        .into_iter()
+                        .map(move |experts| crate::experts::plan::ServiceCell {
+                            workers: capacity.worker_count,
+                            rows,
+                            experts,
+                            seconds: f64::from(rows * experts) * 0.00002,
+                        })
+                })
+                .collect(),
+        )?;
+        let cpu_bounds = if capacity.prefill_staging_slots > 0 {
+            let bound =
+                residency::cpu_bound(geometry, capacity.span_rows, &service, 1_000_000_000.0)?;
+            (bound.0.max(8), bound.1.max(8 * geometry.top_k as usize))
+        } else {
+            (8, 8 * geometry.top_k as usize)
+        };
         let device = Device::new(0)?;
         let stream = &device.stream;
         let catalogue = native_fixture(fixture, runtime)?;
@@ -261,7 +284,7 @@ impl Engine {
                 catalogue,
                 directory: runtime,
                 engines,
-                max_rows: 8,
+                max_rows: cpu_bounds.0 as u32,
             },
         )?;
         std::fs::remove_file(runtime.join("expert-fixture.bin"))?;
@@ -319,9 +342,33 @@ impl Engine {
         let mut linear = LayerLinearPlan::bind(&plan, &catalog, None, stream)?;
         let ffn = BoundFfn::bind(&model_spec, &mut linear)?;
         let weights = Weights {
-            embed: stream.alloc_zeros(32 * d.hidden)?,
+            embed: stream.clone_htod(
+                &(0..32 * d.hidden)
+                    .map(|index| {
+                        let (token, column) = (index / d.hidden, index % d.hidden);
+                        if column < 8 {
+                            if token % 8 == column {
+                                bf16::ONE
+                            } else {
+                                bf16::ZERO
+                            }
+                        } else {
+                            bf16::from_f32((((token * 37 + column * 11) % 53) as f32 - 26.0) / 64.0)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )?,
             norm: stream.clone_htod(&vec![bf16::ONE; d.hidden])?,
-            head: stream.alloc_zeros(32 * d.hidden)?,
+            head: stream.clone_htod(
+                &(0..32 * d.hidden)
+                    .map(|index| {
+                        bf16::from_f32(
+                            (((index / d.hidden * 17 + index % d.hidden * 7) % 61) as f32 - 30.0)
+                                / 128.0,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )?,
             bytes: 0,
             layers: Vec::new(),
         };
@@ -335,13 +382,44 @@ impl Engine {
         let mut work = Work::new(stream, &model_spec, 8)?;
         stream.memcpy_htod(&[1i32], &mut work.length)?;
         let flash = Some(Flash::new(stream.clone(), 8, model_spec.q_heads as usize)?);
-        let moe = Some(Decode::new(&device, geometry, 8, capacity.worker_count)?);
+        let moe = Some(Decode::new(
+            &device,
+            geometry,
+            8,
+            capacity.worker_count,
+            cpu_bounds,
+        )?);
+        let moe_prefill = if capacity.prefill_staging_slots > 0 {
+            Some(Prefill::new(
+                &device,
+                geometry,
+                capacity,
+                crate::experts::plan::Reserves {
+                    device_fixed_bytes: 0,
+                    host_fixed_bytes: 0,
+                    residual_row_bytes: u64::from(geometry.hidden) * 2,
+                    normalized_row_bytes: u64::from(geometry.hidden) * 2,
+                    contribution_row_bytes: u64::from(geometry.top_k)
+                        * u64::from(geometry.hidden)
+                        * 2,
+                    done_row_bytes: u64::from(geometry.top_k) * 4,
+                    route_row_bytes: u64::from(geometry.top_k) * 18,
+                    prefill_staging_slots: capacity.prefill_staging_slots,
+                    disk_ring_slots: engines.min(2),
+                },
+                service,
+                1_000_000_000.0,
+            )?)
+        } else {
+            None
+        };
         let mut engine = Self {
             capture_fail_after_layer: None,
             capture_fail_stage: None,
             qwen: None,
             moe,
             moe_slots: Some(slots),
+            moe_prefill,
             moe_test_ffn: Some(ffn),
             mtp: None,
             mtp_state: None,
@@ -500,7 +578,7 @@ fn step(rows: usize) -> crate::backend::Step<'static> {
     }
 }
 
-fn tier_fixture(variant: u32) -> MoeFixture {
+pub(super) fn tier_fixture(variant: u32) -> MoeFixture {
     let mut values = fixture(MoeDims::new(8, 16, 4, 128, 64), variant);
     values.router_w.fill(bf16::ZERO);
     for row in 0..8 {
@@ -528,7 +606,7 @@ fn routed_experts(row: usize) -> [u32; 4] {
     ]
 }
 
-fn tier_capacity(geometry: ExpertGeometry, pinned: bool) -> Result<Capacity> {
+pub(super) fn tier_capacity(geometry: ExpertGeometry, pinned: bool) -> Result<Capacity> {
     let slot = geometry.slot_bytes()?;
     Ok(Capacity {
         span_rows: 8,

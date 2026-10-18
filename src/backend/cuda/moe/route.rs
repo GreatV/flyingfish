@@ -6,7 +6,6 @@ use crate::backend::cuda::contracts::{Tensor, TensorMut};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
 use anyhow::{Result, ensure};
-#[cfg(test)]
 use cudarc::cublas::{CudaBlas, sys as bs};
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, PushKernelArg};
 use half::bf16;
@@ -14,9 +13,7 @@ use std::sync::Arc;
 
 pub(crate) struct RouteOps {
     route: CudaFunction,
-    #[cfg(test)]
     topk: CudaFunction,
-    #[cfg(test)]
     blas: CudaBlas,
     stream: Arc<CudaStream>,
 }
@@ -24,9 +21,7 @@ pub(crate) struct RouteOps {
 impl RouteOps {
     pub fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<Self> {
         let module = cubin::module(ctx, "moe_route")?;
-        #[cfg(test)]
         let blas = CudaBlas::new(stream.clone())?;
-        #[cfg(test)]
         unsafe {
             bs::cublasSetMathMode(
                 *blas.handle(),
@@ -36,9 +31,7 @@ impl RouteOps {
         }
         Ok(Self {
             route: module.load_function("moe_route_bf16")?,
-            #[cfg(test)]
             topk: module.load_function("moe_route_topk")?,
-            #[cfg(test)]
             blas,
             stream: stream.clone(),
         })
@@ -76,7 +69,6 @@ impl RouteOps {
     /// Prefill routing: logits = x·routerᵀ via one cuBLAS GEMM, then
     /// `moe_route_topk`. `logits` is the GEMM output buffer, [rows, experts]
     /// dense; it is not read after this call returns.
-    #[cfg(test)]
     pub fn route_prefill(
         &self,
         stream: &Arc<CudaStream>,
@@ -163,7 +155,6 @@ impl RouteOps {
     }
 }
 
-#[cfg(test)]
 fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
     a: &Tensor<T, R>,
     b: &Tensor<U, S>,

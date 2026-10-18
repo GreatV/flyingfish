@@ -198,3 +198,15 @@ extern "C" __global__ void moe_slot_publish(
   generation[incoming] = epoch;
   valid[incoming] = 1;
 }
+
+extern "C" __global__ void moe_route_mask(
+    const int* ids, const uint32_t* valid, const uint64_t* generation,
+    uint32_t* active, uint64_t* assignment_gen, int assignments, int experts) {
+  const int a = blockIdx.x * blockDim.x + threadIdx.x;
+  if (a >= assignments) return;
+  const int expert = ids[a];
+  if (expert < 0 || expert >= experts || valid[expert] > 1 ||
+      (valid[expert] == 1 && generation[expert] == 0)) __trap();
+  active[a] = valid[expert];
+  assignment_gen[a] = valid[expert] ? generation[expert] : 0;
+}
