@@ -76,7 +76,8 @@ impl Bounds {
             serde_json::from_slice(&std::fs::read(directory.join("noise_floor_r2.json"))?)?;
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join("fixtures_manifest.json"))?)?;
-        let comparisons = noise["per_case_reference_floor"]["cases"][case]["comparisons"]
+        let floor = &noise["per_case_reference_floor"]["cases"][case];
+        let comparisons = floor["comparisons"]
             .as_object()
             .with_context(|| format!("missing per-case reference noise {case}"))?;
         ensure!(
@@ -86,10 +87,13 @@ impl Bounds {
         let mut layers = std::collections::BTreeMap::new();
         for layer in [0, 3, 6, 19, 39] {
             let key = format!("layer_{layer:02}_hidden_last8");
-            let cells: Vec<_> = comparisons
+            let mut cells: Vec<_> = comparisons
                 .values()
                 .map(|cell| &cell["layers"][&key])
                 .collect();
+            if layer == 0 {
+                cells.push(&floor["fp32_layer0"]);
+            }
             layers.insert(layer, measured_bounds(&cells)?);
         }
         let cells = |key: &str| {
@@ -578,6 +582,70 @@ fn cosine_budget_covers_two_opposite_reference_errors() -> Result<()> {
         bound[3]
     );
     Ok(())
+}
+
+#[test]
+fn layer0_precision_floor_is_selected_per_input() -> Result<()> {
+    let directory = std::env::temp_dir().join(format!(
+        "flyingfish-layer0-floor-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory)?;
+    let result = (|| -> Result<()> {
+        let zero = serde_json::json!({"max_abs":0.0, "p99_abs":0.0,
+            "mean_abs":0.0, "cosine_sim":1.0});
+        let layers = [0, 3, 6, 19, 39]
+            .map(|layer| (format!("layer_{layer:02}_hidden_last8"), zero.clone()))
+            .into_iter()
+            .collect::<serde_json::Map<_, _>>();
+        let comparison = serde_json::json!({"layers":layers, "norm":zero,
+            "logits":zero, "teacher_top2":zero});
+        let comparisons = (0..4)
+            .map(|index| (index.to_string(), comparison.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        let cases = [("text_32", 0.125), ("image_boat_16x", 0.25)]
+            .map(|(case, error)| {
+                (
+                    case.to_owned(),
+                    serde_json::json!({"comparisons":comparisons,
+                    "fp32_layer0":{"max_abs":error, "p99_abs":error/2.0,
+                        "mean_abs":error/4.0, "cosine_sim":1.0}}),
+                )
+            })
+            .into_iter()
+            .collect::<serde_json::Map<_, _>>();
+        std::fs::write(
+            directory.join("noise_floor_r2.json"),
+            serde_json::to_vec(&serde_json::json!({"per_case_reference_floor":{"cases":cases}}))?,
+        )?;
+        let media = serde_json::json!({"max_abs":1.0, "cosine_sim":0.0});
+        std::fs::write(
+            directory.join("fixtures_manifest.json"),
+            serde_json::to_vec(&serde_json::json!({"image":{"media_reach_controls":{
+                "same_grid_400x267_hockey_vs_boat_logits_diff":media,
+                "hockey_16x_vs_boat_16x_logits_diff":media}}}))?,
+        )?;
+        for (case, expected) in [("text_32", 0.25), ("image_boat_16x", 0.5)] {
+            let bounds = Bounds::read(&directory.join("fixtures"), case)?;
+            ensure!(
+                bounds.layers[&0] == [expected, expected / 2.0, expected / 4.0, 1.0],
+                "wrong layer0 precision floor for {case}: {:?}",
+                bounds.layers[&0]
+            );
+            for layer in [3, 6, 19, 39] {
+                assert_eq!(bounds.layers[&layer], [0.0, 0.0, 0.0, 1.0]);
+            }
+            assert_eq!(bounds.norm, [0.0, 0.0, 0.0, 1.0]);
+            assert_eq!(bounds.logits, [0.0, 0.0, 0.0, 1.0]);
+            assert_eq!(bounds.decode, [0.0, 0.0, 0.0, 1.0]);
+        }
+        Ok(())
+    })();
+    std::fs::remove_dir_all(&directory)?;
+    result
 }
 
 #[test]
