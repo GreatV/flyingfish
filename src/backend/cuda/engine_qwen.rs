@@ -109,6 +109,11 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             "hybrid engine does not implement {name}={value}"
         );
     }
+    ensure!(
+        gdn.qk_norm_fp32 == (hv == 32),
+        "hybrid engine does not implement qk_norm_fp32={} for linear_num_value_heads={hv}",
+        gdn.qk_norm_fp32
+    );
     Ok(())
 }
 
@@ -2004,6 +2009,7 @@ mod tests {
                 "linear_key_head_dim",
                 "linear_value_head_dim",
                 "linear_conv_kernel_dim",
+                "qk_norm_fp32",
                 "gdn",
                 "linear_format",
                 "architecture",
@@ -2029,6 +2035,10 @@ mod tests {
                     "linear_key_head_dim" => bad.gdn.as_mut().unwrap().key_head_dim += 1,
                     "linear_value_head_dim" => bad.gdn.as_mut().unwrap().value_head_dim += 1,
                     "linear_conv_kernel_dim" => bad.gdn.as_mut().unwrap().conv_kernel += 1,
+                    "qk_norm_fp32" => {
+                        let gdn = bad.gdn.as_mut().unwrap();
+                        gdn.qk_norm_fp32 = !gdn.qk_norm_fp32;
+                    }
                     "gdn" => bad.gdn = None,
                     "linear_format" => {
                         bad.linear_format = match original.linear_format {

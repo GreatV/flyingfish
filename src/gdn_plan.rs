@@ -298,6 +298,7 @@ mod tests {
         for hv in [32, 48] {
             let spec = GdnSpec {
                 hv,
+                qk_norm_fp32: hv == 32,
                 ..GdnSpec::q38()
             };
             let cd = (2 * spec.hk + hv) * 128;

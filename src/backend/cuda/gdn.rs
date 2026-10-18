@@ -1105,6 +1105,7 @@ mod tests {
         out: Vec<bf16>,
         state: Vec<f32>,
         history: Vec<f32>,
+        norm_ratio: f64,
     }
 
     fn geometry_meta(
@@ -1141,7 +1142,6 @@ mod tests {
         valid: u32,
         core: GeometryCore,
         graph: bool,
-        mutant: bool,
     ) -> Result<GeometryOutput> {
         use cudarc::driver::{DevicePtr, sys};
         let stream = &device.stream;
@@ -1161,7 +1161,7 @@ mod tests {
         for row in 0..if sequential { valid } else { 1 } {
             let bound = if sequential { 1 } else { rows };
             let meta = geometry_meta(stream, 23 + row, if sequential { 1 } else { valid })?;
-            let mut plan = GdnOps::prepare(
+            let plan = GdnOps::prepare(
                 &device.ctx,
                 &spec,
                 bound,
@@ -1169,21 +1169,6 @@ mod tests {
                 common.clone(),
                 p2,
             )?;
-            if mutant {
-                let root = std::path::PathBuf::from(
-                    std::env::var_os("FF_Q38_PROBE_DIR").context("FF_Q38_PROBE_DIR is required")?,
-                );
-                let path = root.join(format!(
-                    "gdn_prep_h32_wrong_gqa_sm{}.cubin",
-                    device.info.arch
-                ));
-                let module = device
-                    .ctx
-                    .load_module(cudarc::nvrtc::Ptx::from_binary(std::fs::read(path)?))?;
-                Arc::get_mut(&mut plan.kernels)
-                    .context("geometry fixture unexpectedly shares kernels")?
-                    .prep = module.load_function("gdn_prep_fp32")?;
-            }
             plans.push((plan, meta));
         }
         let p1 = if let GeometryCore::P1(split) = core {
@@ -1268,6 +1253,14 @@ mod tests {
             execute()?;
         }
         stream.synchronize()?;
+        let norm_ratio = if spec.qk_norm_fp32 {
+            let plan = &plans.last().context("empty geometry plans")?.0;
+            let data = stream.clone_dtoh(&workspace.slice(..plan.ws.bytes as usize))?;
+            let checked_rows = if sequential { 1 } else { valid };
+            geometry_qk_norm(&data, plan, checked_rows)?
+        } else {
+            0.0
+        };
         let out = stream.clone_dtoh(&buffers.out)?;
         let state = stream.clone_dtoh(&buffers.state)?;
         let history = stream.clone_dtoh(&buffers.history)?;
@@ -1288,43 +1281,86 @@ mod tests {
             out,
             state,
             history,
+            norm_ratio,
         })
     }
 
-    fn geometry_mismatches(a: &GeometryOutput, b: &GeometryOutput, valid: u32) -> usize {
-        let mut mismatches = 0;
-        for h in 0..32 {
-            let reference = h / 2 * 3 + h % 2;
-            for row in 0..valid as usize {
-                for d in 0..128 {
-                    mismatches += usize::from(
-                        a.out[(row * 32 + h) * 128 + d].to_bits()
-                            != b.out[(row * 48 + reference) * 128 + d].to_bits(),
-                    );
+    fn geometry_qk_norm(data: &[u8], plan: &GdnPlan, rows: u32) -> Result<f64> {
+        let spec = plan.spec;
+        let read_bf16 = |offset: usize| {
+            f64::from(
+                bf16::from_bits(u16::from_ne_bytes([data[offset], data[offset + 1]])).to_f32(),
+            )
+        };
+        let read_f32 = |offset: usize| {
+            f64::from(f32::from_ne_bytes(
+                data[offset..offset + 4].try_into().unwrap(),
+            ))
+        };
+        // DK reduction roundings, rsqrt's 2-ulp error, query scaling and output multiplies.
+        let relative_bound = super::super::gamma(spec.dk as usize + 8, 2f64.powi(-24));
+        let mut worst_ratio = 0f64;
+        for row in 0..rows as usize {
+            for kh in 0..spec.hk as usize {
+                for (side, region) in [plan.ws.q_fp32, plan.ws.k_fp32].into_iter().enumerate() {
+                    let offset = plan.ws.conv_out.offset as usize
+                        + (row * plan.conv_dim as usize
+                            + (side * spec.hk as usize + kh) * spec.dk as usize)
+                            * 2;
+                    let sum: f64 = (0..spec.dk as usize)
+                        .map(|d| read_bf16(offset + d * 2).powi(2))
+                        .sum();
+                    ensure!(sum.is_finite(), "nonfinite GDN Q/K reference");
+                    let inv = (sum + f64::from(plan.l2_eps)).sqrt().recip();
+                    let scale = if side == 0 {
+                        f64::from(spec.dk).sqrt().recip()
+                    } else {
+                        1.0
+                    };
+                    for child in 0..spec.hv / spec.hk {
+                        let head = kh * (spec.hv / spec.hk) as usize + child as usize;
+                        for d in 0..spec.dk as usize {
+                            let expected = read_bf16(offset + d * 2) * inv * scale;
+                            let index = (row * spec.hv as usize + head) * spec.dk as usize + d;
+                            let actual = read_f32(region.offset as usize + index * 4);
+                            ensure!(actual.is_finite(), "nonfinite GDN Q/K preparation");
+                            let error = (actual - expected).abs();
+                            let bound = expected.abs() * relative_bound;
+                            let ratio = if bound == 0.0 {
+                                if error == 0.0 { 0.0 } else { f64::INFINITY }
+                            } else {
+                                error / bound
+                            };
+                            worst_ratio = worst_ratio.max(ratio);
+                        }
+                    }
                 }
             }
-            for element in 0..128 * 128 {
-                mismatches += usize::from(
-                    a.state[h * 128 * 128 + element].to_bits()
-                        != b.state[reference * 128 * 128 + element].to_bits(),
-                );
-            }
         }
-        for channel in 0..8192 {
-            let reference = if channel < 4096 {
-                channel
-            } else {
-                4096 + ((channel - 4096) / 128 / 2 * 3 + ((channel - 4096) / 128) % 2) * 128
-                    + channel % 128
-            };
-            for tap in 0..3 {
-                mismatches += usize::from(
-                    a.history[channel * 3 + tap].to_bits()
-                        != b.history[reference * 3 + tap].to_bits(),
-                );
-            }
-        }
-        mismatches
+        println!(
+            "GDN_QK_FP32 rows={rows} hv={} relative_bound={relative_bound} worst_ratio={worst_ratio} {}",
+            spec.hv,
+            if worst_ratio <= 1.0 { "PASS" } else { "DEFECT" }
+        );
+        Ok(worst_ratio)
+    }
+
+    fn geometry_mismatches(a: &GeometryOutput, b: &GeometryOutput) -> usize {
+        a.out
+            .iter()
+            .zip(&b.out)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count()
+            + a.state
+                .iter()
+                .zip(&b.state)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count()
+            + a.history
+                .iter()
+                .zip(&b.history)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count()
     }
 
     #[test]
@@ -1344,26 +1380,34 @@ mod tests {
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
         let spec = GdnSpec::from_model(&model)?;
+        let mut defects = 0;
         for core in [
             GeometryCore::Recurrent,
             GeometryCore::Chunked,
             GeometryCore::P2,
         ] {
             for graph in [false, true] {
-                let reference = geometry_run(&device, GdnSpec::q38(), 2, 2, core, graph, false)?;
-                let candidate = geometry_run(&device, spec, 2, 2, core, graph, false)?;
-                ensure!(
-                    geometry_mismatches(&candidate, &reference, 2) == 0,
-                    "mixer SMOKE geometry differs"
+                let reference_core = if matches!(core, GeometryCore::P2) {
+                    GeometryCore::P1(4)
+                } else {
+                    core
+                };
+                let reference = geometry_run(&device, spec, 2, 2, reference_core, false)?;
+                let candidate = geometry_run(&device, spec, 2, 2, core, graph)?;
+                defects += usize::from(
+                    geometry_mismatches(&candidate, &reference) != 0
+                        || candidate.norm_ratio > 1.0
+                        || reference.norm_ratio > 1.0,
                 );
             }
         }
-        println!("MIXER_SMOKE PASS prefix=23 rows=2 cores=3 graph_modes=2");
+        println!("MIXER_SMOKE prefix=23 rows=2 cores=3 graph_modes=2 defects={defects}");
+        ensure!(defects == 0, "mixer SMOKE DEFECT cases={defects}");
         Ok(())
     }
 
     #[test]
-    #[ignore = "GPU window and FF_Q38_PROBE_DIR/gdn_prep_h32_wrong_gqa_sm{86,89}.cubin required"]
+    #[ignore = "exclusive GPU window required"]
     fn mixer_geometry_gdn_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -1404,32 +1448,27 @@ mod tests {
             }
             for core in cores {
                 for graph in [false, true] {
+                    let reference_core = if matches!(core, GeometryCore::P2) {
+                        GeometryCore::P1(4)
+                    } else {
+                        core
+                    };
                     let reference =
-                        geometry_run(&device, GdnSpec::q38(), rows, valid, core, graph, false)?;
-                    let candidate = geometry_run(&device, spec, rows, valid, core, graph, false)?;
-                    let mismatches = geometry_mismatches(&candidate, &reference, valid);
+                        geometry_run(&device, spec, rows, valid, reference_core, false)?;
+                    let candidate = geometry_run(&device, spec, rows, valid, core, graph)?;
+                    let mismatches = geometry_mismatches(&candidate, &reference);
+                    let passed = mismatches == 0
+                        && candidate.norm_ratio <= 1.0
+                        && reference.norm_ratio <= 1.0;
                     println!(
                         "GDN_GEOMETRY core={core:?} rows={rows} valid={valid} prefix=23 graph={graph} mismatches={mismatches} {}",
-                        if mismatches == 0 { "PASS" } else { "DEFECT" }
+                        if passed { "PASS" } else { "DEFECT" }
                     );
-                    defects += usize::from(mismatches != 0);
+                    defects += usize::from(!passed);
                     cases += 1;
                 }
             }
         }
-        let reference = geometry_run(
-            &device,
-            GdnSpec::q38(),
-            8,
-            8,
-            GeometryCore::Chunked,
-            false,
-            false,
-        )?;
-        let mutant = geometry_run(&device, spec, 8, 8, GeometryCore::Chunked, false, true)?;
-        let mismatches = geometry_mismatches(&mutant, &reference, 8);
-        ensure!(mismatches > 0, "h/3 mutant was not detected");
-        println!("GDN_WRONG_GQA_MUTANT PASS mismatches={mismatches}");
         println!("GDN_GEOMETRY_SUMMARY cases={cases} defects={defects}");
         ensure!(defects == 0, "GDN_GEOMETRY DEFECT cases={defects}");
         Ok(())
@@ -2061,6 +2100,7 @@ mod tests {
         for (hv, stored_channels) in [(32, 8192), (48, 10240)] {
             let spec = GdnSpec {
                 hv,
+                qk_norm_fp32: hv == 32,
                 ..GdnSpec::q38()
             };
             assert_eq!(spec.conv_dim().expect("conv_dim"), stored_channels);

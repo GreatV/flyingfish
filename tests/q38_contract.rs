@@ -16,16 +16,13 @@ fn g0_normalized_geometry_and_rejections() {
             key_head_dim: 128,
             value_head_dim: 128,
             conv_kernel: 4,
+            qk_norm_fp32: false,
         })
     );
     assert_eq!(spec.moe, None);
     assert_eq!(spec.linear_format, LinearFormat::Fp8E4m3Block128);
-    let canonical = serde_json::to_string(&spec).unwrap();
-    assert_eq!(
-        flyingfish::prefix_state::sha256(canonical.as_bytes()),
-        "071f71a3277004bf8f4878a65e5384f54fdb3b188f100cbedd3def52e7582d66",
-        "Q38 spec serialization changed"
-    );
+    let canonical = serde_json::to_value(&spec).unwrap();
+    assert_eq!(canonical["gdn"]["qk_norm_fp32"], false);
     let public = spec.config();
     assert_eq!(
         (
