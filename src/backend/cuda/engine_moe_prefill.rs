@@ -1797,7 +1797,7 @@ impl Gpu {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::tests::{hybrid_spec, tier_capacity, tier_fixture};
+    use super::super::super::tests::{hybrid_spec, tier_capacity, tier_fixture, tier_service};
     use super::*;
     use crate::backend::cuda::moe::reference::MoeFixture;
     use crate::cpu::expert_ffn::{Contribution, Isa, Scratch, contribution};
@@ -1902,6 +1902,13 @@ mod tests {
                 assert_eq!(capacity.pinned, pinned);
             }
         }
+        let capacity = capacity(geometry, 17, false, 2, false)?;
+        assert_eq!(reference_cpu_choices(&[0, 3, 4, 5], 0, &capacity)?, [4, 5]);
+        assert_eq!(
+            reference_cpu_choices(&[0, 3, 4, 5], 1, &capacity)?,
+            [3, 4, 5]
+        );
+        assert!(reference_cpu_choices(&[0, 3, 4, 5].repeat(3), 1, &capacity)?.is_empty());
         println!(
             "PASS prefill_span_cpu_views spans=8,17,37,263 global_choice_offsets=true borrowed_tail_prefix=true wave_workspace_bound=true derived_host_surplus_blocks=1 GPU_executed=false"
         );
@@ -1995,7 +2002,8 @@ mod tests {
         engine: &Engine,
         fixture: &MoeFixture,
         layer: u32,
-        cpu_experts: &[u32],
+        wave: usize,
+        cpu_experts: impl FnOnce(&[i32]) -> Result<Vec<u32>>,
     ) -> Result<Reference> {
         let stream = &engine.device.stream;
         let rows = fixture.dims.rows;
@@ -2027,6 +2035,7 @@ mod tests {
         )?;
         let host_ids = stream.clone_dtoh(&ids)?;
         let host_weights = stream.clone_dtoh(&weights)?;
+        let cpu_experts = cpu_experts(&host_ids)?;
         let slots = engine
             .moe_slots
             .as_ref()
@@ -2060,9 +2069,9 @@ mod tests {
         let done = stream.alloc_zeros::<u32>(rows * 4)?;
         let y = stream.alloc_zeros::<bf16>(rows * 128)?;
         let scratch =
-            stream.alloc_zeros::<u8>(prefill_scratch_bytes(4, 4, 16, 128, 64)? as usize)?;
-        for base in (0..rows).step_by(4) {
-            let count = 4.min(rows - base);
+            stream.alloc_zeros::<u8>(prefill_scratch_bytes(wave, 4, 16, 128, 64)? as usize)?;
+        for base in (0..rows).step_by(wave) {
+            let count = wave.min(rows - base);
             decode.prefill.prefill_contribute(
                 stream,
                 MoePrefillContribute {
@@ -2115,7 +2124,7 @@ mod tests {
             down: 16384..24576,
             down_stride: 64,
         };
-        for &expert in cpu_experts {
+        for &expert in &cpu_experts {
             let expert = expert as usize;
             let arena = fixture.gate_up[expert * 16384..(expert + 1) * 16384]
                 .iter()
@@ -2148,8 +2157,8 @@ mod tests {
             }
         }
         stream.memcpy_htod(&expected, &mut contributions)?;
-        for base in (0..rows).step_by(4) {
-            let count = 4.min(rows - base);
+        for base in (0..rows).step_by(wave) {
+            let count = wave.min(rows - base);
             decode.prefill.prefill_finish(
                 stream,
                 MoePrefillFinish {
@@ -2204,11 +2213,12 @@ mod tests {
                 let oracle = Engine::load_moe_test(
                     &fixture,
                     &runtime.join(format!("ref-{variant}-{rows}")),
+                    8,
                 )?;
                 let mut expected = Vec::new();
                 for layer in 0..2 {
-                    let first = reference(&oracle, &fixture, layer, &[])?;
-                    let second = reference(&oracle, &fixture, layer, &[])?;
+                    let first = reference(&oracle, &fixture, layer, 4, |_| Ok(Vec::new()))?;
+                    let second = reference(&oracle, &fixture, layer, 4, |_| Ok(Vec::new()))?;
                     ensure!(
                         first.ids == second.ids
                             && same_bits(&first.weights, &second.weights, |x| u32::from(
@@ -2236,6 +2246,7 @@ mod tests {
                             budget_bytes_per_token: 2 * capacity.slot_bytes(),
                         },
                         engines,
+                        8,
                     )?;
                     let mut prefill = engine
                         .moe_prefill
@@ -2402,8 +2413,9 @@ mod tests {
                             }
                             engine.device.stream.synchronize()?;
                         }
-                        let reference =
-                            reference(&oracle, &fixture, layer as u32, expected_plan.cpu())?;
+                        let reference = reference(&oracle, &fixture, layer as u32, 4, |_| {
+                            Ok(expected_plan.cpu().to_vec())
+                        })?;
                         let actual = engine.device.stream.clone_dtoh(&output)?;
                         let span = prefill.span.as_ref().context("prefill gate span missing")?;
                         let mut contributions = vec![bf16::ZERO; rows as usize * 4 * 128];
@@ -2635,6 +2647,173 @@ mod tests {
             .fold(0.0, f32::max))
     }
 
+    fn reference_cpu_choices(ids: &[i32], layer: u32, capacity: &Capacity) -> Result<Vec<u32>> {
+        let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+        ensure!(
+            !ids.is_empty() && ids.len().is_multiple_of(geometry.top_k as usize),
+            "order reference choices={} are not complete top_k={} rows",
+            ids.len(),
+            geometry.top_k
+        );
+        let layout = crate::experts::arena::SlotLayout::new(geometry, capacity)?;
+        let borrowed = crate::experts::plan::span_borrow_slots(
+            &reserves(geometry),
+            capacity.slot_bytes(),
+            capacity.span_rows,
+            capacity.span_rows,
+        )?;
+        let mut resident = vec![false; geometry.experts as usize];
+        for expert in 0..layout.slot_count(layer)? {
+            let slot = layout.resident_slot(layer, expert)?.start / layout.slot_bytes();
+            resident[expert as usize] = slot < (capacity.slots_total() - borrowed) as usize;
+        }
+        let mut counts = vec![0; geometry.experts as usize];
+        for &expert in ids {
+            ensure!(
+                (0..geometry.experts as i32).contains(&expert),
+                "order reference expert={expert} outside0..{}",
+                geometry.experts
+            );
+            counts[expert as usize] += 1;
+        }
+        let mut plan = SpanPlan::new(
+            &geometry,
+            capacity.slot_bytes(),
+            capacity.prefill_staging_slots,
+            capacity.worker_count,
+        )?;
+        plan.update(
+            &counts,
+            &resident,
+            u32::try_from(ids.len() / geometry.top_k as usize)?,
+            capacity
+                .wave_rows
+                .min((ids.len() / geometry.top_k as usize) as u32),
+            &SpanRates {
+                service: &tier_service(capacity.worker_count)?,
+                h2d_bytes_per_second: 1_000_000_000.0,
+            },
+        )?;
+        Ok(plan.cpu().to_vec())
+    }
+
+    fn reference_layer_order(
+        engine: &mut Engine,
+        ids: &[u32],
+        schedule: [usize; 3],
+        placement: Option<&Capacity>,
+    ) -> Result<(Vec<bf16>, Vec<f32>)> {
+        use crate::backend::Operator as O;
+        let [span_rows, chunk, wave] = schedule;
+        ensure!(
+            span_rows > 0
+                && chunk > 0
+                && wave > 0
+                && chunk <= engine.workspace_rows
+                && wave <= engine.workspace_rows,
+            "order reference schedule={schedule:?} workspace={}",
+            engine.workspace_rows
+        );
+        engine.reset()?;
+        let mut fixture = tier_fixture(3);
+        let mut hidden = Vec::new();
+        for (span_index, admitted) in ids.chunks(span_rows).enumerate() {
+            let start = span_index * span_rows;
+            let mut residual = Vec::new();
+            for (index, values) in admitted.chunks(chunk).enumerate() {
+                let step = engine.moe_wave(start + index * chunk, values.len())?;
+                engine
+                    .device
+                    .stream
+                    .memcpy_htod(values, &mut engine.work.ids.slice_mut(..values.len()))?;
+                engine.run_operator(O::Embed, 0, step, &mut None)?;
+                residual.extend(
+                    engine
+                        .device
+                        .stream
+                        .clone_dtoh(&engine.work.x.slice(..values.len() * 128))?,
+                );
+            }
+            for layer in 0..engine.model_spec.layers.len() {
+                let mut normalized = Vec::new();
+                for base in (0..admitted.len()).step_by(chunk) {
+                    let rows = chunk.min(admitted.len() - base);
+                    let step = engine.moe_wave(start + base, rows)?;
+                    engine.select_qwen_positions()?;
+                    engine.device.stream.memcpy_htod(
+                        &residual[base * 128..(base + rows) * 128],
+                        &mut engine.work.x.slice_mut(..rows * 128),
+                    )?;
+                    engine.qwen_layer_begin(layer, step)?;
+                    engine.run_operator(O::Norm, layer, step, &mut None)?;
+                    engine.qwen_mixer(layer, step, &mut None)?;
+                    engine.run_operator(O::PostNorm, layer, step, &mut None)?;
+                    residual[base * 128..(base + rows) * 128].copy_from_slice(
+                        &engine
+                            .device
+                            .stream
+                            .clone_dtoh(&engine.work.x.slice(..rows * 128))?,
+                    );
+                    normalized.extend(
+                        engine
+                            .device
+                            .stream
+                            .clone_dtoh(&engine.work.n.slice(..rows * 128))?,
+                    );
+                }
+                fixture.x = normalized;
+                fixture.dims.rows = admitted.len();
+                let ffn = reference(
+                    engine,
+                    &fixture,
+                    layer as u32,
+                    wave,
+                    |ids| match placement {
+                        Some(capacity) => reference_cpu_choices(ids, layer as u32, capacity),
+                        None => Ok(Vec::new()),
+                    },
+                )?;
+                for base in (0..admitted.len()).step_by(wave) {
+                    let rows = wave.min(admitted.len() - base);
+                    let step = engine.moe_wave(start + base, rows)?;
+                    engine.device.stream.memcpy_htod(
+                        &residual[base * 128..(base + rows) * 128],
+                        &mut engine.work.x.slice_mut(..rows * 128),
+                    )?;
+                    engine.device.stream.memcpy_htod(
+                        &ffn.output[base * 128..(base + rows) * 128],
+                        &mut engine.work.out.slice_mut(..rows * 128),
+                    )?;
+                    engine.run_operator(O::NextNorm, layer, step, &mut None)?;
+                    residual[base * 128..(base + rows) * 128].copy_from_slice(
+                        &engine
+                            .device
+                            .stream
+                            .clone_dtoh(&engine.work.x.slice(..rows * 128))?,
+                    );
+                }
+            }
+            for base in (0..admitted.len()).step_by(chunk) {
+                let rows = chunk.min(admitted.len() - base);
+                let mut step = engine.moe_wave(start + base, rows)?;
+                engine.device.stream.memcpy_htod(
+                    &residual[base * 128..(base + rows) * 128],
+                    &mut engine.work.x.slice_mut(..rows * 128),
+                )?;
+                if start + base + rows == ids.len() {
+                    step.head = Head::Last;
+                }
+                engine.run_operator(O::Head, 0, step, &mut None)?;
+            }
+            hidden.extend(residual);
+        }
+        let logits = engine
+            .device
+            .stream
+            .clone_dtoh(&engine.work.logits.slice(..32))?;
+        Ok((hidden, logits.into_iter().map(bf16::to_f32).collect()))
+    }
+
     #[test]
     #[ignore = "authorized GPU window"]
     fn prefill_layer_order_gpu() -> Result<()> {
@@ -2644,7 +2823,7 @@ mod tests {
         );
         let fixture = tier_fixture(3);
         let ids = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3];
-        let mut oracle = Engine::load_moe_test(&fixture, &runtime.join("order-reference"))?;
+        let mut oracle = Engine::load_moe_test(&fixture, &runtime.join("order-reference"), 8)?;
         let baseline = reference_order(&mut oracle, &ids, 8)?;
         let repeated = reference_order(&mut oracle, &ids, 8)?;
         ensure!(
@@ -2652,29 +2831,86 @@ mod tests {
                 && same_bits(&baseline.1, &repeated.1, f32::to_bits),
             "Runner FAIL prefill order same-form repeat differs"
         );
-        let mut floor = [0.0f32; 2];
-        for chunk in [1, 4] {
+        let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+        let capacities = [
+            capacity(geometry, 17, false, 2, false)?,
+            capacity(geometry, 8, false, 2, false)?,
+        ];
+        let mut floor_cases = Vec::new();
+        for chunk in [1, 4, 2] {
             let other = reference_order(&mut oracle, &ids, chunk)?;
-            floor[0] = floor[0].max(max_difference(&baseline.0, &other.0, bf16::to_f32)?);
-            floor[1] = floor[1].max(max_difference(&baseline.1, &other.1, |x| x)?);
+            let repeat = reference_order(&mut oracle, &ids, chunk)?;
+            floor_cases.push((format!("chunk{chunk}"), other, repeat));
+        }
+        let mut wide = Engine::load_moe_test(&fixture, &runtime.join("order-reference-wide"), 16)?;
+        floor_cases.push((
+            "chunk16".into(),
+            reference_layer_order(&mut wide, &ids, [16, 16, 4], None)?,
+            reference_layer_order(&mut wide, &ids, [16, 16, 4], None)?,
+        ));
+        for capacity in &capacities {
+            for wave in [2, 8] {
+                let schedule = [capacity.span_rows as usize, 8, wave];
+                floor_cases.push((
+                    format!("span{}-wave{wave}", capacity.span_rows),
+                    reference_layer_order(&mut oracle, &ids, schedule, Some(capacity))?,
+                    reference_layer_order(&mut oracle, &ids, schedule, Some(capacity))?,
+                ));
+            }
+        }
+        let mut floor = [0.0f32; 2];
+        for (case, other, repeat) in floor_cases {
+            ensure!(
+                same_bits(&other.0, &repeat.0, |x| u32::from(x.to_bits()))
+                    && same_bits(&other.1, &repeat.1, f32::to_bits),
+                "Runner FAIL prefill floor reference repeat differs case={case}"
+            );
+            let hidden = max_difference(&baseline.0, &other.0, bf16::to_f32)?;
+            let logits = max_difference(&baseline.1, &other.1, |x| x)?;
+            floor[0] = floor[0].max(hidden);
+            floor[1] = floor[1].max(logits);
+            println!(
+                "PASS prefill_order_floor_cell case={case} hidden_max_abs={hidden} logits_max_abs={logits} same_form_bitwise=true ref_outside_NVTX=true"
+            );
         }
         println!(
-            "PASS prefill_order_reference rows=17 chunks=8,4,1 hidden_floor={} logits_floor={} same_form_bitwise=true",
+            "PASS prefill_order_reference rows=17 chunks=8,4,1,2,16 waves=4,2,8 reference_cells=8 hidden_floor={} logits_floor={} same_form_bitwise=true",
             floor[0], floor[1]
         );
-        let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+        let mut identities = Vec::new();
+        for capacity in &capacities {
+            let schedule = [capacity.span_rows as usize, 8, 4];
+            let expected = reference_layer_order(&mut oracle, &ids, schedule, Some(capacity))?;
+            let repeated = reference_layer_order(&mut oracle, &ids, schedule, Some(capacity))?;
+            ensure!(
+                same_bits(&expected.0, &repeated.0, |x| u32::from(x.to_bits()))
+                    && same_bits(&expected.1, &repeated.1, f32::to_bits),
+                "Runner FAIL same-order reference repeat differs span_rows={}",
+                capacity.span_rows
+            );
+            max_difference(&expected.0, &repeated.0, bf16::to_f32)?;
+            max_difference(&expected.1, &repeated.1, |x| x)?;
+            println!(
+                "PASS prefill_order_identity_reference span_rows={} chunk=8 wave=4 hidden_words={} logits_words={} same_form_bitwise=true ref_outside_NVTX=true",
+                capacity.span_rows,
+                expected.0.len(),
+                expected.1.len()
+            );
+            identities.push(expected);
+        }
         let mut defects = 0;
-        for span_rows in [17, 8] {
-            let capacity = capacity(geometry, span_rows, false, 2, false)?;
+        for (capacity, identity) in capacities.iter().zip(&identities) {
+            let span_rows = capacity.span_rows;
             let mut engine = Engine::load_moe_placed(
                 &fixture,
                 &runtime.join(format!("order-candidate-{span_rows}")),
-                &capacity,
+                capacity,
                 &[vec![0, 1, 2, 3], vec![0, 1, 2, 3]],
                 crate::experts::plan::Admission {
                     budget_bytes_per_token: 2 * capacity.slot_bytes(),
                 },
                 2,
+                8,
             )?;
             engine.closure.freeze_fixed()?;
             engine.closure.ready(Instant::now())?;
@@ -2695,6 +2931,27 @@ mod tests {
                 engine.device.stream.synchronize()?;
             }
             let logits = engine.decode_logits()?;
+            max_difference(&identity.0, &hidden, bf16::to_f32)?;
+            max_difference(&identity.1, &logits, |x| x)?;
+            let identity_hidden = identity
+                .0
+                .iter()
+                .zip(&hidden)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let identity_logits = identity
+                .1
+                .iter()
+                .zip(&logits)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let identity_pass = identity_hidden == 0 && identity_logits == 0;
+            println!(
+                "{} prefill_order_identity span_rows={span_rows} chunk=8 wave=4 hidden_bit_mismatches={identity_hidden} logits_bit_mismatches={identity_logits} hidden_words={} logits_words={} ref_outside_NVTX=true",
+                if identity_pass { "PASS" } else { "DEFECT" },
+                hidden.len(),
+                logits.len()
+            );
             let hidden_error = max_difference(&baseline.0, &hidden, bf16::to_f32)?;
             let logits_error = max_difference(&baseline.1, &logits, |x| x)?;
             let hidden_bitwise = same_bits(&baseline.0, &hidden, |x| u32::from(x.to_bits()));
@@ -2719,7 +2976,7 @@ mod tests {
                 && engine.committed_prefix_ids == ids
                 && engine.pending_token.is_some()
                 && drains == spans as u64;
-            defects += usize::from(!pass);
+            defects += usize::from(!pass || !identity_pass);
             println!(
                 "{} prefill_layer_order rows=17 span_rows={span_rows} spans={spans} last_span_rows={} drains={drains} layers=2 GDN=true attention_d256=true rope_kv=false hidden_max_abs={hidden_error} hidden_floor={} logits_max_abs={logits_error} logits_floor={} hidden_bitwise={hidden_bitwise} logits_bitwise={logits_bitwise} ref_outside_NVTX=true",
                 if pass { "PASS" } else { "DEFECT" },

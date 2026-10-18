@@ -202,7 +202,11 @@ fn hybrid_manifest(
 }
 
 impl Engine {
-    pub(crate) fn load_moe_test(fixture: &MoeFixture, runtime: &Path) -> Result<Self> {
+    pub(crate) fn load_moe_test(
+        fixture: &MoeFixture,
+        runtime: &Path,
+        workspace_rows: usize,
+    ) -> Result<Self> {
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
         let count = geometry.layers * geometry.experts;
         let layout = crate::experts::catalogue::ExpertLayout::new(
@@ -233,6 +237,7 @@ impl Engine {
                 budget_bytes_per_token: 0,
             },
             2,
+            workspace_rows,
         )
     }
 
@@ -243,6 +248,7 @@ impl Engine {
         initial: &[Vec<u32>],
         admission: crate::experts::plan::Admission,
         engines: u32,
+        workspace_rows: usize,
     ) -> Result<Self> {
         use crate::backend::cuda::{
             linear::LayerLinearPlan,
@@ -253,26 +259,15 @@ impl Engine {
             d.hidden == 128 && d.inter == 64 && d.experts == 16 && d.top_k == 4,
             "MoE hook expects H128/I64/E16/K4, received {d:?}"
         );
+        ensure!(
+            (8..=32).contains(&workspace_rows),
+            "hybrid fixture workspace_rows={workspace_rows} outside8..32"
+        );
         let model_spec = hybrid_spec()?;
         let config = model_spec.config();
         let manifest = hybrid_manifest(&model_spec)?;
         let geometry = ExpertGeometry::from_model(&model_spec)?;
-        let service = crate::experts::plan::ServiceTable::new(
-            "fixture",
-            [1, 2, 5, 8, 16, 32, 64]
-                .into_iter()
-                .flat_map(|rows| {
-                    [1, 2, 4, 8]
-                        .into_iter()
-                        .map(move |experts| crate::experts::plan::ServiceCell {
-                            workers: capacity.worker_count,
-                            rows,
-                            experts,
-                            seconds: f64::from(rows * experts) * 0.00002,
-                        })
-                })
-                .collect(),
-        )?;
+        let service = tier_service(capacity.worker_count)?;
         let cpu_bounds = if capacity.prefill_staging_slots > 0 {
             let bound = residency::cpu_bound(
                 geometry,
@@ -393,9 +388,13 @@ impl Engine {
         ));
         let blas = Blas::new(&device, &ops, runtime, closure.clone())?;
         let state = super::super::super::state::StateStore::new(&model_spec, 32, stream)?;
-        let mut work = Work::new(stream, &model_spec, 8)?;
+        let mut work = Work::new(stream, &model_spec, workspace_rows)?;
         stream.memcpy_htod(&[1i32], &mut work.length)?;
-        let flash = Some(Flash::new(stream.clone(), 8, model_spec.q_heads as usize)?);
+        let flash = Some(Flash::new(
+            stream.clone(),
+            workspace_rows,
+            model_spec.q_heads as usize,
+        )?);
         let moe = Some(Decode::new(
             &device,
             geometry,
@@ -422,7 +421,7 @@ impl Engine {
                 reserves,
                 service,
                 1_000_000_000.0,
-                (8, 8),
+                (workspace_rows, 8),
             )?)
         } else {
             None
@@ -440,7 +439,7 @@ impl Engine {
             mtp_epoch: 0,
             images: None,
             qwen_device_prefix: false,
-            forward_rows: (1..=8).collect(),
+            forward_rows: (1..=workspace_rows).collect(),
             graphs: Vec::new(),
             closure,
             poisoned: false,
@@ -465,7 +464,7 @@ impl Engine {
             model_spec,
             capacity: 32,
             chunk: 8,
-            workspace_rows: 8,
+            workspace_rows,
             trace_layer: 0,
             position: 0,
             prefix_identity: None,
@@ -478,14 +477,20 @@ impl Engine {
         };
         let scratch = engine.device.stream.alloc_zeros(qwen::Runtime::workspace(
             &engine.model_spec,
-            8,
+            workspace_rows,
             32,
             crate::gdn_plan::GdnPolicy::for_device(engine.device.info.arch, engine.device.info.sms),
         )?)?;
         engine.qwen = Some(qwen::Runtime::new(
-            &engine, runtime, catalog, None, scratch, None, 8,
+            &engine,
+            runtime,
+            catalog,
+            None,
+            scratch,
+            None,
+            workspace_rows,
         )?);
-        for rows in 1..=8 {
+        for rows in 1..=workspace_rows {
             engine.prepare_qwen(rows)?;
             engine.prepare_prefill_rows(rows)?;
         }
@@ -618,6 +623,25 @@ fn routed_experts(row: usize) -> [u32; 4] {
         8 + (offset + 1) % 4,
         12 + (offset + 3) % 4,
     ]
+}
+
+pub(super) fn tier_service(workers: u32) -> Result<crate::experts::plan::ServiceTable> {
+    crate::experts::plan::ServiceTable::new(
+        "fixture",
+        [1, 2, 5, 8, 16, 32, 64]
+            .into_iter()
+            .flat_map(|rows| {
+                [1, 2, 4, 8]
+                    .into_iter()
+                    .map(move |experts| crate::experts::plan::ServiceCell {
+                        workers,
+                        rows,
+                        experts,
+                        seconds: f64::from(rows * experts) * 0.00002,
+                    })
+            })
+            .collect(),
+    )
 }
 
 pub(super) fn tier_capacity(geometry: ExpertGeometry, pinned: bool) -> Result<Capacity> {
@@ -1199,7 +1223,7 @@ fn tier_gate(variants: &[u32], cases: &[(bool, u32)]) -> Result<()> {
     for &variant in variants {
         let fixture = tier_fixture(variant);
         let reference =
-            Engine::load_moe_test(&fixture, &runtime.join(format!("reference-{variant}")))?;
+            Engine::load_moe_test(&fixture, &runtime.join(format!("reference-{variant}")), 8)?;
         let mut references = std::collections::BTreeMap::new();
         for layer in 0..2 {
             for rows in [1, 2, 5, 8] {
@@ -1225,6 +1249,7 @@ fn tier_gate(variants: &[u32], cases: &[(bool, u32)]) -> Result<()> {
                     budget_bytes_per_token: 2 * capacity.slot_bytes(),
                 },
                 engines,
+                8,
             )?;
             engine
                 .moe_slots
@@ -1522,7 +1547,7 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
     let mut defects = 0;
     for &variant in variants {
         let fixture = fixture(MoeDims::new(8, 16, 4, 128, 64), variant);
-        let mut engine = Engine::load_moe_test(&fixture, runtime)?;
+        let mut engine = Engine::load_moe_test(&fixture, runtime, 8)?;
         for &rows in row_cases {
             let input = &fixture.x[..rows * 128];
             let reference = direct(&engine, 0, input, rows)?;
