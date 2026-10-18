@@ -144,7 +144,9 @@ mod tests {
             );
             for (row, values) in input.data().chunks_exact(k * 2).enumerate() {
                 let x = values
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|v| bf16::from_le_bytes([v[0], v[1]]))
                     .collect::<Vec<_>>();
                 let (s, c, f) = fake_quant_reference(&x)?;

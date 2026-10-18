@@ -272,7 +272,7 @@ extern "C" __global__ void e4m3_fake_quant_bf16(
     const uint64_t base = uint64_t(blockIdx.x) * uint64_t(cols);
     const int lane = threadIdx.x & 31;
     float amax = 0.0f;
-    for (int col = threadIdx.x; col < cols; col += 256) {
+    for (uint64_t col = threadIdx.x; col < uint64_t(cols); col += 256) {
         const float value = __bfloat162float(x[base + col]);
         if (!isfinite(value)) { __trap(); return; }
         amax = fmaxf(amax, fabsf(value));
@@ -289,7 +289,7 @@ extern "C" __global__ void e4m3_fake_quant_bf16(
         if (scales) scales[blockIdx.x] = __float2bfloat16_rn(scale);
     }
     __syncthreads();
-    for (int col = threadIdx.x; col < cols; col += 256) {
+    for (uint64_t col = threadIdx.x; col < uint64_t(cols); col += 256) {
         const float value = __bfloat162float(x[base + col]);
         const float normalized = __bfloat162float(__float2bfloat16_rn(value / scale));
         const uint8_t code = __nv_cvt_float_to_fp8(

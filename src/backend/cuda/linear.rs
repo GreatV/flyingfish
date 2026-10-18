@@ -514,7 +514,9 @@ mod tests {
             );
             let values = input
                 .data()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|v| bf16::from_le_bytes([v[0], v[1]]))
                 .collect::<Vec<_>>();
             for (row, x) in values.chunks_exact(width).enumerate() {
