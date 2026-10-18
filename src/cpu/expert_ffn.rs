@@ -903,7 +903,7 @@ impl ExpertPool {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
                     {
-                        let _guard = shared.park.lock().unwrap_or_else(|e| e.into_inner());
+                        let _guard = shared.park.lock();
                         shared.shutdown.store(true, Ordering::Release);
                         shared.wake.notify_all();
                     }
@@ -939,6 +939,10 @@ impl ExpertPool {
 
     /// Publishes a job; the guard holds the output and the lease until finish or drop.
     pub fn submit<'a>(&'a self, job: Job<'a>) -> Result<PendingJob<'a>> {
+        ensure!(
+            !self.shared.shutdown.load(Ordering::Acquire),
+            "expert pool worker synchronization failed"
+        );
         let Job {
             arena,
             hidden,
@@ -981,8 +985,22 @@ impl ExpertPool {
         )?;
         let blocks = assignment_blocks(arena, experts, assignments)?;
         let lease = Arc::new(arena.lease(&blocks)?);
+        let mut error = self
+            .shared
+            .error
+            .lock()
+            .map_err(|_| anyhow::anyhow!("expert pool error mutex poisoned"))?;
+        let _guard = self
+            .shared
+            .park
+            .lock()
+            .map_err(|_| anyhow::anyhow!("expert pool park mutex poisoned"))?;
         {
-            let mut slot = self.shared.job.write().unwrap_or_else(|e| e.into_inner());
+            let mut slot = self
+                .shared
+                .job
+                .write()
+                .map_err(|_| anyhow::anyhow!("expert pool job lock poisoned"))?;
             slot.rows = rows;
             slot.arena = Some(lease);
             slot.hidden[..hidden.len()].copy_from_slice(hidden);
@@ -991,15 +1009,12 @@ impl ExpertPool {
             slot.assignments.clear();
             slot.assignments.extend_from_slice(assignments);
         }
-        *self.shared.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *error = None;
         self.shared.phase1.store(0, Ordering::Release);
         self.shared.finished.store(0, Ordering::Release);
         self.shared.failed.store(false, Ordering::Release);
-        {
-            let _guard = self.shared.park.lock().unwrap_or_else(|e| e.into_inner());
-            self.shared.generation.fetch_add(1, Ordering::Release);
-            self.shared.wake.notify_all();
-        }
+        self.shared.generation.fetch_add(1, Ordering::Release);
+        self.shared.wake.notify_all();
         Ok(())
     }
 
@@ -1019,6 +1034,10 @@ impl ExpertPool {
     fn complete(&self, out: &mut [bf16]) -> Result<()> {
         let mut spins = 0u32;
         loop {
+            ensure!(
+                !self.shared.shutdown.load(Ordering::Acquire),
+                "expert pool worker synchronization failed"
+            );
             if self.shared.finished.load(Ordering::Acquire) >= self.workers {
                 break;
             }
@@ -1027,40 +1046,53 @@ impl ExpertPool {
                 std::hint::spin_loop();
                 continue;
             }
-            let mut guard = self.shared.park.lock().unwrap_or_else(|e| e.into_inner());
-            while self.shared.finished.load(Ordering::Acquire) < self.workers {
-                guard = self
-                    .shared
-                    .wake
-                    .wait(guard)
-                    .unwrap_or_else(|e| e.into_inner());
+            let mut guard = self
+                .shared
+                .park
+                .lock()
+                .map_err(|_| anyhow::anyhow!("expert pool park mutex poisoned"))?;
+            while self.shared.finished.load(Ordering::Acquire) < self.workers
+                && !self.shared.shutdown.load(Ordering::Acquire)
+            {
+                guard =
+                    self.shared.wake.wait(guard).map_err(|_| {
+                        anyhow::anyhow!("expert pool completion wait mutex poisoned")
+                    })?;
             }
-            break;
         }
+        ensure!(
+            !self.shared.shutdown.load(Ordering::Acquire),
+            "expert pool worker synchronization failed"
+        );
         if let Some(error) = self
             .shared
             .error
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .map_err(|_| anyhow::anyhow!("expert pool error mutex poisoned"))?
             .take()
         {
-            self.release();
+            self.release()?;
             bail!("{error}");
         }
         let len = out.len();
         for (target, source) in out.iter_mut().zip(&self.shared.out[..len]) {
             *target = bf16::from_bits(source.load(Ordering::Acquire));
         }
-        self.release();
+        self.release()?;
         Ok(())
     }
 
-    fn release(&self) {
+    fn release(&self) -> Result<()> {
         {
-            let mut slot = self.shared.job.write().unwrap_or_else(|e| e.into_inner());
+            let mut slot = self
+                .shared
+                .job
+                .write()
+                .map_err(|_| anyhow::anyhow!("expert pool job lock poisoned at release"))?;
             slot.arena = None;
         }
         self.shared.pending.store(false, Ordering::Release);
+        Ok(())
     }
 
     fn validate(
@@ -1139,7 +1171,10 @@ impl ExpertPool {
 impl Drop for ExpertPool {
     fn drop(&mut self) {
         {
-            let _guard = self.shared.park.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = self.shared.park.lock();
+            if guard.is_err() {
+                eprintln!("expert pool park mutex poisoned during drop");
+            }
             self.shared.shutdown.store(true, Ordering::Release);
             self.shared.wake.notify_all();
         }
@@ -1158,51 +1193,79 @@ fn worker(
     max_assignments: usize,
 ) {
     let mut local = Local::new(&shape, shared.workers, max_rows, max_assignments);
-    let mut seen = 0u64;
-    loop {
-        let mut spins = 0u32;
+    let result = (|| -> Result<()> {
+        let mut seen = 0u64;
         loop {
-            if shared.shutdown.load(Ordering::Acquire) {
-                return;
+            let mut spins = 0u32;
+            loop {
+                if shared.shutdown.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let current = shared.generation.load(Ordering::Acquire);
+                if current != seen {
+                    seen = current;
+                    break;
+                }
+                if spins < SPIN_ROUNDS {
+                    spins += 1;
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let mut guard = shared
+                    .park
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("expert worker park mutex poisoned"))?;
+                while shared.generation.load(Ordering::Acquire) == seen
+                    && !shared.shutdown.load(Ordering::Acquire)
+                {
+                    guard = shared
+                        .wake
+                        .wait(guard)
+                        .map_err(|_| anyhow::anyhow!("expert worker wake mutex poisoned"))?;
+                }
+                drop(guard);
             }
-            let current = shared.generation.load(Ordering::Acquire);
-            if current != seen {
-                seen = current;
-                break;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                phases(index, &shared, &shape, isa, &mut local)
+            }));
+            let message = match outcome {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some("expert worker panicked".to_string()),
+            };
+            if let Some(message) = message {
+                let mut error = shared
+                    .error
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("expert worker error mutex poisoned"))?;
+                if error.is_none() {
+                    *error = Some(message);
+                }
+                shared.failed.store(true, Ordering::Release);
             }
-            if spins < SPIN_ROUNDS {
-                spins += 1;
-                std::hint::spin_loop();
-                continue;
+            let done = shared.finished.fetch_add(1, Ordering::AcqRel) + 1;
+            if done == shared.workers {
+                let _guard = shared
+                    .park
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("expert worker completion mutex poisoned"))?;
+                shared.wake.notify_all();
             }
-            let mut guard = shared.park.lock().unwrap_or_else(|e| e.into_inner());
-            while shared.generation.load(Ordering::Acquire) == seen
-                && !shared.shutdown.load(Ordering::Acquire)
-            {
-                guard = shared.wake.wait(guard).unwrap_or_else(|e| e.into_inner());
-            }
-            drop(guard);
         }
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            phases(index, &shared, &shape, isa, &mut local)
-        }));
-        let message = match outcome {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(error.to_string()),
-            Err(_) => Some("expert worker panicked".to_string()),
-        };
-        if let Some(message) = message {
-            let mut error = shared.error.lock().unwrap_or_else(|e| e.into_inner());
-            if error.is_none() {
-                *error = Some(message);
+    })();
+    if let Err(failure) = result {
+        shared.failed.store(true, Ordering::Release);
+        match shared.error.lock() {
+            Ok(mut error) => {
+                if error.is_none() {
+                    *error = Some(format!("{failure:#}"));
+                }
             }
-            shared.failed.store(true, Ordering::Release);
+            Err(_) => eprintln!("expert worker error mutex poisoned: {failure:#}"),
         }
-        let done = shared.finished.fetch_add(1, Ordering::AcqRel) + 1;
-        if done == shared.workers {
-            let _guard = shared.park.lock().unwrap_or_else(|e| e.into_inner());
-            shared.wake.notify_all();
-        }
+        let _guard = shared.park.lock();
+        shared.shutdown.store(true, Ordering::Release);
+        shared.wake.notify_all();
     }
 }
 
@@ -1217,7 +1280,10 @@ fn phases(
     let (hidden, intermediate) = (shape.hidden, shape.intermediate);
     let workers = shared.workers;
     let (lease, items_len, range1, rows) = {
-        let slot = shared.job.read().unwrap_or_else(|e| e.into_inner());
+        let slot = shared
+            .job
+            .read()
+            .map_err(|_| anyhow::anyhow!("expert worker job lock poisoned"))?;
         local.experts.clear();
         local.experts.extend_from_slice(&slot.experts);
         local.items.clear();
