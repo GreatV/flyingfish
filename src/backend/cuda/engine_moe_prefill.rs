@@ -1866,7 +1866,8 @@ mod tests {
                     &capacity,
                     &initial,
                     crate::experts::plan::Admission {
-                        budget_bytes_per_token: 0,
+                        budget_bytes_per_token: u64::from(capacity.spare_blocks)
+                            * capacity.slot_bytes(),
                     },
                     2,
                     8,
