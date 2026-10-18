@@ -2901,8 +2901,9 @@ mod tests {
                 merged_expected.push((case, feature_rows));
             }
         }
-        // Two-image reach control: independent per-crop segments must reproduce each standalone
-        // merger block and the two blocks must not be byte-identical.
+        // Two-image reach control: each packed merger block is scored against its standalone run at
+        // `merger_out_packed`; one-row-shifted and swapped-order reads must exceed that bound and the
+        // two blocks must not be byte-identical.
         if let Some(merged) = merged_input {
             ensure!(
                 merged_expected.len() == 2,
@@ -2937,30 +2938,75 @@ mod tests {
                 merged.len() == first + second,
                 "merged merger output extent"
             );
+            let mut packed_bounds = Vec::new();
             for (index, (case, rows)) in merged_expected.iter().enumerate() {
                 let start = if index == 0 { 0 } else { first };
-                let block = &merged[start..start + rows * output_width];
+                let extent = rows * output_width;
+                let block = &merged[start..start + extent];
                 let reference = standalone
                     .get(&format!("{case}/merger_out"))
                     .with_context(|| format!("standalone merger missing for {case}"))?;
                 let metrics = tap_metrics(block, reference)?;
+                let bound = &tolerances[case]["merger_out_packed"];
+                let k = bound["k"]
+                    .as_f64()
+                    .with_context(|| format!("missing k {case}/merger_out_packed"))?;
+                let rms = bound["rms"]
+                    .as_f64()
+                    .with_context(|| format!("missing rms {case}/merger_out_packed"))?;
+                let ratio = crate::verify::half_ulp_ratio(block, reference, rms as f32);
+                let shifted = if index == 0 {
+                    start + output_width
+                } else {
+                    start - output_width
+                };
+                let shifted_ratio = crate::verify::half_ulp_ratio(
+                    &merged[shifted..shifted + extent],
+                    reference,
+                    rms as f32,
+                );
+                let pass = ratio <= k;
                 eprintln!(
                     "{}",
-                    serde_json::json!({"minicpm_vision_control": {"case": case, "tap": "merger_out",
-                        "metrics": metrics}})
+                    serde_json::json!({"minicpm_vision_control": {"case": case,
+                        "tap": "merger_out_packed", "max_ulp_ratio": ratio, "k": k, "rms": rms,
+                        "shifted_ratio": shifted_ratio, "shifted_margin": shifted_ratio / k,
+                        "pass": pass, "metrics": metrics}})
                 );
-                let k = tolerances[case]["merger_out"]["k"]
-                    .as_f64()
-                    .context("merger k")?;
-                let rms = tolerances[case]["merger_out"]["rms"]
-                    .as_f64()
-                    .context("merger rms")?;
-                let ratio = crate::verify::half_ulp_ratio(block, reference, rms as f32);
                 ensure!(
-                    ratio <= k,
-                    "{case} merged block differs from its standalone run: {ratio} ulps > {k}"
+                    shifted_ratio > k,
+                    "{case} one-row-shifted block is within the packed bound: {shifted_ratio} <= {k}"
                 );
+                verdict.insert(
+                    format!("{case}/merger_out_packed"),
+                    (metrics["max_abs"].as_f64().context("max_abs")?, ratio, pass),
+                );
+                packed_bounds.push((k, rms));
             }
+            let (case, rows) = merged_expected[0];
+            let extent = rows * output_width;
+            ensure!(
+                extent <= second,
+                "swapped-order control needs the second block to cover the first"
+            );
+            let (k, rms) = packed_bounds[0];
+            let swapped_ratio = crate::verify::half_ulp_ratio(
+                &merged[first..first + extent],
+                standalone
+                    .get(&format!("{case}/merger_out"))
+                    .with_context(|| format!("standalone merger missing for {case}"))?,
+                rms as f32,
+            );
+            eprintln!(
+                "{}",
+                serde_json::json!({"minicpm_vision_control": {"case": case,
+                    "tap": "merger_out_packed_swapped", "swapped_ratio": swapped_ratio, "k": k,
+                    "swapped_margin": swapped_ratio / k}})
+            );
+            ensure!(
+                swapped_ratio > k,
+                "{case} swapped-order block is within the packed bound: {swapped_ratio} <= {k}"
+            );
             ensure!(
                 merged[..first] != merged[first..],
                 "the two images produced identical merger blocks"
