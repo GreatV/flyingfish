@@ -530,6 +530,10 @@ fn target_hidden_capture_gpu() -> Result<()> {
                     "target trace shape/finiteness"
                 );
                 let enabled = trace.values(&name)?;
+                ensure!(
+                    enabled.len() == values.len() && enabled.iter().all(|x| x.is_finite()),
+                    "enabled target trace shape/finiteness"
+                );
                 mismatches += values
                     .iter()
                     .zip(enabled)
@@ -578,7 +582,11 @@ fn target_hidden_capture_gpu() -> Result<()> {
                     values.iter().all(|x| x.to_f32().is_finite()),
                     "non-finite graph target capture"
                 );
-                defects += usize::from(values != expected || state(&model)? != baseline);
+                let mismatch = values
+                    .iter()
+                    .zip(&expected)
+                    .any(|(a, b)| a.to_bits() != b.to_bits());
+                defects += usize::from(mismatch || state(&model)? != baseline);
                 graph_replays += 1;
             }
             if prefix == 7 && rows == 17 {
