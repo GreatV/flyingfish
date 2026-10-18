@@ -84,6 +84,16 @@ impl Bounds {
             comparisons.len() == 4,
             "reference noise {case} needs four comparisons"
         );
+        let cross_gpu = &noise["official_cross_gpu_streamed"];
+        ensure!(
+            cross_gpu["sm89_primary_bitwise"].as_bool() == Some(true),
+            "streamed official sm89 reference did not reproduce the frozen primary"
+        );
+        let cross_gpu = &cross_gpu["cases"][case];
+        ensure!(
+            cross_gpu.is_object(),
+            "missing official cross-GPU reference noise {case}"
+        );
         let vision = case
             .starts_with("image_")
             .then(|| &noise["official_vision_implementation_propagation"]["cases"][case]);
@@ -100,6 +110,7 @@ impl Bounds {
                 .values()
                 .map(|cell| &cell["layers"][&key])
                 .collect();
+            cells.push(&cross_gpu["layers"][&key]);
             if layer == 0 {
                 cells.push(&floor["fp32_layer0"]);
             }
@@ -113,6 +124,7 @@ impl Bounds {
                 .values()
                 .map(|cell| &cell[key])
                 .collect::<Vec<_>>();
+            cells.push(&cross_gpu[key]);
             if let Some(cell) = vision {
                 cells.push(&cell[key]);
             }
@@ -650,12 +662,27 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             .collect::<serde_json::Map<_, _>>();
         let vision = serde_json::json!({"layers":vision_layers, "norm":vision_error,
             "logits":vision_error, "teacher_top2":vision_error});
+        let cross_error = serde_json::json!({"max_abs":0.03125, "p99_abs":0.015625,
+            "mean_abs":0.0078125, "cosine_sim":1.0});
+        let cross_layers = [0, 3, 6, 19, 39]
+            .map(|layer| {
+                (
+                    format!("layer_{layer:02}_hidden_last8"),
+                    cross_error.clone(),
+                )
+            })
+            .into_iter()
+            .collect::<serde_json::Map<_, _>>();
+        let cross = serde_json::json!({"layers":cross_layers, "norm":cross_error,
+            "logits":cross_error, "teacher_top2":cross_error});
         std::fs::write(
             directory.join("noise_floor_r2.json"),
             serde_json::to_vec(
                 &serde_json::json!({"per_case_reference_floor":{"cases":cases},
                 "official_vision_implementation_propagation":{"cases":{
-                    "image_boat_16x":vision,"image_hockey_16x":vision}}}),
+                    "image_boat_16x":vision,"image_hockey_16x":vision}},
+                "official_cross_gpu_streamed":{"sm89_primary_bitwise":true,"cases":{
+                    "text_32":cross,"image_boat_16x":cross,"image_hockey_16x":cross}}}),
             )?,
         )?;
         let media = serde_json::json!({"max_abs":1.0, "cosine_sim":0.0});
@@ -679,7 +706,7 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             let other = if case.starts_with("image_") {
                 [0.125, 0.0625, 0.03125, 1.0]
             } else {
-                [0.0, 0.0, 0.0, 1.0]
+                [0.0625, 0.03125, 0.015625, 1.0]
             };
             for layer in [3, 6, 19, 39] {
                 assert_eq!(bounds.layers[&layer], other);
@@ -731,98 +758,140 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
     println!("minicpm_reference_bounds {cases:?}");
     check_fixtures(&fixtures, &crate::model_spec::ModelSpec::read(&model)?)?;
     Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
-    let mut engine = Engine::load(&model, 0, 4352, None, settings)?;
-    ensure!(
-        engine.model_spec.hidden == 2048
-            && engine.model_spec.vocab == 248144
-            && engine.model_spec.layers.len() == 40,
-        "published MiniCPM geometry required"
-    );
-    let mut defects = 0;
-    let mut media_logits = Vec::new();
-    for (case, bounds) in cases {
-        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
-        let source = SafeTensors::deserialize(&bytes)?;
-        let media = case.starts_with("image_");
-        let mut input = Input::read(&source, media)?;
-        engine.reset()?;
-        let mut trace = Trace::default();
-        if media {
-            engine.prepare_multimodal(&input.packed(), Some(&mut trace))?;
-        }
-        engine.prefill_tail(&input.ids, &mut trace, 8)?;
-        let first_logits = engine.decode_logits()?;
-        defects += prefill_scores(case, &source, &trace, &first_logits, &bounds)?;
-        let calls = engine
+    let mut expected_geometry = None;
+    let mut total_defects = 0;
+    for (arm, fp32) in [("production", false), ("fp32_core_reference", true)] {
+        println!("minicpm_core_arm_begin arm={arm}");
+        let mut engine = Engine::load(&model, 0, 4352, None, settings.clone())?;
+        let (p2_plans, scratch) = engine
             .qwen
+            .as_mut()
+            .context("hybrid runtime missing")?
+            .prefill_core_reference(fp32)?;
+        let slots = engine
+            .moe_slots
             .as_ref()
-            .context("runtime missing")?
-            .vision_encode_calls;
-        ensure!(
-            calls == usize::from(media),
-            "encoder call count {case}={calls}"
-        );
-        println!("PASS minicpm_media_calls {case} encoder_calls={calls}");
-        let mut checkpoint = super::super::super::state::StateCheckpoint::new(
-            &engine.state,
-            &engine.model_spec,
-            64,
-            &engine.device.stream,
-        )?;
-        checkpoint.save(
-            &engine.state,
-            &engine.work.token,
-            engine.position,
-            &engine.device.stream,
-            None,
-        )?;
-        let pending = engine.token()?;
-        let (errors, logits) = teacher_force(&mut engine, &source, case, &model, &bounds)?;
-        defects += errors;
-        defects += replay(
-            &mut engine,
-            &source,
-            &checkpoint,
-            &logits,
-            input.ids.len(),
-            pending,
-        )?;
-        drop(checkpoint);
-        let mut stats = Trace::default();
-        engine.record_test_stats(&mut stats)?;
+            .context("expert slots missing")?
+            .storage
+            .layout();
+        let counts = (0..engine.model_spec.layers.len())
+            .map(|layer| slots.slot_count(layer as u32))
+            .collect::<Result<Vec<_>>>()?;
+        let geometry = serde_json::json!({
+            "prefill":engine.moe_prefill.as_ref().context("prefill missing")?.reference_geometry(),
+            "chunk":engine.chunk, "workspace_rows":engine.workspace_rows, "scratch_bytes":scratch,
+            "slot_counts":counts, "slot_allocation_bytes":slots.allocation_bytes()?,
+            "host_blocks":slots.host_blocks(), "slot_bytes":slots.slot_bytes()
+        });
+        if let Some(expected) = &expected_geometry {
+            ensure!(
+                expected == &geometry,
+                "prefill core arms differ in admission/workspace/slots: expected={expected} actual={geometry}"
+            );
+        } else {
+            expected_geometry = Some(geometry.clone());
+        }
         println!(
-            "minicpm_modes {case} resident_hits={} cpu_misses={} disk_experts={} graph_segments={}",
-            stats.values("stats.gpu_resident_hits")?[0],
-            stats.values("stats.cpu_worker_misses")?[0],
-            stats
-                .values("residency.tier")?
-                .iter()
-                .filter(|&&tier| tier == 2.0)
-                .count(),
-            engine.graphs.len()
+            "PASS minicpm_core_geometry arm={arm} fp32_reference={fp32} production_p2_plans={p2_plans} geometry={geometry}"
         );
-        if media {
-            media_logits.push(first_logits.clone());
-        }
-        if case == "image_hockey_16x" {
-            defects += media_control(
-                &mut engine,
-                &mut input,
-                &fixtures,
-                &first_logits,
-                bounds.media,
+        ensure!(
+            engine.model_spec.hidden == 2048
+                && engine.model_spec.vocab == 248144
+                && engine.model_spec.layers.len() == 40,
+            "published MiniCPM geometry required"
+        );
+        let mut defects = 0;
+        let mut media_logits = Vec::new();
+        for (case, bounds) in &cases {
+            let case = *case;
+            let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+            let source = SafeTensors::deserialize(&bytes)?;
+            let media = case.starts_with("image_");
+            let mut input = Input::read(&source, media)?;
+            engine.reset()?;
+            let mut trace = Trace::default();
+            if media {
+                engine.prepare_multimodal(&input.packed(), Some(&mut trace))?;
+            }
+            engine.prefill_tail(&input.ids, &mut trace, 8)?;
+            let first_logits = engine.decode_logits()?;
+            defects += prefill_scores(case, &source, &trace, &first_logits, bounds)?;
+            let calls = engine
+                .qwen
+                .as_ref()
+                .context("runtime missing")?
+                .vision_encode_calls;
+            ensure!(
+                calls == usize::from(media),
+                "encoder call count {case}={calls}"
+            );
+            println!("PASS minicpm_media_calls {case} encoder_calls={calls}");
+            let mut checkpoint = super::super::super::state::StateCheckpoint::new(
+                &engine.state,
+                &engine.model_spec,
+                64,
+                &engine.device.stream,
             )?;
+            checkpoint.save(
+                &engine.state,
+                &engine.work.token,
+                engine.position,
+                &engine.device.stream,
+                None,
+            )?;
+            let pending = engine.token()?;
+            let (errors, logits) = teacher_force(&mut engine, &source, case, &model, bounds)?;
+            defects += errors;
+            defects += replay(
+                &mut engine,
+                &source,
+                &checkpoint,
+                &logits,
+                input.ids.len(),
+                pending,
+            )?;
+            drop(checkpoint);
+            let mut stats = Trace::default();
+            engine.record_test_stats(&mut stats)?;
+            println!(
+                "minicpm_modes {case} resident_hits={} cpu_misses={} disk_experts={} graph_segments={}",
+                stats.values("stats.gpu_resident_hits")?[0],
+                stats.values("stats.cpu_worker_misses")?[0],
+                stats
+                    .values("residency.tier")?
+                    .iter()
+                    .filter(|&&tier| tier == 2.0)
+                    .count(),
+                engine.graphs.len()
+            );
+            if media {
+                media_logits.push(first_logits.clone());
+            }
+            if case == "image_hockey_16x" {
+                defects += media_control(
+                    &mut engine,
+                    &mut input,
+                    &fixtures,
+                    &first_logits,
+                    bounds.media,
+                )?;
+            }
         }
+        let media = metrics(&media_logits[0], &media_logits[1])?;
+        defects += usize::from(media[0] < cross_media[0] || media[3] > cross_media[1]);
+        println!(
+            "minicpm_two_media max={} cosine={} defects={defects}",
+            media[0], media[3]
+        );
+        println!("minicpm_core_arm_end arm={arm} defects={defects}");
+        total_defects += defects;
     }
-    let media = metrics(&media_logits[0], &media_logits[1])?;
-    defects += usize::from(media[0] < cross_media[0] || media[3] > cross_media[1]);
-    println!(
-        "minicpm_two_media max={} cosine={} defects={defects}",
-        media[0], media[3]
+    ensure!(
+        total_defects == 0,
+        "MiniCPM end-to-end DEFECT count={total_defects}"
     );
-    ensure!(defects == 0, "MiniCPM end-to-end DEFECT count={defects}");
     println!(
-        "PASS minicpm_native_checkpoint cases=5 teacher_steps=256 bitwise_graphs=true media_control=boat_pixels"
+        "PASS minicpm_native_checkpoint arms=2 cases_per_arm=5 teacher_steps_per_arm=256 bitwise_graphs=true media_control=boat_pixels"
     );
     Ok(())
 }
