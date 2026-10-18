@@ -110,8 +110,8 @@ fn compare_case(
         for (j, (got, &expected)) in weights.iter().zip(&want.weights).enumerate() {
             let (got, expected) = (got.to_f32(), expected.to_f32());
             let dev = (got - expected).abs();
-            let rounding = (k as f32 + 1.0) * (f32::EPSILON / 2.0);
-            let tol = reference::bf16_ulp(expected) + expected.abs() * rounding / (1.0 - rounding);
+            let rounding = crate::backend::cuda::gamma(k + 1, f64::from(f32::EPSILON) / 2.0) as f32;
+            let tol = reference::bf16_ulp(expected) + expected.abs() * rounding;
             max_weight_dev = max_weight_dev.max(dev);
             ensure!(
                 dev <= tol,
