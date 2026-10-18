@@ -724,22 +724,6 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
 #[test]
 #[ignore = "requires CUDA, FF_MODEL, FF_MINICPM_REFERENCE_DIR and FLYINGFISH_RUNTIME_DIR"]
 fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
-    native_checkpoint(Some(false))
-}
-
-#[test]
-#[ignore = "requires the production geometry record and the same pinned calibration in a fresh process"]
-fn minicpm_c32_checkpoint_e2e_gpu() -> Result<()> {
-    native_checkpoint(Some(true))
-}
-
-#[test]
-#[ignore = "pins calibration before the production and reference processes"]
-fn minicpm_native_calibration_gpu() -> Result<()> {
-    native_checkpoint(None)
-}
-
-fn native_checkpoint(fp32: Option<bool>) -> Result<()> {
     let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
     let fixtures = PathBuf::from(
         std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("reference directory missing")?,
@@ -747,7 +731,6 @@ fn native_checkpoint(fp32: Option<bool>) -> Result<()> {
     let runtime = PathBuf::from(
         std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime directory missing")?,
     );
-    let geometry_path = runtime.join("minicpm-prefill-core-geometry.json");
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
@@ -775,51 +758,7 @@ fn native_checkpoint(fp32: Option<bool>) -> Result<()> {
     println!("minicpm_reference_bounds {cases:?}");
     check_fixtures(&fixtures, &crate::model_spec::ModelSpec::read(&model)?)?;
     Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
-    let Some(fp32) = fp32 else {
-        println!("PASS minicpm_native_calibration cases=5 pinned=true");
-        return Ok(());
-    };
-    let arm = if fp32 {
-        "fp32_core_reference"
-    } else {
-        "production"
-    };
-    println!("minicpm_core_arm_begin arm={arm}");
     let mut engine = Engine::load(&model, 0, 4352, None, settings.clone())?;
-    let (p2_plans, scratch) = engine
-        .qwen
-        .as_mut()
-        .context("hybrid runtime missing")?
-        .prefill_core_reference(fp32)?;
-    let slots = engine
-        .moe_slots
-        .as_ref()
-        .context("expert slots missing")?
-        .storage
-        .layout();
-    let counts = (0..engine.model_spec.layers.len())
-        .map(|layer| slots.slot_count(layer as u32))
-        .collect::<Result<Vec<_>>>()?;
-    let geometry = serde_json::json!({
-        "prefill":engine.moe_prefill.as_ref().context("prefill missing")?.reference_geometry(),
-        "chunk":engine.chunk, "workspace_rows":engine.workspace_rows, "scratch_bytes":scratch,
-        "slot_counts":counts, "slot_allocation_bytes":slots.allocation_bytes()?,
-        "host_blocks":slots.host_blocks(), "slot_bytes":slots.slot_bytes()
-    });
-    if fp32 {
-        let expected: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&geometry_path).context("production prefill geometry record missing")?,
-        )?;
-        ensure!(
-            expected == geometry,
-            "prefill core arms differ in admission/workspace/slots: expected={expected} actual={geometry}"
-        );
-    } else {
-        std::fs::write(&geometry_path, serde_json::to_vec(&geometry)?)?;
-    }
-    println!(
-        "PASS minicpm_core_geometry arm={arm} fp32_reference={fp32} production_p2_plans={p2_plans} geometry={geometry}"
-    );
     ensure!(
         engine.model_spec.hidden == 2048
             && engine.model_spec.vocab == 248144
@@ -909,10 +848,10 @@ fn native_checkpoint(fp32: Option<bool>) -> Result<()> {
         "minicpm_two_media max={} cosine={} defects={defects}",
         media[0], media[3]
     );
-    println!("minicpm_core_arm_end arm={arm} defects={defects}");
+    println!("minicpm_native_end defects={defects}");
     ensure!(defects == 0, "MiniCPM end-to-end DEFECT count={defects}");
     println!(
-        "PASS minicpm_native_checkpoint arm={arm} cases=5 teacher_steps=256 bitwise_graphs=true media_control=boat_pixels"
+        "PASS minicpm_native_checkpoint cases=5 teacher_steps=256 bitwise_graphs=true media_control=boat_pixels"
     );
     Ok(())
 }

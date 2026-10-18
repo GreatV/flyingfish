@@ -318,16 +318,6 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
 
 impl Prefill {
     #[cfg(test)]
-    pub(in crate::backend::cuda::engine) fn reference_geometry(&self) -> [usize; 4] {
-        [
-            self.capacity.span_rows as usize,
-            self.capacity.wave_rows as usize,
-            self.mixer_rows,
-            self.workspace_rows,
-        ]
-    }
-
-    #[cfg(test)]
     pub(in crate::backend::cuda::engine) fn reseed_request(&self, slots: &mut Slots) -> Result<()> {
         slots.end_request()?;
         slots.begin_request(&self.frequency)

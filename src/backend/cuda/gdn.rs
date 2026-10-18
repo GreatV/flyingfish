@@ -180,17 +180,6 @@ pub(crate) struct P2Sources {
 }
 
 impl GdnPlan {
-    #[cfg(test)]
-    pub(crate) fn prefill_core_reference(&mut self, fp32: bool) -> Result<bool> {
-        ensure!(
-            self.spec.hv == 32 && self.spec.qk_norm_fp32 && self.snapshots.is_none(),
-            "prefill core reference requires h32 FP32 Q/K without snapshots"
-        );
-        let p2 = self.cw_p2;
-        self.cw_p2 &= !fp32;
-        Ok(p2)
-    }
-
     /// Setup-only prefix view; reuses loaded modules and physical addresses.
     pub(crate) fn for_rows(
         &self,

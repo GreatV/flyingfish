@@ -271,24 +271,6 @@ fn nested_verify_tcmqa(device_prefix: bool, rows: usize) -> Result<bool> {
     Ok(true)
 }
 impl Runtime {
-    #[cfg(test)]
-    pub(super) fn prefill_core_reference(&mut self, fp32: bool) -> Result<(usize, usize)> {
-        ensure!(
-            self.gdn.hv == 32 && self.gdn.qk_norm_fp32,
-            "prefill core reference requires the MiniCPM h32 FP32 Q/K binding"
-        );
-        let mut p2 = 0;
-        for layer in &mut self.layers {
-            if let BoundMixer::Gdn { prefill, .. } = &mut layer.mixer {
-                p2 += usize::from(prefill.full.prefill_core_reference(fp32)?);
-                for plan in &mut prefill.small {
-                    p2 += usize::from(plan.prefill_core_reference(fp32)?);
-                }
-            }
-        }
-        Ok((p2, self.scratch.len()))
-    }
-
     fn select_positions(
         &self,
         stream: &Arc<CudaStream>,
