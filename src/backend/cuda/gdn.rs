@@ -540,11 +540,10 @@ impl GdnOps {
             None
         };
         meta.validate()?;
-        // The P2 plan skips the prep launch, so its FP32 regions are unwritten; decode uses the
-        // separate one-row decode plan.
+        // Decode uses the separate one-row plan.
         ensure!(
             !plan.cw_p2 || phase != ExecutionPhase::Decode,
-            "the chunkwise-P2 plan has no FP32 sources: decode must use the decode plan"
+            "chunkwise-P2 prefill plan cannot run phase={phase:?}; decode requires the one-row plan"
         );
         ensure!(
             !verify || !plan.cw_p2,
