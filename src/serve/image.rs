@@ -3,13 +3,16 @@ use crate::serve::detok::Shared;
 use crate::vision_input::{ImageGrid, MultimodalInput};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DECODED_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_SOURCE_PIXELS: usize = 4 * 16_777_216;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const DECODE_TIMEOUT: Duration = Duration::from_secs(600);
 static VIDEO_SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct RgbImage {
@@ -46,11 +49,10 @@ impl VideoMetadata {
     }
 }
 
-/// Decoded video container: RGB frames in decode order, their presentation timestamps and metadata.
+/// Decoded video container: RGB frames in decode order and their metadata.
 pub struct DecodedVideo {
     pub frames: Vec<RgbImage>,
     pub metadata: VideoMetadata,
-    pub timestamps: Vec<f64>,
 }
 
 /// `numpy.linspace(0, len - 1, count, dtype=int)` positions; the endpoint is exactly `len - 1`.
@@ -1363,7 +1365,7 @@ fn load_encoded_video(url: &str) -> Result<Vec<u8>> {
     base64::decode(data).context("video data URL is not valid base64")
 }
 
-/// Decodes one MP4 container: ffprobe metadata and timestamps, ffmpeg rgb24 frames over a pipe.
+/// Decodes one video container: ffprobe stream geometry, ffmpeg rgb24 frames over a pipe.
 pub fn decode_video(bytes: &[u8]) -> Result<DecodedVideo> {
     ensure!(!bytes.is_empty(), "empty video container");
     ensure!(
@@ -1375,6 +1377,7 @@ pub fn decode_video(bytes: &[u8]) -> Result<DecodedVideo> {
         .path()
         .to_str()
         .context("video scratch path is not UTF-8")?;
+    let file = format!("file:{path}");
     let probe = tool_stdout(
         "ffprobe",
         &[
@@ -1383,15 +1386,13 @@ pub fn decode_video(bytes: &[u8]) -> Result<DecodedVideo> {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height,avg_frame_rate,nb_frames,duration",
-            "-show_entries",
-            "frame=pts_time",
-            "-show_entries",
-            "format=duration",
+            "stream=width,height,avg_frame_rate,nb_frames",
             "-of",
             "json",
-            path,
+            &file,
         ],
+        PROBE_TIMEOUT,
+        MAX_ENCODED_BYTES,
     )?;
     let probed = parse_probe(&probe)?;
     let frame_bytes = (probed.width as usize)
@@ -1400,12 +1401,18 @@ pub fn decode_video(bytes: &[u8]) -> Result<DecodedVideo> {
         .context("video frame byte count overflow")?;
     let expected = probed
         .frames
-        .checked_mul(frame_bytes)
-        .context("decoded video byte count overflow")?;
-    ensure!(
-        expected <= MAX_DECODED_VIDEO_BYTES,
-        "decoded video is {expected} bytes over the {MAX_DECODED_VIDEO_BYTES}-byte limit"
-    );
+        .map(|count| {
+            count
+                .checked_mul(frame_bytes)
+                .context("decoded video byte count overflow")
+        })
+        .transpose()?;
+    if let Some(expected) = expected {
+        ensure!(
+            expected <= MAX_DECODED_VIDEO_BYTES,
+            "decoded video is expected to be {expected} bytes over the {MAX_DECODED_VIDEO_BYTES}-byte limit"
+        );
+    }
     let raw = tool_stdout(
         "ffmpeg",
         &[
@@ -1413,22 +1420,29 @@ pub fn decode_video(bytes: &[u8]) -> Result<DecodedVideo> {
             "error",
             "-noautorotate",
             "-i",
-            path,
+            &file,
+            "-map",
+            "0:v:0",
+            "-fps_mode",
+            "passthrough",
             "-f",
             "rawvideo",
             "-pix_fmt",
             "rgb24",
             "-",
         ],
+        DECODE_TIMEOUT,
+        expected.unwrap_or(MAX_DECODED_VIDEO_BYTES),
     )?;
     ensure!(
-        raw.len() == expected,
-        "ffmpeg decoded {} bytes; ffprobe metadata expects {expected} for {} frames of {}x{}",
+        raw.len() % frame_bytes == 0,
+        "ffmpeg produced {} bytes, not a multiple of the {frame_bytes}-byte {}x{} frame",
         raw.len(),
-        probed.frames,
         probed.width,
         probed.height
     );
+    let count = raw.len() / frame_bytes;
+    ensure!(count > 0, "ffmpeg decoded no video frames");
     let frames = raw
         .chunks_exact(frame_bytes)
         .map(|pixels| RgbImage {
@@ -1440,26 +1454,122 @@ pub fn decode_video(bytes: &[u8]) -> Result<DecodedVideo> {
     Ok(DecodedVideo {
         frames,
         metadata: VideoMetadata {
-            total_num_frames: probed.frames,
+            total_num_frames: count,
             fps: probed.fps,
-            duration: probed.duration,
+            duration: count as f64 / probed.fps,
         },
-        timestamps: probed.timestamps,
     })
 }
 
-fn tool_stdout(tool: &str, args: &[&str]) -> Result<Vec<u8>> {
-    let output = std::process::Command::new(tool)
+enum ToolExit {
+    Status(std::process::ExitStatus),
+    TimedOut,
+    WaitFailed(String),
+}
+
+/// Runs one tool, keeps stdout under `limit` bytes and kills it after `timeout`.
+fn tool_stdout(tool: &str, args: &[&str], timeout: Duration, limit: usize) -> Result<Vec<u8>> {
+    let mut child = std::process::Command::new(tool)
         .args(args)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .with_context(|| format!("run {tool}"))?;
-    ensure!(
-        output.status.success(),
-        "{tool} failed ({}): {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(output.stdout)
+    let mut stdout = child.stdout.take().context("tool stdout pipe missing")?;
+    let mut stderr = child.stderr.take().context("tool stderr pipe missing")?;
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let (exit_tx, exit_rx) = std::sync::mpsc::channel::<ToolExit>();
+    let waiter = std::thread::Builder::new()
+        .name(format!("{tool}-wait"))
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + timeout;
+            let exit = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break ToolExit::Status(status),
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break ToolExit::WaitFailed(error.to_string());
+                    }
+                }
+                if stop_rx.try_recv().is_ok() {
+                    let _ = child.kill();
+                    break child.wait().map_or_else(
+                        |error| ToolExit::WaitFailed(error.to_string()),
+                        ToolExit::Status,
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break ToolExit::TimedOut;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let _ = exit_tx.send(exit);
+        })
+        .context("spawn tool waiter")?;
+    let stderr_reader = std::thread::Builder::new()
+        .name(format!("{tool}-stderr"))
+        .spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = stderr.read_to_end(&mut buffer);
+            buffer
+        })
+        .context("spawn tool stderr reader")?;
+    let mut output = Vec::new();
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut failure = None;
+    loop {
+        match stdout.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                if failure.is_none() && output.len().checked_add(read).is_none_or(|n| n > limit) {
+                    failure = Some(anyhow::anyhow!(
+                        "{tool} output exceeds the {limit}-byte limit"
+                    ));
+                    let _ = stop_tx.send(());
+                }
+                if failure.is_none() {
+                    output.extend_from_slice(&chunk[..read]);
+                }
+            }
+            Err(error) => {
+                if failure.is_none() {
+                    failure = Some(anyhow::anyhow!("read {tool} stdout: {error}"));
+                }
+                let _ = stop_tx.send(());
+                break;
+            }
+        }
+    }
+    drop(stdout);
+    let exit = exit_rx.recv().context("tool waiter stopped")?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("{tool} stderr reader panicked"))?;
+    waiter
+        .join()
+        .map_err(|_| anyhow::anyhow!("{tool} waiter panicked"))?;
+    if let Some(failure) = failure {
+        return Err(failure);
+    }
+    match exit {
+        ToolExit::TimedOut => bail!(
+            "{tool} timed out after {} s and was killed",
+            timeout.as_secs()
+        ),
+        ToolExit::WaitFailed(error) => bail!("wait for {tool}: {error}"),
+        ToolExit::Status(status) => ensure!(
+            status.success(),
+            "{tool} failed ({}): {}",
+            status,
+            String::from_utf8_lossy(&stderr).trim()
+        ),
+    }
+    Ok(output)
 }
 
 struct ScratchVideo {
@@ -1469,6 +1579,7 @@ struct ScratchVideo {
 impl ScratchVideo {
     fn write(bytes: &[u8]) -> Result<Self> {
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let directory = std::env::temp_dir();
         for _ in 0..8 {
             let counter = VIDEO_SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1479,6 +1590,7 @@ impl ScratchVideo {
             let mut file = match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .mode(0o600)
                 .open(&path)
             {
                 Ok(file) => file,
@@ -1516,10 +1628,6 @@ impl Drop for ScratchVideo {
 struct ProbeReport {
     #[serde(default)]
     streams: Vec<ProbeStream>,
-    #[serde(default)]
-    frames: Vec<ProbeFrame>,
-    #[serde(default)]
-    format: Option<ProbeFormat>,
 }
 
 #[derive(Deserialize)]
@@ -1528,17 +1636,6 @@ struct ProbeStream {
     height: Option<u32>,
     avg_frame_rate: Option<String>,
     nb_frames: Option<String>,
-    duration: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ProbeFrame {
-    pts_time: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ProbeFormat {
-    duration: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1546,9 +1643,7 @@ struct ProbedVideo {
     width: u32,
     height: u32,
     fps: f64,
-    duration: f64,
-    frames: usize,
-    timestamps: Vec<f64>,
+    frames: Option<usize>,
 }
 
 fn parse_probe(bytes: &[u8]) -> Result<ProbedVideo> {
@@ -1581,57 +1676,23 @@ fn parse_probe(bytes: &[u8]) -> Result<ProbedVideo> {
         fps.is_finite() && fps > 0.0,
         "ffprobe average frame rate {rate} is not positive"
     );
-    let duration = match stream.duration.as_deref().or(report
-        .format
-        .as_ref()
-        .and_then(|format| format.duration.as_deref()))
-    {
-        Some(duration) => duration
-            .parse::<f64>()
-            .context("parse ffprobe video duration")?,
-        None => bail!("ffprobe reported no video duration"),
+    // Containers report an unknown frame count as "N/A".
+    let frames = match stream.nb_frames.as_deref() {
+        None | Some("N/A") => None,
+        Some(text) => Some(
+            text.parse()
+                .with_context(|| format!("parse ffprobe frame count {text}"))?,
+        ),
     };
     ensure!(
-        duration.is_finite() && duration > 0.0,
-        "ffprobe video duration {duration} is not positive"
+        frames.is_none_or(|count| count > 0),
+        "ffprobe reported zero frames"
     );
-    let mut timestamps = Vec::with_capacity(report.frames.len());
-    for (index, frame) in report.frames.iter().enumerate() {
-        let text = frame
-            .pts_time
-            .as_deref()
-            .with_context(|| format!("ffprobe reported no timestamp for frame {index}"))?;
-        let timestamp: f64 = text
-            .parse()
-            .with_context(|| format!("parse ffprobe timestamp {text} of frame {index}"))?;
-        ensure!(
-            timestamp.is_finite(),
-            "ffprobe timestamp of frame {index} is not finite"
-        );
-        if let Some(previous) = timestamps.last() {
-            ensure!(
-                timestamp >= *previous,
-                "ffprobe timestamp of frame {index} decreases"
-            );
-        }
-        timestamps.push(timestamp);
-    }
-    ensure!(!timestamps.is_empty(), "ffprobe reported no video frames");
-    if let Some(count) = stream.nb_frames.as_deref() {
-        let count: usize = count.parse().context("parse ffprobe frame count")?;
-        ensure!(
-            count == timestamps.len(),
-            "ffprobe reports {count} frames but {} frame timestamps",
-            timestamps.len()
-        );
-    }
     Ok(ProbedVideo {
         width,
         height,
         fps,
-        duration,
-        frames: timestamps.len(),
-        timestamps,
+        frames,
     })
 }
 
@@ -2265,30 +2326,29 @@ mod tests {
     }
 
     #[test]
-    fn ffprobe_metadata_parses_rate_duration_and_timestamps() -> Result<()> {
+    fn ffprobe_metadata_parses_geometry_rate_and_frame_count() -> Result<()> {
         let report = serde_json::json!({
             "streams": [{"width": 64, "height": 48, "avg_frame_rate": "30000/1001",
-                         "nb_frames": "3", "duration": "0.100100"}],
-            "frames": [{"pts_time": "0.000000"}, {"pts_time": "0.033367"},
-                       {"pts_time": "0.066733"}],
-            "format": {"duration": "0.100100"},
+                         "nb_frames": "3"}],
         });
         let probed = parse_probe(&serde_json::to_vec(&report)?)?;
         assert_eq!((probed.width, probed.height), (64, 48));
         assert!((probed.fps - 30000.0 / 1001.0).abs() < 1e-12);
-        assert!((probed.duration - 0.1001).abs() < 1e-12);
-        assert_eq!(probed.frames, 3);
-        assert_eq!(probed.timestamps, [0.0, 0.033367, 0.066733]);
-        let mut container = report.clone();
+        assert_eq!(probed.frames, Some(3));
+        let mut unknown = report.clone();
+        unknown["streams"][0]["nb_frames"] = serde_json::json!("N/A");
+        let probed = parse_probe(&serde_json::to_vec(&unknown)?)?;
+        assert_eq!(probed.frames, None);
+        let mut absent = report.clone();
         assert!(
-            container["streams"][0]
+            absent["streams"][0]
                 .as_object_mut()
                 .unwrap()
-                .remove("duration")
+                .remove("nb_frames")
                 .is_some()
         );
-        let probed = parse_probe(&serde_json::to_vec(&container)?)?;
-        assert!((probed.duration - 0.1001).abs() < 1e-12);
+        let probed = parse_probe(&serde_json::to_vec(&absent)?)?;
+        assert_eq!(probed.frames, None);
         Ok(())
     }
 
@@ -2296,10 +2356,7 @@ mod tests {
     fn ffprobe_metadata_rejects_missing_or_inconsistent_fields() -> Result<()> {
         let valid = serde_json::json!({
             "streams": [{"width": 64, "height": 48, "avg_frame_rate": "10/1",
-                         "nb_frames": "3", "duration": "0.300000"}],
-            "frames": [{"pts_time": "0.000000"}, {"pts_time": "0.100000"},
-                       {"pts_time": "0.200000"}],
-            "format": {"duration": "0.300000"},
+                         "nb_frames": "3"}],
         });
         let error = |value: serde_json::Value| -> Result<String> {
             match parse_probe(&serde_json::to_vec(&value)?) {
@@ -2338,30 +2395,11 @@ mod tests {
         value["streams"][0]["avg_frame_rate"] = serde_json::json!("10");
         assert!(error(value)?.contains("not a fraction"));
         let mut value = valid.clone();
-        assert!(
-            value["streams"][0]
-                .as_object_mut()
-                .unwrap()
-                .remove("duration")
-                .is_some()
-        );
-        value["format"] = serde_json::json!({});
-        assert!(error(value)?.contains("no video duration"));
+        value["streams"][0]["nb_frames"] = serde_json::json!("0");
+        assert!(error(value)?.contains("zero frames"));
         let mut value = valid.clone();
-        value["streams"][0]["duration"] = serde_json::json!("-1.0");
-        assert!(error(value)?.contains("not positive"));
-        let mut value = valid.clone();
-        value["streams"][0]["nb_frames"] = serde_json::json!("4");
-        assert!(error(value)?.contains("reports 4 frames but 3"));
-        let mut value = valid.clone();
-        value["frames"][2]["pts_time"] = serde_json::json!("0.050000");
-        assert!(error(value)?.contains("decreases"));
-        let mut value = valid.clone();
-        value["frames"][1] = serde_json::json!({});
-        assert!(error(value)?.contains("no timestamp for frame 1"));
-        let mut value = valid.clone();
-        value["frames"] = serde_json::json!([]);
-        assert!(error(value)?.contains("no video frames"));
+        value["streams"][0]["nb_frames"] = serde_json::json!("3x");
+        assert!(error(value)?.contains("frame count"));
         Ok(())
     }
 
@@ -2405,11 +2443,8 @@ mod tests {
         let video = decode_video(&bytes)?;
         assert_eq!(video.frames.len(), 15);
         assert_eq!(video.metadata.total_num_frames, 15);
-        assert!((video.metadata.fps - 10.0).abs() < 1e-6);
-        assert!((video.metadata.duration - 1.5).abs() < 1e-3);
-        assert_eq!(video.timestamps.len(), 15);
-        assert!(video.timestamps[0].abs() < 1e-6);
-        assert!((video.timestamps[14] - 1.4).abs() < 1e-6);
+        assert_eq!(video.metadata.fps, 10.0);
+        assert_eq!(video.metadata.duration, 1.5);
         assert_eq!((video.frames[0].width, video.frames[0].height), (64, 48));
         assert_eq!(video.frames[0].pixels.len(), 64 * 48 * 3);
         let processor = video_processor()?;
@@ -2430,6 +2465,164 @@ mod tests {
                 .count(),
             126
         );
+        Ok(())
+    }
+
+    fn ffprobe_report(path: &Path, entries: &str) -> Result<serde_json::Value> {
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_frames",
+                "-show_entries",
+                entries,
+                "-of",
+                "json",
+            ])
+            .arg(format!("file:{}", path.display()))
+            .output()
+            .context("run ffprobe")?;
+        assert!(probe.status.success());
+        serde_json::from_slice(&probe.stdout).context("parse ffprobe JSON")
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_decoding_keeps_variable_frame_timing() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!("ff-video-vfr-{}", std::process::id()));
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join("vfr.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=30:duration=1",
+                "-vf",
+                "select='eq(n,0)+eq(n,1)+eq(n,5)+eq(n,6)+eq(n,7)+eq(n,13)'",
+                "-fps_mode",
+                "vfr",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&path)
+            .status()
+            .context("run ffmpeg to build the VFR clip")?;
+        assert!(status.success());
+        let count = ffprobe_report(&path, "stream=nb_read_frames")?["streams"][0]["nb_read_frames"]
+            .as_str()
+            .context("nb_read_frames missing")?
+            .parse::<usize>()?;
+        assert_eq!(count, 6);
+        let bytes = std::fs::read(&path)?;
+        let reference = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-noautorotate", "-i"])
+            .arg(format!("file:{}", path.display()))
+            .args([
+                "-map",
+                "0:v:0",
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-",
+            ])
+            .output()
+            .context("run ffmpeg passthrough decode")?;
+        std::fs::remove_dir_all(&directory)?;
+        assert!(reference.status.success());
+        let video = decode_video(&bytes)?;
+        assert_eq!(video.frames.len(), count);
+        assert_eq!(video.metadata.fps, 15.0);
+        assert_eq!(video.metadata.duration, 0.4);
+        let decoded: Vec<u8> = video
+            .frames
+            .iter()
+            .flat_map(|frame| frame.pixels.iter().copied())
+            .collect();
+        assert_eq!(decoded, reference.stdout);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_metadata_uses_the_decoded_count_over_the_header_duration() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("ff-video-header-{}", std::process::id()));
+        std::fs::create_dir_all(&directory)?;
+        let clip = directory.join("video.mp4");
+        let audio = directory.join("audio.mkv");
+        let padded = directory.join("padded.mkv");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=30",
+                "-frames:v",
+                "300",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&clip)
+            .status()
+            .context("run ffmpeg to build the 300-frame clip")?;
+        assert!(status.success());
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono",
+                "-t",
+                "10.03",
+                "-c:a",
+                "pcm_s16le",
+                "-y",
+            ])
+            .arg(&audio)
+            .status()
+            .context("run ffmpeg to build the 10.03 s audio track")?;
+        assert!(status.success());
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&clip)
+            .arg("-i")
+            .arg(&audio)
+            .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-y"])
+            .arg(&padded)
+            .status()
+            .context("run ffmpeg to mux the padded container")?;
+        assert!(status.success());
+        let header = ffprobe_report(&padded, "format=duration")?["format"]["duration"]
+            .as_str()
+            .context("format duration missing")?
+            .parse::<f64>()?;
+        assert!((header - 10.03).abs() < 1e-9, "{header}");
+        let bytes = std::fs::read(&padded)?;
+        std::fs::remove_dir_all(&directory)?;
+        let decoded = decode_video(&bytes)?;
+        assert_eq!(decoded.metadata.total_num_frames, 300);
+        assert_eq!(decoded.metadata.fps, 30.0);
+        assert_eq!(decoded.metadata.duration, 10.0);
+        let indices = sample_frame_indices(&decoded.metadata, 128, 1)?;
+        assert_eq!(indices, (0..10).map(|i| i * 30).collect::<Vec<_>>());
         Ok(())
     }
 
