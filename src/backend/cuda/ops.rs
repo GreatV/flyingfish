@@ -193,6 +193,111 @@ pub(crate) struct ResidualRmsInput<'a> {
     pub weight: Tensor<bf16, 1>,
 }
 
+pub(crate) struct ResidualRmsCapture<'a> {
+    pub input: ResidualRmsInput<'a>,
+    pub capture: &'a mut TensorMut<bf16, 3>,
+    pub slot: u32,
+}
+
+impl Ops {
+    pub fn add_rmsnorm_capture(
+        &self,
+        stream: &Arc<CudaStream>,
+        domain: Option<RowDomain>,
+        input: ResidualRmsCapture<'_>,
+        y: &mut TensorMut<bf16, 3>,
+        options: RmsOptions,
+    ) -> Result<()> {
+        let ResidualRmsCapture {
+            input,
+            capture,
+            slot,
+        } = input;
+        let ResidualRmsInput {
+            x,
+            residual,
+            weight,
+        } = input;
+        for tensor in [x.0, residual, y.0] {
+            tensor.validate()?;
+            ensure!(
+                tensor.shape == x.0.shape
+                    && tensor.shape[1] == 1
+                    && tensor.stride == [u64::from(tensor.shape[2]), u64::from(tensor.shape[2]), 1],
+                "capture norm requires contiguous rows with one hidden vector"
+            );
+        }
+        let hidden = x.0.shape[2];
+        ensure!(
+            [2048, 5120].contains(&hidden),
+            "capture norm hidden width is unsupported"
+        );
+        weight.validate()?;
+        capture.0.validate()?;
+        let taps = capture.0.shape[1];
+        ensure!(
+            weight.shape == [hidden]
+                && weight.stride == [1]
+                && capture.0.shape[0] >= x.0.shape[0]
+                && capture.0.shape[2] == hidden
+                && slot < taps
+                && capture.0.stride == [u64::from(taps) * u64::from(hidden), u64::from(hidden), 1],
+            "capture norm weight or [rows,taps,hidden] layout mismatch"
+        );
+        ensure!(
+            options.eps.is_finite() && options.eps > 0.0,
+            "invalid capture norm epsilon"
+        );
+        for (a, b) in [
+            (x.0, residual),
+            (x.0, y.0),
+            (x.0, capture.0),
+            (residual, y.0),
+            (residual, capture.0),
+            (y.0, capture.0),
+        ] {
+            no_overlap(&a, &b)?;
+        }
+        for tensor in [x.0, residual, y.0, capture.0] {
+            no_overlap(&weight, &tensor)?;
+        }
+        let (meta, base, rows) = if let Some(domain) = domain {
+            domain.validate(x.0.shape[0])?;
+            (domain.meta.ptr, domain.row_base, domain.row_capacity)
+        } else {
+            (0, 0, x.0.shape[0])
+        };
+        let slices = if matches!(options.mode, RmsMode::ZeroCentered) && hidden == 5120 && rows > 16
+        {
+            4
+        } else {
+            1
+        };
+        let pitch = i32::try_from(u64::from(taps) * u64::from(hidden))?;
+        let column = i32::try_from(u64::from(slot) * u64::from(hidden))?;
+        unsafe {
+            stream
+                .launch_builder(&self.add_norm_capture)
+                .arg(&residual.ptr)
+                .arg(&x.0.ptr)
+                .arg(&weight.ptr)
+                .arg(&y.0.ptr)
+                .arg(&x.0.ptr)
+                .arg(&capture.0.ptr)
+                .arg(&i32::try_from(rows)?)
+                .arg(&i32::try_from(hidden)?)
+                .arg(&options.eps)
+                .arg(&pitch)
+                .arg(&column)
+                .arg(&(options.mode as i32))
+                .arg(&meta)
+                .arg(&i32::try_from(base)?)
+                .launch(grid(rows.div_ceil(slices) as usize, 256))?;
+        }
+        Ok(())
+    }
+}
+
 fn norm_slices_per_block(
     row_capacity: u32,
     x: &Tensor<bf16, 3>,

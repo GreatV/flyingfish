@@ -131,12 +131,6 @@ impl MixerWork {
     }
 }
 
-/// DSpark capture destination for one layer slot.
-struct Capture<'a> {
-    buffer: &'a mut CudaSlice<bf16>,
-    slot: usize,
-}
-
 impl Work {
     fn new(
         stream: &Arc<CudaStream>,
@@ -223,46 +217,6 @@ impl Work {
                 .arg(&(rows as i32))
                 .arg(&(c.hidden_size as i32))
                 .arg(&c.rms_norm_eps)
-                .launch(grid(rows, 256))?;
-        }
-        Ok(())
-    }
-
-    /// add_rmsnorm plus the DSpark capture mirror of the residual stream it
-    /// just wrote: capture[row][slot * hidden + d] = x[row][d].
-    fn add_norm_capture(
-        &mut self,
-        ops: &Ops,
-        stream: &Arc<CudaStream>,
-        weight: &CudaSlice<bf16>,
-        capture: Capture<'_>,
-        rows: usize,
-        c: &Config,
-    ) -> Result<()> {
-        let Capture {
-            buffer: capture,
-            slot,
-        } = capture;
-        ensure!(
-            capture.len() >= rows * 5 * c.hidden_size,
-            "DSpark capture buffer is too small for the capture column copy"
-        );
-        let (res, _res) = self.x.device_ptr_mut(stream);
-        let (cap, _cap) = capture.device_ptr_mut(stream);
-        unsafe {
-            stream
-                .launch_builder(&ops.add_norm_capture)
-                .arg(&self.out)
-                .arg(&res)
-                .arg(weight)
-                .arg(&mut self.n)
-                .arg(&res)
-                .arg(&cap)
-                .arg(&(rows as i32))
-                .arg(&(c.hidden_size as i32))
-                .arg(&c.rms_norm_eps)
-                .arg(&((5 * c.hidden_size) as i32))
-                .arg(&((slot * c.hidden_size) as i32))
                 .launch(grid(rows, 256))?;
         }
         Ok(())
@@ -1655,17 +1609,35 @@ impl Engine {
                     && let Some(slot) =
                         crate::dspark::capture_slot(&spec.draft.config.target_layer_ids, i)
                 {
-                    // Capture layer: the capture copy is folded into the norm.
-                    w.add_norm_capture(
-                        &self.ops,
+                    use super::contracts::TensorMut;
+                    use super::ops::{ResidualRmsCapture, ResidualRmsInput, RmsMode, RmsOptions};
+                    let taps = spec.draft.config.target_layer_ids.len();
+                    let mut x = TensorMut(qwen::heads(&w.x, s, 0, rows, 1, h as u32)?);
+                    let mut y = TensorMut(qwen::heads(&w.n, s, 0, rows, 1, h as u32)?);
+                    let mut capture = TensorMut(qwen::view(
+                        &spec.capture,
                         s,
-                        weight,
-                        Capture {
-                            buffer: &mut spec.capture,
-                            slot,
+                        0,
+                        [rows as u32, taps as u32, h as u32],
+                        [(taps * h) as u64, h as u64, 1],
+                    )?);
+                    self.ops.add_rmsnorm_capture(
+                        s,
+                        None,
+                        ResidualRmsCapture {
+                            input: ResidualRmsInput {
+                                x: &mut x,
+                                residual: qwen::heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                weight: qwen::vector(weight, s)?,
+                            },
+                            capture: &mut capture,
+                            slot: slot as u32,
                         },
-                        rows,
-                        c,
+                        &mut y,
+                        RmsOptions {
+                            mode: RmsMode::Standard,
+                            eps: c.rms_norm_eps,
+                        },
                     )?;
                 } else {
                     w.add_norm(&self.ops, s, weight, rows, c)?;

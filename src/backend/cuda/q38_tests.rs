@@ -3166,3 +3166,208 @@ fn q38_norm_stage_ab_gpu() -> Result<()> {
     ensure!(defects == 0, "norm candidate has {defects} defects");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires GPU window and FF_Q38_GPU_WINDOW=granted"]
+fn residual_rms_capture_gpu() -> Result<()> {
+    use super::ops::ResidualRmsCapture;
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let device = Device::new(0)?;
+    let stream = &device.stream;
+    let ops = Ops::new(&device.ctx)?;
+    let common = CommonOpsRef::new(&device.ctx)?;
+    let sentinel = bf16::from_f32(-17.0);
+    let mut cells = 0;
+    let mut controls = 0;
+    for hidden in [2048usize, 5120] {
+        for rows in [1usize, 5, 16, 17, 256, 4096] {
+            for mode in [RmsMode::Standard, RmsMode::ZeroCentered] {
+                let total = rows + 2;
+                let active = if rows == 1 { 1 } else { rows - 1 };
+                let (_metadata, sequence) =
+                    meta(stream, 7, (active + 1) as i32, (total + 8) as i32)?;
+                let domain = RowDomain {
+                    meta: sequence,
+                    row_base: 1,
+                    row_capacity: rows as u32,
+                };
+                let pattern = |i: usize, layer: usize| {
+                    bf16::from_f32((((i + layer * 17) % 257) as f32 - 128.0) / 128.0)
+                };
+                let addend_host: Vec<_> = (0..total * hidden).map(|i| pattern(i, 3)).collect();
+                let residual_host: Vec<_> = (0..total * hidden)
+                    .map(|i| bf16::from_f32(((i % 263) as f32 - 131.0) / 256.0))
+                    .collect();
+                let weight_host: Vec<_> = (0..hidden)
+                    .map(|i| bf16::from_f32((i % 251) as f32 / 256.0 + 0.5))
+                    .collect();
+                let addend = stream.clone_htod(&addend_host)?;
+                let weights = stream.clone_htod(&weight_host)?;
+                let mut residual = stream.clone_htod(&residual_host)?;
+                let baseline = stream.clone_htod(&residual_host)?;
+                let mut normalized = stream.clone_htod(&vec![sentinel; total * hidden])?;
+                let baseline_normalized = stream.clone_htod(&vec![sentinel; total * hidden])?;
+                let mut capture = stream.clone_htod(&vec![sentinel; total * 5 * hidden])?;
+                let shape = [total as u32, 1, hidden as u32];
+                let strides = [hidden as u64, hidden as u64, 1];
+                let addend_view = view(&addend, stream, shape, strides)?;
+                let weight_view = view(&weights, stream, [hidden as u32], [1])?;
+                let mut residual_view = TensorMut(view(&residual, stream, shape, strides)?);
+                let mut normalized_view = TensorMut(view(&normalized, stream, shape, strides)?);
+                let mut capture_view = TensorMut(view(
+                    &capture,
+                    stream,
+                    [total as u32, 5, hidden as u32],
+                    [(5 * hidden) as u64, hidden as u64, 1],
+                )?);
+                let mut baseline_view = TensorMut(view(&baseline, stream, shape, strides)?);
+                let mut baseline_output =
+                    TensorMut(view(&baseline_normalized, stream, shape, strides)?);
+                let options = RmsOptions { mode, eps: 1e-6 };
+                match mode {
+                    RmsMode::ZeroCentered => common.norm.rms_add_with(
+                        stream,
+                        domain,
+                        ResidualRmsInput {
+                            x: &mut baseline_view,
+                            residual: addend_view,
+                            weight: weight_view,
+                        },
+                        &mut baseline_output,
+                        options,
+                    )?,
+                    RmsMode::Standard => {
+                        let offset = (hidden * std::mem::size_of::<bf16>()) as u64;
+                        let rp = baseline_view.0.ptr + offset;
+                        let xp = addend_view.ptr + offset;
+                        let yp = baseline_output.0.ptr + offset;
+                        unsafe {
+                            stream
+                                .launch_builder(&ops.add_norm)
+                                .arg(&xp)
+                                .arg(&rp)
+                                .arg(&weight_view.ptr)
+                                .arg(&yp)
+                                .arg(&rp)
+                                .arg(&(active as i32))
+                                .arg(&(hidden as i32))
+                                .arg(&options.eps)
+                                .launch(grid(active, 256))?;
+                        }
+                    }
+                }
+                let mut launch = || {
+                    ops.add_rmsnorm_capture(
+                        stream,
+                        Some(domain),
+                        ResidualRmsCapture {
+                            input: ResidualRmsInput {
+                                x: &mut residual_view,
+                                residual: addend_view,
+                                weight: weight_view,
+                            },
+                            capture: &mut capture_view,
+                            slot: 2,
+                        },
+                        &mut normalized_view,
+                        options,
+                    )
+                };
+                launch()?;
+                stream.synchronize()?;
+                let expected_residual = stream.clone_dtoh(&baseline)?;
+                let expected_normalized = stream.clone_dtoh(&baseline_normalized)?;
+                let actual_residual = stream.clone_dtoh(&residual)?;
+                let actual_normalized = stream.clone_dtoh(&normalized)?;
+                let actual_capture = stream.clone_dtoh(&capture)?;
+                let unequal = |a: &[bf16], b: &[bf16]| {
+                    a.iter()
+                        .zip(b)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count()
+                };
+                ensure!(
+                    unequal(&actual_residual, &expected_residual) == 0,
+                    "capture residual differs hidden={hidden} rows={rows} mode={mode:?}"
+                );
+                ensure!(
+                    unequal(&actual_normalized, &expected_normalized) == 0,
+                    "capture normalization differs hidden={hidden} rows={rows} mode={mode:?}"
+                );
+                let mut expected_capture = vec![sentinel; total * 5 * hidden];
+                for row in 1..=active {
+                    let offset = row * 5 * hidden + 2 * hidden;
+                    expected_capture[offset..offset + hidden]
+                        .copy_from_slice(&expected_residual[row * hidden..(row + 1) * hidden]);
+                }
+                ensure!(
+                    unequal(&actual_capture, &expected_capture) == 0,
+                    "capture layout or inactive rows differ hidden={hidden} rows={rows} mode={mode:?}"
+                );
+                stream.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                let captured_launch = launch();
+                let graph = stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?;
+                captured_launch?;
+                let graph = graph.context("capture graph missing")?;
+                for _ in 0..2 {
+                    stream.memcpy_htod(&residual_host, &mut residual)?;
+                    stream.memcpy_htod(&vec![sentinel; total * hidden], &mut normalized)?;
+                    stream.memcpy_htod(&vec![sentinel; total * 5 * hidden], &mut capture)?;
+                    graph.launch()?;
+                    stream.synchronize()?;
+                    ensure!(
+                        unequal(&stream.clone_dtoh(&residual)?, &expected_residual) == 0
+                            && unequal(&stream.clone_dtoh(&normalized)?, &expected_normalized) == 0
+                            && unequal(&stream.clone_dtoh(&capture)?, &expected_capture) == 0,
+                        "capture graph differs hidden={hidden} rows={rows} mode={mode:?}"
+                    );
+                }
+                if rows == 17 {
+                    let wrong: Vec<_> = (0..total * hidden).map(|i| pattern(i, 4)).collect();
+                    let wrong = stream.clone_htod(&wrong)?;
+                    stream.memcpy_htod(&residual_host, &mut residual)?;
+                    let wrong_view = view(&wrong, stream, shape, strides)?;
+                    ops.add_rmsnorm_capture(
+                        stream,
+                        Some(domain),
+                        ResidualRmsCapture {
+                            input: ResidualRmsInput {
+                                x: &mut residual_view,
+                                residual: wrong_view,
+                                weight: weight_view,
+                            },
+                            capture: &mut capture_view,
+                            slot: 2,
+                        },
+                        &mut normalized_view,
+                        options,
+                    )?;
+                    stream.synchronize()?;
+                    let mismatch = unequal(&stream.clone_dtoh(&capture)?, &expected_capture);
+                    ensure!(
+                        mismatch > 0,
+                        "wrong-layer control escaped capture comparison"
+                    );
+                    println!(
+                        "CAPTURE_WRONG_LAYER hidden={hidden} rows={rows} mode={mode:?} bit_mismatches={mismatch} PASS"
+                    );
+                    controls += 1;
+                }
+                println!(
+                    "CAPTURE_OP hidden={hidden} rows={rows} active={active} taps=5 mode={mode:?} residual/norm/capture/graph_bits PASS"
+                );
+                cells += 1;
+            }
+        }
+    }
+    println!(
+        "RESIDUAL_RMS_CAPTURE cells={cells} wrong_layer_controls={controls} graph_replays={} PASS",
+        cells * 2
+    );
+    Ok(())
+}
