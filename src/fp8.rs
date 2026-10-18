@@ -20,3 +20,82 @@ pub fn decode_e4m3(code: u8) -> f32 {
 pub fn effective_weight(code: u8, scale: bf16) -> bf16 {
     bf16::from_f32(decode_e4m3(code) * scale.to_f32())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The anchor: effective_weight over the layer-0 expert-0 native FP8
+    /// bytes equals agy's torch-dequantized BF16 dump bitwise.
+    #[test]
+    fn effective_weight_matches_real_expert_bitwise() -> anyhow::Result<()> {
+        let path = std::env::var("FF_T13_ANCHOR").unwrap_or_else(|_| {
+            format!(
+                "{}/../../ff-work/minicpm47/evidence/T13-fp8-ref/expert_l0e0_dequant.safetensors",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+        if !std::path::Path::new(&path).exists() {
+            anyhow::bail!("anchor dump missing: {path}");
+        }
+        let f = std::fs::read(path)?;
+        let tensors = safetensors::SafeTensors::deserialize(&f)?;
+        let pairs = [
+            ("gate", "gate_proj.weight_fp8", "gate_proj.weight_scale"),
+            ("up", "up_proj.weight_fp8", "up_proj.weight_scale"),
+            ("down", "down_proj.weight_fp8", "down_proj.weight_scale"),
+        ];
+        for (want_name, code_name, scale_name) in pairs {
+            let want = tensors.tensor(want_name)?;
+            let codes = tensors.tensor(code_name)?;
+            let scales = tensors.tensor(scale_name)?;
+            anyhow::ensure!(
+                want.dtype() == safetensors::Dtype::BF16,
+                "{want_name}: expected BF16, got {:?}",
+                want.dtype()
+            );
+            anyhow::ensure!(
+                codes.dtype() == safetensors::Dtype::F8_E4M3,
+                "{code_name}: expected F8_E4M3, got {:?}",
+                codes.dtype()
+            );
+            anyhow::ensure!(
+                scales.dtype() == safetensors::Dtype::BF16,
+                "{scale_name}: expected BF16, got {:?}",
+                scales.dtype()
+            );
+            let want_b = want.data();
+            let code_b = codes.data();
+            let scale_b = scales.data();
+            anyhow::ensure!(
+                code_b.len() * 2 == want_b.len(),
+                "{want_name}: extents want {} code {}",
+                want_b.len(),
+                code_b.len()
+            );
+            // Per-output-channel scales: one BF16 scale per weight row.
+            let k = code_b.len() / (scale_b.len() / 2);
+            anyhow::ensure!(
+                scale_b.len() / 2 * k == code_b.len(),
+                "{want_name}: scale rows do not divide the codes"
+            );
+            let mut bad = None;
+            for i in 0..code_b.len() {
+                let row = i / k;
+                let s = bf16::from_le_bytes([scale_b[row * 2], scale_b[row * 2 + 1]]);
+                let got = effective_weight(code_b[i], s);
+                let exp = bf16::from_le_bytes([want_b[i * 2], want_b[i * 2 + 1]]);
+                if got.to_bits() != exp.to_bits() {
+                    bad = Some((i, got, exp));
+                    break;
+                }
+            }
+            anyhow::ensure!(
+                bad.is_none(),
+                "{want_name}: effective_weight mismatch at {bad:?}"
+            );
+            eprintln!("{want_name}: {} weights bitwise-equal", code_b.len());
+        }
+        Ok(())
+    }
+}
