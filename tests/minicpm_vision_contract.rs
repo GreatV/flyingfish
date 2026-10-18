@@ -425,6 +425,10 @@ fn video_processor_and_canvas_match_reference() -> Result<()> {
         for (primary, pil) in reference_pixels.iter().zip(&pil_pixels) {
             pil_floor = pil_floor.max((primary - pil).abs());
         }
+        assert!(
+            pil_floor <= PIXEL_TOLERANCE,
+            "{case} PIL noise floor {pil_floor} exceeds {PIXEL_TOLERANCE}"
+        );
         println!(
             "{}",
             serde_json::json!({

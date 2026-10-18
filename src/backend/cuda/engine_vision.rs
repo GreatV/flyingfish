@@ -2594,18 +2594,6 @@ mod tests {
         merged
     }
 
-    /// T0 fixture epsilons; the fixture comparison is a reported secondary metric.
-    fn fixture_eps(tap: &str) -> Result<f32> {
-        Ok(match tap {
-            "vision_patch_embeddings" | "vision_tower_out" => 0.0625,
-            "vit_merger_out" => 0.03125,
-            "vit_merger_in" => 0.03125,
-            "merger_out" => 0.0078125,
-            _ if tap.starts_with("vision_layer_") => 0.03125,
-            _ => bail!("unknown fixture tap {tap}"),
-        })
-    }
-
     /// Largest per-element distance in half-BF16-ulp units of `max(|reference_i|, rms)`.
     fn ulp_ratio(candidate: &[f32], reference: &[f32], rms: f32) -> f64 {
         let mut worst = 0f64;
@@ -2886,7 +2874,7 @@ mod tests {
                         "max_abs": metrics["max_abs"], "max_ulp_ratio": ratio, "k": k, "rms": rms,
                         "cosine": metrics["cosine"],
                         "max_abs_over_rms": metrics["max_abs"].as_f64().context("max_abs")? / rms,
-                        "pass": pass, "fixture_secondary": fixture_metrics, "fixture_eps": fixture_eps(tap)?}})
+                        "pass": pass, "fixture_secondary": fixture_metrics}})
                 );
                 verdict.insert(
                     format!("{case}/{tap}"),

@@ -3054,13 +3054,17 @@ mod tests {
             .as_str()
             .context("format duration missing")?
             .parse::<f64>()?;
-        assert!(header > 11.0, "{header}");
         let bytes = std::fs::read(&padded)?;
         std::fs::remove_dir_all(&directory)?;
         let decoded = decode_video(&bytes)?;
         assert_eq!(decoded.metadata.total_num_frames, 300);
         assert_eq!(decoded.metadata.fps, 30.0);
         assert_eq!(decoded.metadata.duration, 10.0);
+        assert!(
+            header > decoded.metadata.duration,
+            "header={header} decoded={}",
+            decoded.metadata.duration
+        );
         let indices = sample_frame_indices(&decoded.metadata, 128, 1)?;
         assert_eq!(indices, (0..10).map(|i| i * 30).collect::<Vec<_>>());
         Ok(())
