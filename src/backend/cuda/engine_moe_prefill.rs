@@ -1884,13 +1884,13 @@ mod tests {
             engine.closure.ready(Instant::now())?;
             engine.reset()?;
         }
-        reference.prefill_tail(&[1, 2, 3, 4, 5], &mut Trace::default(), 8)?;
+        reference.prefill(&[1, 2, 3, 4, 5], None)?;
         candidate
             .moe_slots
             .as_mut()
             .context("graph refill slots missing")?
             .delay_request = true;
-        candidate.prefill_tail(&[1, 2, 3, 4, 5], &mut Trace::default(), 8)?;
+        candidate.prefill(&[1, 2, 3, 4, 5], None)?;
         let slots = candidate
             .moe_slots
             .as_ref()
