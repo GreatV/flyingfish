@@ -2739,13 +2739,6 @@ mod tests {
             .vision
             .as_ref()
             .context("vision configuration missing")?;
-        let requested: Option<Vec<String>> =
-            std::env::var("FF_MINICPM_VISION_CASES").ok().map(|value| {
-                value
-                    .split(',')
-                    .map(|case| case.trim().to_owned())
-                    .collect()
-            });
         for (case, pixels_key, sizes_key, video) in [
             ("image_hockey_16x", "pixel_values", "target_sizes", false),
             ("image_boat_16x", "pixel_values", "target_sizes", false),
@@ -2768,13 +2761,6 @@ mod tests {
                 true,
             ),
         ] {
-            let selected = match &requested {
-                Some(list) => list.iter().any(|name| name == case),
-                None => !video,
-            };
-            if !selected {
-                continue;
-            }
             let path = fixture_reference.join(format!("{case}.safetensors"));
             let file =
                 std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
@@ -2940,6 +2926,11 @@ mod tests {
         // Two-image reach control: independent per-crop segments must reproduce each standalone
         // merger block and the two blocks must not be byte-identical.
         if let Some(merged) = merged_input {
+            ensure!(
+                merged_expected.len() == 2,
+                "two-image reach control needs exactly two image cases, got {}",
+                merged_expected.len()
+            );
             let vision_config = model
                 .vision
                 .as_ref()

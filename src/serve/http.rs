@@ -507,7 +507,7 @@ async fn chat_completions(
             ));
         }
     }
-    let (images, videos) = match prepare_message_media(&state, &mut messages) {
+    let (images, videos) = match prepare_message_media(&state, &mut messages).await {
         Ok(media) => media,
         Err(error) => return bad_request(&format!("media input: {error}")),
     };
@@ -564,14 +564,19 @@ async fn chat_completions(
             Ok(images) => images,
             Err(error) => return bad_request(&format!("image input: {error}")),
         };
-        let videos = match videos
-            .into_iter()
-            .map(|video| processor.prepare_planned_video(video))
-            .collect::<Result<Vec<_>>>()
-        {
-            Ok(videos) => videos,
-            Err(error) => return bad_request(&format!("video input: {error}")),
-        };
+        let mut prepared_videos = Vec::with_capacity(videos.len());
+        for video in videos {
+            let processor = processor.clone();
+            match tokio::task::spawn_blocking(move || processor.prepare_planned_video(video)).await
+            {
+                Ok(Ok(video)) => prepared_videos.push(video),
+                Ok(Err(error)) => return bad_request(&format!("video input: {error}")),
+                Err(error) => {
+                    return bad_request(&format!("video input: preparation task failed: {error}"));
+                }
+            }
+        }
+        let videos = prepared_videos;
         match processor.expand(&ids, images, videos, state.backend.options().capacity) {
             Ok((expanded, prepared)) => {
                 ids = expanded;
@@ -600,7 +605,7 @@ async fn chat_completions(
     .await
 }
 
-fn prepare_message_media(
+async fn prepare_message_media(
     state: &AppState,
     messages: &mut [serde_json::Value],
 ) -> Result<(
@@ -672,8 +677,10 @@ fn prepare_message_media(
                         .get("url")
                         .and_then(|v| v.as_str())
                         .context("video_url needs a string url")?;
+                    // Video processor class default and the model card pass 128
+                    // (video_processing_minicpmv4_6.py:99, README.md:213/250).
                     let max_num_frames = match object.get("max_num_frames") {
-                        None => 4,
+                        None => 128,
                         Some(value) => usize::try_from(
                             value
                                 .as_u64()
@@ -707,13 +714,23 @@ fn prepare_message_media(
                     let processor = state
                         .image_processor
                         .as_ref()
-                        .context("this model does not support video input")?;
+                        .context("this model does not support video input")?
+                        .clone();
+                    // max_slice_nums = 1: the model card's video call (README.md:214); the
+                    // processor class default is 9 (video_processing_minicpmv4_6.py:92).
                     let options = super::image::VideoOptions {
                         max_num_frames,
                         stack_frames,
                         max_slice_nums: Some(1),
                     };
-                    let video = processor.plan_video(url, options)?;
+                    let url = url.to_owned();
+                    let capacity = state.backend.options().capacity;
+                    let planning = processor.clone();
+                    let video = tokio::task::spawn_blocking(move || {
+                        planning.plan_video(&url, options, capacity)
+                    })
+                    .await
+                    .context("video planning task failed")??;
                     video_tokens = video_tokens
                         .checked_add(processor.video_tokens(&video)?)
                         .context("video token count overflow")?;
