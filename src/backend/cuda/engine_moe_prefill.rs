@@ -222,6 +222,7 @@ struct Gpu {
     staging_readers: Vec<Option<Ticket>>,
     staging_copy: Option<Ticket>,
     resident_slots: Vec<u32>,
+    cpu_arithmetic: Vec<bool>,
     epoch: u64,
     read_ahead: ReadAhead,
 }
@@ -246,6 +247,7 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     reserves: Reserves,
     service: ServiceTable,
     workers: u32,
+    cpu_ceiling: u32,
     h2d_bytes_per_second: f64,
     span: Option<Span>,
     gpu: Gpu,
@@ -273,7 +275,7 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
     rows: u32,
     service: &ServiceTable,
     h2d_bytes_per_second: f64,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, u32)> {
     ensure!(
         rows > 0
             && service.max_rows() > 0
@@ -313,6 +315,7 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
     Ok((
         usize::try_from(choices.min(u64::from(rows)))?,
         usize::try_from(choices)?,
+        cpu_rows,
     ))
 }
 
@@ -397,6 +400,7 @@ impl Prefill {
             reserves,
             service,
             workers,
+            cpu_ceiling: cpu.2,
             h2d_bytes_per_second,
             span: None,
             gpu: Gpu {
@@ -418,6 +422,7 @@ impl Prefill {
                 staging_readers: vec![None; capacity.prefill_staging_slots as usize],
                 staging_copy: None,
                 resident_slots: Vec::with_capacity(geometry.experts as usize),
+                cpu_arithmetic: vec![false; geometry.experts as usize],
                 epoch: 0,
                 read_ahead: ReadAhead::new(
                     capacity.prefill_staging_slots,
@@ -745,6 +750,17 @@ impl Prefill {
             },
         )?;
         let plan = &self.plan;
+        for (expert, form) in self.gpu.cpu_arithmetic.iter_mut().enumerate() {
+            *form = self.counts[expert] <= self.cpu_ceiling;
+        }
+        for &expert in plan.cpu() {
+            ensure!(
+                self.counts[expert as usize] <= self.cpu_ceiling,
+                "prefill CPU expert layer={layer} expert={expert} rows={} exceed setup ceiling={}",
+                self.counts[expert as usize],
+                self.cpu_ceiling
+            );
+        }
         for (total, &count) in self.frequency[layer as usize].iter_mut().zip(&self.counts) {
             *total += f64::from(count);
         }
@@ -1799,6 +1815,7 @@ impl Gpu {
             ops.prefill_contribute(
                 stream,
                 MoePrefillContribute {
+                    cpu_arithmetic: &self.cpu_arithmetic,
                     x: span.hidden(&span.layout.normalized, base, rows)?,
                     ids: span.choices(&span.layout.ids, base, rows)?,
                     weights: span.choices(&span.layout.weights, base, rows)?,
@@ -1948,6 +1965,39 @@ mod tests {
         };
         let device = Device::new(0)?;
         let stream = &device.stream;
+        let domain: Vec<_> = (0..=u16::MAX)
+            .flat_map(|bits| [bf16::from_bits(bits), bf16::ONE])
+            .collect();
+        let domain_device = stream.clone_htod(&domain)?;
+        let silu_device = stream.alloc_zeros::<bf16>(usize::from(u16::MAX) + 1)?;
+        let silu =
+            crate::backend::cuda::cubin::module(&device.ctx, "act")?.load_function("silu_mul")?;
+        // SAFETY: the dense [65536,2] input and [65536,1] output cover the BF16 domain.
+        unsafe {
+            stream
+                .launch_builder(&silu)
+                .arg(&domain_device.device_ptr(stream).0)
+                .arg(&silu_device.device_ptr(stream).0)
+                .arg(&65536i32)
+                .arg(&1i32)
+                .launch(crate::backend::cuda::ops::grid(256, 256))?;
+        }
+        let silu_map = stream.clone_dtoh(&silu_device)?;
+        let silu_mismatches = silu_map
+            .iter()
+            .enumerate()
+            .filter(|(bits, actual)| {
+                let value = bf16::from_bits(*bits as u16).to_f32();
+                value.is_finite()
+                    && actual.to_bits()
+                        != bf16::from_f32(value * (1.0 / (1.0 + (-value).exp()))).to_bits()
+            })
+            .count();
+        ensure!(
+            silu_mismatches == 0,
+            "BF16 SiLU CPU/GPU map mismatches={silu_mismatches}"
+        );
+        println!("PASS expert_tier_silu_map finite_inputs=65280 bit_mismatches=0");
         let native_device = stream.clone_htod(&native)?;
         let gate_up_pointer = native_device.device_ptr(stream).0;
         let down_pointer = gate_up_pointer + (cut * 2) as u64;
@@ -2032,6 +2082,7 @@ mod tests {
                 ops.prefill_contribute(
                     stream,
                     MoePrefillContribute {
+                        cpu_arithmetic: &[true; 256],
                         x: qwen::matrix(&x_device, stream, 0, rows, hidden)?,
                         ids: testing::dense(&ids, stream, rows as u32, 1)?,
                         weights: testing::dense(&routing_device, stream, rows as u32, 1)?,
@@ -2305,16 +2356,10 @@ mod tests {
                     });
                 println!(
                     "{} expert_tier_identity layer=0 expert={expert} rows={rows} weighted={weighted} comparison={name} stored=[rows,2048] bit_mismatches={mismatches} max_abs={maximum} first={first:?} cpu_isa={}",
-                    if mismatches == 0 {
-                        "PASS"
-                    } else if name == "cpu_pool_vs_disk" {
-                        "DEFECT"
-                    } else {
-                        "DIFFERENCE"
-                    },
+                    if mismatches == 0 { "PASS" } else { "DEFECT" },
                     pool.isa().name()
                 );
-                defects += usize::from(name == "cpu_pool_vs_disk" && mismatches != 0);
+                defects += usize::from(mismatches != 0);
             }
         }
         ensure!(
@@ -2436,15 +2481,15 @@ mod tests {
         )?;
         assert_eq!(
             cpu_bound(geometry, slot_bytes, 263, &service, 1_000_000_000.0)?,
-            (32, 32)
+            (32, 32, 2)
         );
         assert_eq!(
             cpu_bound(geometry, slot_bytes, 263, &service, 1_000_000_000_000.0)?,
-            (1, 1)
+            (1, 1, 0)
         );
         assert_eq!(
             cpu_bound(geometry, slot_bytes, 263, &service, 1_000_000.0)?,
-            (263, 1024)
+            (263, 1024, 64)
         );
         for span_rows in [8, 17, 37, 263] {
             let layout =
@@ -2639,6 +2684,15 @@ mod tests {
         )?;
         let host_ids = stream.clone_dtoh(&ids)?;
         let host_weights = stream.clone_dtoh(&weights)?;
+        let ceiling = engine
+            .moe_prefill
+            .as_ref()
+            .context("prefill reference planner missing")?
+            .cpu_ceiling;
+        let mut arithmetic = [false; 16];
+        for (expert, form) in arithmetic.iter_mut().enumerate() {
+            *form = host_ids.iter().filter(|&&id| id == expert as i32).count() <= ceiling as usize;
+        }
         let (cpu_experts, cohorts) = cohorts(&host_ids)?;
         let slots = engine
             .moe_slots
@@ -2685,6 +2739,7 @@ mod tests {
                 decode.prefill.prefill_contribute(
                     stream,
                     MoePrefillContribute {
+                        cpu_arithmetic: &arithmetic,
                         x: qwen::matrix(&input, stream, base * 128, count, 128)?,
                         ids: qwen::view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
                         weights: qwen::view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,

@@ -5,6 +5,34 @@
 
 using bf16 = __nv_bfloat16;
 
+// Sixteen K-strided FMA accumulators and the CPU expert's pairwise tree.
+extern "C" __global__ void moe_gemm_lane16(
+    const unsigned long long* __restrict__ matrices, int problems,
+    int first, int columns, int inner) {
+  if (blockDim.x != 256 || first < 0 || first >= problems ||
+      columns < 1 || inner < 1) __trap();
+  const int problem = first + blockIdx.z;
+  if (problem >= problems) __trap();
+  const int row = blockIdx.y;
+  if (row >= matrices[3 * problems + problem]) return;
+  const int column = blockIdx.x * 16 + threadIdx.x / 16;
+  if (column >= columns) return;
+  const int lane = threadIdx.x % 16;
+  const bf16* __restrict__ weight =
+      reinterpret_cast<const bf16*>(matrices[problem]) + (size_t)column * inner;
+  const bf16* __restrict__ x =
+      reinterpret_cast<const bf16*>(matrices[problems + problem]) + (size_t)row * inner;
+  bf16* __restrict__ y =
+      reinterpret_cast<bf16*>(matrices[2 * problems + problem]) + (size_t)row * columns;
+  float sum = 0.0f;
+  for (int k = lane; k < inner; k += 16)
+    sum = __fmaf_rn(__bfloat162float(x[k]), __bfloat162float(weight[k]), sum);
+  const unsigned mask = __activemask();
+  for (int step = 1; step < 16; step *= 2)
+    sum = __fadd_rn(sum, __shfl_down_sync(mask, sum, step, 16));
+  if (lane == 0) y[column] = __float2bfloat16_rn(sum);
+}
+
 #define FD_MOE_GUARDS do {                                                              \
   if (blockDim.x != 1024 || experts < 1 || experts > 1024) __trap();                    \
 } while (0)

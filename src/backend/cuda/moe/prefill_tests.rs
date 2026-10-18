@@ -93,8 +93,8 @@ fn stage_capacity_math() {
         );
     }
     assert_eq!(d2h_window_words(MAX_EXPERTS), 2113);
-    assert_eq!(GEMM1_PTR_WORDS, 3 * (MAX_EXPERTS + 2));
-    assert_eq!(GEMM2_PTR_WORDS, 3 * (MAX_EXPERTS + 1));
+    assert_eq!(GEMM1_PTR_WORDS, 4 * (MAX_EXPERTS + 2));
+    assert_eq!(GEMM2_PTR_WORDS, 4 * (MAX_EXPERTS + 1));
 }
 
 #[test]
@@ -102,19 +102,27 @@ fn grouping_orders_and_runs() {
     let mut order = Vec::new();
     let mut runs = Vec::new();
     let counts = [0i32, 3, 0, 1, 3, 2];
-    problem_order(&counts, &mut order);
+    problem_order(&counts, &[false; 6], &mut order);
     assert_eq!(order, vec![3, 5, 1, 4]);
     group_runs(&order, &counts, &mut runs);
     assert_eq!(runs, vec![(1, 1), (2, 1), (3, 2)]);
-    problem_order(&[0, 0, 0], &mut order);
+    problem_order(&[0, 0, 0], &[false; 3], &mut order);
     assert!(order.is_empty());
     group_runs(&order, &[0, 0, 0], &mut runs);
     assert!(runs.is_empty());
     let flat = [2, 2, 2, 2];
-    problem_order(&flat, &mut order);
+    problem_order(&flat, &[false; 4], &mut order);
     assert_eq!(order, vec![0, 1, 2, 3]);
     group_runs(&order, &flat, &mut runs);
     assert_eq!(runs, vec![(2, 4)]);
+    problem_order(
+        &counts,
+        &[false, true, false, true, false, false],
+        &mut order,
+    );
+    assert_eq!(order, vec![5, 4, 3, 1]);
+    group_runs(&order[..2], &counts, &mut runs);
+    assert_eq!(runs, vec![(2, 1), (3, 1)]);
 }
 
 /// The eviction-arm fixture: hot-expert weights scaled by 1.25 (bf16 round);
@@ -393,6 +401,7 @@ fn contribute_input<'a>(
         fx.dims.inter,
     );
     Ok(MoePrefillContribute {
+        cpu_arithmetic: &[false; MAX_EXPERTS][..experts],
         x: testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
         ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
         active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
@@ -1609,8 +1618,8 @@ fn prefill_pos_of_bounds_gpu() -> Result<()> {
 
 #[test]
 fn stage_accounting_is_pinned() {
-    assert_eq!(super::prefill::stage_host_pinned_bytes(), 57_676);
-    assert_eq!(super::prefill::stage_device_bytes(), 49_224);
+    assert_eq!(super::prefill::stage_host_pinned_bytes(), 74_084);
+    assert_eq!(super::prefill::stage_device_bytes(), 65_632);
 }
 
 /// Small frozen case for the prefill racecheck: rows=64, E=16, K=4, H=128,

@@ -30,10 +30,9 @@ const ALIGN_MIN_BYTES: u64 = 4;
 /// i32 words of the pinned D2H window at full capacity: counts[E], the
 /// active-assignment total and offsets[E+1] with the scratch region paddings.
 const D2H_WINDOW_WORDS: usize = 2113;
-/// A/B/C pointer block capacities in device pointers: one problem per active
-/// expert plus the shared entries.
-pub(crate) const GEMM1_PTR_WORDS: usize = 3 * (MAX_EXPERTS + 2);
-pub(crate) const GEMM2_PTR_WORDS: usize = 3 * (MAX_EXPERTS + 1);
+/// A/B/C pointers and row counts, one problem per active expert plus shared entries.
+pub(crate) const GEMM1_PTR_WORDS: usize = 4 * (MAX_EXPERTS + 2);
+pub(crate) const GEMM2_PTR_WORDS: usize = 4 * (MAX_EXPERTS + 1);
 /// Upper bound of per-GEMM groups: one per same-count run plus the shared
 /// group.
 const MAX_GROUPS: usize = MAX_EXPERTS + 2;
@@ -41,6 +40,8 @@ const MAX_GROUPS: usize = MAX_EXPERTS + 2;
 /// Caller-owned contribution/done buffers survive cohorts; inputs stay immutable until stream completion.
 #[derive(Debug)]
 pub(crate) struct MoePrefillContribute<'a> {
+    /// Whole-span CPU-eligible arithmetic mask, independent of this cohort's row wave.
+    pub cpu_arithmetic: &'a [bool],
     pub x: Tensor<bf16, 2>,
     pub ids: Tensor<i32, 2>,
     pub weights: Tensor<bf16, 2>,
@@ -256,6 +257,11 @@ impl MoePrefillContribute<'_> {
             "moe prefill ids/active/weights/assignment_gen must be dense [rows, top_k] views (top_k {top_k})"
         );
         let experts = self.slot_valid.shape[0];
+        ensure!(
+            self.cpu_arithmetic.len() == experts as usize,
+            "moe prefill CPU arithmetic mask length={} experts={experts}",
+            self.cpu_arithmetic.len()
+        );
         self.slots_gate_up.validate()?;
         self.slots_down.validate()?;
         self.slot_valid.validate()?;
@@ -466,14 +472,12 @@ pub(crate) struct PrefillLayout {
 
 /// Persistent pinned host bytes reserved by PrefillOps::new: one D2H
 /// window plus the two GEMM pointer mirrors.
-#[cfg(test)]
 pub fn stage_host_pinned_bytes() -> u64 {
     (D2H_WINDOW_WORDS * 4 + (GEMM1_PTR_WORDS + GEMM2_PTR_WORDS) * 8) as u64
 }
 
 /// Persistent device bytes reserved by PrefillOps::new: the two GEMM
 /// pointer blocks.
-#[cfg(test)]
 pub fn stage_device_bytes() -> u64 {
     ((GEMM1_PTR_WORDS + GEMM2_PTR_WORDS) * 8) as u64
 }
@@ -566,11 +570,11 @@ pub(crate) fn d2h_window_words(experts: usize) -> usize {
     d2h_active_total_word(experts) + REGION as usize / 4 + experts + 1
 }
 
-/// Active experts (count > 0) in problem order: count ascending, id ascending.
-pub(crate) fn problem_order(counts: &[i32], order: &mut Vec<u32>) {
+/// Tensor-core problems precede CPU-form problems, each ordered by count then id.
+pub(crate) fn problem_order(counts: &[i32], cpu_arithmetic: &[bool], order: &mut Vec<u32>) {
     order.clear();
     order.extend((0..counts.len() as u32).filter(|&e| counts[e as usize] > 0));
-    order.sort_by_key(|&e| counts[e as usize]);
+    order.sort_unstable_by_key(|&e| (cpu_arithmetic[e as usize], counts[e as usize], e));
 }
 
 /// Consecutive same-count runs of the problem order as (count, run length).
@@ -700,6 +704,7 @@ pub(crate) struct PrefillOps {
     scan: CudaFunction,
     permute: CudaFunction,
     scatter: CudaFunction,
+    lane16: CudaFunction,
     silu: CudaFunction,
     combine: CombineOps,
     blas: CudaBlas,
@@ -724,6 +729,7 @@ impl PrefillOps {
             scan: module.load_function("moe_scan")?,
             permute: module.load_function("moe_permute")?,
             scatter: module.load_function("moe_scatter")?,
+            lane16: module.load_function("moe_gemm_lane16")?,
             silu: act.load_function("silu_mul")?,
             combine: CombineOps::new(ctx)?,
             blas,
@@ -834,8 +840,16 @@ impl PrefillOps {
         if active_total == 0 {
             return Ok(());
         }
-        problem_order(counts, &mut stage.order);
-        group_runs(&stage.order, counts, &mut stage.runs);
+        problem_order(counts, input.cpu_arithmetic, &mut stage.order);
+        let tensor_problems = stage
+            .order
+            .partition_point(|&expert| !input.cpu_arithmetic[expert as usize]);
+        let small_rows = stage.order[tensor_problems..]
+            .iter()
+            .map(|&expert| counts[expert as usize] as u32)
+            .max()
+            .unwrap_or(0);
+        group_runs(&stage.order[..tensor_problems], counts, &mut stage.runs);
         stage.offsets.clear();
         let mut acc = 0i32;
         for &count in counts {
@@ -878,6 +892,7 @@ impl PrefillOps {
                 mirror[j] = gu;
                 mirror[len1 + j] = x_perm_at + elem(off * u64::from(hidden));
                 mirror[2 * len1 + j] = h1_at + elem(off * u64::from(2 * inter));
+                mirror[3 * len1 + j] = counts[e] as u64;
             }
         }
         stage.arrays.clear();
@@ -898,12 +913,18 @@ impl PrefillOps {
                 stream,
                 gemm1_base,
                 &stage.gemm1_host,
-                3 * len1,
+                4 * len1,
                 &mut stage.gemm1_copy_done,
             )?;
             self.grouped_gemm(stage, gemm1_base, len1)
                 .context("moe prefill grouped GEMM 1")?;
         }
+        self.small_gemm(
+            gemm1_base,
+            len1,
+            (tensor_problems, small_rows),
+            (2 * inter, hidden),
+        )?;
 
         let silu_grid = |elems: usize| grid(elems.div_ceil(BLOCK_THREADS as usize), BLOCK_THREADS);
         unsafe {
@@ -928,6 +949,7 @@ impl PrefillOps {
                 mirror[j] = input.slots_down_host[e];
                 mirror[len2 + j] = act_at + elem(off * u64::from(inter));
                 mirror[2 * len2 + j] = y_perm_at + elem(off * u64::from(hidden));
+                mirror[3 * len2 + j] = counts[e] as u64;
             }
         }
         stage.arrays.clear();
@@ -948,12 +970,18 @@ impl PrefillOps {
                 stream,
                 gemm2_base,
                 &stage.gemm2_host,
-                3 * len2,
+                4 * len2,
                 &mut stage.gemm2_copy_done,
             )?;
             self.grouped_gemm(stage, gemm2_base, len2)
                 .context("moe prefill grouped GEMM 2")?;
         }
+        self.small_gemm(
+            gemm2_base,
+            len2,
+            (tensor_problems, small_rows),
+            (hidden, inter),
+        )?;
         unsafe {
             stream
                 .launch_builder(&self.scatter)
@@ -994,6 +1022,7 @@ impl PrefillOps {
         )?;
         let assignments = u64::from(rows) * u64::from(top_k);
         let cohort = MoePrefillContribute {
+            cpu_arithmetic: &[false; MAX_EXPERTS][..input.slot_valid.shape[0] as usize],
             contributions: unsafe {
                 Tensor::<bf16, 3>::new(
                     scratch.ptr + layout.contributions,
@@ -1187,6 +1216,35 @@ impl PrefillOps {
         Ok(())
     }
 
+    fn small_gemm(
+        &self,
+        block: u64,
+        problems: usize,
+        small: (usize, u32),
+        shape: (u32, u32),
+    ) -> Result<()> {
+        let (first, rows) = small;
+        if first == problems {
+            return Ok(());
+        }
+        // SAFETY: the stream-ordered A/B/C/rows mirror covers every selected problem and matrix.
+        unsafe {
+            self.stream
+                .launch_builder(&self.lane16)
+                .arg(&block)
+                .arg(&(problems as i32))
+                .arg(&(first as i32))
+                .arg(&(shape.0 as i32))
+                .arg(&(shape.1 as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (shape.0.div_ceil(16), rows, (problems - first) as u32),
+                    block_dim: (BLOCK_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
     /// BF16 A/B/C, FP32 accumulation, alpha=1, beta=0, opA=T, opB=N.
     /// # Safety
     /// `block` must address 3*`problems` device pointers whose targets match
@@ -1194,6 +1252,9 @@ impl PrefillOps {
     unsafe fn grouped_gemm(&self, stage: &Stage, block: u64, problems: usize) -> Result<()> {
         let arrays = &stage.arrays;
         let n = arrays.m.len();
+        if n == 0 {
+            return Ok(());
+        }
         unsafe {
             bs::cublasGemmGroupedBatchedEx(
                 *self.blas.handle(),

@@ -219,9 +219,13 @@ impl Setup {
                 })
                 .and_then(|n| n.checked_add(geometry.hidden as usize * 2 + 2))
                 .and_then(|n| n.checked_add(decode_scratch))
+                .and_then(|n| {
+                    n.checked_add(super::super::moe::prefill::stage_device_bytes() as usize)
+                })
                 .context("expert fixed device reserve overflow")?;
-            let host = host_workspace(geometry, cpu, workers, copies)?
-                .checked_add(available / 16)
+            let host = host_workspace(geometry, (cpu.0, cpu.1), workers, copies)?
+                .checked_add(super::super::moe::prefill::stage_host_pinned_bytes())
+                .and_then(|n| n.checked_add(available / 16))
                 .and_then(|n| n.checked_add(u64::from(copies) * slot * 5))
                 .context("expert fixed host reserve overflow")?;
             let candidate = ExpertWorkspaceBudget::new(
