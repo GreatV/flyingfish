@@ -17,6 +17,14 @@ pub struct Distribution {
     choices: Vec<Choice>,
 }
 
+/// Upper bound on the summed probability of f32 log-probabilities normalized by an f32
+/// logsumexp over `vocab` logits: exp(2u·max|logp| + (vocab + 1 + 3·ln vocab)·u), u = 2^-24.
+pub fn f32_mass_bound(vocab: usize, max_abs_logp: f64) -> f64 {
+    let u = f64::from(f32::EPSILON) / 2.0;
+    let n = vocab as f64;
+    (2.0 * u * max_abs_logp + (n + 1.0 + 3.0 * n.ln()) * u).exp()
+}
+
 impl Distribution {
     pub fn logits(logits: &[f32], branches: usize) -> Result<Self> {
         ensure!(
@@ -52,19 +60,24 @@ impl Distribution {
             .collect();
         choices.sort_by(|a, b| b.logp.total_cmp(&a.logp).then(a.token.cmp(&b.token)));
         choices.truncate(branches);
-        Self::top(choices)
+        Self::top(choices, logits.len())
     }
 
-    pub fn top(mut choices: Vec<Choice>) -> Result<Self> {
+    pub fn top(mut choices: Vec<Choice>, vocab: usize) -> Result<Self> {
         ensure!(!choices.is_empty(), "draft top candidates are empty");
         ensure!(
             choices.iter().all(|c| c.logp.is_finite() && c.logp <= 0.0),
             "invalid full-vocabulary normalized log probability"
         );
-        let mass: f64 = choices.iter().map(|c| c.logp.exp()).sum();
         ensure!(
-            mass <= 1.000001,
-            "draft top candidates exceed unit probability mass"
+            vocab >= choices.len(),
+            "draft top candidates exceed the vocabulary"
+        );
+        let mass: f64 = choices.iter().map(|c| c.logp.exp()).sum();
+        let bound = f32_mass_bound(vocab, choices.iter().map(|c| -c.logp).fold(0.0, f64::max));
+        ensure!(
+            mass <= bound,
+            "draft top candidates mass {mass} exceeds the f32 normalization bound {bound}"
         );
         for (i, c) in choices.iter().enumerate() {
             ensure!(
@@ -650,7 +663,9 @@ mod tests {
         let d = Distribution::logits(&[0., 0., 0., 0.], 2).unwrap();
         assert_eq!(d.choices()[0].token, 0);
         assert_eq!(d.choices()[1].token, 1);
-        assert!((d.choices()[0].logp.exp() - 0.25).abs() < 1e-7);
+        assert!(
+            (d.choices()[0].logp.exp() - 0.25).abs() <= 0.25 * (f32_mass_bound(4, 4f64.ln()) - 1.0)
+        );
         assert!(Distribution::logits(&[f32::NAN], 1).is_err());
         assert!(Distribution::logits(&[f32::INFINITY], 1).is_err());
         assert!(Distribution::logits(&[f32::NEG_INFINITY], 1).is_err());
@@ -658,51 +673,63 @@ mod tests {
     }
     #[test]
     fn gpu_top_candidates_keep_full_vocabulary_probabilities() {
-        let d = Distribution::top(vec![
-            Choice {
-                token: 2,
-                logp: 0.2f64.ln(),
-            },
-            Choice {
-                token: 1,
-                logp: 0.3f64.ln(),
-            },
-        ])
-        .unwrap();
-        assert_eq!(d.choices()[0].token, 1);
-        assert!((d.choices()[0].logp.exp() - 0.3).abs() < 1e-12);
-        assert!(Distribution::top(vec![]).is_err());
-        assert!(
-            Distribution::top(vec![
-                Choice {
-                    token: 1,
-                    logp: 0.0
-                },
+        let d = Distribution::top(
+            vec![
                 Choice {
                     token: 2,
-                    logp: 0.0
-                }
-            ])
-            .is_err()
-        );
-        assert!(
-            Distribution::top(vec![
-                Choice {
-                    token: 1,
-                    logp: -1.0
+                    logp: 0.2f64.ln(),
                 },
                 Choice {
                     token: 1,
-                    logp: -1.0
-                }
-            ])
+                    logp: 0.3f64.ln(),
+                },
+            ],
+            64,
+        )
+        .unwrap();
+        assert_eq!(d.choices()[0].token, 1);
+        assert_eq!(d.choices()[0].logp, 0.3f64.ln());
+        assert!(Distribution::top(vec![], 64).is_err());
+        assert!(
+            Distribution::top(
+                vec![
+                    Choice {
+                        token: 1,
+                        logp: 0.0
+                    },
+                    Choice {
+                        token: 2,
+                        logp: 0.0
+                    }
+                ],
+                64
+            )
             .is_err()
         );
         assert!(
-            Distribution::top(vec![Choice {
-                token: 1,
-                logp: f64::NAN
-            }])
+            Distribution::top(
+                vec![
+                    Choice {
+                        token: 1,
+                        logp: -1.0
+                    },
+                    Choice {
+                        token: 1,
+                        logp: -1.0
+                    }
+                ],
+                64
+            )
+            .is_err()
+        );
+        assert!(
+            Distribution::top(
+                vec![Choice {
+                    token: 1,
+                    logp: f64::NAN
+                }],
+                64
+            )
             .is_err()
         );
     }
@@ -912,16 +939,19 @@ mod tests {
     #[test]
     fn depth_waves_preserve_a_deep_first_multibranch_tree() {
         let scores = |_: u8, token: u32| {
-            Distribution::top(vec![
-                Choice {
-                    token: token * 2 + 1,
-                    logp: 0.9f64.ln(),
-                },
-                Choice {
-                    token: token * 2 + 2,
-                    logp: 0.1f64.ln(),
-                },
-            ])
+            Distribution::top(
+                vec![
+                    Choice {
+                        token: token * 2 + 1,
+                        logp: 0.9f64.ln(),
+                    },
+                    Choice {
+                        token: token * 2 + 2,
+                        logp: 0.1f64.ln(),
+                    },
+                ],
+                64,
+            )
         };
         let mut serial_requests = 0;
         let serial = Tree::best_first(0, 100, 116, 16, 7, |row, token| {
@@ -957,6 +987,7 @@ mod tests {
                     .into_iter()
                     .map(|(token, logp)| Choice { token, logp })
                     .collect(),
+                64,
             )
         };
         let serial = Tree::best_first(0, 0, 7, 7, 7, scores).unwrap();

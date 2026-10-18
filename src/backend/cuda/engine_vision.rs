@@ -2594,17 +2594,6 @@ mod tests {
         merged
     }
 
-    /// Largest per-element distance in half-BF16-ulp units of `max(|reference_i|, rms)`.
-    fn ulp_ratio(candidate: &[f32], reference: &[f32], rms: f32) -> f64 {
-        let mut worst = 0f64;
-        for (&c, &r) in candidate.iter().zip(reference) {
-            let scale = r.abs().max(rms).max(2f32.powi(-30));
-            let ulp = 2f64.powi(scale.log2().floor() as i32 - 8);
-            worst = worst.max(f64::from((c - r).abs()) / ulp);
-        }
-        worst
-    }
-
     fn tensor_values<T, const N: usize>(
         source: &safetensors::SafeTensors<'_>,
         name: &str,
@@ -2862,7 +2851,8 @@ mod tests {
                 let rms = tolerances[case][tap]["rms"]
                     .as_f64()
                     .with_context(|| format!("missing rms {case}/{tap}"))?;
-                let ratio = ulp_ratio(&candidate, &reference_values, rms as f32);
+                let ratio =
+                    crate::verify::half_ulp_ratio(&candidate, &reference_values, rms as f32);
                 let fixture_values = tensor_values(&source, tap, safetensors::Dtype::BF16, |v| {
                     bf16::from_bits(u16::from_le_bytes(v)).to_f32()
                 })?;
@@ -2965,7 +2955,7 @@ mod tests {
                 let rms = tolerances[case]["merger_out"]["rms"]
                     .as_f64()
                     .context("merger rms")?;
-                let ratio = ulp_ratio(block, reference, rms as f32);
+                let ratio = crate::verify::half_ulp_ratio(block, reference, rms as f32);
                 ensure!(
                     ratio <= k,
                     "{case} merged block differs from its standalone run: {ratio} ulps > {k}"

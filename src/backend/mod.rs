@@ -22,6 +22,7 @@ pub struct Top4 {
     pub tokens: [u32; 4],
     pub logp: [f32; 4],
     pub lse: f32,
+    pub vocab: usize,
 }
 
 impl Top4 {
@@ -36,6 +37,7 @@ impl Top4 {
                     logp: f64::from(logp),
                 })
                 .collect(),
+            self.vocab,
         )
     }
 
