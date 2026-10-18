@@ -1325,6 +1325,20 @@ mod tests {
         assert_eq!(derived.host_blocks, 15, "12 non-GPU plus 3 borrow slots");
         assert_eq!(derived.spare_blocks, 1);
         assert_eq!(derived.disk_bytes, 0);
+        assert_eq!(derived.disk_workers, 0);
+        let partial = PlanInputs {
+            host_available_bytes: reserves.host_bytes(slot()).unwrap() + 14 * slot(),
+            ..capacity_ref(&inputs)
+        };
+        let borrowed_disk = capacity(&partial, 0).unwrap();
+        assert_eq!(borrowed_disk.host_blocks, 13);
+        assert_eq!(borrowed_disk.disk_bytes, 0);
+        assert_eq!(borrowed_disk.disk_workers, inputs.disk_readers);
+        let no_readers = PlanInputs {
+            disk_readers: 0,
+            ..capacity_ref(&partial)
+        };
+        assert!(capacity(&no_readers, 0).is_err());
         let small_host = PlanInputs {
             host_available_bytes: reserves.host_bytes(slot()).unwrap() + 8 * slot(),
             ..capacity_ref(&inputs)
