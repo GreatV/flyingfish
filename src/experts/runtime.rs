@@ -1781,8 +1781,23 @@ mod tests {
             "only the non-GPU experts are loaded"
         );
         assert_eq!(residency.free_host_blocks(), host_blocks - 12 + spare);
+        residency.begin_request(&frequency)?;
+        let admitted = host_swap(&mut residency, 0, 0, 2, 1, 90)?;
+        let source = admitted.source_block.context("host source missing")?;
+        residency.end_request()?;
+        let free_before = residency.free_host_blocks();
+        assert_eq!(free_before, host_blocks - 12 + spare - 1);
+        assert_eq!(residency.released.len(), 1);
+        assert_eq!(residency.released[0].block, source);
+        assert_eq!(residency.released[0].event, Some(90));
+        assert!(residency.borrow(u32::MAX).is_err());
+        assert_eq!(residency.free_host_blocks(), free_before);
+        assert_eq!(residency.released.len(), 1);
+        assert_eq!(residency.ledger().disk_bytes()?, 0);
         let borrow = residency.borrow(2)?;
         assert_eq!((borrow.to_host, borrow.to_disk), (2, 0));
+        assert!(borrow.host_waits.contains(&Some(90)));
+        assert!(residency.released.is_empty());
         assert_eq!(borrow.d2h_bytes, 2 * slot);
         assert_eq!(borrow.disk_bytes, 0);
         assert_eq!(residency.free_host_blocks(), spare);
