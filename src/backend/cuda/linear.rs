@@ -8,7 +8,7 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaStream, DevicePtr, PushKerne
 use half::bf16;
 use std::sync::Arc;
 /// Explicit visible bias boundary; the caller's numerical contract selects it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum LinearBiasMode {
     BeforeOutputRound,
     AfterOutputRound,

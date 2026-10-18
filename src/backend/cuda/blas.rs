@@ -276,7 +276,7 @@ pub struct Blas {
     fp8: Option<super::linear::Fp8Ops>,
     skinny: CudaFunction,
     plans: RefCell<BTreeMap<(usize, usize, usize, u32), Plan>>,
-    biased_plans: RefCell<BTreeMap<(u32, u32, u32, u64), Plan>>,
+    biased_plans: RefCell<BTreeMap<(u32, u32, u32, u64, super::linear::LinearBiasMode), Plan>>,
     bias_add: Option<CudaFunction>,
     handle: sys::cublasLtHandle_t,
     decode: CudaBlas,
@@ -736,7 +736,7 @@ impl Blas {
 }
 
 impl Blas {
-    /// Binds a BF16 bias epilogue before run/capture; the bias pointer is part of the plan key.
+    /// Request-bound BF16 Lt plans are keyed by geometry, bias pointer and rounding mode.
     pub(crate) fn prepare_biased(
         &mut self,
         rows: u32,
@@ -756,17 +756,7 @@ impl Blas {
             bias.shape == [output] && bias.stride == [1],
             "linear bias shape mismatch"
         );
-        if mode == super::linear::LinearBiasMode::AfterOutputRound {
-            self.prepare_fixed(rows, output, input)?;
-            if self.bias_add.is_none() {
-                self.bias_add = Some(
-                    cubin::module(self.stream.context(), "q38_common")?
-                        .load_function("q38_bias_add")?,
-                );
-            }
-            return Ok(());
-        }
-        let key = (rows, output, input, bias.ptr);
+        let key = (rows, output, input, bias.ptr, mode);
         let mut plans = self.biased_plans.borrow_mut();
         if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry(key) {
             let plan = Plan::new_with_bias(
@@ -776,10 +766,16 @@ impl Blas {
                 input as usize,
                 self.workspace.len(),
                 0,
-                Some(bias.ptr),
+                (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
             )?;
             plan.describe(rows as usize, output as usize, input as usize)?;
             entry.insert(plan);
+        }
+        if mode == super::linear::LinearBiasMode::AfterOutputRound && self.bias_add.is_none() {
+            self.bias_add = Some(
+                cubin::module(self.stream.context(), "q38_common")?
+                    .load_function("q38_bias_add")?,
+            );
         }
         Ok(())
     }
@@ -805,36 +801,21 @@ impl Blas {
         );
         super::linear::disjoint(&weight, &y.0)?;
         super::linear::disjoint(&bias, &y.0)?;
-        if mode == super::linear::LinearBiasMode::AfterOutputRound {
-            let add = self
-                .bias_add
-                .as_ref()
-                .context("bias add kernel not prepared")?;
-            self.linear_typed(
-                crate::op_contract::ExecutionPhase::Prefill,
-                super::linear::LinearWeightRef::Bf16(weight),
-                x,
-                y,
-            )?;
-            let count = u64::from(y.0.shape[0]) * u64::from(y.0.shape[1]);
-            unsafe {
-                self.stream
-                    .launch_builder(add)
-                    .arg(&y.0.ptr)
-                    .arg(&bias.ptr)
-                    .arg(&count)
-                    .arg(&y.0.shape[1])
-                    .launch(super::ops::grid(
-                        count.div_ceil(256).min(65535) as usize,
-                        256,
-                    ))?;
-            }
-            return Ok(());
-        }
+        let add = match mode {
+            super::linear::LinearBiasMode::BeforeOutputRound => None,
+            super::linear::LinearBiasMode::AfterOutputRound => Some(
+                self.bias_add
+                    .as_ref()
+                    .context("bias add kernel not prepared")?,
+            ),
+        };
         let plans = self.biased_plans.borrow();
         let p = plans
-            .get(&(x.shape[0], weight.shape[0], weight.shape[1], bias.ptr))
-            .context("biased Lt plan missing; bind before run/capture")?;
+            .get(&(x.shape[0], weight.shape[0], weight.shape[1], bias.ptr, mode))
+            .with_context(|| format!(
+                "biased Lt plan missing rows={} output={} input={} mode={mode:?}; bind before run/capture",
+                x.shape[0], weight.shape[0], weight.shape[1],
+            ))?;
         let (workspace, _read) = self.workspace.device_ptr(&self.stream);
         let alpha = 1f32;
         let beta = 0f32;
@@ -857,6 +838,21 @@ impl Blas {
                 self.workspace.len(),
                 self.stream.cu_stream() as _,
             )?;
+        }
+        if let Some(add) = add {
+            let count = u64::from(y.0.shape[0]) * u64::from(y.0.shape[1]);
+            unsafe {
+                self.stream
+                    .launch_builder(add)
+                    .arg(&y.0.ptr)
+                    .arg(&bias.ptr)
+                    .arg(&count)
+                    .arg(&y.0.shape[1])
+                    .launch(super::ops::grid(
+                        count.div_ceil(256).min(65535) as usize,
+                        256,
+                    ))?;
+            }
         }
         Ok(())
     }
