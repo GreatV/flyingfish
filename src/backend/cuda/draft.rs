@@ -1241,3 +1241,698 @@ impl Draft {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use safetensors::{Dtype, SafeTensors};
+    use std::{collections::BTreeSet, path::PathBuf, rc::Rc};
+
+    fn values(tensors: &SafeTensors<'_>, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        let tensor = tensors.tensor(name)?;
+        ensure!(tensor.shape() == shape, "reference {name} shape mismatch");
+        let result: Vec<_> = match tensor.dtype() {
+            Dtype::BF16 => tensor
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| bf16::from_bits(u16::from_le_bytes(*v)).to_f32())
+                .collect(),
+            Dtype::F32 => tensor
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect(),
+            _ => anyhow::bail!("reference {name} is not BF16/FP32"),
+        };
+        ensure!(
+            result.iter().all(|v| v.is_finite()),
+            "nonfinite reference {name}"
+        );
+        Ok(result)
+    }
+
+    fn ids(tensors: &SafeTensors<'_>, name: &str, shape: &[usize]) -> Result<Vec<u32>> {
+        let tensor = tensors.tensor(name)?;
+        ensure!(
+            tensor.dtype() == Dtype::I64 && tensor.shape() == shape,
+            "reference {name} id layout mismatch"
+        );
+        tensor
+            .data()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|v| Ok(u32::try_from(i64::from_le_bytes(*v))?))
+            .collect()
+    }
+
+    fn native(
+        device: &Device,
+        path: &Path,
+        name: &str,
+        shape: &[usize],
+    ) -> Result<CudaSlice<bf16>> {
+        let mapped = crate::checkpoint::MappedCheckpoint::open(path)?;
+        let views = mapped.views()?;
+        let shard = mapped
+            .index
+            .weight_map
+            .get(name)
+            .context("native tensor absent")?;
+        let tensor = views[shard].tensor(name)?;
+        ensure!(
+            tensor.dtype() == Dtype::BF16 && tensor.shape() == shape,
+            "native {name} layout mismatch"
+        );
+        let data: Vec<_> = tensor
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| bf16::from_bits(u16::from_le_bytes(*v)))
+            .collect();
+        ensure!(
+            data.iter().all(|v| v.to_f32().is_finite()),
+            "nonfinite native {name}"
+        );
+        Ok(device.stream.clone_htod(&data)?)
+    }
+
+    fn coefficient(config: &DraftConfig, context: usize, layers: usize, extra: u32) -> f64 {
+        let h = config.hidden_size;
+        let d = config.head_dim;
+        let keys = context + config.block_size;
+        let mut reductions = vec![config.capture_width(), h];
+        for _ in 0..layers {
+            reductions.extend([h, h, d, d, keys, keys, h, h, h, config.intermediate_size]);
+        }
+        // Per layer: input norm2, QKV1, Q/K norm2, RoPE3, probability1, PV1, O1, add1,
+        // post norm2, gate/up1, SiLU1, product1, down1, add1.
+        let rounds = 3 + 19 * layers as u32 + extra;
+        let chain = super::super::bf16_chain_bound(rounds, &reductions);
+        let norm = super::super::bf16_chain_bound(2 * layers as u32, &[h, d]);
+        let silu = super::super::bf16_chain_bound(2 * layers as u32, &[h]) / std::f64::consts::E;
+        let softmax = super::super::gamma(keys, 2f64.powi(-24)) * 0.5;
+        chain + norm + silu + softmax
+    }
+
+    fn compare(
+        name: &str,
+        actual: &[f32],
+        expected: (&[f32], &[f32]),
+        coefficient: f64,
+        width: usize,
+    ) -> Result<usize> {
+        let (reference, floor) = expected;
+        ensure!(
+            actual.len() == reference.len()
+                && floor.len() == reference.len()
+                && width > 0
+                && reference.len().is_multiple_of(width),
+            "{name} extent mismatch"
+        );
+        ensure!(
+            actual.iter().all(|v| v.is_finite())
+                && floor.iter().all(|v| v.is_finite() && *v >= 0.0),
+            "nonfinite {name}"
+        );
+        let mut failures = 0;
+        let mut maximum = 0f64;
+        let mut error = 0f64;
+        for ((actual, reference), floor) in actual
+            .chunks_exact(width)
+            .zip(reference.chunks_exact(width))
+            .zip(floor.chunks_exact(width))
+        {
+            let rms = (reference.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / width as f64)
+                .sqrt();
+            for ((a, b), f) in actual.iter().zip(reference).zip(floor) {
+                let delta = (f64::from(*a) - f64::from(*b)).abs();
+                let bound = coefficient * f64::from(*b).abs().max(rms) + f64::from(*f);
+                failures += usize::from(delta > bound);
+                maximum = maximum.max(if bound == 0.0 {
+                    if delta == 0.0 { 0.0 } else { f64::INFINITY }
+                } else {
+                    delta / bound
+                });
+                error = error.max(delta);
+            }
+        }
+        println!(
+            "T19_TENSOR name={name} max_abs={error} max_bound_ratio={maximum} coefficient={coefficient} violations={failures}"
+        );
+        Ok(failures)
+    }
+
+    fn calibrate(draft: &Draft, head: &CudaSlice<bf16>, blas: &mut Blas) -> Result<()> {
+        use crate::backend::setup::LinearShape;
+        let c = &draft.config;
+        let h = c.hidden_size;
+        let f = c.intermediate_size;
+        let shapes = [
+            (
+                &draft.weights.layers[0].block.qkv,
+                c.block_size,
+                c.qkv_dim(),
+                h,
+            ),
+            (&draft.weights.layers[0].block.o, c.block_size, h, h),
+            (&draft.weights.layers[0].block.gu, c.block_size, 2 * f, h),
+            (&draft.weights.layers[0].block.down, c.block_size, h, f),
+            (head, c.block_size, c.vocab_size, h),
+            (&draft.weights.w2, 1, c.vocab_size, c.markov_rank),
+        ];
+        let pairs: BTreeSet<_> = shapes
+            .iter()
+            .map(|(_, _, output, input)| (*output, *input))
+            .chain([(h, c.capture_width()), (c.kv_dim(), h)])
+            .collect();
+        blas.declare(draft.rows, &pairs);
+        let count = shapes
+            .iter()
+            .map(|(_, r, _, k)| r * k)
+            .max()
+            .context("no draft shapes")?;
+        let input: Vec<_> = (0..count)
+            .map(|i| bf16::from_f32(((i % 257) as f32 - 128.0) / 128.0))
+            .collect();
+        let input = draft.stream.clone_htod(&input)?;
+        for (weight, rows, output, input_width) in shapes {
+            let shape = LinearShape {
+                rows,
+                output,
+                input: input_width,
+            };
+            if super::super::linear_calibrate::supports(shape) {
+                blas.calibrate_shape(weight, &input.slice(..rows * input_width), shape)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn confidence_bounds(
+        draft: &Draft,
+        reference: (&[f32], &[f32]),
+        parents: &[u32],
+        propagated: f64,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let (hidden, floor) = reference;
+        let c = &draft.config;
+        ensure!(
+            hidden.len() == c.block_size * c.hidden_size
+                && floor.len() == c.block_size
+                && parents.len() == c.block_size,
+            "confidence reference extent mismatch"
+        );
+        let s = &draft.stream;
+        let weight = s.clone_dtoh(&draft.weights.confidence)?;
+        let bias = s.clone_dtoh(&draft.weights.confidence_bias)?[0]
+            .to_f32()
+            .abs();
+        let local = super::super::bf16_chain_bound(1, &[c.hidden_size + c.markov_rank]);
+        let mut complete = Vec::new();
+        let mut isolated = Vec::new();
+        for (row, &parent) in parents.iter().enumerate() {
+            let begin = parent as usize * c.markov_rank;
+            let embedding = s.clone_dtoh(&draft.weights.w1.slice(begin..begin + c.markov_rank))?;
+            let h_product: f64 = hidden[row * c.hidden_size..(row + 1) * c.hidden_size]
+                .iter()
+                .zip(&weight[..c.hidden_size])
+                .map(|(v, w)| f64::from(*v).abs() * f64::from(w.to_f32()).abs())
+                .sum();
+            let m_product: f64 = embedding
+                .iter()
+                .zip(&weight[c.hidden_size..])
+                .map(|(v, w)| f64::from(v.to_f32()).abs() * f64::from(w.to_f32()).abs())
+                .sum();
+            let budget =
+                0.25 * local * (h_product + m_product + f64::from(bias)) + f64::from(floor[row]);
+            isolated.push(budget as f32);
+            complete.push((budget + 0.25 * propagated * h_product) as f32);
+        }
+        Ok((complete, isolated))
+    }
+
+    #[test]
+    #[ignore = "requires a GPU window and native target/draft, T14 fixtures and frozen reference floors"]
+    fn fixture_forward_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
+        let draft_path = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
+        let reference = PathBuf::from(std::env::var("FF_MARKOV_FIXTURES")?);
+        let floor_manifest = PathBuf::from(std::env::var("FF_MINICPM_TOLERANCES")?);
+        let floor_root = floor_manifest
+            .parent()
+            .context("floor manifest parent missing")?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&floor_manifest)?)?;
+        ensure!(
+            manifest["candidate_executed"] == false,
+            "reference floors were not frozen before the candidate"
+        );
+        let config = crate::model_spec::ModelSpec::read(&target)?.config();
+        let c = DraftConfig::read(&draft_path, &config)?;
+        ensure!(
+            c.block_size == 15 && c.hidden_size == 2048 && c.head_dim == 256,
+            "T14 native draft geometry required"
+        );
+        let names = [
+            "math-block-0",
+            "math-block-1",
+            "code-block-0",
+            "code-block-1",
+            "general-block-0",
+            "general-block-1",
+        ];
+        let mut context_max = 0;
+        for name in names {
+            let data = std::fs::read(reference.join(format!("{name}.safetensors")))?;
+            let tensors = SafeTensors::deserialize(&data)?;
+            let shape = tensors.tensor("target_taps")?.shape().to_vec();
+            ensure!(
+                shape.len() == 4
+                    && shape[0] == 1
+                    && shape[2] == c.target_layer_ids.len()
+                    && shape[3] == c.hidden_size,
+                "T14 tap layout mismatch"
+            );
+            context_max = context_max.max(shape[1]);
+            for depth in 0..=c.num_hidden_layers {
+                println!(
+                    "T19_FROZEN_BOUND fixture={name} layers={depth} coefficient={} context={} block={}",
+                    coefficient(&c, shape[1], depth, 0),
+                    shape[1],
+                    c.block_size
+                );
+            }
+        }
+        let capacity = context_max
+            .checked_add(c.block_size)
+            .context("draft fixture capacity overflow")?
+            .next_multiple_of(32);
+        let rows = context_max.max(c.block_size + 1);
+        let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+        std::fs::create_dir_all(&runtime)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        let closure = Rc::new(super::super::closure::Closure::new(
+            true,
+            "T19 frozen native fixture calibration".into(),
+        ));
+        let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
+        let mut draft = Draft::new(
+            &draft_path,
+            &device,
+            &config,
+            capacity,
+            rows,
+            &mut blas,
+            super::super::markov::ScoreRounding::F32,
+        )?;
+        let embedding = native(
+            &device,
+            &target,
+            "model.language_model.embed_tokens.weight",
+            &[c.vocab_size, c.hidden_size],
+        )?;
+        let head = native(
+            &device,
+            &target,
+            "lm_head.weight",
+            &[c.vocab_size, c.hidden_size],
+        )?;
+        calibrate(&draft, &head, &mut blas)?;
+        draft.setup_attention(&device, &ops, &config, &runtime, &closure)?;
+        draft.setup_markov(&device, &ops, &runtime, &closure)?;
+        let s = &device.stream;
+        let mut defects = 0;
+        let mut rejected_control = 0;
+        let mut graph_replays = 0;
+        let mut native_requests = 0;
+        for name in names {
+            let data = std::fs::read(reference.join(format!("{name}.safetensors")))?;
+            let tensors = SafeTensors::deserialize(&data)?;
+            let floor_data = std::fs::read(floor_root.join(format!("{name}-floor.safetensors")))?;
+            let floors = SafeTensors::deserialize(&floor_data)?;
+            let context = tensors.tensor("target_taps")?.shape()[1];
+            let h = c.hidden_size;
+            let b = c.block_size;
+            let v = c.vocab_size;
+            let block_ids = ids(&tensors, "draft_input_ids", &[1, b])?;
+            let positions = ids(&tensors, "draft_position_ids", &[1, b])?;
+            let ctx_positions = ids(&tensors, "ctx_position_ids", &[1, context])?;
+            ensure!(
+                positions
+                    .iter()
+                    .enumerate()
+                    .all(|(i, p)| *p as usize == context + i)
+                    && ctx_positions
+                        .iter()
+                        .enumerate()
+                        .all(|(i, p)| *p as usize == i),
+                "T14 frozen absolute positions changed"
+            );
+            ensure!(
+                block_ids[1..].iter().all(|id| *id == c.mask_token_id),
+                "T14 mask layout changed"
+            );
+            let expected_ids = ids(&tensors, "proposals_tensor", &[b])?;
+            let expected_hidden = values(&tensors, "draft_norm_hidden", &[1, b, h])?;
+            let expected_confidence = values(&tensors, "confidence_c_k", &[b])?;
+            let confidence_floor = values(&floors, "confidence_c_k", &[b])?;
+            let parents: Vec<_> = std::iter::once(block_ids[0])
+                .chain(expected_ids.iter().copied().take(b - 1))
+                .collect();
+            let final_coefficient = coefficient(&c, context, c.num_hidden_layers, 2);
+            let (confidence_budget, isolated_budget) = confidence_bounds(
+                &draft,
+                (&expected_hidden, &confidence_floor),
+                &parents,
+                final_coefficient,
+            )?;
+            println!(
+                "T19_CONFIDENCE_BOUND fixture={name} sigmoid_lipschitz=0.25 full_max={} isolated_max={}",
+                confidence_budget.iter().copied().fold(0.0f32, f32::max),
+                isolated_budget.iter().copied().fold(0.0f32, f32::max)
+            );
+            let taps: Vec<_> = values(&tensors, "target_taps", &[1, context, 5, h])?
+                .into_iter()
+                .map(bf16::from_f32)
+                .collect();
+            let taps = s.clone_htod(&taps)?;
+            draft.position_shift = 0;
+            draft.reset_setup()?;
+            let poison = vec![bf16::from_f32(-17.0); capacity * c.kv_dim()];
+            for cache in &mut draft.kv {
+                s.memcpy_htod(&poison, &mut cache.k)?;
+                s.memcpy_htod(&poison, &mut cache.v)?;
+            }
+            let mut trace = Trace::default();
+            draft.inject(
+                &taps,
+                context,
+                0,
+                Compute {
+                    ops: &ops,
+                    blas: &mut blas,
+                },
+                Some((&mut trace, "context")),
+            )?;
+            let proposals = draft.propose(
+                block_ids[0],
+                context,
+                (&embedding, &head),
+                Compute {
+                    ops: &ops,
+                    blas: &mut blas,
+                },
+                Some((&mut trace, "draft")),
+                Some(&expected_ids),
+            )?;
+            let mut fixture_defects = usize::from(proposals != expected_ids);
+            for (point, key, coef) in [
+                (
+                    "context.c_projected",
+                    "h_ctx_pre_norm",
+                    super::super::bf16_chain_bound(1, &[c.capture_width()]),
+                ),
+                (
+                    "context.c_committed",
+                    "h_ctx",
+                    coefficient(&c, context, 0, 0),
+                ),
+            ] {
+                fixture_defects += compare(
+                    &format!("{name}.{point}"),
+                    &trace.values(point)?,
+                    (
+                        &values(&tensors, key, &[1, context, h])?,
+                        &values(&floors, key, &[1, context, h])?,
+                    ),
+                    coef,
+                    h,
+                )?;
+            }
+            for layer in 0..c.num_hidden_layers {
+                let key = format!("draft_layer_{layer}");
+                fixture_defects += compare(
+                    &format!("{name}.{key}"),
+                    &trace.values(&format!("draft.layer.{layer}"))?,
+                    (
+                        &values(&tensors, &key, &[1, b, h])?,
+                        &values(&floors, &key, &[1, b, h])?,
+                    ),
+                    coefficient(&c, context, layer + 1, 0),
+                    h,
+                )?;
+            }
+            fixture_defects += compare(
+                &format!("{name}.final_norm"),
+                &trace.values("draft.H")?,
+                (
+                    &expected_hidden,
+                    &values(&floors, "draft_norm_hidden", &[1, b, h])?,
+                ),
+                final_coefficient,
+                h,
+            )?;
+            for row in [0, b - 1] {
+                for (point, key, coef) in [
+                    (
+                        "draft.B",
+                        format!("u_logits_k{row}"),
+                        coefficient(&c, context, c.num_hidden_layers, 3),
+                    ),
+                    (
+                        "draft.M",
+                        format!("b_logits_k{row}"),
+                        super::super::bf16_chain_bound(1, &[c.markov_rank]),
+                    ),
+                    (
+                        "draft.s",
+                        format!("combined_logits_k{row}"),
+                        coefficient(&c, context, c.num_hidden_layers, 3)
+                            + super::super::bf16_chain_bound(1, &[c.markov_rank])
+                            + super::super::gamma(1, 2f64.powi(-24)),
+                    ),
+                ] {
+                    let actual = trace.values(point)?;
+                    fixture_defects += compare(
+                        &format!("{name}.{key}"),
+                        &actual[row * v..(row + 1) * v],
+                        (
+                            &values(&tensors, &key, &[v])?,
+                            &values(&floors, &key, &[v])?,
+                        ),
+                        coef,
+                        v,
+                    )?;
+                }
+            }
+            let confidence = trace.values("draft.conf")?;
+            ensure!(
+                confidence.iter().all(|p| (0.0..=1.0).contains(p)),
+                "nonfinite/out-of-range confidence"
+            );
+            fixture_defects += compare(
+                &format!("{name}.confidence"),
+                &confidence,
+                (&expected_confidence, &confidence_budget),
+                0.0,
+                b,
+            )?;
+            let supplied: Vec<_> = expected_hidden
+                .iter()
+                .copied()
+                .map(bf16::from_f32)
+                .collect();
+            s.memcpy_htod(&supplied, &mut draft.n)?;
+            unsafe {
+                s.launch_builder(&draft.concat_dot_sigmoid)
+                    .arg(&draft.n)
+                    .arg(&draft.weights.w1)
+                    .arg(&draft.ids)
+                    .arg(&draft.forced_tokens)
+                    .arg(&draft.weights.confidence)
+                    .arg(&draft.weights.confidence_bias)
+                    .arg(&mut draft.confidence_values)
+                    .arg(&(b as i32))
+                    .arg(&(h as i32))
+                    .arg(&(c.markov_rank as i32))
+                    .arg(&(v as i32))
+                    .launch(grid(b, 256))?;
+            }
+            fixture_defects += compare(
+                &format!("{name}.confidence_isolated"),
+                &s.clone_dtoh(&draft.confidence_values)?,
+                (&expected_confidence, &isolated_budget),
+                0.0,
+                b,
+            )?;
+            let top = values(&tensors, "combined_top32_vals", &[b, 32])?;
+            let margin = (0..b)
+                .map(|r| top[r * 32] - top[r * 32 + 1])
+                .fold(f32::INFINITY, f32::min);
+            println!(
+                "T19_TEACHER fixture={name} proposal_mismatches={} min_top12_margin={margin} defects={fixture_defects}",
+                proposals
+                    .iter()
+                    .zip(&expected_ids)
+                    .filter(|(a, b)| a != b)
+                    .count()
+            );
+            defects += fixture_defects;
+
+            draft.reset_setup()?;
+            draft.inject(
+                &taps,
+                context,
+                0,
+                Compute {
+                    ops: &ops,
+                    blas: &mut blas,
+                },
+                None,
+            )?;
+            let free = draft.propose(
+                block_ids[0],
+                context,
+                (&embedding, &head),
+                Compute {
+                    ops: &ops,
+                    blas: &mut blas,
+                },
+                None,
+                None,
+            )?;
+            defects += usize::from(free != expected_ids);
+            let mut expected_bits = Vec::new();
+            draft.state_bits(context, b, &mut expected_bits)?;
+            let anchor = s.clone_htod(&[block_ids[0]])?;
+            let prefix = s.clone_htod(&[context as i32])?;
+            s.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            let launched = draft.propose_device(
+                &anchor,
+                &prefix,
+                context,
+                (&embedding, &head),
+                Compute {
+                    ops: &ops,
+                    blas: &mut blas,
+                },
+            );
+            let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+            launched?;
+            let graph = captured?.context("empty draft graph")?;
+            for _ in 0..2 {
+                graph.launch()?;
+                s.synchronize()?;
+                let mut actual = Vec::new();
+                draft.state_bits(context, b, &mut actual)?;
+                defects += usize::from(actual != expected_bits);
+                graph_replays += 1;
+            }
+            drop(graph);
+            let requests: Vec<_> = (0..b)
+                .map(|row| {
+                    (
+                        row as u8,
+                        if row == 0 {
+                            block_ids[0]
+                        } else {
+                            expected_ids[row - 1]
+                        },
+                    )
+                })
+                .collect();
+            let first = draft.distributions_batch(&requests)?;
+            let expanded: Vec<_> = requests.iter().copied().cycle().take(64).collect();
+            let many = draft.distributions_batch(&expanded)?;
+            for (i, actual) in many.iter().enumerate() {
+                defects += usize::from(!actual.bits_equal(&first[i % b]));
+            }
+            for (actual, expected) in first.iter().zip(&expected_ids) {
+                defects += usize::from(actual.tokens[0] != *expected);
+            }
+            native_requests += requests.len() + expanded.len();
+
+            draft.position_shift = 257;
+            draft.reset_setup()?;
+            draft.inject(
+                &taps,
+                context,
+                0,
+                Compute {
+                    ops: &ops,
+                    blas: &mut blas,
+                },
+                None,
+            )?;
+            let mut wrong = Trace::default();
+            draft.propose(
+                block_ids[0],
+                context,
+                (&embedding, &head),
+                Compute {
+                    ops: &ops,
+                    blas: &mut blas,
+                },
+                Some((&mut wrong, "draft")),
+                Some(&expected_ids),
+            )?;
+            let mut rejected = 0;
+            for layer in 0..c.num_hidden_layers {
+                let key = format!("draft_layer_{layer}");
+                rejected += compare(
+                    &format!("{name}.wrong_position.{key}"),
+                    &wrong.values(&format!("draft.layer.{layer}"))?,
+                    (
+                        &values(&tensors, &key, &[1, b, h])?,
+                        &values(&floors, &key, &[1, b, h])?,
+                    ),
+                    coefficient(&c, context, layer + 1, 0),
+                    h,
+                )?;
+            }
+            for row in [0, b - 1] {
+                let key = format!("combined_logits_k{row}");
+                let actual = wrong.values("draft.s")?;
+                rejected += compare(
+                    &format!("{name}.wrong_position.{key}"),
+                    &actual[row * v..(row + 1) * v],
+                    (
+                        &values(&tensors, &key, &[v])?,
+                        &values(&floors, &key, &[v])?,
+                    ),
+                    coefficient(&c, context, c.num_hidden_layers, 3)
+                        + super::super::bf16_chain_bound(1, &[c.markov_rank]),
+                    v,
+                )?;
+            }
+            rejected_control += usize::from(rejected > 0);
+            println!(
+                "T19_FIXTURE fixture={name} free_proposal_mismatches={} wrong_position_violations={rejected} defects={defects}",
+                free.iter()
+                    .zip(&expected_ids)
+                    .filter(|(a, b)| a != b)
+                    .count()
+            );
+        }
+        defects += usize::from(rejected_control == 0);
+        println!(
+            "T19_DRAFT fixtures=6 graph_replays={graph_replays} native_markov_requests={native_requests} wrong_position_rejected={rejected_control} defects={defects} {}",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "T19 draft has {defects} finite defects");
+        Ok(())
+    }
+}
