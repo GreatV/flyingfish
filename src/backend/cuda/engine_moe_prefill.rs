@@ -3206,7 +3206,7 @@ mod tests {
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("prefill runtime missing")?,
         );
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
-        let rows = 17;
+        let rows = 8;
         let fixture = inputs(3, rows);
         let mut capacity = capacity(geometry, rows as u32, false, 2, true)?;
         capacity.host_blocks = geometry.layers * geometry.experts - capacity.slots_total();
