@@ -1313,6 +1313,9 @@ impl Engine {
         if let Some(setup) = expert_setup {
             setup.bind(&mut engine)?;
         }
+        if engine.model_spec.moe.is_some() {
+            engine.declare_graphs()?;
+        }
         engine.prepare(1)?;
         engine.prepare_prefill_plans()?;
         engine

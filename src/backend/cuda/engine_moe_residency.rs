@@ -607,7 +607,9 @@ impl Slots {
             host_experts: Vec::with_capacity(geometry.experts as usize),
             host_weights: Vec::with_capacity(geometry.experts as usize),
             moves: Vec::with_capacity(physical_count),
-            readers: Vec::with_capacity(input.max_rows as usize * geometry.top_k as usize),
+            readers: Vec::with_capacity(
+                physical_count.max(input.max_rows as usize * geometry.top_k as usize),
+            ),
             disk_cpu: if input.capacity.disk_bytes > 0 {
                 Some(DiskExperts::new(
                     input.catalogue.clone(),
@@ -974,6 +976,46 @@ impl Slots {
         y: &mut TensorMut<bf16, 2>,
     ) -> Result<()> {
         decode.route(device, ffn, x)?;
+        self.complete(device, decode, layer, ffn, (x, y), None)
+    }
+
+    pub(in crate::backend::cuda::engine) fn all_resident(&self) -> bool {
+        let geometry = self.catalogue.geometry();
+        self.physical.len() == geometry.layers as usize * geometry.experts as usize
+    }
+
+    pub(super) fn record_all_readers(&mut self, device: &Device) -> Result<()> {
+        self.readers.clear();
+        self.readers.extend(0..u32::try_from(self.physical.len())?);
+        let event = self.events.record(&device.stream)?;
+        self.policy.record_readers(&self.readers, event.id)?;
+        for physical in &mut self.physical {
+            physical.reader = Some(event.clone());
+        }
+        Ok(())
+    }
+
+    pub(super) fn run_graph(
+        &mut self,
+        device: &Device,
+        decode: &mut Decode,
+        layer: u32,
+        ffn: BoundFfn,
+        activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
+    ) -> Result<()> {
+        decode.read_route(device, ffn, activation.0)?;
+        self.complete(device, decode, layer, ffn, activation, Some(layer as usize))
+    }
+
+    fn complete(
+        &mut self,
+        device: &Device,
+        decode: &mut Decode,
+        layer: u32,
+        ffn: BoundFfn,
+        activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
+        graph: Option<usize>,
+    ) -> Result<()> {
         self.prepare_routes(device, layer, decode)?;
         let bindings = self.bindings(layer as usize, &device.stream)?;
         let dispatch = self.policy.dispatch(layer, &self.routes)?;
@@ -981,7 +1023,7 @@ impl Slots {
             dispatch.host_experts == self.host_experts,
             "host expert compact order differs from residency at layer={layer}"
         );
-        decode.finish(
+        decode.finish_with(
             device,
             ffn,
             bindings,
@@ -997,7 +1039,8 @@ impl Slots {
                 disk_cpu: self.disk_cpu.as_mut(),
                 layer,
             },
-            (x, y),
+            activation,
+            graph,
         )?;
         if !self.readers.is_empty() {
             let event = self.events.record(&device.stream)?;

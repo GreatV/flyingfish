@@ -17,6 +17,8 @@ use cudarc::driver::{CudaEvent, DevicePtr, DeviceRepr, HostSlice, ValidAsZeroBit
 #[path = "engine_moe_residency.rs"]
 mod residency;
 pub(super) use residency::{Prefill, Slots};
+#[path = "engine_moe_graph.rs"]
+mod graphs;
 
 fn pinned_zeros<T: DeviceRepr + ValidAsZeroBits>(
     context: &Arc<CudaContext>,
@@ -454,6 +456,10 @@ pub(super) struct Decode {
     cpu_done: PinnedHostSlice<u32>,
     pool: ExpertPool,
     mailbox: Arc<CudaStream>,
+    segments: Vec<graphs::Segments>,
+    capture_events: Vec<CudaEvent>,
+    reader: Arc<CudaEvent>,
+    mask: cudarc::driver::CudaFunction,
     pub stats: [u64; 5],
 }
 
@@ -524,6 +530,11 @@ impl Decode {
             cpu_out: pinned_zeros(context, elements)?,
             cpu_done: pinned_zeros(context, choices)?,
             mailbox: context.new_stream()?,
+            segments: Vec::new(),
+            capture_events: Vec::new(),
+            reader: Arc::new(context.new_event(None)?),
+            mask: super::super::cubin::module(context, "moe_route")?
+                .load_function("moe_route_mask")?,
             pool: ExpertPool::new(
                 workers as usize,
                 Shape::new(geometry.hidden as usize, geometry.intermediate as usize)?,
@@ -535,6 +546,11 @@ impl Decode {
     }
 
     pub fn route(&mut self, device: &Device, ffn: BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
+        self.route_device(device, ffn, x)?;
+        self.read_route(device, ffn, x)
+    }
+
+    fn route_device(&self, device: &Device, ffn: BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
         let BoundFfn::Moe { router, .. } = ffn else {
             anyhow::bail!("MoE route received a dense FFN");
         };
@@ -576,7 +592,26 @@ impl Decode {
                 [rows as u32, k],
                 [u64::from(k), 1],
             )?),
-        )?;
+        )
+    }
+
+    fn read_route(&mut self, device: &Device, ffn: BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
+        let BoundFfn::Moe { router, .. } = ffn else {
+            anyhow::bail!("MoE route mailbox received a dense FFN");
+        };
+        let rows = x.shape[0] as usize;
+        ensure!(
+            !self.pending
+                && rows > 0
+                && rows <= self.max_rows
+                && x.shape[1] == self.geometry.hidden,
+            "MoE route mailbox pending={} shape={:?} row_bound={}",
+            self.pending,
+            x.shape,
+            self.max_rows
+        );
+        let k = self.geometry.top_k;
+        let stream = &device.stream;
         self.mailbox.wait(&stream.record_event(None)?)?;
         let count = rows * k as usize;
         {
@@ -619,21 +654,28 @@ impl Decode {
         ))
     }
 
+    #[cfg(test)]
     pub fn finish(
+        &mut self,
+        device: &Device,
+        ffn: BoundFfn,
+        slots: SlotBindings,
+        dispatch: Dispatch<'_>,
+        activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
+    ) -> Result<()> {
+        self.finish_with(device, ffn, slots, dispatch, activation, None)
+    }
+
+    fn finish_with(
         &mut self,
         device: &Device,
         ffn: BoundFfn,
         slots: SlotBindings,
         mut dispatch: Dispatch<'_>,
         activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
+        graph: Option<usize>,
     ) -> Result<()> {
-        let BoundFfn::Moe {
-            router,
-            shared,
-            shared_gate,
-            ..
-        } = ffn
-        else {
+        let BoundFfn::Moe { router, shared, .. } = ffn else {
             anyhow::bail!("MoE completion received a dense FFN");
         };
         let (x, y) = activation;
@@ -688,6 +730,55 @@ impl Decode {
             }
         }
         stream.wait(&self.mailbox.record_event(None)?)?;
+        let _owned_reader = if let Some(layer) = graph {
+            self.segments
+                .get(layer)
+                .context("MoE contribution graph missing")?
+                .contribute
+                .launch()?;
+            None
+        } else {
+            Some(self.contribute_device(device, ffn, slots, x)?)
+        };
+        self.reader.record(stream)?;
+        let reader = self.reader.clone();
+        self.upload_cpu(device, &mut dispatch, &reader)?;
+        if let Some(layer) = graph {
+            self.segments
+                .get(layer)
+                .context("MoE join graph missing")?
+                .join
+                .launch()?;
+        } else {
+            self.combine_device(device, ffn, x, y)?;
+        }
+        self.stats[1] += dispatch.active.iter().map(|&n| u64::from(n)).sum::<u64>();
+        self.stats[4] += 1;
+        self.pending = false;
+        Ok(())
+    }
+
+    fn contribute_device(
+        &mut self,
+        device: &Device,
+        ffn: BoundFfn,
+        slots: SlotBindings,
+        x: Tensor<bf16, 2>,
+    ) -> Result<CudaEvent> {
+        let BoundFfn::Moe {
+            shared,
+            shared_gate,
+            ..
+        } = ffn
+        else {
+            anyhow::bail!("MoE contribution received a dense FFN");
+        };
+        let (rows, k, hidden) = (
+            x.shape[0] as usize,
+            self.geometry.top_k as usize,
+            self.geometry.hidden as usize,
+        );
+        let stream = &device.stream;
         {
             let (done_ptr, _write) = self.done.device_ptr_mut(stream);
             // SAFETY: done owns max_rows*top_k words and is ordered after the preceding layer's combine.
@@ -723,7 +814,7 @@ impl Decode {
             [rows as u32, k as u32],
             [k as u64, 1],
         )?);
-        let reader = self.contribute.contribute(
+        self.contribute.contribute(
             stream,
             &MoeDecode {
                 x,
@@ -756,10 +847,38 @@ impl Decode {
                 done: &mut done,
             },
             &qwen::scratch(&self.scratch, stream),
+        )
+    }
+
+    fn upload_cpu(
+        &mut self,
+        device: &Device,
+        dispatch: &mut Dispatch<'_>,
+        reader: &CudaEvent,
+    ) -> Result<()> {
+        let (rows, k, hidden) = (
+            self.rows,
+            self.geometry.top_k as usize,
+            self.geometry.hidden as usize,
+        );
+        let stream = &device.stream;
+        let contributions = qwen::view(
+            &self.contributions,
+            stream,
+            0,
+            [rows as u32, k as u32, hidden as u32],
+            [(k * hidden) as u64, hidden as u64, 1],
+        )?;
+        let done = qwen::view(
+            &self.done,
+            stream,
+            0,
+            [rows as u32, k as u32],
+            [k as u64, 1],
         )?;
         if !dispatch.assignments.is_empty() || !dispatch.disk.is_empty() {
-            self.run_cpu(device, &mut dispatch)?;
-            self.mailbox.wait(&reader)?;
+            self.run_cpu(device, dispatch)?;
+            self.mailbox.wait(reader)?;
             let values = self.cpu_out.as_slice()?;
             let done_values = self.cpu_done.as_mut_slice()?;
             for choice in dispatch
@@ -779,7 +898,7 @@ impl Decode {
                         self.mailbox.cu_stream(),
                     )?;
                     result::memcpy_htod_async(
-                        done.read().ptr + (choice * 4) as u64,
+                        done.ptr + (choice * 4) as u64,
                         &done_values[choice..choice + 1],
                         self.mailbox.cu_stream(),
                     )?;
@@ -791,6 +910,41 @@ impl Decode {
             self.stats[2] += (dispatch.assignments.len() + dispatch.disk.len()) as u64;
             self.stats[3] += 1;
         }
+        Ok(())
+    }
+
+    fn combine_device(
+        &self,
+        device: &Device,
+        ffn: BoundFfn,
+        x: Tensor<bf16, 2>,
+        y: &mut TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        let BoundFfn::Moe { shared_gate, .. } = ffn else {
+            anyhow::bail!("MoE combine received a dense FFN");
+        };
+        let (rows, k, hidden) = (
+            x.shape[0] as usize,
+            self.geometry.top_k as usize,
+            self.geometry.hidden as usize,
+        );
+        let stream = &device.stream;
+        let ids = qwen::view(&self.ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
+        let contributions = qwen::view(
+            &self.contributions,
+            stream,
+            0,
+            [rows as u32, k as u32, hidden as u32],
+            [(k * hidden) as u64, hidden as u64, 1],
+        )?;
+        let shared_out = qwen::matrix(&self.shared, stream, 0, rows, hidden)?;
+        let done = qwen::view(
+            &self.done,
+            stream,
+            0,
+            [rows as u32, k as u32],
+            [k as u64, 1],
+        )?;
         let mut scale = TensorMut(qwen::view(
             &self.scale,
             stream,
@@ -807,23 +961,20 @@ impl Decode {
             [rows as u32, k as u32],
             [k as u64, 1],
         )?;
-        self.stats[1] += dispatch.active.iter().map(|&n| u64::from(n)).sum::<u64>();
-        self.stats[4] += 1;
         self.combine.combine(
             stream,
             &MoeCombine {
                 ids,
                 final_active,
-                done: done.read(),
+                done,
                 contributions,
-                shared_out: shared_out.read(),
+                shared_out,
                 x,
                 shared_expert_gate: shared_gate,
                 scale,
                 y: TensorMut(y.read()),
             },
         )?;
-        self.pending = false;
         Ok(())
     }
 

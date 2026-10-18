@@ -388,6 +388,12 @@ impl Engine {
         ));
         let blas = Blas::new(&device, &ops, runtime, closure.clone())?;
         let state = super::super::super::state::StateStore::new(&model_spec, 32, stream)?;
+        let capture_checkpoint = Some(super::super::super::state::StateCheckpoint::new(
+            &state,
+            &model_spec,
+            1,
+            stream,
+        )?);
         let mut work = Work::new(stream, &model_spec, workspace_rows)?;
         stream.memcpy_htod(&[1i32], &mut work.length)?;
         let flash = Some(Flash::new(
@@ -453,7 +459,7 @@ impl Engine {
             graph: None,
             weights,
             state,
-            capture_checkpoint: None,
+            capture_checkpoint,
             work,
             ops,
             blas,
@@ -580,6 +586,224 @@ impl Engine {
             .trace(trace)?;
         Ok(())
     }
+}
+
+fn graph_state(engine: &Engine) -> Result<Vec<u32>> {
+    let stream = &engine.device.stream;
+    let mut values = vec![engine.position as u32];
+    for kv in &engine.state.kv {
+        for data in [&kv.k, &kv.v] {
+            values.extend(
+                stream
+                    .clone_dtoh(data)?
+                    .into_iter()
+                    .map(|v| u32::from(v.to_bits())),
+            );
+        }
+    }
+    for state in &engine.state.gdn {
+        for data in [&state.s, &state.history] {
+            values.extend(stream.clone_dtoh(data)?.into_iter().map(f32::to_bits));
+        }
+    }
+    if let Some(sequence) = &engine.state.sequence {
+        values.extend(stream.clone_dtoh(sequence)?.into_iter().map(|v| v as u32));
+    }
+    values.extend(stream.clone_dtoh(&engine.work.token)?);
+    values.extend(
+        stream
+            .clone_dtoh(&engine.work.position)?
+            .into_iter()
+            .map(|v| v as u32),
+    );
+    values.extend(
+        stream
+            .clone_dtoh(&engine.work.length)?
+            .into_iter()
+            .map(|v| v as u32),
+    );
+    Ok(values)
+}
+
+#[test]
+#[ignore = "requires CUDA and FLYINGFISH_RUNTIME_DIR"]
+fn moe_graphs_match_eager_and_preserve_capture_state_gpu() -> Result<()> {
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("graph gate runtime missing")?,
+    );
+    let fixture = tier_fixture(3);
+    let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+    let frequency = vec![vec![1.0; 16]; 2];
+    let mut defects = 0;
+    let mut control = false;
+    for (resident, pinned, engines, cap) in [
+        (true, false, 1, 0),
+        (false, false, 1, 2),
+        (false, true, 2, 2),
+        (false, false, 2, 0),
+    ] {
+        let capacity = tier_capacity(geometry, pinned)?;
+        let mut pair = (0..2)
+            .map(|arm| {
+                let directory =
+                    runtime.join(format!("graphs-{resident}-{pinned}-{engines}-{cap}-{arm}"));
+                if resident {
+                    Engine::load_moe_test(&fixture, &directory, 8)
+                } else {
+                    Engine::load_moe_placed(
+                        &fixture,
+                        &directory,
+                        &capacity,
+                        &[vec![0, 1, 2, 3], vec![0, 1, 2, 3]],
+                        crate::experts::plan::Admission {
+                            budget_bytes_per_token: cap * capacity.slot_bytes(),
+                        },
+                        engines,
+                        8,
+                    )
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut candidate = pair.pop().context("graph candidate missing")?;
+        let mut reference = pair.pop().context("graph reference missing")?;
+        for engine in [&mut reference, &mut candidate] {
+            engine.reset()?;
+            engine
+                .moe_slots
+                .as_mut()
+                .context("graph slots missing")?
+                .begin_request(&frequency)?;
+            engine.closure.freeze_fixed()?;
+        }
+        candidate.declare_graphs()?;
+        let before = graph_state(&candidate)?;
+        candidate.capture()?;
+        let after = graph_state(&candidate)?;
+        let capture_mismatches = before.iter().zip(&after).filter(|(a, b)| a != b).count()
+            + before.len().abs_diff(after.len());
+        defects += usize::from(capture_mismatches != 0);
+        let expected_graphs = if resident { 1 } else { 6 };
+        ensure!(
+            candidate.graphs.len() == expected_graphs,
+            "Runner FAIL graph declaration count"
+        );
+        candidate.closure.expect_captures(expected_graphs)?;
+        candidate.check_graphs()?;
+        reference.closure.ready(Instant::now())?;
+        candidate.closure.ready(Instant::now())?;
+        println!(
+            "{} moe_graph_capture resident={resident} pinned={pinned} engines={engines} admission_cap={cap} graphs={expected_graphs} state_bit_mismatches={capture_mismatches}",
+            if capture_mismatches == 0 {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+        for request in 0..2 {
+            if request > 0 {
+                for engine in [&mut reference, &mut candidate] {
+                    engine.reset()?;
+                    engine
+                        .moe_slots
+                        .as_mut()
+                        .context("graph reset slots missing")?
+                        .begin_request(&frequency)?;
+                }
+            }
+            for step in 0..6 {
+                let token = (3 + step * 7 + request * 11) % 32;
+                reference.set_token(token)?;
+                candidate.set_token(token)?;
+                {
+                    let _range =
+                        super::super::super::profile::Range::new(true, c"moe_graph_reference");
+                    reference.decode(false, None)?;
+                }
+                {
+                    let _range =
+                        super::super::super::profile::Range::new(true, c"moe_graph_candidate");
+                    candidate.decode(true, None)?;
+                }
+                let a = reference.decode_logits()?;
+                let b = candidate.decode_logits()?;
+                ensure!(
+                    a.iter().chain(&b).all(|v| v.is_finite()),
+                    "Runner FAIL graph comparison is nonfinite"
+                );
+                let logits = a
+                    .iter()
+                    .zip(&b)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let a = graph_state(&reference)?;
+                let b = graph_state(&candidate)?;
+                let state =
+                    a.iter().zip(&b).filter(|(a, b)| a != b).count() + a.len().abs_diff(b.len());
+                let mut a = Trace::default();
+                let mut b = Trace::default();
+                reference.record_test_stats(&mut a)?;
+                candidate.record_test_stats(&mut b)?;
+                let mut placement = 0;
+                for key in ["residency.tier", "residency.generation"] {
+                    let (a, b) = (a.values(key)?, b.values(key)?);
+                    placement += a
+                        .iter()
+                        .zip(b)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                }
+                let mismatch = logits + state + placement;
+                defects += usize::from(mismatch != 0);
+                println!(
+                    "{} moe_graph_decode resident={resident} pinned={pinned} engines={engines} admission_cap={cap} request={request} step={step} logits_bit_mismatches={logits} state_bit_mismatches={state} placement_mismatches={placement} graph_launches={expected_graphs}",
+                    if mismatch == 0 { "PASS" } else { "DEFECT" }
+                );
+            }
+        }
+        if !resident && !control {
+            for engine in [&mut reference, &mut candidate] {
+                engine.reset()?;
+                engine
+                    .moe_slots
+                    .as_mut()
+                    .context("graph control slots missing")?
+                    .begin_request(&frequency)?;
+                engine.set_token(3)?;
+            }
+            reference.decode(false, None)?;
+            {
+                let segments = &mut candidate
+                    .moe
+                    .as_mut()
+                    .context("control executor missing")?
+                    .segments;
+                let (first, tail) = segments.split_at_mut(1);
+                std::mem::swap(&mut first[0].join, &mut tail[0].join);
+            }
+            candidate.decode(true, None)?;
+            let a = reference.decode_logits()?;
+            let b = candidate.decode_logits()?;
+            ensure!(
+                a.iter().chain(&b).all(|v| v.is_finite()),
+                "Runner FAIL wrong-join control is nonfinite"
+            );
+            let mismatches = a
+                .iter()
+                .zip(&b)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            ensure!(
+                mismatches > 0,
+                "Runner FAIL wrong-join control was not detected"
+            );
+            println!("PASS moe_graph_control wrong_join_logits_bit_mismatches={mismatches}");
+            control = true;
+        }
+    }
+    ensure!(control, "Runner FAIL graph control did not execute");
+    ensure!(defects == 0, "DEFECT MoE graph cells={defects}");
+    println!("PASS moe_graph_gate cases=4 requests=2 steps=6 bitwise=true control=wrong_join");
+    Ok(())
 }
 
 fn step(rows: usize) -> crate::backend::Step<'static> {

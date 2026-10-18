@@ -398,6 +398,9 @@ impl Spec {
 #[serde(rename_all = "snake_case")]
 enum Graph {
     Decode,
+    MoeRoute(usize),
+    MoeContribute(usize),
+    MoeJoin(usize),
     Draft,
     Verify,
     TreeDraft,
@@ -931,7 +934,7 @@ impl Engine {
             });
         }
         engine.size_workspace(requested_chunk)?;
-        engine.declare_graphs();
+        engine.declare_graphs()?;
         if engine.spec.is_some() {
             eprintln!(
                 "{}",
@@ -1097,35 +1100,62 @@ impl Engine {
         &self.device.info
     }
 
-    fn declare_graphs(&mut self) {
-        self.graphs = match &self.spec {
-            None => vec![Graph::Decode],
-            Some(spec) if !spec.graph => Vec::new(),
-            Some(spec) => {
-                let mut graphs = if self.spec_budget.is_tree() {
-                    vec![Graph::TreeDraft, Graph::TreeVerify, Graph::TreeCommit]
-                } else {
-                    vec![Graph::Draft, Graph::Verify]
-                };
-                graphs.extend((1..=spec.inject_graphs.len()).map(Graph::Inject));
-                graphs
+    fn declare_graphs(&mut self) -> Result<()> {
+        self.graphs = if self.model_spec.moe.is_some() {
+            if self
+                .moe_slots
+                .as_ref()
+                .context("MoE graph declaration has no slots")?
+                .all_resident()
+            {
+                vec![Graph::Decode]
+            } else {
+                (0..self.model_spec.layers.len())
+                    .flat_map(|layer| {
+                        [
+                            Graph::MoeRoute(layer),
+                            Graph::MoeContribute(layer),
+                            Graph::MoeJoin(layer),
+                        ]
+                    })
+                    .collect()
+            }
+        } else {
+            match &self.spec {
+                None => vec![Graph::Decode],
+                Some(spec) if !spec.graph => Vec::new(),
+                Some(spec) => {
+                    let mut graphs = if self.spec_budget.is_tree() {
+                        vec![Graph::TreeDraft, Graph::TreeVerify, Graph::TreeCommit]
+                    } else {
+                        vec![Graph::Draft, Graph::Verify]
+                    };
+                    graphs.extend((1..=spec.inject_graphs.len()).map(Graph::Inject));
+                    graphs
+                }
             }
         };
         eprintln!(
             "{}",
             serde_json::json!({"backend_graph_declaration":self.graphs})
         );
+        Ok(())
     }
 
     fn has_graph(&self, graph: Graph) -> bool {
         if matches!(graph, Graph::Decode) {
             return self.graph.is_some();
         }
+        if let Graph::MoeRoute(layer) | Graph::MoeContribute(layer) | Graph::MoeJoin(layer) = graph
+        {
+            return layer < self.model_spec.layers.len() && self.has_moe_segments();
+        }
         let Some(spec) = &self.spec else {
             return false;
         };
         match graph {
             Graph::Decode => self.graph.is_some(),
+            Graph::MoeRoute(_) | Graph::MoeContribute(_) | Graph::MoeJoin(_) => false,
             Graph::Draft => spec.draft_graph.is_some(),
             Graph::Verify => spec.verify_graph.is_some(),
             Graph::TreeDraft => spec.tree_draft_graph.is_some(),
@@ -1488,6 +1518,12 @@ impl Engine {
             }
         }
         #[cfg(test)]
+        self.check_capture_layer(layer)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn check_capture_layer(&mut self, layer: usize) -> Result<()> {
         if let Some((fail_layer, remaining)) = &mut self.capture_fail_after_layer
             && *fail_layer == layer
         {
@@ -2544,14 +2580,18 @@ impl Engine {
             None => self.token()?,
         };
         if graph {
-            let result = self
-                .graph
-                .as_ref()
-                .context("decode graph is not captured")?
-                .launch();
+            let result = if self.moe.is_some() {
+                self.run_moe_graph()
+            } else {
+                self.graph
+                    .as_ref()
+                    .context("decode graph is not captured")?
+                    .launch()
+                    .map_err(Into::into)
+            };
             if let Err(error) = result {
                 self.poisoned = true;
-                return Err(error.into());
+                return Err(error);
             }
             self.logits_cache.mark_valid();
         } else {
@@ -2628,10 +2668,9 @@ impl Engine {
     }
 
     pub fn capture(&mut self) -> Result<()> {
-        ensure!(
-            self.moe.is_none(),
-            "MoE segmented decode graphs are not bound"
-        );
+        if self.moe.is_some() {
+            return self.capture_moe();
+        }
         ensure!(
             self.spec.is_none(),
             "graph decode is not declared for draft-enabled engines"
@@ -4268,6 +4307,9 @@ impl Engine {
             return Ok(());
         }
         self.set_token(0)?;
+        if self.moe.is_some() {
+            return self.capture();
+        }
         if self.spec.is_none() {
             self.capture()?;
             self.graph
