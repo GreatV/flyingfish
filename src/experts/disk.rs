@@ -789,6 +789,7 @@ mod tests {
 
     #[test]
     fn reads_native_ranges_at_the_catalogue_offsets() -> Result<()> {
+        assert!(AlignedSlot::new(0).is_err());
         let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
         let pattern = pattern(1536, 0);
         let reader = DiskReader::open(&catalogue, dir.path(), 2)?;

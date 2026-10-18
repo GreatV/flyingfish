@@ -579,6 +579,32 @@ mod tests {
 
     #[test]
     fn slice_offsets_cover_each_expert_exactly() -> Result<()> {
+        for bad in [
+            ExpertGeometry {
+                layers: 0,
+                ..geometry()
+            },
+            ExpertGeometry {
+                experts: 0,
+                ..geometry()
+            },
+            ExpertGeometry {
+                hidden: 0,
+                ..geometry()
+            },
+            ExpertGeometry {
+                intermediate: 0,
+                ..geometry()
+            },
+            ExpertGeometry {
+                top_k: 0,
+                ..geometry()
+            },
+        ] {
+            for format in [ExpertFormat::Bf16, ExpertFormat::Fp8W8a16] {
+                assert!(ExpertLayout::new(format, &bad).is_err(), "{bad:?}");
+            }
+        }
         let catalogue =
             ExpertCatalogue::from_manifest(&manifest(), geometry(), ExpertFormat::Bf16)?;
         let first = match catalogue.range(0, 0)? {

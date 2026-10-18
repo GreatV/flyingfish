@@ -2082,70 +2082,71 @@ mod tests {
 
     #[test]
     fn pool_matches_single_threaded_contributions() -> Result<()> {
-        let shape = Shape::new(128, 64)?;
-        let arena = build_arena(&shape, 8);
-        let mut scratch = Scratch::new(&shape);
-        let rows = 8usize;
-        let hidden: Vec<bf16> = (0..rows * shape.hidden).map(|k| pattern(k, 0.7)).collect();
-        for experts_used in [1usize, 2, 5, 8] {
-            let mut assignments = Vec::new();
-            for row in 0..rows {
-                for choice in 0..8 {
-                    assignments.push(Assignment {
-                        row: row as u32,
-                        choice: (row * 8 + choice) as u32,
-                        expert: ((row * 3 + choice) % experts_used) as u32,
-                        weight: bf16::from_f32(0.125 * (choice as f32 + 1.0)),
-                    });
+        for shape in [Shape::new(128, 64)?, Shape::new(64, 128)?] {
+            let arena = build_arena(&shape, 8);
+            let mut scratch = Scratch::new(&shape);
+            let rows = 8usize;
+            let hidden: Vec<bf16> = (0..rows * shape.hidden).map(|k| pattern(k, 0.7)).collect();
+            for experts_used in [1usize, 2, 5, 8] {
+                let mut assignments = Vec::new();
+                for row in 0..rows {
+                    for choice in 0..8 {
+                        assignments.push(Assignment {
+                            row: row as u32,
+                            choice: (row * 8 + choice) as u32,
+                            expert: ((row * 3 + choice) % experts_used) as u32,
+                            weight: bf16::from_f32(0.125 * (choice as f32 + 1.0)),
+                        });
+                    }
                 }
-            }
-            let experts: Vec<_> = (0..experts_used).map(|e| weights(&shape, e)).collect();
-            let mut expected = vec![bf16::ZERO; assignments.len() * shape.hidden];
-            for assignment in &assignments {
-                let row = &hidden[assignment.row as usize * shape.hidden..][..shape.hidden];
-                let out =
-                    &mut expected[assignment.choice as usize * shape.hidden..][..shape.hidden];
-                contribution(
-                    Isa::Scalar,
-                    Contribution {
-                        shape: &shape,
-                        arena: &arena_flat(&arena),
-                        weights: &experts[assignment.expert as usize],
-                        hidden: row,
-                        routing: assignment.weight,
-                    },
-                    out,
-                    &mut scratch,
-                )?;
-            }
-            for workers in [1usize, 2, 4, 8] {
-                let pool = ExpertPool::new(workers, shape, rows, assignments.len())?;
-                let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
-                pool.run(Job {
-                    arena: arena.clone(),
-                    hidden: &hidden,
-                    rows,
-                    experts: &experts,
-                    assignments: &assignments,
-                    out: &mut out,
-                })?;
-                assert_eq!(out, expected, "workers {workers}, experts {experts_used}");
-                // Assignment order must not move results: `out` is indexed by choice slot.
-                let mut shuffled = assignments.clone();
-                shuffled.reverse();
-                let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
-                pool.run(Job {
-                    arena: arena.clone(),
-                    hidden: &hidden,
-                    rows,
-                    experts: &experts,
-                    assignments: &shuffled,
-                    out: &mut out,
-                })?;
-                assert_eq!(
-                    out, expected,
-                    "reversed assignment order, workers {workers}, experts {experts_used}"
-                );
+                let experts: Vec<_> = (0..experts_used).map(|e| weights(&shape, e)).collect();
+                let mut expected = vec![bf16::ZERO; assignments.len() * shape.hidden];
+                for assignment in &assignments {
+                    let row = &hidden[assignment.row as usize * shape.hidden..][..shape.hidden];
+                    let out =
+                        &mut expected[assignment.choice as usize * shape.hidden..][..shape.hidden];
+                    contribution(
+                        Isa::Scalar,
+                        Contribution {
+                            shape: &shape,
+                            arena: &arena_flat(&arena),
+                            weights: &experts[assignment.expert as usize],
+                            hidden: row,
+                            routing: assignment.weight,
+                        },
+                        out,
+                        &mut scratch,
+                    )?;
+                }
+                for workers in [1usize, 2, 4, 8] {
+                    let pool = ExpertPool::new(workers, shape, rows, assignments.len())?;
+                    let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
+                    pool.run(Job {
+                        arena: arena.clone(),
+                        hidden: &hidden,
+                        rows,
+                        experts: &experts,
+                        assignments: &assignments,
+                        out: &mut out,
+                    })?;
+                    assert_eq!(out, expected, "workers {workers}, experts {experts_used}");
+                    // Assignment order must not move results: `out` is indexed by choice slot.
+                    let mut shuffled = assignments.clone();
+                    shuffled.reverse();
+                    let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
+                    pool.run(Job {
+                        arena: arena.clone(),
+                        hidden: &hidden,
+                        rows,
+                        experts: &experts,
+                        assignments: &shuffled,
+                        out: &mut out,
+                    })?;
+                    assert_eq!(
+                        out, expected,
+                        "reversed assignment order, workers {workers}, experts {experts_used}"
+                    );
+                }
             }
         }
         Ok(())

@@ -1402,7 +1402,7 @@ mod tests {
         let scores = seed_scores(&frequency(), &geometry()).unwrap();
         for layer in &scores {
             let sum: f64 = layer.iter().sum();
-            assert!((sum - F_SEED_SCALE * FREQUENCY_SUM).abs() < 1e-9);
+            assert!((sum - F_SEED_SCALE * f64::from(geometry().top_k)).abs() < 1e-9);
         }
         let zero = vec![vec![0.0; 8], vec![0.0; 8]];
         assert!(seed_scores(&zero, &geometry()).is_err());
