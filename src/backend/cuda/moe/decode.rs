@@ -14,6 +14,8 @@ use std::sync::Arc;
 pub(crate) struct DecodeOps {
     gate_up: CudaFunction,
     down: CudaFunction,
+    gate_up_w8a16: CudaFunction,
+    down_w8a16: CudaFunction,
     #[cfg(test)]
     combine: CombineOps,
 }
@@ -36,6 +38,21 @@ pub(crate) struct MoeDecode<'a> {
     pub contributions: Tensor<bf16, 3>,
     pub shared_out: &'a mut TensorMut<bf16, 2>,
     pub done: &'a mut TensorMut<u32, 2>,
+}
+
+/// W8A16 decode input: the MoeDecode fields with slots_gate_up and
+/// slots_down carrying expert slot BASE pointers, one per expert, each
+/// covering the whole 6-slice slot (3*I*H code bytes then (2*I + H)*2 BF16
+/// scale bytes); the shared expert tensors stay BF16.
+pub(crate) struct MoeDecodeW8a16<'a> {
+    pub routed: MoeDecode<'a>,
+    pub slot_bytes: u64,
+}
+
+/// One W8A16 expert slot: 3*I*H E4M3 code bytes plus (2*I + H) BF16 scale
+/// bytes; 3,151,872 at I=512, H=2048.
+pub(crate) fn slot_bytes_w8a16(hidden: u32, inter: u32) -> u64 {
+    3 * u64::from(inter) * u64::from(hidden) + (2 * u64::from(inter) + u64::from(hidden)) * 2
 }
 
 /// h `[rows*top_k, inter]` bf16 + h_shared `[rows, inter]` bf16, then the
@@ -246,12 +263,28 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
     })
 }
 
+pub(super) fn validate_w8a16(input: &MoeDecodeW8a16<'_>, scratch: &Scratch) -> Result<DecodeDims> {
+    let dims = validate(&input.routed, scratch)?;
+    let expected = slot_bytes_w8a16(dims.hidden, dims.inter);
+    ensure!(
+        input.slot_bytes == expected,
+        "w8a16 decode slot_bytes {} does not match the dims-derived {} (hidden {}, inter {})",
+        input.slot_bytes,
+        expected,
+        dims.hidden,
+        dims.inter
+    );
+    Ok(dims)
+}
+
 impl DecodeOps {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let module = cubin::module(ctx, "moe_ffn")?;
         Ok(Self {
             gate_up: module.load_function("moe_ffn_gate_up")?,
             down: module.load_function("moe_ffn_down")?,
+            gate_up_w8a16: module.load_function("moe_ffn_gate_up_w8a16")?,
+            down_w8a16: module.load_function("moe_ffn_down_w8a16")?,
             #[cfg(test)]
             combine: CombineOps::new(ctx)?,
         })
@@ -358,6 +391,117 @@ impl DecodeOps {
             shared_out: input.shared_out.read(),
             x: input.x,
             shared_expert_gate: input.shared_expert_gate,
+            scale,
+            y: TensorMut(y.read()),
+        };
+        self.combine.combine(stream, &combine_input)
+    }
+
+    /// W8A16 contribute: the same launch structure and guarantees as
+    /// [`DecodeOps::contribute`], with routed experts read from their slot
+    /// bases as E4M3 codes plus per-output-channel BF16 scales.
+    pub fn contribute_w8a16(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &MoeDecodeW8a16<'_>,
+        scratch: &Scratch,
+    ) -> Result<CudaEvent> {
+        let DecodeDims {
+            rows,
+            experts,
+            top_k,
+            hidden,
+            inter,
+        } = validate_w8a16(input, scratch)?;
+        let routed = &input.routed;
+        let h_bytes = u64::from(rows) * u64::from(top_k) * u64::from(inter) * 2;
+        let h_ptr = scratch.ptr;
+        let hs_ptr = scratch.ptr + h_bytes;
+        unsafe {
+            stream
+                .launch_builder(&self.gate_up_w8a16)
+                .arg(&routed.x.ptr)
+                .arg(&routed.ids.ptr)
+                .arg(&routed.active.ptr)
+                .arg(&routed.slots_gate_up.ptr)
+                .arg(&routed.slot_valid.ptr)
+                .arg(&routed.slot_generation.ptr)
+                .arg(&routed.assignment_gen.ptr)
+                .arg(&routed.shared_gate.ptr)
+                .arg(&routed.shared_up.ptr)
+                .arg(&h_ptr)
+                .arg(&hs_ptr)
+                .arg(&(rows as i32))
+                .arg(&(experts as i32))
+                .arg(&(top_k as i32))
+                .arg(&(hidden as i32))
+                .arg(&(inter as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (inter.div_ceil(32), rows, top_k + 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: hidden * 2,
+                })?;
+            stream
+                .launch_builder(&self.down_w8a16)
+                .arg(&h_ptr)
+                .arg(&hs_ptr)
+                .arg(&routed.ids.ptr)
+                .arg(&routed.active.ptr)
+                .arg(&routed.weights.ptr)
+                .arg(&routed.slots_down.ptr)
+                .arg(&routed.slot_valid.ptr)
+                .arg(&routed.slot_generation.ptr)
+                .arg(&routed.assignment_gen.ptr)
+                .arg(&routed.shared_down.ptr)
+                .arg(&routed.contributions.ptr)
+                .arg(&routed.shared_out.read().ptr)
+                .arg(&routed.done.read().ptr)
+                .arg(&(rows as i32))
+                .arg(&(experts as i32))
+                .arg(&(top_k as i32))
+                .arg(&(hidden as i32))
+                .arg(&(inter as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (hidden.div_ceil(16), rows, top_k + 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(stream.record_event(None)?)
+    }
+
+    /// One full W8A16 decode MoE row block: contribute_w8a16, shared sigmoid
+    /// scale and the single deterministic combine, with final_active =
+    /// active.
+    pub fn decode_w8a16(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &MoeDecodeW8a16<'_>,
+        y: &mut TensorMut<bf16, 2>,
+        scratch: &Scratch,
+    ) -> Result<CudaEvent> {
+        self.contribute_w8a16(stream, input, scratch)?;
+        let routed = &input.routed;
+        let rows = routed.x.shape[0];
+        let top_k = routed.ids.shape[1];
+        let inter = routed.shared_gate.shape[0];
+        let scale_ptr = scratch.ptr + u64::from(rows) * u64::from(top_k + 1) * u64::from(inter) * 2;
+        // moe_combine documents the scale as [rows,1] x stride [1,0];
+        // contracts::Tensor::validate rejects zero strides, so this view of
+        // the same [rows] words carries [1,1].
+        let mut scale = unsafe {
+            TensorMut::<bf16, 2>::new(scale_ptr, [rows, 1], [1, 1], u64::from(rows) * 2)?
+        };
+        self.combine
+            .shared_scale(stream, routed.x, routed.shared_expert_gate, &mut scale)?;
+        let combine_input = MoeCombine {
+            ids: routed.ids,
+            final_active: routed.active,
+            done: routed.done.read(),
+            contributions: routed.contributions,
+            shared_out: routed.shared_out.read(),
+            x: routed.x,
+            shared_expert_gate: routed.shared_expert_gate,
             scale,
             y: TensorMut(y.read()),
         };

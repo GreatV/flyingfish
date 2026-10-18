@@ -1,7 +1,7 @@
 //! GPU correctness, control and trap gates for the decode contribute and
 //! combine ops.
 use super::combine::{CombineOps, MoeCombine};
-use super::decode::{DecodeOps, MoeDecode, decode_scratch_bytes};
+use super::decode::{DecodeOps, MoeDecode, MoeDecodeW8a16, decode_scratch_bytes, slot_bytes_w8a16};
 use super::reference::{self, Combine, MoeDims};
 use super::testing;
 use crate::backend::cuda::Device;
@@ -18,6 +18,173 @@ fn decode_scratch_bytes_sizes_h_shared_and_scale() {
     assert_eq!(decode_scratch_bytes(1, 8, 512), 9 * 512 * 2 + 2);
     assert_eq!(decode_scratch_bytes(8, 8, 512), 8 * 9 * 512 * 2 + 8 * 2);
     assert_eq!(decode_scratch_bytes(3, 4, 64), 3 * 5 * 64 * 2 + 3 * 2);
+}
+
+#[test]
+fn w8a16_slot_bytes_matches_checkpoint_layout() {
+    assert_eq!(slot_bytes_w8a16(2048, 512), 3_151_872);
+    assert_eq!(slot_bytes_w8a16(128, 64), 3 * 64 * 128 + (2 * 64 + 128) * 2);
+}
+
+fn pow2i(e: i32) -> f32 {
+    f32::from_bits(((e + 127) as u32) << 23)
+}
+
+/// Round-to-nearest-even f32 onto the E4M3 grid (bias 7, largest finite
+/// magnitude 448); magnitudes above 448 clamp to 448.
+fn e4m3_encode(value: f32) -> u8 {
+    let sign = u8::from(value.is_sign_negative()) << 7;
+    let mag = value.abs().min(448.0);
+    let (field, mantissa) = if mag < pow2i(-6) {
+        (0u8, (mag / pow2i(-9)).round_ties_even() as u8)
+    } else {
+        let e = ((mag.to_bits() >> 23) & 0xff) as i32 - 127;
+        let mut q = (mag / pow2i(e - 3)).round_ties_even() as u32;
+        let mut field = (e + 7) as u32;
+        if q == 16 {
+            q = 8;
+            field += 1;
+        }
+        (field as u8, (q - 8) as u8)
+    };
+    sign | (field << 3) | mantissa
+}
+
+#[test]
+fn e4m3_encode_round_trips_nearest_grid_point() {
+    let cases: [(f32, u8); 6] = [
+        (0.0, 0x00),
+        (448.0, 0x7e),
+        (449.0, 0x7e),
+        (1.5 * pow2i(-9), 0x02),
+        (2.5 * pow2i(-9), 0x02),
+        (1.1875, 0x3a),
+    ];
+    for (value, code) in cases {
+        assert_eq!(e4m3_encode(value), code, "value {value:e}");
+    }
+    assert_eq!(e4m3_encode(-0.0), 0x80);
+    assert_eq!(e4m3_encode(-448.0), 0xfe);
+    let mut state = 0x243f_6a88u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 40) as f32 / 8_388_608.0 - 1.0) * 440.0
+    };
+    for _ in 0..4096 {
+        let v = next();
+        let code = e4m3_encode(v);
+        assert_ne!(code & 0x7f, 0x7f, "reserved code from {v:e}");
+        let d = crate::fp8::decode_e4m3(code);
+        assert!(
+            (v - d).abs() <= pow2i(-9) + d.abs() * pow2i(-4),
+            "value {v:e} decoded to {d:e}"
+        );
+    }
+}
+
+/// Per-output-channel W8A16 quantization of one weight row:
+/// s = amax(|w|)/448 in f32 (scale stored BF16), codes = e4m3(w/s).
+fn quantize_row(row: &[bf16]) -> (Vec<u8>, bf16) {
+    let amax = row.iter().map(|w| w.to_f32().abs()).fold(0.0f32, f32::max);
+    if amax == 0.0 {
+        return (vec![0u8; row.len()], bf16::from_f32(0.0));
+    }
+    let codes = row
+        .iter()
+        .map(|&w| e4m3_encode(w.to_f32() / (amax / 448.0)))
+        .collect();
+    (codes, bf16::from_f32(amax / 448.0))
+}
+
+/// Per-expert W8A16 slots in the checkpoint in-slot order plus the
+/// materialized effective BF16 weights bf16(f32(code) * f32(scale)).
+struct W8a16World {
+    slots: Vec<u8>,
+    effective_gate_up: Vec<bf16>,
+    effective_down: Vec<bf16>,
+    slot_bytes: u64,
+}
+
+fn w8a16_world(fx: &reference::MoeFixture) -> W8a16World {
+    let (e, h, i) = (fx.dims.experts, fx.dims.hidden, fx.dims.inter);
+    let slot_bytes = slot_bytes_w8a16(h as u32, i as u32);
+    let weight = i * h;
+    let mut slots = vec![0u8; e * slot_bytes as usize];
+    let mut effective_gate_up = vec![bf16::from_f32(0.0); e * 2 * i * h];
+    let mut effective_down = vec![bf16::from_f32(0.0); e * h * i];
+    let mut quantize_into =
+        |row: &[bf16], codes_at: usize, scale_at: usize, effective: &mut [bf16]| {
+            let (codes, scale) = quantize_row(row);
+            assert_eq!(codes.len(), effective.len());
+            slots[codes_at..codes_at + codes.len()].copy_from_slice(&codes);
+            slots[scale_at..scale_at + 2].copy_from_slice(&scale.to_bits().to_le_bytes());
+            for (dst, &code) in effective.iter_mut().zip(&codes) {
+                *dst = crate::fp8::effective_weight(code, scale);
+            }
+        };
+    for ex in 0..e {
+        let base = ex * slot_bytes as usize;
+        for j in 0..i {
+            quantize_into(
+                fx.gate_row(ex, j),
+                base + j * h,
+                base + 3 * weight + 2 * j,
+                &mut effective_gate_up[(ex * 2 * i + j) * h..][..h],
+            );
+            quantize_into(
+                fx.up_row(ex, j),
+                base + weight + j * h,
+                base + 3 * weight + 2 * (i + j),
+                &mut effective_gate_up[(ex * 2 * i + i + j) * h..][..h],
+            );
+        }
+        for d in 0..h {
+            quantize_into(
+                fx.down_row(ex, d),
+                base + 2 * weight + d * i,
+                base + 3 * weight + 4 * i + 2 * d,
+                &mut effective_down[(ex * h + d) * i..][..i],
+            );
+        }
+    }
+    assert!(
+        !slots.iter().any(|&b| (b & 0x7f) == 0x7f),
+        "fixture quantization produced the reserved e4m3 code"
+    );
+    W8a16World {
+        slots,
+        effective_gate_up,
+        effective_down,
+        slot_bytes,
+    }
+}
+
+fn u16_words(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect()
+}
+
+fn bf16_bits(words: &[bf16]) -> Vec<u16> {
+    words.iter().map(|w| w.to_bits()).collect()
+}
+
+fn ensure_bitwise(name: &str, got: &[u16], want: &[u16]) -> Result<()> {
+    anyhow::ensure!(
+        got.len() == want.len(),
+        "{name} word count {} != {}",
+        got.len(),
+        want.len()
+    );
+    for (idx, (&g, &w)) in got.iter().zip(want).enumerate() {
+        anyhow::ensure!(g == w, "{name} word {idx}: {g:#06x} != {w:#06x}");
+    }
+    Ok(())
 }
 
 fn max_row_diff(got: &[bf16], want: &[bf16]) -> f32 {
@@ -616,4 +783,365 @@ fn decode_stale_generation_gpu() -> Result<()> {
 #[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
 fn decode_duplicate_ids_gpu() -> Result<()> {
     trap_parent("dup")
+}
+
+/// W8A16 arm of the decode gate: the shared-expert BF16 tensors and the
+/// validation surface of Gate, with Routing's gu/dn views carrying slot
+/// base pointers.
+struct W8Gate<'a> {
+    ops: &'a DecodeOps,
+    s: &'a Arc<CudaStream>,
+    x: Tensor<bf16, 2>,
+    shared_gate: Tensor<bf16, 2>,
+    shared_up: Tensor<bf16, 2>,
+    shared_down: Tensor<bf16, 2>,
+    seg: Tensor<bf16, 1>,
+    valid: Tensor<u32, 1>,
+    slot_bytes: u64,
+    top_k: u32,
+    hidden: u32,
+}
+
+impl W8Gate<'_> {
+    fn input<'a>(
+        &self,
+        rows: u32,
+        rt: &Routing,
+        contributions: Tensor<bf16, 3>,
+        shared_out: &'a mut TensorMut<bf16, 2>,
+        done: &'a mut TensorMut<u32, 2>,
+    ) -> Result<MoeDecodeW8a16<'a>> {
+        Ok(MoeDecodeW8a16 {
+            slot_bytes: self.slot_bytes,
+            routed: MoeDecode {
+                x: self.x.prefix_rows(rows)?,
+                ids: rt.ids.prefix_rows(rows)?,
+                active: rt.active.prefix_rows(rows)?,
+                weights: rt.weights.prefix_rows(rows)?,
+                slots_gate_up: rt.gu,
+                slots_down: rt.dn,
+                slot_valid: self.valid,
+                slot_generation: rt.slot_gen,
+                assignment_gen: rt.agen.prefix_rows(rows)?,
+                shared_gate: self.shared_gate,
+                shared_up: self.shared_up,
+                shared_down: self.shared_down,
+                shared_expert_gate: self.seg,
+                contributions,
+                shared_out,
+                done,
+            },
+        })
+    }
+
+    /// contribute_w8a16 + shared_scale + combine through DecodeOps::decode_w8a16.
+    fn run(&self, rows: u32, rt: &Routing, scratch: &Scratch) -> Result<Vec<bf16>> {
+        let mut io = decode_io(self.s, rows, self.top_k, self.hidden)?;
+        {
+            let input = self.input(rows, rt, io.contributions, &mut io.shared_out, &mut io.done)?;
+            self.ops.decode_w8a16(self.s, &input, &mut io.y, scratch)?;
+        }
+        self.s.synchronize()?;
+        Ok(self.s.clone_dtoh(&io.y_dev)?)
+    }
+}
+
+#[test]
+#[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
+fn decode_expert_ffn_w8a16_gpu() -> Result<()> {
+    anyhow::ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let device = Device::new(0)?;
+    let ops = DecodeOps::new(&device.ctx)?;
+    let s = &device.stream;
+    let fx = reference::fixture(MoeDims::new(4, 16, 4, 128, 64), 0);
+    let (e, k, h, i) = (
+        fx.dims.experts,
+        fx.dims.top_k,
+        fx.dims.hidden,
+        fx.dims.inter,
+    );
+    let (eu, ku, hu, iu) = (e as u32, k as u32, h as u32, i as u32);
+    let world = w8a16_world(&fx);
+
+    // Oracle fixture: routing inputs unchanged, routed experts replaced by
+    // the materialized effective weights.
+    let mut fxq = reference::fixture(MoeDims::new(4, 16, 4, 128, 64), 0);
+    fxq.gate_up = world.effective_gate_up.clone();
+    fxq.down = world.effective_down.clone();
+
+    let x_dev = testing::upload(&device.upload, fx.x.clone())?;
+    let sg_dev = testing::upload(&device.upload, fx.shared_gate.clone())?;
+    let su_dev = testing::upload(&device.upload, fx.shared_up.clone())?;
+    let sd_dev = testing::upload(&device.upload, fx.shared_down.clone())?;
+    let se_dev = testing::upload(&device.upload, fx.shared_expert_gate.clone())?;
+    let slots_dev = testing::upload(&device.upload, world.slots.clone())?;
+    let gu_eff_dev = testing::upload(&device.upload, world.effective_gate_up.clone())?;
+    let dn_eff_dev = testing::upload(&device.upload, world.effective_down.clone())?;
+    device.finish_upload()?;
+
+    let mut ids_host = Vec::with_capacity(4 * k);
+    let mut weights_host = Vec::with_capacity(4 * k);
+    for r in 0..4 {
+        let routed = reference::route_row(&fx, r);
+        ids_host.extend_from_slice(&routed.ids);
+        weights_host.extend_from_slice(&routed.weights);
+    }
+    let ids_dev = testing::upload(s, ids_host.clone())?;
+    let weights_dev = testing::upload(s, weights_host.clone())?;
+    let keep_all: Vec<usize> = (0..k).collect();
+
+    let x_full = testing::dense(&x_dev, s, 4, hu)?;
+    let ids_full = testing::dense(&ids_dev, s, 4, ku)?;
+    let weights_full = testing::dense(&weights_dev, s, 4, ku)?;
+    let active_dev = testing::upload(s, vec![1u32; 4 * k])?;
+    let active_full = testing::dense(&active_dev, s, 4, ku)?;
+    let agen_dev = testing::upload(s, vec![1u64; 4 * k])?;
+    let agen_full = testing::dense(&agen_dev, s, 4, ku)?;
+    let shared_gate_view = testing::dense(&sg_dev, s, iu, hu)?;
+    let shared_up_view = testing::dense(&su_dev, s, iu, hu)?;
+    let shared_down_view = testing::dense(&sd_dev, s, hu, iu)?;
+    let seg_view = testing::view(&se_dev, s, [hu], [1])?;
+
+    let slot_base = slots_dev.device_ptr(s).0;
+    let w8_table = testing::slots(
+        s,
+        e,
+        slot_base,
+        world.slot_bytes,
+        slot_base,
+        world.slot_bytes,
+    )?;
+    let w8_gu = testing::view(&w8_table.gate_up, s, [eu], [1])?;
+    let w8_dn = testing::view(&w8_table.down, s, [eu], [1])?;
+    let w8_valid = testing::view(&w8_table.valid, s, [eu], [1])?;
+    let w8_gen = testing::view(&w8_table.generation, s, [eu], [1])?;
+
+    let bf16_table = testing::slots(
+        s,
+        e,
+        gu_eff_dev.device_ptr(s).0,
+        (2 * i * h * 2) as u64,
+        dn_eff_dev.device_ptr(s).0,
+        (h * i * 2) as u64,
+    )?;
+    let bf16_gu = testing::view(&bf16_table.gate_up, s, [eu], [1])?;
+    let bf16_dn = testing::view(&bf16_table.down, s, [eu], [1])?;
+    let bf16_valid = testing::view(&bf16_table.valid, s, [eu], [1])?;
+    let bf16_gen = testing::view(&bf16_table.generation, s, [eu], [1])?;
+
+    let scratch_mem = testing::zeros::<u8>(s, decode_scratch_bytes(4, k, i) as usize)?;
+    let scratch = Scratch {
+        ptr: scratch_mem.device_ptr(s).0,
+        bytes: decode_scratch_bytes(4, k, i),
+    };
+    let w8 = W8Gate {
+        ops: &ops,
+        s,
+        x: x_full,
+        shared_gate: shared_gate_view,
+        shared_up: shared_up_view,
+        shared_down: shared_down_view,
+        seg: seg_view,
+        valid: w8_valid,
+        slot_bytes: world.slot_bytes,
+        top_k: ku,
+        hidden: hu,
+    };
+
+    // K1 bitwise cell: the W8A16 kernels against the BF16 kernels running on
+    // the host-side materialized effective weights, one row's expert set.
+    {
+        let rt_w8 = Routing {
+            ids: ids_full.prefix_rows(1)?,
+            active: active_full.prefix_rows(1)?,
+            weights: weights_full.prefix_rows(1)?,
+            agen: agen_full.prefix_rows(1)?,
+            gu: w8_gu,
+            dn: w8_dn,
+            slot_gen: w8_gen,
+        };
+        let mut io_w8 = decode_io(s, 1, ku, hu)?;
+        {
+            let input = w8.input(
+                1,
+                &rt_w8,
+                io_w8.contributions,
+                &mut io_w8.shared_out,
+                &mut io_w8.done,
+            )?;
+            ops.contribute_w8a16(s, &input, &scratch)?;
+        }
+        s.synchronize()?;
+        let scratch_w8 = s.clone_dtoh(&scratch_mem)?;
+        let contrib_w8 = s.clone_dtoh(&io_w8._contrib_dev)?;
+        let shared_out_w8 = s.clone_dtoh(&io_w8._shared_out_dev)?;
+
+        let rt_bf16 = Routing {
+            ids: ids_full.prefix_rows(1)?,
+            active: active_full.prefix_rows(1)?,
+            weights: weights_full.prefix_rows(1)?,
+            agen: agen_full.prefix_rows(1)?,
+            gu: bf16_gu,
+            dn: bf16_dn,
+            slot_gen: bf16_gen,
+        };
+        let mut io_bf16 = decode_io(s, 1, ku, hu)?;
+        {
+            let input = MoeDecode {
+                x: w8.x.prefix_rows(1)?,
+                ids: rt_bf16.ids,
+                active: rt_bf16.active,
+                weights: rt_bf16.weights,
+                slots_gate_up: rt_bf16.gu,
+                slots_down: rt_bf16.dn,
+                slot_valid: bf16_valid,
+                slot_generation: rt_bf16.slot_gen,
+                assignment_gen: rt_bf16.agen,
+                shared_gate: w8.shared_gate,
+                shared_up: w8.shared_up,
+                shared_down: w8.shared_down,
+                shared_expert_gate: w8.seg,
+                contributions: io_bf16.contributions,
+                shared_out: &mut io_bf16.shared_out,
+                done: &mut io_bf16.done,
+            };
+            ops.contribute(s, &input, &scratch)?;
+        }
+        s.synchronize()?;
+        let scratch_bf16 = s.clone_dtoh(&scratch_mem)?;
+        let contrib_bf16 = s.clone_dtoh(&io_bf16._contrib_dev)?;
+        let shared_out_bf16 = s.clone_dtoh(&io_bf16._shared_out_dev)?;
+
+        let (h_bytes, hs_bytes) = (k * i * 2, i * 2);
+        ensure_bitwise(
+            "h",
+            &u16_words(&scratch_w8[..h_bytes]),
+            &u16_words(&scratch_bf16[..h_bytes]),
+        )?;
+        ensure_bitwise(
+            "h_shared",
+            &u16_words(&scratch_w8[h_bytes..h_bytes + hs_bytes]),
+            &u16_words(&scratch_bf16[h_bytes..h_bytes + hs_bytes]),
+        )?;
+        ensure_bitwise(
+            "contributions",
+            &bf16_bits(&contrib_w8),
+            &bf16_bits(&contrib_bf16),
+        )?;
+        ensure_bitwise(
+            "shared_out",
+            &bf16_bits(&shared_out_w8),
+            &bf16_bits(&shared_out_bf16),
+        )?;
+        println!(
+            "MOE_DECODE_W8A16_K1_BITWISE h={h_bytes}B h_shared={hs_bytes}B contributions={}w shared_out={}w PASS",
+            k * h,
+            h
+        );
+    }
+
+    for rows in [1u32, 2, 3, 4] {
+        let rt = Routing {
+            ids: ids_full.prefix_rows(rows)?,
+            active: active_full.prefix_rows(rows)?,
+            weights: weights_full.prefix_rows(rows)?,
+            agen: agen_full.prefix_rows(rows)?,
+            gu: w8_gu,
+            dn: w8_dn,
+            slot_gen: w8_gen,
+        };
+        let got = w8.run(rows, &rt, &scratch)?;
+        let sample: Vec<usize> = (0..rows as usize).collect();
+        let tol = reference::tolerance(&fxq, &sample);
+        let mut worst = 0.0f32;
+        for r in 0..rows as usize {
+            let want = reference::moe_row_ids(
+                &fxq,
+                r,
+                &ids_host[r * k..(r + 1) * k],
+                &weights_host[r * k..(r + 1) * k],
+                &keep_all,
+                Combine::Fp32,
+            );
+            let diff = max_row_diff(&got[r * h..(r + 1) * h], &want);
+            worst = worst.max(diff);
+            anyhow::ensure!(
+                diff <= tol,
+                "w8a16 decode rows={rows} row={r} max diff {diff:e} exceeds tolerance {tol:e}"
+            );
+            println!("MOE_DECODE_W8A16_SPREAD rows={rows} row={r} max_diff={diff:e} tol={tol:e}");
+        }
+        println!("MOE_DECODE_W8A16 rows={rows} worst_diff={worst:e} tol={tol:e} PASS");
+    }
+
+    {
+        let victim = ids_host[0] as usize;
+        let vs = victim * world.slot_bytes as usize;
+        let gate_scale_at = |j: usize| {
+            let at = vs + 3 * i * h + 2 * j;
+            bf16::from_bits(u16::from_le_bytes([world.slots[at], world.slots[at + 1]]))
+        };
+        let (mut j0, mut j1, mut spread) = (0usize, 1usize, 0.0f32);
+        for a in 0..i {
+            for b in a + 1..i {
+                let d = (gate_scale_at(a).to_f32() - gate_scale_at(b).to_f32()).abs();
+                if d > spread {
+                    spread = d;
+                    (j0, j1) = (a, b);
+                }
+            }
+        }
+        anyhow::ensure!(
+            spread > 0.0,
+            "swapped-scale control requires distinct gate scales"
+        );
+        let mut corrupted = world.slots.clone();
+        let (a0, a1) = (vs + 3 * i * h + 2 * j0, vs + 3 * i * h + 2 * j1);
+        for t in 0..2 {
+            corrupted.swap(a0 + t, a1 + t);
+        }
+        let corrupt_dev = testing::upload(s, corrupted)?;
+        let corrupt_base = corrupt_dev.device_ptr(s).0;
+        let mut gu_tab: Vec<u64> = (0..e)
+            .map(|ex| slot_base + ex as u64 * world.slot_bytes)
+            .collect();
+        let dn_tab = gu_tab.clone();
+        gu_tab[victim] = corrupt_base;
+        let gu_cor = testing::upload(s, gu_tab)?;
+        let dn_cor = testing::upload(s, dn_tab)?;
+        let gu_cor_view = testing::view(&gu_cor, s, [eu], [1])?;
+        let dn_cor_view = testing::view(&dn_cor, s, [eu], [1])?;
+        let rt = Routing {
+            ids: ids_full.prefix_rows(1)?,
+            active: active_full.prefix_rows(1)?,
+            weights: weights_full.prefix_rows(1)?,
+            agen: agen_full.prefix_rows(1)?,
+            gu: gu_cor_view,
+            dn: dn_cor_view,
+            slot_gen: w8_gen,
+        };
+        let got = w8.run(1, &rt, &scratch)?;
+        let want = reference::moe_row_ids(
+            &fxq,
+            0,
+            &ids_host[..k],
+            &weights_host[..k],
+            &keep_all,
+            Combine::Fp32,
+        );
+        let tol0 = reference::tolerance(&fxq, &[0]);
+        let diff = max_row_diff(&got[..h], &want);
+        anyhow::ensure!(
+            diff > tol0,
+            "swapped gate-scale control undetected: diff {diff:e} within tolerance {tol0:e}"
+        );
+        println!(
+            "MOE_DECODE_W8A16_CONTROL swapped_gate_scales victim={victim} rows=({j0},{j1}) diff={diff:e} tol={tol0:e} DETECTED"
+        );
+    }
+    println!("MOE_DECODE_W8A16_GPU k1_bitwise=1 rows=1,2,3,4 control=1 PASS");
+    Ok(())
 }
