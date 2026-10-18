@@ -28,6 +28,7 @@ pub struct DraftConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rope {
     pub rope_theta: f32,
     pub rope_type: String,
@@ -194,6 +195,23 @@ fn read_config(path: &Path) -> Result<serde_json::Value> {
     )?;
     if let Some(nested) = value.get("dflash_config").cloned() {
         let fields = nested.as_object().context("invalid DSpark dflash_config")?;
+        for name in fields.keys() {
+            ensure!(
+                matches!(
+                    name.as_str(),
+                    "target_layer_ids"
+                        | "mask_token_id"
+                        | "markov_rank"
+                        | "markov_head_type"
+                        | "projector_type"
+                        | "attention_mode"
+                        | "enable_confidence_head"
+                        | "confidence_head_with_markov"
+                        | "confidence_head_alpha"
+                ),
+                "unknown DSpark dflash_config field {name}"
+            );
+        }
         let root = value.as_object_mut().context("invalid DSpark config")?;
         for name in [
             "target_layer_ids",
@@ -201,6 +219,10 @@ fn read_config(path: &Path) -> Result<serde_json::Value> {
             "markov_rank",
             "markov_head_type",
             "projector_type",
+            "attention_mode",
+            "enable_confidence_head",
+            "confidence_head_with_markov",
+            "confidence_head_alpha",
         ] {
             if let Some(field) = fields.get(name) {
                 if let Some(existing) = root.get(name) {
@@ -212,19 +234,39 @@ fn read_config(path: &Path) -> Result<serde_json::Value> {
                 root.insert(name.into(), field.clone());
             }
         }
-        for (name, expected) in [
-            ("attention_mode", serde_json::json!("gqa")),
-            ("enable_confidence_head", serde_json::json!(true)),
-            ("confidence_head_with_markov", serde_json::json!(true)),
-            ("confidence_head_alpha", serde_json::json!(1.0)),
-        ] {
-            if let Some(actual) = fields.get(name) {
-                ensure!(*actual == expected, "unsupported DSpark {name}");
-                if let Some(existing) = root.get(name) {
-                    ensure!(existing == actual, "ambiguous DSpark config field {name}");
-                }
-            }
+    }
+    for (name, expected) in [
+        ("attention_mode", serde_json::json!("gqa")),
+        ("enable_confidence_head", serde_json::json!(true)),
+        ("confidence_head_with_markov", serde_json::json!(true)),
+        ("attention_bias", serde_json::json!(false)),
+        ("mlp_bias", serde_json::json!(false)),
+        ("hidden_act", serde_json::json!("silu")),
+        ("sliding_window", serde_json::Value::Null),
+        ("use_sliding_window", serde_json::json!(false)),
+        ("tie_word_embeddings", serde_json::json!(false)),
+    ] {
+        if let Some(actual) = value.get(name) {
+            ensure!(*actual == expected, "unsupported DSpark {name}");
         }
+    }
+    if let Some(alpha) = value.get("confidence_head_alpha") {
+        ensure!(
+            alpha.as_f64() == Some(1.0),
+            "unsupported DSpark confidence_head_alpha"
+        );
+    }
+    if let Some(types) = value.get("layer_types") {
+        ensure!(
+            types.as_array().is_some_and(|types| {
+                value["num_hidden_layers"].as_u64() == Some(types.len() as u64)
+                    && types.iter().all(|kind| kind == "full_attention")
+            }),
+            "unsupported DSpark layer_types"
+        );
+    }
+    if let Some(rope) = value.get("rope_parameters") {
+        serde_json::from_value::<Rope>(rope.clone()).context("invalid DSpark rope_parameters")?;
     }
     Ok(value)
 }
@@ -403,7 +445,8 @@ mod tests {
                 DraftConfig::read(&root, &target)?.block_size == 7,
                 "dense draft rejected"
             );
-            let mut hybrid_target = target;
+            let flat = full.clone();
+            let mut hybrid_target = target.clone();
             hybrid_target.intermediate_size = 512;
             hybrid_target.num_attention_heads = 16;
             hybrid_target.head_dim = 256;
@@ -448,6 +491,74 @@ mod tests {
             ensure!(
                 draft.block_size == 15 && draft.kv_dim() == 512 && draft.qkv_dim() == 3072,
                 "draft geometry borrowed target dimensions"
+            );
+            let mut admitted = Vec::new();
+            for (schema, original, target) in
+                [("flat", &flat, &target), ("nested", &full, &hybrid_target)]
+            {
+                for (field, value) in [
+                    ("attention_mode", serde_json::json!("mha")),
+                    ("enable_confidence_head", serde_json::json!(false)),
+                    ("confidence_head_with_markov", serde_json::json!(false)),
+                    ("confidence_head_alpha", serde_json::json!(0.5)),
+                    ("attention_bias", serde_json::json!(true)),
+                    ("mlp_bias", serde_json::json!(true)),
+                    ("hidden_act", serde_json::json!("gelu")),
+                    ("sliding_window", serde_json::json!(4096)),
+                    ("use_sliding_window", serde_json::json!(true)),
+                    (
+                        "layer_types",
+                        serde_json::json!(vec!["sliding_attention"; 5]),
+                    ),
+                    ("tie_word_embeddings", serde_json::json!(true)),
+                ] {
+                    let mut invalid = original.clone();
+                    if schema == "nested"
+                        && [
+                            "attention_mode",
+                            "enable_confidence_head",
+                            "confidence_head_with_markov",
+                            "confidence_head_alpha",
+                        ]
+                        .contains(&field)
+                    {
+                        invalid["dflash_config"][field] = value;
+                    } else {
+                        invalid[field] = value;
+                    }
+                    write(&invalid)?;
+                    let rejected = DraftConfig::read(&root, target).is_err();
+                    println!(
+                        "DSPARK_CONFIG_REJECTION schema={schema} field={field} rejected={rejected}"
+                    );
+                    if !rejected {
+                        admitted.push(format!("{schema}.{field}"));
+                    }
+                }
+                let mut invalid = original.clone();
+                invalid["rope_parameters"]["unknown_rope"] = serde_json::json!(true);
+                write(&invalid)?;
+                let rejected = DraftConfig::read(&root, target).is_err();
+                println!(
+                    "DSPARK_CONFIG_REJECTION schema={schema} field=rope_parameters.unknown_rope rejected={rejected}"
+                );
+                if !rejected {
+                    admitted.push(format!("{schema}.rope_parameters.unknown_rope"));
+                }
+            }
+            let mut invalid = full.clone();
+            invalid["dflash_config"]["unknown_draft"] = serde_json::json!(true);
+            write(&invalid)?;
+            let rejected = DraftConfig::read(&root, &hybrid_target).is_err();
+            println!(
+                "DSPARK_CONFIG_REJECTION schema=nested field=dflash_config.unknown_draft rejected={rejected}"
+            );
+            if !rejected {
+                admitted.push("nested.dflash_config.unknown_draft".into());
+            }
+            ensure!(
+                admitted.is_empty(),
+                "unsupported draft fields admitted: {admitted:?}"
             );
             for (field, value) in [
                 ("draft_vocab_size", serde_json::json!(130560)),
