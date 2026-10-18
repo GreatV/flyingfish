@@ -675,12 +675,24 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             .collect::<serde_json::Map<_, _>>();
         let cross = serde_json::json!({"layers":cross_layers, "norm":cross_error,
             "logits":cross_error, "teacher_top2":cross_error});
+        let batch_shape = cases
+            .iter()
+            .map(|(case, floor)| {
+                let mut shape = comparison.clone();
+                shape["logits"] = floor["fp32_layer0"].clone();
+                (
+                    case.clone(),
+                    serde_json::json!({"sm89":shape,"sm86":comparison}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
         std::fs::write(
             directory.join("noise_floor_r2.json"),
             serde_json::to_vec(
                 &serde_json::json!({"per_case_reference_floor":{"cases":cases},
                 "official_vision_implementation_propagation":{"cases":{
                     "image_boat_16x":vision,"image_hockey_16x":vision}},
+                "official_expert_batch_shape":{"validated":true,"cases":batch_shape},
                 "official_cross_gpu_streamed":{"sm89_primary_bitwise":true,"cases":{
                     "text_32":cross,"image_boat_16x":cross,"image_hockey_16x":cross}}}),
             )?,
@@ -712,7 +724,10 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
                 assert_eq!(bounds.layers[&layer], other);
             }
             assert_eq!(bounds.norm, other);
-            assert_eq!(bounds.logits, other);
+            assert_eq!(
+                bounds.logits,
+                [expected, expected / 2.0, expected / 4.0, 1.0]
+            );
             assert_eq!(bounds.decode, other);
         }
         Ok(())
