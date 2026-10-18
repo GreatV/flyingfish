@@ -138,6 +138,7 @@ impl Markov {
                 tokens: std::array::from_fn(|j| output[i * 4 + j]),
                 logp: std::array::from_fn(|j| f32::from_bits(output[p * 4 + i * 4 + j])),
                 lse: f32::from_bits(output[p * 8 + i]),
+                vocab: 130560,
             })
             .collect::<Vec<_>>();
         for (i, top) in top4.iter().enumerate() {

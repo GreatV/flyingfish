@@ -6,20 +6,19 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
 const STEPS: usize = 64;
-const COSINE_MIN: f64 = 0.999;
-const LOGITS_MAX: f64 = 1.5;
-const LOGITS_MEAN: f64 = 0.1;
-const JUMP_MAX: f64 = 3.0;
-const OUTLIER_RATE: f64 = 0.005;
-const OUTLIER_ALPHA: f64 = 0.01;
 
 pub struct Rules {
-    hidden: Vec<LayerLimit>,
-    source: String,
+    hidden: Option<HiddenRules>,
     logits_mean: Vec<f64>,
     logits_max: Vec<f64>,
     logits_source: String,
-    systematic: Option<SystemRule>,
+    systematic: SystemRule,
+}
+
+#[derive(Serialize)]
+struct HiddenRules {
+    limits: Vec<LayerLimit>,
+    source: String,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -95,25 +94,6 @@ impl LayerLimit {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum HiddenLimit {
-    Legacy(f64),
-    Current(LayerLimit),
-}
-
-impl HiddenLimit {
-    fn value(&self) -> LayerLimit {
-        match self {
-            Self::Legacy(rel) => LayerLimit {
-                rel: *rel,
-                cos_min: COSINE_MIN,
-            },
-            Self::Current(v) => *v,
-        }
-    }
-}
-
 impl Rules {
     pub fn check_step(
         &self,
@@ -134,13 +114,12 @@ impl Rules {
         );
         let exact = token == reference.tokens[step];
         let near = !exact && (reference.margins[step] as f64) < self.logits_max[step];
-        let warn = m.mean_abs > self.logits_mean[step] || m.max_abs > self.logits_max[step];
         println!(
             "{}",
             serde_json::json!({"step":step,"logits":m,"actual_token":token,
             "expected_token":reference.tokens[step],"reference_margin":reference.margins[step],
             "mean_abs_limit":self.logits_mean[step],"max_abs_limit":self.logits_max[step],
-            "exact_match":exact,"near_tie_exception":near,"warn":warn,"pass":exact||near})
+            "exact_match":exact,"near_tie_exception":near,"pass":exact||near})
         );
         ensure!(
             exact || near,
@@ -148,60 +127,46 @@ impl Rules {
         );
         Ok(m)
     }
+    /// `hidden_path` is absent only for callers that never compare hidden states.
     pub fn read(
-        path: Option<&Path>,
-        logit_path: Option<&Path>,
+        hidden_path: Option<&Path>,
+        logit_path: &Path,
         fixture: &Path,
         layers: usize,
     ) -> Result<Self> {
-        let (hidden, source) = if let Some(path) = path {
-            let table: BTreeMap<String, BTreeMap<usize, HiddenLimit>> =
-                serde_json::from_slice(&std::fs::read(path)?)?;
-            let stem = fixture
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .context("invalid fixture stem")?;
-            let values = table
-                .get(stem)
-                .with_context(|| format!("hidden limit table missing {stem}"))?;
-            ensure!(
-                values.keys().copied().eq(0..layers + 1),
-                "hidden limit table {stem} must contain each layer 0..={layers}"
-            );
-            (
-                values.values().map(HiddenLimit::value).collect(),
-                path.display().to_string(),
-            )
-        } else {
-            (
-                vec![
-                    LayerLimit {
-                        rel: 0.05,
-                        cos_min: COSINE_MIN
-                    };
-                    layers + 1
-                ],
-                "uniform provisional hidden limits".into(),
-            )
+        let stem = fixture
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .context("invalid fixture stem")?;
+        let hidden = match hidden_path {
+            Some(path) => {
+                let table: BTreeMap<String, BTreeMap<usize, LayerLimit>> =
+                    serde_json::from_slice(&std::fs::read(path)?)?;
+                let values = table
+                    .get(stem)
+                    .with_context(|| format!("hidden limit table missing {stem}"))?;
+                ensure!(
+                    values.keys().copied().eq(0..layers + 1),
+                    "hidden limit table {stem} must contain each layer 0..={layers}"
+                );
+                let limits: Vec<LayerLimit> = values.values().copied().collect();
+                ensure!(
+                    limits.iter().all(|v| v.rel.is_finite()
+                        && v.rel >= 0.0
+                        && v.cos_min.is_finite()
+                        && (-1.0..=1.0).contains(&v.cos_min)),
+                    "invalid per-layer hidden limits"
+                );
+                Some(HiddenRules {
+                    limits,
+                    source: path.display().to_string(),
+                })
+            }
+            None => None,
         };
-        ensure!(
-            hidden.len() == layers + 1,
-            "hidden limit count must be {}",
-            layers + 1
-        );
-        ensure!(
-            hidden.iter().all(|v| v.rel.is_finite()
-                && v.rel >= 0.0
-                && v.cos_min.is_finite()
-                && (-1.0..=1.0).contains(&v.cos_min)),
-            "invalid per-layer hidden limits"
-        );
-        let (logits_mean, logits_max, logits_source, systematic) = if let Some(path) = logit_path {
+        let (logits_mean, logits_max, logits_source, systematic) = {
+            let path = logit_path;
             let table: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-            let stem = fixture
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .context("invalid fixture stem")?;
             let item = table
                 .get(stem)
                 .with_context(|| format!("logit limit table missing {stem}"))?;
@@ -252,16 +217,9 @@ impl Rules {
                         && mean.iter().chain(&max).all(|v| v.is_finite() && *v >= 0.0),
                     "systematic probes must match the prompt step count and be finite/nonnegative"
                 );
-                Some(SystemRule { gates, mean, max })
+                SystemRule { gates, mean, max }
             };
             (mean, max, path.display().to_string(), systematic)
-        } else {
-            (
-                vec![LOGITS_MEAN; STEPS],
-                vec![LOGITS_MAX; STEPS],
-                "uniform provisional logit limits".into(),
-                None,
-            )
         };
         ensure!(
             !logits_mean.is_empty() && logits_max.len() == logits_mean.len(),
@@ -274,12 +232,19 @@ impl Rules {
         );
         Ok(Self {
             hidden,
-            source,
             logits_mean,
             logits_max,
             logits_source,
             systematic,
         })
+    }
+
+    fn hidden_limits(&self) -> Result<&[LayerLimit]> {
+        Ok(&self
+            .hidden
+            .as_ref()
+            .context("hidden comparison requires --hidden-limits")?
+            .limits)
     }
 
     pub fn systematic(&self, values: &[Metrics]) -> Result<bool> {
@@ -288,13 +253,7 @@ impl Rules {
             "systematic logits check must cover every prompt step"
         );
         let mut passed = true;
-        let binomial = self.systematic.as_ref().map_or(
-            Binomial {
-                p: OUTLIER_RATE,
-                alpha: OUTLIER_ALPHA,
-            },
-            |r| r.gates.outlier_binomial,
-        );
+        let binomial = self.systematic.gates.outlier_binomial;
         for (kind, engine, limits) in [
             (
                 "mean_abs",
@@ -323,9 +282,7 @@ impl Rules {
                 "alpha":binomial.alpha,"p_value":probability,"pass":pass})
             );
         }
-        let Some(rule) = &self.systematic else {
-            return Ok(passed);
-        };
+        let rule = &self.systematic;
         for (kind, probe, engine) in [
             (
                 "mean_abs",
@@ -359,7 +316,7 @@ impl Rules {
     fn print(&self) {
         println!(
             "{}",
-            serde_json::json!({"rules_source":self.source,"hidden_limits":self.hidden,"logits_source":self.logits_source,"logits_max_abs":self.logits_max,"logits_mean_abs":self.logits_mean,"hidden_jump_diagnostic":JUMP_MAX})
+            serde_json::json!({"hidden":self.hidden,"logits_source":self.logits_source,"logits_max_abs":self.logits_max,"logits_mean_abs":self.logits_mean})
         );
     }
 }
@@ -371,6 +328,25 @@ pub struct Metrics {
     rel_rmse: f64,
     cosine: f64,
     exact: bool,
+}
+
+/// Half a BF16 ulp at magnitude `x`: 2^(⌊log2 x⌋ − 8); 0 at `x <= 0`.
+pub fn bf16_half_ulp(x: f64) -> f64 {
+    if x > 0.0 {
+        2f64.powi(x.log2().floor() as i32 - 8)
+    } else {
+        0.0
+    }
+}
+
+/// Largest per-element distance in half-BF16-ulp units of `max(|reference_i|, rms)`.
+pub fn half_ulp_ratio(candidate: &[f32], reference: &[f32], rms: f32) -> f64 {
+    let mut worst = 0f64;
+    for (&c, &r) in candidate.iter().zip(reference) {
+        let scale = r.abs().max(rms).max(2f32.powi(-30));
+        worst = worst.max(f64::from((c - r).abs()) / bf16_half_ulp(f64::from(scale)));
+    }
+    worst
 }
 
 fn metrics(actual: &[f32], expected: &[f32]) -> Result<Metrics> {
@@ -559,8 +535,8 @@ fn hidden_compare(
 ) -> Result<bool> {
     let parts = trace.prefill_parts()?;
     let mut passed = true;
-    let mut previous = 0f64;
-    for layer in 0..rules.hidden.len() {
+    let limits = rules.hidden_limits()?;
+    for layer in 0..limits.len() {
         let tensor = reference.tensor(&format!("hidden_states.{layer}"))?;
         let shape = tensor.shape();
         ensure!(
@@ -575,7 +551,7 @@ fn hidden_compare(
         let expected = floats(tensor)?;
         let suffix = if layer == 0 {
             "embed".into()
-        } else if layer + 1 == rules.hidden.len() {
+        } else if layer + 1 == limits.len() {
             "norm".into()
         } else {
             format!("layer.{}", layer - 1)
@@ -590,22 +566,16 @@ fn hidden_compare(
         );
         let actual = &actual[actual.len() - expected_rows * width..];
         let m = metrics(actual, &expected).with_context(|| format!("hidden_states.{layer}"))?;
-        let jump = if layer > 1 && previous > 0.0 {
-            Some(m.rel_rmse / previous)
-        } else {
-            None
-        };
         let pass = if layer == 0 {
             m.exact
         } else {
-            rules.hidden[layer].accepts(&m)
+            limits[layer].accepts(&m)
         };
         println!(
             "{}",
-            serde_json::json!({"tensor":format!("hidden_states.{layer}"),"metrics":m,"rel_rmse_limit":rules.hidden[layer],"jump_ratio":jump,"jump_flag":jump.is_some_and(|v|v>JUMP_MAX),"pass":pass})
+            serde_json::json!({"tensor":format!("hidden_states.{layer}"),"metrics":m,"rel_rmse_limit":limits[layer],"pass":pass})
         );
         passed &= pass;
-        previous = m.rel_rmse;
     }
     Ok(passed)
 }
@@ -626,10 +596,9 @@ fn logits_compare(
     let exact = token == reference.greedy[step];
     let near_tie = !exact && (reference.margins[step] as f64) < rules.logits_max[step];
     let pass = exact || near_tie;
-    let warn = m.max_abs > rules.logits_max[step] || m.mean_abs > rules.logits_mean[step];
     println!(
         "{}",
-        serde_json::json!({"step":step,"logits":m,"mean_abs_limit":rules.logits_mean[step],"max_abs_limit":rules.logits_max[step],"actual_token":token,"expected_token":reference.greedy[step],"reference_margin":reference.margins[step],"exact_match":exact,"near_tie_exception":near_tie,"warn":warn,"pass":pass})
+        serde_json::json!({"step":step,"logits":m,"mean_abs_limit":rules.logits_mean[step],"max_abs_limit":rules.logits_max[step],"actual_token":token,"expected_token":reference.greedy[step],"reference_margin":reference.margins[step],"exact_match":exact,"near_tie_exception":near_tie,"pass":pass})
     );
     Ok((pass, near_tie, m))
 }
@@ -722,6 +691,7 @@ pub fn run(model: &mut Model, fixture: &Path, rules: &Rules, graph: bool) -> Res
 
 pub fn compare_saved(fixture: &Path, log: &Path, rules: &Rules) -> Result<()> {
     let text = std::fs::read_to_string(log)?;
+    let limits = rules.hidden_limits()?;
     let mut hidden = BTreeMap::new();
     let mut logits = BTreeMap::new();
     let mut source = None;
@@ -753,7 +723,7 @@ pub fn compare_saved(fixture: &Path, log: &Path, rules: &Rules) -> Result<()> {
         }
     }
     ensure!(
-        hidden.keys().copied().eq(0..rules.hidden.len()),
+        hidden.keys().copied().eq(0..limits.len()),
         "saved log must cover all hidden layers"
     );
     ensure!(
@@ -781,12 +751,12 @@ pub fn compare_saved(fixture: &Path, log: &Path, rules: &Rules) -> Result<()> {
         let pass = if *layer == 0 {
             m.exact
         } else {
-            rules.hidden[*layer].accepts(m)
+            limits[*layer].accepts(m)
         };
         passed &= pass;
         println!(
             "{}",
-            serde_json::json!({"saved_layer":layer,"metrics":m,"limit":rules.hidden[*layer],"pass":pass})
+            serde_json::json!({"saved_layer":layer,"metrics":m,"limit":limits[*layer],"pass":pass})
         );
     }
     let mut logit_metrics = Vec::with_capacity(STEPS);
@@ -812,13 +782,12 @@ pub fn compare_saved(fixture: &Path, log: &Path, rules: &Rules) -> Result<()> {
         let exact = a == e;
         let near = !exact && margin < rules.logits_max[*step];
         let pass = exact || near;
-        let warn = m.max_abs > rules.logits_max[*step] || m.mean_abs > rules.logits_mean[*step];
         passed &= pass;
         exact_tokens += usize::from(exact);
         near_ties += usize::from(near);
         println!(
             "{}",
-            serde_json::json!({"saved_step":step,"metrics":m,"mean_limit":rules.logits_mean[*step],"max_limit":rules.logits_max[*step],"exact_token":exact,"near_tie":near,"warn":warn,"pass":pass})
+            serde_json::json!({"saved_step":step,"metrics":m,"mean_limit":rules.logits_mean[*step],"max_limit":rules.logits_max[*step],"exact_token":exact,"near_tie":near,"pass":pass})
         );
         logit_metrics.push(m);
     }
@@ -834,6 +803,31 @@ pub fn compare_saved(fixture: &Path, log: &Path, rules: &Rules) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RATE: f64 = 0.005;
+    const ALPHA: f64 = 0.01;
+
+    /// Rules with uniform (mean, max) step limits, (mean, max) probes and (median, p90) ratio gates.
+    fn rules(steps: usize, limits: (f64, f64), probes: (f64, f64), ratios: (f64, f64)) -> Rules {
+        Rules {
+            hidden: None,
+            logits_mean: vec![limits.0; steps],
+            logits_max: vec![limits.1; steps],
+            logits_source: "test".into(),
+            systematic: SystemRule {
+                gates: Gates {
+                    ratio_median_max: ratios.0,
+                    ratio_p90_max: ratios.1,
+                    outlier_binomial: Binomial {
+                        p: RATE,
+                        alpha: ALPHA,
+                    },
+                },
+                mean: vec![probes.0; steps],
+                max: vec![probes.1; steps],
+            },
+        }
+    }
 
     #[test]
     fn reference_byte_decoding_preserves_bits_and_id_bounds() -> Result<()> {
@@ -872,19 +866,7 @@ mod tests {
 
     #[test]
     fn systematic_gates_detect_small_but_persistent_errors() -> Result<()> {
-        let mut rules = Rules::read(None, None, Path::new("p1.safetensors"), 42)?;
-        rules.systematic = Some(SystemRule {
-            gates: Gates {
-                ratio_median_max: 1.5,
-                ratio_p90_max: 2.5,
-                outlier_binomial: Binomial {
-                    p: OUTLIER_RATE,
-                    alpha: OUTLIER_ALPHA,
-                },
-            },
-            mean: vec![0.01; STEPS],
-            max: vec![0.2; STEPS],
-        });
+        let rules = rules(STEPS, (0.1, 1.5), (0.01, 0.2), (1.5, 2.5));
         let make = |ratio: f64| Metrics {
             max_abs: 0.2 * ratio,
             mean_abs: 0.01 * ratio,
@@ -907,12 +889,13 @@ mod tests {
 
     #[test]
     fn per_layer_cosine_schema_controls_acceptance() -> Result<()> {
-        let legacy: HiddenLimit = serde_json::from_str("0.2")?;
-        let current: HiddenLimit = serde_json::from_str(r#"{"rel":0.2,"cos_min":0.99}"#)?;
+        let limit: LayerLimit = serde_json::from_str(r#"{"rel":0.2,"cos_min":0.99}"#)?;
+        let strict: LayerLimit = serde_json::from_str(r#"{"rel":0.2,"cos_min":0.999}"#)?;
         let m = metrics(&[1.0, 0.1], &[1.0, 0.0])?;
-        assert!(!legacy.value().accepts(&m));
-        assert!(current.value().accepts(&m));
-        assert!(serde_json::from_str::<HiddenLimit>(r#"{"rel":0.2}"#).is_err());
+        assert!(limit.accepts(&m));
+        assert!(!strict.accepts(&m));
+        assert!(serde_json::from_str::<LayerLimit>("0.2").is_err());
+        assert!(serde_json::from_str::<LayerLimit>(r#"{"rel":0.2}"#).is_err());
         Ok(())
     }
 
@@ -922,15 +905,15 @@ mod tests {
         let got = [10098.0, 1.0, -1.0];
         let m = metrics(&got, &reference)?;
         assert_eq!(m.max_abs, 98.0);
-        assert!(m.rel_rmse < 0.05 && m.cosine >= COSINE_MIN);
+        assert!(m.rel_rmse < 0.05 && m.cosine >= 0.999);
         let m = metrics(&[0.0, 10.0, -1.0], &reference)?;
-        assert!(m.rel_rmse > 0.05 || m.cosine < COSINE_MIN);
+        assert!(m.rel_rmse > 0.05 || m.cosine < 0.999);
         Ok(())
     }
 
     #[test]
     fn near_tie_and_single_step_warnings_do_not_excuse_wrong_tokens() -> Result<()> {
-        let rules = Rules::read(None, None, Path::new("p1.safetensors"), 42)?;
+        let rules = rules(64, (0.1, 1.5), (0.1, 1.5), (f64::INFINITY, f64::INFINITY));
         let r = Reference {
             input: vec![0],
             greedy: vec![0],
@@ -954,9 +937,7 @@ mod tests {
 
     #[test]
     fn outlier_counts_are_independent_per_metric_and_use_binomial_significance() -> Result<()> {
-        let mut rules = Rules::read(None, None, Path::new("p1.safetensors"), 42)?;
-        rules.logits_mean = vec![0.1; 256];
-        rules.logits_max = vec![1.5; 256];
+        let rules = rules(256, (0.1, 1.5), (0.1, 1.5), (f64::INFINITY, f64::INFINITY));
         let mut values: Vec<_> = (0..256)
             .map(|_| Metrics {
                 max_abs: 1.0,
@@ -983,12 +964,12 @@ mod tests {
 
     #[test]
     fn binomial_count_cutoffs_match_the_approved_64_and_256_step_cases() -> Result<()> {
-        assert!(outlier_p_value(64, 2, OUTLIER_RATE)? > OUTLIER_ALPHA);
-        assert!(outlier_p_value(64, 3, OUTLIER_RATE)? < OUTLIER_ALPHA);
-        assert!(outlier_p_value(256, 4, OUTLIER_RATE)? > OUTLIER_ALPHA);
-        assert!(outlier_p_value(256, 5, OUTLIER_RATE)? < OUTLIER_ALPHA);
-        assert_eq!(outlier_p_value(256, 0, OUTLIER_RATE)?, 1.0);
-        assert!(outlier_p_value(64, 65, OUTLIER_RATE).is_err());
+        assert!(outlier_p_value(64, 2, RATE)? > ALPHA);
+        assert!(outlier_p_value(64, 3, RATE)? < ALPHA);
+        assert!(outlier_p_value(256, 4, RATE)? > ALPHA);
+        assert!(outlier_p_value(256, 5, RATE)? < ALPHA);
+        assert_eq!(outlier_p_value(256, 0, RATE)?, 1.0);
+        assert!(outlier_p_value(64, 65, RATE).is_err());
         Ok(())
     }
 

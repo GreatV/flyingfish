@@ -2342,16 +2342,15 @@ mod tests {
 ///   3. a negative control (a/b bindings swapped) that must fail on numbers;
 ///   4. end-to-end against the oracle for both phases plus a nonzero-prefix continuation.
 ///
-/// Bounds are per-case: cases at >= 20k elements use the fraction term (5e-4) plus the case's
-/// own `scaled` basis; smaller cases use a count bound.
+/// Bounds are per-case: the fraction term plus the case's own `scaled` basis where the manifest's
+/// count bound over the element count falls below its fraction bound; the count bound otherwise.
 #[cfg(test)]
 mod gpu_probe {
     use super::*;
-    use crate::backend::cuda::Device;
+    use crate::backend::cuda::{Device, gamma};
     use crate::op_contract::{ExecutionPhase, SequenceMeta};
     use cudarc::driver::{CudaSlice, DevicePtr};
     use std::path::PathBuf;
-    const FLOOR_REL: f64 = 1e-3;
     /// core_out marker for rows at or past valid_rows; finite.
     const TAIL_MARKER: f32 = 1234.0;
     /// bf16 NaN (0x7FC0), written into input rows at or past valid_rows.
@@ -2367,11 +2366,11 @@ mod gpu_probe {
     }
 
     /// The gate's comparator, on BF16-rounded values.
-    fn terms(got: &[bf16], reference: &[bf16], valid: usize) -> Terms {
+    fn terms(got: &[bf16], reference: &[bf16], man: &Man) -> Terms {
         let qwen = GdnSpec::q38();
         let heads = qwen.hv as usize;
         let dv = DV as usize;
-        let rows = valid;
+        let rows = man.valid;
         let f = |x: &bf16| f64::from(x.to_f32());
         let mut rms = vec![0f64; rows * heads];
         for m in 0..rows {
@@ -2386,7 +2385,7 @@ mod gpu_probe {
         }
         let mut sorted = rms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let floor = sorted[sorted.len() / 2] * FLOOR_REL;
+        let floor = sorted[sorted.len() / 2] * man.floor_rel;
         let mut t = Terms {
             scaled: 0.0,
             dead_max: 0.0,
@@ -2430,6 +2429,7 @@ mod gpu_probe {
         prefix: i32,
         capacity: i32,
         plan_rows: u32,
+        floor_rel: f64,
         scaled_bound: f64,
         degenerate: bool,
         frac_bound: Option<f64>,
@@ -2451,6 +2451,8 @@ mod gpu_probe {
             let m: serde_json::Value = serde_json::from_str(&text).expect("manifest json");
             let bounds = &m["bounds"];
             let elems = m["valid_rows"].as_u64().unwrap() * qwen.hv as u64 * DV as u64;
+            let count_bound = bounds["count_bound"].as_u64().unwrap() as usize;
+            let frac_bound = bounds.get("frac_bound").and_then(|v| v.as_f64());
             Man {
                 mode: m["mode"].as_str().unwrap().to_string(),
                 valid: m["valid_rows"].as_u64().unwrap() as usize,
@@ -2459,17 +2461,17 @@ mod gpu_probe {
                 plan_rows: m["plan_rows"]
                     .as_u64()
                     .unwrap_or(m["valid_rows"].as_u64().unwrap()) as u32,
+                floor_rel: m["floor_rel"].as_f64().unwrap(),
                 scaled_bound: bounds["scaled_bound"].as_f64().unwrap(),
                 degenerate: bounds
                     .get("scaled_bound_degenerate")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
                     || bounds["scaled_bound"].as_f64().unwrap() == 0.0,
-                frac_bound: bounds.get("frac_bound").and_then(|v| v.as_f64()),
-                count_bound: if elems >= 20_000 {
-                    None
-                } else {
-                    Some(bounds["count_bound"].as_u64().unwrap() as usize)
+                frac_bound,
+                count_bound: match frac_bound {
+                    Some(frac) if (count_bound as f64) < frac * elems as f64 => None,
+                    _ => Some(count_bound),
                 },
                 rule: bounds
                     .get("rule")
@@ -2712,15 +2714,15 @@ mod gpu_probe {
     }
 
     /// The per-case gate, three terms:
-    ///   (a) COUNT: the per-case count bound below 20k elements; the fraction bound (<= 5e-4) at >= 20k.
+    ///   (a) COUNT: the fraction bound where count_bound / elems < frac_bound; the count bound otherwise.
     ///   (b) SCALED against the case's own basis; informational when the basis is 0 and for rec_m1.
     ///   (c) the dead-row absolute term against the floor; always binds.
     ///
-    /// The scaled comparison is `measured <= basis` in f64 with `RMS_ULP_TOL` relative slack.
+    /// The scaled comparison is `measured <= basis` in f64 with γ_DV(f64::EPSILON) relative slack.
     fn check_core(case: &str, man: &Man, got: &[bf16], reference: &[bf16]) -> Terms {
         let qwen = GdnSpec::q38();
         let elems = man.valid * qwen.hv as usize * DV as usize;
-        let t = terms(got, reference, man.valid);
+        let t = terms(got, reference, man);
         let frac = t.ndiff as f64 / elems as f64;
         let degenerate = man.degenerate;
         let (rule, scaled_informational) = if degenerate {
@@ -2789,11 +2791,10 @@ mod gpu_probe {
         }
         // (b) scaled, when it is a constraint
         if !scaled_informational {
-            // The basis and the measured row RMS are 128-term f64 reductions in different orders;
-            // the slack covers f64 rounding only.
-            const RMS_ULP_TOL: f64 = 8.0 * f64::EPSILON;
+            // The basis and the measured row RMS are DV-term f64 reductions in different orders.
+            let slack = gamma(DV as usize, f64::EPSILON);
             assert!(
-                t.scaled <= man.scaled_bound * (1.0 + RMS_ULP_TOL),
+                t.scaled <= man.scaled_bound * (1.0 + slack),
                 "{case}: scaled {:.17e} > per-case basis {:.17e} (excess {:.3e} relative) [{rule}]",
                 t.scaled,
                 man.scaled_bound,
@@ -3041,7 +3042,6 @@ mod gpu_probe {
             let ref_rec = case2.man.bf16("ref_core_other.bf16", elems);
             let man_rec = {
                 let mut m = Man::load("prefill_m1");
-                m.scaled_bound = f64::INFINITY; // same count rule; scaled not the operative term
                 m.count_bound = Some(4);
                 m
             };
@@ -3076,7 +3076,7 @@ mod gpu_probe {
             run_case(&device, &case, common, ExecutionPhase::Prefill, true)?;
             let got = s.clone_dtoh(&case.dev_core)?;
             let reference = case.man.bf16("ref_core.bf16", elems);
-            let t = terms(&got[..elems], &reference, case.man.valid);
+            let t = terms(&got[..elems], &reference, &case.man);
             let frac = t.ndiff as f64 / elems as f64;
             println!(
                 "  control(swapped a/b): scaled={:.3e} frac={:.3e} (bounds {:.3e} / {:?})",

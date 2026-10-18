@@ -136,6 +136,7 @@ impl Reference {
                 tokens: std::array::from_fn(|j| values[i * 4 + j]),
                 logp: std::array::from_fn(|j| f32::from_bits(values[p * 4 + i * 4 + j])),
                 lse: f32::from_bits(values[p * 8 + i]),
+                vocab: 130560,
             })
             .collect())
     }

@@ -23,11 +23,45 @@ const CASES: [&str; 10] = [
     "many-11",
 ];
 
-/// Reference-only preprocess noise floor: torchvision vs PIL processor, max 0.0156863257 normalized
-/// (2 u8 levels), `evidence/T0-ref/preprocess_noise_floor.json` sha256
-/// `3431df00de14adfbd0b50c5ef650319523412b8278cce25fa2fb9ef115ea02c1`; the 4·EPS slack covers
-/// f32 accumulation, not candidate measurements.
-const PIXEL_TOLERANCE: f32 = 4.0 / 255.0 + 4.0 * f32::EPSILON;
+/// Measured torchvision-vs-PIL preprocess floor: the largest `tv_vs_pil_diff.max_abs` over all
+/// images in `FF_MINICPM_PREPROCESS_FLOOR`, plus 4·EPS for the f32 normalization.
+fn pixel_tolerance() -> Result<f32> {
+    let path = PathBuf::from(
+        std::env::var_os("FF_MINICPM_PREPROCESS_FLOOR")
+            .context("FF_MINICPM_PREPROCESS_FLOOR missing")?,
+    );
+    let floor: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let images = floor["images"]
+        .as_object()
+        .context("preprocess floor has no images")?;
+    ensure!(!images.is_empty(), "preprocess floor has no images");
+    let mut worst = 0f64;
+    for (name, image) in images {
+        worst = worst.max(
+            image["tv_vs_pil_diff"]["max_abs"]
+                .as_f64()
+                .with_context(|| format!("preprocess floor {name} max_abs"))?,
+        );
+    }
+    Ok(worst as f32 + 4.0 * f32::EPSILON)
+}
+
+/// Measured reference floor `(k, rms)` for `case`/`tap` from `FF_MINICPM_TOLERANCES`; `k` is in
+/// half-BF16-ulp units of `max(|reference|, rms)`.
+fn measured_floor(case: &str, tap: &str) -> Result<(f64, f32)> {
+    let path = PathBuf::from(
+        std::env::var_os("FF_MINICPM_TOLERANCES").context("FF_MINICPM_TOLERANCES missing")?,
+    );
+    let table: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let entry = &table[case][tap];
+    let k = entry["k"]
+        .as_f64()
+        .with_context(|| format!("missing k {case}/{tap}"))?;
+    let rms = entry["rms"]
+        .as_f64()
+        .with_context(|| format!("missing rms {case}/{tap}"))?;
+    Ok((k, rms as f32))
+}
 
 fn tensor_values<T, const N: usize>(
     tensors: &SafeTensors<'_>,
@@ -47,12 +81,13 @@ fn tensor_values<T, const N: usize>(
 }
 
 #[test]
-#[ignore = "CPU-only external fixtures; set FF_MODEL and FF_MINICPM_FIXTURE_DIR"]
+#[ignore = "CPU-only external fixtures; set FF_MODEL, FF_MINICPM_FIXTURE_DIR and FF_MINICPM_PREPROCESS_FLOOR"]
 fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
     let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
     let fixtures = PathBuf::from(
         std::env::var_os("FF_MINICPM_FIXTURE_DIR").context("FF_MINICPM_FIXTURE_DIR missing")?,
     );
+    let pixel_tolerance = pixel_tolerance()?;
     let spec = ModelSpec::read(&model)?;
     ensure!(
         spec.architecture == Architecture::MiniCpmV47,
@@ -157,8 +192,8 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
             })
         );
         assert!(
-            worst <= PIXEL_TOLERANCE,
-            "{case} pixel error {worst} exceeds {PIXEL_TOLERANCE}"
+            worst <= pixel_tolerance,
+            "{case} pixel error {worst} exceeds the measured preprocess floor {pixel_tolerance}"
         );
 
         let plan = prepared.input(&expanded).validate(&spec, capacity)?;
@@ -310,9 +345,10 @@ fn video_prompt(ids: &[u32], vision: &flyingfish::model_spec::VisionConfig) -> R
 }
 
 #[test]
-#[ignore = "CPU-only external fixtures; set FF_MODEL and FF_VIDEO_REF_DIR"]
+#[ignore = "CPU-only external fixtures; set FF_MODEL, FF_VIDEO_REF_DIR and FF_MINICPM_PREPROCESS_FLOOR"]
 fn video_processor_and_canvas_match_reference() -> Result<()> {
     let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let pixel_tolerance = pixel_tolerance()?;
     let ref_dir = video_ref_dir()?;
     let spec = ModelSpec::read(&model)?;
     ensure!(
@@ -426,8 +462,8 @@ fn video_processor_and_canvas_match_reference() -> Result<()> {
             pil_floor = pil_floor.max((primary - pil).abs());
         }
         assert!(
-            pil_floor <= PIXEL_TOLERANCE,
-            "{case} PIL noise floor {pil_floor} exceeds {PIXEL_TOLERANCE}"
+            pil_floor <= pixel_tolerance,
+            "{case} PIL noise floor {pil_floor} exceeds the measured preprocess floor {pixel_tolerance}"
         );
         println!(
             "{}",
@@ -440,8 +476,8 @@ fn video_processor_and_canvas_match_reference() -> Result<()> {
             })
         );
         assert!(
-            worst <= PIXEL_TOLERANCE,
-            "{case} pixel error {worst} exceeds {PIXEL_TOLERANCE}"
+            worst <= pixel_tolerance,
+            "{case} pixel error {worst} exceeds the measured preprocess floor {pixel_tolerance}"
         );
         let clip_meta = &reference["clips"][clip]["ffprobe"];
         let real = VideoMetadata {
@@ -463,7 +499,7 @@ fn video_processor_and_canvas_match_reference() -> Result<()> {
 }
 
 #[test]
-#[ignore = "CPU-only external fixtures; set FF_MODEL and FF_VIDEO_REF_DIR"]
+#[ignore = "CPU-only external fixtures; set FF_MODEL, FF_VIDEO_REF_DIR and FF_MINICPM_PREPROCESS_FLOOR"]
 fn video_canvas_positions_match_reference() -> Result<()> {
     let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
     let ref_dir = video_ref_dir()?;
@@ -749,9 +785,9 @@ fn checkpoint_bf16(model_dir: &std::path::Path, name: &str) -> Result<(Vec<usize
 
 /// Pins the NaViT pack order at the patch embedding: the correct (c, ky, patch, kx) gather plus the
 /// position add reproduces the T0 hockey tap, while a ky/kx-transposed gather must fail.
-/// Measured on CPU (torch): correct 0.0625, transposed 6.4375 max_abs; the tolerance sits between.
+/// The verdict is the measured `vision_patch_embeddings` reference floor `k`.
 #[test]
-#[ignore = "CPU-only external fixtures; set FF_MODEL and FF_MINICPM_REFERENCE_DIR; run with --release"]
+#[ignore = "CPU-only external fixtures; set FF_MODEL, FF_MINICPM_REFERENCE_DIR and FF_MINICPM_TOLERANCES; run with --release"]
 fn patch_rows_reorder_matches_the_reference() -> Result<()> {
     use flyingfish::vision_input::{ImageGrid, nearest_position_ids};
     let model_dir = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
@@ -810,7 +846,8 @@ fn patch_rows_reorder_matches_the_reference() -> Result<()> {
     );
     let ids = nearest_position_ids(&grids, vision.position_side)?;
     ensure!(ids.len() == patches, "one position id per patch");
-    let mut worst = [0f32; 2];
+    let (k, rms) = measured_floor("image_hockey_16x", "vision_patch_embeddings")?;
+    let mut worst = [0f64; 2];
     for (arm, transposed) in [false, true].into_iter().enumerate() {
         let rows = patch_rows(&pixels, patches, channels, side, transposed);
         let embedded = patch_embedding(&rows, &weight, &bias, patches, hidden, width);
@@ -822,27 +859,19 @@ fn patch_rows_reorder_matches_the_reference() -> Result<()> {
                 added[patch * hidden + o] = half::bf16::from_f32(sum).to_f32();
             }
         }
-        let mut diff = 0f32;
-        let mut mean = 0f64;
-        for (a, r) in added.iter().zip(&reference) {
-            diff = diff.max((a - r).abs());
-            mean += f64::from((a - r).abs());
-        }
-        worst[arm] = diff;
+        worst[arm] = flyingfish::verify::half_ulp_ratio(&added, &reference, rms);
         println!(
             "{}",
-            serde_json::json!({"patch_rows": {"transposed": transposed, "max_abs": diff,
-                "mean_abs": mean / added.len() as f64}})
+            serde_json::json!({"patch_rows": {"transposed": transposed, "max_half_ulp_ratio": worst[arm], "k": k}})
         );
     }
-    let tolerance = 0.25;
     ensure!(
-        worst[0] <= tolerance,
-        "interleaved patch rows exceed the reference tolerance: {} > {tolerance}",
+        worst[0] <= k,
+        "interleaved patch rows exceed the measured reference floor: {} > {k}",
         worst[0]
     );
     ensure!(
-        worst[1] > tolerance,
+        worst[1] > k,
         "the ky/kx-transposed mutant must fail, measured {}",
         worst[1]
     );
@@ -899,7 +928,7 @@ fn matmul_f32(
 /// `merge_groups` map must reproduce the T0 merger output from the fixture tower output, while
 /// contiguous four-row chunks must fail.
 #[test]
-#[ignore = "CPU-only external fixtures; set FF_MODEL and FF_MINICPM_REFERENCE_DIR; run with --release"]
+#[ignore = "CPU-only external fixtures; set FF_MODEL, FF_MINICPM_REFERENCE_DIR and FF_MINICPM_TOLERANCES; run with --release"]
 fn final_merger_groups_match_the_reference() -> Result<()> {
     use flyingfish::vision_input::merge_groups;
     let model_dir = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
@@ -960,7 +989,8 @@ fn final_merger_groups_match_the_reference() -> Result<()> {
     let row_grids = [(h / 2, w / 2)];
     let groups = merge_groups(&row_grids, 2)?;
     ensure!(groups.len() == tokens * 4, "group map extent");
-    let mut worst = [0f32; 2];
+    let (k, rms) = measured_floor("image_hockey_16x", "merger_out")?;
+    let mut worst = [0f64; 2];
     for (arm, contiguous) in [false, true].into_iter().enumerate() {
         let mut out = vec![0f32; tokens * output];
         for token in 0..tokens {
@@ -988,24 +1018,19 @@ fn final_merger_groups_match_the_reference() -> Result<()> {
             let row = matmul_f32(&activated, &l2_w, &l2_b, 1, fc1, output);
             out[token * output..][..output].copy_from_slice(&row);
         }
-        let mut diff = 0f32;
-        for (a, r) in out.iter().zip(&reference) {
-            diff = diff.max((a - r).abs());
-        }
-        worst[arm] = diff;
+        worst[arm] = flyingfish::verify::half_ulp_ratio(&out, &reference, rms);
         println!(
             "{}",
-            serde_json::json!({"merger_groups": {"contiguous": contiguous, "max_abs": diff}})
+            serde_json::json!({"merger_groups": {"contiguous": contiguous, "max_half_ulp_ratio": worst[arm], "k": k}})
         );
     }
-    let tolerance = 0.25;
     ensure!(
-        worst[0] <= tolerance,
-        "grouped merger exceeds the reference tolerance: {} > {tolerance}",
+        worst[0] <= k,
+        "grouped merger exceeds the measured reference floor: {} > {k}",
         worst[0]
     );
     ensure!(
-        worst[1] > tolerance,
+        worst[1] > k,
         "the contiguous-grouping mutant must fail, measured {}",
         worst[1]
     );

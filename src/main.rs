@@ -137,14 +137,12 @@ enum Command {
         input: Input,
         #[arg(long, default_value_t = 64)]
         steps: usize,
-        #[arg(long, requires = "prompt_name", required_unless_present_any = ["strict", "provisional_near_ties"])]
+        #[arg(long, requires = "prompt_name", required_unless_present = "strict")]
         logit_limits: Option<PathBuf>,
         #[arg(long, requires = "logit_limits")]
         prompt_name: Option<String>,
         #[arg(long, conflicts_with = "logit_limits")]
         strict: bool,
-        #[arg(long, conflicts_with_all = ["strict", "logit_limits"])]
-        provisional_near_ties: bool,
         #[arg(long)]
         reference: Option<PathBuf>,
     },
@@ -688,7 +686,6 @@ fn run() -> Result<()> {
             logit_limits,
             prompt_name,
             strict,
-            provisional_near_ties,
             reference,
         } => {
             let draft = cli
@@ -697,17 +694,7 @@ fn run() -> Result<()> {
                 .context("verify-spec requires --draft-model")?
                 .canonicalize()?;
             eprintln!("draft_model={}", draft.display());
-            let limits: Vec<f64> = if *provisional_near_ties {
-                eprintln!(
-                    "spec comparison=approved max_abs floor 1.5; margin source {}",
-                    if reference.is_some() {
-                        "FP32 peer fixture"
-                    } else {
-                        "engine BF16; provisional pending FP32 recheck"
-                    }
-                );
-                vec![1.5; *steps]
-            } else if *strict {
+            let limits: Vec<f64> = if *strict {
                 eprintln!("spec comparison=strict exact; near-tie exceptions disabled");
                 vec![0.0; *steps]
             } else {
@@ -739,7 +726,7 @@ fn run() -> Result<()> {
                 match (logit_limits.as_deref(), reference.as_deref()) {
                     (Some(limits), Some(reference)) => Some(flyingfish::verify::Rules::read(
                         None,
-                        Some(limits),
+                        limits,
                         reference,
                         Config::read(&cli.model)?.num_hidden_layers,
                     )?),
@@ -911,7 +898,7 @@ fn run() -> Result<()> {
             let config = Config::read(&cli.model)?;
             let rules = flyingfish::verify::Rules::read(
                 Some(hidden_limits),
-                Some(logit_limits),
+                logit_limits,
                 fixture,
                 config.num_hidden_layers,
             )?;
@@ -933,7 +920,7 @@ fn run() -> Result<()> {
             let config = Config::read(&cli.model)?;
             let rules = flyingfish::verify::Rules::read(
                 Some(hidden_limits),
-                Some(logit_limits),
+                logit_limits,
                 fixture,
                 config.num_hidden_layers,
             )?;
@@ -954,7 +941,7 @@ fn run() -> Result<()> {
             let config = Config::read(&cli.model)?;
             let rules = flyingfish::verify::Rules::read(
                 Some(hidden_limits),
-                Some(logit_limits),
+                logit_limits,
                 fixture,
                 config.num_hidden_layers,
             )?;

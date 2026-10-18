@@ -20,7 +20,7 @@ struct Differences {
     lse: usize,
     max_logp_abs: f64,
     max_lse_abs: f64,
-    actual_mass_max: f64,
+    mass_over_bound_max: f64,
 }
 
 impl Differences {
@@ -34,9 +34,15 @@ impl Differences {
         self.tokens += usize::from(actual.tokens != expected.tokens);
         self.logp += usize::from(actual.logp.map(f32::to_bits) != expected.logp.map(f32::to_bits));
         self.lse += usize::from(actual.lse.to_bits() != expected.lse.to_bits());
-        self.actual_mass_max = self
-            .actual_mass_max
-            .max(actual.logp.iter().map(|&v| f64::from(v).exp()).sum());
+        let mass: f64 = actual.logp.iter().map(|&v| f64::from(v).exp()).sum();
+        let max_abs = actual
+            .logp
+            .iter()
+            .map(|&v| -f64::from(v))
+            .fold(0.0, f64::max);
+        self.mass_over_bound_max = self
+            .mass_over_bound_max
+            .max(mass / crate::tree::f32_mass_bound(actual.vocab, max_abs));
         for (&a, &b) in actual.logp.iter().zip(&expected.logp) {
             self.max_logp_abs = self.max_logp_abs.max((f64::from(a) - f64::from(b)).abs());
         }
@@ -63,6 +69,7 @@ fn bit_diagnostics_keep_float_and_token_differences_separate() {
         tokens: [0, 1, 2, 3],
         logp: [-4.0, -5.0, -6.0, -7.0],
         lse: 1.0,
+        vocab: 130560,
     };
     let mut actual = expected.clone();
     actual.logp[0] = f32::from_bits(actual.logp[0].to_bits() + 1);
@@ -337,13 +344,13 @@ fn top4_matches_reference() -> Result<()> {
     }
     println!(
         "{}",
-        serde_json::json!({"markov_reference_summary":{"requests_compared":compared,"pass":differences.tokens==0 && differences.actual_mass_max<=1.000001,"differences":differences,"rule":"top4 token bits equal; FP32 bit equality is diagnostic; FP64 accuracy checked separately"}})
+        serde_json::json!({"markov_reference_summary":{"requests_compared":compared,"pass":differences.tokens==0 && differences.mass_over_bound_max<=1.0,"differences":differences,"rule":"top4 token bits equal; FP32 bit equality is diagnostic; FP64 accuracy checked separately"}})
     );
     ensure!(
-        differences.tokens == 0 && differences.actual_mass_max <= 1.000001,
-        "Markov v1/version token differences={} probability mass={}",
+        differences.tokens == 0 && differences.mass_over_bound_max <= 1.0,
+        "Markov v1/version token differences={} probability mass over f32 bound={}",
         differences.tokens,
-        differences.actual_mass_max
+        differences.mass_over_bound_max
     );
     Ok(())
 }

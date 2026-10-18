@@ -704,14 +704,12 @@ mod tests {
 mod probe {
     //! GPU probe of `workspace` -> `prepare` -> `run` for the attention stage and the merger, with negative controls.
     use super::*;
-    use crate::backend::cuda::Device;
     use crate::backend::cuda::closure::Closure;
     use crate::backend::cuda::ops::Ops;
+    use crate::backend::cuda::{Device, bf16_chain_bound};
     use cudarc::driver::{CudaSlice, DevicePtr};
     use std::rc::Rc;
 
-    const BF16_ULP: f32 = 1.0 / 256.0;
-    const BOUND: f32 = 8.0 * BF16_ULP;
     /// From `kernels/vision_rope.cu` / `kernels/vision_attn.cu` (private there).
     const THETA: f32 = 1.0e4;
     const SCALE: f32 = 0.11785113; // fp32 nearest to 72**-0.5, same bits as the kernel
@@ -1019,10 +1017,13 @@ mod probe {
         let got: Vec<f32> = s.clone_dtoh(&dev_o)?.iter().map(|v| v.to_f32()).collect();
         let reference = reference_attn(&grids, &q_in, &k_in, &v_pad, &kb);
         let (err, rel) = max_rel(&got, &reference);
-        eprintln!("Q38_VISION_ATTN_BINDER max|d|={err:.3e} rel={rel:.3e} bound={BOUND:.3e}");
+        let keys = grids.iter().map(|g| (g.h * g.w) as usize).max().unwrap();
+        // BF16 roundings: rotated Q, rotated K, P, O. FP32 reductions: QK over D, softmax sum and PV over the image keys.
+        let bound = bf16_chain_bound(4, &[d, keys, keys]) as f32;
+        eprintln!("Q38_VISION_ATTN_BINDER max|d|={err:.3e} rel={rel:.3e} bound={bound:.3e}");
         ensure!(
-            rel <= BOUND,
-            "attention binder output differs from the fp32 reference: rel={rel:.3e} bound={BOUND:.3e}"
+            rel <= bound,
+            "attention binder output differs from the fp32 reference: rel={rel:.3e} bound={bound:.3e}"
         );
 
         // Negative control: Q rows swapped between the two images must exceed the bound.
@@ -1079,10 +1080,13 @@ mod probe {
         s.synchronize()?;
         let got2: Vec<f32> = s.clone_dtoh(&dev_o)?.iter().map(|v| v.to_f32()).collect();
         let (_, ctl_rel) = max_rel(&got2, &reference);
-        eprintln!("Q38_VISION_ATTN_CONTROL rel={ctl_rel:.3e} (must exceed {BOUND:.3e})");
+        eprintln!(
+            "Q38_VISION_ATTN_CONTROL rel={ctl_rel:.3e} bound={bound:.3e} rel/bound={:.3}",
+            ctl_rel / bound
+        );
         ensure!(
-            ctl_rel > BOUND,
-            "negative control was not rejected: rel={ctl_rel:.3e} bound={BOUND:.3e}"
+            ctl_rel > bound,
+            "negative control was not rejected: rel={ctl_rel:.3e} bound={bound:.3e}"
         );
 
         // Merger stage: 8 rows, two merged tokens.
@@ -1164,19 +1168,24 @@ mod probe {
         };
         let mref = reference_merger(&x, mrows, &mw, false);
         let (merr, mrel) = max_rel(&mgot, &mref);
-        eprintln!("Q38_VISION_MERGER_BINDER max|d|={merr:.3e} rel={mrel:.3e} bound={BOUND:.3e}");
+        // BF16 roundings: LayerNorm, fc1, GELU, fc2. FP32 reductions: LayerNorm mean and variance over HIDDEN, fc1 and fc2 over MERGER_FC1.
+        let mbound = bf16_chain_bound(4, &[hidden, hidden, fc1, fc1]) as f32;
+        eprintln!("Q38_VISION_MERGER_BINDER max|d|={merr:.3e} rel={mrel:.3e} bound={mbound:.3e}");
         ensure!(
-            mrel <= BOUND,
-            "merger binder output differs from the fp32 reference: rel={mrel:.3e} bound={BOUND:.3e}"
+            mrel <= mbound,
+            "merger binder output differs from the fp32 reference: rel={mrel:.3e} bound={mbound:.3e}"
         );
 
         // Negative control: block-wise (post-shuffle) LayerNorm statistics must exceed the bound.
         let mctl = reference_merger(&x, mrows, &mw, true);
         let (_, mctl_rel) = max_rel(&mgot, &mctl);
-        eprintln!("Q38_VISION_MERGER_CONTROL rel={mctl_rel:.3e} (must exceed {BOUND:.3e})");
+        eprintln!(
+            "Q38_VISION_MERGER_CONTROL rel={mctl_rel:.3e} bound={mbound:.3e} rel/bound={:.3}",
+            mctl_rel / mbound
+        );
         ensure!(
-            mctl_rel > BOUND,
-            "post-shuffle-norm negative control was not rejected: rel={mctl_rel:.3e} bound={BOUND:.3e}"
+            mctl_rel > mbound,
+            "post-shuffle-norm negative control was not rejected: rel={mctl_rel:.3e} bound={mbound:.3e}"
         );
 
         eprintln!("Q38_VISION_BINDER_PROBE PASS");
