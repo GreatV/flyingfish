@@ -117,7 +117,6 @@ struct Tables {
 }
 
 impl Tables {
-    #[cfg(test)]
     fn new(device: &Device, experts: usize, cohorts: usize) -> Result<Self> {
         let words = experts
             .checked_mul(cohorts)
@@ -268,7 +267,6 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     pub stats: [u64; 8],
 }
 
-#[cfg(test)]
 pub(in crate::backend::cuda::engine) fn cpu_bound(
     geometry: ExpertGeometry,
     slot_bytes: u64,
@@ -319,7 +317,6 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
 }
 
 impl Prefill {
-    #[cfg(test)]
     pub(in crate::backend::cuda::engine) fn new(
         device: &Device,
         slots: &mut Slots,

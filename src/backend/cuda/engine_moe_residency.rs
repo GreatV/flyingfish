@@ -13,7 +13,6 @@ use std::cell::RefCell;
 #[path = "engine_moe_prefill.rs"]
 mod prefill;
 pub(in crate::backend::cuda::engine) use prefill::Prefill;
-#[cfg(test)]
 pub(super) use prefill::cpu_bound;
 
 #[derive(Clone)]
@@ -41,7 +40,6 @@ fn event_index(id: u64, ids: &[u64]) -> Result<usize> {
 }
 
 impl Events {
-    #[cfg(test)]
     fn new(context: &Arc<CudaContext>, count: usize) -> Result<Self> {
         ensure!(count > 0, "empty expert event pool");
         Ok(Self {
@@ -96,7 +94,6 @@ struct Reader {
 }
 
 impl Reader {
-    #[cfg(test)]
     fn new(device: &Device, disk: DiskReader, catalogue: &ExpertCatalogue) -> Result<Self> {
         let slots = disk.ring_slots() as usize;
         let mut reader = Self {
@@ -198,7 +195,6 @@ pub(in crate::backend::cuda::engine) struct Transfers {
 }
 
 impl Transfers {
-    #[cfg(test)]
     fn new(
         device: &Device,
         storage: &super::super::super::weights::ExpertStorage,
@@ -434,7 +430,6 @@ struct Physical {
     waited: bool,
 }
 
-#[cfg(test)]
 pub(super) struct Load<'a> {
     pub capacity: &'a crate::experts::plan::Capacity,
     pub admission: crate::experts::plan::Admission,
@@ -524,7 +519,6 @@ fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
 }
 
 impl Slots {
-    #[cfg(test)]
     pub(super) fn load(device: &Device, geometry: ExpertGeometry, input: Load<'_>) -> Result<Self> {
         ensure!(
             input.catalogue.geometry() == geometry,
@@ -625,6 +619,7 @@ impl Slots {
                 None
             },
             request_open: false,
+            #[cfg(test)]
             pending_reads: 0,
         };
         device.upload.wait(&device.stream.record_event(None)?)?;

@@ -2629,6 +2629,10 @@ impl Engine {
 
     pub fn capture(&mut self) -> Result<()> {
         ensure!(
+            self.moe.is_none(),
+            "MoE segmented decode graphs are not bound"
+        );
+        ensure!(
             self.spec.is_none(),
             "graph decode is not declared for draft-enabled engines"
         );
@@ -4260,6 +4264,9 @@ impl Engine {
     }
 
     fn prepare_graphs(&mut self) -> Result<()> {
+        if self.graphs.is_empty() {
+            return Ok(());
+        }
         self.set_token(0)?;
         if self.spec.is_none() {
             self.capture()?;
@@ -4269,9 +4276,6 @@ impl Engine {
                 .launch()?;
             self.device.stream.synchronize()?;
             self.check_logits()?;
-            return Ok(());
-        }
-        if self.graphs.is_empty() {
             return Ok(());
         }
         let injections: Vec<_> = self

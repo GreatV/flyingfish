@@ -12,7 +12,7 @@ use crate::backend::cuda::{
 /// The workspace alignment the default-chunk cap must preserve; the same value the budget call passes.
 const CHUNK_ALIGNMENT: usize = 32;
 /// The default chunk is bounded by the largest alignment multiple at or under the CUDA gridDim.y/z limit the GDN prep pair launches rows on.
-fn default_chunk(admitted: usize) -> usize {
+pub(super) fn default_chunk(admitted: usize) -> usize {
     admitted.min(CUDA_GRID_YZ_MAX as usize / CHUNK_ALIGNMENT * CHUNK_ALIGNMENT)
 }
 
@@ -985,14 +985,17 @@ impl Engine {
         model_spec: crate::model_spec::ModelSpec,
     ) -> Result<Self> {
         require_qwen35_geometry(&model_spec)?;
-        ensure!(
-            model_spec.moe.is_none(),
-            "MoE FFN execution is not bound: missing=expert residency architecture={:?} moe={:?}",
-            model_spec.architecture,
-            model_spec.moe
-        );
         let write = !matches!(mode, super::SetupMode::Ready);
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
+        ensure!(
+            model_spec.moe.is_none() || !reserve_mtp,
+            "MoE MTP attachment is not bound: architecture={:?}",
+            model_spec.architecture
+        );
+        ensure!(
+            model_spec.moe.is_none() || !settings.prefix_cache,
+            "MoE prefix_cache=true has no delegated-expert content identity"
+        );
         let verify_rows = match mode {
             super::SetupMode::Mtp { verify_rows } => verify_rows,
             _ => crate::mtp::MAX_VERIFY_ROWS,
@@ -1121,47 +1124,70 @@ impl Engine {
         let mtp_budget = reserve_mtp
             .then(|| crate::mtp::AttachmentBudget::new(&model_spec, capacity))
             .transpose()?;
-        let budget = crate::prefill::WorkspaceBudget::new(
-            crate::prefill::WorkspaceRequest {
-                capacity,
-                requested: requested_chunk,
-                free_after_resident: free,
-                total,
-                alignment: CHUNK_ALIGNMENT,
-                row_bytes: Runtime::row_bytes(&model_spec)?
-                    .checked_add(mtp_budget.as_ref().map_or(0, |b| b.row_bytes))
-                    .and_then(|bytes| bytes.checked_add(capture_row_bytes))
-                    .context("combined row bytes overflow")?,
-                fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
-                    .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
-                    .context("combined fixed bytes overflow")?,
-            },
-            |rows| {
-                let mut target = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?;
-                if settings.kv_format != crate::kv::KvFormat::Bf16 {
-                    target = target.max(
-                        crate::op_contract::AttentionWorkspace::new(
-                            &attention,
-                            verify_rows as u32,
-                            capacity as u32,
-                            limits(verify_rows, capacity)?.key_chunk,
-                        )?
-                        .bytes as usize,
-                    );
-                }
-                target
-                    .checked_add(
-                        mtp_budget
-                            .as_ref()
-                            .map(|b| b.workspace(rows))
-                            .transpose()?
-                            .unwrap_or(0),
-                    )
-                    .context("Q38 combined workspace overflow")
-            },
-            |admitted| Ok(default_chunk(admitted)),
-        )?;
-        let rows = budget.plan.chunk;
+        let request = crate::prefill::WorkspaceRequest {
+            capacity,
+            requested: requested_chunk,
+            free_after_resident: free,
+            total,
+            alignment: CHUNK_ALIGNMENT,
+            row_bytes: Runtime::row_bytes(&model_spec)?
+                .checked_add(mtp_budget.as_ref().map_or(0, |b| b.row_bytes))
+                .and_then(|bytes| bytes.checked_add(capture_row_bytes))
+                .context("combined row bytes overflow")?,
+            fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
+                .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
+                .context("combined fixed bytes overflow")?,
+        };
+        let expert_setup = if model_spec.moe.is_some() {
+            Some(super::moe::Setup::new(
+                &device,
+                &model_spec,
+                &catalog.manifest,
+                dir,
+                &runtime,
+                write,
+                request,
+            )?)
+        } else {
+            None
+        };
+        let dense_budget;
+        let budget = if let Some(setup) = &expert_setup {
+            &setup.workspace.mixer
+        } else {
+            dense_budget = crate::prefill::WorkspaceBudget::new(
+                request,
+                |rows| {
+                    let mut target = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?;
+                    if settings.kv_format != crate::kv::KvFormat::Bf16 {
+                        target = target.max(
+                            crate::op_contract::AttentionWorkspace::new(
+                                &attention,
+                                verify_rows as u32,
+                                capacity as u32,
+                                limits(verify_rows, capacity)?.key_chunk,
+                            )?
+                            .bytes as usize,
+                        );
+                    }
+                    target
+                        .checked_add(
+                            mtp_budget
+                                .as_ref()
+                                .map(|b| b.workspace(rows))
+                                .transpose()?
+                                .unwrap_or(0),
+                        )
+                        .context("Q38 combined workspace overflow")
+                },
+                |admitted| Ok(default_chunk(admitted)),
+            )?;
+            &dense_budget
+        };
+        let chunk = budget.plan.chunk;
+        let rows = expert_setup
+            .as_ref()
+            .map_or(chunk, |setup| setup.workspace.workspace_rows);
         ensure!(
             !reserve_mtp || rows >= verify_rows,
             "MTP chunk {rows} cannot fit {verify_rows} verification rows"
@@ -1225,7 +1251,11 @@ impl Engine {
             capture_fail_stage: None,
             qwen_device_prefix: false,
             forward_rows: (1..=rows.min(16)).collect(),
-            graphs: vec![Graph::Decode],
+            graphs: if expert_setup.is_some() {
+                Vec::new()
+            } else {
+                vec![Graph::Decode]
+            },
             closure,
             graph: None,
             poisoned: false,
@@ -1249,7 +1279,7 @@ impl Engine {
             config,
             model_spec,
             capacity,
-            chunk: rows,
+            chunk,
             workspace_rows: rows,
             trace_layer: 0,
             position: 0,
@@ -1280,23 +1310,8 @@ impl Engine {
             kv_scratch,
             verify_rows,
         )?);
-        if engine.model_spec.moe.is_some() {
-            let geometry =
-                crate::experts::catalogue::ExpertGeometry::from_model(&engine.model_spec)?;
-            let measured = super::super::calibrate::load_experts(
-                &engine.device,
-                &engine.runtime,
-                geometry,
-                engine.model_spec.expert_format,
-                &engine.closure,
-            )?;
-            engine.moe = Some(super::moe::Decode::new(
-                &engine.device,
-                geometry,
-                rows.min(8),
-                measured.service.worker_count()?,
-                (rows.min(8), rows.min(8) * geometry.top_k as usize),
-            )?);
+        if let Some(setup) = expert_setup {
+            setup.bind(&mut engine)?;
         }
         engine.prepare(1)?;
         engine.prepare_prefill_plans()?;
@@ -2036,8 +2051,8 @@ mod tests {
             minicpm,
         )
         .err()
-        .context("MoE model reached device setup")?;
-        assert!(error.to_string().contains("MoE FFN execution"), "{error}");
+        .context("MoE model reached device setup without a runtime directory")?;
+        assert!(error.to_string().contains("runtime directory"), "{error}");
         Ok(())
     }
 

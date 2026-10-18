@@ -1,7 +1,6 @@
 //! Bounded native disk reads with one owner of the registered ring.
 use super::*;
 use crate::experts::span::{Prefetch, Requested, Retired};
-#[cfg(test)]
 use std::sync::mpsc::sync_channel;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::thread::JoinHandle;
@@ -39,7 +38,6 @@ pub(super) struct ReadAhead {
 }
 
 impl ReadAhead {
-    #[cfg(test)]
     pub fn new(staging: u32, rings: u32, experts: u32) -> Result<Self> {
         ensure!(
             staging > 0 && experts > 0,

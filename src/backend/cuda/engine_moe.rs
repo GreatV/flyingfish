@@ -30,6 +30,338 @@ fn pinned_zeros<T: DeviceRepr + ValidAsZeroBits>(
     Ok(allocation)
 }
 
+pub(super) struct Setup {
+    pub workspace: crate::prefill::ExpertWorkspaceBudget,
+    capacity: crate::experts::plan::Capacity,
+    admission: crate::experts::plan::Admission,
+    measured: super::super::calibrate::ExpertCalibration,
+    catalogue: Arc<crate::experts::catalogue::ExpertCatalogue>,
+}
+
+fn host_memory() -> Result<(u64, u64)> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo")?;
+    let mut available = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|line| line.split_whitespace().next())
+        .context("expert host profile has no MemAvailable")?
+        .parse::<u64>()?
+        .checked_mul(1024)
+        .context("expert available host bytes overflow")?;
+    let groups = std::fs::read_to_string("/proc/self/cgroup")?;
+    let group = groups
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .context("expert host profile has no unified cgroup")?;
+    let mount = Path::new("/sys/fs/cgroup");
+    let mut directory = mount.join(group.trim_start_matches('/'));
+    loop {
+        let limit = std::fs::read_to_string(directory.join("memory.max"))?;
+        if limit.trim() != "max" {
+            let used = std::fs::read_to_string(directory.join("memory.current"))?
+                .trim()
+                .parse::<u64>()?;
+            available = available.min(limit.trim().parse::<u64>()?.saturating_sub(used));
+        }
+        if directory == mount {
+            break;
+        }
+        ensure!(directory.pop(), "expert cgroup has no parent: {group}");
+    }
+    let limits = std::fs::read_to_string("/proc/self/limits")?;
+    let locked = limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max locked memory"))
+        .and_then(|line| line.split_whitespace().next())
+        .context("expert host profile has no locked-memory limit")?;
+    let locked = if locked == "unlimited" {
+        available
+    } else {
+        locked.parse::<u64>()?.min(available)
+    };
+    Ok((available, locked))
+}
+
+fn host_workspace(
+    geometry: ExpertGeometry,
+    bounds: (usize, usize),
+    workers: u32,
+    copies: u32,
+) -> Result<u64> {
+    let (rows, choices) = (bounds.0 as u64, bounds.1 as u64);
+    let (h, i, k) = (
+        u64::from(geometry.hidden),
+        u64::from(geometry.intermediate),
+        u64::from(geometry.top_k),
+    );
+    let workers = u64::from(workers);
+    ensure!(workers > 0, "expert host workspace has zero workers");
+    let metadata = (size_of::<ExpertWeights>() + size_of::<Assignment>()) as u64;
+    let local = rows * h * 6
+        + rows
+        + choices * i * 2
+        + i * 4
+        + (choices * h).div_ceil(workers) * 2
+        + choices * metadata;
+    let shared = rows * h * 2 + choices * (i + h) * 2 + choices * metadata;
+    let mailboxes = rows * h * 8 + choices * (h * 4 + 16);
+    let disk = u64::from(copies) * (rows * h * 2 + rows * k * (h * 2 + 16));
+    (local * workers)
+        .checked_add(shared)
+        .and_then(|n| n.checked_add(mailboxes))
+        .and_then(|n| n.checked_add(disk))
+        .context("expert host workspace overflow")
+}
+
+impl Setup {
+    pub fn new(
+        device: &Device,
+        model: &crate::model_spec::ModelSpec,
+        manifest: &crate::checkpoint::TensorManifest,
+        directory: &Path,
+        runtime: &Path,
+        write: bool,
+        request: crate::prefill::WorkspaceRequest,
+    ) -> Result<Self> {
+        use crate::experts::plan::PlanInputs;
+        use crate::prefill::{ExpertWorkspaceBudget, ExpertWorkspaceRequest};
+        let geometry = ExpertGeometry::from_model(model)?;
+        let catalogue = Arc::new(crate::experts::catalogue::ExpertCatalogue::from_manifest(
+            manifest,
+            geometry,
+            model.expert_format,
+        )?);
+        let calibration = super::super::closure::Closure::new(
+            write,
+            format!(
+                "calibrate the expert service table for {}",
+                directory.display()
+            ),
+        );
+        let measured = super::super::calibrate::load_experts(
+            device,
+            runtime,
+            geometry,
+            model.expert_format,
+            &calibration,
+        )?;
+        let (available, locked) = host_memory()?;
+        let copies = measured.copy_engines.min(2);
+        let slot = catalogue.slot_bytes();
+        let workers = measured.service.worker_count()?;
+        let policy = crate::gdn_plan::GdnPolicy::for_device(device.info.arch, device.info.sms);
+        let vision = if model.vision.is_some() {
+            crate::checkpoint::MappedCheckpoint::open(directory)?
+                .manifest(model, crate::checkpoint::LoadPolicy::VisionOnly)?
+                .resident_bytes
+                .checked_add(request.total / 16)
+                .context("expert vision reserve overflow")?
+        } else {
+            0
+        };
+        let mut candidates = Vec::new();
+        let mut failures = Vec::new();
+        let mut spans = (0..usize::BITS)
+            .map(|shift| 1usize << shift)
+            .take_while(|&rows| rows <= request.capacity)
+            .chain([request.capacity])
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(rows) = request.requested {
+            spans.retain(|&span| span >= rows);
+        }
+        for span in spans {
+            let span_rows = u32::try_from(span)?;
+            let mut wave_rows = 1u32;
+            while wave_rows <= span_rows / 2
+                && crate::backend::cuda::moe::prefill::prefill_scratch_bytes(
+                    wave_rows as usize * 2,
+                    geometry.top_k as usize,
+                    geometry.experts as usize,
+                    geometry.hidden as usize,
+                    geometry.intermediate as usize,
+                )? <= device.info.l2_bytes as u64 / 2
+            {
+                wave_rows *= 2;
+            }
+            let cpu = residency::cpu_bound(
+                geometry,
+                slot,
+                span_rows,
+                &measured.service,
+                measured.h2d_bytes_per_second,
+            )?;
+            let scratch =
+                usize::try_from(crate::backend::cuda::moe::prefill::prefill_scratch_bytes(
+                    wave_rows as usize,
+                    geometry.top_k as usize,
+                    geometry.experts as usize,
+                    geometry.hidden as usize,
+                    geometry.intermediate as usize,
+                )?)?;
+            let decode_scratch = usize::try_from(decode_scratch_bytes(
+                1,
+                geometry.top_k as usize,
+                geometry.intermediate as usize,
+            ))?;
+            let fixed = vision
+                .checked_add(scratch)
+                .and_then(|n| {
+                    n.checked_add(geometry.layers as usize * geometry.experts as usize * 28)
+                })
+                .and_then(|n| n.checked_add(geometry.hidden as usize * 2 + 2))
+                .and_then(|n| n.checked_add(decode_scratch))
+                .context("expert fixed device reserve overflow")?;
+            let host = host_workspace(geometry, cpu, workers, copies)?
+                .checked_add(available / 16)
+                .and_then(|n| n.checked_add(u64::from(copies) * slot * 5))
+                .context("expert fixed host reserve overflow")?;
+            let candidate = ExpertWorkspaceBudget::new(
+                ExpertWorkspaceRequest {
+                    mixer: crate::prefill::WorkspaceRequest {
+                        fixed_transient_bytes: request
+                            .fixed_transient_bytes
+                            .checked_add(fixed)
+                            .context("expert mixer fixed reserve overflow")?,
+                        ..request
+                    },
+                    span_rows,
+                    wave_rows,
+                    wave_workspace_bytes: 0,
+                    device_headroom_bytes: request.total / 16,
+                    host_fixed_bytes: host,
+                    prefill_staging_slots: copies,
+                    disk_ring_slots: copies,
+                },
+                geometry,
+                slot,
+                |rows| {
+                    qwen::Runtime::workspace(
+                        model,
+                        rows.max(wave_rows as usize),
+                        request.capacity,
+                        policy,
+                    )
+                },
+                |rows| Ok(qwen::default_chunk(rows)),
+            );
+            match candidate {
+                Ok(candidate) => candidates.push(candidate),
+                Err(error) => failures.push(format!("span={span}: {error}")),
+            }
+        }
+        ensure!(
+            !candidates.is_empty(),
+            "no admitted expert workspace: {}",
+            failures.join("; ")
+        );
+        let registration = if device.ctx.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED,
+        )? != 0
+        {
+            locked.saturating_sub(u64::from(copies) * slot)
+        } else {
+            0
+        };
+        let first = &candidates[0].candidate;
+        let (index, capacity, admission) = ExpertWorkspaceBudget::select(
+            &PlanInputs {
+                geometry,
+                layout: catalogue.layout().clone(),
+                device_free_bytes: request.free_after_resident as u64,
+                host_available_bytes: available,
+                h2d_bytes_per_second: measured.h2d_bytes_per_second,
+                d2h_bytes_per_second: measured.d2h_bytes_per_second,
+                copy_engines: measured.copy_engines,
+                disk_readers: copies,
+                host_registration_bytes: registration,
+                service: &measured.service,
+                reserves: &first.reserves,
+                span_rows: first.span_rows,
+                wave_rows: first.wave_rows,
+            },
+            u32::try_from(request.capacity)?,
+            &candidates,
+        )?;
+        let workspace = candidates.swap_remove(index);
+        eprintln!(
+            "{}",
+            serde_json::json!({"expert_memory_plan": {
+                "span_rows":capacity.span_rows,"wave_rows":capacity.wave_rows,
+                "mixer_rows":workspace.mixer.plan.chunk,"workspace_rows":workspace.workspace_rows,
+                "borrowed_slots":workspace.borrowed_slots,"slots_per_layer":capacity.slots_per_layer,
+                "host_blocks":capacity.host_blocks,"spare_blocks":capacity.spare_blocks,
+                "disk_bytes":capacity.disk_bytes,"pinned":capacity.pinned,
+                "host_available_bytes":available,"host_registration_bytes":registration,
+                "device_fixed_bytes":workspace.candidate.reserves.device_fixed_bytes,
+                "host_fixed_bytes":workspace.candidate.reserves.host_fixed_bytes,
+                "vision_reserved_bytes":vision,"budget_bytes_per_token":admission.budget_bytes_per_token
+            }})
+        );
+        Ok(Self {
+            workspace,
+            capacity,
+            admission,
+            measured,
+            catalogue,
+        })
+    }
+
+    pub fn bind(self, engine: &mut Engine) -> Result<()> {
+        let geometry = self.catalogue.geometry();
+        let initial = crate::experts::plan::initial_residency(
+            &vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize],
+            &self.capacity.slots_per_layer,
+            &geometry,
+        )?;
+        let cpu = residency::cpu_bound(
+            geometry,
+            self.capacity.slot_bytes(),
+            self.capacity.span_rows,
+            &self.measured.service,
+            self.measured.h2d_bytes_per_second,
+        )?;
+        let mut slots = Slots::load(
+            &engine.device,
+            geometry,
+            residency::Load {
+                capacity: &self.capacity,
+                admission: self.admission,
+                initial: &initial,
+                directory: engine
+                    .qwen
+                    .as_ref()
+                    .context("expert hybrid runtime missing")?
+                    .checkpoint_path(),
+                catalogue: self.catalogue,
+                engines: self.measured.copy_engines,
+                max_rows: u32::try_from(cpu.0.max(1))?,
+            },
+        )?;
+        engine.moe = Some(Decode::new(
+            &engine.device,
+            geometry,
+            1,
+            self.capacity.worker_count,
+            (cpu.0.max(1), cpu.1.max(geometry.top_k as usize)),
+        )?);
+        engine.moe_prefill = Some(Prefill::new(
+            &engine.device,
+            &mut slots,
+            &self.capacity,
+            self.workspace.candidate.reserves,
+            self.measured.service,
+            self.measured.h2d_bytes_per_second,
+            (
+                self.workspace.workspace_rows,
+                self.workspace.mixer.plan.chunk,
+            ),
+        )?);
+        engine.device.finish_upload()?;
+        engine.moe_slots = Some(slots);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct SlotBindings {
     pub gate_up: Tensor<u64, 1>,
