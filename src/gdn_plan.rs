@@ -203,10 +203,15 @@ impl GdnWorkspace {
 
         let hd_dv = mul(hd, dv)?;
         let hk_dk = mul(hk, dk)?;
+        let normalized_bf16 = if spec.qk_norm_fp32 {
+            0
+        } else {
+            mul(rows, mul(hk_dk, 2)?)?
+        };
         let sizes = [
             mul(rows, mul(conv_dim, 2)?)?, // conv_out  BF16 [R, conv_dim]
-            mul(rows, mul(hk_dk, 2)?)?,    // q_bf16     BF16 [R, 16, 128] KEY heads
-            mul(rows, mul(hk_dk, 2)?)?,    // k_bf16     BF16 [R, 16, 128] KEY heads
+            normalized_bf16,               // q_bf16    BF16 [R, hk, dk], BF16-L2 only
+            normalized_bf16,               // k_bf16    BF16 [R, hk, dk], BF16-L2 only
             mul(rows, mul(hd, 2)?)?,       // beta       BF16 [R, hv]
             mul(rows, mul(hd, 4)?)?,       // beta_fp32  FP32 [R, hv]
             mul(rows, mul(hd, 4)?)?,       // g          FP32 [R, hv]

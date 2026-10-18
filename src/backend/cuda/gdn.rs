@@ -563,8 +563,14 @@ impl GdnOps {
         let v_off = add(k_off, u64::from(plan.spec.hk * plan.spec.dk) * el_bf)?;
 
         let conv_out = ws_bf16(plan.ws.conv_out, ws_ptr, rows, cd)?;
-        let mut q_bf16 = ws_bf16_3(plan.ws.q_bf16, ws_ptr, rows, plan.spec.hk, plan.spec.dk)?;
-        let mut k_bf16 = ws_bf16_3(plan.ws.k_bf16, ws_ptr, rows, plan.spec.hk, plan.spec.dk)?;
+        let mut normalized = if plan.spec.qk_norm_fp32 {
+            None
+        } else {
+            Some((
+                ws_bf16_3(plan.ws.q_bf16, ws_ptr, rows, plan.spec.hk, plan.spec.dk)?,
+                ws_bf16_3(plan.ws.k_bf16, ws_ptr, rows, plan.spec.hk, plan.spec.dk)?,
+            ))
+        };
         let mut beta = ws_bf16(plan.ws.beta, ws_ptr, rows, plan.spec.hv)?;
         let beta_fp32 = ws_f32(plan.ws.beta_fp32, ws_ptr, rows, plan.spec.hv)?;
         let mut g = ws_f32(plan.ws.g, ws_ptr, rows, plan.spec.hv)?;
@@ -612,21 +618,19 @@ impl GdnOps {
                     .launch(plan.hist_cfg)?;
             }
         }
-        if !plan.spec.qk_norm_fp32 {
-            // common l2_heads on Q and K only (V is not normed, ABI §5), read as conv_out column
-            // windows of 16 key heads each.
+        if let Some((q_bf16, k_bf16)) = normalized.as_mut() {
             plan.common.norm.l2_heads(
                 stream,
                 dom,
                 as3(conv_ptr, rows, plan.spec.hk, cd, span, q_off)?,
-                &mut q_bf16,
+                q_bf16,
                 l2_eps,
             )?;
             plan.common.norm.l2_heads(
                 stream,
                 dom,
                 as3(conv_ptr, rows, plan.spec.hk, cd, span, k_off)?,
-                &mut k_bf16,
+                k_bf16,
                 l2_eps,
             )?;
         }
@@ -646,6 +650,14 @@ impl GdnOps {
         )?;
         // V is read in place from its conv_out columns through the validated window helper.
         let v_bf16 = as3(conv_ptr, rows, plan.spec.hv, cd, span, v_off)?;
+        let (q, k) = if plan.spec.qk_norm_fp32 {
+            (conv_ptr + q_off, conv_ptr + k_off)
+        } else {
+            let (q_bf16, k_bf16) = normalized
+                .as_ref()
+                .context("GDN BF16 normalization workspace missing")?;
+            (q_bf16.0.ptr, k_bf16.0.ptr)
+        };
         // Exact widens; the cores read `beta` as FP32.
         unsafe {
             stream
@@ -656,22 +668,20 @@ impl GdnOps {
                 .launch(plan.beta_cfg)?;
             // Q/K expand to value heads; Q is scaled by 1/sqrt(dk).
             if plan.spec.qk_norm_fp32 || !plan.cw_p2 {
-                let (q, k) = if plan.spec.qk_norm_fp32 {
-                    (conv_ptr + q_off, conv_ptr + k_off)
-                } else {
-                    (q_bf16.0.ptr, k_bf16.0.ptr)
-                };
-                stream
-                    .launch_builder(&plan.kernels.prep)
-                    .arg(&q)
+                let v = if plan.cw_p2 { 0 } else { v_fp32.0.ptr };
+                let mut prep = stream.launch_builder(&plan.kernels.prep);
+                prep.arg(&q)
                     .arg(&k)
                     .arg(&v_bf16.ptr)
                     .arg(&q_fp32.0.ptr)
                     .arg(&k_fp32.0.ptr)
-                    .arg(&v_fp32.0.ptr)
+                    .arg(&v)
                     .arg(&cd)
-                    .arg(&meta.ptr)
-                    .launch(plan.prep_cfg)?;
+                    .arg(&meta.ptr);
+                if plan.spec.qk_norm_fp32 {
+                    prep.arg(&l2_eps);
+                }
+                prep.launch(plan.prep_cfg)?;
             }
         }
         // The core is selected by phase, never by a host valid_rows. The launch builder must be one
@@ -694,12 +704,12 @@ impl GdnOps {
                             q: if plan.spec.qk_norm_fp32 {
                                 q_fp32.0.ptr
                             } else {
-                                q_bf16.0.ptr
+                                q
                             },
                             k: if plan.spec.qk_norm_fp32 {
                                 k_fp32.0.ptr
                             } else {
-                                k_bf16.0.ptr
+                                k
                             },
                             v: v_bf16.ptr,
                             v_row_stride: cd,
@@ -1154,6 +1164,7 @@ mod tests {
         Chunked,
         P1(u32),
         P2,
+        WrongHeadStride,
     }
 
     fn geometry_run(
@@ -1182,7 +1193,7 @@ mod tests {
         for row in 0..if sequential { valid } else { 1 } {
             let bound = if sequential { 1 } else { rows };
             let meta = geometry_meta(stream, 23 + row, if sequential { 1 } else { valid })?;
-            let plan = GdnOps::prepare(
+            let mut plan = GdnOps::prepare(
                 &device.ctx,
                 &spec,
                 bound,
@@ -1190,6 +1201,22 @@ mod tests {
                 common.clone(),
                 p2,
             )?;
+            if matches!(core, GeometryCore::WrongHeadStride) {
+                let directory = PathBuf::from(
+                    std::env::var_os("FF_Q38_PROBE_DIR")
+                        .context("GDN control directory missing")?,
+                );
+                let module =
+                    device
+                        .ctx
+                        .load_module(cudarc::nvrtc::Ptx::from_file(directory.join(format!(
+                            "gdn_prep_h32_wrong_stride_sm{}.cubin",
+                            device.info.arch
+                        ))))?;
+                Arc::get_mut(&mut plan.kernels)
+                    .context("GDN control kernels are shared")?
+                    .prep = module.load_function("gdn_prep_l2_fp32")?;
+            }
             plans.push((plan, meta));
         }
         let p1 = if let GeometryCore::P1(split) = core {
@@ -1491,6 +1518,17 @@ mod tests {
             }
         }
         println!("GDN_GEOMETRY_SUMMARY cases={cases} defects={defects}");
+        let reference = geometry_run(&device, spec, 37, 37, GeometryCore::Chunked, false)?;
+        let control = geometry_run(&device, spec, 37, 37, GeometryCore::WrongHeadStride, false)?;
+        let mismatches = geometry_mismatches(&control, &reference);
+        ensure!(
+            mismatches > 0 || control.norm_ratio > 1.0,
+            "wrong-head-stride GDN control escaped"
+        );
+        println!(
+            "PASS GDN_GEOMETRY_CONTROL wrong_head_stride rows=37 mismatches={mismatches} norm_ratio={}",
+            control.norm_ratio
+        );
         ensure!(defects == 0, "GDN_GEOMETRY DEFECT cases={defects}");
         Ok(())
     }

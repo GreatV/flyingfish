@@ -70,7 +70,8 @@ extern "C" __global__ void gdn_prep_l2_fp32(
         float* __restrict__ k_fp32,
         float* __restrict__ v_fp32,
         uint32_t row_stride,
-        const GdnPrepMeta* __restrict__ meta) {
+        const GdnPrepMeta* __restrict__ meta,
+        float l2_eps) {
     if (blockDim.x != GDN_PREP_DK || blockDim.y != 1 || blockDim.z != 1
         || gridDim.x != 1 || gridDim.y != GDN_PREP_KHEADS) {
         __trap();
@@ -107,8 +108,8 @@ extern "C" __global__ void gdn_prep_l2_fp32(
             ks += __shfl_down_sync(0xffffffff, ks, delta);
         }
         if (lane == 0) {
-            sums[0][0] = rsqrtf(qs + 1e-6f);
-            sums[1][0] = rsqrtf(ks + 1e-6f);
+            sums[0][0] = rsqrtf(qs + l2_eps);
+            sums[1][0] = rsqrtf(ks + l2_eps);
         }
     }
     __syncthreads();
@@ -121,8 +122,10 @@ extern "C" __global__ void gdn_prep_l2_fp32(
         const size_t out = ((size_t)row * GDN_PREP_HEADS + value_head) * GDN_PREP_DV + d;
         q_fp32[out] = scaled_q;
         k_fp32[out] = kn;
-        v_fp32[out] = __bfloat162float(
-            v_bf16[(size_t)row * row_stride + value_head * GDN_PREP_DV + d]);
+        if (v_fp32 != nullptr) {
+            v_fp32[out] = __bfloat162float(
+                v_bf16[(size_t)row * row_stride + value_head * GDN_PREP_DV + d]);
+        }
     }
 }
 #endif
