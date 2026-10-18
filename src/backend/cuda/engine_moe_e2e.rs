@@ -585,7 +585,7 @@ fn cosine_budget_covers_two_opposite_reference_errors() -> Result<()> {
 }
 
 #[test]
-fn layer0_precision_floor_is_selected_per_input() -> Result<()> {
+fn reference_floors_are_selected_per_input() -> Result<()> {
     let directory = std::env::temp_dir().join(format!(
         "flyingfish-layer0-floor-{}-{}",
         std::process::id(),
@@ -606,20 +606,41 @@ fn layer0_precision_floor_is_selected_per_input() -> Result<()> {
         let comparisons = (0..4)
             .map(|index| (index.to_string(), comparison.clone()))
             .collect::<serde_json::Map<_, _>>();
-        let cases = [("text_32", 0.125), ("image_boat_16x", 0.25)]
-            .map(|(case, error)| {
-                (
-                    case.to_owned(),
-                    serde_json::json!({"comparisons":comparisons,
+        let cases = [
+            ("text_32", 0.125),
+            ("image_boat_16x", 0.25),
+            ("image_hockey_16x", 0.375),
+        ]
+        .map(|(case, error)| {
+            (
+                case.to_owned(),
+                serde_json::json!({"comparisons":comparisons,
                     "fp32_layer0":{"max_abs":error, "p99_abs":error/2.0,
                         "mean_abs":error/4.0, "cosine_sim":1.0}}),
+            )
+        })
+        .into_iter()
+        .collect::<serde_json::Map<_, _>>();
+        let vision_error = serde_json::json!({"max_abs":0.0625, "p99_abs":0.03125,
+            "mean_abs":0.015625, "cosine_sim":1.0});
+        let vision_layers = [0, 3, 6, 19, 39]
+            .map(|layer| {
+                (
+                    format!("layer_{layer:02}_hidden_last8"),
+                    vision_error.clone(),
                 )
             })
             .into_iter()
             .collect::<serde_json::Map<_, _>>();
+        let vision = serde_json::json!({"layers":vision_layers, "norm":vision_error,
+            "logits":vision_error, "teacher_top2":vision_error});
         std::fs::write(
             directory.join("noise_floor_r2.json"),
-            serde_json::to_vec(&serde_json::json!({"per_case_reference_floor":{"cases":cases}}))?,
+            serde_json::to_vec(
+                &serde_json::json!({"per_case_reference_floor":{"cases":cases},
+                "official_vision_implementation_propagation":{"cases":{
+                    "image_boat_16x":vision,"image_hockey_16x":vision}}}),
+            )?,
         )?;
         let media = serde_json::json!({"max_abs":1.0, "cosine_sim":0.0});
         std::fs::write(
@@ -628,19 +649,28 @@ fn layer0_precision_floor_is_selected_per_input() -> Result<()> {
                 "same_grid_400x267_hockey_vs_boat_logits_diff":media,
                 "hockey_16x_vs_boat_16x_logits_diff":media}}}))?,
         )?;
-        for (case, expected) in [("text_32", 0.25), ("image_boat_16x", 0.5)] {
+        for (case, expected) in [
+            ("text_32", 0.25),
+            ("image_boat_16x", 0.5),
+            ("image_hockey_16x", 0.75),
+        ] {
             let bounds = Bounds::read(&directory.join("fixtures"), case)?;
             ensure!(
                 bounds.layers[&0] == [expected, expected / 2.0, expected / 4.0, 1.0],
                 "wrong layer0 precision floor for {case}: {:?}",
                 bounds.layers[&0]
             );
+            let other = if case.starts_with("image_") {
+                [0.125, 0.0625, 0.03125, 1.0]
+            } else {
+                [0.0, 0.0, 0.0, 1.0]
+            };
             for layer in [3, 6, 19, 39] {
-                assert_eq!(bounds.layers[&layer], [0.0, 0.0, 0.0, 1.0]);
+                assert_eq!(bounds.layers[&layer], other);
             }
-            assert_eq!(bounds.norm, [0.0, 0.0, 0.0, 1.0]);
-            assert_eq!(bounds.logits, [0.0, 0.0, 0.0, 1.0]);
-            assert_eq!(bounds.decode, [0.0, 0.0, 0.0, 1.0]);
+            assert_eq!(bounds.norm, other);
+            assert_eq!(bounds.logits, other);
+            assert_eq!(bounds.decode, other);
         }
         Ok(())
     })();
