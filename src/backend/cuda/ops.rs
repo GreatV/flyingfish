@@ -6,10 +6,8 @@ use std::sync::Arc;
 pub struct Ops {
     pub embed: CudaFunction,
     pub embed_rmsnorm: CudaFunction,
-    pub norm: CudaFunction,
     pub add_norm: CudaFunction,
     pub add_norm_capture: CudaFunction,
-    pub rope_float: CudaFunction,
     pub kv_write: CudaFunction,
     pub rope_kv: CudaFunction,
     pub act: CudaFunction,
@@ -57,10 +55,8 @@ impl Ops {
         Ok(Self {
             embed: embed.load_function("embed")?,
             embed_rmsnorm: embed_rmsnorm.load_function("embed_rmsnorm")?,
-            norm: norm.load_function("rms_norm")?,
             add_norm: norm.load_function("add_rmsnorm")?,
             add_norm_capture: add_norm_capture.load_function("add_rmsnorm_capture")?,
-            rope_float: rope.load_function("rope_float")?,
             kv_write: rope.load_function("kv_write")?,
             rope_kv: rope_kv.load_function("rope_kv")?,
             act: act.load_function("silu_mul")?,
