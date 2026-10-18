@@ -1,6 +1,86 @@
 use super::*;
 
 #[test]
+fn llama_rejects_unsupported_draft_blocks_before_device_setup() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "flyingfish-draft-block-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root)?;
+    let result = (|| -> Result<()> {
+        let target = root.join("target");
+        let draft = root.join("draft");
+        std::fs::create_dir(&target)?;
+        std::fs::create_dir(&draft)?;
+        let value = serde_json::json!({
+            "model_type":"llama", "hidden_size":2048, "intermediate_size":6144,
+            "num_hidden_layers":42, "num_attention_heads":16, "num_key_value_heads":2,
+            "head_dim":128, "vocab_size":130560, "max_position_embeddings":131072,
+            "rms_norm_eps":1e-6, "rope_theta":5000000.0, "hidden_act":"silu",
+            "tie_word_embeddings":false, "torch_dtype":"bfloat16", "eos_token_id":[2]
+        });
+        std::fs::write(target.join("config.json"), serde_json::to_vec(&value)?)?;
+        let target_config: Config = serde_json::from_value(value)?;
+        let mut value = serde_json::json!({
+            "model_type":"qwen3", "architectures":["Qwen3DSparkModel"], "dtype":"bfloat16",
+            "hidden_size":2048, "intermediate_size":6144, "num_hidden_layers":5,
+            "num_attention_heads":16, "num_key_value_heads":2, "head_dim":128,
+            "vocab_size":130560, "draft_vocab_size":130560, "rms_norm_eps":1e-6,
+            "block_size":7, "mask_token_id":75982, "target_layer_ids":[1,10,20,30,39],
+            "num_target_layers":42, "markov_rank":256, "markov_head_type":"vanilla",
+            "projector_type":"dspark", "rope_parameters":{"rope_theta":5000000.0,"rope_type":"default"}
+        });
+        let runtime = root.join("blocked-runtime");
+        std::fs::write(&runtime, b"not a directory")?;
+        let mut rejected = 0;
+        for block in 1..=8 {
+            value["block_size"] = block.into();
+            std::fs::write(draft.join("config.json"), serde_json::to_vec(&value)?)?;
+            assert_eq!(
+                crate::dspark::DraftConfig::read(&draft, &target_config)?.block_size,
+                block
+            );
+            if block == 7 {
+                continue;
+            }
+            for budget in [SpecBudget::Chain, SpecBudget::Tree16] {
+                for write in [false, true] {
+                    let settings = Settings {
+                        tree_builder: TreeBuilder::Waves,
+                        spec_budget: budget,
+                        spec_graph: true,
+                        draft_model: Some(draft.clone()),
+                        runtime_dir: Some(runtime.clone()),
+                        prefix_cache: false,
+                        kv_format: crate::kv::KvFormat::Bf16,
+                    };
+                    let error = if write {
+                        Engine::calibrate(&target, 0, 32, Some(16), settings).err()
+                    } else {
+                        Engine::load(&target, 0, 32, Some(16), settings).err()
+                    }
+                    .context("unsupported draft block reached device setup")?;
+                    ensure!(
+                        error
+                            .to_string()
+                            .starts_with("unsupported Llama DSpark block_size="),
+                        "draft block {block} reached runtime/device setup: {error:#}"
+                    );
+                    rejected += 1;
+                }
+            }
+        }
+        println!("PR61_DRAFT_BLOCK pre_device_rejections={rejected} block7_config_valid=true PASS");
+        Ok(())
+    })();
+    std::fs::remove_dir_all(&root)?;
+    result
+}
+
+#[test]
 fn load_dispatch_selects_shared_hybrid_and_llama() -> Result<()> {
     assert_eq!(
         super::load_dispatch(crate::model_spec::Architecture::Qwen35Text)?,
@@ -205,7 +285,6 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
             super::super::draft::Compute {
                 ops: &model.ops,
                 blas: &mut model.blas,
-                config: &model.config,
             },
             None,
         )?;
@@ -400,6 +479,232 @@ fn chain_argmax_matches_single_on_real_logits() -> Result<()> {
         "{}",
         serde_json::json!({"chain_argmax_equivalence_summary":{"prompts":13,"rounds":rounds,"predictions_compared":compared,"pass":true}})
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU window and FF_ARGMAX_MODEL/FF_ARGMAX_DRAFT/FLYINGFISH_RUNTIME_DIR"]
+fn target_hidden_capture_gpu() -> Result<()> {
+    use cudarc::driver::DevicePtr;
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
+    let draft = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
+    let settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: false,
+        draft_model: None,
+        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut model = Engine::load_kind(&target, 0, 128, Some(17), settings, true)?;
+    ensure!(
+        model.qwen.is_none(),
+        "Llama operator capture fixture required"
+    );
+    let layers = crate::dspark::read_capture_layers(&draft, &model.config)?;
+    let mut capture = Some(HiddenCapture::new(
+        &layers,
+        &model.config,
+        model.workspace_rows,
+        &model.device.stream,
+    )?);
+    let s = model.device.stream.clone();
+    let h = model.config.hidden_size;
+    let width = capture.as_ref().context("capture missing")?.width;
+    let poison = bf16::from_f32(-17.0);
+    let prepare = |model: &mut Engine, start: usize, ids: &[u32]| -> Result<()> {
+        model.position = start;
+        model
+            .device
+            .stream
+            .memcpy_htod(ids, &mut model.work.ids.slice_mut(..ids.len()))?;
+        model
+            .device
+            .stream
+            .memcpy_htod(&[start as i32], &mut model.work.position)?;
+        model
+            .device
+            .stream
+            .memcpy_htod(&[(start + ids.len()) as i32], &mut model.work.length)?;
+        Ok(())
+    };
+    let run =
+        |model: &mut Engine, start: usize, ids: &[u32], trace: Option<&mut Trace>| -> Result<()> {
+            prepare(model, start, ids)?;
+            model.forward(
+                ids.len(),
+                false,
+                true,
+                trace.map(|trace| Target {
+                    trace,
+                    prefix: "tap",
+                    skip: 0,
+                }),
+            )
+        };
+    let state = |model: &Engine| -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for layer in &model.state.kv {
+            for value in [&layer.k, &layer.v] {
+                copy::bits(&s, value, &mut out)?;
+            }
+        }
+        for value in [&model.work.x, &model.work.n, &model.work.logits] {
+            copy::bits(&s, value, &mut out)?;
+        }
+        Ok(out)
+    };
+    let mut defects = 0;
+    let mut cells = 0;
+    let mut graph_replays = 0;
+    let mut wrong_mismatches = 0;
+    for prefix in [0usize, 7, 17] {
+        for rows in [1usize, 2, 5, 17] {
+            let ids: Vec<_> = (0..prefix + rows).map(|i| (i * 263 + 17) as u32).collect();
+            model.hidden_capture = None;
+            model.reset()?;
+            if prefix > 0 {
+                run(&mut model, 0, &ids[..prefix], None)?;
+            }
+            let mut baseline_trace = Trace::default();
+            run(
+                &mut model,
+                prefix,
+                &ids[prefix..],
+                Some(&mut baseline_trace),
+            )?;
+            model.check_logits()?;
+            let baseline = state(&model)?;
+            model.hidden_capture = capture.take();
+            model.reset()?;
+            if prefix > 0 {
+                run(&mut model, 0, &ids[..prefix], None)?;
+            }
+            let binding = model.hidden_capture.as_mut().context("capture missing")?;
+            let pointer = binding.values.device_ptr(&s).0;
+            s.memcpy_htod(&vec![poison; binding.values.len()], &mut binding.values)?;
+            let mut trace = Trace::default();
+            run(&mut model, prefix, &ids[prefix..], Some(&mut trace))?;
+            model.check_logits()?;
+            let binding = model.hidden_capture.as_ref().context("capture missing")?;
+            let actual = s.clone_dtoh(&binding.values)?;
+            ensure!(
+                actual.iter().all(|x| x.to_f32().is_finite()),
+                "non-finite target capture"
+            );
+            let mut expected = vec![poison; actual.len()];
+            let mut mismatches = 0;
+            for (slot, layer) in layers.iter().enumerate() {
+                let name = format!("tap.layer.{layer}");
+                let values = baseline_trace.values(&name)?;
+                ensure!(
+                    values.len() == rows * h && values.iter().all(|x| x.is_finite()),
+                    "target trace shape/finiteness"
+                );
+                let enabled = trace.values(&name)?;
+                ensure!(
+                    enabled.len() == values.len() && enabled.iter().all(|x| x.is_finite()),
+                    "enabled target trace shape/finiteness"
+                );
+                mismatches += values
+                    .iter()
+                    .zip(enabled)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                for row in 0..rows {
+                    for d in 0..h {
+                        expected[row * width + slot * h + d] = bf16::from_f32(values[row * h + d]);
+                    }
+                }
+            }
+            mismatches += actual
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(mismatches != 0 || state(&model)? != baseline);
+            prepare(&mut model, prefix, &ids[prefix..])?;
+            s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            let launched = model.forward(rows, false, true, None);
+            let graph = s.end_capture(sys::CUgraphInstantiate_flags(0))?;
+            launched?;
+            let graph = graph.context("target capture graph missing")?;
+            for _ in 0..2 {
+                model.reset()?;
+                if prefix > 0 {
+                    run(&mut model, 0, &ids[..prefix], None)?;
+                }
+                prepare(&mut model, prefix, &ids[prefix..])?;
+                let binding = model.hidden_capture.as_mut().context("capture missing")?;
+                s.memcpy_htod(&vec![poison; binding.values.len()], &mut binding.values)?;
+                ensure!(
+                    binding.values.device_ptr(&s).0 == pointer,
+                    "capture graph pointer moved"
+                );
+                graph.launch()?;
+                s.synchronize()?;
+                let values = s.clone_dtoh(
+                    &model
+                        .hidden_capture
+                        .as_ref()
+                        .context("capture missing")?
+                        .values,
+                )?;
+                ensure!(
+                    values.iter().all(|x| x.to_f32().is_finite()),
+                    "non-finite graph target capture"
+                );
+                let mismatch = values
+                    .iter()
+                    .zip(&expected)
+                    .any(|(a, b)| a.to_bits() != b.to_bits());
+                defects += usize::from(mismatch || state(&model)? != baseline);
+                graph_replays += 1;
+            }
+            if prefix == 7 && rows == 17 {
+                let mut wrong = layers.clone();
+                wrong[0] += 1;
+                let mut binding =
+                    HiddenCapture::new(&wrong, &model.config, model.workspace_rows, &s)?;
+                s.memcpy_htod(&vec![poison; binding.values.len()], &mut binding.values)?;
+                let healthy = model.hidden_capture.replace(binding);
+                model.reset()?;
+                run(&mut model, 0, &ids[..prefix], None)?;
+                run(&mut model, prefix, &ids[prefix..], None)?;
+                let values = s.clone_dtoh(
+                    &model
+                        .hidden_capture
+                        .as_ref()
+                        .context("capture missing")?
+                        .values,
+                )?;
+                for row in 0..rows {
+                    wrong_mismatches += values[row * width..row * width + h]
+                        .iter()
+                        .zip(&expected[row * width..row * width + h])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                }
+                defects += usize::from(wrong_mismatches == 0);
+                model.hidden_capture = healthy;
+            }
+            println!(
+                "TARGET_CAPTURE operator=Llama prefix={prefix} rows={rows} taps={layers:?} bit_mismatches={mismatches} defects={defects}"
+            );
+            capture = model.hidden_capture.take();
+            cells += 1;
+        }
+    }
+    println!(
+        "TARGET_HIDDEN_CAPTURE operator=Llama cells={cells} graph_replays={graph_replays} wrong_layer_bit_mismatches={wrong_mismatches} defects={defects} {}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "target capture has {defects} finite defects");
     Ok(())
 }
 

@@ -21,16 +21,12 @@ impl Plan {
         free: usize,
         total: usize,
         alignment: usize,
-        draft: bool,
+        draft_row_bytes: usize,
     ) -> Result<Self> {
         let row_bytes = (4 * c.hidden_size + c.qkv_dim() + 3 * c.intermediate_size) * 2
             + 4
             + c.num_attention_heads * 4
-            + if draft {
-                (7 * c.hidden_size + 5 * c.kv_dim()) * 2
-            } else {
-                0
-            };
+            + draft_row_bytes;
         Self::budget(capacity, requested, free, total, alignment, row_bytes)
     }
 

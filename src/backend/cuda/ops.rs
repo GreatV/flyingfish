@@ -6,10 +6,9 @@ use std::sync::Arc;
 pub struct Ops {
     pub embed: CudaFunction,
     pub embed_rmsnorm: CudaFunction,
-    pub norm: CudaFunction,
     pub add_norm: CudaFunction,
     pub add_norm_capture: CudaFunction,
-    pub rope_float: CudaFunction,
+    norm_capture: CudaFunction,
     pub kv_write: CudaFunction,
     pub rope_kv: CudaFunction,
     pub act: CudaFunction,
@@ -57,10 +56,9 @@ impl Ops {
         Ok(Self {
             embed: embed.load_function("embed")?,
             embed_rmsnorm: embed_rmsnorm.load_function("embed_rmsnorm")?,
-            norm: norm.load_function("rms_norm")?,
             add_norm: norm.load_function("add_rmsnorm")?,
             add_norm_capture: add_norm_capture.load_function("add_rmsnorm_capture")?,
-            rope_float: rope.load_function("rope_float")?,
+            norm_capture: cubin::module(ctx, "q38_common")?.load_function("q38_norm_capture")?,
             kv_write: rope.load_function("kv_write")?,
             rope_kv: rope_kv.load_function("rope_kv")?,
             act: act.load_function("silu_mul")?,
@@ -191,6 +189,145 @@ pub(crate) struct ResidualRmsInput<'a> {
     pub x: &'a mut TensorMut<bf16, 3>,
     pub residual: Tensor<bf16, 3>,
     pub weight: Tensor<bf16, 1>,
+}
+
+pub(crate) struct ResidualRmsCapture<'a> {
+    pub input: ResidualRmsInput<'a>,
+    pub capture: &'a mut TensorMut<bf16, 3>,
+    pub slot: u32,
+}
+
+impl Ops {
+    pub fn add_rmsnorm_capture(
+        &self,
+        stream: &Arc<CudaStream>,
+        domain: Option<RowDomain>,
+        input: ResidualRmsCapture<'_>,
+        y: &mut TensorMut<bf16, 3>,
+        options: RmsOptions,
+    ) -> Result<()> {
+        let ResidualRmsCapture {
+            input,
+            capture,
+            slot,
+        } = input;
+        let ResidualRmsInput {
+            x,
+            residual,
+            weight,
+        } = input;
+        for tensor in [x.0, residual, y.0] {
+            tensor.validate()?;
+            ensure!(
+                tensor.shape == x.0.shape
+                    && tensor.shape[1] == 1
+                    && tensor.stride == [u64::from(tensor.shape[2]), u64::from(tensor.shape[2]), 1],
+                "capture norm requires contiguous rows with one hidden vector"
+            );
+        }
+        let hidden = x.0.shape[2];
+        ensure!(
+            [2048, 5120].contains(&hidden),
+            "capture norm hidden width is unsupported"
+        );
+        weight.validate()?;
+        capture.0.validate()?;
+        let taps = capture.0.shape[1];
+        ensure!(
+            weight.shape == [hidden]
+                && weight.stride == [1]
+                && capture.0.shape[0] >= x.0.shape[0]
+                && capture.0.shape[2] == hidden
+                && slot < taps
+                && capture.0.stride == [u64::from(taps) * u64::from(hidden), u64::from(hidden), 1],
+            "capture norm weight or [rows,taps,hidden] layout mismatch"
+        );
+        ensure!(
+            options.eps.is_finite() && options.eps > 0.0,
+            "invalid capture norm epsilon"
+        );
+        for (a, b) in [
+            (x.0, residual),
+            (x.0, y.0),
+            (x.0, capture.0),
+            (residual, y.0),
+            (residual, capture.0),
+            (y.0, capture.0),
+        ] {
+            no_overlap(&a, &b)?;
+        }
+        for tensor in [x.0, residual, y.0, capture.0] {
+            no_overlap(&weight, &tensor)?;
+        }
+        let (meta, base, rows) = if let Some(domain) = domain {
+            domain.validate(x.0.shape[0])?;
+            (domain.meta.ptr, domain.row_base, domain.row_capacity)
+        } else {
+            (0, 0, x.0.shape[0])
+        };
+        let pitch = i32::try_from(u64::from(taps) * u64::from(hidden))?;
+        let column = i32::try_from(u64::from(slot) * u64::from(hidden))?;
+        if matches!(options.mode, RmsMode::ZeroCentered) {
+            let slices = norm_slices_per_block(
+                rows,
+                &x.0,
+                weight.ptr,
+                residual.ptr,
+                residual.stride,
+                &y.0,
+                4,
+            );
+            unsafe {
+                stream
+                    .launch_builder(&self.norm_capture)
+                    .arg(&x.0.ptr)
+                    .arg(&weight.ptr)
+                    .arg(&residual.ptr)
+                    .arg(&y.0.ptr)
+                    .arg(&meta)
+                    .arg(&base)
+                    .arg(&rows)
+                    .arg(&1u32)
+                    .arg(&hidden)
+                    .arg(&x.0.stride[0])
+                    .arg(&x.0.stride[1])
+                    .arg(&x.0.stride[2])
+                    .arg(&y.0.stride[0])
+                    .arg(&y.0.stride[1])
+                    .arg(&y.0.stride[2])
+                    .arg(&residual.stride[0])
+                    .arg(&residual.stride[1])
+                    .arg(&residual.stride[2])
+                    .arg(&4i32)
+                    .arg(&options.eps)
+                    .arg(&capture.0.ptr)
+                    .arg(&u64::try_from(pitch)?)
+                    .arg(&u64::try_from(column)?)
+                    .launch(grid(rows.div_ceil(slices) as usize, 256))?;
+            }
+            return Ok(());
+        }
+        unsafe {
+            stream
+                .launch_builder(&self.add_norm_capture)
+                .arg(&residual.ptr)
+                .arg(&x.0.ptr)
+                .arg(&weight.ptr)
+                .arg(&y.0.ptr)
+                .arg(&x.0.ptr)
+                .arg(&capture.0.ptr)
+                .arg(&i32::try_from(rows)?)
+                .arg(&i32::try_from(hidden)?)
+                .arg(&options.eps)
+                .arg(&pitch)
+                .arg(&column)
+                .arg(&(options.mode as i32))
+                .arg(&meta)
+                .arg(&i32::try_from(base)?)
+                .launch(grid(rows as usize, 256))?;
+        }
+        Ok(())
+    }
 }
 
 fn norm_slices_per_block(

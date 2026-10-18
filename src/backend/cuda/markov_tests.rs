@@ -1,7 +1,14 @@
-use super::{Markov, check_requests};
+use super::{Markov, MarkovShape, ScoreRounding, check_requests};
+
+const SHAPE: MarkovShape = MarkovShape {
+    rows: 7,
+    vocab: 130560,
+    rank: 256,
+    rounding: ScoreRounding::Bf16,
+};
 use crate::backend::cuda::{Device, ops::Ops};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaSlice, PushKernelArg};
+use cudarc::driver::{CudaSlice, DevicePtrMut, PushKernelArg};
 use half::bf16;
 use memmap2::MmapOptions;
 use safetensors::{Dtype, SafeTensors};
@@ -11,6 +18,386 @@ use std::{hint::black_box, path::Path, time::Instant};
 mod reference;
 
 const BATCH_COUNTS: [usize; 16] = [1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128, 129];
+
+#[test]
+#[ignore = "requires a GPU window and FLYINGFISH_RUNTIME_DIR"]
+fn native_geometry_head_ops_gpu() -> Result<()> {
+    use crate::backend::cuda::{bf16_chain_bound, cubin, gamma, markov_calibrate::Body, ops::grid};
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let (rows, vocab, rank, width) = (15usize, 248144usize, 256usize, 2048usize);
+    let coefficient = |i: usize, period: usize| {
+        let v = i * 31 % period;
+        (if v.is_multiple_of(2) { 1.0 } else { -1.0 }) * 2.0f32.powi((v % 5) as i32 - 2)
+    };
+    let e: Vec<f32> = (0..rank)
+        .map(|k| ((k * 17 % 257) as f32 - 128.0) / 128.0)
+        .collect();
+    let g: Vec<f32> = (0..rank)
+        .map(|k| ((k * 29 % 263) as f32 - 131.0) / 128.0)
+        .collect();
+    let dot: f64 = e
+        .iter()
+        .zip(&g)
+        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+        .sum();
+    let w1: Vec<_> = (0..vocab * rank)
+        .map(|i| bf16::from_f32(coefficient(i / rank, 257) * e[i % rank]))
+        .collect();
+    let w2: Vec<_> = (0..vocab * rank)
+        .map(|i| bf16::from_f32(coefficient(i / rank, 263) * g[i % rank]))
+        .collect();
+    let base: Vec<_> = (0..rows * vocab)
+        .map(|i| {
+            bf16::from_f32(((i % vocab * 47 + i / vocab * 31) % 269) as f32 / 32.0 - 134.0 / 32.0)
+        })
+        .collect();
+    let requests: Vec<_> = (0..65)
+        .map(|i| {
+            (
+                ((i * 7 + 14) % rows) as u8,
+                ((i * 1009 + 257) % vocab) as u32,
+            )
+        })
+        .collect();
+    let oracle = |base: &[bf16], row: u8, parent: u32, rounding: ScoreRounding| {
+        let a = f64::from(coefficient(parent as usize, 257));
+        let scores: Vec<_> = (0..vocab)
+            .map(|token| {
+                let bias =
+                    bf16::from_f32((a * f64::from(coefficient(token, 263)) * dot) as f32).to_f32();
+                let sum = bias + base[row as usize * vocab + token].to_f32();
+                f64::from(if rounding == ScoreRounding::Bf16 {
+                    bf16::from_f32(sum).to_f32()
+                } else {
+                    sum
+                })
+            })
+            .collect();
+        let mut top = [(f64::NEG_INFINITY, u32::MAX); 4];
+        for (id, &score) in scores.iter().enumerate() {
+            if let Some(index) = top
+                .iter()
+                .position(|(s, t)| score > *s || (score == *s && (id as u32) < *t))
+            {
+                top[index..].rotate_right(1);
+                top[index] = (score, id as u32);
+            }
+        }
+        let lse = top[0].0
+            + scores
+                .iter()
+                .map(|s| (s - top[0].0).exp())
+                .sum::<f64>()
+                .ln();
+        (
+            top.map(|(_, id)| id),
+            top.map(|(s, _)| s - lse),
+            lse,
+            gamma(rank + 32 + 8 + vocab.div_ceil(256) + 5, 2f64.powi(-24))
+                * (1.0 + lse.abs() + top[0].0.abs()),
+        )
+    };
+    let hidden: Vec<_> = (0..rows * width)
+        .map(|i| bf16::from_f32(((i * 37 % 269) as f32 - 134.0) / 128.0))
+        .collect();
+    let weight: Vec<_> = (0..width + rank)
+        .map(|i| bf16::from_f32(((i * 43 % 263) as f32 - 131.0) / 1024.0))
+        .collect();
+    let previous: Vec<u32> = (0..rows)
+        .map(|i| ((i * 1009 + 257) % vocab) as u32)
+        .collect();
+    let bias = bf16::from_f32(1.0 / 32.0);
+    let mut confidence = Vec::new();
+    for row in 0..rows {
+        let parent = if row == 0 {
+            vocab - 1
+        } else {
+            previous[row - 1] as usize
+        };
+        let products: Vec<f64> = hidden[row * width..(row + 1) * width]
+            .iter()
+            .chain(&w1[parent * rank..(parent + 1) * rank])
+            .zip(&weight)
+            .map(|(a, b)| f64::from(a.to_f32()) * f64::from(b.to_f32()))
+            .collect();
+        let logit =
+            bf16::from_f32((products.iter().sum::<f64>() + f64::from(bias.to_f32())) as f32)
+                .to_f32();
+        confidence.push((
+            f64::from(bf16::from_f32((1.0 / (1.0 + (-f64::from(logit)).exp())) as f32).to_f32()),
+            0.25 * bf16_chain_bound(1, &[width + rank])
+                * (products.iter().map(|v| v.abs()).sum::<f64>() + f64::from(bias.to_f32()).abs())
+                + gamma(5, 2f64.powi(-24)),
+        ));
+    }
+    println!(
+        "HEAD_OPS_FROZEN base=[{rows},{vocab}] w1_w2=[{vocab},{rank}] confidence_width={} periods=257,263,269 score_modes=bf16,f32",
+        width + rank
+    );
+    let d = Device::new(0)?;
+    let s = &d.stream;
+    let ops = Ops::new(&d.ctx)?;
+    let runtime = std::path::PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+    std::fs::create_dir_all(&runtime)?;
+    let closure = crate::backend::cuda::closure::Closure::new(
+        true,
+        "explicit native geometry head gate".into(),
+    );
+    let module = cubin::module(&d.ctx, "markov")?;
+    let device_w1 = s.clone_htod(&w1)?;
+    let device_w2 = s.clone_htod(&w2)?;
+    let mut device_base = s.clone_htod(&base)?;
+    d.finish_upload()?;
+    let mut defects = 0;
+    let mut compared = 0;
+    for rounding in [ScoreRounding::Bf16, ScoreRounding::F32] {
+        let shape = MarkovShape {
+            rows,
+            vocab,
+            rank,
+            rounding,
+        };
+        let mut markov = Markov::new(&d, &ops, &runtime, &closure, shape)?;
+        s.memcpy_htod(&base, &mut device_base)?;
+        let canonical =
+            markov.distributions_batch(&device_base, &device_w1, &device_w2, &requests)?;
+        for (actual, (row, parent)) in canonical.iter().zip(&requests) {
+            let (tokens, logp, lse, bound) = oracle(&base, *row, *parent, rounding);
+            defects += usize::from(
+                actual.tokens != tokens
+                    || (f64::from(actual.lse) - lse).abs() > bound
+                    || actual
+                        .logp
+                        .iter()
+                        .zip(logp)
+                        .any(|(a, b)| (f64::from(*a) - b).abs() > bound),
+            );
+        }
+        for body in [Body::F1, Body::PreF1] {
+            markov.first[0] = module.load_function(body.symbol(1))?;
+            markov.first[1] = module.load_function(body.symbol(8))?;
+            for p in [1, 8, 15, 64, 65, 129] {
+                let batch: Vec<_> = requests.iter().copied().cycle().take(p).collect();
+                let actual =
+                    markov.distributions_batch(&device_base, &device_w1, &device_w2, &batch)?;
+                let mismatches = actual
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, a)| !a.bits_equal(&canonical[*i % requests.len()]))
+                    .count();
+                println!(
+                    "NATIVE_MARKOV rounding={rounding:?} body={body:?} P={p} mismatches={mismatches} {}",
+                    if mismatches == 0 { "PASS" } else { "DEFECT" }
+                );
+                defects += mismatches;
+                compared += p;
+            }
+        }
+        let mut tail = base.clone();
+        let bound = e
+            .iter()
+            .zip(&g)
+            .map(|(a, b)| a.abs() * b.abs())
+            .sum::<f32>()
+            * 16.0;
+        tail[(rows - 1) * vocab + vocab - 1] = bf16::from_f32(4.0 * bound + 16.0);
+        s.memcpy_htod(&tail, &mut device_base)?;
+        let actual = markov.distributions_batch(
+            &device_base,
+            &device_w1,
+            &device_w2,
+            &[(14, (vocab - 1) as u32)],
+        )?;
+        defects += usize::from(actual[0].tokens[0] != (vocab - 1) as u32);
+        println!(
+            "NATIVE_MARKOV_TAIL rounding={rounding:?} row=14 expected={} actual={}",
+            vocab - 1,
+            actual[0].tokens[0]
+        );
+    }
+    let mut bf16_scores = s.alloc_zeros::<bf16>(vocab + 1)?;
+    let mut f32_scores = s.alloc_zeros::<f32>(vocab + 1)?;
+    let mut token = s.alloc_zeros::<u32>(1)?;
+    let sum = module.load_function("sum_argmax")?;
+    for (test_vocab, offset) in [(vocab, 0), (vocab - 3, 0), (vocab - 3, 1)] {
+        let live = offset..offset + test_vocab;
+        let mut simple_base = vec![bf16::from_f32(-10.0); vocab + 1];
+        let mut simple_bias = vec![bf16::ZERO; vocab + 1];
+        simple_base[offset] = bf16::ZERO;
+        simple_base[live.end - 1] = bf16::from_f32(1.0 / 512.0);
+        simple_bias[offset] = bf16::ONE;
+        simple_bias[live.end - 1] = bf16::ONE;
+        let mut guarded_bias = vec![bf16::NAN; vocab + 1];
+        guarded_bias[live.clone()].copy_from_slice(&simple_bias[live.clone()]);
+        let simple_base = s.clone_htod(&simple_base)?;
+        let simple_bias = s.clone_htod(&simple_bias)?;
+        for rounding in [ScoreRounding::Bf16, ScoreRounding::F32] {
+            s.memcpy_htod(&guarded_bias, &mut bf16_scores)?;
+            s.memcpy_htod(&vec![f32::NAN; vocab + 1], &mut f32_scores)?;
+            let (bf_ptr, bf_hold) = bf16_scores.device_ptr_mut(s);
+            let (fp_ptr, fp_hold) = f32_scores.device_ptr_mut(s);
+            drop(bf_hold);
+            drop(fp_hold);
+            let ptr = if rounding == ScoreRounding::Bf16 {
+                bf_ptr + (offset * 2) as u64
+            } else {
+                fp_ptr + (offset * 4) as u64
+            };
+            let bias = if rounding == ScoreRounding::Bf16 {
+                bf16_scores.slice(live.clone())
+            } else {
+                simple_bias.slice(live.clone())
+            };
+            unsafe {
+                s.launch_builder(&sum)
+                    .arg(&simple_base.slice(live.clone()))
+                    .arg(&bias)
+                    .arg(&ptr)
+                    .arg(&mut token)
+                    .arg(&(test_vocab as i32))
+                    .arg(&(rounding as i32))
+                    .launch(grid(1, 1024))?;
+            }
+            let actual = s.clone_dtoh(&token)?[0];
+            let expected = if rounding == ScoreRounding::Bf16 {
+                0
+            } else {
+                (test_vocab - 1) as u32
+            };
+            defects += usize::from(actual != expected);
+            let scores = if rounding == ScoreRounding::Bf16 {
+                s.clone_dtoh(&bf16_scores)?
+                    .into_iter()
+                    .map(bf16::to_f32)
+                    .collect::<Vec<_>>()
+            } else {
+                s.clone_dtoh(&f32_scores)?
+            };
+            let guard_mismatches = scores[..offset]
+                .iter()
+                .chain(&scores[live.end..])
+                .filter(|v| !v.is_nan())
+                .count();
+            defects += guard_mismatches;
+            let mut score_mismatches = 0;
+            for (index, value) in scores[live.clone()].iter().enumerate() {
+                let expected = if index == 0 {
+                    1.0f32
+                } else if index + 1 == test_vocab {
+                    if rounding == ScoreRounding::Bf16 {
+                        1.0
+                    } else {
+                        1.0 + 1.0 / 512.0
+                    }
+                } else {
+                    -10.0
+                };
+                score_mismatches += usize::from(value.to_bits() != expected.to_bits());
+            }
+            defects += score_mismatches;
+            println!(
+                "SUM_ARGMAX_ROUNDING vocab={test_vocab} offset={offset} rounding={rounding:?} expected={expected} actual={actual} guard_mismatches={guard_mismatches} score_mismatches={score_mismatches}"
+            );
+            s.memcpy_htod(&guarded_bias, &mut bf16_scores)?;
+            s.memcpy_htod(&vec![f32::NAN; vocab + 1], &mut f32_scores)?;
+            let bias = bf16_scores.slice(live.clone());
+            unsafe {
+                s.launch_builder(&sum)
+                    .arg(&simple_base.slice(live.clone()))
+                    .arg(&bias)
+                    .arg(&0u64)
+                    .arg(&mut token)
+                    .arg(&(test_vocab as i32))
+                    .arg(&(rounding as i32))
+                    .launch(grid(1, 1024))?;
+            }
+            let actual = s.clone_dtoh(&token)?[0];
+            let bias_mismatches = s
+                .clone_dtoh(&bf16_scores)?
+                .iter()
+                .zip(&guarded_bias)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let output_mismatches = s
+                .clone_dtoh(&f32_scores)?
+                .iter()
+                .filter(|v| !v.is_nan())
+                .count();
+            defects += usize::from(actual != expected) + bias_mismatches + output_mismatches;
+            println!(
+                "SUM_ARGMAX_NO_WRITE vocab={test_vocab} offset={offset} rounding={rounding:?} expected={expected} actual={actual} bias_mismatches={bias_mismatches} output_mismatches={output_mismatches}"
+            );
+        }
+    }
+    let device_hidden = s.clone_htod(&hidden)?;
+    let device_weight = s.clone_htod(&weight)?;
+    let device_bias = s.clone_htod(&[bias])?;
+    let device_previous = s.clone_htod(&previous)?;
+    let anchor = s.clone_htod(&[(vocab - 1) as u32])?;
+    let mut output = s.clone_htod(&vec![f32::NAN; rows + 1])?;
+    let (out_ptr, _out_hold) = output.device_ptr_mut(s);
+    drop(_out_hold);
+    let kernel = module.load_function("concat_dot_sigmoid")?;
+    let execute = || -> Result<()> {
+        unsafe {
+            s.launch_builder(&kernel)
+                .arg(&device_hidden)
+                .arg(&device_w1)
+                .arg(&anchor)
+                .arg(&device_previous)
+                .arg(&device_weight)
+                .arg(&device_bias)
+                .arg(&out_ptr)
+                .arg(&(rows as i32))
+                .arg(&(width as i32))
+                .arg(&(rank as i32))
+                .arg(&(vocab as i32))
+                .launch(grid(rows, 256))?;
+        }
+        Ok(())
+    };
+    execute()?;
+    let eager = s.clone_dtoh(&output)?;
+    ensure!(
+        eager[..rows]
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+        "nonfinite confidence"
+    );
+    defects += eager[..rows]
+        .iter()
+        .zip(confidence)
+        .filter(|(a, (b, bound))| (f64::from(**a) - b).abs() > *bound)
+        .count();
+    defects += usize::from(!eager[rows].is_nan());
+    defects += eager[..rows]
+        .iter()
+        .filter(|v| bf16::from_f32(**v).to_f32().to_bits() != v.to_bits())
+        .count();
+    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+    let run = execute();
+    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+    run?;
+    let graph = captured?.context("empty confidence graph")?;
+    for _ in 0..2 {
+        graph.launch()?;
+        let actual = s.clone_dtoh(&output)?;
+        defects += actual
+            .iter()
+            .zip(&eager)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+    }
+    println!(
+        "NATIVE_HEAD_OPS requests={compared} confidence_rows={rows} graph_replays=2 defects={defects} {}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "native head operation defects={defects}");
+    Ok(())
+}
 
 #[derive(Default, serde::Serialize)]
 struct Differences {
@@ -195,10 +582,10 @@ fn requests(p: usize, seed: usize) -> Vec<(u8, u32)> {
 
 #[test]
 fn request_bounds() -> Result<()> {
-    check_requests(&[])?;
-    check_requests(&[(0, 0), (6, 130559)])?;
-    assert!(check_requests(&[(7, 0)]).is_err());
-    assert!(check_requests(&[(0, 130560)]).is_err());
+    check_requests(&[], SHAPE)?;
+    check_requests(&[(0, 0), (6, 130559)], SHAPE)?;
+    assert!(check_requests(&[(7, 0)], SHAPE).is_err());
+    assert!(check_requests(&[(0, 130560)], SHAPE).is_err());
     Ok(())
 }
 
@@ -215,7 +602,7 @@ fn batch_matches_single() -> Result<()> {
         true,
         "explicit Markov test calibration".into(),
     );
-    let mut markov = Markov::new(&d, &ops, &runtime, &calibration)?;
+    let mut markov = Markov::new(&d, &ops, &runtime, &calibration, SHAPE)?;
     let mut compared = 0;
     let mut differences = Differences::default();
     for (seed, file) in ["r0008", "r0042", "r0089", "r0140"].iter().enumerate() {
@@ -295,7 +682,7 @@ fn top4_matches_reference() -> Result<()> {
         true,
         "explicit Markov test calibration".into(),
     );
-    let mut markov = Markov::new(&d, &ops, &runtime, &calibration)?;
+    let mut markov = Markov::new(&d, &ops, &runtime, &calibration, SHAPE)?;
     let mut reference = reference::Reference::new(&d)?;
     let mut compared = 0;
     let mut differences = Differences::default();
@@ -381,7 +768,7 @@ fn batch_wall() -> Result<()> {
         true,
         "explicit Markov test calibration".into(),
     );
-    let mut markov = Markov::new(&d, &ops, &runtime, &calibration)?;
+    let mut markov = Markov::new(&d, &ops, &runtime, &calibration, SHAPE)?;
     let count = d.info.l2_bytes.max(1024 * 1024);
     let mut flush = d.stream.alloc_zeros::<bf16>(count)?;
     let zeros = d.stream.alloc_zeros::<bf16>(count)?;

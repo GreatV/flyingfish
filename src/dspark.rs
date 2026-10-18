@@ -28,9 +28,11 @@ pub struct DraftConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rope {
     pub rope_theta: f32,
     pub rope_type: String,
+    pub rope_dim: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,32 +98,56 @@ impl DraftConfig {
     pub fn capture_width(&self) -> usize {
         self.target_layer_ids.len() * self.hidden_size
     }
+    pub fn kv_dim(&self) -> usize {
+        self.num_key_value_heads * self.head_dim
+    }
+    pub fn qkv_dim(&self) -> usize {
+        (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim
+    }
     pub fn read(path: &Path, target: &Config) -> Result<Self> {
-        let path = path.join("config.json");
-        let c: Self = serde_json::from_slice(
-            &std::fs::read(&path)
-                .with_context(|| format!("read draft config {}", path.display()))?,
-        )?;
+        let c: Self = serde_json::from_value(read_config(path)?)?;
         ensure!(
             c.model_type == "qwen3" && c.architectures == ["Qwen3DSparkModel"],
             "unsupported DSpark architecture"
         );
         ensure!(c.dtype == "bfloat16", "DSpark dtype must be bfloat16");
         ensure!(
-            c.hidden_size == target.hidden_size
-                && c.intermediate_size == target.intermediate_size
-                && c.num_attention_heads == target.num_attention_heads
-                && c.num_key_value_heads == target.num_key_value_heads
-                && c.head_dim == target.head_dim,
-            "DSpark/target dimensions do not match"
+            c.hidden_size == target.hidden_size,
+            "DSpark/target hidden_size mismatch"
         );
         ensure!(
-            c.vocab_size == target.vocab_size && c.draft_vocab_size == target.vocab_size,
+            matches!(
+                (c.num_attention_heads, c.num_key_value_heads, c.head_dim),
+                (16, 2, 128) | (8, 2, 256)
+            ) && c.num_attention_heads.checked_mul(c.head_dim) == Some(c.hidden_size),
+            "unsupported DSpark attention geometry"
+        );
+        ensure!(
+            c.intermediate_size > 0 && c.intermediate_size.is_multiple_of(256),
+            "unsupported DSpark intermediate_size"
+        );
+        ensure!(
+            c.vocab_size == target.vocab_size,
             "DSpark shared vocabulary mismatch"
         );
         ensure!(
-            c.num_hidden_layers == 5 && c.block_size == 7 && c.markov_rank == 256,
-            "DSpark requires 5 layers, gamma7 and markov rank256"
+            c.draft_vocab_size == c.vocab_size,
+            "DSpark draft_vocab_size differs from vocab_size"
+        );
+        ensure!(
+            c.num_hidden_layers == 5 && c.markov_rank == 256,
+            "DSpark requires five layers and Markov rank256"
+        );
+        let row_limit = if c.head_dim == 128 { 8 } else { 64 };
+        ensure!(
+            (1..=row_limit).contains(&c.block_size),
+            "DSpark block_size exceeds its attention geometry row limit {row_limit}"
+        );
+        ensure!(
+            c.block_size.checked_mul(c.vocab_size).is_some()
+                && c.vocab_size <= i32::MAX as usize
+                && c.capture_width().checked_mul(c.hidden_size).is_some(),
+            "DSpark tensor extent overflow"
         );
         ensure!(
             c.num_target_layers == target.num_hidden_layers,
@@ -140,11 +166,136 @@ impl DraftConfig {
         );
         ensure!(
             c.rope_parameters.rope_type == "default"
-                && c.rope_parameters.rope_theta == target.rope_theta,
-            "DSpark/target RoPE mismatch"
+                && c.rope_parameters.rope_theta.is_finite()
+                && c.rope_parameters.rope_theta > 0.0
+                && c.rope_parameters.rope_dim.unwrap_or(c.head_dim) == c.head_dim,
+            "DSpark requires default full-head rotary geometry"
         );
+        if c.head_dim == 256 {
+            crate::op_contract::FullAttentionSpec {
+                hq: c.num_attention_heads as u32,
+                hkv: c.num_key_value_heads as u32,
+                d: c.head_dim as u32,
+                scale: (c.head_dim as f32).sqrt().recip(),
+                rms_eps: c.rms_norm_eps,
+                rope_theta: c.rope_parameters.rope_theta,
+                rotary_dim: c.head_dim as u32,
+            }
+            .validate()
+            .context("unsupported DSpark full-attention parameters")?;
+        }
         Ok(c)
     }
+}
+
+fn read_config(path: &Path) -> Result<serde_json::Value> {
+    let path = path.join("config.json");
+    let mut value: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("read draft config {}", path.display()))?,
+    )?;
+    if let Some(nested) = value.get("dflash_config").cloned() {
+        let fields = nested.as_object().context("invalid DSpark dflash_config")?;
+        for name in fields.keys() {
+            ensure!(
+                matches!(
+                    name.as_str(),
+                    "target_layer_ids"
+                        | "mask_token_id"
+                        | "markov_rank"
+                        | "markov_head_type"
+                        | "projector_type"
+                        | "attention_mode"
+                        | "enable_confidence_head"
+                        | "confidence_head_with_markov"
+                        | "confidence_head_alpha"
+                ),
+                "unknown DSpark dflash_config field {name}"
+            );
+        }
+        let root = value.as_object_mut().context("invalid DSpark config")?;
+        for name in [
+            "target_layer_ids",
+            "mask_token_id",
+            "markov_rank",
+            "markov_head_type",
+            "projector_type",
+            "attention_mode",
+            "enable_confidence_head",
+            "confidence_head_with_markov",
+            "confidence_head_alpha",
+        ] {
+            if let Some(field) = fields.get(name) {
+                if let Some(existing) = root.get(name) {
+                    ensure!(
+                        name != "target_layer_ids" && existing == field,
+                        "ambiguous DSpark config field {name}"
+                    );
+                }
+                root.insert(name.into(), field.clone());
+            }
+        }
+    }
+    for (name, expected) in [
+        ("attention_mode", serde_json::json!("gqa")),
+        ("enable_confidence_head", serde_json::json!(true)),
+        ("confidence_head_with_markov", serde_json::json!(true)),
+        ("attention_bias", serde_json::json!(false)),
+        ("mlp_bias", serde_json::json!(false)),
+        ("hidden_act", serde_json::json!("silu")),
+        ("sliding_window", serde_json::Value::Null),
+        ("use_sliding_window", serde_json::json!(false)),
+        ("tie_word_embeddings", serde_json::json!(false)),
+    ] {
+        if let Some(actual) = value.get(name) {
+            ensure!(*actual == expected, "unsupported DSpark {name}");
+        }
+    }
+    if let Some(alpha) = value.get("confidence_head_alpha") {
+        ensure!(
+            alpha.as_f64() == Some(1.0),
+            "unsupported DSpark confidence_head_alpha"
+        );
+    }
+    if let Some(types) = value.get("layer_types") {
+        ensure!(
+            types.as_array().is_some_and(|types| {
+                value["num_hidden_layers"].as_u64() == Some(types.len() as u64)
+                    && types.iter().all(|kind| kind == "full_attention")
+            }),
+            "unsupported DSpark layer_types"
+        );
+    }
+    if let Some(rope) = value.get("rope_parameters") {
+        serde_json::from_value::<Rope>(rope.clone()).context("invalid DSpark rope_parameters")?;
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn read_capture_layers(path: &Path, target: &Config) -> Result<Vec<usize>> {
+    let value = read_config(path)?;
+    ensure!(
+        value["architectures"] == serde_json::json!(["Qwen3DSparkModel"]),
+        "unsupported capture draft architecture"
+    );
+    for (name, expected) in [
+        ("hidden_size", target.hidden_size),
+        ("vocab_size", target.vocab_size),
+        ("num_target_layers", target.num_hidden_layers),
+    ] {
+        ensure!(
+            value[name].as_u64() == Some(u64::try_from(expected)?),
+            "capture draft/target {name} mismatch"
+        );
+    }
+    let ids: Vec<usize> = serde_json::from_value(
+        value
+            .get("target_layer_ids")
+            .context("DSpark target_layer_ids missing")?
+            .clone(),
+    )?;
+    check_capture_layers(&ids, target.num_hidden_layers)?;
+    Ok(ids)
 }
 
 fn check_capture_layers(ids: &[usize], target_layers: usize) -> Result<()> {
@@ -183,11 +334,6 @@ pub fn accept(proposals: &[u32], predictions: &[u32]) -> Result<Accept> {
     })
 }
 
-// target_layer_ids 中 i 指 decoder 层 i 的输出，即 hidden_states[i + 1]。
-pub fn capture_slot(ids: &[usize], decoder_layer: usize) -> Option<usize> {
-    ids.iter().position(|&i| i == decoder_layer)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +361,229 @@ mod tests {
             }
         );
         assert!(accept(&[3, 4, 5], &[3, 4, 5]).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn target_capture_metadata_preserves_slots_and_rejects_bad_extents() -> Result<()> {
+        let target: Config = serde_json::from_value(serde_json::json!({
+            "model_type":"llama", "hidden_size":2048, "intermediate_size":6144,
+            "num_hidden_layers":42, "num_attention_heads":16, "num_key_value_heads":2,
+            "head_dim":128, "vocab_size":130560, "max_position_embeddings":32768,
+            "rms_norm_eps":1e-6, "rope_theta":5000000.0, "rope_scaling":null,
+            "hidden_act":"silu", "tie_word_embeddings":false,
+            "torch_dtype":"bfloat16", "eos_token_id":[2]
+        }))?;
+        let ids = [39usize, 1, 30, 10, 20];
+        let flat = serde_json::json!({
+            "architectures":["Qwen3DSparkModel"], "hidden_size":2048,
+            "vocab_size":130560, "num_target_layers":42, "target_layer_ids":ids
+        });
+        let mut nested = flat.clone();
+        nested
+            .as_object_mut()
+            .context("capture config object")?
+            .remove("target_layer_ids");
+        nested["dflash_config"] = serde_json::json!({"target_layer_ids":ids});
+        let root = std::env::temp_dir().join(format!(
+            "flyingfish-capture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let write = |value: &serde_json::Value| -> Result<()> {
+                Ok(std::fs::write(
+                    root.join("config.json"),
+                    serde_json::to_vec(value)?,
+                )?)
+            };
+            for value in [&flat, &nested] {
+                write(value)?;
+                ensure!(
+                    read_capture_layers(&root, &target)? == ids,
+                    "capture slot order changed"
+                );
+            }
+            ensure!(
+                serde_json::from_value::<Vec<usize>>(nested["target_layer_ids"].clone()).is_err(),
+                "flat-only capture control accepted nested metadata"
+            );
+            let mut invalid = vec![flat.clone(); 7];
+            invalid[0]["dflash_config"] = serde_json::json!({"target_layer_ids":ids});
+            invalid[1]["target_layer_ids"] = serde_json::json!([1, 10, 20, 30, 42]);
+            invalid[2]["target_layer_ids"] = serde_json::json!([1, 10, 20, 30, 30]);
+            invalid[3]["target_layer_ids"] = serde_json::json!([1, 10, 20, 30]);
+            invalid[4]["hidden_size"] = serde_json::json!(5120);
+            invalid[5]["vocab_size"] = serde_json::json!(248144);
+            invalid[6]["num_target_layers"] = serde_json::json!(40);
+            for value in invalid {
+                write(&value)?;
+                ensure!(
+                    read_capture_layers(&root, &target).is_err(),
+                    "invalid capture extent admitted"
+                );
+            }
+            let mut full = flat.clone();
+            for (name, value) in serde_json::json!({
+                "model_type":"qwen3", "dtype":"bfloat16", "intermediate_size":6144,
+                "num_hidden_layers":5, "num_attention_heads":16, "num_key_value_heads":2,
+                "head_dim":128, "draft_vocab_size":130560, "rms_norm_eps":1e-6,
+                "block_size":7, "mask_token_id":75982, "markov_rank":256,
+                "markov_head_type":"vanilla", "projector_type":"dspark",
+                "rope_parameters":{"rope_theta":5000000.0,"rope_type":"default"}
+            })
+            .as_object()
+            .context("draft fixture object")?
+            {
+                full[name] = value.clone();
+            }
+            write(&full)?;
+            ensure!(
+                DraftConfig::read(&root, &target)?.block_size == 7,
+                "dense draft rejected"
+            );
+            let flat = full.clone();
+            let mut hybrid_target = target.clone();
+            hybrid_target.intermediate_size = 512;
+            hybrid_target.num_attention_heads = 16;
+            hybrid_target.head_dim = 256;
+            hybrid_target.vocab_size = 248144;
+            hybrid_target.num_hidden_layers = 40;
+            hybrid_target.rope_theta = 1e7;
+            for (name, value) in serde_json::json!({
+                "num_attention_heads":8, "head_dim":256, "vocab_size":248144,
+                "draft_vocab_size":248144, "num_target_layers":40, "block_size":15,
+                "rope_parameters":{"rope_theta":1e7,"rope_type":"default","rope_dim":256}
+            })
+            .as_object()
+            .context("hybrid draft fixture object")?
+            {
+                full[name] = value.clone();
+            }
+            let mut nested = serde_json::Map::new();
+            for name in [
+                "target_layer_ids",
+                "mask_token_id",
+                "markov_rank",
+                "markov_head_type",
+                "projector_type",
+            ] {
+                nested.insert(
+                    name.into(),
+                    full.as_object_mut()
+                        .context("draft object")?
+                        .remove(name)
+                        .context("draft field")?,
+                );
+            }
+            nested.insert(
+                "target_layer_ids".into(),
+                serde_json::json!([3, 11, 19, 27, 35]),
+            );
+            nested.insert("mask_token_id".into(), serde_json::json!(248076));
+            nested.insert("enable_confidence_head".into(), serde_json::json!(true));
+            full["dflash_config"] = nested.into();
+            write(&full)?;
+            let draft = DraftConfig::read(&root, &hybrid_target)?;
+            ensure!(
+                draft.block_size == 15 && draft.kv_dim() == 512 && draft.qkv_dim() == 3072,
+                "draft geometry borrowed target dimensions"
+            );
+            let mut admitted = Vec::new();
+            for (schema, original, target) in
+                [("flat", &flat, &target), ("nested", &full, &hybrid_target)]
+            {
+                for (field, value) in [
+                    ("attention_mode", serde_json::json!("mha")),
+                    ("enable_confidence_head", serde_json::json!(false)),
+                    ("confidence_head_with_markov", serde_json::json!(false)),
+                    ("confidence_head_alpha", serde_json::json!(0.5)),
+                    ("attention_bias", serde_json::json!(true)),
+                    ("mlp_bias", serde_json::json!(true)),
+                    ("hidden_act", serde_json::json!("gelu")),
+                    ("sliding_window", serde_json::json!(4096)),
+                    ("use_sliding_window", serde_json::json!(true)),
+                    (
+                        "layer_types",
+                        serde_json::json!(vec!["sliding_attention"; 5]),
+                    ),
+                    ("tie_word_embeddings", serde_json::json!(true)),
+                ] {
+                    let mut invalid = original.clone();
+                    if schema == "nested"
+                        && [
+                            "attention_mode",
+                            "enable_confidence_head",
+                            "confidence_head_with_markov",
+                            "confidence_head_alpha",
+                        ]
+                        .contains(&field)
+                    {
+                        invalid["dflash_config"][field] = value;
+                    } else {
+                        invalid[field] = value;
+                    }
+                    write(&invalid)?;
+                    let rejected = DraftConfig::read(&root, target).is_err();
+                    println!(
+                        "DSPARK_CONFIG_REJECTION schema={schema} field={field} rejected={rejected}"
+                    );
+                    if !rejected {
+                        admitted.push(format!("{schema}.{field}"));
+                    }
+                }
+                let mut invalid = original.clone();
+                invalid["rope_parameters"]["unknown_rope"] = serde_json::json!(true);
+                write(&invalid)?;
+                let rejected = DraftConfig::read(&root, target).is_err();
+                println!(
+                    "DSPARK_CONFIG_REJECTION schema={schema} field=rope_parameters.unknown_rope rejected={rejected}"
+                );
+                if !rejected {
+                    admitted.push(format!("{schema}.rope_parameters.unknown_rope"));
+                }
+            }
+            let mut invalid = full.clone();
+            invalid["dflash_config"]["unknown_draft"] = serde_json::json!(true);
+            write(&invalid)?;
+            let rejected = DraftConfig::read(&root, &hybrid_target).is_err();
+            println!(
+                "DSPARK_CONFIG_REJECTION schema=nested field=dflash_config.unknown_draft rejected={rejected}"
+            );
+            if !rejected {
+                admitted.push("nested.dflash_config.unknown_draft".into());
+            }
+            ensure!(
+                admitted.is_empty(),
+                "unsupported draft fields admitted: {admitted:?}"
+            );
+            for (field, value) in [
+                ("draft_vocab_size", serde_json::json!(130560)),
+                ("block_size", serde_json::json!(65)),
+                ("num_attention_heads", serde_json::json!(16)),
+                ("enable_confidence_head", serde_json::json!(false)),
+                (
+                    "rope_parameters",
+                    serde_json::json!({"rope_theta":1e7,"rope_type":"default","rope_dim":64}),
+                ),
+            ] {
+                let mut invalid = full.clone();
+                invalid[field] = value;
+                write(&invalid)?;
+                ensure!(
+                    DraftConfig::read(&root, &hybrid_target).is_err(),
+                    "invalid draft geometry admitted"
+                );
+            }
+            Ok(())
+        })();
+        let cleanup = std::fs::remove_dir_all(root);
+        result?;
+        cleanup?;
+        Ok(())
     }
 }
 

@@ -131,12 +131,6 @@ impl MixerWork {
     }
 }
 
-/// DSpark capture destination for one layer slot.
-struct Capture<'a> {
-    buffer: &'a mut CudaSlice<bf16>,
-    slot: usize,
-}
-
 impl Work {
     fn new(
         stream: &Arc<CudaStream>,
@@ -228,46 +222,6 @@ impl Work {
         Ok(())
     }
 
-    /// add_rmsnorm plus the DSpark capture mirror of the residual stream it
-    /// just wrote: capture[row][slot * hidden + d] = x[row][d].
-    fn add_norm_capture(
-        &mut self,
-        ops: &Ops,
-        stream: &Arc<CudaStream>,
-        weight: &CudaSlice<bf16>,
-        capture: Capture<'_>,
-        rows: usize,
-        c: &Config,
-    ) -> Result<()> {
-        let Capture {
-            buffer: capture,
-            slot,
-        } = capture;
-        ensure!(
-            capture.len() >= rows * 5 * c.hidden_size,
-            "DSpark capture buffer is too small for the capture column copy"
-        );
-        let (res, _res) = self.x.device_ptr_mut(stream);
-        let (cap, _cap) = capture.device_ptr_mut(stream);
-        unsafe {
-            stream
-                .launch_builder(&ops.add_norm_capture)
-                .arg(&self.out)
-                .arg(&res)
-                .arg(weight)
-                .arg(&mut self.n)
-                .arg(&res)
-                .arg(&cap)
-                .arg(&(rows as i32))
-                .arg(&(c.hidden_size as i32))
-                .arg(&c.rms_norm_eps)
-                .arg(&((5 * c.hidden_size) as i32))
-                .arg(&((slot * c.hidden_size) as i32))
-                .launch(grid(rows, 256))?;
-        }
-        Ok(())
-    }
-
     fn advance(&mut self, ops: &Ops, stream: &Arc<CudaStream>) -> Result<()> {
         unsafe {
             stream
@@ -335,6 +289,53 @@ impl Views<'_> {
     }
 }
 
+struct HiddenCapture {
+    values: CudaSlice<bf16>,
+    layer_slots: Vec<Option<u32>>,
+    taps: usize,
+    width: usize,
+}
+
+impl HiddenCapture {
+    fn new(ids: &[usize], config: &Config, rows: usize, stream: &Arc<CudaStream>) -> Result<Self> {
+        let mut layer_slots = vec![None; config.num_hidden_layers];
+        for (slot, &layer) in ids.iter().enumerate() {
+            // Slots store decoder-layer outputs, hidden_states[layer + 1].
+            let entry = layer_slots
+                .get_mut(layer)
+                .context("capture layer outside target")?;
+            ensure!(entry.is_none(), "duplicate capture layer {layer}");
+            *entry = Some(u32::try_from(slot)?);
+        }
+        let width = ids
+            .len()
+            .checked_mul(config.hidden_size)
+            .filter(|&width| width > 0 && width <= i32::MAX as usize)
+            .context("capture row width overflow")?;
+        let elements = rows
+            .checked_mul(width)
+            .and_then(|n| n.checked_mul(size_of::<bf16>()))
+            .context("capture allocation size overflow")?
+            / size_of::<bf16>();
+        Ok(Self {
+            values: stream.alloc_zeros(elements)?,
+            layer_slots,
+            taps: ids.len(),
+            width,
+        })
+    }
+
+    fn grow(&mut self, rows: usize, stream: &Arc<CudaStream>) -> Result<()> {
+        let elements = rows
+            .checked_mul(self.width)
+            .and_then(|n| n.checked_mul(size_of::<bf16>()))
+            .context("capture allocation size overflow")?
+            / size_of::<bf16>();
+        self.values = stream.alloc_zeros(elements)?;
+        Ok(())
+    }
+}
+
 struct Spec {
     eos: Vec<u32>,
     tree_verify_graph: Option<CudaGraph>,
@@ -349,7 +350,6 @@ struct Spec {
     graph: bool,
     verification: Option<super::verification::Verification>,
     draft: super::draft::Draft,
-    capture: CudaSlice<bf16>,
     logits: CudaSlice<bf16>,
     predictions: CudaSlice<u32>,
     row_counts: CudaSlice<i32>,
@@ -452,6 +452,7 @@ pub struct Engine {
     profile_rounds: bool,
     runtime: PathBuf,
     spec: Option<Spec>,
+    hidden_capture: Option<HiddenCapture>,
     qwen: Option<qwen::Runtime>,
     mtp: Option<mtp::Chain>,
     mtp_state: Option<super::state::StateStore>,
@@ -717,6 +718,14 @@ impl Engine {
         command.push_str(" calibrate");
         let closure = Rc::new(super::closure::Closure::new(write, command));
         let config = Config::read(dir)?;
+        if let Some(path) = &draft_path {
+            let draft = crate::dspark::DraftConfig::read(path, &config)?;
+            ensure!(
+                draft.block_size == 7,
+                "unsupported Llama DSpark block_size={}; proposal/verification requires 7 proposals and 8 verify rows",
+                draft.block_size
+            );
+        }
         let model_spec = crate::model_spec::ModelSpec::from_llama(&config)?;
         ensure!(
             capacity > 0
@@ -777,6 +786,7 @@ impl Engine {
             profile_rounds: false,
             runtime,
             spec: None,
+            hidden_capture: None,
             graph: None,
             weights,
             state,
@@ -817,7 +827,14 @@ impl Engine {
                 engine.capacity,
                 engine.workspace_rows,
                 &mut engine.blas,
+                super::markov::ScoreRounding::Bf16,
             )?;
+            engine.hidden_capture = Some(HiddenCapture::new(
+                &draft.config.target_layer_ids,
+                &engine.config,
+                engine.workspace_rows,
+                &engine.device.stream,
+            )?);
             engine.prepare(8)?;
             engine
                 .blas
@@ -857,7 +874,6 @@ impl Engine {
                 inject_graphs: (0..8).map(|_| None).collect(),
                 verification: None,
                 draft,
-                capture: s.alloc_zeros(engine.workspace_rows * 5 * engine.config.hidden_size)?,
                 logits: s.alloc_zeros(rows * engine.config.vocab_size)?,
                 predictions: s.alloc_zeros(rows)?,
                 row_counts,
@@ -898,11 +914,10 @@ impl Engine {
             self.work
                 .grow(&self.device.stream, &self.model_spec, rows)?;
             if let Some(spec) = &mut self.spec {
-                spec.draft.grow(&self.config, rows)?;
-                spec.capture = self
-                    .device
-                    .stream
-                    .alloc_zeros(rows * 5 * self.config.hidden_size)?;
+                spec.draft.grow(rows)?;
+            }
+            if let Some(capture) = &mut self.hidden_capture {
+                capture.grow(rows, &self.device.stream)?;
             }
         }
         if rows != old_rows || chunk != old_chunk {
@@ -928,7 +943,12 @@ impl Engine {
             free,
             total,
             Flash::tile(self.config.head_dim)?,
-            self.spec.is_some(),
+            self.hidden_capture
+                .as_ref()
+                .map_or(0, |capture| capture.width * 2)
+                + self.spec.as_ref().map_or(0, |spec| {
+                    (2 * spec.draft.config.hidden_size + 5 * spec.draft.config.kv_dim()) * 2
+                }),
         )?;
         let rows = self.spec_budget.workspace_rows(plan.chunk);
         let required = rows
@@ -1651,21 +1671,38 @@ impl Engine {
                 } else {
                     &self.weights.norm
                 };
-                if let Some(spec) = self.spec.as_mut()
-                    && let Some(slot) =
-                        crate::dspark::capture_slot(&spec.draft.config.target_layer_ids, i)
+                if let Some(binding) = self.hidden_capture.as_mut()
+                    && let Some(slot) = binding.layer_slots[i]
                 {
-                    // Capture layer: the capture copy is folded into the norm.
-                    w.add_norm_capture(
-                        &self.ops,
+                    use super::contracts::TensorMut;
+                    use super::ops::{ResidualRmsCapture, ResidualRmsInput, RmsMode, RmsOptions};
+                    let taps = binding.taps;
+                    let mut x = TensorMut(qwen::heads(&w.x, s, 0, rows, 1, h as u32)?);
+                    let mut y = TensorMut(qwen::heads(&w.n, s, 0, rows, 1, h as u32)?);
+                    let mut capture = TensorMut(super::contracts::view(
+                        &binding.values,
                         s,
-                        weight,
-                        Capture {
-                            buffer: &mut spec.capture,
+                        0,
+                        [rows as u32, taps as u32, h as u32],
+                        [(taps * h) as u64, h as u64, 1],
+                    )?);
+                    self.ops.add_rmsnorm_capture(
+                        s,
+                        None,
+                        ResidualRmsCapture {
+                            input: ResidualRmsInput {
+                                x: &mut x,
+                                residual: qwen::heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                weight: qwen::vector(weight, s)?,
+                            },
+                            capture: &mut capture,
                             slot,
                         },
-                        rows,
-                        c,
+                        &mut y,
+                        RmsOptions {
+                            mode: RmsMode::Standard,
+                            eps: c.rms_norm_eps,
+                        },
                     )?;
                 } else {
                     w.add_norm(&self.ops, s, weight, rows, c)?;
@@ -2914,7 +2951,14 @@ impl Engine {
     fn tree_gather_scatter(&mut self) -> Result<()> {
         let spec = self.spec.as_mut().context("draft State is not enabled")?;
         let state = spec.tree.as_mut().context("tree State is not enabled")?;
-        state.gather_path(&self.state.kv, &spec.capture)?;
+        state.gather_path(
+            &self.state.kv,
+            &self
+                .hidden_capture
+                .as_ref()
+                .context("target capture missing")?
+                .values,
+        )?;
         state.scatter(&mut self.state.kv)
     }
 
@@ -2947,7 +2991,6 @@ impl Engine {
             super::draft::Compute {
                 ops: &self.ops,
                 blas: &mut self.blas,
-                config: &self.config,
             },
         )
     }
@@ -3007,10 +3050,14 @@ impl Engine {
             .as_ref()
             .context("tree State is not enabled")?
             .rows();
+        let capture = self
+            .hidden_capture
+            .as_ref()
+            .context("target capture missing")?;
         Ok(self
             .device
             .stream
-            .clone_dtoh(&spec.capture.slice(..rows * 5 * self.config.hidden_size))?
+            .clone_dtoh(&capture.values.slice(..rows * capture.width))?
             .into_iter()
             .map(bf16::to_f32)
             .collect())
@@ -3227,13 +3274,16 @@ impl Engine {
     ) -> Result<()> {
         let spec = self.spec.as_mut().context("draft state is not enabled")?;
         spec.draft.inject(
-            &spec.capture,
+            &self
+                .hidden_capture
+                .as_ref()
+                .context("target capture missing")?
+                .values,
             rows,
             start,
             super::draft::Compute {
                 ops: &self.ops,
                 blas: &mut self.blas,
-                config: &self.config,
             },
             trace,
         )
@@ -3250,11 +3300,10 @@ impl Engine {
                     &self.work.token,
                     &self.work.position,
                     start,
-                    &self.weights,
+                    (&self.weights.embed, &self.weights.head),
                     super::draft::Compute {
                         ops: &self.ops,
                         blas: &mut self.blas,
-                        config: &self.config,
                     },
                 ),
             SpecPhase::Verify => {
@@ -3279,14 +3328,17 @@ impl Engine {
             SpecPhase::Inject(rows) => {
                 let spec = self.spec.as_mut().context("draft is not enabled")?;
                 spec.draft.inject_device(
-                    &spec.capture,
+                    &self
+                        .hidden_capture
+                        .as_ref()
+                        .context("target capture missing")?
+                        .values,
                     rows,
                     start,
                     &self.work.position,
                     super::draft::Compute {
                         ops: &self.ops,
                         blas: &mut self.blas,
-                        config: &self.config,
                     },
                 )
             }
@@ -3355,11 +3407,10 @@ impl Engine {
                 &self.work.token,
                 &self.work.position,
                 start,
-                &self.weights,
+                (&self.weights.embed, &self.weights.head),
                 super::draft::Compute {
                     ops: &self.ops,
                     blas: &mut self.blas,
-                    config: &self.config,
                 },
             )
     }
@@ -3403,6 +3454,10 @@ impl Engine {
         mut trace: Option<&mut Trace>,
         prefix: &str,
     ) -> Result<crate::dspark::Round> {
+        ensure!(
+            self.qwen.is_none(),
+            "Qwen DSpark proposal/verification execution is not bound"
+        );
         self.closure.assert_ready()?;
         if self.spec_budget.is_tree() {
             return self.tree_round(limit, trace, prefix);
@@ -3451,11 +3506,10 @@ impl Engine {
             spec.draft.propose(
                 anchor,
                 start,
-                &self.weights,
+                (&self.weights.embed, &self.weights.head),
                 super::draft::Compute {
                     ops: &self.ops,
                     blas: &mut self.blas,
-                    config: &self.config,
                 },
                 trace.as_deref_mut().map(|t| (t, prefix)),
                 None,
@@ -3635,11 +3689,10 @@ impl Engine {
             spec.draft.forward_base(
                 anchor,
                 start,
-                &self.weights,
+                (&self.weights.embed, &self.weights.head),
                 super::draft::Compute {
                     ops: &self.ops,
                     blas: &mut self.blas,
-                    config: &self.config,
                 },
             )?;
         }
@@ -3839,16 +3892,20 @@ impl Engine {
             rows > 0 && (rows > 16 || rows <= limit),
             "injection rows {rows} exceed declared small-row limit {limit}"
         );
+        ensure!(self.spec.is_some(), "draft is not enabled");
+        let capture = self
+            .hidden_capture
+            .as_mut()
+            .context("target capture missing")?;
         ensure!(
-            hidden.len() == rows * 5 * self.config.hidden_size,
+            rows.checked_mul(capture.width) == Some(hidden.len()),
             "injected hidden shape mismatch"
         );
-        let spec = self.spec.as_mut().context("draft is not enabled")?;
         ensure!(rows <= self.workspace_rows, "injection exceeds workspace");
         let values: Vec<bf16> = hidden.iter().copied().map(bf16::from_f32).collect();
         self.device
             .stream
-            .memcpy_htod(&values, &mut spec.capture.slice_mut(..values.len()))?;
+            .memcpy_htod(&values, &mut capture.values.slice_mut(..values.len()))?;
         self.inject_capture(rows, start, None)
     }
 
@@ -3860,6 +3917,10 @@ impl Engine {
         prefix: &str,
         forced: Option<&[u32]>,
     ) -> Result<Vec<u32>> {
+        ensure!(
+            self.qwen.is_none(),
+            "Qwen DSpark proposal execution is not bound"
+        );
         let spec = self.spec.as_mut().context("draft is not enabled")?;
         spec.draft.setup_attention(
             &self.device,
@@ -3871,11 +3932,10 @@ impl Engine {
         spec.draft.propose(
             anchor,
             position,
-            &self.weights,
+            (&self.weights.embed, &self.weights.head),
             super::draft::Compute {
                 ops: &self.ops,
                 blas: &mut self.blas,
-                config: &self.config,
             },
             Some((trace, prefix)),
             forced,
@@ -3887,7 +3947,7 @@ impl Engine {
             .as_ref()
             .context("draft is not enabled")?
             .draft
-            .snapshot_kv(trace, start, rows, &self.config)
+            .snapshot_kv(trace, start, rows)
     }
 
     pub fn position(&self) -> usize {
@@ -4022,7 +4082,15 @@ impl Engine {
             });
         }
         if budget.is_some_and(SpecBudget::is_tree) {
-            paths.push(super::markov_calibrate::cache_path(&self.runtime, &key));
+            paths.push(super::markov_calibrate::cache_path(
+                &self.runtime,
+                &key,
+                self.spec
+                    .as_ref()
+                    .context("tree draft missing")?
+                    .draft
+                    .markov_shape(),
+            ));
         }
         paths.push(profile.path(&self.runtime, &key)?);
         self.closure.preflight(&paths)?;
@@ -4058,7 +4126,7 @@ impl Engine {
                         .as_ref()
                         .context("draft shape without draft")?
                         .draft
-                        .calibrate_injection(&mut self.blas, &input.slice(..), shape)?;
+                        .calibrate_shape(&mut self.blas, &input.slice(..), shape)?;
                 }
             }
         } else {
@@ -4258,11 +4326,12 @@ impl Engine {
         }
         s.memset_zeros(&mut self.work.ids)?;
         s.memset_zeros(&mut self.work.token)?;
+        if let Some(capture) = &mut self.hidden_capture {
+            s.memset_zeros(&mut capture.values)?;
+        }
         if let Some(spec) = &mut self.spec {
             spec.draft.reset_setup()?;
-            for value in [&mut spec.capture, &mut spec.logits] {
-                s.memset_zeros(value)?;
-            }
+            s.memset_zeros(&mut spec.logits)?;
             s.memset_zeros(&mut spec.predictions)?;
             spec.active_rows = 0;
             if let Some(tree) = &mut spec.tree {

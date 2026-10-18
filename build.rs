@@ -197,6 +197,14 @@ fn main() {
                     "_q16_kv2",
                     &["-DATTENTION_Q_HEADS=16", "-DATTENTION_KV_HEADS=2"],
                 ),
+                (
+                    "_q8_kv2",
+                    &[
+                        "-DATTENTION_Q_HEADS=8",
+                        "-DATTENTION_KV_HEADS=2",
+                        "-DATTENTION_ROTARY_DIM=256",
+                    ],
+                ),
             ]
         } else {
             &[("", &[])]

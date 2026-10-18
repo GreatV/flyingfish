@@ -100,7 +100,7 @@ fn shapes(
     c: &Config,
     small_rows: usize,
     budget: Option<SpecBudget>,
-    dimensions: Option<(usize, usize)>,
+    draft: Option<&crate::dspark::DraftConfig>,
 ) -> Result<(BTreeSet<LinearShape>, Pairs)> {
     let mut linear = BTreeSet::new();
     let mut pairs = BTreeSet::new();
@@ -127,17 +127,27 @@ fn shapes(
     }
     add(1, c.vocab_size, c.hidden_size);
     if let Some(budget) = budget {
-        let (context, rank) =
-            dimensions.context("draft dimensions missing from closure declaration")?;
-        add(7, c.vocab_size, c.hidden_size);
+        let draft = draft.context("draft config missing from closure declaration")?;
+        for (output, input) in [
+            (draft.qkv_dim(), draft.hidden_size),
+            (draft.hidden_size, draft.hidden_size),
+            (2 * draft.intermediate_size, draft.hidden_size),
+            (draft.hidden_size, draft.intermediate_size),
+            (draft.vocab_size, draft.hidden_size),
+        ] {
+            add(draft.block_size, output, input);
+        }
         add(budget.rows(), c.vocab_size, c.hidden_size);
         let max = injection_limit(small_rows);
         for rows in 1..=max {
-            for (output, input) in [(c.hidden_size, context), (c.kv_dim(), c.hidden_size)] {
+            for (output, input) in [
+                (draft.hidden_size, draft.capture_width()),
+                (draft.kv_dim(), draft.hidden_size),
+            ] {
                 add(rows, output, input);
             }
         }
-        add(1, c.vocab_size, rank);
+        add(1, draft.vocab_size, draft.markov_rank);
     }
     Ok((linear, pairs))
 }
@@ -152,10 +162,9 @@ impl Profile {
         draft: Option<&Path>,
         draft_config: Option<&crate::dspark::DraftConfig>,
     ) -> Result<Self> {
-        let dimensions = draft_config.map(|d| (d.capture_width(), d.markov_rank));
         let small_rows = small_rows(chunk, capacity);
         ensure!(small_rows > 0, "empty profile row bound");
-        let (linear, pairs) = shapes(c, small_rows, budget, dimensions)?;
+        let (linear, pairs) = shapes(c, small_rows, budget, draft_config)?;
         Ok(Self {
             linear,
             pairs,
@@ -387,22 +396,229 @@ mod tests {
         Ok(serde_json::from_value(config_value())?)
     }
 
+    fn draft_value() -> serde_json::Value {
+        serde_json::json!({
+            "model_type":"qwen3", "architectures":["Qwen3DSparkModel"], "dtype":"bfloat16",
+            "hidden_size":2048, "intermediate_size":6144, "num_hidden_layers":5,
+            "num_attention_heads":16, "num_key_value_heads":2, "head_dim":128,
+            "vocab_size":130560, "draft_vocab_size":130560, "rms_norm_eps":1e-6,
+            "block_size":7, "mask_token_id":75982, "target_layer_ids":[1,10,20,30,39],
+            "num_target_layers":42, "markov_rank":256, "markov_head_type":"vanilla",
+            "projector_type":"dspark", "rope_parameters":{"rope_theta":5000000.0,"rope_type":"default"}
+        })
+    }
+
+    #[test]
+    fn draft_linear_closure_covers_all_execution_sites() -> Result<()> {
+        let source = include_str!("draft.rs");
+        for (function, sites) in [("inject_block", 3), ("block", 6)] {
+            let body = source
+                .split_once(&format!("    fn {function}("))
+                .context("draft execution function missing")?
+                .1
+                .split_once("\n    }\n")
+                .context("draft execution function end missing")?
+                .0;
+            assert_eq!(body.matches("blas.linear(").count(), sites);
+        }
+        let mut target_value = config_value();
+        target_value["num_key_value_heads"] = 4.into();
+        let c: Config = serde_json::from_value(target_value.clone())?;
+        let mut draft_value = draft_value();
+        draft_value["intermediate_size"] = 8192.into();
+        let root = std::env::temp_dir().join(format!(
+            "flyingfish-draft-linears-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let model = root.join("target");
+            let draft_dir = root.join("draft");
+            fs::create_dir(&model)?;
+            fs::create_dir(&draft_dir)?;
+            fs::write(
+                model.join("config.json"),
+                serde_json::to_vec(&target_value)?,
+            )?;
+            fs::write(
+                draft_dir.join("config.json"),
+                serde_json::to_vec(&draft_value)?,
+            )?;
+            let draft = crate::dspark::DraftConfig::read(&draft_dir, &c)?;
+            let (h, f, kv, rows) = (
+                draft.hidden_size,
+                draft.intermediate_size,
+                draft.num_key_value_heads * draft.head_dim,
+                draft.block_size,
+            );
+            let (mut cells, mut checks, mut defects) = (0, 0, 0);
+            for budget in [
+                SpecBudget::Chain,
+                SpecBudget::Tree16,
+                SpecBudget::Tree32,
+                SpecBudget::Tree64,
+            ] {
+                for chunk in [1, 16, 256] {
+                    let profile = Profile::new(
+                        &c,
+                        4096,
+                        chunk,
+                        Some(budget),
+                        &model,
+                        Some(&draft_dir),
+                        Some(&draft),
+                    )?;
+                    let mut missing = BTreeSet::new();
+                    for injected in 1..=injection_limit(small_rows(chunk, 4096)) {
+                        for (site, rows, output, input) in [
+                            (
+                                "inject_block/fc",
+                                injected,
+                                h,
+                                draft.target_layer_ids.len() * h,
+                            ),
+                            ("inject_block/k", injected, kv, h),
+                            ("inject_block/v", injected, kv, h),
+                            (
+                                "block/qkv",
+                                rows,
+                                (draft.num_attention_heads + 2 * draft.num_key_value_heads)
+                                    * draft.head_dim,
+                                h,
+                            ),
+                            ("block/o", rows, h, h),
+                            ("block/gate_up", rows, 2 * f, h),
+                            ("block/down", rows, h, f),
+                            ("block/target_head", rows, draft.vocab_size, h),
+                            ("block/markov_w2", 1, draft.vocab_size, draft.markov_rank),
+                        ] {
+                            let shape = LinearShape {
+                                rows,
+                                output,
+                                input,
+                            };
+                            if !profile.linear.contains(&shape)
+                                || !profile.pairs.contains(&(output, input))
+                            {
+                                missing.insert((site, rows, output, input));
+                                defects += 1;
+                            }
+                            checks += 1;
+                        }
+                    }
+                    if !missing.is_empty() {
+                        println!(
+                            "DEFECT PR61_DRAFT_LINEAR budget={budget:?} chunk={chunk} missing={missing:?}"
+                        );
+                    }
+                    cells += 1;
+                }
+            }
+            println!(
+                "PR61_DRAFT_LINEAR_CLOSURE sites=9 profile_cells={cells} shape_checks={checks} target_kv=4 draft_kv=2 target_intermediate=6144 draft_intermediate=8192 defects={defects} {}",
+                if defects == 0 { "PASS" } else { "DEFECT" }
+            );
+            ensure!(defects == 0, "draft execution linears missing from closure");
+            Ok(())
+        })();
+        fs::remove_dir_all(&root)?;
+        result
+    }
+
+    #[test]
+    fn draft_mlp_closure_covers_distinct_intermediate_size() -> Result<()> {
+        let c = config()?;
+        let mut draft_value = draft_value();
+        let root = std::env::temp_dir().join(format!(
+            "flyingfish-draft-closure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let model = root.join("target");
+            let draft_dir = root.join("draft");
+            fs::create_dir(&model)?;
+            fs::create_dir(&draft_dir)?;
+            fs::write(
+                model.join("config.json"),
+                serde_json::to_vec(&config_value())?,
+            )?;
+            let mut cells = 0;
+            for budget in [
+                SpecBudget::Chain,
+                SpecBudget::Tree16,
+                SpecBudget::Tree32,
+                SpecBudget::Tree64,
+            ] {
+                for chunk in [1, 16, 256] {
+                    let make = |d: &crate::dspark::DraftConfig| {
+                        Profile::new(
+                            &c,
+                            4096,
+                            chunk,
+                            Some(budget),
+                            &model,
+                            Some(&draft_dir),
+                            Some(d),
+                        )
+                    };
+                    draft_value["intermediate_size"] = c.intermediate_size.into();
+                    fs::write(
+                        draft_dir.join("config.json"),
+                        serde_json::to_vec(&draft_value)?,
+                    )?;
+                    let draft = crate::dspark::DraftConfig::read(&draft_dir, &c)?;
+                    let base = make(&draft)?;
+                    draft_value["intermediate_size"] = 8192.into();
+                    fs::write(
+                        draft_dir.join("config.json"),
+                        serde_json::to_vec(&draft_value)?,
+                    )?;
+                    let draft = crate::dspark::DraftConfig::read(&draft_dir, &c)?;
+                    let distinct = make(&draft)?;
+                    let mut expected_linear = base.linear.clone();
+                    let mut expected_pairs = base.pairs.clone();
+                    for (output, input) in [
+                        (2 * draft.intermediate_size, c.hidden_size),
+                        (c.hidden_size, draft.intermediate_size),
+                    ] {
+                        expected_linear.insert(LinearShape {
+                            rows: 7,
+                            output,
+                            input,
+                        });
+                        expected_pairs.insert((output, input));
+                    }
+                    assert_eq!(distinct.linear, expected_linear);
+                    assert_eq!(distinct.pairs, expected_pairs);
+                    assert_eq!(distinct.linear.len(), base.linear.len() + 2);
+                    assert_eq!(distinct.attention, base.attention);
+                    cells += 1;
+                }
+            }
+            println!(
+                "PR61_DRAFT_MLP profile_cells={cells} target_intermediate=6144 draft_intermediate=8192 added_choices=2 added_pairs=2 PASS"
+            );
+            Ok(())
+        })();
+        fs::remove_dir_all(&root)?;
+        result
+    }
+
     #[test]
     fn shape_closure_covers_prefill_and_all_commits() -> Result<()> {
         let c = config()?;
-        let draft_value = serde_json::json!({
-            "model_type":"dflash","architectures":[],"dtype":"bfloat16",
-            "hidden_size":2048,"intermediate_size":6144,"num_hidden_layers":5,
-            "num_attention_heads":16,"num_key_value_heads":2,"head_dim":128,
-            "vocab_size":130560,"draft_vocab_size":130560,"rms_norm_eps":0.00001,
-            "block_size":8,"mask_token_id":0,"target_layer_ids":[1,10,20,30,39],
-            "num_target_layers":42,"markov_rank":256,"markov_head_type":"markov",
-            "projector_type":"linear","rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}
-        });
+        let draft_value = draft_value();
         let draft: crate::dspark::DraftConfig = serde_json::from_value(draft_value.clone())?;
         assert_eq!(draft.num_target_layers, 42);
         assert_eq!(draft.capture_width(), 10240);
-        let dimensions = Some((draft.capture_width(), draft.markov_rank));
+        let draft_config = Some(&draft);
         let root = std::env::current_exe()?
             .parent()
             .context("test executable directory missing")?
@@ -474,7 +690,7 @@ mod tests {
                 &c,
                 small_rows(32768, 33824),
                 Some(SpecBudget::Chain),
-                dimensions
+                draft_config
             )?
             .0
             .len(),
@@ -485,7 +701,7 @@ mod tests {
                 &c,
                 small_rows(32768, 33824),
                 Some(SpecBudget::Tree16),
-                dimensions
+                draft_config
             )?
             .0
             .len(),
@@ -497,7 +713,7 @@ mod tests {
             SpecBudget::Tree32,
             SpecBudget::Tree64,
         ] {
-            let (linear, pairs) = shapes(&c, small_rows(32768, 33824), Some(budget), dimensions)?;
+            let (linear, pairs) = shapes(&c, small_rows(32768, 33824), Some(budget), draft_config)?;
             assert!(linear.contains(&LinearShape {
                 rows: 1,
                 output: c.vocab_size,
@@ -529,7 +745,7 @@ mod tests {
             for chunk in [1, 8, 9, 15, 16, 32] {
                 let limit = injection_limit(small_rows(chunk, 4096));
                 let (linear, pairs) =
-                    shapes(&c, small_rows(chunk, 4096), Some(budget), dimensions)?;
+                    shapes(&c, small_rows(chunk, 4096), Some(budget), draft_config)?;
                 let allowed = forward_rows(small_rows(chunk, 4096), Some(budget));
                 let workspace = budget.workspace_rows(chunk);
                 for rows in 1..=workspace {
@@ -590,7 +806,7 @@ mod tests {
             &c,
             small_rows(1, 4096),
             Some(SpecBudget::Tree16),
-            dimensions,
+            draft_config,
         )?;
         for rows in 1..=8 {
             for (output, input) in [(2048, 10240), (256, 2048)] {
@@ -615,7 +831,7 @@ mod tests {
             &c,
             small_rows(32768, 33824),
             Some(SpecBudget::Tree64),
-            dimensions,
+            draft_config,
         )?;
         assert!(wide.iter().all(|s| s.rows <= 16));
         Ok(())
@@ -629,18 +845,19 @@ mod tests {
             c.intermediate_size = intermediate;
             c.num_attention_heads = hidden / c.head_dim;
             c.num_key_value_heads = 1;
+            let mut draft: crate::dspark::DraftConfig = serde_json::from_value(draft_value())?;
+            draft.hidden_size = hidden;
+            draft.intermediate_size = intermediate;
+            draft.num_attention_heads = c.num_attention_heads;
+            draft.num_key_value_heads = c.num_key_value_heads;
+            draft.markov_rank = 128;
             for budget in [
                 None,
                 Some(SpecBudget::Chain),
                 Some(SpecBudget::Tree16),
                 Some(SpecBudget::Tree64),
             ] {
-                let (linear, _) = shapes(
-                    &c,
-                    small_rows(32768, 33824),
-                    budget,
-                    Some((5 * hidden, 128)),
-                )?;
+                let (linear, _) = shapes(&c, small_rows(32768, 33824), budget, Some(&draft))?;
                 assert!(!linear.is_empty());
                 for &shape in &linear {
                     super::super::linear_calibrate::check_extent(
@@ -672,6 +889,12 @@ mod tests {
         c.intermediate_size = 640;
         c.num_attention_heads = 3;
         c.num_key_value_heads = 1;
+        let mut draft: crate::dspark::DraftConfig = serde_json::from_value(draft_value())?;
+        draft.hidden_size = c.hidden_size;
+        draft.intermediate_size = c.intermediate_size;
+        draft.num_attention_heads = c.num_attention_heads;
+        draft.num_key_value_heads = c.num_key_value_heads;
+        draft.markov_rank = 128;
         let base = BTreeSet::from([
             (c.qkv_dim(), 384),
             (384, 384),
@@ -685,7 +908,7 @@ mod tests {
             Some(SpecBudget::Tree16),
             Some(SpecBudget::Tree64),
         ] {
-            let (linear, pairs) = shapes(&c, small_rows(32768, 33824), budget, Some((1920, 128)))?;
+            let (linear, pairs) = shapes(&c, small_rows(32768, 33824), budget, Some(&draft))?;
             assert!(linear.is_empty());
             let mut expected = base.clone();
             if budget.is_some() {

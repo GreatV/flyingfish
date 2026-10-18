@@ -1,21 +1,7 @@
-// Residual add + RMSNorm with a capture copy in the same launch: the x/res/y/res_out
-// writes are bit-identical to add_rmsnorm, and capture receives the rounded res_out values.
-//
-// res_out = bf16(res + x) (one rounding), then
-// y = bf16(res_out * rsqrt(mean(res_out^2) + eps) * w) in fp32 with one rounding at the
-// store; the same rounded res_out values are mirrored into
-// capture[r * dst_pitch + dst_col + d].
-//
-// Layout / contract:
-//   * x, res, y, res_out bf16 [rows][hidden] (res_out may alias res);
-//     capture bf16 with row stride dst_pitch and slot offset dst_col.
-//   * grid = (rows,1,1), block = (256,1,1), smem 128 B static; blocks past
-//     rows return before any write.
-//   * __trap() on: hidden != 2048, rows < 1, eps negative or not finite, any null
-//     buffer, blockDim.x not a multiple of 32 or outside [32,1024],
-//     dst_col + hidden > dst_pitch, dst_pitch/dst_col not a multiple of 8 elements.
+// BF16 residual capture with standard or zero-centered RMSNorm.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include "q38_contract.cuh"
 
 namespace add_norm_capture {
 
@@ -26,7 +12,7 @@ constexpr int kVec = 8;            // bf16 elements per 16 B access
 constexpr int kMaxPerThread = 8;   // elements cached per thread in registers
 
 __device__ __forceinline__ void shape(int rows, int hidden, float eps, unsigned nthr) {
-    if (hidden != kHidden) __trap();
+    if (hidden != kHidden && hidden != 5120) __trap();
     if (rows < 1) __trap();
     if (!(eps >= 0.f) || !isfinite(eps)) __trap();
     if (nthr < 32u || nthr > 1024u || (nthr & 31u)) __trap();
@@ -110,8 +96,6 @@ __device__ __forceinline__ void st_vec(bf16* __restrict__ p, const float* __rest
     }
 }
 
-// Pack 8 already-rounded bf16 values into one 16 B store (bit packing only,
-// no second rounding).
 template <int VEC>
 __device__ __forceinline__ void st_vec_bf16(bf16* __restrict__ p, const bf16* __restrict__ v) {
     static_assert(VEC % 8 == 0, "vector store needs a multiple of 8 elements");
@@ -121,8 +105,6 @@ __device__ __forceinline__ void st_vec_bf16(bf16* __restrict__ p, const bf16* __
     *reinterpret_cast<float4*>(p) = u.v;
 }
 
-// One block: res_out[r] = bf16(res[r] + x[r]), y[r] = rmsnorm(res_out[r], w),
-// and the same rounded res_out[r] mirrored into capture[r][dst_col + ...].
 template <int VEC>
 __device__ __forceinline__ void add_rmsnorm_capture_row(const bf16* __restrict__ x,
                                                         const bf16* res,
@@ -131,13 +113,13 @@ __device__ __forceinline__ void add_rmsnorm_capture_row(const bf16* __restrict__
                                                         bf16* res_out,
                                                         bf16* __restrict__ capture,
                                                         int n, float eps, int dst_pitch,
-                                                        int dst_col) {
+                                                        int dst_col, int row) {
     __shared__ float smem[32];
     const int nthr = blockDim.x;
     const int gid = threadIdx.x;
     const int nv = n / VEC;
     const bool cached = (nv <= nthr * (kMaxPerThread / VEC));   // block-uniform
-    bf16* cap = capture + (size_t)blockIdx.x * dst_pitch + dst_col;
+    bf16* cap = capture + (size_t)row * dst_pitch + dst_col;
 
     float rr[kMaxPerThread];
     float ssq = 0.0f;
@@ -212,29 +194,25 @@ __device__ __forceinline__ void add_rmsnorm_capture_row(const bf16* __restrict__
     }
 }
 
-}  // namespace add_norm_capture
 
-extern "C" {
-
-// add_rmsnorm plus the capture mirror. One block per row, grid == rows.
-__global__ __launch_bounds__(1024) void add_rmsnorm_capture(const __nv_bfloat16* __restrict__ x,
-                                                            const __nv_bfloat16* res,
-                                                            const __nv_bfloat16* __restrict__ w,
-                                                            __nv_bfloat16* __restrict__ y,
-                                                            __nv_bfloat16* res_out,
-                                                            __nv_bfloat16* __restrict__ capture,
-                                                            int rows, int hidden, float eps,
-                                                            int dst_pitch, int dst_col) {
-    using namespace add_norm_capture;
-    shape(rows, hidden, eps, blockDim.x);
-    rect(hidden, dst_pitch, dst_col);
-    if (!x || !res || !w || !y || !res_out || !capture) __trap();
-    const int row = blockIdx.x;
-    if (row >= rows) return;
-    const size_t off = (size_t)row * hidden;
-    // hidden == 2048 (guarded); VEC = 8 takes the register-cached path.
-    add_rmsnorm_capture_row<8>(x + off, res + off, w, y + off, res_out + off, capture, hidden,
-                               eps, dst_pitch, dst_col);
 }
 
-}  // extern "C"
+extern "C" __global__ __launch_bounds__(256) void add_rmsnorm_capture(
+    const __nv_bfloat16* x, const __nv_bfloat16* res, const __nv_bfloat16* w,
+    __nv_bfloat16* y, __nv_bfloat16* res_out, __nv_bfloat16* capture,
+    int rows, int hidden, float eps, int pitch, int column, int mode,
+    const Q38SequenceMeta* meta, int base) {
+    using namespace add_norm_capture;
+    shape(rows, hidden, eps, blockDim.x);
+    rect(hidden, pitch, column);
+    if (!x || !res || !w || !y || !res_out || !capture || mode != 0 ||
+        blockDim.x != 256 || base < 0) __trap();
+    if (meta) q38_meta_guard(meta);
+    const int valid = meta ? meta->valid_rows : rows;
+    if (int(gridDim.x) != rows) __trap();
+    const int row = base + int(blockIdx.x);
+    if (row >= valid) return;
+    const size_t offset = size_t(row) * hidden;
+    add_rmsnorm_capture_row<8>(x + offset, res + offset, w, y + offset,
+                               res_out + offset, capture, hidden, eps, pitch, column, row);
+}

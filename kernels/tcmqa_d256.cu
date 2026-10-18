@@ -1,5 +1,5 @@
 // HD256 full attention.
-// Shape: (q_heads, kv_heads) = (24, 4) or (16, 2), head_dim=256, scale=1/16.
+// Shape: (q_heads, kv_heads) = (24, 4), (16, 2) or (8, 2), head_dim=256, scale=1/16.
 // Tile: MT=64 pair rows, KT=32 KV positions, 4 warps / 128 threads, dynamic smem SMEM_NARROW.
 // Array extents and unrolled loop bounds are written in DH/HQ/HKV through
 // NSLICE = DH/8 and KSLICE = DH/16; no dimension is a literal.
@@ -14,7 +14,7 @@
 // Query segmentation: segments of at most 64 rows. Segment local row 0 is global row
 // row_base, absolute position L = prefix + row_base, m = min(seg_rows, valid_rows - row_base)
 // live rows. Row r sees every key below L, and key L+jj iff bit jj of causal_mask[r] is
-// set. causal_mask is u64[64]; mask[63] is UINT64_MAX.
+// set. causal_mask is u64[64]; the caller supplies the visible block-key bits.
 // Kernels read prefix/valid_rows from the device SequenceMeta. Grids are sized from
 // max_rows; segments with no live rows exit without writing.
 #include <cuda_bf16.h>
@@ -60,7 +60,10 @@ constexpr int SMEM_NARROW = (MT + 2 * KT) * LDS * 2 + M_CAP * 8;
 static_assert(SMEM_NARROW == 68096, "narrow-tile shared memory budget");
 
 // Partial RoPE: only the first ROTARY dims rotate, in (j, j+ROTARY/2) pairs.
-constexpr int ROTARY = 64;
+#ifndef ATTENTION_ROTARY_DIM
+#define ATTENTION_ROTARY_DIM 64
+#endif
+constexpr int ROTARY = ATTENTION_ROTARY_DIM;
 constexpr int RHALF  = ROTARY / 2;
 constexpr float THETA = 1.0e7f;
 
@@ -111,7 +114,7 @@ __device__ __forceinline__ void guard_meta(const int4* meta) {
   const int key_count  = meta[0].z;
   const int capacity   = meta[0].w;
   const int causal     = meta[1].x;
-  if (causal != 1) __trap();
+  if (causal != 1 && !(ROTARY == DH && causal == 0)) __trap();
   if (prefix < 0 || valid_rows <= 0 || key_count != prefix + valid_rows) __trap();
   if (key_count > capacity) __trap();
 }
@@ -148,14 +151,22 @@ extern "C" __global__ void tcmqa_d256_qg_split(const __nv_bfloat16* __restrict__
   const int d   = i % DH;
   const int h   = (i / DH) % HQ;
   const int row = i / (DH * HQ);
-  const __nv_bfloat16* src = q_gate + (size_t)row * qg_tok_stride + (size_t)h * 2 * DH + d;
+  const int head_width = gate ? 2 * DH : DH;
+  const __nv_bfloat16* src = q_gate + (size_t)row * qg_tok_stride + (size_t)h * head_width + d;
   q[(size_t)row * q_tok_stride + (size_t)h * DH + d] = src[0];
-  gate[(size_t)row * g_tok_stride + (size_t)h * DH + d] = src[DH];
+  if (gate) gate[(size_t)row * g_tok_stride + (size_t)h * DH + d] = src[DH];
 }
 
 // Rotation of one (j, j+RHALF) pair at the given fp32 angle; both halves are read before
 // either is written.
 __device__ __forceinline__ void rope_apply(bf16& a, bf16& b, float ang) {
+  if constexpr (ROTARY == DH) {
+    const bf16 c = __float2bfloat16(cosf(ang)), s = __float2bfloat16(sinf(ang));
+    const bf16 old_a = a, old_b = b;
+    a = __hsub(__hmul(old_a, c), __hmul(old_b, s));
+    b = __hadd(__hmul(old_b, c), __hmul(old_a, s));
+    return;
+  }
   const float c = cosf(ang), s = sinf(ang);
   const float af = __bfloat162float(a), bf = __bfloat162float(b);
   a = __float2bfloat16(af * c - bf * s);
@@ -183,7 +194,7 @@ static_assert(RHALF != 32 ||
                    rope_axis_count(2) == 10),
               "mrope_section (11, 11, 10) over RHALF = 32");
 
-// In-place partial RoPE on Q ([M,HQ,256] BF16 view) at absolute position prefix + row.
+// In-place RoPE on Q ([M,HQ,256] BF16 view) at absolute position prefix + row.
 // Writes only dims [0, ROTARY); qg_split writes the full view first.
 extern "C" __global__ void tcmqa_d256_rope_q(__nv_bfloat16* __restrict__ q,
                                              const int4* __restrict__ meta,

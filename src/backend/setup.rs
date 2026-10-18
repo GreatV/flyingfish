@@ -181,7 +181,7 @@ impl Setup {
         total: usize,
         alignment: usize,
     ) -> Result<Plan> {
-        Plan::new(c, capacity, requested, free, total, alignment, false)
+        Plan::new(c, capacity, requested, free, total, alignment, 0)
     }
 }
 

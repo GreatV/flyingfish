@@ -1,10 +1,11 @@
 //! Single-Engine MTP component shared by generation and numerical probes.
 use super::{
     Work, bucketed_prefill_rows,
-    qwen::{heads, limits, matrix, scratch, vector, view},
+    qwen::{heads, limits, matrix, scratch, vector},
 };
 #[cfg(test)]
 use crate::backend::cuda::closure::Closure;
+use crate::backend::cuda::contracts::view;
 #[cfg(test)]
 use crate::model_spec::{LayerPlan, Mixer};
 use crate::{
@@ -240,7 +241,8 @@ impl MtpRuntime {
                     256,
                 )?,
                 q: TensorMut(heads(&mixer.q, s, 0, rows, 24, 256)?),
-                gate: TensorMut(heads(&mixer.gate, s, 0, rows, 24, 256)?),
+                gate: Some(TensorMut(heads(&mixer.gate, s, 0, rows, 24, 256)?)),
+                norm_mode: crate::backend::cuda::ops::RmsMode::ZeroCentered,
                 k_cache: TensorMut(view(
                     &kv.k,
                     s,

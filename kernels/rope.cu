@@ -1,5 +1,26 @@
 #include <cuda_bf16.h>
 
+extern "C" __global__ void sequence_positions(const int* prefix, int* metadata,
+                                                int* axes, int rows, int capacity,
+                                                int rotary_shift) {
+    const int p = *prefix;
+    if (p < 0 || rows < 1 || rows > 64 || p > capacity - rows || p + rotary_shift < 0)
+        __trap();
+    const int row = threadIdx.x;
+    if (row == 0) {
+        metadata[0] = p;
+        metadata[1] = rows;
+        metadata[2] = p + rows;
+        metadata[3] = capacity;
+        metadata[4] = 0;
+        metadata[5] = metadata[6] = metadata[7] = 0;
+    }
+    if (row < rows) {
+        const int position = p + row + rotary_shift;
+        axes[row * 3] = axes[row * 3 + 1] = axes[row * 3 + 2] = position;
+    }
+}
+
 extern "C" __global__ void rope(__nv_bfloat16* qkv, const int* start,
                                int rows, int q_heads, int kv_heads, int dim, float theta) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
