@@ -1340,11 +1340,9 @@ fn moe_prefill_gpu() -> Result<()> {
                 .map(|a| if pred(a) { 1 } else { 0 })
                 .collect()
         };
-        let even = mask(&|a| ids[a] % 2 == 0);
-        let odd = mask(&|a| ids[a] % 2 == 1);
-        let cpu_set = mask(&|a| a % 3 == 0 && ids[a] % 2 == 0);
-        let cpu_source = mask(&|a| a % 3 == 0 && ids[a] % 2 == 0);
-        let _ = &cpu_source;
+        let cpu_set = mask(&|a| a % 3 == 0);
+        let even = mask(&|a| a % 3 != 0 && ids[a] % 2 == 0);
+        let odd = mask(&|a| a % 3 != 0 && ids[a] % 2 == 1);
         let mut cohort = CohortBufs {
             contributions: s.alloc_zeros(rows * top_k * hidden)?,
             done: s.alloc_zeros(rows * top_k)?,
