@@ -826,7 +826,7 @@ impl Residency {
     pub fn record_copy(&mut self, slots: &[u32], event: u64) -> Result<()> {
         self.events.record_copy(slots, event)?;
         for released in &mut self.released {
-            if slots.contains(&released.slot) {
+            if released.event.is_none() && slots.contains(&released.slot) {
                 released.event = Some(event);
             }
         }
@@ -1590,6 +1590,24 @@ mod tests {
         residency.begin_token()?;
         assert_eq!(residency.free_host_blocks(), 2);
         assert!(residency.ledger().check().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn released_host_block_wait_keeps_its_source_copy_event() -> Result<()> {
+        let mut residency = build(3, 2)?;
+        let entry = host_swap(&mut residency, 0, 0, 2, 1, 90)?;
+        let source = entry
+            .source_block
+            .context("host admission source missing")?;
+        residency.record_copy(&[entry.slot], 91)?;
+        residency.begin_token()?;
+        let free = residency
+            .free_blocks
+            .iter()
+            .find(|free| free.id == source)
+            .context("admitted source block did not return to the free pool")?;
+        assert_eq!(free.wait, Some(90));
         Ok(())
     }
 
