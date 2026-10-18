@@ -1903,12 +1903,18 @@ mod tests {
             }
         }
         let capacity = capacity(geometry, 17, false, 2, false)?;
-        assert_eq!(reference_cpu_choices(&[0, 3, 4, 5], 0, &capacity)?, [4, 5]);
         assert_eq!(
-            reference_cpu_choices(&[0, 3, 4, 5], 1, &capacity)?,
-            [3, 4, 5]
+            reference_cohorts(&[0, 3, 4, 5], 0, &capacity)?,
+            (vec![4, 5], vec![vec![0, 3]])
         );
-        assert!(reference_cpu_choices(&[0, 3, 4, 5].repeat(3), 1, &capacity)?.is_empty());
+        assert_eq!(
+            reference_cohorts(&[0, 3, 4, 5], 1, &capacity)?,
+            (vec![3, 4, 5], vec![vec![0]])
+        );
+        assert_eq!(
+            reference_cohorts(&[0, 3, 4, 5].repeat(3), 1, &capacity)?,
+            (vec![], vec![vec![0], vec![3, 4], vec![5]])
+        );
         println!(
             "PASS prefill_span_cpu_views spans=8,17,37,263 global_choice_offsets=true borrowed_tail_prefix=true wave_workspace_bound=true derived_host_surplus_blocks=1 GPU_executed=false"
         );
@@ -2003,7 +2009,7 @@ mod tests {
         fixture: &MoeFixture,
         layer: u32,
         wave: usize,
-        cpu_experts: impl FnOnce(&[i32]) -> Result<Vec<u32>>,
+        cohorts: impl FnOnce(&[i32]) -> Result<(Vec<u32>, Vec<Vec<u32>>)>,
     ) -> Result<Reference> {
         let stream = &engine.device.stream;
         let rows = fixture.dims.rows;
@@ -2035,7 +2041,7 @@ mod tests {
         )?;
         let host_ids = stream.clone_dtoh(&ids)?;
         let host_weights = stream.clone_dtoh(&weights)?;
-        let cpu_experts = cpu_experts(&host_ids)?;
+        let (cpu_experts, cohorts) = cohorts(&host_ids)?;
         let slots = engine
             .moe_slots
             .as_ref()
@@ -2064,56 +2070,63 @@ mod tests {
                 .map(|&expert| slots.published[layer as usize * 16 + expert as usize])
                 .collect::<Vec<_>>(),
         )?;
-        let active = stream.clone_htod(&vec![1u32; rows * 4])?;
+        let mut active = stream.alloc_zeros::<u32>(rows * 4)?;
         let mut contributions = stream.alloc_zeros::<bf16>(rows * 4 * 128)?;
-        let done = stream.alloc_zeros::<u32>(rows * 4)?;
+        let mut done = stream.alloc_zeros::<u32>(rows * 4)?;
         let y = stream.alloc_zeros::<bf16>(rows * 128)?;
         let scratch =
             stream.alloc_zeros::<u8>(prefill_scratch_bytes(wave, 4, 16, 128, 64)? as usize)?;
-        for base in (0..rows).step_by(wave) {
-            let count = wave.min(rows - base);
-            decode.prefill.prefill_contribute(
-                stream,
-                MoePrefillContribute {
-                    x: qwen::matrix(&input, stream, base * 128, count, 128)?,
-                    ids: qwen::view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
-                    weights: qwen::view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,
-                    active: qwen::view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
-                    assignment_gen: qwen::view(
-                        &generation,
-                        stream,
-                        base * 4,
-                        [count as u32, 4],
-                        [4, 1],
-                    )?,
-                    slots_gate_up: table.gate_up,
-                    slots_down: table.down,
-                    slot_valid: table.valid,
-                    slot_generation: table.generation,
-                    slots_gate_up_host: &gate_up,
-                    slots_down_host: &down,
-                    shared_gate: shared[0],
-                    shared_up: shared[1],
-                    shared_down: shared[2],
-                    shared_expert_gate: shared_gate,
-                    contributions: qwen::view(
-                        &contributions,
-                        stream,
-                        base * 4 * 128,
-                        [count as u32, 4, 128],
-                        [512, 128, 1],
-                    )?,
-                    done: TensorMut(qwen::view(
-                        &done,
-                        stream,
-                        base * 4,
-                        [count as u32, 4],
-                        [4, 1],
-                    )?),
-                },
-                &qwen::scratch(&scratch, stream),
-            )?;
-            stream.synchronize()?;
+        for experts in &cohorts {
+            let mask = host_ids
+                .iter()
+                .map(|&expert| u32::from(experts.contains(&(expert as u32))))
+                .collect::<Vec<_>>();
+            stream.memcpy_htod(&mask, &mut active)?;
+            for base in (0..rows).step_by(wave) {
+                let count = wave.min(rows - base);
+                decode.prefill.prefill_contribute(
+                    stream,
+                    MoePrefillContribute {
+                        x: qwen::matrix(&input, stream, base * 128, count, 128)?,
+                        ids: qwen::view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
+                        weights: qwen::view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,
+                        active: qwen::view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
+                        assignment_gen: qwen::view(
+                            &generation,
+                            stream,
+                            base * 4,
+                            [count as u32, 4],
+                            [4, 1],
+                        )?,
+                        slots_gate_up: table.gate_up,
+                        slots_down: table.down,
+                        slot_valid: table.valid,
+                        slot_generation: table.generation,
+                        slots_gate_up_host: &gate_up,
+                        slots_down_host: &down,
+                        shared_gate: shared[0],
+                        shared_up: shared[1],
+                        shared_down: shared[2],
+                        shared_expert_gate: shared_gate,
+                        contributions: qwen::view(
+                            &contributions,
+                            stream,
+                            base * 4 * 128,
+                            [count as u32, 4, 128],
+                            [512, 128, 1],
+                        )?,
+                        done: TensorMut(qwen::view(
+                            &done,
+                            stream,
+                            base * 4,
+                            [count as u32, 4],
+                            [4, 1],
+                        )?),
+                    },
+                    &qwen::scratch(&scratch, stream),
+                )?;
+                stream.synchronize()?;
+            }
         }
         let mut expected = stream.clone_dtoh(&contributions)?;
         let shape = Shape::new(128, 64)?;
@@ -2157,6 +2170,26 @@ mod tests {
             }
         }
         stream.memcpy_htod(&expected, &mut contributions)?;
+        let mut completed = stream.clone_dtoh(&done)?;
+        for (choice, &expert) in host_ids.iter().enumerate() {
+            let gpu = cohorts
+                .iter()
+                .any(|cohort| cohort.contains(&(expert as u32)));
+            ensure!(
+                completed[choice] == u32::from(gpu),
+                "Runner FAIL direct cohort done choice={choice} expert={expert} done={} expected={gpu}",
+                completed[choice]
+            );
+            if cpu_experts.contains(&(expert as u32)) {
+                completed[choice] = 1;
+            }
+            ensure!(
+                completed[choice] == 1,
+                "Runner FAIL direct reference choice={choice} is uncovered"
+            );
+        }
+        stream.memcpy_htod(&completed, &mut done)?;
+        stream.memcpy_htod(&vec![1u32; rows * 4], &mut active)?;
         for base in (0..rows).step_by(wave) {
             let count = wave.min(rows - base);
             decode.prefill.prefill_finish(
@@ -2217,8 +2250,12 @@ mod tests {
                 )?;
                 let mut expected = Vec::new();
                 for layer in 0..2 {
-                    let first = reference(&oracle, &fixture, layer, 4, |_| Ok(Vec::new()))?;
-                    let second = reference(&oracle, &fixture, layer, 4, |_| Ok(Vec::new()))?;
+                    let first = reference(&oracle, &fixture, layer, 4, |_| {
+                        Ok((vec![], vec![(0..16).collect()]))
+                    })?;
+                    let second = reference(&oracle, &fixture, layer, 4, |_| {
+                        Ok((vec![], vec![(0..16).collect()]))
+                    })?;
                     ensure!(
                         first.ids == second.ids
                             && same_bits(&first.weights, &second.weights, |x| u32::from(
@@ -2414,7 +2451,7 @@ mod tests {
                             engine.device.stream.synchronize()?;
                         }
                         let reference = reference(&oracle, &fixture, layer as u32, 4, |_| {
-                            Ok(expected_plan.cpu().to_vec())
+                            Ok((expected_plan.cpu().to_vec(), vec![(0..16).collect()]))
                         })?;
                         let actual = engine.device.stream.clone_dtoh(&output)?;
                         let span = prefill.span.as_ref().context("prefill gate span missing")?;
@@ -2647,7 +2684,11 @@ mod tests {
             .fold(0.0, f32::max))
     }
 
-    fn reference_cpu_choices(ids: &[i32], layer: u32, capacity: &Capacity) -> Result<Vec<u32>> {
+    fn reference_cohorts(
+        ids: &[i32],
+        layer: u32,
+        capacity: &Capacity,
+    ) -> Result<(Vec<u32>, Vec<Vec<u32>>)> {
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
         ensure!(
             !ids.is_empty() && ids.len().is_multiple_of(geometry.top_k as usize),
@@ -2694,7 +2735,16 @@ mod tests {
                 h2d_bytes_per_second: 1_000_000_000.0,
             },
         )?;
-        Ok(plan.cpu().to_vec())
+        let mut cohorts = Vec::new();
+        if !plan.resident().is_empty() {
+            cohorts.push(plan.resident().to_vec());
+        }
+        cohorts.extend(
+            plan.staged()
+                .chunks(capacity.prefill_staging_slots as usize)
+                .map(<[u32]>::to_vec),
+        );
+        Ok((plan.cpu().to_vec(), cohorts))
     }
 
     fn reference_layer_order(
@@ -2769,8 +2819,8 @@ mod tests {
                     layer as u32,
                     wave,
                     |ids| match placement {
-                        Some(capacity) => reference_cpu_choices(ids, layer as u32, capacity),
-                        None => Ok(Vec::new()),
+                        Some(capacity) => reference_cohorts(ids, layer as u32, capacity),
+                        None => Ok((vec![], vec![(0..16).collect()])),
                     },
                 )?;
                 for base in (0..admitted.len()).step_by(wave) {
