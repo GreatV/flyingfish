@@ -150,6 +150,7 @@ fn native_geometry_head_ops_gpu() -> Result<()> {
     let device_w1 = s.clone_htod(&w1)?;
     let device_w2 = s.clone_htod(&w2)?;
     let mut device_base = s.clone_htod(&base)?;
+    d.finish_upload()?;
     let mut defects = 0;
     let mut compared = 0;
     for rounding in [ScoreRounding::Bf16, ScoreRounding::F32] {
@@ -265,7 +266,6 @@ fn native_geometry_head_ops_gpu() -> Result<()> {
     let (out_ptr, _out_hold) = output.device_ptr_mut(s);
     drop(_out_hold);
     let kernel = module.load_function("concat_dot_sigmoid")?;
-    d.finish_upload()?;
     let execute = || -> Result<()> {
         unsafe {
             s.launch_builder(&kernel)
