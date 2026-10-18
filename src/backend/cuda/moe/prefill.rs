@@ -701,6 +701,8 @@ struct Stage {
     gemm1_dev: CudaSlice<u64>,
     gemm2_host: PinnedHostSlice<u64>,
     gemm2_dev: CudaSlice<u64>,
+    gemm1_copy_done: Option<CudaEvent>,
+    gemm2_copy_done: Option<CudaEvent>,
     order: Vec<u32>,
     runs: Vec<(u32, u32)>,
     offsets: Vec<i32>,
@@ -720,6 +722,8 @@ impl Stage {
                 gemm1_dev: stream.alloc_zeros::<u64>(GEMM1_PTR_WORDS)?,
                 gemm2_host: ctx.alloc_pinned_with_flags::<u64>(GEMM2_PTR_WORDS, 0)?,
                 gemm2_dev: stream.alloc_zeros::<u64>(GEMM2_PTR_WORDS)?,
+                gemm1_copy_done: None,
+                gemm2_copy_done: None,
                 order: Vec::new(),
                 runs: Vec::new(),
                 offsets: Vec::with_capacity(MAX_EXPERTS),
@@ -945,7 +949,13 @@ impl PrefillOps {
         }
         let (gemm1_base, _g1) = stage.gemm1_dev.device_ptr(stream);
         unsafe {
-            htod_ptrs(stream, gemm1_base, &stage.gemm1_host, 3 * len1)?;
+            htod_ptrs(
+                stream,
+                gemm1_base,
+                &stage.gemm1_host,
+                3 * len1,
+                &mut stage.gemm1_copy_done,
+            )?;
             self.grouped_gemm(stage, gemm1_base, len1)
                 .context("moe prefill grouped GEMM 1")?;
         }
@@ -988,7 +998,13 @@ impl PrefillOps {
         }
         let (gemm2_base, _g2) = stage.gemm2_dev.device_ptr(stream);
         unsafe {
-            htod_ptrs(stream, gemm2_base, &stage.gemm2_host, 3 * len2)?;
+            htod_ptrs(
+                stream,
+                gemm2_base,
+                &stage.gemm2_host,
+                3 * len2,
+                &mut stage.gemm2_copy_done,
+            )?;
             self.grouped_gemm(stage, gemm2_base, len2)
                 .context("moe prefill grouped GEMM 2")?;
         }
@@ -1155,7 +1171,13 @@ impl PrefillOps {
             });
             let (base, _gs) = stage.gemm1_dev.device_ptr(stream);
             unsafe {
-                htod_ptrs(stream, base, &stage.gemm1_host, 9)?;
+                htod_ptrs(
+                    stream,
+                    base,
+                    &stage.gemm1_host,
+                    9,
+                    &mut stage.gemm1_copy_done,
+                )?;
                 self.grouped_gemm(stage, base, 2)
                     .context("moe prefill shared gate/up GEMM")?;
             }
@@ -1307,6 +1329,7 @@ unsafe fn htod_ptrs(
     dst: u64,
     src: &PinnedHostSlice<u64>,
     words: usize,
+    done: &mut Option<CudaEvent>,
 ) -> Result<()> {
     ensure!(
         words <= src.len(),
@@ -1314,6 +1337,11 @@ unsafe fn htod_ptrs(
         src.len()
     );
     stream.context().bind_to_thread()?;
+    // The pinned mirror is rewritten on the next call; the previous copy
+    // must have completed first.
+    if let Some(event) = done.as_ref() {
+        stream.wait(event)?;
+    }
     let host = src.as_ptr()?;
     unsafe {
         ds::cuMemcpyHtoDAsync_v2(
@@ -1324,5 +1352,6 @@ unsafe fn htod_ptrs(
         )
         .result()?;
     }
+    *done = Some(stream.record_event(None)?);
     Ok(())
 }

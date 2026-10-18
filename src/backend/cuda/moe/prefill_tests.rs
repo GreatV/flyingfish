@@ -2071,3 +2071,92 @@ fn k5c_partition_is_disjoint_and_covers_all() {
             .all(|(a, c)| (c[0] == bf16::ONE) == cpu[a])
     );
 }
+
+/// H1 discriminator: three prefill calls queued back-to-back with no host
+/// sync between them (the stage mirror is rewritten while earlier copies may
+/// still be queued); the third output must equal three independent runs.
+#[test]
+#[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
+fn prefill_stage_backtoback_gpu() -> Result<()> {
+    let d = crate::backend::cuda::Device::new(0)?;
+    let s = &d.stream;
+    let fx = reference::fixture(MoeDims::minicpm47(8), 0);
+    let (experts, top_k, hidden, inter) = (
+        fx.dims.experts,
+        fx.dims.top_k,
+        fx.dims.hidden,
+        fx.dims.inter,
+    );
+    let ops = PrefillOps::new(&d.ctx, s)?;
+    let gu: CudaSlice<bf16> = s.clone_htod(fx.gate_up.as_slice())?;
+    let dn: CudaSlice<bf16> = s.clone_htod(fx.down.as_slice())?;
+    let (gu_ptr, _a) = gu.device_ptr(s);
+    let (dn_ptr, _b) = dn.device_ptr(s);
+    let slots = device_slots(
+        s,
+        (0..experts as u64)
+            .map(|e| gu_ptr + e * (2 * inter * hidden * 2) as u64)
+            .collect(),
+        (0..experts as u64)
+            .map(|e| dn_ptr + e * (hidden * inter * 2) as u64)
+            .collect(),
+        vec![1u32; experts],
+        vec![1u64; experts],
+    )?;
+    let scratch_bytes = prefill_scratch_bytes(fx.dims.rows, top_k, experts, hidden, inter)?;
+    let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
+    let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
+    let scratch = Scratch {
+        ptr: scratch_ptr,
+        bytes: scratch_bytes,
+    };
+    let shared = SharedBufs {
+        sg: s.clone_htod(fx.shared_gate.as_slice())?,
+        su: s.clone_htod(fx.shared_up.as_slice())?,
+        sd: s.clone_htod(fx.shared_down.as_slice())?,
+        seg: s.clone_htod(fx.shared_expert_gate.as_slice())?,
+    };
+    let rows = fx.dims.rows;
+    let (ids, weights) = planted_uniform(rows, experts, top_k);
+    let gens = vec![1u64; rows * top_k];
+    let run_once = |y: &CudaSlice<bf16>| -> Result<()> {
+        let bufs = case_bufs(
+            s,
+            &fx,
+            rows,
+            &ids,
+            &all_active(rows, top_k),
+            &weights,
+            &gens,
+        )?;
+        let y_view = testing::dense_mut(y, s, rows as u32, hidden as u32)?;
+        let input = moe_input(s, &fx, rows, &bufs, &slots, &shared, y_view)?;
+        ops.prefill(s, input, &scratch)?;
+        Ok(())
+    };
+    let mut queued: Vec<CudaSlice<bf16>> = Vec::new();
+    for _ in 0..3 {
+        let y = s.alloc_zeros(rows * hidden)?;
+        run_once(&y)?;
+        queued.push(y);
+    }
+    s.synchronize()?;
+    let mut all_equal = true;
+    for y in &queued {
+        let a: Vec<u16> = s.clone_dtoh(y)?.iter().map(|v| v.to_bits()).collect();
+        let b: Vec<u16> = s
+            .clone_dtoh(&queued[0])?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        if a != b {
+            all_equal = false;
+        }
+    }
+    anyhow::ensure!(
+        all_equal,
+        "back-to-back prefill outputs diverged: the stage mirror was rewritten before a queued copy completed"
+    );
+    eprintln!("moe_prefill H1 back-to-back 3x outputs bitwise-identical PASS");
+    Ok(())
+}
