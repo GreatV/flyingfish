@@ -3229,7 +3229,7 @@ mod tests {
     #[ignore = "requires FF_Q38_VISION_WINDOW=granted and FF_Q38_VISION_OUTPUT_DIR"]
     fn vision_merger_bias_rounding_gpu() -> Result<()> {
         use crate::backend::cuda::{closure::Closure, ops::Ops};
-        use std::{path::PathBuf, rc::Rc};
+        use std::{path::PathBuf, rc::Rc, time::Instant};
         ensure!(
             std::env::var("FF_Q38_VISION_WINDOW").as_deref() == Ok("granted"),
             "vision GPU window missing"
@@ -3242,12 +3242,10 @@ mod tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         let ops = Ops::new(&device.ctx)?;
-        let mut blas = Blas::new(
-            &device,
-            &ops,
-            &output,
-            Rc::new(Closure::new(false, "merger bias rounding".into())),
-        )?;
+        let closure = Rc::new(Closure::new(false, "merger bias rounding".into()));
+        let mut blas = Blas::new(&device, &ops, &output, closure.clone())?;
+        closure.freeze_fixed()?;
+        closure.ready(Instant::now())?;
         {
             use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
             use std::collections::BTreeMap;
@@ -3322,34 +3320,62 @@ mod tests {
                 }
                 let x = s.clone_htod(&host)?;
                 let y = s.alloc_zeros::<bf16>((rows * width) as usize)?;
-                patch.prepare(s, &mut blas, rows)?;
-                patch.run(
-                    s,
-                    &blas,
-                    dense(&x, s, [rows, input])?,
-                    &mut TensorMut(dense(&y, s, [rows, width])?),
-                )?;
-                let wrong = s
-                    .clone_dtoh(&y)?
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, value)| {
-                        let sign = if index % (width as usize) < width as usize / 2 {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                        value.to_bits() != bf16::from_f32(sign).to_bits()
-                    })
-                    .count();
-                println!(
-                    "{} vision_patch_bias_rounding rows={rows} width={width} input={input} bit_mismatches={wrong}",
-                    if wrong == 0 { "PASS" } else { "DEFECT" }
-                );
-                ensure!(
-                    wrong == 0,
-                    "patch bias preceded BF16 conversion: rows={rows}, {wrong} wrong elements"
-                );
+                for mode in [
+                    LinearBiasMode::AfterOutputRound,
+                    LinearBiasMode::BeforeOutputRound,
+                    LinearBiasMode::AfterOutputRound,
+                ] {
+                    match mode {
+                        LinearBiasMode::AfterOutputRound => patch.prepare(s, &mut blas, rows)?,
+                        LinearBiasMode::BeforeOutputRound => blas.prepare_biased(
+                            rows,
+                            width,
+                            input,
+                            dense(&patch.bias, s, [width])?,
+                            mode,
+                        )?,
+                    }
+                    match mode {
+                        LinearBiasMode::AfterOutputRound => patch.run(
+                            s,
+                            &blas,
+                            dense(&x, s, [rows, input])?,
+                            &mut TensorMut(dense(&y, s, [rows, width])?),
+                        )?,
+                        LinearBiasMode::BeforeOutputRound => blas.linear_biased(
+                            dense(&patch.weight, s, [width, input])?,
+                            dense(&patch.bias, s, [width])?,
+                            dense(&x, s, [rows, input])?,
+                            &mut TensorMut(dense(&y, s, [rows, width])?),
+                            mode,
+                        )?,
+                    }
+                    let magnitude = match mode {
+                        LinearBiasMode::AfterOutputRound => 1.0,
+                        LinearBiasMode::BeforeOutputRound => 1.0 + 2.0 * half_ulp.to_f32(),
+                    };
+                    let wrong = s
+                        .clone_dtoh(&y)?
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, value)| {
+                            let sign = if index % (width as usize) < width as usize / 2 {
+                                1.0
+                            } else {
+                                -1.0
+                            };
+                            value.to_bits() != bf16::from_f32(sign * magnitude).to_bits()
+                        })
+                        .count();
+                    println!(
+                        "{} vision_patch_bias_rounding rows={rows} width={width} input={input} mode={mode:?} bit_mismatches={wrong}",
+                        if wrong == 0 { "PASS" } else { "DEFECT" }
+                    );
+                    ensure!(
+                        wrong == 0,
+                        "patch bias mode={mode:?}: rows={rows}, {wrong} wrong elements"
+                    );
+                }
             }
         }
         let input = 4608u32;
@@ -3388,6 +3414,7 @@ mod tests {
                 );
             }
         }
+        closure.assert_ready()?;
         Ok(())
     }
 
