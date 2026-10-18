@@ -21,6 +21,43 @@ pub fn effective_weight(code: u8, scale: bf16) -> bf16 {
     bf16::from_f32(decode_e4m3(code) * scale.to_f32())
 }
 
+/// Scale layout of a published FP8 linear weight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Fp8ScaleLayout {
+    /// BF16 `[ceil(N/128), ceil(K/128)]`: one scale per 128x128 block.
+    Block128,
+    /// BF16 `[N, 1]`: one scale per output channel.
+    PerChannel,
+}
+
+impl Fp8ScaleLayout {
+    /// Stored scale extent for one `[n, k]` weight.
+    pub fn scale_shape(self, n: u32, k: u32) -> [usize; 2] {
+        match self {
+            Self::Block128 => [n.div_ceil(128) as usize, k.div_ceil(128) as usize],
+            Self::PerChannel => [n as usize, 1],
+        }
+    }
+
+    /// Checkpoint tensor suffix of the scale beside `...weight`.
+    pub fn scale_suffix(self) -> &'static str {
+        match self {
+            Self::Block128 => "weight_scale_inv",
+            Self::PerChannel => "weight_scale",
+        }
+    }
+}
+
+impl crate::model_spec::LinearFormat {
+    pub fn fp8_layout(self) -> Option<Fp8ScaleLayout> {
+        match self {
+            Self::Bf16 => None,
+            Self::Fp8E4m3Block128 => Some(Fp8ScaleLayout::Block128),
+            Self::Fp8E4m3Channel => Some(Fp8ScaleLayout::PerChannel),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

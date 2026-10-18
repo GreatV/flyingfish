@@ -14,7 +14,9 @@ use std::sync::Arc;
 pub(crate) struct DecodeOps {
     gate_up: CudaFunction,
     down: CudaFunction,
+    #[cfg(test)]
     gate_up_w8a16: CudaFunction,
+    #[cfg(test)]
     down_w8a16: CudaFunction,
     #[cfg(test)]
     combine: CombineOps,
@@ -44,6 +46,7 @@ pub(crate) struct MoeDecode<'a> {
 /// slots_down carrying expert slot BASE pointers, one per expert, each
 /// covering the whole 6-slice slot (3*I*H code bytes then (2*I + H)*2 BF16
 /// scale bytes); the shared expert tensors stay BF16.
+#[cfg(test)]
 pub(crate) struct MoeDecodeW8a16<'a> {
     pub routed: MoeDecode<'a>,
     pub slot_bytes: u64,
@@ -51,6 +54,7 @@ pub(crate) struct MoeDecodeW8a16<'a> {
 
 /// One W8A16 expert slot: 3*I*H E4M3 code bytes plus (2*I + H) BF16 scale
 /// bytes; 3,151,872 at I=512, H=2048.
+#[cfg(test)]
 pub(crate) fn slot_bytes_w8a16(hidden: u32, inter: u32) -> u64 {
     3 * u64::from(inter) * u64::from(hidden) + (2 * u64::from(inter) + u64::from(hidden)) * 2
 }
@@ -263,6 +267,7 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
     })
 }
 
+#[cfg(test)]
 pub(super) fn validate_w8a16(input: &MoeDecodeW8a16<'_>, scratch: &Scratch) -> Result<DecodeDims> {
     let dims = validate(&input.routed, scratch)?;
     let expected = slot_bytes_w8a16(dims.hidden, dims.inter);
@@ -283,7 +288,9 @@ impl DecodeOps {
         Ok(Self {
             gate_up: module.load_function("moe_ffn_gate_up")?,
             down: module.load_function("moe_ffn_down")?,
+            #[cfg(test)]
             gate_up_w8a16: module.load_function("moe_ffn_gate_up_w8a16")?,
+            #[cfg(test)]
             down_w8a16: module.load_function("moe_ffn_down_w8a16")?,
             #[cfg(test)]
             combine: CombineOps::new(ctx)?,
@@ -400,6 +407,7 @@ impl DecodeOps {
     /// W8A16 contribute: the same launch structure and guarantees as
     /// [`DecodeOps::contribute`], with routed experts read from their slot
     /// bases as E4M3 codes plus per-output-channel BF16 scales.
+    #[cfg(test)]
     pub fn contribute_w8a16(
         &self,
         stream: &Arc<CudaStream>,
@@ -473,13 +481,14 @@ impl DecodeOps {
     /// One full W8A16 decode MoE row block: contribute_w8a16, shared sigmoid
     /// scale and the single deterministic combine, with final_active =
     /// active.
+    #[cfg(test)]
     pub fn decode_w8a16(
         &self,
         stream: &Arc<CudaStream>,
         input: &MoeDecodeW8a16<'_>,
         y: &mut TensorMut<bf16, 2>,
         scratch: &Scratch,
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         self.contribute_w8a16(stream, input, scratch)?;
         let routed = &input.routed;
         let rows = routed.x.shape[0];

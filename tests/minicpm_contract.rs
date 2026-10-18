@@ -177,6 +177,38 @@ fn fp8_spec_states_per_channel_linears_and_the_published_ignore_list() -> Result
         spec.expert_format,
         Some(flyingfish::model_spec::ExpertFormat::Fp8W8a16)
     );
+    let mapped = MappedCheckpoint::open(&dir)?;
+    let manifest = mapped.manifest(&spec, LoadPolicy::TextOnly)?;
+    let geometry = flyingfish::experts::catalogue::ExpertGeometry::from_model(&spec)?;
+    let catalogue = flyingfish::experts::catalogue::ExpertCatalogue::from_manifest(
+        &manifest,
+        geometry,
+        spec.expert_format,
+    )?;
+    assert_eq!(catalogue.geometry(), geometry);
+    for (layer, kind) in spec.layers.iter().enumerate() {
+        let plan = flyingfish::linear_plan::LayerDequantPlan::from_manifest(
+            &manifest,
+            layer as u32,
+            spec.linear_format,
+        )?;
+        assert_eq!(
+            plan.slots.len(),
+            if kind.mixer == Mixer::FullAttention {
+                4
+            } else {
+                0
+            }
+        );
+        for (name, slot) in &plan.slots {
+            assert!(name.contains(".self_attn."));
+            assert!(slot.scale_name.ends_with(".weight_scale"));
+            assert_eq!(
+                manifest.entries[&slot.scale_name].shape,
+                [slot.n as usize, 1]
+            );
+        }
+    }
 
     let mut unexpected = root.clone();
     unexpected["quantization_config"]["ignore"]

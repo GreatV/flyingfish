@@ -3,6 +3,7 @@ use super::{
     contracts::{Scratch, Tensor, TensorMut},
     weights::WeightCatalog,
 };
+use crate::fp8::Fp8ScaleLayout;
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, DevicePtr, PushKernelArg};
 use half::bf16;
@@ -16,30 +17,43 @@ pub(crate) enum LinearBiasMode {
 #[derive(Clone, Copy)]
 pub(crate) enum LinearWeightRef {
     Bf16(Tensor<bf16, 2>),
-    BlockFp8 {
+    Fp8 {
         codes: Tensor<u8, 2>,
         scale: Tensor<bf16, 2>,
+        layout: Fp8ScaleLayout,
     },
 }
 pub(crate) struct Fp8Ops {
-    dequant: CudaFunction,
-    small: [CudaFunction; 5],
+    dequant: [CudaFunction; 2],
+    small: [[CudaFunction; 5]; 2],
 }
 impl Fp8Ops {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let m = super::cubin::module(ctx, "fp8_linear")?;
         Ok(Self {
-            dequant: m.load_function("fp8_dequant_bf16")?,
+            dequant: [
+                m.load_function("fp8_dequant_bf16")?,
+                m.load_function("fp8_dequant_bf16_per_channel")?,
+            ],
             small: [
-                m.load_function("fp8_gemv_bf16")?,
-                m.load_function("fp8_skinny_bf16_m2")?,
-                m.load_function("fp8_skinny_bf16_m3")?,
-                m.load_function("fp8_skinny_bf16_m4")?,
-                m.load_function("fp8_skinny_bf16_m5")?,
+                [
+                    m.load_function("fp8_gemv_bf16")?,
+                    m.load_function("fp8_skinny_bf16_m2")?,
+                    m.load_function("fp8_skinny_bf16_m3")?,
+                    m.load_function("fp8_skinny_bf16_m4")?,
+                    m.load_function("fp8_skinny_bf16_m5")?,
+                ],
+                [
+                    m.load_function("fp8_gemv_bf16_per_channel")?,
+                    m.load_function("fp8_skinny_bf16_m2_per_channel")?,
+                    m.load_function("fp8_skinny_bf16_m3_per_channel")?,
+                    m.load_function("fp8_skinny_bf16_m4_per_channel")?,
+                    m.load_function("fp8_skinny_bf16_m5_per_channel")?,
+                ],
             ],
         })
     }
-    fn check(codes: &Tensor<u8, 2>, scale: &Tensor<bf16, 2>) -> Result<()> {
+    fn check(codes: &Tensor<u8, 2>, scale: &Tensor<bf16, 2>, layout: Fp8ScaleLayout) -> Result<()> {
         codes.validate()?;
         scale.validate()?;
         ensure!(
@@ -47,7 +61,9 @@ impl Fp8Ops {
                 && codes.stride == [u64::from(codes.shape[1]), 1],
             "invalid FP8 matrix"
         );
-        let shape = codes.shape.map(|v| v.div_ceil(128));
+        let shape = layout
+            .scale_shape(codes.shape[0], codes.shape[1])
+            .map(|v| v as u32);
         ensure!(
             scale.shape == shape && scale.stride == [u64::from(shape[1]), 1],
             "invalid FP8 scale"
@@ -59,9 +75,10 @@ impl Fp8Ops {
         stream: &Arc<CudaStream>,
         codes: Tensor<u8, 2>,
         scale: Tensor<bf16, 2>,
+        layout: Fp8ScaleLayout,
         dst: &mut TensorMut<bf16, 2>,
     ) -> Result<()> {
-        Self::check(&codes, &scale)?;
+        Self::check(&codes, &scale, layout)?;
         dst.0.validate()?;
         ensure!(
             dst.0.shape == codes.shape && dst.0.stride == codes.stride,
@@ -72,7 +89,7 @@ impl Fp8Ops {
         let count = u64::from(codes.shape[0]) * u64::from(codes.shape[1]);
         unsafe {
             stream
-                .launch_builder(&self.dequant)
+                .launch_builder(&self.dequant[layout as usize])
                 .arg(&codes.ptr)
                 .arg(&scale.ptr)
                 .arg(&dst.0.ptr)
@@ -90,10 +107,11 @@ impl Fp8Ops {
         stream: &Arc<CudaStream>,
         codes: Tensor<u8, 2>,
         scale: Tensor<bf16, 2>,
+        layout: Fp8ScaleLayout,
         x: Tensor<bf16, 2>,
         y: &mut TensorMut<bf16, 2>,
     ) -> Result<()> {
-        Self::check(&codes, &scale)?;
+        Self::check(&codes, &scale, layout)?;
         validate_call(codes.shape, x, &y.0)?;
         ensure!(
             crate::linear_plan::direct_fp8_rows(x.shape[0] as usize),
@@ -103,7 +121,7 @@ impl Fp8Ops {
         disjoint(&scale, &y.0)?;
         unsafe {
             stream
-                .launch_builder(&self.small[x.shape[0] as usize - 1])
+                .launch_builder(&self.small[layout as usize][x.shape[0] as usize - 1])
                 .arg(&codes.ptr)
                 .arg(&scale.ptr)
                 .arg(&x.ptr)
@@ -173,15 +191,25 @@ impl WeightCatalog {
                 }))
             }
             super::weights::StoredTensor::Fp8(w) => {
-                let scale_name = format!(
-                    "{}.weight_scale_inv",
-                    name.strip_suffix(".weight").context("FP8 weight name")?
-                );
-                let scale = self.bf16(&scale_name)?;
-                let sh = shape.map(|n| n.div_ceil(128));
+                let scale_name = entry
+                    .scale_name
+                    .as_ref()
+                    .context("FP8 scale descriptor missing")?;
+                let layout = if scale_name.ends_with(".weight_scale_inv") {
+                    Fp8ScaleLayout::Block128
+                } else {
+                    ensure!(
+                        scale_name.ends_with(".weight_scale"),
+                        "invalid FP8 scale descriptor {scale_name}"
+                    );
+                    Fp8ScaleLayout::PerChannel
+                };
+                let scale = self.bf16(scale_name)?;
+                let sh = layout.scale_shape(shape[0], shape[1]).map(|v| v as u32);
                 let (wp, _rw) = w.device_ptr(stream);
                 let (sp, _rs) = scale.device_ptr(stream);
-                Ok(LinearWeightRef::BlockFp8 {
+                Ok(LinearWeightRef::Fp8 {
+                    layout,
                     codes: unsafe { Tensor::new(wp, shape, stride, entry.bytes as u64)? },
                     scale: unsafe {
                         Tensor::new(sp, sh, [u64::from(sh[1]), 1], (scale.len() * 2) as u64)?
@@ -217,7 +245,7 @@ struct BoundProjection {
 /// not construct tensor names, allocate scratch or invoke a Lt heuristic.
 pub(crate) struct LayerLinearPlan {
     projections: std::collections::BTreeMap<String, BoundProjection>,
-    materialize: Vec<(Tensor<u8, 2>, Tensor<bf16, 2>, TensorMut<bf16, 2>)>,
+    materialize: Vec<(LinearWeightRef, TensorMut<bf16, 2>)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -235,11 +263,6 @@ impl BoundFfn {
         let Some(moe) = spec.moe else {
             return Ok(Self::Dense);
         };
-        ensure!(
-            spec.linear_format == crate::model_spec::LinearFormat::Bf16,
-            "MoE FFN requires BF16 weights: linear_format={:?}",
-            spec.linear_format
-        );
         let h = spec.hidden;
         let i = moe.shared_intermediate;
         let router = linear.take_bf16("mlp.gate.weight", [moe.experts, h])?;
@@ -311,6 +334,7 @@ impl LayerLinearPlan {
         let mut materialize = Vec::new();
         for (name, entry) in &catalog.manifest.entries {
             if !entry.load
+                || entry.is_routed_expert()
                 || !name.starts_with(prefix)
                 || !name.ends_with(".weight")
                 || entry.shape.len() != 2
@@ -320,7 +344,7 @@ impl LayerLinearPlan {
             let resident = catalog.linear_ref(name, stream)?;
             let prefill = match &resident {
                 LinearWeightRef::Bf16(w) => *w,
-                LinearWeightRef::BlockFp8 { codes, scale } => {
+                LinearWeightRef::Fp8 { .. } => {
                     let LinearWeightRef::Bf16(w) = plan.weight(
                         name,
                         arena.context("FP8 layer has no materialization arena")?,
@@ -328,7 +352,7 @@ impl LayerLinearPlan {
                     else {
                         unreachable!()
                     };
-                    materialize.push((*codes, *scale, TensorMut(w)));
+                    materialize.push((resident, TensorMut(w)));
                     w
                 }
             };
@@ -357,8 +381,17 @@ impl LayerLinearPlan {
         blas: &super::blas::Blas,
         stream: &Arc<CudaStream>,
     ) -> Result<()> {
-        for (codes, scale, dst) in &mut self.materialize {
-            blas.fp8_ops()?.materialize(stream, *codes, *scale, dst)?;
+        for (weight, dst) in &mut self.materialize {
+            let LinearWeightRef::Fp8 {
+                codes,
+                scale,
+                layout,
+            } = *weight
+            else {
+                anyhow::bail!("materialization source requires an FP8 weight");
+            };
+            blas.fp8_ops()?
+                .materialize(stream, codes, scale, layout, dst)?;
         }
         Ok(())
     }

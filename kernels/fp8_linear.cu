@@ -1,4 +1,4 @@
-// Row-major E4M3 codes, BF16 [ceil(N/128),ceil(K/128)] scales.
+// Row-major E4M3 codes; BF16 block-128 or per-output-channel scales.
 // M>5 prefill materializes effective BF16 weights. M1..5 forms the same rounded
 // weight in registers, accumulates FP32, and writes BF16; no matrix scratch.
 // Format: __nv_fp8_e4m3 (CUDA Math API).
@@ -17,14 +17,18 @@ __device__ __forceinline__ float e4m3_decode(uint8_t code) {
 __device__ __forceinline__ bool aligned16(const void* p) {
     return p && (reinterpret_cast<uintptr_t>(p) & 15) == 0;
 }
+template <bool PER_CHANNEL>
 __device__ __forceinline__ __nv_bfloat16 weight_at(
         const uint8_t* w, const __nv_bfloat16* scales, uint64_t n,
         uint64_t k, uint64_t in, uint64_t scale_stride) {
-    const float s = __bfloat162float(scales[(n/128)*scale_stride + k/128]);
+    const float s = PER_CHANNEL
+        ? __bfloat162float(__ldg(scales + n))
+        : __bfloat162float(scales[(n/128)*scale_stride + k/128]);
     return __float2bfloat16_rn(e4m3_decode(w[n*in+k]) * s);
 }
 // launch: block256; grid ceil(N*K/256), capped to a positive device-valid grid.
-extern "C" __global__ void fp8_dequant_bf16(
+template <bool PER_CHANNEL>
+__device__ __forceinline__ void fp8_dequant(
         const uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
         __nv_bfloat16* __restrict__ out, int n, int k) {
     if (n <= 0 || k <= 0 || blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
@@ -35,8 +39,18 @@ extern "C" __global__ void fp8_dequant_bf16(
     const uint64_t scale_stride = (uint64_t(k)+127)/128;
     for (uint64_t i=uint64_t(blockIdx.x)*256+threadIdx.x;
          i<count; i+=uint64_t(gridDim.x)*256) {
-        out[i] = weight_at(w,scales,i/uint64_t(k),i%uint64_t(k),k,scale_stride);
+        out[i] = weight_at<PER_CHANNEL>(w,scales,i/uint64_t(k),i%uint64_t(k),k,scale_stride);
     }
+}
+extern "C" __global__ void fp8_dequant_bf16(
+        const uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
+        __nv_bfloat16* __restrict__ out, int n, int k) {
+    fp8_dequant<false>(w, scales, out, n, k);
+}
+extern "C" __global__ void fp8_dequant_bf16_per_channel(
+        const uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
+        __nv_bfloat16* __restrict__ out, int n, int k) {
+    fp8_dequant<true>(w, scales, out, n, k);
 }
 __device__ __forceinline__ float2 gemv_decode_pair(uint16_t packed) {
 #if __CUDA_ARCH__ >= 890
@@ -96,49 +110,60 @@ __device__ __forceinline__ void gemv_accumulate_tiles(
 }
 
 // launch: grid ceil(N/4), block 128. K % 1024 == 0 takes the vectorized path.
-extern "C" __global__ void fp8_gemv_bf16(
-        const uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
-        const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y,
-        int n, int k) {
-    if (n <= 0 || k <= 0 || blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
-        gridDim.y != 1 || gridDim.z != 1 || uint64_t(gridDim.x) != (uint64_t(n)+3)/4 ||
-        !aligned16(w) || !aligned16(scales) || !aligned16(x) || !aligned16(y)) {
-        __trap(); return;
-    }
-    const uint64_t row = uint64_t(blockIdx.x)*4 + threadIdx.x/32;
-    const uint32_t lane = threadIdx.x%32;
-    if (row >= uint64_t(n)) return;
-    const uint64_t scale_stride = (uint64_t(k)+127)/128;
-    float acc=0.0f;
-    if ((k & 1023) == 0) {
-        float a0=0.0f, a1=0.0f, a2=0.0f, a3=0.0f;
-        const uint8_t* const row_codes = w + row * uint64_t(k);
-        const __nv_bfloat16* const row_scales = scales + (row / 128) * scale_stride;
-        for (int base=0; base<k; base+=1024) {
-            const int col = base + int(lane) * 16;
-            uint4 first, next;
-            gemv_load_pair(row_codes + col, first, next);
-            float scale0=0.0f, scale1=0.0f;
-            if ((lane & 7u) == 0) {
-                scale0 = __bfloat162float(__ldg(row_scales + col / 128));
-                scale1 = __bfloat162float(__ldg(row_scales + (col + 512) / 128));
-            }
-            scale0 = __shfl_sync(0xffffffffu, scale0, 0, 8);
-            scale1 = __shfl_sync(0xffffffffu, scale1, 0, 8);
-            gemv_accumulate_tiles(first, next, x + col, scale0, scale1, a0, a1, a2, a3);
-        }
-        acc = (a0+a1)+(a2+a3);
-    } else {
-        for (uint64_t col=lane; col<uint64_t(k); col+=32) {
-            const float weight = __bfloat162float(weight_at(w,scales,row,col,k,scale_stride));
-            acc = fmaf(weight,__bfloat162float(x[col]),acc);
-        }
-    }
-    for (int shift=16; shift>0; shift/=2) acc += __shfl_down_sync(0xffffffffu,acc,shift);
-    if (lane==0) y[row]=__float2bfloat16_rn(acc);
+#define FP8_GEMV_ENTRY(NAME, PER_CHANNEL) \
+extern "C" __global__ void NAME( \
+        const uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales, \
+        const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y, \
+        int n, int k) { \
+    if (n <= 0 || k <= 0 || blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 || \
+        gridDim.y != 1 || gridDim.z != 1 || uint64_t(gridDim.x) != (uint64_t(n)+3)/4 || \
+        !aligned16(w) || !aligned16(scales) || !aligned16(x) || !aligned16(y)) { \
+        __trap(); return; \
+    } \
+    const uint64_t row = uint64_t(blockIdx.x)*4 + threadIdx.x/32; \
+    const uint32_t lane = threadIdx.x%32; \
+    if (row >= uint64_t(n)) return; \
+    const uint64_t scale_stride = (uint64_t(k)+127)/128; \
+    float acc=0.0f; \
+    if ((k & 1023) == 0) { \
+        float a0=0.0f, a1=0.0f, a2=0.0f, a3=0.0f; \
+        const uint8_t* const row_codes = w + row * uint64_t(k); \
+        const __nv_bfloat16* const row_scales = PER_CHANNEL \
+            ? scales + row \
+            : scales + (row / 128) * scale_stride; \
+        for (int base=0; base<k; base+=1024) { \
+            const int col = base + int(lane) * 16; \
+            uint4 first, next; \
+            gemv_load_pair(row_codes + col, first, next); \
+            float scale0=0.0f, scale1=0.0f; \
+            if constexpr (PER_CHANNEL) { \
+                scale0 = __bfloat162float(__ldg(row_scales)); \
+                scale1 = scale0; \
+            } else { \
+                if ((lane & 7u) == 0) { \
+                    scale0 = __bfloat162float(__ldg(row_scales + col / 128)); \
+                    scale1 = __bfloat162float(__ldg(row_scales + (col + 512) / 128)); \
+                } \
+                scale0 = __shfl_sync(0xffffffffu, scale0, 0, 8); \
+                scale1 = __shfl_sync(0xffffffffu, scale1, 0, 8); \
+            } \
+            gemv_accumulate_tiles(first, next, x + col, scale0, scale1, a0, a1, a2, a3); \
+        } \
+        acc = (a0+a1)+(a2+a3); \
+    } else { \
+        for (uint64_t col=lane; col<uint64_t(k); col+=32) { \
+            const float weight = __bfloat162float(weight_at<PER_CHANNEL>(w,scales,row,col,k,scale_stride)); \
+            acc = fmaf(weight,__bfloat162float(x[col]),acc); \
+        } \
+    } \
+    for (int shift=16; shift>0; shift/=2) acc += __shfl_down_sync(0xffffffffu,acc,shift); \
+    if (lane==0) y[row]=__float2bfloat16_rn(acc); \
 }
+FP8_GEMV_ENTRY(fp8_gemv_bf16, false)
+FP8_GEMV_ENTRY(fp8_gemv_bf16_per_channel, true)
+#undef FP8_GEMV_ENTRY
 
-template<int M>
+template<int M, bool PER_CHANNEL>
 __device__ __forceinline__ void fp8_skinny(
         const uint8_t* w, const __nv_bfloat16* scales,
         const __nv_bfloat16* x, __nv_bfloat16* y, int n, int k) {
@@ -154,18 +179,24 @@ __device__ __forceinline__ void fp8_skinny(
     float sums[M][4] = {};
     if ((k & 1023) == 0) {
         const uint8_t* const codes = w + row*uint64_t(k);
-        const __nv_bfloat16* const row_scales = scales + (row/128)*stride;
+        const __nv_bfloat16* const row_scales = PER_CHANNEL
+            ? scales + row : scales + (row/128)*stride;
         for (int base=0; base<k; base+=1024) {
             const int col = base + int(lane)*16;
             uint4 first, next;
             gemv_load_pair(codes+col, first, next);
             float s0=0.0f,s1=0.0f;
+            if constexpr (PER_CHANNEL) {
+                s0=__bfloat162float(__ldg(row_scales));
+                s1=s0;
+            } else {
             if ((lane&7u)==0) {
                 s0=__bfloat162float(__ldg(row_scales+col/128));
                 s1=__bfloat162float(__ldg(row_scales+(col+512)/128));
             }
             s0=__shfl_sync(0xffffffffu,s0,0,8);
             s1=__shfl_sync(0xffffffffu,s1,0,8);
+            }
             const uint32_t c0[4]={first.x,first.y,first.z,first.w};
             const uint32_t c1[4]={next.x,next.y,next.z,next.w};
             #pragma unroll
@@ -199,7 +230,7 @@ __device__ __forceinline__ void fp8_skinny(
         }
     } else {
         for (uint64_t col=lane; col<uint64_t(k); col+=32) {
-            const float weight=__bfloat162float(weight_at(w,scales,row,col,k,stride));
+            const float weight=__bfloat162float(weight_at<PER_CHANNEL>(w,scales,row,col,k,stride));
             #pragma unroll
             for (int m=0; m<M; ++m)
                 sums[m][0]=fmaf(weight,__bfloat162float(x[uint64_t(m)*uint64_t(k)+col]),sums[m][0]);
@@ -217,7 +248,10 @@ __device__ __forceinline__ void fp8_skinny(
 #define FP8_SKINNY_ENTRY(M) \
 extern "C" __global__ __launch_bounds__(128, 5) void fp8_skinny_bf16_m##M( \
     const uint8_t* w, const __nv_bfloat16* scales, const __nv_bfloat16* x, \
-    __nv_bfloat16* y, int n, int k) { fp8_skinny<M>(w,scales,x,y,n,k); }
+    __nv_bfloat16* y, int n, int k) { fp8_skinny<M, false>(w,scales,x,y,n,k); } \
+extern "C" __global__ __launch_bounds__(128, 5) void fp8_skinny_bf16_m##M##_per_channel( \
+    const uint8_t* w, const __nv_bfloat16* scales, const __nv_bfloat16* x, \
+    __nv_bfloat16* y, int n, int k) { fp8_skinny<M, true>(w,scales,x,y,n,k); }
 FP8_SKINNY_ENTRY(2)
 FP8_SKINNY_ENTRY(3)
 FP8_SKINNY_ENTRY(4)

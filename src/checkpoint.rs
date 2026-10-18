@@ -235,7 +235,13 @@ impl MappedCheckpoint {
                 sum.checked_add(tensor_bytes(*dtype, shape)?)
                     .context("resident size overflow")
             })?;
-        self.assemble_manifest(label, expected, policy, planned)
+        self.assemble_manifest(
+            label,
+            expected,
+            policy,
+            planned,
+            spec.linear_format.fp8_layout(),
+        )
     }
 
     fn text_entries(
@@ -248,11 +254,8 @@ impl MappedCheckpoint {
         let head_dim = spec.head_dim as usize;
         let q_width = spec.q_width as usize;
         let kv_width = spec.kv_heads as usize * head_dim;
-        let fp8 = match spec.linear_format {
-            crate::model_spec::LinearFormat::Bf16 => false,
-            crate::model_spec::LinearFormat::Fp8E4m3Block128 => true,
-            other => bail!("checkpoint manifest has no mapping for linear_format={other:?}"),
-        };
+        let fp8 = spec.linear_format.fp8_layout();
+        let dense_fp8 = fp8.filter(|layout| *layout == crate::fp8::Fp8ScaleLayout::Block128);
         for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
             put(
                 expected,
@@ -292,20 +295,38 @@ impl MappedCheckpoint {
                         vec![experts, hidden],
                         TensorScope::Text,
                     );
-                    put(
-                        expected,
-                        format!("{p}.mlp.experts.gate_up_proj"),
-                        Dtype::BF16,
-                        vec![experts, 2 * expert_i, hidden],
-                        TensorScope::Text,
-                    );
-                    put(
-                        expected,
-                        format!("{p}.mlp.experts.down_proj"),
-                        Dtype::BF16,
-                        vec![experts, hidden, expert_i],
-                        TensorScope::Text,
-                    );
+                    if spec.expert_format == crate::model_spec::ExpertFormat::Fp8W8a16 {
+                        for expert in 0..experts {
+                            for (role, n, k) in [
+                                ("gate_proj", expert_i, hidden),
+                                ("up_proj", expert_i, hidden),
+                                ("down_proj", hidden, expert_i),
+                            ] {
+                                projection(
+                                    expected,
+                                    format!("{p}.mlp.experts.{expert}.{role}"),
+                                    n,
+                                    k,
+                                    Some(crate::fp8::Fp8ScaleLayout::PerChannel),
+                                );
+                            }
+                        }
+                    } else {
+                        put(
+                            expected,
+                            format!("{p}.mlp.experts.gate_up_proj"),
+                            Dtype::BF16,
+                            vec![experts, 2 * expert_i, hidden],
+                            TensorScope::Text,
+                        );
+                        put(
+                            expected,
+                            format!("{p}.mlp.experts.down_proj"),
+                            Dtype::BF16,
+                            vec![experts, hidden, expert_i],
+                            TensorScope::Text,
+                        );
+                    }
                     put(
                         expected,
                         format!("{p}.mlp.shared_expert.gate_proj.weight"),
@@ -342,21 +363,21 @@ impl MappedCheckpoint {
                         format!("{p}.mlp.gate_proj"),
                         intermediate,
                         hidden,
-                        fp8,
+                        dense_fp8,
                     );
                     projection(
                         expected,
                         format!("{p}.mlp.up_proj"),
                         intermediate,
                         hidden,
-                        fp8,
+                        dense_fp8,
                     );
                     projection(
                         expected,
                         format!("{p}.mlp.down_proj"),
                         hidden,
                         intermediate,
-                        fp8,
+                        dense_fp8,
                     );
                 }
             }
@@ -411,21 +432,21 @@ impl MappedCheckpoint {
                         format!("{p}.linear_attn.in_proj_qkv"),
                         conv_dim,
                         hidden,
-                        fp8,
+                        dense_fp8,
                     );
                     projection(
                         expected,
                         format!("{p}.linear_attn.in_proj_z"),
                         value_dim,
                         hidden,
-                        fp8,
+                        dense_fp8,
                     );
                     projection(
                         expected,
                         format!("{p}.linear_attn.out_proj"),
                         hidden,
                         value_dim,
-                        fp8,
+                        dense_fp8,
                     );
                     for name in ["in_proj_a", "in_proj_b"] {
                         put(
@@ -644,6 +665,7 @@ impl MappedCheckpoint {
         mut expected: BTreeMap<String, ExpectedTensor>,
         policy: LoadPolicy,
         expected_bytes: usize,
+        fp8_layout: Option<crate::fp8::Fp8ScaleLayout>,
     ) -> Result<TensorManifest> {
         ensure!(
             expected.len() == self.index.weight_map.len(),
@@ -694,9 +716,12 @@ impl MappedCheckpoint {
             };
             let scale_name = if dtype == Dtype::F8_E4M3 {
                 Some(format!(
-                    "{}.weight_scale_inv",
+                    "{}.{}",
                     name.strip_suffix(".weight")
-                        .context("invalid FP8 tensor suffix")?
+                        .context("invalid FP8 tensor suffix")?,
+                    fp8_layout
+                        .context("FP8 tensor without scale layout")?
+                        .scale_suffix()
                 ))
             } else {
                 None
@@ -746,9 +771,13 @@ fn projection(
     base: String,
     n: usize,
     k: usize,
-    fp8: bool,
+    fp8: Option<crate::fp8::Fp8ScaleLayout>,
 ) {
-    let dtype = if fp8 { Dtype::F8_E4M3 } else { Dtype::BF16 };
+    let dtype = if fp8.is_some() {
+        Dtype::F8_E4M3
+    } else {
+        Dtype::BF16
+    };
     put(
         expected,
         format!("{base}.weight"),
@@ -756,12 +785,12 @@ fn projection(
         vec![n, k],
         TensorScope::Text,
     );
-    if fp8 {
+    if let Some(layout) = fp8 {
         put(
             expected,
-            format!("{base}.weight_scale_inv"),
+            format!("{base}.{}", layout.scale_suffix()),
             Dtype::BF16,
-            vec![n.div_ceil(128), k.div_ceil(128)],
+            layout.scale_shape(n as u32, k as u32).to_vec(),
             TensorScope::Text,
         );
     }
@@ -840,6 +869,11 @@ pub struct TensorEntry {
     pub layer: Option<u32>,
     pub role: String,
     pub scale_name: Option<String>,
+}
+impl TensorEntry {
+    pub(crate) fn is_routed_expert(&self) -> bool {
+        self.role.starts_with("mlp.experts.")
+    }
 }
 #[derive(Debug, serde::Serialize)]
 pub struct TensorManifest {
