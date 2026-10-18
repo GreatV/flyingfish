@@ -3221,6 +3221,104 @@ mod tests {
             &output,
             Rc::new(Closure::new(false, "merger bias rounding".into())),
         )?;
+        {
+            use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
+            use std::collections::BTreeMap;
+
+            let stored_shape = [1152usize, 3, 14, 14];
+            let width = stored_shape[0] as u32;
+            let input = stored_shape[1..].iter().product::<usize>() as u32;
+            let half_ulp = bf16::from_f32(bf16::EPSILON.to_f32() / 2.0);
+            let mut weight = vec![bf16::ZERO; (width * input) as usize];
+            let mut bias = Vec::with_capacity(width as usize);
+            for (column, values) in weight.chunks_exact_mut(input as usize).enumerate() {
+                let sign = if column < width as usize / 2 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                values[0] = bf16::from_f32(sign);
+                values[1] = bf16::from_f32(sign * half_ulp.to_f32());
+                bias.push(values[1]);
+            }
+            let prefix = "model.vision_tower.embeddings.patch_embedding";
+            let mut tensors = BTreeMap::new();
+            let mut entries = BTreeMap::new();
+            let mut bytes = 0;
+            for (suffix, shape, values) in [
+                ("weight", stored_shape.to_vec(), weight),
+                ("bias", vec![width as usize], bias),
+            ] {
+                let name = format!("{prefix}.{suffix}");
+                let size = values.len() * size_of::<bf16>();
+                tensors.insert(name.clone(), StoredTensor::Bf16(s.clone_htod(&values)?));
+                entries.insert(
+                    name,
+                    TensorEntry {
+                        dtype: safetensors::Dtype::BF16,
+                        shape,
+                        shard: "patch-fixture.safetensors".into(),
+                        bytes: size,
+                        load: true,
+                        data_start: 0,
+                        data_offsets: [0, size as u64],
+                        scope: TensorScope::Vision,
+                        layer: None,
+                        role: suffix.into(),
+                        scale_name: None,
+                    },
+                );
+                bytes += size;
+            }
+            let mut catalog = WeightCatalog {
+                tensors,
+                manifest: TensorManifest {
+                    entries,
+                    resident_bytes: bytes,
+                },
+                bytes,
+                upload_content_sha256: None,
+                upload_hashed_bytes: None,
+                load_wall_ms: 0.0,
+            };
+            let patch = BiasedWeight::take(&mut catalog, prefix, [width, input], &stored_shape)?;
+            for rows in [1u32, 37, 1120, 7104] {
+                let mut host = vec![bf16::ZERO; (rows * input) as usize];
+                for row in host.chunks_exact_mut(input as usize) {
+                    row[..2].fill(bf16::ONE);
+                }
+                let x = s.clone_htod(&host)?;
+                let y = s.alloc_zeros::<bf16>((rows * width) as usize)?;
+                patch.prepare(s, &mut blas, rows)?;
+                patch.run(
+                    s,
+                    &blas,
+                    dense(&x, s, [rows, input])?,
+                    &mut TensorMut(dense(&y, s, [rows, width])?),
+                )?;
+                let wrong = s
+                    .clone_dtoh(&y)?
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, value)| {
+                        let sign = if index % (width as usize) < width as usize / 2 {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        value.to_bits() != bf16::from_f32(sign).to_bits()
+                    })
+                    .count();
+                println!(
+                    "{} vision_patch_bias_rounding rows={rows} width={width} input={input} bit_mismatches={wrong}",
+                    if wrong == 0 { "PASS" } else { "DEFECT" }
+                );
+                ensure!(
+                    wrong == 0,
+                    "patch bias preceded BF16 conversion: rows={rows}, {wrong} wrong elements"
+                );
+            }
+        }
         let input = 4608u32;
         let half_ulp = bf16::from_f32(1.0 / 256.0);
         // The dot product is a BF16 midpoint. Adding bias before conversion
