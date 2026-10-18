@@ -1030,7 +1030,7 @@ mod tests {
                     let got_codes = stream.clone_dtoh(&codes)?;
                     let got_scales = stream.clone_dtoh(&scales)?;
                     let mut bad = 0;
-                    for row in 0..rows {
+                    for (row, got_scale) in got_scales.iter().enumerate() {
                         let range = row * width..(row + 1) * width;
                         let active = row >= row_base as usize
                             && row < (row_base + row_capacity) as usize
@@ -1041,7 +1041,7 @@ mod tests {
                                 got[range.clone()].iter().all(|v| v.is_finite()),
                                 "nonfinite active quantization output"
                             );
-                            bad += usize::from(got_scales[row].to_bits() != s.to_bits());
+                            bad += usize::from(got_scale.to_bits() != s.to_bits());
                             bad += got_codes[range.clone()]
                                 .iter()
                                 .zip(&c)
@@ -1053,8 +1053,7 @@ mod tests {
                                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                                 .count();
                         } else {
-                            bad +=
-                                usize::from(got_scales[row].to_bits() != scale_sentinel.to_bits());
+                            bad += usize::from(got_scale.to_bits() != scale_sentinel.to_bits());
                             bad += got_codes[range.clone()]
                                 .iter()
                                 .filter(|&&v| v != code_sentinel)
