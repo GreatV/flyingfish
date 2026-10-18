@@ -2005,6 +2005,9 @@ mod tests {
                             crate::model_spec::LinearFormat::Fp8E4m3Block128 => {
                                 crate::model_spec::LinearFormat::Bf16
                             }
+                            crate::model_spec::LinearFormat::Fp8E4m3Channel => {
+                                crate::model_spec::LinearFormat::Bf16
+                            }
                         }
                     }
                     "architecture" => bad.architecture = crate::model_spec::Architecture::Llama,

@@ -248,7 +248,11 @@ impl MappedCheckpoint {
         let head_dim = spec.head_dim as usize;
         let q_width = spec.q_width as usize;
         let kv_width = spec.kv_heads as usize * head_dim;
-        let fp8 = spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Block128;
+        let fp8 = match spec.linear_format {
+            crate::model_spec::LinearFormat::Bf16 => false,
+            crate::model_spec::LinearFormat::Fp8E4m3Block128 => true,
+            other => bail!("checkpoint manifest has no mapping for linear_format={other:?}"),
+        };
         for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
             put(
                 expected,

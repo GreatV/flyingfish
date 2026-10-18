@@ -209,6 +209,7 @@ impl HostBlocks {
 /// Native expert slots in rank-major, layer-minor order, followed by persistent staging.
 pub struct SlotLayout {
     geometry: ExpertGeometry,
+    slot_bytes: usize,
     slots: Vec<Vec<Range<usize>>>,
     resident_bytes: usize,
     staging_slots: u32,
@@ -226,11 +227,11 @@ impl SlotLayout {
                 && geometry.top_k <= geometry.experts,
             "invalid slot geometry {geometry:?}"
         );
-        let slot_bytes = usize::try_from(geometry.slot_bytes()?)?;
+        let slot_bytes = usize::try_from(capacity.slot_bytes())?;
+        let gate_up_bytes = capacity.layout.gate_up_bytes().unwrap_or(0);
         ensure!(
-            slot_bytes.is_multiple_of(16) && geometry.gate_up_bytes()?.is_multiple_of(16),
-            "native slot alignment: slot_bytes={slot_bytes} gate_up_bytes={}",
-            geometry.gate_up_bytes()?
+            slot_bytes.is_multiple_of(16) && gate_up_bytes.is_multiple_of(16),
+            "native slot alignment: slot_bytes={slot_bytes} gate_up_bytes={gate_up_bytes}"
         );
         ensure!(
             capacity.slots_per_layer.len() == geometry.layers as usize,
@@ -292,6 +293,7 @@ impl SlotLayout {
         );
         let layout = Self {
             geometry,
+            slot_bytes,
             slots,
             resident_bytes,
             staging_slots: capacity.prefill_staging_slots,
@@ -302,7 +304,7 @@ impl SlotLayout {
     }
 
     pub fn allocation_bytes(&self) -> Result<usize> {
-        usize::try_from(self.geometry.slot_bytes()?)?
+        self.slot_bytes
             .checked_mul(self.staging_slots as usize)
             .and_then(|n| n.checked_add(self.resident_bytes))
             .filter(|&n| n <= isize::MAX as usize)
@@ -311,6 +313,10 @@ impl SlotLayout {
 
     pub fn geometry(&self) -> ExpertGeometry {
         self.geometry
+    }
+
+    pub fn slot_bytes(&self) -> usize {
+        self.slot_bytes
     }
 
     pub fn host_blocks(&self) -> u32 {
@@ -339,14 +345,14 @@ impl SlotLayout {
             "staging slot={slot} outside count={}",
             self.staging_slots
         );
-        let bytes = usize::try_from(self.geometry.slot_bytes()?)?;
+        let bytes = self.slot_bytes;
         let start = self.resident_bytes + slot as usize * bytes;
         Ok(start..start + bytes)
     }
 
     /// Borrowed storage excludes persistent staging and retains the first slot of every layer.
     pub fn borrowed_tail(&self, slots: u32) -> Result<Range<usize>> {
-        let bytes = usize::try_from(self.geometry.slot_bytes()?)?;
+        let bytes = self.slot_bytes;
         let count = self.resident_bytes / bytes;
         ensure!(
             slots as usize <= count - self.geometry.layers as usize,
@@ -435,8 +441,13 @@ impl SlotEvents {
 mod tests {
     use super::*;
     fn slot_capacity(geometry: ExpertGeometry, slots_per_layer: Vec<u32>) -> Result<Capacity> {
-        let bytes = geometry.slot_bytes()?;
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            &geometry,
+        )?;
+        let bytes = layout.slot_bytes();
         Ok(Capacity {
+            layout,
             span_rows: 8,
             wave_rows: 2,
             device_expert_bytes: slots_per_layer.iter().map(|&n| u64::from(n)).sum::<u64>() * bytes,
@@ -463,7 +474,7 @@ mod tests {
         };
         let capacity = slot_capacity(geometry, vec![3, 2, 2])?;
         let layout = SlotLayout::new(geometry, &capacity)?;
-        let bytes = geometry.slot_bytes()? as usize;
+        let bytes = layout.slot_bytes();
         let order = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1), (0, 2)];
         for (physical, &(layer, rank)) in order.iter().enumerate() {
             assert_eq!(
@@ -499,10 +510,10 @@ mod tests {
             top_k: 8,
         };
         let mut capacity = slot_capacity(geometry, crate::experts::plan::equal_slots(2701, 40)?)?;
-        let bytes = geometry.slot_bytes()? as usize;
+        let bytes = capacity.slot_bytes() as usize;
         assert_eq!(bytes, 6_291_456);
-        assert_eq!(geometry.gate_up_bytes()?, 4_194_304);
-        assert_eq!(geometry.down_bytes()?, 2_097_152);
+        assert_eq!(capacity.layout.gate_up_bytes(), Some(4_194_304));
+        assert_eq!(bytes as u64 - 4_194_304, 2_097_152);
         let layout = SlotLayout::new(geometry, &capacity)?;
         assert_eq!(layout.resident_slot(20, 67)?, 2700 * bytes..2701 * bytes);
         assert!(layout.resident_slot(21, 67).is_err());

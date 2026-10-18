@@ -164,6 +164,52 @@ fn spec_rejects_every_unsupported_field() {
     assert!(ModelSpec::minicpm(&config(), &json!({"eos_token_id": 248144})).is_err());
 }
 
+#[test]
+#[ignore = "official FP8 checkpoint; set FF_FP8_MODEL"]
+fn fp8_spec_states_per_channel_linears_and_the_published_ignore_list() -> Result<()> {
+    let dir =
+        std::path::PathBuf::from(std::env::var_os("FF_FP8_MODEL").context("FF_FP8_MODEL missing")?);
+    let root: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+    let generation: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("generation_config.json"))?)?;
+    let spec = ModelSpec::minicpm(&root, &generation)?;
+    assert_eq!(spec.linear_format, LinearFormat::Fp8E4m3Channel);
+    assert_eq!(
+        spec.expert_format,
+        flyingfish::model_spec::ExpertFormat::Fp8W8a16
+    );
+
+    let mut unexpected = root.clone();
+    unexpected["quantization_config"]["ignore"]
+        .as_array_mut()
+        .context("ignore list")?
+        .push(json!(
+            "model.language_model.layers.0.self_attn.q_proj.weight"
+        ));
+    let error = ModelSpec::minicpm(&unexpected, &generation)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unexpected entry"), "{error}");
+
+    let mut missing = root.clone();
+    missing["quantization_config"]["ignore"]
+        .as_array_mut()
+        .context("ignore list")?
+        .pop();
+    let error = ModelSpec::minicpm(&missing, &generation)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("quantization ignore missing"), "{error}");
+
+    let mut unknown = root.clone();
+    unknown["quantization_config"]["weights"] = json!(1);
+    let error = ModelSpec::minicpm(&unknown, &generation)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown quantization_config key"), "{error}");
+    Ok(())
+}
+
 fn write_checkpoint(
     real: &Path,
     root: &Path,

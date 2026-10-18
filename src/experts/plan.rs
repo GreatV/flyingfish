@@ -190,9 +190,9 @@ pub struct Reserves {
 
 impl Reserves {
     /// Device bytes reserved outside the expert slots: fixed profile plus staging slots.
-    pub fn persistent_bytes(&self, geometry: &ExpertGeometry) -> Result<u64> {
+    pub fn persistent_bytes(&self, slot_bytes: u64) -> Result<u64> {
         let staging = u64::from(self.prefill_staging_slots)
-            .checked_mul(geometry.slot_bytes()?)
+            .checked_mul(slot_bytes)
             .context("prefill staging overflow")?;
         self.device_fixed_bytes
             .checked_add(staging)
@@ -213,9 +213,9 @@ impl Reserves {
             .context("span buffer overflow")
     }
 
-    pub fn host_bytes(&self, geometry: &ExpertGeometry) -> Result<u64> {
+    pub fn host_bytes(&self, slot_bytes: u64) -> Result<u64> {
         let ring = u64::from(self.disk_ring_slots)
-            .checked_mul(geometry.slot_bytes()?)
+            .checked_mul(slot_bytes)
             .context("disk ring overflow")?;
         self.host_fixed_bytes
             .checked_add(ring)
@@ -227,6 +227,7 @@ impl Reserves {
 #[derive(Clone, Debug)]
 pub struct PlanInputs<'a> {
     pub geometry: ExpertGeometry,
+    pub layout: crate::experts::catalogue::ExpertLayout,
     pub device_free_bytes: u64,
     pub host_available_bytes: u64,
     pub h2d_bytes_per_second: f64,
@@ -245,6 +246,7 @@ pub struct PlanInputs<'a> {
 /// Setup capacity derived for one admission cap.
 #[derive(Clone, Debug)]
 pub struct Capacity {
+    pub layout: crate::experts::catalogue::ExpertLayout,
     pub span_rows: u32,
     pub wave_rows: u32,
     pub device_expert_bytes: u64,
@@ -267,6 +269,10 @@ impl Capacity {
     pub fn slots_total(&self) -> u32 {
         self.slots_per_layer.iter().sum()
     }
+
+    pub fn slot_bytes(&self) -> u64 {
+        self.layout.slot_bytes()
+    }
 }
 
 /// One span/wave candidate with the caller's exact reserves.
@@ -280,7 +286,7 @@ pub struct SpanCandidate {
 /// Tail slots borrowed by a prefill of `prefill_rows` at `span_rows`.
 pub fn span_borrow_slots(
     reserves: &Reserves,
-    geometry: &ExpertGeometry,
+    slot_bytes: u64,
     prefill_rows: u32,
     span_rows: u32,
 ) -> Result<u32> {
@@ -288,7 +294,7 @@ pub fn span_borrow_slots(
     let rows = prefill_rows.min(span_rows);
     ensure!(rows > 0, "zero prefill rows");
     let bytes = reserves.span_bytes(rows)?;
-    let slot = geometry.slot_bytes()?;
+    let slot = slot_bytes;
     u32::try_from(bytes.div_ceil(slot)).context("span borrow exceeds u32 slots")
 }
 
@@ -318,7 +324,7 @@ pub fn select_span(
         };
         let borrow = span_borrow_slots(
             &candidate.reserves,
-            &inputs.geometry,
+            inputs.layout.slot_bytes(),
             prefill_rows,
             candidate.span_rows,
         )?;
@@ -438,8 +444,9 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         "invalid copy engine count {}",
         inputs.copy_engines
     );
-    let device_reserved = inputs.reserves.persistent_bytes(&geometry)?;
-    let host_reserved = inputs.reserves.host_bytes(&geometry)?;
+    let slot_bytes = inputs.layout.slot_bytes();
+    let device_reserved = inputs.reserves.persistent_bytes(slot_bytes)?;
+    let host_reserved = inputs.reserves.host_bytes(slot_bytes)?;
     ensure!(
         inputs.device_free_bytes >= device_reserved,
         "persistent reserves {device_reserved} B exceed device free bytes {}",
@@ -450,7 +457,6 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         "host reserves {host_reserved} B exceed host available bytes {}",
         inputs.host_available_bytes
     );
-    let slot_bytes = geometry.slot_bytes()?;
     let device_expert_bytes = inputs.device_free_bytes - device_reserved;
     let host_expert_bytes = inputs.host_available_bytes - host_reserved;
     let routed_slots = u64::from(geometry.layers)
@@ -469,19 +475,29 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         "host blocks {host_block_slots} cannot hold {admission_cap} reserve blocks"
     );
     let non_gpu = routed_slots - total_slots;
+    let headroom = span_borrow_slots(
+        inputs.reserves,
+        slot_bytes,
+        inputs.span_rows,
+        inputs.span_rows,
+    )?;
+    let host_target = non_gpu
+        .checked_add(u64::from(headroom))
+        .context("host headroom overflow")?;
     let mut reserve = admission_cap;
-    let mut host_blocks = (host_block_slots - u64::from(reserve)).min(non_gpu);
+    let mut host_blocks = (host_block_slots - u64::from(reserve)).min(host_target);
     if host_blocks > 0 && reserve == 0 {
         if host_block_slots > 1 {
             reserve = 1;
-            host_blocks = (host_block_slots - 1).min(non_gpu);
+            host_blocks = (host_block_slots - 1).min(host_target);
         } else {
             host_blocks = 0;
         }
     }
     let host_blocks = u32::try_from(host_blocks).context("host block count exceeds u32")?;
+    let hosted = u64::from(host_blocks).min(non_gpu);
     let unique_slots = total_slots
-        .checked_add(u64::from(host_blocks))
+        .checked_add(hosted)
         .context("unique expert count overflow")?;
     ensure!(
         unique_slots <= routed_slots,
@@ -503,6 +519,7 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         0
     };
     Ok(Capacity {
+        layout: inputs.layout.clone(),
         span_rows: inputs.span_rows,
         wave_rows: inputs.wave_rows,
         device_expert_bytes,
@@ -612,7 +629,7 @@ impl TierLedger {
 
     fn positions(layout: &SlotLayout) -> Result<(Vec<u32>, usize)> {
         let geometry = layout.geometry();
-        let bytes = usize::try_from(geometry.slot_bytes()?)?;
+        let bytes = layout.slot_bytes();
         let mut count = 0usize;
         for layer in 0..geometry.layers {
             count = count
@@ -643,8 +660,7 @@ impl TierLedger {
     }
 
     fn position(&self, layer: u32, rank: u32) -> Result<usize> {
-        let bytes = usize::try_from(self.layout.geometry().slot_bytes()?)?;
-        Ok(self.layout.resident_slot(layer, rank)?.start / bytes)
+        Ok(self.layout.resident_slot(layer, rank)?.start / self.layout.slot_bytes())
     }
 
     pub fn tier(&self, layer: u32, expert: u32) -> Result<Tier> {
@@ -860,8 +876,8 @@ impl TierLedger {
     pub(crate) fn borrow_tail(&mut self, slots: u32, to_host_limit: u32) -> Result<Borrow> {
         ensure!(slots > 0, "zero borrowed slots");
         let range = self.layout.borrowed_tail(slots)?;
-        let slot_bytes = self.layout.geometry().slot_bytes()?;
-        let bytes = usize::try_from(slot_bytes)?;
+        let bytes = self.layout.slot_bytes();
+        let slot_bytes = bytes as u64;
         ensure!(
             range.start % bytes == 0 && range.end % bytes == 0,
             "borrowed tail {range:?} is not slot-aligned"
@@ -944,7 +960,7 @@ impl TierLedger {
             .filter(|resident| **resident)
             .count();
         u64::try_from(slots)?
-            .checked_mul(self.layout.geometry().slot_bytes()?)
+            .checked_mul(self.layout.slot_bytes() as u64)
             .context("unique bytes overflow")
     }
 
@@ -953,7 +969,7 @@ impl TierLedger {
         let routed = u64::from(geometry.layers)
             .checked_mul(u64::from(geometry.experts))
             .context("routed expert count overflow")?;
-        let slot = geometry.slot_bytes()?;
+        let slot = self.layout.slot_bytes() as u64;
         let used = self.unique_bytes()? / slot;
         routed
             .checked_sub(used)
@@ -1166,9 +1182,19 @@ mod tests {
         }
     }
 
+    fn slot() -> u64 {
+        crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            &geometry(),
+        )
+        .unwrap()
+        .slot_bytes()
+    }
+
     fn capacity_ref<'a>(inputs: &PlanInputs<'a>) -> PlanInputs<'a> {
         PlanInputs {
             geometry: inputs.geometry,
+            layout: inputs.layout.clone(),
             device_free_bytes: inputs.device_free_bytes,
             host_available_bytes: inputs.host_available_bytes,
             h2d_bytes_per_second: inputs.h2d_bytes_per_second,
@@ -1185,11 +1211,17 @@ mod tests {
 
     fn inputs<'a>(service: &'a ServiceTable, reserves: &'a Reserves) -> PlanInputs<'a> {
         let geometry = geometry();
-        let slot = geometry.slot_bytes().unwrap();
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            &geometry,
+        )
+        .unwrap();
+        let slot = layout.slot_bytes();
         PlanInputs {
             geometry,
-            device_free_bytes: reserves.persistent_bytes(&geometry).unwrap() + 4 * slot,
-            host_available_bytes: reserves.host_bytes(&geometry).unwrap() + 26 * slot,
+            layout,
+            device_free_bytes: reserves.persistent_bytes(slot).unwrap() + 4 * slot,
+            host_available_bytes: reserves.host_bytes(slot).unwrap() + 26 * slot,
             h2d_bytes_per_second: 1e9,
             d2h_bytes_per_second: 5e8,
             copy_engines: 2,
@@ -1209,11 +1241,10 @@ mod tests {
         let inputs = inputs(&service, &reserves);
         let derived = capacity(&inputs, 0).unwrap();
         assert_eq!(derived.slots_per_layer, vec![2, 2]);
-        assert_eq!(derived.host_blocks, 12);
+        assert_eq!(derived.host_blocks, 15);
         assert_eq!(derived.disk_bytes, 0);
         let small_host = PlanInputs {
-            host_available_bytes: reserves.host_bytes(&geometry()).unwrap()
-                + 8 * geometry().slot_bytes().unwrap(),
+            host_available_bytes: reserves.host_bytes(slot()).unwrap() + 8 * slot(),
             ..capacity_ref(&inputs)
         };
         let small = capacity(&small_host, 0).unwrap();
@@ -1221,20 +1252,15 @@ mod tests {
             small.host_blocks, 7,
             "one block is reserved for swap write-backs"
         );
-        assert_eq!(
-            small.disk_bytes,
-            (16 - 4 - 7) * geometry().slot_bytes().unwrap()
-        );
+        assert_eq!(small.disk_bytes, (16 - 4 - 7) * slot());
         let tight = PlanInputs {
-            device_free_bytes: reserves.persistent_bytes(&geometry()).unwrap()
-                + 2 * geometry().slot_bytes().unwrap()
-                - 1,
+            device_free_bytes: reserves.persistent_bytes(slot()).unwrap() + 2 * slot() - 1,
             ..capacity_ref(&inputs)
         };
         let error = capacity(&tight, 0).unwrap_err().to_string();
         assert!(error.contains("device expert bytes"), "{error}");
         let over = PlanInputs {
-            device_free_bytes: reserves.persistent_bytes(&geometry()).unwrap() - 1,
+            device_free_bytes: reserves.persistent_bytes(slot()).unwrap() - 1,
             ..tight
         };
         let error = capacity(&over, 0).unwrap_err().to_string();
@@ -1248,7 +1274,7 @@ mod tests {
         let service = service();
         let reserves = reserves();
         let inputs = inputs(&service, &reserves);
-        let arena_bytes = 13 * geometry().slot_bytes().unwrap();
+        let arena_bytes = 16 * slot();
         let eligible = PlanInputs {
             host_registration_bytes: arena_bytes,
             ..capacity_ref(&inputs)
@@ -1267,18 +1293,73 @@ mod tests {
     }
 
     #[test]
-    fn fully_resident_capacity_is_clamped_to_the_routed_count() {
+    fn capacity_sizes_from_the_fp8_layout_slot_bytes() {
         let service = service();
         let reserves = reserves();
         let geometry = geometry();
-        let slot = geometry.slot_bytes().unwrap();
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Fp8W8a16,
+            &geometry,
+        )
+        .unwrap();
+        let slot = layout.slot_bytes();
+        assert_eq!(slot, 128);
+        let inputs = PlanInputs {
+            geometry,
+            layout,
+            device_free_bytes: reserves.persistent_bytes(slot).unwrap() + 4 * slot,
+            host_available_bytes: reserves.host_bytes(slot).unwrap() + 10 * slot,
+            h2d_bytes_per_second: 1e9,
+            d2h_bytes_per_second: 5e8,
+            copy_engines: 2,
+            disk_readers: 2,
+            host_registration_bytes: u64::MAX,
+            service: &service,
+            reserves: &reserves,
+            span_rows: 4,
+            wave_rows: 2,
+        };
+        let capacity = capacity(&inputs, 0).unwrap();
+        assert_eq!(capacity.slot_bytes(), 128);
+        assert_eq!(capacity.slots_per_layer, vec![2, 2]);
+        assert_eq!(capacity.host_blocks, 9);
+        assert_eq!(capacity.disk_bytes, 3 * 128);
+    }
+
+    #[test]
+    fn host_blocks_cover_the_worst_case_span_borrow() {
+        let service = service();
+        let reserves = reserves();
+        let inputs = inputs(&service, &reserves);
+        assert_eq!(span_borrow_slots(&reserves, slot(), 4, 4).unwrap(), 3);
+        let derived = capacity(&inputs, 0).unwrap();
+        assert_eq!(derived.host_blocks, 15, "12 non-GPU plus 3 borrow slots");
+        assert_eq!(derived.spare_blocks, 1);
+        assert_eq!(derived.disk_bytes, 0);
+        let small_host = PlanInputs {
+            host_available_bytes: reserves.host_bytes(slot()).unwrap() + 8 * slot(),
+            ..capacity_ref(&inputs)
+        };
+        let small = capacity(&small_host, 0).unwrap();
+        assert_eq!(small.host_blocks, 7, "host bytes below the headroom target");
+        assert_eq!(small.disk_bytes, 5 * slot());
+    }
+
+    #[test]
+    fn fully_resident_capacity_is_clamped_to_the_routed_count() {
+        let service = service();
+        let reserves = reserves();
+        let slot = slot();
         let mut inputs = inputs(&service, &reserves);
-        inputs.device_free_bytes =
-            reserves.persistent_bytes(&geometry).unwrap() + 16 * slot + 4_096;
-        inputs.host_available_bytes = reserves.host_bytes(&geometry).unwrap() + 2 * slot;
+        inputs.device_free_bytes = reserves.persistent_bytes(slot).unwrap() + 16 * slot + 4_096;
+        inputs.host_available_bytes = reserves.host_bytes(slot).unwrap() + 2 * slot;
         let derived = capacity(&inputs, 0).unwrap();
         assert_eq!(derived.slots_per_layer, vec![8, 8]);
-        assert_eq!(derived.host_blocks, 0);
+        assert_eq!(
+            derived.host_blocks, 1,
+            "the borrow headroom keeps one block above the reserve floor"
+        );
+        assert_eq!(derived.spare_blocks, 1);
         assert_eq!(derived.disk_bytes, 0);
         assert_eq!(derived.disk_workers, 0);
     }
@@ -1354,9 +1435,9 @@ mod tests {
             Admission {
                 budget_bytes_per_token: budget
             }
-            .hard_cap(geometry.slot_bytes().unwrap())
+            .hard_cap(slot())
             .unwrap(),
-            400_000 / geometry.slot_bytes().unwrap() as u32
+            400_000 / slot() as u32
         );
         let serial = admission_budget(&geometry, &table, 1e9, 1e9, 1).unwrap();
         assert_eq!(serial, 200_000);
@@ -1366,13 +1447,12 @@ mod tests {
 
     #[test]
     fn span_borrow_uses_the_prompt_and_span_minimum() {
-        let geometry = geometry();
         let reserves = reserves();
-        assert_eq!(span_borrow_slots(&reserves, &geometry, 4, 4).unwrap(), 3);
-        assert_eq!(span_borrow_slots(&reserves, &geometry, 2, 4).unwrap(), 2);
-        assert_eq!(span_borrow_slots(&reserves, &geometry, 8, 4).unwrap(), 3);
-        assert!(span_borrow_slots(&reserves, &geometry, 0, 4).is_err());
-        assert!(span_borrow_slots(&reserves, &geometry, 4, 0).is_err());
+        assert_eq!(span_borrow_slots(&reserves, slot(), 4, 4).unwrap(), 3);
+        assert_eq!(span_borrow_slots(&reserves, slot(), 2, 4).unwrap(), 2);
+        assert_eq!(span_borrow_slots(&reserves, slot(), 8, 4).unwrap(), 3);
+        assert!(span_borrow_slots(&reserves, slot(), 0, 4).is_err());
+        assert!(span_borrow_slots(&reserves, slot(), 4, 0).is_err());
     }
 
     #[test]
@@ -1380,8 +1460,7 @@ mod tests {
         let service = service();
         let reserves = reserves();
         let mut inputs = inputs(&service, &reserves);
-        inputs.device_free_bytes =
-            reserves.persistent_bytes(&geometry()).unwrap() + 4 * geometry().slot_bytes().unwrap();
+        inputs.device_free_bytes = reserves.persistent_bytes(slot()).unwrap() + 4 * slot();
         let mut tight = reserves;
         tight.residual_row_bytes = 128;
         let candidates = vec![
@@ -1415,8 +1494,13 @@ mod tests {
         slots_per_layer: Vec<u32>,
         host_blocks: u32,
     ) -> SlotLayout {
-        let slot = geometry.slot_bytes().unwrap();
+        let slot = slot();
         let capacity = Capacity {
+            layout: crate::experts::catalogue::ExpertLayout::new(
+                crate::model_spec::ExpertFormat::Bf16,
+                &geometry,
+            )
+            .unwrap(),
             span_rows: 4,
             wave_rows: 2,
             device_expert_bytes: slots_per_layer.iter().map(|&n| u64::from(n)).sum::<u64>() * slot,
@@ -1512,7 +1596,7 @@ mod tests {
     #[test]
     fn ledger_borrow_takes_the_layout_physical_tail() {
         let geometry = geometry();
-        let slot = geometry.slot_bytes().unwrap();
+        let slot = slot();
         let initial = initial_residency(&frequency(), &[2, 2], &geometry).unwrap();
         let mut ledger = ledger_for(geometry, vec![2, 2], 2, &initial);
         let borrow = ledger.borrow_tail(2, 2).unwrap();
@@ -1540,7 +1624,7 @@ mod tests {
     #[test]
     fn ledger_keeps_tiers_disjoint_and_bytes_exact() {
         let geometry = geometry();
-        let slot = geometry.slot_bytes().unwrap();
+        let slot = slot();
         let initial = initial_residency(&frequency(), &[2, 2], &geometry).unwrap();
         let mut ledger = ledger_for(geometry, vec![2, 2], 5, &initial);
         let routed = 16 * slot;

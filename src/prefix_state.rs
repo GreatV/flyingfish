@@ -1076,6 +1076,7 @@ mod tests {
         ModelSpec {
             abi_version: 1,
             architecture: Architecture::Qwen35Text,
+            expert_format: crate::model_spec::ExpertFormat::Bf16,
             hidden: 5120,
             intermediate: 17408,
             vocab: 248320,

@@ -23,7 +23,7 @@ fn g0_normalized_geometry_and_rejections() {
     let canonical = serde_json::to_string(&spec).unwrap();
     assert_eq!(
         flyingfish::prefix_state::sha256(canonical.as_bytes()),
-        "ba4a85072bea08b0113de8d0ae69aba447df73d62443d85af75385a97de43794",
+        "071f71a3277004bf8f4878a65e5384f54fdb3b188f100cbedd3def52e7582d66",
         "Q38 spec serialization changed"
     );
     let public = spec.config();
