@@ -7,6 +7,7 @@ use crate::experts::{
     span::{SpanPlan, SpanRates, StagingLeases, plan_span},
 };
 use crate::prefill::ExpertSpanLayout;
+use std::fmt::Write;
 use std::ops::Range;
 
 #[path = "engine_moe_prefetch.rs"]
@@ -221,6 +222,7 @@ struct Gpu {
     mailbox: Arc<CudaStream>,
     staging_readers: Vec<Option<Ticket>>,
     staging_copy: Option<Ticket>,
+    resident_slots: Vec<u32>,
     epoch: u64,
     read_ahead: ReadAhead,
 }
@@ -237,11 +239,14 @@ struct Cpu {
     disk: Vec<crate::experts::runtime::Route>,
 }
 
+type Wave = (usize, usize, usize, bool, String);
+
 pub(in crate::backend::cuda::engine) struct Prefill {
     geometry: ExpertGeometry,
     capacity: Capacity,
     reserves: Reserves,
     service: ServiceTable,
+    workers: u32,
     h2d_bytes_per_second: f64,
     span: Option<Span>,
     gpu: Gpu,
@@ -249,6 +254,14 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     frequency: Vec<Vec<f64>>,
     rows: u64,
     failed: bool,
+    mixer_rows: usize,
+    workspace_rows: usize,
+    waves: Vec<Wave>,
+    layer_names: Vec<String>,
+    counts: Vec<u32>,
+    resident: Vec<bool>,
+    forecast_counts: Vec<u32>,
+    forecast_resident: Vec<bool>,
     pub stats: [u64; 8],
 }
 
@@ -306,12 +319,19 @@ impl Prefill {
     #[cfg(test)]
     pub(in crate::backend::cuda::engine) fn new(
         device: &Device,
-        geometry: ExpertGeometry,
+        slots: &mut Slots,
         capacity: &Capacity,
         reserves: Reserves,
         service: ServiceTable,
         h2d_bytes_per_second: f64,
+        windows: (usize, usize),
     ) -> Result<Self> {
+        let (workspace_rows, mixer_rows) = windows;
+        let geometry = slots.catalogue.geometry();
+        ensure!(
+            mixer_rows > 0 && mixer_rows <= workspace_rows,
+            "prefill mixer_rows={mixer_rows} exceed workspace_rows={workspace_rows}"
+        );
         ensure!(
             capacity.span_rows > 0
                 && capacity.wave_rows > 0
@@ -335,9 +355,23 @@ impl Prefill {
             h2d_bytes_per_second.is_finite() && h2d_bytes_per_second > 0.0,
             "prefill H2D rate={h2d_bytes_per_second}"
         );
-        ExpertSpanLayout::new(&reserves, geometry, capacity.span_rows)?;
+        ExpertSpanLayout::new(&reserves, geometry, capacity.span_rows)?
+            .validate_wave(capacity.wave_rows, workspace_rows)?;
+        let borrowed = reserves
+            .span_bytes(capacity.span_rows)?
+            .div_ceil(geometry.slot_bytes()?);
+        let host_union = u64::from(geometry.layers) * u64::from(geometry.experts)
+            - u64::from(capacity.slots_total());
+        if capacity.disk_bytes == 0 && u64::from(capacity.host_blocks) >= host_union + borrowed {
+            slots.disk = None;
+        }
+        let rings = slots
+            .disk
+            .as_ref()
+            .map_or(0, |reader| reader.disk.ring_slots());
         let assignments = capacity.span_rows as usize * geometry.top_k as usize;
         let cpu = cpu_bound(geometry, capacity.span_rows, &service, h2d_bytes_per_second)?;
+        let workers = service.worker_count()?;
         let cohorts =
             (geometry.experts as usize).div_ceil(capacity.prefill_staging_slots as usize) + 1;
         Ok(Self {
@@ -345,6 +379,7 @@ impl Prefill {
             capacity: capacity.clone(),
             reserves,
             service,
+            workers,
             h2d_bytes_per_second,
             span: None,
             gpu: Gpu {
@@ -365,10 +400,12 @@ impl Prefill {
                 mailbox: device.ctx.new_stream()?,
                 staging_readers: vec![None; capacity.prefill_staging_slots as usize],
                 staging_copy: None,
+                resident_slots: Vec::with_capacity(geometry.experts as usize),
                 epoch: 0,
                 read_ahead: ReadAhead::new(
                     capacity.prefill_staging_slots,
-                    reserves.disk_ring_slots,
+                    rings,
+                    geometry.experts,
                 )?,
             },
             cpu: Cpu {
@@ -389,19 +426,42 @@ impl Prefill {
             frequency: vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize],
             rows: 0,
             failed: false,
+            mixer_rows,
+            workspace_rows,
+            waves: (0..capacity.span_rows as usize)
+                .step_by(mixer_rows)
+                .map(|base| {
+                    (
+                        base,
+                        0,
+                        0,
+                        false,
+                        String::with_capacity("prefill.".len() + usize::MAX.ilog10() as usize + 1),
+                    )
+                })
+                .collect(),
+            layer_names: (0..geometry.layers)
+                .map(|layer| format!("layer.{layer}"))
+                .collect(),
+            counts: vec![0; geometry.experts as usize],
+            resident: vec![false; geometry.experts as usize],
+            forecast_counts: vec![0; geometry.experts as usize],
+            forecast_resident: vec![false; geometry.experts as usize],
             stats: [0; 8],
         })
     }
 
     fn begin(&mut self, device: &Device, slots: &mut Slots, rows: u32) -> Result<()> {
         ensure!(self.span.is_none(), "prefill span is already borrowed");
+        ensure!(
+            !slots.request_open,
+            "prefill cannot begin while a decode request is open; end_request or reset is required"
+        );
         self.gpu.read_ahead.finish(slots)?;
-        self.gpu.read_ahead.stats = [0; 4];
-        if slots.request_open {
-            slots.end_request()?;
-        }
+        self.gpu.read_ahead.stats = [0; 6];
         let rows = rows.min(self.capacity.span_rows);
         let layout = ExpertSpanLayout::new(&self.reserves, self.geometry, rows)?;
+        layout.validate_wave(self.capacity.wave_rows.min(rows), self.workspace_rows)?;
         let borrowed = u32::try_from(
             self.reserves
                 .span_bytes(rows)?
@@ -557,15 +617,22 @@ impl Prefill {
         let BoundFfn::Moe { router, .. } = ffn else {
             anyhow::bail!("prefill layer={layer} has a dense FFN");
         };
+        let span_rows = self
+            .span
+            .as_ref()
+            .context("prefill FFN has no borrowed storage")?
+            .layout
+            .rows;
+        ensure!(
+            layer < self.geometry.layers && rows > 0 && rows <= span_rows,
+            "prefill FFN layer={layer} rows={rows} geometry={:?}",
+            self.geometry
+        );
+        let next = self.lookahead(slots, layer, rows)?;
         let span = self
             .span
             .as_ref()
             .context("prefill FFN has no borrowed storage")?;
-        ensure!(
-            layer < self.geometry.layers && rows > 0 && rows <= span.layout.rows,
-            "prefill FFN layer={layer} rows={rows} geometry={:?}",
-            self.geometry
-        );
         let stream = &device.stream;
         ensure!(
             self.gpu.scratch.len() as u64
@@ -597,7 +664,8 @@ impl Prefill {
             &mut TensorMut(weights),
             &mut logits,
         )?;
-        self.gpu.mailbox.wait(&stream.record_event(None)?)?;
+        let routed = slots.events.record(stream)?;
+        self.gpu.mailbox.wait(&routed.event)?;
         let choices = rows as usize * self.geometry.top_k as usize;
         // SAFETY: the route receipt copies exactly the live prefix into persistent pinned buffers.
         unsafe {
@@ -615,7 +683,7 @@ impl Prefill {
         self.gpu.mailbox.synchronize()?;
         let host_ids = &self.gpu.host_ids.as_slice()?[..choices];
         let host_weights = &self.gpu.host_weights.as_slice()?[..choices];
-        let mut counts = vec![0; self.geometry.experts as usize];
+        self.counts.fill(0);
         for (choice, (&expert, weight)) in host_ids.iter().zip(host_weights).enumerate() {
             ensure!(
                 expert >= 0 && expert < self.geometry.experts as i32 && weight.to_f32().is_finite(),
@@ -626,15 +694,15 @@ impl Prefill {
                 !host_ids[row_start..choice].contains(&expert),
                 "prefill duplicate route layer={layer} choice={choice} expert={expert}"
             );
-            counts[expert as usize] += 1;
+            self.counts[expert as usize] += 1;
         }
-        let resident = (0..self.geometry.experts)
-            .map(|expert| Ok(slots.policy.ledger().tier(layer, expert)? == Tier::Gpu))
-            .collect::<Result<Vec<_>>>()?;
+        for (expert, resident) in self.resident.iter_mut().enumerate() {
+            *resident = slots.policy.ledger().tier(layer, expert as u32)? == Tier::Gpu;
+        }
         let plan = plan_span(
             &self.geometry,
-            &counts,
-            &resident,
+            &self.counts,
+            &self.resident,
             rows,
             self.capacity.wave_rows.min(rows),
             self.capacity.prefill_staging_slots,
@@ -643,8 +711,7 @@ impl Prefill {
                 h2d_bytes_per_second: self.h2d_bytes_per_second,
             },
         )?;
-        let next = self.lookahead(slots, layer, rows)?;
-        for (total, &count) in self.frequency[layer as usize].iter_mut().zip(&counts) {
+        for (total, &count) in self.frequency[layer as usize].iter_mut().zip(&self.counts) {
             *total += f64::from(count);
         }
         if layer == 0 {
@@ -718,7 +785,8 @@ impl Prefill {
         gpu_result?;
         host_result?;
         disk_result?;
-        self.cpu.upload(&self.gpu.mailbox, stream, span)?;
+        self.cpu
+            .upload(&self.gpu.mailbox, stream, span, &mut slots.events)?;
         // SAFETY: the complete routed union contains exactly rows*top_k u32 words.
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(
@@ -736,29 +804,29 @@ impl Prefill {
         Ok(())
     }
 
-    fn lookahead(&self, slots: &Slots, layer: u32, rows: u32) -> Result<Option<SpanPlan>> {
+    fn lookahead(&mut self, slots: &Slots, layer: u32, rows: u32) -> Result<Option<SpanPlan>> {
         if layer + 1 == self.geometry.layers {
             return Ok(None);
         }
         let expected =
             u64::from(rows) * u64::from(self.geometry.top_k) / u64::from(self.geometry.experts);
-        let workers = self.service.worker_count()?;
         let copy_seconds = self.geometry.slot_bytes()? as f64 / self.h2d_bytes_per_second;
         if expected <= u64::from(self.service.max_rows())
             || copy_seconds
                 >= self
                     .service
-                    .rows_time(self.service.max_rows(), 1, workers)?
+                    .rows_time(self.service.max_rows(), 1, self.workers)?
         {
             return Ok(None);
         }
-        let resident = (0..self.geometry.experts)
-            .map(|expert| Ok(slots.policy.ledger().tier(layer + 1, expert)? == Tier::Gpu))
-            .collect::<Result<Vec<_>>>()?;
+        for (expert, resident) in self.forecast_resident.iter_mut().enumerate() {
+            *resident = slots.policy.ledger().tier(layer + 1, expert as u32)? == Tier::Gpu;
+        }
+        self.forecast_counts.fill(u32::try_from(expected)?);
         plan_span(
             &self.geometry,
-            &vec![u32::try_from(expected)?; self.geometry.experts as usize],
-            &resident,
+            &self.forecast_counts,
+            &self.forecast_resident,
             rows,
             rows.min(self.capacity.wave_rows),
             self.capacity.prefill_staging_slots,
@@ -879,14 +947,16 @@ impl Engine {
             .moe
             .take()
             .context("MoE CPU worker pool is not bound")?;
+        let mut waves = std::mem::take(&mut prefill.waves);
         let result = self.run_moe_prefill(
             &mut prefill,
             &mut slots,
             &mut decode,
-            ids,
+            (ids, &mut waves),
             (trace, keep),
             after_chunk,
         );
+        prefill.waves = waves;
         if result.is_err() {
             prefill.failed = true;
         }
@@ -924,16 +994,25 @@ impl Engine {
         prefill: &mut Prefill,
         slots: &mut Slots,
         decode: &mut Decode,
-        ids: &[u32],
+        input: (&[u32], &mut [Wave]),
         tracing: (Option<&mut Trace>, usize),
         after_chunk: &mut impl FnMut(&mut Self, &[u32]) -> Result<()>,
     ) -> Result<u32> {
         use crate::backend::Operator as O;
+        let (ids, waves) = input;
         let (mut trace, keep) = tracing;
         let start = self.position;
         let end = start + ids.len();
         let trace_start = end.saturating_sub(keep);
         let all_layers = trace.as_ref().is_some_and(|trace| trace.all_layers);
+        ensure!(
+            self.chunk == prefill.mixer_rows && self.workspace_rows == prefill.workspace_rows,
+            "prefill mixer/workspace={}/{} differ from bound engine rows={}/{}",
+            prefill.mixer_rows,
+            prefill.workspace_rows,
+            self.chunk,
+            self.workspace_rows
+        );
         prefill.begin(&self.device, slots, u32::try_from(ids.len())?)?;
         let mut part = 0usize;
         for (span_index, admitted) in ids.chunks(prefill.capacity.span_rows as usize).enumerate() {
@@ -941,22 +1020,28 @@ impl Engine {
                 prefill.gpu.read_ahead.finish(slots)?;
             }
             let span_start = start + span_index * prefill.capacity.span_rows as usize;
-            let mut waves = Vec::new();
-            for base in (0..admitted.len()).step_by(self.chunk) {
-                let rows = self.chunk.min(admitted.len() - base);
-                let skip = trace_start.saturating_sub(span_start + base).min(rows);
-                let selected = trace.is_some() && skip < rows;
-                let prefix = if all_layers {
-                    "layer".to_owned()
-                } else {
-                    format!("prefill.{part}")
-                };
-                waves.push((base, rows, skip, selected, prefix));
-                if selected {
+            let wave_count = admitted.len().div_ceil(self.chunk);
+            ensure!(
+                wave_count <= waves.len(),
+                "prefill wave_count={wave_count} exceed setup bound={}",
+                waves.len()
+            );
+            let waves = &mut waves[..wave_count];
+            for (base, rows, skip, selected, prefix) in waves.iter_mut() {
+                *rows = self.chunk.min(admitted.len() - *base);
+                *skip = trace_start.saturating_sub(span_start + *base).min(*rows);
+                *selected = trace.is_some() && *skip < *rows;
+                prefix.clear();
+                if *selected {
+                    if all_layers {
+                        prefix.push_str("layer");
+                    } else {
+                        write!(prefix, "prefill.{part}")?;
+                    }
                     part += 1;
                 }
             }
-            for (base, rows, skip, selected, prefix) in &waves {
+            for (base, rows, skip, selected, prefix) in waves.iter() {
                 let step = self.moe_wave(span_start + base, *rows)?;
                 self.device.stream.memcpy_htod(
                     &admitted[*base..base + rows],
@@ -989,7 +1074,7 @@ impl Engine {
                 )?;
             }
             for layer in 0..self.model_spec.layers.len() {
-                for (base, rows, skip, selected, prefix) in &waves {
+                for (base, rows, skip, selected, prefix) in waves.iter() {
                     let step = self.moe_wave(span_start + base, *rows)?;
                     self.select_qwen_positions()?;
                     let span = prefill
@@ -1094,6 +1179,7 @@ impl Engine {
                         )?,
                         span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
                     )?;
+                    // SAFETY: the two owned dense row windows cover rows*hidden values on this stream.
                     unsafe {
                         self.device
                             .stream
@@ -1117,7 +1203,7 @@ impl Engine {
                         span.hidden(&span.layout.residual, base as u32, rows as u32)?,
                     )?;
                 }
-                for (base, rows, skip, selected, prefix) in &waves {
+                for (base, rows, skip, selected, prefix) in waves.iter() {
                     if !selected {
                         continue;
                     }
@@ -1162,14 +1248,14 @@ impl Engine {
                     )?;
                     if !all_layers || [0, 3, 7, 31, 32, 47, 63].contains(&layer) {
                         let name = if all_layers {
-                            layer.to_string()
+                            &prefill.layer_names[layer]["layer.".len()..]
                         } else {
-                            format!("layer.{layer}")
+                            &prefill.layer_names[layer]
                         };
                         trace_value(
                             &mut target,
                             &self.device.stream,
-                            &name,
+                            name,
                             &self.work.x,
                             *rows,
                             self.model_spec.hidden as usize,
@@ -1177,7 +1263,7 @@ impl Engine {
                     }
                 }
             }
-            for (base, rows, skip, selected, prefix) in &waves {
+            for (base, rows, skip, selected, prefix) in waves.iter() {
                 let mut step = self.moe_wave(span_start + base, *rows)?;
                 self.device.stream.memcpy_htod(
                     &admitted[*base..base + rows],
@@ -1344,11 +1430,13 @@ impl Cpu {
         mailbox: &Arc<CudaStream>,
         compute: &Arc<CudaStream>,
         span: &Span,
+        events: &mut Events,
     ) -> Result<()> {
         if self.choices.is_empty() {
             return Ok(());
         }
-        mailbox.wait(&compute.record_event(None)?)?;
+        let ready = events.record(compute)?;
+        mailbox.wait(&ready.event)?;
         let hidden = span.geometry.hidden as usize;
         let values = self.out.as_slice()?;
         let done = self.done.as_slice()?;
@@ -1369,9 +1457,9 @@ impl Cpu {
                 )?;
             }
         }
-        let uploaded = mailbox.record_event(None)?;
-        compute.wait(&uploaded)?;
-        uploaded.synchronize()?;
+        let uploaded = events.record(mailbox)?;
+        compute.wait(&uploaded.event)?;
+        uploaded.event.synchronize()?;
         Ok(())
     }
 }
@@ -1444,7 +1532,7 @@ impl Gpu {
         if plan.staged.is_empty()
             && let Some((layer, next)) = next
         {
-            self.read_ahead.prime(slots, layer, next)?;
+            self.read_ahead.predict(slots, layer, next)?;
         }
         // SAFETY: done is reset once for the whole layer before any cohort writes it.
         unsafe {
@@ -1457,13 +1545,15 @@ impl Gpu {
         }
         if !plan.resident.is_empty() {
             let ticket = self.cohort(device, slots, span, ops, plan, (layer, 0, ffn, None))?;
-            let positions = plan
-                .resident
-                .iter()
-                .map(|&expert| slots.policy.ledger().slot(layer, expert))
-                .collect::<Result<Vec<_>>>()?;
-            slots.policy.record_readers(&positions, ticket.id)?;
-            for &position in &positions {
+            self.resident_slots.clear();
+            for &expert in &plan.resident {
+                self.resident_slots
+                    .push(slots.policy.ledger().slot(layer, expert)?);
+            }
+            slots
+                .policy
+                .record_readers(&self.resident_slots, ticket.id)?;
+            for &position in &self.resident_slots {
                 slots.physical[position as usize].reader = Some(ticket.clone());
             }
         }
@@ -1483,7 +1573,7 @@ impl Gpu {
             if cohort + 1 == plan.staged.len()
                 && let Some((layer, next)) = next
             {
-                self.read_ahead.prime(slots, layer, next)?;
+                self.read_ahead.predict(slots, layer, next)?;
             }
             self.cohort(
                 device,
@@ -1703,8 +1793,13 @@ mod tests {
             cpu_bound(geometry, 263, &service, 1_000_000.0)?,
             (263, 1024)
         );
-        for span_rows in [17, 37, 263] {
+        for span_rows in [8, 17, 37, 263] {
             let layout = ExpertSpanLayout::new(&reserves(geometry), geometry, span_rows)?;
+            layout.validate_wave(4, 8)?;
+            assert!(layout.validate_wave(4, 3).is_err());
+            if span_rows >= 17 {
+                assert!(layout.validate_wave(12, 8).is_err());
+            }
             let span = Span {
                 base: 0x1000,
                 layout,
@@ -1741,7 +1836,7 @@ mod tests {
             assert!(span.choices::<bf16>(&span.layout.weights, 1, 1).is_err());
         }
         println!(
-            "PASS prefill_span_cpu_views spans=17,37,263 global_choice_offsets=true borrowed_tail_prefix=true GPU_executed=false"
+            "PASS prefill_span_cpu_views spans=8,17,37,263 global_choice_offsets=true borrowed_tail_prefix=true wave_workspace_bound=true GPU_executed=false"
         );
         Ok(())
     }
@@ -2059,6 +2154,17 @@ mod tests {
                         .take()
                         .context("prefill gate arena missing")?;
                     let mut decode = engine.moe.take().context("prefill gate CPU pool missing")?;
+                    ensure!(
+                        slots.request_open,
+                        "Runner FAIL prefill lifecycle control has no open request"
+                    );
+                    ensure!(
+                        prefill.begin(&engine.device, &mut slots, rows).is_err()
+                            && prefill.span.is_none()
+                            && slots.request_open,
+                        "DEFECT prefill silently ended an open request"
+                    );
+                    slots.end_request()?;
                     if host_complete {
                         super::super::delay_stream(&slots.transfers.d2h)?;
                     }
@@ -2071,10 +2177,11 @@ mod tests {
                     slots.policy.ledger().check()?;
                     if host_complete {
                         ensure!(
-                            prefill.stats[4] > 0 && prefill.stats[5] == 0,
-                            "Runner FAIL host borrow fixture: D2H_bytes={} dropped_bytes={}",
+                            prefill.stats[4] > 0 && prefill.stats[5] == 0 && slots.disk.is_none(),
+                            "Runner FAIL host borrow fixture: D2H_bytes={} dropped_bytes={} disk_reader={}",
                             prefill.stats[4],
-                            prefill.stats[5]
+                            prefill.stats[5],
+                            slots.disk.is_some()
                         );
                     }
                     let output = engine
@@ -2089,6 +2196,20 @@ mod tests {
                         span_input,
                     )?;
                     let mut coverage = [0u64; 5];
+                    let mut forecast = Vec::new();
+                    let mut expected_cancellations = 0;
+                    if rows == 263 {
+                        ensure!(
+                            rows * geometry.top_k / geometry.experts > prefill.service.max_rows()
+                                && (geometry.slot_bytes()? as f64 / prefill.h2d_bytes_per_second)
+                                    < prefill.service.rows_time(
+                                        prefill.service.max_rows(),
+                                        1,
+                                        prefill.service.worker_count()?,
+                                    )?,
+                            "Runner FAIL S263 uniform forecast is not wholly streamed"
+                        );
+                    }
                     for (layer, all_resident) in expected.iter().enumerate() {
                         let prior_coverage = coverage;
                         let mut counts = vec![0; geometry.experts as usize];
@@ -2112,6 +2233,25 @@ mod tests {
                                 h2d_bytes_per_second: prefill.h2d_bytes_per_second,
                             },
                         )?;
+                        expected_cancellations += forecast
+                            .iter()
+                            .filter(|expert| {
+                                !expected_plan
+                                    .staged
+                                    .iter()
+                                    .any(|cohort| cohort.contains(expert))
+                            })
+                            .count() as u64;
+                        forecast.clear();
+                        if rows == 263 && layer + 1 < geometry.layers as usize {
+                            for expert in 0..geometry.experts {
+                                if slots.policy.ledger().tier(layer as u32 + 1, expert)?
+                                    == Tier::Disk
+                                {
+                                    forecast.push(expert);
+                                }
+                            }
+                        }
                         coverage[0] += expected_plan
                             .resident
                             .iter()
@@ -2259,15 +2399,16 @@ mod tests {
                         "Runner FAIL prefill fixture coverage={coverage:?} host_complete={host_complete}"
                     );
                     ensure!(
-                        rows != 263 || prefill.gpu.read_ahead.stats[2] > 0,
-                        "Runner FAIL prefill next-layer prediction cancellation was not exercised: rows={rows} IO={:?}",
-                        prefill.gpu.read_ahead.stats
+                        rows != 263 || expected_cancellations > 0,
+                        "Runner FAIL prefill S263 has no wrong-prediction cancellation decisions"
                     );
                     let state_mismatch = prefill.stats[0] != 2
                         || prefill.stats[1] != 2 * u64::from(rows)
                         || prefill.stats[2]
                             != (coverage[3] + coverage[4]) * geometry.slot_bytes()?
-                        || prefill.stats[3] != coverage[1] + coverage[2];
+                        || prefill.stats[3] != coverage[1] + coverage[2]
+                        || prefill.gpu.read_ahead.stats[4] != expected_cancellations
+                        || prefill.gpu.read_ahead.stats[5] != 1;
                     defects += usize::from(state_mismatch);
                     if let Err(error) = slots.policy.ledger().check() {
                         defects += 1;
@@ -2276,7 +2417,7 @@ mod tests {
                         );
                     }
                     println!(
-                        "{} prefill_span_coverage rows={rows} variant={variant} pinned={pinned} engines={engines} stats={:?} IO={:?} expected={coverage:?} ref_outside_NVTX=true",
+                        "{} prefill_span_coverage rows={rows} variant={variant} pinned={pinned} engines={engines} stats={:?} IO={:?} expected={coverage:?} expected_cancellations={expected_cancellations} ref_outside_NVTX=true",
                         if state_mismatch { "DEFECT" } else { "PASS" },
                         prefill.stats,
                         prefill.gpu.read_ahead.stats
@@ -2409,63 +2550,74 @@ mod tests {
             floor[0], floor[1]
         );
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
-        let capacity = capacity(geometry, 17, false)?;
-        let mut engine = Engine::load_moe_placed(
-            &fixture,
-            &runtime.join("order-candidate"),
-            &capacity,
-            &[vec![0, 1, 2, 3], vec![0, 1, 2, 3]],
-            crate::experts::plan::Admission {
-                budget_bytes_per_token: 2 * geometry.slot_bytes()?,
-            },
-            2,
-        )?;
-        engine.closure.freeze_fixed()?;
-        engine.closure.ready(Instant::now())?;
-        engine.reset()?;
-        let mut hidden = Vec::new();
-        {
-            let _range = crate::backend::cuda::profile::Range::new(true, c"engine_moe_layer_order");
-            engine.prefill_chunks(&ids, None, 0, |engine, values| {
-                hidden.extend(
-                    engine
-                        .device
-                        .stream
-                        .clone_dtoh(&engine.work.x.slice(..values.len() * 128))?,
-                );
-                Ok(())
-            })?;
-            engine.device.stream.synchronize()?;
-        }
-        let logits = engine.decode_logits()?;
-        let hidden_error = max_difference(&baseline.0, &hidden, bf16::to_f32)?;
-        let logits_error = max_difference(&baseline.1, &logits, |x| x)?;
-        let hidden_bitwise = same_bits(&baseline.0, &hidden, |x| u32::from(x.to_bits()));
-        let logits_bitwise = same_bits(&baseline.1, &logits, f32::to_bits);
-        let pass = (if floor[0] == 0.0 {
-            hidden_bitwise
-        } else {
-            hidden_error <= floor[0]
-        }) && (if floor[1] == 0.0 {
-            logits_bitwise
-        } else {
-            logits_error <= floor[1]
-        });
-        println!(
-            "{} prefill_layer_order rows=17 layers=2 GDN=true attention_d256=true rope_kv=false hidden_max_abs={hidden_error} hidden_floor={} logits_max_abs={logits_error} logits_floor={} hidden_bitwise={hidden_bitwise} logits_bitwise={logits_bitwise} ref_outside_NVTX=true",
-            if pass { "PASS" } else { "DEFECT" },
-            floor[0],
-            floor[1]
-        );
-        ensure!(
-            engine.position == ids.len()
+        let mut defects = 0;
+        for span_rows in [17, 8] {
+            let capacity = capacity(geometry, span_rows, false)?;
+            let mut engine = Engine::load_moe_placed(
+                &fixture,
+                &runtime.join(format!("order-candidate-{span_rows}")),
+                &capacity,
+                &[vec![0, 1, 2, 3], vec![0, 1, 2, 3]],
+                crate::experts::plan::Admission {
+                    budget_bytes_per_token: 2 * geometry.slot_bytes()?,
+                },
+                2,
+            )?;
+            engine.closure.freeze_fixed()?;
+            engine.closure.ready(Instant::now())?;
+            engine.reset()?;
+            let mut hidden = Vec::new();
+            {
+                let _range =
+                    crate::backend::cuda::profile::Range::new(true, c"engine_moe_layer_order");
+                engine.prefill_chunks(&ids, None, 0, |engine, values| {
+                    hidden.extend(
+                        engine
+                            .device
+                            .stream
+                            .clone_dtoh(&engine.work.x.slice(..values.len() * 128))?,
+                    );
+                    Ok(())
+                })?;
+                engine.device.stream.synchronize()?;
+            }
+            let logits = engine.decode_logits()?;
+            let hidden_error = max_difference(&baseline.0, &hidden, bf16::to_f32)?;
+            let logits_error = max_difference(&baseline.1, &logits, |x| x)?;
+            let hidden_bitwise = same_bits(&baseline.0, &hidden, |x| u32::from(x.to_bits()));
+            let logits_bitwise = same_bits(&baseline.1, &logits, f32::to_bits);
+            let drains = engine
+                .moe_prefill
+                .as_ref()
+                .context("prefill order has no executor")?
+                .gpu
+                .read_ahead
+                .stats[5];
+            let spans = ids.len().div_ceil(span_rows as usize);
+            let pass = (if floor[0] == 0.0 {
+                hidden_bitwise
+            } else {
+                hidden_error <= floor[0]
+            }) && (if floor[1] == 0.0 {
+                logits_bitwise
+            } else {
+                logits_error <= floor[1]
+            }) && engine.position == ids.len()
                 && engine.committed_prefix_ids == ids
-                && engine.pending_token.is_some(),
-            "DEFECT prefill layer-major sequence boundary differs"
-        );
+                && engine.pending_token.is_some()
+                && drains == spans as u64;
+            defects += usize::from(!pass);
+            println!(
+                "{} prefill_layer_order rows=17 span_rows={span_rows} spans={spans} last_span_rows={} drains={drains} layers=2 GDN=true attention_d256=true rope_kv=false hidden_max_abs={hidden_error} hidden_floor={} logits_max_abs={logits_error} logits_floor={} hidden_bitwise={hidden_bitwise} logits_bitwise={logits_bitwise} ref_outside_NVTX=true",
+                if pass { "PASS" } else { "DEFECT" },
+                ids.len() - (spans - 1) * span_rows as usize,
+                floor[0],
+                floor[1]
+            );
+        }
         ensure!(
-            pass,
-            "DEFECT prefill layer order exceeds the measured reference shape floor"
+            defects == 0,
+            "DEFECT prefill layer order or sequence/drain boundary cells={defects}"
         );
         Ok(())
     }

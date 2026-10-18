@@ -390,25 +390,25 @@ impl Engine {
             cpu_bounds,
         )?);
         let moe_prefill = if capacity.prefill_staging_slots > 0 {
+            let reserves = crate::experts::plan::Reserves {
+                device_fixed_bytes: 0,
+                host_fixed_bytes: 0,
+                residual_row_bytes: u64::from(geometry.hidden) * 2,
+                normalized_row_bytes: u64::from(geometry.hidden) * 2,
+                contribution_row_bytes: u64::from(geometry.top_k) * u64::from(geometry.hidden) * 2,
+                done_row_bytes: u64::from(geometry.top_k) * 4,
+                route_row_bytes: u64::from(geometry.top_k) * 18,
+                prefill_staging_slots: capacity.prefill_staging_slots,
+                disk_ring_slots: 0,
+            };
             Some(Prefill::new(
                 &device,
-                geometry,
+                &mut slots,
                 capacity,
-                crate::experts::plan::Reserves {
-                    device_fixed_bytes: 0,
-                    host_fixed_bytes: 0,
-                    residual_row_bytes: u64::from(geometry.hidden) * 2,
-                    normalized_row_bytes: u64::from(geometry.hidden) * 2,
-                    contribution_row_bytes: u64::from(geometry.top_k)
-                        * u64::from(geometry.hidden)
-                        * 2,
-                    done_row_bytes: u64::from(geometry.top_k) * 4,
-                    route_row_bytes: u64::from(geometry.top_k) * 18,
-                    prefill_staging_slots: capacity.prefill_staging_slots,
-                    disk_ring_slots: engines.min(2),
-                },
+                reserves,
                 service,
                 1_000_000_000.0,
+                (8, 8),
             )?)
         } else {
             None

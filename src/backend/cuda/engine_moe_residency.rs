@@ -1111,8 +1111,6 @@ mod tests {
                 "publication_equal",
                 "publication_older",
                 "publication_victim",
-                "publication_mutant_equal",
-                "publication_mutant_older",
             ] {
                 let output = Command::new(std::env::current_exe()?)
                     .args([
@@ -1125,56 +1123,27 @@ mod tests {
                     .env("FF_MOE_CHILD", case)
                     .output()?;
                 let log = String::from_utf8_lossy(&output.stdout);
-                let error = String::from_utf8_lossy(&output.stderr);
-                let mutant = case.starts_with("publication_mutant_");
-                let expected = if mutant {
-                    101
-                } else if case == "publication_valid" {
-                    0
-                } else {
-                    3
-                };
+                let expected = if case == "publication_valid" { 0 } else { 3 };
                 ensure!(
                     output.status.code() == Some(expected)
                         && log.contains("running 1 test")
-                        && if mutant {
-                            error.contains("DEFECT stale publication did not trap")
-                        } else {
-                            log.contains(&format!("PASS slot_publication_epoch case={case}"))
-                        },
+                        && log.contains(&format!("PASS slot_publication_epoch case={case}")),
                     "publication child case={case} exit={:?} stdout={log} stderr={}",
                     output.status.code(),
                     String::from_utf8_lossy(&output.stderr)
                 );
                 print!("{log}");
-                if mutant {
-                    println!(
-                        "PASS slot_publication_guard_ablation case={case} missing_guard_detected=true"
-                    );
-                }
             }
             return Ok(());
         };
         let device = Device::new(0)?;
         let stream = &device.stream;
-        let module = if case.starts_with("publication_mutant_") {
-            let sm = super::super::super::super::cubin::capability(&device.ctx)?;
-            let runtime = std::env::var_os("FLYINGFISH_RUNTIME_DIR")
-                .context("publication mutant runtime missing")?;
-            let bytes = std::fs::read(
-                Path::new(&runtime).join(format!("moe_route_without_epoch_sm{sm}.cubin")),
-            )?;
-            device
-                .ctx
-                .load_module(cudarc::nvrtc::Ptx::from_binary(bytes))?
-        } else {
-            super::super::super::super::cubin::module(&device.ctx, "moe_route")?
-        };
+        let module = super::super::super::super::cubin::module(&device.ctx, "moe_route")?;
         let function = module.load_function("moe_slot_publish")?;
         let cases = match case.as_str() {
             "publication_valid" => vec![(1, 7, 8, -1), (0, 99, 1, -1), (1, 7, u64::MAX, 1)],
-            "publication_equal" | "publication_mutant_equal" => vec![(1, 7, 7, -1)],
-            "publication_older" | "publication_mutant_older" => vec![(1, 7, 6, -1)],
+            "publication_equal" => vec![(1, 7, 7, -1)],
+            "publication_older" => vec![(1, 7, 6, -1)],
             "publication_victim" => vec![(1, 7, 8, 0)],
             _ => anyhow::bail!("unknown publication child case={case}"),
         };

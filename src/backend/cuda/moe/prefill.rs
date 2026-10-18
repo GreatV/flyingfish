@@ -581,12 +581,16 @@ pub(crate) fn prefill_layout(
     let offsets = region(&mut at, experts + 1, 4)?;
     let cursor = region(&mut at, experts, 4)?;
     let pos_of = region(&mut at, assignments, 4)?;
-    let _done = region(&mut at, assignments, 4)?;
+    #[cfg(test)]
+    let done = at;
+    region(&mut at, assignments, 4)?;
     let x_perm = region(&mut at, assignments * hidden, 2)?;
     let h1 = region(&mut at, assignments * 2 * inter, 2)?;
     let act = region(&mut at, assignments * inter, 2)?;
     let y_perm = region(&mut at, assignments * hidden, 2)?;
-    let _contributions = region(&mut at, assignments * hidden, 2)?;
+    #[cfg(test)]
+    let contributions = at;
+    region(&mut at, assignments * hidden, 2)?;
     let h1s = region(&mut at, rows * 2 * inter, 2)?;
     let act_s = region(&mut at, rows * inter, 2)?;
     let shared_out = region(&mut at, rows * hidden, 2)?;
@@ -598,13 +602,13 @@ pub(crate) fn prefill_layout(
         cursor,
         pos_of,
         #[cfg(test)]
-        done: _done,
+        done,
         x_perm,
         h1,
         act,
         y_perm,
         #[cfg(test)]
-        contributions: _contributions,
+        contributions,
         h1s,
         act_s,
         shared_out,

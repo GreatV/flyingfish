@@ -281,6 +281,15 @@ pub(crate) struct ExpertSpanLayout {
 
 #[cfg(any(feature = "cuda", test))]
 impl ExpertSpanLayout {
+    pub fn validate_wave(&self, wave_rows: u32, workspace_rows: usize) -> Result<()> {
+        ensure!(
+            wave_rows > 0 && wave_rows <= self.rows && wave_rows as usize <= workspace_rows,
+            "expert wave_rows={wave_rows} exceed span_rows={} or workspace_rows={workspace_rows}",
+            self.rows
+        );
+        Ok(())
+    }
+
     pub fn new(
         reserves: &crate::experts::plan::Reserves,
         geometry: crate::experts::catalogue::ExpertGeometry,
@@ -652,6 +661,11 @@ mod admission_tests {
         assert_eq!(reserves.span_bytes(request.span_rows)?, 65_536 * 41136);
         for rows in [1, 97, request.span_rows] {
             let layout = ExpertSpanLayout::new(reserves, geometry, rows)?;
+            layout.validate_wave(1, 1)?;
+            assert!(layout.validate_wave(1, 0).is_err());
+            if rows >= 12 {
+                assert!(layout.validate_wave(12, 8).is_err());
+            }
             assert_eq!(layout.bytes, rows as usize * 41136);
             let regions = [
                 &layout.residual,

@@ -11,6 +11,7 @@ struct Read {
     catalogue: Arc<ExpertCatalogue>,
     layer: u32,
     expert: u32,
+    reclaimed: Vec<u32>,
 }
 
 struct Completed {
@@ -22,36 +23,57 @@ struct Completed {
 }
 
 pub(super) struct ReadAhead {
-    queue: Prefetch,
+    queue: Option<Prefetch>,
     depth: u32,
     input: Option<SyncSender<Read>>,
-    output: Receiver<Completed>,
+    output: Option<Receiver<Completed>>,
     worker: Option<JoinHandle<()>>,
     pending: bool,
     failed: bool,
     predictions: Vec<(u32, u32)>,
+    forecast: Vec<(u32, u32)>,
     consumed: Vec<(u32, u32)>,
     taken: Vec<bool>,
-    pub stats: [u64; 4],
+    recycled: Vec<u32>,
+    pub stats: [u64; 6],
 }
 
 impl ReadAhead {
     #[cfg(test)]
-    pub fn new(staging: u32, rings: u32) -> Result<Self> {
+    pub fn new(staging: u32, rings: u32, experts: u32) -> Result<Self> {
+        ensure!(
+            staging > 0 && experts > 0,
+            "prefetch staging={staging} experts={experts}"
+        );
         let depth = staging.min(rings);
-        let queue = Prefetch::new(depth, rings)?;
+        if rings == 0 {
+            return Ok(Self {
+                queue: None,
+                depth,
+                input: None,
+                output: None,
+                worker: None,
+                pending: false,
+                failed: false,
+                predictions: Vec::new(),
+                forecast: Vec::with_capacity(experts as usize),
+                consumed: Vec::with_capacity(experts as usize),
+                taken: Vec::new(),
+                recycled: Vec::new(),
+                stats: [0; 6],
+            });
+        }
+        let queue = Some(Prefetch::new(depth, rings)?);
         let (input, requests) = sync_channel::<Read>(1);
         let (results, output) = sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("expert-read-ahead".into())
             .spawn(move || {
+                let mut copied = vec![false; rings as usize];
                 while let Ok(mut request) = requests.recv() {
-                    let copied = request
-                        .reader
-                        .copied
-                        .iter()
-                        .map(Option::is_some)
-                        .collect::<Vec<_>>();
+                    for (previous, copy) in copied.iter_mut().zip(&request.reader.copied) {
+                        *previous = copy.is_some();
+                    }
                     let result = request
                         .reader
                         .context
@@ -62,21 +84,19 @@ impl ReadAhead {
                                 .reader
                                 .read(request.layer, request.expert, &request.catalogue)
                         });
-                    let reclaimed = copied
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(slot, &was_copied)| {
-                            (was_copied && request.reader.copied[slot].is_none())
-                                .then_some(slot as u32)
-                        })
-                        .collect();
+                    request.reclaimed.clear();
+                    for (slot, &was_copied) in copied.iter().enumerate() {
+                        if was_copied && request.reader.copied[slot].is_none() {
+                            request.reclaimed.push(slot as u32);
+                        }
+                    }
                     if results
                         .send(Completed {
                             reader: request.reader,
                             layer: request.layer,
                             expert: request.expert,
                             result,
-                            reclaimed,
+                            reclaimed: request.reclaimed,
                         })
                         .is_err()
                     {
@@ -89,14 +109,16 @@ impl ReadAhead {
             queue,
             depth,
             input: Some(input),
-            output,
+            output: Some(output),
             worker: Some(worker),
             pending: false,
             failed: false,
             predictions: Vec::with_capacity(depth as usize),
-            consumed: Vec::new(),
+            forecast: Vec::with_capacity(experts as usize),
+            consumed: Vec::with_capacity(experts as usize),
             taken: vec![false; rings as usize],
-            stats: [0; 4],
+            recycled: Vec::with_capacity(rings as usize),
+            stats: [0; 6],
         })
     }
 
@@ -107,7 +129,10 @@ impl ReadAhead {
             .context("prefetch reclaimed ring outside allocation")?;
         if *taken {
             ensure!(
-                self.queue.release(ring),
+                self.queue
+                    .as_mut()
+                    .context("prefetch ring has no queue")?
+                    .release(ring),
                 "prefetch taken ring={ring} has no queue owner"
             );
             *taken = false;
@@ -122,11 +147,18 @@ impl ReadAhead {
         let completed = if wait {
             Some(
                 self.output
+                    .as_ref()
+                    .context("prefetch pending read has no receiver")?
                     .recv()
                     .context("native read-ahead worker stopped")?,
             )
         } else {
-            match self.output.try_recv() {
+            match self
+                .output
+                .as_ref()
+                .context("prefetch pending read has no receiver")?
+                .try_recv()
+            {
                 Ok(completed) => Some(completed),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => {
@@ -143,9 +175,11 @@ impl ReadAhead {
         );
         slots.disk = Some(completed.reader);
         self.pending = false;
-        for ring in completed.reclaimed {
+        let mut reclaimed = completed.reclaimed;
+        for ring in reclaimed.drain(..) {
             self.release(ring)?;
         }
+        self.recycled = reclaimed;
         let ring = match completed.result {
             Ok(ring) => ring,
             Err(error) => {
@@ -154,6 +188,8 @@ impl ReadAhead {
             }
         };
         self.queue
+            .as_mut()
+            .context("prefetch completion has no queue")?
             .complete(completed.layer, completed.expert, ring)?;
         self.stats[0] += 1;
         Ok(true)
@@ -207,17 +243,32 @@ impl ReadAhead {
             return Ok(());
         }
         self.reclaim(slots, false)?;
-        if let Some((layer, expert)) = self.queue.begin_read() {
+        let next = self.queue.as_mut().and_then(Prefetch::begin_read);
+        if let Some((layer, expert)) = next {
             let reader = slots
                 .disk
                 .take()
                 .context("prefetch disk reader has no owner")?;
+            ensure!(
+                reader.copied.len() == self.taken.len(),
+                "prefetch reader rings={} differ from setup rings={}",
+                reader.copied.len(),
+                self.taken.len()
+            );
             let request = Read {
                 reader,
                 catalogue: slots.catalogue.clone(),
                 layer,
                 expert,
+                reclaimed: std::mem::take(&mut self.recycled),
             };
+            ensure!(
+                request.reclaimed.is_empty() && request.reclaimed.capacity() >= self.taken.len(),
+                "prefetch completion scratch len={} capacity={} rings={}",
+                request.reclaimed.len(),
+                request.reclaimed.capacity(),
+                self.taken.len()
+            );
             ensure!(
                 Arc::ptr_eq(&request.reader.context, slots.transfers.h2d.context()),
                 "prefetch reader and H2D stream contexts differ: layer={} expert={}",
@@ -248,6 +299,7 @@ impl ReadAhead {
 
     pub fn begin_layer(&mut self, slots: &mut Slots, layer: u32, plan: &SpanPlan) -> Result<()> {
         self.receive(slots, true)?;
+        self.retire_forecast(layer, plan)?;
         self.consumed
             .retain(|&(completed_layer, _)| completed_layer >= layer);
         let mut index = 0;
@@ -257,7 +309,12 @@ impl ReadAhead {
                 && !(predicted_layer == layer
                     && plan.staged.iter().any(|cohort| cohort.contains(&expert)))
             {
-                if let Retired::Loaded(ring) = self.queue.cancel(predicted_layer, expert)? {
+                if let Retired::Loaded(ring) = self
+                    .queue
+                    .as_mut()
+                    .context("prefetch cancellation has no queue")?
+                    .cancel(predicted_layer, expert)?
+                {
                     self.discard(slots, ring)?;
                 }
                 self.predictions.remove(index);
@@ -274,16 +331,20 @@ impl ReadAhead {
             self.reclaim(slots, false)?;
         }
         for &expert in plan.staged.iter().flatten() {
-            if self.queue.entries() >= self.depth {
-                break;
-            }
             if slots.policy.ledger().tier(layer, expert)? != Tier::Disk
                 || self.predictions.contains(&(layer, expert))
                 || self.consumed.contains(&(layer, expert))
             {
                 continue;
             }
-            let (requested, retired) = self.queue.request(layer, expert, false, false)?;
+            let queue = self
+                .queue
+                .as_mut()
+                .context("disk prefetch has no setup ring")?;
+            if queue.entries() >= self.depth {
+                break;
+            }
+            let (requested, retired) = queue.request(layer, expert, false, false)?;
             ensure!(
                 matches!(requested, Requested::Queued | Requested::Present) && retired.is_none(),
                 "prefetch non-demand request={requested:?} retired={retired:?}"
@@ -294,20 +355,77 @@ impl ReadAhead {
         self.drive(slots)
     }
 
+    pub fn predict(&mut self, slots: &mut Slots, layer: u32, plan: &SpanPlan) -> Result<()> {
+        ensure!(
+            self.forecast.is_empty(),
+            "prefetch forecast for layer={layer} overlaps an earlier layer"
+        );
+        for &expert in plan.staged.iter().flatten() {
+            if slots.policy.ledger().tier(layer, expert)? == Tier::Disk {
+                ensure!(
+                    self.forecast.len() < self.forecast.capacity(),
+                    "prefetch forecast exceeds experts={}",
+                    self.forecast.capacity()
+                );
+                self.forecast.push((layer, expert));
+            }
+        }
+        self.prime(slots, layer, plan)
+    }
+
+    fn retire_forecast(&mut self, layer: u32, plan: &SpanPlan) -> Result<()> {
+        ensure!(
+            self.forecast
+                .iter()
+                .all(|&(predicted, _)| predicted >= layer),
+            "prefetch forecast precedes actual layer={layer}"
+        );
+        self.stats[4] += self
+            .forecast
+            .iter()
+            .filter(|&&(predicted, expert)| {
+                predicted == layer && !plan.staged.iter().any(|cohort| cohort.contains(&expert))
+            })
+            .count() as u64;
+        self.forecast.retain(|&(predicted, _)| predicted > layer);
+        Ok(())
+    }
+
     pub fn demand(&mut self, slots: &mut Slots, layer: u32, expert: u32) -> Result<u32> {
+        ensure!(
+            self.queue.is_some(),
+            "disk demand layer={layer} expert={expert} has no setup ring"
+        );
         self.receive(slots, true)?;
         let predicted = self.predictions.contains(&(layer, expert));
         ensure!(
             !self.consumed.contains(&(layer, expert)),
             "prefill disk expert layer={layer} expert={expert} was streamed twice"
         );
-        if !predicted && self.queue.entries() >= self.depth && !self.predictions.is_empty() {
+        if !predicted
+            && self
+                .queue
+                .as_ref()
+                .context("prefetch demand has no queue")?
+                .entries()
+                >= self.depth
+            && !self.predictions.is_empty()
+        {
             let (old_layer, old_expert) = self.predictions.remove(0);
-            if let Retired::Loaded(ring) = self.queue.cancel(old_layer, old_expert)? {
+            if let Retired::Loaded(ring) = self
+                .queue
+                .as_mut()
+                .context("prefetch cancellation has no queue")?
+                .cancel(old_layer, old_expert)?
+            {
                 self.discard(slots, ring)?;
             }
         }
-        let (_, retired) = self.queue.request(layer, expert, true, false)?;
+        let (_, retired) = self
+            .queue
+            .as_mut()
+            .context("prefetch demand has no queue")?
+            .request(layer, expert, true, false)?;
         ensure!(
             retired.is_none(),
             "prefetch demand retired an untracked ring={retired:?}"
@@ -315,12 +433,22 @@ impl ReadAhead {
         self.predictions
             .retain(|&request| request != (layer, expert));
         loop {
-            if let Some(ring) = self.queue.take(layer, expert) {
+            if let Some(ring) = self
+                .queue
+                .as_mut()
+                .context("prefetch demand has no queue")?
+                .take(layer, expert)
+            {
                 ensure!(
                     !self.taken[ring as usize],
                     "prefetch ring={ring} was already taken"
                 );
                 self.taken[ring as usize] = true;
+                ensure!(
+                    self.consumed.len() < self.consumed.capacity(),
+                    "prefetch consumed experts exceed capacity={}",
+                    self.consumed.capacity()
+                );
                 self.consumed.push((layer, expert));
                 self.stats[1] += u64::from(predicted);
                 return Ok(ring);
@@ -344,21 +472,28 @@ impl ReadAhead {
     pub fn finish(&mut self, slots: &mut Slots) -> Result<()> {
         self.receive(slots, true)?;
         while let Some((layer, expert)) = self.predictions.pop() {
-            if let Retired::Loaded(ring) = self.queue.cancel(layer, expert)? {
+            if let Retired::Loaded(ring) = self
+                .queue
+                .as_mut()
+                .context("prefetch cancellation has no queue")?
+                .cancel(layer, expert)?
+            {
                 self.discard(slots, ring)?;
             }
         }
         while self.reclaim(slots, true)? {}
         self.consumed.clear();
+        self.forecast.clear();
         ensure!(
-            self.queue.entries() == 0
+            self.queue.as_ref().is_none_or(|queue| queue.entries() == 0)
                 && self.taken.iter().all(|taken| !taken)
-                && slots.disk.is_some(),
+                && (self.depth == 0 || slots.disk.is_some()),
             "prefetch finish entries={} taken={:?} reader_owned={}",
-            self.queue.entries(),
+            self.queue.as_ref().map_or(0, Prefetch::entries),
             self.taken,
             slots.disk.is_some()
         );
+        self.stats[5] += 1;
         Ok(())
     }
 }
@@ -369,5 +504,45 @@ impl Drop for ReadAhead {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forecast_cancellations_ignore_read_completion() -> Result<()> {
+        let plan = SpanPlan {
+            span_rows: 263,
+            wave_rows: 4,
+            waves: 66,
+            resident: vec![1],
+            staged: vec![vec![0, 2], vec![5]],
+            cpu: vec![7],
+            streamed_bytes: 0,
+        };
+        for completed in [false, true] {
+            let mut ahead = ReadAhead::new(2, 0, 16)?;
+            assert!(ahead.worker.is_none() && ahead.queue.is_none() && ahead.depth == 0);
+            ahead.forecast.extend([(1, 0), (1, 2), (1, 5), (1, 7)]);
+            let mut queue = Prefetch::new(2, 2)?;
+            queue.request(1, 7, false, false)?;
+            if completed {
+                assert_eq!(queue.begin_read(), Some((1, 7)));
+                queue.complete(1, 7, 0)?;
+                ahead.stats[2] = 49152;
+            }
+            ahead.queue = Some(queue);
+            ahead.retire_forecast(1, &plan)?;
+            assert_eq!(ahead.stats[4], 1);
+            assert!(ahead.forecast.is_empty());
+            ahead.retire_forecast(1, &plan)?;
+            assert_eq!(ahead.stats[4], 1);
+        }
+        println!(
+            "PASS prefill_forecast_cancellations queued=1 completed=1 duplicate_decisions=0 zero_ring_worker=false GPU_executed=false"
+        );
+        Ok(())
     }
 }
