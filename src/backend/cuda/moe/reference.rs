@@ -314,9 +314,9 @@ pub(crate) enum Combine {
     Fp32,
 }
 
-/// The row's shared expert (sigmoid-gated) plus the routed contributions
-/// selected by `keep` (indices into `ids`/`weights`), accumulated per
-/// `combine` with contributions ordered ascending expert id.
+/// Routed contributions selected by `keep` are reduced per `combine`, rounded
+/// to BF16, then added to the BF16 sigmoid-gated shared expert in BF16.
+/// Contributions are ordered ascending expert id.
 pub(crate) fn moe_row_ids(
     fx: &MoeFixture,
     row: usize,
@@ -374,7 +374,8 @@ pub(crate) fn moe_row_ids(
                 }
             }
             for d in 0..h {
-                y[d] = bf16::from_f32(yf[d] + gated[d].to_f32());
+                let routed = bf16::from_f32(yf[d]);
+                y[d] = bf16::from_f32(routed.to_f32() + gated[d].to_f32());
             }
         }
     }

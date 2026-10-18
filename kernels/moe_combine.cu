@@ -4,8 +4,8 @@
 //   contributions: [rows*top_k, hidden] BF16, slot a = row*top_k + choice,
 //     already weighted (down output x router weight, BF16 boundary).
 //   shared_out: [rows, hidden] BF16; scale: [rows] BF16 (sigmoid gate).
-//   y[row] = BF16( sum over the row's final-active choices, ascending
-//     expert id, FP32, of contributions[a] + BF16(scale*shared_out[row]) ).
+//   routed[row] = BF16(FP32 sum of final-active contributions, ascending expert id).
+//   y[row] = BF16(routed[row] + BF16(scale*shared_out[row])).
 // __trap() on top_k outside [1,32], done[a] != final_active[a] (a choice
 // must be contributed exactly once), or row out of range.
 #include <cuda_runtime.h>
@@ -72,9 +72,9 @@ extern "C" __global__ void moe_combine(
   bf16* __restrict__ yr = y + (long long)row * hidden;
   for (long long d = tid; d < hidden; d += blockDim.x) {
     const bf16 gated = __hmul(scale[row], sh[d]);
-    float acc = __bfloat162float(gated);
+    float acc = 0.0f;
     for (int k = 0; k < live; ++k)
       acc += __bfloat162float(contributions[(long long)(a0 + order[k]) * hidden + d]);
-    yr[d] = __float2bfloat16(acc);
+    yr[d] = __hadd(__float2bfloat16(acc), gated);
   }
 }
