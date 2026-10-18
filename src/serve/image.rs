@@ -137,6 +137,12 @@ pub struct PackedVideo {
     pub frames: Vec<PackedImage>,
 }
 
+/// A decoded video plus the sampling options, before frame packing.
+pub struct PlannedVideo {
+    decoded: DecodedVideo,
+    options: VideoOptions,
+}
+
 pub struct PlannedImage {
     bytes: Vec<u8>,
     mime: String,
@@ -509,6 +515,71 @@ impl Processor {
         self.prepare_planned(self.plan_url(url)?)
     }
 
+    /// Decodes one video source (local path or MP4 data URL) and validates its options.
+    pub fn plan_video(&self, url: &str, options: VideoOptions) -> Result<PlannedVideo> {
+        ensure!(
+            options.stack_frames == 1,
+            "stack_frames {} is not supported; first support requires stack_frames = 1",
+            options.stack_frames
+        );
+        ensure!(options.max_num_frames > 0, "zero max_num_frames");
+        let ImageConfig::MiniCpm(_) = &self.config else {
+            bail!("video input requires the MiniCPM image configuration")
+        };
+        let decoded = decode_video(&load_video_source(url)?)?;
+        sample_frame_indices(
+            &decoded.metadata,
+            options.max_num_frames,
+            options.stack_frames,
+        )?;
+        Ok(PlannedVideo { decoded, options })
+    }
+
+    /// Packs the sampled frames of a planned video; runs after admission.
+    pub fn prepare_planned_video(&self, planned: PlannedVideo) -> Result<PackedVideo> {
+        self.prepare_video(
+            &planned.decoded.frames,
+            &planned.decoded.metadata,
+            &planned.options,
+        )
+    }
+
+    /// Expanded prompt tokens of one planned video: every sampled frame's visual unit.
+    pub fn video_tokens(&self, video: &PlannedVideo) -> Result<usize> {
+        let vision = self
+            .spec
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        let ImageConfig::MiniCpm(base) = &self.config else {
+            bail!("video input requires the MiniCPM image configuration")
+        };
+        let mut config = base.clone();
+        if let Some(max) = video.options.max_slice_nums {
+            ensure!(max > 0, "zero max_slice_nums");
+            config.max_slice_nums = max;
+        }
+        let indices = sample_frame_indices(
+            &video.decoded.metadata,
+            video.options.max_num_frames,
+            video.options.stack_frames,
+        )?;
+        let frame = video
+            .decoded
+            .frames
+            .first()
+            .context("decoded video holds no frames")?;
+        let (grids, rows, cols) = mini_cpm_grids(
+            frame.height,
+            frame.width,
+            vision.patch as usize,
+            config.max_slice_nums,
+        )?;
+        let per = visual_unit_tokens(vision, &grids, rows, cols, 0)?;
+        per.checked_mul(indices.len())
+            .context("video token count overflow")
+    }
+
     pub fn plan_url(&self, url: &str) -> Result<PlannedImage> {
         let (bytes, mime) = load_encoded(url)?;
         let (width, height) = image_dimensions(&bytes, Some(&mime))?;
@@ -594,25 +665,39 @@ impl Processor {
         }
     }
 
-    pub fn expanded_token_count(&self, ids: &[u32], images: &[PlannedImage]) -> Result<usize> {
+    pub fn expanded_token_count(
+        &self,
+        ids: &[u32],
+        images: &[PlannedImage],
+        videos: &[PlannedVideo],
+    ) -> Result<usize> {
         let vision = self
             .spec
             .vision
             .as_ref()
             .context("vision configuration missing")?;
-        let placeholders = ids.iter().filter(|&&id| id == vision.image_token).count();
+        let image_placeholders = ids.iter().filter(|&&id| id == vision.image_token).count();
         ensure!(
-            placeholders == images.len(),
+            image_placeholders == images.len(),
             "image placeholder count differs from supplied images"
         );
-        images
-            .iter()
-            .enumerate()
-            .try_fold(ids.len() - placeholders, |total, (index, image)| {
-                total
-                    .checked_add(self.image_tokens(image, index)?)
-                    .context("image token count overflow")
-            })
+        let video_placeholders = ids.iter().filter(|&&id| id == vision.video_token).count();
+        ensure!(
+            video_placeholders == videos.len(),
+            "video placeholder count differs from supplied videos"
+        );
+        let mut total = ids.len() - image_placeholders - video_placeholders;
+        for (index, image) in images.iter().enumerate() {
+            total = total
+                .checked_add(self.image_tokens(image, index)?)
+                .context("image token count overflow")?;
+        }
+        for video in videos {
+            total = total
+                .checked_add(self.video_tokens(video)?)
+                .context("video token count overflow")?;
+        }
+        Ok(total)
     }
 
     pub fn expand(
@@ -932,6 +1017,37 @@ struct VisualUnit<'a> {
 }
 
 /// Emits one visual unit's placeholder block: tag, thumbnail run, then slice rows.
+/// Expanded token count of one visual unit, start and end markers included.
+fn visual_unit_tokens(
+    vision: &crate::model_spec::VisionConfig,
+    grids: &[ImageGrid],
+    rows: usize,
+    cols: usize,
+    tag_len: usize,
+) -> Result<usize> {
+    let thumb = *grids.first().context("visual unit has no crops")?;
+    let thumb_tokens = thumb.feature_rows(vision.merge)?;
+    let mut len = tag_len
+        .checked_add(2)
+        .and_then(|n| n.checked_add(thumb_tokens))
+        .context("visual token count overflow")?;
+    if rows > 0 && cols > 0 {
+        ensure!(
+            grids.len() == 1 + rows * cols,
+            "crop count does not match the slice grid"
+        );
+        let slice = *grids.get(1).context("sliced unit lacks a slice crop")?;
+        let per_slice = slice.feature_rows(vision.merge)?;
+        len = len
+            .checked_add(rows - 1)
+            .and_then(|n| n.checked_add(rows * cols * (2 + per_slice)))
+            .context("visual token count overflow")?;
+    } else {
+        ensure!(grids.len() == 1, "unsliced unit carries slice crops");
+    }
+    Ok(len)
+}
+
 fn push_visual_unit(
     vision: &crate::model_spec::VisionConfig,
     markers: &crate::model_spec::MiniCpmVision,
@@ -959,18 +1075,13 @@ fn push_visual_unit(
         ensure!(unit.grids.len() == 1, "unsliced unit carries slice crops");
         None
     };
-    let mut len = visual
-        .tag
-        .len()
-        .checked_add(2)
-        .and_then(|n| n.checked_add(thumb_tokens))
-        .context("visual token count overflow")?;
-    if let Some((rows, cols, per_slice)) = slices {
-        len = len
-            .checked_add(rows - 1)
-            .and_then(|n| n.checked_add(rows * cols * (2 + per_slice)))
-            .context("visual token count overflow")?;
-    }
+    let len = visual_unit_tokens(
+        vision,
+        &unit.grids,
+        unit.rows as usize,
+        unit.cols as usize,
+        visual.tag.len(),
+    )?;
     ensure!(
         expanded
             .len()
@@ -1344,7 +1455,19 @@ fn load_encoded(url: &str) -> Result<(Vec<u8>, String)> {
 
 /// Decodes one MP4 data URL through the system ffprobe and ffmpeg.
 pub fn load_video(url: &str) -> Result<DecodedVideo> {
-    decode_video(&load_encoded_video(url)?)
+    decode_video(&load_video_source(url)?)
+}
+
+/// Reads a video source: a local file path or a base64 MP4 data URL.
+fn load_video_source(url: &str) -> Result<Vec<u8>> {
+    if url.starts_with("data:") {
+        return load_encoded_video(url);
+    }
+    ensure!(
+        !url.contains("://"),
+        "video URL must be a local file path or a data URL"
+    );
+    std::fs::read(url).with_context(|| format!("read video file {url}"))
 }
 
 fn load_encoded_video(url: &str) -> Result<Vec<u8>> {
@@ -1475,7 +1598,13 @@ fn tool_stdout(tool: &str, args: &[&str], timeout: Duration, limit: usize) -> Re
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .with_context(|| format!("run {tool}"))?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!("video decoding requires {tool} on PATH")
+            } else {
+                anyhow::Error::new(error).context(format!("run {tool}"))
+            }
+        })?;
     let mut stdout = child.stdout.take().context("tool stdout pipe missing")?;
     let mut stderr = child.stderr.take().context("tool stderr pipe missing")?;
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
@@ -2489,6 +2618,85 @@ mod tests {
             126
         );
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires system ffmpeg"]
+    fn video_request_matches_fixture4_token_counts() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-video-fixture4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("clip.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=1280x720:rate=30:duration=3.1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&path)
+            .status()
+            .context("run ffmpeg to build the fixture-4 clip")?;
+        assert!(status.success());
+        let processor = video_processor()?;
+        let options = VideoOptions {
+            max_num_frames: 4,
+            stack_frames: 1,
+            max_slice_nums: Some(1),
+        };
+        let planned = processor.plan_video(path.to_str().context("clip path")?, options)?;
+        std::fs::remove_dir_all(&dir)?;
+        let indices = sample_frame_indices(&planned.decoded.metadata, 4, 1)?;
+        assert_eq!(indices, vec![0, 30, 60, 90]);
+        assert_eq!(planned.decoded.frames.len(), 93);
+        let vision = processor.spec.vision.as_ref().unwrap();
+        let frame = &planned.decoded.frames[0];
+        assert_eq!((frame.height, frame.width), (720, 1280));
+        let (grids, rows, cols) =
+            mini_cpm_grids(frame.height, frame.width, vision.patch as usize, 1)?;
+        assert_eq!((grids[0].h, grids[0].w), (24, 44));
+        assert_eq!((rows, cols), (0, 0));
+        assert_eq!(processor.video_tokens(&planned)?, 272);
+        let packed = processor.prepare_planned_video(planned)?;
+        assert_eq!(packed.frames.len(), 4);
+        for frame in &packed.frames {
+            assert_eq!((frame.grids.len(), frame.rows, frame.cols), (1, 0, 0));
+            assert_eq!((frame.grids[0].h, frame.grids[0].w), (24, 44));
+        }
+        let ids = vec![5u32, 9, vision.video_token, 7];
+        let (expanded, prepared) = processor.expand(&ids, Vec::new(), vec![packed], 4096)?;
+        assert_eq!(expanded.len(), ids.len() - 1 + 272);
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|&&id| id == vision.video_token)
+                .count(),
+            264
+        );
+        assert_eq!(prepared.grids.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_video_tools_are_named() {
+        let error = tool_stdout(
+            "ffmpeg-not-on-path-ds",
+            &[],
+            std::time::Duration::from_millis(10),
+            16,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("video decoding requires ffmpeg-not-on-path-ds on PATH"),
+            "{error}"
+        );
     }
 
     fn ffprobe_report(path: &Path, entries: &str) -> Result<serde_json::Value> {

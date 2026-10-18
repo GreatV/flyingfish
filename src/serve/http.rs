@@ -507,9 +507,9 @@ async fn chat_completions(
             ));
         }
     }
-    let images = match prepare_message_images(&state, &mut messages) {
-        Ok(images) => images,
-        Err(error) => return bad_request(&format!("image input: {error}")),
+    let (images, videos) = match prepare_message_media(&state, &mut messages) {
+        Ok(media) => media,
+        Err(error) => return bad_request(&format!("media input: {error}")),
     };
     let max_tokens = match resolve_max_tokens(&body.params) {
         Ok(v) => v,
@@ -535,22 +535,22 @@ async fn chat_completions(
         Err(e) => return bad_request(&format!("tokenize: {e}")),
     };
     let mut admission = None;
-    let images = if images.is_empty() {
+    let images = if images.is_empty() && videos.is_empty() {
         None
     } else {
         let Some(processor) = &state.image_processor else {
             return bad_request("this model does not support image input");
         };
-        let expanded_tokens = match processor.expanded_token_count(&ids, &images) {
+        let expanded_tokens = match processor.expanded_token_count(&ids, &images, &videos) {
             Ok(count) => count,
-            Err(error) => return bad_request(&format!("image input: {error}")),
+            Err(error) => return bad_request(&format!("media input: {error}")),
         };
         if let Err(error) = crate::model::check_generation_capacity(
             expanded_tokens,
             max_tokens,
             state.backend.options().capacity,
         ) {
-            return bad_request(&format!("image input: {error}"));
+            return bad_request(&format!("media input: {error}"));
         }
         admission = match state.backend.reserve() {
             Ok(reservation) => Some(reservation),
@@ -564,12 +564,20 @@ async fn chat_completions(
             Ok(images) => images,
             Err(error) => return bad_request(&format!("image input: {error}")),
         };
-        match processor.expand(&ids, images, Vec::new(), state.backend.options().capacity) {
+        let videos = match videos
+            .into_iter()
+            .map(|video| processor.prepare_planned_video(video))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(videos) => videos,
+            Err(error) => return bad_request(&format!("video input: {error}")),
+        };
+        match processor.expand(&ids, images, videos, state.backend.options().capacity) {
             Ok((expanded, prepared)) => {
                 ids = expanded;
                 Some(prepared)
             }
-            Err(error) => return bad_request(&format!("image input: {error}")),
+            Err(error) => return bad_request(&format!("media input: {error}")),
         }
     };
     if let Err(response) = check_validity(&state, &ids, max_tokens, images.is_some()) {
@@ -592,12 +600,17 @@ async fn chat_completions(
     .await
 }
 
-fn prepare_message_images(
+fn prepare_message_media(
     state: &AppState,
     messages: &mut [serde_json::Value],
-) -> Result<Vec<super::image::PlannedImage>> {
+) -> Result<(
+    Vec<super::image::PlannedImage>,
+    Vec<super::image::PlannedVideo>,
+)> {
     let mut images = Vec::new();
+    let mut videos = Vec::new();
     let mut image_tokens = 0usize;
+    let mut video_tokens = 0usize;
     for message in messages {
         let is_system = message["role"] == "system";
         let Some(parts) = message.get_mut("content").and_then(|v| v.as_array_mut()) else {
@@ -636,7 +649,82 @@ fn prepare_message_images(
                     images.push(image);
                     *part = json!({"type":"image"});
                 }
-                _ => anyhow::bail!("content part type must be text or image_url"),
+                Some("video_url") => {
+                    anyhow::ensure!(!is_system, "system messages cannot contain videos");
+                    anyhow::ensure!(
+                        state.backend.options().backend.draft_model.is_none(),
+                        "video input does not support a draft model"
+                    );
+                    let object = part
+                        .get("video_url")
+                        .and_then(|v| v.as_object())
+                        .context("video_url needs an object")?;
+                    for key in object.keys() {
+                        anyhow::ensure!(
+                            matches!(
+                                key.as_str(),
+                                "url" | "max_num_frames" | "stack_frames" | "downsample_mode"
+                            ),
+                            "unknown video_url field {key}"
+                        );
+                    }
+                    let url = object
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .context("video_url needs a string url")?;
+                    let max_num_frames = match object.get("max_num_frames") {
+                        None => 4,
+                        Some(value) => usize::try_from(
+                            value
+                                .as_u64()
+                                .context("max_num_frames must be a positive integer")?,
+                        )
+                        .context("max_num_frames exceeds usize")?,
+                    };
+                    let stack_frames = match object.get("stack_frames") {
+                        None => 1,
+                        Some(value) => u32::try_from(
+                            value
+                                .as_u64()
+                                .context("stack_frames must be a positive integer")?,
+                        )
+                        .context("stack_frames exceeds u32")?,
+                    };
+                    anyhow::ensure!(
+                        stack_frames == 1,
+                        "stack_frames {stack_frames} is not supported; first support requires stack_frames = 1"
+                    );
+                    let downsample = match object.get("downsample_mode") {
+                        None => "16x",
+                        Some(value) => {
+                            value.as_str().context("downsample_mode must be a string")?
+                        }
+                    };
+                    anyhow::ensure!(
+                        downsample == "16x",
+                        "downsample_mode {downsample:?} is not supported; the model uses 16x"
+                    );
+                    let processor = state
+                        .image_processor
+                        .as_ref()
+                        .context("this model does not support video input")?;
+                    let options = super::image::VideoOptions {
+                        max_num_frames,
+                        stack_frames,
+                        max_slice_nums: Some(1),
+                    };
+                    let video = processor.plan_video(url, options)?;
+                    video_tokens = video_tokens
+                        .checked_add(processor.video_tokens(&video)?)
+                        .context("video token count overflow")?;
+                    anyhow::ensure!(
+                        image_tokens + video_tokens <= state.backend.options().capacity,
+                        "video tokens exceed request capacity before pixel preprocessing"
+                    );
+                    videos.push(video);
+                    *part = json!({"type":"video"});
+                }
+                _ => anyhow::bail!("content part type must be text, image_url or video_url"),
             }
         }
         if parts.iter().all(|p| p["type"] == "text") {
@@ -652,7 +740,7 @@ fn prepare_message_images(
             message["content"] = json!(text);
         }
     }
-    Ok(images)
+    Ok((images, videos))
 }
 
 async fn respond(
@@ -1271,6 +1359,33 @@ mod tests {
             .unwrap();
             let response = chat_completions(State(state.clone()), Json(request)).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(commands.try_recv().is_err());
+            assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        }
+    }
+
+    #[tokio::test]
+    async fn video_parts_name_unsupported_processor_options() {
+        for (part, needle) in [
+            (
+                json!({"type":"video_url","video_url":{"url":"/nonexistent.mp4","stack_frames":2}}),
+                "stack_frames 2 is not supported",
+            ),
+            (
+                json!({"type":"video_url","video_url":{"url":"/nonexistent.mp4","downsample_mode":"4x"}}),
+                "downsample_mode \"4x\" is not supported",
+            ),
+        ] {
+            let (state, commands) = test_state(256, Slot::Idle);
+            let request = serde_json::from_value(json!({
+                "messages":[{"role":"user","content":[part]}], "max_tokens":1
+            }))
+            .unwrap();
+            let response = chat_completions(State(state.clone()), Json(request)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = body_json(response).await;
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains(needle), "{needle}: {message}");
             assert!(commands.try_recv().is_err());
             assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
         }
