@@ -443,6 +443,26 @@ pub struct Job<'a> {
     pub out: &'a mut [bf16],
 }
 
+/// A published pool job; dropping it waits for completion and releases the lease.
+/// `ExpertPool::finish` is the form that reports a worker error.
+pub struct PendingJob<'a> {
+    pool: &'a ExpertPool,
+    out: Option<&'a mut [bf16]>,
+    armed: bool,
+}
+
+impl Drop for PendingJob<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        if let Some(out) = self.out.take() {
+            let _ = self.pool.complete(out);
+        }
+    }
+}
+
 struct PoolShared {
     job: RwLock<JobSlot>,
     park: Mutex<()>,
@@ -450,6 +470,7 @@ struct PoolShared {
     error: Mutex<Option<String>>,
     workers: usize,
     generation: AtomicU64,
+    pending: AtomicBool,
     shutdown: AtomicBool,
     phase1: AtomicUsize,
     finished: AtomicUsize,
@@ -562,6 +583,7 @@ impl ExpertPool {
             error: Mutex::new(None),
             workers,
             generation: AtomicU64::new(0),
+            pending: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             phase1: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
@@ -619,7 +641,8 @@ impl ExpertPool {
         self.isa
     }
 
-    pub fn run(&self, job: Job<'_>) -> Result<()> {
+    /// Publishes a job; the guard holds the output and the lease until finish or drop.
+    pub fn submit<'a>(&'a self, job: Job<'a>) -> Result<PendingJob<'a>> {
         let Job {
             arena,
             hidden,
@@ -628,20 +651,44 @@ impl ExpertPool {
             assignments,
             out,
         } = job;
+        ensure!(
+            !self.shared.pending.swap(true, Ordering::AcqRel),
+            "expert pool job is already pending"
+        );
+        if let Err(error) = self.publish(&arena, hidden, rows, experts, assignments, out.len()) {
+            self.shared.pending.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(PendingJob {
+            pool: self,
+            out: Some(out),
+            armed: true,
+        })
+    }
+
+    fn publish(
+        &self,
+        arena: &Arc<HostBlocks>,
+        hidden: &[bf16],
+        rows: usize,
+        experts: &[ExpertWeights],
+        assignments: &[Assignment],
+        out_len: usize,
+    ) -> Result<()> {
         self.validate(
             arena.elements(),
             hidden.len(),
             rows,
             experts,
             assignments,
-            out.len(),
+            out_len,
         )?;
-        let blocks = assignment_blocks(&arena, experts, assignments)?;
+        let blocks = assignment_blocks(arena, experts, assignments)?;
         let lease = Arc::new(arena.lease(&blocks)?);
         {
             let mut slot = self.shared.job.write().unwrap_or_else(|e| e.into_inner());
             slot.rows = rows;
-            slot.arena = Some(lease.clone());
+            slot.arena = Some(lease);
             slot.hidden[..hidden.len()].copy_from_slice(hidden);
             slot.experts.clear();
             slot.experts.extend_from_slice(experts);
@@ -657,6 +704,23 @@ impl ExpertPool {
             self.shared.generation.fetch_add(1, Ordering::Release);
             self.shared.wake.notify_all();
         }
+        Ok(())
+    }
+
+    /// Waits for the pending job and copies its output; on error the output is left unmodified.
+    pub fn finish(&self, mut pending: PendingJob<'_>) -> Result<()> {
+        debug_assert!(std::ptr::eq(self, pending.pool));
+        pending.armed = false;
+        let out = pending.out.take().context("pending job has no output")?;
+        self.complete(out)
+    }
+
+    pub fn run(&self, job: Job<'_>) -> Result<()> {
+        let pending = self.submit(job)?;
+        self.finish(pending)
+    }
+
+    fn complete(&self, out: &mut [bf16]) -> Result<()> {
         let mut spins = 0u32;
         loop {
             if self.shared.finished.load(Ordering::Acquire) >= self.workers {
@@ -684,18 +748,23 @@ impl ExpertPool {
             .unwrap_or_else(|e| e.into_inner())
             .take()
         {
+            self.release();
             bail!("{error}");
         }
         let len = out.len();
         for (target, source) in out.iter_mut().zip(&self.shared.out[..len]) {
             *target = bf16::from_bits(source.load(Ordering::Acquire));
         }
+        self.release();
+        Ok(())
+    }
+
+    fn release(&self) {
         {
             let mut slot = self.shared.job.write().unwrap_or_else(|e| e.into_inner());
             slot.arena = None;
         }
-        drop(lease);
-        Ok(())
+        self.shared.pending.store(false, Ordering::Release);
     }
 
     fn validate(
@@ -1355,6 +1424,160 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    struct PoolFixture {
+        shape: Shape,
+        arena: Arc<HostBlocks>,
+        hidden: Vec<bf16>,
+        experts: Vec<ExpertWeights>,
+        assignments: Vec<Assignment>,
+    }
+
+    fn pool_fixture() -> Result<PoolFixture> {
+        let shape = Shape::new(128, 64)?;
+        let arena = build_arena(&shape, 4);
+        let rows = 2usize;
+        let hidden: Vec<bf16> = (0..rows).flat_map(|row| hidden_row(&shape, row)).collect();
+        let assignments: Vec<Assignment> = (0..rows)
+            .flat_map(|row| {
+                (0..2).map(move |choice| Assignment {
+                    row: row as u32,
+                    choice: (row * 2 + choice) as u32,
+                    expert: ((row + choice) % 3) as u32,
+                    weight: bf16::from_f32(0.5 + choice as f32 * 0.25),
+                })
+            })
+            .collect();
+        let experts: Vec<ExpertWeights> = (0..3).map(|expert| weights(&shape, expert)).collect();
+        Ok(PoolFixture {
+            shape,
+            arena,
+            hidden,
+            experts,
+            assignments,
+        })
+    }
+
+    fn expected_output(fixture: &PoolFixture) -> Result<Vec<bf16>> {
+        let shape = &fixture.shape;
+        let mut scratch = Scratch::new(shape);
+        let flat = arena_flat(&fixture.arena);
+        let mut expected = vec![bf16::ZERO; fixture.assignments.len() * shape.hidden];
+        for assignment in &fixture.assignments {
+            let row = &fixture.hidden[assignment.row as usize * shape.hidden..][..shape.hidden];
+            let out = &mut expected[assignment.choice as usize * shape.hidden..][..shape.hidden];
+            contribution(
+                Isa::Scalar,
+                Contribution {
+                    shape,
+                    arena: &flat,
+                    weights: &fixture.experts[assignment.expert as usize],
+                    hidden: row,
+                    routing: assignment.weight,
+                },
+                out,
+                &mut scratch,
+            )?;
+        }
+        Ok(expected)
+    }
+
+    fn fixture_job<'a>(fixture: &'a PoolFixture, out: &'a mut [bf16]) -> Job<'a> {
+        Job {
+            arena: fixture.arena.clone(),
+            hidden: &fixture.hidden,
+            rows: 2,
+            experts: &fixture.experts,
+            assignments: &fixture.assignments,
+            out,
+        }
+    }
+
+    #[test]
+    fn pending_guard_holds_the_lease_until_finish() -> Result<()> {
+        let fixture = pool_fixture()?;
+        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len())?;
+        let mut out = vec![bf16::ZERO; fixture.assignments.len() * fixture.shape.hidden];
+        let block =
+            u32::try_from(fixture.experts[0].gate_up.start / fixture.arena.block_elements())?;
+        let pending = pool.submit(fixture_job(&fixture, &mut out))?;
+        assert!(
+            fixture.arena.claim(block).is_err(),
+            "a pending guard must keep its lease"
+        );
+        pool.finish(pending)?;
+        assert!(
+            fixture.arena.claim(block).is_ok(),
+            "finish must release the lease"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_submit_errors_without_touching_its_output() -> Result<()> {
+        let fixture = pool_fixture()?;
+        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len())?;
+        let mut first = vec![bf16::ZERO; fixture.assignments.len() * fixture.shape.hidden];
+        let pending = pool.submit(fixture_job(&fixture, &mut first))?;
+        let mut second =
+            vec![bf16::from_f32(-3.0); fixture.assignments.len() * fixture.shape.hidden];
+        let error = pool
+            .submit(fixture_job(&fixture, &mut second))
+            .err()
+            .context("overlapping submit must fail")?
+            .to_string();
+        assert!(error.contains("already pending"), "{error}");
+        assert!(
+            second.iter().all(|value| *value == bf16::from_f32(-3.0)),
+            "an errored submit must leave its output unmodified"
+        );
+        pool.finish(pending)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_the_guard_waits_and_releases() -> Result<()> {
+        let fixture = pool_fixture()?;
+        let expected = expected_output(&fixture)?;
+        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len())?;
+        let mut out = vec![bf16::ZERO; fixture.assignments.len() * fixture.shape.hidden];
+        {
+            let _pending = pool.submit(fixture_job(&fixture, &mut out))?;
+        }
+        assert_eq!(out, expected, "drop must wait for completion");
+        let block =
+            u32::try_from(fixture.experts[0].gate_up.start / fixture.arena.block_elements())?;
+        assert!(
+            fixture.arena.claim(block).is_ok(),
+            "drop must release the lease"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_and_submit_finish_are_bitwise_identical() -> Result<()> {
+        let fixture = pool_fixture()?;
+        let expected = expected_output(&fixture)?;
+        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len())?;
+        let mut out_run = vec![bf16::ZERO; fixture.assignments.len() * fixture.shape.hidden];
+        pool.run(fixture_job(&fixture, &mut out_run))?;
+        let mut out_seam = vec![bf16::ZERO; fixture.assignments.len() * fixture.shape.hidden];
+        let pending = pool.submit(fixture_job(&fixture, &mut out_seam))?;
+        pool.finish(pending)?;
+        let bits = |values: &[bf16]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(&out_run),
+            bits(&out_seam),
+            "run and submit+finish differ"
+        );
+        assert_eq!(out_run, expected);
         Ok(())
     }
 
