@@ -182,15 +182,18 @@ impl Scratch {
 }
 
 type DotFn = unsafe fn(&[f32], &[bf16]) -> f32;
+type Fp8DotFn = unsafe fn(&[f32], &[u8], f32) -> f32;
 type RoundFn = unsafe fn(&[f32], &mut [bf16]);
 
 struct Arm {
     dot: DotFn,
+    dot_e4m3: Fp8DotFn,
     round: RoundFn,
 }
 
 const SCALAR_ARM: Arm = Arm {
     dot: scalar_dot,
+    dot_e4m3: scalar_dot_e4m3,
     round: scalar_round,
 };
 
@@ -288,6 +291,138 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
     unsafe { (arm.round)(&scratch.weighted, out) };
 }
 
+/// One routed-expert contribution over one native FP8 slot: E4M3 weights scaled per output
+/// channel, the BF16 arm's rounding boundaries and accumulation order.
+pub struct Fp8Contribution<'a> {
+    pub shape: &'a Shape,
+    pub slot: &'a [u8],
+    pub slot_layout: &'a crate::experts::catalogue::Fp8Slot,
+    pub hidden: &'a [bf16],
+    pub routing: bf16,
+}
+
+struct Fp8Rows<'a> {
+    gate: &'a [u8],
+    up: &'a [u8],
+    down: &'a [u8],
+    gate_scale: &'a [u8],
+    up_scale: &'a [u8],
+    down_scale: &'a [u8],
+}
+
+fn fp8_slice<'a>(slot: &'a [u8], range: &Range<u64>, bytes: usize, role: &str) -> Result<&'a [u8]> {
+    let start = usize::try_from(range.start).context("FP8 slot offset exceeds usize")?;
+    let end = usize::try_from(range.end).context("FP8 slot end exceeds usize")?;
+    ensure!(
+        end <= slot.len(),
+        "FP8 {role} range {start}..{end} exceeds the {}-byte slot",
+        slot.len()
+    );
+    ensure!(
+        end - start == bytes,
+        "FP8 {role} range holds {} bytes, expected {bytes}",
+        end - start
+    );
+    Ok(&slot[start..end])
+}
+
+fn row_scale(bytes: &[u8], row: usize) -> f32 {
+    let at = 2 * row;
+    f32::from(bf16::from_bits(u16::from_le_bytes([
+        bytes[at],
+        bytes[at + 1],
+    ])))
+}
+
+pub fn fp8_contribution(
+    isa: Isa,
+    input: Fp8Contribution<'_>,
+    out: &mut [bf16],
+    scratch: &mut Scratch,
+) -> Result<()> {
+    let (hidden, intermediate) = (input.shape.hidden, input.shape.intermediate);
+    ensure!(
+        input.hidden.len() == hidden && out.len() == hidden,
+        "hidden/out width differs from the expert shape"
+    );
+    let layout = input.slot_layout;
+    let rows = Fp8Rows {
+        gate: fp8_slice(input.slot, &layout.gate, intermediate * hidden, "gate")?,
+        up: fp8_slice(input.slot, &layout.up, intermediate * hidden, "up")?,
+        down: fp8_slice(input.slot, &layout.down, hidden * intermediate, "down")?,
+        gate_scale: fp8_slice(
+            input.slot,
+            &layout.gate_scale,
+            intermediate * 2,
+            "gate scale",
+        )?,
+        up_scale: fp8_slice(input.slot, &layout.up_scale, intermediate * 2, "up scale")?,
+        down_scale: fp8_slice(input.slot, &layout.down_scale, hidden * 2, "down scale")?,
+    };
+    scratch.check(input.shape)?;
+    compute_fp8(
+        arm_for(isa)?,
+        input.shape,
+        rows,
+        input.hidden,
+        input.routing,
+        out,
+        scratch,
+    );
+    Ok(())
+}
+
+fn compute_fp8(
+    arm: &Arm,
+    shape: &Shape,
+    rows: Fp8Rows<'_>,
+    hidden: &[bf16],
+    routing: bf16,
+    out: &mut [bf16],
+    scratch: &mut Scratch,
+) {
+    let (hidden_width, intermediate) = (shape.hidden, shape.intermediate);
+    for (value, source) in scratch.hidden.iter_mut().zip(hidden) {
+        *value = f32::from(*source);
+    }
+    for j in 0..intermediate {
+        let gate = &rows.gate[j * hidden_width..][..hidden_width];
+        let up = &rows.up[j * hidden_width..][..hidden_width];
+        // SAFETY: the arm was selected by `Isa::detect` or checked by `Isa::available`.
+        scratch.gate[j] =
+            unsafe { (arm.dot_e4m3)(&scratch.hidden, gate, row_scale(rows.gate_scale, j)) };
+        scratch.up[j] = unsafe { (arm.dot_e4m3)(&scratch.hidden, up, row_scale(rows.up_scale, j)) };
+    }
+    // SAFETY: as above.
+    unsafe { (arm.round)(&scratch.gate, &mut scratch.gate_bf) };
+    // SAFETY: as above.
+    unsafe { (arm.round)(&scratch.up, &mut scratch.up_bf) };
+    for j in 0..intermediate {
+        let gate = f32::from(scratch.gate_bf[j]);
+        let silu = gate * (1.0 / (1.0 + (-gate).exp()));
+        scratch.product[j] = silu * f32::from(scratch.up_bf[j]);
+    }
+    // SAFETY: as above.
+    unsafe { (arm.round)(&scratch.product, &mut scratch.activated) };
+    for (value, source) in scratch.activated_f.iter_mut().zip(&scratch.activated) {
+        *value = f32::from(*source);
+    }
+    for k in 0..hidden_width {
+        let row = &rows.down[k * intermediate..][..intermediate];
+        // SAFETY: as above.
+        scratch.down[k] =
+            unsafe { (arm.dot_e4m3)(&scratch.activated_f, row, row_scale(rows.down_scale, k)) };
+    }
+    // SAFETY: as above.
+    unsafe { (arm.round)(&scratch.down, &mut scratch.down_bf) };
+    let weight = f32::from(routing);
+    for (value, source) in scratch.weighted.iter_mut().zip(&scratch.down_bf) {
+        *value = f32::from(*source) * weight;
+    }
+    // SAFETY: as above.
+    unsafe { (arm.round)(&scratch.weighted, out) };
+}
+
 fn pairwise(lanes: &[f32; LANES]) -> f32 {
     let low = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
         + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
@@ -309,6 +444,26 @@ fn scalar_dot(x: &[f32], weights: &[bf16]) -> f32 {
     while k < x.len() {
         let lane = k % LANES;
         lanes[lane] = x[k].mul_add(f32::from(weights[k]), lanes[lane]);
+        k += 1;
+    }
+    pairwise(&lanes)
+}
+
+fn scalar_dot_e4m3(x: &[f32], codes: &[u8], scale: f32) -> f32 {
+    assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
+    let mut lanes = [0f32; LANES];
+    let mut k = 0;
+    while k + LANES <= x.len() {
+        for lane in 0..LANES {
+            let weight = crate::fp8::decode_e4m3(codes[k + lane]) * scale;
+            lanes[lane] = x[k + lane].mul_add(weight, lanes[lane]);
+        }
+        k += LANES;
+    }
+    while k < x.len() {
+        let lane = k % LANES;
+        let weight = crate::fp8::decode_e4m3(codes[k]) * scale;
+        lanes[lane] = x[k].mul_add(weight, lanes[lane]);
         k += 1;
     }
     pairwise(&lanes)
@@ -362,6 +517,73 @@ mod x86 {
         }
     }
 
+    /// E4M3 byte to f32 as the scalar decode defines it: bias 7, no infinity,
+    /// magnitude 0x7f is NaN, exponent 0 decodes to mantissa / 512.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn decode8(codes: *const u8) -> __m256 {
+        unsafe {
+            let packed = _mm_loadl_epi64(codes as *const __m128i);
+            let value = _mm256_cvtepu8_epi32(packed);
+            let sign = _mm256_slli_epi32(_mm256_and_si256(value, _mm256_set1_epi32(0x80)), 24);
+            let magnitude = _mm256_and_si256(value, _mm256_set1_epi32(0x7f));
+            let exponent = _mm256_srli_epi32(magnitude, 3);
+            let mantissa = _mm256_and_si256(magnitude, _mm256_set1_epi32(7));
+            let normal = _mm256_castsi256_ps(_mm256_or_si256(
+                sign,
+                _mm256_or_si256(
+                    _mm256_slli_epi32(_mm256_add_epi32(exponent, _mm256_set1_epi32(120)), 23),
+                    _mm256_slli_epi32(mantissa, 20),
+                ),
+            ));
+            let subnormal = _mm256_or_ps(
+                _mm256_castsi256_ps(sign),
+                _mm256_mul_ps(_mm256_cvtepi32_ps(mantissa), _mm256_set1_ps(1.0 / 512.0)),
+            );
+            let nan = _mm256_castsi256_ps(_mm256_or_si256(sign, _mm256_set1_epi32(0x7fc0_0000)));
+            let subnormal_mask =
+                _mm256_castsi256_ps(_mm256_cmpeq_epi32(exponent, _mm256_setzero_si256()));
+            let nan_mask =
+                _mm256_castsi256_ps(_mm256_cmpeq_epi32(magnitude, _mm256_set1_epi32(0x7f)));
+            _mm256_blendv_ps(
+                _mm256_blendv_ps(normal, subnormal, subnormal_mask),
+                nan,
+                nan_mask,
+            )
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn dot_e4m3(x: &[f32], codes: &[u8], scale: f32) -> f32 {
+        assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
+        let factor = _mm256_set1_ps(scale);
+        let mut low = _mm256_setzero_ps();
+        let mut high = _mm256_setzero_ps();
+        let mut k = 0;
+        while k + LANES <= x.len() {
+            unsafe {
+                let xl = _mm256_loadu_ps(x.as_ptr().add(k));
+                let xh = _mm256_loadu_ps(x.as_ptr().add(k + 8));
+                let wl = _mm256_mul_ps(decode8(codes.as_ptr().add(k)), factor);
+                let wh = _mm256_mul_ps(decode8(codes.as_ptr().add(k + 8)), factor);
+                low = _mm256_fmadd_ps(xl, wl, low);
+                high = _mm256_fmadd_ps(xh, wh, high);
+            }
+            k += LANES;
+        }
+        let mut lanes = [0f32; LANES];
+        unsafe {
+            _mm256_storeu_ps(lanes.as_mut_ptr(), low);
+            _mm256_storeu_ps(lanes.as_mut_ptr().add(8), high);
+        }
+        while k < x.len() {
+            let lane = k % LANES;
+            let weight = crate::fp8::decode_e4m3(codes[k]) * scale;
+            lanes[lane] = x[k].mul_add(weight, lanes[lane]);
+            k += 1;
+        }
+        pairwise(&lanes)
+    }
+
     #[target_feature(enable = "avx512f,avx512bf16")]
     pub(super) unsafe fn dot_512(x: &[f32], weights: &[bf16]) -> f32 {
         assert_eq!(x.len(), weights.len(), "dot operand width mismatch");
@@ -392,6 +614,61 @@ mod x86 {
         }
     }
 
+    /// E4M3 byte to f32 as the scalar decode defines it: bias 7, no infinity,
+    /// magnitude 0x7f is NaN, exponent 0 decodes to mantissa / 512.
+    #[target_feature(enable = "avx512f,avx512bf16")]
+    unsafe fn decode16(codes: *const u8) -> __m512 {
+        unsafe {
+            let packed = _mm_loadu_si128(codes as *const __m128i);
+            let value = _mm512_cvtepu8_epi32(packed);
+            let sign = _mm512_slli_epi32(_mm512_and_si512(value, _mm512_set1_epi32(0x80)), 24);
+            let magnitude = _mm512_and_si512(value, _mm512_set1_epi32(0x7f));
+            let exponent = _mm512_srli_epi32(magnitude, 3);
+            let mantissa = _mm512_and_si512(magnitude, _mm512_set1_epi32(7));
+            let normal = _mm512_castsi512_ps(_mm512_or_si512(
+                sign,
+                _mm512_or_si512(
+                    _mm512_slli_epi32(_mm512_add_epi32(exponent, _mm512_set1_epi32(120)), 23),
+                    _mm512_slli_epi32(mantissa, 20),
+                ),
+            ));
+            let subnormal = _mm512_or_ps(
+                _mm512_castsi512_ps(sign),
+                _mm512_mul_ps(_mm512_cvtepi32_ps(mantissa), _mm512_set1_ps(1.0 / 512.0)),
+            );
+            let nan = _mm512_castsi512_ps(_mm512_or_si512(sign, _mm512_set1_epi32(0x7fc0_0000)));
+            let subnormal_mask = _mm512_cmpeq_epi32_mask(exponent, _mm512_setzero_si512());
+            let nan_mask = _mm512_cmpeq_epi32_mask(magnitude, _mm512_set1_epi32(0x7f));
+            let decoded = _mm512_mask_blend_ps(subnormal_mask, normal, subnormal);
+            _mm512_mask_blend_ps(nan_mask, decoded, nan)
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bf16")]
+    pub(super) unsafe fn dot_e4m3_512(x: &[f32], codes: &[u8], scale: f32) -> f32 {
+        assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
+        let factor = _mm512_set1_ps(scale);
+        let mut acc = _mm512_setzero_ps();
+        let mut k = 0;
+        while k + LANES <= x.len() {
+            unsafe {
+                let xv = _mm512_loadu_ps(x.as_ptr().add(k));
+                let weights = _mm512_mul_ps(decode16(codes.as_ptr().add(k)), factor);
+                acc = _mm512_fmadd_ps(xv, weights, acc);
+            }
+            k += LANES;
+        }
+        let mut lanes = [0f32; LANES];
+        unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), acc) };
+        while k < x.len() {
+            let lane = k % LANES;
+            let weight = crate::fp8::decode_e4m3(codes[k]) * scale;
+            lanes[lane] = x[k].mul_add(weight, lanes[lane]);
+            k += 1;
+        }
+        pairwise(&lanes)
+    }
+
     #[target_feature(enable = "avx512f,avx512bf16")]
     pub(super) unsafe fn round_512(values: &[f32], out: &mut [bf16]) {
         assert_eq!(values.len(), out.len(), "round operand width mismatch");
@@ -411,11 +688,13 @@ mod x86 {
 
     pub(super) const AVX2: Arm = Arm {
         dot,
+        dot_e4m3,
         round: super::scalar_round,
     };
 
     pub(super) const AVX512: Arm = Arm {
         dot: dot_512,
+        dot_e4m3: dot_e4m3_512,
         round: round_512,
     };
 }
@@ -1230,6 +1509,220 @@ mod tests {
             worst <= 1,
             "FP32 accumulation moved a result by more than one BF16 step"
         );
+        Ok(())
+    }
+
+    fn fp8_fixture(shape: &Shape) -> (Vec<u8>, crate::experts::catalogue::Fp8Slot) {
+        let geometry = crate::experts::catalogue::ExpertGeometry {
+            layers: 1,
+            experts: 1,
+            hidden: shape.hidden as u32,
+            intermediate: shape.intermediate as u32,
+            top_k: 1,
+        };
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Fp8W8a16,
+            &geometry,
+        )
+        .unwrap();
+        let crate::experts::catalogue::ExpertLayout::Fp8W8a16(slot_layout) = layout else {
+            panic!("FP8 layout expected");
+        };
+        let mut slot = vec![0u8; slot_layout.down_scale.end as usize];
+        let codes = 3 * shape.hidden * shape.intermediate;
+        for (index, byte) in slot.iter_mut().take(codes).enumerate() {
+            *byte = (((index * 37 + 11) % 64) as u8) | ((((index / 7) & 1) as u8) << 7);
+        }
+        for (range, rows) in [
+            (&slot_layout.gate_scale, shape.intermediate),
+            (&slot_layout.up_scale, shape.intermediate),
+            (&slot_layout.down_scale, shape.hidden),
+        ] {
+            for row in 0..rows {
+                let value = bf16::from_f32(0.5 + (row % 9) as f32 * 0.125);
+                let at = range.start as usize + 2 * row;
+                slot[at..at + 2].copy_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+        (slot, slot_layout)
+    }
+
+    /// FP64 accumulation over the dequantized weights with the model's BF16 rounding points.
+    fn fp8_oracle(
+        shape: &Shape,
+        slot: &[u8],
+        layout: &crate::experts::catalogue::Fp8Slot,
+        hidden: &[bf16],
+        routing: bf16,
+    ) -> Vec<bf16> {
+        let (h, i) = (shape.hidden, shape.intermediate);
+        let scale = |range: &std::ops::Range<u64>, row: usize| -> f32 {
+            let at = range.start as usize + 2 * row;
+            f32::from(bf16::from_bits(u16::from_le_bytes([
+                slot[at],
+                slot[at + 1],
+            ])))
+        };
+        let mut gate_w = vec![0.0f32; i * h];
+        let mut up_w = vec![0.0f32; i * h];
+        for j in 0..i {
+            let gate_scale = scale(&layout.gate_scale, j);
+            let up_scale = scale(&layout.up_scale, j);
+            for k in 0..h {
+                gate_w[j * h + k] =
+                    crate::fp8::decode_e4m3(slot[layout.gate.start as usize + j * h + k])
+                        * gate_scale;
+                up_w[j * h + k] =
+                    crate::fp8::decode_e4m3(slot[layout.up.start as usize + j * h + k]) * up_scale;
+            }
+        }
+        let mut down_w = vec![0.0f32; h * i];
+        for k in 0..h {
+            let down_scale = scale(&layout.down_scale, k);
+            for j in 0..i {
+                down_w[k * i + j] =
+                    crate::fp8::decode_e4m3(slot[layout.down.start as usize + k * i + j])
+                        * down_scale;
+            }
+        }
+        let mut gate = vec![0.0f64; i];
+        let mut up = vec![0.0f64; i];
+        for j in 0..i {
+            for k in 0..h {
+                gate[j] += f64::from(hidden[k]) * f64::from(gate_w[j * h + k]);
+                up[j] += f64::from(hidden[k]) * f64::from(up_w[j * h + k]);
+            }
+        }
+        let mut activated = vec![0.0f64; i];
+        for j in 0..i {
+            let gate = f64::from(bf16::from_f32(gate[j] as f32));
+            let up = f64::from(bf16::from_f32(up[j] as f32));
+            let silu = gate * (1.0 / (1.0 + (-gate).exp()));
+            activated[j] = f64::from(bf16::from_f32((silu * up) as f32));
+        }
+        let mut out = Vec::with_capacity(h);
+        for k in 0..h {
+            let mut acc = 0.0f64;
+            for j in 0..i {
+                acc += activated[j] * f64::from(down_w[k * i + j]);
+            }
+            let linear = bf16::from_f32(acc as f32);
+            out.push(bf16::from_f32(f32::from(linear) * f32::from(routing)));
+        }
+        out
+    }
+
+    #[test]
+    fn fp8_scalar_matches_the_oracle_at_the_bf16_boundaries() -> Result<()> {
+        let shape = production_shape();
+        let (slot, layout) = fp8_fixture(&shape);
+        let mut scratch = Scratch::new(&shape);
+        let mut elements = 0usize;
+        let mut differing = 0usize;
+        let mut worst = 0u32;
+        for (row, routing) in [(0usize, 0.3125f32), (1, -0.5), (2, 0.0625), (3, 1.0)] {
+            let hidden = hidden_row(&shape, row);
+            let routing = bf16::from_f32(routing);
+            let mut out = vec![bf16::ZERO; shape.hidden];
+            fp8_contribution(
+                Isa::Scalar,
+                Fp8Contribution {
+                    shape: &shape,
+                    slot: &slot,
+                    slot_layout: &layout,
+                    hidden: &hidden,
+                    routing,
+                },
+                &mut out,
+                &mut scratch,
+            )?;
+            let expected = fp8_oracle(&shape, &slot, &layout, &hidden, routing);
+            for (actual, expected) in out.iter().zip(&expected) {
+                let distance = order_key(*actual).abs_diff(order_key(*expected));
+                elements += 1;
+                differing += usize::from(distance != 0);
+                worst = worst.max(distance);
+            }
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "fp8_scalar_vs_oracle": {
+                    "elements": elements,
+                    "differing": differing,
+                    "max_bf16_steps": worst,
+                }
+            })
+        );
+        assert!(
+            worst <= 1,
+            "FP32 accumulation moved a result by more than one BF16 step"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_detected_arms_match_the_scalar_arm_bitwise() -> Result<()> {
+        let shape = production_shape();
+        let (slot, layout) = fp8_fixture(&shape);
+        let mut scratch = Scratch::new(&shape);
+        for (row, routing) in [(0usize, 0.3125f32), (1, -0.5)] {
+            let hidden = hidden_row(&shape, row);
+            let routing = bf16::from_f32(routing);
+            let mut scalar = vec![bf16::ZERO; shape.hidden];
+            fp8_contribution(
+                Isa::Scalar,
+                Fp8Contribution {
+                    shape: &shape,
+                    slot: &slot,
+                    slot_layout: &layout,
+                    hidden: &hidden,
+                    routing,
+                },
+                &mut scalar,
+                &mut scratch,
+            )?;
+            for isa in [Isa::Avx2, Isa::Avx512Bf16] {
+                if !isa.available() {
+                    println!("arm {} unavailable", isa.name());
+                    continue;
+                }
+                let mut out = vec![bf16::ZERO; shape.hidden];
+                fp8_contribution(
+                    isa,
+                    Fp8Contribution {
+                        shape: &shape,
+                        slot: &slot,
+                        slot_layout: &layout,
+                        hidden: &hidden,
+                        routing,
+                    },
+                    &mut out,
+                    &mut scratch,
+                )?;
+                assert_eq!(out, scalar, "{} differs from the scalar arm", isa.name());
+            }
+            let mut mutated = slot.clone();
+            let down_scale = layout.down_scale.start as usize;
+            mutated[down_scale + 1] ^= 0x80;
+            let mut mutant = vec![bf16::ZERO; shape.hidden];
+            fp8_contribution(
+                Isa::Scalar,
+                Fp8Contribution {
+                    shape: &shape,
+                    slot: &mutated,
+                    slot_layout: &layout,
+                    hidden: &hidden,
+                    routing,
+                },
+                &mut mutant,
+                &mut scratch,
+            )?;
+            assert_ne!(
+                mutant, scalar,
+                "a flipped down-scale sign left the output unchanged"
+            );
+        }
         Ok(())
     }
 

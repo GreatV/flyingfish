@@ -27,6 +27,14 @@ pub enum LinearFormat {
     Bf16,
     Fp8E4m3Block128,
 }
+/// Routed-expert checkpoint layout: fused BF16 slices or per-expert E4M3 weights with BF16
+/// per-output-channel scales (compressed-tensors FP8_DYNAMIC).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ExpertFormat {
+    #[default]
+    Bf16,
+    Fp8W8a16,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GdnConfig {
     pub key_heads: u32,
@@ -56,6 +64,8 @@ pub struct ModelSpec {
     pub rope_theta: f32,
     pub rotary_dim: u32,
     pub linear_format: LinearFormat,
+    #[serde(default)]
+    pub expert_format: ExpertFormat,
     pub eos: Vec<u32>,
     pub layers: Vec<LayerPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,6 +337,125 @@ impl LinearFormat {
         }
         equal(quant, "weight_block_size", serde_json::json!([128, 128]))?;
         Ok(Self::Fp8E4m3Block128)
+    }
+}
+impl ExpertFormat {
+    /// Parses the published compressed-tensors FP8_DYNAMIC form; a partial or unknown config errors.
+    fn read(root: &Value) -> Result<Self> {
+        let Some(quant) = root
+            .get("quantization_config")
+            .filter(|value| !value.is_null())
+        else {
+            return Ok(Self::Bf16);
+        };
+        for (key, value) in [
+            ("quant_method", "compressed-tensors"),
+            ("format", "float-quantized"),
+            ("quantization_status", "compressed"),
+        ] {
+            equal(quant, key, value.into())?;
+        }
+        for key in ["global_compression_ratio", "kv_cache_scheme"] {
+            ensure!(
+                quant.get(key).is_none_or(Value::is_null),
+                "unsupported quantization {key}: {:?}",
+                quant.get(key)
+            );
+        }
+        for key in ["sparsity_config", "transform_config"] {
+            ensure!(
+                quant
+                    .get(key)
+                    .is_none_or(|value| value == &serde_json::json!({})),
+                "unsupported quantization {key}: {:?}",
+                quant.get(key)
+            );
+        }
+        ensure!(
+            quant
+                .get("version")
+                .and_then(Value::as_str)
+                .is_some_and(|version| !version.is_empty()),
+            "quantization version missing"
+        );
+        ensure!(
+            quant
+                .get("ignore")
+                .and_then(Value::as_array)
+                .is_some_and(|ignore| !ignore.is_empty()),
+            "quantization ignore list missing"
+        );
+        let groups = quant
+            .get("config_groups")
+            .and_then(Value::as_object)
+            .context("quantization config_groups missing")?;
+        ensure!(
+            groups.len() == 1,
+            "quantization expects one config group, got {}",
+            groups.len()
+        );
+        let group = groups.values().next().context("empty quantization group")?;
+        equal(group, "format", "float-quantized".into())?;
+        ensure!(
+            group.get("output_activations").is_none_or(Value::is_null),
+            "unsupported quantization output_activations"
+        );
+        equal(group, "targets", serde_json::json!(["Linear"]))?;
+        let weights = group
+            .get("weights")
+            .context("quantization weights missing")?;
+        equal(weights, "num_bits", 8.into())?;
+        equal(weights, "type", "float".into())?;
+        equal(weights, "strategy", "channel".into())?;
+        equal(weights, "symmetric", true.into())?;
+        equal(weights, "dynamic", false.into())?;
+        equal(weights, "observer", "memoryless_minmax".into())?;
+        for key in [
+            "actorder",
+            "block_structure",
+            "group_size",
+            "scale_dtype",
+            "zp_dtype",
+        ] {
+            ensure!(
+                weights.get(key).is_none_or(Value::is_null),
+                "unsupported quantization weights {key}"
+            );
+        }
+        ensure!(
+            weights
+                .get("observer_kwargs")
+                .is_none_or(|value| value == &serde_json::json!({})),
+            "unsupported quantization weights observer_kwargs"
+        );
+        let activations = group
+            .get("input_activations")
+            .context("quantization input_activations missing")?;
+        equal(activations, "num_bits", 8.into())?;
+        equal(activations, "type", "float".into())?;
+        equal(activations, "strategy", "token".into())?;
+        equal(activations, "symmetric", true.into())?;
+        equal(activations, "dynamic", true.into())?;
+        for key in [
+            "actorder",
+            "block_structure",
+            "group_size",
+            "observer",
+            "scale_dtype",
+            "zp_dtype",
+        ] {
+            ensure!(
+                activations.get(key).is_none_or(Value::is_null),
+                "unsupported quantization input_activations {key}"
+            );
+        }
+        ensure!(
+            activations
+                .get("observer_kwargs")
+                .is_none_or(|value| value == &serde_json::json!({})),
+            "unsupported quantization input_activations observer_kwargs"
+        );
+        Ok(Self::Fp8W8a16)
     }
 }
 fn eos(v: &Value, vocab: u32) -> Result<Vec<u32>> {
@@ -601,6 +730,7 @@ impl ModelSpec {
             rope_theta: c.rope_theta,
             rotary_dim: u(c.head_dim)?,
             linear_format: LinearFormat::Bf16,
+            expert_format: ExpertFormat::Bf16,
             eos: c.eos_token_id.clone(),
             vision: None,
             moe: None,
@@ -630,6 +760,7 @@ impl ModelSpec {
             generation,
             VisionConfig::from_root(root)?,
             LinearFormat::read(root)?,
+            ExpertFormat::Bf16,
         )
     }
     pub fn minicpm(root: &Value, generation: &Value) -> Result<Self> {
@@ -653,7 +784,8 @@ impl ModelSpec {
             t,
             generation,
             VisionConfig::from_root(root)?,
-            LinearFormat::read(root)?,
+            LinearFormat::Bf16,
+            ExpertFormat::read(root)?,
         )
     }
     fn from_text(
@@ -663,6 +795,7 @@ impl ModelSpec {
         generation: &Value,
         vision: Option<VisionConfig>,
         linear_format: LinearFormat,
+        expert_format: ExpertFormat,
     ) -> Result<Self> {
         let eos_value = generation
             .get("eos_token_id")
@@ -684,6 +817,7 @@ impl ModelSpec {
             rope_theta: text.rope_theta,
             rotary_dim: text.rotary_dim,
             linear_format,
+            expert_format,
             eos: eos(eos_value, text.vocab)?,
             layers: text.layers,
             moe: text.moe,

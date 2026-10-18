@@ -27,6 +27,7 @@ pub struct SpanPlan {
     waves: u32,
     streamed_bytes: u64,
     geometry: ExpertGeometry,
+    slot_bytes: u64,
     staging_slots: u32,
     workers: u32,
     resident: Vec<u32>,
@@ -38,7 +39,13 @@ pub struct SpanPlan {
 impl SpanPlan {
     /// Setup-time allocation for one geometry's experts and `staging_slots`-expert cohorts;
     /// `workers` is the service table's selected worker count.
-    pub fn new(geometry: &ExpertGeometry, staging_slots: u32, workers: u32) -> Result<Self> {
+    pub fn new(
+        geometry: &ExpertGeometry,
+        slot_bytes: u64,
+        staging_slots: u32,
+        workers: u32,
+    ) -> Result<Self> {
+        ensure!(slot_bytes > 0, "zero expert slot bytes");
         ensure!(staging_slots > 0, "zero prefill staging slots");
         ensure!(workers > 0, "zero service workers");
         let experts = geometry.experts as usize;
@@ -48,6 +55,7 @@ impl SpanPlan {
             waves: 0,
             streamed_bytes: 0,
             geometry: *geometry,
+            slot_bytes,
             staging_slots,
             workers,
             resident: Vec::with_capacity(experts),
@@ -90,7 +98,7 @@ impl SpanPlan {
             "invalid H2D rate {}",
             rates.h2d_bytes_per_second
         );
-        let slot_bytes = geometry.slot_bytes()?;
+        let slot_bytes = self.slot_bytes;
         let copy_seconds = slot_bytes as f64 / rates.h2d_bytes_per_second;
         let workers = self.workers;
         let max_rows = rates.service.max_rows();
@@ -761,7 +769,17 @@ mod tests {
         staging_slots: u32,
         rates: &SpanRates<'_>,
     ) -> Result<SpanPlan> {
-        SpanPlan::new(geometry, staging_slots, rates.service.worker_count()?)
+        let slot_bytes = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            geometry,
+        )?
+        .slot_bytes();
+        SpanPlan::new(
+            geometry,
+            slot_bytes,
+            staging_slots,
+            rates.service.worker_count()?,
+        )
     }
 
     #[test]

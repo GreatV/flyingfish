@@ -260,7 +260,7 @@ impl Residency {
             initial.len() == geometry.layers as usize,
             "initial set layer count mismatch"
         );
-        let slot_bytes = geometry.slot_bytes()?;
+        let slot_bytes = capacity.slot_bytes();
         let cap = admission.hard_cap(slot_bytes)?;
         let reserve = if capacity.host_blocks > 0 {
             cap.max(1)
@@ -714,7 +714,7 @@ impl Residency {
     /// Every pair's block needs are validated before the plan is applied.
     pub fn finish_token(&mut self) -> Result<&[Published]> {
         ensure!(self.token_open, "no token open");
-        let cap = self.admission.hard_cap(self.geometry.slot_bytes()?)?;
+        let cap = self.admission.hard_cap(self.capacity.slot_bytes())?;
         self.pending.clear();
         for layer in 0..self.geometry.layers {
             let l = layer as usize;
@@ -1109,8 +1109,19 @@ mod tests {
             bytes = bytes.max(entry.data_offsets[1] as usize);
         }
         std::fs::write(dir.path().join("shard-0.safetensors"), pattern(bytes))?;
-        let catalogue = ExpertCatalogue::from_manifest(&manifest, geometry)?;
+        let catalogue = ExpertCatalogue::from_manifest(
+            &manifest,
+            geometry,
+            crate::model_spec::ExpertFormat::Bf16,
+        )?;
         Ok((dir, catalogue))
+    }
+
+    fn bf16_layout(geometry: &ExpertGeometry) -> Result<crate::experts::catalogue::ExpertLayout> {
+        crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            geometry,
+        )
     }
 
     fn slots(geometry: ExpertGeometry) -> Result<u32> {
@@ -1127,13 +1138,14 @@ mod tests {
     ) -> Result<(Residency, LoadReport, Arc<HostBlocks>, TempDir)> {
         let reserves = reserves();
         let service = service();
-        let slot = geometry.slot_bytes()?;
+        let layout = bf16_layout(&geometry)?;
+        let slot = layout.slot_bytes();
         let inputs = PlanInputs {
             geometry,
-            device_free_bytes: reserves.persistent_bytes(&geometry)?
+            layout,
+            device_free_bytes: reserves.persistent_bytes(slot)?
                 + u64::from(slots(geometry)?) * slot,
-            host_available_bytes: reserves.host_bytes(&geometry)?
-                + u64::from(host_blocks + cap) * slot,
+            host_available_bytes: reserves.host_bytes(slot)? + u64::from(host_blocks + cap) * slot,
             h2d_bytes_per_second: 1e9,
             d2h_bytes_per_second: 1e9,
             copy_engines: 2,
@@ -1212,7 +1224,7 @@ mod tests {
     #[test]
     fn load_fills_the_host_tier_interleaved_from_the_native_ranges() -> Result<()> {
         let (residency, report, host, _dir) = build_full(geometry(), 3, 2)?;
-        let slot = geometry().slot_bytes()?;
+        let slot = bf16_layout(&geometry())?.slot_bytes();
         assert_eq!(report.host_bytes, 3 * slot);
         assert!(report.seconds.is_finite() && report.seconds >= 0.0);
         for layer in 0..2u32 {
@@ -1649,15 +1661,16 @@ mod tests {
         let geometry = geometry();
         let reserves = reserves();
         let service = service();
-        let slot = geometry.slot_bytes()?;
+        let slot = bf16_layout(&geometry)?.slot_bytes();
         let routed = u64::from(geometry.layers)
             .checked_mul(u64::from(geometry.experts))
             .context("routed count overflow")?;
         let inputs = PlanInputs {
             geometry,
-            device_free_bytes: reserves.persistent_bytes(&geometry)?
+            layout: bf16_layout(&geometry)?,
+            device_free_bytes: reserves.persistent_bytes(slot)?
                 + routed.checked_mul(slot).context("device extent overflow")?,
-            host_available_bytes: reserves.host_bytes(&geometry)? + 2 * slot,
+            host_available_bytes: reserves.host_bytes(slot)? + 2 * slot,
             h2d_bytes_per_second: 1e9,
             d2h_bytes_per_second: 1e9,
             copy_engines: 2,
@@ -1704,11 +1717,12 @@ mod tests {
         let geometry = geometry();
         let reserves = reserves();
         let service = service();
-        let slot = geometry.slot_bytes()?;
+        let slot = bf16_layout(&geometry)?.slot_bytes();
         let inputs = PlanInputs {
             geometry,
-            device_free_bytes: reserves.persistent_bytes(&geometry)? + 4 * slot,
-            host_available_bytes: reserves.host_bytes(&geometry)? + 3 * slot,
+            layout: bf16_layout(&geometry)?,
+            device_free_bytes: reserves.persistent_bytes(slot)? + 4 * slot,
+            host_available_bytes: reserves.host_bytes(slot)? + 3 * slot,
             h2d_bytes_per_second: 1e9,
             d2h_bytes_per_second: 1e9,
             copy_engines: 2,
