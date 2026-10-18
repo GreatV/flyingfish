@@ -1,6 +1,86 @@
 use super::*;
 
 #[test]
+fn llama_rejects_unsupported_draft_blocks_before_device_setup() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "flyingfish-draft-block-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root)?;
+    let result = (|| -> Result<()> {
+        let target = root.join("target");
+        let draft = root.join("draft");
+        std::fs::create_dir(&target)?;
+        std::fs::create_dir(&draft)?;
+        let value = serde_json::json!({
+            "model_type":"llama", "hidden_size":2048, "intermediate_size":6144,
+            "num_hidden_layers":42, "num_attention_heads":16, "num_key_value_heads":2,
+            "head_dim":128, "vocab_size":130560, "max_position_embeddings":131072,
+            "rms_norm_eps":1e-6, "rope_theta":5000000.0, "hidden_act":"silu",
+            "tie_word_embeddings":false, "torch_dtype":"bfloat16", "eos_token_id":[2]
+        });
+        std::fs::write(target.join("config.json"), serde_json::to_vec(&value)?)?;
+        let target_config: Config = serde_json::from_value(value)?;
+        let mut value = serde_json::json!({
+            "model_type":"qwen3", "architectures":["Qwen3DSparkModel"], "dtype":"bfloat16",
+            "hidden_size":2048, "intermediate_size":6144, "num_hidden_layers":5,
+            "num_attention_heads":16, "num_key_value_heads":2, "head_dim":128,
+            "vocab_size":130560, "draft_vocab_size":130560, "rms_norm_eps":1e-6,
+            "block_size":7, "mask_token_id":75982, "target_layer_ids":[1,10,20,30,39],
+            "num_target_layers":42, "markov_rank":256, "markov_head_type":"vanilla",
+            "projector_type":"dspark", "rope_parameters":{"rope_theta":5000000.0,"rope_type":"default"}
+        });
+        let runtime = root.join("blocked-runtime");
+        std::fs::write(&runtime, b"not a directory")?;
+        let mut rejected = 0;
+        for block in 1..=8 {
+            value["block_size"] = block.into();
+            std::fs::write(draft.join("config.json"), serde_json::to_vec(&value)?)?;
+            assert_eq!(
+                crate::dspark::DraftConfig::read(&draft, &target_config)?.block_size,
+                block
+            );
+            if block == 7 {
+                continue;
+            }
+            for budget in [SpecBudget::Chain, SpecBudget::Tree16] {
+                for write in [false, true] {
+                    let settings = Settings {
+                        tree_builder: TreeBuilder::Waves,
+                        spec_budget: budget,
+                        spec_graph: true,
+                        draft_model: Some(draft.clone()),
+                        runtime_dir: Some(runtime.clone()),
+                        prefix_cache: false,
+                        kv_format: crate::kv::KvFormat::Bf16,
+                    };
+                    let error = if write {
+                        Engine::calibrate(&target, 0, 32, Some(16), settings).err()
+                    } else {
+                        Engine::load(&target, 0, 32, Some(16), settings).err()
+                    }
+                    .context("unsupported draft block reached device setup")?;
+                    ensure!(
+                        error
+                            .to_string()
+                            .starts_with("unsupported Llama DSpark block_size="),
+                        "draft block {block} reached runtime/device setup: {error:#}"
+                    );
+                    rejected += 1;
+                }
+            }
+        }
+        println!("PR61_DRAFT_BLOCK pre_device_rejections={rejected} block7_config_valid=true PASS");
+        Ok(())
+    })();
+    std::fs::remove_dir_all(&root)?;
+    result
+}
+
+#[test]
 fn load_dispatch_selects_shared_hybrid_and_llama() -> Result<()> {
     assert_eq!(
         super::load_dispatch(crate::model_spec::Architecture::Qwen35Text)?,

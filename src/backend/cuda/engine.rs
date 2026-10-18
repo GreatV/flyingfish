@@ -718,6 +718,14 @@ impl Engine {
         command.push_str(" calibrate");
         let closure = Rc::new(super::closure::Closure::new(write, command));
         let config = Config::read(dir)?;
+        if let Some(path) = &draft_path {
+            let draft = crate::dspark::DraftConfig::read(path, &config)?;
+            ensure!(
+                draft.block_size == 7,
+                "unsupported Llama DSpark block_size={}; proposal/verification requires 7 proposals and 8 verify rows",
+                draft.block_size
+            );
+        }
         let model_spec = crate::model_spec::ModelSpec::from_llama(&config)?;
         ensure!(
             capacity > 0

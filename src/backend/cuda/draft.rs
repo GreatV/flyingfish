@@ -311,6 +311,14 @@ impl Draft {
             let kv = shape.output;
             let weight = self.weights.layers[0].block.qkv.slice(h * h..(h + kv) * h);
             blas.calibrate_shape(&weight, input, shape)
+        } else if shape.input == self.config.hidden_size
+            && shape.output == 2 * self.config.intermediate_size
+        {
+            blas.calibrate_shape(&self.weights.layers[0].block.gu, input, shape)
+        } else if shape.input == self.config.intermediate_size
+            && shape.output == self.config.hidden_size
+        {
+            blas.calibrate_shape(&self.weights.layers[0].block.down, input, shape)
         } else {
             ensure!(
                 shape.rows == 1
