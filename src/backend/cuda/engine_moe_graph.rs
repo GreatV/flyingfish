@@ -208,7 +208,6 @@ impl Engine {
                 })?;
                 graph.launch()?;
                 stream.synchronize()?;
-                self.check_logits()?;
                 return Ok(Some(graph));
             }
             for layer in 0..self.model_spec.layers.len() {
@@ -243,9 +242,16 @@ impl Engine {
                 decode.segments[layer].join.launch()?;
             }
             stream.synchronize()?;
-            self.check_logits()?;
             Ok(None)
         })();
+        let result = result.and_then(|graph| {
+            let logits = stream.clone_dtoh(&self.work.logits.slice(..self.config.vocab_size))?;
+            ensure!(
+                logits.iter().all(|value| value.to_f32().is_finite()),
+                "nonfinite MoE capture logits"
+            );
+            Ok(graph)
+        });
         let restored = (|| -> Result<()> {
             checkpoint.restore(&mut self.state, &mut self.work.token, &stream)?;
             stream.memcpy_htod(&saved_position, &mut self.work.position)?;
