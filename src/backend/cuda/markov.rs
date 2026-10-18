@@ -5,6 +5,45 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKern
 use half::bf16;
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(i32)]
+pub enum ScoreRounding {
+    Bf16 = 0,
+    F32 = 1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MarkovShape {
+    pub rows: usize,
+    pub vocab: usize,
+    pub rank: usize,
+    pub rounding: ScoreRounding,
+}
+
+impl MarkovShape {
+    pub(super) fn validate(self) -> Result<()> {
+        ensure!(
+            (1..=64).contains(&self.rows),
+            "Markov block rows outside1..64"
+        );
+        ensure!(
+            self.vocab >= 4 && self.vocab <= i32::MAX as usize,
+            "Markov vocabulary outside kernel range"
+        );
+        ensure!(self.rank == 256, "Markov rank must be256");
+        ensure!(
+            self.rows.checked_mul(self.vocab).is_some()
+                && self.vocab.checked_mul(self.rank).is_some(),
+            "Markov shape overflow"
+        );
+        Ok(())
+    }
+
+    pub(super) fn tiles(self) -> usize {
+        self.vocab.div_ceil(256)
+    }
+}
+
 pub struct Markov {
     stream: Arc<CudaStream>,
     first: Vec<CudaFunction>,
@@ -14,6 +53,7 @@ pub struct Markov {
     partial_top: CudaSlice<f32>,
     partial_lse: CudaSlice<f32>,
     output: CudaSlice<u32>,
+    shape: MarkovShape,
 }
 
 impl Markov {
@@ -22,14 +62,16 @@ impl Markov {
         ops: &super::ops::Ops,
         dir: &std::path::Path,
         closure: &super::closure::Closure,
+        shape: MarkovShape,
     ) -> Result<Self> {
+        shape.validate()?;
         let module = cubin::module(&d.ctx, "markov")?;
         let s = &d.stream;
         ensure!(
             d.info.shared_bytes >= 32768,
             "Markov v2 kernels require 32768 bytes static shared memory"
         );
-        let calibration = super::markov_calibrate::load(d, ops, dir, closure)?;
+        let calibration = super::markov_calibrate::load(d, ops, dir, closure, shape)?;
         let (p1, p8) = (calibration.choice(1)?, calibration.choice(8)?);
         let first = [p1.symbol(1), p8.symbol(8), "markov2_top4_phase1_p64"]
             .iter()
@@ -50,9 +92,10 @@ impl Markov {
             second: module.load_function("markov2_top4_phase2")?,
             tokens: s.alloc_zeros(64)?,
             rows: s.alloc_zeros(64)?,
-            partial_top: s.alloc_zeros(510 * 64 * 8)?,
-            partial_lse: s.alloc_zeros(510 * 64 * 2)?,
+            partial_top: s.alloc_zeros(shape.tiles() * 64 * 8)?,
+            partial_lse: s.alloc_zeros(shape.tiles() * 64 * 2)?,
             output: s.alloc_zeros(64 * 9)?,
+            shape,
         })
     }
 
@@ -63,7 +106,7 @@ impl Markov {
         w2: &CudaSlice<bf16>,
         requests: &[(u8, u32)],
     ) -> Result<Vec<Top4>> {
-        check_requests(requests)?;
+        check_requests(requests, self.shape)?;
         let mut result = Vec::with_capacity(requests.len());
         for chunk in requests.chunks(64) {
             result.extend(self.run(base, w1, w2, chunk)?);
@@ -80,9 +123,11 @@ impl Markov {
     ) -> Result<Vec<Top4>> {
         let p = requests.len();
         ensure!(p > 0 && p <= 64, "Markov batch must have1..64 requests");
-        check_requests(requests)?;
+        check_requests(requests, self.shape)?;
         ensure!(
-            base.len() == 7 * 130560 && w1.len() == 130560 * 256 && w2.len() == 130560 * 256,
+            base.len() == self.shape.rows * self.shape.vocab
+                && w1.len() == self.shape.vocab * self.shape.rank
+                && w2.len() == self.shape.vocab * self.shape.rank,
             "Markov native weight/base layout mismatch"
         );
         let (index, pt) = if p == 1 {
@@ -110,6 +155,7 @@ impl Markov {
                     partial_top: &self.partial_top,
                     partial_lse: &self.partial_lse,
                     p,
+                    shape: self.shape,
                 },
             )?;
             let mut output = self.output.slice_mut(..p * 9);
@@ -121,7 +167,7 @@ impl Markov {
                 .arg(&mut top)
                 .arg(&mut logp)
                 .arg(&mut lse)
-                .arg(&130560i32)
+                .arg(&(self.shape.vocab as i32))
                 .arg(&(p as i32))
                 .arg(&pt)
                 .launch(LaunchConfig {
@@ -138,7 +184,7 @@ impl Markov {
                 tokens: std::array::from_fn(|j| output[i * 4 + j]),
                 logp: std::array::from_fn(|j| f32::from_bits(output[p * 4 + i * 4 + j])),
                 lse: f32::from_bits(output[p * 8 + i]),
-                vocab: 130560,
+                vocab: self.shape.vocab,
             })
             .collect::<Vec<_>>();
         for (i, top) in top4.iter().enumerate() {
@@ -166,6 +212,7 @@ pub(super) struct Phase1State<'a> {
     pub partial_top: &'a CudaSlice<f32>,
     pub partial_lse: &'a CudaSlice<f32>,
     pub p: usize,
+    pub shape: MarkovShape,
 }
 
 pub(super) unsafe fn phase1_launch(
@@ -182,11 +229,12 @@ pub(super) unsafe fn phase1_launch(
             .arg(state.rows)
             .arg(state.partial_top)
             .arg(state.partial_lse)
-            .arg(&130560i32)
-            .arg(&256i32)
+            .arg(&(state.shape.vocab as i32))
+            .arg(&(state.shape.rank as i32))
             .arg(&(state.p as i32))
+            .arg(&(state.shape.rounding as i32))
             .launch(LaunchConfig {
-                grid_dim: (510, 1, 1),
+                grid_dim: (state.shape.tiles() as u32, 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             })?;
@@ -208,11 +256,11 @@ pub(super) fn phase1_bits(
     Ok((top, lse))
 }
 
-fn check_requests(requests: &[(u8, u32)]) -> Result<()> {
+fn check_requests(requests: &[(u8, u32)], shape: MarkovShape) -> Result<()> {
     ensure!(
         requests
             .iter()
-            .all(|&(row, token)| row < 7 && token < 130560),
+            .all(|&(row, token)| usize::from(row) < shape.rows && (token as usize) < shape.vocab),
         "Markov request B row/token is invalid"
     );
     Ok(())

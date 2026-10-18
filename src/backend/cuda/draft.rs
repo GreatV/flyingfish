@@ -128,6 +128,7 @@ struct Kv {
 
 pub struct Draft {
     markov: Option<super::markov::Markov>,
+    score_rounding: super::markov::ScoreRounding,
     pub config: DraftConfig,
     weights: DraftWeights,
     kv: Vec<Kv>,
@@ -251,6 +252,7 @@ impl Draft {
         capacity: usize,
         rows: usize,
         blas: &mut Blas,
+        score_rounding: super::markov::ScoreRounding,
     ) -> Result<Self> {
         let config = DraftConfig::read(path, c)?;
         ensure!(rows >= 8, "DSpark workspace needs at least eight rows");
@@ -287,6 +289,7 @@ impl Draft {
             super::cubin::module(&d.ctx, "rope")?.load_function("draft_qknorm_rope_kv")?;
         Ok(Self {
             markov: None,
+            score_rounding,
             config,
             weights,
             kv: caches,
@@ -627,9 +630,24 @@ impl Draft {
         closure: &super::closure::Closure,
     ) -> Result<()> {
         if self.markov.is_none() {
-            self.markov = Some(super::markov::Markov::new(d, ops, dir, closure)?);
+            self.markov = Some(super::markov::Markov::new(
+                d,
+                ops,
+                dir,
+                closure,
+                self.markov_shape(),
+            )?);
         }
         Ok(())
+    }
+
+    pub(super) fn markov_shape(&self) -> super::markov::MarkovShape {
+        super::markov::MarkovShape {
+            rows: self.config.block_size,
+            vocab: self.config.vocab_size,
+            rank: self.config.markov_rank,
+            rounding: self.score_rounding,
+        }
     }
 
     pub fn distributions_batch(

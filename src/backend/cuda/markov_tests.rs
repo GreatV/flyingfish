@@ -1,4 +1,11 @@
-use super::{Markov, check_requests};
+use super::{Markov, MarkovShape, ScoreRounding, check_requests};
+
+const SHAPE: MarkovShape = MarkovShape {
+    rows: 7,
+    vocab: 130560,
+    rank: 256,
+    rounding: ScoreRounding::Bf16,
+};
 use crate::backend::cuda::{Device, ops::Ops};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaSlice, PushKernelArg};
@@ -195,10 +202,10 @@ fn requests(p: usize, seed: usize) -> Vec<(u8, u32)> {
 
 #[test]
 fn request_bounds() -> Result<()> {
-    check_requests(&[])?;
-    check_requests(&[(0, 0), (6, 130559)])?;
-    assert!(check_requests(&[(7, 0)]).is_err());
-    assert!(check_requests(&[(0, 130560)]).is_err());
+    check_requests(&[], SHAPE)?;
+    check_requests(&[(0, 0), (6, 130559)], SHAPE)?;
+    assert!(check_requests(&[(7, 0)], SHAPE).is_err());
+    assert!(check_requests(&[(0, 130560)], SHAPE).is_err());
     Ok(())
 }
 
@@ -215,7 +222,7 @@ fn batch_matches_single() -> Result<()> {
         true,
         "explicit Markov test calibration".into(),
     );
-    let mut markov = Markov::new(&d, &ops, &runtime, &calibration)?;
+    let mut markov = Markov::new(&d, &ops, &runtime, &calibration, SHAPE)?;
     let mut compared = 0;
     let mut differences = Differences::default();
     for (seed, file) in ["r0008", "r0042", "r0089", "r0140"].iter().enumerate() {
@@ -295,7 +302,7 @@ fn top4_matches_reference() -> Result<()> {
         true,
         "explicit Markov test calibration".into(),
     );
-    let mut markov = Markov::new(&d, &ops, &runtime, &calibration)?;
+    let mut markov = Markov::new(&d, &ops, &runtime, &calibration, SHAPE)?;
     let mut reference = reference::Reference::new(&d)?;
     let mut compared = 0;
     let mut differences = Differences::default();
@@ -381,7 +388,7 @@ fn batch_wall() -> Result<()> {
         true,
         "explicit Markov test calibration".into(),
     );
-    let mut markov = Markov::new(&d, &ops, &runtime, &calibration)?;
+    let mut markov = Markov::new(&d, &ops, &runtime, &calibration, SHAPE)?;
     let count = d.info.l2_bytes.max(1024 * 1024);
     let mut flush = d.stream.alloc_zeros::<bf16>(count)?;
     let zeros = d.stream.alloc_zeros::<bf16>(count)?;

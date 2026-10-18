@@ -6,6 +6,7 @@ use std::{
 
 use super::{
     Device, cubin,
+    markov::MarkovShape,
     ops::{Ops, grid},
 };
 use crate::backend::setup::CacheKey;
@@ -60,6 +61,7 @@ struct Cache {
     schema: u32,
     choices: Vec<Choice>,
     wall_ms: f64,
+    shape: MarkovShape,
 }
 
 pub(super) struct Calibrated {
@@ -88,9 +90,9 @@ impl Calibrated {
     }
 }
 
-fn check(cache: &Cache, key: &CacheKey) -> Result<()> {
+fn check(cache: &Cache, key: &CacheKey, shape: MarkovShape) -> Result<()> {
     ensure!(
-        cache.schema == 1 && cache.key == *key,
+        cache.schema == 2 && cache.key == *key && cache.shape == shape,
         "markov phase-1 cache identity mismatch"
     );
     ensure!(
@@ -141,10 +143,16 @@ fn check(cache: &Cache, key: &CacheKey) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn cache_path(dir: &Path, key: &CacheKey) -> PathBuf {
+pub(super) fn cache_path(dir: &Path, key: &CacheKey, shape: MarkovShape) -> PathBuf {
     dir.join(format!(
-        "markov-phase1-v1-{}-{}-{}.json",
-        key.device_uuid, key.driver_version, key.binary_version
+        "markov-phase1-v2-{}-{}-{}-{}-{}-{}-{}.json",
+        key.device_uuid,
+        key.driver_version,
+        key.binary_version,
+        shape.rows,
+        shape.vocab,
+        shape.rank,
+        shape.rounding as i32
     ))
 }
 
@@ -153,20 +161,22 @@ pub(super) fn load(
     ops: &Ops,
     dir: &Path,
     closure: &super::closure::Closure,
+    shape: MarkovShape,
 ) -> Result<Calibrated> {
+    shape.validate()?;
     let key = super::calibrate::key(d)?;
-    let path = cache_path(dir, &key);
+    let path = cache_path(dir, &key, shape);
     let (cache, hit) = if closure.access(&path)? {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)?;
-        check(&cache, &key)?;
+        check(&cache, &key, shape)?;
         (cache, true)
     } else {
         eprintln!(
             "{}",
-            serde_json::json!({"markov_phase1_calibration":{"schema":1,"buckets":BUCKETS,"path":path,"cached":false,"action":"measure both bodies"}})
+            serde_json::json!({"markov_phase1_calibration":{"schema":2,"shape":shape,"buckets":BUCKETS,"path":path,"cached":false,"action":"measure both bodies"}})
         );
-        let cache = measure(d, ops, key.clone(), closure)?;
-        check(&cache, &key)?;
+        let cache = measure(d, ops, key.clone(), closure, shape)?;
+        check(&cache, &key, shape)?;
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -194,14 +204,15 @@ fn measure(
     ops: &Ops,
     key: CacheKey,
     closure: &super::closure::Closure,
+    shape: MarkovShape,
 ) -> Result<Cache> {
     closure.measurement()?;
     let start = Instant::now();
     let s = &d.stream;
     let module = cubin::module(&d.ctx, "markov")?;
-    let base = s.clone_htod(&random(7 * 130560, 11))?;
-    let w1 = s.clone_htod(&random(130560 * 256, 12))?;
-    let w2 = s.clone_htod(&random(130560 * 256, 13))?;
+    let base = s.clone_htod(&random(shape.rows * shape.vocab, 11))?;
+    let w1 = s.clone_htod(&random(shape.vocab * shape.rank, 12))?;
+    let w2 = s.clone_htod(&random(shape.vocab * shape.rank, 13))?;
     let flush_n = d.info.l2_bytes.max(1024 * 1024);
     let mut flush = s.clone_htod(&random(flush_n, 14))?;
     let zero = s.alloc_zeros::<bf16>(flush_n)?;
@@ -213,12 +224,14 @@ fn measure(
     );
     let mut choices = Vec::new();
     for &p in &BUCKETS {
-        let tokens: Vec<u32> = (0..p as u32).map(|i| 1000 + 7 * i).collect();
-        let rows: Vec<i32> = (0..p).map(|i| (i % 7) as i32).collect();
+        let tokens: Vec<u32> = (0..p)
+            .map(|i| ((1000 + 7 * i) % shape.vocab) as u32)
+            .collect();
+        let rows: Vec<i32> = (0..p).map(|i| (i % shape.rows) as i32).collect();
         let tokens = s.clone_htod(&tokens)?;
         let rows = s.clone_htod(&rows)?;
-        let partial_top = s.alloc_zeros::<f32>(510 * 64 * 8)?;
-        let partial_lse = s.alloc_zeros::<f32>(510 * 64 * 2)?;
+        let partial_top = s.alloc_zeros::<f32>(shape.tiles() * 64 * 8)?;
+        let partial_lse = s.alloc_zeros::<f32>(shape.tiles() * 64 * 2)?;
         let mut functions = Vec::new();
         for body in [Body::F1, Body::PreF1] {
             functions.push((body, module.load_function(body.symbol(p))?));
@@ -232,6 +245,7 @@ fn measure(
             partial_top: &partial_top,
             partial_lse: &partial_lse,
             p,
+            shape,
         };
         let reference = super::markov::phase1_bits(s, &functions[0].1, &state)?;
         let candidate = super::markov::phase1_bits(s, &functions[1].1, &state)?;
@@ -292,8 +306,9 @@ fn measure(
     }
     Ok(Cache {
         key,
-        schema: 1,
+        schema: 2,
         choices,
         wall_ms: start.elapsed().as_secs_f64() * 1000.0,
+        shape,
     })
 }

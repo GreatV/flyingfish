@@ -819,6 +819,7 @@ impl Engine {
                 engine.capacity,
                 engine.workspace_rows,
                 &mut engine.blas,
+                super::markov::ScoreRounding::Bf16,
             )?;
             engine.hidden_capture = Some(HiddenCapture::new(
                 &draft.config.target_layer_ids,
@@ -4083,7 +4084,15 @@ impl Engine {
             });
         }
         if budget.is_some_and(SpecBudget::is_tree) {
-            paths.push(super::markov_calibrate::cache_path(&self.runtime, &key));
+            paths.push(super::markov_calibrate::cache_path(
+                &self.runtime,
+                &key,
+                self.spec
+                    .as_ref()
+                    .context("tree draft missing")?
+                    .draft
+                    .markov_shape(),
+            ));
         }
         paths.push(profile.path(&self.runtime, &key)?);
         self.closure.preflight(&paths)?;

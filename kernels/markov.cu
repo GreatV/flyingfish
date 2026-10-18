@@ -4,7 +4,7 @@
 //
 // Semantics (two bf16 rounding points):
 //   bias[p][v] = bf16( fp32 dot( w2[v][0:256], w1[req_tok[p]][0:256] ) )
-//   s[p][v]    = __hadd(bias[p][v], B[req_row[p]][v])           (bf16 add)
+//   s[p][v]    = bias[p][v] + B[req_row[p]][v], BF16 or FP32 per caller binding
 //   score      = __bfloat162float(s)
 //   top-4[p]   = the 4 largest scores; strictly greater wins, tie -> smaller
 //                token id
@@ -20,7 +20,7 @@
 // score set; phase 2's merge order does not depend on PT.
 //
 // Inputs / outputs:
-//   B       bf16 [7][V] base logits rows; row per request from req_row
+//   B       bf16 [block_rows][V] base logits rows; row per request from req_row
 //   w1      bf16 [V][256] (markov_w1); the parent embedding is w1[parent]
 //   w2      bf16 [V][256] (markov_w2), row-major, 16B-aligned rows
 //   req_tok u32  [P] parent tokens (device)
@@ -31,7 +31,7 @@
 //
 // Two-phase structure (all smem static; dynamic smem = 0):
 //   phase 1 (markov2_top4_phase1_*p{1,8,64}): grid = dim3(NB), block = 256.
-//     Block blk owns vocab rows [blk*VT, +VT) (VT = 256, NB = V/VT = 510)
+//     Block blk owns vocab rows [blk*VT, +VT) (VT = 256, NB = ceil(V/VT))
 //     and writes, per act p < P, its local top-4 (4 (score, id) pairs) and
 //     its lse partial (m, l) to caller scratch. Slots p >= P are not written.
 //   phase 2 (markov2_top4_phase2): grid = dim3(P), block = 256. Reads exactly
@@ -46,9 +46,9 @@
 // Every needed scratch element is written by exactly one phase-1 block.
 //
 // Every entry point __trap()s on a wrong-shape launch:
-//   phase 1: V != 130560 || in != 256 || P < 1 || P > PT ||
-//            blockDim.x != 256 || gridDim.x != 510
-//   phase 2: V != 130560 || P < 1 || P > 64 || blockDim.x != 256
+//   phase 1: V < 4 || in != 256 || P < 1 || P > PT ||
+//            blockDim.x != 256 || gridDim.x != ceil(V/256)
+//   phase 2: V < 4 || P < 1 || P > 64 || blockDim.x != 256
 //
 // CUDA Graph: P and PT are fixed per capture; the request arrays and output
 // buffers are pointers fixed per capture whose contents change between
@@ -56,17 +56,21 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
-constexpr int MK2_VOCAB = 130560;
 constexpr int MK2_DIM   = 256;
 constexpr int MK2_VT    = 256;                  // vocab rows per phase-1 block
-constexpr int MK2_NB2   = MK2_VOCAB / MK2_VT;   // 510 phase-1 blocks
 constexpr int MK2_NT    = 256;                  // block size, both phases
 
 using bf16 = __nv_bfloat16;
 
+__device__ __forceinline__ float markov_score(float dot, bf16 base, int rounding) {
+  const bf16 bias = __float2bfloat16(dot);
+  return rounding == 0 ? __bfloat162float(__hadd(bias, base))
+                       : __bfloat162float(bias) + __bfloat162float(base);
+}
+
 #define MK2_GUARD_P1(PT) do {                                                 \
-  if (V != MK2_VOCAB || in != MK2_DIM || P < 1 || P > PT ||                  \
-      blockDim.x != MK2_NT || gridDim.x != MK2_NB2) __trap();                \
+  if (V < 4 || score_rounding < 0 || score_rounding > 1 || in != MK2_DIM || P < 1 || P > PT ||                  \
+      blockDim.x != MK2_NT || gridDim.x != (V + MK2_VT - 1) / MK2_VT) __trap();                \
 } while (0)
 
 // Test-only score dump: with -DMK2_DUMP_S and a non-null g_mk2_dump, every
@@ -76,7 +80,7 @@ __device__ float* g_mk2_dump;
 // The host installs g_mk2_dump by launching this kernel.
 extern "C" __global__ void mk2_set_dump(float* p) { g_mk2_dump = p; }
 #define MK2_DUMP_S_WRITE(act, v, s)                                          \
-  do { if (g_mk2_dump) g_mk2_dump[(size_t)(act) * MK2_VOCAB + (v)] = (s); } while (0)
+  do { if (g_mk2_dump) g_mk2_dump[(size_t)(act) * V + (v)] = (s); } while (0)
 #else
 #define MK2_DUMP_S_WRITE(act, v, s) ((void)0)
 #endif
@@ -212,7 +216,7 @@ __device__ __forceinline__ void markov2_p1_body64(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
-    float* __restrict__ scratch_lse, int P, bf16* __restrict__ w2sm) {
+    float* __restrict__ scratch_lse, int P, int V, int score_rounding, bf16* __restrict__ w2sm) {
   constexpr int PT = 64;
   constexpr int NBUF = 4;                           // w2 chunk buffers
   constexpr int CH = 16;                            // rows per chunk
@@ -226,8 +230,8 @@ __device__ __forceinline__ void markov2_p1_body64(
   const int act0 = warp * 8 + c0, act1 = act0 + 1;
   const int rr0 = (act0 < P) ? req_row[act0] : 0;
   const int rr1 = (act1 < P) ? req_row[act1] : 0;
-  const bf16* Brow0 = B + (size_t)rr0 * MK2_VOCAB;
-  const bf16* Brow1 = B + (size_t)rr1 * MK2_VOCAB;
+  const bf16* Brow0 = B + (size_t)rr0 * V;
+  const bf16* Brow1 = B + (size_t)rr1 * V;
 
   // Hoist this warp's 16 k16 B-fragments (acts [w*8, w*8+8)) from gmem:
   // b0 = e[act = w*8 + lane/4][kk*16 + (lane%4)*2 +{0,1}], b1 = k + 8.
@@ -251,7 +255,7 @@ __device__ __forceinline__ void markov2_p1_body64(
     for (int rep = 0; rep < 2; ++rep) {
       const int idx = tid + rep * MK2_NT;
       const int r = idx >> 5, seg = idx & 31;
-      cp16(d + r * MK2_DIM + swz(seg, r) * 8, g + r * MK2_DIM + seg * 8, 16);
+      cp16(d + r * MK2_DIM + swz(seg, r) * 8, g + r * MK2_DIM + seg * 8, vBlk0 + c * CH + r < V ? 16 : 0);
     }
   };
 
@@ -285,25 +289,25 @@ __device__ __forceinline__ void markov2_p1_body64(
 
     // Two bf16 rounding points, then running top-4 / lse per act column.
     const int vg = vBlk0 + c * CH + r0;
-    if (act0 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[0]), Brow0[vg]);
-      st.add<0>(__bfloat162float(sv), (unsigned)vg);
-      MK2_DUMP_S_WRITE(act0, vg, __bfloat162float(sv));
+    if (act0 < P && vg < V) {
+      const float sv = markov_score(acc[0], Brow0[vg], score_rounding);
+      st.add<0>(sv, (unsigned)vg);
+      MK2_DUMP_S_WRITE(act0, vg, sv);
     }
-    if (act1 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[1]), Brow1[vg]);
-      st.add<1>(__bfloat162float(sv), (unsigned)vg);
-      MK2_DUMP_S_WRITE(act1, vg, __bfloat162float(sv));
+    if (act1 < P && vg < V) {
+      const float sv = markov_score(acc[1], Brow1[vg], score_rounding);
+      st.add<1>(sv, (unsigned)vg);
+      MK2_DUMP_S_WRITE(act1, vg, sv);
     }
-    if (act0 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[2]), Brow0[vg + 8]);
-      st.add<0>(__bfloat162float(sv), (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act0, vg + 8, __bfloat162float(sv));
+    if (act0 < P && vg + 8 < V) {
+      const float sv = markov_score(acc[2], Brow0[vg + 8], score_rounding);
+      st.add<0>(sv, (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act0, vg + 8, sv);
     }
-    if (act1 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[3]), Brow1[vg + 8]);
-      st.add<1>(__bfloat162float(sv), (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act1, vg + 8, __bfloat162float(sv));
+    if (act1 < P && vg + 8 < V) {
+      const float sv = markov_score(acc[3], Brow1[vg + 8], score_rounding);
+      st.add<1>(sv, (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act1, vg + 8, sv);
     }
     if (c & 1) {                          // 32-v group complete
       st.merge_lanes_ml();
@@ -345,11 +349,11 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 3) markov2_top4_phase1_p64(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
-    float* __restrict__ scratch_lse, int V, int in, int P) {
+    float* __restrict__ scratch_lse, int V, int in, int P, int score_rounding) {
   MK2_GUARD_P1(64);
   __shared__ __align__(16) bf16 w2sm[4 * 16 * MK2_DIM];   // 32768 B swizzled
   markov2_p1_body64(B, w1c, w2c, req_tok, req_row, scratch_top4, scratch_lse,
-                    P, w2sm);
+                    P, V, score_rounding, w2sm);
 }
 
 // Small-PT body (PT = 8 / PT = 1): both run the same mma code; e rows p >= P
@@ -363,7 +367,7 @@ __device__ __forceinline__ void markov2_p1_small_body(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
-    float* __restrict__ scratch_lse, int P, bf16* __restrict__ w2sm) {
+    float* __restrict__ scratch_lse, int P, int V, int score_rounding, bf16* __restrict__ w2sm) {
   __shared__ __align__(16) bf16 esm[8 * MK2_DIM];         // 4096 B swizzled
   // Merge arrays are indexed by act (0..7), independent of the scratch
   // stride PTB: [8][8], 2560 B.
@@ -390,8 +394,8 @@ __device__ __forceinline__ void markov2_p1_small_body(
   const int act0 = c0, act1 = c0 + 1;
   const int rr0 = (act0 < P) ? req_row[act0] : 0;
   const int rr1 = (act1 < P) ? req_row[act1] : 0;
-  const bf16* Brow0 = B + (size_t)rr0 * MK2_VOCAB;
-  const bf16* Brow1 = B + (size_t)rr1 * MK2_VOCAB;
+  const bf16* Brow0 = B + (size_t)rr0 * V;
+  const bf16* Brow1 = B + (size_t)rr1 * V;
 
   ActState st;
   st.init();
@@ -415,7 +419,7 @@ __device__ __forceinline__ void markov2_p1_small_body(
       const int idx = lane + rep * 32;
       const int r = idx >> 2, seg = idx & 3;
       cp16(d + r * 32 + ((seg ^ ((r >> 1) & 3)) << 3),
-           g + (size_t)r * MK2_DIM + seg * 8, 16);
+           g + (size_t)r * MK2_DIM + seg * 8, vBlk0 + warp * 32 + r < V ? 16 : 0);
     }
   };
   stage_w2(0, 0);
@@ -460,25 +464,25 @@ __device__ __forceinline__ void markov2_p1_small_body(
 #pragma unroll
   for (int t = 0; t < 2; ++t) {
     const int vg = vBlk0 + warp * 32 + t * 16 + r0;
-    if (act0 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[t][0]), Brow0[vg]);
-      st.add<0>(__bfloat162float(sv), (unsigned)vg);
-      MK2_DUMP_S_WRITE(act0, vg, __bfloat162float(sv));
+    if (act0 < P && vg < V) {
+      const float sv = markov_score(acc[t][0], Brow0[vg], score_rounding);
+      st.add<0>(sv, (unsigned)vg);
+      MK2_DUMP_S_WRITE(act0, vg, sv);
     }
-    if (act1 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[t][1]), Brow1[vg]);
-      st.add<1>(__bfloat162float(sv), (unsigned)vg);
-      MK2_DUMP_S_WRITE(act1, vg, __bfloat162float(sv));
+    if (act1 < P && vg < V) {
+      const float sv = markov_score(acc[t][1], Brow1[vg], score_rounding);
+      st.add<1>(sv, (unsigned)vg);
+      MK2_DUMP_S_WRITE(act1, vg, sv);
     }
-    if (act0 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[t][2]), Brow0[vg + 8]);
-      st.add<0>(__bfloat162float(sv), (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act0, vg + 8, __bfloat162float(sv));
+    if (act0 < P && vg + 8 < V) {
+      const float sv = markov_score(acc[t][2], Brow0[vg + 8], score_rounding);
+      st.add<0>(sv, (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act0, vg + 8, sv);
     }
-    if (act1 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[t][3]), Brow1[vg + 8]);
-      st.add<1>(__bfloat162float(sv), (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act1, vg + 8, __bfloat162float(sv));
+    if (act1 < P && vg + 8 < V) {
+      const float sv = markov_score(acc[t][3], Brow1[vg + 8], score_rounding);
+      st.add<1>(sv, (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act1, vg + 8, sv);
     }
   }
 
@@ -532,7 +536,7 @@ __device__ __forceinline__ void markov2_p1_small_body_preF1(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
-    float* __restrict__ scratch_lse, int P) {
+    float* __restrict__ scratch_lse, int P, int V, int score_rounding) {
   __shared__ __align__(16) bf16 esm[8 * MK2_DIM];         // 4096 B swizzled
   // Merge arrays are indexed by act (0..7), independent of the scratch
   // stride PTB: [8][8], 2560 B.
@@ -559,8 +563,8 @@ __device__ __forceinline__ void markov2_p1_small_body_preF1(
   const int act0 = c0, act1 = c0 + 1;
   const int rr0 = (act0 < P) ? req_row[act0] : 0;
   const int rr1 = (act1 < P) ? req_row[act1] : 0;
-  const bf16* Brow0 = B + (size_t)rr0 * MK2_VOCAB;
-  const bf16* Brow1 = B + (size_t)rr1 * MK2_VOCAB;
+  const bf16* Brow0 = B + (size_t)rr0 * V;
+  const bf16* Brow1 = B + (size_t)rr1 * V;
 
   ActState st;
   st.init();
@@ -582,34 +586,34 @@ __device__ __forceinline__ void markov2_p1_small_body_preF1(
 #pragma unroll
     for (int kk = 0; kk < 16; ++kk) {
       unsigned wa[4], eb[2];
-      wa[0] = *reinterpret_cast<const unsigned*>(rA + kk * 16);
-      wa[1] = *reinterpret_cast<const unsigned*>(rB_ + kk * 16);
-      wa[2] = *reinterpret_cast<const unsigned*>(rA + kk * 16 + 8);
-      wa[3] = *reinterpret_cast<const unsigned*>(rB_ + kk * 16 + 8);
+      wa[0] = vt0 + r0 < V ? *reinterpret_cast<const unsigned*>(rA + kk * 16) : 0u;
+      wa[1] = vt0 + r0 + 8 < V ? *reinterpret_cast<const unsigned*>(rB_ + kk * 16) : 0u;
+      wa[2] = vt0 + r0 < V ? *reinterpret_cast<const unsigned*>(rA + kk * 16 + 8) : 0u;
+      wa[3] = vt0 + r0 + 8 < V ? *reinterpret_cast<const unsigned*>(rB_ + kk * 16 + 8) : 0u;
       ldsm_x2(eb, erow + swz((kk * 2 + (lane >> 3)) & 31, eseg) * 8);
       mma_16816(acc, wa, eb);
     }
 
     const int vg = vt0 + r0;
-    if (act0 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[0]), Brow0[vg]);
-      st.add<0>(__bfloat162float(sv), (unsigned)vg);
-      MK2_DUMP_S_WRITE(act0, vg, __bfloat162float(sv));
+    if (act0 < P && vg < V) {
+      const float sv = markov_score(acc[0], Brow0[vg], score_rounding);
+      st.add<0>(sv, (unsigned)vg);
+      MK2_DUMP_S_WRITE(act0, vg, sv);
     }
-    if (act1 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[1]), Brow1[vg]);
-      st.add<1>(__bfloat162float(sv), (unsigned)vg);
-      MK2_DUMP_S_WRITE(act1, vg, __bfloat162float(sv));
+    if (act1 < P && vg < V) {
+      const float sv = markov_score(acc[1], Brow1[vg], score_rounding);
+      st.add<1>(sv, (unsigned)vg);
+      MK2_DUMP_S_WRITE(act1, vg, sv);
     }
-    if (act0 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[2]), Brow0[vg + 8]);
-      st.add<0>(__bfloat162float(sv), (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act0, vg + 8, __bfloat162float(sv));
+    if (act0 < P && vg + 8 < V) {
+      const float sv = markov_score(acc[2], Brow0[vg + 8], score_rounding);
+      st.add<0>(sv, (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act0, vg + 8, sv);
     }
-    if (act1 < P) {
-      const bf16 sv = __hadd(__float2bfloat16(acc[3]), Brow1[vg + 8]);
-      st.add<1>(__bfloat162float(sv), (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act1, vg + 8, __bfloat162float(sv));
+    if (act1 < P && vg + 8 < V) {
+      const float sv = markov_score(acc[3], Brow1[vg + 8], score_rounding);
+      st.add<1>(sv, (unsigned)(vg + 8));
+      MK2_DUMP_S_WRITE(act1, vg + 8, sv);
     }
   }
 
@@ -662,11 +666,11 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_p8(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
-    float* __restrict__ scratch_lse, int V, int in, int P) {
+    float* __restrict__ scratch_lse, int V, int in, int P, int score_rounding) {
   MK2_GUARD_P1(8);
   __shared__ __align__(16) bf16 w2sm[4 * 16 * MK2_DIM];
   markov2_p1_small_body<8>(B, w1c, w2c, req_tok, req_row, scratch_top4,
-                           scratch_lse, P, w2sm);
+                           scratch_lse, P, V, score_rounding, w2sm);
 }
 
 // PT = 1: the small body with scratch stride 1.
@@ -674,11 +678,11 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_p1(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
-    float* __restrict__ scratch_lse, int V, int in, int P) {
+    float* __restrict__ scratch_lse, int V, int in, int P, int score_rounding) {
   MK2_GUARD_P1(1);
   __shared__ __align__(16) bf16 w2sm[4 * 16 * MK2_DIM];
   markov2_p1_small_body<1>(B, w1c, w2c, req_tok, req_row, scratch_top4,
-                           scratch_lse, P, w2sm);
+                           scratch_lse, P, V, score_rounding, w2sm);
 }
 
 // The small body with direct 32-bit global loads of w2 in place of the
@@ -688,20 +692,20 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_preF
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
-    float* __restrict__ scratch_lse, int V, int in, int P) {
+    float* __restrict__ scratch_lse, int V, int in, int P, int score_rounding) {
   MK2_GUARD_P1(8);
   markov2_p1_small_body_preF1<8>(B, w1c, w2c, req_tok, req_row, scratch_top4,
-                                 scratch_lse, P);
+                                 scratch_lse, P, V, score_rounding);
 }
 
 extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_preF1_p1(
     const bf16* __restrict__ B, const bf16* __restrict__ w1c,
     const bf16* __restrict__ w2c, const unsigned* __restrict__ req_tok,
     const int* __restrict__ req_row, float* __restrict__ scratch_top4,
-    float* __restrict__ scratch_lse, int V, int in, int P) {
+    float* __restrict__ scratch_lse, int V, int in, int P, int score_rounding) {
   MK2_GUARD_P1(1);
   markov2_p1_small_body_preF1<1>(B, w1c, w2c, req_tok, req_row, scratch_top4,
-                                 scratch_lse, P);
+                                 scratch_lse, P, V, score_rounding);
 }
 
 #undef MK2_GUARD_P1
@@ -714,7 +718,7 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_preF
 __device__ __forceinline__ void markov2_p2_body(
     const float* __restrict__ scratch_top4, const float* __restrict__ scratch_lse,
     unsigned* __restrict__ top4, float* __restrict__ logp, float* __restrict__ lse,
-    int P, int PT) {
+    int P, int PT, int V) {
   __shared__ float ws_sc[8][4];                  // per-warp top4 partials
   __shared__ unsigned ws_id[8][4];
   __shared__ float ws_ml[8][2];                  // per-warp (m, l)
@@ -726,7 +730,7 @@ __device__ __forceinline__ void markov2_p2_body(
   T4 t4; t4.init();
   float m = -3.0e38f, l = 0.0f;
 #pragma unroll
-  for (int b = tid; b < MK2_NB2; b += MK2_NT) {
+  for (int b = tid; b < (V + MK2_VT - 1) / MK2_VT; b += MK2_NT) {
     const float4 qa = *reinterpret_cast<const float4*>(scratch_top4 + ((size_t)b * PT + p) * 8);
     const float4 qb = *reinterpret_cast<const float4*>(scratch_top4 + ((size_t)b * PT + p) * 8 + 4);
     t4.insert(qa.x, __float_as_uint(qa.y));
@@ -801,6 +805,6 @@ extern "C" __global__ void __launch_bounds__(MK2_NT) markov2_top4_phase2(
     const float* __restrict__ scratch_top4, const float* __restrict__ scratch_lse,
     unsigned* __restrict__ top4, float* __restrict__ logp, float* __restrict__ lse,
     int V, int P, int PT) {
-  if (V != MK2_VOCAB || P < 1 || P > 64 || blockDim.x != MK2_NT) __trap();
-  markov2_p2_body(scratch_top4, scratch_lse, top4, logp, lse, P, PT);
+  if (V < 4 || P < 1 || P > 64 || blockDim.x != MK2_NT) __trap();
+  markov2_p2_body(scratch_top4, scratch_lse, top4, logp, lse, P, PT, V);
 }
