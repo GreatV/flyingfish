@@ -26,6 +26,20 @@ const PREP_THREADS: u32 = 256;
 const PHASE1_SMEM: u32 = 68096;
 const MASK_LEN: u32 = 64;
 
+fn rotary_query_extent(spec: &FullAttentionSpec, rows: u32) -> Result<u32> {
+    let queries = spec
+        .hq
+        .checked_mul(spec.rotary_dim)
+        .context("Q rotary extent overflow")?
+        / 2;
+    let keys = spec
+        .hkv
+        .checked_mul(D)
+        .context("KV rotary extent overflow")?;
+    rows.checked_mul(queries.max(keys))
+        .context("Q rotary grid overflow")
+}
+
 /// RoPE coordinate source: `Linear` = physical `prefix + row`; `Axes` = per-row (T, H, W) from a
 /// `[max_rows, 3]` i32 table. KV slot and causal key count stay physical; T = H = W matches `Linear` bitwise.
 #[derive(Clone, Copy, Debug)]
@@ -82,6 +96,7 @@ pub(crate) struct FullAttentionPlan {
     max_parts: u32,
     segments: u32,
     split_cfg: LaunchConfig,
+    rope_q_cfg: LaunchConfig,
     scatter_cfg: LaunchConfig,
     phase1_cfg: LaunchConfig,
     phase2_cfg: LaunchConfig,
@@ -137,6 +152,8 @@ impl FullAttentionPlan {
             .checked_mul(self.spec.hkv * D)
             .context("scatter grid overflow")?
             .div_ceil(PREP_THREADS);
+        let mut rope_q_cfg = self.rope_q_cfg;
+        rope_q_cfg.grid_dim.0 = rotary_query_extent(&self.spec, rows)?.div_ceil(PREP_THREADS);
         let mut phase1_cfg = self.phase1_cfg;
         phase1_cfg.grid_dim.2 = ((self.spec.hq / self.spec.hkv) * segment_rows).div_ceil(SEG_MAX);
         let mut phase2_cfg = self.phase2_cfg;
@@ -152,6 +169,7 @@ impl FullAttentionPlan {
             max_parts: self.max_parts,
             segments: rows.div_ceil(segment_rows),
             split_cfg,
+            rope_q_cfg,
             scatter_cfg,
             phase1_cfg,
             phase2_cfg,
@@ -407,6 +425,7 @@ impl FullAttentionOps {
             rows.checked_mul(spec.hkv * D)
                 .context("KV scatter grid overflow")?,
         )?;
+        let rope_q_cfg = flat(rotary_query_extent(spec, rows)?)?;
         let phase1_cfg = LaunchConfig {
             grid_dim: (
                 max_parts,
@@ -432,6 +451,7 @@ impl FullAttentionOps {
             max_parts,
             segments: rows.div_ceil(segment_rows),
             split_cfg,
+            rope_q_cfg,
             scatter_cfg,
             phase1_cfg,
             phase2_cfg,
@@ -464,7 +484,7 @@ impl FullAttentionOps {
         let limits = plan.limits;
         let rows = limits.max_rows;
         let q_tok = b.q.0.stride[0] as i32;
-        let k_tok = b.k.stride[0] as i32;
+        let k_norm_stride = (plan.spec.hkv * D) as i32;
         let v_tok = b.v.stride[0] as i32;
         let head_stride = (u64::from(limits.capacity) * u64::from(D)) as i32;
         let pos_stride = D as i32;
@@ -534,7 +554,7 @@ impl FullAttentionOps {
                 launch.arg(&axes);
             }
             unsafe {
-                launch.arg(&q_tok).launch(plan.scatter_cfg)?;
+                launch.arg(&q_tok).launch(plan.rope_q_cfg)?;
             }
             unsafe {
                 stream
@@ -548,7 +568,7 @@ impl FullAttentionOps {
                     .arg(&b.v.ptr)
                     .arg(&meta.ptr)
                     .arg(&axes)
-                    .arg(&k_tok)
+                    .arg(&k_norm_stride)
                     .arg(&v_tok)
                     .arg(&cache)
                     .launch(plan.scatter_cfg)?;
@@ -564,13 +584,13 @@ impl FullAttentionOps {
                     .arg(&b.q.0.ptr)
                     .arg(&meta.ptr)
                     .arg(&q_tok)
-                    .launch(plan.scatter_cfg)?;
+                    .launch(plan.rope_q_cfg)?;
                 stream
                     .launch_builder(&plan.kernels.rope_k_scatter)
                     .arg(&k_tmp)
                     .arg(&b.k_cache.0.ptr)
                     .arg(&meta.ptr)
-                    .arg(&k_tok)
+                    .arg(&k_norm_stride)
                     .arg(&head_stride)
                     .arg(&pos_stride)
                     .launch(plan.scatter_cfg)?;
@@ -582,14 +602,14 @@ impl FullAttentionOps {
                     .arg(&meta.ptr)
                     .arg(&table.ptr)
                     .arg(&q_tok)
-                    .launch(plan.scatter_cfg)?;
+                    .launch(plan.rope_q_cfg)?;
                 stream
                     .launch_builder(&plan.kernels.rope_k_scatter)
                     .arg(&k_tmp)
                     .arg(&b.k_cache.0.ptr)
                     .arg(&meta.ptr)
                     .arg(&table.ptr)
-                    .arg(&k_tok)
+                    .arg(&k_norm_stride)
                     .arg(&head_stride)
                     .arg(&pos_stride)
                     .launch(plan.scatter_cfg)?;
@@ -779,6 +799,13 @@ mod tests {
             rotary_dim: 256,
             ..spec
         };
+        assert_eq!(rotary_query_extent(&spec, 37)?, 37 * 512);
+        assert_eq!(
+            rotary_query_extent(&FullAttentionSpec::q38(), 37)?,
+            37 * 1024
+        );
+        assert_eq!(rotary_query_extent(&draft_spec, 37)?, 37 * 1024);
+        assert!(rotary_query_extent(&draft_spec, u32::MAX).is_err());
         bindings.q_gate = view([37, 8, 256], [3072, 256, 1])?;
         bindings.q = TensorMut(view([37, 8, 256], [2048, 256, 1])?);
         bindings.core_out = TensorMut(bindings.q.read());
