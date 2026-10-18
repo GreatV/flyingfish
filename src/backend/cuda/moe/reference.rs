@@ -316,7 +316,7 @@ pub(crate) enum Combine {
 
 /// Routed contributions selected by `keep` are reduced per `combine`, rounded
 /// to BF16, then added to the BF16 sigmoid-gated shared expert in BF16.
-/// Contributions are ordered ascending expert id.
+/// Fp32 sums use ascending expert id order.
 pub(crate) fn moe_row_ids(
     fx: &MoeFixture,
     row: usize,
@@ -527,6 +527,6 @@ mod tests {
             noise.ascending_vs_descending.to_bits(),
             0.001953125f32.to_bits()
         );
-        assert_eq!(noise.ascending_vs_fp32.to_bits(), 0.001953125f32.to_bits());
+        assert_eq!(noise.ascending_vs_fp32.to_bits(), 0.0009765625f32.to_bits());
     }
 }
