@@ -666,6 +666,20 @@ fn q38_mtp_batch_chain_gpu() -> Result<()> {
 #[test]
 #[ignore = "authorized review GPU window; frozen K2 bootstrap acceptance regression"]
 fn q38_mtp_bootstrap_acceptance_gpu() -> Result<()> {
+    let root = PathBuf::from(
+        std::env::var_os("FF_Q38_MTP_REF_ROOT").context("FF_Q38_MTP_REF_ROOT missing")?,
+    );
+    let path = root.join("mtp-gate-bounds.json");
+    let bounds: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+    )?;
+    let band = &bounds["bootstrap_acceptance"];
+    let z = band["z"]
+        .as_f64()
+        .context("mtp-gate-bounds.json bootstrap_acceptance.z missing")?;
+    let reference_rounds: BTreeMap<String, Vec<usize>> =
+        serde_json::from_value(band["round_tokens"].clone())
+            .context("mtp-gate-bounds.json bootstrap_acceptance.round_tokens missing")?;
     let mut e = super::super::tests::load_capacity(true, 512)?;
     let selected = options(
         2,
@@ -693,6 +707,7 @@ fn q38_mtp_bootstrap_acceptance_gpu() -> Result<()> {
         for iteration in 0..5 {
             let mut tokens = vec![e.mtp_prefill(ids)?];
             let (mut emitted, mut count) = (0usize, 0usize);
+            let mut round_tokens = Vec::new();
             while emitted < 32 {
                 let r = e.mtp_batch_round(32 - emitted, None)?.round;
                 ensure!(!r.tokens.is_empty(), "bootstrap warmup stopped early");
@@ -705,6 +720,7 @@ fn q38_mtp_bootstrap_acceptance_gpu() -> Result<()> {
                 ensure!(!r.tokens.is_empty(), "bootstrap measurement stopped early");
                 emitted += r.tokens.len();
                 count += 1;
+                round_tokens.push(r.tokens.len());
                 tokens.extend(r.tokens);
             }
             ensure!(
@@ -713,24 +729,73 @@ fn q38_mtp_bootstrap_acceptance_gpu() -> Result<()> {
             );
             published += emitted;
             rounds += count;
-            cases.push(serde_json::json!({"case":name,"iteration":iteration,"tokens":tokens,"measured_tokens":emitted,"rounds":count}));
+            cases.push(serde_json::json!({"case":name,"iteration":iteration,"tokens":tokens,"measured_tokens":emitted,"rounds":count,"round_tokens":round_tokens}));
         }
     }
-    let reference = 5000.0 / 1920.0;
+    ensure!(
+        inputs
+            .iter()
+            .all(|(name, _)| reference_rounds.contains_key(*name)),
+        "bootstrap_acceptance.round_tokens must cover every prompt"
+    );
+    let (reference, half_width) =
+        acceptance_band(&reference_rounds.into_values().collect::<Vec<_>>(), z)?;
     let actual = published as f64 / rounds as f64;
-    let pass = (reference * 0.97..=reference * 1.03).contains(&actual);
+    let pass = (actual / reference - 1.0).abs() <= half_width;
     receipt(
         "bootstrap-acceptance",
         serde_json::json!({
             "result":if pass {"PASS"} else {"FAIL"},"depth":2,"warmup_tokens":32,
-            "reference_tokens":5000,"reference_rounds":1920,"relative_limit":0.03,
+            "reference_mean_tokens_per_round":reference,"z":z,"relative_half_width":half_width,
             "published":published,"rounds":rounds,"mean_tokens_per_round":actual,"cases":cases
         }),
     )?;
     ensure!(
         pass,
-        "K2 bootstrap acceptance {actual} is outside +/-3% of {reference}"
+        "K2 bootstrap acceptance {actual} is outside +/-{half_width} of {reference}"
     );
+    Ok(())
+}
+
+/// Mean tokens per round of the reference streams and the relative half-width
+/// z·√2·SE/mean, SE = sqrt(σ²·τ/n), τ = 1 + 2·Σρ_k over lags before the first negative ρ_k.
+/// ρ_k pairs rounds within one stream; σ² is the population variance over all n rounds.
+fn acceptance_band(streams: &[Vec<usize>], z: f64) -> Result<(f64, f64)> {
+    let all: Vec<f64> = streams.iter().flatten().map(|&x| x as f64).collect();
+    ensure!(all.len() > 1, "reference round counts missing");
+    let n = all.len() as f64;
+    let mean = all.iter().sum::<f64>() / n;
+    let ss: f64 = all.iter().map(|x| (x - mean).powi(2)).sum();
+    ensure!(ss > 0.0, "reference round counts have zero variance");
+    let longest = streams.iter().map(Vec::len).max().unwrap_or(0);
+    let mut tau = 1.0;
+    for k in 1..longest {
+        let rho = streams
+            .iter()
+            .flat_map(|s| s.windows(k + 1))
+            .map(|w| (w[0] as f64 - mean) * (w[k] as f64 - mean))
+            .sum::<f64>()
+            / ss;
+        if rho < 0.0 {
+            break;
+        }
+        tau += 2.0 * rho;
+    }
+    let se = (ss / n * tau / n).sqrt();
+    Ok((mean, z * std::f64::consts::SQRT_2 * se / mean))
+}
+
+#[test]
+fn acceptance_band_truncates_at_first_negative_autocorrelation() -> Result<()> {
+    // [3,3,1,1]: mean 2, σ² 1, ρ1 = 1/4, ρ2 = -1/2, τ = 3/2.
+    let (mean, h) = acceptance_band(&[vec![3, 3, 1, 1]], 2.0)?;
+    assert_eq!(mean, 2.0);
+    let expected = 2.0 * std::f64::consts::SQRT_2 * (1.5f64 / 4.0).sqrt() / 2.0;
+    assert!((h - expected).abs() <= 4.0 * f64::EPSILON * expected);
+    // [3,1,3,1]: ρ1 = -3/4, τ = 1.
+    let (_, h) = acceptance_band(&[vec![3, 1, 3, 1]], 2.0)?;
+    let expected = 2.0 * std::f64::consts::SQRT_2 * 0.25f64.sqrt() / 2.0;
+    assert!((h - expected).abs() <= 4.0 * f64::EPSILON * expected);
     Ok(())
 }
 

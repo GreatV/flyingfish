@@ -2434,7 +2434,6 @@ mod gpu_probe {
         degenerate: bool,
         frac_bound: Option<f64>,
         count_bound: Option<usize>,
-        rule: Option<String>,
         dir: PathBuf,
     }
 
@@ -2473,10 +2472,6 @@ mod gpu_probe {
                     Some(frac) if (count_bound as f64) < frac * elems as f64 => None,
                     _ => Some(count_bound),
                 },
-                rule: bounds
-                    .get("rule")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
                 dir,
             }
         }
@@ -2715,7 +2710,7 @@ mod gpu_probe {
 
     /// The per-case gate, three terms:
     ///   (a) COUNT: the fraction bound where count_bound / elems < frac_bound; the count bound otherwise.
-    ///   (b) SCALED against the case's own basis; informational when the basis is 0 and for rec_m1.
+    ///   (b) SCALED against the case's own basis; informational when the basis is 0.
     ///   (c) the dead-row absolute term against the floor; always binds.
     ///
     /// The scaled comparison is `measured <= basis` in f64 with γ_DV(f64::EPSILON) relative slack.
@@ -2730,8 +2725,6 @@ mod gpu_probe {
                 "COUNT (basis 0, v1.2 section 3: degenerate, scaled informational)".to_string(),
                 true,
             )
-        } else if let Some(r) = &man.rule {
-            (format!("COUNT ({r}; scaled informational)"), true)
         } else {
             (
                 "COUNT+FRACTION and SCALED (v1.2 section 3)".to_string(),
@@ -3042,10 +3035,39 @@ mod gpu_probe {
             let ref_rec = case2.man.bf16("ref_core_other.bf16", elems);
             let man_rec = {
                 let mut m = Man::load("prefill_m1");
-                m.count_bound = Some(4);
+                let text = std::fs::read_to_string(m.dir.join("manifest.json"))?;
+                let manifest: serde_json::Value = serde_json::from_str(&text)?;
+                m.count_bound = Some(
+                    manifest["bounds_other"]["count_bound"]
+                        .as_u64()
+                        .context("prefill_m1 manifest bounds_other.count_bound missing")?
+                        as usize,
+                );
                 m
             };
             check_core("phase:decode_m1", &man_rec, &got_rec[..elems], &ref_rec);
+            // Planted: `bound` elements one BF16 ulp off pass; `bound + 1` fail.
+            let bound = man_rec.count_bound.unwrap();
+            for (planted, fails) in [(bound, false), (bound + 1, true)] {
+                let mut mutant = ref_rec.clone();
+                for i in 0..planted {
+                    let at = i * 127 % elems;
+                    mutant[at] = bf16::from_bits(mutant[at].to_bits() ^ 1);
+                }
+                let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    check_core("planted:decode_m1", &man_rec, &mutant, &ref_rec)
+                }))
+                .is_err();
+                println!(
+                    "  planted:decode_m1 {planted} elements (bound {bound}): {}",
+                    if failed { "FAIL" } else { "PASS" }
+                );
+                ensure!(
+                    failed == fails,
+                    "planted {planted}-element mutant judged {} against count bound {bound}",
+                    if failed { "FAIL" } else { "PASS" }
+                );
+            }
             // The phase contract is asserted on the path taken: at M=1 both cores compute the same
             // recurrence, so outputs cannot distinguish them.
             let log = take_phase_log();
@@ -3065,6 +3087,25 @@ mod gpu_probe {
                 .count();
             println!(
                 "  phase contract: Prefill-M1 vs Decode-M1 differ on {differing} elements (informational)"
+            );
+            // Negative control: a/b swapped in the Decode phase must exceed the count bound.
+            let case3 = build_case(&device, Man::load("prefill_m1"))?;
+            run_case(
+                &device,
+                &case3,
+                common.clone(),
+                ExecutionPhase::Decode,
+                true,
+            )?;
+            let got_swap = s.clone_dtoh(&case3.dev_core)?;
+            let t = terms(&got_swap[..elems], &ref_rec, &man_rec);
+            println!(
+                "  control(swapped a/b, Decode): {}/{elems} elements differ (count bound {bound}) nan={}",
+                t.ndiff, t.nan
+            );
+            ensure!(
+                t.ndiff > bound || t.nan > 0,
+                "the swapped-gate Decode control passed the count bound"
             );
         }
 

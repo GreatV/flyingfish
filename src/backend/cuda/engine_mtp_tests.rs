@@ -310,7 +310,19 @@ fn values(dump: &Dump, name: &str) -> Result<Vec<bf16>> {
         .map(|b| bf16::from_bits(u16::from_le_bytes(*b)))
         .collect())
 }
-fn score(candidate: &[bf16], reference: &[bf16]) -> Result<serde_json::Value> {
+/// Near-tie cut 2ε at a recursion depth (1-based); ε from `<root>/mtp-gate-bounds.json`.
+fn near_tie_cut(root: &Path, depth: usize) -> Result<f32> {
+    let path = root.join("mtp-gate-bounds.json");
+    let bounds: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+    )?;
+    let epsilon = bounds["near_tie"]["epsilon_by_depth"][depth - 1]
+        .as_f64()
+        .with_context(|| format!("near_tie.epsilon_by_depth[{}] missing", depth - 1))?;
+    Ok(2.0 * epsilon as f32)
+}
+/// A row whose argmax differs is a NEAR-TIE when the reference margin is at most `cut`.
+fn score(candidate: &[bf16], reference: &[bf16], cut: f32) -> Result<serde_json::Value> {
     ensure!(
         !candidate.is_empty()
             && candidate.len() == reference.len()
@@ -349,7 +361,7 @@ fn score(candidate: &[bf16], reference: &[bf16]) -> Result<serde_json::Value> {
         let margin = t[ti].to_f32() - t[ci].to_f32();
         if ci == ti {
             exact += 1;
-        } else if margin < 1.0 {
+        } else if margin <= cut {
             near += 1;
         } else {
             defects
@@ -357,7 +369,7 @@ fn score(candidate: &[bf16], reference: &[bf16]) -> Result<serde_json::Value> {
         }
     }
     Ok(
-        serde_json::json!({"argmax":exact,"near_tie":near,"defects":defects,"max_abs_logits":max_abs,"opref":"PENDING"}),
+        serde_json::json!({"argmax":exact,"near_tie":near,"cut":cut,"defects":defects,"max_abs_logits":max_abs,"opref":"PENDING"}),
     )
 }
 
@@ -365,6 +377,7 @@ fn score(candidate: &[bf16], reference: &[bf16]) -> Result<serde_json::Value> {
 #[ignore = "local 4090 MTP window; FF_Q38_MODEL, FF_Q38_MTP_REF_ROOT, FF_Q38_MTP_OUTPUT required"]
 fn q38_mtp_single_step_gpu() -> Result<()> {
     let probe = Probe::new()?;
+    let cut = near_tie_cut(&probe.root, 1)?;
     for case in ["math1", "code1", "gen1", "gen2", "math2"] {
         let f = Fixture::load(&probe.root, case)?;
         let rows = f.sequence.len() - 1;
@@ -386,7 +399,7 @@ fn q38_mtp_single_step_gpu() -> Result<()> {
             )?;
             let name = format!("{case}-{tap:?}-full");
             probe.save(&dump, &name, p, 0, "None")?;
-            let result = score(&values(&dump, "logits")?, f.logits(tap))?;
+            let result = score(&values(&dump, "logits")?, f.logits(tap), cut)?;
             std::fs::write(
                 probe.output.join(format!("{name}-score.json")),
                 serde_json::to_vec_pretty(&result)?,
@@ -408,6 +421,7 @@ fn q38_mtp_single_step_gpu() -> Result<()> {
 #[ignore = "local 4090 MTP window; cached row fixture comparison"]
 fn q38_mtp_cached_rows_gpu() -> Result<()> {
     let probe = Probe::new()?;
+    let cut = near_tie_cut(&probe.root, 1)?;
     for case in ["math1", "code1", "gen1", "gen2", "math2"] {
         let f = Fixture::load(&probe.root, case)?;
         let rows = f.sequence.len() - 1;
@@ -439,7 +453,7 @@ fn q38_mtp_cached_rows_gpu() -> Result<()> {
             dump.bf16("logits", vec![rows, VOCAB], logits.clone())?;
             let name = format!("{case}-{tap:?}-cached");
             probe.save(&dump, &name, p, 0, "None")?;
-            let result = score(&logits, f.logits(tap))?;
+            let result = score(&logits, f.logits(tap), cut)?;
             std::fs::write(
                 probe.output.join(format!("{name}-score.json")),
                 serde_json::to_vec_pretty(&result)?,
@@ -955,7 +969,74 @@ fn q38_mtp_negative_controls_gpu() -> Result<()> {
                 "MTP_CONTROL_EXPORTED tap={tap:?} control={label}; independent frozen-rule detection PENDING"
             );
         }
+        // Each slot r runs the control over an uncontrolled past 0..r-1, then is rewritten
+        // without the control; the controlled rows must score at least one DEFECT.
+        let cut = near_tie_cut(&probe.root, 1)?;
+        let rows = f.sequence.len() - 1;
+        for (control, label) in [
+            (Control::ShiftNewPosition, "shift_new_position"),
+            (Control::SwapConcat, "swap_concat"),
+        ] {
+            let p = plan(tap, 1, rows, ExecutionPhase::Decode);
+            let mut state = probe.state(p.capacity)?;
+            let mut runtime = probe.runtime(p, &state)?;
+            let mut logits = Vec::with_capacity(rows * VOCAB);
+            for r in 0..rows {
+                for c in [control, Control::None] {
+                    let dump = probe.run(
+                        &mut runtime,
+                        &mut state,
+                        RunInput {
+                            device_ids: None,
+                            prefix: r,
+                            ids: &f.sequence[r + 1..r + 2],
+                            hidden: &f.hidden(tap)[r * HIDDEN..(r + 1) * HIDDEN],
+                            control: c,
+                            detailed: false,
+                        },
+                    )?;
+                    if !matches!(c, Control::None) {
+                        logits.extend(values(&dump, "logits")?);
+                    }
+                }
+            }
+            let result = score(&logits, f.logits(tap), cut)?;
+            std::fs::write(
+                probe
+                    .output
+                    .join(format!("math1-{tap:?}-control-{label}-slots-score.json")),
+                serde_json::to_vec_pretty(&result)?,
+            )?;
+            eprintln!("MTP_CONTROL_SCORE tap={tap:?} control={label} {result}");
+            let detected = !result["defects"]
+                .as_array()
+                .context("score defects missing")?
+                .is_empty();
+            // ShiftNewPosition moves no math1 argmax (max |Δlogit| 1.21875 on PreFinalNorm); recorded only.
+            ensure!(
+                detected || matches!(control, Control::ShiftNewPosition),
+                "control {label} scored no DEFECT at cut {cut}"
+            );
+        }
     }
+    Ok(())
+}
+
+#[test]
+fn score_separates_near_tie_from_defect_at_the_cut() -> Result<()> {
+    let mut reference = vec![bf16::ZERO; 2 * VOCAB];
+    let mut candidate = reference.clone();
+    // Row 0: margin 0.5, row 1: margin 0.75; the candidate takes the runner-up in both rows.
+    for (row, margin) in [(0, 0.5f32), (1, 0.75)] {
+        reference[row * VOCAB + 7] = bf16::from_f32(16.0);
+        reference[row * VOCAB + 11] = bf16::from_f32(16.0 - margin);
+        candidate[row * VOCAB + 11] = bf16::from_f32(16.0);
+    }
+    let result = score(&candidate, &reference, 0.5)?;
+    assert_eq!(result["near_tie"], 1);
+    let defects = result["defects"].as_array().context("defects")?;
+    assert_eq!(defects.len(), 1);
+    assert_eq!(defects[0]["row"], 1);
     Ok(())
 }
 
@@ -1154,7 +1235,11 @@ fn q38_mtp_recursive_fixture_gpu() -> Result<()> {
             )?;
             let prefix = format!("{key}.step{}", depth + 1);
             let expected = read(&format!("{prefix}.logits"), VOCAB)?;
-            let result = score(&values(&dump, "logits")?, &expected)?;
+            let result = score(
+                &values(&dump, "logits")?,
+                &expected,
+                near_tie_cut(&root, depth + 1)?,
+            )?;
             probe.save(
                 &dump,
                 &format!("recursive-{prefix}"),
