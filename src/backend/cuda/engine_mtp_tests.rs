@@ -310,7 +310,21 @@ fn values(dump: &Dump, name: &str) -> Result<Vec<bf16>> {
         .map(|b| bf16::from_bits(u16::from_le_bytes(*b)))
         .collect())
 }
-fn score(candidate: &[bf16], reference: &[bf16]) -> Result<serde_json::Value> {
+/// Reference logit spread ε at a recursion depth (1-based), from `<root>/mtp-gate-bounds.json`.
+fn near_tie_epsilon(root: &Path, depth: usize) -> Result<f32> {
+    let path = root.join("mtp-gate-bounds.json");
+    let bounds: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+    )?;
+    let epsilon = bounds["near_tie"]["epsilon_by_depth"][depth - 1]
+        .as_f64()
+        .with_context(|| format!("near_tie.epsilon_by_depth[{}] missing", depth - 1))?;
+    Ok(epsilon as f32)
+}
+/// A row is a DEFECT when its max |Δlogit| exceeds `epsilon`, or when its argmax differs and the
+/// reference margin exceeds the cut 2ε; a differing argmax within the cut is a NEAR-TIE.
+fn score(candidate: &[bf16], reference: &[bf16], epsilon: f32) -> Result<serde_json::Value> {
+    let cut = 2.0 * epsilon;
     ensure!(
         !candidate.is_empty()
             && candidate.len() == reference.len()
@@ -341,15 +355,20 @@ fn score(candidate: &[bf16], reference: &[bf16]) -> Result<serde_json::Value> {
             c.iter().chain(t).all(|x| x.is_finite()),
             "nonfinite logits row {r}"
         );
-        for (a, b) in c.iter().zip(t) {
-            max_abs = max_abs.max((a.to_f32() - b.to_f32()).abs());
-        }
+        let row_abs = c
+            .iter()
+            .zip(t)
+            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+            .fold(0f32, f32::max);
+        max_abs = max_abs.max(row_abs);
         let ci = argmax(c);
         let ti = argmax(t);
         let margin = t[ti].to_f32() - t[ci].to_f32();
-        if ci == ti {
+        if row_abs > epsilon {
+            defects.push(serde_json::json!({"row":r,"candidate":ci,"reference":ti,"margin":margin,"max_abs":row_abs}));
+        } else if ci == ti {
             exact += 1;
-        } else if margin < 1.0 {
+        } else if margin <= cut {
             near += 1;
         } else {
             defects
@@ -357,7 +376,7 @@ fn score(candidate: &[bf16], reference: &[bf16]) -> Result<serde_json::Value> {
         }
     }
     Ok(
-        serde_json::json!({"argmax":exact,"near_tie":near,"defects":defects,"max_abs_logits":max_abs,"opref":"PENDING"}),
+        serde_json::json!({"argmax":exact,"near_tie":near,"epsilon":epsilon,"cut":cut,"defects":defects,"max_abs_logits":max_abs,"opref":"PENDING"}),
     )
 }
 
@@ -365,6 +384,7 @@ fn score(candidate: &[bf16], reference: &[bf16]) -> Result<serde_json::Value> {
 #[ignore = "local 4090 MTP window; FF_Q38_MODEL, FF_Q38_MTP_REF_ROOT, FF_Q38_MTP_OUTPUT required"]
 fn q38_mtp_single_step_gpu() -> Result<()> {
     let probe = Probe::new()?;
+    let epsilon = near_tie_epsilon(&probe.root, 1)?;
     for case in ["math1", "code1", "gen1", "gen2", "math2"] {
         let f = Fixture::load(&probe.root, case)?;
         let rows = f.sequence.len() - 1;
@@ -386,7 +406,7 @@ fn q38_mtp_single_step_gpu() -> Result<()> {
             )?;
             let name = format!("{case}-{tap:?}-full");
             probe.save(&dump, &name, p, 0, "None")?;
-            let result = score(&values(&dump, "logits")?, f.logits(tap))?;
+            let result = score(&values(&dump, "logits")?, f.logits(tap), epsilon)?;
             std::fs::write(
                 probe.output.join(format!("{name}-score.json")),
                 serde_json::to_vec_pretty(&result)?,
@@ -408,6 +428,7 @@ fn q38_mtp_single_step_gpu() -> Result<()> {
 #[ignore = "local 4090 MTP window; cached row fixture comparison"]
 fn q38_mtp_cached_rows_gpu() -> Result<()> {
     let probe = Probe::new()?;
+    let epsilon = near_tie_epsilon(&probe.root, 1)?;
     for case in ["math1", "code1", "gen1", "gen2", "math2"] {
         let f = Fixture::load(&probe.root, case)?;
         let rows = f.sequence.len() - 1;
@@ -439,7 +460,7 @@ fn q38_mtp_cached_rows_gpu() -> Result<()> {
             dump.bf16("logits", vec![rows, VOCAB], logits.clone())?;
             let name = format!("{case}-{tap:?}-cached");
             probe.save(&dump, &name, p, 0, "None")?;
-            let result = score(&logits, f.logits(tap))?;
+            let result = score(&logits, f.logits(tap), epsilon)?;
             std::fs::write(
                 probe.output.join(format!("{name}-score.json")),
                 serde_json::to_vec_pretty(&result)?,
@@ -955,7 +976,83 @@ fn q38_mtp_negative_controls_gpu() -> Result<()> {
                 "MTP_CONTROL_EXPORTED tap={tap:?} control={label}; independent frozen-rule detection PENDING"
             );
         }
+        // Each slot r runs the control over an uncontrolled past 0..r-1, then is rewritten
+        // without the control; the controlled rows must score at least one DEFECT.
+        let epsilon = near_tie_epsilon(&probe.root, 1)?;
+        let rows = f.sequence.len() - 1;
+        for (control, label) in [
+            (Control::ShiftNewPosition, "shift_new_position"),
+            (Control::SwapConcat, "swap_concat"),
+        ] {
+            let p = plan(tap, 1, rows, ExecutionPhase::Decode);
+            let mut state = probe.state(p.capacity)?;
+            let mut runtime = probe.runtime(p, &state)?;
+            let mut logits = Vec::with_capacity(rows * VOCAB);
+            for r in 0..rows {
+                for c in [control, Control::None] {
+                    let dump = probe.run(
+                        &mut runtime,
+                        &mut state,
+                        RunInput {
+                            device_ids: None,
+                            prefix: r,
+                            ids: &f.sequence[r + 1..r + 2],
+                            hidden: &f.hidden(tap)[r * HIDDEN..(r + 1) * HIDDEN],
+                            control: c,
+                            detailed: false,
+                        },
+                    )?;
+                    if !matches!(c, Control::None) {
+                        logits.extend(values(&dump, "logits")?);
+                    }
+                }
+            }
+            let result = score(&logits, f.logits(tap), epsilon)?;
+            std::fs::write(
+                probe
+                    .output
+                    .join(format!("math1-{tap:?}-control-{label}-slots-score.json")),
+                serde_json::to_vec_pretty(&result)?,
+            )?;
+            eprintln!("MTP_CONTROL_SCORE tap={tap:?} control={label} {result}");
+            let detected = !result["defects"]
+                .as_array()
+                .context("score defects missing")?
+                .is_empty();
+            ensure!(
+                detected,
+                "control {label} scored no DEFECT at epsilon {epsilon}"
+            );
+        }
     }
+    Ok(())
+}
+
+#[test]
+fn score_separates_near_tie_from_defect_at_the_cut() -> Result<()> {
+    let mut reference = vec![bf16::ZERO; 3 * VOCAB];
+    let mut candidate = reference.clone();
+    let mut set = |row: usize, i: usize, t: f32, c: f32| {
+        reference[row * VOCAB + i] = bf16::from_f32(t);
+        candidate[row * VOCAB + i] = bf16::from_f32(c);
+    };
+    // ε = 0.25, cut 0.5. Row 0: margin 0.375, |Δ| 0.25, argmax flips.
+    set(0, 7, 16.0, 15.75);
+    set(0, 11, 15.625, 15.875);
+    // Row 1: argmax kept, |Δ| 0.375.
+    set(1, 7, 16.0, 16.0);
+    set(1, 3, 1.0, 1.375);
+    // Row 2: margin 0.75, |Δ| 0.4375, argmax flips.
+    set(2, 7, 16.0, 15.625);
+    set(2, 11, 15.25, 15.6875);
+    let result = score(&candidate, &reference, 0.25)?;
+    assert_eq!(result["near_tie"], 1);
+    assert_eq!(result["argmax"], 0);
+    let defects = result["defects"].as_array().context("defects")?;
+    assert_eq!(
+        defects.iter().map(|d| d["row"].clone()).collect::<Vec<_>>(),
+        [1, 2]
+    );
     Ok(())
 }
 
@@ -1154,7 +1251,11 @@ fn q38_mtp_recursive_fixture_gpu() -> Result<()> {
             )?;
             let prefix = format!("{key}.step{}", depth + 1);
             let expected = read(&format!("{prefix}.logits"), VOCAB)?;
-            let result = score(&values(&dump, "logits")?, &expected)?;
+            let result = score(
+                &values(&dump, "logits")?,
+                &expected,
+                near_tie_epsilon(&root, depth + 1)?,
+            )?;
             probe.save(
                 &dump,
                 &format!("recursive-{prefix}"),
