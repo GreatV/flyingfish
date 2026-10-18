@@ -2,6 +2,33 @@ use super::*;
 use crate::backend::cuda::moe::reference::{MoeDims, MoeFixture, fixture};
 use crate::experts::plan::Capacity;
 
+#[test]
+fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
+    let (available, locked) = super::host_memory()?;
+    ensure!(
+        available > 0 && locked <= available,
+        "invalid expert host memory profile"
+    );
+    let groups = std::fs::read_to_string("/proc/self/cgroup")?;
+    let group = groups
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .context("unified cgroup missing")?;
+    let limit = Path::new("/sys/fs/cgroup")
+        .join(group.trim_start_matches('/'))
+        .join("memory.max");
+    if limit.try_exists()? {
+        let text = std::fs::read_to_string(limit)?;
+        if text.trim() != "max" {
+            ensure!(
+                available <= text.trim().parse::<u64>()?,
+                "expert arena exceeds cgroup limit"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn native_fixture(
     fixture: &MoeFixture,
     directory: &Path,

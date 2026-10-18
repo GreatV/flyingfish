@@ -58,9 +58,16 @@ fn host_memory() -> Result<(u64, u64)> {
     let mount = Path::new("/sys/fs/cgroup");
     let mut directory = mount.join(group.trim_start_matches('/'));
     loop {
-        let limit = std::fs::read_to_string(directory.join("memory.max"))?;
+        let maximum = directory.join("memory.max");
+        if directory == mount && !maximum.try_exists()? {
+            break;
+        }
+        let limit = std::fs::read_to_string(&maximum)
+            .with_context(|| format!("read expert cgroup limit {}", maximum.display()))?;
         if limit.trim() != "max" {
-            let used = std::fs::read_to_string(directory.join("memory.current"))?
+            let current = directory.join("memory.current");
+            let used = std::fs::read_to_string(&current)
+                .with_context(|| format!("read expert cgroup usage {}", current.display()))?
                 .trim()
                 .parse::<u64>()?;
             available = available.min(limit.trim().parse::<u64>()?.saturating_sub(used));
