@@ -494,6 +494,7 @@ impl Engine {
             engine.prepare_qwen(rows)?;
             engine.prepare_prefill_rows(rows)?;
         }
+        engine.device.finish_upload()?;
         Ok(engine)
     }
 
