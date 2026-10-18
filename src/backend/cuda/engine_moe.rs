@@ -467,7 +467,7 @@ pub(super) struct Decode {
     pool: ExpertPool,
     mailbox: Arc<CudaStream>,
     segments: Vec<graphs::Segments>,
-    capture_events: Vec<CudaEvent>,
+    mailbox_ready: CudaEvent,
     reader: Arc<CudaEvent>,
     mask: cudarc::driver::CudaFunction,
     pub stats: [u64; 5],
@@ -541,7 +541,7 @@ impl Decode {
             cpu_done: pinned_zeros(context, choices)?,
             mailbox: context.new_stream()?,
             segments: Vec::new(),
-            capture_events: Vec::new(),
+            mailbox_ready: context.new_event(None)?,
             reader: Arc::new(context.new_event(None)?),
             mask: super::super::cubin::module(context, "moe_route")?
                 .load_function("moe_route_mask")?,
@@ -622,7 +622,8 @@ impl Decode {
         );
         let k = self.geometry.top_k;
         let stream = &device.stream;
-        self.mailbox.wait(&stream.record_event(None)?)?;
+        self.reader.record(stream)?;
+        self.mailbox.wait(&self.reader)?;
         let count = rows * k as usize;
         {
             let (ids, _ids) = self.ids.device_ptr(&self.mailbox);
@@ -739,17 +740,17 @@ impl Decode {
                 )?;
             }
         }
-        stream.wait(&self.mailbox.record_event(None)?)?;
-        let _owned_reader = if let Some(layer) = graph {
+        self.mailbox_ready.record(&self.mailbox)?;
+        stream.wait(&self.mailbox_ready)?;
+        if let Some(layer) = graph {
             self.segments
                 .get(layer)
                 .context("MoE contribution graph missing")?
                 .contribute
                 .launch()?;
-            None
         } else {
-            Some(self.contribute_device(device, ffn, slots, x)?)
-        };
+            self.contribute_device(device, ffn, slots, x)?;
+        }
         self.reader.record(stream)?;
         let reader = self.reader.clone();
         self.upload_cpu(device, &mut dispatch, &reader)?;
@@ -774,7 +775,7 @@ impl Decode {
         ffn: BoundFfn,
         slots: SlotBindings,
         x: Tensor<bf16, 2>,
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         let BoundFfn::Moe {
             shared,
             shared_gate,
@@ -914,9 +915,9 @@ impl Decode {
                     )?;
                 }
             }
-            let published = self.mailbox.record_event(None)?;
-            stream.wait(&published)?;
-            published.synchronize()?;
+            self.mailbox_ready.record(&self.mailbox)?;
+            stream.wait(&self.mailbox_ready)?;
+            self.mailbox_ready.synchronize()?;
             self.stats[2] += (dispatch.assignments.len() + dispatch.disk.len()) as u64;
             self.stats[3] += 1;
         }

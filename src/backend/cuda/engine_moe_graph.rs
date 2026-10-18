@@ -130,7 +130,6 @@ impl Engine {
         decode: &mut Decode,
         slots: &Slots,
         resident: bool,
-        retain_events: bool,
     ) -> Result<()> {
         let stream = self.device.stream.clone();
         if !resident {
@@ -143,15 +142,12 @@ impl Engine {
             if resident {
                 decode.resident_mask(&self.device, bindings)?;
             }
-            let reader = decode.contribute_device(
+            decode.contribute_device(
                 &self.device,
                 self.moe_ffn_binding(layer)?,
                 bindings,
                 qwen::matrix(&self.work.n, &stream, 0, 1, self.model_spec.hidden as usize)?,
             )?;
-            if retain_events {
-                decode.capture_events.push(reader);
-            }
             if !resident {
                 decode.warmup_completion(&self.device)?;
             }
@@ -192,12 +188,11 @@ impl Engine {
             .context("MoE capture checkpoint missing")?;
         let mut decode = self.moe.take().context("MoE capture executor missing")?;
         let slots = self.moe_slots.take().context("MoE capture slots missing")?;
-        decode.capture_events.reserve(self.model_spec.layers.len());
         decode.segments.reserve(self.model_spec.layers.len());
         let result = (|| -> Result<Option<CudaGraph>> {
             stream.wait(&slots.refill)?;
             checkpoint.save(&self.state, &self.work.token, self.position, &stream, None)?;
-            self.moe_device_decode(&mut decode, &slots, resident, false)?;
+            self.moe_device_decode(&mut decode, &slots, resident)?;
             stream.synchronize()?;
             checkpoint.restore(&mut self.state, &mut self.work.token, &stream)?;
             stream.memcpy_htod(&saved_position, &mut self.work.position)?;
@@ -205,7 +200,7 @@ impl Engine {
             stream.synchronize()?;
             if resident {
                 let graph = record(self, |engine| {
-                    engine.moe_device_decode(&mut decode, &slots, true, true)
+                    engine.moe_device_decode(&mut decode, &slots, true)
                 })?;
                 graph.launch()?;
                 stream.synchronize()?;
@@ -214,7 +209,7 @@ impl Engine {
             for layer in 0..self.model_spec.layers.len() {
                 let route = record(self, |engine| engine.moe_route_segment(layer, &decode))?;
                 let contribute = record(self, |engine| {
-                    let reader = decode.contribute_device(
+                    decode.contribute_device(
                         &engine.device,
                         engine.moe_ffn_binding(layer)?,
                         slots.bindings(layer, &stream)?,
@@ -226,7 +221,6 @@ impl Engine {
                             engine.model_spec.hidden as usize,
                         )?,
                     )?;
-                    decode.capture_events.push(reader);
                     Ok(())
                 })?;
                 let join = record(self, |engine| engine.moe_join_segment(layer, &decode))?;
@@ -262,7 +256,6 @@ impl Engine {
         })();
         if result.is_err() || restored.is_err() {
             decode.segments.clear();
-            decode.capture_events.clear();
         }
         self.capture_checkpoint = Some(checkpoint);
         self.moe = Some(decode);

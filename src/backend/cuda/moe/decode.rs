@@ -7,9 +7,7 @@ use crate::backend::cuda::cubin;
 #[cfg(test)]
 use crate::backend::cuda::moe::combine::{CombineOps, MoeCombine};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{
-    CudaContext, CudaEvent, CudaFunction, CudaStream, LaunchConfig, PushKernelArg,
-};
+use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -166,7 +164,10 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
         input.shared_down.shape,
         input.shared_down.stride
     );
-    input.shared_expert_gate.validate().context("decode shared_expert_gate")?;
+    input
+        .shared_expert_gate
+        .validate()
+        .context("decode shared_expert_gate")?;
     ensure!(
         input.shared_expert_gate.shape == [hidden] && input.shared_expert_gate.stride == [1],
         "decode shared expert gate must be a contiguous [hidden] vector (shape {:?}, stride {:?}, hidden {hidden})",
@@ -256,16 +257,13 @@ impl DecodeOps {
         })
     }
 
-    /// Gate/up pass, down pass and the per-assignment done bits of one
-    /// active cohort. The returned event records completion of the down
-    /// kernel; ids/active/assignment_gen, the slot tables and the output
-    /// buffers are immutable until it completes.
+    /// Contributes one cohort; inputs and slot tables stay immutable until the stream completes.
     pub fn contribute(
         &self,
         stream: &Arc<CudaStream>,
         input: &MoeDecode<'_>,
         scratch: &Scratch,
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         let DecodeDims {
             rows,
             experts,
@@ -326,7 +324,7 @@ impl DecodeOps {
                     shared_mem_bytes: 0,
                 })?;
         }
-        Ok(stream.record_event(None)?)
+        Ok(())
     }
 
     /// One full decode MoE row block: contribute, shared sigmoid scale and
