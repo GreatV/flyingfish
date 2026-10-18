@@ -23,11 +23,8 @@ impl RouteOps {
         let module = cubin::module(ctx, "moe_route")?;
         let blas = CudaBlas::new(stream.clone())?;
         unsafe {
-            bs::cublasSetMathMode(
-                *blas.handle(),
-                bs::cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
-            )
-            .result()?;
+            bs::cublasSetMathMode(*blas.handle(), bs::cublasMath_t::CUBLAS_DEFAULT_MATH)
+                .result()?;
         }
         Ok(Self {
             route: module.load_function("moe_route_bf16")?,
