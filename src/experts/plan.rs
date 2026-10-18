@@ -765,6 +765,7 @@ impl TierLedger {
     }
 
     /// Drops a GPU-only expert to the disk tier without a host copy.
+    #[cfg(test)]
     pub fn evict_gpu(&mut self, layer: u32, expert: u32) -> Result<()> {
         self.check_index(layer, expert)?;
         let (l, e) = (layer as usize, expert as usize);

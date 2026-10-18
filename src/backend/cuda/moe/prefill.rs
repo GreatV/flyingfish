@@ -1,68 +1,7 @@
-//! MoE prefill op: per-expert count/scan/permute, two cuBLAS grouped GEMM
-//! stages (cublasGemmGroupedBatchedEx, one problem per expert), silu_mul
-//! activation (kernels/act.cu), the per-assignment scatter (moe_scatter) and
-//! the shared combine (kernels/moe_combine.cu).
-//!
-//! Grouped-GEMM column-major mapping of the row-major buffers:
-//!   GEMM1 per expert e with m_e routed rows:
-//!     gemm(opA=T, opB=N, m=2I, n=m_e, k=H, lda=H, ldb=H, ldc=2I)
-//!     A = gate_up_e row-major [2I,H] = column-major [H,2I]; op(A)=[2I,H].
-//!     B = X_perm_e row-major [m_e,H] = column-major [H,m_e].
-//!     C = H1_e row-major [m_e,2I] = column-major [2I,m_e];
-//!     C = op(A)·B = H1_e^T, i.e. H1_e = X_perm_e·gate_up_e^T.
-//!   GEMM2 per expert e over the expert's whole segment:
-//!     gemm(opA=T, opB=N, m=H, n=m_e, k=I, lda=I, ldb=I, ldc=H)
-//!     A = down_e row-major [H,I]; B = act_e [m_e,I]; C = Y_perm_e [m_e,H]
-//!     at segment offset offsets[e], so Y_perm is one contiguous
-//!     [active_assignments, H] buffer in expert-segment order.
-//!   moe_scatter computes contributions[a] = BF16(Y_perm[pos_of[a]] *
-//!   weights[a]) on the active assignments (pos_of[a] = the segment position
-//!   moe_permute claimed for assignment a), giving the combine its
-//!   per-(row, choice) contribution at slot a = row*top_k + choice.
-//!   Shared expert runs as extra problems over all rows: gate and up as one
-//!   m=I, n=rows, k=H group of size 2 writing the two halves of H1s
-//!   [rows,2I] (ldc=2I), down as one m=H, n=rows, k=I problem (FP32
-//!   accumulate, BF16 out, alpha=1, beta=0) writing shared_out [rows,H].
-//!
-//! Count sync and the persistent stage: the m/n/k/ld arrays of this cuBLAS
-//! API are host-side, so after the permute launch one pinned D2H copy moves
-//! the scratch span [counts, offsets end] (counts[E], the active-assignment
-//! total and the scan total) to the host and the stream synchronizes once per
-//! call. Per-expert problem sizes and the routed GEMMs' A/B/C device pointer
-//! arrays are rebuilt in pinned host mirrors and copied back with one pinned
-//! H2D per GEMM call. The stage (pinned D2H window, pinned pointer mirrors,
-//! device pointer blocks, reused host Vecs) is created once in
-//! `PrefillOps::new` with capacity for `MAX_EXPERTS` experts; expert counts
-//! above the capacity error by name in validation, and the copy helpers
-//! bound-check every transfer against the stage capacity. The per-expert
-//! weight pointers come from the caller's host slot tables; the tables and
-//! every input tensor are immutable until the returned event.
-//!
-//! Contribute/wrapper split: `prefill_contribute` runs
-//! count→scan→permute→GEMM1→silu→GEMM2→scatter for one cohort's active
-//! assignments into CALLER-OWNED contributions [rows,top_k,hidden] and done
-//! [rows,top_k] buffers — no zero/reset of either, no shared FFN, no sigmoid
-//! gate, no combine — and returns the completion event of the cohort's last
-//! launch. Consecutive cohorts write disjoint (row, choice) sets into the
-//! same buffers; the permute done-claim is exactly-once across cohorts. The
-//! `prefill` wrapper zeroes the scratch-backed done buffer, contributes the
-//! all-active cohort, then runs the shared FFN (one grouped gate/up call,
-//! silu, one grouped down call over a single 9-pointer block), the sigmoid
-//! gate and the combine, returning the combine event. Per call the
-//! contribute path issues one pinned D2H and at most two pinned H2D; the
-//! wrapper adds one more 9-pointer H2D.
-//!
-//! Active cohort and slot generation: `active [rows,top_k]` selects the
-//! assignments this launch computes; inactive assignments are never
-//! dereferenced and trip no guard. An active assignment on a slot with
-//! slot_valid == 0 or slot_generation != assignment_gen (the per-assignment
-//! snapshot at routing time) traps. Permute records pos_of[a] and sets
-//! done[a] = 1 exactly once (a pre-set done traps); the scan total is
-//! asserted equal to the count kernel's active-assignment total. When that
-//! total is zero the routed problems (grouped GEMMs, silu, gemm2, scatter)
-//! are skipped and the combine writes the shared-only output.
-//!
-//! Zero-count experts are excluded from the problem list.
+//! Cohorts write caller-owned weighted BF16 contributions and done bits.
+//! Grouped GEMMs use opA=T/opB=N over native [2I,H] and [H,I] expert weights.
+//! Count/scan/permute stage one host count read and two pointer-table uploads per cohort.
+//! Finish runs the shared FFN and one combine after every contribution is complete.
 use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
@@ -99,10 +38,7 @@ pub(crate) const GEMM2_PTR_WORDS: usize = 3 * (MAX_EXPERTS + 1);
 /// group.
 const MAX_GROUPS: usize = MAX_EXPERTS + 2;
 
-/// One cohort's contribute input. `contributions` and `done` are
-/// CALLER-OWNED and survive across cohorts; every other tensor and both slot
-/// tables are immutable until the event returned by
-/// `PrefillOps::prefill_contribute`.
+/// Caller-owned contribution/done buffers survive cohorts; inputs stay immutable until stream completion.
 #[derive(Debug)]
 pub(crate) struct MoePrefillContribute<'a> {
     pub x: Tensor<bf16, 2>,
@@ -145,10 +81,10 @@ pub(crate) struct MoePrefill<'a> {
     pub slot_generation: Tensor<u64, 1>,
     pub assignment_gen: Tensor<u64, 2>,
     /// `[experts]` device addresses of each expert's fused gate/up blocks.
-    /// Immutable until the event returned by `PrefillOps::prefill`.
+    /// Immutable until the stream completes.
     pub slots_gate_up_host: &'a [u64],
     /// `[experts]` device addresses of each expert's down blocks.
-    /// Immutable until the event returned by `PrefillOps::prefill`.
+    /// Immutable until the stream completes.
     pub slots_down_host: &'a [u64],
     pub shared_gate: Tensor<bf16, 2>,
     pub shared_up: Tensor<bf16, 2>,
@@ -796,12 +732,7 @@ impl PrefillOps {
         })
     }
 
-    /// Contribute one cohort: count→scan→permute→GEMM1→silu→GEMM2→scatter
-    /// over THIS cohort's active assignments into the caller-owned
-    /// contributions/done buffers. No zero/reset of either buffer, no shared
-    /// FFN, no sigmoid gate, no combine; a cohort with no active assignments
-    /// runs no routed problem. Every input tensor and both slot tables are
-    /// immutable until this stream completes.
+    /// Count→scan→permute→GEMM1→silu→GEMM2→scatter into caller-owned contribution/done buffers.
     pub fn prefill_contribute(
         &self,
         stream: &Arc<CudaStream>,
@@ -1256,12 +1187,7 @@ impl PrefillOps {
         Ok(())
     }
 
-    /// cublasGemmGroupedBatchedEx with BF16 A/B/C, CUBLAS_COMPUTE_32F,
-    /// alpha=1, beta=0, opA=T, opB=N for every group. `block` is the device
-    /// address of the pointer block holding `problems` A pointers, then
-    /// `problems` B pointers, then `problems` C pointers; the per-group
-    /// m/n/k/ld/size arrays come from the stage.
-    ///
+    /// BF16 A/B/C, FP32 accumulation, alpha=1, beta=0, opA=T, opB=N.
     /// # Safety
     /// `block` must address 3*`problems` device pointers whose targets match
     /// the group shapes and are kept alive until the stream completes.

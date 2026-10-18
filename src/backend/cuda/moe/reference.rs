@@ -1,14 +1,6 @@
-//! Host fixture and numerics reference for the MoE operator gates.
-//! Semantics follow the model definition, transformers 5.19 qwen3_5_moe
-//! (Qwen3_5MoeTopKRouter, Qwen3_5MoeExperts, Qwen3_5MoeSparseMoeBlock):
-//! router logits are FP32 accumulations rounded to BF16 (F.linear boundary),
-//! softmax runs in FP32 over the BF16 logits, top-k is descending with exact
-//! ties broken by the lower expert id, the selected weights are renormalised
-//! in FP32 and cast to BF16. Expert gate/up outputs, SiLU, the gate·up
-//! product, the down output and each weighted contribution round at BF16
-//! boundaries; contributions accumulate in ascending expert id with BF16
-//! rounding per addition (index_add_); sigmoid(x·shared_expert_gate) scales
-//! the shared expert and the final sums round to BF16.
+//! MoE model-definition oracle: BF16 linear/SiLU/product/contribution boundaries.
+//! Router softmax and weight renormalization use FP32; exact ties select lower expert ids.
+//! The grouped_mm form sums routed contributions in FP32, rounds to BF16, then adds gated BF16 shared output.
 use half::bf16;
 
 #[derive(Clone, Copy, Debug)]

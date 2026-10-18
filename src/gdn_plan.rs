@@ -157,9 +157,9 @@ pub struct Region {
 pub struct GdnWorkspace {
     /// `[R, conv_dim]` BF16 — the conv result, SiLU'd in place; there is no `act` region.
     pub conv_out: Region,
-    /// `[R, 16, 128]` BF16 — Q after `l2_heads`, KEY heads, before the widen.
+    /// `[R, hk, dk]` BF16 Q after `l2_heads`; empty for FP32 normalization.
     pub q_bf16: Region,
-    /// `[R, 16, 128]` BF16 — K after `l2_heads`, KEY heads.
+    /// `[R, hk, dk]` BF16 K after `l2_heads`; empty for FP32 normalization.
     pub k_bf16: Region,
     // No `v_bf16` region: `gdn_prep_fp32` reads V in place from `conv_out` at row stride conv_dim.
     /// `[R, hv]` BF16 — `beta = BF16(sigmoid(b))`, as emitted by `gdn_gates`.

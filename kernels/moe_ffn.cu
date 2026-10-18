@@ -1,33 +1,7 @@
-// Decode MoE expert FFN contribute stage, bf16, rows in [1,8]: top-k routed
-// experts addressed through device slot tables plus one shared expert, each
-// active routed assignment writing one weighted BF16 contribution row and the
-// shared expert one ungated output row for moe_combine.
-// Active assignment cohort: active[r][seg] == 0 skips the assignment entirely
-// (no slot dereference, no h element written, no contribution, no done bit);
-// the shared expert (seg == K) always computes. An active assignment traps
-// when slot_valid[id] == 0 or slot_generation[id] != assignment_gen[a], the
-// per-assignment snapshot of the slot generation at routing time.
-// moe_ffn_gate_up: grid (ceil(I/32), rows, K+1), block 256, dynamic smem
-//   hidden*2 bytes. Each 8-lane group computes one intermediate element
-//   h[(r*K+seg)*I+j] = bf16(bf16(silu(bf16(x_r.gate_j))) * bf16(x_r.up_j));
-//   seg < K reads rows j and I+j of expert ids[r][seg]'s gate_up block,
-//   seg == K reads shared_gate/shared_up into h_shared[r*I+j]. Block (0,r,0)
-//   thread 0 traps on duplicate ids among the row's active choices; ids of
-//   inactive choices are never read.
-// moe_ffn_down: grid (ceil(H/16), rows, K+1), block 128. Each 8-lane group
-//   computes one output element:
-//   seg < K: contributions[(r*K+seg)*H+d] = bf16(bf16(down_e_k[h_row])[d] *
-//                                              weights[r][seg]);
-//   seg == K: shared_out[r*H+d] = bf16(shared_down[h_shared[r]][d]), ungated;
-//   moe_shared_scale and moe_combine apply the sigmoid gate. Block (0,r,seg)
-//   thread 0 of an active routed assignment writes done[r*K+seg] = 1 exactly
-//   once; an already-set done traps (double-write detection).
-// Weight bytes per row at E=256,K=8,H=2048,I=512: gate_up streams
-// K*2I*H*2 + 2I*H*2 = 37.7 MB, down streams K*H*I*2 + H*I*2 = 18.9 MB;
-// 56.6 MB total, no expert byte read twice within a launch. h makes one round
-// trip through scratch: rows*(K+1)*I*2*2 = 147456 B at rows=8, 0.26% of the
-// streamed bytes. 16-byte vector loads; every expert row is read once, by one
-// 8-lane group sweeping it in 128-byte warp segments.
+// BF16 routed and shared expert contributions for rows1..8; caller-owned done bits.
+// gate_up: grid(ceil(I/32),rows,K+1), block256, smem=H*2; down: grid(ceil(H/16),rows,K+1), block128.
+// Active assignments require valid slots, matching generations and distinct expert ids.
+// Expert row pointers and shared weights are 16-byte aligned.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 

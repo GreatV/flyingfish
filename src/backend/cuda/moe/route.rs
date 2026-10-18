@@ -102,15 +102,8 @@ impl RouteOps {
         no_overlap(&ids.0, &logits.0, "ids", "logits")?;
         no_overlap(&weights.0, &logits.0, "weights", "logits")?;
 
-        // Column-major mapping of the row-major buffers:
-        //   x [rows, H] row-major = [H, rows] column-major, ld = H.
-        //   router [E, H] row-major = [H, E] column-major, ld = H.
-        //   logits [rows, E] row-major = [E, rows] column-major, ld = E.
-        // gemmEx(opA=T, opB=N, m=E, n=rows, k=H, A=router, B=x, C=logits)
-        // computes op(A)·B = [E, rows] column-major = x·routerᵀ row-major.
-        // CUBLAS_COMPUTE_32F with CUBLAS_GEMM_DEFAULT: cublasGemmEx takes no
-        // caller workspace. lda = ldb = H (H % 8 == 0 from validate keeps the
-        // A/B rows 16-byte aligned); ldc = E.
+        // opA=T/opB=N: router[H,E] * x[H,rows] -> logits[E,rows], column-major.
+        // CUBLAS_COMPUTE_32F/CUBLAS_GEMM_DEFAULT; lda=ldb=H, ldc=E.
         let alpha = 1f32;
         let beta = 0f32;
         unsafe {
