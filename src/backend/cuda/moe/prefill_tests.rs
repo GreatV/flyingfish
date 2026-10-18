@@ -1838,14 +1838,13 @@ fn prefill_reset_done_gpu() -> Result<()> {
     }
     let status = std::process::Command::new(std::env::current_exe()?)
         .args([
-            "moe_prefill_gpu",
+            "prefill_reset_done_gpu",
             "--ignored",
             "--test-threads=1",
             "--nocapture",
         ])
         .env("FF_Q38_GPU_WINDOW", "granted")
         .env("FF_MOE_CHILD", "resetdone")
-        .env_remove("FF_MOE_TIMING")
         .status()?;
     anyhow::ensure!(!status.success(), "reset-done child exited successfully");
     anyhow::ensure!(
