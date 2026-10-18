@@ -161,17 +161,23 @@ impl HostBlocks {
         let mut unique = blocks.to_vec();
         unique.sort_unstable();
         unique.dedup();
-        let _guard = self.claim.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self
+            .claim
+            .lock()
+            .map_err(|error| anyhow::anyhow!("host block claim mutex poisoned: {error}"))?;
         for (index, &block) in unique.iter().enumerate() {
             let word = &self.words[block as usize];
-            let current = word.load(Ordering::Acquire);
-            if current == WRITER {
+            if let Err(current) = word.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1).filter(|&count| count < WRITER)
+            }) {
                 for &held in &unique[..index] {
                     self.words[held as usize].fetch_sub(1, Ordering::AcqRel);
                 }
-                anyhow::bail!("host block {block} is writer-claimed");
+                if current == WRITER {
+                    anyhow::bail!("host block {block} is writer-claimed");
+                }
+                anyhow::bail!("host block {block} reader count overflow: count={current}");
             }
-            word.store(current + 1, Ordering::Release);
         }
         Ok(BlockLease {
             arena: self.clone(),
@@ -182,7 +188,10 @@ impl HostBlocks {
     /// Claims one block exclusively; fails while it is leased or claimed.
     pub fn claim(self: &Arc<Self>, block: u32) -> Result<WriteClaim> {
         self.block_range(block)?;
-        let _guard = self.claim.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self
+            .claim
+            .lock()
+            .map_err(|error| anyhow::anyhow!("host block claim mutex poisoned: {error}"))?;
         self.words[block as usize]
             .compare_exchange(0, WRITER, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|current| {
@@ -194,6 +203,7 @@ impl HostBlocks {
         })
     }
 
+    #[cfg(test)]
     pub fn lease_count(&self, block: u32) -> Result<u32> {
         self.block_range(block)?;
         Ok(self.words[block as usize].load(Ordering::Acquire))
@@ -579,6 +589,42 @@ mod tests {
         drop(claim);
         let lease = arena.lease(&[0])?;
         assert_eq!(lease.read(0)?, values.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_lease_release_preserves_the_reader_count() -> Result<()> {
+        let arena = HostBlocks::new(1, 4)?;
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| -> Result<()> {
+            let arena = &arena;
+            let barrier = &barrier;
+            let releasing = scope.spawn(move || -> Result<()> {
+                for delay in 0..100_000 {
+                    let lease = arena.lease(&[0])?;
+                    barrier.wait();
+                    for _ in 0..delay % 64 {
+                        std::hint::spin_loop();
+                    }
+                    drop(lease);
+                    barrier.wait();
+                }
+                Ok(())
+            });
+            for _ in 0..100_000 {
+                barrier.wait();
+                let lease = arena.lease(&[0])?;
+                drop(lease);
+                barrier.wait();
+            }
+            releasing
+                .join()
+                .map_err(|_| anyhow::anyhow!("lease-release thread panicked"))??;
+            Ok(())
+        })?;
+        assert_eq!(arena.lease_count(0)?, 0);
+        let claim = arena.claim(0)?;
+        drop(claim);
         Ok(())
     }
 
