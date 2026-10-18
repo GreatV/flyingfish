@@ -31,6 +31,7 @@ pub struct DraftConfig {
 pub struct Rope {
     pub rope_theta: f32,
     pub rope_type: String,
+    pub rope_dim: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,32 +97,55 @@ impl DraftConfig {
     pub fn capture_width(&self) -> usize {
         self.target_layer_ids.len() * self.hidden_size
     }
+    pub fn kv_dim(&self) -> usize {
+        self.num_key_value_heads * self.head_dim
+    }
+    pub fn qkv_dim(&self) -> usize {
+        (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim
+    }
     pub fn read(path: &Path, target: &Config) -> Result<Self> {
-        let path = path.join("config.json");
-        let c: Self = serde_json::from_slice(
-            &std::fs::read(&path)
-                .with_context(|| format!("read draft config {}", path.display()))?,
-        )?;
+        let c: Self = serde_json::from_value(read_config(path)?)?;
         ensure!(
             c.model_type == "qwen3" && c.architectures == ["Qwen3DSparkModel"],
             "unsupported DSpark architecture"
         );
         ensure!(c.dtype == "bfloat16", "DSpark dtype must be bfloat16");
         ensure!(
-            c.hidden_size == target.hidden_size
-                && c.intermediate_size == target.intermediate_size
-                && c.num_attention_heads == target.num_attention_heads
-                && c.num_key_value_heads == target.num_key_value_heads
-                && c.head_dim == target.head_dim,
-            "DSpark/target dimensions do not match"
+            c.hidden_size == target.hidden_size,
+            "DSpark/target hidden_size mismatch"
         );
         ensure!(
-            c.vocab_size == target.vocab_size && c.draft_vocab_size == target.vocab_size,
+            matches!(
+                (c.num_attention_heads, c.num_key_value_heads, c.head_dim),
+                (16, 2, 128) | (8, 2, 256)
+            ) && c.num_attention_heads.checked_mul(c.head_dim) == Some(c.hidden_size),
+            "unsupported DSpark attention geometry"
+        );
+        ensure!(
+            c.intermediate_size > 0 && c.intermediate_size.is_multiple_of(256),
+            "unsupported DSpark intermediate_size"
+        );
+        ensure!(
+            c.vocab_size == target.vocab_size,
             "DSpark shared vocabulary mismatch"
         );
         ensure!(
-            c.num_hidden_layers == 5 && c.block_size == 7 && c.markov_rank == 256,
-            "DSpark requires 5 layers, gamma7 and markov rank256"
+            c.draft_vocab_size == c.vocab_size,
+            "DSpark draft_vocab_size differs from vocab_size"
+        );
+        ensure!(
+            c.num_hidden_layers == 5 && c.markov_rank == 256,
+            "DSpark requires five layers and Markov rank256"
+        );
+        ensure!(
+            (1..=64).contains(&c.block_size),
+            "DSpark block_size exceeds the 64-row attention mask"
+        );
+        ensure!(
+            c.block_size.checked_mul(c.vocab_size).is_some()
+                && c.vocab_size <= i32::MAX as usize
+                && c.capture_width().checked_mul(c.hidden_size).is_some(),
+            "DSpark tensor extent overflow"
         );
         ensure!(
             c.num_target_layers == target.num_hidden_layers,
@@ -140,17 +164,57 @@ impl DraftConfig {
         );
         ensure!(
             c.rope_parameters.rope_type == "default"
-                && c.rope_parameters.rope_theta == target.rope_theta,
-            "DSpark/target RoPE mismatch"
+                && c.rope_parameters.rope_theta.is_finite()
+                && c.rope_parameters.rope_theta > 0.0
+                && c.rope_parameters.rope_dim.unwrap_or(c.head_dim) == c.head_dim,
+            "DSpark requires default full-head rotary geometry"
         );
         Ok(c)
     }
 }
 
+fn read_config(path: &Path) -> Result<serde_json::Value> {
+    let path = path.join("config.json");
+    let mut value: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("read draft config {}", path.display()))?,
+    )?;
+    if let Some(nested) = value.get("dflash_config").cloned() {
+        let fields = nested.as_object().context("invalid DSpark dflash_config")?;
+        let root = value.as_object_mut().context("invalid DSpark config")?;
+        for name in [
+            "target_layer_ids",
+            "mask_token_id",
+            "markov_rank",
+            "markov_head_type",
+            "projector_type",
+        ] {
+            if let Some(field) = fields.get(name) {
+                if let Some(existing) = root.get(name) {
+                    ensure!(
+                        name != "target_layer_ids" && existing == field,
+                        "ambiguous DSpark config field {name}"
+                    );
+                }
+                root.insert(name.into(), field.clone());
+            }
+        }
+        for (name, expected) in [
+            ("attention_mode", serde_json::json!("gqa")),
+            ("enable_confidence_head", serde_json::json!(true)),
+            ("confidence_head_with_markov", serde_json::json!(true)),
+            ("confidence_head_alpha", serde_json::json!(1.0)),
+        ] {
+            if let Some(actual) = fields.get(name) {
+                ensure!(*actual == expected, "unsupported DSpark {name}");
+            }
+        }
+    }
+    Ok(value)
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn read_capture_layers(path: &Path, target: &Config) -> Result<Vec<usize>> {
-    let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
+    let value = read_config(path)?;
     ensure!(
         value["architectures"] == serde_json::json!(["Qwen3DSparkModel"]),
         "unsupported capture draft architecture"
@@ -165,14 +229,12 @@ pub(crate) fn read_capture_layers(path: &Path, target: &Config) -> Result<Vec<us
             "capture draft/target {name} mismatch"
         );
     }
-    let flat = value.get("target_layer_ids");
-    let nested = value
-        .get("dflash_config")
-        .and_then(|config| config.get("target_layer_ids"));
-    let ids: Vec<usize> = match (flat, nested) {
-        (Some(ids), None) | (None, Some(ids)) => serde_json::from_value(ids.clone())?,
-        _ => anyhow::bail!("capture config requires exactly one target_layer_ids field"),
-    };
+    let ids: Vec<usize> = serde_json::from_value(
+        value
+            .get("target_layer_ids")
+            .context("DSpark target_layer_ids missing")?
+            .clone(),
+    )?;
     check_capture_layers(&ids, target.num_hidden_layers)?;
     Ok(ids)
 }
@@ -303,6 +365,87 @@ mod tests {
                 ensure!(
                     read_capture_layers(&root, &target).is_err(),
                     "invalid capture extent admitted"
+                );
+            }
+            let mut full = flat.clone();
+            for (name, value) in serde_json::json!({
+                "model_type":"qwen3", "dtype":"bfloat16", "intermediate_size":6144,
+                "num_hidden_layers":5, "num_attention_heads":16, "num_key_value_heads":2,
+                "head_dim":128, "draft_vocab_size":130560, "rms_norm_eps":1e-6,
+                "block_size":7, "mask_token_id":75982, "markov_rank":256,
+                "markov_head_type":"vanilla", "projector_type":"dspark",
+                "rope_parameters":{"rope_theta":5000000.0,"rope_type":"default"}
+            })
+            .as_object()
+            .context("draft fixture object")?
+            {
+                full[name] = value.clone();
+            }
+            write(&full)?;
+            ensure!(
+                DraftConfig::read(&root, &target)?.block_size == 7,
+                "dense draft rejected"
+            );
+            let mut hybrid_target = target;
+            hybrid_target.intermediate_size = 512;
+            hybrid_target.num_attention_heads = 16;
+            hybrid_target.head_dim = 256;
+            hybrid_target.vocab_size = 248144;
+            hybrid_target.num_hidden_layers = 40;
+            hybrid_target.rope_theta = 1e7;
+            for (name, value) in serde_json::json!({
+                "num_attention_heads":8, "head_dim":256, "vocab_size":248144,
+                "draft_vocab_size":248144, "num_target_layers":40, "block_size":15,
+                "rope_parameters":{"rope_theta":1e7,"rope_type":"default","rope_dim":256}
+            })
+            .as_object()
+            .context("hybrid draft fixture object")?
+            {
+                full[name] = value.clone();
+            }
+            let mut nested = serde_json::Map::new();
+            for name in [
+                "target_layer_ids",
+                "mask_token_id",
+                "markov_rank",
+                "markov_head_type",
+                "projector_type",
+            ] {
+                nested.insert(
+                    name.into(),
+                    full.as_object_mut()
+                        .context("draft object")?
+                        .remove(name)
+                        .context("draft field")?,
+                );
+            }
+            nested.insert(
+                "target_layer_ids".into(),
+                serde_json::json!([3, 11, 19, 27, 35]),
+            );
+            nested.insert("mask_token_id".into(), serde_json::json!(248076));
+            full["dflash_config"] = nested.into();
+            write(&full)?;
+            let draft = DraftConfig::read(&root, &hybrid_target)?;
+            ensure!(
+                draft.block_size == 15 && draft.kv_dim() == 512 && draft.qkv_dim() == 3072,
+                "draft geometry borrowed target dimensions"
+            );
+            for (field, value) in [
+                ("draft_vocab_size", serde_json::json!(130560)),
+                ("block_size", serde_json::json!(65)),
+                ("num_attention_heads", serde_json::json!(16)),
+                (
+                    "rope_parameters",
+                    serde_json::json!({"rope_theta":1e7,"rope_type":"default","rope_dim":64}),
+                ),
+            ] {
+                let mut invalid = full.clone();
+                invalid[field] = value;
+                write(&invalid)?;
+                ensure!(
+                    DraftConfig::read(&root, &hybrid_target).is_err(),
+                    "invalid draft geometry admitted"
                 );
             }
             Ok(())
