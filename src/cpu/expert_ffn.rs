@@ -146,6 +146,11 @@ pub struct Scratch {
 }
 
 impl Scratch {
+    #[cfg(test)]
+    pub(crate) fn stages(&self) -> [&[bf16]; 4] {
+        [&self.gate_bf, &self.up_bf, &self.activated, &self.down_bf]
+    }
+
     pub fn new(shape: &Shape) -> Self {
         Self {
             hidden: vec![0.0; shape.hidden],
