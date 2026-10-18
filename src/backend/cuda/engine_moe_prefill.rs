@@ -1169,6 +1169,25 @@ impl Engine {
                     admitted.len() as u32,
                     ffn,
                 )?;
+                #[cfg(test)]
+                if trace.is_some() {
+                    let experts = prefill
+                        .plan
+                        .cpu()
+                        .iter()
+                        .map(|&expert| {
+                            Ok((
+                                expert,
+                                prefill.counts[expert as usize],
+                                slots.policy.ledger().tier(layer as u32, expert)?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    println!(
+                        "minicpm_prefill_cpu span_start={span_start} rows={} layer={layer} experts={experts:?}",
+                        admitted.len()
+                    );
+                }
                 for base in (0..admitted.len()).step_by(prefill.capacity.wave_rows as usize) {
                     let rows = (prefill.capacity.wave_rows as usize).min(admitted.len() - base);
                     prefill.finish_wave(
