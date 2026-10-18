@@ -199,7 +199,7 @@ fn host_fill_order(
     initial: &[Vec<u32>],
     geometry: &ExpertGeometry,
     host_blocks: u32,
-) -> Result<Vec<(u32, u32)>> {
+) -> Vec<(u32, u32)> {
     let mut per_layer: Vec<Vec<u32>> = Vec::with_capacity(geometry.layers as usize);
     for set in initial {
         per_layer.push(
@@ -227,12 +227,7 @@ fn host_fill_order(
         }
         rank += 1;
     }
-    ensure!(
-        order.len() == host_blocks as usize,
-        "host tier {host_blocks} exceeds {} non-GPU experts",
-        order.len()
-    );
-    Ok(order)
+    order
 }
 
 impl Residency {
@@ -312,7 +307,7 @@ impl Residency {
             }
         }
         let mut host_block = vec![vec![NO_BLOCK; experts]; layers];
-        let order = host_fill_order(initial, &geometry, capacity.host_blocks)?;
+        let order = host_fill_order(initial, &geometry, capacity.host_blocks);
         let mut host_bytes = 0u64;
         for (index, &(layer, expert)) in order.iter().enumerate() {
             let block = u32::try_from(index).context("host block id exceeds u32")?;
@@ -1709,6 +1704,75 @@ mod tests {
         }
         assert_eq!(residency.free_host_blocks(), 0);
         assert!(residency.begin_request(&frequency)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn host_surplus_above_full_coverage_absorbs_borrow_victims() -> Result<()> {
+        let geometry = geometry();
+        let reserves = reserves();
+        let service = service();
+        let layout = bf16_layout(&geometry)?;
+        let slot = layout.slot_bytes();
+        let cap = 2u32;
+        let spare = cap;
+        let host_blocks = 14u32;
+        let inputs = PlanInputs {
+            geometry,
+            layout,
+            device_free_bytes: reserves.persistent_bytes(slot)?
+                + u64::from(slots(geometry)?) * slot,
+            host_available_bytes: reserves.host_bytes(slot)?
+                + u64::from(host_blocks + spare) * slot,
+            h2d_bytes_per_second: 1e9,
+            d2h_bytes_per_second: 1e9,
+            copy_engines: 2,
+            disk_readers: 1,
+            host_registration_bytes: u64::MAX,
+            service: &service,
+            reserves: &reserves,
+            span_rows: 4,
+            wave_rows: 2,
+        };
+        let mut capacity = capacity(&inputs, cap)?;
+        assert_eq!(
+            capacity.host_blocks, 12,
+            "the planner clamps to the non-GPU count"
+        );
+        capacity.host_blocks = host_blocks;
+        let admission = Admission {
+            budget_bytes_per_token: slot * u64::from(cap),
+        };
+        let host = HostBlocks::new(host_blocks + spare, usize::try_from(slot / 2)?)?;
+        let (dir, catalogue) = staged(geometry)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let frequency = frequency();
+        let initial = initial_residency(&frequency, &capacity.slots_per_layer, &geometry)?;
+        let (mut residency, report) = Residency::load(LoadInputs {
+            geometry,
+            capacity,
+            admission,
+            max_rows: 8,
+            initial: &initial,
+            host: Some(&host),
+            catalogue: &catalogue,
+            reader: &reader,
+        })?;
+        assert_eq!(
+            report.host_bytes,
+            12 * slot,
+            "only the non-GPU experts are loaded"
+        );
+        assert_eq!(residency.free_host_blocks(), host_blocks - 12 + spare);
+        let borrow = residency.borrow(2)?;
+        assert_eq!((borrow.to_host, borrow.to_disk), (2, 0));
+        assert_eq!(borrow.d2h_bytes, 2 * slot);
+        assert_eq!(borrow.disk_bytes, 0);
+        assert_eq!(residency.free_host_blocks(), spare);
+        assert_eq!(residency.ledger().unique_bytes()?, 16 * slot);
+        assert_eq!(residency.ledger().disk_bytes()?, 0);
+        let returned = residency.refill()?;
+        assert_eq!(returned.len(), 2);
         Ok(())
     }
 
