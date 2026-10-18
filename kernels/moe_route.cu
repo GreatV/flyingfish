@@ -177,6 +177,7 @@ extern "C" __global__ void moe_route_topk(
 }
 
 // Stream-ordered publication of one native expert slot and its generation.
+// victim is -1 or differs from incoming; a valid incoming epoch strictly increases.
 extern "C" __global__ void moe_slot_publish(
     uint64_t* gate_up, uint64_t* down, uint32_t* valid, uint64_t* generation,
     int experts, int incoming, int victim, uint64_t gu, uint64_t dn,
@@ -185,6 +186,7 @@ extern "C" __global__ void moe_slot_publish(
   if (experts <= 0 || incoming < 0 || incoming >= experts || victim < -1 ||
       victim >= experts || victim == incoming || gu == 0 || dn == 0 ||
       (gu & 15) != 0 || (dn & 15) != 0 || epoch == 0) __trap();
+  if (valid[incoming] == 1 && generation[incoming] >= epoch) __trap();
   if (victim >= 0) {
     valid[victim] = 0;
     generation[victim] = 0;

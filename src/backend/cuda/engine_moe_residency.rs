@@ -471,6 +471,7 @@ fn check_publish(
     gu: u64,
     down: u64,
     generation: u64,
+    previous: u64,
 ) -> Result<()> {
     ensure!(
         experts > 0
@@ -482,6 +483,10 @@ fn check_publish(
     ensure!(
         gu > 0 && down > 0 && gu.is_multiple_of(16) && down.is_multiple_of(16) && generation > 0,
         "expert publication pointer/generation: gu={gu:#x} down={down:#x} generation={generation}"
+    );
+    ensure!(
+        previous < generation,
+        "expert publication epoch: incoming={incoming} previous={previous} generation={generation}"
     );
     Ok(())
 }
@@ -637,7 +642,20 @@ impl Slots {
         let down = pointer
             .checked_add(geometry.gate_up_bytes()?)
             .context("expert down pointer overflow")?;
-        check_publish(geometry.experts, expert, victim, pointer, down, generation)?;
+        let offset = layer as usize * geometry.experts as usize;
+        let previous = *self
+            .published
+            .get(offset + expert as usize)
+            .context("expert publication layer/expert outside generation table")?;
+        check_publish(
+            geometry.experts,
+            expert,
+            victim,
+            pointer,
+            down,
+            generation,
+            previous,
+        )?;
         let tables = self.bindings(layer as usize, &self.transfers.h2d)?;
         let stream = &self.transfers.h2d;
         // SAFETY: checked layer/expert extents and owned tables cover both scalar updates.
@@ -660,7 +678,6 @@ impl Slots {
         self.physical[slot as usize].copy = Some(event.clone());
         self.physical[slot as usize].reader = None;
         self.physical[slot as usize].waited = false;
-        let offset = layer as usize * geometry.experts as usize;
         if let Some(victim) = victim {
             self.published[offset + victim as usize] = 0;
         }
@@ -1053,14 +1070,122 @@ mod tests {
 
     #[test]
     fn slot_publications_and_lifetimes_reject_stale_state() -> Result<()> {
-        check_publish(16, 3, Some(1), 0x1000, 0x2000, 7)?;
-        assert!(check_publish(16, 16, Some(1), 0x1000, 0x2000, 7).is_err());
-        assert!(check_publish(16, 3, Some(3), 0x1000, 0x2000, 7).is_err());
-        assert!(check_publish(16, 3, Some(1), 0x1002, 0x2000, 7).is_err());
-        assert!(check_publish(16, 3, Some(1), 0x1000, 0x2000, 0).is_err());
+        check_publish(16, 3, Some(1), 0x1000, 0x2000, 7, 0)?;
+        check_publish(16, 3, None, 0x1000, 0x2000, 8, 7)?;
+        assert!(check_publish(16, 3, None, 0x1000, 0x2000, 7, 7).is_err());
+        assert!(check_publish(16, 3, None, 0x1000, 0x2000, 6, 7).is_err());
+        assert!(check_publish(16, 16, Some(1), 0x1000, 0x2000, 7, 0).is_err());
+        assert!(check_publish(16, 3, Some(3), 0x1000, 0x2000, 7, 0).is_err());
+        assert!(check_publish(16, 3, Some(1), 0x1002, 0x2000, 7, 0).is_err());
+        assert!(check_publish(16, 3, Some(1), 0x1000, 0x2000, 0, 0).is_err());
         check_lifetime([Some(3), Some(7)], [Some(3), Some(7)])?;
         assert!(check_lifetime([Some(3), Some(7)], [Some(3), None]).is_err());
         assert!(check_lifetime([Some(3), Some(7)], [Some(3), Some(6)]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "authorized GPU window; device traps run in separate processes"]
+    fn slot_publication_epochs_gpu() -> Result<()> {
+        use cudarc::driver::sys::CUresult;
+        use std::{io::Write, process::Command};
+
+        let Ok(case) = std::env::var("FF_MOE_CHILD") else {
+            for case in [
+                "publication_valid",
+                "publication_equal",
+                "publication_older",
+                "publication_victim",
+            ] {
+                let output = Command::new(std::env::current_exe()?)
+                    .args([
+                        "backend::cuda::engine::moe::residency::tests::slot_publication_epochs_gpu",
+                        "--exact",
+                        "--include-ignored",
+                        "--test-threads=1",
+                        "--nocapture",
+                    ])
+                    .env("FF_MOE_CHILD", case)
+                    .output()?;
+                let log = String::from_utf8_lossy(&output.stdout);
+                let expected = if case == "publication_valid" { 0 } else { 3 };
+                ensure!(
+                    output.status.code() == Some(expected)
+                        && log.contains("running 1 test")
+                        && log.contains(&format!("PASS slot_publication_epoch case={case}")),
+                    "publication child case={case} exit={:?} stdout={log} stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                print!("{log}");
+            }
+            return Ok(());
+        };
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let function = super::super::super::super::cubin::module(&device.ctx, "moe_route")?
+            .load_function("moe_slot_publish")?;
+        let cases = match case.as_str() {
+            "publication_valid" => vec![(1, 7, 8, -1), (0, 99, 1, -1), (1, 7, u64::MAX, 1)],
+            "publication_equal" => vec![(1, 7, 7, -1)],
+            "publication_older" => vec![(1, 7, 6, -1)],
+            "publication_victim" => vec![(1, 7, 8, 0)],
+            _ => anyhow::bail!("unknown publication child case={case}"),
+        };
+        for (incoming_valid, previous, epoch, victim) in cases {
+            let mut gate_up = stream.clone_htod(&[0x1000u64, 0x5000])?;
+            let mut down = stream.clone_htod(&[0x2000u64, 0x6000])?;
+            let mut valid = stream.clone_htod(&[incoming_valid, 1u32])?;
+            let mut generation = stream.clone_htod(&[previous, 13u64])?;
+            // SAFETY: the four tables each own two entries; the kernel stores metadata only.
+            let launch = unsafe {
+                stream
+                    .launch_builder(&function)
+                    .arg(&mut gate_up)
+                    .arg(&mut down)
+                    .arg(&mut valid)
+                    .arg(&mut generation)
+                    .arg(&2i32)
+                    .arg(&0i32)
+                    .arg(&victim)
+                    .arg(&0x3000u64)
+                    .arg(&0x4000u64)
+                    .arg(&epoch)
+                    .launch(super::super::super::super::ops::grid(1, 1))
+            };
+            let outcome = launch.and_then(|_| stream.synchronize());
+            if case != "publication_valid" {
+                let error = outcome
+                    .context("DEFECT stale publication did not trap")
+                    .expect_err("DEFECT stale publication did not trap");
+                let driver = error
+                    .downcast_ref::<cudarc::driver::DriverError>()
+                    .context("publication child did not return a driver error")?;
+                ensure!(
+                    matches!(
+                        driver.0,
+                        CUresult::CUDA_ERROR_ILLEGAL_INSTRUCTION
+                            | CUresult::CUDA_ERROR_LAUNCH_FAILED
+                    ),
+                    "publication child case={case} unrelated driver error={driver:?}"
+                );
+                println!("PASS slot_publication_epoch case={case} error={driver:?}");
+                std::io::stdout().flush()?;
+                std::process::exit(3);
+            }
+            outcome?;
+            let removed = victim == 1;
+            ensure!(
+                stream.clone_dtoh(&gate_up)? == [0x3000, if removed { 0 } else { 0x5000 }]
+                    && stream.clone_dtoh(&down)? == [0x4000, if removed { 0 } else { 0x6000 }]
+                    && stream.clone_dtoh(&valid)? == [1, u32::from(!removed)]
+                    && stream.clone_dtoh(&generation)? == [epoch, if removed { 0 } else { 13 }],
+                "DEFECT publication metadata differs previous={previous} epoch={epoch} victim={victim}"
+            );
+        }
+        println!(
+            "PASS slot_publication_epoch case={case} newer=true inactive=true victim_cleared=true"
+        );
         Ok(())
     }
 }
