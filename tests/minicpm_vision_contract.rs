@@ -2,7 +2,9 @@ use anyhow::{Context, Result, ensure};
 use flyingfish::{
     model_spec::{Architecture, ModelSpec},
     serve::detok::Shared,
-    serve::image::{PreparedInput, Processor, RgbImage},
+    serve::image::{
+        PreparedInput, Processor, RgbImage, VideoMetadata, VideoOptions, sample_frame_indices,
+    },
     vision_input::{ImageGrid, merge_groups, nearest_position_ids, window_gather},
 };
 use safetensors::{Dtype, SafeTensors};
@@ -213,6 +215,346 @@ fn processor_layout_pixels_and_canvas_match_reference() -> Result<()> {
         }
     }
     println!("{{\"worst_pixel_max_abs\":{worst_pixels}}}");
+    Ok(())
+}
+
+/// T10 video processor cases: (fixture prefix, decoded clip, max_slice_nums).
+const VIDEO_CASES: [(&str, &str, usize); 4] = [
+    ("football_4s_16x_s1", "football_4s", 1),
+    ("football_4s_16x_s9", "football_4s", 9),
+    ("boat_pan_4s_16x_s1", "boat_pan_4s", 1),
+    ("sample_demo_1_16x_s1", "sample_demo_1", 1),
+];
+
+fn video_ref_dir() -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        std::env::var_os("FF_VIDEO_REF_DIR").context("FF_VIDEO_REF_DIR missing")?,
+    ))
+}
+
+fn i64_values(tensors: &SafeTensors<'_>, name: &str) -> Result<Vec<i64>> {
+    tensor_values(tensors, name, Dtype::I64, i64::from_le_bytes)
+}
+
+fn i32_values(tensors: &SafeTensors<'_>, name: &str) -> Result<Vec<i32>> {
+    tensor_values(tensors, name, Dtype::I32, i32::from_le_bytes)
+}
+
+fn u32_values(tensors: &SafeTensors<'_>, name: &str) -> Result<Vec<u32>> {
+    i64_values(tensors, name)?
+        .into_iter()
+        .map(u32::try_from)
+        .collect::<std::result::Result<_, _>>()
+        .map_err(Into::into)
+}
+
+/// The pre-expansion prompt: the fixture ids with the video block replaced by one placeholder.
+fn video_prompt(ids: &[u32], vision: &flyingfish::model_spec::VisionConfig) -> Result<Vec<u32>> {
+    let markers = vision.minicpm.as_ref().context("MiniCPM markers missing")?;
+    let first = ids
+        .iter()
+        .position(|&id| id == vision.video_token)
+        .context("no video placeholder in the fixture ids")?;
+    let start = ids[..first]
+        .iter()
+        .rposition(|&id| id == vision.start_token)
+        .context("no video opening marker")?;
+    let mut cursor = start;
+    loop {
+        ensure!(
+            ids.get(cursor) == Some(&vision.start_token),
+            "video frame has no opening marker"
+        );
+        cursor += 1;
+        let mut thumb = 0usize;
+        while cursor < ids.len() && ids[cursor] == vision.video_token {
+            cursor += 1;
+            thumb += 1;
+        }
+        ensure!(thumb > 0, "empty video frame run");
+        ensure!(
+            ids.get(cursor) == Some(&vision.end_token),
+            "video frame has no end marker"
+        );
+        cursor += 1;
+        loop {
+            if ids.get(cursor) == Some(&markers.slice_start_token) {
+                cursor += 1;
+                let mut run = 0usize;
+                while cursor < ids.len() && ids[cursor] == vision.video_token {
+                    cursor += 1;
+                    run += 1;
+                }
+                ensure!(run > 0, "empty video slice run");
+                ensure!(
+                    ids.get(cursor) == Some(&markers.slice_end_token),
+                    "video slice has no end marker"
+                );
+                cursor += 1;
+            } else if ids.get(cursor) == Some(&markers.newline_token)
+                && ids.get(cursor + 1) == Some(&markers.slice_start_token)
+            {
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+        if ids.get(cursor) != Some(&vision.start_token) {
+            break;
+        }
+    }
+    let mut prompt = ids[..start].to_vec();
+    prompt.push(vision.video_token);
+    prompt.extend_from_slice(&ids[cursor..]);
+    Ok(prompt)
+}
+
+#[test]
+#[ignore = "CPU-only external fixtures; set FF_MODEL and FF_VIDEO_REF_DIR"]
+fn video_processor_and_canvas_match_reference() -> Result<()> {
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let ref_dir = video_ref_dir()?;
+    let spec = ModelSpec::read(&model)?;
+    ensure!(
+        spec.architecture == Architecture::MiniCpmV47,
+        "fixtures require the MiniCPM spec"
+    );
+    let vision = spec
+        .vision
+        .as_ref()
+        .context("vision configuration missing")?;
+    let tokenizer = Shared::load(&model)?;
+    let processor =
+        Processor::load(&model, Some(&tokenizer))?.context("MiniCPM image processor")?;
+    let processor_bytes =
+        std::fs::read(ref_dir.join("fixtures/video_processor_stack1.safetensors"))?;
+    let processor_tensors = SafeTensors::deserialize(&processor_bytes)?;
+    let frames_bytes = std::fs::read(ref_dir.join("fixtures/video_decoded_frames.safetensors"))?;
+    let frames_tensors = SafeTensors::deserialize(&frames_bytes)?;
+    let reference: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        ref_dir.join("fixtures/video_decode_reference.json"),
+    )?)?;
+    for (case, clip, slice_nums) in VIDEO_CASES {
+        let tensor = frames_tensors.tensor(&format!("{clip}_sampled_rgb"))?;
+        ensure!(tensor.dtype() == Dtype::U8, "{case} sampled rgb dtype");
+        let shape = tensor.shape();
+        ensure!(
+            shape.len() == 4 && shape[3] == 3,
+            "{case} sampled rgb shape"
+        );
+        let (count, height, width) = (shape[0], shape[1], shape[2]);
+        let plane = height * width * 3;
+        let frames: Vec<RgbImage> = (0..count)
+            .map(|index| RgbImage {
+                width,
+                height,
+                pixels: tensor.data()[index * plane..(index + 1) * plane].to_vec(),
+            })
+            .collect();
+        let video_meta = VideoMetadata {
+            total_num_frames: count,
+            fps: 1.0,
+            duration: count as f64,
+        };
+        let options = VideoOptions {
+            max_num_frames: count,
+            stack_frames: 1,
+            max_slice_nums: Some(slice_nums),
+        };
+        let video = processor.prepare_video(&frames, &video_meta, &options)?;
+        assert_eq!(video.frames.len(), count, "{case} frames");
+        let expected_grids = i32_values(&processor_tensors, &format!("{case}_grids_videos"))?;
+        let expected_counts =
+            i32_values(&processor_tensors, &format!("{case}_num_patches_per_frame"))?;
+        let expected_sizes =
+            i32_values(&processor_tensors, &format!("{case}_target_sizes_videos"))?;
+        for (frame, grid) in video.frames.iter().zip(expected_grids.as_chunks::<2>().0) {
+            assert_eq!(
+                [frame.rows as i32, frame.cols as i32],
+                *grid,
+                "{case} frame grid"
+            );
+        }
+        for (frame, crops) in video.frames.iter().zip(&expected_counts) {
+            assert_eq!(frame.grids.len() as i32, *crops, "{case} crops per frame");
+        }
+        let ours: Vec<i32> = video
+            .frames
+            .iter()
+            .flat_map(|frame| {
+                frame
+                    .grids
+                    .iter()
+                    .flat_map(|grid| [grid.h as i32, grid.w as i32])
+            })
+            .collect();
+        assert_eq!(ours, expected_sizes, "{case} target sizes");
+        let ids = u32_values(&processor_tensors, &format!("{case}_input_ids"))?;
+        let prompt = video_prompt(&ids, vision)?;
+        let capacity = ids.len() + 64;
+        let (expanded, prepared) = processor.expand(&prompt, Vec::new(), vec![video], capacity)?;
+        assert_eq!(expanded, ids, "{case} ids");
+        let modality: Vec<u8> =
+            i64_values(&processor_tensors, &format!("{case}_mm_token_type_ids"))?
+                .into_iter()
+                .map(u8::try_from)
+                .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(prepared.modality_ids, modality, "{case} modality");
+        let reference_pixels = tensor_values(
+            &processor_tensors,
+            &format!("{case}_pixel_values_videos"),
+            Dtype::F32,
+            f32::from_le_bytes,
+        )?;
+        assert_eq!(
+            prepared.pixel_values.len(),
+            reference_pixels.len(),
+            "{case} pixel count"
+        );
+        let mut worst = 0.0_f32;
+        for (actual, expected) in prepared.pixel_values.iter().zip(&reference_pixels) {
+            worst = worst.max((actual - expected).abs());
+        }
+        let pil_pixels = tensor_values(
+            &processor_tensors,
+            &format!("{case}_pixel_values_videos_pil"),
+            Dtype::F32,
+            f32::from_le_bytes,
+        )?;
+        let mut pil_floor = 0.0_f32;
+        for (primary, pil) in reference_pixels.iter().zip(&pil_pixels) {
+            pil_floor = pil_floor.max((primary - pil).abs());
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "case": case,
+                "ids": expanded.len(),
+                "crops": prepared.grids.len(),
+                "pixel_max_abs": worst,
+                "pil_arm_max_abs": pil_floor,
+            })
+        );
+        assert!(
+            worst <= PIXEL_TOLERANCE,
+            "{case} pixel error {worst} exceeds {PIXEL_TOLERANCE}"
+        );
+        let clip_meta = &reference["clips"][clip]["ffprobe"];
+        let real = VideoMetadata {
+            total_num_frames: clip_meta["total_num_frames"]
+                .as_u64()
+                .context("clip total frames")? as usize,
+            fps: clip_meta["fps"].as_f64().context("clip fps")?,
+            duration: clip_meta["duration"].as_f64().context("clip duration")?,
+        };
+        let sampled = sample_frame_indices(&real, count, 1)?;
+        let expected_indices: Vec<usize> =
+            i64_values(&frames_tensors, &format!("{clip}_sampled_indices"))?
+                .into_iter()
+                .map(|value| value as usize)
+                .collect();
+        assert_eq!(sampled, expected_indices, "{case} sample indices");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "CPU-only external fixtures; set FF_MODEL and FF_VIDEO_REF_DIR"]
+fn video_canvas_positions_match_reference() -> Result<()> {
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let ref_dir = video_ref_dir()?;
+    let spec = ModelSpec::read(&model)?;
+    ensure!(
+        spec.architecture == Architecture::MiniCpmV47,
+        "fixtures require the MiniCPM spec"
+    );
+    let patch_elements = spec
+        .vision
+        .as_ref()
+        .context("vision configuration missing")?
+        .patch_elements(spec.architecture)?;
+    let canvas_bytes = std::fs::read(ref_dir.join("fixtures/video_canvas_positions.safetensors"))?;
+    let canvas = SafeTensors::deserialize(&canvas_bytes)?;
+    let processor_bytes =
+        std::fs::read(ref_dir.join("fixtures/video_processor_stack1.safetensors"))?;
+    let processor_tensors = SafeTensors::deserialize(&processor_bytes)?;
+    for case in [
+        "synth_2f_64x48_s1",
+        "synth_2f_640x480_s9",
+        "synth_2f_1024x1024_s9",
+        "synth_mixed_img_plus_2f_64x48_s1",
+        "football_4s_16x_s1",
+        "football_4s_16x_s9",
+        "sample_demo_1_16x_s1",
+        "boat_pan_4s_16x_s1",
+    ] {
+        let ids = u32_values(&canvas, &format!("{case}_input_ids"))?;
+        let modality: Vec<u8> = i64_values(&canvas, &format!("{case}_mm_token_type_ids"))?
+            .into_iter()
+            .map(u8::try_from)
+            .collect::<std::result::Result<_, _>>()?;
+        let mut grids = Vec::new();
+        if canvas.tensor(&format!("{case}_target_sizes")).is_ok() {
+            let sizes = i32_values(&canvas, &format!("{case}_target_sizes"))?;
+            for row in sizes.as_chunks::<2>().0 {
+                grids.push(ImageGrid {
+                    t: 1,
+                    h: u32::try_from(row[0])?,
+                    w: u32::try_from(row[1])?,
+                });
+            }
+        }
+        let video_sizes = if canvas
+            .tensor(&format!("{case}_target_sizes_videos"))
+            .is_ok()
+        {
+            i32_values(&canvas, &format!("{case}_target_sizes_videos"))?
+        } else {
+            i32_values(&processor_tensors, &format!("{case}_target_sizes_videos"))?
+        };
+        for row in video_sizes.as_chunks::<2>().0 {
+            grids.push(ImageGrid {
+                t: 1,
+                h: u32::try_from(row[0])?,
+                w: u32::try_from(row[1])?,
+            });
+        }
+        let patch_rows: usize = grids
+            .iter()
+            .map(|grid| grid.h as usize * grid.w as usize)
+            .sum();
+        let grid_count = grids.len();
+        let prepared = PreparedInput {
+            modality_ids: modality,
+            pixel_values: vec![0.0; patch_rows * patch_elements],
+            grids,
+        };
+        let capacity = ids.len() + 64;
+        let plan = prepared.input(&ids).validate(&spec, capacity)?;
+        let positions = i64_values(&canvas, &format!("{case}_canvas_position_ids"))?;
+        let len = ids.len();
+        ensure!(positions.len() == 3 * len, "{case} position extent");
+        for axis in 0..3 {
+            for row in 0..len {
+                assert_eq!(
+                    i64::from(plan.axes()[axis][row]),
+                    positions[axis * len + row],
+                    "{case} axis {axis} row {row}"
+                );
+            }
+        }
+        let deltas = i64_values(&canvas, &format!("{case}_rope_deltas"))?;
+        assert_eq!(plan.rope_delta(), deltas[0], "{case} rope delta");
+        println!(
+            "{}",
+            serde_json::json!({
+                "case": case,
+                "seq": len,
+                "grids": grid_count,
+                "rope_delta": plan.rope_delta(),
+            })
+        );
+    }
     Ok(())
 }
 
