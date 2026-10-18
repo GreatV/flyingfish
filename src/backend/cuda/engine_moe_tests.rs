@@ -586,6 +586,7 @@ impl Engine {
             8,
             capacity.worker_count,
             cpu_bounds,
+            model_spec.expert_format,
         )?);
         let moe_prefill = if capacity.prefill_staging_slots > 0 {
             let reserves = crate::experts::plan::Reserves {

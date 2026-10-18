@@ -421,6 +421,7 @@ impl Prefill {
                         geometry.experts as usize,
                         geometry.hidden as usize,
                         geometry.intermediate as usize,
+                        capacity.layout.fp8_slot(),
                     )?)?)?,
                 tables: Tables::new(device, geometry.experts as usize, cohorts)?,
                 host_ids: pinned_zeros(&device.ctx, assignments)?,
@@ -689,6 +690,7 @@ impl Prefill {
                     self.geometry.experts as usize,
                     self.geometry.hidden as usize,
                     self.geometry.intermediate as usize,
+                    self.capacity.layout.fp8_slot(),
                 )?,
             "prefill wave scratch bytes={} are below the rows={rows} wave={} bound",
             self.gpu.scratch.len(),
@@ -1796,6 +1798,7 @@ impl Gpu {
                 stream,
                 MoePrefillContribute {
                     cpu_arithmetic: &self.cpu_arithmetic,
+                    fp8_slot: slots.catalogue.layout().fp8_slot(),
                     x: span.hidden(&span.layout.normalized, base, rows)?,
                     ids: span.choices(&span.layout.ids, base, rows)?,
                     weights: span.choices(&span.layout.weights, base, rows)?,
@@ -2820,7 +2823,7 @@ mod tests {
         let mut done = stream.alloc_zeros::<u32>(rows * 4)?;
         let y = stream.alloc_zeros::<bf16>(rows * 128)?;
         let scratch =
-            stream.alloc_zeros::<u8>(prefill_scratch_bytes(wave, 4, 16, 128, 64)? as usize)?;
+            stream.alloc_zeros::<u8>(prefill_scratch_bytes(wave, 4, 16, 128, 64, None)? as usize)?;
         for experts in &cohorts {
             let mask = host_ids
                 .iter()
@@ -2833,6 +2836,7 @@ mod tests {
                     stream,
                     MoePrefillContribute {
                         cpu_arithmetic: &arithmetic,
+                        fp8_slot: None,
                         x: qwen::matrix(&input, stream, base * 128, count, 128)?,
                         ids: view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
                         weights: view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,

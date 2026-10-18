@@ -50,7 +50,7 @@ fn scratch_sizing_matches_region_math() {
             .iter()
             .map(|&(n, size)| up256((n as u64) * size))
             .sum();
-        let got = prefill_scratch_bytes(rows, top_k, experts, hidden, inter).unwrap();
+        let got = prefill_scratch_bytes(rows, top_k, experts, hidden, inter, None).unwrap();
         assert_eq!(got, expected, "rows={rows} top_k={top_k}");
         assert_eq!(got % 256, 0);
         assert!(
@@ -62,13 +62,302 @@ fn scratch_sizing_matches_region_math() {
     // paddings; y_perm duplicates the contributions extent for the
     // per-expert grouped GEMM2.
     assert_eq!(
-        prefill_scratch_bytes(4096, 8, 256, 2048, 512).unwrap(),
+        prefill_scratch_bytes(4096, 8, 256, 2048, 512, None).unwrap(),
         532_950_528
     );
     assert!(
-        prefill_scratch_bytes(4096, 8, 256, 2048, 512).unwrap()
-            > prefill_scratch_bytes(512, 8, 256, 2048, 512).unwrap()
+        prefill_scratch_bytes(4096, 8, 256, 2048, 512, None).unwrap()
+            > prefill_scratch_bytes(512, 8, 256, 2048, 512, None).unwrap()
     );
+    use crate::{
+        experts::catalogue::{ExpertGeometry, ExpertLayout},
+        model_spec::ExpertFormat,
+    };
+    let geometry = ExpertGeometry {
+        layers: 40,
+        experts: 256,
+        hidden: 2048,
+        intermediate: 512,
+        top_k: 8,
+    };
+    let native = ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry).unwrap();
+    let wave = ExpertLayout::new(ExpertFormat::Bf16, &geometry).unwrap();
+    assert_eq!(native.slot_bytes(), 3_151_872);
+    assert_eq!(wave.slot_bytes(), 6_291_456);
+    for rows in [1usize, 2, 37, 4096] {
+        let baseline = prefill_scratch_bytes(rows, 8, 256, 2048, 512, None).unwrap();
+        let got = prefill_scratch_bytes(rows, 8, 256, 2048, 512, native.fp8_slot()).unwrap();
+        let active = 256.min(rows * 8) as u64;
+        assert_eq!(got, baseline + active * wave.slot_bytes());
+        assert_ne!(got, baseline + active * native.slot_bytes());
+    }
+    assert!(prefill_scratch_bytes(usize::MAX, 2, 256, 2048, 512, native.fp8_slot()).is_err());
+    assert!(prefill_scratch_bytes(1, 1, 256, usize::MAX, 512, native.fp8_slot()).is_err());
+    let mut wrong = native.fp8_slot().unwrap().clone();
+    wrong.up.start += 16;
+    assert!(prefill_scratch_bytes(37, 8, 256, 2048, 512, Some(&wrong)).is_err());
+}
+
+#[test]
+#[ignore = "GPU window and FF_MINICPM_REFERENCE_DIR required"]
+fn fp8_prefill_gpu() -> Result<()> {
+    use crate::{
+        experts::catalogue::{ExpertGeometry, ExpertLayout},
+        model_spec::ExpertFormat,
+    };
+    use anyhow::{Context, ensure};
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let root = std::path::PathBuf::from(
+        std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("FF_MINICPM_REFERENCE_DIR missing")?,
+    );
+    let bytes = std::fs::read(root.join("expert_l0e0_dequant.safetensors"))?;
+    let anchor = safetensors::SafeTensors::deserialize(&bytes)?;
+    let model = crate::model_spec::ModelSpec::minicpm(
+        &serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/minicpm-config.json"
+        )))?,
+        &serde_json::json!({"eos_token_id":[248044,248046]}),
+    )?;
+    let production = ExpertGeometry::from_model(&model)?;
+    let (experts, top_k, hidden, inter) = (
+        16usize,
+        production.top_k as usize,
+        production.hidden as usize,
+        production.intermediate as usize,
+    );
+    let geometry = ExpertGeometry {
+        experts: experts as u32,
+        ..production
+    };
+    let native_layout = ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry)?;
+    let slot = native_layout
+        .fp8_slot()
+        .context("native FP8 descriptor missing")?;
+    let mut fx = reference::fixture(MoeDims::new(37, experts, top_k, hidden, inter), 47);
+    let mut native = vec![0u8; native_layout.slot_bytes() as usize * experts];
+    for (op, n, k, code_range, scale_range) in [
+        ("gate", inter, hidden, &slot.gate, &slot.gate_scale),
+        ("up", inter, hidden, &slot.up, &slot.up_scale),
+        ("down", hidden, inter, &slot.down, &slot.down_scale),
+    ] {
+        let code = anchor.tensor(&format!("{op}_proj.weight_fp8"))?;
+        let scale = anchor.tensor(&format!("{op}_proj.weight_scale"))?;
+        let want = anchor.tensor(op)?;
+        ensure!(
+            code.dtype() == safetensors::Dtype::F8_E4M3
+                && code.shape() == [n, k]
+                && scale.dtype() == safetensors::Dtype::BF16
+                && scale.shape() == [n, 1]
+                && want.dtype() == safetensors::Dtype::BF16
+                && want.shape() == [n, k],
+            "invalid real expert anchor {op}"
+        );
+        for e in 0..experts {
+            let base = e * native_layout.slot_bytes() as usize;
+            native[base + code_range.start as usize..base + code_range.end as usize]
+                .copy_from_slice(code.data());
+            for (row, value) in scale.data().as_chunks::<2>().0.iter().enumerate() {
+                let scale = bf16::from_f32(
+                    bf16::from_le_bytes(*value).to_f32() * (1.0 + ((e * 3) % 7) as f32 / 16.0),
+                );
+                let at = base + scale_range.start as usize + row * 2;
+                native[at..at + 2].copy_from_slice(&scale.to_le_bytes());
+                for col in 0..k {
+                    let code = native[base + code_range.start as usize + row * k + col];
+                    let value = crate::fp8::effective_weight(code, scale);
+                    ensure!(value.is_finite(), "nonfinite effective expert weight");
+                    if e == 0 {
+                        let at = (row * k + col) * 2;
+                        ensure!(
+                            value.to_le_bytes() == want.data()[at..at + 2],
+                            "real expert scalar anchor mismatch"
+                        );
+                    }
+                    if op == "down" {
+                        fx.down[(e * hidden + row) * inter + col] = value;
+                    } else {
+                        let offset = usize::from(op == "up") * inter;
+                        fx.gate_up[(e * 2 * inter + offset + row) * hidden + col] = value;
+                    }
+                }
+            }
+        }
+    }
+    let d = crate::backend::cuda::Device::new(0)?;
+    let s = &d.stream;
+    let ops = PrefillOps::new(&d.ctx, s, ExpertFormat::Fp8W8a16)?;
+    let native_buf = s.clone_htod(&native)?;
+    let native_base = native_buf.device_ptr(s).0;
+    let addresses = (0..experts)
+        .map(|e| native_base + e as u64 * native_layout.slot_bytes())
+        .collect::<Vec<_>>();
+    let fp8_slots = device_slots(
+        s,
+        addresses.clone(),
+        addresses,
+        vec![1; experts],
+        vec![1; experts],
+    )?;
+    let gu = s.clone_htod(&fx.gate_up)?;
+    let dn = s.clone_htod(&fx.down)?;
+    let bf16_slots = device_slots(
+        s,
+        (0..experts)
+            .map(|e| gu.device_ptr(s).0 + (e * 2 * inter * hidden * 2) as u64)
+            .collect(),
+        (0..experts)
+            .map(|e| dn.device_ptr(s).0 + (e * hidden * inter * 2) as u64)
+            .collect(),
+        vec![1; experts],
+        vec![1; experts],
+    )?;
+    let shared = SharedBufs {
+        sg: s.clone_htod(&fx.shared_gate)?,
+        su: s.clone_htod(&fx.shared_up)?,
+        sd: s.clone_htod(&fx.shared_down)?,
+        seg: s.clone_htod(&fx.shared_expert_gate)?,
+    };
+    let mut defects = 0;
+    for rows in [1usize, 37] {
+        let layout = prefill_layout(rows, top_k, experts, hidden, inter, Some(slot))?;
+        let scratch_bytes = prefill_scratch_bytes(rows, top_k, experts, hidden, inter, Some(slot))?;
+        let scratch_buf = s.alloc_zeros::<u8>(scratch_bytes as usize)?;
+        let scratch = Scratch {
+            ptr: scratch_buf.device_ptr(s).0,
+            bytes: scratch_bytes,
+        };
+        let (ids, weights) = planted_uniform(rows, experts, top_k);
+        let bufs = case_bufs(
+            s,
+            &fx,
+            rows,
+            &ids,
+            &vec![1; rows * top_k],
+            &weights,
+            &vec![1; rows * top_k],
+        )?;
+        let reference = CohortBufs {
+            contributions: s.alloc_zeros(rows * top_k * hidden)?,
+            done: s.alloc_zeros(rows * top_k)?,
+        };
+        ops.prefill_contribute(
+            s,
+            contribute_input(s, &fx, rows, &bufs, &bf16_slots, &shared, &reference)?,
+            &scratch,
+        )?;
+        let expected = s.clone_dtoh(&reference.contributions)?;
+        let candidate = CohortBufs {
+            contributions: s.alloc_zeros(rows * top_k * hidden)?,
+            done: s.alloc_zeros(rows * top_k)?,
+        };
+        let mut input = contribute_input(s, &fx, rows, &bufs, &fp8_slots, &shared, &candidate)?;
+        input.fp8_slot = Some(slot);
+        d.finish_upload()?;
+        ops.prefill_contribute(s, input, &scratch)?;
+        let actual = s.clone_dtoh(&candidate.contributions)?;
+        ensure!(
+            actual.iter().all(|v| v.is_finite()),
+            "nonfinite FP8 prefill contribution"
+        );
+        let output_bad = actual
+            .iter()
+            .zip(&expected)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let mut counts = vec![0i32; experts];
+        for &e in &ids {
+            counts[e as usize] += 1;
+        }
+        let mut order = Vec::new();
+        problem_order(&counts, &mut order);
+        let wave_bytes = order.len() as u64 * layout.wave_slot_bytes;
+        let got_wave = s.clone_dtoh(
+            &scratch_buf.slice(layout.wave as usize..(layout.wave + wave_bytes) as usize),
+        )?;
+        let mut expected_wave = Vec::with_capacity(got_wave.len());
+        for &e in &order {
+            expected_wave.extend(
+                fx.gate_up[e as usize * 2 * inter * hidden..(e as usize + 1) * 2 * inter * hidden]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes()),
+            );
+            expected_wave.extend(
+                fx.down[e as usize * hidden * inter..(e as usize + 1) * hidden * inter]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes()),
+            );
+        }
+        let wave_bad = got_wave
+            .iter()
+            .zip(&expected_wave)
+            .filter(|(a, b)| a != b)
+            .count();
+        let done_bad = s
+            .clone_dtoh(&candidate.done)?
+            .iter()
+            .filter(|&&v| v != 1)
+            .count();
+        let bad = output_bad + wave_bad + done_bad;
+        println!(
+            "FP8_PREFILL rows={rows} expert_subset={experts} top_k={top_k} stored_gate_up=[{},{}] stored_down=[{hidden},{inter}] active_experts={} native_slot_bytes={} bf16_wave_slot_bytes={} wave_byte_mismatches={wave_bad} contribution_bit_mismatches={output_bad} done_mismatches={done_bad} {}",
+            2 * inter,
+            hidden,
+            order.len(),
+            native_layout.slot_bytes(),
+            layout.wave_slot_bytes,
+            if bad == 0 { "PASS" } else { "DEFECT" }
+        );
+        defects += usize::from(bad != 0);
+        if rows == 37 {
+            let mut swapped = native.clone();
+            for e in 0..experts {
+                let base = e * native_layout.slot_bytes() as usize;
+                for i in 0..(slot.gate.end - slot.gate.start) as usize {
+                    swapped.swap(
+                        base + slot.gate.start as usize + i,
+                        base + slot.down.start as usize + i,
+                    );
+                }
+            }
+            let swapped_buf = s.clone_htod(&swapped)?;
+            let base = swapped_buf.device_ptr(s).0;
+            let addresses = (0..experts)
+                .map(|e| base + e as u64 * native_layout.slot_bytes())
+                .collect::<Vec<_>>();
+            let swapped_slots = device_slots(
+                s,
+                addresses.clone(),
+                addresses,
+                vec![1; experts],
+                vec![1; experts],
+            )?;
+            let mutant = CohortBufs {
+                contributions: s.alloc_zeros(rows * top_k * hidden)?,
+                done: s.alloc_zeros(rows * top_k)?,
+            };
+            let mut input =
+                contribute_input(s, &fx, rows, &bufs, &swapped_slots, &shared, &mutant)?;
+            input.fp8_slot = Some(slot);
+            ops.prefill_contribute(s, input, &scratch)?;
+            let changed = s
+                .clone_dtoh(&mutant.contributions)?
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            ensure!(changed > 0, "FP8 slot-slice swap control undetected");
+            println!(
+                "PASS FP8_PREFILL_SLOT_SWAP rows={rows} contribution_bit_mismatches={changed}"
+            );
+        }
+    }
+    println!("FP8_PREFILL_SUMMARY cases=2 defects={defects}");
+    ensure!(defects == 0, "FP8 prefill DEFECT cases={defects}");
+    Ok(())
 }
 
 /// Stage capacities: the D2H window holds counts[E], the 256-byte-aligned
@@ -402,6 +691,7 @@ fn contribute_input<'a>(
     );
     Ok(MoePrefillContribute {
         cpu_arithmetic: &[false; MAX_EXPERTS][..experts],
+        fp8_slot: None,
         x: testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
         ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
         active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
@@ -591,7 +881,7 @@ fn capture_shared_out(
     let input = moe_input(ctx.s, fx, rows, &case_bufs, ctx.slots, ctx.shared, y_view)?;
     ctx.ops.prefill(ctx.s, input, ctx.scratch)?;
     ctx.s.synchronize()?;
-    let layout = prefill_layout(rows, top_k, experts, hidden, inter)?;
+    let layout = prefill_layout(rows, top_k, experts, hidden, inter, None)?;
     let mut host = vec![bf16::ZERO; rows * hidden];
     raw_dtoh(ctx.s, ctx.scratch.ptr + layout.shared_out, &mut host)?;
     Ok(ctx.s.clone_htod(&host)?)
@@ -728,7 +1018,7 @@ fn moe_prefill_gpu() -> Result<()> {
     let d = crate::backend::cuda::Device::new(0)?;
     let s = &d.stream;
     let mut defects: Vec<String> = Vec::new();
-    let ops = PrefillOps::new(&d.ctx, s)?;
+    let ops = PrefillOps::new(&d.ctx, s, crate::model_spec::ExpertFormat::Bf16)?;
     // The 16384-row arm slices the same fixture, so its weights are the ones
     // every smaller-rows arm already scores against.
     let fx = reference::fixture(MoeDims::minicpm47(16384), 0);
@@ -757,7 +1047,7 @@ fn moe_prefill_gpu() -> Result<()> {
         vec![1u32; experts],
         vec![1u64; experts],
     )?;
-    let scratch_bytes = prefill_scratch_bytes(16384, top_k, experts, hidden, inter)?;
+    let scratch_bytes = prefill_scratch_bytes(16384, top_k, experts, hidden, inter, None)?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
     let scratch = Scratch {
@@ -1152,7 +1442,7 @@ fn moe_prefill_gpu() -> Result<()> {
         let input = contribute_input(s, &fx, rows, &bufs, &main_slots, &shared, &cohort)?;
         ops.prefill_contribute(s, input, &scratch)?;
         s.synchronize()?;
-        let layout = prefill_layout(rows, top_k, experts, hidden, inter)?;
+        let layout = prefill_layout(rows, top_k, experts, hidden, inter, None)?;
         let mut pos_of = vec![0i32; rows * top_k];
         raw_dtoh(s, scratch.ptr + layout.pos_of, &mut pos_of)?;
         let planted = (pos_of[0], pos_of[1]);
@@ -1379,7 +1669,7 @@ fn child_setup(s: &Arc<CudaStream>, fx: &MoeFixture, generation: Vec<u64>) -> Re
         sd: s.clone_htod(fx.shared_down.as_slice())?,
         seg: s.clone_htod(fx.shared_expert_gate.as_slice())?,
     };
-    let scratch_bytes = prefill_scratch_bytes(fx.dims.rows, top_k, experts, hidden, inter)?;
+    let scratch_bytes = prefill_scratch_bytes(fx.dims.rows, top_k, experts, hidden, inter, None)?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let scratch_ptr = {
         let (ptr, guard) = scratch_buf.device_ptr(s);
@@ -1406,7 +1696,7 @@ fn child_setup(s: &Arc<CudaStream>, fx: &MoeFixture, generation: Vec<u64>) -> Re
 fn stale_generation_child() -> Result<()> {
     let d = crate::backend::cuda::Device::new(0)?;
     let s = &d.stream;
-    let ops = PrefillOps::new(&d.ctx, s)?;
+    let ops = PrefillOps::new(&d.ctx, s, crate::model_spec::ExpertFormat::Bf16)?;
     let fx = reference::fixture(MoeDims::new(8, 16, 4, 32, 16), 0);
     let (experts, top_k, hidden) = (fx.dims.experts, fx.dims.top_k, fx.dims.hidden);
     let rows = fx.dims.rows;
@@ -1447,7 +1737,7 @@ fn stale_generation_child() -> Result<()> {
 fn duplicate_ids_child() -> Result<()> {
     let d = crate::backend::cuda::Device::new(0)?;
     let s = &d.stream;
-    let ops = PrefillOps::new(&d.ctx, s)?;
+    let ops = PrefillOps::new(&d.ctx, s, crate::model_spec::ExpertFormat::Bf16)?;
     let fx = reference::fixture(MoeDims::new(2, 16, 4, 32, 16), 0);
     let (experts, top_k, hidden) = (fx.dims.experts, fx.dims.top_k, fx.dims.hidden);
     let rows = fx.dims.rows;
@@ -1483,7 +1773,7 @@ fn duplicate_ids_child() -> Result<()> {
 fn pos_of_oob_child() -> Result<()> {
     let d = crate::backend::cuda::Device::new(0)?;
     let s = &d.stream;
-    let ops = PrefillOps::new(&d.ctx, s)?;
+    let ops = PrefillOps::new(&d.ctx, s, crate::model_spec::ExpertFormat::Bf16)?;
     let fx = reference::fixture(MoeDims::new(8, 16, 4, 32, 16), 0);
     let (experts, top_k, hidden, inter) = (
         fx.dims.experts,
@@ -1504,7 +1794,7 @@ fn pos_of_oob_child() -> Result<()> {
     let input = contribute_input(s, &fx, rows, &bufs, &setup.slots, &setup.shared, &cohort)?;
     ops.prefill_contribute(s, input, &setup.scratch)?;
     s.synchronize()?;
-    let layout = prefill_layout(rows, top_k, experts, hidden, inter)?;
+    let layout = prefill_layout(rows, top_k, experts, hidden, inter, None)?;
     let planted = [(rows * top_k) as i32];
     raw_htod(s, setup.scratch.ptr + layout.pos_of, &planted)?;
     let module = cubin::module(&d.ctx, "moe_prefill")?;
@@ -1637,7 +1927,7 @@ fn prefill_racecheck_small_gpu() -> Result<()> {
         fx.dims.hidden,
         fx.dims.inter,
     );
-    let ops = PrefillOps::new(&d.ctx, s)?;
+    let ops = PrefillOps::new(&d.ctx, s, crate::model_spec::ExpertFormat::Bf16)?;
     let gu: CudaSlice<bf16> = s.clone_htod(fx.gate_up.as_slice())?;
     let dn: CudaSlice<bf16> = s.clone_htod(fx.down.as_slice())?;
     let (gu_ptr, _a) = gu.device_ptr(s);
@@ -1654,7 +1944,7 @@ fn prefill_racecheck_small_gpu() -> Result<()> {
     let su: CudaSlice<bf16> = s.clone_htod(fx.shared_up.as_slice())?;
     let sd: CudaSlice<bf16> = s.clone_htod(fx.shared_down.as_slice())?;
     let seg: CudaSlice<bf16> = s.clone_htod(fx.shared_expert_gate.as_slice())?;
-    let scratch_bytes = prefill_scratch_bytes(64, top_k, experts, hidden, inter)?;
+    let scratch_bytes = prefill_scratch_bytes(64, top_k, experts, hidden, inter, None)?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let (scratch_ptr, _c) = scratch_buf.device_ptr(s);
     let scratch = Scratch {
@@ -1722,7 +2012,7 @@ fn prefill_reset_done_gpu() -> Result<()> {
             fx.dims.hidden,
             fx.dims.inter,
         );
-        let ops = PrefillOps::new(&d.ctx, s)?;
+        let ops = PrefillOps::new(&d.ctx, s, crate::model_spec::ExpertFormat::Bf16)?;
         let rows = fx.dims.rows;
         let gu: CudaSlice<bf16> = s.clone_htod(fx.gate_up.as_slice())?;
         let dn: CudaSlice<bf16> = s.clone_htod(fx.down.as_slice())?;
@@ -1741,7 +2031,7 @@ fn prefill_reset_done_gpu() -> Result<()> {
             vec![1u32; experts],
             vec![1u64; experts],
         )?;
-        let scratch_bytes = prefill_scratch_bytes(rows, top_k, experts, hidden, inter)?;
+        let scratch_bytes = prefill_scratch_bytes(rows, top_k, experts, hidden, inter, None)?;
         let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
         let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
         let scratch = Scratch {
@@ -1853,7 +2143,7 @@ fn prefill_reset_done_gpu() -> Result<()> {
 fn k5c_seam_child() -> Result<()> {
     let d = crate::backend::cuda::Device::new(0)?;
     let s = &d.stream;
-    let ops = PrefillOps::new(&d.ctx, s)?;
+    let ops = PrefillOps::new(&d.ctx, s, crate::model_spec::ExpertFormat::Bf16)?;
     let fx = reference::fixture(MoeDims::minicpm47(37), 0);
     let (experts, top_k, hidden, inter) = (
         fx.dims.experts,
@@ -1876,7 +2166,7 @@ fn k5c_seam_child() -> Result<()> {
         vec![1u32; experts],
         vec![1u64; experts],
     )?;
-    let scratch_bytes = prefill_scratch_bytes(37, top_k, experts, hidden, inter)?;
+    let scratch_bytes = prefill_scratch_bytes(37, top_k, experts, hidden, inter, None)?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
     let scratch = Scratch {
@@ -2078,7 +2368,7 @@ fn prefill_stage_backtoback_gpu() -> Result<()> {
         fx.dims.hidden,
         fx.dims.inter,
     );
-    let ops = PrefillOps::new(&d.ctx, s)?;
+    let ops = PrefillOps::new(&d.ctx, s, crate::model_spec::ExpertFormat::Bf16)?;
     let gu: CudaSlice<bf16> = s.clone_htod(fx.gate_up.as_slice())?;
     let dn: CudaSlice<bf16> = s.clone_htod(fx.down.as_slice())?;
     let (gu_ptr, _a) = gu.device_ptr(s);
@@ -2094,7 +2384,7 @@ fn prefill_stage_backtoback_gpu() -> Result<()> {
         vec![1u32; experts],
         vec![1u64; experts],
     )?;
-    let scratch_bytes = prefill_scratch_bytes(fx.dims.rows, top_k, experts, hidden, inter)?;
+    let scratch_bytes = prefill_scratch_bytes(fx.dims.rows, top_k, experts, hidden, inter, None)?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
     let scratch = Scratch {

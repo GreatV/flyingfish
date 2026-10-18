@@ -141,6 +141,7 @@ impl Setup {
                     geometry.experts as usize,
                     geometry.hidden as usize,
                     geometry.intermediate as usize,
+                    catalogue.layout().fp8_slot(),
                 )? <= device.info.l2_bytes as u64 / 2
             {
                 wave_rows *= 2;
@@ -152,6 +153,7 @@ impl Setup {
                     geometry.experts as usize,
                     geometry.hidden as usize,
                     geometry.intermediate as usize,
+                    catalogue.layout().fp8_slot(),
                 )?)?;
             let decode_scratch = usize::try_from(decode_scratch_bytes(
                 1,
@@ -311,6 +313,7 @@ impl Setup {
             1,
             self.capacity.worker_count,
             (cpu.0.max(1), cpu.1.max(geometry.top_k as usize)),
+            engine.model_spec.expert_format,
         )?);
         engine.moe_prefill = Some(Prefill::new(
             &engine.device,
@@ -439,6 +442,7 @@ impl Decode {
         max_rows: usize,
         workers: u32,
         cpu_bounds: (usize, usize),
+        format: crate::model_spec::ExpertFormat,
     ) -> Result<Self> {
         ensure!(
             (1..=8).contains(&max_rows),
@@ -474,7 +478,7 @@ impl Decode {
             router_ptr: 0,
             route: RouteOps::new(context, stream)?,
             contribute: DecodeOps::new(context)?,
-            prefill: PrefillOps::new(context, stream)?,
+            prefill: PrefillOps::new(context, stream, format)?,
             combine: CombineOps::new(context)?,
             ids: stream.alloc_zeros(choices)?,
             weights: stream.alloc_zeros(choices)?,

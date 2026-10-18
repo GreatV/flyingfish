@@ -144,6 +144,13 @@ impl ExpertLayout {
             Self::Fp8W8a16(_) => None,
         }
     }
+
+    pub fn fp8_slot(&self) -> Option<&Fp8Slot> {
+        match self {
+            Self::Bf16Fused { .. } => None,
+            Self::Fp8W8a16(slot) => Some(slot),
+        }
+    }
 }
 
 /// Routed-expert geometry of the text tower.
