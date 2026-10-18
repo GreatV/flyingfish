@@ -534,23 +534,37 @@ impl Processor {
         ensure!(token_limit > 0, "zero video token capacity");
         let bytes = load_encoded_video(url)?;
         let (source, probed) = probe_video(&bytes)?;
+        self.plan_probed_video(source, probed, options, token_limit)
+    }
+
+    fn plan_probed_video(
+        &self,
+        source: ScratchVideo,
+        probed: ProbedVideo,
+        options: VideoOptions,
+        token_limit: usize,
+    ) -> Result<PlannedVideo> {
         let metadata = probed.metadata()?;
         let per_frame =
             self.frame_tokens(probed.width as usize, probed.height as usize, &options)?;
-        let budget = token_limit / per_frame.max(1);
-        ensure!(
-            options.max_num_frames <= budget,
-            "video max_num_frames {} exceeds the request capacity of {token_limit} tokens at {per_frame} tokens per frame",
-            options.max_num_frames
-        );
-        let indices =
-            sample_frame_indices(&metadata, options.max_num_frames, options.stack_frames)?;
+        let count = if metadata.duration > options.max_num_frames as f64 {
+            ((metadata.duration / 0.1).floor() as usize).min(options.max_num_frames)
+        } else {
+            metadata.duration.ceil() as usize
+        };
         let tokens = per_frame
-            .checked_mul(indices.len())
+            .checked_mul(count)
             .context("video token count overflow")?;
         ensure!(
             tokens <= token_limit,
-            "video needs {tokens} tokens; request capacity is {token_limit}"
+            "video needs {tokens} tokens for {count} sampled frames; request capacity is {token_limit}"
+        );
+        let indices =
+            sample_frame_indices(&metadata, options.max_num_frames, options.stack_frames)?;
+        ensure!(
+            indices.len() == count,
+            "video sample count mismatch: planned {count}, got {}",
+            indices.len()
         );
         Ok(PlannedVideo {
             source,
@@ -2388,6 +2402,31 @@ mod tests {
         assert_eq!(indices.len(), 4);
         assert!(indices.iter().all(|&index| index < 30), "{indices:?}");
         assert_eq!(indices[0], 0);
+        let processor = video_processor()?;
+        let probed = ProbedVideo {
+            width: 1280,
+            height: 720,
+            numerator: 30,
+            denominator: 1_000_000_000_000,
+            frames: 30,
+        };
+        assert_eq!(probed.metadata()?.duration, 1e12);
+        let error = processor
+            .plan_probed_video(
+                ScratchVideo::write(&[])?,
+                probed,
+                VideoOptions {
+                    max_num_frames: u32::MAX as usize,
+                    stack_frames: 1,
+                    max_slice_nums: Some(1),
+                },
+                4096,
+            )
+            .unwrap_err();
+        eprintln!(
+            "PASS video_sample_capacity duration=1e12 max_num_frames={} error={error}",
+            u32::MAX
+        );
         Ok(())
     }
 
@@ -2916,7 +2955,7 @@ mod tests {
         let url = format!("data:video/mp4;base64,{}", base64::encode(bytes));
         let processor = video_processor()?;
         let options = VideoOptions {
-            max_num_frames: 4,
+            max_num_frames: 128,
             stack_frames: 1,
             max_slice_nums: Some(1),
         };
@@ -2933,18 +2972,9 @@ mod tests {
         assert_eq!((rows, cols), (0, 0));
         assert_eq!(processor.video_tokens(&planned)?, 272);
         let error = processor
-            .plan_video(
-                &url,
-                VideoOptions {
-                    max_num_frames: 1 << 20,
-                    ..options
-                },
-                4096,
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("max_num_frames 1048576"), "{error}");
-        assert!(error.contains("capacity"), "{error}");
+            .plan_video(&url, options, processor.video_tokens(&planned)? - 1)
+            .unwrap_err();
+        eprintln!("PASS video_sample_capacity below_required error={error}");
         let packed = processor.prepare_planned_video(planned)?;
         assert_eq!(packed.frames.len(), 4);
         for frame in &packed.frames {
