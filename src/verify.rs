@@ -330,13 +330,21 @@ pub struct Metrics {
     exact: bool,
 }
 
+/// Half a BF16 ulp at magnitude `x`: 2^(⌊log2 x⌋ − 8); 0 at `x <= 0`.
+pub fn bf16_half_ulp(x: f64) -> f64 {
+    if x > 0.0 {
+        2f64.powi(x.log2().floor() as i32 - 8)
+    } else {
+        0.0
+    }
+}
+
 /// Largest per-element distance in half-BF16-ulp units of `max(|reference_i|, rms)`.
 pub fn half_ulp_ratio(candidate: &[f32], reference: &[f32], rms: f32) -> f64 {
     let mut worst = 0f64;
     for (&c, &r) in candidate.iter().zip(reference) {
         let scale = r.abs().max(rms).max(2f32.powi(-30));
-        let ulp = 2f64.powi(scale.log2().floor() as i32 - 8);
-        worst = worst.max(f64::from((c - r).abs()) / ulp);
+        worst = worst.max(f64::from((c - r).abs()) / bf16_half_ulp(f64::from(scale)));
     }
     worst
 }

@@ -385,7 +385,7 @@ pub(super) fn uniform_attention_error(
             let error = (v.to_f32() as f64 - e).abs();
             (
                 error,
-                error / (accumulation + super::bf16_half_ulp(e.abs() + accumulation)),
+                error / (accumulation + crate::verify::bf16_half_ulp(e.abs() + accumulation)),
             )
         })
         .fold((0f64, 0f64), |(a, r), (e, q)| (a.max(e), r.max(q)))

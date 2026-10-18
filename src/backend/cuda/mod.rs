@@ -103,15 +103,6 @@ pub(crate) fn gamma(n: usize, u: f64) -> f64 {
     nu / (1.0 - nu)
 }
 
-/// Half a BF16 ulp at magnitude `x`: 2^(⌊log2 x⌋ − 8); 0 at `x <= 0`.
-pub(crate) fn bf16_half_ulp(x: f64) -> f64 {
-    if x > 0.0 {
-        2f64.powi(x.log2().floor() as i32 - 8)
-    } else {
-        0.0
-    }
-}
-
 /// Max |a − b| relative to the compared magnitude, for two chains that each apply `roundings`
 /// BF16 roundings and FP32 reductions of the given lengths: 2·(roundings·2^-8 + Σ γ_K(2^-24)).
 pub(crate) fn bf16_chain_bound(roundings: u32, reductions: &[usize]) -> f64 {
