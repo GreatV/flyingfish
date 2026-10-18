@@ -293,7 +293,7 @@ impl ReadAhead {
             .context("prefetch discard has no reader owner")?
             .disk
             .discard(ring)?;
-        self.stats[2] += slots.catalogue.geometry().slot_bytes()?;
+        self.stats[2] += slots.catalogue.slot_bytes();
         Ok(())
     }
 
@@ -529,7 +529,16 @@ mod tests {
                 })
                 .collect(),
         )?;
-        let mut plan = SpanPlan::new(&geometry, 2, 2)?;
+        let mut plan = SpanPlan::new(
+            &geometry,
+            crate::experts::catalogue::ExpertLayout::new(
+                crate::model_spec::ExpertFormat::Bf16,
+                &geometry,
+            )?
+            .slot_bytes(),
+            2,
+            2,
+        )?;
         let mut counts = [0; 16];
         for expert in [0, 2, 5] {
             counts[expert] = 65;

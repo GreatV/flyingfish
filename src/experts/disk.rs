@@ -968,7 +968,7 @@ mod tests {
         let catalogue = Arc::new(ExpertCatalogue::from_manifest(
             &manifest,
             geometry,
-            ExpertLayout::new(ExpertFormat::Bf16, &geometry)?,
+            crate::model_spec::ExpertFormat::Bf16,
         )?);
         let mut pool = DiskExperts::new(catalogue.clone(), dir.path(), 2, 3)?;
         let oracle = DiskReader::open(&catalogue, dir.path(), 1)?;

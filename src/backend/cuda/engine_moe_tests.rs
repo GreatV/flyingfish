@@ -63,7 +63,11 @@ fn native_fixture(
         .open(&path)?;
     std::io::Write::write_all(&mut file, &bytes)?;
     Ok(Arc::new(
-        crate::experts::catalogue::ExpertCatalogue::from_manifest(&manifest, geometry)?,
+        crate::experts::catalogue::ExpertCatalogue::from_manifest(
+            &manifest,
+            geometry,
+            crate::model_spec::ExpertFormat::Bf16,
+        )?,
     ))
 }
 
@@ -201,10 +205,15 @@ impl Engine {
     pub(crate) fn load_moe_test(fixture: &MoeFixture, runtime: &Path) -> Result<Self> {
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
         let count = geometry.layers * geometry.experts;
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            &geometry,
+        )?;
         let capacity = Capacity {
+            layout: layout.clone(),
             span_rows: 8,
             wave_rows: 8,
-            device_expert_bytes: geometry.slot_bytes()? * u64::from(count),
+            device_expert_bytes: layout.slot_bytes() * u64::from(count),
             host_expert_bytes: 0,
             slots_per_layer: vec![geometry.experts; geometry.layers as usize],
             host_blocks: 0,
@@ -265,8 +274,13 @@ impl Engine {
                 .collect(),
         )?;
         let cpu_bounds = if capacity.prefill_staging_slots > 0 {
-            let bound =
-                residency::cpu_bound(geometry, capacity.span_rows, &service, 1_000_000_000.0)?;
+            let bound = residency::cpu_bound(
+                geometry,
+                capacity.slot_bytes(),
+                capacity.span_rows,
+                &service,
+                1_000_000_000.0,
+            )?;
             (bound.0.max(8), bound.1.max(8 * geometry.top_k as usize))
         } else {
             (8, 8 * geometry.top_k as usize)
@@ -607,8 +621,13 @@ fn routed_experts(row: usize) -> [u32; 4] {
 }
 
 pub(super) fn tier_capacity(geometry: ExpertGeometry, pinned: bool) -> Result<Capacity> {
-    let slot = geometry.slot_bytes()?;
+    let layout = crate::experts::catalogue::ExpertLayout::new(
+        crate::model_spec::ExpertFormat::Bf16,
+        &geometry,
+    )?;
+    let slot = layout.slot_bytes();
     Ok(Capacity {
+        layout,
         span_rows: 8,
         wave_rows: 8,
         device_expert_bytes: slot * 8,
@@ -651,7 +670,7 @@ impl TierOracle {
         let host = if layout.host_blocks() > 0 {
             Some(HostBlocks::new(
                 layout.host_blocks(),
-                usize::try_from(geometry.slot_bytes()? / 2)?,
+                usize::try_from(capacity.slot_bytes() / 2)?,
             )?)
         } else {
             None
@@ -661,7 +680,7 @@ impl TierOracle {
             geometry,
             capacity: capacity.clone(),
             admission: crate::experts::plan::Admission {
-                budget_bytes_per_token: 2 * geometry.slot_bytes()?,
+                budget_bytes_per_token: 2 * capacity.slot_bytes(),
             },
             max_rows: 8,
             initial: &vec![vec![0, 1, 2, 3]; geometry.layers as usize],
@@ -1203,7 +1222,7 @@ fn tier_gate(variants: &[u32], cases: &[(bool, u32)]) -> Result<()> {
                 &capacity,
                 &[vec![0, 1, 2, 3], vec![0, 1, 2, 3]],
                 crate::experts::plan::Admission {
-                    budget_bytes_per_token: 2 * geometry.slot_bytes()?,
+                    budget_bytes_per_token: 2 * capacity.slot_bytes(),
                 },
                 engines,
             )?;

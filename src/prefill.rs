@@ -293,6 +293,7 @@ impl ExpertSpanLayout {
     pub fn new(
         reserves: &crate::experts::plan::Reserves,
         geometry: crate::experts::catalogue::ExpertGeometry,
+        slot_bytes: u64,
         rows: u32,
     ) -> Result<Self> {
         ensure!(rows > 0, "zero expert span rows={rows}");
@@ -333,7 +334,7 @@ impl ExpertSpanLayout {
         let active = region(choices * 4)?;
         let generation = region(choices * 8)?;
         let raw = reserves.span_bytes(rows)?;
-        let slot = geometry.slot_bytes()?;
+        let slot = slot_bytes;
         ensure!(
             slot.is_multiple_of(16) && bytes as u64 <= raw.div_ceil(slot) * slot,
             "aligned expert span bytes={bytes} exceed borrowed bytes={} raw={raw}",
@@ -358,6 +359,7 @@ impl ExpertWorkspaceBudget {
     pub fn new(
         request: ExpertWorkspaceRequest,
         geometry: crate::experts::catalogue::ExpertGeometry,
+        slot_bytes: u64,
         mixer_workspace: impl Fn(usize) -> Result<usize>,
         select: impl FnOnce(usize) -> Result<usize>,
     ) -> Result<Self> {
@@ -414,10 +416,9 @@ impl ExpertWorkspaceBudget {
             prefill_staging_slots,
             disk_ring_slots,
         };
-        let staging_bytes = reserves.persistent_bytes(&geometry)?;
+        let staging_bytes = reserves.persistent_bytes(slot_bytes)?;
         let span_bytes = reserves.span_bytes(span_rows)?;
-        let slot_bytes = geometry.slot_bytes()?;
-        let borrowed_slots = span_borrow_slots(&reserves, &geometry, span_rows, span_rows)?;
+        let borrowed_slots = span_borrow_slots(&reserves, slot_bytes, span_rows, span_rows)?;
         let routed_slots = u64::from(geometry.layers) * u64::from(geometry.experts);
         ensure!(
             u64::from(borrowed_slots) + u64::from(geometry.layers) <= routed_slots,
@@ -510,7 +511,7 @@ impl ExpertWorkspaceBudget {
             .collect::<Vec<_>>();
         let (index, capacity) = select_span(
             inputs,
-            admission.hard_cap(inputs.geometry.slot_bytes()?),
+            admission.hard_cap(inputs.layout.slot_bytes())?,
             prefill_rows,
             &span_candidates,
         )?;
@@ -612,6 +613,8 @@ mod admission_tests {
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
         let geometry = ExpertGeometry::from_model(&model)?;
+        let layout = crate::experts::catalogue::ExpertLayout::new(model.expert_format, &geometry)?;
+        let slot_bytes = layout.slot_bytes();
         let row_bytes = crate::work_layout::RowWorkSpec::new(&model)?.row_bytes()?;
         let request = ExpertWorkspaceRequest {
             mixer: WorkspaceRequest {
@@ -639,6 +642,7 @@ mod admission_tests {
                         ..request
                     },
                     geometry,
+                    slot_bytes,
                     |r| Ok(r * 257),
                     Ok,
                 )
@@ -660,7 +664,7 @@ mod admission_tests {
         assert_eq!(reserves.device_fixed_bytes, fixed as u64);
         assert_eq!(reserves.span_bytes(request.span_rows)?, 65_536 * 41136);
         for rows in [1, 97, request.span_rows] {
-            let layout = ExpertSpanLayout::new(reserves, geometry, rows)?;
+            let layout = ExpertSpanLayout::new(reserves, geometry, slot_bytes, rows)?;
             layout.validate_wave(1, 1)?;
             assert!(layout.validate_wave(1, 0).is_err());
             if rows >= 12 {
@@ -686,10 +690,10 @@ mod admission_tests {
             assert_eq!(layout.generation.end, layout.bytes);
         }
         assert_eq!(
-            reserves.persistent_bytes(&geometry)?,
+            reserves.persistent_bytes(slot_bytes)?,
             fixed as u64 + 2 * 6_291_456
         );
-        assert_eq!(reserves.host_bytes(&geometry)?, 16384 + 3 * 6_291_456);
+        assert_eq!(reserves.host_bytes(slot_bytes)?, 16384 + 3 * 6_291_456);
         let service = ServiceTable::new(
             "fixture",
             vec![
@@ -709,6 +713,7 @@ mod admission_tests {
         )?;
         let inputs = PlanInputs {
             geometry,
+            layout: layout.clone(),
             device_free_bytes: request.mixer.free_after_resident as u64,
             host_available_bytes: 48 << 30,
             h2d_bytes_per_second: (16u64 << 30) as f64,
@@ -729,8 +734,8 @@ mod admission_tests {
         assert_eq!(capacity.span_rows, 65_536);
         assert_eq!(capacity.wave_rows, 71);
         let slots: u64 = capacity.slots_per_layer.iter().map(|&n| u64::from(n)).sum();
-        let remaining = inputs.device_free_bytes - reserves.persistent_bytes(&geometry)?;
-        assert_eq!(slots, remaining / geometry.slot_bytes()?);
+        let remaining = inputs.device_free_bytes - reserves.persistent_bytes(slot_bytes)?;
+        assert_eq!(slots, remaining / slot_bytes);
         assert!(slots - u64::from(budget.borrowed_slots) >= u64::from(geometry.layers));
         let short = &candidates[0];
         assert_eq!(short.borrowed_slots, 1);
@@ -805,31 +810,43 @@ mod admission_tests {
             prefill_staging_slots: 2,
             disk_ring_slots: 1,
         };
-        let budget = ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok)?;
-        let exact = budget.candidate.reserves.persistent_bytes(&geometry)?
-            + (u64::from(budget.borrowed_slots) + u64::from(geometry.layers))
-                * geometry.slot_bytes()?;
+        let slot_bytes = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            &geometry,
+        )?
+        .slot_bytes();
+        let budget = ExpertWorkspaceBudget::new(request, geometry, slot_bytes, |r| Ok(r * 13), Ok)?;
+        let exact = budget.candidate.reserves.persistent_bytes(slot_bytes)?
+            + (u64::from(budget.borrowed_slots) + u64::from(geometry.layers)) * slot_bytes;
         request.mixer.free_after_resident = usize::try_from(exact)?;
-        let admitted = ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok)?;
+        let admitted =
+            ExpertWorkspaceBudget::new(request, geometry, slot_bytes, |r| Ok(r * 13), Ok)?;
         assert_eq!(admitted.workspace_rows, 5);
         assert_eq!(admitted.mixer.operator_workspace_bytes, 2048);
         assert_eq!(
-            admitted.candidate.reserves.persistent_bytes(&geometry)?
-                + (u64::from(admitted.borrowed_slots) + u64::from(geometry.layers))
-                    * geometry.slot_bytes()?,
+            admitted.candidate.reserves.persistent_bytes(slot_bytes)?
+                + (u64::from(admitted.borrowed_slots) + u64::from(geometry.layers)) * slot_bytes,
             exact
         );
         request.mixer.free_after_resident -= 1;
-        assert!(ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok).is_err());
+        assert!(
+            ExpertWorkspaceBudget::new(request, geometry, slot_bytes, |r| Ok(r * 13), Ok).is_err()
+        );
         request.mixer.free_after_resident = 1 << 20;
         request.wave_rows = 17;
-        assert!(ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok).is_err());
+        assert!(
+            ExpertWorkspaceBudget::new(request, geometry, slot_bytes, |r| Ok(r * 13), Ok).is_err()
+        );
         request.wave_rows = 5;
         request.mixer.requested = Some(17);
-        assert!(ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok).is_err());
+        assert!(
+            ExpertWorkspaceBudget::new(request, geometry, slot_bytes, |r| Ok(r * 13), Ok).is_err()
+        );
         request.mixer.requested = Some(3);
         request.mixer.free_after_resident = request.mixer.total + 1;
-        assert!(ExpertWorkspaceBudget::new(request, geometry, |r| Ok(r * 13), Ok).is_err());
+        assert!(
+            ExpertWorkspaceBudget::new(request, geometry, slot_bytes, |r| Ok(r * 13), Ok).is_err()
+        );
         request.mixer.free_after_resident = request.mixer.total;
         let oversized = ExpertGeometry {
             hidden: u32::MAX,
@@ -837,7 +854,9 @@ mod admission_tests {
             top_k: u32::MAX,
             ..geometry
         };
-        assert!(ExpertWorkspaceBudget::new(request, oversized, |r| Ok(r * 13), Ok).is_err());
+        assert!(
+            ExpertWorkspaceBudget::new(request, oversized, slot_bytes, |r| Ok(r * 13), Ok).is_err()
+        );
         Ok(())
     }
 }

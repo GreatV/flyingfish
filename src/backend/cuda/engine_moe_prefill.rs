@@ -271,6 +271,7 @@ pub(in crate::backend::cuda::engine) struct Prefill {
 #[cfg(test)]
 pub(in crate::backend::cuda::engine) fn cpu_bound(
     geometry: ExpertGeometry,
+    slot_bytes: u64,
     rows: u32,
     service: &ServiceTable,
     h2d_bytes_per_second: f64,
@@ -286,7 +287,7 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
     );
     let mut counts = vec![0; geometry.experts as usize];
     let resident = vec![false; geometry.experts as usize];
-    let mut plan = SpanPlan::new(&geometry, 1, service.worker_count()?)?;
+    let mut plan = SpanPlan::new(&geometry, slot_bytes, 1, service.worker_count()?)?;
     let mut cpu_rows = 0;
     for row_count in 1..=service.max_rows().min(rows) {
         counts[0] = row_count;
@@ -357,11 +358,16 @@ impl Prefill {
             h2d_bytes_per_second.is_finite() && h2d_bytes_per_second > 0.0,
             "prefill H2D rate={h2d_bytes_per_second}"
         );
-        ExpertSpanLayout::new(&reserves, geometry, capacity.span_rows)?
-            .validate_wave(capacity.wave_rows, workspace_rows)?;
+        ExpertSpanLayout::new(
+            &reserves,
+            geometry,
+            capacity.slot_bytes(),
+            capacity.span_rows,
+        )?
+        .validate_wave(capacity.wave_rows, workspace_rows)?;
         let borrowed = reserves
             .span_bytes(capacity.span_rows)?
-            .div_ceil(geometry.slot_bytes()?);
+            .div_ceil(capacity.slot_bytes());
         let host_union = u64::from(geometry.layers) * u64::from(geometry.experts)
             - u64::from(capacity.slots_total());
         if capacity.disk_bytes == 0 && u64::from(capacity.host_blocks) >= host_union + borrowed {
@@ -372,7 +378,13 @@ impl Prefill {
             .as_ref()
             .map_or(0, |reader| reader.disk.ring_slots());
         let assignments = capacity.span_rows as usize * geometry.top_k as usize;
-        let cpu = cpu_bound(geometry, capacity.span_rows, &service, h2d_bytes_per_second)?;
+        let cpu = cpu_bound(
+            geometry,
+            capacity.slot_bytes(),
+            capacity.span_rows,
+            &service,
+            h2d_bytes_per_second,
+        )?;
         let workers = service.worker_count()?;
         let cohorts =
             (geometry.experts as usize).div_ceil(capacity.prefill_staging_slots as usize) + 1;
@@ -449,8 +461,18 @@ impl Prefill {
             resident: vec![false; geometry.experts as usize],
             forecast_counts: vec![0; geometry.experts as usize],
             forecast_resident: vec![false; geometry.experts as usize],
-            plan: SpanPlan::new(&geometry, capacity.prefill_staging_slots, workers)?,
-            forecast_plan: SpanPlan::new(&geometry, capacity.prefill_staging_slots, workers)?,
+            plan: SpanPlan::new(
+                &geometry,
+                capacity.slot_bytes(),
+                capacity.prefill_staging_slots,
+                workers,
+            )?,
+            forecast_plan: SpanPlan::new(
+                &geometry,
+                capacity.slot_bytes(),
+                capacity.prefill_staging_slots,
+                workers,
+            )?,
             leases: StagingLeases::new(capacity.prefill_staging_slots)?,
             stats: [0; 8],
         })
@@ -465,12 +487,17 @@ impl Prefill {
         self.gpu.read_ahead.finish(slots)?;
         self.gpu.read_ahead.stats = [0; 6];
         let rows = rows.min(self.capacity.span_rows);
-        let layout = ExpertSpanLayout::new(&self.reserves, self.geometry, rows)?;
+        let layout = ExpertSpanLayout::new(
+            &self.reserves,
+            self.geometry,
+            self.capacity.slot_bytes(),
+            rows,
+        )?;
         layout.validate_wave(self.capacity.wave_rows.min(rows), self.workspace_rows)?;
         let borrowed = u32::try_from(
             self.reserves
                 .span_bytes(rows)?
-                .div_ceil(self.geometry.slot_bytes()?),
+                .div_ceil(self.capacity.slot_bytes()),
         )?;
         let mut occupants = vec![None; self.capacity.slots_total() as usize];
         for layer in 0..self.geometry.layers {
@@ -516,7 +543,7 @@ impl Prefill {
                     let copied = slots.transfers.write_back(
                         physical.pointer,
                         block,
-                        usize::try_from(self.geometry.slot_bytes()?)?,
+                        usize::try_from(self.capacity.slot_bytes())?,
                         &mut slots.events,
                     )?;
                     device.stream.wait(&copied.event)?;
@@ -601,9 +628,9 @@ impl Prefill {
         slots.begin_request(&self.frequency)?;
         for movement in &slots.moves {
             self.stats[6 + usize::from(movement.source == MoveSource::Disk)] +=
-                self.geometry.slot_bytes()?;
+                self.capacity.slot_bytes();
             if movement.dest_block.is_some() {
-                self.stats[4] += self.geometry.slot_bytes()?;
+                self.stats[4] += self.capacity.slot_bytes();
             }
         }
         self.span = None;
@@ -814,7 +841,7 @@ impl Prefill {
         }
         let expected =
             u64::from(rows) * u64::from(self.geometry.top_k) / u64::from(self.geometry.experts);
-        let copy_seconds = self.geometry.slot_bytes()? as f64 / self.h2d_bytes_per_second;
+        let copy_seconds = self.capacity.slot_bytes() as f64 / self.h2d_bytes_per_second;
         if expected <= u64::from(self.service.max_rows())
             || copy_seconds
                 >= self
@@ -1359,7 +1386,15 @@ impl Cpu {
                     .as_ref()
                     .context("prefill host tier has no arena")?
                     .block_range(block)?;
-                let down = range.start + usize::try_from(geometry.gate_up_bytes()? / 2)?;
+                let down = range.start
+                    + usize::try_from(
+                        slots
+                            .catalogue
+                            .layout()
+                            .gate_up_bytes()
+                            .context("BF16 prefill gate-up")?
+                            / 2,
+                    )?;
                 self.experts.push(ExpertWeights {
                     gate_up: range.start..down,
                     gate_up_stride: geometry.hidden as usize,
@@ -1497,7 +1532,12 @@ impl Gpu {
                 expert,
                 (
                     physical.pointer,
-                    physical.pointer + geometry.gate_up_bytes()?,
+                    physical.pointer
+                        + slots
+                            .catalogue
+                            .layout()
+                            .gate_up_bytes()
+                            .context("BF16 prefill gate-up")?,
                 ),
                 slots.policy.generation(layer, expert)?,
             )?;
@@ -1606,7 +1646,7 @@ impl Gpu {
         position: u32,
     ) -> Result<()> {
         let pointer = slots.storage.staging(position)?.0;
-        let bytes = usize::try_from(slots.catalogue.geometry().slot_bytes()?)?;
+        let bytes = usize::try_from(slots.catalogue.slot_bytes())?;
         let (source, host) = match slots.policy.ledger().tier(layer, expert)? {
             Tier::Host => {
                 let block = slots.policy.host_block(layer, expert)?;
@@ -1779,6 +1819,11 @@ mod tests {
     #[test]
     fn borrowed_span_views_preserve_global_choice_and_tail_offsets() -> Result<()> {
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+        let slot_bytes = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            &geometry,
+        )?
+        .slot_bytes();
         let service = ServiceTable::new(
             "fixture",
             [1, 64]
@@ -1792,19 +1837,20 @@ mod tests {
                 .collect(),
         )?;
         assert_eq!(
-            cpu_bound(geometry, 263, &service, 1_000_000_000.0)?,
+            cpu_bound(geometry, slot_bytes, 263, &service, 1_000_000_000.0)?,
             (32, 32)
         );
         assert_eq!(
-            cpu_bound(geometry, 263, &service, 1_000_000_000_000.0)?,
+            cpu_bound(geometry, slot_bytes, 263, &service, 1_000_000_000_000.0)?,
             (1, 1)
         );
         assert_eq!(
-            cpu_bound(geometry, 263, &service, 1_000_000.0)?,
+            cpu_bound(geometry, slot_bytes, 263, &service, 1_000_000.0)?,
             (263, 1024)
         );
         for span_rows in [8, 17, 37, 263] {
-            let layout = ExpertSpanLayout::new(&reserves(geometry), geometry, span_rows)?;
+            let layout =
+                ExpertSpanLayout::new(&reserves(geometry), geometry, slot_bytes, span_rows)?;
             layout.validate_wave(4, 8)?;
             assert!(layout.validate_wave(4, 3).is_err());
             if span_rows >= 17 {
@@ -1845,8 +1891,19 @@ mod tests {
             assert!(span.contributions(span_rows - 1, 2).is_err());
             assert!(span.choices::<bf16>(&span.layout.weights, 1, 1).is_err());
         }
+        for pinned in [false, true] {
+            for engines in [1, 2] {
+                let capacity = capacity(geometry, 17, pinned, engines, true)?;
+                assert_eq!(capacity.host_blocks, 25);
+                assert_eq!(capacity.spare_blocks, 2);
+                assert_eq!(capacity.host_expert_bytes, 27 * slot_bytes);
+                assert_eq!(capacity.disk_bytes, 0);
+                assert_eq!(capacity.disk_workers, 0);
+                assert_eq!(capacity.pinned, pinned);
+            }
+        }
         println!(
-            "PASS prefill_span_cpu_views spans=8,17,37,263 global_choice_offsets=true borrowed_tail_prefix=true wave_workspace_bound=true GPU_executed=false"
+            "PASS prefill_span_cpu_views spans=8,17,37,263 global_choice_offsets=true borrowed_tail_prefix=true wave_workspace_bound=true derived_host_surplus_blocks=1 GPU_executed=false"
         );
         Ok(())
     }
@@ -1872,15 +1929,57 @@ mod tests {
         fixture
     }
 
-    fn capacity(geometry: ExpertGeometry, rows: u32, pinned: bool) -> Result<Capacity> {
+    fn capacity(
+        geometry: ExpertGeometry,
+        rows: u32,
+        pinned: bool,
+        engines: u32,
+        host_complete: bool,
+    ) -> Result<Capacity> {
         let mut capacity = tier_capacity(geometry, pinned)?;
         capacity.span_rows = rows;
         capacity.wave_rows = 4;
         capacity.prefill_staging_slots = 2;
         if rows > 37 {
             capacity.slots_per_layer = vec![8, 8];
-            capacity.device_expert_bytes = 16 * geometry.slot_bytes()?;
-            capacity.disk_bytes = 8 * geometry.slot_bytes()?;
+            capacity.device_expert_bytes = 16 * capacity.slot_bytes();
+            capacity.disk_bytes = 8 * capacity.slot_bytes();
+        }
+        if host_complete {
+            let reserves = reserves(geometry);
+            let slot_bytes = capacity.slot_bytes();
+            let borrowed =
+                crate::experts::plan::span_borrow_slots(&reserves, slot_bytes, rows, rows)?;
+            let non_gpu = geometry.layers * geometry.experts - capacity.slots_total();
+            let host_bytes = u64::from(non_gpu + borrowed + capacity.spare_blocks) * slot_bytes;
+            let service = ServiceTable::new(
+                "fixture",
+                vec![crate::experts::plan::ServiceCell {
+                    workers: capacity.worker_count,
+                    rows: 1,
+                    experts: 1,
+                    seconds: 0.00002,
+                }],
+            )?;
+            return crate::experts::plan::capacity(
+                &crate::experts::plan::PlanInputs {
+                    geometry,
+                    layout: capacity.layout.clone(),
+                    device_free_bytes: capacity.device_expert_bytes
+                        + reserves.persistent_bytes(slot_bytes)?,
+                    host_available_bytes: host_bytes + reserves.host_bytes(slot_bytes)?,
+                    h2d_bytes_per_second: 1_000_000_000.0,
+                    d2h_bytes_per_second: 1_000_000_000.0,
+                    copy_engines: engines,
+                    disk_readers: 0,
+                    host_registration_bytes: if pinned { host_bytes } else { 0 },
+                    service: &service,
+                    reserves: &reserves,
+                    span_rows: rows,
+                    wave_rows: 4,
+                },
+                capacity.spare_blocks,
+            );
         }
         Ok(capacity)
     }
@@ -1933,12 +2032,19 @@ mod tests {
             .as_ref()
             .context("prefill reference slots missing")?;
         let table = slots.bindings(layer as usize, stream)?;
-        let geometry = slots.catalogue.geometry();
         let pointers = (0..16)
             .map(|expert| {
                 let position = slots.policy.ledger().slot(layer, expert)?;
                 let pointer = slots.physical[position as usize].pointer;
-                Ok((pointer, pointer + geometry.gate_up_bytes()?))
+                Ok((
+                    pointer,
+                    pointer
+                        + slots
+                            .catalogue
+                            .layout()
+                            .gate_up_bytes()
+                            .context("BF16 prefill gate-up")?,
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         let gate_up = pointers.iter().map(|p| p.0).collect::<Vec<_>>();
@@ -2119,21 +2225,7 @@ mod tests {
                 for &(pinned, engines) in modes {
                     let directory =
                         runtime.join(format!("span-{variant}-{rows}-{pinned}-{engines}"));
-                    let mut capacity = capacity(geometry, rows, pinned)?;
-                    if host_complete {
-                        let borrowed = u32::try_from(
-                            reserves(geometry)
-                                .span_bytes(rows)?
-                                .div_ceil(geometry.slot_bytes()?),
-                        )?;
-                        capacity.host_blocks =
-                            geometry.layers * geometry.experts - capacity.slots_total() + borrowed;
-                        capacity.host_expert_bytes =
-                            u64::from(capacity.host_blocks + capacity.spare_blocks)
-                                * geometry.slot_bytes()?;
-                        capacity.disk_bytes = 0;
-                        capacity.disk_workers = 0;
-                    }
+                    let capacity = capacity(geometry, rows, pinned, engines, host_complete)?;
                     let initial = vec![(0..capacity.slots_per_layer[0]).collect::<Vec<_>>(); 2];
                     let mut engine = Engine::load_moe_placed(
                         &fixture,
@@ -2141,7 +2233,7 @@ mod tests {
                         &capacity,
                         &initial,
                         crate::experts::plan::Admission {
-                            budget_bytes_per_token: 2 * geometry.slot_bytes()?,
+                            budget_bytes_per_token: 2 * capacity.slot_bytes(),
                         },
                         engines,
                     )?;
@@ -2201,7 +2293,7 @@ mod tests {
                     if rows == 263 {
                         ensure!(
                             rows * geometry.top_k / geometry.experts > prefill.service.max_rows()
-                                && (geometry.slot_bytes()? as f64 / prefill.h2d_bytes_per_second)
+                                && (capacity.slot_bytes() as f64 / prefill.h2d_bytes_per_second)
                                     < prefill.service.rows_time(
                                         prefill.service.max_rows(),
                                         1,
@@ -2221,7 +2313,12 @@ mod tests {
                                 Ok(slots.policy.ledger().tier(layer as u32, expert)? == Tier::Gpu)
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        let mut expected_plan = SpanPlan::new(&geometry, 2, prefill.workers)?;
+                        let mut expected_plan = SpanPlan::new(
+                            &geometry,
+                            slots.catalogue.slot_bytes(),
+                            2,
+                            prefill.workers,
+                        )?;
                         expected_plan.update(
                             &counts,
                             &resident,
@@ -2421,8 +2518,7 @@ mod tests {
                     );
                     let state_mismatch = prefill.stats[0] != 2
                         || prefill.stats[1] != 2 * u64::from(rows)
-                        || prefill.stats[2]
-                            != (coverage[3] + coverage[4]) * geometry.slot_bytes()?
+                        || prefill.stats[2] != (coverage[3] + coverage[4]) * capacity.slot_bytes()
                         || prefill.stats[3] != coverage[1] + coverage[2]
                         || prefill.gpu.read_ahead.stats[4] != expected_cancellations
                         || prefill.gpu.read_ahead.stats[5] != 1;
@@ -2569,14 +2665,14 @@ mod tests {
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
         let mut defects = 0;
         for span_rows in [17, 8] {
-            let capacity = capacity(geometry, span_rows, false)?;
+            let capacity = capacity(geometry, span_rows, false, 2, false)?;
             let mut engine = Engine::load_moe_placed(
                 &fixture,
                 &runtime.join(format!("order-candidate-{span_rows}")),
                 &capacity,
                 &[vec![0, 1, 2, 3], vec![0, 1, 2, 3]],
                 crate::experts::plan::Admission {
-                    budget_bytes_per_token: 2 * geometry.slot_bytes()?,
+                    budget_bytes_per_token: 2 * capacity.slot_bytes(),
                 },
                 2,
             )?;

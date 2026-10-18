@@ -792,14 +792,18 @@ impl ExpertHost {
             .collect()
     }
 
-    fn ring_experts(&self, geometry: &crate::experts::catalogue::ExpertGeometry) -> Result<u32> {
+    fn ring_experts(
+        &self,
+        geometry: &crate::experts::catalogue::ExpertGeometry,
+        slot_bytes: u64,
+    ) -> Result<u32> {
         let bytes = self
             .llc_bytes
             .checked_mul(8)
             .context("CPU service ring extent overflow")?;
         u32::try_from(
             bytes
-                .div_ceil(geometry.slot_bytes()?)
+                .div_ceil(slot_bytes)
                 .max(u64::from(geometry.top_k) * 6),
         )
         .context("CPU service ring exceeds u32 experts")
@@ -840,6 +844,7 @@ impl ExpertCache {
         key: &CacheKey,
         host: &ExpertHost,
         geometry: &crate::experts::catalogue::ExpertGeometry,
+        slot_bytes: u64,
     ) -> Result<ExpertCalibration> {
         ensure!(
             self.schema == 1,
@@ -867,11 +872,10 @@ impl ExpertCache {
             self.copy_engines
         );
         ensure!(
-            self.ring_experts == host.ring_experts(geometry)?,
+            self.ring_experts == host.ring_experts(geometry, slot_bytes)?,
             "expert ring count {} differs from host-derived count",
             self.ring_experts
         );
-        let slot_bytes = geometry.slot_bytes()?;
         let sizes = [1, geometry.top_k]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()
@@ -1047,11 +1051,18 @@ pub(super) fn load_experts(
     d: &Device,
     dir: &Path,
     geometry: crate::experts::catalogue::ExpertGeometry,
+    expert_format: crate::model_spec::ExpertFormat,
     closure: &super::closure::Closure,
 ) -> Result<ExpertCalibration> {
+    ensure!(
+        expert_format == crate::model_spec::ExpertFormat::Bf16,
+        "expert CPU setup service requires BF16, got {expert_format:?}"
+    );
+    let slot_bytes =
+        crate::experts::catalogue::ExpertLayout::new(expert_format, &geometry)?.slot_bytes();
     let key = key(d)?;
     let host = ExpertHost::read()?;
-    let identity = super::closure::hash(&serde_json::to_vec(&(&host, geometry))?);
+    let identity = super::closure::hash(&serde_json::to_vec(&(&host, geometry, expert_format))?);
     let path = dir.join(format!(
         "experts-v1-{}-{}-{}-{identity}.json",
         key.device_uuid, key.driver_version, key.binary_version
@@ -1064,9 +1075,9 @@ pub(super) fn load_experts(
         )
     } else {
         closure.measurement()?;
-        let ring_experts = host.ring_experts(&geometry)?;
+        let ring_experts = host.ring_experts(&geometry, slot_bytes)?;
         let ring_bytes = u64::from(ring_experts)
-            .checked_mul(geometry.slot_bytes()?)
+            .checked_mul(slot_bytes)
             .context("expert ring bytes overflow")?;
         let meminfo =
             std::fs::read_to_string("/proc/meminfo").context("read host memory profile")?;
@@ -1087,7 +1098,6 @@ pub(super) fn load_experts(
             d.ctx
                 .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT)?,
         )?;
-        let slot_bytes = geometry.slot_bytes()?;
         let transfers = [1, geometry.top_k]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()
@@ -1129,7 +1139,7 @@ pub(super) fn load_experts(
             transfers,
             service,
         };
-        cache.check(&key, &host, &geometry)?;
+        cache.check(&key, &host, &geometry, slot_bytes)?;
         let temp = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -1149,7 +1159,7 @@ pub(super) fn load_experts(
         "expert cache engine count {} differs from driver {measured_engines}",
         cache.copy_engines
     );
-    let measured = cache.check(&key, &host, &geometry)?;
+    let measured = cache.check(&key, &host, &geometry, slot_bytes)?;
     eprintln!(
         "{}",
         serde_json::json!({"expert_calibration":{"path":path,"cached":hit,"cells":cache,"h2d_bytes_per_second":measured.h2d_bytes_per_second,"d2h_bytes_per_second":measured.d2h_bytes_per_second}})
@@ -1186,13 +1196,18 @@ mod long_tests {
             intermediate: 8,
             top_k: 2,
         };
+        let slot_bytes = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            &geometry,
+        )?
+        .slot_bytes();
         let mut cache = ExpertCache {
             schema: 1,
             key: key.clone(),
             host: host.clone(),
             geometry,
             copy_engines: 2,
-            ring_experts: host.ring_experts(&geometry)?,
+            ring_experts: host.ring_experts(&geometry, slot_bytes)?,
             transfers: [768, 1536]
                 .map(|bytes| ExpertTransfer {
                     bytes,
@@ -1214,7 +1229,7 @@ mod long_tests {
                 })
                 .collect(),
         };
-        let measured = cache.check(&key, &host, &geometry)?;
+        let measured = cache.check(&key, &host, &geometry, slot_bytes)?;
         assert_eq!(measured.h2d_bytes_per_second, 768000.0);
         assert_eq!(measured.d2h_bytes_per_second, 384000.0);
         assert_eq!(measured.copy_engines, 2);
@@ -1222,30 +1237,30 @@ mod long_tests {
         assert_eq!(measured.service.seconds(64, 1, 1)?, 0.001);
         let large = cache.service.iter().position(|c| c.rows == 64).unwrap();
         let cell = cache.service.remove(large);
-        assert!(cache.check(&key, &host, &geometry).is_err());
+        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
         cache.service.insert(large, cell);
         cache.transfers[0].d2h_seconds[0] = f64::NAN;
-        assert!(cache.check(&key, &host, &geometry).is_err());
+        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
         cache.transfers[0].d2h_seconds[0] = 0.0;
-        assert!(cache.check(&key, &host, &geometry).is_err());
+        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
         cache.transfers[0].d2h_seconds[0] = 0.002;
         cache.service[0].experts = 2;
-        assert!(cache.check(&key, &host, &geometry).is_err());
+        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
         cache.service[0].experts = 1;
         cache.copy_engines = 0;
-        assert!(cache.check(&key, &host, &geometry).is_err());
+        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
         cache.copy_engines = 2;
         cache.host.affinity = "2-3".into();
-        assert!(cache.check(&key, &host, &geometry).is_err());
+        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
         cache.host = host.clone();
         cache.geometry.hidden += 4;
-        assert!(cache.check(&key, &host, &geometry).is_err());
+        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
         cache.geometry = geometry;
         cache.key.binary_version = "changed".into();
-        assert!(cache.check(&key, &host, &geometry).is_err());
+        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
         cache.key = key.clone();
         cache.transfers[0].bytes -= 1;
-        assert!(cache.check(&key, &host, &geometry).is_err());
+        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
         Ok(())
     }
 
@@ -1303,6 +1318,9 @@ mod long_tests {
         );
         let spec = crate::model_spec::ModelSpec::read(&model)?;
         let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&spec)?;
+        let slot_bytes =
+            crate::experts::catalogue::ExpertLayout::new(spec.expert_format, &geometry)?
+                .slot_bytes();
         super::super::engine::Engine::calibrate(
             &model,
             0,
@@ -1329,9 +1347,10 @@ mod long_tests {
         let modified = std::fs::metadata(&path)?.modified()?;
         let device = Device::new(0)?;
         let measured: ExpertCache = serde_json::from_slice(&bytes)?;
-        let measured = measured.check(&key(&device)?, &ExpertHost::read()?, &geometry)?;
+        let measured =
+            measured.check(&key(&device)?, &ExpertHost::read()?, &geometry, slot_bytes)?;
         let reader = super::super::closure::Closure::new(false, "calibrate".into());
-        let reused = load_experts(&device, &runtime, geometry, &reader)?;
+        let reused = load_experts(&device, &runtime, geometry, spec.expert_format, &reader)?;
         assert_eq!(measured.h2d_bytes_per_second, reused.h2d_bytes_per_second);
         assert_eq!(measured.d2h_bytes_per_second, reused.d2h_bytes_per_second);
         assert_eq!(measured.copy_engines, reused.copy_engines);
@@ -1341,7 +1360,7 @@ mod long_tests {
         let mut invalid: ExpertCache = serde_json::from_slice(&bytes)?;
         invalid.transfers[0].d2h_seconds[0] = 0.0;
         std::fs::write(&path, serde_json::to_vec(&invalid)?)?;
-        let rejected = load_experts(&device, &runtime, geometry, &reader);
+        let rejected = load_experts(&device, &runtime, geometry, spec.expert_format, &reader);
         std::fs::write(&path, &bytes)?;
         assert!(rejected.is_err());
         device.upload.synchronize()?;

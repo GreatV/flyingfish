@@ -39,6 +39,7 @@ pub struct Weights {
 /// Stable native expert slots, persistent staging and host data plus spare blocks.
 pub struct ExpertStorage {
     layout: SlotLayout,
+    gate_up_bytes: u64,
     device: CudaSlice<bf16>,
     host: Option<Arc<HostBlocks>>,
     context: Arc<CudaContext>,
@@ -56,13 +57,19 @@ impl ExpertStorage {
             Arc::ptr_eq(stream.context(), upload.context()),
             "expert allocation streams have different contexts"
         );
+        let gate_up_bytes = capacity.layout.gate_up_bytes().with_context(|| {
+            format!(
+                "BF16 expert pointer binding requires fused gate-up, got {:?}",
+                capacity.layout
+            )
+        })?;
         let layout = SlotLayout::new(geometry, capacity)?;
         let bytes = layout.allocation_bytes()?;
         let host = (layout.host_blocks() > 0)
             .then(|| {
                 HostBlocks::new(
                     layout.host_blocks(),
-                    usize::try_from(geometry.slot_bytes()? / 2)?,
+                    usize::try_from(capacity.slot_bytes() / 2)?,
                 )
             })
             .transpose()?;
@@ -72,6 +79,7 @@ impl ExpertStorage {
         upload.wait(&stream.record_event(None)?)?;
         Ok(Self {
             layout,
+            gate_up_bytes,
             device: allocation,
             host,
             context: stream.context().clone(),
@@ -98,7 +106,7 @@ impl ExpertStorage {
             .checked_add(range.start as u64)
             .context("native expert address overflow")?;
         let down = gate_up
-            .checked_add(self.layout.geometry().gate_up_bytes()?)
+            .checked_add(self.gate_up_bytes)
             .context("native down address overflow")?;
         Ok((gate_up, down))
     }
@@ -696,10 +704,15 @@ mod tests {
     fn expert_storage_case(geometry: crate::experts::catalogue::ExpertGeometry) -> Result<()> {
         use crate::experts::plan::Capacity;
         use cudarc::driver::result;
-        let slot_bytes = geometry.slot_bytes()?;
+        let expert_layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            &geometry,
+        )?;
+        let slot_bytes = expert_layout.slot_bytes();
         let mut counts = vec![1; geometry.layers as usize];
         counts[0] += 1;
         let capacity = Capacity {
+            layout: expert_layout,
             span_rows: 8,
             wave_rows: 2,
             device_expert_bytes: u64::from(geometry.layers + 1) * slot_bytes,
@@ -752,7 +765,13 @@ mod tests {
         let upload = &device.upload;
         let stream = &device.stream;
         let (first, first_down) = storage.slot(0, 0)?;
-        assert_eq!(first_down - first, geometry.gate_up_bytes()?);
+        assert_eq!(
+            first_down - first,
+            capacity
+                .layout
+                .gate_up_bytes()
+                .context("BF16 fixture gate-up")?
+        );
         let lease = host.lease(&[0])?;
         // SAFETY: the registered block is leased through completion and the destination owns a full slot.
         unsafe { result::memcpy_htod_async(first, lease.read(0)?, upload.cu_stream())? };

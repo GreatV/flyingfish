@@ -217,7 +217,7 @@ impl Transfers {
         let host_use = (0..host.as_ref().map_or(0, |arena| arena.blocks()))
             .map(|_| RefCell::new(HostUse::default()))
             .collect();
-        let elements = usize::try_from(storage.layout().geometry().slot_bytes()? / 2)?;
+        let elements = storage.layout().slot_bytes() / 2;
         let per_direction = engines.min(2) as usize;
         let stages = if !pinned && host.is_some() {
             2 * per_direction
@@ -531,6 +531,12 @@ impl Slots {
             "expert slot/catalogue geometry differs"
         );
         ensure!(
+            input.capacity.layout == *input.catalogue.layout(),
+            "expert slot/catalogue layout differs: planned={:?} catalogue={:?}",
+            input.capacity.layout,
+            input.catalogue.layout()
+        );
+        ensure!(
             input.engines > 0,
             "expert setup has no measured copy engines"
         );
@@ -562,7 +568,7 @@ impl Slots {
         let mut physical = (0..physical_count)
             .map(|_| Physical::default())
             .collect::<Vec<_>>();
-        let bytes = usize::try_from(geometry.slot_bytes()?)?;
+        let bytes = storage.layout().slot_bytes();
         for layer in 0..geometry.layers {
             for rank in 0..storage.layout().slot_count(layer)? {
                 let index = storage.layout().resident_slot(layer, rank)?.start / bytes;
@@ -665,7 +671,12 @@ impl Slots {
             .context("publish physical slot outside allocation")?
             .pointer;
         let down = pointer
-            .checked_add(geometry.gate_up_bytes()?)
+            .checked_add(
+                self.catalogue
+                    .layout()
+                    .gate_up_bytes()
+                    .context("BF16 expert gate-up")?,
+            )
             .context("expert down pointer overflow")?;
         let offset = layer as usize * geometry.experts as usize;
         let previous = *self
@@ -720,7 +731,6 @@ impl Slots {
         generation: u64,
         source: MoveSource,
     ) -> Result<()> {
-        let geometry = self.storage.layout().geometry();
         self.transfers.h2d.context().bind_to_thread()?;
         let (pointer, staging, ring) = match source {
             MoveSource::Host(block) => {
@@ -740,7 +750,7 @@ impl Slots {
                     cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                         self.physical[slot as usize].pointer,
                         pointer as *const std::ffi::c_void,
-                        usize::try_from(geometry.slot_bytes()?)?,
+                        usize::try_from(self.catalogue.slot_bytes())?,
                         self.transfers.h2d.cu_stream(),
                     )
                     .result()
@@ -759,7 +769,7 @@ impl Slots {
                 cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                     self.physical[slot as usize].pointer,
                     pointer as *const std::ffi::c_void,
-                    usize::try_from(geometry.slot_bytes()?)?,
+                    usize::try_from(self.catalogue.slot_bytes())?,
                     self.transfers.h2d.cu_stream(),
                 )
                 .result()
@@ -815,7 +825,7 @@ impl Slots {
             let event = self.transfers.write_back(
                 slot.pointer,
                 block,
-                usize::try_from(self.catalogue.geometry().slot_bytes()?)?,
+                usize::try_from(self.catalogue.slot_bytes())?,
                 &mut self.events,
             )?;
             self.transfers.h2d.wait(&event.event)?;
@@ -940,7 +950,14 @@ impl Slots {
                 .as_ref()
                 .context("host tier has no arena")?
                 .block_range(block)?;
-            let down = range.start + usize::try_from(geometry.gate_up_bytes()? / 2)?;
+            let down = range.start
+                + usize::try_from(
+                    self.catalogue
+                        .layout()
+                        .gate_up_bytes()
+                        .context("BF16 expert gate-up")?
+                        / 2,
+                )?;
             self.host_experts.push(expert);
             self.host_weights.push(ExpertWeights {
                 gate_up: range.start..down,

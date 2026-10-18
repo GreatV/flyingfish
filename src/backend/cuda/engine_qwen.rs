@@ -1287,6 +1287,7 @@ impl Engine {
                 &engine.device,
                 &engine.runtime,
                 geometry,
+                engine.model_spec.expert_format,
                 &engine.closure,
             )?;
             engine.moe = Some(super::moe::Decode::new(
