@@ -514,17 +514,13 @@ mod tests {
         let expected = stream.clone_dtoh(&expected)?;
         let mut defects = 0;
         for m in [1, 2, 3, 4, 5, 8, 15, 16] {
-            let execute = || {
-                blas.linear_typed(
-                    ExecutionPhase::Prefill,
-                    weight,
-                    view(&input, stream, 0, [m, k as u32], [k as u64, 1])?,
-                    &mut TensorMut(view(&output, stream, 0, [m, n as u32], [n as u64, 1])?),
-                )
-            };
+            let x = view(&input, stream, 0, [m, k as u32], [k as u64, 1])?;
+            let mut y = TensorMut(view(&output, stream, 0, [m, n as u32], [n as u64, 1])?);
+            let mut execute = || blas.linear_typed(ExecutionPhase::Prefill, weight, x, &mut y);
             for graph in [false, true] {
                 if graph {
                     use cudarc::driver::sys;
+                    stream.synchronize()?;
                     stream.begin_capture(
                         sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
                     )?;
