@@ -770,7 +770,7 @@ impl Engine {
         Ok(())
     }
 
-    pub(super) fn bind_mtp_snapshots(
+    pub(super) fn bind_gdn_snapshots(
         &mut self,
         snapshots: &[super::super::state::GdnState],
         verify_rows: usize,
@@ -779,6 +779,12 @@ impl Engine {
         let stream = &self.device.stream;
         let g = q.gdn;
         let cd = g.conv_dim()?;
+        ensure!(
+            (1..=g.snapshot_limit()? as usize).contains(&verify_rows),
+            "GDN hv={} verify_rows={verify_rows} exceeds snapshot bound={}",
+            g.hv,
+            g.snapshot_limit()?
+        );
         let mut states = snapshots.iter();
         for layer in &mut q.layers {
             if let BoundMixer::Gdn {
@@ -786,11 +792,25 @@ impl Engine {
             } = &mut layer.mixer
             {
                 let state = states.next().context("missing GDN snapshot allocation")?;
+                let state_width = (g.hv * g.dk * g.dv) as usize;
+                let history_width = (cd * g.history_width) as usize;
+                let slots = state.s.len() / state_width;
+                ensure!(
+                    slots > 0
+                        && slots < g.snapshot_limit()? as usize
+                        && slots >= verify_rows - 1
+                        && state.s.len() == slots * state_width
+                        && state.history.len() == slots * history_width,
+                    "GDN snapshot storage hv={} rows={verify_rows} slots={slots} state_words={} history_words={}",
+                    g.hv,
+                    state.s.len(),
+                    state.history.len()
+                );
                 let s = view(
                     &state.s,
                     stream,
                     0,
-                    [4, g.hv, g.dk, g.dv],
+                    [slots as u32, g.hv, g.dk, g.dv],
                     [
                         u64::from(g.hv * g.dk * g.dv),
                         u64::from(g.dk * g.dv),
@@ -802,7 +822,7 @@ impl Engine {
                     &state.history,
                     stream,
                     0,
-                    [4, cd, g.history_width],
+                    [slots as u32, cd, g.history_width],
                     [
                         u64::from(cd * g.history_width),
                         u64::from(g.history_width),
