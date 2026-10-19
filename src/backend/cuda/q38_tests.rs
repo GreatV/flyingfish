@@ -3210,7 +3210,7 @@ fn invariant_gated_norm(device: &Device) -> Result<()> {
         .collect();
     let z: Vec<_> = (0..rows * row_words)
         .map(|i| {
-            bf16::from_f32(((i * 13 + i / row_words * 37) % 257) as f32 / 128.0 - 128.0 / 128.0)
+            bf16::from_f32(((i * 13 + i / row_words * 37) % 257) as f32 / 128.0 - 1.0)
         })
         .collect();
     let weight: Vec<_> = (0..width)
