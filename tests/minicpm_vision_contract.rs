@@ -397,7 +397,28 @@ fn video_processor_and_canvas_match_reference() -> Result<()> {
             stack_frames: 1,
             max_slice_nums: Some(slice_nums),
         };
-        let video = processor.prepare_video(&frames, &video_meta, &options)?;
+        let direct = processor.prepare_video(&frames, &video_meta, &options)?;
+        let ids = u32_values(&processor_tensors, &format!("{case}_input_ids"))?;
+        let capacity = ids.len() + 64;
+        let encoded = std::fs::read(ref_dir.join("inputs").join(format!("{clip}.mp4")))?;
+        let url = format!("data:video/mp4;base64,{}", base64::encode(encoded));
+        let planned = processor.plan_video(&url, options, capacity)?;
+        let video = processor.prepare_planned_video(planned)?;
+        assert_eq!(
+            video.frames.len(),
+            direct.frames.len(),
+            "{case} decoded frames"
+        );
+        for (index, (actual, expected)) in video.frames.iter().zip(&direct.frames).enumerate() {
+            assert_eq!(
+                actual.grids, expected.grids,
+                "{case} decoded frame {index} grids"
+            );
+            assert_eq!(
+                actual.pixel_values, expected.pixel_values,
+                "{case} decoded frame {index} pixels"
+            );
+        }
         assert_eq!(video.frames.len(), count, "{case} frames");
         let expected_grids = i32_values(&processor_tensors, &format!("{case}_grids_videos"))?;
         let expected_counts =
@@ -425,9 +446,7 @@ fn video_processor_and_canvas_match_reference() -> Result<()> {
             })
             .collect();
         assert_eq!(ours, expected_sizes, "{case} target sizes");
-        let ids = u32_values(&processor_tensors, &format!("{case}_input_ids"))?;
         let prompt = video_prompt(&ids, vision)?;
-        let capacity = ids.len() + 64;
         let (expanded, prepared) = processor.expand(&prompt, Vec::new(), vec![video], capacity)?;
         assert_eq!(expanded, ids, "{case} ids");
         let modality: Vec<u8> =

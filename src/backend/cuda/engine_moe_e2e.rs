@@ -104,8 +104,7 @@ impl Bounds {
             batch_shape.iter().all(|cell| cell.is_object()),
             "missing official expert batch-shape noise {case}"
         );
-        let vision = case
-            .starts_with("image_")
+        let vision = (case.starts_with("image_") || case.starts_with("video_"))
             .then(|| &noise["official_vision_implementation_propagation"]["cases"][case]);
         if let Some(cell) = vision {
             ensure!(
@@ -142,14 +141,26 @@ impl Bounds {
             }
             cells
         };
-        let media = &manifest["image"]["media_reach_controls"];
+        let video = case.starts_with("video_");
+        let media = &manifest[if video { "video" } else { "image" }]["media_reach_controls"];
+        let (same_grid, cross_media) = if video {
+            (
+                "same_grid_1280x720_football_vs_boat_pan_logits_diff",
+                "football_16x_vs_sample_demo_1_16x_logits_diff",
+            )
+        } else {
+            (
+                "same_grid_400x267_hockey_vs_boat_logits_diff",
+                "hockey_16x_vs_boat_16x_logits_diff",
+            )
+        };
         Ok(Self {
             layers,
             norm: measured_bounds(&cells("norm"))?,
             logits: measured_bounds(&cells("logits"))?,
             decode: measured_bounds(&cells("teacher_top2"))?,
-            media: media_boundary(&media["same_grid_400x267_hockey_vs_boat_logits_diff"])?,
-            cross_media: media_boundary(&media["hockey_16x_vs_boat_16x_logits_diff"])?,
+            media: media_boundary(&media[same_grid])?,
+            cross_media: media_boundary(&media[cross_media])?,
         })
     }
 }
@@ -278,7 +289,7 @@ struct Input {
 }
 
 impl Input {
-    fn read(source: &SafeTensors<'_>, media: bool) -> Result<Self> {
+    fn read(source: &SafeTensors<'_>, case: &str) -> Result<Self> {
         let ids = integers(source, "input_ids")?;
         ensure!(
             source.tensor("input_ids")?.shape() == [1, ids.len()],
@@ -290,28 +301,143 @@ impl Input {
             pixels: Vec::new(),
             grids: Vec::new(),
         };
-        if media {
-            input.modalities = integers(source, "mm_token_type_ids")?
-                .into_iter()
-                .map(|v| Ok(u8::try_from(v)?))
-                .collect::<Result<_>>()?;
-            input.pixels = floats(source, "pixel_values")?;
-            let sizes = integers(source, "target_sizes")?;
-            ensure!(
-                sizes.len().is_multiple_of(2),
-                "reference target_sizes layout"
-            );
-            input.grids = sizes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|s| ImageGrid {
-                    t: 1,
-                    h: s[0],
-                    w: s[1],
-                })
-                .collect();
-        }
+        let (pixels, sizes) = match case.split('_').next() {
+            Some("text") => return Ok(input),
+            Some("image") => ("pixel_values", "target_sizes"),
+            Some("video") => ("pixel_values_videos", "target_sizes_videos"),
+            _ => anyhow::bail!("unknown native fixture case={case}"),
+        };
+        input.modalities = integers(source, "mm_token_type_ids")?
+            .into_iter()
+            .map(|v| Ok(u8::try_from(v)?))
+            .collect::<Result<_>>()?;
+        input.pixels = floats(source, pixels)?;
+        let sizes = integers(source, sizes)?;
+        ensure!(
+            sizes.len().is_multiple_of(2),
+            "reference target_sizes layout"
+        );
+        input.grids = sizes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|s| ImageGrid {
+                t: 1,
+                h: s[0],
+                w: s[1],
+            })
+            .collect();
+        Ok(input)
+    }
+
+    fn video(source: &SafeTensors<'_>, model: &Path, case: &str) -> Result<Self> {
+        use crate::serve::{
+            detok::Shared,
+            image::{Processor, VideoOptions},
+        };
+        let reference = Self::read(source, case)?;
+        let directory = PathBuf::from(
+            std::env::var_os("FF_VIDEO_REF_DIR").context("FF_VIDEO_REF_DIR missing")?,
+        );
+        let (clip, processor_case) = match case {
+            "video_football_16x" => ("football_4s", "football_4s_16x_s1"),
+            "video_control_clip2_16x" => ("sample_demo_1", "sample_demo_1_16x_s1"),
+            "video_control_same_grid_16x" => ("boat_pan_4s", "boat_pan_4s_16x_s1"),
+            _ => anyhow::bail!("unknown video fixture case={case}"),
+        };
+        let floor: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            directory.join("preprocess_video_noise_floor.json"),
+        )?)?;
+        let measured = &floor["cases"][processor_case];
+        let tolerance = measured["tv_vs_pil_diff"]["max_abs"]
+            .as_f64()
+            .context("video pixel floor missing")? as f32
+            + 4.0 * f32::EPSILON;
+        ensure!(
+            tolerance.is_finite() && tolerance > 0.0,
+            "invalid video pixel floor {case}"
+        );
+        let spec = crate::model_spec::ModelSpec::read(model)?;
+        let vision = spec.vision.as_ref().context("video vision spec missing")?;
+        let first = reference
+            .ids
+            .iter()
+            .position(|&id| id == vision.start_token)
+            .context("video opening marker missing")?;
+        let last = reference
+            .ids
+            .iter()
+            .rposition(|&id| id == vision.end_token)
+            .context("video closing marker missing")?;
+        ensure!(first < last, "video marker extent {case}");
+        let mut prompt = reference.ids[..first].to_vec();
+        prompt.push(vision.video_token);
+        prompt.extend_from_slice(&reference.ids[last + 1..]);
+        let tokenizer = Shared::load(model)?;
+        let processor =
+            Processor::load(model, Some(&tokenizer))?.context("video processor missing")?;
+        let bytes = std::fs::read(directory.join("inputs").join(format!("{clip}.mp4")))?;
+        let url = format!("data:video/mp4;base64,{}", base64::encode(bytes));
+        let planned = processor.plan_video(
+            &url,
+            VideoOptions {
+                max_num_frames: 4,
+                stack_frames: 1,
+                max_slice_nums: Some(1),
+            },
+            4352,
+        )?;
+        let video = processor.prepare_planned_video(planned)?;
+        let frames = video.frames.len();
+        let (ids, prepared) = processor.expand(&prompt, Vec::new(), vec![video], 4352)?;
+        let input = Self {
+            ids,
+            modalities: prepared.modality_ids,
+            pixels: prepared.pixel_values,
+            grids: prepared.grids,
+        };
+        ensure!(
+            input.ids == reference.ids
+                && input.modalities == reference.modalities
+                && input.grids == reference.grids,
+            "video preprocessing ids/modality/grid mismatch {case}"
+        );
+        ensure!(
+            input.pixels.len() == reference.pixels.len()
+                && input.pixels.iter().all(|value| value.is_finite()),
+            "video pixel extent/finite check {case}"
+        );
+        let error = input
+            .pixels
+            .iter()
+            .zip(&reference.pixels)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        ensure!(
+            error <= tolerance,
+            "video preprocess {case} pixel max={error} > {tolerance}"
+        );
+        let axes = input.packed().validate(&spec, 4352)?.packed_axes()?;
+        let expected = integers(source, "canvas_position_ids")?;
+        ensure!(
+            expected.len() == 3 * input.ids.len(),
+            "video reference canvas extent {case}"
+        );
+        ensure!(
+            (0..3).all(
+                |axis| (0..input.ids.len()).all(|row| i64::from(axes[3 * row + axis])
+                    == i64::from(expected[axis * input.ids.len() + row]))
+            ),
+            "video canvas mismatch {case}"
+        );
+        ensure!(
+            frames == integers(source, "sampled_frame_indices")?.len(),
+            "video frame count mismatch {case}"
+        );
+        println!(
+            "PASS minicpm_video_preprocess {case} frames={frames} modality=2 ids={} pixel_max={error} measured_floor={tolerance}",
+            input.ids.len()
+        );
         Ok(input)
     }
 
@@ -325,17 +451,26 @@ impl Input {
     }
 }
 
-fn check_fixtures(fixtures: &Path, model: &crate::model_spec::ModelSpec) -> Result<()> {
+fn check_fixtures(fixtures: &Path, model_dir: &Path) -> Result<()> {
+    let model = crate::model_spec::ModelSpec::read(model_dir)?;
     for case in [
         "text_32",
         "text_1k",
         "text_4k",
         "image_hockey_16x",
         "image_boat_16x",
+        "video_football_16x",
+        "video_control_clip2_16x",
+        "video_control_same_grid_16x",
     ] {
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
         let source = SafeTensors::deserialize(&bytes)?;
-        let input = Input::read(&source, case.starts_with("image_"))?;
+        Bounds::read(fixtures, case)?;
+        let input = if case.starts_with("video_") {
+            Input::video(&source, model_dir, case)?
+        } else {
+            Input::read(&source, case)?
+        };
         ensure!(
             input.ids.len() >= 8
                 && input.ids.len() <= 4096
@@ -343,14 +478,14 @@ fn check_fixtures(fixtures: &Path, model: &crate::model_spec::ModelSpec) -> Resu
             "fixture prompt extent/vocabulary {case}"
         );
         if !input.grids.is_empty() {
-            input.packed().validate(model, 4352)?;
+            input.packed().validate(&model, 4352)?;
         }
         if case == "image_hockey_16x" {
             let bytes =
                 std::fs::read(fixtures.join("control_boat_at_hockey_size_16x.safetensors"))?;
             let tensors = SafeTensors::deserialize(&bytes)?;
-            let control = Input::read(&tensors, true)?;
-            control.packed().validate(model, 4352)?;
+            let control = Input::read(&tensors, "image_control")?;
+            control.packed().validate(&model, 4352)?;
             ensure!(
                 control.ids == input.ids
                     && control.grids == input.grids
@@ -378,6 +513,20 @@ fn check_fixtures(fixtures: &Path, model: &crate::model_spec::ModelSpec) -> Resu
     Ok(())
 }
 
+#[test]
+#[ignore = "CPU-only native fixtures; requires FF_MODEL, FF_MINICPM_REFERENCE_DIR and FF_VIDEO_REF_DIR"]
+fn minicpm_native_checkpoint_fixtures_cpu() -> Result<()> {
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let fixtures = PathBuf::from(
+        std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("reference directory missing")?,
+    );
+    check_fixtures(&fixtures, &model)?;
+    println!(
+        "PASS minicpm_native_fixture_preflight cases=8 video_decode=ffmpeg canvas=true floors_complete=true"
+    );
+    Ok(())
+}
+
 fn prefill_scores(
     case: &str,
     source: &SafeTensors<'_>,
@@ -385,9 +534,9 @@ fn prefill_scores(
     logits: &[f32],
     bounds: &Bounds,
 ) -> Result<usize> {
-    let image = case.starts_with("image_");
+    let media = case.starts_with("image_") || case.starts_with("video_");
     let mut defects = 0;
-    if !image {
+    if !media {
         defects += score(
             &format!("{case}/embed"),
             &tail(trace, "embed", 8 * 2048)?,
@@ -501,7 +650,7 @@ fn teacher_force(
             "DEFECT"
         }
     );
-    if case.starts_with("image_") {
+    if case.starts_with("image_") || case.starts_with("video_") {
         println!(
             "minicpm_decoded {case} {:?}",
             crate::tokenizer::decode(model, &predictions)?
@@ -574,7 +723,7 @@ fn media_control(
 ) -> Result<usize> {
     let bytes = std::fs::read(fixtures.join("control_boat_at_hockey_size_16x.safetensors"))?;
     let source = SafeTensors::deserialize(&bytes)?;
-    let control = Input::read(&source, true)?;
+    let control = Input::read(&source, "image_control")?;
     ensure!(
         control.ids == input.ids
             && control.modalities == input.modalities
@@ -599,6 +748,60 @@ fn media_control(
         m[3]
     );
     Ok(usize::from(!pass))
+}
+
+fn video_caption(
+    engine: &mut Engine,
+    input: &Input,
+    case: &str,
+    model: &Path,
+    steps: usize,
+) -> Result<Vec<u32>> {
+    engine.reset()?;
+    let mut token = engine.prefill_multimodal(&input.packed(), None)?;
+    let mut ids = Vec::with_capacity(steps);
+    for step in 0..steps {
+        ids.push(token);
+        if engine.model_spec.eos.contains(&token) || step + 1 == steps {
+            break;
+        }
+        token = engine.decode(false, None)?;
+    }
+    println!(
+        "minicpm_video_caption {case} ids={ids:?} text={:?}",
+        crate::tokenizer::decode(model, &ids)?
+    );
+    Ok(ids)
+}
+
+fn video_splice_control(
+    engine: &mut Engine,
+    input: &Input,
+    source: &SafeTensors<'_>,
+    bounds: &Bounds,
+) -> Result<()> {
+    engine.reset()?;
+    engine.prepare_multimodal(&input.packed(), None)?;
+    engine.images = None;
+    engine.prefill(&input.ids, None)?;
+    let metrics = metrics(
+        &engine.decode_logits()?,
+        &floats(source, "prefill_last_logits_bf16")?,
+    )?;
+    let detected = metrics[..3]
+        .iter()
+        .zip(&bounds.logits[..3])
+        .any(|(value, bound)| value > bound)
+        || metrics[3] < bounds.logits[3];
+    ensure!(
+        detected,
+        "omitted video splice was not detected: {metrics:?}"
+    );
+    println!(
+        "PASS minicpm_video_splice_control omitted=true detected=true metrics={metrics:?} bound={:?}",
+        bounds.logits
+    );
+    Ok(())
 }
 
 #[test]
@@ -650,6 +853,7 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             ("text_32", 0.125),
             ("image_boat_16x", 0.25),
             ("image_hockey_16x", 0.375),
+            ("video_football_16x", 0.5),
         ]
         .map(|(case, error)| {
             (
@@ -703,10 +907,10 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             serde_json::to_vec(
                 &serde_json::json!({"per_case_reference_floor":{"cases":cases},
                 "official_vision_implementation_propagation":{"cases":{
-                    "image_boat_16x":vision,"image_hockey_16x":vision}},
+                    "image_boat_16x":vision,"image_hockey_16x":vision,"video_football_16x":vision}},
                 "official_expert_batch_shape":{"validated":true,"cases":batch_shape},
                 "official_cross_gpu_streamed":{"sm89_primary_bitwise":true,"cases":{
-                    "text_32":cross,"image_boat_16x":cross,"image_hockey_16x":cross}}}),
+                    "text_32":cross,"image_boat_16x":cross,"image_hockey_16x":cross,"video_football_16x":cross}}}),
             )?,
         )?;
         let media = serde_json::json!({"max_abs":1.0, "cosine_sim":0.0});
@@ -714,12 +918,15 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             directory.join("fixtures_manifest.json"),
             serde_json::to_vec(&serde_json::json!({"image":{"media_reach_controls":{
                 "same_grid_400x267_hockey_vs_boat_logits_diff":media,
-                "hockey_16x_vs_boat_16x_logits_diff":media}}}))?,
+                "hockey_16x_vs_boat_16x_logits_diff":media}},"video":{"media_reach_controls":{
+                "same_grid_1280x720_football_vs_boat_pan_logits_diff":media,
+                "football_16x_vs_sample_demo_1_16x_logits_diff":media}}}))?,
         )?;
         for (case, expected) in [
             ("text_32", 0.25),
             ("image_boat_16x", 0.5),
             ("image_hockey_16x", 0.75),
+            ("video_football_16x", 1.0),
         ] {
             let bounds = Bounds::read(&directory.join("fixtures"), case)?;
             ensure!(
@@ -727,7 +934,7 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
                 "wrong layer0 precision floor for {case}: {:?}",
                 bounds.layers[&0]
             );
-            let other = if case.starts_with("image_") {
+            let other = if !case.starts_with("text_") {
                 [0.125, 0.0625, 0.03125, 1.0]
             } else {
                 [0.0625, 0.03125, 0.015625, 1.0]
@@ -749,7 +956,7 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires CUDA, FF_MODEL, FF_MINICPM_REFERENCE_DIR and FLYINGFISH_RUNTIME_DIR"]
+#[ignore = "requires CUDA, FF_MODEL, FF_MINICPM_REFERENCE_DIR, FF_VIDEO_REF_DIR and FLYINGFISH_RUNTIME_DIR"]
 fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
     let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
     let fixtures = PathBuf::from(
@@ -773,6 +980,9 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
         "text_4k",
         "image_hockey_16x",
         "image_boat_16x",
+        "video_football_16x",
+        "video_control_clip2_16x",
+        "video_control_same_grid_16x",
     ]
     .into_iter()
     .map(|case| Ok((case, Bounds::read(&fixtures, case)?)))
@@ -783,7 +993,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
         .1
         .cross_media;
     println!("minicpm_reference_bounds {cases:?}");
-    check_fixtures(&fixtures, &crate::model_spec::ModelSpec::read(&model)?)?;
+    check_fixtures(&fixtures, &model)?;
     Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
     let mut engine = Engine::load(&model, 0, 4352, None, settings.clone())?;
     ensure!(
@@ -794,12 +1004,18 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
     );
     let mut defects = 0;
     let mut media_logits = Vec::new();
+    let mut videos = Vec::new();
     for (case, bounds) in &cases {
         let case = *case;
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
         let source = SafeTensors::deserialize(&bytes)?;
-        let media = case.starts_with("image_");
-        let mut input = Input::read(&source, media)?;
+        let video = case.starts_with("video_");
+        let media = case.starts_with("image_") || video;
+        let mut input = if video {
+            Input::video(&source, &model, case)?
+        } else {
+            Input::read(&source, case)?
+        };
         engine.reset()?;
         let mut trace = Trace::default();
         if media {
@@ -856,8 +1072,21 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
                 .count(),
             engine.graphs.len()
         );
-        if media {
+        if case.starts_with("image_") {
             media_logits.push(first_logits.clone());
+        }
+        if video {
+            let ids = video_caption(
+                &mut engine,
+                &input,
+                case,
+                &model,
+                integers(&source, "greedy_token_ids")?.len(),
+            )?;
+            videos.push((case, first_logits.clone(), ids));
+            if case == "video_football_16x" {
+                video_splice_control(&mut engine, &input, &source, bounds)?;
+            }
         }
         if case == "image_hockey_16x" {
             defects += media_control(
@@ -875,10 +1104,41 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
         "minicpm_two_media max={} cosine={} defects={defects}",
         media[0], media[3]
     );
+    let video_bounds = &cases
+        .iter()
+        .find(|(case, _)| *case == "video_football_16x")
+        .context("video bounds missing")?
+        .1;
+    for (index, bound) in [(1, video_bounds.cross_media), (2, video_bounds.media)] {
+        let metrics = metrics(&videos[0].1, &videos[index].1)?;
+        let pass =
+            metrics[0] >= bound[0] && metrics[3] <= bound[1] && videos[0].2 != videos[index].2;
+        defects += usize::from(!pass);
+        println!(
+            "{} minicpm_two_videos pair={} max={} cosine={} distinct_ids={} bound={bound:?}",
+            if pass { "PASS" } else { "DEFECT" },
+            videos[index].0,
+            metrics[0],
+            metrics[3],
+            videos[0].2 != videos[index].2
+        );
+    }
+    for (case, _, expected) in videos.iter().rev() {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let source = SafeTensors::deserialize(&bytes)?;
+        let input = Input::video(&source, &model, case)?;
+        let ids = video_caption(&mut engine, &input, case, &model, expected.len())?;
+        defects += usize::from(ids != *expected);
+        println!(
+            "{} minicpm_video_request_order {case} reverse_order=true same_ids={}",
+            if ids == *expected { "PASS" } else { "DEFECT" },
+            ids == *expected
+        );
+    }
     println!("minicpm_native_end defects={defects}");
     ensure!(defects == 0, "MiniCPM end-to-end DEFECT count={defects}");
     println!(
-        "PASS minicpm_native_checkpoint cases=5 teacher_steps=256 bitwise_graphs=true media_control=boat_pixels"
+        "PASS minicpm_native_checkpoint cases=8 teacher_steps=352 bitwise_graphs=true media_control=boat_pixels,video_pixels video_splice_control=true"
     );
     Ok(())
 }
