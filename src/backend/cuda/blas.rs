@@ -600,7 +600,6 @@ fn drop_result(name: &str, result: std::result::Result<(), impl std::fmt::Debug>
 }
 
 impl Blas {
-    #[cfg(test)]
     pub(crate) fn bind_invariant(
         &mut self,
         ctx: &Arc<cudarc::driver::CudaContext>,

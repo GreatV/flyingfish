@@ -293,7 +293,6 @@ impl DecodeOps {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn new_invariant(ctx: &Arc<CudaContext>) -> Result<Self> {
         let module = cubin::module(ctx, "moe_ffn")?;
         Ok(Self {
@@ -305,6 +304,7 @@ impl DecodeOps {
                 cubin::module(ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,
                 cubin::module(ctx, "act")?.load_function("silu_mul_split")?,
             )),
+            #[cfg(test)]
             combine: CombineOps::new(ctx)?,
         })
     }

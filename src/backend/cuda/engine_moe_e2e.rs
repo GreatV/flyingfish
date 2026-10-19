@@ -894,6 +894,248 @@ fn check_fixtures(fixtures: &Path, model_dir: &Path, cases: &[&str]) -> Result<(
 }
 
 #[test]
+#[ignore = "requires CUDA, published target/draft and an owned FLYINGFISH_RUNTIME_DIR"]
+fn minicpm_chain_verify_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let target = PathBuf::from(std::env::var("FF_MODEL")?);
+    let draft = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
+    let settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: false,
+        draft_model: Some(draft),
+        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    Engine::calibrate(&target, 0, 256, Some(32), settings.clone())?;
+    let mut model = Engine::load(&target, 0, 256, Some(32), settings)?;
+    let stream = model.device.stream.clone();
+    let state = |model: &Engine| -> Result<Vec<u8>> {
+        let mut values = Vec::new();
+        for layer in &model.state.gdn {
+            for buffer in [&layer.s, &layer.history] {
+                for value in stream.clone_dtoh(buffer)? {
+                    values.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+            }
+        }
+        for cache in &model.state.kv {
+            copy::bits(&stream, &cache.k, &mut values)?;
+            copy::bits(&stream, &cache.v, &mut values)?;
+        }
+        Ok(values)
+    };
+    let (rows, taps) = {
+        let spec = model.spec.as_ref().context("chain draft missing")?;
+        (
+            spec.draft.config.verify_rows()?,
+            spec.draft.config.target_layer_ids.clone(),
+        )
+    };
+    ensure!(
+        rows == 16 && model.model_spec.moe.is_some(),
+        "production block15 MoE fixture required"
+    );
+    let h = model.config.hidden_size;
+    let width = h * taps.len();
+    let mut defects = 0;
+    let mut wrong_layer = 0;
+    for prefix in [17usize, 65] {
+        model.reset()?;
+        let ids: Vec<_> = (0..prefix).map(|row| (row * 263 + 17) as u32).collect();
+        let mut trace = Trace::all_layers();
+        if prefix <= model.chunk {
+            model.prefill_tail(&ids, &mut trace, ids.len())?;
+            let capture = model
+                .hidden_capture
+                .as_ref()
+                .context("prefill tap binding missing")?;
+            let values = stream.clone_dtoh(&capture.values.slice(..prefix * width))?;
+            for (slot, layer) in taps.iter().enumerate() {
+                let expected = trace.values(&format!("layer.{layer}"))?;
+                ensure!(
+                    expected.len() == prefix * h,
+                    "prefill trace extent mismatch"
+                );
+                defects += values
+                    .chunks_exact(width)
+                    .enumerate()
+                    .map(|(row, values)| {
+                        values[slot * h..(slot + 1) * h]
+                            .iter()
+                            .zip(&expected[row * h..(row + 1) * h])
+                            .filter(|(a, b)| a.to_bits() != bf16::from_f32(**b).to_bits())
+                            .count()
+                    })
+                    .sum::<usize>();
+            }
+            let saved = values;
+            let first = taps[0];
+            let capture = model
+                .hidden_capture
+                .as_mut()
+                .context("tap control binding missing")?;
+            ensure!(
+                capture.layer_slots[first + 1].is_none(),
+                "wrong-layer control overlaps a tap"
+            );
+            capture.layer_slots[first] = None;
+            capture.layer_slots[first + 1] = Some(0);
+            model.reset()?;
+            model.prefill(&ids, None)?;
+            let capture = model
+                .hidden_capture
+                .as_mut()
+                .context("tap control binding missing")?;
+            let changed = stream.clone_dtoh(&capture.values.slice(..prefix * width))?;
+            wrong_layer += changed
+                .chunks_exact(width)
+                .zip(saved.chunks_exact(width))
+                .map(|(a, b)| {
+                    a[..h]
+                        .iter()
+                        .zip(&b[..h])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count()
+                })
+                .sum::<usize>();
+            capture.layer_slots[first + 1] = None;
+            capture.layer_slots[first] = Some(0);
+            model.reset()?;
+            model.prefill(&ids, None)?;
+        } else {
+            model.prefill(&ids, None)?;
+        }
+        let inputs: Vec<_> = (0..rows)
+            .map(|row| ((prefix + row) * 541 + 37) as u32)
+            .collect();
+        model.set_token(inputs[0])?;
+        model
+            .spec
+            .as_mut()
+            .context("chain missing")?
+            .checkpoint
+            .as_mut()
+            .context("chain checkpoint missing")?
+            .save(&model.state, &model.work.token, prefix, &stream, None)?;
+        let mut expected_states = vec![state(&model)?];
+        let mut logits = Vec::new();
+        let mut captures = Vec::new();
+        let mut predictions = Vec::new();
+        for token in &inputs {
+            model.set_token(*token)?;
+            model.advance(false, None)?;
+            logits.extend(stream.clone_dtoh(&model.work.logits)?);
+            predictions.push(model.token()?);
+            captures.extend(
+                stream.clone_dtoh(
+                    &model
+                        .hidden_capture
+                        .as_ref()
+                        .context("decode taps missing")?
+                        .values
+                        .slice(..width),
+                )?,
+            );
+            expected_states.push(state(&model)?);
+        }
+        model
+            .spec
+            .as_ref()
+            .context("chain missing")?
+            .checkpoint
+            .as_ref()
+            .context("chain checkpoint missing")?
+            .restore(&mut model.state, &mut model.work.token, &stream)?;
+        model.position = prefix;
+        model.committed_prefix_ids.truncate(prefix);
+        model.set_token(inputs[0])?;
+        stream.memcpy_htod(&[prefix as i32], &mut model.work.position)?;
+        stream.memcpy_htod(&[prefix as i32 + 1], &mut model.work.length)?;
+        stream.memcpy_htod(&inputs, &mut model.work.ids.slice_mut(..rows))?;
+        model.run_step(
+            crate::backend::Step {
+                rows,
+                input: crate::backend::Input::Ids,
+                mask: crate::backend::Mask::Causal,
+                head: Head::All,
+            },
+            None,
+        )?;
+        let spec = model.spec.as_ref().context("chain missing")?;
+        let actual = stream.clone_dtoh(&spec.logits)?;
+        let logit_mismatches = actual
+            .iter()
+            .zip(&logits)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let actual = stream.clone_dtoh(
+            &model
+                .hidden_capture
+                .as_ref()
+                .context("verify taps missing")?
+                .values
+                .slice(..rows * width),
+        )?;
+        let tap_mismatches = actual
+            .iter()
+            .zip(&captures)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let id_mismatches = stream
+            .clone_dtoh(&spec.predictions)?
+            .iter()
+            .zip(&predictions)
+            .filter(|(a, b)| a != b)
+            .count();
+        defects += logit_mismatches + tap_mismatches + id_mismatches;
+        for accepted in (0..=rows).rev() {
+            let spec = model.spec.as_ref().context("chain missing")?;
+            spec.checkpoint
+                .as_ref()
+                .context("chain checkpoint missing")?
+                .select_prefix(&mut model.state, &spec.snapshots, accepted, &stream)?;
+            let actual = state(&model)?;
+            let mismatches = actual
+                .iter()
+                .zip(&expected_states[accepted])
+                .filter(|(a, b)| a != b)
+                .count();
+            defects += mismatches;
+            println!(
+                "{} minicpm_chain_prefix prefix={prefix} accepted={accepted} state_bit_mismatches={mismatches}",
+                if mismatches == 0 { "PASS" } else { "DEFECT" }
+            );
+        }
+        println!(
+            "{} minicpm_chain_verify prefix={prefix} rows={rows} logits_bit_mismatches={logit_mismatches} capture_bit_mismatches={tap_mismatches} id_mismatches={id_mismatches}",
+            if logit_mismatches + tap_mismatches + id_mismatches == 0 {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+    }
+    ensure!(
+        wrong_layer > 0,
+        "Runner FAIL wrong-layer capture control was not detected"
+    );
+    println!(
+        "{} minicpm_chain_verify_end rows=16 prefixes=17,65 accepted=0..16 wrong_layer_mismatches={wrong_layer} defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(
+        defects == 0,
+        "DEFECT production chain verification cells={defects}"
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "CPU-only native fixtures; requires FF_MODEL, FF_MINICPM_REFERENCE_DIR and FF_VIDEO_REF_DIR"]
 fn minicpm_native_checkpoint_fixtures_cpu() -> Result<()> {
     let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);

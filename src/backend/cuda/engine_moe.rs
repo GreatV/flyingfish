@@ -223,12 +223,17 @@ impl Setup {
                 geometry,
                 slot,
                 |rows| {
-                    qwen::Runtime::workspace(
+                    let mixer = qwen::Runtime::workspace(
                         model,
                         rows.max(wave_rows as usize),
                         request.capacity,
                         policy,
-                    )
+                    )?;
+                    let verify = super::super::attention_d256::FullAttentionOps::workspace(
+                        &crate::op_contract::FullAttentionSpec::from_model(model)?,
+                        qwen::limits(decode_rows, request.capacity)?,
+                    )?;
+                    Ok(mixer.max(usize::try_from(verify.bytes)?))
                 },
                 |rows| Ok(qwen::default_chunk(rows)),
             );
@@ -377,8 +382,7 @@ pub(super) struct SlotBindings {
 }
 
 impl Engine {
-    #[cfg(test)]
-    pub(super) fn bind_arithmetic_gate(&mut self) -> Result<()> {
+    pub(super) fn bind_invariant_arithmetic(&mut self) -> Result<()> {
         self.closure.bind_fixed()?;
         let executor = self
             .moe

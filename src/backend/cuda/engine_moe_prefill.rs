@@ -982,8 +982,8 @@ impl Engine {
         after_chunk: &mut impl FnMut(&mut Self, &[u32]) -> Result<()>,
     ) -> Result<u32> {
         ensure!(
-            self.spec.is_none(),
-            "MoE prefill has no bound speculative-state consumer"
+            self.spec.is_none() || self.hidden_capture.is_some(),
+            "MoE draft prefill requires the bound target capture"
         );
         ensure!(
             self.moe_prefill.is_some() && self.moe_slots.is_some() && self.moe.is_some(),
@@ -1248,6 +1248,23 @@ impl Engine {
                                 rows * self.model_spec.hidden as usize,
                             ))?;
                     }
+                    if let Some(capture) = &mut self.hidden_capture
+                        && let Some(slot) = capture.layer_slots[layer]
+                    {
+                        copy::columns(
+                            &self.device.stream,
+                            &self.work.x,
+                            &mut capture.values.slice_mut(base * capture.width..),
+                            copy::Rect {
+                                rows,
+                                width: self.model_spec.hidden as usize,
+                                src_pitch: self.model_spec.hidden as usize,
+                                src_col: 0,
+                                dst_pitch: capture.width,
+                                dst_col: slot as usize * self.model_spec.hidden as usize,
+                            },
+                        )?;
+                    }
                     device_copy(
                         &self.device.stream,
                         qwen::matrix(
@@ -1367,6 +1384,9 @@ impl Engine {
                 after_chunk(self, &admitted[*base..base + rows])?;
                 self.committed_prefix_ids
                     .extend_from_slice(&admitted[*base..base + rows]);
+            }
+            if self.spec.is_some() {
+                self.inject_capture(admitted.len(), span_start, None)?;
             }
         }
         prefill.end(&self.device, slots)?;

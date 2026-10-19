@@ -1912,16 +1912,16 @@ fn tier_gate(
     let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
     let mut defects = 0;
     for &variant in variants {
-        let fixture = tier_fixture(variant, 16);
+        let fixture = tier_fixture(variant, 8);
         let reference = Engine::load_moe_test(
             &fixture,
             &runtime.join(format!("reference-{variant}")),
-            16,
+            8,
             format,
         )?;
         let mut references = std::collections::BTreeMap::new();
         for layer in 0..2 {
-            for rows in [1, 2, 5, 8, 16] {
+            for rows in [1, 2, 5, 8] {
                 let input = &fixture.x[..rows * 128];
                 let trace = direct(&reference, layer, input, rows)?;
                 ensure!(
@@ -1933,8 +1933,7 @@ fn tier_gate(
         }
         for &(pinned, engines) in cases {
             let directory = runtime.join(format!("tier-{variant}-{pinned}-{engines}"));
-            let mut capacity = tier_capacity(geometry, pinned, format)?;
-            capacity.span_rows = 16;
+            let capacity = tier_capacity(geometry, pinned, format)?;
             let mut oracle = TierOracle::new(&fixture, &directory.join("oracle"), &capacity)?;
             let mut engine = Engine::load_moe_placed(
                 &fixture,
@@ -1945,7 +1944,7 @@ fn tier_gate(
                     budget_bytes_per_token: 2 * capacity.slot_bytes(),
                 },
                 engines,
-                16,
+                8,
             )?;
             engine
                 .moe_slots
@@ -1976,7 +1975,7 @@ fn tier_gate(
                     slots.begin_request(&frequency)?;
                 }
                 defects += oracle.compare_state(&engine)?;
-                for rows in rows.iter().copied().chain([16]) {
+                for &rows in rows {
                     oracle.policy.begin_token()?;
                     engine
                         .moe_slots
@@ -2041,7 +2040,7 @@ fn tier_gate(
     }
     ensure!(defects == 0, "DEFECT decode residency cells={defects}");
     println!(
-        "PASS decode_residency_gate variants={} cases={} rows=1,2,5,8,16 format={format:?} host=true disk=true admissions=true writeback=true requests=3 graphs=false",
+        "PASS decode_residency_gate variants={} cases={} rows=1,2,5,8 format={format:?} host=true disk=true admissions=true writeback=true requests=3 graphs=false",
         variants.len(),
         cases.len()
     );

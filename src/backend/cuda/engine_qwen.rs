@@ -194,9 +194,17 @@ impl<T> std::ops::Deref for Narrowed<'_, T> {
     }
 }
 impl<T> PrefillPlans<T> {
-    fn bind(full: T, max_rows: usize, narrow: impl Fn(&T, u32) -> Result<T>) -> Result<Self> {
-        ensure!(max_rows > 0, "prefill plan requires rows");
-        let small = (1..=crate::mtp::MAX_VERIFY_ROWS.min(max_rows))
+    fn bind(
+        full: T,
+        bounds: (usize, usize),
+        narrow: impl Fn(&T, u32) -> Result<T>,
+    ) -> Result<Self> {
+        let (max_rows, small_rows) = bounds;
+        ensure!(
+            max_rows > 0 && (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&small_rows),
+            "prefill plan max_rows={max_rows} small_rows={small_rows} exceeds its binding"
+        );
+        let small = (1..=small_rows.min(max_rows))
             .map(|rows| narrow(&full, rows as u32))
             .collect::<Result<_>>()?;
         Ok(Self {
@@ -205,7 +213,7 @@ impl<T> PrefillPlans<T> {
             max_rows,
         })
     }
-    /// Rows 1..=5 borrow prebound small plans; larger sizes narrow at dispatch.
+    /// Declared small extents borrow prebound plans; larger sizes narrow at dispatch.
     fn select(
         &self,
         rows: usize,
@@ -271,13 +279,13 @@ pub(super) fn limits(rows: usize, capacity: usize) -> Result<AttentionLimits> {
         causal: 1,
     })
 }
-fn nested_verify_tcmqa(device_prefix: bool, rows: usize) -> Result<bool> {
+fn nested_verify_tcmqa(device_prefix: bool, rows: usize, bound: usize) -> Result<bool> {
     if !device_prefix {
         return Ok(false);
     }
     ensure!(
-        rows > 0 && rows <= 5,
-        "nested device-prefix attention supports rows 1..=5"
+        rows > 0 && rows <= bound,
+        "nested device-prefix attention rows={rows} exceeds bound={bound}"
     );
     Ok(true)
 }
@@ -522,7 +530,7 @@ impl Runtime {
                     }
                     let text_prefill = PrefillPlans::bind(
                         bind(rows, PositionBindings::Linear, false)?,
-                        rows,
+                        (rows, verify_rows),
                         FullAttentionPlan::for_rows,
                     )?;
                     ensure!(
@@ -545,14 +553,14 @@ impl Runtime {
                                 )?),
                                 false,
                             )?,
-                            rows,
+                            (rows, verify_rows),
                             FullAttentionPlan::for_rows,
                         )?,
                         text_prefill,
                         compact_small: if kv.compact.is_some() {
                             Some(PrefillPlans::bind(
                                 bind(verify_rows.min(rows), PositionBindings::Linear, true)?,
-                                verify_rows.min(rows),
+                                (verify_rows.min(rows), verify_rows),
                                 FullAttentionPlan::for_rows,
                             )?)
                         } else {
@@ -625,9 +633,11 @@ impl Runtime {
                     };
                     BoundMixer::Gdn {
                         norm: weight("linear_attn.norm.weight")?,
-                        prefill: PrefillPlans::bind(bind(rows)?, rows, |plan, rows| {
-                            plan.for_rows(rows, None)
-                        })?,
+                        prefill: PrefillPlans::bind(
+                            bind(rows)?,
+                            (rows, verify_rows),
+                            |plan, rows| plan.for_rows(rows, None),
+                        )?,
                         verify: Vec::new(),
                         decode: Box::new(bind(1)?),
                     }
@@ -1061,6 +1071,11 @@ impl Engine {
             .filter(|_| model_spec.moe.is_some())
             .map(|path| crate::dspark::DraftConfig::read(path, &config))
             .transpose()?;
+        ensure!(
+            draft_config.is_none() || settings.kv_format == crate::kv::KvFormat::Bf16,
+            "MoE DSpark requires BF16 target KV, received {:?}",
+            settings.kv_format
+        );
         let verify_rows = match mode {
             super::SetupMode::Mtp { verify_rows } => verify_rows,
             _ => draft_config
@@ -1307,8 +1322,12 @@ impl Engine {
         if let Some(draft) = &mut draft {
             draft.grow(rows)?;
         }
-        let target_workspace = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?.max(
-            if settings.kv_format == crate::kv::KvFormat::Bf16 {
+        let target_workspace = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?
+            .max(usize::try_from(
+                FullAttentionOps::workspace(&attention, limits(verify_rows.min(rows), capacity)?)?
+                    .bytes,
+            )?)
+            .max(if settings.kv_format == crate::kv::KvFormat::Bf16 {
                 0
             } else {
                 crate::op_contract::AttentionWorkspace::new(
@@ -1318,8 +1337,7 @@ impl Engine {
                     limits(verify_rows, capacity)?.key_chunk,
                 )?
                 .bytes as usize
-            },
-        );
+            });
         eprintln!(
             "{}",
             serde_json::json!({
@@ -1343,7 +1361,7 @@ impl Engine {
                 "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?.bytes,
                 "attention_prefill_lse_bytes": rows * model_spec.q_heads as usize * size_of::<f32>(),
                 "attention_decode_workspace_bytes": FullAttentionOps::workspace(&attention, limits(1, capacity)?)?.bytes,
-                "attention_nested_verify_workspace_bytes": FullAttentionOps::workspace(&attention, limits(rows.min(5), capacity)?)?.bytes,
+                "attention_nested_verify_workspace_bytes": FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?.bytes,
                 "attention_prefill_backend": "FA2 d256",
                 "attention_decode_backend": "TCMQA d256",
                 "gdn_prefill_workspace_bytes": GdnOps::workspace(&gdn, u32::try_from(rows)?, gdn_policy)?.bytes,
@@ -1436,9 +1454,12 @@ impl Engine {
         if let Some(setup) = expert_setup {
             setup.bind(&mut engine)?;
         }
+        if engine.spec.is_some() {
+            engine.bind_invariant_arithmetic()?;
+        }
         #[cfg(test)]
-        if matches!(mode, super::SetupMode::Arithmetic) {
-            engine.bind_arithmetic_gate()?;
+        if matches!(mode, super::SetupMode::Arithmetic) && engine.spec.is_none() {
+            engine.bind_invariant_arithmetic()?;
         }
         if engine.model_spec.moe.is_some() {
             engine.declare_graphs()?;
@@ -1602,7 +1623,11 @@ impl Engine {
                 }
                 match phase {
                     ExecutionPhase::Prefill => {
-                        if nested_verify_tcmqa(self.qwen_device_prefix, rows)? {
+                        if nested_verify_tcmqa(
+                            self.qwen_device_prefix,
+                            rows,
+                            gdn.snapshot_limit()? as usize,
+                        )? {
                             let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
                             let plans = if kv.compact.is_some() {
                                 compact_small
@@ -1924,6 +1949,9 @@ impl Engine {
             }
             O::Norm => {
                 if i == 0
+                    || (self.model_spec.moe.is_some()
+                        && !self.qwen_device_prefix
+                        && step.input == crate::backend::Input::Ids)
                     || !self
                         .hidden_capture
                         .as_ref()
@@ -2058,13 +2086,13 @@ impl Engine {
                 if step.head == Head::None {
                     return Ok(());
                 }
-                ensure!(
-                    step.head == Head::Last,
-                    "Q38 all-row speculative head is not bound"
-                );
-                if !self.hidden_capture.as_ref().is_some_and(|capture| {
-                    capture.layer_slots[self.model_spec.layers.len() - 1].is_some()
-                }) {
+                if (self.model_spec.moe.is_some()
+                    && !self.qwen_device_prefix
+                    && step.input == crate::backend::Input::Ids)
+                    || !self.hidden_capture.as_ref().is_some_and(|capture| {
+                        capture.layer_slots[self.model_spec.layers.len() - 1].is_some()
+                    })
+                {
                     q.common.norm.rms_with(
                         s,
                         domain,
@@ -2079,6 +2107,45 @@ impl Engine {
                 }
                 #[cfg(test)]
                 trace_value(trace, s, "norm", &w.n, rows, h)?;
+                if step.head == Head::All {
+                    let spec = self
+                        .spec
+                        .as_mut()
+                        .context("MoE all-row head requires draft state")?;
+                    ensure!(
+                        self.model_spec.moe.is_some() && rows == spec.draft.config.verify_rows()?,
+                        "all-row head rows={rows} differs from the loaded MoE verification extent"
+                    );
+                    self.blas.linear_typed(
+                        phase,
+                        LinearWeightRef::Bf16(matrix(
+                            &self.weights.head,
+                            s,
+                            0,
+                            self.model_spec.vocab as usize,
+                            h,
+                        )?),
+                        matrix(&w.n, s, 0, rows, h)?,
+                        &mut TensorMut(matrix(
+                            &spec.logits,
+                            s,
+                            0,
+                            rows,
+                            self.model_spec.vocab as usize,
+                        )?),
+                    )?;
+                    // SAFETY: the bound logits and predictions cover every complete vocabulary row.
+                    unsafe {
+                        s.launch_builder(&self.ops.argmax_rows)
+                            .arg(&spec.logits)
+                            .arg(&mut spec.predictions)
+                            .arg(&(self.model_spec.vocab as i32))
+                            .arg(&spec.row_counts.slice(rows - 1..rows))
+                            .launch(grid(rows, 1024))?;
+                    }
+                    spec.active_rows = rows;
+                    return Ok(());
+                }
                 self.blas.linear_typed(
                     phase,
                     LinearWeightRef::Bf16(matrix(
@@ -2285,7 +2352,7 @@ mod tests {
 
     #[test]
     fn select_returns_the_plan_narrowed_to_the_steps_live_rows() {
-        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, (2048, 5), FakePlan::for_rows)
             .expect("bind");
         // A step size never seen before narrows host-side at dispatch; no preparation step exists.
         assert_eq!(
@@ -2309,7 +2376,7 @@ mod tests {
 
     #[test]
     fn a_step_only_runs_a_plan_narrowed_to_its_own_rows() {
-        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, (2048, 5), FakePlan::for_rows)
             .expect("bind");
         assert_eq!(
             plans.select(1021, &FakePlan::for_rows).unwrap().max_rows,
@@ -2321,7 +2388,7 @@ mod tests {
     #[test]
     fn every_step_size_of_a_chunked_prompt_gets_its_own_plan() {
         // 4093 tokens over a 2048 chunk: two 2048 steps and one 997 tail.
-        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, (2048, 5), FakePlan::for_rows)
             .expect("bind");
         for step in [2048usize, 997] {
             assert_eq!(
@@ -2359,7 +2426,7 @@ mod tests {
                 assert_eq!(full, capacity);
                 Ok(rows as usize)
             };
-            let plans = PrefillPlans::bind(capacity, capacity, narrow)?;
+            let plans = PrefillPlans::bind(capacity, (capacity, 5), narrow)?;
             assert_eq!(plans.small, (1..=5.min(capacity)).collect::<Vec<_>>());
             for rows in 1..=capacity {
                 assert_eq!(*plans.select(rows, &narrow)?, rows);
@@ -2396,20 +2463,32 @@ mod tests {
                 );
             }
         }
-        assert!(PrefillPlans::bind(0, 0, |_, rows| Ok(rows as usize)).is_err());
+        assert!(PrefillPlans::bind(0, (0, 5), |_, rows| Ok(rows as usize)).is_err());
+        let plans = PrefillPlans::bind(4096, (4096, 16), |_, rows| Ok(rows as usize))?;
+        for rows in 1..=16 {
+            assert!(matches!(
+                plans.select(rows, &|_, row| Ok(row as usize))?,
+                Narrowed::Borrowed(_)
+            ));
+        }
+        assert!(PrefillPlans::bind(32, (32, 17), |_, rows| Ok(rows as usize)).is_err());
         Ok(())
     }
 
     #[test]
     fn nested_verify_routes_only_small_rows_to_tcmqa() -> Result<()> {
         for rows in [1, 4, 65, 2048] {
-            assert!(!nested_verify_tcmqa(false, rows)?);
+            assert!(!nested_verify_tcmqa(false, rows, 5)?);
         }
         for rows in 1..=5 {
-            assert!(nested_verify_tcmqa(true, rows)?);
+            assert!(nested_verify_tcmqa(true, rows, 5)?);
         }
-        assert!(nested_verify_tcmqa(true, 0).is_err());
-        assert!(nested_verify_tcmqa(true, 6).is_err());
+        assert!(nested_verify_tcmqa(true, 0, 5).is_err());
+        assert!(nested_verify_tcmqa(true, 6, 5).is_err());
+        for rows in 1..=16 {
+            assert!(nested_verify_tcmqa(true, rows, 16)?);
+        }
+        assert!(nested_verify_tcmqa(true, 17, 16).is_err());
         Ok(())
     }
 

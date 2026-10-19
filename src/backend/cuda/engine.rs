@@ -1229,7 +1229,9 @@ impl Engine {
     }
 
     fn declare_graphs(&mut self) -> Result<()> {
-        self.graphs = if self.model_spec.moe.is_some() {
+        self.graphs = if self.spec.as_ref().is_some_and(|spec| !spec.graph) {
+            Vec::new()
+        } else if self.model_spec.moe.is_some() {
             if self
                 .moe_slots
                 .as_ref()
@@ -1375,8 +1377,10 @@ impl Engine {
     fn check_step(&self, step: crate::backend::Step<'_>) -> Result<()> {
         if self.qwen.is_some() {
             ensure!(
-                matches!(step.mask, crate::backend::Mask::Causal) && step.head != Head::All,
-                "Q38 only supports causal text forward with optional last-row head"
+                matches!(step.mask, crate::backend::Mask::Causal)
+                    && (step.head != Head::All || self.model_spec.moe.is_some()),
+                "hybrid forward requires causal mask and a bound MoE chain for head={:?}",
+                step.head
             );
         }
         let linear_rows = if matches!(step.mask, crate::backend::Mask::Tree { .. }) {
@@ -1442,7 +1446,12 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: Option<Target<'_>>,
     ) -> Result<()> {
+        let previous = self.qwen_device_prefix;
+        if self.qwen.is_some() && step.head == Head::All {
+            self.qwen_device_prefix = true;
+        }
         let result = self.run_step_inner(step, trace);
+        self.qwen_device_prefix = previous;
         if self.qwen.is_some() && result.is_err() {
             self.poisoned = true;
         }
@@ -1468,6 +1477,14 @@ impl Engine {
                 crate::linear_plan::MAX_SKINNY_ROWS
             );
             self.ensure_verification()?;
+            if self.qwen.is_some() {
+                self.state.set_sequence(
+                    &self.device.stream,
+                    self.position as u32,
+                    step.rows as u32,
+                    self.workspace_rows as u32,
+                )?;
+            }
         }
         if let Some(slots) = self.moe_slots.as_mut() {
             slots.begin_token()?;
@@ -3021,6 +3038,13 @@ impl Drop for Engine {
 impl Engine {
     fn ensure_verification(&mut self) -> Result<()> {
         let spec = self.spec.as_mut().context("draft state is not enabled")?;
+        if self.qwen.is_some() {
+            ensure!(
+                spec.checkpoint.is_some() && spec.snapshots.len() == self.state.gdn.len(),
+                "MoE verification lacks transaction state or recurrent prefix images"
+            );
+            return Ok(());
+        }
         if spec.verification.is_some() {
             return Ok(());
         }
