@@ -39,7 +39,7 @@ pub struct Weights {
 /// Stable native expert slots, persistent staging and host data plus spare blocks.
 pub struct ExpertStorage {
     layout: SlotLayout,
-    gate_up_bytes: u64,
+    down_offset: u64,
     device: CudaSlice<bf16>,
     host: Option<Arc<HostBlocks>>,
     context: Arc<CudaContext>,
@@ -57,12 +57,7 @@ impl ExpertStorage {
             Arc::ptr_eq(stream.context(), upload.context()),
             "expert allocation streams have different contexts"
         );
-        let gate_up_bytes = capacity.layout.gate_up_bytes().with_context(|| {
-            format!(
-                "BF16 expert pointer binding requires fused gate-up, got {:?}",
-                capacity.layout
-            )
-        })?;
+        let down_offset = capacity.layout.down_offset();
         let layout = SlotLayout::new(geometry, capacity)?;
         let bytes = layout.allocation_bytes()?;
         let host = (layout.host_blocks() > 0)
@@ -79,7 +74,7 @@ impl ExpertStorage {
         upload.wait(&stream.record_event(None)?)?;
         Ok(Self {
             layout,
-            gate_up_bytes,
+            down_offset,
             device: allocation,
             host,
             context: stream.context().clone(),
@@ -106,12 +101,12 @@ impl ExpertStorage {
             .checked_add(range.start as u64)
             .context("native expert address overflow")?;
         let down = gate_up
-            .checked_add(self.gate_up_bytes)
+            .checked_add(self.down_offset)
             .context("native down address overflow")?;
         Ok((gate_up, down))
     }
 
-    /// Native `[2I,H]` gate-up and `[H,I]` down device addresses of one resident slot.
+    /// Native gate-up/down addresses; both address the full slot for FP8.
     pub fn slot(&self, layer: u32, rank: u32) -> Result<(u64, u64)> {
         self.native_pointers(self.layout.resident_slot(layer, rank)?)
     }
@@ -765,13 +760,7 @@ mod tests {
         let upload = &device.upload;
         let stream = &device.stream;
         let (first, first_down) = storage.slot(0, 0)?;
-        assert_eq!(
-            first_down - first,
-            capacity
-                .layout
-                .gate_up_bytes()
-                .context("BF16 fixture gate-up")?
-        );
+        assert_eq!(first_down - first, capacity.layout.down_offset());
         let lease = host.lease(&[0])?;
         // SAFETY: the registered block is leased through completion and the destination owns a full slot.
         unsafe { result::memcpy_htod_async(first, lease.read(0)?, upload.cu_stream())? };

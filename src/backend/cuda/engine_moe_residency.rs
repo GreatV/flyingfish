@@ -675,12 +675,7 @@ impl Slots {
             .context("publish physical slot outside allocation")?
             .pointer;
         let down = pointer
-            .checked_add(
-                self.catalogue
-                    .layout()
-                    .gate_up_bytes()
-                    .context("BF16 expert gate-up")?,
-            )
+            .checked_add(self.catalogue.layout().down_offset())
             .context("expert down pointer overflow")?;
         let offset = layer as usize * geometry.experts as usize;
         let previous = *self
@@ -959,21 +954,15 @@ impl Slots {
                 .as_ref()
                 .context("host tier has no arena")?
                 .block_range(block)?;
-            let down = range.start
-                + usize::try_from(
-                    self.catalogue
-                        .layout()
-                        .gate_up_bytes()
-                        .context("BF16 expert gate-up")?
-                        / 2,
-                )?;
             self.host_experts.push(expert);
-            self.host_weights.push(ExpertWeights {
-                gate_up: range.start..down,
-                gate_up_stride: geometry.hidden as usize,
-                down: down..range.end,
-                down_stride: geometry.intermediate as usize,
-            });
+            self.host_weights.push(ExpertWeights::from_slot(
+                Shape {
+                    hidden: geometry.hidden as usize,
+                    intermediate: geometry.intermediate as usize,
+                },
+                range,
+                self.catalogue.layout(),
+            )?);
         }
         Ok(())
     }
@@ -1062,6 +1051,18 @@ impl Slots {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_routed(
+        &mut self,
+        device: &Device,
+        decode: &mut Decode,
+        layer: u32,
+        ffn: BoundFfn,
+        activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
+    ) -> Result<()> {
+        self.complete(device, decode, layer, ffn, activation, None)
     }
 
     #[cfg(test)]

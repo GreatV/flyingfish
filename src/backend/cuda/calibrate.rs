@@ -753,6 +753,34 @@ pub(super) fn host_memory(root: &Path) -> Result<(u64, u64)> {
                 .with_context(|| format!("read expert cgroup usage {}", current.display()))?
                 .trim()
                 .parse::<u64>()?;
+            let statistics = directory.join("memory.stat");
+            let statistics = std::fs::read_to_string(&statistics).with_context(|| {
+                format!("read expert cgroup statistics {}", statistics.display())
+            })?;
+            let counter = |name: &str| -> Result<u64> {
+                statistics
+                    .lines()
+                    .find_map(|line| {
+                        let mut fields = line.split_whitespace();
+                        (fields.next()? == name).then(|| fields.next()).flatten()
+                    })
+                    .with_context(|| {
+                        format!(
+                            "expert cgroup statistics missing {name} in {}",
+                            directory.display()
+                        )
+                    })?
+                    .parse::<u64>()
+                    .with_context(|| format!("invalid expert cgroup counter {name}"))
+            };
+            let reclaimable = if memory.is_some() {
+                counter("total_active_file")?
+                    .checked_add(counter("total_inactive_file")?)
+                    .context("expert cgroup file LRU bytes overflow")?
+            } else {
+                counter("file")?.saturating_sub(counter("shmem")?)
+            };
+            let used = used.saturating_sub(reclaimable);
             available = available.min(limit.trim().parse::<u64>()?.saturating_sub(used));
         }
         if directory == mount {
@@ -925,6 +953,8 @@ const EXPERT_SERVICE_ROWS: [u32; 7] = [1, 2, 5, 8, 16, 32, 64];
 #[derive(Serialize, Deserialize)]
 struct ExpertCache {
     schema: u32,
+    expert_format: crate::model_spec::ExpertFormat,
+    slot_bytes: u64,
     key: CacheKey,
     host: ExpertHost,
     geometry: crate::experts::catalogue::ExpertGeometry,
@@ -950,9 +980,18 @@ impl ExpertCache {
         slot_bytes: u64,
     ) -> Result<ExpertCalibration> {
         ensure!(
-            self.schema == 1,
-            "expert calibration schema {} expected 1",
+            self.schema == 2,
+            "expert calibration schema {} expected 2",
             self.schema
+        );
+        ensure!(
+            self.slot_bytes == slot_bytes
+                && crate::experts::catalogue::ExpertLayout::new(self.expert_format, geometry)?
+                    .slot_bytes()
+                    == slot_bytes,
+            "expert calibration format={:?} slot_bytes={} expected={slot_bytes}",
+            self.expert_format,
+            self.slot_bytes
         );
         ensure!(
             self.key == *key,
@@ -1157,17 +1196,13 @@ pub(super) fn load_experts(
     expert_format: crate::model_spec::ExpertFormat,
     closure: &super::closure::Closure,
 ) -> Result<ExpertCalibration> {
-    ensure!(
-        expert_format == crate::model_spec::ExpertFormat::Bf16,
-        "expert CPU setup service requires BF16, got {expert_format:?}"
-    );
     let slot_bytes =
         crate::experts::catalogue::ExpertLayout::new(expert_format, &geometry)?.slot_bytes();
     let key = key(d)?;
     let host = ExpertHost::read()?;
     let identity = super::closure::hash(&serde_json::to_vec(&(&host, geometry, expert_format))?);
     let path = dir.join(format!(
-        "experts-v1-{}-{}-{}-{identity}.json",
+        "experts-v2-{}-{}-{}-{identity}.json",
         key.device_uuid, key.driver_version, key.binary_version
     ));
     let (cache, hit) = if closure.access(&path)? {
@@ -1221,9 +1256,12 @@ pub(super) fn load_experts(
             &host.workers(),
             &EXPERT_SERVICE_ROWS,
             &missed,
+            expert_format,
         )?;
         let cache = ExpertCache {
-            schema: 1,
+            schema: 2,
+            expert_format,
+            slot_bytes,
             key: key.clone(),
             host: host.clone(),
             geometry,
@@ -1295,7 +1333,9 @@ mod long_tests {
         )?
         .slot_bytes();
         let mut cache = ExpertCache {
-            schema: 1,
+            schema: 2,
+            expert_format: crate::model_spec::ExpertFormat::Bf16,
+            slot_bytes,
             key: key.clone(),
             host: host.clone(),
             geometry,
@@ -1323,6 +1363,12 @@ mod long_tests {
                 .collect(),
         };
         let measured = cache.check(&key, &host, &geometry, slot_bytes)?;
+        cache.expert_format = crate::model_spec::ExpertFormat::Fp8W8a16;
+        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        cache.expert_format = crate::model_spec::ExpertFormat::Bf16;
+        cache.slot_bytes += 16;
+        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        cache.slot_bytes = slot_bytes;
         assert_eq!(measured.h2d_bytes_per_second, 768000.0);
         assert_eq!(measured.d2h_bytes_per_second, 384000.0);
         assert_eq!(measured.copy_engines, 2);
@@ -1383,6 +1429,7 @@ mod long_tests {
             &[1],
             &[1],
             &[1],
+            crate::model_spec::ExpertFormat::Bf16,
         )?;
         let table = crate::experts::plan::ServiceTable::new(&host.isa, cells)?;
         ensure!(

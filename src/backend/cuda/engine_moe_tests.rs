@@ -82,6 +82,10 @@ fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
 
 #[test]
 fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
+    use crate::experts::{
+        catalogue::ExpertLayout,
+        plan::{PlanInputs, Reserves, ServiceCell, ServiceTable, capacity},
+    };
     let (available, locked) = super::host_memory(Path::new("/"))?;
     ensure!(
         available > 0 && locked <= available,
@@ -101,6 +105,62 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             std::fs::create_dir_all(path.parent().context("fixture parent missing")?)?;
             Ok(std::fs::write(path, value)?)
         };
+        let placement = |available| -> Result<Vec<_>> {
+            let model = crate::model_spec::ModelSpec::minicpm(
+                &serde_json::from_str(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/data/minicpm-config.json"
+                )))?,
+                &serde_json::json!({"eos_token_id": [248044, 248046]}),
+            )?;
+            let geometry = ExpertGeometry::from_model(&model)?;
+            let service = ServiceTable::new(
+                "fixture",
+                vec![ServiceCell {
+                    workers: 2,
+                    rows: 1,
+                    experts: 1,
+                    seconds: 0.001,
+                }],
+            )?;
+            let reserves = Reserves {
+                device_fixed_bytes: 0,
+                host_fixed_bytes: 0,
+                residual_row_bytes: 0,
+                normalized_row_bytes: 0,
+                contribution_row_bytes: 0,
+                done_row_bytes: 0,
+                route_row_bytes: 0,
+                prefill_staging_slots: 1,
+                disk_ring_slots: 1,
+            };
+            [
+                crate::model_spec::ExpertFormat::Bf16,
+                crate::model_spec::ExpertFormat::Fp8W8a16,
+            ]
+            .into_iter()
+            .map(|format| {
+                let inputs = PlanInputs {
+                    geometry,
+                    layout: ExpertLayout::new(format, &geometry)?,
+                    device_free_bytes: 12 << 30,
+                    host_available_bytes: available,
+                    h2d_bytes_per_second: 1e9,
+                    d2h_bytes_per_second: 1e9,
+                    copy_engines: 1,
+                    disk_readers: 1,
+                    host_registration_bytes: 0,
+                    service: &service,
+                    reserves: &reserves,
+                    span_rows: 1,
+                    wave_rows: 1,
+                };
+                let plan = capacity(&inputs, 1)?;
+                Ok((plan.slots_per_layer, plan.host_blocks, plan.disk_bytes))
+            })
+            .collect()
+        };
+        let expected_placement = placement(5 << 30)?;
         write("proc/meminfo", "MemAvailable: 16777216 kB\n")?;
         write(
             "proc/self/limits",
@@ -118,6 +178,10 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
         ] {
             write(&format!("{path}/memory.limit_in_bytes"), limit)?;
             write(&format!("{path}/memory.usage_in_bytes"), "1073741824\n")?;
+            write(
+                &format!("{path}/memory.stat"),
+                "total_active_file 0\ntotal_inactive_file 0\n",
+            )?;
         }
         ensure!(
             super::host_memory(&root)? == (5 << 30, 8 << 20),
@@ -127,6 +191,31 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             "PASS host_memory_fixture v1 ancestor_available_bytes={}",
             5u64 << 30
         );
+        for (active, inactive) in [(0u64, 1u64 << 30), (2 << 30, 1 << 30), (3 << 30, 0), (0, 0)] {
+            let cache = active + inactive;
+            for path in [
+                "controllers/memory bank/job",
+                "controllers/memory bank/job/leaf",
+            ] {
+                write(
+                    &format!("{path}/memory.usage_in_bytes"),
+                    &format!("{}\n", (1 << 30) + cache),
+                )?;
+                write(
+                    &format!("{path}/memory.stat"),
+                    &format!("total_active_file {active}\ntotal_inactive_file {inactive}\n"),
+                )?;
+            }
+            let (available, locked) = super::host_memory(&root)?;
+            ensure!(
+                available == 5 << 30 && locked == 8 << 20,
+                "v1 cache changed headroom"
+            );
+            ensure!(
+                placement(available)? == expected_placement,
+                "v1 cache changed placement"
+            );
+        }
         for path in [
             "controllers/memory bank/job",
             "controllers/memory bank/job/leaf",
@@ -155,10 +244,54 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
         ] {
             write(&format!("{path}/memory.max"), limit)?;
             write(&format!("{path}/memory.current"), "1073741824\n")?;
+            write(
+                &format!("{path}/memory.stat"),
+                "file 0\nshmem 0\ninactive_file 0\n",
+            )?;
         }
         ensure!(
             super::host_memory(&root)? == (5 << 30, 8 << 20),
             "v2 ancestor headroom did not bind"
+        );
+        for (cache, inactive) in [(1u64 << 30, 1 << 30), (3 << 30, 1 << 30), (0, 0)] {
+            for path in ["sys/fs/cgroup/job", "sys/fs/cgroup/job/leaf"] {
+                write(
+                    &format!("{path}/memory.current"),
+                    &format!("{}\n", (1 << 30) + cache),
+                )?;
+                write(
+                    &format!("{path}/memory.stat"),
+                    &format!("file {cache}\nshmem 0\ninactive_file {inactive}\n"),
+                )?;
+            }
+            let (available, locked) = super::host_memory(&root)?;
+            ensure!(
+                available == 5 << 30 && locked == 8 << 20,
+                "v2 cache changed headroom"
+            );
+            ensure!(
+                placement(available)? == expected_placement,
+                "v2 cache changed placement"
+            );
+        }
+        write("sys/fs/cgroup/job/memory.current", "3221225472\n")?;
+        write(
+            "sys/fs/cgroup/job/memory.stat",
+            "file 3221225472\nshmem 1073741824\ninactive_file 1073741824\n",
+        )?;
+        ensure!(
+            super::host_memory(&root)?.0 == 5 << 30,
+            "shared memory was reclaimed"
+        );
+        write("sys/fs/cgroup/job/memory.stat", "file 0\n")?;
+        ensure!(
+            super::host_memory(&root).is_err(),
+            "missing shared-memory counter admitted"
+        );
+        write("sys/fs/cgroup/job/memory.stat", "file invalid\nshmem 0\n")?;
+        ensure!(
+            super::host_memory(&root).is_err(),
+            "invalid file counter admitted"
         );
         for path in ["sys/fs/cgroup/job", "sys/fs/cgroup/job/leaf"] {
             write(&format!("{path}/memory.max"), "max\n")?;
@@ -173,7 +306,7 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             "missing memory hierarchy admitted"
         );
         println!(
-            "PASS host_memory_fixtures v1_finite=true v1_unlimited=true hybrid=true v2_finite=true v2_unlimited=true missing_controller_rejected=true"
+            "PASS host_memory_fixtures v1_finite=true v1_unlimited=true hybrid=true v2_finite=true v2_unlimited=true cache_independent_placement=true shmem_retained=true malformed_stats_rejected=true missing_controller_rejected=true"
         );
         Ok(())
     })();
@@ -184,6 +317,7 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
 fn native_fixture(
     fixture: &MoeFixture,
     directory: &Path,
+    format: crate::model_spec::ExpertFormat,
 ) -> Result<Arc<crate::experts::catalogue::ExpertCatalogue>> {
     use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
     let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
@@ -193,7 +327,60 @@ fn native_fixture(
         entries: Default::default(),
         resident_bytes: 0,
     };
+    if format == crate::model_spec::ExpertFormat::Fp8W8a16 {
+        for layer in 0..geometry.layers {
+            for expert in 0..geometry.experts {
+                for (tag, op, n, k) in [
+                    (0usize, "gate_proj", d.inter, d.hidden),
+                    (1, "up_proj", d.inter, d.hidden),
+                    (2, "down_proj", d.hidden, d.inter),
+                ] {
+                    for scale in [false, true] {
+                        let start = bytes.len() as u64;
+                        if scale {
+                            for row in 0..n {
+                                let value = bf16::from_f32(
+                                    (1.0 + ((row * 13
+                                        + expert as usize * 7
+                                        + layer as usize * 11
+                                        + tag)
+                                        % 31) as f32
+                                        / 64.0)
+                                        / 128.0,
+                                );
+                                bytes.extend(value.to_le_bytes());
+                            }
+                        } else {
+                            bytes.extend((0..n * k).map(|index| {
+                                let (row, col) = (index / k, index % k);
+                                (((row * 37
+                                    + col * 11
+                                    + expert as usize * 17
+                                    + layer as usize * 19
+                                    + tag)
+                                    % 61) as u8)
+                                    | ((((col / 7 + row + expert as usize) % 2) as u8) << 7)
+                            }));
+                        }
+                        let suffix = if scale { "weight_scale" } else { "weight" };
+                        let role = format!("mlp.experts.{expert}.{op}.{suffix}");
+                        manifest.entries.insert(format!("model.language_model.layers.{layer}.{role}"), TensorEntry {
+                            dtype: if scale { safetensors::Dtype::BF16 } else { safetensors::Dtype::F8_E4M3 },
+                            shape: if scale { vec![n, 1] } else { vec![n, k] },
+                            shard: "expert-fixture.bin".into(), bytes: bytes.len() - start as usize,
+                            load: false, data_start: 0, data_offsets: [start, bytes.len() as u64],
+                            scope: TensorScope::Text, layer: Some(layer), role,
+                            scale_name: (!scale).then(|| format!("model.language_model.layers.{layer}.mlp.experts.{expert}.{op}.weight_scale")),
+                        });
+                    }
+                }
+            }
+        }
+    }
     for layer in 0..geometry.layers {
+        if format != crate::model_spec::ExpertFormat::Bf16 {
+            break;
+        }
         for (role, values, shape) in [
             (
                 "gate_up_proj",
@@ -242,11 +429,7 @@ fn native_fixture(
         .open(&path)?;
     std::io::Write::write_all(&mut file, &bytes)?;
     Ok(Arc::new(
-        crate::experts::catalogue::ExpertCatalogue::from_manifest(
-            &manifest,
-            geometry,
-            crate::model_spec::ExpertFormat::Bf16,
-        )?,
+        crate::experts::catalogue::ExpertCatalogue::from_manifest(&manifest, geometry, format)?,
     ))
 }
 
@@ -385,13 +568,11 @@ impl Engine {
         fixture: &MoeFixture,
         runtime: &Path,
         workspace_rows: usize,
+        format: crate::model_spec::ExpertFormat,
     ) -> Result<Self> {
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
         let count = geometry.layers * geometry.experts;
-        let layout = crate::experts::catalogue::ExpertLayout::new(
-            crate::model_spec::ExpertFormat::Bf16,
-            &geometry,
-        )?;
+        let layout = crate::experts::catalogue::ExpertLayout::new(format, &geometry)?;
         let capacity = Capacity {
             layout: layout.clone(),
             span_rows: 8,
@@ -442,7 +623,15 @@ impl Engine {
             (8..=32).contains(&workspace_rows),
             "hybrid fixture workspace_rows={workspace_rows} outside8..32"
         );
-        let model_spec = hybrid_spec()?;
+        let mut model_spec = hybrid_spec()?;
+        model_spec.expert_format = Some(match &capacity.layout {
+            crate::experts::catalogue::ExpertLayout::Bf16Fused { .. } => {
+                crate::model_spec::ExpertFormat::Bf16
+            }
+            crate::experts::catalogue::ExpertLayout::Fp8W8a16(_) => {
+                crate::model_spec::ExpertFormat::Fp8W8a16
+            }
+        });
         let config = model_spec.config();
         let manifest = hybrid_manifest(&model_spec)?;
         let geometry = ExpertGeometry::from_model(&model_spec)?;
@@ -461,7 +650,13 @@ impl Engine {
         };
         let device = Device::new(0)?;
         let stream = &device.stream;
-        let catalogue = native_fixture(fixture, runtime)?;
+        let catalogue = native_fixture(
+            fixture,
+            runtime,
+            model_spec
+                .expert_format
+                .context("MoE expert_format missing")?,
+        )?;
         let mut slots = Slots::load(
             &device,
             geometry,
@@ -806,9 +1001,7 @@ pub(super) fn graph_state(engine: &Engine) -> Result<Vec<u32>> {
     Ok(values)
 }
 
-#[test]
-#[ignore = "requires CUDA and FLYINGFISH_RUNTIME_DIR"]
-fn moe_graphs_match_eager_and_preserve_capture_state_gpu() -> Result<()> {
+fn graph_gate(format: crate::model_spec::ExpertFormat) -> Result<()> {
     let runtime = PathBuf::from(
         std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("graph gate runtime missing")?,
     );
@@ -823,7 +1016,7 @@ fn moe_graphs_match_eager_and_preserve_capture_state_gpu() -> Result<()> {
         (false, true, 2, 2),
         (false, false, 2, 0),
     ] {
-        let mut capacity = tier_capacity(geometry, pinned)?;
+        let mut capacity = tier_capacity(geometry, pinned, format)?;
         if cap == 0 {
             capacity.spare_blocks = 1;
             capacity.host_expert_bytes = 9 * capacity.slot_bytes();
@@ -833,7 +1026,7 @@ fn moe_graphs_match_eager_and_preserve_capture_state_gpu() -> Result<()> {
                 let directory =
                     runtime.join(format!("graphs-{resident}-{pinned}-{engines}-{cap}-{arm}"));
                 if resident {
-                    Engine::load_moe_test(&fixture, &directory, 8)
+                    Engine::load_moe_test(&fixture, &directory, 8, format)
                 } else {
                     Engine::load_moe_placed(
                         &fixture,
@@ -987,8 +1180,22 @@ fn moe_graphs_match_eager_and_preserve_capture_state_gpu() -> Result<()> {
     }
     ensure!(control, "Runner FAIL graph control did not execute");
     ensure!(defects == 0, "DEFECT MoE graph cells={defects}");
-    println!("PASS moe_graph_gate cases=4 requests=2 steps=6 bitwise=true control=wrong_join");
+    println!(
+        "PASS moe_graph_gate format={format:?} cases=4 requests=2 steps=6 bitwise=true control=wrong_join"
+    );
     Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA and FLYINGFISH_RUNTIME_DIR"]
+fn moe_graphs_match_eager_and_preserve_capture_state_gpu() -> Result<()> {
+    graph_gate(crate::model_spec::ExpertFormat::Bf16)
+}
+
+#[test]
+#[ignore = "requires CUDA and FLYINGFISH_RUNTIME_DIR"]
+fn fp8_moe_graphs_match_eager_and_preserve_capture_state_gpu() -> Result<()> {
+    graph_gate(crate::model_spec::ExpertFormat::Fp8W8a16)
 }
 
 fn step(rows: usize) -> crate::backend::Step<'static> {
@@ -1047,11 +1254,12 @@ pub(super) fn tier_service(workers: u32) -> Result<crate::experts::plan::Service
     )
 }
 
-pub(super) fn tier_capacity(geometry: ExpertGeometry, pinned: bool) -> Result<Capacity> {
-    let layout = crate::experts::catalogue::ExpertLayout::new(
-        crate::model_spec::ExpertFormat::Bf16,
-        &geometry,
-    )?;
+pub(super) fn tier_capacity(
+    geometry: ExpertGeometry,
+    pinned: bool,
+    format: crate::model_spec::ExpertFormat,
+) -> Result<Capacity> {
+    let layout = crate::experts::catalogue::ExpertLayout::new(format, &geometry)?;
     let slot = layout.slot_bytes();
     Ok(Capacity {
         layout,
@@ -1091,7 +1299,15 @@ impl TierOracle {
             disk::DiskReader,
             runtime::{LoadInputs, Residency},
         };
-        let catalogue = native_fixture(fixture, directory)?;
+        let format = match &capacity.layout {
+            crate::experts::catalogue::ExpertLayout::Bf16Fused { .. } => {
+                crate::model_spec::ExpertFormat::Bf16
+            }
+            crate::experts::catalogue::ExpertLayout::Fp8W8a16(_) => {
+                crate::model_spec::ExpertFormat::Fp8W8a16
+            }
+        };
+        let catalogue = native_fixture(fixture, directory, format)?;
         let geometry = catalogue.geometry();
         let layout = SlotLayout::new(geometry, capacity)?;
         let host = if layout.host_blocks() > 0 {
@@ -1146,7 +1362,10 @@ impl TierOracle {
         reference: &Trace,
         active: &[u32],
     ) -> Result<Vec<bf16>> {
-        use crate::cpu::expert_ffn::{Contribution, Isa, Scratch, contribution};
+        use crate::cpu::expert_ffn::{
+            Contribution, Fp8Contribution, Isa, Scratch, contribution, fp8_contribution,
+            native_bytes,
+        };
         let shape = Shape::new(128, 64)?;
         let mut scratch = Scratch::new(&shape);
         let native = ExpertWeights {
@@ -1171,18 +1390,33 @@ impl TierOracle {
                 .read_expert(layer, ids[choice] as u32, &self.catalogue)?;
             let values = self.reader.values(slot)?;
             let row = choice / 4;
-            contribution(
-                Isa::detect(),
-                Contribution {
-                    shape: &shape,
-                    arena: &values,
-                    weights: &native,
-                    hidden: &input[row * 128..(row + 1) * 128],
-                    routing: bf16::from_f32(weights[choice]),
-                },
-                &mut output[choice * 128..(choice + 1) * 128],
-                &mut scratch,
-            )?;
+            if let Some(slot_layout) = self.catalogue.layout().fp8_slot() {
+                fp8_contribution(
+                    Isa::detect(),
+                    Fp8Contribution {
+                        shape: &shape,
+                        slot: native_bytes(&values),
+                        slot_layout,
+                        hidden: &input[row * 128..(row + 1) * 128],
+                        routing: bf16::from_f32(weights[choice]),
+                    },
+                    &mut output[choice * 128..(choice + 1) * 128],
+                    &mut scratch,
+                )?;
+            } else {
+                contribution(
+                    Isa::detect(),
+                    Contribution {
+                        shape: &shape,
+                        arena: &values,
+                        weights: &native,
+                        hidden: &input[row * 128..(row + 1) * 128],
+                        routing: bf16::from_f32(weights[choice]),
+                    },
+                    &mut output[choice * 128..(choice + 1) * 128],
+                    &mut scratch,
+                )?;
+            }
         }
         Ok(output)
     }
@@ -1225,7 +1459,11 @@ fn decode_residency_fixture_covers_tiers_requests_and_cap() -> Result<()> {
     ));
     let fixture = tier_fixture(3);
     let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
-    let mut oracle = TierOracle::new(&fixture, &directory, &tier_capacity(geometry, false)?)?;
+    let mut oracle = TierOracle::new(
+        &fixture,
+        &directory,
+        &tier_capacity(geometry, false, crate::model_spec::ExpertFormat::Bf16)?,
+    )?;
     for layer in 0..2 {
         for expert in 0..16 {
             let slot = oracle
@@ -1361,48 +1599,62 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
         .map(|&id| published[layer * 16 + id as usize])
         .collect::<Vec<_>>();
     stream.memcpy_htod(&generations, &mut generation)?;
-    DecodeOps::new(ctx)?.decode(
+    let mut shared_view = TensorMut(qwen::matrix(&shared_out, stream, 0, rows, h)?);
+    let mut done_view = TensorMut(view(
+        &done,
         stream,
-        &MoeDecode {
-            x: xv,
-            ids: idv,
-            active: view(&active, stream, 0, [rows as u32, k as u32], [k as u64, 1])?,
-            weights: weightv,
-            slots_gate_up: slots.gate_up,
-            slots_down: slots.down,
-            slot_valid: slots.valid,
-            slot_generation: slots.generation,
-            assignment_gen: view(
-                &generation,
-                stream,
-                0,
-                [rows as u32, k as u32],
-                [k as u64, 1],
-            )?,
-            shared_gate: shared[0],
-            shared_up: shared[1],
-            shared_down: shared[2],
-            shared_expert_gate: shared_gate,
-            contributions: view(
-                &contributions,
-                stream,
-                0,
-                [rows as u32, k as u32, h as u32],
-                [(k * h) as u64, h as u64, 1],
-            )?,
-            shared_out: &mut TensorMut(qwen::matrix(&shared_out, stream, 0, rows, h)?),
-            done: &mut TensorMut(view(
-                &done,
-                stream,
-                0,
-                [rows as u32, k as u32],
-                [k as u64, 1],
-            )?),
-        },
-        &mut TensorMut(qwen::matrix(&y, stream, 0, rows, h)?),
-        &qwen::scratch(&scratch, stream),
-        None,
+        0,
+        [rows as u32, k as u32],
+        [k as u64, 1],
+    )?);
+    let input = MoeDecode {
+        x: xv,
+        ids: idv,
+        active: view(&active, stream, 0, [rows as u32, k as u32], [k as u64, 1])?,
+        weights: weightv,
+        slots_gate_up: slots.gate_up,
+        slots_down: slots.down,
+        slot_valid: slots.valid,
+        slot_generation: slots.generation,
+        assignment_gen: view(
+            &generation,
+            stream,
+            0,
+            [rows as u32, k as u32],
+            [k as u64, 1],
+        )?,
+        shared_gate: shared[0],
+        shared_up: shared[1],
+        shared_down: shared[2],
+        shared_expert_gate: shared_gate,
+        contributions: view(
+            &contributions,
+            stream,
+            0,
+            [rows as u32, k as u32, h as u32],
+            [(k * h) as u64, h as u64, 1],
+        )?,
+        shared_out: &mut shared_view,
+        done: &mut done_view,
+    };
+    let op = DecodeOps::new(ctx)?;
+    let mut y_view = TensorMut(qwen::matrix(&y, stream, 0, rows, h)?);
+    let scratch = qwen::scratch(&scratch, stream);
+    let geometry = crate::experts::catalogue::ExpertGeometry {
+        layers: 1,
+        experts: slots.valid.shape[0],
+        hidden: h as u32,
+        intermediate: i as u32,
+        top_k: k as u32,
+    };
+    let layout = crate::experts::catalogue::ExpertLayout::new(
+        engine
+            .model_spec
+            .expert_format
+            .context("MoE reference expert format missing")?,
+        &geometry,
     )?;
+    op.decode(stream, &input, &mut y_view, &scratch, layout.fp8_slot())?;
     stream.synchronize()?;
     let mut trace = Trace::default();
     trace.add(
@@ -1545,6 +1797,7 @@ fn tier_cell(
         .stream
         .memcpy_htod(input, &mut engine.work.n.slice_mut(..input.len()))?;
     let mut trace = Trace::default();
+    engine.trace_layer = layer as usize;
     engine.run_ffn(
         layer as usize,
         step(rows),
@@ -1618,7 +1871,11 @@ fn tier_cell(
     ))
 }
 
-fn tier_gate(variants: &[u32], cases: &[(bool, u32)]) -> Result<()> {
+fn tier_gate(
+    variants: &[u32],
+    cases: &[(bool, u32)],
+    format: crate::model_spec::ExpertFormat,
+) -> Result<()> {
     let runtime = PathBuf::from(
         std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("tier gate runtime missing")?,
     );
@@ -1626,8 +1883,12 @@ fn tier_gate(variants: &[u32], cases: &[(bool, u32)]) -> Result<()> {
     let mut defects = 0;
     for &variant in variants {
         let fixture = tier_fixture(variant);
-        let reference =
-            Engine::load_moe_test(&fixture, &runtime.join(format!("reference-{variant}")), 8)?;
+        let reference = Engine::load_moe_test(
+            &fixture,
+            &runtime.join(format!("reference-{variant}")),
+            8,
+            format,
+        )?;
         let mut references = std::collections::BTreeMap::new();
         for layer in 0..2 {
             for rows in [1, 2, 5, 8] {
@@ -1642,7 +1903,7 @@ fn tier_gate(variants: &[u32], cases: &[(bool, u32)]) -> Result<()> {
         }
         for &(pinned, engines) in cases {
             let directory = runtime.join(format!("tier-{variant}-{pinned}-{engines}"));
-            let capacity = tier_capacity(geometry, pinned)?;
+            let capacity = tier_capacity(geometry, pinned, format)?;
             let mut oracle = TierOracle::new(&fixture, &directory.join("oracle"), &capacity)?;
             let mut engine = Engine::load_moe_placed(
                 &fixture,
@@ -1749,7 +2010,7 @@ fn tier_gate(variants: &[u32], cases: &[(bool, u32)]) -> Result<()> {
     }
     ensure!(defects == 0, "DEFECT decode residency cells={defects}");
     println!(
-        "PASS decode_residency_gate variants={} cases={} host=true disk=true admissions=true writeback=true requests=3 graphs=false",
+        "PASS decode_residency_gate variants={} cases={} format={format:?} host=true disk=true admissions=true writeback=true requests=3 graphs=false",
         variants.len(),
         cases.len()
     );
@@ -1759,13 +2020,27 @@ fn tier_gate(variants: &[u32], cases: &[(bool, u32)]) -> Result<()> {
 #[test]
 #[ignore = "authorized GPU window"]
 fn decode_residency_smoke_gpu() -> Result<()> {
-    tier_gate(&[3], &[(false, 1)])
+    tier_gate(&[3], &[(false, 1)], crate::model_spec::ExpertFormat::Bf16)
 }
 
 #[test]
 #[ignore = "authorized GPU window"]
 fn decode_residency_gpu() -> Result<()> {
-    tier_gate(&[3, 7], &[(false, 1), (false, 2), (true, 1), (true, 2)])
+    tier_gate(
+        &[3, 7],
+        &[(false, 1), (false, 2), (true, 1), (true, 2)],
+        crate::model_spec::ExpertFormat::Bf16,
+    )
+}
+
+#[test]
+#[ignore = "GPU window and FLYINGFISH_RUNTIME_DIR required"]
+fn fp8_decode_residency_gpu() -> Result<()> {
+    tier_gate(
+        &[3, 7],
+        &[(false, 1), (true, 2)],
+        crate::model_spec::ExpertFormat::Fp8W8a16,
+    )
 }
 
 fn cpu_control(
@@ -1951,7 +2226,8 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
     let mut defects = 0;
     for &variant in variants {
         let fixture = fixture(MoeDims::new(8, 16, 4, 128, 64), variant);
-        let mut engine = Engine::load_moe_test(&fixture, runtime, 8)?;
+        let mut engine =
+            Engine::load_moe_test(&fixture, runtime, 8, crate::model_spec::ExpertFormat::Bf16)?;
         for &rows in row_cases {
             let input = &fixture.x[..rows * 128];
             let reference = direct(&engine, 0, input, rows)?;

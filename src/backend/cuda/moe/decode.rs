@@ -14,9 +14,7 @@ use std::sync::Arc;
 pub(crate) struct DecodeOps {
     gate_up: CudaFunction,
     down: CudaFunction,
-    #[cfg(test)]
     gate_up_w8a16: CudaFunction,
-    #[cfg(test)]
     down_w8a16: CudaFunction,
     #[cfg(test)]
     combine: CombineOps,
@@ -250,7 +248,6 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
     })
 }
 
-#[cfg(test)]
 pub(super) fn validate_w8a16(
     input: &MoeDecode<'_>,
     slot: &crate::experts::catalogue::Fp8Slot,
@@ -281,9 +278,7 @@ impl DecodeOps {
         Ok(Self {
             gate_up: module.load_function("moe_ffn_gate_up")?,
             down: module.load_function("moe_ffn_down")?,
-            #[cfg(test)]
             gate_up_w8a16: module.load_function("moe_ffn_gate_up_w8a16")?,
-            #[cfg(test)]
             down_w8a16: module.load_function("moe_ffn_down_w8a16")?,
             #[cfg(test)]
             combine: CombineOps::new(ctx)?,
@@ -411,7 +406,6 @@ impl DecodeOps {
         self.combine.combine(stream, &combine_input)
     }
 
-    #[cfg(test)]
     pub fn contribute_w8a16(
         &self,
         stream: &Arc<CudaStream>,

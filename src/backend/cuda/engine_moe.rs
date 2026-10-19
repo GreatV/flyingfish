@@ -134,7 +134,7 @@ impl Setup {
         for span in spans {
             let span_rows = u32::try_from(span)?;
             let mut wave_rows = 1u32;
-            // L2 bounds activation scratch; BF16 materialization is reserved in VRAM.
+            // L2 bounds activation scratch.
             while wave_rows <= span_rows / 2
                 && crate::backend::cuda::moe::prefill::prefill_scratch_bytes(
                     wave_rows as usize * 2,
@@ -403,6 +403,7 @@ pub(super) struct Dispatch<'a> {
 
 pub(super) struct Decode {
     geometry: ExpertGeometry,
+    fp8_slot: Option<crate::experts::catalogue::Fp8Slot>,
     max_rows: usize,
     rows: usize,
     pending: bool,
@@ -473,8 +474,10 @@ impl Decode {
         );
         let stream = &device.stream;
         let context = &device.ctx;
+        let layout = crate::experts::catalogue::ExpertLayout::new(format, &geometry)?;
         Ok(Self {
             geometry,
+            fp8_slot: layout.fp8_slot().cloned(),
             max_rows,
             rows: 0,
             pending: false,
@@ -517,6 +520,7 @@ impl Decode {
                 Shape::new(geometry.hidden as usize, geometry.intermediate as usize)?,
                 cpu_bounds.0,
                 cpu_bounds.1,
+                layout.fp8_slot().cloned(),
             )?,
             stats: [0; 5],
         })
@@ -792,40 +796,43 @@ impl Decode {
             [rows as u32, k as u32],
             [k as u64, 1],
         )?);
-        self.contribute.contribute(
-            stream,
-            &MoeDecode {
-                x,
-                ids,
-                active,
-                weights: view(
-                    &self.weights,
-                    stream,
-                    0,
-                    [rows as u32, k as u32],
-                    [k as u64, 1],
-                )?,
-                slots_gate_up: slots.gate_up,
-                slots_down: slots.down,
-                slot_valid: slots.valid,
-                slot_generation: slots.generation,
-                assignment_gen: view(
-                    &self.generation,
-                    stream,
-                    0,
-                    [rows as u32, k as u32],
-                    [k as u64, 1],
-                )?,
-                shared_gate: shared[0],
-                shared_up: shared[1],
-                shared_down: shared[2],
-                shared_expert_gate: shared_gate,
-                contributions,
-                shared_out: &mut shared_out,
-                done: &mut done,
-            },
-            &qwen::scratch(&self.scratch, stream),
-        )
+        let input = MoeDecode {
+            x,
+            ids,
+            active,
+            weights: view(
+                &self.weights,
+                stream,
+                0,
+                [rows as u32, k as u32],
+                [k as u64, 1],
+            )?,
+            slots_gate_up: slots.gate_up,
+            slots_down: slots.down,
+            slot_valid: slots.valid,
+            slot_generation: slots.generation,
+            assignment_gen: view(
+                &self.generation,
+                stream,
+                0,
+                [rows as u32, k as u32],
+                [k as u64, 1],
+            )?,
+            shared_gate: shared[0],
+            shared_up: shared[1],
+            shared_down: shared[2],
+            shared_expert_gate: shared_gate,
+            contributions,
+            shared_out: &mut shared_out,
+            done: &mut done,
+        };
+        let scratch = qwen::scratch(&self.scratch, stream);
+        if let Some(slot) = self.fp8_slot.as_ref() {
+            self.contribute
+                .contribute_w8a16(stream, &input, slot, &scratch)
+        } else {
+            self.contribute.contribute(stream, &input, &scratch)
+        }
     }
 
     fn upload_cpu(

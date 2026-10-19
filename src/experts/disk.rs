@@ -383,8 +383,17 @@ impl DiskExperts {
             let reader = DiskReader::open(&catalogue, directory, 1)?;
             let mut scratch = crate::cpu::expert_ffn::Scratch::new(&shape);
             let mut vector = vec![bf16::ZERO; shape.hidden];
-            let native = native_weights(shape);
+            let native = crate::cpu::expert_ffn::ExpertWeights::from_slot(
+                shape,
+                0..usize::try_from(catalogue.slot_bytes() / 2)?,
+                catalogue.layout(),
+            )?;
             let isa = crate::cpu::expert_ffn::Isa::detect();
+            let compute = if catalogue.layout().fp8_slot().is_some() {
+                disk_contributions::<true>
+            } else {
+                disk_contributions::<false>
+            };
             let source = catalogue.clone();
             let (input, requests) = std::sync::mpsc::sync_channel::<Work>(1);
             let (results, output) = std::sync::mpsc::sync_channel(1);
@@ -392,7 +401,7 @@ impl DiskExperts {
                 .name(format!("expert-disk-{index}"))
                 .spawn(move || {
                     while let Ok(mut work) = requests.recv() {
-                        let result = disk_contributions(
+                        let result = compute(
                             &reader,
                             &source,
                             &mut work,
@@ -532,17 +541,7 @@ impl Drop for DiskExperts {
     }
 }
 
-fn native_weights(shape: crate::cpu::expert_ffn::Shape) -> crate::cpu::expert_ffn::ExpertWeights {
-    let down = 2 * shape.intermediate * shape.hidden;
-    crate::cpu::expert_ffn::ExpertWeights {
-        gate_up: 0..down,
-        gate_up_stride: shape.hidden,
-        down: down..down + shape.hidden * shape.intermediate,
-        down_stride: shape.intermediate,
-    }
-}
-
-fn disk_contributions(
+fn disk_contributions<const FP8: bool>(
     reader: &DiskReader,
     catalogue: &ExpertCatalogue,
     work: &mut Work,
@@ -551,7 +550,9 @@ fn disk_contributions(
     vector: &mut [bf16],
     isa: crate::cpu::expert_ffn::Isa,
 ) -> Result<()> {
-    use crate::cpu::expert_ffn::{Contribution, Shape, contribution};
+    use crate::cpu::expert_ffn::{
+        Contribution, Fp8Contribution, Shape, contribution, fp8_contribution, native_bytes,
+    };
     let geometry = catalogue.geometry();
     let shape = Shape::new(geometry.hidden as usize, geometry.intermediate as usize)?;
     for expert in 0..geometry.experts {
@@ -562,18 +563,36 @@ fn disk_contributions(
         let values = reader.values(slot)?;
         for route in work.routes.iter().filter(|route| route.expert == expert) {
             let first = route.row as usize * shape.hidden;
-            contribution(
-                isa,
-                Contribution {
-                    shape: &shape,
-                    arena: &values,
-                    weights,
-                    hidden: &work.hidden[first..first + shape.hidden],
-                    routing: route.weight,
-                },
-                vector,
-                scratch,
-            )?;
+            if FP8 {
+                fp8_contribution(
+                    isa,
+                    Fp8Contribution {
+                        shape: &shape,
+                        slot: native_bytes(&values),
+                        slot_layout: catalogue
+                            .layout()
+                            .fp8_slot()
+                            .context("FP8 disk slot missing")?,
+                        hidden: &work.hidden[first..first + shape.hidden],
+                        routing: route.weight,
+                    },
+                    vector,
+                    scratch,
+                )?;
+            } else {
+                contribution(
+                    isa,
+                    Contribution {
+                        shape: &shape,
+                        arena: &values,
+                        weights,
+                        hidden: &work.hidden[first..first + shape.hidden],
+                        routing: route.weight,
+                    },
+                    vector,
+                    scratch,
+                )?;
+            }
             ensure!(
                 vector.iter().all(|value| value.to_f32().is_finite()),
                 "non-finite disk contribution layer={} expert={expert} row={}",
@@ -681,11 +700,11 @@ mod tests {
         }
     }
 
-    fn fp8_manifest() -> TensorManifest {
+    fn fp8_manifest(geometry: ExpertGeometry) -> TensorManifest {
         let mut entries = BTreeMap::new();
         let mut next = 0u64;
-        for layer in 0..2u32 {
-            for expert in 0..4u32 {
+        for layer in 0..geometry.layers {
+            for expert in 0..geometry.experts {
                 let name = |role: &str| {
                     format!("model.language_model.layers.{layer}.mlp.experts.{expert}.{role}")
                 };
@@ -693,32 +712,32 @@ mod tests {
                     (
                         "gate_proj.weight",
                         safetensors::Dtype::F8_E4M3,
-                        vec![4usize, 8],
+                        vec![geometry.intermediate as usize, geometry.hidden as usize],
                     ),
                     (
                         "up_proj.weight",
                         safetensors::Dtype::F8_E4M3,
-                        vec![4usize, 8],
+                        vec![geometry.intermediate as usize, geometry.hidden as usize],
                     ),
                     (
                         "down_proj.weight",
                         safetensors::Dtype::F8_E4M3,
-                        vec![8usize, 4],
+                        vec![geometry.hidden as usize, geometry.intermediate as usize],
                     ),
                     (
                         "gate_proj.weight_scale",
                         safetensors::Dtype::BF16,
-                        vec![4usize, 1],
+                        vec![geometry.intermediate as usize, 1],
                     ),
                     (
                         "up_proj.weight_scale",
                         safetensors::Dtype::BF16,
-                        vec![4usize, 1],
+                        vec![geometry.intermediate as usize, 1],
                     ),
                     (
                         "down_proj.weight_scale",
                         safetensors::Dtype::BF16,
-                        vec![8usize, 1],
+                        vec![geometry.hidden as usize, 1],
                     ),
                 ] {
                     let elements: usize = shape.iter().product();
@@ -1010,7 +1029,11 @@ mod tests {
                     Contribution {
                         shape: &shape,
                         arena: &values,
-                        weights: &native_weights(shape),
+                        weights: &crate::cpu::expert_ffn::ExpertWeights::from_slot(
+                            shape,
+                            0..values.len(),
+                            catalogue.layout(),
+                        )?,
                         hidden: &hidden[first..first + 8],
                         routing: route.weight,
                     },
@@ -1032,10 +1055,101 @@ mod tests {
     }
 
     #[test]
+    fn fp8_disk_workers_preserve_native_scales_rows_and_choices() -> Result<()> {
+        use crate::cpu::expert_ffn::{
+            Fp8Contribution, Isa, Scratch, Shape, fp8_contribution, native_bytes,
+        };
+        use crate::experts::runtime::Route;
+        use std::sync::Arc;
+        let dir = temp_dir("fp8-workers")?;
+        let geometry = ExpertGeometry {
+            hidden: 16,
+            intermediate: 8,
+            ..geometry()
+        };
+        let manifest = fp8_manifest(geometry);
+        let len = manifest
+            .entries
+            .values()
+            .map(|e| e.data_offsets[1])
+            .max()
+            .context("empty fixture")?;
+        let mut bytes = vec![0u8; len as usize];
+        for (name, entry) in &manifest.entries {
+            let data = &mut bytes[entry.data_offsets[0] as usize..entry.data_offsets[1] as usize];
+            if name.ends_with("weight_scale") {
+                for (index, value) in data.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    let scale = bf16::from_f32(
+                        (1.0 + ((index + entry.data_offsets[0] as usize / 2) % 17) as f32 / 16.0)
+                            / 8.0,
+                    );
+                    value.copy_from_slice(&scale.to_le_bytes());
+                }
+            } else {
+                for (index, value) in data.iter_mut().enumerate() {
+                    *value = (((index * 37 + entry.data_offsets[0] as usize) % 64) as u8)
+                        | (((index / 7 % 2) as u8) << 7);
+                }
+            }
+        }
+        std::fs::write(dir.path().join("fp8-0.safetensors"), bytes)?;
+        let catalogue = Arc::new(ExpertCatalogue::from_manifest(
+            &manifest,
+            geometry,
+            crate::model_spec::ExpertFormat::Fp8W8a16,
+        )?);
+        let mut pool = DiskExperts::new(catalogue.clone(), dir.path(), 2, 3)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let shape = Shape::new(16, 8)?;
+        let mut scratch = Scratch::new(&shape);
+        let hidden = (0..3 * shape.hidden)
+            .map(|k| bf16::from_f32(((k * 11 % 29) as f32 - 13.0) / 32.0))
+            .collect::<Vec<_>>();
+        for layer in [1, 0, 1] {
+            let routes = [(1, 5, 3, 0.25), (0, 1, 0, 0.5), (2, 4, 3, 0.75)].map(
+                |(row, choice, expert, weight)| Route {
+                    row,
+                    choice,
+                    expert,
+                    weight: bf16::from_f32(weight),
+                },
+            );
+            let mut actual = vec![bf16::from_f32(-99.0); 6 * shape.hidden];
+            let mut expected = actual.clone();
+            for route in routes {
+                let slot = reader.read_expert(layer, route.expert, &catalogue)?;
+                let values = reader.values(slot)?;
+                fp8_contribution(
+                    Isa::Scalar,
+                    Fp8Contribution {
+                        shape: &shape,
+                        slot: native_bytes(&values),
+                        slot_layout: catalogue.layout().fp8_slot().context("FP8 fixture slot")?,
+                        hidden: &hidden[route.row as usize * shape.hidden..][..shape.hidden],
+                        routing: route.weight,
+                    },
+                    &mut expected[route.choice as usize * shape.hidden..][..shape.hidden],
+                    &mut scratch,
+                )?;
+            }
+            pool.start(layer, &hidden, 3, &routes)?;
+            pool.finish(&mut actual)?;
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        println!(
+            "PASS FP8_DISK_POOL layers=2 jobs=3 rows=3 choices=3 native_offsets=true bit_mismatches=0"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn fp8_slot_packs_the_six_ranges_in_the_documented_order() -> Result<()> {
         let geometry = geometry();
         let dir = temp_dir("fp8-order")?;
-        let manifest = fp8_manifest();
+        let manifest = fp8_manifest(geometry);
         let mut bytes = 0u64;
         for entry in manifest.entries.values() {
             bytes = bytes.max(entry.data_offsets[1]);
