@@ -767,7 +767,9 @@ fn video_caption(
     steps: usize,
 ) -> Result<Vec<u32>> {
     engine.reset()?;
+    let range = super::super::super::profile::Range::new(true, c"minicpm_video_prefill");
     let mut token = engine.prefill_multimodal(&input.packed(), None)?;
+    drop(range);
     let mut ids = Vec::with_capacity(steps);
     for step in 0..steps {
         ids.push(token);
