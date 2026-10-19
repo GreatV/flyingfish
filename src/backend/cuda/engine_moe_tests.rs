@@ -82,29 +82,103 @@ fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
 
 #[test]
 fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
-    let (available, locked) = super::host_memory()?;
+    let (available, locked) = super::host_memory(Path::new("/"))?;
     ensure!(
         available > 0 && locked <= available,
         "invalid expert host memory profile"
     );
-    let groups = std::fs::read_to_string("/proc/self/cgroup")?;
-    let group = groups
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .context("unified cgroup missing")?;
-    let limit = Path::new("/sys/fs/cgroup")
-        .join(group.trim_start_matches('/'))
-        .join("memory.max");
-    if limit.try_exists()? {
-        let text = std::fs::read_to_string(limit)?;
-        if text.trim() != "max" {
-            ensure!(
-                available <= text.trim().parse::<u64>()?,
-                "expert arena exceeds cgroup limit"
-            );
+    let root = std::env::temp_dir().join(format!(
+        "flyingfish-host-memory-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root)?;
+    let result = (|| -> Result<()> {
+        let write = |path: &str, value: &str| -> Result<()> {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().context("fixture parent missing")?)?;
+            Ok(std::fs::write(path, value)?)
+        };
+        write("proc/meminfo", "MemAvailable: 16777216 kB\n")?;
+        write(
+            "proc/self/limits",
+            "Max locked memory 8388608 8388608 bytes\n",
+        )?;
+        let mounts = "1 0 0:1 / /other rw - cgroup none rw,cpuset\n2 0 0:2 /pod /controllers/memory\\040bank rw - cgroup none rw,cpu,memory\n3 0 0:3 / /sys/fs/cgroup rw - cgroup2 none rw\n";
+        write("proc/self/mountinfo", mounts)?;
+        write(
+            "proc/self/cgroup",
+            "2:cpuset:/other\n5:cpu,memory:/pod/job/leaf\n",
+        )?;
+        for (path, limit) in [
+            ("controllers/memory bank/job", "6442450944\n"),
+            ("controllers/memory bank/job/leaf", "8589934592\n"),
+        ] {
+            write(&format!("{path}/memory.limit_in_bytes"), limit)?;
+            write(&format!("{path}/memory.usage_in_bytes"), "1073741824\n")?;
         }
-    }
-    Ok(())
+        ensure!(
+            super::host_memory(&root)? == (5 << 30, 8 << 20),
+            "v1 ancestor headroom did not bind"
+        );
+        println!(
+            "PASS host_memory_fixture v1 ancestor_available_bytes={}",
+            5u64 << 30
+        );
+        for path in [
+            "controllers/memory bank/job",
+            "controllers/memory bank/job/leaf",
+        ] {
+            write(
+                &format!("{path}/memory.limit_in_bytes"),
+                "9223372036854771712\n",
+            )?;
+        }
+        ensure!(
+            super::host_memory(&root)? == (16 << 30, 8 << 20),
+            "v1 unlimited bound MemAvailable"
+        );
+        write(
+            "proc/self/cgroup",
+            "0::/unified\n5:cpu,memory:/pod/job/leaf\n",
+        )?;
+        ensure!(
+            super::host_memory(&root)? == (16 << 30, 8 << 20),
+            "hybrid memory controller was not selected"
+        );
+        write("proc/self/cgroup", "0::/job/leaf\n")?;
+        for (path, limit) in [
+            ("sys/fs/cgroup/job", "6442450944\n"),
+            ("sys/fs/cgroup/job/leaf", "8589934592\n"),
+        ] {
+            write(&format!("{path}/memory.max"), limit)?;
+            write(&format!("{path}/memory.current"), "1073741824\n")?;
+        }
+        ensure!(
+            super::host_memory(&root)? == (5 << 30, 8 << 20),
+            "v2 ancestor headroom did not bind"
+        );
+        for path in ["sys/fs/cgroup/job", "sys/fs/cgroup/job/leaf"] {
+            write(&format!("{path}/memory.max"), "max\n")?;
+        }
+        ensure!(
+            super::host_memory(&root)? == (16 << 30, 8 << 20),
+            "v2 unlimited bound MemAvailable"
+        );
+        write("proc/self/cgroup", "2:cpuset:/other\n")?;
+        ensure!(
+            super::host_memory(&root).is_err(),
+            "missing memory hierarchy admitted"
+        );
+        println!(
+            "PASS host_memory_fixtures v1_finite=true v1_unlimited=true hybrid=true v2_finite=true v2_unlimited=true missing_controller_rejected=true"
+        );
+        Ok(())
+    })();
+    std::fs::remove_dir_all(&root)?;
+    result
 }
 
 fn native_fixture(

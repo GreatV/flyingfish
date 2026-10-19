@@ -675,8 +675,8 @@ fn measure(
     })
 }
 
-pub(super) fn host_memory() -> Result<(u64, u64)> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo")?;
+pub(super) fn host_memory(root: &Path) -> Result<(u64, u64)> {
+    let meminfo = std::fs::read_to_string(root.join("proc/meminfo"))?;
     let mut available = meminfo
         .lines()
         .find_map(|line| line.strip_prefix("MemAvailable:"))
@@ -685,22 +685,70 @@ pub(super) fn host_memory() -> Result<(u64, u64)> {
         .parse::<u64>()?
         .checked_mul(1024)
         .context("expert available host bytes overflow")?;
-    let groups = std::fs::read_to_string("/proc/self/cgroup")?;
-    let group = groups
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .context("expert host profile has no unified cgroup")?;
-    let mount = Path::new("/sys/fs/cgroup");
-    let mut directory = mount.join(group.trim_start_matches('/'));
+    let groups = std::fs::read_to_string(root.join("proc/self/cgroup"))?;
+    let memory = groups.lines().find_map(|line| {
+        let (_, rest) = line.split_once(':')?;
+        let (controllers, group) = rest.split_once(':')?;
+        controllers
+            .split(',')
+            .any(|controller| controller == "memory")
+            .then_some(group)
+    });
+    let (mount, mut directory, maximum_name, current_name) = if let Some(group) = memory {
+        let mounts = std::fs::read_to_string(root.join("proc/self/mountinfo"))?;
+        let decode = |field: &str| {
+            field
+                .replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\012", "\n")
+                .replace("\\134", "\\")
+        };
+        let (_, point, relative) = mounts
+            .lines()
+            .filter_map(|line| {
+                let (paths, options) = line.split_once(" - ")?;
+                let mut options = options.split_whitespace();
+                if options.next()? != "cgroup" {
+                    return None;
+                }
+                options.next()?;
+                if !options.next()?.split(',').any(|name| name == "memory") {
+                    return None;
+                }
+                let mut paths = paths.split_whitespace().skip(3);
+                let base = decode(paths.next()?);
+                let point = decode(paths.next()?);
+                let relative = Path::new(group).strip_prefix(&base).ok()?.to_path_buf();
+                Some((Path::new(&base).components().count(), point, relative))
+            })
+            .min_by_key(|(depth, _, _)| *depth)
+            .with_context(|| format!("expert v1 memory controller mount missing for {group}"))?;
+        let mount = root.join(point.trim_start_matches('/'));
+        let directory = mount.join(relative);
+        (
+            mount,
+            directory,
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+        )
+    } else {
+        let group = groups
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .context("expert memory controller missing from v1 and v2 cgroup memberships")?;
+        let mount = root.join("sys/fs/cgroup");
+        let directory = mount.join(group.trim_start_matches('/'));
+        (mount, directory, "memory.max", "memory.current")
+    };
     loop {
-        let maximum = directory.join("memory.max");
+        let maximum = directory.join(maximum_name);
         if directory == mount && !maximum.try_exists()? {
             break;
         }
         let limit = std::fs::read_to_string(&maximum)
             .with_context(|| format!("read expert cgroup limit {}", maximum.display()))?;
-        if limit.trim() != "max" {
-            let current = directory.join("memory.current");
+        if memory.is_some() || limit.trim() != "max" {
+            let current = directory.join(current_name);
             let used = std::fs::read_to_string(&current)
                 .with_context(|| format!("read expert cgroup usage {}", current.display()))?
                 .trim()
@@ -710,9 +758,13 @@ pub(super) fn host_memory() -> Result<(u64, u64)> {
         if directory == mount {
             break;
         }
-        ensure!(directory.pop(), "expert cgroup has no parent: {group}");
+        ensure!(
+            directory.pop(),
+            "expert cgroup has no parent under {}",
+            mount.display()
+        );
     }
-    let limits = std::fs::read_to_string("/proc/self/limits")?;
+    let limits = std::fs::read_to_string(root.join("proc/self/limits"))?;
     let locked = limits
         .lines()
         .find_map(|line| line.strip_prefix("Max locked memory"))
@@ -1130,7 +1182,7 @@ pub(super) fn load_experts(
         let ring_bytes = u64::from(ring_experts)
             .checked_mul(slot_bytes)
             .context("expert ring bytes overflow")?;
-        let (available, _) = host_memory()?;
+        let (available, _) = host_memory(Path::new("/"))?;
         ensure!(
             ring_bytes <= available / 2,
             "expert service ring {ring_bytes} B exceeds half of effective available host memory {available} B"

@@ -107,7 +107,7 @@ impl Setup {
             model.expert_format.context("MoE expert_format missing")?,
             &calibration,
         )?;
-        let (available, locked) = host_memory()?;
+        let (available, locked) = host_memory(Path::new("/"))?;
         let copies = measured.copy_engines.min(2);
         let slot = catalogue.slot_bytes();
         let workers = measured.service.worker_count()?;
