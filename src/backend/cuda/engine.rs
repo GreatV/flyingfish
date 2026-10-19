@@ -355,6 +355,8 @@ struct Spec {
     logits: CudaSlice<bf16>,
     predictions: CudaSlice<u32>,
     row_counts: CudaSlice<i32>,
+    checkpoint: Option<super::state::StateCheckpoint>,
+    snapshots: Vec<super::state::GdnState>,
 }
 
 #[derive(Clone, Copy)]
@@ -382,6 +384,91 @@ impl SpecPhase {
 }
 
 impl Spec {
+    fn new(draft: super::draft::Draft, engine: &Engine) -> Result<Self> {
+        let verify_rows = draft.config.verify_rows()?;
+        let rows = if engine.spec_budget.is_tree() {
+            engine.spec_budget.rows()
+        } else {
+            verify_rows
+        };
+        ensure!(
+            rows <= engine.workspace_rows && rows <= engine.capacity,
+            "DSpark allocated rows={rows} workspace={} capacity={}",
+            engine.workspace_rows,
+            engine.capacity
+        );
+        let stream = &engine.device.stream;
+        let counts: Vec<_> = (1..=rows).map(|row| row as i32).collect();
+        let row_counts = stream.clone_htod(&counts)?;
+        stream.synchronize()?;
+        let checkpoint = engine
+            .model_spec
+            .moe
+            .as_ref()
+            .map(|_| {
+                super::state::StateCheckpoint::new(&engine.state, &engine.model_spec, rows, stream)
+            })
+            .transpose()?;
+        let snapshots = if checkpoint.is_some() {
+            engine
+                .state
+                .gdn
+                .iter()
+                .map(|live| {
+                    Ok(super::state::GdnState {
+                        s: stream.alloc_zeros((rows - 1) * live.s.len())?,
+                        history: stream.alloc_zeros((rows - 1) * live.history.len())?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let spec = Self {
+            eos: Vec::new(),
+            tree_verify_graph: None,
+            tree_commit_graph: None,
+            tree_draft_graph: None,
+            tree: if engine.spec_budget.is_tree() {
+                Some(super::tree::State::new(
+                    &engine.device,
+                    &engine.config,
+                    &engine.state.kv,
+                    engine.capacity,
+                    rows,
+                )?)
+            } else {
+                None
+            },
+            tree_attention: None,
+            active_rows: 0,
+            graph: engine.spec_graph,
+            draft_graph: None,
+            verify_graph: None,
+            inject_graphs: (0..verify_rows).map(|_| None).collect(),
+            verification: None,
+            draft,
+            logits: stream.alloc_zeros(rows * engine.config.vocab_size)?,
+            predictions: stream.alloc_zeros(rows)?,
+            row_counts,
+            checkpoint,
+            snapshots,
+        };
+        if let Some(checkpoint) = &spec.checkpoint {
+            let actual = checkpoint.bytes()
+                + spec
+                    .snapshots
+                    .iter()
+                    .map(|image| (image.s.len() + image.history.len()) * size_of::<f32>())
+                    .sum::<usize>();
+            let planned = spec.draft.config.target_state_bytes(&engine.model_spec)?;
+            ensure!(
+                actual == planned,
+                "DSpark state allocation={actual} differs from planned={planned} rows={rows}"
+            );
+        }
+        Ok(spec)
+    }
     fn graph_slot(&mut self, phase: SpecPhase) -> Result<&mut Option<CudaGraph>> {
         Ok(match phase {
             SpecPhase::Draft => &mut self.draft_graph,
@@ -687,7 +774,7 @@ impl Engine {
         settings: Settings,
     ) -> Result<()> {
         let spec = crate::model_spec::ModelSpec::read(dir)?;
-        if spec.moe.is_some() {
+        if spec.moe.is_some() && settings.draft_model.is_none() {
             let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&spec)?;
             let runtime = super::calibrate::runtime_dir(
                 settings
@@ -966,38 +1053,7 @@ impl Engine {
                     .blas
                     .prepare(rows, engine.config.vocab_size, engine.config.hidden_size)?;
             }
-            let s = &engine.device.stream;
-            let count_values: Vec<_> = (1..=rows).map(|n| n as i32).collect();
-            let row_counts = s.clone_htod(&count_values)?;
-            s.synchronize()?;
-            engine.spec = Some(Spec {
-                eos: Vec::new(),
-                tree_verify_graph: None,
-                tree_commit_graph: None,
-                tree_draft_graph: None,
-                tree: if engine.spec_budget.is_tree() {
-                    Some(super::tree::State::new(
-                        &engine.device,
-                        &engine.config,
-                        &engine.state.kv,
-                        engine.capacity,
-                        rows,
-                    )?)
-                } else {
-                    None
-                },
-                tree_attention: None,
-                active_rows: 0,
-                graph: engine.spec_graph,
-                draft_graph: None,
-                verify_graph: None,
-                inject_graphs: (0..verify_rows).map(|_| None).collect(),
-                verification: None,
-                draft,
-                logits: s.alloc_zeros(rows * engine.config.vocab_size)?,
-                predictions: s.alloc_zeros(rows)?,
-                row_counts,
-            });
+            engine.spec = Some(Spec::new(draft, &engine)?);
         }
         engine.size_workspace(requested_chunk)?;
         engine.declare_graphs()?;

@@ -296,7 +296,6 @@ fn norm(
 }
 
 impl Draft {
-    #[cfg(test)]
     pub(super) fn prepare_linears(
         &self,
         head: &CudaSlice<bf16>,

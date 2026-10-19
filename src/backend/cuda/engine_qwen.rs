@@ -1088,6 +1088,15 @@ impl Engine {
             .map(|draft| draft.workspace_row_bytes())
             .transpose()?
             .unwrap_or(0);
+        let target_head_bytes = if draft_config.is_some() {
+            (model_spec.vocab as usize)
+                .checked_mul(size_of::<bf16>())
+                .and_then(|n| n.checked_add(size_of::<i32>() + size_of::<u32>()))
+                .and_then(|n| n.checked_mul(verify_rows))
+                .context("DSpark all-row head byte count overflow")?
+        } else {
+            0
+        };
         ensure!(
             !settings.spec_budget.is_tree(),
             "Qwen DSpark proposal/tree execution is not bound"
@@ -1116,7 +1125,10 @@ impl Engine {
         std::fs::create_dir_all(&runtime)?;
         let closure = Rc::new(super::super::closure::Closure::new(
             write,
-            "Q38 uses fixed operator plans".into(),
+            format!(
+                "run calibrate with model={dir:?} draft={:?} capacity={capacity} runtime={runtime:?}",
+                settings.draft_model
+            ),
         ));
         let device = Device::new(ordinal)?;
         let gdn_policy = GdnPolicy::for_device(device.info.arch, device.info.sms);
@@ -1197,6 +1209,25 @@ impl Engine {
         if model_spec.linear_format.fp8_layout().is_some() {
             blas.enable_fp8(&device.ctx)?;
         }
+        let mut draft = if draft_config.is_some() {
+            let path = settings
+                .draft_model
+                .as_deref()
+                .context("draft config has no checkpoint path")?;
+            let mut draft = super::super::draft::Draft::new(
+                path,
+                &device,
+                &config,
+                capacity,
+                verify_rows,
+                &mut blas,
+                super::super::markov::ScoreRounding::F32,
+            )?;
+            draft.setup_attention(&device, &ops, &config, &runtime, &closure)?;
+            Some(draft)
+        } else {
+            None
+        };
         device.finish_upload()?;
         let (free, total) = device.ctx.mem_get_info()?;
         let mtp_budget = reserve_mtp
@@ -1216,6 +1247,7 @@ impl Engine {
             fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
                 .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
                 .and_then(|bytes| bytes.checked_add(target_transaction_bytes))
+                .and_then(|bytes| bytes.checked_add(target_head_bytes))
                 .context("combined fixed bytes overflow")?,
         };
         let expert_setup = if model_spec.moe.is_some() {
@@ -1269,9 +1301,12 @@ impl Engine {
             .as_ref()
             .map_or(chunk, |setup| setup.workspace.workspace_rows);
         ensure!(
-            !reserve_mtp || rows >= verify_rows,
-            "MTP chunk {rows} cannot fit {verify_rows} verification rows"
+            !(reserve_mtp || draft.is_some()) || rows >= verify_rows,
+            "speculative chunk {rows} cannot fit {verify_rows} verification rows"
         );
+        if let Some(draft) = &mut draft {
+            draft.grow(rows)?;
+        }
         let target_workspace = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?.max(
             if settings.kv_format == crate::kv::KvFormat::Bf16 {
                 0
@@ -1303,6 +1338,7 @@ impl Engine {
                 "target_hidden_capture_bytes": rows.checked_mul(capture_row_bytes).context("capture byte count overflow")?,
                 "draft_workspace_row_bytes": draft_row_bytes,
                 "target_transaction_planned_bytes": target_transaction_bytes,
+                "target_all_row_head_bytes": target_head_bytes,
                 "layer_arena_bytes": arena_bytes,
                 "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?.bytes,
                 "attention_prefill_lse_bytes": rows * model_spec.q_heads as usize * size_of::<f32>(),
@@ -1392,6 +1428,11 @@ impl Engine {
             kv_scratch,
             verify_rows,
         )?);
+        if let Some(draft) = draft {
+            let spec = Spec::new(draft, &engine)?;
+            engine.bind_gdn_snapshots(&spec.snapshots, verify_rows)?;
+            engine.spec = Some(spec);
+        }
         if let Some(setup) = expert_setup {
             setup.bind(&mut engine)?;
         }
@@ -1409,7 +1450,36 @@ impl Engine {
             .as_ref()
             .context("Q38 runtime missing")?
             .ensure_complete()?;
-        engine.closure.freeze_fixed()?;
+        if let Some(spec) = &engine.spec {
+            let profile = super::super::closure::Profile::draft(
+                &spec.draft.config,
+                capacity,
+                rows,
+                dir,
+                settings
+                    .draft_model
+                    .as_deref()
+                    .context("draft calibration path missing")?,
+            )?;
+            let key = super::super::calibrate::key(&engine.device)?;
+            let mut paths: Vec<_> = profile
+                .linear
+                .iter()
+                .map(|&shape| engine.blas.choice_path(shape))
+                .collect();
+            paths.push(profile.path(&engine.runtime, &key)?);
+            engine.closure.preflight(&paths)?;
+            spec.draft
+                .prepare_linears(&engine.weights.head, &mut engine.blas, &profile, write)?;
+            engine.blas.prepare_fixed(
+                verify_rows as u32,
+                engine.model_spec.vocab,
+                engine.model_spec.hidden,
+            )?;
+            engine.closure.finish(profile, &engine.runtime, key)?;
+        } else {
+            engine.closure.freeze_fixed()?;
+        }
         if !write {
             engine.reset()?;
             engine.prepare_graphs()?;

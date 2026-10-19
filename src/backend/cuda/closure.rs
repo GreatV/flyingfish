@@ -190,7 +190,6 @@ fn shapes(
 }
 
 impl Profile {
-    #[cfg(test)]
     pub(super) fn draft(
         config: &crate::dspark::DraftConfig,
         capacity: usize,
