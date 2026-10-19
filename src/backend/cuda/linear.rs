@@ -503,8 +503,7 @@ mod tests {
             std::env::var_os("FF_MINICPM_REFERENCE_DIR")
                 .context("FF_MINICPM_REFERENCE_DIR missing")?,
         );
-        let model =
-            PathBuf::from(std::env::var_os("FF_FP8_MODEL").context("FF_FP8_MODEL missing")?);
+        let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
         let spec = crate::model_spec::ModelSpec::read(&model)?;
         ensure!(
             spec.hidden == 2048
