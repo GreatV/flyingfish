@@ -104,7 +104,7 @@ impl Setup {
         directory: &Path,
         runtime: &Path,
         write: bool,
-        (request, decode_rows): (crate::prefill::WorkspaceRequest, usize),
+        (request, decode_rows, context_row_bytes): (crate::prefill::WorkspaceRequest, usize, usize),
     ) -> Result<Self> {
         use crate::experts::plan::PlanInputs;
         use crate::prefill::{ExpertWorkspaceBudget, ExpertWorkspaceRequest};
@@ -209,7 +209,16 @@ impl Setup {
                         fixed_transient_bytes: request
                             .fixed_transient_bytes
                             .checked_add(fixed)
+                            .and_then(|bytes| {
+                                context_row_bytes
+                                    .checked_mul(span)
+                                    .and_then(|context| bytes.checked_add(context))
+                            })
                             .context("expert mixer fixed reserve overflow")?,
+                        row_bytes: request
+                            .row_bytes
+                            .checked_sub(context_row_bytes)
+                            .context("draft context row reserve exceeds combined row bytes")?,
                         ..request
                     },
                     span_rows,
@@ -297,7 +306,9 @@ impl Setup {
                 "vision_reserved_bytes":vision,"budget_bytes_per_token":admission.budget_bytes_per_token,
                 "cpu_rows_measured":cpu.3,"cpu_rows_limit":cpu.2,
                 "cpu_arithmetic_rows":super::super::moe::prefill::LANE16_ROWS,
-                "decode_rows":decode_rows,"decode_extra_device_bytes":decode_extra
+                "decode_rows":decode_rows,"decode_extra_device_bytes":decode_extra,
+                "context_span_rows":capacity.span_rows,"context_span_row_bytes":context_row_bytes,
+                "context_span_bytes":context_row_bytes.checked_mul(capacity.span_rows as usize).context("draft context span bytes overflow")?
             }})
         );
         Ok(Self {

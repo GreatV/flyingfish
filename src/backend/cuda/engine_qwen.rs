@@ -1273,7 +1273,13 @@ impl Engine {
                 dir,
                 &runtime,
                 write,
-                (request, if draft.is_some() { verify_rows } else { 1 }),
+                (
+                    request,
+                    if draft.is_some() { verify_rows } else { 1 },
+                    capture_row_bytes
+                        .checked_add(draft_row_bytes)
+                        .context("draft context row bytes overflow")?,
+                ),
             )?)
         } else {
             None
@@ -1315,12 +1321,22 @@ impl Engine {
         let rows = expert_setup
             .as_ref()
             .map_or(chunk, |setup| setup.workspace.workspace_rows);
+        let context_rows = if draft.is_some() {
+            expert_setup
+                .as_ref()
+                .context("draft context requires expert span setup")?
+                .workspace
+                .candidate
+                .span_rows as usize
+        } else {
+            rows
+        };
         ensure!(
             !(reserve_mtp || draft.is_some()) || rows >= verify_rows,
             "speculative chunk {rows} cannot fit {verify_rows} verification rows"
         );
         if let Some(draft) = &mut draft {
-            draft.grow(rows)?;
+            draft.grow(context_rows)?;
         }
         let target_workspace = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?
             .max(usize::try_from(
@@ -1353,7 +1369,8 @@ impl Engine {
                 "kv_format": settings.kv_format.tag(),
                 "kv_prefill_scratch_bytes": kv_scratch.as_ref().map_or(0,|(k,v)|(k.len()+v.len())*size_of::<bf16>()),
                 "capture_checkpoint_bytes": capture_checkpoint.as_ref().context("capture checkpoint missing")?.bytes(),
-                "target_hidden_capture_bytes": rows.checked_mul(capture_row_bytes).context("capture byte count overflow")?,
+                "target_hidden_capture_bytes": context_rows.checked_mul(capture_row_bytes).context("capture byte count overflow")?,
+                "draft_context_span_rows": context_rows,
                 "draft_workspace_row_bytes": draft_row_bytes,
                 "target_transaction_planned_bytes": target_transaction_bytes,
                 "target_all_row_head_bytes": target_head_bytes,
@@ -1378,7 +1395,7 @@ impl Engine {
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
         let hidden_capture = capture_layers
             .as_ref()
-            .map(|ids| HiddenCapture::new(ids, &config, rows, s))
+            .map(|ids| HiddenCapture::new(ids, &config, context_rows, s))
             .transpose()?;
         let mut engine = Self {
             #[cfg(test)]
@@ -1475,7 +1492,7 @@ impl Engine {
             let profile = super::super::closure::Profile::draft(
                 &spec.draft.config,
                 capacity,
-                rows,
+                context_rows,
                 dir,
                 settings
                     .draft_model
