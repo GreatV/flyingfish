@@ -8,14 +8,6 @@
 #include <stdint.h>
 #include "q38_contract.cuh"
 
-__device__ __forceinline__ float e4m3_decode(uint8_t code) {
-    const uint32_t sign = uint32_t(code & 0x80) << 24;
-    const uint32_t mag = code & 0x7f;
-    if (mag == 0x7f) return __uint_as_float(sign | 0x7fc00000u);
-    const uint32_t e = mag >> 3, m = mag & 7;
-    if (e == 0) return __uint_as_float(__float_as_uint(float(m) * (1.0f/512.0f)) | sign);
-    return __uint_as_float(sign | ((e + 120) << 23) | (m << 20));
-}
 __device__ __forceinline__ bool aligned16(const void* p) {
     return p && (reinterpret_cast<uintptr_t>(p) & 15) == 0;
 }
@@ -262,15 +254,14 @@ FP8_SKINNY_ENTRY(5)
 
 // scale and normalized quotient round to BF16 before E4M3 conversion.
 extern "C" __global__ void e4m3_fake_quant_bf16(
-        __nv_bfloat16* x, uint8_t* codes, __nv_bfloat16* scales,
+        __nv_bfloat16* x,
         int rows, int cols, const Q38SequenceMeta* meta,
         uint32_t row_base, uint32_t row_capacity) {
     if (rows <= 0 || cols <= 0 || blockDim.x != 256 || blockDim.y != 1 ||
         blockDim.z != 1 || !row_capacity ||
         uint64_t(row_base) + row_capacity > uint64_t(rows) ||
         gridDim.x != row_capacity || gridDim.y != 1 ||
-        gridDim.z != 1 || !aligned16(x) || (codes && !aligned16(codes)) ||
-        (scales && !aligned16(scales))) { __trap(); return; }
+        gridDim.z != 1 || !aligned16(x)) { __trap(); return; }
     const uint64_t row = uint64_t(row_base) + blockIdx.x;
     if (meta) {
         q38_meta_guard(meta);
@@ -295,7 +286,6 @@ extern "C" __global__ void e4m3_fake_quant_bf16(
         for (int warp = 0; warp < 8; ++warp) amax = fmaxf(amax, maxima[warp]);
         scale = __bfloat162float(__float2bfloat16_rn(amax / 448.0f));
         if (scale == 0.0f) scale = 0.0078125f;
-        if (scales) scales[row] = __float2bfloat16_rn(scale);
     }
     __syncthreads();
     for (uint64_t col = threadIdx.x; col < uint64_t(cols); col += 256) {
@@ -303,7 +293,6 @@ extern "C" __global__ void e4m3_fake_quant_bf16(
         const float normalized = __bfloat162float(__float2bfloat16_rn(value / scale));
         const uint8_t code = __nv_cvt_float_to_fp8(
             fminf(448.0f, fmaxf(-448.0f, normalized)), __NV_SATFINITE, __NV_E4M3);
-        if (codes) codes[base + col] = code;
         x[base + col] = __float2bfloat16_rn(e4m3_decode(code) * scale);
     }
 }

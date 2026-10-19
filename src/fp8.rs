@@ -230,8 +230,7 @@ mod tests {
         Ok(())
     }
 
-    /// The anchor: effective_weight over the layer-0 expert-0 native FP8
-    /// bytes equals agy's torch-dequantized BF16 dump bitwise.
+    /// Effective weights equal the published layer-0 expert-0 BF16 reference bitwise.
     #[ignore = "CPU-only external fixture; set FF_MINICPM_REFERENCE_DIR"]
     #[test]
     fn effective_weight_matches_real_expert_bitwise() -> anyhow::Result<()> {

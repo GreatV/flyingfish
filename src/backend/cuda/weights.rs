@@ -580,6 +580,7 @@ pub(crate) enum StoredTensor {
     Fp8(CudaSlice<u8>),
 }
 pub(crate) struct WeightCatalog {
+    pub linear_format: crate::model_spec::LinearFormat,
     pub tensors: BTreeMap<String, StoredTensor>,
     pub manifest: TensorManifest,
     pub bytes: usize,
@@ -676,6 +677,7 @@ impl WeightCatalog {
             manifest.resident_bytes
         );
         Ok(Self {
+            linear_format: spec.linear_format,
             tensors,
             manifest,
             bytes,

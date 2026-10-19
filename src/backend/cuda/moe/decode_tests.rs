@@ -1,12 +1,16 @@
 //! GPU correctness, control and trap gates for the decode contribute and
 //! combine ops.
 use super::combine::{CombineOps, MoeCombine};
-use super::decode::{DecodeOps, MoeDecode, MoeDecodeW8a16, decode_scratch_bytes, slot_bytes_w8a16};
+use super::decode::{DecodeOps, MoeDecode, decode_scratch_bytes};
 use super::reference::{self, Combine, MoeDims};
 use super::testing;
 use crate::backend::cuda::Device;
 use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut};
-use anyhow::Result;
+use crate::{
+    experts::catalogue::{ExpertGeometry, ExpertLayout},
+    model_spec::ExpertFormat,
+};
+use anyhow::{Result, ensure};
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DriverError};
 use half::bf16;
@@ -18,12 +22,6 @@ fn decode_scratch_bytes_sizes_h_shared_and_scale() {
     assert_eq!(decode_scratch_bytes(1, 8, 512), 9 * 512 * 2 + 2);
     assert_eq!(decode_scratch_bytes(8, 8, 512), 8 * 9 * 512 * 2 + 8 * 2);
     assert_eq!(decode_scratch_bytes(3, 4, 64), 3 * 5 * 64 * 2 + 3 * 2);
-}
-
-#[test]
-fn w8a16_slot_bytes_matches_checkpoint_layout() {
-    assert_eq!(slot_bytes_w8a16(2048, 512), 3_151_872);
-    assert_eq!(slot_bytes_w8a16(128, 64), 3 * 64 * 128 + (2 * 64 + 128) * 2);
 }
 
 fn pow2i(e: i32) -> f32 {
@@ -107,9 +105,19 @@ struct W8a16World {
     slot_bytes: u64,
 }
 
-fn w8a16_world(fx: &reference::MoeFixture) -> W8a16World {
+fn w8a16_world(fx: &reference::MoeFixture) -> Result<W8a16World> {
     let (e, h, i) = (fx.dims.experts, fx.dims.hidden, fx.dims.inter);
-    let slot_bytes = slot_bytes_w8a16(h as u32, i as u32);
+    let layout = ExpertLayout::new(
+        ExpertFormat::Fp8W8a16,
+        &ExpertGeometry {
+            layers: 1,
+            experts: e as u32,
+            hidden: h as u32,
+            intermediate: i as u32,
+            top_k: fx.dims.top_k as u32,
+        },
+    )?;
+    let slot_bytes = layout.slot_bytes();
     let weight = i * h;
     let mut slots = vec![0u8; e * slot_bytes as usize];
     let mut effective_gate_up = vec![bf16::from_f32(0.0); e * 2 * i * h];
@@ -153,12 +161,12 @@ fn w8a16_world(fx: &reference::MoeFixture) -> W8a16World {
         !slots.iter().any(|&b| (b & 0x7f) == 0x7f),
         "fixture quantization produced the reserved e4m3 code"
     );
-    W8a16World {
+    Ok(W8a16World {
         slots,
         effective_gate_up,
         effective_down,
         slot_bytes,
-    }
+    })
 }
 
 fn u16_words(bytes: &[u8]) -> Vec<u16> {
@@ -295,7 +303,8 @@ impl Gate<'_> {
         let mut io = decode_io(self.s, rows, self.top_k, self.hidden)?;
         {
             let input = self.input(rows, rt, io.contributions, &mut io.shared_out, &mut io.done)?;
-            self.ops.decode(self.s, &input, &mut io.y, &self.scratch)?;
+            self.ops
+                .decode(self.s, &input, &mut io.y, &self.scratch, None)?;
         }
         self.s.synchronize()?;
         Ok(self.s.clone_dtoh(&io.y_dev)?)
@@ -810,36 +819,46 @@ impl W8Gate<'_> {
         contributions: Tensor<bf16, 3>,
         shared_out: &'a mut TensorMut<bf16, 2>,
         done: &'a mut TensorMut<u32, 2>,
-    ) -> Result<MoeDecodeW8a16<'a>> {
-        Ok(MoeDecodeW8a16 {
-            slot_bytes: self.slot_bytes,
-            routed: MoeDecode {
-                x: self.x.prefix_rows(rows)?,
-                ids: rt.ids.prefix_rows(rows)?,
-                active: rt.active.prefix_rows(rows)?,
-                weights: rt.weights.prefix_rows(rows)?,
-                slots_gate_up: rt.gu,
-                slots_down: rt.dn,
-                slot_valid: self.valid,
-                slot_generation: rt.slot_gen,
-                assignment_gen: rt.agen.prefix_rows(rows)?,
-                shared_gate: self.shared_gate,
-                shared_up: self.shared_up,
-                shared_down: self.shared_down,
-                shared_expert_gate: self.seg,
-                contributions,
-                shared_out,
-                done,
-            },
+    ) -> Result<MoeDecode<'a>> {
+        Ok(MoeDecode {
+            x: self.x.prefix_rows(rows)?,
+            ids: rt.ids.prefix_rows(rows)?,
+            active: rt.active.prefix_rows(rows)?,
+            weights: rt.weights.prefix_rows(rows)?,
+            slots_gate_up: rt.gu,
+            slots_down: rt.dn,
+            slot_valid: self.valid,
+            slot_generation: rt.slot_gen,
+            assignment_gen: rt.agen.prefix_rows(rows)?,
+            shared_gate: self.shared_gate,
+            shared_up: self.shared_up,
+            shared_down: self.shared_down,
+            shared_expert_gate: self.seg,
+            contributions,
+            shared_out,
+            done,
         })
     }
 
-    /// contribute_w8a16 + shared_scale + combine through DecodeOps::decode_w8a16.
+    /// The native slot layout selects the routed weight loads.
     fn run(&self, rows: u32, rt: &Routing, scratch: &Scratch) -> Result<Vec<bf16>> {
         let mut io = decode_io(self.s, rows, self.top_k, self.hidden)?;
         {
             let input = self.input(rows, rt, io.contributions, &mut io.shared_out, &mut io.done)?;
-            self.ops.decode_w8a16(self.s, &input, &mut io.y, scratch)?;
+            let geometry = ExpertGeometry {
+                layers: 1,
+                experts: self.valid.shape[0],
+                hidden: self.hidden,
+                intermediate: self.shared_gate.shape[0],
+                top_k: self.top_k,
+            };
+            let layout = ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry)?;
+            ensure!(
+                layout.slot_bytes() == self.slot_bytes,
+                "W8A16 gate slot bytes"
+            );
+            self.ops
+                .decode(self.s, &input, &mut io.y, scratch, layout.fp8_slot())?;
         }
         self.s.synchronize()?;
         Ok(self.s.clone_dtoh(&io.y_dev)?)
@@ -864,7 +883,7 @@ fn decode_expert_ffn_w8a16_gpu() -> Result<()> {
         fx.dims.inter,
     );
     let (eu, ku, hu, iu) = (e as u32, k as u32, h as u32, i as u32);
-    let world = w8a16_world(&fx);
+    let world = w8a16_world(&fx)?;
 
     // Oracle fixture: routing inputs unchanged, routed experts replaced by
     // the materialized effective weights.
@@ -972,7 +991,17 @@ fn decode_expert_ffn_w8a16_gpu() -> Result<()> {
                 &mut io_w8.shared_out,
                 &mut io_w8.done,
             )?;
-            ops.contribute_w8a16(s, &input, &scratch)?;
+            let layout = ExpertLayout::new(
+                ExpertFormat::Fp8W8a16,
+                &ExpertGeometry {
+                    layers: 1,
+                    experts: eu,
+                    hidden: hu,
+                    intermediate: iu,
+                    top_k: ku,
+                },
+            )?;
+            ops.contribute_w8a16(s, &input, layout.fp8_slot().unwrap(), &scratch)?;
         }
         s.synchronize()?;
         let scratch_w8 = s.clone_dtoh(&scratch_mem)?;

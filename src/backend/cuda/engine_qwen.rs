@@ -1448,8 +1448,6 @@ impl Engine {
                     self.blas.fp8_ops()?.fake_quant(
                         s,
                         &mut TensorMut(matrix(&w.n, s, 0, linear_rows, hidden)?),
-                        None,
-                        None,
                         Some(domain),
                     )?;
                 }
@@ -1576,8 +1574,6 @@ impl Engine {
                     self.blas.fp8_ops()?.fake_quant(
                         s,
                         &mut TensorMut(matrix(&w.attn, s, 0, linear_rows, q_width as usize)?),
-                        None,
-                        None,
                         Some(domain),
                     )?;
                 }

@@ -3296,6 +3296,7 @@ mod tests {
                 bytes += size;
             }
             let mut catalog = WeightCatalog {
+                linear_format: crate::model_spec::LinearFormat::Bf16,
                 tensors,
                 manifest: TensorManifest {
                     entries,

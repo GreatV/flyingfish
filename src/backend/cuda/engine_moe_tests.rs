@@ -515,6 +515,7 @@ impl Engine {
         }
         let bytes = manifest.resident_bytes;
         let catalog = WeightCatalog {
+            linear_format: model_spec.linear_format,
             tensors,
             manifest,
             bytes,
@@ -1400,6 +1401,7 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
         },
         &mut TensorMut(qwen::matrix(&y, stream, 0, rows, h)?),
         &qwen::scratch(&scratch, stream),
+        None,
     )?;
     stream.synchronize()?;
     let mut trace = Trace::default();

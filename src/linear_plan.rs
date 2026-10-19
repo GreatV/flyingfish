@@ -117,14 +117,7 @@ impl LayerDequantPlan {
         let plan_shape = match format {
             LinearFormat::Fp8E4m3Block128 => !slots.is_empty(),
             LinearFormat::Bf16 => slots.is_empty(),
-            LinearFormat::Fp8E4m3Channel => {
-                !slots.is_empty()
-                    || !manifest.entries.keys().any(|name| {
-                        name.starts_with(&prefix)
-                            && name.contains(".self_attn.")
-                            && name.ends_with("_proj.weight")
-                    })
-            }
+            LinearFormat::Fp8E4m3Channel => true,
         };
         ensure!(
             plan_shape,
@@ -176,6 +169,17 @@ mod tests {
         assert_eq!(plan.bytes, 0);
         assert!(plan.slots.is_empty());
         assert!(LayerDequantPlan::from_manifest(&manifest, 1, LinearFormat::Bf16).is_err());
+        let original = manifest.entries.keys().next().unwrap().clone();
+        let mut ignored = manifest.entries.remove(&original).unwrap();
+        let role = ignored.role.clone();
+        ignored.role = "self_attn.q_proj.weight".into();
+        let name = "model.language_model.layers.0.self_attn.q_proj.weight".to_owned();
+        manifest.entries.insert(name.clone(), ignored);
+        let plan = LayerDequantPlan::from_manifest(&manifest, 0, LinearFormat::Fp8E4m3Channel)?;
+        assert_eq!(plan.bytes, 0);
+        let mut ignored = manifest.entries.remove(&name).unwrap();
+        ignored.role = role;
+        manifest.entries.insert(original, ignored);
         let name = manifest.entries.keys().next().unwrap().clone();
         for format in [LinearFormat::Fp8E4m3Block128, LinearFormat::Fp8E4m3Channel] {
             let layout = format.fp8_layout().unwrap();

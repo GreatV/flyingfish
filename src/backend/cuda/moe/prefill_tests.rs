@@ -158,8 +158,12 @@ fn fp8_prefill_gpu() -> Result<()> {
         );
         for e in 0..experts {
             let base = e * native_layout.slot_bytes() as usize;
-            native[base + code_range.start as usize..base + code_range.end as usize]
-                .copy_from_slice(code.data());
+            for row in 0..n {
+                for col in 0..k {
+                    native[base + code_range.start as usize + row * k + col] =
+                        code.data()[row * k + (col + e * 37) % k];
+                }
+            }
             for (row, value) in scale.data().as_chunks::<2>().0.iter().enumerate() {
                 let scale = bf16::from_f32(
                     bf16::from_le_bytes(*value).to_f32() * (1.0 + ((e * 3) % 7) as f32 / 16.0),
@@ -222,7 +226,10 @@ fn fp8_prefill_gpu() -> Result<()> {
         seg: s.clone_htod(&fx.shared_expert_gate)?,
     };
     let mut defects = 0;
-    for rows in [1usize, 37] {
+    for (rows, lane16) in [(1usize, false), (17, true), (37, false)] {
+        let cpu_arithmetic = (0..experts)
+            .map(|e| lane16 && e % 3 == 1)
+            .collect::<Vec<_>>();
         let layout = prefill_layout(rows, top_k, experts, hidden, inter, Some(slot))?;
         let scratch_bytes = prefill_scratch_bytes(rows, top_k, experts, hidden, inter, Some(slot))?;
         let scratch_buf = s.alloc_zeros::<u8>(scratch_bytes as usize)?;
@@ -244,11 +251,10 @@ fn fp8_prefill_gpu() -> Result<()> {
             contributions: s.alloc_zeros(rows * top_k * hidden)?,
             done: s.alloc_zeros(rows * top_k)?,
         };
-        ops.prefill_contribute(
-            s,
-            contribute_input(s, &fx, rows, &bufs, &bf16_slots, &shared, &reference)?,
-            &scratch,
-        )?;
+        let mut reference_input =
+            contribute_input(s, &fx, rows, &bufs, &bf16_slots, &shared, &reference)?;
+        reference_input.cpu_arithmetic = &cpu_arithmetic;
+        ops.prefill_contribute(s, reference_input, &scratch)?;
         let expected = s.clone_dtoh(&reference.contributions)?;
         let candidate = CohortBufs {
             contributions: s.alloc_zeros(rows * top_k * hidden)?,
@@ -256,6 +262,7 @@ fn fp8_prefill_gpu() -> Result<()> {
         };
         let mut input = contribute_input(s, &fx, rows, &bufs, &fp8_slots, &shared, &candidate)?;
         input.fp8_slot = Some(slot);
+        input.cpu_arithmetic = &cpu_arithmetic;
         d.finish_upload()?;
         ops.prefill_contribute(s, input, &scratch)?;
         let actual = s.clone_dtoh(&candidate.contributions)?;
@@ -273,7 +280,7 @@ fn fp8_prefill_gpu() -> Result<()> {
             counts[e as usize] += 1;
         }
         let mut order = Vec::new();
-        problem_order(&counts, &[false; MAX_EXPERTS][..experts], &mut order);
+        problem_order(&counts, &cpu_arithmetic, &mut order);
         let wave_bytes = order.len() as u64 * layout.wave_slot_bytes;
         let got_wave = s.clone_dtoh(
             &scratch_buf.slice(layout.wave as usize..(layout.wave + wave_bytes) as usize),
@@ -303,7 +310,7 @@ fn fp8_prefill_gpu() -> Result<()> {
             .count();
         let bad = output_bad + wave_bad + done_bad;
         println!(
-            "FP8_PREFILL rows={rows} expert_subset={experts} top_k={top_k} native_gate=[{inter},{hidden}] native_up=[{inter},{hidden}] native_down=[{hidden},{inter}] wave_gate_up=[{},{}] wave_down=[{hidden},{inter}] active_experts={} native_slot_bytes={} bf16_wave_slot_bytes={} wave_byte_mismatches={wave_bad} contribution_bit_mismatches={output_bad} done_mismatches={done_bad} {}",
+            "FP8_PREFILL rows={rows} cpu_arithmetic={lane16} expert_subset={experts} top_k={top_k} native_gate=[{inter},{hidden}] native_up=[{inter},{hidden}] native_down=[{hidden},{inter}] wave_gate_up=[{},{}] wave_down=[{hidden},{inter}] active_experts={} native_slot_bytes={} bf16_wave_slot_bytes={} wave_byte_mismatches={wave_bad} contribution_bit_mismatches={output_bad} done_mismatches={done_bad} {}",
             2 * inter,
             hidden,
             order.len(),
@@ -312,17 +319,17 @@ fn fp8_prefill_gpu() -> Result<()> {
             if bad == 0 { "PASS" } else { "DEFECT" }
         );
         defects += usize::from(bad != 0);
-        if rows == 37 {
+        if lane16 {
             let mut swapped = native.clone();
-            for e in 0..experts {
-                let base = e * native_layout.slot_bytes() as usize;
-                for i in 0..(slot.gate.end - slot.gate.start) as usize {
-                    swapped.swap(
-                        base + slot.gate.start as usize + i,
-                        base + slot.down.start as usize + i,
-                    );
+            for range in [&slot.gate, &slot.up, &slot.down] {
+                for i in range.clone() {
+                    swapped.swap(i as usize, native_layout.slot_bytes() as usize + i as usize);
                 }
             }
+            ensure!(
+                swapped != native,
+                "distinct expert-code fixture control is not discriminating"
+            );
             let swapped_buf = s.clone_htod(&swapped)?;
             let base = swapped_buf.device_ptr(s).0;
             let addresses = (0..experts)
@@ -342,6 +349,7 @@ fn fp8_prefill_gpu() -> Result<()> {
             let mut input =
                 contribute_input(s, &fx, rows, &bufs, &swapped_slots, &shared, &mutant)?;
             input.fp8_slot = Some(slot);
+            input.cpu_arithmetic = &cpu_arithmetic;
             ops.prefill_contribute(s, input, &scratch)?;
             let changed = s
                 .clone_dtoh(&mutant.contributions)?
@@ -349,13 +357,13 @@ fn fp8_prefill_gpu() -> Result<()> {
                 .zip(&expected)
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
-            ensure!(changed > 0, "FP8 slot-slice swap control undetected");
+            ensure!(changed > 0, "FP8 expert-code swap control undetected");
             println!(
-                "PASS FP8_PREFILL_SLOT_SWAP rows={rows} contribution_bit_mismatches={changed}"
+                "PASS FP8_PREFILL_CODE_SWAP rows={rows} cpu_arithmetic={lane16} contribution_bit_mismatches={changed}"
             );
         }
     }
-    println!("FP8_PREFILL_SUMMARY cases=2 defects={defects}");
+    println!("FP8_PREFILL_SUMMARY cases=3 defects={defects}");
     ensure!(defects == 0, "FP8 prefill DEFECT cases={defects}");
     Ok(())
 }

@@ -42,23 +42,6 @@ pub(crate) struct MoeDecode<'a> {
     pub done: &'a mut TensorMut<u32, 2>,
 }
 
-/// W8A16 decode input: the MoeDecode fields with slots_gate_up and
-/// slots_down carrying expert slot BASE pointers, one per expert, each
-/// covering the whole 6-slice slot (3*I*H code bytes then (2*I + H)*2 BF16
-/// scale bytes); the shared expert tensors stay BF16.
-#[cfg(test)]
-pub(crate) struct MoeDecodeW8a16<'a> {
-    pub routed: MoeDecode<'a>,
-    pub slot_bytes: u64,
-}
-
-/// One W8A16 expert slot: 3*I*H E4M3 code bytes plus (2*I + H) BF16 scale
-/// bytes; 3,151,872 at I=512, H=2048.
-#[cfg(test)]
-pub(crate) fn slot_bytes_w8a16(hidden: u32, inter: u32) -> u64 {
-    3 * u64::from(inter) * u64::from(hidden) + (2 * u64::from(inter) + u64::from(hidden)) * 2
-}
-
 /// h `[rows*top_k, inter]` bf16 + h_shared `[rows, inter]` bf16, then the
 /// `[rows]` bf16 scale of moe_shared_scale; inter % 8 == 0 keeps every region
 /// 16-byte aligned.
@@ -268,16 +251,26 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
 }
 
 #[cfg(test)]
-pub(super) fn validate_w8a16(input: &MoeDecodeW8a16<'_>, scratch: &Scratch) -> Result<DecodeDims> {
-    let dims = validate(&input.routed, scratch)?;
-    let expected = slot_bytes_w8a16(dims.hidden, dims.inter);
+pub(super) fn validate_w8a16(
+    input: &MoeDecode<'_>,
+    slot: &crate::experts::catalogue::Fp8Slot,
+    scratch: &Scratch,
+) -> Result<DecodeDims> {
+    use crate::{
+        experts::catalogue::{ExpertGeometry, ExpertLayout},
+        model_spec::ExpertFormat,
+    };
+    let dims = validate(input, scratch)?;
+    let geometry = ExpertGeometry {
+        layers: 1,
+        experts: dims.experts,
+        hidden: dims.hidden,
+        intermediate: dims.inter,
+        top_k: dims.top_k,
+    };
     ensure!(
-        input.slot_bytes == expected,
-        "w8a16 decode slot_bytes {} does not match the dims-derived {} (hidden {}, inter {})",
-        input.slot_bytes,
-        expected,
-        dims.hidden,
-        dims.inter
+        ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry)?.fp8_slot() == Some(slot),
+        "W8A16 decode slot differs from geometry"
     );
     Ok(dims)
 }
@@ -304,19 +297,31 @@ impl DecodeOps {
         input: &MoeDecode<'_>,
         scratch: &Scratch,
     ) -> Result<()> {
+        let dims = validate(input, scratch)?;
+        self.launch(stream, input, scratch, dims, (&self.gate_up, &self.down))
+    }
+
+    fn launch(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &MoeDecode<'_>,
+        scratch: &Scratch,
+        dims: DecodeDims,
+        functions: (&CudaFunction, &CudaFunction),
+    ) -> Result<()> {
         let DecodeDims {
             rows,
             experts,
             top_k,
             hidden,
             inter,
-        } = validate(input, scratch)?;
+        } = dims;
         let h_bytes = u64::from(rows) * u64::from(top_k) * u64::from(inter) * 2;
         let h_ptr = scratch.ptr;
         let hs_ptr = scratch.ptr + h_bytes;
         unsafe {
             stream
-                .launch_builder(&self.gate_up)
+                .launch_builder(functions.0)
                 .arg(&input.x.ptr)
                 .arg(&input.ids.ptr)
                 .arg(&input.active.ptr)
@@ -339,7 +344,7 @@ impl DecodeOps {
                     shared_mem_bytes: hidden * 2,
                 })?;
             stream
-                .launch_builder(&self.down)
+                .launch_builder(functions.1)
                 .arg(&h_ptr)
                 .arg(&hs_ptr)
                 .arg(&input.ids.ptr)
@@ -367,8 +372,7 @@ impl DecodeOps {
         Ok(())
     }
 
-    /// One full decode MoE row block: contribute, shared sigmoid scale and
-    /// the single deterministic combine, with final_active = active.
+    /// Native expert contributions and the shared expert use one deterministic combine.
     #[cfg(test)]
     pub fn decode(
         &self,
@@ -376,15 +380,18 @@ impl DecodeOps {
         input: &MoeDecode<'_>,
         y: &mut TensorMut<bf16, 2>,
         scratch: &Scratch,
+        layout: Option<&crate::experts::catalogue::Fp8Slot>,
     ) -> Result<()> {
-        self.contribute(stream, input, scratch)?;
+        if let Some(slot) = layout {
+            self.contribute_w8a16(stream, input, slot, scratch)?;
+        } else {
+            self.contribute(stream, input, scratch)?;
+        }
         let rows = input.x.shape[0];
         let top_k = input.ids.shape[1];
         let inter = input.shared_gate.shape[0];
         let scale_ptr = scratch.ptr + u64::from(rows) * u64::from(top_k + 1) * u64::from(inter) * 2;
-        // moe_combine documents the scale as [rows,1] x stride [1,0];
-        // contracts::Tensor::validate rejects zero strides, so this view of
-        // the same [rows] words carries [1,1].
+        // The contiguous shared scale has shape [rows,1] and strides [1,1].
         let mut scale = unsafe {
             TensorMut::<bf16, 2>::new(scale_ptr, [rows, 1], [1, 1], u64::from(rows) * 2)?
         };
@@ -404,116 +411,21 @@ impl DecodeOps {
         self.combine.combine(stream, &combine_input)
     }
 
-    /// W8A16 contribute: the same launch structure and guarantees as
-    /// [`DecodeOps::contribute`], with routed experts read from their slot
-    /// bases as E4M3 codes plus per-output-channel BF16 scales.
     #[cfg(test)]
     pub fn contribute_w8a16(
         &self,
         stream: &Arc<CudaStream>,
-        input: &MoeDecodeW8a16<'_>,
+        input: &MoeDecode<'_>,
+        slot: &crate::experts::catalogue::Fp8Slot,
         scratch: &Scratch,
     ) -> Result<()> {
-        let DecodeDims {
-            rows,
-            experts,
-            top_k,
-            hidden,
-            inter,
-        } = validate_w8a16(input, scratch)?;
-        let routed = &input.routed;
-        let h_bytes = u64::from(rows) * u64::from(top_k) * u64::from(inter) * 2;
-        let h_ptr = scratch.ptr;
-        let hs_ptr = scratch.ptr + h_bytes;
-        unsafe {
-            stream
-                .launch_builder(&self.gate_up_w8a16)
-                .arg(&routed.x.ptr)
-                .arg(&routed.ids.ptr)
-                .arg(&routed.active.ptr)
-                .arg(&routed.slots_gate_up.ptr)
-                .arg(&routed.slot_valid.ptr)
-                .arg(&routed.slot_generation.ptr)
-                .arg(&routed.assignment_gen.ptr)
-                .arg(&routed.shared_gate.ptr)
-                .arg(&routed.shared_up.ptr)
-                .arg(&h_ptr)
-                .arg(&hs_ptr)
-                .arg(&(rows as i32))
-                .arg(&(experts as i32))
-                .arg(&(top_k as i32))
-                .arg(&(hidden as i32))
-                .arg(&(inter as i32))
-                .launch(LaunchConfig {
-                    grid_dim: (inter.div_ceil(32), rows, top_k + 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: hidden * 2,
-                })?;
-            stream
-                .launch_builder(&self.down_w8a16)
-                .arg(&h_ptr)
-                .arg(&hs_ptr)
-                .arg(&routed.ids.ptr)
-                .arg(&routed.active.ptr)
-                .arg(&routed.weights.ptr)
-                .arg(&routed.slots_down.ptr)
-                .arg(&routed.slot_valid.ptr)
-                .arg(&routed.slot_generation.ptr)
-                .arg(&routed.assignment_gen.ptr)
-                .arg(&routed.shared_down.ptr)
-                .arg(&routed.contributions.ptr)
-                .arg(&routed.shared_out.read().ptr)
-                .arg(&routed.done.read().ptr)
-                .arg(&(rows as i32))
-                .arg(&(experts as i32))
-                .arg(&(top_k as i32))
-                .arg(&(hidden as i32))
-                .arg(&(inter as i32))
-                .launch(LaunchConfig {
-                    grid_dim: (hidden.div_ceil(16), rows, top_k + 1),
-                    block_dim: (128, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-        }
-        Ok(())
-    }
-
-    /// One full W8A16 decode MoE row block: contribute_w8a16, shared sigmoid
-    /// scale and the single deterministic combine, with final_active =
-    /// active.
-    #[cfg(test)]
-    pub fn decode_w8a16(
-        &self,
-        stream: &Arc<CudaStream>,
-        input: &MoeDecodeW8a16<'_>,
-        y: &mut TensorMut<bf16, 2>,
-        scratch: &Scratch,
-    ) -> Result<()> {
-        self.contribute_w8a16(stream, input, scratch)?;
-        let routed = &input.routed;
-        let rows = routed.x.shape[0];
-        let top_k = routed.ids.shape[1];
-        let inter = routed.shared_gate.shape[0];
-        let scale_ptr = scratch.ptr + u64::from(rows) * u64::from(top_k + 1) * u64::from(inter) * 2;
-        // moe_combine documents the scale as [rows,1] x stride [1,0];
-        // contracts::Tensor::validate rejects zero strides, so this view of
-        // the same [rows] words carries [1,1].
-        let mut scale = unsafe {
-            TensorMut::<bf16, 2>::new(scale_ptr, [rows, 1], [1, 1], u64::from(rows) * 2)?
-        };
-        self.combine
-            .shared_scale(stream, routed.x, routed.shared_expert_gate, &mut scale)?;
-        let combine_input = MoeCombine {
-            ids: routed.ids,
-            final_active: routed.active,
-            done: routed.done.read(),
-            contributions: routed.contributions,
-            shared_out: routed.shared_out.read(),
-            x: routed.x,
-            shared_expert_gate: routed.shared_expert_gate,
-            scale,
-            y: TensorMut(y.read()),
-        };
-        self.combine.combine(stream, &combine_input)
+        let dims = validate_w8a16(input, slot, scratch)?;
+        self.launch(
+            stream,
+            input,
+            scratch,
+            dims,
+            (&self.gate_up_w8a16, &self.down_w8a16),
+        )
     }
 }

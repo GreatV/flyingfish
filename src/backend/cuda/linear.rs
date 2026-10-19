@@ -59,8 +59,6 @@ impl Fp8Ops {
         &self,
         stream: &Arc<CudaStream>,
         x: &mut TensorMut<bf16, 2>,
-        codes: Option<&TensorMut<u8, 2>>,
-        scales: Option<&TensorMut<bf16, 1>>,
         rows: Option<RowDomain>,
     ) -> Result<()> {
         x.0.validate()?;
@@ -69,27 +67,6 @@ impl Fp8Ops {
                 && x.0.stride == [u64::from(x.0.shape[1]), 1],
             "invalid E4M3 activation layout"
         );
-        if let Some(out) = codes {
-            out.0.validate()?;
-            ensure!(
-                out.0.shape == x.0.shape && out.0.stride == x.0.stride,
-                "E4M3 code output mismatch"
-            );
-            disjoint(&x.0, &out.0)?;
-            if let Some(scale) = scales {
-                disjoint(&out.0, &scale.0)?;
-            }
-        }
-        if let Some(out) = scales {
-            out.0.validate()?;
-            ensure!(
-                out.0.shape == [x.0.shape[0]] && out.0.stride == [1],
-                "E4M3 scale output mismatch"
-            );
-            disjoint(&x.0, &out.0)?;
-        }
-        let codes_ptr = codes.map_or(0, |out| out.0.ptr);
-        let scales_ptr = scales.map_or(0, |out| out.0.ptr);
         if let Some(rows) = rows {
             rows.validate(x.0.shape[0])?;
         }
@@ -100,8 +77,6 @@ impl Fp8Ops {
             stream
                 .launch_builder(&self.fake_quant)
                 .arg(&x.0.ptr)
-                .arg(&codes_ptr)
-                .arg(&scales_ptr)
                 .arg(&(x.0.shape[0] as i32))
                 .arg(&(x.0.shape[1] as i32))
                 .arg(&meta)
@@ -147,7 +122,10 @@ impl Fp8Ops {
         let count = u64::from(codes.shape[0]) * u64::from(codes.shape[1]);
         unsafe {
             stream
-                .launch_builder(&self.dequant[layout as usize])
+                .launch_builder(match layout {
+                    Fp8ScaleLayout::Block128 => &self.dequant[0],
+                    Fp8ScaleLayout::PerChannel => &self.dequant[1],
+                })
                 .arg(&codes.ptr)
                 .arg(&scale.ptr)
                 .arg(&dst.0.ptr)
@@ -179,7 +157,12 @@ impl Fp8Ops {
         disjoint(&scale, &y.0)?;
         unsafe {
             stream
-                .launch_builder(&self.small[layout as usize][x.shape[0] as usize - 1])
+                .launch_builder(
+                    &match layout {
+                        Fp8ScaleLayout::Block128 => &self.small[0],
+                        Fp8ScaleLayout::PerChannel => &self.small[1],
+                    }[x.shape[0] as usize - 1],
+                )
                 .arg(&codes.ptr)
                 .arg(&scale.ptr)
                 .arg(&x.ptr)
@@ -253,15 +236,10 @@ impl WeightCatalog {
                     .scale_name
                     .as_ref()
                     .context("FP8 scale descriptor missing")?;
-                let layout = if scale_name.ends_with(".weight_scale_inv") {
-                    Fp8ScaleLayout::Block128
-                } else {
-                    ensure!(
-                        scale_name.ends_with(".weight_scale"),
-                        "invalid FP8 scale descriptor {scale_name}"
-                    );
-                    Fp8ScaleLayout::PerChannel
-                };
+                let layout = self
+                    .linear_format
+                    .fp8_layout()
+                    .context("FP8 tensor declared as BF16")?;
                 let scale = self.bf16(scale_name)?;
                 let sh = layout.scale_shape(shape[0], shape[1]).map(|v| v as u32);
                 let (wp, _rw) = w.device_ptr(stream);
@@ -530,13 +508,29 @@ mod tests {
         blas.enable_fp8(&device.ctx)?;
         let mut defects = 0;
         let mut cases = 0;
-        // Twice the sm89 BF16 rows1..5,8,32 shape/FP32-path floors.
-        for (op, n, k, input_name, limit) in [
-            ("q", 8192u32, 2048u32, "layer_03_mixer_in_norm", 0.0625f32),
-            ("k", 512, 2048, "layer_03_mixer_in_norm", 0.0625),
-            ("v", 512, 2048, "layer_03_mixer_in_norm", 0.03125),
-            ("o", 2048, 4096, "layer_03_o_proj_in", 0.0078125),
+        // Reference-only BF16 shape/FP32 floors on sm89, sm86 and cross-GPU; rows1..5,8,32.
+        for (op, n, k, input_name, floors) in [
+            (
+                "q",
+                8192u32,
+                2048u32,
+                "layer_03_mixer_in_norm",
+                [0.03125f32; 3],
+            ),
+            (
+                "k",
+                512,
+                2048,
+                "layer_03_mixer_in_norm",
+                [0.03125, 0.015625, 0.03125],
+            ),
+            ("v", 512, 2048, "layer_03_mixer_in_norm", [0.015625; 3]),
+            ("o", 2048, 4096, "layer_03_o_proj_in", [0.00390625; 3]),
         ] {
+            let two_arm = 2.0 * floors.into_iter().fold(0.0f32, f32::max);
+            let rounded = bf16::from_f32(two_arm);
+            let limit =
+                bf16::from_bits(rounded.to_bits() + u16::from(rounded.to_f32() < two_arm)).to_f32();
             let role = format!("self_attn.{op}_proj.weight");
             let name = format!("model.language_model.layers.3.{role}");
             let scale_name = format!("{name}_scale");
@@ -610,6 +604,7 @@ mod tests {
                 spec.linear_format,
             )?;
             let catalog = WeightCatalog {
+                linear_format: spec.linear_format,
                 tensors: [
                     (name.clone(), StoredTensor::Fp8(codes)),
                     (scale_name.clone(), StoredTensor::Bf16(scales)),
@@ -679,13 +674,8 @@ mod tests {
                     let y_view = view(&y, stream, [m, n], [u64::from(n), 1])?;
                     device.finish_upload()?;
                     let execute = || -> Result<()> {
-                        blas.fp8_ops()?.fake_quant(
-                            stream,
-                            &mut TensorMut(x_view),
-                            None,
-                            None,
-                            None,
-                        )?;
+                        blas.fp8_ops()?
+                            .fake_quant(stream, &mut TensorMut(x_view), None)?;
                         plan.run(
                             &blas,
                             &role,
@@ -824,7 +814,9 @@ mod tests {
                 0 => bf16::ZERO,
                 1 => bf16::NEG_ZERO,
                 2 => {
-                    if i % 2 == 0 {
+                    if i % 17 == 0 {
+                        bf16::from_f32(tiny.to_f32() / 262144.0)
+                    } else if i % 2 == 0 {
                         tiny
                     } else {
                         -tiny
@@ -834,13 +826,20 @@ mod tests {
                 _ => bf16::from_f32(((i * 37 % 101) as f32 - 50.0) / 32.0),
             })
             .collect::<Vec<_>>();
-        let (right, _, _) = fake_quant_reference(&values[2 * width..3 * width])?;
-        let wrong = bf16::from_f32(tiny.to_f32().max(bf16::EPSILON.to_f32()) / 448.0);
+        let (_, _, right) = fake_quant_reference(&values[2 * width..3 * width])?;
+        let mut wrong_input = values[2 * width..3 * width].to_vec();
+        wrong_input.push(bf16::EPSILON);
+        let (_, _, wrong) = fake_quant_reference(&wrong_input)?;
+        let changed = right
+            .iter()
+            .zip(&wrong)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
         ensure!(
-            right != wrong,
-            "max(amax,eps) control is not discriminating"
+            changed > 0,
+            "max(amax,eps) output control is not discriminating"
         );
-        println!("PASS E4M3_EPS_CONTROL right={right:?} max_amax_eps={wrong:?}");
+        println!("PASS E4M3_EPS_CONTROL fake_bit_mismatches={changed}");
         inputs.push(("zero_tiny_tail", 9, width, values));
         let device = Device::new(0)?;
         let stream = &device.stream;
@@ -848,88 +847,45 @@ mod tests {
         let mut defects = 0;
         let mut cases = 0;
         for (name, rows, width, values) in inputs {
-            let mut want_codes = Vec::new();
-            let mut want_scales = Vec::new();
-            let mut want_fake = Vec::new();
-            for x in values.chunks_exact(width) {
-                let (s, c, f) = fake_quant_reference(x)?;
-                want_scales.push(s);
-                want_codes.extend(c);
-                want_fake.extend(f);
+            let mut want = Vec::new();
+            for row in values.chunks_exact(width) {
+                want.extend(fake_quant_reference(row)?.2);
             }
-            let codes = stream.alloc_zeros::<u8>(values.len())?;
-            let scales = stream.alloc_zeros::<bf16>(rows)?;
-            let code_view = TensorMut(view(
-                &codes,
-                stream,
-                [rows as u32, width as u32],
-                [width as u64, 1],
-            )?);
-            let scale_view = TensorMut(view(&scales, stream, [rows as u32], [1])?);
             for graph in [false, true] {
-                for capture_outputs in [false, true] {
-                    let x = stream.clone_htod(&values)?;
-                    let x_view = view(&x, stream, [rows as u32, width as u32], [width as u64, 1])?;
-                    device.finish_upload()?;
-                    let execute = || {
-                        op.fake_quant(
-                            stream,
-                            &mut TensorMut(x_view),
-                            capture_outputs.then_some(&code_view),
-                            capture_outputs.then_some(&scale_view),
-                            None,
-                        )
-                    };
-                    if graph {
-                        stream.begin_capture(
-                            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                        )?;
-                        let run = execute();
-                        let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
-                        run?;
-                        captured?
-                            .context("empty activation quantization graph")?
-                            .launch()?;
-                    } else {
-                        execute()?;
-                    }
-                    stream.synchronize()?;
-                    let got = stream.clone_dtoh(&x)?;
-                    ensure!(
-                        got.iter().all(|v| v.is_finite()),
-                        "nonfinite fake-quant output"
-                    );
-                    let fake_bad = got
-                        .iter()
-                        .zip(&want_fake)
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count();
-                    let (code_bad, scale_bad) = if capture_outputs {
-                        (
-                            stream
-                                .clone_dtoh(&codes)?
-                                .iter()
-                                .zip(&want_codes)
-                                .filter(|(a, b)| a != b)
-                                .count(),
-                            stream
-                                .clone_dtoh(&scales)?
-                                .iter()
-                                .zip(&want_scales)
-                                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                                .count(),
-                        )
-                    } else {
-                        (0, 0)
-                    };
-                    let bad = fake_bad + code_bad + scale_bad;
-                    println!(
-                        "E4M3_QUANT source={name} stored_input=[{rows},{width}] graph={graph} capture_outputs={capture_outputs} scale_bad={scale_bad} code_bad={code_bad} fake_bad={fake_bad} {}",
-                        if bad == 0 { "PASS" } else { "DEFECT" }
-                    );
-                    defects += usize::from(bad != 0);
-                    cases += 1;
+                let x = stream.clone_htod(&values)?;
+                let x_view = view(&x, stream, [rows as u32, width as u32], [width as u64, 1])?;
+                device.finish_upload()?;
+                let execute = || op.fake_quant(stream, &mut TensorMut(x_view), None);
+                if graph {
+                    stream.begin_capture(
+                        sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                    )?;
+                    let run = execute();
+                    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                    run?;
+                    captured?
+                        .context("empty activation quantization graph")?
+                        .launch()?;
+                } else {
+                    execute()?;
                 }
+                stream.synchronize()?;
+                let got = stream.clone_dtoh(&x)?;
+                ensure!(
+                    got.iter().all(|v| v.is_finite()),
+                    "nonfinite fake-quant output"
+                );
+                let bad = got
+                    .iter()
+                    .zip(&want)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                println!(
+                    "E4M3_QUANT source={name} stored_input=[{rows},{width}] graph={graph} fake_bad={bad} {}",
+                    if bad == 0 { "PASS" } else { "DEFECT" }
+                );
+                defects += usize::from(bad != 0);
+                cases += 1;
             }
         }
         println!("E4M3_QUANT_SUMMARY cases={cases} defects={defects}");
@@ -954,7 +910,6 @@ mod tests {
         let stream = &device.stream;
         let op = Fp8Ops::new(&device.ctx)?;
         let (rows, width) = (32usize, 257usize);
-        let code_sentinel = 0xa5u8;
         let scale_sentinel = bf16::from_bits(0x7fc5);
         let mut defects = 0;
         let mut cases = 0;
@@ -975,8 +930,6 @@ mod tests {
             );
             for graph in [false, true] {
                 let mut x = stream.clone_htod(&values)?;
-                let mut codes = stream.clone_htod(&vec![code_sentinel; values.len()])?;
-                let mut scales = stream.clone_htod(&vec![scale_sentinel; rows])?;
                 let mut metadata = stream.clone_htod(&[3i32, 1, 4, 64, 1, 0, 0, 0])?;
                 let domain = RowDomain {
                     meta: SeqRef {
@@ -986,23 +939,8 @@ mod tests {
                     row_capacity,
                 };
                 let x_view = view(&x, stream, [rows as u32, width as u32], [width as u64, 1])?;
-                let code_view = TensorMut(view(
-                    &codes,
-                    stream,
-                    [rows as u32, width as u32],
-                    [width as u64, 1],
-                )?);
-                let scale_view = TensorMut(view(&scales, stream, [rows as u32], [1])?);
                 device.finish_upload()?;
-                let execute = || {
-                    op.fake_quant(
-                        stream,
-                        &mut TensorMut(x_view),
-                        Some(&code_view),
-                        Some(&scale_view),
-                        Some(domain),
-                    )
-                };
+                let execute = || op.fake_quant(stream, &mut TensorMut(x_view), Some(domain));
                 let captured = if graph {
                     stream.begin_capture(
                         sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
@@ -1016,8 +954,6 @@ mod tests {
                 };
                 for valid in [1i32, 17, 20, 5] {
                     stream.memcpy_htod(&values, &mut x)?;
-                    stream.memcpy_htod(&vec![code_sentinel; values.len()], &mut codes)?;
-                    stream.memcpy_htod(&vec![scale_sentinel; rows], &mut scales)?;
                     stream.memcpy_htod(&[3, valid, 3 + valid, 64, 1, 0, 0, 0], &mut metadata)?;
                     if let Some(captured) = &captured {
                         captured.launch()?;
@@ -1026,37 +962,24 @@ mod tests {
                     }
                     stream.synchronize()?;
                     let got = stream.clone_dtoh(&x)?;
-                    let got_codes = stream.clone_dtoh(&codes)?;
-                    let got_scales = stream.clone_dtoh(&scales)?;
                     let mut bad = 0;
-                    for (row, got_scale) in got_scales.iter().enumerate() {
+                    for row in 0..rows {
                         let range = row * width..(row + 1) * width;
                         let active = row >= row_base as usize
                             && row < (row_base + row_capacity) as usize
                             && row < valid as usize;
                         if active {
-                            let (s, c, f) = fake_quant_reference(&values[range.clone()])?;
+                            let (_, _, f) = fake_quant_reference(&values[range.clone()])?;
                             ensure!(
                                 got[range.clone()].iter().all(|v| v.is_finite()),
                                 "nonfinite active quantization output"
                             );
-                            bad += usize::from(got_scale.to_bits() != s.to_bits());
-                            bad += got_codes[range.clone()]
-                                .iter()
-                                .zip(&c)
-                                .filter(|(a, b)| a != b)
-                                .count();
                             bad += got[range]
                                 .iter()
                                 .zip(&f)
                                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                                 .count();
                         } else {
-                            bad += usize::from(got_scale.to_bits() != scale_sentinel.to_bits());
-                            bad += got_codes[range.clone()]
-                                .iter()
-                                .filter(|&&v| v != code_sentinel)
-                                .count();
                             bad += got[range.clone()]
                                 .iter()
                                 .zip(&values[range])
@@ -1202,6 +1125,7 @@ mod tests {
                 resident_bytes: bytes,
             };
             let catalog = WeightCatalog {
+                linear_format: crate::model_spec::LinearFormat::Bf16,
                 tensors: [(name.clone(), StoredTensor::Bf16(weight))].into(),
                 manifest,
                 bytes,
