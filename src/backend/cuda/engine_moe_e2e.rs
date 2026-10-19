@@ -1814,7 +1814,7 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
     drop(plain);
     settings.draft_model = Some(draft);
     Engine::calibrate(&target, 0, capacity, None, settings.clone())?;
-    let mut model = Engine::load(&target, 0, capacity, None, settings)?;
+    let mut model = Engine::load(&target, 0, capacity, None, settings.clone())?;
     model.set_spec_eos(&eos)?;
     let layout = model
         .moe_slots
@@ -1890,8 +1890,73 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
             if distinct { "PASS" } else { "DEFECT" }
         );
     }
+    model.synchronize()?;
+    drop(model);
+    let options = crate::spec::Options {
+        device: 0,
+        capacity,
+        chunk: None,
+        backend: settings,
+        count: rows + 1,
+        ignore_eos: false,
+    };
+    let mut public =
+        crate::model::Model::load(&target, 0, capacity, None, options.backend.clone())?;
+    let first = baseline[0][0];
+    let eos_index = baseline[0]
+        .iter()
+        .take(rows)
+        .position(|&token| token != first)
+        .context("Runner FAIL EOS fixture has no distinct decode token")?;
+    for graph in [false, true] {
+        public.set_spec_graph(graph)?;
+        public.config.eos_token_id = vec![baseline[0][eos_index]];
+        let output = crate::spec::produce_events(
+            &mut public,
+            &inputs[0].ids,
+            None,
+            &options,
+            None,
+            &mut |_| true,
+        )?;
+        let pass = output.ids == baseline[0][..=eos_index];
+        defects += usize::from(!pass);
+        println!(
+            "{} minicpm_chain_production_eos graph={graph} tokens={} expected_tokens={} ids={:?}",
+            if pass { "PASS" } else { "DEFECT" },
+            output.ids.len(),
+            eos_index + 1,
+            output.ids
+        );
+        ensure!(
+            public.rewind(public.position(), public.token()?).is_err(),
+            "Runner FAIL old scalar EOS rewind control did not reject recurrent state"
+        );
+        public.config.eos_token_id = eos.clone();
+        for index in [3, 4] {
+            let input = &inputs[index];
+            let output = crate::spec::produce_events(
+                &mut public,
+                &input.ids,
+                Some(&input.packed()),
+                &options,
+                None,
+                &mut |_| true,
+            )?;
+            let expected = &baseline[index][..options.count.min(baseline[index].len())];
+            let pass = output.ids == expected;
+            defects += usize::from(!pass);
+            println!(
+                "{} minicpm_chain_production_media case={} graph={graph} tokens={} token_equal={pass} decoded={:?}",
+                if pass { "PASS" } else { "DEFECT" },
+                cases[index],
+                output.ids.len(),
+                crate::tokenizer::decode(&target, &output.ids)?
+            );
+        }
+    }
     println!(
-        "{} minicpm_chain_decode_end cases=5 modes=2 horizon=256 natural_eos=true exact_tokens=true exact_boundaries=true defects={defects}",
+        "{} minicpm_chain_decode_end cases=5 modes=2 horizon=256 natural_eos=true exact_tokens=true exact_boundaries=true production_eos_and_media=true defects={defects}",
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(defects == 0, "DEFECT MiniCPM chain decode count={defects}");

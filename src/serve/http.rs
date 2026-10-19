@@ -630,10 +630,6 @@ async fn prepare_message_media(
                 }
                 Some("image_url") => {
                     anyhow::ensure!(!is_system, "system messages cannot contain images");
-                    anyhow::ensure!(
-                        state.backend.options().backend.draft_model.is_none(),
-                        "image input does not support a draft model"
-                    );
                     let processor = state
                         .image_processor
                         .as_ref()

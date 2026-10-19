@@ -332,10 +332,6 @@ fn generate(
         "--graph and --dump cannot be combined"
     );
     let ids = input.read(&cli.model)?;
-    ensure!(
-        image_tensors.is_none() || cli.draft_model.is_none(),
-        "image input does not support a draft model"
-    );
     let model_spec = match &image_tensors {
         Some(_) => Some(flyingfish::model_spec::ModelSpec::read(&cli.model)?),
         None => None,
@@ -378,6 +374,7 @@ fn generate(
             &cli.model,
             &draft,
             &ids,
+            images.as_ref().map(|images| images.input(&ids)).as_ref(),
             &flyingfish::spec::Options {
                 device: cli.device,
                 capacity: cli.capacity,

@@ -294,12 +294,6 @@ fn generate_once(
         let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
         return;
     }
-    if request.images.is_some() && run_options.backend.draft_model.is_some() {
-        let _ = events.blocking_send(EngineEvent::Failed(
-            "image input does not support a draft model".into(),
-        ));
-        return;
-    }
     let input_dump = match trace_image_input(model_spec, &request) {
         Ok(path) => path,
         Err(error) => {
@@ -351,18 +345,29 @@ fn generate_once(
                 decode_ms: output.decode_ms,
             })
     } else if run_options.backend.draft_model.is_some() {
-        spec::produce_events(model, &request.ids, &run_options, None, &mut |step| {
-            on_event(match step {
-                Step::First(token) => EngineEvent::Tokens {
-                    ids: vec![token],
-                    accepted: 0,
-                },
-                Step::Round(round) => EngineEvent::Tokens {
-                    ids: round.output.clone(),
-                    accepted: round.accepted,
-                },
-            })
-        })
+        spec::produce_events(
+            model,
+            &request.ids,
+            request
+                .images
+                .as_ref()
+                .map(|images| images.input(&request.ids))
+                .as_ref(),
+            &run_options,
+            None,
+            &mut |step| {
+                on_event(match step {
+                    Step::First(token) => EngineEvent::Tokens {
+                        ids: vec![token],
+                        accepted: 0,
+                    },
+                    Step::Round(round) => EngineEvent::Tokens {
+                        ids: round.output.clone(),
+                        accepted: round.accepted,
+                    },
+                })
+            },
+        )
     } else {
         produce_plain_events(
             model,
@@ -446,8 +451,8 @@ fn trace_image_input(
 
 fn check_request(ids: &[u32], options: &SpecOptions) -> Result<()> {
     ensure!(!ids.is_empty(), "prompt must not be empty");
-    if options.backend.draft_model.is_some() {
-        spec::check(ids, options)
+    if let Some(draft) = &options.backend.draft_model {
+        spec::check(ids, options, draft)
     } else {
         crate::model::check_generation_capacity(ids.len(), options.count, options.capacity)
     }
