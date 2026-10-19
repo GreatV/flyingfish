@@ -1141,7 +1141,7 @@ fn validate_dispatch(
     dispatch: &Dispatch<'_>,
 ) -> Result<()> {
     ensure!(
-        (1..=8).contains(&rows) && (1..=32).contains(&top_k),
+        (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows) && (1..=32).contains(&top_k),
         "MoE dispatch rows={rows} top_k={top_k} exceed decode bounds"
     );
     let count = rows * top_k;
@@ -1169,7 +1169,7 @@ fn validate_dispatch(
         dispatch.disk.is_empty() || dispatch.disk_cpu.is_some(),
         "disk CPU assignments have no bound worker service"
     );
-    let mut coverage = [0u8; 8 * 32];
+    let mut coverage = [0u8; crate::linear_plan::MAX_SKINNY_ROWS * 32];
     for assignment in dispatch.assignments {
         let choice = assignment.choice as usize;
         ensure!(

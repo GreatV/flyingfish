@@ -2375,6 +2375,38 @@ fn eager_moe_decode_gpu() -> Result<()> {
 
 #[test]
 fn dispatch_covers_original_choices_once_after_row_compaction() -> Result<()> {
+    for rows in [1, 8, 16] {
+        let choices = rows * 32;
+        let mut active = vec![1; choices];
+        active[choices - 1] = 0;
+        let generations = vec![7; choices];
+        let weights = vec![bf16::ONE; choices];
+        let host = Some(HostBlocks::new(1, 32)?);
+        let dispatch = Dispatch {
+            active: &active,
+            generation: &generations,
+            host,
+            experts: &[ExpertWeights {
+                gate_up: 0..16,
+                gate_up_stride: 4,
+                down: 16..32,
+                down_stride: 4,
+            }],
+            assignments: &[Assignment {
+                row: 0,
+                choice: (choices - 1) as u32,
+                expert: 0,
+                weight: bf16::ONE,
+            }],
+            miss_rows: &[(rows - 1) as u32],
+            host_dma: None,
+            disk: &[],
+            disk_cpu: None,
+            layer: 0,
+        };
+        validate_dispatch(rows, 32, &weights, &dispatch)?;
+        assert!(validate_dispatch(17, 32, &weights, &dispatch).is_err());
+    }
     let mut active = [1u32; 20];
     active[1] = 0;
     active[9] = 0;
