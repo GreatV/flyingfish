@@ -1747,8 +1747,11 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
         let source = SafeTensors::deserialize(&bytes)?;
         inputs.push(Input::read(&source, case)?);
     }
-    let rows = crate::dspark::DraftConfig::read(&draft, &crate::config::Config::read(&target)?)?
-        .verify_rows()?;
+    let rows = crate::dspark::DraftConfig::read(
+        &draft,
+        &crate::model_spec::ModelSpec::read(&target)?.config(),
+    )?
+    .verify_rows()?;
     let capacity = (inputs
         .iter()
         .map(|input| input.ids.len())
