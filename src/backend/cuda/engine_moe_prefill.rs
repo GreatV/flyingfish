@@ -2441,7 +2441,7 @@ mod tests {
                 + u64::from(capacity.prefill_staging_slots));
         let initial =
             vec![(0..geometry.experts).rev().collect::<Vec<_>>(); geometry.layers as usize];
-        let mut fixture = tier_fixture(3);
+        let mut fixture = tier_fixture(3, 8);
         fixture.router_w.fill(bf16::ZERO);
         let mut engines = (0..2)
             .map(|arm| {
@@ -2672,7 +2672,7 @@ mod tests {
     }
 
     fn inputs(variant: u32, rows: usize) -> MoeFixture {
-        let mut fixture = tier_fixture(variant);
+        let mut fixture = tier_fixture(variant, 8);
         let source = fixture.x.clone();
         let pattern = (0..rows).map(|row| {
             if row + 7 < rows {
@@ -3733,7 +3733,7 @@ mod tests {
             engine.workspace_rows
         );
         engine.reset()?;
-        let mut fixture = tier_fixture(3);
+        let mut fixture = tier_fixture(3, 8);
         let mut hidden = Vec::new();
         for (span_index, admitted) in ids.chunks(span_rows).enumerate() {
             let start = span_index * span_rows;
@@ -3839,7 +3839,7 @@ mod tests {
             std::env::var_os("FLYINGFISH_RUNTIME_DIR")
                 .context("prefill order gate runtime missing")?,
         );
-        let fixture = tier_fixture(3);
+        let fixture = tier_fixture(3, 8);
         let ids = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3];
         let mut oracle = Engine::load_moe_test(
             &fixture,

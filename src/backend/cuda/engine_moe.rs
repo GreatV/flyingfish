@@ -39,6 +39,27 @@ pub(super) struct Setup {
     admission: crate::experts::plan::Admission,
     measured: super::super::calibrate::ExpertCalibration,
     catalogue: Arc<crate::experts::catalogue::ExpertCatalogue>,
+    decode_rows: usize,
+}
+
+fn decode_device_bytes(geometry: ExpertGeometry, rows: usize) -> Result<usize> {
+    ensure!(
+        (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
+        "expert decode rows={rows} exceeds skinny bound={} geometry={geometry:?}",
+        crate::linear_plan::MAX_SKINNY_ROWS
+    );
+    let hidden = geometry.hidden as usize;
+    let k = geometry.top_k as usize;
+    let row = hidden
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(26))
+        .and_then(|n| n.checked_mul(k))
+        .and_then(|n| n.checked_add(hidden * 2 + 2))
+        .context("expert decode row byte count overflow")?;
+    let scratch = decode_scratch_bytes(rows, k, geometry.intermediate as usize);
+    rows.checked_mul(row)
+        .and_then(|n| n.checked_add(usize::try_from(scratch).ok()?))
+        .context("expert decode device reserve overflow")
 }
 
 fn host_workspace(
@@ -83,11 +104,14 @@ impl Setup {
         directory: &Path,
         runtime: &Path,
         write: bool,
-        request: crate::prefill::WorkspaceRequest,
+        (request, decode_rows): (crate::prefill::WorkspaceRequest, usize),
     ) -> Result<Self> {
         use crate::experts::plan::PlanInputs;
         use crate::prefill::{ExpertWorkspaceBudget, ExpertWorkspaceRequest};
         let geometry = ExpertGeometry::from_model(model)?;
+        let decode_extra = decode_device_bytes(geometry, decode_rows)?
+            .checked_sub(decode_device_bytes(geometry, 1)?)
+            .context("expert decode reserve underflow")?;
         let catalogue = Arc::new(crate::experts::catalogue::ExpertCatalogue::from_manifest(
             manifest,
             geometry,
@@ -131,6 +155,7 @@ impl Setup {
         if let Some(rows) = request.requested {
             spans.retain(|&span| span >= rows);
         }
+        spans.retain(|&span| span >= decode_rows);
         for span in spans {
             let span_rows = u32::try_from(span)?;
             let mut wave_rows = 1u32;
@@ -168,6 +193,7 @@ impl Setup {
                 })
                 .and_then(|n| n.checked_add(geometry.hidden as usize * 2 + 2))
                 .and_then(|n| n.checked_add(decode_scratch))
+                .and_then(|n| n.checked_add(decode_extra))
                 .and_then(|n| {
                     n.checked_add(super::super::moe::prefill::stage_device_bytes() as usize)
                 })
@@ -265,7 +291,8 @@ impl Setup {
                 "host_fixed_bytes":workspace.candidate.reserves.host_fixed_bytes,
                 "vision_reserved_bytes":vision,"budget_bytes_per_token":admission.budget_bytes_per_token,
                 "cpu_rows_measured":cpu.3,"cpu_rows_limit":cpu.2,
-                "cpu_arithmetic_rows":super::super::moe::prefill::LANE16_ROWS
+                "cpu_arithmetic_rows":super::super::moe::prefill::LANE16_ROWS,
+                "decode_rows":decode_rows,"decode_extra_device_bytes":decode_extra
             }})
         );
         Ok(Self {
@@ -274,6 +301,7 @@ impl Setup {
             admission,
             measured,
             catalogue,
+            decode_rows,
         })
     }
 
@@ -305,15 +333,18 @@ impl Setup {
                     .checkpoint_path(),
                 catalogue: self.catalogue,
                 engines: self.measured.copy_engines,
-                max_rows: u32::try_from(cpu.0.max(1))?,
+                max_rows: u32::try_from(cpu.0.max(self.decode_rows))?,
             },
         )?;
         engine.moe = Some(Decode::new(
             &engine.device,
             geometry,
-            1,
+            self.decode_rows,
             self.capacity.worker_count,
-            (cpu.0.max(1), cpu.1.max(geometry.top_k as usize)),
+            (
+                cpu.0.max(self.decode_rows),
+                cpu.1.max(self.decode_rows * geometry.top_k as usize),
+            ),
             engine
                 .model_spec
                 .expert_format
@@ -476,8 +507,9 @@ impl Decode {
         format: crate::model_spec::ExpertFormat,
     ) -> Result<Self> {
         ensure!(
-            (1..=8).contains(&max_rows),
-            "MoE decode row bound={max_rows} outside1..8"
+            (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&max_rows),
+            "MoE decode row bound={max_rows} exceeds skinny bound={}",
+            crate::linear_plan::MAX_SKINNY_ROWS
         );
         ensure!(
             geometry.top_k > 0 && geometry.top_k <= 32 && geometry.top_k <= geometry.experts,
@@ -501,7 +533,7 @@ impl Decode {
         let stream = &device.stream;
         let context = &device.ctx;
         let layout = crate::experts::catalogue::ExpertLayout::new(format, &geometry)?;
-        Ok(Self {
+        let decode = Self {
             geometry,
             fp8_slot: layout.fp8_slot().cloned(),
             max_rows,
@@ -549,7 +581,23 @@ impl Decode {
                 layout.fp8_slot().cloned(),
             )?,
             stats: [0; 5],
-        })
+        };
+        let allocated = (decode.ids.len()
+            + decode.active.len()
+            + decode.final_active.len()
+            + decode.done.len())
+            * size_of::<u32>()
+            + decode.weights.len() * size_of::<bf16>()
+            + decode.generation.len() * size_of::<u64>()
+            + (decode.contributions.len() + decode.shared.len() + decode.scale.len())
+                * size_of::<bf16>()
+            + decode.scratch.len();
+        let planned = decode_device_bytes(geometry, max_rows)?;
+        ensure!(
+            allocated == planned,
+            "MoE decode row buffers allocation={allocated} differs from planned={planned} rows={max_rows}"
+        );
+        Ok(decode)
     }
 
     pub fn route(&mut self, device: &Device, ffn: BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {

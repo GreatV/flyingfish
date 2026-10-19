@@ -1258,7 +1258,7 @@ impl Engine {
                 dir,
                 &runtime,
                 write,
-                request,
+                (request, if draft.is_some() { verify_rows } else { 1 }),
             )?)
         } else {
             None

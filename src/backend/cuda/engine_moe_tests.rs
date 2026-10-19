@@ -77,6 +77,29 @@ fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
         admitted.push(capacity.span_rows);
     }
     assert_eq!(admitted, [32, 32]);
+    let extra = |rows| -> Result<usize> {
+        Ok(decode_device_bytes(geometry, rows)? - decode_device_bytes(geometry, 1)?)
+    };
+    let total = 24usize << 30;
+    let mut request = crate::prefill::WorkspaceRequest {
+        capacity: 16,
+        requested: Some(16),
+        free_after_resident: total / 16 + 16 * 64 + extra(8)?,
+        total,
+        alignment: 1,
+        row_bytes: 64,
+        fixed_transient_bytes: extra(8)?,
+    };
+    assert!(crate::prefill::WorkspaceBudget::new(request, |_| Ok(0), Ok).is_ok());
+    request.fixed_transient_bytes = extra(16)?;
+    assert!(crate::prefill::WorkspaceBudget::new(request, |_| Ok(0), Ok).is_err());
+    assert!(decode_device_bytes(geometry, 17).is_err());
+    assert_eq!(extra(1)?, 0);
+    println!(
+        "PASS expert_decode_row_reserve rows=1,8,16 extra8={} extra16={} legacy8_control=admitted full16=rejected",
+        extra(8)?,
+        extra(16)?
+    );
     Ok(())
 }
 
@@ -575,7 +598,10 @@ impl Engine {
         let layout = crate::experts::catalogue::ExpertLayout::new(format, &geometry)?;
         let capacity = Capacity {
             layout: layout.clone(),
-            span_rows: 8,
+            span_rows: fixture
+                .dims
+                .rows
+                .clamp(8, crate::linear_plan::MAX_SKINNY_ROWS) as u32,
             wave_rows: 8,
             device_expert_bytes: layout.slot_bytes() * u64::from(count),
             host_expert_bytes: 0,
@@ -636,6 +662,7 @@ impl Engine {
         let manifest = hybrid_manifest(&model_spec)?;
         let geometry = ExpertGeometry::from_model(&model_spec)?;
         let service = tier_service(capacity.worker_count)?;
+        let decode_rows = fixture.dims.rows.min(crate::linear_plan::MAX_SKINNY_ROWS);
         let cpu_bounds = if capacity.prefill_staging_slots > 0 {
             let bound = residency::cpu_bound(
                 geometry,
@@ -644,9 +671,12 @@ impl Engine {
                 &service,
                 1_000_000_000.0,
             )?;
-            (bound.0.max(8), bound.1.max(8 * geometry.top_k as usize))
+            (
+                bound.0.max(decode_rows),
+                bound.1.max(decode_rows * geometry.top_k as usize),
+            )
         } else {
-            (8, 8 * geometry.top_k as usize)
+            (decode_rows, decode_rows * geometry.top_k as usize)
         };
         let device = Device::new(0)?;
         let stream = &device.stream;
@@ -779,7 +809,7 @@ impl Engine {
         let moe = Some(Decode::new(
             &device,
             geometry,
-            8,
+            decode_rows,
             capacity.worker_count,
             cpu_bounds,
             model_spec
@@ -1005,7 +1035,7 @@ fn graph_gate(format: crate::model_spec::ExpertFormat) -> Result<()> {
     let runtime = PathBuf::from(
         std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("graph gate runtime missing")?,
     );
-    let fixture = tier_fixture(3);
+    let fixture = tier_fixture(3, 8);
     let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
     let frequency = vec![vec![1.0; 16]; 2];
     let mut defects = 0;
@@ -1207,11 +1237,11 @@ fn step(rows: usize) -> crate::backend::Step<'static> {
     }
 }
 
-pub(super) fn tier_fixture(variant: u32) -> MoeFixture {
-    let mut values = fixture(MoeDims::new(8, 16, 4, 128, 64), variant);
+pub(super) fn tier_fixture(variant: u32, rows: usize) -> MoeFixture {
+    let mut values = fixture(MoeDims::new(rows, 16, 4, 128, 64), variant);
     values.router_w.fill(bf16::ZERO);
-    for row in 0..8 {
-        values.x[row * 128..row * 128 + 8].fill(bf16::ZERO);
+    for row in 0..rows {
+        values.x[row * 128..row * 128 + rows].fill(bf16::ZERO);
         values.x[row * 128 + row] = bf16::ONE;
         let experts = routed_experts(row);
         for expert in 0..16 {
@@ -1325,7 +1355,7 @@ impl TierOracle {
             admission: crate::experts::plan::Admission {
                 budget_bytes_per_token: 2 * capacity.slot_bytes(),
             },
-            max_rows: 8,
+            max_rows: fixture.dims.rows as u32,
             initial: &vec![vec![0, 1, 2, 3]; geometry.layers as usize],
             host: host.as_ref(),
             catalogue: &catalogue,
@@ -1457,7 +1487,7 @@ fn decode_residency_fixture_covers_tiers_requests_and_cap() -> Result<()> {
         "flyingfish-decode-residency-{}",
         std::process::id()
     ));
-    let fixture = tier_fixture(3);
+    let fixture = tier_fixture(3, 8);
     let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
     let mut oracle = TierOracle::new(
         &fixture,
@@ -1882,16 +1912,16 @@ fn tier_gate(
     let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
     let mut defects = 0;
     for &variant in variants {
-        let fixture = tier_fixture(variant);
+        let fixture = tier_fixture(variant, 16);
         let reference = Engine::load_moe_test(
             &fixture,
             &runtime.join(format!("reference-{variant}")),
-            8,
+            16,
             format,
         )?;
         let mut references = std::collections::BTreeMap::new();
         for layer in 0..2 {
-            for rows in [1, 2, 5, 8] {
+            for rows in [1, 2, 5, 8, 16] {
                 let input = &fixture.x[..rows * 128];
                 let trace = direct(&reference, layer, input, rows)?;
                 ensure!(
@@ -1903,7 +1933,8 @@ fn tier_gate(
         }
         for &(pinned, engines) in cases {
             let directory = runtime.join(format!("tier-{variant}-{pinned}-{engines}"));
-            let capacity = tier_capacity(geometry, pinned, format)?;
+            let mut capacity = tier_capacity(geometry, pinned, format)?;
+            capacity.span_rows = 16;
             let mut oracle = TierOracle::new(&fixture, &directory.join("oracle"), &capacity)?;
             let mut engine = Engine::load_moe_placed(
                 &fixture,
@@ -1914,7 +1945,7 @@ fn tier_gate(
                     budget_bytes_per_token: 2 * capacity.slot_bytes(),
                 },
                 engines,
-                8,
+                16,
             )?;
             engine
                 .moe_slots
@@ -1945,7 +1976,7 @@ fn tier_gate(
                     slots.begin_request(&frequency)?;
                 }
                 defects += oracle.compare_state(&engine)?;
-                for &rows in rows {
+                for rows in rows.iter().copied().chain([16]) {
                     oracle.policy.begin_token()?;
                     engine
                         .moe_slots
@@ -2010,7 +2041,7 @@ fn tier_gate(
     }
     ensure!(defects == 0, "DEFECT decode residency cells={defects}");
     println!(
-        "PASS decode_residency_gate variants={} cases={} format={format:?} host=true disk=true admissions=true writeback=true requests=3 graphs=false",
+        "PASS decode_residency_gate variants={} cases={} rows=1,2,5,8,16 format={format:?} host=true disk=true admissions=true writeback=true requests=3 graphs=false",
         variants.len(),
         cases.len()
     );
