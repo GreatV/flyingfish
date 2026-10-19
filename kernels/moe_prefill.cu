@@ -27,16 +27,15 @@ __device__ __forceinline__ void moe_lane16(
       reinterpret_cast<bf16*>(matrices[2 * problems + problem]) + (size_t)row * columns;
   float sum = 0.0f;
   for (int k = lane; k < inner; k += 16) {
-    bf16 value;
     if constexpr (FP8) {
       const unsigned char* codes = reinterpret_cast<const unsigned char*>(matrices[problem]);
       const bf16* scales = reinterpret_cast<const bf16*>(codes + scale_offset);
-      value = __float2bfloat16_rn(e4m3_decode(codes[(size_t)column * inner + k]) *
-                                __bfloat162float(scales[column]));
+      const bf16 value = __float2bfloat16_rn(
+          e4m3_decode(codes[(size_t)column * inner + k]) * __bfloat162float(scales[column]));
+      sum = __fmaf_rn(__bfloat162float(x[k]), __bfloat162float(value), sum);
     } else {
-      value = weight[k];
+      sum = __fmaf_rn(__bfloat162float(x[k]), __bfloat162float(weight[k]), sum);
     }
-    sum = __fmaf_rn(__bfloat162float(x[k]), __bfloat162float(value), sum);
   }
   const unsigned mask = 0xFFFFu << (threadIdx.x & 16);
   for (int step = 1; step < 16; step *= 2)
