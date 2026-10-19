@@ -70,7 +70,10 @@ fn media_boundary(measured: &serde_json::Value) -> Result<[f64; 2]> {
 }
 
 impl Bounds {
-    fn read(fixtures: &Path, case: &str) -> Result<Self> {
+    fn read(fixtures: &Path, case: &str, format: crate::model_spec::ExpertFormat) -> Result<Self> {
+        if format == crate::model_spec::ExpertFormat::Fp8W8a16 {
+            return Self::read_fp8(fixtures, case);
+        }
         let directory = fixtures.parent().context("reference parent missing")?;
         let noise: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join("noise_floor_r2.json"))?)?;
@@ -161,6 +164,115 @@ impl Bounds {
             decode: measured_bounds(&cells("teacher_top2"))?,
             media: media_boundary(&media[same_grid])?,
             cross_media: media_boundary(&media[cross_media])?,
+        })
+    }
+
+    fn read_fp8(fixtures: &Path, case: &str) -> Result<Self> {
+        let directory = fixtures.parent().context("FP8 reference parent missing")?;
+        let noise: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("fp8-floor.json"))?)?;
+        ensure!(
+            noise["schema"] == 1
+                && noise["format"] == "fp8_w8a16"
+                && noise["state"] == "frozen_before_candidate_measurement"
+                && noise["declaration"]["candidate_results_seen"] == false,
+            "FP8 reference floor is not valid and frozen"
+        );
+        let components = noise["cases"][case]["components"]
+            .as_object()
+            .with_context(|| format!("FP8 floor case missing: {case}"))?;
+        ensure!(components.len() == 6, "FP8 floor requires six components");
+        for name in [
+            "expert_implementation_order",
+            "layer0_mixed_precision",
+            "official_vision_implementation_propagation",
+            "same_input_cross_gpu",
+            "teacher_forced_per_step",
+            "official_fp8_fake_quant_cross_gpu",
+        ] {
+            ensure!(
+                components.contains_key(name),
+                "FP8 floor component missing: {case}/{name}"
+            );
+        }
+        let mut arms = vec![
+            "expert_implementation_order",
+            "layer0_mixed_precision",
+            "same_input_cross_gpu",
+        ];
+        let vision = &components["official_vision_implementation_propagation"];
+        ensure!(
+            vision["applicable"] == case.starts_with("image_"),
+            "FP8 vision floor applicability differs from case={case}"
+        );
+        if case.starts_with("image_") {
+            arms.push("official_vision_implementation_propagation");
+        }
+        for arm in &arms {
+            ensure!(
+                components[*arm]["applicable"] == true,
+                "missing FP8 arm {case}/{arm}"
+            );
+        }
+        let cells = |key: &str| {
+            arms.iter()
+                .map(|arm| &components[*arm]["tensors"][key])
+                .collect::<Vec<_>>()
+        };
+        let mut layers = std::collections::BTreeMap::new();
+        for layer in [0, 3, 6, 19, 39] {
+            let key = format!("layer_{layer:02}_hidden_last8");
+            let mut values = cells(&key);
+            if layer == 0 {
+                values.push(
+                    &components["layer0_mixed_precision"]["tensors"]["layer0_fp32_raw_last8"],
+                );
+            }
+            layers.insert(layer, measured_bounds(&values)?);
+        }
+        let teacher = &components["teacher_forced_per_step"];
+        ensure!(
+            teacher["steps"] == 32,
+            "FP8 teacher floor requires 32 steps"
+        );
+        for arm in &arms {
+            ensure!(
+                teacher["comparisons"][*arm]
+                    .as_array()
+                    .is_some_and(|steps| steps.len() == 32),
+                "FP8 teacher floor extent differs: {case}/{arm}"
+            );
+        }
+        for arm in &arms {
+            for step in 0..32 {
+                measured_bounds(&[&teacher["comparisons"][*arm][step]["top2"]])?;
+            }
+        }
+        let quant = &components["official_fp8_fake_quant_cross_gpu"];
+        ensure!(
+            quant["form"] == "P2_official_loader_token_fake_quant",
+            "FP8 fake-quant form missing"
+        );
+        for layer in [3, 39] {
+            for role in ["attn", "o"] {
+                for kind in ["scale", "codes", "fake"] {
+                    let key = format!("fixed_layer_{layer:02}_{role}_{kind}");
+                    measured_bounds(&[&quant["cells"][key]])?;
+                }
+            }
+        }
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("fixtures_manifest.json"))?)?;
+        let media = media_boundary(
+            &manifest["image"]["media_reach_controls"]["same_grid_400x267_hockey_vs_boat_logits_diff"],
+        )?;
+        Ok(Self {
+            layers,
+            norm: measured_bounds(&cells("final_norm_last"))?,
+            logits: measured_bounds(&cells("prefill_last_logits_bf16"))?,
+            decode: measured_bounds(&cells("teacher_top2"))?,
+            media,
+            cross_media: media,
         })
     }
 }
@@ -279,6 +391,243 @@ fn tail(trace: &Trace, name: &str, words: usize) -> Result<Vec<f32>> {
         words
     );
     Ok(values.split_off(values.len() - words))
+}
+
+fn score_chain(
+    name: &str,
+    got: &[f32],
+    expected: &[f32],
+    rounds: u32,
+    reductions: &[usize],
+) -> Result<usize> {
+    let values = metrics(got, expected)?;
+    let magnitude = got
+        .iter()
+        .chain(expected)
+        .map(|v| f64::from(v.abs()))
+        .fold(0.0, f64::max);
+    let relative = super::super::super::bf16_chain_bound(rounds, reductions);
+    let pass = values[0] <= relative * magnitude;
+    println!(
+        "{} minicpm_fp8_layer0 {name} max={} magnitude={magnitude} relative_bound={relative}",
+        if pass { "PASS" } else { "DEFECT" },
+        values[0]
+    );
+    Ok(usize::from(!pass))
+}
+
+fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize> {
+    let h = engine.model_spec.hidden as usize;
+    let moe = engine
+        .model_spec
+        .moe
+        .context("FP8 layer0 MoE configuration missing")?;
+    let (k, experts, intermediate) = (
+        moe.experts_per_tok as usize,
+        moe.experts as usize,
+        moe.expert_intermediate as usize,
+    );
+    let normalized = source.tensor("layer_00_moe_in_norm")?;
+    ensure!(
+        normalized.shape().len() == 2,
+        "FP8 layer0 normalized input is not a matrix"
+    );
+    let rows = normalized.shape()[0];
+    for (name, shape) in [
+        ("layer_00_moe_in_norm", vec![rows, h]),
+        ("layer_00_router_logits", vec![rows, experts]),
+        ("layer_00_router_topk_ids", vec![rows, k]),
+        ("layer_00_router_topk_weights", vec![rows, k]),
+        ("layer_00_routed_per_choice_out", vec![rows, k, h]),
+    ] {
+        ensure!(
+            source.tensor(name)?.shape() == shape,
+            "FP8 layer0 reference shape: {name}"
+        );
+    }
+    let input = floats(source, "layer_00_moe_in_norm")?
+        .into_iter()
+        .map(bf16::from_f32)
+        .collect::<Vec<_>>();
+    let reference_ids = integers(source, "layer_00_router_topk_ids")?;
+    let reference_weights = floats(source, "layer_00_router_topk_weights")?;
+    let reference_logits = floats(source, "layer_00_router_logits")?;
+    let expected = floats(source, "layer_00_routed_per_choice_out")?;
+    ensure!(
+        reference_ids.iter().all(|&id| (id as usize) < experts),
+        "FP8 layer0 reference expert outside model"
+    );
+    engine.reset()?;
+    let ffn = engine.moe_ffn_binding(0)?;
+    let BoundFfn::Moe { router, .. } = ffn else {
+        anyhow::bail!("FP8 layer0 FFN is dense");
+    };
+    let mut decode = engine.moe.take().context("FP8 layer0 decoder missing")?;
+    let mut slots = engine
+        .moe_slots
+        .take()
+        .context("FP8 layer0 residency missing")?;
+    let result = (|| -> Result<usize> {
+        let stream = &engine.device.stream;
+        let batch = decode.max_rows.min(8);
+        ensure!(batch > 0 && rows > 0, "FP8 layer0 input is empty");
+        let logits = stream.alloc_zeros::<bf16>(batch * experts)?;
+        slots.begin_request(&vec![vec![1.0; experts]; engine.model_spec.layers.len()])?;
+        let mut defects = 0;
+        for base in (0..rows).step_by(batch) {
+            let count = batch.min(rows - base);
+            let choices = base * k..(base + count) * k;
+            stream.memcpy_htod(
+                &input[base * h..(base + count) * h],
+                &mut engine.work.n.slice_mut(..count * h),
+            )?;
+            let x = qwen::matrix(&engine.work.n, stream, 0, count, h)?;
+            decode.route.route_prefill(
+                stream,
+                x,
+                router,
+                &mut TensorMut(view(
+                    &decode.ids,
+                    stream,
+                    0,
+                    [count as u32, k as u32],
+                    [k as u64, 1],
+                )?),
+                &mut TensorMut(view(
+                    &decode.weights,
+                    stream,
+                    0,
+                    [count as u32, k as u32],
+                    [k as u64, 1],
+                )?),
+                &mut TensorMut(qwen::matrix(&logits, stream, 0, count, experts)?),
+            )?;
+            defects += score_chain(
+                "router_logits",
+                &stream
+                    .clone_dtoh(&logits.slice(..count * experts))?
+                    .into_iter()
+                    .map(bf16::to_f32)
+                    .collect::<Vec<_>>(),
+                &reference_logits[base * experts..(base + count) * experts],
+                1,
+                &[h],
+            )?;
+            decode.route(&engine.device, ffn, x)?;
+            let (actual_ids, actual_weights) = decode.routed()?;
+            let mut routed = Vec::new();
+            let mut reference = Vec::new();
+            let mut selection_errors = 0;
+            for row in 0..count {
+                let ids = &reference_ids[(base + row) * k..(base + row + 1) * k];
+                let row_logits =
+                    &reference_logits[(base + row) * experts..(base + row + 1) * experts];
+                let cutoff = ids
+                    .iter()
+                    .map(|&id| row_logits[id as usize])
+                    .fold(f32::INFINITY, f32::min);
+                let magnitude = row_logits
+                    .iter()
+                    .map(|v| f64::from(v.abs()))
+                    .fold(0.0, f64::max);
+                let limit = super::super::super::bf16_chain_bound(1, &[h]) * magnitude;
+                for choice in 0..k {
+                    let id = actual_ids[row * k + choice];
+                    ensure!(
+                        id >= 0 && (id as usize) < experts,
+                        "FP8 layer0 route expert outside model"
+                    );
+                    selection_errors +=
+                        usize::from(f64::from(row_logits[id as usize]) + limit < f64::from(cutoff));
+                    if let Some(index) = ids.iter().position(|&expected| expected == id as u32) {
+                        routed.push(actual_weights[row * k + choice].to_f32());
+                        reference.push(reference_weights[(base + row) * k + index]);
+                    }
+                }
+            }
+            defects += usize::from(selection_errors != 0);
+            println!(
+                "{} minicpm_fp8_layer0 router_selection base={base} rows={count} outside_margin={selection_errors} matched_weights={}",
+                if selection_errors == 0 {
+                    "PASS"
+                } else {
+                    "DEFECT"
+                },
+                routed.len()
+            );
+            if routed.is_empty() {
+                defects += 1;
+                println!("DEFECT minicpm_fp8_layer0 router_weights overlap=0");
+            } else {
+                defects += score_chain("router_weights", &routed, &reference, 2, &[h, experts])?;
+            }
+            let ids = reference_ids[choices.clone()]
+                .iter()
+                .map(|&id| id as i32)
+                .collect::<Vec<_>>();
+            let weights = reference_weights[choices.clone()]
+                .iter()
+                .map(|&v| bf16::from_f32(v))
+                .collect::<Vec<_>>();
+            stream.memcpy_htod(&ids, &mut decode.ids.slice_mut(..count * k))?;
+            stream.memcpy_htod(&weights, &mut decode.weights.slice_mut(..count * k))?;
+            decode.host_ids.as_mut_slice()?[..count * k].copy_from_slice(&ids);
+            decode.host_weights.as_mut_slice()?[..count * k].copy_from_slice(&weights);
+            slots.begin_token()?;
+            slots.complete(
+                &engine.device,
+                &mut decode,
+                0,
+                ffn,
+                (
+                    x,
+                    &mut TensorMut(qwen::matrix(&engine.work.out, stream, 0, count, h)?),
+                ),
+                None,
+            )?;
+            let contributions = stream.clone_dtoh(&decode.contributions.slice(..count * k * h))?;
+            // Gate/up, SiLU, product, down and routing apply six BF16 roundings.
+            defects += score_chain(
+                "native_contributions",
+                &contributions
+                    .iter()
+                    .copied()
+                    .map(bf16::to_f32)
+                    .collect::<Vec<_>>(),
+                &expected[base * k * h..(base + count) * k * h],
+                6,
+                &[h, h, intermediate],
+            )?;
+            let shared = stream.clone_dtoh(&decode.shared.slice(..count * h))?;
+            let scale = stream.clone_dtoh(&decode.scale.slice(..count))?;
+            let got = stream.clone_dtoh(&engine.work.out.slice(..count * h))?;
+            let mut mismatches = 0;
+            for row in 0..count {
+                for column in 0..h {
+                    let routed = bf16::from_f32(
+                        (0..k)
+                            .map(|choice| contributions[(row * k + choice) * h + column].to_f32())
+                            .sum(),
+                    );
+                    let shared =
+                        bf16::from_f32(shared[row * h + column].to_f32() * scale[row].to_f32());
+                    let value = bf16::from_f32(routed.to_f32() + shared.to_f32());
+                    mismatches += usize::from(value.to_bits() != got[row * h + column].to_bits());
+                }
+            }
+            defects += usize::from(mismatches != 0);
+            println!(
+                "{} minicpm_fp8_layer0 combine_boundaries base={base} rows={count} bit_mismatches={mismatches}",
+                if mismatches == 0 { "PASS" } else { "DEFECT" }
+            );
+            slots.finish_token()?;
+        }
+        slots.end_request()?;
+        Ok(defects)
+    })();
+    engine.moe = Some(decode);
+    engine.moe_slots = Some(slots);
+    result
 }
 
 struct Input {
@@ -460,8 +809,16 @@ impl Input {
     }
 }
 
-fn teacher_steps(source: &SafeTensors<'_>, case: &str) -> Result<usize> {
-    let steps = if case.starts_with("text_") { 64 } else { 32 };
+fn teacher_steps(
+    source: &SafeTensors<'_>,
+    case: &str,
+    format: crate::model_spec::ExpertFormat,
+) -> Result<usize> {
+    let steps = if format == crate::model_spec::ExpertFormat::Bf16 && case.starts_with("text_") {
+        64
+    } else {
+        32
+    };
     let rows = [steps];
     let pairs = [steps, 2];
     for (key, expected) in [
@@ -480,22 +837,16 @@ fn teacher_steps(source: &SafeTensors<'_>, case: &str) -> Result<usize> {
     Ok(steps)
 }
 
-fn check_fixtures(fixtures: &Path, model_dir: &Path) -> Result<()> {
+fn check_fixtures(fixtures: &Path, model_dir: &Path, cases: &[&str]) -> Result<()> {
     let model = crate::model_spec::ModelSpec::read(model_dir)?;
-    for case in [
-        "text_32",
-        "text_1k",
-        "text_4k",
-        "image_hockey_16x",
-        "image_boat_16x",
-        "video_football_16x",
-        "video_control_clip2_16x",
-        "video_control_same_grid_16x",
-    ] {
+    let format = model
+        .expert_format
+        .context("native fixture expert_format missing")?;
+    for &case in cases {
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
         let source = SafeTensors::deserialize(&bytes)?;
-        teacher_steps(&source, case)?;
-        Bounds::read(fixtures, case)?;
+        teacher_steps(&source, case, format)?;
+        Bounds::read(fixtures, case, format)?;
         let input = if case.starts_with("video_") {
             Input::video(&source, model_dir, case)?
         } else {
@@ -550,9 +901,175 @@ fn minicpm_native_checkpoint_fixtures_cpu() -> Result<()> {
     let fixtures = PathBuf::from(
         std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("reference directory missing")?,
     );
-    check_fixtures(&fixtures, &model)?;
+    check_fixtures(
+        &fixtures,
+        &model,
+        &[
+            "text_32",
+            "text_1k",
+            "text_4k",
+            "image_hockey_16x",
+            "image_boat_16x",
+            "video_football_16x",
+            "video_control_clip2_16x",
+            "video_control_same_grid_16x",
+        ],
+    )?;
     println!(
         "PASS minicpm_native_fixture_preflight cases=8 video_decode=ffmpeg canvas=true floors_complete=true"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "exclusive CUDA profiling, native FP8 FF_MODEL, text1k/text4k inputs and FLYINGFISH_RUNTIME_DIR required"]
+fn minicpm_native_prefill_profile_gpu() -> Result<()> {
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FP8 model missing")?);
+    let fixtures = PathBuf::from(
+        std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("profile input directory missing")?,
+    );
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("profile runtime missing")?,
+    );
+    let spec = crate::model_spec::ModelSpec::read(&model)?;
+    ensure!(
+        spec.expert_format == Some(crate::model_spec::ExpertFormat::Fp8W8a16)
+            && spec.hidden == 2048
+            && spec.layers.len() == 40,
+        "native FP8 profile requires the published MiniCPM geometry"
+    );
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
+    let mut engine = Engine::load(&model, 0, 4352, None, settings)?;
+    for (case, rows) in [("text_1k", 1024usize), ("text_4k", 4096)] {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let source = SafeTensors::deserialize(&bytes)?;
+        ensure!(
+            source.tensor("input_ids")?.shape() == [1, rows],
+            "profile input layout {case}"
+        );
+        let ids = integers(&source, "input_ids")?;
+        ensure!(
+            ids.len() == rows && ids.iter().all(|&id| id < spec.vocab),
+            "profile input extent/vocabulary {case}"
+        );
+        engine.reset()?;
+        engine.prefill(&ids, None)?;
+        engine.device.stream.synchronize()?;
+        engine.reset()?;
+        engine.profiler_start()?;
+        let started = Instant::now();
+        let result = engine.prefill(&ids, None);
+        engine.device.stream.synchronize()?;
+        let seconds = started.elapsed().as_secs_f64();
+        let stop = engine.profiler_stop();
+        result?;
+        stop?;
+        ensure!(
+            engine
+                .decode_logits()?
+                .iter()
+                .all(|value| value.is_finite()),
+            "nonfinite native prefill output {case}"
+        );
+        println!(
+            "{}",
+            serde_json::json!({"minicpm_native_prefill_profile": {
+                "case":case,"input_layout":[1,rows],"hidden":spec.hidden,
+                "graphs":false,"seconds":seconds,"warm_requests":1,
+                "region":"native full-model prefill; setup and warm request excluded"
+            }})
+        );
+    }
+    println!("PASS minicpm_native_prefill_profile cases=2 graphs=false finite=true");
+    Ok(())
+}
+
+#[test]
+#[ignore = "exclusive CUDA timing, BF16 FF_MODEL, FF_MINICPM_REFERENCE_DIR and pinned FLYINGFISH_RUNTIME_DIR required"]
+fn minicpm_bf16_timing_arm_gpu() -> Result<()> {
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("BF16 timing model missing")?);
+    let fixtures = PathBuf::from(
+        std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("BF16 timing reference missing")?,
+    );
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("BF16 timing runtime missing")?,
+    );
+    let spec = crate::model_spec::ModelSpec::read(&model)?;
+    ensure!(
+        spec.expert_format == Some(crate::model_spec::ExpertFormat::Bf16)
+            && spec.hidden == 2048
+            && spec.layers.len() == 40,
+        "BF16 timing requires the published MiniCPM geometry"
+    );
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut engine = Engine::load(&model, 0, 4352, None, settings)?;
+    ensure!(
+        !engine.graphs.is_empty(),
+        "BF16 timing requires segmented graphs"
+    );
+    for case in ["text_32", "text_1k"] {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let source = SafeTensors::deserialize(&bytes)?;
+        let input = Input::read(&source, case)?;
+        let forced = integers(&source, "greedy_token_ids")?;
+        let margins = floats(&source, "step_top2_margin")?;
+        ensure!(
+            forced.len() >= 32 && margins.len() >= 32 && input.ids.len() <= 4096,
+            "BF16 timing fixture extent: {case}"
+        );
+        for run in 0..3 {
+            engine.device.stream.synchronize()?;
+            let started = Instant::now();
+            engine.reset()?;
+            let mut predictions = vec![engine.prefill(&input.ids, None)?];
+            for &token in &forced[..31] {
+                engine.set_token(token)?;
+                predictions.push(engine.decode(true, None)?);
+            }
+            engine.device.stream.synchronize()?;
+            let seconds = started.elapsed().as_secs_f64();
+            ensure!(
+                engine.decode_logits()?.iter().all(|v| v.is_finite()),
+                "BF16 timing nonfinite output: {case}"
+            );
+            println!(
+                "{}",
+                serde_json::json!({"minicpm_bf16_timing_arm":{
+                    "case":case,"run":run,"measured":run>0,"seconds":seconds,
+                    "prompt_tokens":input.ids.len(),"teacher_steps":32,"predictions":predictions,
+                    "reference_top2_margins":&margins[..32],"graph_segments":engine.graphs.len(),
+                    "region":"reset+prefill+31 forced graph decodes; synchronization and token transfers included; load/calibration excluded"
+                }})
+            );
+        }
+    }
+    let mut stats = Trace::default();
+    engine.record_test_stats(&mut stats)?;
+    println!(
+        "{}",
+        serde_json::json!({"minicpm_bf16_timing_modes":{
+            "resident_hits":stats.values("stats.gpu_resident_hits")?[0],
+            "cpu_misses":stats.values("stats.cpu_worker_misses")?[0],
+            "disk_experts":stats.values("residency.tier")?.iter().filter(|&&tier| tier==2.0).count(),
+            "graph_segments":engine.graphs.len()
+        }})
     );
     Ok(())
 }
@@ -615,7 +1132,14 @@ fn teacher_force(
     let top = integers(source, "step_top2_ids")?;
     let expected = floats(source, "step_top2_logits")?;
     let margins = floats(source, "step_top2_margin")?;
-    let steps = teacher_steps(source, case)?;
+    let steps = teacher_steps(
+        source,
+        case,
+        engine
+            .model_spec
+            .expert_format
+            .context("native teacher expert_format missing")?,
+    )?;
     let mut outputs = Vec::with_capacity(steps);
     let mut errors = Vec::with_capacity(steps * 2);
     let (mut defects, mut scored) = (0, 0);
@@ -953,7 +1477,11 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             ("image_hockey_16x", 0.75),
             ("video_football_16x", 1.0),
         ] {
-            let bounds = Bounds::read(&directory.join("fixtures"), case)?;
+            let bounds = Bounds::read(
+                &directory.join("fixtures"),
+                case,
+                crate::model_spec::ExpertFormat::Bf16,
+            )?;
             ensure!(
                 bounds.layers[&0] == [expected, expected / 2.0, expected / 4.0, 1.0],
                 "wrong layer0 precision floor for {case}: {:?}",
@@ -974,6 +1502,80 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             );
             assert_eq!(bounds.decode, other);
         }
+        let quant_cells = [3, 39]
+            .into_iter()
+            .flat_map(|layer| {
+                ["attn", "o"].into_iter().flat_map(move |role| {
+                    ["scale", "codes", "fake"]
+                        .into_iter()
+                        .map(move |kind| format!("fixed_layer_{layer:02}_{role}_{kind}"))
+                })
+            })
+            .map(|key| (key, zero.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        let fp8_cases = ["text_32", "text_1k", "image_hockey_16x"].into_iter().enumerate().map(|(index, case)| {
+            let mut tensors = layers.clone();
+            for key in ["final_norm_last", "prefill_last_logits_bf16", "teacher_top2", "layer0_fp32_raw_last8"] {
+                tensors.insert(key.to_owned(), zero.clone());
+            }
+            let error = (index + 1) as f64 / 8.0;
+            let aggregate = serde_json::json!({"max_abs":error,"p99_abs":error,
+                "mean_abs":error,"cosine_sim":1.0});
+            tensors.insert("teacher_top2".to_owned(), aggregate.clone());
+            let arm = serde_json::json!({"applicable":true, "tensors":tensors});
+            let teacher = (0..32).map(|step| {
+                serde_json::json!({"top2":if step == 0 {zero.clone()} else {aggregate.clone()}})
+            }).collect::<Vec<_>>();
+            let image = case.starts_with("image_");
+            let mut teacher_arms = serde_json::json!({
+                "expert_implementation_order":teacher,"layer0_mixed_precision":teacher,
+                "same_input_cross_gpu":teacher});
+            if image {
+                teacher_arms["official_vision_implementation_propagation"] = serde_json::json!(teacher);
+            }
+            (case.to_owned(), serde_json::json!({"components":{
+                "expert_implementation_order":arm,"layer0_mixed_precision":arm,
+                "same_input_cross_gpu":arm,
+                "official_vision_implementation_propagation":if image {arm.clone()} else {serde_json::json!({"applicable":false})},
+                "teacher_forced_per_step":{"steps":32,"comparisons":teacher_arms},
+                "official_fp8_fake_quant_cross_gpu":{"form":"P2_official_loader_token_fake_quant","cells":quant_cells}
+            }}))
+        }).collect::<serde_json::Map<_, _>>();
+        let mut fp8 = serde_json::json!({"schema":1,"format":"fp8_w8a16",
+            "state":"frozen_before_candidate_measurement","declaration":{"candidate_results_seen":false},"cases":fp8_cases});
+        let path = directory.join("fp8-floor.json");
+        std::fs::write(&path, serde_json::to_vec(&fp8)?)?;
+        for (index, case) in ["text_32", "text_1k", "image_hockey_16x"]
+            .into_iter()
+            .enumerate()
+        {
+            let bound = Bounds::read(
+                &directory.join("fixtures"),
+                case,
+                crate::model_spec::ExpertFormat::Fp8W8a16,
+            )?;
+            let expected = (index + 1) as f64 / 4.0;
+            assert_eq!(bound.decode, [expected, expected, expected, 1.0]);
+        }
+        fp8["cases"]["text_32"]["components"]["teacher_forced_per_step"]["comparisons"]["same_input_cross_gpu"] =
+            serde_json::json!([]);
+        std::fs::write(&path, serde_json::to_vec(&fp8)?)?;
+        assert!(
+            Bounds::read(
+                &directory.join("fixtures"),
+                "text_32",
+                crate::model_spec::ExpertFormat::Fp8W8a16
+            )
+            .is_err()
+        );
+        assert!(
+            Bounds::read(
+                &directory.join("fixtures"),
+                "missing_case",
+                crate::model_spec::ExpertFormat::Fp8W8a16
+            )
+            .is_err()
+        );
         Ok(())
     })();
     std::fs::remove_dir_all(&directory)?;
@@ -999,26 +1601,35 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
         spec_graph: true,
         kv_format: crate::kv::KvFormat::Bf16,
     };
-    let cases = [
-        "text_32",
-        "text_1k",
-        "text_4k",
-        "image_hockey_16x",
-        "image_boat_16x",
-        "video_football_16x",
-        "video_control_clip2_16x",
-        "video_control_same_grid_16x",
-    ]
-    .into_iter()
-    .map(|case| Ok((case, Bounds::read(&fixtures, case)?)))
-    .collect::<Result<Vec<_>>>()?;
+    let spec = crate::model_spec::ModelSpec::read(&model)?;
+    let format = spec
+        .expert_format
+        .context("native checkpoint expert_format missing")?;
+    let names: &[&str] = match format {
+        crate::model_spec::ExpertFormat::Bf16 => &[
+            "text_32",
+            "text_1k",
+            "text_4k",
+            "image_hockey_16x",
+            "image_boat_16x",
+            "video_football_16x",
+            "video_control_clip2_16x",
+            "video_control_same_grid_16x",
+        ],
+        crate::model_spec::ExpertFormat::Fp8W8a16 => &["text_32", "text_1k", "image_hockey_16x"],
+    };
+    let cases = names
+        .iter()
+        .copied()
+        .map(|case| Ok((case, Bounds::read(&fixtures, case, format)?)))
+        .collect::<Result<Vec<_>>>()?;
     let cross_media = cases
         .first()
         .context("reference cases missing")?
         .1
         .cross_media;
     println!("minicpm_reference_bounds {cases:?}");
-    check_fixtures(&fixtures, &model)?;
+    check_fixtures(&fixtures, &model, names)?;
     Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
     let mut engine = Engine::load(&model, 0, 4352, None, settings.clone())?;
     ensure!(
@@ -1028,6 +1639,10 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
         "published MiniCPM geometry required"
     );
     let mut defects = 0;
+    if format == crate::model_spec::ExpertFormat::Fp8W8a16 {
+        let bytes = std::fs::read(fixtures.join("text_32_layer00_moe.safetensors"))?;
+        defects += native_layer0(&mut engine, &SafeTensors::deserialize(&bytes)?)?;
+    }
     let mut media_logits = Vec::new();
     let mut videos = Vec::new();
     for (case, bounds) in &cases {
@@ -1123,47 +1738,56 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
             )?;
         }
     }
-    let media = metrics(&media_logits[0], &media_logits[1])?;
-    defects += usize::from(media[0] < cross_media[0] || media[3] > cross_media[1]);
-    println!(
-        "minicpm_two_media max={} cosine={} defects={defects}",
-        media[0], media[3]
-    );
-    let video_bounds = &cases
-        .iter()
-        .find(|(case, _)| *case == "video_football_16x")
-        .context("video bounds missing")?
-        .1;
-    for (index, bound) in [(1, video_bounds.cross_media), (2, video_bounds.media)] {
-        let metrics = metrics(&videos[0].1, &videos[index].1)?;
-        let pass =
-            metrics[0] >= bound[0] && metrics[3] <= bound[1] && videos[0].2 != videos[index].2;
-        defects += usize::from(!pass);
+    if format == crate::model_spec::ExpertFormat::Bf16 {
+        let media = metrics(&media_logits[0], &media_logits[1])?;
+        defects += usize::from(media[0] < cross_media[0] || media[3] > cross_media[1]);
         println!(
-            "{} minicpm_two_videos pair={} max={} cosine={} distinct_ids={} bound={bound:?}",
-            if pass { "PASS" } else { "DEFECT" },
-            videos[index].0,
-            metrics[0],
-            metrics[3],
-            videos[0].2 != videos[index].2
+            "minicpm_two_media max={} cosine={} defects={defects}",
+            media[0], media[3]
         );
-    }
-    for (case, _, expected) in videos.iter().rev() {
-        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
-        let source = SafeTensors::deserialize(&bytes)?;
-        let input = Input::video(&source, &model, case)?;
-        let ids = video_caption(&mut engine, &input, case, &model, expected.len())?;
-        defects += usize::from(ids != *expected);
-        println!(
-            "{} minicpm_video_request_order {case} reverse_order=true same_ids={}",
-            if ids == *expected { "PASS" } else { "DEFECT" },
-            ids == *expected
-        );
+        let video_bounds = &cases
+            .iter()
+            .find(|(case, _)| *case == "video_football_16x")
+            .context("video bounds missing")?
+            .1;
+        for (index, bound) in [(1, video_bounds.cross_media), (2, video_bounds.media)] {
+            let metrics = metrics(&videos[0].1, &videos[index].1)?;
+            let pass =
+                metrics[0] >= bound[0] && metrics[3] <= bound[1] && videos[0].2 != videos[index].2;
+            defects += usize::from(!pass);
+            println!(
+                "{} minicpm_two_videos pair={} max={} cosine={} distinct_ids={} bound={bound:?}",
+                if pass { "PASS" } else { "DEFECT" },
+                videos[index].0,
+                metrics[0],
+                metrics[3],
+                videos[0].2 != videos[index].2
+            );
+        }
+        for (case, _, expected) in videos.iter().rev() {
+            let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+            let source = SafeTensors::deserialize(&bytes)?;
+            let input = Input::video(&source, &model, case)?;
+            let ids = video_caption(&mut engine, &input, case, &model, expected.len())?;
+            defects += usize::from(ids != *expected);
+            println!(
+                "{} minicpm_video_request_order {case} reverse_order=true same_ids={}",
+                if ids == *expected { "PASS" } else { "DEFECT" },
+                ids == *expected
+            );
+        }
     }
     println!("minicpm_native_end defects={defects}");
     ensure!(defects == 0, "MiniCPM end-to-end DEFECT count={defects}");
     println!(
-        "PASS minicpm_native_checkpoint cases=8 teacher_steps=352 bitwise_graphs=true media_control=boat_pixels,video_pixels video_splice_control=true"
+        "PASS minicpm_native_checkpoint format={format:?} cases={} bitwise_graphs=true media_control={} video_splice_control={}",
+        names.len(),
+        if format == crate::model_spec::ExpertFormat::Bf16 {
+            "boat_pixels,video_pixels"
+        } else {
+            "boat_pixels"
+        },
+        format == crate::model_spec::ExpertFormat::Bf16
     );
     Ok(())
 }

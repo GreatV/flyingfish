@@ -544,7 +544,7 @@ mod tests {
         let mut capacity = slot_capacity(geometry, crate::experts::plan::equal_slots(2701, 40)?)?;
         let bytes = capacity.slot_bytes() as usize;
         assert_eq!(bytes, 6_291_456);
-        assert_eq!(capacity.layout.gate_up_bytes(), Some(4_194_304));
+        assert_eq!(capacity.layout.down_offset(), 4_194_304);
         assert_eq!(bytes as u64 - 4_194_304, 2_097_152);
         let layout = SlotLayout::new(geometry, &capacity)?;
         assert_eq!(layout.resident_slot(20, 67)?, 2700 * bytes..2701 * bytes);

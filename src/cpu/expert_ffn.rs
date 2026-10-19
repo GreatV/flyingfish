@@ -1,5 +1,6 @@
 //! Host-side routed-expert FFN for decode misses; model-independent.
 use crate::experts::arena::{BlockLease, HostBlocks};
+use crate::experts::catalogue::{ExpertGeometry, ExpertLayout, Fp8Slot};
 use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
 use std::ops::Range;
@@ -84,8 +85,7 @@ impl Isa {
     }
 }
 
-/// Native `[2I, H]` gate-up and `[H, I]` down slices addressed by element ranges
-/// into an arena, one row stride each; rows are contiguous and gate rows precede up rows.
+/// BF16 arena-word ranges: fused matrices for BF16 or the full native FP8 slot in both ranges.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpertWeights {
     pub gate_up: Range<usize>,
@@ -95,8 +95,42 @@ pub struct ExpertWeights {
 }
 
 impl ExpertWeights {
-    fn validate(&self, shape: &Shape, arena: usize) -> Result<()> {
+    pub fn from_slot(shape: Shape, range: Range<usize>, layout: &ExpertLayout) -> Result<Self> {
+        ensure!(
+            range.end >= range.start
+                && range.len().checked_mul(2) == Some(usize::try_from(layout.slot_bytes())?),
+            "expert slot extent differs from layout"
+        );
+        let (gate_up, down) = match layout {
+            ExpertLayout::Bf16Fused { gate_up_bytes, .. } => {
+                let down = range.start + usize::try_from(gate_up_bytes / 2)?;
+                (range.start..down, down..range.end)
+            }
+            ExpertLayout::Fp8W8a16(_) => (range.clone(), range),
+        };
+        Ok(Self {
+            gate_up,
+            gate_up_stride: shape.hidden,
+            down,
+            down_stride: shape.intermediate,
+        })
+    }
+
+    fn validate(&self, shape: &Shape, arena: usize, fp8: Option<&Fp8Slot>) -> Result<()> {
         let (hidden, intermediate) = (shape.hidden, shape.intermediate);
+        if let Some(slot) = fp8 {
+            ensure!(
+                self.gate_up.start <= self.gate_up.end
+                    && self.gate_up == self.down
+                    && self.gate_up.end <= arena
+                    && self.gate_up.len().checked_mul(2)
+                        == Some(usize::try_from(slot.down_scale.end)?)
+                    && self.gate_up_stride == hidden
+                    && self.down_stride == intermediate,
+                "FP8 expert slot differs from the pool layout"
+            );
+            return Ok(());
+        }
         ensure!(
             self.gate_up_stride >= hidden && self.down_stride >= intermediate,
             "expert stride below the row width"
@@ -240,7 +274,9 @@ pub fn contribution(
         input.hidden.len() == input.shape.hidden && out.len() == input.shape.hidden,
         "hidden/out width differs from the expert shape"
     );
-    input.weights.validate(input.shape, input.arena.len())?;
+    input
+        .weights
+        .validate(input.shape, input.arena.len(), None)?;
     scratch.check(input.shape)?;
     compute(arm_for(isa)?, input, out, scratch);
     Ok(())
@@ -731,6 +767,7 @@ pub struct ExpertPool {
     max_rows: usize,
     max_assignments: usize,
     isa: Isa,
+    fp8_slot: Option<Fp8Slot>,
     shared: Arc<PoolShared>,
     handles: Vec<JoinHandle<()>>,
 }
@@ -866,6 +903,7 @@ impl ExpertPool {
         shape: Shape,
         max_rows: usize,
         max_assignments: usize,
+        fp8_slot: Option<Fp8Slot>,
     ) -> Result<Self> {
         ensure!(
             workers > 0 && workers <= 256,
@@ -877,6 +915,20 @@ impl ExpertPool {
             "invalid expert assignment capacity {max_assignments}"
         );
         let isa = Isa::detect();
+        if let Some(slot) = &fp8_slot {
+            let geometry = ExpertGeometry {
+                layers: 1,
+                experts: 1,
+                hidden: u32::try_from(shape.hidden)?,
+                intermediate: u32::try_from(shape.intermediate)?,
+                top_k: 1,
+            };
+            ensure!(
+                ExpertLayout::new(crate::model_spec::ExpertFormat::Fp8W8a16, &geometry)?
+                    == ExpertLayout::Fp8W8a16(slot.clone()),
+                "FP8 pool slot differs from the expert shape"
+            );
+        }
         let shared = Arc::new(PoolShared {
             job: RwLock::new(JobSlot::new(&shape, max_rows, max_assignments)),
             park: Mutex::new(()),
@@ -901,9 +953,20 @@ impl ExpertPool {
         let mut handles = Vec::with_capacity(workers);
         for index in 0..workers {
             let worker_shared = shared.clone();
+            let worker_fp8 = fp8_slot.clone();
             let spawned = thread::Builder::new()
                 .name(format!("expert-ffn-{index}"))
-                .spawn(move || worker(index, worker_shared, shape, isa, max_rows, max_assignments));
+                .spawn(move || {
+                    worker(
+                        index,
+                        worker_shared,
+                        shape,
+                        isa,
+                        max_rows,
+                        max_assignments,
+                        worker_fp8,
+                    )
+                });
             match spawned {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
@@ -925,6 +988,7 @@ impl ExpertPool {
             max_rows,
             max_assignments,
             isa,
+            fp8_slot,
             shared,
             handles,
         })
@@ -1141,7 +1205,7 @@ impl ExpertPool {
         );
         for (index, weights) in experts.iter().enumerate() {
             weights
-                .validate(&self.shape, arena_len)
+                .validate(&self.shape, arena_len, self.fp8_slot.as_ref())
                 .with_context(|| format!("expert {index} weights"))?;
         }
         for (index, assignment) in assignments.iter().enumerate() {
@@ -1196,8 +1260,14 @@ fn worker(
     isa: Isa,
     max_rows: usize,
     max_assignments: usize,
+    fp8_slot: Option<Fp8Slot>,
 ) {
     let mut local = Local::new(&shape, shared.workers, max_rows, max_assignments);
+    let phases = if fp8_slot.is_some() {
+        phases::<true>
+    } else {
+        phases::<false>
+    };
     let result = (|| -> Result<()> {
         let mut seen = 0u64;
         loop {
@@ -1231,7 +1301,7 @@ fn worker(
                 drop(guard);
             }
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                phases(index, &shared, &shape, isa, &mut local)
+                phases(index, &shared, &shape, isa, &mut local, fp8_slot.as_ref())
             }));
             let message = match outcome {
                 Ok(Ok(())) => None,
@@ -1274,12 +1344,18 @@ fn worker(
     }
 }
 
-fn phases(
+pub(crate) fn native_bytes(values: &[bf16]) -> &[u8] {
+    // BF16 storage contains initialized bytes and the caller holds the block read lease.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
+fn phases<const FP8: bool>(
     index: usize,
     shared: &PoolShared,
     shape: &Shape,
     isa: Isa,
     local: &mut Local,
+    fp8_slot: Option<&Fp8Slot>,
 ) -> Result<()> {
     let arm = arm_for(isa)?;
     let (hidden, intermediate) = (shape.hidden, shape.intermediate);
@@ -1331,12 +1407,29 @@ fn phases(
         let gate_up = &data[expert.gate_up.start % block_elements..]
             [..expert.gate_up.end - expert.gate_up.start];
         let x = &local.hidden_f[item.row as usize * hidden..][..hidden];
-        let gate = unsafe { (arm.dot)(x, &gate_up[j * expert.gate_up_stride..][..hidden]) };
-        let up = unsafe {
-            (arm.dot)(
-                x,
-                &gate_up[(intermediate + j) * expert.gate_up_stride..][..hidden],
-            )
+        let (gate, up) = if FP8 {
+            let slot = fp8_slot.context("FP8 worker slot missing")?;
+            let bytes = native_bytes(gate_up);
+            let gate = &bytes[slot.gate.start as usize + j * hidden..][..hidden];
+            let up = &bytes[slot.up.start as usize + j * hidden..][..hidden];
+            let gate_scale = row_scale(&bytes[slot.gate_scale.start as usize..], j);
+            let up_scale = row_scale(&bytes[slot.up_scale.start as usize..], j);
+            unsafe {
+                (
+                    (arm.dot_e4m3)(x, gate, gate_scale),
+                    (arm.dot_e4m3)(x, up, up_scale),
+                )
+            }
+        } else {
+            unsafe {
+                (
+                    (arm.dot)(x, &gate_up[j * expert.gate_up_stride..][..hidden]),
+                    (arm.dot)(
+                        x,
+                        &gate_up[(intermediate + j) * expert.gate_up_stride..][..hidden],
+                    ),
+                )
+            }
         };
         let gate = bf16::from_f32(gate);
         let up = bf16::from_f32(up);
@@ -1398,11 +1491,19 @@ fn phases(
             let down = &data[expert.down.start % lease.block_elements()..]
                 [..expert.down.end - expert.down.start];
             let k = unit % hidden;
-            let value = unsafe {
-                (arm.dot)(
-                    &local.act_f,
-                    &down[k * expert.down_stride..][..intermediate],
-                )
+            let value = if FP8 {
+                let slot = fp8_slot.context("FP8 worker slot missing")?;
+                let bytes = native_bytes(down);
+                let row = &bytes[slot.down.start as usize + k * intermediate..][..intermediate];
+                let scale = row_scale(&bytes[slot.down_scale.start as usize..], k);
+                unsafe { (arm.dot_e4m3)(&local.act_f, row, scale) }
+            } else {
+                unsafe {
+                    (arm.dot)(
+                        &local.act_f,
+                        &down[k * expert.down_stride..][..intermediate],
+                    )
+                }
             };
             let linear = bf16::from_f32(value);
             local.block[unit - range2.start] =
@@ -1427,6 +1528,7 @@ pub fn measure_service_table(
     workers: &[u32],
     rows: &[u32],
     missed: &[u32],
+    format: crate::model_spec::ExpertFormat,
 ) -> Result<Vec<crate::experts::plan::ServiceCell>> {
     Shape::new(shape.hidden, shape.intermediate)?;
     let rows_max = *rows.iter().max().context("empty service row lattice")? as usize;
@@ -1442,11 +1544,15 @@ pub fn measure_service_table(
         ring_experts as usize >= missed_max,
         "expert service ring {ring_experts} cannot hold {missed_max} misses"
     );
-    let per = shape
-        .hidden
-        .checked_mul(shape.intermediate)
-        .and_then(|n| n.checked_mul(3))
-        .context("service expert extent overflow")?;
+    let geometry = ExpertGeometry {
+        layers: 1,
+        experts: ring_experts,
+        hidden: u32::try_from(shape.hidden)?,
+        intermediate: u32::try_from(shape.intermediate)?,
+        top_k: u32::try_from(missed_max)?,
+    };
+    let layout = ExpertLayout::new(format, &geometry)?;
+    let per = usize::try_from(layout.slot_bytes() / 2)?;
     let max_assignments = rows_max
         .checked_mul(missed_max)
         .context("service assignment extent overflow")?;
@@ -1457,8 +1563,28 @@ pub fn measure_service_table(
     );
     let arena = HostBlocks::new(ring_experts, per)?;
     let mut values = vec![bf16::ZERO; per];
-    for (index, slot) in values.iter_mut().enumerate() {
-        *slot = bf16::from_f32((((index % 251) as f32) - 125.0) / 128.0);
+    match &layout {
+        ExpertLayout::Bf16Fused { .. } => {
+            for (index, value) in values.iter_mut().enumerate() {
+                *value = bf16::from_f32((((index % 251) as f32) - 125.0) / 128.0);
+            }
+        }
+        ExpertLayout::Fp8W8a16(slot) => {
+            for (word, value) in values[..slot.gate_scale.start as usize / 2]
+                .iter_mut()
+                .enumerate()
+            {
+                let code =
+                    |index| (((index * 37 + 11) % 64) as u8) | ((((index / 7) & 1) as u8) << 7);
+                *value = bf16::from_le_bytes([code(2 * word), code(2 * word + 1)]);
+            }
+            for (row, value) in values[slot.gate_scale.start as usize / 2..]
+                .iter_mut()
+                .enumerate()
+            {
+                *value = bf16::from_f32((1.0 + (row % 19) as f32 / 32.0) / 8.0);
+            }
+        }
     }
     for expert in 0..ring_experts {
         arena.claim(expert)?.slice()?.copy_from_slice(&values);
@@ -1469,7 +1595,13 @@ pub fn measure_service_table(
     let mut cells = Vec::new();
     let mut cursor = 0usize;
     for &workers in workers {
-        let pool = ExpertPool::new(workers as usize, shape, rows_max, max_assignments)?;
+        let pool = ExpertPool::new(
+            workers as usize,
+            shape,
+            rows_max,
+            max_assignments,
+            layout.fp8_slot().cloned(),
+        )?;
         for &rows in rows {
             let row_started = std::time::Instant::now();
             for &missed in missed {
@@ -1488,15 +1620,9 @@ pub fn measure_service_table(
                     let selected: Vec<ExpertWeights> = (0..missed as usize)
                         .map(|choice| {
                             let start = ((cursor + choice) % ring_experts as usize) * per;
-                            let down = start + 2 * shape.intermediate * shape.hidden;
-                            ExpertWeights {
-                                gate_up: start..down,
-                                gate_up_stride: shape.hidden,
-                                down: down..start + per,
-                                down_stride: shape.intermediate,
-                            }
+                            ExpertWeights::from_slot(shape, start..start + per, &layout)
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>>>()?;
                     let started = std::time::Instant::now();
                     pool.run(Job {
                         arena: arena.clone(),
@@ -1707,7 +1833,7 @@ mod tests {
         }
         let arena = HostBlocks::new(1, flat.len())?;
         arena.claim(0)?.slice()?.copy_from_slice(&flat);
-        let pool = ExpertPool::new(2, shape, 1, 1)?;
+        let pool = ExpertPool::new(2, shape, 1, 1, None)?;
         let assignments = [Assignment {
             row: 0,
             choice: 0,
@@ -1730,6 +1856,65 @@ mod tests {
             .count();
         println!("expert_silu_boundary arm=pool bit_mismatches={count}");
         assert_eq!(mismatches + count, 0);
+        let (mut native, slot) = fp8_fixture(&shape);
+        native.fill(0);
+        for bytes in native[slot.gate_scale.start as usize..]
+            .as_chunks_mut::<2>()
+            .0
+        {
+            bytes.copy_from_slice(&bf16::ONE.to_le_bytes());
+        }
+        native[0] = 0x88;
+        native[slot.up.start as usize] = 0x3c;
+        for row in 0..h {
+            native[slot.down.start as usize + row * i] = 0x38;
+        }
+        for isa in [Isa::Scalar, Isa::Avx2, Isa::Avx512Bf16] {
+            if !isa.available() {
+                continue;
+            }
+            fp8_contribution(
+                isa,
+                Fp8Contribution {
+                    shape: &shape,
+                    slot: &native,
+                    slot_layout: &slot,
+                    hidden: &hidden,
+                    routing: bf16::ONE,
+                },
+                &mut output,
+                &mut scratch,
+            )?;
+            assert!(output.iter().all(|v| v.to_bits() == expected.to_bits()));
+            println!(
+                "expert_silu_boundary arm=fp8_{} bit_mismatches=0",
+                isa.name()
+            );
+        }
+        let arena = HostBlocks::new(1, native.len() / 2)?;
+        {
+            let mut claim = arena.claim(0)?;
+            for (value, bytes) in claim.slice()?.iter_mut().zip(native.as_chunks::<2>().0) {
+                *value = bf16::from_le_bytes(*bytes);
+            }
+        }
+        let layout = ExpertLayout::Fp8W8a16(slot.clone());
+        let experts = [ExpertWeights::from_slot(
+            shape,
+            arena.block_range(0)?,
+            &layout,
+        )?];
+        let pool = ExpertPool::new(2, shape, 1, 1, Some(slot))?;
+        pool.run(Job {
+            arena,
+            hidden: &hidden,
+            rows: 1,
+            experts: &experts,
+            assignments: &assignments,
+            out: &mut output,
+        })?;
+        assert!(output.iter().all(|v| v.to_bits() == expected.to_bits()));
+        println!("expert_silu_boundary arm=fp8_pool bit_mismatches=0");
         Ok(())
     }
 
@@ -1953,6 +2138,110 @@ mod tests {
             })
         );
         assert_eq!(worst, 0, "FP32 and FP64 rounded contributions differ");
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_pool_matches_native_contributions_and_holds_block_leases() -> Result<()> {
+        let shape = production_shape();
+        let (codes, slot) = fp8_fixture(&shape);
+        let layout = ExpertLayout::Fp8W8a16(slot.clone());
+        let per = codes.len() / 2;
+        let arena = HostBlocks::new(4, per)?;
+        for block in [1, 3] {
+            let mut claim = arena.claim(block)?;
+            for (dst, bytes) in claim.slice()?.iter_mut().zip(codes.as_chunks::<2>().0) {
+                *dst = bf16::from_le_bytes(*bytes);
+            }
+        }
+        let experts = [1, 3]
+            .map(|block| ExpertWeights::from_slot(shape, arena.block_range(block)?, &layout))
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let hidden = [hidden_row(&shape, 0), hidden_row(&shape, 1)].concat();
+        let assignments = [(1, 3, 1, 0.3125), (0, 0, 0, -0.5), (1, 5, 0, 0.125)].map(
+            |(row, choice, expert, weight)| Assignment {
+                row,
+                choice,
+                expert,
+                weight: bf16::from_f32(weight),
+            },
+        );
+        let mut expected = vec![bf16::ZERO; 6 * shape.hidden];
+        let mut scratch = Scratch::new(&shape);
+        for item in &assignments {
+            fp8_contribution(
+                Isa::Scalar,
+                Fp8Contribution {
+                    shape: &shape,
+                    slot: &codes,
+                    slot_layout: &slot,
+                    hidden: &hidden[item.row as usize * shape.hidden..][..shape.hidden],
+                    routing: item.weight,
+                },
+                &mut expected[item.choice as usize * shape.hidden..][..shape.hidden],
+                &mut scratch,
+            )?;
+        }
+        let bits = |values: &[bf16]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for workers in [1, 4] {
+            let pool = ExpertPool::new(workers, shape, 2, 6, Some(slot.clone()))?;
+            let mut out = vec![bf16::ZERO; expected.len()];
+            let pending = pool.submit(Job {
+                arena: arena.clone(),
+                hidden: &hidden,
+                rows: 2,
+                experts: &experts,
+                assignments: &assignments,
+                out: &mut out,
+            })?;
+            assert!(arena.claim(1).is_err() && arena.claim(3).is_err());
+            assert!(arena.claim(0).is_ok());
+            pool.finish(pending)?;
+            assert_eq!(bits(&out), bits(&expected));
+            assert!(arena.claim(1).is_ok() && arena.claim(3).is_ok());
+            let mut malformed = experts.clone();
+            malformed[0].gate_up.end += 1;
+            assert!(
+                pool.run(Job {
+                    arena: arena.clone(),
+                    hidden: &hidden,
+                    rows: 2,
+                    experts: &malformed,
+                    assignments: &assignments,
+                    out: &mut out,
+                })
+                .is_err()
+            );
+            assert_eq!(bits(&out), bits(&expected));
+            println!(
+                "PASS FP8_POOL stored_gate=[512,2048] stored_down=[2048,512] rows=2 choices=3 slots=6 workers={workers} isa={} bit_mismatches=0 leases=true bounds=true",
+                pool.isa().name()
+            );
+        }
+        {
+            let mut claim = arena.claim(3)?;
+            let bytes = claim.slice()?;
+            bytes[slot.down_scale.start as usize / 2..slot.down_scale.end as usize / 2]
+                .rotate_left(1);
+        }
+        let pool = ExpertPool::new(4, shape, 2, 6, Some(slot))?;
+        let mut wrong = vec![bf16::ZERO; expected.len()];
+        pool.run(Job {
+            arena,
+            hidden: &hidden,
+            rows: 2,
+            experts: &experts,
+            assignments: &assignments,
+            out: &mut wrong,
+        })?;
+        let mismatches = bits(&wrong)
+            .iter()
+            .zip(bits(&expected))
+            .filter(|(a, b)| **a != *b)
+            .count();
+        assert!(mismatches > 0);
+        println!("PASS FP8_POOL_SCALE_ROW_CONTROL bit_mismatches={mismatches}");
         Ok(())
     }
 
@@ -2184,7 +2473,7 @@ mod tests {
                     )?;
                 }
                 for workers in [1usize, 2, 4, 8] {
-                    let pool = ExpertPool::new(workers, shape, rows, assignments.len())?;
+                    let pool = ExpertPool::new(workers, shape, rows, assignments.len(), None)?;
                     let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
                     pool.run(Job {
                         arena: arena.clone(),
@@ -2288,7 +2577,7 @@ mod tests {
     #[test]
     fn poisoned_job_lock_rejects_work_without_publishing_output() -> Result<()> {
         let fixture = pool_fixture()?;
-        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len())?;
+        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len(), None)?;
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = pool.shared.job.write().unwrap();
             panic!("expert job poison control");
@@ -2304,7 +2593,7 @@ mod tests {
     #[test]
     fn pending_guard_holds_the_lease_until_finish() -> Result<()> {
         let fixture = pool_fixture()?;
-        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len())?;
+        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len(), None)?;
         let mut out = vec![bf16::ZERO; fixture.assignments.len() * fixture.shape.hidden];
         let block =
             u32::try_from(fixture.experts[0].gate_up.start / fixture.arena.block_elements())?;
@@ -2324,7 +2613,7 @@ mod tests {
     #[test]
     fn overlapping_submit_errors_without_touching_its_output() -> Result<()> {
         let fixture = pool_fixture()?;
-        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len())?;
+        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len(), None)?;
         let mut first = vec![bf16::ZERO; fixture.assignments.len() * fixture.shape.hidden];
         let pending = pool.submit(fixture_job(&fixture, &mut first))?;
         let mut second =
@@ -2347,7 +2636,7 @@ mod tests {
     fn dropping_the_guard_waits_and_releases() -> Result<()> {
         let fixture = pool_fixture()?;
         let expected = expected_output(&fixture)?;
-        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len())?;
+        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len(), None)?;
         let mut out = vec![bf16::ZERO; fixture.assignments.len() * fixture.shape.hidden];
         {
             let _pending = pool.submit(fixture_job(&fixture, &mut out))?;
@@ -2366,7 +2655,7 @@ mod tests {
     fn run_and_submit_finish_are_bitwise_identical() -> Result<()> {
         let fixture = pool_fixture()?;
         let expected = expected_output(&fixture)?;
-        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len())?;
+        let pool = ExpertPool::new(2, fixture.shape, 2, fixture.assignments.len(), None)?;
         let mut out_run = vec![bf16::ZERO; fixture.assignments.len() * fixture.shape.hidden];
         pool.run(fixture_job(&fixture, &mut out_run))?;
         let mut out_seam = vec![bf16::ZERO; fixture.assignments.len() * fixture.shape.hidden];
@@ -2418,7 +2707,7 @@ mod tests {
                 &mut scratch,
             )?;
         }
-        let pool = ExpertPool::new(4, shape, 1, assignments.len())?;
+        let pool = ExpertPool::new(4, shape, 1, assignments.len(), None)?;
         let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
         pool.run(Job {
             arena,
@@ -2438,7 +2727,7 @@ mod tests {
         let arena = build_arena(&shape, 1);
         let experts = [weights(&shape, 0)];
         let hidden = vec![bf16::ZERO; shape.hidden];
-        let pool = ExpertPool::new(1, shape, 1, 2)?;
+        let pool = ExpertPool::new(1, shape, 1, 2, None)?;
         let good = Assignment {
             row: 0,
             choice: 0,
@@ -2454,7 +2743,7 @@ mod tests {
             assignments: &[good],
             out: &mut out,
         })?;
-        assert!(ExpertPool::new(0, shape, 1, 1).is_err());
+        assert!(ExpertPool::new(0, shape, 1, 1, None).is_err());
         assert!(
             pool.run(Job {
                 arena: arena.clone(),
@@ -2651,6 +2940,7 @@ mod tests {
             &[1, 2, 4, 8, 16, 24],
             &[1, 2, 5, 8],
             &[1, 2, 4, 8],
+            crate::model_spec::ExpertFormat::Bf16,
         )?;
         for cell in cells {
             let cold_bytes = f64::from(cell.experts) * per as f64 * 2.0;

@@ -1422,21 +1422,14 @@ impl Cpu {
                     .as_ref()
                     .context("prefill host tier has no arena")?
                     .block_range(block)?;
-                let down = range.start
-                    + usize::try_from(
-                        slots
-                            .catalogue
-                            .layout()
-                            .gate_up_bytes()
-                            .context("BF16 prefill gate-up")?
-                            / 2,
-                    )?;
-                self.experts.push(ExpertWeights {
-                    gate_up: range.start..down,
-                    gate_up_stride: geometry.hidden as usize,
-                    down: down..range.end,
-                    down_stride: geometry.intermediate as usize,
-                });
+                self.experts.push(ExpertWeights::from_slot(
+                    Shape {
+                        hidden: geometry.hidden as usize,
+                        intermediate: geometry.intermediate as usize,
+                    },
+                    range,
+                    slots.catalogue.layout(),
+                )?);
             }
             ensure!(
                 tier != Tier::Gpu,
@@ -1568,12 +1561,7 @@ impl Gpu {
                 expert,
                 (
                     physical.pointer,
-                    physical.pointer
-                        + slots
-                            .catalogue
-                            .layout()
-                            .gate_up_bytes()
-                            .context("BF16 prefill gate-up")?,
+                    physical.pointer + slots.catalogue.layout().down_offset(),
                 ),
                 slots.policy.generation(layer, expert)?,
             )?;
@@ -1840,7 +1828,9 @@ mod tests {
     };
     use super::*;
     use crate::backend::cuda::moe::reference::MoeFixture;
-    use crate::cpu::expert_ffn::{Contribution, Isa, Scratch, contribution};
+    use crate::cpu::expert_ffn::{
+        Contribution, Fp8Contribution, Isa, Scratch, contribution, fp8_contribution,
+    };
 
     fn reserves(geometry: ExpertGeometry) -> Reserves {
         Reserves {
@@ -1887,13 +1877,7 @@ mod tests {
         let native = reader.values(slot)?.values().to_vec();
         let hidden = geometry.hidden as usize;
         let intermediate = geometry.intermediate as usize;
-        let cut = usize::try_from(
-            catalogue
-                .layout()
-                .gate_up_bytes()
-                .context("BF16 gate-up missing")?
-                / 2,
-        )?;
+        let cut = usize::try_from(catalogue.layout().down_offset() / 2)?;
         let host = HostBlocks::new(1, native.len())?;
         host.claim(0)?.slice()?.copy_from_slice(&native);
         let weights = [ExpertWeights {
@@ -1997,7 +1981,7 @@ mod tests {
             generation: stream
                 .clone_htod(&valid.iter().copied().map(u64::from).collect::<Vec<_>>())?,
         };
-        let pool = ExpertPool::new(2, Shape::new(hidden, intermediate)?, 32, 32)?;
+        let pool = ExpertPool::new(2, Shape::new(hidden, intermediate)?, 32, 32, None)?;
         let mut disk = DiskExperts::new(catalogue, &directory, 1, 32)?;
         let ops = PrefillOps::new(&device.ctx, stream, crate::model_spec::ExpertFormat::Bf16)?;
         let mut defects = 0;
@@ -2443,7 +2427,14 @@ mod tests {
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("graph refill runtime missing")?,
         );
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
-        let mut capacity = capacity(geometry, 8, false, 2, true)?;
+        let mut capacity = capacity(
+            geometry,
+            8,
+            false,
+            2,
+            true,
+            crate::model_spec::ExpertFormat::Bf16,
+        )?;
         capacity.slots_per_layer.fill(geometry.experts);
         capacity.device_expert_bytes = capacity.slot_bytes()
             * (u64::from(geometry.layers) * u64::from(geometry.experts)
@@ -2638,7 +2629,14 @@ mod tests {
         }
         for pinned in [false, true] {
             for engines in [1, 2] {
-                let capacity = capacity(geometry, 17, pinned, engines, true)?;
+                let capacity = capacity(
+                    geometry,
+                    17,
+                    pinned,
+                    engines,
+                    true,
+                    crate::model_spec::ExpertFormat::Bf16,
+                )?;
                 assert_eq!(capacity.host_blocks, 25);
                 assert_eq!(capacity.spare_blocks, 2);
                 assert_eq!(capacity.host_expert_bytes, 27 * slot_bytes);
@@ -2647,7 +2645,14 @@ mod tests {
                 assert_eq!(capacity.pinned, pinned);
             }
         }
-        let capacity = capacity(geometry, 17, false, 2, false)?;
+        let capacity = capacity(
+            geometry,
+            17,
+            false,
+            2,
+            false,
+            crate::model_spec::ExpertFormat::Bf16,
+        )?;
         assert_eq!(
             reference_cohorts(&[0, 3, 4, 5], 0, &capacity)?,
             (vec![4, 5], vec![vec![0, 3]])
@@ -2693,15 +2698,32 @@ mod tests {
         pinned: bool,
         engines: u32,
         host_complete: bool,
+        format: crate::model_spec::ExpertFormat,
     ) -> Result<Capacity> {
-        let mut capacity = tier_capacity(geometry, pinned)?;
+        let mut capacity = tier_capacity(geometry, pinned, format)?;
         capacity.span_rows = rows;
         capacity.wave_rows = 4;
         capacity.prefill_staging_slots = 2;
         if rows > 37 {
-            capacity.slots_per_layer = vec![8, 8];
-            capacity.device_expert_bytes = 16 * capacity.slot_bytes();
-            capacity.disk_bytes = 8 * capacity.slot_bytes();
+            let borrowed = crate::experts::plan::span_borrow_slots(
+                &reserves(geometry),
+                capacity.slot_bytes(),
+                rows,
+                rows,
+            )?;
+            let per_layer = (borrowed + geometry.layers)
+                .div_ceil(geometry.layers)
+                .max(8);
+            ensure!(
+                per_layer <= geometry.experts,
+                "prefill fixture exceeds expert count"
+            );
+            capacity.slots_per_layer = vec![per_layer; geometry.layers as usize];
+            capacity.device_expert_bytes =
+                u64::from(capacity.slots_total()) * capacity.slot_bytes();
+            capacity.disk_bytes = u64::from(
+                geometry.layers * geometry.experts - capacity.slots_total() - capacity.host_blocks,
+            ) * capacity.slot_bytes();
         }
         if host_complete {
             let reserves = reserves(geometry);
@@ -2802,15 +2824,7 @@ mod tests {
             .map(|expert| {
                 let position = slots.policy.ledger().slot(layer, expert)?;
                 let pointer = slots.physical[position as usize].pointer;
-                Ok((
-                    pointer,
-                    pointer
-                        + slots
-                            .catalogue
-                            .layout()
-                            .gate_up_bytes()
-                            .context("BF16 prefill gate-up")?,
-                ))
+                Ok((pointer, pointer + slots.catalogue.layout().down_offset()))
             })
             .collect::<Result<Vec<_>>>()?;
         let gate_up = pointers.iter().map(|p| p.0).collect::<Vec<_>>();
@@ -2825,8 +2839,14 @@ mod tests {
         let mut contributions = stream.alloc_zeros::<bf16>(rows * 4 * 128)?;
         let mut done = stream.alloc_zeros::<u32>(rows * 4)?;
         let y = stream.alloc_zeros::<bf16>(rows * 128)?;
-        let scratch =
-            stream.alloc_zeros::<u8>(prefill_scratch_bytes(wave, 4, 16, 128, 64, None)? as usize)?;
+        let scratch = stream.alloc_zeros::<u8>(prefill_scratch_bytes(
+            wave,
+            4,
+            16,
+            128,
+            64,
+            slots.catalogue.layout().fp8_slot(),
+        )? as usize)?;
         for experts in &cohorts {
             let mask = host_ids
                 .iter()
@@ -2839,7 +2859,7 @@ mod tests {
                     stream,
                     MoePrefillContribute {
                         cpu_arithmetic: &arithmetic,
-                        fp8_slot: None,
+                        fp8_slot: slots.catalogue.layout().fp8_slot(),
                         x: qwen::matrix(&input, stream, base * 128, count, 128)?,
                         ids: view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
                         weights: view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,
@@ -2886,34 +2906,66 @@ mod tests {
         };
         for &expert in &cpu_experts {
             let expert = expert as usize;
-            let arena = fixture.gate_up[expert * 16384..(expert + 1) * 16384]
-                .iter()
-                .chain(&fixture.down[expert * 8192..(expert + 1) * 8192])
-                .map(|&value| {
-                    if layer == 0 {
-                        value
-                    } else {
-                        bf16::from_f32(-0.75 * value.to_f32())
-                    }
-                })
-                .collect::<Vec<_>>();
+            let mut native_slot = vec![0u8; slots.catalogue.slot_bytes() as usize];
+            let arena = if slots.catalogue.layout().fp8_slot().is_some() {
+                stream.synchronize()?;
+                // SAFETY: the resident oracle owns this initialized native slot until this read completes.
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        native_slot.as_mut_ptr().cast(),
+                        pointers[expert].0,
+                        native_slot.len(),
+                    )
+                    .result()?;
+                }
+                Vec::new()
+            } else {
+                fixture.gate_up[expert * 16384..(expert + 1) * 16384]
+                    .iter()
+                    .chain(&fixture.down[expert * 8192..(expert + 1) * 8192])
+                    .map(|&value| {
+                        if layer == 0 {
+                            value
+                        } else {
+                            bf16::from_f32(-0.75 * value.to_f32())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
             for (choice, (&id, &weight)) in host_ids.iter().zip(&host_weights).enumerate() {
                 if id as usize != expert {
                     continue;
                 }
                 let row = choice / 4;
-                contribution(
-                    Isa::detect(),
-                    Contribution {
-                        shape: &shape,
-                        arena: &arena,
-                        weights: &native,
-                        hidden: &fixture.x[row * 128..(row + 1) * 128],
-                        routing: weight,
-                    },
-                    &mut expected[choice * 128..(choice + 1) * 128],
-                    &mut cpu_scratch,
-                )?;
+                let hidden = &fixture.x[row * 128..(row + 1) * 128];
+                let out = &mut expected[choice * 128..(choice + 1) * 128];
+                if let Some(slot_layout) = slots.catalogue.layout().fp8_slot() {
+                    fp8_contribution(
+                        Isa::detect(),
+                        Fp8Contribution {
+                            shape: &shape,
+                            slot: &native_slot,
+                            slot_layout,
+                            hidden,
+                            routing: weight,
+                        },
+                        out,
+                        &mut cpu_scratch,
+                    )?;
+                } else {
+                    contribution(
+                        Isa::detect(),
+                        Contribution {
+                            shape: &shape,
+                            arena: &arena,
+                            weights: &native,
+                            hidden,
+                            routing: weight,
+                        },
+                        out,
+                        &mut cpu_scratch,
+                    )?;
+                }
             }
         }
         stream.memcpy_htod(&expected, &mut contributions)?;
@@ -2981,12 +3033,14 @@ mod tests {
         variants: &[u32],
         modes: &[(bool, u32)],
         host_complete: bool,
+        format: crate::model_spec::ExpertFormat,
     ) -> Result<()> {
         let runtime = PathBuf::from(
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("prefill gate runtime missing")?,
         );
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
         let mut defects = 0;
+        let mut total_coverage = [0u64; 5];
         for &variant in variants {
             for &rows in row_cases {
                 let fixture = inputs(variant, rows as usize);
@@ -2994,9 +3048,10 @@ mod tests {
                     &fixture,
                     &runtime.join(format!("ref-{variant}-{rows}")),
                     8,
+                    format,
                 )?;
                 let mut expected = Vec::new();
-                let reference_capacity = tier_capacity(geometry, false)?;
+                let reference_capacity = tier_capacity(geometry, false, format)?;
                 let ceiling = cpu_bound(
                     geometry,
                     reference_capacity.slot_bytes(),
@@ -3028,7 +3083,8 @@ mod tests {
                 for &(pinned, engines) in modes {
                     let directory =
                         runtime.join(format!("span-{variant}-{rows}-{pinned}-{engines}"));
-                    let capacity = capacity(geometry, rows, pinned, engines, host_complete)?;
+                    let capacity =
+                        capacity(geometry, rows, pinned, engines, host_complete, format)?;
                     let initial = vec![(0..capacity.slots_per_layer[0]).collect::<Vec<_>>(); 2];
                     let mut engine = Engine::load_moe_placed(
                         &fixture,
@@ -3313,7 +3369,6 @@ mod tests {
                     );
                     ensure!(
                         coverage[0] > 0
-                            && coverage[1] > 0
                             && coverage[3] > 0
                             && if host_complete {
                                 coverage[2] == 0 && coverage[4] == 0
@@ -3322,6 +3377,9 @@ mod tests {
                             },
                         "Runner FAIL prefill fixture coverage={coverage:?} host_complete={host_complete}"
                     );
+                    for (total, count) in total_coverage.iter_mut().zip(coverage) {
+                        *total += count;
+                    }
                     ensure!(
                         rows != 263 || expected_cancellations > 0,
                         "Runner FAIL prefill S263 has no wrong-prediction cancellation decisions"
@@ -3349,9 +3407,16 @@ mod tests {
                 }
             }
         }
+        ensure!(
+            total_coverage[0] > 0
+                && total_coverage[1] > 0
+                && total_coverage[3] > 0
+                && (host_complete || total_coverage[2] > 0 && total_coverage[4] > 0),
+            "Runner FAIL prefill gate coverage={total_coverage:?} host_complete={host_complete}"
+        );
         ensure!(defects == 0, "DEFECT prefill span cells={defects}");
         println!(
-            "PASS prefill_span_gate rows={row_cases:?} variants={variants:?} modes={modes:?} host_complete={host_complete} borrowed=true refill=true CPU_submit=true"
+            "PASS prefill_span_gate format={format:?} rows={row_cases:?} variants={variants:?} modes={modes:?} host_complete={host_complete} borrowed=true refill=true CPU_submit=true"
         );
         Ok(())
     }
@@ -3359,7 +3424,13 @@ mod tests {
     #[test]
     #[ignore = "authorized GPU window"]
     fn prefill_span_smoke_gpu() -> Result<()> {
-        gate(&[17], &[3], &[(false, 1)], false)
+        gate(
+            &[17],
+            &[3],
+            &[(false, 1)],
+            false,
+            crate::model_spec::ExpertFormat::Bf16,
+        )
     }
 
     #[test]
@@ -3371,7 +3442,14 @@ mod tests {
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
         let rows = 8;
         let fixture = inputs(3, rows);
-        let mut capacity = capacity(geometry, rows as u32, false, 2, true)?;
+        let mut capacity = capacity(
+            geometry,
+            rows as u32,
+            false,
+            2,
+            true,
+            crate::model_spec::ExpertFormat::Bf16,
+        )?;
         capacity.host_blocks = geometry.layers * geometry.experts - capacity.slots_total();
         capacity.host_expert_bytes =
             u64::from(capacity.host_blocks + capacity.spare_blocks) * capacity.slot_bytes();
@@ -3389,7 +3467,12 @@ mod tests {
             2,
             8,
         )?;
-        let oracle = Engine::load_moe_test(&fixture, &runtime.join("borrow-oracle"), 8)?;
+        let oracle = Engine::load_moe_test(
+            &fixture,
+            &runtime.join("borrow-oracle"),
+            8,
+            crate::model_spec::ExpertFormat::Bf16,
+        )?;
         let mut prefill = engine.moe_prefill.take().context("prefill missing")?;
         let mut slots = engine.moe_slots.take().context("slots missing")?;
         let mut decode = engine.moe.take().context("decode missing")?;
@@ -3466,6 +3549,7 @@ mod tests {
             &[3, 7],
             &[(false, 1), (false, 2), (true, 1), (true, 2)],
             false,
+            crate::model_spec::ExpertFormat::Bf16,
         )
     }
 
@@ -3477,7 +3561,28 @@ mod tests {
             &[3, 7],
             &[(false, 1), (false, 2), (true, 1), (true, 2)],
             true,
+            crate::model_spec::ExpertFormat::Bf16,
         )
+    }
+
+    #[test]
+    #[ignore = "GPU window and FLYINGFISH_RUNTIME_DIR required"]
+    fn fp8_prefill_residency_gpu() -> Result<()> {
+        gate(
+            &[17, 263],
+            &[3, 7],
+            &[(false, 1), (true, 2)],
+            false,
+            crate::model_spec::ExpertFormat::Fp8W8a16,
+        )?;
+        gate(
+            &[17],
+            &[3, 7],
+            &[(false, 1), (true, 2)],
+            true,
+            crate::model_spec::ExpertFormat::Fp8W8a16,
+        )?;
+        Ok(())
     }
 
     fn reference_order(
@@ -3731,7 +3836,12 @@ mod tests {
         );
         let fixture = tier_fixture(3);
         let ids = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3];
-        let mut oracle = Engine::load_moe_test(&fixture, &runtime.join("order-reference"), 8)?;
+        let mut oracle = Engine::load_moe_test(
+            &fixture,
+            &runtime.join("order-reference"),
+            8,
+            crate::model_spec::ExpertFormat::Bf16,
+        )?;
         let baseline = reference_order(&mut oracle, &ids, 8)?;
         let repeated = reference_order(&mut oracle, &ids, 8)?;
         ensure!(
@@ -3741,8 +3851,22 @@ mod tests {
         );
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
         let capacities = [
-            capacity(geometry, 17, false, 2, false)?,
-            capacity(geometry, 8, false, 2, false)?,
+            capacity(
+                geometry,
+                17,
+                false,
+                2,
+                false,
+                crate::model_spec::ExpertFormat::Bf16,
+            )?,
+            capacity(
+                geometry,
+                8,
+                false,
+                2,
+                false,
+                crate::model_spec::ExpertFormat::Bf16,
+            )?,
         ];
         let mut floor_cases = Vec::new();
         for chunk in [1, 4, 2] {
@@ -3750,7 +3874,12 @@ mod tests {
             let repeat = reference_order(&mut oracle, &ids, chunk)?;
             floor_cases.push((format!("chunk{chunk}"), other, repeat));
         }
-        let mut wide = Engine::load_moe_test(&fixture, &runtime.join("order-reference-wide"), 16)?;
+        let mut wide = Engine::load_moe_test(
+            &fixture,
+            &runtime.join("order-reference-wide"),
+            16,
+            crate::model_spec::ExpertFormat::Bf16,
+        )?;
         floor_cases.push((
             "chunk16".into(),
             reference_layer_order(&mut wide, &ids, [16, 16, 4], None)?,

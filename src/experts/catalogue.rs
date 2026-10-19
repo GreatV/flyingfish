@@ -138,10 +138,10 @@ impl ExpertLayout {
         }
     }
 
-    pub fn gate_up_bytes(&self) -> Option<u64> {
+    pub fn down_offset(&self) -> u64 {
         match self {
-            Self::Bf16Fused { gate_up_bytes, .. } => Some(*gate_up_bytes),
-            Self::Fp8W8a16(_) => None,
+            Self::Bf16Fused { gate_up_bytes, .. } => *gate_up_bytes,
+            Self::Fp8W8a16(_) => 0,
         }
     }
 
