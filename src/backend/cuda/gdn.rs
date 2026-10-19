@@ -867,7 +867,7 @@ fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32, hv: u32) -> Result<
 #[cfg(test)]
 mod tests {
     use super::prep_grids;
-    use cudarc::driver::LaunchConfig;
+    use cudarc::driver::{DevicePtr, LaunchConfig, sys};
 
     fn cfg(d: (u32, u32, u32)) -> LaunchConfig {
         LaunchConfig {
@@ -931,6 +931,10 @@ mod tests {
         out: cudarc::driver::CudaSlice<bf16>,
         state: cudarc::driver::CudaSlice<f32>,
         history: cudarc::driver::CudaSlice<f32>,
+        snapshots: Option<(
+            cudarc::driver::CudaSlice<f32>,
+            cudarc::driver::CudaSlice<f32>,
+        )>,
     }
 
     fn geometry_state(heads: usize) -> Vec<f32> {
@@ -1023,7 +1027,33 @@ mod tests {
                 out: stream.clone_htod(&vec![bf16::from_bits(0x7fc5); rows as usize * hv * 128])?,
                 state: stream.clone_htod(&geometry_state(hv))?,
                 history: stream.clone_htod(&history)?,
+                snapshots: None,
             })
+        }
+
+        fn bind_snapshots(
+            &mut self,
+            stream: &Arc<CudaStream>,
+            spec: GdnSpec,
+        ) -> Result<(Tensor<f32, 4>, Tensor<f32, 3>)> {
+            ensure!(self.snapshots.is_none(), "geometry snapshots already bound");
+            let cd = spec.conv_dim()?;
+            let poison = f32::from_bits(0x7fc1_0001);
+            self.snapshots = Some((
+                stream.clone_htod(&vec![poison; 4 * spec.hv as usize * 128 * 128])?,
+                stream.clone_htod(&vec![poison; 4 * cd as usize * 3])?,
+            ));
+            let (state, history) = self.snapshots.as_ref().context("snapshots not allocated")?;
+            Ok((
+                geometry_view(
+                    state,
+                    stream,
+                    [4, spec.hv, 128, 128],
+                    [u64::from(spec.hv) * 128 * 128, 128 * 128, 128, 1],
+                    0,
+                )?,
+                geometry_view(history, stream, [4, cd, 3], [u64::from(cd) * 3, 3, 1], 0)?,
+            ))
         }
 
         fn bindings(
@@ -1087,6 +1117,7 @@ mod tests {
         prefix_states: Vec<f32>,
         prefix_histories: Vec<f32>,
         norm_ratio: f64,
+        snapshot_mismatches: usize,
     }
 
     fn geometry_meta(
@@ -1138,17 +1169,6 @@ mod tests {
         .bytes;
         let mut workspace = stream.alloc_zeros::<u8>(bytes as usize)?;
         let ptr = workspace.device_ptr(stream).0;
-        let snapshots = if matches!(core, GeometryCore::Verify) {
-            let state = (spec.hv * DK * DV) as usize;
-            let history = (spec.conv_dim()? * spec.history_width) as usize;
-            let marker = f32::from_bits(0x7fc1_0001);
-            Some((
-                stream.clone_htod(&vec![marker; rows as usize * state])?,
-                stream.clone_htod(&vec![marker; rows as usize * history])?,
-            ))
-        } else {
-            None
-        };
         let mut plans = Vec::new();
         let sequential = matches!(core, GeometryCore::Recurrent);
         if !sequential && valid < rows {
@@ -1173,36 +1193,8 @@ mod tests {
                 buffers.bindings(stream, spec, bound, row)?,
                 p2,
             )?;
-            if let Some((state, history)) = &snapshots {
-                let slots = rows - 1;
-                plan = plan.for_rows(
-                    rows,
-                    Some((
-                        geometry_view(
-                            state,
-                            stream,
-                            [slots, spec.hv, DK, DV],
-                            [
-                                u64::from(spec.hv * DK * DV),
-                                u64::from(DK * DV),
-                                u64::from(DV),
-                                1,
-                            ],
-                            0,
-                        )?,
-                        geometry_view(
-                            history,
-                            stream,
-                            [slots, spec.conv_dim()?, spec.history_width],
-                            [
-                                u64::from(spec.conv_dim()? * spec.history_width),
-                                u64::from(spec.history_width),
-                                1,
-                            ],
-                            0,
-                        )?,
-                    )),
-                )?;
+            if matches!(core, GeometryCore::Verify) {
+                plan = plan.for_rows(rows, Some(buffers.bind_snapshots(stream, spec)?))?;
             }
             if matches!(core, GeometryCore::WrongHeadStride) {
                 let directory = std::path::PathBuf::from(
@@ -1324,8 +1316,8 @@ mod tests {
         let out = stream.clone_dtoh(&buffers.out)?;
         let state = stream.clone_dtoh(&buffers.state)?;
         let history = stream.clone_dtoh(&buffers.history)?;
-        let (prefix_states, prefix_histories) = if let Some((states, histories)) = snapshots {
-            (stream.clone_dtoh(&states)?, stream.clone_dtoh(&histories)?)
+        let (prefix_states, prefix_histories) = if let Some((states, histories)) = &buffers.snapshots {
+            (stream.clone_dtoh(states)?, stream.clone_dtoh(histories)?)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1342,6 +1334,43 @@ mod tests {
                 .all(|v| v.to_bits() == 0x7fc5),
             "geometry fixture wrote an inactive row"
         );
+        let mut snapshot_mismatches = 0;
+        if let Some((saved_state, saved_history)) = &buffers.snapshots {
+            let states = stream.clone_dtoh(saved_state)?;
+            let histories = stream.clone_dtoh(saved_history)?;
+            let state_width = spec.hv as usize * 128 * 128;
+            let history_width = spec.conv_dim()? as usize * 3;
+            for prefix in 0..4usize {
+                let state = &states[prefix * state_width..(prefix + 1) * state_width];
+                let history = &histories[prefix * history_width..(prefix + 1) * history_width];
+                if prefix + 1 < valid as usize {
+                    let reference = geometry_run(
+                        device,
+                        spec,
+                        rows,
+                        prefix as u32 + 1,
+                        GeometryCore::Recurrent,
+                        false,
+                    )?;
+                    ensure!(
+                        state.iter().chain(history).all(|value| value.is_finite()),
+                        "nonfinite geometry snapshot"
+                    );
+                    snapshot_mismatches += state
+                        .iter()
+                        .zip(&reference.state)
+                        .chain(history.iter().zip(&reference.history))
+                        .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+                        .count();
+                } else {
+                    snapshot_mismatches += state
+                        .iter()
+                        .chain(history)
+                        .filter(|value| value.to_bits() != 0x7fc1_0001)
+                        .count();
+                }
+            }
+        }
         Ok(GeometryOutput {
             out,
             state,
@@ -1349,6 +1378,7 @@ mod tests {
             prefix_states,
             prefix_histories,
             norm_ratio,
+            snapshot_mismatches,
         })
     }
 
@@ -1509,6 +1539,8 @@ mod tests {
                 .zip(&b.history)
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count()
+            + a.snapshot_mismatches
+            + b.snapshot_mismatches
     }
 
     #[test]
@@ -1584,6 +1616,7 @@ mod tests {
                 (1, 1),
                 (2, 2),
                 (5, 5),
+                (5, 2),
                 (8, 8),
                 (37, 37),
                 (64, 37),
@@ -1597,22 +1630,33 @@ mod tests {
                 (512, 509),
                 (4096, 4096),
             ] {
-                let mut cores = vec![
-                    GeometryCore::Chunked,
-                    GeometryCore::P1(4),
-                    GeometryCore::P1(8),
-                    GeometryCore::P1(16),
-                    GeometryCore::P2,
-                ];
-                if rows <= 8 {
+                let verify_tail = rows == 5 && valid == 2;
+                if verify_tail && device.info.arch != 89 {
+                    continue;
+                }
+                let mut cores = if verify_tail {
+                    vec![GeometryCore::Verify]
+                } else {
+                    vec![
+                        GeometryCore::Chunked,
+                        GeometryCore::P1(4),
+                        GeometryCore::P1(8),
+                        GeometryCore::P1(16),
+                        GeometryCore::P2,
+                    ]
+                };
+                if rows <= 8 && !verify_tail {
                     cores.push(GeometryCore::Recurrent);
+                }
+                if rows <= 5 && device.info.arch == 89 && !verify_tail {
+                    cores.push(GeometryCore::Verify);
                 }
                 for core in cores {
                     for graph in [false, true] {
-                        let reference_core = if matches!(core, GeometryCore::P2) {
-                            GeometryCore::P1(4)
-                        } else {
-                            core
+                        let reference_core = match core {
+                            GeometryCore::P2 => GeometryCore::P1(4),
+                            GeometryCore::Verify => GeometryCore::Recurrent,
+                            _ => core,
                         };
                         let reference =
                             geometry_run(&device, spec, rows, valid, reference_core, false)?;
@@ -1645,6 +1689,178 @@ mod tests {
             control.norm_ratio
         );
         ensure!(defects == 0, "GDN_GEOMETRY DEFECT cases={defects}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires exclusive sm89 window, FF_Q38_MODEL and native GDN parameters"]
+    fn gdn_operation_timing_gpu() -> Result<()> {
+        use crate::checkpoint::{LoadPolicy, MappedCheckpoint};
+        use std::path::PathBuf;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let directory =
+            PathBuf::from(std::env::var_os("FF_Q38_MODEL").context("FF_Q38_MODEL required")?);
+        let model = crate::model_spec::ModelSpec::read(&directory)?;
+        let spec = GdnSpec::from_model(&model)?;
+        ensure!(spec.hv == 48 && spec.hk == 16, "timing requires h48/hk16");
+        let mapped = MappedCheckpoint::open(&directory)?;
+        mapped.manifest(&model, LoadPolicy::TextOnly)?;
+        let views = mapped.views()?;
+        let read = |suffix: &str, shape: &[usize]| -> Result<Vec<bf16>> {
+            let name = format!("model.language_model.layers.0.linear_attn.{suffix}");
+            let shard = mapped
+                .index
+                .weight_map
+                .get(&name)
+                .context("GDN weight missing")?;
+            let tensor = views
+                .get(shard)
+                .context("GDN shard missing")?
+                .tensor(&name)?;
+            ensure!(
+                tensor.dtype() == safetensors::Dtype::BF16 && tensor.shape() == shape,
+                "native GDN tensor dtype/shape mismatch {name}"
+            );
+            let mut bytes = vec![0u8; tensor.data().len()];
+            mapped.read_mapped_range(shard, tensor.data(), &mut bytes)?;
+            Ok(bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|value| bf16::from_bits(u16::from_le_bytes([value[0], value[1]])))
+                .collect())
+        };
+        let cd = spec.conv_dim()? as usize;
+        let conv = read("conv1d.weight", &[cd, 1, 4])?;
+        let a_log = read("A_log", &[spec.hv as usize])?;
+        let dt = read("dt_bias", &[spec.hv as usize])?;
+        drop(views);
+        drop(mapped);
+        let device = crate::backend::cuda::Device::new(0)?;
+        ensure!(device.info.arch == 89, "operator timing requires sm89");
+        let stream = &device.stream;
+        for (mode, rows, valid) in [
+            ("recurrent", 1, 1),
+            ("legacy", 2, 2),
+            ("legacy", 5, 5),
+            ("verify", 2, 2),
+            ("verify", 5, 5),
+            ("verify", 5, 2),
+            ("legacy", 64, 64),
+            ("legacy", 512, 512),
+            ("legacy", 512, 509),
+            ("legacy", 4096, 4096),
+            ("p2", 64, 64),
+            ("p2", 512, 512),
+            ("p2", 512, 509),
+            ("p2", 4096, 4096),
+        ] {
+            let mut buffers = GeometryBuffers::new(stream, spec, rows, valid)?;
+            stream.memcpy_htod(&conv, &mut buffers.conv)?;
+            stream.memcpy_htod(&a_log, &mut buffers.a_log)?;
+            stream.memcpy_htod(&dt, &mut buffers.dt)?;
+            let initial_state = geometry_state(spec.hv as usize);
+            let initial_history = stream.clone_dtoh(&buffers.history)?;
+            let p2 = mode == "p2";
+            let bytes = GdnOps::workspace(
+                &spec,
+                rows,
+                if p2 { GdnPolicy::P2 } else { GdnPolicy::LEGACY },
+            )?
+            .bytes;
+            let workspace = stream.alloc_zeros::<u8>(bytes as usize)?;
+            let ptr = workspace.device_ptr(stream).0;
+            let mut plan = GdnOps::prepare(
+                &device.ctx,
+                &spec,
+                rows,
+                buffers.bindings(stream, spec, rows, 0)?,
+                p2,
+            )?;
+            if mode == "verify" {
+                plan = plan.for_rows(rows, Some(buffers.bind_snapshots(stream, spec)?))?;
+            }
+            let metadata = geometry_meta(stream, 23, valid)?;
+            let meta = SeqRef {
+                ptr: metadata.device_ptr(stream).0,
+            };
+            device.finish_upload()?;
+            let execute = || -> Result<()> {
+                if mode == "verify" {
+                    GdnOps::run_verify(&plan, stream, meta, Scratch { ptr, bytes })
+                } else {
+                    GdnOps::run(
+                        &plan,
+                        stream,
+                        meta,
+                        if mode == "recurrent" {
+                            ExecutionPhase::Decode
+                        } else {
+                            ExecutionPhase::Prefill
+                        },
+                        Scratch { ptr, bytes },
+                    )
+                }
+            };
+            execute()?;
+            let reference_out = stream.clone_dtoh(&buffers.out)?;
+            let reference_state = stream.clone_dtoh(&buffers.state)?;
+            let reference_history = stream.clone_dtoh(&buffers.history)?;
+            for graph in [false, true] {
+                let captured = if graph {
+                    stream.begin_capture(
+                        sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                    )?;
+                    let result = execute();
+                    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                    result?;
+                    Some(captured?.context("empty GDN operation graph")?)
+                } else {
+                    None
+                };
+                let mean_ms = crate::backend::cuda::time_prepared_operation(
+                    stream,
+                    || {
+                        stream.memcpy_htod(&initial_state, &mut buffers.state)?;
+                        stream.memcpy_htod(&initial_history, &mut buffers.history)?;
+                        Ok(())
+                    },
+                    || {
+                        if let Some(graph) = &captured {
+                            graph.launch()?;
+                            Ok(())
+                        } else {
+                            execute()
+                        }
+                    },
+                )?;
+                let out = stream.clone_dtoh(&buffers.out)?;
+                let state = stream.clone_dtoh(&buffers.state)?;
+                let history = stream.clone_dtoh(&buffers.history)?;
+                ensure!(
+                    out.iter()
+                        .zip(&reference_out)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                        && state
+                            .iter()
+                            .zip(&reference_state)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                        && history
+                            .iter()
+                            .zip(&reference_history)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "GDN operation reset/replay changed mode={mode} rows={rows} valid={valid} graph={graph}"
+                );
+                println!(
+                    "T20_OP_SAMPLE {}",
+                    serde_json::json!({"operation":"gdn","mode":mode,"rows":rows,"valid":valid,
+                        "graph":graph,"warm":16,"calls":32,"mean_ms":mean_ms,"native_weights":true})
+                );
+            }
+        }
         Ok(())
     }
 

@@ -3453,6 +3453,133 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires exclusive sm89 vision window and the native Qwen checkpoint"]
+    fn vision_patch_operation_timing_gpu() -> Result<()> {
+        use crate::backend::cuda::{closure::Closure, ops::Ops};
+        use std::{path::PathBuf, rc::Rc, time::Instant};
+        ensure!(
+            std::env::var("FF_Q38_VISION_WINDOW").as_deref() == Ok("granted"),
+            "vision GPU window missing"
+        );
+        let directory =
+            PathBuf::from(std::env::var_os("FF_Q38_MODEL").context("model directory missing")?);
+        let output = PathBuf::from(
+            std::env::var_os("FF_Q38_VISION_OUTPUT_DIR")
+                .context("vision output directory missing")?,
+        );
+        std::fs::create_dir_all(&output)?;
+        let model = ModelSpec::read(&directory)?;
+        ensure!(
+            model.architecture == Architecture::Qwen35Text,
+            "patch timing requires the Qwen checkpoint"
+        );
+        let geometry = VisionGeometry::from_model(&model)?;
+        let vision = model
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        let stored_shape = [
+            vision.hidden as usize,
+            vision.channels as usize,
+            vision.temporal_patch as usize,
+            vision.patch as usize,
+            vision.patch as usize,
+        ];
+        ensure!(
+            stored_shape == [1152, 3, 2, 16, 16] && geometry.patch == 1536,
+            "patch timing checkpoint geometry mismatch"
+        );
+        let device = Device::new(0)?;
+        ensure!(device.info.arch == 89, "operator timing requires sm89");
+        let stream = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        let closure = Rc::new(Closure::new(false, "patch operation timing".into()));
+        let mut blas = Blas::new(&device, &ops, &output, closure.clone())?;
+        let mut catalog = WeightCatalog::load_with_policy(
+            &directory,
+            &model,
+            &device,
+            crate::checkpoint::LoadPolicy::VisionOnly,
+        )?;
+        let patch = BiasedWeight::patch(
+            &mut catalog,
+            "model.visual.patch_embed.proj",
+            [vision.hidden, geometry.patch],
+            &stored_shape,
+        )?;
+        drop(catalog);
+        for rows in [1u32, 37, 1120, 7104] {
+            patch.prepare(stream, &mut blas, rows)?;
+        }
+        closure.freeze_fixed()?;
+        closure.ready(Instant::now())?;
+        device.finish_upload()?;
+        for rows in [1u32, 37, 1120, 7104] {
+            let input: Vec<_> = (0..rows as usize * geometry.patch as usize)
+                .map(|index| bf16::from_f32(((index * 17 % 251) as f32 - 125.0) / 128.0))
+                .collect();
+            let input = stream.clone_htod(&input)?;
+            let output = stream.alloc_zeros::<bf16>(rows as usize * vision.hidden as usize)?;
+            let execute = || {
+                patch.run(
+                    stream,
+                    &blas,
+                    dense(&input, stream, [rows, geometry.patch])?,
+                    &mut TensorMut(dense(&output, stream, [rows, vision.hidden])?),
+                )
+            };
+            execute()?;
+            let reference = stream.clone_dtoh(&output)?;
+            ensure!(
+                reference.iter().all(|value| value.is_finite()),
+                "nonfinite native patch output"
+            );
+            for graph in [false, true] {
+                let captured = if graph {
+                    stream.begin_capture(
+                        cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                    )?;
+                    let result = execute();
+                    let captured =
+                        stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    result?;
+                    Some(captured?.context("empty patch operation graph")?)
+                } else {
+                    None
+                };
+                let mean_ms = crate::backend::cuda::time_prepared_operation(
+                    stream,
+                    || Ok(()),
+                    || {
+                        if let Some(graph) = &captured {
+                            graph.launch()?;
+                            Ok(())
+                        } else {
+                            execute()
+                        }
+                    },
+                )?;
+                ensure!(
+                    stream
+                        .clone_dtoh(&output)?
+                        .iter()
+                        .zip(&reference)
+                        .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+                    "patch operation replay changed rows={rows} graph={graph}"
+                );
+                println!(
+                    "T20_OP_SAMPLE {}",
+                    serde_json::json!({"operation":"patch","mode":"biased_projection",
+                        "rows":rows,"valid":rows,"graph":graph,"warm":16,"calls":32,
+                        "mean_ms":mean_ms,"native_weights":true,"bias_mode":format!("{:?}",patch.bias_mode)})
+                );
+            }
+        }
+        closure.assert_ready()?;
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires local vision GPU window and model/fixture/output paths; full tower diagnostics"]
     fn vision_tower_gpu() -> Result<()> {
         use crate::backend::cuda::{closure::Closure, ops::Ops};
