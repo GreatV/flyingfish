@@ -55,11 +55,11 @@ extern "C" __global__ void moe_gemm_lane16_w8a16(
   moe_lane16<true>(matrices, problems, first, columns, inner, scale_offset);
 }
 
-// A128x64, B64x64; four warps own64x32 outputs, with increasing k16 MMA steps.
-extern "C" __global__ void __launch_bounds__(128) moe_gemm_w8a16(
+// A128x64, B64x64; eight warps own32x32 outputs, with increasing k16 MMA steps.
+extern "C" __global__ void __launch_bounds__(256) moe_gemm_w8a16(
     const unsigned long long* __restrict__ matrices, int problems,
     int tensor_problems, int columns, int inner, unsigned long long scale_offset) {
-  if (blockDim.x != 128 || tensor_problems < 1 || tensor_problems > problems ||
+  if (blockDim.x != 256 || tensor_problems < 1 || tensor_problems > problems ||
       columns < 1 || inner < 1 || (inner & 7) != 0 || blockIdx.z >= tensor_problems)
     __trap();
   constexpr int CK = 64, LDS = 72;
@@ -74,10 +74,10 @@ extern "C" __global__ void __launch_bounds__(128) moe_gemm_w8a16(
   __shared__ __align__(16) bf16 weight_tile[128][LDS];
   __shared__ __align__(16) bf16 input_tile[64][LDS];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int wm = (warp >> 1) * 64, wn = (warp & 1) * 32;
-  float accum[4][4][4] = {};
+  const int wm = (warp >> 1) * 32, wn = (warp & 1) * 32;
+  float accum[2][4][4] = {};
   for (int k0 = 0; k0 < inner; k0 += CK) {
-    for (int index = tid; index < 64 * (CK / 8); index += 128) {
+    for (int index = tid; index < 64 * (CK / 8); index += 256) {
       const int row = index / (CK / 8), col = (index % (CK / 8)) * 8;
       const bool live = n0 + row < acts && k0 + col < inner;
       const bf16* source = live ? input + (size_t)(n0 + row) * inner + k0 + col : input;
@@ -87,7 +87,7 @@ extern "C" __global__ void __launch_bounds__(128) moe_gemm_w8a16(
           :: "r"(destination), "l"(source), "r"(bytes) : "memory");
     }
     asm volatile("cp.async.commit_group;");
-    for (int index = tid; index < 128 * (CK / 8); index += 128) {
+    for (int index = tid; index < 128 * (CK / 8); index += 256) {
       const int row = index / (CK / 8), col = (index % (CK / 8)) * 8;
       uint4 decoded = {};
       if (m0 + row < columns && k0 + col < inner) {
@@ -107,9 +107,9 @@ extern "C" __global__ void __launch_bounds__(128) moe_gemm_w8a16(
     __syncthreads();
 #pragma unroll
     for (int kk = 0; kk < CK; kk += 16) {
-      unsigned a[4][4], b[4][2];
+      unsigned a[2][4], b[4][2];
 #pragma unroll
-      for (int m = 0; m < 4; ++m) {
+      for (int m = 0; m < 2; ++m) {
         const unsigned address = (unsigned)__cvta_generic_to_shared(
             &weight_tile[wm + m * 16 + (lane & 15)][kk + (lane >> 4) * 8]);
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -125,7 +125,7 @@ extern "C" __global__ void __launch_bounds__(128) moe_gemm_w8a16(
             : "=r"(b[n][0]), "=r"(b[n][1]) : "r"(address));
       }
 #pragma unroll
-      for (int m = 0; m < 4; ++m) {
+      for (int m = 0; m < 2; ++m) {
 #pragma unroll
         for (int n = 0; n < 4; ++n) {
           if (n0 + wn + n * 8 >= acts) continue;
@@ -141,7 +141,7 @@ extern "C" __global__ void __launch_bounds__(128) moe_gemm_w8a16(
     __syncthreads();
   }
 #pragma unroll
-  for (int m = 0; m < 4; ++m) {
+  for (int m = 0; m < 2; ++m) {
 #pragma unroll
     for (int n = 0; n < 4; ++n) {
 #pragma unroll

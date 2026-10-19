@@ -1375,7 +1375,7 @@ impl PrefillOps {
                             rows.div_ceil(64),
                             tensor_problems as u32,
                         ),
-                        block_dim: (128, 1, 1),
+                        block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
                     })?;
             }
