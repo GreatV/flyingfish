@@ -752,7 +752,7 @@ fn qwen_target_hidden_capture_gpu() -> Result<()> {
     let settings = Settings {
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
-        spec_graph: false,
+        spec_graph: true,
         draft_model: Some(draft.clone()),
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
         prefix_cache: false,
@@ -763,6 +763,10 @@ fn qwen_target_hidden_capture_gpu() -> Result<()> {
     ensure!(
         model.qwen.is_some() && model.moe_prefill.is_some() && model.spec.is_some(),
         "draft-attached Qwen capture binding missing"
+    );
+    ensure!(
+        !model.graphs.is_empty(),
+        "capture parity gate requires declared target graphs"
     );
     model.reset()?;
     model.prepare_graphs()?;
@@ -794,7 +798,11 @@ fn qwen_target_hidden_capture_gpu() -> Result<()> {
         .reference_geometry()[0];
     let poison = bf16::from_f32(-17.0);
     let signature = |model: &Engine, rows: usize| -> Result<[Vec<u8>; 4]> {
-        model.check_logits()?;
+        let logits = s.clone_dtoh(&model.work.logits)?;
+        ensure!(
+            logits.iter().all(|value| value.to_f32().is_finite()),
+            "non-finite capture signature logits"
+        );
         let mut bits = [qwen_state_bits(model)?, Vec::new(), Vec::new(), Vec::new()];
         for (index, value) in [&model.work.x, &model.work.n].into_iter().enumerate() {
             copy::bits(&s, &value.slice(..rows * hidden), &mut bits[index + 1])?;
@@ -1109,7 +1117,7 @@ fn qwen_target_hidden_capture_gpu() -> Result<()> {
     pin(&mut model)?;
     prefill(&mut model, &prefix, None, false)?;
     model.reset()?;
-    let placement = pin(&mut model)?;
+    pin(&mut model)?;
     prefill(&mut model, &prefix, None, false)?;
     let decode_placement = model
         .moe_slots
@@ -1126,11 +1134,6 @@ fn qwen_target_hidden_capture_gpu() -> Result<()> {
     poison_capture(&mut model)?;
     let mut trace = Trace::default();
     model.profiler_start()?;
-    let graph_routed = model
-        .moe_prefill
-        .as_ref()
-        .context("prefill missing")?
-        .capture_frequency();
     model.decode(false, Some((&mut trace, "decode")))?;
     let expected = signature(&model, 1)?;
     let disabled_equal = expected == disabled_state;
@@ -1155,12 +1158,74 @@ fn qwen_target_hidden_capture_gpu() -> Result<()> {
     )?;
     defects += usize::from(result.0 != 0);
     old_noop += result.1;
+    let graph_rows = model
+        .spec
+        .as_ref()
+        .context("draft state missing")?
+        .draft
+        .config
+        .verify_rows()?;
+    let graph_ids: Vec<_> = (0..graph_rows).map(|row| (row * 269 + 23) as u32).collect();
+    model.reset()?;
+    let graph_seed = pin(&mut model)?;
+    prefill(&mut model, &prefix, None, false)?;
+    let graph_placement = model
+        .moe_slots
+        .as_ref()
+        .context("expert slots missing")?
+        .capture_placement()?;
+    let graph_routed = model
+        .moe_prefill
+        .as_ref()
+        .context("prefill missing")?
+        .capture_frequency();
+    poison_capture(&mut model)?;
+    s.memcpy_htod(&graph_ids, &mut model.work.ids.slice_mut(..graph_rows))?;
+    let mut verify_trace = Trace::default();
+    model.run_step(
+        crate::backend::Step {
+            rows: graph_rows,
+            input: crate::backend::Input::Ids,
+            head: Head::All,
+            mask: crate::backend::Mask::Causal,
+        },
+        Some(Target {
+            trace: &mut verify_trace,
+            prefix: "verify",
+            skip: 0,
+        }),
+    )?;
+    let graph_expected = signature(&model, graph_rows)?;
+    let graph_capture = s.clone_dtoh(
+        &model
+            .hidden_capture
+            .as_ref()
+            .context("target capture missing")?
+            .values,
+    )?;
+    let spec = model.spec.as_ref().context("draft state missing")?;
+    let graph_logits = s.clone_dtoh(&spec.logits)?;
+    let graph_predictions = s.clone_dtoh(&spec.predictions)?;
+    ensure!(
+        graph_logits.iter().all(|x| x.to_f32().is_finite()),
+        "non-finite verify capture reference logits"
+    );
+    let result = captured_trace_bits(
+        &graph_capture[..graph_rows * width],
+        (graph_rows, hidden),
+        &layers,
+        &verify_trace,
+        "verify",
+        poison,
+    )?;
+    defects += usize::from(result.0 != 0);
+    old_noop += result.1;
     for _ in 0..2 {
         model.reset()?;
         ensure!(
             placement_matches(
                 pin(&mut model)?,
-                &placement,
+                &graph_seed,
                 "graph_seed",
                 Some(prefix.len()),
                 Some(&graph_routed)
@@ -1174,13 +1239,14 @@ fn qwen_target_hidden_capture_gpu() -> Result<()> {
                 .as_ref()
                 .context("expert slots missing")?
                 .capture_placement()?,
-            &decode_placement,
+            &graph_placement,
             "graph_prefix",
             None,
             None,
         )?);
         poison_capture(&mut model)?;
-        model.decode(true, None)?;
+        s.memcpy_htod(&graph_ids, &mut model.work.ids.slice_mut(..graph_rows))?;
+        model.launch_spec_graph(SpecPhase::Verify)?;
         let actual = s.clone_dtoh(
             &model
                 .hidden_capture
@@ -1188,13 +1254,26 @@ fn qwen_target_hidden_capture_gpu() -> Result<()> {
                 .context("target capture missing")?
                 .values,
         )?;
+        let spec = model.spec.as_ref().context("draft state missing")?;
+        let logits = s.clone_dtoh(&spec.logits)?;
+        ensure!(
+            actual.iter().chain(&logits).all(|x| x.to_f32().is_finite()),
+            "non-finite verify capture replay"
+        );
         let equal = actual
             .iter()
-            .zip(&expected_capture)
+            .zip(&graph_capture)
             .all(|(a, b)| a.to_bits() == b.to_bits())
-            && signature(&model, 1)? == expected;
+            && logits
+                .iter()
+                .zip(&graph_logits)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+            && s.clone_dtoh(&spec.predictions)? == graph_predictions
+            && signature(&model, graph_rows)? == graph_expected;
         defects += usize::from(!equal);
-        println!("QWEN_CAPTURE_GRAPH prefix=17 rows=1 bitwise_equal={equal} defects={defects}");
+        println!(
+            "QWEN_CAPTURE_GRAPH prefix=17 rows={graph_rows} phase=verify bitwise_equal={equal} defects={defects}"
+        );
     }
     let original = model
         .hidden_capture
