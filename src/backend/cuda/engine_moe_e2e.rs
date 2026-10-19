@@ -905,8 +905,12 @@ fn chain_state(model: &Engine) -> Result<Vec<u8>> {
         }
     }
     for cache in &model.state.kv {
-        copy::bits(stream, &cache.k, &mut values)?;
-        copy::bits(stream, &cache.v, &mut values)?;
+        for buffer in [&cache.k, &cache.v] {
+            for value in stream.clone_dtoh(buffer)? {
+                ensure!(value.is_finite(), "nonfinite chain KV");
+                values.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
     }
     Ok(values)
 }
@@ -1630,6 +1634,11 @@ fn chain_replay(
     let stream = model.device.stream.clone();
     let actual = chain_state(model)?;
     model.check_logits()?;
+    let verified = stream.clone_dtoh(&model.spec.as_ref().context("chain missing")?.logits)?;
+    ensure!(
+        verified.iter().all(|value| value.is_finite()),
+        "nonfinite chain verification logits"
+    );
     let logits = stream.clone_dtoh(&model.work.logits)?;
     let sequence = stream.clone_dtoh(
         model
@@ -1960,6 +1969,120 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(defects == 0, "DEFECT MiniCPM chain decode count={defects}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA, T0 fixtures, pinned calibration and explicit draft/graph timing arms"]
+fn minicpm_chain_decode_timing_gpu() -> Result<()> {
+    // R4: eight ABBA blocks, three measured decodes after one warmup per arm.
+    // Paired bootstrap: 20,000 resamples, seed 20261019, 95% CI.
+    // Upper < 1 is PASS; lower >= 1 is no speedup; the remaining outcome is INCONCLUSIVE.
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let target = PathBuf::from(std::env::var("FF_MODEL")?);
+    let fixtures = PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+    let graph = match std::env::var("FF_MINICPM_DECODE_GRAPH")?.as_str() {
+        "graph" => true,
+        "eager" => false,
+        value => anyhow::bail!("chain timing graph mode={value}"),
+    };
+    let settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        draft_model: std::env::var_os("FF_ARGMAX_DRAFT").map(PathBuf::from),
+        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut inputs = Vec::new();
+    for case in ["text_1k", "text_4k"] {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let tensors = SafeTensors::deserialize(&bytes)?;
+        inputs.push((case, integers(&tensors, "input_ids")?));
+    }
+    let capacity = (inputs
+        .iter()
+        .map(|(_, ids)| ids.len())
+        .max()
+        .context("no timing inputs")?
+        + 256
+        + crate::linear_plan::MAX_SKINNY_ROWS)
+        .next_multiple_of(32);
+    let setup = Instant::now();
+    let mut model = Engine::load(&target, 0, capacity, None, settings)?;
+    let setup_seconds = setup.elapsed().as_secs_f64();
+    let eos = model.model_spec.eos.clone();
+    let with_draft = model.spec.is_some();
+    if with_draft {
+        model.set_spec_graph(graph)?;
+        model.set_spec_eos(&eos)?;
+    }
+    let slots = model
+        .moe_slots
+        .as_ref()
+        .context("chain timing requires MoE slots")?
+        .storage
+        .layout();
+    let slots = (0..model.model_spec.layers.len())
+        .map(|layer| slots.slot_count(layer as u32))
+        .collect::<Result<Vec<_>>>()?;
+    println!(
+        "minicpm_chain_timing_plan {}",
+        serde_json::json!({"with_draft":with_draft,
+        "capacity":capacity,"slots_per_layer":slots,"setup_seconds":setup_seconds})
+    );
+    let mut defects = 0;
+    for (case, input) in inputs {
+        let mut expected = None;
+        for run in 0..4 {
+            model.reset()?;
+            let prefill = Instant::now();
+            let first = model.prefill(&input, None)?;
+            model.synchronize()?;
+            let prefill_seconds = prefill.elapsed().as_secs_f64();
+            let mut ids = vec![first];
+            let mut rounds = Vec::new();
+            let range = super::super::super::profile::Range::new(run > 0, c"minicpm_chain_decode");
+            let timer = Instant::now();
+            while ids.len() < 256 && !eos.contains(ids.last().context("timing output missing")?) {
+                if with_draft {
+                    let round = model.spec_round(256 - ids.len(), None, "timing")?;
+                    ids.extend(&round.output);
+                    rounds.push(round);
+                } else {
+                    ids.push(model.decode(graph, None)?);
+                }
+            }
+            model.synchronize()?;
+            let seconds = timer.elapsed().as_secs_f64();
+            drop(range);
+            model.check_logits()?;
+            ensure!(
+                seconds.is_finite() && seconds > 0.0,
+                "nonfinite/nonpositive chain timing"
+            );
+            let same = expected.as_ref().is_none_or(|expected| *expected == ids);
+            defects += usize::from(!same);
+            println!(
+                "{} minicpm_chain_decode_timing {}",
+                if same { "PASS" } else { "DEFECT" },
+                serde_json::json!({"case":case,"run":run,"measured":run>0,"with_draft":with_draft,
+                    "graph":graph,"seconds":seconds,"prefill_seconds":prefill_seconds,
+                    "tokens":ids.len(),"ids":ids,"rounds":rounds})
+            );
+            if expected.is_none() {
+                expected = Some(ids);
+            }
+        }
+    }
+    ensure!(
+        defects == 0,
+        "DEFECT chain timing output changed across repeats count={defects}"
+    );
     Ok(())
 }
 
