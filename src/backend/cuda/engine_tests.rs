@@ -66,16 +66,23 @@ fn chain_geometry_is_checked_before_device_setup() -> Result<()> {
                         let expected = if budget.is_tree() && block + 1 != SpecBudget::Chain.rows()
                         {
                             rejected += 1;
-                            "tree draft block_size="
+                            Some("tree draft block_size=")
                         } else if capacity == block + 1 {
                             rejected += 1;
-                            "DSpark block_size="
+                            Some("DSpark block_size=")
                         } else {
                             declared += 1;
-                            "runtime path is not a directory"
+                            None
+                        };
+                        let reached = match expected {
+                            Some(prefix) => error.to_string().starts_with(prefix),
+                            None if write => error
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists),
+                            None => error.to_string() == "runtime path is not a directory",
                         };
                         ensure!(
-                            error.to_string().starts_with(expected),
+                            reached,
                             "draft block={block} capacity={capacity} budget={budget:?} validation order: {error:#}"
                         );
                     }
