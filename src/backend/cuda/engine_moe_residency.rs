@@ -653,10 +653,10 @@ impl Slots {
         );
         let offset = layer * geometry.experts as usize;
         Ok(SlotBindings {
-            gate_up: qwen::view(&self.gate_up, stream, offset, [geometry.experts], [1])?,
-            down: qwen::view(&self.down, stream, offset, [geometry.experts], [1])?,
-            valid: qwen::view(&self.valid, stream, offset, [geometry.experts], [1])?,
-            generation: qwen::view(&self.generation, stream, offset, [geometry.experts], [1])?,
+            gate_up: view(&self.gate_up, stream, offset, [geometry.experts], [1])?,
+            down: view(&self.down, stream, offset, [geometry.experts], [1])?,
+            valid: view(&self.valid, stream, offset, [geometry.experts], [1])?,
+            generation: view(&self.generation, stream, offset, [geometry.experts], [1])?,
         })
     }
 

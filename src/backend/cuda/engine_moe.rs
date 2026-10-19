@@ -1,7 +1,7 @@
 //! Eager routed-FFN execution over caller-provided residency decisions.
 use super::*;
 use crate::backend::cuda::{
-    contracts::{Tensor, TensorMut},
+    contracts::{Tensor, TensorMut, view},
     linear::BoundFfn,
     moe::{
         combine::{CombineOps, MoeCombine},
@@ -601,14 +601,14 @@ impl Decode {
             stream,
             x,
             router,
-            &mut TensorMut(qwen::view(
+            &mut TensorMut(view(
                 &self.ids,
                 stream,
                 0,
                 [rows as u32, k],
                 [u64::from(k), 1],
             )?),
-            &mut TensorMut(qwen::view(
+            &mut TensorMut(view(
                 &self.weights,
                 stream,
                 0,
@@ -815,15 +815,15 @@ impl Decode {
                 )?
             };
         }
-        let ids = qwen::view(&self.ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
-        let active = qwen::view(
+        let ids = view(&self.ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
+        let active = view(
             &self.active,
             stream,
             0,
             [rows as u32, k as u32],
             [k as u64, 1],
         )?;
-        let contributions = qwen::view(
+        let contributions = view(
             &self.contributions,
             stream,
             0,
@@ -831,7 +831,7 @@ impl Decode {
             [(k * hidden) as u64, hidden as u64, 1],
         )?;
         let mut shared_out = TensorMut(qwen::matrix(&self.shared, stream, 0, rows, hidden)?);
-        let mut done = TensorMut(qwen::view(
+        let mut done = TensorMut(view(
             &self.done,
             stream,
             0,
@@ -844,7 +844,7 @@ impl Decode {
                 x,
                 ids,
                 active,
-                weights: qwen::view(
+                weights: view(
                     &self.weights,
                     stream,
                     0,
@@ -855,7 +855,7 @@ impl Decode {
                 slots_down: slots.down,
                 slot_valid: slots.valid,
                 slot_generation: slots.generation,
-                assignment_gen: qwen::view(
+                assignment_gen: view(
                     &self.generation,
                     stream,
                     0,
@@ -886,14 +886,14 @@ impl Decode {
             self.geometry.hidden as usize,
         );
         let stream = &device.stream;
-        let contributions = qwen::view(
+        let contributions = view(
             &self.contributions,
             stream,
             0,
             [rows as u32, k as u32, hidden as u32],
             [(k * hidden) as u64, hidden as u64, 1],
         )?;
-        let done = qwen::view(
+        let done = view(
             &self.done,
             stream,
             0,
@@ -953,8 +953,8 @@ impl Decode {
             self.geometry.hidden as usize,
         );
         let stream = &device.stream;
-        let ids = qwen::view(&self.ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
-        let contributions = qwen::view(
+        let ids = view(&self.ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
+        let contributions = view(
             &self.contributions,
             stream,
             0,
@@ -962,23 +962,17 @@ impl Decode {
             [(k * hidden) as u64, hidden as u64, 1],
         )?;
         let shared_out = qwen::matrix(&self.shared, stream, 0, rows, hidden)?;
-        let done = qwen::view(
+        let done = view(
             &self.done,
             stream,
             0,
             [rows as u32, k as u32],
             [k as u64, 1],
         )?;
-        let mut scale = TensorMut(qwen::view(
-            &self.scale,
-            stream,
-            0,
-            [rows as u32, 1],
-            [1, 1],
-        )?);
+        let mut scale = TensorMut(view(&self.scale, stream, 0, [rows as u32, 1], [1, 1])?);
         self.combine
             .shared_scale(stream, x, shared_gate, &mut scale)?;
-        let final_active = qwen::view(
+        let final_active = view(
             &self.final_active,
             stream,
             0,

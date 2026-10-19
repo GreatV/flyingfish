@@ -460,6 +460,7 @@ impl Engine {
             None
         };
         let mut engine = Self {
+            hidden_capture: None,
             capture_fail_after_layer: None,
             capture_fail_stage: None,
             qwen: None,
@@ -553,19 +554,10 @@ impl Engine {
         self.inject_moe_test_positions(pos_axes)?;
         let stream = &self.device.stream;
         stream.memcpy_htod(hidden_in, &mut self.work.x.slice_mut(..hidden_in.len()))?;
-        if self.qwen.is_none() {
-            unsafe {
-                stream
-                    .launch_builder(&self.ops.norm)
-                    .arg(&self.work.x)
-                    .arg(&self.weights.layers[layer].input_norm)
-                    .arg(&mut self.work.n)
-                    .arg(&(rows as i32))
-                    .arg(&(hidden as i32))
-                    .arg(&self.config.rms_norm_eps)
-                    .launch(grid(rows, 256))?;
-            }
-        }
+        ensure!(
+            self.qwen.is_some(),
+            "layer injection requires the hybrid runtime"
+        );
         self.moe_slots
             .as_mut()
             .context("injected layer has no residency")?
@@ -1193,7 +1185,7 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
         .context("test slots absent")?
         .bindings(layer, stream)?;
     let xv = qwen::matrix(&x, stream, 0, rows, h)?;
-    let idv = qwen::view(&ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
+    let idv = view(&ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
     let weightv = qwen::matrix(&weights, stream, 0, rows, k)?;
     RouteOps::new(ctx, stream)?.route(
         stream,
@@ -1218,13 +1210,13 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
         &MoeDecode {
             x: xv,
             ids: idv,
-            active: qwen::view(&active, stream, 0, [rows as u32, k as u32], [k as u64, 1])?,
+            active: view(&active, stream, 0, [rows as u32, k as u32], [k as u64, 1])?,
             weights: weightv,
             slots_gate_up: slots.gate_up,
             slots_down: slots.down,
             slot_valid: slots.valid,
             slot_generation: slots.generation,
-            assignment_gen: qwen::view(
+            assignment_gen: view(
                 &generation,
                 stream,
                 0,
@@ -1235,7 +1227,7 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
             shared_up: shared[1],
             shared_down: shared[2],
             shared_expert_gate: shared_gate,
-            contributions: qwen::view(
+            contributions: view(
                 &contributions,
                 stream,
                 0,
@@ -1243,7 +1235,7 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
                 [(k * h) as u64, h as u64, 1],
             )?,
             shared_out: &mut TensorMut(qwen::matrix(&shared_out, stream, 0, rows, h)?),
-            done: &mut TensorMut(qwen::view(
+            done: &mut TensorMut(view(
                 &done,
                 stream,
                 0,
@@ -1332,16 +1324,16 @@ fn combine_expected(engine: &Engine, contributions: &[bf16], rows: usize) -> Res
     let BoundFfn::Moe { shared_gate, .. } = ffn else {
         anyhow::bail!("dense CPU control FFN");
     };
-    let scale = qwen::view(&expected_scale, stream, 0, [rows as u32, 1], [1, 1])?;
+    let scale = view(&expected_scale, stream, 0, [rows as u32, 1], [1, 1])?;
     let combine = CombineOps::new(&engine.device.ctx)?;
     combine.shared_scale(stream, x, shared_gate, &mut TensorMut(scale))?;
     combine.combine(
         stream,
         &MoeCombine {
-            ids: qwen::view(&decode.ids, stream, 0, [rows as u32, 4], [4, 1])?,
-            final_active: qwen::view(&decode.final_active, stream, 0, [rows as u32, 4], [4, 1])?,
-            done: qwen::view(&decode.done, stream, 0, [rows as u32, 4], [4, 1])?,
-            contributions: qwen::view(
+            ids: view(&decode.ids, stream, 0, [rows as u32, 4], [4, 1])?,
+            final_active: view(&decode.final_active, stream, 0, [rows as u32, 4], [4, 1])?,
+            done: view(&decode.done, stream, 0, [rows as u32, 4], [4, 1])?,
+            contributions: view(
                 &expected_contributions,
                 stream,
                 0,

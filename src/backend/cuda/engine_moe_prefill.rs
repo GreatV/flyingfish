@@ -206,10 +206,10 @@ impl Tables {
             )?;
         }
         Ok(SlotBindings {
-            gate_up: qwen::view(&self.gate_up, stream, 0, [experts], [1])?,
-            down: qwen::view(&self.down, stream, 0, [experts], [1])?,
-            valid: qwen::view(&self.valid, stream, 0, [experts], [1])?,
-            generation: qwen::view(&self.generation, stream, 0, [experts], [1])?,
+            gate_up: view(&self.gate_up, stream, 0, [experts], [1])?,
+            down: view(&self.down, stream, 0, [experts], [1])?,
+            valid: view(&self.valid, stream, 0, [experts], [1])?,
+            generation: view(&self.generation, stream, 0, [experts], [1])?,
         })
     }
 }
@@ -2801,8 +2801,8 @@ mod tests {
             stream,
             qwen::matrix(&input, stream, 0, rows, 128)?,
             router,
-            &mut TensorMut(qwen::view(&ids, stream, 0, [rows as u32, 4], [4, 1])?),
-            &mut TensorMut(qwen::view(&weights, stream, 0, [rows as u32, 4], [4, 1])?),
+            &mut TensorMut(view(&ids, stream, 0, [rows as u32, 4], [4, 1])?),
+            &mut TensorMut(view(&weights, stream, 0, [rows as u32, 4], [4, 1])?),
             &mut TensorMut(qwen::matrix(&logits, stream, 0, rows, 16)?),
         )?;
         let host_ids = stream.clone_dtoh(&ids)?;
@@ -2861,10 +2861,10 @@ mod tests {
                     MoePrefillContribute {
                         cpu_arithmetic: &arithmetic,
                         x: qwen::matrix(&input, stream, base * 128, count, 128)?,
-                        ids: qwen::view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
-                        weights: qwen::view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,
-                        active: qwen::view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
-                        assignment_gen: qwen::view(
+                        ids: view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
+                        weights: view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,
+                        active: view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
+                        assignment_gen: view(
                             &generation,
                             stream,
                             base * 4,
@@ -2881,20 +2881,14 @@ mod tests {
                         shared_up: shared[1],
                         shared_down: shared[2],
                         shared_expert_gate: shared_gate,
-                        contributions: qwen::view(
+                        contributions: view(
                             &contributions,
                             stream,
                             base * 4 * 128,
                             [count as u32, 4, 128],
                             [512, 128, 1],
                         )?,
-                        done: TensorMut(qwen::view(
-                            &done,
-                            stream,
-                            base * 4,
-                            [count as u32, 4],
-                            [4, 1],
-                        )?),
+                        done: TensorMut(view(&done, stream, base * 4, [count as u32, 4], [4, 1])?),
                     },
                     &qwen::scratch(&scratch, stream),
                 )?;
@@ -2969,16 +2963,16 @@ mod tests {
                 stream,
                 MoePrefillFinish {
                     x: qwen::matrix(&input, stream, base * 128, count, 128)?,
-                    ids: qwen::view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
-                    final_active: qwen::view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
-                    contributions: qwen::view(
+                    ids: view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
+                    final_active: view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
+                    contributions: view(
                         &contributions,
                         stream,
                         base * 512,
                         [count as u32, 4, 128],
                         [512, 128, 1],
                     )?,
-                    done: qwen::view(&done, stream, base * 4, [count as u32, 4], [4, 1])?,
+                    done: view(&done, stream, base * 4, [count as u32, 4], [4, 1])?,
                     experts: 16,
                     shared_gate: shared[0],
                     shared_up: shared[1],

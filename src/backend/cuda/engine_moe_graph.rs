@@ -42,9 +42,9 @@ impl Decode {
     fn resident_mask(&self, device: &Device, slots: SlotBindings) -> Result<()> {
         let stream = &device.stream;
         let k = self.geometry.top_k;
-        let ids = qwen::view(&self.ids, stream, 0, [1, k], [u64::from(k), 1])?;
-        let active = qwen::view(&self.active, stream, 0, [1, k], [u64::from(k), 1])?;
-        let generation = qwen::view(&self.generation, stream, 0, [1, k], [u64::from(k), 1])?;
+        let ids = view(&self.ids, stream, 0, [1, k], [u64::from(k), 1])?;
+        let active = view(&self.active, stream, 0, [1, k], [u64::from(k), 1])?;
+        let generation = view(&self.generation, stream, 0, [1, k], [u64::from(k), 1])?;
         // SAFETY: every table covers the bound expert domain and every assignment buffer covers k.
         unsafe {
             stream
