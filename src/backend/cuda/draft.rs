@@ -479,12 +479,23 @@ impl Draft {
         );
         let c = &self.config;
         let s = &self.stream;
+        let planned = rows
+            .checked_mul(c.workspace_row_bytes()?)
+            .context("draft row workspace byte count overflow")?;
         let k_raw = s.alloc_zeros(rows * c.kv_dim())?;
         let k_norm = s.alloc_zeros(rows * c.kv_dim())?;
         let v_raw = s.alloc_zeros(rows * c.kv_dim())?;
         let projected = s.alloc_zeros(rows * c.hidden_size)?;
         let context = s.alloc_zeros(rows * c.hidden_size)?;
         let packed = s.alloc_zeros(rows * 2 * c.kv_dim())?;
+        let allocated = [&k_raw, &k_norm, &v_raw, &projected, &context, &packed]
+            .iter()
+            .map(|buffer| buffer.len() * size_of::<bf16>())
+            .sum::<usize>();
+        ensure!(
+            allocated == planned,
+            "draft row workspace allocation={allocated} differs from planned={planned} rows={rows}"
+        );
         self.k_raw = k_raw;
         self.k_norm = k_norm;
         self.v_raw = v_raw;
@@ -1629,6 +1640,7 @@ mod tests {
             &mut blas,
             super::super::markov::ScoreRounding::F32,
         )?;
+        draft.grow(rows)?;
         let embedding = native(
             &device,
             &target,

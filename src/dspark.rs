@@ -141,6 +141,18 @@ impl DraftConfig {
     pub fn capture_width(&self) -> usize {
         self.target_layer_ids.len() * self.hidden_size
     }
+    pub fn workspace_row_bytes(&self) -> Result<usize> {
+        let kv = self
+            .num_key_value_heads
+            .checked_mul(self.head_dim)
+            .and_then(|n| n.checked_mul(5))
+            .context("DSpark KV workspace row overflow")?;
+        self.hidden_size
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(kv))
+            .and_then(|n| n.checked_mul(size_of::<half::bf16>()))
+            .context("DSpark workspace row bytes overflow")
+    }
     pub fn kv_dim(&self) -> usize {
         self.num_key_value_heads * self.head_dim
     }
@@ -546,6 +558,28 @@ mod tests {
                 "draft verify extent changed"
             );
             ensure!(
+                draft.workspace_row_bytes()? == 13_312,
+                "draft row workspace must include projected/context and five KV widths"
+            );
+            let mut row_request = crate::prefill::WorkspaceRequest {
+                capacity: 16,
+                requested: Some(16),
+                free_after_resident: 16 * model.hidden as usize * size_of::<half::bf16>(),
+                total: 24 << 30,
+                alignment: 1,
+                row_bytes: model.hidden as usize * size_of::<half::bf16>(),
+                fixed_transient_bytes: 0,
+            };
+            ensure!(
+                crate::prefill::WorkspaceBudget::new(row_request, |_| Ok(0), Ok).is_ok(),
+                "omitted draft-row reserve control did not admit"
+            );
+            row_request.row_bytes += draft.workspace_row_bytes()?;
+            ensure!(
+                crate::prefill::WorkspaceBudget::new(row_request, |_| Ok(0), Ok).is_err(),
+                "draft rows escaped the workspace budget"
+            );
+            ensure!(
                 draft.target_state_bytes(&model)? == 1_054_146_596,
                 "block15 transaction must retain 30 GDN checkpoint+15 prefix images and 16 KV write slots for 10 attention layers"
             );
@@ -601,6 +635,21 @@ mod tests {
                     "invalid verify extent admitted block={block}"
                 );
             }
+            invalid_rows.hidden_size = usize::MAX;
+            ensure!(
+                invalid_rows.workspace_row_bytes().is_err(),
+                "overflowed draft hidden workspace admitted"
+            );
+            invalid_rows.hidden_size = draft.hidden_size;
+            invalid_rows.num_key_value_heads = usize::MAX;
+            ensure!(
+                invalid_rows.workspace_row_bytes().is_err(),
+                "overflowed draft KV workspace admitted"
+            );
+            println!(
+                "PASS draft_workspace_row_bytes={} omitted_reserve=admitted charged_reserve=rejected overflow_controls=2",
+                draft.workspace_row_bytes()?
+            );
             let mut admitted = Vec::new();
             for (schema, original, target) in
                 [("flat", &flat, &target), ("nested", &full, &hybrid_target)]

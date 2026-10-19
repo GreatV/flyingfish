@@ -1083,6 +1083,11 @@ impl Engine {
             .map(|draft| draft.target_state_bytes(&model_spec))
             .transpose()?
             .unwrap_or(0);
+        let draft_row_bytes = draft_config
+            .as_ref()
+            .map(|draft| draft.workspace_row_bytes())
+            .transpose()?
+            .unwrap_or(0);
         ensure!(
             !settings.spec_budget.is_tree(),
             "Qwen DSpark proposal/tree execution is not bound"
@@ -1206,6 +1211,7 @@ impl Engine {
             row_bytes: Runtime::row_bytes(&model_spec)?
                 .checked_add(mtp_budget.as_ref().map_or(0, |b| b.row_bytes))
                 .and_then(|bytes| bytes.checked_add(capture_row_bytes))
+                .and_then(|bytes| bytes.checked_add(draft_row_bytes))
                 .context("combined row bytes overflow")?,
             fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
                 .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
@@ -1295,6 +1301,8 @@ impl Engine {
                 "kv_prefill_scratch_bytes": kv_scratch.as_ref().map_or(0,|(k,v)|(k.len()+v.len())*size_of::<bf16>()),
                 "capture_checkpoint_bytes": capture_checkpoint.as_ref().context("capture checkpoint missing")?.bytes(),
                 "target_hidden_capture_bytes": rows.checked_mul(capture_row_bytes).context("capture byte count overflow")?,
+                "draft_workspace_row_bytes": draft_row_bytes,
+                "target_transaction_planned_bytes": target_transaction_bytes,
                 "layer_arena_bytes": arena_bytes,
                 "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?.bytes,
                 "attention_prefill_lse_bytes": rows * model_spec.q_heads as usize * size_of::<f32>(),
