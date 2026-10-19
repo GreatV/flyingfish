@@ -1328,9 +1328,10 @@ impl Engine {
                         || layer == self.trace_layer
                         || layer == layers / 2
                         || layer + 1 == layers
-                        || self.hidden_capture.as_ref().is_some_and(|capture| {
-                            capture.layer_slots[layer].is_some()
-                        })
+                        || self
+                            .hidden_capture
+                            .as_ref()
+                            .is_some_and(|capture| capture.layer_slots[layer].is_some())
                     {
                         let name = if all_layers {
                             &prefill.layer_names[layer]["layer.".len()..]
