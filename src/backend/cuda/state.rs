@@ -721,6 +721,48 @@ impl StateCheckpoint {
             stream.memcpy_dtod(&src.s, &mut dst.s)?;
             stream.memcpy_dtod(&src.history, &mut dst.history)?;
         }
+        self.restore_kv_rows(store, 0, stream)?;
+        if let (Some(saved), Some(seq)) = (&self.sequence, &mut store.sequence) {
+            stream.memcpy_dtod(saved, seq)?;
+        }
+        for kv in &store.kv {
+            if let Some(c) = &kv.compact {
+                c.cursor_mode(
+                    c.view(&kv.k, &kv.v, stream),
+                    store.seq_ref(stream)?,
+                    2,
+                    stream,
+                )?;
+            }
+        }
+        stream.memcpy_dtod(&self.token, token)?;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn restore_rejected_kv(
+        &self,
+        store: &mut StateStore,
+        accepted: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<()> {
+        ensure!(self.valid, "checkpoint has no valid snapshot");
+        self.check(store)?;
+        self.restore_kv_rows(store, accepted, stream)
+    }
+    fn restore_kv_rows(
+        &self,
+        store: &mut StateStore,
+        first: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<()> {
+        ensure!(
+            first <= self.active_rows,
+            "accepted KV rows={first} exceeds checkpoint rows={}",
+            self.active_rows
+        );
+        if first == self.active_rows {
+            return Ok(());
+        }
         for (src, dst) in self.kv.iter().zip(&mut store.kv) {
             let cap = dst
                 .compact
@@ -735,16 +777,16 @@ impl StateCheckpoint {
                         b,
                         super::copy::Rect {
                             rows: self.heads,
-                            width: self.active_rows * self.dim,
+                            width: (self.active_rows - first) * self.dim,
                             src_pitch: self.rows * self.dim,
-                            src_col: 0,
+                            src_col: first * self.dim,
                             dst_pitch: self.capacity * self.dim,
-                            dst_col: self.prefix * self.dim,
+                            dst_col: (self.prefix + first) * self.dim,
                         },
                     )?;
                     continue;
                 }
-                for row in 0..self.active_rows {
+                for row in first..self.active_rows {
                     let pos = crate::kv::ring_slot(self.prefix + row, cap)?;
                     super::copy::columns(
                         stream,
@@ -762,20 +804,6 @@ impl StateCheckpoint {
                 }
             }
         }
-        if let (Some(saved), Some(seq)) = (&self.sequence, &mut store.sequence) {
-            stream.memcpy_dtod(saved, seq)?;
-        }
-        for kv in &store.kv {
-            if let Some(c) = &kv.compact {
-                c.cursor_mode(
-                    c.view(&kv.k, &kv.v, stream),
-                    store.seq_ref(stream)?,
-                    2,
-                    stream,
-                )?;
-            }
-        }
-        stream.memcpy_dtod(&self.token, token)?;
         Ok(())
     }
     pub fn bytes(&self) -> usize {

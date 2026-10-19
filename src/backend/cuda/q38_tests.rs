@@ -1839,6 +1839,86 @@ fn verify_attention_m4_serial_bits_gpu() -> Result<()> {
     )
 }
 
+fn checkpoint_rejected_prefixes(device: &Device) -> Result<()> {
+    let root = serde_json::from_str(include_str!("../../../tests/data/minicpm-config.json"))?;
+    let spec = crate::model_spec::ModelSpec::minicpm(
+        &root,
+        &serde_json::json!({"eos_token_id": [248044, 248046]}),
+    )?;
+    let capacity = 37;
+    let rows = 16;
+    let stream = &device.stream;
+    let mut state = super::state::StateStore::new(&spec, capacity, stream)?;
+    let token = stream.clone_htod(&[97u32])?;
+    let mut checkpoint = super::state::StateCheckpoint::new(&state, &spec, rows, stream)?;
+    let dim = spec.head_dim as usize;
+    let elements = spec.kv_heads as usize * capacity * dim;
+    let original: Vec<_> = (0..elements)
+        .map(|i| bf16::from_f32(((i * 17 % 251) as f32 - 125.0) / 128.0))
+        .collect();
+    let verified: Vec<_> = original
+        .iter()
+        .map(|value| bf16::from_f32(value.to_f32() + 4.0))
+        .collect();
+    let upload = |state: &mut super::state::StateStore, values: &[bf16]| -> Result<()> {
+        for kv in &mut state.kv {
+            stream.memcpy_htod(values, &mut kv.k)?;
+            stream.memcpy_htod(values, &mut kv.v)?;
+        }
+        Ok(())
+    };
+    let mut cases = 0;
+    for prefix in [5, capacity - rows] {
+        state.set_sequence(stream, prefix as u32, rows as u32, rows as u32)?;
+        upload(&mut state, &original)?;
+        checkpoint.save(&state, &token, prefix, stream, None)?;
+        let sequence = stream.clone_dtoh(state.sequence.as_ref().context("sequence missing")?)?;
+        for accepted in 0..=rows {
+            upload(&mut state, &verified)?;
+            checkpoint.restore_rejected_kv(&mut state, accepted, stream)?;
+            for kv in &state.kv {
+                for buffer in [&kv.k, &kv.v] {
+                    for (i, value) in stream.clone_dtoh(buffer)?.iter().enumerate() {
+                        let position = (i / dim) % capacity;
+                        let rejected = (prefix + accepted..prefix + rows).contains(&position);
+                        let expected = if rejected { original[i] } else { verified[i] };
+                        ensure!(
+                            value.to_bits() == expected.to_bits(),
+                            "rejected KV prefix={prefix} accepted={accepted} index={i} position={position}"
+                        );
+                    }
+                }
+            }
+            ensure!(
+                stream.clone_dtoh(state.sequence.as_ref().context("sequence missing")?)?
+                    == sequence
+                    && stream.clone_dtoh(&token)? == [97],
+                "KV suffix restore changed sequence/token"
+            );
+            cases += 1;
+        }
+        ensure!(
+            checkpoint
+                .restore_rejected_kv(&mut state, rows + 1, stream)
+                .is_err(),
+            "checkpoint accepted more rows than its saved window"
+        );
+        upload(&mut state, &verified)?;
+        checkpoint.restore_rejected_kv(&mut state, rows / 2 + 1, stream)?;
+        let wrong = stream.clone_dtoh(&state.kv[0].k)?;
+        let slot = (prefix + rows / 2) * dim;
+        ensure!(
+            wrong[slot..slot + dim] != original[slot..slot + dim],
+            "wrong accepted-prefix row escaped the KV oracle"
+        );
+    }
+    println!(
+        "PASS CHECKPOINT_REJECTED_KV kv=[{},37,{}] window_rows={rows} accepted=0..16 prefixes=5,21 cases={cases} bit_mismatches=0 wrong_prefix_control=true",
+        spec.kv_heads, spec.head_dim
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
 fn q38_state_checkpoint_gpu() -> Result<()> {
@@ -2145,6 +2225,7 @@ fn q38_state_checkpoint_gpu() -> Result<()> {
     eprintln!(
         "Q38_STATE_PROBE mapping/byte_accounting/nonzero_prefix/S/history/KV_window/token/reset/repeated_metadata_graph PASS"
     );
+    checkpoint_rejected_prefixes(&d)?;
     Ok(())
 }
 
