@@ -339,19 +339,28 @@ impl Input {
         let directory = PathBuf::from(
             std::env::var_os("FF_VIDEO_REF_DIR").context("FF_VIDEO_REF_DIR missing")?,
         );
-        let (clip, processor_case) = match case {
-            "video_football_16x" => ("football_4s", "football_4s_16x_s1"),
-            "video_control_clip2_16x" => ("sample_demo_1", "sample_demo_1_16x_s1"),
-            "video_control_same_grid_16x" => ("boat_pan_4s", "boat_pan_4s_16x_s1"),
+        let clip = match case {
+            "video_football_16x" => "football_4s",
+            "video_control_clip2_16x" => "sample_demo_1",
+            "video_control_same_grid_16x" => "boat_pan_4s",
             _ => anyhow::bail!("unknown video fixture case={case}"),
         };
         let floor: serde_json::Value = serde_json::from_slice(&std::fs::read(
             directory.join("preprocess_video_noise_floor.json"),
         )?)?;
-        let measured = &floor["cases"][processor_case];
-        let tolerance = measured["tv_vs_pil_diff"]["max_abs"]
-            .as_f64()
-            .context("video pixel floor missing")? as f32
+        let measured = floor["cases"]
+            .as_object()
+            .context("video pixel floor cases missing")?;
+        ensure!(!measured.is_empty(), "video pixel floor has no cases");
+        let tolerance = measured
+            .iter()
+            .try_fold(0.0f64, |bound, (name, cell)| -> Result<f64> {
+                Ok(bound.max(
+                    cell["tv_vs_pil_diff"]["max_abs"]
+                        .as_f64()
+                        .with_context(|| format!("video pixel floor {name} max_abs missing"))?,
+                ))
+            })? as f32
             + 4.0 * f32::EPSILON;
         ensure!(
             tolerance.is_finite() && tolerance > 0.0,
