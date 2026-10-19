@@ -549,6 +549,50 @@ mod tests {
                 draft.target_state_bytes(&model)? == 1_054_146_596,
                 "block15 transaction must retain 30 GDN checkpoint+15 prefix images and 16 KV write slots for 10 attention layers"
             );
+            let state_bytes = draft.target_state_bytes(&model)?;
+            let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&model)?;
+            let slot_bytes = crate::experts::catalogue::ExpertLayout::new(
+                crate::model_spec::ExpertFormat::Bf16,
+                &geometry,
+            )?
+            .slot_bytes();
+            let request = crate::prefill::ExpertWorkspaceRequest {
+                mixer: crate::prefill::WorkspaceRequest {
+                    capacity: 16,
+                    requested: Some(16),
+                    free_after_resident: state_bytes / 2,
+                    total: 24 << 30,
+                    alignment: 1,
+                    row_bytes: model.hidden as usize * size_of::<half::bf16>(),
+                    fixed_transient_bytes: 0,
+                },
+                span_rows: 16,
+                wave_rows: 16,
+                wave_workspace_bytes: 0,
+                device_headroom_bytes: 0,
+                host_fixed_bytes: 0,
+                prefill_staging_slots: 1,
+                disk_ring_slots: 0,
+            };
+            let budget = |request| {
+                crate::prefill::ExpertWorkspaceBudget::new(
+                    request,
+                    geometry,
+                    slot_bytes,
+                    |_| Ok(0),
+                    Ok,
+                )
+            };
+            ensure!(
+                budget(request).is_ok(),
+                "omitted-reserve control did not admit"
+            );
+            let mut reserved = request;
+            reserved.mixer.fixed_transient_bytes = state_bytes;
+            ensure!(
+                budget(reserved).is_err(),
+                "snapshot reserve escaped expert admission"
+            );
             let mut invalid_rows = DraftConfig::read(&root, &hybrid_target)?;
             for block in [0, crate::linear_plan::MAX_SKINNY_ROWS, usize::MAX] {
                 invalid_rows.block_size = block;

@@ -513,7 +513,7 @@ mod tests {
         }
         let expected = stream.clone_dtoh(&expected)?;
         let mut defects = 0;
-        for m in [1, 2, 3, 4, 5, 8, 15, 16] {
+        for m in 1..=rows as u32 {
             let x = view(&input, stream, 0, [m, k as u32], [k as u64, 1])?;
             let mut y = TensorMut(view(&output, stream, 0, [m, n as u32], [n as u64, 1])?);
             let mut execute = || blas.linear_typed(ExecutionPhase::Prefill, weight, x, &mut y);
@@ -656,7 +656,7 @@ mod tests {
             }
         }
         println!(
-            "INVARIANT_LINEAR_SUMMARY shapes=6 formats=3 rows=1,2,3,4,5,8,15,16 eager_graph=true defects={defects}"
+            "INVARIANT_LINEAR_SUMMARY shapes=6 formats=3 rows=1..16 eager_graph=true defects={defects}"
         );
         ensure!(defects == 0, "invariant linear DEFECT cells={defects}");
         Ok(())
