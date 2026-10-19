@@ -574,7 +574,7 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
             decode.host_ids.as_mut_slice()?[..count * k].copy_from_slice(&ids);
             decode.host_weights.as_mut_slice()?[..count * k].copy_from_slice(&weights);
             slots.begin_token()?;
-            slots.complete(
+            slots.finish_routed(
                 &engine.device,
                 &mut decode,
                 0,
@@ -583,7 +583,6 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
                     x,
                     &mut TensorMut(qwen::matrix(&engine.work.out, stream, 0, count, h)?),
                 ),
-                None,
             )?;
             let contributions = stream.clone_dtoh(&decode.contributions.slice(..count * k * h))?;
             // Gate/up, SiLU, product, down and routing apply six BF16 roundings.

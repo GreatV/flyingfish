@@ -89,6 +89,29 @@ fn scratch_sizing_matches_region_math() {
         let got = prefill_scratch_bytes(rows, 8, 256, 2048, 512, native.fp8_slot()).unwrap();
         assert_eq!(got, baseline);
     }
+    for (hidden, intermediate, supported) in [
+        (64, 128, false),
+        (192, 128, false),
+        (128, 96, false),
+        (128, 64, true),
+        (384, 192, true),
+    ] {
+        let geometry = ExpertGeometry {
+            hidden,
+            intermediate,
+            ..geometry
+        };
+        let native = ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry).unwrap();
+        let scratch = prefill_scratch_bytes(
+            37,
+            8,
+            256,
+            hidden as usize,
+            intermediate as usize,
+            native.fp8_slot(),
+        );
+        assert_eq!(scratch.is_ok(), supported, "native geometry {geometry:?}");
+    }
     assert!(prefill_scratch_bytes(usize::MAX, 2, 256, 2048, 512, native.fp8_slot()).is_err());
     assert!(prefill_scratch_bytes(1, 1, 256, usize::MAX, 512, native.fp8_slot()).is_err());
     let mut wrong = native.fp8_slot().unwrap().clone();
@@ -370,7 +393,10 @@ fn fp8_prefill_gpu() -> Result<()> {
             );
         }
     }
-    println!("FP8_PREFILL_SUMMARY cases=15 defects={defects} exact_bf16_grouped=true");
+    println!(
+        "FP8_PREFILL_SUMMARY cases=15 defects={defects} exact_bf16_grouped={}",
+        defects == 0
+    );
     ensure!(defects == 0, "FP8 prefill DEFECT cases={defects}");
     Ok(())
 }

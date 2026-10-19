@@ -541,17 +541,6 @@ impl Drop for DiskExperts {
     }
 }
 
-#[cfg(test)]
-fn native_weights(shape: crate::cpu::expert_ffn::Shape) -> crate::cpu::expert_ffn::ExpertWeights {
-    let down = 2 * shape.intermediate * shape.hidden;
-    crate::cpu::expert_ffn::ExpertWeights {
-        gate_up: 0..down,
-        gate_up_stride: shape.hidden,
-        down: down..down + shape.hidden * shape.intermediate,
-        down_stride: shape.intermediate,
-    }
-}
-
 fn disk_contributions<const FP8: bool>(
     reader: &DiskReader,
     catalogue: &ExpertCatalogue,
@@ -1040,7 +1029,11 @@ mod tests {
                     Contribution {
                         shape: &shape,
                         arena: &values,
-                        weights: &native_weights(shape),
+                        weights: &crate::cpu::expert_ffn::ExpertWeights::from_slot(
+                            shape,
+                            0..values.len(),
+                            catalogue.layout(),
+                        )?,
                         hidden: &hidden[first..first + 8],
                         routing: route.weight,
                     },

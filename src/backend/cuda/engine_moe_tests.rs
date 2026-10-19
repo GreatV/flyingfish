@@ -178,7 +178,10 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
         ] {
             write(&format!("{path}/memory.limit_in_bytes"), limit)?;
             write(&format!("{path}/memory.usage_in_bytes"), "1073741824\n")?;
-            write(&format!("{path}/memory.stat"), "total_inactive_file 0\n")?;
+            write(
+                &format!("{path}/memory.stat"),
+                "total_active_file 0\ntotal_inactive_file 0\n",
+            )?;
         }
         ensure!(
             super::host_memory(&root)? == (5 << 30, 8 << 20),
@@ -188,7 +191,8 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             "PASS host_memory_fixture v1 ancestor_available_bytes={}",
             5u64 << 30
         );
-        for cache in [1u64 << 30, 3 << 30, 0] {
+        for (active, inactive) in [(0u64, 1u64 << 30), (2 << 30, 1 << 30), (3 << 30, 0), (0, 0)] {
+            let cache = active + inactive;
             for path in [
                 "controllers/memory bank/job",
                 "controllers/memory bank/job/leaf",
@@ -199,7 +203,7 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
                 )?;
                 write(
                     &format!("{path}/memory.stat"),
-                    &format!("total_inactive_file {cache}\n"),
+                    &format!("total_active_file {active}\ntotal_inactive_file {inactive}\n"),
                 )?;
             }
             let (available, locked) = super::host_memory(&root)?;

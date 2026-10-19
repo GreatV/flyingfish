@@ -2704,7 +2704,11 @@ mod tests {
         capacity.span_rows = rows;
         capacity.wave_rows = 4;
         capacity.prefill_staging_slots = 2;
-        if rows > 37 {
+        if rows > 37 && format == crate::model_spec::ExpertFormat::Bf16 {
+            capacity.slots_per_layer = vec![8, 8];
+            capacity.device_expert_bytes = 16 * capacity.slot_bytes();
+            capacity.disk_bytes = 8 * capacity.slot_bytes();
+        } else if rows > 37 {
             let borrowed = crate::experts::plan::span_borrow_slots(
                 &reserves(geometry),
                 capacity.slot_bytes(),
@@ -3369,6 +3373,7 @@ mod tests {
                     );
                     ensure!(
                         coverage[0] > 0
+                            && (format != crate::model_spec::ExpertFormat::Bf16 || coverage[1] > 0)
                             && coverage[3] > 0
                             && if host_complete {
                                 coverage[2] == 0 && coverage[4] == 0

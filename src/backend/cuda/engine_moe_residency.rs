@@ -1008,7 +1008,7 @@ impl Slots {
         self.complete(device, decode, layer, ffn, activation, Some(layer as usize))
     }
 
-    pub(super) fn complete(
+    fn complete(
         &mut self,
         device: &Device,
         decode: &mut Decode,
@@ -1051,6 +1051,18 @@ impl Slots {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_routed(
+        &mut self,
+        device: &Device,
+        decode: &mut Decode,
+        layer: u32,
+        ffn: BoundFfn,
+        activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
+    ) -> Result<()> {
+        self.complete(device, decode, layer, ffn, activation, None)
     }
 
     #[cfg(test)]

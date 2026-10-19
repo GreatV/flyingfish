@@ -774,7 +774,9 @@ pub(super) fn host_memory(root: &Path) -> Result<(u64, u64)> {
                     .with_context(|| format!("invalid expert cgroup counter {name}"))
             };
             let reclaimable = if memory.is_some() {
-                counter("total_inactive_file")?
+                counter("total_active_file")?
+                    .checked_add(counter("total_inactive_file")?)
+                    .context("expert cgroup file LRU bytes overflow")?
             } else {
                 counter("file")?.saturating_sub(counter("shmem")?)
             };

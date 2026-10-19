@@ -1,5 +1,5 @@
 //! Cohorts write caller-owned weighted BF16 contributions and done bits.
-//! Grouped GEMMs use opA=T/opB=N over native [2I,H] and [H,I] expert weights.
+//! Grouped GEMMs use opA=T/opB=N over native [2I, H] and [H, I] expert weights.
 //! Count/scan/permute stage one host count read and two pointer-table uploads per cohort.
 //! Finish runs the shared FFN and one combine after every contribution is complete.
 use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut};
@@ -571,8 +571,8 @@ pub(crate) fn prefill_layout(
     let scale = region(&mut at, rows, 2)?;
     if let Some(slot) = fp8_slot {
         ensure!(
-            hidden.is_multiple_of(8) && inter.is_multiple_of(8),
-            "FP8 prefill hidden/inter must be multiples of eight"
+            hidden.is_multiple_of(128) && inter.is_multiple_of(64),
+            "unsupported native expert GEMM shape hidden={hidden} intermediate={inter}: output channels must be multiples of 128 and K multiples of 64"
         );
         let geometry = ExpertGeometry {
             layers: 1,
