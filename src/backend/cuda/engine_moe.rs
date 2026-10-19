@@ -1,6 +1,7 @@
 //! Eager routed-FFN execution over caller-provided residency decisions.
 use super::*;
 use crate::backend::cuda::{
+    calibrate::host_memory,
     contracts::{Tensor, TensorMut, view},
     linear::BoundFfn,
     moe::{
@@ -38,57 +39,6 @@ pub(super) struct Setup {
     admission: crate::experts::plan::Admission,
     measured: super::super::calibrate::ExpertCalibration,
     catalogue: Arc<crate::experts::catalogue::ExpertCatalogue>,
-}
-
-fn host_memory() -> Result<(u64, u64)> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo")?;
-    let mut available = meminfo
-        .lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))
-        .and_then(|line| line.split_whitespace().next())
-        .context("expert host profile has no MemAvailable")?
-        .parse::<u64>()?
-        .checked_mul(1024)
-        .context("expert available host bytes overflow")?;
-    let groups = std::fs::read_to_string("/proc/self/cgroup")?;
-    let group = groups
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .context("expert host profile has no unified cgroup")?;
-    let mount = Path::new("/sys/fs/cgroup");
-    let mut directory = mount.join(group.trim_start_matches('/'));
-    loop {
-        let maximum = directory.join("memory.max");
-        if directory == mount && !maximum.try_exists()? {
-            break;
-        }
-        let limit = std::fs::read_to_string(&maximum)
-            .with_context(|| format!("read expert cgroup limit {}", maximum.display()))?;
-        if limit.trim() != "max" {
-            let current = directory.join("memory.current");
-            let used = std::fs::read_to_string(&current)
-                .with_context(|| format!("read expert cgroup usage {}", current.display()))?
-                .trim()
-                .parse::<u64>()?;
-            available = available.min(limit.trim().parse::<u64>()?.saturating_sub(used));
-        }
-        if directory == mount {
-            break;
-        }
-        ensure!(directory.pop(), "expert cgroup has no parent: {group}");
-    }
-    let limits = std::fs::read_to_string("/proc/self/limits")?;
-    let locked = limits
-        .lines()
-        .find_map(|line| line.strip_prefix("Max locked memory"))
-        .and_then(|line| line.split_whitespace().next())
-        .context("expert host profile has no locked-memory limit")?;
-    let locked = if locked == "unlimited" {
-        available
-    } else {
-        locked.parse::<u64>()?.min(available)
-    };
-    Ok((available, locked))
 }
 
 fn host_workspace(
