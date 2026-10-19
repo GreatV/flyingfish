@@ -1236,13 +1236,17 @@ impl Engine {
         self.graphs = if self.spec.as_ref().is_some_and(|spec| !spec.graph) {
             Vec::new()
         } else if self.model_spec.moe.is_some() {
-            if self
+            let mut graphs = if self
                 .moe_slots
                 .as_ref()
                 .context("MoE graph declaration has no slots")?
                 .all_resident()
             {
-                vec![Graph::Decode]
+                vec![if self.spec.is_some() {
+                    Graph::Verify
+                } else {
+                    Graph::Decode
+                }]
             } else {
                 (0..self.model_spec.layers.len())
                     .flat_map(|layer| {
@@ -1253,7 +1257,12 @@ impl Engine {
                         ]
                     })
                     .collect()
+            };
+            if let Some(spec) = &self.spec {
+                graphs.push(Graph::Draft);
+                graphs.extend((1..=spec.inject_graphs.len()).map(Graph::Inject));
             }
+            graphs
         } else {
             match &self.spec {
                 None => vec![Graph::Decode],
@@ -3584,21 +3593,33 @@ impl Engine {
                 .config,
         )?;
         match phase {
-            SpecPhase::Draft => self
-                .spec
-                .as_mut()
-                .context("draft is not enabled")?
-                .draft
-                .propose_device(
-                    &self.work.token,
-                    &self.work.position,
-                    start,
-                    (&self.weights.embed, &self.weights.head),
-                    super::draft::Compute {
-                        ops: &self.ops,
-                        blas: &mut self.blas,
-                    },
-                ),
+            SpecPhase::Draft => {
+                self.spec
+                    .as_mut()
+                    .context("draft is not enabled")?
+                    .draft
+                    .propose_device(
+                        &self.work.token,
+                        &self.work.position,
+                        start,
+                        (&self.weights.embed, &self.weights.head),
+                        super::draft::Compute {
+                            ops: &self.ops,
+                            blas: &mut self.blas,
+                        },
+                    )?;
+                if self.model_spec.moe.is_some() {
+                    self.spec
+                        .as_ref()
+                        .context("MoE draft missing")?
+                        .draft
+                        .copy_proposals(&mut self.work.ids.slice_mut(1..rows + 1))?;
+                    self.device
+                        .stream
+                        .memcpy_dtod(&self.work.token, &mut self.work.ids.slice_mut(..1))?;
+                }
+                Ok(())
+            }
             SpecPhase::Verify => {
                 self.spec
                     .as_ref()
@@ -3639,6 +3660,17 @@ impl Engine {
     }
 
     fn ensure_spec_graph(&mut self, phase: SpecPhase, start: usize) -> Result<()> {
+        if self.model_spec.moe.is_some() && matches!(phase, SpecPhase::Verify) {
+            ensure!(
+                self.has_moe_segments()
+                    || self
+                        .spec
+                        .as_ref()
+                        .is_some_and(|spec| spec.verify_graph.is_some()),
+                "MoE verification graphs were not bound before Ready"
+            );
+            return Ok(());
+        }
         let rows = phase.rows(
             &self
                 .spec
@@ -3662,12 +3694,27 @@ impl Engine {
         let token = s.clone_dtoh(&self.work.token)?;
         let position = s.clone_dtoh(&self.work.position)?;
         let length = s.clone_dtoh(&self.work.length)?;
-        self.run_spec_device(phase, start)?;
+        if self.model_spec.moe.is_some() {
+            self.spec
+                .as_mut()
+                .context("MoE draft missing")?
+                .draft
+                .checkpoint_kv(start)?;
+        }
+        let warmed = self.run_spec_device(phase, start);
         s.synchronize()?;
+        if self.model_spec.moe.is_some() {
+            self.spec
+                .as_mut()
+                .context("MoE draft missing")?
+                .draft
+                .restore_kv(start, 0)?;
+        }
         s.memcpy_htod(&token, &mut self.work.token)?;
         s.memcpy_htod(&position, &mut self.work.position)?;
         s.memcpy_htod(&length, &mut self.work.length)?;
         s.synchronize()?;
+        warmed?;
         s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
         let launched = self.run_spec_device(phase, start);
         let captured = s.end_capture(sys::CUgraphInstantiate_flags(0));
@@ -3688,6 +3735,24 @@ impl Engine {
     }
 
     fn launch_spec_graph(&mut self, phase: SpecPhase) -> Result<()> {
+        if self.model_spec.moe.is_some() && matches!(phase, SpecPhase::Verify) {
+            let rows = self
+                .spec
+                .as_ref()
+                .context("MoE chain missing")?
+                .draft
+                .config
+                .verify_rows()?;
+            self.state.set_sequence(
+                &self.device.stream,
+                self.position as u32,
+                rows as u32,
+                self.workspace_rows as u32,
+            )?;
+            self.run_moe_graph()?;
+            self.spec.as_mut().context("MoE chain missing")?.active_rows = rows;
+            return Ok(());
+        }
         let spec = self.spec.as_mut().context("draft is not enabled")?;
         spec.graph_slot(phase)?
             .as_ref()
@@ -3786,7 +3851,6 @@ impl Engine {
                 self.capacity,
                 self.spec_budget
             );
-            ensure!(!spec.graph, "MoE DSpark segmented graphs are not bound");
             spec.checkpoint
                 .as_mut()
                 .context("MoE chain checkpoint missing")?
@@ -3840,10 +3904,22 @@ impl Engine {
             );
             let start = self.position;
             if graph {
-                self.ensure_spec_graph(SpecPhase::Draft, start)?;
-                self.ensure_spec_graph(SpecPhase::Verify, start)?;
+                if transaction {
+                    ensure!(
+                        self.has_graph(Graph::Draft)
+                            && (self.has_moe_segments() || self.has_graph(Graph::Verify)),
+                        "MoE draft/verify graphs were not bound before Ready"
+                    );
+                } else {
+                    self.ensure_spec_graph(SpecPhase::Draft, start)?;
+                    self.ensure_spec_graph(SpecPhase::Verify, start)?;
+                }
             }
-            let anchor = if graph { None } else { Some(self.token()?) };
+            let anchor = if graph && !transaction {
+                None
+            } else {
+                Some(self.token()?)
+            };
             let draft_range = super::profile::Range::new(self.profile_rounds, c"draft");
             let draft_start = std::time::Instant::now();
             let proposals = if graph {
@@ -3869,6 +3945,8 @@ impl Engine {
                 )?
             };
             #[cfg(test)]
+            let mut forced_applied = false;
+            #[cfg(test)]
             let proposals = if let Some(forced) = self
                 .spec
                 .as_mut()
@@ -3883,6 +3961,7 @@ impl Engine {
                             .all(|&id| (id as usize) < self.config.vocab_size),
                     "forced chain proposals exceed the loaded geometry"
                 );
+                forced_applied = true;
                 forced
             } else {
                 proposals
@@ -3890,6 +3969,15 @@ impl Engine {
             self.device.stream.synchronize()?;
             let draft_ms = draft_start.elapsed().as_secs_f64() * 1000.0;
             drop(draft_range);
+            #[cfg(test)]
+            if graph && transaction && forced_applied {
+                let ids: Vec<_> = std::iter::once(anchor.context("forced graph anchor missing")?)
+                    .chain(proposals.iter().copied())
+                    .collect();
+                self.device
+                    .stream
+                    .memcpy_htod(&ids, &mut self.work.ids.slice_mut(..rows))?;
+            }
             if !graph {
                 let mut ids = vec![anchor.context("eager verify anchor missing")?];
                 ids.extend(&proposals);
@@ -3941,7 +4029,14 @@ impl Engine {
             let committed = output.len();
             let bonus = *output.last().context("spec round emitted no token")?;
             if graph {
-                self.ensure_spec_graph(SpecPhase::Inject(committed), start)?;
+                if transaction {
+                    ensure!(
+                        self.has_graph(Graph::Inject(committed)),
+                        "MoE commit graph rows={committed} missing before Ready"
+                    );
+                } else {
+                    self.ensure_spec_graph(SpecPhase::Inject(committed), start)?;
+                }
             }
             let inject_start = std::time::Instant::now();
             let _inject_range = super::profile::Range::new(self.profile_rounds, c"inject");
@@ -4647,7 +4742,46 @@ impl Engine {
             return Ok(());
         }
         if self.moe.is_some() {
-            return self.capture();
+            if self.spec.is_none() {
+                return self.capture();
+            }
+            self.spec
+                .as_mut()
+                .context("MoE chain missing")?
+                .draft
+                .checkpoint_kv(0)?;
+            self.ensure_spec_graph(SpecPhase::Draft, 0)?;
+            self.launch_spec_graph(SpecPhase::Draft)?;
+            self.device.stream.synchronize()?;
+            self.spec
+                .as_mut()
+                .context("MoE chain missing")?
+                .draft
+                .restore_kv(0, 0)?;
+            self.capture()?;
+            let rows = self
+                .spec
+                .as_ref()
+                .context("MoE chain missing")?
+                .inject_graphs
+                .len();
+            for rows in 1..=rows {
+                self.spec
+                    .as_mut()
+                    .context("MoE chain missing")?
+                    .draft
+                    .checkpoint_kv(0)?;
+                self.ensure_spec_graph(SpecPhase::Inject(rows), 0)?;
+                self.launch_spec_graph(SpecPhase::Inject(rows))?;
+                self.device.stream.synchronize()?;
+                self.spec
+                    .as_mut()
+                    .context("MoE chain missing")?
+                    .draft
+                    .restore_kv(0, 0)?;
+            }
+            self.spec.as_mut().context("MoE chain missing")?.active_rows = 0;
+            return Ok(());
         }
         if self.spec.is_none() {
             self.capture()?;
