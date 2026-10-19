@@ -739,14 +739,53 @@ impl StateCheckpoint {
         Ok(())
     }
     #[cfg(test)]
-    pub(super) fn restore_rejected_kv(
+    pub(super) fn select_prefix(
         &self,
         store: &mut StateStore,
+        prefixes: &[GdnState],
         accepted: usize,
         stream: &Arc<CudaStream>,
     ) -> Result<()> {
         ensure!(self.valid, "checkpoint has no valid snapshot");
         self.check(store)?;
+        ensure!(
+            accepted <= self.active_rows && prefixes.len() == store.gdn.len(),
+            "checkpoint accepted={accepted} rows={} prefix_layers={} state_layers={}",
+            self.active_rows,
+            prefixes.len(),
+            store.gdn.len()
+        );
+        for (layer, (prefix, state)) in prefixes.iter().zip(&store.gdn).enumerate() {
+            let states = state.s.len().checked_mul(self.rows - 1);
+            let history = state.history.len().checked_mul(self.rows - 1);
+            ensure!(
+                states == Some(prefix.s.len()) && history == Some(prefix.history.len()),
+                "GDN prefix layer={layer} images={} S={} history={} live_S={} live_history={}",
+                self.rows - 1,
+                prefix.s.len(),
+                prefix.history.len(),
+                state.s.len(),
+                state.history.len()
+            );
+        }
+        if accepted < self.active_rows {
+            for ((saved, prefix), state) in self.gdn.iter().zip(prefixes).zip(&mut store.gdn) {
+                for (original, images, live) in [
+                    (&saved.s, &prefix.s, &mut state.s),
+                    (&saved.history, &prefix.history, &mut state.history),
+                ] {
+                    if accepted == 0 {
+                        stream.memcpy_dtod(original, live)?;
+                    } else {
+                        let count = live.len();
+                        stream.memcpy_dtod(
+                            &images.slice((accepted - 1) * count..accepted * count),
+                            live,
+                        )?;
+                    }
+                }
+            }
+        }
         self.restore_kv_rows(store, accepted, stream)
     }
     fn restore_kv_rows(

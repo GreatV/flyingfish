@@ -1851,6 +1851,55 @@ fn checkpoint_rejected_prefixes(device: &Device) -> Result<()> {
     let mut state = super::state::StateStore::new(&spec, capacity, stream)?;
     let token = stream.clone_htod(&[97u32])?;
     let mut checkpoint = super::state::StateCheckpoint::new(&state, &spec, rows, stream)?;
+    let gdn = crate::op_contract::GdnSpec::from_model(&spec)?;
+    let image = |layer: usize, row: usize, count: usize| {
+        (0..count)
+            .map(|i| {
+                ((i * 17 % 251) as f32 - 125.0) / 128.0 + layer as f32 * 4.0 + row as f32 / 8.0
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut prefixes = state
+        .gdn
+        .iter()
+        .map(|live| {
+            Ok(super::state::GdnState {
+                s: stream.alloc_zeros((rows - 1) * live.s.len())?,
+                history: stream.alloc_zeros((rows - 1) * live.history.len())?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (layer, (prefix, live)) in prefixes.iter_mut().zip(&state.gdn).enumerate() {
+        for (images, count) in [
+            (&mut prefix.s, live.s.len()),
+            (&mut prefix.history, live.history.len()),
+        ] {
+            for row in 0..rows - 1 {
+                stream.memcpy_htod(
+                    &image(layer, row + 1, count),
+                    &mut images.slice_mut(row * count..(row + 1) * count),
+                )?;
+            }
+        }
+    }
+    let bytes = checkpoint.bytes()
+        + prefixes
+            .iter()
+            .map(|p| (p.s.len() + p.history.len()) * size_of::<f32>())
+            .sum::<usize>();
+    let planned = crate::mtp::checkpoint_bytes(&spec, rows)?
+        + gdn.image_bytes()? as usize * state.gdn.len() * (rows - 1);
+    ensure!(
+        bytes == planned,
+        "checkpoint/prefix allocation={bytes} differs from planned={planned}"
+    );
+    let upload_gdn = |state: &mut super::state::StateStore, row| -> Result<()> {
+        for (layer, live) in state.gdn.iter_mut().enumerate() {
+            stream.memcpy_htod(&image(layer, row, live.s.len()), &mut live.s)?;
+            stream.memcpy_htod(&image(layer, row, live.history.len()), &mut live.history)?;
+        }
+        Ok(())
+    };
     let dim = spec.head_dim as usize;
     let elements = spec.kv_heads as usize * capacity * dim;
     let original: Vec<_> = (0..elements)
@@ -1871,11 +1920,26 @@ fn checkpoint_rejected_prefixes(device: &Device) -> Result<()> {
     for prefix in [5, capacity - rows] {
         state.set_sequence(stream, prefix as u32, rows as u32, rows as u32)?;
         upload(&mut state, &original)?;
+        upload_gdn(&mut state, 0)?;
         checkpoint.save(&state, &token, prefix, stream, None)?;
         let sequence = stream.clone_dtoh(state.sequence.as_ref().context("sequence missing")?)?;
         for accepted in 0..=rows {
             upload(&mut state, &verified)?;
-            checkpoint.restore_rejected_kv(&mut state, accepted, stream)?;
+            upload_gdn(&mut state, rows)?;
+            checkpoint.select_prefix(&mut state, &prefixes, accepted, stream)?;
+            for (layer, live) in state.gdn.iter().enumerate() {
+                for buffer in [&live.s, &live.history] {
+                    let expected = image(layer, accepted, buffer.len());
+                    ensure!(
+                        stream
+                            .clone_dtoh(buffer)?
+                            .iter()
+                            .zip(&expected)
+                            .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+                        "GDN prefix={prefix} accepted={accepted} layer={layer}"
+                    );
+                }
+            }
             for kv in &state.kv {
                 for buffer in [&kv.k, &kv.v] {
                     for (i, value) in stream.clone_dtoh(buffer)?.iter().enumerate() {
@@ -1899,22 +1963,33 @@ fn checkpoint_rejected_prefixes(device: &Device) -> Result<()> {
         }
         ensure!(
             checkpoint
-                .restore_rejected_kv(&mut state, rows + 1, stream)
+                .select_prefix(&mut state, &prefixes, rows + 1, stream)
                 .is_err(),
             "checkpoint accepted more rows than its saved window"
         );
         upload(&mut state, &verified)?;
-        checkpoint.restore_rejected_kv(&mut state, rows / 2 + 1, stream)?;
+        upload_gdn(&mut state, rows)?;
+        checkpoint.select_prefix(&mut state, &prefixes, rows / 2 + 1, stream)?;
         let wrong = stream.clone_dtoh(&state.kv[0].k)?;
         let slot = (prefix + rows / 2) * dim;
         ensure!(
             wrong[slot..slot + dim] != original[slot..slot + dim],
             "wrong accepted-prefix row escaped the KV oracle"
         );
+        ensure!(
+            stream.clone_dtoh(&state.gdn[0].s.slice(..64))? != image(0, rows / 2, 64),
+            "wrong accepted-prefix row escaped the recurrent-state oracle"
+        );
     }
     println!(
-        "PASS CHECKPOINT_REJECTED_KV kv=[{},37,{}] window_rows={rows} accepted=0..16 prefixes=5,21 cases={cases} bit_mismatches=0 wrong_prefix_control=true",
-        spec.kv_heads, spec.head_dim
+        "PASS CHECKPOINT_PREFIX S=[15,{},{},{}] history=[15,{},{}] kv=[{},37,{}] window_rows={rows} accepted=0..16 prefixes=5,21 cases={cases} transaction_bytes={bytes} bit_mismatches=0 wrong_prefix_control=true",
+        gdn.hv,
+        gdn.dk,
+        gdn.dv,
+        gdn.conv_dim()?,
+        gdn.history_width,
+        spec.kv_heads,
+        spec.head_dim
     );
     Ok(())
 }
