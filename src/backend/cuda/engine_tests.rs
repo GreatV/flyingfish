@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn llama_rejects_unsupported_draft_blocks_before_device_setup() -> Result<()> {
+fn chain_geometry_is_checked_before_device_setup() -> Result<()> {
     let root = std::env::temp_dir().join(format!(
         "flyingfish-draft-block-{}-{}",
         std::process::id(),
@@ -36,44 +36,56 @@ fn llama_rejects_unsupported_draft_blocks_before_device_setup() -> Result<()> {
         let runtime = root.join("blocked-runtime");
         std::fs::write(&runtime, b"not a directory")?;
         let mut rejected = 0;
+        let mut declared = 0;
         for block in 1..=8 {
             value["block_size"] = block.into();
             std::fs::write(draft.join("config.json"), serde_json::to_vec(&value)?)?;
-            assert_eq!(
-                crate::dspark::DraftConfig::read(&draft, &target_config)?.block_size,
-                block
-            );
-            if block == 7 {
-                continue;
-            }
+            let geometry = crate::dspark::DraftConfig::read(&draft, &target_config)?;
+            assert_eq!(geometry.block_size, block);
+            assert_eq!(SpecPhase::Draft.rows(&geometry)?, block);
+            assert_eq!(SpecPhase::Verify.rows(&geometry)?, block + 1);
+            assert_eq!(SpecPhase::Inject(block + 1).rows(&geometry)?, block + 1);
             for budget in [SpecBudget::Chain, SpecBudget::Tree16] {
                 for write in [false, true] {
-                    let settings = Settings {
-                        tree_builder: TreeBuilder::Waves,
-                        spec_budget: budget,
-                        spec_graph: true,
-                        draft_model: Some(draft.clone()),
-                        runtime_dir: Some(runtime.clone()),
-                        prefix_cache: false,
-                        kv_format: crate::kv::KvFormat::Bf16,
-                    };
-                    let error = if write {
-                        Engine::calibrate(&target, 0, 32, Some(16), settings).err()
-                    } else {
-                        Engine::load(&target, 0, 32, Some(16), settings).err()
+                    for capacity in [block + 1, 32] {
+                        let settings = Settings {
+                            tree_builder: TreeBuilder::Waves,
+                            spec_budget: budget,
+                            spec_graph: true,
+                            draft_model: Some(draft.clone()),
+                            runtime_dir: Some(runtime.clone()),
+                            prefix_cache: false,
+                            kv_format: crate::kv::KvFormat::Bf16,
+                        };
+                        let error = if write {
+                            Engine::calibrate(&target, 0, capacity, Some(16), settings).err()
+                        } else {
+                            Engine::load(&target, 0, capacity, Some(16), settings).err()
+                        }
+                        .context("draft metadata reached device setup")?;
+                        let expected = if budget.is_tree() && block + 1 != SpecBudget::Chain.rows()
+                        {
+                            rejected += 1;
+                            "tree draft block_size="
+                        } else if capacity == block + 1 {
+                            rejected += 1;
+                            "DSpark block_size="
+                        } else {
+                            declared += 1;
+                            "runtime path is not a directory"
+                        };
+                        ensure!(
+                            error.to_string().starts_with(expected),
+                            "draft block={block} capacity={capacity} budget={budget:?} validation order: {error:#}"
+                        );
                     }
-                    .context("unsupported draft block reached device setup")?;
-                    ensure!(
-                        error
-                            .to_string()
-                            .starts_with("unsupported Llama DSpark block_size="),
-                        "draft block {block} reached runtime/device setup: {error:#}"
-                    );
-                    rejected += 1;
                 }
             }
         }
-        println!("PR61_DRAFT_BLOCK pre_device_rejections={rejected} block7_config_valid=true PASS");
+        println!(
+            "PASS chain_geometry_order block=1..8 pre_device_bounds={rejected} runtime_sentinel={declared} tree_chain_rows={}",
+            SpecBudget::Chain.rows()
+        );
         Ok(())
     })();
     std::fs::remove_dir_all(&root)?;
