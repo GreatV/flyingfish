@@ -1462,7 +1462,7 @@ fn minicpm_plain_decode_timing_gpu() -> Result<()> {
         spec_graph: true,
         kv_format: crate::kv::KvFormat::Bf16,
     };
-    let mut engine = Engine::load_arithmetic_gate(&model, 0, 4608, None, settings, false)?;
+    let mut engine = Engine::load_arithmetic_gate(&model, 0, 4608, None, settings, true)?;
     ensure!(engine.moe.is_some(), "decode timing requires MoE");
     for case in ["text_1k", "text_4k"] {
         let input = inputs
@@ -1780,7 +1780,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
     println!("minicpm_reference_bounds {cases:?}");
     check_fixtures(&fixtures, &model, names)?;
     Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
-    let mut engine = Engine::load(&model, 0, 4352, None, settings.clone())?;
+    let mut engine = Engine::load_arithmetic_gate(&model, 0, 4352, None, settings.clone(), true)?;
     ensure!(
         engine.model_spec.hidden == 2048
             && engine.model_spec.vocab == 248144
