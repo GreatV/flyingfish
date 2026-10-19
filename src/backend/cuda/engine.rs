@@ -933,12 +933,6 @@ impl Engine {
         };
         if let Some(path) = settings.draft_model {
             let path = path.canonicalize()?;
-            ensure!(
-                engine.spec_budget.rows() <= engine.capacity,
-                "draft workspace needs {} KV rows but capacity is {}",
-                engine.spec_budget.rows(),
-                engine.capacity
-            );
             let draft = super::draft::Draft::new(
                 &path,
                 &engine.device,
@@ -4304,17 +4298,28 @@ impl Engine {
         for &kind in &profile.attention {
             paths.push(match kind {
                 Kind::Decode => super::calibrate::cache_path(&self.runtime, &key, bucket, None),
-                Kind::Draft => {
-                    super::multi_calibrate::cache_path(&self.runtime, &key, bucket, 7, false, false)
+                Kind::Draft | Kind::Verify | Kind::Tree => {
+                    let draft = &self
+                        .spec
+                        .as_ref()
+                        .context("attention calibration requires draft geometry")?
+                        .draft
+                        .config;
+                    let rows = match kind {
+                        Kind::Draft => SpecPhase::Draft.rows(draft)?,
+                        Kind::Verify => SpecPhase::Verify.rows(draft)?,
+                        Kind::Tree => self.spec_budget.rows(),
+                        Kind::Decode => anyhow::bail!("decode attention has no multirow cache"),
+                    };
+                    super::multi_calibrate::cache_path(
+                        &self.runtime,
+                        &key,
+                        bucket,
+                        rows,
+                        kind == Kind::Verify,
+                        kind == Kind::Tree,
+                    )
                 }
-                Kind::Verify | Kind::Tree => super::multi_calibrate::cache_path(
-                    &self.runtime,
-                    &key,
-                    bucket,
-                    self.spec_budget.rows(),
-                    kind == Kind::Verify,
-                    kind == Kind::Tree,
-                ),
             });
         }
         if budget.is_some_and(SpecBudget::is_tree) {
