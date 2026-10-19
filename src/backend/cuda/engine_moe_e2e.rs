@@ -1024,6 +1024,15 @@ fn minicpm_bf16_timing_arm_gpu() -> Result<()> {
         !engine.graphs.is_empty(),
         "BF16 timing requires segmented graphs"
     );
+    let read_bytes = || -> Result<u64> {
+        std::fs::read_to_string("/proc/self/io")?
+            .lines()
+            .find_map(|line| line.strip_prefix("read_bytes:"))
+            .context("BF16 timing process has no physical read counter")?
+            .trim()
+            .parse()
+            .context("invalid BF16 timing physical read counter")
+    };
     for case in ["text_32", "text_1k"] {
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
         let source = SafeTensors::deserialize(&bytes)?;
@@ -1036,6 +1045,7 @@ fn minicpm_bf16_timing_arm_gpu() -> Result<()> {
         );
         for run in 0..3 {
             engine.device.stream.synchronize()?;
+            let reads_before = read_bytes()?;
             let started = Instant::now();
             engine.reset()?;
             let mut predictions = vec![engine.prefill(&input.ids, None)?];
@@ -1045,6 +1055,9 @@ fn minicpm_bf16_timing_arm_gpu() -> Result<()> {
             }
             engine.device.stream.synchronize()?;
             let seconds = started.elapsed().as_secs_f64();
+            let reads = read_bytes()?
+                .checked_sub(reads_before)
+                .context("BF16 timing physical read counter decreased")?;
             ensure!(
                 engine.decode_logits()?.iter().all(|v| v.is_finite()),
                 "BF16 timing nonfinite output: {case}"
@@ -1053,6 +1066,7 @@ fn minicpm_bf16_timing_arm_gpu() -> Result<()> {
                 "{}",
                 serde_json::json!({"minicpm_bf16_timing_arm":{
                     "case":case,"run":run,"measured":run>0,"seconds":seconds,
+                    "read_bytes":reads,
                     "prompt_tokens":input.ids.len(),"teacher_steps":32,"predictions":predictions,
                     "reference_top2_margins":&margins[..32],"graph_segments":engine.graphs.len(),
                     "region":"reset+prefill+31 forced graph decodes; synchronization and token transfers included; load/calibration excluded"
