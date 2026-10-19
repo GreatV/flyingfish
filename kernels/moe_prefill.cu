@@ -27,7 +27,7 @@ extern "C" __global__ void moe_gemm_lane16(
   float sum = 0.0f;
   for (int k = lane; k < inner; k += 16)
     sum = __fmaf_rn(__bfloat162float(x[k]), __bfloat162float(weight[k]), sum);
-  const unsigned mask = __activemask();
+  const unsigned mask = 0xFFFFu << (threadIdx.x & 16);
   for (int step = 1; step < 16; step *= 2)
     sum = __fadd_rn(sum, __shfl_down_sync(mask, sum, step, 16));
   if (lane == 0) y[column] = __float2bfloat16_rn(sum);

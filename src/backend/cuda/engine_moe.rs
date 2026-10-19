@@ -6,7 +6,7 @@ use crate::backend::cuda::{
     moe::{
         combine::{CombineOps, MoeCombine},
         decode::{DecodeOps, MoeDecode, decode_scratch_bytes},
-        prefill::PrefillOps,
+        prefill::{LANE16_ROWS, PrefillOps},
         route::RouteOps,
     },
 };
@@ -93,16 +93,19 @@ fn host_memory() -> Result<(u64, u64)> {
 
 fn host_workspace(
     geometry: ExpertGeometry,
-    bounds: (usize, usize),
+    span_rows: u32,
     workers: u32,
     copies: u32,
 ) -> Result<u64> {
-    let (rows, choices) = (bounds.0 as u64, bounds.1 as u64);
     let (h, i, k) = (
         u64::from(geometry.hidden),
         u64::from(geometry.intermediate),
         u64::from(geometry.top_k),
     );
+    let choices = (u64::from(span_rows) * k)
+        .min(u64::from(geometry.experts) * u64::from(LANE16_ROWS))
+        .max(1);
+    let rows = u64::from(span_rows).min(choices);
     let workers = u64::from(workers);
     ensure!(workers > 0, "expert host workspace has zero workers");
     let metadata = (size_of::<ExpertWeights>() + size_of::<Assignment>()) as u64;
@@ -110,7 +113,7 @@ fn host_workspace(
         + rows
         + choices * i * 2
         + i * 4
-        + (choices * h).div_ceil(workers) * 2
+        + (choices * h.max(i)).div_ceil(workers) * 2
         + choices * metadata;
     let shared = rows * h * 2 + choices * (i + h) * 2 + choices * metadata;
     let mailboxes = rows * h * 8 + choices * (h * 4 + 16);
@@ -192,13 +195,6 @@ impl Setup {
             {
                 wave_rows *= 2;
             }
-            let cpu = residency::cpu_bound(
-                geometry,
-                slot,
-                span_rows,
-                &measured.service,
-                measured.h2d_bytes_per_second,
-            )?;
             let scratch =
                 usize::try_from(crate::backend::cuda::moe::prefill::prefill_scratch_bytes(
                     wave_rows as usize,
@@ -223,7 +219,7 @@ impl Setup {
                     n.checked_add(super::super::moe::prefill::stage_device_bytes() as usize)
                 })
                 .context("expert fixed device reserve overflow")?;
-            let host = host_workspace(geometry, (cpu.0, cpu.1), workers, copies)?
+            let host = host_workspace(geometry, span_rows, workers, copies)?
                 .checked_add(super::super::moe::prefill::stage_host_pinned_bytes())
                 .and_then(|n| n.checked_add(available / 16))
                 .and_then(|n| n.checked_add(u64::from(copies) * slot * 5))

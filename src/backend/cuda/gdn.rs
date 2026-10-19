@@ -1455,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "exclusive GPU window required"]
+    #[ignore = "requires CUDA and FF_Q38_PROBE_DIR/gdn_prep_h32_wrong_stride_sm<arch>.cubin"]
     fn mixer_geometry_gdn_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),

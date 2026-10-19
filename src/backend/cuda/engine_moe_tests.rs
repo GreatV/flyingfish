@@ -3,6 +3,84 @@ use crate::backend::cuda::moe::reference::{MoeDims, MoeFixture, fixture};
 use crate::experts::plan::Capacity;
 
 #[test]
+fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
+    use crate::experts::{
+        catalogue::ExpertLayout,
+        plan::{PlanInputs, Reserves, ServiceCell, ServiceTable, SpanCandidate, select_span},
+    };
+    let geometry = ExpertGeometry {
+        layers: 2,
+        experts: 16,
+        hidden: 32,
+        intermediate: 64,
+        top_k: 2,
+    };
+    let layout = ExpertLayout::new(crate::model_spec::ExpertFormat::Bf16, &geometry)?;
+    let slot = layout.slot_bytes();
+    let service = ServiceTable::new(
+        "fixture",
+        [1, 64]
+            .into_iter()
+            .map(|rows| ServiceCell {
+                workers: 2,
+                rows,
+                experts: 1,
+                seconds: f64::from(rows) * 0.00002,
+            })
+            .collect(),
+    )?;
+    let mut admitted = Vec::new();
+    for measured in [15, 16] {
+        let h2d = slot as f64 / ((f64::from(measured) + 0.5) * 0.00002);
+        let candidates = [32, 256]
+            .map(|span_rows| {
+                let cpu = residency::cpu_bound(geometry, slot, span_rows, &service, h2d)?;
+                assert_eq!(cpu.3, measured);
+                Ok(SpanCandidate {
+                    span_rows,
+                    wave_rows: 1,
+                    reserves: Reserves {
+                        device_fixed_bytes: 0,
+                        host_fixed_bytes: host_workspace(geometry, span_rows, 2, 1)?,
+                        residual_row_bytes: 64,
+                        normalized_row_bytes: 64,
+                        contribution_row_bytes: 128,
+                        done_row_bytes: 8,
+                        route_row_bytes: 36,
+                        prefill_staging_slots: 1,
+                        disk_ring_slots: 0,
+                    },
+                })
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let inputs = PlanInputs {
+            geometry,
+            layout: layout.clone(),
+            device_free_bytes: slot * 16,
+            host_available_bytes: 439_520,
+            h2d_bytes_per_second: h2d,
+            d2h_bytes_per_second: h2d,
+            copy_engines: 1,
+            disk_readers: 1,
+            host_registration_bytes: 0,
+            service: &service,
+            reserves: &candidates[0].reserves,
+            span_rows: 256,
+            wave_rows: 1,
+        };
+        let (_, capacity) = select_span(&inputs, 1, 256, &candidates)?;
+        println!(
+            "expert_host_reserve measured_cpu_ceiling={measured} admitted_span={} large_span_host_bytes={}",
+            capacity.span_rows, candidates[1].reserves.host_fixed_bytes
+        );
+        admitted.push(capacity.span_rows);
+    }
+    assert_eq!(admitted, [32, 32]);
+    Ok(())
+}
+
+#[test]
 fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
     let (available, locked) = super::host_memory()?;
     ensure!(

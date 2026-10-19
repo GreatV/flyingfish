@@ -1192,33 +1192,6 @@ impl Engine {
                     admitted.len() as u32,
                     ffn,
                 )?;
-                #[cfg(test)]
-                if trace.is_some() {
-                    let experts = prefill
-                        .plan
-                        .cpu()
-                        .iter()
-                        .map(|&expert| {
-                            Ok((
-                                expert,
-                                prefill.counts[expert as usize],
-                                slots.policy.ledger().tier(layer as u32, expert)?,
-                            ))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let cohort = |experts: &[u32]| {
-                        experts
-                            .iter()
-                            .map(|&expert| (expert, prefill.counts[expert as usize]))
-                            .collect::<Vec<_>>()
-                    };
-                    let resident = cohort(prefill.plan.resident());
-                    let streamed = cohort(prefill.plan.staged());
-                    println!(
-                        "minicpm_prefill_cpu span_start={span_start} rows={} layer={layer} experts={experts:?} resident={resident:?} streamed={streamed:?}",
-                        admitted.len()
-                    );
-                }
                 for base in (0..admitted.len()).step_by(prefill.capacity.wave_rows as usize) {
                     let rows = (prefill.capacity.wave_rows as usize).min(admitted.len() - base);
                     prefill.finish_wave(

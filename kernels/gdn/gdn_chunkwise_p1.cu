@@ -5,6 +5,7 @@
 // U = bf16(T)@bf16(beta.V), v_new = U - bf16(W)@bf16(S), QS = bf16(q.e^G)@bf16(S),
 // AD = bf16(qk)@bf16(v_new), out = BF16_RNE(QS+AD) and
 // S = S.exp(G_last) + bf16(k.e^{G_last-G})^T@bf16(v_new).
+// One BF16 RNE copy per GEMM operand for 48 value heads.
 // Stage-H Q/K use BF16 high/residual terms for 32 value heads.
 // FP32 accumulators and FP32 T leaves; __expf only
 // on differences of non-positive log-cumulatives. BM = C = 64, BN = VW = 128/s, BK = 16,
