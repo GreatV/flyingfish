@@ -561,11 +561,13 @@ mod tests {
                 draft.workspace_row_bytes()? == 13_312,
                 "draft row workspace must include projected/context and five KV widths"
             );
+            let total = 24usize << 30;
             let mut row_request = crate::prefill::WorkspaceRequest {
                 capacity: 16,
                 requested: Some(16),
-                free_after_resident: 16 * model.hidden as usize * size_of::<half::bf16>(),
-                total: 24 << 30,
+                free_after_resident: total / 16
+                    + 16 * model.hidden as usize * size_of::<half::bf16>(),
+                total,
                 alignment: 1,
                 row_bytes: model.hidden as usize * size_of::<half::bf16>(),
                 fixed_transient_bytes: 0,
