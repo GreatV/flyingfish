@@ -77,6 +77,7 @@ fn q38_primitives_gpu() -> Result<()> {
     );
     let d = Device::new(0)?;
     invariant_attention(&d)?;
+    let _dense = super::profile::Range::new(true, c"q38_primitives_dense");
     let s = &d.stream;
     let fixture_dir = std::env::temp_dir().join(format!("ff-q38-upload-{}", std::process::id()));
     std::fs::create_dir(&fixture_dir)?;
@@ -2002,6 +2003,7 @@ fn q38_state_checkpoint_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let d = Device::new(0)?;
+    let dense = super::profile::Range::new(true, c"q38_state_checkpoint_dense");
     let s = &d.stream;
     let root: serde_json::Value =
         serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?;
@@ -2300,6 +2302,7 @@ fn q38_state_checkpoint_gpu() -> Result<()> {
     eprintln!(
         "Q38_STATE_PROBE mapping/byte_accounting/nonzero_prefix/S/history/KV_window/token/reset/repeated_metadata_graph PASS"
     );
+    drop(dense);
     checkpoint_rejected_prefixes(&d)?;
     Ok(())
 }

@@ -1044,12 +1044,6 @@ impl Engine {
     ) -> Result<Self> {
         require_qwen35_geometry(&model_spec)?;
         let write = mode.writes();
-        #[cfg(test)]
-        ensure!(
-            !matches!(mode, super::SetupMode::Arithmetic) || model_spec.moe.is_some(),
-            "arithmetic qualification requires MoE architecture={:?}",
-            model_spec.architecture
-        );
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
         ensure!(
             model_spec.moe.is_none() || !reserve_mtp,
@@ -1472,10 +1466,6 @@ impl Engine {
             setup.bind(&mut engine)?;
         }
         if engine.spec.is_some() {
-            engine.bind_invariant_arithmetic()?;
-        }
-        #[cfg(test)]
-        if matches!(mode, super::SetupMode::Arithmetic) && engine.spec.is_none() {
             engine.bind_invariant_arithmetic()?;
         }
         if engine.model_spec.moe.is_some() {

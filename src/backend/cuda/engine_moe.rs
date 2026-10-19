@@ -398,7 +398,7 @@ impl Engine {
         let executor = self
             .moe
             .as_mut()
-            .context("arithmetic qualification requires MoE")?;
+            .context("invariant target arithmetic requires MoE")?;
         ensure!(
             executor.geometry.hidden.is_multiple_of(256)
                 && executor.geometry.intermediate.is_multiple_of(256)
@@ -412,7 +412,7 @@ impl Engine {
             .bind_invariant(&self.device.ctx, crate::linear_plan::MAX_SKINNY_ROWS)?;
         executor.contribute = DecodeOps::new_invariant(&self.device.ctx)?;
         eprintln!(
-            "plain_decode_arithmetic lane16_routed=true skinny_shared=true skinny_typed=true rows={}",
+            "draft_target_arithmetic lane16_routed=true skinny_shared=true skinny_typed=true rows={}",
             crate::linear_plan::MAX_SKINNY_ROWS
         );
         Ok(())

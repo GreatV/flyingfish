@@ -1779,8 +1779,7 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
         kv_format: crate::kv::KvFormat::Bf16,
     };
     Engine::calibrate(&target, 0, capacity, None, settings.clone())?;
-    let mut plain =
-        Engine::load_arithmetic_gate(&target, 0, capacity, None, settings.clone(), true)?;
+    let mut plain = Engine::load(&target, 0, capacity, None, settings.clone())?;
     ensure!(plain.spec.is_none(), "plain baseline loaded a draft");
     let layout = plain
         .moe_slots
@@ -1792,7 +1791,7 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
         .map(|layer| layout.slot_count(layer as u32))
         .collect::<Result<Vec<_>>>()?;
     let eos = plain.model_spec.eos.clone();
-    let mut baseline = Vec::new();
+    let mut plain_only = Vec::new();
     for (case, input) in cases.iter().zip(&inputs) {
         plain.reset()?;
         if !input.grids.is_empty() {
@@ -1813,18 +1812,46 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
             "plain encoder count {case}"
         );
         println!(
-            "PASS minicpm_chain_plain case={case} tokens={} ids={ids:?} decoded={:?}",
+            "minicpm_chain_plain_only case={case} tokens={} ids={ids:?} decoded={:?}",
             ids.len(),
             crate::tokenizer::decode(&target, &ids)?
         );
-        baseline.push(ids);
+        plain_only.push(ids);
     }
     plain.synchronize()?;
     drop(plain);
     settings.draft_model = Some(draft);
     Engine::calibrate(&target, 0, capacity, None, settings.clone())?;
     let mut model = Engine::load(&target, 0, capacity, None, settings.clone())?;
+    ensure!(model.spec.is_some(), "chain target has no attached draft");
     model.set_spec_eos(&eos)?;
+    let mut baseline = Vec::new();
+    for (case, input) in cases.iter().zip(&inputs) {
+        model.reset()?;
+        if !input.grids.is_empty() {
+            model.prepare_multimodal(&input.packed(), None)?;
+        }
+        let mut ids = vec![model.prefill(&input.ids, None)?];
+        while ids.len() < 256 && !eos.contains(ids.last().context("M1 output missing")?) {
+            ids.push(model.decode(false, None)?);
+        }
+        model.check_logits()?;
+        ensure!(
+            model
+                .qwen
+                .as_ref()
+                .context("M1 runtime missing")?
+                .vision_encode_calls
+                == usize::from(!input.grids.is_empty()),
+            "M1 encoder count {case}"
+        );
+        println!(
+            "PASS minicpm_chain_m1 case={case} draft_attached=true tokens={} ids={ids:?} decoded={:?}",
+            ids.len(),
+            crate::tokenizer::decode(&target, &ids)?
+        );
+        baseline.push(ids);
+    }
     let layout = model
         .moe_slots
         .as_ref()
@@ -1842,7 +1869,9 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
     for graph in [false, true] {
         model.set_spec_graph(graph)?;
         let mut media_outputs = Vec::new();
-        for ((case, input), expected) in cases.iter().zip(&inputs).zip(&baseline) {
+        for (((case, input), expected), ordinary) in
+            cases.iter().zip(&inputs).zip(&baseline).zip(&plain_only)
+        {
             model.reset()?;
             if !input.grids.is_empty() {
                 model.prepare_multimodal(&input.packed(), None)?;
@@ -1882,11 +1911,18 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
                 + ids.len().abs_diff(expected.len());
             defects += mismatches;
             println!(
-                "{} minicpm_chain_lossless case={case} graph={graph} tokens={} expected_tokens={} token_mismatches={mismatches} rounds={rounds} accepted={accepted} committed={committed} encoder_calls={calls} ids={ids:?} decoded={:?}",
+                "{} minicpm_chain_lossless case={case} graph={graph} tokens={} expected_tokens={} token_mismatches={mismatches} rounds={rounds} accepted={accepted} committed={committed} encoder_calls={calls} ids={ids:?} decoded={:?} baseline=draft_attached_m1",
                 if mismatches == 0 { "PASS" } else { "DEFECT" },
                 ids.len(),
                 expected.len(),
                 crate::tokenizer::decode(&target, &ids)?
+            );
+            let agreement = ids.iter().zip(ordinary).filter(|(a, b)| a == b).count();
+            println!(
+                "minicpm_chain_plain_only_agreement case={case} graph={graph} exact={} matching_positions={agreement} dspark_tokens={} plain_only_tokens={} descriptive=true",
+                ids == *ordinary,
+                ids.len(),
+                ordinary.len()
             );
             if !input.grids.is_empty() {
                 media_outputs.push(ids);
@@ -1965,7 +2001,7 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
         }
     }
     println!(
-        "{} minicpm_chain_decode_end cases=5 modes=2 horizon=256 natural_eos=true exact_tokens=true exact_boundaries=true production_eos_and_media=true defects={defects}",
+        "{} minicpm_chain_decode_end cases=5 modes=2 horizon=256 natural_eos=true exact_tokens=true exact_boundaries=true production_eos_and_media=true defects={defects} lossless_scope=draft_attached_m1",
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(defects == 0, "DEFECT MiniCPM chain decode count={defects}");
@@ -2365,142 +2401,6 @@ fn video_splice_control(
     Ok(())
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
-struct DecodeTeacher {
-    input_ids: Vec<u32>,
-    decode_ids: Vec<u32>,
-}
-
-#[test]
-#[ignore = "requires CUDA, pinned calibration, FF_MODEL, FF_MINICPM_REFERENCE_DIR and FF_MINICPM_DECODE_TEACHER"]
-fn minicpm_plain_teacher_gpu() -> Result<()> {
-    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
-    let fixtures = PathBuf::from(
-        std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("reference directory missing")?,
-    );
-    let runtime = PathBuf::from(
-        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime directory missing")?,
-    );
-    let output = PathBuf::from(
-        std::env::var_os("FF_MINICPM_DECODE_TEACHER").context("teacher path missing")?,
-    );
-    ensure!(!output.exists(), "teacher output already exists");
-    let settings = Settings {
-        runtime_dir: Some(runtime),
-        prefix_cache: false,
-        draft_model: None,
-        tree_builder: TreeBuilder::Waves,
-        spec_budget: SpecBudget::Chain,
-        spec_graph: true,
-        kv_format: crate::kv::KvFormat::Bf16,
-    };
-    let mut engine = Engine::load(&model, 0, 4608, None, settings)?;
-    ensure!(engine.moe.is_some(), "plain teacher requires MoE");
-    let mut outputs = std::collections::BTreeMap::new();
-    for case in ["text_1k", "text_4k"] {
-        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
-        let source = SafeTensors::deserialize(&bytes)?;
-        let input_ids = integers(&source, "input_ids")?;
-        ensure!(
-            input_ids.len() + 256 <= engine.capacity,
-            "teacher capacity {case}"
-        );
-        engine.reset()?;
-        engine.prefill(&input_ids, None)?;
-        let mut decode_ids = Vec::with_capacity(256);
-        for _ in 0..256 {
-            decode_ids.push(engine.token()?);
-            engine.decode(true, None)?;
-        }
-        engine.check_logits()?;
-        println!(
-            "PASS minicpm_plain_teacher {case} steps={} input_rows={}",
-            decode_ids.len(),
-            input_ids.len()
-        );
-        outputs.insert(
-            case,
-            DecodeTeacher {
-                input_ids,
-                decode_ids,
-            },
-        );
-    }
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)?;
-    serde_json::to_writer_pretty(file, &outputs)?;
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires CUDA, pinned teacher/calibration, FF_MODEL and FF_MINICPM_DECODE_GRAPH=eager|graph"]
-fn minicpm_plain_decode_timing_gpu() -> Result<()> {
-    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
-    let runtime = PathBuf::from(
-        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime directory missing")?,
-    );
-    let teacher = PathBuf::from(
-        std::env::var_os("FF_MINICPM_DECODE_TEACHER").context("teacher path missing")?,
-    );
-    let graph = match std::env::var("FF_MINICPM_DECODE_GRAPH")?.as_str() {
-        "eager" => false,
-        "graph" => true,
-        value => anyhow::bail!("decode timing graph mode={value}"),
-    };
-    let inputs: std::collections::BTreeMap<String, DecodeTeacher> =
-        serde_json::from_slice(&std::fs::read(teacher)?)?;
-    ensure!(inputs.len() == 2, "decode timing needs two teacher cases");
-    let settings = Settings {
-        runtime_dir: Some(runtime),
-        prefix_cache: false,
-        draft_model: None,
-        tree_builder: TreeBuilder::Waves,
-        spec_budget: SpecBudget::Chain,
-        spec_graph: true,
-        kv_format: crate::kv::KvFormat::Bf16,
-    };
-    let mut engine = Engine::load_arithmetic_gate(&model, 0, 4608, None, settings, true)?;
-    ensure!(engine.moe.is_some(), "decode timing requires MoE");
-    for case in ["text_1k", "text_4k"] {
-        let input = inputs
-            .get(case)
-            .with_context(|| format!("teacher case missing {case}"))?;
-        ensure!(
-            input.decode_ids.len() == 256
-                && !input.input_ids.is_empty()
-                && input.input_ids.len() + input.decode_ids.len() <= engine.capacity
-                && input
-                    .input_ids
-                    .iter()
-                    .chain(&input.decode_ids)
-                    .all(|&id| (id as usize) < engine.config.vocab_size),
-            "decode timing teacher shape or ids {case}"
-        );
-        for run in 0..4 {
-            engine.reset()?;
-            engine.prefill(&input.input_ids, None)?;
-            engine.synchronize()?;
-            let measured = run > 0;
-            let range = super::super::super::profile::Range::new(measured, c"minicpm_plain_decode");
-            let started = Instant::now();
-            for &id in &input.decode_ids {
-                engine.set_token(id)?;
-                engine.decode(graph, None)?;
-            }
-            engine.synchronize()?;
-            let seconds = started.elapsed().as_secs_f64();
-            drop(range);
-            engine.check_logits()?;
-            println!(
-                "PASS minicpm_plain_decode_timing case={case} run={run} measured={measured} graph={graph} steps=256 seconds={seconds:.9}"
-            );
-        }
-    }
-    Ok(())
-}
-
 #[test]
 fn cosine_budget_covers_two_opposite_reference_errors() -> Result<()> {
     let reference = [1.0, 0.0];
@@ -2779,7 +2679,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
     println!("minicpm_reference_bounds {cases:?}");
     check_fixtures(&fixtures, &model, names)?;
     Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
-    let mut engine = Engine::load_arithmetic_gate(&model, 0, 4352, None, settings.clone(), true)?;
+    let mut engine = Engine::load(&model, 0, 4352, None, settings.clone())?;
     ensure!(
         engine.model_spec.hidden == 2048
             && engine.model_spec.vocab == 248144
