@@ -855,6 +855,39 @@ impl Slots {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn capture_placement(
+        &self,
+    ) -> Result<Vec<(Tier, Option<u32>)>> {
+        let geometry = self.catalogue.geometry();
+        let mut placement = Vec::with_capacity((geometry.layers * geometry.experts) as usize);
+        for layer in 0..geometry.layers {
+            for expert in 0..geometry.experts {
+                let tier = self.policy.ledger().tier(layer, expert)?;
+                let slot = if tier == Tier::Gpu {
+                    Some(self.policy.ledger().slot(layer, expert)?)
+                } else {
+                    None
+                };
+                placement.push((tier, slot));
+            }
+        }
+        Ok(placement)
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn pin_capture_request(
+        &mut self,
+        frequency: &[Vec<f64>],
+    ) -> Result<Vec<(Tier, Option<u32>)>> {
+        if self.request_open {
+            self.end_request()?;
+        }
+        self.begin_request(frequency)?;
+        self.end_request()?;
+        self.capture_placement()
+    }
+
     pub fn end_request(&mut self) -> Result<()> {
         self.policy.end_request()?;
         self.request_open = false;
