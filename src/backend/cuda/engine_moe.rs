@@ -346,6 +346,32 @@ pub(super) struct SlotBindings {
 }
 
 impl Engine {
+    #[cfg(test)]
+    pub(super) fn bind_arithmetic_gate(&mut self) -> Result<()> {
+        self.closure.bind_fixed()?;
+        let executor = self
+            .moe
+            .as_mut()
+            .context("arithmetic qualification requires MoE")?;
+        ensure!(
+            executor.geometry.hidden.is_multiple_of(256)
+                && executor.geometry.intermediate.is_multiple_of(256)
+                && u64::from(executor.geometry.hidden)
+                    >= 2 * u64::from(executor.geometry.intermediate),
+            "invariant shared geometry hidden={} inter={}",
+            executor.geometry.hidden,
+            executor.geometry.intermediate
+        );
+        self.blas
+            .bind_invariant(&self.device.ctx, crate::linear_plan::MAX_SKINNY_ROWS)?;
+        executor.contribute = DecodeOps::new_invariant(&self.device.ctx)?;
+        eprintln!(
+            "plain_decode_arithmetic lane16_routed=true skinny_shared=true skinny_typed=true rows={}",
+            crate::linear_plan::MAX_SKINNY_ROWS
+        );
+        Ok(())
+    }
+
     pub(super) fn run_moe_ffn(
         &mut self,
         layer: usize,

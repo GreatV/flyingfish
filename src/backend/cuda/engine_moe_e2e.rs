@@ -1366,6 +1366,142 @@ fn video_splice_control(
     Ok(())
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct DecodeTeacher {
+    input_ids: Vec<u32>,
+    decode_ids: Vec<u32>,
+}
+
+#[test]
+#[ignore = "requires CUDA, pinned calibration, FF_MODEL, FF_MINICPM_REFERENCE_DIR and FF_MINICPM_DECODE_TEACHER"]
+fn minicpm_plain_teacher_gpu() -> Result<()> {
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let fixtures = PathBuf::from(
+        std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("reference directory missing")?,
+    );
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime directory missing")?,
+    );
+    let output = PathBuf::from(
+        std::env::var_os("FF_MINICPM_DECODE_TEACHER").context("teacher path missing")?,
+    );
+    ensure!(!output.exists(), "teacher output already exists");
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut engine = Engine::load(&model, 0, 4608, None, settings)?;
+    ensure!(engine.moe.is_some(), "plain teacher requires MoE");
+    let mut outputs = std::collections::BTreeMap::new();
+    for case in ["text_1k", "text_4k"] {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let source = SafeTensors::deserialize(&bytes)?;
+        let input_ids = integers(&source, "input_ids")?;
+        ensure!(
+            input_ids.len() + 256 <= engine.capacity,
+            "teacher capacity {case}"
+        );
+        engine.reset()?;
+        engine.prefill(&input_ids, None)?;
+        let mut decode_ids = Vec::with_capacity(256);
+        for _ in 0..256 {
+            decode_ids.push(engine.token()?);
+            engine.decode(true, None)?;
+        }
+        engine.check_logits()?;
+        println!(
+            "PASS minicpm_plain_teacher {case} steps={} input_rows={}",
+            decode_ids.len(),
+            input_ids.len()
+        );
+        outputs.insert(
+            case,
+            DecodeTeacher {
+                input_ids,
+                decode_ids,
+            },
+        );
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    serde_json::to_writer_pretty(file, &outputs)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA, pinned teacher/calibration, FF_MODEL and FF_MINICPM_DECODE_GRAPH=eager|graph"]
+fn minicpm_plain_decode_timing_gpu() -> Result<()> {
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime directory missing")?,
+    );
+    let teacher = PathBuf::from(
+        std::env::var_os("FF_MINICPM_DECODE_TEACHER").context("teacher path missing")?,
+    );
+    let graph = match std::env::var("FF_MINICPM_DECODE_GRAPH")?.as_str() {
+        "eager" => false,
+        "graph" => true,
+        value => anyhow::bail!("decode timing graph mode={value}"),
+    };
+    let inputs: std::collections::BTreeMap<String, DecodeTeacher> =
+        serde_json::from_slice(&std::fs::read(teacher)?)?;
+    ensure!(inputs.len() == 2, "decode timing needs two teacher cases");
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut engine = Engine::load_arithmetic_gate(&model, 0, 4608, None, settings, false)?;
+    ensure!(engine.moe.is_some(), "decode timing requires MoE");
+    for case in ["text_1k", "text_4k"] {
+        let input = inputs
+            .get(case)
+            .with_context(|| format!("teacher case missing {case}"))?;
+        ensure!(
+            input.decode_ids.len() == 256
+                && !input.input_ids.is_empty()
+                && input.input_ids.len() + input.decode_ids.len() <= engine.capacity
+                && input
+                    .input_ids
+                    .iter()
+                    .chain(&input.decode_ids)
+                    .all(|&id| (id as usize) < engine.config.vocab_size),
+            "decode timing teacher shape or ids {case}"
+        );
+        for run in 0..4 {
+            engine.reset()?;
+            engine.prefill(&input.input_ids, None)?;
+            engine.synchronize()?;
+            let measured = run > 0;
+            let range = super::super::super::profile::Range::new(measured, c"minicpm_plain_decode");
+            let started = Instant::now();
+            for &id in &input.decode_ids {
+                engine.set_token(id)?;
+                engine.decode(graph, None)?;
+            }
+            engine.synchronize()?;
+            let seconds = started.elapsed().as_secs_f64();
+            drop(range);
+            engine.check_logits()?;
+            println!(
+                "PASS minicpm_plain_decode_timing case={case} run={run} measured={measured} graph={graph} steps=256 seconds={seconds:.9}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn cosine_budget_covers_two_opposite_reference_errors() -> Result<()> {
     let reference = [1.0, 0.0];

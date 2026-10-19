@@ -421,7 +421,22 @@ enum CaptureFault {
 enum SetupMode {
     Ready,
     Prepare,
-    Mtp { verify_rows: usize },
+    Mtp {
+        verify_rows: usize,
+    },
+    #[cfg(test)]
+    Arithmetic,
+}
+
+impl SetupMode {
+    fn writes(self) -> bool {
+        match self {
+            Self::Ready => false,
+            #[cfg(test)]
+            Self::Arithmetic => false,
+            Self::Prepare | Self::Mtp { .. } => true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -629,6 +644,29 @@ fn prefix_attention_host_tensors(
 }
 
 impl Engine {
+    #[cfg(test)]
+    pub(super) fn load_arithmetic_gate(
+        dir: &Path,
+        ordinal: usize,
+        capacity: usize,
+        chunk: Option<usize>,
+        settings: Settings,
+        candidate: bool,
+    ) -> Result<Self> {
+        Self::load_kind_for(
+            dir,
+            ordinal,
+            capacity,
+            chunk,
+            settings,
+            if candidate {
+                SetupMode::Arithmetic
+            } else {
+                SetupMode::Ready
+            },
+        )
+    }
+
     pub fn load(
         dir: &Path,
         ordinal: usize,
@@ -716,7 +754,7 @@ impl Engine {
         settings: Settings,
         mode: SetupMode,
     ) -> Result<Self> {
-        let write = !matches!(mode, SetupMode::Ready);
+        let write = mode.writes();
         let started = Instant::now();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
         match load_dispatch(model_spec.architecture)? {

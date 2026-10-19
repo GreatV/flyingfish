@@ -1033,7 +1033,13 @@ impl Engine {
         model_spec: crate::model_spec::ModelSpec,
     ) -> Result<Self> {
         require_qwen35_geometry(&model_spec)?;
-        let write = !matches!(mode, super::SetupMode::Ready);
+        let write = mode.writes();
+        #[cfg(test)]
+        ensure!(
+            !matches!(mode, super::SetupMode::Arithmetic) || model_spec.moe.is_some(),
+            "arithmetic qualification requires MoE architecture={:?}",
+            model_spec.architecture
+        );
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
         ensure!(
             model_spec.moe.is_none() || !reserve_mtp,
@@ -1380,6 +1386,10 @@ impl Engine {
         )?);
         if let Some(setup) = expert_setup {
             setup.bind(&mut engine)?;
+        }
+        #[cfg(test)]
+        if matches!(mode, super::SetupMode::Arithmetic) {
+            engine.bind_arithmetic_gate()?;
         }
         if engine.model_spec.moe.is_some() {
             engine.declare_graphs()?;
