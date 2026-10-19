@@ -65,10 +65,7 @@ fn trace_value(
     Ok(())
 }
 
-pub(in crate::backend::cuda::engine) fn bucketed_prefill_rows(
-    rows: u32,
-    workspace_rows: u32,
-) -> Result<u32> {
+pub(super) fn bucketed_prefill_rows(rows: u32, workspace_rows: u32) -> Result<u32> {
     ensure!(
         rows > 0 && rows <= workspace_rows,
         "prefill rows {rows} outside workspace {workspace_rows}"

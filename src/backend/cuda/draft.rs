@@ -304,6 +304,19 @@ impl Draft {
         write: bool,
     ) -> Result<()> {
         blas.declare(self.rows, &profile.pairs);
+        if self.score_rounding == super::markov::ScoreRounding::F32 {
+            let buckets = (1..=self.rows)
+                .map(|rows| super::engine::bucketed_prefill_rows(rows as u32, self.rows as u32))
+                .collect::<Result<std::collections::BTreeSet<_>>>()?;
+            for rows in buckets {
+                blas.prepare(
+                    rows as usize,
+                    self.config.hidden_size,
+                    self.config.capture_width(),
+                )?;
+                blas.prepare(rows as usize, self.config.kv_dim(), self.config.hidden_size)?;
+            }
+        }
         if !write {
             return blas.load_choices(&profile.linear);
         }
@@ -572,13 +585,24 @@ impl Draft {
         let s = &self.stream;
         let h = c.hidden_size;
         let kv = c.kv_dim();
-        blas.prepare(rows, h, c.capture_width())?;
-        blas.prepare(rows, kv, h)?;
+        let linear_rows = if self.score_rounding == super::markov::ScoreRounding::F32 {
+            super::engine::bucketed_prefill_rows(rows as u32, self.rows as u32)? as usize
+        } else {
+            blas.prepare(rows, h, c.capture_width())?;
+            blas.prepare(rows, kv, h)?;
+            rows
+        };
+        ensure!(
+            input.len() >= linear_rows * c.capture_width(),
+            "draft injection input={} rows={rows} linear_rows={linear_rows} capture_width={}",
+            input.len(),
+            c.capture_width()
+        );
         blas.linear(
             &self.weights.fc,
-            &input.slice(..rows * c.capture_width()),
-            &mut self.projected.slice_mut(..rows * h),
-            rows,
+            &input.slice(..linear_rows * c.capture_width()),
+            &mut self.projected.slice_mut(..linear_rows * h),
+            linear_rows,
             h,
             c.capture_width(),
         )?;
@@ -596,17 +620,17 @@ impl Draft {
             let v_weight = layer.block.qkv.slice((h + kv) * h..(h + 2 * kv) * h);
             blas.linear(
                 &k_weight,
-                &self.context.slice(..rows * h),
-                &mut self.k_raw.slice_mut(..rows * kv),
-                rows,
+                &self.context.slice(..linear_rows * h),
+                &mut self.k_raw.slice_mut(..linear_rows * kv),
+                linear_rows,
                 kv,
                 h,
             )?;
             blas.linear(
                 &v_weight,
-                &self.context.slice(..rows * h),
-                &mut self.v_raw.slice_mut(..rows * kv),
-                rows,
+                &self.context.slice(..linear_rows * h),
+                &mut self.v_raw.slice_mut(..linear_rows * kv),
+                linear_rows,
                 kv,
                 h,
             )?;
@@ -1682,10 +1706,11 @@ mod tests {
             let (confidence_budget, isolated_budget) = confidence_limits
                 .get(name)
                 .context("confidence budget absent")?;
-            let taps: Vec<_> = values(&tensors, "target_taps", &[1, context, 5, h])?
+            let mut taps: Vec<_> = values(&tensors, "target_taps", &[1, context, 5, h])?
                 .into_iter()
                 .map(bf16::from_f32)
                 .collect();
+            taps.resize(rows * c.capture_width(), bf16::ZERO);
             let taps = s.clone_htod(&taps)?;
             draft.position_shift = 0;
             draft.reset_setup()?;
@@ -1695,6 +1720,7 @@ mod tests {
                 s.memcpy_htod(&poison, &mut cache.v)?;
             }
             let mut trace = Trace::default();
+            let bound_plans = blas.fixed_plan_count();
             draft.inject(
                 &taps,
                 context,
@@ -1705,6 +1731,10 @@ mod tests {
                 },
                 Some((&mut trace, "context")),
             )?;
+            ensure!(
+                blas.fixed_plan_count() == bound_plans,
+                "draft context injection created a plan after setup"
+            );
             let proposals = draft.propose(
                 block_ids[0],
                 context,
