@@ -275,11 +275,7 @@ pub(crate) fn checkpoint_bytes(spec: &ModelSpec, rows: usize) -> Result<usize> {
         .context("checkpoint KV overflow")?;
     let gdn = if spec.layers.iter().any(|l| l.mixer == Mixer::Gdn) {
         let g = GdnSpec::from_model(spec)?;
-        usize::try_from(
-            g.state_bytes()?
-                .checked_add(g.history_bytes()?)
-                .context("GDN checkpoint overflow")?,
-        )?
+        usize::try_from(g.image_bytes()?)?
     } else {
         0
     };
@@ -317,9 +313,8 @@ pub(crate) fn snapshot_bytes(spec: &ModelSpec) -> Result<usize> {
     }
     let g = crate::op_contract::GdnSpec::from_model(spec)?;
     usize::try_from(
-        g.state_bytes()?
-            .checked_add(g.history_bytes()?)
-            .and_then(|n| n.checked_mul(4))
+        g.image_bytes()?
+            .checked_mul(4)
             .context("snapshot byte overflow")?,
     )?
     .checked_mul(layers)

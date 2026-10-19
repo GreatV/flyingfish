@@ -300,6 +300,11 @@ impl GdnSpec {
             4,
         )
     }
+    pub fn image_bytes(&self) -> Result<u64> {
+        self.state_bytes()?
+            .checked_add(self.history_bytes()?)
+            .context("GDN state image byte overflow")
+    }
 }
 
 #[cfg(test)]

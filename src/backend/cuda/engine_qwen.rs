@@ -1024,20 +1024,39 @@ impl Engine {
             model_spec.moe.is_none() || !settings.prefix_cache,
             "MoE prefix_cache=true has no delegated-expert content identity"
         );
-        let verify_rows = match mode {
-            super::SetupMode::Mtp { verify_rows } => verify_rows,
-            _ => crate::mtp::MAX_VERIFY_ROWS,
-        };
         let started = Instant::now();
         let attention = FullAttentionSpec::from_model(&model_spec)?;
         let gdn = GdnSpec::from_model(&model_spec)?;
         let kv_width = attention.hkv * attention.d;
         let config = model_spec.config();
-        let capture_layers = settings
+        let draft_config = settings
             .draft_model
             .as_deref()
-            .map(|path| crate::dspark::read_capture_layers(path, &config))
+            .filter(|_| model_spec.moe.is_some())
+            .map(|path| crate::dspark::DraftConfig::read(path, &config))
             .transpose()?;
+        let verify_rows = match mode {
+            super::SetupMode::Mtp { verify_rows } => verify_rows,
+            _ => draft_config
+                .as_ref()
+                .map(|draft| draft.target_rows(&model_spec))
+                .transpose()?
+                .unwrap_or(crate::mtp::MAX_VERIFY_ROWS),
+        };
+        let capture_layers = if let Some(draft) = &draft_config {
+            Some(draft.target_layer_ids.clone())
+        } else {
+            settings
+                .draft_model
+                .as_deref()
+                .map(|path| crate::dspark::read_capture_layers(path, &config))
+                .transpose()?
+        };
+        let target_transaction_bytes = draft_config
+            .as_ref()
+            .map(|draft| draft.target_state_bytes(&model_spec))
+            .transpose()?
+            .unwrap_or(0);
         ensure!(
             !settings.spec_budget.is_tree(),
             "Qwen DSpark proposal/tree execution is not bound"
@@ -1164,6 +1183,7 @@ impl Engine {
                 .context("combined row bytes overflow")?,
             fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
                 .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
+                .and_then(|bytes| bytes.checked_add(target_transaction_bytes))
                 .context("combined fixed bytes overflow")?,
         };
         let expert_setup = if model_spec.moe.is_some() {

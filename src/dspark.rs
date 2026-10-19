@@ -95,6 +95,49 @@ impl Rules {
 }
 
 impl DraftConfig {
+    pub fn verify_rows(&self) -> Result<usize> {
+        self.block_size
+            .checked_add(1)
+            .context("DSpark block_size+1 overflow")
+    }
+    pub fn target_rows(&self, spec: &crate::model_spec::ModelSpec) -> Result<usize> {
+        let rows = self.verify_rows()?;
+        ensure!(
+            spec.moe.is_some()
+                && self.head_dim == 256
+                && self.num_attention_heads == 8
+                && self.num_key_value_heads == 2,
+            "DSpark target architecture={:?} draft attention={}/{}/{} requires MoE with 8/2/256 draft heads",
+            spec.architecture,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim
+        );
+        ensure!(
+            (2..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
+            "DSpark block_size={} verify_rows={rows} exceeds skinny and routed arithmetic bound={}",
+            self.block_size,
+            crate::linear_plan::MAX_SKINNY_ROWS
+        );
+        Ok(rows)
+    }
+    #[cfg(any(feature = "cuda", test))]
+    pub(crate) fn target_state_bytes(&self, spec: &crate::model_spec::ModelSpec) -> Result<usize> {
+        let rows = self.target_rows(spec)?;
+        let layers = spec
+            .layers
+            .iter()
+            .filter(|layer| layer.mixer == crate::model_spec::Mixer::Gdn)
+            .count();
+        let images =
+            usize::try_from(crate::op_contract::GdnSpec::from_model(spec)?.image_bytes()?)?
+                .checked_mul(layers)
+                .and_then(|n| n.checked_mul(rows - 1))
+                .context("DSpark intermediate GDN snapshots overflow")?;
+        crate::mtp::checkpoint_bytes(spec, rows)?
+            .checked_add(images)
+            .context("DSpark target transaction byte overflow")
+    }
     pub fn capture_width(&self) -> usize {
         self.target_layer_ids.len() * self.hidden_size
     }
@@ -271,7 +314,7 @@ fn read_config(path: &Path) -> Result<serde_json::Value> {
     Ok(value)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn read_capture_layers(path: &Path, target: &Config) -> Result<Vec<usize>> {
     let value = read_config(path)?;
     ensure!(
@@ -364,7 +407,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn target_capture_metadata_preserves_slots_and_rejects_bad_extents() -> Result<()> {
         let target: Config = serde_json::from_value(serde_json::json!({
             "model_type":"llama", "hidden_size":2048, "intermediate_size":6144,
@@ -492,6 +534,29 @@ mod tests {
                 draft.block_size == 15 && draft.kv_dim() == 512 && draft.qkv_dim() == 3072,
                 "draft geometry borrowed target dimensions"
             );
+            let model = crate::model_spec::ModelSpec::minicpm(
+                &serde_json::from_str(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/data/minicpm-config.json"
+                )))?,
+                &serde_json::json!({"eos_token_id":[248044,248046]}),
+            )?;
+            ensure!(
+                draft.target_rows(&model)? == 16,
+                "draft verify extent changed"
+            );
+            ensure!(
+                draft.target_state_bytes(&model)? == 1_054_146_596,
+                "block15 transaction must retain 30 GDN checkpoint+15 prefix images and 16 KV write slots for 10 attention layers"
+            );
+            let mut invalid_rows = DraftConfig::read(&root, &hybrid_target)?;
+            for block in [0, crate::linear_plan::MAX_SKINNY_ROWS, usize::MAX] {
+                invalid_rows.block_size = block;
+                ensure!(
+                    invalid_rows.target_rows(&model).is_err(),
+                    "invalid verify extent admitted block={block}"
+                );
+            }
             let mut admitted = Vec::new();
             for (schema, original, target) in
                 [("flat", &flat, &target), ("nested", &full, &hybrid_target)]
