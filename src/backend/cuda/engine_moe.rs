@@ -314,7 +314,10 @@ impl Setup {
             1,
             self.capacity.worker_count,
             (cpu.0.max(1), cpu.1.max(geometry.top_k as usize)),
-            engine.model_spec.expert_format,
+            engine
+                .model_spec
+                .expert_format
+                .context("MoE expert_format missing")?,
         )?);
         engine.moe_prefill = Some(Prefill::new(
             &engine.device,

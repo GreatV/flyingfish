@@ -1999,7 +1999,7 @@ mod tests {
         };
         let pool = ExpertPool::new(2, Shape::new(hidden, intermediate)?, 32, 32)?;
         let mut disk = DiskExperts::new(catalogue, &directory, 1, 32)?;
-        let ops = PrefillOps::new(&device.ctx, stream, ExpertFormat::Bf16)?;
+        let ops = PrefillOps::new(&device.ctx, stream, crate::model_spec::ExpertFormat::Bf16)?;
         let mut defects = 0;
         for (rows, weighted) in [
             (1usize, false),

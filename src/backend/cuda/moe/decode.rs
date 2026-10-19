@@ -413,7 +413,7 @@ impl DecodeOps {
         stream: &Arc<CudaStream>,
         input: &MoeDecodeW8a16<'_>,
         scratch: &Scratch,
-    ) -> Result<CudaEvent> {
+    ) -> Result<()> {
         let DecodeDims {
             rows,
             experts,
@@ -475,7 +475,7 @@ impl DecodeOps {
                     shared_mem_bytes: 0,
                 })?;
         }
-        Ok(stream.record_event(None)?)
+        Ok(())
     }
 
     /// One full W8A16 decode MoE row block: contribute_w8a16, shared sigmoid

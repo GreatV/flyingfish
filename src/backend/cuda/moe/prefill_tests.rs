@@ -273,7 +273,7 @@ fn fp8_prefill_gpu() -> Result<()> {
             counts[e as usize] += 1;
         }
         let mut order = Vec::new();
-        problem_order(&counts, &mut order);
+        problem_order(&counts, &[false; MAX_EXPERTS][..experts], &mut order);
         let wave_bytes = order.len() as u64 * layout.wave_slot_bytes;
         let got_wave = s.clone_dtoh(
             &scratch_buf.slice(layout.wave as usize..(layout.wave + wave_bytes) as usize),

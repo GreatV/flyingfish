@@ -183,7 +183,7 @@ fn fp8_spec_states_per_channel_linears_and_the_published_ignore_list() -> Result
     let catalogue = flyingfish::experts::catalogue::ExpertCatalogue::from_manifest(
         &manifest,
         geometry,
-        spec.expert_format,
+        spec.expert_format.context("MoE expert_format missing")?,
     )?;
     assert_eq!(catalogue.geometry(), geometry);
     for (layer, kind) in spec.layers.iter().enumerate() {

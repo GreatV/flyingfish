@@ -295,7 +295,7 @@ impl MappedCheckpoint {
                         vec![experts, hidden],
                         TensorScope::Text,
                     );
-                    if spec.expert_format == crate::model_spec::ExpertFormat::Fp8W8a16 {
+                    if spec.expert_format == Some(crate::model_spec::ExpertFormat::Fp8W8a16) {
                         for expert in 0..experts {
                             for (role, n, k) in [
                                 ("gate_proj", expert_i, hidden),
