@@ -338,12 +338,13 @@ pub const LAYER: [crate::backend::Operator; 10] = [
 pub enum LayerStage {
     Common(crate::backend::Operator),
     Mixer(crate::model_spec::Mixer),
+    Ffn,
 }
 
 pub fn layer_program(
     spec: &crate::model_spec::ModelSpec,
     layer: usize,
-) -> anyhow::Result<[LayerStage; 7]> {
+) -> anyhow::Result<[LayerStage; 5]> {
     use crate::backend::Operator as O;
     use anyhow::Context;
     let mixer = spec
@@ -355,9 +356,7 @@ pub fn layer_program(
         LayerStage::Common(O::Norm),
         LayerStage::Mixer(mixer),
         LayerStage::Common(O::PostNorm),
-        LayerStage::Common(O::GateUp),
-        LayerStage::Common(O::Activate),
-        LayerStage::Common(O::Down),
+        LayerStage::Ffn,
         LayerStage::Common(O::NextNorm),
     ])
 }

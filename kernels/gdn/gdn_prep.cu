@@ -60,3 +60,72 @@ extern "C" __global__ void gdn_beta_widen(
     beta_fp32[(size_t)m * GDN_PREP_HEADS + h] =
         __bfloat162float(beta_bf16[(size_t)m * GDN_PREP_HEADS + h]);
 }
+
+#if GDN_HEADS == 32
+extern "C" __global__ void gdn_prep_l2_fp32(
+        const __nv_bfloat16* __restrict__ q_bf16,
+        const __nv_bfloat16* __restrict__ k_bf16,
+        const __nv_bfloat16* __restrict__ v_bf16,
+        float* __restrict__ q_fp32,
+        float* __restrict__ k_fp32,
+        float* __restrict__ v_fp32,
+        uint32_t row_stride,
+        const GdnPrepMeta* __restrict__ meta,
+        float l2_eps) {
+    if (blockDim.x != GDN_PREP_DK || blockDim.y != 1 || blockDim.z != 1
+        || gridDim.x != 1 || gridDim.y != GDN_PREP_KHEADS) {
+        __trap();
+        return;
+    }
+    const int row = blockIdx.z;
+    if (row >= meta->valid_rows) return;
+    const int head = blockIdx.y;
+    const int d = threadIdx.x;
+    const int lane = d & 31;
+    const int warp = d >> 5;
+    const size_t source = (size_t)row * row_stride + head * GDN_PREP_DK + d;
+    const float q = __bfloat162float(q_bf16[source]);
+    const float k = __bfloat162float(k_bf16[source]);
+    float qs = q * q;
+    float ks = k * k;
+    #pragma unroll
+    for (int delta = 16; delta > 0; delta >>= 1) {
+        qs += __shfl_down_sync(0xffffffff, qs, delta);
+        ks += __shfl_down_sync(0xffffffff, ks, delta);
+    }
+    __shared__ float sums[2][GDN_PREP_DK / 32];
+    if (lane == 0) {
+        sums[0][warp] = qs;
+        sums[1][warp] = ks;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        qs = lane < GDN_PREP_DK / 32 ? sums[0][lane] : 0.0f;
+        ks = lane < GDN_PREP_DK / 32 ? sums[1][lane] : 0.0f;
+        #pragma unroll
+        for (int delta = 16; delta > 0; delta >>= 1) {
+            qs += __shfl_down_sync(0xffffffff, qs, delta);
+            ks += __shfl_down_sync(0xffffffff, ks, delta);
+        }
+        if (lane == 0) {
+            sums[0][0] = rsqrtf(qs + l2_eps);
+            sums[1][0] = rsqrtf(ks + l2_eps);
+        }
+    }
+    __syncthreads();
+    const float qn = q * sums[0][0];
+    const float kn = k * sums[1][0];
+    const float scaled_q = qn * (1.0f / sqrtf((float)GDN_PREP_DK));
+    #pragma unroll
+    for (int child = 0; child < GDN_PREP_HEADS / GDN_PREP_KHEADS; ++child) {
+        const int value_head = head * (GDN_PREP_HEADS / GDN_PREP_KHEADS) + child;
+        const size_t out = ((size_t)row * GDN_PREP_HEADS + value_head) * GDN_PREP_DV + d;
+        q_fp32[out] = scaled_q;
+        k_fp32[out] = kn;
+        if (v_fp32 != nullptr) {
+            v_fp32[out] = __bfloat162float(
+                v_bf16[(size_t)row * row_stride + value_head * GDN_PREP_DV + d]);
+        }
+    }
+}
+#endif

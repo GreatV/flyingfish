@@ -5,7 +5,9 @@
 // U = bf16(T)@bf16(beta.V), v_new = U - bf16(W)@bf16(S), QS = bf16(q.e^G)@bf16(S),
 // AD = bf16(qk)@bf16(v_new), out = BF16_RNE(QS+AD) and
 // S = S.exp(G_last) + bf16(k.e^{G_last-G})^T@bf16(v_new).
-// One BF16 RNE copy per GEMM operand, FP32 accumulators and FP32 T leaves; __expf only
+// One BF16 RNE copy per GEMM operand for 48 value heads.
+// Stage-H Q/K use BF16 high/residual terms for 32 value heads.
+// FP32 accumulators and FP32 T leaves; __expf only
 // on differences of non-positive log-cumulatives. BM = C = 64, BN = VW = 128/s, BK = 16,
 // 256 threads = 8 warps, S[:,j0:j0+VW] in registers, one CTA per SM.
 #include <cuda_runtime.h>
@@ -56,7 +58,12 @@ struct BFrag { uint32_t r[2]; };
 #define P1_GID(l) ((l) >> 2)
 #define P1_T2(l)  (((l) & 3) << 1)
 
+template<bool Residual = false>
 __device__ __forceinline__ uint32_t p1_pack(float lo, float hi) {
+    if constexpr (Residual) {
+        lo = __fsub_rn(lo, __bfloat162float(__float2bfloat16_rn(lo)));
+        hi = __fsub_rn(hi, __bfloat162float(__float2bfloat16_rn(hi)));
+    }
     return (uint32_t)__bfloat16_as_ushort(__float2bfloat16_rn(lo))
          | ((uint32_t)__bfloat16_as_ushort(__float2bfloat16_rn(hi)) << 16);
 }
@@ -65,13 +72,14 @@ __device__ __forceinline__ uint32_t p1_pack(float lo, float hi) {
 
 // A from FP32 rows, one scale per row (beta, and the q liveness mask): register 1 is the
 // +8 row at the low columns and register 2 the base row at the +8 columns.
+template<bool Residual = false>
 __device__ __forceinline__ AFrag p1_a_rows(const float* lo, const float* hi, int col0,
                                            int t2, float s_lo, float s_hi) {
     AFrag f;
-    f.r[0] = p1_pack(lo[col0 + t2] * s_lo, lo[col0 + t2 + 1] * s_lo);
-    f.r[1] = p1_pack(hi[col0 + t2] * s_hi, hi[col0 + t2 + 1] * s_hi);
-    f.r[2] = p1_pack(lo[col0 + t2 + 8] * s_lo, lo[col0 + t2 + 9] * s_lo);
-    f.r[3] = p1_pack(hi[col0 + t2 + 8] * s_hi, hi[col0 + t2 + 9] * s_hi);
+    f.r[0] = p1_pack<Residual>(lo[col0 + t2] * s_lo, lo[col0 + t2 + 1] * s_lo);
+    f.r[1] = p1_pack<Residual>(hi[col0 + t2] * s_hi, hi[col0 + t2 + 1] * s_hi);
+    f.r[2] = p1_pack<Residual>(lo[col0 + t2 + 8] * s_lo, lo[col0 + t2 + 9] * s_lo);
+    f.r[3] = p1_pack<Residual>(hi[col0 + t2 + 8] * s_hi, hi[col0 + t2 + 9] * s_hi);
     return f;
 }
 
@@ -83,17 +91,18 @@ __device__ __forceinline__ float p1_kdec(const float* kh, size_t ld, int row0, i
     return kh[(size_t)gr * ld + dk] * __expf(gl - sG[ci]);
 }
 
+template<bool Residual = false>
 __device__ __forceinline__ AFrag p1_a_kdec(const float* kh, size_t ld, int row0, int valid,
                                            const float* sG, float gl, int dk, int t2) {
     const int c0 = t2;
     AFrag f;
-    f.r[0] = p1_pack(p1_kdec(kh, ld, row0, valid, c0, dk, sG, gl),
+    f.r[0] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0, dk, sG, gl),
                      p1_kdec(kh, ld, row0, valid, c0 + 1, dk, sG, gl));
-    f.r[1] = p1_pack(p1_kdec(kh, ld, row0, valid, c0, dk + 8, sG, gl),
+    f.r[1] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0, dk + 8, sG, gl),
                      p1_kdec(kh, ld, row0, valid, c0 + 1, dk + 8, sG, gl));
-    f.r[2] = p1_pack(p1_kdec(kh, ld, row0, valid, c0 + 8, dk, sG, gl),
+    f.r[2] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0 + 8, dk, sG, gl),
                      p1_kdec(kh, ld, row0, valid, c0 + 9, dk, sG, gl));
-    f.r[3] = p1_pack(p1_kdec(kh, ld, row0, valid, c0 + 8, dk + 8, sG, gl),
+    f.r[3] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0 + 8, dk + 8, sG, gl),
                      p1_kdec(kh, ld, row0, valid, c0 + 9, dk + 8, sG, gl));
     return f;
 }
@@ -577,6 +586,10 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
                 const AFrag a = p1_a_rows(al, ah, ks * 16, t2, sl, sh);
                 const BFrag b = p1_b_sbf(sV, P1_VLDK, nt * 8 + gid, ks * 16, t2);
                 P1_MMA(d, a, b);
+#if GDN_HEADS == 32
+                const AFrag residual = p1_a_rows<true>(al, ah, ks * 16, t2, sl, sh);
+                P1_MMA(d, residual, b);
+#endif
             }
             o[0] = d[0];
             o[1] = d[1];
@@ -613,10 +626,17 @@ __device__ __forceinline__ void gdn_chunkwise_p1_t(
                 // ks*16 is the chunk-row offset of the 16-wide k-step.
                 const AFrag a = p1_a_kdec(kh, rstride, row0, valid_rows, sG, gl,
                                           warp * 16 + gid, ks * 16 + t2);
+#if GDN_HEADS == 32
+                const AFrag residual = p1_a_kdec<true>(kh, rstride, row0, valid_rows, sG, gl,
+                                                      warp * 16 + gid, ks * 16 + t2);
+#endif
                 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
                     const BFrag b = p1_b_sbf(sV, VLD, nt * 8 + gid, ks * 16, t2);
                     P1_MMA(o[nt], a, b);
+#if GDN_HEADS == 32
+                    P1_MMA(o[nt], residual, b);
+#endif
                 }
             }
             #pragma unroll

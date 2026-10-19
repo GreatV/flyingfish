@@ -193,6 +193,7 @@ pub struct GdnSpec {
     pub decode_value_split: u32,
     pub rms_eps: f32,
     pub l2_eps: f32,
+    pub qk_norm_fp32: bool,
 }
 impl GdnSpec {
     pub const PLAN_ID: &'static str = "gdn-plan-v2-c32-vs1-fp32";
@@ -212,6 +213,7 @@ impl GdnSpec {
                 .checked_sub(1)
                 .context("GDN history width underflow")?,
             rms_eps: spec.rms_eps,
+            qk_norm_fp32: g.qk_norm_fp32,
             ..Self::q38()
         };
         bound.validate()?;
@@ -230,6 +232,7 @@ impl GdnSpec {
             decode_value_split: 2,
             rms_eps: 1e-6,
             l2_eps: 1e-6,
+            qk_norm_fp32: false,
         }
     }
     pub fn kernel_suffix(&self) -> Result<&'static str> {
@@ -257,6 +260,12 @@ impl GdnSpec {
             .context("GDN convolution width overflow")
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            matches!((self.hv, self.qk_norm_fp32), (32, true) | (48, false)),
+            "unsupported GDN hv={} qk_norm_fp32={}",
+            self.hv,
+            self.qk_norm_fp32
+        );
         ensure!(
             self.hk == 16
                 && matches!(self.hv, 32 | 48)
@@ -319,6 +328,7 @@ mod tests {
         model.kv_heads = 2;
         model.q_width = 4096;
         model.gdn.as_mut().unwrap().value_heads = 32;
+        model.gdn.as_mut().unwrap().qk_norm_fp32 = true;
         let changed = GdnSpec::from_model(&model)?;
         let attention = FullAttentionSpec::from_model(&model)?;
         let work = crate::work_layout::RowWorkSpec::new(&model)?;

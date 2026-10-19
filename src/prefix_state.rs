@@ -1076,6 +1076,7 @@ mod tests {
         ModelSpec {
             abi_version: 1,
             architecture: Architecture::Qwen35Text,
+            expert_format: None,
             hidden: 5120,
             intermediate: 17408,
             vocab: 248320,
@@ -1097,6 +1098,7 @@ mod tests {
                 key_head_dim: 128,
                 value_head_dim: 128,
                 conv_kernel: 4,
+                qk_norm_fp32: false,
             }),
             vision: None,
         }

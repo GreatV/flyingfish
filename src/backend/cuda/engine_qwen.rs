@@ -5,14 +5,14 @@ use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
     gdn::{CUDA_GRID_YZ_MAX, GdnBindings, GdnOps, GdnPlan},
-    linear::{LayerLinearPlan, LinearWeightRef},
+    linear::{BoundFfn, LayerLinearPlan, LinearWeightRef},
     ops::{CommonOpsRef, GatedRmsInput, ResidualRmsCapture, ResidualRmsInput, RmsMode, RmsOptions},
     weights::WeightCatalog,
 };
 /// The workspace alignment the default-chunk cap must preserve; the same value the budget call passes.
 const CHUNK_ALIGNMENT: usize = 32;
 /// The default chunk is bounded by the largest alignment multiple at or under the CUDA gridDim.y/z limit the GDN prep pair launches rows on.
-fn default_chunk(admitted: usize) -> usize {
+pub(super) fn default_chunk(admitted: usize) -> usize {
     admitted.min(CUDA_GRID_YZ_MAX as usize / CHUNK_ALIGNMENT * CHUNK_ALIGNMENT)
 }
 
@@ -109,6 +109,11 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             "hybrid engine does not implement {name}={value}"
         );
     }
+    ensure!(
+        gdn.qk_norm_fp32 == (hv == 32),
+        "hybrid engine does not implement qk_norm_fp32={} for linear_num_value_heads={hv}",
+        gdn.qk_norm_fp32
+    );
     Ok(())
 }
 
@@ -118,6 +123,8 @@ pub(super) struct Runtime {
     checkpoint_dir: PathBuf,
     vision: Option<super::vision_runtime::VisionRuntime>,
     vision_bytes: usize,
+    #[cfg(test)]
+    pub(super) vision_encode_calls: usize,
     positions: CudaSlice<i32>,
     active_positions: CudaSlice<i32>,
     gather_positions: CudaFunction,
@@ -134,6 +141,7 @@ pub(super) struct Runtime {
 }
 struct Layer {
     linear: LayerLinearPlan,
+    ffn: BoundFfn,
     input_norm: Tensor<bf16, 1>,
     post_norm: Tensor<bf16, 1>,
     mixer: BoundMixer,
@@ -263,6 +271,26 @@ fn nested_verify_tcmqa(device_prefix: bool, rows: usize) -> Result<bool> {
     Ok(true)
 }
 impl Runtime {
+    fn select_positions(
+        &self,
+        stream: &Arc<CudaStream>,
+        meta: crate::backend::cuda::contracts::SeqRef,
+        workspace_rows: usize,
+    ) -> Result<()> {
+        let (table, _table) = self.positions.device_ptr(stream);
+        let (active, _active) = self.active_positions.device_ptr(stream);
+        let max_rows = u32::try_from(workspace_rows)?;
+        unsafe {
+            stream
+                .launch_builder(&self.gather_positions)
+                .arg(&table)
+                .arg(&active)
+                .arg(&meta.ptr)
+                .arg(&max_rows)
+                .launch(grid((workspace_rows * 3).div_ceil(256).min(65535), 256))?;
+        }
+        Ok(())
+    }
     pub(super) fn checkpoint_path(&self) -> &Path {
         &self.checkpoint_dir
     }
@@ -286,7 +314,7 @@ impl Runtime {
             .and_then(|n| n.checked_add(spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>()))
             .context("Q38 fixed workspace overflow")
     }
-    fn workspace(
+    pub(super) fn workspace(
         model: &crate::model_spec::ModelSpec,
         rows: usize,
         capacity: usize,
@@ -325,7 +353,7 @@ impl Runtime {
                 .max(decode.bytes),
         )?)
     }
-    fn new(
+    pub(super) fn new(
         engine: &Engine,
         checkpoint_dir: &Path,
         catalog: WeightCatalog,
@@ -369,7 +397,8 @@ impl Runtime {
                 engine.model_spec.linear_format,
             )?;
             let arena_view = arena.as_ref().map(|b| scratch(b, s));
-            let linear = LayerLinearPlan::bind(&plan, &catalog, arena_view.as_ref(), s)?;
+            let mut linear = LayerLinearPlan::bind(&plan, &catalog, arena_view.as_ref(), s)?;
+            let ffn = BoundFfn::bind(&engine.model_spec, &mut linear)?;
             let mixer = match layout.mixer {
                 Mixer::FullAttention => {
                     let kv = &engine.state.kv[layout.state_index as usize];
@@ -595,6 +624,7 @@ impl Runtime {
             };
             layers.push(Layer {
                 linear,
+                ffn,
                 input_norm: weight("input_layernorm.weight")?,
                 post_norm: weight("post_attention_layernorm.weight")?,
                 mixer,
@@ -609,6 +639,8 @@ impl Runtime {
                 .context("resolve Q38 checkpoint directory")?,
             vision: None,
             vision_bytes: 0,
+            #[cfg(test)]
+            vision_encode_calls: 0,
             positions,
             active_positions,
             gather_positions: crate::backend::cuda::cubin::module(
@@ -648,6 +680,7 @@ impl Runtime {
         }
         for layer in &mut self.layers {
             layer.linear.prepare(blas, rows)?;
+            layer.ffn.prepare(blas, rows)?;
         }
         blas.prepare_fixed(1, vocab, hidden)?;
         self.prepared.insert(rows);
@@ -686,6 +719,46 @@ impl Runtime {
     }
 }
 impl Engine {
+    #[cfg(test)]
+    pub(super) fn inject_moe_test_positions(&mut self, axes: [&[i32]; 3]) -> Result<()> {
+        let rows = axes[0].len();
+        let first = *axes[0]
+            .first()
+            .context("layer injection positions are empty")?;
+        ensure!(
+            first >= 0
+                && axes.iter().all(|a| a.len() == rows
+                    && a.iter()
+                        .all(|&v| v >= 0 && (v as u32) < self.model_spec.max_position)),
+            "invalid layer injection position axes"
+        );
+        if let Some(runtime) = self.qwen.as_mut() {
+            let packed = (0..rows)
+                .flat_map(|row| axes.map(|a| a[row]))
+                .collect::<Vec<_>>();
+            self.device
+                .stream
+                .memcpy_htod(&packed, &mut runtime.active_positions.slice_mut(..rows * 3))?;
+            self.state.set_sequence(
+                &self.device.stream,
+                first as u32,
+                rows as u32,
+                self.workspace_rows as u32,
+            )?;
+        } else {
+            ensure!(
+                axes.iter()
+                    .all(|axis| axis.iter().enumerate().all(|(r, &v)| v == first + r as i32)),
+                "legacy layer injection requires contiguous equal position axes"
+            );
+        }
+        self.position = first as usize;
+        self.device
+            .stream
+            .memcpy_htod(&[first], &mut self.work.position)?;
+        Ok(())
+    }
+
     pub(super) fn bind_mtp_snapshots(
         &mut self,
         snapshots: &[super::super::state::GdnState],
@@ -736,6 +809,10 @@ impl Engine {
 
     pub(super) fn reset_qwen_positions(&mut self) -> Result<()> {
         if let Some(q) = self.qwen.as_mut() {
+            #[cfg(test)]
+            {
+                q.vision_encode_calls = 0;
+            }
             let positions =
                 crate::vision_input::PositionPlan::text(1, self.capacity)?.packed_axes()?;
             self.device
@@ -797,6 +874,10 @@ impl Engine {
         self.poisoned = true;
         let request = vision.prepare(&self.device, &mut self.blas, input, self.capacity)?;
         let images = vision.encode(&self.device.stream, &self.blas, request, trace)?;
+        #[cfg(test)]
+        {
+            q.vision_encode_calls += 1;
+        }
         self.device
             .stream
             .memcpy_htod(&positions, &mut q.positions)?;
@@ -921,9 +1002,17 @@ impl Engine {
         model_spec: crate::model_spec::ModelSpec,
     ) -> Result<Self> {
         require_qwen35_geometry(&model_spec)?;
-        ensure!(model_spec.moe.is_none(), "MoE FFN execution is not bound");
         let write = !matches!(mode, super::SetupMode::Ready);
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
+        ensure!(
+            model_spec.moe.is_none() || !reserve_mtp,
+            "MoE MTP attachment is not bound: architecture={:?}",
+            model_spec.architecture
+        );
+        ensure!(
+            model_spec.moe.is_none() || !settings.prefix_cache,
+            "MoE prefix_cache=true has no delegated-expert content identity"
+        );
         let verify_rows = match mode {
             super::SetupMode::Mtp { verify_rows } => verify_rows,
             _ => crate::mtp::MAX_VERIFY_ROWS,
@@ -1052,47 +1141,70 @@ impl Engine {
         let mtp_budget = reserve_mtp
             .then(|| crate::mtp::AttachmentBudget::new(&model_spec, capacity))
             .transpose()?;
-        let budget = crate::prefill::WorkspaceBudget::new(
-            crate::prefill::WorkspaceRequest {
-                capacity,
-                requested: requested_chunk,
-                free_after_resident: free,
-                total,
-                alignment: CHUNK_ALIGNMENT,
-                row_bytes: Runtime::row_bytes(&model_spec)?
-                    .checked_add(mtp_budget.as_ref().map_or(0, |b| b.row_bytes))
-                    .and_then(|bytes| bytes.checked_add(capture_row_bytes))
-                    .context("combined row bytes overflow")?,
-                fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
-                    .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
-                    .context("combined fixed bytes overflow")?,
-            },
-            |rows| {
-                let mut target = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?;
-                if settings.kv_format != crate::kv::KvFormat::Bf16 {
-                    target = target.max(
-                        crate::op_contract::AttentionWorkspace::new(
-                            &attention,
-                            verify_rows as u32,
-                            capacity as u32,
-                            limits(verify_rows, capacity)?.key_chunk,
-                        )?
-                        .bytes as usize,
-                    );
-                }
-                target
-                    .checked_add(
-                        mtp_budget
-                            .as_ref()
-                            .map(|b| b.workspace(rows))
-                            .transpose()?
-                            .unwrap_or(0),
-                    )
-                    .context("Q38 combined workspace overflow")
-            },
-            |admitted| Ok(default_chunk(admitted)),
-        )?;
-        let rows = budget.plan.chunk;
+        let request = crate::prefill::WorkspaceRequest {
+            capacity,
+            requested: requested_chunk,
+            free_after_resident: free,
+            total,
+            alignment: CHUNK_ALIGNMENT,
+            row_bytes: Runtime::row_bytes(&model_spec)?
+                .checked_add(mtp_budget.as_ref().map_or(0, |b| b.row_bytes))
+                .and_then(|bytes| bytes.checked_add(capture_row_bytes))
+                .context("combined row bytes overflow")?,
+            fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
+                .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
+                .context("combined fixed bytes overflow")?,
+        };
+        let expert_setup = if model_spec.moe.is_some() {
+            Some(super::moe::Setup::new(
+                &device,
+                &model_spec,
+                &catalog.manifest,
+                dir,
+                &runtime,
+                write,
+                request,
+            )?)
+        } else {
+            None
+        };
+        let dense_budget;
+        let budget = if let Some(setup) = &expert_setup {
+            &setup.workspace.mixer
+        } else {
+            dense_budget = crate::prefill::WorkspaceBudget::new(
+                request,
+                |rows| {
+                    let mut target = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?;
+                    if settings.kv_format != crate::kv::KvFormat::Bf16 {
+                        target = target.max(
+                            crate::op_contract::AttentionWorkspace::new(
+                                &attention,
+                                verify_rows as u32,
+                                capacity as u32,
+                                limits(verify_rows, capacity)?.key_chunk,
+                            )?
+                            .bytes as usize,
+                        );
+                    }
+                    target
+                        .checked_add(
+                            mtp_budget
+                                .as_ref()
+                                .map(|b| b.workspace(rows))
+                                .transpose()?
+                                .unwrap_or(0),
+                        )
+                        .context("Q38 combined workspace overflow")
+                },
+                |admitted| Ok(default_chunk(admitted)),
+            )?;
+            &dense_budget
+        };
+        let chunk = budget.plan.chunk;
+        let rows = expert_setup
+            .as_ref()
+            .map_or(chunk, |setup| setup.workspace.workspace_rows);
         ensure!(
             !reserve_mtp || rows >= verify_rows,
             "MTP chunk {rows} cannot fit {verify_rows} verification rows"
@@ -1156,7 +1268,11 @@ impl Engine {
             capture_fail_stage: None,
             qwen_device_prefix: false,
             forward_rows: (1..=rows.min(16)).collect(),
-            graphs: vec![Graph::Decode],
+            graphs: if expert_setup.is_some() {
+                Vec::new()
+            } else {
+                vec![Graph::Decode]
+            },
             closure,
             graph: None,
             poisoned: false,
@@ -1180,7 +1296,7 @@ impl Engine {
             config,
             model_spec,
             capacity,
-            chunk: rows,
+            chunk,
             workspace_rows: rows,
             trace_layer: 0,
             position: 0,
@@ -1192,6 +1308,11 @@ impl Engine {
             resident_ids_len: 0,
             last_input_kind: None,
             qwen: None,
+            moe: None,
+            moe_slots: None,
+            moe_prefill: None,
+            #[cfg(test)]
+            moe_test_ffn: None,
             mtp: None,
             mtp_state: None,
             mtp_epoch: 0,
@@ -1206,6 +1327,12 @@ impl Engine {
             kv_scratch,
             verify_rows,
         )?);
+        if let Some(setup) = expert_setup {
+            setup.bind(&mut engine)?;
+        }
+        if engine.model_spec.moe.is_some() {
+            engine.declare_graphs()?;
+        }
         engine.prepare(1)?;
         engine.prepare_prefill_plans()?;
         engine
@@ -1539,6 +1666,53 @@ impl Engine {
         }
         Ok(())
     }
+    pub(super) fn run_ffn(
+        &mut self,
+        layer: usize,
+        step: crate::backend::Step<'_>,
+        trace: &mut Option<Target<'_>>,
+    ) -> Result<()> {
+        let ffn = self.qwen.as_ref().map(|runtime| runtime.layers[layer].ffn);
+        #[cfg(test)]
+        let ffn = ffn.or(self.moe_test_ffn);
+        if let Some(ffn @ BoundFfn::Moe { .. }) = ffn {
+            return self.run_moe_ffn(layer, step.rows, ffn, trace);
+        }
+        for op in [
+            crate::backend::Operator::GateUp,
+            crate::backend::Operator::Activate,
+            crate::backend::Operator::Down,
+        ] {
+            self.run_operator(op, layer, step, trace)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn moe_ffn_binding(&self, layer: usize) -> Result<BoundFfn> {
+        let ffn = self
+            .qwen
+            .as_ref()
+            .context("MoE hybrid runtime missing")?
+            .layers
+            .get(layer)
+            .with_context(|| format!("MoE hybrid layer={layer} is outside runtime"))?
+            .ffn;
+        ensure!(
+            matches!(ffn, BoundFfn::Moe { .. }),
+            "MoE hybrid layer={layer} has a dense FFN binding"
+        );
+        Ok(ffn)
+    }
+
+    pub(super) fn select_qwen_positions(&self) -> Result<()> {
+        let q = self.qwen.as_ref().context("Q38 position runtime missing")?;
+        q.select_positions(
+            &self.device.stream,
+            self.state.seq_ref(&self.device.stream)?,
+            self.workspace_rows,
+        )
+    }
+
     pub(super) fn qwen_operator(
         &mut self,
         op: crate::backend::Operator,
@@ -1567,20 +1741,7 @@ impl Engine {
         };
         match op {
             O::Embed => {
-                let (table, _table) = q.positions.device_ptr(s);
-                let (active, _active) = q.active_positions.device_ptr(s);
-                let max_rows = self.workspace_rows as u32;
-                unsafe {
-                    s.launch_builder(&q.gather_positions)
-                        .arg(&table)
-                        .arg(&active)
-                        .arg(&domain.meta.ptr)
-                        .arg(&max_rows)
-                        .launch(grid(
-                            (self.workspace_rows * 3).div_ceil(256).min(65535),
-                            256,
-                        ))?;
-                }
+                q.select_positions(s, domain.meta, self.workspace_rows)?;
                 let ids = if step.input == crate::backend::Input::Token {
                     &w.token
                 } else {
@@ -1761,6 +1922,8 @@ impl Engine {
                         },
                     )?;
                 }
+                #[cfg(test)]
+                trace_value(trace, s, "norm", &w.n, rows, h)?;
                 self.blas.linear_typed(
                     phase,
                     LinearWeightRef::Bf16(matrix(
@@ -1846,6 +2009,7 @@ mod tests {
                 "linear_key_head_dim",
                 "linear_value_head_dim",
                 "linear_conv_kernel_dim",
+                "qk_norm_fp32",
                 "gdn",
                 "linear_format",
                 "architecture",
@@ -1871,6 +2035,10 @@ mod tests {
                     "linear_key_head_dim" => bad.gdn.as_mut().unwrap().key_head_dim += 1,
                     "linear_value_head_dim" => bad.gdn.as_mut().unwrap().value_head_dim += 1,
                     "linear_conv_kernel_dim" => bad.gdn.as_mut().unwrap().conv_kernel += 1,
+                    "qk_norm_fp32" => {
+                        let gdn = bad.gdn.as_mut().unwrap();
+                        gdn.qk_norm_fp32 = !gdn.qk_norm_fp32;
+                    }
                     "gdn" => bad.gdn = None,
                     "linear_format" => {
                         bad.linear_format = match original.linear_format {
@@ -1878,6 +2046,9 @@ mod tests {
                                 crate::model_spec::LinearFormat::Fp8E4m3Block128
                             }
                             crate::model_spec::LinearFormat::Fp8E4m3Block128 => {
+                                crate::model_spec::LinearFormat::Bf16
+                            }
+                            crate::model_spec::LinearFormat::Fp8E4m3Channel => {
                                 crate::model_spec::LinearFormat::Bf16
                             }
                         }
@@ -1907,8 +2078,8 @@ mod tests {
             minicpm,
         )
         .err()
-        .context("MoE model reached device setup")?;
-        assert!(error.to_string().contains("MoE FFN execution"), "{error}");
+        .context("MoE model reached device setup without a runtime directory")?;
+        assert!(error.to_string().contains("runtime directory"), "{error}");
         Ok(())
     }
 

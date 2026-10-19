@@ -31,6 +31,8 @@ use std::{
     time::Instant,
 };
 
+#[path = "engine_moe.rs"]
+mod moe;
 #[path = "engine_mtp.rs"]
 mod mtp;
 #[path = "engine_mtp_generate.rs"]
@@ -396,6 +398,9 @@ impl Spec {
 #[serde(rename_all = "snake_case")]
 enum Graph {
     Decode,
+    MoeRoute(usize),
+    MoeContribute(usize),
+    MoeJoin(usize),
     Draft,
     Verify,
     TreeDraft,
@@ -454,6 +459,11 @@ pub struct Engine {
     spec: Option<Spec>,
     hidden_capture: Option<HiddenCapture>,
     qwen: Option<qwen::Runtime>,
+    moe: Option<moe::Decode>,
+    moe_slots: Option<moe::Slots>,
+    moe_prefill: Option<moe::Prefill>,
+    #[cfg(test)]
+    moe_test_ffn: Option<super::linear::BoundFfn>,
     mtp: Option<mtp::Chain>,
     mtp_state: Option<super::state::StateStore>,
     mtp_epoch: u64,
@@ -635,6 +645,45 @@ impl Engine {
         chunk: Option<usize>,
         settings: Settings,
     ) -> Result<()> {
+        let spec = crate::model_spec::ModelSpec::read(dir)?;
+        if spec.moe.is_some() {
+            let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&spec)?;
+            let runtime = super::calibrate::runtime_dir(
+                settings
+                    .runtime_dir
+                    .as_deref()
+                    .context("expert calibration requires a runtime directory")?,
+                dir,
+                true,
+            )?;
+            let closure = super::closure::Closure::new(
+                true,
+                format!(
+                    "{:?} --model {dir:?} --device {ordinal} --runtime-dir {runtime:?} calibrate",
+                    std::env::current_exe()?,
+                ),
+            );
+            let device = Device::new(ordinal)?;
+            let measured = super::calibrate::load_experts(
+                &device,
+                &runtime,
+                geometry,
+                spec.expert_format.context("MoE expert_format missing")?,
+                &closure,
+            )?;
+            let budget = crate::experts::plan::admission_budget(
+                &geometry,
+                &measured.service,
+                measured.h2d_bytes_per_second,
+                measured.d2h_bytes_per_second,
+                measured.copy_engines,
+            )?;
+            eprintln!(
+                "{}",
+                serde_json::json!({"expert_setup_calibrated":{"budget_bytes_per_token":budget,"hard_step_cap":crate::experts::plan::Admission { budget_bytes_per_token: budget }.hard_cap(crate::experts::catalogue::ExpertLayout::new(spec.expert_format.context("MoE expert_format missing")?, &geometry)?.slot_bytes())?}})
+            );
+            return Ok(());
+        }
         Self::load_kind(dir, ordinal, capacity, chunk, settings, true)?;
         Ok(())
     }
@@ -770,6 +819,11 @@ impl Engine {
             #[cfg(test)]
             capture_fail_stage: None,
             qwen: None,
+            moe: None,
+            moe_slots: None,
+            moe_prefill: None,
+            #[cfg(test)]
+            moe_test_ffn: None,
             mtp: None,
             mtp_state: None,
             mtp_epoch: 0,
@@ -880,7 +934,7 @@ impl Engine {
             });
         }
         engine.size_workspace(requested_chunk)?;
-        engine.declare_graphs();
+        engine.declare_graphs()?;
         if engine.spec.is_some() {
             eprintln!(
                 "{}",
@@ -1046,35 +1100,62 @@ impl Engine {
         &self.device.info
     }
 
-    fn declare_graphs(&mut self) {
-        self.graphs = match &self.spec {
-            None => vec![Graph::Decode],
-            Some(spec) if !spec.graph => Vec::new(),
-            Some(spec) => {
-                let mut graphs = if self.spec_budget.is_tree() {
-                    vec![Graph::TreeDraft, Graph::TreeVerify, Graph::TreeCommit]
-                } else {
-                    vec![Graph::Draft, Graph::Verify]
-                };
-                graphs.extend((1..=spec.inject_graphs.len()).map(Graph::Inject));
-                graphs
+    fn declare_graphs(&mut self) -> Result<()> {
+        self.graphs = if self.model_spec.moe.is_some() {
+            if self
+                .moe_slots
+                .as_ref()
+                .context("MoE graph declaration has no slots")?
+                .all_resident()
+            {
+                vec![Graph::Decode]
+            } else {
+                (0..self.model_spec.layers.len())
+                    .flat_map(|layer| {
+                        [
+                            Graph::MoeRoute(layer),
+                            Graph::MoeContribute(layer),
+                            Graph::MoeJoin(layer),
+                        ]
+                    })
+                    .collect()
+            }
+        } else {
+            match &self.spec {
+                None => vec![Graph::Decode],
+                Some(spec) if !spec.graph => Vec::new(),
+                Some(spec) => {
+                    let mut graphs = if self.spec_budget.is_tree() {
+                        vec![Graph::TreeDraft, Graph::TreeVerify, Graph::TreeCommit]
+                    } else {
+                        vec![Graph::Draft, Graph::Verify]
+                    };
+                    graphs.extend((1..=spec.inject_graphs.len()).map(Graph::Inject));
+                    graphs
+                }
             }
         };
         eprintln!(
             "{}",
             serde_json::json!({"backend_graph_declaration":self.graphs})
         );
+        Ok(())
     }
 
     fn has_graph(&self, graph: Graph) -> bool {
         if matches!(graph, Graph::Decode) {
             return self.graph.is_some();
         }
+        if let Graph::MoeRoute(layer) | Graph::MoeContribute(layer) | Graph::MoeJoin(layer) = graph
+        {
+            return layer < self.model_spec.layers.len() && self.has_moe_segments();
+        }
         let Some(spec) = &self.spec else {
             return false;
         };
         match graph {
             Graph::Decode => self.graph.is_some(),
+            Graph::MoeRoute(_) | Graph::MoeContribute(_) | Graph::MoeJoin(_) => false,
             Graph::Draft => spec.draft_graph.is_some(),
             Graph::Verify => spec.verify_graph.is_some(),
             Graph::TreeDraft => spec.tree_draft_graph.is_some(),
@@ -1250,11 +1331,17 @@ impl Engine {
             );
             self.ensure_verification()?;
         }
+        if let Some(slots) = self.moe_slots.as_mut() {
+            slots.begin_token()?;
+        }
         self.run_operator(crate::backend::Operator::Embed, 0, step, &mut trace)?;
         for i in 0..self.config.num_hidden_layers {
             self.run_layer(i, step, &mut trace)?;
         }
         self.run_operator(crate::backend::Operator::Head, 0, step, &mut trace)?;
+        if let Some(slots) = self.moe_slots.as_mut() {
+            slots.finish_token()?;
+        }
         if step.head == Head::None {
             self.logits_cache.invalidate();
         } else {
@@ -1427,9 +1514,16 @@ impl Engine {
                 crate::model::LayerStage::Mixer(mixer) => {
                     self.run_mixer(mixer, layer, step, trace)?
                 }
+                crate::model::LayerStage::Ffn => self.run_ffn(layer, step, trace)?,
             }
         }
         #[cfg(test)]
+        self.check_capture_layer(layer)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn check_capture_layer(&mut self, layer: usize) -> Result<()> {
         if let Some((fail_layer, remaining)) = &mut self.capture_fail_after_layer
             && *fail_layer == layer
         {
@@ -1583,25 +1677,27 @@ impl Engine {
                     trace_value(trace, s, "debug.qkv", &w.qkv, trace_rows, c.qkv_dim())?;
                 }
             }
-            crate::backend::Operator::RopeKv => unsafe {
-                // Fused rotation + KV write over rows x heads x (head_dim/2) element pairs.
-                let kv = &mut self.state.kv[i];
-                s.launch_builder(&self.ops.rope_kv)
-                    .arg(&mut w.qkv)
-                    .arg(&mut kv.k)
-                    .arg(&mut kv.v)
-                    .arg(&w.position)
-                    .arg(&nr)
-                    .arg(&qh)
-                    .arg(&kh)
-                    .arg(&dim)
-                    .arg(&c.rope_theta)
-                    .arg(&cap)
-                    .launch(flat(
-                        rows * (c.num_attention_heads + 2 * c.num_key_value_heads)
-                            * (c.head_dim / 2),
-                    ))?;
-            },
+            crate::backend::Operator::RopeKv => {
+                unsafe {
+                    // Fused rotation + KV write over rows x heads x (head_dim/2) element pairs.
+                    let kv = &mut self.state.kv[i];
+                    s.launch_builder(&self.ops.rope_kv)
+                        .arg(&mut w.qkv)
+                        .arg(&mut kv.k)
+                        .arg(&mut kv.v)
+                        .arg(&w.position)
+                        .arg(&nr)
+                        .arg(&qh)
+                        .arg(&kh)
+                        .arg(&dim)
+                        .arg(&c.rope_theta)
+                        .arg(&cap)
+                        .launch(flat(
+                            rows * (c.num_attention_heads + 2 * c.num_key_value_heads)
+                                * (c.head_dim / 2),
+                        ))?;
+                }
+            }
             crate::backend::Operator::Attention => {
                 self.run_attention(i, step)?;
             }
@@ -1800,7 +1896,13 @@ impl Engine {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        self.check_moe_reset()?;
         self.poisoned = true;
+        if let Some(slots) = self.moe_slots.as_mut()
+            && slots.request_open
+        {
+            slots.end_request()?;
+        }
         if let Some(chain) = self.mtp.as_mut() {
             chain.invalidate_verify();
         }
@@ -2372,6 +2474,9 @@ impl Engine {
             ids.iter().all(|&x| (x as usize) < self.config.vocab_size),
             "input token id outside vocabulary"
         );
+        if self.model_spec.moe.is_some() {
+            return self.prefill_moe_chunks(ids, trace, keep, &mut after_chunk);
+        }
         let trace_start = self.position + ids.len() - keep;
         let end = self.position + ids.len();
         let mut part = 0usize;
@@ -2463,14 +2568,18 @@ impl Engine {
             None => self.token()?,
         };
         if graph {
-            let result = self
-                .graph
-                .as_ref()
-                .context("decode graph is not captured")?
-                .launch();
+            let result = if self.moe.is_some() {
+                self.run_moe_graph()
+            } else {
+                self.graph
+                    .as_ref()
+                    .context("decode graph is not captured")?
+                    .launch()
+                    .map_err(Into::into)
+            };
             if let Err(error) = result {
                 self.poisoned = true;
-                return Err(error.into());
+                return Err(error);
             }
             self.logits_cache.mark_valid();
         } else {
@@ -2547,6 +2656,9 @@ impl Engine {
     }
 
     pub fn capture(&mut self) -> Result<()> {
+        if self.moe.is_some() {
+            return self.capture_moe();
+        }
         ensure!(
             self.spec.is_none(),
             "graph decode is not declared for draft-enabled engines"
@@ -4180,6 +4292,12 @@ impl Engine {
 
     fn prepare_graphs(&mut self) -> Result<()> {
         self.set_token(0)?;
+        if self.graphs.is_empty() {
+            return Ok(());
+        }
+        if self.moe.is_some() {
+            return self.capture();
+        }
         if self.spec.is_none() {
             self.capture()?;
             self.graph
@@ -4188,9 +4306,6 @@ impl Engine {
                 .launch()?;
             self.device.stream.synchronize()?;
             self.check_logits()?;
-            return Ok(());
-        }
-        if self.graphs.is_empty() {
             return Ok(());
         }
         let injections: Vec<_> = self
