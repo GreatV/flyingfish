@@ -365,11 +365,11 @@ enum SpecPhase {
 }
 
 impl SpecPhase {
-    fn rows(self) -> usize {
+    fn rows(self, draft: &crate::dspark::DraftConfig) -> Result<usize> {
         match self {
-            Self::Draft => 7,
-            Self::Verify => 8,
-            Self::Inject(rows) => rows,
+            Self::Draft => Ok(draft.block_size),
+            Self::Verify => draft.verify_rows(),
+            Self::Inject(rows) => Ok(rows),
         }
     }
     fn name(self) -> &'static str {
@@ -387,8 +387,11 @@ impl Spec {
             SpecPhase::Draft => &mut self.draft_graph,
             SpecPhase::Verify => &mut self.verify_graph,
             SpecPhase::Inject(rows) => {
-                ensure!(rows > 0 && rows <= 8, "inject Graph M must be within1..8");
-                &mut self.inject_graphs[rows - 1]
+                let index = rows.checked_sub(1).context("inject Graph rows=0")?;
+                let bound = self.inject_graphs.len();
+                self.inject_graphs
+                    .get_mut(index)
+                    .with_context(|| format!("inject Graph rows={rows} exceeds bound={bound}"))?
             }
         })
     }
@@ -805,11 +808,27 @@ impl Engine {
         command.push_str(" calibrate");
         let closure = Rc::new(super::closure::Closure::new(write, command));
         let config = Config::read(dir)?;
-        if let Some(path) = &draft_path {
-            let draft = crate::dspark::DraftConfig::read(path, &config)?;
+        let draft_config = draft_path
+            .as_deref()
+            .map(|path| crate::dspark::DraftConfig::read(path, &config))
+            .transpose()?;
+        if let Some(draft) = &draft_config {
+            let rows = draft.verify_rows()?;
             ensure!(
-                draft.block_size == 7,
-                "unsupported Llama DSpark block_size={}; proposal/verification requires 7 proposals and 8 verify rows",
+                rows <= crate::linear_plan::MAX_SKINNY_ROWS,
+                "DSpark block_size={} verify_rows={rows} exceeds skinny bound={}",
+                draft.block_size,
+                crate::linear_plan::MAX_SKINNY_ROWS
+            );
+            ensure!(
+                !settings.spec_budget.is_tree() || rows == SpecBudget::Chain.rows(),
+                "tree draft block_size={} requires the declared chain rows={}",
+                draft.block_size,
+                SpecBudget::Chain.rows()
+            );
+            ensure!(
+                rows < capacity,
+                "DSpark block_size={} verify_rows={rows} exceeds capacity={capacity}",
                 draft.block_size
             );
         }
@@ -845,7 +864,15 @@ impl Engine {
         let ops = Ops::new(&device.ctx).context("load CUDA operator modules")?;
         eprintln!("{}", serde_json::json!({"backend_device":device.info}));
         let blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
-        let workspace_rows = settings.spec_budget.rows().min(capacity);
+        let workspace_rows = if let Some(draft) = &draft_config {
+            if settings.spec_budget.is_tree() {
+                settings.spec_budget.rows()
+            } else {
+                draft.verify_rows()?
+            }
+        } else {
+            settings.spec_budget.rows().min(capacity)
+        };
         let chunk = workspace_rows;
         let mut work = Work::new(s, &model_spec, workspace_rows)?;
         s.memcpy_htod(&[1i32], &mut work.length)?;
@@ -927,11 +954,18 @@ impl Engine {
                 engine.workspace_rows,
                 &engine.device.stream,
             )?);
-            engine.prepare(8)?;
-            engine
-                .blas
-                .prepare(8, engine.config.vocab_size, engine.config.hidden_size)?;
-            let rows = engine.spec_budget.rows();
+            let verify_rows = draft.config.verify_rows()?;
+            engine.prepare(verify_rows)?;
+            engine.blas.prepare(
+                verify_rows,
+                engine.config.vocab_size,
+                engine.config.hidden_size,
+            )?;
+            let rows = if engine.spec_budget.is_tree() {
+                engine.spec_budget.rows()
+            } else {
+                verify_rows
+            };
             if engine.spec_budget.is_tree() {
                 engine.prepare(rows)?;
                 engine
@@ -963,7 +997,7 @@ impl Engine {
                 graph: engine.spec_graph,
                 draft_graph: None,
                 verify_graph: None,
-                inject_graphs: (0..8).map(|_| None).collect(),
+                inject_graphs: (0..verify_rows).map(|_| None).collect(),
                 verification: None,
                 draft,
                 logits: s.alloc_zeros(rows * engine.config.vocab_size)?,
@@ -973,10 +1007,10 @@ impl Engine {
         }
         engine.size_workspace(requested_chunk)?;
         engine.declare_graphs()?;
-        if engine.spec.is_some() {
+        if let Some(spec) = &engine.spec {
             eprintln!(
                 "{}",
-                serde_json::json!({"spec_execution":{"graph":engine.spec_graph,"budget":engine.spec_budget,"draft_rows":7,"verify_rows":engine.spec_budget.rows(),"workspace_rows":engine.workspace_rows,"inject_rows":"actual committed M1..8","acceptance":"host greedy prefix"}})
+                serde_json::json!({"spec_execution":{"graph":engine.spec_graph,"budget":engine.spec_budget,"draft_rows":spec.draft.config.block_size,"verify_rows":spec.draft.config.verify_rows()?,"workspace_rows":engine.workspace_rows,"inject_rows":spec.inject_graphs.len(),"acceptance":"host greedy prefix"}})
             );
         }
         engine.device.stream.synchronize()?;
@@ -1042,7 +1076,13 @@ impl Engine {
                     (2 * spec.draft.config.hidden_size + 5 * spec.draft.config.kv_dim()) * 2
                 }),
         )?;
-        let rows = self.spec_budget.workspace_rows(plan.chunk);
+        let rows = self.spec_budget.workspace_rows(plan.chunk).max(
+            self.spec
+                .as_ref()
+                .map(|spec| spec.draft.config.verify_rows())
+                .transpose()?
+                .unwrap_or(1),
+        );
         let required = rows
             .checked_mul(plan.row_bytes)
             .context("workspace byte count overflow")?;
@@ -1313,8 +1353,16 @@ impl Engine {
             && matches!(step.mask, crate::backend::Mask::Causal)
         {
             ensure!(
-                step.rows == SpecBudget::Chain.rows(),
-                "causal all-row verification requires the declared eight-row chain shape"
+                step.rows
+                    == self
+                        .spec
+                        .as_ref()
+                        .context("causal verification requires draft geometry")?
+                        .draft
+                        .config
+                        .verify_rows()?,
+                "causal all-row verification rows={} differs from the loaded chain geometry",
+                step.rows
             );
         }
         Ok(())
@@ -1364,8 +1412,10 @@ impl Engine {
             self.ensure_decode()?;
         } else if step.head == Head::All && matches!(step.mask, crate::backend::Mask::Causal) {
             ensure!(
-                step.rows <= 8,
-                "chain verification supports at most eight rows"
+                step.rows <= crate::linear_plan::MAX_SKINNY_ROWS,
+                "chain verification rows={} exceeds skinny bound={}",
+                step.rows,
+                crate::linear_plan::MAX_SKINNY_ROWS
             );
             self.ensure_verification()?;
         }
@@ -2924,13 +2974,14 @@ impl Engine {
         if spec.verification.is_some() {
             return Ok(());
         }
+        let rows = spec.draft.config.verify_rows()?;
         let calibrated = super::multi_calibrate::load(
             &self.device,
             &self.ops,
             &self.config,
             &self.runtime,
             crate::backend::setup::MultiShape {
-                rows: 8,
+                rows,
                 causal: true,
                 capacity: self.capacity,
             },
@@ -2941,7 +2992,7 @@ impl Engine {
         eprintln!(
             "{}",
             serde_json::json!({"backend_setup":{
-                "rows":8,"attention":attention,"selection":selection,"calibration":calibrated,
+                "rows":rows,"attention":attention,"selection":selection,"calibration":calibrated,
                 "length":"device position counts prefix KV before the query block"
             }})
         );
@@ -2951,7 +3002,7 @@ impl Engine {
             &self.config,
             crate::backend::setup::MultiShape {
                 capacity: self.capacity,
-                rows: 8,
+                rows,
                 causal: true,
             },
             attention,
@@ -3440,6 +3491,14 @@ impl Engine {
     }
 
     fn run_spec_device(&mut self, phase: SpecPhase, start: usize) -> Result<()> {
+        let rows = phase.rows(
+            &self
+                .spec
+                .as_ref()
+                .context("draft is not enabled")?
+                .draft
+                .config,
+        )?;
         match phase {
             SpecPhase::Draft => self
                 .spec
@@ -3461,13 +3520,13 @@ impl Engine {
                     .as_ref()
                     .context("draft is not enabled")?
                     .draft
-                    .copy_proposals(&mut self.work.ids.slice_mut(1..8))?;
+                    .copy_proposals(&mut self.work.ids.slice_mut(1..rows))?;
                 self.device
                     .stream
                     .memcpy_dtod(&self.work.token, &mut self.work.ids.slice_mut(..1))?;
                 self.run_step(
                     crate::backend::Step {
-                        rows: 8,
+                        rows,
                         input: crate::backend::Input::Ids,
                         head: Head::All,
                         mask: crate::backend::Mask::Causal,
@@ -3496,6 +3555,14 @@ impl Engine {
     }
 
     fn ensure_spec_graph(&mut self, phase: SpecPhase, start: usize) -> Result<()> {
+        let rows = phase.rows(
+            &self
+                .spec
+                .as_ref()
+                .context("draft is not enabled")?
+                .draft
+                .config,
+        )?;
         if self
             .spec
             .as_mut()
@@ -3531,7 +3598,7 @@ impl Engine {
             .graph_slot(phase)? = Some(graph);
         eprintln!(
             "{}",
-            serde_json::json!({"spec_graph_setup":{"phase":phase.name(),"rows":phase.rows(),"capacity":self.capacity,"wall_ms":timer.elapsed().as_secs_f64()*1000.0,"prefix":"device position","warmup":"selected implementation; token/position/length restored"}})
+            serde_json::json!({"spec_graph_setup":{"phase":phase.name(),"rows":rows,"capacity":self.capacity,"wall_ms":timer.elapsed().as_secs_f64()*1000.0,"prefix":"device position","warmup":"selected implementation; token/position/length restored"}})
         );
         Ok(())
     }
@@ -3543,7 +3610,7 @@ impl Engine {
             .context("spec Graph has not been captured")?
             .launch()?;
         if matches!(phase, SpecPhase::Verify) {
-            spec.active_rows = phase.rows();
+            spec.active_rows = phase.rows(&spec.draft.config)?;
         }
         Ok(())
     }
@@ -3625,10 +3692,21 @@ impl Engine {
                 &self.closure,
             )?;
         let _round_range = super::profile::Range::new(self.profile_rounds, c"dspark_round");
+        let rows = self
+            .spec
+            .as_ref()
+            .context("draft is not enabled")?
+            .draft
+            .config
+            .verify_rows()?;
         ensure!(limit > 0, "spec round output limit must be positive");
         ensure!(
-            self.position + 8 <= self.capacity,
-            "spec verification exceeds KV capacity"
+            self.position
+                .checked_add(rows)
+                .is_some_and(|end| end <= self.capacity),
+            "spec verification position={} rows={rows} exceeds capacity={}",
+            self.position,
+            self.capacity
         );
         let graph = self.spec.as_ref().context("draft is not enabled")?.graph;
         ensure!(
@@ -3673,7 +3751,7 @@ impl Engine {
             ids.extend(&proposals);
             self.device
                 .stream
-                .memcpy_htod(&ids, &mut self.work.ids.slice_mut(..8))?;
+                .memcpy_htod(&ids, &mut self.work.ids.slice_mut(..rows))?;
             self.device
                 .stream
                 .memcpy_htod(&[start as i32], &mut self.work.position)?;
@@ -3685,7 +3763,7 @@ impl Engine {
         } else {
             self.run_step(
                 crate::backend::Step {
-                    rows: 8,
+                    rows,
                     input: crate::backend::Input::Ids,
                     head: Head::All,
                     mask: crate::backend::Mask::Causal,
@@ -3702,7 +3780,7 @@ impl Engine {
         )?;
         let verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
         drop(verify_range);
-        self.position += 8;
+        self.position += rows;
         let accepted = crate::dspark::accept(&proposals, &predictions)?;
         let mut output = proposals[..accepted.proposals].to_vec();
         output.push(accepted.bonus);
@@ -3732,7 +3810,7 @@ impl Engine {
         if let Some(t) = trace {
             t.add(
                 format!("{prefix}.target_argmax"),
-                vec![8],
+                vec![rows],
                 predictions.iter().map(|&v| v as f32).collect(),
             )?;
             t.add(
@@ -4036,8 +4114,15 @@ impl Engine {
     }
 
     pub fn inject_hidden(&mut self, hidden: &[f32], start: usize, rows: usize) -> Result<()> {
-        let limit =
-            super::closure::injection_limit(super::closure::small_rows(self.chunk, self.capacity));
+        let limit = super::closure::injection_limit(
+            super::closure::small_rows(self.chunk, self.capacity),
+            self.spec
+                .as_ref()
+                .context("draft geometry missing")?
+                .draft
+                .config
+                .verify_rows()?,
+        );
         ensure!(
             rows > 0 && (rows > 16 || rows <= limit),
             "injection rows {rows} exceed declared small-row limit {limit}"
@@ -4196,7 +4281,8 @@ impl Engine {
         self.forward_rows = super::closure::forward_rows(
             super::closure::small_rows(self.chunk, self.capacity),
             budget,
-        );
+            self.spec.as_ref().map(|spec| &spec.draft.config),
+        )?;
         let profile = super::closure::Profile::new(
             &self.config,
             self.capacity,
@@ -4453,7 +4539,16 @@ impl Engine {
         let s = self.device.stream.clone();
         s.synchronize()?;
         let rows = if self.spec.is_some() {
-            self.spec_budget.rows()
+            if self.spec_budget.is_tree() {
+                self.spec_budget.rows()
+            } else {
+                self.spec
+                    .as_ref()
+                    .context("draft geometry missing")?
+                    .draft
+                    .config
+                    .verify_rows()?
+            }
         } else {
             1
         };
