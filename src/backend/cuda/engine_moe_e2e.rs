@@ -1120,6 +1120,194 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             }
         );
     }
+    let ids: Vec<_> = (0..17).map(|row| (row * 263 + 17) as u32).collect();
+    model.reset()?;
+    model.prefill(&ids, None)?;
+    let mut greedy = Vec::new();
+    let mut greedy_states = vec![state(&model)?];
+    let mut greedy_logits = Vec::new();
+    let mut greedy_taps = Vec::new();
+    model
+        .spec
+        .as_mut()
+        .context("chain missing")?
+        .checkpoint
+        .as_mut()
+        .context("checkpoint missing")?
+        .save(&model.state, &model.work.token, ids.len(), &stream, None)?;
+    for _ in 0..rows {
+        greedy.push(model.decode(false, None)?);
+        greedy_states.push(state(&model)?);
+        greedy_logits.push(stream.clone_dtoh(&model.work.logits)?);
+        greedy_taps.extend(
+            stream.clone_dtoh(
+                &model
+                    .hidden_capture
+                    .as_ref()
+                    .context("greedy taps missing")?
+                    .values
+                    .slice(..width),
+            )?,
+        );
+    }
+    let greedy_taps = stream.clone_htod(&greedy_taps)?;
+    for (matched, limit, eos) in [
+        (0usize, 16, None),
+        (7, 16, None),
+        (15, 16, None),
+        (15, 1, None),
+        (15, 8, None),
+        (15, 16, Some(greedy[3])),
+        (16, 16, None),
+    ] {
+        model.reset()?;
+        model.prefill(&ids, None)?;
+        model
+            .spec
+            .as_ref()
+            .context("chain missing")?
+            .checkpoint
+            .as_ref()
+            .context("checkpoint missing")?
+            .restore(&mut model.state, &mut model.work.token, &stream)?;
+        let anchor = model.token()?;
+        model.set_token(anchor)?;
+        model.set_spec_eos(&eos.into_iter().collect::<Vec<_>>())?;
+        if matched < rows {
+            let mut proposals = greedy[..rows - 1].to_vec();
+            if matched < rows - 1 {
+                proposals[matched] = (proposals[matched] + 1) % model.model_spec.vocab;
+            }
+            model
+                .spec
+                .as_mut()
+                .context("chain missing")?
+                .forced_proposals = Some(proposals);
+        }
+        let round = model.spec_round(limit, None, "chain")?;
+        let committed = round.output.len();
+        ensure!(
+            committed > 0 && committed <= rows,
+            "Runner FAIL transaction committed extent"
+        );
+        let mut expected = greedy[..(matched + 1).min(rows).min(limit)].to_vec();
+        if matched == rows {
+            expected.truncate(committed);
+        }
+        if let Some(index) = expected.iter().position(|id| Some(*id) == eos) {
+            expected.truncate(index + 1);
+        }
+        let output_mismatches = usize::from(round.output != expected)
+            + usize::from(matched < rows && round.accepted != matched);
+        let boundary_mismatches = usize::from(model.position != ids.len() + committed)
+            + usize::from(model.pending_token != expected.last().copied())
+            + usize::from(
+                model.committed_prefix_ids
+                    != ids
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(anchor))
+                        .chain(expected.iter().copied().take(committed - 1))
+                        .collect::<Vec<_>>(),
+            );
+        let actual = state(&model)?;
+        let state_mismatches = actual
+            .iter()
+            .zip(&greedy_states[committed])
+            .filter(|(a, b)| a != b)
+            .count();
+        let actual = stream.clone_dtoh(&model.work.logits)?;
+        let logit_mismatches = actual
+            .iter()
+            .zip(&greedy_logits[committed - 1])
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let draft = &mut model.spec.as_mut().context("chain missing")?.draft;
+        let mut actual = Trace::default();
+        draft.snapshot_kv(&mut actual, ids.len(), rows)?;
+        draft.restore_kv(ids.len(), 0)?;
+        draft.inject(
+            &greedy_taps,
+            committed,
+            ids.len(),
+            super::super::super::draft::Compute {
+                ops: &model.ops,
+                blas: &mut model.blas,
+            },
+            None,
+        )?;
+        let mut expected_kv = Trace::default();
+        draft.snapshot_kv(&mut expected_kv, ids.len(), rows)?;
+        let mut draft_mismatches = 0;
+        for layer in 0..draft.config.num_hidden_layers {
+            for name in [format!("kv_k_{layer}"), format!("kv_v_{layer}")] {
+                draft_mismatches += actual
+                    .values(&name)?
+                    .iter()
+                    .zip(expected_kv.values(&name)?)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+            }
+        }
+        let mismatches = output_mismatches
+            + boundary_mismatches
+            + state_mismatches
+            + logit_mismatches
+            + draft_mismatches;
+        defects += mismatches;
+        println!(
+            "{} minicpm_chain_commit matched={matched} limit={limit} eos={eos:?} accepted={} committed={committed} output_mismatches={output_mismatches} boundary_mismatches={boundary_mismatches} state_bit_mismatches={state_mismatches} logits_bit_mismatches={logit_mismatches} draft_kv_bit_mismatches={draft_mismatches}",
+            if mismatches == 0 { "PASS" } else { "DEFECT" },
+            round.accepted
+        );
+    }
+    model.reset()?;
+    model.prefill(&ids, None)?;
+    let before = state(&model)?;
+    let mut draft_before = Trace::default();
+    model
+        .spec
+        .as_ref()
+        .context("chain missing")?
+        .draft
+        .snapshot_kv(&mut draft_before, ids.len(), rows)?;
+    let pending = model.pending_token;
+    model.capture_fail_after_layer = Some((0, 1));
+    let failed = model.spec_round(rows, None, "chain_error").is_err();
+    model.capture_fail_after_layer = None;
+    ensure!(
+        failed && model.poisoned,
+        "Runner FAIL transaction fault was not exposed"
+    );
+    let mut error_mismatches = usize::from(state(&model)? != before)
+        + usize::from(
+            model.position != ids.len()
+                || model.pending_token != pending
+                || model.committed_prefix_ids != ids,
+        );
+    let mut draft_after = Trace::default();
+    let draft = &model.spec.as_ref().context("chain missing")?.draft;
+    draft.snapshot_kv(&mut draft_after, ids.len(), rows)?;
+    for layer in 0..draft.config.num_hidden_layers {
+        for name in [format!("kv_k_{layer}"), format!("kv_v_{layer}")] {
+            error_mismatches += draft_before
+                .values(&name)?
+                .iter()
+                .zip(draft_after.values(&name)?)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+        }
+    }
+    defects += error_mismatches;
+    println!(
+        "{} minicpm_chain_error restored_bit_mismatches={error_mismatches} poisoned=true",
+        if error_mismatches == 0 {
+            "PASS"
+        } else {
+            "DEFECT"
+        }
+    );
+    model.reset()?;
     ensure!(
         wrong_layer > 0,
         "Runner FAIL wrong-layer capture control was not detected"

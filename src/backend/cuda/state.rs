@@ -738,7 +738,6 @@ impl StateCheckpoint {
         stream.memcpy_dtod(&self.token, token)?;
         Ok(())
     }
-    #[cfg(test)]
     pub(super) fn select_prefix(
         &self,
         store: &mut StateStore,

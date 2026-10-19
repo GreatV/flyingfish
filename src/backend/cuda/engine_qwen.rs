@@ -1633,6 +1633,8 @@ impl Engine {
                                 compact_small
                                     .as_ref()
                                     .context("compact verify plan missing")?
+                            } else if self.model_spec.moe.is_some() {
+                                image_prefill
                             } else {
                                 text_prefill
                             };

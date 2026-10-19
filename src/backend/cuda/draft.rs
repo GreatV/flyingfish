@@ -234,6 +234,7 @@ pub struct Draft {
     pub config: DraftConfig,
     weights: DraftWeights,
     kv: Vec<Kv>,
+    kv_checkpoint: Vec<Kv>,
     capacity: usize,
     rows: usize,
     stream: Arc<CudaStream>,
@@ -426,11 +427,22 @@ impl Draft {
         let rank = config.markov_rank;
         let block_rows = config.block_size;
         let mut caches = Vec::new();
+        let mut kv_checkpoint = Vec::new();
+        let checkpoint_words = config
+            .verify_rows()?
+            .checked_mul(kv)
+            .context("draft KV checkpoint extent overflow")?;
         for _ in 0..config.num_hidden_layers {
             caches.push(Kv {
                 k: s.alloc_zeros(capacity * kv)?,
                 v: s.alloc_zeros(capacity * kv)?,
             });
+            if score_rounding == super::markov::ScoreRounding::F32 {
+                kv_checkpoint.push(Kv {
+                    k: s.alloc_zeros(checkpoint_words)?,
+                    v: s.alloc_zeros(checkpoint_words)?,
+                });
+            }
         }
         for (n, o, i) in [
             (block_rows, qkv, h),
@@ -444,9 +456,13 @@ impl Draft {
             blas.prepare(n, o, i)?;
         }
         eprintln!(
-            "draft_weights_bytes={} draft_kv_bytes={}",
+            "draft_weights_bytes={} draft_kv_bytes={} draft_kv_checkpoint_bytes={}",
             weights.bytes,
-            config.num_hidden_layers * capacity * kv * 4
+            config.num_hidden_layers * capacity * kv * 4,
+            kv_checkpoint
+                .iter()
+                .map(|cache| (cache.k.len() + cache.v.len()) * size_of::<bf16>())
+                .sum::<usize>()
         );
         let mask_ids = vec![config.mask_token_id; block_rows];
         let qknorm_rope_kv =
@@ -465,6 +481,7 @@ impl Draft {
             config,
             weights,
             kv: caches,
+            kv_checkpoint,
             capacity,
             rows,
             stream: s.clone(),
@@ -540,6 +557,75 @@ impl Draft {
         self.context = context;
         self.packed = packed;
         self.rows = rows;
+        Ok(())
+    }
+
+    pub(super) fn checkpoint_kv(&mut self, start: usize) -> Result<()> {
+        let rows = self.config.verify_rows()?;
+        ensure!(
+            self.kv_checkpoint.len() == self.kv.len()
+                && !self.kv_checkpoint.is_empty()
+                && start
+                    .checked_add(rows)
+                    .is_some_and(|end| end <= self.capacity),
+            "draft KV checkpoint start={start} rows={rows} capacity={} layers={}",
+            self.capacity,
+            self.kv_checkpoint.len()
+        );
+        let d = self.config.head_dim;
+        for (live, saved) in self.kv.iter().zip(&mut self.kv_checkpoint) {
+            for (source, destination) in [(&live.k, &mut saved.k), (&live.v, &mut saved.v)] {
+                columns(
+                    &self.stream,
+                    source,
+                    destination,
+                    Rect {
+                        rows: self.config.num_key_value_heads,
+                        width: rows * d,
+                        src_pitch: self.capacity * d,
+                        src_col: start * d,
+                        dst_pitch: rows * d,
+                        dst_col: 0,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_kv(&mut self, start: usize, accepted: usize) -> Result<()> {
+        let rows = self.config.verify_rows()?;
+        ensure!(
+            accepted <= rows
+                && self.kv_checkpoint.len() == self.kv.len()
+                && !self.kv_checkpoint.is_empty()
+                && start
+                    .checked_add(rows)
+                    .is_some_and(|end| end <= self.capacity),
+            "draft KV restore start={start} accepted={accepted} rows={rows} capacity={}",
+            self.capacity
+        );
+        if accepted == rows {
+            return Ok(());
+        }
+        let d = self.config.head_dim;
+        for (saved, live) in self.kv_checkpoint.iter().zip(&mut self.kv) {
+            for (source, destination) in [(&saved.k, &mut live.k), (&saved.v, &mut live.v)] {
+                columns(
+                    &self.stream,
+                    source,
+                    destination,
+                    Rect {
+                        rows: self.config.num_key_value_heads,
+                        width: (rows - accepted) * d,
+                        src_pitch: rows * d,
+                        src_col: accepted * d,
+                        dst_pitch: self.capacity * d,
+                        dst_col: (start + accepted) * d,
+                    },
+                )?;
+            }
+        }
         Ok(())
     }
 

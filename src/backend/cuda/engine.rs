@@ -336,6 +336,8 @@ impl HiddenCapture {
 }
 
 struct Spec {
+    #[cfg(test)]
+    forced_proposals: Option<Vec<u32>>,
     eos: Vec<u32>,
     tree_verify_graph: Option<CudaGraph>,
     tree_commit_graph: Option<CudaGraph>,
@@ -422,6 +424,8 @@ impl Spec {
             Vec::new()
         };
         let spec = Self {
+            #[cfg(test)]
+            forced_proposals: None,
             eos: Vec::new(),
             tree_verify_graph: None,
             tree_commit_graph: None,
@@ -1489,14 +1493,20 @@ impl Engine {
         if let Some(slots) = self.moe_slots.as_mut() {
             slots.begin_token()?;
         }
-        self.run_operator(crate::backend::Operator::Embed, 0, step, &mut trace)?;
-        for i in 0..self.config.num_hidden_layers {
-            self.run_layer(i, step, &mut trace)?;
-        }
-        self.run_operator(crate::backend::Operator::Head, 0, step, &mut trace)?;
-        if let Some(slots) = self.moe_slots.as_mut() {
-            slots.finish_token()?;
-        }
+        let executed = (|| {
+            self.run_operator(crate::backend::Operator::Embed, 0, step, &mut trace)?;
+            for i in 0..self.config.num_hidden_layers {
+                self.run_layer(i, step, &mut trace)?;
+            }
+            self.run_operator(crate::backend::Operator::Head, 0, step, &mut trace)
+        })();
+        let completed = if let Some(slots) = self.moe_slots.as_mut() {
+            slots.finish_token()
+        } else {
+            Ok(())
+        };
+        executed?;
+        completed?;
         if step.head == Head::None {
             self.logits_cache.invalidate();
         } else {
@@ -3746,171 +3756,303 @@ impl Engine {
         prefix: &str,
     ) -> Result<crate::dspark::Round> {
         ensure!(
-            self.qwen.is_none(),
-            "Qwen DSpark proposal/verification execution is not bound"
+            self.qwen.is_none() || self.model_spec.moe.is_some(),
+            "DSpark verification is not bound for {:?}",
+            self.model_spec.architecture
         );
-        self.closure.assert_ready()?;
-        if self.spec_budget.is_tree() {
-            return self.tree_round(limit, trace, prefix);
+        let transaction = self.model_spec.moe.is_some();
+        let origin = self.position;
+        let pending = self.pending_token;
+        let resident = self.resident_ids_len;
+        let last_input = self.last_input_kind;
+        if transaction {
+            self.closure.assert_ready()?;
+            ensure!(
+                !self.poisoned,
+                "DSpark transaction requires reset after an error"
+            );
+            let spec = self
+                .spec
+                .as_mut()
+                .context("MoE chain requires a loaded draft")?;
+            let rows = spec.draft.config.verify_rows()?;
+            ensure!(
+                limit > 0
+                    && !self.spec_budget.is_tree()
+                    && origin
+                        .checked_add(rows)
+                        .is_some_and(|end| end <= self.capacity),
+                "MoE chain limit={limit} prefix={origin} rows={rows} capacity={} budget={:?}",
+                self.capacity,
+                self.spec_budget
+            );
+            ensure!(!spec.graph, "MoE DSpark segmented graphs are not bound");
+            spec.checkpoint
+                .as_mut()
+                .context("MoE chain checkpoint missing")?
+                .save(
+                    &self.state,
+                    &self.work.token,
+                    origin,
+                    &self.device.stream,
+                    None,
+                )?;
+            spec.draft.checkpoint_kv(origin)?;
         }
-        self.ensure_verification()?;
-        self.spec
-            .as_mut()
-            .context("draft state is not enabled")?
-            .draft
-            .setup_attention(
-                &self.device,
-                &self.ops,
-                &self.config,
-                &self.runtime,
-                &self.closure,
-            )?;
-        let _round_range = super::profile::Range::new(self.profile_rounds, c"dspark_round");
-        let rows = self
-            .spec
-            .as_ref()
-            .context("draft is not enabled")?
-            .draft
-            .config
-            .verify_rows()?;
-        ensure!(limit > 0, "spec round output limit must be positive");
-        ensure!(
-            self.position
-                .checked_add(rows)
-                .is_some_and(|end| end <= self.capacity),
-            "spec verification position={} rows={rows} exceeds capacity={}",
-            self.position,
-            self.capacity
-        );
-        let graph = self.spec.as_ref().context("draft is not enabled")?.graph;
-        ensure!(
-            !graph || trace.is_none(),
-            "spec Graph tracing requires --spec-graph false"
-        );
-        let start = self.position;
-        if graph {
-            self.ensure_spec_graph(SpecPhase::Draft, start)?;
-            self.ensure_spec_graph(SpecPhase::Verify, start)?;
-        }
-        let anchor = if graph { None } else { Some(self.token()?) };
-        let draft_range = super::profile::Range::new(self.profile_rounds, c"draft");
-        let draft_start = std::time::Instant::now();
-        let proposals = if graph {
-            self.launch_spec_graph(SpecPhase::Draft)?;
+        let result = (|| {
+            self.closure.assert_ready()?;
+            if self.spec_budget.is_tree() {
+                return self.tree_round(limit, trace, prefix);
+            }
+            self.ensure_verification()?;
             self.spec
-                .as_ref()
-                .context("draft is not enabled")?
+                .as_mut()
+                .context("draft state is not enabled")?
                 .draft
-                .proposals()?
-        } else {
-            let anchor = anchor.context("eager draft anchor missing")?;
-            let spec = self.spec.as_mut().context("draft is not enabled")?;
-            spec.draft.propose(
-                anchor,
-                start,
-                (&self.weights.embed, &self.weights.head),
-                super::draft::Compute {
-                    ops: &self.ops,
-                    blas: &mut self.blas,
-                },
-                trace.as_deref_mut().map(|t| (t, prefix)),
-                None,
-            )?
-        };
-        self.device.stream.synchronize()?;
-        let draft_ms = draft_start.elapsed().as_secs_f64() * 1000.0;
-        drop(draft_range);
-        if !graph {
-            let mut ids = vec![anchor.context("eager verify anchor missing")?];
-            ids.extend(&proposals);
-            self.device
-                .stream
-                .memcpy_htod(&ids, &mut self.work.ids.slice_mut(..rows))?;
-            self.device
-                .stream
-                .memcpy_htod(&[start as i32], &mut self.work.position)?;
-        }
-        let verify_start = std::time::Instant::now();
-        let verify_range = super::profile::Range::new(self.profile_rounds, c"verify");
-        if graph {
-            self.launch_spec_graph(SpecPhase::Verify)?;
-        } else {
-            self.run_step(
-                crate::backend::Step {
-                    rows,
-                    input: crate::backend::Input::Ids,
-                    head: Head::All,
-                    mask: crate::backend::Mask::Causal,
-                },
-                None,
-            )?;
-        }
-        let predictions = self.device.stream.clone_dtoh(
-            &self
+                .setup_attention(
+                    &self.device,
+                    &self.ops,
+                    &self.config,
+                    &self.runtime,
+                    &self.closure,
+                )?;
+            let _round_range = super::profile::Range::new(self.profile_rounds, c"dspark_round");
+            let rows = self
                 .spec
                 .as_ref()
                 .context("draft is not enabled")?
-                .predictions,
-        )?;
-        let verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
-        drop(verify_range);
-        self.position += rows;
-        let accepted = crate::dspark::accept(&proposals, &predictions)?;
-        let mut output = proposals[..accepted.proposals].to_vec();
-        output.push(accepted.bonus);
-        output.truncate(limit);
-        let committed = output.len();
-        let bonus = *output.last().context("spec round emitted no token")?;
-        if graph {
-            self.ensure_spec_graph(SpecPhase::Inject(committed), start)?;
-        }
-        let inject_start = std::time::Instant::now();
-        let _inject_range = super::profile::Range::new(self.profile_rounds, c"inject");
-        if graph {
-            self.launch_spec_graph(SpecPhase::Inject(committed))?;
-        } else {
-            self.inject_capture(committed, start, trace.as_deref_mut().map(|t| (t, prefix)))?;
-        }
-        let s = &self.device.stream;
-        let spec = self.spec.as_ref().context("draft is not enabled")?;
-        s.memcpy_dtod(
-            &spec.logits.slice(
-                (committed - 1) * self.config.vocab_size..committed * self.config.vocab_size,
-            ),
-            &mut self.work.logits,
-        )?;
-        self.logits_cache.mark_valid();
-        self.rewind(start + committed, bonus)?;
-        if let Some(t) = trace {
-            t.add(
-                format!("{prefix}.target_argmax"),
-                vec![rows],
-                predictions.iter().map(|&v| v as f32).collect(),
+                .draft
+                .config
+                .verify_rows()?;
+            ensure!(limit > 0, "spec round output limit must be positive");
+            ensure!(
+                self.position
+                    .checked_add(rows)
+                    .is_some_and(|end| end <= self.capacity),
+                "spec verification position={} rows={rows} exceeds capacity={}",
+                self.position,
+                self.capacity
+            );
+            let graph = self.spec.as_ref().context("draft is not enabled")?.graph;
+            ensure!(
+                !graph || trace.is_none(),
+                "spec Graph tracing requires --spec-graph false"
+            );
+            let start = self.position;
+            if graph {
+                self.ensure_spec_graph(SpecPhase::Draft, start)?;
+                self.ensure_spec_graph(SpecPhase::Verify, start)?;
+            }
+            let anchor = if graph { None } else { Some(self.token()?) };
+            let draft_range = super::profile::Range::new(self.profile_rounds, c"draft");
+            let draft_start = std::time::Instant::now();
+            let proposals = if graph {
+                self.launch_spec_graph(SpecPhase::Draft)?;
+                self.spec
+                    .as_ref()
+                    .context("draft is not enabled")?
+                    .draft
+                    .proposals()?
+            } else {
+                let anchor = anchor.context("eager draft anchor missing")?;
+                let spec = self.spec.as_mut().context("draft is not enabled")?;
+                spec.draft.propose(
+                    anchor,
+                    start,
+                    (&self.weights.embed, &self.weights.head),
+                    super::draft::Compute {
+                        ops: &self.ops,
+                        blas: &mut self.blas,
+                    },
+                    trace.as_deref_mut().map(|t| (t, prefix)),
+                    None,
+                )?
+            };
+            #[cfg(test)]
+            let proposals = if let Some(forced) = self
+                .spec
+                .as_mut()
+                .context("chain missing")?
+                .forced_proposals
+                .take()
+            {
+                ensure!(
+                    forced.len() == rows - 1
+                        && forced
+                            .iter()
+                            .all(|&id| (id as usize) < self.config.vocab_size),
+                    "forced chain proposals exceed the loaded geometry"
+                );
+                forced
+            } else {
+                proposals
+            };
+            self.device.stream.synchronize()?;
+            let draft_ms = draft_start.elapsed().as_secs_f64() * 1000.0;
+            drop(draft_range);
+            if !graph {
+                let mut ids = vec![anchor.context("eager verify anchor missing")?];
+                ids.extend(&proposals);
+                self.device
+                    .stream
+                    .memcpy_htod(&ids, &mut self.work.ids.slice_mut(..rows))?;
+                self.device
+                    .stream
+                    .memcpy_htod(&[start as i32], &mut self.work.position)?;
+            }
+            let verify_start = std::time::Instant::now();
+            let verify_range = super::profile::Range::new(self.profile_rounds, c"verify");
+            if graph {
+                self.launch_spec_graph(SpecPhase::Verify)?;
+            } else {
+                self.run_step(
+                    crate::backend::Step {
+                        rows,
+                        input: crate::backend::Input::Ids,
+                        head: Head::All,
+                        mask: crate::backend::Mask::Causal,
+                    },
+                    None,
+                )?;
+            }
+            let predictions = self.device.stream.clone_dtoh(
+                &self
+                    .spec
+                    .as_ref()
+                    .context("draft is not enabled")?
+                    .predictions,
             )?;
-            t.add(
-                format!("{prefix}.m"),
-                vec![1],
-                vec![accepted.proposals as f32],
+            let verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
+            drop(verify_range);
+            self.position += rows;
+            let accepted = crate::dspark::accept(&proposals, &predictions)?;
+            let mut output = proposals[..accepted.proposals].to_vec();
+            output.push(accepted.bonus);
+            output.truncate(limit);
+            if transaction
+                && let Some(index) = output.iter().position(|token| {
+                    self.spec
+                        .as_ref()
+                        .is_some_and(|spec| spec.eos.contains(token))
+                })
+            {
+                output.truncate(index + 1);
+            }
+            let committed = output.len();
+            let bonus = *output.last().context("spec round emitted no token")?;
+            if graph {
+                self.ensure_spec_graph(SpecPhase::Inject(committed), start)?;
+            }
+            let inject_start = std::time::Instant::now();
+            let _inject_range = super::profile::Range::new(self.profile_rounds, c"inject");
+            if graph {
+                self.launch_spec_graph(SpecPhase::Inject(committed))?;
+            } else {
+                self.inject_capture(committed, start, trace.as_deref_mut().map(|t| (t, prefix)))?;
+            }
+            let s = &self.device.stream;
+            let spec = self.spec.as_ref().context("draft is not enabled")?;
+            s.memcpy_dtod(
+                &spec.logits.slice(
+                    (committed - 1) * self.config.vocab_size..committed * self.config.vocab_size,
+                ),
+                &mut self.work.logits,
             )?;
-            t.add(
-                format!("{prefix}.bonus"),
-                vec![1],
-                vec![accepted.bonus as f32],
-            )?;
+            self.logits_cache.mark_valid();
+            if transaction {
+                let spec = self.spec.as_mut().context("MoE chain missing")?;
+                spec.checkpoint
+                    .as_ref()
+                    .context("MoE chain checkpoint missing")?
+                    .select_prefix(&mut self.state, &spec.snapshots, committed, s)?;
+                spec.draft.restore_kv(start, committed)?;
+                self.state.set_sequence(
+                    s,
+                    (start + committed - 1) as u32,
+                    1,
+                    self.workspace_rows as u32,
+                )?;
+                s.memcpy_htod(&[(start + committed - 1) as i32], &mut self.work.position)?;
+                s.memcpy_htod(&[(start + committed) as i32], &mut self.work.length)?;
+                self.qwen_advance()?;
+                self.committed_prefix_ids
+                    .push(anchor.context("MoE committed anchor missing")?);
+                self.committed_prefix_ids
+                    .extend_from_slice(&output[..committed - 1]);
+                self.resident_ids_len = committed;
+                self.last_input_kind = Some(PrefixLastInputKind::DecodeToken);
+                self.position = start + committed;
+                self.set_token(bonus)?;
+                self.device.stream.synchronize()?;
+            } else {
+                self.rewind(start + committed, bonus)?;
+            }
+            if let Some(t) = trace {
+                t.add(
+                    format!("{prefix}.target_argmax"),
+                    vec![rows],
+                    predictions.iter().map(|&v| v as f32).collect(),
+                )?;
+                t.add(
+                    format!("{prefix}.m"),
+                    vec![1],
+                    vec![accepted.proposals as f32],
+                )?;
+                t.add(
+                    format!("{prefix}.bonus"),
+                    vec![1],
+                    vec![accepted.bonus as f32],
+                )?;
+            }
+            Ok(crate::dspark::Round {
+                logits_rows: (0..committed).collect(),
+                proposals,
+                predictions,
+                accepted: accepted.proposals,
+                committed,
+                output,
+                position: self.position,
+                draft_ms,
+                verify_ms,
+                inject_ms: inject_start.elapsed().as_secs_f64() * 1000.0,
+                tree: None,
+            })
+        })();
+        if transaction && result.is_err() {
+            self.poisoned = true;
+            let spec = self
+                .spec
+                .as_mut()
+                .context("failed MoE chain lost its draft")?;
+            spec.checkpoint
+                .as_ref()
+                .context("failed MoE chain lost its checkpoint")?
+                .restore(&mut self.state, &mut self.work.token, &self.device.stream)
+                .context("restore target after MoE chain failure")?;
+            spec.draft
+                .restore_kv(origin, 0)
+                .context("restore draft after MoE chain failure")?;
+            self.device
+                .stream
+                .memcpy_htod(&[origin as i32], &mut self.work.position)?;
+            self.device
+                .stream
+                .memcpy_htod(&[origin as i32 + 1], &mut self.work.length)?;
+            self.committed_prefix_ids.truncate(origin);
+            if last_input == Some(PrefixLastInputKind::PrefillChunk) {
+                self.device.stream.memcpy_htod(
+                    &self.committed_prefix_ids[origin - resident..origin],
+                    &mut self.work.ids.slice_mut(..resident),
+                )?;
+            }
+            self.position = origin;
+            self.pending_token = pending;
+            self.resident_ids_len = resident;
+            self.last_input_kind = last_input;
+            self.logits_cache.invalidate();
+            self.device.stream.synchronize()?;
         }
-        Ok(crate::dspark::Round {
-            logits_rows: (0..committed).collect(),
-            proposals,
-            predictions,
-            accepted: accepted.proposals,
-            committed,
-            output,
-            position: self.position,
-            draft_ms,
-            verify_ms,
-            inject_ms: inject_start.elapsed().as_secs_f64() * 1000.0,
-            tree: None,
-        })
+        result
     }
 
     pub fn set_spec_graph(&mut self, graph: bool) -> Result<()> {
