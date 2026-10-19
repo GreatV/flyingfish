@@ -1999,7 +1999,7 @@ mod tests {
         };
         let pool = ExpertPool::new(2, Shape::new(hidden, intermediate)?, 32, 32)?;
         let mut disk = DiskExperts::new(catalogue, &directory, 1, 32)?;
-        let ops = PrefillOps::new(&device.ctx, stream)?;
+        let ops = PrefillOps::new(&device.ctx, stream, ExpertFormat::Bf16)?;
         let mut defects = 0;
         for (rows, weighted) in [
             (1usize, false),
@@ -2055,6 +2055,7 @@ mod tests {
                 geometry.experts as usize,
                 hidden,
                 intermediate,
+                None,
             )?;
             let scratch = stream.alloc_zeros::<u8>(usize::try_from(prefill_scratch_bytes(
                 rows,
@@ -2062,6 +2063,7 @@ mod tests {
                 geometry.experts as usize,
                 hidden,
                 intermediate,
+                None,
             )?)?)?;
             let boundary = rows == LANE16_ROWS as usize || rows == LANE16_ROWS as usize + 1;
             let mut arithmetic = vec![true; geometry.experts as usize];
@@ -2087,6 +2089,7 @@ mod tests {
                         stream,
                         MoePrefillContribute {
                             cpu_arithmetic: &arithmetic,
+                            fp8_slot: None,
                             x: qwen::matrix(&x_device, stream, 0, rows, hidden)?,
                             ids: testing::dense(&ids, stream, rows as u32, 1)?,
                             weights: testing::dense(&routing_device, stream, rows as u32, 1)?,
