@@ -25,34 +25,38 @@ pub(crate) enum LinearWeightRef {
 }
 pub(crate) struct Fp8Ops {
     dequant: [CudaFunction; 2],
-    small: [[CudaFunction; 5]; 2],
+    small: [Vec<CudaFunction>; 2],
     fake_quant: CudaFunction,
 }
 impl Fp8Ops {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
-        let m = super::cubin::module(ctx, "fp8_linear")?;
+        Self::for_rows(ctx, crate::mtp::MAX_VERIFY_ROWS)
+    }
+    pub(super) fn for_rows(ctx: &Arc<CudaContext>, rows: usize) -> Result<Self> {
+        ensure!(
+            (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
+            "FP8 skinny row bound={rows} exceeds {}",
+            crate::linear_plan::MAX_SKINNY_ROWS
+        );
+        let module = super::cubin::module(ctx, "fp8_linear")?;
+        let load = |suffix: &str| {
+            (1..=rows)
+                .map(|row| {
+                    module.load_function(&if row == 1 {
+                        format!("fp8_gemv_bf16{suffix}")
+                    } else {
+                        format!("fp8_skinny_bf16_m{row}{suffix}")
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+        };
         Ok(Self {
-            fake_quant: m.load_function("e4m3_fake_quant_bf16")?,
+            fake_quant: module.load_function("e4m3_fake_quant_bf16")?,
             dequant: [
-                m.load_function("fp8_dequant_bf16")?,
-                m.load_function("fp8_dequant_bf16_per_channel")?,
+                module.load_function("fp8_dequant_bf16")?,
+                module.load_function("fp8_dequant_bf16_per_channel")?,
             ],
-            small: [
-                [
-                    m.load_function("fp8_gemv_bf16")?,
-                    m.load_function("fp8_skinny_bf16_m2")?,
-                    m.load_function("fp8_skinny_bf16_m3")?,
-                    m.load_function("fp8_skinny_bf16_m4")?,
-                    m.load_function("fp8_skinny_bf16_m5")?,
-                ],
-                [
-                    m.load_function("fp8_gemv_bf16_per_channel")?,
-                    m.load_function("fp8_skinny_bf16_m2_per_channel")?,
-                    m.load_function("fp8_skinny_bf16_m3_per_channel")?,
-                    m.load_function("fp8_skinny_bf16_m4_per_channel")?,
-                    m.load_function("fp8_skinny_bf16_m5_per_channel")?,
-                ],
-            ],
+            small: [load("")?, load("_per_channel")?],
         })
     }
     pub fn fake_quant(
@@ -150,8 +154,10 @@ impl Fp8Ops {
         Self::check(&codes, &scale, layout)?;
         validate_call(codes.shape, x, &y.0)?;
         ensure!(
-            crate::linear_plan::direct_fp8_rows(x.shape[0] as usize),
-            "direct FP8 linear requires M1..5"
+            (1..=self.small[0].len()).contains(&(x.shape[0] as usize)),
+            "direct FP8 rows={} exceeds bound={}",
+            x.shape[0],
+            self.small[0].len()
         );
         disjoint(&codes, &y.0)?;
         disjoint(&scale, &y.0)?;
@@ -463,6 +469,202 @@ mod tests {
     use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
     use crate::op_contract::ExecutionPhase;
     use std::{path::PathBuf, rc::Rc};
+
+    fn invariant_rows(
+        device: &Device,
+        blas: &Blas,
+        weight: LinearWeightRef,
+        shape: (usize, usize),
+    ) -> Result<usize> {
+        use crate::backend::cuda::contracts::view;
+        use crate::op_contract::ExecutionPhase;
+        let (n, k) = shape;
+        let rows = crate::linear_plan::MAX_SKINNY_ROWS;
+        let format = match weight {
+            LinearWeightRef::Bf16(_) => "BF16",
+            LinearWeightRef::Fp8 { layout, .. } => match layout {
+                Fp8ScaleLayout::Block128 => "FP8_BLOCK128",
+                Fp8ScaleLayout::PerChannel => "FP8_PER_CHANNEL",
+            },
+        };
+        let stream = &device.stream;
+        let values: Vec<_> = (0..rows * k)
+            .map(|i| {
+                bf16::from_f32((((i / k) * 71 + (i % k) * 13) % 509) as f32 / 256.0 - 254.0 / 256.0)
+            })
+            .collect();
+        let input = stream.clone_htod(&values)?;
+        let expected = stream.alloc_zeros::<bf16>(rows * n)?;
+        let canary = bf16::from_bits(0x7fc1);
+        let output = stream.clone_htod(&vec![canary; (rows + 1) * n])?;
+        for row in 0..rows {
+            blas.linear_typed(
+                ExecutionPhase::Decode,
+                weight,
+                view(&input, stream, row * k, [1, k as u32], [k as u64, 1])?,
+                &mut TensorMut(view(
+                    &expected,
+                    stream,
+                    row * n,
+                    [1, n as u32],
+                    [n as u64, 1],
+                )?),
+            )?;
+        }
+        let expected = stream.clone_dtoh(&expected)?;
+        let mut defects = 0;
+        for m in [1, 2, 3, 4, 5, 8, 15, 16] {
+            let execute = || {
+                blas.linear_typed(
+                    ExecutionPhase::Prefill,
+                    weight,
+                    view(&input, stream, 0, [m, k as u32], [k as u64, 1])?,
+                    &mut TensorMut(view(&output, stream, 0, [m, n as u32], [n as u64, 1])?),
+                )
+            };
+            for graph in [false, true] {
+                if graph {
+                    use cudarc::driver::sys;
+                    stream.begin_capture(
+                        sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                    )?;
+                    let launched = execute();
+                    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                    launched?;
+                    captured?
+                        .context("empty invariant linear graph")?
+                        .launch()?;
+                } else {
+                    execute()?;
+                }
+                let got = stream.clone_dtoh(&output)?;
+                ensure!(
+                    got[..m as usize * n].iter().all(|v| v.is_finite()),
+                    "nonfinite invariant linear {shape:?} rows={m}"
+                );
+                ensure!(
+                    got[m as usize * n..]
+                        .iter()
+                        .all(|v| v.to_bits() == canary.to_bits()),
+                    "invariant linear wrote past rows={m} weight={shape:?}"
+                );
+                let mismatches = got[..m as usize * n]
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                defects += usize::from(mismatches != 0);
+                println!(
+                    "{} INVARIANT_LINEAR format={format} weight=[{n},{k}] rows={m} graph={graph} bit_mismatches={mismatches}",
+                    if mismatches == 0 { "PASS" } else { "DEFECT" }
+                );
+            }
+        }
+        let mut wrong = values.clone();
+        for row in 1..rows {
+            wrong[row * k..(row + 1) * k].copy_from_slice(&values[..k]);
+        }
+        let wrong = stream.clone_htod(&wrong)?;
+        blas.linear_typed(
+            ExecutionPhase::Prefill,
+            weight,
+            view(&wrong, stream, 0, [rows as u32, k as u32], [k as u64, 1])?,
+            &mut TensorMut(view(
+                &output,
+                stream,
+                0,
+                [rows as u32, n as u32],
+                [n as u64, 1],
+            )?),
+        )?;
+        let got = stream.clone_dtoh(&output)?;
+        let mismatches = got
+            .iter()
+            .zip(&expected)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        ensure!(
+            mismatches > 0,
+            "row0-reuse control escaped invariant linear {shape:?}"
+        );
+        println!(
+            "PASS INVARIANT_LINEAR_CONTROL format={format} weight=[{n},{k}] row0_reuse=true bit_mismatches={mismatches}"
+        );
+        Ok(defects)
+    }
+
+    fn invariant_linears(device: &Device, root: &std::path::Path) -> Result<()> {
+        use crate::backend::cuda::contracts::view;
+        let stream = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            device,
+            &ops,
+            root,
+            Rc::new(Closure::new(false, "invariant linear gate".into())),
+        )?;
+        blas.enable_fp8(&device.ctx)?;
+        blas.bind_invariant(&device.ctx, crate::linear_plan::MAX_SKINNY_ROWS)?;
+        let mut defects = 0;
+        for (n, k) in [
+            (8192, 2048),
+            (32, 2048),
+            (2048, 4096),
+            (248144, 2048),
+            (512, 2048),
+            (2048, 512),
+        ] {
+            {
+                let values: Vec<_> = (0..n * k)
+                    .map(|i| {
+                        bf16::from_f32(((i * 37 + i / k * 71) % 257) as f32 / 512.0 - 128.0 / 512.0)
+                    })
+                    .collect();
+                let weight = stream.clone_htod(&values)?;
+                let weight = LinearWeightRef::Bf16(view(
+                    &weight,
+                    stream,
+                    0,
+                    [n as u32, k as u32],
+                    [k as u64, 1],
+                )?);
+                defects += invariant_rows(device, &blas, weight, (n, k))?;
+            }
+            {
+                let codes: Vec<_> = (0..n * k)
+                    .map(|i| {
+                        (0x10 + (i * 37 + i / k * 71) % 80) as u8
+                            | if (i / 257) & 1 == 1 { 0x80 } else { 0 }
+                    })
+                    .collect();
+                let codes = stream.clone_htod(&codes)?;
+                for layout in [Fp8ScaleLayout::Block128, Fp8ScaleLayout::PerChannel] {
+                    let [scale_rows, scale_cols] = layout.scale_shape(n as u32, k as u32);
+                    let scales: Vec<_> = (0..scale_rows * scale_cols)
+                        .map(|i| bf16::from_f32(2f32.powi(-7 + (i % 3) as i32)))
+                        .collect();
+                    let scale = stream.clone_htod(&scales)?;
+                    let weight = LinearWeightRef::Fp8 {
+                        codes: view(&codes, stream, 0, [n as u32, k as u32], [k as u64, 1])?,
+                        scale: view(
+                            &scale,
+                            stream,
+                            0,
+                            [scale_rows as u32, scale_cols as u32],
+                            [scale_cols as u64, 1],
+                        )?,
+                        layout,
+                    };
+                    defects += invariant_rows(device, &blas, weight, (n, k))?;
+                }
+            }
+        }
+        println!(
+            "INVARIANT_LINEAR_SUMMARY shapes=6 formats=3 rows=1,2,3,4,5,8,15,16 eager_graph=true defects={defects}"
+        );
+        ensure!(defects == 0, "invariant linear DEFECT cells={defects}");
+        Ok(())
+    }
 
     #[test]
     #[ignore = "GPU window, official FP8 model, T13 and projection reference required"]
@@ -1082,6 +1284,7 @@ mod tests {
         let root = PathBuf::from(
             std::env::var_os("FF_Q38_PROBE_DIR").context("FF_Q38_PROBE_DIR is required")?,
         );
+        invariant_linears(&device, &root)?;
         let ops = Ops::new(&device.ctx)?;
         let blas = Blas::new(
             &device,
