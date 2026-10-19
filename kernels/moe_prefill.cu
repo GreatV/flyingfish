@@ -77,20 +77,33 @@ extern "C" __global__ void __launch_bounds__(128) moe_gemm_w8a16(
   const int wm = (warp >> 1) * 64, wn = (warp & 1) * 32;
   float accum[4][4][4] = {};
   for (int k0 = 0; k0 < inner; k0 += CK) {
-    for (int index = tid; index < 128 * CK; index += 128) {
-      const int row = index / CK, col = index % CK;
-      const bool live = m0 + row < columns && k0 + col < inner;
-      weight_tile[row][col] = live
-          ? __float2bfloat16_rn(e4m3_decode(codes[(size_t)(m0 + row) * inner + k0 + col]) *
-                               __bfloat162float(scales[m0 + row]))
-          : __float2bfloat16_rn(0.0f);
+    for (int index = tid; index < 64 * (CK / 8); index += 128) {
+      const int row = index / (CK / 8), col = (index % (CK / 8)) * 8;
+      const bool live = n0 + row < acts && k0 + col < inner;
+      const bf16* source = live ? input + (size_t)(n0 + row) * inner + k0 + col : input;
+      const unsigned destination = (unsigned)__cvta_generic_to_shared(&input_tile[row][col]);
+      const int bytes = live ? 16 : 0;
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
+          :: "r"(destination), "l"(source), "r"(bytes) : "memory");
     }
-    for (int index = tid; index < 64 * CK; index += 128) {
-      const int row = index / CK, col = index % CK;
-      input_tile[row][col] = n0 + row < acts && k0 + col < inner
-          ? input[(size_t)(n0 + row) * inner + k0 + col]
-          : __float2bfloat16_rn(0.0f);
+    asm volatile("cp.async.commit_group;");
+    for (int index = tid; index < 128 * (CK / 8); index += 128) {
+      const int row = index / (CK / 8), col = (index % (CK / 8)) * 8;
+      uint4 decoded = {};
+      if (m0 + row < columns && k0 + col < inner) {
+        const uint2 packed = *reinterpret_cast<const uint2*>(
+            codes + (size_t)(m0 + row) * inner + k0 + col);
+        const unsigned char* values = reinterpret_cast<const unsigned char*>(&packed);
+        unsigned short* bits = reinterpret_cast<unsigned short*>(&decoded);
+        const float scale = __bfloat162float(scales[m0 + row]);
+#pragma unroll
+        for (int value = 0; value < 8; ++value)
+          bits[value] = __bfloat16_as_ushort(
+              __float2bfloat16_rn(e4m3_decode(values[value]) * scale));
+      }
+      *reinterpret_cast<uint4*>(&weight_tile[row][col]) = decoded;
     }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
 #pragma unroll
     for (int kk = 0; kk < CK; kk += 16) {
