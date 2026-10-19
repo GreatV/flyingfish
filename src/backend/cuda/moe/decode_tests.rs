@@ -317,6 +317,10 @@ fn invariant_decode(device: &Device) -> Result<()> {
         for r in 0..max_rows {
             let one = Gate {
                 x: row(gate.x, r)?,
+                scratch: Scratch {
+                    ptr: gate.scratch.ptr,
+                    bytes: gate.scratch.bytes,
+                },
                 ..gate
             };
             let route = Routing {
@@ -406,6 +410,10 @@ fn invariant_decode(device: &Device) -> Result<()> {
         );
         let old = Gate {
             ops: &legacy,
+            scratch: Scratch {
+                ptr: gate.scratch.ptr,
+                bytes: gate.scratch.bytes,
+            },
             ..gate
         }
         .stages(1, &routing, slot, false)?;
