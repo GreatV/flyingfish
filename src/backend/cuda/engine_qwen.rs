@@ -1553,7 +1553,7 @@ impl Engine {
         step: crate::backend::Step<'_>,
     ) -> Result<()> {
         if step.input == crate::backend::Input::Ids
-            && !crate::linear_plan::direct_fp8_rows(step.rows)
+            && !self.blas.direct_fp8_rows().contains(&step.rows)
         {
             self.qwen.as_mut().context("Q38 runtime missing")?.layers[i]
                 .linear

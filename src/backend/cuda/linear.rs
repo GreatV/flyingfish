@@ -450,7 +450,7 @@ impl LayerLinearPlan {
             .get(role)
             .with_context(|| format!("layer projection not bound: {role}"))?;
         let weight = if phase == crate::op_contract::ExecutionPhase::Prefill
-            && !crate::linear_plan::direct_fp8_rows(x.shape[0] as usize)
+            && !blas.direct_fp8_rows().contains(&(x.shape[0] as usize))
         {
             LinearWeightRef::Bf16(p.prefill)
         } else {
@@ -489,6 +489,40 @@ mod tests {
             },
         };
         let stream = &device.stream;
+        let materialized = match weight {
+            LinearWeightRef::Bf16(_) => None,
+            LinearWeightRef::Fp8 { .. } => Some(stream.alloc_zeros::<bf16>(n * k)?),
+        };
+        let prefill = match weight {
+            LinearWeightRef::Bf16(w) => w,
+            LinearWeightRef::Fp8 {
+                codes,
+                scale,
+                layout,
+            } => {
+                let mut output = TensorMut(view(
+                    materialized.as_ref().context("FP8 test arena missing")?,
+                    stream,
+                    0,
+                    [n as u32, k as u32],
+                    [k as u64, 1],
+                )?);
+                blas.fp8_ops()?
+                    .materialize(stream, codes, scale, layout, &mut output)?;
+                output.read()
+            }
+        };
+        let layer = LayerLinearPlan {
+            projections: [(
+                "projection.weight".into(),
+                BoundProjection {
+                    resident: weight,
+                    prefill,
+                },
+            )]
+            .into(),
+            materialize: Vec::new(),
+        };
         let values: Vec<_> = (0..rows * k)
             .map(|i| {
                 bf16::from_f32((((i / k) * 71 + (i % k) * 13) % 509) as f32 / 256.0 - 254.0 / 256.0)
@@ -507,9 +541,10 @@ mod tests {
         let valid_ptr = valid.device_ptr(stream).0;
         device.finish_upload()?;
         for row in 0..rows {
-            blas.linear_typed(
+            layer.run(
+                blas,
+                "projection.weight",
                 ExecutionPhase::Decode,
-                weight,
                 view(&input, stream, row * k, [1, k as u32], [k as u64, 1])?,
                 &mut TensorMut(view(
                     &expected,
@@ -555,7 +590,13 @@ mod tests {
             let x = view(&input, stream, 0, [m, k as u32], [k as u64, 1])?;
             let mut y = TensorMut(view(&output, stream, 0, [m, n as u32], [n as u64, 1])?);
             let mut execute = || -> Result<()> {
-                blas.linear_typed(ExecutionPhase::Prefill, weight, x, &mut y)?;
+                layer.run(
+                    blas,
+                    "projection.weight",
+                    ExecutionPhase::Prefill,
+                    x,
+                    &mut y,
+                )?;
                 // SAFETY: the logits and token slabs cover all rows; valid contains the live extent.
                 unsafe {
                     stream
@@ -612,7 +653,7 @@ mod tests {
                     .count();
                 defects += usize::from(mismatches != 0 || id_mismatches != 0);
                 println!(
-                    "{} INVARIANT_LINEAR format={format} weight=[{n},{k}] rows={m} graph={graph} bit_mismatches={mismatches} argmax_id_mismatches={id_mismatches}",
+                    "{} INVARIANT_LINEAR consumer=layer_plan format={format} weight=[{n},{k}] rows={m} graph={graph} bit_mismatches={mismatches} argmax_id_mismatches={id_mismatches}",
                     if mismatches == 0 && id_mismatches == 0 {
                         "PASS"
                     } else {
@@ -626,9 +667,10 @@ mod tests {
             wrong[row * k..(row + 1) * k].copy_from_slice(&values[..k]);
         }
         let wrong = stream.clone_htod(&wrong)?;
-        blas.linear_typed(
+        layer.run(
+            blas,
+            "projection.weight",
             ExecutionPhase::Prefill,
-            weight,
             view(&wrong, stream, 0, [rows as u32, k as u32], [k as u64, 1])?,
             &mut TensorMut(view(
                 &output,

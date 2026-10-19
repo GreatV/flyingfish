@@ -7,10 +7,6 @@ use std::collections::BTreeMap;
 /// Activation tile width of gemm_skinny_bf16.
 pub const MAX_SKINNY_ROWS: usize = 16;
 
-pub const fn direct_fp8_rows(rows: usize) -> bool {
-    rows >= 1 && rows <= 5
-}
-
 #[derive(Debug)]
 pub struct DequantSlot {
     pub offset_bytes: u64,

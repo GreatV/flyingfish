@@ -600,6 +600,14 @@ fn drop_result(name: &str, result: std::result::Result<(), impl std::fmt::Debug>
 }
 
 impl Blas {
+    pub(crate) fn direct_fp8_rows(&self) -> std::ops::RangeInclusive<usize> {
+        let rows = match self.invariant_rows {
+            0 => crate::mtp::MAX_VERIFY_ROWS,
+            rows => rows,
+        };
+        1..=rows
+    }
+
     pub(crate) fn bind_invariant(
         &mut self,
         ctx: &Arc<cudarc::driver::CudaContext>,
@@ -706,15 +714,12 @@ impl Blas {
                 scale,
                 layout,
             } => {
+                let direct_rows = self.direct_fp8_rows();
                 ensure!(
-                    if self.invariant_rows > 0 {
-                        (1..=self.invariant_rows).contains(&(x.shape[0] as usize))
-                    } else {
-                        crate::linear_plan::direct_fp8_rows(x.shape[0] as usize)
-                    },
+                    direct_rows.contains(&(x.shape[0] as usize)),
                     "direct FP8 rows={} exceeds the bound={} and requires materialized BF16 weight",
                     x.shape[0],
-                    self.invariant_rows.max(crate::mtp::MAX_VERIFY_ROWS)
+                    direct_rows.end()
                 );
                 self.fp8_ops()?
                     .small_gemm(&self.stream, codes, scale, layout, x, y)
