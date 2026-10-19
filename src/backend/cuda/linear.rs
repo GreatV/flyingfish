@@ -473,6 +473,7 @@ mod tests {
     fn invariant_rows(
         device: &Device,
         blas: &Blas,
+        ops: &Ops,
         weight: LinearWeightRef,
         shape: (usize, usize),
     ) -> Result<usize> {
@@ -497,6 +498,14 @@ mod tests {
         let expected = stream.alloc_zeros::<bf16>(rows * n)?;
         let canary = bf16::from_bits(0x7fc1);
         let output = stream.clone_htod(&vec![canary; (rows + 1) * n])?;
+        let serial_ids = stream.alloc_zeros::<u32>(rows)?;
+        let predictions = stream.clone_htod(&vec![u32::MAX; rows + 1])?;
+        let mut valid = stream.clone_htod(&[0i32])?;
+        let serial_ptr = serial_ids.device_ptr(stream).0;
+        let predicted_ptr = predictions.device_ptr(stream).0;
+        let output_ptr = output.device_ptr(stream).0;
+        let valid_ptr = valid.device_ptr(stream).0;
+        device.finish_upload()?;
         for row in 0..rows {
             blas.linear_typed(
                 ExecutionPhase::Decode,
@@ -510,13 +519,55 @@ mod tests {
                     [n as u64, 1],
                 )?),
             )?;
+            let input_ptr = expected.device_ptr(stream).0 + (row * n * size_of::<bf16>()) as u64;
+            let token_ptr = serial_ptr + (row * size_of::<u32>()) as u64;
+            // SAFETY: each M1 input covers n logits and each output covers one token.
+            unsafe {
+                stream
+                    .launch_builder(&ops.argmax)
+                    .arg(&input_ptr)
+                    .arg(&token_ptr)
+                    .arg(&(n as i32))
+                    .launch(crate::backend::cuda::ops::grid(1, 1024))?;
+            }
         }
         let expected = stream.clone_dtoh(&expected)?;
+        let expected_ids = stream.clone_dtoh(&serial_ids)?;
+        for (row, &id) in expected.chunks_exact(n).zip(&expected_ids) {
+            let (want, _) = row.iter().enumerate().fold(
+                (0usize, f32::NEG_INFINITY),
+                |(index, value), (next, &logit)| {
+                    if logit.to_f32() > value {
+                        (next, logit.to_f32())
+                    } else {
+                        (index, value)
+                    }
+                },
+            );
+            ensure!(
+                id as usize == want,
+                "M1 argmax tie/index oracle id={id} expected={want}"
+            );
+        }
         let mut defects = 0;
         for m in 1..=rows as u32 {
+            stream.memcpy_htod(&[m as i32], &mut valid)?;
             let x = view(&input, stream, 0, [m, k as u32], [k as u64, 1])?;
             let mut y = TensorMut(view(&output, stream, 0, [m, n as u32], [n as u64, 1])?);
-            let mut execute = || blas.linear_typed(ExecutionPhase::Prefill, weight, x, &mut y);
+            let mut execute = || -> Result<()> {
+                blas.linear_typed(ExecutionPhase::Prefill, weight, x, &mut y)?;
+                // SAFETY: the logits and token slabs cover all rows; valid contains the live extent.
+                unsafe {
+                    stream
+                        .launch_builder(&ops.argmax_rows)
+                        .arg(&output_ptr)
+                        .arg(&predicted_ptr)
+                        .arg(&(n as i32))
+                        .arg(&valid_ptr)
+                        .launch(crate::backend::cuda::ops::grid(rows, 1024))?;
+                }
+                Ok(())
+            };
             for graph in [false, true] {
                 if graph {
                     use cudarc::driver::sys;
@@ -549,10 +600,24 @@ mod tests {
                     .zip(&expected)
                     .filter(|(a, b)| a.to_bits() != b.to_bits())
                     .count();
-                defects += usize::from(mismatches != 0);
+                let ids = stream.clone_dtoh(&predictions)?;
+                ensure!(
+                    ids[m as usize..].iter().all(|&id| id == u32::MAX),
+                    "argmax wrote past rows={m}"
+                );
+                let id_mismatches = ids[..m as usize]
+                    .iter()
+                    .zip(&expected_ids)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                defects += usize::from(mismatches != 0 || id_mismatches != 0);
                 println!(
-                    "{} INVARIANT_LINEAR format={format} weight=[{n},{k}] rows={m} graph={graph} bit_mismatches={mismatches}",
-                    if mismatches == 0 { "PASS" } else { "DEFECT" }
+                    "{} INVARIANT_LINEAR format={format} weight=[{n},{k}] rows={m} graph={graph} bit_mismatches={mismatches} argmax_id_mismatches={id_mismatches}",
+                    if mismatches == 0 && id_mismatches == 0 {
+                        "PASS"
+                    } else {
+                        "DEFECT"
+                    }
                 );
             }
         }
@@ -624,7 +689,7 @@ mod tests {
                     [n as u32, k as u32],
                     [k as u64, 1],
                 )?);
-                defects += invariant_rows(device, &blas, weight, (n, k))?;
+                defects += invariant_rows(device, &blas, &ops, weight, (n, k))?;
             }
             {
                 let codes: Vec<_> = (0..n * k)
@@ -651,7 +716,7 @@ mod tests {
                         )?,
                         layout,
                     };
-                    defects += invariant_rows(device, &blas, weight, (n, k))?;
+                    defects += invariant_rows(device, &blas, &ops, weight, (n, k))?;
                 }
             }
         }

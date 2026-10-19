@@ -314,6 +314,22 @@ fn invariant_decode(device: &Device) -> Result<()> {
             hidden: h as u32,
             inter: i as u32,
         };
+        let mut alias_io = decode_io(s, 1, k as u32, h as u32)?;
+        let mut alias_shared = TensorMut(gate.x.prefix_rows(1)?);
+        let alias = gate.input(
+            1,
+            &routing,
+            alias_io.contributions,
+            &mut alias_shared,
+            &mut alias_io.done,
+        )?;
+        ensure!(
+            super::decode::validate(&alias, &gate.scratch).is_err(),
+            "shared output may not alias the source activation"
+        );
+        println!(
+            "PASS INVARIANT_MOE_ALIAS_CONTROL format={format:?} x_shared_overlap_rejected=true"
+        );
         let mut serial: [Vec<bf16>; 3] = std::array::from_fn(|_| Vec::new());
         for r in 0..max_rows {
             let one = Gate {

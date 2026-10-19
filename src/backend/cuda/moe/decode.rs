@@ -182,6 +182,11 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
         spans_disjoint(
             input.x.ptr,
             input.x.span_bytes,
+            shared_out.ptr,
+            shared_out.span_bytes
+        ) && spans_disjoint(
+            input.x.ptr,
+            input.x.span_bytes,
             input.contributions.ptr,
             input.contributions.span_bytes
         ) && spans_disjoint(
@@ -195,7 +200,7 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
             input.contributions.ptr,
             input.contributions.span_bytes
         ),
-        "decode contributions overlap x/shared_out/done (contributions ptr {:#x} bytes {}, x ptr {:#x}, shared_out ptr {:#x}, done ptr {:#x})",
+        "decode contributions/shared_out overlap x/shared_out/done (contributions ptr {:#x} bytes {}, x ptr {:#x}, shared_out ptr {:#x}, done ptr {:#x})",
         input.contributions.ptr,
         input.contributions.span_bytes,
         input.x.ptr,
