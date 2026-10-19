@@ -753,6 +753,32 @@ pub(super) fn host_memory(root: &Path) -> Result<(u64, u64)> {
                 .with_context(|| format!("read expert cgroup usage {}", current.display()))?
                 .trim()
                 .parse::<u64>()?;
+            let statistics = directory.join("memory.stat");
+            let statistics = std::fs::read_to_string(&statistics).with_context(|| {
+                format!("read expert cgroup statistics {}", statistics.display())
+            })?;
+            let counter = |name: &str| -> Result<u64> {
+                statistics
+                    .lines()
+                    .find_map(|line| {
+                        let mut fields = line.split_whitespace();
+                        (fields.next()? == name).then(|| fields.next()).flatten()
+                    })
+                    .with_context(|| {
+                        format!(
+                            "expert cgroup statistics missing {name} in {}",
+                            directory.display()
+                        )
+                    })?
+                    .parse::<u64>()
+                    .with_context(|| format!("invalid expert cgroup counter {name}"))
+            };
+            let reclaimable = if memory.is_some() {
+                counter("total_inactive_file")?
+            } else {
+                counter("file")?.saturating_sub(counter("shmem")?)
+            };
+            let used = used.saturating_sub(reclaimable);
             available = available.min(limit.trim().parse::<u64>()?.saturating_sub(used));
         }
         if directory == mount {

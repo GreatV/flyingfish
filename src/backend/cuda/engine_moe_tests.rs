@@ -82,6 +82,10 @@ fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
 
 #[test]
 fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
+    use crate::experts::{
+        catalogue::ExpertLayout,
+        plan::{PlanInputs, Reserves, ServiceCell, ServiceTable, capacity},
+    };
     let (available, locked) = super::host_memory(Path::new("/"))?;
     ensure!(
         available > 0 && locked <= available,
@@ -101,6 +105,62 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             std::fs::create_dir_all(path.parent().context("fixture parent missing")?)?;
             Ok(std::fs::write(path, value)?)
         };
+        let placement = |available| -> Result<Vec<_>> {
+            let model = crate::model_spec::ModelSpec::minicpm(
+                &serde_json::from_str(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/data/minicpm-config.json"
+                )))?,
+                &serde_json::json!({"eos_token_id": [248044, 248046]}),
+            )?;
+            let geometry = ExpertGeometry::from_model(&model)?;
+            let service = ServiceTable::new(
+                "fixture",
+                vec![ServiceCell {
+                    workers: 2,
+                    rows: 1,
+                    experts: 1,
+                    seconds: 0.001,
+                }],
+            )?;
+            let reserves = Reserves {
+                device_fixed_bytes: 0,
+                host_fixed_bytes: 0,
+                residual_row_bytes: 0,
+                normalized_row_bytes: 0,
+                contribution_row_bytes: 0,
+                done_row_bytes: 0,
+                route_row_bytes: 0,
+                prefill_staging_slots: 1,
+                disk_ring_slots: 1,
+            };
+            [
+                crate::model_spec::ExpertFormat::Bf16,
+                crate::model_spec::ExpertFormat::Fp8W8a16,
+            ]
+            .into_iter()
+            .map(|format| {
+                let inputs = PlanInputs {
+                    geometry,
+                    layout: ExpertLayout::new(format, &geometry)?,
+                    device_free_bytes: 12 << 30,
+                    host_available_bytes: available,
+                    h2d_bytes_per_second: 1e9,
+                    d2h_bytes_per_second: 1e9,
+                    copy_engines: 1,
+                    disk_readers: 1,
+                    host_registration_bytes: 0,
+                    service: &service,
+                    reserves: &reserves,
+                    span_rows: 1,
+                    wave_rows: 1,
+                };
+                let plan = capacity(&inputs, 1)?;
+                Ok((plan.slots_per_layer, plan.host_blocks, plan.disk_bytes))
+            })
+            .collect()
+        };
+        let expected_placement = placement(5 << 30)?;
         write("proc/meminfo", "MemAvailable: 16777216 kB\n")?;
         write(
             "proc/self/limits",
@@ -118,6 +178,7 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
         ] {
             write(&format!("{path}/memory.limit_in_bytes"), limit)?;
             write(&format!("{path}/memory.usage_in_bytes"), "1073741824\n")?;
+            write(&format!("{path}/memory.stat"), "total_inactive_file 0\n")?;
         }
         ensure!(
             super::host_memory(&root)? == (5 << 30, 8 << 20),
@@ -127,6 +188,30 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             "PASS host_memory_fixture v1 ancestor_available_bytes={}",
             5u64 << 30
         );
+        for cache in [1u64 << 30, 3 << 30, 0] {
+            for path in [
+                "controllers/memory bank/job",
+                "controllers/memory bank/job/leaf",
+            ] {
+                write(
+                    &format!("{path}/memory.usage_in_bytes"),
+                    &format!("{}\n", (1 << 30) + cache),
+                )?;
+                write(
+                    &format!("{path}/memory.stat"),
+                    &format!("total_inactive_file {cache}\n"),
+                )?;
+            }
+            let (available, locked) = super::host_memory(&root)?;
+            ensure!(
+                available == 5 << 30 && locked == 8 << 20,
+                "v1 cache changed headroom"
+            );
+            ensure!(
+                placement(available)? == expected_placement,
+                "v1 cache changed placement"
+            );
+        }
         for path in [
             "controllers/memory bank/job",
             "controllers/memory bank/job/leaf",
@@ -155,10 +240,54 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
         ] {
             write(&format!("{path}/memory.max"), limit)?;
             write(&format!("{path}/memory.current"), "1073741824\n")?;
+            write(
+                &format!("{path}/memory.stat"),
+                "file 0\nshmem 0\ninactive_file 0\n",
+            )?;
         }
         ensure!(
             super::host_memory(&root)? == (5 << 30, 8 << 20),
             "v2 ancestor headroom did not bind"
+        );
+        for (cache, inactive) in [(1u64 << 30, 1 << 30), (3 << 30, 1 << 30), (0, 0)] {
+            for path in ["sys/fs/cgroup/job", "sys/fs/cgroup/job/leaf"] {
+                write(
+                    &format!("{path}/memory.current"),
+                    &format!("{}\n", (1 << 30) + cache),
+                )?;
+                write(
+                    &format!("{path}/memory.stat"),
+                    &format!("file {cache}\nshmem 0\ninactive_file {inactive}\n"),
+                )?;
+            }
+            let (available, locked) = super::host_memory(&root)?;
+            ensure!(
+                available == 5 << 30 && locked == 8 << 20,
+                "v2 cache changed headroom"
+            );
+            ensure!(
+                placement(available)? == expected_placement,
+                "v2 cache changed placement"
+            );
+        }
+        write("sys/fs/cgroup/job/memory.current", "3221225472\n")?;
+        write(
+            "sys/fs/cgroup/job/memory.stat",
+            "file 3221225472\nshmem 1073741824\ninactive_file 1073741824\n",
+        )?;
+        ensure!(
+            super::host_memory(&root)?.0 == 5 << 30,
+            "shared memory was reclaimed"
+        );
+        write("sys/fs/cgroup/job/memory.stat", "file 0\n")?;
+        ensure!(
+            super::host_memory(&root).is_err(),
+            "missing shared-memory counter admitted"
+        );
+        write("sys/fs/cgroup/job/memory.stat", "file invalid\nshmem 0\n")?;
+        ensure!(
+            super::host_memory(&root).is_err(),
+            "invalid file counter admitted"
         );
         for path in ["sys/fs/cgroup/job", "sys/fs/cgroup/job/leaf"] {
             write(&format!("{path}/memory.max"), "max\n")?;
@@ -173,7 +302,7 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             "missing memory hierarchy admitted"
         );
         println!(
-            "PASS host_memory_fixtures v1_finite=true v1_unlimited=true hybrid=true v2_finite=true v2_unlimited=true missing_controller_rejected=true"
+            "PASS host_memory_fixtures v1_finite=true v1_unlimited=true hybrid=true v2_finite=true v2_unlimited=true cache_independent_placement=true shmem_retained=true malformed_stats_rejected=true missing_controller_rejected=true"
         );
         Ok(())
     })();
