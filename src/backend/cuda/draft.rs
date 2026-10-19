@@ -296,6 +296,31 @@ fn norm(
 }
 
 impl Draft {
+    #[cfg(test)]
+    pub(super) fn prepare_linears(
+        &self,
+        head: &CudaSlice<bf16>,
+        blas: &mut Blas,
+        profile: &super::closure::Profile,
+        write: bool,
+    ) -> Result<()> {
+        blas.declare(self.rows, &profile.pairs);
+        if !write {
+            return blas.load_choices(&profile.linear);
+        }
+        for &shape in &profile.linear {
+            let values: Vec<_> = (0..shape.rows * shape.input)
+                .map(|i| bf16::from_f32(((i % 257) as f32 - 128.0) / 128.0))
+                .collect();
+            let input = self.stream.clone_htod(&values)?;
+            if shape.output == self.config.vocab_size && shape.input == self.config.hidden_size {
+                blas.calibrate_shape(head, &input.slice(..), shape)?;
+            } else {
+                self.calibrate_shape(blas, &input.slice(..), shape)?;
+            }
+        }
+        Ok(())
+    }
     pub(super) fn calibrate_shape(
         &self,
         blas: &mut Blas,
@@ -1277,7 +1302,7 @@ mod tests {
     use super::*;
     use anyhow::Context;
     use safetensors::{Dtype, SafeTensors};
-    use std::{collections::BTreeSet, path::PathBuf, rc::Rc};
+    use std::{path::PathBuf, rc::Rc};
 
     fn values(tensors: &SafeTensors<'_>, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
         let tensor = tensors.tensor(name)?;
@@ -1417,52 +1442,6 @@ mod tests {
             "T19_TENSOR name={name} max_abs={error} max_bound_ratio={maximum} coefficient={coefficient} violations={failures}"
         );
         Ok(failures)
-    }
-
-    fn calibrate(draft: &Draft, head: &CudaSlice<bf16>, blas: &mut Blas) -> Result<()> {
-        use crate::backend::setup::LinearShape;
-        let c = &draft.config;
-        let h = c.hidden_size;
-        let f = c.intermediate_size;
-        let shapes = [
-            (
-                &draft.weights.layers[0].block.qkv,
-                c.block_size,
-                c.qkv_dim(),
-                h,
-            ),
-            (&draft.weights.layers[0].block.o, c.block_size, h, h),
-            (&draft.weights.layers[0].block.gu, c.block_size, 2 * f, h),
-            (&draft.weights.layers[0].block.down, c.block_size, h, f),
-            (head, c.block_size, c.vocab_size, h),
-            (&draft.weights.w2, 1, c.vocab_size, c.markov_rank),
-        ];
-        let pairs: BTreeSet<_> = shapes
-            .iter()
-            .map(|(_, _, output, input)| (*output, *input))
-            .chain([(h, c.capture_width()), (c.kv_dim(), h)])
-            .collect();
-        blas.declare(draft.rows, &pairs);
-        let count = shapes
-            .iter()
-            .map(|(_, r, _, k)| r * k)
-            .max()
-            .context("no draft shapes")?;
-        let input: Vec<_> = (0..count)
-            .map(|i| bf16::from_f32(((i % 257) as f32 - 128.0) / 128.0))
-            .collect();
-        let input = draft.stream.clone_htod(&input)?;
-        for (weight, rows, output, input_width) in shapes {
-            let shape = LinearShape {
-                rows,
-                output,
-                input: input_width,
-            };
-            if super::super::linear_calibrate::supports(shape) {
-                blas.calibrate_shape(weight, &input.slice(..rows * input_width), shape)?;
-            }
-        }
-        Ok(())
     }
 
     fn confidence_bounds(
@@ -1653,7 +1632,15 @@ mod tests {
             "lm_head.weight",
             &[c.vocab_size, c.hidden_size],
         )?;
-        calibrate(&draft, &head, &mut blas)?;
+        let profile = super::super::closure::Profile::draft(
+            &draft.config,
+            capacity,
+            rows,
+            &target,
+            &draft_path,
+        )?;
+        draft.prepare_linears(&head, &mut blas, &profile, true)?;
+        draft.prepare_linears(&head, &mut blas, &profile, false)?;
         draft.setup_attention(&device, &ops, &config, &runtime, &closure)?;
         draft.setup_markov(&device, &ops, &runtime, &closure)?;
         let s = &device.stream;

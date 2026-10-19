@@ -108,6 +108,41 @@ pub(super) fn forward_rows(
     Ok(rows)
 }
 
+fn draft_shapes(
+    draft: &crate::dspark::DraftConfig,
+    injection_rows: usize,
+) -> (BTreeSet<LinearShape>, Pairs) {
+    let rows = draft.block_size;
+    let h = draft.hidden_size;
+    let f = draft.intermediate_size;
+    let roles = [
+        (rows, draft.qkv_dim(), h),
+        (rows, h, h),
+        (rows, 2 * f, h),
+        (rows, h, f),
+        (rows, draft.vocab_size, h),
+        (1, draft.vocab_size, draft.markov_rank),
+    ]
+    .into_iter()
+    .chain(
+        (1..=injection_rows)
+            .flat_map(|rows| [(rows, h, draft.capture_width()), (rows, draft.kv_dim(), h)]),
+    );
+    let all: BTreeSet<_> = roles
+        .map(|(rows, output, input)| LinearShape {
+            rows,
+            output,
+            input,
+        })
+        .collect();
+    let pairs = all.iter().map(|s| (s.output, s.input)).collect();
+    let linear = all
+        .into_iter()
+        .filter(|shape| super::linear_calibrate::supports(*shape))
+        .collect();
+    (linear, pairs)
+}
+
 fn shapes(
     c: &Config,
     small_rows: usize,
@@ -140,36 +175,47 @@ fn shapes(
     add(1, c.vocab_size, c.hidden_size);
     if let Some(budget) = budget {
         let draft = draft.context("draft config missing from closure declaration")?;
-        for (output, input) in [
-            (draft.qkv_dim(), draft.hidden_size),
-            (draft.hidden_size, draft.hidden_size),
-            (2 * draft.intermediate_size, draft.hidden_size),
-            (draft.hidden_size, draft.intermediate_size),
-            (draft.vocab_size, draft.hidden_size),
-        ] {
-            add(draft.block_size, output, input);
-        }
         let verify_rows = if budget.is_tree() {
             budget.rows()
         } else {
             draft.verify_rows()?
         };
         add(verify_rows, c.vocab_size, c.hidden_size);
-        let max = injection_limit(small_rows, draft.verify_rows()?);
-        for rows in 1..=max {
-            for (output, input) in [
-                (draft.hidden_size, draft.capture_width()),
-                (draft.kv_dim(), draft.hidden_size),
-            ] {
-                add(rows, output, input);
-            }
-        }
-        add(1, draft.vocab_size, draft.markov_rank);
+        let (draft_linear, draft_pairs) =
+            draft_shapes(draft, injection_limit(small_rows, draft.verify_rows()?));
+        linear.extend(draft_linear);
+        pairs.extend(draft_pairs);
     }
     Ok((linear, pairs))
 }
 
 impl Profile {
+    #[cfg(test)]
+    pub(super) fn draft(
+        config: &crate::dspark::DraftConfig,
+        capacity: usize,
+        rows: usize,
+        model: &Path,
+        draft: &Path,
+    ) -> Result<Self> {
+        ensure!(
+            config.head_dim == 256 && rows >= config.verify_rows()? && rows <= capacity,
+            "hybrid draft calibration geometry exceeds its workspace"
+        );
+        let small_rows = small_rows(rows, capacity);
+        let (linear, pairs) =
+            draft_shapes(config, injection_limit(small_rows, config.verify_rows()?));
+        Ok(Self {
+            linear,
+            pairs,
+            attention: Vec::new(),
+            capacity,
+            small_rows,
+            budget: Some(config.verify_rows()?),
+            model: hash(&fs::read(model.join("config.json"))?),
+            draft: Some(hash(&fs::read(draft.join("config.json"))?)),
+        })
+    }
     pub fn new(
         c: &Config,
         capacity: usize,
@@ -879,18 +925,30 @@ mod tests {
         assert!(step.check(16, 16, &allowed).is_ok());
         assert!(step.check(16, 16, &BTreeSet::from([1, 7, 8])).is_err());
         let (linear, _) = shapes(&c, 1, Some(SpecBudget::Chain), Some(&full))?;
+        let (draft_linear, draft_pairs) = draft_shapes(&full, full.verify_rows()?);
         for rows in 1..=full.verify_rows()? {
-            assert!(linear.contains(&LinearShape {
+            let projected = LinearShape {
                 rows,
                 output: full.hidden_size,
-                input: full.capture_width()
-            }));
-            assert!(linear.contains(&LinearShape {
+                input: full.capture_width(),
+            };
+            let kv = LinearShape {
                 rows,
                 output: full.kv_dim(),
-                input: full.hidden_size
-            }));
+                input: full.hidden_size,
+            };
+            for shape in [projected, kv] {
+                assert!(linear.contains(&shape));
+                assert!(draft_linear.contains(&shape));
+                assert!(draft_pairs.contains(&(shape.output, shape.input)));
+            }
         }
+        assert_eq!(draft_linear.len(), 6 + 2 * full.verify_rows()?);
+        assert!(!draft_linear.contains(&LinearShape {
+            rows: full.verify_rows()?,
+            output: c.vocab_size,
+            input: c.hidden_size
+        }));
         assert!(linear.contains(&LinearShape {
             rows: 16,
             output: c.vocab_size,
