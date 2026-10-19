@@ -475,8 +475,6 @@ pub(crate) struct PrefillLayout {
     act_s: u64,
     pub(crate) shared_out: u64,
     scale: u64,
-    pub(crate) wave: u64,
-    pub(crate) wave_slot_bytes: u64,
     bytes: u64,
 }
 
@@ -571,8 +569,7 @@ pub(crate) fn prefill_layout(
     let act_s = region(&mut at, shared_inter, 2)?;
     let shared_out = region(&mut at, shared_hidden, 2)?;
     let scale = region(&mut at, rows, 2)?;
-    let wave = at;
-    let wave_slot_bytes = if let Some(slot) = fp8_slot {
+    if let Some(slot) = fp8_slot {
         ensure!(
             hidden.is_multiple_of(8) && inter.is_multiple_of(8),
             "FP8 prefill hidden/inter must be multiples of eight"
@@ -589,15 +586,7 @@ pub(crate) fn prefill_layout(
                 == ExpertLayout::Fp8W8a16(slot.clone()),
             "FP8 prefill slot layout differs from geometry"
         );
-        let bytes = ExpertLayout::new(ExpertFormat::Bf16, &geometry)?.slot_bytes();
-        let total = bytes
-            .checked_mul(experts.min(assignments) as u64)
-            .context("FP8 prefill wave buffer overflow")?;
-        region(&mut at, usize::try_from(total)?, 1)?;
-        bytes
-    } else {
-        0
-    };
+    }
     Ok(PrefillLayout {
         counts,
         active_total,
@@ -616,8 +605,6 @@ pub(crate) fn prefill_layout(
         act_s,
         shared_out,
         scale,
-        wave,
-        wave_slot_bytes,
         bytes: at,
     })
 }
@@ -765,7 +752,7 @@ impl Stage {
 }
 
 pub(crate) struct PrefillOps {
-    fp8: Option<super::super::linear::Fp8Ops>,
+    fp8: Option<(CudaFunction, CudaFunction)>,
     count: CudaFunction,
     scan: CudaFunction,
     permute: CudaFunction,
@@ -809,7 +796,12 @@ impl PrefillOps {
         }
         Ok(Self {
             fp8: (format == ExpertFormat::Fp8W8a16)
-                .then(|| super::super::linear::Fp8Ops::new(ctx))
+                .then(|| -> Result<_> {
+                    Ok((
+                        module.load_function("moe_gemm_w8a16")?,
+                        module.load_function("moe_gemm_lane16_w8a16")?,
+                    ))
+                })
                 .transpose()?,
             count: module.load_function("moe_count")?,
             scan: module.load_function("moe_scan")?,
@@ -942,7 +934,7 @@ impl PrefillOps {
         group_runs(&stage.order[..tensor_problems], counts, &mut stage.runs);
         ensure!(
             stage.order.len() <= experts.min(plan.assignments as usize),
-            "FP8 prefill active experts exceed the wave buffer bound"
+            "prefill active experts exceed the assignment bound"
         );
         stage.offsets.clear();
         let mut acc = 0i32;
@@ -983,61 +975,13 @@ impl PrefillOps {
                     "moe prefill down slot pointer of expert {e} (0x{dn:x}) below cuBLAS alignment {dn_align}"
                 );
                 let off = stage.offsets[e] as u64;
-                mirror[j] = if let Some(slot) = input.fp8_slot {
+                if input.fp8_slot.is_some() {
                     ensure!(
                         gu == dn,
                         "FP8 prefill expert {e} needs identical native slot bases"
                     );
-                    let destination = scratch.ptr + layout.wave + j as u64 * layout.wave_slot_bytes;
-                    for (code, scale, n, k, offset) in [
-                        (&slot.gate, &slot.gate_scale, inter, hidden, 0),
-                        (&slot.up, &slot.up_scale, inter, hidden, slot.up.start * 2),
-                        (
-                            &slot.down,
-                            &slot.down_scale,
-                            hidden,
-                            inter,
-                            slot.down.start * 2,
-                        ),
-                    ] {
-                        // The validated native descriptor and wave slot cover each matrix.
-                        let (codes, scales, mut output) = unsafe {
-                            (
-                                Tensor::new(
-                                    gu + code.start,
-                                    [n, k],
-                                    [u64::from(k), 1],
-                                    code.end - code.start,
-                                )?,
-                                Tensor::new(
-                                    gu + scale.start,
-                                    [n, 1],
-                                    [1, 1],
-                                    scale.end - scale.start,
-                                )?,
-                                TensorMut::new(
-                                    destination + offset,
-                                    [n, k],
-                                    [u64::from(k), 1],
-                                    (code.end - code.start) * 2,
-                                )?,
-                            )
-                        };
-                        self.fp8
-                            .as_ref()
-                            .context("FP8 prefill operators missing")?
-                            .materialize(
-                                stream,
-                                codes,
-                                scales,
-                                crate::fp8::Fp8ScaleLayout::PerChannel,
-                                &mut output,
-                            )?;
-                    }
-                    destination
-                } else {
-                    gu
-                };
+                }
+                mirror[j] = gu;
                 mirror[len1 + j] = x_perm_at + elem(off * u64::from(hidden));
                 mirror[2 * len1 + j] = h1_at + elem(off * u64::from(2 * inter));
                 mirror[3 * len1 + j] = counts[e] as u64;
@@ -1064,15 +1008,29 @@ impl PrefillOps {
                 4 * len1,
                 &mut stage.gemm1_copy_done,
             )?;
-            self.grouped_gemm(stage, gemm1_base, len1)
-                .context("moe prefill grouped GEMM 1")?;
         }
-        self.small_gemm(
-            gemm1_base,
-            len1,
-            (tensor_problems, small_rows),
-            (2 * inter, hidden),
-        )?;
+        if let Some(slot) = input.fp8_slot {
+            self.native_gemm(
+                stage,
+                gemm1_base,
+                len1,
+                (tensor_problems, small_rows),
+                (2 * inter, hidden),
+                slot.gate_scale.start,
+            )?;
+        } else {
+            unsafe {
+                self.grouped_gemm(stage, gemm1_base, len1)
+                    .context("moe prefill grouped GEMM 1")?;
+            }
+            self.small_gemm(
+                gemm1_base,
+                len1,
+                (tensor_problems, small_rows),
+                (2 * inter, hidden),
+                None,
+            )?;
+        }
 
         let silu_grid = |elems: usize| grid(elems.div_ceil(BLOCK_THREADS as usize), BLOCK_THREADS);
         unsafe {
@@ -1095,10 +1053,7 @@ impl PrefillOps {
                 let e = e as usize;
                 let off = stage.offsets[e] as u64;
                 mirror[j] = if let Some(slot) = input.fp8_slot {
-                    scratch.ptr
-                        + layout.wave
-                        + j as u64 * layout.wave_slot_bytes
-                        + slot.down.start * 2
+                    input.slots_down_host[e] + slot.down.start
                 } else {
                     input.slots_down_host[e]
                 };
@@ -1128,15 +1083,29 @@ impl PrefillOps {
                 4 * len2,
                 &mut stage.gemm2_copy_done,
             )?;
-            self.grouped_gemm(stage, gemm2_base, len2)
-                .context("moe prefill grouped GEMM 2")?;
         }
-        self.small_gemm(
-            gemm2_base,
-            len2,
-            (tensor_problems, small_rows),
-            (hidden, inter),
-        )?;
+        if let Some(slot) = input.fp8_slot {
+            self.native_gemm(
+                stage,
+                gemm2_base,
+                len2,
+                (tensor_problems, small_rows),
+                (hidden, inter),
+                slot.down_scale.start - slot.down.start,
+            )?;
+        } else {
+            unsafe {
+                self.grouped_gemm(stage, gemm2_base, len2)
+                    .context("moe prefill grouped GEMM 2")?;
+            }
+            self.small_gemm(
+                gemm2_base,
+                len2,
+                (tensor_problems, small_rows),
+                (hidden, inter),
+                None,
+            )?;
+        }
         unsafe {
             stream
                 .launch_builder(&self.scatter)
@@ -1373,35 +1342,92 @@ impl PrefillOps {
         Ok(())
     }
 
+    fn native_gemm(
+        &self,
+        stage: &Stage,
+        block: u64,
+        problems: usize,
+        small: (usize, u32),
+        shape: (u32, u32),
+        scale_offset: u64,
+    ) -> Result<()> {
+        let (tensor_problems, _) = small;
+        if tensor_problems > 0 {
+            let kernel = &self.fp8.as_ref().context("native expert GEMM missing")?.0;
+            let rows = stage
+                .runs
+                .last()
+                .context("native tensor-core groups missing")?
+                .0;
+            // SAFETY: both native matrices and BF16 input/output views cover the validated shape.
+            unsafe {
+                self.stream
+                    .launch_builder(kernel)
+                    .arg(&block)
+                    .arg(&(problems as i32))
+                    .arg(&(tensor_problems as i32))
+                    .arg(&(shape.0 as i32))
+                    .arg(&(shape.1 as i32))
+                    .arg(&scale_offset)
+                    .launch(cudarc::driver::LaunchConfig {
+                        grid_dim: (
+                            shape.0.div_ceil(128),
+                            rows.div_ceil(64),
+                            tensor_problems as u32,
+                        ),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+        }
+        self.small_gemm(block, problems, small, shape, Some(scale_offset))
+    }
+
     fn small_gemm(
         &self,
         block: u64,
         problems: usize,
         small: (usize, u32),
         shape: (u32, u32),
+        scale_offset: Option<u64>,
     ) -> Result<()> {
         let (first, rows) = small;
         if first == problems {
             return Ok(());
         }
+        let kernel = if scale_offset.is_some() {
+            &self.fp8.as_ref().context("FP8 lane16 operator missing")?.1
+        } else {
+            &self.lane16
+        };
+        let offset = scale_offset.unwrap_or(0);
+        let (problem_count, first_problem, columns, inner) = (
+            problems as i32,
+            first as i32,
+            shape.0 as i32,
+            shape.1 as i32,
+        );
         // SAFETY: the stream-ordered A/B/C/rows mirror covers every selected problem and matrix.
         unsafe {
-            self.stream
-                .launch_builder(&self.lane16)
+            let mut launch = self.stream.launch_builder(kernel);
+            launch
                 .arg(&block)
-                .arg(&(problems as i32))
-                .arg(&(first as i32))
-                .arg(&(shape.0 as i32))
-                .arg(&(shape.1 as i32))
-                .launch(cudarc::driver::LaunchConfig {
-                    grid_dim: (
-                        shape.0.div_ceil(LANE16_ROWS),
-                        rows,
-                        (problems - first) as u32,
-                    ),
-                    block_dim: (BLOCK_THREADS, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+                .arg(&problem_count)
+                .arg(&first_problem)
+                .arg(&columns)
+                .arg(&inner);
+            if scale_offset.is_some() {
+                launch.arg(&offset);
+            }
+            launch.launch(cudarc::driver::LaunchConfig {
+                grid_dim: (
+                    shape.0.div_ceil(LANE16_ROWS),
+                    rows,
+                    (problems - first) as u32,
+                ),
+                block_dim: (BLOCK_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
         }
         Ok(())
     }

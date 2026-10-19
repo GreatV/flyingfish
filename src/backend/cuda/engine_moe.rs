@@ -134,7 +134,7 @@ impl Setup {
         for span in spans {
             let span_rows = u32::try_from(span)?;
             let mut wave_rows = 1u32;
-            // L2 bounds activation scratch; BF16 materialization is reserved in VRAM.
+            // L2 bounds activation scratch.
             while wave_rows <= span_rows / 2
                 && crate::backend::cuda::moe::prefill::prefill_scratch_bytes(
                     wave_rows as usize * 2,

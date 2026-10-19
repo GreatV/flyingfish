@@ -259,12 +259,14 @@ fn fp8_prefill_gpu() -> Result<()> {
         let expected = s.clone_dtoh(&reference.contributions)?;
         let canonical = || -> Result<Vec<u8>> {
             let assignments = rows * top_k;
-            let positions = s.clone_dtoh(&scratch_buf.slice(
-                layout.pos_of as usize..layout.pos_of as usize + assignments * 4,
-            ))?;
-            let gate_up = s.clone_dtoh(&scratch_buf.slice(
-                layout.h1 as usize..layout.h1 as usize + assignments * 2 * inter * 2,
-            ))?;
+            let positions = s.clone_dtoh(
+                &scratch_buf
+                    .slice(layout.pos_of as usize..layout.pos_of as usize + assignments * 4),
+            )?;
+            let gate_up = s.clone_dtoh(
+                &scratch_buf
+                    .slice(layout.h1 as usize..layout.h1 as usize + assignments * 2 * inter * 2),
+            )?;
             let down = s.clone_dtoh(&scratch_buf.slice(
                 layout.y_perm as usize..layout.y_perm as usize + assignments * hidden * 2,
             ))?;
@@ -272,8 +274,10 @@ fn fp8_prefill_gpu() -> Result<()> {
             for bytes in positions.as_chunks::<4>().0 {
                 let position = u32::from_le_bytes(*bytes) as usize;
                 ensure!(position < assignments, "prefill gate segment position");
-                ordered.extend_from_slice(&gate_up[position * 4 * inter..(position + 1) * 4 * inter]);
-                ordered.extend_from_slice(&down[position * 2 * hidden..(position + 1) * 2 * hidden]);
+                ordered
+                    .extend_from_slice(&gate_up[position * 4 * inter..(position + 1) * 4 * inter]);
+                ordered
+                    .extend_from_slice(&down[position * 2 * hidden..(position + 1) * 2 * hidden]);
             }
             Ok(ordered)
         };
@@ -314,7 +318,10 @@ fn fp8_prefill_gpu() -> Result<()> {
             if bad == 0 { "PASS" } else { "DEFECT" }
         );
         defects += usize::from(bad != 0);
-        for control in ["code", "scale"].into_iter().filter(|_| rows == 17 && arithmetic == 1) {
+        for control in ["code", "scale"]
+            .into_iter()
+            .filter(|_| rows == 17 && arithmetic == 1)
+        {
             let mut swapped = native.clone();
             let ranges = if control == "code" {
                 [&slot.gate, &slot.up, &slot.down]
