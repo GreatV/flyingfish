@@ -4,9 +4,9 @@ use super::reference::{self, MoeDims, RouteRow};
 use super::route::RouteOps;
 use super::testing;
 use crate::backend::cuda::Device;
-use crate::backend::cuda::contracts::TensorMut;
+use crate::backend::cuda::contracts::{Tensor, TensorMut};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, PushKernelArg};
 use half::bf16;
 use std::collections::HashMap;
 
@@ -126,6 +126,167 @@ fn compare_case(
     Ok(())
 }
 
+fn invariant_route(device: &Device) -> Result<()> {
+    use crate::backend::cuda::{contracts::view, cubin, ops::grid};
+    let rows = crate::linear_plan::MAX_SKINNY_ROWS;
+    let (e, k, h) = (256usize, 8usize, 2048usize);
+    let s = &device.stream;
+    let ops = RouteOps::new(&device.ctx, s)?;
+    let logit_kernel =
+        cubin::module(&device.ctx, "moe_route")?.load_function("moe_route_logits")?;
+    let values: Vec<_> = (0..rows * h)
+        .map(|i| bf16::from_f32(((i / h * 71 + i % h * 13) % 509) as f32 / 256.0 - 254.0 / 256.0))
+        .collect();
+    let mut router: Vec<_> = (0..e * h)
+        .map(|i| bf16::from_f32(((i / h * 37 + i % h * 17) % 257) as f32 / 4096.0 - 128.0 / 4096.0))
+        .collect();
+    let tie = router[3 * h..4 * h].to_vec();
+    router[7 * h..8 * h].copy_from_slice(&tie);
+    let x = s.clone_htod(&values)?;
+    let router = s.clone_htod(&router)?;
+    let w = view(&router, s, 0, [e as u32, h as u32], [h as u64, 1])?;
+    let expected_ids = s.alloc_zeros::<i32>(rows * k)?;
+    let expected_weights = s.alloc_zeros::<bf16>(rows * k)?;
+    let expected_logits = s.alloc_zeros::<bf16>(rows * e)?;
+    device.finish_upload()?;
+    let logits = |x: Tensor<bf16, 2>, output: Tensor<bf16, 2>| -> Result<()> {
+        // SAFETY: prebound dense views cover every row/expert written by the diagnostic boundary.
+        unsafe {
+            s.launch_builder(&logit_kernel)
+                .arg(&x.ptr)
+                .arg(&w.ptr)
+                .arg(&output.ptr)
+                .arg(&(x.shape[0] as i32))
+                .arg(&(e as i32))
+                .arg(&(h as i32))
+                .launch(grid(x.shape[0] as usize, e as u32))?;
+        }
+        Ok(())
+    };
+    for r in 0..rows {
+        let input = view(&x, s, r * h, [1, h as u32], [h as u64, 1])?;
+        ops.route(
+            s,
+            input,
+            w,
+            &mut TensorMut(view(&expected_ids, s, r * k, [1, k as u32], [k as u64, 1])?),
+            &mut TensorMut(view(
+                &expected_weights,
+                s,
+                r * k,
+                [1, k as u32],
+                [k as u64, 1],
+            )?),
+        )?;
+        logits(
+            input,
+            view(&expected_logits, s, r * e, [1, e as u32], [e as u64, 1])?,
+        )?;
+    }
+    let expected_ids = s.clone_dtoh(&expected_ids)?;
+    let expected_weights = s.clone_dtoh(&expected_weights)?;
+    let expected_logits = s.clone_dtoh(&expected_logits)?;
+    ensure!(
+        expected_logits
+            .chunks_exact(e)
+            .all(|row| row[3].to_bits() == row[7].to_bits()),
+        "router tie fixture invalid"
+    );
+    let canary = bf16::from_bits(0x7fc1);
+    let ids = s.clone_htod(&vec![-33i32; (rows + 1) * k])?;
+    let weights = s.clone_htod(&vec![canary; (rows + 1) * k])?;
+    let output = s.clone_htod(&vec![canary; (rows + 1) * e])?;
+    let mut defects = 0;
+    for m in 1..=rows as u32 {
+        let input = view(&x, s, 0, [m, h as u32], [h as u64, 1])?;
+        let mut id_view = TensorMut(view(&ids, s, 0, [m, k as u32], [k as u64, 1])?);
+        let mut weight_view = TensorMut(view(&weights, s, 0, [m, k as u32], [k as u64, 1])?);
+        let logit_view = view(&output, s, 0, [m, e as u32], [e as u64, 1])?;
+        let mut execute = || -> Result<()> {
+            ops.route(s, input, w, &mut id_view, &mut weight_view)?;
+            logits(input, logit_view)
+        };
+        for graph in [false, true] {
+            if graph {
+                s.synchronize()?;
+                s.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                let launched = execute();
+                let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                launched?;
+                captured?
+                    .context("empty invariant router graph")?
+                    .launch()?;
+            } else {
+                execute()?;
+            }
+            let got_ids = s.clone_dtoh(&ids)?;
+            let got_weights = s.clone_dtoh(&weights)?;
+            let got_logits = s.clone_dtoh(&output)?;
+            let choices = m as usize * k;
+            let count = m as usize * e;
+            ensure!(
+                got_ids[choices..].iter().all(|&v| v == -33)
+                    && got_weights[choices..]
+                        .iter()
+                        .chain(&got_logits[count..])
+                        .all(|v| v.to_bits() == canary.to_bits()),
+                "router wrote a dead row"
+            );
+            ensure!(
+                got_logits[..count]
+                    .iter()
+                    .chain(&got_weights[..choices])
+                    .all(|v| v.is_finite()),
+                "nonfinite invariant router boundary"
+            );
+            let mismatches = got_ids[..choices]
+                .iter()
+                .zip(&expected_ids)
+                .filter(|(a, b)| a != b)
+                .count()
+                + got_weights[..choices]
+                    .iter()
+                    .zip(&expected_weights)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count()
+                + got_logits[..count]
+                    .iter()
+                    .zip(&expected_logits)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+            defects += usize::from(mismatches != 0);
+            println!(
+                "{} INVARIANT_ROUTE x=[{m},{h}] router=[{e},{h}] top_k={k} graph={graph} logits_ids_weights_bit_mismatches={mismatches}",
+                if mismatches == 0 { "PASS" } else { "DEFECT" }
+            );
+        }
+    }
+    let mut wrong = values.clone();
+    for r in 1..rows {
+        wrong[r * h..(r + 1) * h].copy_from_slice(&values[..h]);
+    }
+    let wrong = s.clone_htod(&wrong)?;
+    logits(
+        view(&wrong, s, 0, [rows as u32, h as u32], [h as u64, 1])?,
+        view(&output, s, 0, [rows as u32, e as u32], [e as u64, 1])?,
+    )?;
+    let mismatches = s
+        .clone_dtoh(&output)?
+        .iter()
+        .zip(&expected_logits)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    ensure!(mismatches > 0, "router row0-reuse control escaped");
+    println!("PASS INVARIANT_ROUTE_CONTROL row0_reuse=true bit_mismatches={mismatches}");
+    println!(
+        "INVARIANT_ROUTE_SUMMARY rows=1..16 eager_graph=true logits_ids_weights=true defects={defects}"
+    );
+    ensure!(defects == 0, "invariant router DEFECT cells={defects}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
 fn moe_route_gpu() -> Result<()> {
@@ -134,6 +295,7 @@ fn moe_route_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let d = Device::new(0)?;
+    invariant_route(&d)?;
     let s = &d.stream;
     let ops = RouteOps::new(&d.ctx, s)?;
     let dims = MoeDims::minicpm47(4096);

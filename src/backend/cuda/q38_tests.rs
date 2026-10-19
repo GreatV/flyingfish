@@ -3197,6 +3197,145 @@ fn q38_norm_stage_ab_gpu() -> Result<()> {
     Ok(())
 }
 
+fn invariant_gated_norm(device: &Device) -> Result<()> {
+    let rows = crate::linear_plan::MAX_SKINNY_ROWS;
+    let (heads, width) = (32usize, 128usize);
+    let row_words = heads * width;
+    let s = &device.stream;
+    let common = CommonOpsRef::new(&device.ctx)?;
+    let x: Vec<_> = (0..rows * row_words)
+        .map(|i| {
+            bf16::from_f32(((i * 17 + i / row_words * 71) % 509) as f32 / 128.0 - 254.0 / 128.0)
+        })
+        .collect();
+    let z: Vec<_> = (0..rows * row_words)
+        .map(|i| {
+            bf16::from_f32(((i * 13 + i / row_words * 37) % 257) as f32 / 128.0 - 128.0 / 128.0)
+        })
+        .collect();
+    let weight: Vec<_> = (0..width)
+        .map(|i| bf16::from_f32((i % 127) as f32 / 128.0 + 0.5))
+        .collect();
+    let xb = s.clone_htod(&x)?;
+    let zb = s.clone_htod(&z)?;
+    let wb = s.clone_htod(&weight)?;
+    let expected = s.alloc_zeros::<bf16>(rows * row_words)?;
+    let output = s.clone_htod(&vec![bf16::from_bits(0x7fc1); (rows + 1) * row_words])?;
+    let tensor = |buffer: &CudaSlice<bf16>, offset, n| {
+        super::contracts::view(
+            buffer,
+            s,
+            offset,
+            [n, heads as u32, width as u32],
+            [row_words as u64, width as u64, 1],
+        )
+    };
+    let weight = view(&wb, s, [width as u32], [1])?;
+    let (_one, one_meta) = meta(s, 0, 1, 32)?;
+    let one = RowDomain {
+        meta: one_meta,
+        row_base: 0,
+        row_capacity: 1,
+    };
+    device.finish_upload()?;
+    for r in 0..rows {
+        common.norm.rms_gated(
+            s,
+            one,
+            GatedRmsInput {
+                x: tensor(&xb, r * row_words, 1)?,
+                weight,
+                gate: tensor(&zb, r * row_words, 1)?,
+            },
+            &mut TensorMut(tensor(&expected, r * row_words, 1)?),
+            1e-6,
+        )?;
+    }
+    let expected = s.clone_dtoh(&expected)?;
+    let mut defects = 0;
+    for m in 1..=rows as u32 {
+        let (_metadata, seq) = meta(s, 0, m as i32, 32)?;
+        let domain = RowDomain {
+            meta: seq,
+            row_base: 0,
+            row_capacity: m,
+        };
+        let x = tensor(&xb, 0, m)?;
+        let gate = tensor(&zb, 0, m)?;
+        let mut y = TensorMut(tensor(&output, 0, m)?);
+        let mut execute = || {
+            common
+                .norm
+                .rms_gated(s, domain, GatedRmsInput { x, weight, gate }, &mut y, 1e-6)
+        };
+        for graph in [false, true] {
+            if graph {
+                s.synchronize()?;
+                s.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                let launched = execute();
+                let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                launched?;
+                captured?
+                    .context("empty invariant gated norm graph")?
+                    .launch()?;
+            } else {
+                execute()?;
+            }
+            let got = s.clone_dtoh(&output)?;
+            let count = m as usize * row_words;
+            ensure!(
+                got[..count].iter().all(|v| v.is_finite())
+                    && got[count..].iter().all(|v| v.to_bits() == 0x7fc1),
+                "invariant gated norm finite/tail"
+            );
+            let mismatches = got[..count]
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(mismatches != 0);
+            println!(
+                "{} INVARIANT_GATED_NORM x=[{m},{heads},{width}] graph={graph} bit_mismatches={mismatches}",
+                if mismatches == 0 { "PASS" } else { "DEFECT" }
+            );
+        }
+    }
+    let mut wrong = z.clone();
+    for r in 1..rows {
+        wrong[r * row_words..(r + 1) * row_words].copy_from_slice(&z[..row_words]);
+    }
+    let wrong = s.clone_htod(&wrong)?;
+    let (_metadata, seq) = meta(s, 0, rows as i32, 32)?;
+    common.norm.rms_gated(
+        s,
+        RowDomain {
+            meta: seq,
+            row_base: 0,
+            row_capacity: rows as u32,
+        },
+        GatedRmsInput {
+            x: tensor(&xb, 0, rows as u32)?,
+            weight,
+            gate: tensor(&wrong, 0, rows as u32)?,
+        },
+        &mut TensorMut(tensor(&output, 0, rows as u32)?),
+        1e-6,
+    )?;
+    let mismatches = s
+        .clone_dtoh(&output)?
+        .iter()
+        .zip(&expected)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    ensure!(mismatches > 0, "gated norm row0-reuse control escaped");
+    println!("PASS INVARIANT_GATED_NORM_CONTROL row0_reuse=true bit_mismatches={mismatches}");
+    println!("INVARIANT_GATED_NORM_SUMMARY rows=1..16 eager_graph=true defects={defects}");
+    ensure!(defects == 0, "invariant gated norm DEFECT cells={defects}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires GPU window and FF_Q38_GPU_WINDOW=granted"]
 fn residual_rms_capture_gpu() -> Result<()> {
@@ -3206,6 +3345,7 @@ fn residual_rms_capture_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let device = Device::new(0)?;
+    invariant_gated_norm(&device)?;
     let stream = &device.stream;
     let ops = Ops::new(&device.ctx)?;
     let common = CommonOpsRef::new(&device.ctx)?;
@@ -3214,7 +3354,7 @@ fn residual_rms_capture_gpu() -> Result<()> {
     let mut controls = 0;
     let mut defects = 0;
     for hidden in [2048usize, 5120] {
-        for rows in [1usize, 5, 16, 17, 256, 4096] {
+        for rows in (1usize..=17).chain([256, 4096]) {
             for mode in [RmsMode::Standard, RmsMode::ZeroCentered] {
                 let total = rows + 2;
                 let active = if rows == 1 { 1 } else { rows - 1 };
@@ -3258,6 +3398,12 @@ fn residual_rms_capture_gpu() -> Result<()> {
                 let mut baseline_output =
                     TensorMut(view(&baseline_normalized, stream, shape, strides)?);
                 let options = RmsOptions { mode, eps: 1e-6 };
+                let (_one_metadata, one_sequence) = meta(stream, 0, 1, 32)?;
+                let one_domain = RowDomain {
+                    meta: one_sequence,
+                    row_base: 0,
+                    row_capacity: 1,
+                };
                 match mode {
                     RmsMode::ZeroCentered => {
                         let offset = (hidden * std::mem::size_of::<bf16>()) as u64;
@@ -3271,32 +3417,55 @@ fn residual_rms_capture_gpu() -> Result<()> {
                                 .arg(&((rows * hidden) as i32))
                                 .launch(super::ops::flat(rows * hidden))?;
                         }
-                        common.norm.rms_with(
-                            stream,
-                            domain,
-                            baseline_view.0,
-                            weight_view,
-                            &mut baseline_output,
-                            options,
-                        )?;
+                        for row in 1..=active {
+                            let offset = (row * hidden * size_of::<bf16>()) as u64;
+                            // SAFETY: each retained row is inside the original dense allocation.
+                            let (input, mut output) = unsafe {
+                                (
+                                    Tensor::new(
+                                        baseline_view.0.ptr + offset,
+                                        [1, 1, hidden as u32],
+                                        strides,
+                                        (hidden * 2) as u64,
+                                    )?,
+                                    TensorMut(Tensor::new(
+                                        baseline_output.0.ptr + offset,
+                                        [1, 1, hidden as u32],
+                                        strides,
+                                        (hidden * 2) as u64,
+                                    )?),
+                                )
+                            };
+                            common.norm.rms_with(
+                                stream,
+                                one_domain,
+                                input,
+                                weight_view,
+                                &mut output,
+                                options,
+                            )?;
+                        }
                     }
                     RmsMode::Standard => {
-                        let offset = (hidden * std::mem::size_of::<bf16>()) as u64;
-                        let rp = baseline_view.0.ptr + offset;
-                        let xp = addend_view.ptr + offset;
-                        let yp = baseline_output.0.ptr + offset;
-                        unsafe {
-                            stream
-                                .launch_builder(&ops.add_norm)
-                                .arg(&xp)
-                                .arg(&rp)
-                                .arg(&weight_view.ptr)
-                                .arg(&yp)
-                                .arg(&rp)
-                                .arg(&(active as i32))
-                                .arg(&(hidden as i32))
-                                .arg(&options.eps)
-                                .launch(grid(active, 256))?;
+                        for row in 1..=active {
+                            let offset = (row * hidden * size_of::<bf16>()) as u64;
+                            let rp = baseline_view.0.ptr + offset;
+                            let xp = addend_view.ptr + offset;
+                            let yp = baseline_output.0.ptr + offset;
+                            // SAFETY: pointers cover this one row in the preallocated baseline buffers.
+                            unsafe {
+                                stream
+                                    .launch_builder(&ops.add_norm)
+                                    .arg(&xp)
+                                    .arg(&rp)
+                                    .arg(&weight_view.ptr)
+                                    .arg(&yp)
+                                    .arg(&rp)
+                                    .arg(&1i32)
+                                    .arg(&(hidden as i32))
+                                    .arg(&options.eps)
+                                    .launch(grid(1, 256))?;
+                            }
                         }
                     }
                 }
@@ -3351,6 +3520,21 @@ fn residual_rms_capture_gpu() -> Result<()> {
                     Ok(usize::from(mismatch != 0))
                 };
                 let cell_before = defects;
+                if matches!(mode, RmsMode::ZeroCentered) {
+                    common.norm.rms_with(
+                        stream,
+                        domain,
+                        baseline_view.0,
+                        weight_view,
+                        &mut baseline_output,
+                        options,
+                    )?;
+                    defects += check(
+                        "batch_rms_vs_M1",
+                        &stream.clone_dtoh(&baseline_normalized)?,
+                        &expected_normalized,
+                    )?;
+                }
                 defects += check("residual", &actual_residual, &expected_residual)?;
                 defects += check("normalization", &actual_normalized, &expected_normalized)?;
                 let mut expected_capture = vec![sentinel; total * 5 * hidden];

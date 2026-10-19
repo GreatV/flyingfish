@@ -268,6 +268,7 @@ fn invariant_decode(device: &Device) -> Result<()> {
     let layout = ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry)?;
     let shape = cpu::Shape::new(h, i)?;
     let mut cpu_scratch = cpu::Scratch::new(&shape);
+    device.finish_upload()?;
     let mut defects = 0;
     for format in [ExpertFormat::Bf16, ExpertFormat::Fp8W8a16] {
         let slot = (format == ExpertFormat::Fp8W8a16)
