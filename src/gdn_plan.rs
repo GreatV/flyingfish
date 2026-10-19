@@ -65,9 +65,9 @@ pub const fn cw_p2_bytes(value_heads: u32, max_rows: u32) -> u64 {
 /// The chunkwise-P2 stage ABI: field order is the argument order in `kernels/gdn/gdn_cw_p2.cu`.
 #[derive(Copy, Clone)]
 pub struct P2StageArgs {
-    /// h32: scaled FP32 [M,32,128]. h48: BF16 [M,16,128], expanded/scaled on load.
+    /// Scaled FP32 [M, hv, 128].
     pub q: u64,
-    /// h32: FP32 [M,32,128]. h48: BF16 [M,16,128], expanded on load.
+    /// FP32 [M, hv, 128].
     pub k: u64,
     /// BF16 [M, hv, 128] rows, `v_row_stride` elements apart.
     pub v: u64,
@@ -126,7 +126,7 @@ impl GdnPolicy {
     }
     pub const fn identity(self) -> &'static str {
         if self.cw_p2 {
-            "gdn-plan-v3-c32-vs1-fp32-p2-w32"
+            "gdn-plan-v4-c32-vs1-l2fp32-p2-w32"
         } else {
             GdnSpec::PLAN_ID
         }
@@ -157,11 +157,6 @@ pub struct Region {
 pub struct GdnWorkspace {
     /// `[R, conv_dim]` BF16 — the conv result, SiLU'd in place; there is no `act` region.
     pub conv_out: Region,
-    /// `[R, hk, dk]` BF16 Q after `l2_heads`; empty for FP32 normalization.
-    pub q_bf16: Region,
-    /// `[R, hk, dk]` BF16 K after `l2_heads`; empty for FP32 normalization.
-    pub k_bf16: Region,
-    // No `v_bf16` region: `gdn_prep_fp32` reads V in place from `conv_out` at row stride conv_dim.
     /// `[R, hv]` BF16 — `beta = BF16(sigmoid(b))`, as emitted by `gdn_gates`.
     pub beta: Region,
     /// `[R, hv]` FP32 — the exact widen of `beta`; both cores read `const float* beta`.
@@ -198,20 +193,10 @@ impl GdnWorkspace {
         let rows = u64::from(max_rows);
         let hd = u64::from(spec.hv);
         let dv = u64::from(spec.dv);
-        let hk = u64::from(spec.hk);
-        let dk = u64::from(spec.dk);
 
         let hd_dv = mul(hd, dv)?;
-        let hk_dk = mul(hk, dk)?;
-        let normalized_bf16 = if spec.qk_norm_fp32 {
-            0
-        } else {
-            mul(rows, mul(hk_dk, 2)?)?
-        };
         let sizes = [
             mul(rows, mul(conv_dim, 2)?)?, // conv_out  BF16 [R, conv_dim]
-            normalized_bf16,               // q_bf16    BF16 [R, hk, dk], BF16-L2 only
-            normalized_bf16,               // k_bf16    BF16 [R, hk, dk], BF16-L2 only
             mul(rows, mul(hd, 2)?)?,       // beta       BF16 [R, hv]
             mul(rows, mul(hd, 4)?)?,       // beta_fp32  FP32 [R, hv]
             mul(rows, mul(hd, 4)?)?,       // g          FP32 [R, hv]
@@ -223,7 +208,7 @@ impl GdnWorkspace {
         let mut r = [Region {
             offset: 0,
             bytes: 0,
-        }; 9];
+        }; 7];
         for (i, s) in sizes.iter().enumerate() {
             let padded = align(*s)?;
             r[i] = Region {
@@ -234,14 +219,12 @@ impl GdnWorkspace {
         }
         Ok(Self {
             conv_out: r[0],
-            q_bf16: r[1],
-            k_bf16: r[2],
-            beta: r[3],
-            beta_fp32: r[4],
-            g: r[5],
-            q_fp32: r[6],
-            k_fp32: r[7],
-            v_fp32: r[8],
+            beta: r[1],
+            beta_fp32: r[2],
+            g: r[3],
+            q_fp32: r[4],
+            k_fp32: r[5],
+            v_fp32: r[6],
             bytes: off,
             alignment: 256,
         })
@@ -303,7 +286,6 @@ mod tests {
         for hv in [32, 48] {
             let spec = GdnSpec {
                 hv,
-                qk_norm_fp32: hv == 32,
                 ..GdnSpec::q38()
             };
             let cd = (2 * spec.hk + hv) * 128;

@@ -640,23 +640,28 @@ impl BiasedWeight {
         name: &str,
         shape: [u32; 2],
         stored_shape: &[usize],
-        architecture: Architecture,
+        bias_mode: LinearBiasMode,
     ) -> Result<Self> {
-        let bias_mode = match (architecture, stored_shape.len()) {
-            (Architecture::MiniCpmV47, 4) => LinearBiasMode::AfterOutputRound,
-            (Architecture::MiniCpmV47, 2) | (Architecture::Qwen35Text, 2 | 5) => {
-                LinearBiasMode::BeforeOutputRound
-            }
-            _ => bail!(
-                "unsupported biased vision projection: architecture={architecture:?} stored_shape={stored_shape:?}"
-            ),
-        };
         Ok(Self {
             weight: take(catalog, &format!("{name}.weight"), stored_shape)?,
             bias: take(catalog, &format!("{name}.bias"), &[shape[0] as usize])?,
             shape,
             bias_mode,
         })
+    }
+    fn patch(
+        catalog: &mut WeightCatalog,
+        name: &str,
+        shape: [u32; 2],
+        stored_shape: &[usize],
+    ) -> Result<Self> {
+        Self::take(
+            catalog,
+            name,
+            shape,
+            stored_shape,
+            LinearBiasMode::AfterOutputRound,
+        )
     }
     fn prepare(&self, stream: &Arc<CudaStream>, blas: &mut Blas, rows: u32) -> Result<()> {
         blas.prepare_biased(
@@ -771,12 +776,11 @@ impl VisionWeights {
         let window_width = (merge * merge) as usize * mlp_usize;
         let (patch, position, post_norm, blocks, window, merger, expected) = match architecture {
             Architecture::Qwen35Text => {
-                let patch = BiasedWeight::take(
+                let patch = BiasedWeight::patch(
                     catalog,
                     "model.visual.patch_embed.proj",
                     [hidden, geometry.patch],
                     &patch_shape,
-                    architecture,
                 )?;
                 let position = take(
                     catalog,
@@ -793,14 +797,14 @@ impl VisionWeights {
                             &format!("{p}.attn.qkv"),
                             [3 * hidden, hidden],
                             &[3 * hidden_usize, hidden_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?),
                         projection: BiasedWeight::take(
                             catalog,
                             &format!("{p}.attn.proj"),
                             [hidden, hidden],
                             &[hidden_usize, hidden_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?,
                         norm2: AffineWeights::take(catalog, &format!("{p}.norm2"), hidden)?,
                         fc1: BiasedWeight::take(
@@ -808,14 +812,14 @@ impl VisionWeights {
                             &format!("{p}.mlp.linear_fc1"),
                             [mlp, hidden],
                             &[mlp_usize, hidden_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?,
                         fc2: BiasedWeight::take(
                             catalog,
                             &format!("{p}.mlp.linear_fc2"),
                             [hidden, mlp],
                             &[hidden_usize, mlp_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?,
                     });
                 }
@@ -826,14 +830,14 @@ impl VisionWeights {
                         "model.visual.merger.linear_fc1",
                         [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
                         &[fc1_usize, fc1_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         "model.visual.merger.linear_fc2",
                         [geometry.output(), geometry.spec.merger_fc1],
                         &[output_usize, fc1_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                 };
                 (
@@ -847,12 +851,11 @@ impl VisionWeights {
                 )
             }
             Architecture::MiniCpmV47 => {
-                let patch = BiasedWeight::take(
+                let patch = BiasedWeight::patch(
                     catalog,
                     "model.vision_tower.embeddings.patch_embedding",
                     [hidden, geometry.patch],
                     &patch_shape,
-                    architecture,
                 )?;
                 let position = take(
                     catalog,
@@ -873,7 +876,7 @@ impl VisionWeights {
                         &format!("{prefix}.self_attn.{name}_proj"),
                         [hidden, hidden],
                         &[hidden_usize, hidden_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )
                 };
                 let mut blocks = Vec::with_capacity(depth as usize);
@@ -893,14 +896,14 @@ impl VisionWeights {
                             &format!("{p}.mlp.fc1"),
                             [mlp, hidden],
                             &[mlp_usize, hidden_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?,
                         fc2: BiasedWeight::take(
                             catalog,
                             &format!("{p}.mlp.fc2"),
                             [hidden, mlp],
                             &[hidden_usize, mlp_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?,
                     });
                 }
@@ -921,14 +924,14 @@ impl VisionWeights {
                         &format!("{p}.linear_1"),
                         [merge * merge * mlp, geometry.spec.merger_fc1],
                         &[window_width, fc1_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         &format!("{p}.linear_2"),
                         [hidden, merge * merge * mlp],
                         &[hidden_usize, window_width],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                 };
                 let m = "model.merger.mlp.0";
@@ -943,14 +946,14 @@ impl VisionWeights {
                         &format!("{m}.linear_1"),
                         [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
                         &[fc1_usize, fc1_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         &format!("{m}.linear_2"),
                         [geometry.output(), geometry.spec.merger_fc1],
                         &[output_usize, fc1_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                 };
                 let expected = 2 + 1 + 2 + depth as usize * 16 + 16 + 6;
@@ -3229,6 +3232,7 @@ mod tests {
     #[ignore = "requires FF_Q38_VISION_WINDOW=granted and FF_Q38_VISION_OUTPUT_DIR"]
     fn vision_merger_bias_rounding_gpu() -> Result<()> {
         use crate::backend::cuda::{closure::Closure, ops::Ops};
+        use cudarc::driver::DevicePtr;
         use std::{path::PathBuf, rc::Rc, time::Instant};
         ensure!(
             std::env::var("FF_Q38_VISION_WINDOW").as_deref() == Ok("granted"),
@@ -3246,139 +3250,164 @@ mod tests {
         let mut blas = Blas::new(&device, &ops, &output, closure.clone())?;
         closure.freeze_fixed()?;
         closure.ready(Instant::now())?;
+        let mut patch_defects = 0;
         {
             use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
             use std::collections::BTreeMap;
 
-            let stored_shape = [1152usize, 3, 14, 14];
-            let width = stored_shape[0] as u32;
-            let input = stored_shape[1..].iter().product::<usize>() as u32;
-            let half_ulp = bf16::from_f32(bf16::EPSILON.to_f32() / 2.0);
-            let mut weight = vec![bf16::ZERO; (width * input) as usize];
-            let mut bias = Vec::with_capacity(width as usize);
-            for (column, values) in weight.chunks_exact_mut(input as usize).enumerate() {
-                let sign = if column < width as usize / 2 {
-                    1.0
-                } else {
-                    -1.0
-                };
-                values[0] = bf16::from_f32(sign);
-                values[1] = bf16::from_f32(sign * half_ulp.to_f32());
-                bias.push(values[1]);
-            }
-            let prefix = "model.vision_tower.embeddings.patch_embedding";
-            let mut tensors = BTreeMap::new();
-            let mut entries = BTreeMap::new();
-            let mut bytes = 0;
-            for (suffix, shape, values) in [
-                ("weight", stored_shape.to_vec(), weight),
-                ("bias", vec![width as usize], bias),
+            for (prefix, stored_shape) in [
+                (
+                    "model.vision_tower.embeddings.patch_embedding",
+                    vec![1152usize, 3, 14, 14],
+                ),
+                (
+                    "model.visual.patch_embed.proj",
+                    vec![1152usize, 3, 2, 16, 16],
+                ),
             ] {
-                let name = format!("{prefix}.{suffix}");
-                let size = values.len() * size_of::<bf16>();
-                tensors.insert(name.clone(), StoredTensor::Bf16(s.clone_htod(&values)?));
-                entries.insert(
-                    name,
-                    TensorEntry {
-                        dtype: safetensors::Dtype::BF16,
-                        shape,
-                        shard: "patch-fixture.safetensors".into(),
-                        bytes: size,
-                        load: true,
-                        data_start: 0,
-                        data_offsets: [0, size as u64],
-                        scope: TensorScope::Vision,
-                        layer: None,
-                        role: suffix.into(),
-                        scale_name: None,
-                    },
-                );
-                bytes += size;
-            }
-            let mut catalog = WeightCatalog {
-                linear_format: crate::model_spec::LinearFormat::Bf16,
-                tensors,
-                manifest: TensorManifest {
-                    entries,
-                    resident_bytes: bytes,
-                },
-                bytes,
-                upload_content_sha256: None,
-                upload_hashed_bytes: None,
-                load_wall_ms: 0.0,
-            };
-            let patch = BiasedWeight::take(
-                &mut catalog,
-                prefix,
-                [width, input],
-                &stored_shape,
-                Architecture::MiniCpmV47,
-            )?;
-            for rows in [1u32, 37, 1120, 7104] {
-                let mut host = vec![bf16::ZERO; (rows * input) as usize];
-                for row in host.chunks_exact_mut(input as usize) {
-                    row[..2].fill(bf16::ONE);
-                }
-                let x = s.clone_htod(&host)?;
-                let y = s.alloc_zeros::<bf16>((rows * width) as usize)?;
-                for mode in [
-                    LinearBiasMode::AfterOutputRound,
-                    LinearBiasMode::BeforeOutputRound,
-                    LinearBiasMode::AfterOutputRound,
-                ] {
-                    match mode {
-                        LinearBiasMode::AfterOutputRound => patch.prepare(s, &mut blas, rows)?,
-                        LinearBiasMode::BeforeOutputRound => blas.prepare_biased(
-                            rows,
-                            width,
-                            input,
-                            dense(&patch.bias, s, [width])?,
-                            mode,
-                        )?,
-                    }
-                    match mode {
-                        LinearBiasMode::AfterOutputRound => patch.run(
-                            s,
-                            &blas,
-                            dense(&x, s, [rows, input])?,
-                            &mut TensorMut(dense(&y, s, [rows, width])?),
-                        )?,
-                        LinearBiasMode::BeforeOutputRound => blas.linear_biased(
-                            dense(&patch.weight, s, [width, input])?,
-                            dense(&patch.bias, s, [width])?,
-                            dense(&x, s, [rows, input])?,
-                            &mut TensorMut(dense(&y, s, [rows, width])?),
-                            mode,
-                        )?,
-                    }
-                    let magnitude = match mode {
-                        LinearBiasMode::AfterOutputRound => 1.0,
-                        LinearBiasMode::BeforeOutputRound => 1.0 + 2.0 * half_ulp.to_f32(),
+                let width = stored_shape[0] as u32;
+                let input = stored_shape[1..].iter().product::<usize>() as u32;
+                let half_ulp = bf16::from_f32(bf16::EPSILON.to_f32() / 2.0);
+                let mut weight = vec![bf16::ZERO; (width * input) as usize];
+                let mut bias = Vec::with_capacity(width as usize);
+                for (column, values) in weight.chunks_exact_mut(input as usize).enumerate() {
+                    let sign = if column < width as usize / 2 {
+                        1.0
+                    } else {
+                        -1.0
                     };
-                    let wrong = s
-                        .clone_dtoh(&y)?
-                        .iter()
-                        .enumerate()
-                        .filter(|(index, value)| {
-                            let sign = if index % (width as usize) < width as usize / 2 {
-                                1.0
-                            } else {
-                                -1.0
-                            };
-                            value.to_bits() != bf16::from_f32(sign * magnitude).to_bits()
-                        })
-                        .count();
-                    println!(
-                        "{} vision_patch_bias_rounding rows={rows} width={width} input={input} mode={mode:?} bit_mismatches={wrong}",
-                        if wrong == 0 { "PASS" } else { "DEFECT" }
+                    values[0] = bf16::from_f32(sign);
+                    values[1] = bf16::from_f32(sign * half_ulp.to_f32());
+                    bias.push(values[1]);
+                }
+                let mut tensors = BTreeMap::new();
+                let mut entries = BTreeMap::new();
+                let mut bytes = 0;
+                for (suffix, shape, values) in [
+                    ("weight", stored_shape.to_vec(), weight),
+                    ("bias", vec![width as usize], bias),
+                ] {
+                    let name = format!("{prefix}.{suffix}");
+                    let size = values.len() * size_of::<bf16>();
+                    tensors.insert(name.clone(), StoredTensor::Bf16(s.clone_htod(&values)?));
+                    entries.insert(
+                        name,
+                        TensorEntry {
+                            dtype: safetensors::Dtype::BF16,
+                            shape,
+                            shard: "patch-fixture.safetensors".into(),
+                            bytes: size,
+                            load: true,
+                            data_start: 0,
+                            data_offsets: [0, size as u64],
+                            scope: TensorScope::Vision,
+                            layer: None,
+                            role: suffix.into(),
+                            scale_name: None,
+                        },
                     );
-                    ensure!(
-                        wrong == 0,
-                        "patch bias mode={mode:?}: rows={rows}, {wrong} wrong elements"
-                    );
+                    bytes += size;
+                }
+                let mut catalog = WeightCatalog {
+                    linear_format: crate::model_spec::LinearFormat::Bf16,
+                    tensors,
+                    manifest: TensorManifest {
+                        entries,
+                        resident_bytes: bytes,
+                    },
+                    bytes,
+                    upload_content_sha256: None,
+                    upload_hashed_bytes: None,
+                    load_wall_ms: 0.0,
+                };
+                let patch =
+                    BiasedWeight::patch(&mut catalog, prefix, [width, input], &stored_shape)?;
+                let bias_pointer = patch.bias.device_ptr(s).0;
+                for rows in [1u32, 37, 1120, 7104] {
+                    let mut host = vec![bf16::ZERO; (rows * input) as usize];
+                    for row in host.chunks_exact_mut(input as usize) {
+                        row[..2].fill(bf16::ONE);
+                    }
+                    let x = s.clone_htod(&host)?;
+                    let y = s.alloc_zeros::<bf16>((rows * width) as usize)?;
+                    if rows == 1 {
+                        ensure!(
+                            patch
+                                .run(
+                                    s,
+                                    &blas,
+                                    dense(&x, s, [rows, input])?,
+                                    &mut TensorMut(dense(&y, s, [rows, width])?),
+                                )
+                                .is_err(),
+                            "unprepared patch projection executed after Ready"
+                        );
+                    }
+                    for mode in [
+                        LinearBiasMode::AfterOutputRound,
+                        LinearBiasMode::BeforeOutputRound,
+                        LinearBiasMode::AfterOutputRound,
+                    ] {
+                        match mode {
+                            LinearBiasMode::AfterOutputRound => {
+                                patch.prepare(s, &mut blas, rows)?
+                            }
+                            LinearBiasMode::BeforeOutputRound => blas.prepare_biased(
+                                rows,
+                                width,
+                                input,
+                                dense(&patch.bias, s, [width])?,
+                                mode,
+                            )?,
+                        }
+                        match mode {
+                            LinearBiasMode::AfterOutputRound => patch.run(
+                                s,
+                                &blas,
+                                dense(&x, s, [rows, input])?,
+                                &mut TensorMut(dense(&y, s, [rows, width])?),
+                            )?,
+                            LinearBiasMode::BeforeOutputRound => blas.linear_biased(
+                                dense(&patch.weight, s, [width, input])?,
+                                dense(&patch.bias, s, [width])?,
+                                dense(&x, s, [rows, input])?,
+                                &mut TensorMut(dense(&y, s, [rows, width])?),
+                                mode,
+                            )?,
+                        }
+                        let magnitude = match mode {
+                            LinearBiasMode::AfterOutputRound => 1.0,
+                            LinearBiasMode::BeforeOutputRound => 1.0 + 2.0 * half_ulp.to_f32(),
+                        };
+                        let wrong = s
+                            .clone_dtoh(&y)?
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, value)| {
+                                let sign = if index % (width as usize) < width as usize / 2 {
+                                    1.0
+                                } else {
+                                    -1.0
+                                };
+                                value.to_bits() != bf16::from_f32(sign * magnitude).to_bits()
+                            })
+                            .count();
+                        ensure!(
+                            patch.bias.device_ptr(s).0 == bias_pointer,
+                            "patch preparation moved the bias pointer"
+                        );
+                        patch_defects += usize::from(wrong != 0);
+                        println!(
+                            "{} vision_patch_bias_rounding projection={prefix} stored_shape={stored_shape:?} rows={rows} width={width} input={input} mode={mode:?} bit_mismatches={wrong}",
+                            if wrong == 0 { "PASS" } else { "DEFECT" }
+                        );
+                    }
                 }
             }
         }
+        println!(
+            "VISION_PATCH_BIAS_SUMMARY layouts=2 row_shapes=4 request_modes=3 defects={patch_defects}"
+        );
         let input = 4608u32;
         let half_ulp = bf16::from_f32(1.0 / 256.0);
         // The dot product is a BF16 midpoint. Adding bias before conversion
@@ -3416,6 +3445,10 @@ mod tests {
             }
         }
         closure.assert_ready()?;
+        ensure!(
+            patch_defects == 0,
+            "VISION_PATCH_BIAS DEFECT cases={patch_defects}"
+        );
         Ok(())
     }
 

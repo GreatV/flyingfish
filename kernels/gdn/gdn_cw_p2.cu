@@ -1,8 +1,7 @@
 // GDN chunkwise prefill as two kernels, C = 64, with FP32 accumulators.
 // Stage H uses BF16 high/residual Q/K terms for 32 value heads.
 //
-//   h32 Q/K sources are expanded FP32 [M,32,128], with Q already scaled.
-//   h48 Q/K sources are BF16 [M,16,128], expanded at load and Q scaled by 1/sqrt(DK).
+//   Q/K sources are expanded FP32 [M,HV,128], with Q already scaled.
 //   beta and g are FP32.
 //
 //   stage A  grid (nchunk, P2_HEADS): gates and the cumsum, A = -tril(...), the blocked
@@ -40,9 +39,6 @@
 #endif
 #define P2_HEADS GDN_HEADS
 #define P2_MT      (P2_C / 16)          // row tiles of 16
-#define P2_KHEADS  16                   // KEY heads in the projection's Q and K
-#define P2_GQA     (P2_HEADS / P2_KHEADS)   // value head -> key head, h / GQA
-#define P2_KROW    (P2_KHEADS * P2_DK)  // a KEY-head row of the bf16 sources
 #define P2_NT_C    (P2_C / 8)           // column tiles of 8 in the [C][C] products
 #define P2_VL      72                    // sV row stride for the CHUNK axis, bf16 (+8 off 64)
 #define P2_VLDK    136                   // sV row stride for the d_k axis, bf16 (+8 off 128)
@@ -50,21 +46,8 @@
 #define P2_T_LD    72                    // sT row stride, bf16 (+8 off 64)
 
 // One arena for both stages, in order: sA | sT | sV | sVn | sG | sBeta | sSc.
-#if GDN_HEADS == 32
-using P2Qk = float;
 #define P2_QK_ROW (P2_HEADS * P2_DK)
-#define P2_QK_HEAD(h) (h)
 #define P2_QUERY_SCALE 1.0f
-__device__ __forceinline__ float p2_qk_float(float value) { return value; }
-#else
-using P2Qk = __nv_bfloat16;
-#define P2_QK_ROW P2_KROW
-#define P2_QK_HEAD(h) ((h) / P2_GQA)
-#define P2_QUERY_SCALE (1.0f / sqrtf((float)P2_DK))
-__device__ __forceinline__ float p2_qk_float(__nv_bfloat16 value) {
-    return __bfloat162float(value);
-}
-#endif
 
 #define P2_SMEM_BYTES GDN_CW_P2_SMEM_BYTES
 
@@ -119,33 +102,33 @@ __device__ __forceinline__ uint32_t p1_pack(float lo, float hi) {
 
 // A from Q/K source rows, one scale per row (beta, and the q liveness mask): register 1 is the
 // +8 row at the low columns and register 2 the base row at the +8 columns. `qscale` is
-// 1/sqrt(DK) for h48 Q and 1.0f otherwise, applied before the row scale.
+// 1.0f for the prepared Q/K sources, applied before the row scale.
 template<bool Residual = false>
-__device__ __forceinline__ AFrag p1_a_rows(const P2Qk* lo, const P2Qk* hi,
+__device__ __forceinline__ AFrag p1_a_rows(const float* lo, const float* hi,
                                            int col0, int t2, float qscale,
                                            float s_lo, float s_hi) {
     AFrag f;
-    f.r[0] = p1_pack<Residual>(p2_qk_float(lo[col0 + t2]) * qscale * s_lo,
-                     p2_qk_float(lo[col0 + t2 + 1]) * qscale * s_lo);
-    f.r[1] = p1_pack<Residual>(p2_qk_float(hi[col0 + t2]) * qscale * s_hi,
-                     p2_qk_float(hi[col0 + t2 + 1]) * qscale * s_hi);
-    f.r[2] = p1_pack<Residual>(p2_qk_float(lo[col0 + t2 + 8]) * qscale * s_lo,
-                     p2_qk_float(lo[col0 + t2 + 9]) * qscale * s_lo);
-    f.r[3] = p1_pack<Residual>(p2_qk_float(hi[col0 + t2 + 8]) * qscale * s_hi,
-                     p2_qk_float(hi[col0 + t2 + 9]) * qscale * s_hi);
+    f.r[0] = p1_pack<Residual>(lo[col0 + t2] * qscale * s_lo,
+                     lo[col0 + t2 + 1] * qscale * s_lo);
+    f.r[1] = p1_pack<Residual>(hi[col0 + t2] * qscale * s_hi,
+                     hi[col0 + t2 + 1] * qscale * s_hi);
+    f.r[2] = p1_pack<Residual>(lo[col0 + t2 + 8] * qscale * s_lo,
+                     lo[col0 + t2 + 9] * qscale * s_lo);
+    f.r[3] = p1_pack<Residual>(hi[col0 + t2 + 8] * qscale * s_hi,
+                     hi[col0 + t2 + 9] * qscale * s_hi);
     return f;
 }
 
 // One element of (k . e^{G_last-G}) at chunk row ci and d_k column dk; the state update's A operand is the TRANSPOSE, so a register pair's two elements sit in DIFFERENT chunk rows at the SAME d_k column.
-__device__ __forceinline__ float p1_kdec(const P2Qk* kh, size_t ld, int row0,
+__device__ __forceinline__ float p1_kdec(const float* kh, size_t ld, int row0,
                                           int valid, int ci, int dk, const float* sG, float gl) {
     const int gr = row0 + ci;
     if (gr >= valid) return 0.0f;
-    return p2_qk_float(kh[(size_t)gr * ld + dk]) * __expf(gl - sG[ci]);
+    return kh[(size_t)gr * ld + dk] * __expf(gl - sG[ci]);
 }
 
 template<bool Residual = false>
-__device__ __forceinline__ AFrag p1_a_kdec(const P2Qk* kh, size_t ld, int row0,
+__device__ __forceinline__ AFrag p1_a_kdec(const float* kh, size_t ld, int row0,
                                            int valid, const float* sG, float gl, int dk, int t2) {
     const int c0 = t2;
     AFrag f;
@@ -161,13 +144,13 @@ __device__ __forceinline__ AFrag p1_a_kdec(const P2Qk* kh, size_t ld, int row0,
 }
 
 // B from a row-major Q/K source: fragment row n, columns 2tig + {0,1} and +8.
-__device__ __forceinline__ BFrag p1_b_rows(const P2Qk* p, int ld, int n, int col0,
+__device__ __forceinline__ BFrag p1_b_rows(const float* p, int ld, int n, int col0,
                                            int t2, float s0, float s1, float s8, float s9) {
-    const P2Qk* r = p + (size_t)n * ld;
+    const float* r = p + (size_t)n * ld;
     BFrag f;
-    f.r[0] = p1_pack(p2_qk_float(r[col0 + t2]) * s0, p2_qk_float(r[col0 + t2 + 1]) * s1);
-    f.r[1] = p1_pack(p2_qk_float(r[col0 + t2 + 8]) * s8,
-                     p2_qk_float(r[col0 + t2 + 9]) * s9);
+    f.r[0] = p1_pack(r[col0 + t2] * s0, r[col0 + t2 + 1] * s1);
+    f.r[1] = p1_pack(r[col0 + t2 + 8] * s8,
+                     r[col0 + t2 + 9] * s9);
     return f;
 }
 
@@ -219,11 +202,11 @@ __device__ __forceinline__ BFrag p1_b_sf32(const float* base, int ld, int n, int
 
 // One element of (beta . K . e^G) at chunk row ci, d_k column dk; the only GEMM whose
 // B fragment reads the input TRANSPOSED (fragment row = d_k index, column = chunk row).
-__device__ __forceinline__ float p1_kbg(const P2Qk* kh, size_t ld, int row0, int valid,
+__device__ __forceinline__ float p1_kbg(const float* kh, size_t ld, int row0, int valid,
                                         int ci, int dk, const float* sSc) {
     const int gr = row0 + ci;
-    const P2Qk* p = kh + (size_t)(gr < valid ? gr : row0) * ld + dk;
-    return p2_qk_float(p[0]) * sSc[ci];
+    const float* p = kh + (size_t)(gr < valid ? gr : row0) * ld + dk;
+    return p[0] * sSc[ci];
 }
 
 // D fragment -> FP32 shared, at (row0 + gid, col0 + 2*tig) and the +8 row.
@@ -296,8 +279,8 @@ __device__ __forceinline__ int p2_valid_rows(const GdnMeta* meta, int valid_rows
 // Stage A: one CTA per (chunk, head); no S dependency. Grid x is ceil(max_rows / P2_C);
 // CTAs past the valid chunks exit before the first barrier.
 extern "C" __global__ __launch_bounds__(P2_THREADS, 1)
-void gdn_cw_p2_stage_a(const P2Qk* __restrict__ q,
-                       const P2Qk* __restrict__ k,
+void gdn_cw_p2_stage_a(const float* __restrict__ q,
+                       const float* __restrict__ k,
                        const __nv_bfloat16* __restrict__ v,  // BF16 [M, HEADS, DV] VALUE heads
                        const float* __restrict__ beta,// FP32 [M, HEADS]
                        const float* __restrict__ g,   // FP32 [M, HEADS]
@@ -340,8 +323,8 @@ void gdn_cw_p2_stage_a(const P2Qk* __restrict__ q,
 
     // Q/K source rows follow P2_QK_ROW; V rows are v_row_stride elements apart.
     constexpr size_t rstride = P2_QK_ROW;
-    const P2Qk* const kh = k + (size_t)P2_QK_HEAD(head) * P2_DK;
-    const P2Qk* const qh = q + (size_t)P2_QK_HEAD(head) * P2_DK;
+    const float* const kh = k + (size_t)head * P2_DK;
+    const float* const qh = q + (size_t)head * P2_DK;
     const __nv_bfloat16* const vh = v + (size_t)head * P2_DV;
     const float qscale = P2_QUERY_SCALE;
 
@@ -365,9 +348,9 @@ void gdn_cw_p2_stage_a(const P2Qk* __restrict__ q,
     for (int tile = warp; tile < P2_MT * P2_NT_C; tile += P2_WARPS) {
         const int mt = tile / P2_NT_C, nt = tile - mt * P2_NT_C;
         const int cl = mt * 16 + gid, ch = cl + 8, bn = nt * 8 + gid;
-        const P2Qk* al = kh + (size_t)((row0 + cl) < valid_rows ? row0 + cl : row0) * rstride;
-        const P2Qk* ah = kh + (size_t)((row0 + ch) < valid_rows ? row0 + ch : row0) * rstride;
-        const P2Qk* bp = kh + (size_t)((row0 + bn) < valid_rows ? row0 + bn : row0) * rstride;
+        const float* al = kh + (size_t)((row0 + cl) < valid_rows ? row0 + cl : row0) * rstride;
+        const float* ah = kh + (size_t)((row0 + ch) < valid_rows ? row0 + ch : row0) * rstride;
+        const float* bp = kh + (size_t)((row0 + bn) < valid_rows ? row0 + bn : row0) * rstride;
         const float sl = sBeta[cl], sh = sBeta[ch];     // zero on a dead row
         float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         #pragma unroll
@@ -588,9 +571,9 @@ void gdn_cw_p2_stage_a(const P2Qk* __restrict__ q,
     for (int tile = warp; tile < P2_MT * P2_NT_C; tile += P2_WARPS) {
         const int mt = tile / P2_NT_C, nt = tile - mt * P2_NT_C;
         const int cl = mt * 16 + gid, ch = cl + 8, bn = nt * 8 + gid;
-        const P2Qk* al = qh + (size_t)((row0 + cl) < valid_rows ? row0 + cl : row0) * rstride;
-        const P2Qk* ah = qh + (size_t)((row0 + ch) < valid_rows ? row0 + ch : row0) * rstride;
-        const P2Qk* bp = kh + (size_t)((row0 + bn) < valid_rows ? row0 + bn : row0) * rstride;
+        const float* al = qh + (size_t)((row0 + cl) < valid_rows ? row0 + cl : row0) * rstride;
+        const float* ah = qh + (size_t)((row0 + ch) < valid_rows ? row0 + ch : row0) * rstride;
+        const float* bp = kh + (size_t)((row0 + bn) < valid_rows ? row0 + bn : row0) * rstride;
         const float sl = (row0 + cl) < valid_rows ? 1.0f : 0.0f;
         const float sh = (row0 + ch) < valid_rows ? 1.0f : 0.0f;
         const float sb = (row0 + bn) < valid_rows ? 1.0f : 0.0f;
@@ -630,8 +613,8 @@ void gdn_cw_p2_stage_a(const P2Qk* __restrict__ q,
 // Stage H: one CTA per (32-wide value strip, head), the chunk loop in order,
 // S[:, j0:j0+32] in registers. v, beta and g are not read.
 extern "C" __global__ __launch_bounds__(P2_THREADS, 1)
-void gdn_cw_p2_stage_h(const P2Qk* __restrict__ q,
-                       const P2Qk* __restrict__ k,
+void gdn_cw_p2_stage_h(const float* __restrict__ q,
+                       const float* __restrict__ k,
                        const __nv_bfloat16* __restrict__ v,
                        const float* __restrict__ beta,
                        const float* __restrict__ g,
@@ -669,8 +652,8 @@ void gdn_cw_p2_stage_h(const P2Qk* __restrict__ q,
     float* const sSc = ar.sSc;
 
     constexpr size_t rstride = P2_QK_ROW;
-    const P2Qk* const kh = k + (size_t)P2_QK_HEAD(head) * P2_DK;
-    const P2Qk* const qh = q + (size_t)P2_QK_HEAD(head) * P2_DK;
+    const float* const kh = k + (size_t)head * P2_DK;
+    const float* const qh = q + (size_t)head * P2_DK;
     const float qscale = P2_QUERY_SCALE;
 
     // S[:, j0:j0+VW] stays in registers for the whole call; every index into Sr is
@@ -786,9 +769,9 @@ void gdn_cw_p2_stage_h(const P2Qk* __restrict__ q,
         for (int tile = warp; tile < P2_MT * NT; tile += P2_WARPS) {
             const int mt = tile / NT, nt = tile - (tile / NT) * NT;
             const int cl = mt * 16 + gid, ch = cl + 8;
-            const P2Qk* al =
+            const float* al =
                 qh + (size_t)((row0 + cl) < valid_rows ? row0 + cl : row0) * rstride;
-            const P2Qk* ah =
+            const float* ah =
                 qh + (size_t)((row0 + ch) < valid_rows ? row0 + ch : row0) * rstride;
             const float sl = (row0 + cl) < valid_rows ? __expf(sG[cl]) : 0.0f;
             const float sh = (row0 + ch) < valid_rows ? __expf(sG[ch]) : 0.0f;
