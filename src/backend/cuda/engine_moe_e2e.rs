@@ -460,6 +460,26 @@ impl Input {
     }
 }
 
+fn teacher_steps(source: &SafeTensors<'_>, case: &str) -> Result<usize> {
+    let steps = if case.starts_with("text_") { 64 } else { 32 };
+    let rows = [steps];
+    let pairs = [steps, 2];
+    for (key, expected) in [
+        ("greedy_token_ids", rows.as_slice()),
+        ("step_top2_ids", pairs.as_slice()),
+        ("step_top2_logits", pairs.as_slice()),
+        ("step_top2_margin", rows.as_slice()),
+    ] {
+        let actual = source.tensor(key)?;
+        ensure!(
+            actual.shape() == expected,
+            "teacher fixture {case}/{key} shape={:?}, expected={expected:?}",
+            actual.shape()
+        );
+    }
+    Ok(steps)
+}
+
 fn check_fixtures(fixtures: &Path, model_dir: &Path) -> Result<()> {
     let model = crate::model_spec::ModelSpec::read(model_dir)?;
     for case in [
@@ -474,6 +494,7 @@ fn check_fixtures(fixtures: &Path, model_dir: &Path) -> Result<()> {
     ] {
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
         let source = SafeTensors::deserialize(&bytes)?;
+        teacher_steps(&source, case)?;
         Bounds::read(fixtures, case)?;
         let input = if case.starts_with("video_") {
             Input::video(&source, model_dir, case)?
@@ -594,14 +615,7 @@ fn teacher_force(
     let top = integers(source, "step_top2_ids")?;
     let expected = floats(source, "step_top2_logits")?;
     let margins = floats(source, "step_top2_margin")?;
-    let steps = if case.starts_with("image_") { 32 } else { 64 };
-    ensure!(
-        ids.len() >= steps
-            && top.len() == steps * 2
-            && expected.len() == top.len()
-            && margins.len() == steps,
-        "teacher-forced fixture extents {case}"
-    );
+    let steps = teacher_steps(source, case)?;
     let mut outputs = Vec::with_capacity(steps);
     let mut errors = Vec::with_capacity(steps * 2);
     let (mut defects, mut scored) = (0, 0);
