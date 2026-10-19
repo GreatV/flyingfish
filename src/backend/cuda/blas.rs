@@ -679,12 +679,17 @@ impl Blas {
             ensure!(x.shape[0] == 1, "Decode requires M1");
         }
         match weight {
-            LinearWeightRef::BlockFp8 { codes, scale } => {
+            LinearWeightRef::Fp8 {
+                codes,
+                scale,
+                layout,
+            } => {
                 ensure!(
                     crate::linear_plan::direct_fp8_rows(x.shape[0] as usize),
                     "M>5 Prefill requires materialized BF16 weight"
                 );
-                self.fp8_ops()?.small_gemm(&self.stream, codes, scale, x, y)
+                self.fp8_ops()?
+                    .small_gemm(&self.stream, codes, scale, layout, x, y)
             }
             LinearWeightRef::Bf16(w) => {
                 w.validate()?;

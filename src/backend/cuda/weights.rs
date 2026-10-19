@@ -193,11 +193,7 @@ impl Drop for ExpertStorage {
 use crate::checkpoint::{Index, MappedCheckpoint, TensorEntry, TensorManifest};
 
 fn upload_entry(entry: &TensorEntry) -> bool {
-    entry.load
-        && !matches!(
-            entry.role.as_str(),
-            "mlp.experts.gate_up_proj" | "mlp.experts.down_proj"
-        )
+    entry.load && !entry.is_routed_expert()
 }
 
 pub(crate) struct Loader<'a> {
@@ -584,6 +580,7 @@ pub(crate) enum StoredTensor {
     Fp8(CudaSlice<u8>),
 }
 pub(crate) struct WeightCatalog {
+    pub linear_format: crate::model_spec::LinearFormat,
     pub tensors: BTreeMap<String, StoredTensor>,
     pub manifest: TensorManifest,
     pub bytes: usize,
@@ -680,6 +677,7 @@ impl WeightCatalog {
             manifest.resident_bytes
         );
         Ok(Self {
+            linear_format: spec.linear_format,
             tensors,
             manifest,
             bytes,
@@ -912,15 +910,32 @@ mod tests {
     #[test]
     fn expert_upload_partition_preserves_other_three_dimensional_weights() {
         let entries = [
-            ("mlp.experts.gate_up_proj", vec![2, 4, 4], true),
-            ("mlp.experts.down_proj", vec![2, 4, 2], true),
-            ("linear_attn.conv1d.weight", vec![4, 1, 4], true),
-            ("mlp.gate.weight", vec![2, 4], true),
-            ("vision.projection.weight", vec![4, 4], false),
+            ("mlp.experts.gate_up_proj", vec![2, 4, 4], true, Dtype::BF16),
+            ("mlp.experts.down_proj", vec![2, 4, 2], true, Dtype::BF16),
+            (
+                "mlp.experts.2.gate_proj.weight",
+                vec![4, 4],
+                true,
+                Dtype::F8_E4M3,
+            ),
+            (
+                "mlp.experts.2.gate_proj.weight_scale",
+                vec![4, 1],
+                true,
+                Dtype::BF16,
+            ),
+            (
+                "linear_attn.conv1d.weight",
+                vec![4, 1, 4],
+                true,
+                Dtype::BF16,
+            ),
+            ("mlp.gate.weight", vec![2, 4], true, Dtype::BF16),
+            ("vision.projection.weight", vec![4, 4], false, Dtype::BF16),
         ]
-        .map(|(role, shape, load)| TensorEntry {
-            dtype: Dtype::BF16,
-            bytes: shape.iter().product::<usize>() * 2,
+        .map(|(role, shape, load, dtype)| TensorEntry {
+            dtype,
+            bytes: shape.iter().product::<usize>() * dtype.bitsize() / 8,
             shape,
             shard: "native.safetensors".into(),
             load,
@@ -949,7 +964,7 @@ mod tests {
                 .filter(|entry| entry.load && !upload_entry(entry))
                 .map(|entry| entry.bytes)
                 .sum::<usize>(),
-            96
+            120
         );
     }
     #[test]

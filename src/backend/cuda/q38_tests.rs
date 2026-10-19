@@ -13,7 +13,7 @@ use super::{
     },
 };
 use crate::{
-    fp8::effective_weight,
+    fp8::{Fp8ScaleLayout, effective_weight},
     op_contract::{
         AttentionLimits, AttentionWorkspace, ExecutionPhase, FullAttentionSpec, SequenceMeta,
     },
@@ -23,7 +23,7 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelA
 use half::bf16;
 use std::{rc::Rc, sync::Arc};
 
-fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
+pub(super) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     b: &CudaSlice<T>,
     s: &Arc<CudaStream>,
     shape: [u32; R],
@@ -132,38 +132,57 @@ fn q38_primitives_gpu() -> Result<()> {
     uploaded?;
     let fp8 = Fp8Ops::new(&d.ctx)?;
     // All codes, including the two NaNs, plus non-integral 128-block scale tails.
-    for (n, k) in [(1u32, 256u32), (129, 257)] {
-        let codes: Vec<u8> = (0..n * k).map(|i| i as u8).collect();
-        let scales: Vec<bf16> = (0..n.div_ceil(128) * k.div_ceil(128))
-            .map(|i| bf16::from_f32([1.0078125, 0.03125, 3.140625][i as usize % 3]))
-            .collect();
-        let wb = s.clone_htod(&codes)?;
-        let sb = s.clone_htod(&scales)?;
-        let y = s.alloc_zeros::<bf16>((n * k) as usize)?;
-        let w = view(&wb, s, [n, k], [u64::from(k), 1])?;
-        let sc = view(
-            &sb,
-            s,
-            [n.div_ceil(128), k.div_ceil(128)],
-            [u64::from(k.div_ceil(128)), 1],
-        )?;
-        let mut out = TensorMut(view(&y, s, [n, k], [u64::from(k), 1])?);
-        fp8.materialize(s, w, sc, &mut out)?;
-        let got = s.clone_dtoh(&y)?;
-        for row in 0..n {
-            for col in 0..k {
-                let i = (row * k + col) as usize;
-                let want = effective_weight(
-                    codes[i],
-                    scales[((row / 128) * k.div_ceil(128) + col / 128) as usize],
-                );
-                ensure!(
-                    if want.to_f32().is_nan() {
-                        got[i].to_f32().is_nan()
-                    } else {
-                        got[i].to_bits() == want.to_bits()
-                    },
-                    "dequant mismatch at {n}x{k} ({row},{col})"
+    for layout in [Fp8ScaleLayout::Block128, Fp8ScaleLayout::PerChannel] {
+        for (n, k) in [(1u32, 256u32), (129, 257)] {
+            let codes: Vec<u8> = (0..n * k).map(|i| i as u8).collect();
+            let shape = layout.scale_shape(n, k).map(|v| v as u32);
+            let scales: Vec<bf16> = (0..shape[0] * shape[1])
+                .map(|i| bf16::from_f32([1.0078125, 0.03125, 3.140625][i as usize % 3]))
+                .collect();
+            let wb = s.clone_htod(&codes)?;
+            let mut sb = s.clone_htod(&scales)?;
+            let y = s.alloc_zeros::<bf16>((n * k) as usize)?;
+            let w = view(&wb, s, [n, k], [u64::from(k), 1])?;
+            let sc = view(&sb, s, shape, [u64::from(shape[1]), 1])?;
+            let mut out = TensorMut(view(&y, s, [n, k], [u64::from(k), 1])?);
+            fp8.materialize(s, w, sc, layout, &mut out)?;
+            let got = s.clone_dtoh(&y)?;
+            for row in 0..n {
+                for col in 0..k {
+                    let i = (row * k + col) as usize;
+                    let want = effective_weight(
+                        codes[i],
+                        scales[match layout {
+                            Fp8ScaleLayout::Block128 => {
+                                ((row / 128) * k.div_ceil(128) + col / 128) as usize
+                            }
+                            Fp8ScaleLayout::PerChannel => row as usize,
+                        }],
+                    );
+                    ensure!(
+                        if want.to_f32().is_nan() {
+                            got[i].to_f32().is_nan()
+                        } else {
+                            got[i].to_bits() == want.to_bits()
+                        },
+                        "dequant mismatch at {n}x{k} ({row},{col})"
+                    );
+                }
+            }
+            if layout == Fp8ScaleLayout::PerChannel && n > 1 {
+                let mut permuted = scales.clone();
+                permuted.rotate_left(1);
+                s.memcpy_htod(&permuted, &mut sb)?;
+                fp8.materialize(s, w, sc, layout, &mut out)?;
+                let wrong = s.clone_dtoh(&y)?;
+                let differences = got
+                    .iter()
+                    .zip(&wrong)
+                    .filter(|(a, b)| a.is_finite() && b.is_finite() && a.to_bits() != b.to_bits())
+                    .count();
+                ensure!(differences > 0, "FP8 swapped-row-scale control undetected");
+                eprintln!(
+                    "PASS FP8_SWAPPED_ROW_SCALE stored_weight=[{n},{k}] layout={layout:?} mismatches={differences}"
                 );
             }
         }
@@ -201,7 +220,7 @@ fn q38_primitives_gpu() -> Result<()> {
         )?;
         let materialized = s.alloc_zeros::<bf16>((n * k) as usize)?;
         let mut mat = TensorMut(view(&materialized, s, [n, k], [u64::from(k), 1])?);
-        fp8.materialize(s, w, sc, &mut mat)?;
+        fp8.materialize(s, w, sc, Fp8ScaleLayout::Block128, &mut mat)?;
         for m in [1u32, 2, 3, 4, 5, 63, 64, 65] {
             let row_values = [1.0f32, -1.0, 2.0, -2.0, 4.0];
             let inputs: Vec<_> = (0..m * k)
@@ -241,7 +260,8 @@ fn q38_primitives_gpu() -> Result<()> {
                     } else {
                         ExecutionPhase::Prefill
                     },
-                    LinearWeightRef::BlockFp8 {
+                    LinearWeightRef::Fp8 {
+                        layout: Fp8ScaleLayout::Block128,
                         codes: w,
                         scale: sc,
                     },
@@ -263,130 +283,136 @@ fn q38_primitives_gpu() -> Result<()> {
         }
     }
     // Sparse inputs across scale blocks expose skipped effective-BF16 rounding.
-    for (n, k) in [(129u32, 257u32), (6144, 5120)] {
-        let columns: &[usize] = if k == 257 {
-            &[127, 128, 256]
-        } else {
-            &[0, 127, 128, 511, 512, 1023, 1024, 5119]
-        };
-        let scale_cols = k.div_ceil(128);
-        let codes: Vec<u8> = (0..n * k)
-            .map(|i| [0x2d, 0x35, 0x41][i as usize % 131 % 3])
-            .collect();
-        let scales: Vec<bf16> = (0..n.div_ceil(128) * scale_cols)
-            .map(|i| bf16::from_f32([1.0078125, 0.03125, 3.140625][i as usize % 137 % 3]))
-            .collect();
-        let wb = s.clone_htod(&codes)?;
-        let sb = s.clone_htod(&scales)?;
-        let codes_view = view(&wb, s, [n, k], [u64::from(k), 1])?;
-        let scales_view = view(
-            &sb,
-            s,
-            [n.div_ceil(128), scale_cols],
-            [u64::from(scale_cols), 1],
-        )?;
-        for m in 1u32..=5 {
-            let mut inputs = vec![bf16::ZERO; (m * k) as usize];
-            for row in 0..m as usize {
-                for (i, &col) in columns.iter().enumerate() {
-                    let coefficients = [1.0f32, 1.0, -1.0, 2.0, -2.0, 1.0, 1.0, -1.0];
-                    let row_values = [1.0f32, -1.0, 2.0, -2.0, 4.0];
-                    inputs[row * k as usize + col] =
-                        bf16::from_f32(coefficients[i] * row_values[row]);
-                }
-            }
-            let mut xb = s.clone_htod(&inputs)?;
-            let yb = s.alloc_zeros::<bf16>((m * n) as usize)?;
-            let x = view(&xb, s, [m, k], [u64::from(k), 1])?;
-            let mut y = TensorMut(view(&yb, s, [m, n], [u64::from(n), 1])?);
-            blas.linear_typed(
-                if m == 1 {
-                    ExecutionPhase::Decode
-                } else {
-                    ExecutionPhase::Prefill
-                },
-                LinearWeightRef::BlockFp8 {
-                    codes: codes_view,
-                    scale: scales_view,
-                },
-                x,
-                &mut y,
-            )?;
-            let got = s.clone_dtoh(&yb)?;
-            ensure!(
-                got.iter().all(|v| v.is_finite()),
-                "direct FP8 sparse non-finite M={m}"
-            );
-            let expected: Vec<_> = (0..(m * n) as usize)
-                .map(|index| {
-                    let row = index / n as usize;
-                    let out = index % n as usize;
-                    bf16::from_f32(
-                        columns
-                            .iter()
-                            .map(|&col| {
-                                effective_weight(
-                                    codes[out * k as usize + col],
-                                    scales[(out / 128) * scale_cols as usize + col / 128],
-                                )
-                                .to_f32()
-                                    * inputs[row * k as usize + col].to_f32()
-                            })
-                            .sum::<f32>(),
-                    )
-                })
+    for layout in [Fp8ScaleLayout::Block128, Fp8ScaleLayout::PerChannel] {
+        for (n, k) in [(129u32, 257u32), (6144, 5120), (8192, 2048)] {
+            let columns: &[usize] = if k == 257 {
+                &[127, 128, 256]
+            } else if k == 2048 {
+                &[0, 127, 128, 511, 512, 1023, 1024, 2047]
+            } else {
+                &[0, 127, 128, 511, 512, 1023, 1024, 5119]
+            };
+            let shape = layout.scale_shape(n, k).map(|v| v as u32);
+            let scale_cols = shape[1];
+            let codes: Vec<u8> = (0..n * k)
+                .map(|i| [0x2d, 0x35, 0x41][i as usize % 131 % 3])
                 .collect();
-            ensure!(
-                got.iter()
-                    .zip(&expected)
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "direct FP8 effective-weight rounding mismatch M={m}"
-            );
-            if m > 1 {
-                let rotated: Vec<_> = inputs[k as usize..]
-                    .iter()
-                    .chain(&inputs[..k as usize])
-                    .copied()
-                    .collect();
-                s.memcpy_htod(&rotated, &mut xb)?;
+            let scales: Vec<bf16> = (0..shape[0] * scale_cols)
+                .map(|i| bf16::from_f32([1.0078125, 0.03125, 3.140625][i as usize % 137 % 3]))
+                .collect();
+            let wb = s.clone_htod(&codes)?;
+            let sb = s.clone_htod(&scales)?;
+            let codes_view = view(&wb, s, [n, k], [u64::from(k), 1])?;
+            let scales_view = view(&sb, s, shape, [u64::from(scale_cols), 1])?;
+            for m in 1u32..=5 {
+                let mut inputs = vec![bf16::ZERO; (m * k) as usize];
+                for row in 0..m as usize {
+                    for (i, &col) in columns.iter().enumerate() {
+                        let coefficients = [1.0f32, 1.0, -1.0, 2.0, -2.0, 1.0, 1.0, -1.0];
+                        let row_values = [1.0f32, -1.0, 2.0, -2.0, 4.0];
+                        inputs[row * k as usize + col] =
+                            bf16::from_f32(coefficients[i] * row_values[row]);
+                    }
+                }
+                let mut xb = s.clone_htod(&inputs)?;
+                let yb = s.alloc_zeros::<bf16>((m * n) as usize)?;
+                let x = view(&xb, s, [m, k], [u64::from(k), 1])?;
+                let mut y = TensorMut(view(&yb, s, [m, n], [u64::from(n), 1])?);
                 blas.linear_typed(
-                    ExecutionPhase::Prefill,
-                    LinearWeightRef::BlockFp8 {
+                    if m == 1 {
+                        ExecutionPhase::Decode
+                    } else {
+                        ExecutionPhase::Prefill
+                    },
+                    LinearWeightRef::Fp8 {
+                        layout,
                         codes: codes_view,
                         scale: scales_view,
                     },
                     x,
                     &mut y,
                 )?;
-                let mutant = s.clone_dtoh(&yb)?;
+                let got = s.clone_dtoh(&yb)?;
                 ensure!(
-                    mutant.iter().all(|v| v.is_finite()),
-                    "direct FP8 mutant non-finite M={m}"
+                    got.iter().all(|v| v.is_finite()),
+                    "direct FP8 sparse non-finite M={m}"
                 );
+                let expected: Vec<_> = (0..(m * n) as usize)
+                    .map(|index| {
+                        let row = index / n as usize;
+                        let out = index % n as usize;
+                        bf16::from_f32(
+                            columns
+                                .iter()
+                                .map(|&col| {
+                                    effective_weight(
+                                        codes[out * k as usize + col],
+                                        scales[match layout {
+                                            Fp8ScaleLayout::Block128 => {
+                                                (out / 128) * scale_cols as usize + col / 128
+                                            }
+                                            Fp8ScaleLayout::PerChannel => out,
+                                        }],
+                                    )
+                                    .to_f32()
+                                        * inputs[row * k as usize + col].to_f32()
+                                })
+                                .sum::<f32>(),
+                        )
+                    })
+                    .collect();
                 ensure!(
-                    mutant.iter().enumerate().all(|(i, v)| v.is_finite()
-                        && v.to_bits()
-                            == expected[((i / n as usize + 1) % m as usize) * n as usize
-                                + i % n as usize]
-                                .to_bits()),
-                    "FP8 rotated-input reference mismatch M={m}"
+                    got.iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "direct FP8 effective-weight rounding mismatch M={m}"
                 );
-                let mutant_mismatches = mutant
-                    .iter()
-                    .zip(&expected)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count();
-                ensure!(
-                    mutant_mismatches > 0,
-                    "FP8 wrong-row mutant undetected M={m}"
+                if m > 1 {
+                    let rotated: Vec<_> = inputs[k as usize..]
+                        .iter()
+                        .chain(&inputs[..k as usize])
+                        .copied()
+                        .collect();
+                    s.memcpy_htod(&rotated, &mut xb)?;
+                    blas.linear_typed(
+                        ExecutionPhase::Prefill,
+                        LinearWeightRef::Fp8 {
+                            layout,
+                            codes: codes_view,
+                            scale: scales_view,
+                        },
+                        x,
+                        &mut y,
+                    )?;
+                    let mutant = s.clone_dtoh(&yb)?;
+                    ensure!(
+                        mutant.iter().all(|v| v.is_finite()),
+                        "direct FP8 mutant non-finite M={m}"
+                    );
+                    ensure!(
+                        mutant.iter().enumerate().all(|(i, v)| v.is_finite()
+                            && v.to_bits()
+                                == expected[((i / n as usize + 1) % m as usize) * n as usize
+                                    + i % n as usize]
+                                    .to_bits()),
+                        "FP8 rotated-input reference mismatch M={m}"
+                    );
+                    let mutant_mismatches = mutant
+                        .iter()
+                        .zip(&expected)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    ensure!(
+                        mutant_mismatches > 0,
+                        "FP8 wrong-row mutant undetected M={m}"
+                    );
+                    eprintln!("Q38_FP8_ROW_MUTANT M={m} mismatches={mutant_mismatches} PASS");
+                }
+                eprintln!(
+                    "Q38_FP8_DIRECT layout={layout:?} M={m} stored_weight=[{n},{k}] scale=[{},{}] exact=PASS",
+                    shape[0], scale_cols
                 );
-                eprintln!("Q38_FP8_ROW_MUTANT M={m} mismatches={mutant_mismatches} PASS");
             }
-            eprintln!(
-                "Q38_FP8_DIRECT M={m} stored_weight=[{n},{k}] scale=[{},{}] exact=PASS",
-                n.div_ceil(128),
-                scale_cols
-            );
         }
     }
     if let Ok(path) = std::env::var("FF_Q38_OFFICIAL_SAMPLE") {
@@ -443,7 +469,7 @@ fn q38_primitives_gpu() -> Result<()> {
             )?;
             let materialized = s.alloc_zeros::<bf16>((u64::from(n) * u64::from(k)) as usize)?;
             let mut mat = TensorMut(view(&materialized, s, [n, k], [u64::from(k), 1])?);
-            fp8.materialize(s, w, sc, &mut mat)?;
+            fp8.materialize(s, w, sc, Fp8ScaleLayout::Block128, &mut mat)?;
             for row in [0u32, 127, 128, n - 1] {
                 let base = row as usize * k as usize;
                 let got = s.clone_dtoh(&materialized.slice(base..base + k as usize))?;
@@ -467,7 +493,8 @@ fn q38_primitives_gpu() -> Result<()> {
                     (ExecutionPhase::Prefill, LinearWeightRef::Bf16(mat.read())),
                     (
                         ExecutionPhase::Decode,
-                        LinearWeightRef::BlockFp8 {
+                        LinearWeightRef::Fp8 {
+                            layout: Fp8ScaleLayout::Block128,
                             codes: w,
                             scale: sc,
                         },
@@ -866,7 +893,8 @@ fn verify_projection_m4(
         [output.div_ceil(128), scale_cols],
         [u64::from(scale_cols), 1],
     )?;
-    let weight = LinearWeightRef::BlockFp8 {
+    let weight = LinearWeightRef::Fp8 {
+        layout: Fp8ScaleLayout::Block128,
         codes: codes_view,
         scale: scales_view,
     };

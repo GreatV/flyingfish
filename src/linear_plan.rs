@@ -1,6 +1,6 @@
 //! Checked single-layer materialization layout, shared by planner and Linear.
 use crate::{checkpoint::TensorManifest, model_spec::LinearFormat};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use safetensors::Dtype;
 use std::collections::BTreeMap;
 
@@ -50,15 +50,23 @@ impl LayerDequantPlan {
         let mut bytes = 0u64;
         let mut slots = BTreeMap::new();
         for (name, e) in &manifest.entries {
-            if !e.load || e.dtype != Dtype::F8_E4M3 || !name.starts_with(&prefix) {
+            if !e.load
+                || e.is_routed_expert()
+                || e.dtype != Dtype::F8_E4M3
+                || !name.starts_with(&prefix)
+            {
                 continue;
             }
             ensure!(e.shape.len() == 2, "linear weight is not a matrix");
             let n = u32::try_from(e.shape[0])?;
             let k = u32::try_from(e.shape[1])?;
             let scale_name = format!(
-                "{}.weight_scale_inv",
-                name.strip_suffix(".weight").context("FP8 weight name")?
+                "{}.{}",
+                name.strip_suffix(".weight").context("FP8 weight name")?,
+                format
+                    .fp8_layout()
+                    .context("BF16 plan contains an FP8 weight")?
+                    .scale_suffix()
             );
             let scale = manifest
                 .entries
@@ -66,7 +74,12 @@ impl LayerDequantPlan {
                 .context("FP8 weight missing scale")?;
             ensure!(
                 scale.dtype == Dtype::BF16
-                    && scale.shape == [n.div_ceil(128) as usize, k.div_ceil(128) as usize],
+                    && scale.shape
+                        == format
+                            .fp8_layout()
+                            .context("FP8 scale layout missing")?
+                            .scale_shape(n, k)
+                    && e.scale_name.as_ref() == Some(&scale_name),
                 "FP8 scale layout mismatch"
             );
             let size = u64::from(n)
@@ -93,6 +106,7 @@ impl LayerDequantPlan {
         ensure!(
             manifest.entries.iter().any(|(name, entry)| {
                 entry.load
+                    && !entry.is_routed_expert()
                     && name.starts_with(&prefix)
                     && name.ends_with(".weight")
                     && entry.shape.len() == 2
@@ -103,7 +117,7 @@ impl LayerDequantPlan {
         let plan_shape = match format {
             LinearFormat::Fp8E4m3Block128 => !slots.is_empty(),
             LinearFormat::Bf16 => slots.is_empty(),
-            other => bail!("linear_format={other:?} has no dequant plan"),
+            LinearFormat::Fp8E4m3Channel => true,
         };
         ensure!(
             plan_shape,
@@ -126,7 +140,7 @@ mod tests {
     use crate::checkpoint::{TensorEntry, TensorScope};
 
     #[test]
-    fn native_bf16_layer_requires_no_materialization_storage() -> Result<()> {
+    fn layer_materialization_checks_native_storage_and_scale_layouts() -> Result<()> {
         let entry = TensorEntry {
             dtype: Dtype::BF16,
             shape: vec![8192, 2048],
@@ -140,7 +154,7 @@ mod tests {
             role: "linear_attn.in_proj_qkv.weight".into(),
             scale_name: None,
         };
-        let manifest = TensorManifest {
+        let mut manifest = TensorManifest {
             entries: [(
                 "model.language_model.layers.0.linear_attn.in_proj_qkv.weight".into(),
                 entry,
@@ -155,6 +169,56 @@ mod tests {
         assert_eq!(plan.bytes, 0);
         assert!(plan.slots.is_empty());
         assert!(LayerDequantPlan::from_manifest(&manifest, 1, LinearFormat::Bf16).is_err());
+        let original = manifest.entries.keys().next().unwrap().clone();
+        let mut ignored = manifest.entries.remove(&original).unwrap();
+        let role = ignored.role.clone();
+        ignored.role = "self_attn.q_proj.weight".into();
+        let name = "model.language_model.layers.0.self_attn.q_proj.weight".to_owned();
+        manifest.entries.insert(name.clone(), ignored);
+        let plan = LayerDequantPlan::from_manifest(&manifest, 0, LinearFormat::Fp8E4m3Channel)?;
+        assert_eq!(plan.bytes, 0);
+        let mut ignored = manifest.entries.remove(&name).unwrap();
+        ignored.role = role;
+        manifest.entries.insert(original, ignored);
+        let name = manifest.entries.keys().next().unwrap().clone();
+        for format in [LinearFormat::Fp8E4m3Block128, LinearFormat::Fp8E4m3Channel] {
+            let layout = format.fp8_layout().unwrap();
+            let scale_name = format!(
+                "{}.{}",
+                name.strip_suffix(".weight").unwrap(),
+                layout.scale_suffix()
+            );
+            let weight = manifest.entries.get_mut(&name).unwrap();
+            weight.dtype = Dtype::F8_E4M3;
+            weight.bytes = 8192 * 2048;
+            weight.data_offsets = [0, weight.bytes as u64];
+            weight.scale_name = Some(scale_name.clone());
+            let shape = layout.scale_shape(8192, 2048);
+            let bytes = shape.iter().product::<usize>() * 2;
+            manifest.entries.insert(
+                scale_name.clone(),
+                TensorEntry {
+                    dtype: Dtype::BF16,
+                    shape: shape.to_vec(),
+                    shard: "native.safetensors".into(),
+                    bytes,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [0, bytes as u64],
+                    scope: TensorScope::Text,
+                    layer: Some(0),
+                    role: "linear_attn.in_proj_qkv.scale".into(),
+                    scale_name: None,
+                },
+            );
+            let plan = LayerDequantPlan::from_manifest(&manifest, 0, format)?;
+            assert_eq!(plan.bytes, 8192 * 2048 * 2);
+            assert_eq!(plan.slots[&name].offset_bytes, 0);
+            let scale = manifest.entries.get_mut(&scale_name).unwrap();
+            scale.shape.swap(0, 1);
+            assert!(LayerDequantPlan::from_manifest(&manifest, 0, format).is_err());
+            manifest.entries.remove(&scale_name);
+        }
         Ok(())
     }
 }

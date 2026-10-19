@@ -50,7 +50,18 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             48,
             LinearFormat::Fp8E4m3Block128,
         ),
-        Architecture::MiniCpmV47 => (2048, 512, 248144, 16, 2, 40, 32, LinearFormat::Bf16),
+        Architecture::MiniCpmV47 => {
+            ensure!(
+                matches!(
+                    spec.linear_format,
+                    LinearFormat::Bf16 | LinearFormat::Fp8E4m3Channel
+                ),
+                "hybrid engine does not implement linear_format={:?} for {:?}",
+                spec.linear_format,
+                spec.architecture
+            );
+            (2048, 512, 248144, 16, 2, 40, 32, spec.linear_format)
+        }
         Architecture::Llama => anyhow::bail!(
             "hybrid engine does not implement architecture={:?}",
             spec.architecture
@@ -1133,7 +1144,7 @@ impl Engine {
         };
         let ops = Ops::new(&device.ctx)?;
         let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
-        if model_spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Block128 {
+        if model_spec.linear_format.fp8_layout().is_some() {
             blas.enable_fp8(&device.ctx)?;
         }
         device.finish_upload()?;
@@ -1432,6 +1443,14 @@ impl Engine {
                 decode,
                 compact_small,
             } => {
+                if self.model_spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Channel
+                {
+                    self.blas.fp8_ops()?.fake_quant(
+                        s,
+                        &mut TensorMut(matrix(&w.n, s, 0, linear_rows, hidden)?),
+                        Some(domain),
+                    )?;
+                }
                 for (role, width, offset) in [
                     ("self_attn.q_proj.weight", 2 * q_width as usize, 0),
                     (
@@ -1550,6 +1569,14 @@ impl Engine {
                     heads(&mw.gate, s, 0, rows, attention.hq, 256)?,
                     &mut TensorMut(heads(&w.attn, s, 0, rows, attention.hq, 256)?),
                 )?;
+                if self.model_spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Channel
+                {
+                    self.blas.fp8_ops()?.fake_quant(
+                        s,
+                        &mut TensorMut(matrix(&w.attn, s, 0, linear_rows, q_width as usize)?),
+                        Some(domain),
+                    )?;
+                }
                 layer.linear.run(
                     &self.blas,
                     "self_attn.o_proj.weight",

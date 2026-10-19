@@ -5,6 +5,8 @@
 use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
+use crate::experts::catalogue::{ExpertGeometry, ExpertLayout, Fp8Slot};
+use crate::model_spec::ExpertFormat;
 use anyhow::{Context, Result, ensure};
 use cudarc::{
     cublas::{CudaBlas, sys as bs},
@@ -44,6 +46,8 @@ const MAX_GROUPS: usize = MAX_EXPERTS + 2;
 pub(crate) struct MoePrefillContribute<'a> {
     /// Whole-span counts at most LANE16_ROWS use the CPU arithmetic form in every wave.
     pub cpu_arithmetic: &'a [bool],
+    /// Native FP8 tables carry the six-slice slot base in both pointer arrays.
+    pub fp8_slot: Option<&'a Fp8Slot>,
     pub x: Tensor<bf16, 2>,
     pub ids: Tensor<i32, 2>,
     pub weights: Tensor<bf16, 2>,
@@ -220,6 +224,7 @@ impl MoePrefillFinish {
             self.experts as usize,
             hidden as usize,
             inter as usize,
+            None,
         )?;
         Ok(PrefillPlan {
             rows,
@@ -392,6 +397,7 @@ impl MoePrefillContribute<'_> {
             experts as usize,
             hidden as usize,
             inter as usize,
+            self.fp8_slot,
         )?;
         Ok(PrefillPlan {
             rows,
@@ -469,6 +475,8 @@ pub(crate) struct PrefillLayout {
     act_s: u64,
     pub(crate) shared_out: u64,
     scale: u64,
+    pub(crate) wave: u64,
+    pub(crate) wave_slot_bytes: u64,
     bytes: u64,
 }
 
@@ -490,8 +498,9 @@ pub(crate) fn prefill_scratch_bytes(
     experts: usize,
     hidden: usize,
     inter: usize,
+    fp8_slot: Option<&Fp8Slot>,
 ) -> Result<u64> {
-    prefill_layout(rows, top_k, experts, hidden, inter).map(|layout| layout.bytes)
+    prefill_layout(rows, top_k, experts, hidden, inter, fp8_slot).map(|layout| layout.bytes)
 }
 
 fn region(at: &mut u64, elements: usize, element_bytes: u64) -> Result<u64> {
@@ -513,30 +522,82 @@ pub(crate) fn prefill_layout(
     experts: usize,
     hidden: usize,
     inter: usize,
+    fp8_slot: Option<&Fp8Slot>,
 ) -> Result<PrefillLayout> {
     let assignments = rows
         .checked_mul(top_k)
         .context("moe prefill assignment overflow")?;
+    let routed_hidden = assignments
+        .checked_mul(hidden)
+        .context("moe prefill hidden extent overflow")?;
+    let routed_inter = assignments
+        .checked_mul(inter)
+        .context("moe prefill intermediate extent overflow")?;
+    let routed_gate_up = routed_inter
+        .checked_mul(2)
+        .context("moe prefill gate-up extent overflow")?;
+    let shared_inter = rows
+        .checked_mul(inter)
+        .context("moe prefill shared intermediate overflow")?;
+    let shared_gate_up = shared_inter
+        .checked_mul(2)
+        .context("moe prefill shared gate-up overflow")?;
+    let shared_hidden = rows
+        .checked_mul(hidden)
+        .context("moe prefill shared hidden overflow")?;
     let mut at = 0u64;
     let counts = region(&mut at, experts, 4)?;
     let active_total = region(&mut at, 1, 4)?;
-    let offsets = region(&mut at, experts + 1, 4)?;
+    let offsets = region(
+        &mut at,
+        experts
+            .checked_add(1)
+            .context("moe prefill expert extent overflow")?,
+        4,
+    )?;
     let cursor = region(&mut at, experts, 4)?;
     let pos_of = region(&mut at, assignments, 4)?;
     #[cfg(test)]
     let done = at;
     region(&mut at, assignments, 4)?;
-    let x_perm = region(&mut at, assignments * hidden, 2)?;
-    let h1 = region(&mut at, assignments * 2 * inter, 2)?;
-    let act = region(&mut at, assignments * inter, 2)?;
-    let y_perm = region(&mut at, assignments * hidden, 2)?;
+    let x_perm = region(&mut at, routed_hidden, 2)?;
+    let h1 = region(&mut at, routed_gate_up, 2)?;
+    let act = region(&mut at, routed_inter, 2)?;
+    let y_perm = region(&mut at, routed_hidden, 2)?;
     #[cfg(test)]
     let contributions = at;
-    region(&mut at, assignments * hidden, 2)?;
-    let h1s = region(&mut at, rows * 2 * inter, 2)?;
-    let act_s = region(&mut at, rows * inter, 2)?;
-    let shared_out = region(&mut at, rows * hidden, 2)?;
+    region(&mut at, routed_hidden, 2)?;
+    let h1s = region(&mut at, shared_gate_up, 2)?;
+    let act_s = region(&mut at, shared_inter, 2)?;
+    let shared_out = region(&mut at, shared_hidden, 2)?;
     let scale = region(&mut at, rows, 2)?;
+    let wave = at;
+    let wave_slot_bytes = if let Some(slot) = fp8_slot {
+        ensure!(
+            hidden.is_multiple_of(8) && inter.is_multiple_of(8),
+            "FP8 prefill hidden/inter must be multiples of eight"
+        );
+        let geometry = ExpertGeometry {
+            layers: 1,
+            experts: u32::try_from(experts)?,
+            hidden: u32::try_from(hidden)?,
+            intermediate: u32::try_from(inter)?,
+            top_k: u32::try_from(top_k)?,
+        };
+        ensure!(
+            ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry)?
+                == ExpertLayout::Fp8W8a16(slot.clone()),
+            "FP8 prefill slot layout differs from geometry"
+        );
+        let bytes = ExpertLayout::new(ExpertFormat::Bf16, &geometry)?.slot_bytes();
+        let total = bytes
+            .checked_mul(experts.min(assignments) as u64)
+            .context("FP8 prefill wave buffer overflow")?;
+        region(&mut at, usize::try_from(total)?, 1)?;
+        bytes
+    } else {
+        0
+    };
     Ok(PrefillLayout {
         counts,
         active_total,
@@ -555,6 +616,8 @@ pub(crate) fn prefill_layout(
         act_s,
         shared_out,
         scale,
+        wave,
+        wave_slot_bytes,
         bytes: at,
     })
 }
@@ -702,6 +765,7 @@ impl Stage {
 }
 
 pub(crate) struct PrefillOps {
+    fp8: Option<super::super::linear::Fp8Ops>,
     count: CudaFunction,
     scan: CudaFunction,
     permute: CudaFunction,
@@ -728,7 +792,11 @@ pub(crate) fn arithmetic_mask(counts: &[u32], mask: &mut [bool]) -> Result<()> {
 }
 
 impl PrefillOps {
-    pub fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<Self> {
+    pub fn new(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        format: ExpertFormat,
+    ) -> Result<Self> {
         let module = cubin::module(ctx, "moe_prefill")?;
         let act = cubin::module(ctx, "act")?;
         let blas = CudaBlas::new(stream.clone())?;
@@ -740,6 +808,9 @@ impl PrefillOps {
             .result()?;
         }
         Ok(Self {
+            fp8: (format == ExpertFormat::Fp8W8a16)
+                .then(|| super::super::linear::Fp8Ops::new(ctx))
+                .transpose()?,
             count: module.load_function("moe_count")?,
             scan: module.load_function("moe_scan")?,
             permute: module.load_function("moe_permute")?,
@@ -765,6 +836,10 @@ impl PrefillOps {
             "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
         );
         let plan = input.validate()?;
+        ensure!(
+            input.fp8_slot.is_none() || self.fp8.is_some(),
+            "FP8 prefill operators not bound at setup"
+        );
         scratch.validate(plan.layout.bytes)?;
         self.contribute(stream, &input, &plan, scratch)?;
         Ok(())
@@ -865,6 +940,10 @@ impl PrefillOps {
             .max()
             .unwrap_or(0);
         group_runs(&stage.order[..tensor_problems], counts, &mut stage.runs);
+        ensure!(
+            stage.order.len() <= experts.min(plan.assignments as usize),
+            "FP8 prefill active experts exceed the wave buffer bound"
+        );
         stage.offsets.clear();
         let mut acc = 0i32;
         for &count in counts {
@@ -904,7 +983,61 @@ impl PrefillOps {
                     "moe prefill down slot pointer of expert {e} (0x{dn:x}) below cuBLAS alignment {dn_align}"
                 );
                 let off = stage.offsets[e] as u64;
-                mirror[j] = gu;
+                mirror[j] = if let Some(slot) = input.fp8_slot {
+                    ensure!(
+                        gu == dn,
+                        "FP8 prefill expert {e} needs identical native slot bases"
+                    );
+                    let destination = scratch.ptr + layout.wave + j as u64 * layout.wave_slot_bytes;
+                    for (code, scale, n, k, offset) in [
+                        (&slot.gate, &slot.gate_scale, inter, hidden, 0),
+                        (&slot.up, &slot.up_scale, inter, hidden, slot.up.start * 2),
+                        (
+                            &slot.down,
+                            &slot.down_scale,
+                            hidden,
+                            inter,
+                            slot.down.start * 2,
+                        ),
+                    ] {
+                        // The validated native descriptor and wave slot cover each matrix.
+                        let (codes, scales, mut output) = unsafe {
+                            (
+                                Tensor::new(
+                                    gu + code.start,
+                                    [n, k],
+                                    [u64::from(k), 1],
+                                    code.end - code.start,
+                                )?,
+                                Tensor::new(
+                                    gu + scale.start,
+                                    [n, 1],
+                                    [1, 1],
+                                    scale.end - scale.start,
+                                )?,
+                                TensorMut::new(
+                                    destination + offset,
+                                    [n, k],
+                                    [u64::from(k), 1],
+                                    (code.end - code.start) * 2,
+                                )?,
+                            )
+                        };
+                        self.fp8
+                            .as_ref()
+                            .context("FP8 prefill operators missing")?
+                            .materialize(
+                                stream,
+                                codes,
+                                scales,
+                                crate::fp8::Fp8ScaleLayout::PerChannel,
+                                &mut output,
+                            )?;
+                    }
+                    destination
+                } else {
+                    gu
+                };
                 mirror[len1 + j] = x_perm_at + elem(off * u64::from(hidden));
                 mirror[2 * len1 + j] = h1_at + elem(off * u64::from(2 * inter));
                 mirror[3 * len1 + j] = counts[e] as u64;
@@ -961,7 +1094,14 @@ impl PrefillOps {
             for (j, &e) in stage.order.iter().enumerate() {
                 let e = e as usize;
                 let off = stage.offsets[e] as u64;
-                mirror[j] = input.slots_down_host[e];
+                mirror[j] = if let Some(slot) = input.fp8_slot {
+                    scratch.ptr
+                        + layout.wave
+                        + j as u64 * layout.wave_slot_bytes
+                        + slot.down.start * 2
+                } else {
+                    input.slots_down_host[e]
+                };
                 mirror[len2 + j] = act_at + elem(off * u64::from(inter));
                 mirror[2 * len2 + j] = y_perm_at + elem(off * u64::from(hidden));
                 mirror[3 * len2 + j] = counts[e] as u64;
@@ -1034,10 +1174,12 @@ impl PrefillOps {
             input.slot_valid.shape[0] as usize,
             hidden as usize,
             input.shared_gate.shape[0] as usize,
+            None,
         )?;
         let assignments = u64::from(rows) * u64::from(top_k);
         let cohort = MoePrefillContribute {
             cpu_arithmetic: &[false; MAX_EXPERTS][..input.slot_valid.shape[0] as usize],
+            fp8_slot: None,
             contributions: unsafe {
                 Tensor::<bf16, 3>::new(
                     scratch.ptr + layout.contributions,

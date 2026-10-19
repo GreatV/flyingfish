@@ -15,6 +15,10 @@ pub(crate) struct DecodeOps {
     gate_up: CudaFunction,
     down: CudaFunction,
     #[cfg(test)]
+    gate_up_w8a16: CudaFunction,
+    #[cfg(test)]
+    down_w8a16: CudaFunction,
+    #[cfg(test)]
     combine: CombineOps,
 }
 
@@ -246,12 +250,41 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
     })
 }
 
+#[cfg(test)]
+pub(super) fn validate_w8a16(
+    input: &MoeDecode<'_>,
+    slot: &crate::experts::catalogue::Fp8Slot,
+    scratch: &Scratch,
+) -> Result<DecodeDims> {
+    use crate::{
+        experts::catalogue::{ExpertGeometry, ExpertLayout},
+        model_spec::ExpertFormat,
+    };
+    let dims = validate(input, scratch)?;
+    let geometry = ExpertGeometry {
+        layers: 1,
+        experts: dims.experts,
+        hidden: dims.hidden,
+        intermediate: dims.inter,
+        top_k: dims.top_k,
+    };
+    ensure!(
+        ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry)?.fp8_slot() == Some(slot),
+        "W8A16 decode slot differs from geometry"
+    );
+    Ok(dims)
+}
+
 impl DecodeOps {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let module = cubin::module(ctx, "moe_ffn")?;
         Ok(Self {
             gate_up: module.load_function("moe_ffn_gate_up")?,
             down: module.load_function("moe_ffn_down")?,
+            #[cfg(test)]
+            gate_up_w8a16: module.load_function("moe_ffn_gate_up_w8a16")?,
+            #[cfg(test)]
+            down_w8a16: module.load_function("moe_ffn_down_w8a16")?,
             #[cfg(test)]
             combine: CombineOps::new(ctx)?,
         })
@@ -264,19 +297,31 @@ impl DecodeOps {
         input: &MoeDecode<'_>,
         scratch: &Scratch,
     ) -> Result<()> {
+        let dims = validate(input, scratch)?;
+        self.launch(stream, input, scratch, dims, (&self.gate_up, &self.down))
+    }
+
+    fn launch(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &MoeDecode<'_>,
+        scratch: &Scratch,
+        dims: DecodeDims,
+        functions: (&CudaFunction, &CudaFunction),
+    ) -> Result<()> {
         let DecodeDims {
             rows,
             experts,
             top_k,
             hidden,
             inter,
-        } = validate(input, scratch)?;
+        } = dims;
         let h_bytes = u64::from(rows) * u64::from(top_k) * u64::from(inter) * 2;
         let h_ptr = scratch.ptr;
         let hs_ptr = scratch.ptr + h_bytes;
         unsafe {
             stream
-                .launch_builder(&self.gate_up)
+                .launch_builder(functions.0)
                 .arg(&input.x.ptr)
                 .arg(&input.ids.ptr)
                 .arg(&input.active.ptr)
@@ -299,7 +344,7 @@ impl DecodeOps {
                     shared_mem_bytes: hidden * 2,
                 })?;
             stream
-                .launch_builder(&self.down)
+                .launch_builder(functions.1)
                 .arg(&h_ptr)
                 .arg(&hs_ptr)
                 .arg(&input.ids.ptr)
@@ -327,8 +372,7 @@ impl DecodeOps {
         Ok(())
     }
 
-    /// One full decode MoE row block: contribute, shared sigmoid scale and
-    /// the single deterministic combine, with final_active = active.
+    /// Native expert contributions and the shared expert use one deterministic combine.
     #[cfg(test)]
     pub fn decode(
         &self,
@@ -336,15 +380,18 @@ impl DecodeOps {
         input: &MoeDecode<'_>,
         y: &mut TensorMut<bf16, 2>,
         scratch: &Scratch,
+        layout: Option<&crate::experts::catalogue::Fp8Slot>,
     ) -> Result<()> {
-        self.contribute(stream, input, scratch)?;
+        if let Some(slot) = layout {
+            self.contribute_w8a16(stream, input, slot, scratch)?;
+        } else {
+            self.contribute(stream, input, scratch)?;
+        }
         let rows = input.x.shape[0];
         let top_k = input.ids.shape[1];
         let inter = input.shared_gate.shape[0];
         let scale_ptr = scratch.ptr + u64::from(rows) * u64::from(top_k + 1) * u64::from(inter) * 2;
-        // moe_combine documents the scale as [rows,1] x stride [1,0];
-        // contracts::Tensor::validate rejects zero strides, so this view of
-        // the same [rows] words carries [1,1].
+        // The contiguous shared scale has shape [rows,1] and strides [1,1].
         let mut scale = unsafe {
             TensorMut::<bf16, 2>::new(scale_ptr, [rows, 1], [1, 1], u64::from(rows) * 2)?
         };
@@ -362,5 +409,23 @@ impl DecodeOps {
             y: TensorMut(y.read()),
         };
         self.combine.combine(stream, &combine_input)
+    }
+
+    #[cfg(test)]
+    pub fn contribute_w8a16(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &MoeDecode<'_>,
+        slot: &crate::experts::catalogue::Fp8Slot,
+        scratch: &Scratch,
+    ) -> Result<()> {
+        let dims = validate_w8a16(input, slot, scratch)?;
+        self.launch(
+            stream,
+            input,
+            scratch,
+            dims,
+            (&self.gate_up_w8a16, &self.down_w8a16),
+        )
     }
 }

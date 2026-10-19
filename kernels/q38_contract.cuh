@@ -21,3 +21,12 @@ __device__ __forceinline__ void q38_meta_guard(const Q38SequenceMeta* s, bool ca
         int64_t(s->prefix)+s->valid_rows!=s->key_count || s->key_count>s->capacity ||
         s->reserved[0] || s->reserved[1] || s->reserved[2]) __trap();
 }
+
+__device__ __forceinline__ float e4m3_decode(uint8_t code) {
+    const uint32_t sign = uint32_t(code & 0x80) << 24;
+    const uint32_t mag = code & 0x7f;
+    if (mag == 0x7f) return __uint_as_float(sign | 0x7fc00000u);
+    const uint32_t e = mag >> 3, m = mag & 7;
+    if (e == 0) return __uint_as_float(__float_as_uint(float(m) * (1.0f/512.0f)) | sign);
+    return __uint_as_float(sign | ((e + 120) << 23) | (m << 20));
+}

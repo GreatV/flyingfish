@@ -3,7 +3,7 @@
 // Active assignments require valid slots, matching generations and distinct expert ids.
 // Expert row pointers and shared weights are 16-byte aligned.
 #include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "q38_contract.cuh"
 
 using bf16 = __nv_bfloat16;
 
@@ -49,10 +49,32 @@ __device__ __forceinline__ float moe_group_sum(float v) {
 
 __device__ __forceinline__ float moe_silu(float v) { return v / (1.0f + expf(-v)); }
 
-extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up(
+// Native FP8 slots contain gate/up/down E4M3 codes followed by BF16 channel scales.
+__device__ __forceinline__ uint4 moe_dequant8(uint2 codes, float scale) {
+  uint4 w;
+  const unsigned char* in = reinterpret_cast<const unsigned char*>(&codes);
+  unsigned short* out = reinterpret_cast<unsigned short*>(&w);
+#pragma unroll
+  for (int b = 0; b < 8; ++b)
+    out[b] = __bfloat16_as_ushort(
+        __float2bfloat16(e4m3_decode(in[b]) * scale));
+  return w;
+}
+
+template <bool FP8>
+__device__ __forceinline__ uint4 moe_load8(const bf16* base, const unsigned char* codes,
+                                         float scale, int v) {
+  if constexpr (FP8) {
+    if (codes) return moe_dequant8(reinterpret_cast<const uint2*>(codes)[v], scale);
+  }
+  return reinterpret_cast<const uint4*>(base)[v];
+}
+
+template <bool FP8, class Word>
+__device__ __forceinline__ void moe_gate_up(
     const bf16* __restrict__ x, const int* __restrict__ ids,
     const unsigned* __restrict__ active,
-    const bf16* const* __restrict__ slots_gate_up,
+    const Word* const* __restrict__ slots_gate_up,
     const unsigned* __restrict__ slot_valid,
     const unsigned long long* __restrict__ slot_generation,
     const unsigned long long* __restrict__ assignment_gen,
@@ -79,8 +101,8 @@ extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up(
 
   const bf16* gate_base = shared_gate;
   const bf16* up_base = shared_up;
-  // Router outputs carry K distinct experts per row (torch.topk); a
-  // duplicate id among a row's active choices is an invalid input.
+  const unsigned char* codes = nullptr;
+  // Active router choices have distinct expert ids.
   if (seg == 0 && blockIdx.x == 0 && tid == 0) {
     for (int c0 = 0; c0 < top_k; ++c0) {
       if (active[(size_t)r * top_k + c0] == 0u) continue;
@@ -95,21 +117,37 @@ extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up(
     if ((unsigned)e >= (unsigned)experts || slot_valid[e] == 0u ||
         slot_generation[e] != assignment_gen[(size_t)r * top_k + seg])
       __trap();
-    const bf16* gu = slots_gate_up[e];
+    const Word* gu = slots_gate_up[e];
     if ((reinterpret_cast<unsigned long long>(gu) & 15) != 0) __trap();
-    gate_base = gu;
-    up_base = gu + (size_t)inter * hidden;
+    if constexpr (FP8) {
+      codes = gu;
+    } else {
+      gate_base = gu;
+      up_base = gu + (size_t)inter * hidden;
+    }
   }
 
   float accg = 0.0f;
   float accu = 0.0f;
   if (j < inter && live_seg) {
-    const uint4* gv = reinterpret_cast<const uint4*>(gate_base + (size_t)j * hidden);
-    const uint4* uv = reinterpret_cast<const uint4*>(up_base + (size_t)j * hidden);
+    float gs = 0.0f, us = 0.0f;
+    const unsigned char* gc = nullptr;
+    const unsigned char* uc = nullptr;
+    if constexpr (FP8) {
+      if (codes) {
+        const bf16* scales = reinterpret_cast<const bf16*>(codes + (size_t)3 * inter * hidden);
+        gs = __bfloat162float(scales[j]);
+        us = __bfloat162float(scales[inter + j]);
+        gc = codes + (size_t)j * hidden;
+        uc = codes + (size_t)(inter + j) * hidden;
+      }
+    }
+    const bf16* gv = gate_base + (size_t)j * hidden;
+    const bf16* uv = up_base + (size_t)j * hidden;
 #pragma unroll 4
     for (int v = lane; v < nvec; v += LANES) {
-      accg += moe_dot8(gv[v], xq[v]);
-      accu += moe_dot8(uv[v], xq[v]);
+      accg += moe_dot8(moe_load8<FP8>(gv, gc, gs, v), xq[v]);
+      accu += moe_dot8(moe_load8<FP8>(uv, uc, us, v), xq[v]);
     }
   }
   accg = moe_group_sum(accg);
@@ -124,11 +162,12 @@ extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up(
   }
 }
 
-extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down(
+template <bool FP8, class Word>
+__device__ __forceinline__ void moe_down(
     const bf16* __restrict__ h, const bf16* __restrict__ h_shared,
     const int* __restrict__ ids, const unsigned* __restrict__ active,
     const bf16* __restrict__ weights,
-    const bf16* const* __restrict__ slots_down,
+    const Word* const* __restrict__ slots_down,
     const unsigned* __restrict__ slot_valid,
     const unsigned long long* __restrict__ slot_generation,
     const unsigned long long* __restrict__ assignment_gen,
@@ -146,14 +185,20 @@ extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down(
   const bool routed = seg < top_k;
   const bool live = !routed || active[(size_t)r * top_k + seg] != 0u;
   const bf16* wrow = shared_down;
+  const unsigned char* codes = nullptr;
   float wk = 0.0f;
   if (routed && live) {
     const int e = ids[(size_t)r * top_k + seg];
     if ((unsigned)e >= (unsigned)experts || slot_valid[e] == 0u ||
         slot_generation[e] != assignment_gen[(size_t)r * top_k + seg])
       __trap();
-    wrow = slots_down[e];
-    if ((reinterpret_cast<unsigned long long>(wrow) & 15) != 0) __trap();
+    const Word* slot = slots_down[e];
+    if ((reinterpret_cast<unsigned long long>(slot) & 15) != 0) __trap();
+    if constexpr (FP8) {
+      codes = slot;
+    } else {
+      wrow = slot;
+    }
     wk = __bfloat162float(weights[(size_t)r * top_k + seg]);
     if (blockIdx.x == 0 && tid == 0) {
       const size_t a = (size_t)r * top_k + seg;
@@ -165,10 +210,20 @@ extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down(
       routed ? h + ((size_t)r * top_k + seg) * inter : h_shared + (size_t)r * inter;
   float acc = 0.0f;
   if (d < hidden && live) {
-    const uint4* wv = reinterpret_cast<const uint4*>(wrow + (size_t)d * inter);
+    float scale = 0.0f;
+    const unsigned char* wc = nullptr;
+    if constexpr (FP8) {
+      if (codes) {
+        const bf16* scales = reinterpret_cast<const bf16*>(codes + (size_t)3 * inter * hidden);
+        scale = __bfloat162float(scales[2 * inter + d]);
+        wc = codes + (size_t)2 * inter * hidden + (size_t)d * inter;
+      }
+    }
+    const bf16* wv = wrow + (size_t)d * inter;
     const uint4* hv = reinterpret_cast<const uint4*>(hrow);
 #pragma unroll 4
-    for (int v = lane; v < ivec; v += LANES) acc += moe_dot8(wv[v], hv[v]);
+    for (int v = lane; v < ivec; v += LANES)
+      acc += moe_dot8(moe_load8<FP8>(wv, wc, scale, v), hv[v]);
   }
   acc = moe_group_sum(acc);
   if (lane == 0 && d < hidden && live) {
@@ -177,6 +232,62 @@ extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down(
                        : shared_out + (size_t)r * (size_t)hidden;
     out[d] = routed ? __float2bfloat16(lin * wk) : __float2bfloat16(lin);
   }
+}
+
+extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up(
+    const bf16* __restrict__ x, const int* __restrict__ ids,
+    const unsigned* __restrict__ active,
+    const bf16* const* __restrict__ slots_gate_up,
+    const unsigned* __restrict__ slot_valid,
+    const unsigned long long* __restrict__ slot_generation,
+    const unsigned long long* __restrict__ assignment_gen,
+    const bf16* __restrict__ shared_gate, const bf16* __restrict__ shared_up,
+    bf16* __restrict__ h, bf16* __restrict__ h_shared,
+    int rows, int experts, int top_k, int hidden, int inter) {
+  moe_gate_up<false>(x, ids, active, slots_gate_up, slot_valid, slot_generation, assignment_gen, shared_gate, shared_up, h, h_shared, rows, experts, top_k, hidden, inter);
+}
+
+extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up_w8a16(
+    const bf16* __restrict__ x, const int* __restrict__ ids,
+    const unsigned* __restrict__ active,
+    const unsigned char* const* __restrict__ slots_gate_up,
+    const unsigned* __restrict__ slot_valid,
+    const unsigned long long* __restrict__ slot_generation,
+    const unsigned long long* __restrict__ assignment_gen,
+    const bf16* __restrict__ shared_gate, const bf16* __restrict__ shared_up,
+    bf16* __restrict__ h, bf16* __restrict__ h_shared,
+    int rows, int experts, int top_k, int hidden, int inter) {
+  moe_gate_up<true>(x, ids, active, slots_gate_up, slot_valid, slot_generation, assignment_gen, shared_gate, shared_up, h, h_shared, rows, experts, top_k, hidden, inter);
+}
+
+extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down(
+    const bf16* __restrict__ h, const bf16* __restrict__ h_shared,
+    const int* __restrict__ ids, const unsigned* __restrict__ active,
+    const bf16* __restrict__ weights,
+    const bf16* const* __restrict__ slots_down,
+    const unsigned* __restrict__ slot_valid,
+    const unsigned long long* __restrict__ slot_generation,
+    const unsigned long long* __restrict__ assignment_gen,
+    const bf16* __restrict__ shared_down,
+    bf16* __restrict__ contributions, bf16* __restrict__ shared_out,
+    unsigned* __restrict__ done,
+    int rows, int experts, int top_k, int hidden, int inter) {
+  moe_down<false>(h, h_shared, ids, active, weights, slots_down, slot_valid, slot_generation, assignment_gen, shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter);
+}
+
+extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down_w8a16(
+    const bf16* __restrict__ h, const bf16* __restrict__ h_shared,
+    const int* __restrict__ ids, const unsigned* __restrict__ active,
+    const bf16* __restrict__ weights,
+    const unsigned char* const* __restrict__ slots_down,
+    const unsigned* __restrict__ slot_valid,
+    const unsigned long long* __restrict__ slot_generation,
+    const unsigned long long* __restrict__ assignment_gen,
+    const bf16* __restrict__ shared_down,
+    bf16* __restrict__ contributions, bf16* __restrict__ shared_out,
+    unsigned* __restrict__ done,
+    int rows, int experts, int top_k, int hidden, int inter) {
+  moe_down<true>(h, h_shared, ids, active, weights, slots_down, slot_valid, slot_generation, assignment_gen, shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter);
 }
 
 #undef FD_GUARD_MOE_GATE_UP
