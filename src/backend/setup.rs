@@ -148,8 +148,8 @@ impl Setup {
         ensure!(
             attention.merge_threads >= 128
                 && attention.merge_threads <= info.max_threads
-                && attention.merge_threads.is_multiple_of(128),
-            "attention merge threads exceed device limits or are not a multiple of 128"
+                && attention.merge_threads.is_power_of_two(),
+            "attention merge threads exceed device limits or are not a power of two"
         );
         ensure!(
             chunk > 0 && chunk <= i32::MAX as usize - capacity,
@@ -239,6 +239,62 @@ mod long_tests {
             for &chunk in attention_chunks(attention_bucket(capacity)?) {
                 assert!((2 * capacity.div_ceil(chunk) + 256) * 4 <= 49152);
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn merge_threads_must_be_a_power_of_two() -> Result<()> {
+        let c: Config = serde_json::from_value(serde_json::json!({
+            "model_type": "llama", "hidden_size": 2048, "intermediate_size": 8192,
+            "num_hidden_layers": 1, "num_attention_heads": 16, "num_key_value_heads": 2,
+            "head_dim": 128, "vocab_size": 1024, "max_position_embeddings": 4096,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "rope_scaling": null,
+            "hidden_act": "silu", "tie_word_embeddings": false, "torch_dtype": "bfloat16",
+            "eos_token_id": [1]
+        }))?;
+        let info = DeviceInfo {
+            name: String::new(),
+            arch: 89,
+            sms: 128,
+            l2_bytes: 72 << 20,
+            warp: 32,
+            max_threads: 1024,
+            shared_bytes: 48 << 10,
+            sm_shared_bytes: 100 << 10,
+            cooperative: true,
+            optin_shared_bytes: 99 << 10,
+        };
+        for (merge_threads, valid) in [
+            (128, true),
+            (256, true),
+            (512, true),
+            (1024, true),
+            (384, false),
+            (640, false),
+            (768, false),
+            (896, false),
+        ] {
+            let plan = AttentionPlan {
+                chunk: 512,
+                qpack: 2,
+                threads: 128,
+                merge_threads,
+            };
+            let selected = Setup::select(info.clone(), &c, 2048, |_, _| {
+                Ok((
+                    plan,
+                    Selection::Calibrated {
+                        key: CacheKey {
+                            device_uuid: String::new(),
+                            driver_version: String::new(),
+                            binary_version: String::new(),
+                        },
+                        cached: true,
+                    },
+                ))
+            });
+            assert_eq!(selected.is_ok(), valid, "merge_threads={merge_threads}");
         }
         Ok(())
     }

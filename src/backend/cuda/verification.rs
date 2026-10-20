@@ -100,7 +100,7 @@ impl Verification {
         ensure!(
             plan.merge_threads >= 128
                 && plan.merge_threads <= 1024
-                && plan.merge_threads.is_multiple_of(128),
+                && plan.merge_threads.is_power_of_two(),
             "invalid MQ phase2 block size"
         );
         let chunks = capacity.div_ceil(plan.chunk);

@@ -52,7 +52,7 @@
 //   _w:      (128+32+32)*136*2 + 512 = 52736 B.
 //   _ws:     50176 B (Q/K unpadded and XOR-swizzled).
 //   _w and _ws require cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize).
-//   phase 2: block = threads2 (multiple of 128, <= 1024),
+//   phase 2: block = threads2 (power of two in [128, 1024]),
 //            smem = (2*nchunks + threads2) * 4 B <= 48 KB.
 // Out-of-extent tile rows are zero-filled on load.
 //

@@ -73,8 +73,8 @@ impl Attention {
         ensure!(
             settings.merge_threads >= 128
                 && settings.merge_threads <= 1024
-                && settings.merge_threads.is_multiple_of(128),
-            "attention merge threads must be a multiple of 128 in 128..=1024"
+                && settings.merge_threads.is_power_of_two(),
+            "attention merge threads must be a power of two in 128..=1024"
         );
         let chunks = capacity.div_ceil(chunk);
         let first_smem = settings.qpack * (settings.threads as usize / 32) * 130 * 4;
