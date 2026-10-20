@@ -145,6 +145,16 @@ fn invariant_route(device: &Device) -> Result<()> {
     let w = view(&router, s, 0, [e as u32, h as u32], [h as u64, 1])?;
     let expected_ids = s.alloc_zeros::<i32>(rows * k)?;
     let expected_weights = s.alloc_zeros::<bf16>(rows * k)?;
+    let logits = s.alloc_zeros::<bf16>(rows * e)?;
+    let logits_view = |m: u32| -> Result<_> {
+        Ok(TensorMut(view(
+            &logits,
+            s,
+            0,
+            [m, e as u32],
+            [e as u64, 1],
+        )?))
+    };
     device.finish_upload()?;
     for r in 0..rows {
         ops.route(
@@ -159,6 +169,7 @@ fn invariant_route(device: &Device) -> Result<()> {
                 [1, k as u32],
                 [k as u64, 1],
             )?),
+            &mut logits_view(1)?,
         )?;
     }
     let expected_ids = s.clone_dtoh(&expected_ids)?;
@@ -171,7 +182,9 @@ fn invariant_route(device: &Device) -> Result<()> {
         let input = view(&x, s, 0, [m, h as u32], [h as u64, 1])?;
         let mut id_view = TensorMut(view(&ids, s, 0, [m, k as u32], [k as u64, 1])?);
         let mut weight_view = TensorMut(view(&weights, s, 0, [m, k as u32], [k as u64, 1])?);
-        let mut execute = || ops.route(s, input, w, &mut id_view, &mut weight_view);
+        let mut logit_view = logits_view(m)?;
+        let mut execute =
+            || ops.route(s, input, w, &mut id_view, &mut weight_view, &mut logit_view);
         for graph in [false, true] {
             if graph {
                 s.synchronize()?;
@@ -218,6 +231,50 @@ fn invariant_route(device: &Device) -> Result<()> {
             );
         }
     }
+    let rx = crate::backend::cuda::calibrate::random(rows * h, 11);
+    let rw = crate::backend::cuda::calibrate::random(e * h, 12);
+    let (dx, dw) = (s.clone_htod(&rx)?, s.clone_htod(&rw)?);
+    ops.route(
+        s,
+        view(&dx, s, 0, [rows as u32, h as u32], [h as u64, 1])?,
+        view(&dw, s, 0, [e as u32, h as u32], [h as u64, 1])?,
+        &mut TensorMut(view(&ids, s, 0, [rows as u32, k as u32], [k as u64, 1])?),
+        &mut TensorMut(view(
+            &weights,
+            s,
+            0,
+            [rows as u32, k as u32],
+            [k as u64, 1],
+        )?),
+        &mut logits_view(rows as u32)?,
+    )?;
+    let got_logits = s.clone_dtoh(&logits)?;
+    let chain = |r: usize, j: usize, order: &mut dyn Iterator<Item = usize>| {
+        bf16::from_f32(order.fold(0f32, |acc, i| {
+            rx[r * h + i].to_f32().mul_add(rw[j * h + i].to_f32(), acc)
+        }))
+    };
+    let (mut logit_mismatches, mut reversed_differs) = (0usize, 0usize);
+    for r in 0..rows {
+        for j in 0..e {
+            let got = got_logits[r * e + j].to_bits();
+            logit_mismatches += usize::from(got != chain(r, j, &mut (0..h)).to_bits());
+            reversed_differs += usize::from(got != chain(r, j, &mut (0..h).rev()).to_bits());
+        }
+    }
+    ensure!(
+        reversed_differs > 0,
+        "router logit bit control escaped: reversed accumulation matches every logit"
+    );
+    println!(
+        "{} ROUTE_LOGITS_BITWISE x=[{rows},{h}] router=[{e},{h}] fmaf_ascending_mismatches={logit_mismatches} reversed_control_differs={reversed_differs}",
+        if logit_mismatches == 0 {
+            "PASS"
+        } else {
+            "DEFECT"
+        }
+    );
+    defects += usize::from(logit_mismatches != 0);
     let mut wrong = values.clone();
     for r in 1..rows {
         wrong[r * h..(r + 1) * h].copy_from_slice(&values[..h]);
@@ -235,6 +292,7 @@ fn invariant_route(device: &Device) -> Result<()> {
             [rows as u32, k as u32],
             [k as u64, 1],
         )?),
+        &mut logits_view(rows as u32)?,
     )?;
     let mismatches = s
         .clone_dtoh(&ids)?
@@ -280,6 +338,7 @@ fn moe_route_gpu() -> Result<()> {
     d.finish_upload()?;
     let mut idsb = testing::zeros::<i32>(s, dims.rows * k)?;
     let mut wb = testing::zeros::<bf16>(s, dims.rows * k)?;
+    let lb = testing::zeros::<bf16>(s, dims.rows * e)?;
 
     let run = |rows: u32,
                xb: &CudaSlice<bf16>,
@@ -299,7 +358,12 @@ fn moe_route_gpu() -> Result<()> {
                 .0
                 .prefix_rows(rows)?,
         );
-        ops.route(s, x, router, &mut ids, &mut weights)
+        let mut logits = TensorMut(
+            testing::dense_mut(&lb, s, dims.rows as u32, e as u32)?
+                .0
+                .prefix_rows(rows)?,
+        );
+        ops.route(s, x, router, &mut ids, &mut weights, &mut logits)
     };
 
     for &case in &ROW_CASES {

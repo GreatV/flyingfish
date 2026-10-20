@@ -1,28 +1,31 @@
 // MoE router: FP32 softmax over BF16 expert logits, deterministic top-k
 // (descending, exact ties by lower expert id), FP32 renormalised weights
 // stored as BF16.
-//   moe_route_bf16(x, router, ids, weights, rows, experts, top_k, hidden):
+//   moe_route_logits_bf16(x, router, logits, rows, experts, hidden):
 //     x [rows, hidden] bf16 row-major, router W [experts, hidden] bf16
-//     row-major; each expert logit is an FP32 accumulation of BF16 products
-//     over uint4 (8-element) loads, rounded to BF16 (F.linear boundary).
+//     row-major, logits [rows, experts] bf16 row-major; each expert logit is
+//     one thread's FP32 fmaf chain over BF16 products in ascending element
+//     order, rounded to BF16 (F.linear boundary). Grid (ceil(experts/32),
+//     rows), block 128; the block stages 32 router rows x 512 elements and the
+//     matching x elements in static shared memory (34,304 B) per step.
 //   moe_route_topk(logits, ids, weights, rows, experts, top_k):
-//     logits [rows, experts] bf16 row-major, pre-computed by a BF16 GEMM with
-//     FP32 accumulation; no rounding is applied here (already BF16).
-//   ids [rows, top_k] i32, weights [rows, top_k] bf16 for both entries.
-// One block per row; thread e < experts owns expert e. Softmax runs in FP32
-// over the BF16 logits. top_k selection rounds each take the block maximum
-// under the comparator (higher probability, then lower expert id); a selected
-// thread retires with probability -1.0f, below every softmax output. The
-// top-k probabilities are renormalised in FP32 accumulated in selection order
-// and stored as BF16.
-// __trap() guards (both entries unless named): grid beyond rows, blockDim.x
-// not a warp multiple or below experts, experts outside [1,1024], top_k
-// outside [1,32] or >= experts. moe_route_bf16 additionally: hidden < 8 or
-// % 8 != 0, x/router base pointers not 16-byte aligned; moe_route_topk:
-// logits base pointer not 16-byte aligned.
-// Static shared memory: two 32-word reduction stages plus 32 selected
-// (id, probability) slots; blockDim.x <= 1024.
-// Launch: grid = rows, block = experts rounded up to a warp multiple.
+//     logits [rows, experts] bf16 row-major from moe_route_logits_bf16 or a
+//     BF16 GEMM with FP32 accumulation; no rounding is applied here.
+//   ids [rows, top_k] i32, weights [rows, top_k] bf16.
+// moe_route_topk: one block per row; thread e < experts owns expert e. Softmax
+// runs in FP32 over the BF16 logits. top_k selection rounds each take the block
+// maximum under the comparator (higher probability, then lower expert id); a
+// selected thread retires with probability -1.0f, below every softmax output.
+// The top-k probabilities are renormalised in FP32 accumulated in selection
+// order and stored as BF16.
+// __trap() guards: grid beyond rows, experts outside [1,1024]. moe_route_topk:
+// blockDim.x not a warp multiple or below experts, top_k outside [1,32] or
+// >= experts, logits base pointer not 16-byte aligned. moe_route_logits_bf16:
+// hidden < 8 or % 8 != 0, blockDim.x != 128, gridDim.x != ceil(experts/32),
+// x/router base pointers not 16-byte aligned.
+// moe_route_topk static shared memory: two 32-word reduction stages plus 32
+// selected (id, probability) slots; launch grid = rows, block = experts
+// rounded up to a warp multiple (<= 1024).
 #include <cuda_bf16.h>
 #include <math_constants.h>
 #include <stdint.h>
@@ -119,47 +122,71 @@ __device__ void moe_route_select(
   }
 }
 
-__device__ __forceinline__ float moe_route_logit(
-    const bf16* x, const bf16* router, int row, int e, int hidden) {
-    const uint4* xr = reinterpret_cast<const uint4*>(x + (size_t)row * hidden);
-    const uint4* wr =
-        reinterpret_cast<const uint4*>(router + (size_t)e * hidden);
-    const int words = hidden >> 3;
-    float acc = 0.0f;
-#pragma unroll 4
-    for (int w = 0; w < words; ++w) {
-      const uint4 a = xr[w];
-      const uint4 b = wr[w];
-      const __nv_bfloat162* ha = reinterpret_cast<const __nv_bfloat162*>(&a);
-      const __nv_bfloat162* hb = reinterpret_cast<const __nv_bfloat162*>(&b);
+__device__ __forceinline__ float moe_route_dot8(uint4 a, uint4 b, float acc) {
+    const __nv_bfloat162* ha = reinterpret_cast<const __nv_bfloat162*>(&a);
+    const __nv_bfloat162* hb = reinterpret_cast<const __nv_bfloat162*>(&b);
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const float2 fa = __bfloat1622float2(ha[j]);
-        const float2 fb = __bfloat1622float2(hb[j]);
-        acc = fmaf(fa.x, fb.x, acc);
-        acc = fmaf(fa.y, fb.y, acc);
-      }
+    for (int j = 0; j < 4; ++j) {
+      const float2 fa = __bfloat1622float2(ha[j]);
+      const float2 fb = __bfloat1622float2(hb[j]);
+      acc = fmaf(fa.x, fb.x, acc);
+      acc = fmaf(fa.y, fb.y, acc);
     }
-    return __bfloat162float(__float2bfloat16(acc));
+    return acc;
 }
 
-extern "C" __global__ void moe_route_bf16(
+#define MOE_ROUTE_EPB 32
+#define MOE_ROUTE_WORDS 64
+#define MOE_ROUTE_THREADS 128
+extern "C" __global__ __launch_bounds__(MOE_ROUTE_THREADS) void moe_route_logits_bf16(
     const bf16* __restrict__ x, const bf16* __restrict__ router,
-    int* __restrict__ ids, bf16* __restrict__ weights,
-    int rows, int experts, int top_k, int hidden) {
-  if ((int)blockIdx.x >= rows || experts < 1 || experts > 1024 || top_k < 1 ||
-      top_k > 32 || top_k >= experts || hidden < 8 || (hidden & 7) != 0 ||
-      (blockDim.x & 31) != 0 || (int)blockDim.x < experts ||
+    bf16* __restrict__ logits, int rows, int experts, int hidden) {
+  if ((int)blockIdx.y >= rows || experts < 1 || experts > 1024 || hidden < 8 ||
+      (hidden & 7) != 0 || blockDim.x != MOE_ROUTE_THREADS ||
+      (int)gridDim.x != (experts + MOE_ROUTE_EPB - 1) / MOE_ROUTE_EPB ||
       (reinterpret_cast<uintptr_t>(x) & 15) != 0 ||
       (reinterpret_cast<uintptr_t>(router) & 15) != 0)
     __trap();
 
+  __shared__ uint4 s_w[MOE_ROUTE_EPB][MOE_ROUTE_WORDS + 1];
+  __shared__ uint4 s_x[MOE_ROUTE_WORDS];
   const int tid = threadIdx.x;
-  const int row = blockIdx.x;
-  const int e = tid;
-  float logit = -CUDART_INF_F;
-  if (e < experts) logit = moe_route_logit(x, router, row, e, hidden);
-  moe_route_select(logit, ids, weights, experts, top_k);
+  const int row = blockIdx.y;
+  const int e0 = blockIdx.x * MOE_ROUTE_EPB;
+  const int words = hidden >> 3;
+  const uint4* xr = reinterpret_cast<const uint4*>(x + (size_t)row * hidden);
+  const uint4* wr = reinterpret_cast<const uint4*>(router);
+  const bool owner = tid < MOE_ROUTE_EPB && e0 + tid < experts;
+  float acc = 0.0f;
+  for (int c = 0; c < words; c += MOE_ROUTE_WORDS) {
+    const int n = min(MOE_ROUTE_WORDS, words - c);
+    if (n == MOE_ROUTE_WORDS && e0 + MOE_ROUTE_EPB <= experts) {
+      constexpr int per = MOE_ROUTE_EPB * MOE_ROUTE_WORDS / MOE_ROUTE_THREADS;
+      uint4 v[per];
+#pragma unroll
+      for (int p = 0; p < per; ++p) {
+        const int i = tid + p * MOE_ROUTE_THREADS;
+        v[p] = wr[(size_t)(e0 + i / MOE_ROUTE_WORDS) * words + c + i % MOE_ROUTE_WORDS];
+      }
+#pragma unroll
+      for (int p = 0; p < per; ++p) {
+        const int i = tid + p * MOE_ROUTE_THREADS;
+        s_w[i / MOE_ROUTE_WORDS][i % MOE_ROUTE_WORDS] = v[p];
+      }
+    } else {
+      for (int i = tid; i < MOE_ROUTE_EPB * MOE_ROUTE_WORDS; i += MOE_ROUTE_THREADS) {
+        const int r = i / MOE_ROUTE_WORDS, w = i % MOE_ROUTE_WORDS;
+        if (w < n && e0 + r < experts)
+          s_w[r][w] = wr[(size_t)(e0 + r) * words + c + w];
+      }
+    }
+    if (tid < n) s_x[tid] = xr[c + tid];
+    __syncthreads();
+    if (owner)
+      for (int w = 0; w < n; ++w) acc = moe_route_dot8(s_x[w], s_w[tid][w], acc);
+    __syncthreads();
+  }
+  if (owner) logits[(size_t)row * experts + e0 + tid] = __float2bfloat16(acc);
 }
 
 extern "C" __global__ void moe_route_topk(
