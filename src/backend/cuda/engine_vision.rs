@@ -3410,6 +3410,7 @@ mod tests {
             None
         };
         let io = VisionIo::new(device, OUTPUT)?;
+        device.finish_upload()?;
         let execute = |trace_patches| {
             io.project_position(
                 s,
