@@ -21,7 +21,7 @@
 // Phase-1 grid.x may exceed nchunks; blocks with blockIdx.x >= nchunks return before any write.
 // Phase-1 launch: block = threads (multiple of 32), grid = (nchunks, n_q_heads/qpack),
 //   smem = qpack*(threads/32)*(128+2)*4 bytes <= 48 KB.
-// Phase-2 launch: grid = n_q_heads, block = threads2 (multiple of 128, <= 1024),
+// Phase-2 launch: grid = n_q_heads, block = threads2 (power of two in [128, 1024]),
 //   smem = (2*nchunks + threads2)*4 bytes <= 48 KB.
 // nchunks is identical in both phases for the same (L, chunk).
 #include <cuda_runtime.h>
@@ -371,7 +371,7 @@ extern "C" __global__ void flash_decode_phase2(float* __restrict__ scratch,
 // Phase-1 grid.x may exceed nchunks; blocks with blockIdx.x >= nchunks return before any write.
 // Phase-1 launch: block = threads (multiple of 32), grid = (nchunks, n_q_heads/qpack, M),
 //   smem = qpack*(threads/32)*130*4 bytes <= 48 KB.
-// Phase-2 launch: grid = n_q_heads*M, block = threads2 (multiple of 128, <= 1024),
+// Phase-2 launch: grid = n_q_heads*M, block = threads2 (power of two in [128, 1024]),
 //   smem = (2*nchunks + threads2)*4 bytes <= 48 KB.
 
 constexpr int MQ_MAX = 16;              // guard range for query tokens: 1..MQ_MAX
