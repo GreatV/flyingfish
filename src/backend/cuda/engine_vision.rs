@@ -3499,6 +3499,9 @@ mod tests {
         let ops = Ops::new(&device.ctx)?;
         let closure = Rc::new(Closure::new(false, "merger bias rounding".into()));
         let mut blas = Blas::new(&device, &ops, &output, closure.clone())?;
+        for rows in [1u32, 37, 1120, 7104] {
+            blas.prepare_fixed(rows, HIDDEN, PATCH)?;
+        }
         closure.freeze_fixed()?;
         closure.ready(Instant::now())?;
         let mut patch_defects = 0;
