@@ -1429,11 +1429,12 @@ mod tests {
         let out = stream.clone_dtoh(&buffers.out)?;
         let state = stream.clone_dtoh(&buffers.state)?;
         let history = stream.clone_dtoh(&buffers.history)?;
-        let (prefix_states, prefix_histories) = if let Some((states, histories)) = &buffers.snapshots {
-            (stream.clone_dtoh(states)?, stream.clone_dtoh(histories)?)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let (prefix_states, prefix_histories) =
+            if let Some((states, histories)) = &buffers.snapshots {
+                (stream.clone_dtoh(states)?, stream.clone_dtoh(histories)?)
+            } else {
+                (Vec::new(), Vec::new())
+            };
         ensure!(
             out[..valid as usize * spec.hv as usize * 128]
                 .iter()
