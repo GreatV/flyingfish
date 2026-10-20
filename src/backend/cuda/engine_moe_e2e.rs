@@ -893,6 +893,544 @@ fn check_fixtures(fixtures: &Path, model_dir: &Path, cases: &[&str]) -> Result<(
     Ok(())
 }
 
+fn chain_state(model: &Engine) -> Result<Vec<u8>> {
+    let stream = &model.device.stream;
+    let mut values = Vec::new();
+    for layer in &model.state.gdn {
+        for buffer in [&layer.s, &layer.history] {
+            for value in stream.clone_dtoh(buffer)? {
+                ensure!(value.is_finite(), "nonfinite chain recurrent state");
+                values.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+    }
+    for cache in &model.state.kv {
+        for buffer in [&cache.k, &cache.v] {
+            for value in stream.clone_dtoh(buffer)? {
+                ensure!(value.is_finite(), "nonfinite chain KV");
+                values.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn restore_chain_state(model: &mut Engine, mut values: &[u8]) -> Result<()> {
+    let stream = &model.device.stream;
+    for layer in &mut model.state.gdn {
+        for buffer in [&mut layer.s, &mut layer.history] {
+            let (saved, tail) = values
+                .split_at_checked(buffer.len() * size_of::<f32>())
+                .context("chain recurrent state restore extent")?;
+            let saved: Vec<_> = saved
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|value| f32::from_le_bytes(*value))
+                .collect();
+            stream.memcpy_htod(&saved, buffer)?;
+            values = tail;
+        }
+    }
+    for cache in &mut model.state.kv {
+        for buffer in [&mut cache.k, &mut cache.v] {
+            let (saved, tail) = values
+                .split_at_checked(buffer.len() * size_of::<bf16>())
+                .context("chain KV restore extent")?;
+            let saved: Vec<_> = saved
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|value| bf16::from_bits(u16::from_le_bytes(*value)))
+                .collect();
+            stream.memcpy_htod(&saved, buffer)?;
+            values = tail;
+        }
+    }
+    ensure!(values.is_empty(), "chain state restore has trailing bytes");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA, published target/draft and an owned FLYINGFISH_RUNTIME_DIR"]
+fn minicpm_chain_verify_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let target = PathBuf::from(std::env::var("FF_MODEL")?);
+    let draft = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
+    let settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        draft_model: Some(draft),
+        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    Engine::calibrate(&target, 0, 256, Some(32), settings.clone())?;
+    let mut model = Engine::load(&target, 0, 256, Some(32), settings)?;
+    let stream = model.device.stream.clone();
+    let (rows, taps) = {
+        let spec = model.spec.as_ref().context("chain draft missing")?;
+        (
+            spec.draft.config.verify_rows()?,
+            spec.draft.config.target_layer_ids.clone(),
+        )
+    };
+    ensure!(
+        rows == 16 && model.model_spec.moe.is_some(),
+        "production block15 MoE fixture required"
+    );
+    let h = model.config.hidden_size;
+    let width = h * taps.len();
+    ensure!(
+        chain_state(&model)?.iter().all(|&value| value == 0),
+        "graph setup changed initial target state"
+    );
+    let mut initial_draft = Trace::default();
+    model
+        .spec
+        .as_ref()
+        .context("chain missing")?
+        .draft
+        .snapshot_kv(&mut initial_draft, 0, rows)?;
+    for layer in 0..model
+        .spec
+        .as_ref()
+        .context("chain missing")?
+        .draft
+        .config
+        .num_hidden_layers
+    {
+        for name in [format!("kv_k_{layer}"), format!("kv_v_{layer}")] {
+            ensure!(
+                initial_draft
+                    .values(&name)?
+                    .iter()
+                    .all(|value| value.to_bits() == 0),
+                "graph setup changed initial draft KV layer={layer}"
+            );
+        }
+    }
+    let mut defects = 0;
+    let mut wrong_layer = 0;
+    for prefix in [17usize, 65] {
+        model.reset()?;
+        let ids: Vec<_> = (0..prefix).map(|row| (row * 263 + 17) as u32).collect();
+        let mut trace = Trace::all_layers();
+        if prefix <= model.chunk {
+            model.prefill_tail(&ids, &mut trace, ids.len())?;
+            let capture = model
+                .hidden_capture
+                .as_ref()
+                .context("prefill tap binding missing")?;
+            let values = stream.clone_dtoh(&capture.values.slice(..prefix * width))?;
+            for (slot, layer) in taps.iter().enumerate() {
+                let expected = trace.values(&format!("layer.{layer}"))?;
+                ensure!(
+                    expected.len() == prefix * h,
+                    "prefill trace extent mismatch"
+                );
+                defects += values
+                    .chunks_exact(width)
+                    .enumerate()
+                    .map(|(row, values)| {
+                        values[slot * h..(slot + 1) * h]
+                            .iter()
+                            .zip(&expected[row * h..(row + 1) * h])
+                            .filter(|(a, b)| a.to_bits() != bf16::from_f32(**b).to_bits())
+                            .count()
+                    })
+                    .sum::<usize>();
+            }
+            let saved = values;
+            let first = taps[0];
+            let capture = model
+                .hidden_capture
+                .as_mut()
+                .context("tap control binding missing")?;
+            ensure!(
+                capture.layer_slots[first + 1].is_none(),
+                "wrong-layer control overlaps a tap"
+            );
+            capture.layer_slots[first] = None;
+            capture.layer_slots[first + 1] = Some(0);
+            model.reset()?;
+            model.prefill(&ids, None)?;
+            let capture = model
+                .hidden_capture
+                .as_mut()
+                .context("tap control binding missing")?;
+            let changed = stream.clone_dtoh(&capture.values.slice(..prefix * width))?;
+            wrong_layer += changed
+                .chunks_exact(width)
+                .zip(saved.chunks_exact(width))
+                .map(|(a, b)| {
+                    a[..h]
+                        .iter()
+                        .zip(&b[..h])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count()
+                })
+                .sum::<usize>();
+            capture.layer_slots[first + 1] = None;
+            capture.layer_slots[first] = Some(0);
+            model.reset()?;
+            model.prefill(&ids, None)?;
+        } else {
+            model.prefill(&ids, None)?;
+        }
+        let inputs: Vec<_> = (0..rows)
+            .map(|row| ((prefix + row) * 541 + 37) as u32)
+            .collect();
+        model.set_token(inputs[0])?;
+        model
+            .spec
+            .as_mut()
+            .context("chain missing")?
+            .checkpoint
+            .as_mut()
+            .context("chain checkpoint missing")?
+            .save(&model.state, &model.work.token, prefix, &stream, None)?;
+        let mut expected_states = vec![chain_state(&model)?];
+        let mut logits = Vec::new();
+        let mut captures = Vec::new();
+        let mut predictions = Vec::new();
+        for token in &inputs {
+            model.set_token(*token)?;
+            model.advance(false, None)?;
+            logits.extend(stream.clone_dtoh(&model.work.logits)?);
+            predictions.push(model.token()?);
+            captures.extend(
+                stream.clone_dtoh(
+                    &model
+                        .hidden_capture
+                        .as_ref()
+                        .context("decode taps missing")?
+                        .values
+                        .slice(..width),
+                )?,
+            );
+            expected_states.push(chain_state(&model)?);
+        }
+        model
+            .spec
+            .as_ref()
+            .context("chain missing")?
+            .checkpoint
+            .as_ref()
+            .context("chain checkpoint missing")?
+            .restore(&mut model.state, &mut model.work.token, &stream)?;
+        model.position = prefix;
+        model.committed_prefix_ids.truncate(prefix);
+        model.set_token(inputs[0])?;
+        stream.memcpy_htod(&[prefix as i32], &mut model.work.position)?;
+        stream.memcpy_htod(&[prefix as i32 + 1], &mut model.work.length)?;
+        stream.memcpy_htod(&inputs, &mut model.work.ids.slice_mut(..rows))?;
+        model.run_step(
+            crate::backend::Step {
+                rows,
+                input: crate::backend::Input::Ids,
+                mask: crate::backend::Mask::Causal,
+                head: Head::All,
+            },
+            None,
+        )?;
+        let spec = model.spec.as_ref().context("chain missing")?;
+        let actual = stream.clone_dtoh(&spec.logits)?;
+        let logit_mismatches = actual
+            .iter()
+            .zip(&logits)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let actual = stream.clone_dtoh(
+            &model
+                .hidden_capture
+                .as_ref()
+                .context("verify taps missing")?
+                .values
+                .slice(..rows * width),
+        )?;
+        let tap_mismatches = actual
+            .iter()
+            .zip(&captures)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let id_mismatches = stream
+            .clone_dtoh(&spec.predictions)?
+            .iter()
+            .zip(&predictions)
+            .filter(|(a, b)| a != b)
+            .count();
+        defects += logit_mismatches + tap_mismatches + id_mismatches;
+        for accepted in (0..=rows).rev() {
+            let spec = model.spec.as_ref().context("chain missing")?;
+            spec.checkpoint
+                .as_ref()
+                .context("chain checkpoint missing")?
+                .select_prefix(&mut model.state, &spec.snapshots, accepted, &stream)?;
+            let actual = chain_state(&model)?;
+            let mismatches = actual
+                .iter()
+                .zip(&expected_states[accepted])
+                .filter(|(a, b)| a != b)
+                .count();
+            defects += mismatches;
+            println!(
+                "{} minicpm_chain_prefix prefix={prefix} accepted={accepted} state_bit_mismatches={mismatches}",
+                if mismatches == 0 { "PASS" } else { "DEFECT" }
+            );
+        }
+        println!(
+            "{} minicpm_chain_verify prefix={prefix} rows={rows} logits_bit_mismatches={logit_mismatches} capture_bit_mismatches={tap_mismatches} id_mismatches={id_mismatches}",
+            if logit_mismatches + tap_mismatches + id_mismatches == 0 {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+    }
+    let ids: Vec<_> = (0..17).map(|row| (row * 263 + 17) as u32).collect();
+    model.reset()?;
+    model.prefill(&ids, None)?;
+    let mut greedy = Vec::new();
+    let mut greedy_states = vec![chain_state(&model)?];
+    let mut greedy_logits = Vec::new();
+    let mut greedy_taps = Vec::new();
+    model
+        .spec
+        .as_mut()
+        .context("chain missing")?
+        .checkpoint
+        .as_mut()
+        .context("checkpoint missing")?
+        .save(&model.state, &model.work.token, ids.len(), &stream, None)?;
+    for _ in 0..rows {
+        greedy.push(model.decode(false, None)?);
+        greedy_states.push(chain_state(&model)?);
+        greedy_logits.push(stream.clone_dtoh(&model.work.logits)?);
+        greedy_taps.extend(
+            stream.clone_dtoh(
+                &model
+                    .hidden_capture
+                    .as_ref()
+                    .context("greedy taps missing")?
+                    .values
+                    .slice(..width),
+            )?,
+        );
+    }
+    let greedy_taps = stream.clone_htod(&greedy_taps)?;
+    for graph in [false, true] {
+        model.set_spec_graph(graph)?;
+        for (matched, limit, eos) in [
+            (0usize, 16, None),
+            (7, 16, None),
+            (15, 16, None),
+            (15, 1, None),
+            (15, 8, None),
+            (15, 16, Some(greedy[3])),
+            (16, 16, None),
+        ] {
+            model.reset()?;
+            model.prefill(&ids, None)?;
+            model
+                .spec
+                .as_ref()
+                .context("chain missing")?
+                .checkpoint
+                .as_ref()
+                .context("checkpoint missing")?
+                .restore(&mut model.state, &mut model.work.token, &stream)?;
+            let anchor = model.token()?;
+            model.set_token(anchor)?;
+            model.set_spec_eos(&eos.into_iter().collect::<Vec<_>>())?;
+            if matched < rows {
+                let mut proposals = greedy[..rows - 1].to_vec();
+                if matched < rows - 1 {
+                    proposals[matched] = (proposals[matched] + 1) % model.model_spec.vocab;
+                }
+                model
+                    .spec
+                    .as_mut()
+                    .context("chain missing")?
+                    .forced_proposals = Some(proposals);
+            }
+            let graph_range =
+                super::super::super::profile::Range::new(graph, c"minicpm_chain_graph");
+            let round = model.spec_round(limit, None, "chain")?;
+            drop(graph_range);
+            let committed = round.output.len();
+            ensure!(
+                committed > 0 && committed <= rows,
+                "Runner FAIL transaction committed extent"
+            );
+            let mut expected = greedy[..(matched + 1).min(rows).min(limit)].to_vec();
+            if matched == rows {
+                expected.truncate(committed);
+            }
+            if let Some(index) = expected.iter().position(|id| Some(*id) == eos) {
+                expected.truncate(index + 1);
+            }
+            let output_mismatches = usize::from(round.output != expected)
+                + usize::from(round.accepted + 1 != committed);
+            let boundary_mismatches = usize::from(model.position != ids.len() + committed)
+                + usize::from(model.pending_token != expected.last().copied())
+                + usize::from(
+                    model.committed_prefix_ids
+                        != ids
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(anchor))
+                            .chain(expected.iter().copied().take(committed - 1))
+                            .collect::<Vec<_>>(),
+                );
+            let actual = chain_state(&model)?;
+            let state_mismatches = actual
+                .iter()
+                .zip(&greedy_states[committed])
+                .filter(|(a, b)| a != b)
+                .count();
+            let actual = stream.clone_dtoh(&model.work.logits)?;
+            let logit_mismatches = actual
+                .iter()
+                .zip(&greedy_logits[committed - 1])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let draft = &mut model.spec.as_mut().context("chain missing")?.draft;
+            let mut actual = Trace::default();
+            draft.snapshot_kv(&mut actual, ids.len(), rows)?;
+            draft.restore_kv(ids.len(), 0)?;
+            draft.inject(
+                &greedy_taps,
+                committed,
+                ids.len(),
+                super::super::super::draft::Compute {
+                    ops: &model.ops,
+                    blas: &mut model.blas,
+                },
+                None,
+            )?;
+            let mut expected_kv = Trace::default();
+            draft.snapshot_kv(&mut expected_kv, ids.len(), rows)?;
+            let mut draft_mismatches = 0;
+            for layer in 0..draft.config.num_hidden_layers {
+                for name in [format!("kv_k_{layer}"), format!("kv_v_{layer}")] {
+                    draft_mismatches += actual
+                        .values(&name)?
+                        .iter()
+                        .zip(expected_kv.values(&name)?)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                }
+            }
+            let mismatches = output_mismatches
+                + boundary_mismatches
+                + state_mismatches
+                + logit_mismatches
+                + draft_mismatches;
+            defects += mismatches;
+            println!(
+                "{} minicpm_chain_commit graph={graph} matched={matched} limit={limit} eos={eos:?} accepted={} committed={committed} output_mismatches={output_mismatches} boundary_mismatches={boundary_mismatches} state_bit_mismatches={state_mismatches} logits_bit_mismatches={logit_mismatches} draft_kv_bit_mismatches={draft_mismatches}",
+                if mismatches == 0 { "PASS" } else { "DEFECT" },
+                round.accepted
+            );
+        }
+    }
+    for graph in [false, true] {
+        model.set_spec_graph(graph)?;
+        model.reset()?;
+        model.prefill(&ids, None)?;
+        let before = chain_state(&model)?;
+        let mut draft_before = Trace::default();
+        model
+            .spec
+            .as_ref()
+            .context("chain missing")?
+            .draft
+            .snapshot_kv(&mut draft_before, ids.len(), rows)?;
+        let pending = model.pending_token;
+        let missing = if graph {
+            model
+                .spec
+                .as_mut()
+                .context("chain missing")?
+                .forced_proposals = Some(greedy[..rows - 1].to_vec());
+            model.spec.as_mut().context("chain missing")?.inject_graphs[7].take()
+        } else {
+            model.capture_fail_after_layer = Some((0, 1));
+            None
+        };
+        let error = model
+            .spec_round(8, None, "chain_error")
+            .err()
+            .context("Runner FAIL transaction fault was ignored")?;
+        if graph {
+            ensure!(
+                error
+                    .to_string()
+                    .contains("MoE commit graph rows=8 missing before Ready"),
+                "Runner FAIL graph fault reached a different failure: {error}"
+            );
+            model.spec.as_mut().context("chain missing")?.inject_graphs[7] = missing;
+        } else {
+            ensure!(
+                error.to_string().contains("injected capture failure"),
+                "Runner FAIL eager fault reached a different failure: {error}"
+            );
+        }
+        model.capture_fail_after_layer = None;
+        ensure!(
+            model.poisoned,
+            "Runner FAIL transaction fault was not exposed"
+        );
+        let mut error_mismatches = usize::from(chain_state(&model)? != before)
+            + usize::from(
+                model.position != ids.len()
+                    || model.pending_token != pending
+                    || model.committed_prefix_ids != ids,
+            );
+        let mut draft_after = Trace::default();
+        let draft = &model.spec.as_ref().context("chain missing")?.draft;
+        draft.snapshot_kv(&mut draft_after, ids.len(), rows)?;
+        for layer in 0..draft.config.num_hidden_layers {
+            for name in [format!("kv_k_{layer}"), format!("kv_v_{layer}")] {
+                error_mismatches += draft_before
+                    .values(&name)?
+                    .iter()
+                    .zip(draft_after.values(&name)?)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+            }
+        }
+        defects += error_mismatches;
+        println!(
+            "{} minicpm_chain_error graph={graph} restored_bit_mismatches={error_mismatches} poisoned=true",
+            if error_mismatches == 0 {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+        model.reset()?;
+    }
+    ensure!(
+        wrong_layer > 0,
+        "Runner FAIL wrong-layer capture control was not detected"
+    );
+    println!(
+        "{} minicpm_chain_verify_end rows=16 prefixes=17,65 accepted=0..16 wrong_layer_mismatches={wrong_layer} defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(
+        defects == 0,
+        "DEFECT production chain verification cells={defects}"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "CPU-only native fixtures; requires FF_MODEL, FF_MINICPM_REFERENCE_DIR and FF_VIDEO_REF_DIR"]
 fn minicpm_native_checkpoint_fixtures_cpu() -> Result<()> {
@@ -1083,6 +1621,511 @@ fn minicpm_bf16_timing_arm_gpu() -> Result<()> {
             "disk_experts":stats.values("residency.tier")?.iter().filter(|&&tier| tier==2.0).count(),
             "graph_segments":engine.graphs.len()
         }})
+    );
+    Ok(())
+}
+
+fn chain_replay(
+    model: &mut Engine,
+    round: &crate::dspark::Round,
+    origin: usize,
+    anchor: u32,
+) -> Result<usize> {
+    let stream = model.device.stream.clone();
+    let actual = chain_state(model)?;
+    model.check_logits()?;
+    let verified = stream.clone_dtoh(&model.spec.as_ref().context("chain missing")?.logits)?;
+    ensure!(
+        verified.iter().all(|value| value.is_finite()),
+        "nonfinite chain verification logits"
+    );
+    let logits = stream.clone_dtoh(&model.work.logits)?;
+    let sequence = stream.clone_dtoh(
+        model
+            .state
+            .sequence
+            .as_ref()
+            .context("chain sequence missing")?,
+    )?;
+    let position = stream.clone_dtoh(&model.work.position)?;
+    let length = stream.clone_dtoh(&model.work.length)?;
+    let token = model.token()?;
+    let boundary = (
+        model.position,
+        model.pending_token,
+        model.resident_ids_len,
+        model.last_input_kind,
+        model.committed_prefix_ids.clone(),
+    );
+    model
+        .spec
+        .as_ref()
+        .context("chain missing")?
+        .checkpoint
+        .as_ref()
+        .context("chain checkpoint missing")?
+        .restore(&mut model.state, &mut model.work.token, &stream)?;
+    model.position = origin;
+    model.committed_prefix_ids.truncate(origin);
+    stream.memcpy_htod(&[origin as i32], &mut model.work.position)?;
+    stream.memcpy_htod(&[origin as i32 + 1], &mut model.work.length)?;
+    let mut predictions = Vec::new();
+    for input in
+        std::iter::once(anchor).chain(round.output.iter().copied().take(round.committed - 1))
+    {
+        model.set_token(input)?;
+        predictions.push(model.decode(false, None)?);
+    }
+    let expected = chain_state(model)?;
+    ensure!(actual.len() == expected.len(), "chain replay state extent");
+    let state_mismatches = actual
+        .iter()
+        .zip(expected)
+        .filter(|(a, b)| **a != *b)
+        .count();
+    let replay_logits = stream.clone_dtoh(&model.work.logits)?;
+    let logit_mismatches = logits
+        .iter()
+        .zip(replay_logits)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let metadata_mismatches = usize::from(
+        boundary.0 != model.position
+            || boundary.1 != model.pending_token
+            || boundary.4 != model.committed_prefix_ids
+            || token != model.token()?
+            || position != stream.clone_dtoh(&model.work.position)?
+            || length != stream.clone_dtoh(&model.work.length)?
+            || sequence
+                != stream.clone_dtoh(
+                    model
+                        .state
+                        .sequence
+                        .as_ref()
+                        .context("chain sequence missing")?,
+                )?,
+    );
+    let output_mismatches = usize::from(predictions != round.output);
+    let acceptance_mismatches = usize::from(round.accepted + 1 != round.committed);
+    let mismatches = state_mismatches
+        + logit_mismatches
+        + metadata_mismatches
+        + output_mismatches
+        + acceptance_mismatches;
+    println!(
+        "{} minicpm_chain_boundary origin={origin} committed={} state_bit_mismatches={state_mismatches} logits_bit_mismatches={logit_mismatches} metadata_mismatches={metadata_mismatches} output_mismatches={output_mismatches} acceptance_mismatches={acceptance_mismatches}",
+        if mismatches == 0 { "PASS" } else { "DEFECT" },
+        round.committed
+    );
+    restore_chain_state(model, &actual)?;
+    stream.memcpy_htod(
+        &sequence,
+        model
+            .state
+            .sequence
+            .as_mut()
+            .context("chain sequence missing")?,
+    )?;
+    stream.memcpy_htod(&position, &mut model.work.position)?;
+    stream.memcpy_htod(&length, &mut model.work.length)?;
+    stream.memcpy_htod(&logits, &mut model.work.logits)?;
+    model.set_token(token)?;
+    model.position = boundary.0;
+    model.pending_token = boundary.1;
+    model.resident_ids_len = boundary.2;
+    model.last_input_kind = boundary.3;
+    model.committed_prefix_ids = boundary.4;
+    Ok(mismatches)
+}
+
+#[test]
+#[ignore = "requires CUDA, published target/draft, five T0 fixtures and owned runtime"]
+fn minicpm_chain_decode_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let target = PathBuf::from(std::env::var("FF_MODEL")?);
+    let draft = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
+    let fixtures = PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+    let cases = [
+        "text_32",
+        "text_1k",
+        "text_4k",
+        "image_hockey_16x",
+        "image_boat_16x",
+    ];
+    let mut inputs = Vec::new();
+    for case in cases {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let source = SafeTensors::deserialize(&bytes)?;
+        inputs.push(Input::read(&source, case)?);
+    }
+    let rows = crate::dspark::DraftConfig::read(
+        &draft,
+        &crate::model_spec::ModelSpec::read(&target)?.config(),
+    )?
+    .verify_rows()?;
+    let capacity = (inputs
+        .iter()
+        .map(|input| input.ids.len())
+        .max()
+        .context("no chain inputs")?
+        + 256
+        + rows)
+        .next_multiple_of(32);
+    let mut settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        draft_model: None,
+        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    Engine::calibrate(&target, 0, capacity, None, settings.clone())?;
+    let mut plain = Engine::load(&target, 0, capacity, None, settings.clone())?;
+    ensure!(plain.spec.is_none(), "plain baseline loaded a draft");
+    let layout = plain
+        .moe_slots
+        .as_ref()
+        .context("plain slots missing")?
+        .storage
+        .layout();
+    let plain_slots = (0..plain.model_spec.layers.len())
+        .map(|layer| layout.slot_count(layer as u32))
+        .collect::<Result<Vec<_>>>()?;
+    let eos = plain.model_spec.eos.clone();
+    let mut plain_only = Vec::new();
+    for (case, input) in cases.iter().zip(&inputs) {
+        plain.reset()?;
+        if !input.grids.is_empty() {
+            plain.prepare_multimodal(&input.packed(), None)?;
+        }
+        let mut ids = vec![plain.prefill(&input.ids, None)?];
+        while ids.len() < 256 && !eos.contains(ids.last().context("plain output missing")?) {
+            ids.push(plain.decode(false, None)?);
+        }
+        plain.check_logits()?;
+        ensure!(
+            plain
+                .qwen
+                .as_ref()
+                .context("plain runtime missing")?
+                .vision_encode_calls
+                == usize::from(!input.grids.is_empty()),
+            "plain encoder count {case}"
+        );
+        println!(
+            "minicpm_chain_plain_only case={case} tokens={} ids={ids:?} decoded={:?}",
+            ids.len(),
+            crate::tokenizer::decode(&target, &ids)?
+        );
+        plain_only.push(ids);
+    }
+    plain.synchronize()?;
+    drop(plain);
+    settings.draft_model = Some(draft);
+    Engine::calibrate(&target, 0, capacity, None, settings.clone())?;
+    let mut model = Engine::load(&target, 0, capacity, None, settings.clone())?;
+    ensure!(model.spec.is_some(), "chain target has no attached draft");
+    model.set_spec_eos(&eos)?;
+    let mut baseline = Vec::new();
+    for (case, input) in cases.iter().zip(&inputs) {
+        model.reset()?;
+        if !input.grids.is_empty() {
+            model.prepare_multimodal(&input.packed(), None)?;
+        }
+        let mut ids = vec![model.prefill(&input.ids, None)?];
+        while ids.len() < 256 && !eos.contains(ids.last().context("M1 output missing")?) {
+            ids.push(model.decode(false, None)?);
+        }
+        model.check_logits()?;
+        ensure!(
+            model
+                .qwen
+                .as_ref()
+                .context("M1 runtime missing")?
+                .vision_encode_calls
+                == usize::from(!input.grids.is_empty()),
+            "M1 encoder count {case}"
+        );
+        println!(
+            "PASS minicpm_chain_m1 case={case} draft_attached=true tokens={} ids={ids:?} decoded={:?}",
+            ids.len(),
+            crate::tokenizer::decode(&target, &ids)?
+        );
+        baseline.push(ids);
+    }
+    let layout = model
+        .moe_slots
+        .as_ref()
+        .context("chain slots missing")?
+        .storage
+        .layout();
+    let chain_slots = (0..model.model_spec.layers.len())
+        .map(|layer| layout.slot_count(layer as u32))
+        .collect::<Result<Vec<_>>>()?;
+    println!(
+        "minicpm_chain_deployment capacity={capacity} rows={rows} plain_slots={plain_slots:?} chain_slots={chain_slots:?} slot_delta={}",
+        i64::from(chain_slots.iter().sum::<u32>()) - i64::from(plain_slots.iter().sum::<u32>())
+    );
+    let mut defects = 0;
+    for graph in [false, true] {
+        model.set_spec_graph(graph)?;
+        let mut media_outputs = Vec::new();
+        for (((case, input), expected), ordinary) in
+            cases.iter().zip(&inputs).zip(&baseline).zip(&plain_only)
+        {
+            model.reset()?;
+            if !input.grids.is_empty() {
+                model.prepare_multimodal(&input.packed(), None)?;
+            }
+            let mut ids = vec![model.prefill(&input.ids, None)?];
+            let (mut rounds, mut accepted, mut committed) = (0, 0, 0);
+            while ids.len() < 256 && !eos.contains(ids.last().context("chain output missing")?) {
+                let origin = model.position;
+                let anchor = model.token()?;
+                let round = model.spec_round(256 - ids.len(), None, case)?;
+                ensure!(
+                    round.committed > 0
+                        && round.committed == round.output.len()
+                        && round.committed <= rows,
+                    "chain committed extent {case}"
+                );
+                defects += chain_replay(&mut model, &round, origin, anchor)?;
+                println!(
+                    "minicpm_chain_round case={case} graph={graph} round={rounds} accepted={} committed={} output={:?}",
+                    round.accepted, round.committed, round.output
+                );
+                accepted += round.accepted;
+                committed += round.committed;
+                rounds += 1;
+                ids.extend(&round.output);
+            }
+            let calls = model
+                .qwen
+                .as_ref()
+                .context("chain runtime missing")?
+                .vision_encode_calls;
+            ensure!(
+                calls == usize::from(!input.grids.is_empty()),
+                "chain encoder count {case}"
+            );
+            let mismatches = ids.iter().zip(expected).filter(|(a, b)| a != b).count()
+                + ids.len().abs_diff(expected.len());
+            defects += mismatches;
+            println!(
+                "{} minicpm_chain_lossless case={case} graph={graph} tokens={} expected_tokens={} token_mismatches={mismatches} rounds={rounds} accepted={accepted} committed={committed} encoder_calls={calls} ids={ids:?} decoded={:?} baseline=draft_attached_m1",
+                if mismatches == 0 { "PASS" } else { "DEFECT" },
+                ids.len(),
+                expected.len(),
+                crate::tokenizer::decode(&target, &ids)?
+            );
+            let agreement = ids.iter().zip(ordinary).filter(|(a, b)| a == b).count();
+            println!(
+                "minicpm_chain_plain_only_agreement case={case} graph={graph} exact={} matching_positions={agreement} dspark_tokens={} plain_only_tokens={} descriptive=true",
+                ids == *ordinary,
+                ids.len(),
+                ordinary.len()
+            );
+            if !input.grids.is_empty() {
+                media_outputs.push(ids);
+            }
+        }
+        let distinct = media_outputs.len() == 2 && media_outputs[0] != media_outputs[1];
+        defects += usize::from(!distinct);
+        println!(
+            "{} minicpm_chain_two_media graph={graph} distinct_ids={distinct}",
+            if distinct { "PASS" } else { "DEFECT" }
+        );
+    }
+    model.synchronize()?;
+    drop(model);
+    let options = crate::spec::Options {
+        device: 0,
+        capacity,
+        chunk: None,
+        backend: settings,
+        count: rows + 1,
+        ignore_eos: false,
+    };
+    let mut public =
+        crate::model::Model::load(&target, 0, capacity, None, options.backend.clone())?;
+    let first = baseline[0][0];
+    let eos_index = baseline[0]
+        .iter()
+        .take(rows)
+        .position(|&token| token != first)
+        .context("Runner FAIL EOS fixture has no distinct decode token")?;
+    let committed_counts = |output: &crate::spec::Output| {
+        output.rounds.iter().all(|round| {
+            round.accepted + 1 == round.committed && round.committed == round.output.len()
+        })
+    };
+    for graph in [false, true] {
+        public.set_spec_graph(graph)?;
+        public.config.eos_token_id = vec![baseline[0][eos_index]];
+        let output = crate::spec::produce_events(
+            &mut public,
+            &inputs[0].ids,
+            None,
+            &options,
+            None,
+            &mut |_| true,
+        )?;
+        let pass = output.ids == baseline[0][..=eos_index] && committed_counts(&output);
+        defects += usize::from(!pass);
+        println!(
+            "{} minicpm_chain_production_eos graph={graph} tokens={} expected_tokens={} ids={:?}",
+            if pass { "PASS" } else { "DEFECT" },
+            output.ids.len(),
+            eos_index + 1,
+            output.ids
+        );
+        ensure!(
+            public.rewind(public.position(), public.token()?).is_err(),
+            "Runner FAIL old scalar EOS rewind control did not reject recurrent state"
+        );
+        public.config.eos_token_id = eos.clone();
+        for index in [3, 4] {
+            let input = &inputs[index];
+            let output = crate::spec::produce_events(
+                &mut public,
+                &input.ids,
+                Some(&input.packed()),
+                &options,
+                None,
+                &mut |_| true,
+            )?;
+            let expected = &baseline[index][..options.count.min(baseline[index].len())];
+            let pass = output.ids == expected && committed_counts(&output);
+            defects += usize::from(!pass);
+            println!(
+                "{} minicpm_chain_production_media case={} graph={graph} tokens={} token_equal={pass} decoded={:?}",
+                if pass { "PASS" } else { "DEFECT" },
+                cases[index],
+                output.ids.len(),
+                crate::tokenizer::decode(&target, &output.ids)?
+            );
+        }
+    }
+    println!(
+        "{} minicpm_chain_decode_end cases=5 modes=2 horizon=256 natural_eos=true exact_tokens=true exact_boundaries=true production_eos_and_media=true defects={defects} lossless_scope=draft_attached_m1",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "DEFECT MiniCPM chain decode count={defects}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA, T0 fixtures, pinned calibration and explicit draft/graph timing arms"]
+fn minicpm_chain_decode_timing_gpu() -> Result<()> {
+    // One deployment arm runs text1k/text4k with one warmup and three measured decodes each.
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let target = PathBuf::from(std::env::var("FF_MODEL")?);
+    let fixtures = PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+    let graph = match std::env::var("FF_MINICPM_DECODE_GRAPH")?.as_str() {
+        "graph" => true,
+        "eager" => false,
+        value => anyhow::bail!("chain timing graph mode={value}"),
+    };
+    let settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        draft_model: std::env::var_os("FF_ARGMAX_DRAFT").map(PathBuf::from),
+        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut inputs = Vec::new();
+    for case in ["text_1k", "text_4k"] {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let tensors = SafeTensors::deserialize(&bytes)?;
+        inputs.push((case, integers(&tensors, "input_ids")?));
+    }
+    let capacity = (inputs
+        .iter()
+        .map(|(_, ids)| ids.len())
+        .max()
+        .context("no timing inputs")?
+        + 256
+        + crate::linear_plan::MAX_SKINNY_ROWS)
+        .next_multiple_of(32);
+    let setup = Instant::now();
+    let mut model = Engine::load(&target, 0, capacity, None, settings)?;
+    let setup_seconds = setup.elapsed().as_secs_f64();
+    let eos = model.model_spec.eos.clone();
+    let with_draft = model.spec.is_some();
+    if with_draft {
+        model.set_spec_graph(graph)?;
+        model.set_spec_eos(&eos)?;
+    }
+    let slots = model
+        .moe_slots
+        .as_ref()
+        .context("chain timing requires MoE slots")?
+        .storage
+        .layout();
+    let slots = (0..model.model_spec.layers.len())
+        .map(|layer| slots.slot_count(layer as u32))
+        .collect::<Result<Vec<_>>>()?;
+    println!(
+        "minicpm_chain_timing_plan {}",
+        serde_json::json!({"with_draft":with_draft,
+        "capacity":capacity,"slots_per_layer":slots,"setup_seconds":setup_seconds})
+    );
+    let mut defects = 0;
+    for (case, input) in inputs {
+        let mut expected = None;
+        for run in 0..4 {
+            model.reset()?;
+            let prefill = Instant::now();
+            let first = model.prefill(&input, None)?;
+            model.synchronize()?;
+            let prefill_seconds = prefill.elapsed().as_secs_f64();
+            let mut ids = vec![first];
+            let mut rounds = Vec::new();
+            let range = super::super::super::profile::Range::new(run > 0, c"minicpm_chain_decode");
+            let timer = Instant::now();
+            while ids.len() < 256 && !eos.contains(ids.last().context("timing output missing")?) {
+                if with_draft {
+                    let round = model.spec_round(256 - ids.len(), None, "timing")?;
+                    ids.extend(&round.output);
+                    rounds.push(round);
+                } else {
+                    ids.push(model.decode(graph, None)?);
+                }
+            }
+            model.synchronize()?;
+            let seconds = timer.elapsed().as_secs_f64();
+            drop(range);
+            model.check_logits()?;
+            ensure!(
+                seconds.is_finite() && seconds > 0.0,
+                "nonfinite/nonpositive chain timing"
+            );
+            let same = expected.as_ref().is_none_or(|expected| *expected == ids);
+            defects += usize::from(!same);
+            println!(
+                "{} minicpm_chain_decode_timing {}",
+                if same { "PASS" } else { "DEFECT" },
+                serde_json::json!({"case":case,"run":run,"measured":run>0,"with_draft":with_draft,
+                    "graph":graph,"seconds":seconds,"prefill_seconds":prefill_seconds,
+                    "tokens":ids.len(),"ids":ids,"rounds":rounds})
+            );
+            if expected.is_none() {
+                expected = Some(ids);
+            }
+        }
+    }
+    ensure!(
+        defects == 0,
+        "DEFECT chain timing output changed across repeats count={defects}"
     );
     Ok(())
 }

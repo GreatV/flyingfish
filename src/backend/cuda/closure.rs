@@ -86,14 +86,61 @@ pub(super) fn small_rows(chunk: usize, capacity: usize) -> usize {
     chunk.min(capacity).min(16)
 }
 
-pub(super) fn injection_limit(small_rows: usize) -> usize {
-    small_rows.max(8)
+pub(super) fn injection_limit(small_rows: usize, verify_rows: usize) -> usize {
+    small_rows.max(verify_rows)
 }
 
-pub(super) fn forward_rows(small_rows: usize, budget: Option<SpecBudget>) -> BTreeSet<usize> {
-    (1..=small_rows)
-        .chain(budget.into_iter().flat_map(|b| [7, b.rows()]))
-        .collect()
+pub(super) fn forward_rows(
+    small_rows: usize,
+    budget: Option<SpecBudget>,
+    draft: Option<&crate::dspark::DraftConfig>,
+) -> Result<BTreeSet<usize>> {
+    let mut rows = (1..=small_rows).collect::<BTreeSet<_>>();
+    if let Some(budget) = budget {
+        let draft = draft.context("draft geometry missing from forward-row declaration")?;
+        rows.insert(draft.block_size);
+        rows.insert(if budget.is_tree() {
+            budget.rows()
+        } else {
+            draft.verify_rows()?
+        });
+    }
+    Ok(rows)
+}
+
+fn draft_shapes(
+    draft: &crate::dspark::DraftConfig,
+    injection_rows: usize,
+) -> (BTreeSet<LinearShape>, Pairs) {
+    let rows = draft.block_size;
+    let h = draft.hidden_size;
+    let f = draft.intermediate_size;
+    let roles = [
+        (rows, draft.qkv_dim(), h),
+        (rows, h, h),
+        (rows, 2 * f, h),
+        (rows, h, f),
+        (rows, draft.vocab_size, h),
+        (1, draft.vocab_size, draft.markov_rank),
+    ]
+    .into_iter()
+    .chain(
+        (1..=injection_rows)
+            .flat_map(|rows| [(rows, h, draft.capture_width()), (rows, draft.kv_dim(), h)]),
+    );
+    let all: BTreeSet<_> = roles
+        .map(|(rows, output, input)| LinearShape {
+            rows,
+            output,
+            input,
+        })
+        .collect();
+    let pairs = all.iter().map(|s| (s.output, s.input)).collect();
+    let linear = all
+        .into_iter()
+        .filter(|shape| super::linear_calibrate::supports(*shape))
+        .collect();
+    (linear, pairs)
 }
 
 fn shapes(
@@ -115,7 +162,7 @@ fn shapes(
             linear.insert(shape);
         }
     };
-    for rows in forward_rows(small_rows, budget) {
+    for rows in forward_rows(small_rows, budget, draft)? {
         for (output, input) in [
             (c.qkv_dim(), c.hidden_size),
             (c.hidden_size, c.hidden_size),
@@ -128,31 +175,46 @@ fn shapes(
     add(1, c.vocab_size, c.hidden_size);
     if let Some(budget) = budget {
         let draft = draft.context("draft config missing from closure declaration")?;
-        for (output, input) in [
-            (draft.qkv_dim(), draft.hidden_size),
-            (draft.hidden_size, draft.hidden_size),
-            (2 * draft.intermediate_size, draft.hidden_size),
-            (draft.hidden_size, draft.intermediate_size),
-            (draft.vocab_size, draft.hidden_size),
-        ] {
-            add(draft.block_size, output, input);
-        }
-        add(budget.rows(), c.vocab_size, c.hidden_size);
-        let max = injection_limit(small_rows);
-        for rows in 1..=max {
-            for (output, input) in [
-                (draft.hidden_size, draft.capture_width()),
-                (draft.kv_dim(), draft.hidden_size),
-            ] {
-                add(rows, output, input);
-            }
-        }
-        add(1, draft.vocab_size, draft.markov_rank);
+        let verify_rows = if budget.is_tree() {
+            budget.rows()
+        } else {
+            draft.verify_rows()?
+        };
+        add(verify_rows, c.vocab_size, c.hidden_size);
+        let (draft_linear, draft_pairs) =
+            draft_shapes(draft, injection_limit(small_rows, draft.verify_rows()?));
+        linear.extend(draft_linear);
+        pairs.extend(draft_pairs);
     }
     Ok((linear, pairs))
 }
 
 impl Profile {
+    pub(super) fn draft(
+        config: &crate::dspark::DraftConfig,
+        capacity: usize,
+        rows: usize,
+        model: &Path,
+        draft: &Path,
+    ) -> Result<Self> {
+        ensure!(
+            config.head_dim == 256 && rows >= config.verify_rows()? && rows <= capacity,
+            "hybrid draft calibration geometry exceeds its workspace"
+        );
+        let small_rows = small_rows(rows, capacity);
+        let (linear, pairs) =
+            draft_shapes(config, injection_limit(small_rows, config.verify_rows()?));
+        Ok(Self {
+            linear,
+            pairs,
+            attention: Vec::new(),
+            capacity,
+            small_rows,
+            budget: Some(config.verify_rows()?),
+            model: hash(&fs::read(model.join("config.json"))?),
+            draft: Some(hash(&fs::read(draft.join("config.json"))?)),
+        })
+    }
     pub fn new(
         c: &Config,
         capacity: usize,
@@ -171,7 +233,17 @@ impl Profile {
             attention: attention(budget),
             capacity,
             small_rows,
-            budget: budget.map(SpecBudget::rows),
+            budget: budget
+                .map(|b| {
+                    if b.is_tree() {
+                        Ok(b.rows())
+                    } else {
+                        draft_config
+                            .context("draft geometry missing from chain profile")?
+                            .verify_rows()
+                    }
+                })
+                .transpose()?,
             model: hash(&fs::read(model.join("config.json"))?),
             draft: draft
                 .map(|p| fs::read(p.join("config.json")).map(|b| hash(&b)))
@@ -472,7 +544,9 @@ mod tests {
                         Some(&draft),
                     )?;
                     let mut missing = BTreeSet::new();
-                    for injected in 1..=injection_limit(small_rows(chunk, 4096)) {
+                    for injected in
+                        1..=injection_limit(small_rows(chunk, 4096), draft.verify_rows()?)
+                    {
                         for (site, rows, output, input) in [
                             (
                                 "inject_block/fc",
@@ -743,10 +817,10 @@ mod tests {
             SpecBudget::Tree64,
         ] {
             for chunk in [1, 8, 9, 15, 16, 32] {
-                let limit = injection_limit(small_rows(chunk, 4096));
+                let limit = injection_limit(small_rows(chunk, 4096), draft.verify_rows()?);
                 let (linear, pairs) =
                     shapes(&c, small_rows(chunk, 4096), Some(budget), draft_config)?;
-                let allowed = forward_rows(small_rows(chunk, 4096), Some(budget));
+                let allowed = forward_rows(small_rows(chunk, 4096), Some(budget), draft_config)?;
                 let workspace = budget.workspace_rows(chunk);
                 for rows in 1..=workspace {
                     let step = crate::backend::Step {
@@ -834,6 +908,55 @@ mod tests {
             draft_config,
         )?;
         assert!(wide.iter().all(|s| s.rows <= 16));
+        let mut full = draft;
+        full.block_size = 15;
+        full.head_dim = 256;
+        full.num_attention_heads = 8;
+        full.num_key_value_heads = 2;
+        let allowed = forward_rows(1, Some(SpecBudget::Chain), Some(&full))?;
+        assert_eq!(allowed, BTreeSet::from([1, 15, 16]));
+        let step = crate::backend::Step {
+            rows: 16,
+            input: crate::backend::Input::Ids,
+            head: crate::backend::Head::All,
+            mask: crate::backend::Mask::Causal,
+        };
+        assert!(step.check(16, 16, &allowed).is_ok());
+        assert!(step.check(16, 16, &BTreeSet::from([1, 7, 8])).is_err());
+        let (linear, _) = shapes(&c, 1, Some(SpecBudget::Chain), Some(&full))?;
+        let (draft_linear, draft_pairs) = draft_shapes(&full, full.verify_rows()?);
+        for rows in 1..=full.verify_rows()? {
+            let projected = LinearShape {
+                rows,
+                output: full.hidden_size,
+                input: full.capture_width(),
+            };
+            let kv = LinearShape {
+                rows,
+                output: full.kv_dim(),
+                input: full.hidden_size,
+            };
+            for shape in [projected, kv] {
+                assert!(linear.contains(&shape));
+                assert!(draft_linear.contains(&shape));
+                assert!(draft_pairs.contains(&(shape.output, shape.input)));
+            }
+        }
+        assert_eq!(draft_linear.len(), 6 + 2 * full.verify_rows()?);
+        assert!(!draft_linear.contains(&LinearShape {
+            rows: full.verify_rows()?,
+            output: c.vocab_size,
+            input: c.hidden_size
+        }));
+        assert!(linear.contains(&LinearShape {
+            rows: 16,
+            output: c.vocab_size,
+            input: c.hidden_size
+        }));
+        assert!(forward_rows(1, Some(SpecBudget::Chain), None).is_err());
+        println!(
+            "PASS chain_geometry_declaration block=15 verify=16 injection=1..16 legacy_7_8_rejected=true"
+        );
         Ok(())
     }
 

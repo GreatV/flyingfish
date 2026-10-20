@@ -135,10 +135,11 @@ extern "C" __global__ void gdn_conv_hist_snapshot(
         const GdnMeta* __restrict__ meta, int conv_dim, float* __restrict__ snapshots) {
     const int ch = blockIdx.x * GDN_CONV_CHAN + threadIdx.x;
     const int rows = meta->valid_rows;
+    constexpr int row_limit = GDN_HEADS == 32 ? 16 : 5;
     if (conv_dim != GDN_CONV_DIM || blockDim.x != GDN_CONV_CHAN || blockDim.y != 1 ||
         blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1 || ch >= conv_dim ||
         !aligned16(qkv) || !aligned16(history) || !aligned16(snapshots) ||
-        rows < 1 || rows > 5 || meta->prefix < 0 || meta->causal != 1 ||
+        rows < 1 || rows > row_limit || meta->prefix < 0 || meta->causal != 1 ||
         meta->key_count != meta->prefix + rows || meta->capacity < meta->key_count) {
         __trap(); return;
     }

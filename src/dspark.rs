@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct DraftConfig {
     pub model_type: String,
     pub architectures: Vec<String>,
@@ -27,7 +27,7 @@ pub struct DraftConfig {
     pub rope_parameters: Rope,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rope {
     pub rope_theta: f32,
@@ -95,8 +95,63 @@ impl Rules {
 }
 
 impl DraftConfig {
+    pub fn verify_rows(&self) -> Result<usize> {
+        self.block_size
+            .checked_add(1)
+            .context("DSpark block_size+1 overflow")
+    }
+    pub fn target_rows(&self, spec: &crate::model_spec::ModelSpec) -> Result<usize> {
+        let rows = self.verify_rows()?;
+        ensure!(
+            spec.moe.is_some()
+                && self.head_dim == 256
+                && self.num_attention_heads == 8
+                && self.num_key_value_heads == 2,
+            "DSpark target architecture={:?} draft attention={}/{}/{} requires MoE with 8/2/256 draft heads",
+            spec.architecture,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim
+        );
+        ensure!(
+            (2..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
+            "DSpark block_size={} verify_rows={rows} exceeds skinny and routed arithmetic bound={}",
+            self.block_size,
+            crate::linear_plan::MAX_SKINNY_ROWS
+        );
+        Ok(rows)
+    }
+    #[cfg(any(feature = "cuda", test))]
+    pub(crate) fn target_state_bytes(&self, spec: &crate::model_spec::ModelSpec) -> Result<usize> {
+        let rows = self.target_rows(spec)?;
+        let layers = spec
+            .layers
+            .iter()
+            .filter(|layer| layer.mixer == crate::model_spec::Mixer::Gdn)
+            .count();
+        let images =
+            usize::try_from(crate::op_contract::GdnSpec::from_model(spec)?.image_bytes()?)?
+                .checked_mul(layers)
+                .and_then(|n| n.checked_mul(rows - 1))
+                .context("DSpark intermediate GDN snapshots overflow")?;
+        crate::mtp::checkpoint_bytes(spec, rows)?
+            .checked_add(images)
+            .context("DSpark target transaction byte overflow")
+    }
     pub fn capture_width(&self) -> usize {
         self.target_layer_ids.len() * self.hidden_size
+    }
+    pub fn workspace_row_bytes(&self) -> Result<usize> {
+        let kv = self
+            .num_key_value_heads
+            .checked_mul(self.head_dim)
+            .and_then(|n| n.checked_mul(5))
+            .context("DSpark KV workspace row overflow")?;
+        self.hidden_size
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(kv))
+            .and_then(|n| n.checked_mul(size_of::<half::bf16>()))
+            .context("DSpark workspace row bytes overflow")
     }
     pub fn kv_dim(&self) -> usize {
         self.num_key_value_heads * self.head_dim
@@ -271,7 +326,7 @@ fn read_config(path: &Path) -> Result<serde_json::Value> {
     Ok(value)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn read_capture_layers(path: &Path, target: &Config) -> Result<Vec<usize>> {
     let value = read_config(path)?;
     ensure!(
@@ -364,7 +419,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn target_capture_metadata_preserves_slots_and_rejects_bad_extents() -> Result<()> {
         let target: Config = serde_json::from_value(serde_json::json!({
             "model_type":"llama", "hidden_size":2048, "intermediate_size":6144,
@@ -491,6 +545,112 @@ mod tests {
             ensure!(
                 draft.block_size == 15 && draft.kv_dim() == 512 && draft.qkv_dim() == 3072,
                 "draft geometry borrowed target dimensions"
+            );
+            let model = crate::model_spec::ModelSpec::minicpm(
+                &serde_json::from_str(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/data/minicpm-config.json"
+                )))?,
+                &serde_json::json!({"eos_token_id":[248044,248046]}),
+            )?;
+            ensure!(
+                draft.target_rows(&model)? == 16,
+                "draft verify extent changed"
+            );
+            ensure!(
+                draft.workspace_row_bytes()? == 13_312,
+                "draft row workspace must include projected/context and five KV widths"
+            );
+            let total = 24usize << 30;
+            let mut row_request = crate::prefill::WorkspaceRequest {
+                capacity: 16,
+                requested: Some(16),
+                free_after_resident: total / 16
+                    + 16 * model.hidden as usize * size_of::<half::bf16>(),
+                total,
+                alignment: 1,
+                row_bytes: model.hidden as usize * size_of::<half::bf16>(),
+                fixed_transient_bytes: 0,
+            };
+            ensure!(
+                crate::prefill::WorkspaceBudget::new(row_request, |_| Ok(0), Ok).is_ok(),
+                "omitted draft-row reserve control did not admit"
+            );
+            row_request.row_bytes += draft.workspace_row_bytes()?;
+            ensure!(
+                crate::prefill::WorkspaceBudget::new(row_request, |_| Ok(0), Ok).is_err(),
+                "draft rows escaped the workspace budget"
+            );
+            ensure!(
+                draft.target_state_bytes(&model)? == 1_054_146_596,
+                "block15 transaction must retain 30 GDN checkpoint+15 prefix images and 16 KV write slots for 10 attention layers"
+            );
+            let state_bytes = draft.target_state_bytes(&model)?;
+            let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&model)?;
+            let slot_bytes = crate::experts::catalogue::ExpertLayout::new(
+                crate::model_spec::ExpertFormat::Bf16,
+                &geometry,
+            )?
+            .slot_bytes();
+            let request = crate::prefill::ExpertWorkspaceRequest {
+                mixer: crate::prefill::WorkspaceRequest {
+                    capacity: 16,
+                    requested: Some(16),
+                    free_after_resident: state_bytes / 2,
+                    total: 24 << 30,
+                    alignment: 1,
+                    row_bytes: model.hidden as usize * size_of::<half::bf16>(),
+                    fixed_transient_bytes: 0,
+                },
+                span_rows: 16,
+                wave_rows: 16,
+                wave_workspace_bytes: 0,
+                device_headroom_bytes: 0,
+                host_fixed_bytes: 0,
+                prefill_staging_slots: 1,
+                disk_ring_slots: 0,
+            };
+            let budget = |request| {
+                crate::prefill::ExpertWorkspaceBudget::new(
+                    request,
+                    geometry,
+                    slot_bytes,
+                    |_| Ok(0),
+                    Ok,
+                )
+            };
+            ensure!(
+                budget(request).is_ok(),
+                "omitted-reserve control did not admit"
+            );
+            let mut reserved = request;
+            reserved.mixer.fixed_transient_bytes = state_bytes;
+            ensure!(
+                budget(reserved).is_err(),
+                "snapshot reserve escaped expert admission"
+            );
+            let mut invalid_rows = DraftConfig::read(&root, &hybrid_target)?;
+            for block in [0, crate::linear_plan::MAX_SKINNY_ROWS, usize::MAX] {
+                invalid_rows.block_size = block;
+                ensure!(
+                    invalid_rows.target_rows(&model).is_err(),
+                    "invalid verify extent admitted block={block}"
+                );
+            }
+            invalid_rows.hidden_size = usize::MAX;
+            ensure!(
+                invalid_rows.workspace_row_bytes().is_err(),
+                "overflowed draft hidden workspace admitted"
+            );
+            invalid_rows.hidden_size = draft.hidden_size;
+            invalid_rows.num_key_value_heads = usize::MAX;
+            ensure!(
+                invalid_rows.workspace_row_bytes().is_err(),
+                "overflowed draft KV workspace admitted"
+            );
+            println!(
+                "PASS draft_workspace_row_bytes={} omitted_reserve=admitted charged_reserve=rejected overflow_controls=2",
+                draft.workspace_row_bytes()?
             );
             let mut admitted = Vec::new();
             for (schema, original, target) in

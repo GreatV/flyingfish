@@ -119,22 +119,8 @@ __device__ void moe_route_select(
   }
 }
 
-extern "C" __global__ void moe_route_bf16(
-    const bf16* __restrict__ x, const bf16* __restrict__ router,
-    int* __restrict__ ids, bf16* __restrict__ weights,
-    int rows, int experts, int top_k, int hidden) {
-  if ((int)blockIdx.x >= rows || experts < 1 || experts > 1024 || top_k < 1 ||
-      top_k > 32 || top_k >= experts || hidden < 8 || (hidden & 7) != 0 ||
-      (blockDim.x & 31) != 0 || (int)blockDim.x < experts ||
-      (reinterpret_cast<uintptr_t>(x) & 15) != 0 ||
-      (reinterpret_cast<uintptr_t>(router) & 15) != 0)
-    __trap();
-
-  const int tid = threadIdx.x;
-  const int row = blockIdx.x;
-  const int e = tid;
-  float logit = -CUDART_INF_F;
-  if (e < experts) {
+__device__ __forceinline__ float moe_route_logit(
+    const bf16* x, const bf16* router, int row, int e, int hidden) {
     const uint4* xr = reinterpret_cast<const uint4*>(x + (size_t)row * hidden);
     const uint4* wr =
         reinterpret_cast<const uint4*>(router + (size_t)e * hidden);
@@ -154,8 +140,25 @@ extern "C" __global__ void moe_route_bf16(
         acc = fmaf(fa.y, fb.y, acc);
       }
     }
-    logit = __bfloat162float(__float2bfloat16(acc));
-  }
+    return __bfloat162float(__float2bfloat16(acc));
+}
+
+extern "C" __global__ void moe_route_bf16(
+    const bf16* __restrict__ x, const bf16* __restrict__ router,
+    int* __restrict__ ids, bf16* __restrict__ weights,
+    int rows, int experts, int top_k, int hidden) {
+  if ((int)blockIdx.x >= rows || experts < 1 || experts > 1024 || top_k < 1 ||
+      top_k > 32 || top_k >= experts || hidden < 8 || (hidden & 7) != 0 ||
+      (blockDim.x & 31) != 0 || (int)blockDim.x < experts ||
+      (reinterpret_cast<uintptr_t>(x) & 15) != 0 ||
+      (reinterpret_cast<uintptr_t>(router) & 15) != 0)
+    __trap();
+
+  const int tid = threadIdx.x;
+  const int row = blockIdx.x;
+  const int e = tid;
+  float logit = -CUDART_INF_F;
+  if (e < experts) logit = moe_route_logit(x, router, row, e, hidden);
   moe_route_select(logit, ids, weights, experts, top_k);
 }
 

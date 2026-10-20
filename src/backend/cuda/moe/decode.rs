@@ -14,6 +14,7 @@ use std::sync::Arc;
 pub(crate) struct DecodeOps {
     gate_up: CudaFunction,
     down: CudaFunction,
+    invariant: Option<(CudaFunction, CudaFunction)>,
     gate_up_w8a16: CudaFunction,
     down_w8a16: CudaFunction,
     #[cfg(test)]
@@ -63,8 +64,9 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
     input.x.validate()?;
     let (rows, hidden) = (input.x.shape[0], input.x.shape[1]);
     ensure!(
-        (1..=8).contains(&rows),
-        "decode rows {rows} outside [1,8] (x shape {:?})",
+        (1..=crate::linear_plan::MAX_SKINNY_ROWS as u32).contains(&rows),
+        "decode rows {rows} exceeds skinny bound={} (x shape {:?})",
+        crate::linear_plan::MAX_SKINNY_ROWS,
         input.x.shape
     );
     ensure!(
@@ -180,6 +182,11 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
         spans_disjoint(
             input.x.ptr,
             input.x.span_bytes,
+            shared_out.ptr,
+            shared_out.span_bytes
+        ) && spans_disjoint(
+            input.x.ptr,
+            input.x.span_bytes,
             input.contributions.ptr,
             input.contributions.span_bytes
         ) && spans_disjoint(
@@ -193,7 +200,7 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
             input.contributions.ptr,
             input.contributions.span_bytes
         ),
-        "decode contributions overlap x/shared_out/done (contributions ptr {:#x} bytes {}, x ptr {:#x}, shared_out ptr {:#x}, done ptr {:#x})",
+        "decode contributions/shared_out overlap x/shared_out/done (contributions ptr {:#x} bytes {}, x ptr {:#x}, shared_out ptr {:#x}, done ptr {:#x})",
         input.contributions.ptr,
         input.contributions.span_bytes,
         input.x.ptr,
@@ -278,8 +285,25 @@ impl DecodeOps {
         Ok(Self {
             gate_up: module.load_function("moe_ffn_gate_up")?,
             down: module.load_function("moe_ffn_down")?,
+            invariant: None,
             gate_up_w8a16: module.load_function("moe_ffn_gate_up_w8a16")?,
             down_w8a16: module.load_function("moe_ffn_down_w8a16")?,
+            #[cfg(test)]
+            combine: CombineOps::new(ctx)?,
+        })
+    }
+
+    pub(crate) fn new_invariant(ctx: &Arc<CudaContext>) -> Result<Self> {
+        let module = cubin::module(ctx, "moe_ffn")?;
+        Ok(Self {
+            gate_up: module.load_function("moe_ffn_gate_up_lane16")?,
+            down: module.load_function("moe_ffn_down_lane16")?,
+            gate_up_w8a16: module.load_function("moe_ffn_gate_up_w8a16_lane16")?,
+            down_w8a16: module.load_function("moe_ffn_down_w8a16_lane16")?,
+            invariant: Some((
+                cubin::module(ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,
+                cubin::module(ctx, "act")?.load_function("silu_mul_split")?,
+            )),
             #[cfg(test)]
             combine: CombineOps::new(ctx)?,
         })
@@ -311,6 +335,18 @@ impl DecodeOps {
             hidden,
             inter,
         } = dims;
+        ensure!(
+            self.invariant.is_some() || rows <= 8,
+            "legacy decode row bound=8, requested={rows}"
+        );
+        ensure!(
+            self.invariant.is_none()
+                || (u64::from(hidden) >= 2 * u64::from(inter)
+                    && hidden.is_multiple_of(256)
+                    && inter.is_multiple_of(256)),
+            "invariant shared expert requires hidden>=2*inter and 256-aligned widths: hidden={hidden} inter={inter}"
+        );
+        let invariant = u32::from(self.invariant.is_some());
         let h_bytes = u64::from(rows) * u64::from(top_k) * u64::from(inter) * 2;
         let h_ptr = scratch.ptr;
         let hs_ptr = scratch.ptr + h_bytes;
@@ -334,7 +370,7 @@ impl DecodeOps {
                 .arg(&(hidden as i32))
                 .arg(&(inter as i32))
                 .launch(LaunchConfig {
-                    grid_dim: (inter.div_ceil(32), rows, top_k + 1),
+                    grid_dim: (inter.div_ceil(32 >> invariant), rows, top_k + 1 - invariant),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: hidden * 2,
                 })?;
@@ -359,10 +395,53 @@ impl DecodeOps {
                 .arg(&(hidden as i32))
                 .arg(&(inter as i32))
                 .launch(LaunchConfig {
-                    grid_dim: (hidden.div_ceil(16), rows, top_k + 1),
+                    grid_dim: (
+                        hidden.div_ceil(16 >> invariant),
+                        rows,
+                        top_k + 1 - invariant,
+                    ),
                     block_dim: (128, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
+        }
+        if let Some((skinny, silu)) = &self.invariant {
+            let shared = input.shared_out.read().ptr;
+            let up = shared + u64::from(rows) * u64::from(inter) * 2;
+            let gemm = |weight: u64, x: u64, y: u64, columns: u32, inner: u32| -> Result<()> {
+                // SAFETY: validated dense regions cover every complete weight and activation tile.
+                unsafe {
+                    stream
+                        .launch_builder(skinny)
+                        .arg(&weight)
+                        .arg(&x)
+                        .arg(&y)
+                        .arg(&(columns as i32))
+                        .arg(&(inner as i32))
+                        .arg(&i64::from(inner))
+                        .arg(&(rows as i32))
+                        .launch(crate::backend::cuda::blas::Blas::skinny_launch(
+                            crate::backend::setup::LinearShape {
+                                rows: rows as usize,
+                                output: columns as usize,
+                                input: inner as usize,
+                            },
+                        )?)?;
+                }
+                Ok(())
+            };
+            gemm(input.shared_gate.ptr, input.x.ptr, shared, inter, hidden)?;
+            gemm(input.shared_up.ptr, input.x.ptr, up, inter, hidden)?;
+            // SAFETY: shared_out holds two rows*inter regions; hs_ptr is disjoint scratch.
+            unsafe {
+                stream
+                    .launch_builder(silu)
+                    .arg(&shared)
+                    .arg(&up)
+                    .arg(&hs_ptr)
+                    .arg(&((rows * inter) as i32))
+                    .launch(crate::backend::cuda::ops::flat((rows * inter) as usize))?;
+            }
+            gemm(input.shared_down.ptr, hs_ptr, shared, hidden, inter)?;
         }
         Ok(())
     }

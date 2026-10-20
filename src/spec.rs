@@ -30,7 +30,6 @@ pub fn check_tree_greedy(
         options.backend.spec_budget.is_tree(),
         "check-tree-greedy requires --spec-budget tree16, tree32 or tree64"
     );
-    check(ids, options)?;
     ensure!(
         options.ignore_eos,
         "strict tree greedy check requires --ignore-eos"
@@ -46,6 +45,7 @@ pub fn check_tree_greedy(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     let mut plain_settings = options.backend.clone();
     plain_settings.draft_model = None;
@@ -112,7 +112,6 @@ pub fn compare_padding(
     options: &Options,
     nodes: usize,
 ) -> Result<()> {
-    check(ids, options)?;
     ensure!(
         options.backend.spec_budget.is_tree()
             && nodes > 1
@@ -126,6 +125,7 @@ pub fn compare_padding(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     let anchor = model.prefill(ids, None)?;
     let mut tokens = vec![anchor];
@@ -176,7 +176,6 @@ pub fn compare_padding(
 }
 
 pub fn compare_graph(target: &Path, draft: &Path, ids: &[u32], options: &Options) -> Result<()> {
-    check(ids, options)?;
     let mut model = Model::load(
         target,
         options.device,
@@ -184,6 +183,7 @@ pub fn compare_graph(target: &Path, draft: &Path, ids: &[u32], options: &Options
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     model.set_spec_graph(false)?;
     model.reset()?;
@@ -256,7 +256,7 @@ fn produce(
     options: &Options,
     trace: Option<&mut Trace>,
 ) -> Result<Output> {
-    produce_events(m, ids, options, trace, &mut |_| true)
+    produce_events(m, ids, None, options, trace, &mut |_| true)
 }
 
 /// One emission step of `produce_events`: the prefill's first token, then
@@ -272,10 +272,12 @@ pub enum Step<'a> {
 pub fn produce_events(
     m: &mut Model,
     ids: &[u32],
+    media: Option<&crate::vision_input::MultimodalInput<'_>>,
     options: &Options,
     mut trace: Option<&mut Trace>,
     on_step: &mut dyn FnMut(Step) -> bool,
 ) -> Result<Output> {
+    check(ids, options, m.draft_config()?)?;
     let eos = if options.ignore_eos {
         Vec::new()
     } else {
@@ -284,7 +286,17 @@ pub fn produce_events(
     m.set_spec_eos(&eos)?;
     m.reset()?;
     let start = Instant::now();
-    let first = m.prefill(ids, None)?;
+    let first = match media {
+        Some(input) => {
+            ensure!(input.input_ids == ids, "DSpark media prompt ids differ");
+            ensure!(
+                !input.modality_ids.contains(&2),
+                "DSpark does not support video input"
+            );
+            m.prefill_multimodal(input, None)?
+        }
+        None => m.prefill(ids, None)?,
+    };
     let prefill_ms = start.elapsed().as_secs_f64() * 1000.0;
     let mut output = vec![first];
     if !on_step(Step::First(first)) {
@@ -315,6 +327,7 @@ pub fn produce_events(
                 .output
                 .iter()
                 .position(|v| m.config.eos_token_id.contains(v))
+            && index + 1 < round.output.len()
         {
             round.output.truncate(index + 1);
             let position = round.position - round.committed + round.output.len();
@@ -340,13 +353,17 @@ pub fn produce_events(
     })
 }
 
-pub fn check(ids: &[u32], options: &Options) -> Result<()> {
+pub fn check(ids: &[u32], options: &Options, draft: &crate::dspark::DraftConfig) -> Result<()> {
     ensure!(
         !ids.is_empty() && options.count > 0,
         "spec input and output count must be positive"
     );
     let budget = options.backend.spec_budget;
-    let headroom = if budget.is_tree() { budget.rows() } else { 7 };
+    let headroom = if budget.is_tree() {
+        budget.rows()
+    } else {
+        draft.block_size
+    };
     let required = ids
         .len()
         .checked_add(options.count)
@@ -388,32 +405,62 @@ mod tests {
         }
     }
 
+    fn draft(block_size: usize) -> crate::dspark::DraftConfig {
+        crate::dspark::DraftConfig {
+            model_type: "qwen3".into(),
+            architectures: vec!["Qwen3DSparkModel".into()],
+            dtype: "bfloat16".into(),
+            hidden_size: 2048,
+            intermediate_size: 6144,
+            num_hidden_layers: 5,
+            num_attention_heads: 16,
+            num_key_value_heads: 2,
+            head_dim: 128,
+            vocab_size: 130560,
+            draft_vocab_size: 130560,
+            rms_norm_eps: 1e-6,
+            block_size,
+            mask_token_id: 75982,
+            target_layer_ids: vec![1, 10, 20, 30, 39],
+            num_target_layers: 42,
+            markov_rank: 256,
+            markov_head_type: "vanilla".into(),
+            projector_type: "dspark".into(),
+            rope_parameters: crate::dspark::Rope {
+                rope_theta: 5000000.0,
+                rope_type: "default".into(),
+                rope_dim: None,
+            },
+        }
+    }
     #[test]
     fn budget_capacity_accepts_exact_fit_and_rejects_one_row_short() -> Result<()> {
         let ids = [1, 2, 3];
-        for (budget, headroom) in [
-            (SpecBudget::Chain, 7),
-            (SpecBudget::Tree16, 16),
-            (SpecBudget::Tree32, 32),
-            (SpecBudget::Tree64, 64),
-        ] {
-            let required = ids.len() + 256 + headroom;
-            check(&ids, &options(budget, required))?;
-            let error = check(&ids, &options(budget, required - 1))
-                .expect_err("one-row-short capacity must fail")
-                .to_string();
-            assert!(error.contains(&format!("{budget:?}")));
-            assert!(error.contains(&format!("requires KV capacity {required}")));
-            assert!(error.contains(&format!("got {}", required - 1)));
+        for block in [7, 15] {
+            let draft = draft(block);
+            for (budget, headroom) in [
+                (SpecBudget::Chain, block),
+                (SpecBudget::Tree16, 16),
+                (SpecBudget::Tree32, 32),
+                (SpecBudget::Tree64, 64),
+            ] {
+                let required = ids.len() + 256 + headroom;
+                check(&ids, &options(budget, required), &draft)?;
+                let error = check(&ids, &options(budget, required - 1), &draft)
+                    .expect_err("one-row-short capacity must fail")
+                    .to_string();
+                assert!(error.contains(&format!("{budget:?}")));
+                assert!(error.contains(&format!("requires KV capacity {required}")));
+                assert!(error.contains(&format!("got {}", required - 1)));
+            }
         }
         Ok(())
     }
-
     #[test]
     fn budget_capacity_rejects_overflow() {
         let mut options = options(SpecBudget::Tree64, usize::MAX);
         options.count = usize::MAX;
-        let error = check(&[1], &options)
+        let error = check(&[1], &options, &draft(7))
             .expect_err("overflow must fail")
             .to_string();
         assert!(error.contains("Tree64") && error.contains("overflows usize"));
@@ -424,10 +471,10 @@ pub fn generate(
     target: &Path,
     draft: &Path,
     ids: &[u32],
+    media: Option<&crate::vision_input::MultimodalInput<'_>>,
     options: &Options,
     dump: Option<&Path>,
 ) -> Result<()> {
-    check(ids, options)?;
     let mut model = Model::load(
         target,
         options.device,
@@ -435,10 +482,18 @@ pub fn generate(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     let mut trace = Trace::default();
     trace.set_device(&model.device_info().name)?;
-    let result = produce(&mut model, ids, options, dump.map(|_| &mut trace))?;
+    let result = produce_events(
+        &mut model,
+        ids,
+        media,
+        options,
+        dump.map(|_| &mut trace),
+        &mut |_| true,
+    )?;
     if let Some(dump) = dump {
         trace.save(dump)?;
     }
@@ -461,7 +516,6 @@ pub fn bench(
     options: &Options,
     runs: usize,
 ) -> Result<()> {
-    check(ids, options)?;
     ensure!(
         runs > 0 && options.count >= 200 && options.ignore_eos,
         "spec bench needs >=200 output tokens, positive runs and ignore EOS"
@@ -473,6 +527,7 @@ pub fn bench(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     produce(&mut model, ids, options, None)?;
     let mut times = Vec::new();
@@ -513,13 +568,12 @@ pub fn bench(
     }));
     println!(
         "{}",
-        serde_json::json!({"spec_benchmark":{"prompt_tokens":ids.len(),"output_tokens":options.count,"runs":runs,"warmup_runs":1,"decode_wall_ms_median":ms,"end_to_end_ms_median":total_ms,"end_to_end_tok_s":options.count as f64*1000.0/total_ms,"sglang_accept_len":sglang_accept_len,"decode_tok_s":(options.count-1) as f64*1000.0/ms,"mean_accept_including_bonus":all_rounds.iter().map(|r|r.accepted+1).sum::<usize>() as f64/rounds,"mean_emitted":all_rounds.iter().map(|r|r.committed).sum::<usize>() as f64/rounds,"draft_ms_per_round":all_rounds.iter().map(|r|r.draft_ms).sum::<f64>()/rounds,"verify_ms_per_round":all_rounds.iter().map(|r|r.verify_ms).sum::<f64>()/rounds,"inject_ms_per_round":all_rounds.iter().map(|r|r.inject_ms).sum::<f64>()/rounds,"timing":"wall time; token transfers and synchronization included; initial prefill excluded","draft_attention":"full block","verify":model.verification_impl(),"confidence_budget":"fixed 7","tree_build":tree_summary}})
+        serde_json::json!({"spec_benchmark":{"prompt_tokens":ids.len(),"output_tokens":options.count,"runs":runs,"warmup_runs":1,"decode_wall_ms_median":ms,"end_to_end_ms_median":total_ms,"end_to_end_tok_s":options.count as f64*1000.0/total_ms,"sglang_accept_len":sglang_accept_len,"decode_tok_s":(options.count-1) as f64*1000.0/ms,"mean_accept_including_bonus":all_rounds.iter().map(|r|r.accepted+1).sum::<usize>() as f64/rounds,"mean_emitted":all_rounds.iter().map(|r|r.committed).sum::<usize>() as f64/rounds,"draft_ms_per_round":all_rounds.iter().map(|r|r.draft_ms).sum::<f64>()/rounds,"verify_ms_per_round":all_rounds.iter().map(|r|r.verify_ms).sum::<f64>()/rounds,"inject_ms_per_round":all_rounds.iter().map(|r|r.inject_ms).sum::<f64>()/rounds,"timing":"wall time; token transfers and synchronization included; initial prefill excluded","draft_attention":"full block","verify":model.verification_impl(),"confidence_budget":"full_block","proposal_rows":all_rounds.first().map(|round|round.proposals.len()),"tree_build":tree_summary}})
     );
     Ok(())
 }
 
 pub fn compare_builders(target: &Path, draft: &Path, ids: &[u32], options: &Options) -> Result<()> {
-    check(ids, options)?;
     ensure!(
         options.backend.spec_budget.is_tree(),
         "builder comparison requires a tree budget"
@@ -531,6 +585,7 @@ pub fn compare_builders(target: &Path, draft: &Path, ids: &[u32], options: &Opti
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     model.compare_tree_builders(true)?;
     let result = produce(&mut model, ids, options, None)?;
@@ -558,7 +613,6 @@ pub fn compare_builders(target: &Path, draft: &Path, ids: &[u32], options: &Opti
 }
 
 pub fn profile(target: &Path, draft: &Path, ids: &[u32], options: &Options) -> Result<()> {
-    check(ids, options)?;
     let mut model = Model::load(
         target,
         options.device,
@@ -566,14 +620,16 @@ pub fn profile(target: &Path, draft: &Path, ids: &[u32], options: &Options) -> R
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
+    let rows = model.draft_config()?.verify_rows()?;
     model.prefill(ids, None)?;
-    model.spec_round(8, None, "")?;
+    model.spec_round(rows, None, "")?;
     model.reset()?;
     model.prefill(ids, None)?;
     model.synchronize()?;
     model.profile_rounds(true);
-    let round = model.spec_round(8, None, "")?;
+    let round = model.spec_round(rows, None, "")?;
     model.profile_rounds(false);
     model.check_logits()?;
     println!(
@@ -592,7 +648,6 @@ pub fn verify_greedy(
     reference: Option<&Path>,
     rules: Option<&crate::verify::Rules>,
 ) -> Result<()> {
-    check(ids, options)?;
     ensure!(
         limits.len() >= options.count,
         "greedy comparison needs per-step max_abs thresholds"
@@ -636,6 +691,7 @@ pub fn verify_greedy(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, spec.draft_config()?)?;
 
     let first = plain.prefill(ids, None)?;
     let spec_first = spec.prefill(ids, None)?;
@@ -860,7 +916,6 @@ pub fn replay(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
-
     let mut position = inject_reference(&mut model, &replay.initial, &rules)?;
     let mut near = 0;
     let mut exact = 0;

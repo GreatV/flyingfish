@@ -76,6 +76,8 @@ fn q38_primitives_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let d = Device::new(0)?;
+    invariant_attention(&d)?;
+    let _dense = super::profile::Range::new(true, c"q38_primitives_dense");
     let s = &d.stream;
     let fixture_dir = std::env::temp_dir().join(format!("ff-q38-upload-{}", std::process::id()));
     std::fs::create_dir(&fixture_dir)?;
@@ -934,6 +936,8 @@ fn verify_projection_m4(
 }
 
 struct VerifyAttentionFixture {
+    spec: FullAttentionSpec,
+    positions: Option<Vec<i32>>,
     prefix: u32,
     capacity: u32,
     q_gate: Vec<bf16>,
@@ -947,15 +951,30 @@ struct VerifyAttentionFixture {
 
 impl VerifyAttentionFixture {
     fn new(prefix: u32, capacity: u32, state: &mut u64) -> Self {
-        let qwen = FullAttentionSpec::q38();
+        Self::geometry(
+            FullAttentionSpec::q38(),
+            VERIFY_M4_ROWS,
+            prefix,
+            capacity,
+            state,
+        )
+    }
+    fn geometry(
+        spec: FullAttentionSpec,
+        rows: usize,
+        prefix: u32,
+        capacity: u32,
+        state: &mut u64,
+    ) -> Self {
+        let qwen = spec;
         let value = |state: &mut u64| bf16::from_f32(next_f32_unit(state) * 3.0 - 1.5);
-        let q_gate = (0..VERIFY_M4_ROWS * qwen.hq as usize * 2 * D as usize)
+        let q_gate = (0..rows * qwen.hq as usize * 2 * D as usize)
             .map(|_| value(state))
             .collect::<Vec<_>>();
-        let k = (0..VERIFY_M4_ROWS * qwen.hkv as usize * D as usize)
+        let k = (0..rows * qwen.hkv as usize * D as usize)
             .map(|_| value(state))
             .collect::<Vec<_>>();
-        let v = (0..VERIFY_M4_ROWS * qwen.hkv as usize * D as usize)
+        let v = (0..rows * qwen.hkv as usize * D as usize)
             .map(|_| value(state))
             .collect::<Vec<_>>();
         let q_norm = (0..D as usize)
@@ -971,6 +990,8 @@ impl VerifyAttentionFixture {
             .map(|_| value(state))
             .collect::<Vec<_>>();
         Self {
+            spec,
+            positions: None,
             prefix,
             capacity,
             q_gate,
@@ -984,7 +1005,7 @@ impl VerifyAttentionFixture {
     }
 
     fn caches(&self) -> (Vec<bf16>, Vec<bf16>) {
-        let qwen = FullAttentionSpec::q38();
+        let qwen = self.spec;
         let span = self.capacity as usize * D as usize;
         let nan = bf16::from_bits(0x7fc0);
         let mut k = vec![nan; qwen.hkv as usize * span];
@@ -1004,6 +1025,7 @@ impl VerifyAttentionFixture {
 }
 
 struct VerifyRunDump {
+    spec: FullAttentionSpec,
     gate: Vec<bf16>,
     q: Vec<bf16>,
     core: Vec<bf16>,
@@ -1034,8 +1056,9 @@ fn verify_run_batch(
     common: &CommonOpsRef,
     fixture: &VerifyAttentionFixture,
     rows: u32,
+    graph: bool,
 ) -> Result<VerifyRunDump> {
-    let qwen = FullAttentionSpec::q38();
+    let qwen = fixture.spec;
     let s = &device.stream;
     let limits = AttentionLimits {
         max_rows: rows,
@@ -1043,7 +1066,7 @@ fn verify_run_batch(
         key_chunk: 256,
         causal: 1,
     };
-    let request = FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits)?;
+    let request = FullAttentionOps::workspace(&qwen, limits)?;
     let q_gate = s.clone_htod(&fixture.q_gate)?;
     let k = s.clone_htod(&fixture.k)?;
     let v = s.clone_htod(&fixture.v)?;
@@ -1067,6 +1090,11 @@ fn verify_run_batch(
     )?;
     let scratch = s.alloc_zeros::<u8>(usize::try_from(request.bytes)?)?;
     let (scratch_ptr, _scratch_hold) = scratch.device_ptr(s);
+    let positions = fixture
+        .positions
+        .as_ref()
+        .map(|values| s.clone_htod(values))
+        .transpose()?;
     let bindings = AttentionBindings {
         compact: None,
         q_gate: view(
@@ -1121,28 +1149,44 @@ fn verify_run_batch(
         q_norm: view(&q_norm, s, [D], [1])?,
         k_norm: view(&k_norm, s, [D], [1])?,
         causal_mask: view(&mask, s, [VERIFY_CAUSAL_MASK_LEN as u32], [1])?,
-        positions: PositionBindings::Linear,
-    };
-    let plan = FullAttentionOps::prepare(
-        &device.ctx,
-        &FullAttentionSpec::q38(),
-        limits,
-        bindings,
-        common.clone(),
-    )?;
-    let max_parts = plan.max_parts();
-    FullAttentionOps::run(
-        &plan,
-        s,
-        meta_ref,
-        Scratch {
-            ptr: scratch_ptr,
-            bytes: request.bytes,
+        positions: if let Some(axes) = &positions {
+            PositionBindings::Axes(view(axes, s, [rows, 3], [3, 1])?)
+        } else {
+            PositionBindings::Linear
         },
-    )?;
+    };
+    let plan = FullAttentionOps::prepare(&device.ctx, &qwen, limits, bindings, common.clone())?;
+    let max_parts = plan.max_parts();
+    device.finish_upload()?;
+    let execute = || {
+        FullAttentionOps::run(
+            &plan,
+            s,
+            meta_ref,
+            Scratch {
+                ptr: scratch_ptr,
+                bytes: request.bytes,
+            },
+        )
+    };
+    if graph {
+        s.synchronize()?;
+        s.begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )?;
+        let launched = execute();
+        let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+        launched?;
+        captured?
+            .context("empty invariant attention graph")?
+            .launch()?;
+    } else {
+        execute()?;
+    }
     s.synchronize()?;
     drop(metadata);
     Ok(VerifyRunDump {
+        spec: qwen,
         gate: s.clone_dtoh(&gate)?,
         q: s.clone_dtoh(&q)?,
         core: s.clone_dtoh(&core)?,
@@ -1181,7 +1225,7 @@ fn verify_run_serial(
     fixture: &VerifyAttentionFixture,
     rows: u32,
 ) -> Result<VerifySerialDump> {
-    let qwen = FullAttentionSpec::q38();
+    let qwen = fixture.spec;
     let s = &device.stream;
     let limits = AttentionLimits {
         max_rows: 1,
@@ -1189,7 +1233,7 @@ fn verify_run_serial(
         key_chunk: 256,
         causal: 1,
     };
-    let request = FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits)?;
+    let request = FullAttentionOps::workspace(&qwen, limits)?;
     let (host_k, host_v) = fixture.caches();
     let k_cache = s.clone_htod(&host_k)?;
     let v_cache = s.clone_htod(&host_v)?;
@@ -1211,6 +1255,11 @@ fn verify_run_serial(
     let mut queries = Vec::new();
     let mut outputs = Vec::new();
     let mut partials = Vec::new();
+    let mut positions = fixture
+        .positions
+        .as_ref()
+        .map(|_| s.alloc_zeros::<i32>(3))
+        .transpose()?;
 
     for row in 0..rows as usize {
         let q_gate_row = fixture.q_gate[row * qwen.hq as usize * 2 * D as usize
@@ -1231,6 +1280,12 @@ fn verify_run_serial(
         )?;
         let prefix = fixture.prefix + row as u32;
         let (metadata, meta_ref) = meta(s, prefix as i32, 1, fixture.capacity as i32)?;
+        if let Some(axes) = positions.as_mut() {
+            s.memcpy_htod(
+                &fixture.positions.as_ref().context("axes fixture missing")?[row * 3..row * 3 + 3],
+                axes,
+            )?;
+        }
         let bindings = AttentionBindings {
             compact: None,
             q_gate: view(
@@ -1285,15 +1340,13 @@ fn verify_run_serial(
             q_norm: view(&q_norm, s, [D], [1])?,
             k_norm: view(&k_norm, s, [D], [1])?,
             causal_mask: view(&mask, s, [VERIFY_CAUSAL_MASK_LEN as u32], [1])?,
-            positions: PositionBindings::Linear,
+            positions: if let Some(axes) = &positions {
+                PositionBindings::Axes(view(axes, s, [1, 3], [3, 1])?)
+            } else {
+                PositionBindings::Linear
+            },
         };
-        let plan = FullAttentionOps::prepare(
-            &device.ctx,
-            &FullAttentionSpec::q38(),
-            limits,
-            bindings,
-            common.clone(),
-        )?;
+        let plan = FullAttentionOps::prepare(&device.ctx, &qwen, limits, bindings, common.clone())?;
         FullAttentionOps::run(
             &plan,
             s,
@@ -1306,6 +1359,7 @@ fn verify_run_serial(
         s.synchronize()?;
         drop(metadata);
         let run = VerifyRunDump {
+            spec: qwen,
             gate: s.clone_dtoh(&gate)?,
             q: s.clone_dtoh(&q)?,
             core: s.clone_dtoh(&core)?,
@@ -1338,7 +1392,7 @@ fn verify_row_partials(
     key_count: u32,
     key_chunk: u32,
 ) -> Result<VerifyPartials> {
-    let qwen = FullAttentionSpec::q38();
+    let qwen = run.spec;
     let active = key_count.div_ceil(key_chunk).max(1);
     let segment_rows = run.workspace.segment_rows as usize;
     let mut max = Vec::with_capacity(active as usize * qwen.hq as usize);
@@ -1375,6 +1429,138 @@ fn verify_row_partials(
         "VERIFY_M4 non-finite partials row={row}"
     );
     Ok(VerifyPartials { max, sum, out })
+}
+
+fn invariant_attention(device: &Device) -> Result<()> {
+    let model = crate::model_spec::ModelSpec::minicpm(
+        &serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/minicpm-config.json"
+        )))?,
+        &serde_json::json!({"eos_token_id":[248044,248046]}),
+    )?;
+    let spec = FullAttentionSpec::from_model(&model)?;
+    let rows = crate::linear_plan::MAX_SKINNY_ROWS;
+    let common = CommonOpsRef::new(&device.ctx)?;
+    let row_words = (spec.hq * D) as usize;
+    let mut seed = 0x7c13_5a09_2bd6_e84fu64;
+    let mut defects = 0;
+    let mut controls = 0;
+    for (prefix, capacity) in [(0u32, 256u32), (251, 1024), (4093, 4352), (16373, 16832)] {
+        for axes in [false, true] {
+            let mut fixture =
+                VerifyAttentionFixture::geometry(spec, rows, prefix, capacity, &mut seed);
+            if axes {
+                fixture.positions = Some(
+                    (0..rows)
+                        .flat_map(|row| {
+                            let p = prefix as i32 + row as i32;
+                            [p + 17, p + 31, p + 47]
+                        })
+                        .collect(),
+                );
+            }
+            let serial = verify_run_serial(device, &common, &fixture, rows as u32)?;
+            let (mut expected_k, mut expected_v) = fixture.caches();
+            for m in 1..=rows as u32 {
+                for head in 0..spec.hkv as usize {
+                    let at =
+                        (head * capacity as usize + prefix as usize + m as usize - 1) * D as usize;
+                    expected_k[at..at + D as usize]
+                        .copy_from_slice(&serial.k_cache[at..at + D as usize]);
+                    expected_v[at..at + D as usize]
+                        .copy_from_slice(&serial.v_cache[at..at + D as usize]);
+                }
+                for graph in [false, true] {
+                    let candidate = verify_run_batch(device, &common, &fixture, m, graph)?;
+                    let mut mismatches = 0;
+                    for (got, want) in [
+                        (&candidate.q[..], &serial.q[..m as usize * row_words]),
+                        (&candidate.gate[..], &serial.gate[..m as usize * row_words]),
+                        (&candidate.core[..], &serial.core[..m as usize * row_words]),
+                    ] {
+                        ensure!(
+                            got.iter().chain(want).all(|v| v.is_finite()),
+                            "nonfinite invariant attention boundary"
+                        );
+                        mismatches += got
+                            .iter()
+                            .zip(want)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                    }
+                    for (got, want) in [
+                        (&candidate.k_cache, &expected_k),
+                        (&candidate.v_cache, &expected_v),
+                    ] {
+                        mismatches += got
+                            .iter()
+                            .zip(want)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                    }
+                    let mut partial_mismatches = 0;
+                    for r in 0..m as usize {
+                        let got = verify_row_partials(&candidate, r, prefix + r as u32 + 1, 256)?;
+                        let want = &serial.partials[r];
+                        for (a, b) in [
+                            (&got.max, &want.max),
+                            (&got.sum, &want.sum),
+                            (&got.out, &want.out),
+                        ] {
+                            ensure!(
+                                a.len() == b.len() && a.iter().chain(b).all(|v| v.is_finite()),
+                                "invariant attention partial shape/finite"
+                            );
+                            partial_mismatches += a
+                                .iter()
+                                .zip(b)
+                                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                .count();
+                        }
+                    }
+                    defects += usize::from(mismatches != 0 || partial_mismatches != 0);
+                    println!(
+                        "{} INVARIANT_ATTENTION q_gate=[{m},{},512] kv=[{},{capacity},256] prefix={prefix} axes={axes} graph={graph} boundary_bit_mismatches={mismatches} partial_bit_mismatches={partial_mismatches}",
+                        if mismatches == 0 && partial_mismatches == 0 {
+                            "PASS"
+                        } else {
+                            "DEFECT"
+                        },
+                        spec.hq,
+                        spec.hkv
+                    );
+                }
+            }
+            if prefix == 251 && axes {
+                let width = 2 * row_words;
+                let first = fixture.q_gate[..width].to_vec();
+                for row in 1..rows {
+                    fixture.q_gate[row * width..(row + 1) * width].copy_from_slice(&first);
+                }
+                let wrong = verify_run_batch(device, &common, &fixture, rows as u32, false)?;
+                let mismatches = wrong
+                    .core
+                    .iter()
+                    .zip(&serial.core)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                ensure!(mismatches > 0, "attention row0-reuse control escaped");
+                controls += 1;
+                println!(
+                    "PASS INVARIANT_ATTENTION_CONTROL row0_reuse=true bit_mismatches={mismatches}"
+                );
+            }
+        }
+    }
+    println!(
+        "INVARIANT_ATTENTION_SUMMARY rows=1..16 prefixes=4 axes=2 eager_graph=true controls={controls} defects={defects}"
+    );
+    ensure!(
+        defects == 0 && controls == 1,
+        "invariant attention DEFECT cells={defects}"
+    );
+    Ok(())
 }
 
 fn verify_partial_sum(
@@ -1473,7 +1659,7 @@ fn verify_attention_m4_serial_bits_gpu() -> Result<()> {
         for (case_index, &(prefix, capacity)) in cases.iter().enumerate() {
             let defects_before = defects;
             let fixture = VerifyAttentionFixture::new(prefix, capacity, &mut rng);
-            let batch = verify_run_batch(&device, &common, &fixture, rows)?;
+            let batch = verify_run_batch(&device, &common, &fixture, rows, false)?;
             let serial = verify_run_serial(&device, &common, &fixture, rows)?;
             let row_span = qwen.hq as usize * D as usize;
             let cache_span = capacity as usize * D as usize;
@@ -1654,6 +1840,161 @@ fn verify_attention_m4_serial_bits_gpu() -> Result<()> {
     )
 }
 
+fn checkpoint_rejected_prefixes(device: &Device) -> Result<()> {
+    let root = serde_json::from_str(include_str!("../../../tests/data/minicpm-config.json"))?;
+    let spec = crate::model_spec::ModelSpec::minicpm(
+        &root,
+        &serde_json::json!({"eos_token_id": [248044, 248046]}),
+    )?;
+    let capacity = 37;
+    let rows = 16;
+    let stream = &device.stream;
+    let mut state = super::state::StateStore::new(&spec, capacity, stream)?;
+    let token = stream.clone_htod(&[97u32])?;
+    let mut checkpoint = super::state::StateCheckpoint::new(&state, &spec, rows, stream)?;
+    let gdn = crate::op_contract::GdnSpec::from_model(&spec)?;
+    let image = |layer: usize, row: usize, count: usize| {
+        (0..count)
+            .map(|i| {
+                ((i * 17 % 251) as f32 - 125.0) / 128.0 + layer as f32 * 4.0 + row as f32 / 8.0
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut prefixes = state
+        .gdn
+        .iter()
+        .map(|live| {
+            Ok(super::state::GdnState {
+                s: stream.alloc_zeros((rows - 1) * live.s.len())?,
+                history: stream.alloc_zeros((rows - 1) * live.history.len())?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (layer, (prefix, live)) in prefixes.iter_mut().zip(&state.gdn).enumerate() {
+        for (images, count) in [
+            (&mut prefix.s, live.s.len()),
+            (&mut prefix.history, live.history.len()),
+        ] {
+            for row in 0..rows - 1 {
+                stream.memcpy_htod(
+                    &image(layer, row + 1, count),
+                    &mut images.slice_mut(row * count..(row + 1) * count),
+                )?;
+            }
+        }
+    }
+    let bytes = checkpoint.bytes()
+        + prefixes
+            .iter()
+            .map(|p| (p.s.len() + p.history.len()) * size_of::<f32>())
+            .sum::<usize>();
+    let planned = crate::mtp::checkpoint_bytes(&spec, rows)?
+        + gdn.image_bytes()? as usize * state.gdn.len() * (rows - 1);
+    ensure!(
+        bytes == planned,
+        "checkpoint/prefix allocation={bytes} differs from planned={planned}"
+    );
+    let upload_gdn = |state: &mut super::state::StateStore, row| -> Result<()> {
+        for (layer, live) in state.gdn.iter_mut().enumerate() {
+            stream.memcpy_htod(&image(layer, row, live.s.len()), &mut live.s)?;
+            stream.memcpy_htod(&image(layer, row, live.history.len()), &mut live.history)?;
+        }
+        Ok(())
+    };
+    let dim = spec.head_dim as usize;
+    let elements = spec.kv_heads as usize * capacity * dim;
+    let original: Vec<_> = (0..elements)
+        .map(|i| bf16::from_f32(((i * 17 % 251) as f32 - 125.0) / 128.0))
+        .collect();
+    let verified: Vec<_> = original
+        .iter()
+        .map(|value| bf16::from_f32(value.to_f32() + 4.0))
+        .collect();
+    let upload = |state: &mut super::state::StateStore, values: &[bf16]| -> Result<()> {
+        for kv in &mut state.kv {
+            stream.memcpy_htod(values, &mut kv.k)?;
+            stream.memcpy_htod(values, &mut kv.v)?;
+        }
+        Ok(())
+    };
+    let mut cases = 0;
+    for prefix in [5, capacity - rows] {
+        state.set_sequence(stream, prefix as u32, rows as u32, rows as u32)?;
+        upload(&mut state, &original)?;
+        upload_gdn(&mut state, 0)?;
+        checkpoint.save(&state, &token, prefix, stream, None)?;
+        let sequence = stream.clone_dtoh(state.sequence.as_ref().context("sequence missing")?)?;
+        for accepted in 0..=rows {
+            upload(&mut state, &verified)?;
+            upload_gdn(&mut state, rows)?;
+            checkpoint.select_prefix(&mut state, &prefixes, accepted, stream)?;
+            for (layer, live) in state.gdn.iter().enumerate() {
+                for buffer in [&live.s, &live.history] {
+                    let expected = image(layer, accepted, buffer.len());
+                    ensure!(
+                        stream
+                            .clone_dtoh(buffer)?
+                            .iter()
+                            .zip(&expected)
+                            .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+                        "GDN prefix={prefix} accepted={accepted} layer={layer}"
+                    );
+                }
+            }
+            for kv in &state.kv {
+                for buffer in [&kv.k, &kv.v] {
+                    for (i, value) in stream.clone_dtoh(buffer)?.iter().enumerate() {
+                        let position = (i / dim) % capacity;
+                        let rejected = (prefix + accepted..prefix + rows).contains(&position);
+                        let expected = if rejected { original[i] } else { verified[i] };
+                        ensure!(
+                            value.to_bits() == expected.to_bits(),
+                            "rejected KV prefix={prefix} accepted={accepted} index={i} position={position}"
+                        );
+                    }
+                }
+            }
+            ensure!(
+                stream.clone_dtoh(state.sequence.as_ref().context("sequence missing")?)?
+                    == sequence
+                    && stream.clone_dtoh(&token)? == [97],
+                "KV suffix restore changed sequence/token"
+            );
+            cases += 1;
+        }
+        ensure!(
+            checkpoint
+                .select_prefix(&mut state, &prefixes, rows + 1, stream)
+                .is_err(),
+            "checkpoint accepted more rows than its saved window"
+        );
+        upload(&mut state, &verified)?;
+        upload_gdn(&mut state, rows)?;
+        checkpoint.select_prefix(&mut state, &prefixes, rows / 2 + 1, stream)?;
+        let wrong = stream.clone_dtoh(&state.kv[0].k)?;
+        let slot = (prefix + rows / 2) * dim;
+        ensure!(
+            wrong[slot..slot + dim] != original[slot..slot + dim],
+            "wrong accepted-prefix row escaped the KV oracle"
+        );
+        ensure!(
+            stream.clone_dtoh(&state.gdn[0].s.slice(..64))? != image(0, rows / 2, 64),
+            "wrong accepted-prefix row escaped the recurrent-state oracle"
+        );
+    }
+    println!(
+        "PASS CHECKPOINT_PREFIX S=[15,{},{},{}] history=[15,{},{}] kv=[{},37,{}] window_rows={rows} accepted=0..16 prefixes=5,21 cases={cases} transaction_bytes={bytes} bit_mismatches=0 wrong_prefix_control=true",
+        gdn.hv,
+        gdn.dk,
+        gdn.dv,
+        gdn.conv_dim()?,
+        gdn.history_width,
+        spec.kv_heads,
+        spec.head_dim
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
 fn q38_state_checkpoint_gpu() -> Result<()> {
@@ -1662,6 +2003,7 @@ fn q38_state_checkpoint_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let d = Device::new(0)?;
+    let dense = super::profile::Range::new(true, c"q38_state_checkpoint_dense");
     let s = &d.stream;
     let root: serde_json::Value =
         serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?;
@@ -1960,6 +2302,8 @@ fn q38_state_checkpoint_gpu() -> Result<()> {
     eprintln!(
         "Q38_STATE_PROBE mapping/byte_accounting/nonzero_prefix/S/history/KV_window/token/reset/repeated_metadata_graph PASS"
     );
+    drop(dense);
+    checkpoint_rejected_prefixes(&d)?;
     Ok(())
 }
 
@@ -3197,6 +3541,143 @@ fn q38_norm_stage_ab_gpu() -> Result<()> {
     Ok(())
 }
 
+fn invariant_gated_norm(device: &Device) -> Result<()> {
+    let rows = crate::linear_plan::MAX_SKINNY_ROWS;
+    let (heads, width) = (32usize, 128usize);
+    let row_words = heads * width;
+    let s = &device.stream;
+    let common = CommonOpsRef::new(&device.ctx)?;
+    let x: Vec<_> = (0..rows * row_words)
+        .map(|i| {
+            bf16::from_f32(((i * 17 + i / row_words * 71) % 509) as f32 / 128.0 - 254.0 / 128.0)
+        })
+        .collect();
+    let z: Vec<_> = (0..rows * row_words)
+        .map(|i| bf16::from_f32(((i * 13 + i / row_words * 37) % 257) as f32 / 128.0 - 1.0))
+        .collect();
+    let weight: Vec<_> = (0..width)
+        .map(|i| bf16::from_f32((i % 127) as f32 / 128.0 + 0.5))
+        .collect();
+    let xb = s.clone_htod(&x)?;
+    let zb = s.clone_htod(&z)?;
+    let wb = s.clone_htod(&weight)?;
+    let expected = s.alloc_zeros::<bf16>(rows * row_words)?;
+    let output = s.clone_htod(&vec![bf16::from_bits(0x7fc1); (rows + 1) * row_words])?;
+    let tensor = |buffer: &CudaSlice<bf16>, offset, n| {
+        super::contracts::view(
+            buffer,
+            s,
+            offset,
+            [n, heads as u32, width as u32],
+            [row_words as u64, width as u64, 1],
+        )
+    };
+    let weight = view(&wb, s, [width as u32], [1])?;
+    let (_one, one_meta) = meta(s, 0, 1, 32)?;
+    let one = RowDomain {
+        meta: one_meta,
+        row_base: 0,
+        row_capacity: 1,
+    };
+    device.finish_upload()?;
+    for r in 0..rows {
+        common.norm.rms_gated(
+            s,
+            one,
+            GatedRmsInput {
+                x: tensor(&xb, r * row_words, 1)?,
+                weight,
+                gate: tensor(&zb, r * row_words, 1)?,
+            },
+            &mut TensorMut(tensor(&expected, r * row_words, 1)?),
+            1e-6,
+        )?;
+    }
+    let expected = s.clone_dtoh(&expected)?;
+    let mut defects = 0;
+    for m in 1..=rows as u32 {
+        let (_metadata, seq) = meta(s, 0, m as i32, 32)?;
+        let domain = RowDomain {
+            meta: seq,
+            row_base: 0,
+            row_capacity: m,
+        };
+        let x = tensor(&xb, 0, m)?;
+        let gate = tensor(&zb, 0, m)?;
+        let mut y = TensorMut(tensor(&output, 0, m)?);
+        let mut execute = || {
+            common
+                .norm
+                .rms_gated(s, domain, GatedRmsInput { x, weight, gate }, &mut y, 1e-6)
+        };
+        for graph in [false, true] {
+            if graph {
+                s.synchronize()?;
+                s.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                let launched = execute();
+                let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                launched?;
+                captured?
+                    .context("empty invariant gated norm graph")?
+                    .launch()?;
+            } else {
+                execute()?;
+            }
+            let got = s.clone_dtoh(&output)?;
+            let count = m as usize * row_words;
+            ensure!(
+                got[..count].iter().all(|v| v.is_finite())
+                    && got[count..].iter().all(|v| v.to_bits() == 0x7fc1),
+                "invariant gated norm finite/tail"
+            );
+            let mismatches = got[..count]
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(mismatches != 0);
+            println!(
+                "{} INVARIANT_GATED_NORM x=[{m},{heads},{width}] graph={graph} bit_mismatches={mismatches}",
+                if mismatches == 0 { "PASS" } else { "DEFECT" }
+            );
+        }
+    }
+    let mut wrong = z.clone();
+    for r in 1..rows {
+        wrong[r * row_words..(r + 1) * row_words].copy_from_slice(&z[..row_words]);
+    }
+    let wrong = s.clone_htod(&wrong)?;
+    let (_metadata, seq) = meta(s, 0, rows as i32, 32)?;
+    common.norm.rms_gated(
+        s,
+        RowDomain {
+            meta: seq,
+            row_base: 0,
+            row_capacity: rows as u32,
+        },
+        GatedRmsInput {
+            x: tensor(&xb, 0, rows as u32)?,
+            weight,
+            gate: tensor(&wrong, 0, rows as u32)?,
+        },
+        &mut TensorMut(tensor(&output, 0, rows as u32)?),
+        1e-6,
+    )?;
+    let mismatches = s
+        .clone_dtoh(&output)?
+        .iter()
+        .zip(&expected)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    ensure!(mismatches > 0, "gated norm row0-reuse control escaped");
+    println!("PASS INVARIANT_GATED_NORM_CONTROL row0_reuse=true bit_mismatches={mismatches}");
+    println!("INVARIANT_GATED_NORM_SUMMARY rows=1..16 eager_graph=true defects={defects}");
+    ensure!(defects == 0, "invariant gated norm DEFECT cells={defects}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires GPU window and FF_Q38_GPU_WINDOW=granted"]
 fn residual_rms_capture_gpu() -> Result<()> {
@@ -3206,6 +3687,7 @@ fn residual_rms_capture_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let device = Device::new(0)?;
+    invariant_gated_norm(&device)?;
     let stream = &device.stream;
     let ops = Ops::new(&device.ctx)?;
     let common = CommonOpsRef::new(&device.ctx)?;
@@ -3214,7 +3696,7 @@ fn residual_rms_capture_gpu() -> Result<()> {
     let mut controls = 0;
     let mut defects = 0;
     for hidden in [2048usize, 5120] {
-        for rows in [1usize, 5, 16, 17, 256, 4096] {
+        for rows in (1usize..=17).chain([256, 4096]) {
             for mode in [RmsMode::Standard, RmsMode::ZeroCentered] {
                 let total = rows + 2;
                 let active = if rows == 1 { 1 } else { rows - 1 };
@@ -3258,6 +3740,12 @@ fn residual_rms_capture_gpu() -> Result<()> {
                 let mut baseline_output =
                     TensorMut(view(&baseline_normalized, stream, shape, strides)?);
                 let options = RmsOptions { mode, eps: 1e-6 };
+                let (_one_metadata, one_sequence) = meta(stream, 0, 1, 32)?;
+                let one_domain = RowDomain {
+                    meta: one_sequence,
+                    row_base: 0,
+                    row_capacity: 1,
+                };
                 match mode {
                     RmsMode::ZeroCentered => {
                         let offset = (hidden * std::mem::size_of::<bf16>()) as u64;
@@ -3271,32 +3759,55 @@ fn residual_rms_capture_gpu() -> Result<()> {
                                 .arg(&((rows * hidden) as i32))
                                 .launch(super::ops::flat(rows * hidden))?;
                         }
-                        common.norm.rms_with(
-                            stream,
-                            domain,
-                            baseline_view.0,
-                            weight_view,
-                            &mut baseline_output,
-                            options,
-                        )?;
+                        for row in 1..=active {
+                            let offset = (row * hidden * size_of::<bf16>()) as u64;
+                            // SAFETY: each retained row is inside the original dense allocation.
+                            let (input, mut output) = unsafe {
+                                (
+                                    Tensor::new(
+                                        baseline_view.0.ptr + offset,
+                                        [1, 1, hidden as u32],
+                                        strides,
+                                        (hidden * 2) as u64,
+                                    )?,
+                                    TensorMut(Tensor::new(
+                                        baseline_output.0.ptr + offset,
+                                        [1, 1, hidden as u32],
+                                        strides,
+                                        (hidden * 2) as u64,
+                                    )?),
+                                )
+                            };
+                            common.norm.rms_with(
+                                stream,
+                                one_domain,
+                                input,
+                                weight_view,
+                                &mut output,
+                                options,
+                            )?;
+                        }
                     }
                     RmsMode::Standard => {
-                        let offset = (hidden * std::mem::size_of::<bf16>()) as u64;
-                        let rp = baseline_view.0.ptr + offset;
-                        let xp = addend_view.ptr + offset;
-                        let yp = baseline_output.0.ptr + offset;
-                        unsafe {
-                            stream
-                                .launch_builder(&ops.add_norm)
-                                .arg(&xp)
-                                .arg(&rp)
-                                .arg(&weight_view.ptr)
-                                .arg(&yp)
-                                .arg(&rp)
-                                .arg(&(active as i32))
-                                .arg(&(hidden as i32))
-                                .arg(&options.eps)
-                                .launch(grid(active, 256))?;
+                        for row in 1..=active {
+                            let offset = (row * hidden * size_of::<bf16>()) as u64;
+                            let rp = baseline_view.0.ptr + offset;
+                            let xp = addend_view.ptr + offset;
+                            let yp = baseline_output.0.ptr + offset;
+                            // SAFETY: pointers cover this one row in the preallocated baseline buffers.
+                            unsafe {
+                                stream
+                                    .launch_builder(&ops.add_norm)
+                                    .arg(&xp)
+                                    .arg(&rp)
+                                    .arg(&weight_view.ptr)
+                                    .arg(&yp)
+                                    .arg(&rp)
+                                    .arg(&1i32)
+                                    .arg(&(hidden as i32))
+                                    .arg(&options.eps)
+                                    .launch(grid(1, 256))?;
+                            }
                         }
                     }
                 }
@@ -3351,6 +3862,21 @@ fn residual_rms_capture_gpu() -> Result<()> {
                     Ok(usize::from(mismatch != 0))
                 };
                 let cell_before = defects;
+                if matches!(mode, RmsMode::ZeroCentered) {
+                    common.norm.rms_with(
+                        stream,
+                        domain,
+                        baseline_view.0,
+                        weight_view,
+                        &mut baseline_output,
+                        options,
+                    )?;
+                    defects += check(
+                        "batch_rms_vs_M1",
+                        &stream.clone_dtoh(&baseline_normalized)?,
+                        &expected_normalized,
+                    )?;
+                }
                 defects += check("residual", &actual_residual, &expected_residual)?;
                 defects += check("normalization", &actual_normalized, &expected_normalized)?;
                 let mut expected_capture = vec![sentinel; total * 5 * hidden];

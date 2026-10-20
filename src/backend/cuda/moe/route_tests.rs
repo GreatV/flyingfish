@@ -126,6 +126,136 @@ fn compare_case(
     Ok(())
 }
 
+fn invariant_route(device: &Device) -> Result<()> {
+    use crate::backend::cuda::contracts::view;
+    let rows = crate::linear_plan::MAX_SKINNY_ROWS;
+    let (e, k, h) = (256usize, 8usize, 2048usize);
+    let s = &device.stream;
+    let ops = RouteOps::new(&device.ctx, s)?;
+    let values: Vec<_> = (0..rows * h)
+        .map(|i| bf16::from_f32(((i / h * 71 + i % h * 13) % 509) as f32 / 256.0 - 254.0 / 256.0))
+        .collect();
+    let mut router: Vec<_> = (0..e * h)
+        .map(|i| bf16::from_f32(((i / h * 37 + i % h * 17) % 257) as f32 / 4096.0 - 128.0 / 4096.0))
+        .collect();
+    let tie = router[3 * h..4 * h].to_vec();
+    router[7 * h..8 * h].copy_from_slice(&tie);
+    let x = s.clone_htod(&values)?;
+    let router = s.clone_htod(&router)?;
+    let w = view(&router, s, 0, [e as u32, h as u32], [h as u64, 1])?;
+    let expected_ids = s.alloc_zeros::<i32>(rows * k)?;
+    let expected_weights = s.alloc_zeros::<bf16>(rows * k)?;
+    device.finish_upload()?;
+    for r in 0..rows {
+        ops.route(
+            s,
+            view(&x, s, r * h, [1, h as u32], [h as u64, 1])?,
+            w,
+            &mut TensorMut(view(&expected_ids, s, r * k, [1, k as u32], [k as u64, 1])?),
+            &mut TensorMut(view(
+                &expected_weights,
+                s,
+                r * k,
+                [1, k as u32],
+                [k as u64, 1],
+            )?),
+        )?;
+    }
+    let expected_ids = s.clone_dtoh(&expected_ids)?;
+    let expected_weights = s.clone_dtoh(&expected_weights)?;
+    let canary = bf16::from_bits(0x7fc1);
+    let ids = s.clone_htod(&vec![-33i32; (rows + 1) * k])?;
+    let weights = s.clone_htod(&vec![canary; (rows + 1) * k])?;
+    let mut defects = 0;
+    for m in 1..=rows as u32 {
+        let input = view(&x, s, 0, [m, h as u32], [h as u64, 1])?;
+        let mut id_view = TensorMut(view(&ids, s, 0, [m, k as u32], [k as u64, 1])?);
+        let mut weight_view = TensorMut(view(&weights, s, 0, [m, k as u32], [k as u64, 1])?);
+        let mut execute = || ops.route(s, input, w, &mut id_view, &mut weight_view);
+        for graph in [false, true] {
+            if graph {
+                s.synchronize()?;
+                s.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                let launched = execute();
+                let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                launched?;
+                captured?
+                    .context("empty invariant router graph")?
+                    .launch()?;
+            } else {
+                execute()?;
+            }
+            let got_ids = s.clone_dtoh(&ids)?;
+            let got_weights = s.clone_dtoh(&weights)?;
+            let choices = m as usize * k;
+            ensure!(
+                got_ids[choices..].iter().all(|&v| v == -33)
+                    && got_weights[choices..]
+                        .iter()
+                        .all(|v| v.to_bits() == canary.to_bits()),
+                "router wrote a dead row"
+            );
+            ensure!(
+                got_weights[..choices].iter().all(|v| v.is_finite()),
+                "nonfinite invariant router boundary"
+            );
+            let mismatches = got_ids[..choices]
+                .iter()
+                .zip(&expected_ids)
+                .filter(|(a, b)| a != b)
+                .count()
+                + got_weights[..choices]
+                    .iter()
+                    .zip(&expected_weights)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+            defects += usize::from(mismatches != 0);
+            println!(
+                "{} INVARIANT_ROUTE x=[{m},{h}] router=[{e},{h}] top_k={k} graph={graph} ids_weights_bit_mismatches={mismatches}",
+                if mismatches == 0 { "PASS" } else { "DEFECT" }
+            );
+        }
+    }
+    let mut wrong = values.clone();
+    for r in 1..rows {
+        wrong[r * h..(r + 1) * h].copy_from_slice(&values[..h]);
+    }
+    let wrong = s.clone_htod(&wrong)?;
+    ops.route(
+        s,
+        view(&wrong, s, 0, [rows as u32, h as u32], [h as u64, 1])?,
+        w,
+        &mut TensorMut(view(&ids, s, 0, [rows as u32, k as u32], [k as u64, 1])?),
+        &mut TensorMut(view(
+            &weights,
+            s,
+            0,
+            [rows as u32, k as u32],
+            [k as u64, 1],
+        )?),
+    )?;
+    let mismatches = s
+        .clone_dtoh(&ids)?
+        .iter()
+        .zip(&expected_ids)
+        .filter(|(a, b)| a != b)
+        .count()
+        + s.clone_dtoh(&weights)?
+            .iter()
+            .zip(&expected_weights)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+    ensure!(mismatches > 0, "router row0-reuse control escaped");
+    println!("PASS INVARIANT_ROUTE_CONTROL row0_reuse=true bit_mismatches={mismatches}");
+    println!(
+        "INVARIANT_ROUTE_SUMMARY rows=1..16 eager_graph=true ids_weights=true defects={defects}"
+    );
+    ensure!(defects == 0, "invariant router DEFECT cells={defects}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
 fn moe_route_gpu() -> Result<()> {
@@ -134,6 +264,7 @@ fn moe_route_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let d = Device::new(0)?;
+    invariant_route(&d)?;
     let s = &d.stream;
     let ops = RouteOps::new(&d.ctx, s)?;
     let dims = MoeDims::minicpm47(4096);

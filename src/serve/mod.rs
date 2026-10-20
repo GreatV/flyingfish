@@ -67,6 +67,7 @@ pub struct Backend {
     slot: Arc<Mutex<Slot>>,
     options: SpecOptions,
     vocab_size: usize,
+    draft_config: Option<crate::dspark::DraftConfig>,
     mtp: bool,
 }
 
@@ -176,7 +177,8 @@ fn run_inner(
     }
     let (command_tx, command_rx) = mpsc::channel::<EngineCommand>();
     let slot = Arc::new(Mutex::new(Slot::Idle));
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<usize>>();
+    let (ready_tx, ready_rx) =
+        mpsc::channel::<Result<(usize, Option<crate::dspark::DraftConfig>)>>();
     let engine_slot = slot.clone();
     let engine_options = options.clone();
     // The model holds non-Send CUDA handles; readiness carries the load result and vocab size before bind.
@@ -194,16 +196,22 @@ fn run_inner(
                 } else {
                     load_model(&target, &engine_options)
                 }?;
-                Ok((model, spec))
+                let draft = engine_options
+                    .backend
+                    .draft_model
+                    .as_ref()
+                    .map(|_| model.draft_config().cloned())
+                    .transpose()?;
+                Ok((model, spec, draft))
             });
-            let (model, model_spec) = match loaded {
+            let (model, model_spec, draft_config) = match loaded {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
                     return;
                 }
             };
-            let _ = ready_tx.send(Ok(model.config.vocab_size));
+            let _ = ready_tx.send(Ok((model.config.vocab_size, draft_config)));
             engine_loop(
                 model,
                 engine_options,
@@ -214,7 +222,7 @@ fn run_inner(
             )
         })
         .context("spawn engine thread")?;
-    let vocab_size = ready_rx
+    let (vocab_size, draft_config) = ready_rx
         .recv()
         .context("engine thread exited before reporting readiness")??;
     let backend = Backend {
@@ -222,6 +230,7 @@ fn run_inner(
         slot,
         options,
         vocab_size,
+        draft_config,
         mtp: mtp.is_some(),
     };
     http::serve(backend, tokenizer_dir, port, handle)
@@ -287,17 +296,15 @@ fn generate_once(
     };
     let checked = if mtp {
         crate::mtp::check_request(request.ids.len(), run_options.count, run_options.capacity)
+    } else if run_options.backend.draft_model.is_some() {
+        model
+            .draft_config()
+            .and_then(|draft| check_request(&request.ids, &run_options, Some(draft)))
     } else {
-        check_request(&request.ids, &run_options)
+        check_request(&request.ids, &run_options, None)
     };
     if let Err(error) = checked {
         let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
-        return;
-    }
-    if request.images.is_some() && run_options.backend.draft_model.is_some() {
-        let _ = events.blocking_send(EngineEvent::Failed(
-            "image input does not support a draft model".into(),
-        ));
         return;
     }
     let input_dump = match trace_image_input(model_spec, &request) {
@@ -351,18 +358,29 @@ fn generate_once(
                 decode_ms: output.decode_ms,
             })
     } else if run_options.backend.draft_model.is_some() {
-        spec::produce_events(model, &request.ids, &run_options, None, &mut |step| {
-            on_event(match step {
-                Step::First(token) => EngineEvent::Tokens {
-                    ids: vec![token],
-                    accepted: 0,
-                },
-                Step::Round(round) => EngineEvent::Tokens {
-                    ids: round.output.clone(),
-                    accepted: round.accepted,
-                },
-            })
-        })
+        spec::produce_events(
+            model,
+            &request.ids,
+            request
+                .images
+                .as_ref()
+                .map(|images| images.input(&request.ids))
+                .as_ref(),
+            &run_options,
+            None,
+            &mut |step| {
+                on_event(match step {
+                    Step::First(token) => EngineEvent::Tokens {
+                        ids: vec![token],
+                        accepted: 0,
+                    },
+                    Step::Round(round) => EngineEvent::Tokens {
+                        ids: round.output.clone(),
+                        accepted: round.accepted,
+                    },
+                })
+            },
+        )
     } else {
         produce_plain_events(
             model,
@@ -444,10 +462,18 @@ fn trace_image_input(
     Ok(Some(path))
 }
 
-fn check_request(ids: &[u32], options: &SpecOptions) -> Result<()> {
+fn check_request(
+    ids: &[u32],
+    options: &SpecOptions,
+    draft: Option<&crate::dspark::DraftConfig>,
+) -> Result<()> {
     ensure!(!ids.is_empty(), "prompt must not be empty");
     if options.backend.draft_model.is_some() {
-        spec::check(ids, options)
+        spec::check(
+            ids,
+            options,
+            draft.context("loaded draft config is missing from request admission")?,
+        )
     } else {
         crate::model::check_generation_capacity(ids.len(), options.count, options.capacity)
     }

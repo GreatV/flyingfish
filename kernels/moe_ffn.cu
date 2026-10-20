@@ -1,4 +1,4 @@
-// BF16 routed and shared expert contributions for rows1..8; caller-owned done bits.
+// BF16 routed and shared contributions: legacy rows1..8, invariant rows1..16; caller-owned done bits.
 // gate_up: grid(ceil(I/32),rows,K+1), block256, smem=H*2; down: grid(ceil(H/16),rows,K+1), block128.
 // Active assignments require valid slots, matching generations and distinct expert ids.
 // Expert row pointers and shared weights are 16-byte aligned.
@@ -70,7 +70,24 @@ __device__ __forceinline__ uint4 moe_load8(const bf16* base, const unsigned char
   return reinterpret_cast<const uint4*>(base)[v];
 }
 
-template <bool FP8, class Word>
+// Sixteen scalar FMA lanes, paired in ascending 1/2/4/8 order.
+__device__ __forceinline__ float moe_pairwise16(float sum, int tid) {
+  const unsigned mask = 0xffffu << (tid & 16);
+  for (int step = 1; step < 16; step *= 2)
+    sum = __fadd_rn(sum, __shfl_down_sync(mask, sum, step, 16));
+  return sum;
+}
+
+template<bool FP8>
+__device__ __forceinline__ float moe_load1(const bf16* weight,
+    const unsigned char* codes, float scale, int col) {
+  if constexpr (FP8) {
+    if (codes) return __bfloat162float(__float2bfloat16_rn(e4m3_decode(codes[col]) * scale));
+  }
+  return __bfloat162float(weight[col]);
+}
+
+template <bool FP8, bool INVARIANT = false, class Word>
 __device__ __forceinline__ void moe_gate_up(
     const bf16* __restrict__ x, const int* __restrict__ ids,
     const unsigned* __restrict__ active,
@@ -81,12 +98,19 @@ __device__ __forceinline__ void moe_gate_up(
     const bf16* __restrict__ shared_gate, const bf16* __restrict__ shared_up,
     bf16* __restrict__ h, bf16* __restrict__ h_shared,
     int rows, int experts, int top_k, int hidden, int inter) {
-  FD_GUARD_MOE_GATE_UP;
+  constexpr int lanes = INVARIANT ? 16 : LANES;
+  if constexpr (INVARIANT) {
+    if (blockDim.x != GU_NT || gridDim.y != rows || gridDim.z != top_k ||
+        rows < 1 || rows > 16 || top_k < 1 || (hidden & 7) != 0 || inter < 1)
+      __trap();
+  } else {
+    FD_GUARD_MOE_GATE_UP;
+  }
   const int r = blockIdx.y;
   const int seg = blockIdx.z;
   const int tid = threadIdx.x;
-  const int lane = tid & (LANES - 1);
-  const int j = blockIdx.x * GU_ROWS + (tid / LANES);
+  const int lane = tid & (lanes - 1);
+  const int j = blockIdx.x * (GU_NT / lanes) + (tid / lanes);
   const int nvec = hidden >> 3;
   const bool live_seg = seg >= top_k || active[(size_t)r * top_k + seg] != 0u;
 
@@ -144,25 +168,36 @@ __device__ __forceinline__ void moe_gate_up(
     }
     const bf16* gv = gate_base + (size_t)j * hidden;
     const bf16* uv = up_base + (size_t)j * hidden;
+    if constexpr (INVARIANT) {
+      for (int col = lane; col < hidden; col += 16) {
+        const float a = __bfloat162float(xs[col]);
+        accg = __fmaf_rn(a, moe_load1<FP8>(gv, gc, gs, col), accg);
+        accu = __fmaf_rn(a, moe_load1<FP8>(uv, uc, us, col), accu);
+      }
+    } else {
 #pragma unroll 4
-    for (int v = lane; v < nvec; v += LANES) {
-      accg += moe_dot8(moe_load8<FP8>(gv, gc, gs, v), xq[v]);
-      accu += moe_dot8(moe_load8<FP8>(uv, uc, us, v), xq[v]);
+      for (int v = lane; v < nvec; v += LANES) {
+        accg += moe_dot8(moe_load8<FP8>(gv, gc, gs, v), xq[v]);
+        accu += moe_dot8(moe_load8<FP8>(uv, uc, us, v), xq[v]);
+      }
     }
   }
-  accg = moe_group_sum(accg);
-  accu = moe_group_sum(accu);
+  accg = INVARIANT ? moe_pairwise16(accg, tid) : moe_group_sum(accg);
+  accu = INVARIANT ? moe_pairwise16(accu, tid) : moe_group_sum(accu);
   if (lane == 0 && j < inter && live_seg) {
     const float g = __bfloat162float(__float2bfloat16(accg));
     const float u = __bfloat162float(__float2bfloat16(accu));
-    const float s = __bfloat162float(__float2bfloat16(moe_silu(g)));
+    const float activation = INVARIANT
+        ? __fmul_rn(g, __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-g))))
+        : moe_silu(g);
+    const float s = __bfloat162float(__float2bfloat16(activation));
     bf16* out = seg == top_k ? h_shared + (size_t)r * inter
                              : h + ((size_t)r * top_k + seg) * inter;
     out[j] = __float2bfloat16(s * u);
   }
 }
 
-template <bool FP8, class Word>
+template <bool FP8, bool INVARIANT = false, class Word>
 __device__ __forceinline__ void moe_down(
     const bf16* __restrict__ h, const bf16* __restrict__ h_shared,
     const int* __restrict__ ids, const unsigned* __restrict__ active,
@@ -175,12 +210,19 @@ __device__ __forceinline__ void moe_down(
     bf16* __restrict__ contributions, bf16* __restrict__ shared_out,
     unsigned* __restrict__ done,
     int rows, int experts, int top_k, int hidden, int inter) {
-  FD_GUARD_MOE_DOWN;
+  constexpr int lanes = INVARIANT ? 16 : LANES;
+  if constexpr (INVARIANT) {
+    if (blockDim.x != DN_NT || gridDim.y != rows || gridDim.z != top_k ||
+        rows < 1 || rows > 16 || top_k < 1 || (inter & 7) != 0)
+      __trap();
+  } else {
+    FD_GUARD_MOE_DOWN;
+  }
   const int r = blockIdx.y;
   const int seg = blockIdx.z;
   const int tid = threadIdx.x;
-  const int lane = tid & (LANES - 1);
-  const int d = blockIdx.x * DN_ROWS + (tid / LANES);
+  const int lane = tid & (lanes - 1);
+  const int d = blockIdx.x * (DN_NT / lanes) + (tid / lanes);
   const int ivec = inter >> 3;
   const bool routed = seg < top_k;
   const bool live = !routed || active[(size_t)r * top_k + seg] != 0u;
@@ -221,11 +263,17 @@ __device__ __forceinline__ void moe_down(
     }
     const bf16* wv = wrow + (size_t)d * inter;
     const uint4* hv = reinterpret_cast<const uint4*>(hrow);
+    if constexpr (INVARIANT) {
+      for (int col = lane; col < inter; col += 16)
+        acc = __fmaf_rn(__bfloat162float(hrow[col]),
+                       moe_load1<FP8>(wv, wc, scale, col), acc);
+    } else {
 #pragma unroll 4
-    for (int v = lane; v < ivec; v += LANES)
-      acc += moe_dot8(moe_load8<FP8>(wv, wc, scale, v), hv[v]);
+      for (int v = lane; v < ivec; v += LANES)
+        acc += moe_dot8(moe_load8<FP8>(wv, wc, scale, v), hv[v]);
+    }
   }
-  acc = moe_group_sum(acc);
+  acc = INVARIANT ? moe_pairwise16(acc, tid) : moe_group_sum(acc);
   if (lane == 0 && d < hidden && live) {
     const float lin = __bfloat162float(__float2bfloat16(acc));
     bf16* out = routed ? contributions + ((size_t)r * top_k + seg) * (size_t)hidden
@@ -289,6 +337,33 @@ extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down_w8a16(
     int rows, int experts, int top_k, int hidden, int inter) {
   moe_down<true>(h, h_shared, ids, active, weights, slots_down, slot_valid, slot_generation, assignment_gen, shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter);
 }
+
+#define MOE_INVARIANT_GU(NAME, WORD, FP8) \
+extern "C" __global__ void __launch_bounds__(GU_NT) NAME( \
+    const bf16* x, const int* ids, const unsigned* active, \
+    const WORD* const* slots, const unsigned* valid, \
+    const unsigned long long* generation, const unsigned long long* assigned, \
+    const bf16* shared_gate, const bf16* shared_up, bf16* h, bf16* hs, \
+    int rows, int experts, int top_k, int hidden, int inter) { \
+  moe_gate_up<FP8, true>(x, ids, active, slots, valid, generation, assigned, \
+      shared_gate, shared_up, h, hs, rows, experts, top_k, hidden, inter); \
+}
+#define MOE_INVARIANT_DOWN(NAME, WORD, FP8) \
+extern "C" __global__ void __launch_bounds__(DN_NT) NAME( \
+    const bf16* h, const bf16* hs, const int* ids, const unsigned* active, \
+    const bf16* weights, const WORD* const* slots, const unsigned* valid, \
+    const unsigned long long* generation, const unsigned long long* assigned, \
+    const bf16* shared_down, bf16* contributions, bf16* shared_out, unsigned* done, \
+    int rows, int experts, int top_k, int hidden, int inter) { \
+  moe_down<FP8, true>(h, hs, ids, active, weights, slots, valid, generation, assigned, \
+      shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter); \
+}
+MOE_INVARIANT_GU(moe_ffn_gate_up_lane16, bf16, false)
+MOE_INVARIANT_DOWN(moe_ffn_down_lane16, bf16, false)
+MOE_INVARIANT_GU(moe_ffn_gate_up_w8a16_lane16, unsigned char, true)
+MOE_INVARIANT_DOWN(moe_ffn_down_w8a16_lane16, unsigned char, true)
+#undef MOE_INVARIANT_GU
+#undef MOE_INVARIANT_DOWN
 
 #undef FD_GUARD_MOE_GATE_UP
 #undef FD_GUARD_MOE_DOWN

@@ -263,6 +263,7 @@ pub struct Blas {
     calibration: linear_calibrate::Environment,
     fp8: Option<super::linear::Fp8Ops>,
     skinny: CudaFunction,
+    invariant_rows: usize,
     plans: RefCell<BTreeMap<(usize, usize, usize, u32), Plan>>,
     biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
     bias_add: Option<CudaFunction>,
@@ -313,6 +314,7 @@ impl Blas {
             calibration,
             fp8: None,
             skinny: cubin::module(&device.ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,
+            invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
             biased_plans: RefCell::new(BTreeMap::new()),
             bias_add: None,
@@ -465,14 +467,13 @@ impl Blas {
         y: &mut CudaViewMut<'_, bf16>,
         shape: LinearShape,
     ) -> Result<()> {
-        ensure!(
-            shape.rows > 0 && shape.rows <= 16 && shape.input.is_multiple_of(256),
-            "unsupported skinny GEMM shape: {shape:?}"
-        );
-        checked_dims(shape.rows, shape.output, shape.input)?;
         let (wp, _w) = w.device_ptr(&self.stream);
         let (xp, _x) = x.device_ptr(&self.stream);
         let (yp, _y) = y.device_ptr_mut(&self.stream);
+        self.skinny_raw(wp, xp, yp, shape)
+    }
+    fn skinny_raw(&self, wp: u64, xp: u64, yp: u64, shape: LinearShape) -> Result<()> {
+        let launch = Self::skinny_launch(shape)?;
         unsafe {
             self.stream
                 .launch_builder(&self.skinny)
@@ -483,13 +484,22 @@ impl Blas {
                 .arg(&(shape.input as i32))
                 .arg(&(shape.input as i64))
                 .arg(&(shape.rows as i32))
-                .launch(LaunchConfig {
-                    grid_dim: (shape.output.div_ceil(16) as u32, 1, 1),
-                    block_dim: (128, 1, 1),
-                    shared_mem_bytes: 40960,
-                })?;
+                .launch(launch)?;
         }
         Ok(())
+    }
+    pub(super) fn skinny_launch(shape: LinearShape) -> Result<LaunchConfig> {
+        ensure!(
+            (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&shape.rows)
+                && shape.input.is_multiple_of(256),
+            "unsupported skinny GEMM shape: {shape:?}"
+        );
+        checked_dims(shape.rows, shape.output, shape.input)?;
+        Ok(LaunchConfig {
+            grid_dim: (shape.output.div_ceil(16) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 40960,
+        })
     }
 
     pub fn decode_impl(&self) -> &'static str {
@@ -594,9 +604,40 @@ fn drop_result(name: &str, result: std::result::Result<(), impl std::fmt::Debug>
 }
 
 impl Blas {
+    pub(crate) fn direct_fp8_rows(&self) -> std::ops::RangeInclusive<usize> {
+        let rows = match self.invariant_rows {
+            0 => crate::mtp::MAX_VERIFY_ROWS,
+            rows => rows,
+        };
+        1..=rows
+    }
+
+    pub(crate) fn bind_invariant(
+        &mut self,
+        ctx: &Arc<cudarc::driver::CudaContext>,
+        rows: usize,
+    ) -> Result<()> {
+        ensure!(
+            (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
+            "invariant linear row bound={rows} exceeds {}",
+            crate::linear_plan::MAX_SKINNY_ROWS
+        );
+        if self.fp8.is_some() {
+            let fp8 = super::linear::Fp8Ops::for_rows(ctx, rows)?;
+            fp8.require_rows(rows)?;
+            self.fp8 = Some(fp8);
+        }
+        self.invariant_rows = rows;
+        Ok(())
+    }
     pub(crate) fn enable_fp8(&mut self, ctx: &Arc<cudarc::driver::CudaContext>) -> Result<()> {
         ensure!(self.fp8.is_none(), "FP8 operators already bound");
-        self.fp8 = Some(super::linear::Fp8Ops::new(ctx)?);
+        let fp8 = match self.invariant_rows {
+            0 => super::linear::Fp8Ops::new(ctx)?,
+            rows => super::linear::Fp8Ops::for_rows(ctx, rows)?,
+        };
+        fp8.require_rows(*self.direct_fp8_rows().end())?;
+        self.fp8 = Some(fp8);
         Ok(())
     }
     #[cfg(test)]
@@ -684,9 +725,12 @@ impl Blas {
                 scale,
                 layout,
             } => {
+                let direct_rows = self.direct_fp8_rows();
                 ensure!(
-                    crate::linear_plan::direct_fp8_rows(x.shape[0] as usize),
-                    "M>5 Prefill requires materialized BF16 weight"
+                    direct_rows.contains(&(x.shape[0] as usize)),
+                    "direct FP8 rows={} exceeds the bound={} and requires materialized BF16 weight",
+                    x.shape[0],
+                    direct_rows.end()
                 );
                 self.fp8_ops()?
                     .small_gemm(&self.stream, codes, scale, layout, x, y)
@@ -699,6 +743,18 @@ impl Blas {
                     w.stride == [u64::from(w.shape[1]), 1],
                     "BF16 linear requires row-major weight"
                 );
+                if (1..=self.invariant_rows).contains(&(x.shape[0] as usize)) {
+                    return self.skinny_raw(
+                        w.ptr,
+                        x.ptr,
+                        y.0.ptr,
+                        LinearShape {
+                            rows: x.shape[0] as usize,
+                            output: w.shape[0] as usize,
+                            input: w.shape[1] as usize,
+                        },
+                    );
+                }
                 let plans = self.plans.borrow();
                 let p = plans
                     .get(&(

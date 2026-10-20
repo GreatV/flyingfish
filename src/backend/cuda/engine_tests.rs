@@ -36,44 +36,51 @@ fn llama_rejects_unsupported_draft_blocks_before_device_setup() -> Result<()> {
         let runtime = root.join("blocked-runtime");
         std::fs::write(&runtime, b"not a directory")?;
         let mut rejected = 0;
-        for block in 1..=8 {
-            value["block_size"] = block.into();
-            std::fs::write(draft.join("config.json"), serde_json::to_vec(&value)?)?;
-            assert_eq!(
-                crate::dspark::DraftConfig::read(&draft, &target_config)?.block_size,
-                block
-            );
-            if block == 7 {
-                continue;
-            }
-            for budget in [SpecBudget::Chain, SpecBudget::Tree16] {
-                for write in [false, true] {
-                    let settings = Settings {
-                        tree_builder: TreeBuilder::Waves,
-                        spec_budget: budget,
-                        spec_graph: true,
-                        draft_model: Some(draft.clone()),
-                        runtime_dir: Some(runtime.clone()),
-                        prefix_cache: false,
-                        kv_format: crate::kv::KvFormat::Bf16,
-                    };
-                    let error = if write {
-                        Engine::calibrate(&target, 0, 32, Some(16), settings).err()
-                    } else {
-                        Engine::load(&target, 0, 32, Some(16), settings).err()
+        for (heads, head_dim, limit) in [(16, 128, 8), (8, 256, 16)] {
+            value["num_attention_heads"] = heads.into();
+            value["head_dim"] = head_dim.into();
+            value["rope_parameters"]["rope_theta"] = if head_dim == 256 { 1e7 } else { 5e6 }.into();
+            for block in 1..=limit {
+                value["block_size"] = block.into();
+                std::fs::write(draft.join("config.json"), serde_json::to_vec(&value)?)?;
+                assert_eq!(
+                    crate::dspark::DraftConfig::read(&draft, &target_config)?.block_size,
+                    block
+                );
+                if block == 7 {
+                    continue;
+                }
+                for budget in [SpecBudget::Chain, SpecBudget::Tree16] {
+                    for write in [false, true] {
+                        let settings = Settings {
+                            tree_builder: TreeBuilder::Waves,
+                            spec_budget: budget,
+                            spec_graph: true,
+                            draft_model: Some(draft.clone()),
+                            runtime_dir: Some(runtime.clone()),
+                            prefix_cache: false,
+                            kv_format: crate::kv::KvFormat::Bf16,
+                        };
+                        let error = if write {
+                            Engine::calibrate(&target, 0, 32, Some(16), settings).err()
+                        } else {
+                            Engine::load(&target, 0, 32, Some(16), settings).err()
+                        }
+                        .context("unsupported draft block reached device setup")?;
+                        ensure!(
+                            error
+                                .to_string()
+                                .starts_with("unsupported Llama DSpark block_size="),
+                            "draft block {block} reached runtime/device setup: {error:#}"
+                        );
+                        rejected += 1;
                     }
-                    .context("unsupported draft block reached device setup")?;
-                    ensure!(
-                        error
-                            .to_string()
-                            .starts_with("unsupported Llama DSpark block_size="),
-                        "draft block {block} reached runtime/device setup: {error:#}"
-                    );
-                    rejected += 1;
                 }
             }
         }
-        println!("PR61_DRAFT_BLOCK pre_device_rejections={rejected} block7_config_valid=true PASS");
+        println!(
+            "PASS llama_draft_block pre_device_rejections={rejected} block7_config_valid=true"
+        );
         Ok(())
     })();
     std::fs::remove_dir_all(&root)?;
@@ -480,6 +487,945 @@ fn chain_argmax_matches_single_on_real_logits() -> Result<()> {
         serde_json::json!({"chain_argmax_equivalence_summary":{"prompts":13,"rounds":rounds,"predictions_compared":compared,"pass":true}})
     );
     Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU window and FF_Q38_GPU_WINDOW=granted"]
+fn target_capture_wave_offsets_gpu() -> Result<()> {
+    use super::super::{
+        contracts::{RowDomain, SeqRef, TensorMut},
+        ops::{CommonOpsRef, ResidualRmsInput, RmsMode, RmsOptions},
+    };
+    use cudarc::driver::DevicePtr;
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "model_type":"llama", "hidden_size":2048, "intermediate_size":6144,
+        "num_hidden_layers":42, "num_attention_heads":16, "num_key_value_heads":2,
+        "head_dim":128, "vocab_size":130560, "max_position_embeddings":32768,
+        "rms_norm_eps":1e-6, "rope_theta":5000000.0, "rope_scaling":null,
+        "hidden_act":"silu", "tie_word_embeddings":false,
+        "torch_dtype":"bfloat16", "eos_token_id":[2]
+    }))?;
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let ops = Ops::new(&device.ctx)?;
+    let common = CommonOpsRef::new(&device.ctx)?;
+    let rows = 263;
+    let hidden = config.hidden_size;
+    let poison = bf16::from_f32(-17.0);
+    let x_host: Vec<_> = (0..rows * hidden)
+        .map(|i| bf16::from_f32(((i % 257) as f32 - 128.0) / 128.0))
+        .collect();
+    let add_host: Vec<_> = (0..rows * hidden)
+        .map(|i| bf16::from_f32(((i % 263) as f32 - 131.0) / 256.0))
+        .collect();
+    let weights_host: Vec<_> = (0..hidden)
+        .map(|i| bf16::from_f32((i % 251) as f32 / 256.0 + 0.5))
+        .collect();
+    let add = s.clone_htod(&add_host)?;
+    let weights = s.clone_htod(&weights_host)?;
+    let baseline = s.clone_htod(&x_host)?;
+    let baseline_norm = s.alloc_zeros::<bf16>(rows * hidden)?;
+    let mut metadata = s.clone_htod(&[0i32, rows as i32, rows as i32, rows as i32, 1, 0, 0, 0])?;
+    let seq = SeqRef {
+        ptr: metadata.device_ptr(s).0,
+    };
+    let options = RmsOptions {
+        mode: RmsMode::ZeroCentered,
+        eps: config.rms_norm_eps,
+    };
+    common.norm.rms_add_with(
+        s,
+        RowDomain {
+            meta: seq,
+            row_base: 0,
+            row_capacity: rows as u32,
+        },
+        ResidualRmsInput {
+            x: &mut TensorMut(qwen::heads(&baseline, s, 0, rows, 1, hidden as u32)?),
+            residual: qwen::heads(&add, s, 0, rows, 1, hidden as u32)?,
+            weight: qwen::vector(&weights, s)?,
+        },
+        &mut TensorMut(qwen::heads(&baseline_norm, s, 0, rows, 1, hidden as u32)?),
+        options,
+    )?;
+    let expected_x = s.clone_dtoh(&baseline)?;
+    let expected_norm = s.clone_dtoh(&baseline_norm)?;
+    ensure!(
+        expected_x
+            .iter()
+            .chain(&expected_norm)
+            .all(|v| v.to_f32().is_finite()),
+        "non-finite wave reference"
+    );
+    let unequal = |a: &[bf16], b: &[bf16]| {
+        a.iter()
+            .zip(b)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count()
+    };
+    let mut expected_capture = vec![poison; rows * 5 * hidden];
+    for row in 0..rows {
+        expected_capture[row * 5 * hidden + 2 * hidden..row * 5 * hidden + 3 * hidden]
+            .copy_from_slice(&expected_x[row * hidden..(row + 1) * hidden]);
+    }
+    let mut defects = 0;
+    let mut control_mismatch = 0;
+    for wrong in [false, true] {
+        let mut capture = HiddenCapture::new(&[1, 10, 20, 30, 39], &config, rows, s)?;
+        s.memcpy_htod(&vec![poison; capture.values.len()], &mut capture.values)?;
+        let mut x = s.clone_htod(&x_host)?;
+        let normalized = s.alloc_zeros::<bf16>(rows * hidden)?;
+        for base in [0, 256] {
+            let count = (rows - base).min(256);
+            let meta = crate::op_contract::SequenceMeta {
+                prefix: base as i32,
+                valid_rows: count as i32,
+                key_count: (base + count) as i32,
+                capacity: rows as i32,
+                causal: 1,
+                reserved: [0; 3],
+            };
+            meta.validate(rows as u32, count as u32)?;
+            s.memcpy_htod(
+                &[
+                    meta.prefix,
+                    meta.valid_rows,
+                    meta.key_count,
+                    meta.capacity,
+                    1,
+                    0,
+                    0,
+                    0,
+                ],
+                &mut metadata,
+            )?;
+            // SAFETY: each wave covers count*hidden values in the owned row buffers.
+            unsafe {
+                s.launch_builder(&ops.residual)
+                    .arg(&mut x.slice_mut(base * hidden..(base + count) * hidden))
+                    .arg(&add.slice(base * hidden..(base + count) * hidden))
+                    .arg(&i32::try_from(count * hidden)?)
+                    .launch(crate::backend::cuda::ops::flat(count * hidden))?;
+            }
+            copy::columns(
+                s,
+                &x.slice(base * hidden..(base + count) * hidden),
+                &mut capture
+                    .values
+                    .slice_mut(if wrong { 0 } else { base * capture.width }..),
+                copy::Rect {
+                    rows: count,
+                    width: hidden,
+                    src_pitch: hidden,
+                    src_col: 0,
+                    dst_pitch: capture.width,
+                    dst_col: 2 * hidden,
+                },
+            )?;
+            common.norm.rms_with(
+                s,
+                RowDomain {
+                    meta: seq,
+                    row_base: 0,
+                    row_capacity: count as u32,
+                },
+                qwen::heads(&x, s, base * hidden, count, 1, hidden as u32)?,
+                qwen::vector(&weights, s)?,
+                &mut TensorMut(qwen::heads(
+                    &normalized,
+                    s,
+                    base * hidden,
+                    count,
+                    1,
+                    hidden as u32,
+                )?),
+                options,
+            )?;
+        }
+        let actual_x = s.clone_dtoh(&x)?;
+        let actual_norm = s.clone_dtoh(&normalized)?;
+        let actual_capture = s.clone_dtoh(&capture.values)?;
+        ensure!(
+            actual_x
+                .iter()
+                .chain(&actual_norm)
+                .chain(&actual_capture)
+                .all(|x| x.to_f32().is_finite()),
+            "non-finite capture waves"
+        );
+        let mismatch = unequal(&actual_capture, &expected_capture);
+        if wrong {
+            control_mismatch = mismatch;
+            defects += usize::from(mismatch == 0);
+        } else {
+            defects += usize::from(mismatch != 0);
+        }
+        let residual_mismatch = unequal(&actual_x, &expected_x);
+        let norm_mismatch = unequal(&actual_norm, &expected_norm);
+        defects += usize::from(residual_mismatch != 0 || norm_mismatch != 0);
+        println!(
+            "CAPTURE_WAVE_ARM wrong_base={wrong} residual_bit_mismatches={residual_mismatch} norm_bit_mismatches={norm_mismatch} capture_bit_mismatches={mismatch} defects={defects}"
+        );
+    }
+    println!(
+        "CAPTURE_WAVES rows=263 hidden=2048 waves=256,7 writer=residual_then_columns wrong_base_bit_mismatches={control_mismatch} defects={defects} {}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(
+        defects == 0,
+        "capture wave copy has {defects} finite defects"
+    );
+    Ok(())
+}
+
+fn captured_trace_bits(
+    actual: &[bf16],
+    shape: (usize, usize),
+    layers: &[usize],
+    trace: &Trace,
+    prefix: &str,
+    poison: bf16,
+) -> Result<(usize, usize)> {
+    let (rows, hidden) = shape;
+    let width = layers
+        .len()
+        .checked_mul(hidden)
+        .context("capture trace width overflow")?;
+    ensure!(
+        rows.checked_mul(width) == Some(actual.len())
+            && actual.iter().all(|x| x.to_f32().is_finite()),
+        "capture trace shape/finiteness"
+    );
+    let mut mismatch = 0;
+    let mut old_noop = 0;
+    for (slot, layer) in layers.iter().enumerate() {
+        let expected = trace.values(&format!("{prefix}.layer.{layer}"))?;
+        ensure!(
+            expected.len() == rows * hidden && expected.iter().all(|x| x.is_finite()),
+            "layer trace shape/finiteness"
+        );
+        for row in 0..rows {
+            for d in 0..hidden {
+                let expected = bf16::from_f32(expected[row * hidden + d]).to_bits();
+                mismatch +=
+                    usize::from(actual[row * width + slot * hidden + d].to_bits() != expected);
+                old_noop += usize::from(poison.to_bits() != expected);
+            }
+        }
+    }
+    Ok((mismatch, old_noop))
+}
+
+#[test]
+#[ignore = "requires a MiniCPM BF16 full-model window and FF_ARGMAX_MODEL/FF_ARGMAX_DRAFT/FLYINGFISH_RUNTIME_DIR"]
+fn qwen_target_hidden_capture_gpu() -> Result<()> {
+    use crate::experts::plan::Tier;
+    use cudarc::driver::DevicePtr;
+    ensure!(
+        std::env::var("FF_Q38_FULL_MODEL_WINDOW").as_deref() == Ok("granted"),
+        "full-model GPU window not acknowledged"
+    );
+    let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
+    let draft = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
+    let spec = crate::model_spec::ModelSpec::read(&target)?;
+    ensure!(
+        spec.architecture == crate::model_spec::Architecture::MiniCpmV47
+            && spec.linear_format == crate::model_spec::LinearFormat::Bf16,
+        "capture gate requires MiniCPM-V BF16"
+    );
+    let settings = Settings {
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        draft_model: Some(draft.clone()),
+        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let started = Instant::now();
+    let mut model = Engine::load_kind(&target, 0, 512, Some(17), settings, true)?;
+    ensure!(
+        model.qwen.is_some() && model.moe_prefill.is_some() && model.spec.is_some(),
+        "draft-attached Qwen capture binding missing"
+    );
+    ensure!(
+        !model.graphs.is_empty(),
+        "capture parity gate requires declared target graphs"
+    );
+    model.reset()?;
+    model.prepare_graphs()?;
+    model.closure.expect_captures(model.graphs.len())?;
+    model.check_graphs()?;
+    model.reset()?;
+    model.closure.ready(started)?;
+    let mut draft_state = model.spec.take();
+    let layers = crate::dspark::read_capture_layers(&draft, &model.config)?;
+    let mut capture = Some(
+        model
+            .hidden_capture
+            .take()
+            .context("target capture missing")?,
+    );
+    let s = model.device.stream.clone();
+    let hidden = model.config.hidden_size;
+    let width = capture.as_ref().context("target capture missing")?.width;
+    let pointer = capture
+        .as_ref()
+        .context("target capture missing")?
+        .values
+        .device_ptr(&s)
+        .0;
+    let span_rows = model
+        .moe_prefill
+        .as_ref()
+        .context("prefill missing")?
+        .reference_geometry()[0];
+    let poison = bf16::from_f32(-17.0);
+    let signature = |model: &Engine, rows: usize| -> Result<[Vec<u8>; 4]> {
+        let logits = s.clone_dtoh(&model.work.logits)?;
+        ensure!(
+            logits.iter().all(|value| value.to_f32().is_finite()),
+            "non-finite capture signature logits"
+        );
+        let mut bits = [qwen_state_bits(model)?, Vec::new(), Vec::new(), Vec::new()];
+        for (index, value) in [&model.work.x, &model.work.n].into_iter().enumerate() {
+            copy::bits(&s, &value.slice(..rows * hidden), &mut bits[index + 1])?;
+        }
+        copy::bits(&s, &model.work.logits, &mut bits[3])?;
+        Ok(bits)
+    };
+    let prefill = |model: &mut Engine,
+                   ids: &[u32],
+                   trace: Option<&mut Trace>,
+                   observe: bool|
+     -> Result<Vec<(usize, Vec<bf16>)>> {
+        let start = model.position;
+        let mut observed = Vec::new();
+        model.prefill_moe_chunks(ids, trace, ids.len(), &mut |engine, part| {
+            if observe {
+                let base = (engine.position - start) % span_rows;
+                let binding = engine
+                    .hidden_capture
+                    .as_ref()
+                    .context("target capture missing")?;
+                observed.push((
+                    part.len(),
+                    s.clone_dtoh(
+                        &binding
+                            .values
+                            .slice(base * width..(base + part.len()) * width),
+                    )?,
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(observed)
+    };
+    let poison_capture = |model: &mut Engine| -> Result<()> {
+        let binding = model
+            .hidden_capture
+            .as_mut()
+            .context("target capture missing")?;
+        ensure!(
+            binding.values.device_ptr(&s).0 == pointer,
+            "capture graph pointer moved"
+        );
+        s.memcpy_htod(&vec![poison; binding.values.len()], &mut binding.values)?;
+        Ok(())
+    };
+    let mut defects = 0;
+    let mut old_noop = 0;
+    let seed: Vec<_> = (0..17).map(|i| (i * 263 + 17) as u32).collect();
+    prefill(&mut model, &seed, None, false)?;
+    let frequency = model
+        .moe_prefill
+        .as_ref()
+        .context("prefill missing")?
+        .capture_frequency();
+    ensure!(
+        frequency
+            .iter()
+            .all(|layer| layer.iter().all(|x| x.is_finite() && *x >= 0.0)
+                && layer.iter().sum::<f64>() > 0.0),
+        "capture seed frequency is invalid"
+    );
+    println!(
+        "QWEN_CAPTURE_SEED rows=17 layers={} frequency=frozen_actual_prefill",
+        frequency.len()
+    );
+    let pin = |model: &mut Engine| -> Result<_> {
+        let slots = model.moe_slots.as_mut().context("expert slots missing")?;
+        slots.pin_capture_request(&frequency)
+    };
+    let resident_limits = [2usize, 5, 17, 18, 35, 263]
+        .into_iter()
+        .map(|rows| {
+            Ok((
+                rows,
+                model
+                    .moe_prefill
+                    .as_ref()
+                    .context("prefill missing")?
+                    .capture_resident_limit(rows)?,
+            ))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+    let placement_matches = |actual: Vec<(Tier, Option<u32>)>,
+                             expected: &[(Tier, Option<u32>)],
+                             phase: &str,
+                             prefill_rows: Option<usize>,
+                             routed: Option<&[Vec<f64>]>|
+     -> Result<bool> {
+        ensure!(
+            actual.len() == expected.len(),
+            "Runner FAIL capture placement geometry differs"
+        );
+        ensure!(
+            prefill_rows.is_some() == routed.is_some(),
+            "Runner FAIL capture activity geometry differs"
+        );
+        let routed = routed.map(|layers| layers.iter().flatten().copied().collect::<Vec<_>>());
+        ensure!(
+            routed
+                .as_ref()
+                .is_none_or(|counts| counts.len() == actual.len()
+                    && counts
+                        .iter()
+                        .all(|count| count.is_finite() && *count >= 0.0)),
+            "Runner FAIL capture activity is invalid"
+        );
+        let gpu_cpu = actual
+            .iter()
+            .zip(expected)
+            .filter(|(a, b)| (a.0 == Tier::Gpu) != (b.0 == Tier::Gpu))
+            .count();
+        let storage = actual
+            .iter()
+            .zip(expected)
+            .filter(|(a, b)| a.0 != b.0)
+            .count();
+        let slots = actual
+            .iter()
+            .zip(expected)
+            .filter(|(a, b)| a.0 == Tier::Gpu && b.0 == Tier::Gpu && a.1 != b.1)
+            .count();
+        let limit = prefill_rows
+            .map(|rows| {
+                resident_limits
+                    .get(&rows)
+                    .copied()
+                    .context("capture row count missing")
+            })
+            .transpose()?
+            .unwrap_or(u32::MAX);
+        let resident = |entry: &(Tier, Option<u32>)| {
+            entry.0 == Tier::Gpu && entry.1.is_some_and(|slot| slot < limit)
+        };
+        let borrowed = actual
+            .iter()
+            .zip(expected)
+            .filter(|(a, b)| resident(a) != resident(b))
+            .count();
+        let executed = actual
+            .iter()
+            .zip(expected)
+            .enumerate()
+            .filter(|(index, (a, b))| {
+                resident(a) != resident(b)
+                    && routed.as_ref().is_none_or(|counts| counts[*index] > 0.0)
+            })
+            .count();
+        println!(
+            "QWEN_CAPTURE_PLACEMENT phase={phase} gpu_cpu_mismatches={gpu_cpu} post_borrow_gpu_cpu_mismatches={borrowed} executed_post_borrow_gpu_cpu_mismatches={executed} resident_slot_limit={limit} storage_tier_changes={storage} physical_gpu_slot_changes={slots}"
+        );
+        Ok(gpu_cpu == 0 && executed == 0)
+    };
+    for rows in [18usize, 35, 263] {
+        let ids: Vec<_> = (0..rows).map(|i| (i * 263 + 17) as u32).collect();
+        model.reset()?;
+        pin(&mut model)?;
+        prefill(&mut model, &ids, None, false)?;
+        model.reset()?;
+        let placement = pin(&mut model)?;
+        prefill(&mut model, &ids, None, false)?;
+        let tail = rows % model.chunk;
+        let active = if tail == 0 { model.chunk } else { tail };
+        let expected = signature(&model, active)?;
+        let routed = model
+            .moe_prefill
+            .as_ref()
+            .context("prefill missing")?
+            .capture_frequency();
+        model.reset()?;
+        ensure!(
+            placement_matches(
+                pin(&mut model)?,
+                &placement,
+                "prefill_seed",
+                Some(rows),
+                Some(&routed)
+            )?,
+            "Runner FAIL native placement differs before capture pair"
+        );
+        model.spec = draft_state.take();
+        model.hidden_capture = capture.take();
+        poison_capture(&mut model)?;
+        let mut trace = Trace::default();
+        let observed = prefill(&mut model, &ids, Some(&mut trace), true)?;
+        let mut mismatch = 0;
+        for (part, (count, values)) in observed.iter().enumerate() {
+            let result = captured_trace_bits(
+                values,
+                (*count, hidden),
+                &layers,
+                &trace,
+                &format!("prefill.{part}"),
+                poison,
+            )?;
+            mismatch += result.0;
+            old_noop += result.1;
+        }
+        let state_equal = signature(&model, active)? == expected;
+        defects += usize::from(mismatch != 0 || !state_equal);
+        println!(
+            "QWEN_CAPTURE_PREFILL rows={rows} mixer_rows={} span_rows={span_rows} trace_bit_mismatches={mismatch} residual_norm_logits_state_bits_equal={state_equal} defects={defects}",
+            model.chunk
+        );
+        draft_state = model.spec.take();
+        capture = model.hidden_capture.take();
+    }
+    let prefix: Vec<_> = (0..17).map(|i| (i * 263 + 17) as u32).collect();
+    for rows in [2usize, 5] {
+        let ids: Vec<_> = (0..rows).map(|i| (i * 269 + 23) as u32).collect();
+        let causal = |model: &mut Engine, trace: Option<&mut Trace>| -> Result<()> {
+            model
+                .moe_slots
+                .as_mut()
+                .context("expert slots missing")?
+                .end_request()?;
+            model.prefill_moe_chunks(&ids, trace, ids.len(), &mut |_, _| Ok(()))?;
+            Ok(())
+        };
+        model.reset()?;
+        pin(&mut model)?;
+        prefill(&mut model, &prefix, None, false)?;
+        causal(&mut model, None)?;
+        model.reset()?;
+        let placement = pin(&mut model)?;
+        prefill(&mut model, &prefix, None, false)?;
+        let prefix_routed = model
+            .moe_prefill
+            .as_ref()
+            .context("prefill missing")?
+            .capture_frequency();
+        let before = model
+            .moe_slots
+            .as_ref()
+            .context("expert slots missing")?
+            .capture_placement()?;
+        causal(&mut model, None)?;
+        let expected = signature(&model, rows)?;
+        let append_routed = model
+            .moe_prefill
+            .as_ref()
+            .context("prefill missing")?
+            .capture_frequency();
+        model.reset()?;
+        ensure!(
+            placement_matches(
+                pin(&mut model)?,
+                &placement,
+                "causal_seed",
+                Some(prefix.len()),
+                Some(&prefix_routed)
+            )?,
+            "Runner FAIL native causal placement differs"
+        );
+        model.spec = draft_state.take();
+        model.hidden_capture = capture.take();
+        prefill(&mut model, &prefix, None, false)?;
+        defects += usize::from(!placement_matches(
+            model
+                .moe_slots
+                .as_ref()
+                .context("expert slots missing")?
+                .capture_placement()?,
+            &before,
+            "causal_prefix",
+            Some(rows),
+            Some(&append_routed),
+        )?);
+        poison_capture(&mut model)?;
+        let mut trace = Trace::default();
+        causal(&mut model, Some(&mut trace))?;
+        let binding = model
+            .hidden_capture
+            .as_ref()
+            .context("target capture missing")?;
+        let values = s.clone_dtoh(&binding.values)?;
+        let result = captured_trace_bits(
+            &values[..rows * width],
+            (rows, hidden),
+            &layers,
+            &trace,
+            "prefill.0",
+            poison,
+        )?;
+        let inactive = values[rows * width..]
+            .iter()
+            .filter(|x| x.to_bits() != poison.to_bits())
+            .count();
+        old_noop += result.1;
+        let state_equal = signature(&model, rows)? == expected;
+        defects += usize::from(result.0 != 0 || inactive != 0 || !state_equal);
+        println!(
+            "QWEN_CAPTURE_CAUSAL_APPEND prefix=17 rows={rows} trace_bit_mismatches={} inactive_bit_mismatches={inactive} residual_norm_logits_state_bits_equal={state_equal} defects={defects}",
+            result.0
+        );
+        draft_state = model.spec.take();
+        capture = model.hidden_capture.take();
+    }
+    model.reset()?;
+    pin(&mut model)?;
+    prefill(&mut model, &prefix, None, false)?;
+    let disabled_placement = model
+        .moe_slots
+        .as_ref()
+        .context("expert slots missing")?
+        .capture_placement()?;
+    model.decode(false, None)?;
+    let disabled_state = signature(&model, 1)?;
+    model.spec = draft_state.take();
+    model.hidden_capture = capture.take();
+    model.reset()?;
+    pin(&mut model)?;
+    prefill(&mut model, &prefix, None, false)?;
+    model.reset()?;
+    pin(&mut model)?;
+    prefill(&mut model, &prefix, None, false)?;
+    let decode_placement = model
+        .moe_slots
+        .as_ref()
+        .context("expert slots missing")?
+        .capture_placement()?;
+    defects += usize::from(!placement_matches(
+        decode_placement.clone(),
+        &disabled_placement,
+        "decode_prefix",
+        None,
+        None,
+    )?);
+    poison_capture(&mut model)?;
+    let mut trace = Trace::default();
+    model.profiler_start()?;
+    model.decode(false, Some((&mut trace, "decode")))?;
+    let expected = signature(&model, 1)?;
+    let disabled_equal = expected == disabled_state;
+    defects += usize::from(!disabled_equal);
+    println!(
+        "QWEN_CAPTURE_DECODE rows=1 capture_off_state_bits_equal={disabled_equal} defects={defects}"
+    );
+    let expected_capture = s.clone_dtoh(
+        &model
+            .hidden_capture
+            .as_ref()
+            .context("target capture missing")?
+            .values,
+    )?;
+    let result = captured_trace_bits(
+        &expected_capture[..width],
+        (1, hidden),
+        &layers,
+        &trace,
+        "decode",
+        poison,
+    )?;
+    defects += usize::from(result.0 != 0);
+    old_noop += result.1;
+    let graph_rows = model
+        .spec
+        .as_ref()
+        .context("draft state missing")?
+        .draft
+        .config
+        .verify_rows()?;
+    let graph_ids: Vec<_> = (0..graph_rows).map(|row| (row * 269 + 23) as u32).collect();
+    model.reset()?;
+    let graph_seed = pin(&mut model)?;
+    prefill(&mut model, &prefix, None, false)?;
+    let graph_placement = model
+        .moe_slots
+        .as_ref()
+        .context("expert slots missing")?
+        .capture_placement()?;
+    let graph_routed = model
+        .moe_prefill
+        .as_ref()
+        .context("prefill missing")?
+        .capture_frequency();
+    poison_capture(&mut model)?;
+    s.memcpy_htod(&graph_ids, &mut model.work.ids.slice_mut(..graph_rows))?;
+    let mut verify_trace = Trace::default();
+    model.run_step(
+        crate::backend::Step {
+            rows: graph_rows,
+            input: crate::backend::Input::Ids,
+            head: Head::All,
+            mask: crate::backend::Mask::Causal,
+        },
+        Some(Target {
+            trace: &mut verify_trace,
+            prefix: "verify",
+            skip: 0,
+        }),
+    )?;
+    let graph_expected = signature(&model, graph_rows)?;
+    let graph_capture = s.clone_dtoh(
+        &model
+            .hidden_capture
+            .as_ref()
+            .context("target capture missing")?
+            .values,
+    )?;
+    let spec = model.spec.as_ref().context("draft state missing")?;
+    let graph_logits = s.clone_dtoh(&spec.logits)?;
+    let graph_predictions = s.clone_dtoh(&spec.predictions)?;
+    ensure!(
+        graph_logits.iter().all(|x| x.to_f32().is_finite()),
+        "non-finite verify capture reference logits"
+    );
+    let result = captured_trace_bits(
+        &graph_capture[..graph_rows * width],
+        (graph_rows, hidden),
+        &layers,
+        &verify_trace,
+        "verify",
+        poison,
+    )?;
+    defects += usize::from(result.0 != 0);
+    old_noop += result.1;
+    for _ in 0..2 {
+        model.reset()?;
+        ensure!(
+            placement_matches(
+                pin(&mut model)?,
+                &graph_seed,
+                "graph_seed",
+                Some(prefix.len()),
+                Some(&graph_routed)
+            )?,
+            "Runner FAIL graph seed placement differs"
+        );
+        prefill(&mut model, &prefix, None, false)?;
+        defects += usize::from(!placement_matches(
+            model
+                .moe_slots
+                .as_ref()
+                .context("expert slots missing")?
+                .capture_placement()?,
+            &graph_placement,
+            "graph_prefix",
+            None,
+            None,
+        )?);
+        poison_capture(&mut model)?;
+        s.memcpy_htod(&graph_ids, &mut model.work.ids.slice_mut(..graph_rows))?;
+        model.launch_spec_graph(SpecPhase::Verify)?;
+        let actual = s.clone_dtoh(
+            &model
+                .hidden_capture
+                .as_ref()
+                .context("target capture missing")?
+                .values,
+        )?;
+        let spec = model.spec.as_ref().context("draft state missing")?;
+        let logits = s.clone_dtoh(&spec.logits)?;
+        ensure!(
+            actual.iter().chain(&logits).all(|x| x.to_f32().is_finite()),
+            "non-finite verify capture replay"
+        );
+        let equal = actual
+            .iter()
+            .zip(&graph_capture)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+            && logits
+                .iter()
+                .zip(&graph_logits)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+            && s.clone_dtoh(&spec.predictions)? == graph_predictions
+            && signature(&model, graph_rows)? == graph_expected;
+        defects += usize::from(!equal);
+        println!(
+            "QWEN_CAPTURE_GRAPH prefix=17 rows={graph_rows} phase=verify bitwise_equal={equal} defects={defects}"
+        );
+    }
+    let original = model
+        .hidden_capture
+        .as_ref()
+        .context("target capture missing")?
+        .layer_slots
+        .clone();
+    draft_state = model.spec.take();
+    capture = model.hidden_capture.take();
+    let final_ids: Vec<_> = (0..35).map(|i| (i * 263 + 17) as u32).collect();
+    model.reset()?;
+    pin(&mut model)?;
+    prefill(&mut model, &final_ids, None, false)?;
+    model.reset()?;
+    let final_placement = pin(&mut model)?;
+    prefill(&mut model, &final_ids, None, false)?;
+    let final_expected = signature(&model, 1)?;
+    let final_routed = model
+        .moe_prefill
+        .as_ref()
+        .context("prefill missing")?
+        .capture_frequency();
+    model.reset()?;
+    ensure!(
+        placement_matches(
+            pin(&mut model)?,
+            &final_placement,
+            "final_seed",
+            Some(final_ids.len()),
+            Some(&final_routed)
+        )?,
+        "Runner FAIL final-tap seed placement differs"
+    );
+    model.spec = draft_state.take();
+    model.hidden_capture = capture.take();
+    let mut final_layers = layers.clone();
+    let slot = final_layers.len() - 1;
+    let last = model.config.num_hidden_layers - 1;
+    {
+        let binding = model
+            .hidden_capture
+            .as_mut()
+            .context("target capture missing")?;
+        binding.layer_slots[final_layers[slot]] = None;
+        binding.layer_slots[last] = Some(u32::try_from(slot)?);
+        final_layers[slot] = last;
+    }
+    poison_capture(&mut model)?;
+    let mut final_trace = Trace::default();
+    let observed = prefill(&mut model, &final_ids, Some(&mut final_trace), true)?;
+    let mut final_mismatches = 0;
+    for (part, (count, values)) in observed.iter().enumerate() {
+        final_mismatches += captured_trace_bits(
+            values,
+            (*count, hidden),
+            &final_layers,
+            &final_trace,
+            &format!("prefill.{part}"),
+            poison,
+        )?
+        .0;
+    }
+    let final_actual = signature(&model, 1)?;
+    for ((name, actual), expected) in ["state", "residual", "norm", "logits"]
+        .into_iter()
+        .zip(&final_actual)
+        .zip(&final_expected)
+    {
+        ensure!(
+            actual.len() == expected.len(),
+            "final-tap signature extent differs"
+        );
+        let mismatch = actual.iter().zip(expected).filter(|(a, b)| a != b).count();
+        println!("QWEN_CAPTURE_FINAL_COMPONENT component={name} byte_mismatches={mismatch}");
+    }
+    let final_equal = final_actual == final_expected;
+    defects += usize::from(final_mismatches != 0 || !final_equal);
+    println!(
+        "QWEN_CAPTURE_FINAL_TAP layer={last} trace_bit_mismatches={final_mismatches} capture_off_state_bits_equal={final_equal} defects={defects}"
+    );
+    model
+        .hidden_capture
+        .as_mut()
+        .context("target capture missing")?
+        .layer_slots = original.clone();
+    {
+        let binding = model
+            .hidden_capture
+            .as_mut()
+            .context("target capture missing")?;
+        binding.layer_slots[layers[0]] = None;
+        binding.layer_slots[layers[0] + 1] = Some(0);
+    }
+    model.reset()?;
+    pin(&mut model)?;
+    poison_capture(&mut model)?;
+    let ids: Vec<_> = (0..35).map(|i| (i * 263 + 17) as u32).collect();
+    let mut trace = Trace::default();
+    let observed = prefill(&mut model, &ids, Some(&mut trace), true)?;
+    let mut wrong = 0;
+    for (part, (count, values)) in observed.iter().enumerate() {
+        wrong += captured_trace_bits(
+            values,
+            (*count, hidden),
+            &layers,
+            &trace,
+            &format!("prefill.{part}"),
+            poison,
+        )?
+        .0;
+    }
+    model
+        .hidden_capture
+        .as_mut()
+        .context("target capture missing")?
+        .layer_slots = original;
+    defects += usize::from(wrong == 0 || old_noop == 0);
+    model.profiler_stop()?;
+    println!(
+        "QWEN_TARGET_CAPTURE prefill_cells=3 causal_append_cells=2 final_tap_cells=1 graph_replays=2 wrong_layer_bit_mismatches={wrong} old_noop_bit_mismatches={old_noop} defects={defects} {}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "Qwen capture has {defects} finite defects");
+    Ok(())
+}
+
+fn qwen_state_bits(engine: &Engine) -> Result<Vec<u8>> {
+    let s = &engine.device.stream;
+    let mut bits = Vec::with_capacity(engine.state.bytes() + 32);
+    for state in &engine.state.gdn {
+        for buffer in [&state.s, &state.history] {
+            for value in s.clone_dtoh(buffer)? {
+                bits.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+    }
+    for kv in &engine.state.kv {
+        for buffer in [&kv.k, &kv.v] {
+            for value in s.clone_dtoh(buffer)? {
+                bits.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+    }
+    for value in s.clone_dtoh(engine.state.sequence.as_ref().context("metadata missing")?)? {
+        bits.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in engine
+        .qwen
+        .as_ref()
+        .context("Q38 runtime missing")?
+        .position_values(s)?
+    {
+        bits.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in s.clone_dtoh(&engine.work.token)? {
+        bits.extend_from_slice(&value.to_le_bytes());
+    }
+    for buffer in [&engine.work.position, &engine.work.length] {
+        for value in s.clone_dtoh(buffer)? {
+            bits.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    bits.extend_from_slice(&engine.position.to_le_bytes());
+    Ok(bits)
 }
 
 #[test]

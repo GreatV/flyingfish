@@ -328,6 +328,39 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
 
 impl Prefill {
     #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn capture_frequency(&self) -> Vec<Vec<f64>> {
+        self.frequency.clone()
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn capture_resident_limit(
+        &self,
+        rows: usize,
+    ) -> Result<u32> {
+        let rows = u32::try_from(rows)?.min(self.capacity.span_rows);
+        ensure!(rows > 0, "capture request has no rows");
+        let borrowed = u32::try_from(
+            self.reserves
+                .span_bytes(rows)?
+                .div_ceil(self.capacity.slot_bytes()),
+        )?;
+        self.capacity
+            .slots_total()
+            .checked_sub(borrowed)
+            .context("capture borrow exceeds resident slots")
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn reference_geometry(&self) -> [usize; 4] {
+        [
+            self.capacity.span_rows as usize,
+            self.capacity.wave_rows as usize,
+            self.mixer_rows,
+            self.workspace_rows,
+        ]
+    }
+
+    #[cfg(test)]
     pub(in crate::backend::cuda::engine) fn reseed_request(&self, slots: &mut Slots) -> Result<()> {
         slots.end_request()?;
         slots.begin_request(&self.frequency)
@@ -982,8 +1015,8 @@ impl Engine {
         after_chunk: &mut impl FnMut(&mut Self, &[u32]) -> Result<()>,
     ) -> Result<u32> {
         ensure!(
-            self.spec.is_none(),
-            "MoE prefill has no bound speculative-state consumer"
+            self.spec.is_none() || self.hidden_capture.is_some(),
+            "MoE draft prefill requires the bound target capture"
         );
         ensure!(
             self.moe_prefill.is_some() && self.moe_slots.is_some() && self.moe.is_some(),
@@ -1248,6 +1281,23 @@ impl Engine {
                                 rows * self.model_spec.hidden as usize,
                             ))?;
                     }
+                    if let Some(capture) = &mut self.hidden_capture
+                        && let Some(slot) = capture.layer_slots[layer]
+                    {
+                        copy::columns(
+                            &self.device.stream,
+                            &self.work.x,
+                            &mut capture.values.slice_mut(base * capture.width..),
+                            copy::Rect {
+                                rows,
+                                width: self.model_spec.hidden as usize,
+                                src_pitch: self.model_spec.hidden as usize,
+                                src_col: 0,
+                                dst_pitch: capture.width,
+                                dst_col: slot as usize * self.model_spec.hidden as usize,
+                            },
+                        )?;
+                    }
                     device_copy(
                         &self.device.stream,
                         qwen::matrix(
@@ -1311,6 +1361,10 @@ impl Engine {
                         || layer == self.trace_layer
                         || layer == layers / 2
                         || layer + 1 == layers
+                        || self
+                            .hidden_capture
+                            .as_ref()
+                            .is_some_and(|capture| capture.layer_slots[layer].is_some())
                     {
                         let name = if all_layers {
                             &prefill.layer_names[layer]["layer.".len()..]
@@ -1367,6 +1421,9 @@ impl Engine {
                 after_chunk(self, &admitted[*base..base + rows])?;
                 self.committed_prefix_ids
                     .extend_from_slice(&admitted[*base..base + rows]);
+            }
+            if self.spec.is_some() {
+                self.inject_capture(admitted.len(), span_start, None)?;
             }
         }
         prefill.end(&self.device, slots)?;
@@ -2441,7 +2498,7 @@ mod tests {
                 + u64::from(capacity.prefill_staging_slots));
         let initial =
             vec![(0..geometry.experts).rev().collect::<Vec<_>>(); geometry.layers as usize];
-        let mut fixture = tier_fixture(3);
+        let mut fixture = tier_fixture(3, 8);
         fixture.router_w.fill(bf16::ZERO);
         let mut engines = (0..2)
             .map(|arm| {
@@ -2672,7 +2729,7 @@ mod tests {
     }
 
     fn inputs(variant: u32, rows: usize) -> MoeFixture {
-        let mut fixture = tier_fixture(variant);
+        let mut fixture = tier_fixture(variant, 8);
         let source = fixture.x.clone();
         let pattern = (0..rows).map(|row| {
             if row + 7 < rows {
@@ -3733,7 +3790,7 @@ mod tests {
             engine.workspace_rows
         );
         engine.reset()?;
-        let mut fixture = tier_fixture(3);
+        let mut fixture = tier_fixture(3, 8);
         let mut hidden = Vec::new();
         for (span_index, admitted) in ids.chunks(span_rows).enumerate() {
             let start = span_index * span_rows;
@@ -3839,7 +3896,7 @@ mod tests {
             std::env::var_os("FLYINGFISH_RUNTIME_DIR")
                 .context("prefill order gate runtime missing")?,
         );
-        let fixture = tier_fixture(3);
+        let fixture = tier_fixture(3, 8);
         let ids = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3];
         let mut oracle = Engine::load_moe_test(
             &fixture,

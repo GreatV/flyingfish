@@ -65,10 +65,7 @@ fn trace_value(
     Ok(())
 }
 
-pub(in crate::backend::cuda::engine) fn bucketed_prefill_rows(
-    rows: u32,
-    workspace_rows: u32,
-) -> Result<u32> {
+pub(super) fn bucketed_prefill_rows(rows: u32, workspace_rows: u32) -> Result<u32> {
     ensure!(
         rows > 0 && rows <= workspace_rows,
         "prefill rows {rows} outside workspace {workspace_rows}"
@@ -339,6 +336,8 @@ impl HiddenCapture {
 }
 
 struct Spec {
+    #[cfg(test)]
+    forced_proposals: Option<Vec<u32>>,
     eos: Vec<u32>,
     tree_verify_graph: Option<CudaGraph>,
     tree_commit_graph: Option<CudaGraph>,
@@ -355,6 +354,8 @@ struct Spec {
     logits: CudaSlice<bf16>,
     predictions: CudaSlice<u32>,
     row_counts: CudaSlice<i32>,
+    checkpoint: Option<super::state::StateCheckpoint>,
+    snapshots: Vec<super::state::GdnState>,
 }
 
 #[derive(Clone, Copy)]
@@ -365,11 +366,11 @@ enum SpecPhase {
 }
 
 impl SpecPhase {
-    fn rows(self) -> usize {
+    fn rows(self, draft: &crate::dspark::DraftConfig) -> Result<usize> {
         match self {
-            Self::Draft => 7,
-            Self::Verify => 8,
-            Self::Inject(rows) => rows,
+            Self::Draft => Ok(draft.block_size),
+            Self::Verify => draft.verify_rows(),
+            Self::Inject(rows) => Ok(rows),
         }
     }
     fn name(self) -> &'static str {
@@ -382,13 +383,103 @@ impl SpecPhase {
 }
 
 impl Spec {
+    fn new(draft: super::draft::Draft, engine: &Engine) -> Result<Self> {
+        let verify_rows = draft.config.verify_rows()?;
+        let rows = if engine.spec_budget.is_tree() {
+            engine.spec_budget.rows()
+        } else {
+            verify_rows
+        };
+        ensure!(
+            rows <= engine.workspace_rows && rows <= engine.capacity,
+            "DSpark allocated rows={rows} workspace={} capacity={}",
+            engine.workspace_rows,
+            engine.capacity
+        );
+        let stream = &engine.device.stream;
+        let counts: Vec<_> = (1..=rows).map(|row| row as i32).collect();
+        let row_counts = stream.clone_htod(&counts)?;
+        stream.synchronize()?;
+        let checkpoint = engine
+            .model_spec
+            .moe
+            .as_ref()
+            .map(|_| {
+                super::state::StateCheckpoint::new(&engine.state, &engine.model_spec, rows, stream)
+            })
+            .transpose()?;
+        let snapshots = if checkpoint.is_some() {
+            engine
+                .state
+                .gdn
+                .iter()
+                .map(|live| {
+                    Ok(super::state::GdnState {
+                        s: stream.alloc_zeros((rows - 1) * live.s.len())?,
+                        history: stream.alloc_zeros((rows - 1) * live.history.len())?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let spec = Self {
+            #[cfg(test)]
+            forced_proposals: None,
+            eos: Vec::new(),
+            tree_verify_graph: None,
+            tree_commit_graph: None,
+            tree_draft_graph: None,
+            tree: if engine.spec_budget.is_tree() {
+                Some(super::tree::State::new(
+                    &engine.device,
+                    &engine.config,
+                    &engine.state.kv,
+                    engine.capacity,
+                    rows,
+                )?)
+            } else {
+                None
+            },
+            tree_attention: None,
+            active_rows: 0,
+            graph: engine.spec_graph,
+            draft_graph: None,
+            verify_graph: None,
+            inject_graphs: (0..verify_rows).map(|_| None).collect(),
+            verification: None,
+            draft,
+            logits: stream.alloc_zeros(rows * engine.config.vocab_size)?,
+            predictions: stream.alloc_zeros(rows)?,
+            row_counts,
+            checkpoint,
+            snapshots,
+        };
+        if let Some(checkpoint) = &spec.checkpoint {
+            let actual = checkpoint.bytes()
+                + spec
+                    .snapshots
+                    .iter()
+                    .map(|image| (image.s.len() + image.history.len()) * size_of::<f32>())
+                    .sum::<usize>();
+            let planned = spec.draft.config.target_state_bytes(&engine.model_spec)?;
+            ensure!(
+                actual == planned,
+                "DSpark state allocation={actual} differs from planned={planned} rows={rows}"
+            );
+        }
+        Ok(spec)
+    }
     fn graph_slot(&mut self, phase: SpecPhase) -> Result<&mut Option<CudaGraph>> {
         Ok(match phase {
             SpecPhase::Draft => &mut self.draft_graph,
             SpecPhase::Verify => &mut self.verify_graph,
             SpecPhase::Inject(rows) => {
-                ensure!(rows > 0 && rows <= 8, "inject Graph M must be within1..8");
-                &mut self.inject_graphs[rows - 1]
+                let index = rows.checked_sub(1).context("inject Graph rows=0")?;
+                let bound = self.inject_graphs.len();
+                self.inject_graphs
+                    .get_mut(index)
+                    .with_context(|| format!("inject Graph rows={rows} exceeds bound={bound}"))?
             }
         })
     }
@@ -422,6 +513,15 @@ enum SetupMode {
     Ready,
     Prepare,
     Mtp { verify_rows: usize },
+}
+
+impl SetupMode {
+    fn writes(self) -> bool {
+        match self {
+            Self::Ready => false,
+            Self::Prepare | Self::Mtp { .. } => true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -646,7 +746,7 @@ impl Engine {
         settings: Settings,
     ) -> Result<()> {
         let spec = crate::model_spec::ModelSpec::read(dir)?;
-        if spec.moe.is_some() {
+        if spec.moe.is_some() && settings.draft_model.is_none() {
             let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&spec)?;
             let runtime = super::calibrate::runtime_dir(
                 settings
@@ -716,7 +816,7 @@ impl Engine {
         settings: Settings,
         mode: SetupMode,
     ) -> Result<Self> {
-        let write = !matches!(mode, SetupMode::Ready);
+        let write = mode.writes();
         let started = Instant::now();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
         match load_dispatch(model_spec.architecture)? {
@@ -767,11 +867,32 @@ impl Engine {
         command.push_str(" calibrate");
         let closure = Rc::new(super::closure::Closure::new(write, command));
         let config = Config::read(dir)?;
-        if let Some(path) = &draft_path {
-            let draft = crate::dspark::DraftConfig::read(path, &config)?;
+        let draft_config = draft_path
+            .as_deref()
+            .map(|path| crate::dspark::DraftConfig::read(path, &config))
+            .transpose()?;
+        if let Some(draft) = &draft_config {
             ensure!(
                 draft.block_size == 7,
-                "unsupported Llama DSpark block_size={}; proposal/verification requires 7 proposals and 8 verify rows",
+                "unsupported Llama DSpark block_size={}; requires block_size=7",
+                draft.block_size
+            );
+            let rows = draft.verify_rows()?;
+            ensure!(
+                rows <= crate::linear_plan::MAX_SKINNY_ROWS,
+                "DSpark block_size={} verify_rows={rows} exceeds skinny bound={}",
+                draft.block_size,
+                crate::linear_plan::MAX_SKINNY_ROWS
+            );
+            ensure!(
+                !settings.spec_budget.is_tree() || rows == SpecBudget::Chain.rows(),
+                "tree draft block_size={} requires the declared chain rows={}",
+                draft.block_size,
+                SpecBudget::Chain.rows()
+            );
+            ensure!(
+                rows < capacity,
+                "DSpark block_size={} verify_rows={rows} exceeds capacity={capacity}",
                 draft.block_size
             );
         }
@@ -807,7 +928,15 @@ impl Engine {
         let ops = Ops::new(&device.ctx).context("load CUDA operator modules")?;
         eprintln!("{}", serde_json::json!({"backend_device":device.info}));
         let blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
-        let workspace_rows = settings.spec_budget.rows().min(capacity);
+        let workspace_rows = if let Some(draft) = &draft_config {
+            if settings.spec_budget.is_tree() {
+                settings.spec_budget.rows()
+            } else {
+                draft.verify_rows()?
+            }
+        } else {
+            settings.spec_budget.rows().min(capacity)
+        };
         let chunk = workspace_rows;
         let mut work = Work::new(s, &model_spec, workspace_rows)?;
         s.memcpy_htod(&[1i32], &mut work.length)?;
@@ -868,12 +997,6 @@ impl Engine {
         };
         if let Some(path) = settings.draft_model {
             let path = path.canonicalize()?;
-            ensure!(
-                engine.spec_budget.rows() <= engine.capacity,
-                "draft workspace needs {} KV rows but capacity is {}",
-                engine.spec_budget.rows(),
-                engine.capacity
-            );
             let draft = super::draft::Draft::new(
                 &path,
                 &engine.device,
@@ -889,56 +1012,32 @@ impl Engine {
                 engine.workspace_rows,
                 &engine.device.stream,
             )?);
-            engine.prepare(8)?;
-            engine
-                .blas
-                .prepare(8, engine.config.vocab_size, engine.config.hidden_size)?;
-            let rows = engine.spec_budget.rows();
+            let verify_rows = draft.config.verify_rows()?;
+            engine.prepare(verify_rows)?;
+            engine.blas.prepare(
+                verify_rows,
+                engine.config.vocab_size,
+                engine.config.hidden_size,
+            )?;
+            let rows = if engine.spec_budget.is_tree() {
+                engine.spec_budget.rows()
+            } else {
+                verify_rows
+            };
             if engine.spec_budget.is_tree() {
                 engine.prepare(rows)?;
                 engine
                     .blas
                     .prepare(rows, engine.config.vocab_size, engine.config.hidden_size)?;
             }
-            let s = &engine.device.stream;
-            let count_values: Vec<_> = (1..=rows).map(|n| n as i32).collect();
-            let row_counts = s.clone_htod(&count_values)?;
-            s.synchronize()?;
-            engine.spec = Some(Spec {
-                eos: Vec::new(),
-                tree_verify_graph: None,
-                tree_commit_graph: None,
-                tree_draft_graph: None,
-                tree: if engine.spec_budget.is_tree() {
-                    Some(super::tree::State::new(
-                        &engine.device,
-                        &engine.config,
-                        &engine.state.kv,
-                        engine.capacity,
-                        rows,
-                    )?)
-                } else {
-                    None
-                },
-                tree_attention: None,
-                active_rows: 0,
-                graph: engine.spec_graph,
-                draft_graph: None,
-                verify_graph: None,
-                inject_graphs: (0..8).map(|_| None).collect(),
-                verification: None,
-                draft,
-                logits: s.alloc_zeros(rows * engine.config.vocab_size)?,
-                predictions: s.alloc_zeros(rows)?,
-                row_counts,
-            });
+            engine.spec = Some(Spec::new(draft, &engine)?);
         }
         engine.size_workspace(requested_chunk)?;
         engine.declare_graphs()?;
-        if engine.spec.is_some() {
+        if let Some(spec) = &engine.spec {
             eprintln!(
                 "{}",
-                serde_json::json!({"spec_execution":{"graph":engine.spec_graph,"budget":engine.spec_budget,"draft_rows":7,"verify_rows":engine.spec_budget.rows(),"workspace_rows":engine.workspace_rows,"inject_rows":"actual committed M1..8","acceptance":"host greedy prefix"}})
+                serde_json::json!({"spec_execution":{"graph":engine.spec_graph,"budget":engine.spec_budget,"draft_rows":spec.draft.config.block_size,"verify_rows":spec.draft.config.verify_rows()?,"workspace_rows":engine.workspace_rows,"inject_rows":spec.inject_graphs.len(),"acceptance":"host greedy prefix"}})
             );
         }
         engine.device.stream.synchronize()?;
@@ -1000,11 +1099,20 @@ impl Engine {
             self.hidden_capture
                 .as_ref()
                 .map_or(0, |capture| capture.width * 2)
-                + self.spec.as_ref().map_or(0, |spec| {
-                    (2 * spec.draft.config.hidden_size + 5 * spec.draft.config.kv_dim()) * 2
-                }),
+                + self
+                    .spec
+                    .as_ref()
+                    .map(|spec| spec.draft.config.workspace_row_bytes())
+                    .transpose()?
+                    .unwrap_or(0),
         )?;
-        let rows = self.spec_budget.workspace_rows(plan.chunk);
+        let rows = self.spec_budget.workspace_rows(plan.chunk).max(
+            self.spec
+                .as_ref()
+                .map(|spec| spec.draft.config.verify_rows())
+                .transpose()?
+                .unwrap_or(1),
+        );
         let required = rows
             .checked_mul(plan.row_bytes)
             .context("workspace byte count overflow")?;
@@ -1101,14 +1209,20 @@ impl Engine {
     }
 
     fn declare_graphs(&mut self) -> Result<()> {
-        self.graphs = if self.model_spec.moe.is_some() {
-            if self
+        self.graphs = if self.spec.as_ref().is_some_and(|spec| !spec.graph) {
+            Vec::new()
+        } else if self.model_spec.moe.is_some() {
+            let mut graphs = if self
                 .moe_slots
                 .as_ref()
                 .context("MoE graph declaration has no slots")?
                 .all_resident()
             {
-                vec![Graph::Decode]
+                vec![if self.spec.is_some() {
+                    Graph::Verify
+                } else {
+                    Graph::Decode
+                }]
             } else {
                 (0..self.model_spec.layers.len())
                     .flat_map(|layer| {
@@ -1119,7 +1233,12 @@ impl Engine {
                         ]
                     })
                     .collect()
+            };
+            if let Some(spec) = &self.spec {
+                graphs.push(Graph::Draft);
+                graphs.extend((1..=spec.inject_graphs.len()).map(Graph::Inject));
             }
+            graphs
         } else {
             match &self.spec {
                 None => vec![Graph::Decode],
@@ -1247,8 +1366,10 @@ impl Engine {
     fn check_step(&self, step: crate::backend::Step<'_>) -> Result<()> {
         if self.qwen.is_some() {
             ensure!(
-                matches!(step.mask, crate::backend::Mask::Causal) && step.head != Head::All,
-                "Q38 only supports causal text forward with optional last-row head"
+                matches!(step.mask, crate::backend::Mask::Causal)
+                    && (step.head != Head::All || self.model_spec.moe.is_some()),
+                "hybrid forward requires causal mask and a bound MoE chain for head={:?}",
+                step.head
             );
         }
         let linear_rows = if matches!(step.mask, crate::backend::Mask::Tree { .. }) {
@@ -1275,8 +1396,16 @@ impl Engine {
             && matches!(step.mask, crate::backend::Mask::Causal)
         {
             ensure!(
-                step.rows == SpecBudget::Chain.rows(),
-                "causal all-row verification requires the declared eight-row chain shape"
+                step.rows
+                    == self
+                        .spec
+                        .as_ref()
+                        .context("causal verification requires draft geometry")?
+                        .draft
+                        .config
+                        .verify_rows()?,
+                "causal all-row verification rows={} differs from the loaded chain geometry",
+                step.rows
             );
         }
         Ok(())
@@ -1306,7 +1435,12 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: Option<Target<'_>>,
     ) -> Result<()> {
+        let previous = self.qwen_device_prefix;
+        if self.qwen.is_some() && step.head == Head::All {
+            self.qwen_device_prefix = true;
+        }
         let result = self.run_step_inner(step, trace);
+        self.qwen_device_prefix = previous;
         if self.qwen.is_some() && result.is_err() {
             self.poisoned = true;
         }
@@ -1326,22 +1460,38 @@ impl Engine {
             self.ensure_decode()?;
         } else if step.head == Head::All && matches!(step.mask, crate::backend::Mask::Causal) {
             ensure!(
-                step.rows <= 8,
-                "chain verification supports at most eight rows"
+                step.rows <= crate::linear_plan::MAX_SKINNY_ROWS,
+                "chain verification rows={} exceeds skinny bound={}",
+                step.rows,
+                crate::linear_plan::MAX_SKINNY_ROWS
             );
             self.ensure_verification()?;
+            if self.qwen.is_some() {
+                self.state.set_sequence(
+                    &self.device.stream,
+                    self.position as u32,
+                    step.rows as u32,
+                    self.workspace_rows as u32,
+                )?;
+            }
         }
         if let Some(slots) = self.moe_slots.as_mut() {
             slots.begin_token()?;
         }
-        self.run_operator(crate::backend::Operator::Embed, 0, step, &mut trace)?;
-        for i in 0..self.config.num_hidden_layers {
-            self.run_layer(i, step, &mut trace)?;
-        }
-        self.run_operator(crate::backend::Operator::Head, 0, step, &mut trace)?;
-        if let Some(slots) = self.moe_slots.as_mut() {
-            slots.finish_token()?;
-        }
+        let executed = (|| {
+            self.run_operator(crate::backend::Operator::Embed, 0, step, &mut trace)?;
+            for i in 0..self.config.num_hidden_layers {
+                self.run_layer(i, step, &mut trace)?;
+            }
+            self.run_operator(crate::backend::Operator::Head, 0, step, &mut trace)
+        })();
+        let completed = if let Some(slots) = self.moe_slots.as_mut() {
+            slots.finish_token()
+        } else {
+            Ok(())
+        };
+        executed?;
+        completed?;
         if step.head == Head::None {
             self.logits_cache.invalidate();
         } else {
@@ -2883,16 +3033,24 @@ impl Drop for Engine {
 impl Engine {
     fn ensure_verification(&mut self) -> Result<()> {
         let spec = self.spec.as_mut().context("draft state is not enabled")?;
+        if self.qwen.is_some() {
+            ensure!(
+                spec.checkpoint.is_some() && spec.snapshots.len() == self.state.gdn.len(),
+                "MoE verification lacks transaction state or recurrent prefix images"
+            );
+            return Ok(());
+        }
         if spec.verification.is_some() {
             return Ok(());
         }
+        let rows = spec.draft.config.verify_rows()?;
         let calibrated = super::multi_calibrate::load(
             &self.device,
             &self.ops,
             &self.config,
             &self.runtime,
             crate::backend::setup::MultiShape {
-                rows: 8,
+                rows,
                 causal: true,
                 capacity: self.capacity,
             },
@@ -2903,7 +3061,7 @@ impl Engine {
         eprintln!(
             "{}",
             serde_json::json!({"backend_setup":{
-                "rows":8,"attention":attention,"selection":selection,"calibration":calibrated,
+                "rows":rows,"attention":attention,"selection":selection,"calibration":calibrated,
                 "length":"device position counts prefix KV before the query block"
             }})
         );
@@ -2913,7 +3071,7 @@ impl Engine {
             &self.config,
             crate::backend::setup::MultiShape {
                 capacity: self.capacity,
-                rows: 8,
+                rows,
                 causal: true,
             },
             attention,
@@ -3402,34 +3560,54 @@ impl Engine {
     }
 
     fn run_spec_device(&mut self, phase: SpecPhase, start: usize) -> Result<()> {
-        match phase {
-            SpecPhase::Draft => self
+        let rows = phase.rows(
+            &self
                 .spec
-                .as_mut()
+                .as_ref()
                 .context("draft is not enabled")?
                 .draft
-                .propose_device(
-                    &self.work.token,
-                    &self.work.position,
-                    start,
-                    (&self.weights.embed, &self.weights.head),
-                    super::draft::Compute {
-                        ops: &self.ops,
-                        blas: &mut self.blas,
-                    },
-                ),
+                .config,
+        )?;
+        match phase {
+            SpecPhase::Draft => {
+                self.spec
+                    .as_mut()
+                    .context("draft is not enabled")?
+                    .draft
+                    .propose_device(
+                        &self.work.token,
+                        &self.work.position,
+                        start,
+                        (&self.weights.embed, &self.weights.head),
+                        super::draft::Compute {
+                            ops: &self.ops,
+                            blas: &mut self.blas,
+                        },
+                    )?;
+                if self.model_spec.moe.is_some() {
+                    self.spec
+                        .as_ref()
+                        .context("MoE draft missing")?
+                        .draft
+                        .copy_proposals(&mut self.work.ids.slice_mut(1..rows + 1))?;
+                    self.device
+                        .stream
+                        .memcpy_dtod(&self.work.token, &mut self.work.ids.slice_mut(..1))?;
+                }
+                Ok(())
+            }
             SpecPhase::Verify => {
                 self.spec
                     .as_ref()
                     .context("draft is not enabled")?
                     .draft
-                    .copy_proposals(&mut self.work.ids.slice_mut(1..8))?;
+                    .copy_proposals(&mut self.work.ids.slice_mut(1..rows))?;
                 self.device
                     .stream
                     .memcpy_dtod(&self.work.token, &mut self.work.ids.slice_mut(..1))?;
                 self.run_step(
                     crate::backend::Step {
-                        rows: 8,
+                        rows,
                         input: crate::backend::Input::Ids,
                         head: Head::All,
                         mask: crate::backend::Mask::Causal,
@@ -3458,6 +3636,25 @@ impl Engine {
     }
 
     fn ensure_spec_graph(&mut self, phase: SpecPhase, start: usize) -> Result<()> {
+        if self.model_spec.moe.is_some() && matches!(phase, SpecPhase::Verify) {
+            ensure!(
+                self.has_moe_segments()
+                    || self
+                        .spec
+                        .as_ref()
+                        .is_some_and(|spec| spec.verify_graph.is_some()),
+                "MoE verification graphs were not bound before Ready"
+            );
+            return Ok(());
+        }
+        let rows = phase.rows(
+            &self
+                .spec
+                .as_ref()
+                .context("draft is not enabled")?
+                .draft
+                .config,
+        )?;
         if self
             .spec
             .as_mut()
@@ -3473,12 +3670,27 @@ impl Engine {
         let token = s.clone_dtoh(&self.work.token)?;
         let position = s.clone_dtoh(&self.work.position)?;
         let length = s.clone_dtoh(&self.work.length)?;
-        self.run_spec_device(phase, start)?;
+        if self.model_spec.moe.is_some() {
+            self.spec
+                .as_mut()
+                .context("MoE draft missing")?
+                .draft
+                .checkpoint_kv(start)?;
+        }
+        let warmed = self.run_spec_device(phase, start);
         s.synchronize()?;
+        if self.model_spec.moe.is_some() {
+            self.spec
+                .as_mut()
+                .context("MoE draft missing")?
+                .draft
+                .restore_kv(start, 0)?;
+        }
         s.memcpy_htod(&token, &mut self.work.token)?;
         s.memcpy_htod(&position, &mut self.work.position)?;
         s.memcpy_htod(&length, &mut self.work.length)?;
         s.synchronize()?;
+        warmed?;
         s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
         let launched = self.run_spec_device(phase, start);
         let captured = s.end_capture(sys::CUgraphInstantiate_flags(0));
@@ -3493,19 +3705,37 @@ impl Engine {
             .graph_slot(phase)? = Some(graph);
         eprintln!(
             "{}",
-            serde_json::json!({"spec_graph_setup":{"phase":phase.name(),"rows":phase.rows(),"capacity":self.capacity,"wall_ms":timer.elapsed().as_secs_f64()*1000.0,"prefix":"device position","warmup":"selected implementation; token/position/length restored"}})
+            serde_json::json!({"spec_graph_setup":{"phase":phase.name(),"rows":rows,"capacity":self.capacity,"wall_ms":timer.elapsed().as_secs_f64()*1000.0,"prefix":"device position","warmup":"selected implementation; token/position/length restored"}})
         );
         Ok(())
     }
 
     fn launch_spec_graph(&mut self, phase: SpecPhase) -> Result<()> {
+        if self.model_spec.moe.is_some() && matches!(phase, SpecPhase::Verify) {
+            let rows = self
+                .spec
+                .as_ref()
+                .context("MoE chain missing")?
+                .draft
+                .config
+                .verify_rows()?;
+            self.state.set_sequence(
+                &self.device.stream,
+                self.position as u32,
+                rows as u32,
+                self.workspace_rows as u32,
+            )?;
+            self.run_moe_graph()?;
+            self.spec.as_mut().context("MoE chain missing")?.active_rows = rows;
+            return Ok(());
+        }
         let spec = self.spec.as_mut().context("draft is not enabled")?;
         spec.graph_slot(phase)?
             .as_ref()
             .context("spec Graph has not been captured")?
             .launch()?;
         if matches!(phase, SpecPhase::Verify) {
-            spec.active_rows = phase.rows();
+            spec.active_rows = phase.rows(&spec.draft.config)?;
         }
         Ok(())
     }
@@ -3560,6 +3790,14 @@ impl Engine {
         Ok(())
     }
 
+    pub fn draft_config(&self) -> Result<&crate::dspark::DraftConfig> {
+        Ok(&self
+            .spec
+            .as_ref()
+            .context("draft is not enabled")?
+            .draft
+            .config)
+    }
     pub fn spec_round(
         &mut self,
         limit: usize,
@@ -3567,160 +3805,334 @@ impl Engine {
         prefix: &str,
     ) -> Result<crate::dspark::Round> {
         ensure!(
-            self.qwen.is_none(),
-            "Qwen DSpark proposal/verification execution is not bound"
+            self.qwen.is_none() || self.model_spec.moe.is_some(),
+            "DSpark verification is not bound for {:?}",
+            self.model_spec.architecture
         );
-        self.closure.assert_ready()?;
-        if self.spec_budget.is_tree() {
-            return self.tree_round(limit, trace, prefix);
+        let transaction = self.model_spec.moe.is_some();
+        let origin = self.position;
+        let pending = self.pending_token;
+        let resident = self.resident_ids_len;
+        let last_input = self.last_input_kind;
+        if transaction {
+            self.closure.assert_ready()?;
+            ensure!(
+                !self.poisoned,
+                "DSpark transaction requires reset after an error"
+            );
+            let spec = self
+                .spec
+                .as_mut()
+                .context("MoE chain requires a loaded draft")?;
+            let rows = spec.draft.config.verify_rows()?;
+            ensure!(
+                limit > 0
+                    && !self.spec_budget.is_tree()
+                    && origin
+                        .checked_add(rows)
+                        .is_some_and(|end| end <= self.capacity),
+                "MoE chain limit={limit} prefix={origin} rows={rows} capacity={} budget={:?}",
+                self.capacity,
+                self.spec_budget
+            );
+            spec.checkpoint
+                .as_mut()
+                .context("MoE chain checkpoint missing")?
+                .save(
+                    &self.state,
+                    &self.work.token,
+                    origin,
+                    &self.device.stream,
+                    None,
+                )?;
+            spec.draft.checkpoint_kv(origin)?;
         }
-        self.ensure_verification()?;
-        self.spec
-            .as_mut()
-            .context("draft state is not enabled")?
-            .draft
-            .setup_attention(
-                &self.device,
-                &self.ops,
-                &self.config,
-                &self.runtime,
-                &self.closure,
-            )?;
-        let _round_range = super::profile::Range::new(self.profile_rounds, c"dspark_round");
-        ensure!(limit > 0, "spec round output limit must be positive");
-        ensure!(
-            self.position + 8 <= self.capacity,
-            "spec verification exceeds KV capacity"
-        );
-        let graph = self.spec.as_ref().context("draft is not enabled")?.graph;
-        ensure!(
-            !graph || trace.is_none(),
-            "spec Graph tracing requires --spec-graph false"
-        );
-        let start = self.position;
-        if graph {
-            self.ensure_spec_graph(SpecPhase::Draft, start)?;
-            self.ensure_spec_graph(SpecPhase::Verify, start)?;
-        }
-        let anchor = if graph { None } else { Some(self.token()?) };
-        let draft_range = super::profile::Range::new(self.profile_rounds, c"draft");
-        let draft_start = std::time::Instant::now();
-        let proposals = if graph {
-            self.launch_spec_graph(SpecPhase::Draft)?;
+        let result = (|| {
+            self.closure.assert_ready()?;
+            if self.spec_budget.is_tree() {
+                return self.tree_round(limit, trace, prefix);
+            }
+            self.ensure_verification()?;
             self.spec
-                .as_ref()
-                .context("draft is not enabled")?
+                .as_mut()
+                .context("draft state is not enabled")?
                 .draft
-                .proposals()?
-        } else {
-            let anchor = anchor.context("eager draft anchor missing")?;
-            let spec = self.spec.as_mut().context("draft is not enabled")?;
-            spec.draft.propose(
-                anchor,
-                start,
-                (&self.weights.embed, &self.weights.head),
-                super::draft::Compute {
-                    ops: &self.ops,
-                    blas: &mut self.blas,
-                },
-                trace.as_deref_mut().map(|t| (t, prefix)),
-                None,
-            )?
-        };
-        self.device.stream.synchronize()?;
-        let draft_ms = draft_start.elapsed().as_secs_f64() * 1000.0;
-        drop(draft_range);
-        if !graph {
-            let mut ids = vec![anchor.context("eager verify anchor missing")?];
-            ids.extend(&proposals);
-            self.device
-                .stream
-                .memcpy_htod(&ids, &mut self.work.ids.slice_mut(..8))?;
-            self.device
-                .stream
-                .memcpy_htod(&[start as i32], &mut self.work.position)?;
-        }
-        let verify_start = std::time::Instant::now();
-        let verify_range = super::profile::Range::new(self.profile_rounds, c"verify");
-        if graph {
-            self.launch_spec_graph(SpecPhase::Verify)?;
-        } else {
-            self.run_step(
-                crate::backend::Step {
-                    rows: 8,
-                    input: crate::backend::Input::Ids,
-                    head: Head::All,
-                    mask: crate::backend::Mask::Causal,
-                },
-                None,
-            )?;
-        }
-        let predictions = self.device.stream.clone_dtoh(
-            &self
+                .setup_attention(
+                    &self.device,
+                    &self.ops,
+                    &self.config,
+                    &self.runtime,
+                    &self.closure,
+                )?;
+            let _round_range = super::profile::Range::new(self.profile_rounds, c"dspark_round");
+            let rows = self
                 .spec
                 .as_ref()
                 .context("draft is not enabled")?
-                .predictions,
-        )?;
-        let verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
-        drop(verify_range);
-        self.position += 8;
-        let accepted = crate::dspark::accept(&proposals, &predictions)?;
-        let mut output = proposals[..accepted.proposals].to_vec();
-        output.push(accepted.bonus);
-        output.truncate(limit);
-        let committed = output.len();
-        let bonus = *output.last().context("spec round emitted no token")?;
-        if graph {
-            self.ensure_spec_graph(SpecPhase::Inject(committed), start)?;
-        }
-        let inject_start = std::time::Instant::now();
-        let _inject_range = super::profile::Range::new(self.profile_rounds, c"inject");
-        if graph {
-            self.launch_spec_graph(SpecPhase::Inject(committed))?;
-        } else {
-            self.inject_capture(committed, start, trace.as_deref_mut().map(|t| (t, prefix)))?;
-        }
-        let s = &self.device.stream;
-        let spec = self.spec.as_ref().context("draft is not enabled")?;
-        s.memcpy_dtod(
-            &spec.logits.slice(
-                (committed - 1) * self.config.vocab_size..committed * self.config.vocab_size,
-            ),
-            &mut self.work.logits,
-        )?;
-        self.logits_cache.mark_valid();
-        self.rewind(start + committed, bonus)?;
-        if let Some(t) = trace {
-            t.add(
-                format!("{prefix}.target_argmax"),
-                vec![8],
-                predictions.iter().map(|&v| v as f32).collect(),
+                .draft
+                .config
+                .verify_rows()?;
+            ensure!(limit > 0, "spec round output limit must be positive");
+            ensure!(
+                self.position
+                    .checked_add(rows)
+                    .is_some_and(|end| end <= self.capacity),
+                "spec verification position={} rows={rows} exceeds capacity={}",
+                self.position,
+                self.capacity
+            );
+            let graph = self.spec.as_ref().context("draft is not enabled")?.graph;
+            ensure!(
+                !graph || trace.is_none(),
+                "spec Graph tracing requires --spec-graph false"
+            );
+            let start = self.position;
+            if graph {
+                if transaction {
+                    ensure!(
+                        self.has_graph(Graph::Draft)
+                            && (self.has_moe_segments() || self.has_graph(Graph::Verify)),
+                        "MoE draft/verify graphs were not bound before Ready"
+                    );
+                } else {
+                    self.ensure_spec_graph(SpecPhase::Draft, start)?;
+                    self.ensure_spec_graph(SpecPhase::Verify, start)?;
+                }
+            }
+            let anchor = if graph && !transaction {
+                None
+            } else {
+                Some(self.token()?)
+            };
+            let draft_range = super::profile::Range::new(self.profile_rounds, c"draft");
+            let draft_start = std::time::Instant::now();
+            let proposals = if graph {
+                self.launch_spec_graph(SpecPhase::Draft)?;
+                self.spec
+                    .as_ref()
+                    .context("draft is not enabled")?
+                    .draft
+                    .proposals()?
+            } else {
+                let anchor = anchor.context("eager draft anchor missing")?;
+                let spec = self.spec.as_mut().context("draft is not enabled")?;
+                spec.draft.propose(
+                    anchor,
+                    start,
+                    (&self.weights.embed, &self.weights.head),
+                    super::draft::Compute {
+                        ops: &self.ops,
+                        blas: &mut self.blas,
+                    },
+                    trace.as_deref_mut().map(|t| (t, prefix)),
+                    None,
+                )?
+            };
+            #[cfg(test)]
+            let mut forced_applied = false;
+            #[cfg(test)]
+            let proposals = if let Some(forced) = self
+                .spec
+                .as_mut()
+                .context("chain missing")?
+                .forced_proposals
+                .take()
+            {
+                ensure!(
+                    forced.len() == rows - 1
+                        && forced
+                            .iter()
+                            .all(|&id| (id as usize) < self.config.vocab_size),
+                    "forced chain proposals exceed the loaded geometry"
+                );
+                forced_applied = true;
+                forced
+            } else {
+                proposals
+            };
+            self.device.stream.synchronize()?;
+            let draft_ms = draft_start.elapsed().as_secs_f64() * 1000.0;
+            drop(draft_range);
+            #[cfg(test)]
+            if graph && transaction && forced_applied {
+                let ids: Vec<_> = std::iter::once(anchor.context("forced graph anchor missing")?)
+                    .chain(proposals.iter().copied())
+                    .collect();
+                self.device
+                    .stream
+                    .memcpy_htod(&ids, &mut self.work.ids.slice_mut(..rows))?;
+            }
+            if !graph {
+                let mut ids = vec![anchor.context("eager verify anchor missing")?];
+                ids.extend(&proposals);
+                self.device
+                    .stream
+                    .memcpy_htod(&ids, &mut self.work.ids.slice_mut(..rows))?;
+                self.device
+                    .stream
+                    .memcpy_htod(&[start as i32], &mut self.work.position)?;
+            }
+            let verify_start = std::time::Instant::now();
+            let verify_range = super::profile::Range::new(self.profile_rounds, c"verify");
+            if graph {
+                self.launch_spec_graph(SpecPhase::Verify)?;
+            } else {
+                self.run_step(
+                    crate::backend::Step {
+                        rows,
+                        input: crate::backend::Input::Ids,
+                        head: Head::All,
+                        mask: crate::backend::Mask::Causal,
+                    },
+                    None,
+                )?;
+            }
+            let predictions = self.device.stream.clone_dtoh(
+                &self
+                    .spec
+                    .as_ref()
+                    .context("draft is not enabled")?
+                    .predictions,
             )?;
-            t.add(
-                format!("{prefix}.m"),
-                vec![1],
-                vec![accepted.proposals as f32],
+            let verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
+            drop(verify_range);
+            self.position += rows;
+            let accepted = crate::dspark::accept(&proposals, &predictions)?;
+            let mut output = proposals[..accepted.proposals].to_vec();
+            output.push(accepted.bonus);
+            output.truncate(limit);
+            if transaction
+                && let Some(index) = output.iter().position(|token| {
+                    self.spec
+                        .as_ref()
+                        .is_some_and(|spec| spec.eos.contains(token))
+                })
+            {
+                output.truncate(index + 1);
+            }
+            let committed = output.len();
+            let accepted_proposals = accepted.proposals.min(committed - 1);
+            let bonus = *output.last().context("spec round emitted no token")?;
+            if graph {
+                if transaction {
+                    ensure!(
+                        self.has_graph(Graph::Inject(committed)),
+                        "MoE commit graph rows={committed} missing before Ready"
+                    );
+                } else {
+                    self.ensure_spec_graph(SpecPhase::Inject(committed), start)?;
+                }
+            }
+            let inject_start = std::time::Instant::now();
+            let _inject_range = super::profile::Range::new(self.profile_rounds, c"inject");
+            if graph {
+                self.launch_spec_graph(SpecPhase::Inject(committed))?;
+            } else {
+                self.inject_capture(committed, start, trace.as_deref_mut().map(|t| (t, prefix)))?;
+            }
+            let s = &self.device.stream;
+            let spec = self.spec.as_ref().context("draft is not enabled")?;
+            s.memcpy_dtod(
+                &spec.logits.slice(
+                    (committed - 1) * self.config.vocab_size..committed * self.config.vocab_size,
+                ),
+                &mut self.work.logits,
             )?;
-            t.add(
-                format!("{prefix}.bonus"),
-                vec![1],
-                vec![accepted.bonus as f32],
-            )?;
+            self.logits_cache.mark_valid();
+            if transaction {
+                let spec = self.spec.as_mut().context("MoE chain missing")?;
+                spec.checkpoint
+                    .as_ref()
+                    .context("MoE chain checkpoint missing")?
+                    .select_prefix(&mut self.state, &spec.snapshots, committed, s)?;
+                spec.draft.restore_kv(start, committed)?;
+                self.state.set_sequence(
+                    s,
+                    (start + committed - 1) as u32,
+                    1,
+                    self.workspace_rows as u32,
+                )?;
+                s.memcpy_htod(&[(start + committed - 1) as i32], &mut self.work.position)?;
+                s.memcpy_htod(&[(start + committed) as i32], &mut self.work.length)?;
+                self.qwen_advance()?;
+                self.committed_prefix_ids
+                    .push(anchor.context("MoE committed anchor missing")?);
+                self.committed_prefix_ids
+                    .extend_from_slice(&output[..committed - 1]);
+                self.resident_ids_len = committed;
+                self.last_input_kind = Some(PrefixLastInputKind::DecodeToken);
+                self.position = start + committed;
+                self.set_token(bonus)?;
+                self.device.stream.synchronize()?;
+            } else {
+                self.rewind(start + committed, bonus)?;
+            }
+            if let Some(t) = trace {
+                t.add(
+                    format!("{prefix}.target_argmax"),
+                    vec![rows],
+                    predictions.iter().map(|&v| v as f32).collect(),
+                )?;
+                t.add(
+                    format!("{prefix}.m"),
+                    vec![1],
+                    vec![accepted_proposals as f32],
+                )?;
+                t.add(
+                    format!("{prefix}.bonus"),
+                    vec![1],
+                    vec![accepted.bonus as f32],
+                )?;
+            }
+            Ok(crate::dspark::Round {
+                logits_rows: (0..committed).collect(),
+                proposals,
+                predictions,
+                accepted: accepted_proposals,
+                committed,
+                output,
+                position: self.position,
+                draft_ms,
+                verify_ms,
+                inject_ms: inject_start.elapsed().as_secs_f64() * 1000.0,
+                tree: None,
+            })
+        })();
+        if transaction && result.is_err() {
+            self.poisoned = true;
+            let spec = self
+                .spec
+                .as_mut()
+                .context("failed MoE chain lost its draft")?;
+            spec.checkpoint
+                .as_ref()
+                .context("failed MoE chain lost its checkpoint")?
+                .restore(&mut self.state, &mut self.work.token, &self.device.stream)
+                .context("restore target after MoE chain failure")?;
+            spec.draft
+                .restore_kv(origin, 0)
+                .context("restore draft after MoE chain failure")?;
+            self.device
+                .stream
+                .memcpy_htod(&[origin as i32], &mut self.work.position)?;
+            self.device
+                .stream
+                .memcpy_htod(&[origin as i32 + 1], &mut self.work.length)?;
+            self.committed_prefix_ids.truncate(origin);
+            if last_input == Some(PrefixLastInputKind::PrefillChunk) {
+                self.device.stream.memcpy_htod(
+                    &self.committed_prefix_ids[origin - resident..origin],
+                    &mut self.work.ids.slice_mut(..resident),
+                )?;
+            }
+            self.position = origin;
+            self.pending_token = pending;
+            self.resident_ids_len = resident;
+            self.last_input_kind = last_input;
+            self.logits_cache.invalidate();
+            self.device.stream.synchronize()?;
         }
-        Ok(crate::dspark::Round {
-            logits_rows: (0..committed).collect(),
-            proposals,
-            predictions,
-            accepted: accepted.proposals,
-            committed,
-            output,
-            position: self.position,
-            draft_ms,
-            verify_ms,
-            inject_ms: inject_start.elapsed().as_secs_f64() * 1000.0,
-            tree: None,
-        })
+        result
     }
 
     pub fn set_spec_graph(&mut self, graph: bool) -> Result<()> {
@@ -3998,8 +4410,15 @@ impl Engine {
     }
 
     pub fn inject_hidden(&mut self, hidden: &[f32], start: usize, rows: usize) -> Result<()> {
-        let limit =
-            super::closure::injection_limit(super::closure::small_rows(self.chunk, self.capacity));
+        let limit = super::closure::injection_limit(
+            super::closure::small_rows(self.chunk, self.capacity),
+            self.spec
+                .as_ref()
+                .context("draft geometry missing")?
+                .draft
+                .config
+                .verify_rows()?,
+        );
         ensure!(
             rows > 0 && (rows > 16 || rows <= limit),
             "injection rows {rows} exceed declared small-row limit {limit}"
@@ -4158,7 +4577,8 @@ impl Engine {
         self.forward_rows = super::closure::forward_rows(
             super::closure::small_rows(self.chunk, self.capacity),
             budget,
-        );
+            self.spec.as_ref().map(|spec| &spec.draft.config),
+        )?;
         let profile = super::closure::Profile::new(
             &self.config,
             self.capacity,
@@ -4180,17 +4600,28 @@ impl Engine {
         for &kind in &profile.attention {
             paths.push(match kind {
                 Kind::Decode => super::calibrate::cache_path(&self.runtime, &key, bucket, None),
-                Kind::Draft => {
-                    super::multi_calibrate::cache_path(&self.runtime, &key, bucket, 7, false, false)
+                Kind::Draft | Kind::Verify | Kind::Tree => {
+                    let draft = &self
+                        .spec
+                        .as_ref()
+                        .context("attention calibration requires draft geometry")?
+                        .draft
+                        .config;
+                    let rows = match kind {
+                        Kind::Draft => SpecPhase::Draft.rows(draft)?,
+                        Kind::Verify => SpecPhase::Verify.rows(draft)?,
+                        Kind::Tree => self.spec_budget.rows(),
+                        Kind::Decode => anyhow::bail!("decode attention has no multirow cache"),
+                    };
+                    super::multi_calibrate::cache_path(
+                        &self.runtime,
+                        &key,
+                        bucket,
+                        rows,
+                        kind == Kind::Verify,
+                        kind == Kind::Tree,
+                    )
                 }
-                Kind::Verify | Kind::Tree => super::multi_calibrate::cache_path(
-                    &self.runtime,
-                    &key,
-                    bucket,
-                    self.spec_budget.rows(),
-                    kind == Kind::Verify,
-                    kind == Kind::Tree,
-                ),
             });
         }
         if budget.is_some_and(SpecBudget::is_tree) {
@@ -4296,7 +4727,46 @@ impl Engine {
             return Ok(());
         }
         if self.moe.is_some() {
-            return self.capture();
+            if self.spec.is_none() {
+                return self.capture();
+            }
+            self.spec
+                .as_mut()
+                .context("MoE chain missing")?
+                .draft
+                .checkpoint_kv(0)?;
+            self.ensure_spec_graph(SpecPhase::Draft, 0)?;
+            self.launch_spec_graph(SpecPhase::Draft)?;
+            self.device.stream.synchronize()?;
+            self.spec
+                .as_mut()
+                .context("MoE chain missing")?
+                .draft
+                .restore_kv(0, 0)?;
+            self.capture()?;
+            let rows = self
+                .spec
+                .as_ref()
+                .context("MoE chain missing")?
+                .inject_graphs
+                .len();
+            for rows in 1..=rows {
+                self.spec
+                    .as_mut()
+                    .context("MoE chain missing")?
+                    .draft
+                    .checkpoint_kv(0)?;
+                self.ensure_spec_graph(SpecPhase::Inject(rows), 0)?;
+                self.launch_spec_graph(SpecPhase::Inject(rows))?;
+                self.device.stream.synchronize()?;
+                self.spec
+                    .as_mut()
+                    .context("MoE chain missing")?
+                    .draft
+                    .restore_kv(0, 0)?;
+            }
+            self.spec.as_mut().context("MoE chain missing")?.active_rows = 0;
+            return Ok(());
         }
         if self.spec.is_none() {
             self.capture()?;
@@ -4415,7 +4885,16 @@ impl Engine {
         let s = self.device.stream.clone();
         s.synchronize()?;
         let rows = if self.spec.is_some() {
-            self.spec_budget.rows()
+            if self.spec_budget.is_tree() {
+                self.spec_budget.rows()
+            } else {
+                self.spec
+                    .as_ref()
+                    .context("draft geometry missing")?
+                    .draft
+                    .config
+                    .verify_rows()?
+            }
         } else {
             1
         };

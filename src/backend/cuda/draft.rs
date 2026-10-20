@@ -234,6 +234,7 @@ pub struct Draft {
     pub config: DraftConfig,
     weights: DraftWeights,
     kv: Vec<Kv>,
+    kv_checkpoint: Vec<Kv>,
     capacity: usize,
     rows: usize,
     stream: Arc<CudaStream>,
@@ -296,6 +297,43 @@ fn norm(
 }
 
 impl Draft {
+    pub(super) fn prepare_linears(
+        &self,
+        head: &CudaSlice<bf16>,
+        blas: &mut Blas,
+        profile: &super::closure::Profile,
+        write: bool,
+    ) -> Result<()> {
+        blas.declare(self.rows, &profile.pairs);
+        if self.score_rounding == super::markov::ScoreRounding::F32 {
+            let buckets = (1..=self.rows)
+                .map(|rows| super::engine::bucketed_prefill_rows(rows as u32, self.rows as u32))
+                .collect::<Result<std::collections::BTreeSet<_>>>()?;
+            for rows in buckets {
+                blas.prepare(
+                    rows as usize,
+                    self.config.hidden_size,
+                    self.config.capture_width(),
+                )?;
+                blas.prepare(rows as usize, self.config.kv_dim(), self.config.hidden_size)?;
+            }
+        }
+        if !write {
+            return blas.load_choices(&profile.linear);
+        }
+        for &shape in &profile.linear {
+            let values: Vec<_> = (0..shape.rows * shape.input)
+                .map(|i| bf16::from_f32(((i % 257) as f32 - 128.0) / 128.0))
+                .collect();
+            let input = self.stream.clone_htod(&values)?;
+            if shape.output == self.config.vocab_size && shape.input == self.config.hidden_size {
+                blas.calibrate_shape(head, &input.slice(..), shape)?;
+            } else {
+                self.calibrate_shape(blas, &input.slice(..), shape)?;
+            }
+        }
+        Ok(())
+    }
     pub(super) fn calibrate_shape(
         &self,
         blas: &mut Blas,
@@ -389,11 +427,22 @@ impl Draft {
         let rank = config.markov_rank;
         let block_rows = config.block_size;
         let mut caches = Vec::new();
+        let mut kv_checkpoint = Vec::new();
+        let checkpoint_words = config
+            .verify_rows()?
+            .checked_mul(kv)
+            .context("draft KV checkpoint extent overflow")?;
         for _ in 0..config.num_hidden_layers {
             caches.push(Kv {
                 k: s.alloc_zeros(capacity * kv)?,
                 v: s.alloc_zeros(capacity * kv)?,
             });
+            if score_rounding == super::markov::ScoreRounding::F32 {
+                kv_checkpoint.push(Kv {
+                    k: s.alloc_zeros(checkpoint_words)?,
+                    v: s.alloc_zeros(checkpoint_words)?,
+                });
+            }
         }
         for (n, o, i) in [
             (block_rows, qkv, h),
@@ -407,9 +456,13 @@ impl Draft {
             blas.prepare(n, o, i)?;
         }
         eprintln!(
-            "draft_weights_bytes={} draft_kv_bytes={}",
+            "draft_weights_bytes={} draft_kv_bytes={} draft_kv_checkpoint_bytes={}",
             weights.bytes,
-            config.num_hidden_layers * capacity * kv * 4
+            config.num_hidden_layers * capacity * kv * 4,
+            kv_checkpoint
+                .iter()
+                .map(|cache| (cache.k.len() + cache.v.len()) * size_of::<bf16>())
+                .sum::<usize>()
         );
         let mask_ids = vec![config.mask_token_id; block_rows];
         let qknorm_rope_kv =
@@ -428,6 +481,7 @@ impl Draft {
             config,
             weights,
             kv: caches,
+            kv_checkpoint,
             capacity,
             rows,
             stream: s.clone(),
@@ -479,12 +533,23 @@ impl Draft {
         );
         let c = &self.config;
         let s = &self.stream;
+        let planned = rows
+            .checked_mul(c.workspace_row_bytes()?)
+            .context("draft row workspace byte count overflow")?;
         let k_raw = s.alloc_zeros(rows * c.kv_dim())?;
         let k_norm = s.alloc_zeros(rows * c.kv_dim())?;
         let v_raw = s.alloc_zeros(rows * c.kv_dim())?;
         let projected = s.alloc_zeros(rows * c.hidden_size)?;
         let context = s.alloc_zeros(rows * c.hidden_size)?;
         let packed = s.alloc_zeros(rows * 2 * c.kv_dim())?;
+        let allocated = [&k_raw, &k_norm, &v_raw, &projected, &context, &packed]
+            .iter()
+            .map(|buffer| buffer.len() * size_of::<bf16>())
+            .sum::<usize>();
+        ensure!(
+            allocated == planned,
+            "draft row workspace allocation={allocated} differs from planned={planned} rows={rows}"
+        );
         self.k_raw = k_raw;
         self.k_norm = k_norm;
         self.v_raw = v_raw;
@@ -492,6 +557,75 @@ impl Draft {
         self.context = context;
         self.packed = packed;
         self.rows = rows;
+        Ok(())
+    }
+
+    pub(super) fn checkpoint_kv(&mut self, start: usize) -> Result<()> {
+        let rows = self.config.verify_rows()?;
+        ensure!(
+            self.kv_checkpoint.len() == self.kv.len()
+                && !self.kv_checkpoint.is_empty()
+                && start
+                    .checked_add(rows)
+                    .is_some_and(|end| end <= self.capacity),
+            "draft KV checkpoint start={start} rows={rows} capacity={} layers={}",
+            self.capacity,
+            self.kv_checkpoint.len()
+        );
+        let d = self.config.head_dim;
+        for (live, saved) in self.kv.iter().zip(&mut self.kv_checkpoint) {
+            for (source, destination) in [(&live.k, &mut saved.k), (&live.v, &mut saved.v)] {
+                columns(
+                    &self.stream,
+                    source,
+                    destination,
+                    Rect {
+                        rows: self.config.num_key_value_heads,
+                        width: rows * d,
+                        src_pitch: self.capacity * d,
+                        src_col: start * d,
+                        dst_pitch: rows * d,
+                        dst_col: 0,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_kv(&mut self, start: usize, accepted: usize) -> Result<()> {
+        let rows = self.config.verify_rows()?;
+        ensure!(
+            accepted <= rows
+                && self.kv_checkpoint.len() == self.kv.len()
+                && !self.kv_checkpoint.is_empty()
+                && start
+                    .checked_add(rows)
+                    .is_some_and(|end| end <= self.capacity),
+            "draft KV restore start={start} accepted={accepted} rows={rows} capacity={}",
+            self.capacity
+        );
+        if accepted == rows {
+            return Ok(());
+        }
+        let d = self.config.head_dim;
+        for (saved, live) in self.kv_checkpoint.iter().zip(&mut self.kv) {
+            for (source, destination) in [(&saved.k, &mut live.k), (&saved.v, &mut live.v)] {
+                columns(
+                    &self.stream,
+                    source,
+                    destination,
+                    Rect {
+                        rows: self.config.num_key_value_heads,
+                        width: (rows - accepted) * d,
+                        src_pitch: rows * d,
+                        src_col: accepted * d,
+                        dst_pitch: self.capacity * d,
+                        dst_col: (start + accepted) * d,
+                    },
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -537,13 +671,24 @@ impl Draft {
         let s = &self.stream;
         let h = c.hidden_size;
         let kv = c.kv_dim();
-        blas.prepare(rows, h, c.capture_width())?;
-        blas.prepare(rows, kv, h)?;
+        let linear_rows = if self.score_rounding == super::markov::ScoreRounding::F32 {
+            super::engine::bucketed_prefill_rows(rows as u32, self.rows as u32)? as usize
+        } else {
+            blas.prepare(rows, h, c.capture_width())?;
+            blas.prepare(rows, kv, h)?;
+            rows
+        };
+        ensure!(
+            input.len() >= linear_rows * c.capture_width(),
+            "draft injection input={} rows={rows} linear_rows={linear_rows} capture_width={}",
+            input.len(),
+            c.capture_width()
+        );
         blas.linear(
             &self.weights.fc,
-            &input.slice(..rows * c.capture_width()),
-            &mut self.projected.slice_mut(..rows * h),
-            rows,
+            &input.slice(..linear_rows * c.capture_width()),
+            &mut self.projected.slice_mut(..linear_rows * h),
+            linear_rows,
             h,
             c.capture_width(),
         )?;
@@ -561,17 +706,17 @@ impl Draft {
             let v_weight = layer.block.qkv.slice((h + kv) * h..(h + 2 * kv) * h);
             blas.linear(
                 &k_weight,
-                &self.context.slice(..rows * h),
-                &mut self.k_raw.slice_mut(..rows * kv),
-                rows,
+                &self.context.slice(..linear_rows * h),
+                &mut self.k_raw.slice_mut(..linear_rows * kv),
+                linear_rows,
                 kv,
                 h,
             )?;
             blas.linear(
                 &v_weight,
-                &self.context.slice(..rows * h),
-                &mut self.v_raw.slice_mut(..rows * kv),
-                rows,
+                &self.context.slice(..linear_rows * h),
+                &mut self.v_raw.slice_mut(..linear_rows * kv),
+                linear_rows,
                 kv,
                 h,
             )?;
@@ -1266,7 +1411,7 @@ mod tests {
     use super::*;
     use anyhow::Context;
     use safetensors::{Dtype, SafeTensors};
-    use std::{collections::BTreeSet, path::PathBuf, rc::Rc};
+    use std::{path::PathBuf, rc::Rc};
 
     fn values(tensors: &SafeTensors<'_>, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
         let tensor = tensors.tensor(name)?;
@@ -1406,52 +1551,6 @@ mod tests {
             "T19_TENSOR name={name} max_abs={error} max_bound_ratio={maximum} coefficient={coefficient} violations={failures}"
         );
         Ok(failures)
-    }
-
-    fn calibrate(draft: &Draft, head: &CudaSlice<bf16>, blas: &mut Blas) -> Result<()> {
-        use crate::backend::setup::LinearShape;
-        let c = &draft.config;
-        let h = c.hidden_size;
-        let f = c.intermediate_size;
-        let shapes = [
-            (
-                &draft.weights.layers[0].block.qkv,
-                c.block_size,
-                c.qkv_dim(),
-                h,
-            ),
-            (&draft.weights.layers[0].block.o, c.block_size, h, h),
-            (&draft.weights.layers[0].block.gu, c.block_size, 2 * f, h),
-            (&draft.weights.layers[0].block.down, c.block_size, h, f),
-            (head, c.block_size, c.vocab_size, h),
-            (&draft.weights.w2, 1, c.vocab_size, c.markov_rank),
-        ];
-        let pairs: BTreeSet<_> = shapes
-            .iter()
-            .map(|(_, _, output, input)| (*output, *input))
-            .chain([(h, c.capture_width()), (c.kv_dim(), h)])
-            .collect();
-        blas.declare(draft.rows, &pairs);
-        let count = shapes
-            .iter()
-            .map(|(_, r, _, k)| r * k)
-            .max()
-            .context("no draft shapes")?;
-        let input: Vec<_> = (0..count)
-            .map(|i| bf16::from_f32(((i % 257) as f32 - 128.0) / 128.0))
-            .collect();
-        let input = draft.stream.clone_htod(&input)?;
-        for (weight, rows, output, input_width) in shapes {
-            let shape = LinearShape {
-                rows,
-                output,
-                input: input_width,
-            };
-            if super::super::linear_calibrate::supports(shape) {
-                blas.calibrate_shape(weight, &input.slice(..rows * input_width), shape)?;
-            }
-        }
-        Ok(())
     }
 
     fn confidence_bounds(
@@ -1629,6 +1728,7 @@ mod tests {
             &mut blas,
             super::super::markov::ScoreRounding::F32,
         )?;
+        draft.grow(rows)?;
         let embedding = native(
             &device,
             &target,
@@ -1641,7 +1741,15 @@ mod tests {
             "lm_head.weight",
             &[c.vocab_size, c.hidden_size],
         )?;
-        calibrate(&draft, &head, &mut blas)?;
+        let profile = super::super::closure::Profile::draft(
+            &draft.config,
+            capacity,
+            rows,
+            &target,
+            &draft_path,
+        )?;
+        draft.prepare_linears(&head, &mut blas, &profile, true)?;
+        draft.prepare_linears(&head, &mut blas, &profile, false)?;
         draft.setup_attention(&device, &ops, &config, &runtime, &closure)?;
         draft.setup_markov(&device, &ops, &runtime, &closure)?;
         let s = &device.stream;
@@ -1684,10 +1792,11 @@ mod tests {
             let (confidence_budget, isolated_budget) = confidence_limits
                 .get(name)
                 .context("confidence budget absent")?;
-            let taps: Vec<_> = values(&tensors, "target_taps", &[1, context, 5, h])?
+            let mut taps: Vec<_> = values(&tensors, "target_taps", &[1, context, 5, h])?
                 .into_iter()
                 .map(bf16::from_f32)
                 .collect();
+            taps.resize(rows * c.capture_width(), bf16::ZERO);
             let taps = s.clone_htod(&taps)?;
             draft.position_shift = 0;
             draft.reset_setup()?;
@@ -1697,6 +1806,7 @@ mod tests {
                 s.memcpy_htod(&poison, &mut cache.v)?;
             }
             let mut trace = Trace::default();
+            let bound_plans = blas.fixed_plan_count();
             draft.inject(
                 &taps,
                 context,
@@ -1707,6 +1817,10 @@ mod tests {
                 },
                 Some((&mut trace, "context")),
             )?;
+            ensure!(
+                blas.fixed_plan_count() == bound_plans,
+                "draft context injection created a plan after setup"
+            );
             let proposals = draft.propose(
                 block_ids[0],
                 context,

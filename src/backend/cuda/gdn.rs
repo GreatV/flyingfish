@@ -9,7 +9,8 @@
 //! `hist_update` is a separate launch after conv; conv blocks read `history[]` to seed their window.
 //!
 //! Ordinary `run` selects the core by phase. `run_verify` keeps Prefill preparation and uses the
-//! R1..5 recurrent core on sm_89. Modules and launch bounds are prepared before Ready.
+//! ordered h32 R1..16 core on every bound architecture and h48 R1..5 core on sm89.
+//! Plans bind before Ready.
 //!
 //! Rows are local: `qkv` and `core_out` are this call's `[M, ...]`; prefix rows are reachable only
 //! through `history[]`. `GdnMeta.prefix` is validated, never used as an index.
@@ -191,10 +192,18 @@ impl GdnPlan {
             "GDN rows outside binding"
         );
         if let Some((state, history)) = snapshots {
-            ensure!((1..=5).contains(&rows), "snapshot plan bound must be 1..5");
-            state.validate()?;
+            let limit = self.spec.snapshot_limit()?;
             ensure!(
-                state.shape == [4, self.spec.hv, DK, DV]
+                (1..=limit).contains(&rows),
+                "GDN hv={} snapshot rows={rows} exceeds bound={limit}",
+                self.spec.hv
+            );
+            state.validate()?;
+            let slots = state.shape[0];
+            ensure!(
+                slots < limit
+                    && slots >= rows - 1
+                    && state.shape == [slots, self.spec.hv, DK, DV]
                     && state.stride
                         == [
                             u64::from(self.spec.hv * DK * DV),
@@ -206,7 +215,7 @@ impl GdnPlan {
             );
             history.validate()?;
             ensure!(
-                history.shape == [4, self.conv_dim, 3]
+                history.shape == [slots, self.conv_dim, 3]
                     && history.stride == [u64::from(self.conv_dim * 3), 3, 1],
                 "invalid history snapshot layout"
             );
@@ -397,8 +406,7 @@ impl GdnOps {
             }
         }
 
-        // The rstep core binds only on sm_89.
-        let rstep = if cubin::capability(ctx)? == 89 {
+        let rstep = if spec.hv == 32 || cubin::capability(ctx)? == 89 {
             Some(module("gdn_rstep")?.load_function("gdn_rstep_core_v1")?)
         } else {
             None
@@ -514,8 +522,15 @@ impl GdnOps {
         scratch: Scratch,
     ) -> Result<()> {
         ensure!(
-            plan.kernels.rstep.is_none() || (1..=5).contains(&plan.max_rows),
-            "verify GDN bound must be 1..5"
+            (1..=plan.spec.snapshot_limit()?).contains(&plan.max_rows),
+            "GDN hv={} verify rows={} exceeds snapshot bound={}",
+            plan.spec.hv,
+            plan.max_rows,
+            plan.spec.snapshot_limit()?
+        );
+        ensure!(
+            plan.spec.hv != 32 || plan.kernels.rstep.is_some(),
+            "GDN hv=32 verify requires the ordered recurrent core"
         );
         ensure!(plan.snapshots.is_some(), "verify snapshots not bound");
         Self::run_core(plan, stream, meta, ExecutionPhase::Prefill, scratch, true)
@@ -1136,6 +1151,8 @@ mod tests {
         out: Vec<bf16>,
         state: Vec<f32>,
         history: Vec<f32>,
+        prefix_states: Vec<f32>,
+        prefix_histories: Vec<f32>,
         norm_ratio: f64,
     }
 
@@ -1161,6 +1178,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum GeometryCore {
         Recurrent,
+        Verify,
         Chunked,
         P1(u32),
         P2,
@@ -1188,6 +1206,17 @@ mod tests {
         let workspace = stream.alloc_zeros::<u8>(bytes as usize)?;
         let ptr = workspace.device_ptr(stream).0;
         let common = CommonOpsRef::new(&device.ctx)?;
+        let snapshots = if matches!(core, GeometryCore::Verify) {
+            let state = (spec.hv * DK * DV) as usize;
+            let history = (spec.conv_dim()? * spec.history_width) as usize;
+            let marker = f32::from_bits(0x7fc1_0001);
+            Some((
+                stream.clone_htod(&vec![marker; rows as usize * state])?,
+                stream.clone_htod(&vec![marker; rows as usize * history])?,
+            ))
+        } else {
+            None
+        };
         let mut plans = Vec::new();
         let sequential = matches!(core, GeometryCore::Recurrent);
         for row in 0..if sequential { valid } else { 1 } {
@@ -1201,6 +1230,37 @@ mod tests {
                 common.clone(),
                 p2,
             )?;
+            if let Some((state, history)) = &snapshots {
+                let slots = rows - 1;
+                plan = plan.for_rows(
+                    rows,
+                    Some((
+                        geometry_view(
+                            state,
+                            stream,
+                            [slots, spec.hv, DK, DV],
+                            [
+                                u64::from(spec.hv * DK * DV),
+                                u64::from(DK * DV),
+                                u64::from(DV),
+                                1,
+                            ],
+                            0,
+                        )?,
+                        geometry_view(
+                            history,
+                            stream,
+                            [slots, spec.conv_dim()?, spec.history_width],
+                            [
+                                u64::from(spec.conv_dim()? * spec.history_width),
+                                u64::from(spec.history_width),
+                                1,
+                            ],
+                            0,
+                        )?,
+                    )),
+                )?;
+            }
             if matches!(core, GeometryCore::WrongHeadStride) {
                 let directory = std::path::PathBuf::from(
                     std::env::var_os("FF_Q38_PROBE_DIR")
@@ -1275,6 +1335,8 @@ mod tests {
                             .arg(&0i32)
                             .launch(*config)?;
                     }
+                } else if matches!(core, GeometryCore::Verify) {
+                    GdnOps::run_verify(plan, stream, meta, Scratch { ptr, bytes })?;
                 } else {
                     GdnOps::run(
                         plan,
@@ -1312,6 +1374,11 @@ mod tests {
         let out = stream.clone_dtoh(&buffers.out)?;
         let state = stream.clone_dtoh(&buffers.state)?;
         let history = stream.clone_dtoh(&buffers.history)?;
+        let (prefix_states, prefix_histories) = if let Some((states, histories)) = snapshots {
+            (stream.clone_dtoh(&states)?, stream.clone_dtoh(&histories)?)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         ensure!(
             out[..valid as usize * spec.hv as usize * 128]
                 .iter()
@@ -1329,8 +1396,91 @@ mod tests {
             out,
             state,
             history,
+            prefix_states,
+            prefix_histories,
             norm_ratio,
         })
+    }
+
+    fn invariant_gdn(device: &crate::backend::cuda::Device, spec: GdnSpec) -> Result<()> {
+        let rows = spec.snapshot_limit()?;
+        let reference = (1..=rows)
+            .map(|valid| geometry_run(device, spec, rows, valid, GeometryCore::Recurrent, false))
+            .collect::<Result<Vec<_>>>()?;
+        let state_words = (spec.hv * DK * DV) as usize;
+        let history_words = (spec.conv_dim()? * spec.history_width) as usize;
+        let mut defects = 0;
+        let mut controls = 0;
+        for valid in 1..=rows {
+            for graph in [false, true] {
+                let candidate =
+                    geometry_run(device, spec, rows, valid, GeometryCore::Verify, graph)?;
+                let expected = &reference[valid as usize - 1];
+                let mismatches = geometry_mismatches(&candidate, expected);
+                defects += usize::from(mismatches != 0);
+                println!(
+                    "{} INVARIANT_GDN hv={} bound={rows} valid={valid} graph={graph} output_state_history_bit_mismatches={mismatches}",
+                    if mismatches == 0 { "PASS" } else { "DEFECT" },
+                    spec.hv
+                );
+                for (stage, slots, width) in [
+                    ("state", &candidate.prefix_states, state_words),
+                    ("history", &candidate.prefix_histories, history_words),
+                ] {
+                    let used = (valid as usize - 1) * width;
+                    ensure!(
+                        slots[..used].iter().all(|v| v.is_finite()),
+                        "nonfinite GDN {stage} prefix"
+                    );
+                    ensure!(
+                        slots[used..].iter().all(|v| v.to_bits() == 0x7fc1_0001),
+                        "GDN {stage} wrote a dead snapshot"
+                    );
+                    for prefix in 1..valid as usize {
+                        let expected = if stage == "state" {
+                            &reference[prefix - 1].state
+                        } else {
+                            &reference[prefix - 1].history
+                        };
+                        let got = &slots[(prefix - 1) * width..prefix * width];
+                        let mismatches = got
+                            .iter()
+                            .zip(expected)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        defects += usize::from(mismatches != 0);
+                        println!(
+                            "{} INVARIANT_GDN_PREFIX hv={} valid={valid} prefix={prefix} stage={stage} graph={graph} bit_mismatches={mismatches}",
+                            if mismatches == 0 { "PASS" } else { "DEFECT" },
+                            spec.hv
+                        );
+                    }
+                }
+                if valid == rows && !graph {
+                    let wrong = &candidate.prefix_states[state_words..2 * state_words];
+                    let mismatches = wrong
+                        .iter()
+                        .zip(&reference[0].state)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    ensure!(mismatches > 0, "wrong snapshot row control escaped");
+                    controls += 1;
+                    println!(
+                        "PASS INVARIANT_GDN_CONTROL wrong_snapshot_row=true hv={} bit_mismatches={mismatches}",
+                        spec.hv
+                    );
+                }
+            }
+        }
+        println!(
+            "INVARIANT_GDN_SUMMARY hv={} rows=1..{rows} eager_graph=true prefix_control={controls} defects={defects}",
+            spec.hv
+        );
+        ensure!(
+            defects == 0 && controls == 1,
+            "invariant GDN DEFECT cells={defects}"
+        );
+        Ok(())
     }
 
     fn geometry_qk_norm(data: &[u8], plan: &GdnPlan, rows: u32) -> Result<f64> {
@@ -1428,6 +1578,7 @@ mod tests {
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
         let spec = GdnSpec::from_model(&model)?;
+        invariant_gdn(&device, spec)?;
         let mut defects = 0;
         for core in [
             GeometryCore::Recurrent,

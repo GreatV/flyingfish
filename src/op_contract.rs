@@ -250,6 +250,16 @@ impl GdnSpec {
             _ => anyhow::bail!("unsupported GDN hv={}", self.hv),
         }
     }
+
+    /// Ordered recurrent rows supported by the geometry's snapshot kernels.
+    pub fn snapshot_limit(&self) -> Result<u32> {
+        self.validate()?;
+        match self.hv {
+            32 => Ok(crate::linear_plan::MAX_SKINNY_ROWS as u32),
+            48 => Ok(crate::mtp::MAX_VERIFY_ROWS as u32),
+            _ => anyhow::bail!("unsupported GDN hv={}", self.hv),
+        }
+    }
     /// Projection/history channel width derived from the normalized GDN geometry.
     pub fn conv_dim(&self) -> Result<u32> {
         self.validate()?;
@@ -300,6 +310,11 @@ impl GdnSpec {
             4,
         )
     }
+    pub fn image_bytes(&self) -> Result<u64> {
+        self.state_bytes()?
+            .checked_add(self.history_bytes()?)
+            .context("GDN state image byte overflow")
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +353,8 @@ mod tests {
         assert_eq!(attention.kernel_module()?, "tcmqa_d256_q16_kv2");
         assert_eq!(changed.kernel_suffix()?, "_h32");
         assert_eq!(changed.gate_kernel()?, "gdn_gates_h32");
+        assert_eq!(original.snapshot_limit()?, 5);
+        assert_eq!(changed.snapshot_limit()?, 16);
         let unsupported = GdnSpec { hv: 64, ..changed };
         assert!(
             unsupported

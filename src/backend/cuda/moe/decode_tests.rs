@@ -10,7 +10,7 @@ use crate::{
     experts::catalogue::{ExpertGeometry, ExpertLayout},
     model_spec::ExpertFormat,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DriverError};
 use half::bf16;
@@ -202,6 +202,258 @@ fn max_row_diff(got: &[bf16], want: &[bf16]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+fn row<T: Copy>(tensor: Tensor<T, 2>, index: usize) -> Result<Tensor<T, 2>> {
+    ensure!(index < tensor.shape[0] as usize, "test row outside tensor");
+    let offset = index as u64 * tensor.stride[0] * size_of::<T>() as u64;
+    // SAFETY: the original view owns the complete row and outlives every test launch.
+    unsafe {
+        Tensor::new(
+            tensor.ptr + offset,
+            [1, tensor.shape[1]],
+            tensor.stride,
+            tensor.span_bytes - offset,
+        )
+    }
+}
+
+fn invariant_decode(device: &Device) -> Result<()> {
+    use crate::cpu::expert_ffn as cpu;
+    let max_rows = crate::linear_plan::MAX_SKINNY_ROWS;
+    let fx = reference::fixture(
+        MoeDims {
+            experts: 17,
+            ..MoeDims::minicpm47(max_rows)
+        },
+        3,
+    );
+    let (e, k, h, i) = (
+        fx.dims.experts,
+        fx.dims.top_k,
+        fx.dims.hidden,
+        fx.dims.inter,
+    );
+    let world = w8a16_world(&fx)?;
+    let mut arena = fx.gate_up.clone();
+    arena.extend_from_slice(&fx.down);
+    let s = &device.stream;
+    let x = s.clone_htod(&fx.x)?;
+    let gu = s.clone_htod(&fx.gate_up)?;
+    let dn = s.clone_htod(&fx.down)?;
+    let fp8 = s.clone_htod(&world.slots)?;
+    let shared_gate = s.clone_htod(&fx.shared_gate)?;
+    let shared_up = s.clone_htod(&fx.shared_up)?;
+    let shared_down = s.clone_htod(&fx.shared_down)?;
+    let shared_expert_gate = s.clone_htod(&fx.shared_expert_gate)?;
+    let ids: Vec<_> = (0..max_rows * k)
+        .map(|a| ((a / k * 5 + a % k * 3) % e) as i32)
+        .collect();
+    let weights: Vec<_> = (0..max_rows * k)
+        .map(|a| bf16::from_f32(1.0 / (2 + (a * 7) % 19) as f32))
+        .collect();
+    let ids_device = s.clone_htod(&ids)?;
+    let weights_device = s.clone_htod(&weights)?;
+    let active = s.clone_htod(&vec![1u32; max_rows * k])?;
+    let assigned = s.clone_htod(&vec![1u64; max_rows * k])?;
+    let scratch = s.alloc_zeros::<u8>(decode_scratch_bytes(max_rows, k, i) as usize)?;
+    let ops = DecodeOps::new_invariant(&device.ctx)?;
+    let legacy = DecodeOps::new(&device.ctx)?;
+    let combine = CombineOps::new(&device.ctx)?;
+    let geometry = ExpertGeometry {
+        layers: 1,
+        experts: e as u32,
+        top_k: k as u32,
+        hidden: h as u32,
+        intermediate: i as u32,
+    };
+    let layout = ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry)?;
+    let shape = cpu::Shape::new(h, i)?;
+    let mut cpu_scratch = cpu::Scratch::new(&shape);
+    device.finish_upload()?;
+    let mut defects = 0;
+    for format in [ExpertFormat::Bf16, ExpertFormat::Fp8W8a16] {
+        let slot = (format == ExpertFormat::Fp8W8a16)
+            .then(|| layout.fp8_slot())
+            .flatten();
+        let table = if slot.is_some() {
+            let base = fp8.device_ptr(s).0;
+            testing::slots(s, e, base, world.slot_bytes, base, world.slot_bytes)?
+        } else {
+            testing::slots(
+                s,
+                e,
+                gu.device_ptr(s).0,
+                (2 * i * h * 2) as u64,
+                dn.device_ptr(s).0,
+                (h * i * 2) as u64,
+            )?
+        };
+        let routing = Routing {
+            ids: testing::dense(&ids_device, s, max_rows as u32, k as u32)?,
+            weights: testing::dense(&weights_device, s, max_rows as u32, k as u32)?,
+            active: testing::dense(&active, s, max_rows as u32, k as u32)?,
+            agen: testing::dense(&assigned, s, max_rows as u32, k as u32)?,
+            gu: testing::view(&table.gate_up, s, [e as u32], [1])?,
+            dn: testing::view(&table.down, s, [e as u32], [1])?,
+            slot_gen: testing::view(&table.generation, s, [e as u32], [1])?,
+        };
+        let gate = Gate {
+            ops: &ops,
+            combine: &combine,
+            s,
+            x: testing::dense(&x, s, max_rows as u32, h as u32)?,
+            shared_gate: testing::dense(&shared_gate, s, i as u32, h as u32)?,
+            shared_up: testing::dense(&shared_up, s, i as u32, h as u32)?,
+            shared_down: testing::dense(&shared_down, s, h as u32, i as u32)?,
+            seg: testing::view(&shared_expert_gate, s, [h as u32], [1])?,
+            valid: testing::view(&table.valid, s, [e as u32], [1])?,
+            scratch: Scratch {
+                ptr: scratch.device_ptr(s).0,
+                bytes: scratch.len() as u64,
+            },
+            top_k: k as u32,
+            hidden: h as u32,
+            inter: i as u32,
+        };
+        let mut alias_io = decode_io(s, 1, k as u32, h as u32)?;
+        let mut alias_shared = TensorMut(gate.x.prefix_rows(1)?);
+        let alias = gate.input(
+            1,
+            &routing,
+            alias_io.contributions,
+            &mut alias_shared,
+            &mut alias_io.done,
+        )?;
+        ensure!(
+            super::decode::validate(&alias, &gate.scratch).is_err(),
+            "shared output may not alias the source activation"
+        );
+        println!(
+            "PASS INVARIANT_MOE_ALIAS_CONTROL format={format:?} x_shared_overlap_rejected=true"
+        );
+        let mut serial: [Vec<bf16>; 3] = std::array::from_fn(|_| Vec::new());
+        for r in 0..max_rows {
+            let one = Gate {
+                x: row(gate.x, r)?,
+                scratch: Scratch {
+                    ptr: gate.scratch.ptr,
+                    bytes: gate.scratch.bytes,
+                },
+                ..gate
+            };
+            let route = Routing {
+                ids: row(routing.ids, r)?,
+                weights: row(routing.weights, r)?,
+                active: row(routing.active, r)?,
+                agen: row(routing.agen, r)?,
+                ..routing
+            };
+            for (all, values) in serial.iter_mut().zip(one.stages(1, &route, slot, false)?) {
+                all.extend(values);
+            }
+        }
+        for rows in 1..=max_rows {
+            for graph in [false, true] {
+                let got = gate.stages(rows as u32, &routing, slot, graph)?;
+                for ((stage, values), reference) in ["contribution", "shared", "combine"]
+                    .into_iter()
+                    .zip(got)
+                    .zip(&serial)
+                {
+                    let mismatches = values
+                        .iter()
+                        .zip(reference)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    defects += usize::from(mismatches != 0);
+                    println!(
+                        "{} INVARIANT_MOE format={format:?} x=[{rows},{h}] top_k={k} inter={i} stage={stage} graph={graph} bit_mismatches={mismatches}",
+                        if mismatches == 0 { "PASS" } else { "DEFECT" }
+                    );
+                }
+            }
+        }
+        let mut cpu_output = vec![bf16::ZERO; max_rows * k * h];
+        for r in 0..max_rows {
+            for c in 0..k {
+                let a = r * k + c;
+                let expert = ids[a] as usize;
+                let output = &mut cpu_output[a * h..(a + 1) * h];
+                if let Some(slot_layout) = slot {
+                    let start = expert * world.slot_bytes as usize;
+                    cpu::fp8_contribution(
+                        cpu::Isa::detect(),
+                        cpu::Fp8Contribution {
+                            shape: &shape,
+                            slot: &world.slots[start..start + world.slot_bytes as usize],
+                            slot_layout,
+                            hidden: &fx.x[r * h..(r + 1) * h],
+                            routing: weights[a],
+                        },
+                        output,
+                        &mut cpu_scratch,
+                    )?;
+                } else {
+                    cpu::contribution(
+                        cpu::Isa::detect(),
+                        cpu::Contribution {
+                            shape: &shape,
+                            arena: &arena,
+                            weights: &cpu::ExpertWeights {
+                                gate_up: expert * 2 * i * h..(expert + 1) * 2 * i * h,
+                                gate_up_stride: h,
+                                down: fx.gate_up.len() + expert * h * i
+                                    ..fx.gate_up.len() + (expert + 1) * h * i,
+                                down_stride: i,
+                            },
+                            hidden: &fx.x[r * h..(r + 1) * h],
+                            routing: weights[a],
+                        },
+                        output,
+                        &mut cpu_scratch,
+                    )?;
+                }
+            }
+        }
+        let mismatches = cpu_output
+            .iter()
+            .zip(&serial[0])
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        defects += usize::from(mismatches != 0);
+        println!(
+            "{} INVARIANT_MOE_CPU format={format:?} rows={max_rows} isa={} weighted=true bit_mismatches={mismatches}",
+            if mismatches == 0 { "PASS" } else { "DEFECT" },
+            cpu::Isa::detect().name()
+        );
+        let old = Gate {
+            ops: &legacy,
+            scratch: Scratch {
+                ptr: gate.scratch.ptr,
+                bytes: gate.scratch.bytes,
+            },
+            ..gate
+        }
+        .stages(1, &routing, slot, false)?;
+        let mismatches = old[0]
+            .iter()
+            .zip(&cpu_output)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        ensure!(
+            mismatches > 0,
+            "legacy lane8 control did not distinguish lane16"
+        );
+        println!(
+            "PASS INVARIANT_MOE_CONTROL format={format:?} legacy_lane8=true bit_mismatches={mismatches}"
+        );
+    }
+    println!(
+        "INVARIANT_MOE_SUMMARY formats=2 rows=1..16 stages=3 eager_graph=true weighted_CPU=true defects={defects}"
+    );
+    ensure!(defects == 0, "invariant MoE DEFECT cells={defects}");
+    Ok(())
+}
+
 /// Per-launch output buffers: contributions [rows, top_k, hidden],
 /// shared_out [rows, hidden], done [rows, top_k] (zeroed) and y [rows, hidden].
 struct DecodeIo {
@@ -270,6 +522,85 @@ struct Gate<'a> {
 }
 
 impl Gate<'_> {
+    fn stages(
+        &self,
+        rows: u32,
+        routing: &Routing,
+        layout: Option<&crate::experts::catalogue::Fp8Slot>,
+        graph: bool,
+    ) -> Result<[Vec<bf16>; 3]> {
+        let mut io = decode_io(self.s, rows + 1, self.top_k, self.hidden)?;
+        let words = rows as usize * self.hidden as usize;
+        let choices = rows as usize * self.top_k as usize;
+        let marker = bf16::from_bits(0x7fc1);
+        self.s
+            .memcpy_htod(&vec![marker; io._contrib_dev.len()], &mut io._contrib_dev)?;
+        self.s.memcpy_htod(
+            &vec![marker; io._shared_out_dev.len()],
+            &mut io._shared_out_dev,
+        )?;
+        self.s
+            .memcpy_htod(&vec![marker; io.y_dev.len()], &mut io.y_dev)?;
+        self.s
+            .memcpy_htod(&vec![0xfeedbeefu32; io._done_dev.len()], &mut io._done_dev)?;
+        io.contributions = io.contributions.prefix_rows(rows)?;
+        io.shared_out = TensorMut(io.shared_out.read().prefix_rows(rows)?);
+        io.done = TensorMut(io.done.read().prefix_rows(rows)?);
+        io.y = TensorMut(io.y.read().prefix_rows(rows)?);
+        let input = self.input(
+            rows,
+            routing,
+            io.contributions,
+            &mut io.shared_out,
+            &mut io.done,
+        )?;
+        let mut done = io._done_dev.slice_mut(..choices);
+        let mut execute = || -> Result<()> {
+            self.s.memset_zeros(&mut done)?;
+            self.ops
+                .decode(self.s, &input, &mut io.y, &self.scratch, layout)
+        };
+        execute()?;
+        if graph {
+            self.s.synchronize()?;
+            self.s.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            let launched = execute();
+            let captured = self
+                .s
+                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+            launched?;
+            captured?.context("empty invariant FFN graph")?.launch()?;
+        }
+        self.s.synchronize()?;
+        let completed = self.s.clone_dtoh(&io._done_dev)?;
+        ensure!(
+            completed[..choices].iter().all(|&v| v == 1)
+                && completed[choices..].iter().all(|&v| v == 0xfeedbeef),
+            "invariant FFN completion/tail rows={rows} graph={graph}"
+        );
+        let mut stages = [
+            self.s.clone_dtoh(&io._contrib_dev)?,
+            self.s.clone_dtoh(&io._shared_out_dev)?,
+            self.s.clone_dtoh(&io.y_dev)?,
+        ];
+        for (stage, count) in stages
+            .iter_mut()
+            .zip([words * self.top_k as usize, words, words])
+        {
+            ensure!(
+                stage[..count].iter().all(|v| v.is_finite())
+                    && stage[count..]
+                        .iter()
+                        .all(|v| v.to_bits() == marker.to_bits()),
+                "invariant FFN finite/tail rows={rows} graph={graph}"
+            );
+            stage.truncate(count);
+        }
+        Ok(stages)
+    }
+
     fn input<'a>(
         &self,
         rows: u32,
@@ -376,6 +707,9 @@ fn decode_expert_ffn_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let device = Device::new(0)?;
+    if std::env::var_os("FF_MOE_CHILD").is_none() {
+        invariant_decode(&device)?;
+    }
     let ops = DecodeOps::new(&device.ctx)?;
     let combine_ops = CombineOps::new(&device.ctx)?;
     let s = &device.stream;

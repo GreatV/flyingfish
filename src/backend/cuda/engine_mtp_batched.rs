@@ -106,7 +106,7 @@ impl Engine {
                 == snapshot_bytes,
             "snapshot allocation ledger mismatch"
         );
-        self.bind_mtp_snapshots(&snapshots, verify_rows)?;
+        self.bind_gdn_snapshots(&snapshots, verify_rows)?;
         let mut batch = Batch {
             snapshots,
             frame_epoch: None,

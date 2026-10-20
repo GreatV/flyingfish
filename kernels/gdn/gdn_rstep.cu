@@ -1,4 +1,4 @@
-// Recurrent GDN step over 1..5 ordered rows: one CTA per (head, value split) holds FP32
+// Ordered recurrent rows: h32 1..16, h48 1..5. Each (head,value split) CTA holds FP32
 // state in registers. The live row count is read from the device meta; bound is the
 // prepared allocation. No metadata mutation and no cross-CTA state dependency.
 #include <cuda_runtime.h>
@@ -46,7 +46,8 @@ void gdn_rstep_core_t(
     if (SNAPSHOT && !aligned16(snapshots)) { __trap(); return; }
     const int prefix = meta->prefix;
     const int valid_rows = meta->valid_rows;
-    if (bound < 1 || bound > 5 || valid_rows < 1 || valid_rows > bound || prefix < 0 || meta->causal != 1 ||
+    constexpr int row_limit = GDN_HEADS == 32 ? 16 : 5;
+    if (bound < 1 || bound > row_limit || valid_rows < 1 || valid_rows > bound || prefix < 0 || meta->causal != 1 ||
         meta->key_count != prefix + valid_rows || meta->capacity < meta->key_count) {
         __trap(); return;
     }

@@ -149,6 +149,7 @@ pub(super) struct Runtime {
     advance: CudaFunction,
     prepared: BTreeSet<u32>,
     workspace_rows: u32,
+    verify_rows: usize,
 }
 struct Layer {
     linear: LayerLinearPlan,
@@ -194,9 +195,17 @@ impl<T> std::ops::Deref for Narrowed<'_, T> {
     }
 }
 impl<T> PrefillPlans<T> {
-    fn bind(full: T, max_rows: usize, narrow: impl Fn(&T, u32) -> Result<T>) -> Result<Self> {
-        ensure!(max_rows > 0, "prefill plan requires rows");
-        let small = (1..=crate::mtp::MAX_VERIFY_ROWS.min(max_rows))
+    fn bind(
+        full: T,
+        bounds: (usize, usize),
+        narrow: impl Fn(&T, u32) -> Result<T>,
+    ) -> Result<Self> {
+        let (max_rows, small_rows) = bounds;
+        ensure!(
+            max_rows > 0 && (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&small_rows),
+            "prefill plan max_rows={max_rows} small_rows={small_rows} exceeds its binding"
+        );
+        let small = (1..=small_rows.min(max_rows))
             .map(|rows| narrow(&full, rows as u32))
             .collect::<Result<_>>()?;
         Ok(Self {
@@ -205,7 +214,7 @@ impl<T> PrefillPlans<T> {
             max_rows,
         })
     }
-    /// Rows 1..=5 borrow prebound small plans; larger sizes narrow at dispatch.
+    /// Declared small extents borrow prebound plans; larger sizes narrow at dispatch.
     fn select(
         &self,
         rows: usize,
@@ -271,13 +280,13 @@ pub(super) fn limits(rows: usize, capacity: usize) -> Result<AttentionLimits> {
         causal: 1,
     })
 }
-fn nested_verify_tcmqa(device_prefix: bool, rows: usize) -> Result<bool> {
+fn nested_verify_tcmqa(device_prefix: bool, rows: usize, bound: usize) -> Result<bool> {
     if !device_prefix {
         return Ok(false);
     }
     ensure!(
-        rows > 0 && rows <= 5,
-        "nested device-prefix attention supports rows 1..=5"
+        rows > 0 && rows <= bound,
+        "nested device-prefix attention rows={rows} exceeds bound={bound}"
     );
     Ok(true)
 }
@@ -330,16 +339,15 @@ impl Runtime {
         rows: usize,
         capacity: usize,
         policy: GdnPolicy,
+        verify_rows: usize,
     ) -> Result<usize> {
         let attention = FullAttentionSpec::from_model(model)?;
         let gdn = GdnSpec::from_model(model)?;
         let attention_prefill =
             FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?;
         let attention_decode = FullAttentionOps::workspace(&attention, limits(1, capacity)?)?;
-        let attention_nested_verify = FullAttentionOps::workspace(
-            &attention,
-            limits(rows.min(crate::mtp::MAX_VERIFY_ROWS), capacity)?,
-        )?;
+        let attention_nested_verify =
+            FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?;
         let spec = gdn;
         let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?, policy)?;
         let decode = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY)?;
@@ -522,7 +530,7 @@ impl Runtime {
                     }
                     let text_prefill = PrefillPlans::bind(
                         bind(rows, PositionBindings::Linear, false)?,
-                        rows,
+                        (rows, verify_rows),
                         FullAttentionPlan::for_rows,
                     )?;
                     ensure!(
@@ -545,14 +553,14 @@ impl Runtime {
                                 )?),
                                 false,
                             )?,
-                            rows,
+                            (rows, verify_rows),
                             FullAttentionPlan::for_rows,
                         )?,
                         text_prefill,
                         compact_small: if kv.compact.is_some() {
                             Some(PrefillPlans::bind(
                                 bind(verify_rows.min(rows), PositionBindings::Linear, true)?,
-                                verify_rows.min(rows),
+                                (verify_rows.min(rows), verify_rows),
                                 FullAttentionPlan::for_rows,
                             )?)
                         } else {
@@ -625,9 +633,11 @@ impl Runtime {
                     };
                     BoundMixer::Gdn {
                         norm: weight("linear_attn.norm.weight")?,
-                        prefill: PrefillPlans::bind(bind(rows)?, rows, |plan, rows| {
-                            plan.for_rows(rows, None)
-                        })?,
+                        prefill: PrefillPlans::bind(
+                            bind(rows)?,
+                            (rows, verify_rows),
+                            |plan, rows| plan.for_rows(rows, None),
+                        )?,
                         verify: Vec::new(),
                         decode: Box::new(bind(1)?),
                     }
@@ -669,6 +679,7 @@ impl Runtime {
             advance: module.load_function("q38_advance")?,
             prepared: BTreeSet::new(),
             workspace_rows: u32::try_from(rows)?,
+            verify_rows,
         })
     }
     fn prepare(
@@ -770,7 +781,7 @@ impl Engine {
         Ok(())
     }
 
-    pub(super) fn bind_mtp_snapshots(
+    pub(super) fn bind_gdn_snapshots(
         &mut self,
         snapshots: &[super::super::state::GdnState],
         verify_rows: usize,
@@ -779,6 +790,12 @@ impl Engine {
         let stream = &self.device.stream;
         let g = q.gdn;
         let cd = g.conv_dim()?;
+        ensure!(
+            (1..=g.snapshot_limit()? as usize).contains(&verify_rows),
+            "GDN hv={} verify_rows={verify_rows} exceeds snapshot bound={}",
+            g.hv,
+            g.snapshot_limit()?
+        );
         let mut states = snapshots.iter();
         for layer in &mut q.layers {
             if let BoundMixer::Gdn {
@@ -786,11 +803,25 @@ impl Engine {
             } = &mut layer.mixer
             {
                 let state = states.next().context("missing GDN snapshot allocation")?;
+                let state_width = (g.hv * g.dk * g.dv) as usize;
+                let history_width = (cd * g.history_width) as usize;
+                let slots = state.s.len() / state_width;
+                ensure!(
+                    slots > 0
+                        && slots < g.snapshot_limit()? as usize
+                        && slots >= verify_rows - 1
+                        && state.s.len() == slots * state_width
+                        && state.history.len() == slots * history_width,
+                    "GDN snapshot storage hv={} rows={verify_rows} slots={slots} state_words={} history_words={}",
+                    g.hv,
+                    state.s.len(),
+                    state.history.len()
+                );
                 let s = view(
                     &state.s,
                     stream,
                     0,
-                    [4, g.hv, g.dk, g.dv],
+                    [slots as u32, g.hv, g.dk, g.dv],
                     [
                         u64::from(g.hv * g.dk * g.dv),
                         u64::from(g.dk * g.dv),
@@ -802,7 +833,7 @@ impl Engine {
                     &state.history,
                     stream,
                     0,
-                    [4, cd, g.history_width],
+                    [slots as u32, cd, g.history_width],
                     [
                         u64::from(cd * g.history_width),
                         u64::from(g.history_width),
@@ -1013,7 +1044,7 @@ impl Engine {
         model_spec: crate::model_spec::ModelSpec,
     ) -> Result<Self> {
         require_qwen35_geometry(&model_spec)?;
-        let write = !matches!(mode, super::SetupMode::Ready);
+        let write = mode.writes();
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
         ensure!(
             model_spec.moe.is_none() || !reserve_mtp,
@@ -1024,20 +1055,58 @@ impl Engine {
             model_spec.moe.is_none() || !settings.prefix_cache,
             "MoE prefix_cache=true has no delegated-expert content identity"
         );
-        let verify_rows = match mode {
-            super::SetupMode::Mtp { verify_rows } => verify_rows,
-            _ => crate::mtp::MAX_VERIFY_ROWS,
-        };
         let started = Instant::now();
         let attention = FullAttentionSpec::from_model(&model_spec)?;
         let gdn = GdnSpec::from_model(&model_spec)?;
         let kv_width = attention.hkv * attention.d;
         let config = model_spec.config();
-        let capture_layers = settings
+        let draft_config = settings
             .draft_model
             .as_deref()
-            .map(|path| crate::dspark::read_capture_layers(path, &config))
+            .filter(|_| model_spec.moe.is_some())
+            .map(|path| crate::dspark::DraftConfig::read(path, &config))
             .transpose()?;
+        ensure!(
+            draft_config.is_none() || settings.kv_format == crate::kv::KvFormat::Bf16,
+            "MoE DSpark requires BF16 target KV, received {:?}",
+            settings.kv_format
+        );
+        let verify_rows = match mode {
+            super::SetupMode::Mtp { verify_rows } => verify_rows,
+            _ => draft_config
+                .as_ref()
+                .map(|draft| draft.target_rows(&model_spec))
+                .transpose()?
+                .unwrap_or(crate::mtp::MAX_VERIFY_ROWS),
+        };
+        let capture_layers = if let Some(draft) = &draft_config {
+            Some(draft.target_layer_ids.clone())
+        } else {
+            settings
+                .draft_model
+                .as_deref()
+                .map(|path| crate::dspark::read_capture_layers(path, &config))
+                .transpose()?
+        };
+        let target_transaction_bytes = draft_config
+            .as_ref()
+            .map(|draft| draft.target_state_bytes(&model_spec))
+            .transpose()?
+            .unwrap_or(0);
+        let draft_row_bytes = draft_config
+            .as_ref()
+            .map(|draft| draft.workspace_row_bytes())
+            .transpose()?
+            .unwrap_or(0);
+        let target_head_bytes = if draft_config.is_some() {
+            (model_spec.vocab as usize)
+                .checked_mul(size_of::<bf16>())
+                .and_then(|n| n.checked_add(size_of::<i32>() + size_of::<u32>()))
+                .and_then(|n| n.checked_mul(verify_rows))
+                .context("DSpark all-row head byte count overflow")?
+        } else {
+            0
+        };
         ensure!(
             !settings.spec_budget.is_tree(),
             "Qwen DSpark proposal/tree execution is not bound"
@@ -1057,7 +1126,7 @@ impl Engine {
             "invalid Q38 capacity"
         );
         // Reject an incomplete operator plan before allocating model weights.
-        Runtime::workspace(&model_spec, 1, capacity, GdnPolicy::LEGACY)?;
+        Runtime::workspace(&model_spec, 1, capacity, GdnPolicy::LEGACY, verify_rows)?;
         let runtime = settings
             .runtime_dir
             .as_deref()
@@ -1066,7 +1135,10 @@ impl Engine {
         std::fs::create_dir_all(&runtime)?;
         let closure = Rc::new(super::super::closure::Closure::new(
             write,
-            "Q38 uses fixed operator plans".into(),
+            format!(
+                "run calibrate with model={dir:?} draft={:?} capacity={capacity} runtime={runtime:?}",
+                settings.draft_model
+            ),
         ));
         let device = Device::new(ordinal)?;
         let gdn_policy = GdnPolicy::for_device(device.info.arch, device.info.sms);
@@ -1147,6 +1219,25 @@ impl Engine {
         if model_spec.linear_format.fp8_layout().is_some() {
             blas.enable_fp8(&device.ctx)?;
         }
+        let mut draft = if draft_config.is_some() {
+            let path = settings
+                .draft_model
+                .as_deref()
+                .context("draft config has no checkpoint path")?;
+            let mut draft = super::super::draft::Draft::new(
+                path,
+                &device,
+                &config,
+                capacity,
+                verify_rows,
+                &mut blas,
+                super::super::markov::ScoreRounding::F32,
+            )?;
+            draft.setup_attention(&device, &ops, &config, &runtime, &closure)?;
+            Some(draft)
+        } else {
+            None
+        };
         device.finish_upload()?;
         let (free, total) = device.ctx.mem_get_info()?;
         let mtp_budget = reserve_mtp
@@ -1161,9 +1252,12 @@ impl Engine {
             row_bytes: Runtime::row_bytes(&model_spec)?
                 .checked_add(mtp_budget.as_ref().map_or(0, |b| b.row_bytes))
                 .and_then(|bytes| bytes.checked_add(capture_row_bytes))
+                .and_then(|bytes| bytes.checked_add(draft_row_bytes))
                 .context("combined row bytes overflow")?,
             fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
                 .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
+                .and_then(|bytes| bytes.checked_add(target_transaction_bytes))
+                .and_then(|bytes| bytes.checked_add(target_head_bytes))
                 .context("combined fixed bytes overflow")?,
         };
         let expert_setup = if model_spec.moe.is_some() {
@@ -1174,7 +1268,14 @@ impl Engine {
                 dir,
                 &runtime,
                 write,
-                request,
+                (
+                    request,
+                    if draft.is_some() { verify_rows } else { 1 },
+                    verify_rows,
+                    capture_row_bytes
+                        .checked_add(draft_row_bytes)
+                        .context("draft context row bytes overflow")?,
+                ),
             )?)
         } else {
             None
@@ -1186,7 +1287,8 @@ impl Engine {
             dense_budget = crate::prefill::WorkspaceBudget::new(
                 request,
                 |rows| {
-                    let mut target = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?;
+                    let mut target =
+                        Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?;
                     if settings.kv_format != crate::kv::KvFormat::Bf16 {
                         target = target.max(
                             crate::op_contract::AttentionWorkspace::new(
@@ -1216,23 +1318,37 @@ impl Engine {
         let rows = expert_setup
             .as_ref()
             .map_or(chunk, |setup| setup.workspace.workspace_rows);
+        let context_rows = if draft.is_some() {
+            expert_setup
+                .as_ref()
+                .context("draft context requires expert span setup")?
+                .workspace
+                .candidate
+                .span_rows as usize
+        } else {
+            rows
+        };
         ensure!(
-            !reserve_mtp || rows >= verify_rows,
-            "MTP chunk {rows} cannot fit {verify_rows} verification rows"
+            !(reserve_mtp || draft.is_some()) || rows >= verify_rows,
+            "speculative chunk {rows} cannot fit {verify_rows} verification rows"
         );
-        let target_workspace = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?.max(
-            if settings.kv_format == crate::kv::KvFormat::Bf16 {
-                0
-            } else {
-                crate::op_contract::AttentionWorkspace::new(
-                    &attention,
-                    verify_rows as u32,
-                    capacity as u32,
-                    limits(verify_rows, capacity)?.key_chunk,
-                )?
-                .bytes as usize
-            },
-        );
+        if let Some(draft) = &mut draft {
+            draft.grow(context_rows)?;
+        }
+        let target_workspace =
+            Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?.max(
+                if settings.kv_format == crate::kv::KvFormat::Bf16 {
+                    0
+                } else {
+                    crate::op_contract::AttentionWorkspace::new(
+                        &attention,
+                        verify_rows as u32,
+                        capacity as u32,
+                        limits(verify_rows, capacity)?.key_chunk,
+                    )?
+                    .bytes as usize
+                },
+            );
         eprintln!(
             "{}",
             serde_json::json!({
@@ -1248,12 +1364,16 @@ impl Engine {
                 "kv_format": settings.kv_format.tag(),
                 "kv_prefill_scratch_bytes": kv_scratch.as_ref().map_or(0,|(k,v)|(k.len()+v.len())*size_of::<bf16>()),
                 "capture_checkpoint_bytes": capture_checkpoint.as_ref().context("capture checkpoint missing")?.bytes(),
-                "target_hidden_capture_bytes": rows.checked_mul(capture_row_bytes).context("capture byte count overflow")?,
+                "target_hidden_capture_bytes": context_rows.checked_mul(capture_row_bytes).context("capture byte count overflow")?,
+                "draft_context_span_rows": context_rows,
+                "draft_workspace_row_bytes": draft_row_bytes,
+                "target_transaction_planned_bytes": target_transaction_bytes,
+                "target_all_row_head_bytes": target_head_bytes,
                 "layer_arena_bytes": arena_bytes,
                 "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?.bytes,
                 "attention_prefill_lse_bytes": rows * model_spec.q_heads as usize * size_of::<f32>(),
                 "attention_decode_workspace_bytes": FullAttentionOps::workspace(&attention, limits(1, capacity)?)?.bytes,
-                "attention_nested_verify_workspace_bytes": FullAttentionOps::workspace(&attention, limits(rows.min(5), capacity)?)?.bytes,
+                "attention_nested_verify_workspace_bytes": FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?.bytes,
                 "attention_prefill_backend": "FA2 d256",
                 "attention_decode_backend": "TCMQA d256",
                 "gdn_prefill_workspace_bytes": GdnOps::workspace(&gdn, u32::try_from(rows)?, gdn_policy)?.bytes,
@@ -1270,7 +1390,7 @@ impl Engine {
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
         let hidden_capture = capture_layers
             .as_ref()
-            .map(|ids| HiddenCapture::new(ids, &config, rows, s))
+            .map(|ids| HiddenCapture::new(ids, &config, context_rows, s))
             .transpose()?;
         let mut engine = Self {
             #[cfg(test)]
@@ -1338,8 +1458,16 @@ impl Engine {
             kv_scratch,
             verify_rows,
         )?);
+        if let Some(draft) = draft {
+            let spec = Spec::new(draft, &engine)?;
+            engine.bind_gdn_snapshots(&spec.snapshots, verify_rows)?;
+            engine.spec = Some(spec);
+        }
         if let Some(setup) = expert_setup {
             setup.bind(&mut engine)?;
+        }
+        if engine.spec.is_some() {
+            engine.bind_invariant_arithmetic()?;
         }
         if engine.model_spec.moe.is_some() {
             engine.declare_graphs()?;
@@ -1351,7 +1479,31 @@ impl Engine {
             .as_ref()
             .context("Q38 runtime missing")?
             .ensure_complete()?;
-        engine.closure.freeze_fixed()?;
+        if let Some(spec) = &engine.spec {
+            let profile = super::super::closure::Profile::draft(
+                &spec.draft.config,
+                capacity,
+                context_rows,
+                dir,
+                settings
+                    .draft_model
+                    .as_deref()
+                    .context("draft calibration path missing")?,
+            )?;
+            let key = super::super::calibrate::key(&engine.device)?;
+            let mut paths: Vec<_> = profile
+                .linear
+                .iter()
+                .map(|&shape| engine.blas.choice_path(shape))
+                .collect();
+            paths.push(profile.path(&engine.runtime, &key)?);
+            engine.closure.preflight(&paths)?;
+            spec.draft
+                .prepare_linears(&engine.weights.head, &mut engine.blas, &profile, write)?;
+            engine.closure.finish(profile, &engine.runtime, key)?;
+        } else {
+            engine.closure.freeze_fixed()?;
+        }
         if !write {
             engine.reset()?;
             engine.prepare_graphs()?;
@@ -1397,7 +1549,7 @@ impl Engine {
         step: crate::backend::Step<'_>,
     ) -> Result<()> {
         if step.input == crate::backend::Input::Ids
-            && !crate::linear_plan::direct_fp8_rows(step.rows)
+            && !self.blas.direct_fp8_rows().contains(&step.rows)
         {
             self.qwen.as_mut().context("Q38 runtime missing")?.layers[i]
                 .linear
@@ -1474,12 +1626,14 @@ impl Engine {
                 }
                 match phase {
                     ExecutionPhase::Prefill => {
-                        if nested_verify_tcmqa(self.qwen_device_prefix, rows)? {
+                        if nested_verify_tcmqa(self.qwen_device_prefix, rows, q.verify_rows)? {
                             let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
                             let plans = if kv.compact.is_some() {
                                 compact_small
                                     .as_ref()
                                     .context("compact verify plan missing")?
+                            } else if self.model_spec.moe.is_some() {
+                                image_prefill
                             } else {
                                 text_prefill
                             };
@@ -1796,6 +1950,9 @@ impl Engine {
             }
             O::Norm => {
                 if i == 0
+                    || (self.model_spec.moe.is_some()
+                        && !self.qwen_device_prefix
+                        && step.input == crate::backend::Input::Ids)
                     || !self
                         .hidden_capture
                         .as_ref()
@@ -1930,13 +2087,13 @@ impl Engine {
                 if step.head == Head::None {
                     return Ok(());
                 }
-                ensure!(
-                    step.head == Head::Last,
-                    "Q38 all-row speculative head is not bound"
-                );
-                if !self.hidden_capture.as_ref().is_some_and(|capture| {
-                    capture.layer_slots[self.model_spec.layers.len() - 1].is_some()
-                }) {
+                if (self.model_spec.moe.is_some()
+                    && !self.qwen_device_prefix
+                    && step.input == crate::backend::Input::Ids)
+                    || !self.hidden_capture.as_ref().is_some_and(|capture| {
+                        capture.layer_slots[self.model_spec.layers.len() - 1].is_some()
+                    })
+                {
                     q.common.norm.rms_with(
                         s,
                         domain,
@@ -1951,6 +2108,45 @@ impl Engine {
                 }
                 #[cfg(test)]
                 trace_value(trace, s, "norm", &w.n, rows, h)?;
+                if step.head == Head::All {
+                    let spec = self
+                        .spec
+                        .as_mut()
+                        .context("MoE all-row head requires draft state")?;
+                    ensure!(
+                        self.model_spec.moe.is_some() && rows == spec.draft.config.verify_rows()?,
+                        "all-row head rows={rows} differs from the loaded MoE verification extent"
+                    );
+                    self.blas.linear_typed(
+                        phase,
+                        LinearWeightRef::Bf16(matrix(
+                            &self.weights.head,
+                            s,
+                            0,
+                            self.model_spec.vocab as usize,
+                            h,
+                        )?),
+                        matrix(&w.n, s, 0, rows, h)?,
+                        &mut TensorMut(matrix(
+                            &spec.logits,
+                            s,
+                            0,
+                            rows,
+                            self.model_spec.vocab as usize,
+                        )?),
+                    )?;
+                    // SAFETY: the bound logits and predictions cover every complete vocabulary row.
+                    unsafe {
+                        s.launch_builder(&self.ops.argmax_rows)
+                            .arg(&spec.logits)
+                            .arg(&mut spec.predictions)
+                            .arg(&(self.model_spec.vocab as i32))
+                            .arg(&spec.row_counts.slice(rows - 1..rows))
+                            .launch(grid(rows, 1024))?;
+                    }
+                    spec.active_rows = rows;
+                    return Ok(());
+                }
                 self.blas.linear_typed(
                     phase,
                     LinearWeightRef::Bf16(matrix(
@@ -2157,7 +2353,7 @@ mod tests {
 
     #[test]
     fn select_returns_the_plan_narrowed_to_the_steps_live_rows() {
-        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, (2048, 5), FakePlan::for_rows)
             .expect("bind");
         // A step size never seen before narrows host-side at dispatch; no preparation step exists.
         assert_eq!(
@@ -2181,7 +2377,7 @@ mod tests {
 
     #[test]
     fn a_step_only_runs_a_plan_narrowed_to_its_own_rows() {
-        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, (2048, 5), FakePlan::for_rows)
             .expect("bind");
         assert_eq!(
             plans.select(1021, &FakePlan::for_rows).unwrap().max_rows,
@@ -2193,7 +2389,7 @@ mod tests {
     #[test]
     fn every_step_size_of_a_chunked_prompt_gets_its_own_plan() {
         // 4093 tokens over a 2048 chunk: two 2048 steps and one 997 tail.
-        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, 2048, FakePlan::for_rows)
+        let plans = PrefillPlans::bind(FakePlan { max_rows: 2048 }, (2048, 5), FakePlan::for_rows)
             .expect("bind");
         for step in [2048usize, 997] {
             assert_eq!(
@@ -2231,7 +2427,7 @@ mod tests {
                 assert_eq!(full, capacity);
                 Ok(rows as usize)
             };
-            let plans = PrefillPlans::bind(capacity, capacity, narrow)?;
+            let plans = PrefillPlans::bind(capacity, (capacity, 5), narrow)?;
             assert_eq!(plans.small, (1..=5.min(capacity)).collect::<Vec<_>>());
             for rows in 1..=capacity {
                 assert_eq!(*plans.select(rows, &narrow)?, rows);
@@ -2245,9 +2441,13 @@ mod tests {
             assert!(plans.select(0, &narrow).is_err());
             assert!(plans.select(capacity + 1, &narrow).is_err());
             assert!(plans.select(usize::MAX, &narrow).is_err());
-            let budget =
-                Runtime::workspace(&geometry(), capacity, 4096, GdnPolicy::for_device(89, 128))?
-                    as u64;
+            let budget = Runtime::workspace(
+                &geometry(),
+                capacity,
+                4096,
+                GdnPolicy::for_device(89, 128),
+                5,
+            )? as u64;
             for rows in 1..=5.min(capacity) {
                 assert!(
                     GdnOps::workspace(
@@ -2268,20 +2468,32 @@ mod tests {
                 );
             }
         }
-        assert!(PrefillPlans::bind(0, 0, |_, rows| Ok(rows as usize)).is_err());
+        assert!(PrefillPlans::bind(0, (0, 5), |_, rows| Ok(rows as usize)).is_err());
+        let plans = PrefillPlans::bind(4096, (4096, 16), |_, rows| Ok(rows as usize))?;
+        for rows in 1..=16 {
+            assert!(matches!(
+                plans.select(rows, &|_, row| Ok(row as usize))?,
+                Narrowed::Borrowed(_)
+            ));
+        }
+        assert!(PrefillPlans::bind(32, (32, 17), |_, rows| Ok(rows as usize)).is_err());
         Ok(())
     }
 
     #[test]
     fn nested_verify_routes_only_small_rows_to_tcmqa() -> Result<()> {
         for rows in [1, 4, 65, 2048] {
-            assert!(!nested_verify_tcmqa(false, rows)?);
+            assert!(!nested_verify_tcmqa(false, rows, 5)?);
         }
         for rows in 1..=5 {
-            assert!(nested_verify_tcmqa(true, rows)?);
+            assert!(nested_verify_tcmqa(true, rows, 5)?);
         }
-        assert!(nested_verify_tcmqa(true, 0).is_err());
-        assert!(nested_verify_tcmqa(true, 6).is_err());
+        assert!(nested_verify_tcmqa(true, 0, 5).is_err());
+        assert!(nested_verify_tcmqa(true, 6, 5).is_err());
+        for rows in 1..=16 {
+            assert!(nested_verify_tcmqa(true, rows, 16)?);
+        }
+        assert!(nested_verify_tcmqa(true, 17, 16).is_err());
         Ok(())
     }
 
@@ -2298,7 +2510,7 @@ mod tests {
             let required =
                 FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(5, capacity)?)?;
             let allocated =
-                Runtime::workspace(&geometry(), 5, capacity, GdnPolicy::for_device(89, 128))?;
+                Runtime::workspace(&geometry(), 5, capacity, GdnPolicy::for_device(89, 128), 5)?;
             ensure!(
                 required.bytes <= allocated as u64,
                 "nested verify workspace {required:?} exceeds allocation {allocated}"
@@ -2306,15 +2518,15 @@ mod tests {
             let mtp = crate::mtp::AttachmentBudget::new(&spec, capacity)?;
             let row_bytes = Runtime::row_bytes(&spec)? + mtp.row_bytes;
             let fixed = Runtime::fixed_bytes(&spec, capacity)? + mtp.fixed_bytes;
-            let workspace =
-                |rows| {
-                    Ok(Runtime::workspace(
-                        &geometry(),
-                        rows,
-                        capacity,
-                        GdnPolicy::for_device(89, 128),
-                    )? + mtp.workspace(rows)?)
-                };
+            let workspace = |rows| {
+                Ok(Runtime::workspace(
+                    &geometry(),
+                    rows,
+                    capacity,
+                    GdnPolicy::for_device(89, 128),
+                    5,
+                )? + mtp.workspace(rows)?)
+            };
             let total = 24usize << 30;
             let request = WorkspaceRequest {
                 capacity,
@@ -2379,7 +2591,7 @@ mod tests {
         let total = 1 << 30;
         let fixed = spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>() + capacity * 12;
         for rows in [1, 65, 128] {
-            let scratch = Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::LEGACY)?;
+            let scratch = Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::LEGACY, 5)?;
             for required in [
                 FullAttentionOps::preprocess_workspace(
                     &FullAttentionSpec::q38(),
@@ -2411,7 +2623,7 @@ mod tests {
             };
             let budget = WorkspaceBudget::new(
                 request,
-                |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY),
+                |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY, 5),
                 Ok,
             )?;
             assert_eq!(budget.planned_transient_bytes, allocated);
@@ -2423,7 +2635,7 @@ mod tests {
                         free_after_resident: request.free_after_resident - 1,
                         ..request
                     },
-                    |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY),
+                    |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY, 5),
                     Ok,
                 )
                 .is_err()
@@ -2446,7 +2658,7 @@ mod tests {
         let row_bytes = Runtime::row_bytes(&spec)?;
         let fixed = Runtime::fixed_bytes(&spec, capacity)?;
         for rows in [512, 513, 1021, 1024, 2048, 4096, 8192] {
-            let scratch = Runtime::workspace(&geometry(), rows, capacity, policy)?;
+            let scratch = Runtime::workspace(&geometry(), rows, capacity, policy, 5)?;
             let gdn = policy.workspace(&crate::op_contract::GdnSpec::q38(), rows as u32)?;
             assert!(scratch as u64 >= gdn.bytes);
             let required = rows * row_bytes + fixed + scratch;
@@ -2461,7 +2673,7 @@ mod tests {
             };
             let budget = WorkspaceBudget::new(
                 request,
-                |r| Runtime::workspace(&geometry(), r, capacity, policy),
+                |r| Runtime::workspace(&geometry(), r, capacity, policy, 5),
                 Ok,
             )?;
             assert_eq!(budget.plan.chunk, rows);
@@ -2473,7 +2685,7 @@ mod tests {
                         free_after_resident: request.free_after_resident - 1,
                         ..request
                     },
-                    |r| Runtime::workspace(&geometry(), r, capacity, policy),
+                    |r| Runtime::workspace(&geometry(), r, capacity, policy, 5),
                     Ok,
                 )
                 .is_err()
