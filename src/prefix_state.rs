@@ -1098,7 +1098,6 @@ mod tests {
                 key_head_dim: 128,
                 value_head_dim: 128,
                 conv_kernel: 4,
-                qk_norm_fp32: false,
             }),
             vision: None,
         }

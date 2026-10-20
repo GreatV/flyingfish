@@ -5,7 +5,7 @@ use crate::{
         blas::Blas,
         contracts::{Scratch, Tensor, TensorMut},
         cubin,
-        linear::{LinearBiasMode, disjoint},
+        linear::{LinearBiasMode, LinearWeightRef, disjoint},
         ops::{CommonOpsRef, GeluMode, grid},
         vision::{
             PatchGrid, PatchPacking, VisionAttnBindings, VisionAttnOps, VisionAttnPlan,
@@ -267,6 +267,19 @@ pub(super) struct PositionInputs {
     pub indices: Tensor<i32, 2>,
     pub weights: Tensor<f32, 2>,
     pub patches: Tensor<bf16, 2>,
+    pub bias: Option<Tensor<bf16, 1>>,
+    pub trace_patches: bool,
+}
+
+struct PatchPositionBindings<'a> {
+    patch: &'a BiasedWeight,
+    position: &'a CudaSlice<bf16>,
+    indices: &'a CudaSlice<i32>,
+    bilinear: Option<&'a BilinearTables>,
+    packed: &'a CudaSlice<bf16>,
+    patch_output: &'a CudaSlice<bf16>,
+    hidden: &'a CudaSlice<bf16>,
+    trace_patches: bool,
 }
 
 impl VisionIo {
@@ -332,6 +345,8 @@ impl VisionIo {
             indices,
             weights,
             patches,
+            bias,
+            trace_patches,
         } = input;
         matrix(&table, hidden)?;
         ensure!(
@@ -361,6 +376,26 @@ impl VisionIo {
         disjoint(&table, &interpolated.0)?;
         disjoint(&indices, &interpolated.0)?;
         disjoint(&weights, &interpolated.0)?;
+        let bias_ptr = if let Some(bias) = bias {
+            bias.validate()?;
+            ensure!(
+                bias.shape == [hidden] && bias.stride == [1],
+                "position bias shape mismatch"
+            );
+            disjoint(&bias, &patches)?;
+            disjoint(&bias, &output.0)?;
+            disjoint(&bias, &interpolated.0)?;
+            bias.ptr
+        } else {
+            ensure!(!trace_patches, "position patch trace requires bias");
+            0
+        };
+        if trace_patches {
+            disjoint(&table, &patches)?;
+            disjoint(&indices, &patches)?;
+            disjoint(&weights, &patches)?;
+        }
+        let trace_ptr = if trace_patches { patches.ptr } else { 0 };
         let count = u64::from(rows) * u64::from(hidden);
         unsafe {
             stream
@@ -369,12 +404,79 @@ impl VisionIo {
                 .arg(&indices.ptr)
                 .arg(&weights.ptr)
                 .arg(&patches.ptr)
+                .arg(&bias_ptr)
+                .arg(&trace_ptr)
                 .arg(&output.0.ptr)
                 .arg(&interpolated.0.ptr)
                 .arg(&rows)
                 .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
         }
         Ok(())
+    }
+
+    fn project_position(
+        &self,
+        stream: &Arc<CudaStream>,
+        blas: &Blas,
+        bindings: PatchPositionBindings<'_>,
+    ) -> Result<()> {
+        let PatchPositionBindings {
+            patch,
+            position,
+            indices,
+            bilinear,
+            packed,
+            patch_output,
+            hidden,
+            trace_patches,
+        } = bindings;
+        let width = patch.shape[0];
+        let rows = u32::try_from(packed.len() / patch.shape[1] as usize)?;
+        let output = dense(patch_output, stream, [rows, width])?;
+        let table = dense(
+            position,
+            stream,
+            [u32::try_from(position.len() / width as usize)?, width],
+        )?;
+        disjoint(&table, &output)?;
+        let input = dense(packed, stream, [rows, patch.shape[1]])?;
+        let bias = dense(&patch.bias, stream, [width])?;
+        disjoint(&bias, &output)?;
+        if bilinear.is_some() {
+            blas.linear_typed(
+                crate::op_contract::ExecutionPhase::Prefill,
+                LinearWeightRef::Bf16(dense(&patch.weight, stream, patch.shape)?),
+                input,
+                &mut TensorMut(output),
+            )?;
+        } else {
+            patch.run(stream, blas, input, &mut TensorMut(output))?;
+        }
+        let mut hidden = TensorMut(dense(hidden, stream, [rows, width])?);
+        match bilinear {
+            Some(bilinear) => self.position_add(
+                stream,
+                PositionInputs {
+                    table,
+                    indices: dense(indices, stream, [4, rows])?,
+                    weights: dense(&bilinear.coefficients, stream, [4, rows])?,
+                    patches: output,
+                    bias: Some(bias),
+                    trace_patches,
+                },
+                &mut hidden,
+                &mut TensorMut(dense(&bilinear.values, stream, [rows, width])?),
+                width,
+            ),
+            None => self.bucket_position_add(
+                stream,
+                table,
+                dense(indices, stream, [rows])?,
+                output,
+                &mut hidden,
+                width,
+            ),
+        }
     }
 
     fn splice(
@@ -640,23 +742,28 @@ impl BiasedWeight {
         name: &str,
         shape: [u32; 2],
         stored_shape: &[usize],
-        architecture: Architecture,
+        bias_mode: LinearBiasMode,
     ) -> Result<Self> {
-        let bias_mode = match (architecture, stored_shape.len()) {
-            (Architecture::MiniCpmV47, 4) => LinearBiasMode::AfterOutputRound,
-            (Architecture::MiniCpmV47, 2) | (Architecture::Qwen35Text, 2 | 5) => {
-                LinearBiasMode::BeforeOutputRound
-            }
-            _ => bail!(
-                "unsupported biased vision projection: architecture={architecture:?} stored_shape={stored_shape:?}"
-            ),
-        };
         Ok(Self {
             weight: take(catalog, &format!("{name}.weight"), stored_shape)?,
             bias: take(catalog, &format!("{name}.bias"), &[shape[0] as usize])?,
             shape,
             bias_mode,
         })
+    }
+    fn patch(
+        catalog: &mut WeightCatalog,
+        name: &str,
+        shape: [u32; 2],
+        stored_shape: &[usize],
+    ) -> Result<Self> {
+        Self::take(
+            catalog,
+            name,
+            shape,
+            stored_shape,
+            LinearBiasMode::AfterOutputRound,
+        )
     }
     fn prepare(&self, stream: &Arc<CudaStream>, blas: &mut Blas, rows: u32) -> Result<()> {
         blas.prepare_biased(
@@ -771,12 +878,11 @@ impl VisionWeights {
         let window_width = (merge * merge) as usize * mlp_usize;
         let (patch, position, post_norm, blocks, window, merger, expected) = match architecture {
             Architecture::Qwen35Text => {
-                let patch = BiasedWeight::take(
+                let patch = BiasedWeight::patch(
                     catalog,
                     "model.visual.patch_embed.proj",
                     [hidden, geometry.patch],
                     &patch_shape,
-                    architecture,
                 )?;
                 let position = take(
                     catalog,
@@ -793,14 +899,14 @@ impl VisionWeights {
                             &format!("{p}.attn.qkv"),
                             [3 * hidden, hidden],
                             &[3 * hidden_usize, hidden_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?),
                         projection: BiasedWeight::take(
                             catalog,
                             &format!("{p}.attn.proj"),
                             [hidden, hidden],
                             &[hidden_usize, hidden_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?,
                         norm2: AffineWeights::take(catalog, &format!("{p}.norm2"), hidden)?,
                         fc1: BiasedWeight::take(
@@ -808,14 +914,14 @@ impl VisionWeights {
                             &format!("{p}.mlp.linear_fc1"),
                             [mlp, hidden],
                             &[mlp_usize, hidden_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?,
                         fc2: BiasedWeight::take(
                             catalog,
                             &format!("{p}.mlp.linear_fc2"),
                             [hidden, mlp],
                             &[hidden_usize, mlp_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?,
                     });
                 }
@@ -826,14 +932,14 @@ impl VisionWeights {
                         "model.visual.merger.linear_fc1",
                         [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
                         &[fc1_usize, fc1_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         "model.visual.merger.linear_fc2",
                         [geometry.output(), geometry.spec.merger_fc1],
                         &[output_usize, fc1_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                 };
                 (
@@ -847,12 +953,11 @@ impl VisionWeights {
                 )
             }
             Architecture::MiniCpmV47 => {
-                let patch = BiasedWeight::take(
+                let patch = BiasedWeight::patch(
                     catalog,
                     "model.vision_tower.embeddings.patch_embedding",
                     [hidden, geometry.patch],
                     &patch_shape,
-                    architecture,
                 )?;
                 let position = take(
                     catalog,
@@ -873,7 +978,7 @@ impl VisionWeights {
                         &format!("{prefix}.self_attn.{name}_proj"),
                         [hidden, hidden],
                         &[hidden_usize, hidden_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )
                 };
                 let mut blocks = Vec::with_capacity(depth as usize);
@@ -893,14 +998,14 @@ impl VisionWeights {
                             &format!("{p}.mlp.fc1"),
                             [mlp, hidden],
                             &[mlp_usize, hidden_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?,
                         fc2: BiasedWeight::take(
                             catalog,
                             &format!("{p}.mlp.fc2"),
                             [hidden, mlp],
                             &[hidden_usize, mlp_usize],
-                            architecture,
+                            LinearBiasMode::BeforeOutputRound,
                         )?,
                     });
                 }
@@ -921,14 +1026,14 @@ impl VisionWeights {
                         &format!("{p}.linear_1"),
                         [merge * merge * mlp, geometry.spec.merger_fc1],
                         &[window_width, fc1_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         &format!("{p}.linear_2"),
                         [hidden, merge * merge * mlp],
                         &[hidden_usize, window_width],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                 };
                 let m = "model.merger.mlp.0";
@@ -943,14 +1048,14 @@ impl VisionWeights {
                         &format!("{m}.linear_1"),
                         [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
                         &[fc1_usize, fc1_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                     fc2: BiasedWeight::take(
                         catalog,
                         &format!("{m}.linear_2"),
                         [geometry.output(), geometry.spec.merger_fc1],
                         &[output_usize, fc1_usize],
-                        architecture,
+                        LinearBiasMode::BeforeOutputRound,
                     )?,
                 };
                 let expected = 2 + 1 + 2 + depth as usize * 16 + 16 + 6;
@@ -1486,7 +1591,7 @@ impl VisionRuntime {
         mut trace: Option<&mut crate::trace::Trace>,
     ) -> Result<EncodedImages> {
         let launched = (|| -> Result<()> {
-            self.run_prefix(stream, blas, &mut request.prefix)?;
+            self.run_prefix(stream, blas, &mut request.prefix, trace.is_some())?;
             let geometry = self.geometry;
             let spec = geometry.spec;
             let width = geometry.hidden();
@@ -2047,7 +2152,6 @@ impl VisionRuntime {
             .as_ref()
             .context("vision configuration missing")?;
         let s = &device.stream;
-        self.weights.patch.prepare(s, blas, row_count)?;
         let (indices, bilinear) = match self.model.architecture {
             Architecture::Qwen35Text => {
                 let tables =
@@ -2070,6 +2174,11 @@ impl VisionRuntime {
             Architecture::Llama => bail!("vision configuration requires a multimodal architecture"),
         };
         let hidden = geometry.hidden() as usize;
+        if bilinear.is_some() {
+            blas.prepare_request_fixed(row_count, geometry.hidden(), geometry.patch)?;
+        } else {
+            self.weights.patch.prepare(s, blas, row_count)?;
+        }
         let prefix = VisionPrefix {
             positions,
             pixels: s.clone_htod(input.pixel_values)?,
@@ -2089,12 +2198,11 @@ impl VisionRuntime {
         stream: &Arc<CudaStream>,
         blas: &Blas,
         request: &mut VisionPrefix,
+        trace_patches: bool,
     ) -> Result<()> {
         let rows = u32::try_from(request.positions.patch_rows())?;
         let geometry = self.geometry;
-        let hidden = geometry.hidden();
         let packed = dense(&request.packed, stream, [rows, geometry.patch])?;
-        let patch_output = dense(&request.patch_output, stream, [rows, hidden])?;
         let launched = (|| -> Result<()> {
             match self.model.architecture {
                 Architecture::Qwen35Text => {
@@ -2124,39 +2232,20 @@ impl VisionRuntime {
                     bail!("vision configuration requires a multimodal architecture")
                 }
             }
-            self.weights
-                .patch
-                .run(stream, blas, packed, &mut TensorMut(patch_output))?;
-            match &request.bilinear {
-                Some(bilinear) => self.io.position_add(
-                    stream,
-                    PositionInputs {
-                        table: dense(&self.weights.position, stream, [2304, hidden])?,
-                        indices: dense(&request.indices, stream, [4, rows])?,
-                        weights: dense(&bilinear.coefficients, stream, [4, rows])?,
-                        patches: patch_output,
-                    },
-                    &mut TensorMut(dense(&request.hidden, stream, [rows, hidden])?),
-                    &mut TensorMut(dense(&bilinear.values, stream, [rows, hidden])?),
-                    hidden,
-                )?,
-                None => {
-                    let vision = self
-                        .model
-                        .vision
-                        .as_ref()
-                        .context("vision configuration missing")?;
-                    let side = vision.position_side;
-                    self.io.bucket_position_add(
-                        stream,
-                        dense(&self.weights.position, stream, [side * side, hidden])?,
-                        dense(&request.indices, stream, [rows])?,
-                        patch_output,
-                        &mut TensorMut(dense(&request.hidden, stream, [rows, hidden])?),
-                        hidden,
-                    )?;
-                }
-            }
+            self.io.project_position(
+                stream,
+                blas,
+                PatchPositionBindings {
+                    patch: &self.weights.patch,
+                    position: &self.weights.position,
+                    indices: &request.indices,
+                    bilinear: request.bilinear.as_ref(),
+                    packed: &request.packed,
+                    patch_output: &request.patch_output,
+                    hidden: &request.hidden,
+                    trace_patches,
+                },
+            )?;
             Ok(())
         })();
         let synchronized = stream.synchronize();
@@ -2519,6 +2608,8 @@ mod tests {
                 indices: dense(&index, s, [4, rows])?,
                 weights: dense(&coefficient, s, [4, rows])?,
                 patches: dense(&patch, s, [rows, HIDDEN])?,
+                bias: None,
+                trace_patches: false,
             },
             &mut TensorMut(dense(&hidden, s, [rows, HIDDEN])?),
             &mut TensorMut(dense(&interpolation, s, [rows, HIDDEN])?),
@@ -3225,10 +3316,174 @@ mod tests {
         Ok(())
     }
 
+    fn patch_position_bits(
+        device: &Device,
+        blas: &mut Blas,
+        patch: &BiasedWeight,
+        host: &[bf16],
+        expected_patch: &[bf16],
+        cell: (u32, bool, bool),
+    ) -> Result<usize> {
+        let (rows, bilinear, zero_position) = cell;
+        let s = &device.stream;
+        let width = patch.shape[0];
+        let table_rows = if bilinear { 2304 } else { 4900 };
+        let position_host: Vec<_> = (0..table_rows * width)
+            .map(|i| {
+                if zero_position {
+                    bf16::ZERO
+                } else {
+                    bf16::from_f32((i % 17) as f32 / 32.0 - 0.25)
+                }
+            })
+            .collect();
+        let position = s.clone_htod(&position_host)?;
+        let (indices, coefficients) = if bilinear {
+            let (h, w) = match rows {
+                1 => (2, 2),
+                37 => (2, 20),
+                1120 => (28, 40),
+                7104 => (96, 74),
+                _ => bail!("patch position fixture row extent unsupported"),
+            };
+            let model = ModelSpec::qwen(
+                &serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?,
+                &serde_json::Value::Null,
+            )?;
+            let tables = VisionPositions::new(
+                model.vision.as_ref().context("vision fixture missing")?,
+                model.architecture,
+                &[ImageGrid { t: 1, h, w }],
+                (h * w) as usize,
+            )?;
+            let indices = tables
+                .bilinear_indices
+                .iter()
+                .flat_map(|corner| corner[..rows as usize].iter().copied())
+                .collect::<Vec<_>>();
+            let coefficients = tables
+                .bilinear_weights
+                .iter()
+                .flat_map(|corner| corner[..rows as usize].iter().copied())
+                .collect::<Vec<_>>();
+            (indices, coefficients)
+        } else {
+            (
+                (0..rows)
+                    .map(|row| ((row * 13) % table_rows) as i32)
+                    .collect(),
+                Vec::new(),
+            )
+        };
+        let expected: Vec<_> = expected_patch
+            .iter()
+            .enumerate()
+            .map(|(i, patch)| {
+                let (row, column) = (i / width as usize, i % width as usize);
+                let pos = if bilinear {
+                    let mut sum = 0.0f32;
+                    for corner in 0..4 {
+                        let offset = corner * rows as usize + row;
+                        sum += position_host[indices[offset] as usize * width as usize + column]
+                            .to_f32()
+                            * coefficients[offset];
+                    }
+                    bf16::from_f32(sum)
+                } else {
+                    position_host[indices[row] as usize * width as usize + column]
+                };
+                bf16::from_f32(patch.to_f32() + pos.to_f32())
+            })
+            .collect();
+        let x = s.clone_htod(host)?;
+        let y = s.alloc_zeros::<bf16>((rows * width) as usize)?;
+        let hidden = s.alloc_zeros::<bf16>((rows * width) as usize)?;
+        let indices = s.clone_htod(&indices)?;
+        let tables = if bilinear {
+            blas.prepare_fixed(rows, width, patch.shape[1])?;
+            Some(BilinearTables {
+                coefficients: s.clone_htod(&coefficients)?,
+                values: s.alloc_zeros((rows * width) as usize)?,
+            })
+        } else {
+            patch.prepare(s, blas, rows)?;
+            None
+        };
+        let io = VisionIo::new(device, OUTPUT)?;
+        device.finish_upload()?;
+        let execute = |trace_patches| {
+            io.project_position(
+                s,
+                blas,
+                PatchPositionBindings {
+                    patch,
+                    position: &position,
+                    indices: &indices,
+                    bilinear: tables.as_ref(),
+                    packed: &x,
+                    patch_output: &y,
+                    hidden: &hidden,
+                    trace_patches,
+                },
+            )
+        };
+        let mut defects = 0;
+        for graph in [false, true] {
+            for trace in [false, true] {
+                let captured = if graph {
+                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    let result = execute(trace);
+                    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    result?;
+                    Some(captured?.context("empty patch position graph")?)
+                } else {
+                    None
+                };
+                for _ in 0..2 {
+                    if let Some(graph) = &captured {
+                        graph.launch()?;
+                    } else {
+                        execute(trace)?;
+                    }
+                    let actual = s.clone_dtoh(&hidden)?;
+                    ensure!(
+                        actual.iter().all(|v| v.is_finite()),
+                        "nonfinite positioned patch"
+                    );
+                    let wrong = actual
+                        .iter()
+                        .zip(&expected)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    let pre_position = if trace || !bilinear {
+                        s.clone_dtoh(&y)?
+                            .iter()
+                            .zip(expected_patch)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count()
+                    } else {
+                        0
+                    };
+                    defects += wrong + pre_position;
+                    println!(
+                        "{} VISION_PATCH_POSITION rows={rows} bilinear={bilinear} zero_position={zero_position} graph={graph} trace={trace} bit_mismatches={wrong} pre_position_mismatches={pre_position}",
+                        if wrong + pre_position == 0 {
+                            "PASS"
+                        } else {
+                            "DEFECT"
+                        }
+                    );
+                }
+            }
+        }
+        Ok(defects)
+    }
+
     #[test]
     #[ignore = "requires FF_Q38_VISION_WINDOW=granted and FF_Q38_VISION_OUTPUT_DIR"]
     fn vision_merger_bias_rounding_gpu() -> Result<()> {
         use crate::backend::cuda::{closure::Closure, ops::Ops};
+        use cudarc::driver::DevicePtr;
         use std::{path::PathBuf, rc::Rc, time::Instant};
         ensure!(
             std::env::var("FF_Q38_VISION_WINDOW").as_deref() == Ok("granted"),
@@ -3244,139 +3499,266 @@ mod tests {
         let ops = Ops::new(&device.ctx)?;
         let closure = Rc::new(Closure::new(false, "merger bias rounding".into()));
         let mut blas = Blas::new(&device, &ops, &output, closure.clone())?;
+        for rows in [1u32, 37, 1120, 7104] {
+            blas.prepare_fixed(rows, HIDDEN, PATCH)?;
+        }
         closure.freeze_fixed()?;
         closure.ready(Instant::now())?;
+        let mut patch_defects = 0;
+        let mut position_defects = 0;
         {
             use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
             use std::collections::BTreeMap;
 
-            let stored_shape = [1152usize, 3, 14, 14];
-            let width = stored_shape[0] as u32;
-            let input = stored_shape[1..].iter().product::<usize>() as u32;
-            let half_ulp = bf16::from_f32(bf16::EPSILON.to_f32() / 2.0);
-            let mut weight = vec![bf16::ZERO; (width * input) as usize];
-            let mut bias = Vec::with_capacity(width as usize);
-            for (column, values) in weight.chunks_exact_mut(input as usize).enumerate() {
-                let sign = if column < width as usize / 2 {
-                    1.0
-                } else {
-                    -1.0
-                };
-                values[0] = bf16::from_f32(sign);
-                values[1] = bf16::from_f32(sign * half_ulp.to_f32());
-                bias.push(values[1]);
-            }
-            let prefix = "model.vision_tower.embeddings.patch_embedding";
-            let mut tensors = BTreeMap::new();
-            let mut entries = BTreeMap::new();
-            let mut bytes = 0;
-            for (suffix, shape, values) in [
-                ("weight", stored_shape.to_vec(), weight),
-                ("bias", vec![width as usize], bias),
+            for (prefix, stored_shape) in [
+                (
+                    "model.vision_tower.embeddings.patch_embedding",
+                    vec![1152usize, 3, 14, 14],
+                ),
+                (
+                    "model.visual.patch_embed.proj",
+                    vec![1152usize, 3, 2, 16, 16],
+                ),
             ] {
-                let name = format!("{prefix}.{suffix}");
-                let size = values.len() * size_of::<bf16>();
-                tensors.insert(name.clone(), StoredTensor::Bf16(s.clone_htod(&values)?));
-                entries.insert(
-                    name,
-                    TensorEntry {
-                        dtype: safetensors::Dtype::BF16,
-                        shape,
-                        shard: "patch-fixture.safetensors".into(),
-                        bytes: size,
-                        load: true,
-                        data_start: 0,
-                        data_offsets: [0, size as u64],
-                        scope: TensorScope::Vision,
-                        layer: None,
-                        role: suffix.into(),
-                        scale_name: None,
-                    },
-                );
-                bytes += size;
-            }
-            let mut catalog = WeightCatalog {
-                linear_format: crate::model_spec::LinearFormat::Bf16,
-                tensors,
-                manifest: TensorManifest {
-                    entries,
-                    resident_bytes: bytes,
-                },
-                bytes,
-                upload_content_sha256: None,
-                upload_hashed_bytes: None,
-                load_wall_ms: 0.0,
-            };
-            let patch = BiasedWeight::take(
-                &mut catalog,
-                prefix,
-                [width, input],
-                &stored_shape,
-                Architecture::MiniCpmV47,
-            )?;
-            for rows in [1u32, 37, 1120, 7104] {
-                let mut host = vec![bf16::ZERO; (rows * input) as usize];
-                for row in host.chunks_exact_mut(input as usize) {
-                    row[..2].fill(bf16::ONE);
-                }
-                let x = s.clone_htod(&host)?;
-                let y = s.alloc_zeros::<bf16>((rows * width) as usize)?;
-                for mode in [
-                    LinearBiasMode::AfterOutputRound,
-                    LinearBiasMode::BeforeOutputRound,
-                    LinearBiasMode::AfterOutputRound,
-                ] {
-                    match mode {
-                        LinearBiasMode::AfterOutputRound => patch.prepare(s, &mut blas, rows)?,
-                        LinearBiasMode::BeforeOutputRound => blas.prepare_biased(
-                            rows,
-                            width,
-                            input,
-                            dense(&patch.bias, s, [width])?,
-                            mode,
-                        )?,
-                    }
-                    match mode {
-                        LinearBiasMode::AfterOutputRound => patch.run(
-                            s,
-                            &blas,
-                            dense(&x, s, [rows, input])?,
-                            &mut TensorMut(dense(&y, s, [rows, width])?),
-                        )?,
-                        LinearBiasMode::BeforeOutputRound => blas.linear_biased(
-                            dense(&patch.weight, s, [width, input])?,
-                            dense(&patch.bias, s, [width])?,
-                            dense(&x, s, [rows, input])?,
-                            &mut TensorMut(dense(&y, s, [rows, width])?),
-                            mode,
-                        )?,
-                    }
-                    let magnitude = match mode {
-                        LinearBiasMode::AfterOutputRound => 1.0,
-                        LinearBiasMode::BeforeOutputRound => 1.0 + 2.0 * half_ulp.to_f32(),
+                let width = stored_shape[0] as u32;
+                let input = stored_shape[1..].iter().product::<usize>() as u32;
+                let half_ulp = bf16::from_f32(bf16::EPSILON.to_f32() / 2.0);
+                let mut weight = vec![bf16::ZERO; (width * input) as usize];
+                let mut bias = Vec::with_capacity(width as usize);
+                for (column, values) in weight.chunks_exact_mut(input as usize).enumerate() {
+                    let sign = if column < width as usize / 2 {
+                        1.0
+                    } else {
+                        -1.0
                     };
-                    let wrong = s
-                        .clone_dtoh(&y)?
-                        .iter()
-                        .enumerate()
-                        .filter(|(index, value)| {
-                            let sign = if index % (width as usize) < width as usize / 2 {
+                    values[0] = bf16::from_f32(sign);
+                    values[1] = bf16::from_f32(sign * half_ulp.to_f32());
+                    bias.push(values[1]);
+                }
+                let mut tensors = BTreeMap::new();
+                let mut entries = BTreeMap::new();
+                let mut bytes = 0;
+                for (suffix, shape, values) in [
+                    ("weight", stored_shape.to_vec(), weight),
+                    ("bias", vec![width as usize], bias),
+                ] {
+                    let name = format!("{prefix}.{suffix}");
+                    let size = values.len() * size_of::<bf16>();
+                    tensors.insert(name.clone(), StoredTensor::Bf16(s.clone_htod(&values)?));
+                    entries.insert(
+                        name,
+                        TensorEntry {
+                            dtype: safetensors::Dtype::BF16,
+                            shape,
+                            shard: "patch-fixture.safetensors".into(),
+                            bytes: size,
+                            load: true,
+                            data_start: 0,
+                            data_offsets: [0, size as u64],
+                            scope: TensorScope::Vision,
+                            layer: None,
+                            role: suffix.into(),
+                            scale_name: None,
+                        },
+                    );
+                    bytes += size;
+                }
+                let mut catalog = WeightCatalog {
+                    linear_format: crate::model_spec::LinearFormat::Bf16,
+                    tensors,
+                    manifest: TensorManifest {
+                        entries,
+                        resident_bytes: bytes,
+                    },
+                    bytes,
+                    upload_content_sha256: None,
+                    upload_hashed_bytes: None,
+                    load_wall_ms: 0.0,
+                };
+                let patch =
+                    BiasedWeight::patch(&mut catalog, prefix, [width, input], &stored_shape)?;
+                let bias_pointer = patch.bias.device_ptr(s).0;
+                for rows in [1u32, 37, 1120, 7104] {
+                    let mut host = vec![bf16::ZERO; (rows * input) as usize];
+                    for row in host.chunks_exact_mut(input as usize) {
+                        row[..2].fill(bf16::ONE);
+                    }
+                    let x = s.clone_htod(&host)?;
+                    let y = s.alloc_zeros::<bf16>((rows * width) as usize)?;
+                    if rows == 1 {
+                        ensure!(
+                            patch
+                                .run(
+                                    s,
+                                    &blas,
+                                    dense(&x, s, [rows, input])?,
+                                    &mut TensorMut(dense(&y, s, [rows, width])?),
+                                )
+                                .is_err(),
+                            "unprepared patch projection executed after Ready"
+                        );
+                    }
+                    for mode in [
+                        LinearBiasMode::AfterOutputRound,
+                        LinearBiasMode::BeforeOutputRound,
+                        LinearBiasMode::AfterOutputRound,
+                    ] {
+                        match mode {
+                            LinearBiasMode::AfterOutputRound => {
+                                patch.prepare(s, &mut blas, rows)?
+                            }
+                            LinearBiasMode::BeforeOutputRound => blas.prepare_biased(
+                                rows,
+                                width,
+                                input,
+                                dense(&patch.bias, s, [width])?,
+                                mode,
+                            )?,
+                        }
+                        match mode {
+                            LinearBiasMode::AfterOutputRound => patch.run(
+                                s,
+                                &blas,
+                                dense(&x, s, [rows, input])?,
+                                &mut TensorMut(dense(&y, s, [rows, width])?),
+                            )?,
+                            LinearBiasMode::BeforeOutputRound => blas.linear_biased(
+                                dense(&patch.weight, s, [width, input])?,
+                                dense(&patch.bias, s, [width])?,
+                                dense(&x, s, [rows, input])?,
+                                &mut TensorMut(dense(&y, s, [rows, width])?),
+                                mode,
+                            )?,
+                        }
+                        let magnitude = match mode {
+                            LinearBiasMode::AfterOutputRound => 1.0,
+                            LinearBiasMode::BeforeOutputRound => 1.0 + 2.0 * half_ulp.to_f32(),
+                        };
+                        let wrong = s
+                            .clone_dtoh(&y)?
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, value)| {
+                                let sign = if index % (width as usize) < width as usize / 2 {
+                                    1.0
+                                } else {
+                                    -1.0
+                                };
+                                value.to_bits() != bf16::from_f32(sign * magnitude).to_bits()
+                            })
+                            .count();
+                        ensure!(
+                            patch.bias.device_ptr(s).0 == bias_pointer,
+                            "patch preparation moved the bias pointer"
+                        );
+                        patch_defects += usize::from(wrong != 0);
+                        println!(
+                            "{} vision_patch_bias_rounding projection={prefix} stored_shape={stored_shape:?} rows={rows} width={width} input={input} mode={mode:?} bit_mismatches={wrong}",
+                            if wrong == 0 { "PASS" } else { "DEFECT" }
+                        );
+                    }
+                    let expected: Vec<_> = (0..rows as usize * width as usize)
+                        .map(|i| {
+                            bf16::from_f32(if i % (width as usize) < width as usize / 2 {
                                 1.0
                             } else {
                                 -1.0
-                            };
-                            value.to_bits() != bf16::from_f32(sign * magnitude).to_bits()
+                            })
                         })
-                        .count();
-                    println!(
-                        "{} vision_patch_bias_rounding rows={rows} width={width} input={input} mode={mode:?} bit_mismatches={wrong}",
-                        if wrong == 0 { "PASS" } else { "DEFECT" }
-                    );
-                    ensure!(
-                        wrong == 0,
-                        "patch bias mode={mode:?}: rows={rows}, {wrong} wrong elements"
-                    );
+                        .collect();
+                    position_defects += patch_position_bits(
+                        &device,
+                        &mut blas,
+                        &patch,
+                        &host,
+                        &expected,
+                        (rows, input == PATCH, true),
+                    )?;
                 }
+            }
+        }
+        println!(
+            "VISION_PATCH_BIAS_SUMMARY layouts=2 row_shapes=4 request_modes=3 defects={patch_defects}"
+        );
+        {
+            let (input, width) = (1536u32, 1152u32);
+            let activation = |phase: usize, k: usize| ((k * 5 + phase * 7) % 23) as i32 - 11;
+            let coefficient = |phase: usize, k: usize| ((k * 11 + phase * 3) % 31) as i32 - 15;
+            ensure!(
+                input * 11 * 15 < 1 << 24,
+                "full-K dot exceeds FP32 exact integers"
+            );
+            let mut expected = vec![0u16; 23 * 31];
+            let mut truncated_differences = 0;
+            for rp in 0..23 {
+                for cp in 0..31 {
+                    let dot: i32 = (0..input as usize)
+                        .map(|k| activation(rp, k) * coefficient(cp, k))
+                        .sum();
+                    let short: i32 = (0..2).map(|k| activation(rp, k) * coefficient(cp, k)).sum();
+                    let bias = (cp as f32 - 15.0) / 8.0;
+                    let rounded = |value| {
+                        bf16::from_f32(bf16::from_f32(value as f32).to_f32() + bias).to_bits()
+                    };
+                    expected[rp * 31 + cp] = rounded(dot);
+                    truncated_differences += usize::from(rounded(dot) != rounded(short));
+                }
+            }
+            ensure!(
+                truncated_differences > 0,
+                "truncated-K patch control escaped"
+            );
+            println!(
+                "PASS VISION_PATCH_FULL_K_CONTROL truncated_k=2 differing_phases={truncated_differences}"
+            );
+            let weights: Vec<_> =
+                (0..width as usize * input as usize)
+                    .map(|i| {
+                        bf16::from_f32(
+                            coefficient((i / input as usize) % 31, i % input as usize) as f32
+                        )
+                    })
+                    .collect();
+            let weight = s.clone_htod(&weights)?;
+            let bias = s.clone_htod(
+                &(0..width as usize)
+                    .map(|c| bf16::from_f32(((c % 31) as f32 - 15.0) / 8.0))
+                    .collect::<Vec<_>>(),
+            )?;
+            let patch = BiasedWeight {
+                weight,
+                bias,
+                shape: [width, input],
+                bias_mode: LinearBiasMode::AfterOutputRound,
+            };
+            for rows in [1u32, 37, 1120, 7104] {
+                let host: Vec<_> = (0..rows as usize * input as usize)
+                    .map(|i| {
+                        bf16::from_f32(
+                            activation((i / input as usize) % 23, i % input as usize) as f32
+                        )
+                    })
+                    .collect();
+                let expected: Vec<_> = (0..rows as usize * width as usize)
+                    .map(|i| {
+                        bf16::from_bits(
+                            expected[(i / width as usize % 23) * 31 + i % width as usize % 31],
+                        )
+                    })
+                    .collect();
+                let wrong = patch_position_bits(
+                    &device,
+                    &mut blas,
+                    &patch,
+                    &host,
+                    &expected,
+                    (rows, true, false),
+                )?;
+                println!(
+                    "{} VISION_PATCH_FULL_K rows={rows} input={input} width={width} periods=23,31 bit_mismatches={wrong}",
+                    if wrong == 0 { "PASS" } else { "DEFECT" }
+                );
+                patch_defects += usize::from(wrong != 0);
             }
         }
         let input = 4608u32;
@@ -3416,6 +3798,174 @@ mod tests {
             }
         }
         closure.assert_ready()?;
+        println!("VISION_PATCH_POSITION_SUMMARY bit_mismatches={position_defects}");
+        ensure!(
+            patch_defects == 0 && position_defects == 0,
+            "VISION_PATCH_BIAS DEFECT cases={patch_defects} positioned={position_defects}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires exclusive sm89 vision window and the native Qwen checkpoint"]
+    fn vision_patch_operation_timing_gpu() -> Result<()> {
+        use crate::backend::cuda::{closure::Closure, ops::Ops};
+        use std::{path::PathBuf, rc::Rc, time::Instant};
+        ensure!(
+            std::env::var("FF_Q38_VISION_WINDOW").as_deref() == Ok("granted"),
+            "vision GPU window missing"
+        );
+        let directory =
+            PathBuf::from(std::env::var_os("FF_Q38_MODEL").context("model directory missing")?);
+        let output = PathBuf::from(
+            std::env::var_os("FF_Q38_VISION_OUTPUT_DIR")
+                .context("vision output directory missing")?,
+        );
+        std::fs::create_dir_all(&output)?;
+        let model = ModelSpec::read(&directory)?;
+        ensure!(
+            model.architecture == Architecture::Qwen35Text,
+            "patch timing requires the Qwen checkpoint"
+        );
+        let geometry = VisionGeometry::from_model(&model)?;
+        let vision = model
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        let stored_shape = [
+            vision.hidden as usize,
+            vision.channels as usize,
+            vision.temporal_patch as usize,
+            vision.patch as usize,
+            vision.patch as usize,
+        ];
+        ensure!(
+            stored_shape == [1152, 3, 2, 16, 16] && geometry.patch == 1536,
+            "patch timing checkpoint geometry mismatch"
+        );
+        let device = Device::new(0)?;
+        ensure!(device.info.arch == 89, "operator timing requires sm89");
+        let stream = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        let closure = Rc::new(Closure::new(false, "patch operation timing".into()));
+        let blas = Blas::new(&device, &ops, &output, closure.clone())?;
+        let mut catalog = WeightCatalog::load_with_policy(
+            &directory,
+            &model,
+            &device,
+            crate::checkpoint::LoadPolicy::VisionOnly,
+        )?;
+        let patch = BiasedWeight::patch(
+            &mut catalog,
+            "model.visual.patch_embed.proj",
+            [vision.hidden, geometry.patch],
+            &stored_shape,
+        )?;
+        let position = take(
+            &mut catalog,
+            "model.visual.pos_embed.weight",
+            &[2304, vision.hidden as usize],
+        )?;
+        let io = VisionIo::new(&device, geometry.output())?;
+        drop(catalog);
+        for rows in [1u32, 37, 1120, 7104] {
+            blas.prepare_fixed(rows, vision.hidden, geometry.patch)?;
+        }
+        closure.freeze_fixed()?;
+        closure.ready(Instant::now())?;
+        device.finish_upload()?;
+        for (rows, h, w) in [(1u32, 2, 2), (37, 2, 20), (1120, 28, 40), (7104, 96, 74)] {
+            let input: Vec<_> = (0..rows as usize * geometry.patch as usize)
+                .map(|index| bf16::from_f32(((index * 17 % 251) as f32 - 125.0) / 128.0))
+                .collect();
+            let input = stream.clone_htod(&input)?;
+            let output = stream.alloc_zeros::<bf16>(rows as usize * vision.hidden as usize)?;
+            let tables = VisionPositions::new(
+                vision,
+                model.architecture,
+                &[ImageGrid { t: 1, h, w }],
+                (h * w) as usize,
+            )?;
+            let indices: Vec<_> = tables
+                .bilinear_indices
+                .iter()
+                .flat_map(|corner| corner[..rows as usize].iter().copied())
+                .collect();
+            let coefficients: Vec<_> = tables
+                .bilinear_weights
+                .iter()
+                .flat_map(|corner| corner[..rows as usize].iter().copied())
+                .collect();
+            let indices = stream.clone_htod(&indices)?;
+            let bilinear = BilinearTables {
+                coefficients: stream.clone_htod(&coefficients)?,
+                values: stream.alloc_zeros(rows as usize * vision.hidden as usize)?,
+            };
+            let hidden = stream.alloc_zeros::<bf16>(rows as usize * vision.hidden as usize)?;
+            let execute = || {
+                io.project_position(
+                    stream,
+                    &blas,
+                    PatchPositionBindings {
+                        patch: &patch,
+                        position: &position,
+                        indices: &indices,
+                        bilinear: Some(&bilinear),
+                        packed: &input,
+                        patch_output: &output,
+                        hidden: &hidden,
+                        trace_patches: false,
+                    },
+                )
+            };
+            execute()?;
+            let reference = stream.clone_dtoh(&hidden)?;
+            ensure!(
+                reference.iter().all(|value| value.is_finite()),
+                "nonfinite native patch output"
+            );
+            for graph in [false, true] {
+                let captured = if graph {
+                    stream.begin_capture(
+                        cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                    )?;
+                    let result = execute();
+                    let captured =
+                        stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    result?;
+                    Some(captured?.context("empty patch operation graph")?)
+                } else {
+                    None
+                };
+                let mean_ms = crate::backend::cuda::time_prepared_operation(
+                    stream,
+                    || Ok(()),
+                    || {
+                        if let Some(graph) = &captured {
+                            graph.launch()?;
+                            Ok(())
+                        } else {
+                            execute()
+                        }
+                    },
+                )?;
+                ensure!(
+                    stream
+                        .clone_dtoh(&hidden)?
+                        .iter()
+                        .zip(&reference)
+                        .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+                    "patch operation replay changed rows={rows} graph={graph}"
+                );
+                println!(
+                    "T20_OP_SAMPLE {}",
+                    serde_json::json!({"operation":"patch","mode":"projection_bias_position",
+                        "rows":rows,"valid":rows,"graph":graph,"warm":16,"calls":32,
+                        "mean_ms":mean_ms,"native_weights":true,"bias_mode":format!("{:?}",patch.bias_mode)})
+                );
+            }
+        }
+        closure.assert_ready()?;
         Ok(())
     }
 
@@ -3424,7 +3974,7 @@ mod tests {
     fn vision_tower_gpu() -> Result<()> {
         use crate::backend::cuda::{closure::Closure, ops::Ops};
         use safetensors::{Dtype, SafeTensors};
-        use std::{path::PathBuf, rc::Rc};
+        use std::{path::PathBuf, rc::Rc, time::Instant};
         ensure!(
             std::env::var("FF_Q38_VISION_WINDOW").as_deref() == Ok("granted"),
             "vision GPU window missing"
@@ -3444,12 +3994,8 @@ mod tests {
         let s = &device.stream;
         let common = CommonOpsRef::new(&device.ctx)?;
         let ops = Ops::new(&device.ctx)?;
-        let mut blas = Blas::new(
-            &device,
-            &ops,
-            &output,
-            Rc::new(Closure::new(false, "vision prefix diagnostic".into())),
-        )?;
+        let closure = Rc::new(Closure::new(false, "vision prefix diagnostic".into()));
+        let mut blas = Blas::new(&device, &ops, &output, closure.clone())?;
         let mut catalog = WeightCatalog::load_with_policy(
             &model_dir,
             &model,
@@ -3465,6 +4011,8 @@ mod tests {
             catalog.tensors.is_empty(),
             "vision binding left unloaded owners"
         );
+        closure.freeze_fixed()?;
+        closure.ready(Instant::now())?;
         for case in ["img-report", "img-nonsquare", "img-marker", "img-tiny"] {
             let file = std::fs::File::open(fixtures.join(format!("{case}.safetensors")))?;
             let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
@@ -3523,6 +4071,8 @@ mod tests {
                 "VISION_TOWER_DIAGNOSTIC {case} rows={rows} written; numerical verdict requires per-stage reference checks"
             );
         }
+        closure.assert_ready()?;
+        eprintln!("VISION_REQUEST_BINDINGS PASS cases=4 after_ready=true");
         Ok(())
     }
 }

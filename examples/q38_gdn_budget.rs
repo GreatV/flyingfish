@@ -18,7 +18,7 @@ fn main() -> Result<()> {
     let rows = args[2].parse::<u32>().context("invalid row capacity")?;
     let policy = GdnPolicy::for_device(arch, sms);
     let spec = GdnSpec::q38();
-    let legacy = GdnWorkspace::new(&spec, rows)?;
+    let legacy = GdnWorkspace::new(&spec, rows, false)?;
     let workspace = policy.workspace(&spec, rows)?;
     println!(
         "{}",

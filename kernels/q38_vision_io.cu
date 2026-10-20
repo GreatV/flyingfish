@@ -20,13 +20,14 @@ extern "C" __global__ void q38_vision_cast_patches(
     }
 }
 
-// Corner-major indices/weights. Interpolation is FP32; cast before the BF16 add.
+// FP32 interpolation casts before position addition; optional bias rounds in BF16 first.
 extern "C" __global__ void q38_vision_position_add(
     const __nv_bfloat16* table, const int32_t* indices, const float* weights,
-    const __nv_bfloat16* patches, __nv_bfloat16* hidden, float* interpolated,
+    const __nv_bfloat16* patches, const __nv_bfloat16* bias,
+    __nv_bfloat16* trace_patches, __nv_bfloat16* hidden, float* interpolated,
     uint32_t rows) {
     if (!flat_launch() || !table || !indices || !weights || !patches ||
-        !hidden || !interpolated || !rows) { __trap(); return; }
+        !hidden || !interpolated || !rows || (trace_patches && !bias)) { __trap(); return; }
     uint64_t count = uint64_t(rows) * 1152;
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x;
          i < count; i += uint64_t(gridDim.x) * 256) {
@@ -42,7 +43,9 @@ extern "C" __global__ void q38_vision_position_add(
         }
         if (!isfinite(sum)) { __trap(); return; }
         interpolated[i] = sum;
-        hidden[i] = __hadd(patches[i], __float2bfloat16_rn(sum));
+        const __nv_bfloat16 patch = bias ? __hadd(patches[i], bias[d]) : patches[i];
+        if (trace_patches) trace_patches[i] = patch;
+        hidden[i] = __hadd(patch, __float2bfloat16_rn(sum));
     }
 }
 

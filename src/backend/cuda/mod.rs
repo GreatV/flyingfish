@@ -112,4 +112,35 @@ pub(crate) fn bf16_chain_bound(roundings: u32, reductions: &[usize]) -> f64 {
 }
 
 #[cfg(test)]
+pub(crate) fn time_prepared_operation(
+    stream: &Arc<CudaStream>,
+    mut reset: impl FnMut() -> Result<()>,
+    mut operation: impl FnMut() -> Result<()>,
+) -> Result<f64> {
+    for _ in 0..16 {
+        reset()?;
+        operation()?;
+    }
+    stream.synchronize()?;
+    let flags = cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+    let start = stream.context().new_event(Some(flags))?;
+    let end = stream.context().new_event(Some(flags))?;
+    let mut total = 0.0;
+    for _ in 0..32 {
+        reset()?;
+        start.record(stream)?;
+        operation()?;
+        end.record(stream)?;
+        stream.synchronize()?;
+        let elapsed = f64::from(start.elapsed_ms(&end)?);
+        ensure!(
+            elapsed.is_finite() && elapsed > 0.0,
+            "invalid prepared operation elapsed_ms={elapsed}"
+        );
+        total += elapsed;
+    }
+    Ok(total / 32.0)
+}
+
+#[cfg(test)]
 mod q38_tests;

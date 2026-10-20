@@ -4,7 +4,7 @@
 //! dk = dv = 128, conv width 4, history width 3, chunk 32, FP32 tiles. Kernels are in `kernels/gdn/`.
 //!
 //! `run` issues the whole mixer between the `qkv`/`a`/`b` projections and the ungated
-//! `core_out` on one stream; GdnSpec binds Q/K precision, and gates use [`CommonOpsRef`].
+//! `core_out` on one stream; Q/K normalization uses FP32 before expansion.
 //!
 //! `hist_update` is a separate launch after conv; conv blocks read `history[]` to seed their window.
 //!
@@ -32,7 +32,7 @@ pub(crate) fn take_phase_log() -> Vec<&'static str> {
 
 use super::contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut};
 use super::cubin;
-use super::ops::{CommonOpsRef, GdnGateBindings};
+use super::ops::GdnGateBindings;
 use crate::gdn_plan::{
     CW_P2_CHUNK, CW_P2_VALUE_BLOCK, GdnPolicy, GdnWorkspace, Region, add, cw_p2, cw_p2_bytes, mul,
 };
@@ -88,6 +88,7 @@ pub(crate) struct GdnBindings {
 struct Kernels {
     gate: CudaFunction,
     conv: CudaFunction,
+    conv_l2: Option<[CudaFunction; 2]>,
     hist_update: CudaFunction,
     prep: CudaFunction,
     beta_widen: CudaFunction,
@@ -105,6 +106,28 @@ struct Kernels {
 struct ChunkwiseP2 {
     a: CudaFunction,
     h: CudaFunction,
+}
+
+fn bind_conv(
+    kernels: &Kernels,
+    spec: &GdnSpec,
+    rows: u32,
+    sms: u32,
+    compact: bool,
+) -> Result<(CudaFunction, u32)> {
+    let qk_blocks = 2 * spec.hk * spec.dk / CONV_CHAN;
+    let narrow = compact
+        && qk_blocks * rows.div_ceil(CONV_ROWS) < sms
+        && rows.div_ceil(8) > rows.div_ceil(CONV_ROWS);
+    let function = if compact {
+        &kernels
+            .conv_l2
+            .as_ref()
+            .context("compact GDN convolution not bound")?[usize::from(narrow)]
+    } else {
+        &kernels.conv
+    };
+    Ok((function.clone(), if narrow { 8 } else { CONV_ROWS }))
 }
 
 /// Chunkwise-P2 launch configs for a plan bound at `rows`: stage A one CTA per (chunk, head)
@@ -132,6 +155,7 @@ fn prep_grids(
     beta_cfg: LaunchConfig,
     conv_cfg: LaunchConfig,
     rows: u32,
+    conv_rows: u32,
 ) -> Result<(LaunchConfig, LaunchConfig, LaunchConfig)> {
     ensure!(
         rows <= CUDA_GRID_YZ_MAX,
@@ -142,7 +166,7 @@ fn prep_grids(
     let mut beta_cfg = beta_cfg;
     beta_cfg.grid_dim.1 = rows;
     let mut conv_cfg = conv_cfg;
-    conv_cfg.grid_dim.1 = rows.div_ceil(CONV_ROWS);
+    conv_cfg.grid_dim.1 = rows.div_ceil(conv_rows);
     Ok((prep_cfg, beta_cfg, conv_cfg))
 }
 
@@ -150,12 +174,13 @@ pub(crate) struct GdnPlan {
     spec: GdnSpec,
     snapshots: Option<(Tensor<f32, 4>, Tensor<f32, 3>)>,
     kernels: Arc<Kernels>,
+    conv: CudaFunction,
+    sms: u32,
     bindings: GdnBindings,
-    common: CommonOpsRef,
     ws: GdnWorkspace,
     /// The single derivation of `conv_dim`, asserted against the kernel constant.
     conv_dim: u32,
-    /// `GdnSpec::l2_eps`, used for the Q/K `l2_heads` calls.
+    /// `GdnSpec::l2_eps`, used by FP32 Q/K normalization.
     l2_eps: f32,
     max_rows: u32,
     prep_cfg: LaunchConfig,
@@ -171,7 +196,7 @@ pub(crate) struct GdnPlan {
     ws_p2: u64,
 }
 
-/// Q/K precision follows GdnSpec; V is the BF16 conv_out column window at v_row_stride.
+/// Q/K are expanded FP32; V is the BF16 conv_out column window at v_row_stride.
 #[derive(Copy, Clone)]
 pub(crate) struct P2Sources {
     pub q: u64,
@@ -233,16 +258,25 @@ impl GdnPlan {
             history: TensorMut(b.history.read()),
         };
         check_bindings(&bindings, rows, self.conv_dim, self.spec.hv)?;
-        let (prep_cfg, beta_cfg, conv_cfg) =
-            prep_grids(self.prep_cfg, self.beta_cfg, self.conv_cfg, rows)?;
         let cw_p2 = snapshots.is_none() && self.cw_p2 && rows > crate::gdn_plan::MIN_VERIFY_ROWS;
+        let ws = GdnWorkspace::new(&self.spec, rows, cw_p2)?;
+        let (conv, conv_rows) = bind_conv(
+            &self.kernels,
+            &self.spec,
+            rows,
+            self.sms,
+            ws.q_bf16.bytes > 0,
+        )?;
+        let (prep_cfg, beta_cfg, conv_cfg) =
+            prep_grids(self.prep_cfg, self.beta_cfg, self.conv_cfg, rows, conv_rows)?;
         Ok(Self {
             spec: self.spec,
             snapshots,
             kernels: self.kernels.clone(),
+            conv,
+            sms: self.sms,
             bindings,
-            common: self.common.clone(),
-            ws: GdnWorkspace::new(&self.spec, rows)?,
+            ws,
             conv_dim: self.conv_dim,
             l2_eps: self.l2_eps,
             max_rows: rows,
@@ -296,10 +330,16 @@ impl GdnPlan {
             v_row_stride: src.v_row_stride,
         };
         let (a_cfg, h_cfg) = cw_p2_grids(rows, self.spec.hv);
+        let compact = self.ws.q_bf16.bytes > 0;
+        let a_query = if compact {
+            ws + self.ws.q_bf16.offset
+        } else {
+            stage.q
+        };
+        let a_key = ws + self.ws.k_bf16.offset;
         unsafe {
-            stream
-                .launch_builder(&p2.a)
-                .arg(&stage.q)
+            let mut a = stream.launch_builder(&p2.a);
+            a.arg(&a_query)
                 .arg(&stage.k)
                 .arg(&stage.v)
                 .arg(&stage.beta)
@@ -307,8 +347,11 @@ impl GdnPlan {
                 .arg(&stage.ws)
                 .arg(&stage.meta)
                 .arg(&stage.valid_rows)
-                .arg(&stage.v_row_stride)
-                .launch(a_cfg)?;
+                .arg(&stage.v_row_stride);
+            if compact {
+                a.arg(&a_key);
+            }
+            a.launch(a_cfg)?;
             stream
                 .launch_builder(&p2.h)
                 .arg(&stage.q)
@@ -346,11 +389,11 @@ impl GdnOps {
         spec: &GdnSpec,
         max_rows: u32,
         bindings: GdnBindings,
-        common: CommonOpsRef,
         cw_p2: bool,
     ) -> Result<GdnPlan> {
         spec.validate()?;
-        let ws = GdnWorkspace::new(spec, max_rows)?;
+        let ws = GdnWorkspace::new(spec, max_rows, cw_p2)?;
+        let compact = ws.q_bf16.bytes > 0;
         let conv_dim = spec.conv_dim()?;
         let suffix = spec.kernel_suffix()?;
         let compiled_width = match suffix {
@@ -366,6 +409,9 @@ impl GdnOps {
         check_bindings(&bindings, max_rows, conv_dim, spec.hv)?;
 
         use cudarc::driver::sys::CUdevice_attribute as Attribute;
+        let sms =
+            u32::try_from(ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)?;
+        ensure!(sms > 0, "GDN device has no multiprocessors");
         let optin =
             ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)? as u64;
         for (name, bytes) in [
@@ -386,11 +432,7 @@ impl GdnOps {
         let recurrent_mod = module("gdn_recurrent")?;
         let f_conv = conv.load_function("gdn_conv")?;
         let f_hist = conv.load_function("gdn_conv_hist_update")?;
-        let f_prep = prep_mod.load_function(if spec.qk_norm_fp32 {
-            "gdn_prep_l2_fp32"
-        } else {
-            "gdn_prep_fp32"
-        })?;
+        let f_prep = prep_mod.load_function("gdn_prep_l2_fp32")?;
         let f_beta = prep_mod.load_function("gdn_beta_widen")?;
         let f_chunked = chunked_mod.load_function("gdn_chunked_core_v1")?;
         let f_recurrent = recurrent_mod.load_function("gdn_recurrent_core_v2")?;
@@ -423,7 +465,11 @@ impl GdnOps {
         let p2 = if !cw_p2 {
             None
         } else {
-            let p2_mod = module("gdn_cw_p2")?;
+            let p2_mod = module(if compact {
+                "gdn_cw_p2_compact"
+            } else {
+                "gdn_cw_p2"
+            })?;
             Some(ChunkwiseP2 {
                 a: p2_mod.load_function("gdn_cw_p2_stage_a")?,
                 h: p2_mod.load_function("gdn_cw_p2_stage_h")?,
@@ -435,6 +481,14 @@ impl GdnOps {
             core_snapshot,
             rstep,
             conv: f_conv,
+            conv_l2: if compact {
+                Some([
+                    conv.load_function("gdn_conv_l2_compact")?,
+                    conv.load_function("gdn_conv_l2_compact_rows8")?,
+                ])
+            } else {
+                None
+            },
             hist_update: f_hist,
             prep: f_prep,
             beta_widen: f_beta,
@@ -442,14 +496,11 @@ impl GdnOps {
             recurrent: f_recurrent,
             p2,
         };
+        let (conv, conv_rows) = bind_conv(&kernels, spec, max_rows, sms, compact)?;
         // Grids derive from the bound rows, never from device valid_rows.
         let (prep_cfg, beta_cfg, conv_cfg) = prep_grids(
             LaunchConfig {
-                grid_dim: (
-                    DV.div_ceil(PREP_THREADS),
-                    if spec.qk_norm_fp32 { spec.hk } else { spec.hv },
-                    1,
-                ),
+                grid_dim: (DV.div_ceil(PREP_THREADS), spec.hk, 1),
                 block_dim: (PREP_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             },
@@ -464,13 +515,15 @@ impl GdnOps {
                 shared_mem_bytes: 0,
             },
             max_rows,
+            conv_rows,
         )?;
         Ok(GdnPlan {
             spec: *spec,
             snapshots: None,
             kernels: Arc::new(kernels),
+            conv,
+            sms,
             bindings,
-            common,
             ws,
             conv_dim,
             l2_eps: spec.l2_eps,
@@ -578,19 +631,11 @@ impl GdnOps {
         let v_off = add(k_off, u64::from(plan.spec.hk * plan.spec.dk) * el_bf)?;
 
         let conv_out = ws_bf16(plan.ws.conv_out, ws_ptr, rows, cd)?;
-        let mut normalized = if plan.spec.qk_norm_fp32 {
-            None
-        } else {
-            Some((
-                ws_bf16_3(plan.ws.q_bf16, ws_ptr, rows, plan.spec.hk, plan.spec.dk)?,
-                ws_bf16_3(plan.ws.k_bf16, ws_ptr, rows, plan.spec.hk, plan.spec.dk)?,
-            ))
-        };
         let mut beta = ws_bf16(plan.ws.beta, ws_ptr, rows, plan.spec.hv)?;
         let beta_fp32 = ws_f32(plan.ws.beta_fp32, ws_ptr, rows, plan.spec.hv)?;
         let mut g = ws_f32(plan.ws.g, ws_ptr, rows, plan.spec.hv)?;
-        let q_fp32 = ws_f32_3(plan.ws.q_fp32, ws_ptr, rows, plan.spec.hv, plan.spec.dv)?;
-        let k_fp32 = ws_f32_3(plan.ws.k_fp32, ws_ptr, rows, plan.spec.hv, plan.spec.dv)?;
+        let q_fp32 = ws_f32_3(plan.ws.q_fp32, ws_ptr, rows, plan.ws.qk_heads, plan.spec.dk)?;
+        let k_fp32 = ws_f32_3(plan.ws.k_fp32, ws_ptr, rows, plan.ws.qk_heads, plan.spec.dk)?;
         let v_fp32 = ws_f32_3(plan.ws.v_fp32, ws_ptr, rows, plan.spec.hv, plan.spec.dv)?;
 
         let dom = RowDomain {
@@ -600,19 +645,33 @@ impl GdnOps {
         };
         let l2_eps = plan.l2_eps;
         let conv_ptr = conv_out.0.ptr;
+        let compact = plan.ws.q_bf16.bytes > 0;
 
         // conv: qkv -> conv_out with the exact SiLU; the conv output is cast to BF16 and back
         // before silu() (ABI §5).
         unsafe {
-            stream
-                .launch_builder(&plan.kernels.conv)
-                .arg(&b.qkv.ptr)
+            let q_bf16 = ws_ptr + plan.ws.q_bf16.offset;
+            let k_bf16 = ws_ptr + plan.ws.k_bf16.offset;
+            if compact {
+                ws_region(plan.ws.q_bf16, rows, plan.ws.qk_heads * DK, 2)?;
+                ws_region(plan.ws.k_bf16, rows, plan.ws.qk_heads * DK, 2)?;
+            }
+            let cd_i32 = cd as i32;
+            let mut conv = stream.launch_builder(&plan.conv);
+            conv.arg(&b.qkv.ptr)
                 .arg(&b.conv_weight.ptr)
                 .arg(&b.history.0.ptr)
                 .arg(&conv_ptr)
                 .arg(&meta.ptr)
-                .arg(&(cd as i32))
-                .launch(plan.conv_cfg)?;
+                .arg(&cd_i32);
+            if compact {
+                conv.arg(&q_fp32.0.ptr)
+                    .arg(&k_fp32.0.ptr)
+                    .arg(&q_bf16)
+                    .arg(&k_bf16)
+                    .arg(&l2_eps);
+            }
+            conv.launch(plan.conv_cfg)?;
             // hist_update: after conv, same stream.
             if let Some((_, history)) = snapshots {
                 stream
@@ -633,22 +692,6 @@ impl GdnOps {
                     .launch(plan.hist_cfg)?;
             }
         }
-        if let Some((q_bf16, k_bf16)) = normalized.as_mut() {
-            plan.common.norm.l2_heads(
-                stream,
-                dom,
-                as3(conv_ptr, rows, plan.spec.hk, cd, span, q_off)?,
-                q_bf16,
-                l2_eps,
-            )?;
-            plan.common.norm.l2_heads(
-                stream,
-                dom,
-                as3(conv_ptr, rows, plan.spec.hk, cd, span, k_off)?,
-                k_bf16,
-                l2_eps,
-            )?;
-        }
         // common gdn_gates: beta BF16, g FP32.
         super::ops::GateOps::gdn_gates_with(
             &plan.kernels.gate,
@@ -665,14 +708,8 @@ impl GdnOps {
         )?;
         // V is read in place from its conv_out columns through the validated window helper.
         let v_bf16 = as3(conv_ptr, rows, plan.spec.hv, cd, span, v_off)?;
-        let (q, k) = if plan.spec.qk_norm_fp32 {
-            (conv_ptr + q_off, conv_ptr + k_off)
-        } else {
-            let (q_bf16, k_bf16) = normalized
-                .as_ref()
-                .context("GDN BF16 normalization workspace missing")?;
-            (q_bf16.0.ptr, k_bf16.0.ptr)
-        };
+        let q = conv_ptr + q_off;
+        let k = conv_ptr + k_off;
         // Exact widens; the cores read `beta` as FP32.
         unsafe {
             stream
@@ -682,23 +719,23 @@ impl GdnOps {
                 .arg(&meta.ptr)
                 .launch(plan.beta_cfg)?;
             // Q/K expand to value heads; Q is scaled by 1/sqrt(dk).
-            if plan.spec.qk_norm_fp32 || !plan.cw_p2 {
-                let v = if plan.cw_p2 { 0 } else { v_fp32.0.ptr };
-                let mut prep = stream.launch_builder(&plan.kernels.prep);
-                prep.arg(&q)
+            let v = if plan.cw_p2 { 0 } else { v_fp32.0.ptr };
+            if !compact {
+                stream
+                    .launch_builder(&plan.kernels.prep)
+                    .arg(&q)
                     .arg(&k)
                     .arg(&v_bf16.ptr)
                     .arg(&q_fp32.0.ptr)
                     .arg(&k_fp32.0.ptr)
                     .arg(&v)
                     .arg(&cd)
-                    .arg(&meta.ptr);
-                if plan.spec.qk_norm_fp32 {
-                    prep.arg(&l2_eps);
-                }
-                prep.launch(plan.prep_cfg)?;
+                    .arg(&meta.ptr)
+                    .arg(&l2_eps)
+                    .launch(plan.prep_cfg)?;
             }
         }
+
         // The core is selected by phase, never by a host valid_rows. The launch builder must be one
         // expression: it borrows the stream.
         #[cfg(test)]
@@ -716,16 +753,8 @@ impl GdnOps {
                         meta,
                         scratch,
                         P2Sources {
-                            q: if plan.spec.qk_norm_fp32 {
-                                q_fp32.0.ptr
-                            } else {
-                                q
-                            },
-                            k: if plan.spec.qk_norm_fp32 {
-                                k_fp32.0.ptr
-                            } else {
-                                k
-                            },
+                            q: q_fp32.0.ptr,
+                            k: k_fp32.0.ptr,
                             v: v_bf16.ptr,
                             v_row_stride: cd,
                         },
@@ -845,17 +874,6 @@ fn ws_bf16(r: Region, ptr: u64, rows: u32, cols: u32) -> Result<TensorMut<bf16, 
     ws_region(r, rows, cols, size_of::<bf16>() as u64)?;
     unsafe { TensorMut::new(ptr + r.offset, [rows, cols], [u64::from(cols), 1], r.bytes) }
 }
-fn ws_bf16_3(r: Region, ptr: u64, rows: u32, h: u32, d: u32) -> Result<TensorMut<bf16, 3>> {
-    ws_region(r, rows, h * d, size_of::<bf16>() as u64)?;
-    unsafe {
-        TensorMut::new(
-            ptr + r.offset,
-            [rows, h, d],
-            [u64::from(h * d), u64::from(d), 1],
-            r.bytes,
-        )
-    }
-}
 fn ws_f32(r: Region, ptr: u64, rows: u32, cols: u32) -> Result<TensorMut<f32, 2>> {
     ws_region(r, rows, cols, size_of::<f32>() as u64)?;
     unsafe { TensorMut::new(ptr + r.offset, [rows, cols], [u64::from(cols), 1], r.bytes) }
@@ -930,7 +948,7 @@ fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32, hv: u32) -> Result<
 #[cfg(test)]
 mod tests {
     use super::prep_grids;
-    use cudarc::driver::LaunchConfig;
+    use cudarc::driver::{DevicePtr, LaunchConfig, sys};
 
     fn cfg(d: (u32, u32, u32)) -> LaunchConfig {
         LaunchConfig {
@@ -944,8 +962,8 @@ mod tests {
     fn every_prep_grid_is_a_function_of_the_live_rows_alone() -> Result<()> {
         let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
         for rows in [5u32, 7, 1021, 2047, 2048] {
-            let (prep, beta, conv) = prep_grids(full.0, full.1, full.2, rows)?;
-            assert_eq!(prep.grid_dim.2, rows, "gdn_prep_fp32 grid z");
+            let (prep, beta, conv) = prep_grids(full.0, full.1, full.2, rows, CONV_ROWS)?;
+            assert_eq!(prep.grid_dim.2, rows, "GDN FP32 L2 prep grid z");
             assert_eq!(beta.grid_dim.1, rows, "gdn_beta_widen grid y");
             assert_eq!(
                 conv.grid_dim.1,
@@ -966,8 +984,8 @@ mod tests {
     #[test]
     fn a_narrower_step_never_widens_a_grid() -> Result<()> {
         let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
-        let (wide, _, _) = prep_grids(full.0, full.1, full.2, 2048)?;
-        let (narrow, _, _) = prep_grids(full.0, full.1, full.2, 1021)?;
+        let (wide, _, _) = prep_grids(full.0, full.1, full.2, 2048, CONV_ROWS)?;
+        let (narrow, _, _) = prep_grids(full.0, full.1, full.2, 1021, CONV_ROWS)?;
         assert!(narrow.grid_dim.2 < wide.grid_dim.2);
         Ok(())
     }
@@ -975,8 +993,8 @@ mod tests {
     #[test]
     fn rows_beyond_the_cuda_grid_yz_limit_are_rejected() -> Result<()> {
         let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
-        prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX)?;
-        let rejected = prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX + 1)
+        prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX, CONV_ROWS)?;
+        let rejected = prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX + 1, CONV_ROWS)
             .expect_err("rows above the CUDA gridDim.y/z limit must not form a launch");
         assert!(rejected.to_string().contains("gridDim"), "{rejected}");
         Ok(())
@@ -994,23 +1012,15 @@ mod tests {
         out: cudarc::driver::CudaSlice<bf16>,
         state: cudarc::driver::CudaSlice<f32>,
         history: cudarc::driver::CudaSlice<f32>,
-    }
-
-    fn logical_head(head: usize, heads: usize) -> usize {
-        if heads == 48 {
-            (head / 3) * 2 + (head % 3).min(1)
-        } else {
-            head
-        }
+        snapshots: Option<(
+            cudarc::driver::CudaSlice<f32>,
+            cudarc::driver::CudaSlice<f32>,
+        )>,
     }
 
     fn geometry_state(heads: usize) -> Vec<f32> {
         (0..heads * 128 * 128)
-            .map(|i| {
-                let h = logical_head(i / (128 * 128), heads);
-                let index = h * 128 * 128 + i % (128 * 128);
-                ((index * 19 % 127) as f32 - 63.0) / 512.0
-            })
+            .map(|i| ((i * 19 % 251) as f32 - 125.0) / 1024.0)
             .collect()
     }
 
@@ -1042,28 +1052,30 @@ mod tests {
         fn new(stream: &Arc<CudaStream>, spec: GdnSpec, rows: u32, valid: u32) -> Result<Self> {
             let hv = spec.hv as usize;
             let cd = spec.conv_dim()? as usize;
-            let channel = |c: usize| {
-                if c < 4096 {
-                    c
-                } else {
-                    4096 + logical_head((c - 4096) / 128, hv) * 128 + c % 128
-                }
+            let pattern = |i: usize, period: usize| {
+                bf16::from_f32(((i % period) as f32 - (period / 2) as f32) / 512.0)
             };
-            let pattern = |i: usize| bf16::from_f32(((i % 53) as f32 - 26.0) / 64.0);
+            let period = |c: usize| if c < 2048 { 251 } else { 257 };
+            let zero_head = |c: usize| c < 4096 && c % 2048 < 128;
             let qkv: Vec<_> = (0..rows as usize * cd)
                 .map(|i| {
                     if i / cd < valid as usize {
-                        pattern((i / cd) * 17 + channel(i % cd) * 11)
+                        let c = i % cd;
+                        if zero_head(c) {
+                            bf16::ZERO
+                        } else {
+                            pattern((i / cd) * 17 + c * 11, period(c))
+                        }
                     } else {
                         bf16::NAN
                     }
                 })
                 .collect();
-            let gates = |shift| {
+            let gates = |shift, prime| {
                 (0..rows as usize * hv)
                     .map(|i| {
                         if i / hv < valid as usize {
-                            pattern((i / hv) * 7 + logical_head(i % hv, hv) * 13 + shift)
+                            pattern((i / hv) * 7 + (i % hv) * 13 + shift, prime)
                         } else {
                             bf16::NAN
                         }
@@ -1071,26 +1083,58 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             let conv: Vec<_> = (0..cd * 4)
-                .map(|i| pattern(channel(i / 4) * 5 + i % 4))
+                .map(|i| pattern((i / 4) * 5 + i % 4, period(i / 4)))
                 .collect();
             let a_log: Vec<_> = (0..hv)
-                .map(|h| bf16::from_f32(-3.0 + logical_head(h, hv) as f32 / 128.0))
+                .map(|h| bf16::from_f32(-3.0 + h as f32 / 128.0))
                 .collect();
-            let dt: Vec<_> = (0..hv).map(|h| pattern(logical_head(h, hv) * 3)).collect();
+            let dt: Vec<_> = (0..hv).map(|h| pattern(h * 3, 251)).collect();
             let history: Vec<_> = (0..cd * 3)
-                .map(|i| pattern(channel(i / 3) * 23 + i % 3).to_f32())
+                .map(|i| {
+                    if zero_head(i / 3) {
+                        0.0
+                    } else {
+                        pattern((i / 3) * 23 + i % 3, period(i / 3)).to_f32()
+                    }
+                })
                 .collect();
             Ok(Self {
                 qkv: stream.clone_htod(&qkv)?,
-                a: stream.clone_htod(&gates(0))?,
-                b: stream.clone_htod(&gates(19))?,
+                a: stream.clone_htod(&gates(0, 251))?,
+                b: stream.clone_htod(&gates(19, 257))?,
                 conv: stream.clone_htod(&conv)?,
                 a_log: stream.clone_htod(&a_log)?,
                 dt: stream.clone_htod(&dt)?,
                 out: stream.clone_htod(&vec![bf16::from_bits(0x7fc5); rows as usize * hv * 128])?,
                 state: stream.clone_htod(&geometry_state(hv))?,
                 history: stream.clone_htod(&history)?,
+                snapshots: None,
             })
+        }
+
+        fn bind_snapshots(
+            &mut self,
+            stream: &Arc<CudaStream>,
+            spec: GdnSpec,
+        ) -> Result<(Tensor<f32, 4>, Tensor<f32, 3>)> {
+            ensure!(self.snapshots.is_none(), "geometry snapshots already bound");
+            let cd = spec.conv_dim()?;
+            let poison = f32::from_bits(0x7fc1_0001);
+            self.snapshots = Some((
+                stream.clone_htod(&vec![poison; 4 * spec.hv as usize * 128 * 128])?,
+                stream.clone_htod(&vec![poison; 4 * cd as usize * 3])?,
+            ));
+            let (state, history) = self.snapshots.as_ref().context("snapshots not allocated")?;
+            Ok((
+                geometry_view(
+                    state,
+                    stream,
+                    [4, spec.hv, 128, 128],
+                    [u64::from(spec.hv) * 128 * 128, 128 * 128, 128, 1],
+                    0,
+                )?,
+                geometry_view(history, stream, [4, cd, 3], [u64::from(cd) * 3, 3, 1], 0)?,
+            ))
         }
 
         fn bindings(
@@ -1154,6 +1198,9 @@ mod tests {
         prefix_states: Vec<f32>,
         prefix_histories: Vec<f32>,
         norm_ratio: f64,
+        snapshot_mismatches: usize,
+        p2_prepared: Vec<u8>,
+        p2_slots: Vec<u8>,
     }
 
     fn geometry_meta(
@@ -1182,6 +1229,7 @@ mod tests {
         Chunked,
         P1(u32),
         P2,
+        P2Expanded,
         WrongHeadStride,
     }
 
@@ -1196,29 +1244,36 @@ mod tests {
         use cudarc::driver::{DevicePtr, sys};
         let stream = &device.stream;
         let mut buffers = GeometryBuffers::new(stream, spec, rows, valid)?;
-        let p2 = matches!(core, GeometryCore::P2);
-        let bytes = GdnOps::workspace(
-            &spec,
-            rows,
-            if p2 { GdnPolicy::P2 } else { GdnPolicy::LEGACY },
-        )?
-        .bytes;
-        let workspace = stream.alloc_zeros::<u8>(bytes as usize)?;
+        let p2 = matches!(core, GeometryCore::P2 | GeometryCore::P2Expanded);
+        let compact_binding = p2 && !matches!(core, GeometryCore::P2Expanded);
+        let layout = GdnWorkspace::new(&spec, rows, compact_binding)?;
+        let bytes = add(
+            layout.bytes,
+            if p2 { cw_p2_bytes(spec.hv, rows) } else { 0 },
+        )?;
+        let mut workspace = stream.alloc_zeros::<u8>(bytes as usize)?;
         let ptr = workspace.device_ptr(stream).0;
-        let common = CommonOpsRef::new(&device.ctx)?;
-        let snapshots = if matches!(core, GeometryCore::Verify) {
-            let state = (spec.hv * DK * DV) as usize;
-            let history = (spec.conv_dim()? * spec.history_width) as usize;
-            let marker = f32::from_bits(0x7fc1_0001);
-            Some((
-                stream.clone_htod(&vec![marker; rows as usize * state])?,
-                stream.clone_htod(&vec![marker; rows as usize * history])?,
-            ))
-        } else {
-            None
-        };
         let mut plans = Vec::new();
         let sequential = matches!(core, GeometryCore::Recurrent);
+        if !sequential && valid < rows {
+            for (region, element_bytes) in [
+                (layout.q_fp32, 4),
+                (layout.k_fp32, 4),
+                (layout.q_bf16, 2),
+                (layout.k_bf16, 2),
+            ] {
+                if region.bytes == 0 {
+                    continue;
+                }
+                let live = valid as usize * layout.qk_heads as usize * 128 * element_bytes;
+                let start = region.offset as usize + live;
+                let end = (region.offset + region.bytes) as usize;
+                stream.memcpy_htod(
+                    &vec![0xa5u8; end - start],
+                    &mut workspace.slice_mut(start..end),
+                )?;
+            }
+        }
         for row in 0..if sequential { valid } else { 1 } {
             let bound = if sequential { 1 } else { rows };
             let meta = geometry_meta(stream, 23 + row, if sequential { 1 } else { valid })?;
@@ -1227,39 +1282,24 @@ mod tests {
                 &spec,
                 bound,
                 buffers.bindings(stream, spec, bound, row)?,
-                common.clone(),
-                p2,
+                compact_binding,
             )?;
-            if let Some((state, history)) = &snapshots {
-                let slots = rows - 1;
-                plan = plan.for_rows(
-                    rows,
-                    Some((
-                        geometry_view(
-                            state,
-                            stream,
-                            [slots, spec.hv, DK, DV],
-                            [
-                                u64::from(spec.hv * DK * DV),
-                                u64::from(DK * DV),
-                                u64::from(DV),
-                                1,
-                            ],
-                            0,
-                        )?,
-                        geometry_view(
-                            history,
-                            stream,
-                            [slots, spec.conv_dim()?, spec.history_width],
-                            [
-                                u64::from(spec.conv_dim()? * spec.history_width),
-                                u64::from(spec.history_width),
-                                1,
-                            ],
-                            0,
-                        )?,
-                    )),
+            if matches!(core, GeometryCore::P2Expanded) {
+                let module = cubin::module(
+                    &device.ctx,
+                    &format!("gdn/gdn_cw_p2{}", spec.kernel_suffix()?),
                 )?;
+                Arc::get_mut(&mut plan.kernels)
+                    .context("expanded P2 kernels are shared")?
+                    .p2 = Some(ChunkwiseP2 {
+                    a: module.load_function("gdn_cw_p2_stage_a")?,
+                    h: module.load_function("gdn_cw_p2_stage_h")?,
+                });
+                plan.cw_p2 = true;
+                plan.ws_p2 = cw_p2_bytes(spec.hv, rows);
+            }
+            if matches!(core, GeometryCore::Verify) {
+                plan = plan.for_rows(rows, Some(buffers.bind_snapshots(stream, spec)?))?;
             }
             if matches!(core, GeometryCore::WrongHeadStride) {
                 let directory = std::path::PathBuf::from(
@@ -1363,22 +1403,38 @@ mod tests {
             execute()?;
         }
         stream.synchronize()?;
-        let norm_ratio = if spec.qk_norm_fp32 {
-            let plan = &plans.last().context("empty geometry plans")?.0;
-            let data = stream.clone_dtoh(&workspace.slice(..plan.ws.bytes as usize))?;
-            let checked_rows = if sequential { 1 } else { valid };
-            geometry_qk_norm(&data, plan, checked_rows)?
-        } else {
-            0.0
-        };
+        let plan = &plans.last().context("empty geometry plans")?.0;
+        let data = stream.clone_dtoh(&workspace.slice(..plan.ws.bytes as usize))?;
+        let checked_rows = if sequential { 1 } else { valid };
+        let norm_ratio = geometry_qk_norm(&data, plan, checked_rows)?;
+        if !sequential && valid < rows {
+            for (region, element_bytes) in [
+                (plan.ws.q_fp32, 4),
+                (plan.ws.k_fp32, 4),
+                (plan.ws.q_bf16, 2),
+                (plan.ws.k_bf16, 2),
+            ] {
+                if region.bytes == 0 {
+                    continue;
+                }
+                let live = valid as usize * plan.ws.qk_heads as usize * 128 * element_bytes;
+                let start = region.offset as usize + live;
+                let end = (region.offset + region.bytes) as usize;
+                ensure!(
+                    data[start..end].iter().all(|byte| *byte == 0xa5),
+                    "GDN Q/K prep wrote inactive rows"
+                );
+            }
+        }
         let out = stream.clone_dtoh(&buffers.out)?;
         let state = stream.clone_dtoh(&buffers.state)?;
         let history = stream.clone_dtoh(&buffers.history)?;
-        let (prefix_states, prefix_histories) = if let Some((states, histories)) = snapshots {
-            (stream.clone_dtoh(&states)?, stream.clone_dtoh(&histories)?)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let (prefix_states, prefix_histories) =
+            if let Some((states, histories)) = &buffers.snapshots {
+                (stream.clone_dtoh(states)?, stream.clone_dtoh(histories)?)
+            } else {
+                (Vec::new(), Vec::new())
+            };
         ensure!(
             out[..valid as usize * spec.hv as usize * 128]
                 .iter()
@@ -1392,6 +1448,83 @@ mod tests {
                 .all(|v| v.to_bits() == 0x7fc5),
             "geometry fixture wrote an inactive row"
         );
+        let mut snapshot_mismatches = 0;
+        let (p2_prepared, p2_slots) = if p2 {
+            let mut prepared = data[plan.ws.conv_out.offset as usize
+                ..plan.ws.conv_out.offset as usize + valid as usize * plan.conv_dim as usize * 2]
+                .to_vec();
+            for row in 0..valid as usize {
+                for head in 0..spec.hv as usize {
+                    let physical = if plan.ws.qk_heads == spec.hk {
+                        head / (spec.hv / spec.hk) as usize
+                    } else {
+                        head
+                    };
+                    for d in 0..DK as usize {
+                        let index = (row * plan.ws.qk_heads as usize + physical) * DK as usize + d;
+                        for (full, rounded) in [
+                            (plan.ws.q_fp32, plan.ws.q_bf16),
+                            (plan.ws.k_fp32, plan.ws.k_bf16),
+                        ] {
+                            let offset = full.offset as usize + index * 4;
+                            let bits = &data[offset..offset + 4];
+                            prepared.extend_from_slice(bits);
+                            if rounded.bytes > 0 {
+                                let offset = rounded.offset as usize + index * 2;
+                                prepared.extend_from_slice(&data[offset..offset + 2]);
+                            } else {
+                                prepared.extend_from_slice(
+                                    &bf16::from_f32(f32::from_ne_bytes(bits.try_into()?))
+                                        .to_bits()
+                                        .to_ne_bytes(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let slots =
+                stream.clone_dtoh(&workspace.slice(plan.ws.bytes as usize..bytes as usize))?;
+            (prepared, slots)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        if let Some((saved_state, saved_history)) = &buffers.snapshots {
+            let states = stream.clone_dtoh(saved_state)?;
+            let histories = stream.clone_dtoh(saved_history)?;
+            let state_width = spec.hv as usize * 128 * 128;
+            let history_width = spec.conv_dim()? as usize * 3;
+            for prefix in 0..4usize {
+                let state = &states[prefix * state_width..(prefix + 1) * state_width];
+                let history = &histories[prefix * history_width..(prefix + 1) * history_width];
+                if prefix + 1 < valid as usize {
+                    let reference = geometry_run(
+                        device,
+                        spec,
+                        rows,
+                        prefix as u32 + 1,
+                        GeometryCore::Recurrent,
+                        false,
+                    )?;
+                    ensure!(
+                        state.iter().chain(history).all(|value| value.is_finite()),
+                        "nonfinite geometry snapshot"
+                    );
+                    snapshot_mismatches += state
+                        .iter()
+                        .zip(&reference.state)
+                        .chain(history.iter().zip(&reference.history))
+                        .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+                        .count();
+                } else {
+                    snapshot_mismatches += state
+                        .iter()
+                        .chain(history)
+                        .filter(|value| value.to_bits() != 0x7fc1_0001)
+                        .count();
+                }
+            }
+        }
         Ok(GeometryOutput {
             out,
             state,
@@ -1399,6 +1532,9 @@ mod tests {
             prefix_states,
             prefix_histories,
             norm_ratio,
+            snapshot_mismatches,
+            p2_prepared,
+            p2_slots,
         })
     }
 
@@ -1516,10 +1652,15 @@ mod tests {
                         1.0
                     };
                     for child in 0..spec.hv / spec.hk {
-                        let head = kh * (spec.hv / spec.hk) as usize + child as usize;
+                        let head = if plan.ws.qk_heads == spec.hk {
+                            kh
+                        } else {
+                            kh * (spec.hv / spec.hk) as usize + child as usize
+                        };
                         for d in 0..spec.dk as usize {
                             let expected = read_bf16(offset + d * 2) * inv * scale;
-                            let index = (row * spec.hv as usize + head) * spec.dk as usize + d;
+                            let index =
+                                (row * plan.ws.qk_heads as usize + head) * spec.dk as usize + d;
                             let actual = read_f32(region.offset as usize + index * 4);
                             ensure!(actual.is_finite(), "nonfinite GDN Q/K preparation");
                             let error = (actual - expected).abs();
@@ -1559,6 +1700,8 @@ mod tests {
                 .zip(&b.history)
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count()
+            + a.snapshot_mismatches
+            + b.snapshot_mismatches
     }
 
     #[test]
@@ -1622,49 +1765,121 @@ mod tests {
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
         let spec = GdnSpec::from_model(&model)?;
+        let qwen_root = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/q38-config.json"
+        )))?;
+        let qwen = crate::model_spec::ModelSpec::qwen(&qwen_root, &serde_json::Value::Null)?;
         let mut defects = 0;
         let mut cases = 0;
-        for (rows, valid) in [
-            (1, 1),
-            (2, 2),
-            (5, 5),
-            (8, 8),
-            (37, 37),
-            (64, 37),
-            (512, 512),
-            (512, 509),
-            (4096, 4096),
-        ] {
-            let mut cores = vec![
-                GeometryCore::Chunked,
-                GeometryCore::P1(4),
-                GeometryCore::P1(8),
-                GeometryCore::P1(16),
-                GeometryCore::P2,
-            ];
-            if rows <= 8 {
-                cores.push(GeometryCore::Recurrent);
-            }
-            for core in cores {
-                for graph in [false, true] {
-                    let reference_core = if matches!(core, GeometryCore::P2) {
-                        GeometryCore::P1(4)
-                    } else {
-                        core
-                    };
-                    let reference =
-                        geometry_run(&device, spec, rows, valid, reference_core, false)?;
-                    let candidate = geometry_run(&device, spec, rows, valid, core, graph)?;
-                    let mismatches = geometry_mismatches(&candidate, &reference);
-                    let passed = mismatches == 0
-                        && candidate.norm_ratio <= 1.0
-                        && reference.norm_ratio <= 1.0;
-                    println!(
-                        "GDN_GEOMETRY core={core:?} rows={rows} valid={valid} prefix=23 graph={graph} mismatches={mismatches} {}",
-                        if passed { "PASS" } else { "DEFECT" }
-                    );
-                    defects += usize::from(!passed);
-                    cases += 1;
+        for spec in [spec, GdnSpec::from_model(&qwen)?] {
+            for (rows, valid) in [
+                (1, 1),
+                (2, 2),
+                (5, 5),
+                (5, 2),
+                (7, 7),
+                (8, 8),
+                (9, 9),
+                (31, 31),
+                (32, 32),
+                (33, 33),
+                (37, 37),
+                (64, 37),
+                (63, 63),
+                (64, 64),
+                (65, 65),
+                (127, 127),
+                (128, 128),
+                (129, 129),
+                (512, 512),
+                (512, 509),
+                (4096, 4096),
+            ] {
+                let verify_tail = rows == 5 && valid == 2;
+                if verify_tail && device.info.arch != 89 {
+                    continue;
+                }
+                let mut cores = if verify_tail {
+                    vec![GeometryCore::Verify]
+                } else {
+                    vec![
+                        GeometryCore::Chunked,
+                        GeometryCore::P1(4),
+                        GeometryCore::P1(8),
+                        GeometryCore::P1(16),
+                        GeometryCore::P2,
+                    ]
+                };
+                if rows <= 8 && !verify_tail {
+                    cores.push(GeometryCore::Recurrent);
+                }
+                if rows <= 5 && device.info.arch == 89 && !verify_tail {
+                    cores.push(GeometryCore::Verify);
+                }
+                for core in cores {
+                    for graph in [false, true] {
+                        let reference_core = match core {
+                            GeometryCore::P2 => GeometryCore::P1(4),
+                            GeometryCore::Verify => GeometryCore::Recurrent,
+                            _ => core,
+                        };
+                        let reference =
+                            geometry_run(&device, spec, rows, valid, reference_core, false)?;
+                        let candidate = geometry_run(&device, spec, rows, valid, core, graph)?;
+                        let mismatches = geometry_mismatches(&candidate, &reference);
+                        let compact_mismatches = if matches!(core, GeometryCore::P2)
+                            && spec.hv == 48
+                            && rows > crate::gdn_plan::MIN_VERIFY_ROWS
+                        {
+                            let expanded = geometry_run(
+                                &device,
+                                spec,
+                                rows,
+                                valid,
+                                GeometryCore::P2Expanded,
+                                false,
+                            )?;
+                            let mismatches = geometry_mismatches(&candidate, &expanded)
+                                + candidate
+                                    .p2_prepared
+                                    .iter()
+                                    .zip(&expanded.p2_prepared)
+                                    .filter(|(a, b)| a != b)
+                                    .count()
+                                + candidate
+                                    .p2_slots
+                                    .iter()
+                                    .zip(&expanded.p2_slots)
+                                    .filter(|(a, b)| a != b)
+                                    .count();
+                            ensure!(
+                                candidate.p2_prepared.len() == expanded.p2_prepared.len()
+                                    && candidate.p2_slots.len() == expanded.p2_slots.len(),
+                                "compact P2 comparison extent differs"
+                            );
+                            println!(
+                                "{} GDN_COMPACT_BITS rows={rows} valid={valid} graph={graph} prepared_bytes={} slot_bytes={} mismatches={mismatches}",
+                                if mismatches == 0 { "PASS" } else { "DEFECT" },
+                                candidate.p2_prepared.len(),
+                                candidate.p2_slots.len()
+                            );
+                            mismatches
+                        } else {
+                            0
+                        };
+                        let passed = mismatches == 0
+                            && compact_mismatches == 0
+                            && candidate.norm_ratio <= 1.0
+                            && reference.norm_ratio <= 1.0;
+                        println!(
+                            "GDN_GEOMETRY hv={} core={core:?} rows={rows} valid={valid} prefix=23 graph={graph} mismatches={mismatches} {}",
+                            spec.hv,
+                            if passed { "PASS" } else { "DEFECT" }
+                        );
+                        defects += usize::from(!passed);
+                        cases += 1;
+                    }
                 }
             }
         }
@@ -1681,6 +1896,178 @@ mod tests {
             control.norm_ratio
         );
         ensure!(defects == 0, "GDN_GEOMETRY DEFECT cases={defects}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires exclusive sm89 window, FF_Q38_MODEL and native GDN parameters"]
+    fn gdn_operation_timing_gpu() -> Result<()> {
+        use crate::checkpoint::{LoadPolicy, MappedCheckpoint};
+        use std::path::PathBuf;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let directory =
+            PathBuf::from(std::env::var_os("FF_Q38_MODEL").context("FF_Q38_MODEL required")?);
+        let model = crate::model_spec::ModelSpec::read(&directory)?;
+        let spec = GdnSpec::from_model(&model)?;
+        ensure!(spec.hv == 48 && spec.hk == 16, "timing requires h48/hk16");
+        let mapped = MappedCheckpoint::open(&directory)?;
+        mapped.manifest(&model, LoadPolicy::TextOnly)?;
+        let views = mapped.views()?;
+        let read = |suffix: &str, shape: &[usize]| -> Result<Vec<bf16>> {
+            let name = format!("model.language_model.layers.0.linear_attn.{suffix}");
+            let shard = mapped
+                .index
+                .weight_map
+                .get(&name)
+                .context("GDN weight missing")?;
+            let tensor = views
+                .get(shard)
+                .context("GDN shard missing")?
+                .tensor(&name)?;
+            ensure!(
+                tensor.dtype() == safetensors::Dtype::BF16 && tensor.shape() == shape,
+                "native GDN tensor dtype/shape mismatch {name}"
+            );
+            let mut bytes = vec![0u8; tensor.data().len()];
+            mapped.read_mapped_range(shard, tensor.data(), &mut bytes)?;
+            Ok(bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|value| bf16::from_bits(u16::from_le_bytes([value[0], value[1]])))
+                .collect())
+        };
+        let cd = spec.conv_dim()? as usize;
+        let conv = read("conv1d.weight", &[cd, 1, 4])?;
+        let a_log = read("A_log", &[spec.hv as usize])?;
+        let dt = read("dt_bias", &[spec.hv as usize])?;
+        drop(views);
+        drop(mapped);
+        let device = crate::backend::cuda::Device::new(0)?;
+        ensure!(device.info.arch == 89, "operator timing requires sm89");
+        let stream = &device.stream;
+        for (mode, rows, valid) in [
+            ("recurrent", 1, 1),
+            ("legacy", 2, 2),
+            ("legacy", 5, 5),
+            ("verify", 2, 2),
+            ("verify", 5, 5),
+            ("verify", 5, 2),
+            ("legacy", 64, 64),
+            ("legacy", 512, 512),
+            ("legacy", 512, 509),
+            ("legacy", 4096, 4096),
+            ("p2", 64, 64),
+            ("p2", 512, 512),
+            ("p2", 512, 509),
+            ("p2", 4096, 4096),
+        ] {
+            let mut buffers = GeometryBuffers::new(stream, spec, rows, valid)?;
+            stream.memcpy_htod(&conv, &mut buffers.conv)?;
+            stream.memcpy_htod(&a_log, &mut buffers.a_log)?;
+            stream.memcpy_htod(&dt, &mut buffers.dt)?;
+            let initial_state = geometry_state(spec.hv as usize);
+            let initial_history = stream.clone_dtoh(&buffers.history)?;
+            let p2 = mode == "p2";
+            let bytes = GdnOps::workspace(
+                &spec,
+                rows,
+                if p2 { GdnPolicy::P2 } else { GdnPolicy::LEGACY },
+            )?
+            .bytes;
+            let workspace = stream.alloc_zeros::<u8>(bytes as usize)?;
+            let ptr = workspace.device_ptr(stream).0;
+            let mut plan = GdnOps::prepare(
+                &device.ctx,
+                &spec,
+                rows,
+                buffers.bindings(stream, spec, rows, 0)?,
+                p2,
+            )?;
+            if mode == "verify" {
+                plan = plan.for_rows(rows, Some(buffers.bind_snapshots(stream, spec)?))?;
+            }
+            let metadata = geometry_meta(stream, 23, valid)?;
+            let meta = SeqRef {
+                ptr: metadata.device_ptr(stream).0,
+            };
+            device.finish_upload()?;
+            let execute = || -> Result<()> {
+                if mode == "verify" {
+                    GdnOps::run_verify(&plan, stream, meta, Scratch { ptr, bytes })
+                } else {
+                    GdnOps::run(
+                        &plan,
+                        stream,
+                        meta,
+                        if mode == "recurrent" {
+                            ExecutionPhase::Decode
+                        } else {
+                            ExecutionPhase::Prefill
+                        },
+                        Scratch { ptr, bytes },
+                    )
+                }
+            };
+            execute()?;
+            let reference_out = stream.clone_dtoh(&buffers.out)?;
+            let reference_state = stream.clone_dtoh(&buffers.state)?;
+            let reference_history = stream.clone_dtoh(&buffers.history)?;
+            for graph in [false, true] {
+                let captured = if graph {
+                    stream.begin_capture(
+                        sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                    )?;
+                    let result = execute();
+                    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                    result?;
+                    Some(captured?.context("empty GDN operation graph")?)
+                } else {
+                    None
+                };
+                let mean_ms = crate::backend::cuda::time_prepared_operation(
+                    stream,
+                    || {
+                        stream.memcpy_htod(&initial_state, &mut buffers.state)?;
+                        stream.memcpy_htod(&initial_history, &mut buffers.history)?;
+                        Ok(())
+                    },
+                    || {
+                        if let Some(graph) = &captured {
+                            graph.launch()?;
+                            Ok(())
+                        } else {
+                            execute()
+                        }
+                    },
+                )?;
+                let out = stream.clone_dtoh(&buffers.out)?;
+                let state = stream.clone_dtoh(&buffers.state)?;
+                let history = stream.clone_dtoh(&buffers.history)?;
+                ensure!(
+                    out.iter()
+                        .zip(&reference_out)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                        && state
+                            .iter()
+                            .zip(&reference_state)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                        && history
+                            .iter()
+                            .zip(&reference_history)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "GDN operation reset/replay changed mode={mode} rows={rows} valid={valid} graph={graph}"
+                );
+                println!(
+                    "T20_OP_SAMPLE {}",
+                    serde_json::json!({"operation":"gdn","mode":mode,"rows":rows,"valid":valid,
+                        "graph":graph,"warm":16,"calls":32,"mean_ms":mean_ms,"native_weights":true})
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1917,14 +2304,7 @@ mod tests {
                 )?),
             }
         };
-        let full = GdnOps::prepare(
-            &device.ctx,
-            &GdnSpec::q38(),
-            5,
-            bindings,
-            CommonOpsRef::new(&device.ctx)?,
-            true,
-        )?;
+        let full = GdnOps::prepare(&device.ctx, &GdnSpec::q38(), 5, bindings, true)?;
         let ordinary = full.for_rows(5, None)?;
         ensure!(
             ordinary.cw_p2 && ordinary.ws_p2 > 0,
@@ -2053,14 +2433,7 @@ mod tests {
                     )?),
                 }
             };
-            let reference = GdnOps::prepare(
-                &device.ctx,
-                &GdnSpec::q38(),
-                1,
-                bindings,
-                full.common.clone(),
-                false,
-            )?;
+            let reference = GdnOps::prepare(&device.ctx, &GdnSpec::q38(), 1, bindings, false)?;
             let meta =
                 stream.clone_htod(&[17 + row as i32, 1, 18 + row as i32, 128, 1, 0, 0, 0])?;
             GdnOps::run_core(
@@ -2168,75 +2541,73 @@ mod tests {
 
     #[test]
     fn workspace_regions_match_the_interface_table() {
-        let qwen = GdnSpec::q38();
-        let spec = GdnSpec::q38();
-        let conv_dim = u64::from(spec.conv_dim().expect("conv_dim"));
-        for rows in [1u32, 64, 2048] {
-            let ws = GdnWorkspace::new(&spec, rows).expect("workspace");
-            let r = u64::from(rows);
-            let head = u64::from(qwen.hv);
-            let khead = u64::from(qwen.hk);
-            let d = u64::from(DV);
-            let dk = u64::from(DK);
+        for hv in [32, 48] {
+            let spec = GdnSpec {
+                hv,
+                ..GdnSpec::q38()
+            };
+            let conv_dim = u64::from(spec.conv_dim().expect("conv_dim"));
+            for rows in [1u32, 64, 2048] {
+                let ws = GdnWorkspace::new(&spec, rows, false).expect("workspace");
+                let r = u64::from(rows);
+                let head = u64::from(spec.hv);
+                let d = u64::from(DV);
 
-            let want = |cols: u64, elem: u64| align256(r * cols * elem);
-            assert_eq!(
-                ws.conv_out.bytes,
-                want(conv_dim, 2),
-                "conv_out, rows={rows}"
-            );
-            assert_eq!(ws.q_bf16.bytes, want(khead * dk, 2), "q_bf16, rows={rows}");
-            assert_eq!(ws.k_bf16.bytes, want(khead * dk, 2), "k_bf16, rows={rows}");
-            assert_eq!(ws.beta.bytes, want(head, 2), "beta, rows={rows}");
-            assert_eq!(ws.beta_fp32.bytes, want(head, 4), "beta_fp32, rows={rows}");
-            assert_eq!(ws.g.bytes, want(head, 4), "g, rows={rows}");
-            assert_eq!(ws.q_fp32.bytes, want(head * d, 4), "q_fp32, rows={rows}");
-            assert_eq!(ws.k_fp32.bytes, want(head * d, 4), "k_fp32, rows={rows}");
-            assert_eq!(ws.v_fp32.bytes, want(head * d, 4), "v_fp32, rows={rows}");
+                let want = |cols: u64, elem: u64| align256(r * cols * elem);
+                assert_eq!(
+                    ws.conv_out.bytes,
+                    want(conv_dim, 2),
+                    "conv_out, rows={rows}"
+                );
+                assert_eq!(ws.beta.bytes, want(head, 2), "beta, rows={rows}");
+                assert_eq!(ws.beta_fp32.bytes, want(head, 4), "beta_fp32, rows={rows}");
+                assert_eq!(ws.g.bytes, want(head, 4), "g, rows={rows}");
+                assert_eq!(ws.q_fp32.bytes, want(head * d, 4), "q_fp32, rows={rows}");
+                assert_eq!(ws.k_fp32.bytes, want(head * d, 4), "k_fp32, rows={rows}");
+                assert_eq!(ws.v_fp32.bytes, want(head * d, 4), "v_fp32, rows={rows}");
 
-            // Regions within the Engine slice have 256 B alignment and do not overlap.
-            let regions = [
-                ("conv_out", ws.conv_out),
-                ("q_bf16", ws.q_bf16),
-                ("k_bf16", ws.k_bf16),
-                ("beta", ws.beta),
-                ("beta_fp32", ws.beta_fp32),
-                ("g", ws.g),
-                ("q_fp32", ws.q_fp32),
-                ("k_fp32", ws.k_fp32),
-                ("v_fp32", ws.v_fp32),
-            ];
-            for (n, reg) in regions {
-                assert!(
-                    reg.offset.is_multiple_of(256),
-                    "{n} offset {} not 256-aligned",
-                    reg.offset
-                );
-                assert!(
-                    reg.bytes.is_multiple_of(256),
-                    "{n} bytes {} not 256-aligned",
-                    reg.bytes
-                );
-                assert!(
-                    reg.offset + reg.bytes <= ws.bytes,
-                    "{n} runs past the slice"
+                // Regions within the Engine slice have 256 B alignment and do not overlap.
+                let regions = [
+                    ("conv_out", ws.conv_out),
+                    ("beta", ws.beta),
+                    ("beta_fp32", ws.beta_fp32),
+                    ("g", ws.g),
+                    ("q_fp32", ws.q_fp32),
+                    ("k_fp32", ws.k_fp32),
+                    ("v_fp32", ws.v_fp32),
+                ];
+                for (n, reg) in regions {
+                    assert!(
+                        reg.offset.is_multiple_of(256),
+                        "{n} offset {} not 256-aligned",
+                        reg.offset
+                    );
+                    assert!(
+                        reg.bytes.is_multiple_of(256),
+                        "{n} bytes {} not 256-aligned",
+                        reg.bytes
+                    );
+                    assert!(
+                        reg.offset + reg.bytes <= ws.bytes,
+                        "{n} runs past the slice"
+                    );
+                }
+                let mut spans: Vec<(u64, u64, &str)> = regions
+                    .iter()
+                    .map(|(n, r)| (r.offset, r.offset + r.bytes, *n))
+                    .collect();
+                spans.sort();
+                for w in spans.windows(2) {
+                    assert!(w[0].1 <= w[1].0, "{} overlaps {}", w[0].2, w[1].2);
+                }
+                // The declared total is the Engine slice and accounts for every region.
+                let last = spans.last().expect("regions");
+                assert_eq!(
+                    ws.bytes,
+                    align256(last.1),
+                    "total does not close over the regions"
                 );
             }
-            let mut spans: Vec<(u64, u64, &str)> = regions
-                .iter()
-                .map(|(n, r)| (r.offset, r.offset + r.bytes, *n))
-                .collect();
-            spans.sort();
-            for w in spans.windows(2) {
-                assert!(w[0].1 <= w[1].0, "{} overlaps {}", w[0].2, w[1].2);
-            }
-            // The declared total is the Engine slice and accounts for every region.
-            let last = spans.last().expect("regions");
-            assert_eq!(
-                ws.bytes,
-                align256(last.1),
-                "total does not close over the regions"
-            );
         }
     }
 
@@ -2248,16 +2619,15 @@ mod tests {
         let b = GdnOps::workspace(&spec, 2048, GdnPolicy::LEGACY).expect("workspace");
         assert_eq!(a.bytes, b.bytes);
         assert_eq!(a.alignment, 256);
-        assert_eq!(a.bytes, GdnWorkspace::new(&spec, 2048).expect("ws").bytes);
+        assert_eq!(
+            a.bytes,
+            GdnWorkspace::new(&spec, 2048, false).expect("ws").bytes
+        );
         // decode's plan is max_rows = 1; the Engine shares one scratch sized to the larger.
         let d = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY).expect("decode workspace");
         assert!(
             d.bytes < a.bytes,
             "a 1-row plan must not exceed the prefill plan"
-        );
-        assert!(
-            d.bytes >= 102_880,
-            "one row needs the full 102,880 B of intermediates"
         );
     }
 
@@ -2310,7 +2680,6 @@ mod tests {
         for (hv, stored_channels) in [(32, 8192), (48, 10240)] {
             let spec = GdnSpec {
                 hv,
-                qk_norm_fp32: hv == 32,
                 ..GdnSpec::q38()
             };
             assert_eq!(spec.conv_dim().expect("conv_dim"), stored_channels);
@@ -2357,10 +2726,15 @@ mod tests {
             );
             // The planner's number, with the split armed, is the fused layout plus the
             // slots; unarmed it is the fused layout alone.
-            let fused = GdnWorkspace::new(&spec, rows)?.bytes;
+            let fused = GdnWorkspace::new(&spec, rows, false)?.bytes;
             assert_eq!(
                 GdnPolicy::P2.workspace(&spec, rows)?.bytes,
-                fused + cw_p2_bytes(qwen.hv, rows),
+                GdnWorkspace::new(&spec, rows, GdnPolicy::P2.cw_p2_for_step(rows))?.bytes
+                    + if GdnPolicy::P2.cw_p2_for_step(rows) {
+                        cw_p2_bytes(qwen.hv, rows)
+                    } else {
+                        0
+                    },
                 "rows={rows}"
             );
             assert_eq!(
@@ -2918,23 +3292,10 @@ mod gpu_probe {
         Ok((buffer, SeqRef { ptr }))
     }
 
-    fn run_case(
-        device: &Device,
-        c: &Case,
-        common: CommonOpsRef,
-        phase: ExecutionPhase,
-        swap_gates: bool,
-    ) -> Result<()> {
+    fn run_case(device: &Device, c: &Case, phase: ExecutionPhase, swap_gates: bool) -> Result<()> {
         let s = &device.stream;
         let b = bindings(c, s, swap_gates)?;
-        let plan = GdnOps::prepare(
-            &device.ctx,
-            &GdnSpec::q38(),
-            c.man.plan_rows,
-            b,
-            common,
-            false,
-        )?;
+        let plan = GdnOps::prepare(&device.ctx, &GdnSpec::q38(), c.man.plan_rows, b, false)?;
         let (meta_buf, meta) = meta_device(
             s,
             c.man.prefix,
@@ -3060,7 +3421,7 @@ mod gpu_probe {
     /// of conv_out / q / k / v / beta_fp32 / g, plus the final state S.
     fn dump_workspace(case: &Case, name: &str, s: &Arc<CudaStream>) -> Result<()> {
         let qwen = GdnSpec::q38();
-        let ws = GdnWorkspace::new(&GdnSpec::q38(), case.man.plan_rows)?;
+        let ws = GdnWorkspace::new(&GdnSpec::q38(), case.man.plan_rows, false)?;
         let host = s.clone_dtoh(&case.scratch_buf)?;
         let valid = case.man.valid as u64;
         let cd = 10_240u64;
@@ -3127,7 +3488,6 @@ mod gpu_probe {
             .unwrap_or(0);
         let device = Device::new(ordinal)?;
         let s = &device.stream;
-        let common = CommonOpsRef::new(&device.ctx)?;
         let phase_of = |m: &str| {
             if m == "recurrent" {
                 ExecutionPhase::Decode
@@ -3151,13 +3511,7 @@ mod gpu_probe {
             let man = Man::load(name);
             let case = build_case(&device, man)?;
             let case = &case;
-            run_case(
-                &device,
-                case,
-                common.clone(),
-                phase_of(&case.man.mode),
-                false,
-            )?;
+            run_case(&device, case, phase_of(&case.man.mode), false)?;
             let elems = case.man.valid * qwen.hv as usize * DV as usize;
             dump_workspace(case, name, s)?;
             let got = s.clone_dtoh(&case.dev_core)?;
@@ -3202,13 +3556,7 @@ mod gpu_probe {
                 let mut man2 = Man::load(name);
                 man2.plan_rows = man2.valid as u32;
                 let case2 = build_case(&device, man2)?;
-                run_case(
-                    &device,
-                    &case2,
-                    common.clone(),
-                    phase_of(&case2.man.mode),
-                    false,
-                )?;
+                run_case(&device, &case2, phase_of(&case2.man.mode), false)?;
                 let got2 = s.clone_dtoh(&case2.dev_core)?;
                 assert!(
                     got2[..elems] == got[..elems],
@@ -3238,13 +3586,7 @@ mod gpu_probe {
             let man = Man::load("prefill_m1");
             let case = build_case(&device, man)?;
             let elems = case.man.valid * qwen.hv as usize * DV as usize;
-            run_case(
-                &device,
-                &case,
-                common.clone(),
-                ExecutionPhase::Prefill,
-                false,
-            )?;
+            run_case(&device, &case, ExecutionPhase::Prefill, false)?;
             dump_workspace(&case, "prefill_m1_prefill", s)?;
             {
                 let dir = dump_dir();
@@ -3266,13 +3608,7 @@ mod gpu_probe {
             // Rebuild the case for the Decode leg: `run` advances dev_s and dev_hist in place, and both
             // phases start from the fixture's initial state.
             let case2 = build_case(&device, Man::load("prefill_m1"))?;
-            run_case(
-                &device,
-                &case2,
-                common.clone(),
-                ExecutionPhase::Decode,
-                false,
-            )?;
+            run_case(&device, &case2, ExecutionPhase::Decode, false)?;
             // Distinct dump name: the second phase overwrites the scratch buffer.
             dump_workspace(&case2, "prefill_m1_decode", s)?;
             let got_rec = s.clone_dtoh(&case2.dev_core)?;
@@ -3340,13 +3676,7 @@ mod gpu_probe {
             );
             // Negative control: a/b swapped in the Decode phase must exceed the count bound.
             let case3 = build_case(&device, Man::load("prefill_m1"))?;
-            run_case(
-                &device,
-                &case3,
-                common.clone(),
-                ExecutionPhase::Decode,
-                true,
-            )?;
+            run_case(&device, &case3, ExecutionPhase::Decode, true)?;
             let got_swap = s.clone_dtoh(&case3.dev_core)?;
             let t = terms(&got_swap[..elems], &ref_rec, &man_rec);
             println!(
@@ -3364,7 +3694,7 @@ mod gpu_probe {
             let man = Man::load("prefill_m64");
             let case = build_case(&device, man)?;
             let elems = case.man.valid * qwen.hv as usize * DV as usize;
-            run_case(&device, &case, common, ExecutionPhase::Prefill, true)?;
+            run_case(&device, &case, ExecutionPhase::Prefill, true)?;
             let got = s.clone_dtoh(&case.dev_core)?;
             let reference = case.man.bf16("ref_core.bf16", elems);
             let t = terms(&got[..elems], &reference, &case.man);

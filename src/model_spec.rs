@@ -37,14 +37,13 @@ pub enum ExpertFormat {
     Fp8W8a16,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GdnConfig {
     pub key_heads: u32,
     pub value_heads: u32,
     pub key_head_dim: u32,
     pub value_head_dim: u32,
     pub conv_kernel: u32,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub qk_norm_fp32: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayerPlan {
@@ -784,7 +783,6 @@ impl TextGeometry {
             key_head_dim: positive(t, "linear_key_head_dim")?,
             value_head_dim: positive(t, "linear_value_head_dim")?,
             conv_kernel: positive(t, "linear_conv_kernel_dim")?,
-            qk_norm_fp32: model_type == "qwen3_5_moe_text",
         };
         ensure!(
             gdn.value_heads.is_multiple_of(gdn.key_heads),

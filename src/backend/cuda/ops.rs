@@ -425,6 +425,7 @@ impl NormOps {
             },
         )
     }
+    #[cfg(test)]
     pub fn l2_heads(
         &self,
         stream: &Arc<CudaStream>,

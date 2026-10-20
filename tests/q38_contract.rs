@@ -16,7 +16,6 @@ fn g0_normalized_geometry_and_rejections() {
             key_head_dim: 128,
             value_head_dim: 128,
             conv_kernel: 4,
-            qk_norm_fp32: false,
         })
     );
     assert_eq!(spec.moe, None);
