@@ -88,7 +88,7 @@ pub(crate) struct GdnBindings {
 struct Kernels {
     gate: CudaFunction,
     conv: CudaFunction,
-    conv_l2: Option<CudaFunction>,
+    conv_l2: Option<[CudaFunction; 2]>,
     hist_update: CudaFunction,
     prep: CudaFunction,
     beta_widen: CudaFunction,
@@ -106,6 +106,28 @@ struct Kernels {
 struct ChunkwiseP2 {
     a: CudaFunction,
     h: CudaFunction,
+}
+
+fn bind_conv(
+    kernels: &Kernels,
+    spec: &GdnSpec,
+    rows: u32,
+    sms: u32,
+    compact: bool,
+) -> Result<(CudaFunction, u32)> {
+    let qk_blocks = 2 * spec.hk * spec.dk / CONV_CHAN;
+    let narrow = compact
+        && qk_blocks * rows.div_ceil(CONV_ROWS) < sms
+        && rows.div_ceil(8) > rows.div_ceil(CONV_ROWS);
+    let function = if compact {
+        &kernels
+            .conv_l2
+            .as_ref()
+            .context("compact GDN convolution not bound")?[usize::from(narrow)]
+    } else {
+        &kernels.conv
+    };
+    Ok((function.clone(), if narrow { 8 } else { CONV_ROWS }))
 }
 
 /// Chunkwise-P2 launch configs for a plan bound at `rows`: stage A one CTA per (chunk, head)
@@ -133,6 +155,7 @@ fn prep_grids(
     beta_cfg: LaunchConfig,
     conv_cfg: LaunchConfig,
     rows: u32,
+    conv_rows: u32,
 ) -> Result<(LaunchConfig, LaunchConfig, LaunchConfig)> {
     ensure!(
         rows <= CUDA_GRID_YZ_MAX,
@@ -143,7 +166,7 @@ fn prep_grids(
     let mut beta_cfg = beta_cfg;
     beta_cfg.grid_dim.1 = rows;
     let mut conv_cfg = conv_cfg;
-    conv_cfg.grid_dim.1 = rows.div_ceil(CONV_ROWS);
+    conv_cfg.grid_dim.1 = rows.div_ceil(conv_rows);
     Ok((prep_cfg, beta_cfg, conv_cfg))
 }
 
@@ -151,6 +174,8 @@ pub(crate) struct GdnPlan {
     spec: GdnSpec,
     snapshots: Option<(Tensor<f32, 4>, Tensor<f32, 3>)>,
     kernels: Arc<Kernels>,
+    conv: CudaFunction,
+    sms: u32,
     bindings: GdnBindings,
     ws: GdnWorkspace,
     /// The single derivation of `conv_dim`, asserted against the kernel constant.
@@ -233,15 +258,25 @@ impl GdnPlan {
             history: TensorMut(b.history.read()),
         };
         check_bindings(&bindings, rows, self.conv_dim, self.spec.hv)?;
-        let (prep_cfg, beta_cfg, conv_cfg) =
-            prep_grids(self.prep_cfg, self.beta_cfg, self.conv_cfg, rows)?;
         let cw_p2 = snapshots.is_none() && self.cw_p2 && rows > crate::gdn_plan::MIN_VERIFY_ROWS;
+        let ws = GdnWorkspace::new(&self.spec, rows, cw_p2)?;
+        let (conv, conv_rows) = bind_conv(
+            &self.kernels,
+            &self.spec,
+            rows,
+            self.sms,
+            ws.q_bf16.bytes > 0,
+        )?;
+        let (prep_cfg, beta_cfg, conv_cfg) =
+            prep_grids(self.prep_cfg, self.beta_cfg, self.conv_cfg, rows, conv_rows)?;
         Ok(Self {
             spec: self.spec,
             snapshots,
             kernels: self.kernels.clone(),
+            conv,
+            sms: self.sms,
             bindings,
-            ws: GdnWorkspace::new(&self.spec, rows, cw_p2)?,
+            ws,
             conv_dim: self.conv_dim,
             l2_eps: self.l2_eps,
             max_rows: rows,
@@ -374,6 +409,9 @@ impl GdnOps {
         check_bindings(&bindings, max_rows, conv_dim, spec.hv)?;
 
         use cudarc::driver::sys::CUdevice_attribute as Attribute;
+        let sms =
+            u32::try_from(ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)?;
+        ensure!(sms > 0, "GDN device has no multiprocessors");
         let optin =
             ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)? as u64;
         for (name, bytes) in [
@@ -444,7 +482,10 @@ impl GdnOps {
             rstep,
             conv: f_conv,
             conv_l2: if compact {
-                Some(conv.load_function("gdn_conv_l2_compact")?)
+                Some([
+                    conv.load_function("gdn_conv_l2_compact")?,
+                    conv.load_function("gdn_conv_l2_compact_rows8")?,
+                ])
             } else {
                 None
             },
@@ -455,6 +496,7 @@ impl GdnOps {
             recurrent: f_recurrent,
             p2,
         };
+        let (conv, conv_rows) = bind_conv(&kernels, spec, max_rows, sms, compact)?;
         // Grids derive from the bound rows, never from device valid_rows.
         let (prep_cfg, beta_cfg, conv_cfg) = prep_grids(
             LaunchConfig {
@@ -473,11 +515,14 @@ impl GdnOps {
                 shared_mem_bytes: 0,
             },
             max_rows,
+            conv_rows,
         )?;
         Ok(GdnPlan {
             spec: *spec,
             snapshots: None,
             kernels: Arc::new(kernels),
+            conv,
+            sms,
             bindings,
             ws,
             conv_dim,
@@ -605,14 +650,6 @@ impl GdnOps {
         // conv: qkv -> conv_out with the exact SiLU; the conv output is cast to BF16 and back
         // before silu() (ABI §5).
         unsafe {
-            let function = if compact {
-                plan.kernels
-                    .conv_l2
-                    .as_ref()
-                    .context("compact GDN convolution not bound")?
-            } else {
-                &plan.kernels.conv
-            };
             let q_bf16 = ws_ptr + plan.ws.q_bf16.offset;
             let k_bf16 = ws_ptr + plan.ws.k_bf16.offset;
             if compact {
@@ -620,7 +657,7 @@ impl GdnOps {
                 ws_region(plan.ws.k_bf16, rows, plan.ws.qk_heads * DK, 2)?;
             }
             let cd_i32 = cd as i32;
-            let mut conv = stream.launch_builder(function);
+            let mut conv = stream.launch_builder(&plan.conv);
             conv.arg(&b.qkv.ptr)
                 .arg(&b.conv_weight.ptr)
                 .arg(&b.history.0.ptr)
@@ -925,7 +962,7 @@ mod tests {
     fn every_prep_grid_is_a_function_of_the_live_rows_alone() -> Result<()> {
         let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
         for rows in [5u32, 7, 1021, 2047, 2048] {
-            let (prep, beta, conv) = prep_grids(full.0, full.1, full.2, rows)?;
+            let (prep, beta, conv) = prep_grids(full.0, full.1, full.2, rows, CONV_ROWS)?;
             assert_eq!(prep.grid_dim.2, rows, "GDN FP32 L2 prep grid z");
             assert_eq!(beta.grid_dim.1, rows, "gdn_beta_widen grid y");
             assert_eq!(
@@ -947,8 +984,8 @@ mod tests {
     #[test]
     fn a_narrower_step_never_widens_a_grid() -> Result<()> {
         let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
-        let (wide, _, _) = prep_grids(full.0, full.1, full.2, 2048)?;
-        let (narrow, _, _) = prep_grids(full.0, full.1, full.2, 1021)?;
+        let (wide, _, _) = prep_grids(full.0, full.1, full.2, 2048, CONV_ROWS)?;
+        let (narrow, _, _) = prep_grids(full.0, full.1, full.2, 1021, CONV_ROWS)?;
         assert!(narrow.grid_dim.2 < wide.grid_dim.2);
         Ok(())
     }
@@ -956,8 +993,8 @@ mod tests {
     #[test]
     fn rows_beyond_the_cuda_grid_yz_limit_are_rejected() -> Result<()> {
         let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
-        prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX)?;
-        let rejected = prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX + 1)
+        prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX, CONV_ROWS)?;
+        let rejected = prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX + 1, CONV_ROWS)
             .expect_err("rows above the CUDA gridDim.y/z limit must not form a launch");
         assert!(rejected.to_string().contains("gridDim"), "{rejected}");
         Ok(())
@@ -1740,7 +1777,12 @@ mod tests {
                 (2, 2),
                 (5, 5),
                 (5, 2),
+                (7, 7),
                 (8, 8),
+                (9, 9),
+                (31, 31),
+                (32, 32),
+                (33, 33),
                 (37, 37),
                 (64, 37),
                 (63, 63),

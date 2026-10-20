@@ -28,8 +28,8 @@ __device__ __forceinline__ bool aligned16(const void* p) {
 // One thread per channel; the block's 256 threads cover 256 contiguous channels. Each
 // thread walks a strip of rows.
 //
-// launch: grid (conv_dim/GDN_CONV_CHAN, ceil(valid_rows/GDN_CONV_ROWS)), block 256.
-template<bool Normalize>
+// launch: grid (conv_dim/GDN_CONV_CHAN, ceil(valid_rows/RowTile)), block 256.
+template<bool Normalize, int RowTile = GDN_CONV_ROWS>
 __device__ __forceinline__ void gdn_conv_impl(
         const __nv_bfloat16* __restrict__ qkv,     // [M, conv_dim] pre-conv, strides [conv_dim,1]
         const __nv_bfloat16* __restrict__ conv_w,  // [conv_dim, 4],   strides [4,1]
@@ -51,14 +51,14 @@ __device__ __forceinline__ void gdn_conv_impl(
         __trap(); return;
     }
 
-    const int row_base = blockIdx.y * GDN_CONV_ROWS;
+    const int row_base = blockIdx.y * RowTile;
     if (row_base >= valid_rows) return;
 
     float wgt[4];
     #pragma unroll
     for (int j = 0; j < 4; ++j) wgt[j] = __bfloat162float(conv_w[ch * 4 + j]);
 
-    const int rows_here = min(GDN_CONV_ROWS, valid_rows - row_base);
+    const int rows_here = min(RowTile, valid_rows - row_base);
     __shared__ float sums[2][4];
     for (int i = 0; i < rows_here; ++i) {
         // Local row: qkv and out are this call's [M, conv_dim] buffers, indexed 0-based
@@ -141,6 +141,18 @@ extern "C" __global__ void gdn_conv_l2_compact(
         !aligned16(q_bf16) || !aligned16(k_bf16)) { __trap(); return; }
     gdn_conv_impl<true>(qkv, conv_w, history, out, meta, conv_dim,
                         q_fp32, k_fp32, q_bf16, k_bf16, l2_eps);
+}
+
+extern "C" __global__ void gdn_conv_l2_compact_rows8(
+        const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
+        const float* __restrict__ history, __nv_bfloat16* __restrict__ out,
+        const GdnMeta* __restrict__ meta, int conv_dim,
+        float* __restrict__ q_fp32, float* __restrict__ k_fp32,
+        __nv_bfloat16* __restrict__ q_bf16, __nv_bfloat16* __restrict__ k_bf16, float l2_eps) {
+    if (conv_dim != 10240 || !aligned16(q_fp32) || !aligned16(k_fp32) ||
+        !aligned16(q_bf16) || !aligned16(k_bf16)) { __trap(); return; }
+    gdn_conv_impl<true, 8>(qkv, conv_w, history, out, meta, conv_dim,
+                         q_fp32, k_fp32, q_bf16, k_bf16, l2_eps);
 }
 
 // New history = the last 3 rows of (old history ++ this call's valid rows). The sequence has

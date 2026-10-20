@@ -5,7 +5,7 @@ use crate::{
         blas::Blas,
         contracts::{Scratch, Tensor, TensorMut},
         cubin,
-        linear::{LinearBiasMode, disjoint},
+        linear::{LinearBiasMode, LinearWeightRef, disjoint},
         ops::{CommonOpsRef, GeluMode, grid},
         vision::{
             PatchGrid, PatchPacking, VisionAttnBindings, VisionAttnOps, VisionAttnPlan,
@@ -267,6 +267,8 @@ pub(super) struct PositionInputs {
     pub indices: Tensor<i32, 2>,
     pub weights: Tensor<f32, 2>,
     pub patches: Tensor<bf16, 2>,
+    pub bias: Option<Tensor<bf16, 1>>,
+    pub trace_patches: bool,
 }
 
 struct PatchPositionBindings<'a> {
@@ -277,6 +279,7 @@ struct PatchPositionBindings<'a> {
     packed: &'a CudaSlice<bf16>,
     patch_output: &'a CudaSlice<bf16>,
     hidden: &'a CudaSlice<bf16>,
+    trace_patches: bool,
 }
 
 impl VisionIo {
@@ -342,6 +345,8 @@ impl VisionIo {
             indices,
             weights,
             patches,
+            bias,
+            trace_patches,
         } = input;
         matrix(&table, hidden)?;
         ensure!(
@@ -371,6 +376,26 @@ impl VisionIo {
         disjoint(&table, &interpolated.0)?;
         disjoint(&indices, &interpolated.0)?;
         disjoint(&weights, &interpolated.0)?;
+        let bias_ptr = if let Some(bias) = bias {
+            bias.validate()?;
+            ensure!(
+                bias.shape == [hidden] && bias.stride == [1],
+                "position bias shape mismatch"
+            );
+            disjoint(&bias, &patches)?;
+            disjoint(&bias, &output.0)?;
+            disjoint(&bias, &interpolated.0)?;
+            bias.ptr
+        } else {
+            ensure!(!trace_patches, "position patch trace requires bias");
+            0
+        };
+        if trace_patches {
+            disjoint(&table, &patches)?;
+            disjoint(&indices, &patches)?;
+            disjoint(&weights, &patches)?;
+        }
+        let trace_ptr = if trace_patches { patches.ptr } else { 0 };
         let count = u64::from(rows) * u64::from(hidden);
         unsafe {
             stream
@@ -379,6 +404,8 @@ impl VisionIo {
                 .arg(&indices.ptr)
                 .arg(&weights.ptr)
                 .arg(&patches.ptr)
+                .arg(&bias_ptr)
+                .arg(&trace_ptr)
                 .arg(&output.0.ptr)
                 .arg(&interpolated.0.ptr)
                 .arg(&rows)
@@ -401,25 +428,41 @@ impl VisionIo {
             packed,
             patch_output,
             hidden,
+            trace_patches,
         } = bindings;
         let width = patch.shape[0];
         let rows = u32::try_from(packed.len() / patch.shape[1] as usize)?;
         let output = dense(patch_output, stream, [rows, width])?;
-        patch.run(
+        let table = dense(
+            position,
             stream,
-            blas,
-            dense(packed, stream, [rows, patch.shape[1]])?,
-            &mut TensorMut(output),
+            [u32::try_from(position.len() / width as usize)?, width],
         )?;
+        disjoint(&table, &output)?;
+        let input = dense(packed, stream, [rows, patch.shape[1]])?;
+        let bias = dense(&patch.bias, stream, [width])?;
+        disjoint(&bias, &output)?;
+        if bilinear.is_some() {
+            blas.linear_typed(
+                crate::op_contract::ExecutionPhase::Prefill,
+                LinearWeightRef::Bf16(dense(&patch.weight, stream, patch.shape)?),
+                input,
+                &mut TensorMut(output),
+            )?;
+        } else {
+            patch.run(stream, blas, input, &mut TensorMut(output))?;
+        }
         let mut hidden = TensorMut(dense(hidden, stream, [rows, width])?);
         match bilinear {
             Some(bilinear) => self.position_add(
                 stream,
                 PositionInputs {
-                    table: dense(position, stream, [2304, width])?,
+                    table,
                     indices: dense(indices, stream, [4, rows])?,
                     weights: dense(&bilinear.coefficients, stream, [4, rows])?,
                     patches: output,
+                    bias: Some(bias),
+                    trace_patches,
                 },
                 &mut hidden,
                 &mut TensorMut(dense(&bilinear.values, stream, [rows, width])?),
@@ -427,11 +470,7 @@ impl VisionIo {
             ),
             None => self.bucket_position_add(
                 stream,
-                dense(
-                    position,
-                    stream,
-                    [u32::try_from(position.len() / width as usize)?, width],
-                )?,
+                table,
                 dense(indices, stream, [rows])?,
                 output,
                 &mut hidden,
@@ -1552,7 +1591,7 @@ impl VisionRuntime {
         mut trace: Option<&mut crate::trace::Trace>,
     ) -> Result<EncodedImages> {
         let launched = (|| -> Result<()> {
-            self.run_prefix(stream, blas, &mut request.prefix)?;
+            self.run_prefix(stream, blas, &mut request.prefix, trace.is_some())?;
             let geometry = self.geometry;
             let spec = geometry.spec;
             let width = geometry.hidden();
@@ -2113,7 +2152,6 @@ impl VisionRuntime {
             .as_ref()
             .context("vision configuration missing")?;
         let s = &device.stream;
-        self.weights.patch.prepare(s, blas, row_count)?;
         let (indices, bilinear) = match self.model.architecture {
             Architecture::Qwen35Text => {
                 let tables =
@@ -2136,6 +2174,11 @@ impl VisionRuntime {
             Architecture::Llama => bail!("vision configuration requires a multimodal architecture"),
         };
         let hidden = geometry.hidden() as usize;
+        if bilinear.is_some() {
+            blas.prepare_fixed(row_count, geometry.hidden(), geometry.patch)?;
+        } else {
+            self.weights.patch.prepare(s, blas, row_count)?;
+        }
         let prefix = VisionPrefix {
             positions,
             pixels: s.clone_htod(input.pixel_values)?,
@@ -2155,6 +2198,7 @@ impl VisionRuntime {
         stream: &Arc<CudaStream>,
         blas: &Blas,
         request: &mut VisionPrefix,
+        trace_patches: bool,
     ) -> Result<()> {
         let rows = u32::try_from(request.positions.patch_rows())?;
         let geometry = self.geometry;
@@ -2199,6 +2243,7 @@ impl VisionRuntime {
                     packed: &request.packed,
                     patch_output: &request.patch_output,
                     hidden: &request.hidden,
+                    trace_patches,
                 },
             )?;
             Ok(())
@@ -2563,6 +2608,8 @@ mod tests {
                 indices: dense(&index, s, [4, rows])?,
                 weights: dense(&coefficient, s, [4, rows])?,
                 patches: dense(&patch, s, [rows, HIDDEN])?,
+                bias: None,
+                trace_patches: false,
             },
             &mut TensorMut(dense(&hidden, s, [rows, HIDDEN])?),
             &mut TensorMut(dense(&interpolation, s, [rows, HIDDEN])?),
@@ -3269,6 +3316,168 @@ mod tests {
         Ok(())
     }
 
+    fn patch_position_bits(
+        device: &Device,
+        blas: &mut Blas,
+        patch: &BiasedWeight,
+        host: &[bf16],
+        expected_patch: &[bf16],
+        cell: (u32, bool, bool),
+    ) -> Result<usize> {
+        let (rows, bilinear, zero_position) = cell;
+        let s = &device.stream;
+        let width = patch.shape[0];
+        let table_rows = if bilinear { 2304 } else { 4900 };
+        let position_host: Vec<_> = (0..table_rows * width)
+            .map(|i| {
+                if zero_position {
+                    bf16::ZERO
+                } else {
+                    bf16::from_f32((i % 17) as f32 / 32.0 - 0.25)
+                }
+            })
+            .collect();
+        let position = s.clone_htod(&position_host)?;
+        let (indices, coefficients) = if bilinear {
+            let (h, w) = match rows {
+                1 => (2, 2),
+                37 => (2, 20),
+                1120 => (28, 40),
+                7104 => (96, 74),
+                _ => bail!("patch position fixture row extent unsupported"),
+            };
+            let model = ModelSpec::qwen(
+                &serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?,
+                &serde_json::Value::Null,
+            )?;
+            let tables = VisionPositions::new(
+                model.vision.as_ref().context("vision fixture missing")?,
+                model.architecture,
+                &[ImageGrid { t: 1, h, w }],
+                (h * w) as usize,
+            )?;
+            let indices = tables
+                .bilinear_indices
+                .iter()
+                .flat_map(|corner| corner[..rows as usize].iter().copied())
+                .collect::<Vec<_>>();
+            let coefficients = tables
+                .bilinear_weights
+                .iter()
+                .flat_map(|corner| corner[..rows as usize].iter().copied())
+                .collect::<Vec<_>>();
+            (indices, coefficients)
+        } else {
+            (
+                (0..rows)
+                    .map(|row| ((row * 13) % table_rows) as i32)
+                    .collect(),
+                Vec::new(),
+            )
+        };
+        let expected: Vec<_> = expected_patch
+            .iter()
+            .enumerate()
+            .map(|(i, patch)| {
+                let (row, column) = (i / width as usize, i % width as usize);
+                let pos = if bilinear {
+                    let mut sum = 0.0f32;
+                    for corner in 0..4 {
+                        let offset = corner * rows as usize + row;
+                        sum += position_host[indices[offset] as usize * width as usize + column]
+                            .to_f32()
+                            * coefficients[offset];
+                    }
+                    bf16::from_f32(sum)
+                } else {
+                    position_host[indices[row] as usize * width as usize + column]
+                };
+                bf16::from_f32(patch.to_f32() + pos.to_f32())
+            })
+            .collect();
+        let x = s.clone_htod(host)?;
+        let y = s.alloc_zeros::<bf16>((rows * width) as usize)?;
+        let hidden = s.alloc_zeros::<bf16>((rows * width) as usize)?;
+        let indices = s.clone_htod(&indices)?;
+        let tables = if bilinear {
+            blas.prepare_fixed(rows, width, patch.shape[1])?;
+            Some(BilinearTables {
+                coefficients: s.clone_htod(&coefficients)?,
+                values: s.alloc_zeros((rows * width) as usize)?,
+            })
+        } else {
+            patch.prepare(s, blas, rows)?;
+            None
+        };
+        let io = VisionIo::new(device, OUTPUT)?;
+        let execute = |trace_patches| {
+            io.project_position(
+                s,
+                blas,
+                PatchPositionBindings {
+                    patch,
+                    position: &position,
+                    indices: &indices,
+                    bilinear: tables.as_ref(),
+                    packed: &x,
+                    patch_output: &y,
+                    hidden: &hidden,
+                    trace_patches,
+                },
+            )
+        };
+        let mut defects = 0;
+        for graph in [false, true] {
+            for trace in [false, true] {
+                let captured = if graph {
+                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    let result = execute(trace);
+                    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    result?;
+                    Some(captured?.context("empty patch position graph")?)
+                } else {
+                    None
+                };
+                for _ in 0..2 {
+                    if let Some(graph) = &captured {
+                        graph.launch()?;
+                    } else {
+                        execute(trace)?;
+                    }
+                    let actual = s.clone_dtoh(&hidden)?;
+                    ensure!(
+                        actual.iter().all(|v| v.is_finite()),
+                        "nonfinite positioned patch"
+                    );
+                    let wrong = actual
+                        .iter()
+                        .zip(&expected)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    let pre_position = if trace || !bilinear {
+                        s.clone_dtoh(&y)?
+                            .iter()
+                            .zip(expected_patch)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count()
+                    } else {
+                        0
+                    };
+                    defects += wrong + pre_position;
+                    println!(
+                        "{} VISION_PATCH_POSITION rows={rows} bilinear={bilinear} zero_position={zero_position} graph={graph} trace={trace} bit_mismatches={wrong} pre_position_mismatches={pre_position}",
+                        if wrong + pre_position == 0 {
+                            "PASS"
+                        } else {
+                            "DEFECT"
+                        }
+                    );
+                }
+            }
+        }
+        Ok(defects)
+    }
+
     #[test]
     #[ignore = "requires FF_Q38_VISION_WINDOW=granted and FF_Q38_VISION_OUTPUT_DIR"]
     fn vision_merger_bias_rounding_gpu() -> Result<()> {
@@ -3292,6 +3501,7 @@ mod tests {
         closure.freeze_fixed()?;
         closure.ready(Instant::now())?;
         let mut patch_defects = 0;
+        let mut position_defects = 0;
         {
             use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
             use std::collections::BTreeMap;
@@ -3443,6 +3653,23 @@ mod tests {
                             if wrong == 0 { "PASS" } else { "DEFECT" }
                         );
                     }
+                    let expected: Vec<_> = (0..rows as usize * width as usize)
+                        .map(|i| {
+                            bf16::from_f32(if i % (width as usize) < width as usize / 2 {
+                                1.0
+                            } else {
+                                -1.0
+                            })
+                        })
+                        .collect();
+                    position_defects += patch_position_bits(
+                        &device,
+                        &mut blas,
+                        &patch,
+                        &host,
+                        &expected,
+                        (rows, input == PATCH, true),
+                    )?;
                 }
             }
         }
@@ -3494,6 +3721,12 @@ mod tests {
                     .map(|c| bf16::from_f32(((c % 31) as f32 - 15.0) / 8.0))
                     .collect::<Vec<_>>(),
             )?;
+            let patch = BiasedWeight {
+                weight,
+                bias,
+                shape: [width, input],
+                bias_mode: LinearBiasMode::AfterOutputRound,
+            };
             for rows in [1u32, 37, 1120, 7104] {
                 let host: Vec<_> = (0..rows as usize * input as usize)
                     .map(|i| {
@@ -3502,31 +3735,21 @@ mod tests {
                         )
                     })
                     .collect();
-                let x = s.clone_htod(&host)?;
-                let y = s.alloc_zeros::<bf16>((rows * width) as usize)?;
-                blas.prepare_biased(
-                    rows,
-                    width,
-                    input,
-                    dense(&bias, s, [width])?,
-                    LinearBiasMode::AfterOutputRound,
-                )?;
-                blas.linear_biased(
-                    dense(&weight, s, [width, input])?,
-                    dense(&bias, s, [width])?,
-                    dense(&x, s, [rows, input])?,
-                    &mut TensorMut(dense(&y, s, [rows, width])?),
-                    LinearBiasMode::AfterOutputRound,
-                )?;
-                let wrong = s
-                    .clone_dtoh(&y)?
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, value)| {
-                        value.to_bits()
-                            != expected[(i / width as usize % 23) * 31 + i % width as usize % 31]
+                let expected: Vec<_> = (0..rows as usize * width as usize)
+                    .map(|i| {
+                        bf16::from_bits(
+                            expected[(i / width as usize % 23) * 31 + i % width as usize % 31],
+                        )
                     })
-                    .count();
+                    .collect();
+                let wrong = patch_position_bits(
+                    &device,
+                    &mut blas,
+                    &patch,
+                    &host,
+                    &expected,
+                    (rows, true, false),
+                )?;
                 println!(
                     "{} VISION_PATCH_FULL_K rows={rows} input={input} width={width} periods=23,31 bit_mismatches={wrong}",
                     if wrong == 0 { "PASS" } else { "DEFECT" }
@@ -3571,9 +3794,10 @@ mod tests {
             }
         }
         closure.assert_ready()?;
+        println!("VISION_PATCH_POSITION_SUMMARY bit_mismatches={position_defects}");
         ensure!(
-            patch_defects == 0,
-            "VISION_PATCH_BIAS DEFECT cases={patch_defects}"
+            patch_defects == 0 && position_defects == 0,
+            "VISION_PATCH_BIAS DEFECT cases={patch_defects} positioned={position_defects}"
         );
         Ok(())
     }
@@ -3641,7 +3865,7 @@ mod tests {
         let io = VisionIo::new(&device, geometry.output())?;
         drop(catalog);
         for rows in [1u32, 37, 1120, 7104] {
-            patch.prepare(stream, &mut blas, rows)?;
+            blas.prepare_fixed(rows, vision.hidden, geometry.patch)?;
         }
         closure.freeze_fixed()?;
         closure.ready(Instant::now())?;
@@ -3686,6 +3910,7 @@ mod tests {
                         packed: &input,
                         patch_output: &output,
                         hidden: &hidden,
+                        trace_patches: false,
                     },
                 )
             };
