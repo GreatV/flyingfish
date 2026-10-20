@@ -686,6 +686,16 @@ impl Blas {
     }
     // Setup/eager binding for the fixed BF16 Lt path.
     pub(crate) fn prepare_fixed(&self, rows: u32, output: u32, input: u32) -> Result<()> {
+        let key = (rows as usize, output as usize, input as usize, 0);
+        if !self.plans.borrow().contains_key(&key) {
+            self.closure.bind_fixed()?;
+            self.prepare_request_fixed(rows, output, input)?;
+        }
+        Ok(())
+    }
+
+    /// Request-bound BF16 Lt plans have no measured choices or calibration files.
+    pub(crate) fn prepare_request_fixed(&self, rows: u32, output: u32, input: u32) -> Result<()> {
         ensure!(
             [rows, output, input]
                 .iter()
@@ -694,7 +704,6 @@ impl Blas {
         );
         let key = (rows as usize, output as usize, input as usize, 0);
         if !self.plans.borrow().contains_key(&key) {
-            self.closure.bind_fixed()?;
             let p = Plan::new(self.handle, key.0, key.1, key.2, self.workspace.len(), 0)?;
             self.plans.borrow_mut().insert(key, p);
         }

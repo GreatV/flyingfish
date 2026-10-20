@@ -2175,7 +2175,7 @@ impl VisionRuntime {
         };
         let hidden = geometry.hidden() as usize;
         if bilinear.is_some() {
-            blas.prepare_fixed(row_count, geometry.hidden(), geometry.patch)?;
+            blas.prepare_request_fixed(row_count, geometry.hidden(), geometry.patch)?;
         } else {
             self.weights.patch.prepare(s, blas, row_count)?;
         }
@@ -3974,7 +3974,7 @@ mod tests {
     fn vision_tower_gpu() -> Result<()> {
         use crate::backend::cuda::{closure::Closure, ops::Ops};
         use safetensors::{Dtype, SafeTensors};
-        use std::{path::PathBuf, rc::Rc};
+        use std::{path::PathBuf, rc::Rc, time::Instant};
         ensure!(
             std::env::var("FF_Q38_VISION_WINDOW").as_deref() == Ok("granted"),
             "vision GPU window missing"
@@ -3994,12 +3994,8 @@ mod tests {
         let s = &device.stream;
         let common = CommonOpsRef::new(&device.ctx)?;
         let ops = Ops::new(&device.ctx)?;
-        let mut blas = Blas::new(
-            &device,
-            &ops,
-            &output,
-            Rc::new(Closure::new(false, "vision prefix diagnostic".into())),
-        )?;
+        let closure = Rc::new(Closure::new(false, "vision prefix diagnostic".into()));
+        let mut blas = Blas::new(&device, &ops, &output, closure.clone())?;
         let mut catalog = WeightCatalog::load_with_policy(
             &model_dir,
             &model,
@@ -4015,6 +4011,8 @@ mod tests {
             catalog.tensors.is_empty(),
             "vision binding left unloaded owners"
         );
+        closure.freeze_fixed()?;
+        closure.ready(Instant::now())?;
         for case in ["img-report", "img-nonsquare", "img-marker", "img-tiny"] {
             let file = std::fs::File::open(fixtures.join(format!("{case}.safetensors")))?;
             let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
@@ -4073,6 +4071,8 @@ mod tests {
                 "VISION_TOWER_DIAGNOSTIC {case} rows={rows} written; numerical verdict requires per-stage reference checks"
             );
         }
+        closure.assert_ready()?;
+        eprintln!("VISION_REQUEST_BINDINGS PASS cases=4 after_ready=true");
         Ok(())
     }
 }
