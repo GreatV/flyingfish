@@ -3844,7 +3844,7 @@ mod tests {
         let stream = &device.stream;
         let ops = Ops::new(&device.ctx)?;
         let closure = Rc::new(Closure::new(false, "patch operation timing".into()));
-        let mut blas = Blas::new(&device, &ops, &output, closure.clone())?;
+        let blas = Blas::new(&device, &ops, &output, closure.clone())?;
         let mut catalog = WeightCatalog::load_with_policy(
             &directory,
             &model,
