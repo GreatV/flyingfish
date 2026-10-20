@@ -295,7 +295,7 @@ impl State {
         Ok(())
     }
 
-    /// tree_prepare's metadata writes fused with the embedding gather and the layer-0 RMSNorm.
+    /// Tree metadata writes fused with the embedding gather and the layer-0 RMSNorm.
     pub(crate) fn prepare_embed_norm(
         &self,
         prefix: &CudaSlice<i32>,

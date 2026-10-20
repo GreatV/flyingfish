@@ -4599,7 +4599,7 @@ impl Engine {
         use super::closure::Attention as Kind;
         for &kind in &profile.attention {
             paths.push(match kind {
-                Kind::Decode => super::calibrate::cache_path(&self.runtime, &key, bucket, None),
+                Kind::Decode => super::calibrate::cache_path(&self.runtime, &key, bucket),
                 Kind::Draft | Kind::Verify | Kind::Tree => {
                     let draft = &self
                         .spec

@@ -1,6 +1,6 @@
 // Row-major E4M3 codes; BF16 block-128 or per-output-channel scales.
-// M>5 prefill materializes effective BF16 weights. M1..5 forms the same rounded
-// weight in registers, accumulates FP32, and writes BF16; no matrix scratch.
+// M1..16 entry points form the rounded weight in registers, accumulate FP32 and
+// write BF16 with no matrix scratch; larger M materializes effective BF16 weights.
 // Format: __nv_fp8_e4m3 (CUDA Math API).
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>

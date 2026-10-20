@@ -1,9 +1,8 @@
 // Embedding gather + RMSNorm as a single launch.
 //   embed_rmsnorm            decode/chain paths
-//   tree_prepare_embed_norm  tree path: tree_prepare's metadata writes plus
-//                            the same gather+norm body
-// Bit-identical to (embed, rms_norm [, tree_prepare]): same per-element math,
-// reduction order and rounding points. x receives the exact table bits.
+//   tree_prepare_embed_norm  tree path: tree metadata writes (ids, positions,
+//                            slots, snapshot) plus the same gather+norm body
+// x receives the exact table bits.
 //
 // Semantics as embed.cu + norm.cu rms_norm: fp32 ssq per row (butterfly warp
 // reduction, one value per warp in smem), y = bf16(x * rsqrt(mean+eps) * w),
@@ -16,7 +15,7 @@
 //     the valid rows return before any write.
 //   * __trap() when: hidden != 2048, rows < 1, eps negative or not
 //     finite, any null buffer, blockDim.x not a multiple of 32 or outside
-//     [32,1024]. The tree entry additionally keeps tree_prepare's checks:
+//     [32,1024]. The tree entry additionally requires:
 //     valid_rows in [1,64], budget in [1,64], valid_rows <= budget,
 //     *prefix in [0, capacity-budget], *prefix == *expected, depth[row] in
 //     [0,7] for valid rows, gridDim.x >= valid_rows.
@@ -141,7 +140,7 @@ __device__ __forceinline__ void gather_norm_row(const bf16* __restrict__ src,
     }
 }
 
-// tree_prepare's check conditions.
+// Tree metadata checks.
 __device__ __forceinline__ void tree_rows(int n) {
     if (n < 1 || n > 64) __trap();
 }
@@ -170,7 +169,7 @@ __global__ __launch_bounds__(1024) void embed_rmsnorm(const __nv_bfloat16* __res
                     y + (size_t)row * hidden, hidden, eps);
 }
 
-// tree_prepare's metadata writes (all budget entries, every check) plus the
+// Tree metadata writes (all budget entries, every check) plus the
 // same per-row gather+norm, for blockIdx.x < valid_rows.
 __global__ __launch_bounds__(1024) void tree_prepare_embed_norm(
     const __nv_bfloat16* __restrict__ table, const uint32_t* __restrict__ tokens,
@@ -188,7 +187,7 @@ __global__ __launch_bounds__(1024) void tree_prepare_embed_norm(
     if (!table || !tokens || !depth || !ids || !positions || !slots || !w || !x || !y) __trap();
     if (gridDim.x < n) __trap();
 
-    // same index map as tree_prepare; budget <= 64 puts every entry in block 0
+    // budget <= 64 puts every entry in block 0
     const int m = blockIdx.x * blockDim.x + threadIdx.x;
     if (m < budget) {
         if (!m) *snapshot = start;

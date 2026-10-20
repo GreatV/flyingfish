@@ -1,9 +1,7 @@
 use super::{
     Device,
     decode::Attention,
-    flash::Shape,
     ops::{Ops, grid},
-    verification::Verification,
 };
 use crate::{
     backend::setup::{
@@ -54,15 +52,10 @@ impl Occupancy {
     }
 }
 
-fn plans(bucket: usize, query_rows: Option<usize>) -> Vec<AttentionPlan> {
-    let packs: &[usize] = if query_rows.is_some() {
-        &[1, 2, 4, 8]
-    } else {
-        &[2, 4]
-    };
+fn plans(bucket: usize) -> Vec<AttentionPlan> {
     let mut plans = Vec::new();
     for &chunk in attention_chunks(bucket) {
-        for &qpack in packs {
+        for qpack in [2, 4] {
             for threads in [128, 256] {
                 for merge_threads in [256, 512] {
                     plans.push(AttentionPlan {
@@ -80,8 +73,6 @@ fn plans(bucket: usize, query_rows: Option<usize>) -> Vec<AttentionPlan> {
 
 #[derive(Serialize, Deserialize)]
 struct Cache {
-    #[serde(default)]
-    query_rows: Option<usize>,
     schema: u32,
     key: CacheKey,
     winner: AttentionPlan,
@@ -215,14 +206,13 @@ fn rank(t: &Trial) -> (f64, f64, usize) {
     (t.median_us, t.p90_us, usize::MAX - t.plan.chunk)
 }
 
-fn check(cache: &Cache, key: &CacheKey, query_rows: Option<usize>, bucket: usize) -> Result<()> {
-    let expected = plans(bucket, query_rows);
-    let filtered = query_rows.is_none() && bucket >= 3;
+fn check(cache: &Cache, key: &CacheKey, bucket: usize) -> Result<()> {
+    let expected = plans(bucket);
+    let filtered = bucket >= 3;
     ensure!(
         cache.schema == 2
             && cache.lengths == LENGTHS
             && cache.key == *key
-            && cache.query_rows == query_rows
             && bucket < LENGTHS.len()
             && cache.bucket == bucket
             && cache.sms > 0,
@@ -288,6 +278,13 @@ fn check(cache: &Cache, key: &CacheKey, query_rows: Option<usize>, bucket: usize
     Ok(())
 }
 
+pub(super) fn cache_path(dir: &Path, key: &CacheKey, bucket: usize) -> PathBuf {
+    dir.join(format!(
+        "attention-long-v2-b{bucket}-{}-{}-{}.json",
+        key.device_uuid, key.driver_version, key.binary_version
+    ))
+}
+
 pub(super) fn load(
     d: &Device,
     ops: &Ops,
@@ -296,50 +293,23 @@ pub(super) fn load(
     capacity: usize,
     closure: &super::closure::Closure,
 ) -> Result<Calibrated> {
-    load_kind(d, ops, c, dir, None, attention_bucket(capacity)?, closure)
-}
-
-pub(super) fn cache_path(
-    dir: &Path,
-    key: &CacheKey,
-    bucket: usize,
-    query_rows: Option<usize>,
-) -> PathBuf {
-    let name = query_rows.map_or_else(
-        || "attention".to_owned(),
-        |rows| format!("attention-mq{rows}"),
-    );
-    dir.join(format!(
-        "{name}-long-v2-b{bucket}-{}-{}-{}.json",
-        key.device_uuid, key.driver_version, key.binary_version
-    ))
-}
-
-fn load_kind(
-    d: &Device,
-    ops: &Ops,
-    c: &Config,
-    dir: &Path,
-    query_rows: Option<usize>,
-    bucket: usize,
-    closure: &super::closure::Closure,
-) -> Result<Calibrated> {
+    let bucket = attention_bucket(capacity)?;
     let key = key(d).context("calibration cache key")?;
-    let path = cache_path(dir, &key, bucket, query_rows);
+    let path = cache_path(dir, &key, bucket);
     let (cache, hit) = if closure.access(&path)? {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)
             .with_context(|| format!("read calibration cache {}", path.display()))?;
         ensure!(cache.sms == d.info.sms, "attention cache SM count mismatch");
-        check(&cache, &key, query_rows, bucket)?;
+        check(&cache, &key, bucket)?;
         (cache, true)
     } else {
         eprintln!(
             "{}",
             serde_json::json!({"attention_calibration_cache":{"schema":2,"lengths":LENGTHS,"bucket":bucket,"path":path,"cached":false,"action":"measure requested bucket"}})
         );
-        let cache = measure(d, ops, c, key, query_rows, bucket, closure)
-            .context("measure attention candidates")?;
-        check(&cache, &cache.key, query_rows, bucket)?;
+        let cache =
+            measure(d, ops, c, key, bucket, closure).context("measure attention candidates")?;
+        check(&cache, &cache.key, bucket)?;
         let temp = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -391,58 +361,19 @@ pub(super) fn uniform_attention_error(
         .fold((0f64, 0f64), |(a, r), (e, q)| (a.max(e), r.max(q)))
 }
 
-enum Candidate {
-    Decode(Attention),
-    Multi(Verification),
-}
-
-struct Buffers<'a> {
-    q: &'a cudarc::driver::CudaSlice<bf16>,
-    k: &'a cudarc::driver::CudaSlice<bf16>,
-    v: &'a cudarc::driver::CudaSlice<bf16>,
-    out: &'a mut cudarc::driver::CudaSlice<bf16>,
-    length: &'a cudarc::driver::CudaSlice<i32>,
-}
-
-impl Candidate {
-    fn run(&mut self, d: &Device, b: Buffers<'_>, capacity: usize, rows: usize) -> Result<()> {
-        match self {
-            Self::Decode(a) => a.run(&d.stream, b.q, b.k, b.v, b.out, b.length),
-            Self::Multi(a) => a.run(
-                b.q,
-                b.k,
-                b.v,
-                b.out,
-                b.length,
-                Shape {
-                    rows,
-                    start: 0,
-                    q_heads: 16,
-                    kv_heads: 2,
-                    capacity,
-                    head_dim: 128,
-                    causal: true,
-                },
-            ),
-        }
-    }
-}
-
 fn measure(
     d: &Device,
     ops: &Ops,
     c: &Config,
     key: CacheKey,
-    query_rows: Option<usize>,
     selected: usize,
     closure: &super::closure::Closure,
 ) -> Result<Cache> {
     closure.measurement()?;
     let start = Instant::now();
     let s = &d.stream;
-    let rows = query_rows.unwrap_or(1);
-    let trial_ms = if query_rows.is_some() { 15 } else { 30 };
-    let mut q = s.alloc_zeros::<bf16>(rows * c.qkv_dim())?;
+    let trial_ms = 30;
+    let mut q = s.alloc_zeros::<bf16>(c.qkv_dim())?;
     let random = |count: usize, mut seed: u32| {
         (0..count)
             .map(|_| {
@@ -451,17 +382,16 @@ fn measure(
             })
             .collect::<Vec<_>>()
     };
-    let zero_q = vec![bf16::ZERO; rows * c.qkv_dim()];
-    let queries = random(rows * c.qkv_dim(), 4);
-    let capacities = CAPACITIES.map(|n| n + query_rows.unwrap_or(0));
-    let k = s.clone_htod(&random(capacities[selected] * c.kv_dim(), 1))?;
-    let v_values = random(capacities[selected] * c.kv_dim(), 2);
+    let zero_q = vec![bf16::ZERO; c.qkv_dim()];
+    let queries = random(c.qkv_dim(), 4);
+    let k = s.clone_htod(&random(CAPACITIES[selected] * c.kv_dim(), 1))?;
+    let v_values = random(CAPACITIES[selected] * c.kv_dim(), 2);
     let v_max = v_values
         .iter()
         .map(|v| v.to_f32().abs() as f64)
         .fold(0f64, f64::max);
     let v = s.clone_htod(&v_values)?;
-    let mut out = s.alloc_zeros::<bf16>(rows * c.hidden_size)?;
+    let mut out = s.alloc_zeros::<bf16>(c.hidden_size)?;
     let mut length = s.alloc_zeros::<i32>(1)?;
     let flush_count = d.info.l2_bytes.max(1024 * 1024);
     let mut flush = s.alloc_zeros::<bf16>(flush_count)?;
@@ -490,55 +420,29 @@ fn measure(
     let mut winner = None;
     for (bucket, &l) in LENGTHS.iter().enumerate().filter(|(b, _)| *b == selected) {
         s.memcpy_htod(&[l as i32], &mut length)?;
-        let mut expected = vec![0f64; rows * c.kv_dim()];
+        let mut expected = vec![0f64; c.kv_dim()];
         for head in 0..c.num_key_value_heads {
             let mut sum = vec![0f64; c.head_dim];
             for row in 0..l {
                 for (dim, value) in sum.iter_mut().enumerate() {
-                    *value += v_values[(head * capacities[bucket] + row) * c.head_dim + dim]
+                    *value += v_values[(head * CAPACITIES[bucket] + row) * c.head_dim + dim]
                         .to_f32() as f64;
                 }
             }
-            for qi in 0..rows {
-                let visible = if query_rows.is_some() { l + qi + 1 } else { l };
-                for (dim, value) in sum.iter_mut().enumerate() {
-                    if query_rows.is_some() {
-                        *value += v_values[(head * capacities[bucket] + l + qi) * c.head_dim + dim]
-                            .to_f32() as f64;
-                    }
-                    expected[(qi * c.num_key_value_heads + head) * c.head_dim + dim] =
-                        *value / visible as f64;
-                }
+            for (dim, value) in sum.iter().enumerate() {
+                expected[head * c.head_dim + dim] = *value / l as f64;
             }
         }
         let mut best = (f64::INFINITY, f64::INFINITY, usize::MAX);
-        for plan in plans(bucket, query_rows) {
+        for plan in plans(bucket) {
             let chunk = plan.chunk;
-            let mut attention = match query_rows {
-                Some(rows) => Candidate::Multi(Verification::candidate(
-                    &d.ctx,
-                    s,
-                    c,
-                    capacities[bucket],
-                    rows,
-                    plan,
-                )?),
-                None => Candidate::Decode(Attention::candidate(
-                    &d.ctx,
-                    s,
-                    c,
-                    capacities[bucket],
-                    plan,
-                    false,
-                )?),
-            };
-            if bucket >= 3
-                && let Candidate::Decode(op) = &attention
-            {
+            let mut attention =
+                Attention::candidate(&d.ctx, s, c, CAPACITIES[bucket], plan, false)?;
+            if bucket >= 3 {
                 let record = Occupancy {
                     plan,
                     blocks: l.div_ceil(chunk) * (16 / plan.qpack),
-                    active_per_sm: op
+                    active_per_sm: attention
                         .phase1_blocks_per_sm()
                         .context("query decode phase1 occupancy")?,
                 };
@@ -556,18 +460,7 @@ fn measure(
             s.memcpy_htod(&zero_q, &mut q)?;
             s.memcpy_htod(&[l as i32], &mut length)?;
             attention
-                .run(
-                    d,
-                    Buffers {
-                        q: &q,
-                        k: &k,
-                        v: &v,
-                        out: &mut out,
-                        length: &length,
-                    },
-                    capacities[bucket],
-                    rows,
-                )
+                .run(s, &q, &k, &v, &mut out, &length)
                 .context("warm attention candidate")?;
             s.synchronize()?;
             let actual = s.clone_dtoh(&out)?;
@@ -575,32 +468,15 @@ fn measure(
                 actual.iter().all(|v| v.is_finite()),
                 "nonfinite calibration output"
             );
-            let (max_error, ratio) = uniform_attention_error(
-                c,
-                &actual,
-                &expected,
-                chunk,
-                l + query_rows.unwrap_or(0),
-                v_max,
-            );
+            let (max_error, ratio) =
+                uniform_attention_error(c, &actual, &expected, chunk, l, v_max);
             ensure!(
                 ratio <= 1.0,
                 "calibration uniform-attention reference mismatch: max_error={max_error} error/bound={ratio}"
             );
             s.memcpy_htod(&queries, &mut q)?;
             s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-            let launch = attention.run(
-                d,
-                Buffers {
-                    q: &q,
-                    k: &k,
-                    v: &v,
-                    out: &mut out,
-                    length: &length,
-                },
-                capacities[bucket],
-                rows,
-            );
+            let launch = attention.run(s, &q, &k, &v, &mut out, &length);
             let graph = s.end_capture(sys::CUgraphInstantiate_flags(0));
             launch?;
             let graph = graph?.context("empty calibration graph")?;
@@ -662,7 +538,6 @@ fn measure(
     }
     let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
     Ok(Cache {
-        query_rows,
         schema: 2,
         lengths: LENGTHS,
         key,
@@ -1535,7 +1410,7 @@ mod long_tests {
             };
             let mut trials = Vec::new();
             let mut phase1 = Vec::new();
-            for plan in plans(bucket, None) {
+            for plan in plans(bucket) {
                 if bucket >= 3 {
                     let o = Occupancy {
                         plan,
@@ -1562,7 +1437,6 @@ mod long_tests {
                 });
             }
             let mut cache = Cache {
-                query_rows: None,
                 schema: 2,
                 key,
                 winner: trials[0].plan,
@@ -1573,25 +1447,25 @@ mod long_tests {
                 phase1,
                 wall_ms: 1.0,
             };
-            check(&cache, &cache.key, None, bucket)?;
+            check(&cache, &cache.key, bucket)?;
             let winner = cache.winner;
             cache.winner = cache.trials[1].plan;
-            assert!(check(&cache, &cache.key, None, bucket).is_err());
+            assert!(check(&cache, &cache.key, bucket).is_err());
             cache.winner = winner;
-            assert!(check(&cache, &cache.key, None, (bucket + 1) % LENGTHS.len()).is_err());
+            assert!(check(&cache, &cache.key, (bucket + 1) % LENGTHS.len()).is_err());
             if bucket >= 3 {
                 cache.phase1[0].blocks += 1;
-                assert!(check(&cache, &cache.key, None, bucket).is_err());
+                assert!(check(&cache, &cache.key, bucket).is_err());
                 cache.phase1[0].blocks -= 1;
             }
             cache.schema = 1;
-            assert!(check(&cache, &cache.key, None, bucket).is_err());
+            assert!(check(&cache, &cache.key, bucket).is_err());
             cache.schema = 2;
             cache.lengths[4] = 32768;
-            assert!(check(&cache, &cache.key, None, bucket).is_err());
+            assert!(check(&cache, &cache.key, bucket).is_err());
             cache.lengths = LENGTHS;
             cache.trials.pop();
-            assert!(check(&cache, &cache.key, None, bucket).is_err());
+            assert!(check(&cache, &cache.key, bucket).is_err());
         }
         Ok(())
     }

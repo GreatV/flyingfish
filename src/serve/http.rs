@@ -1064,9 +1064,7 @@ mod tests {
                 .expect("request");
         let response = completions(State(state), Json(request)).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let EngineCommand::Generate { events, .. } = commands.try_recv().expect("generate") else {
-            panic!("expected Generate");
-        };
+        let EngineCommand { events, .. } = commands.try_recv().expect("generate");
         assert!(!events.is_closed());
         drop(response);
         assert!(events.is_closed());
@@ -1123,11 +1121,8 @@ mod tests {
     async fn completion_respects_exact_plain_capacity_and_counts() {
         let (state, commands) = test_state(2, Slot::Idle);
         let worker = std::thread::spawn(move || {
-            let EngineCommand::Generate { request, events } =
-                commands.recv_timeout(Duration::from_secs(5)).unwrap()
-            else {
-                panic!("expected Generate");
-            };
+            let EngineCommand { request, events } =
+                commands.recv_timeout(Duration::from_secs(5)).unwrap();
             assert_eq!(request.ids, [1]);
             assert_eq!(request.max_new_tokens, 1);
             events
@@ -1458,9 +1453,7 @@ mod tests {
             }))?;
             let response = chat_completions(State(state), Json(request)).await;
             assert_eq!(response.status(), StatusCode::OK, "{}", case["name"]);
-            let EngineCommand::Generate { request, events } = commands.try_recv()? else {
-                panic!("expected Generate");
-            };
+            let EngineCommand { request, events } = commands.try_recv()?;
             assert_eq!(request.ids, expected, "{} chat IDs", case["name"]);
             let prepared = request.images.context("image payload")?;
             let grids: Vec<_> = prepared.grids.iter().map(|g| [g.t, g.h, g.w]).collect();
@@ -1573,11 +1566,8 @@ mod tests {
                 case["name"]
             );
             let worker = std::thread::spawn(move || {
-                let EngineCommand::Generate { request, events } =
-                    commands.recv_timeout(Duration::from_secs(5)).unwrap()
-                else {
-                    panic!("expected Generate");
-                };
+                let EngineCommand { request, events } =
+                    commands.recv_timeout(Duration::from_secs(5)).unwrap();
                 events
                     .blocking_send(EngineEvent::Tokens {
                         ids: output.clone(),

@@ -22,75 +22,12 @@ __device__ __forceinline__ int input_row(const int* path, int row, int count, in
 }
 }
 
-extern "C" __global__ void tree_prepare(const uint32_t* tokens, const int* depth,
-    const int* rows, const int* expected, const int* prefix, int* snapshot,
-    uint32_t* ids, int* positions, int* slots, int budget, int capacity) {
-    const int n = *rows, start = *prefix;
-    tree_meta::rows(n);
-    tree_meta::extent(start,budget,capacity);
-    if (n > budget || start != *expected) __trap();
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (!row) *snapshot = start;
-    if (row >= budget) return;
-    if (row < n) {
-        if (depth[row] < 0 || depth[row] > 7) __trap();
-        ids[row] = tokens[row];
-        positions[row] = start + depth[row];
-    } else {
-        ids[row] = 0;
-        positions[row] = 0;
-    }
-    slots[row] = start + row;
-}
-
 extern "C" __global__ void tree_logits(const __nv_bfloat16* source,
     __nv_bfloat16* destination, const int* row, const int* rows, int width) {
     tree_meta::rows(*rows);
     if (*row < 0 || *row >= *rows || width < 1) __trap();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < width) destination[i] = source[size_t(*row)*width+i];
-}
-
-extern "C" __global__ void tree_rope(__nv_bfloat16* qkv, const int* positions,
-    const int* rows, int budget, int q_heads, int kv_heads, int dim, float theta) {
-    const int n = *rows;
-    tree_meta::rows(n);
-    if (budget < n || budget > 64) __trap();
-    if (q_heads != 16 || kv_heads != 2 || dim != 128 || !isfinite(theta) || theta <= 0.f) __trap();
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= budget * 20 * 64) return;
-    const int d = i % 64, head = (i / 64) % 20, row = i / (20 * 64);
-    const int off = row * 2560 + head * 128 + d;
-    if (row >= n) {
-        qkv[off] = __float2bfloat16(0.f);
-        qkv[off+64] = __float2bfloat16(0.f);
-        return;
-    }
-    if (head >= 18) return;
-    if (positions[row] < 0) __trap();
-    const float angle = float(positions[row]) * (1.f / powf(theta, float(2*d)/128));
-    const __nv_bfloat16 c = __float2bfloat16(cosf(angle)), s = __float2bfloat16(sinf(angle));
-    const __nv_bfloat16 a = qkv[off], b = qkv[off + 64];
-    qkv[off] = __hsub(__hmul(a,c),__hmul(b,s));
-    qkv[off+64] = __hadd(__hmul(b,c),__hmul(a,s));
-}
-
-extern "C" __global__ void tree_kv_write(const __nv_bfloat16* qkv, __nv_bfloat16* k,
-    __nv_bfloat16* v, const int* prefix, const int* rows, int budget, int capacity) {
-    const int n = *rows, start = *prefix;
-    tree_meta::extent(start,budget,capacity);
-    if (n < 1 || n > budget) __trap();
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= budget * 256) return;
-    const int d = i % 128, head = (i / 128) % 2, row = i / 256;
-    const size_t dst = (size_t(head) * capacity + start + row) * 128 + d;
-    if (row < n) {
-        k[dst] = qkv[row*2560 + 2048 + head*128 + d];
-        v[dst] = qkv[row*2560 + 2304 + head*128 + d];
-    } else {
-        k[dst] = __float2bfloat16(0.f);
-        v[dst] = __float2bfloat16(0.f);
-    }
 }
 
 extern "C" __global__ void tree_kv_gather(const uint64_t* k, const uint64_t* v,
@@ -135,12 +72,3 @@ extern "C" __global__ void tree_hidden_gather(const __nv_bfloat16* hidden,
     compact[i] = hidden[size_t(src)*width+i%width];
 }
 
-extern "C" __global__ void tree_hidden_scatter(const __nv_bfloat16* compact,
-    __nv_bfloat16* hidden, const int* count, const int* start, int capacity, int width) {
-    const int n = *count, base = *start;
-    tree_meta::extent(base,n,capacity);
-    if (width != 2048 && width != 10240) __trap();
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n * width) return;
-    hidden[size_t(base)*width+i] = compact[i];
-}

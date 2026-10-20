@@ -69,10 +69,10 @@
 //   partial index = (kv*NC + ch)*8*M + p
 //   Size: 16 * NC * M * 130 floats. Each partial is written by exactly one block.
 //
-// CUDA Graph: non-_host entry points read L from len_dev; _host variants take
-// L by value. M, chunk and the anc pointer are fixed per capture; M and chunk
-// are identical in both phases. Phase 1 may launch with grid.x = nchunks_max;
-// blocks with blockIdx.x >= ceil((L+M)/chunk) return before writing.
+// CUDA Graph: entry points read L from len_dev. M, chunk and the anc pointer
+// are fixed per capture; M and chunk are identical in both phases. Phase 1 may
+// launch with grid.x = nchunks_max; blocks with blockIdx.x >= ceil((L+M)/chunk)
+// return before writing.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -564,19 +564,6 @@ extern "C" __global__ void __launch_bounds__(NT) tcmqa_phase1(
                              k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
 }
 
-extern "C" __global__ void __launch_bounds__(NT) tcmqa_phase1_host(
-    const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
-    float* __restrict__ scratch, int L, int M,
-    int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-    int q_tok_stride, int q_head_stride,
-    int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride,
-    int chunk, const unsigned long long* __restrict__ anc) {
-  FD_GUARD_P1;
-  tcmqa_phase1_entry<MT, NT>(q, k, v, scratch, anc, L, M, chunk,
-                             q_tok_stride, q_head_stride,
-                             k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
-}
-
 // Wide pair-tile variant: one 128-row tile per block; 8 warps share one K/V
 // smem tile set.
 extern "C" __global__ void __launch_bounds__(256) tcmqa_phase1_w(
@@ -588,19 +575,6 @@ extern "C" __global__ void __launch_bounds__(256) tcmqa_phase1_w(
     int chunk, const unsigned long long* __restrict__ anc) {
   FD_GUARD_P1W;
   tcmqa_phase1_entry<128, 256>(q, k, v, scratch, anc, *len_dev, M, chunk,
-                               q_tok_stride, q_head_stride,
-                               k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
-}
-
-extern "C" __global__ void __launch_bounds__(256) tcmqa_phase1_w_host(
-    const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
-    float* __restrict__ scratch, int L, int M,
-    int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-    int q_tok_stride, int q_head_stride,
-    int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride,
-    int chunk, const unsigned long long* __restrict__ anc) {
-  FD_GUARD_P1W;
-  tcmqa_phase1_entry<128, 256>(q, k, v, scratch, anc, L, M, chunk,
                                q_tok_stride, q_head_stride,
                                k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
 }
@@ -628,16 +602,6 @@ extern "C" __global__ void tcmqa_phase2(float* __restrict__ scratch,
   tcmqa_phase2_entry(scratch, o, *len_dev, M, chunk, n_q_heads, o_tok_stride, o_head_stride);
 }
 
-extern "C" __global__ void tcmqa_phase2_host(float* __restrict__ scratch,
-                                             bf16* __restrict__ o, int L, int M,
-                                             int n_q_heads, int n_kv_heads, int gqa,
-                                             int head_dim,
-                                             int o_tok_stride, int o_head_stride,
-                                             int chunk) {
-  FD_GUARD_P2;
-  tcmqa_phase2_entry(scratch, o, L, M, chunk, n_q_heads, o_tok_stride, o_head_stride);
-}
-
 __device__ __forceinline__ void tcmqa_phase2_short_entry(
     float* __restrict__ scratch, bf16* __restrict__ o, int L, int M,
     int chunk, int o_tok_stride, int o_head_stride) {
@@ -658,15 +622,6 @@ extern "C" __global__ void tcmqa_phase2_short(
     int o_tok_stride, int o_head_stride, int chunk) {
   FD_GUARD_P2;
   tcmqa_phase2_short_entry(scratch, o, *len_dev, M, chunk,
-                          o_tok_stride, o_head_stride);
-}
-
-extern "C" __global__ void tcmqa_phase2_short_host(
-    float* __restrict__ scratch, bf16* __restrict__ o, int L, int M,
-    int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-    int o_tok_stride, int o_head_stride, int chunk) {
-  FD_GUARD_P2;
-  tcmqa_phase2_short_entry(scratch, o, L, M, chunk,
                           o_tok_stride, o_head_stride);
 }
 
@@ -699,19 +654,6 @@ extern "C" __global__ void __launch_bounds__(256) tcmqa_phase1_ws(
     int chunk, const unsigned long long* __restrict__ anc) {
   FD_GUARD_P1W;
   tcmqa_phase1_entry_ws(q, k, v, scratch, anc, *len_dev, M, chunk,
-                        q_tok_stride, q_head_stride,
-                        k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
-}
-
-extern "C" __global__ void __launch_bounds__(256) tcmqa_phase1_ws_host(
-    const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
-    float* __restrict__ scratch, int L, int M,
-    int n_q_heads, int n_kv_heads, int gqa, int head_dim,
-    int q_tok_stride, int q_head_stride,
-    int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride,
-    int chunk, const unsigned long long* __restrict__ anc) {
-  FD_GUARD_P1W;
-  tcmqa_phase1_entry_ws(q, k, v, scratch, anc, L, M, chunk,
                         q_tok_stride, q_head_stride,
                         k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
 }
