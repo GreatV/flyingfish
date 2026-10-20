@@ -88,6 +88,7 @@ pub(crate) struct GdnBindings {
 struct Kernels {
     gate: CudaFunction,
     conv: CudaFunction,
+    conv_l2: Option<CudaFunction>,
     hist_update: CudaFunction,
     prep: CudaFunction,
     beta_widen: CudaFunction,
@@ -240,7 +241,7 @@ impl GdnPlan {
             snapshots,
             kernels: self.kernels.clone(),
             bindings,
-            ws: GdnWorkspace::new(&self.spec, rows)?,
+            ws: GdnWorkspace::new(&self.spec, rows, cw_p2)?,
             conv_dim: self.conv_dim,
             l2_eps: self.l2_eps,
             max_rows: rows,
@@ -294,10 +295,16 @@ impl GdnPlan {
             v_row_stride: src.v_row_stride,
         };
         let (a_cfg, h_cfg) = cw_p2_grids(rows, self.spec.hv);
+        let compact = self.ws.q_bf16.bytes > 0;
+        let a_query = if compact {
+            ws + self.ws.q_bf16.offset
+        } else {
+            stage.q
+        };
+        let a_key = ws + self.ws.k_bf16.offset;
         unsafe {
-            stream
-                .launch_builder(&p2.a)
-                .arg(&stage.q)
+            let mut a = stream.launch_builder(&p2.a);
+            a.arg(&a_query)
                 .arg(&stage.k)
                 .arg(&stage.v)
                 .arg(&stage.beta)
@@ -305,8 +312,11 @@ impl GdnPlan {
                 .arg(&stage.ws)
                 .arg(&stage.meta)
                 .arg(&stage.valid_rows)
-                .arg(&stage.v_row_stride)
-                .launch(a_cfg)?;
+                .arg(&stage.v_row_stride);
+            if compact {
+                a.arg(&a_key);
+            }
+            a.launch(a_cfg)?;
             stream
                 .launch_builder(&p2.h)
                 .arg(&stage.q)
@@ -347,7 +357,8 @@ impl GdnOps {
         cw_p2: bool,
     ) -> Result<GdnPlan> {
         spec.validate()?;
-        let ws = GdnWorkspace::new(spec, max_rows)?;
+        let ws = GdnWorkspace::new(spec, max_rows, cw_p2)?;
+        let compact = ws.q_bf16.bytes > 0;
         let conv_dim = spec.conv_dim()?;
         let suffix = spec.kernel_suffix()?;
         let compiled_width = match suffix {
@@ -416,7 +427,11 @@ impl GdnOps {
         let p2 = if !cw_p2 {
             None
         } else {
-            let p2_mod = module("gdn_cw_p2")?;
+            let p2_mod = module(if compact {
+                "gdn_cw_p2_compact"
+            } else {
+                "gdn_cw_p2"
+            })?;
             Some(ChunkwiseP2 {
                 a: p2_mod.load_function("gdn_cw_p2_stage_a")?,
                 h: p2_mod.load_function("gdn_cw_p2_stage_h")?,
@@ -428,6 +443,11 @@ impl GdnOps {
             core_snapshot,
             rstep,
             conv: f_conv,
+            conv_l2: if compact {
+                Some(conv.load_function("gdn_conv_l2_compact")?)
+            } else {
+                None
+            },
             hist_update: f_hist,
             prep: f_prep,
             beta_widen: f_beta,
@@ -569,8 +589,8 @@ impl GdnOps {
         let mut beta = ws_bf16(plan.ws.beta, ws_ptr, rows, plan.spec.hv)?;
         let beta_fp32 = ws_f32(plan.ws.beta_fp32, ws_ptr, rows, plan.spec.hv)?;
         let mut g = ws_f32(plan.ws.g, ws_ptr, rows, plan.spec.hv)?;
-        let q_fp32 = ws_f32_3(plan.ws.q_fp32, ws_ptr, rows, plan.spec.hv, plan.spec.dv)?;
-        let k_fp32 = ws_f32_3(plan.ws.k_fp32, ws_ptr, rows, plan.spec.hv, plan.spec.dv)?;
+        let q_fp32 = ws_f32_3(plan.ws.q_fp32, ws_ptr, rows, plan.ws.qk_heads, plan.spec.dk)?;
+        let k_fp32 = ws_f32_3(plan.ws.k_fp32, ws_ptr, rows, plan.ws.qk_heads, plan.spec.dk)?;
         let v_fp32 = ws_f32_3(plan.ws.v_fp32, ws_ptr, rows, plan.spec.hv, plan.spec.dv)?;
 
         let dom = RowDomain {
@@ -580,19 +600,41 @@ impl GdnOps {
         };
         let l2_eps = plan.l2_eps;
         let conv_ptr = conv_out.0.ptr;
+        let compact = plan.ws.q_bf16.bytes > 0;
 
         // conv: qkv -> conv_out with the exact SiLU; the conv output is cast to BF16 and back
         // before silu() (ABI §5).
         unsafe {
-            stream
-                .launch_builder(&plan.kernels.conv)
-                .arg(&b.qkv.ptr)
+            let function = if compact {
+                plan.kernels
+                    .conv_l2
+                    .as_ref()
+                    .context("compact GDN convolution not bound")?
+            } else {
+                &plan.kernels.conv
+            };
+            let q_bf16 = ws_ptr + plan.ws.q_bf16.offset;
+            let k_bf16 = ws_ptr + plan.ws.k_bf16.offset;
+            if compact {
+                ws_region(plan.ws.q_bf16, rows, plan.ws.qk_heads * DK, 2)?;
+                ws_region(plan.ws.k_bf16, rows, plan.ws.qk_heads * DK, 2)?;
+            }
+            let cd_i32 = cd as i32;
+            let mut conv = stream.launch_builder(function);
+            conv.arg(&b.qkv.ptr)
                 .arg(&b.conv_weight.ptr)
                 .arg(&b.history.0.ptr)
                 .arg(&conv_ptr)
                 .arg(&meta.ptr)
-                .arg(&(cd as i32))
-                .launch(plan.conv_cfg)?;
+                .arg(&cd_i32);
+            if compact {
+                conv.arg(&q_fp32.0.ptr)
+                    .arg(&k_fp32.0.ptr)
+                    .arg(&q_bf16)
+                    .arg(&k_bf16)
+                    .arg(&l2_eps);
+            }
+            conv.launch(plan.conv_cfg)?;
             // hist_update: after conv, same stream.
             if let Some((_, history)) = snapshots {
                 stream
@@ -641,18 +683,20 @@ impl GdnOps {
                 .launch(plan.beta_cfg)?;
             // Q/K expand to value heads; Q is scaled by 1/sqrt(dk).
             let v = if plan.cw_p2 { 0 } else { v_fp32.0.ptr };
-            stream
-                .launch_builder(&plan.kernels.prep)
-                .arg(&q)
-                .arg(&k)
-                .arg(&v_bf16.ptr)
-                .arg(&q_fp32.0.ptr)
-                .arg(&k_fp32.0.ptr)
-                .arg(&v)
-                .arg(&cd)
-                .arg(&meta.ptr)
-                .arg(&l2_eps)
-                .launch(plan.prep_cfg)?;
+            if !compact {
+                stream
+                    .launch_builder(&plan.kernels.prep)
+                    .arg(&q)
+                    .arg(&k)
+                    .arg(&v_bf16.ptr)
+                    .arg(&q_fp32.0.ptr)
+                    .arg(&k_fp32.0.ptr)
+                    .arg(&v)
+                    .arg(&cd)
+                    .arg(&meta.ptr)
+                    .arg(&l2_eps)
+                    .launch(plan.prep_cfg)?;
+            }
         }
 
         // The core is selected by phase, never by a host valid_rows. The launch builder must be one
@@ -1118,6 +1162,8 @@ mod tests {
         prefix_histories: Vec<f32>,
         norm_ratio: f64,
         snapshot_mismatches: usize,
+        p2_prepared: Vec<u8>,
+        p2_slots: Vec<u8>,
     }
 
     fn geometry_meta(
@@ -1146,6 +1192,7 @@ mod tests {
         Chunked,
         P1(u32),
         P2,
+        P2Expanded,
         WrongHeadStride,
     }
 
@@ -1160,21 +1207,28 @@ mod tests {
         use cudarc::driver::{DevicePtr, sys};
         let stream = &device.stream;
         let mut buffers = GeometryBuffers::new(stream, spec, rows, valid)?;
-        let p2 = matches!(core, GeometryCore::P2);
-        let bytes = GdnOps::workspace(
-            &spec,
-            rows,
-            if p2 { GdnPolicy::P2 } else { GdnPolicy::LEGACY },
-        )?
-        .bytes;
+        let p2 = matches!(core, GeometryCore::P2 | GeometryCore::P2Expanded);
+        let compact_binding = p2 && !matches!(core, GeometryCore::P2Expanded);
+        let layout = GdnWorkspace::new(&spec, rows, compact_binding)?;
+        let bytes = add(
+            layout.bytes,
+            if p2 { cw_p2_bytes(spec.hv, rows) } else { 0 },
+        )?;
         let mut workspace = stream.alloc_zeros::<u8>(bytes as usize)?;
         let ptr = workspace.device_ptr(stream).0;
         let mut plans = Vec::new();
         let sequential = matches!(core, GeometryCore::Recurrent);
         if !sequential && valid < rows {
-            let layout = GdnWorkspace::new(&spec, rows)?;
-            let live = valid as usize * spec.hv as usize * 128 * size_of::<f32>();
-            for region in [layout.q_fp32, layout.k_fp32] {
+            for (region, element_bytes) in [
+                (layout.q_fp32, 4),
+                (layout.k_fp32, 4),
+                (layout.q_bf16, 2),
+                (layout.k_bf16, 2),
+            ] {
+                if region.bytes == 0 {
+                    continue;
+                }
+                let live = valid as usize * layout.qk_heads as usize * 128 * element_bytes;
                 let start = region.offset as usize + live;
                 let end = (region.offset + region.bytes) as usize;
                 stream.memcpy_htod(
@@ -1191,8 +1245,22 @@ mod tests {
                 &spec,
                 bound,
                 buffers.bindings(stream, spec, bound, row)?,
-                p2,
+                compact_binding,
             )?;
+            if matches!(core, GeometryCore::P2Expanded) {
+                let module = cubin::module(
+                    &device.ctx,
+                    &format!("gdn/gdn_cw_p2{}", spec.kernel_suffix()?),
+                )?;
+                Arc::get_mut(&mut plan.kernels)
+                    .context("expanded P2 kernels are shared")?
+                    .p2 = Some(ChunkwiseP2 {
+                    a: module.load_function("gdn_cw_p2_stage_a")?,
+                    h: module.load_function("gdn_cw_p2_stage_h")?,
+                });
+                plan.cw_p2 = true;
+                plan.ws_p2 = cw_p2_bytes(spec.hv, rows);
+            }
             if matches!(core, GeometryCore::Verify) {
                 plan = plan.for_rows(rows, Some(buffers.bind_snapshots(stream, spec)?))?;
             }
@@ -1303,8 +1371,16 @@ mod tests {
         let checked_rows = if sequential { 1 } else { valid };
         let norm_ratio = geometry_qk_norm(&data, plan, checked_rows)?;
         if !sequential && valid < rows {
-            let live = valid as usize * spec.hv as usize * 128 * size_of::<f32>();
-            for region in [plan.ws.q_fp32, plan.ws.k_fp32] {
+            for (region, element_bytes) in [
+                (plan.ws.q_fp32, 4),
+                (plan.ws.k_fp32, 4),
+                (plan.ws.q_bf16, 2),
+                (plan.ws.k_bf16, 2),
+            ] {
+                if region.bytes == 0 {
+                    continue;
+                }
+                let live = valid as usize * plan.ws.qk_heads as usize * 128 * element_bytes;
                 let start = region.offset as usize + live;
                 let end = (region.offset + region.bytes) as usize;
                 ensure!(
@@ -1335,6 +1411,46 @@ mod tests {
             "geometry fixture wrote an inactive row"
         );
         let mut snapshot_mismatches = 0;
+        let (p2_prepared, p2_slots) = if p2 {
+            let mut prepared = data[plan.ws.conv_out.offset as usize
+                ..plan.ws.conv_out.offset as usize + valid as usize * plan.conv_dim as usize * 2]
+                .to_vec();
+            for row in 0..valid as usize {
+                for head in 0..spec.hv as usize {
+                    let physical = if plan.ws.qk_heads == spec.hk {
+                        head / (spec.hv / spec.hk) as usize
+                    } else {
+                        head
+                    };
+                    for d in 0..DK as usize {
+                        let index = (row * plan.ws.qk_heads as usize + physical) * DK as usize + d;
+                        for (full, rounded) in [
+                            (plan.ws.q_fp32, plan.ws.q_bf16),
+                            (plan.ws.k_fp32, plan.ws.k_bf16),
+                        ] {
+                            let offset = full.offset as usize + index * 4;
+                            let bits = &data[offset..offset + 4];
+                            prepared.extend_from_slice(bits);
+                            if rounded.bytes > 0 {
+                                let offset = rounded.offset as usize + index * 2;
+                                prepared.extend_from_slice(&data[offset..offset + 2]);
+                            } else {
+                                prepared.extend_from_slice(
+                                    &bf16::from_f32(f32::from_ne_bytes(bits.try_into()?))
+                                        .to_bits()
+                                        .to_ne_bytes(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let slots =
+                stream.clone_dtoh(&workspace.slice(plan.ws.bytes as usize..bytes as usize))?;
+            (prepared, slots)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         if let Some((saved_state, saved_history)) = &buffers.snapshots {
             let states = stream.clone_dtoh(saved_state)?;
             let histories = stream.clone_dtoh(saved_history)?;
@@ -1379,6 +1495,8 @@ mod tests {
             prefix_histories,
             norm_ratio,
             snapshot_mismatches,
+            p2_prepared,
+            p2_slots,
         })
     }
 
@@ -1496,10 +1614,15 @@ mod tests {
                         1.0
                     };
                     for child in 0..spec.hv / spec.hk {
-                        let head = kh * (spec.hv / spec.hk) as usize + child as usize;
+                        let head = if plan.ws.qk_heads == spec.hk {
+                            kh
+                        } else {
+                            kh * (spec.hv / spec.hk) as usize + child as usize
+                        };
                         for d in 0..spec.dk as usize {
                             let expected = read_bf16(offset + d * 2) * inv * scale;
-                            let index = (row * spec.hv as usize + head) * spec.dk as usize + d;
+                            let index =
+                                (row * plan.ws.qk_heads as usize + head) * spec.dk as usize + d;
                             let actual = read_f32(region.offset as usize + index * 4);
                             ensure!(actual.is_finite(), "nonfinite GDN Q/K preparation");
                             let error = (actual - expected).abs();
@@ -1662,7 +1785,48 @@ mod tests {
                             geometry_run(&device, spec, rows, valid, reference_core, false)?;
                         let candidate = geometry_run(&device, spec, rows, valid, core, graph)?;
                         let mismatches = geometry_mismatches(&candidate, &reference);
+                        let compact_mismatches = if matches!(core, GeometryCore::P2)
+                            && spec.hv == 48
+                            && rows > crate::gdn_plan::MIN_VERIFY_ROWS
+                        {
+                            let expanded = geometry_run(
+                                &device,
+                                spec,
+                                rows,
+                                valid,
+                                GeometryCore::P2Expanded,
+                                false,
+                            )?;
+                            let mismatches = geometry_mismatches(&candidate, &expanded)
+                                + candidate
+                                    .p2_prepared
+                                    .iter()
+                                    .zip(&expanded.p2_prepared)
+                                    .filter(|(a, b)| a != b)
+                                    .count()
+                                + candidate
+                                    .p2_slots
+                                    .iter()
+                                    .zip(&expanded.p2_slots)
+                                    .filter(|(a, b)| a != b)
+                                    .count();
+                            ensure!(
+                                candidate.p2_prepared.len() == expanded.p2_prepared.len()
+                                    && candidate.p2_slots.len() == expanded.p2_slots.len(),
+                                "compact P2 comparison extent differs"
+                            );
+                            println!(
+                                "{} GDN_COMPACT_BITS rows={rows} valid={valid} graph={graph} prepared_bytes={} slot_bytes={} mismatches={mismatches}",
+                                if mismatches == 0 { "PASS" } else { "DEFECT" },
+                                candidate.p2_prepared.len(),
+                                candidate.p2_slots.len()
+                            );
+                            mismatches
+                        } else {
+                            0
+                        };
                         let passed = mismatches == 0
+                            && compact_mismatches == 0
                             && candidate.norm_ratio <= 1.0
                             && reference.norm_ratio <= 1.0;
                         println!(
@@ -2341,7 +2505,7 @@ mod tests {
             };
             let conv_dim = u64::from(spec.conv_dim().expect("conv_dim"));
             for rows in [1u32, 64, 2048] {
-                let ws = GdnWorkspace::new(&spec, rows).expect("workspace");
+                let ws = GdnWorkspace::new(&spec, rows, false).expect("workspace");
                 let r = u64::from(rows);
                 let head = u64::from(spec.hv);
                 let d = u64::from(DV);
@@ -2412,7 +2576,10 @@ mod tests {
         let b = GdnOps::workspace(&spec, 2048, GdnPolicy::LEGACY).expect("workspace");
         assert_eq!(a.bytes, b.bytes);
         assert_eq!(a.alignment, 256);
-        assert_eq!(a.bytes, GdnWorkspace::new(&spec, 2048).expect("ws").bytes);
+        assert_eq!(
+            a.bytes,
+            GdnWorkspace::new(&spec, 2048, false).expect("ws").bytes
+        );
         // decode's plan is max_rows = 1; the Engine shares one scratch sized to the larger.
         let d = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY).expect("decode workspace");
         assert!(
@@ -2516,10 +2683,11 @@ mod tests {
             );
             // The planner's number, with the split armed, is the fused layout plus the
             // slots; unarmed it is the fused layout alone.
-            let fused = GdnWorkspace::new(&spec, rows)?.bytes;
+            let fused = GdnWorkspace::new(&spec, rows, false)?.bytes;
             assert_eq!(
                 GdnPolicy::P2.workspace(&spec, rows)?.bytes,
-                fused + cw_p2_bytes(qwen.hv, rows),
+                GdnWorkspace::new(&spec, rows, GdnPolicy::P2.cw_p2_for_step(rows))?.bytes
+                    + cw_p2_bytes(qwen.hv, rows),
                 "rows={rows}"
             );
             assert_eq!(
@@ -3206,7 +3374,7 @@ mod gpu_probe {
     /// of conv_out / q / k / v / beta_fp32 / g, plus the final state S.
     fn dump_workspace(case: &Case, name: &str, s: &Arc<CudaStream>) -> Result<()> {
         let qwen = GdnSpec::q38();
-        let ws = GdnWorkspace::new(&GdnSpec::q38(), case.man.plan_rows)?;
+        let ws = GdnWorkspace::new(&GdnSpec::q38(), case.man.plan_rows, false)?;
         let host = s.clone_dtoh(&case.scratch_buf)?;
         let valid = case.man.valid as u64;
         let cd = 10_240u64;

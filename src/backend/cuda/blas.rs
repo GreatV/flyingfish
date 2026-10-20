@@ -257,6 +257,11 @@ impl Drop for Plan {
     }
 }
 
+enum BiasedPlan {
+    Lt(Plan),
+    Fused(CudaFunction, LaunchConfig),
+}
+
 pub struct Blas {
     choices: RefCell<BTreeMap<LinearShape, LinearChoice>>,
     coverage: Option<(usize, std::collections::BTreeSet<(usize, usize)>)>,
@@ -265,7 +270,8 @@ pub struct Blas {
     skinny: CudaFunction,
     invariant_rows: usize,
     plans: RefCell<BTreeMap<(usize, usize, usize, u32), Plan>>,
-    biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
+    biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), BiasedPlan>>,
+    sms: usize,
     bias_add: Option<CudaFunction>,
     handle: sys::cublasLtHandle_t,
     decode: CudaBlas,
@@ -317,6 +323,7 @@ impl Blas {
             invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
             biased_plans: RefCell::new(BTreeMap::new()),
+            sms: device.info.sms,
             bias_add: None,
             handle,
             decode,
@@ -822,16 +829,51 @@ impl Blas {
         let key = (shape, bias.ptr, mode);
         let mut plans = self.biased_plans.borrow_mut();
         if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry(key) {
-            let plan = Plan::new_with_bias(
-                self.handle,
-                shape.rows,
-                shape.output,
-                shape.input,
-                self.workspace.len(),
-                0,
-                (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
-            )?;
-            plan.describe(shape.rows, shape.output, shape.input)?;
+            let grid = if rows == 1 {
+                (output.div_ceil(4), 1, 1)
+            } else {
+                (output.div_ceil(128), rows.div_ceil(64), 1)
+            };
+            let fused = mode == super::linear::LinearBiasMode::AfterOutputRound
+                && input.is_multiple_of(32)
+                && output.is_multiple_of(8)
+                && bias.ptr.is_multiple_of(16)
+                && u64::from(grid.0) * u64::from(grid.1) >= self.sms as u64;
+            let plan = if fused {
+                let name = if rows == 1 {
+                    "gemv_bf16_after_bias"
+                } else {
+                    "gemm_bf16_after_bias"
+                };
+                let function =
+                    cubin::module(self.stream.context(), "gemm_skinny")?.load_function(name)?;
+                let config = LaunchConfig {
+                    grid_dim: grid,
+                    block_dim: (if rows == 1 { 128 } else { 256 }, 1, 1),
+                    shared_mem_bytes: if rows == 1 {
+                        0
+                    } else {
+                        2 * (128 + 64) * 40 * 2
+                    },
+                };
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"biased_linear_plan":{"kernel":name,"rows":rows,"output":output,"input":input,"grid":grid,"threads":config.block_dim.0,"shared_bytes":config.shared_mem_bytes}})
+                );
+                BiasedPlan::Fused(function, config)
+            } else {
+                let plan = Plan::new_with_bias(
+                    self.handle,
+                    shape.rows,
+                    shape.output,
+                    shape.input,
+                    self.workspace.len(),
+                    0,
+                    (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
+                )?;
+                plan.describe(shape.rows, shape.output, shape.input)?;
+                BiasedPlan::Lt(plan)
+            };
             entry.insert(plan);
         }
         if mode == super::linear::LinearBiasMode::AfterOutputRound && self.bias_add.is_none() {
@@ -884,6 +926,30 @@ impl Blas {
                 "biased Lt plan missing rows={} output={} input={} mode={mode:?}; bind before run/capture",
                 x.shape[0], weight.shape[0], weight.shape[1],
             ))?;
+        let p = match p {
+            BiasedPlan::Fused(function, config) => {
+                ensure!(
+                    [weight.ptr, x.ptr, y.0.ptr]
+                        .iter()
+                        .all(|p| p.is_multiple_of(16)),
+                    "fused biased linear requires 16-byte alignment"
+                );
+                unsafe {
+                    self.stream
+                        .launch_builder(function)
+                        .arg(&weight.ptr)
+                        .arg(&x.ptr)
+                        .arg(&bias.ptr)
+                        .arg(&y.0.ptr)
+                        .arg(&(weight.shape[0] as i32))
+                        .arg(&(weight.shape[1] as i32))
+                        .arg(&(x.shape[0] as i32))
+                        .launch(*config)?;
+                }
+                return Ok(());
+            }
+            BiasedPlan::Lt(plan) => plan,
+        };
         let (workspace, _read) = self.workspace.device_ptr(&self.stream);
         let alpha = 1f32;
         let beta = 0f32;

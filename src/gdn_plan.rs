@@ -126,14 +126,15 @@ impl GdnPolicy {
     }
     pub const fn identity(self) -> &'static str {
         if self.cw_p2 {
-            "gdn-plan-v4-c32-vs1-l2fp32-p2-w32"
+            "gdn-plan-v5-c32-vs1-l2fp32-p2-compact-w32"
         } else {
             GdnSpec::PLAN_ID
         }
     }
     /// All prebound operators reuse the arena sized by the maximum complete plan layout.
     pub fn workspace(self, spec: &GdnSpec, physical_rows: u32) -> Result<WorkspaceReq> {
-        let bytes = GdnWorkspace::new(spec, physical_rows)?.bytes;
+        let bytes =
+            GdnWorkspace::new(spec, physical_rows, self.cw_p2_for_step(physical_rows))?.bytes;
         Ok(WorkspaceReq {
             bytes: if self.cw_p2 {
                 add(bytes, cw_p2_bytes(spec.hv, physical_rows))?
@@ -163,12 +164,17 @@ pub struct GdnWorkspace {
     pub beta_fp32: Region,
     /// `[R, hv]` FP32 — `g = -exp(A_log) * softplus(a + dt_bias)`.
     pub g: Region,
-    /// `[R, hv, 128]` FP32 — Q widened, GQA-expanded and scaled by `1/sqrt(DK)`.
+    /// `[R, qk_heads, 128]` FP32 — Q normalized and scaled by `1/sqrt(DK)`.
     pub q_fp32: Region,
-    /// `[R, hv, 128]` FP32 — K widened and expanded to VALUE heads.
+    /// `[R, qk_heads, 128]` FP32 — normalized K.
     pub k_fp32: Region,
     /// `[R, hv, 128]` FP32 — V widened.
     pub v_fp32: Region,
+    /// `[R, hk, 128]` BF16 for unscaled P2 A operands; empty for expanded sources.
+    pub q_bf16: Region,
+    pub k_bf16: Region,
+    /// Physical head count of normalized Q/K, hk for compact P2 and hv otherwise.
+    pub qk_heads: u32,
     pub bytes: u64,
     pub alignment: u64,
 }
@@ -186,7 +192,7 @@ fn align(n: u64) -> Result<u64> {
 
 impl GdnWorkspace {
     /// CPU-only checked sizing; `max_rows` is a workspace capacity, not a device row count.
-    pub fn new(spec: &GdnSpec, max_rows: u32) -> Result<Self> {
+    pub fn new(spec: &GdnSpec, max_rows: u32, p2: bool) -> Result<Self> {
         spec.validate()?;
         ensure!(max_rows > 0, "GDN max_rows must be positive");
         let conv_dim = u64::from(spec.conv_dim()?);
@@ -195,20 +201,30 @@ impl GdnWorkspace {
         let dv = u64::from(spec.dv);
 
         let hd_dv = mul(hd, dv)?;
+        let compact = p2 && spec.hv == 48 && max_rows > MIN_VERIFY_ROWS;
+        let qk_heads = if compact { spec.hk } else { spec.hv };
+        let qk_width = mul(u64::from(qk_heads), u64::from(spec.dk))?;
+        let rounded = if compact {
+            mul(rows, mul(qk_width, 2)?)?
+        } else {
+            0
+        };
         let sizes = [
             mul(rows, mul(conv_dim, 2)?)?, // conv_out  BF16 [R, conv_dim]
             mul(rows, mul(hd, 2)?)?,       // beta       BF16 [R, hv]
             mul(rows, mul(hd, 4)?)?,       // beta_fp32  FP32 [R, hv]
             mul(rows, mul(hd, 4)?)?,       // g          FP32 [R, hv]
-            mul(rows, mul(hd_dv, 4)?)?,    // q_fp32     FP32 [R, hv, 128]
-            mul(rows, mul(hd_dv, 4)?)?,    // k_fp32     FP32 [R, hv, 128]
+            mul(rows, mul(qk_width, 4)?)?, // q_fp32
+            mul(rows, mul(qk_width, 4)?)?, // k_fp32
             mul(rows, mul(hd_dv, 4)?)?,    // v_fp32     FP32 [R, hv, 128]
+            rounded,
+            rounded,
         ];
         let mut off = 0u64;
         let mut r = [Region {
             offset: 0,
             bytes: 0,
-        }; 7];
+        }; 9];
         for (i, s) in sizes.iter().enumerate() {
             let padded = align(*s)?;
             r[i] = Region {
@@ -225,6 +241,9 @@ impl GdnWorkspace {
             q_fp32: r[4],
             k_fp32: r[5],
             v_fp32: r[6],
+            q_bf16: r[7],
+            k_bf16: r[8],
+            qk_heads,
             bytes: off,
             alignment: 256,
         })
@@ -293,7 +312,7 @@ mod tests {
             assert_eq!(spec.state_bytes()?, u64::from(hv) * 128 * 128 * 4);
             assert_eq!(spec.history_bytes()?, u64::from(cd) * 3 * 4);
             for rows in [1, 2, 5, 8, 37, 512, 4096] {
-                let ws = GdnWorkspace::new(&spec, rows)?;
+                let ws = GdnWorkspace::new(&spec, rows, false)?;
                 let padded = |n: u64| (n + 255) & !255;
                 let rows = u64::from(rows);
                 assert_eq!(ws.conv_out.bytes, padded(rows * u64::from(cd) * 2));
@@ -304,6 +323,33 @@ mod tests {
                     assert!(region.offset + region.bytes <= ws.bytes);
                 }
                 assert_eq!(ws.v_fp32.offset + ws.v_fp32.bytes, ws.bytes);
+                let compact = GdnWorkspace::new(&spec, rows as u32, true)?;
+                let active = hv == 48 && rows > u64::from(MIN_VERIFY_ROWS);
+                assert_eq!(compact.qk_heads, if active { spec.hk } else { hv });
+                let width = rows * u64::from(compact.qk_heads) * 128;
+                assert_eq!(compact.q_fp32.bytes, padded(width * 4));
+                assert_eq!(compact.k_fp32.bytes, padded(width * 4));
+                assert_eq!(
+                    compact.q_bf16.bytes,
+                    if active { padded(width * 2) } else { 0 }
+                );
+                assert_eq!(compact.k_bf16.bytes, compact.q_bf16.bytes);
+                let mut end = 0;
+                for region in [
+                    compact.conv_out,
+                    compact.beta,
+                    compact.beta_fp32,
+                    compact.g,
+                    compact.q_fp32,
+                    compact.k_fp32,
+                    compact.v_fp32,
+                    compact.q_bf16,
+                    compact.k_bf16,
+                ] {
+                    assert!(region.offset >= end && region.offset.is_multiple_of(256));
+                    end = region.offset + region.bytes;
+                }
+                assert_eq!(end, compact.bytes);
             }
         }
         Ok(())

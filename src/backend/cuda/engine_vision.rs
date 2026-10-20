@@ -3408,6 +3408,91 @@ mod tests {
         println!(
             "VISION_PATCH_BIAS_SUMMARY layouts=2 row_shapes=4 request_modes=3 defects={patch_defects}"
         );
+        {
+            let (input, width) = (1536u32, 1152u32);
+            let activation = |phase: usize, k: usize| ((k * 5 + phase * 7) % 23) as i32 - 11;
+            let coefficient = |phase: usize, k: usize| ((k * 11 + phase * 3) % 31) as i32 - 15;
+            ensure!(
+                input * 11 * 15 < 1 << 24,
+                "full-K dot exceeds FP32 exact integers"
+            );
+            let mut expected = vec![0u16; 23 * 31];
+            let mut truncated_differences = 0;
+            for rp in 0..23 {
+                for cp in 0..31 {
+                    let dot: i32 = (0..input as usize)
+                        .map(|k| activation(rp, k) * coefficient(cp, k))
+                        .sum();
+                    let short: i32 = (0..2).map(|k| activation(rp, k) * coefficient(cp, k)).sum();
+                    let bias = (cp as f32 - 15.0) / 8.0;
+                    let rounded = |value| {
+                        bf16::from_f32(bf16::from_f32(value as f32).to_f32() + bias).to_bits()
+                    };
+                    expected[rp * 31 + cp] = rounded(dot);
+                    truncated_differences += usize::from(rounded(dot) != rounded(short));
+                }
+            }
+            ensure!(
+                truncated_differences > 0,
+                "truncated-K patch control escaped"
+            );
+            println!(
+                "PASS VISION_PATCH_FULL_K_CONTROL truncated_k=2 differing_phases={truncated_differences}"
+            );
+            let weights: Vec<_> =
+                (0..width as usize * input as usize)
+                    .map(|i| {
+                        bf16::from_f32(
+                            coefficient((i / input as usize) % 31, i % input as usize) as f32
+                        )
+                    })
+                    .collect();
+            let weight = s.clone_htod(&weights)?;
+            let bias = s.clone_htod(
+                &(0..width as usize)
+                    .map(|c| bf16::from_f32(((c % 31) as f32 - 15.0) / 8.0))
+                    .collect::<Vec<_>>(),
+            )?;
+            for rows in [1u32, 37, 1120, 7104] {
+                let host: Vec<_> = (0..rows as usize * input as usize)
+                    .map(|i| {
+                        bf16::from_f32(
+                            activation((i / input as usize) % 23, i % input as usize) as f32
+                        )
+                    })
+                    .collect();
+                let x = s.clone_htod(&host)?;
+                let y = s.alloc_zeros::<bf16>((rows * width) as usize)?;
+                blas.prepare_biased(
+                    rows,
+                    width,
+                    input,
+                    dense(&bias, s, [width])?,
+                    LinearBiasMode::AfterOutputRound,
+                )?;
+                blas.linear_biased(
+                    dense(&weight, s, [width, input])?,
+                    dense(&bias, s, [width])?,
+                    dense(&x, s, [rows, input])?,
+                    &mut TensorMut(dense(&y, s, [rows, width])?),
+                    LinearBiasMode::AfterOutputRound,
+                )?;
+                let wrong = s
+                    .clone_dtoh(&y)?
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, value)| {
+                        value.to_bits()
+                            != expected[(i / width as usize % 23) * 31 + i % width as usize % 31]
+                    })
+                    .count();
+                println!(
+                    "{} VISION_PATCH_FULL_K rows={rows} input={input} width={width} periods=23,31 bit_mismatches={wrong}",
+                    if wrong == 0 { "PASS" } else { "DEFECT" }
+                );
+                patch_defects += usize::from(wrong != 0);
+            }
+        }
         let input = 4608u32;
         let half_ulp = bf16::from_f32(1.0 / 256.0);
         // The dot product is a BF16 midpoint. Adding bias before conversion

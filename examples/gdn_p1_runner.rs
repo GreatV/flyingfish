@@ -297,7 +297,11 @@ fn route_workspace_bytes(route: Route, rows: u32) -> Result<u64> {
     }
     let spec = flyingfish::op_contract::GdnSpec::q38();
     let armed = flyingfish::gdn_plan::GdnPolicy::P2.workspace(&spec, rows)?;
-    let fused = flyingfish::gdn_plan::GdnWorkspace::new(&spec, rows)?;
+    let fused = flyingfish::gdn_plan::GdnWorkspace::new(
+        &spec,
+        rows,
+        rows > flyingfish::gdn_plan::MIN_VERIFY_ROWS,
+    )?;
     let slot = armed
         .bytes
         .checked_sub(fused.bytes)
