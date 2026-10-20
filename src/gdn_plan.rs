@@ -133,10 +133,10 @@ impl GdnPolicy {
     }
     /// All prebound operators reuse the arena sized by the maximum complete plan layout.
     pub fn workspace(self, spec: &GdnSpec, physical_rows: u32) -> Result<WorkspaceReq> {
-        let bytes =
-            GdnWorkspace::new(spec, physical_rows, self.cw_p2_for_step(physical_rows))?.bytes;
+        let p2 = self.cw_p2_for_step(physical_rows);
+        let bytes = GdnWorkspace::new(spec, physical_rows, p2)?.bytes;
         Ok(WorkspaceReq {
-            bytes: if self.cw_p2 {
+            bytes: if p2 {
                 add(bytes, cw_p2_bytes(spec.hv, physical_rows))?
             } else {
                 bytes

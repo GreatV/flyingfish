@@ -2687,7 +2687,11 @@ mod tests {
             assert_eq!(
                 GdnPolicy::P2.workspace(&spec, rows)?.bytes,
                 GdnWorkspace::new(&spec, rows, GdnPolicy::P2.cw_p2_for_step(rows))?.bytes
-                    + cw_p2_bytes(qwen.hv, rows),
+                    + if GdnPolicy::P2.cw_p2_for_step(rows) {
+                        cw_p2_bytes(qwen.hv, rows)
+                    } else {
+                        0
+                    },
                 "rows={rows}"
             );
             assert_eq!(

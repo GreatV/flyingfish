@@ -289,7 +289,7 @@ fn route_splits(route: Route, s: &[u32]) -> Vec<u32> {
     }
 }
 
-/// Workspace bytes of one case: 0 for p1; for p2 the P2 policy's workspace minus the fused layout, checked against `cw_p2_bytes`.
+/// Standalone P2 always allocates slots, including rows below the Engine's P2 dispatch floor.
 #[cfg(feature = "cuda")]
 fn route_workspace_bytes(route: Route, rows: u32) -> Result<u64> {
     if route == Route::P1 {
@@ -307,11 +307,15 @@ fn route_workspace_bytes(route: Route, rows: u32) -> Result<u64> {
         .checked_sub(fused.bytes)
         .context("the P2 policy's workspace is smaller than the fused layout it extends")?;
     ensure!(
-        slot == flyingfish::gdn_plan::cw_p2_bytes(48, rows),
+        slot == if rows > flyingfish::gdn_plan::MIN_VERIFY_ROWS {
+            flyingfish::gdn_plan::cw_p2_bytes(48, rows)
+        } else {
+            0
+        },
         "the P2 slot region is {slot} B for {rows} rows; the planner derives {}",
         flyingfish::gdn_plan::cw_p2_bytes(48, rows)
     );
-    Ok(slot)
+    Ok(flyingfish::gdn_plan::cw_p2_bytes(48, rows))
 }
 
 /// Compute capability and SM count via `cuDeviceGetAttribute`.
