@@ -12,8 +12,8 @@
 //
 // S[:, j] is independent across the value axis; no cross-split reduction.
 //
-// All state math is FP32. q arrives pre-scaled by 1/sqrt(HEAD_K); the caller applies
-// l2_heads and the widen. valid_rows must be 1.
+// All state math is FP32. The caller applies FP32 L2 normalization and scales q
+// by 1/sqrt(HEAD_K). valid_rows must be 1.
 //
 // launch: grid (VSPLIT, NUM_V_HEADS), block GDN_THREADS.
 #include <cuda_runtime.h>
