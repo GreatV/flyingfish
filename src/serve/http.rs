@@ -364,7 +364,7 @@ fn check_validity(
     (if state.backend.mtp && !image {
         crate::mtp::check_request(ids.len(), max_tokens, options.capacity)
     } else {
-        super::check_request(ids, &options)
+        super::check_request(ids, &options, state.backend.draft_config.as_ref())
     })
     .map_err(|error| Box::new(bad_request(&format!("request rejected: {error}"))))
 }
@@ -972,6 +972,7 @@ mod tests {
             commands,
             slot: Arc::new(Mutex::new(slot)),
             vocab_size: 300_000,
+            draft_config: None,
             mtp: false,
             options: crate::spec::Options {
                 device: 0,

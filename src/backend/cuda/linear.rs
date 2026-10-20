@@ -29,6 +29,14 @@ pub(crate) struct Fp8Ops {
     fake_quant: CudaFunction,
 }
 impl Fp8Ops {
+    pub(super) fn require_rows(&self, rows: usize) -> Result<()> {
+        ensure!(
+            rows > 0 && self.small.iter().all(|table| table.len() >= rows),
+            "direct FP8 rows={rows} exceeds bound tables={:?}",
+            self.small.each_ref().map(Vec::len)
+        );
+        Ok(())
+    }
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         Self::for_rows(ctx, crate::mtp::MAX_VERIFY_ROWS)
     }
@@ -153,12 +161,7 @@ impl Fp8Ops {
     ) -> Result<()> {
         Self::check(&codes, &scale, layout)?;
         validate_call(codes.shape, x, &y.0)?;
-        ensure!(
-            (1..=self.small[0].len()).contains(&(x.shape[0] as usize)),
-            "direct FP8 rows={} exceeds bound={}",
-            x.shape[0],
-            self.small[0].len()
-        );
+        self.require_rows(x.shape[0] as usize)?;
         disjoint(&codes, &y.0)?;
         disjoint(&scale, &y.0)?;
         unsafe {
@@ -708,6 +711,17 @@ mod tests {
         )?;
         blas.enable_fp8(&device.ctx)?;
         blas.bind_invariant(&device.ctx, crate::linear_plan::MAX_SKINNY_ROWS)?;
+        let mut bind_first = Blas::new(
+            device,
+            &ops,
+            root,
+            Rc::new(Closure::new(false, "invariant linear gate".into())),
+        )?;
+        bind_first.bind_invariant(&device.ctx, crate::linear_plan::MAX_SKINNY_ROWS)?;
+        bind_first.enable_fp8(&device.ctx)?;
+        bind_first
+            .fp8_ops()?
+            .require_rows(crate::linear_plan::MAX_SKINNY_ROWS)?;
         let mut defects = 0;
         for (n, k) in [
             (8192, 2048),
@@ -758,7 +772,11 @@ mod tests {
                         )?,
                         layout,
                     };
-                    defects += invariant_rows(device, &blas, &ops, weight, (n, k))?;
+                    let bound = match layout {
+                        Fp8ScaleLayout::Block128 => &blas,
+                        Fp8ScaleLayout::PerChannel => &bind_first,
+                    };
+                    defects += invariant_rows(device, bound, &ops, weight, (n, k))?;
                 }
             }
         }

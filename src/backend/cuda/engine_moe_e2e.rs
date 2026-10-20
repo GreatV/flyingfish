@@ -1275,7 +1275,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
                 expected.truncate(index + 1);
             }
             let output_mismatches = usize::from(round.output != expected)
-                + usize::from(matched < rows && round.accepted != matched);
+                + usize::from(round.accepted + 1 != committed);
             let boundary_mismatches = usize::from(model.position != ids.len() + committed)
                 + usize::from(model.pending_token != expected.last().copied())
                 + usize::from(
@@ -1706,9 +1706,14 @@ fn chain_replay(
                 )?,
     );
     let output_mismatches = usize::from(predictions != round.output);
-    let mismatches = state_mismatches + logit_mismatches + metadata_mismatches + output_mismatches;
+    let acceptance_mismatches = usize::from(round.accepted + 1 != round.committed);
+    let mismatches = state_mismatches
+        + logit_mismatches
+        + metadata_mismatches
+        + output_mismatches
+        + acceptance_mismatches;
     println!(
-        "{} minicpm_chain_boundary origin={origin} committed={} state_bit_mismatches={state_mismatches} logits_bit_mismatches={logit_mismatches} metadata_mismatches={metadata_mismatches} output_mismatches={output_mismatches}",
+        "{} minicpm_chain_boundary origin={origin} committed={} state_bit_mismatches={state_mismatches} logits_bit_mismatches={logit_mismatches} metadata_mismatches={metadata_mismatches} output_mismatches={output_mismatches} acceptance_mismatches={acceptance_mismatches}",
         if mismatches == 0 { "PASS" } else { "DEFECT" },
         round.committed
     );
@@ -1953,6 +1958,11 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
         .take(rows)
         .position(|&token| token != first)
         .context("Runner FAIL EOS fixture has no distinct decode token")?;
+    let committed_counts = |output: &crate::spec::Output| {
+        output.rounds.iter().all(|round| {
+            round.accepted + 1 == round.committed && round.committed == round.output.len()
+        })
+    };
     for graph in [false, true] {
         public.set_spec_graph(graph)?;
         public.config.eos_token_id = vec![baseline[0][eos_index]];
@@ -1964,7 +1974,7 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
             None,
             &mut |_| true,
         )?;
-        let pass = output.ids == baseline[0][..=eos_index];
+        let pass = output.ids == baseline[0][..=eos_index] && committed_counts(&output);
         defects += usize::from(!pass);
         println!(
             "{} minicpm_chain_production_eos graph={graph} tokens={} expected_tokens={} ids={:?}",
@@ -1989,7 +1999,7 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
                 &mut |_| true,
             )?;
             let expected = &baseline[index][..options.count.min(baseline[index].len())];
-            let pass = output.ids == expected;
+            let pass = output.ids == expected && committed_counts(&output);
             defects += usize::from(!pass);
             println!(
                 "{} minicpm_chain_production_media case={} graph={graph} tokens={} token_equal={pass} decoded={:?}",
@@ -2011,9 +2021,7 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
 #[test]
 #[ignore = "requires CUDA, T0 fixtures, pinned calibration and explicit draft/graph timing arms"]
 fn minicpm_chain_decode_timing_gpu() -> Result<()> {
-    // R4: eight ABBA blocks, three measured decodes after one warmup per arm.
-    // Paired bootstrap: 20,000 resamples, seed 20261019, 95% CI.
-    // Upper < 1 is PASS; lower >= 1 is no speedup; the remaining outcome is INCONCLUSIVE.
+    // One deployment arm runs text1k/text4k with one warmup and three measured decodes each.
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
         "GPU window not acknowledged"

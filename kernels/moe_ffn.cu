@@ -1,4 +1,4 @@
-// BF16 routed and shared expert contributions for rows1..8; caller-owned done bits.
+// BF16 routed and shared contributions: legacy rows1..8, invariant rows1..16; caller-owned done bits.
 // gate_up: grid(ceil(I/32),rows,K+1), block256, smem=H*2; down: grid(ceil(H/16),rows,K+1), block128.
 // Active assignments require valid slots, matching generations and distinct expert ids.
 // Expert row pointers and shared weights are 16-byte aligned.

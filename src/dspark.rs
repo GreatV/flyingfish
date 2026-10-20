@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct DraftConfig {
     pub model_type: String,
     pub architectures: Vec<String>,
@@ -27,7 +27,7 @@ pub struct DraftConfig {
     pub rope_parameters: Rope,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rope {
     pub rope_theta: f32,

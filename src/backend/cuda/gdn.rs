@@ -9,7 +9,8 @@
 //! `hist_update` is a separate launch after conv; conv blocks read `history[]` to seed their window.
 //!
 //! Ordinary `run` selects the core by phase. `run_verify` keeps Prefill preparation and uses the
-//! ordered h32 R1..16 core on sm86/sm89 and h48 R1..5 core on sm89. Plans bind before Ready.
+//! ordered h32 R1..16 core on every bound architecture and h48 R1..5 core on sm89.
+//! Plans bind before Ready.
 //!
 //! Rows are local: `qkv` and `core_out` are this call's `[M, ...]`; prefix rows are reachable only
 //! through `history[]`. `GdnMeta.prefix` is validated, never used as an index.

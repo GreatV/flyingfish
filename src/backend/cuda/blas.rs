@@ -473,12 +473,7 @@ impl Blas {
         self.skinny_raw(wp, xp, yp, shape)
     }
     fn skinny_raw(&self, wp: u64, xp: u64, yp: u64, shape: LinearShape) -> Result<()> {
-        ensure!(
-            (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&shape.rows)
-                && shape.input.is_multiple_of(256),
-            "unsupported skinny GEMM shape: {shape:?}"
-        );
-        checked_dims(shape.rows, shape.output, shape.input)?;
+        let launch = Self::skinny_launch(shape)?;
         unsafe {
             self.stream
                 .launch_builder(&self.skinny)
@@ -489,13 +484,22 @@ impl Blas {
                 .arg(&(shape.input as i32))
                 .arg(&(shape.input as i64))
                 .arg(&(shape.rows as i32))
-                .launch(LaunchConfig {
-                    grid_dim: (shape.output.div_ceil(16) as u32, 1, 1),
-                    block_dim: (128, 1, 1),
-                    shared_mem_bytes: 40960,
-                })?;
+                .launch(launch)?;
         }
         Ok(())
+    }
+    pub(super) fn skinny_launch(shape: LinearShape) -> Result<LaunchConfig> {
+        ensure!(
+            (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&shape.rows)
+                && shape.input.is_multiple_of(256),
+            "unsupported skinny GEMM shape: {shape:?}"
+        );
+        checked_dims(shape.rows, shape.output, shape.input)?;
+        Ok(LaunchConfig {
+            grid_dim: (shape.output.div_ceil(16) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 40960,
+        })
     }
 
     pub fn decode_impl(&self) -> &'static str {
@@ -619,14 +623,21 @@ impl Blas {
             crate::linear_plan::MAX_SKINNY_ROWS
         );
         if self.fp8.is_some() {
-            self.fp8 = Some(super::linear::Fp8Ops::for_rows(ctx, rows)?);
+            let fp8 = super::linear::Fp8Ops::for_rows(ctx, rows)?;
+            fp8.require_rows(rows)?;
+            self.fp8 = Some(fp8);
         }
         self.invariant_rows = rows;
         Ok(())
     }
     pub(crate) fn enable_fp8(&mut self, ctx: &Arc<cudarc::driver::CudaContext>) -> Result<()> {
         ensure!(self.fp8.is_none(), "FP8 operators already bound");
-        self.fp8 = Some(super::linear::Fp8Ops::new(ctx)?);
+        let fp8 = match self.invariant_rows {
+            0 => super::linear::Fp8Ops::new(ctx)?,
+            rows => super::linear::Fp8Ops::for_rows(ctx, rows)?,
+        };
+        fp8.require_rows(*self.direct_fp8_rows().end())?;
+        self.fp8 = Some(fp8);
         Ok(())
     }
     #[cfg(test)]

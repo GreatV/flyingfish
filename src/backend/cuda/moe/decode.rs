@@ -419,11 +419,13 @@ impl DecodeOps {
                         .arg(&(inner as i32))
                         .arg(&i64::from(inner))
                         .arg(&(rows as i32))
-                        .launch(LaunchConfig {
-                            grid_dim: (columns.div_ceil(16), 1, 1),
-                            block_dim: (128, 1, 1),
-                            shared_mem_bytes: 40960,
-                        })?;
+                        .launch(crate::backend::cuda::blas::Blas::skinny_launch(
+                            crate::backend::setup::LinearShape {
+                                rows: rows as usize,
+                                output: columns as usize,
+                                input: inner as usize,
+                            },
+                        )?)?;
                 }
                 Ok(())
             };

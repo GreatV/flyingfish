@@ -104,7 +104,12 @@ impl Setup {
         directory: &Path,
         runtime: &Path,
         write: bool,
-        (request, decode_rows, context_row_bytes): (crate::prefill::WorkspaceRequest, usize, usize),
+        (request, decode_rows, verify_rows, context_row_bytes): (
+            crate::prefill::WorkspaceRequest,
+            usize,
+            usize,
+            usize,
+        ),
     ) -> Result<Self> {
         use crate::experts::plan::PlanInputs;
         use crate::prefill::{ExpertWorkspaceBudget, ExpertWorkspaceRequest};
@@ -232,17 +237,13 @@ impl Setup {
                 geometry,
                 slot,
                 |rows| {
-                    let mixer = qwen::Runtime::workspace(
+                    qwen::Runtime::workspace(
                         model,
                         rows.max(wave_rows as usize),
                         request.capacity,
                         policy,
-                    )?;
-                    let verify = super::super::attention_d256::FullAttentionOps::workspace(
-                        &crate::op_contract::FullAttentionSpec::from_model(model)?,
-                        qwen::limits(decode_rows, request.capacity)?,
-                    )?;
-                    Ok(mixer.max(usize::try_from(verify.bytes)?))
+                        verify_rows,
+                    )
                 },
                 |rows| Ok(qwen::default_chunk(rows)),
             );

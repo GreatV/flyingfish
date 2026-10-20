@@ -273,6 +273,9 @@ impl Backend {
     pub fn tree_injected_hidden(&self) -> Result<Vec<f32>> {
         match *self {}
     }
+    pub fn draft_config(&self) -> Result<&crate::dspark::DraftConfig> {
+        match *self {}
+    }
     pub fn spec_round(
         &mut self,
         limit: usize,

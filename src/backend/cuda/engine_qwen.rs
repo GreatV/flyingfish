@@ -149,6 +149,7 @@ pub(super) struct Runtime {
     advance: CudaFunction,
     prepared: BTreeSet<u32>,
     workspace_rows: u32,
+    verify_rows: usize,
 }
 struct Layer {
     linear: LayerLinearPlan,
@@ -338,16 +339,15 @@ impl Runtime {
         rows: usize,
         capacity: usize,
         policy: GdnPolicy,
+        verify_rows: usize,
     ) -> Result<usize> {
         let attention = FullAttentionSpec::from_model(model)?;
         let gdn = GdnSpec::from_model(model)?;
         let attention_prefill =
             FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?;
         let attention_decode = FullAttentionOps::workspace(&attention, limits(1, capacity)?)?;
-        let attention_nested_verify = FullAttentionOps::workspace(
-            &attention,
-            limits(rows.min(crate::mtp::MAX_VERIFY_ROWS), capacity)?,
-        )?;
+        let attention_nested_verify =
+            FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?;
         let spec = gdn;
         let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?, policy)?;
         let decode = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY)?;
@@ -679,6 +679,7 @@ impl Runtime {
             advance: module.load_function("q38_advance")?,
             prepared: BTreeSet::new(),
             workspace_rows: u32::try_from(rows)?,
+            verify_rows,
         })
     }
     fn prepare(
@@ -1125,7 +1126,7 @@ impl Engine {
             "invalid Q38 capacity"
         );
         // Reject an incomplete operator plan before allocating model weights.
-        Runtime::workspace(&model_spec, 1, capacity, GdnPolicy::LEGACY)?;
+        Runtime::workspace(&model_spec, 1, capacity, GdnPolicy::LEGACY, verify_rows)?;
         let runtime = settings
             .runtime_dir
             .as_deref()
@@ -1270,6 +1271,7 @@ impl Engine {
                 (
                     request,
                     if draft.is_some() { verify_rows } else { 1 },
+                    verify_rows,
                     capture_row_bytes
                         .checked_add(draft_row_bytes)
                         .context("draft context row bytes overflow")?,
@@ -1285,7 +1287,8 @@ impl Engine {
             dense_budget = crate::prefill::WorkspaceBudget::new(
                 request,
                 |rows| {
-                    let mut target = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?;
+                    let mut target =
+                        Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?;
                     if settings.kv_format != crate::kv::KvFormat::Bf16 {
                         target = target.max(
                             crate::op_contract::AttentionWorkspace::new(
@@ -1332,22 +1335,20 @@ impl Engine {
         if let Some(draft) = &mut draft {
             draft.grow(context_rows)?;
         }
-        let target_workspace = Runtime::workspace(&model_spec, rows, capacity, gdn_policy)?
-            .max(usize::try_from(
-                FullAttentionOps::workspace(&attention, limits(verify_rows.min(rows), capacity)?)?
-                    .bytes,
-            )?)
-            .max(if settings.kv_format == crate::kv::KvFormat::Bf16 {
-                0
-            } else {
-                crate::op_contract::AttentionWorkspace::new(
-                    &attention,
-                    verify_rows as u32,
-                    capacity as u32,
-                    limits(verify_rows, capacity)?.key_chunk,
-                )?
-                .bytes as usize
-            });
+        let target_workspace =
+            Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?.max(
+                if settings.kv_format == crate::kv::KvFormat::Bf16 {
+                    0
+                } else {
+                    crate::op_contract::AttentionWorkspace::new(
+                        &attention,
+                        verify_rows as u32,
+                        capacity as u32,
+                        limits(verify_rows, capacity)?.key_chunk,
+                    )?
+                    .bytes as usize
+                },
+            );
         eprintln!(
             "{}",
             serde_json::json!({
@@ -1499,11 +1500,6 @@ impl Engine {
             engine.closure.preflight(&paths)?;
             spec.draft
                 .prepare_linears(&engine.weights.head, &mut engine.blas, &profile, write)?;
-            engine.blas.prepare_fixed(
-                verify_rows as u32,
-                engine.model_spec.vocab,
-                engine.model_spec.hidden,
-            )?;
             engine.closure.finish(profile, &engine.runtime, key)?;
         } else {
             engine.closure.freeze_fixed()?;
@@ -1630,11 +1626,7 @@ impl Engine {
                 }
                 match phase {
                     ExecutionPhase::Prefill => {
-                        if nested_verify_tcmqa(
-                            self.qwen_device_prefix,
-                            rows,
-                            gdn.snapshot_limit()? as usize,
-                        )? {
+                        if nested_verify_tcmqa(self.qwen_device_prefix, rows, q.verify_rows)? {
                             let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
                             let plans = if kv.compact.is_some() {
                                 compact_small
@@ -2449,9 +2441,13 @@ mod tests {
             assert!(plans.select(0, &narrow).is_err());
             assert!(plans.select(capacity + 1, &narrow).is_err());
             assert!(plans.select(usize::MAX, &narrow).is_err());
-            let budget =
-                Runtime::workspace(&geometry(), capacity, 4096, GdnPolicy::for_device(89, 128))?
-                    as u64;
+            let budget = Runtime::workspace(
+                &geometry(),
+                capacity,
+                4096,
+                GdnPolicy::for_device(89, 128),
+                5,
+            )? as u64;
             for rows in 1..=5.min(capacity) {
                 assert!(
                     GdnOps::workspace(
@@ -2514,7 +2510,7 @@ mod tests {
             let required =
                 FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(5, capacity)?)?;
             let allocated =
-                Runtime::workspace(&geometry(), 5, capacity, GdnPolicy::for_device(89, 128))?;
+                Runtime::workspace(&geometry(), 5, capacity, GdnPolicy::for_device(89, 128), 5)?;
             ensure!(
                 required.bytes <= allocated as u64,
                 "nested verify workspace {required:?} exceeds allocation {allocated}"
@@ -2522,15 +2518,15 @@ mod tests {
             let mtp = crate::mtp::AttachmentBudget::new(&spec, capacity)?;
             let row_bytes = Runtime::row_bytes(&spec)? + mtp.row_bytes;
             let fixed = Runtime::fixed_bytes(&spec, capacity)? + mtp.fixed_bytes;
-            let workspace =
-                |rows| {
-                    Ok(Runtime::workspace(
-                        &geometry(),
-                        rows,
-                        capacity,
-                        GdnPolicy::for_device(89, 128),
-                    )? + mtp.workspace(rows)?)
-                };
+            let workspace = |rows| {
+                Ok(Runtime::workspace(
+                    &geometry(),
+                    rows,
+                    capacity,
+                    GdnPolicy::for_device(89, 128),
+                    5,
+                )? + mtp.workspace(rows)?)
+            };
             let total = 24usize << 30;
             let request = WorkspaceRequest {
                 capacity,
@@ -2595,7 +2591,7 @@ mod tests {
         let total = 1 << 30;
         let fixed = spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>() + capacity * 12;
         for rows in [1, 65, 128] {
-            let scratch = Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::LEGACY)?;
+            let scratch = Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::LEGACY, 5)?;
             for required in [
                 FullAttentionOps::preprocess_workspace(
                     &FullAttentionSpec::q38(),
@@ -2627,7 +2623,7 @@ mod tests {
             };
             let budget = WorkspaceBudget::new(
                 request,
-                |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY),
+                |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY, 5),
                 Ok,
             )?;
             assert_eq!(budget.planned_transient_bytes, allocated);
@@ -2639,7 +2635,7 @@ mod tests {
                         free_after_resident: request.free_after_resident - 1,
                         ..request
                     },
-                    |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY),
+                    |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY, 5),
                     Ok,
                 )
                 .is_err()
@@ -2662,7 +2658,7 @@ mod tests {
         let row_bytes = Runtime::row_bytes(&spec)?;
         let fixed = Runtime::fixed_bytes(&spec, capacity)?;
         for rows in [512, 513, 1021, 1024, 2048, 4096, 8192] {
-            let scratch = Runtime::workspace(&geometry(), rows, capacity, policy)?;
+            let scratch = Runtime::workspace(&geometry(), rows, capacity, policy, 5)?;
             let gdn = policy.workspace(&crate::op_contract::GdnSpec::q38(), rows as u32)?;
             assert!(scratch as u64 >= gdn.bytes);
             let required = rows * row_bytes + fixed + scratch;
@@ -2677,7 +2673,7 @@ mod tests {
             };
             let budget = WorkspaceBudget::new(
                 request,
-                |r| Runtime::workspace(&geometry(), r, capacity, policy),
+                |r| Runtime::workspace(&geometry(), r, capacity, policy, 5),
                 Ok,
             )?;
             assert_eq!(budget.plan.chunk, rows);
@@ -2689,7 +2685,7 @@ mod tests {
                         free_after_resident: request.free_after_resident - 1,
                         ..request
                     },
-                    |r| Runtime::workspace(&geometry(), r, capacity, policy),
+                    |r| Runtime::workspace(&geometry(), r, capacity, policy, 5),
                     Ok,
                 )
                 .is_err()

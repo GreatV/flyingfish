@@ -415,6 +415,9 @@ impl Model {
     pub fn tree_injected_hidden(&self) -> Result<Vec<f32>> {
         self.backend.tree_injected_hidden()
     }
+    pub fn draft_config(&self) -> Result<&crate::dspark::DraftConfig> {
+        self.backend.draft_config()
+    }
     pub fn spec_round(
         &mut self,
         limit: usize,

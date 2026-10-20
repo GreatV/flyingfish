@@ -872,6 +872,11 @@ impl Engine {
             .map(|path| crate::dspark::DraftConfig::read(path, &config))
             .transpose()?;
         if let Some(draft) = &draft_config {
+            ensure!(
+                draft.block_size == 7,
+                "unsupported Llama DSpark block_size={}; requires block_size=7",
+                draft.block_size
+            );
             let rows = draft.verify_rows()?;
             ensure!(
                 rows <= crate::linear_plan::MAX_SKINNY_ROWS,
@@ -3785,6 +3790,14 @@ impl Engine {
         Ok(())
     }
 
+    pub fn draft_config(&self) -> Result<&crate::dspark::DraftConfig> {
+        Ok(&self
+            .spec
+            .as_ref()
+            .context("draft is not enabled")?
+            .draft
+            .config)
+    }
     pub fn spec_round(
         &mut self,
         limit: usize,
@@ -3998,6 +4011,7 @@ impl Engine {
                 output.truncate(index + 1);
             }
             let committed = output.len();
+            let accepted_proposals = accepted.proposals.min(committed - 1);
             let bonus = *output.last().context("spec round emitted no token")?;
             if graph {
                 if transaction {
@@ -4062,7 +4076,7 @@ impl Engine {
                 t.add(
                     format!("{prefix}.m"),
                     vec![1],
-                    vec![accepted.proposals as f32],
+                    vec![accepted_proposals as f32],
                 )?;
                 t.add(
                     format!("{prefix}.bonus"),
@@ -4074,7 +4088,7 @@ impl Engine {
                 logits_rows: (0..committed).collect(),
                 proposals,
                 predictions,
-                accepted: accepted.proposals,
+                accepted: accepted_proposals,
                 committed,
                 output,
                 position: self.position,

@@ -162,23 +162,6 @@ extern "C" __global__ void moe_route_bf16(
   moe_route_select(logit, ids, weights, experts, top_k);
 }
 
-// The fused router's BF16 F.linear boundary, one CTA per row.
-extern "C" __global__ void moe_route_logits(
-    const bf16* x, const bf16* router, bf16* logits,
-    int rows, int experts, int hidden) {
-  if ((int)blockIdx.x >= rows || rows < 1 || experts < 1 || experts > 1024 ||
-      hidden < 8 || (hidden & 7) != 0 || (blockDim.x & 31) != 0 ||
-      (int)blockDim.x < experts ||
-      (reinterpret_cast<uintptr_t>(x) & 15) != 0 ||
-      (reinterpret_cast<uintptr_t>(router) & 15) != 0 ||
-      (reinterpret_cast<uintptr_t>(logits) & 15) != 0)
-    __trap();
-  const int e = threadIdx.x;
-  if (e < experts)
-    logits[(size_t)blockIdx.x * experts + e] =
-        __float2bfloat16_rn(moe_route_logit(x, router, blockIdx.x, e, hidden));
-}
-
 extern "C" __global__ void moe_route_topk(
     const bf16* __restrict__ logits, int* __restrict__ ids,
     bf16* __restrict__ weights, int rows, int experts, int top_k) {

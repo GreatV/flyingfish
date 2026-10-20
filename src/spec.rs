@@ -1,5 +1,5 @@
 use crate::{backend::Settings, dspark::Round, model::Model, tokenizer, trace::Trace};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use std::{path::Path, time::Instant};
 
 #[derive(Clone)]
@@ -30,7 +30,6 @@ pub fn check_tree_greedy(
         options.backend.spec_budget.is_tree(),
         "check-tree-greedy requires --spec-budget tree16, tree32 or tree64"
     );
-    check(ids, options, draft)?;
     ensure!(
         options.ignore_eos,
         "strict tree greedy check requires --ignore-eos"
@@ -46,6 +45,7 @@ pub fn check_tree_greedy(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     let mut plain_settings = options.backend.clone();
     plain_settings.draft_model = None;
@@ -112,7 +112,6 @@ pub fn compare_padding(
     options: &Options,
     nodes: usize,
 ) -> Result<()> {
-    check(ids, options, draft)?;
     ensure!(
         options.backend.spec_budget.is_tree()
             && nodes > 1
@@ -126,6 +125,7 @@ pub fn compare_padding(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     let anchor = model.prefill(ids, None)?;
     let mut tokens = vec![anchor];
@@ -176,7 +176,6 @@ pub fn compare_padding(
 }
 
 pub fn compare_graph(target: &Path, draft: &Path, ids: &[u32], options: &Options) -> Result<()> {
-    check(ids, options, draft)?;
     let mut model = Model::load(
         target,
         options.device,
@@ -184,6 +183,7 @@ pub fn compare_graph(target: &Path, draft: &Path, ids: &[u32], options: &Options
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     model.set_spec_graph(false)?;
     model.reset()?;
@@ -277,6 +277,7 @@ pub fn produce_events(
     mut trace: Option<&mut Trace>,
     on_step: &mut dyn FnMut(Step) -> bool,
 ) -> Result<Output> {
+    check(ids, options, m.draft_config()?)?;
     let eos = if options.ignore_eos {
         Vec::new()
     } else {
@@ -352,7 +353,7 @@ pub fn produce_events(
     })
 }
 
-pub fn check(ids: &[u32], options: &Options, draft: &Path) -> Result<()> {
+pub fn check(ids: &[u32], options: &Options, draft: &crate::dspark::DraftConfig) -> Result<()> {
     ensure!(
         !ids.is_empty() && options.count > 0,
         "spec input and output count must be positive"
@@ -361,13 +362,7 @@ pub fn check(ids: &[u32], options: &Options, draft: &Path) -> Result<()> {
     let headroom = if budget.is_tree() {
         budget.rows()
     } else {
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(draft.join("config.json"))?)?;
-        let block = config["block_size"]
-            .as_u64()
-            .context("DSpark block_size must be a positive integer")?;
-        ensure!(block > 0, "DSpark block_size={block} must be positive");
-        usize::try_from(block).context("DSpark block_size exceeds usize")?
+        draft.block_size
     };
     let required = ids
         .len()
@@ -410,17 +405,39 @@ mod tests {
         }
     }
 
+    fn draft(block_size: usize) -> crate::dspark::DraftConfig {
+        crate::dspark::DraftConfig {
+            model_type: "qwen3".into(),
+            architectures: vec!["Qwen3DSparkModel".into()],
+            dtype: "bfloat16".into(),
+            hidden_size: 2048,
+            intermediate_size: 6144,
+            num_hidden_layers: 5,
+            num_attention_heads: 16,
+            num_key_value_heads: 2,
+            head_dim: 128,
+            vocab_size: 130560,
+            draft_vocab_size: 130560,
+            rms_norm_eps: 1e-6,
+            block_size,
+            mask_token_id: 75982,
+            target_layer_ids: vec![1, 10, 20, 30, 39],
+            num_target_layers: 42,
+            markov_rank: 256,
+            markov_head_type: "vanilla".into(),
+            projector_type: "dspark".into(),
+            rope_parameters: crate::dspark::Rope {
+                rope_theta: 5000000.0,
+                rope_type: "default".into(),
+                rope_dim: None,
+            },
+        }
+    }
     #[test]
     fn budget_capacity_accepts_exact_fit_and_rejects_one_row_short() -> Result<()> {
         let ids = [1, 2, 3];
-        let draft =
-            std::env::temp_dir().join(format!("flyingfish-spec-capacity-{}", std::process::id()));
-        std::fs::create_dir(&draft)?;
         for block in [7, 15] {
-            std::fs::write(
-                draft.join("config.json"),
-                serde_json::to_vec(&serde_json::json!({"block_size":block}))?,
-            )?;
+            let draft = draft(block);
             for (budget, headroom) in [
                 (SpecBudget::Chain, block),
                 (SpecBudget::Tree16, 16),
@@ -437,15 +454,13 @@ mod tests {
                 assert!(error.contains(&format!("got {}", required - 1)));
             }
         }
-        std::fs::remove_dir_all(draft)?;
         Ok(())
     }
-
     #[test]
     fn budget_capacity_rejects_overflow() {
         let mut options = options(SpecBudget::Tree64, usize::MAX);
         options.count = usize::MAX;
-        let error = check(&[1], &options, Path::new("."))
+        let error = check(&[1], &options, &draft(7))
             .expect_err("overflow must fail")
             .to_string();
         assert!(error.contains("Tree64") && error.contains("overflows usize"));
@@ -460,7 +475,6 @@ pub fn generate(
     options: &Options,
     dump: Option<&Path>,
 ) -> Result<()> {
-    check(ids, options, draft)?;
     let mut model = Model::load(
         target,
         options.device,
@@ -468,6 +482,7 @@ pub fn generate(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     let mut trace = Trace::default();
     trace.set_device(&model.device_info().name)?;
@@ -501,7 +516,6 @@ pub fn bench(
     options: &Options,
     runs: usize,
 ) -> Result<()> {
-    check(ids, options, draft)?;
     ensure!(
         runs > 0 && options.count >= 200 && options.ignore_eos,
         "spec bench needs >=200 output tokens, positive runs and ignore EOS"
@@ -513,6 +527,7 @@ pub fn bench(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     produce(&mut model, ids, options, None)?;
     let mut times = Vec::new();
@@ -559,7 +574,6 @@ pub fn bench(
 }
 
 pub fn compare_builders(target: &Path, draft: &Path, ids: &[u32], options: &Options) -> Result<()> {
-    check(ids, options, draft)?;
     ensure!(
         options.backend.spec_budget.is_tree(),
         "builder comparison requires a tree budget"
@@ -571,6 +585,7 @@ pub fn compare_builders(target: &Path, draft: &Path, ids: &[u32], options: &Opti
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
     model.compare_tree_builders(true)?;
     let result = produce(&mut model, ids, options, None)?;
@@ -598,7 +613,6 @@ pub fn compare_builders(target: &Path, draft: &Path, ids: &[u32], options: &Opti
 }
 
 pub fn profile(target: &Path, draft: &Path, ids: &[u32], options: &Options) -> Result<()> {
-    check(ids, options, draft)?;
     let mut model = Model::load(
         target,
         options.device,
@@ -606,8 +620,9 @@ pub fn profile(target: &Path, draft: &Path, ids: &[u32], options: &Options) -> R
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, model.draft_config()?)?;
 
-    let rows = crate::dspark::DraftConfig::read(draft, &model.config)?.verify_rows()?;
+    let rows = model.draft_config()?.verify_rows()?;
     model.prefill(ids, None)?;
     model.spec_round(rows, None, "")?;
     model.reset()?;
@@ -633,7 +648,6 @@ pub fn verify_greedy(
     reference: Option<&Path>,
     rules: Option<&crate::verify::Rules>,
 ) -> Result<()> {
-    check(ids, options, draft)?;
     ensure!(
         limits.len() >= options.count,
         "greedy comparison needs per-step max_abs thresholds"
@@ -677,6 +691,7 @@ pub fn verify_greedy(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
+    check(ids, options, spec.draft_config()?)?;
 
     let first = plain.prefill(ids, None)?;
     let spec_first = spec.prefill(ids, None)?;
@@ -901,7 +916,6 @@ pub fn replay(
         options.chunk,
         options.backend.with_draft(draft),
     )?;
-
     let mut position = inject_reference(&mut model, &replay.initial, &rules)?;
     let mut near = 0;
     let mut exact = 0;

@@ -895,6 +895,7 @@ impl Engine {
             workspace_rows,
             32,
             crate::gdn_plan::GdnPolicy::for_device(engine.device.info.arch, engine.device.info.sms),
+            8,
         )?)?;
         engine.qwen = Some(qwen::Runtime::new(
             &engine, runtime, catalog, None, scratch, None, 8,
@@ -2516,7 +2517,7 @@ fn injected_layers_bind_hybrid_mixer_geometry() -> Result<()> {
             shape
         );
     }
-    assert!(qwen::Runtime::workspace(&spec, 8, 32, crate::gdn_plan::GdnPolicy::LEGACY)? > 0);
+    assert!(qwen::Runtime::workspace(&spec, 8, 32, crate::gdn_plan::GdnPolicy::LEGACY, 8)? > 0);
     let mut old = spec.clone();
     old.architecture = Architecture::Llama;
     assert!(hybrid_manifest(&old).is_err());
